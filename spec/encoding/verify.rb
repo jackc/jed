@@ -61,10 +61,7 @@ def label_of(c) = c["null"] ? "NULL" : c["value"]
 
 def main
   path = File.join(__dir__, "integers.toml")
-  # Read as UTF-8 explicitly rather than TomlRB.load_file: under a non-UTF-8 locale
-  # (e.g. the container's POSIX/US-ASCII default) the file would be tagged US-ASCII
-  # and clash with toml-rb's UTF-8 grammar. Spec files are UTF-8 regardless of locale.
-  data = TomlRB.parse(File.read(path, encoding: "UTF-8"))
+  data = TomlRB.load_file(path)
   checked = 0
 
   (data["bare"] || []).each do |group|

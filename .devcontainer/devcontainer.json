@@ -5,6 +5,7 @@
   "workspaceFolder": "/workspaces/abide",
 
   "containerEnv": {
+    "LANG":              "en_US.UTF-8",
     "CLAUDE_CONFIG_DIR": "/persist/shared/claude",
     "ATUIN_CONFIG_DIR":  "/persist/shared/atuin/config",
     "ATUIN_DATA_DIR":    "/persist/shared/atuin/data",
