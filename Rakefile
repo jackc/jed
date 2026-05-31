@@ -21,6 +21,7 @@
 # command that touches a bare mirror must name it with `--git-dir` AND override
 # the guard with `-c safe.bareRepository=all`. The git_bare helper does both.
 
+require "bundler/setup" # load the gems pinned in Gemfile.lock (rake, toml-rb)
 require "fileutils"
 
 # Each entry is one reference repo. `ref` is the branch/tag checked out into the
@@ -115,6 +116,24 @@ end
 # Bare `rake` is read-only on purpose — provisioning (multi-GB clones) must be
 # explicit via `rake references:setup`.
 task default: "references:status"
+
+# verify — run the spec's data-table checkers (no engine required). Each checker is
+# an independent reference implementation that recomputes values from the rules and
+# asserts the canonical fixtures match (CLAUDE.md §5, §8). Add new checks here as
+# subsystems gain verifiable data.
+desc "Verify the spec data tables and byte fixtures"
+task :verify do
+  checks = [
+    ["key encoding", "spec/encoding/verify.rb"],
+  ]
+  failures = []
+  checks.each do |name, script|
+    puts "#{name}: #{script}"
+    failures << name unless system(RbConfig.ruby, script)
+  end
+  abort "verify: failed for #{failures.join(', ')}" unless failures.empty?
+  puts "\nAll spec checks passed."
+end
 
 namespace :references do
   desc "Clone/refresh reference mirrors on persist and check out worktrees into references/"

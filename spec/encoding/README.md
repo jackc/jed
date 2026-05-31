@@ -24,7 +24,7 @@ nullable presence tag, composition, and the NULLs-first decision — is in
 | File | Contents |
 |---|---|
 | [integers.toml](integers.toml) | Byte-exact `(value → bytes)` vectors: `int16`/`int32`/`int64` bare values, the nullable presence-tag slot, and the descending (inverted) encoding. |
-| [verify.py](verify.py) | Independent reference encoder that checks every vector for round-trip, byte-exactness, and order preservation. Run `python3 spec/encoding/verify.py` (test-time only). |
+| [verify.rb](verify.rb) | Independent reference encoder that checks every vector for round-trip, byte-exactness, and order preservation. Run `rake verify` (or `bundle exec ruby spec/encoding/verify.rb`); test-time only. |
 
 ## NULL ordering (ratified here)
 

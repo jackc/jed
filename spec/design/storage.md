@@ -50,9 +50,10 @@ method is something every host (including OPFS and pure memory) can implement ch
 
 ## 3. Page model
 
-- **Fixed-size pages**, page-aligned (SSD target, §1). **Default 4 KiB**, recorded in the
-  file header so it is a format parameter, not a hardcoded constant — chosen to match
-  common SSD/OS page granularity; revisitable per the fixtures without code assumptions.
+- **Fixed-size pages**, page-aligned (SSD target, §1). **Default 8 KiB**, recorded in the
+  file header so it is a format parameter, not a hardcoded constant — matches PostgreSQL's
+  default block size (a well-proven choice on SSD/OS page granularity) and stays revisitable
+  per the fixtures without code assumptions.
 - **Page 0 is the header / meta page**: magic number, format version, page size, and the
   **root pointer(s)** for the committed state (§4). Byte layout is specified in
   [../fileformat/](../fileformat/) with fixtures, including the cross-core round-trip test
