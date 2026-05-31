@@ -4,10 +4,9 @@ import "fmt"
 
 // Hand-written recursive-descent parser (CLAUDE.md §5, §10).
 //
-// SCAFFOLD (step-5 Phase A): the token cursor and entry point exist; the statement
-// productions are filled in feature-by-feature (Phases B–E). Until a production is
-// implemented it returns a structured 0A000 feature-not-supported error rather than
-// panicking, so the harness reports "not yet" cleanly.
+// Statement productions are filled in feature-by-feature (Phases B–E). Until a
+// production is implemented it returns a structured 0A000 feature-not-supported
+// error rather than panicking, so the harness reports "not yet" cleanly.
 
 // Parser is a token cursor over a single statement.
 type Parser struct {
@@ -39,7 +38,13 @@ func ParseSQL(sql string) (Statement, error) {
 
 func (p *Parser) parseStatement() (Statement, error) {
 	switch p.peekKeyword() {
-	case "create", "insert", "select":
+	case "create":
+		ct, err := p.parseCreateTable()
+		if err != nil {
+			return Statement{}, err
+		}
+		return Statement{CreateTable: ct}, nil
+	case "insert", "select":
 		return Statement{}, NewError(FeatureNotSupported,
 			"SQL statement parsing is not implemented yet (step-5 Phase A scaffold)")
 	case "":
@@ -47,6 +52,66 @@ func (p *Parser) parseStatement() (Statement, error) {
 	default:
 		return Statement{}, NewError(SyntaxError, fmt.Sprintf("unexpected keyword '%s'", p.peekKeyword()))
 	}
+}
+
+// parseCreateTable parses `CREATE TABLE <name> ( <coldef> [, <coldef>]* )`, where
+// each <coldef> is `<name> <typename> [PRIMARY KEY]`. Type names are kept as written
+// and resolved during execution (the catalog owns the type lattice).
+func (p *Parser) parseCreateTable() (*CreateTable, error) {
+	if err := p.expectKeyword("create"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("table"); err != nil {
+		return nil, err
+	}
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect(TokLParen); err != nil {
+		return nil, err
+	}
+
+	var columns []ColumnDef
+	for {
+		col, err := p.parseColumnDef()
+		if err != nil {
+			return nil, err
+		}
+		columns = append(columns, col)
+		switch p.advance().Kind {
+		case TokComma:
+			continue
+		case TokRParen:
+		default:
+			return nil, NewError(SyntaxError, "expected ',' or ')'")
+		}
+		break
+	}
+	if len(columns) == 0 {
+		return nil, NewError(SyntaxError, "a table must have at least one column")
+	}
+	return &CreateTable{Name: name, Columns: columns}, nil
+}
+
+func (p *Parser) parseColumnDef() (ColumnDef, error) {
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return ColumnDef{}, err
+	}
+	typeName, err := p.expectIdentifier()
+	if err != nil {
+		return ColumnDef{}, err
+	}
+	primaryKey := false
+	if p.peekKeyword() == "primary" {
+		p.advance()
+		if err := p.expectKeyword("key"); err != nil {
+			return ColumnDef{}, err
+		}
+		primaryKey = true
+	}
+	return ColumnDef{Name: name, TypeName: typeName, PrimaryKey: primaryKey}, nil
 }
 
 // peek returns the current token without consuming it.
@@ -68,6 +133,33 @@ func (p *Parser) advance() Token {
 		p.pos++
 	}
 	return t
+}
+
+// expect consumes the current token, requiring its kind to equal want.
+func (p *Parser) expect(want TokenKind) error {
+	if got := p.advance(); got.Kind != want {
+		return NewError(SyntaxError, "unexpected token")
+	}
+	return nil
+}
+
+// expectKeyword consumes the current token, requiring it to be the given keyword
+// (case-insensitive).
+func (p *Parser) expectKeyword(kw string) error {
+	t := p.advance()
+	if t.Kind == TokWord && toLowerASCII(t.Word) == kw {
+		return nil
+	}
+	return NewError(SyntaxError, fmt.Sprintf("expected keyword '%s'", kw))
+}
+
+// expectIdentifier consumes the current token, requiring it to be a bare word.
+func (p *Parser) expectIdentifier() (string, error) {
+	t := p.advance()
+	if t.Kind != TokWord {
+		return "", NewError(SyntaxError, "expected an identifier")
+	}
+	return t.Word, nil
 }
 
 // expectEof requires that all input has been consumed.

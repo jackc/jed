@@ -19,8 +19,16 @@ const (
 	UndefinedTable
 	// UndefinedColumn is 42703.
 	UndefinedColumn
+	// UndefinedObject is 42704 (e.g. an unknown type name).
+	UndefinedObject
 	// DatatypeMismatch is 42804.
 	DatatypeMismatch
+	// DuplicateTable is 42P07 (CREATE TABLE of an existing name).
+	DuplicateTable
+	// DuplicateColumn is 42701 (two columns with the same name).
+	DuplicateColumn
+	// InvalidTableDefinition is 42P16 (e.g. more than one primary key).
+	InvalidTableDefinition
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
 )
@@ -36,8 +44,16 @@ func (s SqlState) Code() string {
 		return "42P01"
 	case UndefinedColumn:
 		return "42703"
+	case UndefinedObject:
+		return "42704"
 	case DatatypeMismatch:
 		return "42804"
+	case DuplicateTable:
+		return "42P07"
+	case DuplicateColumn:
+		return "42701"
+	case InvalidTableDefinition:
+		return "42P16"
 	case FeatureNotSupported:
 		return "0A000"
 	default:

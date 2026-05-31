@@ -66,7 +66,11 @@ fn error_codes_are_registered() {
         SqlState::SyntaxError,
         SqlState::UndefinedTable,
         SqlState::UndefinedColumn,
+        SqlState::UndefinedObject,
         SqlState::DatatypeMismatch,
+        SqlState::DuplicateTable,
+        SqlState::DuplicateColumn,
+        SqlState::InvalidTableDefinition,
         SqlState::FeatureNotSupported,
     ] {
         assert!(

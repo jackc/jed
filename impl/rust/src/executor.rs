@@ -4,10 +4,11 @@
 //! feature-by-feature (Phases B–E). The result of running a statement is an
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
-use crate::ast::Statement;
-use crate::catalog::Table;
+use crate::ast::{CreateTable, Statement};
+use crate::catalog::{Column, Table};
 use crate::error::{EngineError, Result, SqlState};
 use crate::storage::TableStore;
+use crate::types::ScalarType;
 use crate::value::Value;
 use std::collections::HashMap;
 
@@ -54,12 +55,64 @@ impl Database {
     /// Execute one parsed statement.
     pub fn execute_stmt(&mut self, stmt: Statement) -> Result<Outcome> {
         match stmt {
-            Statement::CreateTable(_) | Statement::Insert(_) | Statement::Select(_) => {
-                Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "statement execution is not implemented yet (step-5 Phase A scaffold)",
-                ))
-            }
+            Statement::CreateTable(ct) => self.execute_create_table(ct),
+            Statement::Insert(_) | Statement::Select(_) => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "statement execution is not implemented yet (step-5 Phase A scaffold)",
+            )),
         }
+    }
+
+    /// Analyze and run a CREATE TABLE: resolve each column's type name, enforce a
+    /// single primary key (which is implicitly NOT NULL), reject duplicate table
+    /// and column names, then register the table.
+    fn execute_create_table(&mut self, ct: CreateTable) -> Result<Outcome> {
+        if self.table(&ct.name).is_some() {
+            return Err(EngineError::new(
+                SqlState::DuplicateTable,
+                format!("table already exists: {}", ct.name),
+            ));
+        }
+
+        let mut columns = Vec::with_capacity(ct.columns.len());
+        let mut pk_seen = false;
+        for def in &ct.columns {
+            if columns
+                .iter()
+                .any(|c: &Column| c.name.eq_ignore_ascii_case(&def.name))
+            {
+                return Err(EngineError::new(
+                    SqlState::DuplicateColumn,
+                    format!("duplicate column name: {}", def.name),
+                ));
+            }
+            let ty = ScalarType::from_name(&def.type_name).ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedObject,
+                    format!("type does not exist: {}", def.type_name),
+                )
+            })?;
+            if def.primary_key {
+                if pk_seen {
+                    return Err(EngineError::new(
+                        SqlState::InvalidTableDefinition,
+                        "a table may have at most one primary key",
+                    ));
+                }
+                pk_seen = true;
+            }
+            columns.push(Column {
+                name: def.name.clone(),
+                ty,
+                primary_key: def.primary_key,
+                not_null: def.primary_key, // PRIMARY KEY ⇒ NOT NULL
+            });
+        }
+
+        self.put_table(Table {
+            name: ct.name,
+            columns,
+        });
+        Ok(Outcome::Statement)
     }
 }

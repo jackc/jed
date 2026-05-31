@@ -70,7 +70,9 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 	}
 	for _, st := range []SqlState{
 		NumericValueOutOfRange, SyntaxError, UndefinedTable,
-		UndefinedColumn, DatatypeMismatch, FeatureNotSupported,
+		UndefinedColumn, UndefinedObject, DatatypeMismatch,
+		DuplicateTable, DuplicateColumn, InvalidTableDefinition,
+		FeatureNotSupported,
 	} {
 		if _, ok := codes[st.Code()]; !ok {
 			t.Errorf("code %s missing from registry", st.Code())

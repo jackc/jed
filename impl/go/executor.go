@@ -56,10 +56,51 @@ func (db *Database) putTable(t *Table) {
 // ExecuteStmt executes one parsed statement.
 func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
 	switch {
-	case stmt.CreateTable != nil, stmt.Insert != nil, stmt.Select != nil:
+	case stmt.CreateTable != nil:
+		return db.executeCreateTable(stmt.CreateTable)
+	case stmt.Insert != nil, stmt.Select != nil:
 		return Outcome{}, NewError(FeatureNotSupported,
 			"statement execution is not implemented yet (step-5 Phase A scaffold)")
 	default:
 		return Outcome{}, NewError(SyntaxError, "empty statement")
 	}
+}
+
+// executeCreateTable analyzes and runs a CREATE TABLE: resolve each column's type
+// name, enforce a single primary key (which is implicitly NOT NULL), reject
+// duplicate table and column names, then register the table.
+func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
+	if _, ok := db.Table(ct.Name); ok {
+		return Outcome{}, NewError(DuplicateTable, "table already exists: "+ct.Name)
+	}
+
+	columns := make([]Column, 0, len(ct.Columns))
+	pkSeen := false
+	for _, def := range ct.Columns {
+		for _, c := range columns {
+			if strings.EqualFold(c.Name, def.Name) {
+				return Outcome{}, NewError(DuplicateColumn, "duplicate column name: "+def.Name)
+			}
+		}
+		ty, ok := ScalarTypeFromName(def.TypeName)
+		if !ok {
+			return Outcome{}, NewError(UndefinedObject, "type does not exist: "+def.TypeName)
+		}
+		if def.PrimaryKey {
+			if pkSeen {
+				return Outcome{}, NewError(InvalidTableDefinition,
+					"a table may have at most one primary key")
+			}
+			pkSeen = true
+		}
+		columns = append(columns, Column{
+			Name:       def.Name,
+			Type:       ty,
+			PrimaryKey: def.PrimaryKey,
+			NotNull:    def.PrimaryKey, // PRIMARY KEY ⇒ NOT NULL
+		})
+	}
+
+	db.putTable(&Table{Name: ct.Name, Columns: columns})
+	return Outcome{Kind: OutcomeStatement}, nil
 }

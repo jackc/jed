@@ -12,14 +12,22 @@ use std::fmt;
 pub enum SqlState {
     /// 22003 — numeric value out of range (integer overflow; CLAUDE.md §8).
     NumericValueOutOfRange,
-    /// 42601 — syntax error. (Local class 42; not yet in the registry — see note.)
+    /// 42601 — syntax error.
     SyntaxError,
     /// 42P01 — undefined table.
     UndefinedTable,
     /// 42703 — undefined column.
     UndefinedColumn,
-    /// 42804 — datatype mismatch / undefined type name.
+    /// 42704 — undefined object (e.g. an unknown type name).
+    UndefinedObject,
+    /// 42804 — datatype mismatch (a value's type is wrong for its context).
     DatatypeMismatch,
+    /// 42P07 — duplicate table (CREATE TABLE of an existing name).
+    DuplicateTable,
+    /// 42701 — duplicate column (two columns with the same name).
+    DuplicateColumn,
+    /// 42P16 — invalid table definition (e.g. more than one primary key).
+    InvalidTableDefinition,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
 }
@@ -31,7 +39,11 @@ impl SqlState {
             SqlState::SyntaxError => "42601",
             SqlState::UndefinedTable => "42P01",
             SqlState::UndefinedColumn => "42703",
+            SqlState::UndefinedObject => "42704",
             SqlState::DatatypeMismatch => "42804",
+            SqlState::DuplicateTable => "42P07",
+            SqlState::DuplicateColumn => "42701",
+            SqlState::InvalidTableDefinition => "42P16",
             SqlState::FeatureNotSupported => "0A000",
         }
     }

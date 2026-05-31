@@ -44,10 +44,34 @@ class = "syntax error or access rule violation"
 template = "column does not exist: {name}"
 
 [[error]]
+code = "42704"
+name = "undefined_object"
+class = "syntax error or access rule violation"
+template = "{kind} does not exist: {name}"
+
+[[error]]
 code = "42804"
 name = "datatype_mismatch"
 class = "syntax error or access rule violation"
 template = "datatype mismatch: {detail}"
+
+[[error]]
+code = "42701"
+name = "duplicate_column"
+class = "syntax error or access rule violation"
+template = "duplicate column name: {name}"
+
+[[error]]
+code = "42P07"
+name = "duplicate_table"
+class = "syntax error or access rule violation"
+template = "table already exists: {name}"
+
+[[error]]
+code = "42P16"
+name = "invalid_table_definition"
+class = "syntax error or access rule violation"
+template = "invalid table definition: {detail}"
 
 # --- feature not supported (class 0A) ---------------------------------------
 [[error]]
