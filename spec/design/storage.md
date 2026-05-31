@@ -85,8 +85,20 @@ lands in the storage layer as a **root-pointer swap**:
 This is the bbolt model (single writer, copy-on-write pages, meta-page root swap), kept as
 a reference checkout for exactly this reason (CLAUDE.md §12). The atomicity of step 3
 depends on the meta-page write being all-or-nothing; the format reserves **two meta slots**
-and alternates between them (with a checksum) so a torn write during publish can always
-fall back to the previous valid meta — detail specified in [../fileformat/](../fileformat/).
+(with a checksum) so a torn write during publish can always fall back to the previous valid
+meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
+
+> **Step-5b status (whole-image commit).** Persistence has landed in a deliberately
+> narrowed form: a commit serializes the **entire database to one byte image** rather than
+> writing only changed pages. The incremental machinery this section describes —
+> copy-on-write of just the dirty path, the free-list, per-page reuse, B-tree interior
+> pages — is **deferred until `UPDATE`/`DELETE` exist** (nothing exercises it before then;
+> CLAUDE.md §11). What *is* built now and forward-compatible: the two meta slots, the
+> checksum, the root pointer, and the load-bearing **write-ordering rule** (write body
+> pages + `sync()`, *then* publish the meta + `sync()`), so the live incremental commit is
+> an additive change, not a reshape. The whole-image writer fills both meta slots with the
+> same `txid`; slot alternation belongs to the future incremental path. The byte layout is
+> [../fileformat/format.md](../fileformat/format.md).
 
 ## 5. Pluggability (keep the door open — CLAUDE.md §9)
 
@@ -109,15 +121,18 @@ sits so the options stay open (CLAUDE.md §9).
 
 ## 6. Open / deferred
 
-- **On-disk byte format** — magic/version/meta-page/free-list/page layout, with fixtures
-  and the cross-core round-trip test. Authored in [../fileformat/](../fileformat/) at
-  CLAUDE.md §11 step 5 (when the first slice persists). This doc fixes the *model*; that
-  fixes the *bytes*.
-- **Within-page structure** — slotted page vs. fixed records; B-tree vs. other index page
-  layout. Decided with the format, driven by the first slice's access patterns (point
-  lookup by PK).
-- **Free-list / page reclamation** — representation of freed pages. Specified with the
-  format.
+- **On-disk byte format** — ✅ **authored** (step-5b) in [../fileformat/format.md](../fileformat/format.md):
+  magic/version, double-buffered meta with a checksum, catalog + data page chains, record
+  layout, value codec, byte-exact fixtures, and the cross-core golden round-trip (a file
+  written by Rust is byte-identical to one written by Go — CLAUDE.md §8). This doc fixes the
+  *model*; that fixes the *bytes*. **Whole-image** form for now (see the §4 status note).
+- **Incremental commit (COW path, free-list, page reclamation, B-tree interior pages)** —
+  deferred until `UPDATE`/`DELETE` create the pressure. The current whole-image writer
+  rewrites the full image at each commit; the data page layout is a simple sorted-record
+  chain, not yet a B-tree.
+- **Within-page structure** — currently variable-length records packed greedily into the
+  page payload (a record stores its key + each column's value). Slotted pages / a B-tree
+  leaf layout arrive with the incremental commit path.
 - **Crash-recovery story** — the meta double-buffer (§4) gives atomic commit; whether a
   separate WAL is ever added is deferred (the copy-on-write + root-swap model does not
   require one for atomicity).

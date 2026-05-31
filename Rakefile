@@ -126,6 +126,7 @@ task :verify do
   checks = [
     ["key encoding", "spec/encoding/verify.rb"],
     ["conformance taxonomy", "spec/conformance/verify.rb"],
+    ["file format", "spec/fileformat/verify.rb"],
   ]
   failures = []
   checks.each do |name, script|

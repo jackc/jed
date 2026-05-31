@@ -35,6 +35,8 @@ const (
 	InvalidTableDefinition
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
+	// DataCorrupted is XX001 — a malformed on-disk database file (CLAUDE.md §8).
+	DataCorrupted
 )
 
 // Code returns the canonical SQLSTATE string.
@@ -64,6 +66,8 @@ func (s SqlState) Code() string {
 		return "42P16"
 	case FeatureNotSupported:
 		return "0A000"
+	case DataCorrupted:
+		return "XX001"
 	default:
 		return "XX000"
 	}

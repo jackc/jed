@@ -47,6 +47,12 @@ impl TableStore {
         self.rows.values()
     }
 
+    /// Iterate `(encoded key, row)` pairs in key order. Used by the on-disk
+    /// serializer (spec/fileformat/format.md), which stores each row's key verbatim.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (&Vec<u8>, &Row)> {
+        self.rows.iter()
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }

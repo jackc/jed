@@ -237,7 +237,14 @@ decisions; they are miserable to retrofit.
   alternatives later; or (b) a **low-level direct access API** beneath SQL (e.g.
   `value = getValue("tableName", key)`, direct row read/write). Whether either ships is
   **undecided** — the requirement is to keep the seam open, not to build them now.
-- On-disk format and key encoding are spec'd with byte fixtures (§8).
+- On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
+  single-file on-disk format is authored (step 5b) in `spec/fileformat/format.md` in a
+  deliberately narrowed **whole-image** form — a commit serializes the entire database to
+  one byte image. Both the Rust and Go cores read/write byte-identical files, verified
+  against shared golden fixtures (the §8 cross-core round-trip). **Deferred until
+  `UPDATE`/`DELETE`:** incremental copy-on-write, free-list/page reclamation, and B-tree
+  interior pages. The double-buffered meta page + root pointer are the forward-compatible
+  hooks for the live incremental commit model (§3).
 
 ---
 
@@ -281,6 +288,10 @@ The design is optimized for AI agents even more than for humans. In practice:
    `CREATE TABLE` / `INSERT` / `SELECT ... WHERE pk = $1`, **with integer columns only**
    (`int16`/`int32`/`int64`, §4), driven through **both** the Rust and Go cores against
    shared corpus entries. Proves the whole multi-core machinery end to end.
+5b. **On-disk format + cross-core round-trip** — the single-file byte format
+   (`spec/fileformat/format.md`) with byte-exact golden fixtures and the load-bearing §8
+   test: each core writes bytes identical to a shared golden and reads the others'. Authored
+   as a **whole-image** format (full serialize per commit); incremental commit deferred (§9).
 
 Each step is independently testable and independently useful. There is deliberately no
 point where progress is blocked on one giant subsystem.

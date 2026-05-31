@@ -34,6 +34,8 @@ pub enum SqlState {
     InvalidTableDefinition,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
+    /// XX001 — data corrupted (a malformed on-disk database file; CLAUDE.md §8).
+    DataCorrupted,
 }
 
 impl SqlState {
@@ -51,6 +53,7 @@ impl SqlState {
             SqlState::DuplicateColumn => "42701",
             SqlState::InvalidTableDefinition => "42P16",
             SqlState::FeatureNotSupported => "0A000",
+            SqlState::DataCorrupted => "XX001",
         }
     }
 }

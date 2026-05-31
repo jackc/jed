@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod encoding;
 pub mod error;
 pub mod executor;
+pub mod format;
 pub mod lexer;
 pub mod parser;
 pub mod storage;

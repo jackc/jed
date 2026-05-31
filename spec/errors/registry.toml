@@ -92,3 +92,10 @@ code = "0A000"
 name = "feature_not_supported"
 class = "feature not supported"
 template = "feature not supported: {detail}"
+
+# --- internal error (class XX) ----------------------------------------------
+[[error]]
+code = "XX001"
+name = "data_corrupted"
+class = "internal error"
+template = "on-disk database file is malformed: {detail}"

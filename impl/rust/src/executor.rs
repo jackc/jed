@@ -64,6 +64,16 @@ impl Database {
         self.tables.insert(key, table);
     }
 
+    /// Every table with its store, as `(lowercased key, table, store)` tuples, for
+    /// the on-disk serializer (spec/fileformat/format.md). The serializer sorts by
+    /// the lowercased key so hash-map iteration order never leaks (CLAUDE.md §8).
+    pub(crate) fn catalog_and_stores(&self) -> Vec<(&str, &Table, &TableStore)> {
+        self.tables
+            .iter()
+            .map(|(k, t)| (k.as_str(), t, self.stores.get(k).expect("store exists")))
+            .collect()
+    }
+
     /// Execute one parsed statement.
     pub fn execute_stmt(&mut self, stmt: Statement) -> Result<Outcome> {
         match stmt {
@@ -354,7 +364,7 @@ impl Database {
     }
 
     /// Mutable access to a table's store (the table is known to exist).
-    fn store_mut(&mut self, name: &str) -> &mut TableStore {
+    pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
         self.stores
             .get_mut(&name.to_ascii_lowercase())
             .expect("store exists for a known table")

@@ -53,5 +53,28 @@ func (s *TableStore) IterInKeyOrder() []Row {
 	return out
 }
 
+// Entry is one stored (encoded key, row) pair.
+type Entry struct {
+	Key []byte
+	Row Row
+}
+
+// EntriesInKeyOrder returns all (key, row) pairs in encoded-key order. Used by the
+// on-disk serializer (spec/fileformat/format.md), which stores each row's key
+// verbatim (the key is not always reconstructable from the row — e.g. a no-PK
+// table's synthetic rowid).
+func (s *TableStore) EntriesInKeyOrder() []Entry {
+	keys := make([]string, 0, len(s.rows))
+	for k := range s.rows {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]Entry, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, Entry{Key: []byte(k), Row: s.rows[k]})
+	}
+	return out
+}
+
 // Len returns the row count.
 func (s *TableStore) Len() int { return len(s.rows) }

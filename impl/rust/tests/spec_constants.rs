@@ -74,6 +74,7 @@ fn error_codes_are_registered() {
         SqlState::DuplicateColumn,
         SqlState::InvalidTableDefinition,
         SqlState::FeatureNotSupported,
+        SqlState::DataCorrupted,
     ] {
         assert!(
             codes.contains(st.code()),
