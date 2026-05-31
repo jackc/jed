@@ -258,6 +258,12 @@ The design is optimized for AI agents even more than for humans. In practice:
   macro magic. In Go, resist over-interfacing. Flat, well-named, single-responsibility
   modules with small context footprints are easier for agents (and humans) to reason
   over than implicit cleverness.
+- **Prefer Ruby and Rake for scripting and task running** — over bash and Make for
+  build scripts, automation, codegen drivers, and dependency/task orchestration. This is
+  a preference, not a prohibition: reach for bash or Make only when it is a *clearly*
+  better choice for the job (a trivial one-liner, or a tool that specifically expects a
+  Makefile). Ruby's readability keeps automation legible for agents and humans alike,
+  consistent with "boring, explicit code over clever abstraction."
 - **Spec-first per subsystem.** A subsystem's design doc + the relevant corpus is what an
   agent needs to work it without holding the whole engine in context.
 
