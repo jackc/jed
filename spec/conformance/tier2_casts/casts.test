@@ -1,0 +1,41 @@
+# tier2_casts — explicit CAST narrowing (spec/types/casts.toml).
+# Narrowing is lossy in general: it requires an explicit CAST and traps (22003)
+# when the value does not fit. Format: ../../design/conformance.md.
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, b int64)
+
+statement ok
+INSERT INTO t VALUES (1, 2000000000)
+
+statement ok
+INSERT INTO t VALUES (2, 5000000000)
+
+statement ok
+INSERT INTO t VALUES (3, 1000)
+
+# int64 -> int32 narrowing that fits
+query I nosort
+SELECT CAST(b AS int32) FROM t WHERE id = 1
+----
+2000000000
+
+# int64 -> int16 narrowing that does NOT fit -> trap
+statement error 22003
+SELECT CAST(b AS int16) FROM t WHERE id = 1
+
+# int64 -> int32 narrowing that does NOT fit -> trap
+statement error 22003
+SELECT CAST(b AS int32) FROM t WHERE id = 2
+
+# narrowing a literal that fits the target
+query I nosort
+SELECT CAST(1000 AS int16) FROM t WHERE id = 1
+----
+1000
+
+# chained narrowing int64 -> int32 -> int16, fits at every step (b = 1000)
+query I nosort
+SELECT CAST(CAST(b AS int32) AS int16) FROM t WHERE id = 3
+----
+1000

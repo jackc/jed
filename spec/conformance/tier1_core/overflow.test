@@ -1,0 +1,39 @@
+# tier1_core — integer overflow traps on INSERT (CLAUDE.md §8; SQLSTATE 22003).
+# A value outside a column's type range is rejected, never silently wrapped.
+# Format: ../../design/conformance.md.
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, s int16)
+
+# in-range boundary values are accepted
+statement ok
+INSERT INTO t VALUES (1, 32767)
+
+statement ok
+INSERT INTO t VALUES (2, -32768)
+
+# one past each int16 boundary traps
+statement error 22003
+INSERT INTO t VALUES (3, 32768)
+
+statement error 22003
+INSERT INTO t VALUES (4, -32769)
+
+# the rejected rows did not land
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+
+# a wider column accepts what overflowed the narrow one
+statement ok
+CREATE TABLE wide (id int32 PRIMARY KEY, n int32)
+
+statement ok
+INSERT INTO wide VALUES (1, 32768)
+
+query I nosort
+SELECT n FROM wide WHERE id = 1
+----
+32768

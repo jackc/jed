@@ -11,3 +11,5 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 
 - [types.md](types.md) — the type system: scalar set, comparison/coercion/promotion,
   three-valued NULL logic, integer overflow, and order-preserving key encoding.
+- [conformance.md](conformance.md) — the conformance corpus: sqllogictest-style format,
+  structured-error matching, the tier + capability-flag system, and determinism rules.

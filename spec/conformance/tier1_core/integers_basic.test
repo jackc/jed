@@ -1,0 +1,50 @@
+# tier1_core — core integer DDL / DML / SELECT.
+# The CLAUDE.md §11 step-5 "it's alive" scope: CREATE TABLE / INSERT /
+# SELECT ... WHERE pk = / ORDER BY, integer columns only (int16/int32/int64).
+# Format: ../../design/conformance.md.
+
+statement ok
+CREATE TABLE nums (id int32 PRIMARY KEY, small int16, big int64)
+
+statement ok
+INSERT INTO nums VALUES (1, 100, 10000000000)
+
+# boundary values: int16 and int64 extremes must round-trip exactly
+statement ok
+INSERT INTO nums VALUES (2, -32768, -9223372036854775808)
+
+statement ok
+INSERT INTO nums VALUES (3, 32767, 9223372036854775807)
+
+# point lookup by primary key (the step-5 milestone query)
+query III nosort
+SELECT id, small, big FROM nums WHERE id = 1
+----
+1
+100
+10000000000
+
+# full scan made deterministic by ORDER BY
+query III nosort
+SELECT id, small, big FROM nums ORDER BY id
+----
+1
+100
+10000000000
+2
+-32768
+-9223372036854775808
+3
+32767
+9223372036854775807
+
+# extremes survive storage + retrieval
+query I nosort
+SELECT small FROM nums WHERE id = 2
+----
+-32768
+
+query I nosort
+SELECT big FROM nums WHERE id = 3
+----
+9223372036854775807

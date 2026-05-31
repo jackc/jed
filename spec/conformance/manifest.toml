@@ -1,0 +1,111 @@
+# Conformance manifest — CANONICAL DATA (CLAUDE.md §5, §7).
+#
+# Defines the capability flags an implementation may declare, and the corpus tiers
+# (each requiring a set of flags). The harness reads this to filter the corpus to the
+# flags a given implementation supports. TEST-TIME ONLY — no shipped engine reads it.
+# Reasoning lives in ../design/conformance.md — read it before editing this file.
+
+schema_version = 1
+
+# --- capability flags --------------------------------------------------------
+# One feature an implementation may support. An implementation declares the set it
+# supports; a tier runs only if all its required flags (transitively, via `extends`)
+# are declared. Add a flag only when a corpus entry actually exercises it (no silent
+# unused capabilities).
+
+[[flag]]
+id = "ddl.create_table"
+description = "CREATE TABLE with typed columns"
+
+[[flag]]
+id = "ddl.primary_key"
+description = "PRIMARY KEY column constraint (enables point lookup by key)"
+
+[[flag]]
+id = "dml.insert"
+description = "INSERT ... VALUES"
+
+[[flag]]
+id = "query.select"
+description = "SELECT of columns from a single table"
+
+[[flag]]
+id = "query.where_eq"
+description = "WHERE with an equality predicate ( = , <> )"
+
+[[flag]]
+id = "query.comparison_order"
+description = "WHERE with an ordering predicate ( < , > , <= , >= )"
+
+[[flag]]
+id = "query.is_null"
+description = "IS NULL / IS NOT NULL predicates"
+
+[[flag]]
+id = "query.order_by"
+description = "ORDER BY for deterministic multi-row output"
+
+[[flag]]
+id = "types.int16"
+description = "int16 / smallint scalar type"
+
+[[flag]]
+id = "types.int32"
+description = "int32 / int / integer scalar type"
+
+[[flag]]
+id = "types.int64"
+description = "int64 / bigint scalar type"
+
+[[flag]]
+id = "null.three_valued"
+description = "Three-valued NULL logic in comparisons (CLAUDE.md §4)"
+
+[[flag]]
+id = "error.overflow_trap"
+description = "Integer overflow traps with SQLSTATE 22003 (CLAUDE.md §8)"
+
+[[flag]]
+id = "cast.explicit"
+description = "Explicit CAST(x AS type), including narrowing that may trap"
+
+[[flag]]
+id = "compare.promotion"
+description = "Cross-type integer comparison via the promotion tower (int16<int32<int64)"
+
+# --- tiers -------------------------------------------------------------------
+# A tier groups corpus files under `dir`. `requires` lists the flags it needs;
+# `extends` (optional) inherits another tier's requirements transitively.
+
+[[tier]]
+id = "tier1_core"
+title = "Core integer DDL/DML/SELECT — the \"it's alive\" milestone (CLAUDE.md §11 step 5)"
+dir = "tier1_core"
+requires = [
+  "ddl.create_table",
+  "ddl.primary_key",
+  "dml.insert",
+  "query.select",
+  "query.where_eq",
+  "query.is_null",
+  "query.order_by",
+  "types.int16",
+  "types.int32",
+  "types.int64",
+  "null.three_valued",
+  "error.overflow_trap",
+]
+
+[[tier]]
+id = "tier2_casts"
+title = "Explicit CAST narrowing and overflow"
+dir = "tier2_casts"
+extends = "tier1_core"
+requires = ["cast.explicit"]
+
+[[tier]]
+id = "tier3_comparison"
+title = "Cross-type comparison via the promotion tower"
+dir = "tier3_comparison"
+extends = "tier1_core"
+requires = ["query.comparison_order", "compare.promotion"]

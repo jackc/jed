@@ -1,0 +1,45 @@
+# tier3_comparison — cross-type integer comparison via the promotion tower
+# (spec/types/compare.toml: int16 < int32 < int64). When two integer types meet,
+# both promote to the higher-ranked type and compare there; widening is lossless.
+# Format: ../../design/conformance.md.
+
+statement ok
+CREATE TABLE pairs (id int32 PRIMARY KEY, a int16, b int32, c int64)
+
+# row 1: all three columns hold the same logical value
+statement ok
+INSERT INTO pairs VALUES (1, 100, 100, 100)
+
+# row 2: strictly increasing across the widths
+statement ok
+INSERT INTO pairs VALUES (2, 100, 200, 300)
+
+# int16 vs int32: promote to int32, equal only when values match
+query I nosort
+SELECT id FROM pairs WHERE a = b ORDER BY id
+----
+1
+
+# int16 vs int64: promote to int64
+query I nosort
+SELECT id FROM pairs WHERE a = c ORDER BY id
+----
+1
+
+# int32 vs int64: promote to int64
+query I nosort
+SELECT id FROM pairs WHERE b = c ORDER BY id
+----
+1
+
+# ordering comparison across types (int16 vs int64)
+query I nosort
+SELECT id FROM pairs WHERE a < c ORDER BY id
+----
+2
+
+# ordering the other direction (int64 vs int32)
+query I nosort
+SELECT id FROM pairs WHERE c > b ORDER BY id
+----
+2
