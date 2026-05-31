@@ -33,5 +33,5 @@ sort first** in ascending order (descending inverts → NULLs last). This ratifi
 sort-position decision that [../types/compare.toml](../types/compare.toml) deferred to this
 step (`null_ordering = "nulls-first-ascending"`).
 
-> Status: rule defined and fixtures authored + verified (26 vectors). Composite-key and
+> Status: rule defined and fixtures authored + verified (30 vectors). Composite-key and
 > non-integer (decimal/text/bytea) vectors follow when those features land.
