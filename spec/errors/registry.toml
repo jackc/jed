@@ -10,12 +10,48 @@
 # template  message template; {placeholders} are filled by the engine. Message TEXT
 #           is informational — matching is on `code`/`name`, never on prose.
 #
-# Seeded with only the code the integer type semantics require. Grows per subsystem.
+# Grows per subsystem. The conformance corpus only matches on codes it asserts
+# (currently 22003); the others are raised by the engine for failures that surface
+# as a failed `statement ok`. Each core cross-checks its SqlState constants against
+# this registry (impl/*/tests).
 
 schema_version = 1
 
+# --- data exception (class 22) ----------------------------------------------
 [[error]]
 code = "22003"
 name = "numeric_value_out_of_range"
 class = "data exception"
 template = "value out of range for type {type}"
+
+# --- syntax error / access rule violation (class 42) ------------------------
+[[error]]
+code = "42601"
+name = "syntax_error"
+class = "syntax error or access rule violation"
+template = "syntax error: {detail}"
+
+[[error]]
+code = "42P01"
+name = "undefined_table"
+class = "syntax error or access rule violation"
+template = "table does not exist: {name}"
+
+[[error]]
+code = "42703"
+name = "undefined_column"
+class = "syntax error or access rule violation"
+template = "column does not exist: {name}"
+
+[[error]]
+code = "42804"
+name = "datatype_mismatch"
+class = "syntax error or access rule violation"
+template = "datatype mismatch: {detail}"
+
+# --- feature not supported (class 0A) ---------------------------------------
+[[error]]
+code = "0A000"
+name = "feature_not_supported"
+class = "feature not supported"
+template = "feature not supported: {detail}"

@@ -1,0 +1,22 @@
+[package]
+name = "abide"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Rust core of the engine — a downstream consumer of /spec (CLAUDE.md §2)."
+
+[lib]
+name = "abide"
+path = "src/lib.rs"
+
+# The conformance harness: runs the shared corpus under spec/conformance.
+[[bin]]
+name = "conformance"
+path = "src/bin/conformance.rs"
+
+[dependencies]
+
+[dev-dependencies]
+# TOML is a TEST-TIME ONLY dependency (CLAUDE.md §5): the cross-check tests read the
+# canonical spec data tables to prove the hand-written constants match. No runtime use.
+toml = "0.9"
