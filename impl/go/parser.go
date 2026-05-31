@@ -51,8 +51,11 @@ func (p *Parser) parseStatement() (Statement, error) {
 		}
 		return Statement{Insert: ins}, nil
 	case "select":
-		return Statement{}, NewError(FeatureNotSupported,
-			"SQL statement parsing is not implemented yet (step-5 Phase A scaffold)")
+		sel, err := p.parseSelect()
+		if err != nil {
+			return Statement{}, err
+		}
+		return Statement{Select: sel}, nil
 	case "":
 		return Statement{}, NewError(SyntaxError, "expected a SQL statement")
 	default:
@@ -172,6 +175,178 @@ func (p *Parser) parseLiteral() (Literal, error) {
 		return Literal{Kind: LiteralNull}, nil
 	default:
 		return Literal{}, NewError(SyntaxError, "expected a literal value")
+	}
+}
+
+// parseSelect parses
+// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]`,
+// where <items> is `*` or a comma-separated list of column refs / CASTs.
+func (p *Parser) parseSelect() (*Select, error) {
+	if err := p.expectKeyword("select"); err != nil {
+		return nil, err
+	}
+	items, err := p.parseSelectItems()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("from"); err != nil {
+		return nil, err
+	}
+	from, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+
+	sel := &Select{Items: items, From: from}
+
+	if p.peekKeyword() == "where" {
+		p.advance()
+		pred, err := p.parsePredicate()
+		if err != nil {
+			return nil, err
+		}
+		sel.Filter = pred
+	}
+
+	if p.peekKeyword() == "order" {
+		p.advance()
+		if err := p.expectKeyword("by"); err != nil {
+			return nil, err
+		}
+		col, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		descending := false
+		switch p.peekKeyword() {
+		case "asc":
+			p.advance()
+		case "desc":
+			p.advance()
+			descending = true
+		}
+		sel.OrderBy = &OrderBy{Column: col, Descending: descending}
+	}
+
+	return sel, nil
+}
+
+func (p *Parser) parseSelectItems() (SelectItems, error) {
+	if p.peek().Kind == TokStar {
+		p.advance()
+		return SelectItems{All: true}, nil
+	}
+	var items []SelectExpr
+	for {
+		expr, err := p.parseSelectExpr()
+		if err != nil {
+			return SelectItems{}, err
+		}
+		items = append(items, expr)
+		if p.peek().Kind == TokComma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	return SelectItems{Items: items}, nil
+}
+
+// parseSelectExpr parses `CAST ( <expr> AS <type> )`, a bare integer literal, or a
+// bare column name.
+func (p *Parser) parseSelectExpr() (SelectExpr, error) {
+	if p.peekKeyword() == "cast" {
+		p.advance()
+		if err := p.expect(TokLParen); err != nil {
+			return SelectExpr{}, err
+		}
+		inner, err := p.parseSelectExpr()
+		if err != nil {
+			return SelectExpr{}, err
+		}
+		if err := p.expectKeyword("as"); err != nil {
+			return SelectExpr{}, err
+		}
+		typeName, err := p.expectIdentifier()
+		if err != nil {
+			return SelectExpr{}, err
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return SelectExpr{}, err
+		}
+		return SelectExpr{Cast: &CastExpr{Inner: inner, TypeName: typeName}}, nil
+	}
+	if p.peek().Kind == TokInt {
+		n := p.advance().Int
+		return SelectExpr{Literal: &Literal{Kind: LiteralInt, Int: n}}, nil
+	}
+	col, err := p.expectIdentifier()
+	if err != nil {
+		return SelectExpr{}, err
+	}
+	return SelectExpr{Column: col}, nil
+}
+
+// parsePredicate parses `<col> IS [NOT] NULL` or `<col> <cmp> <operand>`, where
+// <operand> is another column or a literal.
+func (p *Parser) parsePredicate() (*Predicate, error) {
+	col, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	if p.peekKeyword() == "is" {
+		p.advance()
+		negated := false
+		if p.peekKeyword() == "not" {
+			p.advance()
+			negated = true
+		}
+		if err := p.expectKeyword("null"); err != nil {
+			return nil, err
+		}
+		return &Predicate{IsNull: &IsNullPredicate{Column: col, Negated: negated}}, nil
+	}
+	var op CompareOp
+	switch p.advance().Kind {
+	case TokEq:
+		op = OpEq
+	case TokLt:
+		op = OpLt
+	case TokGt:
+		op = OpGt
+	case TokLe:
+		op = OpLe
+	case TokGe:
+		op = OpGe
+	default:
+		return nil, NewError(SyntaxError, "expected a comparison operator")
+	}
+	rhs, err := p.parseOperand()
+	if err != nil {
+		return nil, err
+	}
+	return &Predicate{Compare: &ComparePredicate{Column: col, Op: op, RHS: rhs}}, nil
+}
+
+// parseOperand parses a comparison's right-hand side: a literal (integer or NULL) or
+// a column reference.
+func (p *Parser) parseOperand() (Operand, error) {
+	t := p.peek()
+	switch {
+	case t.Kind == TokInt:
+		p.advance()
+		return Operand{Literal: &Literal{Kind: LiteralInt, Int: t.Int}}, nil
+	case t.Kind == TokWord && toLowerASCII(t.Word) == "null":
+		p.advance()
+		return Operand{Literal: &Literal{Kind: LiteralNull}}, nil
+	case t.Kind == TokWord:
+		col, err := p.expectIdentifier()
+		if err != nil {
+			return Operand{}, err
+		}
+		return Operand{Column: col}, nil
+	default:
+		return Operand{}, NewError(SyntaxError, "expected an operand")
 	}
 }
 

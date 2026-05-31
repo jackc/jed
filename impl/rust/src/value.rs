@@ -27,6 +27,17 @@ impl ThreeValued {
     pub fn is_true(self) -> bool {
         matches!(self, ThreeValued::True)
     }
+
+    /// Three-valued OR (Kleene logic): TRUE if either is TRUE, else UNKNOWN if
+    /// either is UNKNOWN, else FALSE. Used to build `<=` / `>=` from `<`/`>` and
+    /// `=` so a NULL operand still yields UNKNOWN rather than a wrong FALSE.
+    pub fn or(self, other: ThreeValued) -> ThreeValued {
+        match (self, other) {
+            (ThreeValued::True, _) | (_, ThreeValued::True) => ThreeValued::True,
+            (ThreeValued::Unknown, _) | (_, ThreeValued::Unknown) => ThreeValued::Unknown,
+            _ => ThreeValued::False,
+        }
+    }
 }
 
 impl Value {

@@ -2,6 +2,7 @@ package abide
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -64,8 +65,7 @@ func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
 	case stmt.Insert != nil:
 		return db.executeInsert(stmt.Insert)
 	case stmt.Select != nil:
-		return Outcome{}, NewError(FeatureNotSupported,
-			"statement execution is not implemented yet (step-5 Phase A scaffold)")
+		return db.executeSelect(stmt.Select)
 	default:
 		return Outcome{}, NewError(SyntaxError, "empty statement")
 	}
@@ -170,4 +170,275 @@ func (db *Database) RowsInKeyOrder(name string) []Row {
 		return nil
 	}
 	return store.IterInKeyOrder()
+}
+
+// executeSelect analyzes and runs a SELECT: resolve projected columns and the
+// WHERE/ORDER BY columns against the catalog, scan the table in primary-key order,
+// filter by the predicate (three-valued — only TRUE keeps a row), optionally re-sort
+// by ORDER BY, then project. Rows are produced deterministically (CLAUDE.md §10).
+func (db *Database) executeSelect(sel *Select) (Outcome, error) {
+	table, ok := db.Table(sel.From)
+	if !ok {
+		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+sel.From)
+	}
+
+	projections, err := db.resolveProjections(table, sel.Items)
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	var filter *resolvedPredicate
+	if sel.Filter != nil {
+		filter, err = db.resolvePredicate(table, sel.Filter)
+		if err != nil {
+			return Outcome{}, err
+		}
+	}
+
+	orderIdx, orderDesc := -1, false
+	if sel.OrderBy != nil {
+		orderIdx = table.ColumnIndex(sel.OrderBy.Column)
+		if orderIdx < 0 {
+			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+sel.OrderBy.Column)
+		}
+		orderDesc = sel.OrderBy.Descending
+	}
+
+	// Scan in primary-key order, then filter.
+	var rows []Row
+	for _, row := range db.RowsInKeyOrder(sel.From) {
+		if filter == nil || filter.eval(row).IsTrue() {
+			rows = append(rows, row)
+		}
+	}
+
+	// ORDER BY: stable sort by the key column's value, NULLs first ascending
+	// (spec/design/encoding.md §4); descending reverses, NULLs last.
+	if orderIdx >= 0 {
+		sort.SliceStable(rows, func(a, b int) bool {
+			c := nullFirstCmp(rows[a][orderIdx], rows[b][orderIdx])
+			if orderDesc {
+				return c > 0
+			}
+			return c < 0
+		})
+	}
+
+	// Project each surviving row.
+	out := make([][]Value, 0, len(rows))
+	for _, row := range rows {
+		projected := make([]Value, len(projections))
+		for i, p := range projections {
+			v, err := p.eval(row)
+			if err != nil {
+				return Outcome{}, err
+			}
+			projected[i] = v
+		}
+		out = append(out, projected)
+	}
+
+	return Outcome{Kind: OutcomeQuery, ColumnCount: len(projections), Rows: out}, nil
+}
+
+func (db *Database) resolveProjections(table *Table, items SelectItems) ([]projection, error) {
+	if items.All {
+		ps := make([]projection, len(table.Columns))
+		for i := range table.Columns {
+			ps[i] = projection{kind: projColumn, index: i}
+		}
+		return ps, nil
+	}
+	ps := make([]projection, 0, len(items.Items))
+	for _, e := range items.Items {
+		p, err := db.resolveExpr(table, e)
+		if err != nil {
+			return nil, err
+		}
+		ps = append(ps, p)
+	}
+	return ps, nil
+}
+
+func (db *Database) resolveExpr(table *Table, e SelectExpr) (projection, error) {
+	switch {
+	case e.Cast != nil:
+		target, ok := ScalarTypeFromName(e.Cast.TypeName)
+		if !ok {
+			return projection{}, NewError(UndefinedObject, "type does not exist: "+e.Cast.TypeName)
+		}
+		inner, err := db.resolveExpr(table, e.Cast.Inner)
+		if err != nil {
+			return projection{}, err
+		}
+		boxed := inner
+		return projection{kind: projCast, target: target, inner: &boxed}, nil
+	case e.Literal != nil:
+		if e.Literal.Kind == LiteralNull {
+			return projection{kind: projNull}, nil
+		}
+		return projection{kind: projLiteralInt, literal: e.Literal.Int}, nil
+	default:
+		idx := table.ColumnIndex(e.Column)
+		if idx < 0 {
+			return projection{}, NewError(UndefinedColumn, "column does not exist: "+e.Column)
+		}
+		return projection{kind: projColumn, index: idx}, nil
+	}
+}
+
+func (db *Database) resolvePredicate(table *Table, p *Predicate) (*resolvedPredicate, error) {
+	resolveCol := func(name string) (int, error) {
+		idx := table.ColumnIndex(name)
+		if idx < 0 {
+			return 0, NewError(UndefinedColumn, "column does not exist: "+name)
+		}
+		return idx, nil
+	}
+	switch {
+	case p.Compare != nil:
+		idx, err := resolveCol(p.Compare.Column)
+		if err != nil {
+			return nil, err
+		}
+		rp := &resolvedPredicate{index: idx, op: p.Compare.Op}
+		if lit := p.Compare.RHS.Literal; lit != nil {
+			if lit.Kind == LiteralInt {
+				rp.rhsConst = IntValue(lit.Int)
+			} else {
+				rp.rhsConst = NullValue()
+			}
+		} else {
+			j, err := resolveCol(p.Compare.RHS.Column)
+			if err != nil {
+				return nil, err
+			}
+			rp.rhsColumn = j
+			rp.rhsIsColumn = true
+		}
+		return rp, nil
+	default: // IsNull
+		idx, err := resolveCol(p.IsNull.Column)
+		if err != nil {
+			return nil, err
+		}
+		return &resolvedPredicate{isNull: true, index: idx, negated: p.IsNull.Negated}, nil
+	}
+}
+
+// projKind tags a resolved projection.
+type projKind int
+
+const (
+	projColumn projKind = iota
+	projLiteralInt
+	projNull
+	projCast
+)
+
+// projection is a resolved output column: how to produce one value from a row.
+type projection struct {
+	kind    projKind
+	index   int         // projColumn
+	literal int64       // projLiteralInt
+	target  ScalarType  // projCast
+	inner   *projection // projCast
+}
+
+func (p projection) eval(row Row) (Value, error) {
+	switch p.kind {
+	case projColumn:
+		return row[p.index], nil
+	case projLiteralInt:
+		return IntValue(p.literal), nil
+	case projNull:
+		return NullValue(), nil
+	case projCast:
+		v, err := p.inner.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		if v.Null {
+			return NullValue(), nil
+		}
+		if !p.target.InRange(v.Int) {
+			return Value{}, NewError(NumericValueOutOfRange,
+				"value out of range for type "+p.target.CanonicalName())
+		}
+		return IntValue(v.Int), nil
+	default:
+		return Value{}, NewError(FeatureNotSupported, "unknown projection")
+	}
+}
+
+// resolvedPredicate is a WHERE predicate over fixed column indices.
+type resolvedPredicate struct {
+	isNull      bool // true => IS [NOT] NULL; false => comparison
+	index       int
+	op          CompareOp // comparison
+	rhsConst    Value     // comparison, when rhsIsColumn is false
+	rhsColumn   int       // comparison, when rhsIsColumn is true
+	rhsIsColumn bool      // comparison: RHS is another column
+	negated     bool      // IS NOT NULL
+}
+
+// eval returns a three-valued result; a WHERE clause keeps a row only on True.
+func (p *resolvedPredicate) eval(row Row) ThreeValued {
+	if p.isNull {
+		got := row[p.index].Null != p.negated
+		if got {
+			return True
+		}
+		return False
+	}
+	lhs := row[p.index]
+	rhs := p.rhsConst
+	if p.rhsIsColumn {
+		rhs = row[p.rhsColumn]
+	}
+	switch p.op {
+	case OpEq:
+		return lhs.Eq3(rhs)
+	case OpLt:
+		return lhs.Lt3(rhs)
+	case OpGt:
+		return lhs.Gt3(rhs)
+	case OpLe:
+		return or3(lhs.Lt3(rhs), lhs.Eq3(rhs))
+	case OpGe:
+		return or3(lhs.Gt3(rhs), lhs.Eq3(rhs))
+	default:
+		return Unknown
+	}
+}
+
+// or3 is three-valued OR (Kleene): used to build <= / >= from < / > and =, so a
+// NULL operand yields UNKNOWN rather than a wrong FALSE (CLAUDE.md §4).
+func or3(a, b ThreeValued) ThreeValued {
+	if a == True || b == True {
+		return True
+	}
+	if a == Unknown || b == Unknown {
+		return Unknown
+	}
+	return False
+}
+
+// nullFirstCmp is a total order for ORDER BY with NULLs first (ascending), matching
+// the key encoding's physical order (spec/design/encoding.md §4). Returns <0, 0, >0.
+func nullFirstCmp(a, b Value) int {
+	switch {
+	case a.Null && b.Null:
+		return 0
+	case a.Null:
+		return -1
+	case b.Null:
+		return 1
+	case a.Int < b.Int:
+		return -1
+	case a.Int > b.Int:
+		return 1
+	default:
+		return 0
+	}
 }

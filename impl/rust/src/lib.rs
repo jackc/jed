@@ -41,6 +41,19 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Phase C — INSERT ... VALUES with positional type-checking + overflow trap.
     "dml.insert",
     "error.overflow_trap",
+    // Phase D/E — SELECT, WHERE (=, ordering), ORDER BY, IS [NOT] NULL, 3VL, casts,
+    // cross-type comparison via the promotion tower, and all three integer types.
+    "query.select",
+    "query.where_eq",
+    "query.comparison_order",
+    "query.is_null",
+    "query.order_by",
+    "null.three_valued",
+    "compare.promotion",
+    "cast.explicit",
+    "types.int16",
+    "types.int32",
+    "types.int64",
 ];
 
 /// Parse and execute one SQL statement against `db`.

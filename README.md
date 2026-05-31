@@ -32,5 +32,9 @@ impl/        native cores, one per language (Rust first, then Go), each a downst
 4. ✅ **Storage seam + key-encoding fixtures** — the block-device seam + root-swap commit
    model ([spec/design/storage.md](spec/design/storage.md)); byte-exact integer key-encoding
    vectors ([spec/encoding/](spec/encoding/)). On-disk byte *format* is authored with step 5.
-5. ⬜ First vertical slice (`CREATE TABLE` / `INSERT` / `SELECT ... WHERE pk = $1`,
-   integer columns only) through both the Rust and Go cores.
+5. ✅ **First vertical slice — "it's alive"** — `CREATE TABLE` / `INSERT` /
+   `SELECT ... WHERE pk =` (+ `ORDER BY`, `IS [NOT] NULL`, three-valued logic, `CAST`,
+   overflow trap), integer columns only, driven through **both** the Rust
+   ([impl/rust/](impl/rust/)) and Go ([impl/go/](impl/go/)) cores against the shared
+   corpus — `core`/`casts`/`comparison` profiles green in both. In-memory storage;
+   the on-disk byte format + Rust↔Go file round-trip is the next step.

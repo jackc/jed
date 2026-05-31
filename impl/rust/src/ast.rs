@@ -64,12 +64,20 @@ pub enum Predicate {
     Compare {
         column: String,
         op: CompareOp,
-        value: Literal,
+        /// The right-hand side: another column or a literal.
+        rhs: Operand,
     },
     IsNull {
         column: String,
         negated: bool,
     },
+}
+
+/// A comparison operand: a column reference or a literal value.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Operand {
+    Column(String),
+    Literal(Literal),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

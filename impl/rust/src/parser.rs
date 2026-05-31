@@ -4,7 +4,10 @@
 //! production is implemented it returns a structured `0A000` feature-not-supported
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
-use crate::ast::{ColumnDef, CreateTable, Insert, Literal, Statement};
+use crate::ast::{
+    ColumnDef, CompareOp, CreateTable, Insert, Literal, Operand, OrderBy, Predicate, Select,
+    SelectExpr, SelectItems, Statement,
+};
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
 use crate::token::Token;
@@ -33,9 +36,7 @@ impl Parser {
         match self.peek_keyword().as_deref() {
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
-            Some("select") => Err(not_supported(
-                "SQL statement parsing is not implemented yet (step-5 Phase A scaffold)",
-            )),
+            Some("select") => Ok(Statement::Select(self.parse_select()?)),
             Some(other) => Err(syntax(format!("unexpected keyword '{other}'"))),
             None => Err(syntax("expected a SQL statement")),
         }
@@ -116,6 +117,138 @@ impl Parser {
         }
     }
 
+    /// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]`,
+    /// where `<items>` is `*` or a comma-separated list of column refs / CASTs.
+    fn parse_select(&mut self) -> Result<Select> {
+        self.expect_keyword("select")?;
+        let items = self.parse_select_items()?;
+        self.expect_keyword("from")?;
+        let from = self.expect_identifier()?;
+
+        let filter = if self.peek_keyword().as_deref() == Some("where") {
+            self.advance();
+            Some(self.parse_predicate()?)
+        } else {
+            None
+        };
+
+        let order_by = if self.peek_keyword().as_deref() == Some("order") {
+            self.advance();
+            self.expect_keyword("by")?;
+            let column = self.expect_identifier()?;
+            let descending = match self.peek_keyword().as_deref() {
+                Some("asc") => {
+                    self.advance();
+                    false
+                }
+                Some("desc") => {
+                    self.advance();
+                    true
+                }
+                _ => false,
+            };
+            Some(OrderBy { column, descending })
+        } else {
+            None
+        };
+
+        Ok(Select {
+            items,
+            from,
+            filter,
+            order_by,
+        })
+    }
+
+    fn parse_select_items(&mut self) -> Result<SelectItems> {
+        if matches!(self.peek(), Token::Star) {
+            self.advance();
+            return Ok(SelectItems::All);
+        }
+        let mut items = Vec::new();
+        loop {
+            items.push(self.parse_select_expr()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(SelectItems::Items(items))
+    }
+
+    /// A projected expression: `CAST ( <expr> AS <type> )` or a bare column name.
+    fn parse_select_expr(&mut self) -> Result<SelectExpr> {
+        if self.peek_keyword().as_deref() == Some("cast") {
+            self.advance();
+            self.expect(&Token::LParen)?;
+            let inner = self.parse_select_expr()?;
+            self.expect_keyword("as")?;
+            let type_name = self.expect_identifier()?;
+            self.expect(&Token::RParen)?;
+            return Ok(SelectExpr::Cast {
+                inner: Box::new(inner),
+                type_name,
+            });
+        }
+        // A bare integer literal is allowed as a projected value (used by CAST
+        // tests like `SELECT CAST(1000 AS int16)`).
+        if let Token::Int(n) = self.peek() {
+            let n = *n;
+            self.advance();
+            return Ok(SelectExpr::Literal(Literal::Int(n)));
+        }
+        Ok(SelectExpr::Column(self.expect_identifier()?))
+    }
+
+    /// A WHERE predicate: `<col> IS [NOT] NULL` or `<col> <cmp> <operand>`, where
+    /// `<operand>` is another column or a literal.
+    fn parse_predicate(&mut self) -> Result<Predicate> {
+        let column = self.expect_identifier()?;
+        if self.peek_keyword().as_deref() == Some("is") {
+            self.advance();
+            let negated = if self.peek_keyword().as_deref() == Some("not") {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            self.expect_keyword("null")?;
+            return Ok(Predicate::IsNull { column, negated });
+        }
+        let op = match self.advance() {
+            Token::Eq => CompareOp::Eq,
+            Token::Lt => CompareOp::Lt,
+            Token::Gt => CompareOp::Gt,
+            Token::Le => CompareOp::Le,
+            Token::Ge => CompareOp::Ge,
+            other => {
+                return Err(syntax(format!(
+                    "expected a comparison operator, found {other:?}"
+                )));
+            }
+        };
+        let rhs = self.parse_operand()?;
+        Ok(Predicate::Compare { column, op, rhs })
+    }
+
+    /// A comparison operand: a literal (integer or NULL) or a column reference.
+    fn parse_operand(&mut self) -> Result<Operand> {
+        match self.peek() {
+            Token::Int(n) => {
+                let n = *n;
+                self.advance();
+                Ok(Operand::Literal(Literal::Int(n)))
+            }
+            Token::Word(w) if w.eq_ignore_ascii_case("null") => {
+                self.advance();
+                Ok(Operand::Literal(Literal::Null))
+            }
+            Token::Word(_) => Ok(Operand::Column(self.expect_identifier()?)),
+            other => Err(syntax(format!("expected an operand, found {other:?}"))),
+        }
+    }
+
     // --- cursor helpers (used by the productions added in later phases) -------
 
     /// Peek the current token without consuming it.
@@ -178,8 +311,4 @@ impl Parser {
 
 fn syntax(msg: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::SyntaxError, msg.into())
-}
-
-fn not_supported(msg: impl Into<String>) -> EngineError {
-    EngineError::new(SqlState::FeatureNotSupported, msg.into())
 }

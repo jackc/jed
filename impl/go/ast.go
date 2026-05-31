@@ -81,11 +81,18 @@ type Predicate struct {
 	IsNull  *IsNullPredicate
 }
 
-// ComparePredicate is `column <op> value`.
+// ComparePredicate is `column <op> rhs`, where rhs is another column or a literal.
 type ComparePredicate struct {
 	Column string
 	Op     CompareOp
-	Value  Literal
+	RHS    Operand
+}
+
+// Operand is a comparison's right-hand side: a column reference or a literal.
+// Exactly one of Column / Literal is set.
+type Operand struct {
+	Column  string
+	Literal *Literal
 }
 
 // IsNullPredicate is `column IS [NOT] NULL`.
