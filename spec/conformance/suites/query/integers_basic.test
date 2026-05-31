@@ -1,7 +1,8 @@
-# tier1_core — core integer DDL / DML / SELECT.
+# Core integer DDL / DML / SELECT.
 # The CLAUDE.md §11 step-5 "it's alive" scope: CREATE TABLE / INSERT /
 # SELECT ... WHERE pk = / ORDER BY, integer columns only (int16/int32/int64).
-# Format: ../../design/conformance.md.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.int16, types.int32, types.int64
 
 statement ok
 CREATE TABLE nums (id int32 PRIMARY KEY, small int16, big int64)

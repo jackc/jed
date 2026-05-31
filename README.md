@@ -26,8 +26,8 @@ impl/        native cores, one per language (Rust first, then Go), each a downst
 2. ✅ **Type-system spec** — scalar set + comparison/coercion matrix as data. *Step-1
    scope: signed integers only* (`int16`/`int32`/`int64`). See [spec/types/](spec/types/)
    and [spec/design/types.md](spec/design/types.md).
-3. ✅ **Conformance harness format + first corpus tier** — sqllogictest-style format,
-   tier/capability-flag system, integer corpus (tiers 1–3). See
+3. ✅ **Conformance harness format + first corpus** — sqllogictest-style format, three-axis
+   taxonomy (suites / capabilities / profiles), integer corpus. See
    [spec/conformance/](spec/conformance/) and [spec/design/conformance.md](spec/design/conformance.md).
 4. ✅ **Storage seam + key-encoding fixtures** — the block-device seam + root-swap commit
    model ([spec/design/storage.md](spec/design/storage.md)); byte-exact integer key-encoding

@@ -125,6 +125,7 @@ desc "Verify the spec data tables and byte fixtures"
 task :verify do
   checks = [
     ["key encoding", "spec/encoding/verify.rb"],
+    ["conformance taxonomy", "spec/conformance/verify.rb"],
   ]
   failures = []
   checks.each do |name, script|

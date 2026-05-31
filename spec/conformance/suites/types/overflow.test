@@ -1,6 +1,7 @@
-# tier1_core — integer overflow traps on INSERT (CLAUDE.md §8; SQLSTATE 22003).
+# Integer overflow traps on INSERT (CLAUDE.md §8; SQLSTATE 22003).
 # A value outside a column's type range is rejected, never silently wrapped.
-# Format: ../../design/conformance.md.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.int16, types.int32, error.overflow_trap
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, s int16)

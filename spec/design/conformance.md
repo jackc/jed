@@ -3,9 +3,10 @@
 > The reasoning behind the conformance corpus and its harness contract. The **corpus
 > is the contract** between implementations (CLAUDE.md §7, §10): a feature is "make
 > these entries pass." This doc defines (1) the file format, (2) the structured-error
-> matching extension, (3) the tier + capability-flag system, (4) the determinism rules,
-> and (5) the corpus-bootstrapping policy. The tier/flag *data* lives in
-> [../conformance/manifest.toml](../conformance/manifest.toml); this doc is the *why*.
+> matching extension, (3) the three-axis taxonomy (suites / capabilities / profiles),
+> (4) the determinism rules, and (5) the corpus-bootstrapping policy. The capability and
+> profile *data* lives in [../conformance/manifest.toml](../conformance/manifest.toml),
+> validated by `rake verify`; this doc is the *why*.
 
 The corpus is the spine of the project (CLAUDE.md §7). Because there is no reference
 implementation (CLAUDE.md §2), the only thing that says two cores agree is that they
@@ -25,10 +26,10 @@ problem (CLAUDE.md §7). We use the standard record types:
 
 Conventions, fixed here so every implementation renders identically:
 
-- **coltypes** — one letter per result column: `I` integer, `T` text, `R` real. Tier 1–3
-  use only `I` (integers, CLAUDE.md §4). The letter is a **rendering** tag (how a value is
-  printed), *not* a type assertion — asserting the precise declared type (`int16` vs
-  `int32`) is a planned directive, deferred (§6).
+- **coltypes** — one letter per result column: `I` integer, `T` text, `R` real. The
+  current corpus uses only `I` (integers, CLAUDE.md §4). The letter is a **rendering** tag
+  (how a value is printed), *not* a type assertion — asserting the precise declared type
+  (`int16` vs `int32`) is a planned directive, deferred (§7).
 - **values** — printed one per line, **row-major** (row 1's columns, then row 2's, …). A
   single integer renders as its shortest decimal form (no leading zeros, leading `-` for
   negatives). **NULL renders as the literal `NULL`.**
@@ -41,16 +42,21 @@ Conventions, fixed here so every implementation renders identically:
 - **hashing** — large result sets may be replaced by `<N> values hashing to <md5>` with a
   `hash-threshold <N>` control record. Unused in tiers 1–3 (result sets are tiny); listed
   here so the format is complete.
-- **conditionals** — `skipif <flag>` / `onlyif <flag>` immediately before a record gate it
-  on a capability flag (§3).
+- **conditionals** — `skipif <capability>` / `onlyif <capability>` immediately before a
+  record gate it on a capability (§3).
+- **`# requires:` header** — each file declares the capabilities it needs on one comment
+  line: `# requires: ddl.create_table, dml.insert, types.int16`. This is the file-level
+  gate (§3). It is a **comment**, so the stock runner ignores it (§1.1); our harness reads
+  it. Exactly one per file; the checker enforces this.
 
 ### 1.1 Why stay format-compatible
 
 CLAUDE.md §12 keeps `sqllogictest-rs` checked out as a reference runner for `impl/rust`'s
 harness. We therefore keep `.test` files parseable by the stock runner: our **extensions
-are additive and live outside the `.test` files** (the tier/flag manifest), or are chosen
-to *also* parse as standard sqllogictest (the error code, §2). Do not invent `.test`
-syntax that the stock runner would reject.
+are additive** — either a comment the stock runner skips (the `# requires:` header), data
+outside the `.test` files (the manifest), or syntax chosen to *also* parse as standard
+sqllogictest (the error code, §2). Do not invent `.test` syntax that the stock runner
+would reject.
 
 ### 1.2 Parameters
 
@@ -73,31 +79,50 @@ Errors are structured data, not free text (CLAUDE.md §5, §10), so matching is 
   stock `sqllogictest-rs` runner. The structured match (our harness) and the regex match
   (stock runner) agree by construction.
 
-## 3. Tiers and capability flags
+## 3. The three-axis taxonomy: suites, capabilities, profiles
 
 The honesty mechanism must tolerate implementations advancing at different speeds — Go
 may run ahead while TS catches up — without the whole suite reading as broken
-(CLAUDE.md §7). Mechanism:
+(CLAUDE.md §7). The earlier "numbered tiers" conflated three different things — how tests
+are *organized*, what an impl *can do*, and what milestone it *targets* — so they are now
+separated into three independent axes:
 
-- A **capability flag** names one feature an implementation may support (e.g.
-  `cast.explicit`, `types.int64`).
-- Each implementation **declares the set of flags it supports**.
-- Each **tier** declares the flags it `requires` (and optionally `extends` a lower tier,
-  inheriting its requirements). An implementation runs a tier iff it supports every
-  required flag, transitively.
-- Within a file, `skipif`/`onlyif <flag>` gate an individual record.
+1. **Suites** — the [`suites/`](../conformance/suites/) directory tree. Purely
+   *organizational*: tests are grouped by feature area (`query/`, `null/`, `types/`,
+   `cast/`, `compare/`). A suite says nothing about gating; it just answers "what area is
+   this test about." New areas are new subdirectories.
 
-The flags and tiers are **data**, in [../conformance/manifest.toml](../conformance/manifest.toml)
-(data over code, CLAUDE.md §5). Like every spec table the manifest is **test-time only** —
-the harness reads it; no shipped engine does.
+2. **Capabilities** — fine-grained features named with a dotted id (`types.int64`,
+   `cast.explicit`, `null.three_valued`). This is the **gating** axis:
+   - Each implementation **declares the set of capabilities it supports.**
+   - Each `.test` file **declares the capabilities it requires** via its `# requires:`
+     header (§1). Per-record `skipif`/`onlyif <capability>` gate individual records.
+   - A test runs for an implementation **iff** the impl supports every capability the
+     test requires. That is the whole gate — no test runs against an engine that hasn't
+     declared it can handle it, so an incomplete engine reads as "fewer tests run," never
+     as "suite broken."
 
-Current tiers:
+3. **Profiles** — named, cumulative **bundles of capabilities** = conformance *levels* an
+   implementation targets. `includes` inherits another profile's capabilities, so they
+   stack. An implementation **meets** a profile iff its declared capability set is a
+   superset of the profile's (transitive) capabilities. Profiles are how we ask "is this
+   engine at `core` yet?" without enumerating capabilities by hand.
 
-| Tier | Scope | Maps to |
+Capabilities and profiles are **data**, in
+[../conformance/manifest.toml](../conformance/manifest.toml) (data over code, CLAUDE.md §5);
+suites are the filesystem. All three are **test-time only** — the harness reads them; no
+shipped engine does. `rake verify` runs [../conformance/verify.rb](../conformance/verify.rb),
+which checks the taxonomy is internally coherent: every required/profiled capability is
+defined, profile `includes` form no cycles, every `.test` has exactly one `# requires:`
+line, and no capability is defined but unused.
+
+Current profiles:
+
+| Profile | Adds | Maps to |
 |---|---|---|
-| `tier1_core` | CREATE TABLE (+PK) / INSERT / SELECT / `WHERE pk =` / `ORDER BY` / `IS [NOT] NULL` / 3-valued NULL / insert overflow trap, integers only. | The CLAUDE.md §11 step-5 "it's alive" milestone. |
-| `tier2_casts` | Explicit `CAST` narrowing (fits, and traps `22003` when it doesn't). Extends `tier1_core`. | [../types/casts.toml](../types/casts.toml). |
-| `tier3_comparison` | Cross-type integer comparison via the promotion tower (`<`, `>`, `=`). Extends `tier1_core`. | [../types/compare.toml](../types/compare.toml). |
+| `core` | CREATE TABLE (+PK) / INSERT / SELECT / `WHERE pk =` / `ORDER BY` / `IS [NOT] NULL` / 3-valued NULL / insert overflow trap, integers only. | The CLAUDE.md §11 step-5 "it's alive" milestone. |
+| `casts` | `core` + explicit `CAST` narrowing (fits, and traps `22003` when it doesn't). | [../types/casts.toml](../types/casts.toml). |
+| `comparison` | `core` + cross-type integer comparison via the promotion tower (`<`, `>`, `=`). | [../types/compare.toml](../types/compare.toml). |
 
 ## 4. Determinism rules
 
@@ -109,13 +134,13 @@ Every corpus entry MUST obey:
 - **One canonical name, one code.** Types print under their canonical id; each error
   condition has exactly one SQLSTATE.
 - **No nondeterminism.** No wall-clock, no random, no hashmap-order leakage.
-- **No floats.** Tiers 1–3 are integer-only, so the float-formatting divergence
+- **No floats.** The corpus is integer-only, so the float-formatting divergence
   (CLAUDE.md §8) cannot arise.
 
 ## 5. Bootstrapping policy
 
-- Tiers 1–3 are **hand-authored.** Integer semantics are small and fully known, so the
-  expected output is written directly and reviewed as the contract.
+- The current corpus is **hand-authored.** Integer semantics are small and fully known, so
+  the expected output is written directly and reviewed as the contract.
 - **Differential bootstrapping** against PostgreSQL/SQLite oracles (CLAUDE.md §7) is
   deferred and optional. When used, where our semantics intentionally diverge from the
   oracle we override the expected output by hand and document why.
@@ -125,11 +150,12 @@ Every corpus entry MUST obey:
 
 ## 6. Running the corpus
 
-No engine exists yet — `impl/rust` and `impl/go` are stubs until CLAUDE.md §11 step 5. At
-that point each implementation ships a **thin harness** that: reads the manifest, filters
-tiers to the flags it declares, executes each record, and compares output under the rules
-above. Until then the corpus is authored and reviewed as the standing contract the first
-slice must satisfy.
+Each implementation ships a **thin harness** that: reads the manifest, determines the
+capabilities the implementation declares, runs every `.test` file whose `# requires:`
+capabilities are all satisfied (skipping the rest), executes each record, and compares
+output under the rules above. Reporting a profile = checking that every test gated by that
+profile's capabilities passes. Harnesses arrive with the first vertical slice
+(CLAUDE.md §11 step 5).
 
 ## 7. Open / deferred
 
@@ -141,4 +167,4 @@ slice must satisfy.
   result depends on it (implicit widening from a literal). Resolve in the type spec, then
   add coverage. This is an ambiguity the spec-first process surfaced; flag, don't guess.
 - **Boolean results / connectives** — `AND`/`OR`/`NOT` over predicates arrive with the
-  `boolean` type (deferred, CLAUDE.md §4). Tiers 1–3 use single predicates only.
+  `boolean` type (deferred, CLAUDE.md §4). The corpus uses single predicates only.

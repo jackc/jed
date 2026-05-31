@@ -1,87 +1,95 @@
 # Conformance manifest — CANONICAL DATA (CLAUDE.md §5, §7).
 #
-# Defines the capability flags an implementation may declare, and the corpus tiers
-# (each requiring a set of flags). The harness reads this to filter the corpus to the
-# flags a given implementation supports. TEST-TIME ONLY — no shipped engine reads it.
-# Reasoning lives in ../design/conformance.md — read it before editing this file.
+# The conformance taxonomy has THREE independent axes (see ../design/conformance.md):
+#   1. suites/      — the directory tree; ORGANIZES tests by feature area.
+#   2. capabilities — fine-grained features an implementation declares it supports.
+#                     Each .test file declares the capabilities it needs via an
+#                     in-band `# requires:` header line; a test runs for an impl iff
+#                     the impl supports every capability the test requires.
+#   3. profiles     — named, cumulative bundles of capabilities = the conformance
+#                     LEVELS an implementation targets ("does impl X meet `core`?").
+#
+# This file defines axes 2 and 3 (axis 1 is the filesystem). TEST-TIME ONLY — the
+# harness reads it; no shipped engine does. Validated by `rake verify`.
 
 schema_version = 1
 
-# --- capability flags --------------------------------------------------------
-# One feature an implementation may support. An implementation declares the set it
-# supports; a tier runs only if all its required flags (transitively, via `extends`)
-# are declared. Add a flag only when a corpus entry actually exercises it (no silent
-# unused capabilities).
+# --- capabilities ------------------------------------------------------------
+# One feature an implementation may support, named with a dotted id. Add a
+# capability only when some .test file actually requires it (the checker rejects
+# orphans). Implementations declare the set they support; tests declare the set
+# they require.
 
-[[flag]]
+[[capability]]
 id = "ddl.create_table"
 description = "CREATE TABLE with typed columns"
 
-[[flag]]
+[[capability]]
 id = "ddl.primary_key"
 description = "PRIMARY KEY column constraint (enables point lookup by key)"
 
-[[flag]]
+[[capability]]
 id = "dml.insert"
 description = "INSERT ... VALUES"
 
-[[flag]]
+[[capability]]
 id = "query.select"
 description = "SELECT of columns from a single table"
 
-[[flag]]
+[[capability]]
 id = "query.where_eq"
-description = "WHERE with an equality predicate ( = , <> )"
+description = "WHERE with an equality predicate ( = )"
 
-[[flag]]
+[[capability]]
 id = "query.comparison_order"
 description = "WHERE with an ordering predicate ( < , > , <= , >= )"
 
-[[flag]]
+[[capability]]
 id = "query.is_null"
 description = "IS NULL / IS NOT NULL predicates"
 
-[[flag]]
+[[capability]]
 id = "query.order_by"
 description = "ORDER BY for deterministic multi-row output"
 
-[[flag]]
+[[capability]]
 id = "types.int16"
 description = "int16 / smallint scalar type"
 
-[[flag]]
+[[capability]]
 id = "types.int32"
 description = "int32 / int / integer scalar type"
 
-[[flag]]
+[[capability]]
 id = "types.int64"
 description = "int64 / bigint scalar type"
 
-[[flag]]
+[[capability]]
 id = "null.three_valued"
 description = "Three-valued NULL logic in comparisons (CLAUDE.md §4)"
 
-[[flag]]
+[[capability]]
 id = "error.overflow_trap"
 description = "Integer overflow traps with SQLSTATE 22003 (CLAUDE.md §8)"
 
-[[flag]]
+[[capability]]
 id = "cast.explicit"
 description = "Explicit CAST(x AS type), including narrowing that may trap"
 
-[[flag]]
+[[capability]]
 id = "compare.promotion"
 description = "Cross-type integer comparison via the promotion tower (int16<int32<int64)"
 
-# --- tiers -------------------------------------------------------------------
-# A tier groups corpus files under `dir`. `requires` lists the flags it needs;
-# `extends` (optional) inherits another tier's requirements transitively.
+# --- profiles ----------------------------------------------------------------
+# A named bundle of capabilities = a conformance level. `includes` (optional)
+# inherits another profile's capabilities transitively, so profiles are cumulative.
+# An implementation "meets" a profile iff its declared capability set is a superset
+# of the profile's (transitive) capabilities.
 
-[[tier]]
-id = "tier1_core"
-title = "Core integer DDL/DML/SELECT — the \"it's alive\" milestone (CLAUDE.md §11 step 5)"
-dir = "tier1_core"
-requires = [
+[[profile]]
+id = "core"
+title = "The \"it's alive\" milestone — integer DDL/DML/SELECT (CLAUDE.md §11 step 5)"
+capabilities = [
   "ddl.create_table",
   "ddl.primary_key",
   "dml.insert",
@@ -96,16 +104,14 @@ requires = [
   "error.overflow_trap",
 ]
 
-[[tier]]
-id = "tier2_casts"
-title = "Explicit CAST narrowing and overflow"
-dir = "tier2_casts"
-extends = "tier1_core"
-requires = ["cast.explicit"]
+[[profile]]
+id = "casts"
+title = "core + explicit CAST narrowing (spec/types/casts.toml)"
+includes = "core"
+capabilities = ["cast.explicit"]
 
-[[tier]]
-id = "tier3_comparison"
-title = "Cross-type comparison via the promotion tower"
-dir = "tier3_comparison"
-extends = "tier1_core"
-requires = ["query.comparison_order", "compare.promotion"]
+[[profile]]
+id = "comparison"
+title = "core + cross-type comparison via the promotion tower (spec/types/compare.toml)"
+includes = "core"
+capabilities = ["query.comparison_order", "compare.promotion"]

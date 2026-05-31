@@ -1,7 +1,8 @@
-# tier3_comparison — cross-type integer comparison via the promotion tower
+# Cross-type integer comparison via the promotion tower
 # (spec/types/compare.toml: int16 < int32 < int64). When two integer types meet,
 # both promote to the higher-ranked type and compare there; widening is lossless.
-# Format: ../../design/conformance.md.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.comparison_order, query.order_by, types.int16, types.int32, types.int64, compare.promotion
 
 statement ok
 CREATE TABLE pairs (id int32 PRIMARY KEY, a int16, b int32, c int64)

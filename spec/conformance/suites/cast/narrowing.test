@@ -1,6 +1,8 @@
-# tier2_casts — explicit CAST narrowing (spec/types/casts.toml).
+# Explicit CAST narrowing (spec/types/casts.toml).
 # Narrowing is lossy in general: it requires an explicit CAST and traps (22003)
-# when the value does not fit. Format: ../../design/conformance.md.
+# when the value does not fit.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.int16, types.int32, types.int64, cast.explicit, error.overflow_trap
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, b int64)

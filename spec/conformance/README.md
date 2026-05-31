@@ -3,7 +3,7 @@
 This is the spine of the project (CLAUDE.md §7). A feature is implemented as "make these
 corpus entries pass"; the corpus *is* the contract, not an afterthought.
 
-**The format, error-matching, tier/flag system, and determinism rules are specified in
+**The format, error-matching, three-axis taxonomy, and determinism rules are specified in
 [../design/conformance.md](../design/conformance.md). Read that first.**
 
 - **Format: sqllogictest-style** — plain-text, declarative (`statement ok`,
@@ -14,21 +14,27 @@ corpus entries pass"; the corpus *is* the contract, not an afterthought.
   SQLSTATE code (from [../errors/registry.toml](../errors/registry.toml)), never on prose.
 - **Bootstrap via differential testing** — hand-authored for now; PostgreSQL/SQLite oracles
   are a deferred, user-initiated option (never auto-run — CLAUDE.md §12).
-- **Tier the corpus** — each implementation declares the capability flags it supports; a
-  tier runs only if all its required flags are present, so one core can run ahead of another
-  without the whole suite reading as broken.
+- **Three-axis taxonomy** — **suites** (this directory tree) organize tests by feature
+  area; **capabilities** (dotted flags an impl declares + a test `# requires:`) gate which
+  tests run; **profiles** (named capability bundles) are the conformance levels an impl
+  targets. A test runs for an impl iff the impl declares every capability the test requires,
+  so one core can run ahead of another without the suite reading as broken.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| [manifest.toml](manifest.toml) | Capability flags + tier definitions (data). |
-| [tier1_core/](tier1_core/) | CREATE/INSERT/SELECT/`WHERE pk =`/`ORDER BY`/NULL/overflow — the §11 step-5 milestone. |
-| [tier2_casts/](tier2_casts/) | Explicit `CAST` narrowing + overflow trap. |
-| [tier3_comparison/](tier3_comparison/) | Cross-type comparison via the promotion tower. |
+| [manifest.toml](manifest.toml) | Capability + profile definitions (data). |
+| [verify.rb](verify.rb) | Taxonomy checker (run via `rake verify`): validates manifest ↔ corpus coherence. |
+| [suites/query/](suites/query/) | CREATE/INSERT/SELECT/`WHERE pk =`/`ORDER BY`. |
+| [suites/null/](suites/null/) | NULL storage, `IS [NOT] NULL`, three-valued logic. |
+| [suites/types/](suites/types/) | Type behavior — integer overflow trap. |
+| [suites/cast/](suites/cast/) | Explicit `CAST` narrowing + overflow. |
+| [suites/compare/](suites/compare/) | Cross-type comparison via the promotion tower. |
 
 Each implementation under [../../impl/](../../impl/) ships a thin harness that reads the
-manifest, filters tiers to its declared flags, and runs this corpus. Harnesses arrive with
-the first vertical slice (CLAUDE.md §11 step 5).
+manifest, runs each `.test` whose `# requires:` capabilities it declares, and reports the
+profiles it meets. Harnesses arrive with the first vertical slice (CLAUDE.md §11 step 5).
 
-> Status: format + first three tiers authored (integers only). Harnesses land at step 5.
+> Status: format + taxonomy + integer corpus authored (5 suites; `core`/`casts`/`comparison`
+> profiles). Harnesses land at step 5.
