@@ -1,0 +1,5 @@
+# Local reference source checkouts (PostgreSQL, SQLite, DuckDB, etc.).
+# Provisioned on demand with `rake references:setup`; never committed.
+# See CLAUDE.md §12. The canonical mirrors live on the persist volume,
+# not here — these are git worktrees of those mirrors.
+/references/

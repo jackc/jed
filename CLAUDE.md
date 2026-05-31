@@ -284,3 +284,51 @@ The design is optimized for AI agents even more than for humans. In practice:
 
 Each step is independently testable and independently useful. There is deliberately no
 point where progress is blocked on one giant subsystem.
+
+---
+
+## 12. Local reference sources (uncommitted)
+
+Full source checkouts of other databases are kept locally for reading — as
+differential-testing **oracles** (§7) and as **design references** (§8). They are **not**
+committed (the workspace `references/` directory is in `.gitignore`).
+
+> **Do NOT provision the references automatically.** Cloning the mirrors is a multi-GB
+> download (PostgreSQL and DuckDB especially). Never run `rake references:setup` /
+> `references:update`, or any other large download, on your own initiative — not to
+> "be helpful", not as a side effect of another task. If a reference you need is not
+> present in `references/`, either **work without it** or **ask the user to run
+> `rake references:setup`** (or for permission to). The same rule applies to any
+> heavy/expensive operation: surface it and let the user decide, don't auto-trigger it.
+
+Provision or refresh them with Rake (§10):
+
+```
+rake references:setup    # clone mirrors (once) + check out worktrees into references/
+rake references:update   # fetch upstream, re-point worktrees
+rake references:status   # list repos, pinned ref, current HEAD
+rake references:clean    # remove worktrees, keep the cached mirrors
+```
+
+**Storage model.** A bare `--mirror` clone of each repo lives on the **persist volume**
+(`/persist/shared/references/<name>.git`, override with `REFERENCES_MIRROR_DIR`): full
+history, downloaded once, shared across every container, survives rebuilds. The browsable
+checkout in `references/<name>` is a **git worktree** of that mirror — it shares the
+object store (no re-download, no duplicated history) but has its own HEAD, so a container
+can check out a different branch/tag locally without disturbing the mirror or other
+containers. Provisioning a fresh container is a cheap `git worktree add`, not a re-clone.
+
+**What's checked out** (all free/OSS licenses):
+
+| Repo | Ref | License | Why it's here |
+|---|---|---|---|
+| `postgres` | `REL_18_STABLE` | PostgreSQL License | Semantic oracle (§1, §7); `numeric.c` is the exact-decimal reference (§8). Pinned to match the live `postgres:18` service in `.devcontainer/docker-compose.yml`. |
+| `sqlite` | `master` | Public Domain | The north star (§1); origin of the sqllogictest format (§7). |
+| `duckdb` | `main` | MIT | Embedded DB that also uses sqllogictest — closest living architecture reference (§7). |
+| `bbolt` | `main` | MIT | Single-file store whose single-writer / root-pointer-swap commit model matches §3 / §9. |
+| `sqllogictest-rs` | `main` | MIT / Apache-2.0 | Reference Rust sqllogictest runner — useful for `impl/rust`'s harness (§7). |
+
+PostgreSQL also runs **live** as the `db` service (a queryable oracle), separate from this
+source checkout. **CockroachDB** is deliberately **excluded** despite being cited in §7/§8:
+its core is BSL 1.1 (source-available, not OSI-free). For its key-encoding design, read it
+from `spec/encoding/` or an old Apache-2.0 tag rather than vendoring the BSL source.
