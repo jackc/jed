@@ -84,11 +84,14 @@ and `IS [NOT] DISTINCT FROM` (the latter arrives with the operator catalog). Thi
 PG model, borrowed because it is principled.
 
 **Value ordering & NULL position.** Non-NULL integers use plain signed numeric ascending
-order, which is exactly what the key encoding (§5) reproduces in raw bytes. Where NULL
-sorts in the *total* order (ORDER BY, index iteration) is deliberately **not yet fixed** —
-it is an encoding concern finalized with the key-encoding spec at CLAUDE.md §11 step 4. The
-provisional lean is NULLs-sort-lowest (a leading `0x00` presence tag ahead of any value);
-do not depend on it until step 4 ratifies it.
+order, which is exactly what the key encoding (§6) reproduces in raw bytes. NULL's position
+in the physical total order is now **ratified** (it was deferred to the key-encoding step):
+**NULLs sort first** (before every present value) in ascending order, via a leading `0x00`
+presence tag on a nullable key slot; descending inverts this (NULLs last). See
+[encoding.md §4](encoding.md) and `null_ordering` in
+[../types/compare.toml](../types/compare.toml). A SQL-level `ORDER BY ... NULLS
+FIRST|LAST` override is a separate, later feature that layers on top of this physical
+order.
 
 ## 5. Coercion / casts
 
@@ -138,11 +141,12 @@ byte-identity is the whole point.
 - ✅ Trap (deterministic error `22003`) instead of platform-dependent wraparound.
 - ✅ Promotion is total and order-independent (`max-rank`).
 - ✅ Value order == key byte order (no separate, possibly-divergent comparator).
-- ⏳ NULL's total-order position — deferred to step 4, flagged above.
+- ✅ NULL's physical total-order position — ratified NULLs-first (ascending), see §4.
 
 ## 8. Open / deferred
 
-- **NULL sort position** — finalize with the key-encoding spec (step 4).
+- **NULL sort position** — ✅ ratified NULLs-first (ascending) with the key-encoding spec
+  (§4, [encoding.md §4](encoding.md)). No longer open.
 - **Operator result types** — `int + int`, etc. live in [../functions/](../functions/),
   authored when the operator catalog lands (needed by the step-5 vertical slice).
 - **`assignment`-mode casts** — vocabulary reserved; first used by non-integer types.

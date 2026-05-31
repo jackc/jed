@@ -13,3 +13,7 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   three-valued NULL logic, integer overflow, and order-preserving key encoding.
 - [conformance.md](conformance.md) — the conformance corpus: sqllogictest-style format,
   structured-error matching, the tier + capability-flag system, and determinism rules.
+- [encoding.md](encoding.md) — order-preserving key encoding: the `int-be-signflip` rule,
+  the nullable presence tag (NULLs-first), composition, and descending order.
+- [storage.md](storage.md) — the storage seam: block interface, page model, and the
+  root-pointer-swap commit model (CLAUDE.md §3/§9).

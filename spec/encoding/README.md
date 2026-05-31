@@ -15,8 +15,23 @@ order is bitwise inversion of a component; composite keys are concatenation. (Co
 `encoding` package is the reference design.)
 
 The per-type encoding rule is recorded as a field on each type in
-[../types/scalars.toml](../types/scalars.toml); the reasoning is in
-[../design/types.md](../design/types.md).
+[../types/scalars.toml](../types/scalars.toml). **The reasoning — bare encoding, the
+nullable presence tag, composition, and the NULLs-first decision — is in
+[../design/encoding.md](../design/encoding.md). Read that first.**
 
-> Status: rule defined; the `(value → bytes)` fixtures are produced at CLAUDE.md §11
-> step 4.
+## Files
+
+| File | Contents |
+|---|---|
+| [integers.toml](integers.toml) | Byte-exact `(value → bytes)` vectors: `int16`/`int32`/`int64` bare values, the nullable presence-tag slot, and the descending (inverted) encoding. |
+| [verify.py](verify.py) | Independent reference encoder that checks every vector for round-trip, byte-exactness, and order preservation. Run `python3 spec/encoding/verify.py` (test-time only). |
+
+## NULL ordering (ratified here)
+
+A nullable key slot carries a 1-byte presence tag (`0x00` NULL, `0x01` present), so **NULLs
+sort first** in ascending order (descending inverts → NULLs last). This ratifies the NULL
+sort-position decision that [../types/compare.toml](../types/compare.toml) deferred to this
+step (`null_ordering = "nulls-first-ascending"`).
+
+> Status: rule defined and fixtures authored + verified (26 vectors). Composite-key and
+> non-integer (decimal/text/bytea) vectors follow when those features land.

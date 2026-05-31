@@ -29,6 +29,8 @@ impl/        native cores, one per language (Rust first, then Go), each a downst
 3. ✅ **Conformance harness format + first corpus tier** — sqllogictest-style format,
    tier/capability-flag system, integer corpus (tiers 1–3). See
    [spec/conformance/](spec/conformance/) and [spec/design/conformance.md](spec/design/conformance.md).
-4. ⬜ Storage seam + key-encoding fixtures.
+4. ✅ **Storage seam + key-encoding fixtures** — the block-device seam + root-swap commit
+   model ([spec/design/storage.md](spec/design/storage.md)); byte-exact integer key-encoding
+   vectors ([spec/encoding/](spec/encoding/)). On-disk byte *format* is authored with step 5.
 5. ⬜ First vertical slice (`CREATE TABLE` / `INSERT` / `SELECT ... WHERE pk = $1`,
    integer columns only) through both the Rust and Go cores.

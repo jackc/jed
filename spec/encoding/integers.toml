@@ -1,0 +1,81 @@
+# Key-encoding fixtures — CANONICAL DATA (CLAUDE.md §8).
+#
+# Byte-exact (value -> bytes) vectors for the order-preserving key encoding.
+# An implementation's encoder is conformant iff, for every vector below:
+#   1. round-trip      decode(encode(v)) == v
+#   2. byte-exactness  encode(v) == bytes
+#   3. order           within a group (listed in ascending logical order), the
+#                      byte strings are strictly increasing under memcmp
+# Reasoning + the encoding rules live in ../design/encoding.md.
+# Test-time only; bytes are lowercase hex, no 0x prefix, no separators.
+
+schema_version = 1
+
+# Method `int-be-signflip` (../types/scalars.toml): fixed-width big-endian, sign
+# bit inverted (== add bias 2^(bits-1), emit unsigned big-endian). Each group is
+# in ascending logical order so invariant (3) is a walk of the list.
+
+# --- int16 (width 2) ---------------------------------------------------------
+[[bare]]
+type = "int16"
+cases = [
+  { value = -32768, bytes = "0000" },  # MIN
+  { value = -256,   bytes = "7f00" },
+  { value = -1,     bytes = "7fff" },
+  { value = 0,      bytes = "8000" },
+  { value = 1,      bytes = "8001" },
+  { value = 100,    bytes = "8064" },
+  { value = 256,    bytes = "8100" },
+  { value = 32767,  bytes = "ffff" },  # MAX
+]
+
+# --- int32 (width 4) ---------------------------------------------------------
+[[bare]]
+type = "int32"
+cases = [
+  { value = -2147483648, bytes = "00000000" },  # MIN
+  { value = -1,          bytes = "7fffffff" },
+  { value = 0,           bytes = "80000000" },
+  { value = 1,           bytes = "80000001" },
+  { value = 100,         bytes = "80000064" },
+  { value = 32768,       bytes = "80008000" },
+  { value = 2000000000,  bytes = "f7359400" },
+  { value = 2147483647,  bytes = "ffffffff" },  # MAX
+]
+
+# --- int64 (width 8) ---------------------------------------------------------
+[[bare]]
+type = "int64"
+cases = [
+  { value = -9223372036854775808, bytes = "0000000000000000" },  # MIN
+  { value = -1,                   bytes = "7fffffffffffffff" },
+  { value = 0,                    bytes = "8000000000000000" },
+  { value = 1,                    bytes = "8000000000000001" },
+  { value = 10000000000,          bytes = "80000002540be400" },
+  { value = 9223372036854775807,  bytes = "ffffffffffffffff" },  # MAX
+]
+
+# --- nullable slot: 1-byte presence tag (0x00 NULL, 0x01 present) + value -----
+# NULL sorts before every present value (../design/encoding.md §4). `null = true`
+# marks the NULL case (TOML has no typed null); present cases carry `value`.
+[[nullable]]
+type = "int16"
+cases = [
+  { null = true,         bytes = "00"     },  # NULL sorts first
+  { value = -1,          bytes = "017fff" },
+  { value = 0,           bytes = "018000" },
+  { value = 1,           bytes = "018001" },
+]
+
+# --- descending: bitwise inversion (one's complement) of the ascending nullable
+# encoding, tag byte included. Order reverses; NULL lands LAST. Listed in
+# ascending byte order (= descending logical order) so invariant (3) still holds.
+[[descending]]
+type = "int16"
+base = "nullable"
+cases = [
+  { value = 1,    bytes = "fe7ffe" },
+  { value = 0,    bytes = "fe7fff" },
+  { value = -1,   bytes = "fe8000" },
+  { null = true,  bytes = "ff"     },  # NULL sorts last under descending
+]

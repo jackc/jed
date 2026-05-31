@@ -10,4 +10,11 @@ the in-memory representation is first-class, and on-disk layout/block size are c
 SSD characteristics. Writes batch in a private staging area and land at commit (CLAUDE.md
 §3).
 
-> Status: empty. Specified at CLAUDE.md §11 step 4 (storage seam) and exercised by step 5.
+The **storage architecture** — the block-device seam, the page model, and the
+root-pointer-swap commit model that carries CLAUDE.md §3 — is designed in
+[../design/storage.md](../design/storage.md). *This* directory holds the concrete **byte
+format** that realizes it.
+
+> Status: model designed ([../design/storage.md](../design/storage.md)); the byte-exact
+> format + fixtures (meta page, page layout, free list, cross-core round-trip) are authored
+> at CLAUDE.md §11 step 5, when the first slice persists.
