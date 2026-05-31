@@ -1,0 +1,21 @@
+# Error-code registry — CANONICAL DATA (CLAUDE.md §5, §10).
+#
+# Errors are structured data, not free text, so `statement error <pattern>` matching
+# in the conformance corpus is stable across every implementation.
+# Build-time input to per-language codegen; never parsed at runtime.
+#
+# code      stable SQLSTATE (5-char class+subclass). The machine-legible identity.
+# name      stable snake_case symbolic name.
+# class     human label for the SQLSTATE class.
+# template  message template; {placeholders} are filled by the engine. Message TEXT
+#           is informational — matching is on `code`/`name`, never on prose.
+#
+# Seeded with only the code the integer type semantics require. Grows per subsystem.
+
+schema_version = 1
+
+[[error]]
+code = "22003"
+name = "numeric_value_out_of_range"
+class = "data exception"
+template = "value out of range for type {type}"

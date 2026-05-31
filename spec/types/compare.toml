@@ -1,0 +1,48 @@
+# Comparison, promotion, and NULL logic — CANONICAL DATA (CLAUDE.md §4, §5).
+#
+# Build-time input to per-language codegen; never parsed at runtime.
+# Reasoning lives in ../design/types.md — read it before editing this file.
+#
+# This file governs *comparison* (=, <, >, ORDER BY, index order). Operator
+# RESULT types (e.g. the type of `int32 + int32`) belong to ../functions/, not here.
+
+schema_version = 1
+
+# --- promotion tower ---------------------------------------------------------
+# When two values of the same family meet, both promote to a common type before
+# comparison. For the integer family the common type is the operand with the
+# higher `rank` in scalars.toml (widening is always lossless). int16 < int32 < int64.
+[[promotion]]
+family = "integer"
+strategy = "max-rank"
+
+# --- comparability -----------------------------------------------------------
+# Which (family, family) pairs may be compared at all. Anything not listed is a
+# type error. Step 1 has exactly one family, so there is one rule. Cross-family
+# rules are added as new families (decimal, text, ...) arrive.
+[[comparable]]
+left_family = "integer"
+right_family = "integer"
+via = "promote"          # promote both to the common type, then compare as integers
+
+# --- value ordering ----------------------------------------------------------
+# The total order over non-NULL integers used by ORDER BY and by index/key
+# iteration. Plain signed numeric order; matches the order-preserving key
+# encoding in scalars.toml (CLAUDE.md §8) so stored byte order == logical order.
+[ordering]
+integer = "numeric-ascending"
+
+# NULL's position in the total order (ORDER BY, index iteration) is intentionally
+# NOT fixed here. It is finalized with the key-encoding spec (CLAUDE.md §11 step
+# 4), since it is an encoding concern. Provisional lean: NULLs sort lowest
+# (encoded with a leading 0x00 tag, ahead of any present value). Do not depend on
+# this until step 4 ratifies it.
+
+# --- NULL logic --------------------------------------------------------------
+# Three-valued logic (CLAUDE.md §4). Any comparison with a NULL operand yields
+# UNKNOWN (represented as NULL), never TRUE or FALSE. Equality is NOT reflexive
+# for NULL: NULL = NULL is UNKNOWN. `IS [NOT] NULL` and `IS [NOT] DISTINCT FROM`
+# (added with the operator catalog) are the only ways to test for NULL.
+[null]
+logic = "three-valued"
+comparison_with_null = "unknown"

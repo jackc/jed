@@ -1,0 +1,55 @@
+# Coercion / cast matrix — CANONICAL DATA (CLAUDE.md §4, §5).
+#
+# Build-time input to per-language codegen; never parsed at runtime.
+# Reasoning lives in ../design/types.md — read it before editing this file.
+#
+# STRICT by default: any (from, to) pair not listed here is FORBIDDEN — values are
+# never silently reinterpreted (CLAUDE.md §4). Identity casts (int16->int16, ...) are
+# implicit and always succeed; they are implied and not listed.
+#
+# mode:
+#   implicit    inserted automatically anywhere a value of `to` is wanted (safe, lossless)
+#   assignment  inserted on INSERT/UPDATE into a column of `to` (safe, lossless)
+#   explicit    only via an explicit CAST(...) ; may fail at runtime
+# on_overflow:
+#   trap        raise the named error when the value does not fit `to` (CLAUDE.md §8)
+
+schema_version = 1
+
+# --- widening: lossless, allowed implicitly ----------------------------------
+[[cast]]
+from = "int16"
+to = "int32"
+mode = "implicit"
+
+[[cast]]
+from = "int16"
+to = "int64"
+mode = "implicit"
+
+[[cast]]
+from = "int32"
+to = "int64"
+mode = "implicit"
+
+# --- narrowing: lossy, explicit CAST only, traps on overflow ------------------
+[[cast]]
+from = "int32"
+to = "int16"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "int64"
+to = "int16"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "int64"
+to = "int32"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"

@@ -1,0 +1,68 @@
+# Scalar type definitions — CANONICAL DATA (CLAUDE.md §4, §5).
+#
+# Build-time input to per-language codegen; never parsed at runtime.
+# Reasoning lives in ../design/types.md — read it before editing this file.
+#
+# Step-1 scope: signed integers only. Every other scalar is deferred (CLAUDE.md §4).
+
+schema_version = 1
+
+# --- conventions -------------------------------------------------------------
+# id            canonical name. ALL aliases normalize to this. It is the single
+#               name that appears in error messages, the catalog, and conformance
+#               `query` column-type tags (determinism: one name per type). Names
+#               state the width in BITS (int16/int32/int64), the convention common
+#               in programming languages.
+# aliases       additional SQL spellings accepted on input (the SQL-standard names).
+# family        types in the same family share comparison/promotion rules.
+# signed        two's-complement signed integer.
+# bits          storage width in bits.
+# min / max     inclusive value range.
+# overflow      what happens when an operation would exceed the range: "trap"
+#               raises `overflow_error`; values are never silently wrapped
+#               (CLAUDE.md §8 — strict typing forbids silent reinterpretation).
+# encoding      order-preserving key encoding (CLAUDE.md §8). method
+#               "int-be-signflip" = fixed-width big-endian with the sign bit
+#               inverted; sorts byte-for-byte identically to logical order.
+# rank          position in the integer promotion tower; the common type of two
+#               integers is the one with the higher rank (see compare.toml).
+# -----------------------------------------------------------------------------
+
+[[type]]
+id = "int16"
+aliases = ["smallint"]
+family = "integer"
+signed = true
+bits = 16
+min = -32768
+max = 32767
+overflow = "trap"
+overflow_error = "22003"
+encoding = { method = "int-be-signflip", width_bytes = 2 }
+rank = 1
+
+[[type]]
+id = "int32"
+aliases = ["int", "integer"]
+family = "integer"
+signed = true
+bits = 32
+min = -2147483648
+max = 2147483647
+overflow = "trap"
+overflow_error = "22003"
+encoding = { method = "int-be-signflip", width_bytes = 4 }
+rank = 2
+
+[[type]]
+id = "int64"
+aliases = ["bigint"]
+family = "integer"
+signed = true
+bits = 64
+min = -9223372036854775808
+max = 9223372036854775807
+overflow = "trap"
+overflow_error = "22003"
+encoding = { method = "int-be-signflip", width_bytes = 8 }
+rank = 3

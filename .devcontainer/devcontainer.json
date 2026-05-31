@@ -1,0 +1,50 @@
+{
+  "name": "${localWorkspaceFolderBasename}",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/abide",
+
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/persist/shared/claude",
+    "ATUIN_CONFIG_DIR":  "/persist/shared/atuin/config",
+    "ATUIN_DATA_DIR":    "/persist/shared/atuin/data",
+    "GOPATH":            "/persist/shared/go",
+    "MISE_DATA_DIR":     "/persist/shared/mise/data",
+    "MISE_CACHE_DIR":    "/persist/shared/mise/cache",
+    "PSQL_HISTORY":      "/persist/shared/psql/history",
+    "PGSERVICEFILE":     "/persist/shared/psql/.pg_service.conf",
+    "PGPASSFILE":        "/persist/shared/psql/.pgpass"
+  },
+
+  // Features to add to the dev container. More info: https://containers.dev/features.
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": true
+    },
+    "ghcr.io/devcontainers-extra/features/mise:1": {},
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
+
+  "initializeCommand": "docker volume create devstate-shared-abide >/dev/null",
+
+  "onCreateCommand": ".devcontainer/on-create.bash",
+
+  // Use 'postCreateCommand' to run commands after the container is created.
+  "postCreateCommand": ".devcontainer/post-create.bash",
+  // Configure tool-specific properties.
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "hverlin.mise-vscode",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  },
+
+  "waitFor": "postCreateCommand"
+
+  // Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+  // "remoteUser": "root"
+}
