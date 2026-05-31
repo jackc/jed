@@ -44,7 +44,13 @@ func (p *Parser) parseStatement() (Statement, error) {
 			return Statement{}, err
 		}
 		return Statement{CreateTable: ct}, nil
-	case "insert", "select":
+	case "insert":
+		ins, err := p.parseInsert()
+		if err != nil {
+			return Statement{}, err
+		}
+		return Statement{Insert: ins}, nil
+	case "select":
 		return Statement{}, NewError(FeatureNotSupported,
 			"SQL statement parsing is not implemented yet (step-5 Phase A scaffold)")
 	case "":
@@ -112,6 +118,61 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		primaryKey = true
 	}
 	return ColumnDef{Name: name, TypeName: typeName, PrimaryKey: primaryKey}, nil
+}
+
+// parseInsert parses `INSERT INTO <table> VALUES ( <literal> [, <literal>]* )`.
+// Values map positionally to columns; the executor type-checks against the catalog.
+func (p *Parser) parseInsert() (*Insert, error) {
+	if err := p.expectKeyword("insert"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("into"); err != nil {
+		return nil, err
+	}
+	table, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("values"); err != nil {
+		return nil, err
+	}
+	if err := p.expect(TokLParen); err != nil {
+		return nil, err
+	}
+
+	var values []Literal
+	for {
+		lit, err := p.parseLiteral()
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, lit)
+		switch p.advance().Kind {
+		case TokComma:
+			continue
+		case TokRParen:
+		default:
+			return nil, NewError(SyntaxError, "expected ',' or ')'")
+		}
+		break
+	}
+	if len(values) == 0 {
+		return nil, NewError(SyntaxError, "VALUES must have at least one value")
+	}
+	return &Insert{Table: table, Values: values}, nil
+}
+
+// parseLiteral parses an integer literal or the keyword NULL.
+func (p *Parser) parseLiteral() (Literal, error) {
+	t := p.advance()
+	switch {
+	case t.Kind == TokInt:
+		return Literal{Kind: LiteralInt, Int: t.Int}, nil
+	case t.Kind == TokWord && toLowerASCII(t.Word) == "null":
+		return Literal{Kind: LiteralNull}, nil
+	default:
+		return Literal{}, NewError(SyntaxError, "expected a literal value")
+	}
 }
 
 // peek returns the current token without consuming it.

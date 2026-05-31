@@ -1,6 +1,9 @@
 package abide
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // Statement executor (CLAUDE.md §10).
 //
@@ -58,7 +61,9 @@ func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
 	switch {
 	case stmt.CreateTable != nil:
 		return db.executeCreateTable(stmt.CreateTable)
-	case stmt.Insert != nil, stmt.Select != nil:
+	case stmt.Insert != nil:
+		return db.executeInsert(stmt.Insert)
+	case stmt.Select != nil:
 		return Outcome{}, NewError(FeatureNotSupported,
 			"statement execution is not implemented yet (step-5 Phase A scaffold)")
 	default:
@@ -103,4 +108,66 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 
 	db.putTable(&Table{Name: ct.Name, Columns: columns})
 	return Outcome{Kind: OutcomeStatement}, nil
+}
+
+// executeInsert analyzes and runs an INSERT: map the literal values positionally to
+// columns, type-check each (NULL into NOT NULL traps 23502; an integer outside the
+// column type's range traps 22003 — CLAUDE.md §8), then store the row keyed by its
+// encoded primary key (duplicate key traps 23505).
+func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
+	table, ok := db.Table(ins.Table)
+	if !ok {
+		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ins.Table)
+	}
+	if len(ins.Values) != len(table.Columns) {
+		return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
+			"INSERT has %d values but table %s has %d columns",
+			len(ins.Values), table.Name, len(table.Columns),
+		))
+	}
+
+	row := make(Row, len(table.Columns))
+	for i, col := range table.Columns {
+		lit := ins.Values[i]
+		switch lit.Kind {
+		case LiteralNull:
+			if col.NotNull {
+				return Outcome{}, NewError(NotNullViolation,
+					"null value in column "+col.Name+" violates not-null constraint")
+			}
+			row[i] = NullValue()
+		case LiteralInt:
+			if !col.Type.InRange(lit.Int) {
+				return Outcome{}, NewError(NumericValueOutOfRange,
+					"value out of range for type "+col.Type.CanonicalName())
+			}
+			row[i] = IntValue(lit.Int)
+		}
+	}
+
+	// The storage key is the encoded primary key, or — for a table without one — a
+	// synthetic insertion-order rowid (rows are append-only in step-1).
+	store := db.stores[strings.ToLower(ins.Table)]
+	var key []byte
+	if pk := table.PrimaryKeyIndex(); pk >= 0 {
+		key = EncodeInt(table.Columns[pk].Type, row[pk].Int)
+	} else {
+		key = EncodeInt(Int64, int64(store.Len()))
+	}
+
+	if !store.Insert(key, row) {
+		return Outcome{}, NewError(UniqueViolation,
+			"duplicate key value violates primary key uniqueness")
+	}
+	return Outcome{Kind: OutcomeStatement}, nil
+}
+
+// RowsInKeyOrder returns a table's rows in primary-key (encoded byte) order, or nil
+// if the table does not exist. Used by SELECT and by tests.
+func (db *Database) RowsInKeyOrder(name string) []Row {
+	store, ok := db.stores[strings.ToLower(name)]
+	if !ok {
+		return nil
+	}
+	return store.IterInKeyOrder()
 }

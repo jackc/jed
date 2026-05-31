@@ -63,6 +63,8 @@ fn error_codes_are_registered() {
     // Every SQLSTATE the core can raise must exist in the registry.
     for st in [
         SqlState::NumericValueOutOfRange,
+        SqlState::NotNullViolation,
+        SqlState::UniqueViolation,
         SqlState::SyntaxError,
         SqlState::UndefinedTable,
         SqlState::UndefinedColumn,

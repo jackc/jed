@@ -12,6 +12,10 @@ use std::fmt;
 pub enum SqlState {
     /// 22003 — numeric value out of range (integer overflow; CLAUDE.md §8).
     NumericValueOutOfRange,
+    /// 23502 — not-null constraint violation.
+    NotNullViolation,
+    /// 23505 — unique (primary key) constraint violation.
+    UniqueViolation,
     /// 42601 — syntax error.
     SyntaxError,
     /// 42P01 — undefined table.
@@ -36,6 +40,8 @@ impl SqlState {
     pub fn code(self) -> &'static str {
         match self {
             SqlState::NumericValueOutOfRange => "22003",
+            SqlState::NotNullViolation => "23502",
+            SqlState::UniqueViolation => "23505",
             SqlState::SyntaxError => "42601",
             SqlState::UndefinedTable => "42P01",
             SqlState::UndefinedColumn => "42703",

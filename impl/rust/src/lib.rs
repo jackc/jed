@@ -38,6 +38,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Phase B — CREATE TABLE with typed columns + single-column PRIMARY KEY.
     "ddl.create_table",
     "ddl.primary_key",
+    // Phase C — INSERT ... VALUES with positional type-checking + overflow trap.
+    "dml.insert",
+    "error.overflow_trap",
 ];
 
 /// Parse and execute one SQL statement against `db`.

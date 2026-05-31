@@ -24,6 +24,19 @@ name = "numeric_value_out_of_range"
 class = "data exception"
 template = "value out of range for type {type}"
 
+# --- integrity constraint violation (class 23) ------------------------------
+[[error]]
+code = "23502"
+name = "not_null_violation"
+class = "integrity constraint violation"
+template = "null value in column {name} violates not-null constraint"
+
+[[error]]
+code = "23505"
+name = "unique_violation"
+class = "integrity constraint violation"
+template = "duplicate key value violates primary key uniqueness"
+
 # --- syntax error / access rule violation (class 42) ------------------------
 [[error]]
 code = "42601"

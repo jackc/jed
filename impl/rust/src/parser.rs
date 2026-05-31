@@ -4,7 +4,7 @@
 //! production is implemented it returns a structured `0A000` feature-not-supported
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
-use crate::ast::{ColumnDef, CreateTable, Statement};
+use crate::ast::{ColumnDef, CreateTable, Insert, Literal, Statement};
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
 use crate::token::Token;
@@ -29,10 +29,11 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Statement> {
-        // Dispatch on the leading keyword. Remaining productions land in Phases C–E.
+        // Dispatch on the leading keyword. Remaining productions land in Phases D–E.
         match self.peek_keyword().as_deref() {
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
-            Some("insert") | Some("select") => Err(not_supported(
+            Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
+            Some("select") => Err(not_supported(
                 "SQL statement parsing is not implemented yet (step-5 Phase A scaffold)",
             )),
             Some(other) => Err(syntax(format!("unexpected keyword '{other}'"))),
@@ -80,6 +81,39 @@ impl Parser {
             type_name,
             primary_key,
         })
+    }
+
+    /// `INSERT INTO <table> VALUES ( <literal> [, <literal>]* )`. Values map
+    /// positionally to columns; the executor type-checks against the catalog.
+    fn parse_insert(&mut self) -> Result<Insert> {
+        self.expect_keyword("insert")?;
+        self.expect_keyword("into")?;
+        let table = self.expect_identifier()?;
+        self.expect_keyword("values")?;
+        self.expect(&Token::LParen)?;
+
+        let mut values = Vec::new();
+        loop {
+            values.push(self.parse_literal()?);
+            match self.advance() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
+            }
+        }
+        if values.is_empty() {
+            return Err(syntax("VALUES must have at least one value"));
+        }
+        Ok(Insert { table, values })
+    }
+
+    /// A literal: an integer (already lexed) or the keyword `NULL`.
+    fn parse_literal(&mut self) -> Result<Literal> {
+        match self.advance() {
+            Token::Int(n) => Ok(Literal::Int(n)),
+            Token::Word(w) if w.eq_ignore_ascii_case("null") => Ok(Literal::Null),
+            other => Err(syntax(format!("expected a literal value, found {other:?}"))),
+        }
     }
 
     // --- cursor helpers (used by the productions added in later phases) -------
