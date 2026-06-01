@@ -1,0 +1,116 @@
+/* ===========================================================================
+ * Abide SQL grammar — CANONICAL (CLAUDE.md §5, §6).
+ *
+ * One language-neutral EBNF. The hand-written parsers (impl/rust, impl/go,
+ * impl/ts) are *downstream consumers* of this grammar, never the source of it;
+ * the parser is explicitly NOT codegen'd (CLAUDE.md §5). This file is
+ * DESCRIPTIVE of the currently-implemented surface, not aspirational — it grows
+ * one production at a time as features land (see ../../TODO.md). The reasoning
+ * lives in ../design/grammar.md; read it before editing.
+ *
+ * Notation (W3C-style EBNF, as in the XML / XQuery specs):
+ *   rule ::= expr          a production
+ *   A B                    concatenation (A then B)
+ *   A | B                  alternation
+ *   A?                     optional (zero or one)
+ *   A*                     zero or more
+ *   A+                     one or more
+ *   ( ... )                grouping
+ *   "..."                  a literal terminal (see case rule below)
+ *   [a-z]                  a character class (one character)
+ *   comment                a slash-star ... star-slash block, as used here
+ *
+ * Conventions specific to this grammar:
+ *   - Keywords ("SELECT", "FROM", ...) are written as quoted terminals but are
+ *     NOT reserved words: the lexer emits one `identifier` token for every bare
+ *     word and the parser distinguishes keywords by position, case-insensitively.
+ *     So a keyword spelling is a legal identifier where the grammar expects one.
+ *   - Keyword terminals match case-insensitively (SELECT = select = SeLeCt).
+ *     Punctuation terminals match literally.
+ *   - Whitespace (space, tab, CR, LF) separates tokens and is otherwise
+ *     insignificant. There is NO comment syntax in the SQL input itself.
+ *   - Exactly one statement is parsed per input; there is no statement
+ *     terminator (no ';').
+ * ===========================================================================
+ */
+
+/* --- entry point --------------------------------------------------------- */
+
+sql_statement  ::= create_table
+                 | insert
+                 | select
+                 | update
+                 | delete
+
+/* --- DDL ----------------------------------------------------------------- */
+
+create_table   ::= "CREATE" "TABLE" identifier
+                   "(" column_def ("," column_def)* ")"
+
+column_def     ::= identifier type_name ("PRIMARY" "KEY")?
+
+/* type_name is parsed as a bare identifier and resolved by the catalog
+ * (case-insensitively). The accepted names this slice are:
+ *   int16 | smallint | int32 | int | integer | int64 | bigint
+ * An unknown name is rejected at execution time (42704), not by the grammar. */
+type_name      ::= identifier
+
+/* --- DML ----------------------------------------------------------------- */
+
+insert         ::= "INSERT" "INTO" identifier
+                   "VALUES" "(" literal ("," literal)* ")"
+
+update         ::= "UPDATE" identifier "SET"
+                   assignment ("," assignment)*
+                   where_clause?
+
+assignment     ::= identifier "=" operand
+
+delete         ::= "DELETE" "FROM" identifier where_clause?
+
+/* --- queries ------------------------------------------------------------- */
+
+select         ::= "SELECT" select_items "FROM" identifier
+                   where_clause?
+                   order_by?
+
+select_items   ::= "*"
+                 | select_expr ("," select_expr)*
+
+/* CAST is recursive (nestable). A bare integer literal is a legal projected
+ * value (e.g. SELECT CAST(1000 AS int16)). There are no column aliases. */
+select_expr    ::= "CAST" "(" select_expr "AS" type_name ")"
+                 | integer
+                 | identifier
+
+order_by       ::= "ORDER" "BY" identifier ("ASC" | "DESC")?
+
+/* --- shared WHERE predicate ---------------------------------------------- */
+
+/* A single predicate only — no AND / OR / NOT, no parentheses. */
+where_clause   ::= "WHERE" predicate
+
+predicate      ::= identifier "IS" "NOT"? "NULL"
+                 | identifier compare_op operand
+
+compare_op     ::= "=" | "<" | ">" | "<=" | ">="   /* no "<>" and no "!=" */
+
+operand        ::= integer
+                 | "NULL"
+                 | identifier
+
+literal        ::= integer | "NULL"
+
+/* --- lexical (token) layer ----------------------------------------------- */
+
+/* An integer literal carries an OPTIONAL leading '-' that is bound at LEX time
+ * (it is part of the token, not a unary operator) — so "- 5" with a space is a
+ * lex error. The magnitude must fit signed 64-bit; out of range is a syntax
+ * error (42601). */
+integer        ::= "-"? digit+
+
+/* Identifiers are ASCII only; there is no quoted-identifier syntax. */
+identifier     ::= (letter | "_") (letter | digit | "_")*
+
+letter         ::= [A-Za-z]
+digit          ::= [0-9]

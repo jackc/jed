@@ -39,11 +39,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > Highest leverage, mostly low difficulty. These unblock nearly every later feature and
 > close gaps in the *canonical artifact itself* (two spec dirs are still empty).
 
-- [ ] **Backfill the EBNF grammar** (`spec/grammar/` is empty). The grammar is supposed to
-      be the shared contract the hand-written parsers conform to (§5/§6); right now three
-      parsers exist with no authored grammar. Write EBNF for the **already-implemented**
-      surface (CREATE TABLE / INSERT / SELECT / WHERE / ORDER BY / UPDATE / DELETE / CAST),
-      then grow it per feature. _(size: M; §6)_
+- [x] **Backfill the EBNF grammar.** The grammar is the shared contract the hand-written
+      parsers conform to (§5/§6); three parsers previously existed with no authored grammar.
+      Done: [spec/grammar/grammar.ebnf](spec/grammar/grammar.ebnf) (W3C-style EBNF) covers the
+      already-implemented surface (CREATE TABLE / INSERT / SELECT / WHERE / ORDER BY / UPDATE /
+      DELETE / CAST), with the *why* in [spec/design/grammar.md](spec/design/grammar.md). Grow
+      it per feature. _(size: M; §6)_
 - [ ] **Author the function / operator catalog** (`spec/functions/` is empty). This is
       where operator **result types** live (e.g. type of `int32 + int32`) and NULL
       behavior, as data (§5). Define the schema + the comparison operators that current

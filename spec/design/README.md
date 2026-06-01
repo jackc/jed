@@ -11,6 +11,8 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 
 - [types.md](types.md) — the type system: scalar set, comparison/coercion/promotion,
   three-valued NULL logic, integer overflow, and order-preserving key encoding.
+- [grammar.md](grammar.md) — the SQL grammar: W3C-style EBNF notation, keywords as
+  non-reserved identifiers, the deliberate narrowings, and how the grammar grows.
 - [conformance.md](conformance.md) — the conformance corpus: sqllogictest-style format,
   structured-error matching, the tier + capability-flag system, and determinism rules.
 - [encoding.md](encoding.md) — order-preserving key encoding: the `int-be-signflip` rule,
