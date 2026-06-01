@@ -310,6 +310,11 @@ The design is optimized for AI agents even more than for humans. In practice:
 Each step is independently testable and independently useful. There is deliberately no
 point where progress is blocked on one giant subsystem.
 
+**Forward work is tracked in [TODO.md](TODO.md)** — the roadmap of features beyond step 6,
+ordered roughly by dependency / importance / difficulty. **Consult it when planning any new
+feature** and confirm the work fits the overall plan (and the commitments in this file);
+update TODO.md in the same change when the plan moves.
+
 ---
 
 ## 12. Local reference sources (uncommitted)
@@ -357,3 +362,48 @@ PostgreSQL also runs **live** as the `db` service (a queryable oracle), separate
 source checkout. **CockroachDB** is deliberately **excluded** despite being cited in §7/§8:
 its core is BSL 1.1 (source-available, not OSI-free). For its key-encoding design, read it
 from `spec/encoding/` or an old Apache-2.0 tag rather than vendoring the BSL source.
+
+---
+
+## 13. Untrusted queries: memory safety + deterministic resource accounting
+
+A first-class use case is **safely evaluating untrusted, user-supplied queries** (a host
+exposing an ad-hoc query surface to its own users). Two requirements follow.
+
+### Memory safety — largely free, but a standing requirement
+
+Every core is written in a **memory-safe language** (Rust, Go, TypeScript — and any later
+core: Java, C#, or a Swift core whether native or **wrapping the safe Rust core**, §2). So
+the engine is *reasonably* safe against malicious input without special hardening: a crafted
+query cannot trigger a buffer overrun, use-after-free, or out-of-bounds read. Treat memory
+safety as a **standing requirement**, not an accident — any future `unsafe` / cgo / FFI path
+(or a non-memory-safe core) must be justified against this property. It is also one more
+reason the Swift exception (§2) wraps the *safe Rust* core rather than dropping to C.
+
+This covers memory safety **only**. It does not bound resource consumption — that is next.
+
+### Deterministic resource accounting + a cost ceiling
+
+An untrusted query must not consume unbounded resources (a pathological scan, cross join,
+or deep expression). The engine must **deterministically meter the cost of executing a
+query** and **abort when a caller-supplied ceiling is exceeded**.
+
+- **Deterministic cost.** Execution accrues a running cost from defined units — each **page
+  read**, each **row produced**, each **function/operator evaluation**, etc. (the unit
+  schedule is spec'd as data, like everything mechanical — §5). The cost of a given
+  `(query, database state)` is **fully deterministic**: the same query against the same
+  database always yields the **same** cost, with no dependence on wall-clock, allocation, or
+  iteration order (§10).
+- **Cross-core identity.** Because there is no reference implementation (§2), cost is part
+  of the shared contract: **every core must compute the identical cost** for the same
+  `(query, database)`. This makes cost a §8-style divergence hotspot and a candidate for the
+  conformance corpus (assert the cost, not only the rows).
+- **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
+  it, execution **aborts deterministically** with a defined error code (registered in
+  `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same
+  abort).
+- **Bake the seam in early.** Enforcement and tuning are *not* needed immediately, but the
+  **metering seam threads through the executor, expression evaluator, and storage reads**,
+  so it is far cheaper to carry the cost counter from early than to retrofit it across a
+  grown executor. Design the seam early even if the ceiling/limits API lands later. Tracked
+  in [TODO.md](TODO.md).
