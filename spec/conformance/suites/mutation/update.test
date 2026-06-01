@@ -1,0 +1,126 @@
+# UPDATE — in-place value replacement (two-phase / all-or-nothing). Assignments
+# evaluate against the pre-update row, so `SET a = b, b = a` swaps. Assigning a
+# PRIMARY KEY column is rejected this slice (0A000); a duplicate target column is
+# rejected (42701); an out-of-range value traps 22003 and leaves the table unchanged.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.update, query.select, query.where_eq, query.order_by, types.int16, types.int32, types.int64, error.overflow_trap
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int16, b int16)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 11)
+
+statement ok
+INSERT INTO t VALUES (2, 20, 22)
+
+statement ok
+INSERT INTO t VALUES (3, 30, 33)
+
+# update one row by primary key
+statement ok
+UPDATE t SET a = 99 WHERE id = 2
+
+query II nosort
+SELECT id, a FROM t ORDER BY id
+----
+1
+10
+2
+99
+3
+30
+
+# multi-assignment swap reads the OLD row, so a and b exchange
+statement ok
+UPDATE t SET a = b, b = a WHERE id = 1
+
+query III nosort
+SELECT id, a, b FROM t WHERE id = 1
+----
+1
+11
+10
+
+# update with no WHERE touches every row
+statement ok
+UPDATE t SET b = 0
+
+query II nosort
+SELECT id, b FROM t ORDER BY id
+----
+1
+0
+2
+0
+3
+0
+
+# assigning NULL into a nullable column is fine
+statement ok
+UPDATE t SET a = NULL WHERE id = 3
+
+query I nosort
+SELECT a FROM t WHERE id = 3
+----
+NULL
+
+# assigning a PRIMARY KEY column is not supported yet (the storage key must not change)
+statement error 0A000
+UPDATE t SET id = 5 WHERE id = 2
+
+# the same column assigned twice in one statement is rejected
+statement error 42701
+UPDATE t SET a = 1, a = 2 WHERE id = 2
+
+# an out-of-range literal traps and leaves the row unchanged (int16 max is 32767;
+# id 2's a is still 99 from the first update)
+statement error 22003
+UPDATE t SET a = 40000 WHERE id = 2
+
+query I nosort
+SELECT a FROM t WHERE id = 2
+----
+99
+
+# assigning from a wider column re-checks the TARGET range (column-source overflow)
+statement ok
+CREATE TABLE w (id int32 PRIMARY KEY, small int16, big int64)
+
+statement ok
+INSERT INTO w VALUES (1, 5, 100000)
+
+statement error 22003
+UPDATE w SET small = big WHERE id = 1
+
+query I nosort
+SELECT small FROM w WHERE id = 1
+----
+5
+
+# all-or-nothing: an UPDATE that overflows on ANY matching row applies to NONE.
+# row 2's source (99999) overflows int16, so rows 1 and 3 stay unchanged too.
+statement ok
+CREATE TABLE m (id int32 PRIMARY KEY, n int16, src int64)
+
+statement ok
+INSERT INTO m VALUES (1, 1, 5)
+
+statement ok
+INSERT INTO m VALUES (2, 2, 99999)
+
+statement ok
+INSERT INTO m VALUES (3, 3, 7)
+
+statement error 22003
+UPDATE m SET n = src
+
+query II nosort
+SELECT id, n FROM m ORDER BY id
+----
+1
+1
+2
+2
+3
+3

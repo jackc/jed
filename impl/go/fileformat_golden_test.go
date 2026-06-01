@@ -160,6 +160,27 @@ func TestReadGoldenReconstructsCatalog(t *testing.T) {
 	}
 }
 
+// A no-PK table's monotonic rowid counter must be reconstructed on load, so inserts
+// after a load don't collide with persisted rowids (the step-6 mutation fix).
+func TestRowidCounterSurvivesLoad(t *testing.T) {
+	db := nopkTableDB(t) // existing rows take rowids 0, 1, 2
+	image, err := db.ToImage(8192, 1)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	loaded, err := LoadDatabase(image)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// The next insert must get rowid 3, not 0 — otherwise it collides (23505).
+	if _, err := Execute(loaded, "INSERT INTO r VALUES (10, 100)"); err != nil {
+		t.Fatalf("insert after load should not collide: %v", err)
+	}
+	if got := len(loaded.RowsInKeyOrder("r")); got != 4 {
+		t.Errorf("expected 4 rows after load+insert, got %d", got)
+	}
+}
+
 // The default 8 KiB page size also round-trips (goldens stay at 256 for reviewable
 // hex, but the real default must work too).
 func TestRoundTripAtDefaultPageSize(t *testing.T) {

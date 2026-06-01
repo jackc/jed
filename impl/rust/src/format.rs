@@ -208,8 +208,17 @@ impl Database {
                 let (table, root_data_page) = decode_table_entry(page.payload, &mut pos)?;
                 let name = table.name.clone();
                 let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
+                let has_pk = table.primary_key_index().is_some();
                 db.put_table(table);
-                read_data_chain(image, page_size, root_data_page, &col_types, &name, &mut db)?;
+                read_data_chain(
+                    image,
+                    page_size,
+                    root_data_page,
+                    &col_types,
+                    has_pk,
+                    &name,
+                    &mut db,
+                )?;
             }
             cat_page = page.next_page;
         }
@@ -217,12 +226,17 @@ impl Database {
     }
 }
 
-/// Read every record in a table's data-page chain into the store under `name`.
+/// Read every record in a table's data-page chain into the store under `name`. For a
+/// table with no primary key, the keys are synthetic int64 rowids; advance the
+/// store's rowid counter past the largest so future inserts don't collide with a
+/// loaded key (spec/fileformat/format.md). No format change — keys are stored
+/// verbatim.
 fn read_data_chain(
     image: &[u8],
     ps: usize,
     root_data_page: u32,
     col_types: &[ScalarType],
+    has_pk: bool,
     name: &str,
     db: &mut Database,
 ) -> Result<()> {
@@ -235,6 +249,10 @@ fn read_data_chain(
         let mut pos = 0usize;
         for _ in 0..page.item_count {
             let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
+            if !has_pk && key.len() == ScalarType::Int64.width_bytes() {
+                db.store_mut(name)
+                    .bump_rowid_to(decode_int(ScalarType::Int64, &key) + 1);
+            }
             if !db.store_mut(name).insert(key, row) {
                 return Err(corrupt("duplicate key in data page"));
             }

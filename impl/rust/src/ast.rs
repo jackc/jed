@@ -7,6 +7,8 @@ pub enum Statement {
     CreateTable(CreateTable),
     Insert(Insert),
     Select(Select),
+    Update(Update),
+    Delete(Delete),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -28,6 +30,31 @@ pub struct Insert {
     pub table: String,
     /// One row's worth of literal values, in column order.
     pub values: Vec<Literal>,
+}
+
+/// `UPDATE <table> SET <col> = <operand> [, ...] [WHERE <predicate>]`. Each
+/// assignment's right-hand side is evaluated against the *pre-update* row (so
+/// `SET a = b, b = a` swaps). Assigning a PRIMARY KEY column is rejected this slice
+/// (the storage key must not change — see the executor).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Update {
+    pub table: String,
+    pub assignments: Vec<Assignment>,
+    pub filter: Option<Predicate>,
+}
+
+/// One `SET <column> = <value>` clause.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Assignment {
+    pub column: String,
+    pub value: Operand,
+}
+
+/// `DELETE FROM <table> [WHERE <predicate>]`. No WHERE deletes every row.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Delete {
+    pub table: String,
+    pub filter: Option<Predicate>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

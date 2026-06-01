@@ -18,12 +18,17 @@ pub type Row = Vec<Value>;
 #[derive(Default)]
 pub struct TableStore {
     rows: BTreeMap<Vec<u8>, Row>,
+    /// Next synthetic rowid for a table with no primary key. Monotonic — never
+    /// reused, so a DELETE-then-INSERT cannot collide with a freed key. Unused for
+    /// tables that have a primary key. Reconstructed on load (spec/fileformat).
+    next_rowid: i64,
 }
 
 impl TableStore {
     pub fn new() -> Self {
         TableStore {
             rows: BTreeMap::new(),
+            next_rowid: 0,
         }
     }
 
@@ -35,6 +40,35 @@ impl TableStore {
         }
         self.rows.insert(key, row);
         true
+    }
+
+    /// Allocate the next monotonic rowid (for a table with no primary key) and
+    /// advance the counter. Never returns a previously-issued value.
+    pub fn alloc_rowid(&mut self) -> i64 {
+        let r = self.next_rowid;
+        self.next_rowid += 1;
+        r
+    }
+
+    /// Ensure the rowid counter is at least `n` (used on load to set it past every
+    /// rowid already present, so future inserts don't collide).
+    pub fn bump_rowid_to(&mut self, n: i64) {
+        if n > self.next_rowid {
+            self.next_rowid = n;
+        }
+    }
+
+    /// Replace the row stored at an existing key (UPDATE). The key is unchanged, so
+    /// key order and the rowid counter are untouched. Panics if the key is absent —
+    /// the caller only replaces keys it just found.
+    pub fn replace(&mut self, key: &[u8], row: Row) {
+        let slot = self.rows.get_mut(key).expect("replace at an existing key");
+        *slot = row;
+    }
+
+    /// Remove the row at `key` (DELETE). Returns whether a row was present.
+    pub fn remove(&mut self, key: &[u8]) -> bool {
+        self.rows.remove(key).is_some()
     }
 
     /// Look up a row by its exact encoded key.

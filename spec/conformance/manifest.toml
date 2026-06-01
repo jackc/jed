@@ -33,6 +33,14 @@ id = "dml.insert"
 description = "INSERT ... VALUES"
 
 [[capability]]
+id = "dml.update"
+description = "UPDATE ... SET ... [WHERE] (in-place value replacement)"
+
+[[capability]]
+id = "dml.delete"
+description = "DELETE FROM ... [WHERE]"
+
+[[capability]]
 id = "query.select"
 description = "SELECT of columns from a single table"
 
@@ -103,6 +111,12 @@ capabilities = [
   "null.three_valued",
   "error.overflow_trap",
 ]
+
+[[profile]]
+id = "mutation"
+title = "core + row mutation (UPDATE / DELETE)"
+includes = "core"
+capabilities = ["dml.update", "dml.delete"]
 
 [[profile]]
 id = "casts"

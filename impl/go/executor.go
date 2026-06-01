@@ -66,6 +66,10 @@ func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
 		return db.executeInsert(stmt.Insert)
 	case stmt.Select != nil:
 		return db.executeSelect(stmt.Select)
+	case stmt.Update != nil:
+		return db.executeUpdate(stmt.Update)
+	case stmt.Delete != nil:
+		return db.executeDelete(stmt.Delete)
 	default:
 		return Outcome{}, NewError(SyntaxError, "empty statement")
 	}
@@ -146,18 +150,142 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 	}
 
 	// The storage key is the encoded primary key, or — for a table without one — a
-	// synthetic insertion-order rowid (rows are append-only in step-1).
+	// monotonic synthetic rowid: never reused, so DELETE then INSERT cannot collide
+	// with a freed key (spec/fileformat/format.md).
 	store := db.stores[strings.ToLower(ins.Table)]
 	var key []byte
 	if pk := table.PrimaryKeyIndex(); pk >= 0 {
 		key = EncodeInt(table.Columns[pk].Type, row[pk].Int)
 	} else {
-		key = EncodeInt(Int64, int64(store.Len()))
+		key = EncodeInt(Int64, store.AllocRowid())
 	}
 
 	if !store.Insert(key, row) {
 		return Outcome{}, NewError(UniqueViolation,
 			"duplicate key value violates primary key uniqueness")
+	}
+	return Outcome{Kind: OutcomeStatement}, nil
+}
+
+// executeDelete analyzes and runs a DELETE: resolve the table and optional predicate,
+// collect the keys of matching rows (only a TRUE predicate matches — Kleene), then
+// remove them. No WHERE deletes every row. Keys are collected before mutating so the
+// map is not modified while iterating.
+func (db *Database) executeDelete(del *Delete) (Outcome, error) {
+	table, ok := db.Table(del.Table)
+	if !ok {
+		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
+	}
+	var filter *resolvedPredicate
+	if del.Filter != nil {
+		var err error
+		filter, err = db.resolvePredicate(table, del.Filter)
+		if err != nil {
+			return Outcome{}, err
+		}
+	}
+
+	store := db.stores[strings.ToLower(del.Table)]
+	var keys [][]byte
+	for _, e := range store.EntriesInKeyOrder() {
+		if filter == nil || filter.eval(e.Row).IsTrue() {
+			keys = append(keys, e.Key)
+		}
+	}
+	for _, k := range keys {
+		store.Remove(k)
+	}
+	return Outcome{Kind: OutcomeStatement}, nil
+}
+
+// executeUpdate analyzes and runs an UPDATE. Two-phase / all-or-nothing: phase 1
+// builds and type-checks every matching row's new values (assignments evaluate
+// against the old row, so `SET a = b, b = a` swaps); a 22003/23502 aborts with no
+// writes. Phase 2 applies. Assigning a PRIMARY KEY column traps 0A000 (the storage
+// key must not change this slice); a duplicate target column traps 42701. No WHERE
+// updates every row.
+func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
+	table, ok := db.Table(upd.Table)
+	if !ok {
+		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+upd.Table)
+	}
+
+	// Resolve assignments up front (fail fast, deterministic).
+	pkIdx := table.PrimaryKeyIndex()
+	plans := make([]assignPlan, 0, len(upd.Assignments))
+	for _, a := range upd.Assignments {
+		idx := table.ColumnIndex(a.Column)
+		if idx < 0 {
+			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+a.Column)
+		}
+		if idx == pkIdx {
+			return Outcome{}, NewError(FeatureNotSupported,
+				"updating a primary key column is not supported")
+		}
+		for _, p := range plans {
+			if p.idx == idx {
+				return Outcome{}, NewError(DuplicateColumn,
+					"column "+a.Column+" assigned more than once")
+			}
+		}
+		col := table.Columns[idx]
+		p := assignPlan{idx: idx, name: col.Name, target: col.Type, notNull: col.NotNull}
+		if lit := a.Value.Literal; lit != nil {
+			if lit.Kind == LiteralInt {
+				p.constVal = IntValue(lit.Int)
+			} else {
+				p.constVal = NullValue()
+			}
+		} else {
+			j := table.ColumnIndex(a.Value.Column)
+			if j < 0 {
+				return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+a.Value.Column)
+			}
+			p.srcColumn = j
+			p.srcIsColumn = true
+		}
+		plans = append(plans, p)
+	}
+
+	var filter *resolvedPredicate
+	if upd.Filter != nil {
+		var err error
+		filter, err = db.resolvePredicate(table, upd.Filter)
+		if err != nil {
+			return Outcome{}, err
+		}
+	}
+
+	// Phase 1: build + validate every matching row's new values; no writes yet.
+	store := db.stores[strings.ToLower(upd.Table)]
+	type pending struct {
+		key []byte
+		row Row
+	}
+	var updates []pending
+	for _, e := range store.EntriesInKeyOrder() {
+		if filter != nil && !filter.eval(e.Row).IsTrue() {
+			continue
+		}
+		newRow := make(Row, len(e.Row))
+		copy(newRow, e.Row)
+		for _, p := range plans {
+			raw := p.constVal
+			if p.srcIsColumn {
+				raw = e.Row[p.srcColumn]
+			}
+			checked, err := p.check(raw)
+			if err != nil {
+				return Outcome{}, err
+			}
+			newRow[p.idx] = checked
+		}
+		updates = append(updates, pending{key: e.Key, row: newRow})
+	}
+
+	// Phase 2: apply (keys unchanged — a PK column can't be assigned).
+	for _, u := range updates {
+		store.Replace(u.key, u.row)
 	}
 	return Outcome{Kind: OutcomeStatement}, nil
 }
@@ -441,4 +569,35 @@ func nullFirstCmp(a, b Value) int {
 	default:
 		return 0
 	}
+}
+
+// assignPlan is a resolved UPDATE assignment: the target column index, its type and
+// nullability for re-checking, and the value source (a constant, or another column
+// read from the same row when srcIsColumn).
+type assignPlan struct {
+	idx         int
+	name        string
+	target      ScalarType
+	notNull     bool
+	constVal    Value
+	srcColumn   int
+	srcIsColumn bool
+}
+
+// check type-checks a candidate value against this column: NULL into NOT NULL traps
+// 23502; an integer outside the target range traps 22003 (CLAUDE.md §8) — mirrors
+// INSERT's per-value checks.
+func (p assignPlan) check(v Value) (Value, error) {
+	if v.Null {
+		if p.notNull {
+			return Value{}, NewError(NotNullViolation,
+				"null value in column "+p.name+" violates not-null constraint")
+		}
+		return NullValue(), nil
+	}
+	if !p.target.InRange(v.Int) {
+		return Value{}, NewError(NumericValueOutOfRange,
+			"value out of range for type "+p.target.CanonicalName())
+	}
+	return IntValue(v.Int), nil
 }

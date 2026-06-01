@@ -15,6 +15,11 @@ type Row []Value
 // TableStore holds one table's rows, keyed by encoded primary key.
 type TableStore struct {
 	rows map[string]Row
+	// nextRowid is the next synthetic rowid for a table with no primary key.
+	// Monotonic — never reused, so a DELETE-then-INSERT cannot collide with a freed
+	// key. Unused for tables with a primary key. Reconstructed on load
+	// (spec/fileformat).
+	nextRowid int64
 }
 
 // NewTableStore builds an empty store.
@@ -30,6 +35,38 @@ func (s *TableStore) Insert(key []byte, row Row) bool {
 		return false
 	}
 	s.rows[k] = row
+	return true
+}
+
+// AllocRowid returns the next monotonic rowid (for a table with no primary key) and
+// advances the counter. Never returns a previously-issued value.
+func (s *TableStore) AllocRowid() int64 {
+	r := s.nextRowid
+	s.nextRowid++
+	return r
+}
+
+// BumpRowidTo ensures the rowid counter is at least n (used on load to set it past
+// every rowid already present, so future inserts don't collide).
+func (s *TableStore) BumpRowidTo(n int64) {
+	if n > s.nextRowid {
+		s.nextRowid = n
+	}
+}
+
+// Replace overwrites the row stored at an existing key (UPDATE). The key is
+// unchanged, so key order and the rowid counter are untouched.
+func (s *TableStore) Replace(key []byte, row Row) {
+	s.rows[string(key)] = row
+}
+
+// Remove deletes the row at key (DELETE). Returns whether a row was present.
+func (s *TableStore) Remove(key []byte) bool {
+	k := string(key)
+	if _, ok := s.rows[k]; !ok {
+		return false
+	}
+	delete(s.rows, k)
 	return true
 }
 

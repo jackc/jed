@@ -292,6 +292,15 @@ The design is optimized for AI agents even more than for humans. In practice:
    (`spec/fileformat/format.md`) with byte-exact golden fixtures and the load-bearing §8
    test: each core writes bytes identical to a shared golden and reads the others'. Authored
    as a **whole-image** format (full serialize per commit); incremental commit deferred (§9).
+6. **Row mutation — `UPDATE` and `DELETE`** (integer columns), in both cores against a
+   `mutation` conformance profile. `UPDATE` is in-place value replacement and is
+   **two-phase / all-or-nothing**: every matching row's new values are type-checked
+   (22003/23502) before any are written. Two deliberate, documented narrowings, relaxable
+   later: (a) assigning a **PRIMARY KEY column is rejected** (`0A000`) so a row's storage
+   key never changes; (b) there is **no cross-statement transaction** yet (the §3
+   staging-buffer model is still future) — UPDATE's two-phase pass gives per-statement
+   atomicity without it. The no-PK synthetic rowid became a **monotonic counter** (never
+   reused), reconstructed on load, so `DELETE` then `INSERT` cannot collide.
 
 Each step is independently testable and independently useful. There is deliberately no
 point where progress is blocked on one giant subsystem.

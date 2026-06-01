@@ -37,9 +37,14 @@ impl/        native cores, one per language (Rust first, then Go), each a downst
    overflow trap), integer columns only, driven through **both** the Rust
    ([impl/rust/](impl/rust/)) and Go ([impl/go/](impl/go/)) cores against the shared
    corpus — `core`/`casts`/`comparison` profiles green in both.
-6. ✅ **On-disk format + Rust↔Go round-trip** — the single-file byte format
+5b. ✅ **On-disk format + Rust↔Go round-trip** — the single-file byte format
    ([spec/fileformat/format.md](spec/fileformat/format.md)) with byte-exact golden fixtures.
    Both cores read every golden and write byte-identical output — the load-bearing
    cross-core honesty test ([CLAUDE.md §8](CLAUDE.md)), with an independent Ruby reference
    ([spec/fileformat/verify.rb](spec/fileformat/verify.rb)) pinning the goldens. Whole-image
-   form for now; incremental commit deferred until `UPDATE`/`DELETE`.
+   form for now; incremental commit deferred.
+6. ✅ **Row mutation — `UPDATE` / `DELETE`** — integer columns, both cores, against a
+   `mutation` conformance profile. `UPDATE` is in-place and two-phase (all-or-nothing:
+   every matching row is type-checked before any write); assigning a `PRIMARY KEY` column
+   is rejected (`0A000`) so the storage key never changes. No-PK rows use a monotonic
+   rowid (reconstructed on load), so `DELETE` then `INSERT` never collides.

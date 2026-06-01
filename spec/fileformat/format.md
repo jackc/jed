@@ -141,6 +141,13 @@ The key is **stored, not derived**: a table without a primary key uses a synthet
 verbatim. There is no per-record payload length — the reader derives each value's width
 from the column types in the catalog.
 
+**Rowid reconstruction (no-PK tables).** The synthetic rowid is allocated from a
+**monotonic counter** that is never reused (so a `DELETE` followed by an `INSERT` cannot
+collide with a freed key). The counter is **not stored** — on load it is set to
+`max(rowid) + 1` over the table's persisted keys (0 for an empty table), which is exact
+because a no-PK key is a bare `int64` rowid and the rowids issued are `0, 1, 2, …`. This
+needs no format change; it is a pure load-time derivation.
+
 ### Value codec
 
 A row value is encoded with the **same nullable encoding as keys**

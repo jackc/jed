@@ -126,6 +126,18 @@ fn read_golden_reconstructs_catalog() {
     assert_eq!(rows[2], vec![Value::Int(3), Value::Null]);
 }
 
+/// A no-PK table's monotonic rowid counter must be reconstructed on load, so inserts
+/// after a load don't collide with persisted rowids (the step-6 mutation fix).
+#[test]
+fn rowid_counter_survives_serialize_and_load() {
+    let db = nopk_table_db(); // existing rows take rowids 0, 1, 2
+    let image = db.to_image(8192, 1).unwrap();
+    let mut loaded = Database::from_image(&image).unwrap();
+    // The next insert must get rowid 3, not 0 — otherwise it collides (23505).
+    execute(&mut loaded, "INSERT INTO r VALUES (10, 100)").expect("insert after load");
+    assert_eq!(loaded.rows_in_key_order("r").unwrap().len(), 4);
+}
+
 /// The default 8 KiB page size also round-trips (goldens stay at 256 for reviewable
 /// hex, but the real default must work too).
 #[test]

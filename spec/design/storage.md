@@ -127,9 +127,13 @@ sits so the options stay open (CLAUDE.md §9).
   written by Rust is byte-identical to one written by Go — CLAUDE.md §8). This doc fixes the
   *model*; that fixes the *bytes*. **Whole-image** form for now (see the §4 status note).
 - **Incremental commit (COW path, free-list, page reclamation, B-tree interior pages)** —
-  deferred until `UPDATE`/`DELETE` create the pressure. The current whole-image writer
-  rewrites the full image at each commit; the data page layout is a simple sorted-record
-  chain, not yet a B-tree.
+  still deferred. `UPDATE`/`DELETE` have **landed** (step 6) on the whole-image store: a
+  mutation is applied in memory and the next serialize rewrites the full image, so nothing
+  yet *requires* incremental copy-on-write or free-list reclamation — they remain a later
+  slice once write volume makes full-image rewrites costly. The data page layout is a
+  simple sorted-record chain, not yet a B-tree. (`DELETE` does free in-memory rows; the
+  no-PK rowid is a **monotonic counter**, reconstructed on load as `max key + 1`, so a
+  freed rowid is never reissued — see [../fileformat/format.md](../fileformat/format.md).)
 - **Within-page structure** — currently variable-length records packed greedily into the
   page payload (a record stores its key + each column's value). Slotted pages / a B-tree
   leaf layout arrive with the incremental commit path.

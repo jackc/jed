@@ -5,8 +5,8 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    CompareOp, CreateTable, Insert, Literal, Operand, Predicate, Select, SelectExpr, SelectItems,
-    Statement,
+    CompareOp, CreateTable, Delete, Insert, Literal, Operand, Predicate, Select, SelectExpr,
+    SelectItems, Statement, Update,
 };
 use crate::catalog::{Column, Table};
 use crate::encoding::encode_int;
@@ -80,6 +80,8 @@ impl Database {
             Statement::CreateTable(ct) => self.execute_create_table(ct),
             Statement::Insert(ins) => self.execute_insert(ins),
             Statement::Select(sel) => self.execute_select(sel),
+            Statement::Update(upd) => self.execute_update(upd),
+            Statement::Delete(del) => self.execute_delete(del),
         }
     }
 
@@ -189,21 +191,19 @@ impl Database {
             row.push(value);
         }
 
-        // The storage key is the encoded primary key, or — for a table without one
-        // — a synthetic insertion-order rowid (rows are append-only in step-1).
-        let key = match table.primary_key_index() {
-            Some(i) => {
-                let pk_ty = table.columns[i].ty;
-                match row[i] {
-                    Value::Int(n) => encode_int(pk_ty, n),
-                    // Unreachable: a PK column is NOT NULL, enforced above.
-                    Value::Null => unreachable!("primary key column is NOT NULL"),
-                }
-            }
-            None => {
-                let store = self.store(&ins.table);
-                encode_int(ScalarType::Int64, store.len() as i64)
-            }
+        // The storage key is the encoded primary key, or — for a table without one —
+        // a monotonic synthetic rowid. Compute the PK column up front so the table
+        // borrow ends before the no-PK arm needs `store_mut`.
+        let pk = table.primary_key_index().map(|i| (i, table.columns[i].ty));
+        let key = match pk {
+            Some((i, pk_ty)) => match row[i] {
+                Value::Int(n) => encode_int(pk_ty, n),
+                // Unreachable: a PK column is NOT NULL, enforced above.
+                Value::Null => unreachable!("primary key column is NOT NULL"),
+            },
+            // Monotonic rowid: never reused, so DELETE then INSERT cannot collide
+            // with a freed key (spec/fileformat/format.md).
+            None => encode_int(ScalarType::Int64, self.store_mut(&ins.table).alloc_rowid()),
         };
 
         let store = self.store_mut(&ins.table);
@@ -212,6 +212,131 @@ impl Database {
                 SqlState::UniqueViolation,
                 "duplicate key value violates primary key uniqueness",
             ));
+        }
+        Ok(Outcome::Statement)
+    }
+
+    /// Analyze and run a DELETE: resolve the table and optional predicate, collect
+    /// the keys of matching rows (only a TRUE predicate matches — Kleene), then
+    /// remove them. No WHERE deletes every row. Keys are collected before mutating
+    /// so the map is not modified while iterating.
+    fn execute_delete(&mut self, del: Delete) -> Result<Outcome> {
+        let table = self.table(&del.table).ok_or_else(|| {
+            EngineError::new(
+                SqlState::UndefinedTable,
+                format!("table does not exist: {}", del.table),
+            )
+        })?;
+        let filter = match &del.filter {
+            Some(p) => Some(self.resolve_predicate(table, p)?),
+            None => None,
+        };
+
+        let keys: Vec<Vec<u8>> = self
+            .store(&del.table)
+            .iter_entries()
+            .filter(|(_, row)| match &filter {
+                None => true,
+                Some(f) => f.eval(row).is_true(),
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        let store = self.store_mut(&del.table);
+        for k in &keys {
+            store.remove(k);
+        }
+        Ok(Outcome::Statement)
+    }
+
+    /// Analyze and run an UPDATE. Two-phase / all-or-nothing: phase 1 builds and
+    /// type-checks every matching row's new values (assignments evaluate against the
+    /// *old* row, so `SET a = b, b = a` swaps); a `22003`/`23502` aborts with no
+    /// writes. Phase 2 applies. Assigning a PRIMARY KEY column traps `0A000` (the
+    /// storage key must not change this slice); a duplicate target column traps
+    /// `42701`. No WHERE updates every row.
+    fn execute_update(&mut self, upd: Update) -> Result<Outcome> {
+        let table = self.table(&upd.table).ok_or_else(|| {
+            EngineError::new(
+                SqlState::UndefinedTable,
+                format!("table does not exist: {}", upd.table),
+            )
+        })?;
+
+        // Resolve assignments up front (fail fast, deterministic).
+        let pk_idx = table.primary_key_index();
+        let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
+        for a in &upd.assignments {
+            let idx = table.column_index(&a.column).ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedColumn,
+                    format!("column does not exist: {}", a.column),
+                )
+            })?;
+            if Some(idx) == pk_idx {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "updating a primary key column is not supported",
+                ));
+            }
+            if plans.iter().any(|p| p.idx == idx) {
+                return Err(EngineError::new(
+                    SqlState::DuplicateColumn,
+                    format!("column {} assigned more than once", a.column),
+                ));
+            }
+            let source = match &a.value {
+                Operand::Literal(Literal::Null) => RhsPlan::Const(Value::Null),
+                Operand::Literal(Literal::Int(n)) => RhsPlan::Const(Value::Int(*n)),
+                Operand::Column(name) => {
+                    RhsPlan::Column(table.column_index(name).ok_or_else(|| {
+                        EngineError::new(
+                            SqlState::UndefinedColumn,
+                            format!("column does not exist: {name}"),
+                        )
+                    })?)
+                }
+            };
+            let col = &table.columns[idx];
+            plans.push(AssignPlan {
+                idx,
+                name: col.name.clone(),
+                target: col.ty,
+                not_null: col.not_null,
+                source,
+            });
+        }
+
+        let filter = match &upd.filter {
+            Some(p) => Some(self.resolve_predicate(table, p)?),
+            None => None,
+        };
+
+        // Phase 1: build + validate every matching row's new values; no writes yet.
+        let mut updates: Vec<(Vec<u8>, Row)> = Vec::new();
+        for (key, row) in self.store(&upd.table).iter_entries() {
+            let matched = match &filter {
+                None => true,
+                Some(f) => f.eval(row).is_true(),
+            };
+            if !matched {
+                continue;
+            }
+            let mut new_row = row.clone();
+            for plan in &plans {
+                let raw = match plan.source {
+                    RhsPlan::Const(v) => v,
+                    RhsPlan::Column(j) => row[j],
+                };
+                new_row[plan.idx] = plan.check(raw)?;
+            }
+            updates.push((key.clone(), new_row));
+        }
+
+        // Phase 2: apply (keys unchanged — a PK column can't be assigned).
+        let store = self.store_mut(&upd.table);
+        for (key, row) in updates {
+            store.replace(&key, row);
         }
         Ok(Outcome::Statement)
     }
@@ -409,10 +534,57 @@ impl Projection {
     }
 }
 
-/// The right-hand side of a resolved comparison: a constant, or another column.
+/// The right-hand side of a resolved comparison (or an UPDATE assignment source): a
+/// constant, or another column read from the same row.
 enum RhsPlan {
     Const(Value),
     Column(usize),
+}
+
+/// A resolved UPDATE assignment: which column to write, plus the target type and
+/// nullability so the new value is re-checked exactly like INSERT, and where the
+/// value comes from.
+struct AssignPlan {
+    idx: usize,
+    name: String,
+    target: ScalarType,
+    not_null: bool,
+    source: RhsPlan,
+}
+
+impl AssignPlan {
+    /// Type-check a candidate value against this column: NULL into NOT NULL traps
+    /// 23502; an integer outside the target range traps 22003 (CLAUDE.md §8) —
+    /// mirrors INSERT's per-value checks.
+    fn check(&self, v: Value) -> Result<Value> {
+        match v {
+            Value::Null => {
+                if self.not_null {
+                    return Err(EngineError::new(
+                        SqlState::NotNullViolation,
+                        format!(
+                            "null value in column {} violates not-null constraint",
+                            self.name
+                        ),
+                    ));
+                }
+                Ok(Value::Null)
+            }
+            Value::Int(n) => {
+                if !self.target.in_range(n) {
+                    Err(EngineError::new(
+                        SqlState::NumericValueOutOfRange,
+                        format!(
+                            "value out of range for type {}",
+                            self.target.canonical_name()
+                        ),
+                    ))
+                } else {
+                    Ok(Value::Int(n))
+                }
+            }
+        }
+    }
 }
 
 /// A resolved WHERE predicate over fixed column indices.

@@ -5,8 +5,8 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    ColumnDef, CompareOp, CreateTable, Insert, Literal, Operand, OrderBy, Predicate, Select,
-    SelectExpr, SelectItems, Statement,
+    Assignment, ColumnDef, CompareOp, CreateTable, Delete, Insert, Literal, Operand, OrderBy,
+    Predicate, Select, SelectExpr, SelectItems, Statement, Update,
 };
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
@@ -37,6 +37,8 @@ impl Parser {
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("select") => Ok(Statement::Select(self.parse_select()?)),
+            Some("update") => Ok(Statement::Update(self.parse_update()?)),
+            Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
             Some(other) => Err(syntax(format!("unexpected keyword '{other}'"))),
             None => Err(syntax("expected a SQL statement")),
         }
@@ -125,12 +127,7 @@ impl Parser {
         self.expect_keyword("from")?;
         let from = self.expect_identifier()?;
 
-        let filter = if self.peek_keyword().as_deref() == Some("where") {
-            self.advance();
-            Some(self.parse_predicate()?)
-        } else {
-            None
-        };
+        let filter = self.parse_optional_where()?;
 
         let order_by = if self.peek_keyword().as_deref() == Some("order") {
             self.advance();
@@ -158,6 +155,55 @@ impl Parser {
             filter,
             order_by,
         })
+    }
+
+    /// `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.
+    fn parse_update(&mut self) -> Result<Update> {
+        self.expect_keyword("update")?;
+        let table = self.expect_identifier()?;
+        self.expect_keyword("set")?;
+
+        let mut assignments = Vec::new();
+        loop {
+            let column = self.expect_identifier()?;
+            self.expect(&Token::Eq)?;
+            let value = self.parse_operand()?;
+            assignments.push(Assignment { column, value });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        if assignments.is_empty() {
+            return Err(syntax("UPDATE must set at least one column"));
+        }
+
+        let filter = self.parse_optional_where()?;
+        Ok(Update {
+            table,
+            assignments,
+            filter,
+        })
+    }
+
+    /// `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes every row.
+    fn parse_delete(&mut self) -> Result<Delete> {
+        self.expect_keyword("delete")?;
+        self.expect_keyword("from")?;
+        let table = self.expect_identifier()?;
+        let filter = self.parse_optional_where()?;
+        Ok(Delete { table, filter })
+    }
+
+    /// Parse an optional trailing `WHERE <predicate>` (shared by SELECT/UPDATE/DELETE).
+    fn parse_optional_where(&mut self) -> Result<Option<Predicate>> {
+        if self.peek_keyword().as_deref() == Some("where") {
+            self.advance();
+            Ok(Some(self.parse_predicate()?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn parse_select_items(&mut self) -> Result<SelectItems> {

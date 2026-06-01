@@ -56,6 +56,18 @@ func (p *Parser) parseStatement() (Statement, error) {
 			return Statement{}, err
 		}
 		return Statement{Select: sel}, nil
+	case "update":
+		upd, err := p.parseUpdate()
+		if err != nil {
+			return Statement{}, err
+		}
+		return Statement{Update: upd}, nil
+	case "delete":
+		del, err := p.parseDelete()
+		if err != nil {
+			return Statement{}, err
+		}
+		return Statement{Delete: del}, nil
 	case "":
 		return Statement{}, NewError(SyntaxError, "expected a SQL statement")
 	default:
@@ -199,14 +211,11 @@ func (p *Parser) parseSelect() (*Select, error) {
 
 	sel := &Select{Items: items, From: from}
 
-	if p.peekKeyword() == "where" {
-		p.advance()
-		pred, err := p.parsePredicate()
-		if err != nil {
-			return nil, err
-		}
-		sel.Filter = pred
+	filter, err := p.parseOptionalWhere()
+	if err != nil {
+		return nil, err
 	}
+	sel.Filter = filter
 
 	if p.peekKeyword() == "order" {
 		p.advance()
@@ -229,6 +238,80 @@ func (p *Parser) parseSelect() (*Select, error) {
 	}
 
 	return sel, nil
+}
+
+// parseUpdate parses
+// `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.
+func (p *Parser) parseUpdate() (*Update, error) {
+	if err := p.expectKeyword("update"); err != nil {
+		return nil, err
+	}
+	table, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("set"); err != nil {
+		return nil, err
+	}
+
+	var assignments []Assignment
+	for {
+		column, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(TokEq); err != nil {
+			return nil, err
+		}
+		value, err := p.parseOperand()
+		if err != nil {
+			return nil, err
+		}
+		assignments = append(assignments, Assignment{Column: column, Value: value})
+		if p.peek().Kind == TokComma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	if len(assignments) == 0 {
+		return nil, NewError(SyntaxError, "UPDATE must set at least one column")
+	}
+
+	filter, err := p.parseOptionalWhere()
+	if err != nil {
+		return nil, err
+	}
+	return &Update{Table: table, Assignments: assignments, Filter: filter}, nil
+}
+
+// parseDelete parses `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes all rows.
+func (p *Parser) parseDelete() (*Delete, error) {
+	if err := p.expectKeyword("delete"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("from"); err != nil {
+		return nil, err
+	}
+	table, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	filter, err := p.parseOptionalWhere()
+	if err != nil {
+		return nil, err
+	}
+	return &Delete{Table: table, Filter: filter}, nil
+}
+
+// parseOptionalWhere parses an optional trailing `WHERE <predicate>` (shared by
+// SELECT / UPDATE / DELETE).
+func (p *Parser) parseOptionalWhere() (*Predicate, error) {
+	if p.peekKeyword() != "where" {
+		return nil, nil
+	}
+	p.advance()
+	return p.parsePredicate()
 }
 
 func (p *Parser) parseSelectItems() (SelectItems, error) {

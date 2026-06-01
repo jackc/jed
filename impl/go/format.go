@@ -223,8 +223,9 @@ func LoadDatabase(image []byte) (*Database, error) {
 				colTypes[j] = c.Type
 			}
 			name := table.Name
+			hasPK := table.PrimaryKeyIndex() >= 0
 			db.putTable(table)
-			if err := readDataChain(image, pageSize, tableRoot, colTypes, name, db); err != nil {
+			if err := readDataChain(image, pageSize, tableRoot, colTypes, hasPK, name, db); err != nil {
 				return nil, err
 			}
 		}
@@ -233,8 +234,12 @@ func LoadDatabase(image []byte) (*Database, error) {
 	return db, nil
 }
 
-// readDataChain reads every record in a table's data-page chain into its store.
-func readDataChain(image []byte, ps int, root uint32, colTypes []ScalarType, name string, db *Database) error {
+// readDataChain reads every record in a table's data-page chain into its store. For a
+// table with no primary key, the keys are synthetic int64 rowids; advance the store's
+// rowid counter past the largest so future inserts don't collide with a loaded key
+// (spec/fileformat/format.md). No format change — keys are stored verbatim.
+func readDataChain(image []byte, ps int, root uint32, colTypes []ScalarType, hasPK bool, name string, db *Database) error {
+	store := db.stores[strings.ToLower(name)]
 	dp := root
 	for dp != 0 {
 		pg, err := readPage(image, ps, dp)
@@ -250,7 +255,10 @@ func readDataChain(image []byte, ps int, root uint32, colTypes []ScalarType, nam
 			if err != nil {
 				return err
 			}
-			if !db.stores[strings.ToLower(name)].Insert(key, row) {
+			if !hasPK && len(key) == Int64.WidthBytes() {
+				store.BumpRowidTo(DecodeInt(Int64, key) + 1)
+			}
+			if !store.Insert(key, row) {
 				return NewError(DataCorrupted, "duplicate key in data page")
 			}
 		}

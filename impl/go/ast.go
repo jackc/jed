@@ -8,6 +8,8 @@ type Statement struct {
 	CreateTable *CreateTable
 	Insert      *Insert
 	Select      *Select
+	Update      *Update
+	Delete      *Delete
 }
 
 // CreateTable is a CREATE TABLE statement.
@@ -28,6 +30,28 @@ type ColumnDef struct {
 type Insert struct {
 	Table  string
 	Values []Literal
+}
+
+// Update is `UPDATE <table> SET <col> = <operand> [, ...] [WHERE <predicate>]`. Each
+// assignment's right-hand side is evaluated against the pre-update row (so
+// `SET a = b, b = a` swaps). Assigning a PRIMARY KEY column is rejected this slice
+// (the storage key must not change — see the executor).
+type Update struct {
+	Table       string
+	Assignments []Assignment
+	Filter      *Predicate
+}
+
+// Assignment is one `SET <Column> = <Value>` clause.
+type Assignment struct {
+	Column string
+	Value  Operand
+}
+
+// Delete is `DELETE FROM <table> [WHERE <predicate>]`. No WHERE deletes every row.
+type Delete struct {
+	Table  string
+	Filter *Predicate
 }
 
 // Select is a single-table SELECT.

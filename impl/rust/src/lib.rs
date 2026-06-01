@@ -42,6 +42,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Phase C — INSERT ... VALUES with positional type-checking + overflow trap.
     "dml.insert",
     "error.overflow_trap",
+    // Step 6 — row mutation: UPDATE (in-place) + DELETE.
+    "dml.update",
+    "dml.delete",
     // Phase D/E — SELECT, WHERE (=, ordering), ORDER BY, IS [NOT] NULL, 3VL, casts,
     // cross-type comparison via the promotion tower, and all three integer types.
     "query.select",
