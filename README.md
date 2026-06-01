@@ -16,9 +16,16 @@ lockstep with **no reference implementation**.
 
 ```
 spec/        CANONICAL source of truth — design docs + data tables + conformance corpus
-impl/        native cores, one per language (Rust first, then Go), each a downstream
-             consumer of spec/
+impl/        native cores, one per language, each a downstream consumer of spec/
+  rust/      first core — manual ownership, no GC
+  go/        second core — pure Go, no cgo/FFI
+  ts/        third core — native TypeScript on modern Node (type-stripping, no build step)
 ```
+
+All three cores agree byte-for-byte (CLAUDE.md §8): the on-disk format round-trip is
+`rust == go == ts == ruby`. The TS core is native (not a Rust→WASM wrapper) precisely to
+stress the spec on dimensions the systems cores hide — exact int64 (`bigint`), UTF-8 names,
+big-endian bytes.
 
 ## Build order & current status (CLAUDE.md §11)
 

@@ -1,5 +1,6 @@
 [tools]
 go = '1.26.3'
+node = '24.16.0'
 rust = '1.92.0'
 "go:github.com/go-critic/go-critic/cmd/gocritic" = "latest"
 "go:github.com/gordonklaus/ineffassign" = "latest"

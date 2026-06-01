@@ -10,3 +10,8 @@
 # Go build artifacts. NOTE: do not ignore "*.test" — the conformance corpus files
 # use that extension (spec/conformance/suites/**/*.test).
 /impl/go/bin/
+
+# TS core: installed dev-dependencies (typescript + @types/node, type-check only).
+# package-lock.json IS committed for reproducibility; the engine/tests/harness run on
+# bare Node with no install.
+/impl/ts/node_modules/

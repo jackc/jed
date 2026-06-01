@@ -1,0 +1,22 @@
+{
+  // Type-checking only — the engine, tests, and harness RUN on bare Node via native
+  // type-stripping (no emit). `erasableSyntaxOnly` mechanically enforces the
+  // elidable-TS subset (no enum / namespace-with-runtime / parameter properties /
+  // import=), so what tsc accepts here is exactly what Node can strip and run.
+  // See ./README.md for the BigInt / UTF-8 / big-endian decisions.
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "esnext",
+    "lib": ["esnext"],
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "noUncheckedIndexedAccess": false,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}

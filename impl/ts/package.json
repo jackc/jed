@@ -1,0 +1,16 @@
+{
+  "name": "abide-ts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The TypeScript/JavaScript core of the engine (CLAUDE.md §2) — a native, downstream consumer of /spec. Runs on modern Node via native type-stripping; no build step.",
+  "type": "module",
+  "scripts": {
+    "conformance": "node src/bin/conformance.ts",
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  }
+}

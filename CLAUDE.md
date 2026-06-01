@@ -60,9 +60,14 @@ vertical slice.
 Later consumers of an already-hardened spec (reveal far fewer new ambiguities; mostly
 prove portability and expand coverage):
 
-3. **JS / TypeScript** — must run in the browser. Native TS implementation is the
-   default under the multi-core philosophy; a Rust→WASM wrap remains a pragmatic
-   fallback. **TBD.**
+3. **JS / TypeScript** — ✅ **landed as a native core** (`impl/ts`), at full parity with
+   Rust and Go (all 17 capabilities, all 7 conformance suites, and the byte-exact on-disk
+   format — `rust == go == ts == ruby`). A Rust→WASM wrap remains an acceptable *production*
+   fallback, but the native core is what stresses the spec — and it does: int64 is exact
+   via uniform `bigint` (JS numbers are f64), names are UTF-8 (JS strings are UTF-16), and
+   bytes are big-endian via `DataView`. Runs on modern Node by **native type-stripping**
+   (no build step), TS limited to the erasable subset. Browser/OPFS storage host (CLAUDE.md
+   §9) is still later; the engine is kept host-agnostic so it slots in.
 4. **Java**, **C#** — native.
 5. **Swift** — the one asterisk. If Swift's Rust-interop story makes a native port
    impractical, wrapping the Rust core is an acceptable *deliberate exception* to the

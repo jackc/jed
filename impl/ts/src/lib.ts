@@ -1,0 +1,52 @@
+// Public entry point of the TypeScript core (CLAUDE.md §2): a downstream consumer of
+// /spec, the canonical source of truth. Runs natively on modern Node via type-stripping
+// — no build step. int64 is exact (uniform bigint); the on-disk format is byte-identical
+// to the Rust and Go cores (CLAUDE.md §8).
+
+import { Database } from "./executor.ts";
+import type { Outcome } from "./executor.ts";
+import { parseSQL } from "./parser.ts";
+
+// SUPPORTED_CAPABILITIES lists the capabilities this core implements (spec/conformance:
+// the gating axis). The harness runs a corpus file iff every capability in the file's
+// `# requires:` header is in this set. Identical to the Rust/Go cores — full parity.
+export const SUPPORTED_CAPABILITIES: readonly string[] = [
+  // CREATE TABLE with typed columns + single-column PRIMARY KEY.
+  "ddl.create_table",
+  "ddl.primary_key",
+  // INSERT ... VALUES with positional type-checking + overflow trap.
+  "dml.insert",
+  "error.overflow_trap",
+  // Row mutation: UPDATE (in-place) + DELETE.
+  "dml.update",
+  "dml.delete",
+  // SELECT, WHERE (=, ordering), ORDER BY, IS [NOT] NULL, 3VL, casts, cross-type
+  // comparison via the promotion tower, and all three integer types.
+  "query.select",
+  "query.where_eq",
+  "query.comparison_order",
+  "query.is_null",
+  "query.order_by",
+  "null.three_valued",
+  "compare.promotion",
+  "cast.explicit",
+  "types.int16",
+  "types.int32",
+  "types.int64",
+];
+
+// execute parses and executes one SQL statement against db.
+export function execute(db: Database, sql: string): Outcome {
+  return db.executeStmt(parseSQL(sql));
+}
+
+// --- public surface (re-exports) ---
+export { Database } from "./executor.ts";
+export type { Outcome } from "./executor.ts";
+export { parseSQL } from "./parser.ts";
+export { EngineError, sqlStateCode } from "./errors.ts";
+export type { SqlState } from "./errors.ts";
+export { intValue, nullValue, render } from "./value.ts";
+export type { ThreeValued, Value } from "./value.ts";
+export { loadDatabase, toImage } from "./format.ts";
+export type { Statement } from "./ast.ts";
