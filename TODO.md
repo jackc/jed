@@ -53,9 +53,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       coherence checker ([spec/functions/verify.rb](spec/functions/verify.rb), wired into
       `rake verify`), and the *why* in [spec/design/functions.md](spec/design/functions.md).
       Prerequisite for all arithmetic/boolean/function work. _(size: M; §5)_
-- [ ] **Decide & build the codegen "middle path"** for the function catalog — generate
-      per-language operator stubs from the shared data rather than hand-writing N times
-      (§5). Pairs with the catalog above. _(size: M; deps: function catalog; §5)_ _(parallel)_
+- [x] **Decide & build the codegen "middle path"** for the function catalog (§5). Decided:
+      codegen emits **data only** (a per-language operator descriptor table from
+      `spec/functions/catalog.toml`); the parser/executor/evaluator that consume it stay
+      hand-written (§5 forbids codegenning those). Done: [scripts/gen_catalog.rb](scripts/gen_catalog.rb)
+      (`rake codegen`) emits `impl/{rust/src,go,ts/src}/operators.{rs,go,ts}` (checked-in,
+      `@generated`); a `rake verify` drift gate + per-core cross-check tests keep them in
+      sync; the *why* is in [spec/design/codegen.md](spec/design/codegen.md). Forward: extend
+      the generator to types/errors. _(size: M; §5)_ _(parallel)_
 - [ ] **Resolve integer-literal typing** — currently flagged *open* (conformance.md §7):
       is a bare `1000` an `int16`, the smallest fitting type, or context-adapted? Decide in
       `spec/types/`, then add corpus coverage. Blocks clean expression semantics. _(size: S; §4)_

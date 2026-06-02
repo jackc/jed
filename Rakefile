@@ -128,14 +128,23 @@ task :verify do
     ["conformance taxonomy", "spec/conformance/verify.rb"],
     ["file format", "spec/fileformat/verify.rb"],
     ["function catalog", "spec/functions/verify.rb"],
+    ["operator codegen (drift)", "scripts/gen_catalog.rb", "--check"],
   ]
   failures = []
-  checks.each do |name, script|
-    puts "#{name}: #{script}"
-    failures << name unless system(RbConfig.ruby, script)
+  checks.each do |name, script, *args|
+    puts "#{name}: #{script} #{args.join(' ')}".rstrip
+    failures << name unless system(RbConfig.ruby, script, *args)
   end
   abort "verify: failed for #{failures.join(', ')}" unless failures.empty?
   puts "\nAll spec checks passed."
+end
+
+# codegen — the "middle path" (CLAUDE.md §5): (re)generate per-language source from the
+# canonical spec data tables. Currently the operator descriptor tables from
+# spec/functions/catalog.toml; `rake verify` fails if the checked-in files are stale.
+desc "Generate per-language source from the spec data tables (codegen middle path)"
+task :codegen do
+  abort "codegen failed" unless system(RbConfig.ruby, "scripts/gen_catalog.rb")
 end
 
 namespace :references do

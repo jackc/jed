@@ -3,6 +3,7 @@
 //! dependency. If the spec changes and the core doesn't (or vice versa), this fails.
 
 use abide::error::SqlState;
+use abide::operators::OPERATORS;
 use abide::types::ScalarType;
 use std::path::Path;
 
@@ -95,4 +96,57 @@ fn error_codes_are_registered() {
         Some("numeric_value_out_of_range")
     );
     assert_eq!(SqlState::NumericValueOutOfRange.code(), "22003");
+}
+
+#[test]
+fn operators_match_spec() {
+    // The generated operator descriptor table (codegen middle path, CLAUDE.md §5) must
+    // match the canonical catalog field-for-field. This also compiles the generated
+    // table into the crate, so a malformed generation fails the build.
+    let v: toml::Value = toml::from_str(&spec("functions/catalog.toml")).unwrap();
+    let ops = v["operator"].as_array().expect("[[operator]] array");
+    assert_eq!(ops.len(), OPERATORS.len(), "operator count");
+
+    for row in ops {
+        let name = row["name"].as_str().unwrap();
+        let desc = OPERATORS
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("generated table missing operator {name}"));
+
+        assert_eq!(desc.kind, row["kind"].as_str().unwrap(), "{name} kind");
+        assert_eq!(
+            desc.arity as i64,
+            row["arity"].as_integer().unwrap(),
+            "{name} arity"
+        );
+        assert_eq!(
+            desc.arg_resolution,
+            row["arg_resolution"].as_str().unwrap(),
+            "{name} arg_resolution"
+        );
+        assert_eq!(desc.result, row["result"].as_str().unwrap(), "{name} result");
+        assert_eq!(desc.null, row["null"].as_str().unwrap(), "{name} null");
+
+        let fams: Vec<&str> = row["arg_families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(desc.arg_families, fams.as_slice(), "{name} arg_families");
+
+        let errs: Vec<&str> = row["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(desc.errors, errs.as_slice(), "{name} errors");
+
+        match row.get("symbol").and_then(|s| s.as_str()) {
+            Some(sym) => assert_eq!(desc.symbol, Some(sym), "{name} symbol"),
+            None => assert_eq!(desc.symbol, None, "{name} symbol absent"),
+        }
+    }
 }

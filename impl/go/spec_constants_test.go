@@ -9,6 +9,7 @@ package abide
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -83,5 +84,53 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 	}
 	if NumericValueOutOfRange.Code() != "22003" {
 		t.Errorf("NumericValueOutOfRange code mismatch")
+	}
+}
+
+func TestOperatorsMatchSpec(t *testing.T) {
+	// The generated operator descriptor table (codegen middle path, CLAUDE.md §5) must
+	// match the canonical catalog field-for-field.
+	rows := readTomlTables(t, specPath(t, "functions/catalog.toml"), "operator")
+	if len(rows) != len(Operators) {
+		t.Fatalf("operator count: spec %d, generated %d", len(rows), len(Operators))
+	}
+	byName := map[string]OperatorDesc{}
+	for _, d := range Operators {
+		byName[d.Name] = d
+	}
+	for _, row := range rows {
+		name := row.str("name")
+		desc, ok := byName[name]
+		if !ok {
+			t.Fatalf("generated table missing operator %q", name)
+		}
+		if desc.Kind != row.str("kind") {
+			t.Errorf("%s: kind got %q want %q", name, desc.Kind, row.str("kind"))
+		}
+		if int64(desc.Arity) != row.int("arity") {
+			t.Errorf("%s: arity mismatch", name)
+		}
+		if desc.ArgResolution != row.str("arg_resolution") {
+			t.Errorf("%s: arg_resolution mismatch", name)
+		}
+		if desc.Result != row.str("result") {
+			t.Errorf("%s: result mismatch", name)
+		}
+		if desc.Null != row.str("null") {
+			t.Errorf("%s: null mismatch", name)
+		}
+		if strings.Join(desc.ArgFamilies, ",") != strings.Join(row.strs("arg_families"), ",") {
+			t.Errorf("%s: arg_families mismatch", name)
+		}
+		if strings.Join(desc.Errors, ",") != strings.Join(row.strs("errors"), ",") {
+			t.Errorf("%s: errors mismatch", name)
+		}
+		if row.str("kind") == "comparison" {
+			if desc.Symbol != row.str("symbol") {
+				t.Errorf("%s: symbol mismatch", name)
+			}
+		} else if desc.Symbol != "" {
+			t.Errorf("%s: expected empty symbol, got %q", name, desc.Symbol)
+		}
 	}
 }

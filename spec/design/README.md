@@ -15,6 +15,9 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   non-reserved identifiers, the deliberate narrowings, and how the grammar grows.
 - [functions.md](functions.md) — the function/operator catalog: the family-based operand
   contract, the truth-value result types, NULL propagation vs detection, and how it grows.
+- [codegen.md](codegen.md) — the codegen "middle path": what is generated (data-shaped
+  descriptor tables) vs hand-written (parser/executor/evaluator), the drift gate, and the
+  per-core cross-check.
 - [conformance.md](conformance.md) — the conformance corpus: sqllogictest-style format,
   structured-error matching, the tier + capability-flag system, and determinism rules.
 - [encoding.md](encoding.md) — order-preserving key encoding: the `int-be-signflip` rule,

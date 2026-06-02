@@ -14,6 +14,7 @@ import {
   scalarTypeFromName,
   widthBytes,
 } from "../src/types.ts";
+import { OPERATORS } from "../src/operators.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
 
 test("scalar types match spec/types/scalars.toml", () => {
@@ -62,4 +63,30 @@ test("error codes are registered in spec/errors/registry.toml", () => {
   }
   assert.equal(codes.get("22003"), "numeric_value_out_of_range");
   assert.equal(sqlStateCode("numeric_value_out_of_range"), "22003");
+});
+
+test("operators match spec/functions/catalog.toml", () => {
+  // The generated operator descriptor table (codegen middle path, CLAUDE.md §5) must
+  // match the canonical catalog field-for-field.
+  const rows = readTomlTables(specPath("functions/catalog.toml"), "operator");
+  assert.equal(rows.length, OPERATORS.length, "operator count");
+  const byName = new Map(OPERATORS.map((d) => [d.name, d]));
+  for (const row of rows) {
+    const name = row.str("name");
+    const desc = byName.get(name);
+    assert.notEqual(desc, undefined, `generated table missing operator ${name}`);
+    const d = desc!;
+    assert.equal(d.kind, row.str("kind"), `${name}: kind`);
+    assert.equal(d.arity, row.num("arity"), `${name}: arity`);
+    assert.equal(d.argResolution, row.str("arg_resolution"), `${name}: arg_resolution`);
+    assert.equal(d.result, row.str("result"), `${name}: result`);
+    assert.equal(d.null, row.str("null"), `${name}: null`);
+    assert.deepEqual([...d.argFamilies], row.strs("arg_families"), `${name}: argFamilies`);
+    assert.deepEqual([...d.errors], row.strs("errors"), `${name}: errors`);
+    if (row.str("kind") === "comparison") {
+      assert.equal(d.symbol, row.str("symbol"), `${name}: symbol`);
+    } else {
+      assert.equal(d.symbol, undefined, `${name}: symbol absent`);
+    }
+  }
 });
