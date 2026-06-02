@@ -105,9 +105,9 @@ fn parse_cost_directive(rest: &str) -> Option<i64> {
 /// Assert the accrued execution cost matches a pending `# cost:` directive (if any).
 fn assert_cost(expected: Option<i64>, actual: i64, sql: &str) -> std::result::Result<(), String> {
     match expected {
-        Some(e) if e != actual => {
-            Err(format!("cost mismatch: expected {e}, got {actual}\n  SQL: {sql}"))
-        }
+        Some(e) if e != actual => Err(format!(
+            "cost mismatch: expected {e}, got {actual}\n  SQL: {sql}"
+        )),
         _ => Ok(()),
     }
 }

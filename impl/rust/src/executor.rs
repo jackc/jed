@@ -14,8 +14,8 @@ use crate::costs::COSTS;
 use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
 use crate::storage::{Row, TableStore};
-use crate::types::{is_boolean_type_name, ScalarType};
-use crate::value::{and3, from3, not3, or3, Value};
+use crate::types::{ScalarType, is_boolean_type_name};
+use crate::value::{Value, and3, from3, not3, or3};
 use std::collections::HashMap;
 
 /// The outcome of executing one statement. Both variants carry the deterministic
@@ -1009,13 +1009,19 @@ fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> 
         ArithOp::Mul => x.checked_mul(y),
         ArithOp::Div => {
             if y == 0 {
-                return Err(EngineError::new(SqlState::DivisionByZero, "division by zero"));
+                return Err(EngineError::new(
+                    SqlState::DivisionByZero,
+                    "division by zero",
+                ));
             }
             x.checked_div(y)
         }
         ArithOp::Mod => {
             if y == 0 {
-                return Err(EngineError::new(SqlState::DivisionByZero, "division by zero"));
+                return Err(EngineError::new(
+                    SqlState::DivisionByZero,
+                    "division by zero",
+                ));
             }
             x.checked_rem(y)
         }

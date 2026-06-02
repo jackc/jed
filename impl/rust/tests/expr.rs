@@ -4,7 +4,7 @@
 //! corpus (spec/conformance/suites/expr/) with finer-grained per-feature assertions.
 
 use abide::value::Value;
-use abide::{execute, Database, Outcome};
+use abide::{Database, Outcome, execute};
 
 fn db_with(stmts: &[&str]) -> Database {
     let mut db = Database::new();
@@ -31,7 +31,9 @@ fn scalar(db: &mut Database, sql: &str) -> Value {
 }
 
 fn err_code(db: &mut Database, sql: &str) -> &'static str {
-    execute(db, sql).expect_err(&format!("{sql:?} should fail")).code()
+    execute(db, sql)
+        .expect_err(&format!("{sql:?} should fail"))
+        .code()
 }
 
 fn setup() -> Database {
@@ -47,14 +49,32 @@ fn setup() -> Database {
 fn arithmetic_and_precedence() {
     let mut db = setup();
     // * binds tighter than +; parens override.
-    assert_eq!(scalar(&mut db, "SELECT 6 + 4 * 2 FROM t WHERE id = 1"), Value::Int(14));
-    assert_eq!(scalar(&mut db, "SELECT (6 + 4) * 2 FROM t WHERE id = 1"), Value::Int(20));
+    assert_eq!(
+        scalar(&mut db, "SELECT 6 + 4 * 2 FROM t WHERE id = 1"),
+        Value::Int(14)
+    );
+    assert_eq!(
+        scalar(&mut db, "SELECT (6 + 4) * 2 FROM t WHERE id = 1"),
+        Value::Int(20)
+    );
     // the four binary ops over columns.
-    assert_eq!(scalar(&mut db, "SELECT a + b FROM t WHERE id = 2"), Value::Int(26));
-    assert_eq!(scalar(&mut db, "SELECT a * b FROM t WHERE id = 2"), Value::Int(120));
+    assert_eq!(
+        scalar(&mut db, "SELECT a + b FROM t WHERE id = 2"),
+        Value::Int(26)
+    );
+    assert_eq!(
+        scalar(&mut db, "SELECT a * b FROM t WHERE id = 2"),
+        Value::Int(120)
+    );
     // integer division truncates toward zero; remainder takes the dividend's sign.
-    assert_eq!(scalar(&mut db, "SELECT a / b FROM t WHERE id = 3"), Value::Int(-2));
-    assert_eq!(scalar(&mut db, "SELECT a % b FROM t WHERE id = 3"), Value::Int(-1));
+    assert_eq!(
+        scalar(&mut db, "SELECT a / b FROM t WHERE id = 3"),
+        Value::Int(-2)
+    );
+    assert_eq!(
+        scalar(&mut db, "SELECT a % b FROM t WHERE id = 3"),
+        Value::Int(-1)
+    );
 }
 
 #[test]
@@ -73,7 +93,10 @@ fn overflow_traps_at_the_result_type() {
         "CREATE TABLE e (id int32 PRIMARY KEY, a int32, b int32)",
         "INSERT INTO e VALUES (1, 2147483647, 1)",
     ]);
-    assert_eq!(err_code(&mut db, "SELECT a + b FROM e WHERE id = 1"), "22003");
+    assert_eq!(
+        err_code(&mut db, "SELECT a + b FROM e WHERE id = 1"),
+        "22003"
+    );
     // Widening the operand to int64 lifts the boundary.
     assert_eq!(
         scalar(&mut db, "SELECT CAST(a AS int64) + b FROM e WHERE id = 1"),
@@ -84,23 +107,41 @@ fn overflow_traps_at_the_result_type() {
 #[test]
 fn division_and_modulo_by_zero_trap_22012() {
     let mut db = setup();
-    assert_eq!(err_code(&mut db, "SELECT a / 0 FROM t WHERE id = 1"), "22012");
-    assert_eq!(err_code(&mut db, "SELECT a % 0 FROM t WHERE id = 1"), "22012");
+    assert_eq!(
+        err_code(&mut db, "SELECT a / 0 FROM t WHERE id = 1"),
+        "22012"
+    );
+    assert_eq!(
+        err_code(&mut db, "SELECT a % 0 FROM t WHERE id = 1"),
+        "22012"
+    );
 }
 
 #[test]
 fn unary_minus_and_int64_min() {
     let mut db = setup();
-    assert_eq!(scalar(&mut db, "SELECT -a FROM t WHERE id = 1"), Value::Int(-6));
-    assert_eq!(scalar(&mut db, "SELECT - -a FROM t WHERE id = 1"), Value::Int(6));
+    assert_eq!(
+        scalar(&mut db, "SELECT -a FROM t WHERE id = 1"),
+        Value::Int(-6)
+    );
+    assert_eq!(
+        scalar(&mut db, "SELECT - -a FROM t WHERE id = 1"),
+        Value::Int(6)
+    );
     // int64's minimum is reachable only via unary minus.
     assert_eq!(
         scalar(&mut db, "SELECT -9223372036854775808 FROM t WHERE id = 1"),
         Value::Int(i64::MIN)
     );
     // a bare 2^63 fits no signed type (22003); a larger magnitude is a lex error (42601).
-    assert_eq!(err_code(&mut db, "SELECT 9223372036854775808 FROM t WHERE id = 1"), "22003");
-    assert_eq!(err_code(&mut db, "SELECT 9223372036854775809 FROM t WHERE id = 1"), "42601");
+    assert_eq!(
+        err_code(&mut db, "SELECT 9223372036854775808 FROM t WHERE id = 1"),
+        "22003"
+    );
+    assert_eq!(
+        err_code(&mut db, "SELECT 9223372036854775809 FROM t WHERE id = 1"),
+        "42601"
+    );
 }
 
 #[test]
@@ -121,8 +162,14 @@ fn comparisons_project_booleans() {
         ]
     );
     // literals render canonically.
-    assert_eq!(scalar(&mut db, "SELECT TRUE FROM t WHERE id = 1"), Value::Bool(true));
-    assert_eq!(scalar(&mut db, "SELECT FALSE FROM t WHERE id = 1"), Value::Bool(false));
+    assert_eq!(
+        scalar(&mut db, "SELECT TRUE FROM t WHERE id = 1"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        scalar(&mut db, "SELECT FALSE FROM t WHERE id = 1"),
+        Value::Bool(false)
+    );
     assert_eq!(Value::Bool(true).render(), "true");
     assert_eq!(Value::Bool(false).render(), "false");
 }
@@ -137,7 +184,10 @@ fn kleene_connectives() {
     ]);
     // false AND unknown = false (NULL does not propagate through a dominant FALSE).
     assert_eq!(
-        scalar(&mut db, "SELECT (p = 1) AND (q = NULL) FROM tv WHERE id = 1"),
+        scalar(
+            &mut db,
+            "SELECT (p = 1) AND (q = NULL) FROM tv WHERE id = 1"
+        ),
         Value::Bool(false)
     );
     // true OR unknown = true.
@@ -159,12 +209,30 @@ fn type_errors_and_boolean_narrowings() {
     assert_eq!(err_code(&mut db, "SELECT id FROM t WHERE a"), "42804");
     // logical connectives need boolean operands; arithmetic needs integer operands.
     assert_eq!(err_code(&mut db, "SELECT id FROM t WHERE a AND b"), "42804");
-    assert_eq!(err_code(&mut db, "SELECT (a = b) + 1 FROM t WHERE id = 1"), "42804");
+    assert_eq!(
+        err_code(&mut db, "SELECT (a = b) + 1 FROM t WHERE id = 1"),
+        "42804"
+    );
     // comparisons are integer-only — comparing two booleans is a type error.
-    assert_eq!(err_code(&mut db, "SELECT id FROM t WHERE (a = b) = (a = b)"), "42804");
+    assert_eq!(
+        err_code(&mut db, "SELECT id FROM t WHERE (a = b) = (a = b)"),
+        "42804"
+    );
     // boolean is not a storable column type, nor a CAST target (0A000).
-    assert_eq!(err_code(&mut db, "CREATE TABLE bt (id int32 PRIMARY KEY, flag boolean)"), "0A000");
-    assert_eq!(err_code(&mut db, "SELECT CAST(a AS boolean) FROM t WHERE id = 1"), "0A000");
+    assert_eq!(
+        err_code(
+            &mut db,
+            "CREATE TABLE bt (id int32 PRIMARY KEY, flag boolean)"
+        ),
+        "0A000"
+    );
+    assert_eq!(
+        err_code(&mut db, "SELECT CAST(a AS boolean) FROM t WHERE id = 1"),
+        "0A000"
+    );
     // there is no boolean -> integer cast.
-    assert_eq!(err_code(&mut db, "SELECT CAST(a = b AS int32) FROM t WHERE id = 1"), "42804");
+    assert_eq!(
+        err_code(&mut db, "SELECT CAST(a = b AS int32) FROM t WHERE id = 1"),
+        "42804"
+    );
 }

@@ -5,7 +5,7 @@
 use abide::costs::COSTS;
 use abide::error::SqlState;
 use abide::operators::OPERATORS;
-use abide::types::{is_boolean_type_name, ScalarType};
+use abide::types::{ScalarType, is_boolean_type_name};
 use std::path::Path;
 
 fn spec(rel: &str) -> String {
@@ -65,7 +65,11 @@ fn scalar_types_match_spec() {
         .iter()
         .find(|t| t["id"].as_str() == Some("boolean"))
         .expect("boolean type present");
-    assert_eq!(boolean["family"].as_str(), Some("boolean"), "boolean family");
+    assert_eq!(
+        boolean["family"].as_str(),
+        Some("boolean"),
+        "boolean family"
+    );
     assert_eq!(
         boolean["storable"].as_bool(),
         Some(false),
@@ -156,11 +160,17 @@ fn operators_match_spec() {
             row["arg_resolution"].as_str().unwrap(),
             "{name} arg_resolution"
         );
-        assert_eq!(desc.result, row["result"].as_str().unwrap(), "{name} result");
+        assert_eq!(
+            desc.result,
+            row["result"].as_str().unwrap(),
+            "{name} result"
+        );
         assert_eq!(desc.null, row["null"].as_str().unwrap(), "{name} null");
         assert_eq!(
             desc.precedence as i64,
-            row.get("precedence").and_then(|p| p.as_integer()).unwrap_or(0),
+            row.get("precedence")
+                .and_then(|p| p.as_integer())
+                .unwrap_or(0),
             "{name} precedence"
         );
 
