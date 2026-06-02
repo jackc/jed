@@ -19,11 +19,13 @@ restating it.
 
 | Kind | Operators | Result | NULL |
 |---|---|---|---|
-| `comparison` | `=` `<` `>` `<=` `>=` | `truth` (three-valued) | propagates |
-| `null_test` | `IS NULL`, `IS NOT NULL` | `truth` (always definite) | detects |
+| `logical` | `AND` `OR` `NOT` | `boolean` | `kleene` (AND/OR), `propagates` (NOT) |
+| `comparison` | `=` `<` `>` `<=` `>=` | `boolean` | propagates |
+| `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` (always definite) | detects |
+| `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` | propagates |
 
-> Status: covers the comparison operators and null tests the cores hardcode today
-> (`<>`/`!=` do not exist). Deferred kinds — arithmetic (`+ - * / %`), logical
-> (`AND`/`OR`/`NOT`), `IS [NOT] DISTINCT FROM`, named functions — and the `cost`/`precedence`
-> fields are added here *first* as their features land. Coherence is checked by
+> Status: covers the comparison/null-test/arithmetic/logical operators the cores
+> implement today (`<>`/`!=` do not exist). The `precedence` field is now authored;
+> `cost` and the deferred surfaces — `IS [NOT] DISTINCT FROM`, named `function` entries —
+> are added here *first* as their features land. Coherence is checked by
 > [verify.rb](verify.rb) (`rake verify`).

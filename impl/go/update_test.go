@@ -48,7 +48,7 @@ func TestUpdateNoWhereTouchesEveryRow(t *testing.T) {
 func TestUpdateToNullInNullableColumn(t *testing.T) {
 	db := setupUpdate(t)
 	mustCreate(t, db, "UPDATE t SET a = NULL WHERE id = 3")
-	if got := query(t, db, "SELECT a FROM t WHERE id = 3"); !got[0][0].Null {
+	if got := query(t, db, "SELECT a FROM t WHERE id = 3"); !got[0][0].IsNull() {
 		t.Errorf("expected NULL, got %v", got)
 	}
 }

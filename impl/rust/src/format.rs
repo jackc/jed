@@ -69,6 +69,9 @@ fn encode_value(ty: ScalarType, v: Value) -> Vec<u8> {
     match v {
         Value::Null => encode_nullable(ty, None),
         Value::Int(n) => encode_nullable(ty, Some(n)),
+        // Unreachable: boolean is expression-only this slice; no column is boolean, so
+        // a boolean value is never serialized (spec/design/types.md §1).
+        Value::Bool(_) => unreachable!("a boolean cannot be a stored column value"),
     }
 }
 

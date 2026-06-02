@@ -28,13 +28,14 @@ corpus entries pass"; the corpus *is* the contract, not an afterthought.
 | [verify.rb](verify.rb) | Taxonomy checker (run via `rake verify`): validates manifest ↔ corpus coherence. |
 | [suites/query/](suites/query/) | CREATE/INSERT/SELECT/`WHERE pk =`/`ORDER BY`. |
 | [suites/null/](suites/null/) | NULL storage, `IS [NOT] NULL`, three-valued logic. |
-| [suites/types/](suites/types/) | Type behavior — integer overflow trap. |
+| [suites/types/](suites/types/) | Type behavior — integer overflow trap, literal typing. |
 | [suites/cast/](suites/cast/) | Explicit `CAST` narrowing + overflow. |
 | [suites/compare/](suites/compare/) | Cross-type comparison via the promotion tower. |
+| [suites/expr/](suites/expr/) | The expression substrate — arithmetic, unary minus, the expression-only `boolean`, AND/OR/NOT, precedence, type errors. |
 
 Each implementation under [../../impl/](../../impl/) ships a thin harness that reads the
 manifest, runs each `.test` whose `# requires:` capabilities it declares, and reports the
 profiles it meets. Harnesses arrive with the first vertical slice (CLAUDE.md §11 step 5).
 
-> Status: format + taxonomy + integer corpus authored (5 suites; `core`/`casts`/`comparison`
-> profiles). Harnesses land at step 5.
+> Status: format + taxonomy + corpus authored (6 suites; `core`/`mutation`/`casts`/
+> `comparison`/`expression` profiles). All three cores pass the corpus.

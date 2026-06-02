@@ -87,6 +87,12 @@ export class TomlRow {
   strs(key: string): string[] {
     return this.arrVals.get(key) ?? [];
   }
+  has(key: string): boolean {
+    return this.vals.has(key);
+  }
+  bool(key: string): boolean {
+    return this.str(key) === "true";
+  }
 }
 
 // readTomlTables parses every `[[section]]` array-of-tables entry from a TOML file.

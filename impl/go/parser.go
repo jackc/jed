@@ -1,6 +1,33 @@
 package abide
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
+
+// foldInt converts a lexed unsigned magnitude (<= 2^63) and a sign into a signed
+// int64, reporting ok=false when the result does not fit (a bare 2^63, or the
+// not-negated 2^63). -(2^63) folds to int64's minimum. See spec/design/grammar.md §4.
+func foldInt(magnitude uint64, negate bool) (int64, bool) {
+	if negate {
+		if magnitude <= uint64(math.MaxInt64) {
+			return -int64(magnitude), true
+		}
+		if magnitude == uint64(1)<<63 {
+			return math.MinInt64, true
+		}
+		return 0, false
+	}
+	if magnitude <= uint64(math.MaxInt64) {
+		return int64(magnitude), true
+	}
+	return 0, false
+}
+
+// binaryExpr builds a binary-operator expression node.
+func binaryExpr(op BinaryOp, lhs, rhs Expr) Expr {
+	return Expr{Kind: ExprBinary, Binary: &BinaryExpr{Op: op, Lhs: lhs, Rhs: rhs}}
+}
 
 // Hand-written recursive-descent parser (CLAUDE.md §5, §10).
 //
@@ -177,14 +204,30 @@ func (p *Parser) parseInsert() (*Insert, error) {
 	return &Insert{Table: table, Values: values}, nil
 }
 
-// parseLiteral parses an integer literal or the keyword NULL.
+// parseLiteral parses a literal value for INSERT: an integer (with an optional leading
+// unary minus, folded here), or one of the keywords NULL / TRUE / FALSE. INSERT takes
+// literals only — not general expressions (spec/grammar/grammar.ebnf `literal`).
 func (p *Parser) parseLiteral() (Literal, error) {
+	negate := false
+	if p.peek().Kind == TokMinus {
+		p.advance()
+		negate = true
+	}
 	t := p.advance()
 	switch {
 	case t.Kind == TokInt:
-		return Literal{Kind: LiteralInt, Int: t.Int}, nil
-	case t.Kind == TokWord && toLowerASCII(t.Word) == "null":
+		v, ok := foldInt(t.Int, negate)
+		if !ok {
+			return Literal{}, NewError(NumericValueOutOfRange,
+				"value out of range: integer literal exceeds the maximum signed 64-bit value")
+		}
+		return Literal{Kind: LiteralInt, Int: v}, nil
+	case !negate && t.Kind == TokWord && toLowerASCII(t.Word) == "null":
 		return Literal{Kind: LiteralNull}, nil
+	case !negate && t.Kind == TokWord && toLowerASCII(t.Word) == "true":
+		return Literal{Kind: LiteralBool, Bool: true}, nil
+	case !negate && t.Kind == TokWord && toLowerASCII(t.Word) == "false":
+		return Literal{Kind: LiteralBool, Bool: false}, nil
 	default:
 		return Literal{}, NewError(SyntaxError, "expected a literal value")
 	}
@@ -263,7 +306,7 @@ func (p *Parser) parseUpdate() (*Update, error) {
 		if err := p.expect(TokEq); err != nil {
 			return nil, err
 		}
-		value, err := p.parseOperand()
+		value, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
@@ -304,14 +347,19 @@ func (p *Parser) parseDelete() (*Delete, error) {
 	return &Delete{Table: table, Filter: filter}, nil
 }
 
-// parseOptionalWhere parses an optional trailing `WHERE <predicate>` (shared by
-// SELECT / UPDATE / DELETE).
-func (p *Parser) parseOptionalWhere() (*Predicate, error) {
+// parseOptionalWhere parses an optional trailing `WHERE <expr>` (shared by
+// SELECT / UPDATE / DELETE). The expression must resolve to boolean (checked by the
+// executor).
+func (p *Parser) parseOptionalWhere() (*Expr, error) {
 	if p.peekKeyword() != "where" {
 		return nil, nil
 	}
 	p.advance()
-	return p.parsePredicate()
+	e, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
 }
 
 func (p *Parser) parseSelectItems() (SelectItems, error) {
@@ -319,13 +367,13 @@ func (p *Parser) parseSelectItems() (SelectItems, error) {
 		p.advance()
 		return SelectItems{All: true}, nil
 	}
-	var items []SelectExpr
+	var items []Expr
 	for {
-		expr, err := p.parseSelectExpr()
+		e, err := p.parseExpr()
 		if err != nil {
 			return SelectItems{}, err
 		}
-		items = append(items, expr)
+		items = append(items, e)
 		if p.peek().Kind == TokComma {
 			p.advance()
 			continue
@@ -335,47 +383,66 @@ func (p *Parser) parseSelectItems() (SelectItems, error) {
 	return SelectItems{Items: items}, nil
 }
 
-// parseSelectExpr parses `CAST ( <expr> AS <type> )`, a bare integer literal, or a
-// bare column name.
-func (p *Parser) parseSelectExpr() (SelectExpr, error) {
-	if p.peekKeyword() == "cast" {
-		p.advance()
-		if err := p.expect(TokLParen); err != nil {
-			return SelectExpr{}, err
-		}
-		inner, err := p.parseSelectExpr()
-		if err != nil {
-			return SelectExpr{}, err
-		}
-		if err := p.expectKeyword("as"); err != nil {
-			return SelectExpr{}, err
-		}
-		typeName, err := p.expectIdentifier()
-		if err != nil {
-			return SelectExpr{}, err
-		}
-		if err := p.expect(TokRParen); err != nil {
-			return SelectExpr{}, err
-		}
-		return SelectExpr{Cast: &CastExpr{Inner: inner, TypeName: typeName}}, nil
-	}
-	if p.peek().Kind == TokInt {
-		n := p.advance().Int
-		return SelectExpr{Literal: &Literal{Kind: LiteralInt, Int: n}}, nil
-	}
-	col, err := p.expectIdentifier()
+// --- expression precedence ladder (spec/grammar/grammar.ebnf `expr`) ----------
+// Loosest to tightest: OR < AND < NOT < comparison/IS NULL < additive <
+// multiplicative < unary minus < primary. One function per level keeps the grammar
+// legible (CLAUDE.md §10). The precedence is authored data (spec/functions/catalog.toml);
+// this ladder must agree with it.
+
+// parseExpr is the entry point for WHERE, the SELECT list, and UPDATE assignment values.
+func (p *Parser) parseExpr() (Expr, error) { return p.parseOr() }
+
+func (p *Parser) parseOr() (Expr, error) {
+	lhs, err := p.parseAnd()
 	if err != nil {
-		return SelectExpr{}, err
+		return Expr{}, err
 	}
-	return SelectExpr{Column: col}, nil
+	for p.peekKeyword() == "or" {
+		p.advance()
+		rhs, err := p.parseAnd()
+		if err != nil {
+			return Expr{}, err
+		}
+		lhs = binaryExpr(OpOr, lhs, rhs)
+	}
+	return lhs, nil
 }
 
-// parsePredicate parses `<col> IS [NOT] NULL` or `<col> <cmp> <operand>`, where
-// <operand> is another column or a literal.
-func (p *Parser) parsePredicate() (*Predicate, error) {
-	col, err := p.expectIdentifier()
+func (p *Parser) parseAnd() (Expr, error) {
+	lhs, err := p.parseNot()
 	if err != nil {
-		return nil, err
+		return Expr{}, err
+	}
+	for p.peekKeyword() == "and" {
+		p.advance()
+		rhs, err := p.parseNot()
+		if err != nil {
+			return Expr{}, err
+		}
+		lhs = binaryExpr(OpAnd, lhs, rhs)
+	}
+	return lhs, nil
+}
+
+func (p *Parser) parseNot() (Expr, error) {
+	if p.peekKeyword() == "not" {
+		p.advance()
+		operand, err := p.parseNot() // right-associative: NOT NOT x
+		if err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: operand}}, nil
+	}
+	return p.parseComparison()
+}
+
+// parseComparison parses one comparison or a postfix IS [NOT] NULL, both
+// non-associative: `a = b = c` is a syntax error, and `a + 1 IS NULL` binds as
+// `(a + 1) IS NULL`.
+func (p *Parser) parseComparison() (Expr, error) {
+	lhs, err := p.parseAdditive()
+	if err != nil {
+		return Expr{}, err
 	}
 	if p.peekKeyword() == "is" {
 		p.advance()
@@ -385,12 +452,12 @@ func (p *Parser) parsePredicate() (*Predicate, error) {
 			negated = true
 		}
 		if err := p.expectKeyword("null"); err != nil {
-			return nil, err
+			return Expr{}, err
 		}
-		return &Predicate{IsNull: &IsNullPredicate{Column: col, Negated: negated}}, nil
+		return Expr{Kind: ExprIsNull, IsNullOf: &IsNullExpr{Operand: lhs, Negated: negated}}, nil
 	}
-	var op CompareOp
-	switch p.advance().Kind {
+	var op BinaryOp
+	switch p.peek().Kind {
 	case TokEq:
 		op = OpEq
 	case TokLt:
@@ -402,34 +469,151 @@ func (p *Parser) parsePredicate() (*Predicate, error) {
 	case TokGe:
 		op = OpGe
 	default:
-		return nil, NewError(SyntaxError, "expected a comparison operator")
+		return lhs, nil
 	}
-	rhs, err := p.parseOperand()
+	p.advance()
+	rhs, err := p.parseAdditive()
 	if err != nil {
-		return nil, err
+		return Expr{}, err
 	}
-	return &Predicate{Compare: &ComparePredicate{Column: col, Op: op, RHS: rhs}}, nil
+	return binaryExpr(op, lhs, rhs), nil
 }
 
-// parseOperand parses a comparison's right-hand side: a literal (integer or NULL) or
-// a column reference.
-func (p *Parser) parseOperand() (Operand, error) {
+func (p *Parser) parseAdditive() (Expr, error) {
+	lhs, err := p.parseMultiplicative()
+	if err != nil {
+		return Expr{}, err
+	}
+	for {
+		var op BinaryOp
+		switch p.peek().Kind {
+		case TokPlus:
+			op = OpAdd
+		case TokMinus:
+			op = OpSub
+		default:
+			return lhs, nil
+		}
+		p.advance()
+		rhs, err := p.parseMultiplicative()
+		if err != nil {
+			return Expr{}, err
+		}
+		lhs = binaryExpr(op, lhs, rhs)
+	}
+}
+
+func (p *Parser) parseMultiplicative() (Expr, error) {
+	lhs, err := p.parseUnary()
+	if err != nil {
+		return Expr{}, err
+	}
+	for {
+		var op BinaryOp
+		switch p.peek().Kind {
+		case TokStar:
+			op = OpMul
+		case TokSlash:
+			op = OpDiv
+		case TokPercent:
+			op = OpMod
+		default:
+			return lhs, nil
+		}
+		p.advance()
+		rhs, err := p.parseUnary()
+		if err != nil {
+			return Expr{}, err
+		}
+		lhs = binaryExpr(op, lhs, rhs)
+	}
+}
+
+func (p *Parser) parseUnary() (Expr, error) {
+	if p.peek().Kind == TokMinus {
+		p.advance()
+		// Fold unary-minus-of-an-integer-literal into one negative literal, so int64's
+		// minimum is representable and the literal range-checks against context.
+		if p.peek().Kind == TokInt {
+			v, ok := foldInt(p.advance().Int, true)
+			if !ok {
+				return Expr{}, NewError(NumericValueOutOfRange,
+					"value out of range: integer literal exceeds the maximum signed 64-bit value")
+			}
+			return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralInt, Int: v}}, nil
+		}
+		operand, err := p.parseUnary()
+		if err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNeg, Operand: operand}}, nil
+	}
+	return p.parsePrimary()
+}
+
+// parsePrimary parses a parenthesized expression, CAST(...), a literal (integer,
+// TRUE/FALSE, NULL), or a column reference.
+func (p *Parser) parsePrimary() (Expr, error) {
+	if p.peek().Kind == TokLParen {
+		p.advance()
+		e, err := p.parseExpr()
+		if err != nil {
+			return Expr{}, err
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Expr{}, err
+		}
+		return e, nil
+	}
+	if p.peekKeyword() == "cast" {
+		p.advance()
+		if err := p.expect(TokLParen); err != nil {
+			return Expr{}, err
+		}
+		inner, err := p.parseExpr()
+		if err != nil {
+			return Expr{}, err
+		}
+		if err := p.expectKeyword("as"); err != nil {
+			return Expr{}, err
+		}
+		typeName, err := p.expectIdentifier()
+		if err != nil {
+			return Expr{}, err
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprCast, Cast: &CastExpr{Inner: inner, TypeName: typeName}}, nil
+	}
 	t := p.peek()
 	switch {
 	case t.Kind == TokInt:
-		p.advance()
-		return Operand{Literal: &Literal{Kind: LiteralInt, Int: t.Int}}, nil
+		v, ok := foldInt(p.advance().Int, false)
+		if !ok {
+			// The only magnitude > MaxInt64 the lexer admits is 2^63, which fits no
+			// signed integer type unless negated (handled by the unary-minus fold).
+			return Expr{}, NewError(NumericValueOutOfRange,
+				"value out of range: integer literal exceeds the maximum signed 64-bit value")
+		}
+		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralInt, Int: v}}, nil
 	case t.Kind == TokWord && toLowerASCII(t.Word) == "null":
 		p.advance()
-		return Operand{Literal: &Literal{Kind: LiteralNull}}, nil
+		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralNull}}, nil
+	case t.Kind == TokWord && toLowerASCII(t.Word) == "true":
+		p.advance()
+		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralBool, Bool: true}}, nil
+	case t.Kind == TokWord && toLowerASCII(t.Word) == "false":
+		p.advance()
+		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralBool, Bool: false}}, nil
 	case t.Kind == TokWord:
 		col, err := p.expectIdentifier()
 		if err != nil {
-			return Operand{}, err
+			return Expr{}, err
 		}
-		return Operand{Column: col}, nil
+		return Expr{Kind: ExprColumn, Column: col}, nil
 	default:
-		return Operand{}, NewError(SyntaxError, "expected an operand")
+		return Expr{}, NewError(SyntaxError, "expected an expression")
 	}
 }
 

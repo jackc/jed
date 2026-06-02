@@ -1,0 +1,88 @@
+# Three-valued (Kleene) AND / OR / NOT, exhaustive over {true, false, unknown}, plus
+# compound WHERE (a row is kept iff the predicate is TRUE). Each of p, q encodes a
+# truth value via (col = 1): col = 1 -> TRUE, col = 0 -> FALSE, col = NULL -> unknown.
+# The nine rows are all (p, q) combinations. Truth tables: spec/design/types.md §9.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.int32, types.boolean, query.logical_connectives, expr.comparison_value, expr.parens, null.three_valued
+
+statement ok
+CREATE TABLE tv (id int32 PRIMARY KEY, p int32, q int32)
+
+statement ok
+INSERT INTO tv VALUES (1, 1, 1)
+
+statement ok
+INSERT INTO tv VALUES (2, 1, 0)
+
+statement ok
+INSERT INTO tv VALUES (3, 1, NULL)
+
+statement ok
+INSERT INTO tv VALUES (4, 0, 1)
+
+statement ok
+INSERT INTO tv VALUES (5, 0, 0)
+
+statement ok
+INSERT INTO tv VALUES (6, 0, NULL)
+
+statement ok
+INSERT INTO tv VALUES (7, NULL, 1)
+
+statement ok
+INSERT INTO tv VALUES (8, NULL, 0)
+
+statement ok
+INSERT INTO tv VALUES (9, NULL, NULL)
+
+# AND truth table: a dominant FALSE absorbs unknown (false AND unknown = false)
+query B nosort
+SELECT (p = 1) AND (q = 1) FROM tv ORDER BY id
+----
+true
+false
+NULL
+false
+false
+false
+NULL
+false
+NULL
+
+# OR truth table: a dominant TRUE absorbs unknown (true OR unknown = true)
+query B nosort
+SELECT (p = 1) OR (q = 1) FROM tv ORDER BY id
+----
+true
+true
+true
+true
+false
+NULL
+true
+NULL
+NULL
+
+# NOT: true -> false, false -> true, unknown -> unknown (genuine propagation)
+query B nosort
+SELECT NOT (p = 1) FROM tv WHERE id = 1 OR id = 4 OR id = 7 ORDER BY id
+----
+false
+true
+NULL
+
+# compound WHERE with AND keeps a row only where the predicate is TRUE
+query I nosort
+SELECT id FROM tv WHERE (p = 1) AND (q = 1) ORDER BY id
+----
+1
+
+# compound WHERE with OR — unknown and false both exclude
+query I nosort
+SELECT id FROM tv WHERE (p = 1) OR (q = 1) ORDER BY id
+----
+1
+2
+3
+4
+7

@@ -88,3 +88,13 @@ export function rank(t: ScalarType): number {
 export function inRange(t: ScalarType, v: bigint): boolean {
   return v >= minOf(t) && v <= maxOf(t);
 }
+
+// isBooleanTypeName reports whether name is the boolean type (canonical "boolean",
+// alias "bool"), case-insensitively. boolean is a known scalar (spec/types/scalars.toml,
+// storable = false) that exists only as an expression type this slice — it is not a
+// ScalarType because it cannot be a column or CAST target. Used to distinguish a
+// known-but-not-storable type name (→ 0A000) from a genuinely unknown one (→ 42704).
+export function isBooleanTypeName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower === "boolean" || lower === "bool";
+}

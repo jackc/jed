@@ -6,8 +6,9 @@
 import { engineError } from "./errors.ts";
 import type { Token } from "./token.ts";
 
-const I64_MIN = -9223372036854775808n;
-const I64_MAX = 9223372036854775807n;
+// The maximum integer-literal MAGNITUDE the lexer accepts: 2^63, so that the unary
+// minus of it folds to int64's minimum. A larger magnitude cannot be represented.
+const MAX_MAGNITUDE = 9223372036854775808n;
 
 function isDigit(c: string): boolean {
   return c >= "0" && c <= "9";
@@ -39,6 +40,18 @@ export function lex(sql: string): Token[] {
     } else if (c === "*") {
       tokens.push({ kind: "star" });
       i++;
+    } else if (c === "+") {
+      tokens.push({ kind: "plus" });
+      i++;
+    } else if (c === "-") {
+      tokens.push({ kind: "minus" });
+      i++;
+    } else if (c === "/") {
+      tokens.push({ kind: "slash" });
+      i++;
+    } else if (c === "%") {
+      tokens.push({ kind: "percent" });
+      i++;
     } else if (c === "=") {
       tokens.push({ kind: "eq" });
       i++;
@@ -58,22 +71,17 @@ export function lex(sql: string): Token[] {
         tokens.push({ kind: "gt" });
         i++;
       }
-    } else if (c === "-" || isDigit(c)) {
-      // Integer literal. A leading '-' is part of the number only when followed by a
-      // digit.
+    } else if (isDigit(c)) {
+      // Integer literal: an unsigned magnitude (the sign is the "minus" operator). The
+      // magnitude must be <= 2^63 so that -(2^63) = int64's minimum is reachable;
+      // anything larger cannot be represented (42601).
       const start = i;
-      if (c === "-") {
-        if (!(i + 1 < n && isDigit(sql[i + 1]!))) {
-          throw engineError("syntax_error", `unexpected character '${c}'`);
-        }
-        i++;
-      }
       while (i < n && isDigit(sql[i]!)) {
         i++;
       }
       const text = sql.slice(start, i);
       const v = BigInt(text);
-      if (v < I64_MIN || v > I64_MAX) {
+      if (v > MAX_MAGNITUDE) {
         throw engineError("syntax_error", `integer literal out of range: ${text}`);
       }
       tokens.push({ kind: "int", int: v });

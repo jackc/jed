@@ -7,6 +7,11 @@
 # never silently reinterpreted (CLAUDE.md §4). Identity casts (int16->int16, ...) are
 # implicit and always succeed; they are implied and not listed.
 #
+# boolean (scalars.toml) is EXPRESSION-ONLY this slice and is NEITHER a cast source
+# NOR a cast target: `CAST(x AS boolean)` traps 0A000 (boolean is not a usable target
+# type yet) and there is no boolean->integer rule, so casting a boolean value is a
+# forbidden pair. Boolean<->integer casts arrive with the storable-boolean slice.
+#
 # mode:
 #   implicit    inserted automatically anywhere a value of `to` is wanted (safe, lossless)
 #   assignment  inserted on INSERT/UPDATE into a column of `to` (safe, lossless)

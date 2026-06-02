@@ -56,6 +56,7 @@ def rust_entry(op)
     "        arg_resolution: #{rust_str(op['arg_resolution'])},",
     "        result: #{rust_str(op['result'])},",
     "        null: #{rust_str(op['null'])},",
+    "        precedence: #{op['precedence'] || 0},",
     "        errors: #{rust_slice(op['errors'])},",
     "    },",
   ].join("\n")
@@ -80,6 +81,7 @@ def rust_file(ops)
         pub arg_resolution: &'static str,
         pub result: &'static str,
         pub null: &'static str,
+        pub precedence: u8,
         pub errors: &'static [&'static str],
     }
 
@@ -105,6 +107,7 @@ def go_entry(op)
     ["ArgResolution", go_str(op["arg_resolution"])],
     ["Result",        go_str(op["result"])],
     ["Null",          go_str(op["null"])],
+    ["Precedence",    (op["precedence"] || 0).to_s],
     ["Errors",        go_slice(op["errors"])],
   ]
   w = fields.map { |k, _| k.length }.max
@@ -134,6 +137,7 @@ def go_file(ops)
     \tArgResolution string
     \tResult        string
     \tNull          string
+    \tPrecedence    int
     \tErrors        []string
     }
 
@@ -159,6 +163,7 @@ def ts_entry(op)
   lines << "    argResolution: #{ts_str(op['arg_resolution'])},"
   lines << "    result: #{ts_str(op['result'])},"
   lines << "    null: #{ts_str(op['null'])},"
+  lines << "    precedence: #{op['precedence'] || 0},"
   lines << "    errors: #{ts_arr(op['errors'])},"
   lines << "  },"
   lines.join("\n")
@@ -184,6 +189,7 @@ def ts_file(ops)
       argResolution: string;
       result: string;
       null: string;
+      precedence: number;
       errors: readonly string[];
     }
 

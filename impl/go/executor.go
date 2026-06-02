@@ -2,6 +2,7 @@ package abide
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 )
@@ -91,9 +92,9 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, NewError(DuplicateColumn, "duplicate column name: "+def.Name)
 			}
 		}
-		ty, ok := ScalarTypeFromName(def.TypeName)
-		if !ok {
-			return Outcome{}, NewError(UndefinedObject, "type does not exist: "+def.TypeName)
+		ty, err := resolveStorableType(def.TypeName)
+		if err != nil {
+			return Outcome{}, err
 		}
 		if def.PrimaryKey {
 			if pkSeen {
@@ -146,6 +147,11 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 					"value out of range for type "+col.Type.CanonicalName())
 			}
 			row[i] = IntValue(lit.Int)
+		case LiteralBool:
+			// boolean is expression-only: there are no boolean columns, so a boolean
+			// literal can only target an integer column — a type error (42804).
+			return Outcome{}, NewError(DatatypeMismatch,
+				"cannot store a boolean value in integer column "+col.Name)
 		}
 	}
 
@@ -176,19 +182,27 @@ func (db *Database) executeDelete(del *Delete) (Outcome, error) {
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
 	}
-	var filter *resolvedPredicate
+	var filter *rExpr
 	if del.Filter != nil {
-		var err error
-		filter, err = db.resolvePredicate(table, del.Filter)
+		f, err := resolveBooleanFilter(table, del.Filter)
 		if err != nil {
 			return Outcome{}, err
 		}
+		filter = f
 	}
 
 	store := db.stores[strings.ToLower(del.Table)]
 	var keys [][]byte
 	for _, e := range store.EntriesInKeyOrder() {
-		if filter == nil || filter.eval(e.Row).IsTrue() {
+		matched := true
+		if filter != nil {
+			v, err := filter.eval(e.Row)
+			if err != nil {
+				return Outcome{}, err
+			}
+			matched = v.IsTrue()
+		}
+		if matched {
 			keys = append(keys, e.Key)
 		}
 	}
@@ -229,31 +243,28 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 			}
 		}
 		col := table.Columns[idx]
-		p := assignPlan{idx: idx, name: col.Name, target: col.Type, notNull: col.NotNull}
-		if lit := a.Value.Literal; lit != nil {
-			if lit.Kind == LiteralInt {
-				p.constVal = IntValue(lit.Int)
-			} else {
-				p.constVal = NullValue()
-			}
-		} else {
-			j := table.ColumnIndex(a.Value.Column)
-			if j < 0 {
-				return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+a.Value.Column)
-			}
-			p.srcColumn = j
-			p.srcIsColumn = true
-		}
-		plans = append(plans, p)
-	}
-
-	var filter *resolvedPredicate
-	if upd.Filter != nil {
-		var err error
-		filter, err = db.resolvePredicate(table, upd.Filter)
+		// The RHS is a general expression evaluated against the *old* row; a literal
+		// operand adapts to the target column's type. The result must be an integer (or
+		// NULL) — assigning a boolean to an integer column is a 42804.
+		src, ty, err := resolve(table, a.Value, &col.Type)
 		if err != nil {
 			return Outcome{}, err
 		}
+		if err := requireAssignableInt(ty, a.Column); err != nil {
+			return Outcome{}, err
+		}
+		plans = append(plans, assignPlan{
+			idx: idx, name: col.Name, target: col.Type, notNull: col.NotNull, source: src,
+		})
+	}
+
+	var filter *rExpr
+	if upd.Filter != nil {
+		f, err := resolveBooleanFilter(table, upd.Filter)
+		if err != nil {
+			return Outcome{}, err
+		}
+		filter = f
 	}
 
 	// Phase 1: build + validate every matching row's new values; no writes yet.
@@ -264,15 +275,21 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 	}
 	var updates []pending
 	for _, e := range store.EntriesInKeyOrder() {
-		if filter != nil && !filter.eval(e.Row).IsTrue() {
-			continue
+		if filter != nil {
+			v, err := filter.eval(e.Row)
+			if err != nil {
+				return Outcome{}, err
+			}
+			if !v.IsTrue() {
+				continue
+			}
 		}
 		newRow := make(Row, len(e.Row))
 		copy(newRow, e.Row)
 		for _, p := range plans {
-			raw := p.constVal
-			if p.srcIsColumn {
-				raw = e.Row[p.srcColumn]
+			raw, err := p.source.eval(e.Row)
+			if err != nil {
+				return Outcome{}, err
 			}
 			checked, err := p.check(raw)
 			if err != nil {
@@ -310,14 +327,14 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+sel.From)
 	}
 
-	projections, err := db.resolveProjections(table, sel.Items)
+	projections, err := resolveProjections(table, sel.Items)
 	if err != nil {
 		return Outcome{}, err
 	}
 
-	var filter *resolvedPredicate
+	var filter *rExpr
 	if sel.Filter != nil {
-		filter, err = db.resolvePredicate(table, sel.Filter)
+		filter, err = resolveBooleanFilter(table, sel.Filter)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -332,10 +349,19 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		orderDesc = sel.OrderBy.Descending
 	}
 
-	// Scan in primary-key order, then filter.
+	// Scan in primary-key order, then filter. A WHERE arithmetic can trap
+	// (22003/22012), so the error is propagated rather than swallowed in a predicate.
 	var rows []Row
 	for _, row := range db.RowsInKeyOrder(sel.From) {
-		if filter == nil || filter.eval(row).IsTrue() {
+		keep := true
+		if filter != nil {
+			v, err := filter.eval(row)
+			if err != nil {
+				return Outcome{}, err
+			}
+			keep = v.IsTrue()
+		}
+		if keep {
 			rows = append(rows, row)
 		}
 	}
@@ -369,187 +395,503 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	return Outcome{Kind: OutcomeQuery, ColumnCount: len(projections), Rows: out}, nil
 }
 
-func (db *Database) resolveProjections(table *Table, items SelectItems) ([]projection, error) {
+// ============================================================================
+// Resolved expression layer (mirrors impl/rust executor.rs).
+//
+// Parse → Expr (names) → resolve → rExpr (column indices, known result types, folded
+// constants) → eval per row → Value. The resolver is where all type-checking and the
+// literal range-check live; the evaluator is a pure tree-walk.
+// ============================================================================
+
+// rtKind tags the static type of a resolved expression.
+type rtKind int
+
+const (
+	rtNull rtKind = iota // an untyped NULL literal
+	rtInt                // integer; intTy carries the ScalarType
+	rtBool
+)
+
+type resolvedType struct {
+	kind  rtKind
+	intTy ScalarType // valid when kind == rtInt
+}
+
+func intType(t resolvedType) (ScalarType, bool) {
+	if t.kind == rtInt {
+		return t.intTy, true
+	}
+	return 0, false
+}
+
+// ctxOf returns the integer type of t as a context for a sibling literal, or nil if t
+// is not integer (so a sibling literal defaults to int64).
+func ctxOf(t resolvedType) *ScalarType {
+	if t.kind == rtInt {
+		ty := t.intTy
+		return &ty
+	}
+	return nil
+}
+
+// rExprKind tags a resolved expression node.
+type rExprKind int
+
+const (
+	reColumn rExprKind = iota
+	reConstInt
+	reConstBool
+	reConstNull
+	reCast
+	reNeg
+	reNot
+	reArith
+	reCompare
+	reAnd
+	reOr
+	reIsNull
+)
+
+// rExpr is a resolved expression over fixed column indices, ready to evaluate against a
+// row. Arithmetic/neg nodes carry their (promotion-tower) result type in `result` so the
+// computed value can be range-checked against it.
+type rExpr struct {
+	kind    rExprKind
+	index   int        // reColumn
+	cInt    int64      // reConstInt
+	cBool   bool       // reConstBool
+	op      BinaryOp   // reArith, reCompare
+	result  ScalarType // reCast target; reNeg / reArith result type
+	lhs     *rExpr     // reArith, reCompare, reAnd, reOr
+	rhs     *rExpr     // reArith, reCompare, reAnd, reOr
+	operand *rExpr     // reCast, reNeg, reNot, reIsNull
+	negated bool       // reIsNull
+}
+
+// resolveProjections resolves SELECT items into evaluable projections (any result type
+// is allowed in the select list, including boolean — SELECT a = b).
+func resolveProjections(table *Table, items SelectItems) ([]*rExpr, error) {
 	if items.All {
-		ps := make([]projection, len(table.Columns))
+		ps := make([]*rExpr, len(table.Columns))
 		for i := range table.Columns {
-			ps[i] = projection{kind: projColumn, index: i}
+			ps[i] = &rExpr{kind: reColumn, index: i}
 		}
 		return ps, nil
 	}
-	ps := make([]projection, 0, len(items.Items))
+	ps := make([]*rExpr, 0, len(items.Items))
 	for _, e := range items.Items {
-		p, err := db.resolveExpr(table, e)
+		node, _, err := resolve(table, e, nil)
 		if err != nil {
 			return nil, err
 		}
-		ps = append(ps, p)
+		ps = append(ps, node)
 	}
 	return ps, nil
 }
 
-func (db *Database) resolveExpr(table *Table, e SelectExpr) (projection, error) {
-	switch {
-	case e.Cast != nil:
-		target, ok := ScalarTypeFromName(e.Cast.TypeName)
-		if !ok {
-			return projection{}, NewError(UndefinedObject, "type does not exist: "+e.Cast.TypeName)
-		}
-		inner, err := db.resolveExpr(table, e.Cast.Inner)
-		if err != nil {
-			return projection{}, err
-		}
-		boxed := inner
-		return projection{kind: projCast, target: target, inner: &boxed}, nil
-	case e.Literal != nil:
-		if e.Literal.Kind == LiteralNull {
-			return projection{kind: projNull}, nil
-		}
-		return projection{kind: projLiteralInt, literal: e.Literal.Int}, nil
-	default:
+// resolveBooleanFilter resolves a WHERE expression; it must resolve to boolean (or an
+// untyped NULL, which is always unknown → no rows). An integer-valued WHERE is a 42804.
+func resolveBooleanFilter(table *Table, e *Expr) (*rExpr, error) {
+	node, ty, err := resolve(table, *e, nil)
+	if err != nil {
+		return nil, err
+	}
+	if ty.kind == rtInt {
+		return nil, typeError("argument of WHERE must be boolean")
+	}
+	return node, nil
+}
+
+// resolve resolves one Expr into an rExpr plus its static type. ctx (non-nil) is the
+// type an untyped integer literal should adapt to (spec/design/types.md §6); nil
+// defaults a bare literal to int64.
+func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
+	switch e.Kind {
+	case ExprColumn:
 		idx := table.ColumnIndex(e.Column)
 		if idx < 0 {
-			return projection{}, NewError(UndefinedColumn, "column does not exist: "+e.Column)
+			return nil, resolvedType{}, NewError(UndefinedColumn, "column does not exist: "+e.Column)
 		}
-		return projection{kind: projColumn, index: idx}, nil
-	}
-}
-
-func (db *Database) resolvePredicate(table *Table, p *Predicate) (*resolvedPredicate, error) {
-	resolveCol := func(name string) (int, error) {
-		idx := table.ColumnIndex(name)
-		if idx < 0 {
-			return 0, NewError(UndefinedColumn, "column does not exist: "+name)
-		}
-		return idx, nil
-	}
-	switch {
-	case p.Compare != nil:
-		idx, err := resolveCol(p.Compare.Column)
-		if err != nil {
-			return nil, err
-		}
-		rp := &resolvedPredicate{index: idx, op: p.Compare.Op}
-		if lit := p.Compare.RHS.Literal; lit != nil {
-			if lit.Kind == LiteralInt {
-				// Context-adaptive literal (spec/design/types.md): the literal adapts to
-				// the compared column's type; a value that does not fit traps 22003 here,
-				// before any row is scanned (deterministic).
-				ty := table.Columns[idx].Type
-				if !ty.InRange(lit.Int) {
-					return nil, NewError(NumericValueOutOfRange,
-						"value out of range for type "+ty.CanonicalName())
-				}
-				rp.rhsConst = IntValue(lit.Int)
-			} else {
-				rp.rhsConst = NullValue()
+		return &rExpr{kind: reColumn, index: idx},
+			resolvedType{kind: rtInt, intTy: table.Columns[idx].Type}, nil
+	case ExprLiteral:
+		switch e.Literal.Kind {
+		case LiteralNull:
+			return &rExpr{kind: reConstNull}, resolvedType{kind: rtNull}, nil
+		case LiteralBool:
+			return &rExpr{kind: reConstBool, cBool: e.Literal.Bool}, resolvedType{kind: rtBool}, nil
+		default: // LiteralInt
+			ty := Int64
+			if ctx != nil {
+				ty = *ctx
 			}
-		} else {
-			j, err := resolveCol(p.Compare.RHS.Column)
+			if !ty.InRange(e.Literal.Int) {
+				return nil, resolvedType{}, overflowErr(ty)
+			}
+			return &rExpr{kind: reConstInt, cInt: e.Literal.Int},
+				resolvedType{kind: rtInt, intTy: ty}, nil
+		}
+	case ExprCast:
+		target, err := resolveStorableType(e.Cast.TypeName)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		inner, ity, err := resolve(table, e.Cast.Inner, nil)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if ity.kind == rtBool {
+			return nil, resolvedType{}, typeError("cannot cast boolean to " + target.CanonicalName())
+		}
+		return &rExpr{kind: reCast, operand: inner, result: target},
+			resolvedType{kind: rtInt, intTy: target}, nil
+	case ExprUnary:
+		if e.Unary.Op == OpNeg {
+			rop, ty, err := resolve(table, e.Unary.Operand, ctx)
 			if err != nil {
-				return nil, err
+				return nil, resolvedType{}, err
 			}
-			rp.rhsColumn = j
-			rp.rhsIsColumn = true
+			result := Int64
+			switch ty.kind {
+			case rtInt:
+				result = ty.intTy
+			case rtNull:
+				result = Int64 // -NULL = NULL
+			default: // rtBool
+				return nil, resolvedType{}, typeError("unary minus requires an integer operand")
+			}
+			return &rExpr{kind: reNeg, operand: rop, result: result},
+				resolvedType{kind: rtInt, intTy: result}, nil
 		}
-		return rp, nil
-	default: // IsNull
-		idx, err := resolveCol(p.IsNull.Column)
+		// OpNot
+		rop, ty, err := resolve(table, e.Unary.Operand, nil)
 		if err != nil {
-			return nil, err
+			return nil, resolvedType{}, err
 		}
-		return &resolvedPredicate{isNull: true, index: idx, negated: p.IsNull.Negated}, nil
+		if err := requireBool(ty, "NOT requires a boolean operand"); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reNot, operand: rop}, resolvedType{kind: rtBool}, nil
+	case ExprIsNull:
+		rop, _, err := resolve(table, e.IsNullOf.Operand, nil)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reIsNull, operand: rop, negated: e.IsNullOf.Negated},
+			resolvedType{kind: rtBool}, nil
+	default: // ExprBinary
+		return resolveBinary(table, e.Binary)
 	}
 }
 
-// projKind tags a resolved projection.
-type projKind int
-
-const (
-	projColumn projKind = iota
-	projLiteralInt
-	projNull
-	projCast
-)
-
-// projection is a resolved output column: how to produce one value from a row.
-type projection struct {
-	kind    projKind
-	index   int         // projColumn
-	literal int64       // projLiteralInt
-	target  ScalarType  // projCast
-	inner   *projection // projCast
+func resolveBinary(table *Table, b *BinaryExpr) (*rExpr, resolvedType, error) {
+	switch b.Op {
+	case OpAdd, OpSub, OpMul, OpDiv, OpMod:
+		rl, lt, rr, rt, err := resolveIntPair(table, b.Lhs, b.Rhs)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		result := promote(lt, rt)
+		return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: result},
+			resolvedType{kind: rtInt, intTy: result}, nil
+	case OpEq, OpLt, OpGt, OpLe, OpGe:
+		rl, _, rr, _, err := resolveIntPair(table, b.Lhs, b.Rhs)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reCompare, op: b.Op, lhs: rl, rhs: rr},
+			resolvedType{kind: rtBool}, nil
+	default: // OpAnd, OpOr
+		rl, lt, err := resolve(table, b.Lhs, nil)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		rr, rt, err := resolve(table, b.Rhs, nil)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := requireBool(lt, "AND/OR requires boolean operands"); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := requireBool(rt, "AND/OR requires boolean operands"); err != nil {
+			return nil, resolvedType{}, err
+		}
+		kind := reAnd
+		if b.Op == OpOr {
+			kind = reOr
+		}
+		return &rExpr{kind: kind, lhs: rl, rhs: rr}, resolvedType{kind: rtBool}, nil
+	}
 }
 
-func (p projection) eval(row Row) (Value, error) {
-	switch p.kind {
-	case projColumn:
-		return row[p.index], nil
-	case projLiteralInt:
-		return IntValue(p.literal), nil
-	case projNull:
+// resolveIntPair resolves the two operands of an arithmetic/comparison operator, giving
+// a bare integer literal the *other* operand's type as context (so `small + 1` types `1`
+// as int16, and `small + 100000` traps 22003 at resolve). Both must be integer (or NULL);
+// a boolean operand is a 42804 type error.
+func resolveIntPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
+	lhsLit := isIntLiteral(lhs)
+	rhsLit := isIntLiteral(rhs)
+	var rl, rr *rExpr
+	var lt, rt resolvedType
+	var err error
+	switch {
+	case lhsLit && rhsLit:
+		i64 := Int64
+		if rl, lt, err = resolve(table, lhs, &i64); err != nil {
+			return nil, resolvedType{}, nil, resolvedType{}, err
+		}
+		rr, rt, err = resolve(table, rhs, &i64)
+	case lhsLit:
+		if rr, rt, err = resolve(table, rhs, nil); err != nil {
+			return nil, resolvedType{}, nil, resolvedType{}, err
+		}
+		rl, lt, err = resolve(table, lhs, ctxOf(rt))
+	case rhsLit:
+		if rl, lt, err = resolve(table, lhs, nil); err != nil {
+			return nil, resolvedType{}, nil, resolvedType{}, err
+		}
+		rr, rt, err = resolve(table, rhs, ctxOf(lt))
+	default:
+		if rl, lt, err = resolve(table, lhs, nil); err != nil {
+			return nil, resolvedType{}, nil, resolvedType{}, err
+		}
+		rr, rt, err = resolve(table, rhs, nil)
+	}
+	if err != nil {
+		return nil, resolvedType{}, nil, resolvedType{}, err
+	}
+	if err := requireIntOperand(lt); err != nil {
+		return nil, resolvedType{}, nil, resolvedType{}, err
+	}
+	if err := requireIntOperand(rt); err != nil {
+		return nil, resolvedType{}, nil, resolvedType{}, err
+	}
+	return rl, lt, rr, rt, nil
+}
+
+func isIntLiteral(e Expr) bool {
+	return e.Kind == ExprLiteral && e.Literal.Kind == LiteralInt
+}
+
+// promote is the promotion-tower result type of two arithmetic operands: the
+// higher-ranked integer type, or int64 when both are untyped NULLs.
+func promote(a, b resolvedType) ScalarType {
+	ax, aok := intType(a)
+	bx, bok := intType(b)
+	switch {
+	case aok && bok:
+		if ax.Rank() >= bx.Rank() {
+			return ax
+		}
+		return bx
+	case aok:
+		return ax
+	case bok:
+		return bx
+	default:
+		return Int64
+	}
+}
+
+func requireIntOperand(t resolvedType) error {
+	if t.kind == rtBool {
+		return typeError("arithmetic and comparison operators require integer operands")
+	}
+	return nil
+}
+
+func requireBool(t resolvedType, msg string) error {
+	if t.kind == rtInt {
+		return typeError(msg)
+	}
+	return nil
+}
+
+// requireAssignableInt: a value assigned to an integer column must itself be integer
+// (or NULL); a boolean expression is a 42804 type error.
+func requireAssignableInt(t resolvedType, col string) error {
+	if t.kind == rtBool {
+		return typeError("cannot assign a boolean value to integer column " + col)
+	}
+	return nil
+}
+
+// resolveStorableType resolves a column-definition or CAST target type name. Only the
+// storable integer types are valid; boolean is known-but-not-storable (→ 0A000),
+// distinct from a genuinely unknown name (→ 42704).
+func resolveStorableType(name string) (ScalarType, error) {
+	if ty, ok := ScalarTypeFromName(name); ok {
+		return ty, nil
+	}
+	if IsBooleanTypeName(name) {
+		return 0, NewError(FeatureNotSupported, "boolean is not a storable type yet: "+name)
+	}
+	return 0, NewError(UndefinedObject, "type does not exist: "+name)
+}
+
+func overflowErr(ty ScalarType) error {
+	return NewError(NumericValueOutOfRange, "value out of range for type "+ty.CanonicalName())
+}
+
+func typeError(msg string) error { return NewError(DatatypeMismatch, msg) }
+
+// eval evaluates against a row, returning a Value (a boolean for comparisons /
+// connectives). Arithmetic traps 22003 on overflow and 22012 on a zero divisor; NULL
+// propagates through arithmetic; the connectives are Kleene; IS NULL is always definite.
+func (e *rExpr) eval(row Row) (Value, error) {
+	switch e.kind {
+	case reColumn:
+		return row[e.index], nil
+	case reConstInt:
+		return IntValue(e.cInt), nil
+	case reConstBool:
+		return BoolValue(e.cBool), nil
+	case reConstNull:
 		return NullValue(), nil
-	case projCast:
-		v, err := p.inner.eval(row)
+	case reCast:
+		v, err := e.operand.eval(row)
 		if err != nil {
 			return Value{}, err
 		}
-		if v.Null {
+		if v.Kind == ValNull {
 			return NullValue(), nil
 		}
-		if !p.target.InRange(v.Int) {
-			return Value{}, NewError(NumericValueOutOfRange,
-				"value out of range for type "+p.target.CanonicalName())
+		if !e.result.InRange(v.Int) {
+			return Value{}, overflowErr(e.result)
 		}
 		return IntValue(v.Int), nil
-	default:
-		return Value{}, NewError(FeatureNotSupported, "unknown projection")
-	}
-}
-
-// resolvedPredicate is a WHERE predicate over fixed column indices.
-type resolvedPredicate struct {
-	isNull      bool // true => IS [NOT] NULL; false => comparison
-	index       int
-	op          CompareOp // comparison
-	rhsConst    Value     // comparison, when rhsIsColumn is false
-	rhsColumn   int       // comparison, when rhsIsColumn is true
-	rhsIsColumn bool      // comparison: RHS is another column
-	negated     bool      // IS NOT NULL
-}
-
-// eval returns a three-valued result; a WHERE clause keeps a row only on True.
-func (p *resolvedPredicate) eval(row Row) ThreeValued {
-	if p.isNull {
-		got := row[p.index].Null != p.negated
-		if got {
-			return True
+	case reNeg:
+		v, err := e.operand.eval(row)
+		if err != nil {
+			return Value{}, err
 		}
-		return False
-	}
-	lhs := row[p.index]
-	rhs := p.rhsConst
-	if p.rhsIsColumn {
-		rhs = row[p.rhsColumn]
-	}
-	switch p.op {
-	case OpEq:
-		return lhs.Eq3(rhs)
-	case OpLt:
-		return lhs.Lt3(rhs)
-	case OpGt:
-		return lhs.Gt3(rhs)
-	case OpLe:
-		return or3(lhs.Lt3(rhs), lhs.Eq3(rhs))
-	case OpGe:
-		return or3(lhs.Gt3(rhs), lhs.Eq3(rhs))
-	default:
-		return Unknown
+		if v.Kind == ValNull {
+			return NullValue(), nil
+		}
+		if v.Int == math.MinInt64 { // negating int64's minimum overflows int64
+			return Value{}, overflowErr(e.result)
+		}
+		n := -v.Int
+		if !e.result.InRange(n) {
+			return Value{}, overflowErr(e.result)
+		}
+		return IntValue(n), nil
+	case reNot:
+		v, err := e.operand.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		return boolNot(v), nil
+	case reArith:
+		a, err := e.lhs.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		b, err := e.rhs.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		if a.Kind == ValNull || b.Kind == ValNull {
+			return NullValue(), nil
+		}
+		return evalArith(e.op, a.Int, b.Int, e.result)
+	case reCompare:
+		a, err := e.lhs.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		b, err := e.rhs.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		switch e.op {
+		case OpEq:
+			return from3(a.Eq3(b)), nil
+		case OpLt:
+			return from3(a.Lt3(b)), nil
+		case OpGt:
+			return from3(a.Gt3(b)), nil
+		case OpLe:
+			return from3(or3(a.Lt3(b), a.Eq3(b))), nil
+		default: // OpGe
+			return from3(or3(a.Gt3(b), a.Eq3(b))), nil
+		}
+	case reAnd:
+		a, err := e.lhs.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		b, err := e.rhs.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		return boolAnd(a, b), nil
+	case reOr:
+		a, err := e.lhs.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		b, err := e.rhs.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		return boolOr(a, b), nil
+	default: // reIsNull
+		v, err := e.operand.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		isNull := v.Kind == ValNull
+		return BoolValue(isNull != e.negated), nil
 	}
 }
 
-// or3 is three-valued OR (Kleene): used to build <= / >= from < / > and =, so a
-// NULL operand yields UNKNOWN rather than a wrong FALSE (CLAUDE.md §4).
+// evalArith evaluates an integer arithmetic op in 64-bit, trapping 22012 on a zero
+// divisor and 22003 if the op overflows int64 OR the in-range result falls outside the
+// declared result type (the int16+int16 → int16 boundary — spec/design/functions.md §7).
+func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
+	var v int64
+	switch op {
+	case OpAdd:
+		v = x + y
+		if (y > 0 && v < x) || (y < 0 && v > x) {
+			return Value{}, overflowErr(result)
+		}
+	case OpSub:
+		v = x - y
+		if (y < 0 && v < x) || (y > 0 && v > x) {
+			return Value{}, overflowErr(result)
+		}
+	case OpMul:
+		v = x * y
+		if x != 0 && (v/x != y || (x == -1 && y == math.MinInt64)) {
+			return Value{}, overflowErr(result)
+		}
+	case OpDiv:
+		if y == 0 {
+			return Value{}, NewError(DivisionByZero, "division by zero")
+		}
+		if x == math.MinInt64 && y == -1 {
+			return Value{}, overflowErr(result)
+		}
+		v = x / y
+	default: // OpMod
+		if y == 0 {
+			return Value{}, NewError(DivisionByZero, "division by zero")
+		}
+		if x == math.MinInt64 && y == -1 {
+			return Value{}, overflowErr(result)
+		}
+		v = x % y
+	}
+	if !result.InRange(v) {
+		return Value{}, overflowErr(result)
+	}
+	return IntValue(v), nil
+}
+
+// or3 is three-valued OR (Kleene): used to build <= / >= from < / > and =, so a NULL
+// operand yields UNKNOWN rather than a wrong FALSE (CLAUDE.md §4).
 func or3(a, b ThreeValued) ThreeValued {
 	if a == True || b == True {
 		return True
@@ -560,52 +902,69 @@ func or3(a, b ThreeValued) ThreeValued {
 	return False
 }
 
-// nullFirstCmp is a total order for ORDER BY with NULLs first (ascending), matching
-// the key encoding's physical order (spec/design/encoding.md §4). Returns <0, 0, >0.
+// nullFirstCmp is a total order for ORDER BY with NULLs first (ascending), matching the
+// key encoding's physical order (spec/design/encoding.md §4). Returns <0, 0, >0. ORDER
+// BY is over an (always-integer) column this slice, so the boolean ordering is defined
+// (false < true) only for totality.
 func nullFirstCmp(a, b Value) int {
 	switch {
-	case a.Null && b.Null:
+	case a.Kind == ValNull && b.Kind == ValNull:
 		return 0
-	case a.Null:
+	case a.Kind == ValNull:
 		return -1
-	case b.Null:
+	case b.Kind == ValNull:
 		return 1
-	case a.Int < b.Int:
+	}
+	x, y := orderKey(a), orderKey(b)
+	switch {
+	case x < y:
 		return -1
-	case a.Int > b.Int:
+	case x > y:
 		return 1
 	default:
 		return 0
 	}
 }
 
+func orderKey(v Value) int64 {
+	if v.Kind == ValBool {
+		if v.Bool {
+			return 1
+		}
+		return 0
+	}
+	return v.Int
+}
+
 // assignPlan is a resolved UPDATE assignment: the target column index, its type and
-// nullability for re-checking, and the value source (a constant, or another column
-// read from the same row when srcIsColumn).
+// nullability for re-checking, and the resolved RHS expression (evaluated against the
+// old row).
 type assignPlan struct {
-	idx         int
-	name        string
-	target      ScalarType
-	notNull     bool
-	constVal    Value
-	srcColumn   int
-	srcIsColumn bool
+	idx     int
+	name    string
+	target  ScalarType
+	notNull bool
+	source  *rExpr
 }
 
 // check type-checks a candidate value against this column: NULL into NOT NULL traps
 // 23502; an integer outside the target range traps 22003 (CLAUDE.md §8) — mirrors
-// INSERT's per-value checks.
+// INSERT's per-value checks. The resolver proved the value is integer or NULL, never
+// boolean.
 func (p assignPlan) check(v Value) (Value, error) {
-	if v.Null {
+	switch v.Kind {
+	case ValNull:
 		if p.notNull {
 			return Value{}, NewError(NotNullViolation,
 				"null value in column "+p.name+" violates not-null constraint")
 		}
 		return NullValue(), nil
+	case ValInt:
+		if !p.target.InRange(v.Int) {
+			return Value{}, overflowErr(p.target)
+		}
+		return IntValue(v.Int), nil
+	default: // ValBool — unreachable: resolver rejects assigning a boolean to a column
+		return Value{}, NewError(FeatureNotSupported, "internal: boolean assigned to integer column")
 	}
-	if !p.target.InRange(v.Int) {
-		return Value{}, NewError(NumericValueOutOfRange,
-			"value out of range for type "+p.target.CanonicalName())
-	}
-	return IntValue(v.Int), nil
 }

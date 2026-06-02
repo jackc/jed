@@ -81,3 +81,12 @@ impl ScalarType {
         [ScalarType::Int16, ScalarType::Int32, ScalarType::Int64]
     }
 }
+
+/// Whether `name` is the `boolean` type (canonical `boolean`, alias `bool`),
+/// case-insensitively. boolean is a known scalar (spec/types/scalars.toml,
+/// `storable = false`) that exists only as an expression type this slice — it is not
+/// a `ScalarType` because it cannot be a column or CAST target. Used to distinguish a
+/// "known but not storable" type name (→ 0A000) from a genuinely unknown one (→ 42704).
+pub fn is_boolean_type_name(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "boolean" | "bool")
+}

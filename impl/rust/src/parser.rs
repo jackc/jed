@@ -5,8 +5,8 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, ColumnDef, CompareOp, CreateTable, Delete, Insert, Literal, Operand, OrderBy,
-    Predicate, Select, SelectExpr, SelectItems, Statement, Update,
+    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, Expr, Insert, Literal, OrderBy, Select,
+    SelectItems, Statement, UnaryOp, Update,
 };
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
@@ -110,11 +110,31 @@ impl Parser {
         Ok(Insert { table, values })
     }
 
-    /// A literal: an integer (already lexed) or the keyword `NULL`.
+    /// A literal value for INSERT: an integer (with an optional leading unary minus,
+    /// folded here), or one of the keywords `NULL` / `TRUE` / `FALSE`. INSERT takes
+    /// literals only — not general expressions (spec/grammar/grammar.ebnf `literal`).
     fn parse_literal(&mut self) -> Result<Literal> {
+        let negate = if matches!(self.peek(), Token::Minus) {
+            self.advance();
+            true
+        } else {
+            false
+        };
         match self.advance() {
-            Token::Int(n) => Ok(Literal::Int(n)),
-            Token::Word(w) if w.eq_ignore_ascii_case("null") => Ok(Literal::Null),
+            Token::Int(m) => {
+                let signed = if negate { -(m as i128) } else { m as i128 };
+                i64::try_from(signed).map(Literal::Int).map_err(|_| {
+                    EngineError::new(
+                        SqlState::NumericValueOutOfRange,
+                        "value out of range: integer literal exceeds the maximum signed 64-bit value",
+                    )
+                })
+            }
+            Token::Word(w) if !negate && w.eq_ignore_ascii_case("null") => Ok(Literal::Null),
+            Token::Word(w) if !negate && w.eq_ignore_ascii_case("true") => Ok(Literal::Bool(true)),
+            Token::Word(w) if !negate && w.eq_ignore_ascii_case("false") => {
+                Ok(Literal::Bool(false))
+            }
             other => Err(syntax(format!("expected a literal value, found {other:?}"))),
         }
     }
@@ -167,7 +187,7 @@ impl Parser {
         loop {
             let column = self.expect_identifier()?;
             self.expect(&Token::Eq)?;
-            let value = self.parse_operand()?;
+            let value = self.parse_expr()?;
             assignments.push(Assignment { column, value });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
@@ -196,11 +216,12 @@ impl Parser {
         Ok(Delete { table, filter })
     }
 
-    /// Parse an optional trailing `WHERE <predicate>` (shared by SELECT/UPDATE/DELETE).
-    fn parse_optional_where(&mut self) -> Result<Option<Predicate>> {
+    /// Parse an optional trailing `WHERE <expr>` (shared by SELECT/UPDATE/DELETE). The
+    /// expression must resolve to boolean (checked by the executor).
+    fn parse_optional_where(&mut self) -> Result<Option<Expr>> {
         if self.peek_keyword().as_deref() == Some("where") {
             self.advance();
-            Ok(Some(self.parse_predicate()?))
+            Ok(Some(self.parse_expr()?))
         } else {
             Ok(None)
         }
@@ -213,7 +234,7 @@ impl Parser {
         }
         let mut items = Vec::new();
         loop {
-            items.push(self.parse_select_expr()?);
+            items.push(self.parse_expr()?);
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
                 continue;
@@ -223,34 +244,55 @@ impl Parser {
         Ok(SelectItems::Items(items))
     }
 
-    /// A projected expression: `CAST ( <expr> AS <type> )` or a bare column name.
-    fn parse_select_expr(&mut self) -> Result<SelectExpr> {
-        if self.peek_keyword().as_deref() == Some("cast") {
-            self.advance();
-            self.expect(&Token::LParen)?;
-            let inner = self.parse_select_expr()?;
-            self.expect_keyword("as")?;
-            let type_name = self.expect_identifier()?;
-            self.expect(&Token::RParen)?;
-            return Ok(SelectExpr::Cast {
-                inner: Box::new(inner),
-                type_name,
-            });
-        }
-        // A bare integer literal is allowed as a projected value (used by CAST
-        // tests like `SELECT CAST(1000 AS int16)`).
-        if let Token::Int(n) = self.peek() {
-            let n = *n;
-            self.advance();
-            return Ok(SelectExpr::Literal(Literal::Int(n)));
-        }
-        Ok(SelectExpr::Column(self.expect_identifier()?))
+    // --- expression precedence ladder (spec/grammar/grammar.ebnf `expr`) ---------
+    // Loosest to tightest: OR < AND < NOT < comparison/IS NULL < additive <
+    // multiplicative < unary minus < primary. One function per level keeps the
+    // grammar legible (CLAUDE.md §10). The precedence is authored data
+    // (spec/functions/catalog.toml); this ladder must agree with it.
+
+    /// Parse a general expression (the entry point for WHERE, the SELECT list, and
+    /// UPDATE assignment values).
+    fn parse_expr(&mut self) -> Result<Expr> {
+        self.parse_or()
     }
 
-    /// A WHERE predicate: `<col> IS [NOT] NULL` or `<col> <cmp> <operand>`, where
-    /// `<operand>` is another column or a literal.
-    fn parse_predicate(&mut self) -> Result<Predicate> {
-        let column = self.expect_identifier()?;
+    fn parse_or(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_and()?;
+        while self.peek_keyword().as_deref() == Some("or") {
+            self.advance();
+            let rhs = self.parse_and()?;
+            lhs = binary(BinaryOp::Or, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_not()?;
+        while self.peek_keyword().as_deref() == Some("and") {
+            self.advance();
+            let rhs = self.parse_not()?;
+            lhs = binary(BinaryOp::And, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_not(&mut self) -> Result<Expr> {
+        if self.peek_keyword().as_deref() == Some("not") {
+            self.advance();
+            // right-associative: NOT NOT x
+            let operand = self.parse_not()?;
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                operand: Box::new(operand),
+            });
+        }
+        self.parse_comparison()
+    }
+
+    /// One comparison or a postfix `IS [NOT] NULL`, both non-associative: `a = b = c`
+    /// is a syntax error, and `a + 1 IS NULL` binds as `(a + 1) IS NULL`.
+    fn parse_comparison(&mut self) -> Result<Expr> {
+        let lhs = self.parse_additive()?;
         if self.peek_keyword().as_deref() == Some("is") {
             self.advance();
             let negated = if self.peek_keyword().as_deref() == Some("not") {
@@ -260,38 +302,131 @@ impl Parser {
                 false
             };
             self.expect_keyword("null")?;
-            return Ok(Predicate::IsNull { column, negated });
+            return Ok(Expr::IsNull {
+                operand: Box::new(lhs),
+                negated,
+            });
         }
-        let op = match self.advance() {
-            Token::Eq => CompareOp::Eq,
-            Token::Lt => CompareOp::Lt,
-            Token::Gt => CompareOp::Gt,
-            Token::Le => CompareOp::Le,
-            Token::Ge => CompareOp::Ge,
-            other => {
-                return Err(syntax(format!(
-                    "expected a comparison operator, found {other:?}"
-                )));
-            }
+        let op = match self.peek() {
+            Token::Eq => Some(BinaryOp::Eq),
+            Token::Lt => Some(BinaryOp::Lt),
+            Token::Gt => Some(BinaryOp::Gt),
+            Token::Le => Some(BinaryOp::Le),
+            Token::Ge => Some(BinaryOp::Ge),
+            _ => None,
         };
-        let rhs = self.parse_operand()?;
-        Ok(Predicate::Compare { column, op, rhs })
+        match op {
+            Some(op) => {
+                self.advance();
+                let rhs = self.parse_additive()?;
+                Ok(binary(op, lhs, rhs))
+            }
+            None => Ok(lhs),
+        }
     }
 
-    /// A comparison operand: a literal (integer or NULL) or a column reference.
-    fn parse_operand(&mut self) -> Result<Operand> {
-        match self.peek() {
-            Token::Int(n) => {
-                let n = *n;
+    fn parse_additive(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Token::Plus => BinaryOp::Add,
+                Token::Minus => BinaryOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_multiplicative()?;
+            lhs = binary(op, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let op = match self.peek() {
+                Token::Star => BinaryOp::Mul,
+                Token::Slash => BinaryOp::Div,
+                Token::Percent => BinaryOp::Mod,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_unary()?;
+            lhs = binary(op, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr> {
+        if matches!(self.peek(), Token::Minus) {
+            self.advance();
+            // Fold unary-minus-of-an-integer-literal into one negative literal: this
+            // makes int64::MIN representable (`-(2^63)`) and lets the negative value
+            // range-check against its context like any literal (spec/design/types.md §6).
+            if let Token::Int(m) = self.peek() {
+                let m = *m;
                 self.advance();
-                Ok(Operand::Literal(Literal::Int(n)))
+                let folded = -(m as i128); // m <= 2^63 ⇒ folded ∈ [-2^63, 0] ⊆ i64
+                return Ok(Expr::Literal(Literal::Int(folded as i64)));
+            }
+            let operand = self.parse_unary()?;
+            return Ok(Expr::Unary {
+                op: UnaryOp::Neg,
+                operand: Box::new(operand),
+            });
+        }
+        self.parse_primary()
+    }
+
+    /// A primary: a parenthesized expression, `CAST(...)`, a literal (integer,
+    /// `TRUE`/`FALSE`, `NULL`), or a column reference.
+    fn parse_primary(&mut self) -> Result<Expr> {
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let e = self.parse_expr()?;
+            self.expect(&Token::RParen)?;
+            return Ok(e);
+        }
+        if self.peek_keyword().as_deref() == Some("cast") {
+            self.advance();
+            self.expect(&Token::LParen)?;
+            let inner = self.parse_expr()?;
+            self.expect_keyword("as")?;
+            let type_name = self.expect_identifier()?;
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::Cast {
+                inner: Box::new(inner),
+                type_name,
+            });
+        }
+        match self.peek() {
+            Token::Int(m) => {
+                let m = *m;
+                self.advance();
+                if m <= i64::MAX as u64 {
+                    Ok(Expr::Literal(Literal::Int(m as i64)))
+                } else {
+                    // The only m > i64::MAX the lexer admits is 2^63, which fits no
+                    // signed integer type unless negated (handled by the unary fold).
+                    Err(EngineError::new(
+                        SqlState::NumericValueOutOfRange,
+                        "value out of range: integer literal exceeds the maximum signed 64-bit value",
+                    ))
+                }
             }
             Token::Word(w) if w.eq_ignore_ascii_case("null") => {
                 self.advance();
-                Ok(Operand::Literal(Literal::Null))
+                Ok(Expr::Literal(Literal::Null))
             }
-            Token::Word(_) => Ok(Operand::Column(self.expect_identifier()?)),
-            other => Err(syntax(format!("expected an operand, found {other:?}"))),
+            Token::Word(w) if w.eq_ignore_ascii_case("true") => {
+                self.advance();
+                Ok(Expr::Literal(Literal::Bool(true)))
+            }
+            Token::Word(w) if w.eq_ignore_ascii_case("false") => {
+                self.advance();
+                Ok(Expr::Literal(Literal::Bool(false)))
+            }
+            Token::Word(_) => Ok(Expr::Column(self.expect_identifier()?)),
+            other => Err(syntax(format!("expected an expression, found {other:?}"))),
         }
     }
 
@@ -357,4 +492,13 @@ impl Parser {
 
 fn syntax(msg: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::SyntaxError, msg.into())
+}
+
+/// Build a binary-operator expression node.
+fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+    Expr::Binary {
+        op,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    }
 }

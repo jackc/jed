@@ -5,8 +5,9 @@ use crate::error::{EngineError, Result, SqlState};
 use crate::token::Token;
 
 /// Tokenize `sql` into tokens terminated by `Token::Eof`. Whitespace separates
-/// tokens; integer literals may carry a leading `-`. Errors are structured
-/// (SQLSTATE 42601 syntax error).
+/// tokens; an integer literal is an unsigned magnitude (the leading `-`, if any, is
+/// the `Minus` operator, folded by the parser). Errors are structured (SQLSTATE
+/// 42601 syntax error).
 pub fn lex(sql: &str) -> Result<Vec<Token>> {
     let bytes = sql.as_bytes();
     let mut i = 0;
@@ -34,6 +35,22 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::Star);
                 i += 1;
             }
+            b'+' => {
+                tokens.push(Token::Plus);
+                i += 1;
+            }
+            b'-' => {
+                tokens.push(Token::Minus);
+                i += 1;
+            }
+            b'/' => {
+                tokens.push(Token::Slash);
+                i += 1;
+            }
+            b'%' => {
+                tokens.push(Token::Percent);
+                i += 1;
+            }
             b'=' => {
                 tokens.push(Token::Eq);
                 i += 1;
@@ -56,23 +73,22 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                     i += 1;
                 }
             }
-            b'-' | b'0'..=b'9' => {
-                // Integer literal. A leading '-' is part of the number only when
-                // followed by a digit; otherwise it is unsupported punctuation.
+            b'0'..=b'9' => {
+                // Integer literal: an unsigned magnitude. The sign is the `Minus`
+                // operator. The magnitude must be <= 2^63 so that -(2^63) = int64::MIN
+                // is reachable; anything larger cannot be represented (42601). i64
+                // cannot hold 2^63, so carry it unsigned and let the parser convert.
                 let start = i;
-                if c == b'-' {
-                    if !(i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit()) {
-                        return Err(syntax(format!("unexpected character '{}'", c as char)));
-                    }
-                    i += 1;
-                }
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
                 let text = &sql[start..i];
-                let n: i64 = text
+                let n: u64 = text
                     .parse()
                     .map_err(|_| syntax(format!("integer literal out of range: {text}")))?;
+                if n > (1u64 << 63) {
+                    return Err(syntax(format!("integer literal out of range: {text}")));
+                }
                 tokens.push(Token::Int(n));
             }
             _ if c.is_ascii_alphabetic() || c == b'_' => {

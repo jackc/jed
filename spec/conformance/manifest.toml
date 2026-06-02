@@ -88,6 +88,38 @@ description = "Explicit CAST(x AS type), including narrowing that may trap"
 id = "compare.promotion"
 description = "Cross-type integer comparison via the promotion tower (int16<int32<int64)"
 
+[[capability]]
+id = "types.boolean"
+description = "boolean / bool scalar type (TRUE/FALSE literals, projected boolean values; expression-only)"
+
+[[capability]]
+id = "expr.arithmetic"
+description = "Integer arithmetic operators + - * / % with trap-on-overflow (22003)"
+
+[[capability]]
+id = "expr.unary_minus"
+description = "Unary minus (negation) as an expression operator"
+
+[[capability]]
+id = "expr.parens"
+description = "Parenthesized sub-expressions"
+
+[[capability]]
+id = "expr.precedence"
+description = "Operator precedence across logical / comparison / arithmetic levels"
+
+[[capability]]
+id = "expr.comparison_value"
+description = "Comparisons produce boolean values usable in the SELECT list and nested expressions"
+
+[[capability]]
+id = "query.logical_connectives"
+description = "AND / OR / NOT with three-valued (Kleene) truth tables"
+
+[[capability]]
+id = "error.division_by_zero"
+description = "Integer division / modulo by zero is defined and traps SQLSTATE 22012"
+
 # --- profiles ----------------------------------------------------------------
 # A named bundle of capabilities = a conformance level. `includes` (optional)
 # inherits another profile's capabilities transitively, so profiles are cumulative.
@@ -129,3 +161,18 @@ id = "comparison"
 title = "core + cross-type comparison via the promotion tower (spec/types/compare.toml)"
 includes = "core"
 capabilities = ["query.comparison_order", "compare.promotion"]
+
+[[profile]]
+id = "expression"
+title = "comparison + the general expression substrate (arithmetic, boolean, logical connectives)"
+includes = "comparison"
+capabilities = [
+  "types.boolean",
+  "expr.arithmetic",
+  "expr.unary_minus",
+  "expr.parens",
+  "expr.precedence",
+  "expr.comparison_value",
+  "query.logical_connectives",
+  "error.division_by_zero",
+]

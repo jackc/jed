@@ -75,7 +75,9 @@ func crc32IEEE(data []byte) uint32 {
 // integer bytes for the column type. Reuses the key encoding; the named seam lets
 // storage and key encodings diverge when non-integer types land.
 func encodeValue(ty ScalarType, v Value) []byte {
-	if v.Null {
+	// boolean is expression-only this slice; no column is boolean, so a stored value is
+	// only ever NULL or an integer (spec/design/types.md §1).
+	if v.Kind == ValNull {
 		return EncodeNullable(ty, nil)
 	}
 	n := v.Int

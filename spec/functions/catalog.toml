@@ -3,48 +3,97 @@
 # Build-time input to per-language codegen; never parsed at runtime.
 # Reasoning lives in ../design/functions.md — read it before editing this file.
 #
-# This file defines what operators DO: their operand contract, result type, and
-# NULL behavior. It REFERENCES the type tables rather than restating them —
-# operand families and the promotion that reconciles a mixed-type pair live in
-# ../types/compare.toml; the scalar set and ranks in ../types/scalars.toml; error
-# codes in ../errors/registry.toml. Comparison/promotion semantics are NOT
-# re-encoded here (see functions.md).
+# This file defines what operators DO: their operand contract, result type, NULL
+# behavior, and precedence. It REFERENCES the type tables rather than restating
+# them — operand families and the promotion that reconciles a mixed-type pair live
+# in ../types/compare.toml; the scalar set and ranks in ../types/scalars.toml; error
+# codes in ../errors/registry.toml. Comparison/promotion and the three-valued NULL
+# logic are NOT re-encoded here (see functions.md).
 
 schema_version = 1
 
 # field doc -------------------------------------------------------------------
-# name            internal identity; the codegen handle and AST node name (the
-#                 CompareOp enum: eq/lt/gt/le/ge). One name per operator.
-# symbol          surface spelling of an infix operator ("=", "<="). Omitted for
-#                 operators with no single infix token (the IS [NOT] NULL tests).
-# kind            operator class: "comparison" | "null_test". Reserved for later
-#                 slices: "arithmetic" | "logical" | "function" (functions.md).
+# name            internal identity; the codegen handle and AST node name. One
+#                 name per operator (eq/lt/gt/le/ge, add/sub/mul/div/mod, neg,
+#                 and/or/not, is_null/is_not_null).
+# symbol          surface spelling of an infix/prefix operator ("=", "<=", "+",
+#                 "-"). Omitted for operators with no single punctuation token:
+#                 the IS [NOT] NULL tests and the keyword connectives AND/OR/NOT.
+# kind            operator class: "comparison" | "null_test" | "arithmetic" |
+#                 "logical". Reserved for a later slice: "function".
 # arity           operand count (2 = binary, 1 = unary).
 # arg_families    required family of each operand, by position, referencing a
 #                 `family` in ../types/scalars.toml. "any" = unconstrained.
 # arg_resolution  how a mixed-type operand pair is reconciled before the operator
 #                 runs, referencing ../types/compare.toml: "promote" = widen both
 #                 to the common type via the promotion tower; "none" = no reconcile.
-# result          result type: a scalar id from scalars.toml, OR a reserved
-#                 non-scalar id (functions.md): "truth" = three-valued truth value
-#                 (true/false/unknown), non-storable until the `boolean` type lands;
-#                 "promoted" = the common promoted operand type (reserved for future
-#                 arithmetic; none authored yet).
+# result          result type: a scalar id from scalars.toml ("boolean"), OR a
+#                 reserved non-scalar id (functions.md): "promoted" = the common
+#                 promoted operand type (arithmetic). Comparisons/null tests/logical
+#                 connectives all yield "boolean"; unknown is represented as a NULL
+#                 boolean (the three-valued domain — types.md).
 # null            NULL behavior: "propagates" = any NULL operand makes the result
-#                 unknown; "detects" = inspects NULL-ness, always returns a definite
-#                 truth value, never unknown.
+#                 NULL/unknown; "detects" = inspects NULL-ness, always returns a
+#                 definite boolean, never unknown; "kleene" = three-valued connective
+#                 truth table — NULL is absorbed by a dominant operand (FALSE for AND,
+#                 TRUE for OR) and only propagates when no operand dominates.
+# precedence      binding tightness as an integer (higher binds tighter). Authored
+#                 here as the SINGLE source of truth for the precedence tower; the
+#                 hand-written parsers must agree (functions.md, grammar.ebnf `expr`).
 # errors          SQLSTATE codes (../errors/registry.toml) this operator may raise;
 #                 empty for operators that cannot fail.
 # -----------------------------------------------------------------------------
 
+# --- logical connectives -----------------------------------------------------
+# Three-valued (Kleene) connectives over boolean operands. AND/OR are NOT plain
+# NULL-propagating: FALSE AND NULL = FALSE and TRUE OR NULL = TRUE (a dominant
+# operand absorbs NULL) — hence null = "kleene". NOT is genuine propagation
+# (NOT NULL = NULL). The truth tables themselves live in ../design/types.md; the
+# catalog records which NULL discipline each operator falls under. AND/OR/NOT are
+# keyword operators with no punctuation symbol. They are the loosest-binding level.
+
+[[operator]]
+name           = "or"
+kind           = "logical"
+arity          = 2
+arg_families   = ["boolean", "boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "kleene"
+precedence     = 10
+errors         = []
+
+[[operator]]
+name           = "and"
+kind           = "logical"
+arity          = 2
+arg_families   = ["boolean", "boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "kleene"
+precedence     = 20
+errors         = []
+
+[[operator]]
+name           = "not"
+kind           = "logical"
+arity          = 1
+arg_families   = ["boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 30
+errors         = []
+
 # --- comparison operators ----------------------------------------------------
 # Binary comparisons over the integer family. A mixed-width pair (e.g. int16 vs
 # int64) is widened to the common type by the promotion tower, then compared as
-# one integer (../types/compare.toml). Result is a three-valued truth: any NULL
-# operand yields unknown — NULL = NULL is unknown, equality is not reflexive
-# across NULL. No overflow is possible (widening is lossless; no arithmetic).
-# `<=`/`>=` are primitive operators here; that they equal `< OR =` / `> OR =`
-# under Kleene logic is reasoning recorded in functions.md, not a data field.
+# one integer (../types/compare.toml). Result is a boolean: any NULL operand
+# yields unknown (a NULL boolean) — NULL = NULL is unknown, equality is not
+# reflexive across NULL. No overflow is possible (widening is lossless; no
+# arithmetic). `<=`/`>=` are primitive operators here; that they equal `< OR =` /
+# `> OR =` under Kleene logic is reasoning recorded in functions.md, not a data
+# field. They bind between NOT and additive (precedence 35), non-associatively.
 
 [[operator]]
 name           = "eq"
@@ -53,8 +102,9 @@ kind           = "comparison"
 arity          = 2
 arg_families   = ["integer", "integer"]
 arg_resolution = "promote"
-result         = "truth"
+result         = "boolean"
 null           = "propagates"
+precedence     = 35
 errors         = []
 
 [[operator]]
@@ -64,8 +114,9 @@ kind           = "comparison"
 arity          = 2
 arg_families   = ["integer", "integer"]
 arg_resolution = "promote"
-result         = "truth"
+result         = "boolean"
 null           = "propagates"
+precedence     = 35
 errors         = []
 
 [[operator]]
@@ -75,8 +126,9 @@ kind           = "comparison"
 arity          = 2
 arg_families   = ["integer", "integer"]
 arg_resolution = "promote"
-result         = "truth"
+result         = "boolean"
 null           = "propagates"
+precedence     = 35
 errors         = []
 
 [[operator]]
@@ -86,8 +138,9 @@ kind           = "comparison"
 arity          = 2
 arg_families   = ["integer", "integer"]
 arg_resolution = "promote"
-result         = "truth"
+result         = "boolean"
 null           = "propagates"
+precedence     = 35
 errors         = []
 
 [[operator]]
@@ -97,16 +150,17 @@ kind           = "comparison"
 arity          = 2
 arg_families   = ["integer", "integer"]
 arg_resolution = "promote"
-result         = "truth"
+result         = "boolean"
 null           = "propagates"
+precedence     = 35
 errors         = []
 
 # --- null tests --------------------------------------------------------------
 # Unary null-detection over any nullable value of any type. Unlike comparisons
-# these never propagate: the result is ALWAYS a definite true/false, never
-# unknown — they are the sanctioned way to observe a NULL (compare.toml [null]).
-# No infix `symbol`; the surface spelling is the `IS [NOT] NULL` keyword form
-# owned by the grammar.
+# these never propagate: the result is ALWAYS a definite boolean, never unknown —
+# they are the sanctioned way to observe a NULL (compare.toml [null]). No infix
+# `symbol`; the surface spelling is the `IS [NOT] NULL` postfix keyword form owned
+# by the grammar, binding at the comparison level (precedence 35).
 
 [[operator]]
 name           = "is_null"
@@ -114,8 +168,9 @@ kind           = "null_test"
 arity          = 1
 arg_families   = ["any"]
 arg_resolution = "none"
-result         = "truth"
+result         = "boolean"
 null           = "detects"
+precedence     = 35
 errors         = []
 
 [[operator]]
@@ -124,6 +179,92 @@ kind           = "null_test"
 arity          = 1
 arg_families   = ["any"]
 arg_resolution = "none"
-result         = "truth"
+result         = "boolean"
 null           = "detects"
+precedence     = 35
 errors         = []
+
+# --- arithmetic operators ----------------------------------------------------
+# Binary integer arithmetic. A mixed-width pair is widened to the common type by
+# the promotion tower (arg_resolution = "promote"); the result type is that
+# common type (result = "promoted"), and a result outside the common type's range
+# traps 22003 (so int16 + int16 overflows at the int16 boundary, not int64's).
+# Any NULL operand yields NULL (null = "propagates"). Multiplicative binds tighter
+# than additive. Division and modulo additionally trap 22012 on a zero divisor;
+# integer division truncates toward zero and the remainder takes the dividend's
+# sign.
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "promoted"
+null           = "propagates"
+precedence     = 40
+errors         = ["22003"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "promoted"
+null           = "propagates"
+precedence     = 40
+errors         = ["22003"]
+
+[[operator]]
+name           = "mul"
+symbol         = "*"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "promoted"
+null           = "propagates"
+precedence     = 50
+errors         = ["22003"]
+
+[[operator]]
+name           = "div"
+symbol         = "/"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "promoted"
+null           = "propagates"
+precedence     = 50
+errors         = ["22003", "22012"]
+
+[[operator]]
+name           = "mod"
+symbol         = "%"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "promoted"
+null           = "propagates"
+precedence     = 50
+errors         = ["22003", "22012"]
+
+# Unary minus (negation). Same family/result discipline; negating int64's minimum
+# has no positive counterpart and traps 22003. Binds tighter than multiplicative.
+
+[[operator]]
+name           = "neg"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 1
+arg_families   = ["integer"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+precedence     = 60
+errors         = ["22003"]

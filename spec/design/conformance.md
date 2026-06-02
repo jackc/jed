@@ -26,13 +26,17 @@ problem (CLAUDE.md §7). We use the standard record types:
 
 Conventions, fixed here so every implementation renders identically:
 
-- **coltypes** — one letter per result column: `I` integer, `T` text, `R` real. The
-  current corpus uses only `I` (integers, CLAUDE.md §4). The letter is a **rendering** tag
-  (how a value is printed), *not* a type assertion — asserting the precise declared type
-  (`int16` vs `int32`) is a planned directive, deferred (§7).
+- **coltypes** — one letter per result column: `I` integer, `B` boolean, `T` text, `R`
+  real. The corpus uses `I` and `B` (integers and the expression-only boolean, CLAUDE.md
+  §4); `T`/`R` are reserved for later types. The letter is a **rendering** tag (how a value
+  is printed), *not* a type assertion — asserting the precise declared type (`int16` vs
+  `int32`) is a planned directive, deferred (§7).
 - **values** — printed one per line, **row-major** (row 1's columns, then row 2's, …). A
   single integer renders as its shortest decimal form (no leading zeros, leading `-` for
-  negatives). **NULL renders as the literal `NULL`.**
+  negatives). A **boolean renders as the literal `true` or `false`** (lowercase; never
+  `t`/`f`, `0`/`1`, or host casing — a CLAUDE.md §8 determinism decision). **NULL renders as
+  the literal `NULL`** (for every column type, boolean included — a NULL boolean is unknown,
+  printed `NULL`, not `false`).
 - **empty result** — the `----` separator followed by no value lines (the record ends at
   the next blank line).
 - **sortmode** — `nosort` (compare in returned order), `rowsort`, or `valuesort`. We
@@ -123,6 +127,7 @@ Current profiles:
 | `core` | CREATE TABLE (+PK) / INSERT / SELECT / `WHERE pk =` / `ORDER BY` / `IS [NOT] NULL` / 3-valued NULL / insert overflow trap, integers only. | The CLAUDE.md §11 step-5 "it's alive" milestone. |
 | `casts` | `core` + explicit `CAST` narrowing (fits, and traps `22003` when it doesn't). | [../types/casts.toml](../types/casts.toml). |
 | `comparison` | `core` + cross-type integer comparison via the promotion tower (`<`, `>`, `=`). | [../types/compare.toml](../types/compare.toml). |
+| `expression` | `comparison` + the general expression substrate: integer arithmetic (`+ - * / %`, unary `-`, precedence, parens; traps `22003`/`22012`), the expression-only `boolean` type (`TRUE`/`FALSE`, comparisons-as-values), and `AND`/`OR`/`NOT` Kleene connectives. | [../functions/catalog.toml](../functions/catalog.toml), [../design/types.md](../design/types.md) §9. |
 
 ## 4. Determinism rules
 
@@ -134,8 +139,10 @@ Every corpus entry MUST obey:
 - **One canonical name, one code.** Types print under their canonical id; each error
   condition has exactly one SQLSTATE.
 - **No nondeterminism.** No wall-clock, no random, no hashmap-order leakage.
-- **No floats.** The corpus is integer-only, so the float-formatting divergence
-  (CLAUDE.md §8) cannot arise.
+- **No floats.** The scalar set is integers + the expression-only boolean, so the
+  float-formatting divergence (CLAUDE.md §8) cannot arise.
+- **Canonical boolean spelling.** A boolean prints as exactly `true`/`false` (NULL as
+  `NULL`); no core may emit `t`/`f`, `0`/`1`, or host-cased variants.
 
 ## 5. Bootstrapping policy
 
@@ -165,5 +172,10 @@ profile's capabilities passes. Harnesses arrive with the first vertical slice
   constant* that adapts to its context and traps `22003` when its value does not fit (so
   `WHERE small = 100000`, with `small int16`, is a type error, not a silent non-match). See
   [../design/types.md](../design/types.md) §6; coverage in `suites/types/literals.test`.
-- **Boolean results / connectives** — `AND`/`OR`/`NOT` over predicates arrive with the
-  `boolean` type (deferred, CLAUDE.md §4). The corpus uses single predicates only.
+- **Boolean results / connectives** — ✅ **resolved**: the `boolean` type (expression-only),
+  comparisons-as-values, and `AND`/`OR`/`NOT` Kleene connectives landed with the general
+  expression substrate. Rendered under the `B` tag (§1); the `expression` profile (§3)
+  gates them; coverage in `suites/expr/`. Boolean as a *storable column type* remains
+  deferred (types.md §10).
+- **Render-tag breadth** — `B` joins `I`; `T` (text) and `R` (real) are still reserved for
+  the deferred `text`/float decisions (CLAUDE.md §8).

@@ -10,11 +10,17 @@ schema_version = 1
 # --- conventions -------------------------------------------------------------
 # id            canonical name. ALL aliases normalize to this. It is the single
 #               name that appears in error messages, the catalog, and conformance
-#               `query` column-type tags (determinism: one name per type). Names
-#               state the width in BITS (int16/int32/int64), the convention common
-#               in programming languages.
+#               `query` column-type tags (determinism: one name per type). Integer
+#               names state the width in BITS (int16/int32/int64), the convention
+#               common in programming languages.
 # aliases       additional SQL spellings accepted on input (the SQL-standard names).
 # family        types in the same family share comparison/promotion rules.
+# storable      true if a column may be declared of this type (and a value of it
+#               stored on disk). false = the type exists only as an EXPRESSION type
+#               (literals, operator results) but is not a column type this slice;
+#               declaring such a column, or CASTing to it, traps 0A000. Integer
+#               fields below (signed/bits/min/max/overflow/rank) apply only to the
+#               integer family.
 # signed        two's-complement signed integer.
 # bits          storage width in bits.
 # min / max     inclusive value range.
@@ -23,15 +29,18 @@ schema_version = 1
 #               (CLAUDE.md §8 — strict typing forbids silent reinterpretation).
 # encoding      order-preserving key encoding (CLAUDE.md §8). method
 #               "int-be-signflip" = fixed-width big-endian with the sign bit
-#               inverted; sorts byte-for-byte identically to logical order.
+#               inverted; "bool-byte" = a single byte 0x00 (false) < 0x01 (true).
+#               Both sort byte-for-byte identically to logical order.
 # rank          position in the integer promotion tower; the common type of two
-#               integers is the one with the higher rank (see compare.toml).
+#               integers is the one with the higher rank (see compare.toml). Omitted
+#               for non-integer types (boolean does not promote — there is one).
 # -----------------------------------------------------------------------------
 
 [[type]]
 id = "int16"
 aliases = ["smallint"]
 family = "integer"
+storable = true
 signed = true
 bits = 16
 min = -32768
@@ -45,6 +54,7 @@ rank = 1
 id = "int32"
 aliases = ["int", "integer"]
 family = "integer"
+storable = true
 signed = true
 bits = 32
 min = -2147483648
@@ -58,6 +68,7 @@ rank = 2
 id = "int64"
 aliases = ["bigint"]
 family = "integer"
+storable = true
 signed = true
 bits = 64
 min = -9223372036854775808
@@ -66,3 +77,20 @@ overflow = "trap"
 overflow_error = "22003"
 encoding = { method = "int-be-signflip", width_bytes = 8 }
 rank = 3
+
+# --- boolean: the first non-integer scalar, EXPRESSION-ONLY this slice --------
+# boolean is the result of comparisons and logical connectives and the type of the
+# TRUE/FALSE literals (../functions/catalog.toml). Its three states under NULL are
+# exactly Kleene's true/false/unknown — unknown is a NULL boolean (../design/types.md).
+# It is NOT a storable column type yet (storable = false): `CREATE TABLE t(b boolean)`
+# and `CAST(x AS boolean)` trap 0A000 (feature_not_supported). The order-preserving
+# `bool-byte` encoding is recorded now as a fixed property of the type, but it is
+# unexercised — there is no on-disk type code and no key/value byte fixtures until
+# the storable-boolean follow-on slice (fileformat.md, encoding/integers.toml are
+# unchanged). The domain is {false, true}, ordered false < true.
+[[type]]
+id = "boolean"
+aliases = ["bool"]
+family = "boolean"
+storable = false
+encoding = { method = "bool-byte", width_bytes = 1 }

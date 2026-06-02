@@ -1,0 +1,47 @@
+# Operator precedence ACROSS levels of the expression tower (loosest to tightest):
+# OR < AND < NOT < comparison < additive < multiplicative < unary minus. Parentheses
+# override. Authored precedence is in spec/functions/catalog.toml (the `precedence`
+# field); the tower is spec/grammar/grammar.ebnf `expr`. Format + `requires`:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.int32, types.boolean, expr.arithmetic, expr.precedence, expr.parens, query.logical_connectives, expr.comparison_value
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+
+statement ok
+INSERT INTO t VALUES (1, 2, 3)
+
+statement ok
+INSERT INTO t VALUES (2, 5, 3)
+
+# comparison binds tighter than AND: a + 1 = 3 AND b = 3 == ((a+1)=3) AND (b=3)
+query I nosort
+SELECT id FROM t WHERE a + 1 = 3 AND b = 3 ORDER BY id
+----
+1
+
+# NOT binds tighter than AND: NOT a = 2 AND b = 3 == (NOT (a=2)) AND (b=3)
+query I nosort
+SELECT id FROM t WHERE NOT a = 2 AND b = 3 ORDER BY id
+----
+2
+
+# arithmetic precedence inside a comparison inside a logical op:
+# a * 2 + 1 = 5 OR b = 99 == (((a*2)+1)=5) OR (b=99)
+query I nosort
+SELECT id FROM t WHERE a * 2 + 1 = 5 OR b = 99 ORDER BY id
+----
+1
+
+# OR binds looser than AND: a = 5 AND b = 3 OR a = 2 == (a=5 AND b=3) OR (a=2)
+query I nosort
+SELECT id FROM t WHERE a = 5 AND b = 3 OR a = 2 ORDER BY id
+----
+1
+2
+
+# precedence is visible in a projected boolean too: NOT a = 2 == NOT (a = 2)
+query B nosort
+SELECT NOT a = 2 FROM t WHERE id = 1
+----
+false

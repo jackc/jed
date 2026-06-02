@@ -32,62 +32,93 @@ type Insert struct {
 	Values []Literal
 }
 
-// Update is `UPDATE <table> SET <col> = <operand> [, ...] [WHERE <predicate>]`. Each
+// Update is `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each
 // assignment's right-hand side is evaluated against the pre-update row (so
 // `SET a = b, b = a` swaps). Assigning a PRIMARY KEY column is rejected this slice
-// (the storage key must not change — see the executor).
+// (the storage key must not change — see the executor). The WHERE expression must
+// resolve to boolean.
 type Update struct {
 	Table       string
 	Assignments []Assignment
-	Filter      *Predicate
+	Filter      *Expr
 }
 
-// Assignment is one `SET <Column> = <Value>` clause.
+// Assignment is one `SET <Column> = <Value>` clause; Value is a general expression.
 type Assignment struct {
 	Column string
-	Value  Operand
+	Value  Expr
 }
 
-// Delete is `DELETE FROM <table> [WHERE <predicate>]`. No WHERE deletes every row.
+// Delete is `DELETE FROM <table> [WHERE <expr>]`. No WHERE deletes every row; the
+// WHERE expression must resolve to boolean.
 type Delete struct {
 	Table  string
-	Filter *Predicate
+	Filter *Expr
 }
 
-// Select is a single-table SELECT.
+// Select is a single-table SELECT. Filter (the WHERE expression) must resolve to
+// boolean.
 type Select struct {
 	Items   SelectItems
 	From    string
-	Filter  *Predicate
+	Filter  *Expr
 	OrderBy *OrderBy
 }
 
 // SelectItems is either all columns (*) or a list of projected expressions.
 type SelectItems struct {
 	All   bool
-	Items []SelectExpr
+	Items []Expr
 }
 
-// SelectExpr is a projected expression: a column reference, a cast, or a literal.
-// Exactly one field is set (Cast nests via Inner).
-type SelectExpr struct {
-	Column  string
-	Literal *Literal
-	Cast    *CastExpr
-}
+// CompareOp is unused now that comparisons are BinaryOp; retained name removed.
 
-// CastExpr is CAST(Inner AS TypeName).
-type CastExpr struct {
-	Inner    SelectExpr
-	TypeName string
-}
-
-// CompareOp is a comparison operator.
-type CompareOp int
+// ExprKind tags an expression node (Go has no sum types; this is the discriminant —
+// the one place this slice deviates from the "exactly one pointer set" idiom, because
+// a Column is a bare string).
+type ExprKind int
 
 const (
+	// ExprColumn is a column reference.
+	ExprColumn ExprKind = iota
+	// ExprLiteral is a literal value.
+	ExprLiteral
+	// ExprCast is CAST(inner AS type).
+	ExprCast
+	// ExprUnary is a unary operator applied to one operand.
+	ExprUnary
+	// ExprBinary is a binary operator over two operands.
+	ExprBinary
+	// ExprIsNull is a postfix IS [NOT] NULL test.
+	ExprIsNull
+)
+
+// UnaryOp is a unary operator.
+type UnaryOp int
+
+const (
+	// OpNeg is arithmetic negation `-x`.
+	OpNeg UnaryOp = iota
+	// OpNot is logical negation `NOT x`.
+	OpNot
+)
+
+// BinaryOp is a binary operator (arithmetic, comparison, or logical).
+type BinaryOp int
+
+const (
+	// OpAdd is +.
+	OpAdd BinaryOp = iota
+	// OpSub is -.
+	OpSub
+	// OpMul is *.
+	OpMul
+	// OpDiv is /.
+	OpDiv
+	// OpMod is %.
+	OpMod
 	// OpEq is =.
-	OpEq CompareOp = iota
+	OpEq
 	// OpLt is <.
 	OpLt
 	// OpGt is >.
@@ -96,32 +127,47 @@ const (
 	OpLe
 	// OpGe is >=.
 	OpGe
+	// OpAnd is AND.
+	OpAnd
+	// OpOr is OR.
+	OpOr
 )
 
-// Predicate is a WHERE predicate. Step-1 has single predicates only (no AND/OR —
-// boolean type deferred): either a comparison or a NULL test. Exactly one is set.
-type Predicate struct {
-	Compare *ComparePredicate
-	IsNull  *IsNullPredicate
+// Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.
+// Kind selects which fields are meaningful. A comparison/logical/null-test node is
+// boolean-valued; arithmetic and columns/integer-literals are integer-valued.
+type Expr struct {
+	Kind     ExprKind
+	Column   string     // ExprColumn
+	Literal  *Literal   // ExprLiteral
+	Cast     *CastExpr  // ExprCast
+	Unary    *UnaryExpr // ExprUnary
+	Binary   *BinaryExpr
+	IsNullOf *IsNullExpr // ExprIsNull
 }
 
-// ComparePredicate is `column <op> rhs`, where rhs is another column or a literal.
-type ComparePredicate struct {
-	Column string
-	Op     CompareOp
-	RHS    Operand
+// CastExpr is CAST(Inner AS TypeName).
+type CastExpr struct {
+	Inner    Expr
+	TypeName string
 }
 
-// Operand is a comparison's right-hand side: a column reference or a literal.
-// Exactly one of Column / Literal is set.
-type Operand struct {
-	Column  string
-	Literal *Literal
+// UnaryExpr is Op applied to Operand.
+type UnaryExpr struct {
+	Op      UnaryOp
+	Operand Expr
 }
 
-// IsNullPredicate is `column IS [NOT] NULL`.
-type IsNullPredicate struct {
-	Column  string
+// BinaryExpr is Lhs Op Rhs.
+type BinaryExpr struct {
+	Op  BinaryOp
+	Lhs Expr
+	Rhs Expr
+}
+
+// IsNullExpr is `Operand IS [NOT] NULL`.
+type IsNullExpr struct {
+	Operand Expr
 	Negated bool
 }
 
@@ -132,7 +178,7 @@ type OrderBy struct {
 	Descending bool
 }
 
-// LiteralKind distinguishes a NULL literal from an integer literal.
+// LiteralKind distinguishes the literal forms.
 type LiteralKind int
 
 const (
@@ -140,13 +186,17 @@ const (
 	LiteralNull LiteralKind = iota
 	// LiteralInt is an integer literal.
 	LiteralInt
+	// LiteralBool is a boolean literal (TRUE / FALSE).
+	LiteralBool
 )
 
 // Literal is a literal value as written in SQL. A bare integer literal is an *untyped
-// constant* that adapts to its context — the target column on INSERT/UPDATE, the CAST
-// target, the compared column in a WHERE predicate — and traps 22003 if it does not fit;
-// with no context it defaults to int64. See spec/design/types.md (Integer-literal typing).
+// constant* that adapts to its context — the target column on INSERT/UPDATE, a sibling
+// operand, the compared column in a WHERE predicate — and traps 22003 if it does not
+// fit; with no context it defaults to int64 (spec/design/types.md §6). A boolean
+// literal is expression-only this slice (it cannot be stored).
 type Literal struct {
 	Kind LiteralKind
 	Int  int64
+	Bool bool
 }

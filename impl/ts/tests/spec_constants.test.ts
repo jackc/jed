@@ -8,6 +8,7 @@ import { type SqlState, sqlStateCode } from "../src/errors.ts";
 import {
   type ScalarType,
   canonicalName,
+  isBooleanTypeName,
   maxOf,
   minOf,
   rank,
@@ -19,13 +20,18 @@ import { readTomlTables, specPath } from "./tomlmini.ts";
 
 test("scalar types match spec/types/scalars.toml", () => {
   const rows = readTomlTables(specPath("types/scalars.toml"), "type");
-  assert.equal(rows.length, 3, "expected 3 scalar types");
-  for (const row of rows) {
+
+  // The storable scalar types are exactly the three integers; each maps to a ScalarType
+  // with matching width/range/rank (CLAUDE.md §5 cross-check).
+  const integers = rows.filter((r) => r.str("family") === "integer");
+  assert.equal(integers.length, 3, "expected 3 storable integer scalar types");
+  for (const row of integers) {
     const id = row.str("id");
     const st = scalarTypeFromName(id);
     assert.notEqual(st, undefined, `unknown type id ${id}`);
     const t = st as ScalarType;
     assert.equal(canonicalName(t), id, `${id}: canonical name`);
+    assert.ok(row.bool("storable"), `${id}: should be storable`);
     assert.equal(BigInt(widthBytes(t) * 8), row.big("bits"), `${id}: bits`);
     assert.equal(minOf(t), row.big("min"), `${id}: min`);
     assert.equal(maxOf(t), row.big("max"), `${id}: max`);
@@ -34,6 +40,16 @@ test("scalar types match spec/types/scalars.toml", () => {
       assert.equal(scalarTypeFromName(alias), t, `alias ${alias} should resolve to ${id}`);
     }
   }
+
+  // boolean is the first non-integer scalar: expression-only (storable = false), so it
+  // is NOT a column ScalarType, only a recognized non-storable type name.
+  const boolean = rows.find((r) => r.str("id") === "boolean");
+  assert.notEqual(boolean, undefined, "boolean type present");
+  assert.equal(boolean!.str("family"), "boolean", "boolean family");
+  assert.equal(boolean!.bool("storable"), false, "boolean is not storable this slice");
+  assert.equal(scalarTypeFromName("boolean"), undefined, "boolean is not a column type");
+  assert.equal(scalarTypeFromName("bool"), undefined, "bool is not a column type");
+  assert.ok(isBooleanTypeName("boolean") && isBooleanTypeName("BOOL"), "boolean name recognized");
 });
 
 test("error codes are registered in spec/errors/registry.toml", () => {
@@ -43,6 +59,7 @@ test("error codes are registered in spec/errors/registry.toml", () => {
 
   const states: SqlState[] = [
     "numeric_value_out_of_range",
+    "division_by_zero",
     "not_null_violation",
     "unique_violation",
     "syntax_error",
@@ -81,9 +98,10 @@ test("operators match spec/functions/catalog.toml", () => {
     assert.equal(d.argResolution, row.str("arg_resolution"), `${name}: arg_resolution`);
     assert.equal(d.result, row.str("result"), `${name}: result`);
     assert.equal(d.null, row.str("null"), `${name}: null`);
+    assert.equal(d.precedence, row.has("precedence") ? row.num("precedence") : 0, `${name}: precedence`);
     assert.deepEqual([...d.argFamilies], row.strs("arg_families"), `${name}: argFamilies`);
     assert.deepEqual([...d.errors], row.strs("errors"), `${name}: errors`);
-    if (row.str("kind") === "comparison") {
+    if (row.has("symbol")) {
       assert.equal(d.symbol, row.str("symbol"), `${name}: symbol`);
     } else {
       assert.equal(d.symbol, undefined, `${name}: symbol absent`);

@@ -31,10 +31,20 @@ func specPath(t *testing.T, rel string) string {
 
 func TestScalarTypesMatchSpec(t *testing.T) {
 	tables := readTomlTables(t, specPath(t, "types/scalars.toml"), "type")
-	if len(tables) != 3 {
-		t.Fatalf("expected 3 scalar types, got %d", len(tables))
-	}
-	for _, row := range tables {
+
+	// The storable scalar types are exactly the three integers; each maps to a
+	// ScalarType with matching width/range/rank/encoding (CLAUDE.md §5 cross-check).
+	integers := 0
+	var boolean *tomlRow
+	for i := range tables {
+		row := tables[i]
+		if row.str("family") != "integer" {
+			if row.str("id") == "boolean" {
+				boolean = &tables[i]
+			}
+			continue
+		}
+		integers++
 		id := row.str("id")
 		st, ok := ScalarTypeFromName(id)
 		if !ok {
@@ -42,6 +52,9 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 		}
 		if st.CanonicalName() != id {
 			t.Errorf("%s: canonical name mismatch", id)
+		}
+		if !row.boolVal("storable") {
+			t.Errorf("%s: should be storable", id)
 		}
 		if got, want := int64(st.WidthBytes()*8), row.int("bits"); got != want {
 			t.Errorf("%s: bits got %d want %d", id, got, want)
@@ -61,6 +74,30 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 			}
 		}
 	}
+	if integers != 3 {
+		t.Fatalf("expected 3 storable integer scalar types, got %d", integers)
+	}
+
+	// boolean is the first non-integer scalar: expression-only (storable = false), so it
+	// is NOT a column ScalarType, only a recognized non-storable type name.
+	if boolean == nil {
+		t.Fatal("boolean type missing from scalars.toml")
+	}
+	if boolean.str("family") != "boolean" {
+		t.Errorf("boolean: family mismatch")
+	}
+	if boolean.boolVal("storable") {
+		t.Errorf("boolean must not be storable this slice")
+	}
+	if _, ok := ScalarTypeFromName("boolean"); ok {
+		t.Errorf("boolean is not a storable column type")
+	}
+	if _, ok := ScalarTypeFromName("bool"); ok {
+		t.Errorf("bool is not a storable column type")
+	}
+	if !IsBooleanTypeName("boolean") || !IsBooleanTypeName("BOOL") {
+		t.Errorf("boolean type name should be recognized (case-insensitively)")
+	}
 }
 
 func TestErrorCodesAreRegistered(t *testing.T) {
@@ -70,7 +107,7 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 		codes[row.str("code")] = row.str("name")
 	}
 	for _, st := range []SqlState{
-		NumericValueOutOfRange, NotNullViolation, UniqueViolation,
+		NumericValueOutOfRange, DivisionByZero, NotNullViolation, UniqueViolation,
 		SyntaxError, UndefinedTable, UndefinedColumn, UndefinedObject,
 		DatatypeMismatch, DuplicateTable, DuplicateColumn,
 		InvalidTableDefinition, FeatureNotSupported, DataCorrupted,
@@ -119,15 +156,22 @@ func TestOperatorsMatchSpec(t *testing.T) {
 		if desc.Null != row.str("null") {
 			t.Errorf("%s: null mismatch", name)
 		}
+		wantPrec := int64(0)
+		if row.has("precedence") {
+			wantPrec = row.int("precedence")
+		}
+		if int64(desc.Precedence) != wantPrec {
+			t.Errorf("%s: precedence got %d want %d", name, desc.Precedence, wantPrec)
+		}
 		if strings.Join(desc.ArgFamilies, ",") != strings.Join(row.strs("arg_families"), ",") {
 			t.Errorf("%s: arg_families mismatch", name)
 		}
 		if strings.Join(desc.Errors, ",") != strings.Join(row.strs("errors"), ",") {
 			t.Errorf("%s: errors mismatch", name)
 		}
-		if row.str("kind") == "comparison" {
+		if row.has("symbol") {
 			if desc.Symbol != row.str("symbol") {
-				t.Errorf("%s: symbol mismatch", name)
+				t.Errorf("%s: symbol got %q want %q", name, desc.Symbol, row.str("symbol"))
 			}
 		} else if desc.Symbol != "" {
 			t.Errorf("%s: expected empty symbol, got %q", name, desc.Symbol)

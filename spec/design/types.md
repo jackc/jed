@@ -12,9 +12,9 @@ system — "like SQLite, but with a real type system." It is designed as data, b
 executor, so that every implementation tests against one shared contract instead of
 discovering semantics in code.
 
-## 1. Scope: signed integers only (for now)
+## 1. Scope: signed integers (storable) + boolean (expression-only)
 
-Step 1 implements exactly three scalar types (CLAUDE.md §4):
+The storable scalar types are exactly three signed integers (CLAUDE.md §4):
 
 | Canonical id | Aliases | Bits | Range |
 |---|---|---|---|
@@ -22,13 +22,19 @@ Step 1 implements exactly three scalar types (CLAUDE.md §4):
 | `int32` | `int`, `integer` | 32 | −2147483648 … 2147483647 |
 | `int64` | `bigint` | 64 | −9223372036854775808 … 9223372036854775807 |
 
-All are signed, two's-complement. Every other scalar (`decimal`, `text`, `boolean`,
-`timestamp`/`timestamptz`, `bytea`, `json`/`jsonb`) is **deferred**. A direct consequence:
-the float-formatting, decimal-rounding, NaN/∞-ordering, and collation decisions in CLAUDE.md
-§8 do **not** bind this step — there are no floats, decimals, or text yet. That is the
-point of starting here: the first slice exercises the whole multi-core machinery against
-the *smallest* type surface that still has real, divergence-prone behavior (overflow,
-promotion, order-preserving encoding).
+All are signed, two's-complement. The general-expression slice adds **`boolean`** (aliases
+`bool`) as the first non-integer scalar — but **expression-only**: it is the result type of
+comparisons and the logical connectives and the type of the `TRUE`/`FALSE` literals, yet it
+is **not a storable column type** (`storable = false` in
+[../types/scalars.toml](../types/scalars.toml)). You cannot declare `CREATE TABLE t(b
+boolean)` or `CAST(x AS boolean)`; both trap `0A000` (feature_not_supported) — a deliberate
+narrowing (§10), relaxable in the storable-boolean follow-on. The remaining scalars
+(`decimal`, `text`, `timestamp`/`timestamptz`, `bytea`, `json`/`jsonb`) are still
+**deferred**. A direct consequence: the float-formatting, decimal-rounding, NaN/∞-ordering,
+and collation decisions in CLAUDE.md §8 still do **not** bind — there are no floats,
+decimals, or text yet. Boolean adds real divergence-prone behavior of its own (a render
+form beyond `I`/`T`/`R`, and three-valued Kleene connectives — §10) on the *smallest*
+possible non-integer surface.
 
 ## 2. Canonical names vs. aliases
 
@@ -60,8 +66,14 @@ also PostgreSQL's behavior, which §1 lets us borrow where principled. Wrap is t
 alternative; if a wrapping operation is ever wanted it will be a *distinct, explicitly
 named* operator, not the default `+`.
 
-This applies uniformly to arithmetic (when the operator catalog lands), to literals that
-don't fit their target column, and to narrowing casts (§5).
+This applies uniformly to arithmetic, to literals that don't fit their target column, and
+to narrowing casts (§5). For arithmetic the trap boundary is the operator's **result type**,
+not int64: `int16 + int16` yields `int16`, so `30000 + 30000` traps `22003` at the int16
+range even though the sum fits int64 (the type-faithful boundary — see
+[functions.md](functions.md) §7 and the promotion tower in §4). Each core computes in 64-bit
+and traps both if the 64-bit operation itself overflows and if the in-range 64-bit result
+falls outside the declared result type. `division`/`modulo` by zero is a distinct defined
+trap, `22012` (`division_by_zero`), not a wrapped or platform-dependent value.
 
 ## 4. Comparison, promotion, three-valued NULL
 
@@ -73,15 +85,23 @@ higher-ranked type (`strategy = "max-rank"`) and are compared there. Widening is
 lossless, so promotion never loses information or traps.
 
 **Comparability.** Only listed `(family, family)` pairs may be compared; everything else
-is a type error. Step 1 has a single family, hence a single rule (`integer × integer`).
-This table is where cross-family comparison rules (e.g. integer ↔ decimal) will be added
-deliberately, rather than falling out of implicit coercions.
+is a type error (`42804`). The one rule is `integer × integer`: the comparison operators
+(`= < > <= >=`) accept **integer operands only**. Comparing a boolean — `(a = b) = (c = d)`,
+`bool = int` — is a `42804` type error this slice; booleans are produced by comparisons and
+consumed by the logical connectives and `WHERE`, but they are not themselves compared with
+the comparison operators (a deliberate narrowing, relaxable by adding a `boolean × boolean`
+comparability rule later). This table is where cross-family rules (integer ↔ decimal, the
+boolean self-comparison) will be added deliberately, rather than falling out of implicit
+coercions.
 
 **Three-valued NULL logic** (CLAUDE.md §4). Any comparison with a NULL operand is
-`UNKNOWN` (represented as NULL), never TRUE/FALSE. Notably `NULL = NULL` is `UNKNOWN`:
-equality is **not** reflexive across NULL. Testing for NULL is done with `IS [NOT] NULL`
-and `IS [NOT] DISTINCT FROM` (the latter arrives with the operator catalog). This is the
-PG model, borrowed because it is principled.
+`UNKNOWN`, never TRUE/FALSE. Notably `NULL = NULL` is `UNKNOWN`: equality is **not**
+reflexive across NULL. With the `boolean` type, `UNKNOWN` has a concrete carrier — a **NULL
+boolean** — so `{true, false, NULL}` *is* the three-valued domain; there is no separate
+non-storable "truth" value (functions.md §2). Testing for NULL is done with `IS [NOT] NULL`;
+`IS [NOT] DISTINCT FROM` (NULL-safe equality) is now unblocked by boolean but not yet
+authored. This is the PG model, borrowed because it is principled. The Kleene truth tables
+for the `AND`/`OR`/`NOT` connectives over this domain are in §10.
 
 **Value ordering & NULL position.** Non-NULL integers use plain signed numeric ascending
 order, which is exactly what the key encoding (§7) reproduces in raw bytes. NULL's position
@@ -117,9 +137,11 @@ its **context**, and **traps `22003`** if its value does not fit that context ty
 keeps a literal from silently forcing a width, and makes `WHERE small = 100000` (where
 `small` is `int16`) a type error rather than a value that silently never matches.
 
-- **Lexing first.** A literal is parsed as a signed 64-bit value; a magnitude beyond int64
-  is a *syntax* error (`42601`, [../grammar/grammar.ebnf](../grammar/grammar.ebnf)), decided
-  before any typing applies.
+- **Lexing first.** A literal is an unsigned magnitude of digits (the sign is the
+  unary-minus operator); a magnitude beyond `2^63` is a *syntax* error (`42601`,
+  [../grammar/grammar.ebnf](../grammar/grammar.ebnf) §4), decided before any typing applies.
+  The value `2^63` is representable only as the operand of unary minus (folding to
+  `int64`'s minimum); a bare `2^63` fits no type and traps `22003` at resolve time.
 - **Assignment context** (`INSERT ... VALUES`, `UPDATE ... SET col = lit`): the context is
   the target column's type. The literal adapts to it — accepted iff in range, else `22003`.
 - **Cast context** (`CAST(lit AS T)`): the context is `T`; range-checked, else `22003`.
@@ -132,10 +154,14 @@ keeps a literal from silently forcing a width, and makes `WHERE small = 100000` 
 - **No context** (a bare projected literal, `SELECT 1000`): defaults to **int64**, the
   widest integer.
 
-**Forward — arithmetic** (when the operator catalog's arithmetic lands): an untyped literal
-operand adapts to the *other* operand's type (`small + 1000` → `int16`, and may overflow per
-§3); a literal meeting only literals (`1000 + 1`) defaults to int64. Recorded here so the
-arithmetic slice inherits the rule rather than re-deciding it.
+- **Arithmetic context** (`a <op> lit`): an untyped literal operand adapts to the *other*
+  operand's type — `small + 1000` types the literal `1000` as `int16` and traps `22003` at
+  resolve if it does not fit (here it does not: `1000` fits, but `small + 100000` traps).
+  A literal meeting only literals (`1000 + 1`) has no column context, so both default to
+  `int64`. The result type is then the promotion of the operand types (§3, §4), and a
+  *computed* result outside that type still traps `22003` at run time (`30000 + 30000` over
+  `int16`). The unary-minus fold (`-lit`) is one negative literal, range-checked against its
+  context like any literal.
 
 **Why this, not "smallest fitting" or "always int64".** Smallest-fitting makes ordinary
 arithmetic overflow surprisingly (`30000 + 30000` would be `int16 + int16`). Always-int64
@@ -175,16 +201,57 @@ byte-identity is the whole point.
 ## 8. Determinism checklist (this step)
 
 - ✅ One canonical name per type in all output.
-- ✅ Trap (deterministic error `22003`) instead of platform-dependent wraparound.
-- ✅ Promotion is total and order-independent (`max-rank`).
+- ✅ Trap (deterministic error `22003`/`22012`) instead of platform-dependent wraparound or
+  undefined divide-by-zero.
+- ✅ Promotion is total and order-independent (`max-rank`); arithmetic result types and the
+  trap boundary are fixed (§3, functions.md §7).
 - ✅ Value order == key byte order (no separate, possibly-divergent comparator).
 - ✅ NULL's physical total-order position — ratified NULLs-first (ascending), see §4.
+- ✅ Boolean renders as a fixed canonical form (`true`/`false`, NULL as `NULL`) — see §10 and
+  [conformance.md](conformance.md); no host-dependent boolean spelling may leak.
+- ✅ Kleene `AND`/`OR`/`NOT` truth tables are fixed data (§10), identical across cores.
 
-## 9. Open / deferred
+## 9. The boolean type and three-valued connectives
+
+`boolean` (aliases `bool`) is the first non-integer scalar, **expression-only** this slice
+(§1): a column cannot be declared boolean and `CAST(x AS boolean)` is rejected, both with
+`0A000`. It exists so the value-world and the truth-world unify — a comparison *produces* a
+boolean, so `SELECT a = b` projects one and `WHERE <expr>` consumes one (keeping a row iff
+the expression is TRUE; FALSE and NULL/unknown both exclude). The domain is `{false, true}`
+plus NULL (= unknown), ordered `false < true` (the `bool-byte` encoding, fixed now but
+unexercised until storable — scalars.toml).
+
+**Rendering.** A boolean renders in the conformance corpus as the literal text `true` or
+`false`, and a NULL boolean as `NULL`, under a new render tag `B`
+([conformance.md](conformance.md)). This is a CLAUDE.md §8 decision: every core must emit the
+identical spelling (not `t`/`f`, not `0`/`1`, not host `True`/`true` casing), or the corpus
+diverges.
+
+**Three-valued (Kleene) connectives.** `AND`, `OR`, `NOT` operate over `{true, false,
+NULL}`. The tables are canonical and identical across cores (functions.md §3 records only
+that `and`/`or` are `kleene` and `not` is `propagates`; the tables themselves are here):
+
+| `AND` | true | false | NULL |   | `OR` | true | false | NULL |   | `NOT` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **true**  | true  | false | NULL  |   | **true**  | true | true  | true |   | true → false |
+| **false** | false | false | false |   | **false** | true | false | NULL |   | false → true |
+| **NULL**  | NULL  | false | NULL  |   | **NULL**  | true | NULL  | NULL |   | NULL → NULL |
+
+The non-propagating cells are the point: a *dominant* operand absorbs NULL — `false AND
+NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain propagation.
+`NOT NULL = NULL` is genuine propagation. These follow from `<=`/`>=` being Kleene-OR of
+`<` and `=` (functions.md §5) and keep `WHERE`'s "row kept iff TRUE" consistent.
+
+## 10. Open / deferred
 
 - **NULL sort position** — ✅ ratified NULLs-first (ascending) with the key-encoding spec
   (§4, [encoding.md §4](encoding.md)). No longer open.
-- **Operator result types** — `int + int`, etc. live in [../functions/](../functions/),
-  authored when the operator catalog lands (needed by the step-5 vertical slice).
+- **Operator result types** — ✅ authored in [../functions/](../functions/): comparisons and
+  connectives yield `boolean`, arithmetic yields the promoted operand type (functions.md §7).
+- **Storable boolean** — boolean as a column type (on-disk type code, key/value encoding
+  fixtures, boolean PK). Deferred to a follow-on slice; the `bool-byte` encoding rule is
+  fixed now (scalars.toml) but unexercised.
+- **`boolean × boolean` comparability** and **`IS [NOT] DISTINCT FROM`** — both unblocked by
+  the boolean type, not yet authored (§4).
 - **`assignment`-mode casts** — vocabulary reserved; first used by non-integer types.
-- **Everything non-integer** — the rest of the scalar set, per CLAUDE.md §4.
+- **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4.

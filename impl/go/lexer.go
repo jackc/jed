@@ -35,6 +35,18 @@ func Lex(sql string) ([]Token, error) {
 		case c == '*':
 			tokens = append(tokens, Token{Kind: TokStar})
 			i++
+		case c == '+':
+			tokens = append(tokens, Token{Kind: TokPlus})
+			i++
+		case c == '-':
+			tokens = append(tokens, Token{Kind: TokMinus})
+			i++
+		case c == '/':
+			tokens = append(tokens, Token{Kind: TokSlash})
+			i++
+		case c == '%':
+			tokens = append(tokens, Token{Kind: TokPercent})
+			i++
 		case c == '=':
 			tokens = append(tokens, Token{Kind: TokEq})
 			i++
@@ -54,22 +66,18 @@ func Lex(sql string) ([]Token, error) {
 				tokens = append(tokens, Token{Kind: TokGt})
 				i++
 			}
-		case c == '-' || isDigit(c):
-			// Integer literal. A leading '-' is part of the number only when
-			// followed by a digit.
+		case isDigit(c):
+			// Integer literal: an unsigned magnitude. The sign is TokMinus. The
+			// magnitude must be <= 2^63 so that -(2^63) = int64's minimum is reachable;
+			// anything larger cannot be represented (42601). int64 cannot hold 2^63, so
+			// carry it unsigned and let the parser convert.
 			start := i
-			if c == '-' {
-				if !(i+1 < len(b) && isDigit(b[i+1])) {
-					return nil, NewError(SyntaxError, fmt.Sprintf("unexpected character '%c'", c))
-				}
-				i++
-			}
 			for i < len(b) && isDigit(b[i]) {
 				i++
 			}
 			text := sql[start:i]
-			n, err := strconv.ParseInt(text, 10, 64)
-			if err != nil {
+			n, err := strconv.ParseUint(text, 10, 64)
+			if err != nil || n > (uint64(1)<<63) {
 				return nil, NewError(SyntaxError, fmt.Sprintf("integer literal out of range: %s", text))
 			}
 			tokens = append(tokens, Token{Kind: TokInt, Int: n})

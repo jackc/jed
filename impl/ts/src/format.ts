@@ -73,7 +73,11 @@ export function crc32Ieee(data: Uint8Array): number {
 // integer bytes for the column type. Reuses the key encoding behind a named seam so
 // storage and key encodings can diverge when non-integer types land.
 function encodeValue(ty: ScalarType, v: Value): Uint8Array {
-  return encodeNullable(ty, v.kind === "null" ? null : v.int);
+  // boolean is expression-only this slice; no column is boolean, so a stored value is
+  // only ever NULL or an integer (spec/design/types.md §1).
+  if (v.kind === "null") return encodeNullable(ty, null);
+  if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");
+  return encodeNullable(ty, v.int);
 }
 
 // ByteWriter accumulates big-endian bytes for a variable-length item.

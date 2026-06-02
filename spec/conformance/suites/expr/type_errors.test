@@ -1,0 +1,41 @@
+# Static type-checking of expressions, and the deliberate boolean narrowings. The
+# resolver type-checks before any row is scanned: a WHERE expression must be boolean,
+# arithmetic needs integer operands, logical connectives need boolean operands, and
+# comparisons are integer-only (42804, datatype_mismatch). boolean is expression-only
+# this slice, so it is neither a column type nor a CAST target (0A000) — see
+# spec/design/types.md §1, §4, §9. Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.int32, types.boolean, expr.arithmetic, expr.parens, query.logical_connectives, expr.comparison_value, cast.explicit
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+
+statement ok
+INSERT INTO t VALUES (1, 5, 5)
+
+# a WHERE expression must be boolean — a bare integer column is a type error
+statement error 42804
+SELECT id FROM t WHERE a
+
+# logical connectives require boolean operands — AND over integers is a type error
+statement error 42804
+SELECT id FROM t WHERE a AND b
+
+# comparisons are integer-only this slice — comparing two booleans is a type error
+statement error 42804
+SELECT id FROM t WHERE (a = b) = (a = b)
+
+# arithmetic requires integer operands — adding to a boolean is a type error
+statement error 42804
+SELECT (a = b) + 1 FROM t WHERE id = 1
+
+# boolean is not a storable column type yet — declaring one is unsupported
+statement error 0A000
+CREATE TABLE bt (id int32 PRIMARY KEY, flag boolean)
+
+# boolean is not a CAST target yet
+statement error 0A000
+SELECT CAST(a AS boolean) FROM t WHERE id = 1
+
+# and there is no boolean -> integer cast (a forbidden pair)
+statement error 42804
+SELECT CAST(a = b AS int32) FROM t WHERE id = 1

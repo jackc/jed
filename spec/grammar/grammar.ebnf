@@ -64,7 +64,7 @@ update         ::= "UPDATE" identifier "SET"
                    assignment ("," assignment)*
                    where_clause?
 
-assignment     ::= identifier "=" operand
+assignment     ::= identifier "=" expr
 
 delete         ::= "DELETE" "FROM" identifier where_clause?
 
@@ -75,39 +75,77 @@ select         ::= "SELECT" select_items "FROM" identifier
                    order_by?
 
 select_items   ::= "*"
-                 | select_expr ("," select_expr)*
-
-/* CAST is recursive (nestable). A bare integer literal is a legal projected
- * value (e.g. SELECT CAST(1000 AS int16)). There are no column aliases. */
-select_expr    ::= "CAST" "(" select_expr "AS" type_name ")"
-                 | integer
-                 | identifier
+                 | expr ("," expr)*
 
 order_by       ::= "ORDER" "BY" identifier ("ASC" | "DESC")?
 
-/* --- shared WHERE predicate ---------------------------------------------- */
+/* A WHERE clause is a general expression that must resolve to `boolean`; a row
+ * is kept iff it evaluates to TRUE (FALSE and NULL/unknown both exclude). */
+where_clause   ::= "WHERE" expr
 
-/* A single predicate only — no AND / OR / NOT, no parentheses. */
-where_clause   ::= "WHERE" predicate
+/* --- expressions --------------------------------------------------------- */
 
-predicate      ::= identifier "IS" "NOT"? "NULL"
-                 | identifier compare_op operand
+/* One expression grammar, shared by the SELECT list, WHERE, and UPDATE ... SET.
+ * The productions are layered by precedence, loosest first; each level binds
+ * tighter than the one above. The precedence is mirrored as authored data in
+ * ../functions/catalog.toml (the `precedence` field) — the hand-written parsers
+ * and that table must agree (see ../design/functions.md). Levels:
+ *   OR  <  AND  <  NOT  <  comparison/IS NULL  <  additive  <  multiplicative
+ *       <  unary minus  <  primary
+ */
+expr           ::= or_expr
+
+or_expr        ::= and_expr ("OR" and_expr)*
+
+and_expr       ::= not_expr ("AND" not_expr)*
+
+not_expr       ::= "NOT" not_expr
+                 | comparison
+
+/* Comparison and IS [NOT] NULL are NON-associative: at most one of them applies
+ * to a pair/operand of additive expressions, so "a = b = c" is a syntax error
+ * (42601). IS [NOT] NULL is a postfix test binding at the comparison level, so
+ * "a + 1 IS NULL" parses as "(a + 1) IS NULL". */
+comparison     ::= additive ( compare_op additive
+                            | "IS" "NOT"? "NULL" )?
 
 compare_op     ::= "=" | "<" | ">" | "<=" | ">="   /* no "<>" and no "!=" */
 
-operand        ::= integer
+additive       ::= multiplicative ( ("+" | "-") multiplicative )*
+
+multiplicative ::= unary ( ("*" | "/" | "%") unary )*
+
+unary          ::= "-" unary
+                 | primary
+
+primary        ::= integer
+                 | "TRUE" | "FALSE"
                  | "NULL"
+                 | "CAST" "(" expr "AS" type_name ")"
+                 | "(" expr ")"
                  | identifier
 
-literal        ::= integer | "NULL"
+/* INSERT takes literals only (no expressions, no columns). A leading "-" before
+ * an integer here is the unary-minus operator applied to the literal, folded at
+ * parse time. TRUE/FALSE/NULL are the non-integer literal forms; a boolean
+ * literal in INSERT is well-formed grammar but is rejected at execution against
+ * an integer column (42804) — boolean is not a storable column type this slice
+ * (see ../design/types.md §1). */
+literal        ::= "-"? integer
+                 | "TRUE" | "FALSE"
+                 | "NULL"
 
 /* --- lexical (token) layer ----------------------------------------------- */
 
-/* An integer literal carries an OPTIONAL leading '-' that is bound at LEX time
- * (it is part of the token, not a unary operator) — so "- 5" with a space is a
- * lex error. The magnitude must fit signed 64-bit; out of range is a syntax
- * error (42601). */
-integer        ::= "-"? digit+
+/* An integer is an UNSIGNED magnitude of digits; the sign, if any, is the
+ * unary-minus operator (so "- 5" with a space is now legal, and "-5" is the
+ * operator applied to "5", folded to a single literal at parse time). The
+ * magnitude must be <= 2^63 (9223372036854775808); a larger magnitude is a
+ * syntax error (42601, cannot be represented). The single value 2^63 is in
+ * range only as the operand of unary minus, where it folds to int64's minimum
+ * (-9223372036854775808); a bare 2^63 fits no signed integer type and traps
+ * 22003 at resolve time. */
+integer        ::= digit+
 
 /* Identifiers are ASCII only; there is no quoted-identifier syntax. */
 identifier     ::= (letter | "_") (letter | digit | "_")*

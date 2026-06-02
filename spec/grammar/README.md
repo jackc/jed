@@ -12,11 +12,12 @@ rule — lives in [../design/grammar.md](../design/grammar.md).
 | Area | Productions |
 |---|---|
 | DDL | `CREATE TABLE` (typed columns, single-column `PRIMARY KEY`) |
-| DML | `INSERT … VALUES` (positional), `UPDATE … SET … [WHERE]`, `DELETE FROM … [WHERE]` |
-| Query | `SELECT` (`*` / column & `CAST` list) `FROM`, `WHERE`, `ORDER BY [ASC\|DESC]` |
-| Predicate | single predicate: `col IS [NOT] NULL` or `col <cmp> operand` (no AND/OR/NOT) |
-| Expression | `CAST(expr AS type)` (nestable), integer & `NULL` literals, column refs |
+| DML | `INSERT … VALUES` (positional literals), `UPDATE … SET = expr … [WHERE expr]`, `DELETE FROM … [WHERE expr]` |
+| Query | `SELECT` (`*` or an `expr` list) `FROM`, `WHERE expr`, `ORDER BY [ASC\|DESC]` |
+| Expression | one `expr` precedence tower: `OR` < `AND` < `NOT` < comparison / `IS [NOT] NULL` < `+ -` < `* / %` < unary `-` < primary; primary = integer / `TRUE` / `FALSE` / `NULL` / column / `CAST(expr AS type)` / `( expr )` |
 
-> Status: covers the step-5 / step-6 surface (CLAUDE.md §11). Deferred constructs —
-> compound predicates, JOINs, aliases, multi-row VALUES, parameters, LIMIT/OFFSET,
-> string/decimal/boolean literals — are added here *first* as their features land.
+> Status: covers the step-5 / step-6 surface plus the general expression substrate
+> (arithmetic, the expression-only `boolean`, AND/OR/NOT — CLAUDE.md §11, Phase 1).
+> Deferred constructs — JOINs, aliases, multi-row VALUES, parameters, LIMIT/OFFSET,
+> function-call syntax, string/decimal literals — are added here *first* as their
+> features land.

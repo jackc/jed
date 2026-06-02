@@ -13,6 +13,8 @@ type SqlState int
 const (
 	// NumericValueOutOfRange is 22003 — integer overflow (CLAUDE.md §8).
 	NumericValueOutOfRange SqlState = iota
+	// DivisionByZero is 22012 — division or modulo by zero.
+	DivisionByZero
 	// NotNullViolation is 23502 — not-null constraint violation.
 	NotNullViolation
 	// UniqueViolation is 23505 — unique (primary key) constraint violation.
@@ -44,6 +46,8 @@ func (s SqlState) Code() string {
 	switch s {
 	case NumericValueOutOfRange:
 		return "22003"
+	case DivisionByZero:
+		return "22012"
 	case NotNullViolation:
 		return "23502"
 	case UniqueViolation:

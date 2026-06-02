@@ -29,6 +29,16 @@ var SupportedCapabilities = []string{
 	"types.int16",
 	"types.int32",
 	"types.int64",
+	// General expression substrate — integer arithmetic, the expression-only boolean
+	// type, and the AND/OR/NOT Kleene connectives (the `expression` profile).
+	"types.boolean",
+	"expr.arithmetic",
+	"expr.unary_minus",
+	"expr.parens",
+	"expr.precedence",
+	"expr.comparison_value",
+	"query.logical_connectives",
+	"error.division_by_zero",
 }
 
 // Execute parses and executes one SQL statement against db.

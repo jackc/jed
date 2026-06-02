@@ -4,16 +4,14 @@
 
 import type {
   Assignment,
+  BinaryOp,
   ColumnDef,
-  CompareOp,
   Delete,
+  Expr,
   Insert,
   Literal,
-  Operand,
   OrderBy,
-  Predicate,
   Select,
-  SelectExpr,
   SelectItems,
   Statement,
   Update,
@@ -22,8 +20,30 @@ import { engineError } from "./errors.ts";
 import { lex } from "./lexer.ts";
 import type { Token, TokenKind } from "./token.ts";
 
+const I64_MIN = -9223372036854775808n;
+const I64_MAX = 9223372036854775807n;
+
 function lower(s: string): string {
   return s.toLowerCase();
+}
+
+// foldInt converts a lexed unsigned magnitude (<= 2^63) and a sign into a signed
+// int64-range bigint, throwing 22003 when the result does not fit (a bare 2^63, or the
+// not-negated 2^63). -(2^63) folds to int64's minimum (spec/design/grammar.md §4).
+function foldInt(magnitude: bigint, negate: boolean): bigint {
+  const v = negate ? -magnitude : magnitude;
+  if (v < I64_MIN || v > I64_MAX) {
+    throw engineError(
+      "numeric_value_out_of_range",
+      "value out of range: integer literal exceeds the maximum signed 64-bit value",
+    );
+  }
+  return v;
+}
+
+// binaryExpr builds a binary-operator expression node.
+function binaryExpr(op: BinaryOp, lhs: Expr, rhs: Expr): Expr {
+  return { kind: "binary", op, lhs, rhs };
 }
 
 // parseSQL parses a single complete statement from sql.
@@ -120,11 +140,23 @@ class Parser {
     return { kind: "insert", table, values };
   }
 
-  // parseLiteral parses an integer literal or the keyword NULL.
+  // parseLiteral parses a literal value for INSERT: an integer (with an optional leading
+  // unary minus, folded here), or one of the keywords NULL / TRUE / FALSE. INSERT takes
+  // literals only — not general expressions (spec/grammar/grammar.ebnf `literal`).
   private parseLiteral(): Literal {
+    let negate = false;
+    if (this.peek().kind === "minus") {
+      this.advance();
+      negate = true;
+    }
     const t = this.advance();
-    if (t.kind === "int") return { kind: "int", int: t.int! };
-    if (t.kind === "word" && lower(t.word!) === "null") return { kind: "null" };
+    if (t.kind === "int") return { kind: "int", int: foldInt(t.int!, negate) };
+    if (!negate && t.kind === "word") {
+      const w = lower(t.word!);
+      if (w === "null") return { kind: "null" };
+      if (w === "true") return { kind: "bool", value: true };
+      if (w === "false") return { kind: "bool", value: false };
+    }
     throw engineError("syntax_error", "expected a literal value");
   }
 
@@ -167,7 +199,7 @@ class Parser {
     for (;;) {
       const column = this.expectIdentifier();
       this.expect("eq");
-      const value = this.parseOperand();
+      const value = this.parseExpr();
       assignments.push({ column, value });
       if (this.peek().kind === "comma") {
         this.advance();
@@ -192,12 +224,13 @@ class Parser {
     return { kind: "delete", table, filter };
   }
 
-  // parseOptionalWhere parses an optional trailing `WHERE <predicate>` (shared by
-  // SELECT / UPDATE / DELETE).
-  private parseOptionalWhere(): Predicate | null {
+  // parseOptionalWhere parses an optional trailing `WHERE <expr>` (shared by
+  // SELECT / UPDATE / DELETE). The expression must resolve to boolean (checked by the
+  // executor).
+  private parseOptionalWhere(): Expr | null {
     if (this.peekKeyword() !== "where") return null;
     this.advance();
-    return this.parsePredicate();
+    return this.parseExpr();
   }
 
   private parseSelectItems(): SelectItems {
@@ -205,9 +238,9 @@ class Parser {
       this.advance();
       return { kind: "all" };
     }
-    const items: SelectExpr[] = [];
+    const items: Expr[] = [];
     for (;;) {
-      items.push(this.parseSelectExpr());
+      items.push(this.parseExpr());
       if (this.peek().kind === "comma") {
         this.advance();
         continue;
@@ -217,29 +250,49 @@ class Parser {
     return { kind: "list", items };
   }
 
-  // parseSelectExpr parses `CAST ( <expr> AS <type> )`, a bare integer literal, or a
-  // bare column name.
-  private parseSelectExpr(): SelectExpr {
-    if (this.peekKeyword() === "cast") {
-      this.advance();
-      this.expect("lparen");
-      const inner = this.parseSelectExpr();
-      this.expectKeyword("as");
-      const typeName = this.expectIdentifier();
-      this.expect("rparen");
-      return { kind: "cast", inner, typeName };
-    }
-    if (this.peek().kind === "int") {
-      const n = this.advance().int!;
-      return { kind: "literal", literal: { kind: "int", int: n } };
-    }
-    const name = this.expectIdentifier();
-    return { kind: "column", name };
+  // --- expression precedence ladder (spec/grammar/grammar.ebnf `expr`) ---------
+  // Loosest to tightest: OR < AND < NOT < comparison/IS NULL < additive <
+  // multiplicative < unary minus < primary. One method per level keeps the grammar
+  // legible (CLAUDE.md §10). The precedence is authored data (spec/functions/catalog.toml);
+  // this ladder must agree with it.
+
+  // parseExpr is the entry point for WHERE, the SELECT list, and UPDATE assignment values.
+  parseExpr(): Expr {
+    return this.parseOr();
   }
 
-  // parsePredicate parses `<col> IS [NOT] NULL` or `<col> <cmp> <operand>`.
-  private parsePredicate(): Predicate {
-    const column = this.expectIdentifier();
+  private parseOr(): Expr {
+    let lhs = this.parseAnd();
+    while (this.peekKeyword() === "or") {
+      this.advance();
+      lhs = binaryExpr("or", lhs, this.parseAnd());
+    }
+    return lhs;
+  }
+
+  private parseAnd(): Expr {
+    let lhs = this.parseNot();
+    while (this.peekKeyword() === "and") {
+      this.advance();
+      lhs = binaryExpr("and", lhs, this.parseNot());
+    }
+    return lhs;
+  }
+
+  private parseNot(): Expr {
+    if (this.peekKeyword() === "not") {
+      this.advance();
+      // right-associative: NOT NOT x
+      return { kind: "unary", op: "not", operand: this.parseNot() };
+    }
+    return this.parseComparison();
+  }
+
+  // parseComparison parses one comparison or a postfix IS [NOT] NULL, both
+  // non-associative: `a = b = c` is a syntax error, and `a + 1 IS NULL` binds as
+  // `(a + 1) IS NULL`.
+  private parseComparison(): Expr {
+    const lhs = this.parseAdditive();
     if (this.peekKeyword() === "is") {
       this.advance();
       let negated = false;
@@ -248,10 +301,10 @@ class Parser {
         negated = true;
       }
       this.expectKeyword("null");
-      return { kind: "isNull", column, negated };
+      return { kind: "isNull", operand: lhs, negated };
     }
-    let op: CompareOp;
-    switch (this.advance().kind) {
+    let op: BinaryOp;
+    switch (this.peek().kind) {
       case "eq":
         op = "eq";
         break;
@@ -268,29 +321,93 @@ class Parser {
         op = "ge";
         break;
       default:
-        throw engineError("syntax_error", "expected a comparison operator");
+        return lhs;
     }
-    const rhs = this.parseOperand();
-    return { kind: "compare", column, op, rhs };
+    this.advance();
+    return binaryExpr(op, lhs, this.parseAdditive());
   }
 
-  // parseOperand parses a comparison's right-hand side: a literal (integer or NULL) or
-  // a column reference.
-  private parseOperand(): Operand {
+  private parseAdditive(): Expr {
+    let lhs = this.parseMultiplicative();
+    for (;;) {
+      let op: BinaryOp;
+      if (this.peek().kind === "plus") op = "add";
+      else if (this.peek().kind === "minus") op = "sub";
+      else return lhs;
+      this.advance();
+      lhs = binaryExpr(op, lhs, this.parseMultiplicative());
+    }
+  }
+
+  private parseMultiplicative(): Expr {
+    let lhs = this.parseUnary();
+    for (;;) {
+      let op: BinaryOp;
+      if (this.peek().kind === "star") op = "mul";
+      else if (this.peek().kind === "slash") op = "div";
+      else if (this.peek().kind === "percent") op = "mod";
+      else return lhs;
+      this.advance();
+      lhs = binaryExpr(op, lhs, this.parseUnary());
+    }
+  }
+
+  private parseUnary(): Expr {
+    if (this.peek().kind === "minus") {
+      this.advance();
+      // Fold unary-minus-of-an-integer-literal into one negative literal, so int64's
+      // minimum is representable and the literal range-checks against context.
+      if (this.peek().kind === "int") {
+        const v = foldInt(this.advance().int!, true);
+        return { kind: "literal", literal: { kind: "int", int: v } };
+      }
+      return { kind: "unary", op: "neg", operand: this.parseUnary() };
+    }
+    return this.parsePrimary();
+  }
+
+  // parsePrimary parses a parenthesized expression, CAST(...), a literal (integer,
+  // TRUE/FALSE, NULL), or a column reference.
+  private parsePrimary(): Expr {
+    if (this.peek().kind === "lparen") {
+      this.advance();
+      const e = this.parseExpr();
+      this.expect("rparen");
+      return e;
+    }
+    if (this.peekKeyword() === "cast") {
+      this.advance();
+      this.expect("lparen");
+      const inner = this.parseExpr();
+      this.expectKeyword("as");
+      const typeName = this.expectIdentifier();
+      this.expect("rparen");
+      return { kind: "cast", inner, typeName };
+    }
     const t = this.peek();
     if (t.kind === "int") {
-      this.advance();
-      return { kind: "literal", literal: { kind: "int", int: t.int! } };
-    }
-    if (t.kind === "word" && lower(t.word!) === "null") {
-      this.advance();
-      return { kind: "literal", literal: { kind: "null" } };
+      // The only magnitude > int64 max the lexer admits is 2^63, which fits no signed
+      // integer type unless negated (handled by the unary-minus fold).
+      const v = foldInt(this.advance().int!, false);
+      return { kind: "literal", literal: { kind: "int", int: v } };
     }
     if (t.kind === "word") {
-      const name = this.expectIdentifier();
-      return { kind: "column", name };
+      const w = lower(t.word!);
+      if (w === "null") {
+        this.advance();
+        return { kind: "literal", literal: { kind: "null" } };
+      }
+      if (w === "true") {
+        this.advance();
+        return { kind: "literal", literal: { kind: "bool", value: true } };
+      }
+      if (w === "false") {
+        this.advance();
+        return { kind: "literal", literal: { kind: "bool", value: false } };
+      }
+      return { kind: "column", name: this.expectIdentifier() };
     }
-    throw engineError("syntax_error", "expected an operand");
+    throw engineError("syntax_error", "expected an expression");
   }
 
   // --- cursor helpers ---

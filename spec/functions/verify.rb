@@ -10,13 +10,17 @@
 #   2. each operator has the fields required for its kind; arity == arg_families
 #      length; null_test => arity 1; comparison => arity 2
 #   3. every arg_families entry is "any" or a real `family` in scalars.toml
-#   4. result is a scalar id in scalars.toml, or a reserved id (truth | promoted)
+#   4. result is a scalar id in scalars.toml ("boolean"), or a reserved id (promoted)
 #   5. arg_resolution is "promote" | "none"; "promote" requires the operand pair
 #      to be comparable and the family to have a promotion rule (compare.toml)
-#   6. null is "propagates" | "detects" (null_safe reserved for IS [NOT] DISTINCT FROM)
+#   6. null is "propagates" | "detects" | "kleene" (null_safe reserved for IS [NOT]
+#      DISTINCT FROM)
 #   7. every code in `errors` exists in registry.toml
-#   8. kind is a known kind (reserved: arithmetic | logical | function)
+#   8. kind is a known kind (comparison | null_test | arithmetic | logical; function
+#      reserved)
 #   9. name unique across the catalog; symbol unique per (kind, arity)
+#  10. precedence, if present, is an integer (the parser precedence tower; absent for
+#      operators with no infix/prefix precedence, e.g. future named functions)
 #
 # Exit 0 = catalog is internally coherent and cross-references resolve; nonzero =
 # the offending problem.
@@ -28,9 +32,9 @@ require "set"
 FUNC_DIR = __dir__
 SPEC_DIR = File.expand_path("..", FUNC_DIR)
 
-RESERVED_RESULTS = %w[truth promoted].to_set
+RESERVED_RESULTS = %w[promoted].to_set
 KNOWN_KINDS      = %w[comparison null_test arithmetic logical function].to_set
-NULL_BEHAVIORS   = %w[propagates detects null_safe].to_set
+NULL_BEHAVIORS   = %w[propagates detects null_safe kleene].to_set
 RESOLUTIONS      = %w[promote none].to_set
 REQUIRED_FIELDS  = %w[name kind arity arg_families arg_resolution result null errors].freeze
 
@@ -104,6 +108,11 @@ def main
 
     # (6) null behavior
     fail!("operator #{id}: null #{op['null'].inspect} not in (#{NULL_BEHAVIORS.to_a.join('|')})") unless NULL_BEHAVIORS.include?(op["null"])
+
+    # (10) precedence is an integer if present
+    if op.key?("precedence")
+      fail!("operator #{id}: precedence #{op['precedence'].inspect} must be an integer") unless op["precedence"].is_a?(Integer)
+    end
 
     # (7) declared errors exist in the registry
     (op["errors"] || []).each do |code|

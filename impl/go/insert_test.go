@@ -90,7 +90,7 @@ func TestNullIntoNullableColumnIsStored(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, NULL)")
 	rows := db.RowsInKeyOrder("t")
-	if !rows[0][1].Null {
+	if !rows[0][1].IsNull() {
 		t.Errorf("expected NULL stored, got %+v", rows[0][1])
 	}
 }

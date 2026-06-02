@@ -8,6 +8,7 @@
 
 export type SqlState =
   | "numeric_value_out_of_range" // 22003 — integer overflow (CLAUDE.md §8)
+  | "division_by_zero" // 22012 — division or modulo by zero
   | "not_null_violation" // 23502
   | "unique_violation" // 23505 — primary-key uniqueness
   | "syntax_error" // 42601
@@ -23,6 +24,7 @@ export type SqlState =
 
 const CODES: Record<SqlState, string> = {
   numeric_value_out_of_range: "22003",
+  division_by_zero: "22012",
   not_null_violation: "23502",
   unique_violation: "23505",
   syntax_error: "42601",

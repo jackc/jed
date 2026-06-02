@@ -70,19 +70,26 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       resolution (so `WHERE small = 100000` now traps instead of silently matching nothing),
       pinned by [spec/conformance/suites/types/literals.test](spec/conformance/suites/types/literals.test).
       _(size: S; §4)_
-- [ ] **General expression evaluator.** Executor today handles bare columns + `CAST` +
-      single comparisons. Build a real nested-expression tree (operators, function calls,
-      parenthesization) in WHERE and the SELECT list. The single biggest unlock for query
-      features. _(size: L; deps: function catalog; §5)_
-- [ ] **Integer arithmetic operators** `+ - * / %` with trap-on-overflow and defined
-      `/`-by-zero / `%`-by-zero (`22012`) behavior; result types from the promotion tower.
-      _(size: M; deps: expression evaluator, function catalog; §4/§8)_
-- [ ] **`boolean` scalar type.** First non-integer type. Unblocks proper predicate values
-      and the logical connectives below. Forces a render tag beyond `I`/`T`/`R`. _(size: M; §4)_
-- [ ] **Logical connectives `AND` / `OR` / `NOT`** over predicates, with three-valued
-      truth tables (§4). Explicitly waiting on `boolean` (conformance.md §7). _(size: M; deps: boolean)_
+- [x] **General expression evaluator.** Done: a unified recursive `Expr` (Column/Literal/
+      Cast/Unary/Binary/IsNull) replaced the split `Operand`/`Predicate`/`SelectExpr`, with a
+      one-function-per-level precedence parser and a recursive resolve→eval in all three cores,
+      shared by WHERE and the SELECT list (parenthesization included). Landed **together** with
+      the next three items as one slice (the substrate is only testable with operators on it);
+      function-call syntax stays deferred (no scalar functions defined yet). _(was: L; §5)_
+- [x] **Integer arithmetic operators** `+ - * / %` and unary `-`, trap-on-overflow (`22003`)
+      at the **result type's** boundary (`int16+int16` traps at int16), defined `/`/`%`-by-zero
+      (`22012`); result types from the promotion tower. Authored in the catalog (kind
+      `arithmetic`, result `promoted`) + `spec/conformance/suites/expr/{arithmetic,unary_minus}.test`.
+      _(was: M; §4/§8)_
+- [x] **`boolean` scalar type** — **expression-only** this slice (the first non-integer scalar):
+      `TRUE`/`FALSE` literals, comparison/logical results, projectable in SELECT, consumed by
+      WHERE; render tag `B` (`true`/`false`). It is **not yet a storable column type** (see the
+      storable-boolean follow-on in Phase 3). _(was: M; §4)_
+- [x] **Logical connectives `AND` / `OR` / `NOT`** with three-valued (Kleene) truth tables —
+      `AND`/`OR` are `null = "kleene"` (a dominant operand absorbs NULL), `NOT` propagates.
+      Coverage in `spec/conformance/suites/expr/{logical,precedence}.test`. _(was: M; deps: boolean ✓)_
 - [ ] **`IS [NOT] DISTINCT FROM`** — NULL-safe equality (design already references it,
-      types.md §4). _(size: S; deps: boolean)_
+      types.md §4). Now **unblocked** by the `boolean` type. _(size: S; deps: boolean ✓)_
 - [ ] **Cost-accounting seam (design early, enforce later).** For safely running untrusted
       queries (CLAUDE.md §13): thread a **deterministic** cost counter through the executor /
       expression evaluator / storage reads *now*, while the executor is still small — every
@@ -119,6 +126,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > "Like SQLite, but with a *real* type system." Each is a vertical slice that forces a
 > §8 divergence decision into the open. `text` then `decimal` are the headline items.
 
+- [ ] **Storable `boolean` column type.** `boolean` is expression-only today (Phase 1); make
+      it a *column* type: allow `CREATE TABLE t(flag boolean)` and `INSERT`/store/retrieve
+      (and `CAST … AS boolean`), currently `0A000`. Touches the byte-exact storage surface —
+      add on-disk type code `4` + a golden round-trip fixture, the `bool-byte` key-encoding
+      vectors (the rule is already recorded in `scalars.toml`), and a `boolean × boolean`
+      comparability rule. Cleanly additive (old files keep working). _(size: M; §4/§8/§9)_
 - [ ] **`text` + ONE defined collation** (byte/codepoint order to start — §8). Unblocks
       `LIKE`, string functions, realistic schemas. UTF-8 vs UTF-16 across cores is a
       divergence hotspot — TS already proved UTF-8 names. _(size: L; §4/§8)_

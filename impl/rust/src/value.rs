@@ -5,11 +5,17 @@
 //! declared type governs range checks (overflow) and key-encoding width, not the
 //! in-memory integer representation.
 
-/// A runtime value: SQL NULL, or an integer.
+/// A runtime value: SQL NULL, an integer, or a boolean.
+///
+/// boolean is expression-only this slice (spec/design/types.md §1): a `Bool` value
+/// is produced by comparisons and logical connectives and can be projected/rendered,
+/// but is never stored in a column. A NULL boolean (unknown) is represented as
+/// `Value::Null`, so `{Bool(true), Bool(false), Null}` is the three-valued domain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Value {
     Null,
     Int(i64),
+    Bool(bool),
 }
 
 /// The result of a three-valued comparison (CLAUDE.md §4): TRUE / FALSE / UNKNOWN.
@@ -41,13 +47,22 @@ impl ThreeValued {
 }
 
 impl Value {
-    /// Render for conformance output: integers as shortest decimal, NULL as the
-    /// literal `NULL` (spec/design/conformance.md §1).
+    /// Render for conformance output: integers as shortest decimal, booleans as the
+    /// canonical `true`/`false`, NULL (including a NULL/unknown boolean) as the literal
+    /// `NULL` (spec/design/conformance.md §1; the canonical spelling is a §8 decision).
     pub fn render(self) -> String {
         match self {
             Value::Null => "NULL".to_string(),
             Value::Int(n) => n.to_string(),
+            Value::Bool(true) => "true".to_string(),
+            Value::Bool(false) => "false".to_string(),
         }
+    }
+
+    /// Whether this value is boolean TRUE. A WHERE expression keeps a row only when it
+    /// is TRUE; FALSE and NULL/unknown both reject (CLAUDE.md §4, Kleene).
+    pub fn is_true(self) -> bool {
+        matches!(self, Value::Bool(true))
     }
 
     /// Three-valued equality. NULL compared with anything (including NULL) is
@@ -83,5 +98,54 @@ fn bool3(b: bool) -> ThreeValued {
         ThreeValued::True
     } else {
         ThreeValued::False
+    }
+}
+
+// --- boolean Value <-> ThreeValued bridges, and the Kleene connectives ----------
+// A boolean Value carries the three-valued domain directly: TRUE = Bool(true),
+// FALSE = Bool(false), UNKNOWN = Null. The comparison primitives (eq3/lt3/gt3) speak
+// `ThreeValued`; `from3` lifts their result into a boolean Value, and `to3` projects
+// a Value back so the AND/OR/NOT connectives can reuse `ThreeValued::or`.
+
+/// Lift a three-valued result into a boolean Value (UNKNOWN → NULL).
+pub fn from3(t: ThreeValued) -> Value {
+    match t {
+        ThreeValued::True => Value::Bool(true),
+        ThreeValued::False => Value::Bool(false),
+        ThreeValued::Unknown => Value::Null,
+    }
+}
+
+/// Project a Value into the three-valued domain. A non-boolean Value (NULL, or
+/// defensively an Int that the resolver should never route here) is UNKNOWN.
+pub fn to3(v: Value) -> ThreeValued {
+    match v {
+        Value::Bool(true) => ThreeValued::True,
+        Value::Bool(false) => ThreeValued::False,
+        _ => ThreeValued::Unknown,
+    }
+}
+
+/// Kleene AND: FALSE dominates (`false AND unknown = false`); TRUE only when both are
+/// TRUE; otherwise UNKNOWN (NULL). This is why AND is not plain NULL-propagation.
+pub fn and3(a: Value, b: Value) -> Value {
+    match (to3(a), to3(b)) {
+        (ThreeValued::False, _) | (_, ThreeValued::False) => Value::Bool(false),
+        (ThreeValued::True, ThreeValued::True) => Value::Bool(true),
+        _ => Value::Null,
+    }
+}
+
+/// Kleene OR: TRUE dominates (`true OR unknown = true`); built on `ThreeValued::or`.
+pub fn or3(a: Value, b: Value) -> Value {
+    from3(to3(a).or(to3(b)))
+}
+
+/// Kleene NOT: genuine propagation — `NOT NULL = NULL`.
+pub fn not3(a: Value) -> Value {
+    match to3(a) {
+        ThreeValued::True => Value::Bool(false),
+        ThreeValued::False => Value::Bool(true),
+        ThreeValued::Unknown => Value::Null,
     }
 }

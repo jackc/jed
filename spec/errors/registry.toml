@@ -10,10 +10,11 @@
 # template  message template; {placeholders} are filled by the engine. Message TEXT
 #           is informational — matching is on `code`/`name`, never on prose.
 #
-# Grows per subsystem. The conformance corpus only matches on codes it asserts
-# (currently 22003); the others are raised by the engine for failures that surface
-# as a failed `statement ok`. Each core cross-checks its SqlState constants against
-# this registry (impl/*/tests).
+# Grows per subsystem. The conformance corpus matches on the codes it asserts
+# (22003 overflow, 22012 division-by-zero, and the 0A000/42xxx it tests directly);
+# others are raised by the engine for failures that surface as a failed
+# `statement ok`. Each core cross-checks its SqlState constants against this
+# registry (impl/*/tests).
 
 schema_version = 1
 
@@ -23,6 +24,12 @@ code = "22003"
 name = "numeric_value_out_of_range"
 class = "data exception"
 template = "value out of range for type {type}"
+
+[[error]]
+code = "22012"
+name = "division_by_zero"
+class = "data exception"
+template = "division by zero"
 
 # --- integrity constraint violation (class 23) ------------------------------
 [[error]]

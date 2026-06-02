@@ -155,7 +155,7 @@ func TestReadGoldenReconstructsCatalog(t *testing.T) {
 	}
 	// A NULL value round-trips (id 3's v).
 	rows := loaded.RowsInKeyOrder("t")
-	if rows[2][0].Null || rows[2][0].Int != 3 || !rows[2][1].Null {
+	if rows[2][0].IsNull() || rows[2][0].Int != 3 || !rows[2][1].IsNull() {
 		t.Errorf("row 3 should be (3, NULL), got %v", rows[2])
 	}
 }

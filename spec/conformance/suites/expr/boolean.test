@@ -1,0 +1,52 @@
+# The boolean type as an expression value: TRUE/FALSE literals and comparisons
+# projected as boolean values in the SELECT list. A boolean renders as `true` /
+# `false`, and unknown (a NULL boolean, e.g. a comparison against NULL) renders
+# `NULL` (spec/design/conformance.md §1, types.md §9). A comparison in WHERE still
+# filters: a row is kept iff the predicate is TRUE (FALSE and unknown both exclude).
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.is_null, types.int32, types.boolean, expr.comparison_value, null.three_valued
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+
+statement ok
+INSERT INTO t VALUES (1, 5, 5)
+
+statement ok
+INSERT INTO t VALUES (2, 5, 9)
+
+statement ok
+INSERT INTO t VALUES (3, 5, NULL)
+
+# boolean literals project directly
+query B nosort
+SELECT TRUE FROM t WHERE id = 1
+----
+true
+
+query B nosort
+SELECT FALSE FROM t WHERE id = 1
+----
+false
+
+# a comparison projects a boolean: true / false / NULL (for the unknown row)
+query B nosort
+SELECT a = b FROM t ORDER BY id
+----
+true
+false
+NULL
+
+# IS NULL projects a definite boolean (never unknown)
+query B nosort
+SELECT b IS NULL FROM t ORDER BY id
+----
+false
+false
+true
+
+# the same comparison in WHERE keeps a row only when it is TRUE
+query I nosort
+SELECT id FROM t WHERE a = b ORDER BY id
+----
+1

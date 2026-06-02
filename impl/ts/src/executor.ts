@@ -5,13 +5,12 @@
 // row), stable ORDER BY with NULLs first.
 
 import type {
-  CompareOp,
+  BinaryOp,
   CreateTable,
   Delete,
+  Expr,
   Insert,
-  Predicate,
   Select,
-  SelectExpr,
   SelectItems,
   Statement,
   Update,
@@ -20,11 +19,21 @@ import { type Column, type Table, columnIndex, primaryKeyIndex } from "./catalog
 import { encodeInt } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { type Row, TableStore } from "./storage.ts";
-import { type ScalarType, canonicalName, inRange, scalarTypeFromName } from "./types.ts";
 import {
-  type ThreeValued,
+  type ScalarType,
+  canonicalName,
+  inRange,
+  isBooleanTypeName,
+  rank,
+  scalarTypeFromName,
+} from "./types.ts";
+import {
   type Value,
+  boolAnd,
+  boolNot,
+  boolOr,
   eq3,
+  from3,
   gt3,
   intValue,
   isTrue,
@@ -100,10 +109,7 @@ export class Database {
           throw engineError("duplicate_column", "duplicate column name: " + def.name);
         }
       }
-      const ty = scalarTypeFromName(def.typeName);
-      if (ty === undefined) {
-        throw engineError("undefined_object", "type does not exist: " + def.typeName);
-      }
+      const ty = resolveStorableType(def.typeName);
       if (def.primaryKey) {
         if (pkSeen) {
           throw engineError(
@@ -153,7 +159,7 @@ export class Database {
           );
         }
         row[i] = nullValue();
-      } else {
+      } else if (lit.kind === "int") {
         if (!inRange(col.type, lit.int)) {
           throw engineError(
             "numeric_value_out_of_range",
@@ -161,6 +167,13 @@ export class Database {
           );
         }
         row[i] = intValue(lit.int);
+      } else {
+        // boolean is expression-only: there are no boolean columns, so a boolean literal
+        // can only target an integer column — a type error (42804).
+        throw engineError(
+          "datatype_mismatch",
+          "cannot store a boolean value in integer column " + col.name,
+        );
       }
     }
 
@@ -194,12 +207,13 @@ export class Database {
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + del.table);
     }
-    const filter = del.filter ? resolvePredicate(table, del.filter) : null;
+    const filter = del.filter ? resolveBooleanFilter(table, del.filter) : null;
 
     const store = this.stores.get(del.table.toLowerCase())!;
     const keys: Uint8Array[] = [];
     for (const e of store.entriesInKeyOrder()) {
-      if (filter === null || isTrue(evalPredicate(filter, e.row))) {
+      // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
+      if (filter === null || isTrue(evalExpr(filter, e.row))) {
         keys.push(e.key);
       }
     }
@@ -241,33 +255,24 @@ export class Database {
         }
       }
       const col = table.columns[idx]!;
-      let source: AssignSource;
-      if (a.value.kind === "literal") {
-        source = {
-          kind: "const",
-          value: a.value.literal.kind === "int" ? intValue(a.value.literal.int) : nullValue(),
-        };
-      } else {
-        const j = columnIndex(table, a.value.name);
-        if (j < 0) {
-          throw engineError("undefined_column", "column does not exist: " + a.value.name);
-        }
-        source = { kind: "column", index: j };
-      }
-      plans.push({ idx, name: col.name, target: col.type, notNull: col.notNull, source });
+      // The RHS is a general expression evaluated against the OLD row; a literal operand
+      // adapts to the target column's type. The result must be an integer (or NULL) —
+      // assigning a boolean to an integer column is a 42804.
+      const { node, type } = resolve(table, a.value, col.type);
+      requireAssignableInt(type, a.column);
+      plans.push({ idx, name: col.name, target: col.type, notNull: col.notNull, source: node });
     }
 
-    const filter = upd.filter ? resolvePredicate(table, upd.filter) : null;
+    const filter = upd.filter ? resolveBooleanFilter(table, upd.filter) : null;
 
     // Phase 1: build + validate every matching row's new values; no writes yet.
     const store = this.stores.get(upd.table.toLowerCase())!;
     const updates: { key: Uint8Array; row: Row }[] = [];
     for (const e of store.entriesInKeyOrder()) {
-      if (filter !== null && !isTrue(evalPredicate(filter, e.row))) continue;
+      if (filter !== null && !isTrue(evalExpr(filter, e.row))) continue;
       const newRow = e.row.slice();
       for (const p of plans) {
-        const raw = p.source.kind === "column" ? e.row[p.source.index]! : p.source.value;
-        newRow[p.idx] = checkAssign(p, raw);
+        newRow[p.idx] = checkAssign(p, evalExpr(p.source, e.row));
       }
       updates.push({ key: e.key, row: newRow });
     }
@@ -287,7 +292,7 @@ export class Database {
     }
 
     const projections = resolveProjections(table, sel.items);
-    const filter = sel.filter ? resolvePredicate(table, sel.filter) : null;
+    const filter = sel.filter ? resolveBooleanFilter(table, sel.filter) : null;
 
     let orderIdx = -1;
     let orderDesc = false;
@@ -299,10 +304,11 @@ export class Database {
       orderDesc = sel.orderBy.descending;
     }
 
-    // Scan in primary-key order, then filter.
+    // Scan in primary-key order, then filter. A WHERE arithmetic can throw
+    // (22003/22012); the throw propagates naturally.
     const rows: Row[] = [];
     for (const row of this.rowsInKeyOrder(sel.from)) {
-      if (filter === null || isTrue(evalPredicate(filter, row))) rows.push(row);
+      if (filter === null || isTrue(evalExpr(filter, row))) rows.push(row);
     }
 
     // ORDER BY: stable sort by the key column's value, NULLs first ascending
@@ -317,171 +323,383 @@ export class Database {
     }
 
     // Project each surviving row.
-    const out: Value[][] = rows.map((row) => projections.map((p) => evalProjection(p, row)));
+    const out: Value[][] = rows.map((row) => projections.map((p) => evalExpr(p, row)));
     return { kind: "query", columnCount: projections.length, rows: out };
   }
 }
 
-// --- resolution + evaluation (projection-independent; shared by the statements) ---
+// ============================================================================
+// Resolved expression layer (mirrors impl/rust executor.rs, impl/go executor.go).
+//
+// Parse → Expr (names) → resolve → RExpr (column indices, known result types, folded
+// constants) → eval per row → Value. The resolver is where all type-checking and the
+// literal range-check live; the evaluator is a pure tree-walk. eval throws on a 22003 /
+// 22012 (the TS idiom), so callers need no Result type.
+// ============================================================================
 
-// Projection is a resolved output column: how to produce one value from a row.
-type Projection =
+// ResolvedType is the static type of a resolved expression. "null" is an untyped NULL
+// literal (its integer type, if needed, is settled by the surrounding operator/context).
+type ResolvedType =
+  | { kind: "int"; ty: ScalarType }
+  | { kind: "bool" }
+  | { kind: "null" };
+
+// RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
+// their (promotion-tower) result type so the computed value can be range-checked.
+type RExpr =
   | { kind: "column"; index: number }
-  | { kind: "literalInt"; value: bigint }
-  | { kind: "null" }
-  | { kind: "cast"; target: ScalarType; inner: Projection };
+  | { kind: "constInt"; value: bigint }
+  | { kind: "constBool"; value: boolean }
+  | { kind: "constNull" }
+  | { kind: "cast"; target: ScalarType; operand: RExpr }
+  | { kind: "neg"; result: ScalarType; operand: RExpr }
+  | { kind: "not"; operand: RExpr }
+  | { kind: "arith"; op: BinaryOp; result: ScalarType; lhs: RExpr; rhs: RExpr }
+  | { kind: "compare"; op: BinaryOp; lhs: RExpr; rhs: RExpr }
+  | { kind: "and"; lhs: RExpr; rhs: RExpr }
+  | { kind: "or"; lhs: RExpr; rhs: RExpr }
+  | { kind: "isNull"; operand: RExpr; negated: boolean };
 
-function resolveProjections(table: Table, items: SelectItems): Projection[] {
+// resolveProjections resolves SELECT items into evaluable projections (any result type
+// is allowed in the select list, including boolean — SELECT a = b).
+function resolveProjections(table: Table, items: SelectItems): RExpr[] {
   if (items.kind === "all") {
-    return table.columns.map((_c, i): Projection => ({ kind: "column", index: i }));
+    return table.columns.map((_c, i): RExpr => ({ kind: "column", index: i }));
   }
-  return items.items.map((e) => resolveExpr(table, e));
+  return items.items.map((e) => resolve(table, e, null).node);
 }
 
-function resolveExpr(table: Table, e: SelectExpr): Projection {
+// resolveBooleanFilter resolves a WHERE expression; it must resolve to boolean (or an
+// untyped NULL, always unknown → no rows). An integer-valued WHERE is a 42804.
+function resolveBooleanFilter(table: Table, e: Expr): RExpr {
+  const { node, type } = resolve(table, e, null);
+  if (type.kind === "int") {
+    throw typeError("argument of WHERE must be boolean");
+  }
+  return node;
+}
+
+// resolve resolves one Expr into an RExpr plus its static type. ctx (non-null) is the
+// type an untyped integer literal should adapt to (spec/design/types.md §6); null
+// defaults a bare literal to int64.
+function resolve(
+  table: Table,
+  e: Expr,
+  ctx: ScalarType | null,
+): { node: RExpr; type: ResolvedType } {
   switch (e.kind) {
-    case "cast": {
-      const target = scalarTypeFromName(e.typeName);
-      if (target === undefined) {
-        throw engineError("undefined_object", "type does not exist: " + e.typeName);
-      }
-      return { kind: "cast", target, inner: resolveExpr(table, e.inner) };
-    }
-    case "literal":
-      if (e.literal.kind === "null") return { kind: "null" };
-      return { kind: "literalInt", value: e.literal.int };
     case "column": {
       const idx = columnIndex(table, e.name);
-      if (idx < 0) {
-        throw engineError("undefined_column", "column does not exist: " + e.name);
+      if (idx < 0) throw engineError("undefined_column", "column does not exist: " + e.name);
+      return { node: { kind: "column", index: idx }, type: { kind: "int", ty: table.columns[idx]!.type } };
+    }
+    case "literal":
+      switch (e.literal.kind) {
+        case "null":
+          return { node: { kind: "constNull" }, type: { kind: "null" } };
+        case "bool":
+          return { node: { kind: "constBool", value: e.literal.value }, type: { kind: "bool" } };
+        default: {
+          const ty = ctx ?? "int64";
+          if (!inRange(ty, e.literal.int)) throw overflow(ty);
+          return { node: { kind: "constInt", value: e.literal.int }, type: { kind: "int", ty } };
+        }
       }
-      return { kind: "column", index: idx };
+    case "cast": {
+      const target = resolveStorableType(e.typeName);
+      const inner = resolve(table, e.inner, null);
+      if (inner.type.kind === "bool") {
+        throw typeError("cannot cast boolean to " + canonicalName(target));
+      }
+      return { node: { kind: "cast", target, operand: inner.node }, type: { kind: "int", ty: target } };
+    }
+    case "unary":
+      if (e.op === "neg") {
+        const { node, type } = resolve(table, e.operand, ctx);
+        let result: ScalarType;
+        if (type.kind === "int") result = type.ty;
+        else if (type.kind === "null") result = "int64"; // -NULL = NULL
+        else throw typeError("unary minus requires an integer operand");
+        return { node: { kind: "neg", result, operand: node }, type: { kind: "int", ty: result } };
+      }
+      {
+        const { node, type } = resolve(table, e.operand, null);
+        requireBool(type, "NOT requires a boolean operand");
+        return { node: { kind: "not", operand: node }, type: { kind: "bool" } };
+      }
+    case "isNull": {
+      const { node } = resolve(table, e.operand, null);
+      return { node: { kind: "isNull", operand: node, negated: e.negated }, type: { kind: "bool" } };
+    }
+    case "binary":
+      return resolveBinary(table, e.op, e.lhs, e.rhs);
+  }
+}
+
+function resolveBinary(
+  table: Table,
+  op: BinaryOp,
+  lhs: Expr,
+  rhs: Expr,
+): { node: RExpr; type: ResolvedType } {
+  switch (op) {
+    case "add":
+    case "sub":
+    case "mul":
+    case "div":
+    case "mod": {
+      const p = resolveIntPair(table, lhs, rhs);
+      const result = promote(p.lt, p.rt);
+      return { node: { kind: "arith", op, result, lhs: p.rl, rhs: p.rr }, type: { kind: "int", ty: result } };
+    }
+    case "eq":
+    case "lt":
+    case "gt":
+    case "le":
+    case "ge": {
+      const p = resolveIntPair(table, lhs, rhs);
+      return { node: { kind: "compare", op, lhs: p.rl, rhs: p.rr }, type: { kind: "bool" } };
+    }
+    default: {
+      // "and" | "or"
+      const l = resolve(table, lhs, null);
+      const r = resolve(table, rhs, null);
+      requireBool(l.type, "AND/OR requires boolean operands");
+      requireBool(r.type, "AND/OR requires boolean operands");
+      return { node: { kind: op === "and" ? "and" : "or", lhs: l.node, rhs: r.node }, type: { kind: "bool" } };
     }
   }
 }
 
-function evalProjection(p: Projection, row: Row): Value {
-  switch (p.kind) {
+// resolveIntPair resolves the two operands of an arithmetic/comparison operator, giving
+// a bare integer literal the OTHER operand's type as context (so `small + 1` types `1`
+// as int16, and `small + 100000` traps 22003 at resolve). Both must be integer (or
+// NULL); a boolean operand is a 42804 type error.
+function resolveIntPair(
+  table: Table,
+  lhs: Expr,
+  rhs: Expr,
+): { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType } {
+  const lhsLit = isIntLiteral(lhs);
+  const rhsLit = isIntLiteral(rhs);
+  let l: { node: RExpr; type: ResolvedType };
+  let r: { node: RExpr; type: ResolvedType };
+  if (lhsLit && rhsLit) {
+    l = resolve(table, lhs, "int64");
+    r = resolve(table, rhs, "int64");
+  } else if (lhsLit) {
+    r = resolve(table, rhs, null);
+    l = resolve(table, lhs, intTypeOf(r.type));
+  } else if (rhsLit) {
+    l = resolve(table, lhs, null);
+    r = resolve(table, rhs, intTypeOf(l.type));
+  } else {
+    l = resolve(table, lhs, null);
+    r = resolve(table, rhs, null);
+  }
+  requireIntOperand(l.type);
+  requireIntOperand(r.type);
+  return { rl: l.node, lt: l.type, rr: r.node, rt: r.type };
+}
+
+function isIntLiteral(e: Expr): boolean {
+  return e.kind === "literal" && e.literal.kind === "int";
+}
+
+// intTypeOf returns the integer type of t as a sibling literal's context, or null.
+function intTypeOf(t: ResolvedType): ScalarType | null {
+  return t.kind === "int" ? t.ty : null;
+}
+
+// promote is the promotion-tower result type of two arithmetic operands: the
+// higher-ranked integer type, or int64 when both are untyped NULLs.
+function promote(a: ResolvedType, b: ResolvedType): ScalarType {
+  const ax = intTypeOf(a);
+  const bx = intTypeOf(b);
+  if (ax !== null && bx !== null) return rank(ax) >= rank(bx) ? ax : bx;
+  if (ax !== null) return ax;
+  if (bx !== null) return bx;
+  return "int64";
+}
+
+function requireIntOperand(t: ResolvedType): void {
+  if (t.kind === "bool") {
+    throw typeError("arithmetic and comparison operators require integer operands");
+  }
+}
+
+function requireBool(t: ResolvedType, msg: string): void {
+  if (t.kind === "int") throw typeError(msg);
+}
+
+// requireAssignableInt: a value assigned to an integer column must itself be integer (or
+// NULL); a boolean expression is a 42804 type error.
+function requireAssignableInt(t: ResolvedType, col: string): void {
+  if (t.kind === "bool") {
+    throw typeError("cannot assign a boolean value to integer column " + col);
+  }
+}
+
+// resolveStorableType resolves a column-definition or CAST target type name. Only the
+// storable integer types are valid; boolean is known-but-not-storable (→ 0A000),
+// distinct from a genuinely unknown name (→ 42704).
+function resolveStorableType(name: string): ScalarType {
+  const ty = scalarTypeFromName(name);
+  if (ty !== undefined) return ty;
+  if (isBooleanTypeName(name)) {
+    throw engineError("feature_not_supported", "boolean is not a storable type yet: " + name);
+  }
+  throw engineError("undefined_object", "type does not exist: " + name);
+}
+
+function overflow(ty: ScalarType): Error {
+  return engineError("numeric_value_out_of_range", "value out of range for type " + canonicalName(ty));
+}
+
+function typeError(msg: string): Error {
+  return engineError("datatype_mismatch", msg);
+}
+
+const I64_MIN = -9223372036854775808n;
+
+// evalExpr evaluates against a row, returning a Value (a boolean for comparisons /
+// connectives). Arithmetic throws 22003 on overflow and 22012 on a zero divisor; NULL
+// propagates through arithmetic; the connectives are Kleene; IS NULL is always definite.
+function evalExpr(e: RExpr, row: Row): Value {
+  switch (e.kind) {
     case "column":
-      return row[p.index]!;
-    case "literalInt":
-      return intValue(p.value);
-    case "null":
+      return row[e.index]!;
+    case "constInt":
+      return intValue(e.value);
+    case "constBool":
+      return { kind: "bool", value: e.value };
+    case "constNull":
       return nullValue();
     case "cast": {
-      const v = evalProjection(p.inner, row);
+      const v = evalExpr(e.operand, row);
       if (v.kind === "null") return nullValue();
-      if (!inRange(p.target, v.int)) {
-        throw engineError(
-          "numeric_value_out_of_range",
-          "value out of range for type " + canonicalName(p.target),
-        );
-      }
+      if (v.kind !== "int") throw typeError("internal: boolean cast operand");
+      if (!inRange(e.target, v.int)) throw overflow(e.target);
       return intValue(v.int);
     }
-  }
-}
-
-// Rhs is a comparison's right-hand side after resolution.
-type Rhs = { kind: "const"; value: Value } | { kind: "column"; index: number };
-
-// ResolvedPredicate is a WHERE predicate over fixed column indices.
-type ResolvedPredicate =
-  | { kind: "isNull"; index: number; negated: boolean }
-  | { kind: "compare"; index: number; op: CompareOp; rhs: Rhs };
-
-function resolvePredicate(table: Table, p: Predicate): ResolvedPredicate {
-  const resolveCol = (name: string): number => {
-    const idx = columnIndex(table, name);
-    if (idx < 0) {
-      throw engineError("undefined_column", "column does not exist: " + name);
+    case "neg": {
+      const v = evalExpr(e.operand, row);
+      if (v.kind === "null") return nullValue();
+      if (v.kind !== "int") throw typeError("internal: boolean unary minus");
+      const n = -v.int;
+      if (!inRange(e.result, n)) throw overflow(e.result);
+      return intValue(n);
     }
-    return idx;
-  };
-  if (p.kind === "compare") {
-    const index = resolveCol(p.column);
-    let rhs: Rhs;
-    if (p.rhs.kind === "literal") {
-      const lit = p.rhs.literal;
-      if (lit.kind === "int") {
-        // Context-adaptive literal (spec/design/types.md): the literal adapts to the
-        // compared column's type; a value that does not fit traps 22003 here, before any
-        // row is scanned (deterministic).
-        const ty = table.columns[index]!.type;
-        if (!inRange(ty, lit.int)) {
-          throw engineError(
-            "numeric_value_out_of_range",
-            "value out of range for type " + canonicalName(ty),
-          );
-        }
-        rhs = { kind: "const", value: intValue(lit.int) };
-      } else {
-        rhs = { kind: "const", value: nullValue() };
+    case "not":
+      return boolNot(evalExpr(e.operand, row));
+    case "arith": {
+      const a = evalExpr(e.lhs, row);
+      const b = evalExpr(e.rhs, row);
+      if (a.kind === "null" || b.kind === "null") return nullValue();
+      if (a.kind !== "int" || b.kind !== "int") throw typeError("internal: boolean arithmetic");
+      return evalArith(e.op, a.int, b.int, e.result);
+    }
+    case "compare": {
+      const a = evalExpr(e.lhs, row);
+      const b = evalExpr(e.rhs, row);
+      switch (e.op) {
+        case "eq":
+          return from3(eq3(a, b));
+        case "lt":
+          return from3(lt3(a, b));
+        case "gt":
+          return from3(gt3(a, b));
+        case "le":
+          return from3(or3(lt3(a, b), eq3(a, b)));
+        default: // "ge"
+          return from3(or3(gt3(a, b), eq3(a, b)));
       }
-    } else {
-      rhs = { kind: "column", index: resolveCol(p.rhs.name) };
     }
-    return { kind: "compare", index, op: p.op, rhs };
+    case "and":
+      return boolAnd(evalExpr(e.lhs, row), evalExpr(e.rhs, row));
+    case "or":
+      return boolOr(evalExpr(e.lhs, row), evalExpr(e.rhs, row));
+    case "isNull": {
+      const isNull = evalExpr(e.operand, row).kind === "null";
+      return { kind: "bool", value: isNull !== e.negated };
+    }
   }
-  return { kind: "isNull", index: resolveCol(p.column), negated: p.negated };
 }
 
-// evalPredicate returns a three-valued result; a WHERE clause keeps a row only on True.
-function evalPredicate(p: ResolvedPredicate, row: Row): ThreeValued {
-  if (p.kind === "isNull") {
-    const got = (row[p.index]!.kind === "null") !== p.negated;
-    return got ? "true" : "false";
+// evalArith computes an integer op with exact bigint, throwing 22012 on a zero divisor
+// and 22003 if the result falls outside the declared result type (the int16+int16 →
+// int16 boundary — spec/design/functions.md §7). The MinInt64/-1 cases trap to match the
+// Rust/Go checked-op behaviour (bigint would not overflow on its own).
+function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Value {
+  let v: bigint;
+  switch (op) {
+    case "add":
+      v = x + y;
+      break;
+    case "sub":
+      v = x - y;
+      break;
+    case "mul":
+      v = x * y;
+      break;
+    case "div":
+      if (y === 0n) throw engineError("division_by_zero", "division by zero");
+      if (x === I64_MIN && y === -1n) throw overflow(result);
+      v = x / y; // bigint truncates toward zero
+      break;
+    default: // "mod"
+      if (y === 0n) throw engineError("division_by_zero", "division by zero");
+      if (x === I64_MIN && y === -1n) throw overflow(result);
+      v = x % y; // bigint remainder takes the dividend's sign
+      break;
   }
-  const lhs = row[p.index]!;
-  const rhs = p.rhs.kind === "const" ? p.rhs.value : row[p.rhs.index]!;
-  switch (p.op) {
-    case "eq":
-      return eq3(lhs, rhs);
-    case "lt":
-      return lt3(lhs, rhs);
-    case "gt":
-      return gt3(lhs, rhs);
-    case "le":
-      return or3(lt3(lhs, rhs), eq3(lhs, rhs));
-    case "ge":
-      return or3(gt3(lhs, rhs), eq3(lhs, rhs));
-  }
+  if (!inRange(result, v)) throw overflow(result);
+  return intValue(v);
 }
 
 // or3 is three-valued OR (Kleene): used to build <= / >= from < / > and =, so a NULL
 // operand yields UNKNOWN rather than a wrong FALSE (CLAUDE.md §4).
-function or3(a: ThreeValued, b: ThreeValued): ThreeValued {
+function or3(a: "true" | "false" | "unknown", b: "true" | "false" | "unknown"): "true" | "false" | "unknown" {
   if (a === "true" || b === "true") return "true";
   if (a === "unknown" || b === "unknown") return "unknown";
   return "false";
 }
 
 // nullFirstCmp is a total order for ORDER BY with NULLs first (ascending), matching the
-// key encoding's physical order (spec/design/encoding.md §4). Returns <0, 0, >0.
+// key encoding's physical order (spec/design/encoding.md §4). Returns <0, 0, >0. ORDER
+// BY is over an (always-integer) column this slice, so the boolean ordering is defined
+// (false < true) only for totality.
 function nullFirstCmp(a: Value, b: Value): number {
   if (a.kind === "null" && b.kind === "null") return 0;
   if (a.kind === "null") return -1;
   if (b.kind === "null") return 1;
-  if (a.int < b.int) return -1;
-  if (a.int > b.int) return 1;
+  const x = orderKey(a);
+  const y = orderKey(b);
+  if (x < y) return -1;
+  if (x > y) return 1;
   return 0;
 }
 
-// AssignSource is an UPDATE assignment's value source.
-type AssignSource = { kind: "const"; value: Value } | { kind: "column"; index: number };
+function orderKey(v: Value): bigint {
+  if (v.kind === "bool") return v.value ? 1n : 0n;
+  if (v.kind === "int") return v.int;
+  return 0n;
+}
 
 // AssignPlan is a resolved UPDATE assignment: target column index, its type and
-// nullability for re-checking, and the value source.
+// nullability for re-checking, and the resolved RHS expression (evaluated against the
+// old row).
 type AssignPlan = {
   idx: number;
   name: string;
   target: ScalarType;
   notNull: boolean;
-  source: AssignSource;
+  source: RExpr;
 };
 
 // checkAssign type-checks a candidate value against a column: NULL into NOT NULL traps
-// 23502; an integer outside the target range traps 22003 — mirrors INSERT's checks.
+// 23502; an integer outside the target range traps 22003 — mirrors INSERT's checks. The
+// resolver proved the value is integer or NULL, never boolean.
 function checkAssign(p: AssignPlan, v: Value): Value {
   if (v.kind === "null") {
     if (p.notNull) {
@@ -492,11 +710,7 @@ function checkAssign(p: AssignPlan, v: Value): Value {
     }
     return nullValue();
   }
-  if (!inRange(p.target, v.int)) {
-    throw engineError(
-      "numeric_value_out_of_range",
-      "value out of range for type " + canonicalName(p.target),
-    );
-  }
+  if (v.kind !== "int") throw typeError("internal: boolean assigned to integer column");
+  if (!inRange(p.target, v.int)) throw overflow(p.target);
   return intValue(v.int);
 }

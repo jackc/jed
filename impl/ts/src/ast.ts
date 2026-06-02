@@ -4,36 +4,50 @@
 // enums). Integer literals carry a `bigint` so int64 is exact.
 
 // Literal is a literal value as written in SQL. A bare integer literal is an *untyped
-// constant* that adapts to its context — the target column on INSERT/UPDATE, the CAST
-// target, the compared column in a WHERE predicate — and traps 22003 if it does not fit;
-// with no context it defaults to int64. See spec/design/types.md (Integer-literal typing).
-export type Literal = { kind: "null" } | { kind: "int"; int: bigint };
+// constant* that adapts to its context — the target column on INSERT/UPDATE, a sibling
+// operand, the compared column in a WHERE predicate — and traps 22003 if it does not
+// fit; with no context it defaults to int64 (spec/design/types.md §6). A boolean literal
+// is expression-only this slice (it cannot be stored).
+export type Literal =
+  | { kind: "null" }
+  | { kind: "int"; int: bigint }
+  | { kind: "bool"; value: boolean };
 
-// Operand is a comparison's / assignment's right-hand side: a column ref or a literal.
-export type Operand =
-  | { kind: "column"; name: string }
-  | { kind: "literal"; literal: Literal };
+// UnaryOp: arithmetic negation `-x` or logical negation `NOT x`.
+export type UnaryOp = "neg" | "not";
 
-// CompareOp is a comparison operator.
-export type CompareOp = "eq" | "lt" | "gt" | "le" | "ge";
+// BinaryOp: arithmetic (integer→promoted), comparison (integer→boolean), or logical
+// (boolean→boolean, Kleene).
+export type BinaryOp =
+  | "add"
+  | "sub"
+  | "mul"
+  | "div"
+  | "mod"
+  | "eq"
+  | "lt"
+  | "gt"
+  | "le"
+  | "ge"
+  | "and"
+  | "or";
 
-// Predicate is a WHERE predicate. Step-1 has single predicates only (no AND/OR —
-// boolean type deferred): either a comparison or a NULL test.
-export type Predicate =
-  | { kind: "compare"; column: string; op: CompareOp; rhs: Operand }
-  | { kind: "isNull"; column: string; negated: boolean };
-
-// SelectExpr is a projected expression: a column reference, a literal, or a cast (which
-// nests via inner).
-export type SelectExpr =
+// Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.
+// The parser builds it via a precedence ladder (spec/grammar/grammar.ebnf `expr`). A
+// comparison/logical/null-test node is boolean-valued; arithmetic and
+// columns/integer-literals are integer-valued.
+export type Expr =
   | { kind: "column"; name: string }
   | { kind: "literal"; literal: Literal }
-  | { kind: "cast"; inner: SelectExpr; typeName: string };
+  | { kind: "cast"; inner: Expr; typeName: string }
+  | { kind: "unary"; op: UnaryOp; operand: Expr }
+  | { kind: "binary"; op: BinaryOp; lhs: Expr; rhs: Expr }
+  | { kind: "isNull"; operand: Expr; negated: boolean };
 
 // SelectItems is either all columns (*) or a list of projected expressions.
 export type SelectItems =
   | { kind: "all" }
-  | { kind: "list"; items: SelectExpr[] };
+  | { kind: "list"; items: Expr[] };
 
 // OrderBy is an ORDER BY clause. Step-1 corpus uses ascending only; descending is
 // reserved for later.
@@ -43,9 +57,9 @@ export type OrderBy = { column: string; descending: boolean };
 // resolved during analysis (the catalog owns the type lattice).
 export type ColumnDef = { name: string; typeName: string; primaryKey: boolean };
 
-// Assignment is one `SET <column> = <value>` clause; value is read against the
-// pre-update row (so `SET a = b, b = a` swaps).
-export type Assignment = { column: string; value: Operand };
+// Assignment is one `SET <column> = <value>` clause; value is a general expression
+// evaluated against the pre-update row (so `SET a = b, b = a` swaps).
+export type Assignment = { column: string; value: Expr };
 
 // CreateTable is a CREATE TABLE statement.
 export type CreateTable = {
@@ -62,21 +76,23 @@ export type Select = {
   kind: "select";
   items: SelectItems;
   from: string;
-  filter: Predicate | null;
+  filter: Expr | null;
   orderBy: OrderBy | null;
 };
 
 // Update is `UPDATE <table> SET ... [WHERE ...]`. Assigning a PRIMARY KEY column is
-// rejected this slice (the storage key must not change — see the executor).
+// rejected this slice (the storage key must not change — see the executor). The WHERE
+// expression must resolve to boolean.
 export type Update = {
   kind: "update";
   table: string;
   assignments: Assignment[];
-  filter: Predicate | null;
+  filter: Expr | null;
 };
 
-// Delete is `DELETE FROM <table> [WHERE ...]`. No WHERE deletes every row.
-export type Delete = { kind: "delete"; table: string; filter: Predicate | null };
+// Delete is `DELETE FROM <table> [WHERE ...]`. No WHERE deletes every row; the WHERE
+// expression must resolve to boolean.
+export type Delete = { kind: "delete"; table: string; filter: Expr | null };
 
 // Statement is a parsed top-level statement.
 export type Statement = CreateTable | Insert | Select | Update | Delete;

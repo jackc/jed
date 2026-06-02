@@ -15,9 +15,13 @@ The reasoning behind these tables lives in
 | [compare.toml](compare.toml) | Comparison & promotion: comparability classes, the numeric promotion tower, three-valued NULL logic. |
 | [casts.toml](casts.toml) | Coercion matrix: which casts exist and their mode (implicit / assignment / explicit). Anything unlisted is forbidden. |
 
-## Current scope — signed integers only
+## Current scope — signed integers (storable) + boolean (expression-only)
 
-Per CLAUDE.md §4, **step 1 implements only** `int16`/`smallint`, `int32`/`int`/`integer`,
-and `int64`/`bigint`. `decimal`, `text`, `boolean`, `timestamp`/`timestamptz`, `bytea`,
-and `json`/`jsonb` are deferred to later slices, and the float/decimal/collation
-divergence decisions in CLAUDE.md §8 do **not** bind this step.
+Per CLAUDE.md §4, the **storable** scalar types are `int16`/`smallint`,
+`int32`/`int`/`integer`, and `int64`/`bigint`. The general-expression slice adds
+`boolean` (aliases `bool`) as the first non-integer scalar, but **expression-only**
+(`storable = false`): it is the type of comparison/logical results and `TRUE`/`FALSE`
+literals, not yet a column type (`CREATE TABLE … boolean` / `CAST … AS boolean` trap
+`0A000`). `decimal`, `text`, `timestamp`/`timestamptz`, `bytea`, and `json`/`jsonb`
+remain deferred, and the float/decimal/collation divergence decisions in CLAUDE.md §8
+still do **not** bind.

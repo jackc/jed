@@ -42,6 +42,17 @@ func (r tomlRow) strs(key string) []string {
 	return r.arrVals[key]
 }
 
+// has reports whether a scalar key is present.
+func (r tomlRow) has(key string) bool {
+	_, ok := r.vals[key]
+	return ok
+}
+
+// boolVal reads a TOML boolean (stored as the literal "true"/"false").
+func (r tomlRow) boolVal(key string) bool {
+	return r.str(key) == "true"
+}
+
 // readTomlTables parses every `[[section]]` array-of-tables entry from a TOML file.
 // Only keys directly under each entry are captured (sufficient for the spec tables).
 func readTomlTables(t *testing.T, path, section string) []tomlRow {

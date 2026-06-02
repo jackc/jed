@@ -32,88 +32,101 @@ pub struct Insert {
     pub values: Vec<Literal>,
 }
 
-/// `UPDATE <table> SET <col> = <operand> [, ...] [WHERE <predicate>]`. Each
-/// assignment's right-hand side is evaluated against the *pre-update* row (so
-/// `SET a = b, b = a` swaps). Assigning a PRIMARY KEY column is rejected this slice
-/// (the storage key must not change — see the executor).
+/// `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each assignment's
+/// right-hand side is evaluated against the *pre-update* row (so `SET a = b, b = a`
+/// swaps). Assigning a PRIMARY KEY column is rejected this slice (the storage key must
+/// not change — see the executor). The WHERE expression must resolve to boolean.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Update {
     pub table: String,
     pub assignments: Vec<Assignment>,
-    pub filter: Option<Predicate>,
+    pub filter: Option<Expr>,
 }
 
-/// One `SET <column> = <value>` clause.
+/// One `SET <column> = <expr>` clause.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Assignment {
     pub column: String,
-    pub value: Operand,
+    pub value: Expr,
 }
 
-/// `DELETE FROM <table> [WHERE <predicate>]`. No WHERE deletes every row.
+/// `DELETE FROM <table> [WHERE <expr>]`. No WHERE deletes every row; the WHERE
+/// expression must resolve to boolean.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Delete {
     pub table: String,
-    pub filter: Option<Predicate>,
+    pub filter: Option<Expr>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Select {
-    /// Projected columns, or `*` for all (`SelectItems::All`).
+    /// Projected expressions, or `*` for all (`SelectItems::All`).
     pub items: SelectItems,
     pub from: String,
-    pub filter: Option<Predicate>,
+    /// The WHERE expression (must resolve to boolean), if any.
+    pub filter: Option<Expr>,
     pub order_by: Option<OrderBy>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SelectItems {
     All,
-    /// Named projections; each is a column name or a CAST of one.
-    Items(Vec<SelectExpr>),
+    /// Projected expressions, one per output column.
+    Items(Vec<Expr>),
 }
 
-/// A projected expression: a column reference or a cast of an expression.
+/// A general expression, shared by the SELECT list, WHERE, and UPDATE ... SET. The
+/// productions are layered by precedence in the parser (spec/grammar/grammar.ebnf
+/// `expr`); this is the flat resulting tree. A comparison/logical/null-test node is
+/// boolean-valued; arithmetic and columns/integer-literals are integer-valued.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum SelectExpr {
+pub enum Expr {
     Column(String),
+    Literal(Literal),
     Cast {
-        inner: Box<SelectExpr>,
+        inner: Box<Expr>,
         type_name: String,
     },
-    Literal(Literal),
-}
-
-/// A WHERE predicate. Step-1 has single predicates only (no AND/OR — boolean type
-/// deferred). Either a comparison, or a NULL test.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Predicate {
-    Compare {
-        column: String,
-        op: CompareOp,
-        /// The right-hand side: another column or a literal.
-        rhs: Operand,
+    Unary {
+        op: UnaryOp,
+        operand: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
     },
     IsNull {
-        column: String,
+        operand: Box<Expr>,
         negated: bool,
     },
 }
 
-/// A comparison operand: a column reference or a literal value.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Operand {
-    Column(String),
-    Literal(Literal),
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnaryOp {
+    /// Arithmetic negation `-x`.
+    Neg,
+    /// Logical negation `NOT x`.
+    Not,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CompareOp {
+pub enum BinaryOp {
+    // arithmetic (integer operands → promoted integer result)
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    // comparison (integer operands → boolean result)
     Eq,
     Lt,
     Gt,
     Le,
     Ge,
+    // logical (boolean operands → boolean result, Kleene)
+    And,
+    Or,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -127,10 +140,14 @@ pub struct OrderBy {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Literal {
     Null,
-    /// An integer literal. Stored as i64. A bare integer literal is an *untyped
-    /// constant* that adapts to its context — the target column on INSERT/UPDATE,
-    /// the CAST target, the compared column in a WHERE predicate — and traps 22003
-    /// if it does not fit; with no context it defaults to int64. See
-    /// spec/design/types.md (Integer-literal typing).
+    /// An integer literal. Stored as i64 (the parser folds a leading unary minus into
+    /// the value). A bare integer literal is an *untyped constant* that adapts to its
+    /// context — the target column on INSERT/UPDATE, a sibling operand, the compared
+    /// column in a WHERE predicate — and traps 22003 if it does not fit; with no
+    /// context it defaults to int64. See spec/design/types.md §6.
     Int(i64),
+    /// A boolean literal, `TRUE` or `FALSE`. boolean is expression-only this slice
+    /// (spec/design/types.md §1): a boolean literal is well-formed but cannot be
+    /// stored in a column.
+    Bool(bool),
 }

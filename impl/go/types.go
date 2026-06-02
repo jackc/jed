@@ -110,3 +110,18 @@ func (t ScalarType) InRange(v int64) bool {
 func AllScalarTypes() []ScalarType {
 	return []ScalarType{Int16, Int32, Int64}
 }
+
+// IsBooleanTypeName reports whether name is the boolean type (canonical "boolean",
+// alias "bool"), case-insensitively. boolean is a known scalar
+// (spec/types/scalars.toml, storable = false) that exists only as an expression type
+// this slice — it is not a ScalarType because it cannot be a column or CAST target.
+// Used to distinguish a known-but-not-storable type name (→ 0A000) from a genuinely
+// unknown one (→ 42704).
+func IsBooleanTypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "boolean", "bool":
+		return true
+	default:
+		return false
+	}
+}

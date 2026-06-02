@@ -56,34 +56,48 @@ reserved a word another did not, the corpus would diverge. Recording the rule in
 grammar keeps all cores honest. (Canonical *output* names — `int16` not `smallint` — are
 a separate determinism rule owned by the type system, see [types.md](types.md) §2.)
 
-## 4. Lexical edges: the leading-minus literal and two-character operators
+## 4. Lexical edges: the minus operator and two-character operators
 
 Two lexer facts are easy to get subtly wrong across cores, so the grammar pins them:
 
-- **A negative integer is one lexical token, not a unary operator.** The leading `-` is
-  bound to the digits at lex time *only when a digit immediately follows*; `- 5` with a
-  space is a lex error, and there is no general unary-minus expression yet. Out-of-range
-  magnitudes (beyond signed 64-bit) are a syntax error (`42601`), not a silent wrap.
-- **`<=` and `>=` are single tokens**, lexed greedily. The only comparison operators are
-  `=`, `<`, `>`, `<=`, `>=`; **`<>` and `!=` do not exist** in this surface.
+- **`-` is a unary/binary operator, not part of the literal.** An `integer` token is an
+  *unsigned* magnitude of digits; `-5` is the unary-minus operator applied to `5`, and
+  `- 5` with a space is now legal (it was a lex error when the sign was lexed into the
+  literal). The parser folds unary-minus-of-a-literal into a single negative `Literal`
+  value, so the negative-literal range checks (types.md §6) are unchanged.
+  - **Magnitude range.** A magnitude must be `<= 2^63` (`9223372036854775808`); a larger
+    one is a syntax error (`42601`), not a silent wrap. So that `int64`'s minimum is
+    reachable, the lexer carries the magnitude *unsigned* (Rust `u64`, Go `uint64`, TS
+    `bigint`) — `i64`/`int64` cannot hold `2^63`. The value `2^63` is in range **only** as
+    the operand of unary minus, where it folds to `-9223372036854775808` (`int64::MIN`); a
+    bare `2^63` fits no signed integer type and traps `22003` at resolve time (deterministic,
+    before any row is scanned).
+- **`<=` and `>=` are single tokens**, lexed greedily. The comparison operators are
+  `=`, `<`, `>`, `<=`, `>=`; **`<>` and `!=` still do not exist** in this surface. The
+  arithmetic operators `+ - * / %` are each single-character tokens; `*` is shared with the
+  `SELECT *` glob and disambiguated by grammatical position (only the first select item).
 
 ## 5. Deliberate narrowings (each relaxable later)
 
 The current surface is intentionally minimal. Every omission below is a future feature,
 tracked in [../../TODO.md](../../TODO.md), not an oversight:
 
-- **Single WHERE predicate** — exactly one `IS [NOT] NULL` test or one comparison. No
-  `AND` / `OR` / `NOT`, and no parentheses around predicates.
 - **No aliases** — neither column (`expr AS name`) nor table aliases. The only `AS` in
   the surface is inside `CAST(expr AS type)`.
 - **Single table** — one table per `SELECT`/`UPDATE`/`DELETE`; no `JOIN`, no subqueries.
-- **Positional `INSERT`** — no column list, no multi-row `VALUES`, no `DEFAULT`.
-- **One `ORDER BY` key**, optional `ASC` / `DESC`. There is no `NULLS FIRST` / `NULLS
-  LAST` *syntax*; NULL ordering is fixed semantics (NULLs first ascending), not a knob.
+- **Positional `INSERT`** — no column list, no multi-row `VALUES`, no `DEFAULT`, and the
+  values are *literals only* (not general expressions; see the `literal` production).
+- **One `ORDER BY` key**, optional `ASC` / `DESC`, over a bare column (not a general
+  expression). There is no `NULLS FIRST` / `NULLS LAST` *syntax*; NULL ordering is fixed
+  semantics (NULLs first ascending), not a knob.
 - **No `LIMIT` / `OFFSET`.**
 - **ASCII-only identifiers**, no quoted identifiers (§3).
-- **Two literal forms only** — integer and `NULL`. No string, decimal, or boolean
-  literals (the scalar set is integers-only this slice — see [types.md](types.md) §1).
+- **No string or decimal literals.** Integer, `TRUE`/`FALSE`, and `NULL` are the literal
+  forms. `boolean` exists only as an *expression* type this slice — there are boolean
+  literals and comparison/logical results, but no boolean *column* (see
+  [types.md](types.md) §1).
+- **No function calls.** The expression grammar has operators and parentheses but no
+  `f(args)` call syntax — no scalar functions are defined yet.
 - **No `;` statement terminator** and **no SQL comment syntax** in the input.
 - **No parameter placeholders** (`$1`, `?`). The conformance corpus uses literal SQL by
   design — see [conformance.md](conformance.md); bound parameters are an
@@ -104,9 +118,11 @@ informative comment beside the `type_name` rule.
 The grammar grows **one production at a time, spec-first**. When a feature lands it
 edits this grammar and [grammar.ebnf](../grammar/grammar.ebnf) in the *same change* that
 adds the parser code in all cores and the conformance entries that exercise it
-(CLAUDE.md §10/§11). [../../TODO.md](../../TODO.md) is the roadmap of what comes next —
-compound predicates (`AND`/`OR`/`NOT`), integer arithmetic operators, a general
-expression evaluator, and onward. Because the parser is hand-written rather than
+(CLAUDE.md §10/§11). The general expression substrate — operator precedence,
+parenthesization, integer arithmetic, the `boolean` type, and the `AND`/`OR`/`NOT`
+connectives — landed together as the `expr` tower above; [../../TODO.md](../../TODO.md)
+is the roadmap of what comes next (select-list aliases, `LIMIT`/`OFFSET`, richer
+`ORDER BY`, more predicate forms, and onward). Because the parser is hand-written rather than
 generated, "conform to the grammar" is verified by cross-reading each production against
 the three parsers and confirming every corpus statement is derivable from the grammar,
 not by a generator step.

@@ -4,7 +4,7 @@
 
 use abide::error::SqlState;
 use abide::operators::OPERATORS;
-use abide::types::ScalarType;
+use abide::types::{is_boolean_type_name, ScalarType};
 use std::path::Path;
 
 fn spec(rel: &str) -> String {
@@ -18,12 +18,20 @@ fn spec(rel: &str) -> String {
 fn scalar_types_match_spec() {
     let v: toml::Value = toml::from_str(&spec("types/scalars.toml")).unwrap();
     let types = v["type"].as_array().expect("[[type]] array");
-    assert_eq!(types.len(), 3, "step-1 has exactly three scalar types");
 
-    for t in types {
+    // The storable scalar types are exactly the three integers; each maps to a
+    // `ScalarType` with matching width/range/rank/encoding (CLAUDE.md §5 cross-check).
+    let integers: Vec<&toml::Value> = types
+        .iter()
+        .filter(|t| t["family"].as_str() == Some("integer"))
+        .collect();
+    assert_eq!(integers.len(), 3, "three storable integer scalar types");
+
+    for t in &integers {
         let id = t["id"].as_str().unwrap();
         let st = ScalarType::from_name(id).unwrap_or_else(|| panic!("unknown type id {id}"));
         assert_eq!(st.canonical_name(), id, "canonical name");
+        assert_eq!(t["storable"].as_bool(), Some(true), "{id} storable");
 
         let bits = t["bits"].as_integer().unwrap();
         assert_eq!(st.width_bytes() as i64 * 8, bits, "{id} bits");
@@ -49,6 +57,27 @@ fn scalar_types_match_spec() {
             );
         }
     }
+
+    // boolean is the first non-integer scalar: expression-only (storable = false), so
+    // it is NOT a column `ScalarType`, only a recognized non-storable type name.
+    let boolean = types
+        .iter()
+        .find(|t| t["id"].as_str() == Some("boolean"))
+        .expect("boolean type present");
+    assert_eq!(boolean["family"].as_str(), Some("boolean"), "boolean family");
+    assert_eq!(
+        boolean["storable"].as_bool(),
+        Some(false),
+        "boolean is not storable this slice"
+    );
+    assert!(
+        ScalarType::from_name("boolean").is_none() && ScalarType::from_name("bool").is_none(),
+        "boolean is not a storable column type"
+    );
+    assert!(
+        is_boolean_type_name("boolean") && is_boolean_type_name("BOOL"),
+        "boolean type name is recognized (case-insensitively)"
+    );
 }
 
 #[test]
@@ -64,6 +93,7 @@ fn error_codes_are_registered() {
     // Every SQLSTATE the core can raise must exist in the registry.
     for st in [
         SqlState::NumericValueOutOfRange,
+        SqlState::DivisionByZero,
         SqlState::NotNullViolation,
         SqlState::UniqueViolation,
         SqlState::SyntaxError,
@@ -127,6 +157,11 @@ fn operators_match_spec() {
         );
         assert_eq!(desc.result, row["result"].as_str().unwrap(), "{name} result");
         assert_eq!(desc.null, row["null"].as_str().unwrap(), "{name} null");
+        assert_eq!(
+            desc.precedence as i64,
+            row.get("precedence").and_then(|p| p.as_integer()).unwrap_or(0),
+            "{name} precedence"
+        );
 
         let fams: Vec<&str> = row["arg_families"]
             .as_array()
