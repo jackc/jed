@@ -1,0 +1,129 @@
+# Function / operator catalog — CANONICAL DATA (CLAUDE.md §5).
+#
+# Build-time input to per-language codegen; never parsed at runtime.
+# Reasoning lives in ../design/functions.md — read it before editing this file.
+#
+# This file defines what operators DO: their operand contract, result type, and
+# NULL behavior. It REFERENCES the type tables rather than restating them —
+# operand families and the promotion that reconciles a mixed-type pair live in
+# ../types/compare.toml; the scalar set and ranks in ../types/scalars.toml; error
+# codes in ../errors/registry.toml. Comparison/promotion semantics are NOT
+# re-encoded here (see functions.md).
+
+schema_version = 1
+
+# field doc -------------------------------------------------------------------
+# name            internal identity; the codegen handle and AST node name (the
+#                 CompareOp enum: eq/lt/gt/le/ge). One name per operator.
+# symbol          surface spelling of an infix operator ("=", "<="). Omitted for
+#                 operators with no single infix token (the IS [NOT] NULL tests).
+# kind            operator class: "comparison" | "null_test". Reserved for later
+#                 slices: "arithmetic" | "logical" | "function" (functions.md).
+# arity           operand count (2 = binary, 1 = unary).
+# arg_families    required family of each operand, by position, referencing a
+#                 `family` in ../types/scalars.toml. "any" = unconstrained.
+# arg_resolution  how a mixed-type operand pair is reconciled before the operator
+#                 runs, referencing ../types/compare.toml: "promote" = widen both
+#                 to the common type via the promotion tower; "none" = no reconcile.
+# result          result type: a scalar id from scalars.toml, OR a reserved
+#                 non-scalar id (functions.md): "truth" = three-valued truth value
+#                 (true/false/unknown), non-storable until the `boolean` type lands;
+#                 "promoted" = the common promoted operand type (reserved for future
+#                 arithmetic; none authored yet).
+# null            NULL behavior: "propagates" = any NULL operand makes the result
+#                 unknown; "detects" = inspects NULL-ness, always returns a definite
+#                 truth value, never unknown.
+# errors          SQLSTATE codes (../errors/registry.toml) this operator may raise;
+#                 empty for operators that cannot fail.
+# -----------------------------------------------------------------------------
+
+# --- comparison operators ----------------------------------------------------
+# Binary comparisons over the integer family. A mixed-width pair (e.g. int16 vs
+# int64) is widened to the common type by the promotion tower, then compared as
+# one integer (../types/compare.toml). Result is a three-valued truth: any NULL
+# operand yields unknown — NULL = NULL is unknown, equality is not reflexive
+# across NULL. No overflow is possible (widening is lossless; no arithmetic).
+# `<=`/`>=` are primitive operators here; that they equal `< OR =` / `> OR =`
+# under Kleene logic is reasoning recorded in functions.md, not a data field.
+
+[[operator]]
+name           = "eq"
+symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "truth"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "lt"
+symbol         = "<"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "truth"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "gt"
+symbol         = ">"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "truth"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "le"
+symbol         = "<="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "truth"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "ge"
+symbol         = ">="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "truth"
+null           = "propagates"
+errors         = []
+
+# --- null tests --------------------------------------------------------------
+# Unary null-detection over any nullable value of any type. Unlike comparisons
+# these never propagate: the result is ALWAYS a definite true/false, never
+# unknown — they are the sanctioned way to observe a NULL (compare.toml [null]).
+# No infix `symbol`; the surface spelling is the `IS [NOT] NULL` keyword form
+# owned by the grammar.
+
+[[operator]]
+name           = "is_null"
+kind           = "null_test"
+arity          = 1
+arg_families   = ["any"]
+arg_resolution = "none"
+result         = "truth"
+null           = "detects"
+errors         = []
+
+[[operator]]
+name           = "is_not_null"
+kind           = "null_test"
+arity          = 1
+arg_families   = ["any"]
+arg_resolution = "none"
+result         = "truth"
+null           = "detects"
+errors         = []

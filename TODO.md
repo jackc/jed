@@ -45,10 +45,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       already-implemented surface (CREATE TABLE / INSERT / SELECT / WHERE / ORDER BY / UPDATE /
       DELETE / CAST), with the *why* in [spec/design/grammar.md](spec/design/grammar.md). Grow
       it per feature. _(size: M; §6)_
-- [ ] **Author the function / operator catalog** (`spec/functions/` is empty). This is
-      where operator **result types** live (e.g. type of `int32 + int32`) and NULL
-      behavior, as data (§5). Define the schema + the comparison operators that current
-      code hardcodes. Prerequisite for all arithmetic/boolean/function work. _(size: M; §5)_
+- [x] **Author the function / operator catalog.** Operator **result types** (e.g. type of
+      `int32 + int32`) and NULL behavior live here as data (§5). Done:
+      [spec/functions/catalog.toml](spec/functions/catalog.toml) backfills the comparison
+      operators (`= < > <= >=`) and null tests (`IS [NOT] NULL`) the cores hardcode, with a
+      family-based schema that references the promotion tower rather than restating it, a
+      coherence checker ([spec/functions/verify.rb](spec/functions/verify.rb), wired into
+      `rake verify`), and the *why* in [spec/design/functions.md](spec/design/functions.md).
+      Prerequisite for all arithmetic/boolean/function work. _(size: M; §5)_
 - [ ] **Decide & build the codegen "middle path"** for the function catalog — generate
       per-language operator stubs from the shared data rather than hand-writing N times
       (§5). Pairs with the catalog above. _(size: M; deps: function catalog; §5)_ _(parallel)_
