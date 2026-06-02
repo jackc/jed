@@ -402,10 +402,22 @@ function resolvePredicate(table: Table, p: Predicate): ResolvedPredicate {
     const index = resolveCol(p.column);
     let rhs: Rhs;
     if (p.rhs.kind === "literal") {
-      rhs = {
-        kind: "const",
-        value: p.rhs.literal.kind === "int" ? intValue(p.rhs.literal.int) : nullValue(),
-      };
+      const lit = p.rhs.literal;
+      if (lit.kind === "int") {
+        // Context-adaptive literal (spec/design/types.md): the literal adapts to the
+        // compared column's type; a value that does not fit traps 22003 here, before any
+        // row is scanned (deterministic).
+        const ty = table.columns[index]!.type;
+        if (!inRange(ty, lit.int)) {
+          throw engineError(
+            "numeric_value_out_of_range",
+            "value out of range for type " + canonicalName(ty),
+          );
+        }
+        rhs = { kind: "const", value: intValue(lit.int) };
+      } else {
+        rhs = { kind: "const", value: nullValue() };
+      }
     } else {
       rhs = { kind: "column", index: resolveCol(p.rhs.name) };
     }

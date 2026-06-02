@@ -161,10 +161,9 @@ profile's capabilities passes. Harnesses arrive with the first vertical slice
 
 - **Result-type assertions** — a directive to assert a result column's precise declared
   type (`int16` vs `int32`), beyond the `I`/`T`/`R` rendering tag. Deferred.
-- **Integer-literal typing** — the type of a bare integer literal (e.g. is `1000` an
-  `int16`, the smallest fitting type, or a context-adapted literal?) is **not yet
-  specified** in [../types/](../types/). The corpus deliberately avoids entries whose
-  result depends on it (implicit widening from a literal). Resolve in the type spec, then
-  add coverage. This is an ambiguity the spec-first process surfaced; flag, don't guess.
+- **Integer-literal typing** — ✅ **resolved**: a bare integer literal is an *untyped
+  constant* that adapts to its context and traps `22003` when its value does not fit (so
+  `WHERE small = 100000`, with `small int16`, is a type error, not a silent non-match). See
+  [../design/types.md](../design/types.md) §6; coverage in `suites/types/literals.test`.
 - **Boolean results / connectives** — `AND`/`OR`/`NOT` over predicates arrive with the
   `boolean` type (deferred, CLAUDE.md §4). The corpus uses single predicates only.

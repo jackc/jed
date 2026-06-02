@@ -61,9 +61,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `@generated`); a `rake verify` drift gate + per-core cross-check tests keep them in
       sync; the *why* is in [spec/design/codegen.md](spec/design/codegen.md). Forward: extend
       the generator to types/errors. _(size: M; §5)_ _(parallel)_
-- [ ] **Resolve integer-literal typing** — currently flagged *open* (conformance.md §7):
-      is a bare `1000` an `int16`, the smallest fitting type, or context-adapted? Decide in
-      `spec/types/`, then add corpus coverage. Blocks clean expression semantics. _(size: S; §4)_
+- [x] **Resolve integer-literal typing.** Decided **context-adaptive**: a bare integer
+      literal is an *untyped constant* that adapts to its context (the column on
+      INSERT/UPDATE/comparison, the CAST target) and traps `22003` when its value does not
+      fit, defaulting to int64 with no context. Authored in
+      [spec/design/types.md](spec/design/types.md) §6 (conformance.md §7 flipped to
+      resolved); the one new code path is a literal range-check in each core's WHERE-predicate
+      resolution (so `WHERE small = 100000` now traps instead of silently matching nothing),
+      pinned by [spec/conformance/suites/types/literals.test](spec/conformance/suites/types/literals.test).
+      _(size: S; §4)_
 - [ ] **General expression evaluator.** Executor today handles bare columns + `CAST` +
       single comparisons. Build a real nested-expression tree (operators, function calls,
       parenthesization) in WHERE and the SELECT list. The single biggest unlock for query
@@ -137,7 +143,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **Subqueries** — scalar, `IN (subquery)`, `EXISTS`, then correlated. _(size: L; deps: joins)_
 - [ ] **Set operations** — `UNION [ALL]`, `INTERSECT`, `EXCEPT`. _(size: M)_
 - [ ] **Constraints** — `NOT NULL`, `DEFAULT`, `UNIQUE`, `CHECK`, **composite `PRIMARY KEY`**
-      (key encoding already composes — types.md §6), `FOREIGN KEY`. NOT NULL/DEFAULT are
+      (key encoding already composes — types.md §7), `FOREIGN KEY`. NOT NULL/DEFAULT are
       easy and could be pulled into Phase 2; UNIQUE/CHECK/FK are heavier. _(size: S→L each)_
 - [ ] **Secondary indexes** (`CREATE INDEX`) — also a planner + storage concern (index
       pages, index maintenance on write). _(size: L; deps: storage maturation)_

@@ -142,9 +142,10 @@ const (
 	LiteralInt
 )
 
-// Literal is a literal value as written in SQL. The type of a bare integer literal
-// is intentionally not committed here — the open spec question recorded in
-// spec/design/conformance.md §7; it is resolved by context.
+// Literal is a literal value as written in SQL. A bare integer literal is an *untyped
+// constant* that adapts to its context — the target column on INSERT/UPDATE, the CAST
+// target, the compared column in a WHERE predicate — and traps 22003 if it does not fit;
+// with no context it defaults to int64. See spec/design/types.md (Integer-literal typing).
 type Literal struct {
 	Kind LiteralKind
 	Int  int64

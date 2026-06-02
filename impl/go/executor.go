@@ -432,6 +432,14 @@ func (db *Database) resolvePredicate(table *Table, p *Predicate) (*resolvedPredi
 		rp := &resolvedPredicate{index: idx, op: p.Compare.Op}
 		if lit := p.Compare.RHS.Literal; lit != nil {
 			if lit.Kind == LiteralInt {
+				// Context-adaptive literal (spec/design/types.md): the literal adapts to
+				// the compared column's type; a value that does not fit traps 22003 here,
+				// before any row is scanned (deterministic).
+				ty := table.Columns[idx].Type
+				if !ty.InRange(lit.Int) {
+					return nil, NewError(NumericValueOutOfRange,
+						"value out of range for type "+ty.CanonicalName())
+				}
 				rp.rhsConst = IntValue(lit.Int)
 			} else {
 				rp.rhsConst = NullValue()

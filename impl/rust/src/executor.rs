@@ -469,7 +469,19 @@ impl Database {
                 let idx = resolve_col(column)?;
                 let rhs = match rhs {
                     Operand::Literal(Literal::Null) => RhsPlan::Const(Value::Null),
-                    Operand::Literal(Literal::Int(n)) => RhsPlan::Const(Value::Int(*n)),
+                    Operand::Literal(Literal::Int(n)) => {
+                        // Context-adaptive literal (spec/design/types.md): the literal
+                        // adapts to the compared column's type; a value that does not fit
+                        // traps 22003 here, before any row is scanned (deterministic).
+                        let ty = table.columns[idx].ty;
+                        if !ty.in_range(*n) {
+                            return Err(EngineError::new(
+                                SqlState::NumericValueOutOfRange,
+                                format!("value out of range for type {}", ty.canonical_name()),
+                            ));
+                        }
+                        RhsPlan::Const(Value::Int(*n))
+                    }
                     Operand::Column(name) => RhsPlan::Column(resolve_col(name)?),
                 };
                 Ok(ResolvedPredicate::Compare { idx, op: *op, rhs })

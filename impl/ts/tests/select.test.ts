@@ -85,3 +85,22 @@ test("unknown column traps 42703", () => {
 test("select from a missing table traps 42P01", () => {
   assert.equal(errCode(() => execute(seed(), "SELECT * FROM nope")), "42P01");
 });
+
+test("an out-of-range literal in a comparison traps 22003 (context-adaptive typing)", () => {
+  // A literal that cannot be represented in the compared column's type is a type error
+  // (spec/design/types.md §6), not a silent non-match — for every operator.
+  const db = dbWith([
+    "CREATE TABLE t (id int32 PRIMARY KEY, small int16)",
+    "INSERT INTO t VALUES (1, 30000)",
+  ]);
+  assert.deepStrictEqual(query(db, "SELECT id FROM t WHERE small = 30000"), [["1"]]);
+  for (const sql of [
+    "SELECT id FROM t WHERE small = 100000",
+    "SELECT id FROM t WHERE small < 100000",
+    "SELECT id FROM t WHERE small > 100000",
+  ]) {
+    assert.equal(errCode(() => execute(db, sql)), "22003", sql);
+  }
+  // The context is the compared column: 5e9 fits int64 but not int32 (the id column).
+  assert.equal(errCode(() => execute(db, "SELECT id FROM t WHERE id = 5000000000")), "22003");
+});

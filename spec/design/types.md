@@ -84,7 +84,7 @@ and `IS [NOT] DISTINCT FROM` (the latter arrives with the operator catalog). Thi
 PG model, borrowed because it is principled.
 
 **Value ordering & NULL position.** Non-NULL integers use plain signed numeric ascending
-order, which is exactly what the key encoding (§6) reproduces in raw bytes. NULL's position
+order, which is exactly what the key encoding (§7) reproduces in raw bytes. NULL's position
 in the physical total order is now **ratified** (it was deferred to the key-encoding step):
 **NULLs sort first** (before every present value) in ascending order, via a leading `0x00`
 presence tag on a nullable key slot; descending inverts this (NULLs last). See
@@ -109,7 +109,44 @@ INSERT/UPDATE into a column but not in general expressions) is part of the vocab
 future types; for the integer set, widenings are fully implicit so no edge needs the
 weaker `assignment` mode yet.
 
-## 6. Order-preserving key encoding
+## 6. Integer-literal typing
+
+A bare integer literal (`1000`, `-32768`) is an **untyped integer constant** — in the
+spirit of Go's and Rust's untyped constants. It has no intrinsic type; it acquires one from
+its **context**, and **traps `22003`** if its value does not fit that context type. This
+keeps a literal from silently forcing a width, and makes `WHERE small = 100000` (where
+`small` is `int16`) a type error rather than a value that silently never matches.
+
+- **Lexing first.** A literal is parsed as a signed 64-bit value; a magnitude beyond int64
+  is a *syntax* error (`42601`, [../grammar/grammar.ebnf](../grammar/grammar.ebnf)), decided
+  before any typing applies.
+- **Assignment context** (`INSERT ... VALUES`, `UPDATE ... SET col = lit`): the context is
+  the target column's type. The literal adapts to it — accepted iff in range, else `22003`.
+- **Cast context** (`CAST(lit AS T)`): the context is `T`; range-checked, else `22003`.
+- **Comparison context** (`col <op> lit`): the context is the column's type. The literal
+  adapts to it; if out of range the predicate **traps `22003` deterministically, before any
+  row is scanned** — a literal that cannot be represented in the column's type is a type
+  error, not a silent non-match, for every operator (`=`, `<`, `>`, `<=`, `>=`). In range,
+  the comparison proceeds within that type (no promotion needed). A `NULL` literal is exempt
+  (it is the absence of a value).
+- **No context** (a bare projected literal, `SELECT 1000`): defaults to **int64**, the
+  widest integer.
+
+**Forward — arithmetic** (when the operator catalog's arithmetic lands): an untyped literal
+operand adapts to the *other* operand's type (`small + 1000` → `int16`, and may overflow per
+§3); a literal meeting only literals (`1000 + 1`) defaults to int64. Recorded here so the
+arithmetic slice inherits the rule rather than re-deciding it.
+
+**Why this, not "smallest fitting" or "always int64".** Smallest-fitting makes ordinary
+arithmetic overflow surprisingly (`30000 + 30000` would be `int16 + int16`). Always-int64
+removes the type error in a comparison (an out-of-range literal would silently never match).
+Context-adaptation gives each literal exactly the type its use demands and surfaces an
+impossible literal as a `22003` the moment it is resolved — consistent with the strict cast
+matrix (§5: adaptation is a value-checked coercion, never a silent reinterpret), the
+promotion tower (§4: once typed, a literal participates like any value), and trap-on-overflow
+(§3).
+
+## 7. Order-preserving key encoding
 
 See [../encoding/](../encoding/); the per-type rule is the `encoding` field in
 [../types/scalars.toml](../types/scalars.toml). Full `(value → bytes)` fixtures are
@@ -135,7 +172,7 @@ reference design (CLAUDE.md §8). The encoding is emitted big-endian regardless 
 endianness, so the byte fixtures are identical across Rust and Go — that cross-language
 byte-identity is the whole point.
 
-## 7. Determinism checklist (this step)
+## 8. Determinism checklist (this step)
 
 - ✅ One canonical name per type in all output.
 - ✅ Trap (deterministic error `22003`) instead of platform-dependent wraparound.
@@ -143,7 +180,7 @@ byte-identity is the whole point.
 - ✅ Value order == key byte order (no separate, possibly-divergent comparator).
 - ✅ NULL's physical total-order position — ratified NULLs-first (ascending), see §4.
 
-## 8. Open / deferred
+## 9. Open / deferred
 
 - **NULL sort position** — ✅ ratified NULLs-first (ascending) with the key-encoding spec
   (§4, [encoding.md §4](encoding.md)). No longer open.

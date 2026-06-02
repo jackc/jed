@@ -150,3 +150,32 @@ fn select_from_missing_table_traps() {
         "42P01"
     );
 }
+
+#[test]
+fn out_of_range_literal_in_comparison_traps() {
+    // Context-adaptive literal typing (spec/design/types.md §6): a literal that cannot be
+    // represented in the compared column's type is a type error (22003), not a silent
+    // non-match — for every operator. An in-range literal compares normally.
+    let mut db = db_with(&[
+        "CREATE TABLE t (id int32 PRIMARY KEY, small int16)",
+        "INSERT INTO t VALUES (1, 30000)",
+    ]);
+    assert_eq!(
+        query(&mut db, "SELECT id FROM t WHERE small = 30000"),
+        vec![vec![Value::Int(1)]]
+    );
+    for sql in [
+        "SELECT id FROM t WHERE small = 100000",
+        "SELECT id FROM t WHERE small < 100000",
+        "SELECT id FROM t WHERE small > 100000",
+    ] {
+        assert_eq!(execute(&mut db, sql).unwrap_err().code(), "22003", "{sql}");
+    }
+    // The context is the compared column: 5e9 fits int64 but not int32 (the id column).
+    assert_eq!(
+        execute(&mut db, "SELECT id FROM t WHERE id = 5000000000")
+            .unwrap_err()
+            .code(),
+        "22003"
+    );
+}

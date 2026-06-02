@@ -1,0 +1,47 @@
+# Integer-literal typing: a bare literal is an untyped constant that adapts to the compared
+# column's type and traps 22003 when its value does not fit (spec/design/types.md §6). An
+# out-of-range literal in a comparison is a TYPE ERROR for every operator, not a silent
+# non-match — decided at predicate resolution, before any row is scanned.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.comparison_order, types.int16, types.int32, types.int64, error.overflow_trap
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, small int16, big int64)
+
+statement ok
+INSERT INTO t VALUES (1, 100, 10000000000)
+
+statement ok
+INSERT INTO t VALUES (2, 30000, 20000000000)
+
+# an in-range literal adapts to the column type and matches normally
+query I nosort
+SELECT id FROM t WHERE small = 30000
+----
+2
+
+# a literal outside int16 is a type error, not a silent non-match — for equality ...
+statement error 22003
+SELECT id FROM t WHERE small = 100000
+
+# ... and for ordering comparisons too (even though every int16 value is < 100000)
+statement error 22003
+SELECT id FROM t WHERE small < 100000
+
+statement error 22003
+SELECT id FROM t WHERE small > 100000
+
+# the context is the compared column's type: 5000000000 fits int64 but not int32 (id)
+statement error 22003
+SELECT id FROM t WHERE id = 5000000000
+
+# the same literal is fine against a wide-enough column
+query I nosort
+SELECT id FROM t WHERE big = 10000000000
+----
+1
+
+# a NULL literal is exempt: `= NULL` is UNKNOWN, yielding no rows, never an error
+query I nosort
+SELECT id FROM t WHERE small = NULL
+----

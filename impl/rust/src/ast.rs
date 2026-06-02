@@ -127,9 +127,10 @@ pub struct OrderBy {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Literal {
     Null,
-    /// An integer literal. Stored as i64; its type is resolved by context
-    /// (the target column on INSERT, the other operand in a comparison). The
-    /// type of a bare integer literal is intentionally not committed here — the
-    /// open spec question recorded in spec/design/conformance.md §7.
+    /// An integer literal. Stored as i64. A bare integer literal is an *untyped
+    /// constant* that adapts to its context — the target column on INSERT/UPDATE,
+    /// the CAST target, the compared column in a WHERE predicate — and traps 22003
+    /// if it does not fit; with no context it defaults to int64. See
+    /// spec/design/types.md (Integer-literal typing).
     Int(i64),
 }

@@ -133,3 +133,25 @@ func TestSelectFromMissingTableTraps(t *testing.T) {
 	db := NewDatabase()
 	wantErr(t, db, "SELECT x FROM nope", "42P01")
 }
+
+func TestOutOfRangeLiteralInComparisonTraps(t *testing.T) {
+	// Context-adaptive literal typing (spec/design/types.md §6): a literal that cannot be
+	// represented in the compared column's type is a type error (22003), not a silent
+	// non-match — for every operator. An in-range literal compares normally.
+	db := dbWith(t,
+		"CREATE TABLE t (id int32 PRIMARY KEY, small int16)",
+		"INSERT INTO t VALUES (1, 30000)",
+	)
+	if got := queryIDs(t, db, "SELECT id FROM t WHERE small = 30000"); !eqInts(got, 1) {
+		t.Errorf("in-range got %v", got)
+	}
+	for _, sql := range []string{
+		"SELECT id FROM t WHERE small = 100000",
+		"SELECT id FROM t WHERE small < 100000",
+		"SELECT id FROM t WHERE small > 100000",
+	} {
+		wantErr(t, db, sql, "22003")
+	}
+	// The context is the compared column: 5e9 fits int64 but not int32 (the id column).
+	wantErr(t, db, "SELECT id FROM t WHERE id = 5000000000", "22003")
+}

@@ -3,8 +3,10 @@
 // with `kind` (the elidable-subset analogue of Go's one-field-set structs / Rust's
 // enums). Integer literals carry a `bigint` so int64 is exact.
 
-// Literal is a literal value as written in SQL. The type of a bare integer literal is
-// intentionally not committed here (spec/design/conformance.md §7); resolved by context.
+// Literal is a literal value as written in SQL. A bare integer literal is an *untyped
+// constant* that adapts to its context — the target column on INSERT/UPDATE, the CAST
+// target, the compared column in a WHERE predicate — and traps 22003 if it does not fit;
+// with no context it defaults to int64. See spec/design/types.md (Integer-literal typing).
 export type Literal = { kind: "null" } | { kind: "int"; int: bigint };
 
 // Operand is a comparison's / assignment's right-hand side: a column ref or a literal.
