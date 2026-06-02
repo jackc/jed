@@ -162,7 +162,8 @@ class Parser {
   }
 
   // parseSelect parses
-  // `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]`.
+  // `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]
+  // [LIMIT <count>] [OFFSET <count>]`. LIMIT/OFFSET may appear in either order (§9).
   private parseSelect(): Select {
     this.expectKeyword("select");
     const items = this.parseSelectItems();
@@ -186,7 +187,47 @@ class Parser {
       orderBy = { column, descending };
     }
 
-    return { kind: "select", items, from, filter, orderBy };
+    let limit: bigint | null = null;
+    let offset: bigint | null = null;
+    for (;;) {
+      const kw = this.peekKeyword();
+      if (kw === "limit") {
+        if (limit !== null) throw engineError("syntax_error", "duplicate LIMIT clause");
+        this.advance();
+        limit = this.parseCount(true);
+      } else if (kw === "offset") {
+        if (offset !== null) throw engineError("syntax_error", "duplicate OFFSET clause");
+        this.advance();
+        offset = this.parseCount(false);
+      } else {
+        break;
+      }
+    }
+
+    return { kind: "select", items, from, filter, orderBy, limit, offset };
+  }
+
+  // parseCount parses a LIMIT/OFFSET count: a non-negative integer literal. The sign is
+  // folded as in parseLiteral; a negative value is rejected with 2201W (LIMIT) / 2201X
+  // (OFFSET), and a magnitude over int64's max throws 22003 (the value -0 folds to 0 and
+  // is accepted). isLimit selects which structured error to raise.
+  private parseCount(isLimit: boolean): bigint {
+    let negate = false;
+    if (this.peek().kind === "minus") {
+      this.advance();
+      negate = true;
+    }
+    const t = this.advance();
+    if (t.kind !== "int") {
+      throw engineError("syntax_error", "expected an integer count");
+    }
+    const v = foldInt(t.int!, negate);
+    if (v < 0n) {
+      throw isLimit
+        ? engineError("invalid_row_count_in_limit_clause", "LIMIT must not be negative")
+        : engineError("invalid_row_count_in_offset_clause", "OFFSET must not be negative");
+    }
+    return v;
   }
 
   // parseUpdate parses

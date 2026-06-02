@@ -441,11 +441,23 @@ impl Database {
             });
         }
 
-        // Project each surviving row. Producing a row, and each projection-list
+        // LIMIT / OFFSET: window the sorted rows BEFORE projection, so rows skipped by
+        // OFFSET or excluded by LIMIT accrue no row_produced/projection cost (they were
+        // still scanned + filtered above). Clamp in the integer domain against the row
+        // count before indexing — never truncate a huge count into usize (CLAUDE.md §8;
+        // spec/design/grammar.md §9). The counts are already non-negative (parser).
+        let start = sel.offset.unwrap_or(0).min(rows.len() as i64) as usize;
+        let end = match sel.limit {
+            Some(lim) if lim < (rows.len() - start) as i64 => start + lim as usize,
+            _ => rows.len(),
+        };
+        let window = &rows[start..end];
+
+        // Project each windowed row. Producing a row, and each projection-list
         // evaluation, accrue cost. (ORDER BY's sort comparisons are not metered —
         // spec/design/cost.md §3.)
-        let mut out_rows = Vec::with_capacity(rows.len());
-        for row in &rows {
+        let mut out_rows = Vec::with_capacity(window.len());
+        for row in window {
             meter.charge(COSTS.row_produced);
             let mut out = Vec::with_capacity(projections.len());
             for p in &projections {

@@ -342,9 +342,19 @@ export class Database {
       });
     }
 
-    // Project each surviving row. Producing a row, and each projection-list evaluation,
+    // LIMIT / OFFSET: window the sorted rows BEFORE projection, so rows skipped by OFFSET
+    // or excluded by LIMIT accrue no rowProduced/projection cost (they were still scanned
+    // + filtered above). Clamp in the bigint domain against the row count, then index —
+    // never let a huge count cross 2^53 via Number (CLAUDE.md §8; grammar.md §9). The
+    // counts are already non-negative (parser).
+    const n = BigInt(rows.length);
+    const start = sel.offset === null ? 0n : sel.offset < n ? sel.offset : n;
+    const end = sel.limit !== null && sel.limit < n - start ? start + sel.limit : n;
+    const windowed = rows.slice(Number(start), Number(end));
+
+    // Project each windowed row. Producing a row, and each projection-list evaluation,
     // accrue cost. (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
-    const out: Value[][] = rows.map((row) => {
+    const out: Value[][] = windowed.map((row) => {
       meter.charge(COSTS.rowProduced);
       return projections.map((p) => evalExpr(p, row, meter));
     });

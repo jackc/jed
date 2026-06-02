@@ -61,6 +61,8 @@ test("error codes are registered in spec/errors/registry.toml", () => {
   const states: SqlState[] = [
     "numeric_value_out_of_range",
     "division_by_zero",
+    "invalid_row_count_in_limit_clause",
+    "invalid_row_count_in_offset_clause",
     "not_null_violation",
     "unique_violation",
     "syntax_error",

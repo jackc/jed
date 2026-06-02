@@ -399,7 +399,25 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		})
 	}
 
-	// Project each surviving row. Producing a row, and each projection-list evaluation,
+	// LIMIT / OFFSET: window the sorted rows BEFORE projection, so rows skipped by OFFSET
+	// or excluded by LIMIT accrue no row_produced/projection cost (they were still scanned
+	// + filtered above). Clamp in the int64 domain against the row count before indexing —
+	// never truncate a huge count (CLAUDE.md §8; spec/design/grammar.md §9). The counts are
+	// already non-negative (parser).
+	n := int64(len(rows))
+	start := int64(0)
+	if sel.Offset != nil && *sel.Offset < n {
+		start = *sel.Offset
+	} else if sel.Offset != nil {
+		start = n
+	}
+	end := n
+	if sel.Limit != nil && *sel.Limit < n-start {
+		end = start + *sel.Limit
+	}
+	rows = rows[start:end]
+
+	// Project each windowed row. Producing a row, and each projection-list evaluation,
 	// accrue cost. (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
 	out := make([][]Value, 0, len(rows))
 	for _, row := range rows {

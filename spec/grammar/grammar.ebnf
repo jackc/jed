@@ -73,6 +73,7 @@ delete         ::= "DELETE" "FROM" identifier where_clause?
 select         ::= "SELECT" select_items "FROM" identifier
                    where_clause?
                    order_by?
+                   limit_offset?
 
 /* A select item is a general expression with an optional output-name alias. The
  * "*" glob is a STANDALONE alternative — it is the whole select list, never mixed
@@ -91,6 +92,26 @@ select_items   ::= "*"
 select_item    ::= expr ("AS" identifier)?
 
 order_by       ::= "ORDER" "BY" identifier ("ASC" | "DESC")?
+
+/* LIMIT and OFFSET cap and skip output rows. They may appear in EITHER order, and
+ * each clause AT MOST ONCE — a repeat (e.g. "LIMIT 1 LIMIT 2") is a syntax error
+ * (42601). The slice is applied AFTER order_by and before projection, so a windowed
+ * row count is what the SELECT result and the row_produced cost both reflect
+ * (../design/grammar.md §9, ../design/cost.md §3). */
+limit_offset   ::= limit_clause offset_clause?
+                 | offset_clause limit_clause?
+
+limit_clause   ::= "LIMIT" count
+
+offset_clause  ::= "OFFSET" count
+
+/* A non-negative integer literal — NOT a general expression (the same literal-only
+ * narrowing INSERT makes). A leading "-" is well-formed grammar but the negative
+ * VALUE is rejected deterministically at parse time — 2201W for LIMIT, 2201X for
+ * OFFSET — analogous to the bare-2^63 -> 22003 case for `integer` (the value -0
+ * folds to 0 and is accepted). The magnitude bound (42601) and the i64-range trap
+ * (22003, a positive magnitude of 2^63) still apply via the shared integer lexer. */
+count          ::= "-"? integer
 
 /* A WHERE clause is a general expression that must resolve to `boolean`; a row
  * is kept iff it evaluates to TRUE (FALSE and NULL/unknown both exclude). */

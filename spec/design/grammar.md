@@ -92,7 +92,10 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
 - **One `ORDER BY` key**, optional `ASC` / `DESC`, over a bare column (not a general
   expression). There is no `NULLS FIRST` / `NULLS LAST` *syntax*; NULL ordering is fixed
   semantics (NULLs first ascending), not a knob.
-- **No `LIMIT` / `OFFSET`.**
+- **`LIMIT` / `OFFSET` take a non-negative integer literal**, not a general expression
+  (the same literal-only narrowing `INSERT` makes). The two clauses may appear in either
+  order, each at most once (§9). There is **no `LIMIT ALL`**, **no `OFFSET … ROWS` /
+  `FETCH NEXT … ROWS ONLY`**, and **no SQLite `LIMIT off, cnt` comma form**.
 - **ASCII-only identifiers**, no quoted identifiers (§3).
 - **No string or decimal literals.** Integer, `TRUE`/`FALSE`, and `NULL` are the literal
   forms. `boolean` exists only as an *expression* type this slice — there are boolean
@@ -123,8 +126,8 @@ adds the parser code in all cores and the conformance entries that exercise it
 (CLAUDE.md §10/§11). The general expression substrate — operator precedence,
 parenthesization, integer arithmetic, the `boolean` type, and the `AND`/`OR`/`NOT`
 connectives — landed together as the `expr` tower above; [../../TODO.md](../../TODO.md)
-is the roadmap of what comes next (`LIMIT`/`OFFSET`, richer `ORDER BY`, more predicate
-forms, and onward). Because the parser is hand-written rather than
+is the roadmap of what comes next (richer `ORDER BY`, more predicate forms, and onward).
+Because the parser is hand-written rather than
 generated, "conform to the grammar" is verified by cross-reading each production against
 the three parsers and confirming every corpus statement is derivable from the grammar,
 not by a generator step.
@@ -156,3 +159,36 @@ text. Echoing normalized SQL text (the SQLite behaviour) would require a canonic
 expression printer that is byte-identical across Rust, Go, and TS — a new §8 divergence
 hotspot for no present benefit. A column whose name matters can be given one with `AS`. A
 normalized-name printer remains a possible later refinement.
+
+## 9. `LIMIT` / `OFFSET`
+
+`LIMIT n` caps the result at `n` rows; `OFFSET m` skips the first `m`; together they skip
+`m` then take `n`. The grammar (`limit_offset`) accepts the two clauses in **either order**
+and **each at most once** — `LIMIT n OFFSET m` and `OFFSET m LIMIT n` are equivalent, and a
+duplicate (`LIMIT 1 LIMIT 2`) is a syntax error (`42601`). PostgreSQL accepts both orders;
+matching it costs only a tiny order-independent parse loop and avoids a gratuitous
+incompatibility.
+
+**Where it applies.** The slice runs **after `ORDER BY` and before projection**, the only
+correct point: the rows must be filtered and ordered before "the first `n`" is meaningful,
+and slicing before projection means the skipped/excluded rows never accrue `row_produced`
+or projection cost. So `OFFSET`/beyond-`LIMIT` rows are scanned and filtered (they pay
+`storage_row_read` + filter `operator_eval`) but **not produced** — the cost contract falls
+straight out of the existing `row_produced`-at-projection rule
+([cost.md](cost.md) §3), with the slice itself unmetered like the sort. Output column names
+are derived from the select list and are unaffected by the window (§8).
+
+**The count is a non-negative integer literal**, not a general expression (§5). This is a
+determinism surface (CLAUDE.md §8): the sign is known at parse time, so a negative count is
+rejected **before any row is scanned** with a precise structured error — `2201W`
+(`invalid_row_count_in_limit_clause`) for `LIMIT`, `2201X`
+(`invalid_row_count_in_offset_clause`) for `OFFSET` ([../errors/registry.toml](../errors/registry.toml)),
+the PostgreSQL SQLSTATEs. The value `-0` folds to `0` and is accepted. The shared integer
+lexer's magnitude rules still hold: a magnitude `> 2^63` is a `42601` syntax error, and a
+positive magnitude of `2^63` (over `int64`'s max) traps `22003` (§4). `LIMIT 0` is valid and
+yields the empty result; an `OFFSET` past the end yields the empty result.
+
+Without `ORDER BY` the window is still **deterministic** here — the scan is in primary-key
+order (CLAUDE.md §10) — but `ORDER BY` is the portable way to pin *which* rows a `LIMIT`
+returns, and the corpus uses it for all but the one test that documents the key-order
+default.

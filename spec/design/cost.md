@@ -56,8 +56,12 @@ TS; any deviation diverges the count and fails the corpus.
   would diverge the (future) abort *point*. The executor loop is the one place all three
   cores agree.
 - **`row_produced`** is charged once per row that survives the filter and is projected
-  into a `SELECT` result set, at projection time (post-filter, post-`ORDER BY`). `DELETE`
-  / `UPDATE` emit no rows and so charge no `row_produced`.
+  into a `SELECT` result set, at projection time (post-filter, post-`ORDER BY`, **and
+  post-`LIMIT`/`OFFSET`**). `LIMIT`/`OFFSET` slice the sorted rows *before* the projection
+  loop, so a row skipped by `OFFSET` or excluded by `LIMIT` is scanned and filtered (it
+  pays `storage_row_read` + its filter `operator_eval`s) but charges **no** `row_produced`
+  or projection cost — only the windowed rows do. `DELETE` / `UPDATE` emit no rows and so
+  charge no `row_produced`.
 - **`operator_eval`** is charged once per **interior** expression node — `cast`, `neg`,
   `not`, `arith`, `compare`, `and`, `or`, `is_null`, `distinct`. **Leaf nodes — `column`
   and the constants (`int`/`bool`/`null`) — charge nothing.** Charging leaves would make
@@ -87,6 +91,10 @@ evaluation. It deliberately does **not** meter:
 - **`ORDER BY` sort-internal comparisons** — the sort compares `Value`s directly, not
   through the expression evaluator, so they are outside the `operator_eval` unit. (A
   dedicated sort-comparison unit could be added later if wanted; it is not in this slice.)
+- **`LIMIT` / `OFFSET` slicing** — selecting the output window is an index slice over the
+  already-sorted rows, not evaluation work; like the sort it is unmetered. Its only cost
+  effect is *fewer* `row_produced`/projection charges (the excluded rows are never
+  projected — see the `row_produced` rule above).
 - **Phase-2 row writes** in `UPDATE`/`DELETE` — the two-phase mutation's write pass does
   no eval and produces no row.
 

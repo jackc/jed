@@ -73,6 +73,14 @@ id = "query.column_alias"
 description = "Select-list output naming: bare column → canonical name, expr AS alias → alias, other expr → ?column?"
 
 [[capability]]
+id = "query.limit"
+description = "LIMIT clause: cap the number of returned rows (non-negative integer literal)"
+
+[[capability]]
+id = "query.offset"
+description = "OFFSET clause: skip leading rows of the result (non-negative integer literal)"
+
+[[capability]]
 id = "types.int16"
 description = "int16 / smallint scalar type"
 

@@ -9,6 +9,8 @@
 export type SqlState =
   | "numeric_value_out_of_range" // 22003 — integer overflow (CLAUDE.md §8)
   | "division_by_zero" // 22012 — division or modulo by zero
+  | "invalid_row_count_in_limit_clause" // 2201W — a negative LIMIT count
+  | "invalid_row_count_in_offset_clause" // 2201X — a negative OFFSET count
   | "not_null_violation" // 23502
   | "unique_violation" // 23505 — primary-key uniqueness
   | "syntax_error" // 42601
@@ -25,6 +27,8 @@ export type SqlState =
 const CODES: Record<SqlState, string> = {
   numeric_value_out_of_range: "22003",
   division_by_zero: "22012",
+  invalid_row_count_in_limit_clause: "2201W",
+  invalid_row_count_in_offset_clause: "2201X",
   not_null_violation: "23502",
   unique_violation: "23505",
   syntax_error: "42601",

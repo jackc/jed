@@ -134,7 +134,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       Go, **and** TS, pinned by
       [spec/conformance/suites/query/select_list.test](spec/conformance/suites/query/select_list.test)
       (capabilities `query.column_alias` + `query.select_star`). _(size: M; deps: expression evaluator)_
-- [ ] **`LIMIT` / `OFFSET`.** _(size: S)_
+- [x] **`LIMIT` / `OFFSET`.** Done: `LIMIT n` caps and `OFFSET m` skips result rows, the two
+      clauses accepted in **either order**, each at most once (a duplicate is `42601`). The count
+      is a **non-negative integer literal** (not a general expression); a negative value is a
+      deterministic parse-time data error — **`2201W`** (LIMIT) / **`2201X`** (OFFSET), the
+      PostgreSQL SQLSTATEs, added to [spec/errors/registry.toml](spec/errors/registry.toml). The
+      slice runs **after `ORDER BY`, before projection**, so excluded rows are scanned + filtered
+      but charge no `row_produced`/projection cost — a cross-core determinism contract pinned by
+      the `# cost:` directive. Authored in [spec/grammar/grammar.ebnf](spec/grammar/grammar.ebnf)
+      (`limit_offset`) + [grammar.md §9](spec/design/grammar.md), [cost.md §3](spec/design/cost.md),
+      and capabilities `query.limit` + `query.offset` in
+      [manifest.toml](spec/conformance/manifest.toml), all three cores in lockstep, pinned by
+      [spec/conformance/suites/query/limit_offset.test](spec/conformance/suites/query/limit_offset.test).
+      _(size: S)_
 - [ ] **Richer `ORDER BY`** — multiple keys, per-key `ASC`/`DESC`, `NULLS FIRST|LAST`
       (the physical NULLs-first order is ratified; this is the SQL-level override, types.md §4).
       _(size: M)_

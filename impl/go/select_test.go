@@ -134,6 +134,69 @@ func TestSelectFromMissingTableTraps(t *testing.T) {
 	wantErr(t, db, "SELECT x FROM nope", "42P01")
 }
 
+func limitDB(t *testing.T) *Database {
+	return dbWith(t,
+		"CREATE TABLE t (id int32 PRIMARY KEY, v int32)",
+		"INSERT INTO t VALUES (1, 10)",
+		"INSERT INTO t VALUES (2, 20)",
+		"INSERT INTO t VALUES (3, 30)",
+		"INSERT INTO t VALUES (4, 40)",
+		"INSERT INTO t VALUES (5, 50)",
+	)
+}
+
+func TestLimitCapsAndOffsetSkips(t *testing.T) {
+	db := limitDB(t)
+	// LIMIT takes the first n; OFFSET skips; the two clauses commute.
+	if got := queryIDs(t, db, "SELECT id FROM t ORDER BY id LIMIT 2"); !eqInts(got, 1, 2) {
+		t.Errorf("LIMIT 2 got %v", got)
+	}
+	if got := queryIDs(t, db, "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1"); !eqInts(got, 2, 3) {
+		t.Errorf("LIMIT 2 OFFSET 1 got %v", got)
+	}
+	if got := queryIDs(t, db, "SELECT id FROM t ORDER BY id OFFSET 1 LIMIT 2"); !eqInts(got, 2, 3) {
+		t.Errorf("OFFSET 1 LIMIT 2 got %v", got)
+	}
+	if got := queryIDs(t, db, "SELECT id FROM t ORDER BY id OFFSET 3"); !eqInts(got, 4, 5) {
+		t.Errorf("OFFSET 3 got %v", got)
+	}
+	// LIMIT 0 and an OFFSET past the end are empty (not errors); a huge LIMIT clamps.
+	if got := query(t, db, "SELECT id FROM t ORDER BY id LIMIT 0"); len(got) != 0 {
+		t.Errorf("LIMIT 0 got %v", got)
+	}
+	if got := query(t, db, "SELECT id FROM t ORDER BY id OFFSET 10"); len(got) != 0 {
+		t.Errorf("OFFSET 10 got %v", got)
+	}
+	if got := query(t, db, "SELECT id FROM t ORDER BY id LIMIT 100"); len(got) != 5 {
+		t.Errorf("LIMIT 100 got %v", got)
+	}
+}
+
+func TestLimitOffsetWindowReducesProducedCost(t *testing.T) {
+	// The slice runs before projection, so only windowed rows charge row_produced:
+	// 5 scanned + 2 produced = 7 (spec/design/cost.md §3).
+	db := limitDB(t)
+	out, err := Execute(db, "SELECT id FROM t ORDER BY id LIMIT 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Cost != 7 {
+		t.Errorf("cost got %d want 7", out.Cost)
+	}
+}
+
+func TestNegativeLimitAndOffsetTrapDistinctly(t *testing.T) {
+	db := setupT(t)
+	wantErr(t, db, "SELECT id FROM t LIMIT -1", "2201W")
+	wantErr(t, db, "SELECT id FROM t OFFSET -1", "2201X")
+}
+
+func TestDuplicateLimitOrOffsetIsSyntaxError(t *testing.T) {
+	db := setupT(t)
+	wantErr(t, db, "SELECT id FROM t LIMIT 1 LIMIT 2", "42601")
+	wantErr(t, db, "SELECT id FROM t OFFSET 1 OFFSET 2", "42601")
+}
+
 func TestOutOfRangeLiteralInComparisonTraps(t *testing.T) {
 	// Context-adaptive literal typing (spec/design/types.md §6): a literal that cannot be
 	// represented in the compared column's type is a type error (22003), not a silent

@@ -139,8 +139,9 @@ impl Parser {
         }
     }
 
-    /// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]`,
-    /// where `<items>` is `*` or a comma-separated list of column refs / CASTs.
+    /// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]
+    /// [LIMIT <count>] [OFFSET <count>]`, where `<items>` is `*` or a comma-separated
+    /// list of column refs / CASTs. LIMIT/OFFSET may appear in either order (§9).
     fn parse_select(&mut self) -> Result<Select> {
         self.expect_keyword("select")?;
         let items = self.parse_select_items()?;
@@ -169,12 +170,78 @@ impl Parser {
             None
         };
 
+        let (limit, offset) = self.parse_limit_offset()?;
+
         Ok(Select {
             items,
             from,
             filter,
             order_by,
+            limit,
+            offset,
         })
+    }
+
+    /// Parse an optional trailing `LIMIT <count>` and/or `OFFSET <count>` in either
+    /// order, each at most once (a repeat is a syntax error, 42601). Returns the
+    /// resolved non-negative counts (spec/grammar/grammar.ebnf `limit_offset`).
+    fn parse_limit_offset(&mut self) -> Result<(Option<i64>, Option<i64>)> {
+        let mut limit = None;
+        let mut offset = None;
+        loop {
+            match self.peek_keyword().as_deref() {
+                Some("limit") if limit.is_none() => {
+                    self.advance();
+                    limit = Some(self.parse_count(true)?);
+                }
+                Some("offset") if offset.is_none() => {
+                    self.advance();
+                    offset = Some(self.parse_count(false)?);
+                }
+                Some("limit") => return Err(syntax("duplicate LIMIT clause")),
+                Some("offset") => return Err(syntax("duplicate OFFSET clause")),
+                _ => break,
+            }
+        }
+        Ok((limit, offset))
+    }
+
+    /// A LIMIT/OFFSET count: a non-negative integer literal. The sign is folded as in
+    /// `parse_literal`; a negative value is rejected at parse time with 2201W (LIMIT) /
+    /// 2201X (OFFSET), and a positive magnitude over i64::MAX traps 22003 (the value -0
+    /// folds to 0 and is accepted). `is_limit` selects which structured error to raise.
+    fn parse_count(&mut self, is_limit: bool) -> Result<i64> {
+        let negate = if matches!(self.peek(), Token::Minus) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        match self.advance() {
+            Token::Int(m) => {
+                let signed = if negate { -(m as i128) } else { m as i128 };
+                if signed < 0 {
+                    let (state, what) = if is_limit {
+                        (SqlState::InvalidRowCountInLimitClause, "LIMIT")
+                    } else {
+                        (SqlState::InvalidRowCountInOffsetClause, "OFFSET")
+                    };
+                    return Err(EngineError::new(
+                        state,
+                        format!("{what} must not be negative"),
+                    ));
+                }
+                i64::try_from(signed).map_err(|_| {
+                    EngineError::new(
+                        SqlState::NumericValueOutOfRange,
+                        "value out of range: count exceeds the maximum signed 64-bit value",
+                    )
+                })
+            }
+            other => Err(syntax(format!(
+                "expected an integer count, found {other:?}"
+            ))),
+        }
     }
 
     /// `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.

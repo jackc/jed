@@ -1,0 +1,136 @@
+# LIMIT / OFFSET restrict and skip result rows (spec/design/grammar.md §9). LIMIT n caps the
+# result at n rows; OFFSET m skips the first m; together they skip m then take n. The two
+# clauses may appear in either order, each at most once. The slice runs AFTER ORDER BY and
+# BEFORE projection, so excluded rows are scanned + filtered but never produced — a CROSS-CORE
+# determinism contract pinned here with the `# cost:` directive (cost.md §3): a row beyond the
+# window charges storage_row_read + its filter ops but no row_produced/projection cost. The
+# count is a non-negative integer literal; a negative value is a deterministic parse-time data
+# error (2201W for LIMIT, 2201X for OFFSET) raised before any scan.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.limit, query.offset, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, val int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10)
+
+statement ok
+INSERT INTO t VALUES (2, 20)
+
+statement ok
+INSERT INTO t VALUES (3, 30)
+
+statement ok
+INSERT INTO t VALUES (4, 40)
+
+statement ok
+INSERT INTO t VALUES (5, 50)
+
+# LIMIT n returns the first n rows of the ordered result. 5 scanned + 2 produced = 7;
+# the 3 rows past the LIMIT are scanned but not produced.
+# names: id
+# cost: 7
+query I nosort
+SELECT id FROM t ORDER BY id LIMIT 2
+----
+1
+2
+
+# OFFSET m skips m rows, then LIMIT n takes the next n. 5 scanned + 2 produced = 7.
+# names: id
+# cost: 7
+query I nosort
+SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1
+----
+2
+3
+
+# The two clauses commute: OFFSET-before-LIMIT is the same window as LIMIT-before-OFFSET.
+# names: id
+# cost: 7
+query I nosort
+SELECT id FROM t ORDER BY id OFFSET 1 LIMIT 2
+----
+2
+3
+
+# OFFSET without LIMIT skips the leading rows and returns the rest. 5 scanned + 2 produced = 7.
+# names: id
+# cost: 7
+query I nosort
+SELECT id FROM t ORDER BY id OFFSET 3
+----
+4
+5
+
+# LIMIT 0 is valid and yields the empty result: 5 scanned + 0 produced = 5 (no row_produced).
+# names: id
+# cost: 5
+query I nosort
+SELECT id FROM t ORDER BY id LIMIT 0
+----
+
+# OFFSET past the end yields the empty result, still scanning every row: 5 + 0 = 5.
+# names: id
+# cost: 5
+query I nosort
+SELECT id FROM t ORDER BY id OFFSET 10
+----
+
+# A LIMIT larger than the row count returns every row (clamped, not an error): 5 + 5 = 10.
+# names: id
+# cost: 10
+query I nosort
+SELECT id FROM t ORDER BY id LIMIT 100
+----
+1
+2
+3
+4
+5
+
+# LIMIT after a WHERE + ORDER BY: the filter runs on every scanned row (one `>=` compare each,
+# even the rows the LIMIT later drops). 5 scanned + 5 filter + 2 produced = 12.
+# names: id
+# cost: 12
+query I nosort
+SELECT id FROM t WHERE id >= 2 ORDER BY id LIMIT 2
+----
+2
+3
+
+# LIMIT without ORDER BY is deterministic here because the scan is in primary-key order
+# (CLAUDE.md §10); ORDER BY is still the portable way to pin which rows a LIMIT returns.
+# names: id
+# cost: 7
+query I nosort
+SELECT id FROM t LIMIT 2
+----
+1
+2
+
+# LIMIT does not change output column naming: `*` still expands to canonical names. The single
+# windowed row is projected (id and val are leaves): 5 scanned + 1 produced = 6.
+# names: id, val
+# cost: 6
+query II nosort
+SELECT * FROM t ORDER BY id LIMIT 1
+----
+1
+10
+
+# A negative LIMIT is a data error, raised at parse time before any row is scanned (2201W).
+statement error 2201W
+SELECT id FROM t LIMIT -1
+
+# A negative OFFSET is the parallel error (2201X).
+statement error 2201X
+SELECT id FROM t OFFSET -1
+
+# Each clause may appear at most once: a duplicate LIMIT is a syntax error.
+statement error 42601
+SELECT id FROM t LIMIT 1 LIMIT 2
+
+# ... and likewise a duplicate OFFSET.
+statement error 42601
+SELECT id FROM t OFFSET 1 OFFSET 2

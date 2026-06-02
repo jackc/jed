@@ -66,6 +66,11 @@ pub struct Select {
     /// The WHERE expression (must resolve to boolean), if any.
     pub filter: Option<Expr>,
     pub order_by: Option<OrderBy>,
+    /// `LIMIT n` — cap the result at `n` rows (a non-negative count). Applied after
+    /// ORDER BY, before projection (spec/design/grammar.md §9).
+    pub limit: Option<i64>,
+    /// `OFFSET m` — skip the first `m` rows of the result (a non-negative count).
+    pub offset: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

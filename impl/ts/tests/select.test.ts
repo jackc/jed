@@ -78,6 +78,45 @@ test("SELECT * projects all columns in declaration order", () => {
   assert.deepStrictEqual(query(seed(), "SELECT * FROM t WHERE id = 3"), [["3", "30"]]);
 });
 
+function limitDB() {
+  return dbWith([
+    "CREATE TABLE t (id int32 PRIMARY KEY, v int32)",
+    "INSERT INTO t VALUES (1, 10)",
+    "INSERT INTO t VALUES (2, 20)",
+    "INSERT INTO t VALUES (3, 30)",
+    "INSERT INTO t VALUES (4, 40)",
+    "INSERT INTO t VALUES (5, 50)",
+  ]);
+}
+
+test("LIMIT caps and OFFSET skips; the two clauses commute", () => {
+  const db = limitDB();
+  assert.deepStrictEqual(query(db, "SELECT id FROM t ORDER BY id LIMIT 2"), [["1"], ["2"]]);
+  assert.deepStrictEqual(query(db, "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1"), [["2"], ["3"]]);
+  assert.deepStrictEqual(query(db, "SELECT id FROM t ORDER BY id OFFSET 1 LIMIT 2"), [["2"], ["3"]]);
+  assert.deepStrictEqual(query(db, "SELECT id FROM t ORDER BY id OFFSET 3"), [["4"], ["5"]]);
+  // LIMIT 0 and an OFFSET past the end are empty (not errors); a huge LIMIT clamps.
+  assert.deepStrictEqual(query(db, "SELECT id FROM t ORDER BY id LIMIT 0"), []);
+  assert.deepStrictEqual(query(db, "SELECT id FROM t ORDER BY id OFFSET 10"), []);
+  assert.equal(query(db, "SELECT id FROM t ORDER BY id LIMIT 100").length, 5);
+});
+
+test("LIMIT/OFFSET window reduces produced cost (slice before projection)", () => {
+  // 5 scanned + 2 produced = 7 (spec/design/cost.md §3).
+  const o = execute(limitDB(), "SELECT id FROM t ORDER BY id LIMIT 2");
+  assert.equal(o.cost, 7n);
+});
+
+test("a negative LIMIT traps 2201W and a negative OFFSET traps 2201X", () => {
+  assert.equal(errCode(() => execute(seed(), "SELECT id FROM t LIMIT -1")), "2201W");
+  assert.equal(errCode(() => execute(seed(), "SELECT id FROM t OFFSET -1")), "2201X");
+});
+
+test("a duplicate LIMIT or OFFSET clause is a syntax error 42601", () => {
+  assert.equal(errCode(() => execute(seed(), "SELECT id FROM t LIMIT 1 LIMIT 2")), "42601");
+  assert.equal(errCode(() => execute(seed(), "SELECT id FROM t OFFSET 1 OFFSET 2")), "42601");
+});
+
 test("unknown column traps 42703", () => {
   assert.equal(errCode(() => execute(seed(), "SELECT nope FROM t")), "42703");
 });

@@ -15,6 +15,10 @@ const (
 	NumericValueOutOfRange SqlState = iota
 	// DivisionByZero is 22012 — division or modulo by zero.
 	DivisionByZero
+	// InvalidRowCountInLimitClause is 2201W — a negative LIMIT count.
+	InvalidRowCountInLimitClause
+	// InvalidRowCountInOffsetClause is 2201X — a negative OFFSET count.
+	InvalidRowCountInOffsetClause
 	// NotNullViolation is 23502 — not-null constraint violation.
 	NotNullViolation
 	// UniqueViolation is 23505 — unique (primary key) constraint violation.
@@ -48,6 +52,10 @@ func (s SqlState) Code() string {
 		return "22003"
 	case DivisionByZero:
 		return "22012"
+	case InvalidRowCountInLimitClause:
+		return "2201W"
+	case InvalidRowCountInOffsetClause:
+		return "2201X"
 	case NotNullViolation:
 		return "23502"
 	case UniqueViolation:

@@ -81,13 +81,17 @@ export type CreateTable = {
 // Insert is an INSERT ... VALUES with one row of literals, in column order.
 export type Insert = { kind: "insert"; table: string; values: Literal[] };
 
-// Select is a single-table SELECT.
+// Select is a single-table SELECT. limit caps the result at `limit` rows; offset skips
+// the first `offset` rows. Both are non-negative counts, applied after ORDER BY, before
+// projection (grammar.md §9); null means the clause is absent.
 export type Select = {
   kind: "select";
   items: SelectItems;
   from: string;
   filter: Expr | null;
   orderBy: OrderBy | null;
+  limit: bigint | null;
+  offset: bigint | null;
 };
 
 // Update is `UPDATE <table> SET ... [WHERE ...]`. Assigning a PRIMARY KEY column is

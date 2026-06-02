@@ -31,6 +31,18 @@ name = "division_by_zero"
 class = "data exception"
 template = "division by zero"
 
+[[error]]
+code = "2201W"
+name = "invalid_row_count_in_limit_clause"
+class = "data exception"
+template = "LIMIT must not be negative"
+
+[[error]]
+code = "2201X"
+name = "invalid_row_count_in_offset_clause"
+class = "data exception"
+template = "OFFSET must not be negative"
+
 # --- integrity constraint violation (class 23) ------------------------------
 [[error]]
 code = "23502"

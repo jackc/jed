@@ -63,6 +63,11 @@ type Select struct {
 	From    string
 	Filter  *Expr
 	OrderBy *OrderBy
+	// Limit caps the result at Limit rows; Offset skips the first Offset rows. Both are
+	// non-negative counts, applied after ORDER BY, before projection (grammar.md §9). A
+	// nil pointer means the clause is absent.
+	Limit  *int64
+	Offset *int64
 }
 
 // SelectItems is either all columns (*) or a list of projected expressions.

@@ -14,6 +14,10 @@ pub enum SqlState {
     NumericValueOutOfRange,
     /// 22012 — division (or modulo) by zero.
     DivisionByZero,
+    /// 2201W — invalid row count in a LIMIT clause (a negative LIMIT).
+    InvalidRowCountInLimitClause,
+    /// 2201X — invalid row count in an OFFSET clause (a negative OFFSET).
+    InvalidRowCountInOffsetClause,
     /// 23502 — not-null constraint violation.
     NotNullViolation,
     /// 23505 — unique (primary key) constraint violation.
@@ -45,6 +49,8 @@ impl SqlState {
         match self {
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::DivisionByZero => "22012",
+            SqlState::InvalidRowCountInLimitClause => "2201W",
+            SqlState::InvalidRowCountInOffsetClause => "2201X",
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
             SqlState::SyntaxError => "42601",

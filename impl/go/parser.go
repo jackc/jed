@@ -234,8 +234,9 @@ func (p *Parser) parseLiteral() (Literal, error) {
 }
 
 // parseSelect parses
-// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]`,
-// where <items> is `*` or a comma-separated list of column refs / CASTs.
+// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]
+// [LIMIT <count>] [OFFSET <count>]`, where <items> is `*` or a comma-separated list of
+// column refs / CASTs. LIMIT/OFFSET may appear in either order (§9).
 func (p *Parser) parseSelect() (*Select, error) {
 	if err := p.expectKeyword("select"); err != nil {
 		return nil, err
@@ -280,7 +281,71 @@ func (p *Parser) parseSelect() (*Select, error) {
 		sel.OrderBy = &OrderBy{Column: col, Descending: descending}
 	}
 
+	if err := p.parseLimitOffset(sel); err != nil {
+		return nil, err
+	}
+
 	return sel, nil
+}
+
+// parseLimitOffset parses an optional trailing `LIMIT <count>` and/or `OFFSET <count>`
+// in either order, each at most once (a repeat is a syntax error, 42601), setting the
+// resolved non-negative counts on sel (spec/grammar/grammar.ebnf `limit_offset`).
+func (p *Parser) parseLimitOffset(sel *Select) error {
+	for {
+		switch p.peekKeyword() {
+		case "limit":
+			if sel.Limit != nil {
+				return NewError(SyntaxError, "duplicate LIMIT clause")
+			}
+			p.advance()
+			n, err := p.parseCount(true)
+			if err != nil {
+				return err
+			}
+			sel.Limit = &n
+		case "offset":
+			if sel.Offset != nil {
+				return NewError(SyntaxError, "duplicate OFFSET clause")
+			}
+			p.advance()
+			n, err := p.parseCount(false)
+			if err != nil {
+				return err
+			}
+			sel.Offset = &n
+		default:
+			return nil
+		}
+	}
+}
+
+// parseCount parses a LIMIT/OFFSET count: a non-negative integer literal. The sign is
+// folded as in parseLiteral; a negative value is rejected with 2201W (LIMIT) / 2201X
+// (OFFSET), and a magnitude over int64's max traps 22003 (the value -0 folds to 0 and is
+// accepted). isLimit selects which structured error to raise.
+func (p *Parser) parseCount(isLimit bool) (int64, error) {
+	negate := false
+	if p.peek().Kind == TokMinus {
+		p.advance()
+		negate = true
+	}
+	t := p.advance()
+	if t.Kind != TokInt {
+		return 0, NewError(SyntaxError, "expected an integer count")
+	}
+	v, ok := foldInt(t.Int, negate)
+	if !ok {
+		return 0, NewError(NumericValueOutOfRange,
+			"value out of range: count exceeds the maximum signed 64-bit value")
+	}
+	if v < 0 {
+		if isLimit {
+			return 0, NewError(InvalidRowCountInLimitClause, "LIMIT must not be negative")
+		}
+		return 0, NewError(InvalidRowCountInOffsetClause, "OFFSET must not be negative")
+	}
+	return v, nil
 }
 
 // parseUpdate parses
