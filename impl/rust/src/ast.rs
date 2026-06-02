@@ -65,7 +65,9 @@ pub struct Select {
     pub from: String,
     /// The WHERE expression (must resolve to boolean), if any.
     pub filter: Option<Expr>,
-    pub order_by: Option<OrderBy>,
+    /// ORDER BY sort keys, applied left to right; empty means no ORDER BY
+    /// (spec/design/grammar.md §10).
+    pub order_by: Vec<OrderKey>,
     /// `LIMIT n` — cap the result at `n` rows (a non-negative count). Applied after
     /// ORDER BY, before projection (spec/design/grammar.md §9).
     pub limit: Option<i64>,
@@ -153,11 +155,16 @@ pub enum BinaryOp {
     Or,
 }
 
+/// One ORDER BY sort key: a bare table column, a sort direction, and a resolved NULL
+/// placement. `nulls_first` is resolved at parse time — an explicit `NULLS FIRST|LAST`,
+/// else the direction default (`!descending`: ASC → first, DESC → last) — so the executor
+/// never re-derives it. Placement is applied independently of the `descending` value flip
+/// (spec/design/grammar.md §10).
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct OrderBy {
+pub struct OrderKey {
     pub column: String,
-    // Step-1 corpus uses ascending only; direction reserved for later.
     pub descending: bool,
+    pub nulls_first: bool,
 }
 
 /// A literal value as written in SQL.

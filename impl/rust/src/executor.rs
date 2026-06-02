@@ -399,19 +399,19 @@ impl Database {
             None => None,
         };
 
-        // Resolve the optional ORDER BY column.
-        let order = match &sel.order_by {
-            Some(ob) => {
-                let idx = table.column_index(&ob.column).ok_or_else(|| {
-                    EngineError::new(
-                        SqlState::UndefinedColumn,
-                        format!("column does not exist: {}", ob.column),
-                    )
-                })?;
-                Some((idx, ob.descending))
-            }
-            None => None,
-        };
+        // Resolve each ORDER BY key to (column index, descending, nulls_first). An unknown
+        // column is the existing UndefinedColumn (42703); nulls_first was resolved at parse
+        // time (explicit clause, else the direction default).
+        let mut order: Vec<(usize, bool, bool)> = Vec::with_capacity(sel.order_by.len());
+        for key in &sel.order_by {
+            let idx = table.column_index(&key.column).ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedColumn,
+                    format!("column does not exist: {}", key.column),
+                )
+            })?;
+            order.push((idx, key.descending, key.nulls_first));
+        }
 
         // Scan in primary-key order (the order-preserving encoding makes this the
         // logical key order), then filter. A WHERE arithmetic can trap (22003/22012),
@@ -431,13 +431,19 @@ impl Database {
             }
         }
 
-        // ORDER BY: a stable sort by the key column's value. NULLs sort first in
-        // ascending order (spec/design/encoding.md §4); descending reverses, NULLs
-        // last.
-        if let Some((idx, descending)) = order {
+        // ORDER BY: a stable sort applying each key left to right — the first non-equal key
+        // decides, and a full tie keeps the primary-key scan order (the sort is stable).
+        // Each key's NULL placement is decoupled from its value-direction flip, so an
+        // explicit NULLS FIRST|LAST overrides the default (spec/design/grammar.md §10).
+        if !order.is_empty() {
             rows.sort_by(|a, b| {
-                let ord = null_first_cmp(a[idx], b[idx]);
-                if descending { ord.reverse() } else { ord }
+                for &(idx, descending, nulls_first) in &order {
+                    let ord = key_cmp(a[idx], b[idx], descending, nulls_first);
+                    if ord.is_ne() {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
             });
         }
 
@@ -1082,19 +1088,47 @@ fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> 
     }
 }
 
-/// Total order over values for ORDER BY with NULLs sorting first (ascending),
-/// matching the key encoding's physical order (spec/design/encoding.md §4). ORDER BY
-/// is over a (always-integer) column this slice, so the boolean arms are not reached
-/// from SELECT, but the order is defined (false < true) for totality.
-fn null_first_cmp(a: Value, b: Value) -> std::cmp::Ordering {
+/// One ORDER BY key's total-order comparison. NULL placement is governed by `nulls_first`
+/// and applied INDEPENDENTLY of the value-direction flip (`descending`), so an explicit
+/// `NULLS FIRST|LAST` overrides the direction default (spec/design/grammar.md §10). The
+/// physical key order ratifies NULL as the smallest value, which surfaces as the parse-time
+/// default `nulls_first = !descending` (ASC → first, DESC → last).
+fn key_cmp(a: Value, b: Value, descending: bool, nulls_first: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Less,
-        (_, Value::Null) => Ordering::Greater,
+        (Value::Null, _) => {
+            if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (_, Value::Null) => {
+            if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        _ => {
+            let base = value_cmp(a, b);
+            if descending { base.reverse() } else { base }
+        }
+    }
+}
+
+/// Total order over NON-NULL values: signed-integer ascending. The boolean arms (false <
+/// true, and boolean < integer) are kept only for totality — ORDER BY is over an integer
+/// column this slice, so they are unreachable from SELECT. NULLs are handled by `key_cmp`
+/// before this is reached.
+fn value_cmp(a: Value, b: Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(&y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(&y),
         (Value::Bool(_), Value::Int(_)) => Ordering::Less,
         (Value::Int(_), Value::Bool(_)) => Ordering::Greater,
+        (Value::Null, _) | (_, Value::Null) => Ordering::Equal,
     }
 }

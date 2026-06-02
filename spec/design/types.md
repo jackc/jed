@@ -111,9 +111,13 @@ in the physical total order is now **ratified** (it was deferred to the key-enco
 **NULLs sort first** (before every present value) in ascending order, via a leading `0x00`
 presence tag on a nullable key slot; descending inverts this (NULLs last). See
 [encoding.md §4](encoding.md) and `null_ordering` in
-[../types/compare.toml](../types/compare.toml). A SQL-level `ORDER BY ... NULLS
-FIRST|LAST` override is a separate, later feature that layers on top of this physical
-order.
+[../types/compare.toml](../types/compare.toml). The SQL-level `ORDER BY ... NULLS
+FIRST|LAST` override now **layers on top of** this physical order (grammar.md §10): with no
+explicit clause a key's default NULL placement *follows the physical order* — `ASC` → NULLs
+first, `DESC` → NULLs last — so a plain `ORDER BY col` mirrors index-iteration order. Because
+NULL is the smallest value, this is the **SQLite** model and a deliberate **divergence from
+PostgreSQL** (where NULL is the largest, so PG defaults `ASC` to NULLs last); an explicit
+`NULLS FIRST|LAST` overrides the default regardless of direction.
 
 ## 5. Coercion / casts
 

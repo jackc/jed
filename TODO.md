@@ -147,8 +147,20 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       [manifest.toml](spec/conformance/manifest.toml), all three cores in lockstep, pinned by
       [spec/conformance/suites/query/limit_offset.test](spec/conformance/suites/query/limit_offset.test).
       _(size: S)_
-- [ ] **Richer `ORDER BY`** — multiple keys, per-key `ASC`/`DESC`, `NULLS FIRST|LAST`
-      (the physical NULLs-first order is ratified; this is the SQL-level override, types.md §4).
+- [x] **Richer `ORDER BY`** — multiple keys, per-key `ASC`/`DESC`, `NULLS FIRST|LAST`. Done:
+      `order_by` is now `sort_key ("," sort_key)*` with each key a **bare column** (ordinal /
+      expression / alias keys still deferred), an optional direction, and an optional
+      `NULLS FIRST|LAST`. The per-key comparator **decouples** NULL placement from the
+      value-direction flip, so an explicit `NULLS FIRST|LAST` overrides regardless of
+      direction; with no clause the default **follows the ratified physical order** —
+      `ASC` → NULLs first, `DESC` → NULLs last (NULL = smallest, the SQLite model, a deliberate
+      **divergence from PostgreSQL**), resolved at parse time. The sort stays **unmetered**
+      (cost.md §3), so the `# cost:` math is unchanged. Authored in
+      [grammar.ebnf](spec/grammar/grammar.ebnf) (`order_by` / `sort_key`) +
+      [grammar.md §10](spec/design/grammar.md), [types.md §4](spec/design/types.md), the new
+      `query.order_by_keys` capability in [manifest.toml](spec/conformance/manifest.toml), all
+      three cores in lockstep, pinned by
+      [spec/conformance/suites/query/order_by.test](spec/conformance/suites/query/order_by.test).
       _(size: M)_
 - [ ] **`DISTINCT`.** _(size: S–M)_
 - [ ] **Predicate forms** — `IN (list)`, `BETWEEN`, `LIKE` (text-dependent), `CASE`

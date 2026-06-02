@@ -1,0 +1,173 @@
+# Richer ORDER BY (spec/design/grammar.md §10): multiple sort keys, per-key ASC/DESC, and
+# per-key NULLS FIRST|LAST. Keys are bare table columns, applied left to right (first key
+# primary, later keys break ties, a full tie keeps the primary-key scan order via a STABLE
+# sort). NULL placement is a CROSS-CORE determinism contract (CLAUDE.md §8): the physical key
+# order ratifies NULL as the SMALLEST value (types.md §4), so a key with no NULLS clause
+# defaults to ASC => NULLS FIRST, DESC => NULLS LAST — the SQLite model, a deliberate
+# DIVERGENCE from PostgreSQL (where NULL is largest, ASC => NULLS LAST). An explicit NULLS
+# FIRST|LAST overrides that default regardless of direction. The sort is unmetered (cost.md
+# §3): cost = storage_row_read per scanned row + row_produced per produced row (+ filter
+# operator_eval); multi-key/NULLS placement adds nothing.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.order_by_keys, query.comparison_order, query.limit, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+
+# Deliberate ties in `a` (rows 1,2,4 all have a=10) and NULLs in both `a` (row 5) and `b`
+# (row 2) to exercise secondary keys, stable tie-breaking, and NULL placement.
+statement ok
+INSERT INTO t VALUES (1, 10, 5)
+
+statement ok
+INSERT INTO t VALUES (2, 10, NULL)
+
+statement ok
+INSERT INTO t VALUES (3, 20, 7)
+
+statement ok
+INSERT INTO t VALUES (4, 10, 5)
+
+statement ok
+INSERT INTO t VALUES (5, NULL, 9)
+
+# ASC with no NULLS clause defaults to NULLS FIRST (NULL is the smallest value): row 5 (a NULL)
+# leads, then the a=10 group in stable scan order, then a=20. 5 scanned + 5 produced = 10.
+# names: a
+# cost: 10
+query I nosort
+SELECT a FROM t ORDER BY a
+----
+NULL
+10
+10
+10
+20
+
+# DESC with no NULLS clause defaults to NULLS LAST (descending inverts the physical order):
+# a=20, then the a=10 group, then NULL last. Pins the PostgreSQL divergence. 5 + 5 = 10.
+# names: a
+# cost: 10
+query I nosort
+SELECT a FROM t ORDER BY a DESC
+----
+20
+10
+10
+10
+NULL
+
+# Explicit NULLS FIRST overrides the DESC default: NULL leads while the non-NULL values stay
+# descending — the case that fails if NULL placement is not decoupled from the direction
+# reversal (grammar.md §10). 5 + 5 = 10.
+# names: a
+# cost: 10
+query I nosort
+SELECT a FROM t ORDER BY a DESC NULLS FIRST
+----
+NULL
+20
+10
+10
+10
+
+# Explicit NULLS LAST overrides the ASC default (which would be FIRST): the non-NULL values
+# stay ascending and NULL goes last. 5 + 5 = 10.
+# names: a
+# cost: 10
+query I nosort
+SELECT a FROM t ORDER BY a ASC NULLS LAST
+----
+10
+10
+10
+20
+NULL
+
+# Two keys, mixed direction: primary `a` ASC (NULLs first by default), ties broken by `id`
+# DESC. Row 5 (a NULL) first; within a=10 the ids descend (4,2,1). 5 + 5 = 10.
+# names: id, a
+# cost: 10
+query II nosort
+SELECT id, a FROM t ORDER BY a ASC, id DESC
+----
+5
+NULL
+4
+10
+2
+10
+1
+10
+3
+20
+
+# Two keys, secondary NULLS override: `a` ASC, then `b` ASC NULLS LAST. Within a=10 the b
+# values are 5 (id1), NULL (id2), 5 (id4); NULLS LAST puts id2 after the two b=5 rows, which
+# keep stable scan order (id1 before id4). 5 + 5 = 10.
+# names: id, a, b
+# cost: 10
+query III nosort
+SELECT id, a, b FROM t ORDER BY a ASC, b ASC NULLS LAST
+----
+5
+NULL
+9
+1
+10
+5
+4
+10
+5
+2
+10
+NULL
+3
+20
+7
+
+# A full tie across every key keeps the primary-key scan order (stable sort): ordering by the
+# constant-after-filter `b` alone leaves the two b=5 rows in id order. WHERE keeps rows 1 and
+# 4 (b=5). 5 scanned + 5 filter + 2 produced = 12.
+# names: id
+# cost: 12
+query I nosort
+SELECT id FROM t WHERE b = 5 ORDER BY b
+----
+1
+4
+
+# Multi-key sort under WHERE + LIMIT: the filter runs on every scanned row, the sort orders the
+# survivors, and LIMIT windows AFTER the sort (excluded rows still pay scan + filter but no
+# produce). WHERE a >= 10 drops row 5 (NULL >= 10 is unknown). Survivors ordered by a DESC then
+# id ASC are 3,1,2,4; LIMIT 2 keeps 3,1. 5 scanned + 5 filter + 2 produced = 12.
+# names: id
+# cost: 12
+query I nosort
+SELECT id FROM t WHERE a >= 10 ORDER BY a DESC, id ASC LIMIT 2
+----
+3
+1
+
+# NULLS must be followed by FIRST or LAST — a bare trailing NULLS is a syntax error.
+statement error 42601
+SELECT a FROM t ORDER BY a NULLS
+
+# ... and an unknown NULLS placement keyword likewise.
+statement error 42601
+SELECT a FROM t ORDER BY a NULLS MIDDLE
+
+# A trailing comma with no following sort key is a syntax error.
+statement error 42601
+SELECT a FROM t ORDER BY a,
+
+# An ordinal sort key (ORDER BY 1) is out of scope: a key must be a column identifier.
+statement error 42601
+SELECT a FROM t ORDER BY 1
+
+# An expression sort key (ORDER BY a + 1) is out of scope for the same reason.
+statement error 42601
+SELECT a FROM t ORDER BY a + 1
+
+# An ORDER BY key that names no column is an undefined-column error, reusing the existing path.
+statement error 42703
+SELECT a FROM t ORDER BY nope

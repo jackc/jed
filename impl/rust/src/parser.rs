@@ -5,7 +5,7 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, Expr, Insert, Literal, OrderBy, Select,
+    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, Expr, Insert, Literal, OrderKey, Select,
     SelectItem, SelectItems, Statement, UnaryOp, Update,
 };
 use crate::error::{EngineError, Result, SqlState};
@@ -139,7 +139,7 @@ impl Parser {
         }
     }
 
-    /// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]
+    /// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <key> [, <key>]*]
     /// [LIMIT <count>] [OFFSET <count>]`, where `<items>` is `*` or a comma-separated
     /// list of column refs / CASTs. LIMIT/OFFSET may appear in either order (§9).
     fn parse_select(&mut self) -> Result<Select> {
@@ -150,9 +150,33 @@ impl Parser {
 
         let filter = self.parse_optional_where()?;
 
-        let order_by = if self.peek_keyword().as_deref() == Some("order") {
-            self.advance();
-            self.expect_keyword("by")?;
+        let order_by = self.parse_order_by()?;
+
+        let (limit, offset) = self.parse_limit_offset()?;
+
+        Ok(Select {
+            items,
+            from,
+            filter,
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
+    /// Parse an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare column with
+    /// an optional `ASC`/`DESC` and an optional `NULLS FIRST|LAST`. `nulls_first` is resolved
+    /// here: explicit if given, else the direction default (ASC → first, DESC → last). A bare
+    /// `NULLS` not followed by `FIRST`/`LAST` is a syntax error (42601). Returns an empty vec
+    /// when there is no ORDER BY (spec/grammar/grammar.ebnf `order_by`).
+    fn parse_order_by(&mut self) -> Result<Vec<OrderKey>> {
+        let mut keys = Vec::new();
+        if self.peek_keyword().as_deref() != Some("order") {
+            return Ok(keys);
+        }
+        self.advance();
+        self.expect_keyword("by")?;
+        loop {
             let column = self.expect_identifier()?;
             let descending = match self.peek_keyword().as_deref() {
                 Some("asc") => {
@@ -165,21 +189,39 @@ impl Parser {
                 }
                 _ => false,
             };
-            Some(OrderBy { column, descending })
-        } else {
-            None
-        };
-
-        let (limit, offset) = self.parse_limit_offset()?;
-
-        Ok(Select {
-            items,
-            from,
-            filter,
-            order_by,
-            limit,
-            offset,
-        })
+            let nulls_first = if self.peek_keyword().as_deref() == Some("nulls") {
+                self.advance();
+                match self.peek_keyword().as_deref() {
+                    Some("first") => {
+                        self.advance();
+                        true
+                    }
+                    Some("last") => {
+                        self.advance();
+                        false
+                    }
+                    other => {
+                        return Err(syntax(format!(
+                            "NULLS must be followed by FIRST or LAST, found {other:?}"
+                        )));
+                    }
+                }
+            } else {
+                // No explicit clause: default follows direction (grammar.md §10).
+                !descending
+            };
+            keys.push(OrderKey {
+                column,
+                descending,
+                nulls_first,
+            });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(keys)
     }
 
     /// Parse an optional trailing `LIMIT <count>` and/or `OFFSET <count>` in either

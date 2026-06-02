@@ -234,7 +234,7 @@ func (p *Parser) parseLiteral() (Literal, error) {
 }
 
 // parseSelect parses
-// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]
+// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <key> [, <key>]*]
 // [LIMIT <count>] [OFFSET <count>]`, where <items> is `*` or a comma-separated list of
 // column refs / CASTs. LIMIT/OFFSET may appear in either order (§9).
 func (p *Parser) parseSelect() (*Select, error) {
@@ -261,14 +261,34 @@ func (p *Parser) parseSelect() (*Select, error) {
 	}
 	sel.Filter = filter
 
-	if p.peekKeyword() == "order" {
-		p.advance()
-		if err := p.expectKeyword("by"); err != nil {
-			return nil, err
-		}
+	if err := p.parseOrderBy(sel); err != nil {
+		return nil, err
+	}
+
+	if err := p.parseLimitOffset(sel); err != nil {
+		return nil, err
+	}
+
+	return sel, nil
+}
+
+// parseOrderBy parses an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare
+// column with an optional ASC/DESC and an optional NULLS FIRST|LAST, setting the keys on
+// sel. NullsFirst is resolved here: explicit if given, else the direction default (ASC ->
+// first, DESC -> last). A bare NULLS not followed by FIRST/LAST is a syntax error (42601).
+// Leaves sel.OrderBy nil when there is no ORDER BY (spec/grammar/grammar.ebnf `order_by`).
+func (p *Parser) parseOrderBy(sel *Select) error {
+	if p.peekKeyword() != "order" {
+		return nil
+	}
+	p.advance()
+	if err := p.expectKeyword("by"); err != nil {
+		return err
+	}
+	for {
 		col, err := p.expectIdentifier()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		descending := false
 		switch p.peekKeyword() {
@@ -278,14 +298,28 @@ func (p *Parser) parseSelect() (*Select, error) {
 			p.advance()
 			descending = true
 		}
-		sel.OrderBy = &OrderBy{Column: col, Descending: descending}
+		nullsFirst := !descending // default follows direction (grammar.md §10)
+		if p.peekKeyword() == "nulls" {
+			p.advance()
+			switch p.peekKeyword() {
+			case "first":
+				p.advance()
+				nullsFirst = true
+			case "last":
+				p.advance()
+				nullsFirst = false
+			default:
+				return NewError(SyntaxError, "NULLS must be followed by FIRST or LAST")
+			}
+		}
+		sel.OrderBy = append(sel.OrderBy, OrderKey{Column: col, Descending: descending, NullsFirst: nullsFirst})
+		if p.peek().Kind == TokComma {
+			p.advance()
+			continue
+		}
+		break
 	}
-
-	if err := p.parseLimitOffset(sel); err != nil {
-		return nil, err
-	}
-
-	return sel, nil
+	return nil
 }
 
 // parseLimitOffset parses an optional trailing `LIMIT <count>` and/or `OFFSET <count>`

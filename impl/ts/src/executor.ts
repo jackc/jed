@@ -310,14 +310,16 @@ export class Database {
     const { nodes: projections, names: columnNames } = resolveProjections(table, sel.items);
     const filter = sel.filter ? resolveBooleanFilter(table, sel.filter) : null;
 
-    let orderIdx = -1;
-    let orderDesc = false;
-    if (sel.orderBy) {
-      orderIdx = columnIndex(table, sel.orderBy.column);
-      if (orderIdx < 0) {
-        throw engineError("undefined_column", "column does not exist: " + sel.orderBy.column);
+    // Resolve each ORDER BY key to (column index, descending, nullsFirst). An unknown column
+    // is the existing undefined_column (42703); nullsFirst was resolved at parse time (explicit
+    // clause, else the direction default).
+    const order: { idx: number; descending: boolean; nullsFirst: boolean }[] = [];
+    for (const key of sel.orderBy) {
+      const idx = columnIndex(table, key.column);
+      if (idx < 0) {
+        throw engineError("undefined_column", "column does not exist: " + key.column);
       }
-      orderDesc = sel.orderBy.descending;
+      order.push({ idx, descending: key.descending, nullsFirst: key.nullsFirst });
     }
 
     // Scan in primary-key order, then filter. A WHERE arithmetic can throw
@@ -331,14 +333,17 @@ export class Database {
       if (filter === null || isTrue(evalExpr(filter, row, meter))) rows.push(row);
     }
 
-    // ORDER BY: stable sort by the key column's value, NULLs first ascending
-    // (spec/design/encoding.md §4); descending reverses, NULLs last. JS Array#sort is
-    // stable, matching Go's SliceStable.
-    if (orderIdx >= 0) {
-      const oi = orderIdx;
+    // ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
+    // and a full tie keeps the primary-key scan order (JS Array#sort is stable, matching Go's
+    // SliceStable). Each key's NULL placement is decoupled from its value-direction flip, so an
+    // explicit NULLS FIRST|LAST overrides the default (spec/design/grammar.md §10).
+    if (order.length > 0) {
       rows.sort((a, b) => {
-        const c = nullFirstCmp(a[oi]!, b[oi]!);
-        return orderDesc ? -c : c;
+        for (const key of order) {
+          const c = keyCmp(a[key.idx]!, b[key.idx]!, key.descending, key.nullsFirst);
+          if (c !== 0) return c;
+        }
+        return 0;
       });
     }
 
@@ -763,14 +768,23 @@ function or3(a: "true" | "false" | "unknown", b: "true" | "false" | "unknown"): 
   return "false";
 }
 
-// nullFirstCmp is a total order for ORDER BY with NULLs first (ascending), matching the
-// key encoding's physical order (spec/design/encoding.md §4). Returns <0, 0, >0. ORDER
-// BY is over an (always-integer) column this slice, so the boolean ordering is defined
-// (false < true) only for totality.
-function nullFirstCmp(a: Value, b: Value): number {
+// keyCmp is one ORDER BY key's total-order comparison, returning <0, 0, >0. NULL placement
+// is governed by nullsFirst and applied INDEPENDENTLY of the value-direction flip
+// (descending), so an explicit NULLS FIRST|LAST overrides the direction default
+// (spec/design/grammar.md §10). The physical key order ratifies NULL as the smallest value,
+// which surfaces as the parse-time default nullsFirst = !descending.
+function keyCmp(a: Value, b: Value, descending: boolean, nullsFirst: boolean): number {
   if (a.kind === "null" && b.kind === "null") return 0;
-  if (a.kind === "null") return -1;
-  if (b.kind === "null") return 1;
+  if (a.kind === "null") return nullsFirst ? -1 : 1;
+  if (b.kind === "null") return nullsFirst ? 1 : -1;
+  const base = valueCmp(a, b);
+  return descending ? -base : base;
+}
+
+// valueCmp is the total order over NON-NULL values: signed-integer ascending, with the
+// boolean ordering (false < true) defined only for totality — ORDER BY is over an integer
+// column this slice. NULLs are handled by keyCmp before this is reached. Returns <0, 0, >0.
+function valueCmp(a: Value, b: Value): number {
   const x = orderKey(a);
   const y = orderKey(b);
   if (x < y) return -1;

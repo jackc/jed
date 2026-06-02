@@ -59,10 +59,12 @@ type Delete struct {
 // Select is a single-table SELECT. Filter (the WHERE expression) must resolve to
 // boolean.
 type Select struct {
-	Items   SelectItems
-	From    string
-	Filter  *Expr
-	OrderBy *OrderBy
+	Items  SelectItems
+	From   string
+	Filter *Expr
+	// OrderBy holds the ORDER BY sort keys, applied left to right; nil/empty means no
+	// ORDER BY (spec/design/grammar.md §10).
+	OrderBy []OrderKey
 	// Limit caps the result at Limit rows; Offset skips the first Offset rows. Both are
 	// non-negative counts, applied after ORDER BY, before projection (grammar.md §9). A
 	// nil pointer means the clause is absent.
@@ -198,11 +200,14 @@ type IsDistinctExpr struct {
 	Negated bool
 }
 
-// OrderBy is an ORDER BY clause. Step-1 corpus uses ascending only; Descending is
-// reserved for later.
-type OrderBy struct {
+// OrderKey is one ORDER BY sort key: a bare table column, a sort direction, and a resolved
+// NULL placement. NullsFirst is resolved at parse time — an explicit NULLS FIRST|LAST, else
+// the direction default (!Descending: ASC -> first, DESC -> last) — and is applied
+// independently of the Descending value flip (spec/design/grammar.md §10).
+type OrderKey struct {
 	Column     string
 	Descending bool
+	NullsFirst bool
 }
 
 // LiteralKind distinguishes the literal forms.

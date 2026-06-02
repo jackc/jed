@@ -10,7 +10,7 @@ import type {
   Expr,
   Insert,
   Literal,
-  OrderBy,
+  OrderKey,
   Select,
   SelectItem,
   SelectItems,
@@ -162,7 +162,7 @@ class Parser {
   }
 
   // parseSelect parses
-  // `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <col> [ASC|DESC]]
+  // `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <key> [, <key>]*]
   // [LIMIT <count>] [OFFSET <count>]`. LIMIT/OFFSET may appear in either order (§9).
   private parseSelect(): Select {
     this.expectKeyword("select");
@@ -172,20 +172,7 @@ class Parser {
 
     const filter = this.parseOptionalWhere();
 
-    let orderBy: OrderBy | null = null;
-    if (this.peekKeyword() === "order") {
-      this.advance();
-      this.expectKeyword("by");
-      const column = this.expectIdentifier();
-      let descending = false;
-      if (this.peekKeyword() === "asc") {
-        this.advance();
-      } else if (this.peekKeyword() === "desc") {
-        this.advance();
-        descending = true;
-      }
-      orderBy = { column, descending };
-    }
+    const orderBy = this.parseOrderBy();
 
     let limit: bigint | null = null;
     let offset: bigint | null = null;
@@ -205,6 +192,48 @@ class Parser {
     }
 
     return { kind: "select", items, from, filter, orderBy, limit, offset };
+  }
+
+  // parseOrderBy parses an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare
+  // column with an optional ASC/DESC and an optional NULLS FIRST|LAST. nullsFirst is resolved
+  // here: explicit if given, else the direction default (ASC -> first, DESC -> last). A bare
+  // NULLS not followed by FIRST/LAST is a syntax error (42601). Returns [] when there is no
+  // ORDER BY (spec/grammar/grammar.ebnf `order_by`).
+  private parseOrderBy(): OrderKey[] {
+    const keys: OrderKey[] = [];
+    if (this.peekKeyword() !== "order") return keys;
+    this.advance();
+    this.expectKeyword("by");
+    for (;;) {
+      const column = this.expectIdentifier();
+      let descending = false;
+      if (this.peekKeyword() === "asc") {
+        this.advance();
+      } else if (this.peekKeyword() === "desc") {
+        this.advance();
+        descending = true;
+      }
+      let nullsFirst = !descending; // default follows direction (grammar.md §10)
+      if (this.peekKeyword() === "nulls") {
+        this.advance();
+        if (this.peekKeyword() === "first") {
+          this.advance();
+          nullsFirst = true;
+        } else if (this.peekKeyword() === "last") {
+          this.advance();
+          nullsFirst = false;
+        } else {
+          throw engineError("syntax_error", "NULLS must be followed by FIRST or LAST");
+        }
+      }
+      keys.push({ column, descending, nullsFirst });
+      if (this.peek().kind === "comma") {
+        this.advance();
+        continue;
+      }
+      break;
+    }
+    return keys;
   }
 
   // parseCount parses a LIMIT/OFFSET count: a non-negative integer literal. The sign is

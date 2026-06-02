@@ -27,6 +27,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.comparison_order",
   "query.is_null",
   "query.order_by",
+  // Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).
+  "query.order_by_keys",
   // Select-list output naming: SELECT *, AS aliases, and the ?column? rule (grammar.md §8).
   "query.select_star",
   "query.column_alias",

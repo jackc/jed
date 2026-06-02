@@ -89,9 +89,10 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
 - **Single table** — one table per `SELECT`/`UPDATE`/`DELETE`; no `JOIN`, no subqueries.
 - **Positional `INSERT`** — no column list, no multi-row `VALUES`, no `DEFAULT`, and the
   values are *literals only* (not general expressions; see the `literal` production).
-- **One `ORDER BY` key**, optional `ASC` / `DESC`, over a bare column (not a general
-  expression). There is no `NULLS FIRST` / `NULLS LAST` *syntax*; NULL ordering is fixed
-  semantics (NULLs first ascending), not a knob.
+- **`ORDER BY` keys are bare columns** — a sort key is a table column, never a general
+  expression (`ORDER BY a + 1`), an output alias, or an ordinal position (`ORDER BY 1`);
+  those stay deferred. The richer surface that *did* land — multiple keys, per-key
+  `ASC` / `DESC`, and per-key `NULLS FIRST | LAST` — is described in §10.
 - **`LIMIT` / `OFFSET` take a non-negative integer literal**, not a general expression
   (the same literal-only narrowing `INSERT` makes). The two clauses may appear in either
   order, each at most once (§9). There is **no `LIMIT ALL`**, **no `OFFSET … ROWS` /
@@ -192,3 +193,36 @@ Without `ORDER BY` the window is still **deterministic** here — the scan is in
 order (CLAUDE.md §10) — but `ORDER BY` is the portable way to pin *which* rows a `LIMIT`
 returns, and the corpus uses it for all but the one test that documents the key-order
 default.
+
+## 10. `ORDER BY`
+
+`ORDER BY` is **one or more sort keys** (`order_by` / `sort_key` in the grammar), each a
+**bare table column** with an optional direction (`ASC` / `DESC`, default `ASC`) and an
+optional explicit NULL placement (`NULLS FIRST | LAST`). Keys apply **left to right**: the
+first is primary, the next breaks its ties, and a full tie across all keys keeps the
+primary-key scan order via a **stable** sort. Resolution is against the *table's* columns and
+is independent of the select list — an `AS` alias is invisible here (§8), and a key need not
+appear in the projection.
+
+**Still narrowed (§5):** a key is a column name only — not a general expression
+(`ORDER BY a + 1`), an output alias, or an ordinal (`ORDER BY 1`). `expect_identifier` (not the
+expression parser) consumes each key, so those forms are a `42601` syntax error; all remain
+relaxable later.
+
+**NULL placement and the default.** The physical key order ratifies NULL as the **smallest**
+value ([types.md](types.md) §4, `null_ordering = "nulls-first-ascending"` in
+[../types/compare.toml](../types/compare.toml)): NULLs sort first ascending, and descending
+inverts that to last. So when a key gives **no** `NULLS` clause the default **follows the
+direction** — `ASC` → `NULLS FIRST`, `DESC` → `NULLS LAST` — and a plain `ORDER BY col` mirrors
+the engine's index-iteration order. This is the **SQLite** model and a deliberate **divergence
+from PostgreSQL**, where NULL is the *largest* value (PG defaults `ASC` to `NULLS LAST`); the
+divergence is ratified, not an oversight — do not "fix" it toward PG. An **explicit**
+`NULLS FIRST | LAST` overrides the default **regardless of direction** (so `ORDER BY a DESC
+NULLS FIRST` keeps non-NULL values descending but lifts NULLs to the front).
+
+This makes NULL placement a CLAUDE.md §8 determinism surface: the per-key comparator must keep
+NULL placement **decoupled** from the value-direction reversal (the `nulls_first` flag is
+resolved at parse time to `explicit ? … : !descending` and applied independently of the
+`ASC`/`DESC` value flip), so all three cores order NULLs byte-identically. The sort itself is
+**unmetered**, like `LIMIT`/`OFFSET` slicing ([cost.md](cost.md) §3); only the scanned and
+produced rows accrue cost.

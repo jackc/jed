@@ -59,9 +59,11 @@ export type SelectItems =
   | { kind: "all" }
   | { kind: "list"; items: SelectItem[] };
 
-// OrderBy is an ORDER BY clause. Step-1 corpus uses ascending only; descending is
-// reserved for later.
-export type OrderBy = { column: string; descending: boolean };
+// OrderKey is one ORDER BY sort key: a bare table column, a sort direction, and a resolved
+// NULL placement. nullsFirst is resolved at parse time — an explicit NULLS FIRST|LAST, else
+// the direction default (!descending: ASC -> first, DESC -> last) — and is applied
+// independently of the descending value flip (spec/design/grammar.md §10).
+export type OrderKey = { column: string; descending: boolean; nullsFirst: boolean };
 
 // ColumnDef is a column definition in a CREATE TABLE. typeName is kept as written and
 // resolved during analysis (the catalog owns the type lattice).
@@ -89,7 +91,8 @@ export type Select = {
   items: SelectItems;
   from: string;
   filter: Expr | null;
-  orderBy: OrderBy | null;
+  // ORDER BY sort keys, applied left to right; empty means no ORDER BY (grammar.md §10).
+  orderBy: OrderKey[];
   limit: bigint | null;
   offset: bigint | null;
 };

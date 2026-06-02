@@ -89,8 +89,10 @@ evaluation. It deliberately does **not** meter:
 - **Parse / plan / resolve** — these are per-statement (and the literal range-checks,
   type resolution, etc. happen once), not per-row execution.
 - **`ORDER BY` sort-internal comparisons** — the sort compares `Value`s directly, not
-  through the expression evaluator, so they are outside the `operator_eval` unit. (A
-  dedicated sort-comparison unit could be added later if wanted; it is not in this slice.)
+  through the expression evaluator, so they are outside the `operator_eval` unit. This holds
+  for a **multi-key** sort too (each key's comparison is the same direct `Value` compare),
+  so adding keys or `NULLS FIRST|LAST` placement changes no cost. (A dedicated
+  sort-comparison unit could be added later if wanted; it is not in this slice.)
 - **`LIMIT` / `OFFSET` slicing** — selecting the output window is an index slice over the
   already-sorted rows, not evaluation work; like the sort it is unmetered. Its only cost
   effect is *fewer* `row_produced`/projection charges (the excluded rows are never

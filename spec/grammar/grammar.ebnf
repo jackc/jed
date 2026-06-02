@@ -91,7 +91,19 @@ select_items   ::= "*"
 
 select_item    ::= expr ("AS" identifier)?
 
-order_by       ::= "ORDER" "BY" identifier ("ASC" | "DESC")?
+/* ORDER BY is one or more sort keys, applied left to right (the first key is
+ * primary, ties broken by the next, and a full tie keeps the primary-key scan
+ * order via a stable sort). A sort_key is a bare table column — NOT a general
+ * expression, an output alias, or an ordinal position (those stay deferred,
+ * ../design/grammar.md §5) — with an optional direction and an optional explicit
+ * NULL placement. Default NULL placement follows direction: ASC => NULLS FIRST,
+ * DESC => NULLS LAST, because the physical key order ratifies NULL as the SMALLEST
+ * value (../design/types.md §4, ../types/compare.toml null_ordering). An explicit
+ * NULLS FIRST | LAST overrides that default regardless of direction. "NULLS" not
+ * followed by FIRST | LAST is a syntax error (42601). */
+order_by       ::= "ORDER" "BY" sort_key ("," sort_key)*
+
+sort_key       ::= identifier ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
 
 /* LIMIT and OFFSET cap and skip output rows. They may appear in EITHER order, and
  * each clause AT MOST ONCE — a repeat (e.g. "LIMIT 1 LIMIT 2") is a syntax error

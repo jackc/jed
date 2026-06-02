@@ -357,13 +357,21 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		}
 	}
 
-	orderIdx, orderDesc := -1, false
-	if sel.OrderBy != nil {
-		orderIdx = table.ColumnIndex(sel.OrderBy.Column)
-		if orderIdx < 0 {
-			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+sel.OrderBy.Column)
+	// Resolve each ORDER BY key to its column index (keeping its direction + NULL placement).
+	// An unknown column is the existing UndefinedColumn (42703); NullsFirst was resolved at
+	// parse time (explicit clause, else the direction default).
+	type orderKeyPlan struct {
+		idx        int
+		descending bool
+		nullsFirst bool
+	}
+	order := make([]orderKeyPlan, 0, len(sel.OrderBy))
+	for _, key := range sel.OrderBy {
+		idx := table.ColumnIndex(key.Column)
+		if idx < 0 {
+			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+key.Column)
 		}
-		orderDesc = sel.OrderBy.Descending
+		order = append(order, orderKeyPlan{idx: idx, descending: key.Descending, nullsFirst: key.NullsFirst})
 	}
 
 	// Scan in primary-key order, then filter. A WHERE arithmetic can trap
@@ -387,15 +395,19 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		}
 	}
 
-	// ORDER BY: stable sort by the key column's value, NULLs first ascending
-	// (spec/design/encoding.md §4); descending reverses, NULLs last.
-	if orderIdx >= 0 {
+	// ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
+	// and a full tie keeps the primary-key scan order (SliceStable). Each key's NULL placement
+	// is decoupled from its value-direction flip, so an explicit NULLS FIRST|LAST overrides the
+	// default (spec/design/grammar.md §10).
+	if len(order) > 0 {
 		sort.SliceStable(rows, func(a, b int) bool {
-			c := nullFirstCmp(rows[a][orderIdx], rows[b][orderIdx])
-			if orderDesc {
-				return c > 0
+			for _, key := range order {
+				c := keyCmp(rows[a][key.idx], rows[b][key.idx], key.descending, key.nullsFirst)
+				if c != 0 {
+					return c < 0
+				}
 			}
-			return c < 0
+			return false
 		})
 	}
 
@@ -1006,19 +1018,37 @@ func or3(a, b ThreeValued) ThreeValued {
 	return False
 }
 
-// nullFirstCmp is a total order for ORDER BY with NULLs first (ascending), matching the
-// key encoding's physical order (spec/design/encoding.md §4). Returns <0, 0, >0. ORDER
-// BY is over an (always-integer) column this slice, so the boolean ordering is defined
-// (false < true) only for totality.
-func nullFirstCmp(a, b Value) int {
+// keyCmp is one ORDER BY key's total-order comparison, returning <0, 0, >0. NULL placement
+// is governed by nullsFirst and applied INDEPENDENTLY of the value-direction flip
+// (descending), so an explicit NULLS FIRST|LAST overrides the direction default
+// (spec/design/grammar.md §10). The physical key order ratifies NULL as the smallest value,
+// which surfaces as the parse-time default nullsFirst = !descending.
+func keyCmp(a, b Value, descending, nullsFirst bool) int {
 	switch {
 	case a.Kind == ValNull && b.Kind == ValNull:
 		return 0
 	case a.Kind == ValNull:
-		return -1
-	case b.Kind == ValNull:
+		if nullsFirst {
+			return -1
+		}
 		return 1
+	case b.Kind == ValNull:
+		if nullsFirst {
+			return 1
+		}
+		return -1
 	}
+	base := valueCmp(a, b)
+	if descending {
+		return -base
+	}
+	return base
+}
+
+// valueCmp is the total order over NON-NULL values: signed-integer ascending, with the
+// boolean ordering (false < true) defined only for totality — ORDER BY is over an integer
+// column this slice. NULLs are handled by keyCmp before this is reached. Returns <0, 0, >0.
+func valueCmp(a, b Value) int {
 	x, y := orderKey(a), orderKey(b)
 	switch {
 	case x < y:
