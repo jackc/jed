@@ -436,9 +436,10 @@ func (p *Parser) parseNot() (Expr, error) {
 	return p.parseComparison()
 }
 
-// parseComparison parses one comparison or a postfix IS [NOT] NULL, both
-// non-associative: `a = b = c` is a syntax error, and `a + 1 IS NULL` binds as
-// `(a + 1) IS NULL`.
+// parseComparison parses one comparison, a postfix IS [NOT] NULL, or
+// IS [NOT] DISTINCT FROM, all non-associative: `a = b = c` is a syntax error, and
+// `a + 1 IS NULL` binds as `(a + 1) IS NULL`. After the shared `IS` `NOT`? it dispatches
+// on the NULL vs DISTINCT FROM keyword (spec/grammar/grammar.ebnf `comparison`).
 func (p *Parser) parseComparison() (Expr, error) {
 	lhs, err := p.parseAdditive()
 	if err != nil {
@@ -450,6 +451,18 @@ func (p *Parser) parseComparison() (Expr, error) {
 		if p.peekKeyword() == "not" {
 			p.advance()
 			negated = true
+		}
+		// IS [NOT] DISTINCT FROM <additive> — NULL-safe equality; else IS [NOT] NULL.
+		if p.peekKeyword() == "distinct" {
+			p.advance()
+			if err := p.expectKeyword("from"); err != nil {
+				return Expr{}, err
+			}
+			rhs, err := p.parseAdditive()
+			if err != nil {
+				return Expr{}, err
+			}
+			return Expr{Kind: ExprIsDistinct, IsDistinct: &IsDistinctExpr{Lhs: lhs, Rhs: rhs, Negated: negated}}, nil
 		}
 		if err := p.expectKeyword("null"); err != nil {
 			return Expr{}, err

@@ -42,6 +42,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "expr.precedence",
   "expr.comparison_value",
   "query.logical_connectives",
+  "query.is_distinct_from",
   "error.division_by_zero",
 ];
 

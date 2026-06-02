@@ -38,6 +38,7 @@ import {
   intValue,
   isTrue,
   lt3,
+  notDistinctFrom,
   nullValue,
 } from "./value.ts";
 
@@ -358,7 +359,8 @@ type RExpr =
   | { kind: "compare"; op: BinaryOp; lhs: RExpr; rhs: RExpr }
   | { kind: "and"; lhs: RExpr; rhs: RExpr }
   | { kind: "or"; lhs: RExpr; rhs: RExpr }
-  | { kind: "isNull"; operand: RExpr; negated: boolean };
+  | { kind: "isNull"; operand: RExpr; negated: boolean }
+  | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean };
 
 // resolveProjections resolves SELECT items into evaluable projections (any result type
 // is allowed in the select list, including boolean — SELECT a = b).
@@ -430,6 +432,13 @@ function resolve(
     case "isNull": {
       const { node } = resolve(table, e.operand, null);
       return { node: { kind: "isNull", operand: node, negated: e.negated }, type: { kind: "bool" } };
+    }
+    case "isDistinct": {
+      // NULL-safe equality: the SAME integer operand contract as `=` (promote a
+      // mixed-width pair, adapt a literal to the sibling's type and range-check it). The
+      // result is always a definite boolean (functions.md §3).
+      const p = resolveIntPair(table, e.lhs, e.rhs);
+      return { node: { kind: "distinct", lhs: p.rl, rhs: p.rr, negated: e.negated }, type: { kind: "bool" } };
     }
     case "binary":
       return resolveBinary(table, e.op, e.lhs, e.rhs);
@@ -622,6 +631,13 @@ function evalExpr(e: RExpr, row: Row): Value {
     case "isNull": {
       const isNull = evalExpr(e.operand, row).kind === "null";
       return { kind: "bool", value: isNull !== e.negated };
+    }
+    case "distinct": {
+      const same = notDistinctFrom(evalExpr(e.lhs, row), evalExpr(e.rhs, row));
+      // negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
+      // the same?"; IS DISTINCT FROM asks the opposite. Always a definite boolean — never
+      // unknown (the null_safe discipline, functions.md §3).
+      return { kind: "bool", value: same === e.negated };
     }
   }
 }

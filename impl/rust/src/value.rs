@@ -91,6 +91,21 @@ impl Value {
             _ => ThreeValued::Unknown,
         }
     }
+
+    /// NULL-safe equality — the `IS NOT DISTINCT FROM` primitive (CLAUDE.md §4,
+    /// spec/design/functions.md §3). NULL is a comparable value, not a poison: two NULLs
+    /// are "not distinct" (the same), a NULL and a present value are distinct, and two
+    /// present integers compare by value. The answer is **always** definite — there is no
+    /// UNKNOWN here, which is the whole point of the operator. `IS DISTINCT FROM` is the
+    /// negation of this. (The resolver guarantees integer/NULL operands, so non-null
+    /// values reduce to `eq3`, which is definite when neither side is NULL.)
+    pub fn not_distinct_from(self, other: Value) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            _ => self.eq3(other) == ThreeValued::True,
+        }
+    }
 }
 
 fn bool3(b: bool) -> ThreeValued {

@@ -98,9 +98,11 @@ coercions.
 `UNKNOWN`, never TRUE/FALSE. Notably `NULL = NULL` is `UNKNOWN`: equality is **not**
 reflexive across NULL. With the `boolean` type, `UNKNOWN` has a concrete carrier — a **NULL
 boolean** — so `{true, false, NULL}` *is* the three-valued domain; there is no separate
-non-storable "truth" value (functions.md §2). Testing for NULL is done with `IS [NOT] NULL`;
-`IS [NOT] DISTINCT FROM` (NULL-safe equality) is now unblocked by boolean but not yet
-authored. This is the PG model, borrowed because it is principled. The Kleene truth tables
+non-storable "truth" value (functions.md §2). Testing for NULL is done with `IS [NOT]
+NULL`; `IS [NOT] DISTINCT FROM` (NULL-safe equality) is **authored** (functions.md §3) —
+it treats NULL as a comparable value, so `NULL IS NOT DISTINCT FROM NULL` is TRUE and the
+result is always a definite boolean, never UNKNOWN. This is the PG model, borrowed because
+it is principled. The Kleene truth tables
 for the `AND`/`OR`/`NOT` connectives over this domain are in §10.
 
 **Value ordering & NULL position.** Non-NULL integers use plain signed numeric ascending
@@ -251,7 +253,10 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
 - **Storable boolean** — boolean as a column type (on-disk type code, key/value encoding
   fixtures, boolean PK). Deferred to a follow-on slice; the `bool-byte` encoding rule is
   fixed now (scalars.toml) but unexercised.
-- **`boolean × boolean` comparability** and **`IS [NOT] DISTINCT FROM`** — both unblocked by
-  the boolean type, not yet authored (§4).
+- **`IS [NOT] DISTINCT FROM`** — ✅ authored (NULL-safe equality over the integer family,
+  `null = "null_safe"`; functions.md §3). Its operand contract matches `=`, so it does not
+  add `boolean × boolean` comparability.
+- **`boolean × boolean` comparability** — still deferred: comparing two booleans
+  (`(a = b) = (c = d)`) remains a `42804` this slice (§4).
 - **`assignment`-mode casts** — vocabulary reserved; first used by non-integer types.
 - **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4.

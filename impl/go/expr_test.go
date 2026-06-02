@@ -109,6 +109,44 @@ func TestComparisonsProjectBooleans(t *testing.T) {
 	}
 }
 
+func TestIsDistinctFrom(t *testing.T) {
+	db := dbWith(t,
+		"CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)",
+		"INSERT INTO t VALUES (1, 5, 5)",       // present, equal
+		"INSERT INTO t VALUES (2, 5, 9)",       // present, unequal
+		"INSERT INTO t VALUES (3, NULL, 5)",    // one NULL
+		"INSERT INTO t VALUES (4, NULL, NULL)", // both NULL
+	)
+	// IS NOT DISTINCT FROM is NULL-safe equality — always a definite boolean: two NULLs
+	// are "the same", a NULL vs a present value is not.
+	same := []Value{BoolValue(true), BoolValue(false), BoolValue(false), BoolValue(true)}
+	nd := query(t, db, "SELECT a IS NOT DISTINCT FROM b FROM t ORDER BY id")
+	for i, w := range same {
+		if nd[i][0] != w {
+			t.Errorf("IS NOT DISTINCT FROM row %d = %v, want %v", i, nd[i][0], w)
+		}
+	}
+	// IS DISTINCT FROM is its exact negation (also always definite, never NULL).
+	d := query(t, db, "SELECT a IS DISTINCT FROM b FROM t ORDER BY id")
+	for i := range same {
+		want := BoolValue(same[i] == BoolValue(false))
+		if d[i][0] != want {
+			t.Errorf("IS DISTINCT FROM row %d = %v, want %v", i, d[i][0], want)
+		}
+	}
+	// WHERE keeps the "same" rows, including both-NULL — which plain `=` would drop.
+	if got := queryIDs(t, db, "SELECT id FROM t WHERE a IS NOT DISTINCT FROM b ORDER BY id"); !eqInts(got, 1, 4) {
+		t.Errorf("not-distinct WHERE got %v want [1 4]", got)
+	}
+	// Distinct-from-NULL coincides with IS NOT NULL (selects the present values).
+	if got := queryIDs(t, db, "SELECT id FROM t WHERE a IS DISTINCT FROM NULL ORDER BY id"); !eqInts(got, 1, 2) {
+		t.Errorf("distinct-from-NULL WHERE got %v want [1 2]", got)
+	}
+	// Same operand contract as `=`: non-associative chaining and boolean operands error.
+	wantErr(t, db, "SELECT id FROM t WHERE a IS DISTINCT FROM b IS DISTINCT FROM b", "42601")
+	wantErr(t, db, "SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM (a = b)", "42804")
+}
+
 func TestKleeneConnectives(t *testing.T) {
 	db := dbWith(t,
 		"CREATE TABLE tv (id int32 PRIMARY KEY, p int32, q int32)",

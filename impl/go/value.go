@@ -110,6 +110,20 @@ func (v Value) Gt3(o Value) ThreeValued {
 	return bool3(v.Int > o.Int)
 }
 
+// NotDistinctFrom is NULL-safe equality — the `IS NOT DISTINCT FROM` primitive
+// (CLAUDE.md §4, spec/design/functions.md §3). NULL is a comparable value, not a poison:
+// two NULLs are "not distinct" (the same), a NULL and a present value are distinct, and
+// two present integers compare by value. The answer is always definite — there is no
+// UNKNOWN here, which is the whole point of the operator. `IS DISTINCT FROM` is the
+// negation of this. (The resolver guarantees integer/NULL operands, so non-null values
+// reduce to Eq3, which is definite when neither side is NULL.)
+func (v Value) NotDistinctFrom(o Value) bool {
+	if v.Kind == ValNull || o.Kind == ValNull {
+		return v.Kind == ValNull && o.Kind == ValNull
+	}
+	return v.Eq3(o) == True
+}
+
 // --- boolean Value <-> ThreeValued bridges, and the Kleene connectives ----------
 // A boolean Value carries the three-valued domain directly: TRUE = BoolValue(true),
 // FALSE = BoolValue(false), UNKNOWN = NULL. The comparison primitives (Eq3/Lt3/Gt3)

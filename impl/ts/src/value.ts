@@ -77,6 +77,18 @@ export function gt3(a: Value, b: Value): ThreeValued {
   return bool3(a.int > b.int);
 }
 
+// notDistinctFrom is NULL-safe equality — the `IS NOT DISTINCT FROM` primitive
+// (CLAUDE.md §4, spec/design/functions.md §3). NULL is a comparable value, not a poison:
+// two NULLs are "not distinct" (the same), a NULL and a present value are distinct, and
+// two present integers compare by value. The answer is always definite — there is no
+// UNKNOWN here, which is the whole point of the operator. `IS DISTINCT FROM` is the
+// negation of this. (The resolver guarantees integer/NULL operands, so non-null values
+// reduce to eq3, which is definite when neither side is NULL.)
+export function notDistinctFrom(a: Value, b: Value): boolean {
+  if (a.kind === "null" || b.kind === "null") return a.kind === "null" && b.kind === "null";
+  return eq3(a, b) === "true";
+}
+
 // --- boolean Value <-> ThreeValued bridges, and the Kleene connectives ----------
 // A boolean Value carries the three-valued domain directly: TRUE = boolValue(true),
 // FALSE = boolValue(false), UNKNOWN = null. The comparison primitives (eq3/lt3/gt3)

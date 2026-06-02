@@ -75,6 +75,49 @@ test("comparisons project booleans (true / false / NULL)", () => {
   assert.deepStrictEqual(query(db, "SELECT FALSE FROM t WHERE id = 1"), [["false"]]);
 });
 
+test("IS [NOT] DISTINCT FROM is NULL-safe equality", () => {
+  const db = dbWith([
+    "CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)",
+    "INSERT INTO t VALUES (1, 5, 5)", // present, equal
+    "INSERT INTO t VALUES (2, 5, 9)", // present, unequal
+    "INSERT INTO t VALUES (3, NULL, 5)", // one NULL
+    "INSERT INTO t VALUES (4, NULL, NULL)", // both NULL
+  ]);
+  // Always a definite boolean: two NULLs are "the same", a NULL vs a present value is not.
+  assert.deepStrictEqual(query(db, "SELECT a IS NOT DISTINCT FROM b FROM t ORDER BY id"), [
+    ["true"],
+    ["false"],
+    ["false"],
+    ["true"],
+  ]);
+  // The exact negation (also definite, never NULL — unlike `=`, which yields NULL here).
+  assert.deepStrictEqual(query(db, "SELECT a IS DISTINCT FROM b FROM t ORDER BY id"), [
+    ["false"],
+    ["true"],
+    ["true"],
+    ["false"],
+  ]);
+  // WHERE keeps the "same" rows, including both-NULL — which plain `=` would drop.
+  assert.deepStrictEqual(query(db, "SELECT id FROM t WHERE a IS NOT DISTINCT FROM b ORDER BY id"), [
+    ["1"],
+    ["4"],
+  ]);
+  // Distinct-from-NULL coincides with IS NOT NULL (selects the present values).
+  assert.deepStrictEqual(query(db, "SELECT id FROM t WHERE a IS DISTINCT FROM NULL ORDER BY id"), [
+    ["1"],
+    ["2"],
+  ]);
+  // Same operand contract as `=`: non-associative chaining and boolean operands error.
+  assert.equal(
+    errCode(() => execute(db, "SELECT id FROM t WHERE a IS DISTINCT FROM b IS DISTINCT FROM b")),
+    "42601",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM (a = b)")),
+    "42804",
+  );
+});
+
 test("Kleene connectives", () => {
   const db = dbWith([
     "CREATE TABLE tv (id int32 PRIMARY KEY, p int32, q int32)",

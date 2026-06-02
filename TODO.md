@@ -88,8 +88,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Logical connectives `AND` / `OR` / `NOT`** with three-valued (Kleene) truth tables —
       `AND`/`OR` are `null = "kleene"` (a dominant operand absorbs NULL), `NOT` propagates.
       Coverage in `spec/conformance/suites/expr/{logical,precedence}.test`. _(was: M; deps: boolean ✓)_
-- [ ] **`IS [NOT] DISTINCT FROM`** — NULL-safe equality (design already references it,
-      types.md §4). Now **unblocked** by the `boolean` type. _(size: S; deps: boolean ✓)_
+- [x] **`IS [NOT] DISTINCT FROM`** — NULL-safe equality. Done: a new `null = "null_safe"`
+      operator pair in [spec/functions/catalog.toml](spec/functions/catalog.toml) (same
+      `integer × integer` `promote` contract and `boolean` result as `=`; only the NULL
+      handling is total — `NULL IS NOT DISTINCT FROM NULL` is TRUE, the result is never
+      unknown). The shared `IS` `NOT`? prefix dispatches on `NULL` vs `DISTINCT FROM` in the
+      grammar ([spec/grammar/grammar.ebnf](spec/grammar/grammar.ebnf) `comparison`,
+      non-associative) and in all three parsers; one `not_distinct_from` value primitive +
+      one resolved node per core (reusing the `=` operand resolution). Pinned by
+      [spec/conformance/suites/expr/is_distinct_from.test](spec/conformance/suites/expr/is_distinct_from.test)
+      (`query.is_distinct_from`, in the `expression` profile). The why is in
+      [functions.md](spec/design/functions.md) §3 / [types.md](spec/design/types.md) §4.
+      _(size: S; deps: boolean ✓)_
 - [ ] **Cost-accounting seam (design early, enforce later).** For safely running untrusted
       queries (CLAUDE.md §13): thread a **deterministic** cost counter through the executor /
       expression evaluator / storage reads *now*, while the executor is still small — every

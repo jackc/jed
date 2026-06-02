@@ -91,6 +91,8 @@ const (
 	ExprBinary
 	// ExprIsNull is a postfix IS [NOT] NULL test.
 	ExprIsNull
+	// ExprIsDistinct is `lhs IS [NOT] DISTINCT FROM rhs` (NULL-safe equality).
+	ExprIsDistinct
 )
 
 // UnaryOp is a unary operator.
@@ -137,13 +139,14 @@ const (
 // Kind selects which fields are meaningful. A comparison/logical/null-test node is
 // boolean-valued; arithmetic and columns/integer-literals are integer-valued.
 type Expr struct {
-	Kind     ExprKind
-	Column   string     // ExprColumn
-	Literal  *Literal   // ExprLiteral
-	Cast     *CastExpr  // ExprCast
-	Unary    *UnaryExpr // ExprUnary
-	Binary   *BinaryExpr
-	IsNullOf *IsNullExpr // ExprIsNull
+	Kind       ExprKind
+	Column     string     // ExprColumn
+	Literal    *Literal   // ExprLiteral
+	Cast       *CastExpr  // ExprCast
+	Unary      *UnaryExpr // ExprUnary
+	Binary     *BinaryExpr
+	IsNullOf   *IsNullExpr     // ExprIsNull
+	IsDistinct *IsDistinctExpr // ExprIsDistinct
 }
 
 // CastExpr is CAST(Inner AS TypeName).
@@ -168,6 +171,16 @@ type BinaryExpr struct {
 // IsNullExpr is `Operand IS [NOT] NULL`.
 type IsNullExpr struct {
 	Operand Expr
+	Negated bool
+}
+
+// IsDistinctExpr is `Lhs IS [NOT] DISTINCT FROM Rhs` — NULL-safe equality. Negated
+// carries the NOT keyword: Negated == true is `IS NOT DISTINCT FROM` (NULL-safe `=`),
+// false is `IS DISTINCT FROM` (its negation). Always boolean-valued, never unknown
+// (spec/design/functions.md §3).
+type IsDistinctExpr struct {
+	Lhs     Expr
+	Rhs     Expr
 	Negated bool
 }
 

@@ -289,8 +289,10 @@ impl Parser {
         self.parse_comparison()
     }
 
-    /// One comparison or a postfix `IS [NOT] NULL`, both non-associative: `a = b = c`
-    /// is a syntax error, and `a + 1 IS NULL` binds as `(a + 1) IS NULL`.
+    /// One comparison, a postfix `IS [NOT] NULL`, or `IS [NOT] DISTINCT FROM`, all
+    /// non-associative: `a = b = c` is a syntax error, and `a + 1 IS NULL` binds as
+    /// `(a + 1) IS NULL`. After the shared `IS` `NOT`? the parser dispatches on the
+    /// `NULL` vs `DISTINCT FROM` keyword (spec/grammar/grammar.ebnf `comparison`).
     fn parse_comparison(&mut self) -> Result<Expr> {
         let lhs = self.parse_additive()?;
         if self.peek_keyword().as_deref() == Some("is") {
@@ -301,6 +303,17 @@ impl Parser {
             } else {
                 false
             };
+            // IS [NOT] DISTINCT FROM <additive> — NULL-safe equality; else IS [NOT] NULL.
+            if self.peek_keyword().as_deref() == Some("distinct") {
+                self.advance();
+                self.expect_keyword("from")?;
+                let rhs = self.parse_additive()?;
+                return Ok(Expr::IsDistinctFrom {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    negated,
+                });
+            }
             self.expect_keyword("null")?;
             return Ok(Expr::IsNull {
                 operand: Box::new(lhs),

@@ -23,6 +23,7 @@ The catalog now lists:
 |---|---|---|
 | `logical` | `AND` `OR` `NOT` | `boolean` |
 | `comparison` | `=` `<` `>` `<=` `>=` | `boolean` |
+| `comparison` (NULL-safe) | `IS DISTINCT FROM`, `IS NOT DISTINCT FROM` | `boolean` |
 | `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` |
 | `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` |
 
@@ -85,10 +86,15 @@ the `null` field:
   in [types.md](types.md), not as catalog data — the catalog records only which discipline
   each operator falls under.
 
-A fourth value, `null_safe`, is **reserved** for `IS [NOT] DISTINCT FROM` (NULL-safe
-equality) — a comparison whose NULL handling is total rather than propagating. It is not
-authored yet; the checker already accepts the value so the operator can be added later
-without touching the checker.
+- `null_safe` — NULL is a **comparable value**, not a poison: the result is **always** a
+  definite boolean, never `unknown`. `IS NOT DISTINCT FROM` is NULL-safe `=` — `NULL IS
+  NOT DISTINCT FROM NULL` is TRUE, `1 IS NOT DISTINCT FROM NULL` is FALSE, and two present
+  integers compare exactly as `=` would. `IS DISTINCT FROM` is its negation. This is the
+  one discipline that separates these two operators from the propagating comparisons:
+  their operand contract (`integer × integer`, `promote`) and `boolean` result are
+  identical to `=`; only the NULL handling differs. The cores implement it by short-
+  circuiting the two NULL cases (both-NULL → "same", one-NULL → "distinct") and otherwise
+  deferring to three-valued `=`, which is definite when neither side is NULL.
 
 ## 4. Operand resolution by reference, not duplication
 
@@ -176,6 +182,10 @@ One field is designed but **deliberately not authored yet**, so its absence is i
 Reserved values and kinds still to be authored spec-first with their own executor slices
 ([../../TODO.md](../../TODO.md)):
 
-- `IS [NOT] DISTINCT FROM`: `null = "null_safe"` — NULL-safe equality, now unblocked by the
-  `boolean` type.
 - named `function` entries (the `function` kind).
+
+The `null_safe` discipline is now **authored**: `IS [NOT] DISTINCT FROM` (`kind =
+"comparison"`, `null = "null_safe"`) landed once the `boolean` type gave the result a
+home (§3). Like the null tests it is a keyword operator with no punctuation `symbol`, so
+the catalog checker exempts a `null_safe` comparison from the "comparison must carry a
+symbol" rule ([../functions/verify.rb](../functions/verify.rb)).

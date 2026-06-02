@@ -100,6 +100,15 @@ pub enum Expr {
         operand: Box<Expr>,
         negated: bool,
     },
+    /// `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
+    /// keyword: `negated = true` is `IS NOT DISTINCT FROM` (NULL-safe `=`); `false` is
+    /// `IS DISTINCT FROM` (its negation). Always boolean-valued, never unknown
+    /// (spec/design/functions.md §3).
+    IsDistinctFrom {
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        negated: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

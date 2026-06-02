@@ -499,6 +499,14 @@ enum RExpr {
         operand: Box<RExpr>,
         negated: bool,
     },
+    /// `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated = true` is the
+    /// `IS NOT DISTINCT FROM` ("are they the same?") form; `false` is `IS DISTINCT FROM`.
+    /// Always evaluates to a definite boolean.
+    Distinct {
+        lhs: Box<RExpr>,
+        rhs: Box<RExpr>,
+        negated: bool,
+    },
 }
 
 /// Resolve `SELECT` items against a table into evaluable projections (any result type
@@ -597,6 +605,20 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             Ok((
                 RExpr::IsNull {
                     operand: Box::new(rop),
+                    negated: *negated,
+                },
+                ResolvedType::Bool,
+            ))
+        }
+        Expr::IsDistinctFrom { lhs, rhs, negated } => {
+            // NULL-safe equality: the SAME integer operand contract as `=` (promote a
+            // mixed-width pair, adapt a literal to the sibling's type and range-check it).
+            // The result is always a definite boolean (functions.md §3).
+            let (rl, _lt, rr, _rt) = resolve_int_pair(table, lhs, rhs)?;
+            Ok((
+                RExpr::Distinct {
+                    lhs: Box::new(rl),
+                    rhs: Box::new(rr),
                     negated: *negated,
                 },
                 ResolvedType::Bool,
@@ -903,6 +925,14 @@ impl RExpr {
                 let is_null = matches!(operand.eval(row)?, Value::Null);
                 // IS [NOT] NULL is always a definite boolean, never unknown (CLAUDE.md §4).
                 Ok(Value::Bool(is_null != *negated))
+            }
+            RExpr::Distinct { lhs, rhs, negated } => {
+                let same = lhs.eval(row)?.not_distinct_from(rhs.eval(row)?);
+                // `negated` carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks
+                // "are they the same?" → `same`; IS DISTINCT FROM asks the opposite. Either
+                // way the result is a definite boolean — never unknown (the null_safe
+                // discipline, functions.md §3).
+                Ok(Value::Bool(same == *negated))
             }
         }
     }

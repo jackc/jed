@@ -13,8 +13,8 @@
 #   4. result is a scalar id in scalars.toml ("boolean"), or a reserved id (promoted)
 #   5. arg_resolution is "promote" | "none"; "promote" requires the operand pair
 #      to be comparable and the family to have a promotion rule (compare.toml)
-#   6. null is "propagates" | "detects" | "kleene" (null_safe reserved for IS [NOT]
-#      DISTINCT FROM)
+#   6. null is "propagates" | "detects" | "kleene" | "null_safe" (null_safe = the
+#      NULL-safe equality discipline of IS [NOT] DISTINCT FROM)
 #   7. every code in `errors` exists in registry.toml
 #   8. kind is a known kind (comparison | null_test | arithmetic | logical; function
 #      reserved)
@@ -81,7 +81,12 @@ def main
     fail!("operator #{id}: unknown kind #{kind.inspect}") unless KNOWN_KINDS.include?(kind)
     fail!("operator #{id}: null_test must have arity 1") if kind == "null_test" && op["arity"] != 1
     fail!("operator #{id}: comparison must have arity 2") if kind == "comparison" && op["arity"] != 2
-    fail!("operator #{id}: comparison must have a `symbol`") if kind == "comparison" && !op.key?("symbol")
+    # A comparison spelled with punctuation (= < > <= >=) must carry its `symbol` (catches
+    # a forgotten spelling). The keyword-form NULL-safe comparisons (IS [NOT] DISTINCT
+    # FROM, null = "null_safe") have no punctuation symbol — exempt them, like null tests.
+    if kind == "comparison" && op["null"] != "null_safe" && !op.key?("symbol")
+      fail!("operator #{id}: comparison must have a `symbol`")
+    end
 
     # (3) arg_families reference real families (or "any")
     args.each do |fam|

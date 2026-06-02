@@ -288,9 +288,11 @@ class Parser {
     return this.parseComparison();
   }
 
-  // parseComparison parses one comparison or a postfix IS [NOT] NULL, both
-  // non-associative: `a = b = c` is a syntax error, and `a + 1 IS NULL` binds as
-  // `(a + 1) IS NULL`.
+  // parseComparison parses one comparison, a postfix IS [NOT] NULL, or
+  // IS [NOT] DISTINCT FROM, all non-associative: `a = b = c` is a syntax error, and
+  // `a + 1 IS NULL` binds as `(a + 1) IS NULL`. After the shared `IS` `NOT`? it
+  // dispatches on the NULL vs DISTINCT FROM keyword (spec/grammar/grammar.ebnf
+  // `comparison`).
   private parseComparison(): Expr {
     const lhs = this.parseAdditive();
     if (this.peekKeyword() === "is") {
@@ -299,6 +301,12 @@ class Parser {
       if (this.peekKeyword() === "not") {
         this.advance();
         negated = true;
+      }
+      // IS [NOT] DISTINCT FROM <additive> — NULL-safe equality; else IS [NOT] NULL.
+      if (this.peekKeyword() === "distinct") {
+        this.advance();
+        this.expectKeyword("from");
+        return { kind: "isDistinct", lhs, rhs: this.parseAdditive(), negated };
       }
       this.expectKeyword("null");
       return { kind: "isNull", operand: lhs, negated };

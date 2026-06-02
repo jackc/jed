@@ -42,7 +42,11 @@ export type Expr =
   | { kind: "cast"; inner: Expr; typeName: string }
   | { kind: "unary"; op: UnaryOp; operand: Expr }
   | { kind: "binary"; op: BinaryOp; lhs: Expr; rhs: Expr }
-  | { kind: "isNull"; operand: Expr; negated: boolean };
+  | { kind: "isNull"; operand: Expr; negated: boolean }
+  // `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
+  // keyword: true is `IS NOT DISTINCT FROM` (NULL-safe `=`), false is `IS DISTINCT FROM`
+  // (its negation). Always boolean-valued, never unknown (spec/design/functions.md §3).
+  | { kind: "isDistinct"; lhs: Expr; rhs: Expr; negated: boolean };
 
 // SelectItems is either all columns (*) or a list of projected expressions.
 export type SelectItems =

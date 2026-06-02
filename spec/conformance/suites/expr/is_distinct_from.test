@@ -1,0 +1,126 @@
+# IS [NOT] DISTINCT FROM — NULL-safe equality (spec/design/functions.md §3, types.md §4).
+# Unlike `=` (which yields UNKNOWN when a NULL participates), IS NOT DISTINCT FROM treats
+# NULL as a comparable value: NULL IS NOT DISTINCT FROM NULL is TRUE, a NULL vs a present
+# value is FALSE, and the result is ALWAYS a definite boolean (never NULL). IS DISTINCT
+# FROM is its exact negation. Same integer operand contract as `=` (promotion + the
+# literal range check), so a too-wide literal traps 22003 and a boolean operand is 42804.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.is_distinct_from, types.int16, types.int32, types.boolean, compare.promotion, expr.comparison_value, expr.parens, null.three_valued
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+
+statement ok
+INSERT INTO t VALUES (1, 5, 5)
+
+statement ok
+INSERT INTO t VALUES (2, 5, 9)
+
+statement ok
+INSERT INTO t VALUES (3, 5, NULL)
+
+statement ok
+INSERT INTO t VALUES (4, NULL, 5)
+
+statement ok
+INSERT INTO t VALUES (5, NULL, NULL)
+
+# IS NOT DISTINCT FROM is NULL-safe equality: two NULLs are "the same", a NULL and a
+# present value are not, two present integers compare by value — always a definite boolean.
+query B nosort
+SELECT a IS NOT DISTINCT FROM b FROM t ORDER BY id
+----
+true
+false
+false
+false
+true
+
+# IS DISTINCT FROM is its exact negation (also always definite, never NULL).
+query B nosort
+SELECT a IS DISTINCT FROM b FROM t ORDER BY id
+----
+false
+true
+true
+true
+false
+
+# Contrast with plain `=`, which propagates: a NULL operand makes the result UNKNOWN
+# (rendered NULL), so equality is not reflexive across NULL.
+query B nosort
+SELECT a = b FROM t ORDER BY id
+----
+true
+false
+NULL
+NULL
+NULL
+
+# In WHERE, IS NOT DISTINCT FROM keeps the rows that are "the same" — including the
+# both-NULL row, which `=` would drop to UNKNOWN.
+query I nosort
+SELECT id FROM t WHERE a IS NOT DISTINCT FROM b ORDER BY id
+----
+1
+5
+
+# IS DISTINCT FROM keeps the complementary rows (and never drops a row to UNKNOWN).
+query I nosort
+SELECT id FROM t WHERE a IS DISTINCT FROM b ORDER BY id
+----
+2
+3
+4
+
+# Against a NULL literal it coincides with IS NULL / IS NOT NULL: not-distinct-from-NULL
+# selects the NULL rows, distinct-from-NULL selects the present values.
+query I nosort
+SELECT id FROM t WHERE a IS NOT DISTINCT FROM NULL ORDER BY id
+----
+4
+5
+
+query I nosort
+SELECT id FROM t WHERE a IS DISTINCT FROM NULL ORDER BY id
+----
+1
+2
+3
+
+# An integer literal adapts to the column's type and compares by value; the NULL rows
+# are distinct from 5, so only the present a = 5 rows match.
+query I nosort
+SELECT id FROM t WHERE a IS NOT DISTINCT FROM 5 ORDER BY id
+----
+1
+2
+3
+
+# Non-associative, like the other comparisons: chaining is a syntax error.
+statement error 42601
+SELECT id FROM t WHERE a IS DISTINCT FROM b IS DISTINCT FROM b
+
+# Same operand contract as `=`: comparing two booleans is a type error this slice.
+statement error 42804
+SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM (a = b)
+
+# Cross-type operands promote exactly like `=` (int16 vs int32 widen to int32).
+statement ok
+CREATE TABLE w (id int32 PRIMARY KEY, s int16, n int32)
+
+statement ok
+INSERT INTO w VALUES (1, 7, 7)
+
+statement ok
+INSERT INTO w VALUES (2, 7, 8)
+
+query I nosort
+SELECT id FROM w WHERE s IS NOT DISTINCT FROM n ORDER BY id
+----
+1
+
+# And an untyped literal that overflows the column's type traps 22003 at resolve, before
+# any row is scanned — the same literal range check `=` performs (types.md §6).
+statement error 22003
+SELECT id FROM w WHERE s IS NOT DISTINCT FROM 100000

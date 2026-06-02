@@ -450,6 +450,7 @@ const (
 	reAnd
 	reOr
 	reIsNull
+	reDistinct
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -462,10 +463,10 @@ type rExpr struct {
 	cBool   bool       // reConstBool
 	op      BinaryOp   // reArith, reCompare
 	result  ScalarType // reCast target; reNeg / reArith result type
-	lhs     *rExpr     // reArith, reCompare, reAnd, reOr
-	rhs     *rExpr     // reArith, reCompare, reAnd, reOr
+	lhs     *rExpr     // reArith, reCompare, reAnd, reOr, reDistinct
+	rhs     *rExpr     // reArith, reCompare, reAnd, reOr, reDistinct
 	operand *rExpr     // reCast, reNeg, reNot, reIsNull
-	negated bool       // reIsNull
+	negated bool       // reIsNull, reDistinct
 }
 
 // resolveProjections resolves SELECT items into evaluable projections (any result type
@@ -578,6 +579,16 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reIsNull, operand: rop, negated: e.IsNullOf.Negated},
+			resolvedType{kind: rtBool}, nil
+	case ExprIsDistinct:
+		// NULL-safe equality: the SAME integer operand contract as `=` (promote a
+		// mixed-width pair, adapt a literal to the sibling's type and range-check it).
+		// The result is always a definite boolean (functions.md §3).
+		rl, _, rr, _, err := resolveIntPair(table, e.IsDistinct.Lhs, e.IsDistinct.Rhs)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reDistinct, lhs: rl, rhs: rr, negated: e.IsDistinct.Negated},
 			resolvedType{kind: rtBool}, nil
 	default: // ExprBinary
 		return resolveBinary(table, e.Binary)
@@ -836,13 +847,26 @@ func (e *rExpr) eval(row Row) (Value, error) {
 			return Value{}, err
 		}
 		return boolOr(a, b), nil
-	default: // reIsNull
+	case reIsNull:
 		v, err := e.operand.eval(row)
 		if err != nil {
 			return Value{}, err
 		}
 		isNull := v.Kind == ValNull
 		return BoolValue(isNull != e.negated), nil
+	default: // reDistinct
+		a, err := e.lhs.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		b, err := e.rhs.eval(row)
+		if err != nil {
+			return Value{}, err
+		}
+		// negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
+		// the same?"; IS DISTINCT FROM asks the opposite. Always a definite boolean — never
+		// unknown (the null_safe discipline, functions.md §3).
+		return BoolValue(a.NotDistinctFrom(b) == e.negated), nil
 	}
 }
 

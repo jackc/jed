@@ -14,8 +14,9 @@ schema_version = 1
 
 # field doc -------------------------------------------------------------------
 # name            internal identity; the codegen handle and AST node name. One
-#                 name per operator (eq/lt/gt/le/ge, add/sub/mul/div/mod, neg,
-#                 and/or/not, is_null/is_not_null).
+#                 name per operator (eq/lt/gt/le/ge, is_distinct_from/
+#                 is_not_distinct_from, add/sub/mul/div/mod, neg, and/or/not,
+#                 is_null/is_not_null).
 # symbol          surface spelling of an infix/prefix operator ("=", "<=", "+",
 #                 "-"). Omitted for operators with no single punctuation token:
 #                 the IS [NOT] NULL tests and the keyword connectives AND/OR/NOT.
@@ -36,7 +37,9 @@ schema_version = 1
 #                 NULL/unknown; "detects" = inspects NULL-ness, always returns a
 #                 definite boolean, never unknown; "kleene" = three-valued connective
 #                 truth table — NULL is absorbed by a dominant operand (FALSE for AND,
-#                 TRUE for OR) and only propagates when no operand dominates.
+#                 TRUE for OR) and only propagates when no operand dominates;
+#                 "null_safe" = NULL is a comparable value, so the result is always a
+#                 definite boolean (NULL-safe equality, IS [NOT] DISTINCT FROM).
 # precedence      binding tightness as an integer (higher binds tighter). Authored
 #                 here as the SINGLE source of truth for the precedence tower; the
 #                 hand-written parsers must agree (functions.md, grammar.ebnf `expr`).
@@ -152,6 +155,40 @@ arg_families   = ["integer", "integer"]
 arg_resolution = "promote"
 result         = "boolean"
 null           = "propagates"
+precedence     = 35
+errors         = []
+
+# --- NULL-safe comparisons ---------------------------------------------------
+# `IS [NOT] DISTINCT FROM`: NULL-safe equality. Same integer operand contract as `=`
+# (a mixed-width pair is widened by the promotion tower, then compared as one integer),
+# but NULL is treated as a comparable value instead of poisoning the result: `NULL IS
+# NOT DISTINCT FROM NULL` is TRUE, `1 IS DISTINCT FROM NULL` is TRUE, and the result is
+# ALWAYS a definite boolean — never unknown. That total NULL handling is the only thing
+# distinguishing these from the propagating comparisons above, recorded as null =
+# "null_safe" (functions.md §3). They are keyword operators with no punctuation `symbol`
+# (like the null tests), bind at the comparison level (precedence 35), and are
+# non-associative. `is_not_distinct_from` is the NULL-safe `=`; `is_distinct_from` is its
+# negation.
+
+[[operator]]
+name           = "is_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_not_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "null_safe"
 precedence     = 35
 errors         = []
 

@@ -127,7 +127,7 @@ Current profiles:
 | `core` | CREATE TABLE (+PK) / INSERT / SELECT / `WHERE pk =` / `ORDER BY` / `IS [NOT] NULL` / 3-valued NULL / insert overflow trap, integers only. | The CLAUDE.md §11 step-5 "it's alive" milestone. |
 | `casts` | `core` + explicit `CAST` narrowing (fits, and traps `22003` when it doesn't). | [../types/casts.toml](../types/casts.toml). |
 | `comparison` | `core` + cross-type integer comparison via the promotion tower (`<`, `>`, `=`). | [../types/compare.toml](../types/compare.toml). |
-| `expression` | `comparison` + the general expression substrate: integer arithmetic (`+ - * / %`, unary `-`, precedence, parens; traps `22003`/`22012`), the expression-only `boolean` type (`TRUE`/`FALSE`, comparisons-as-values), and `AND`/`OR`/`NOT` Kleene connectives. | [../functions/catalog.toml](../functions/catalog.toml), [../design/types.md](../design/types.md) §9. |
+| `expression` | `comparison` + the general expression substrate: integer arithmetic (`+ - * / %`, unary `-`, precedence, parens; traps `22003`/`22012`), the expression-only `boolean` type (`TRUE`/`FALSE`, comparisons-as-values), `AND`/`OR`/`NOT` Kleene connectives, and `IS [NOT] DISTINCT FROM` (NULL-safe equality). | [../functions/catalog.toml](../functions/catalog.toml), [../design/types.md](../design/types.md) §9. |
 
 ## 4. Determinism rules
 
