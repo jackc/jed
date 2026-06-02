@@ -16,6 +16,7 @@ import {
   widthBytes,
 } from "../src/types.ts";
 import { OPERATORS } from "../src/operators.ts";
+import { COSTS } from "../src/costs.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
 
 test("scalar types match spec/types/scalars.toml", () => {
@@ -106,5 +107,31 @@ test("operators match spec/functions/catalog.toml", () => {
     } else {
       assert.equal(d.symbol, undefined, `${name}: symbol absent`);
     }
+  }
+});
+
+test("cost schedule matches spec/cost/schedule.toml", () => {
+  // The generated cost schedule (codegen middle path, CLAUDE.md §5/§13) must match the
+  // canonical schedule.toml weight-for-weight. Cost is a cross-core contract (§8): every
+  // core reads these weights.
+  const rows = readTomlTables(specPath("cost/schedule.toml"), "unit");
+  assert.equal(rows.length, 3, "the three phase-1 cost units");
+  // Every unit id maps to a field on COSTS; a new unit forces this cross-check to be
+  // updated (so a core cannot silently ignore a unit the schedule adds).
+  const weight = (id: string): bigint => {
+    switch (id) {
+      case "storage_row_read":
+        return COSTS.storageRowRead;
+      case "row_produced":
+        return COSTS.rowProduced;
+      case "operator_eval":
+        return COSTS.operatorEval;
+      default:
+        throw new Error(`cost unit ${id} has no COSTS field — update this cross-check`);
+    }
+  };
+  for (const row of rows) {
+    const id = row.str("id");
+    assert.equal(weight(id), row.big("weight"), `${id}: weight`);
   }
 });

@@ -10,6 +10,8 @@
 #   3. every capability a .test file `requires:` is a defined capability
 #   4. no orphan capabilities (defined but never required by any test)
 #   5. every .test file carries exactly one `# requires:` line
+#   6. every `# cost: N` directive parses as a non-negative integer, and any file using
+#      one declares the `resource.cost_metering` capability (CLAUDE.md §13)
 #
 # Exit 0 = taxonomy is internally coherent; nonzero = the offending problem.
 
@@ -33,6 +35,14 @@ def parse_requires(path)
   return nil unless req
 
   req.sub(/^#\s*requires:/i, "").split(",").map(&:strip).reject(&:empty?)
+end
+
+# The raw token of every `# cost: N` directive in a .test file (CLAUDE.md §13). A
+# cost directive asserts the deterministic accrued cost of the next query/statement-ok
+# record; it is a comment the stock sqllogictest runner ignores, like `# requires:`.
+def parse_cost_directives(path)
+  File.readlines(path, encoding: "UTF-8")
+      .filter_map { |l| l[/^#\s*cost:\s*(\S+)/i, 1] }
 end
 
 def main
@@ -77,6 +87,18 @@ def main
     reqs.each do |c|
       fail!("#{rel}: requires undefined capability #{c}") unless cap_set.include?(c)
       required_anywhere << c
+    end
+
+    # (6) cost directives: each is a non-negative integer, and the file must require
+    # the cost-metering capability (so non-cost-aware cores skip it — conformance.md §3).
+    costs = parse_cost_directives(path)
+    unless costs.empty?
+      costs.each do |tok|
+        fail!("#{rel}: `# cost: #{tok}` is not a non-negative integer") unless tok =~ /\A\d+\z/
+      end
+      unless reqs.include?("resource.cost_metering")
+        fail!("#{rel}: uses `# cost:` but does not require `resource.cost_metering`")
+      end
     end
   end
 

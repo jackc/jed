@@ -106,25 +106,58 @@ function arrEq(a: string[], b: string[]): boolean {
   return true;
 }
 
+// parseCostDirective parses a `# cost: N` directive line (CLAUDE.md §13). Returns the
+// asserted cost, or null if the comment is not a cost directive.
+function parseCostDirective(line: string): bigint | null {
+  const m = line.match(/^#\s*cost:\s*(\S+)/);
+  if (!m) return null;
+  try {
+    const n = BigInt(m[1]!);
+    return n >= 0n ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+// assertCost checks the accrued execution cost matches a pending `# cost:` directive.
+function assertCost(expected: bigint | null, actual: bigint, sql: string): void {
+  if (expected !== null && expected !== actual) {
+    throw new Error(`cost mismatch: expected ${expected}, got ${actual}\n  SQL: ${sql}`);
+  }
+}
+
 // runFile runs all records in one .test file against a fresh database.
 function runFile(text: string): void {
   const db = new Database();
   const lines = text.split("\n");
   const c: Cursor = { i: 0 };
+  // A `# cost: N` directive sets this; the next record consumes it (CLAUDE.md §13).
+  let pendingCost: bigint | null = null;
   while (c.i < lines.length) {
     const line = lines[c.i]!.trim();
-    if (line === "" || line.startsWith("#")) {
+    if (line === "") {
       c.i++;
       continue;
     }
+    if (line.startsWith("#")) {
+      // `# cost: N` binds to the next record; every other comment is ignored.
+      const n = parseCostDirective(line);
+      if (n !== null) pendingCost = n;
+      c.i++;
+      continue;
+    }
+    // This record consumes any pending cost assertion (so it never leaks forward).
+    const expectedCost = pendingCost;
+    pendingCost = null;
     const fields = line.split(/\s+/);
     if (fields[0] === "statement") {
       const expect = fields[1] ?? "";
       c.i++;
       const sql = takeSQL(lines, c);
       let err: unknown = null;
+      let outcome: ReturnType<typeof execute> | null = null;
       try {
-        execute(db, sql);
+        outcome = execute(db, sql);
       } catch (e) {
         err = e;
       }
@@ -132,6 +165,7 @@ function runFile(text: string): void {
         if (err !== null) {
           throw new Error(`statement expected ok, got error ${msgOf(err)}\n  SQL: ${sql}`);
         }
+        assertCost(expectedCost, outcome!.cost, sql);
       } else if (expect === "error") {
         const want = fields[2] ?? "";
         if (err === null) {
@@ -168,6 +202,7 @@ function runFile(text: string): void {
           `query result mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(exp)}\n  actual:   ${JSON.stringify(actual)}`,
         );
       }
+      assertCost(expectedCost, outcome.cost, sql);
     } else {
       throw new Error(`unknown record kind "${fields[0]}"`);
     }

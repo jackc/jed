@@ -124,6 +124,13 @@ description = "AND / OR / NOT with three-valued (Kleene) truth tables"
 id = "error.division_by_zero"
 description = "Integer division / modulo by zero is defined and traps SQLSTATE 22012"
 
+# Resource accounting (CLAUDE.md §13) — orthogonal to the SQL feature levels, so it is
+# not bundled into a profile. A core declares it once its harness can assert the
+# deterministic, cross-core-identical query cost (the `# cost:` directive).
+[[capability]]
+id = "resource.cost_metering"
+description = "Deterministic, cross-core-identical query cost accounting (CLAUDE.md §13)"
+
 # --- profiles ----------------------------------------------------------------
 # A named bundle of capabilities = a conformance level. `includes` (optional)
 # inherits another profile's capabilities transitively, so profiles are cumulative.

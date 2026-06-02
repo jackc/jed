@@ -100,13 +100,20 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       (`query.is_distinct_from`, in the `expression` profile). The why is in
       [functions.md](spec/design/functions.md) §3 / [types.md](spec/design/types.md) §4.
       _(size: S; deps: boolean ✓)_
-- [ ] **Cost-accounting seam (design early, enforce later).** For safely running untrusted
-      queries (CLAUDE.md §13): thread a **deterministic** cost counter through the executor /
-      expression evaluator / storage reads *now*, while the executor is still small — every
-      page read, row produced, and function/operator evaluation accrues a defined cost. Cost
-      must be deterministic and **identical across cores** (a §8-style hotspot; assertable in
-      the corpus). The caller-set **max-cost ceiling + deterministic abort** can land later;
-      the seam is what must be baked in early. _(size: M seam / L full enforcement; §13)_ _(parallel)_
+- [x] **Cost-accounting seam (design early, enforce later).** Done (the **seam**; enforcement
+      still deferred): a deterministic cost counter (`Meter`) threads through the executor /
+      expression evaluator / storage reads in all three cores, accruing from a data-defined unit
+      schedule ([spec/cost/schedule.toml](spec/cost/schedule.toml): `storage_row_read`,
+      `row_produced`, a uniform `operator_eval`; codegen'd to `costs.{rs,go,ts}` via
+      [scripts/gen_costs.rb](scripts/gen_costs.rb), drift-gated by `rake verify`). Cost is exposed
+      on `Outcome` and is a cross-core contract: the `# cost: N` corpus directive
+      ([spec/conformance/suites/expr/cost.test](spec/conformance/suites/expr/cost.test), gated by
+      the `resource.cost_metering` capability) asserts the **byte-identical** accrued cost in
+      Rust, Go, **and** TS. The accrual rules (interior nodes only, no short-circuit, pre-order)
+      and the deferred bits are in [spec/design/cost.md](spec/design/cost.md). **Still deferred:**
+      the caller-set **max-cost ceiling + deterministic abort** (and its error code) — designed so
+      `Meter.charge` is the single chokepoint where it slots in; a real `page_read` unit; and
+      per-operator `cost` weights. _(was: M seam / L full enforcement; §13)_ _(parallel)_
 
 ---
 

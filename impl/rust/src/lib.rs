@@ -8,6 +8,8 @@
 
 pub mod ast;
 pub mod catalog;
+pub mod cost;
+pub mod costs;
 pub mod encoding;
 pub mod error;
 pub mod executor;
@@ -20,6 +22,7 @@ pub mod token;
 pub mod types;
 pub mod value;
 
+pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{Database, Outcome};
 pub use parser::Parser;
@@ -70,6 +73,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.logical_connectives",
     "query.is_distinct_from",
     "error.division_by_zero",
+    // Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
+    // accrued cost via the `# cost:` directive (CLAUDE.md §13).
+    "resource.cost_metering",
 ];
 
 /// Parse and execute one SQL statement against `db`.

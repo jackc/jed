@@ -1,0 +1,80 @@
+# Deterministic query cost accounting (CLAUDE.md §13; spec/design/cost.md). The engine
+# meters execution cost from a data-defined unit schedule (spec/cost/schedule.toml) so an
+# untrusted query's cost is bounded. Cost is a CROSS-CORE contract (no reference impl,
+# §2): every core must accrue the BYTE-IDENTICAL cost for the same (query, db), so the
+# single `# cost: N` asserted here holds for Rust, Go, and TS alike.
+#
+# The `# cost: N` directive is a comment the stock sqllogictest runner ignores (like
+# `# requires:`); our cost-aware harness reads it and asserts the accrued cost of the
+# NEXT query/statement-ok record. All units weigh 1 this slice, so for every record:
+#   cost = (rows scanned from the store) + (rows produced) + (interior operator evals).
+# storage_row_read fires per row a scan reads (BEFORE the filter); row_produced per row
+# emitted; operator_eval per INTERIOR expression node (leaf column/constant = free); no
+# short-circuit, so both operands of AND/OR/compare are always counted. Format + the
+# `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.delete, query.select, query.where_eq, query.comparison_order, query.order_by, expr.arithmetic, expr.precedence, query.logical_connectives, expr.comparison_value, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+
+statement ok
+INSERT INTO t VALUES (1, 6, 4)
+
+statement ok
+INSERT INTO t VALUES (2, 10, 20)
+
+statement ok
+INSERT INTO t VALUES (3, 0, 0)
+
+# Plain full scan, bare-column projection: 3 scanned + 0 filter + 3 produced + 0
+# projection (column is a leaf) = 6. ORDER BY's sort comparisons are not metered.
+# cost: 6
+query I nosort
+SELECT a FROM t ORDER BY id
+----
+6
+10
+0
+
+# Filtered scan, single match, one arithmetic op in the projection: 3 scanned + 3 filter
+# (one `=` compare per scanned row) + 1 produced + 1 projection (`a + b` = one Add) = 8.
+# cost: 8
+query I nosort
+SELECT a + b FROM t WHERE id = 1
+----
+10
+
+# Precedence: `a + b * 2` is Add(a, Mul(b, 2)) = two interior nodes. 3 scanned + 3 filter
+# + 1 produced + 2 projection = 9.
+# cost: 9
+query I nosort
+SELECT a + b * 2 FROM t WHERE id = 2
+----
+50
+
+# NO short-circuit, AND: the WHERE is And(a>0, b>0) = 3 interior nodes, evaluated for
+# EVERY scanned row even when the left operand is false (row 3: a=0). 3 scanned + 9 filter
+# (3 nodes x 3 rows) + 2 produced + 0 projection = 14. A core that short-circuited AND
+# would skip row 3's `b>0` and report 13 — this pins the count to 14.
+# cost: 14
+query I nosort
+SELECT id FROM t WHERE a > 0 AND b > 0 ORDER BY id
+----
+1
+2
+
+# NO short-circuit, OR: Or(a>0, b>0) = 3 interior nodes per scanned row even when the left
+# operand is true (rows 1, 2). 3 scanned + 9 filter + 2 produced = 14. A core that
+# short-circuited OR would skip the right operand on rows 1 and 2 and report 12.
+# cost: 14
+query I nosort
+SELECT id FROM t WHERE a > 0 OR b > 0 ORDER BY id
+----
+1
+2
+
+# DML accrues scan + filter cost too (and no produced rows): the DELETE scans all 3 rows
+# and runs one `=` compare each = 3 + 3 = 6. (Run last — it mutates the table.)
+# cost: 6
+statement ok
+DELETE FROM t WHERE id = 3

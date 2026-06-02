@@ -1,0 +1,48 @@
+# Cost unit schedule — CANONICAL DATA (CLAUDE.md §5, §13).
+#
+# Build-time input to per-language codegen (scripts/gen_costs.rb); never parsed at
+# runtime. Reasoning lives in ../design/cost.md — read it before editing this file.
+#
+# The deterministic cost units accrued while EXECUTING a query. The cost of a given
+# (query, database state) is fully deterministic and IDENTICAL across every core (a
+# CLAUDE.md §8 divergence hotspot) — because there is no reference implementation
+# (§2), the cost is part of the shared contract and is asserted in the conformance
+# corpus (the `# cost:` directive — conformance.md). Enforcement (a caller-set ceiling
+# + a deterministic abort) is DEFERRED (TODO.md); this table only defines the unit
+# weights the seam accrues. Weights are uniform (all 1) for this slice — the point is
+# that the seam reads them from DATA, tunable later with no code change.
+
+schema_version = 1
+
+# field doc -------------------------------------------------------------------
+# id      stable snake_case unit name; the codegen handle (a named field on the
+#         per-language CostSchedule).
+# weight  cost accrued each time this unit fires (non-negative integer).
+# event   where in the engine the unit fires (informational; maps to a hand-written
+#         accrual site in the executor / expression evaluator / storage read — the
+#         accrual SITES are hand-written per core, §5 forbids codegenning them; only
+#         the WEIGHTS are shared data).
+# -----------------------------------------------------------------------------
+
+[[unit]]
+id     = "storage_row_read"
+weight = 1
+event  = "one row read from a table store during a scan"
+# Storage is whole-image / row-granular today (../design/storage.md §6): a scan reads
+# N rows from a store, so the structural storage unit is the row read. When a real
+# paged store lands, ADD a separate `page_read` unit here — do NOT rename this one (a
+# row read and a page read are distinct events; both can coexist).
+
+[[unit]]
+id     = "row_produced"
+weight = 1
+event  = "one row emitted into a query result set"
+
+[[unit]]
+id     = "operator_eval"
+weight = 1
+event  = "one function/operator (interior expression node) evaluation"
+# Charged once per INTERIOR expression node (cast/neg/not/arith/compare/and/or/
+# is_null/distinct); leaf nodes (column/constant) charge nothing. A single uniform
+# weight this slice; the per-operator `cost` field in ../functions/catalog.toml stays
+# reserved as the additive tuning hook (functions.md §8).

@@ -173,11 +173,17 @@ trap `22012` on a zero divisor (a defined, deterministic abort, not a wrapped va
 
 One field is designed but **deliberately not authored yet**, so its absence is intentional:
 
-- `cost` — the deterministic, cross-core-identical evaluation cost of an operator
-  (CLAUDE.md §13). It lands with the dedicated cost-accounting-seam item, where the whole
-  unit schedule (page reads, rows produced, operator evaluations) is designed together as
-  data — not piecemeal as a constant here. Adding a field to a data table later is cheap;
-  designing the seam in fragments is not.
+- `cost` — a **per-operator** evaluation cost. The cost-accounting seam has now landed
+  (CLAUDE.md §13): the whole unit schedule is authored as data in
+  [../cost/schedule.toml](../cost/schedule.toml) — storage row reads, rows produced, and a
+  single **uniform `operator_eval`** weight — with the *why* in
+  [../design/cost.md](../design/cost.md). The per-operator `cost` field **here** stays
+  **reserved** as the additive tuning hook: the evaluator charges the uniform `operator_eval`
+  for every operator this slice, and authoring per-operator weights later (the evaluator
+  preferring an operator's own `cost`, falling back to `operator_eval`) is a pure data-only
+  change. The seam was designed as one coherent schedule, not as a per-operator constant
+  bolted on here — adding a field to a data table later is cheap; designing the seam in
+  fragments is not.
 
 Reserved values and kinds still to be authored spec-first with their own executor slices
 ([../../TODO.md](../../TODO.md)):

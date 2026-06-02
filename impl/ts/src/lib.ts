@@ -44,6 +44,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.logical_connectives",
   "query.is_distinct_from",
   "error.division_by_zero",
+  // Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
+  // accrued cost via the `# cost:` directive (CLAUDE.md §13).
+  "resource.cost_metering",
 ];
 
 // execute parses and executes one SQL statement against db.

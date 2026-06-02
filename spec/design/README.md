@@ -24,5 +24,8 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   the nullable presence tag (NULLs-first), composition, and descending order.
 - [storage.md](storage.md) — the storage seam: block interface, page model, and the
   root-pointer-swap commit model (CLAUDE.md §3/§9).
+- [cost.md](cost.md) — the deterministic cost-accounting seam: the unit schedule as data,
+  the cross-core accrual rules, the counter representation, and the deferred ceiling/abort
+  (CLAUDE.md §13).
 - [cores.md](cores.md) — what counts as a core vs. a wrapper, when to add the next core,
   and which languages add new divergence (the selection rule behind CLAUDE.md §2).

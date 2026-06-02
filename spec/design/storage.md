@@ -143,3 +143,10 @@ sits so the options stay open (CLAUDE.md §9).
   separate WAL is ever added is deferred (the copy-on-write + root-swap model does not
   require one for atomicity).
 - **Alternative physical layouts & direct-access API** — kept open (§5), not scheduled.
+- **Cost unit for storage reads** — the cost-accounting seam (CLAUDE.md §13,
+  [cost.md](cost.md)) meters storage with a `storage_row_read` unit (one row read from a
+  store during a scan), because the store is whole-image / row-granular today (§6 above —
+  a scan reads N rows; there is no page abstraction yet). When a real paged store lands, a
+  distinct `page_read` unit is **added** to [../cost/schedule.toml](../cost/schedule.toml)
+  — `storage_row_read` is **not** renamed (a row read and a page read are distinct events
+  that can coexist).

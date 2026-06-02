@@ -2,6 +2,7 @@
 //! match the canonical spec data tables (CLAUDE.md §5). TOML is a test-time-only
 //! dependency. If the spec changes and the core doesn't (or vice versa), this fails.
 
+use abide::costs::COSTS;
 use abide::error::SqlState;
 use abide::operators::OPERATORS;
 use abide::types::{is_boolean_type_name, ScalarType};
@@ -183,5 +184,31 @@ fn operators_match_spec() {
             Some(sym) => assert_eq!(desc.symbol, Some(sym), "{name} symbol"),
             None => assert_eq!(desc.symbol, None, "{name} symbol absent"),
         }
+    }
+}
+
+#[test]
+fn cost_schedule_matches_spec() {
+    // The generated cost schedule (codegen middle path, CLAUDE.md §5/§13) must match the
+    // canonical schedule.toml weight-for-weight. This also compiles the generated table
+    // into the crate. Cost is a cross-core contract (§8): every core reads these weights.
+    let v: toml::Value = toml::from_str(&spec("cost/schedule.toml")).unwrap();
+    let units = v["unit"].as_array().expect("[[unit]] array");
+
+    // Every unit id maps to a field on COSTS; a new unit forces this cross-check to be
+    // updated (so a core cannot silently ignore a unit the schedule adds).
+    let weight = |id: &str| -> i64 {
+        match id {
+            "storage_row_read" => COSTS.storage_row_read,
+            "row_produced" => COSTS.row_produced,
+            "operator_eval" => COSTS.operator_eval,
+            other => panic!("cost unit {other} has no COSTS field — update this cross-check"),
+        }
+    };
+
+    assert_eq!(units.len(), 3, "the three phase-1 cost units");
+    for u in units {
+        let id = u["id"].as_str().unwrap();
+        assert_eq!(weight(id), u["weight"].as_integer().unwrap(), "{id} weight");
     }
 }

@@ -16,6 +16,8 @@ import type {
   Update,
 } from "./ast.ts";
 import { type Column, type Table, columnIndex, primaryKeyIndex } from "./catalog.ts";
+import { Meter } from "./cost.ts";
+import { COSTS } from "./costs.ts";
 import { encodeInt } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { type Row, TableStore } from "./storage.ts";
@@ -43,10 +45,12 @@ import {
 } from "./value.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
-// UPDATE, DELETE) or a query result set.
+// UPDATE, DELETE) or a query result set. cost is the deterministic execution cost accrued
+// while running it (CLAUDE.md §13) — a DML statement accrues its scan + filter cost even
+// though it returns no rows. It is a bigint for int64 parity across cores (§8).
 export type Outcome =
-  | { kind: "statement" }
-  | { kind: "query"; columnCount: number; rows: Value[][] };
+  | { kind: "statement"; cost: bigint }
+  | { kind: "query"; columnCount: number; rows: Value[][]; cost: bigint };
 
 // Database is the whole database: catalog + per-table in-memory stores. Single
 // committed state (CLAUDE.md §3); the staging-buffer commit model lands later. Names
@@ -129,7 +133,8 @@ export class Database {
     }
 
     this.putTable({ name: ct.name, columns });
-    return { kind: "statement" };
+    // DDL touches no rows and evaluates no expressions: zero cost.
+    return { kind: "statement", cost: 0n };
   }
 
   // executeInsert maps the literal values positionally to columns, type-checks each
@@ -197,7 +202,9 @@ export class Database {
         "duplicate key value violates primary key uniqueness",
       );
     }
-    return { kind: "statement" };
+    // A single-row INSERT of literal values reads no rows and evaluates no expression
+    // tree: zero cost (DEFAULT expressions, when added, will accrue here).
+    return { kind: "statement", cost: 0n };
   }
 
   // executeDelete resolves the table and optional predicate, collects the keys of
@@ -210,16 +217,20 @@ export class Database {
     }
     const filter = del.filter ? resolveBooleanFilter(table, del.filter) : null;
 
+    // Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13;
+    // spec/design/cost.md §3). Keys are collected before mutating.
+    const meter = new Meter();
     const store = this.stores.get(del.table.toLowerCase())!;
     const keys: Uint8Array[] = [];
     for (const e of store.entriesInKeyOrder()) {
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
-      if (filter === null || isTrue(evalExpr(filter, e.row))) {
+      meter.charge(COSTS.storageRowRead);
+      if (filter === null || isTrue(evalExpr(filter, e.row, meter))) {
         keys.push(e.key);
       }
     }
     for (const k of keys) store.remove(k);
-    return { kind: "statement" };
+    return { kind: "statement", cost: meter.accrued };
   }
 
   // executeUpdate is two-phase / all-or-nothing: phase 1 builds and type-checks every
@@ -266,21 +277,25 @@ export class Database {
 
     const filter = upd.filter ? resolveBooleanFilter(table, upd.filter) : null;
 
-    // Phase 1: build + validate every matching row's new values; no writes yet.
+    // Phase 1: build + validate every matching row's new values; no writes yet. Each
+    // scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes do
+    // not — they evaluate nothing; spec/design/cost.md §3).
+    const meter = new Meter();
     const store = this.stores.get(upd.table.toLowerCase())!;
     const updates: { key: Uint8Array; row: Row }[] = [];
     for (const e of store.entriesInKeyOrder()) {
-      if (filter !== null && !isTrue(evalExpr(filter, e.row))) continue;
+      meter.charge(COSTS.storageRowRead);
+      if (filter !== null && !isTrue(evalExpr(filter, e.row, meter))) continue;
       const newRow = e.row.slice();
       for (const p of plans) {
-        newRow[p.idx] = checkAssign(p, evalExpr(p.source, e.row));
+        newRow[p.idx] = checkAssign(p, evalExpr(p.source, e.row, meter));
       }
       updates.push({ key: e.key, row: newRow });
     }
 
     // Phase 2: apply (keys unchanged — a PK column can't be assigned).
     for (const u of updates) store.replace(u.key, u.row);
-    return { kind: "statement" };
+    return { kind: "statement", cost: meter.accrued };
   }
 
   // executeSelect resolves projected columns and the WHERE/ORDER BY columns against the
@@ -306,10 +321,14 @@ export class Database {
     }
 
     // Scan in primary-key order, then filter. A WHERE arithmetic can throw
-    // (22003/22012); the throw propagates naturally.
+    // (22003/22012); the throw propagates naturally. Each scanned row and the filter
+    // evaluation accrue cost; the row-produced charge is below, at projection
+    // (CLAUDE.md §13; spec/design/cost.md §3).
+    const meter = new Meter();
     const rows: Row[] = [];
     for (const row of this.rowsInKeyOrder(sel.from)) {
-      if (filter === null || isTrue(evalExpr(filter, row))) rows.push(row);
+      meter.charge(COSTS.storageRowRead);
+      if (filter === null || isTrue(evalExpr(filter, row, meter))) rows.push(row);
     }
 
     // ORDER BY: stable sort by the key column's value, NULLs first ascending
@@ -323,9 +342,13 @@ export class Database {
       });
     }
 
-    // Project each surviving row.
-    const out: Value[][] = rows.map((row) => projections.map((p) => evalExpr(p, row)));
-    return { kind: "query", columnCount: projections.length, rows: out };
+    // Project each surviving row. Producing a row, and each projection-list evaluation,
+    // accrue cost. (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
+    const out: Value[][] = rows.map((row) => {
+      meter.charge(COSTS.rowProduced);
+      return projections.map((p) => evalExpr(p, row, meter));
+    });
+    return { kind: "query", columnCount: projections.length, rows: out, cost: meter.accrued };
   }
 }
 
@@ -571,10 +594,16 @@ function typeError(msg: string): Error {
 
 const I64_MIN = -9223372036854775808n;
 
-// evalExpr evaluates against a row, returning a Value (a boolean for comparisons /
-// connectives). Arithmetic throws 22003 on overflow and 22012 on a zero divisor; NULL
-// propagates through arithmetic; the connectives are Kleene; IS NULL is always definite.
-function evalExpr(e: RExpr, row: Row): Value {
+// evalExpr evaluates against a row, accruing cost into m, and returns a Value (a boolean
+// for comparisons / connectives). Arithmetic throws 22003 on overflow and 22012 on a zero
+// divisor; NULL propagates through arithmetic; the connectives are Kleene; IS NULL is
+// always definite.
+//
+// Cost: each INTERIOR node charges operator_eval once, pre-order (the node, then its
+// operands LHS-before-RHS — JS evaluates arguments left-to-right); leaf nodes
+// (column/constants) charge nothing. Both operands are always evaluated — there is no
+// short-circuit, so the count never depends on operand values (spec/design/cost.md §3).
+function evalExpr(e: RExpr, row: Row, m: Meter): Value {
   switch (e.kind) {
     case "column":
       return row[e.index]!;
@@ -585,32 +614,38 @@ function evalExpr(e: RExpr, row: Row): Value {
     case "constNull":
       return nullValue();
     case "cast": {
-      const v = evalExpr(e.operand, row);
+      m.charge(COSTS.operatorEval);
+      const v = evalExpr(e.operand, row, m);
       if (v.kind === "null") return nullValue();
       if (v.kind !== "int") throw typeError("internal: boolean cast operand");
       if (!inRange(e.target, v.int)) throw overflow(e.target);
       return intValue(v.int);
     }
     case "neg": {
-      const v = evalExpr(e.operand, row);
+      m.charge(COSTS.operatorEval);
+      const v = evalExpr(e.operand, row, m);
       if (v.kind === "null") return nullValue();
       if (v.kind !== "int") throw typeError("internal: boolean unary minus");
       const n = -v.int;
       if (!inRange(e.result, n)) throw overflow(e.result);
       return intValue(n);
     }
-    case "not":
-      return boolNot(evalExpr(e.operand, row));
+    case "not": {
+      m.charge(COSTS.operatorEval);
+      return boolNot(evalExpr(e.operand, row, m));
+    }
     case "arith": {
-      const a = evalExpr(e.lhs, row);
-      const b = evalExpr(e.rhs, row);
+      m.charge(COSTS.operatorEval);
+      const a = evalExpr(e.lhs, row, m);
+      const b = evalExpr(e.rhs, row, m);
       if (a.kind === "null" || b.kind === "null") return nullValue();
       if (a.kind !== "int" || b.kind !== "int") throw typeError("internal: boolean arithmetic");
       return evalArith(e.op, a.int, b.int, e.result);
     }
     case "compare": {
-      const a = evalExpr(e.lhs, row);
-      const b = evalExpr(e.rhs, row);
+      m.charge(COSTS.operatorEval);
+      const a = evalExpr(e.lhs, row, m);
+      const b = evalExpr(e.rhs, row, m);
       switch (e.op) {
         case "eq":
           return from3(eq3(a, b));
@@ -624,16 +659,26 @@ function evalExpr(e: RExpr, row: Row): Value {
           return from3(or3(gt3(a, b), eq3(a, b)));
       }
     }
-    case "and":
-      return boolAnd(evalExpr(e.lhs, row), evalExpr(e.rhs, row));
-    case "or":
-      return boolOr(evalExpr(e.lhs, row), evalExpr(e.rhs, row));
+    case "and": {
+      m.charge(COSTS.operatorEval);
+      const a = evalExpr(e.lhs, row, m);
+      const b = evalExpr(e.rhs, row, m);
+      return boolAnd(a, b);
+    }
+    case "or": {
+      m.charge(COSTS.operatorEval);
+      const a = evalExpr(e.lhs, row, m);
+      const b = evalExpr(e.rhs, row, m);
+      return boolOr(a, b);
+    }
     case "isNull": {
-      const isNull = evalExpr(e.operand, row).kind === "null";
+      m.charge(COSTS.operatorEval);
+      const isNull = evalExpr(e.operand, row, m).kind === "null";
       return { kind: "bool", value: isNull !== e.negated };
     }
     case "distinct": {
-      const same = notDistinctFrom(evalExpr(e.lhs, row), evalExpr(e.rhs, row));
+      m.charge(COSTS.operatorEval);
+      const same = notDistinctFrom(evalExpr(e.lhs, row, m), evalExpr(e.rhs, row, m));
       // negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
       // the same?"; IS DISTINCT FROM asks the opposite. Always a definite boolean — never
       // unknown (the null_safe discipline, functions.md §3).

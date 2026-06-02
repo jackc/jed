@@ -96,17 +96,44 @@ fn parse_requires(text: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Parse a `# cost: N` directive body (the comment text after the `#`). Returns the
+/// asserted cost, or None if this comment is not a cost directive (CLAUDE.md §13).
+fn parse_cost_directive(rest: &str) -> Option<i64> {
+    rest.trim_start().strip_prefix("cost:")?.trim().parse().ok()
+}
+
+/// Assert the accrued execution cost matches a pending `# cost:` directive (if any).
+fn assert_cost(expected: Option<i64>, actual: i64, sql: &str) -> std::result::Result<(), String> {
+    match expected {
+        Some(e) if e != actual => {
+            Err(format!("cost mismatch: expected {e}, got {actual}\n  SQL: {sql}"))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Run all records in one .test file against a fresh database. Returns the first
 /// mismatch as an error string.
 fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut db = Database::new();
     let mut lines = text.lines().peekable();
+    // A `# cost: N` directive sets this; the next record consumes it (CLAUDE.md §13).
+    let mut pending_cost: Option<i64> = None;
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
             continue;
         }
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            // `# cost: N` binds to the next record; every other comment is ignored.
+            if let Some(n) = parse_cost_directive(rest) {
+                pending_cost = Some(n);
+            }
+            continue;
+        }
+        // This record consumes any pending cost assertion (so it never leaks forward).
+        let expected_cost = pending_cost.take();
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();
         match kind {
@@ -115,15 +142,16 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 let sql = take_sql(&mut lines);
                 let result = abide::execute(&mut db, &sql);
                 match expect {
-                    "ok" => {
-                        if let Err(e) = result {
+                    "ok" => match result {
+                        Ok(outcome) => assert_cost(expected_cost, outcome.cost(), &sql)?,
+                        Err(e) => {
                             return Err(format!(
                                 "statement expected ok, got error {}: {}\n  SQL: {sql}",
                                 e.code(),
                                 e.message
                             ));
                         }
-                    }
+                    },
                     "error" => {
                         let want = parts.next().unwrap_or("");
                         match result {
@@ -170,6 +198,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                         "query result mismatch\n  SQL: {sql}\n  expected: {expected:?}\n  actual:   {actual:?}"
                     ));
                 }
+                assert_cost(expected_cost, outcome.cost(), &sql)?;
             }
             other => return Err(format!("unknown record kind '{other}'")),
         }
@@ -208,7 +237,7 @@ fn take_sql_until_separator<'a, I: Iterator<Item = &'a str>>(
 fn render_outcome(outcome: &Outcome, cols: usize, sortmode: &str) -> Vec<String> {
     let rows = match outcome {
         Outcome::Query { rows, .. } => rows,
-        Outcome::Statement => return Vec::new(),
+        Outcome::Statement { .. } => return Vec::new(),
     };
     let mut flat = Vec::new();
     for row in rows {

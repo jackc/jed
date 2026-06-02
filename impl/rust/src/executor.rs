@@ -9,6 +9,8 @@ use crate::ast::{
     Update,
 };
 use crate::catalog::{Column, Table};
+use crate::cost::Meter;
+use crate::costs::COSTS;
 use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
 use crate::storage::{Row, TableStore};
@@ -16,16 +18,29 @@ use crate::types::{is_boolean_type_name, ScalarType};
 use crate::value::{and3, from3, not3, or3, Value};
 use std::collections::HashMap;
 
-/// The outcome of executing one statement.
+/// The outcome of executing one statement. Both variants carry the deterministic
+/// execution `cost` accrued while running the statement (CLAUDE.md §13) — a DML
+/// statement accrues its scan + filter cost even though it returns no rows.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
-    /// A statement that produces no result set (CREATE, INSERT).
-    Statement,
+    /// A statement that produces no result set (CREATE, INSERT, UPDATE, DELETE).
+    Statement { cost: i64 },
     /// A query result: column count plus rows in result order.
     Query {
         column_count: usize,
         rows: Vec<Vec<Value>>,
+        cost: i64,
     },
+}
+
+impl Outcome {
+    /// The accrued execution cost (CLAUDE.md §13), available on either variant.
+    pub fn cost(&self) -> i64 {
+        match self {
+            Outcome::Statement { cost } => *cost,
+            Outcome::Query { cost, .. } => *cost,
+        }
+    }
 }
 
 /// The whole database: catalog + per-table in-memory stores. Single committed
@@ -130,7 +145,8 @@ impl Database {
             name: ct.name,
             columns,
         });
-        Ok(Outcome::Statement)
+        // DDL touches no rows and evaluates no expressions: zero cost.
+        Ok(Outcome::Statement { cost: 0 })
     }
 
     /// Analyze and run an INSERT: map the literal values positionally to columns,
@@ -221,7 +237,9 @@ impl Database {
                 "duplicate key value violates primary key uniqueness",
             ));
         }
-        Ok(Outcome::Statement)
+        // A single-row INSERT of literal values reads no rows and evaluates no
+        // expression tree: zero cost (DEFAULT expressions, when added, will accrue here).
+        Ok(Outcome::Statement { cost: 0 })
     }
 
     /// Analyze and run a DELETE: resolve the table and optional predicate, collect
@@ -242,12 +260,15 @@ impl Database {
 
         // Collect matching keys before mutating (so the map is not modified mid-scan).
         // A WHERE arithmetic can trap (22003/22012), so this is an explicit loop that
-        // propagates the error rather than a `.filter` closure.
+        // propagates the error rather than a `.filter` closure. Each scanned row and each
+        // filter evaluation accrues cost (CLAUDE.md §13; spec/design/cost.md §3).
+        let mut meter = Meter::new();
         let mut keys: Vec<Vec<u8>> = Vec::new();
         for (k, row) in self.store(&del.table).iter_entries() {
+            meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
-                Some(f) => f.eval(row)?.is_true(),
+                Some(f) => f.eval(row, &mut meter)?.is_true(),
             };
             if matched {
                 keys.push(k.clone());
@@ -258,7 +279,9 @@ impl Database {
         for k in &keys {
             store.remove(k);
         }
-        Ok(Outcome::Statement)
+        Ok(Outcome::Statement {
+            cost: meter.accrued,
+        })
     }
 
     /// Analyze and run an UPDATE. Two-phase / all-or-nothing: phase 1 builds and
@@ -312,19 +335,23 @@ impl Database {
             None => None,
         };
 
-        // Phase 1: build + validate every matching row's new values; no writes yet.
+        // Phase 1: build + validate every matching row's new values; no writes yet. Each
+        // scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes
+        // do not — they evaluate nothing; spec/design/cost.md §3).
+        let mut meter = Meter::new();
         let mut updates: Vec<(Vec<u8>, Row)> = Vec::new();
         for (key, row) in self.store(&upd.table).iter_entries() {
+            meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
-                Some(f) => f.eval(row)?.is_true(),
+                Some(f) => f.eval(row, &mut meter)?.is_true(),
             };
             if !matched {
                 continue;
             }
             let mut new_row = row.clone();
             for plan in &plans {
-                let raw = plan.source.eval(row)?;
+                let raw = plan.source.eval(row, &mut meter)?;
                 new_row[plan.idx] = plan.check(raw)?;
             }
             updates.push((key.clone(), new_row));
@@ -335,7 +362,9 @@ impl Database {
         for (key, row) in updates {
             store.replace(&key, row);
         }
-        Ok(Outcome::Statement)
+        Ok(Outcome::Statement {
+            cost: meter.accrued,
+        })
     }
 
     /// Analyze and run a SELECT: resolve projected columns and the WHERE/ORDER BY
@@ -377,12 +406,16 @@ impl Database {
 
         // Scan in primary-key order (the order-preserving encoding makes this the
         // logical key order), then filter. A WHERE arithmetic can trap (22003/22012),
-        // so this is an explicit loop that propagates the error.
+        // so this is an explicit loop that propagates the error. Each scanned row and the
+        // filter evaluation accrue cost; the row-produced charge is below, at projection
+        // (CLAUDE.md §13; spec/design/cost.md §3).
+        let mut meter = Meter::new();
         let mut rows: Vec<Row> = Vec::new();
         for row in self.store(&sel.from).iter_in_key_order() {
+            meter.charge(COSTS.storage_row_read);
             let keep = match &filter {
                 None => true,
-                Some(f) => f.eval(row)?.is_true(),
+                Some(f) => f.eval(row, &mut meter)?.is_true(),
             };
             if keep {
                 rows.push(row.clone());
@@ -399,12 +432,15 @@ impl Database {
             });
         }
 
-        // Project each surviving row.
+        // Project each surviving row. Producing a row, and each projection-list
+        // evaluation, accrue cost. (ORDER BY's sort comparisons are not metered —
+        // spec/design/cost.md §3.)
         let mut out_rows = Vec::with_capacity(rows.len());
         for row in &rows {
+            meter.charge(COSTS.row_produced);
             let mut out = Vec::with_capacity(column_count);
             for p in &projections {
-                out.push(p.eval(row)?);
+                out.push(p.eval(row, &mut meter)?);
             }
             out_rows.push(out);
         }
@@ -412,6 +448,7 @@ impl Database {
         Ok(Outcome::Query {
             column_count,
             rows: out_rows,
+            cost: meter.accrued,
         })
     }
 
@@ -859,48 +896,63 @@ impl AssignPlan {
 }
 
 impl RExpr {
-    /// Evaluate against a row. Returns a `Value` (which may be a boolean for
-    /// comparisons/connectives). Arithmetic traps 22003 on overflow and 22012 on a
-    /// zero divisor; NULL propagates through arithmetic; the connectives are Kleene.
-    fn eval(&self, row: &[Value]) -> Result<Value> {
+    /// Evaluate against a row, accruing cost into `m`. Returns a `Value` (which may be a
+    /// boolean for comparisons/connectives). Arithmetic traps 22003 on overflow and 22012
+    /// on a zero divisor; NULL propagates through arithmetic; the connectives are Kleene.
+    ///
+    /// Cost: each **interior** node charges `operator_eval` once, pre-order (the node, then
+    /// its operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both
+    /// operands are always evaluated — there is no short-circuit, so the count never
+    /// depends on operand values (spec/design/cost.md §3).
+    fn eval(&self, row: &[Value], m: &mut Meter) -> Result<Value> {
         match self {
             RExpr::Column(i) => Ok(row[*i]),
             RExpr::ConstInt(n) => Ok(Value::Int(*n)),
             RExpr::ConstBool(b) => Ok(Value::Bool(*b)),
             RExpr::ConstNull => Ok(Value::Null),
-            RExpr::Cast { inner, target } => match inner.eval(row)? {
-                Value::Null => Ok(Value::Null),
-                Value::Int(n) => {
-                    if target.in_range(n) {
-                        Ok(Value::Int(n))
-                    } else {
-                        Err(overflow(*target))
+            RExpr::Cast { inner, target } => {
+                m.charge(COSTS.operator_eval);
+                match inner.eval(row, m)? {
+                    Value::Null => Ok(Value::Null),
+                    Value::Int(n) => {
+                        if target.in_range(n) {
+                            Ok(Value::Int(n))
+                        } else {
+                            Err(overflow(*target))
+                        }
                     }
+                    Value::Bool(_) => unreachable!("resolver rejects a boolean cast operand"),
                 }
-                Value::Bool(_) => unreachable!("resolver rejects a boolean cast operand"),
-            },
-            RExpr::Neg { operand, result } => match operand.eval(row)? {
-                Value::Null => Ok(Value::Null),
-                Value::Int(n) => {
-                    // checked_neg guards i64::MIN; then range-check the result type.
-                    let v = n.checked_neg().ok_or_else(|| overflow(*result))?;
-                    if result.in_range(v) {
-                        Ok(Value::Int(v))
-                    } else {
-                        Err(overflow(*result))
+            }
+            RExpr::Neg { operand, result } => {
+                m.charge(COSTS.operator_eval);
+                match operand.eval(row, m)? {
+                    Value::Null => Ok(Value::Null),
+                    Value::Int(n) => {
+                        // checked_neg guards i64::MIN; then range-check the result type.
+                        let v = n.checked_neg().ok_or_else(|| overflow(*result))?;
+                        if result.in_range(v) {
+                            Ok(Value::Int(v))
+                        } else {
+                            Err(overflow(*result))
+                        }
                     }
+                    Value::Bool(_) => unreachable!("resolver rejects a boolean unary minus"),
                 }
-                Value::Bool(_) => unreachable!("resolver rejects a boolean unary minus"),
-            },
-            RExpr::Not(e) => Ok(not3(e.eval(row)?)),
+            }
+            RExpr::Not(e) => {
+                m.charge(COSTS.operator_eval);
+                Ok(not3(e.eval(row, m)?))
+            }
             RExpr::Arith {
                 op,
                 lhs,
                 rhs,
                 result,
             } => {
-                let a = lhs.eval(row)?;
-                let b = rhs.eval(row)?;
+                m.charge(COSTS.operator_eval);
+                let a = lhs.eval(row, m)?;
+                let b = rhs.eval(row, m)?;
                 match (a, b) {
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     (Value::Int(x), Value::Int(y)) => eval_arith(*op, x, y, *result),
@@ -908,8 +960,9 @@ impl RExpr {
                 }
             }
             RExpr::Compare { op, lhs, rhs } => {
-                let a = lhs.eval(row)?;
-                let b = rhs.eval(row)?;
+                m.charge(COSTS.operator_eval);
+                let a = lhs.eval(row, m)?;
+                let b = rhs.eval(row, m)?;
                 let tv = match op {
                     CmpOp::Eq => a.eq3(b),
                     CmpOp::Lt => a.lt3(b),
@@ -919,15 +972,23 @@ impl RExpr {
                 };
                 Ok(from3(tv))
             }
-            RExpr::And(l, r) => Ok(and3(l.eval(row)?, r.eval(row)?)),
-            RExpr::Or(l, r) => Ok(or3(l.eval(row)?, r.eval(row)?)),
+            RExpr::And(l, r) => {
+                m.charge(COSTS.operator_eval);
+                Ok(and3(l.eval(row, m)?, r.eval(row, m)?))
+            }
+            RExpr::Or(l, r) => {
+                m.charge(COSTS.operator_eval);
+                Ok(or3(l.eval(row, m)?, r.eval(row, m)?))
+            }
             RExpr::IsNull { operand, negated } => {
-                let is_null = matches!(operand.eval(row)?, Value::Null);
+                m.charge(COSTS.operator_eval);
+                let is_null = matches!(operand.eval(row, m)?, Value::Null);
                 // IS [NOT] NULL is always a definite boolean, never unknown (CLAUDE.md §4).
                 Ok(Value::Bool(is_null != *negated))
             }
             RExpr::Distinct { lhs, rhs, negated } => {
-                let same = lhs.eval(row)?.not_distinct_from(rhs.eval(row)?);
+                m.charge(COSTS.operator_eval);
+                let same = lhs.eval(row, m)?.not_distinct_from(rhs.eval(row, m)?);
                 // `negated` carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks
                 // "are they the same?" → `same`; IS DISTINCT FROM asks the opposite. Either
                 // way the result is a definite boolean — never unknown (the null_safe

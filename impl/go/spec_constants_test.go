@@ -178,3 +178,34 @@ func TestOperatorsMatchSpec(t *testing.T) {
 		}
 	}
 }
+
+func TestCostScheduleMatchesSpec(t *testing.T) {
+	// The generated cost schedule (codegen middle path, CLAUDE.md §5/§13) must match the
+	// canonical schedule.toml weight-for-weight. Cost is a cross-core contract (§8):
+	// every core reads these weights.
+	rows := readTomlTables(t, specPath(t, "cost/schedule.toml"), "unit")
+	if len(rows) != 3 {
+		t.Fatalf("expected the three phase-1 cost units, got %d", len(rows))
+	}
+	// Every unit id maps to a field on Costs; a new unit forces this cross-check to be
+	// updated (so a core cannot silently ignore a unit the schedule adds).
+	weight := func(id string) int64 {
+		switch id {
+		case "storage_row_read":
+			return Costs.StorageRowRead
+		case "row_produced":
+			return Costs.RowProduced
+		case "operator_eval":
+			return Costs.OperatorEval
+		default:
+			t.Fatalf("cost unit %q has no Costs field — update this cross-check", id)
+			return 0
+		}
+	}
+	for _, row := range rows {
+		id := row.str("id")
+		if got, want := weight(id), row.int("weight"); got != want {
+			t.Errorf("%s: weight got %d want %d", id, got, want)
+		}
+	}
+}

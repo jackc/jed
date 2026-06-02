@@ -101,7 +101,7 @@ fn int32_and_int64_overflow_boundaries() {
     // int32 max fits.
     assert_eq!(
         execute(&mut db, "INSERT INTO t VALUES (2, 2147483647)").unwrap(),
-        Outcome::Statement
+        Outcome::Statement { cost: 0 }
     );
 }
 

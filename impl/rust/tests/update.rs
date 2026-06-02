@@ -16,7 +16,7 @@ fn db_with(stmts: &[&str]) -> Database {
 fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
-        Outcome::Statement => panic!("expected a query result for {sql:?}"),
+        Outcome::Statement { .. } => panic!("expected a query result for {sql:?}"),
     }
 }
 

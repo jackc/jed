@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"abide"
@@ -115,17 +116,52 @@ func parseRequires(text string) []string {
 	return nil
 }
 
+// parseCostDirective parses a `# cost: N` directive line (CLAUDE.md §13). Returns the
+// asserted cost and true, or (0, false) if the comment is not a cost directive.
+func parseCostDirective(line string) (int64, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "cost:")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// assertCost checks the accrued execution cost matches a pending `# cost:` directive.
+func assertCost(expected *int64, actual int64, sql string) error {
+	if expected != nil && *expected != actual {
+		return fmt.Errorf("cost mismatch: expected %d, got %d\n  SQL: %s", *expected, actual, sql)
+	}
+	return nil
+}
+
 // runFile runs all records in one .test file against a fresh database.
 func runFile(text string) error {
 	db := abide.NewDatabase()
 	lines := strings.Split(text, "\n")
 	i := 0
+	// A `# cost: N` directive sets this; the next record consumes it (CLAUDE.md §13).
+	var pendingCost *int64
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" {
 			i++
 			continue
 		}
+		if strings.HasPrefix(line, "#") {
+			// `# cost: N` binds to the next record; every other comment is ignored.
+			if n, ok := parseCostDirective(line); ok {
+				pendingCost = &n
+			}
+			i++
+			continue
+		}
+		// This record consumes any pending cost assertion (so it never leaks forward).
+		expectedCost := pendingCost
+		pendingCost = nil
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "statement":
@@ -135,11 +171,14 @@ func runFile(text string) error {
 			}
 			i++
 			sql := takeSQL(lines, &i)
-			_, err := abide.Execute(db, sql)
+			outcome, err := abide.Execute(db, sql)
 			switch expect {
 			case "ok":
 				if err != nil {
 					return fmt.Errorf("statement expected ok, got error %s\n  SQL: %s", err.Error(), sql)
+				}
+				if cerr := assertCost(expectedCost, outcome.Cost, sql); cerr != nil {
+					return cerr
 				}
 			case "error":
 				want := ""
@@ -183,6 +222,9 @@ func runFile(text string) error {
 			expected = applySort(expected, cols, sortmode)
 			if !equal(actual, expected) {
 				return fmt.Errorf("query result mismatch\n  SQL: %s\n  expected: %v\n  actual:   %v", sql, expected, actual)
+			}
+			if cerr := assertCost(expectedCost, outcome.Cost, sql); cerr != nil {
+				return cerr
 			}
 		default:
 			return fmt.Errorf("unknown record kind %q", fields[0])

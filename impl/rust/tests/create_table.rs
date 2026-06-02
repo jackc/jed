@@ -17,7 +17,7 @@ fn creates_table_with_resolved_types_and_pk() {
         "CREATE TABLE nums (id int32 PRIMARY KEY, small int16, big int64)",
     )
     .unwrap();
-    assert_eq!(out, Outcome::Statement);
+    assert_eq!(out, Outcome::Statement { cost: 0 });
 
     let t: &Table = db.table("nums").expect("table registered");
     assert_eq!(t.columns.len(), 3);

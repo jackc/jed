@@ -22,11 +22,14 @@ const (
 	OutcomeQuery
 )
 
-// Outcome is the result of executing one statement.
+// Outcome is the result of executing one statement. Cost is the deterministic execution
+// cost accrued while running it (CLAUDE.md §13) — a DML statement accrues its scan +
+// filter cost even though it returns no rows.
 type Outcome struct {
 	Kind        OutcomeKind
 	ColumnCount int
 	Rows        [][]Value
+	Cost        int64
 }
 
 // Database is the whole database: catalog + per-table in-memory stores. Single
@@ -112,7 +115,8 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	}
 
 	db.putTable(&Table{Name: ct.Name, Columns: columns})
-	return Outcome{Kind: OutcomeStatement}, nil
+	// DDL touches no rows and evaluates no expressions: zero cost.
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
 // executeInsert analyzes and runs an INSERT: map the literal values positionally to
@@ -170,7 +174,9 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 		return Outcome{}, NewError(UniqueViolation,
 			"duplicate key value violates primary key uniqueness")
 	}
-	return Outcome{Kind: OutcomeStatement}, nil
+	// A single-row INSERT of literal values reads no rows and evaluates no expression
+	// tree: zero cost (DEFAULT expressions, when added, will accrue here).
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
 // executeDelete analyzes and runs a DELETE: resolve the table and optional predicate,
@@ -191,12 +197,17 @@ func (db *Database) executeDelete(del *Delete) (Outcome, error) {
 		filter = f
 	}
 
+	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13;
+	// spec/design/cost.md §3). Keys are collected before mutating (so the map is not
+	// modified mid-scan).
+	meter := NewMeter()
 	store := db.stores[strings.ToLower(del.Table)]
 	var keys [][]byte
 	for _, e := range store.EntriesInKeyOrder() {
+		meter.Charge(Costs.StorageRowRead)
 		matched := true
 		if filter != nil {
-			v, err := filter.eval(e.Row)
+			v, err := filter.eval(e.Row, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -209,7 +220,7 @@ func (db *Database) executeDelete(del *Delete) (Outcome, error) {
 	for _, k := range keys {
 		store.Remove(k)
 	}
-	return Outcome{Kind: OutcomeStatement}, nil
+	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
 }
 
 // executeUpdate analyzes and runs an UPDATE. Two-phase / all-or-nothing: phase 1
@@ -267,7 +278,10 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 		filter = f
 	}
 
-	// Phase 1: build + validate every matching row's new values; no writes yet.
+	// Phase 1: build + validate every matching row's new values; no writes yet. Each
+	// scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes
+	// do not — they evaluate nothing; spec/design/cost.md §3).
+	meter := NewMeter()
 	store := db.stores[strings.ToLower(upd.Table)]
 	type pending struct {
 		key []byte
@@ -275,8 +289,9 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 	}
 	var updates []pending
 	for _, e := range store.EntriesInKeyOrder() {
+		meter.Charge(Costs.StorageRowRead)
 		if filter != nil {
-			v, err := filter.eval(e.Row)
+			v, err := filter.eval(e.Row, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -287,7 +302,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 		newRow := make(Row, len(e.Row))
 		copy(newRow, e.Row)
 		for _, p := range plans {
-			raw, err := p.source.eval(e.Row)
+			raw, err := p.source.eval(e.Row, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -304,7 +319,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 	for _, u := range updates {
 		store.Replace(u.key, u.row)
 	}
-	return Outcome{Kind: OutcomeStatement}, nil
+	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
 }
 
 // RowsInKeyOrder returns a table's rows in primary-key (encoded byte) order, or nil
@@ -351,11 +366,15 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 
 	// Scan in primary-key order, then filter. A WHERE arithmetic can trap
 	// (22003/22012), so the error is propagated rather than swallowed in a predicate.
+	// Each scanned row and the filter evaluation accrue cost; the row-produced charge is
+	// below, at projection (CLAUDE.md §13; spec/design/cost.md §3).
+	meter := NewMeter()
 	var rows []Row
 	for _, row := range db.RowsInKeyOrder(sel.From) {
+		meter.Charge(Costs.StorageRowRead)
 		keep := true
 		if filter != nil {
-			v, err := filter.eval(row)
+			v, err := filter.eval(row, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -378,12 +397,14 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		})
 	}
 
-	// Project each surviving row.
+	// Project each surviving row. Producing a row, and each projection-list evaluation,
+	// accrue cost. (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
 	out := make([][]Value, 0, len(rows))
 	for _, row := range rows {
+		meter.Charge(Costs.RowProduced)
 		projected := make([]Value, len(projections))
 		for i, p := range projections {
-			v, err := p.eval(row)
+			v, err := p.eval(row, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -392,7 +413,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		out = append(out, projected)
 	}
 
-	return Outcome{Kind: OutcomeQuery, ColumnCount: len(projections), Rows: out}, nil
+	return Outcome{Kind: OutcomeQuery, ColumnCount: len(projections), Rows: out, Cost: meter.Accrued}, nil
 }
 
 // ============================================================================
@@ -746,10 +767,16 @@ func overflowErr(ty ScalarType) error {
 
 func typeError(msg string) error { return NewError(DatatypeMismatch, msg) }
 
-// eval evaluates against a row, returning a Value (a boolean for comparisons /
-// connectives). Arithmetic traps 22003 on overflow and 22012 on a zero divisor; NULL
-// propagates through arithmetic; the connectives are Kleene; IS NULL is always definite.
-func (e *rExpr) eval(row Row) (Value, error) {
+// eval evaluates against a row, accruing cost into m, and returns a Value (a boolean for
+// comparisons / connectives). Arithmetic traps 22003 on overflow and 22012 on a zero
+// divisor; NULL propagates through arithmetic; the connectives are Kleene; IS NULL is
+// always definite.
+//
+// Cost: each INTERIOR node charges operator_eval once, pre-order (the node, then its
+// operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both operands
+// are always evaluated — there is no short-circuit, so the count never depends on operand
+// values (spec/design/cost.md §3).
+func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 	switch e.kind {
 	case reColumn:
 		return row[e.index], nil
@@ -760,7 +787,8 @@ func (e *rExpr) eval(row Row) (Value, error) {
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
-		v, err := e.operand.eval(row)
+		m.Charge(Costs.OperatorEval)
+		v, err := e.operand.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -772,7 +800,8 @@ func (e *rExpr) eval(row Row) (Value, error) {
 		}
 		return IntValue(v.Int), nil
 	case reNeg:
-		v, err := e.operand.eval(row)
+		m.Charge(Costs.OperatorEval)
+		v, err := e.operand.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -788,17 +817,19 @@ func (e *rExpr) eval(row Row) (Value, error) {
 		}
 		return IntValue(n), nil
 	case reNot:
-		v, err := e.operand.eval(row)
+		m.Charge(Costs.OperatorEval)
+		v, err := e.operand.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return boolNot(v), nil
 	case reArith:
-		a, err := e.lhs.eval(row)
+		m.Charge(Costs.OperatorEval)
+		a, err := e.lhs.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row)
+		b, err := e.rhs.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -807,11 +838,12 @@ func (e *rExpr) eval(row Row) (Value, error) {
 		}
 		return evalArith(e.op, a.Int, b.Int, e.result)
 	case reCompare:
-		a, err := e.lhs.eval(row)
+		m.Charge(Costs.OperatorEval)
+		a, err := e.lhs.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row)
+		b, err := e.rhs.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -828,38 +860,42 @@ func (e *rExpr) eval(row Row) (Value, error) {
 			return from3(or3(a.Gt3(b), a.Eq3(b))), nil
 		}
 	case reAnd:
-		a, err := e.lhs.eval(row)
+		m.Charge(Costs.OperatorEval)
+		a, err := e.lhs.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row)
+		b, err := e.rhs.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return boolAnd(a, b), nil
 	case reOr:
-		a, err := e.lhs.eval(row)
+		m.Charge(Costs.OperatorEval)
+		a, err := e.lhs.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row)
+		b, err := e.rhs.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return boolOr(a, b), nil
 	case reIsNull:
-		v, err := e.operand.eval(row)
+		m.Charge(Costs.OperatorEval)
+		v, err := e.operand.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
 		isNull := v.Kind == ValNull
 		return BoolValue(isNull != e.negated), nil
 	default: // reDistinct
-		a, err := e.lhs.eval(row)
+		m.Charge(Costs.OperatorEval)
+		a, err := e.lhs.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row)
+		b, err := e.rhs.eval(row, m)
 		if err != nil {
 			return Value{}, err
 		}
