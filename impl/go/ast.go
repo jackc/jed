@@ -68,7 +68,16 @@ type Select struct {
 // SelectItems is either all columns (*) or a list of projected expressions.
 type SelectItems struct {
 	All   bool
-	Items []Expr
+	Items []SelectItem
+}
+
+// SelectItem is one select-list expression with its optional output-name alias
+// (expr AS name). The alias is an output label only — it never enters resolution
+// (spec/design/grammar.md §8). When Alias is nil the output name is derived by the
+// resolver: a bare column's canonical name, or the fixed "?column?" otherwise.
+type SelectItem struct {
+	Expr  Expr
+	Alias *string
 }
 
 // CompareOp is unused now that comparisons are BinaryOp; retained name removed.

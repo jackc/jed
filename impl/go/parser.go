@@ -367,13 +367,25 @@ func (p *Parser) parseSelectItems() (SelectItems, error) {
 		p.advance()
 		return SelectItems{All: true}, nil
 	}
-	var items []Expr
+	var items []SelectItem
 	for {
 		e, err := p.parseExpr()
 		if err != nil {
 			return SelectItems{}, err
 		}
-		items = append(items, e)
+		// Optional `AS alias` output label. `AS` is not reserved, so it is taken as an
+		// alias marker only here, after a complete expr (spec/grammar/grammar.ebnf
+		// `select_item`). The alias never enters resolution (grammar.md §8).
+		var alias *string
+		if p.peekKeyword() == "as" {
+			p.advance()
+			name, err := p.expectIdentifier()
+			if err != nil {
+				return SelectItems{}, err
+			}
+			alias = &name
+		}
+		items = append(items, SelectItem{Expr: e, Alias: alias})
 		if p.peek().Kind == TokComma {
 			p.advance()
 			continue

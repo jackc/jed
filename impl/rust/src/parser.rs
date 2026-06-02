@@ -6,7 +6,7 @@
 
 use crate::ast::{
     Assignment, BinaryOp, ColumnDef, CreateTable, Delete, Expr, Insert, Literal, OrderBy, Select,
-    SelectItems, Statement, UnaryOp, Update,
+    SelectItem, SelectItems, Statement, UnaryOp, Update,
 };
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
@@ -234,7 +234,17 @@ impl Parser {
         }
         let mut items = Vec::new();
         loop {
-            items.push(self.parse_expr()?);
+            let expr = self.parse_expr()?;
+            // Optional `AS alias` output label. `AS` is not reserved, so it is taken as
+            // an alias marker only here, after a complete expr (spec/grammar/grammar.ebnf
+            // `select_item`). The alias never enters resolution (grammar.md §8).
+            let alias = if self.peek_keyword().as_deref() == Some("as") {
+                self.advance();
+                Some(self.expect_identifier()?)
+            } else {
+                None
+            };
+            items.push(SelectItem { expr, alias });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
                 continue;

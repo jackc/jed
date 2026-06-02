@@ -82,8 +82,10 @@ Two lexer facts are easy to get subtly wrong across cores, so the grammar pins t
 The current surface is intentionally minimal. Every omission below is a future feature,
 tracked in [../../TODO.md](../../TODO.md), not an oversight:
 
-- **No aliases** — neither column (`expr AS name`) nor table aliases. The only `AS` in
-  the surface is inside `CAST(expr AS type)`.
+- **Column aliases via explicit `AS` only** (`expr AS name`); see §8 for the output-name
+  rule. **Table aliases** and **implicit** aliases (`expr name`, no `AS`) remain deferred,
+  and `AS` aliasing in `ORDER BY` is not yet visible (ORDER BY still resolves a bare table
+  column). Before this slice the only `AS` in the surface was inside `CAST(expr AS type)`.
 - **Single table** — one table per `SELECT`/`UPDATE`/`DELETE`; no `JOIN`, no subqueries.
 - **Positional `INSERT`** — no column list, no multi-row `VALUES`, no `DEFAULT`, and the
   values are *literals only* (not general expressions; see the `literal` production).
@@ -121,8 +123,36 @@ adds the parser code in all cores and the conformance entries that exercise it
 (CLAUDE.md §10/§11). The general expression substrate — operator precedence,
 parenthesization, integer arithmetic, the `boolean` type, and the `AND`/`OR`/`NOT`
 connectives — landed together as the `expr` tower above; [../../TODO.md](../../TODO.md)
-is the roadmap of what comes next (select-list aliases, `LIMIT`/`OFFSET`, richer
-`ORDER BY`, more predicate forms, and onward). Because the parser is hand-written rather than
+is the roadmap of what comes next (`LIMIT`/`OFFSET`, richer `ORDER BY`, more predicate
+forms, and onward). Because the parser is hand-written rather than
 generated, "conform to the grammar" is verified by cross-reading each production against
 the three parsers and confirming every corpus statement is derivable from the grammar,
 not by a generator step.
+
+## 8. Output column names
+
+Every result column has a **name**. The name is a determinism surface (CLAUDE.md §8): all
+three cores must compute the byte-identical name for the same query, so the rule is fixed
+here and asserted in the corpus via the `# names:` directive
+([conformance.md](conformance.md) §1). The resolver derives each select item's name in
+this order:
+
+1. **`expr AS alias`** → the `alias`, **as written**. The alias is a pure output label, so
+   it is *not* case-folded and *not* entered into any resolution namespace — WHERE,
+   ORDER BY, and sibling select items never see it. Aliases may collide with a real column
+   name or with each other (no uniqueness check); this is harmless precisely because they
+   are never looked up.
+2. **A bare column reference** (no alias) → the **catalog's canonical column name** at the
+   resolved index, i.e. the spelling from `CREATE TABLE`, *not* the spelling typed in the
+   SELECT. So with `c int32` declared, `SELECT C FROM t` names the column `c`. (Identifiers
+   match case-insensitively — §3 — so the user's casing must not leak into the output.)
+3. **`*`** → expands to each underlying column's canonical name, in column order — the same
+   expansion that produces the projections.
+4. **Any other un-aliased expression** (arithmetic, comparison, `CAST`, a literal, `IS NULL`,
+   a unary/logical expression, …) → the fixed literal **`?column?`**.
+
+Case 4 is deliberately a constant placeholder rather than a re-rendering of the expression
+text. Echoing normalized SQL text (the SQLite behaviour) would require a canonical
+expression printer that is byte-identical across Rust, Go, and TS — a new §8 divergence
+hotspot for no present benefit. A column whose name matters can be given one with `AS`. A
+normalized-name printer remains a possible later refinement.

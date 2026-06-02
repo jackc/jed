@@ -126,13 +126,34 @@ function assertCost(expected: bigint | null, actual: bigint, sql: string): void 
   }
 }
 
+// parseNamesDirective parses a `# names: a, b, ?column?` directive line. Returns the
+// asserted output column names, or null if not a names directive (conformance.md §1).
+function parseNamesDirective(line: string): string[] | null {
+  const m = line.match(/^#\s*names:\s*(.+)$/);
+  if (!m) return null;
+  return m[1]!
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+}
+
+// assertNames checks the query's output column names match a pending `# names:` directive.
+function assertNames(expected: string[] | null, actual: string[], sql: string): void {
+  if (expected !== null && !arrEq(expected, actual)) {
+    throw new Error(
+      `column-name mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(expected)}\n  actual:   ${JSON.stringify(actual)}`,
+    );
+  }
+}
+
 // runFile runs all records in one .test file against a fresh database.
 function runFile(text: string): void {
   const db = new Database();
   const lines = text.split("\n");
   const c: Cursor = { i: 0 };
-  // A `# cost: N` directive sets this; the next record consumes it (CLAUDE.md §13).
+  // A `# cost: N` / `# names: ...` directive sets these; the next record consumes them.
   let pendingCost: bigint | null = null;
+  let pendingNames: string[] | null = null;
   while (c.i < lines.length) {
     const line = lines[c.i]!.trim();
     if (line === "") {
@@ -140,17 +161,28 @@ function runFile(text: string): void {
       continue;
     }
     if (line.startsWith("#")) {
-      // `# cost: N` binds to the next record; every other comment is ignored.
+      // `# cost:` / `# names:` bind to the next record; every other comment is ignored.
       const n = parseCostDirective(line);
-      if (n !== null) pendingCost = n;
+      if (n !== null) {
+        pendingCost = n;
+      } else {
+        const names = parseNamesDirective(line);
+        if (names !== null) pendingNames = names;
+      }
       c.i++;
       continue;
     }
-    // This record consumes any pending cost assertion (so it never leaks forward).
+    // This record consumes any pending assertions (so they never leak forward).
     const expectedCost = pendingCost;
+    const expectedNames = pendingNames;
     pendingCost = null;
+    pendingNames = null;
     const fields = line.split(/\s+/);
     if (fields[0] === "statement") {
+      // A `# names:` directive asserts result columns, which a statement lacks.
+      if (expectedNames !== null) {
+        throw new Error("# names: directive precedes a non-query statement");
+      }
       const expect = fields[1] ?? "";
       c.i++;
       const sql = takeSQL(lines, c);
@@ -203,6 +235,7 @@ function runFile(text: string): void {
         );
       }
       assertCost(expectedCost, outcome.cost, sql);
+      assertNames(expectedNames, outcome.kind === "query" ? outcome.columnNames : [], sql);
     } else {
       throw new Error(`unknown record kind "${fields[0]}"`);
     }

@@ -25,9 +25,10 @@ use std::collections::HashMap;
 pub enum Outcome {
     /// A statement that produces no result set (CREATE, INSERT, UPDATE, DELETE).
     Statement { cost: i64 },
-    /// A query result: column count plus rows in result order.
+    /// A query result: output column names plus rows in result order. The column count
+    /// is `column_names.len()` (spec/design/grammar.md §8).
     Query {
-        column_count: usize,
+        column_names: Vec<String>,
         rows: Vec<Vec<Value>>,
         cost: i64,
     },
@@ -39,6 +40,14 @@ impl Outcome {
         match self {
             Outcome::Statement { cost } => *cost,
             Outcome::Query { cost, .. } => *cost,
+        }
+    }
+
+    /// The output column names of a query result (empty for a non-query statement).
+    pub fn column_names(&self) -> &[String] {
+        match self {
+            Outcome::Query { column_names, .. } => column_names,
+            Outcome::Statement { .. } => &[],
         }
     }
 }
@@ -380,9 +389,9 @@ impl Database {
             )
         })?;
 
-        // Resolve projections to evaluable expression trees against the table.
-        let projections = resolve_projections(table, &sel.items)?;
-        let column_count = projections.len();
+        // Resolve projections to evaluable expression trees against the table, paired
+        // with their output column names (spec/design/grammar.md §8).
+        let (projections, column_names) = resolve_projections(table, &sel.items)?;
 
         // Resolve the optional WHERE expression; it must resolve to boolean.
         let filter = match &sel.filter {
@@ -438,7 +447,7 @@ impl Database {
         let mut out_rows = Vec::with_capacity(rows.len());
         for row in &rows {
             meter.charge(COSTS.row_produced);
-            let mut out = Vec::with_capacity(column_count);
+            let mut out = Vec::with_capacity(projections.len());
             for p in &projections {
                 out.push(p.eval(row, &mut meter)?);
             }
@@ -446,7 +455,7 @@ impl Database {
         }
 
         Ok(Outcome::Query {
-            column_count,
+            column_names,
             rows: out_rows,
             cost: meter.accrued,
         })
@@ -547,14 +556,41 @@ enum RExpr {
 }
 
 /// Resolve `SELECT` items against a table into evaluable projections (any result type
-/// is allowed in the select list, including boolean — `SELECT a = b`).
-fn resolve_projections(table: &Table, items: &SelectItems) -> Result<Vec<RExpr>> {
+/// is allowed in the select list, including boolean — `SELECT a = b`), each paired with
+/// its output column name (spec/design/grammar.md §8).
+fn resolve_projections(table: &Table, items: &SelectItems) -> Result<(Vec<RExpr>, Vec<String>)> {
     match items {
-        SelectItems::All => Ok((0..table.columns.len()).map(RExpr::Column).collect()),
-        SelectItems::Items(exprs) => exprs
-            .iter()
-            .map(|e| resolve(table, e, None).map(|(node, _)| node))
-            .collect(),
+        SelectItems::All => Ok((
+            (0..table.columns.len()).map(RExpr::Column).collect(),
+            table.columns.iter().map(|c| c.name.clone()).collect(),
+        )),
+        SelectItems::Items(items) => {
+            let mut nodes = Vec::with_capacity(items.len());
+            let mut names = Vec::with_capacity(items.len());
+            for it in items {
+                let (node, _) = resolve(table, &it.expr, None)?;
+                names.push(match &it.alias {
+                    Some(a) => a.clone(),
+                    None => output_name(table, &it.expr),
+                });
+                nodes.push(node);
+            }
+            Ok((nodes, names))
+        }
+    }
+}
+
+/// The output column name of an un-aliased select item (spec/design/grammar.md §8): a
+/// bare column reference takes the catalog's canonical name (the `CREATE TABLE` spelling,
+/// not the SELECT spelling, so the user's casing never leaks); every other expression
+/// takes the fixed `?column?`. The column is known to exist — `resolve` validated it.
+fn output_name(table: &Table, e: &Expr) -> String {
+    match e {
+        Expr::Column(name) => match table.column_index(name) {
+            Some(idx) => table.columns[idx].name.clone(),
+            None => name.clone(),
+        },
+        _ => "?column?".to_string(),
     }
 }
 

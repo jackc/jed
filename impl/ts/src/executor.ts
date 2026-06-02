@@ -50,7 +50,7 @@ import {
 // though it returns no rows. It is a bigint for int64 parity across cores (§8).
 export type Outcome =
   | { kind: "statement"; cost: bigint }
-  | { kind: "query"; columnCount: number; rows: Value[][]; cost: bigint };
+  | { kind: "query"; columnNames: string[]; rows: Value[][]; cost: bigint };
 
 // Database is the whole database: catalog + per-table in-memory stores. Single
 // committed state (CLAUDE.md §3); the staging-buffer commit model lands later. Names
@@ -307,7 +307,7 @@ export class Database {
       throw engineError("undefined_table", "table does not exist: " + sel.from);
     }
 
-    const projections = resolveProjections(table, sel.items);
+    const { nodes: projections, names: columnNames } = resolveProjections(table, sel.items);
     const filter = sel.filter ? resolveBooleanFilter(table, sel.filter) : null;
 
     let orderIdx = -1;
@@ -348,7 +348,7 @@ export class Database {
       meter.charge(COSTS.rowProduced);
       return projections.map((p) => evalExpr(p, row, meter));
     });
-    return { kind: "query", columnCount: projections.length, rows: out, cost: meter.accrued };
+    return { kind: "query", columnNames, rows: out, cost: meter.accrued };
   }
 }
 
@@ -386,12 +386,39 @@ type RExpr =
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean };
 
 // resolveProjections resolves SELECT items into evaluable projections (any result type
-// is allowed in the select list, including boolean — SELECT a = b).
-function resolveProjections(table: Table, items: SelectItems): RExpr[] {
+// is allowed in the select list, including boolean — SELECT a = b), each paired with its
+// output column name (spec/design/grammar.md §8).
+function resolveProjections(
+  table: Table,
+  items: SelectItems,
+): { nodes: RExpr[]; names: string[] } {
   if (items.kind === "all") {
-    return table.columns.map((_c, i): RExpr => ({ kind: "column", index: i }));
+    return {
+      nodes: table.columns.map((_c, i): RExpr => ({ kind: "column", index: i })),
+      names: table.columns.map((c) => c.name),
+    };
   }
-  return items.items.map((e) => resolve(table, e, null).node);
+  const nodes: RExpr[] = [];
+  const names: string[] = [];
+  for (const it of items.items) {
+    nodes.push(resolve(table, it.expr, null).node);
+    names.push(it.alias ?? outputName(table, it.expr));
+  }
+  return { nodes, names };
+}
+
+// outputName is the output column name of an un-aliased select item
+// (spec/design/grammar.md §8): a bare column reference takes the catalog's canonical name
+// (the CREATE TABLE spelling, not the SELECT spelling, so the user's casing never leaks);
+// every other expression takes the fixed "?column?". The column is known to exist —
+// resolve validated it.
+function outputName(table: Table, e: Expr): string {
+  if (e.kind === "column") {
+    const idx = columnIndex(table, e.name);
+    if (idx >= 0) return table.columns[idx]!.name;
+    return e.name;
+  }
+  return "?column?";
 }
 
 // resolveBooleanFilter resolves a WHERE expression; it must resolve to boolean (or an

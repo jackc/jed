@@ -48,10 +48,16 @@ export type Expr =
   // (its negation). Always boolean-valued, never unknown (spec/design/functions.md §3).
   | { kind: "isDistinct"; lhs: Expr; rhs: Expr; negated: boolean };
 
+// SelectItem is one select-list expression with its optional output-name alias
+// (expr AS name). The alias is an output label only — it never enters resolution
+// (spec/design/grammar.md §8). When alias is null the output name is derived by the
+// resolver: a bare column's canonical name, or the fixed "?column?" otherwise.
+export type SelectItem = { expr: Expr; alias: string | null };
+
 // SelectItems is either all columns (*) or a list of projected expressions.
 export type SelectItems =
   | { kind: "all" }
-  | { kind: "list"; items: Expr[] };
+  | { kind: "list"; items: SelectItem[] };
 
 // OrderBy is an ORDER BY clause. Step-1 corpus uses ascending only; descending is
 // reserved for later.

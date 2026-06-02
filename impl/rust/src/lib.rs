@@ -56,6 +56,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.comparison_order",
     "query.is_null",
     "query.order_by",
+    // Select-list output naming: SELECT *, AS aliases, and the ?column? rule (grammar.md §8).
+    "query.select_star",
+    "query.column_alias",
     "null.three_valued",
     "compare.promotion",
     "cast.explicit",

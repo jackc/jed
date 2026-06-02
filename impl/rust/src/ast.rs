@@ -72,7 +72,17 @@ pub struct Select {
 pub enum SelectItems {
     All,
     /// Projected expressions, one per output column.
-    Items(Vec<Expr>),
+    Items(Vec<SelectItem>),
+}
+
+/// One select-list expression with its optional output-name alias (`expr AS name`).
+/// The alias is an output label only — it never enters resolution (spec/design/grammar.md
+/// §8). The output name when `alias` is `None` is derived by the resolver: a bare column's
+/// canonical name, or the fixed `?column?` for any other expression.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SelectItem {
+    pub expr: Expr,
+    pub alias: Option<String>,
 }
 
 /// A general expression, shared by the SELECT list, WHERE, and UPDATE ... SET. The

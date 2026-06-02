@@ -121,8 +121,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 > Builds directly on the Phase 1 expression substrate. High importance, mostly M.
 
-- [ ] **Select-list expressions + `*` + column aliases (`AS`).** Today SELECT takes bare
-      columns (and CAST). _(size: M; deps: expression evaluator)_
+- [x] **Select-list expressions + `*` + column aliases (`AS`).** Select-list expressions and
+      `*` already worked; this added explicit `AS` aliases and, with them, **output column
+      naming** as a cross-core contract. Done: the naming rule (bare column → catalog canonical
+      name; `expr AS alias` → alias; `*` → column names; any other expression → the fixed
+      `?column?`) authored in [spec/design/grammar.md](spec/design/grammar.md) §8 + the
+      `select_item` production in [spec/grammar/grammar.ebnf](spec/grammar/grammar.ebnf); the
+      query `Outcome` now carries `column_names` in all three cores (replacing the dead
+      `column_count`), with aliases parsed as output-only labels (invisible to WHERE/ORDER BY);
+      and a new `# names:` conformance directive (mirroring `# cost:`,
+      [conformance.md](spec/design/conformance.md) §1) asserts the byte-identical names in Rust,
+      Go, **and** TS, pinned by
+      [spec/conformance/suites/query/select_list.test](spec/conformance/suites/query/select_list.test)
+      (capabilities `query.column_alias` + `query.select_star`). _(size: M; deps: expression evaluator)_
 - [ ] **`LIMIT` / `OFFSET`.** _(size: S)_
 - [ ] **Richer `ORDER BY`** — multiple keys, per-key `ASC`/`DESC`, `NULLS FIRST|LAST`
       (the physical NULLs-first order is ratified; this is the SQL-level override, types.md §4).

@@ -26,8 +26,10 @@ const (
 // cost accrued while running it (CLAUDE.md §13) — a DML statement accrues its scan +
 // filter cost even though it returns no rows.
 type Outcome struct {
-	Kind        OutcomeKind
-	ColumnCount int
+	Kind OutcomeKind
+	// ColumnNames are the output column names of a query result (nil for a non-query
+	// statement); the column count is len(ColumnNames) (spec/design/grammar.md §8).
+	ColumnNames []string
 	Rows        [][]Value
 	Cost        int64
 }
@@ -342,7 +344,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+sel.From)
 	}
 
-	projections, err := resolveProjections(table, sel.Items)
+	projections, columnNames, err := resolveProjections(table, sel.Items)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -413,7 +415,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		out = append(out, projected)
 	}
 
-	return Outcome{Kind: OutcomeQuery, ColumnCount: len(projections), Rows: out, Cost: meter.Accrued}, nil
+	return Outcome{Kind: OutcomeQuery, ColumnNames: columnNames, Rows: out, Cost: meter.Accrued}, nil
 }
 
 // ============================================================================
@@ -491,24 +493,48 @@ type rExpr struct {
 }
 
 // resolveProjections resolves SELECT items into evaluable projections (any result type
-// is allowed in the select list, including boolean — SELECT a = b).
-func resolveProjections(table *Table, items SelectItems) ([]*rExpr, error) {
+// is allowed in the select list, including boolean — SELECT a = b), each paired with its
+// output column name (spec/design/grammar.md §8).
+func resolveProjections(table *Table, items SelectItems) ([]*rExpr, []string, error) {
 	if items.All {
 		ps := make([]*rExpr, len(table.Columns))
+		names := make([]string, len(table.Columns))
 		for i := range table.Columns {
 			ps[i] = &rExpr{kind: reColumn, index: i}
+			names[i] = table.Columns[i].Name
 		}
-		return ps, nil
+		return ps, names, nil
 	}
 	ps := make([]*rExpr, 0, len(items.Items))
-	for _, e := range items.Items {
-		node, _, err := resolve(table, e, nil)
+	names := make([]string, 0, len(items.Items))
+	for _, it := range items.Items {
+		node, _, err := resolve(table, it.Expr, nil)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		ps = append(ps, node)
+		if it.Alias != nil {
+			names = append(names, *it.Alias)
+		} else {
+			names = append(names, outputName(table, it.Expr))
+		}
 	}
-	return ps, nil
+	return ps, names, nil
+}
+
+// outputName is the output column name of an un-aliased select item
+// (spec/design/grammar.md §8): a bare column reference takes the catalog's canonical name
+// (the CREATE TABLE spelling, not the SELECT spelling, so the user's casing never leaks);
+// every other expression takes the fixed "?column?". The column is known to exist —
+// resolve validated it.
+func outputName(table *Table, e Expr) string {
+	if e.Kind == ExprColumn {
+		if idx := table.ColumnIndex(e.Column); idx >= 0 {
+			return table.Columns[idx].Name
+		}
+		return e.Column
+	}
+	return "?column?"
 }
 
 // resolveBooleanFilter resolves a WHERE expression; it must resolve to boolean (or an

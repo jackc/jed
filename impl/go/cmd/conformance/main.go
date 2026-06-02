@@ -138,13 +138,39 @@ func assertCost(expected *int64, actual int64, sql string) error {
 	return nil
 }
 
+// parseNamesDirective parses a `# names: a, b, ?column?` directive line. Returns the
+// asserted output column names and true, or (nil, false) if not a names directive
+// (spec/design/conformance.md §1).
+func parseNamesDirective(line string) ([]string, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "names:")
+	if !ok {
+		return nil, false
+	}
+	var names []string
+	for _, part := range strings.Split(rest, ",") {
+		if s := strings.TrimSpace(part); s != "" {
+			names = append(names, s)
+		}
+	}
+	return names, true
+}
+
+// assertNames checks the query's output column names match a pending `# names:` directive.
+func assertNames(expected []string, actual []string, sql string) error {
+	if expected != nil && !equal(expected, actual) {
+		return fmt.Errorf("column-name mismatch\n  SQL: %s\n  expected: %v\n  actual:   %v", sql, expected, actual)
+	}
+	return nil
+}
+
 // runFile runs all records in one .test file against a fresh database.
 func runFile(text string) error {
 	db := abide.NewDatabase()
 	lines := strings.Split(text, "\n")
 	i := 0
-	// A `# cost: N` directive sets this; the next record consumes it (CLAUDE.md §13).
+	// A `# cost: N` / `# names: ...` directive sets these; the next record consumes them.
 	var pendingCost *int64
+	var pendingNames []string
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
@@ -152,19 +178,27 @@ func runFile(text string) error {
 			continue
 		}
 		if strings.HasPrefix(line, "#") {
-			// `# cost: N` binds to the next record; every other comment is ignored.
+			// `# cost:` / `# names:` bind to the next record; every other comment is ignored.
 			if n, ok := parseCostDirective(line); ok {
 				pendingCost = &n
+			} else if names, ok := parseNamesDirective(line); ok {
+				pendingNames = names
 			}
 			i++
 			continue
 		}
-		// This record consumes any pending cost assertion (so it never leaks forward).
+		// This record consumes any pending assertions (so they never leak forward).
 		expectedCost := pendingCost
+		expectedNames := pendingNames
 		pendingCost = nil
+		pendingNames = nil
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "statement":
+			// A `# names:` directive asserts result columns, which a statement lacks.
+			if expectedNames != nil {
+				return fmt.Errorf("# names: directive precedes a non-query statement")
+			}
 			expect := ""
 			if len(fields) > 1 {
 				expect = fields[1]
@@ -225,6 +259,9 @@ func runFile(text string) error {
 			}
 			if cerr := assertCost(expectedCost, outcome.Cost, sql); cerr != nil {
 				return cerr
+			}
+			if nerr := assertNames(expectedNames, outcome.ColumnNames, sql); nerr != nil {
+				return nerr
 			}
 		default:
 			return fmt.Errorf("unknown record kind %q", fields[0])

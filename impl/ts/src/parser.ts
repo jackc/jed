@@ -12,6 +12,7 @@ import type {
   Literal,
   OrderBy,
   Select,
+  SelectItem,
   SelectItems,
   Statement,
   Update,
@@ -238,9 +239,18 @@ class Parser {
       this.advance();
       return { kind: "all" };
     }
-    const items: Expr[] = [];
+    const items: SelectItem[] = [];
     for (;;) {
-      items.push(this.parseExpr());
+      const expr = this.parseExpr();
+      // Optional `AS alias` output label. `AS` is not reserved, so it is taken as an
+      // alias marker only here, after a complete expr (spec/grammar/grammar.ebnf
+      // `select_item`). The alias never enters resolution (grammar.md §8).
+      let alias: string | null = null;
+      if (this.peekKeyword() === "as") {
+        this.advance();
+        alias = this.expectIdentifier();
+      }
+      items.push({ expr, alias });
       if (this.peek().kind === "comma") {
         this.advance();
         continue;

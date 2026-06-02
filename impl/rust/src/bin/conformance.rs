@@ -102,6 +102,18 @@ fn parse_cost_directive(rest: &str) -> Option<i64> {
     rest.trim_start().strip_prefix("cost:")?.trim().parse().ok()
 }
 
+/// Parse a `# names: a, b, ?column?` directive body. Returns the asserted output column
+/// names, or None if this comment is not a names directive (spec/design/conformance.md §1).
+fn parse_names_directive(rest: &str) -> Option<Vec<String>> {
+    let list = rest.trim_start().strip_prefix("names:")?;
+    Some(
+        list.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
+}
+
 /// Assert the accrued execution cost matches a pending `# cost:` directive (if any).
 fn assert_cost(expected: Option<i64>, actual: i64, sql: &str) -> std::result::Result<(), String> {
     match expected {
@@ -112,13 +124,28 @@ fn assert_cost(expected: Option<i64>, actual: i64, sql: &str) -> std::result::Re
     }
 }
 
+/// Assert the query's output column names match a pending `# names:` directive (if any).
+fn assert_names(
+    expected: Option<&[String]>,
+    actual: &[String],
+    sql: &str,
+) -> std::result::Result<(), String> {
+    match expected {
+        Some(e) if e != actual => Err(format!(
+            "column-name mismatch\n  SQL: {sql}\n  expected: {e:?}\n  actual:   {actual:?}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Run all records in one .test file against a fresh database. Returns the first
 /// mismatch as an error string.
 fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut db = Database::new();
     let mut lines = text.lines().peekable();
-    // A `# cost: N` directive sets this; the next record consumes it (CLAUDE.md §13).
+    // A `# cost: N` / `# names: ...` directive sets these; the next record consumes them.
     let mut pending_cost: Option<i64> = None;
+    let mut pending_names: Option<Vec<String>> = None;
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -126,18 +153,25 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('#') {
-            // `# cost: N` binds to the next record; every other comment is ignored.
+            // `# cost:` / `# names:` bind to the next record; every other comment is ignored.
             if let Some(n) = parse_cost_directive(rest) {
                 pending_cost = Some(n);
+            } else if let Some(names) = parse_names_directive(rest) {
+                pending_names = Some(names);
             }
             continue;
         }
-        // This record consumes any pending cost assertion (so it never leaks forward).
+        // This record consumes any pending assertions (so they never leak forward).
         let expected_cost = pending_cost.take();
+        let expected_names = pending_names.take();
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();
         match kind {
             "statement" => {
+                // A `# names:` directive asserts result columns, which a statement lacks.
+                if expected_names.is_some() {
+                    return Err("# names: directive precedes a non-query statement".to_string());
+                }
                 let expect = parts.next().unwrap_or("");
                 let sql = take_sql(&mut lines);
                 let result = abide::execute(&mut db, &sql);
@@ -199,6 +233,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                     ));
                 }
                 assert_cost(expected_cost, outcome.cost(), &sql)?;
+                assert_names(expected_names.as_deref(), outcome.column_names(), &sql)?;
             }
             other => return Err(format!("unknown record kind '{other}'")),
         }

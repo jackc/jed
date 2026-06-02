@@ -52,6 +52,14 @@ Conventions, fixed here so every implementation renders identically:
   line: `# requires: ddl.create_table, dml.insert, types.int16`. This is the file-level
   gate (§3). It is a **comment**, so the stock runner ignores it (§1.1); our harness reads
   it. Exactly one per file; the checker enforces this.
+- **`# names:` directive** — an optional `# names: id, total, ?column?` comment that binds
+  to the **next `query` record** and asserts that query's output column names, in order, as
+  rendered strings. It mirrors the `# cost: N` directive (CLAUDE.md §13): both are comments
+  the stock runner ignores (§1.1), each is consumed independently by the next record, and a
+  `query` may carry either, both, or neither. Output names are a determinism surface — the
+  rule that fixes them (bare column → canonical name, `expr AS alias` → alias, `*` → column
+  names, any other expression → `?column?`) lives in [grammar.md](grammar.md) §8. The
+  directive must precede a `query`, never a `statement` (a statement has no result columns).
 
 ### 1.1 Why stay format-compatible
 

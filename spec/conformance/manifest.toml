@@ -65,6 +65,14 @@ id = "query.order_by"
 description = "ORDER BY for deterministic multi-row output"
 
 [[capability]]
+id = "query.select_star"
+description = "SELECT * expands to all columns with their canonical names"
+
+[[capability]]
+id = "query.column_alias"
+description = "Select-list output naming: bare column → canonical name, expr AS alias → alias, other expr → ?column?"
+
+[[capability]]
 id = "types.int16"
 description = "int16 / smallint scalar type"
 

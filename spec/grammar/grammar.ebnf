@@ -74,8 +74,21 @@ select         ::= "SELECT" select_items "FROM" identifier
                    where_clause?
                    order_by?
 
+/* A select item is a general expression with an optional output-name alias. The
+ * "*" glob is a STANDALONE alternative — it is the whole select list, never mixed
+ * with other items ("SELECT *, a" is not accepted; "SELECT t.*" has no qualified
+ * form). Aliasing requires the explicit "AS" keyword; there is no implicit alias
+ * ("SELECT a b"). The alias is an OUTPUT LABEL only: it names the result column and
+ * is invisible to WHERE and ORDER BY resolution (those still resolve against table
+ * columns). "AS" is not reserved (a column may be named "as"); the parser takes it
+ * as an alias marker only after a complete expr, exactly as CAST consumes its own
+ * inner "AS". The output name of an item with no alias is the column's canonical
+ * name for a bare column reference, and the fixed literal "?column?" for any other
+ * expression (see ../design/grammar.md §8). */
 select_items   ::= "*"
-                 | expr ("," expr)*
+                 | select_item ("," select_item)*
+
+select_item    ::= expr ("AS" identifier)?
 
 order_by       ::= "ORDER" "BY" identifier ("ASC" | "DESC")?
 
