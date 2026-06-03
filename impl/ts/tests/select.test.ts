@@ -1,4 +1,4 @@
-// SELECT: point lookup, ORDER BY (NULLs first), IS [NOT] NULL, three-valued WHERE,
+// SELECT: point lookup, ORDER BY (NULLs last), IS [NOT] NULL, three-valued WHERE,
 // cross-type comparison via the promotion tower, and CAST range re-checking.
 
 import assert from "node:assert/strict";
@@ -19,11 +19,11 @@ test("point lookup by primary key", () => {
   assert.deepStrictEqual(query(seed(), "SELECT v FROM t WHERE id = 1"), [["10"]]);
 });
 
-test("ORDER BY puts NULLs first (ascending)", () => {
+test("ORDER BY puts NULLs last (ascending, the PostgreSQL model)", () => {
   assert.deepStrictEqual(query(seed(), "SELECT v FROM t ORDER BY v"), [
-    ["NULL"],
     ["10"],
     ["30"],
+    ["NULL"],
   ]);
 });
 

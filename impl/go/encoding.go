@@ -34,12 +34,14 @@ func DecodeInt(t ScalarType, b []byte) int64 {
 	return int64(u - (uint64(1) << (shift - 1)))
 }
 
-// EncodeNullable encodes a nullable key slot: a 1-byte presence tag (0x00 NULL,
-// 0x01 present) followed by the value bytes when present. Makes NULLs sort first in
-// ascending order (spec/design/encoding.md §2/§4). A nil pointer means NULL.
+// EncodeNullable encodes a nullable key slot: a 1-byte presence tag (0x00 present,
+// 0x01 NULL), with the value bytes following the tag when present. Because 0x00 <
+// 0x01, present values sort before NULL, so NULLs sort LAST in ascending order;
+// descending inverts the component, lifting NULL to first (the PostgreSQL model —
+// NULL is the largest value; spec/design/encoding.md §2/§4). A nil pointer means NULL.
 func EncodeNullable(t ScalarType, value *int64) []byte {
 	if value == nil {
-		return []byte{0x00}
+		return []byte{0x01}
 	}
-	return append([]byte{0x01}, EncodeInt(t, *value)...)
+	return append([]byte{0x00}, EncodeInt(t, *value)...)
 }

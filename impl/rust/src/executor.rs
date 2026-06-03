@@ -1152,8 +1152,8 @@ fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> 
 /// One ORDER BY key's total-order comparison. NULL placement is governed by `nulls_first`
 /// and applied INDEPENDENTLY of the value-direction flip (`descending`), so an explicit
 /// `NULLS FIRST|LAST` overrides the direction default (spec/design/grammar.md §10). The
-/// physical key order ratifies NULL as the smallest value, which surfaces as the parse-time
-/// default `nulls_first = !descending` (ASC → first, DESC → last).
+/// physical key order ratifies NULL as the largest value (the PostgreSQL model), which
+/// surfaces as the parse-time default `nulls_first = descending` (ASC → last, DESC → first).
 fn key_cmp(a: Value, b: Value, descending: bool, nulls_first: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {

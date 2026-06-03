@@ -29,11 +29,12 @@ def dec_bare(bytes, width)
   bytes.bytes.reduce(0) { |acc, b| (acc << 8) | b } - (1 << (width * 8 - 1))
 end
 
-# nullable slot: 0x00 = NULL, 0x01 = present + value bytes.
+# nullable slot: 0x00 = present + value bytes, 0x01 = NULL. Present (0x00) sorts
+# before NULL (0x01), so NULLs sort last ascending (the PostgreSQL model).
 def enc_nullable(c, width)
-  return [0x00].pack("C") if c["null"]
+  return [0x01].pack("C") if c["null"]
 
-  [0x01].pack("C") + enc_bare(c["value"], width)
+  [0x00].pack("C") + enc_bare(c["value"], width)
 end
 
 def invert(bytes)

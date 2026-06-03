@@ -1,7 +1,7 @@
 package abide
 
 // Phase D/E: SELECT — projection, WHERE (=, ordering ops, IS [NOT] NULL),
-// three-valued logic, ORDER BY (NULLs first), and CAST. These complement the
+// three-valued logic, ORDER BY (NULLs last), and CAST. These complement the
 // conformance corpus with finer-grained per-feature assertions.
 
 import "testing"
@@ -89,13 +89,15 @@ func TestComparisonExcludesNullRows(t *testing.T) {
 	}
 }
 
-func TestOrderByNullsFirstThenDescLast(t *testing.T) {
+func TestOrderByNullsLastThenDescFirst(t *testing.T) {
 	db := setupT(t)
-	if got := queryIDs(t, db, "SELECT id FROM t ORDER BY v"); !eqInts(got, 3, 1, 2) {
-		t.Errorf("asc got %v want [3 1 2]", got)
+	// NULL is the largest value (PostgreSQL model): ASC puts the NULL row (id 3) last.
+	if got := queryIDs(t, db, "SELECT id FROM t ORDER BY v"); !eqInts(got, 1, 2, 3) {
+		t.Errorf("asc got %v want [1 2 3]", got)
 	}
-	if got := queryIDs(t, db, "SELECT id FROM t ORDER BY v DESC"); !eqInts(got, 2, 1, 3) {
-		t.Errorf("desc got %v want [2 1 3]", got)
+	// DESC inverts: the NULL row leads.
+	if got := queryIDs(t, db, "SELECT id FROM t ORDER BY v DESC"); !eqInts(got, 3, 2, 1) {
+		t.Errorf("desc got %v want [3 2 1]", got)
 	}
 }
 

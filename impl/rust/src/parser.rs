@@ -189,7 +189,7 @@ impl Parser {
 
     /// Parse an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare column with
     /// an optional `ASC`/`DESC` and an optional `NULLS FIRST|LAST`. `nulls_first` is resolved
-    /// here: explicit if given, else the direction default (ASC → first, DESC → last). A bare
+    /// here: explicit if given, else the direction default (ASC → last, DESC → first). A bare
     /// `NULLS` not followed by `FIRST`/`LAST` is a syntax error (42601). Returns an empty vec
     /// when there is no ORDER BY (spec/grammar/grammar.ebnf `order_by`).
     fn parse_order_by(&mut self) -> Result<Vec<OrderKey>> {
@@ -231,7 +231,9 @@ impl Parser {
                 }
             } else {
                 // No explicit clause: default follows direction (grammar.md §10).
-                !descending
+                // NULL is the largest value (PostgreSQL model), so ASC → NULLS LAST,
+                // DESC → NULLS FIRST.
+                descending
             };
             keys.push(OrderKey {
                 column,

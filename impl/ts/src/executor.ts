@@ -2,7 +2,7 @@
 // parsed statement; analyze (resolve types, predicates, projections against the
 // catalog); run. Errors throw EngineError. Results are produced deterministically
 // (CLAUDE.md §10): scan in primary-key order, three-valued WHERE (only TRUE keeps a
-// row), stable ORDER BY with NULLs first.
+// row), stable ORDER BY with NULLs last (the PostgreSQL model).
 
 import type {
   BinaryOp,
@@ -846,8 +846,8 @@ function or3(a: "true" | "false" | "unknown", b: "true" | "false" | "unknown"): 
 // keyCmp is one ORDER BY key's total-order comparison, returning <0, 0, >0. NULL placement
 // is governed by nullsFirst and applied INDEPENDENTLY of the value-direction flip
 // (descending), so an explicit NULLS FIRST|LAST overrides the direction default
-// (spec/design/grammar.md §10). The physical key order ratifies NULL as the smallest value,
-// which surfaces as the parse-time default nullsFirst = !descending.
+// (spec/design/grammar.md §10). The physical key order ratifies NULL as the largest value
+// (the PostgreSQL model), which surfaces as the parse-time default nullsFirst = descending.
 function keyCmp(a: Value, b: Value, descending: boolean, nullsFirst: boolean): number {
   if (a.kind === "null" && b.kind === "null") return 0;
   if (a.kind === "null") return nullsFirst ? -1 : 1;

@@ -12,8 +12,8 @@
 #
 # ORDER BY under DISTINCT takes the PostgreSQL restriction: every key must appear as a bare
 # column in the select list (or the list is `*`), else 42P10 — once duplicates collapse, a
-# key not in the output has no single value per row. (The engine keeps its own SQLite NULL
-# ordering, §10 — only the list-membership rule is borrowed from PG.)
+# key not in the output has no single value per row. (NULL ordering also follows PostgreSQL,
+# §10 — NULL is the largest value, so ASC defaults to NULLS LAST.)
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.distinct, query.order_by, query.select_star, query.column_alias, query.comparison_order, query.limit, query.offset, expr.arithmetic, expr.comparison_value, types.int32, types.boolean, error.division_by_zero, resource.cost_metering
 
 statement ok
@@ -62,34 +62,34 @@ SELECT DISTINCT b FROM t
 7
 NULL
 
-# DISTINCT + ORDER BY (allowed — `a` is bare-projected). ASC defaults to NULLS FIRST (the
-# SQLite model, §10): NULL leads, then 10, then 20. 5 scanned + 3 produced = 8.
+# DISTINCT + ORDER BY (allowed — `a` is bare-projected). ASC defaults to NULLS LAST (the
+# PostgreSQL model, §10): 10, then 20, then NULL last. 5 scanned + 3 produced = 8.
 # names: a
 # cost: 8
 query I nosort
 SELECT DISTINCT a FROM t ORDER BY a
 ----
-NULL
 10
 20
+NULL
 
 # Multi-column dedup ordered by `a`: distinct `(a,b)` pairs. Within the a=10 group the
 # distinct pairs (10,5) and (10,NULL) keep first-occurrence order (row1 before row4); the
-# (10,5) duplicate (rows 1,2) collapses, and (NULL,NULL) sorts first. 5 scanned + 4
+# (10,5) duplicate (rows 1,2) collapses, and (NULL,NULL) sorts last. 5 scanned + 4
 # produced = 9.
 # names: a, b
 # cost: 9
 query II nosort
 SELECT DISTINCT a, b FROM t ORDER BY a
 ----
-NULL
-NULL
 10
 5
 10
 NULL
 20
 7
+NULL
+NULL
 
 # DISTINCT * — every row is distinct (the PK makes rows unique), so DISTINCT is a no-op over
 # the projected output. `*` auto-satisfies the ORDER BY restriction. 5 scanned + 5
@@ -116,19 +116,13 @@ NULL
 NULL
 
 # DISTINCT * ORDER BY b: the key `b` is not "bare-projected" by name, but `*` projects every
-# column, so the restriction passes. Orders by b with NULLS FIRST (rows 4,5), then b=5
-# (rows 1,2), then b=7 (row 3). 5 scanned + 5 produced = 10.
+# column, so the restriction passes. Orders by b ASC, default NULLS LAST: b=5 (rows 1,2),
+# then b=7 (row 3), then b NULL (rows 4,5). 5 scanned + 5 produced = 10.
 # names: id, a, b
 # cost: 10
 query III nosort
 SELECT DISTINCT * FROM t ORDER BY b
 ----
-4
-10
-NULL
-5
-NULL
-NULL
 1
 10
 5
@@ -138,6 +132,12 @@ NULL
 3
 20
 7
+4
+10
+NULL
+5
+NULL
+NULL
 
 # Expression projection pins the cost asymmetry: `a + 0` is an interior Add node, charged
 # once per FILTERED row (5), even though only 3 distinct rows are produced and even though
@@ -165,14 +165,14 @@ SELECT DISTINCT a FROM t WHERE id >= 2
 NULL
 
 # LIMIT/OFFSET window the DISTINCT rows, not the source rows: distinct `a` ordered is
-# NULL,10,20; OFFSET 1 LIMIT 1 yields just 10. Only the one emitted row charges
+# 10,20,NULL; OFFSET 1 LIMIT 1 yields just 20. Only the one emitted row charges
 # row_produced. 5 scanned + 1 produced = 6.
 # names: a
 # cost: 6
 query I nosort
 SELECT DISTINCT a FROM t ORDER BY a LIMIT 1 OFFSET 1
 ----
-10
+20
 
 # Boolean projection: `a = b` is false for rows 1,2,3 and unknown (NULL) for rows 4,5; the
 # distinct booleans are false then NULL (the two unknowns collapse). One compare per filtered
@@ -193,9 +193,9 @@ NULL
 query I nosort
 SELECT DISTINCT a AS x FROM t ORDER BY a
 ----
-NULL
 10
 20
+NULL
 
 # 42P10: ORDER BY key `b` is not in the select list (only `a` is) — rejected under DISTINCT.
 statement error 42P10

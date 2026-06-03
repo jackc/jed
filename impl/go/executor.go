@@ -1112,8 +1112,8 @@ func or3(a, b ThreeValued) ThreeValued {
 // keyCmp is one ORDER BY key's total-order comparison, returning <0, 0, >0. NULL placement
 // is governed by nullsFirst and applied INDEPENDENTLY of the value-direction flip
 // (descending), so an explicit NULLS FIRST|LAST overrides the direction default
-// (spec/design/grammar.md §10). The physical key order ratifies NULL as the smallest value,
-// which surfaces as the parse-time default nullsFirst = !descending.
+// (spec/design/grammar.md §10). The physical key order ratifies NULL as the largest value
+// (the PostgreSQL model), which surfaces as the parse-time default nullsFirst = descending.
 func keyCmp(a, b Value, descending, nullsFirst bool) int {
 	switch {
 	case a.Kind == ValNull && b.Kind == ValNull:

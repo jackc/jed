@@ -151,7 +151,7 @@ needs no format change; it is a pure load-time derivation.
 ### Value codec
 
 A row value is encoded with the **same nullable encoding as keys**
-([encoding.md](../design/encoding.md)): a 1-byte presence tag (`0x00` NULL, `0x01` present)
+([encoding.md](../design/encoding.md)): a 1-byte presence tag (`0x00` present, `0x01` NULL)
 followed, when present, by the order-preserving integer bytes for the column's type. Reusing
 the key codec keeps one verified codec (already byte-pinned by
 [../encoding/integers.toml](../encoding/integers.toml)); the order-preserving sign-flip is

@@ -205,8 +205,9 @@ type IsDistinctExpr struct {
 
 // OrderKey is one ORDER BY sort key: a bare table column, a sort direction, and a resolved
 // NULL placement. NullsFirst is resolved at parse time — an explicit NULLS FIRST|LAST, else
-// the direction default (!Descending: ASC -> first, DESC -> last) — and is applied
-// independently of the Descending value flip (spec/design/grammar.md §10).
+// the direction default (Descending: ASC -> last, DESC -> first, the PostgreSQL model where
+// NULL is the largest value) — and is applied independently of the Descending value flip
+// (spec/design/grammar.md §10).
 type OrderKey struct {
 	Column     string
 	Descending bool

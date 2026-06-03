@@ -1,5 +1,5 @@
 //! Phase D/E: SELECT — projection, WHERE (=, ordering ops, IS [NOT] NULL),
-//! three-valued logic, ORDER BY (NULLs first), and CAST. These complement the
+//! three-valued logic, ORDER BY (NULLs last), and CAST. These complement the
 //! conformance corpus with finer-grained per-feature assertions.
 
 use abide::value::Value;
@@ -88,16 +88,16 @@ fn comparison_against_null_column_excludes_null_rows() {
 }
 
 #[test]
-fn order_by_sorts_nulls_first_then_descending_last() {
+fn order_by_sorts_nulls_last_then_descending_first() {
     let mut db = setup();
-    // Ascending: NULL row (id 3) sorts first by v.
+    // NULL is the largest value (PostgreSQL model). Ascending: NULL row (id 3) sorts last by v.
     let asc = query(&mut db, "SELECT id FROM t ORDER BY v");
     let ids: Vec<Value> = asc.into_iter().map(|r| r[0]).collect();
-    assert_eq!(ids, vec![Value::Int(3), Value::Int(1), Value::Int(2)]);
-    // Descending: NULL row sorts last.
+    assert_eq!(ids, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    // Descending inverts: the NULL row sorts first.
     let desc = query(&mut db, "SELECT id FROM t ORDER BY v DESC");
     let ids: Vec<Value> = desc.into_iter().map(|r| r[0]).collect();
-    assert_eq!(ids, vec![Value::Int(2), Value::Int(1), Value::Int(3)]);
+    assert_eq!(ids, vec![Value::Int(3), Value::Int(2), Value::Int(1)]);
 }
 
 fn ids(rows: Vec<Vec<Value>>) -> Vec<Value> {

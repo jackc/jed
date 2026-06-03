@@ -160,9 +160,9 @@ pub enum BinaryOp {
 
 /// One ORDER BY sort key: a bare table column, a sort direction, and a resolved NULL
 /// placement. `nulls_first` is resolved at parse time — an explicit `NULLS FIRST|LAST`,
-/// else the direction default (`!descending`: ASC → first, DESC → last) — so the executor
-/// never re-derives it. Placement is applied independently of the `descending` value flip
-/// (spec/design/grammar.md §10).
+/// else the direction default (`descending`: ASC → last, DESC → first, the PostgreSQL
+/// model where NULL is the largest value) — so the executor never re-derives it. Placement
+/// is applied independently of the `descending` value flip (spec/design/grammar.md §10).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OrderKey {
     pub column: String,

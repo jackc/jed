@@ -291,7 +291,7 @@ func (p *Parser) parseSelect() (*Select, error) {
 // parseOrderBy parses an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare
 // column with an optional ASC/DESC and an optional NULLS FIRST|LAST, setting the keys on
 // sel. NullsFirst is resolved here: explicit if given, else the direction default (ASC ->
-// first, DESC -> last). A bare NULLS not followed by FIRST/LAST is a syntax error (42601).
+// last, DESC -> first). A bare NULLS not followed by FIRST/LAST is a syntax error (42601).
 // Leaves sel.OrderBy nil when there is no ORDER BY (spec/grammar/grammar.ebnf `order_by`).
 func (p *Parser) parseOrderBy(sel *Select) error {
 	if p.peekKeyword() != "order" {
@@ -314,7 +314,9 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 			p.advance()
 			descending = true
 		}
-		nullsFirst := !descending // default follows direction (grammar.md §10)
+		// Default follows direction (grammar.md §10): NULL is the largest value
+		// (PostgreSQL model), so ASC → NULLS LAST, DESC → NULLS FIRST.
+		nullsFirst := descending
 		if p.peekKeyword() == "nulls" {
 			p.advance()
 			switch p.peekKeyword() {

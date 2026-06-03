@@ -444,8 +444,8 @@ function decodeRecord(colTypes: ScalarType[], buf: Uint8Array, cur: Cursor): { k
 // readValue reads one value via the value codec (inverse of encodeValue).
 function readValue(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
   const tag = readU8(buf, cur);
-  if (tag === 0x00) return nullValue();
-  if (tag === 0x01) return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
+  if (tag === 0x00) return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
+  if (tag === 0x01) return nullValue();
   throw engineError("data_corrupted", "invalid value presence tag");
 }
 

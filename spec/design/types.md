@@ -107,17 +107,19 @@ for the `AND`/`OR`/`NOT` connectives over this domain are in §10.
 
 **Value ordering & NULL position.** Non-NULL integers use plain signed numeric ascending
 order, which is exactly what the key encoding (§7) reproduces in raw bytes. NULL's position
-in the physical total order is now **ratified** (it was deferred to the key-encoding step):
-**NULLs sort first** (before every present value) in ascending order, via a leading `0x00`
-presence tag on a nullable key slot; descending inverts this (NULLs last). See
+in the physical total order is **ratified** to the PostgreSQL model (it was deferred to the
+key-encoding step, first ratified NULL-smallest, then re-ratified here): **NULLs sort last**
+(after every present value) in ascending order, via a 1-byte presence tag on a nullable key
+slot (`0x00` present `<` `0x01` NULL); descending inverts this (NULLs first). See
 [encoding.md §4](encoding.md) and `null_ordering` in
 [../types/compare.toml](../types/compare.toml). The SQL-level `ORDER BY ... NULLS
-FIRST|LAST` override now **layers on top of** this physical order (grammar.md §10): with no
+FIRST|LAST` override **layers on top of** this physical order (grammar.md §10): with no
 explicit clause a key's default NULL placement *follows the physical order* — `ASC` → NULLs
-first, `DESC` → NULLs last — so a plain `ORDER BY col` mirrors index-iteration order. Because
-NULL is the smallest value, this is the **SQLite** model and a deliberate **divergence from
-PostgreSQL** (where NULL is the largest, so PG defaults `ASC` to NULLs last); an explicit
-`NULLS FIRST|LAST` overrides the default regardless of direction.
+last, `DESC` → NULLs first — so a plain `ORDER BY col` mirrors index-iteration order. Because
+NULL is the largest value, this is the **PostgreSQL** model (PG defaults `ASC` to NULLs last)
+and a deliberate **divergence from SQLite** (where NULL is the smallest, so SQLite defaults
+`ASC` to NULLs first); an explicit `NULLS FIRST|LAST` overrides the default regardless of
+direction.
 
 ## 5. Coercion / casts
 
@@ -212,7 +214,8 @@ byte-identity is the whole point.
 - ✅ Promotion is total and order-independent (`max-rank`); arithmetic result types and the
   trap boundary are fixed (§3, functions.md §7).
 - ✅ Value order == key byte order (no separate, possibly-divergent comparator).
-- ✅ NULL's physical total-order position — ratified NULLs-first (ascending), see §4.
+- ✅ NULL's physical total-order position — ratified NULLs-last (ascending, the PostgreSQL
+  model), see §4.
 - ✅ Boolean renders as a fixed canonical form (`true`/`false`, NULL as `NULL`) — see §10 and
   [conformance.md](conformance.md); no host-dependent boolean spelling may leak.
 - ✅ Kleene `AND`/`OR`/`NOT` truth tables are fixed data (§10), identical across cores.
@@ -250,8 +253,8 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
 
 ## 10. Open / deferred
 
-- **NULL sort position** — ✅ ratified NULLs-first (ascending) with the key-encoding spec
-  (§4, [encoding.md §4](encoding.md)). No longer open.
+- **NULL sort position** — ✅ ratified NULLs-last (ascending, the PostgreSQL model) — see
+  the key-encoding spec (§4, [encoding.md §4](encoding.md)). No longer open.
 - **Operator result types** — ✅ authored in [../functions/](../functions/): comparisons and
   connectives yield `boolean`, arithmetic yields the promoted operand type (functions.md §7).
 - **Storable boolean** — boolean as a column type (on-disk type code, key/value encoding

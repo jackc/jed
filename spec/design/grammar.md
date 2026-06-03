@@ -209,20 +209,21 @@ appear in the projection.
 expression parser) consumes each key, so those forms are a `42601` syntax error; all remain
 relaxable later.
 
-**NULL placement and the default.** The physical key order ratifies NULL as the **smallest**
-value ([types.md](types.md) §4, `null_ordering = "nulls-first-ascending"` in
-[../types/compare.toml](../types/compare.toml)): NULLs sort first ascending, and descending
-inverts that to last. So when a key gives **no** `NULLS` clause the default **follows the
-direction** — `ASC` → `NULLS FIRST`, `DESC` → `NULLS LAST` — and a plain `ORDER BY col` mirrors
-the engine's index-iteration order. This is the **SQLite** model and a deliberate **divergence
-from PostgreSQL**, where NULL is the *largest* value (PG defaults `ASC` to `NULLS LAST`); the
-divergence is ratified, not an oversight — do not "fix" it toward PG. An **explicit**
-`NULLS FIRST | LAST` overrides the default **regardless of direction** (so `ORDER BY a DESC
-NULLS FIRST` keeps non-NULL values descending but lifts NULLs to the front).
+**NULL placement and the default.** The physical key order ratifies NULL as the **largest**
+value ([types.md](types.md) §4, `null_ordering = "nulls-last-ascending"` in
+[../types/compare.toml](../types/compare.toml)): NULLs sort last ascending, and descending
+inverts that to first. So when a key gives **no** `NULLS` clause the default **follows the
+direction** — `ASC` → `NULLS LAST`, `DESC` → `NULLS FIRST` — and a plain `ORDER BY col` mirrors
+the engine's index-iteration order. This is the **PostgreSQL** model (NULL is the largest
+value, PG defaults `ASC` to `NULLS LAST`), reached under the standing "match PostgreSQL unless
+there's an overriding reason" guideline (CLAUDE.md §1); it is a deliberate **divergence from
+SQLite**, where NULL is the *smallest* value (SQLite defaults `ASC` to `NULLS FIRST`). An
+**explicit** `NULLS FIRST | LAST` overrides the default **regardless of direction** (so
+`ORDER BY a ASC NULLS FIRST` keeps non-NULL values ascending but lifts NULLs to the front).
 
 This makes NULL placement a CLAUDE.md §8 determinism surface: the per-key comparator must keep
 NULL placement **decoupled** from the value-direction reversal (the `nulls_first` flag is
-resolved at parse time to `explicit ? … : !descending` and applied independently of the
+resolved at parse time to `explicit ? … : descending` and applied independently of the
 `ASC`/`DESC` value flip), so all three cores order NULLs byte-identically. The sort itself is
 **unmetered**, like `LIMIT`/`OFFSET` slicing ([cost.md](cost.md) §3); only the scanned and
 produced rows accrue cost.
@@ -264,9 +265,9 @@ key must appear as a bare column in the select list** (or the list is `*`); othe
 satisfy this — `ORDER BY` resolves against table columns, never aliases (§8), so
 `SELECT DISTINCT a AS b FROM t ORDER BY b` orders by the real column `b` and is rejected
 unless `b` is itself bare-projected, while `SELECT DISTINCT a AS x FROM t ORDER BY a` is
-accepted (`a` is bare-projected; the alias is just its output label). This restriction is the
-only behavior borrowed from PostgreSQL here — the engine keeps its **SQLite NULL ordering**
-(NULL smallest, ASC → NULLS FIRST, §10); do not conflate the two.
+accepted (`a` is bare-projected; the alias is just its output label). This is one more place
+the engine follows PostgreSQL, alongside its **PostgreSQL NULL ordering** (NULL largest,
+ASC → NULLS LAST, §10).
 
 **`DISTINCT` is not a reserved word** (§3): a column may be named `distinct`, and
 `SELECT distinct FROM t` must keep selecting it. Because `DISTINCT` is the lone modifier

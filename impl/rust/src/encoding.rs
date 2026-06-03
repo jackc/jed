@@ -31,14 +31,16 @@ pub fn decode_int(ty: ScalarType, bytes: &[u8]) -> i64 {
     (u as i128 - bias as i128) as i64
 }
 
-/// Encode a nullable key slot: a 1-byte presence tag (0x00 NULL, 0x01 present)
-/// followed by the value bytes when present. Makes NULLs sort first in ascending
-/// order (spec/design/encoding.md §2/§4).
+/// Encode a nullable key slot: a 1-byte presence tag (0x00 present, 0x01 NULL),
+/// with the value bytes following the tag when present. Because `0x00 < 0x01`,
+/// present values sort before NULL, so NULLs sort **last** in ascending order;
+/// descending inverts the component, lifting NULL to first (the PostgreSQL model —
+/// NULL is the largest value; spec/design/encoding.md §2/§4).
 pub fn encode_nullable(ty: ScalarType, value: Option<i64>) -> Vec<u8> {
     match value {
-        None => vec![0x00],
+        None => vec![0x01],
         Some(v) => {
-            let mut out = vec![0x01];
+            let mut out = vec![0x00];
             out.extend_from_slice(&encode_int(ty, v));
             out
         }

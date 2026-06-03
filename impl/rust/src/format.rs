@@ -462,12 +462,12 @@ fn decode_record(col_types: &[ScalarType], buf: &[u8], pos: &mut usize) -> Resul
 /// Read one value via the value codec (inverse of `encode_value`).
 fn read_value(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
     match read_u8(buf, pos)? {
-        0x00 => Ok(Value::Null),
-        0x01 => {
+        0x00 => {
             let w = ty.width_bytes();
             let vb = take(buf, pos, w)?;
             Ok(Value::Int(decode_int(ty, vb)))
         }
+        0x01 => Ok(Value::Null),
         _ => Err(corrupt("invalid value presence tag")),
     }
 }

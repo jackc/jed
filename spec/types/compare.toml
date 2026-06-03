@@ -33,13 +33,15 @@ via = "promote"          # promote both to the common type, then compare as inte
 integer = "numeric-ascending"
 
 # NULL's position in the physical total order of encoded keys (index/key
-# iteration), RATIFIED with the key-encoding spec (CLAUDE.md §11 step 4):
-# NULLs sort FIRST (before every present value) in ascending order; descending
-# inverts this (NULLs last). Implemented by the 1-byte presence tag on a nullable
-# key slot (0x00 NULL < 0x01 present) — see ../design/encoding.md §4 and the
-# fixtures in ../encoding/integers.toml. A query-level ORDER BY ... NULLS
-# FIRST|LAST override is a separate, later feature that layers on top of this.
-null_ordering = "nulls-first-ascending"
+# iteration), RATIFIED with the key-encoding spec (CLAUDE.md §11 step 4) and
+# re-ratified to the PostgreSQL model: NULL is the LARGEST value, so NULLs sort
+# LAST (after every present value) in ascending order; descending inverts this
+# (NULLs first). Implemented by the 1-byte presence tag on a nullable key slot
+# (0x00 present < 0x01 NULL) — see ../design/encoding.md §4 and the fixtures in
+# ../encoding/integers.toml. A query-level ORDER BY ... NULLS FIRST|LAST override
+# is a separate feature that layers on top of this; its default placement follows
+# this physical order (ASC -> NULLS LAST, DESC -> NULLS FIRST).
+null_ordering = "nulls-last-ascending"
 
 # --- NULL logic --------------------------------------------------------------
 # Three-valued logic (CLAUDE.md §4). Any comparison with a NULL operand yields

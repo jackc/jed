@@ -2,9 +2,8 @@
 # per-key NULLS FIRST|LAST. Keys are bare table columns, applied left to right (first key
 # primary, later keys break ties, a full tie keeps the primary-key scan order via a STABLE
 # sort). NULL placement is a CROSS-CORE determinism contract (CLAUDE.md §8): the physical key
-# order ratifies NULL as the SMALLEST value (types.md §4), so a key with no NULLS clause
-# defaults to ASC => NULLS FIRST, DESC => NULLS LAST — the SQLite model, a deliberate
-# DIVERGENCE from PostgreSQL (where NULL is largest, ASC => NULLS LAST). An explicit NULLS
+# order ratifies NULL as the LARGEST value (types.md §4), so a key with no NULLS clause
+# defaults to ASC => NULLS LAST, DESC => NULLS FIRST — the PostgreSQL model. An explicit NULLS
 # FIRST|LAST overrides that default regardless of direction. The sort is unmetered (cost.md
 # §3): cost = storage_row_read per scanned row + row_produced per produced row (+ filter
 # operator_eval); multi-key/NULLS placement adds nothing.
@@ -30,68 +29,66 @@ INSERT INTO t VALUES (4, 10, 5)
 statement ok
 INSERT INTO t VALUES (5, NULL, 9)
 
-# ASC with no NULLS clause defaults to NULLS FIRST (NULL is the smallest value): row 5 (a NULL)
-# leads, then the a=10 group in stable scan order, then a=20. 5 scanned + 5 produced = 10.
+# ASC with no NULLS clause defaults to NULLS LAST (NULL is the largest value): the a=10 group
+# in stable scan order, then a=20, then row 5 (a NULL) last. 5 scanned + 5 produced = 10.
 # names: a
 # cost: 10
 query I nosort
 SELECT a FROM t ORDER BY a
 ----
-NULL
 10
 10
 10
 20
+NULL
 
-# DESC with no NULLS clause defaults to NULLS LAST (descending inverts the physical order):
-# a=20, then the a=10 group, then NULL last. Pins the PostgreSQL divergence. 5 + 5 = 10.
+# DESC with no NULLS clause defaults to NULLS FIRST (descending inverts the physical order):
+# NULL leads, then a=20, then the a=10 group. Matches PostgreSQL (NULL largest). 5 + 5 = 10.
 # names: a
 # cost: 10
 query I nosort
 SELECT a FROM t ORDER BY a DESC
 ----
+NULL
 20
 10
 10
 10
-NULL
 
-# Explicit NULLS FIRST overrides the DESC default: NULL leads while the non-NULL values stay
-# descending — the case that fails if NULL placement is not decoupled from the direction
-# reversal (grammar.md §10). 5 + 5 = 10.
+# Explicit NULLS LAST overrides the DESC default (now NULLS FIRST): the non-NULL values stay
+# descending and NULL goes last — the case that fails if NULL placement is not decoupled from
+# the direction reversal (grammar.md §10). 5 + 5 = 10.
 # names: a
 # cost: 10
 query I nosort
-SELECT a FROM t ORDER BY a DESC NULLS FIRST
+SELECT a FROM t ORDER BY a DESC NULLS LAST
 ----
-NULL
 20
 10
 10
 10
+NULL
 
-# Explicit NULLS LAST overrides the ASC default (which would be FIRST): the non-NULL values
-# stay ascending and NULL goes last. 5 + 5 = 10.
+# Explicit NULLS FIRST overrides the ASC default (now NULLS LAST): the non-NULL values stay
+# ascending and NULL leads. 5 + 5 = 10.
 # names: a
 # cost: 10
 query I nosort
-SELECT a FROM t ORDER BY a ASC NULLS LAST
+SELECT a FROM t ORDER BY a ASC NULLS FIRST
 ----
+NULL
 10
 10
 10
 20
-NULL
 
-# Two keys, mixed direction: primary `a` ASC (NULLs first by default), ties broken by `id`
-# DESC. Row 5 (a NULL) first; within a=10 the ids descend (4,2,1). 5 + 5 = 10.
+# Two keys, mixed direction: primary `a` ASC (NULLs last by default), ties broken by `id`
+# DESC. Within a=10 the ids descend (4,2,1), then a=20, then row 5 (a NULL) last. 5 + 5 = 10.
 # names: id, a
 # cost: 10
 query II nosort
 SELECT id, a FROM t ORDER BY a ASC, id DESC
 ----
-5
-NULL
 4
 10
 2
@@ -100,18 +97,17 @@ NULL
 10
 3
 20
+5
+NULL
 
-# Two keys, secondary NULLS override: `a` ASC, then `b` ASC NULLS LAST. Within a=10 the b
+# Two keys: `a` ASC (NULLs last by default), then `b` ASC NULLS LAST. Within a=10 the b
 # values are 5 (id1), NULL (id2), 5 (id4); NULLS LAST puts id2 after the two b=5 rows, which
-# keep stable scan order (id1 before id4). 5 + 5 = 10.
+# keep stable scan order (id1 before id4). Then a=20, then the a NULL row (id5) last. 5 + 5 = 10.
 # names: id, a, b
 # cost: 10
 query III nosort
 SELECT id, a, b FROM t ORDER BY a ASC, b ASC NULLS LAST
 ----
-5
-NULL
-9
 1
 10
 5
@@ -124,6 +120,9 @@ NULL
 3
 20
 7
+5
+NULL
+9
 
 # A full tie across every key keeps the primary-key scan order (stable sort): ordering by the
 # constant-after-filter `b` alone leaves the two b=5 rows in id order. WHERE keeps rows 1 and

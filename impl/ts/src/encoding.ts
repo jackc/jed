@@ -38,14 +38,16 @@ export function decodeInt(t: ScalarType, b: Uint8Array): bigint {
   return u - bias;
 }
 
-// encodeNullable encodes a nullable key slot: a 1-byte presence tag (0x00 NULL, 0x01
-// present) followed by the value bytes when present. Makes NULLs sort first in
-// ascending order (spec/design/encoding.md §2/§4). `null` means NULL.
+// encodeNullable encodes a nullable key slot: a 1-byte presence tag (0x00 present, 0x01
+// NULL), with the value bytes following the tag when present. Because 0x00 < 0x01,
+// present values sort before NULL, so NULLs sort LAST in ascending order; descending
+// inverts the component, lifting NULL to first (the PostgreSQL model — NULL is the
+// largest value; spec/design/encoding.md §2/§4). `null` means NULL.
 export function encodeNullable(t: ScalarType, value: bigint | null): Uint8Array {
-  if (value === null) return new Uint8Array([0x00]);
+  if (value === null) return new Uint8Array([0x01]);
   const v = encodeInt(t, value);
   const out = new Uint8Array(1 + v.length);
-  out[0] = 0x01;
+  out[0] = 0x00;
   out.set(v, 1);
   return out;
 }

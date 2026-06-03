@@ -106,11 +106,11 @@ select_item    ::= expr ("AS" identifier)?
  * order via a stable sort). A sort_key is a bare table column — NOT a general
  * expression, an output alias, or an ordinal position (those stay deferred,
  * ../design/grammar.md §5) — with an optional direction and an optional explicit
- * NULL placement. Default NULL placement follows direction: ASC => NULLS FIRST,
- * DESC => NULLS LAST, because the physical key order ratifies NULL as the SMALLEST
- * value (../design/types.md §4, ../types/compare.toml null_ordering). An explicit
- * NULLS FIRST | LAST overrides that default regardless of direction. "NULLS" not
- * followed by FIRST | LAST is a syntax error (42601). */
+ * NULL placement. Default NULL placement follows direction: ASC => NULLS LAST,
+ * DESC => NULLS FIRST, because the physical key order ratifies NULL as the LARGEST
+ * value (the PostgreSQL model; ../design/types.md §4, ../types/compare.toml
+ * null_ordering). An explicit NULLS FIRST | LAST overrides that default regardless
+ * of direction. "NULLS" not followed by FIRST | LAST is a syntax error (42601). */
 order_by       ::= "ORDER" "BY" sort_key ("," sort_key)*
 
 sort_key       ::= identifier ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?

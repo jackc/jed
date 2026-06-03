@@ -212,7 +212,7 @@ class Parser {
 
   // parseOrderBy parses an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare
   // column with an optional ASC/DESC and an optional NULLS FIRST|LAST. nullsFirst is resolved
-  // here: explicit if given, else the direction default (ASC -> first, DESC -> last). A bare
+  // here: explicit if given, else the direction default (ASC -> last, DESC -> first). A bare
   // NULLS not followed by FIRST/LAST is a syntax error (42601). Returns [] when there is no
   // ORDER BY (spec/grammar/grammar.ebnf `order_by`).
   private parseOrderBy(): OrderKey[] {
@@ -229,7 +229,9 @@ class Parser {
         this.advance();
         descending = true;
       }
-      let nullsFirst = !descending; // default follows direction (grammar.md §10)
+      // Default follows direction (grammar.md §10): NULL is the largest value
+      // (PostgreSQL model), so ASC → NULLS LAST, DESC → NULLS FIRST.
+      let nullsFirst = descending;
       if (this.peekKeyword() === "nulls") {
         this.advance();
         if (this.peekKeyword() === "first") {

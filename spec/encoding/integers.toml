@@ -55,27 +55,29 @@ cases = [
   { value = 9223372036854775807,  bytes = "ffffffffffffffff" },  # MAX
 ]
 
-# --- nullable slot: 1-byte presence tag (0x00 NULL, 0x01 present) + value -----
-# NULL sorts before every present value (../design/encoding.md §4). `null = true`
-# marks the NULL case (TOML has no typed null); present cases carry `value`.
+# --- nullable slot: 1-byte presence tag (0x00 present, 0x01 NULL) + value ------
+# NULL sorts AFTER every present value (../design/encoding.md §4): NULL is the
+# largest value, the PostgreSQL model, so present (tag 0x00) sorts below NULL (tag
+# 0x01). `null = true` marks the NULL case (TOML has no typed null); present cases
+# carry `value`. Listed in ascending logical order.
 [[nullable]]
 type = "int16"
 cases = [
-  { null = true,         bytes = "00"     },  # NULL sorts first
-  { value = -1,          bytes = "017fff" },
-  { value = 0,           bytes = "018000" },
-  { value = 1,           bytes = "018001" },
+  { value = -1,          bytes = "007fff" },
+  { value = 0,           bytes = "008000" },
+  { value = 1,           bytes = "008001" },
+  { null = true,         bytes = "01"     },  # NULL sorts last
 ]
 
 # --- descending: bitwise inversion (one's complement) of the ascending nullable
-# encoding, tag byte included. Order reverses; NULL lands LAST. Listed in
+# encoding, tag byte included. Order reverses; NULL lands FIRST. Listed in
 # ascending byte order (= descending logical order) so invariant (3) still holds.
 [[descending]]
 type = "int16"
 base = "nullable"
 cases = [
-  { value = 1,    bytes = "fe7ffe" },
-  { value = 0,    bytes = "fe7fff" },
-  { value = -1,   bytes = "fe8000" },
-  { null = true,  bytes = "ff"     },  # NULL sorts last under descending
+  { null = true,  bytes = "fe"     },  # NULL sorts first under descending
+  { value = 1,    bytes = "ff7ffe" },
+  { value = 0,    bytes = "ff7fff" },
+  { value = -1,   bytes = "ff8000" },
 ]

@@ -79,11 +79,12 @@ def decode_int(width, bytes)
   bytes.bytes.reduce(0) { |acc, b| (acc << 8) | b } - (1 << (width * 8 - 1))
 end
 
-# value codec: presence tag + (when present) the integer bytes.
+# value codec: presence tag + (when present) the integer bytes. 0x00 = present,
+# 0x01 = NULL (the nullable key encoding; NULLs sort last — encoding.md §4).
 def encode_value(width, v)
-  return "\x00".b if v.nil?
+  return "\x01".b if v.nil?
 
-  "\x01".b + encode_int(width, v)
+  "\x00".b + encode_int(width, v)
 end
 
 # --- encoding (reference serializer) ----------------------------------------
@@ -283,11 +284,11 @@ def decode_record(columns, buf, pos)
   row = []
   columns.each do |c|
     tag, pos = take(buf, pos, 1)
-    if tag.getbyte(0).zero?
-      row << nil
-    else
+    if tag.getbyte(0).zero? # 0x00 = present, 0x01 = NULL
       vb, pos = take(buf, pos, WIDTH.fetch(c[:type]))
       row << decode_int(WIDTH.fetch(c[:type]), vb)
+    else
+      row << nil
     end
   end
   [row, pos]

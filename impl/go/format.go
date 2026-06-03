@@ -493,13 +493,13 @@ func readValue(ty ScalarType, buf []byte, pos *int) (Value, error) {
 	}
 	switch tag {
 	case 0x00:
-		return NullValue(), nil
-	case 0x01:
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {
 			return Value{}, err
 		}
 		return IntValue(DecodeInt(ty, vb)), nil
+	case 0x01:
+		return NullValue(), nil
 	default:
 		return Value{}, NewError(DataCorrupted, "invalid value presence tag")
 	}
