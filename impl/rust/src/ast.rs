@@ -198,4 +198,8 @@ pub enum Literal {
     /// (spec/design/types.md §1): a boolean literal is well-formed but cannot be
     /// stored in a column.
     Bool(bool),
+    /// A single-quoted text literal (decoded content). Its type is always `text`
+    /// (the one collation, `C`); it does not adapt to context like an integer literal
+    /// does (spec/design/types.md §11).
+    Text(String),
 }

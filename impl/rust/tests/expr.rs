@@ -27,7 +27,7 @@ fn scalar(db: &mut Database, sql: &str) -> Value {
     let rows = query(db, sql);
     assert_eq!(rows.len(), 1, "{sql:?}: expected one row");
     assert_eq!(rows[0].len(), 1, "{sql:?}: expected one column");
-    rows[0][0]
+    rows[0][0].clone()
 }
 
 fn err_code(db: &mut Database, sql: &str) -> &'static str {

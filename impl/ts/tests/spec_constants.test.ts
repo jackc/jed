@@ -90,11 +90,15 @@ test("operators match spec/functions/catalog.toml", () => {
   // match the canonical catalog field-for-field.
   const rows = readTomlTables(specPath("functions/catalog.toml"), "operator");
   assert.equal(rows.length, OPERATORS.length, "operator count");
-  const byName = new Map(OPERATORS.map((d) => [d.name, d]));
+  // Operators are overloaded across operand families (one row per (name, arg_families) —
+  // e.g. `eq` for integer and for text), so match on the full signature, not the name.
   for (const row of rows) {
     const name = row.str("name");
-    const desc = byName.get(name);
-    assert.notEqual(desc, undefined, `generated table missing operator ${name}`);
+    const fams = row.strs("arg_families");
+    const desc = OPERATORS.find(
+      (d) => d.name === name && [...d.argFamilies].join(",") === fams.join(","),
+    );
+    assert.notEqual(desc, undefined, `generated table missing operator ${name} ${fams.join(",")}`);
     const d = desc!;
     assert.equal(d.kind, row.str("kind"), `${name}: kind`);
     assert.equal(d.arity, row.num("arity"), `${name}: arity`);

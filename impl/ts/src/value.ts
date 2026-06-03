@@ -10,7 +10,11 @@
 export type Value =
   | { kind: "null" }
   | { kind: "int"; int: bigint }
-  | { kind: "bool"; value: boolean };
+  | { kind: "bool"; value: boolean }
+  // The first stored non-integer value; compares by the C collation (UTF-8 byte /
+  // code-point order — spec/design/types.md §11). NOT compared with JS `<`/localeCompare,
+  // which use UTF-16 code-unit order and disagree above U+FFFF (see compareTextC below).
+  | { kind: "text"; text: string };
 
 // intValue builds a non-null integer value.
 export function intValue(n: bigint): Value {
@@ -25,6 +29,30 @@ export function nullValue(): Value {
 // boolValue builds a boolean value.
 export function boolValue(b: boolean): Value {
   return { kind: "bool", value: b };
+}
+
+// textValue builds a non-null text value.
+export function textValue(s: string): Value {
+  return { kind: "text", text: s };
+}
+
+// compareTextC compares two strings by the `C` collation: the lexicographic order of
+// their UTF-8 byte encodings, which for UTF-8 equals Unicode code-point order. Returns
+// <0, 0, >0. THIS IS THE CROSS-CORE DETERMINISM TRAP (CLAUDE.md §8, spec/design/types.md
+// §11): JS string `<` and localeCompare compare by UTF-16 CODE UNITS, which disagree with
+// UTF-8 byte order for any character above U+FFFF (e.g. U+F900 vs U+1F600). Rust (str Ord)
+// and Go (string compare) are byte order natively; TS must encode to UTF-8 and memcmp to
+// match them. Pinned by the astral-char case in spec/conformance/suites/types/text.test.
+const TEXT_ENCODER = new TextEncoder();
+export function compareTextC(a: string, b: string): number {
+  if (a === b) return 0; // fast path: equal strings encode to equal bytes
+  const ba = TEXT_ENCODER.encode(a);
+  const bb = TEXT_ENCODER.encode(b);
+  const n = ba.length < bb.length ? ba.length : bb.length;
+  for (let i = 0; i < n; i++) {
+    if (ba[i] !== bb[i]) return ba[i]! < bb[i]! ? -1 : 1;
+  }
+  return ba.length === bb.length ? 0 : ba.length < bb.length ? -1 : 1;
 }
 
 // ThreeValued is the result of a three-valued comparison (CLAUDE.md §4):
@@ -51,30 +79,39 @@ export function render(v: Value): string {
       return "NULL";
     case "bool":
       return v.value ? "true" : "false";
+    case "text":
+      return v.text;
     default:
       return v.int.toString();
   }
 }
 
 // eq3 is three-valued equality. NULL compared with anything (including NULL) is
-// UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Since all integer
-// types promote losslessly into the common bigint, cross-type comparison is just
-// bigint equality (spec/types/compare.toml).
+// UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Integers compare by
+// value (all integer types promote losslessly into the common bigint); text by the C
+// collation (UTF-8 byte order — string equality is exact for ===). A mixed int/text pair
+// never reaches here (the resolver rejects it, 42804); any other variant pair is a NULL.
 export function eq3(a: Value, b: Value): ThreeValued {
-  if (a.kind !== "int" || b.kind !== "int") return "unknown";
-  return bool3(a.int === b.int);
+  if (a.kind === "null" || b.kind === "null") return "unknown";
+  if (a.kind === "text" && b.kind === "text") return bool3(a.text === b.text);
+  if (a.kind === "int" && b.kind === "int") return bool3(a.int === b.int);
+  return "unknown";
 }
 
-// lt3 is the three-valued ordering predicate a < b.
+// lt3 is the three-valued ordering predicate a < b (text by C collation = UTF-8 byte order).
 export function lt3(a: Value, b: Value): ThreeValued {
-  if (a.kind !== "int" || b.kind !== "int") return "unknown";
-  return bool3(a.int < b.int);
+  if (a.kind === "null" || b.kind === "null") return "unknown";
+  if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) < 0);
+  if (a.kind === "int" && b.kind === "int") return bool3(a.int < b.int);
+  return "unknown";
 }
 
-// gt3 is the three-valued ordering predicate a > b.
+// gt3 is the three-valued ordering predicate a > b (text by C collation = UTF-8 byte order).
 export function gt3(a: Value, b: Value): ThreeValued {
-  if (a.kind !== "int" || b.kind !== "int") return "unknown";
-  return bool3(a.int > b.int);
+  if (a.kind === "null" || b.kind === "null") return "unknown";
+  if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) > 0);
+  if (a.kind === "int" && b.kind === "int") return bool3(a.int > b.int);
+  return "unknown";
 }
 
 // notDistinctFrom is NULL-safe equality — the `IS NOT DISTINCT FROM` primitive

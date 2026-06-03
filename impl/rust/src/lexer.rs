@@ -73,6 +73,36 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                     i += 1;
                 }
             }
+            b'\'' => {
+                // Single-quoted string literal (the `text` type). `''` is an embedded
+                // single quote; backslash is an ordinary character (no C-style escapes —
+                // standard_conforming_strings, spec/design/types.md §11). The input is
+                // valid UTF-8 and `'` is ASCII (never a UTF-8 continuation byte), so
+                // copying raw bytes between quotes preserves UTF-8 validity.
+                i += 1; // consume the opening quote
+                let mut buf: Vec<u8> = Vec::new();
+                loop {
+                    match bytes.get(i) {
+                        None => return Err(syntax("unterminated string literal".to_string())),
+                        Some(&b'\'') => {
+                            if bytes.get(i + 1) == Some(&b'\'') {
+                                buf.push(b'\'');
+                                i += 2;
+                            } else {
+                                i += 1; // consume the closing quote
+                                break;
+                            }
+                        }
+                        Some(&b) => {
+                            buf.push(b);
+                            i += 1;
+                        }
+                    }
+                }
+                let s = String::from_utf8(buf)
+                    .map_err(|_| syntax("invalid UTF-8 in string literal".to_string()))?;
+                tokens.push(Token::Str(s));
+            }
             b'0'..=b'9' => {
                 // Integer literal: an unsigned magnitude. The sign is the `Minus`
                 // operator. The magnitude must be <= 2^63 so that -(2^63) = int64::MIN

@@ -1,0 +1,156 @@
+# Text scalar type (spec/design/types.md §11): storage, single-quoted literals, equality,
+# ordering, and NULL — all under the one defined collation `C` (byte / code-point order over
+# UTF-8 = PostgreSQL `C`/POSIX). The empty string '' is a distinct, non-NULL value. text is a
+# NON-key column this slice — a text PRIMARY KEY is rejected 0A000 (a documented narrowing).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'Zeta'), (4, ''), (5, NULL)
+
+# a text value renders verbatim under the `T` tag (no quoting)
+query T nosort
+SELECT name FROM t WHERE id = 1
+----
+alice
+
+# equality on text: exact byte match
+query I nosort
+SELECT id FROM t WHERE name = 'alice'
+----
+1
+
+# the empty string is a distinct, non-NULL value: it matches '' and is NOT NULL (id 4),
+# while NULL (id 5) is neither '' nor any value
+query I nosort
+SELECT id FROM t WHERE name = ''
+----
+4
+
+query I nosort
+SELECT id FROM t WHERE name IS NULL
+----
+5
+
+query I nosort
+SELECT id FROM t WHERE name IS NOT NULL ORDER BY id
+----
+1
+2
+3
+4
+
+# = NULL is UNKNOWN, never a match (three-valued logic), for text as for integers
+query I nosort
+SELECT id FROM t WHERE name = NULL
+----
+
+# C collation = code-point order: '' sorts first; uppercase 'Z' (0x5A) sorts BEFORE lowercase
+# 'a' (0x61); NULL sorts last (PostgreSQL model). Expected: '', 'Zeta', 'alice', 'bob', NULL.
+query I nosort
+SELECT id FROM t ORDER BY name
+----
+4
+3
+1
+2
+5
+
+# IS [NOT] DISTINCT FROM: NULL-safe equality on text — NULL is a comparable value here
+query I nosort
+SELECT id FROM t WHERE name IS NOT DISTINCT FROM NULL
+----
+5
+
+query I nosort
+SELECT id FROM t WHERE name IS DISTINCT FROM 'alice' ORDER BY id
+----
+2
+3
+4
+5
+
+# a single-quoted literal escapes an embedded quote by doubling it ('') — standard_conforming
+# strings, no backslash escapes
+statement ok
+INSERT INTO t VALUES (6, 'O''Brien')
+
+query I nosort
+SELECT id FROM t WHERE name = 'O''Brien'
+----
+6
+
+# text vs a non-text operand is NOT comparable: a 42804 type error (like bool = int)
+statement error 42804
+SELECT id FROM t WHERE name = 1
+
+# a string literal into an integer column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES ('seven', 'g')
+
+# an integer literal into a text column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES (7, 123)
+
+# text in a PRIMARY KEY is rejected this slice (documented narrowing): 0A000
+statement error 0A000
+CREATE TABLE bad (k text PRIMARY KEY)
+
+# --- ordering, the prefix case, and cost ------------------------------------
+statement ok
+CREATE TABLE w (id int32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO w VALUES (1, 'b'), (2, 'aa'), (3, 'ab'), (4, 'a'), (5, '😀'), (6, 'Z')
+
+# code-point order including the prefix case (a < aa < ab < b) and that an astral char (😀
+# U+1F600) sorts after all these BMP chars. Uppercase 'Z' (0x5A) < lowercase 'a' (0x61).
+# Expected ascending: 'Z', 'a', 'aa', 'ab', 'b', '😀' → ids 6, 4, 2, 3, 1, 5.
+query I nosort
+SELECT id FROM w ORDER BY s
+----
+6
+4
+2
+3
+1
+5
+
+# ordering predicate on text (C collation): s < 'b'. 'Z'(0x5A) < 'b', 'a'/'aa'/'ab' < 'b',
+# but 'b' is not < itself and '😀' > 'b'. → ids 2, 3, 4, 6.
+query I nosort
+SELECT id FROM w WHERE s < 'b' ORDER BY id
+----
+2
+3
+4
+6
+
+# deterministic, cross-core cost: a text comparison is ONE operator_eval (weight 1), like an
+# integer comparison — independent of string length. 6 scanned + 6 filter (one `=` per row) +
+# 1 produced + 0 projection (bare column) = 13.
+# cost: 13
+query I nosort
+SELECT id FROM w WHERE s = 'a'
+----
+4
+
+# --- the UTF-8-not-UTF-16 ordering trap (spec/design/types.md §11) -----------
+statement ok
+CREATE TABLE astral (id int32 PRIMARY KEY, s text)
+
+# U+F900 (豈, a BMP char ≥ U+E000) and U+1F600 (😀, astral). By Unicode code point = UTF-8
+# byte order (the C collation), U+F900 < U+1F600, so 豈 sorts before 😀. A core comparing by
+# UTF-16 code units would order them oppositely (😀's lead surrogate 0xD83D < 0xF900). This
+# pins the rule that text compares by UTF-8 bytes / code points, never UTF-16.
+statement ok
+INSERT INTO astral VALUES (1, '😀'), (2, '豈')
+
+query T nosort
+SELECT s FROM astral ORDER BY s
+----
+豈
+😀

@@ -157,6 +157,7 @@ impl Parser {
                     )
                 })
             }
+            Token::Str(s) if !negate => Ok(Literal::Text(s)),
             Token::Word(w) if !negate && w.eq_ignore_ascii_case("null") => Ok(Literal::Null),
             Token::Word(w) if !negate && w.eq_ignore_ascii_case("true") => Ok(Literal::Bool(true)),
             Token::Word(w) if !negate && w.eq_ignore_ascii_case("false") => {
@@ -608,6 +609,13 @@ impl Parser {
             Token::Word(w) if w.eq_ignore_ascii_case("false") => {
                 self.advance();
                 Ok(Expr::Literal(Literal::Bool(false)))
+            }
+            Token::Str(_) => {
+                if let Token::Str(s) = self.advance() {
+                    Ok(Expr::Literal(Literal::Text(s)))
+                } else {
+                    unreachable!("peeked a string literal")
+                }
             }
             Token::Word(_) => Ok(Expr::Column(self.expect_identifier()?)),
             other => Err(syntax(format!("expected an expression, found {other:?}"))),

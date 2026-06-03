@@ -66,6 +66,33 @@ func Lex(sql string) ([]Token, error) {
 				tokens = append(tokens, Token{Kind: TokGt})
 				i++
 			}
+		case c == '\'':
+			// Single-quoted string literal (the text type). `''` is an embedded single
+			// quote; backslash is an ordinary character (no C-style escapes —
+			// standard_conforming_strings, spec/design/types.md §11). The input is valid
+			// UTF-8 and `'` is ASCII (never a UTF-8 continuation byte), so copying raw bytes
+			// between quotes preserves UTF-8 validity.
+			i++ // consume the opening quote
+			var sb []byte
+			closed := false
+			for i < len(b) {
+				if b[i] == '\'' {
+					if i+1 < len(b) && b[i+1] == '\'' {
+						sb = append(sb, '\'')
+						i += 2
+						continue
+					}
+					i++ // consume the closing quote
+					closed = true
+					break
+				}
+				sb = append(sb, b[i])
+				i++
+			}
+			if !closed {
+				return nil, NewError(SyntaxError, "unterminated string literal")
+			}
+			tokens = append(tokens, Token{Kind: TokStr, Word: string(sb)})
 		case isDigit(c):
 			// Integer literal: an unsigned magnitude. The sign is TokMinus. The
 			// magnitude must be <= 2^63 so that -(2^63) = int64's minimum is reachable;

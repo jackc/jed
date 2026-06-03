@@ -21,7 +21,7 @@ fn inserts_rows_in_primary_key_order() {
     execute(&mut db, "INSERT INTO t VALUES (2, 20)").unwrap();
 
     let rows = db.rows_in_key_order("t").unwrap();
-    let ids: Vec<Value> = rows.iter().map(|r| r[0]).collect();
+    let ids: Vec<Value> = rows.iter().map(|r| r[0].clone()).collect();
     assert_eq!(ids, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
 }
 
@@ -37,7 +37,7 @@ fn negative_keys_sort_before_positive() {
         execute(&mut db, v).unwrap();
     }
     let rows = db.rows_in_key_order("t").unwrap();
-    let ids: Vec<Value> = rows.iter().map(|r| r[0]).collect();
+    let ids: Vec<Value> = rows.iter().map(|r| r[0].clone()).collect();
     assert_eq!(ids, vec![Value::Int(-1), Value::Int(0), Value::Int(1)]);
 }
 
@@ -160,7 +160,7 @@ fn multi_row_insert_stores_all_rows_in_key_order() {
     // One statement, rows out of key order; storage must yield them in PK order.
     execute(&mut db, "INSERT INTO t VALUES (3, 30), (1, 10), (2, 20)").unwrap();
     let rows = db.rows_in_key_order("t").unwrap();
-    let ids: Vec<Value> = rows.iter().map(|r| r[0]).collect();
+    let ids: Vec<Value> = rows.iter().map(|r| r[0].clone()).collect();
     assert_eq!(ids, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
 }
 
@@ -194,7 +194,7 @@ fn multi_row_insert_duplicate_against_stored_traps_and_stores_nothing() {
         .rows_in_key_order("t")
         .unwrap()
         .iter()
-        .map(|r| r[0])
+        .map(|r| r[0].clone())
         .collect();
     assert_eq!(ids, vec![Value::Int(1)]);
 }
@@ -216,7 +216,7 @@ fn no_pk_multi_row_insert_keeps_insertion_order() {
         .rows_in_key_order("log")
         .unwrap()
         .iter()
-        .map(|r| r[0])
+        .map(|r| r[0].clone())
         .collect();
     assert_eq!(vals, vec![Value::Int(30), Value::Int(10), Value::Int(20)]);
 }
@@ -234,7 +234,7 @@ fn no_pk_multi_row_insert_is_all_or_nothing() {
         .rows_in_key_order("log")
         .unwrap()
         .iter()
-        .map(|r| r[0])
+        .map(|r| r[0].clone())
         .collect();
     // Only 1, 3, 4 landed; the failed batch's 2 is absent.
     assert_eq!(vals, vec![Value::Int(1), Value::Int(3), Value::Int(4)]);

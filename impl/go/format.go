@@ -37,6 +37,8 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 2
 	case Int64:
 		return 3
+	case Text:
+		return 4
 	default:
 		return 0
 	}
@@ -51,6 +53,8 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return Int32, true
 	case 3:
 		return Int64, true
+	case 4:
+		return Text, true
 	default:
 		return 0, false
 	}
@@ -71,17 +75,26 @@ func crc32IEEE(data []byte) uint32 {
 	return ^crc
 }
 
-// encodeValue is the value codec (format.md): a presence tag plus, when present, the
-// integer bytes for the column type. Reuses the key encoding; the named seam lets
-// storage and key encodings diverge when non-integer types land.
+// encodeValue is the value codec (format.md): a 1-byte presence tag (0x01 = NULL), then
+// the type's present-value body. Integers reuse the order-preserving key encoding; text is
+// where the seam diverges — a stored text value needs no ordering, so it is a compact u16
+// byte-length + UTF-8 bytes (collation C, verbatim). A text value whose UTF-8 length exceeds
+// uint16's max is unsupported; in practice it also exceeds a page and is caught by the
+// oversized-item rule in pack (0A000), so the cast here is sound for every supported page
+// size (spec/fileformat/format.md). boolean is expression-only — never stored (§1).
 func encodeValue(ty ScalarType, v Value) []byte {
-	// boolean is expression-only this slice; no column is boolean, so a stored value is
-	// only ever NULL or an integer (spec/design/types.md §1).
-	if v.Kind == ValNull {
+	switch v.Kind {
+	case ValNull:
 		return EncodeNullable(ty, nil)
+	case ValText:
+		out := make([]byte, 0, 3+len(v.Str))
+		out = append(out, 0x00) // present
+		out = appendU16(out, uint16(len(v.Str)))
+		return append(out, v.Str...)
+	default:
+		n := v.Int
+		return EncodeNullable(ty, &n)
 	}
-	n := v.Int
-	return EncodeNullable(ty, &n)
 }
 
 func appendU16(b []byte, v uint16) []byte { return append(b, byte(v>>8), byte(v)) }
@@ -493,6 +506,17 @@ func readValue(ty ScalarType, buf []byte, pos *int) (Value, error) {
 	}
 	switch tag {
 	case 0x00:
+		if ty.IsText() {
+			n, err := readU16(buf, pos)
+			if err != nil {
+				return Value{}, err
+			}
+			sb, err := take(buf, pos, int(n))
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(string(sb)), nil
+		}
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {
 			return Value{}, err

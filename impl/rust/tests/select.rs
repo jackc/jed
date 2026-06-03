@@ -55,7 +55,7 @@ fn full_scan_is_in_primary_key_order() {
         "INSERT INTO t VALUES (2)",
     ]);
     let rows = query(&mut db, "SELECT id FROM t ORDER BY id");
-    let ids: Vec<Value> = rows.into_iter().map(|r| r[0]).collect();
+    let ids: Vec<Value> = rows.into_iter().map(|r| r[0].clone()).collect();
     assert_eq!(ids, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
 }
 
@@ -67,7 +67,7 @@ fn is_null_and_is_not_null() {
         vec![vec![Value::Int(3)]]
     );
     let not_null = query(&mut db, "SELECT id FROM t WHERE v IS NOT NULL ORDER BY id");
-    let ids: Vec<Value> = not_null.into_iter().map(|r| r[0]).collect();
+    let ids: Vec<Value> = not_null.into_iter().map(|r| r[0].clone()).collect();
     assert_eq!(ids, vec![Value::Int(1), Value::Int(2)]);
 }
 
@@ -83,7 +83,7 @@ fn comparison_against_null_column_excludes_null_rows() {
     // The NULL row never satisfies an ordering comparison.
     let mut db = setup();
     let rows = query(&mut db, "SELECT id FROM t WHERE v > 5 ORDER BY id");
-    let ids: Vec<Value> = rows.into_iter().map(|r| r[0]).collect();
+    let ids: Vec<Value> = rows.into_iter().map(|r| r[0].clone()).collect();
     assert_eq!(ids, vec![Value::Int(1), Value::Int(2)]);
 }
 
@@ -92,16 +92,16 @@ fn order_by_sorts_nulls_last_then_descending_first() {
     let mut db = setup();
     // NULL is the largest value (PostgreSQL model). Ascending: NULL row (id 3) sorts last by v.
     let asc = query(&mut db, "SELECT id FROM t ORDER BY v");
-    let ids: Vec<Value> = asc.into_iter().map(|r| r[0]).collect();
+    let ids: Vec<Value> = asc.into_iter().map(|r| r[0].clone()).collect();
     assert_eq!(ids, vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
     // Descending inverts: the NULL row sorts first.
     let desc = query(&mut db, "SELECT id FROM t ORDER BY v DESC");
-    let ids: Vec<Value> = desc.into_iter().map(|r| r[0]).collect();
+    let ids: Vec<Value> = desc.into_iter().map(|r| r[0].clone()).collect();
     assert_eq!(ids, vec![Value::Int(3), Value::Int(2), Value::Int(1)]);
 }
 
 fn ids(rows: Vec<Vec<Value>>) -> Vec<Value> {
-    rows.into_iter().map(|r| r[0]).collect()
+    rows.into_iter().map(|r| r[0].clone()).collect()
 }
 
 #[test]

@@ -144,10 +144,19 @@ fn operators_match_spec() {
 
     for row in ops {
         let name = row["name"].as_str().unwrap();
+        let fams: Vec<&str> = row["arg_families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        // Operators are overloaded across operand families (one row per (name,
+        // arg_families) — e.g. `eq` for integer and for text), so match on the full
+        // signature, not the name alone.
         let desc = OPERATORS
             .iter()
-            .find(|d| d.name == name)
-            .unwrap_or_else(|| panic!("generated table missing operator {name}"));
+            .find(|d| d.name == name && d.arg_families == fams.as_slice())
+            .unwrap_or_else(|| panic!("generated table missing operator {name} {fams:?}"));
 
         assert_eq!(desc.kind, row["kind"].as_str().unwrap(), "{name} kind");
         assert_eq!(

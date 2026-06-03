@@ -236,6 +236,10 @@ const (
 	LiteralInt
 	// LiteralBool is a boolean literal (TRUE / FALSE).
 	LiteralBool
+	// LiteralText is a single-quoted text literal (Str holds the decoded content). Its
+	// type is always text (collation C); it does not adapt to context like an integer
+	// literal does (spec/design/types.md §11).
+	LiteralText
 )
 
 // Literal is a literal value as written in SQL. A bare integer literal is an *untyped
@@ -247,4 +251,5 @@ type Literal struct {
 	Kind LiteralKind
 	Int  int64
 	Bool bool
+	Str  string // LiteralText
 }

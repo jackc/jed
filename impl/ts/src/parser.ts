@@ -180,6 +180,7 @@ class Parser {
     }
     const t = this.advance();
     if (t.kind === "int") return { kind: "int", int: foldInt(t.int!, negate) };
+    if (!negate && t.kind === "str") return { kind: "text", text: t.str! };
     if (!negate && t.kind === "word") {
       const w = lower(t.word!);
       if (w === "null") return { kind: "null" };
@@ -524,6 +525,10 @@ class Parser {
       // integer type unless negated (handled by the unary-minus fold).
       const v = foldInt(this.advance().int!, false);
       return { kind: "literal", literal: { kind: "int", int: v } };
+    }
+    if (t.kind === "str") {
+      this.advance();
+      return { kind: "literal", literal: { kind: "text", text: t.str! } };
     }
     if (t.kind === "word") {
       const w = lower(t.word!);

@@ -135,6 +135,15 @@ impl Database {
             }
             let ty = resolve_storable_type(&def.type_name)?;
             if def.primary_key {
+                // Text is not allowed in a key this slice: the order-preserving text key
+                // encoding (spec/design/encoding.md §2.4) is authored but unexercised, so a
+                // text PRIMARY KEY is a documented 0A000 narrowing (spec/design/types.md §11).
+                if ty.is_text() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a text primary key is not supported yet",
+                    ));
+                }
                 if pk_seen {
                     return Err(EngineError::new(
                         SqlState::InvalidTableDefinition,
@@ -233,6 +242,17 @@ impl Database {
                         Value::Null
                     }
                     Literal::Int(n) => {
+                        // An integer literal targets an integer column; into a text column
+                        // it is a 42804 type error (no implicit int→text — types.md §5/§11).
+                        if col.ty.is_text() {
+                            return Err(EngineError::new(
+                                SqlState::DatatypeMismatch,
+                                format!(
+                                    "cannot store an integer value in text column {}",
+                                    col.name
+                                ),
+                            ));
+                        }
                         if !col.ty.in_range(*n) {
                             return Err(EngineError::new(
                                 SqlState::NumericValueOutOfRange,
@@ -242,15 +262,27 @@ impl Database {
                         Value::Int(*n)
                     }
                     // boolean is expression-only: there are no boolean columns, so a boolean
-                    // literal can only target an integer column — a type error (42804).
+                    // literal can only target an integer/text column — a type error (42804).
                     Literal::Bool(_) => {
                         return Err(EngineError::new(
                             SqlState::DatatypeMismatch,
-                            format!(
-                                "cannot store a boolean value in integer column {}",
-                                col.name
-                            ),
+                            format!("cannot store a boolean value in column {}", col.name),
                         ));
+                    }
+                    // A text literal targets a text column; into an integer column it is a
+                    // 42804 type error (no implicit text→int).
+                    Literal::Text(s) => {
+                        if !col.ty.is_text() {
+                            return Err(EngineError::new(
+                                SqlState::DatatypeMismatch,
+                                format!(
+                                    "cannot store a text value in {} column {}",
+                                    col.ty.canonical_name(),
+                                    col.name
+                                ),
+                            ));
+                        }
+                        Value::Text(s.clone())
                     }
                 };
                 row.push(value);
@@ -258,12 +290,16 @@ impl Database {
 
             let key = match pk {
                 Some((i, pk_ty)) => {
-                    let k = match row[i] {
-                        Value::Int(n) => encode_int(pk_ty, n),
+                    let k = match &row[i] {
+                        Value::Int(n) => encode_int(pk_ty, *n),
                         // Unreachable: a PK column is NOT NULL, enforced above.
                         Value::Null => unreachable!("primary key column is NOT NULL"),
                         // Unreachable: boolean is expression-only; no column is boolean.
                         Value::Bool(_) => unreachable!("a boolean cannot be a stored column value"),
+                        // Unreachable: a text PRIMARY KEY is rejected at CREATE TABLE (0A000).
+                        Value::Text(_) => {
+                            unreachable!("a text primary key is rejected at CREATE TABLE")
+                        }
                     };
                     if seen_keys.contains(&k) || self.store(&ins.table).get(&k).is_some() {
                         return Err(EngineError::new(
@@ -373,7 +409,7 @@ impl Database {
             // operand adapts to the target column's type. The result must be an integer
             // (or NULL) — assigning a boolean to an integer column is a 42804.
             let (source, ty) = resolve(table, &a.value, Some(col.ty))?;
-            require_assignable_int(ty, &a.column)?;
+            require_assignable(ty, col.ty, &a.column)?;
             plans.push(AssignPlan {
                 idx,
                 name: col.name.clone(),
@@ -506,7 +542,7 @@ impl Database {
         if !order.is_empty() {
             rows.sort_by(|a, b| {
                 for &(idx, descending, nulls_first) in &order {
-                    let ord = key_cmp(a[idx], b[idx], descending, nulls_first);
+                    let ord = key_cmp(&a[idx], &b[idx], descending, nulls_first);
                     if ord.is_ne() {
                         return ord;
                     }
@@ -608,11 +644,13 @@ impl Database {
 // ============================================================================
 
 /// The static type of a resolved expression. `Null` is an untyped NULL literal (its
-/// integer type, if needed, is settled by the surrounding operator/context).
+/// type, if needed, is settled by the surrounding operator/context). `Text` is the
+/// `text` family (one collation, `C`); it does not promote.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResolvedType {
     Int(ScalarType),
     Bool,
+    Text,
     Null,
 }
 
@@ -641,6 +679,7 @@ enum RExpr {
     Column(usize),
     ConstInt(i64),
     ConstBool(bool),
+    ConstText(String),
     ConstNull,
     Cast {
         inner: Box<RExpr>,
@@ -723,7 +762,9 @@ fn resolve_boolean_filter(table: &Table, e: &Expr) -> Result<RExpr> {
     let (node, ty) = resolve(table, e, None)?;
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(node),
-        ResolvedType::Int(_) => Err(type_error("argument of WHERE must be boolean")),
+        ResolvedType::Int(_) | ResolvedType::Text => {
+            Err(type_error("argument of WHERE must be boolean"))
+        }
     }
 }
 
@@ -734,19 +775,44 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
     match e {
         Expr::Column(name) => {
             let idx = col_idx(table, name)?;
-            Ok((RExpr::Column(idx), ResolvedType::Int(table.columns[idx].ty)))
+            let ty = table.columns[idx].ty;
+            let rty = if ty.is_text() {
+                ResolvedType::Text
+            } else {
+                ResolvedType::Int(ty)
+            };
+            Ok((RExpr::Column(idx), rty))
         }
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
         Expr::Literal(Literal::Int(n)) => {
-            let ty = ctx.unwrap_or(ScalarType::Int64);
+            // An integer literal adapts to its integer context; a non-integer context
+            // (e.g. a text column on the other side, or a text assignment target) does
+            // not apply — it defaults to int64 and the surrounding type-check then
+            // reports the family mismatch (42804), never a panic on a text range.
+            let ty = match ctx {
+                Some(t) if !t.is_text() => t,
+                _ => ScalarType::Int64,
+            };
             if !ty.in_range(*n) {
                 return Err(overflow(ty));
             }
             Ok((RExpr::ConstInt(*n), ResolvedType::Int(ty)))
         }
+        Expr::Literal(Literal::Text(s)) => {
+            // A text literal is always text (collation `C`); it does not adapt to context.
+            Ok((RExpr::ConstText(s.clone()), ResolvedType::Text))
+        }
         Expr::Cast { inner, type_name } => {
             let target = resolve_storable_type(type_name)?;
+            // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
+            // casting TO text is a 0A000 this slice.
+            if target.is_text() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "casting to text is not supported yet",
+                ));
+            }
             // The inner value is range-checked against `target` at eval (its own
             // context), so it resolves with no literal context here.
             let (rinner, ity) = resolve(table, inner, None)?;
@@ -757,6 +823,13 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
                         "cannot cast boolean to {}",
                         target.canonical_name()
                     )));
+                }
+                // Casting FROM text is likewise deferred (0A000).
+                ResolvedType::Text => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting from text is not supported yet",
+                    ));
                 }
             }
             Ok((
@@ -775,7 +848,7 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             let result = match ty {
                 ResolvedType::Int(t) => t,
                 ResolvedType::Null => ScalarType::Int64, // -NULL = NULL
-                ResolvedType::Bool => {
+                ResolvedType::Bool | ResolvedType::Text => {
                     return Err(type_error("unary minus requires an integer operand"));
                 }
             };
@@ -807,10 +880,12 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             ))
         }
         Expr::IsDistinctFrom { lhs, rhs, negated } => {
-            // NULL-safe equality: the SAME integer operand contract as `=` (promote a
-            // mixed-width pair, adapt a literal to the sibling's type and range-check it).
-            // The result is always a definite boolean (functions.md §3).
-            let (rl, _lt, rr, _rt) = resolve_int_pair(table, lhs, rhs)?;
+            // NULL-safe equality: the SAME operand contract as `=` — resolve the pair
+            // (a literal adapts to its sibling; a text literal stays text), then require
+            // the operands be comparable (both integer-ish or both text-ish; a mixed pair
+            // is 42804). The result is always a definite boolean (functions.md §3).
+            let (rl, lt, rr, rt) = resolve_operand_pair(table, lhs, rhs)?;
+            classify_comparable(lt, rt)?;
             Ok((
                 RExpr::Distinct {
                     lhs: Box::new(rl),
@@ -853,7 +928,12 @@ fn resolve_binary(
             ))
         }
         BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
-            let (rl, _lt, rr, _rt) = resolve_int_pair(table, lhs, rhs)?;
+            // Comparison is overloaded across families: integer×integer or text×text.
+            // Resolve the operands (a literal adapts to its sibling; text literals stay
+            // text), then require they be comparable — a mixed integer/text pair is 42804.
+            // The runtime comparison (eq3/lt3/gt3) dispatches on the value variants.
+            let (rl, lt, rr, rt) = resolve_operand_pair(table, lhs, rhs)?;
+            classify_comparable(lt, rt)?;
             let cop = match op {
                 BinaryOp::Eq => CmpOp::Eq,
                 BinaryOp::Lt => CmpOp::Lt,
@@ -886,11 +966,14 @@ fn resolve_binary(
     }
 }
 
-/// Resolve the two operands of an arithmetic or comparison operator, giving each a
-/// bare integer literal the *other* operand's type as context (so `small + 1` types
-/// `1` as int16, and `small + 100000` traps 22003 at resolve). Both must be integer
-/// (or NULL); a boolean operand is a 42804 type error.
-fn resolve_int_pair(
+/// Resolve the two operands of a binary operator, giving each a bare *integer* literal
+/// the other operand's integer type as context (so `small + 1` types `1` as int16, and
+/// `small + 100000` traps 22003 at resolve). A text literal needs no context (it is
+/// always text); when the sibling is text, an integer literal gets no integer context
+/// and defaults to int64 — the caller's family check then reports the mismatch. This
+/// does NOT enforce a family — `resolve_int_pair` (arithmetic) and `classify_comparable`
+/// (comparison) layer that on top.
+fn resolve_operand_pair(
     table: &Table,
     lhs: &Expr,
     rhs: &Expr,
@@ -898,7 +981,7 @@ fn resolve_int_pair(
     let lhs_lit = matches!(lhs, Expr::Literal(Literal::Int(_)));
     let rhs_lit = matches!(rhs, Expr::Literal(Literal::Int(_)));
     let (rl, lt, rr, rt) = if lhs_lit && rhs_lit {
-        // Both bare literals: no column context, default to int64 (types.md §6).
+        // Both bare integer literals: no column context, default to int64 (types.md §6).
         let (rl, lt) = resolve(table, lhs, Some(ScalarType::Int64))?;
         let (rr, rt) = resolve(table, rhs, Some(ScalarType::Int64))?;
         (rl, lt, rr, rt)
@@ -915,9 +998,36 @@ fn resolve_int_pair(
         let (rr, rt) = resolve(table, rhs, None)?;
         (rl, lt, rr, rt)
     };
+    Ok((rl, lt, rr, rt))
+}
+
+/// Resolve the two operands of an *arithmetic* operator: both must be integer (or NULL);
+/// a boolean or text operand is a 42804 type error.
+fn resolve_int_pair(
+    table: &Table,
+    lhs: &Expr,
+    rhs: &Expr,
+) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
+    let (rl, lt, rr, rt) = resolve_operand_pair(table, lhs, rhs)?;
     require_int_operand(lt)?;
     require_int_operand(rt)?;
     Ok((rl, lt, rr, rt))
+}
+
+/// Require that a comparison operand pair is comparable (spec/types/compare.toml): both
+/// from the integer family (NULL counts as either), or both text. A mixed integer/text
+/// pair, or a boolean operand, is a 42804 type error — comparison is overloaded across
+/// families but never compares across them.
+fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
+    use ResolvedType::{Bool, Int, Text};
+    match (lt, rt) {
+        (Bool, _) | (_, Bool) => Err(type_error("comparison operands must be integer or text")),
+        (Int(_), Text) | (Text, Int(_)) => Err(type_error(
+            "cannot compare a text value with an integer value",
+        )),
+        // (Int,Int) (Int,Null) (Null,Int) (Text,Text) (Text,Null) (Null,Text) (Null,Null)
+        _ => Ok(()),
+    }
 }
 
 /// The `ScalarType` of an integer-typed resolved expression, or `None` for a NULL
@@ -949,27 +1059,36 @@ fn promote(a: ResolvedType, b: ResolvedType) -> ScalarType {
 fn require_int_operand(ty: ResolvedType) -> Result<()> {
     match ty {
         ResolvedType::Int(_) | ResolvedType::Null => Ok(()),
-        ResolvedType::Bool => Err(type_error(
-            "arithmetic and comparison operators require integer operands",
-        )),
+        ResolvedType::Bool | ResolvedType::Text => {
+            Err(type_error("arithmetic operators require integer operands"))
+        }
     }
 }
 
 fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(()),
-        ResolvedType::Int(_) => Err(type_error(msg)),
+        ResolvedType::Int(_) | ResolvedType::Text => Err(type_error(msg)),
     }
 }
 
-/// A value assigned to an integer column must itself be integer (or NULL); a boolean
-/// expression is a 42804 type error.
-fn require_assignable_int(ty: ResolvedType, col: &str) -> Result<()> {
-    match ty {
-        ResolvedType::Int(_) | ResolvedType::Null => Ok(()),
-        ResolvedType::Bool => Err(type_error(format!(
-            "cannot assign a boolean value to integer column {col}"
-        ))),
+/// A value assigned to a column must match its family: an integer column takes an
+/// integer (or NULL) value; a text column takes a text (or NULL) value. Any other pair
+/// (boolean anywhere, or a cross-family int/text) is a 42804 type error. Mirrors the
+/// INSERT literal type-check, generalized to expressions.
+fn require_assignable(ty: ResolvedType, col_ty: ScalarType, col: &str) -> Result<()> {
+    let ok = match (col_ty.is_text(), ty) {
+        (false, ResolvedType::Int(_) | ResolvedType::Null) => true,
+        (true, ResolvedType::Text | ResolvedType::Null) => true,
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(type_error(format!(
+            "cannot assign a value to column {col} of type {}",
+            col_ty.canonical_name()
+        )))
     }
 }
 
@@ -1025,9 +1144,11 @@ struct AssignPlan {
 
 impl AssignPlan {
     /// Type-check a candidate value against this column: NULL into NOT NULL traps
-    /// 23502; an integer outside the target range traps 22003 (CLAUDE.md §8) — mirrors
-    /// INSERT's per-value checks. The resolver already proved the value is integer or
-    /// NULL (never boolean), so a boolean here is unreachable.
+    /// 23502; an integer outside the target range traps 22003 (CLAUDE.md §8); a text
+    /// value into a text column is accepted as-is (the `C` collation imposes no
+    /// constraint) — mirrors INSERT's per-value checks. The resolver already proved the
+    /// value's family matches the column (never boolean, never a cross-family pair), so
+    /// the mismatched variants are unreachable.
     fn check(&self, v: Value) -> Result<Value> {
         match v {
             Value::Null => {
@@ -1049,6 +1170,10 @@ impl AssignPlan {
                     Err(overflow(self.target))
                 }
             }
+            Value::Text(s) => {
+                debug_assert!(self.target.is_text());
+                Ok(Value::Text(s))
+            }
             Value::Bool(_) => unreachable!("resolver rejects assigning a boolean to a column"),
         }
     }
@@ -1065,9 +1190,12 @@ impl RExpr {
     /// depends on operand values (spec/design/cost.md §3).
     fn eval(&self, row: &[Value], m: &mut Meter) -> Result<Value> {
         match self {
-            RExpr::Column(i) => Ok(row[*i]),
+            // The value is read out of a borrowed stored row, so it is cloned (Value is
+            // Clone, not Copy, now that a text value owns a String).
+            RExpr::Column(i) => Ok(row[*i].clone()),
             RExpr::ConstInt(n) => Ok(Value::Int(*n)),
             RExpr::ConstBool(b) => Ok(Value::Bool(*b)),
+            RExpr::ConstText(s) => Ok(Value::Text(s.clone())),
             RExpr::ConstNull => Ok(Value::Null),
             RExpr::Cast { inner, target } => {
                 m.charge(COSTS.operator_eval);
@@ -1081,6 +1209,7 @@ impl RExpr {
                         }
                     }
                     Value::Bool(_) => unreachable!("resolver rejects a boolean cast operand"),
+                    Value::Text(_) => unreachable!("resolver rejects a text cast operand"),
                 }
             }
             RExpr::Neg { operand, result } => {
@@ -1097,11 +1226,13 @@ impl RExpr {
                         }
                     }
                     Value::Bool(_) => unreachable!("resolver rejects a boolean unary minus"),
+                    Value::Text(_) => unreachable!("resolver rejects a text unary minus"),
                 }
             }
             RExpr::Not(e) => {
                 m.charge(COSTS.operator_eval);
-                Ok(not3(e.eval(row, m)?))
+                let v = e.eval(row, m)?;
+                Ok(not3(&v))
             }
             RExpr::Arith {
                 op,
@@ -1115,7 +1246,7 @@ impl RExpr {
                 match (a, b) {
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     (Value::Int(x), Value::Int(y)) => eval_arith(*op, x, y, *result),
-                    _ => unreachable!("resolver rejects boolean arithmetic operands"),
+                    _ => unreachable!("resolver rejects non-integer arithmetic operands"),
                 }
             }
             RExpr::Compare { op, lhs, rhs } => {
@@ -1123,21 +1254,25 @@ impl RExpr {
                 let a = lhs.eval(row, m)?;
                 let b = rhs.eval(row, m)?;
                 let tv = match op {
-                    CmpOp::Eq => a.eq3(b),
-                    CmpOp::Lt => a.lt3(b),
-                    CmpOp::Gt => a.gt3(b),
-                    CmpOp::Le => a.lt3(b).or(a.eq3(b)),
-                    CmpOp::Ge => a.gt3(b).or(a.eq3(b)),
+                    CmpOp::Eq => a.eq3(&b),
+                    CmpOp::Lt => a.lt3(&b),
+                    CmpOp::Gt => a.gt3(&b),
+                    CmpOp::Le => a.lt3(&b).or(a.eq3(&b)),
+                    CmpOp::Ge => a.gt3(&b).or(a.eq3(&b)),
                 };
                 Ok(from3(tv))
             }
             RExpr::And(l, r) => {
                 m.charge(COSTS.operator_eval);
-                Ok(and3(l.eval(row, m)?, r.eval(row, m)?))
+                let lv = l.eval(row, m)?;
+                let rv = r.eval(row, m)?;
+                Ok(and3(&lv, &rv))
             }
             RExpr::Or(l, r) => {
                 m.charge(COSTS.operator_eval);
-                Ok(or3(l.eval(row, m)?, r.eval(row, m)?))
+                let lv = l.eval(row, m)?;
+                let rv = r.eval(row, m)?;
+                Ok(or3(&lv, &rv))
             }
             RExpr::IsNull { operand, negated } => {
                 m.charge(COSTS.operator_eval);
@@ -1147,7 +1282,9 @@ impl RExpr {
             }
             RExpr::Distinct { lhs, rhs, negated } => {
                 m.charge(COSTS.operator_eval);
-                let same = lhs.eval(row, m)?.not_distinct_from(rhs.eval(row, m)?);
+                let lv = lhs.eval(row, m)?;
+                let rv = rhs.eval(row, m)?;
+                let same = lv.not_distinct_from(&rv);
                 // `negated` carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks
                 // "are they the same?" → `same`; IS DISTINCT FROM asks the opposite. Either
                 // way the result is a definite boolean — never unknown (the null_safe
@@ -1198,7 +1335,7 @@ fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> 
 /// `NULLS FIRST|LAST` overrides the direction default (spec/design/grammar.md §10). The
 /// physical key order ratifies NULL as the largest value (the PostgreSQL model), which
 /// surfaces as the parse-time default `nulls_first = descending` (ASC → last, DESC → first).
-fn key_cmp(a: Value, b: Value, descending: bool, nulls_first: bool) -> std::cmp::Ordering {
+fn key_cmp(a: &Value, b: &Value, descending: bool, nulls_first: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
@@ -1223,17 +1360,22 @@ fn key_cmp(a: Value, b: Value, descending: bool, nulls_first: bool) -> std::cmp:
     }
 }
 
-/// Total order over NON-NULL values: signed-integer ascending. The boolean arms (false <
-/// true, and boolean < integer) are kept only for totality — ORDER BY is over an integer
-/// column this slice, so they are unreachable from SELECT. NULLs are handled by `key_cmp`
+/// Total order over NON-NULL values: signed-integer ascending, and text by the `C`
+/// collation — raw UTF-8 bytes, which for UTF-8 equals code-point order
+/// (spec/design/types.md §11). The boolean arms and the cross-family arms (a fixed
+/// `bool < int < text` order) are kept only for totality — ORDER BY is over a single
+/// typed column, so they are unreachable from SELECT. NULLs are handled by `key_cmp`
 /// before this is reached.
-fn value_cmp(a: Value, b: Value) -> std::cmp::Ordering {
+fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(&y),
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(&y),
-        (Value::Bool(_), Value::Int(_)) => Ordering::Less,
-        (Value::Int(_), Value::Bool(_)) => Ordering::Greater,
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Bool(_), _) => Ordering::Less,
+        (_, Value::Bool(_)) => Ordering::Greater,
+        (Value::Int(_), Value::Text(_)) => Ordering::Less,
+        (Value::Text(_), Value::Int(_)) => Ordering::Greater,
         (Value::Null, _) | (_, Value::Null) => Ordering::Equal,
     }
 }

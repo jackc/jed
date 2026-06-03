@@ -109,6 +109,10 @@ id = "types.int64"
 description = "int64 / bigint scalar type"
 
 [[capability]]
+id = "types.text"
+description = "text scalar type (variable-width UTF-8, collation C): storage, literals, and comparison/ordering. Non-key column only this slice — a text PRIMARY KEY is rejected 0A000 (spec/design/types.md §11)"
+
+[[capability]]
 id = "null.three_valued"
 description = "Three-valued NULL logic in comparisons (CLAUDE.md §4)"
 

@@ -52,12 +52,28 @@ function nopkTableDB(): Database {
   return db;
 }
 
+// textTableDB has a text column — exercises the value codec's text branch (u16 length +
+// UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text value,
+// and a 4-byte astral char (😀). The PK stays int32 (no text key this slice).
+function textTableDB(): Database {
+  const db = new Database();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, s text)");
+  run(db, "INSERT INTO t VALUES (1, 'alice')");
+  run(db, "INSERT INTO t VALUES (2, '')");
+  run(db, "INSERT INTO t VALUES (3, 'O''Brien')");
+  run(db, "INSERT INTO t VALUES (4, 'café')");
+  run(db, "INSERT INTO t VALUES (5, NULL)");
+  run(db, "INSERT INTO t VALUES (6, '😀')");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
     { name: "empty_db.adb", build: () => new Database() },
     { name: "one_table_empty.adb", build: oneTableEmptyDB },
     { name: "pk_table.adb", build: pkTableDB },
+    { name: "text_table.adb", build: textTableDB },
     { name: "nopk_table.adb", build: nopkTableDB },
   ];
   for (const c of cases) {
@@ -76,6 +92,7 @@ test("read goldens reproduces rows", () => {
   const cases: { name: string; build: () => Database; table: string }[] = [
     { name: "one_table_empty.adb", build: oneTableEmptyDB, table: "t" },
     { name: "pk_table.adb", build: pkTableDB, table: "t" },
+    { name: "text_table.adb", build: textTableDB, table: "t" },
     { name: "nopk_table.adb", build: nopkTableDB, table: "r" },
     { name: "torn_meta_slot0.adb", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.adb", build: pkTableDB, table: "t" },

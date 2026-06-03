@@ -2,9 +2,11 @@ package abide
 
 import "strings"
 
-// ScalarType is an integer scalar type (CLAUDE.md §4). Step-1 scope: signed
-// integers only. Hand-written per CLAUDE.md §5, cross-checked against
-// spec/types/scalars.toml in tests so the two never drift.
+// ScalarType is a storable scalar type (CLAUDE.md §4): the three signed integers plus
+// text. Hand-written per CLAUDE.md §5, cross-checked against spec/types/scalars.toml in
+// tests so the two never drift. The integer-only accessors (WidthBytes/Min/Max/Rank/
+// InRange) return their zero value for Text; callers route text through its own paths
+// (the value codec, the text comparator), never these.
 type ScalarType int
 
 const (
@@ -14,6 +16,9 @@ const (
 	Int32
 	// Int64 is int64 / bigint.
 	Int64
+	// Text is text / varchar / string: variable-width UTF-8, collation C (byte /
+	// code-point order — spec/design/types.md §11).
+	Text
 )
 
 // CanonicalName is the single name used in all output (determinism — CLAUDE.md §10).
@@ -25,13 +30,17 @@ func (t ScalarType) CanonicalName() string {
 		return "int32"
 	case Int64:
 		return "int64"
+	case Text:
+		return "text"
 	default:
 		return "?"
 	}
 }
 
 // ScalarTypeFromName resolves a type name (canonical or alias) case-insensitively.
-// PG's int2/int4/int8 are intentionally NOT accepted (we own our surface §1).
+// PG's int2/int4/int8 are intentionally NOT accepted (we own our surface §1). The
+// two-word "character varying" alias is recognized, though this slice's parser only
+// produces single-word type names (a documented narrowing — spec/design/types.md §11).
 func ScalarTypeFromName(name string) (ScalarType, bool) {
 	switch strings.ToLower(name) {
 	case "int16", "smallint":
@@ -40,12 +49,19 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return Int32, true
 	case "int64", "bigint":
 		return Int64, true
+	case "text", "varchar", "string", "character varying":
+		return Text, true
 	default:
 		return 0, false
 	}
 }
 
-// WidthBytes is the storage width in bytes (the key-encoding width).
+// IsText reports whether this is the variable-width text type (vs a fixed-width integer).
+func (t ScalarType) IsText() bool { return t == Text }
+
+// WidthBytes is the fixed storage width in bytes (the key-encoding width). Integer-only —
+// text is variable-width and carries its own length (spec/fileformat/format.md), so this
+// returns 0 for Text and is never used on that path.
 func (t ScalarType) WidthBytes() int {
 	switch t {
 	case Int16:
@@ -108,7 +124,7 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64}
+	return []ScalarType{Int16, Int32, Int64, Text}
 }
 
 // IsBooleanTypeName reports whether name is the boolean type (canonical "boolean",

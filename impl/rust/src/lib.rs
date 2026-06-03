@@ -76,6 +76,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "types.int16",
     "types.int32",
     "types.int64",
+    // text scalar type (variable-width UTF-8, collation C): storage, literals, and
+    // comparison/ordering. Non-key column only this slice (text PRIMARY KEY → 0A000).
+    "types.text",
     // General expression substrate — integer arithmetic, the expression-only boolean
     // type, and the AND/OR/NOT Kleene connectives (the `expression` profile).
     "types.boolean",

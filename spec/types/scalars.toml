@@ -29,11 +29,19 @@ schema_version = 1
 #               (CLAUDE.md §8 — strict typing forbids silent reinterpretation).
 # encoding      order-preserving key encoding (CLAUDE.md §8). method
 #               "int-be-signflip" = fixed-width big-endian with the sign bit
-#               inverted; "bool-byte" = a single byte 0x00 (false) < 0x01 (true).
-#               Both sort byte-for-byte identically to logical order.
+#               inverted; "bool-byte" = a single byte 0x00 (false) < 0x01 (true);
+#               "text-terminated-escape" = UTF-8 bytes (the `C` collation), each
+#               0x00 escaped to 0x00 0xFF and the string terminated with 0x00 0x01
+#               (order-preserving + self-delimiting — see ../design/encoding.md §2.4).
+#               All sort byte-for-byte identically to logical order. width_bytes is
+#               omitted for variable-width types (text).
 # rank          position in the integer promotion tower; the common type of two
 #               integers is the one with the higher rank (see compare.toml). Omitted
-#               for non-integer types (boolean does not promote — there is one).
+#               for non-integer types (boolean and text do not promote).
+# collation     for text only: the one defined collation. "C" = byte / code-point
+#               order over UTF-8 (PostgreSQL's `C`/POSIX collation, = SQLite BINARY),
+#               the deterministic, version-independent, table-free choice (CLAUDE.md
+#               §8; ../design/types.md §11). Locale/ICU collations are a later feature.
 # -----------------------------------------------------------------------------
 
 [[type]]
@@ -94,3 +102,24 @@ aliases = ["bool"]
 family = "boolean"
 storable = false
 encoding = { method = "bool-byte", width_bytes = 1 }
+
+# --- text: the first storable non-integer scalar -----------------------------
+# Variable-width UTF-8 string. STORABLE this slice: `CREATE TABLE t(s text)` works,
+# values are stored on disk (on-disk type code 4 — ../fileformat/format.md), and
+# text columns compare/order/dedup. Its one collation is `C` (byte / code-point
+# order over UTF-8) — see ../design/types.md §11 for why one collation, and why
+# locale/ICU collation is deferred. The empty string '' is a distinct, non-NULL
+# value. Aliases cover the SQL spellings; varchar(n) LENGTH limits, text⇄int casts,
+# and string functions/LIKE are all deferred (../design/types.md §11). The text
+# KEY encoding rule (text-terminated-escape) is authored now (encoding.md §2.4) but
+# UNEXERCISED this slice: a text PRIMARY KEY is rejected 0A000 (a documented,
+# relaxable narrowing, like the boolean storable narrowing). No bits/min/max/
+# overflow/rank — those are integer-family fields; no width_bytes — text is
+# variable-width.
+[[type]]
+id = "text"
+aliases = ["varchar", "character varying", "string"]
+family = "text"
+storable = true
+encoding = { method = "text-terminated-escape" }
+collation = "C"

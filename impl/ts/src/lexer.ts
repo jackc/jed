@@ -71,6 +71,32 @@ export function lex(sql: string): Token[] {
         tokens.push({ kind: "gt" });
         i++;
       }
+    } else if (c === "'") {
+      // Single-quoted string literal (the text type). `''` is an embedded single quote;
+      // backslash is an ordinary character (no C-style escapes — standard_conforming_strings,
+      // spec/design/types.md §11). Accumulating code units verbatim preserves the string
+      // (a surrogate pair's halves rejoin), so multibyte/astral text round-trips.
+      i++; // consume the opening quote
+      let s = "";
+      let closed = false;
+      while (i < n) {
+        if (sql[i] === "'") {
+          if (i + 1 < n && sql[i + 1] === "'") {
+            s += "'";
+            i += 2;
+            continue;
+          }
+          i++; // consume the closing quote
+          closed = true;
+          break;
+        }
+        s += sql[i]!;
+        i++;
+      }
+      if (!closed) {
+        throw engineError("syntax_error", "unterminated string literal");
+      }
+      tokens.push({ kind: "str", str: s });
     } else if (isDigit(c)) {
       // Integer literal: an unsigned magnitude (the sign is the "minus" operator). The
       // magnitude must be <= 2^63 so that -(2^63) = int64's minimum is reachable;

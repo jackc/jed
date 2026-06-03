@@ -27,6 +27,7 @@ import {
   canonicalName,
   inRange,
   isBooleanTypeName,
+  isText,
   rank,
   scalarTypeFromName,
 } from "./types.ts";
@@ -35,6 +36,7 @@ import {
   boolAnd,
   boolNot,
   boolOr,
+  compareTextC,
   eq3,
   from3,
   gt3,
@@ -43,6 +45,7 @@ import {
   lt3,
   notDistinctFrom,
   nullValue,
+  textValue,
 } from "./value.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
@@ -119,6 +122,12 @@ export class Database {
       }
       const ty = resolveStorableType(def.typeName);
       if (def.primaryKey) {
+        // Text is not allowed in a key this slice: the order-preserving text key encoding
+        // (spec/design/encoding.md §2.4) is authored but unexercised, so a text PRIMARY KEY
+        // is a documented 0A000 narrowing (spec/design/types.md §11).
+        if (isText(ty)) {
+          throw engineError("feature_not_supported", "a text primary key is not supported yet");
+        }
         if (pkSeen) {
           throw engineError(
             "invalid_table_definition",
@@ -196,6 +205,14 @@ export class Database {
           }
           row[i] = nullValue();
         } else if (lit.kind === "int") {
+          // An integer literal targets an integer column; into a text column it is a 42804
+          // type error (no implicit int→text — types.md §5/§11).
+          if (isText(col.type)) {
+            throw engineError(
+              "datatype_mismatch",
+              "cannot store an integer value in text column " + col.name,
+            );
+          }
           if (!inRange(col.type, lit.int)) {
             throw engineError(
               "numeric_value_out_of_range",
@@ -203,12 +220,22 @@ export class Database {
             );
           }
           row[i] = intValue(lit.int);
+        } else if (lit.kind === "text") {
+          // A text literal targets a text column; into an integer column it is a 42804 type
+          // error (no implicit text→int).
+          if (!isText(col.type)) {
+            throw engineError(
+              "datatype_mismatch",
+              "cannot store a text value in " + canonicalName(col.type) + " column " + col.name,
+            );
+          }
+          row[i] = textValue(lit.text);
         } else {
           // boolean is expression-only: there are no boolean columns, so a boolean literal
-          // can only target an integer column — a type error (42804).
+          // can only target an integer/text column — a type error (42804).
           throw engineError(
             "datatype_mismatch",
-            "cannot store a boolean value in integer column " + col.name,
+            "cannot store a boolean value in column " + col.name,
           );
         }
       }
@@ -307,7 +334,7 @@ export class Database {
       // adapts to the target column's type. The result must be an integer (or NULL) —
       // assigning a boolean to an integer column is a 42804.
       const { node, type } = resolve(table, a.value, col.type);
-      requireAssignableInt(type, a.column);
+      requireAssignable(type, col.type, a.column);
       plans.push({ idx, name: col.name, target: col.type, notNull: col.notNull, source: node });
     }
 
@@ -473,6 +500,10 @@ function distinctRowKey(row: Value[]): string {
           return "i" + v.int.toString();
         case "bool":
           return v.value ? "b1" : "b0";
+        case "text":
+          // Length-prefix the content so the separator byte cannot be confused with a text
+          // value that contains it (the value is arbitrary UTF-8).
+          return "t" + v.text.length.toString() + ":" + v.text;
       }
     })
     .join("|");
@@ -492,6 +523,7 @@ function distinctRowKey(row: Value[]): string {
 type ResolvedType =
   | { kind: "int"; ty: ScalarType }
   | { kind: "bool" }
+  | { kind: "text" } // the text family (one collation, C); does not promote
   | { kind: "null" };
 
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
@@ -500,6 +532,7 @@ type RExpr =
   | { kind: "column"; index: number }
   | { kind: "constInt"; value: bigint }
   | { kind: "constBool"; value: boolean }
+  | { kind: "constText"; value: string }
   | { kind: "constNull" }
   | { kind: "cast"; target: ScalarType; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
@@ -569,7 +602,9 @@ function resolve(
     case "column": {
       const idx = columnIndex(table, e.name);
       if (idx < 0) throw engineError("undefined_column", "column does not exist: " + e.name);
-      return { node: { kind: "column", index: idx }, type: { kind: "int", ty: table.columns[idx]!.type } };
+      const colTy = table.columns[idx]!.type;
+      const type: ResolvedType = isText(colTy) ? { kind: "text" } : { kind: "int", ty: colTy };
+      return { node: { kind: "column", index: idx }, type };
     }
     case "literal":
       switch (e.literal.kind) {
@@ -577,17 +612,33 @@ function resolve(
           return { node: { kind: "constNull" }, type: { kind: "null" } };
         case "bool":
           return { node: { kind: "constBool", value: e.literal.value }, type: { kind: "bool" } };
+        case "text":
+          // A text literal is always text (collation C); it does not adapt to context.
+          return { node: { kind: "constText", value: e.literal.text }, type: { kind: "text" } };
         default: {
-          const ty = ctx ?? "int64";
+          // An integer literal adapts to its integer context; a non-integer context (a text
+          // column on the other side, or a text assignment target) does not apply — it
+          // defaults to int64 and the surrounding type-check then reports the family
+          // mismatch (42804), never a wrong range check on a text type.
+          const ty = ctx !== null && !isText(ctx) ? ctx : "int64";
           if (!inRange(ty, e.literal.int)) throw overflow(ty);
           return { node: { kind: "constInt", value: e.literal.int }, type: { kind: "int", ty } };
         }
       }
     case "cast": {
       const target = resolveStorableType(e.typeName);
+      // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
+      // casting TO text is a 0A000 this slice.
+      if (isText(target)) {
+        throw engineError("feature_not_supported", "casting to text is not supported yet");
+      }
       const inner = resolve(table, e.inner, null);
       if (inner.type.kind === "bool") {
         throw typeError("cannot cast boolean to " + canonicalName(target));
+      }
+      // Casting FROM text is likewise deferred (0A000).
+      if (inner.type.kind === "text") {
+        throw engineError("feature_not_supported", "casting from text is not supported yet");
       }
       return { node: { kind: "cast", target, operand: inner.node }, type: { kind: "int", ty: target } };
     }
@@ -610,10 +661,12 @@ function resolve(
       return { node: { kind: "isNull", operand: node, negated: e.negated }, type: { kind: "bool" } };
     }
     case "isDistinct": {
-      // NULL-safe equality: the SAME integer operand contract as `=` (promote a
-      // mixed-width pair, adapt a literal to the sibling's type and range-check it). The
-      // result is always a definite boolean (functions.md §3).
-      const p = resolveIntPair(table, e.lhs, e.rhs);
+      // NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a literal
+      // adapts to its sibling; a text literal stays text), then require the operands be
+      // comparable (both integer-ish or both text-ish; a mixed pair is 42804). The result
+      // is always a definite boolean (functions.md §3).
+      const p = resolveOperandPair(table, e.lhs, e.rhs);
+      classifyComparable(p.lt, p.rt);
       return { node: { kind: "distinct", lhs: p.rl, rhs: p.rr, negated: e.negated }, type: { kind: "bool" } };
     }
     case "binary":
@@ -642,7 +695,12 @@ function resolveBinary(
     case "gt":
     case "le":
     case "ge": {
-      const p = resolveIntPair(table, lhs, rhs);
+      // Comparison is overloaded across families: integer×integer or text×text. Resolve the
+      // operands (a literal adapts to its sibling; text literals stay text), then require
+      // they be comparable — a mixed integer/text pair is 42804. The runtime comparison
+      // (eq3/lt3/gt3) dispatches on the value kinds.
+      const p = resolveOperandPair(table, lhs, rhs);
+      classifyComparable(p.lt, p.rt);
       return { node: { kind: "compare", op, lhs: p.rl, rhs: p.rr }, type: { kind: "bool" } };
     }
     default: {
@@ -656,11 +714,14 @@ function resolveBinary(
   }
 }
 
-// resolveIntPair resolves the two operands of an arithmetic/comparison operator, giving
-// a bare integer literal the OTHER operand's type as context (so `small + 1` types `1`
-// as int16, and `small + 100000` traps 22003 at resolve). Both must be integer (or
-// NULL); a boolean operand is a 42804 type error.
-function resolveIntPair(
+// resolveOperandPair resolves the two operands of a binary operator, giving a bare
+// *integer* literal the other operand's integer type as context (so `small + 1` types `1`
+// as int16, and `small + 100000` traps 22003 at resolve). A text literal needs no context
+// (it is always text); when the sibling is text, an integer literal gets no integer context
+// (intTypeOf returns null) and defaults to int64 — the caller's family check then reports
+// the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
+// classifyComparable (comparison) layer that on top.
+function resolveOperandPair(
   table: Table,
   lhs: Expr,
   rhs: Expr,
@@ -682,9 +743,33 @@ function resolveIntPair(
     l = resolve(table, lhs, null);
     r = resolve(table, rhs, null);
   }
-  requireIntOperand(l.type);
-  requireIntOperand(r.type);
   return { rl: l.node, lt: l.type, rr: r.node, rt: r.type };
+}
+
+// resolveIntPair resolves the two operands of an *arithmetic* operator: both must be
+// integer (or NULL); a boolean or text operand is a 42804 type error.
+function resolveIntPair(
+  table: Table,
+  lhs: Expr,
+  rhs: Expr,
+): { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType } {
+  const p = resolveOperandPair(table, lhs, rhs);
+  requireIntOperand(p.lt);
+  requireIntOperand(p.rt);
+  return p;
+}
+
+// classifyComparable requires that a comparison operand pair is comparable
+// (spec/types/compare.toml): both from the integer family (NULL counts as either), or both
+// text. A mixed integer/text pair, or a boolean operand, is a 42804 type error — comparison
+// is overloaded across families but never compares across them.
+function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
+  if (lt.kind === "bool" || rt.kind === "bool") {
+    throw typeError("comparison operands must be integer or text");
+  }
+  if ((lt.kind === "int" && rt.kind === "text") || (lt.kind === "text" && rt.kind === "int")) {
+    throw typeError("cannot compare a text value with an integer value");
+  }
 }
 
 function isIntLiteral(e: Expr): boolean {
@@ -708,20 +793,25 @@ function promote(a: ResolvedType, b: ResolvedType): ScalarType {
 }
 
 function requireIntOperand(t: ResolvedType): void {
-  if (t.kind === "bool") {
-    throw typeError("arithmetic and comparison operators require integer operands");
+  if (t.kind === "bool" || t.kind === "text") {
+    throw typeError("arithmetic operators require integer operands");
   }
 }
 
 function requireBool(t: ResolvedType, msg: string): void {
-  if (t.kind === "int") throw typeError(msg);
+  if (t.kind === "int" || t.kind === "text") throw typeError(msg);
 }
 
-// requireAssignableInt: a value assigned to an integer column must itself be integer (or
-// NULL); a boolean expression is a 42804 type error.
-function requireAssignableInt(t: ResolvedType, col: string): void {
-  if (t.kind === "bool") {
-    throw typeError("cannot assign a boolean value to integer column " + col);
+// requireAssignable: a value assigned to a column must match its family — an integer column
+// takes an integer (or NULL) value; a text column takes a text (or NULL) value. Any other
+// pair (boolean anywhere, or a cross-family int/text) is a 42804 type error. Mirrors the
+// INSERT literal type-check, generalized to expressions.
+function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): void {
+  const ok = isText(colTy)
+    ? t.kind === "text" || t.kind === "null"
+    : t.kind === "int" || t.kind === "null";
+  if (!ok) {
+    throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
   }
 }
 
@@ -764,6 +854,8 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
       return intValue(e.value);
     case "constBool":
       return { kind: "bool", value: e.value };
+    case "constText":
+      return textValue(e.value);
     case "constNull":
       return nullValue();
     case "cast": {
@@ -892,10 +984,17 @@ function keyCmp(a: Value, b: Value, descending: boolean, nullsFirst: boolean): n
   return descending ? -base : base;
 }
 
-// valueCmp is the total order over NON-NULL values: signed-integer ascending, with the
-// boolean ordering (false < true) defined only for totality — ORDER BY is over an integer
-// column this slice. NULLs are handled by keyCmp before this is reached. Returns <0, 0, >0.
+// valueCmp is the total order over NON-NULL values: signed-integer ascending, and text by
+// the C collation — UTF-8 byte / code-point order (compareTextC, NOT JS `<` — the §8 trap;
+// spec/design/types.md §11). The boolean ordering and the cross-family arms (a fixed
+// bool < int < text order) are defined only for totality — ORDER BY is over a single typed
+// column, so they are unreachable from SELECT. NULLs are handled by keyCmp before this is
+// reached. Returns <0, 0, >0.
 function valueCmp(a: Value, b: Value): number {
+  if (a.kind === "text" || b.kind === "text") {
+    if (a.kind === "text" && b.kind === "text") return compareTextC(a.text, b.text);
+    return a.kind === "text" ? 1 : -1; // text sorts after any non-text value
+  }
   const x = orderKey(a);
   const y = orderKey(b);
   if (x < y) return -1;
@@ -933,7 +1032,12 @@ function checkAssign(p: AssignPlan, v: Value): Value {
     }
     return nullValue();
   }
-  if (v.kind !== "int") throw typeError("internal: boolean assigned to integer column");
+  if (v.kind === "text") {
+    // A text value into a text column is accepted as-is (the C collation imposes no
+    // constraint). The resolver proved the value's family matches the column.
+    return v;
+  }
+  if (v.kind !== "int") throw typeError("internal: boolean assigned to a column");
   if (!inRange(p.target, v.int)) throw overflow(p.target);
   return intValue(v.int);
 }

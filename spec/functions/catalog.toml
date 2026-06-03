@@ -13,13 +13,20 @@
 schema_version = 1
 
 # field doc -------------------------------------------------------------------
-# name            internal identity; the codegen handle and AST node name. One
-#                 name per operator (eq/lt/gt/le/ge, is_distinct_from/
-#                 is_not_distinct_from, add/sub/mul/div/mod, neg, and/or/not,
-#                 is_null/is_not_null).
+# name            internal identity; the codegen handle and AST node name (eq/lt/
+#                 gt/le/ge, is_distinct_from/is_not_distinct_from, add/sub/mul/div/
+#                 mod, neg, and/or/not, is_null/is_not_null). An operator may be
+#                 OVERLOADED across operand families: e.g. `=` (name "eq") applies
+#                 to both integer×integer and text×text, so there is one [[operator]]
+#                 ROW PER OPERAND-FAMILY SIGNATURE that shares the name+symbol. The
+#                 name is the single AST node (operand types pick the evaluation at
+#                 run time); a row is identified by (name, arg_families). verify.rb
+#                 enforces uniqueness of (name, arg_families) and of (symbol, kind,
+#                 arity, arg_families), not of name/symbol alone.
 # symbol          surface spelling of an infix/prefix operator ("=", "<=", "+",
 #                 "-"). Omitted for operators with no single punctuation token:
 #                 the IS [NOT] NULL tests and the keyword connectives AND/OR/NOT.
+#                 Shared across an operator's overload rows (one `=` token, two rows).
 # kind            operator class: "comparison" | "null_test" | "arithmetic" |
 #                 "logical". Reserved for a later slice: "function".
 # arity           operand count (2 = binary, 1 = unary).
@@ -187,6 +194,99 @@ kind           = "comparison"
 arity          = 2
 arg_families   = ["integer", "integer"]
 arg_resolution = "promote"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+# --- comparison operators (text) ---------------------------------------------
+# The text-family OVERLOAD of the comparisons above: the same operator names/symbols
+# (`=` < > <= >=, and IS [NOT] DISTINCT FROM) applied to text×text. arg_resolution =
+# "none" — there is one text type, so no promotion (compare.toml). Operands compare
+# by the `C` collation (byte / code-point order over UTF-8). text vs a non-text
+# operand is not comparable (compare.toml lists only text×text), so it is a 42804
+# type error. Same precedence (35), same NULL discipline as the integer comparisons:
+# propagating for the ordering/equality ops, null_safe for IS [NOT] DISTINCT FROM. No
+# overflow or other failure is possible, so errors = []. Deferred: string functions,
+# concatenation (||), and LIKE (../design/types.md §11).
+
+[[operator]]
+name           = "eq"
+symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "lt"
+symbol         = "<"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "gt"
+symbol         = ">"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "le"
+symbol         = "<="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ge"
+symbol         = ">="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_not_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
 result         = "boolean"
 null           = "null_safe"
 precedence     = 35

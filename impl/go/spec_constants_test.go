@@ -133,15 +133,21 @@ func TestOperatorsMatchSpec(t *testing.T) {
 	if len(rows) != len(Operators) {
 		t.Fatalf("operator count: spec %d, generated %d", len(rows), len(Operators))
 	}
-	byName := map[string]OperatorDesc{}
-	for _, d := range Operators {
-		byName[d.Name] = d
+	// Operators are overloaded across operand families (one row per (name, arg_families)
+	// — e.g. `eq` for integer and for text), so match on the full signature, not the name.
+	find := func(name string, fams []string) (OperatorDesc, bool) {
+		for _, d := range Operators {
+			if d.Name == name && strings.Join(d.ArgFamilies, ",") == strings.Join(fams, ",") {
+				return d, true
+			}
+		}
+		return OperatorDesc{}, false
 	}
 	for _, row := range rows {
 		name := row.str("name")
-		desc, ok := byName[name]
+		desc, ok := find(name, row.strs("arg_families"))
 		if !ok {
-			t.Fatalf("generated table missing operator %q", name)
+			t.Fatalf("generated table missing operator %q %v", name, row.strs("arg_families"))
 		}
 		if desc.Kind != row.str("kind") {
 			t.Errorf("%s: kind got %q want %q", name, desc.Kind, row.str("kind"))

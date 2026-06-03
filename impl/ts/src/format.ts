@@ -15,8 +15,8 @@ import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database } from "./executor.ts";
 import type { Row } from "./storage.ts";
-import { type ScalarType, widthBytes } from "./types.ts";
-import { type Value, intValue, nullValue } from "./value.ts";
+import { type ScalarType, isText, widthBytes } from "./types.ts";
+import { type Value, intValue, nullValue, textValue } from "./value.ts";
 
 const FORMAT_VERSION = 1; // on-disk format version
 const PAGE_HEADER = 12; // bytes of the catalog/data page header
@@ -37,6 +37,8 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 2;
     case "int64":
       return 3;
+    case "text":
+      return 4;
   }
 }
 
@@ -49,6 +51,8 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "int32";
     case 3:
       return "int64";
+    case 4:
+      return "text";
     default:
       return undefined;
   }
@@ -69,13 +73,24 @@ export function crc32Ieee(data: Uint8Array): number {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-// encodeValue is the value codec (format.md): a presence tag plus, when present, the
-// integer bytes for the column type. Reuses the key encoding behind a named seam so
-// storage and key encodings can diverge when non-integer types land.
+// encodeValue is the value codec (format.md): a 1-byte presence tag (0x01 = NULL), then the
+// type's present-value body. Integers reuse the order-preserving key encoding; text is
+// where the seam diverges — a stored text value needs no ordering, so it is a compact u16
+// byte-length + UTF-8 bytes (collation C, verbatim). A text value whose UTF-8 length exceeds
+// 0xFFFF is unsupported; in practice it also exceeds a page and is caught by the
+// oversized-item rule in packing (0A000), so the u16 write is sound for every supported page
+// size (spec/fileformat/format.md). boolean is expression-only — never stored (§1).
 function encodeValue(ty: ScalarType, v: Value): Uint8Array {
-  // boolean is expression-only this slice; no column is boolean, so a stored value is
-  // only ever NULL or an integer (spec/design/types.md §1).
   if (v.kind === "null") return encodeNullable(ty, null);
+  if (v.kind === "text") {
+    const bytes = UTF8.encode(v.text);
+    const out = new Uint8Array(3 + bytes.length);
+    out[0] = 0x00; // present
+    out[1] = (bytes.length >>> 8) & 0xff;
+    out[2] = bytes.length & 0xff;
+    out.set(bytes, 3);
+    return out;
+  }
   if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");
   return encodeNullable(ty, v.int);
 }
@@ -444,7 +459,18 @@ function decodeRecord(colTypes: ScalarType[], buf: Uint8Array, cur: Cursor): { k
 // readValue reads one value via the value codec (inverse of encodeValue).
 function readValue(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
   const tag = readU8(buf, cur);
-  if (tag === 0x00) return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
+  if (tag === 0x00) {
+    if (isText(ty)) {
+      const n = readU16(buf, cur);
+      const bytes = take(buf, cur, n);
+      try {
+        return textValue(UTF8_DECODE.decode(bytes));
+      } catch {
+        throw engineError("data_corrupted", "non-UTF-8 text value");
+      }
+    }
+    return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
+  }
   if (tag === 0x01) return nullValue();
   throw engineError("data_corrupted", "invalid value presence tag");
 }

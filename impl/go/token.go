@@ -8,6 +8,10 @@ const (
 	TokWord TokenKind = iota
 	// TokInt is an integer literal's unsigned magnitude (the sign is TokMinus).
 	TokInt
+	// TokStr is a single-quoted string literal's decoded content (the text type): the
+	// lexer strips the quotes and collapses each doubled '' to one ' (no backslash
+	// escapes — standard_conforming_strings, spec/design/types.md §11).
+	TokStr
 	// TokComma is ",".
 	TokComma
 	// TokLParen is "(".
@@ -44,6 +48,6 @@ const (
 // -(2^63) folds to int64's minimum (spec/design/grammar.md §4).
 type Token struct {
 	Kind TokenKind
-	Word string
+	Word string // TokWord, or the decoded string for TokStr
 	Int  uint64
 }

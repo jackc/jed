@@ -1,21 +1,25 @@
 //! Runtime values and three-valued comparison (CLAUDE.md §4).
 //!
-//! All step-1 scalar types are signed integers that fit in i64, so a non-null
-//! value is represented as an `i64` regardless of its declared column type. The
-//! declared type governs range checks (overflow) and key-encoding width, not the
-//! in-memory integer representation.
+//! An integer value is held as an `i64` regardless of its declared column type (the
+//! type governs range checks and key-encoding width, not the representation); a `text`
+//! value holds its UTF-8 `String`. Because `Text` owns a `String`, `Value` is `Clone`,
+//! not `Copy` — the comparison/render helpers borrow (`&self`, `&Value`) rather than
+//! consume, and the executor clones a value only when reading it out of a stored row.
 
-/// A runtime value: SQL NULL, an integer, or a boolean.
+/// A runtime value: SQL NULL, an integer, a boolean, or a text string.
 ///
 /// boolean is expression-only this slice (spec/design/types.md §1): a `Bool` value
 /// is produced by comparisons and logical connectives and can be projected/rendered,
 /// but is never stored in a column. A NULL boolean (unknown) is represented as
 /// `Value::Null`, so `{Bool(true), Bool(false), Null}` is the three-valued domain.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// `Text` is the first stored non-integer value; it compares by the `C` collation
+/// (UTF-8 byte / code-point order — spec/design/types.md §11).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Value {
     Null,
     Int(i64),
     Bool(bool),
+    Text(String),
 }
 
 /// The result of a three-valued comparison (CLAUDE.md §4): TRUE / FALSE / UNKNOWN.
@@ -48,46 +52,55 @@ impl ThreeValued {
 
 impl Value {
     /// Render for conformance output: integers as shortest decimal, booleans as the
-    /// canonical `true`/`false`, NULL (including a NULL/unknown boolean) as the literal
-    /// `NULL` (spec/design/conformance.md §1; the canonical spelling is a §8 decision).
-    pub fn render(self) -> String {
+    /// canonical `true`/`false`, text verbatim (the `T` tag — no quoting), NULL
+    /// (including a NULL/unknown boolean) as the literal `NULL` (spec/design/conformance.md
+    /// §1; the canonical spelling is a §8 decision).
+    pub fn render(&self) -> String {
         match self {
             Value::Null => "NULL".to_string(),
             Value::Int(n) => n.to_string(),
             Value::Bool(true) => "true".to_string(),
             Value::Bool(false) => "false".to_string(),
+            Value::Text(s) => s.clone(),
         }
     }
 
     /// Whether this value is boolean TRUE. A WHERE expression keeps a row only when it
     /// is TRUE; FALSE and NULL/unknown both reject (CLAUDE.md §4, Kleene).
-    pub fn is_true(self) -> bool {
+    pub fn is_true(&self) -> bool {
         matches!(self, Value::Bool(true))
     }
 
     /// Three-valued equality. NULL compared with anything (including NULL) is
     /// UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Integers
-    /// compare by value; since all integer types promote losslessly into i64,
-    /// cross-type comparison is just i64 equality (spec/types/compare.toml).
-    pub fn eq3(self, other: Value) -> ThreeValued {
+    /// compare by value (all integer types promote losslessly into i64); text compares
+    /// by the `C` collation — raw UTF-8 bytes, which for UTF-8 equals code-point order
+    /// (spec/design/types.md §11). A mixed int/text pair never reaches here — the
+    /// resolver rejects it (42804) — so any non-matching variant pair is a NULL operand.
+    pub fn eq3(&self, other: &Value) -> ThreeValued {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => bool3(a == b),
+            (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() == b.as_bytes()),
             _ => ThreeValued::Unknown,
         }
     }
 
-    /// Three-valued ordering predicate `self < other`.
-    pub fn lt3(self, other: Value) -> ThreeValued {
+    /// Three-valued ordering predicate `self < other` (text by `C` collation = UTF-8
+    /// byte order).
+    pub fn lt3(&self, other: &Value) -> ThreeValued {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => bool3(a < b),
+            (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() < b.as_bytes()),
             _ => ThreeValued::Unknown,
         }
     }
 
-    /// Three-valued ordering predicate `self > other`.
-    pub fn gt3(self, other: Value) -> ThreeValued {
+    /// Three-valued ordering predicate `self > other` (text by `C` collation = UTF-8
+    /// byte order).
+    pub fn gt3(&self, other: &Value) -> ThreeValued {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => bool3(a > b),
+            (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() > b.as_bytes()),
             _ => ThreeValued::Unknown,
         }
     }
@@ -95,11 +108,11 @@ impl Value {
     /// NULL-safe equality — the `IS NOT DISTINCT FROM` primitive (CLAUDE.md §4,
     /// spec/design/functions.md §3). NULL is a comparable value, not a poison: two NULLs
     /// are "not distinct" (the same), a NULL and a present value are distinct, and two
-    /// present integers compare by value. The answer is **always** definite — there is no
-    /// UNKNOWN here, which is the whole point of the operator. `IS DISTINCT FROM` is the
-    /// negation of this. (The resolver guarantees integer/NULL operands, so non-null
-    /// values reduce to `eq3`, which is definite when neither side is NULL.)
-    pub fn not_distinct_from(self, other: Value) -> bool {
+    /// present values (integer or text) compare by value. The answer is **always**
+    /// definite — there is no UNKNOWN here, which is the whole point of the operator.
+    /// `IS DISTINCT FROM` is the negation of this. (The resolver guarantees same-family
+    /// non-null operands, so they reduce to `eq3`, which is definite when neither is NULL.)
+    pub fn not_distinct_from(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Null, Value::Null) => true,
             (Value::Null, _) | (_, Value::Null) => false,
@@ -131,9 +144,9 @@ pub fn from3(t: ThreeValued) -> Value {
     }
 }
 
-/// Project a Value into the three-valued domain. A non-boolean Value (NULL, or
+/// Project a Value into the three-valued domain. A non-boolean Value (NULL, text, or
 /// defensively an Int that the resolver should never route here) is UNKNOWN.
-pub fn to3(v: Value) -> ThreeValued {
+pub fn to3(v: &Value) -> ThreeValued {
     match v {
         Value::Bool(true) => ThreeValued::True,
         Value::Bool(false) => ThreeValued::False,
@@ -143,7 +156,7 @@ pub fn to3(v: Value) -> ThreeValued {
 
 /// Kleene AND: FALSE dominates (`false AND unknown = false`); TRUE only when both are
 /// TRUE; otherwise UNKNOWN (NULL). This is why AND is not plain NULL-propagation.
-pub fn and3(a: Value, b: Value) -> Value {
+pub fn and3(a: &Value, b: &Value) -> Value {
     match (to3(a), to3(b)) {
         (ThreeValued::False, _) | (_, ThreeValued::False) => Value::Bool(false),
         (ThreeValued::True, ThreeValued::True) => Value::Bool(true),
@@ -152,12 +165,12 @@ pub fn and3(a: Value, b: Value) -> Value {
 }
 
 /// Kleene OR: TRUE dominates (`true OR unknown = true`); built on `ThreeValued::or`.
-pub fn or3(a: Value, b: Value) -> Value {
+pub fn or3(a: &Value, b: &Value) -> Value {
     from3(to3(a).or(to3(b)))
 }
 
 /// Kleene NOT: genuine propagation — `NOT NULL = NULL`.
-pub fn not3(a: Value) -> Value {
+pub fn not3(a: &Value) -> Value {
     match to3(a) {
         ThreeValued::True => Value::Bool(false),
         ThreeValued::False => Value::Bool(true),

@@ -265,6 +265,8 @@ func (p *Parser) parseLiteral() (Literal, error) {
 				"value out of range: integer literal exceeds the maximum signed 64-bit value")
 		}
 		return Literal{Kind: LiteralInt, Int: v}, nil
+	case !negate && t.Kind == TokStr:
+		return Literal{Kind: LiteralText, Str: t.Word}, nil
 	case !negate && t.Kind == TokWord && toLowerASCII(t.Word) == "null":
 		return Literal{Kind: LiteralNull}, nil
 	case !negate && t.Kind == TokWord && toLowerASCII(t.Word) == "true":
@@ -782,6 +784,9 @@ func (p *Parser) parsePrimary() (Expr, error) {
 				"value out of range: integer literal exceeds the maximum signed 64-bit value")
 		}
 		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralInt, Int: v}}, nil
+	case t.Kind == TokStr:
+		p.advance()
+		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralText, Str: t.Word}}, nil
 	case t.Kind == TokWord && toLowerASCII(t.Word) == "null":
 		p.advance()
 		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralNull}}, nil

@@ -11,7 +11,10 @@
 export type Literal =
   | { kind: "null" }
   | { kind: "int"; int: bigint }
-  | { kind: "bool"; value: boolean };
+  | { kind: "bool"; value: boolean }
+  // A single-quoted text literal (decoded content). Its type is always text (collation C);
+  // it does not adapt to context like an integer literal does (spec/design/types.md §11).
+  | { kind: "text"; text: string };
 
 // UnaryOp: arithmetic negation `-x` or logical negation `NOT x`.
 export type UnaryOp = "neg" | "not";

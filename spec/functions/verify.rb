@@ -18,7 +18,10 @@
 #   7. every code in `errors` exists in registry.toml
 #   8. kind is a known kind (comparison | null_test | arithmetic | logical; function
 #      reserved)
-#   9. name unique across the catalog; symbol unique per (kind, arity)
+#   9. each (name, arg_families) signature is unique, and each punctuation symbol is
+#      unique per (kind, arity, arg_families). Operators may be OVERLOADED across
+#      operand families — one row per family signature sharing name+symbol (e.g. `=`
+#      for integer×integer and text×text) — so name/symbol alone need not be unique.
 #  10. precedence, if present, is an integer (the parser precedence tower; absent for
 #      operators with no infix/prefix precedence, e.g. future named functions)
 #
@@ -62,8 +65,8 @@ def main
   operators = catalog["operator"] || []
   fail!("catalog.toml: no [[operator]] entries") if operators.empty?
 
-  names = []
-  symbols_by_kind_arity = Hash.new { |h, k| h[k] = [] }
+  name_sigs = []   # [name, arg_families] — unique per overload
+  symbol_sigs = [] # [symbol, kind, arity, arg_families] — unique per overload
 
   operators.each do |op|
     id = op["name"] || "(unnamed)"
@@ -124,17 +127,21 @@ def main
       fail!("operator #{id}: error code #{code.inspect} is not in registry.toml") unless error_codes.include?(code)
     end
 
-    # (9) collect for uniqueness
-    names << op["name"]
-    symbols_by_kind_arity[[kind, op["arity"]]] << op["symbol"] if op.key?("symbol")
+    # (9) collect for uniqueness — keyed by operand-family signature, so an operator
+    # overloaded across families (one row per arg_families) is allowed; a true
+    # duplicate (same name AND same operand families) is still rejected.
+    name_sigs << [op["name"], args]
+    symbol_sigs << [op["symbol"], kind, op["arity"], args] if op.key?("symbol")
   end
 
-  # (9) uniqueness
-  dup_names = names.tally.select { |_, n| n > 1 }.keys
-  fail!("duplicate operator names: #{dup_names.join(', ')}") unless dup_names.empty?
-  symbols_by_kind_arity.each do |(kind, arity), syms|
-    dup = syms.tally.select { |_, n| n > 1 }.keys
-    fail!("duplicate symbol(s) for #{kind}/arity-#{arity}: #{dup.join(', ')}") unless dup.empty?
+  # (9) uniqueness of overload signatures
+  dup_names = name_sigs.tally.select { |_, n| n > 1 }.keys
+  unless dup_names.empty?
+    fail!("duplicate operator (name, arg_families): #{dup_names.map { |n, a| "#{n}#{a.inspect}" }.join(', ')}")
+  end
+  dup_syms = symbol_sigs.tally.select { |_, n| n > 1 }.keys
+  unless dup_syms.empty?
+    fail!("duplicate (symbol, kind, arity, arg_families): #{dup_syms.map { |s, k, ar, a| "#{s} #{k}/arity-#{ar} #{a.inspect}" }.join(', ')}")
   end
 
   puts "OK: #{operators.length} operators — catalog coherent"

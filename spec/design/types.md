@@ -12,29 +12,32 @@ system — "like SQLite, but with a real type system." It is designed as data, b
 executor, so that every implementation tests against one shared contract instead of
 discovering semantics in code.
 
-## 1. Scope: signed integers (storable) + boolean (expression-only)
+## 1. Scope: signed integers + text (storable) + boolean (expression-only)
 
-The storable scalar types are exactly three signed integers (CLAUDE.md §4):
+The storable scalar types are three signed integers (CLAUDE.md §4) plus `text`:
 
 | Canonical id | Aliases | Bits | Range |
 |---|---|---|---|
 | `int16` | `smallint` | 16 | −32768 … 32767 |
 | `int32` | `int`, `integer` | 32 | −2147483648 … 2147483647 |
 | `int64` | `bigint` | 64 | −9223372036854775808 … 9223372036854775807 |
+| `text` | `varchar`, `character varying`, `string` | — | variable-width UTF-8 (collation `C`) |
 
-All are signed, two's-complement. The general-expression slice adds **`boolean`** (aliases
-`bool`) as the first non-integer scalar — but **expression-only**: it is the result type of
-comparisons and the logical connectives and the type of the `TRUE`/`FALSE` literals, yet it
-is **not a storable column type** (`storable = false` in
-[../types/scalars.toml](../types/scalars.toml)). You cannot declare `CREATE TABLE t(b
-boolean)` or `CAST(x AS boolean)`; both trap `0A000` (feature_not_supported) — a deliberate
-narrowing (§10), relaxable in the storable-boolean follow-on. The remaining scalars
-(`decimal`, `text`, `timestamp`/`timestamptz`, `bytea`, `json`/`jsonb`) are still
-**deferred**. A direct consequence: the float-formatting, decimal-rounding, NaN/∞-ordering,
-and collation decisions in CLAUDE.md §8 still do **not** bind — there are no floats,
-decimals, or text yet. Boolean adds real divergence-prone behavior of its own (a render
-form beyond `I`/`T`/`R`, and three-valued Kleene connectives — §10) on the *smallest*
-possible non-integer surface.
+The integers are signed, two's-complement. **`text`** is the first storable non-integer
+scalar — a variable-width UTF-8 string with one defined collation, `C` (byte / code-point
+order); see §11 for the collation decision and its deferred features. The general-expression
+slice also adds **`boolean`** (aliases `bool`) as the first non-integer scalar, but
+**expression-only**: it is the result type of comparisons and the logical connectives and the
+type of the `TRUE`/`FALSE` literals, yet it is **not a storable column type** (`storable =
+false` in [../types/scalars.toml](../types/scalars.toml)). You cannot declare `CREATE TABLE
+t(b boolean)` or `CAST(x AS boolean)`; both trap `0A000` (feature_not_supported) — a
+deliberate narrowing (§10), relaxable in the storable-boolean follow-on. The remaining scalars
+(`decimal`, `timestamp`/`timestamptz`, `bytea`, `json`/`jsonb`) are still **deferred**, so the
+float-formatting, decimal-rounding, and NaN/∞-ordering decisions in CLAUDE.md §8 still do
+**not** bind — there are no floats or decimals yet. The **collation** decision (§8) *does* now
+bind, and is settled in §11: one collation, `C`. Boolean and text each add real
+divergence-prone behavior (a render form beyond `I`, three-valued Kleene connectives — §10;
+and UTF-8 vs. UTF-16 ordering — §11) on the smallest possible surfaces.
 
 ## 2. Canonical names vs. aliases
 
@@ -85,14 +88,17 @@ higher-ranked type (`strategy = "max-rank"`) and are compared there. Widening is
 lossless, so promotion never loses information or traps.
 
 **Comparability.** Only listed `(family, family)` pairs may be compared; everything else
-is a type error (`42804`). The one rule is `integer × integer`: the comparison operators
-(`= < > <= >=`) accept **integer operands only**. Comparing a boolean — `(a = b) = (c = d)`,
-`bool = int` — is a `42804` type error this slice; booleans are produced by comparisons and
-consumed by the logical connectives and `WHERE`, but they are not themselves compared with
-the comparison operators (a deliberate narrowing, relaxable by adding a `boolean × boolean`
-comparability rule later). This table is where cross-family rules (integer ↔ decimal, the
-boolean self-comparison) will be added deliberately, rather than falling out of implicit
-coercions.
+is a type error (`42804`). There are two rules: `integer × integer` (`via = "promote"` — widen
+to the common type, then compare) and `text × text` (`via = "none"` — both are already text,
+compare by the `C` collation; §11). The comparison operators (`= < > <= >=` and `IS [NOT]
+DISTINCT FROM`) are **overloaded** across these families (one catalog row per signature —
+[../functions/catalog.toml](../functions/catalog.toml)). A **mixed** pair is a `42804` type
+error: `text = int` is not comparable (no such `comparable` pair), exactly as `bool = int` is.
+Comparing a boolean — `(a = b) = (c = d)`, `bool = int` — is likewise a `42804` this slice;
+booleans are produced by comparisons and consumed by the connectives and `WHERE`, not compared
+themselves (a deliberate narrowing, relaxable by adding a `boolean × boolean` rule). This table
+is where cross-family rules (integer ↔ decimal, text ↔ other, the boolean self-comparison) will
+be added deliberately, rather than falling out of implicit coercions.
 
 **Three-valued NULL logic** (CLAUDE.md §4). Any comparison with a NULL operand is
 `UNKNOWN`, never TRUE/FALSE. Notably `NULL = NULL` is `UNKNOWN`: equality is **not**
@@ -131,6 +137,10 @@ listed).
   **implicit** — inserted automatically wherever a wider integer is wanted.
 - **Narrowing** (`int64→int32`, `int64→int16`, `int32→int16`) is lossy in general, so it
   requires an **explicit** `CAST(...)` and **traps** (`22003`) when the value does not fit.
+- **Text casts** are **not in the matrix**, so by the strict rule they are forbidden this
+  slice: `text ↔ int` in either direction is rejected (`CAST('1' AS int)`, `CAST(1 AS text)`).
+  The `text → text` identity is implicit, like any identity cast. Text↔other conversions arrive
+  with the string-function slice (§11).
 
 Cast modes are `implicit` / `assignment` / `explicit`. `assignment` (allowed on
 INSERT/UPDATE into a column but not in general expressions) is part of the vocabulary for
@@ -219,6 +229,8 @@ byte-identity is the whole point.
 - ✅ Boolean renders as a fixed canonical form (`true`/`false`, NULL as `NULL`) — see §10 and
   [conformance.md](conformance.md); no host-dependent boolean spelling may leak.
 - ✅ Kleene `AND`/`OR`/`NOT` truth tables are fixed data (§10), identical across cores.
+- ✅ Text orders by the `C` collation — `memcmp` over UTF-8 = code-point order — identical
+  across cores; the TS UTF-16-vs-UTF-8 ordering trap is avoided by comparing encoded bytes (§11).
 
 ## 9. The boolean type and three-valued connectives
 
@@ -266,4 +278,71 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
 - **`boolean × boolean` comparability** — still deferred: comparing two booleans
   (`(a = b) = (c = d)`) remains a `42804` this slice (§4).
 - **`assignment`-mode casts** — vocabulary reserved; first used by non-integer types.
+- **`text`** — ✅ landed as the first storable non-integer scalar, with one collation `C`
+  (§11). Its deferred sub-features (`varchar(n)` length limits, text⇄other casts, string
+  functions / `||` / `LIKE`, text in keys, and locale/ICU multi-collation) are enumerated in §11.
 - **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4.
+
+## 11. The text type and its collation
+
+`text` (aliases `varchar`, `character varying`, `string`) is a **variable-width UTF-8 string**
+and the first storable non-integer scalar. The empty string `''` is a distinct, non-NULL value
+(a zero-length string), separate from `NULL`.
+
+**One collation: `C` (byte / code-point order over UTF-8).** A *collation* is the rule for
+ordering and equating text, layered on the *encoding* (which maps characters to bytes — the
+engine commits to UTF-8 everywhere). CLAUDE.md §8 calls for **one** defined collation to start,
+"byte/codepoint order is simplest," with ICU/locale collation an explicit later feature. We
+adopt **`C`**: compare the raw UTF-8 bytes lexicographically (`memcmp`). This is the one place
+where the PostgreSQL-default rule (§1/CLAUDE.md §1) and the determinism rule (CLAUDE.md §8/§10)
+point the same way:
+
+- It **is** PostgreSQL's `C`/`POSIX` collation (and SQLite's default `BINARY`), so "match PG"
+  is satisfied with no tension.
+- It needs **zero data tables** and is a fixed algorithm — identical on every platform, every
+  core, every version, forever. Nothing must be embedded in the database file for ordering to
+  be stable. (This is *why* `C` is the right starting collation for a no-reference-implementation,
+  byte-exact, multi-core engine — CLAUDE.md §2/§8.)
+- For UTF-8, byte order **equals Unicode code-point order** (a UTF-8 design property), so the
+  comparator and the order-preserving key encoding (encoding.md §2.4) are order-preserving for
+  free.
+
+The price is that `C` is not "human": `'B' < 'a'` (`0x42 < 0x61`), digits sort before letters,
+and accented/non-ASCII characters sort by code point, after all ASCII — exactly PostgreSQL `C`'s
+behavior, and documented as such.
+
+**Cross-core determinism trap (load-bearing).** Comparing text is *not* as trivially identical
+across cores as comparing integers. Rust (`str` `Ord`) and Go (`string` `<`) compare by **bytes**
+— correct. But JavaScript/TypeScript `<` and `localeCompare` compare by **UTF-16 code units**,
+which **disagrees with UTF-8 / code-point order for any character above U+FFFF** (e.g. `😀`
+U+1F600 sorts before U+E000–U+FFFF in UTF-16 but after them by code point). So the TS core MUST
+compare encoded UTF-8 bytes (or iterate code points) — never the raw JS string. This is pinned
+by a conformance case containing an astral character (CLAUDE.md §8).
+
+**Why not locale/linguistic collation (ICU/CLDR) now.** Locale collations (`en_US`, `de_DE`,
+case/accent folding, language tailoring) are linguistically correct but (a) require large data
+tables and (b) **vary by library version** — an ICU or glibc upgrade can reorder the same
+strings, the well-known cause of silent index corruption in PostgreSQL after an OS upgrade. For
+this engine that is doubly disqualifying: relying on each host's ICU/glibc would make the
+several cores (Rust, Go, TS, …) disagree byte-for-byte, violating cross-core identity (CLAUDE.md
+§8). A linguistic collation here would therefore have to **vendor and version-pin** the UCA/CLDR
+tables as shared spec data (CLAUDE.md §5) — a large, deliberate later feature, exactly as §8
+files it.
+
+**Deferred text sub-features** (relaxable narrowings, each its own follow-up):
+
+- **Text in a key / `PRIMARY KEY`** — rejected `0A000` this slice; the order-preserving key
+  rule is authored (encoding.md §2.4) and the executor path + byte fixtures land when lifted.
+- **`varchar(n)` length limits** — `varchar`/`character varying`/`string` are accepted as
+  aliases for **unbounded** `text`; a length parameter `varchar(n)` is not supported yet
+  (rejected `0A000`). When added, an over-length value traps `22001` (string_data_right_truncation).
+- **Text ⇄ other casts** (§5), **string functions** (`length`, `lower`/`upper`, `substring`),
+  **concatenation `||`**, and **`LIKE`** — separate slices; this slice is comparison + storage
+  only (`= < > <= >=`, `IS [NOT] DISTINCT FROM`).
+- **Multi-collation / ICU** — a second collation, a per-column collation field in the catalog
+  (the on-disk format reserves room for it — format.md), and `COLLATE` clauses.
+
+**Practical size note.** A text value is unbounded by type, but a single stored value (or row)
+larger than one page trips the existing whole-image `feature_not_supported` (`0A000`) narrowing
+(format.md "Oversized item") — with integers that was unreachable; with text it becomes a real,
+documented limit until overflow pages land.

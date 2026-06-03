@@ -9,6 +9,10 @@ pub enum Token {
     /// parser converts: a bare magnitude `> i64::MAX` traps 22003, and `-(2^63)` folds
     /// to `int64::MIN`. See spec/design/grammar.md §4.
     Int(u64),
+    /// A single-quoted string literal's decoded content (the `text` type). The lexer
+    /// strips the surrounding quotes and collapses each doubled `''` to one `'`
+    /// (standard_conforming_strings; no backslash escapes). See spec/design/types.md §11.
+    Str(String),
     Comma,
     LParen,
     RParen,

@@ -105,6 +105,13 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			return Outcome{}, err
 		}
 		if def.PrimaryKey {
+			// Text is not allowed in a key this slice: the order-preserving text key
+			// encoding (spec/design/encoding.md §2.4) is authored but unexercised, so a
+			// text PRIMARY KEY is a documented 0A000 narrowing (spec/design/types.md §11).
+			if ty.IsText() {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a text primary key is not supported yet")
+			}
 			if pkSeen {
 				return Outcome{}, NewError(InvalidTableDefinition,
 					"a table may have at most one primary key")
@@ -183,6 +190,12 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 				}
 				row[i] = NullValue()
 			case LiteralInt:
+				// An integer literal targets an integer column; into a text column it is a
+				// 42804 type error (no implicit int→text — types.md §5/§11).
+				if col.Type.IsText() {
+					return Outcome{}, NewError(DatatypeMismatch,
+						"cannot store an integer value in text column "+col.Name)
+				}
 				if !col.Type.InRange(lit.Int) {
 					return Outcome{}, NewError(NumericValueOutOfRange,
 						"value out of range for type "+col.Type.CanonicalName())
@@ -190,9 +203,17 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 				row[i] = IntValue(lit.Int)
 			case LiteralBool:
 				// boolean is expression-only: there are no boolean columns, so a boolean
-				// literal can only target an integer column — a type error (42804).
+				// literal can only target an integer/text column — a type error (42804).
 				return Outcome{}, NewError(DatatypeMismatch,
-					"cannot store a boolean value in integer column "+col.Name)
+					"cannot store a boolean value in column "+col.Name)
+			case LiteralText:
+				// A text literal targets a text column; into an integer column it is a
+				// 42804 type error (no implicit text→int).
+				if !col.Type.IsText() {
+					return Outcome{}, NewError(DatatypeMismatch,
+						"cannot store a text value in "+col.Type.CanonicalName()+" column "+col.Name)
+				}
+				row[i] = TextValue(lit.Str)
 			}
 		}
 
@@ -311,7 +332,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 		if err != nil {
 			return Outcome{}, err
 		}
-		if err := requireAssignableInt(ty, a.Column); err != nil {
+		if err := requireAssignable(ty, col.Type, a.Column); err != nil {
 			return Outcome{}, err
 		}
 		plans = append(plans, assignPlan{
@@ -581,6 +602,13 @@ func distinctRowKey(row []Value) string {
 			} else {
 				b.WriteByte('0')
 			}
+		case ValText:
+			// Length-prefix the content so the separator byte cannot be confused with a
+			// text value that contains it (the value bytes are arbitrary UTF-8).
+			b.WriteByte('t')
+			b.WriteString(strconv.Itoa(len(v.Str)))
+			b.WriteByte(':')
+			b.WriteString(v.Str)
 		}
 	}
 	return b.String()
@@ -601,6 +629,7 @@ const (
 	rtNull rtKind = iota // an untyped NULL literal
 	rtInt                // integer; intTy carries the ScalarType
 	rtBool
+	rtText // text (one family, collation C); does not promote
 )
 
 type resolvedType struct {
@@ -632,6 +661,7 @@ const (
 	reColumn rExprKind = iota
 	reConstInt
 	reConstBool
+	reConstText
 	reConstNull
 	reCast
 	reNeg
@@ -652,6 +682,7 @@ type rExpr struct {
 	index   int        // reColumn
 	cInt    int64      // reConstInt
 	cBool   bool       // reConstBool
+	cText   string     // reConstText
 	op      BinaryOp   // reArith, reCompare
 	result  ScalarType // reCast target; reNeg / reArith result type
 	lhs     *rExpr     // reArith, reCompare, reAnd, reOr, reDistinct
@@ -728,17 +759,28 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		if idx < 0 {
 			return nil, resolvedType{}, NewError(UndefinedColumn, "column does not exist: "+e.Column)
 		}
-		return &rExpr{kind: reColumn, index: idx},
-			resolvedType{kind: rtInt, intTy: table.Columns[idx].Type}, nil
+		colTy := table.Columns[idx].Type
+		rt := resolvedType{kind: rtInt, intTy: colTy}
+		if colTy.IsText() {
+			rt = resolvedType{kind: rtText}
+		}
+		return &rExpr{kind: reColumn, index: idx}, rt, nil
 	case ExprLiteral:
 		switch e.Literal.Kind {
 		case LiteralNull:
 			return &rExpr{kind: reConstNull}, resolvedType{kind: rtNull}, nil
 		case LiteralBool:
 			return &rExpr{kind: reConstBool, cBool: e.Literal.Bool}, resolvedType{kind: rtBool}, nil
+		case LiteralText:
+			// A text literal is always text (collation C); it does not adapt to context.
+			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
 		default: // LiteralInt
+			// An integer literal adapts to its integer context; a non-integer context
+			// (a text column on the other side, or a text assignment target) does not
+			// apply — it defaults to int64 and the surrounding type-check then reports the
+			// family mismatch (42804), never a wrong range check on a text type.
 			ty := Int64
-			if ctx != nil {
+			if ctx != nil && !ctx.IsText() {
 				ty = *ctx
 			}
 			if !ty.InRange(e.Literal.Int) {
@@ -752,12 +794,21 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		// Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
+		// casting TO text is a 0A000 this slice.
+		if target.IsText() {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to text is not supported yet")
+		}
 		inner, ity, err := resolve(table, e.Cast.Inner, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		if ity.kind == rtBool {
 			return nil, resolvedType{}, typeError("cannot cast boolean to " + target.CanonicalName())
+		}
+		// Casting FROM text is likewise deferred (0A000).
+		if ity.kind == rtText {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from text is not supported yet")
 		}
 		return &rExpr{kind: reCast, operand: inner, result: target},
 			resolvedType{kind: rtInt, intTy: target}, nil
@@ -796,11 +847,15 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		return &rExpr{kind: reIsNull, operand: rop, negated: e.IsNullOf.Negated},
 			resolvedType{kind: rtBool}, nil
 	case ExprIsDistinct:
-		// NULL-safe equality: the SAME integer operand contract as `=` (promote a
-		// mixed-width pair, adapt a literal to the sibling's type and range-check it).
-		// The result is always a definite boolean (functions.md §3).
-		rl, _, rr, _, err := resolveIntPair(table, e.IsDistinct.Lhs, e.IsDistinct.Rhs)
+		// NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a
+		// literal adapts to its sibling; a text literal stays text), then require the
+		// operands be comparable (both integer-ish or both text-ish; a mixed pair is
+		// 42804). The result is always a definite boolean (functions.md §3).
+		rl, lt, rr, rt, err := resolveOperandPair(table, e.IsDistinct.Lhs, e.IsDistinct.Rhs)
 		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := classifyComparable(lt, rt); err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reDistinct, lhs: rl, rhs: rr, negated: e.IsDistinct.Negated},
@@ -821,8 +876,15 @@ func resolveBinary(table *Table, b *BinaryExpr) (*rExpr, resolvedType, error) {
 		return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: result},
 			resolvedType{kind: rtInt, intTy: result}, nil
 	case OpEq, OpLt, OpGt, OpLe, OpGe:
-		rl, _, rr, _, err := resolveIntPair(table, b.Lhs, b.Rhs)
+		// Comparison is overloaded across families: integer×integer or text×text. Resolve
+		// the operands (a literal adapts to its sibling; text literals stay text), then
+		// require they be comparable — a mixed integer/text pair is 42804. The runtime
+		// comparison (Eq3/Lt3/Gt3) dispatches on the value kinds.
+		rl, lt, rr, rt, err := resolveOperandPair(table, b.Lhs, b.Rhs)
 		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := classifyComparable(lt, rt); err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reCompare, op: b.Op, lhs: rl, rhs: rr},
@@ -850,11 +912,14 @@ func resolveBinary(table *Table, b *BinaryExpr) (*rExpr, resolvedType, error) {
 	}
 }
 
-// resolveIntPair resolves the two operands of an arithmetic/comparison operator, giving
-// a bare integer literal the *other* operand's type as context (so `small + 1` types `1`
-// as int16, and `small + 100000` traps 22003 at resolve). Both must be integer (or NULL);
-// a boolean operand is a 42804 type error.
-func resolveIntPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
+// resolveOperandPair resolves the two operands of a binary operator, giving a bare
+// *integer* literal the other operand's integer type as context (so `small + 1` types `1`
+// as int16, and `small + 100000` traps 22003 at resolve). A text literal needs no context
+// (it is always text); when the sibling is text, an integer literal gets no integer
+// context (ctxOf returns nil) and defaults to int64 — the caller's family check then
+// reports the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
+// classifyComparable (comparison) layer that on top.
+func resolveOperandPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
 	lhsLit := isIntLiteral(lhs)
 	rhsLit := isIntLiteral(rhs)
 	var rl, rr *rExpr
@@ -886,6 +951,16 @@ func resolveIntPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, 
 	if err != nil {
 		return nil, resolvedType{}, nil, resolvedType{}, err
 	}
+	return rl, lt, rr, rt, nil
+}
+
+// resolveIntPair resolves the two operands of an *arithmetic* operator: both must be
+// integer (or NULL); a boolean or text operand is a 42804 type error.
+func resolveIntPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
+	rl, lt, rr, rt, err := resolveOperandPair(table, lhs, rhs)
+	if err != nil {
+		return nil, resolvedType{}, nil, resolvedType{}, err
+	}
 	if err := requireIntOperand(lt); err != nil {
 		return nil, resolvedType{}, nil, resolvedType{}, err
 	}
@@ -893,6 +968,20 @@ func resolveIntPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, 
 		return nil, resolvedType{}, nil, resolvedType{}, err
 	}
 	return rl, lt, rr, rt, nil
+}
+
+// classifyComparable requires that a comparison operand pair is comparable
+// (spec/types/compare.toml): both from the integer family (NULL counts as either), or both
+// text. A mixed integer/text pair, or a boolean operand, is a 42804 type error — comparison
+// is overloaded across families but never compares across them.
+func classifyComparable(lt, rt resolvedType) error {
+	if lt.kind == rtBool || rt.kind == rtBool {
+		return typeError("comparison operands must be integer or text")
+	}
+	if (lt.kind == rtInt && rt.kind == rtText) || (lt.kind == rtText && rt.kind == rtInt) {
+		return typeError("cannot compare a text value with an integer value")
+	}
+	return nil
 }
 
 func isIntLiteral(e Expr) bool {
@@ -920,24 +1009,32 @@ func promote(a, b resolvedType) ScalarType {
 }
 
 func requireIntOperand(t resolvedType) error {
-	if t.kind == rtBool {
-		return typeError("arithmetic and comparison operators require integer operands")
+	if t.kind == rtBool || t.kind == rtText {
+		return typeError("arithmetic operators require integer operands")
 	}
 	return nil
 }
 
 func requireBool(t resolvedType, msg string) error {
-	if t.kind == rtInt {
+	if t.kind == rtInt || t.kind == rtText {
 		return typeError(msg)
 	}
 	return nil
 }
 
-// requireAssignableInt: a value assigned to an integer column must itself be integer
-// (or NULL); a boolean expression is a 42804 type error.
-func requireAssignableInt(t resolvedType, col string) error {
-	if t.kind == rtBool {
-		return typeError("cannot assign a boolean value to integer column " + col)
+// requireAssignable: a value assigned to a column must match its family — an integer
+// column takes an integer (or NULL) value; a text column takes a text (or NULL) value.
+// Any other pair (boolean anywhere, or a cross-family int/text) is a 42804 type error.
+// Mirrors the INSERT literal type-check, generalized to expressions.
+func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
+	ok := false
+	if colTy.IsText() {
+		ok = t.kind == rtText || t.kind == rtNull
+	} else {
+		ok = t.kind == rtInt || t.kind == rtNull
+	}
+	if !ok {
+		return typeError("cannot assign a value to column " + col + " of type " + colTy.CanonicalName())
 	}
 	return nil
 }
@@ -978,6 +1075,8 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		return IntValue(e.cInt), nil
 	case reConstBool:
 		return BoolValue(e.cBool), nil
+	case reConstText:
+		return TextValue(e.cText), nil
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
@@ -1183,10 +1282,22 @@ func keyCmp(a, b Value, descending, nullsFirst bool) int {
 	return base
 }
 
-// valueCmp is the total order over NON-NULL values: signed-integer ascending, with the
-// boolean ordering (false < true) defined only for totality — ORDER BY is over an integer
-// column this slice. NULLs are handled by keyCmp before this is reached. Returns <0, 0, >0.
+// valueCmp is the total order over NON-NULL values: signed-integer ascending, and text by
+// the C collation — raw UTF-8 bytes, which for UTF-8 equals code-point order (Go's
+// strings.Compare is byte order — spec/design/types.md §11). The boolean ordering and the
+// cross-family arms (a fixed bool < int < text order) are defined only for totality —
+// ORDER BY is over a single typed column, so they are unreachable from SELECT. NULLs are
+// handled by keyCmp before this is reached. Returns <0, 0, >0.
 func valueCmp(a, b Value) int {
+	if a.Kind == ValText || b.Kind == ValText {
+		if a.Kind == ValText && b.Kind == ValText {
+			return strings.Compare(a.Str, b.Str)
+		}
+		if a.Kind == ValText {
+			return 1 // text sorts after any non-text value
+		}
+		return -1
+	}
 	x, y := orderKey(a), orderKey(b)
 	switch {
 	case x < y:
@@ -1236,7 +1347,11 @@ func (p assignPlan) check(v Value) (Value, error) {
 			return Value{}, overflowErr(p.target)
 		}
 		return IntValue(v.Int), nil
+	case ValText:
+		// A text value into a text column is accepted as-is (the C collation imposes no
+		// constraint). The resolver proved the value's family matches the column.
+		return TextValue(v.Str), nil
 	default: // ValBool — unreachable: resolver rejects assigning a boolean to a column
-		return Value{}, NewError(FeatureNotSupported, "internal: boolean assigned to integer column")
+		return Value{}, NewError(FeatureNotSupported, "internal: boolean assigned to a column")
 	}
 }

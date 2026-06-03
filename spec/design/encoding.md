@@ -66,16 +66,67 @@ position. The tag is one byte, not a bit stolen from the value, so the value enc
   flips `0x00 ↔ 0xFF` and `0x01 ↔ 0xFE`, so **NULL (`0xFE`) sorts before every present
   value (`0xFF…`)** — i.e. descending lifts NULL to **first**, the exact mirror of §2.2.
 
+### 2.4 Text — `text-terminated-escape` (authored; unexercised this slice)
+
+`text` is variable-width, so unlike the fixed-width integers it cannot be a self-delimiting
+key component by raw bytes alone: a plain length prefix is **not** order-preserving (it sorts
+by length first — `"b"` length 1 would sort before `"aa"` length 2, inverting the correct
+`"aa" < "b"`). The order-preserving + self-delimiting rule (CockroachDB's `encoding` package,
+CLAUDE.md §8/§12) is:
+
+1. The value's bytes are its **UTF-8 encoding** — the `C` collation (byte / code-point order;
+   §4 of [types.md](types.md)). For UTF-8, `memcmp` of the bytes equals Unicode code-point
+   order, so raw content bytes already sort correctly.
+2. **Escape** every `0x00` byte in the content to `0x00 0xFF`.
+3. **Terminate** the whole string with `0x00 0x01`.
+
+Because the only place a `0x00` is followed by a byte `< 0xFF` is the terminator (`0x00 0x01`),
+the terminator sorts below any real continuation (`0x01 < 0xFF`, and `0x01` < any non-zero
+content byte), so a string sorts before any string that extends it. Worked bytes (content as
+UTF-8 hex):
+
+| value | encoded key bytes |
+|---|---|
+| `""` | `00 01` |
+| `"a"` | `61 00 01` |
+| `"aa"` | `61 61 00 01` |
+| `"ab"` | `61 62 00 01` |
+| `"b"` | `62 00 01` |
+| `"a\0b"` (literal NUL) | `61 00 FF 62 00 01` |
+| `"é"` (U+00E9) | `C3 A9 00 01` |
+| `"😀"` (U+1F600) | `F0 9F 98 80 00 01` |
+
+`memcmp` then yields `"" < "a" < "aa" < "ab" < "b"`: the prefix case `"a" < "aa"` works because
+`"a"`'s terminator byte `00` beats `"aa"`'s second content byte `61`; the length-prefix
+counterexample `"aa" < "b"` works because content compares before any terminator (`61 < 62`).
+The escape is what stops a literal `0x00` from masquerading as a terminator (`"a" < "a\0b"`).
+**Descending** is the same §2.3 whole-component bitwise inversion (delimiters included:
+`00 01 → FF FE`, `00 FF → FF 00`); a terminated shorter string then inverts to sort *after* a
+longer one, the correct mirror. The **nullable** slot is the §2.2 tag (`0x00` present ‖ the
+encoding above, or `0x01` for NULL).
+
+**Status — authored, not yet exercised.** This slice (`text` as a storable column) keeps text
+out of keys: a text PRIMARY KEY is rejected `0A000` (a documented, relaxable narrowing —
+[types.md §11](types.md)). So no `text` key fixtures or executor key path exist yet; the rule
+is recorded here as a property of the type, exactly as the `bool-byte` rule is recorded but
+unexercised. Stored text *values* use a separate, simpler **value codec** (length-prefixed
+UTF-8, no order-preservation needed — [../fileformat/format.md](../fileformat/format.md)).
+Lifting the narrowing (text in a key / secondary index) adds the `(value → bytes)` fixtures to
+[../encoding/](../encoding/) and the executor path then.
+
 ## 3. Where this is used today
 
 The bare integer rule is exercised by every stored key. The on-disk **value codec**
 ([../fileformat/format.md](../fileformat/format.md)) reuses the §2.2 nullable encoding to
 serialize each row value (the tag marks NULL); for a stored *value* the tag's sort order is
 irrelevant, but reusing one codec keeps key and value bytes consistent and is what lets the
-seam diverge cleanly if a future type ever needs distinct key/value forms. Composite keys
-and the non-integer scalars (`decimal`, `text`, `bytea`, …) will add their own §2 rules and
-fixtures when those features land; nullable *secondary indexes* — the first place §2.2's
-sort order becomes load-bearing rather than spec-only — follow then too.
+seam diverge cleanly if a future type ever needs distinct key/value forms. The text type is
+the first such divergence: text *values* are stored with a compact length-prefixed value codec
+(format.md), while the order-preserving text *key* rule (§2.4) is authored but unexercised —
+text is not yet allowed in a key. The remaining non-integer scalars (`decimal`, `bytea`, …)
+and composite keys will add their own §2 rules and fixtures when those features land; nullable
+*secondary indexes* — the first place §2.2's sort order becomes load-bearing rather than
+spec-only — follow then too.
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)
 

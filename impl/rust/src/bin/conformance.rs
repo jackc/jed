@@ -277,13 +277,13 @@ fn render_outcome(outcome: &Outcome, cols: usize, sortmode: &str) -> Vec<String>
     let mut flat = Vec::new();
     for row in rows {
         for v in row {
-            flat.push(render_value(*v));
+            flat.push(render_value(v));
         }
     }
     apply_sort(flat, cols, sortmode)
 }
 
-fn render_value(v: Value) -> String {
+fn render_value(v: &Value) -> String {
     v.render()
 }
 

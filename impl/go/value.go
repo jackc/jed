@@ -12,18 +12,23 @@ const (
 	ValInt
 	// ValBool is a boolean (expression-only this slice — never stored).
 	ValBool
+	// ValText is a text string (the text column type); Str holds its UTF-8 content.
+	ValText
 )
 
-// Value is a runtime value: SQL NULL, an integer, or a boolean. Integers fit in int64
-// regardless of their declared column type (the type governs range checks and
+// Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers
+// fit in int64 regardless of their declared column type (the type governs range checks and
 // key-encoding width, not the representation). boolean is expression-only
 // (spec/design/types.md §1): a ValBool is produced by comparisons and connectives and
 // can be projected/rendered, but is never stored; a NULL boolean (unknown) is ValNull,
-// so {true, false, NULL} is the three-valued domain.
+// so {true, false, NULL} is the three-valued domain. ValText is the first stored
+// non-integer value; it compares by the C collation (UTF-8 byte / code-point order —
+// spec/design/types.md §11).
 type Value struct {
 	Kind ValueKind
 	Int  int64
 	Bool bool
+	Str  string
 }
 
 // IntValue builds a non-null integer value.
@@ -34,6 +39,9 @@ func NullValue() Value { return Value{Kind: ValNull} }
 
 // BoolValue builds a boolean value.
 func BoolValue(b bool) Value { return Value{Kind: ValBool, Bool: b} }
+
+// TextValue builds a non-null text value.
+func TextValue(s string) Value { return Value{Kind: ValText, Str: s} }
 
 // IsNull reports whether the value is SQL NULL.
 func (v Value) IsNull() bool { return v.Kind == ValNull }
@@ -71,6 +79,8 @@ func (v Value) Render() string {
 			return "true"
 		}
 		return "false"
+	case ValText:
+		return v.Str
 	default:
 		return strconv.FormatInt(v.Int, 10)
 	}
@@ -84,28 +94,39 @@ func bool3(b bool) ThreeValued {
 }
 
 // Eq3 is three-valued equality. NULL compared with anything (including NULL) is
-// UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Integers compare
-// by value; since all integer types promote losslessly into int64, cross-type
-// comparison is just int64 equality (spec/types/compare.toml).
+// UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Integers compare by
+// value (all integer types promote losslessly into int64); text compares by the C
+// collation — raw UTF-8 bytes, which for UTF-8 equals code-point order
+// (spec/design/types.md §11). Go string == / < / > already compare by byte order. A mixed
+// int/text pair never reaches here — the resolver rejects it (42804).
 func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
 	}
+	if v.Kind == ValText || o.Kind == ValText {
+		return bool3(v.Str == o.Str)
+	}
 	return bool3(v.Int == o.Int)
 }
 
-// Lt3 is the three-valued ordering predicate v < o.
+// Lt3 is the three-valued ordering predicate v < o (text by C collation = byte order).
 func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
 	}
+	if v.Kind == ValText || o.Kind == ValText {
+		return bool3(v.Str < o.Str)
+	}
 	return bool3(v.Int < o.Int)
 }
 
-// Gt3 is the three-valued ordering predicate v > o.
+// Gt3 is the three-valued ordering predicate v > o (text by C collation = byte order).
 func (v Value) Gt3(o Value) ThreeValued {
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
+	}
+	if v.Kind == ValText || o.Kind == ValText {
+		return bool3(v.Str > o.Str)
 	}
 	return bool3(v.Int > o.Int)
 }

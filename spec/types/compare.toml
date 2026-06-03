@@ -16,6 +16,14 @@ schema_version = 1
 family = "integer"
 strategy = "max-rank"
 
+# text has no promotion tower — there is one text type, so two text operands need
+# no reconciliation before comparison (strategy = "none"). (A `strategy` entry is
+# still required so the catalog's referential check sees a promotion rule for the
+# family, even though the comparison resolution is "none" — see catalog.toml.)
+[[promotion]]
+family = "text"
+strategy = "none"
+
 # --- comparability -----------------------------------------------------------
 # Which (family, family) pairs may be compared at all. Anything not listed is a
 # type error. Step 1 has exactly one family, so there is one rule. Cross-family
@@ -25,12 +33,26 @@ left_family = "integer"
 right_family = "integer"
 via = "promote"          # promote both to the common type, then compare as integers
 
+# text × text only. via = "none": both operands are already text, so no promotion;
+# compare by the `C` collation (byte / code-point order over UTF-8). text × integer
+# (or any cross-family text pair) is NOT listed, so it is a 42804 type error.
+[[comparable]]
+left_family = "text"
+right_family = "text"
+via = "none"
+
 # --- value ordering ----------------------------------------------------------
 # The total order over non-NULL integers used by ORDER BY and by index/key
 # iteration. Plain signed numeric order; matches the order-preserving key
 # encoding in scalars.toml (CLAUDE.md §8) so stored byte order == logical order.
 [ordering]
 integer = "numeric-ascending"
+# text orders by the `C` collation: raw UTF-8 bytes compared lexicographically
+# (memcmp), which for UTF-8 equals Unicode code-point order. This is PostgreSQL's
+# `C`/POSIX collation. The order-preserving key encoding (scalars.toml
+# "text-terminated-escape") reproduces exactly this order in raw bytes, so stored
+# byte order == logical order, as for integers.
+text = "codepoint-ascending"
 
 # NULL's position in the physical total order of encoded keys (index/key
 # iteration), RATIFIED with the key-encoding spec (CLAUDE.md §11 step 4) and

@@ -60,6 +60,21 @@ fn nopk_table_db() -> Database {
     db
 }
 
+/// A table with a text column — exercises the value codec's text branch (u16 length +
+/// UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text
+/// value, and a 4-byte astral char (😀). The PK stays int32 (no text key this slice).
+fn text_table_db() -> Database {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, s text)");
+    run(&mut db, "INSERT INTO t VALUES (1, 'alice')");
+    run(&mut db, "INSERT INTO t VALUES (2, '')");
+    run(&mut db, "INSERT INTO t VALUES (3, 'O''Brien')");
+    run(&mut db, "INSERT INTO t VALUES (4, 'café')");
+    run(&mut db, "INSERT INTO t VALUES (5, NULL)");
+    run(&mut db, "INSERT INTO t VALUES (6, '😀')");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -67,6 +82,7 @@ fn write_matches_goldens() {
         ("empty_db.adb", Database::new),
         ("one_table_empty.adb", one_table_empty_db),
         ("pk_table.adb", pk_table_db),
+        ("text_table.adb", text_table_db),
         ("nopk_table.adb", nopk_table_db),
     ];
     for (name, build) in cases {
@@ -82,6 +98,7 @@ fn read_goldens_reproduces_rows() {
     let cases: &[(&str, Builder, &str)] = &[
         ("one_table_empty.adb", one_table_empty_db, "t"),
         ("pk_table.adb", pk_table_db, "t"),
+        ("text_table.adb", text_table_db, "t"),
         ("nopk_table.adb", nopk_table_db, "r"),
         ("torn_meta_slot0.adb", pk_table_db, "t"),
         ("torn_meta_slot1.adb", pk_table_db, "t"),

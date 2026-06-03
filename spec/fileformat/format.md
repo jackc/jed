@@ -123,6 +123,11 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 1 | `int16` |
 | 2 | `int32` |
 | 3 | `int64` |
+| 4 | `text` |
+
+A column's collation is **not** stored: there is one collation (`C`) for all text this slice
+(../design/types.md §11). A per-column collation field is a forward extension that will claim a
+spare `flags` bit or a new field under a `format_version` bump when multi-collation lands.
 
 ## Data pages (one chain per non-empty table)
 
@@ -138,8 +143,9 @@ by inserting in file order). Each **record**:
 
 The key is **stored, not derived**: a table without a primary key uses a synthetic
 `int64` rowid that is not reconstructable from row data, so the key bytes are persisted
-verbatim. There is no per-record payload length — the reader derives each value's width
-from the column types in the catalog.
+verbatim. There is no per-record payload length — the reader walks the columns in declaration
+order and takes each value's width from its type: fixed for the integers, and for `text` from
+the `u16` length the value carries (see the value codec below).
 
 **Rowid reconstruction (no-PK tables).** The synthetic rowid is allocated from a
 **monotonic counter** that is never reused (so a `DELETE` followed by an `INSERT` cannot
@@ -150,16 +156,29 @@ needs no format change; it is a pure load-time derivation.
 
 ### Value codec
 
-A row value is encoded with the **same nullable encoding as keys**
-([encoding.md](../design/encoding.md)): a 1-byte presence tag (`0x00` present, `0x01` NULL)
-followed, when present, by the order-preserving integer bytes for the column's type. Reusing
-the key codec keeps one verified codec (already byte-pinned by
-[../encoding/integers.toml](../encoding/integers.toml)); the order-preserving sign-flip is
-unnecessary for stored values but harmless. This is exposed behind a named
-`encode_value`/`decode_value` seam so the codec can diverge from the key codec when
-non-integer types (text, decimal) arrive — at which point storage wants a compact form and
-keys want an order-preserving form. That future split is an implementation change behind the
-seam, not a format-wide retrofit.
+A row value is encoded behind a named `encode_value`/`decode_value` seam, by column type. All
+forms begin with a 1-byte **presence tag** (`0x00` present, `0x01` NULL); a NULL is the tag
+alone. The present-value body depends on the type:
+
+- **Integers** (`int16`/`int32`/`int64`) — the **same order-preserving bytes as keys**
+  ([encoding.md §2.1](../design/encoding.md)): fixed-width big-endian, sign-bit flipped. The
+  sign-flip is unnecessary for a stored value but harmless, and reusing the key codec keeps one
+  verified, byte-pinned ([../encoding/integers.toml](../encoding/integers.toml)) integer codec.
+
+- **`text`** — the seam **diverges** here (its whole purpose): a stored text value uses a
+  **compact length-prefixed** form, NOT the order-preserving key encoding (encoding.md §2.4),
+  because a stored value never needs to sort. The body is a **`u16` byte-length** (big-endian,
+  like every other length in this format) followed by exactly that many **UTF-8 bytes** (the
+  `C` collation's bytes, verbatim — no escaping, no terminator). The empty string is
+  `00`(tag)`00 00`(len), zero content bytes. A value whose UTF-8 length exceeds `0xFFFF` is a
+  write-side `feature_not_supported` (`0A000`) — and in practice such a value also exceeds a
+  page, tripping the oversized-item rule below. The reader reads the tag, then (if present) the
+  `u16` length, then that many bytes — the only value whose width is not fixed by the column
+  type alone.
+
+There is no per-record payload length: the reader walks the columns in declaration order,
+deriving each value's width from its type (fixed for integers; self-describing via the `u16`
+length for text).
 
 ## Packing and page allocation (must be byte-identical across cores)
 

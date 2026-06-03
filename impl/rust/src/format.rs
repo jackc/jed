@@ -34,6 +34,7 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Int16 => 1,
         ScalarType::Int32 => 2,
         ScalarType::Int64 => 3,
+        ScalarType::Text => 4,
     }
 }
 
@@ -43,6 +44,7 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         1 => Some(ScalarType::Int16),
         2 => Some(ScalarType::Int32),
         3 => Some(ScalarType::Int64),
+        4 => Some(ScalarType::Text),
         _ => None,
     }
 }
@@ -62,13 +64,25 @@ fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
-/// The value codec (spec/fileformat/format.md): a 1-byte presence tag plus, when
-/// present, the integer bytes for the column type. Reuses the key encoding; the
-/// named seam lets storage and key encodings diverge when non-integer types land.
-fn encode_value(ty: ScalarType, v: Value) -> Vec<u8> {
+/// The value codec (spec/fileformat/format.md): a 1-byte presence tag (`0x01` = NULL),
+/// then the type's present-value body. Integers reuse the order-preserving key encoding;
+/// `text` is where the seam diverges — a stored text value needs no ordering, so it is a
+/// compact `u16` byte-length + UTF-8 bytes (collation `C`, verbatim). A text value whose
+/// UTF-8 length exceeds `u16::MAX` is unsupported; in practice it also exceeds a page and
+/// is caught by the oversized-item rule in `pack` (0A000), so the cast here is sound for
+/// every supported page size (spec/fileformat/format.md).
+fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
     match v {
         Value::Null => encode_nullable(ty, None),
-        Value::Int(n) => encode_nullable(ty, Some(n)),
+        Value::Int(n) => encode_nullable(ty, Some(*n)),
+        Value::Text(s) => {
+            let bytes = s.as_bytes();
+            let mut out = Vec::with_capacity(3 + bytes.len());
+            out.push(0x00); // present
+            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            out.extend_from_slice(bytes);
+            out
+        }
         // Unreachable: boolean is expression-only this slice; no column is boolean, so
         // a boolean value is never serialized (spec/design/types.md §1).
         Value::Bool(_) => unreachable!("a boolean cannot be a stored column value"),
@@ -271,7 +285,7 @@ fn encode_record(table: &Table, key: &[u8], row: &[Value]) -> Vec<u8> {
     out.extend_from_slice(&(key.len() as u16).to_be_bytes());
     out.extend_from_slice(key);
     for (col, val) in table.columns.iter().zip(row.iter()) {
-        out.extend_from_slice(&encode_value(col.ty, *val));
+        out.extend_from_slice(&encode_value(col.ty, val));
     }
     out
 }
@@ -459,13 +473,22 @@ fn decode_record(col_types: &[ScalarType], buf: &[u8], pos: &mut usize) -> Resul
     Ok((key, row))
 }
 
-/// Read one value via the value codec (inverse of `encode_value`).
+/// Read one value via the value codec (inverse of `encode_value`). The presence tag is
+/// read first; for a present value the body is the column type's: a fixed-width integer,
+/// or — for `text` — a `u16` length followed by that many UTF-8 bytes.
 fn read_value(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
     match read_u8(buf, pos)? {
         0x00 => {
-            let w = ty.width_bytes();
-            let vb = take(buf, pos, w)?;
-            Ok(Value::Int(decode_int(ty, vb)))
+            if ty.is_text() {
+                let len = read_u16(buf, pos)? as usize;
+                let bytes = take(buf, pos, len)?.to_vec();
+                let s = String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 text value"))?;
+                Ok(Value::Text(s))
+            } else {
+                let w = ty.width_bytes();
+                let vb = take(buf, pos, w)?;
+                Ok(Value::Int(decode_int(ty, vb)))
+            }
         }
         0x01 => Ok(Value::Null),
         _ => Err(corrupt("invalid value presence tag")),

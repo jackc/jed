@@ -3,6 +3,7 @@
 export type TokenKind =
   | "word" // a bare word: keyword or identifier (compared case-insensitively)
   | "int" // an integer literal's unsigned magnitude (the sign is "minus")
+  | "str" // a single-quoted string literal's decoded content (the text type)
   | "comma" // ,
   | "lparen" // (
   | "rparen" // )
@@ -25,4 +26,5 @@ export type Token = {
   kind: TokenKind;
   word?: string;
   int?: bigint;
+  str?: string; // decoded content for "str"
 };

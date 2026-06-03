@@ -20,7 +20,7 @@ fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
 }
 
 fn ids(rows: Vec<Vec<Value>>) -> Vec<Value> {
-    rows.into_iter().map(|r| r[0]).collect()
+    rows.into_iter().map(|r| r[0].clone()).collect()
 }
 
 fn setup() -> Database {

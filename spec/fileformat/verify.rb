@@ -20,7 +20,7 @@ ROOT_PAGE = 2
 TXID = 1
 
 WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8 }.freeze
-TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3 }.freeze
+TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4 }.freeze
 CODETYPE = TYPECODE.invert.freeze
 
 # --- declarative fixtures (mirror what the cores build via SQL) --------------
@@ -36,11 +36,22 @@ PK_TABLE = {
   rows: (1..20).map { |i| [i, i == 3 ? nil : i * 10] }
 }.freeze
 
+# A table with a text column: exercises the value codec's text branch (u16 byte-length +
+# UTF-8 bytes), the empty string (a distinct non-NULL value), an embedded quote, a 2-byte
+# UTF-8 char (U+00E9), a NULL text value, and a 4-byte astral char (U+1F600). The PK is an
+# int32 (text is not allowed in a key this slice). \u escapes keep this source ASCII-only.
+TEXT_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("s", "text")],
+  rows: [[1, "alice"], [2, ""], [3, "O'Brien"], [4, "caf\u{E9}"], [5, nil], [6, "\u{1F600}"]]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.adb",        page_size: 256, tables: [] },
   { file: "one_table_empty.adb", page_size: 256,
     tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("v", "int16")], rows: [] }] },
   { file: "pk_table.adb",        page_size: 256, tables: [PK_TABLE] },
+  { file: "text_table.adb",      page_size: 256, tables: [TEXT_TABLE] },
   { file: "nopk_table.adb",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
@@ -79,12 +90,18 @@ def decode_int(width, bytes)
   bytes.bytes.reduce(0) { |acc, b| (acc << 8) | b } - (1 << (width * 8 - 1))
 end
 
-# value codec: presence tag + (when present) the integer bytes. 0x00 = present,
-# 0x01 = NULL (the nullable key encoding; NULLs sort last — encoding.md §4).
-def encode_value(width, v)
+# value codec: presence tag + (when present) the type's body. 0x01 = NULL; 0x00 = present.
+# Integers reuse the order-preserving int bytes; text diverges to a compact u16 byte-length
+# + UTF-8 bytes (collation C, verbatim — format.md "Value codec").
+def encode_value(type, v)
   return "\x01".b if v.nil?
 
-  "\x00".b + encode_int(width, v)
+  if type == "text"
+    bytes = v.b
+    "\x00".b + u16(bytes.bytesize) + bytes
+  else
+    "\x00".b + encode_int(WIDTH.fetch(type), v)
+  end
 end
 
 # --- encoding (reference serializer) ----------------------------------------
@@ -123,7 +140,7 @@ end
 def record_bytes(table, key, row)
   out = +"".b
   out << u16(key.bytesize) << key
-  table[:columns].each_with_index { |c, i| out << encode_value(WIDTH.fetch(c[:type]), row[i]) }
+  table[:columns].each_with_index { |c, i| out << encode_value(c[:type], row[i]) }
   out
 end
 
@@ -285,8 +302,14 @@ def decode_record(columns, buf, pos)
   columns.each do |c|
     tag, pos = take(buf, pos, 1)
     if tag.getbyte(0).zero? # 0x00 = present, 0x01 = NULL
-      vb, pos = take(buf, pos, WIDTH.fetch(c[:type]))
-      row << decode_int(WIDTH.fetch(c[:type]), vb)
+      if c[:type] == "text"
+        len, pos = take(buf, pos, 2)
+        sb, pos = take(buf, pos, len.unpack1("n"))
+        row << sb.dup.force_encoding("UTF-8")
+      else
+        vb, pos = take(buf, pos, WIDTH.fetch(c[:type]))
+        row << decode_int(WIDTH.fetch(c[:type]), vb)
+      end
     else
       row << nil
     end

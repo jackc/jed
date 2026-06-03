@@ -227,18 +227,30 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 > The **real type system** is the product (§4) — PostgreSQL's behavior, stricter than its
 > typing, and nothing like SQLite's runtime affinity. Each item is a vertical slice that
-> forces a §8 divergence decision into the open (default: match PG — §1). `text` then
-> `decimal` are the headline items.
+> forces a §8 divergence decision into the open (default: match PG — §1). `text` is done
+> (the collation §8 decision landed: PostgreSQL `C`); `decimal` is the next headline item.
 
 - [ ] **Storable `boolean` column type.** `boolean` is expression-only today (Phase 1); make
       it a *column* type: allow `CREATE TABLE t(flag boolean)` and `INSERT`/store/retrieve
       (and `CAST … AS boolean`), currently `0A000`. Touches the byte-exact storage surface —
-      add on-disk type code `4` + a golden round-trip fixture, the `bool-byte` key-encoding
-      vectors (the rule is already recorded in `scalars.toml`), and a `boolean × boolean`
-      comparability rule. Cleanly additive (old files keep working). _(size: M; §4/§8/§9)_
-- [ ] **`text` + ONE defined collation** (byte/codepoint order to start — §8). Unblocks
-      `LIKE`, string functions, realistic schemas. UTF-8 vs UTF-16 across cores is a
-      divergence hotspot — TS already proved UTF-8 names. _(size: L; §4/§8)_
+      add on-disk type code `5` (codes 1–4 are int16/int32/int64/**text**) + a golden round-trip
+      fixture, the `bool-byte` key-encoding vectors (the rule is already recorded in
+      `scalars.toml`), and a `boolean × boolean` comparability rule. Cleanly additive (old files
+      keep working). _(size: M; §4/§8/§9)_
+- [x] **`text` + ONE defined collation** — done & committed across Rust/Go/TS. Collation is
+      PostgreSQL `C` (UTF-8 byte / code-point order; `scalars.toml` records the type with
+      `collation = "C"`). Storage + single-quoted literals (`''` escaping) + comparison/ordering
+      (`= < > <= >=`, `IS [NOT] DISTINCT FROM`); on-disk type code 4 with a compact value codec
+      (u16 len + UTF-8 bytes), byte-exact across cores (golden `text_table.adb`). First operator
+      **overload** (`=` over integer & text) — `catalog.toml` carries one row per `(name,
+      arg_families)`; `functions/verify.rb` and the per-core drift tests key on the signature.
+      The UTF-8-vs-UTF-16 ordering trap is handled in TS (`compareTextC` encodes to UTF-8, never
+      JS `<`) and pinned by an astral-char conformance case. _(was: L; §4/§8; spec/design/types.md §11)_
+      **Deferred follow-ups:** text in a `PRIMARY KEY` / index (the order-preserving
+      terminator+escape key encoding is authored in `encoding.md §2.4` but unexercised — text PK
+      is rejected `0A000`); `varchar(n)` length limits (`22001`); text⇄other casts; string
+      functions (`||`, `length`, `lower`/`upper`, `substring`) + `LIKE`; multi-collation / ICU
+      (a per-column catalog collation field + `COLLATE`).
 - [ ] **Exact `decimal`** — *the* headline type. Forces decimal **rounding mode + scale**
       and keeps binary floats out of the comparison/text paths (§8). `numeric.c` (Postgres)
       is the reference. Hard, high-value. _(size: XL; §4/§8)_

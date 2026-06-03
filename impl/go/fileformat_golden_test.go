@@ -74,6 +74,21 @@ func nopkTableDB(t *testing.T) *Database {
 	return db
 }
 
+// textTableDB has a text column — exercises the value codec's text branch (u16 length +
+// UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text value,
+// and a 4-byte astral char (😀). The PK stays int32 (no text key this slice).
+func textTableDB(t *testing.T) *Database {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, s text)")
+	run(t, db, "INSERT INTO t VALUES (1, 'alice')")
+	run(t, db, "INSERT INTO t VALUES (2, '')")
+	run(t, db, "INSERT INTO t VALUES (3, 'O''Brien')")
+	run(t, db, "INSERT INTO t VALUES (4, 'café')")
+	run(t, db, "INSERT INTO t VALUES (5, NULL)")
+	run(t, db, "INSERT INTO t VALUES (6, '😀')")
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -83,6 +98,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"empty_db.adb", func(*testing.T) *Database { return NewDatabase() }},
 		{"one_table_empty.adb", oneTableEmptyDB},
 		{"pk_table.adb", pkTableDB},
+		{"text_table.adb", textTableDB},
 		{"nopk_table.adb", nopkTableDB},
 	}
 	for _, c := range cases {
@@ -106,6 +122,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 	}{
 		{"one_table_empty.adb", oneTableEmptyDB, "t"},
 		{"pk_table.adb", pkTableDB, "t"},
+		{"text_table.adb", textTableDB, "t"},
 		{"nopk_table.adb", nopkTableDB, "r"},
 		{"torn_meta_slot0.adb", pkTableDB, "t"},
 		{"torn_meta_slot1.adb", pkTableDB, "t"},
