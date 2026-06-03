@@ -6,7 +6,8 @@ package abide
 import "testing"
 
 func setupDelete(t *testing.T) *Database {
-	return dbWith(t,
+	return dbWith(
+		t,
 		"CREATE TABLE t (id int32 PRIMARY KEY, v int16)",
 		"INSERT INTO t VALUES (1, 10)",
 		"INSERT INTO t VALUES (2, 20)",
@@ -47,7 +48,8 @@ func TestDeleteThreeValuedOnlyTrueMatches(t *testing.T) {
 func TestDeleteThenInsertNoPKNoCollision(t *testing.T) {
 	// The bug this fixes: a no-PK table keyed rows on store.Len(), so after a delete
 	// the next insert reused a rowid and tripped a spurious 23505.
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE log (n int32)",
 		"INSERT INTO log VALUES (100)",
 		"INSERT INTO log VALUES (200)",

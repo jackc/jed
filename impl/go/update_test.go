@@ -7,7 +7,8 @@ package abide
 import "testing"
 
 func setupUpdate(t *testing.T) *Database {
-	return dbWith(t,
+	return dbWith(
+		t,
 		"CREATE TABLE t (id int32 PRIMARY KEY, a int16, b int16)",
 		"INSERT INTO t VALUES (1, 10, 11)",
 		"INSERT INTO t VALUES (2, 20, 22)",
@@ -74,7 +75,8 @@ func TestUpdateOverflowTrapsRowUnchanged(t *testing.T) {
 }
 
 func TestUpdateColumnSourceRechecksTargetRange(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE w (id int32 PRIMARY KEY, small int16, big int64)",
 		"INSERT INTO w VALUES (1, 5, 100000)",
 	)
@@ -86,7 +88,8 @@ func TestUpdateColumnSourceRechecksTargetRange(t *testing.T) {
 
 func TestUpdateAllOrNothingAcrossRows(t *testing.T) {
 	// Row 2's source overflows int16, so NO row is modified — not even rows 1 and 3.
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE m (id int32 PRIMARY KEY, n int16, src int64)",
 		"INSERT INTO m VALUES (1, 1, 5)",
 		"INSERT INTO m VALUES (2, 2, 99999)",

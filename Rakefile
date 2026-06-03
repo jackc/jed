@@ -141,20 +141,21 @@ task :verify do
   puts "\nAll spec checks passed."
 end
 
-# fmt — formatting gate for the language cores. The toolchains are pinned in mise.toml
-# (rust 1.92.0, go 1.26.x), so `cargo fmt` and `gofmt` are reproducible across every
-# contributor; this task is what makes that pin load-bearing. Without a check, formatting
-# silently drifts from the pinned tools (it had — `rake fmt:fix` was first run to normalise
-# the tree). Rust and Go each have ONE canonical, version-stable formatter and are gated
-# here. TypeScript has no formatter configured (`tsc --noEmit` is a TYPE check, run via
+# fmt — formatting gate for the language cores. The formatters are pinned in mise.toml
+# (rust 1.92.0 ships rustfmt; gofumpt pinned as a go tool), so they are reproducible across
+# contributors; this task is what makes that pin load-bearing. Without a check, formatting
+# silently drifts from the pinned tools (it had, in BOTH cores, before this gate). Rust uses
+# rustfmt (`cargo fmt`); Go uses gofumpt — a stricter SUPERSET of gofmt (gofumpt output is
+# always gofmt-clean too) — chosen over plain gofmt because mise already pins it.
+# TypeScript has no formatter configured (`tsc --noEmit` is a TYPE check, run via
 # `npm run typecheck` in impl/ts), so it is intentionally out of scope. Kept SEPARATE from
 # `verify`, which is deliberately toolchain-light (spec data only, no cargo/go needed).
 RUST_MANIFEST = File.join(__dir__, "impl/rust/Cargo.toml")
 GO_DIR        = File.join(__dir__, "impl/go")
 
-# The Go files gofmt would rewrite. `gofmt -l` exits 0 even when files differ, so the
+# The Go files gofumpt would rewrite. `gofumpt -l` exits 0 even when files differ, so the
 # signal is the printed file list, not the exit status.
-def gofmt_unformatted = capture("gofmt", "-l", GO_DIR).first.split("\n").map(&:strip).reject(&:empty?)
+def gofumpt_unformatted = capture("gofumpt", "-l", GO_DIR).first.split("\n").map(&:strip).reject(&:empty?)
 
 namespace :fmt do
   desc "Check Rust + Go formatting against the mise-pinned toolchains (the gate)"
@@ -166,8 +167,8 @@ namespace :fmt do
       failures << "rust"
     end
 
-    puts "go:   gofmt -l impl/go"
-    unformatted = gofmt_unformatted
+    puts "go:   gofumpt -l impl/go"
+    unformatted = gofumpt_unformatted
     unless unformatted.empty?
       warn "  unformatted: #{unformatted.map { |f| f.delete_prefix("#{__dir__}/") }.join(', ')}"
       failures << "go"
@@ -180,7 +181,7 @@ namespace :fmt do
   desc "Rewrite Rust + Go sources in place with the pinned formatters"
   task :fix do
     sh "cargo", "fmt", "--manifest-path", RUST_MANIFEST
-    sh "gofmt", "-w", GO_DIR
+    sh "gofumpt", "-w", GO_DIR
   end
 end
 

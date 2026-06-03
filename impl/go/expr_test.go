@@ -18,7 +18,8 @@ func scalar(t *testing.T, db *Database, sql string) Value {
 }
 
 func setupExpr(t *testing.T) *Database {
-	return dbWith(t,
+	return dbWith(
+		t,
 		"CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)",
 		"INSERT INTO t VALUES (1, 6, 4)",
 		"INSERT INTO t VALUES (2, 20, 6)",
@@ -55,7 +56,8 @@ func TestArithmeticInWhere(t *testing.T) {
 
 func TestOverflowTrapsAtResultType(t *testing.T) {
 	// int32 + int32 overflows at the int32 boundary even though it fits int64.
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE e (id int32 PRIMARY KEY, a int32, b int32)",
 		"INSERT INTO e VALUES (1, 2147483647, 1)",
 	)
@@ -88,7 +90,8 @@ func TestUnaryMinusAndInt64Min(t *testing.T) {
 }
 
 func TestComparisonsProjectBooleans(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)",
 		"INSERT INTO t VALUES (1, 5, 5)",
 		"INSERT INTO t VALUES (2, 5, 9)",
@@ -110,7 +113,8 @@ func TestComparisonsProjectBooleans(t *testing.T) {
 }
 
 func TestIsDistinctFrom(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)",
 		"INSERT INTO t VALUES (1, 5, 5)",       // present, equal
 		"INSERT INTO t VALUES (2, 5, 9)",       // present, unequal
@@ -148,7 +152,8 @@ func TestIsDistinctFrom(t *testing.T) {
 }
 
 func TestKleeneConnectives(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE tv (id int32 PRIMARY KEY, p int32, q int32)",
 		"INSERT INTO tv VALUES (1, 0, 0)", // false, false
 		"INSERT INTO tv VALUES (2, 0, 1)", // false, true

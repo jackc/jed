@@ -29,7 +29,8 @@ func queryIDs(t *testing.T, db *Database, sql string) []int64 {
 }
 
 func setupT(t *testing.T) *Database {
-	return dbWith(t,
+	return dbWith(
+		t,
 		"CREATE TABLE t (id int32 PRIMARY KEY, v int16)",
 		"INSERT INTO t VALUES (1, 10)",
 		"INSERT INTO t VALUES (2, 20)",
@@ -54,7 +55,8 @@ func TestSelectStarProjectsAllColumns(t *testing.T) {
 }
 
 func TestFullScanInPrimaryKeyOrder(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE t (id int32 PRIMARY KEY)",
 		"INSERT INTO t VALUES (3)",
 		"INSERT INTO t VALUES (1)",
@@ -102,7 +104,8 @@ func TestOrderByNullsLastThenDescFirst(t *testing.T) {
 }
 
 func TestCrossTypeComparisonPromotes(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE p (id int32 PRIMARY KEY, a int16, c int64)",
 		"INSERT INTO p VALUES (1, 100, 100)",
 		"INSERT INTO p VALUES (2, 100, 300)",
@@ -113,7 +116,8 @@ func TestCrossTypeComparisonPromotes(t *testing.T) {
 }
 
 func TestCastNarrowingFitsAndTraps(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE t (id int32 PRIMARY KEY, b int64)",
 		"INSERT INTO t VALUES (1, 1000)",
 		"INSERT INTO t VALUES (2, 5000000000)",
@@ -137,7 +141,8 @@ func TestSelectFromMissingTableTraps(t *testing.T) {
 }
 
 func limitDB(t *testing.T) *Database {
-	return dbWith(t,
+	return dbWith(
+		t,
 		"CREATE TABLE t (id int32 PRIMARY KEY, v int32)",
 		"INSERT INTO t VALUES (1, 10)",
 		"INSERT INTO t VALUES (2, 20)",
@@ -203,7 +208,8 @@ func TestOutOfRangeLiteralInComparisonTraps(t *testing.T) {
 	// Context-adaptive literal typing (spec/design/types.md §6): a literal that cannot be
 	// represented in the compared column's type is a type error (22003), not a silent
 	// non-match — for every operator. An in-range literal compares normally.
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE t (id int32 PRIMARY KEY, small int16)",
 		"INSERT INTO t VALUES (1, 30000)",
 	)
