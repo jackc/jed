@@ -12,22 +12,39 @@ The project name is TBD. This document refers to it as "the engine."
 
 An **embedded SQL database**. The one-line north star:
 
-> **like SQLite, but with a real type system.**
+> **SQLite's footprint, PostgreSQL's behavior, and a real (strict, static) type system.**
+
+The split is deliberate: take the *deployment model* from SQLite and the *observable
+behavior* from PostgreSQL.
 
 Properties:
 
-- **Embeddable** — a library you link into a host program, not a server process.
+- **Embeddable** — a library you link into a host program, not a server process. (SQLite's
+  model.)
 - **Single-file storage** — one database = one file on disk, like SQLite.
 - **A deliberate, strict, static type system** — this is the product. Not SQLite's
-  runtime type affinity.
+  runtime type affinity; closer to PostgreSQL's, but stricter.
+- **PostgreSQL behavior** — the semantics a query observes (NULL logic, comparisons,
+  ordering, exact numerics, errors) match PostgreSQL.
 - **SQL-first, not SQL-only** — relational SQL is the primary surface and *everything*
   must be reachable through it, but the storage layer is designed so SQL need not be the
   only access path (see §9).
 
-PostgreSQL is **inspiration, not a compatibility target.** Where PG's *behavior* is
-principled (three-valued NULL logic, exact decimals, comparison semantics) we borrow
-it. We do **not** owe anyone wire-protocol compatibility, `pg_catalog` fidelity, the
-full PG type-coercion lattice, or arbitrary-SQL coverage. We own our surface.
+**PostgreSQL is the behavioral default.** The standing rule, which settles most design
+questions and divergence hotspots (§8) by default: **when a decision has an option that
+matches PostgreSQL and there is no overriding reason against it, take that option.** This
+covers three-valued NULL logic, exact decimals, comparison/ordering semantics (including
+NULL sort position), error conditions, and the like — borrow PG's behavior rather than
+reinventing it.
+
+PostgreSQL is the default, **not a compatibility target.** We do **not** owe wire-protocol
+compatibility, `pg_catalog` fidelity, the full PG type-coercion lattice, or arbitrary-SQL
+coverage — we choose *which* surface to implement (**we own our surface**), and for the
+surface we *do* implement, behavior tracks PostgreSQL. An **overriding reason** is a genuine
+engineering tradeoff — simplicity, determinism (§10), the strict type system (§4), the
+single-writer model (§3), or the memory-safety / cost-bound requirements (§13) — documented
+at the point it is taken, not mere preference. Where the engine deliberately diverges from
+PG, the divergence is recorded in the relevant spec doc.
 
 ---
 
@@ -195,7 +212,10 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
 ## 8. Cross-implementation divergence hotspots (decide in the spec BEFORE coding)
 
 These are the classic sources of silent divergence. Make explicit, documented
-decisions; they are miserable to retrofit.
+decisions; they are miserable to retrofit. **Default tie-breaker: match PostgreSQL** (§1) —
+where one option matches PG behavior and nothing overriding argues against it, that is the
+decision (e.g. NULL sorts last / NULL is the largest value, `spec/design/encoding.md`). The
+biases below are where an overriding reason *does* steer away from PG.
 
 - **Float formatting** — every language prints `f64` differently. Decision bias: keep
   binary floats **out of the comparison and text-output paths entirely**; lean on exact

@@ -21,6 +21,9 @@ A feature is a **vertical slice** (CLAUDE.md §10), and "done" means **all** of:
    contract (§7), not an afterthought.
 4. **Determinism** — defined ordering, structured error codes, no float/iteration-order
    leakage (§8, §10).
+5. **PostgreSQL behavior by default** — where the feature has a choice and one option matches
+   PostgreSQL, take it unless there's a documented overriding reason (CLAUDE.md §1). Any
+   deliberate divergence from PG is recorded in the relevant spec doc.
 
 Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **XL** ≈ a project.
 
@@ -153,8 +156,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `NULLS FIRST|LAST`. The per-key comparator **decouples** NULL placement from the
       value-direction flip, so an explicit `NULLS FIRST|LAST` overrides regardless of
       direction; with no clause the default **follows the ratified physical order** —
-      `ASC` → NULLs first, `DESC` → NULLs last (NULL = smallest, the SQLite model, a deliberate
-      **divergence from PostgreSQL**), resolved at parse time. The sort stays **unmetered**
+      `ASC` → NULLs last, `DESC` → NULLs first (NULL = largest, the **PostgreSQL model**),
+      resolved at parse time. The sort stays **unmetered**
       (cost.md §3), so the `# cost:` math is unchanged. Authored in
       [grammar.ebnf](spec/grammar/grammar.ebnf) (`order_by` / `sort_key`) +
       [grammar.md §10](spec/design/grammar.md), [types.md §4](spec/design/types.md), the new
@@ -169,8 +172,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       over the primary-key scan with no `ORDER BY`, else the keys order the distinct rows.
       `ORDER BY` under DISTINCT takes the **PostgreSQL restriction** — each key must be a bare
       column in the select list (or `*`), else the new **`42P10`**
-      (`invalid_column_reference`, [registry.toml](spec/errors/registry.toml)); the engine keeps
-      its own SQLite NULL ordering (only the list-membership rule is borrowed). The cost
+      (`invalid_column_reference`, [registry.toml](spec/errors/registry.toml)); NULL ordering
+      follows PostgreSQL too (NULL largest, `ASC` → NULLS LAST). The cost
       asymmetry ([cost.md §3](spec/design/cost.md)) is a cross-core contract: projection
       `operator_eval` is charged per **filtered** row (dedup must evaluate all), `row_produced`
       only per emitted distinct+windowed row, dedup unmetered — so `SELECT DISTINCT 1/a … LIMIT 1`
@@ -193,8 +196,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Phase 3 — The type system as the product (the differentiator, §4)
 
-> "Like SQLite, but with a *real* type system." Each is a vertical slice that forces a
-> §8 divergence decision into the open. `text` then `decimal` are the headline items.
+> The **real type system** is the product (§4) — PostgreSQL's behavior, stricter than its
+> typing, and nothing like SQLite's runtime affinity. Each item is a vertical slice that
+> forces a §8 divergence decision into the open (default: match PG — §1). `text` then
+> `decimal` are the headline items.
 
 - [ ] **Storable `boolean` column type.** `boolean` is expression-only today (Phase 1); make
       it a *column* type: allow `CREATE TABLE t(flag boolean)` and `INSERT`/store/retrieve

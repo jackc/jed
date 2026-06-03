@@ -1,8 +1,11 @@
 # The engine (name TBD)
 
-An **embedded SQL database** — *like SQLite, but with a real type system.* Single-file
-storage, a strict static type system, implemented natively in multiple languages in
-lockstep with **no reference implementation**.
+An **embedded SQL database** — *SQLite's footprint, PostgreSQL's behavior, and a real
+(strict, static) type system.* Single-file storage and in-process embedding from SQLite;
+observable semantics (NULL logic, comparisons, ordering, exact numerics, errors) from
+PostgreSQL — the standing rule is **match PostgreSQL unless there's an overriding reason**
+([CLAUDE.md §1](CLAUDE.md)). Implemented natively in multiple languages in lockstep with
+**no reference implementation**.
 
 ## Read this first
 
