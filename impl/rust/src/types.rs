@@ -1,19 +1,20 @@
 //! Scalar types (CLAUDE.md §4). Storable: the three signed integers + `text` + `boolean`
-//! + `decimal`.
+//! + `decimal` + `bytea`.
 //!
 //! Hand-written per CLAUDE.md §5 (the parser/types are irreducibly per-language),
 //! but cross-checked against the canonical spec/types/scalars.toml in tests so the
 //! two never drift.
 
-/// The storable scalar types: three signed integers, `text`, `boolean`, and `decimal`.
-/// Canonical integer names state width in bits (int16/int32/int64); SQL-standard names
+/// The storable scalar types: three signed integers, `text`, `boolean`, `decimal`, and
+/// `bytea`. Canonical integer names state width in bits (int16/int32/int64); SQL-standard names
 /// (smallint/integer/bigint) are accepted aliases. `text` is variable-width UTF-8 with one
 /// collation, `C` (byte / code-point order) — spec/design/types.md §11. `boolean` (alias
 /// `bool`) stores false/true behind the value codec's 1-byte `bool-byte` body (types.md §9).
-/// `decimal` (aliases `numeric`/`dec`) is the exact base-10 numeric (decimal.md). The
+/// `decimal` (aliases `numeric`/`dec`) is the exact base-10 numeric (decimal.md). `bytea` is a
+/// variable-width binary string (raw bytes), compared by unsigned byte order — §13. The
 /// integer-only accessors (`width_bytes`/`min`/`max`/`rank`/`in_range`) panic on
-/// `Text`/`Bool`/`Decimal`; callers route those through their own paths (the value codec, the
-/// comparators), never these, so the panic is an internal-invariant guard.
+/// `Text`/`Bool`/`Decimal`/`Bytea`; callers route those through their own paths (the value
+/// codec, the comparators), never these, so the panic is an internal-invariant guard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScalarType {
     Int16,
@@ -24,6 +25,8 @@ pub enum ScalarType {
     /// Exact base-10 `decimal` / `numeric` (spec/design/decimal.md). Variable-width and
     /// non-integer; the per-column typmod (precision/scale) lives on the `Column`, not here.
     Decimal,
+    /// Variable-width binary string (raw bytes), compared by unsigned byte order — types.md §13.
+    Bytea,
 }
 
 impl ScalarType {
@@ -36,6 +39,7 @@ impl ScalarType {
             ScalarType::Text => "text",
             ScalarType::Bool => "boolean",
             ScalarType::Decimal => "decimal",
+            ScalarType::Bytea => "bytea",
         }
     }
 
@@ -52,6 +56,7 @@ impl ScalarType {
             "text" | "varchar" | "string" | "character varying" => Some(ScalarType::Text),
             "boolean" | "bool" => Some(ScalarType::Bool),
             "decimal" | "numeric" | "dec" => Some(ScalarType::Decimal),
+            "bytea" => Some(ScalarType::Bytea),
             _ => None,
         }
     }
@@ -71,6 +76,11 @@ impl ScalarType {
         matches!(self, ScalarType::Decimal)
     }
 
+    /// Whether this is the variable-width `bytea` type (raw bytes).
+    pub fn is_bytea(self) -> bool {
+        matches!(self, ScalarType::Bytea)
+    }
+
     /// Whether this is one of the fixed-width signed integer types.
     pub fn is_integer(self) -> bool {
         matches!(
@@ -87,7 +97,7 @@ impl ScalarType {
             ScalarType::Int16 => 2,
             ScalarType::Int32 => 4,
             ScalarType::Int64 => 8,
-            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal => {
+            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal | ScalarType::Bytea => {
                 unreachable!(
                     "text/boolean/decimal are not fixed-width integers; width_bytes is integer-only"
                 )
@@ -101,7 +111,7 @@ impl ScalarType {
             ScalarType::Int16 => i16::MIN as i64,
             ScalarType::Int32 => i32::MIN as i64,
             ScalarType::Int64 => i64::MIN,
-            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal => {
+            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal | ScalarType::Bytea => {
                 unreachable!("text/boolean/decimal have no integer range")
             }
         }
@@ -113,7 +123,7 @@ impl ScalarType {
             ScalarType::Int16 => i16::MAX as i64,
             ScalarType::Int32 => i32::MAX as i64,
             ScalarType::Int64 => i64::MAX,
-            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal => {
+            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal | ScalarType::Bytea => {
                 unreachable!("text/boolean/decimal have no integer range")
             }
         }
@@ -126,7 +136,7 @@ impl ScalarType {
             ScalarType::Int16 => 1,
             ScalarType::Int32 => 2,
             ScalarType::Int64 => 3,
-            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal => {
+            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal | ScalarType::Bytea => {
                 unreachable!("text/boolean/decimal have no integer promotion rank")
             }
         }
@@ -138,7 +148,7 @@ impl ScalarType {
     }
 
     /// All types, for exhaustive iteration in tests.
-    pub fn all() -> [ScalarType; 6] {
+    pub fn all() -> [ScalarType; 7] {
         [
             ScalarType::Int16,
             ScalarType::Int32,
@@ -146,6 +156,7 @@ impl ScalarType {
             ScalarType::Text,
             ScalarType::Bool,
             ScalarType::Decimal,
+            ScalarType::Bytea,
         ]
     }
 }

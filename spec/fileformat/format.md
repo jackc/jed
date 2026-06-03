@@ -128,10 +128,12 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 4 | `text` |
 | 5 | `boolean` |
 | 6 | `decimal` |
+| 7 | `bytea` |
 
 A column's collation is **not** stored: there is one collation (`C`) for all text this slice
 (../design/types.md §11). A per-column collation field is a forward extension that will claim a
 spare `flags` bit or a new field under a `format_version` bump when multi-collation lands.
+`bytea` has no collation (it is raw bytes, not text), so the same field-free encoding applies.
 
 A **decimal** column carries a **typmod** (the `numeric(p,s)` precision/scale) that constrains
 future writes, so it **must** persist. It is appended to the column entry **only when
@@ -156,8 +158,8 @@ by inserting in file order). Each **record**:
 The key is **stored, not derived**: a table without a primary key uses a synthetic
 `int64` rowid that is not reconstructable from row data, so the key bytes are persisted
 verbatim. There is no per-record payload length — the reader walks the columns in declaration
-order and takes each value's width from its type: fixed for the integers, and for `text` from
-the `u16` length the value carries (see the value codec below).
+order and takes each value's width from its type: fixed for the integers, and for `text` /
+`bytea` from the `u16` length the value carries (see the value codec below).
 
 **Rowid reconstruction (no-PK tables).** The synthetic rowid is allocated from a
 **monotonic counter** that is never reused (so a `DELETE` followed by an `INSERT` cannot
@@ -209,9 +211,16 @@ alone. The present-value body depends on the type:
   exceeding the page (impossible under the 1000-digit cap for a 256-byte fixture only at the
   extreme) trips the oversized-item rule below.
 
+- **`bytea`** — the **same compact length-prefixed** form as text (a stored value never needs
+  to sort, so not the order-preserving key encoding, encoding.md §2.6): a **`u16` byte-length**
+  (big-endian) followed by exactly that many **raw bytes**. The one difference from text is that
+  the bytes are written and read **verbatim with no UTF-8 validation** — any byte, including
+  `0x00`, is allowed. The empty value is `00`(tag)`00 00`(len). The `> 0xFFFF` and oversized-item
+  rules are identical to text.
+
 There is no per-record payload length: the reader walks the columns in declaration order,
 deriving each value's width from its type (fixed for integers and the 1-byte boolean;
-self-describing via the `u16` length for text, and via `ndigits` for decimal).
+self-describing via the `u16` length for text and bytea, and via `ndigits` for decimal).
 
 ## Packing and page allocation (must be byte-identical across cores)
 
@@ -245,9 +254,10 @@ by the independent Ruby reference in [verify.rb](verify.rb) (run via `rake verif
 | `empty_db.jed` | zero tables; catalog `item_count = 0` |
 | `one_table_empty.jed` | one table, zero rows (`root_data_page = 0`) |
 | `pk_table.jed` | a PK table with rows spanning **>1** data page; a NULL value in a row |
-| `text_table.jed` | a text column — the value codec's text branch (`u16` length + UTF-8), empty string, embedded quote, multi-byte and astral chars, and a NULL text value |
+| `text_table.jed` | a text column — the value codec's text branch (`u16` len + UTF-8 bytes); empty string, embedded quote, multi-byte + astral chars, a NULL |
 | `bool_table.jed` | a boolean column — the value codec's `bool-byte` branch (`00` false / `01` true) and a NULL boolean |
 | `decimal_table.jed` | a `decimal` column — the value codec's decimal branch (flags + scale + base-10⁴ groups), the per-column `numeric(p,s)` typmod, and positive/negative/zero/multi-group/NULL |
+| `bytea_table.jed` | a bytea column — the value codec's bytea branch (`u16` len + raw bytes); empty value, embedded `0x00`, a high byte, a NULL |
 | `nopk_table.jed` | a table with no PK — exercises the stored synthetic `int64` rowid key |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |

@@ -125,6 +125,10 @@ id = "expr.decimal_arithmetic"
 description = "Decimal arithmetic operators + - * / % and unary - with PostgreSQL result-scale rules and half-away-from-zero rounding (spec/design/decimal.md §4)"
 
 [[capability]]
+id = "types.bytea"
+description = "bytea scalar type (variable-width raw bytes): storage, hex-input literals, and unsigned-byte comparison/ordering. Non-key column only this slice — a bytea PRIMARY KEY is rejected 0A000 (spec/design/types.md §13)"
+
+[[capability]]
 id = "null.three_valued"
 description = "Three-valued NULL logic in comparisons (CLAUDE.md §4)"
 

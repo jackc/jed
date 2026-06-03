@@ -38,6 +38,7 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Text => 4,
         ScalarType::Bool => 5,
         ScalarType::Decimal => 6,
+        ScalarType::Bytea => 7,
     }
 }
 
@@ -50,6 +51,7 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         4 => Some(ScalarType::Text),
         5 => Some(ScalarType::Bool),
         6 => Some(ScalarType::Decimal),
+        7 => Some(ScalarType::Bytea),
         _ => None,
     }
 }
@@ -87,6 +89,15 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
             out.push(0x00); // present
             out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
             out.extend_from_slice(bytes);
+            out
+        }
+        // Bytea: same compact length-prefixed body as text, but the raw bytes verbatim
+        // (no UTF-8) — spec/fileformat/format.md.
+        Value::Bytea(b) => {
+            let mut out = Vec::with_capacity(3 + b.len());
+            out.push(0x00); // present
+            out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+            out.extend_from_slice(b);
             out
         }
         Value::Bool(b) => vec![0x00, u8::from(*b)], // present tag + bool-byte (0x00 false, 0x01 true)
@@ -543,6 +554,10 @@ fn read_value(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
                     groups.push(read_u16(buf, pos)?);
                 }
                 Ok(Value::Decimal(Decimal::from_codec(neg, scale, &groups)))
+            } else if ty.is_bytea() {
+                let len = read_u16(buf, pos)? as usize;
+                let bytes = take(buf, pos, len)?.to_vec();
+                Ok(Value::Bytea(bytes))
             } else {
                 let w = ty.width_bytes();
                 let vb = take(buf, pos, w)?;

@@ -30,6 +30,7 @@ import {
   canonicalName,
   inRange,
   isBool,
+  isBytea,
   isDecimal,
   isInteger,
   isText,
@@ -42,6 +43,8 @@ import {
   boolNot,
   boolOr,
   boolValue,
+  byteaValue,
+  compareBytea,
   compareTextC,
   decimalValue,
   eq3,
@@ -52,6 +55,8 @@ import {
   lt3,
   notDistinctFrom,
   nullValue,
+  parseByteaHex,
+  renderByteaHex,
   textValue,
 } from "./value.ts";
 
@@ -484,6 +489,10 @@ function distinctRowKey(row: Value[]): string {
         case "decimal":
           // Value-canonical key so 1.5 and 1.50 collapse to one DISTINCT bucket (decimal.md §5).
           return "d" + v.dec.canonicalString();
+        case "bytea":
+          // A distinct 'y' tag over the hex form (collision-free), so a bytea never collides
+          // with a text value of the same bytes.
+          return "y" + renderByteaHex(v.bytes);
       }
     })
     .join("|");
@@ -505,6 +514,7 @@ type ResolvedType =
   | { kind: "bool" }
   | { kind: "text" } // the text family (one collation, C); does not promote
   | { kind: "decimal" } // the decimal family (one type; the per-column typmod is separate)
+  | { kind: "bytea" } // the bytea family (raw bytes); does not promote
   | { kind: "null" };
 
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
@@ -515,6 +525,7 @@ type RExpr =
   | { kind: "constBool"; value: boolean }
   | { kind: "constText"; value: string }
   | { kind: "constDecimal"; value: Decimal }
+  | { kind: "constBytea"; value: Uint8Array }
   | { kind: "constNull" }
   | { kind: "cast"; target: ScalarType; typmod: DecimalTypmod | null; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
@@ -591,7 +602,9 @@ function resolve(
           ? { kind: "bool" }
           : isDecimal(colTy)
             ? { kind: "decimal" }
-            : { kind: "int", ty: colTy };
+            : isBytea(colTy)
+              ? { kind: "bytea" }
+              : { kind: "int", ty: colTy };
       return { node: { kind: "column", index: idx }, type };
     }
     case "literal":
@@ -600,9 +613,18 @@ function resolve(
           return { node: { kind: "constNull" }, type: { kind: "null" } };
         case "bool":
           return { node: { kind: "constBool", value: e.literal.value }, type: { kind: "bool" } };
-        case "text":
-          // A text literal is always text (collation C); it does not adapt to context.
+        case "text": {
+          // A string literal is text by default (collation C). It adapts to a BYTEA context
+          // only (types.md §6/§13): decode the hex input there (22P02 on bad hex); any other
+          // context — including none — keeps it text.
+          if (ctx !== null && isBytea(ctx)) {
+            return {
+              node: { kind: "constBytea", value: decodeByteaLiteral(e.literal.text) },
+              type: { kind: "bytea" },
+            };
+          }
           return { node: { kind: "constText", value: e.literal.text }, type: { kind: "text" } };
+        }
         case "decimal":
           // A decimal literal is always decimal; it does not adapt to context (like text).
           // Cap-check it here (an over-long coefficient/scale traps 22003 at resolve).
@@ -630,6 +652,10 @@ function resolve(
       if (isBool(target)) {
         throw engineError("feature_not_supported", "casting to boolean is not supported yet");
       }
+      // bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
+      if (isBytea(target)) {
+        throw engineError("feature_not_supported", "casting to bytea is not supported yet");
+      }
       const inner = resolve(table, e.inner, null);
       if (inner.type.kind === "bool") {
         throw typeError("cannot cast boolean to " + canonicalName(target));
@@ -637,6 +663,10 @@ function resolve(
       // Casting FROM text is likewise deferred (0A000).
       if (inner.type.kind === "text") {
         throw engineError("feature_not_supported", "casting from text is not supported yet");
+      }
+      // Casting FROM bytea is likewise deferred (0A000).
+      if (inner.type.kind === "bytea") {
+        throw engineError("feature_not_supported", "casting from bytea is not supported yet");
       }
       // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
       // decimal→decimal (re-scale), and NULL are all castable.
@@ -739,8 +769,8 @@ function resolveOperandPair(
   lhs: Expr,
   rhs: Expr,
 ): { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType } {
-  const lhsLit = isIntLiteral(lhs);
-  const rhsLit = isIntLiteral(rhs);
+  const lhsLit = isAdaptableLiteral(lhs);
+  const rhsLit = isAdaptableLiteral(rhs);
   let l: { node: RExpr; type: ResolvedType };
   let r: { node: RExpr; type: ResolvedType };
   if (lhsLit && rhsLit) {
@@ -748,10 +778,10 @@ function resolveOperandPair(
     r = resolve(table, rhs, "int64");
   } else if (lhsLit) {
     r = resolve(table, rhs, null);
-    l = resolve(table, lhs, intTypeOf(r.type));
+    l = resolve(table, lhs, ctxOf(r.type));
   } else if (rhsLit) {
     l = resolve(table, lhs, null);
-    r = resolve(table, rhs, intTypeOf(l.type));
+    r = resolve(table, rhs, ctxOf(l.type));
   } else {
     l = resolve(table, lhs, null);
     r = resolve(table, rhs, null);
@@ -778,15 +808,45 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   if ((lNum && rt.kind === "text") || (lt.kind === "text" && rNum)) {
     throw typeError("cannot compare a text value with a numeric value");
   }
+  // bytea compares only with bytea (or NULL); bytea with a number or text is a mismatch.
+  const byteaL = lt.kind === "bytea";
+  const byteaR = rt.kind === "bytea";
+  if (byteaL !== byteaR && lt.kind !== "null" && rt.kind !== "null") {
+    throw typeError("cannot compare a bytea value with a non-bytea value");
+  }
 }
 
-function isIntLiteral(e: Expr): boolean {
-  return e.kind === "literal" && e.literal.kind === "int";
+// isAdaptableLiteral reports whether e is a literal that adapts to its sibling operand's type
+// (an integer or string literal). NULL, boolean, and decimal literals do not take a sibling's context.
+function isAdaptableLiteral(e: Expr): boolean {
+  return e.kind === "literal" && (e.literal.kind === "int" || e.literal.kind === "text");
 }
 
-// intTypeOf returns the integer type of t as a sibling literal's context, or null.
+// ctxOf returns the type a sibling operand offers an adaptable literal: an integer type (so an
+// integer literal adopts that width), or bytea/text (so a string literal can decode to bytea,
+// else stay text). null for bool/decimal/NULL — no useful literal context.
+function ctxOf(t: ResolvedType): ScalarType | null {
+  if (t.kind === "int") return t.ty;
+  if (t.kind === "bytea") return "bytea";
+  if (t.kind === "text") return "text";
+  return null;
+}
+
+// intTypeOf returns the integer type of t (for promotion), or null.
 function intTypeOf(t: ResolvedType): ScalarType | null {
   return t.kind === "int" ? t.ty : null;
+}
+
+// decodeByteaLiteral decodes a single-quoted literal's content as a bytea value via the hex
+// input form (parseByteaHex), mapping malformed hex to a 22P02 (invalid_text_representation).
+// Used when a string literal adapts to a bytea context (types.md §6/§13); the trap is
+// deterministic and fires at resolve time, before any scan.
+function decodeByteaLiteral(str: string): Uint8Array {
+  const r = parseByteaHex(str);
+  if ("error" in r) {
+    throw engineError("invalid_text_representation", "invalid input syntax for type bytea: " + r.error);
+  }
+  return r.bytes;
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the
@@ -803,13 +863,13 @@ function promote(a: ResolvedType, b: ResolvedType): ScalarType {
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
 // or NULL); a boolean or text operand is a 42804 type error.
 function requireNumericOperand(t: ResolvedType): void {
-  if (t.kind === "bool" || t.kind === "text") {
+  if (t.kind === "bool" || t.kind === "text" || t.kind === "bytea") {
     throw typeError("arithmetic operators require numeric operands");
   }
 }
 
 function requireBool(t: ResolvedType, msg: string): void {
-  if (t.kind === "int" || t.kind === "text" || t.kind === "decimal") throw typeError(msg);
+  if (t.kind === "int" || t.kind === "text" || t.kind === "decimal" || t.kind === "bytea") throw typeError(msg);
 }
 
 // requireAssignable: a value assigned to a column must match its family — an integer column
@@ -823,6 +883,7 @@ function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): voi
   if (isInteger(colTy)) ok = t.kind === "int" || t.kind === "null";
   else if (isDecimal(colTy)) ok = t.kind === "int" || t.kind === "decimal" || t.kind === "null";
   else if (isBool(colTy)) ok = t.kind === "bool" || t.kind === "null";
+  else if (isBytea(colTy)) ok = t.kind === "bytea" || t.kind === "null";
   else ok = t.kind === "text" || t.kind === "null";
   if (!ok) {
     throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
@@ -885,7 +946,13 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
       throw typeError("cannot store a decimal value in " + canonicalName(colTy) + " column " + colName);
     case "text":
       if (isText(colTy)) return v;
+      // A string literal adapts to a bytea column, decoding the hex input (types.md §6/§13);
+      // malformed hex traps 22P02.
+      if (isBytea(colTy)) return byteaValue(decodeByteaLiteral(v.text));
       throw typeError("cannot store a text value in " + canonicalName(colTy) + " column " + colName);
+    case "bytea":
+      if (isBytea(colTy)) return v;
+      throw typeError("cannot store a bytea value in " + canonicalName(colTy) + " column " + colName);
     default: // bool
       if (isBool(colTy)) return v;
       throw typeError("cannot store a boolean value in " + canonicalName(colTy) + " column " + colName);
@@ -945,6 +1012,8 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
       return textValue(e.value);
     case "constDecimal":
       return decimalValue(e.value);
+    case "constBytea":
+      return byteaValue(e.value);
     case "constNull":
       return nullValue();
     case "cast": {
@@ -1129,6 +1198,7 @@ function valueCmp(a: Value, b: Value): number {
   if (a.kind === "int" && b.kind === "int") return a.int < b.int ? -1 : a.int > b.int ? 1 : 0;
   if (a.kind === "decimal" && b.kind === "decimal") return a.dec.cmpValue(b.dec);
   if (a.kind === "text" && b.kind === "text") return compareTextC(a.text, b.text);
+  if (a.kind === "bytea" && b.kind === "bytea") return compareBytea(a.bytes, b.bytes);
   if (a.kind === "bool" && b.kind === "bool") {
     return a.value === b.value ? 0 : a.value ? 1 : -1;
   }
@@ -1150,8 +1220,10 @@ function familyRank(v: Value): number {
       return 2;
     case "decimal":
       return 3;
-    default: // text
+    case "text":
       return 4;
+    default: // bytea
+      return 5;
   }
 }
 

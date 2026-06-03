@@ -16,7 +16,7 @@ use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
 use crate::storage::{Row, TableStore};
 use crate::types::{DecimalTypmod, ScalarType};
-use crate::value::{Value, and3, from3, not3, or3};
+use crate::value::{Value, and3, from3, not3, or3, parse_bytea_hex};
 use std::collections::{HashMap, HashSet};
 
 /// The outcome of executing one statement. Both variants carry the deterministic
@@ -259,9 +259,9 @@ impl Database {
                         Value::Bool(_) => {
                             unreachable!("a boolean primary key is rejected at CREATE TABLE")
                         }
-                        // Unreachable: a text/decimal PRIMARY KEY is rejected at CREATE TABLE
-                        // (0A000).
-                        Value::Text(_) | Value::Decimal(_) => {
+                        // Unreachable: a text/decimal/bytea PRIMARY KEY is rejected at CREATE
+                        // TABLE (0A000) — non-integer PKs are caught by `!is_integer()`.
+                        Value::Text(_) | Value::Decimal(_) | Value::Bytea(_) => {
                             unreachable!("a non-integer primary key is rejected at CREATE TABLE")
                         }
                     };
@@ -619,6 +619,8 @@ enum ResolvedType {
     Text,
     /// The decimal family (one type; the per-column typmod is carried separately, not here).
     Decimal,
+    /// The bytea family (raw bytes); does not promote.
+    Bytea,
     Null,
 }
 
@@ -649,6 +651,7 @@ enum RExpr {
     ConstBool(bool),
     ConstText(String),
     ConstDecimal(Decimal),
+    ConstBytea(Vec<u8>),
     ConstNull,
     Cast {
         inner: Box<RExpr>,
@@ -733,7 +736,7 @@ fn resolve_boolean_filter(table: &Table, e: &Expr) -> Result<RExpr> {
     let (node, ty) = resolve(table, e, None)?;
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(node),
-        ResolvedType::Int(_) | ResolvedType::Text | ResolvedType::Decimal => {
+        ResolvedType::Int(_) | ResolvedType::Text | ResolvedType::Decimal | ResolvedType::Bytea => {
             Err(type_error("argument of WHERE must be boolean"))
         }
     }
@@ -753,6 +756,8 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
                 ResolvedType::Bool
             } else if ty.is_decimal() {
                 ResolvedType::Decimal
+            } else if ty.is_bytea() {
+                ResolvedType::Bytea
             } else {
                 ResolvedType::Int(ty)
             };
@@ -775,8 +780,17 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             Ok((RExpr::ConstInt(*n), ResolvedType::Int(ty)))
         }
         Expr::Literal(Literal::Text(s)) => {
-            // A text literal is always text (collation `C`); it does not adapt to context.
-            Ok((RExpr::ConstText(s.clone()), ResolvedType::Text))
+            // A string literal is text by default (collation `C`). It adapts to a BYTEA
+            // context only (types.md §6/§13): decode the hex input form there (22P02 on
+            // malformed hex). Any other context — including none — keeps it text.
+            if matches!(ctx, Some(t) if t.is_bytea()) {
+                Ok((
+                    RExpr::ConstBytea(decode_bytea_literal(s)?),
+                    ResolvedType::Bytea,
+                ))
+            } else {
+                Ok((RExpr::ConstText(s.clone()), ResolvedType::Text))
+            }
         }
         Expr::Literal(Literal::Decimal(d)) => {
             // A decimal literal is always decimal; it does not adapt to context (like text).
@@ -808,6 +822,13 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
                     "casting to boolean is not supported yet",
                 ));
             }
+            // bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
+            if target.is_bytea() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "casting to bytea is not supported yet",
+                ));
+            }
             // The inner value is range-checked / coerced against `target` at eval, so it
             // resolves with no literal context here.
             let (rinner, ity) = resolve(table, inner, None)?;
@@ -826,6 +847,13 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         "casting from text is not supported yet",
+                    ));
+                }
+                // Casting FROM bytea is likewise deferred (0A000).
+                ResolvedType::Bytea => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting from bytea is not supported yet",
                     ));
                 }
             }
@@ -852,7 +880,7 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
                 ResolvedType::Int(t) => t,
                 ResolvedType::Decimal => ScalarType::Decimal,
                 ResolvedType::Null => ScalarType::Int64, // -NULL = NULL
-                ResolvedType::Bool | ResolvedType::Text => {
+                ResolvedType::Bool | ResolvedType::Text | ResolvedType::Bytea => {
                     return Err(type_error("unary minus requires a numeric operand"));
                 }
             };
@@ -987,32 +1015,33 @@ fn resolve_binary(
     }
 }
 
-/// Resolve the two operands of a binary operator, giving each a bare *integer* literal
-/// the other operand's integer type as context (so `small + 1` types `1` as int16, and
-/// `small + 100000` traps 22003 at resolve). A text literal needs no context (it is
-/// always text); when the sibling is text, an integer literal gets no integer context
-/// and defaults to int64 — the caller's family check then reports the mismatch. This
-/// does NOT enforce a family — `resolve_int_pair` (arithmetic) and `classify_comparable`
-/// (comparison) layer that on top.
+/// Resolve the two operands of a binary operator, giving each adaptable literal the other
+/// operand's type as context: a bare *integer* literal adopts the sibling's integer type (so
+/// `small + 1` types `1` as int16, and `small + 100000` traps 22003 at resolve), and a
+/// *string* literal adapts to a bytea sibling (decoding the hex input — types.md §6/§13),
+/// otherwise staying text. When the sibling offers no usable context, the literal defaults to
+/// its own family and the caller's family check reports the mismatch. This does NOT enforce a
+/// family — `resolve_int_pair`/arithmetic and `classify_comparable` (comparison) layer that on top.
 fn resolve_operand_pair(
     table: &Table,
     lhs: &Expr,
     rhs: &Expr,
 ) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
-    let lhs_lit = matches!(lhs, Expr::Literal(Literal::Int(_)));
-    let rhs_lit = matches!(rhs, Expr::Literal(Literal::Int(_)));
+    let lhs_lit = is_adaptable_literal(lhs);
+    let rhs_lit = is_adaptable_literal(rhs);
     let (rl, lt, rr, rt) = if lhs_lit && rhs_lit {
-        // Both bare integer literals: no column context, default to int64 (types.md §6).
+        // Two bare literals: no column context. Default an integer literal to int64; a string
+        // literal stays text (no bytea context to decode it — types.md §6).
         let (rl, lt) = resolve(table, lhs, Some(ScalarType::Int64))?;
         let (rr, rt) = resolve(table, rhs, Some(ScalarType::Int64))?;
         (rl, lt, rr, rt)
     } else if lhs_lit {
         let (rr, rt) = resolve(table, rhs, None)?;
-        let (rl, lt) = resolve(table, lhs, int_type(rt))?;
+        let (rl, lt) = resolve(table, lhs, ctx_of(rt))?;
         (rl, lt, rr, rt)
     } else if rhs_lit {
         let (rl, lt) = resolve(table, lhs, None)?;
-        let (rr, rt) = resolve(table, rhs, int_type(lt))?;
+        let (rr, rt) = resolve(table, rhs, ctx_of(lt))?;
         (rl, lt, rr, rt)
     } else {
         let (rl, lt) = resolve(table, lhs, None)?;
@@ -1022,39 +1051,71 @@ fn resolve_operand_pair(
     Ok((rl, lt, rr, rt))
 }
 
-/// Require that an arithmetic operand is numeric (integer or decimal, or NULL); a boolean or
-/// text operand is a 42804 type error.
+/// Whether `e` is a literal that adapts to its sibling operand's type (an integer or string
+/// literal). NULL, boolean, and decimal literals do not take a sibling's context here.
+fn is_adaptable_literal(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Literal(Literal::Int(_)) | Expr::Literal(Literal::Text(_))
+    )
+}
+
+/// The context type a sibling operand offers an adaptable literal: an integer type (so an
+/// integer literal adopts that width), or `bytea`/`text` (so a string literal can decode to
+/// bytea, else stay text). `None` for bool/decimal/NULL — no useful literal context.
+fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
+    match ty {
+        ResolvedType::Int(t) => Some(t),
+        ResolvedType::Bytea => Some(ScalarType::Bytea),
+        ResolvedType::Text => Some(ScalarType::Text),
+        ResolvedType::Bool | ResolvedType::Decimal | ResolvedType::Null => None,
+    }
+}
+
+/// Require that an arithmetic operand is numeric (integer or decimal, or NULL); a boolean,
+/// text, or bytea operand is a 42804 type error.
 fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
     match ty {
         ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null => Ok(()),
-        ResolvedType::Bool | ResolvedType::Text => {
+        ResolvedType::Bool | ResolvedType::Text | ResolvedType::Bytea => {
             Err(type_error("arithmetic operators require numeric operands"))
         }
     }
 }
 
 /// Require that a comparison operand pair is comparable (spec/types/compare.toml): both
-/// numeric (integer and/or decimal — the integer promotes to decimal), both text, or both
-/// boolean (NULL counts as either). A mixed numeric/text pair, or a boolean with a
-/// non-boolean, is a 42804 type error — comparison is overloaded across these families but
-/// never compares across them.
+/// numeric (integer and/or decimal — the integer promotes to decimal), both text, both
+/// boolean, or both bytea (NULL counts as any). A cross-family pair (numeric/text,
+/// boolean/non-boolean, bytea/non-bytea, …) is a 42804 type error — comparison is overloaded
+/// across these families but never compares across them.
 fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
-    use ResolvedType::{Bool, Decimal, Int, Text};
+    use ResolvedType::{Bool, Bytea, Decimal, Int, Text};
     match (lt, rt) {
-        // Boolean compares only with boolean (or NULL); boolean with a number/text is a mismatch.
+        // Boolean compares only with boolean (or NULL); boolean with a number/text/bytea is a mismatch.
         (Bool, Int(_))
         | (Int(_), Bool)
         | (Bool, Text)
         | (Text, Bool)
         | (Bool, Decimal)
-        | (Decimal, Bool) => Err(type_error(
+        | (Decimal, Bool)
+        | (Bool, Bytea)
+        | (Bytea, Bool) => Err(type_error(
             "cannot compare a boolean value with a non-boolean value",
         )),
         (Int(_), Text) | (Text, Int(_)) | (Decimal, Text) | (Text, Decimal) => Err(type_error(
             "cannot compare a text value with a numeric value",
         )),
-        // Same-family pairs (numeric/numeric incl. int↔decimal, text/text, bool/bool) and any
-        // pairing with a bare NULL literal are comparable.
+        // bytea compares only with bytea (or NULL); bytea with a number or text is a mismatch.
+        (Bytea, Int(_))
+        | (Int(_), Bytea)
+        | (Bytea, Decimal)
+        | (Decimal, Bytea)
+        | (Bytea, Text)
+        | (Text, Bytea) => Err(type_error(
+            "cannot compare a bytea value with a non-bytea value",
+        )),
+        // Same-family pairs (numeric/numeric incl. int↔decimal, text/text, bool/bool,
+        // bytea/bytea) and any pairing with a bare NULL literal are comparable.
         _ => Ok(()),
     }
 }
@@ -1088,7 +1149,9 @@ fn promote(a: ResolvedType, b: ResolvedType) -> ScalarType {
 fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(()),
-        ResolvedType::Int(_) | ResolvedType::Text | ResolvedType::Decimal => Err(type_error(msg)),
+        ResolvedType::Int(_) | ResolvedType::Text | ResolvedType::Decimal | ResolvedType::Bytea => {
+            Err(type_error(msg))
+        }
     }
 }
 
@@ -1108,6 +1171,8 @@ fn require_assignable(ty: ResolvedType, col_ty: ScalarType, col: &str) -> Result
         )
     } else if col_ty.is_bool() {
         matches!(ty, ResolvedType::Bool | ResolvedType::Null)
+    } else if col_ty.is_bytea() {
+        matches!(ty, ResolvedType::Bytea | ResolvedType::Null)
     } else {
         // text column
         matches!(ty, ResolvedType::Text | ResolvedType::Null)
@@ -1203,6 +1268,19 @@ fn type_error(msg: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::DatatypeMismatch, msg.into())
 }
 
+/// Decode a single-quoted literal's content as a bytea value via the hex input form
+/// (`value::parse_bytea_hex`), mapping malformed hex to a `22P02`
+/// (invalid_text_representation). Used when a string literal adapts to a bytea context
+/// (types.md §6/§13); the trap is deterministic and fires at resolve time, before any scan.
+fn decode_bytea_literal(s: &str) -> Result<Vec<u8>> {
+    parse_bytea_hex(s).map_err(|detail| {
+        EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            format!("invalid input syntax for type bytea: {detail}"),
+        )
+    })
+}
+
 /// A resolved UPDATE assignment: which column to write, the target type/nullability so
 /// the new value is re-checked exactly like INSERT, and the resolved RHS expression
 /// (evaluated against the *old* row).
@@ -1281,9 +1359,23 @@ fn store_value(
         Value::Text(s) => {
             if col_ty.is_text() {
                 Ok(Value::Text(s))
+            } else if col_ty.is_bytea() {
+                // A string literal adapts to a bytea column, decoding the hex input form
+                // (types.md §6/§13); malformed hex traps 22P02.
+                Ok(Value::Bytea(decode_bytea_literal(&s)?))
             } else {
                 Err(type_error(format!(
                     "cannot store a text value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+        Value::Bytea(b) => {
+            if col_ty.is_bytea() {
+                Ok(Value::Bytea(b))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a bytea value in {} column {col_name}",
                     col_ty.canonical_name()
                 )))
             }
@@ -1340,6 +1432,7 @@ impl RExpr {
             RExpr::ConstBool(b) => Ok(Value::Bool(*b)),
             RExpr::ConstText(s) => Ok(Value::Text(s.clone())),
             RExpr::ConstDecimal(d) => Ok(Value::Decimal(d.clone())),
+            RExpr::ConstBytea(b) => Ok(Value::Bytea(b.clone())),
             RExpr::ConstNull => Ok(Value::Null),
             RExpr::Cast {
                 inner,
@@ -1379,6 +1472,7 @@ impl RExpr {
                     }
                     Value::Bool(_) => unreachable!("resolver rejects a boolean cast operand"),
                     Value::Text(_) => unreachable!("resolver rejects a text cast operand"),
+                    Value::Bytea(_) => unreachable!("resolver rejects a bytea cast operand"),
                 }
             }
             RExpr::Neg { operand, result } => {
@@ -1400,6 +1494,7 @@ impl RExpr {
                     Value::Decimal(d) => Ok(Value::Decimal(d.neg())),
                     Value::Bool(_) => unreachable!("resolver rejects a boolean unary minus"),
                     Value::Text(_) => unreachable!("resolver rejects a text unary minus"),
+                    Value::Bytea(_) => unreachable!("resolver rejects a bytea unary minus"),
                 }
             }
             RExpr::Not(e) => {
@@ -1576,6 +1671,7 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Decimal(x), Value::Decimal(y)) => x.cmp_value(y),
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
         // Cross-family arms exist only for totality — ORDER BY is over a single typed column,
         // so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -1592,5 +1688,6 @@ fn family_rank(v: &Value) -> u8 {
         Value::Int(_) => 2,
         Value::Decimal(_) => 3,
         Value::Text(_) => 4,
+        Value::Bytea(_) => 5,
     }
 }

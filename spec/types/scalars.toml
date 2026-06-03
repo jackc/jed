@@ -33,11 +33,13 @@ schema_version = 1
 #               "text-terminated-escape" = UTF-8 bytes (the `C` collation), each
 #               0x00 escaped to 0x00 0xFF and the string terminated with 0x00 0x01
 #               (order-preserving + self-delimiting — see ../design/encoding.md §2.4);
-#               "decimal-order-preserving" = sign/class byte + order-preserving
+#               "bytea-terminated-escape" = the same escape+terminator rule over a
+#               value's RAW bytes (no UTF-8 / collation framing — ../design/encoding.md
+#               §2.6); "decimal-order-preserving" = sign/class byte + order-preserving
 #               exponent + big-endian base-100 mantissa pairs + terminator (CockroachDB
 #               style — ../design/encoding.md §2.5). All sort byte-for-byte identically
 #               to logical order. width_bytes is omitted for variable-width types
-#               (text, decimal).
+#               (text, bytea, decimal).
 # max_precision for decimal only: the maximum total significant digits a value may carry
 #               (precision p of numeric(p,s)). 1000, PG's declarable max. An unconstrained
 #               `numeric` (no typmod) is capped here too (../design/decimal.md §2).
@@ -138,7 +140,7 @@ collation = "C"
 # --- decimal: the exact arbitrary-precision numeric (CLAUDE.md §4) ------------
 # An EXACT base-10 numeric: value = (-1)^sign * coefficient * 10^(-scale), held as a
 # hand-rolled sign + base-10^9 limb coefficient + scale (no binary float anywhere —
-# CLAUDE.md §8). STORABLE this slice with the on-disk value codec (type code 5 —
+# CLAUDE.md §8). STORABLE this slice with the on-disk value codec (type code 6 —
 # ../fileformat/format.md). The first PARAMETERIZED type: `numeric` (unconstrained),
 # `numeric(p)` (= numeric(p,0)), and `numeric(p,s)` where p = total significant digits
 # (1..=max_precision) and s = digits after the point (0..=p); a bad typmod traps 22023.
@@ -161,3 +163,25 @@ overflow_error = "22003"
 encoding = { method = "decimal-order-preserving" }
 max_precision = 1000
 max_scale = 1000
+
+# --- bytea: a variable-width binary string (raw bytes) -----------------------
+# STORABLE this slice: `CREATE TABLE t(b bytea)` works, values are stored on disk
+# (on-disk type code 7 — ../fileformat/format.md), and bytea columns compare/order/
+# dedup by UNSIGNED byte order (memcmp over the raw bytes — exactly PostgreSQL's
+# bytea comparison). The empty byte string is a distinct, non-NULL value. There is
+# NO collation (bytea is bytes, not text) and NO alias (PostgreSQL spells it only
+# `bytea`). A bytea literal is written as a single-quoted string in a bytea context
+# (../design/types.md §6): the HEX input form `\x` + an even count of hex digits,
+# decoded to the raw bytes; rendered back as `\x` + lowercase hex (PG bytea_output =
+# hex). Invalid hex input traps 22P02. The traditional escape input format, text⇄
+# bytea casts, and binary functions are deferred. The bytea KEY encoding rule
+# (bytea-terminated-escape) is authored now (encoding.md §2.6) but UNEXERCISED this
+# slice: a bytea PRIMARY KEY is rejected 0A000 (a documented, relaxable narrowing,
+# exactly like the text-PK narrowing). No bits/min/max/overflow/rank (integer-family
+# fields); no width_bytes — bytea is variable-width; no collation.
+[[type]]
+id = "bytea"
+aliases = []
+family = "bytea"
+storable = true
+encoding = { method = "bytea-terminated-escape" }

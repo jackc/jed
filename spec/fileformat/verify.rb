@@ -20,7 +20,7 @@ ROOT_PAGE = 2
 TXID = 1
 
 WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8 }.freeze
-TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6 }.freeze
+TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6, "bytea" => 7 }.freeze
 CODETYPE = TYPECODE.invert.freeze
 
 # --- declarative fixtures (mirror what the cores build via SQL) --------------
@@ -71,6 +71,18 @@ DECIMAL_TABLE = {
          [4, "100000000.000001", "100.00"], [5, nil, nil]]
 }.freeze
 
+# A table with a bytea column: exercises the value codec's bytea branch (u16 byte-length +
+# RAW bytes, no UTF-8 validation). Covers a multi-byte value with a-f hex (\xdeadbeef), the
+# empty byte string (a distinct non-NULL value), embedded 0x00 bytes, a high byte (0xFF), a
+# NULL bytea, and a lone 0x00 byte. The PK is an int32 (bytea is not allowed in a key this
+# slice). All byte values are forced to ASCII-8BIT (.b) so they round-trip verbatim.
+BYTEA_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("b", "bytea")],
+  rows: [[1, "\xDE\xAD\xBE\xEF".b], [2, "".b], [3, "\x00\x01\x02".b],
+         [4, "\xFF".b], [5, nil], [6, "\x00".b]]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "one_table_empty.jed", page_size: 256,
@@ -79,6 +91,7 @@ FIXTURES = [
   { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
   { file: "bool_table.jed",      page_size: 256, tables: [BOOL_TABLE] },
   { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
+  { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
@@ -118,14 +131,15 @@ def decode_int(width, bytes)
 end
 
 # value codec: presence tag + (when present) the type's body. 0x01 = NULL; 0x00 = present.
-# Integers reuse the order-preserving int bytes; text diverges to a compact u16 byte-length
-# + UTF-8 bytes (collation C, verbatim); boolean is a single bool-byte 0x00 false / 0x01
-# true (format.md "Value codec").
+# Integers reuse the order-preserving int bytes; text and bytea diverge to a compact u16
+# byte-length + bytes (text: UTF-8 collation-C bytes; bytea: raw bytes — byte-identical here,
+# only the source encoding / read-side UTF-8 assertion differs); boolean is a single bool-byte
+# 0x00 false / 0x01 true (format.md "Value codec").
 def encode_value(type, v)
   return "\x01".b if v.nil?
 
   case type
-  when "text"
+  when "text", "bytea"
     bytes = v.b
     "\x00".b + u16(bytes.bytesize) + bytes
   when "boolean"
@@ -401,6 +415,10 @@ def decode_record(columns, buf, pos)
           coeff = coeff * 10_000 + gb.unpack1("n")
         end
         row << render_decimal((fb.getbyte(0) & 1) != 0, scb.unpack1("n"), coeff)
+      when "bytea"
+        len, pos = take(buf, pos, 2)
+        bb, pos = take(buf, pos, len.unpack1("n"))
+        row << bb.dup.force_encoding("ASCII-8BIT") # raw bytes, no UTF-8 assertion
       else
         vb, pos = take(buf, pos, WIDTH.fetch(c[:type]))
         row << decode_int(WIDTH.fetch(c[:type]), vb)

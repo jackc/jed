@@ -597,6 +597,13 @@ func distinctRowKey(row []Value) string {
 			// (spec/design/decimal.md §5).
 			b.WriteByte('d')
 			b.WriteString(v.Dec.CanonicalString())
+		case ValBytea:
+			// Length-prefix the raw bytes (held in Str; a distinct 'y' tag, so a bytea never
+			// collides with a text value of the same bytes).
+			b.WriteByte('y')
+			b.WriteString(strconv.Itoa(len(v.Str)))
+			b.WriteByte(':')
+			b.WriteString(v.Str)
 		}
 	}
 	return b.String()
@@ -619,6 +626,7 @@ const (
 	rtBool
 	rtText    // text (one family, collation C); does not promote
 	rtDecimal // decimal (one family; the per-column typmod is carried separately)
+	rtBytea   // bytea (one family, raw bytes); does not promote
 )
 
 type resolvedType struct {
@@ -633,14 +641,23 @@ func intType(t resolvedType) (ScalarType, bool) {
 	return 0, false
 }
 
-// ctxOf returns the integer type of t as a context for a sibling literal, or nil if t
-// is not integer (so a sibling literal defaults to int64).
+// ctxOf returns the type a sibling operand offers an adaptable literal: an integer type
+// (so an integer literal adopts that width), or bytea/text (so a string literal can decode
+// to bytea, else stay text). nil for bool/decimal/NULL — no useful literal context.
 func ctxOf(t resolvedType) *ScalarType {
-	if t.kind == rtInt {
+	switch t.kind {
+	case rtInt:
 		ty := t.intTy
 		return &ty
+	case rtBytea:
+		ty := Bytea
+		return &ty
+	case rtText:
+		ty := Text
+		return &ty
+	default:
+		return nil
 	}
-	return nil
 }
 
 // rExprKind tags a resolved expression node.
@@ -652,6 +669,7 @@ const (
 	reConstBool
 	reConstText
 	reConstDecimal
+	reConstBytea
 	reConstNull
 	reCast
 	reNeg
@@ -674,6 +692,7 @@ type rExpr struct {
 	cBool   bool           // reConstBool
 	cText   string         // reConstText
 	cDec    Decimal        // reConstDecimal
+	cBytea  []byte         // reConstBytea
 	op      BinaryOp       // reArith, reCompare
 	result  ScalarType     // reCast target; reNeg / reArith result type
 	typmod  *DecimalTypmod // reCast: a decimal target's numeric(p,s) typmod
@@ -760,6 +779,8 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 			rt = resolvedType{kind: rtBool}
 		} else if colTy.IsDecimal() {
 			rt = resolvedType{kind: rtDecimal}
+		} else if colTy.IsBytea() {
+			rt = resolvedType{kind: rtBytea}
 		}
 		return &rExpr{kind: reColumn, index: idx}, rt, nil
 	case ExprLiteral:
@@ -769,7 +790,16 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		case LiteralBool:
 			return &rExpr{kind: reConstBool, cBool: e.Literal.Bool}, resolvedType{kind: rtBool}, nil
 		case LiteralText:
-			// A text literal is always text (collation C); it does not adapt to context.
+			// A string literal is text by default (collation C). It adapts to a BYTEA context
+			// only (types.md §6/§13): decode the hex input there (22P02 on bad hex); any other
+			// context — including none — keeps it text.
+			if ctx != nil && ctx.IsBytea() {
+				b, err := decodeByteaLiteral(e.Literal.Str)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return &rExpr{kind: reConstBytea, cBytea: b}, resolvedType{kind: rtBytea}, nil
+			}
 			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
 		case LiteralDecimal:
 			// A decimal literal is always decimal; it does not adapt to context (like text).
@@ -810,6 +840,10 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		if target.IsBool() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to boolean is not supported yet")
 		}
+		// bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
+		if target.IsBytea() {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to bytea is not supported yet")
+		}
 		inner, ity, err := resolve(table, e.Cast.Inner, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -820,6 +854,10 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		// Casting FROM text is likewise deferred (0A000).
 		if ity.kind == rtText {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from text is not supported yet")
+		}
+		// Casting FROM bytea is likewise deferred (0A000).
+		if ity.kind == rtBytea {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from bytea is not supported yet")
 		}
 		// int→int (range check), int→decimal (widen), decimal→int (explicit, round),
 		// decimal→decimal (re-scale), and NULL are all castable.
@@ -952,8 +990,8 @@ func resolveBinary(table *Table, b *BinaryExpr) (*rExpr, resolvedType, error) {
 // reports the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
 // classifyComparable (comparison) layer that on top.
 func resolveOperandPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
-	lhsLit := isIntLiteral(lhs)
-	rhsLit := isIntLiteral(rhs)
+	lhsLit := isAdaptableLiteral(lhs)
+	rhsLit := isAdaptableLiteral(rhs)
 	var rl, rr *rExpr
 	var lt, rt resolvedType
 	var err error
@@ -989,7 +1027,7 @@ func resolveOperandPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rEx
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
 // or NULL); a boolean or text operand is a 42804 type error.
 func requireNumericOperand(t resolvedType) error {
-	if t.kind == rtBool || t.kind == rtText {
+	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea {
 		return typeError("arithmetic operators require numeric operands")
 	}
 	return nil
@@ -1011,11 +1049,31 @@ func classifyComparable(lt, rt resolvedType) error {
 	if (lNum && rt.kind == rtText) || (lt.kind == rtText && rNum) {
 		return typeError("cannot compare a text value with a numeric value")
 	}
+	// bytea compares only with bytea (or NULL); bytea with a number or text is a mismatch.
+	byteaL, byteaR := lt.kind == rtBytea, rt.kind == rtBytea
+	if byteaL != byteaR && lt.kind != rtNull && rt.kind != rtNull {
+		return typeError("cannot compare a bytea value with a non-bytea value")
+	}
 	return nil
 }
 
-func isIntLiteral(e Expr) bool {
-	return e.Kind == ExprLiteral && e.Literal.Kind == LiteralInt
+// isAdaptableLiteral reports whether e is a literal that adapts to its sibling operand's
+// type (an integer or string literal). NULL, boolean, and decimal literals do not take a
+// sibling's context here.
+func isAdaptableLiteral(e Expr) bool {
+	return e.Kind == ExprLiteral && (e.Literal.Kind == LiteralInt || e.Literal.Kind == LiteralText)
+}
+
+// decodeByteaLiteral decodes a single-quoted literal's content as a bytea value via the hex
+// input form (ParseByteaHex), mapping malformed hex to a 22P02 (invalid_text_representation).
+// Used when a string literal adapts to a bytea context (types.md §6/§13); the trap is
+// deterministic and fires at resolve time, before any scan.
+func decodeByteaLiteral(s string) ([]byte, error) {
+	b, reason := ParseByteaHex(s)
+	if reason != "" {
+		return nil, NewError(InvalidTextRepresentation, "invalid input syntax for type bytea: "+reason)
+	}
+	return b, nil
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the
@@ -1039,7 +1097,7 @@ func promote(a, b resolvedType) ScalarType {
 }
 
 func requireBool(t resolvedType, msg string) error {
-	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal {
+	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal || t.kind == rtBytea {
 		return typeError(msg)
 	}
 	return nil
@@ -1060,6 +1118,8 @@ func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
 		ok = t.kind == rtInt || t.kind == rtNull
 	case colTy.IsDecimal():
 		ok = t.kind == rtInt || t.kind == rtDecimal || t.kind == rtNull
+	case colTy.IsBytea():
+		ok = t.kind == rtBytea || t.kind == rtNull
 	default: // text
 		ok = t.kind == rtText || t.kind == rtNull
 	}
@@ -1140,6 +1200,8 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		return TextValue(e.cText), nil
 	case reConstDecimal:
 		return DecimalValue(e.cDec), nil
+	case reConstBytea:
+		return ByteaValue(e.cBytea), nil
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
@@ -1433,6 +1495,9 @@ func valueCmp(a, b Value) int {
 		return a.Dec.CmpValue(*b.Dec)
 	case a.Kind == ValText && b.Kind == ValText:
 		return strings.Compare(a.Str, b.Str)
+	case a.Kind == ValBytea && b.Kind == ValBytea:
+		// bytea is held in Str (raw bytes); strings.Compare is unsigned byte order.
+		return strings.Compare(a.Str, b.Str)
 	case a.Kind == ValBool && b.Kind == ValBool:
 		return cmpInt64(orderKey(a), orderKey(b))
 	default:
@@ -1475,8 +1540,10 @@ func familyRank(v Value) int {
 		return 2
 	case ValDecimal:
 		return 3
-	default: // ValText
+	case ValText:
 		return 4
+	default: // ValBytea
+		return 5
 	}
 }
 
@@ -1541,7 +1608,21 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 		if colTy.IsText() {
 			return TextValue(v.Str), nil
 		}
+		if colTy.IsBytea() {
+			// A string literal adapts to a bytea column, decoding the hex input form
+			// (types.md §6/§13); malformed hex traps 22P02.
+			b, err := decodeByteaLiteral(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return ByteaValue(b), nil
+		}
 		return Value{}, typeError("cannot store a text value in " + colTy.CanonicalName() + " column " + colName)
+	case ValBytea:
+		if colTy.IsBytea() {
+			return v, nil
+		}
+		return Value{}, typeError("cannot store a bytea value in " + colTy.CanonicalName() + " column " + colName)
 	default: // ValBool
 		if colTy.IsBool() {
 			return BoolValue(v.Bool), nil

@@ -1,8 +1,11 @@
 package jed
 
-import "strconv"
+import (
+	"encoding/hex"
+	"strconv"
+)
 
-// ValueKind tags a runtime value: NULL, an integer, or a boolean.
+// ValueKind tags a runtime value: NULL, an integer, a boolean, text, decimal, or bytea.
 type ValueKind int
 
 const (
@@ -16,6 +19,9 @@ const (
 	ValText
 	// ValDecimal is an exact decimal (spec/design/decimal.md); Dec holds the value.
 	ValDecimal
+	// ValBytea is a byte string (the bytea column type); Str holds its raw bytes (a Go
+	// string is an immutable byte sequence — any byte, incl 0x00; keeps Value ==-comparable).
+	ValBytea
 )
 
 // Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers
@@ -53,6 +59,49 @@ func TextValue(s string) Value { return Value{Kind: ValText, Str: s} }
 
 // DecimalValue builds a non-null decimal value.
 func DecimalValue(d Decimal) Value { return Value{Kind: ValDecimal, Dec: &d} }
+
+// ByteaValue builds a non-null bytea value from raw bytes (stored as a byte-holding string).
+func ByteaValue(b []byte) Value { return Value{Kind: ValBytea, Str: string(b)} }
+
+// ParseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
+// a `\x` prefix followed by an even count of hexadecimal digits (case-insensitive), each
+// pair one byte; `\x` alone is the empty byte string. The inverse of the bytea render form,
+// so a value round-trips. The traditional escape input format is not accepted (a documented
+// narrowing). On success the reason is ""; on malformed input the bytes are nil and the
+// reason explains why (the caller raises it as a 22P02).
+func ParseByteaHex(s string) (b []byte, reason string) {
+	if len(s) < 2 || s[0] != '\\' || s[1] != 'x' {
+		return nil, "bytea hex input must begin with \\x"
+	}
+	digits := s[2:]
+	if len(digits)%2 != 0 {
+		return nil, "bytea hex input has an odd number of digits"
+	}
+	out := make([]byte, len(digits)/2)
+	for i := 0; i < len(digits); i += 2 {
+		hi, okHi := hexVal(digits[i])
+		lo, okLo := hexVal(digits[i+1])
+		if !okHi || !okLo {
+			return nil, "invalid hexadecimal digit in bytea input"
+		}
+		out[i/2] = hi<<4 | lo
+	}
+	return out, ""
+}
+
+// hexVal returns one hex digit's value (0–15) and ok, or (0, false) if b is not [0-9a-fA-F].
+func hexVal(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
 
 // IsNull reports whether the value is SQL NULL.
 func (v Value) IsNull() bool { return v.Kind == ValNull }
@@ -96,6 +145,8 @@ func (v Value) Render() string {
 		// Decimal renders as its canonical base-10 string, preserving display scale
 		// (the D tag — spec/design/decimal.md §6).
 		return v.Dec.Render()
+	case ValBytea:
+		return "\\x" + hex.EncodeToString([]byte(v.Str))
 	default:
 		return strconv.FormatInt(v.Int, 10)
 	}
@@ -153,6 +204,9 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValBool || o.Kind == ValBool {
 		return bool3(v.Bool == o.Bool)
 	}
+	if v.Kind == ValBytea || o.Kind == ValBytea {
+		return bool3(v.Str == o.Str)
+	}
 	return Unknown
 }
 
@@ -171,6 +225,9 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValBool || o.Kind == ValBool {
 		return bool3(!v.Bool && o.Bool)
 	}
+	if v.Kind == ValBytea || o.Kind == ValBytea {
+		return bool3(v.Str < o.Str)
+	}
 	return Unknown
 }
 
@@ -188,6 +245,9 @@ func (v Value) Gt3(o Value) ThreeValued {
 	}
 	if v.Kind == ValBool || o.Kind == ValBool {
 		return bool3(v.Bool && !o.Bool)
+	}
+	if v.Kind == ValBytea || o.Kind == ValBytea {
+		return bool3(v.Str > o.Str)
 	}
 	return Unknown
 }

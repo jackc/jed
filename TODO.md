@@ -229,7 +229,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > The **real type system** is the product (§4) — PostgreSQL's behavior, stricter than its
 > typing, and nothing like SQLite's runtime affinity. Each item is a vertical slice that
 > forces a §8 divergence decision into the open (default: match PG — §1). `text` is done
-> (the collation §8 decision landed: PostgreSQL `C`); `decimal` is the next headline item.
+> (the collation §8 decision landed: PostgreSQL `C`) and `bytea` is done (unsigned byte order,
+> `\x`-hex literals); `decimal` is the next headline item.
 
 - [x] **Storable `boolean` column type** — done & committed across Rust/Go/TS. `boolean` was
       expression-only (Phase 1); it is now a *column* type: `CREATE TABLE t(flag boolean)`,
@@ -283,7 +284,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       1000-digit / scale-1000 cap once over-page values (overflow pages / TOAST) land (Phase 6).
 - [ ] **`timestamp` / `timestamptz`.** Forces a defined epoch, range, and tz model;
       determinism-sensitive (no wall-clock in tests). _(size: L; §4)_
-- [ ] **`bytea`.** Order-preserving encoding is straightforward (raw bytes). _(size: M; §4)_
+- [x] **`bytea`** — done & committed across Rust/Go/TS. A variable-width binary string (raw
+      bytes), compared by **unsigned byte order** (PostgreSQL's bytea comparison). Storage +
+      `\x`-hex literals + comparison/ordering (`= < > <= >=`, `IS [NOT] DISTINCT FROM`); on-disk
+      type code 7 with the same compact value codec as text (u16 len + raw bytes, no UTF-8
+      validation), byte-exact across cores (golden `bytea_table.jed`). Another comparison
+      operator **overload** (catalog.toml carries `bytea`-family rows). A bytea literal is a
+      single-quoted string that **adapts to a bytea context** (the integer-literal
+      context-adaptation rule of §6 extended to strings — `INSERT INTO t VALUES (1, '\xff')`,
+      `WHERE b = '\xab'`; no cast needed); **hex input only** (`\x` + even hex digits), malformed
+      hex traps **`22P02`** deterministically pre-scan; rendered `\x`+lowercase-hex. Unlike text
+      there is no UTF-16 ordering trap (bytea is raw bytes). _(was: M; §4/§8; spec/design/types.md
+      §13, encoding.md §2.6)_ **Deferred follow-ups:** bytea in a `PRIMARY KEY` / index (the
+      order-preserving `bytea-terminated-escape` key encoding is authored in `encoding.md §2.6`
+      but unexercised — bytea PK is rejected `0A000`); the traditional escape input format
+      (`\nnn`); bytea⇄other casts; binary functions (`length`, `||`, `substring`,
+      `encode`/`decode`, `get_byte`).
 - [ ] **`uuid`** — a fixed **16-byte** value (RFC 4122). Order-preserving key encoding is
       the raw 16 bytes (compared unsigned/bytewise); the canonical text form is the
       `8-4-4-4-12` **lowercase**-hex spelling (PostgreSQL accepts more input spellings —

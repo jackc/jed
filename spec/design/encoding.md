@@ -149,6 +149,45 @@ narrowing (decimal in a key / secondary index) adds `(value → bytes)` fixtures
 separate, simpler **value codec** (sign + scale + base-10⁴ groups, no order-preservation —
 [../fileformat/format.md](../fileformat/format.md)).
 
+### 2.6 Bytea — `bytea-terminated-escape` (authored; unexercised this slice)
+
+`bytea` is variable-width, so it needs the **same** order-preserving + self-delimiting rule as
+text (§2.4) — a plain length prefix sorts by length first, which is wrong. The rule is
+identical in structure; only step 1 differs, because bytea has no character encoding:
+
+1. The value's bytes are its **raw bytes** — no UTF-8, no collation, no transformation. Unsigned
+   `memcmp` of the raw bytes **is** the type's logical order (`bytea = "byte-ascending"`,
+   [types.md §13](types.md)), so the content bytes already sort correctly.
+2. **Escape** every `0x00` byte in the content to `0x00 0xFF`.
+3. **Terminate** the whole value with `0x00 0x01`.
+
+The order-preservation argument is exactly §2.4's (the terminator `0x00 0x01` sorts below any
+real continuation, so a value sorts before any value that extends it; the escape stops a literal
+`0x00` from masquerading as a terminator) — and it matters **more** for bytea than for text:
+raw `0x00` bytes are common in binary data and there is no UTF-8 validity constraint forbidding
+them, so the escape is routinely exercised rather than an edge case. Worked bytes (content as
+raw hex):
+
+| value | encoded key bytes |
+|---|---|
+| `\x` (empty) | `00 01` |
+| `\x61` | `61 00 01` |
+| `\x6161` | `61 61 00 01` |
+| `\x62` | `62 00 01` |
+| `\x6100ff62` (embedded NUL) | `61 00 FF FF 62 00 01` |
+
+`memcmp` yields `\x < \x61 < \x6161 < \x62`: the prefix case `\x61 < \x6161` works because
+`\x61`'s terminator byte `00` beats `\x6161`'s second content byte `61`; the length-prefix
+counterexample `\x6161 < \x62` works because content compares before any terminator
+(`61 < 62`). **Descending** and the **nullable** slot are the §2.3 / §2.2 rules unchanged
+(whole-component bitwise inversion; the `0x00` present / `0x01` NULL tag).
+
+**Status — authored, not yet exercised.** Exactly like text (§2.4): a bytea `PRIMARY KEY` is
+rejected `0A000` this slice ([types.md §13](types.md)), so no bytea key fixtures or executor
+key path exist yet. Stored bytea *values* use the compact length-prefixed **value codec** (raw
+bytes, no order-preservation needed — [../fileformat/format.md](../fileformat/format.md)).
+Lifting the narrowing adds the `(value → bytes)` fixtures and the executor path then.
+
 ## 3. Where this is used today
 
 The bare integer rule is exercised by every stored key. The on-disk **value codec**
@@ -158,10 +197,11 @@ irrelevant, but reusing one codec keeps key and value bytes consistent and is wh
 seam diverge cleanly if a future type ever needs distinct key/value forms. The text type is
 the first such divergence: text *values* are stored with a compact length-prefixed value codec
 (format.md), while the order-preserving text *key* rule (§2.4) is authored but unexercised —
-text is not yet allowed in a key. The remaining non-integer scalars (`decimal`, `bytea`, …)
-and composite keys will add their own §2 rules and fixtures when those features land; nullable
-*secondary indexes* — the first place §2.2's sort order becomes load-bearing rather than
-spec-only — follow then too.
+text is not yet allowed in a key. `bytea` (§2.5) is the same: raw-byte *values* stored via the
+compact value codec, the order-preserving *key* rule authored but unexercised. The remaining
+non-integer scalars (`decimal`, …) and composite keys will add their own §2 rules and fixtures
+when those features land; nullable *secondary indexes* — the first place §2.2's sort order
+becomes load-bearing rather than spec-only — follow then too.
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)
 

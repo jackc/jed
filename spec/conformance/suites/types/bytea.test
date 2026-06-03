@@ -1,0 +1,162 @@
+# Bytea scalar type (spec/design/types.md §12): storage, hex-input literals (\x...), equality,
+# ordering (UNSIGNED byte order = memcmp), and NULL. The empty byte string '\x' is a distinct,
+# non-NULL value. bytea is a NON-key column this slice — a bytea PRIMARY KEY is rejected 0A000.
+# A single-quoted literal adapts to a bytea context (§6); malformed hex traps 22P02. A literal
+# in a NON-bytea context is never decoded (it stays text). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.int32, types.text, types.bytea, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, b bytea)
+
+statement ok
+INSERT INTO t VALUES (1, '\xdeadbeef'), (2, '\x'), (3, '\x00'), (4, '\xff'), (5, NULL)
+
+# a bytea value renders as \x + LOWERCASE hex under the `T` tag (PostgreSQL bytea_output = hex)
+query T nosort
+SELECT b FROM t WHERE id = 1
+----
+\xdeadbeef
+
+# the empty byte string renders as the bare \x prefix
+query T nosort
+SELECT b FROM t WHERE id = 2
+----
+\x
+
+# equality on bytea: exact byte match
+query I nosort
+SELECT id FROM t WHERE b = '\xdeadbeef'
+----
+1
+
+# the hex INPUT is case-insensitive: uppercase digits decode to the same bytes, so they
+# match the value stored from the lowercase literal (and render lowercase, above)
+query I nosort
+SELECT id FROM t WHERE b = '\xDEADBEEF'
+----
+1
+
+# the empty byte string '\x' is a distinct, non-NULL value: it matches '\x' (id 2) and is NOT
+# NULL, while NULL (id 5) is neither '\x' nor any value
+query I nosort
+SELECT id FROM t WHERE b = '\x'
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE b IS NULL
+----
+5
+
+query I nosort
+SELECT id FROM t WHERE b IS NOT NULL ORDER BY id
+----
+1
+2
+3
+4
+
+# = NULL is UNKNOWN, never a match (three-valued logic), for bytea as for integers/text
+query I nosort
+SELECT id FROM t WHERE b = NULL
+----
+
+# IS [NOT] DISTINCT FROM: NULL-safe equality on bytea — NULL is a comparable value here
+query I nosort
+SELECT id FROM t WHERE b IS NOT DISTINCT FROM NULL
+----
+5
+
+query I nosort
+SELECT id FROM t WHERE b IS DISTINCT FROM '\xdeadbeef' ORDER BY id
+----
+2
+3
+4
+5
+
+# bytea vs a non-bytea operand is NOT comparable: a 42804 type error (like text = int)
+statement error 42804
+SELECT id FROM t WHERE b = 1
+
+# an integer literal into a bytea column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES (6, 123)
+
+# a string literal into an integer column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES ('seven', '\x00')
+
+# malformed hex in a bytea context traps 22P02, deterministically and before any scan:
+# an odd number of digits ...
+statement error 22P02
+INSERT INTO t VALUES (7, '\xabc')
+
+# ... a non-hex character ...
+statement error 22P02
+INSERT INTO t VALUES (8, '\xzz')
+
+# ... missing the \x prefix (the traditional escape format is not accepted this slice) ...
+statement error 22P02
+INSERT INTO t VALUES (9, 'deadbeef')
+
+# ... and a comparison literal traps the same way (pre-scan)
+statement error 22P02
+SELECT id FROM t WHERE b = '\xgg'
+
+# a string literal with NO bytea context stays text and is never decoded: '\xzz' compared with
+# a text column is the ordinary 4-character text value \xzz, NOT a 22P02 (and here it matches).
+statement ok
+CREATE TABLE txt (id int32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO txt VALUES (1, '\xzz')
+
+query I nosort
+SELECT id FROM txt WHERE s = '\xzz'
+----
+1
+
+# bytea in a PRIMARY KEY is rejected this slice (documented narrowing): 0A000
+statement error 0A000
+CREATE TABLE bad (k bytea PRIMARY KEY)
+
+# --- ordering: UNSIGNED byte order, the prefix/length case, embedded 0x00, and cost --------
+statement ok
+CREATE TABLE w (id int32 PRIMARY KEY, b bytea)
+
+statement ok
+INSERT INTO w VALUES (1, '\x62'), (2, '\x6161'), (3, '\x6162'), (4, '\x61'), (5, '\x00'), (6, '\xff')
+
+# unsigned byte order including the prefix/length case (\x61 < \x6161 < \x6162 < \x62 — a
+# shorter value that is a prefix of a longer one sorts first, the length-prefix counterexample)
+# and that a 0x00 byte sorts first while 0xff sorts last. Expected ascending b:
+# \x00, \x61, \x6161, \x6162, \x62, \xff → ids 5, 4, 2, 3, 1, 6.
+query T nosort
+SELECT b FROM w ORDER BY b
+----
+\x00
+\x61
+\x6161
+\x6162
+\x62
+\xff
+
+# ordering predicate on bytea (unsigned byte order): b < '\x62'. \x00, \x61, \x6161, \x6162 are
+# all < \x62, but \x62 is not < itself and \xff > \x62. → ids 2, 3, 4, 5.
+query I nosort
+SELECT id FROM w WHERE b < '\x62' ORDER BY id
+----
+2
+3
+4
+5
+
+# deterministic, cross-core cost: a bytea comparison is ONE operator_eval (weight 1), like an
+# integer/text comparison — independent of byte-string length. 6 scanned + 6 filter (one `=`
+# per row) + 1 produced + 0 projection (bare column) = 13.
+# cost: 13
+query I nosort
+SELECT id FROM w WHERE b = '\x61'
+----
+4

@@ -20,7 +20,10 @@ export type Value =
   | { kind: "text"; text: string }
   // An exact base-10 decimal (spec/design/decimal.md). Value-equality is scale-insensitive
   // (1.5 == 1.50) and goes through eq3/cmpValue / the DISTINCT value-canonical key.
-  | { kind: "decimal"; dec: Decimal };
+  | { kind: "decimal"; dec: Decimal }
+  // A raw byte string (the bytea column type); compares by UNSIGNED byte order (§13). It
+  // holds a Uint8Array — already raw bytes, so unlike text there is NO UTF-16 trap here.
+  | { kind: "bytea"; bytes: Uint8Array };
 
 // intValue builds a non-null integer value.
 export function intValue(n: bigint): Value {
@@ -45,6 +48,71 @@ export function textValue(s: string): Value {
 // decimalValue builds a non-null decimal value.
 export function decimalValue(d: Decimal): Value {
   return { kind: "decimal", dec: d };
+}
+
+// byteaValue builds a non-null bytea value from raw bytes.
+export function byteaValue(b: Uint8Array): Value {
+  return { kind: "bytea", bytes: b };
+}
+
+// compareBytea compares two byte strings by UNSIGNED byte order (Uint8Array elements are
+// 0–255, so a direct element comparison is unsigned). Returns <0, 0, >0. No encoding step,
+// so the UTF-16 trap that complicates text (compareTextC) does not apply. A shorter value
+// that is a prefix of a longer one sorts first.
+export function compareBytea(a: Uint8Array, b: Uint8Array): number {
+  const n = a.length < b.length ? a.length : b.length;
+  for (let i = 0; i < n; i++) {
+    if (a[i] !== b[i]) return a[i]! < b[i]! ? -1 : 1;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
+const HEX_DIGITS = "0123456789abcdef";
+
+// renderByteaHex renders raw bytes as PostgreSQL's hex output form: a `\x` prefix followed
+// by the LOWERCASE hex of each byte. The empty value renders as the bare prefix `\x`. The
+// spelling must be byte-identical across cores (CLAUDE.md §8).
+export function renderByteaHex(bytes: Uint8Array): string {
+  let s = "\\x";
+  for (let i = 0; i < bytes.length; i++) {
+    const byte = bytes[i]!;
+    s += HEX_DIGITS[byte >> 4]! + HEX_DIGITS[byte & 0xf]!;
+  }
+  return s;
+}
+
+// parseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
+// a `\x` prefix followed by an even count of hexadecimal digits (case-insensitive), each
+// pair one byte; `\x` alone is the empty byte string. The inverse of renderByteaHex, so a
+// value round-trips. The traditional escape input format is not accepted (a documented
+// narrowing). Returns the bytes on success, or { error } describing malformed input (the
+// caller raises it as a 22P02).
+export function parseByteaHex(s: string): { bytes: Uint8Array } | { error: string } {
+  if (s.length < 2 || s[0] !== "\\" || s[1] !== "x") {
+    return { error: "bytea hex input must begin with \\x" };
+  }
+  const digits = s.slice(2);
+  if (digits.length % 2 !== 0) {
+    return { error: "bytea hex input has an odd number of digits" };
+  }
+  const out = new Uint8Array(digits.length / 2);
+  for (let i = 0; i < digits.length; i += 2) {
+    const hi = hexVal(digits.charCodeAt(i));
+    const lo = hexVal(digits.charCodeAt(i + 1));
+    if (hi < 0 || lo < 0) {
+      return { error: "invalid hexadecimal digit in bytea input" };
+    }
+    out[i / 2] = (hi << 4) | lo;
+  }
+  return { bytes: out };
+}
+
+// hexVal returns one hex digit's value (0–15) from its char code, or -1 if not [0-9a-fA-F].
+function hexVal(c: number): number {
+  if (c >= 48 && c <= 57) return c - 48; // 0-9
+  if (c >= 97 && c <= 102) return c - 97 + 10; // a-f
+  if (c >= 65 && c <= 70) return c - 65 + 10; // A-F
+  return -1;
 }
 
 // numericCmp compares two numeric values by value, promoting an integer operand to decimal
@@ -108,6 +176,8 @@ export function render(v: Value): string {
       // Decimal renders as its canonical base-10 string, preserving display scale
       // (the D tag — spec/design/decimal.md §6).
       return v.dec.render();
+    case "bytea":
+      return renderByteaHex(v.bytes);
     default:
       return v.int.toString();
   }
@@ -124,6 +194,7 @@ export function eq3(a: Value, b: Value): ThreeValued {
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c === 0);
   if (a.kind === "text" && b.kind === "text") return bool3(a.text === b.text);
+  if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) === 0);
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value === b.value);
   return "unknown";
 }
@@ -135,6 +206,7 @@ export function lt3(a: Value, b: Value): ThreeValued {
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c < 0);
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) < 0);
+  if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) < 0);
   if (a.kind === "bool" && b.kind === "bool") return bool3(!a.value && b.value);
   return "unknown";
 }
@@ -146,6 +218,7 @@ export function gt3(a: Value, b: Value): ThreeValued {
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c > 0);
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) > 0);
+  if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) > 0);
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value && !b.value);
   return "unknown";
 }

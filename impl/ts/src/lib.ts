@@ -59,6 +59,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // slice (decimal PRIMARY KEY → 0A000).
   "types.decimal",
   "expr.decimal_arithmetic",
+  // bytea scalar type (variable-width raw bytes): storage, hex-input literals, and
+  // unsigned-byte comparison/ordering. Non-key column only this slice (bytea PK → 0A000).
+  "types.bytea",
   // General expression substrate — integer arithmetic, the boolean type, and the
   // AND/OR/NOT Kleene connectives (the `expression` profile).
   "types.boolean",

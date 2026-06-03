@@ -3,20 +3,22 @@
 //! An integer value is held as an `i64` regardless of its declared column type (the
 //! type governs range checks and key-encoding width, not the representation); a `text`
 //! value holds its UTF-8 `String`; a `decimal` value holds an exact `Decimal`
-//! (spec/design/decimal.md). Because `Text`/`Decimal` own heap data, `Value` is `Clone`,
-//! not `Copy` — the comparison/render helpers borrow (`&self`, `&Value`) rather than
-//! consume, and the executor clones a value only when reading it out of a stored row.
+//! (spec/design/decimal.md); a `bytea` value holds its raw `Vec<u8>`. Because
+//! `Text`/`Decimal`/`Bytea` own heap data, `Value` is `Clone`, not `Copy` — the
+//! comparison/render helpers borrow (`&self`, `&Value`) rather than consume, and the
+//! executor clones a value only when reading it out of a stored row.
 
 use crate::decimal::Decimal;
 
-/// A runtime value: SQL NULL, an integer, a boolean, or a text string.
+/// A runtime value: SQL NULL, an integer, a boolean, a text string, a decimal, or a byte string.
 ///
 /// A `Bool` value is produced by comparisons and logical connectives, can be
 /// projected/rendered, and — now that boolean is storable (spec/design/types.md §9) —
 /// is stored in a boolean column. A NULL boolean (unknown) is represented as
 /// `Value::Null`, so `{Bool(true), Bool(false), Null}` is the three-valued domain;
 /// booleans compare by value, false < true. `Text` is a stored non-integer value; it
-/// compares by the `C` collation (UTF-8 byte / code-point order — types.md §11).
+/// compares by the `C` collation (UTF-8 byte / code-point order — types.md §11). `Bytea`
+/// is a raw byte string; it compares by unsigned byte order (types.md §13).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Value {
     Null,
@@ -27,6 +29,8 @@ pub enum Value {
     /// **value-canonical** (`1.5 == 1.50`), so DISTINCT/GROUP BY over decimals compare by
     /// value while `render` still preserves the display scale.
     Decimal(Decimal),
+    /// A raw byte string (the bytea column type); compares by unsigned byte order (types.md §13).
+    Bytea(Vec<u8>),
 }
 
 /// Compare two numeric values by value, promoting an integer operand to decimal when its
@@ -85,6 +89,8 @@ impl Value {
             // Decimal renders as its canonical base-10 string, preserving display scale
             // (the `D` tag — spec/design/decimal.md §6).
             Value::Decimal(d) => d.render(),
+            // Bytea renders as `\x` + lowercase hex (PG `bytea_output = hex`; empty → `\x`).
+            Value::Bytea(b) => render_bytea_hex(b),
         }
     }
 
@@ -108,6 +114,7 @@ impl Value {
         match (self, other) {
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() == b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a == b),
+            (Value::Bytea(a), Value::Bytea(b)) => bool3(a == b),
             _ => ThreeValued::Unknown,
         }
     }
@@ -121,6 +128,7 @@ impl Value {
         match (self, other) {
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() < b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a < b),
+            (Value::Bytea(a), Value::Bytea(b)) => bool3(a < b),
             _ => ThreeValued::Unknown,
         }
     }
@@ -134,6 +142,7 @@ impl Value {
         match (self, other) {
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() > b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a > b),
+            (Value::Bytea(a), Value::Bytea(b)) => bool3(a > b),
             _ => ThreeValued::Unknown,
         }
     }
@@ -159,6 +168,56 @@ fn bool3(b: bool) -> ThreeValued {
         ThreeValued::True
     } else {
         ThreeValued::False
+    }
+}
+
+/// Render a bytea value as PostgreSQL's hex output form: a `\x` prefix followed by the
+/// lowercase hex of each byte (two digits per byte). The empty byte string renders as the
+/// bare prefix `\x`. The spelling must be byte-identical across cores (CLAUDE.md §8), so
+/// the case (lowercase) and prefix are fixed here.
+fn render_bytea_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(2 + bytes.len() * 2);
+    s.push_str("\\x");
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Decode a bytea literal from its hex input form (spec/design/types.md §13): a `\x`
+/// prefix followed by an even count of hexadecimal digits (case-insensitive), each pair
+/// one byte; `\x` alone is the empty byte string. This is the inverse of
+/// `render_bytea_hex`, so a value round-trips. The traditional escape input format is not
+/// accepted (a documented narrowing). On malformed input returns the reason string; the
+/// caller raises it as a `22P02` (invalid_text_representation). Used when a single-quoted
+/// literal adapts to a bytea context (the executor), never at parse time.
+pub fn parse_bytea_hex(s: &str) -> Result<Vec<u8>, &'static str> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'\\' || bytes[1] != b'x' {
+        return Err("bytea hex input must begin with \\x");
+    }
+    let hex = &bytes[2..];
+    if hex.len() % 2 != 0 {
+        return Err("bytea hex input has an odd number of digits");
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut i = 0;
+    while i < hex.len() {
+        let hi = hex_val(hex[i]).ok_or("invalid hexadecimal digit in bytea input")?;
+        let lo = hex_val(hex[i + 1]).ok_or("invalid hexadecimal digit in bytea input")?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+/// One hex digit's value (0–15), or None if `b` is not `[0-9a-fA-F]`.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 

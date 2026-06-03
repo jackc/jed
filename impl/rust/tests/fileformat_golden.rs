@@ -108,6 +108,22 @@ fn decimal_table_db() -> Database {
     db
 }
 
+/// A table with a bytea column — exercises the value codec's bytea branch (u16 length + raw
+/// bytes): a multi-byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high
+/// byte (0xFF), a NULL, and a lone 0x00. The PK stays int32 (no bytea key this slice).
+/// Literals are the `\x` hex input form, adapting to the bytea column (types.md §6).
+fn bytea_table_db() -> Database {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, b bytea)");
+    run(&mut db, "INSERT INTO t VALUES (1, '\\xdeadbeef')");
+    run(&mut db, "INSERT INTO t VALUES (2, '\\x')");
+    run(&mut db, "INSERT INTO t VALUES (3, '\\x000102')");
+    run(&mut db, "INSERT INTO t VALUES (4, '\\xff')");
+    run(&mut db, "INSERT INTO t VALUES (5, NULL)");
+    run(&mut db, "INSERT INTO t VALUES (6, '\\x00')");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -118,6 +134,7 @@ fn write_matches_goldens() {
         ("text_table.jed", text_table_db),
         ("bool_table.jed", bool_table_db),
         ("decimal_table.jed", decimal_table_db),
+        ("bytea_table.jed", bytea_table_db),
         ("nopk_table.jed", nopk_table_db),
     ];
     for (name, build) in cases {
@@ -136,6 +153,7 @@ fn read_goldens_reproduces_rows() {
         ("text_table.jed", text_table_db, "t"),
         ("bool_table.jed", bool_table_db, "t"),
         ("decimal_table.jed", decimal_table_db, "t"),
+        ("bytea_table.jed", bytea_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),

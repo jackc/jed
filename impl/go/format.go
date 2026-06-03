@@ -43,6 +43,8 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 5
 	case DecimalType:
 		return 6
+	case Bytea:
+		return 7
 	default:
 		return 0
 	}
@@ -63,6 +65,8 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return Bool, true
 	case 6:
 		return DecimalType, true
+	case 7:
+		return Bytea, true
 	default:
 		return 0, false
 	}
@@ -95,7 +99,9 @@ func encodeValue(ty ScalarType, v Value) []byte {
 	switch v.Kind {
 	case ValNull:
 		return EncodeNullable(ty, nil)
-	case ValText:
+	case ValText, ValBytea:
+		// text (UTF-8) and bytea (raw bytes) share the compact length-prefixed body; both
+		// hold their bytes in Str, so the on-disk form is identical.
 		out := make([]byte, 0, 3+len(v.Str))
 		out = append(out, 0x00) // present
 		out = appendU16(out, uint16(len(v.Str)))
@@ -613,6 +619,18 @@ func readValue(ty ScalarType, buf []byte, pos *int) (Value, error) {
 				groups[i] = g
 			}
 			return DecimalValue(DecimalFromCodec(flags&1 != 0, uint32(scale), groups)), nil
+		}
+		if ty.IsBytea() {
+			n, err := readU16(buf, pos)
+			if err != nil {
+				return Value{}, err
+			}
+			bb, err := take(buf, pos, int(n))
+			if err != nil {
+				return Value{}, err
+			}
+			// ByteaValue copies the bytes into a string, so the value owns its content.
+			return ByteaValue(bb), nil
 		}
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {

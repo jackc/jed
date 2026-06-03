@@ -12,9 +12,10 @@ system — "like SQLite, but with a real type system." It is designed as data, b
 executor, so that every implementation tests against one shared contract instead of
 discovering semantics in code.
 
-## 1. Scope: signed integers + text + boolean (all storable)
+## 1. Scope: signed integers + text + boolean + decimal + bytea (all storable)
 
-The storable scalar types are three signed integers (CLAUDE.md §4) plus `text` and `boolean`:
+The storable scalar types are three signed integers (CLAUDE.md §4) plus `text`, `boolean`,
+`decimal`, and `bytea`:
 
 | Canonical id | Aliases | Bits | Range |
 |---|---|---|---|
@@ -23,6 +24,8 @@ The storable scalar types are three signed integers (CLAUDE.md §4) plus `text` 
 | `int64` | `bigint` | 64 | −9223372036854775808 … 9223372036854775807 |
 | `text` | `varchar`, `character varying`, `string` | — | variable-width UTF-8 (collation `C`) |
 | `boolean` | `bool` | — | `{false, true}`, ordered false `<` true |
+| `decimal` | `numeric`, `dec` | — | exact base-10 (`numeric(p,s)`, `1≤p≤1000`, `0≤s≤p`) |
+| `bytea` | — | — | variable-width raw bytes (unsigned byte order) |
 
 The integers are signed, two's-complement. **`text`** is the first storable non-integer
 scalar — a variable-width UTF-8 string with one defined collation, `C` (byte / code-point
@@ -36,13 +39,15 @@ boolean⇄integer casts) are deferred `0A000` (§9, §10). **`decimal`** (aliase
 is the third storable non-integer scalar — an exact base-10 numeric (§12,
 [decimal.md](decimal.md)); its landing **binds the decimal-rounding decision** of CLAUDE.md §8
 (settled: round **half away from zero**) and keeps binary floats out of the compare/text paths
-entirely. The remaining scalars (`timestamp`/`timestamptz`, `bytea`, `json`/`jsonb`, and any
-`float`) are still **deferred**, so the float-formatting and NaN/∞ decisions in CLAUDE.md §8
-still do **not** bind — there are no floats (decimal is finite and exact, never NaN/∞ — §12).
-The **collation** decision (§8) is settled in §11: one collation, `C`. Boolean, text, and
-decimal each add real divergence-prone behavior (a render form beyond `I`, three-valued Kleene
-connectives — §10; UTF-8 vs. UTF-16 ordering — §11; exact base-10 arithmetic + display-scale —
-§12) on the smallest possible surfaces.
+entirely. **`bytea`** (§13) is the fourth storable non-integer scalar — a variable-width binary
+string (raw bytes), compared by unsigned byte order. The remaining scalars
+(`timestamp`/`timestamptz`, `json`/`jsonb`, and any `float`) are still **deferred**, so the
+float-formatting and NaN/∞ decisions in CLAUDE.md §8 still do **not** bind — there are no floats
+(decimal is finite and exact, never NaN/∞ — §12). The **collation** decision (§8) is settled in
+§11: one collation, `C`. Boolean, text, decimal, and bytea each add real divergence-prone
+behavior (a render form beyond `I`, three-valued Kleene connectives — §10; UTF-8 vs. UTF-16
+ordering — §11; exact base-10 arithmetic + display-scale — §12; and a hex literal/render form —
+§13) on the smallest possible surfaces.
 
 ## 2. Canonical names vs. aliases
 
@@ -194,6 +199,22 @@ matrix (§5: adaptation is a value-checked coercion, never a silent reinterpret)
 promotion tower (§4: once typed, a literal participates like any value), and trap-on-overflow
 (§3).
 
+**String literals adapt to a `bytea` context (the same principle).** A single-quoted literal
+is a `text` value by default (it has the one collation `C`; unlike an integer literal it has no
+width to choose among — §11). But once `bytea` exists (§13) a *string* literal, like an integer
+literal, has a context it can adapt to: in a **bytea** context — `INSERT`/`UPDATE` into a bytea
+column, or a comparison against a bytea column (`WHERE b = '\xab'`) — the string literal is
+read as a **bytea** value via the bytea hex input form (`\x` + an even count of hex digits),
+exactly as PostgreSQL applies bytea's input function to a string constant in a bytea context.
+This is the only context a string literal adapts to; with no bytea context it stays `text`. An
+ill-formed hex literal in a bytea context (no `\x` prefix, odd digit count, a non-hex
+character) is a **`22P02`** (`invalid_text_representation`) raised **deterministically at
+resolve time, before any row is scanned** — the precise analogue of the `22003` an out-of-range
+integer literal raises in a comparison context. A string literal in a *non-bytea* context is
+never decoded, so `'\xZZ'` compared with a `text` column is the ordinary 4-character text value
+`\xZZ`, never a `22P02`. The decode is a value-checked coercion at resolve time, never a silent
+reinterpretation — the same discipline as the integer rule above.
+
 ## 7. Order-preserving key encoding
 
 See [../encoding/](../encoding/); the per-type rule is the `encoding` field in
@@ -307,6 +328,9 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   (`0A000`; the order-preserving encoding is authored, [encoding.md](encoding.md) §2.5),
   scientific `e`-notation literals, negative/over-precision scale typmods, and raising the
   1000-digit cap once over-page values land.
+- **`bytea`** — ✅ landed as the fourth storable non-integer scalar — variable-width raw bytes,
+  unsigned byte-order comparison (§13). Its deferred sub-features (the traditional escape input
+  format, bytea⇄other casts, binary functions, and bytea in keys) are enumerated in §13.
 - **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4. Includes
   **`uuid`** (a fixed 16-byte value; bytewise comparison, raw-16-byte order-preserving key
   encoding, canonical `8-4-4-4-12` lowercase-hex text form — match PostgreSQL's canonical
@@ -403,7 +427,73 @@ it settles.
 - **Casts (stricter than PG).** `int → decimal` is implicit (lossless); `decimal → int` is
   **explicit CAST only** (rounds half-away, traps `22003`) — jed forbids the silent decimal→int
   narrowing PG allows, consistent with the strict matrix (§5, [../types/casts.toml](../types/casts.toml)).
-- **Storage.** On-disk value codec, type code 5 ([../fileformat/format.md](../fileformat/format.md));
+- **Storage.** On-disk value codec, type code 6 ([../fileformat/format.md](../fileformat/format.md));
   rendered under the new **`D`** conformance tag. A decimal **key** (`PRIMARY KEY`/index) is
   rejected `0A000` this slice — the order-preserving rule is authored in
   [encoding.md](encoding.md) §2.5 but unexercised, the text-PK precedent.
+
+## 13. The bytea type
+
+`bytea` (no aliases) is a **variable-width binary string** — a sequence of raw bytes — and the
+fourth storable non-integer scalar. It is *not* text: it carries no collation and no character
+encoding, and a value may contain any byte, including embedded `0x00`. The empty byte string is
+a distinct, non-NULL value (a zero-length string), separate from `NULL`. This is PostgreSQL's
+`bytea`, borrowed because §1 makes PG the default and binary data is a common storable need that
+the strict type system should model explicitly rather than smuggle through `text`.
+
+**Comparison and ordering: unsigned byte order (`memcmp`).** Two bytea values compare by their
+raw bytes, lexicographically, as **unsigned** bytes — exactly PostgreSQL's `bytea` comparison.
+A shorter byte string that is a prefix of a longer one sorts first (`\x61 < \x6161 < \x62`).
+`bytea` is its own comparison family: `bytea` vs `text` and `bytea` vs an integer are **not**
+comparable — each is a `42804` type error (compare.toml lists only `bytea × bytea`), exactly as
+`text` is not comparable with an integer. The ordering operators (`= < > <= >=`) and the
+NULL-safe `IS [NOT] DISTINCT FROM` are another of the catalog's comparison operator overloads,
+alongside integer, text, boolean, and decimal (catalog.toml).
+
+**Cross-core determinism — simpler than text.** The text type's load-bearing trap is that
+JavaScript compares strings by UTF-16 code units, which disagrees with UTF-8 byte order above
+U+FFFF (§11), so the TS core must compare encoded bytes. `bytea` has no such trap: it **is** raw
+bytes in every core (Rust `Vec<u8>`, Go `[]byte`, TS `Uint8Array`), and a byte-wise unsigned
+`memcmp` is natively identical across all three. There are no code points and no encoding to get
+wrong.
+
+**Literals: a string in a bytea context, hex input only.** There is no distinct bytea literal
+token; a bytea value is written as a single-quoted string literal that **adapts to a bytea
+context** (§6) — `INSERT INTO t VALUES (1, '\xdeadbeef')`, `UPDATE t SET b = '\xff'`, and
+`WHERE b = '\xab'`. The string is decoded via the **hex input form**: a literal `\x` followed
+by an **even** count of hexadecimal digits (case-insensitive), each pair one byte; `'\x'` alone
+is the empty byte string. This matches PostgreSQL's hex input and, by being the same form as the
+render output (below), round-trips exactly. An ill-formed hex literal in a bytea context (no
+`\x` prefix, an odd digit count, or a non-hex character) traps **`22P02`**
+(`invalid_text_representation`) deterministically at resolve time, before any row is scanned
+(§6). An integer or boolean literal in a bytea context, and a string literal into a non-bytea
+column, are `42804` type errors, as for text.
+
+**Rendering: lowercase hex.** A bytea value renders in the conformance corpus as `\x` followed
+by the **lowercase** hex of its bytes (the empty value renders as exactly `\x`) — PostgreSQL's
+default `bytea_output = hex`. This reuses the `T` render tag (the tag is a *rendering* tag, not a
+type assertion — conformance.md §1; a bytea renders as a printable ASCII hex string). Every core
+must emit the identical lowercase spelling, or the corpus diverges (a CLAUDE.md §8 decision, like
+the boolean `true`/`false` spelling).
+
+**On-disk.** Stable type code `7` (format.md). The stored value uses the same compact value
+codec as text — a presence tag, then a `u16` big-endian byte-length followed by that many **raw**
+bytes (no UTF-8 validation, the one difference from text's branch) — because a stored value never
+needs to sort. The empty value is the tag plus a zero length. A value longer than `0xFFFF` bytes,
+like an oversized text value, trips the whole-image oversized-item `0A000` narrowing.
+
+**Deferred bytea sub-features** (relaxable narrowings, each its own follow-up):
+
+- **bytea in a key / `PRIMARY KEY`** — rejected `0A000` this slice, exactly matching the text-PK
+  narrowing (§11). The order-preserving key rule (`bytea-terminated-escape`) is authored
+  (encoding.md §2.6) and the executor path + byte fixtures land when lifted.
+- **The traditional escape input format** (`\047`, `\\`, literal printable bytes) — not accepted;
+  the hex form `\x…` is the only input this slice. A deliberate, documented divergence from PG
+  (which also accepts the escape format on input), justified by determinism and a smaller surface;
+  the hex form is the modern canonical spelling and matches the render output.
+- **bytea ⇄ other casts** (§5) and **binary functions** (`length`, `||`, `substring`,
+  `encode`/`decode`, `get_byte`/`set_byte`, …) — separate slices; this slice is comparison +
+  storage only (`= < > <= >=`, `IS [NOT] DISTINCT FROM`).
+
+**Practical size note.** As for text (§11), a single stored bytea value (or row) larger than one
+page trips the whole-image `0A000` oversized-item narrowing until overflow pages land.

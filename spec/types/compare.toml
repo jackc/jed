@@ -39,6 +39,12 @@ strategy = "none"
 family = "decimal"
 strategy = "none"
 
+# bytea, like text, has a single type with no promotion tower (strategy = "none"):
+# two bytea operands compare directly by unsigned byte order, no reconciliation.
+[[promotion]]
+family = "bytea"
+strategy = "none"
+
 # --- comparability -----------------------------------------------------------
 # Which (family, family) pairs may be compared at all. Anything not listed is a
 # type error. Step 1 has exactly one family, so there is one rule. Cross-family
@@ -89,6 +95,14 @@ left_family = "decimal"
 right_family = "integer"
 via = "promote-to-decimal"
 
+# bytea × bytea only. via = "none": compare by unsigned byte order (memcmp over the
+# raw bytes). bytea × text and bytea × integer are NOT listed, so they are 42804 type
+# errors (bytea is its own family — bytes are not text).
+[[comparable]]
+left_family = "bytea"
+right_family = "bytea"
+via = "none"
+
 # --- value ordering ----------------------------------------------------------
 # The total order over non-NULL integers used by ORDER BY and by index/key
 # iteration. Plain signed numeric order; matches the order-preserving key
@@ -110,6 +124,12 @@ boolean = "false-before-true"
 # "decimal-order-preserving") reproduces this in raw bytes — authored but unexercised
 # this slice (decimal is not yet a key; ../design/encoding.md §2.5).
 decimal = "numeric-ascending"
+# bytea orders by unsigned byte order: the raw bytes compared lexicographically
+# (memcmp), exactly PostgreSQL's bytea comparison. A shorter byte string that is a
+# prefix of a longer one sorts first (\x61 < \x6161 < \x62). The order-preserving
+# key encoding (scalars.toml "bytea-terminated-escape") reproduces this order in raw
+# bytes, so stored byte order == logical order.
+bytea = "byte-ascending"
 
 # NULL's position in the physical total order of encoded keys (index/key
 # iteration), RATIFIED with the key-encoding spec (CLAUDE.md §11 step 4) and

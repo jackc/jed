@@ -16,8 +16,8 @@ import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database } from "./executor.ts";
 import type { Row } from "./storage.ts";
-import { type DecimalTypmod, type ScalarType, isBool, isText, widthBytes } from "./types.ts";
-import { type Value, boolValue, decimalValue, intValue, nullValue, textValue } from "./value.ts";
+import { type DecimalTypmod, type ScalarType, isBool, isBytea, isText, widthBytes } from "./types.ts";
+import { type Value, boolValue, byteaValue, decimalValue, intValue, nullValue, textValue } from "./value.ts";
 
 const FORMAT_VERSION = 1; // on-disk format version
 const PAGE_HEADER = 12; // bytes of the catalog/data page header
@@ -44,6 +44,8 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 5;
     case "decimal":
       return 6;
+    case "bytea":
+      return 7;
   }
 }
 
@@ -62,6 +64,8 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "boolean";
     case 6:
       return "decimal";
+    case 7:
+      return "bytea";
     default:
       return undefined;
   }
@@ -99,6 +103,15 @@ function encodeValue(ty: ScalarType, v: Value): Uint8Array {
     out[1] = (bytes.length >>> 8) & 0xff;
     out[2] = bytes.length & 0xff;
     out.set(bytes, 3);
+    return out;
+  }
+  if (v.kind === "bytea") {
+    // Same compact length-prefixed body as text, but the raw bytes verbatim (no UTF-8).
+    const out = new Uint8Array(3 + v.bytes.length);
+    out[0] = 0x00; // present
+    out[1] = (v.bytes.length >>> 8) & 0xff;
+    out[2] = v.bytes.length & 0xff;
+    out.set(v.bytes, 3);
     return out;
   }
   if (v.kind === "bool") {
@@ -527,6 +540,11 @@ function readValue(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
       const groups: number[] = new Array(ndigits);
       for (let i = 0; i < ndigits; i++) groups[i] = readU16(buf, cur);
       return decimalValue(Decimal.fromCodec((flags & 1) !== 0, scale, groups));
+    }
+    if (isBytea(ty)) {
+      const n = readU16(buf, cur);
+      // .slice() copies out of the page buffer so the value owns its bytes (no UTF-8 check).
+      return byteaValue(take(buf, cur, n).slice());
     }
     return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
   }

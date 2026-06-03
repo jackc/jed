@@ -476,6 +476,98 @@ null           = "null_safe"
 precedence     = 35
 errors         = []
 
+# --- comparison operators (bytea) --------------------------------------------
+# The bytea-family OVERLOAD of the comparisons: the same operator names/symbols
+# (`=` < > <= >=, and IS [NOT] DISTINCT FROM) applied to bytea×bytea. arg_resolution
+# = "none" — one bytea type, no promotion (compare.toml). Operands compare by
+# UNSIGNED byte order (memcmp over the raw bytes — exactly PostgreSQL's bytea
+# comparison). bytea vs a non-bytea operand is not comparable (compare.toml lists
+# only bytea×bytea), so it is a 42804 type error. Same precedence (35) and NULL
+# discipline as the integer/text comparisons: propagating for the ordering/equality
+# ops, null_safe for IS [NOT] DISTINCT FROM. No failure is possible, so errors = [].
+
+[[operator]]
+name           = "eq"
+symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "lt"
+symbol         = "<"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "gt"
+symbol         = ">"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "le"
+symbol         = "<="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ge"
+symbol         = ">="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_not_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
 # --- null tests --------------------------------------------------------------
 # Unary null-detection over any nullable value of any type. Unlike comparisons
 # these never propagate: the result is ALWAYS a definite boolean, never unknown —

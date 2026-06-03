@@ -26,6 +26,9 @@ const (
 	// width and non-integer; the per-column typmod (precision/scale) lives on the Column, not
 	// here. (Named DecimalType, not Decimal, because Decimal is the value struct.)
 	DecimalType
+	// Bytea is a variable-width binary string (raw bytes), compared by unsigned byte
+	// order — spec/design/types.md §13.
+	Bytea
 )
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. Precision >= 1;
@@ -51,6 +54,8 @@ func (t ScalarType) CanonicalName() string {
 		return "boolean"
 	case DecimalType:
 		return "decimal"
+	case Bytea:
+		return "bytea"
 	default:
 		return "?"
 	}
@@ -74,6 +79,8 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return Bool, true
 	case "decimal", "numeric", "dec":
 		return DecimalType, true
+	case "bytea":
+		return Bytea, true
 	default:
 		return 0, false
 	}
@@ -87,6 +94,9 @@ func (t ScalarType) IsBool() bool { return t == Bool }
 
 // IsDecimal reports whether this is the exact decimal type.
 func (t ScalarType) IsDecimal() bool { return t == DecimalType }
+
+// IsBytea reports whether this is the variable-width bytea type (raw bytes).
+func (t ScalarType) IsBytea() bool { return t == Bytea }
 
 // IsInteger reports whether this is one of the fixed-width signed integer types.
 func (t ScalarType) IsInteger() bool { return t == Int16 || t == Int32 || t == Int64 }
@@ -156,5 +166,5 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType}
+	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea}
 }

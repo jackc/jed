@@ -17,6 +17,8 @@ const (
 	DivisionByZero
 	// InvalidParameterValue is 22023 — a bad numeric typmod (e.g. numeric(0)).
 	InvalidParameterValue
+	// InvalidTextRepresentation is 22P02 — malformed text input (e.g. bytea hex).
+	InvalidTextRepresentation
 	// InvalidRowCountInLimitClause is 2201W — a negative LIMIT count.
 	InvalidRowCountInLimitClause
 	// InvalidRowCountInOffsetClause is 2201X — a negative OFFSET count.
@@ -59,6 +61,8 @@ func (s SqlState) Code() string {
 		return "22012"
 	case InvalidParameterValue:
 		return "22023"
+	case InvalidTextRepresentation:
+		return "22P02"
 	case InvalidRowCountInLimitClause:
 		return "2201W"
 	case InvalidRowCountInOffsetClause:

@@ -91,6 +91,22 @@ function decimalTableDB(): Database {
   return db;
 }
 
+// byteaTableDB exercises the value codec's bytea branch (u16 length + raw bytes): a multi-
+// byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high byte (0xFF), a
+// NULL, and a lone 0x00. The PK stays int32 (no bytea key this slice). Literals are the `\x`
+// hex input form, adapting to the bytea column (spec/design/types.md §6).
+function byteaTableDB(): Database {
+  const db = new Database();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, b bytea)");
+  run(db, "INSERT INTO t VALUES (1, '\\xdeadbeef')");
+  run(db, "INSERT INTO t VALUES (2, '\\x')");
+  run(db, "INSERT INTO t VALUES (3, '\\x000102')");
+  run(db, "INSERT INTO t VALUES (4, '\\xff')");
+  run(db, "INSERT INTO t VALUES (5, NULL)");
+  run(db, "INSERT INTO t VALUES (6, '\\x00')");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -100,6 +116,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "text_table.jed", build: textTableDB },
     { name: "bool_table.jed", build: boolTableDB },
     { name: "decimal_table.jed", build: decimalTableDB },
+    { name: "bytea_table.jed", build: byteaTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
   ];
   for (const c of cases) {
@@ -121,6 +138,7 @@ test("read goldens reproduces rows", () => {
     { name: "text_table.jed", build: textTableDB, table: "t" },
     { name: "bool_table.jed", build: boolTableDB, table: "t" },
     { name: "decimal_table.jed", build: decimalTableDB, table: "t" },
+    { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },

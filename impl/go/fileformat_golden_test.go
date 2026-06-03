@@ -114,6 +114,22 @@ func decimalTableDB(t *testing.T) *Database {
 	return db
 }
 
+// byteaTableDB exercises the value codec's bytea branch (u16 length + raw bytes): a multi-
+// byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high byte (0xFF), a
+// NULL, and a lone 0x00. The PK stays int32 (no bytea key this slice). Literals are the `\x`
+// hex input form, adapting to the bytea column (spec/design/types.md §6).
+func byteaTableDB(t *testing.T) *Database {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, b bytea)")
+	run(t, db, `INSERT INTO t VALUES (1, '\xdeadbeef')`)
+	run(t, db, `INSERT INTO t VALUES (2, '\x')`)
+	run(t, db, `INSERT INTO t VALUES (3, '\x000102')`)
+	run(t, db, `INSERT INTO t VALUES (4, '\xff')`)
+	run(t, db, "INSERT INTO t VALUES (5, NULL)")
+	run(t, db, `INSERT INTO t VALUES (6, '\x00')`)
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -126,6 +142,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"text_table.jed", textTableDB},
 		{"bool_table.jed", boolTableDB},
 		{"decimal_table.jed", decimalTableDB},
+		{"bytea_table.jed", byteaTableDB},
 		{"nopk_table.jed", nopkTableDB},
 	}
 	for _, c := range cases {
@@ -152,6 +169,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"text_table.jed", textTableDB, "t"},
 		{"bool_table.jed", boolTableDB, "t"},
 		{"decimal_table.jed", decimalTableDB, "t"},
+		{"bytea_table.jed", byteaTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

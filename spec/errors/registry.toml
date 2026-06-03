@@ -49,6 +49,12 @@ name = "invalid_parameter_value"
 class = "data exception"
 template = "invalid parameter value: {detail}"
 
+[[error]]
+code = "22P02"
+name = "invalid_text_representation"
+class = "data exception"
+template = "invalid input syntax for type {type}: {detail}"
+
 # --- integrity constraint violation (class 23) ------------------------------
 [[error]]
 code = "23502"

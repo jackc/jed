@@ -7,7 +7,7 @@
 // exceeds JS's safe-integer range, so every integer flows through bigint — uniform,
 // exact at all widths).
 
-export type ScalarType = "int16" | "int32" | "int64" | "text" | "boolean" | "decimal";
+export type ScalarType = "int16" | "int32" | "int64" | "text" | "boolean" | "decimal" | "bytea";
 
 export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "int16",
@@ -16,6 +16,7 @@ export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "text",
   "boolean",
   "decimal",
+  "bytea",
 ];
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. precision >= 1;
@@ -40,6 +41,12 @@ export function isBool(t: ScalarType): boolean {
 // isDecimal reports whether this is the exact decimal type.
 export function isDecimal(t: ScalarType): boolean {
   return t === "decimal";
+}
+
+// isBytea reports whether this is the variable-width bytea type (raw bytes), compared by
+// unsigned byte order — spec/design/types.md §13.
+export function isBytea(t: ScalarType): boolean {
+  return t === "bytea";
 }
 
 // isInteger reports whether this is one of the fixed-width signed integer types.
@@ -81,6 +88,8 @@ export function scalarTypeFromName(name: string): ScalarType | undefined {
     case "numeric":
     case "dec":
       return "decimal";
+    case "bytea":
+      return "bytea";
     default:
       return undefined;
   }
@@ -103,6 +112,8 @@ export function widthBytes(t: ScalarType): number {
       throw new Error("boolean uses the bool-byte codec; widthBytes is integer-only");
     case "decimal":
       throw new Error("decimal is variable-width; widthBytes is integer-only");
+    case "bytea":
+      throw new Error("bytea is variable-width; widthBytes is integer-only");
   }
 }
 
@@ -121,6 +132,8 @@ export function minOf(t: ScalarType): bigint {
       throw new Error("boolean has no integer range");
     case "decimal":
       throw new Error("decimal has no integer range");
+    case "bytea":
+      throw new Error("bytea has no integer range");
   }
 }
 
@@ -139,6 +152,8 @@ export function maxOf(t: ScalarType): bigint {
       throw new Error("boolean has no integer range");
     case "decimal":
       throw new Error("decimal has no integer range");
+    case "bytea":
+      throw new Error("bytea has no integer range");
   }
 }
 
@@ -158,6 +173,8 @@ export function rank(t: ScalarType): number {
       throw new Error("boolean has no promotion rank");
     case "decimal":
       throw new Error("decimal has no integer promotion rank");
+    case "bytea":
+      throw new Error("bytea has no promotion rank");
   }
 }
 
