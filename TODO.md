@@ -284,7 +284,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **`timestamp` / `timestamptz`.** Forces a defined epoch, range, and tz model;
       determinism-sensitive (no wall-clock in tests). _(size: L; §4)_
 - [ ] **`bytea`.** Order-preserving encoding is straightforward (raw bytes). _(size: M; §4)_
+- [ ] **`uuid`** — a fixed **16-byte** value (RFC 4122). Order-preserving key encoding is
+      the raw 16 bytes (compared unsigned/bytewise); the canonical text form is the
+      `8-4-4-4-12` **lowercase**-hex spelling (PostgreSQL accepts more input spellings —
+      match its canonical *output*). No arithmetic. Cheap once the value-codec/key-encoding
+      machinery is in place. _(size: M; §4/§8)_
 - [ ] **`json` / `jsonb`** — optional headline feature (§1). Large surface. _(size: XL; §4)_
+- [ ] **Composite `array` type** — a **container** over the scalar set: a new type *axis*,
+      not another scalar (CLAUDE.md §4). Array literals, element-type rules, `NULL` element
+      vs `NULL` array, equality/ordering, and an order-preserving key encoding for
+      arrays-in-keys. Match PostgreSQL array semantics by default (§1). Large surface;
+      sequence after the core scalar set settles. _(size: XL; §4/§8)_
 - [ ] **Float policy decision.** §8 deliberately keeps `f64` out of compare/text-output
       paths. Decide if floats ever exist, and if so how rendered. _(size: S decision / L if built; §8)_
 
@@ -338,6 +348,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       (not version GC; still not MVCC). _(size: L; deps: incremental commit)_
 - [ ] **B-tree interior pages + slotted page layout** — current layout is a flat sorted
       record chain (storage.md §6). Needed for scale. _(size: XL; deps: incremental commit)_
+- [ ] **Compression of large values (LZ4).** Transparently compress large
+      `text`/`bytea`/`json` values at the storage layer — likely **LZ4** (fast, streaming,
+      cross-language). Pairs with the overflow-page path (a value larger than one page
+      currently trips the `0A000` oversized-item narrowing — types.md §11, format.md). The
+      compression library is a **third-party dependency → gated on CLAUDE.md §14** (human
+      confirmation; must preserve cross-core byte-identity). _(size: L; §9/§14)_
 - [ ] **Crash-recovery hardening** — torn-meta fixtures exist; expand durability/recovery
       tests. WAL is deferred (COW + root-swap gives atomicity without one). _(size: M; §9)_
 
@@ -426,3 +442,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - **Graph / vector workloads.** Growing toward graph traversal or vector-similarity search.
   §9 already flags alternative physical layouts as open (column-oriented, key-value); a
   vector index would be another. Speculative — noted so the seam stays open.
+- **Encryption at rest (file-level).** Whole-file or per-page **encryption** is a door to
+  keep open, not a scheduled feature (CLAUDE.md §9, storage.md §6). The block seam is the
+  natural insertion point; crypto would come from a **vetted library, never hand-rolled**
+  (§14). The only present requirement is that the on-disk format and storage seam not
+  foreclose it (don't assume page bytes are plaintext-comparable on disk).

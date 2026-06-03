@@ -68,7 +68,8 @@ that language's accidents — which is exactly the leakage we are preventing.
 
 1. **Rust** — manual ownership, no GC, no runtime.
 2. **Go** — GC, goroutine concurrency, a runtime. The maintainer's daily-driver
-   language. Pure Go: **no cgo, no FFI.**
+   language. Pure Go: **no cgo, no FFI** (a standing constraint the dependency policy §14
+   does not relax).
 
 Rust and Go are about as far apart as two systems languages get, so this pairing does
 the bulk of the honesty work. Build these two in genuine lockstep from the first
@@ -124,13 +125,19 @@ everything else tests against, not a detail discovered during implementation.
 - **A deliberate scalar set**, starting small and growing on demand. Eventual intent:
   fixed-width integers (with *defined* overflow behavior), an **exact `decimal`**,
   `text` (one defined collation/encoding to start), `boolean`, `timestamp` /
-  `timestamptz`, `bytea`, and `json`/`jsonb` if we want a headline feature.
+  `timestamptz`, `bytea`, **`uuid`** (a fixed 16-byte value), and `json`/`jsonb` if we
+  want a headline feature.
   - **First implemented step — signed integers only:** `int16` / `smallint` (16-bit),
     `int32` / `int` / `integer` (32-bit), `int64` / `bigint` (64-bit). Canonical names
     state width in **bits** (the programming-language convention); SQL-standard names are
     aliases. Two's-complement, with trap-on-overflow (§8). Every other scalar above is
     explicitly **deferred** to a later slice. The float/decimal/collation decisions in §8
     do not bind step 1.
+  - **Beyond scalars — a composite `array` type is intended (eventually).** An array is a
+    *container* layered over the scalar set, not a scalar, so it is a separate later axis
+    with its own value codec, order-preserving key encoding, and comparison rules — not
+    just another row in the scalar table. Match PostgreSQL's array behavior by default
+    (§1). Deferred like the scalars above; sequence it after the core scalar set settles.
 - **Three-valued NULL logic.**
 - **An explicit, documented comparison / coercion / promotion matrix** — expressed as
   data, not prose.
@@ -268,6 +275,19 @@ biases below are where an overriding reason *does* steer away from PG.
   alternatives later; or (b) a **low-level direct access API** beneath SQL (e.g.
   `value = getValue("tableName", key)`, direct row read/write). Whether either ships is
   **undecided** — the requirement is to keep the seam open, not to build them now.
+- **Leave the door open for encryption at rest (file-level).** The single-file format and
+  the storage seam (storage.md §2) are kept so whole-file (or per-page) **encryption at
+  rest** can be added later **without a reshape** — e.g. an encrypting wrapper at the block
+  seam, or an encrypted page body behind an authenticated header. Not built now; the only
+  present requirement is that nothing foreclose it (don't assume page bytes are
+  plaintext-comparable on disk). When it lands, the crypto comes from a **vetted library,
+  never a hand-rolled algorithm** — the dependency policy (§14).
+- **Leave the door open for compression of large values.** Large values (long `text`,
+  `bytea`, future `json`) may be **compressed** transparently at the storage layer —
+  **LZ4** is the likely choice (fast, streaming, well-supported across languages). Like
+  encryption, a forward-compatible option, not a current feature; it pairs with the
+  deferred overflow-page path for over-large values (storage.md). Any compression library
+  is added under §14.
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored (step 5b) in `spec/fileformat/format.md` in a
   deliberately narrowed **whole-image** form — a commit serializes the entire database to
@@ -403,8 +423,9 @@ core: Java, C#, or a Swift core whether native or **wrapping the safe Rust core*
 the engine is *reasonably* safe against malicious input without special hardening: a crafted
 query cannot trigger a buffer overrun, use-after-free, or out-of-bounds read. Treat memory
 safety as a **standing requirement**, not an accident — any future `unsafe` / cgo / FFI path
-(or a non-memory-safe core) must be justified against this property. It is also one more
-reason the Swift exception (§2) wraps the *safe Rust* core rather than dropping to C.
+(or a non-memory-safe core) must be justified against this property (and against the
+dependency policy, §14). It is also one more reason the Swift exception (§2) wraps the
+*safe Rust* core rather than dropping to C.
 
 This covers memory safety **only**. It does not bound resource consumption — that is next.
 
@@ -433,3 +454,47 @@ query** and **abort when a caller-supplied ceiling is exceeded**.
   so it is far cheaper to carry the cost counter from early than to retrofit it across a
   grown executor. Design the seam early even if the ceiling/limits API lands later. Tracked
   in [TODO.md](TODO.md).
+
+---
+
+## 14. Third-party dependencies
+
+The engine core is written **from scratch** (§2): the parser, planner, executor, storage
+layer, type system, and expression evaluator are hand-written in every core and are
+**never** delegated to a library (the same irreducibly-per-language list §5 forbids
+codegenning). That is the project's identity and it does not change. This section governs
+the **narrow** remainder — bounded, mechanical utilities at the edges (cryptography,
+compression, and the like) — where pulling in a dependency is the right call rather than
+reinventing it N times.
+
+**A third-party dependency is allowed only when at least one of these holds:**
+
+1. **All cores can be made to match.** A dependency (or a per-language equivalent) is
+   available across **every** core such that behavior stays **byte-identical and
+   deterministic** (§2/§8) — adding it does not make the cores disagree. Here "platform"
+   means a *language core* (Rust, Go, TS, …), not an OS.
+2. **A platform-specific implementation is significantly faster.** For a given core, a
+   library native to that language's ecosystem is *significantly* faster than a hand-rolled
+   equivalent — **and still produces output identical to the spec and to the other cores**
+   (§8). "Significantly," not marginally; a small speedup does not justify a dependency, and
+   speed never buys a divergence.
+3. **Cryptography.** We do **not** roll our own crypto. Encryption/hashing primitives (the
+   §9 encryption-at-rest door) come from a vetted, well-reviewed library, never a
+   hand-written algorithm.
+
+**Always get explicit human confirmation before adding any dependency.** A dependency is a
+standing maintenance and supply-chain commitment across every core; it is **never** added on
+an agent's own initiative — same spirit as the heavy-operation rule in §12. Propose it, name
+which clause above justifies it and why, and wait for a yes.
+
+**Guardrails that bind every dependency, no exceptions:**
+
+- **Memory safety (§13).** A dependency must not introduce an `unsafe` / cgo / FFI or
+  otherwise non-memory-safe path. The Go core stays **pure Go — no cgo, no FFI** (§2); a
+  dependency does not relax that.
+- **Determinism + cross-core byte-identity (§8).** A dependency may never leak
+  nondeterminism (iteration order, float formatting, locale/library-version-sensitive
+  behavior — the ICU-collation trap in [spec/design/types.md](spec/design/types.md) §11 is
+  the cautionary tale) nor make two cores diverge. Clause 2's speedup is conditioned on this.
+- **Bounded surface.** Dependencies live at well-defined edges (crypto, compression),
+  never inside the parser / planner / executor / type-system core (§2/§5).

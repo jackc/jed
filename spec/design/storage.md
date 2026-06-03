@@ -143,6 +143,18 @@ sits so the options stay open (CLAUDE.md §9).
   separate WAL is ever added is deferred (the copy-on-write + root-swap model does not
   require one for atomicity).
 - **Alternative physical layouts & direct-access API** — kept open (§5), not scheduled.
+- **Encryption at rest (file-level)** — kept open, not built (CLAUDE.md §9). The block seam
+  (§2) is the natural insertion point: an encrypting host — or a thin layer just above it —
+  can encrypt page bodies, with the meta/header carrying whatever non-secret parameters are
+  needed. The crypto comes from a **vetted library, never hand-rolled** (CLAUDE.md §14). The
+  present requirement is only that the format and seam not foreclose it — concretely, don't
+  bake in assumptions that page bytes are plaintext-comparable on disk.
+- **Compression of large values** — kept open, not built (CLAUDE.md §9). Large
+  `text`/`bytea`/`json` values may be compressed (likely **LZ4**) before they reach a page,
+  pairing with the deferred overflow-page path — a value larger than one page currently
+  trips the `0A000` oversized-item narrowing ([types.md §11](types.md),
+  [../fileformat/format.md](../fileformat/format.md)). Any compression library is a
+  third-party dependency, added under CLAUDE.md §14.
 - **Cost unit for storage reads** — the cost-accounting seam (CLAUDE.md §13,
   [cost.md](cost.md)) meters storage with a `storage_row_read` unit (one row read from a
   store during a scan), because the store is whole-image / row-granular today (§6 above —

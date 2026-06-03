@@ -307,7 +307,14 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   (`0A000`; the order-preserving encoding is authored, [encoding.md](encoding.md) §2.5),
   scientific `e`-notation literals, negative/over-precision scale typmods, and raising the
   1000-digit cap once over-page values land.
-- **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4.
+- **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4. Includes
+  **`uuid`** (a fixed 16-byte value; bytewise comparison, raw-16-byte order-preserving key
+  encoding, canonical `8-4-4-4-12` lowercase-hex text form — match PostgreSQL's canonical
+  *output*).
+- **Composite `array` type** — a *container* over the scalar set, a separate later type
+  axis rather than another scalar (CLAUDE.md §4): its own value codec, order-preserving key
+  encoding, element-type and `NULL`-element rules, and equality/ordering. Deferred; match
+  PostgreSQL array semantics by default (§1).
 
 ## 11. The text type and its collation
 
