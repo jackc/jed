@@ -12,9 +12,9 @@ system — "like SQLite, but with a real type system." It is designed as data, b
 executor, so that every implementation tests against one shared contract instead of
 discovering semantics in code.
 
-## 1. Scope: signed integers + text (storable) + boolean (expression-only)
+## 1. Scope: signed integers + text + boolean (all storable)
 
-The storable scalar types are three signed integers (CLAUDE.md §4) plus `text`:
+The storable scalar types are three signed integers (CLAUDE.md §4) plus `text` and `boolean`:
 
 | Canonical id | Aliases | Bits | Range |
 |---|---|---|---|
@@ -22,18 +22,19 @@ The storable scalar types are three signed integers (CLAUDE.md §4) plus `text`:
 | `int32` | `int`, `integer` | 32 | −2147483648 … 2147483647 |
 | `int64` | `bigint` | 64 | −9223372036854775808 … 9223372036854775807 |
 | `text` | `varchar`, `character varying`, `string` | — | variable-width UTF-8 (collation `C`) |
+| `boolean` | `bool` | — | `{false, true}`, ordered false `<` true |
 
 The integers are signed, two's-complement. **`text`** is the first storable non-integer
 scalar — a variable-width UTF-8 string with one defined collation, `C` (byte / code-point
-order); see §11 for the collation decision and its deferred features. The general-expression
-slice also adds **`boolean`** (aliases `bool`) as the first non-integer scalar, but
-**expression-only**: it is the result type of comparisons and the logical connectives and the
-type of the `TRUE`/`FALSE` literals, yet it is **not a storable column type** (`storable =
-false` in [../types/scalars.toml](../types/scalars.toml)). You cannot declare `CREATE TABLE
-t(b boolean)` or `CAST(x AS boolean)`; both trap `0A000` (feature_not_supported) — a
-deliberate narrowing (§10), relaxable in the storable-boolean follow-on. The remaining scalars
-(`decimal`, `timestamp`/`timestamptz`, `bytea`, `json`/`jsonb`) are still **deferred**, so the
-float-formatting, decimal-rounding, and NaN/∞-ordering decisions in CLAUDE.md §8 still do
+order); see §11 for the collation decision and its deferred features. **`boolean`** (aliases
+`bool`) is the second storable non-integer scalar: it is the result type of comparisons and the
+logical connectives and the type of the `TRUE`/`FALSE` literals, and is now **storable** as a
+column (`storable = true` in [../types/scalars.toml](../types/scalars.toml)) — `CREATE TABLE
+t(flag boolean)`, INSERT/store/retrieve, `boolean × boolean` comparison and `ORDER BY` all work
+(§9). Two narrowings remain, mirroring text: a boolean **PRIMARY KEY** is rejected `0A000`, and
+`CAST(x AS boolean)` (and boolean⇄integer casts) are deferred `0A000` (§9, §10). The remaining
+scalars (`decimal`, `timestamp`/`timestamptz`, `bytea`, `json`/`jsonb`) are still **deferred**,
+so the float-formatting, decimal-rounding, and NaN/∞-ordering decisions in CLAUDE.md §8 still do
 **not** bind — there are no floats or decimals yet. The **collation** decision (§8) *does* now
 bind, and is settled in §11: one collation, `C`. Boolean and text each add real
 divergence-prone behavior (a render form beyond `I`, three-valued Kleene connectives — §10;
@@ -88,17 +89,16 @@ higher-ranked type (`strategy = "max-rank"`) and are compared there. Widening is
 lossless, so promotion never loses information or traps.
 
 **Comparability.** Only listed `(family, family)` pairs may be compared; everything else
-is a type error (`42804`). There are two rules: `integer × integer` (`via = "promote"` — widen
-to the common type, then compare) and `text × text` (`via = "none"` — both are already text,
-compare by the `C` collation; §11). The comparison operators (`= < > <= >=` and `IS [NOT]
-DISTINCT FROM`) are **overloaded** across these families (one catalog row per signature —
+is a type error (`42804`). There are three rules: `integer × integer` (`via = "promote"` —
+widen to the common type, then compare), `text × text` (`via = "none"` — both are already text,
+compare by the `C` collation; §11), and `boolean × boolean` (`via = "none"` — compare by value,
+false `<` true; §9). The comparison operators (`= < > <= >=` and `IS [NOT] DISTINCT FROM`) are
+**overloaded** across these families (one catalog row per signature —
 [../functions/catalog.toml](../functions/catalog.toml)). A **mixed** pair is a `42804` type
 error: `text = int` is not comparable (no such `comparable` pair), exactly as `bool = int` is.
-Comparing a boolean — `(a = b) = (c = d)`, `bool = int` — is likewise a `42804` this slice;
-booleans are produced by comparisons and consumed by the connectives and `WHERE`, not compared
-themselves (a deliberate narrowing, relaxable by adding a `boolean × boolean` rule). This table
-is where cross-family rules (integer ↔ decimal, text ↔ other, the boolean self-comparison) will
-be added deliberately, rather than falling out of implicit coercions.
+So `(a = b) = (c = d)` (two booleans) now compares fine, but `(a = b) = 1` (boolean vs integer)
+is a `42804`. This table is where the remaining cross-family rules (integer ↔ decimal, text ↔
+other) will be added deliberately, rather than falling out of implicit coercions.
 
 **Three-valued NULL logic** (CLAUDE.md §4). Any comparison with a NULL operand is
 `UNKNOWN`, never TRUE/FALSE. Notably `NULL = NULL` is `UNKNOWN`: equality is **not**
@@ -232,15 +232,29 @@ byte-identity is the whole point.
 - ✅ Text orders by the `C` collation — `memcmp` over UTF-8 = code-point order — identical
   across cores; the TS UTF-16-vs-UTF-8 ordering trap is avoided by comparing encoded bytes (§11).
 
-## 9. The boolean type and three-valued connectives
+## 9. The boolean type, its storage, and three-valued connectives
 
-`boolean` (aliases `bool`) is the first non-integer scalar, **expression-only** this slice
-(§1): a column cannot be declared boolean and `CAST(x AS boolean)` is rejected, both with
-`0A000`. It exists so the value-world and the truth-world unify — a comparison *produces* a
-boolean, so `SELECT a = b` projects one and `WHERE <expr>` consumes one (keeping a row iff
-the expression is TRUE; FALSE and NULL/unknown both exclude). The domain is `{false, true}`
-plus NULL (= unknown), ordered `false < true` (the `bool-byte` encoding, fixed now but
-unexercised until storable — scalars.toml).
+`boolean` (aliases `bool`) is the truth type: a comparison *produces* a boolean, so
+`SELECT a = b` projects one and `WHERE <expr>` consumes one (keeping a row iff the expression
+is TRUE; FALSE and NULL/unknown both exclude). The domain is `{false, true}` plus NULL
+(= unknown), ordered `false < true`.
+
+**Storage.** boolean is now a **storable** column type (`storable = true`): `CREATE TABLE
+t(flag boolean)`, INSERT/store/retrieve of `false`/`true`/`NULL`, `boolean × boolean`
+comparison (`= < > <= >=`, `IS [NOT] DISTINCT FROM` — §4), and `ORDER BY` (false `<` true,
+NULLs last — the PostgreSQL model) all work. A stored boolean uses the value codec's 1-byte
+`bool-byte` body (`0x00` false, `0x01` true) behind the shared presence tag (on-disk type code
+`5` — [../fileformat/format.md](../fileformat/format.md)); the same order-preserving `bool-byte`
+is the key encoding rule (scalars.toml), false sorting below true. Two narrowings remain, each
+relaxable and each mirroring text:
+
+- **boolean PRIMARY KEY** — rejected `0A000`. The `bool-byte` key rule is authored but
+  unexercised this slice (a boolean key permits at most two distinct rows); boolean-in-a-key is
+  a later follow-on, with its key byte-fixtures.
+- **boolean casts** — `CAST(x AS boolean)` and boolean⇄integer casts are rejected `0A000` /
+  `42804` (not in the cast matrix — §5, [../types/casts.toml](../types/casts.toml)). PostgreSQL's
+  boolean↔integer casts are asymmetric, so they are authored deliberately in a later cast slice
+  rather than falling out of making boolean storable.
 
 **Rendering.** A boolean renders in the conformance corpus as the literal text `true` or
 `false`, and a NULL boolean as `NULL`, under a new render tag `B`
@@ -269,14 +283,16 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   the key-encoding spec (§4, [encoding.md §4](encoding.md)). No longer open.
 - **Operator result types** — ✅ authored in [../functions/](../functions/): comparisons and
   connectives yield `boolean`, arithmetic yields the promoted operand type (functions.md §7).
-- **Storable boolean** — boolean as a column type (on-disk type code, key/value encoding
-  fixtures, boolean PK). Deferred to a follow-on slice; the `bool-byte` encoding rule is
-  fixed now (scalars.toml) but unexercised.
-- **`IS [NOT] DISTINCT FROM`** — ✅ authored (NULL-safe equality over the integer family,
-  `null = "null_safe"`; functions.md §3). Its operand contract matches `=`, so it does not
-  add `boolean × boolean` comparability.
-- **`boolean × boolean` comparability** — still deferred: comparing two booleans
-  (`(a = b) = (c = d)`) remains a `42804` this slice (§4).
+- **Storable boolean** — ✅ landed (§9): boolean is a column type with on-disk type code `5`,
+  the `bool-byte` value codec, a golden round-trip fixture (`bool_table.jed`), and
+  `boolean × boolean` comparison + `ORDER BY`. Two sub-features remain deferred: **boolean in a
+  key / PRIMARY KEY** (rejected `0A000`; the `bool-byte` key rule is authored but its byte
+  fixtures land when lifted) and **boolean⇄integer casts** (rejected; PG's are asymmetric, so a
+  dedicated cast slice — §5, casts.toml).
+- **`IS [NOT] DISTINCT FROM`** — ✅ authored (NULL-safe equality; functions.md §3), now
+  overloaded over the integer, text, and boolean families (§4).
+- **`boolean × boolean` comparability** — ✅ landed (§4, §9): comparing two booleans
+  (`(a = b) = (c = d)`) is now allowed; a boolean vs a non-boolean is still `42804`.
 - **`assignment`-mode casts** — vocabulary reserved; first used by non-integer types.
 - **`text`** — ✅ landed as the first storable non-integer scalar, with one collation `C`
   (§11). Its deferred sub-features (`varchar(n)` length limits, text⇄other casts, string

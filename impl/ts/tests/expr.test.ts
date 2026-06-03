@@ -107,13 +107,14 @@ test("IS [NOT] DISTINCT FROM is NULL-safe equality", () => {
     ["1"],
     ["2"],
   ]);
-  // Same operand contract as `=`: non-associative chaining and boolean operands error.
+  // Same operand contract as `=`: non-associative chaining errors (42601); two booleans
+  // are now comparable, but a boolean vs a non-boolean (here int) is a 42804 mismatch.
   assert.equal(
     errCode(() => execute(db, "SELECT id FROM t WHERE a IS DISTINCT FROM b IS DISTINCT FROM b")),
     "42601",
   );
   assert.equal(
-    errCode(() => execute(db, "SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM (a = b)")),
+    errCode(() => execute(db, "SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM 1")),
     "42804",
   );
 });
@@ -139,11 +140,11 @@ test("type errors and boolean narrowings", () => {
   assert.equal(errCode(() => execute(db, "SELECT id FROM t WHERE a")), "42804");
   assert.equal(errCode(() => execute(db, "SELECT id FROM t WHERE a AND b")), "42804");
   assert.equal(errCode(() => execute(db, "SELECT (a = b) + 1 FROM t WHERE id = 1")), "42804");
-  assert.equal(errCode(() => execute(db, "SELECT id FROM t WHERE (a = b) = (a = b)")), "42804");
-  assert.equal(
-    errCode(() => execute(db, "CREATE TABLE bt (id int32 PRIMARY KEY, flag boolean)")),
-    "0A000",
-  );
+  // boolean × boolean is now comparable, but boolean vs a non-boolean (int) is a 42804.
+  assert.equal(errCode(() => execute(db, "SELECT id FROM t WHERE (a = b) = 1")), "42804");
+  // a boolean column is now storable (CREATE TABLE succeeds), but casting TO boolean is
+  // still deferred (0A000), as is casting a boolean value to an integer (42804).
+  execute(db, "CREATE TABLE bt (id int32 PRIMARY KEY, flag boolean)");
   assert.equal(errCode(() => execute(db, "SELECT CAST(a AS boolean) FROM t WHERE id = 1")), "0A000");
   assert.equal(errCode(() => execute(db, "SELECT CAST(a = b AS int32) FROM t WHERE id = 1")), "42804");
 });

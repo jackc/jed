@@ -2,11 +2,11 @@ package jed
 
 import "strings"
 
-// ScalarType is a storable scalar type (CLAUDE.md §4): the three signed integers plus
-// text. Hand-written per CLAUDE.md §5, cross-checked against spec/types/scalars.toml in
-// tests so the two never drift. The integer-only accessors (WidthBytes/Min/Max/Rank/
-// InRange) return their zero value for Text; callers route text through its own paths
-// (the value codec, the text comparator), never these.
+// ScalarType is a storable scalar type (CLAUDE.md §4): the three signed integers, text,
+// and boolean. Hand-written per CLAUDE.md §5, cross-checked against spec/types/scalars.toml
+// in tests so the two never drift. The integer-only accessors (WidthBytes/Min/Max/Rank/
+// InRange) return their zero value for Text/Bool; callers route those through their own
+// paths (the value codec, the comparators), never these.
 type ScalarType int
 
 const (
@@ -19,6 +19,9 @@ const (
 	// Text is text / varchar / string: variable-width UTF-8, collation C (byte /
 	// code-point order — spec/design/types.md §11).
 	Text
+	// Bool is boolean / bool: false/true stored as the value codec's 1-byte bool-byte
+	// (spec/design/types.md §9).
+	Bool
 )
 
 // CanonicalName is the single name used in all output (determinism — CLAUDE.md §10).
@@ -32,6 +35,8 @@ func (t ScalarType) CanonicalName() string {
 		return "int64"
 	case Text:
 		return "text"
+	case Bool:
+		return "boolean"
 	default:
 		return "?"
 	}
@@ -51,6 +56,8 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return Int64, true
 	case "text", "varchar", "string", "character varying":
 		return Text, true
+	case "boolean", "bool":
+		return Bool, true
 	default:
 		return 0, false
 	}
@@ -58,6 +65,9 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 
 // IsText reports whether this is the variable-width text type (vs a fixed-width integer).
 func (t ScalarType) IsText() bool { return t == Text }
+
+// IsBool reports whether this is the boolean type.
+func (t ScalarType) IsBool() bool { return t == Bool }
 
 // WidthBytes is the fixed storage width in bytes (the key-encoding width). Integer-only —
 // text is variable-width and carries its own length (spec/fileformat/format.md), so this
@@ -124,20 +134,5 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text}
-}
-
-// IsBooleanTypeName reports whether name is the boolean type (canonical "boolean",
-// alias "bool"), case-insensitively. boolean is a known scalar
-// (spec/types/scalars.toml, storable = false) that exists only as an expression type
-// this slice — it is not a ScalarType because it cannot be a column or CAST target.
-// Used to distinguish a known-but-not-storable type name (→ 0A000) from a genuinely
-// unknown one (→ 42704).
-func IsBooleanTypeName(name string) bool {
-	switch strings.ToLower(name) {
-	case "boolean", "bool":
-		return true
-	default:
-		return false
-	}
+	return []ScalarType{Int16, Int32, Int64, Text, Bool}
 }

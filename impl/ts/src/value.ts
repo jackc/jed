@@ -1,11 +1,12 @@
 // Runtime values and three-valued (Kleene) logic.
 //
-// A Value is SQL NULL, an integer, or a boolean. Integers are held as `bigint`
+// A Value is SQL NULL, an integer, a boolean, or text. Integers are held as `bigint`
 // regardless of declared column type (so int64 is exact — JS `number` cannot represent
 // the full int64 range); the declared type governs range checks and key-encoding width.
-// boolean is expression-only (spec/design/types.md §1): a "bool" Value is produced by
-// comparisons and connectives and can be projected/rendered, but is never stored; a NULL
-// boolean (unknown) is the "null" Value, so {true, false, NULL} is the three-valued domain.
+// A "bool" Value is produced by comparisons and connectives, can be projected/rendered,
+// and — now that boolean is storable (spec/design/types.md §9) — is stored in a boolean
+// column; a NULL boolean (unknown) is the "null" Value, so {true, false, NULL} is the
+// three-valued domain, ordered false < true.
 
 export type Value =
   | { kind: "null" }
@@ -89,28 +90,34 @@ export function render(v: Value): string {
 // eq3 is three-valued equality. NULL compared with anything (including NULL) is
 // UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Integers compare by
 // value (all integer types promote losslessly into the common bigint); text by the C
-// collation (UTF-8 byte order — string equality is exact for ===). A mixed int/text pair
-// never reaches here (the resolver rejects it, 42804); any other variant pair is a NULL.
+// collation (UTF-8 byte order — string equality is exact for ===); booleans by value
+// (false < true). A mixed cross-family pair never reaches here (the resolver rejects it,
+// 42804); any other variant pair is a NULL.
 export function eq3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
   if (a.kind === "text" && b.kind === "text") return bool3(a.text === b.text);
   if (a.kind === "int" && b.kind === "int") return bool3(a.int === b.int);
+  if (a.kind === "bool" && b.kind === "bool") return bool3(a.value === b.value);
   return "unknown";
 }
 
-// lt3 is the three-valued ordering predicate a < b (text by C collation = UTF-8 byte order).
+// lt3 is the three-valued ordering predicate a < b (text by C collation = UTF-8 byte order;
+// boolean by value, false < true).
 export function lt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) < 0);
   if (a.kind === "int" && b.kind === "int") return bool3(a.int < b.int);
+  if (a.kind === "bool" && b.kind === "bool") return bool3(!a.value && b.value);
   return "unknown";
 }
 
-// gt3 is the three-valued ordering predicate a > b (text by C collation = UTF-8 byte order).
+// gt3 is the three-valued ordering predicate a > b (text by C collation = UTF-8 byte order;
+// boolean by value, false < true).
 export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) > 0);
   if (a.kind === "int" && b.kind === "int") return bool3(a.int > b.int);
+  if (a.kind === "bool" && b.kind === "bool") return bool3(a.value && !b.value);
   return "unknown";
 }
 

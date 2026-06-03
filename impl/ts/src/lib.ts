@@ -50,8 +50,12 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // text scalar type (variable-width UTF-8, collation C): storage, literals, and
   // comparison/ordering. Non-key column only this slice (text PRIMARY KEY → 0A000).
   "types.text",
-  // General expression substrate — integer arithmetic, the expression-only boolean
-  // type, and the AND/OR/NOT Kleene connectives (the `expression` profile).
+  // Storable boolean column: CREATE/INSERT/SELECT of false/true/NULL, boolean×boolean
+  // comparison and ORDER BY. Non-key column only (boolean PRIMARY KEY → 0A000); casts
+  // deferred (spec/design/types.md §9).
+  "types.boolean_storable",
+  // General expression substrate — integer arithmetic, the boolean type, and the
+  // AND/OR/NOT Kleene connectives (the `expression` profile).
   "types.boolean",
   "expr.arithmetic",
   "expr.unary_minus",

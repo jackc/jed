@@ -67,6 +67,18 @@ function textTableDB(): Database {
   return db;
 }
 
+// boolTableDB has a boolean column — exercises the value codec's boolean branch (a single
+// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (no boolean
+// key this slice).
+function boolTableDB(): Database {
+  const db = new Database();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)");
+  run(db, "INSERT INTO t VALUES (1, TRUE)");
+  run(db, "INSERT INTO t VALUES (2, FALSE)");
+  run(db, "INSERT INTO t VALUES (3, NULL)");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -74,6 +86,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "one_table_empty.jed", build: oneTableEmptyDB },
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
+    { name: "bool_table.jed", build: boolTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
   ];
   for (const c of cases) {
@@ -93,6 +106,7 @@ test("read goldens reproduces rows", () => {
     { name: "one_table_empty.jed", build: oneTableEmptyDB, table: "t" },
     { name: "pk_table.jed", build: pkTableDB, table: "t" },
     { name: "text_table.jed", build: textTableDB, table: "t" },
+    { name: "bool_table.jed", build: boolTableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },

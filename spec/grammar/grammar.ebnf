@@ -207,10 +207,9 @@ primary        ::= integer
 
 /* INSERT takes literals only (no expressions, no columns). A leading "-" before
  * an integer here is the unary-minus operator applied to the literal, folded at
- * parse time. TRUE/FALSE/NULL are the non-integer literal forms; a boolean
- * literal in INSERT is well-formed grammar but is rejected at execution against
- * an integer column (42804) — boolean is not a storable column type this slice
- * (see ../design/types.md §1). */
+ * parse time. TRUE/FALSE/NULL are the non-integer literal forms; a TRUE/FALSE
+ * literal stores into a boolean column (boolean is storable — ../design/types.md
+ * §9) but into an integer or text column is a 42804 type error at execution. */
 literal        ::= "-"? integer
                  | "TRUE" | "FALSE"
                  | "NULL"

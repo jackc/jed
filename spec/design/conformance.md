@@ -27,8 +27,8 @@ problem (CLAUDE.md §7). We use the standard record types:
 Conventions, fixed here so every implementation renders identically:
 
 - **coltypes** — one letter per result column: `I` integer, `B` boolean, `T` text, `R`
-  real. The corpus uses `I` and `B` (integers and the expression-only boolean, CLAUDE.md
-  §4); `T`/`R` are reserved for later types. The letter is a **rendering** tag (how a value
+  real. The corpus uses `I`, `B`, and `T` (integers, boolean, and text — all storable,
+  CLAUDE.md §4); `R` is reserved for floats. The letter is a **rendering** tag (how a value
   is printed), *not* a type assertion — asserting the precise declared type (`int16` vs
   `int32`) is a planned directive, deferred (§7).
 - **values** — printed one per line, **row-major** (row 1's columns, then row 2's, …). A
@@ -147,8 +147,8 @@ Every corpus entry MUST obey:
 - **One canonical name, one code.** Types print under their canonical id; each error
   condition has exactly one SQLSTATE.
 - **No nondeterminism.** No wall-clock, no random, no hashmap-order leakage.
-- **No floats.** The scalar set is integers + the expression-only boolean, so the
-  float-formatting divergence (CLAUDE.md §8) cannot arise.
+- **No floats.** The scalar set is integers, text, and boolean (no floats or decimals yet),
+  so the float-formatting divergence (CLAUDE.md §8) cannot arise.
 - **Canonical boolean spelling.** A boolean prints as exactly `true`/`false` (NULL as
   `NULL`); no core may emit `t`/`f`, `0`/`1`, or host-cased variants.
 
@@ -180,9 +180,9 @@ profile's capabilities passes. Harnesses arrive with the first vertical slice
   constant* that adapts to its context and traps `22003` when its value does not fit (so
   `WHERE small = 100000`, with `small int16`, is a type error, not a silent non-match). See
   [../design/types.md](../design/types.md) §6; coverage in `suites/types/literals.test`.
-- **Boolean results / connectives** — ✅ **resolved**: the `boolean` type (expression-only),
-  comparisons-as-values, and `AND`/`OR`/`NOT` Kleene connectives landed with the general
-  expression substrate. Rendered under the `B` tag (§1); the `expression` profile (§3)
+- **Boolean results / connectives** — ✅ **resolved**: the `boolean` type (now storable —
+  types.md §9), comparisons-as-values, and `AND`/`OR`/`NOT` Kleene connectives landed with the
+  general expression substrate. Rendered under the `B` tag (§1); the `expression` profile (§3)
   gates them; coverage in `suites/expr/`. Boolean as a *storable column type* remains
   deferred (types.md §10).
 - **Render-tag breadth** — `B` joins `I`; `T` (text) and `R` (real) are still reserved for

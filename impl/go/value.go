@@ -10,7 +10,7 @@ const (
 	ValNull ValueKind = iota
 	// ValInt is an integer (any int* column type; stored as int64).
 	ValInt
-	// ValBool is a boolean (expression-only this slice — never stored).
+	// ValBool is a boolean (the boolean column type; false/true stored as a bool-byte).
 	ValBool
 	// ValText is a text string (the text column type); Str holds its UTF-8 content.
 	ValText
@@ -18,12 +18,12 @@ const (
 
 // Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers
 // fit in int64 regardless of their declared column type (the type governs range checks and
-// key-encoding width, not the representation). boolean is expression-only
-// (spec/design/types.md §1): a ValBool is produced by comparisons and connectives and
-// can be projected/rendered, but is never stored; a NULL boolean (unknown) is ValNull,
-// so {true, false, NULL} is the three-valued domain. ValText is the first stored
-// non-integer value; it compares by the C collation (UTF-8 byte / code-point order —
-// spec/design/types.md §11).
+// key-encoding width, not the representation). A ValBool is produced by comparisons and
+// connectives, can be projected/rendered, and — now that boolean is storable
+// (spec/design/types.md §9) — is stored in a boolean column; a NULL boolean (unknown) is
+// ValNull, so {true, false, NULL} is the three-valued domain, ordered false < true. ValText
+// is a stored non-integer value; it compares by the C collation (UTF-8 byte / code-point
+// order — spec/design/types.md §11).
 type Value struct {
 	Kind ValueKind
 	Int  int64
@@ -97,8 +97,9 @@ func bool3(b bool) ThreeValued {
 // UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Integers compare by
 // value (all integer types promote losslessly into int64); text compares by the C
 // collation — raw UTF-8 bytes, which for UTF-8 equals code-point order
-// (spec/design/types.md §11). Go string == / < / > already compare by byte order. A mixed
-// int/text pair never reaches here — the resolver rejects it (42804).
+// (spec/design/types.md §11). Go string == / < / > already compare by byte order;
+// booleans compare by value (false < true). A mixed cross-family pair never reaches here
+// — the resolver rejects it (42804).
 func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
@@ -106,10 +107,14 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValText || o.Kind == ValText {
 		return bool3(v.Str == o.Str)
 	}
+	if v.Kind == ValBool || o.Kind == ValBool {
+		return bool3(v.Bool == o.Bool)
+	}
 	return bool3(v.Int == o.Int)
 }
 
-// Lt3 is the three-valued ordering predicate v < o (text by C collation = byte order).
+// Lt3 is the three-valued ordering predicate v < o (text by C collation = byte order;
+// boolean by value, false < true).
 func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
@@ -117,16 +122,23 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValText || o.Kind == ValText {
 		return bool3(v.Str < o.Str)
 	}
+	if v.Kind == ValBool || o.Kind == ValBool {
+		return bool3(!v.Bool && o.Bool)
+	}
 	return bool3(v.Int < o.Int)
 }
 
-// Gt3 is the three-valued ordering predicate v > o (text by C collation = byte order).
+// Gt3 is the three-valued ordering predicate v > o (text by C collation = byte order;
+// boolean by value, false < true).
 func (v Value) Gt3(o Value) ThreeValued {
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
 	}
 	if v.Kind == ValText || o.Kind == ValText {
 		return bool3(v.Str > o.Str)
+	}
+	if v.Kind == ValBool || o.Kind == ValBool {
+		return bool3(v.Bool && !o.Bool)
 	}
 	return bool3(v.Int > o.Int)
 }

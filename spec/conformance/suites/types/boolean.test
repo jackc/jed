@@ -1,0 +1,148 @@
+# Storable boolean column (spec/design/types.md §9): CREATE/INSERT/store/retrieve of
+# false/true/NULL, boolean×boolean equality and ordering (false < true), and NULL under
+# three-valued logic. A boolean renders as the canonical `true`/`false` under the `B` tag,
+# and a NULL/unknown boolean as `NULL`. boolean is a NON-key column this slice — a boolean
+# PRIMARY KEY is rejected 0A000, and CAST(x AS boolean) is likewise deferred (0A000), both
+# documented narrowings. Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.int32, types.boolean, types.boolean_storable, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)
+
+statement ok
+INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE), (5, FALSE)
+
+# a boolean value renders under the `B` tag as the canonical `true`/`false`; a NULL boolean
+# renders `NULL` (not t/f, not 0/1 — spec/design/types.md §9)
+query B nosort
+SELECT flag FROM t WHERE id = 1
+----
+true
+
+query B nosort
+SELECT flag FROM t WHERE id = 2
+----
+false
+
+query B nosort
+SELECT flag FROM t WHERE id = 3
+----
+NULL
+
+# equality on boolean: flag = TRUE / flag = FALSE select the matching rows (scan order)
+query I nosort
+SELECT id FROM t WHERE flag = TRUE
+----
+1
+4
+
+query I nosort
+SELECT id FROM t WHERE flag = FALSE
+----
+2
+5
+
+# a boolean column is itself a predicate: WHERE flag keeps a row iff it is TRUE (FALSE and
+# NULL/unknown both exclude — Kleene)
+query I nosort
+SELECT id FROM t WHERE flag
+----
+1
+4
+
+# IS NULL / IS NOT NULL on a boolean column
+query I nosort
+SELECT id FROM t WHERE flag IS NULL
+----
+3
+
+query I nosort
+SELECT id FROM t WHERE flag IS NOT NULL ORDER BY id
+----
+1
+2
+4
+5
+
+# = NULL is UNKNOWN, never a match (three-valued logic), for boolean as for every type
+query I nosort
+SELECT id FROM t WHERE flag = NULL
+----
+
+# ordering comparisons: false < true. flag < TRUE selects the FALSE rows; flag > FALSE
+# selects the TRUE rows; NULL is excluded from both (UNKNOWN).
+query I nosort
+SELECT id FROM t WHERE flag < TRUE ORDER BY id
+----
+2
+5
+
+query I nosort
+SELECT id FROM t WHERE flag > FALSE ORDER BY id
+----
+1
+4
+
+# IS [NOT] DISTINCT FROM: NULL-safe equality on boolean — NULL is a comparable value here
+query I nosort
+SELECT id FROM t WHERE flag IS NOT DISTINCT FROM NULL
+----
+3
+
+query I nosort
+SELECT id FROM t WHERE flag IS DISTINCT FROM TRUE ORDER BY id
+----
+2
+3
+5
+
+# ORDER BY a boolean column: false < true, then NULL last (PostgreSQL model). Within a tie
+# the stable sort keeps primary-key scan order. Expected: false (2,5), true (1,4), NULL (3).
+query I nosort
+SELECT id FROM t ORDER BY flag
+----
+2
+5
+1
+4
+3
+
+# the same ordering, projecting the boolean itself: false, false, true, true, NULL
+query B nosort
+SELECT flag FROM t ORDER BY flag
+----
+false
+false
+true
+true
+NULL
+
+# deterministic, cross-core cost: a boolean comparison is ONE operator_eval (weight 1), like
+# an integer comparison. 5 scanned + 5 filter (one `=` per row) + 2 produced + 0 projection
+# (bare column) = 12.
+# cost: 12
+query I nosort
+SELECT id FROM t WHERE flag = TRUE
+----
+1
+4
+
+# boolean vs a non-boolean operand is NOT comparable: a 42804 type error (like bool = int)
+statement error 42804
+SELECT id FROM t WHERE flag = 1
+
+# an integer literal into a boolean column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES (6, 1)
+
+# a boolean literal into an integer column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES (TRUE, TRUE)
+
+# boolean in a PRIMARY KEY is rejected this slice (documented narrowing): 0A000
+statement error 0A000
+CREATE TABLE bad (k boolean PRIMARY KEY)
+
+# casting TO boolean is deferred this slice (documented narrowing): 0A000
+statement error 0A000
+SELECT CAST(id AS boolean) FROM t WHERE id = 1

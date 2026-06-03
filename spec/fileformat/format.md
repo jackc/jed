@@ -124,6 +124,7 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 2 | `int32` |
 | 3 | `int64` |
 | 4 | `text` |
+| 5 | `boolean` |
 
 A column's collation is **not** stored: there is one collation (`C`) for all text this slice
 (../design/types.md §11). A per-column collation field is a forward extension that will claim a
@@ -176,9 +177,15 @@ alone. The present-value body depends on the type:
   `u16` length, then that many bytes — the only value whose width is not fixed by the column
   type alone.
 
+- **`boolean`** — a single **`bool-byte`** body: `00` false, `01` true (any other byte is
+  `data_corrupted`). A present boolean is two bytes total — `00`(tag)`00`/`01`(value); a NULL
+  boolean is the tag alone. This is the same order-preserving `bool-byte` the key encoding uses
+  (false `<` true), but as a stored value it never needs to sort (a boolean PRIMARY KEY is
+  rejected this slice — types.md §9).
+
 There is no per-record payload length: the reader walks the columns in declaration order,
-deriving each value's width from its type (fixed for integers; self-describing via the `u16`
-length for text).
+deriving each value's width from its type (fixed for integers and the 1-byte boolean;
+self-describing via the `u16` length for text).
 
 ## Packing and page allocation (must be byte-identical across cores)
 
@@ -212,6 +219,8 @@ by the independent Ruby reference in [verify.rb](verify.rb) (run via `rake verif
 | `empty_db.jed` | zero tables; catalog `item_count = 0` |
 | `one_table_empty.jed` | one table, zero rows (`root_data_page = 0`) |
 | `pk_table.jed` | a PK table with rows spanning **>1** data page; a NULL value in a row |
+| `text_table.jed` | a text column — the value codec's text branch (`u16` length + UTF-8), empty string, embedded quote, multi-byte and astral chars, and a NULL text value |
+| `bool_table.jed` | a boolean column — the value codec's `bool-byte` branch (`00` false / `01` true) and a NULL boolean |
 | `nopk_table.jed` | a table with no PK — exercises the stored synthetic `int64` rowid key |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |

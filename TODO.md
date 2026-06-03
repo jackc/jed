@@ -231,13 +231,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > forces a §8 divergence decision into the open (default: match PG — §1). `text` is done
 > (the collation §8 decision landed: PostgreSQL `C`); `decimal` is the next headline item.
 
-- [ ] **Storable `boolean` column type.** `boolean` is expression-only today (Phase 1); make
-      it a *column* type: allow `CREATE TABLE t(flag boolean)` and `INSERT`/store/retrieve
-      (and `CAST … AS boolean`), currently `0A000`. Touches the byte-exact storage surface —
-      add on-disk type code `5` (codes 1–4 are int16/int32/int64/**text**) + a golden round-trip
-      fixture, the `bool-byte` key-encoding vectors (the rule is already recorded in
-      `scalars.toml`), and a `boolean × boolean` comparability rule. Cleanly additive (old files
-      keep working). _(size: M; §4/§8/§9)_
+- [x] **Storable `boolean` column type** — done & committed across Rust/Go/TS. `boolean` was
+      expression-only (Phase 1); it is now a *column* type: `CREATE TABLE t(flag boolean)`,
+      `INSERT`/store/retrieve of `false`/`true`/`NULL`, `boolean × boolean` comparison
+      (`= < > <= >=`, `IS [NOT] DISTINCT FROM`) and `ORDER BY` (false `<` true, NULLs last).
+      On-disk type code `5` (codes 1–4 are int16/int32/int64/**text**) with the 1-byte `bool-byte`
+      value codec, byte-exact across cores (golden `bool_table.jed`); capability
+      `types.boolean_storable`; corpus `spec/conformance/suites/types/boolean.test`. Cleanly
+      additive (old files keep working). Two deliberate narrowings remain (below). _(size: M;
+      §4/§8/§9)_
+  - [ ] **boolean in a key / `PRIMARY KEY`** — rejected `0A000` this slice; the order-preserving
+        `bool-byte` key rule is authored (`scalars.toml`) but unexercised. Lifting it adds the
+        executor key path + `bool-byte` key-encoding byte-vectors. _(size: S)_
+  - [ ] **boolean⇄integer casts** — `CAST(x AS boolean)` / `CAST(bool AS int)` rejected
+        (`0A000` / `42804`); not in the cast matrix. PostgreSQL's are asymmetric (bool→int yes,
+        int→bool no), so authored in a dedicated cast slice, not here. _(size: S; §5)_
 - [x] **`text` + ONE defined collation** — done & committed across Rust/Go/TS. Collation is
       PostgreSQL `C` (UTF-8 byte / code-point order; `scalars.toml` records the type with
       `collation = "C"`). Storage + single-quoted literals (`''` escaping) + comparison/ordering

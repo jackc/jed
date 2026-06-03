@@ -8,7 +8,6 @@ import { type SqlState, sqlStateCode } from "../src/errors.ts";
 import {
   type ScalarType,
   canonicalName,
-  isBooleanTypeName,
   maxOf,
   minOf,
   rank,
@@ -42,15 +41,19 @@ test("scalar types match spec/types/scalars.toml", () => {
     }
   }
 
-  // boolean is the first non-integer scalar: expression-only (storable = false), so it
-  // is NOT a column ScalarType, only a recognized non-storable type name.
+  // boolean is a storable non-integer scalar (storable = true): it resolves to a column
+  // ScalarType, canonical-names to "boolean", and its aliases resolve. It has no integer
+  // fields (bits/min/max/rank), so those accessors are not exercised here.
   const boolean = rows.find((r) => r.str("id") === "boolean");
   assert.notEqual(boolean, undefined, "boolean type present");
   assert.equal(boolean!.str("family"), "boolean", "boolean family");
-  assert.equal(boolean!.bool("storable"), false, "boolean is not storable this slice");
-  assert.equal(scalarTypeFromName("boolean"), undefined, "boolean is not a column type");
-  assert.equal(scalarTypeFromName("bool"), undefined, "bool is not a column type");
-  assert.ok(isBooleanTypeName("boolean") && isBooleanTypeName("BOOL"), "boolean name recognized");
+  assert.ok(boolean!.bool("storable"), "boolean is storable this slice");
+  const boolTy = scalarTypeFromName("boolean");
+  assert.notEqual(boolTy, undefined, "boolean resolves to a ScalarType");
+  assert.equal(canonicalName(boolTy as ScalarType), "boolean", "boolean canonical name");
+  for (const alias of boolean!.strs("aliases")) {
+    assert.equal(scalarTypeFromName(alias), boolTy, `alias ${alias} should resolve to boolean`);
+  }
 });
 
 test("error codes are registered in spec/errors/registry.toml", () => {

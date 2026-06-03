@@ -86,21 +86,25 @@ overflow_error = "22003"
 encoding = { method = "int-be-signflip", width_bytes = 8 }
 rank = 3
 
-# --- boolean: the first non-integer scalar, EXPRESSION-ONLY this slice --------
+# --- boolean: a storable non-integer scalar ----------------------------------
 # boolean is the result of comparisons and logical connectives and the type of the
 # TRUE/FALSE literals (../functions/catalog.toml). Its three states under NULL are
 # exactly Kleene's true/false/unknown — unknown is a NULL boolean (../design/types.md).
-# It is NOT a storable column type yet (storable = false): `CREATE TABLE t(b boolean)`
-# and `CAST(x AS boolean)` trap 0A000 (feature_not_supported). The order-preserving
-# `bool-byte` encoding is recorded now as a fixed property of the type, but it is
-# unexercised — there is no on-disk type code and no key/value byte fixtures until
-# the storable-boolean follow-on slice (fileformat.md, encoding/integers.toml are
-# unchanged). The domain is {false, true}, ordered false < true.
+# STORABLE this slice (storable = true): `CREATE TABLE t(b boolean)` works, values are
+# stored on disk (on-disk type code 5 — ../fileformat/format.md), and boolean columns
+# compare/order/dedup (false < true; boolean × boolean is comparable — compare.toml).
+# The value codec is the 1-byte `bool-byte` body (0x00 false, 0x01 true) behind the
+# shared presence tag. The domain is {false, true} plus NULL (= unknown), ordered
+# false < true. The order-preserving `bool-byte` KEY encoding rule stays authored but
+# UNEXERCISED this slice: a boolean PRIMARY KEY is rejected 0A000 (a documented,
+# relaxable narrowing, like the text-key narrowing). `CAST(x AS boolean)` and
+# boolean⇄integer casts are likewise still rejected (deferred to a casts slice —
+# casts.toml). No bits/min/max/overflow/rank — those are integer-family fields.
 [[type]]
 id = "boolean"
 aliases = ["bool"]
 family = "boolean"
-storable = false
+storable = true
 encoding = { method = "bool-byte", width_bytes = 1 }
 
 # --- text: the first storable non-integer scalar -----------------------------

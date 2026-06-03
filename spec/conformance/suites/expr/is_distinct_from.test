@@ -3,7 +3,8 @@
 # NULL as a comparable value: NULL IS NOT DISTINCT FROM NULL is TRUE, a NULL vs a present
 # value is FALSE, and the result is ALWAYS a definite boolean (never NULL). IS DISTINCT
 # FROM is its exact negation. Same integer operand contract as `=` (promotion + the
-# literal range check), so a too-wide literal traps 22003 and a boolean operand is 42804.
+# literal range check), so a too-wide literal traps 22003 and a boolean vs a non-boolean
+# operand is 42804.
 # Format + `requires`: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.is_distinct_from, types.int16, types.int32, types.boolean, compare.promotion, expr.comparison_value, expr.parens, null.three_valued
 
@@ -101,9 +102,10 @@ SELECT id FROM t WHERE a IS NOT DISTINCT FROM 5 ORDER BY id
 statement error 42601
 SELECT id FROM t WHERE a IS DISTINCT FROM b IS DISTINCT FROM b
 
-# Same operand contract as `=`: comparing two booleans is a type error this slice.
+# Same operand contract as `=`: boolean × boolean is comparable now, but a boolean vs a
+# non-boolean (here an integer) is a type error.
 statement error 42804
-SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM (a = b)
+SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM 1
 
 # Cross-type operands promote exactly like `=` (int16 vs int32 widen to int32).
 statement ok

@@ -146,9 +146,10 @@ func TestIsDistinctFrom(t *testing.T) {
 	if got := queryIDs(t, db, "SELECT id FROM t WHERE a IS DISTINCT FROM NULL ORDER BY id"); !eqInts(got, 1, 2) {
 		t.Errorf("distinct-from-NULL WHERE got %v want [1 2]", got)
 	}
-	// Same operand contract as `=`: non-associative chaining and boolean operands error.
+	// Same operand contract as `=`: non-associative chaining errors (42601); two booleans
+	// are now comparable, but a boolean vs a non-boolean (here int) is a 42804 mismatch.
 	wantErr(t, db, "SELECT id FROM t WHERE a IS DISTINCT FROM b IS DISTINCT FROM b", "42601")
-	wantErr(t, db, "SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM (a = b)", "42804")
+	wantErr(t, db, "SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM 1", "42804")
 }
 
 func TestKleeneConnectives(t *testing.T) {
@@ -174,11 +175,16 @@ func TestKleeneConnectives(t *testing.T) {
 
 func TestTypeErrorsAndBooleanNarrowings(t *testing.T) {
 	db := setupExpr(t)
-	wantErr(t, db, "SELECT id FROM t WHERE a", "42804")                 // WHERE must be boolean
-	wantErr(t, db, "SELECT id FROM t WHERE a AND b", "42804")           // AND needs boolean
-	wantErr(t, db, "SELECT (a = b) + 1 FROM t WHERE id = 1", "42804")   // arithmetic on boolean
-	wantErr(t, db, "SELECT id FROM t WHERE (a = b) = (a = b)", "42804") // bool = bool
-	wantErr(t, db, "CREATE TABLE bt (id int32 PRIMARY KEY, flag boolean)", "0A000")
+	wantErr(t, db, "SELECT id FROM t WHERE a", "42804")               // WHERE must be boolean
+	wantErr(t, db, "SELECT id FROM t WHERE a AND b", "42804")         // AND needs boolean
+	wantErr(t, db, "SELECT (a = b) + 1 FROM t WHERE id = 1", "42804") // arithmetic on boolean
+	// boolean × boolean is now comparable, but boolean vs a non-boolean (int) is a 42804.
+	wantErr(t, db, "SELECT id FROM t WHERE (a = b) = 1", "42804")
+	// a boolean column is now storable (CREATE TABLE succeeds), but casting TO boolean is
+	// still deferred (0A000), as is casting a boolean value to an integer (42804).
+	if _, err := Execute(db, "CREATE TABLE bt (id int32 PRIMARY KEY, flag boolean)"); err != nil {
+		t.Errorf("a boolean column should be storable this slice, got error: %v", err)
+	}
 	wantErr(t, db, "SELECT CAST(a AS boolean) FROM t WHERE id = 1", "0A000")
 	wantErr(t, db, "SELECT CAST(a = b AS int32) FROM t WHERE id = 1", "42804") // no bool->int cast
 }

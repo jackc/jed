@@ -1,9 +1,10 @@
 # Static type-checking of expressions, and the deliberate boolean narrowings. The
 # resolver type-checks before any row is scanned: a WHERE expression must be boolean,
-# arithmetic needs integer operands, logical connectives need boolean operands, and
-# comparisons are integer-only (42804, datatype_mismatch). boolean is expression-only
-# this slice, so it is neither a column type nor a CAST target (0A000) — see
-# spec/design/types.md §1, §4, §9. Format + `requires`: ../../../design/conformance.md.
+# arithmetic needs integer operands, logical connectives need boolean operands, and a
+# comparison is only between operands of the same family — a cross-family pair (here
+# boolean vs integer) is 42804, datatype_mismatch. boolean is storable now, but casting
+# TO boolean is still deferred (0A000) — see spec/design/types.md §4, §9. Format +
+# `requires`: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.int32, types.boolean, expr.arithmetic, expr.parens, query.logical_connectives, expr.comparison_value, cast.explicit
 
 statement ok
@@ -20,19 +21,16 @@ SELECT id FROM t WHERE a
 statement error 42804
 SELECT id FROM t WHERE a AND b
 
-# comparisons are integer-only this slice — comparing two booleans is a type error
+# boolean × boolean is comparable now, but a boolean compared with a non-boolean (here an
+# integer) is a type error
 statement error 42804
-SELECT id FROM t WHERE (a = b) = (a = b)
+SELECT id FROM t WHERE (a = b) = 1
 
 # arithmetic requires integer operands — adding to a boolean is a type error
 statement error 42804
 SELECT (a = b) + 1 FROM t WHERE id = 1
 
-# boolean is not a storable column type yet — declaring one is unsupported
-statement error 0A000
-CREATE TABLE bt (id int32 PRIMARY KEY, flag boolean)
-
-# boolean is not a CAST target yet
+# boolean is not a CAST target yet (casting TO boolean is deferred — types.md §9)
 statement error 0A000
 SELECT CAST(a AS boolean) FROM t WHERE id = 1
 

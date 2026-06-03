@@ -75,6 +75,21 @@ fn text_table_db() -> Database {
     db
 }
 
+/// A table with a boolean column — exercises the value codec's boolean branch (a single
+/// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (no boolean
+/// key this slice).
+fn bool_table_db() -> Database {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)",
+    );
+    run(&mut db, "INSERT INTO t VALUES (1, TRUE)");
+    run(&mut db, "INSERT INTO t VALUES (2, FALSE)");
+    run(&mut db, "INSERT INTO t VALUES (3, NULL)");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -83,6 +98,7 @@ fn write_matches_goldens() {
         ("one_table_empty.jed", one_table_empty_db),
         ("pk_table.jed", pk_table_db),
         ("text_table.jed", text_table_db),
+        ("bool_table.jed", bool_table_db),
         ("nopk_table.jed", nopk_table_db),
     ];
     for (name, build) in cases {
@@ -99,6 +115,7 @@ fn read_goldens_reproduces_rows() {
         ("one_table_empty.jed", one_table_empty_db, "t"),
         ("pk_table.jed", pk_table_db, "t"),
         ("text_table.jed", text_table_db, "t"),
+        ("bool_table.jed", bool_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),

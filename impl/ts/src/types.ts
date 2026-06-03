@@ -7,16 +7,28 @@
 // exceeds JS's safe-integer range, so every integer flows through bigint — uniform,
 // exact at all widths).
 
-export type ScalarType = "int16" | "int32" | "int64" | "text";
+export type ScalarType = "int16" | "int32" | "int64" | "text" | "boolean";
 
-export const ALL_SCALAR_TYPES: readonly ScalarType[] = ["int16", "int32", "int64", "text"];
+export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
+  "int16",
+  "int32",
+  "int64",
+  "text",
+  "boolean",
+];
 
 // isText reports whether this is the variable-width text type (vs a fixed-width integer).
 // text has collation C (UTF-8 byte / code-point order — spec/design/types.md §11). The
-// integer-only helpers below (widthBytes/minOf/maxOf/rank) throw on "text"; callers route
-// text through its own paths (the value codec, the text comparator), never these.
+// integer-only helpers below (widthBytes/minOf/maxOf/rank) throw on "text"/"boolean";
+// callers route those through their own paths (the value codec, the comparators), never these.
 export function isText(t: ScalarType): boolean {
   return t === "text";
+}
+
+// isBool reports whether this is the boolean type (false/true; stored as a bool-byte —
+// spec/design/types.md §9).
+export function isBool(t: ScalarType): boolean {
+  return t === "boolean";
 }
 
 // canonicalName is the single name used in all output (determinism — CLAUDE.md §10).
@@ -46,6 +58,9 @@ export function scalarTypeFromName(name: string): ScalarType | undefined {
     case "string":
     case "character varying":
       return "text";
+    case "boolean":
+    case "bool":
+      return "boolean";
     default:
       return undefined;
   }
@@ -64,6 +79,8 @@ export function widthBytes(t: ScalarType): number {
       return 8;
     case "text":
       throw new Error("text is variable-width; widthBytes is integer-only");
+    case "boolean":
+      throw new Error("boolean uses the bool-byte codec; widthBytes is integer-only");
   }
 }
 
@@ -78,6 +95,8 @@ export function minOf(t: ScalarType): bigint {
       return -9223372036854775808n;
     case "text":
       throw new Error("text has no integer range");
+    case "boolean":
+      throw new Error("boolean has no integer range");
   }
 }
 
@@ -92,6 +111,8 @@ export function maxOf(t: ScalarType): bigint {
       return 9223372036854775807n;
     case "text":
       throw new Error("text has no integer range");
+    case "boolean":
+      throw new Error("boolean has no integer range");
   }
 }
 
@@ -107,20 +128,12 @@ export function rank(t: ScalarType): number {
       return 3;
     case "text":
       throw new Error("text has no promotion rank");
+    case "boolean":
+      throw new Error("boolean has no promotion rank");
   }
 }
 
 // inRange reports whether v fits this type's inclusive range.
 export function inRange(t: ScalarType, v: bigint): boolean {
   return v >= minOf(t) && v <= maxOf(t);
-}
-
-// isBooleanTypeName reports whether name is the boolean type (canonical "boolean",
-// alias "bool"), case-insensitively. boolean is a known scalar (spec/types/scalars.toml,
-// storable = false) that exists only as an expression type this slice — it is not a
-// ScalarType because it cannot be a column or CAST target. Used to distinguish a
-// known-but-not-storable type name (→ 0A000) from a genuinely unknown one (→ 42704).
-export function isBooleanTypeName(name: string): boolean {
-  const lower = name.toLowerCase();
-  return lower === "boolean" || lower === "bool";
 }

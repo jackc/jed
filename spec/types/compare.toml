@@ -24,6 +24,13 @@ strategy = "max-rank"
 family = "text"
 strategy = "none"
 
+# boolean likewise has no promotion tower — one boolean type, so two boolean operands
+# need no reconciliation (strategy = "none"). Required so the catalog's referential
+# check sees a promotion rule for the boolean family (catalog.toml).
+[[promotion]]
+family = "boolean"
+strategy = "none"
+
 # --- comparability -----------------------------------------------------------
 # Which (family, family) pairs may be compared at all. Anything not listed is a
 # type error. Step 1 has exactly one family, so there is one rule. Cross-family
@@ -41,6 +48,16 @@ left_family = "text"
 right_family = "text"
 via = "none"
 
+# boolean × boolean only. via = "none": both operands are already boolean, no
+# promotion; compare by value (false < true). A mixed pair (boolean × integer,
+# boolean × text) is NOT listed, so it is a 42804 type error, exactly as before —
+# this rule only unblocks comparing two booleans, e.g. `flag = true`, `(a = b) =
+# (c = d)`, and `ORDER BY flag` (../design/types.md §4).
+[[comparable]]
+left_family = "boolean"
+right_family = "boolean"
+via = "none"
+
 # --- value ordering ----------------------------------------------------------
 # The total order over non-NULL integers used by ORDER BY and by index/key
 # iteration. Plain signed numeric order; matches the order-preserving key
@@ -53,6 +70,10 @@ integer = "numeric-ascending"
 # "text-terminated-escape") reproduces exactly this order in raw bytes, so stored
 # byte order == logical order, as for integers.
 text = "codepoint-ascending"
+# boolean orders false < true — the `bool-byte` encoding (0x00 false < 0x01 true) is
+# this order in raw bytes. NULL sorts last in ascending order, as for every type
+# (null_ordering below). PostgreSQL orders booleans the same way (false < true).
+boolean = "false-before-true"
 
 # NULL's position in the physical total order of encoded keys (index/key
 # iteration), RATIFIED with the key-encoding spec (CLAUDE.md §11 step 4) and

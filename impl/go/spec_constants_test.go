@@ -78,25 +78,29 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 		t.Fatalf("expected 3 storable integer scalar types, got %d", integers)
 	}
 
-	// boolean is the first non-integer scalar: expression-only (storable = false), so it
-	// is NOT a column ScalarType, only a recognized non-storable type name.
+	// boolean is a storable non-integer scalar (storable = true): it resolves to a column
+	// ScalarType, canonical-names to "boolean", and its aliases resolve. It has no integer
+	// fields (bits/min/max/rank), so those accessors are not exercised here.
 	if boolean == nil {
 		t.Fatal("boolean type missing from scalars.toml")
 	}
 	if boolean.str("family") != "boolean" {
 		t.Errorf("boolean: family mismatch")
 	}
-	if boolean.boolVal("storable") {
-		t.Errorf("boolean must not be storable this slice")
+	if !boolean.boolVal("storable") {
+		t.Errorf("boolean must be storable this slice")
 	}
-	if _, ok := ScalarTypeFromName("boolean"); ok {
-		t.Errorf("boolean is not a storable column type")
+	boolTy, ok := ScalarTypeFromName("boolean")
+	if !ok {
+		t.Fatalf("boolean should resolve to a ScalarType")
 	}
-	if _, ok := ScalarTypeFromName("bool"); ok {
-		t.Errorf("bool is not a storable column type")
+	if boolTy.CanonicalName() != "boolean" {
+		t.Errorf("boolean: canonical name mismatch")
 	}
-	if !IsBooleanTypeName("boolean") || !IsBooleanTypeName("BOOL") {
-		t.Errorf("boolean type name should be recognized (case-insensitively)")
+	for _, alias := range boolean.strs("aliases") {
+		if a, ok := ScalarTypeFromName(alias); !ok || a != boolTy {
+			t.Errorf("alias %q should resolve to boolean", alias)
+		}
 	}
 }
 

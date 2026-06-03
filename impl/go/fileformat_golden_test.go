@@ -89,6 +89,18 @@ func textTableDB(t *testing.T) *Database {
 	return db
 }
 
+// boolTableDB has a boolean column — exercises the value codec's boolean branch (a single
+// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (no boolean
+// key this slice).
+func boolTableDB(t *testing.T) *Database {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)")
+	run(t, db, "INSERT INTO t VALUES (1, TRUE)")
+	run(t, db, "INSERT INTO t VALUES (2, FALSE)")
+	run(t, db, "INSERT INTO t VALUES (3, NULL)")
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -99,6 +111,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"one_table_empty.jed", oneTableEmptyDB},
 		{"pk_table.jed", pkTableDB},
 		{"text_table.jed", textTableDB},
+		{"bool_table.jed", boolTableDB},
 		{"nopk_table.jed", nopkTableDB},
 	}
 	for _, c := range cases {
@@ -123,6 +136,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"one_table_empty.jed", oneTableEmptyDB, "t"},
 		{"pk_table.jed", pkTableDB, "t"},
 		{"text_table.jed", textTableDB, "t"},
+		{"bool_table.jed", boolTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

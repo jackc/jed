@@ -8,12 +8,12 @@
 
 /// A runtime value: SQL NULL, an integer, a boolean, or a text string.
 ///
-/// boolean is expression-only this slice (spec/design/types.md §1): a `Bool` value
-/// is produced by comparisons and logical connectives and can be projected/rendered,
-/// but is never stored in a column. A NULL boolean (unknown) is represented as
-/// `Value::Null`, so `{Bool(true), Bool(false), Null}` is the three-valued domain.
-/// `Text` is the first stored non-integer value; it compares by the `C` collation
-/// (UTF-8 byte / code-point order — spec/design/types.md §11).
+/// A `Bool` value is produced by comparisons and logical connectives, can be
+/// projected/rendered, and — now that boolean is storable (spec/design/types.md §9) —
+/// is stored in a boolean column. A NULL boolean (unknown) is represented as
+/// `Value::Null`, so `{Bool(true), Bool(false), Null}` is the three-valued domain;
+/// booleans compare by value, false < true. `Text` is a stored non-integer value; it
+/// compares by the `C` collation (UTF-8 byte / code-point order — types.md §11).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Value {
     Null,
@@ -75,32 +75,36 @@ impl Value {
     /// UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Integers
     /// compare by value (all integer types promote losslessly into i64); text compares
     /// by the `C` collation — raw UTF-8 bytes, which for UTF-8 equals code-point order
-    /// (spec/design/types.md §11). A mixed int/text pair never reaches here — the
-    /// resolver rejects it (42804) — so any non-matching variant pair is a NULL operand.
+    /// (spec/design/types.md §11); booleans compare by value (false < true). A mixed
+    /// cross-family pair never reaches here — the resolver rejects it (42804) — so any
+    /// non-matching variant pair is a NULL operand.
     pub fn eq3(&self, other: &Value) -> ThreeValued {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => bool3(a == b),
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() == b.as_bytes()),
+            (Value::Bool(a), Value::Bool(b)) => bool3(a == b),
             _ => ThreeValued::Unknown,
         }
     }
 
     /// Three-valued ordering predicate `self < other` (text by `C` collation = UTF-8
-    /// byte order).
+    /// byte order; boolean by value, false < true).
     pub fn lt3(&self, other: &Value) -> ThreeValued {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => bool3(a < b),
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() < b.as_bytes()),
+            (Value::Bool(a), Value::Bool(b)) => bool3(a < b),
             _ => ThreeValued::Unknown,
         }
     }
 
     /// Three-valued ordering predicate `self > other` (text by `C` collation = UTF-8
-    /// byte order).
+    /// byte order; boolean by value, false < true).
     pub fn gt3(&self, other: &Value) -> ThreeValued {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => bool3(a > b),
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() > b.as_bytes()),
+            (Value::Bool(a), Value::Bool(b)) => bool3(a > b),
             _ => ThreeValued::Unknown,
         }
     }

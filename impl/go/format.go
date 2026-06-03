@@ -39,6 +39,8 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 3
 	case Text:
 		return 4
+	case Bool:
+		return 5
 	default:
 		return 0
 	}
@@ -55,6 +57,8 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return Int64, true
 	case 4:
 		return Text, true
+	case 5:
+		return Bool, true
 	default:
 		return 0, false
 	}
@@ -81,7 +85,8 @@ func crc32IEEE(data []byte) uint32 {
 // byte-length + UTF-8 bytes (collation C, verbatim). A text value whose UTF-8 length exceeds
 // uint16's max is unsupported; in practice it also exceeds a page and is caught by the
 // oversized-item rule in pack (0A000), so the cast here is sound for every supported page
-// size (spec/fileformat/format.md). boolean is expression-only — never stored (§1).
+// size (spec/fileformat/format.md). boolean is a single bool-byte body — 0x00 false, 0x01
+// true (types.md §9).
 func encodeValue(ty ScalarType, v Value) []byte {
 	switch v.Kind {
 	case ValNull:
@@ -91,6 +96,12 @@ func encodeValue(ty ScalarType, v Value) []byte {
 		out = append(out, 0x00) // present
 		out = appendU16(out, uint16(len(v.Str)))
 		return append(out, v.Str...)
+	case ValBool:
+		b := byte(0x00)
+		if v.Bool {
+			b = 0x01
+		}
+		return []byte{0x00, b} // present tag + bool-byte (0x00 false, 0x01 true)
 	default:
 		n := v.Int
 		return EncodeNullable(ty, &n)
@@ -516,6 +527,20 @@ func readValue(ty ScalarType, buf []byte, pos *int) (Value, error) {
 				return Value{}, err
 			}
 			return TextValue(string(sb)), nil
+		}
+		if ty.IsBool() {
+			b, err := readU8(buf, pos)
+			if err != nil {
+				return Value{}, err
+			}
+			switch b {
+			case 0x00:
+				return BoolValue(false), nil
+			case 0x01:
+				return BoolValue(true), nil
+			default:
+				return Value{}, NewError(DataCorrupted, "invalid boolean value byte")
+			}
 		}
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {

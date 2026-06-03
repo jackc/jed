@@ -113,6 +113,10 @@ id = "types.text"
 description = "text scalar type (variable-width UTF-8, collation C): storage, literals, and comparison/ordering. Non-key column only this slice — a text PRIMARY KEY is rejected 0A000 (spec/design/types.md §11)"
 
 [[capability]]
+id = "types.boolean_storable"
+description = "storable boolean column: CREATE/INSERT/SELECT of false/true/NULL, boolean×boolean comparison and ORDER BY (false < true). Non-key column only — a boolean PRIMARY KEY is rejected 0A000; boolean⇄integer casts are deferred (spec/design/types.md §9)"
+
+[[capability]]
 id = "null.three_valued"
 description = "Three-valued NULL logic in comparisons (CLAUDE.md §4)"
 

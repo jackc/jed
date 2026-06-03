@@ -292,6 +292,99 @@ null           = "null_safe"
 precedence     = 35
 errors         = []
 
+# --- comparison operators (boolean) ------------------------------------------
+# The boolean-family OVERLOAD of the comparisons above: the same operator names/symbols
+# (`=` < > <= >=, and IS [NOT] DISTINCT FROM) applied to boolean × boolean. arg_resolution
+# = "none" — there is one boolean type, so no promotion (compare.toml). Operands compare
+# by value, false < true (../design/types.md §4). boolean vs a non-boolean operand is not
+# comparable (compare.toml lists only boolean × boolean), so it is a 42804 type error. Same
+# precedence (35), same NULL discipline as the integer/text comparisons: propagating for the
+# ordering/equality ops, null_safe for IS [NOT] DISTINCT FROM. No overflow or other failure
+# is possible, so errors = []. This unblocks comparing two booleans (e.g. `flag = true`,
+# `(a = b) = (c = d)`) and `ORDER BY flag`. Boolean⇄integer casts remain deferred (casts.toml).
+
+[[operator]]
+name           = "eq"
+symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["boolean", "boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "lt"
+symbol         = "<"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["boolean", "boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "gt"
+symbol         = ">"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["boolean", "boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "le"
+symbol         = "<="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["boolean", "boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ge"
+symbol         = ">="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["boolean", "boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["boolean", "boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_not_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["boolean", "boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
 # --- null tests --------------------------------------------------------------
 # Unary null-detection over any nullable value of any type. Unlike comparisons
 # these never propagate: the result is ALWAYS a definite boolean, never unknown —

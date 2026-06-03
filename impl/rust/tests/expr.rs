@@ -213,18 +213,21 @@ fn type_errors_and_boolean_narrowings() {
         err_code(&mut db, "SELECT (a = b) + 1 FROM t WHERE id = 1"),
         "42804"
     );
-    // comparisons are integer-only — comparing two booleans is a type error.
+    // boolean × boolean is now comparable, but a boolean compared with a non-boolean
+    // (here an integer) is still a 42804 type error.
     assert_eq!(
-        err_code(&mut db, "SELECT id FROM t WHERE (a = b) = (a = b)"),
+        err_code(&mut db, "SELECT id FROM t WHERE (a = b) = 1"),
         "42804"
     );
-    // boolean is not a storable column type, nor a CAST target (0A000).
-    assert_eq!(
-        err_code(
+    // a boolean column is now storable (CREATE TABLE succeeds), but casting TO boolean
+    // is still deferred (0A000), as is casting a boolean value to an integer (42804).
+    assert!(
+        execute(
             &mut db,
             "CREATE TABLE bt (id int32 PRIMARY KEY, flag boolean)"
-        ),
-        "0A000"
+        )
+        .is_ok(),
+        "a boolean column is storable this slice"
     );
     assert_eq!(
         err_code(&mut db, "SELECT CAST(a AS boolean) FROM t WHERE id = 1"),

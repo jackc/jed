@@ -35,6 +35,7 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Int32 => 2,
         ScalarType::Int64 => 3,
         ScalarType::Text => 4,
+        ScalarType::Bool => 5,
     }
 }
 
@@ -45,6 +46,7 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         2 => Some(ScalarType::Int32),
         3 => Some(ScalarType::Int64),
         4 => Some(ScalarType::Text),
+        5 => Some(ScalarType::Bool),
         _ => None,
     }
 }
@@ -70,7 +72,8 @@ fn crc32_ieee(data: &[u8]) -> u32 {
 /// compact `u16` byte-length + UTF-8 bytes (collation `C`, verbatim). A text value whose
 /// UTF-8 length exceeds `u16::MAX` is unsupported; in practice it also exceeds a page and
 /// is caught by the oversized-item rule in `pack` (0A000), so the cast here is sound for
-/// every supported page size (spec/fileformat/format.md).
+/// every supported page size (spec/fileformat/format.md). `boolean` is a single
+/// `bool-byte` body — `0x00` false, `0x01` true (types.md §9).
 fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
     match v {
         Value::Null => encode_nullable(ty, None),
@@ -83,9 +86,7 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
             out.extend_from_slice(bytes);
             out
         }
-        // Unreachable: boolean is expression-only this slice; no column is boolean, so
-        // a boolean value is never serialized (spec/design/types.md §1).
-        Value::Bool(_) => unreachable!("a boolean cannot be a stored column value"),
+        Value::Bool(b) => vec![0x00, u8::from(*b)], // present tag + bool-byte (0x00 false, 0x01 true)
     }
 }
 
@@ -475,7 +476,7 @@ fn decode_record(col_types: &[ScalarType], buf: &[u8], pos: &mut usize) -> Resul
 
 /// Read one value via the value codec (inverse of `encode_value`). The presence tag is
 /// read first; for a present value the body is the column type's: a fixed-width integer,
-/// or — for `text` — a `u16` length followed by that many UTF-8 bytes.
+/// a `u16` length + that many UTF-8 bytes for `text`, or a single `bool-byte` for `boolean`.
 fn read_value(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
     match read_u8(buf, pos)? {
         0x00 => {
@@ -484,6 +485,12 @@ fn read_value(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
                 let bytes = take(buf, pos, len)?.to_vec();
                 let s = String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 text value"))?;
                 Ok(Value::Text(s))
+            } else if ty.is_bool() {
+                match read_u8(buf, pos)? {
+                    0x00 => Ok(Value::Bool(false)),
+                    0x01 => Ok(Value::Bool(true)),
+                    _ => Err(corrupt("invalid boolean value byte")),
+                }
             } else {
                 let w = ty.width_bytes();
                 let vb = take(buf, pos, w)?;

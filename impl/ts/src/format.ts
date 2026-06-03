@@ -15,8 +15,8 @@ import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database } from "./executor.ts";
 import type { Row } from "./storage.ts";
-import { type ScalarType, isText, widthBytes } from "./types.ts";
-import { type Value, intValue, nullValue, textValue } from "./value.ts";
+import { type ScalarType, isBool, isText, widthBytes } from "./types.ts";
+import { type Value, boolValue, intValue, nullValue, textValue } from "./value.ts";
 
 const FORMAT_VERSION = 1; // on-disk format version
 const PAGE_HEADER = 12; // bytes of the catalog/data page header
@@ -39,6 +39,8 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 3;
     case "text":
       return 4;
+    case "boolean":
+      return 5;
   }
 }
 
@@ -53,6 +55,8 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "int64";
     case 4:
       return "text";
+    case 5:
+      return "boolean";
     default:
       return undefined;
   }
@@ -79,7 +83,8 @@ export function crc32Ieee(data: Uint8Array): number {
 // byte-length + UTF-8 bytes (collation C, verbatim). A text value whose UTF-8 length exceeds
 // 0xFFFF is unsupported; in practice it also exceeds a page and is caught by the
 // oversized-item rule in packing (0A000), so the u16 write is sound for every supported page
-// size (spec/fileformat/format.md). boolean is expression-only — never stored (§1).
+// size (spec/fileformat/format.md). boolean is a single bool-byte body — 0x00 false, 0x01
+// true (types.md §9).
 function encodeValue(ty: ScalarType, v: Value): Uint8Array {
   if (v.kind === "null") return encodeNullable(ty, null);
   if (v.kind === "text") {
@@ -90,6 +95,9 @@ function encodeValue(ty: ScalarType, v: Value): Uint8Array {
     out[2] = bytes.length & 0xff;
     out.set(bytes, 3);
     return out;
+  }
+  if (v.kind === "bool") {
+    return new Uint8Array([0x00, v.value ? 0x01 : 0x00]); // present tag + bool-byte
   }
   if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");
   return encodeNullable(ty, v.int);
@@ -468,6 +476,12 @@ function readValue(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
       } catch {
         throw engineError("data_corrupted", "non-UTF-8 text value");
       }
+    }
+    if (isBool(ty)) {
+      const b = readU8(buf, cur);
+      if (b === 0x00) return boolValue(false);
+      if (b === 0x01) return boolValue(true);
+      throw engineError("data_corrupted", "invalid boolean value byte");
     }
     return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
   }

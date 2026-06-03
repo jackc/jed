@@ -5,7 +5,7 @@
 use jed::costs::COSTS;
 use jed::error::SqlState;
 use jed::operators::OPERATORS;
-use jed::types::{ScalarType, is_boolean_type_name};
+use jed::types::ScalarType;
 use std::path::Path;
 
 fn spec(rel: &str) -> String {
@@ -59,8 +59,9 @@ fn scalar_types_match_spec() {
         }
     }
 
-    // boolean is the first non-integer scalar: expression-only (storable = false), so
-    // it is NOT a column `ScalarType`, only a recognized non-storable type name.
+    // boolean is a storable non-integer scalar (storable = true): it resolves to a column
+    // `ScalarType::Bool`, canonical-names to "boolean", and its aliases resolve too. It has
+    // no integer fields (bits/min/max/rank), so those accessors are not exercised here.
     let boolean = types
         .iter()
         .find(|t| t["id"].as_str() == Some("boolean"))
@@ -72,17 +73,23 @@ fn scalar_types_match_spec() {
     );
     assert_eq!(
         boolean["storable"].as_bool(),
-        Some(false),
-        "boolean is not storable this slice"
+        Some(true),
+        "boolean is storable this slice"
     );
-    assert!(
-        ScalarType::from_name("boolean").is_none() && ScalarType::from_name("bool").is_none(),
-        "boolean is not a storable column type"
+    let bool_ty = ScalarType::from_name("boolean").expect("boolean resolves to a ScalarType");
+    assert_eq!(
+        bool_ty.canonical_name(),
+        "boolean",
+        "boolean canonical name"
     );
-    assert!(
-        is_boolean_type_name("boolean") && is_boolean_type_name("BOOL"),
-        "boolean type name is recognized (case-insensitively)"
-    );
+    for alias in boolean["aliases"].as_array().unwrap() {
+        let a = alias.as_str().unwrap();
+        assert_eq!(
+            ScalarType::from_name(a),
+            Some(bool_ty),
+            "alias {a} resolves to boolean"
+        );
+    }
 }
 
 #[test]

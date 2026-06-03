@@ -20,7 +20,7 @@ ROOT_PAGE = 2
 TXID = 1
 
 WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8 }.freeze
-TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4 }.freeze
+TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5 }.freeze
 CODETYPE = TYPECODE.invert.freeze
 
 # --- declarative fixtures (mirror what the cores build via SQL) --------------
@@ -46,12 +46,22 @@ TEXT_TABLE = {
   rows: [[1, "alice"], [2, ""], [3, "O'Brien"], [4, "caf\u{E9}"], [5, nil], [6, "\u{1F600}"]]
 }.freeze
 
+# A table with a boolean column: exercises the value codec's boolean branch (a single
+# bool-byte, 0x00 false / 0x01 true) plus a NULL boolean (the tag alone). The PK is an int32
+# (boolean is not allowed in a key this slice — spec/design/types.md §9).
+BOOL_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("flag", "boolean")],
+  rows: [[1, true], [2, false], [3, nil]]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "one_table_empty.jed", page_size: 256,
     tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("v", "int16")], rows: [] }] },
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
   { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
+  { file: "bool_table.jed",      page_size: 256, tables: [BOOL_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
@@ -92,13 +102,17 @@ end
 
 # value codec: presence tag + (when present) the type's body. 0x01 = NULL; 0x00 = present.
 # Integers reuse the order-preserving int bytes; text diverges to a compact u16 byte-length
-# + UTF-8 bytes (collation C, verbatim — format.md "Value codec").
+# + UTF-8 bytes (collation C, verbatim); boolean is a single bool-byte 0x00 false / 0x01
+# true (format.md "Value codec").
 def encode_value(type, v)
   return "\x01".b if v.nil?
 
-  if type == "text"
+  case type
+  when "text"
     bytes = v.b
     "\x00".b + u16(bytes.bytesize) + bytes
+  when "boolean"
+    "\x00".b + (v ? "\x01".b : "\x00".b)
   else
     "\x00".b + encode_int(WIDTH.fetch(type), v)
   end
@@ -302,10 +316,14 @@ def decode_record(columns, buf, pos)
   columns.each do |c|
     tag, pos = take(buf, pos, 1)
     if tag.getbyte(0).zero? # 0x00 = present, 0x01 = NULL
-      if c[:type] == "text"
+      case c[:type]
+      when "text"
         len, pos = take(buf, pos, 2)
         sb, pos = take(buf, pos, len.unpack1("n"))
         row << sb.dup.force_encoding("UTF-8")
+      when "boolean"
+        bb, pos = take(buf, pos, 1)
+        row << (bb.getbyte(0) == 1)
       else
         vb, pos = take(buf, pos, WIDTH.fetch(c[:type]))
         row << decode_int(WIDTH.fetch(c[:type]), vb)

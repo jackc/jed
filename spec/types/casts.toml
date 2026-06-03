@@ -7,10 +7,13 @@
 # never silently reinterpreted (CLAUDE.md §4). Identity casts (int16->int16, ...) are
 # implicit and always succeed; they are implied and not listed.
 #
-# boolean (scalars.toml) is EXPRESSION-ONLY this slice and is NEITHER a cast source
-# NOR a cast target: `CAST(x AS boolean)` traps 0A000 (boolean is not a usable target
-# type yet) and there is no boolean->integer rule, so casting a boolean value is a
-# forbidden pair. Boolean<->integer casts arrive with the storable-boolean slice.
+# boolean (scalars.toml) is now a STORABLE type, but its casts are still DEFERRED to a
+# dedicated cast slice: it is NEITHER a cast source NOR a cast target here. `CAST(x AS
+# boolean)` traps 0A000 (an explicit, relaxable narrowing — like a text PRIMARY KEY),
+# and there is no boolean->integer rule, so casting a boolean value is a forbidden pair
+# (CAST-from-boolean is a 42804 datatype mismatch). PostgreSQL's boolean<->integer casts
+# are asymmetric (bool->int yes, int->bool no), so they are authored deliberately in a
+# later slice rather than falling out of making boolean storable.
 #
 # mode:
 #   implicit    inserted automatically anywhere a value of `to` is wanted (safe, lossless)

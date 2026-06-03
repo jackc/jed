@@ -14,7 +14,7 @@ use crate::costs::COSTS;
 use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
 use crate::storage::{Row, TableStore};
-use crate::types::{ScalarType, is_boolean_type_name};
+use crate::types::ScalarType;
 use crate::value::{Value, and3, from3, not3, or3};
 use std::collections::{HashMap, HashSet};
 
@@ -144,6 +144,15 @@ impl Database {
                         "a text primary key is not supported yet",
                     ));
                 }
+                // Likewise boolean: the bool-byte key encoding rule is authored but
+                // unexercised, so a boolean PRIMARY KEY is a documented 0A000 narrowing
+                // (spec/design/types.md §9), relaxable in a later boolean-in-key slice.
+                if ty.is_bool() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a boolean primary key is not supported yet",
+                    ));
+                }
                 if pk_seen {
                     return Err(EngineError::new(
                         SqlState::InvalidTableDefinition,
@@ -242,13 +251,15 @@ impl Database {
                         Value::Null
                     }
                     Literal::Int(n) => {
-                        // An integer literal targets an integer column; into a text column
-                        // it is a 42804 type error (no implicit int→text — types.md §5/§11).
-                        if col.ty.is_text() {
+                        // An integer literal targets an integer column; into a non-integer
+                        // column (text or boolean) it is a 42804 type error (no implicit
+                        // coercion — types.md §5/§11).
+                        if col.ty.is_text() || col.ty.is_bool() {
                             return Err(EngineError::new(
                                 SqlState::DatatypeMismatch,
                                 format!(
-                                    "cannot store an integer value in text column {}",
+                                    "cannot store an integer value in {} column {}",
+                                    col.ty.canonical_name(),
                                     col.name
                                 ),
                             ));
@@ -261,13 +272,20 @@ impl Database {
                         }
                         Value::Int(*n)
                     }
-                    // boolean is expression-only: there are no boolean columns, so a boolean
-                    // literal can only target an integer/text column — a type error (42804).
-                    Literal::Bool(_) => {
-                        return Err(EngineError::new(
-                            SqlState::DatatypeMismatch,
-                            format!("cannot store a boolean value in column {}", col.name),
-                        ));
+                    // A boolean literal targets a boolean column; into a non-boolean column
+                    // it is a 42804 type error (no implicit coercion).
+                    Literal::Bool(b) => {
+                        if !col.ty.is_bool() {
+                            return Err(EngineError::new(
+                                SqlState::DatatypeMismatch,
+                                format!(
+                                    "cannot store a boolean value in {} column {}",
+                                    col.ty.canonical_name(),
+                                    col.name
+                                ),
+                            ));
+                        }
+                        Value::Bool(*b)
                     }
                     // A text literal targets a text column; into an integer column it is a
                     // 42804 type error (no implicit text→int).
@@ -294,8 +312,10 @@ impl Database {
                         Value::Int(n) => encode_int(pk_ty, *n),
                         // Unreachable: a PK column is NOT NULL, enforced above.
                         Value::Null => unreachable!("primary key column is NOT NULL"),
-                        // Unreachable: boolean is expression-only; no column is boolean.
-                        Value::Bool(_) => unreachable!("a boolean cannot be a stored column value"),
+                        // Unreachable: a boolean PRIMARY KEY is rejected at CREATE TABLE (0A000).
+                        Value::Bool(_) => {
+                            unreachable!("a boolean primary key is rejected at CREATE TABLE")
+                        }
                         // Unreachable: a text PRIMARY KEY is rejected at CREATE TABLE (0A000).
                         Value::Text(_) => {
                             unreachable!("a text primary key is rejected at CREATE TABLE")
@@ -778,6 +798,8 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             let ty = table.columns[idx].ty;
             let rty = if ty.is_text() {
                 ResolvedType::Text
+            } else if ty.is_bool() {
+                ResolvedType::Bool
             } else {
                 ResolvedType::Int(ty)
             };
@@ -811,6 +833,15 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "casting to text is not supported yet",
+                ));
+            }
+            // Boolean casts are likewise deferred (boolean⇄integer is a later cast slice —
+            // spec/types/casts.toml): casting TO boolean is a 0A000 this slice. Without this
+            // guard `resolve_storable_type` now returns boolean, so it must be caught here.
+            if target.is_bool() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "casting to boolean is not supported yet",
                 ));
             }
             // The inner value is range-checked against `target` at eval (its own
@@ -1015,18 +1046,22 @@ fn resolve_int_pair(
 }
 
 /// Require that a comparison operand pair is comparable (spec/types/compare.toml): both
-/// from the integer family (NULL counts as either), or both text. A mixed integer/text
-/// pair, or a boolean operand, is a 42804 type error — comparison is overloaded across
-/// families but never compares across them.
+/// from the integer family (NULL counts as either), both text, or both boolean. A mixed
+/// pair (integer/text, or boolean with either) is a 42804 type error — comparison is
+/// overloaded across these families but never compares across them.
 fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
-    use ResolvedType::{Bool, Int, Text};
+    use ResolvedType::{Bool, Int, Null, Text};
     match (lt, rt) {
-        (Bool, _) | (_, Bool) => Err(type_error("comparison operands must be integer or text")),
+        // Boolean compares only with boolean (or NULL); boolean with int/text is a mismatch.
+        (Bool, Int(_)) | (Int(_), Bool) | (Bool, Text) | (Text, Bool) => Err(type_error(
+            "cannot compare a boolean value with a non-boolean value",
+        )),
         (Int(_), Text) | (Text, Int(_)) => Err(type_error(
             "cannot compare a text value with an integer value",
         )),
-        // (Int,Int) (Int,Null) (Null,Int) (Text,Text) (Text,Null) (Null,Text) (Null,Null)
-        _ => Ok(()),
+        // Same-family pairs (Int/Int, Text/Text, Bool/Bool) and any pairing with a bare
+        // NULL literal are comparable.
+        (Int(_) | Text | Bool | Null, Int(_) | Text | Bool | Null) => Ok(()),
     }
 }
 
@@ -1073,14 +1108,16 @@ fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
 }
 
 /// A value assigned to a column must match its family: an integer column takes an
-/// integer (or NULL) value; a text column takes a text (or NULL) value. Any other pair
-/// (boolean anywhere, or a cross-family int/text) is a 42804 type error. Mirrors the
-/// INSERT literal type-check, generalized to expressions.
+/// integer (or NULL) value; a text column takes a text (or NULL) value; a boolean column
+/// takes a boolean (or NULL) value. Any cross-family pair is a 42804 type error. Mirrors
+/// the INSERT literal type-check, generalized to expressions.
 fn require_assignable(ty: ResolvedType, col_ty: ScalarType, col: &str) -> Result<()> {
-    let ok = match (col_ty.is_text(), ty) {
-        (false, ResolvedType::Int(_) | ResolvedType::Null) => true,
-        (true, ResolvedType::Text | ResolvedType::Null) => true,
-        _ => false,
+    let ok = if col_ty.is_text() {
+        matches!(ty, ResolvedType::Text | ResolvedType::Null)
+    } else if col_ty.is_bool() {
+        matches!(ty, ResolvedType::Bool | ResolvedType::Null)
+    } else {
+        matches!(ty, ResolvedType::Int(_) | ResolvedType::Null)
     };
     if ok {
         Ok(())
@@ -1101,23 +1138,17 @@ fn col_idx(table: &Table, name: &str) -> Result<usize> {
     })
 }
 
-/// Resolve a type name used in a column definition or a CAST target. Only the storable
-/// integer types are valid; `boolean` is a known-but-not-storable type this slice
-/// (→ 0A000), distinct from a genuinely unknown name (→ 42704).
+/// Resolve a type name used in a column definition or a CAST target to its `ScalarType`.
+/// All canonical names and aliases (including `boolean`/`bool`) resolve here; a genuinely
+/// unknown name is a 42704. (Type-specific narrowings — a text/boolean PRIMARY KEY, a
+/// CAST to text/boolean — are enforced at the call site, not here.)
 fn resolve_storable_type(name: &str) -> Result<ScalarType> {
-    if let Some(ty) = ScalarType::from_name(name) {
-        Ok(ty)
-    } else if is_boolean_type_name(name) {
-        Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            format!("boolean is not a storable type yet: {name}"),
-        ))
-    } else {
-        Err(EngineError::new(
+    ScalarType::from_name(name).ok_or_else(|| {
+        EngineError::new(
             SqlState::UndefinedObject,
             format!("type does not exist: {name}"),
-        ))
-    }
+        )
+    })
 }
 
 fn overflow(ty: ScalarType) -> EngineError {
@@ -1145,10 +1176,10 @@ struct AssignPlan {
 impl AssignPlan {
     /// Type-check a candidate value against this column: NULL into NOT NULL traps
     /// 23502; an integer outside the target range traps 22003 (CLAUDE.md §8); a text
-    /// value into a text column is accepted as-is (the `C` collation imposes no
-    /// constraint) — mirrors INSERT's per-value checks. The resolver already proved the
-    /// value's family matches the column (never boolean, never a cross-family pair), so
-    /// the mismatched variants are unreachable.
+    /// value into a text column and a boolean value into a boolean column are accepted
+    /// as-is (no further constraint) — mirrors INSERT's per-value checks. The resolver
+    /// already proved the value's family matches the column (never a cross-family pair),
+    /// so the mismatched variants are unreachable.
     fn check(&self, v: Value) -> Result<Value> {
         match v {
             Value::Null => {
@@ -1174,7 +1205,10 @@ impl AssignPlan {
                 debug_assert!(self.target.is_text());
                 Ok(Value::Text(s))
             }
-            Value::Bool(_) => unreachable!("resolver rejects assigning a boolean to a column"),
+            Value::Bool(b) => {
+                debug_assert!(self.target.is_bool());
+                Ok(Value::Bool(b))
+            }
         }
     }
 }
@@ -1360,12 +1394,12 @@ fn key_cmp(a: &Value, b: &Value, descending: bool, nulls_first: bool) -> std::cm
     }
 }
 
-/// Total order over NON-NULL values: signed-integer ascending, and text by the `C`
+/// Total order over NON-NULL values: signed-integer ascending, text by the `C`
 /// collation — raw UTF-8 bytes, which for UTF-8 equals code-point order
-/// (spec/design/types.md §11). The boolean arms and the cross-family arms (a fixed
-/// `bool < int < text` order) are kept only for totality — ORDER BY is over a single
-/// typed column, so they are unreachable from SELECT. NULLs are handled by `key_cmp`
-/// before this is reached.
+/// (spec/design/types.md §11) — and boolean by value, false < true (types.md §9). The
+/// cross-family arms (a fixed `bool < int < text` order) are kept only for totality —
+/// ORDER BY is over a single typed column, so they are unreachable from SELECT. NULLs are
+/// handled by `key_cmp` before this is reached.
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {

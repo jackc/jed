@@ -112,6 +112,13 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a text primary key is not supported yet")
 			}
+			// Likewise boolean: the bool-byte key encoding rule is authored but
+			// unexercised, so a boolean PRIMARY KEY is a documented 0A000 narrowing
+			// (spec/design/types.md §9), relaxable in a later boolean-in-key slice.
+			if ty.IsBool() {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a boolean primary key is not supported yet")
+			}
 			if pkSeen {
 				return Outcome{}, NewError(InvalidTableDefinition,
 					"a table may have at most one primary key")
@@ -190,11 +197,11 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 				}
 				row[i] = NullValue()
 			case LiteralInt:
-				// An integer literal targets an integer column; into a text column it is a
-				// 42804 type error (no implicit int→text — types.md §5/§11).
-				if col.Type.IsText() {
+				// An integer literal targets an integer column; into a non-integer column
+				// (text or boolean) it is a 42804 type error (no implicit coercion — §5/§11).
+				if col.Type.IsText() || col.Type.IsBool() {
 					return Outcome{}, NewError(DatatypeMismatch,
-						"cannot store an integer value in text column "+col.Name)
+						"cannot store an integer value in "+col.Type.CanonicalName()+" column "+col.Name)
 				}
 				if !col.Type.InRange(lit.Int) {
 					return Outcome{}, NewError(NumericValueOutOfRange,
@@ -202,10 +209,13 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 				}
 				row[i] = IntValue(lit.Int)
 			case LiteralBool:
-				// boolean is expression-only: there are no boolean columns, so a boolean
-				// literal can only target an integer/text column — a type error (42804).
-				return Outcome{}, NewError(DatatypeMismatch,
-					"cannot store a boolean value in column "+col.Name)
+				// A boolean literal targets a boolean column; into a non-boolean column it
+				// is a 42804 type error (no implicit coercion).
+				if !col.Type.IsBool() {
+					return Outcome{}, NewError(DatatypeMismatch,
+						"cannot store a boolean value in "+col.Type.CanonicalName()+" column "+col.Name)
+				}
+				row[i] = BoolValue(lit.Bool)
 			case LiteralText:
 				// A text literal targets a text column; into an integer column it is a
 				// 42804 type error (no implicit text→int).
@@ -737,13 +747,14 @@ func outputName(table *Table, e Expr) string {
 }
 
 // resolveBooleanFilter resolves a WHERE expression; it must resolve to boolean (or an
-// untyped NULL, which is always unknown → no rows). An integer-valued WHERE is a 42804.
+// untyped NULL, which is always unknown → no rows). An integer- or text-valued WHERE is a
+// 42804.
 func resolveBooleanFilter(table *Table, e *Expr) (*rExpr, error) {
 	node, ty, err := resolve(table, *e, nil)
 	if err != nil {
 		return nil, err
 	}
-	if ty.kind == rtInt {
+	if ty.kind != rtBool && ty.kind != rtNull {
 		return nil, typeError("argument of WHERE must be boolean")
 	}
 	return node, nil
@@ -763,6 +774,8 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		rt := resolvedType{kind: rtInt, intTy: colTy}
 		if colTy.IsText() {
 			rt = resolvedType{kind: rtText}
+		} else if colTy.IsBool() {
+			rt = resolvedType{kind: rtBool}
 		}
 		return &rExpr{kind: reColumn, index: idx}, rt, nil
 	case ExprLiteral:
@@ -798,6 +811,12 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		// casting TO text is a 0A000 this slice.
 		if target.IsText() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to text is not supported yet")
+		}
+		// Boolean casts are likewise deferred (boolean⇄integer is a later cast slice —
+		// spec/types/casts.toml): casting TO boolean is a 0A000 this slice. Without this
+		// guard resolveStorableType now returns boolean, so it must be caught here.
+		if target.IsBool() {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to boolean is not supported yet")
 		}
 		inner, ity, err := resolve(table, e.Cast.Inner, nil)
 		if err != nil {
@@ -971,12 +990,15 @@ func resolveIntPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, 
 }
 
 // classifyComparable requires that a comparison operand pair is comparable
-// (spec/types/compare.toml): both from the integer family (NULL counts as either), or both
-// text. A mixed integer/text pair, or a boolean operand, is a 42804 type error — comparison
-// is overloaded across families but never compares across them.
+// (spec/types/compare.toml): both from the integer family (NULL counts as either), both
+// text, or both boolean. A mixed pair (integer/text, or boolean with either) is a 42804
+// type error — comparison is overloaded across these families but never compares across
+// them. A bare NULL pairs with any family.
 func classifyComparable(lt, rt resolvedType) error {
-	if lt.kind == rtBool || rt.kind == rtBool {
-		return typeError("comparison operands must be integer or text")
+	// Boolean compares only with boolean (or NULL); boolean with int/text is a mismatch.
+	boolL, boolR := lt.kind == rtBool, rt.kind == rtBool
+	if boolL != boolR && (lt.kind != rtNull && rt.kind != rtNull) {
+		return typeError("cannot compare a boolean value with a non-boolean value")
 	}
 	if (lt.kind == rtInt && rt.kind == rtText) || (lt.kind == rtText && rt.kind == rtInt) {
 		return typeError("cannot compare a text value with an integer value")
@@ -1023,14 +1045,17 @@ func requireBool(t resolvedType, msg string) error {
 }
 
 // requireAssignable: a value assigned to a column must match its family — an integer
-// column takes an integer (or NULL) value; a text column takes a text (or NULL) value.
-// Any other pair (boolean anywhere, or a cross-family int/text) is a 42804 type error.
-// Mirrors the INSERT literal type-check, generalized to expressions.
+// column takes an integer (or NULL) value; a text column takes a text (or NULL) value; a
+// boolean column takes a boolean (or NULL) value. Any cross-family pair is a 42804 type
+// error. Mirrors the INSERT literal type-check, generalized to expressions.
 func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
-	ok := false
-	if colTy.IsText() {
+	var ok bool
+	switch {
+	case colTy.IsText():
 		ok = t.kind == rtText || t.kind == rtNull
-	} else {
+	case colTy.IsBool():
+		ok = t.kind == rtBool || t.kind == rtNull
+	default:
 		ok = t.kind == rtInt || t.kind == rtNull
 	}
 	if !ok {
@@ -1039,15 +1064,13 @@ func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
 	return nil
 }
 
-// resolveStorableType resolves a column-definition or CAST target type name. Only the
-// storable integer types are valid; boolean is known-but-not-storable (→ 0A000),
-// distinct from a genuinely unknown name (→ 42704).
+// resolveStorableType resolves a column-definition or CAST target type name to its
+// ScalarType. All canonical names and aliases (including boolean/bool) resolve here; a
+// genuinely unknown name is a 42704. Type-specific narrowings (a text/boolean PRIMARY KEY,
+// a CAST to text/boolean) are enforced at the call site, not here.
 func resolveStorableType(name string) (ScalarType, error) {
 	if ty, ok := ScalarTypeFromName(name); ok {
 		return ty, nil
-	}
-	if IsBooleanTypeName(name) {
-		return 0, NewError(FeatureNotSupported, "boolean is not a storable type yet: "+name)
 	}
 	return 0, NewError(UndefinedObject, "type does not exist: "+name)
 }
@@ -1282,12 +1305,13 @@ func keyCmp(a, b Value, descending, nullsFirst bool) int {
 	return base
 }
 
-// valueCmp is the total order over NON-NULL values: signed-integer ascending, and text by
+// valueCmp is the total order over NON-NULL values: signed-integer ascending, text by
 // the C collation — raw UTF-8 bytes, which for UTF-8 equals code-point order (Go's
-// strings.Compare is byte order — spec/design/types.md §11). The boolean ordering and the
-// cross-family arms (a fixed bool < int < text order) are defined only for totality —
-// ORDER BY is over a single typed column, so they are unreachable from SELECT. NULLs are
-// handled by keyCmp before this is reached. Returns <0, 0, >0.
+// strings.Compare is byte order — spec/design/types.md §11) — and boolean by value,
+// false < true (orderKey maps false→0, true→1; types.md §9). The cross-family arms are
+// defined only for totality — ORDER BY is over a single typed column, so a mixed pair is
+// unreachable from SELECT. NULLs are handled by keyCmp before this is reached. Returns
+// <0, 0, >0.
 func valueCmp(a, b Value) int {
 	if a.Kind == ValText || b.Kind == ValText {
 		if a.Kind == ValText && b.Kind == ValText {
@@ -1332,8 +1356,9 @@ type assignPlan struct {
 
 // check type-checks a candidate value against this column: NULL into NOT NULL traps
 // 23502; an integer outside the target range traps 22003 (CLAUDE.md §8) — mirrors
-// INSERT's per-value checks. The resolver proved the value is integer or NULL, never
-// boolean.
+// INSERT's per-value checks. A text value into a text column and a boolean value into a
+// boolean column are accepted as-is. The resolver proved the value's family matches the
+// column, so no cross-family value reaches here.
 func (p assignPlan) check(v Value) (Value, error) {
 	switch v.Kind {
 	case ValNull:
@@ -1349,9 +1374,9 @@ func (p assignPlan) check(v Value) (Value, error) {
 		return IntValue(v.Int), nil
 	case ValText:
 		// A text value into a text column is accepted as-is (the C collation imposes no
-		// constraint). The resolver proved the value's family matches the column.
+		// constraint).
 		return TextValue(v.Str), nil
-	default: // ValBool — unreachable: resolver rejects assigning a boolean to a column
-		return Value{}, NewError(FeatureNotSupported, "internal: boolean assigned to a column")
+	default: // ValBool — a boolean value into a boolean column, accepted as-is.
+		return BoolValue(v.Bool), nil
 	}
 }
