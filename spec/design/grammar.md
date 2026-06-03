@@ -87,8 +87,9 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   and `AS` aliasing in `ORDER BY` is not yet visible (ORDER BY still resolves a bare table
   column). Before this slice the only `AS` in the surface was inside `CAST(expr AS type)`.
 - **Single table** — one table per `SELECT`/`UPDATE`/`DELETE`; no `JOIN`, no subqueries.
-- **Positional `INSERT`** — no column list, no multi-row `VALUES`, no `DEFAULT`, and the
-  values are *literals only* (not general expressions; see the `literal` production).
+- **Positional `INSERT`** — no column list, no `DEFAULT`, and the values are *literals
+  only* (not general expressions; see the `literal` production). Multi-row `VALUES`
+  *did* land (§12); a column list and `DEFAULT` stay deferred.
 - **`ORDER BY` keys are bare columns** — a sort key is a table column, never a general
   expression (`ORDER BY a + 1`), an output alias, or an ordinal position (`ORDER BY 1`);
   those stay deferred. The richer surface that *did* land — multiple keys, per-key
@@ -278,3 +279,40 @@ ASC → NULLS LAST, §10).
 `SELECT DISTINCT FROM t` (the only valid parse being the column) selects `distinct`. This
 lookahead is a CLAUDE.md §8 determinism surface: it must be byte-identical across the three
 hand-written parsers.
+
+## 12. Multi-row `INSERT`
+
+`INSERT INTO t VALUES (...)` accepts **one or more** parenthesized rows
+(`insert` / `row` in the grammar): `INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)` inserts
+three rows in one statement. It is the obvious PostgreSQL surface and a near-free extension
+of the single-row form — one extra parse loop and one validation pass. A column list,
+`DEFAULT`, and `INSERT ... SELECT` stay deferred (§5, [../../TODO.md](../../TODO.md)).
+
+**Every row has the table's column count.** Each `row` is validated against the catalog
+independently; a row whose arity differs from the column count is a syntax error (`42601`),
+the same code the single-row form already raised for a count mismatch. There is no per-row
+column list, so all rows necessarily share the column set.
+
+**Two-phase / all-or-nothing — the UPDATE precedent.** A multi-row `INSERT` is atomic per
+statement, mirroring `UPDATE`'s two-phase pass (CLAUDE.md §11 step 6) and PostgreSQL: the
+engine **fully validates every row before inserting any**. Phase one checks each row's arity,
+type-checks and range-checks every value (an out-of-range integer traps `22003`, a `NULL`
+into a `NOT NULL` column traps `23502`), computes each row's storage key, and checks that key
+for a duplicate — **both against the already-stored rows and against earlier rows in the same
+statement** (a collision traps `23505`). Only once all rows pass does phase two insert them.
+So `INSERT INTO t VALUES (1, 5), (1, 6)` (a key repeated *within* the batch) traps `23505`
+and stores **nothing**, and a batch whose third row overflows leaves the first two unstored.
+This matters because the §3 staging buffer is still future: without the pre-validation pass a
+mid-batch failure would leave a partial insert, breaking statement atomicity. Validation is
+left-to-right by row then by column, so the *first* failing row's error wins
+deterministically (CLAUDE.md §8/§10).
+
+**Synthetic rowids are allocated in phase two, in row order.** For a table with no primary
+key, each row's key is a fresh monotonic rowid (CLAUDE.md §11 step 6). Allocation happens in
+phase two, after every row has validated, and proceeds in `VALUES` order — so a batch that
+fails validation burns no rowids, and a batch that succeeds assigns consecutive rowids
+left-to-right. This keeps the assignment deterministic and identical across the three cores.
+
+**Cost is unchanged — zero.** Literal rows read no storage and evaluate no expression tree,
+so a multi-row `INSERT` accrues the same zero cost as the single-row form
+([cost.md](cost.md); `DEFAULT` expressions, when added, will accrue here).

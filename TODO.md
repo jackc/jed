@@ -189,7 +189,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **Aggregates** `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` + **`GROUP BY`** + **`HAVING`**.
       `AVG`/`SUM` interact with overflow & with decimal — sequence after `decimal` or define
       integer-only semantics first. _(size: L; deps: expression evaluator)_
-- [ ] **Multi-row `INSERT`** (`VALUES (..),(..)`) and **`INSERT ... SELECT`**. _(size: S/M)_
+- [x] **Multi-row `INSERT`** (`VALUES (..),(..)`). Done: `INSERT INTO t VALUES (..),(..)`
+      accepts one or more parenthesized rows, **two-phase / all-or-nothing** like `UPDATE`
+      (CLAUDE.md §11 step 6) — every row is fully validated (arity → `42601`, type/range →
+      `22003`, NOT NULL → `23502`) and every storage key checked for a duplicate (`23505`,
+      against both stored rows **and** earlier rows in the same batch) **before any row is
+      inserted**, so a mid-batch failure stores nothing. Synthetic rowids (no-PK tables) are
+      allocated in phase two, in row order, so a failed batch burns none. The `Insert` AST
+      went from one `values` row to `rows: [][]Literal` across all three cores. Authored in
+      [grammar.ebnf](spec/grammar/grammar.ebnf) (`insert` / `row`) +
+      [grammar.md §12](spec/design/grammar.md), capability `dml.insert_multi_row` in
+      [manifest.toml](spec/conformance/manifest.toml), all three cores in lockstep, pinned by
+      [spec/conformance/suites/dml/insert_multi_row.test](spec/conformance/suites/dml/insert_multi_row.test).
+      _(size: S)_
+- [ ] **`INSERT ... SELECT`** — insert the rows a query produces (the second half of the
+      original multi-row-INSERT item). Needs the executor to feed a SELECT result set
+      through the same two-phase, all-or-nothing INSERT validation. _(size: M; deps: SELECT ✓)_
 - [ ] **`DROP TABLE`.** _(size: S)_
 
 ---

@@ -68,3 +68,61 @@ test("insert into a missing table traps 42P01", () => {
     "42P01",
   );
 });
+
+// --- multi-row INSERT (spec/design/grammar.md §12) --------------------------------
+
+test("multi-row INSERT stores all rows in key order", () => {
+  const db = nums();
+  // One statement, rows out of key order; storage yields them in PK order.
+  execute(db, "INSERT INTO nums VALUES (3, 30, 300), (1, 10, 100), (2, 20, 200)");
+  assert.deepStrictEqual(query(db, "SELECT id FROM nums ORDER BY id"), [["1"], ["2"], ["3"]]);
+});
+
+test("multi-row INSERT is all-or-nothing on overflow", () => {
+  const db = nums();
+  // The second row overflows int16 — the whole statement fails, storing nothing.
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO nums VALUES (1, 10, 100), (2, 99999, 200)")),
+    "22003",
+  );
+  assert.equal(query(db, "SELECT id FROM nums").length, 0);
+});
+
+test("multi-row INSERT duplicate key within the batch traps 23505 and stores nothing", () => {
+  const db = nums();
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO nums VALUES (1, 1, 1), (1, 2, 2)")),
+    "23505",
+  );
+  assert.equal(query(db, "SELECT id FROM nums").length, 0);
+});
+
+test("multi-row INSERT duplicate against a stored row traps 23505, leaving it alone", () => {
+  const db = nums();
+  execute(db, "INSERT INTO nums VALUES (1, 1, 1)");
+  // The batch's second row collides with stored row 1; the new row 2 must not land.
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO nums VALUES (2, 2, 2), (1, 9, 9)")),
+    "23505",
+  );
+  assert.deepStrictEqual(query(db, "SELECT id FROM nums ORDER BY id"), [["1"]]);
+});
+
+test("multi-row INSERT with a wrong-arity row traps 42601 and stores nothing", () => {
+  const db = nums();
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO nums VALUES (1, 1, 1), (2, 2)")),
+    "42601",
+  );
+  assert.equal(query(db, "SELECT id FROM nums").length, 0);
+});
+
+test("no-PK multi-row INSERT keeps insertion order; a failed batch stores nothing", () => {
+  const db = dbWith(["CREATE TABLE log (a int16)"]);
+  // No PK ⇒ monotonic synthetic rowids, allocated left-to-right; key order = insertion order.
+  execute(db, "INSERT INTO log VALUES (30), (10), (20)");
+  assert.deepStrictEqual(query(db, "SELECT a FROM log"), [["30"], ["10"], ["20"]]);
+  // A failing batch (second row overflows) stores neither row.
+  assert.equal(errCode(() => execute(db, "INSERT INTO log VALUES (40), (99999)")), "22003");
+  assert.deepStrictEqual(query(db, "SELECT a FROM log"), [["30"], ["10"], ["20"]]);
+});

@@ -81,8 +81,11 @@ export type CreateTable = {
   columns: ColumnDef[];
 };
 
-// Insert is an INSERT ... VALUES with one row of literals, in column order.
-export type Insert = { kind: "insert"; table: string; values: Literal[] };
+// Insert is an INSERT ... VALUES with one or more rows of literals, each in column
+// order. A multi-row INSERT is two-phase / all-or-nothing — every row is validated
+// before any is stored (spec/design/grammar.md §12). `rows` is always non-empty (the
+// parser requires ≥1 row).
+export type Insert = { kind: "insert"; table: string; rows: Literal[][] };
 
 // Select is a single-table SELECT. limit caps the result at `limit` rows; offset skips
 // the first `offset` rows. Both are non-negative counts, applied after ORDER BY, before

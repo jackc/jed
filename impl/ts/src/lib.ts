@@ -16,6 +16,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "ddl.primary_key",
   // INSERT ... VALUES with positional type-checking + overflow trap.
   "dml.insert",
+  // Multi-row INSERT ... VALUES (..),(..) — two-phase / all-or-nothing (grammar.md §12).
+  "dml.insert_multi_row",
   "error.overflow_trap",
   // Row mutation: UPDATE (in-place) + DELETE.
   "dml.update",

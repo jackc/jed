@@ -119,14 +119,30 @@ class Parser {
     return { name, typeName, primaryKey };
   }
 
-  // parseInsert parses `INSERT INTO <table> VALUES ( <literal> [, <literal>]* )`.
+  // parseInsert parses `INSERT INTO <table> VALUES <row> [, <row>]*`, where each <row>
+  // is `( <literal> [, <literal>]* )`. Values map positionally to columns; the executor
+  // type-checks each row against the catalog and inserts all-or-nothing (grammar.md §12).
   private parseInsert(): Insert {
     this.expectKeyword("insert");
     this.expectKeyword("into");
     const table = this.expectIdentifier();
     this.expectKeyword("values");
-    this.expect("lparen");
 
+    const rows: Literal[][] = [];
+    for (;;) {
+      rows.push(this.parseInsertRow());
+      if (this.peek().kind === "comma") {
+        this.advance();
+        continue;
+      }
+      break;
+    }
+    return { kind: "insert", table, rows };
+  }
+
+  // parseInsertRow parses one parenthesized `( <literal> [, <literal>]* )` row.
+  private parseInsertRow(): Literal[] {
+    this.expect("lparen");
     const values: Literal[] = [];
     for (;;) {
       values.push(this.parseLiteral());
@@ -136,9 +152,9 @@ class Parser {
       throw engineError("syntax_error", "expected ',' or ')'");
     }
     if (values.length === 0) {
-      throw engineError("syntax_error", "VALUES must have at least one value");
+      throw engineError("syntax_error", "a VALUES row must have at least one value");
     }
-    return { kind: "insert", table, values };
+    return values;
   }
 
   // parseLiteral parses a literal value for INSERT: an integer (with an optional leading

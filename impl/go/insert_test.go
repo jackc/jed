@@ -116,3 +116,69 @@ func TestInsertIntoMissingTableTraps(t *testing.T) {
 	db := NewDatabase()
 	wantErr(t, db, "INSERT INTO nope VALUES (1)", "42P01")
 }
+
+// --- multi-row INSERT (spec/design/grammar.md §12) --------------------------------
+
+func TestMultiRowInsertStoresAllRowsInKeyOrder(t *testing.T) {
+	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")
+	// One statement, rows out of key order; storage must yield them in PK order.
+	mustCreate(t, db, "INSERT INTO t VALUES (3, 30), (1, 10), (2, 20)")
+	if got := ids(db.RowsInKeyOrder("t")); !eqInts(got, 1, 2, 3) {
+		t.Errorf("key order got %v want [1 2 3]", got)
+	}
+}
+
+func TestMultiRowInsertAllOrNothingOnOverflow(t *testing.T) {
+	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY, s int16)")
+	// The second row overflows int16 — the whole statement fails, storing nothing.
+	wantErr(t, db, "INSERT INTO t VALUES (1, 10), (2, 99999)", "22003")
+	if n := len(db.RowsInKeyOrder("t")); n != 0 {
+		t.Errorf("expected 0 rows stored, got %d", n)
+	}
+}
+
+func TestMultiRowInsertDuplicateWithinBatchTraps(t *testing.T) {
+	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	wantErr(t, db, "INSERT INTO t VALUES (1), (1)", "23505")
+	if n := len(db.RowsInKeyOrder("t")); n != 0 {
+		t.Errorf("expected 0 rows stored, got %d", n)
+	}
+}
+
+func TestMultiRowInsertDuplicateAgainstStoredTraps(t *testing.T) {
+	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	mustCreate(t, db, "INSERT INTO t VALUES (1)")
+	// The batch's second row collides with stored row 1; the new row 2 must not land.
+	wantErr(t, db, "INSERT INTO t VALUES (2), (1)", "23505")
+	if got := ids(db.RowsInKeyOrder("t")); !eqInts(got, 1) {
+		t.Errorf("got %v want [1]", got)
+	}
+}
+
+func TestMultiRowInsertWrongArityInOneRowIsRejected(t *testing.T) {
+	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")
+	wantErr(t, db, "INSERT INTO t VALUES (1, 10), (2)", "42601")
+	if n := len(db.RowsInKeyOrder("t")); n != 0 {
+		t.Errorf("expected 0 rows stored, got %d", n)
+	}
+}
+
+func TestNoPKMultiRowInsertKeepsInsertionOrder(t *testing.T) {
+	db := dbWith(t, "CREATE TABLE log (a int32)")
+	// No PK ⇒ monotonic synthetic rowids, allocated left-to-right; key order = insertion order.
+	mustCreate(t, db, "INSERT INTO log VALUES (30), (10), (20)")
+	if got := ids(db.RowsInKeyOrder("log")); !eqInts(got, 30, 10, 20) {
+		t.Errorf("got %v want [30 10 20]", got)
+	}
+}
+
+func TestNoPKMultiRowInsertIsAllOrNothing(t *testing.T) {
+	db := dbWith(t, "CREATE TABLE log (a int16)")
+	mustCreate(t, db, "INSERT INTO log VALUES (1)")
+	// The batch fails validation (second row overflows), so its first row (2) is not stored.
+	wantErr(t, db, "INSERT INTO log VALUES (2), (99999)", "22003")
+	mustCreate(t, db, "INSERT INTO log VALUES (3), (4)")
+	if got := ids(db.RowsInKeyOrder("log")); !eqInts(got, 1, 3, 4) {
+		t.Errorf("got %v want [1 3 4]", got)
+	}
+}

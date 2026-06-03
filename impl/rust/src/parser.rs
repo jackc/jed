@@ -86,15 +86,31 @@ impl Parser {
         })
     }
 
-    /// `INSERT INTO <table> VALUES ( <literal> [, <literal>]* )`. Values map
-    /// positionally to columns; the executor type-checks against the catalog.
+    /// `INSERT INTO <table> VALUES <row> [, <row>]*`, where each `<row>` is
+    /// `( <literal> [, <literal>]* )`. Values map positionally to columns; the
+    /// executor type-checks each row against the catalog and inserts all-or-nothing
+    /// (spec/design/grammar.md §12).
     fn parse_insert(&mut self) -> Result<Insert> {
         self.expect_keyword("insert")?;
         self.expect_keyword("into")?;
         let table = self.expect_identifier()?;
         self.expect_keyword("values")?;
-        self.expect(&Token::LParen)?;
 
+        let mut rows = Vec::new();
+        loop {
+            rows.push(self.parse_insert_row()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(Insert { table, rows })
+    }
+
+    /// One parenthesized `( <literal> [, <literal>]* )` row of an INSERT.
+    fn parse_insert_row(&mut self) -> Result<Vec<Literal>> {
+        self.expect(&Token::LParen)?;
         let mut values = Vec::new();
         loop {
             values.push(self.parse_literal()?);
@@ -105,9 +121,9 @@ impl Parser {
             }
         }
         if values.is_empty() {
-            return Err(syntax("VALUES must have at least one value"));
+            return Err(syntax("a VALUES row must have at least one value"));
         }
-        Ok(Insert { table, values })
+        Ok(values)
     }
 
     /// A literal value for INSERT: an integer (with an optional leading unary minus,

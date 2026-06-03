@@ -122,63 +122,93 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
-// executeInsert analyzes and runs an INSERT: map the literal values positionally to
-// columns, type-check each (NULL into NOT NULL traps 23502; an integer outside the
-// column type's range traps 22003 — CLAUDE.md §8), then store the row keyed by its
-// encoded primary key (duplicate key traps 23505).
+// executeInsert analyzes and runs an INSERT of one or more rows. Each row maps its
+// literal values positionally to columns and is type-checked (NULL into NOT NULL traps
+// 23502; an integer outside the column type's range traps 22003 — CLAUDE.md §8); a
+// duplicate primary key traps 23505. A multi-row INSERT is two-phase / all-or-nothing
+// (spec/design/grammar.md §12), mirroring UPDATE: every row is validated — including its
+// storage key checked against both the stored rows and earlier rows in the same statement
+// — before any row is inserted, so a mid-batch failure stores nothing.
 func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 	table, ok := db.Table(ins.Table)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ins.Table)
 	}
-	if len(ins.Values) != len(table.Columns) {
-		return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
-			"INSERT has %d values but table %s has %d columns",
-			len(ins.Values), table.Name, len(table.Columns),
-		))
+	store := db.stores[strings.ToLower(ins.Table)]
+	pk := table.PrimaryKeyIndex()
+
+	// Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
+	// table with a primary key, the encoded key is checked for a duplicate (within the
+	// batch via seenKeys, and against the store) up front; for a table with none, key is
+	// left nil and a fresh monotonic rowid is allocated in phase 2.
+	type preparedRow struct {
+		key []byte // nil for a no-PK table (rowid allocated in phase 2)
+		row Row
+	}
+	prepared := make([]preparedRow, 0, len(ins.Rows))
+	seenKeys := make(map[string]struct{})
+	for _, lits := range ins.Rows {
+		if len(lits) != len(table.Columns) {
+			return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
+				"INSERT row has %d values but table %s has %d columns",
+				len(lits), table.Name, len(table.Columns),
+			))
+		}
+
+		row := make(Row, len(table.Columns))
+		for i, col := range table.Columns {
+			lit := lits[i]
+			switch lit.Kind {
+			case LiteralNull:
+				if col.NotNull {
+					return Outcome{}, NewError(NotNullViolation,
+						"null value in column "+col.Name+" violates not-null constraint")
+				}
+				row[i] = NullValue()
+			case LiteralInt:
+				if !col.Type.InRange(lit.Int) {
+					return Outcome{}, NewError(NumericValueOutOfRange,
+						"value out of range for type "+col.Type.CanonicalName())
+				}
+				row[i] = IntValue(lit.Int)
+			case LiteralBool:
+				// boolean is expression-only: there are no boolean columns, so a boolean
+				// literal can only target an integer column — a type error (42804).
+				return Outcome{}, NewError(DatatypeMismatch,
+					"cannot store a boolean value in integer column "+col.Name)
+			}
+		}
+
+		var key []byte
+		if pk >= 0 {
+			key = EncodeInt(table.Columns[pk].Type, row[pk].Int)
+			if _, dup := seenKeys[string(key)]; dup {
+				return Outcome{}, NewError(UniqueViolation,
+					"duplicate key value violates primary key uniqueness")
+			}
+			if _, exists := store.Get(key); exists {
+				return Outcome{}, NewError(UniqueViolation,
+					"duplicate key value violates primary key uniqueness")
+			}
+			seenKeys[string(key)] = struct{}{}
+		}
+		prepared = append(prepared, preparedRow{key: key, row: row})
 	}
 
-	row := make(Row, len(table.Columns))
-	for i, col := range table.Columns {
-		lit := ins.Values[i]
-		switch lit.Kind {
-		case LiteralNull:
-			if col.NotNull {
-				return Outcome{}, NewError(NotNullViolation,
-					"null value in column "+col.Name+" violates not-null constraint")
-			}
-			row[i] = NullValue()
-		case LiteralInt:
-			if !col.Type.InRange(lit.Int) {
-				return Outcome{}, NewError(NumericValueOutOfRange,
-					"value out of range for type "+col.Type.CanonicalName())
-			}
-			row[i] = IntValue(lit.Int)
-		case LiteralBool:
-			// boolean is expression-only: there are no boolean columns, so a boolean
-			// literal can only target an integer column — a type error (42804).
-			return Outcome{}, NewError(DatatypeMismatch,
-				"cannot store a boolean value in integer column "+col.Name)
+	// Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
+	// rowid is allocated here, in row order, so a failed validation pass burns none
+	// (spec/fileformat/format.md, spec/design/grammar.md §12).
+	for _, pr := range prepared {
+		key := pr.key
+		if key == nil {
+			key = EncodeInt(Int64, store.AllocRowid())
+		}
+		if !store.Insert(key, pr.row) {
+			panic("pre-validated INSERT key must be unique")
 		}
 	}
-
-	// The storage key is the encoded primary key, or — for a table without one — a
-	// monotonic synthetic rowid: never reused, so DELETE then INSERT cannot collide
-	// with a freed key (spec/fileformat/format.md).
-	store := db.stores[strings.ToLower(ins.Table)]
-	var key []byte
-	if pk := table.PrimaryKeyIndex(); pk >= 0 {
-		key = EncodeInt(table.Columns[pk].Type, row[pk].Int)
-	} else {
-		key = EncodeInt(Int64, store.AllocRowid())
-	}
-
-	if !store.Insert(key, row) {
-		return Outcome{}, NewError(UniqueViolation,
-			"duplicate key value violates primary key uniqueness")
-	}
-	// A single-row INSERT of literal values reads no rows and evaluates no expression
-	// tree: zero cost (DEFAULT expressions, when added, will accrue here).
+	// INSERT of literal rows reads no rows and evaluates no expression tree: zero cost
+	// (DEFAULT expressions, when added, will accrue here).
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 

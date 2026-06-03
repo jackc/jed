@@ -45,6 +45,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "ddl.primary_key",
     // Phase C — INSERT ... VALUES with positional type-checking + overflow trap.
     "dml.insert",
+    // Multi-row INSERT ... VALUES (..),(..) — two-phase / all-or-nothing (grammar.md §12).
+    "dml.insert_multi_row",
     "error.overflow_trap",
     // Step 6 — row mutation: UPDATE (in-place) + DELETE.
     "dml.update",

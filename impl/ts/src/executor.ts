@@ -137,73 +137,91 @@ export class Database {
     return { kind: "statement", cost: 0n };
   }
 
-  // executeInsert maps the literal values positionally to columns, type-checks each
-  // (NULL into NOT NULL traps 23502; an integer outside the column type's range traps
-  // 22003 — CLAUDE.md §8), then stores the row keyed by its encoded primary key
-  // (duplicate key traps 23505) or a monotonic synthetic rowid.
+  // executeInsert maps each row's literal values positionally to columns and type-checks
+  // them (NULL into NOT NULL traps 23502; an integer outside the column type's range traps
+  // 22003 — CLAUDE.md §8); a duplicate primary key traps 23505. A multi-row INSERT is
+  // two-phase / all-or-nothing (grammar.md §12), mirroring UPDATE: every row is validated —
+  // including its storage key checked against both the stored rows and earlier rows in the
+  // same statement — before any row is inserted, so a mid-batch failure stores nothing.
   private executeInsert(ins: Insert): Outcome {
     const table = this.table(ins.table);
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + ins.table);
     }
-    if (ins.values.length !== table.columns.length) {
-      throw engineError(
-        "syntax_error",
-        `INSERT has ${ins.values.length} values but table ${table.name} has ${table.columns.length} columns`,
-      );
-    }
-
-    const row: Row = new Array(table.columns.length);
-    for (let i = 0; i < table.columns.length; i++) {
-      const col = table.columns[i]!;
-      const lit = ins.values[i]!;
-      if (lit.kind === "null") {
-        if (col.notNull) {
-          throw engineError(
-            "not_null_violation",
-            "null value in column " + col.name + " violates not-null constraint",
-          );
-        }
-        row[i] = nullValue();
-      } else if (lit.kind === "int") {
-        if (!inRange(col.type, lit.int)) {
-          throw engineError(
-            "numeric_value_out_of_range",
-            "value out of range for type " + canonicalName(col.type),
-          );
-        }
-        row[i] = intValue(lit.int);
-      } else {
-        // boolean is expression-only: there are no boolean columns, so a boolean literal
-        // can only target an integer column — a type error (42804).
-        throw engineError(
-          "datatype_mismatch",
-          "cannot store a boolean value in integer column " + col.name,
-        );
-      }
-    }
-
-    // The storage key is the encoded primary key, or — for a table without one — a
-    // monotonic synthetic rowid: never reused, so DELETE then INSERT cannot collide
-    // with a freed key (spec/fileformat/format.md).
     const store = this.stores.get(ins.table.toLowerCase())!;
     const pk = primaryKeyIndex(table);
-    let key: Uint8Array;
-    if (pk >= 0) {
-      const pkv = row[pk]!; // non-null: a PK column is NOT NULL and was checked above
-      key = encodeInt(table.columns[pk]!.type, pkv.kind === "int" ? pkv.int : 0n);
-    } else {
-      key = encodeInt("int64", store.allocRowid());
+
+    // Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
+    // table with a primary key, the encoded key is checked for a duplicate (within the
+    // batch via seenKeys, and against the store) up front; for a table with none, key is
+    // null and a fresh monotonic rowid is allocated in phase 2.
+    const prepared: { key: Uint8Array | null; row: Row }[] = [];
+    const seenKeys = new Set<string>();
+    for (const lits of ins.rows) {
+      if (lits.length !== table.columns.length) {
+        throw engineError(
+          "syntax_error",
+          `INSERT row has ${lits.length} values but table ${table.name} has ${table.columns.length} columns`,
+        );
+      }
+
+      const row: Row = new Array(table.columns.length);
+      for (let i = 0; i < table.columns.length; i++) {
+        const col = table.columns[i]!;
+        const lit = lits[i]!;
+        if (lit.kind === "null") {
+          if (col.notNull) {
+            throw engineError(
+              "not_null_violation",
+              "null value in column " + col.name + " violates not-null constraint",
+            );
+          }
+          row[i] = nullValue();
+        } else if (lit.kind === "int") {
+          if (!inRange(col.type, lit.int)) {
+            throw engineError(
+              "numeric_value_out_of_range",
+              "value out of range for type " + canonicalName(col.type),
+            );
+          }
+          row[i] = intValue(lit.int);
+        } else {
+          // boolean is expression-only: there are no boolean columns, so a boolean literal
+          // can only target an integer column — a type error (42804).
+          throw engineError(
+            "datatype_mismatch",
+            "cannot store a boolean value in integer column " + col.name,
+          );
+        }
+      }
+
+      let key: Uint8Array | null = null;
+      if (pk >= 0) {
+        const pkv = row[pk]!; // non-null: a PK column is NOT NULL and was checked above
+        key = encodeInt(table.columns[pk]!.type, pkv.kind === "int" ? pkv.int : 0n);
+        const seen = key.join(",");
+        if (seenKeys.has(seen) || store.get(key) !== undefined) {
+          throw engineError(
+            "unique_violation",
+            "duplicate key value violates primary key uniqueness",
+          );
+        }
+        seenKeys.add(seen);
+      }
+      prepared.push({ key, row });
     }
 
-    if (!store.insert(key, row)) {
-      throw engineError(
-        "unique_violation",
-        "duplicate key value violates primary key uniqueness",
-      );
+    // Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
+    // rowid is allocated here, in row order, so a failed validation pass burns none
+    // (spec/fileformat/format.md, grammar.md §12).
+    for (const pr of prepared) {
+      const key = pr.key ?? encodeInt("int64", store.allocRowid());
+      if (!store.insert(key, pr.row)) {
+        throw new Error("pre-validated INSERT key must be unique");
+      }
     }
-    // A single-row INSERT of literal values reads no rows and evaluates no expression
-    // tree: zero cost (DEFAULT expressions, when added, will accrue here).
+    // INSERT of literal rows reads no rows and evaluates no expression tree: zero cost
+    // (DEFAULT expressions, when added, will accrue here).
     return { kind: "statement", cost: 0n };
   }
 

@@ -33,6 +33,10 @@ id = "dml.insert"
 description = "INSERT ... VALUES"
 
 [[capability]]
+id = "dml.insert_multi_row"
+description = "Multi-row INSERT ... VALUES (..),(..) — two-phase / all-or-nothing (grammar.md §12)"
+
+[[capability]]
 id = "dml.update"
 description = "UPDATE ... SET ... [WHERE] (in-place value replacement)"
 

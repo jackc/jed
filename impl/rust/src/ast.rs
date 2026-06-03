@@ -25,11 +25,15 @@ pub struct ColumnDef {
     pub primary_key: bool,
 }
 
+/// `INSERT INTO <table> VALUES (..)[, (..)]*`. One or more rows of literal values,
+/// each in column order. A multi-row INSERT is two-phase / all-or-nothing — every
+/// row is validated before any is stored (spec/design/grammar.md §12).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Insert {
     pub table: String,
-    /// One row's worth of literal values, in column order.
-    pub values: Vec<Literal>,
+    /// The rows to insert, in statement order; each inner vec is one row's literal
+    /// values in column order. Always non-empty (the parser requires ≥1 row).
+    pub rows: Vec<Vec<Literal>>,
 }
 
 /// `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each assignment's

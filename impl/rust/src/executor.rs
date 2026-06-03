@@ -16,7 +16,7 @@ use crate::error::{EngineError, Result, SqlState};
 use crate::storage::{Row, TableStore};
 use crate::types::{ScalarType, is_boolean_type_name};
 use crate::value::{Value, and3, from3, not3, or3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The outcome of executing one statement. Both variants carry the deterministic
 /// execution `cost` accrued while running the statement (CLAUDE.md §13) — a DML
@@ -158,10 +158,13 @@ impl Database {
         Ok(Outcome::Statement { cost: 0 })
     }
 
-    /// Analyze and run an INSERT: map the literal values positionally to columns,
-    /// type-check each (NULL into NOT NULL traps 23502; an integer outside the
-    /// column type's range traps 22003 — CLAUDE.md §8), then store the row keyed by
-    /// its encoded primary key (duplicate key traps 23505).
+    /// Analyze and run an INSERT of one or more rows. Each row maps its literal values
+    /// positionally to columns and is type-checked (NULL into NOT NULL traps 23502; an
+    /// integer outside the column type's range traps 22003 — CLAUDE.md §8); a duplicate
+    /// primary key traps 23505. A multi-row INSERT is **two-phase / all-or-nothing**
+    /// (spec/design/grammar.md §12), mirroring UPDATE: every row is validated — including
+    /// its storage key checked against both the stored rows and earlier rows in the same
+    /// statement — before any row is inserted, so a mid-batch failure stores nothing.
     fn execute_insert(&mut self, ins: Insert) -> Result<Outcome> {
         let table = self.table(&ins.table).ok_or_else(|| {
             EngineError::new(
@@ -170,84 +173,103 @@ impl Database {
             )
         })?;
 
-        if ins.values.len() != table.columns.len() {
-            return Err(EngineError::new(
-                SqlState::SyntaxError,
-                format!(
-                    "INSERT has {} values but table {} has {} columns",
-                    ins.values.len(),
-                    table.name,
-                    table.columns.len()
-                ),
-            ));
-        }
-
-        // Coerce + type-check each value against its column.
-        let mut row = Vec::with_capacity(table.columns.len());
-        for (col, lit) in table.columns.iter().zip(&ins.values) {
-            let value = match lit {
-                Literal::Null => {
-                    if col.not_null {
-                        return Err(EngineError::new(
-                            SqlState::NotNullViolation,
-                            format!(
-                                "null value in column {} violates not-null constraint",
-                                col.name
-                            ),
-                        ));
-                    }
-                    Value::Null
-                }
-                Literal::Int(n) => {
-                    if !col.ty.in_range(*n) {
-                        return Err(EngineError::new(
-                            SqlState::NumericValueOutOfRange,
-                            format!("value out of range for type {}", col.ty.canonical_name()),
-                        ));
-                    }
-                    Value::Int(*n)
-                }
-                // boolean is expression-only: there are no boolean columns, so a boolean
-                // literal can only target an integer column — a type error (42804).
-                Literal::Bool(_) => {
-                    return Err(EngineError::new(
-                        SqlState::DatatypeMismatch,
-                        format!(
-                            "cannot store a boolean value in integer column {}",
-                            col.name
-                        ),
-                    ));
-                }
-            };
-            row.push(value);
-        }
-
-        // The storage key is the encoded primary key, or — for a table without one —
-        // a monotonic synthetic rowid. Compute the PK column up front so the table
-        // borrow ends before the no-PK arm needs `store_mut`.
+        // Snapshot the catalog data each row is validated against, ending the `table`
+        // borrow so phase 1 can read the store (dup-key check) and phase 2 can mutate it.
+        let table_name = table.name.clone();
+        let columns: Vec<Column> = table.columns.clone();
         let pk = table.primary_key_index().map(|i| (i, table.columns[i].ty));
-        let key = match pk {
-            Some((i, pk_ty)) => match row[i] {
-                Value::Int(n) => encode_int(pk_ty, n),
-                // Unreachable: a PK column is NOT NULL, enforced above.
-                Value::Null => unreachable!("primary key column is NOT NULL"),
-                // Unreachable: boolean is expression-only; no column is boolean.
-                Value::Bool(_) => unreachable!("a boolean cannot be a stored column value"),
-            },
-            // Monotonic rowid: never reused, so DELETE then INSERT cannot collide
-            // with a freed key (spec/fileformat/format.md).
-            None => encode_int(ScalarType::Int64, self.store_mut(&ins.table).alloc_rowid()),
-        };
 
-        let store = self.store_mut(&ins.table);
-        if !store.insert(key, row) {
-            return Err(EngineError::new(
-                SqlState::UniqueViolation,
-                "duplicate key value violates primary key uniqueness",
-            ));
+        // Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
+        // table with a primary key, `key` is Some(encoded) and is checked for a duplicate
+        // (within the batch via `seen_keys`, and against the store) up front; for a table
+        // with none it is None and a fresh monotonic rowid is allocated in phase 2.
+        let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(ins.rows.len());
+        let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+        for lits in &ins.rows {
+            if lits.len() != columns.len() {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    format!(
+                        "INSERT row has {} values but table {} has {} columns",
+                        lits.len(),
+                        table_name,
+                        columns.len()
+                    ),
+                ));
+            }
+
+            let mut row = Vec::with_capacity(columns.len());
+            for (col, lit) in columns.iter().zip(lits) {
+                let value = match lit {
+                    Literal::Null => {
+                        if col.not_null {
+                            return Err(EngineError::new(
+                                SqlState::NotNullViolation,
+                                format!(
+                                    "null value in column {} violates not-null constraint",
+                                    col.name
+                                ),
+                            ));
+                        }
+                        Value::Null
+                    }
+                    Literal::Int(n) => {
+                        if !col.ty.in_range(*n) {
+                            return Err(EngineError::new(
+                                SqlState::NumericValueOutOfRange,
+                                format!("value out of range for type {}", col.ty.canonical_name()),
+                            ));
+                        }
+                        Value::Int(*n)
+                    }
+                    // boolean is expression-only: there are no boolean columns, so a boolean
+                    // literal can only target an integer column — a type error (42804).
+                    Literal::Bool(_) => {
+                        return Err(EngineError::new(
+                            SqlState::DatatypeMismatch,
+                            format!("cannot store a boolean value in integer column {}", col.name),
+                        ));
+                    }
+                };
+                row.push(value);
+            }
+
+            let key = match pk {
+                Some((i, pk_ty)) => {
+                    let k = match row[i] {
+                        Value::Int(n) => encode_int(pk_ty, n),
+                        // Unreachable: a PK column is NOT NULL, enforced above.
+                        Value::Null => unreachable!("primary key column is NOT NULL"),
+                        // Unreachable: boolean is expression-only; no column is boolean.
+                        Value::Bool(_) => unreachable!("a boolean cannot be a stored column value"),
+                    };
+                    if seen_keys.contains(&k) || self.store(&ins.table).get(&k).is_some() {
+                        return Err(EngineError::new(
+                            SqlState::UniqueViolation,
+                            "duplicate key value violates primary key uniqueness",
+                        ));
+                    }
+                    seen_keys.insert(k.clone());
+                    Some(k)
+                }
+                None => None,
+            };
+            prepared.push((key, row));
         }
-        // A single-row INSERT of literal values reads no rows and evaluates no
-        // expression tree: zero cost (DEFAULT expressions, when added, will accrue here).
+
+        // Phase 2 — every row validated, so each insert is guaranteed to succeed. A
+        // synthetic rowid is allocated here, in row order, so a failed validation pass
+        // burns none (spec/fileformat/format.md, spec/design/grammar.md §12).
+        let store = self.store_mut(&ins.table);
+        for (key, row) in prepared {
+            let key = key.unwrap_or_else(|| encode_int(ScalarType::Int64, store.alloc_rowid()));
+            assert!(
+                store.insert(key, row),
+                "pre-validated INSERT key must be unique"
+            );
+        }
+        // INSERT of literal rows reads no rows and evaluates no expression tree: zero
+        // cost (DEFAULT expressions, when added, will accrue here).
         Ok(Outcome::Statement { cost: 0 })
     }
 

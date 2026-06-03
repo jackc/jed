@@ -57,8 +57,17 @@ type_name      ::= identifier
 
 /* --- DML ----------------------------------------------------------------- */
 
-insert         ::= "INSERT" "INTO" identifier
-                   "VALUES" "(" literal ("," literal)* ")"
+/* INSERT is multi-row: "VALUES" is one or more parenthesized rows. Every row has
+ * the table's column count (a row with the wrong arity is 42601), and the values
+ * are literals only (the `literal` rule below; no expressions, no columns). A
+ * multi-row INSERT is two-phase / all-or-nothing, exactly like UPDATE
+ * (../design/grammar.md §12): every row is fully validated — arity, type/range
+ * (22003), NOT NULL (23502) — and every storage key checked for a duplicate
+ * (23505), both against existing rows AND earlier rows in the same statement,
+ * BEFORE any row is inserted. If any check fails, no row is inserted. */
+insert         ::= "INSERT" "INTO" identifier "VALUES" row ("," row)*
+
+row            ::= "(" literal ("," literal)* ")"
 
 update         ::= "UPDATE" identifier "SET"
                    assignment ("," assignment)*

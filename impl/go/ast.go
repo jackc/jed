@@ -26,10 +26,13 @@ type ColumnDef struct {
 	PrimaryKey bool
 }
 
-// Insert is an INSERT ... VALUES with one row of literals, in column order.
+// Insert is an INSERT ... VALUES with one or more rows of literals, each in column
+// order. A multi-row INSERT is two-phase / all-or-nothing — every row is validated
+// before any is stored (spec/design/grammar.md §12). Rows is always non-empty (the
+// parser requires ≥1 row).
 type Insert struct {
-	Table  string
-	Values []Literal
+	Table string
+	Rows  [][]Literal
 }
 
 // Update is `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each

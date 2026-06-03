@@ -162,8 +162,10 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	return ColumnDef{Name: name, TypeName: typeName, PrimaryKey: primaryKey}, nil
 }
 
-// parseInsert parses `INSERT INTO <table> VALUES ( <literal> [, <literal>]* )`.
-// Values map positionally to columns; the executor type-checks against the catalog.
+// parseInsert parses `INSERT INTO <table> VALUES <row> [, <row>]*`, where each <row>
+// is `( <literal> [, <literal>]* )`. Values map positionally to columns; the executor
+// type-checks each row against the catalog and inserts all-or-nothing
+// (spec/design/grammar.md §12).
 func (p *Parser) parseInsert() (*Insert, error) {
 	if err := p.expectKeyword("insert"); err != nil {
 		return nil, err
@@ -178,10 +180,28 @@ func (p *Parser) parseInsert() (*Insert, error) {
 	if err := p.expectKeyword("values"); err != nil {
 		return nil, err
 	}
+
+	var rows [][]Literal
+	for {
+		row, err := p.parseInsertRow()
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+		if p.peek().Kind == TokComma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	return &Insert{Table: table, Rows: rows}, nil
+}
+
+// parseInsertRow parses one parenthesized `( <literal> [, <literal>]* )` row of an INSERT.
+func (p *Parser) parseInsertRow() ([]Literal, error) {
 	if err := p.expect(TokLParen); err != nil {
 		return nil, err
 	}
-
 	var values []Literal
 	for {
 		lit, err := p.parseLiteral()
@@ -199,9 +219,9 @@ func (p *Parser) parseInsert() (*Insert, error) {
 		break
 	}
 	if len(values) == 0 {
-		return nil, NewError(SyntaxError, "VALUES must have at least one value")
+		return nil, NewError(SyntaxError, "a VALUES row must have at least one value")
 	}
-	return &Insert{Table: table, Values: values}, nil
+	return values, nil
 }
 
 // parseLiteral parses a literal value for INSERT: an integer (with an optional leading
