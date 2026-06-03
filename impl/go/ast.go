@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Abstract syntax for the step-1 SQL surface. Boring, explicit shapes (CLAUDE.md
 // §10); the hand-written parser produces these.

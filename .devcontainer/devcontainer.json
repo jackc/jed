@@ -2,7 +2,7 @@
   "name": "${localWorkspaceFolderBasename}",
   "dockerComposeFile": "docker-compose.yml",
   "service": "app",
-  "workspaceFolder": "/workspaces/abide",
+  "workspaceFolder": "/workspaces/jed",
 
   "containerEnv": {
     "LANG":              "en_US.UTF-8",
@@ -27,7 +27,7 @@
     "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
   },
 
-  "initializeCommand": "docker volume create devstate-shared-abide >/dev/null",
+  "initializeCommand": "docker volume create devstate-shared-jed >/dev/null",
 
   "onCreateCommand": ".devcontainer/on-create.bash",
 

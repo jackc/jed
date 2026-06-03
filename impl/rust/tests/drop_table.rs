@@ -2,9 +2,9 @@
 //! inverse of CREATE TABLE: a missing table is 42P01 and there is no IF EXISTS this
 //! slice; single table, no CASCADE/RESTRICT (spec/design/grammar.md §13).
 
-use abide::{Database, Outcome, execute};
+use jed::{Database, Outcome, execute};
 
-fn run(db: &mut Database, sql: &str) -> abide::Result<Outcome> {
+fn run(db: &mut Database, sql: &str) -> jed::Result<Outcome> {
     execute(db, sql)
 }
 

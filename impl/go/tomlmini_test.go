@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // A deliberately tiny TOML reader for the cross-check tests ONLY. It understands
 // just enough of the spec tables' shape — arrays of tables (`[[type]]`), scalar

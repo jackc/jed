@@ -1,8 +1,8 @@
 //! Step 6: DELETE — predicate-matched removal, no-WHERE clears, three-valued logic,
 //! and the no-PK monotonic-rowid regression (DELETE then INSERT must not collide).
 
-use abide::value::Value;
-use abide::{Database, Outcome, execute};
+use jed::value::Value;
+use jed::{Database, Outcome, execute};
 
 fn db_with(stmts: &[&str]) -> Database {
     let mut db = Database::new();

@@ -1,8 +1,8 @@
-// Package abide is the Go core of the engine (CLAUDE.md §2): a downstream consumer
+// Package jed is the Go core of the engine (CLAUDE.md §2): a downstream consumer
 // of /spec, the canonical source of truth. Pure Go — no cgo, no FFI. It implements
 // the step-1 surface (integer DDL/DML/SELECT) and ships a conformance harness
 // (cmd/conformance) that runs the shared corpus.
-package abide
+package jed
 
 import "fmt"
 

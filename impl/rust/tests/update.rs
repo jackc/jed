@@ -2,8 +2,8 @@
 //! two-phase all-or-nothing guarantee, and the rejected cases (PK column, duplicate
 //! target, overflow, not-null).
 
-use abide::value::Value;
-use abide::{Database, Outcome, execute};
+use jed::value::Value;
+use jed::{Database, Outcome, execute};
 
 fn db_with(stmts: &[&str]) -> Database {
     let mut db = Database::new();

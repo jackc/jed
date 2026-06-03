@@ -13,7 +13,7 @@
 #
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
-MAGIC = "ABDB".b
+MAGIC = "JEDB".b
 VERSION = 1
 PAGE_HEADER = 12
 ROOT_PAGE = 2
@@ -47,17 +47,17 @@ TEXT_TABLE = {
 }.freeze
 
 FIXTURES = [
-  { file: "empty_db.adb",        page_size: 256, tables: [] },
-  { file: "one_table_empty.adb", page_size: 256,
+  { file: "empty_db.jed",        page_size: 256, tables: [] },
+  { file: "one_table_empty.jed", page_size: 256,
     tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("v", "int16")], rows: [] }] },
-  { file: "pk_table.adb",        page_size: 256, tables: [PK_TABLE] },
-  { file: "text_table.adb",      page_size: 256, tables: [TEXT_TABLE] },
-  { file: "nopk_table.adb",      page_size: 256,
+  { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
+  { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
+  { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
-  { file: "torn_meta_slot0.adb", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
-  { file: "torn_meta_slot1.adb", page_size: 256, tables: [PK_TABLE], corrupt_slot: 1 }
+  { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
+  { file: "torn_meta_slot1.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 1 }
 ].freeze
 
 # --- primitives -------------------------------------------------------------

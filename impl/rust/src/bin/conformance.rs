@@ -10,7 +10,7 @@
 //! core's declared capability set. The manifest/profile data is validated
 //! separately by `rake verify`. Exit code is nonzero if any run file fails.
 
-use abide::{Database, Outcome, SUPPORTED_CAPABILITIES, Value};
+use jed::{Database, Outcome, SUPPORTED_CAPABILITIES, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -174,7 +174,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 }
                 let expect = parts.next().unwrap_or("");
                 let sql = take_sql(&mut lines);
-                let result = abide::execute(&mut db, &sql);
+                let result = jed::execute(&mut db, &sql);
                 match expect {
                     "ok" => match result {
                         Ok(outcome) => assert_cost(expected_cost, outcome.cost(), &sql)?,
@@ -217,7 +217,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                     }
                     expected.push(l.trim().to_string());
                 }
-                let outcome = abide::execute(&mut db, &sql).map_err(|e| {
+                let outcome = jed::execute(&mut db, &sql).map_err(|e| {
                     format!(
                         "query failed with {}: {}\n  SQL: {sql}",
                         e.code(),

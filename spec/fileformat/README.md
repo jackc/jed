@@ -20,7 +20,7 @@ format** that realizes it.
 | File | Contents |
 |---|---|
 | [format.md](format.md) | The byte-exact format: meta double-buffer, page header, catalog chain, record layout, value codec, stable type codes, packing rule. The canonical contract. |
-| [fixtures/](fixtures/) | Byte-exact golden `.adb` files at `page_size = 256` (reviewable hex). Each core reads them and writes bytes equal to them. |
+| [fixtures/](fixtures/) | Byte-exact golden `.jed` files at `page_size = 256` (reviewable hex). Each core reads them and writes bytes equal to them. |
 | [verify.rb](verify.rb) | Independent Ruby reference that (re)generates and validates the goldens — a *third* implementation, so the goldens are not self-certified by the two cores. `--generate` rewrites them; bare run verifies. Test-time only; run via `rake verify`. |
 
 ## Scope (step-5b)

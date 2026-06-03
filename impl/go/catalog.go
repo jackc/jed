@@ -1,4 +1,4 @@
-package abide
+package jed
 
 import "strings"
 

@@ -338,8 +338,8 @@ function writeMeta(
   pageCount: number,
 ): void {
   const off = slot * ps;
-  image[off] = 0x41; // 'A'
-  image[off + 1] = 0x42; // 'B'
+  image[off] = 0x4a; // 'J'
+  image[off + 1] = 0x45; // 'E'
   image[off + 2] = 0x44; // 'D'
   image[off + 3] = 0x42; // 'B'
   dv.setUint16(off + 4, FORMAT_VERSION, false);
@@ -376,7 +376,7 @@ type Meta = { txid: bigint; rootPage: number };
 function readMeta(image: Uint8Array, dv: DataView, ps: number, slot: number): Meta | null {
   const off = slot * ps;
   if (off + ps > image.length) return null;
-  if (!(image[off] === 0x41 && image[off + 1] === 0x42 && image[off + 2] === 0x44 && image[off + 3] === 0x42)) {
+  if (!(image[off] === 0x4a && image[off + 1] === 0x45 && image[off + 2] === 0x44 && image[off + 3] === 0x42)) {
     return null;
   }
   if (dv.getUint16(off + 4, false) !== FORMAT_VERSION) return null;

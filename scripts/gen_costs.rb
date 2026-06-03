@@ -90,7 +90,7 @@ def go_file(us)
     // hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
     // `rake verify` fails if this file is stale. Reasoning: ../../spec/design/cost.md.
 
-    package abide
+    package jed
 
     // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
     type CostSchedule struct {

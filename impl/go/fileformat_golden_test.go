@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Golden-file cross-core test (CLAUDE.md §8). The load-bearing honesty test for the
 // on-disk format: each core must (a) READ a checked-in golden into the expected
@@ -95,11 +95,11 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		name  string
 		build func(*testing.T) *Database
 	}{
-		{"empty_db.adb", func(*testing.T) *Database { return NewDatabase() }},
-		{"one_table_empty.adb", oneTableEmptyDB},
-		{"pk_table.adb", pkTableDB},
-		{"text_table.adb", textTableDB},
-		{"nopk_table.adb", nopkTableDB},
+		{"empty_db.jed", func(*testing.T) *Database { return NewDatabase() }},
+		{"one_table_empty.jed", oneTableEmptyDB},
+		{"pk_table.jed", pkTableDB},
+		{"text_table.jed", textTableDB},
+		{"nopk_table.jed", nopkTableDB},
 	}
 	for _, c := range cases {
 		image, err := c.build(t).ToImage(goldenPageSize, 1)
@@ -120,12 +120,12 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		build func(*testing.T) *Database
 		table string
 	}{
-		{"one_table_empty.adb", oneTableEmptyDB, "t"},
-		{"pk_table.adb", pkTableDB, "t"},
-		{"text_table.adb", textTableDB, "t"},
-		{"nopk_table.adb", nopkTableDB, "r"},
-		{"torn_meta_slot0.adb", pkTableDB, "t"},
-		{"torn_meta_slot1.adb", pkTableDB, "t"},
+		{"one_table_empty.jed", oneTableEmptyDB, "t"},
+		{"pk_table.jed", pkTableDB, "t"},
+		{"text_table.jed", textTableDB, "t"},
+		{"nopk_table.jed", nopkTableDB, "r"},
+		{"torn_meta_slot0.jed", pkTableDB, "t"},
+		{"torn_meta_slot1.jed", pkTableDB, "t"},
 	}
 	for _, c := range cases {
 		loaded, err := LoadDatabase(fixture(t, c.name))
@@ -140,7 +140,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 	}
 
 	// Empty database: zero tables, and a missing table reads as absent.
-	empty, err := LoadDatabase(fixture(t, "empty_db.adb"))
+	empty, err := LoadDatabase(fixture(t, "empty_db.jed"))
 	if err != nil {
 		t.Fatalf("load empty_db: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 // READ side, catalog detail: column names, types, and flags survive exactly (a read
 // bug in an unexercised flag would otherwise slip past a rows-only check).
 func TestReadGoldenReconstructsCatalog(t *testing.T) {
-	loaded, err := LoadDatabase(fixture(t, "pk_table.adb"))
+	loaded, err := LoadDatabase(fixture(t, "pk_table.jed"))
 	if err != nil {
 		t.Fatalf("load pk_table: %v", err)
 	}

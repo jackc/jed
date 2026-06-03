@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // SupportedCapabilities lists the capabilities this implementation currently
 // supports (spec/conformance: the gating axis). The harness runs a corpus file iff

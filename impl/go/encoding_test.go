@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Cross-check: the Go key encoder must reproduce the byte-exact vectors in
 // spec/encoding/integers.toml (CLAUDE.md §8). This is what guarantees the Rust and

@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // On-disk single-file format: serialize / load (spec/fileformat/format.md).
 //
@@ -16,8 +16,8 @@ import (
 	"unicode/utf8"
 )
 
-// magic — ASCII "ABDB" (working magic; revisit when the project is named).
-var magic = [4]byte{'A', 'B', 'D', 'B'}
+// magic — ASCII "JEDB" (the engine is named `jed`).
+var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
 	formatVersion uint16 = 1  // on-disk format version

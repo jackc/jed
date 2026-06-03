@@ -31,9 +31,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Phase 0 — Meta / housekeeping
 
-- [ ] **Name the project.** CLAUDE.md says the name is *TBD*; `abide` is the de-facto
-      placeholder (Cargo crate, Go module, `.adb` file extension). Decide: ratify `abide`
-      or pick a name, then sweep the codebase + docs. _(size: S)_
+- [x] **Name the project.** Settled on **`jed`** (was the placeholder `abide`). Swept the
+      codebase + docs: Cargo crate, Go module/package, TS package, the on-disk magic
+      (`ABDB` → `JEDB`), the file extension (`.adb` → `.jed`), and the devcontainer
+      identifiers (`devstate-shared-jed`, `/workspaces/jed`). _(size: S)_
 
 ---
 
@@ -241,7 +242,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       PostgreSQL `C` (UTF-8 byte / code-point order; `scalars.toml` records the type with
       `collation = "C"`). Storage + single-quoted literals (`''` escaping) + comparison/ordering
       (`= < > <= >=`, `IS [NOT] DISTINCT FROM`); on-disk type code 4 with a compact value codec
-      (u16 len + UTF-8 bytes), byte-exact across cores (golden `text_table.adb`). First operator
+      (u16 len + UTF-8 bytes), byte-exact across cores (golden `text_table.jed`). First operator
       **overload** (`=` over integer & text) — `catalog.toml` carries one row per `(name,
       arg_families)`; `functions/verify.rb` and the per-core drift tests key on the signature.
       The UTF-8-vs-UTF-16 ordering trap is handled in TS (`compareTextC` encodes to UTF-8, never

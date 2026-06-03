@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Step 6: DELETE — predicate-matched removal, no-WHERE clears, three-valued logic,
 // and the no-PK monotonic-rowid regression (DELETE then INSERT must not collide).

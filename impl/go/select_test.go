@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Phase D/E: SELECT — projection, WHERE (=, ordering ops, IS [NOT] NULL),
 // three-valued logic, ORDER BY (NULLs last), and CAST. These complement the

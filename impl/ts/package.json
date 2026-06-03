@@ -1,5 +1,5 @@
 {
-  "name": "abide-ts",
+  "name": "jed-ts",
   "version": "0.0.0",
   "private": true,
   "description": "The TypeScript/JavaScript core of the engine (CLAUDE.md §2) — a native, downstream consumer of /spec. Runs on modern Node via native type-stripping; no build step.",

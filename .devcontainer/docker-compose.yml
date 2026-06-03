@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - ..:/workspaces/abide:cached
+      - ..:/workspaces/jed:cached
       - devstate-local:/persist/local
       - devstate-shared:/persist/shared
     command: sleep infinity
@@ -32,5 +32,5 @@ volumes:
   # shared across all containers for this project
   # pre-created in devcontainer.json's initializeCommand
   devstate-shared:
-    name: devstate-shared-abide
+    name: devstate-shared-jed
     external: true

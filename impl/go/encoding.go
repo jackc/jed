@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Order-preserving key encoding (CLAUDE.md §8; spec/design/encoding.md). Encoded
 // keys sort byte-for-byte identically to logical order, so stored key order needs no

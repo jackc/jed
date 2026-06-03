@@ -2,8 +2,8 @@
 //! spec/encoding/integers.toml (CLAUDE.md §8). This is what guarantees the Rust and
 //! Go cores iterate keys in the same order. TOML is a test-time-only dependency.
 
-use abide::encoding::{decode_int, encode_int, encode_nullable};
-use abide::types::ScalarType;
+use jed::encoding::{decode_int, encode_int, encode_nullable};
+use jed::types::ScalarType;
 use std::path::Path;
 
 fn spec(rel: &str) -> String {

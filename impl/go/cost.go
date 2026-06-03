@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Deterministic cost meter (CLAUDE.md §13).
 //

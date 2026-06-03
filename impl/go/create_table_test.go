@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Phase B: CREATE TABLE — parse, analyze, register in the catalog. Driven by unit
 // tests until the `core` profile is complete and the corpus runs (Phase E).

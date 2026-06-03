@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Cross-check: the hand-written type and error constants in the Go core must match
 // the canonical spec data tables (CLAUDE.md §5). The spec TOML is parsed with a tiny

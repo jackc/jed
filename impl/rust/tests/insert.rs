@@ -1,8 +1,8 @@
 //! Phase C: INSERT ... VALUES — positional type-checking, overflow trap (22003),
 //! NOT NULL (23502) and unique-PK (23505) enforcement, storage in PK order.
 
-use abide::value::Value;
-use abide::{Database, Outcome, execute};
+use jed::value::Value;
+use jed::{Database, Outcome, execute};
 
 fn db_with(sql: &[&str]) -> Database {
     let mut db = Database::new();

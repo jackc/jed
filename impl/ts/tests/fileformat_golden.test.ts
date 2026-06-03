@@ -70,11 +70,11 @@ function textTableDB(): Database {
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
-    { name: "empty_db.adb", build: () => new Database() },
-    { name: "one_table_empty.adb", build: oneTableEmptyDB },
-    { name: "pk_table.adb", build: pkTableDB },
-    { name: "text_table.adb", build: textTableDB },
-    { name: "nopk_table.adb", build: nopkTableDB },
+    { name: "empty_db.jed", build: () => new Database() },
+    { name: "one_table_empty.jed", build: oneTableEmptyDB },
+    { name: "pk_table.jed", build: pkTableDB },
+    { name: "text_table.jed", build: textTableDB },
+    { name: "nopk_table.jed", build: nopkTableDB },
   ];
   for (const c of cases) {
     const image = toImage(c.build(), GOLDEN_PAGE_SIZE, 1n);
@@ -90,12 +90,12 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
 // torn-meta goldens must read through the valid slot to the pk_table content.
 test("read goldens reproduces rows", () => {
   const cases: { name: string; build: () => Database; table: string }[] = [
-    { name: "one_table_empty.adb", build: oneTableEmptyDB, table: "t" },
-    { name: "pk_table.adb", build: pkTableDB, table: "t" },
-    { name: "text_table.adb", build: textTableDB, table: "t" },
-    { name: "nopk_table.adb", build: nopkTableDB, table: "r" },
-    { name: "torn_meta_slot0.adb", build: pkTableDB, table: "t" },
-    { name: "torn_meta_slot1.adb", build: pkTableDB, table: "t" },
+    { name: "one_table_empty.jed", build: oneTableEmptyDB, table: "t" },
+    { name: "pk_table.jed", build: pkTableDB, table: "t" },
+    { name: "text_table.jed", build: textTableDB, table: "t" },
+    { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
+    { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
+    { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },
   ];
   for (const c of cases) {
     const loaded = loadDatabase(fixture(c.name));
@@ -106,13 +106,13 @@ test("read goldens reproduces rows", () => {
     );
   }
   // Empty database: zero tables, and a missing table reads as absent.
-  const empty = loadDatabase(fixture("empty_db.adb"));
+  const empty = loadDatabase(fixture("empty_db.jed"));
   assert.equal(empty.table("t"), undefined, "empty_db should have no tables");
 });
 
 // READ side, catalog detail: column names, types, and flags survive exactly.
 test("read golden reconstructs catalog", () => {
-  const loaded = loadDatabase(fixture("pk_table.adb"));
+  const loaded = loadDatabase(fixture("pk_table.jed"));
   const tbl = loaded.table("t");
   assert.ok(tbl, "table t missing");
   assert.equal(tbl!.name, "t");

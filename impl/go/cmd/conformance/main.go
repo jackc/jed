@@ -18,7 +18,7 @@ import (
 	"strconv"
 	"strings"
 
-	"abide"
+	"jed"
 )
 
 func main() {
@@ -37,7 +37,7 @@ func run() int {
 	sort.Strings(files)
 
 	supported := map[string]bool{}
-	for _, c := range abide.SupportedCapabilities {
+	for _, c := range jed.SupportedCapabilities {
 		supported[c] = true
 	}
 
@@ -165,7 +165,7 @@ func assertNames(expected []string, actual []string, sql string) error {
 
 // runFile runs all records in one .test file against a fresh database.
 func runFile(text string) error {
-	db := abide.NewDatabase()
+	db := jed.NewDatabase()
 	lines := strings.Split(text, "\n")
 	i := 0
 	// A `# cost: N` / `# names: ...` directive sets these; the next record consumes them.
@@ -205,7 +205,7 @@ func runFile(text string) error {
 			}
 			i++
 			sql := takeSQL(lines, &i)
-			outcome, err := abide.Execute(db, sql)
+			outcome, err := jed.Execute(db, sql)
 			switch expect {
 			case "ok":
 				if err != nil {
@@ -244,7 +244,7 @@ func runFile(text string) error {
 				expected = append(expected, strings.TrimSpace(lines[i]))
 				i++
 			}
-			outcome, err := abide.Execute(db, sql)
+			outcome, err := jed.Execute(db, sql)
 			if err != nil {
 				return fmt.Errorf("query failed with %s\n  SQL: %s", err.Error(), sql)
 			}
@@ -271,7 +271,7 @@ func runFile(text string) error {
 }
 
 func codeOf(err error) string {
-	if e, ok := err.(*abide.EngineError); ok {
+	if e, ok := err.(*jed.EngineError); ok {
 		return e.Code()
 	}
 	return "?"
@@ -299,8 +299,8 @@ func takeSQLUntilSeparator(lines []string, i *int) string {
 	return strings.Join(sql, "\n")
 }
 
-func renderOutcome(o abide.Outcome, cols int, sortmode string) []string {
-	if o.Kind != abide.OutcomeQuery {
+func renderOutcome(o jed.Outcome, cols int, sortmode string) []string {
+	if o.Kind != jed.OutcomeQuery {
 		return nil
 	}
 	var flat []string

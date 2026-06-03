@@ -124,7 +124,7 @@ def go_file(ops)
     // (§5 forbids codegenning those). Regenerate with `rake codegen`; `rake verify` fails
     // if this file is stale. Reasoning: ../../spec/design/codegen.md.
 
-    package abide
+    package jed
 
     // OperatorDesc is one operator's metadata, mirroring a [[operator]] entry in catalog.toml.
     // Symbol is "" for operators with no infix symbol (the IS [NOT] NULL tests).

@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // DROP TABLE — remove a table (its definition + all its rows) from the catalog. The
 // inverse of CREATE TABLE: a missing table is 42P01 and there is no IF EXISTS this

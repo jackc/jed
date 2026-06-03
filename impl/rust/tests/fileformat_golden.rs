@@ -6,9 +6,9 @@
 //! without any live cross-process exchange. Goldens are authored at page_size 256 by
 //! spec/fileformat/verify.rb (the independent reference).
 
-use abide::types::ScalarType;
-use abide::value::Value;
-use abide::{Database, execute};
+use jed::types::ScalarType;
+use jed::value::Value;
+use jed::{Database, execute};
 use std::path::PathBuf;
 
 /// The page size the goldens are authored at (small, so the hex stays reviewable).
@@ -79,11 +79,11 @@ fn text_table_db() -> Database {
 #[test]
 fn write_matches_goldens() {
     let cases: &[(&str, Builder)] = &[
-        ("empty_db.adb", Database::new),
-        ("one_table_empty.adb", one_table_empty_db),
-        ("pk_table.adb", pk_table_db),
-        ("text_table.adb", text_table_db),
-        ("nopk_table.adb", nopk_table_db),
+        ("empty_db.jed", Database::new),
+        ("one_table_empty.jed", one_table_empty_db),
+        ("pk_table.jed", pk_table_db),
+        ("text_table.jed", text_table_db),
+        ("nopk_table.jed", nopk_table_db),
     ];
     for (name, build) in cases {
         let image = build().to_image(GOLDEN_PAGE_SIZE, 1).unwrap();
@@ -96,12 +96,12 @@ fn write_matches_goldens() {
 #[test]
 fn read_goldens_reproduces_rows() {
     let cases: &[(&str, Builder, &str)] = &[
-        ("one_table_empty.adb", one_table_empty_db, "t"),
-        ("pk_table.adb", pk_table_db, "t"),
-        ("text_table.adb", text_table_db, "t"),
-        ("nopk_table.adb", nopk_table_db, "r"),
-        ("torn_meta_slot0.adb", pk_table_db, "t"),
-        ("torn_meta_slot1.adb", pk_table_db, "t"),
+        ("one_table_empty.jed", one_table_empty_db, "t"),
+        ("pk_table.jed", pk_table_db, "t"),
+        ("text_table.jed", text_table_db, "t"),
+        ("nopk_table.jed", nopk_table_db, "r"),
+        ("torn_meta_slot0.jed", pk_table_db, "t"),
+        ("torn_meta_slot1.jed", pk_table_db, "t"),
     ];
     for (name, build, table) in cases {
         let loaded = Database::from_image(&fixture(name))
@@ -115,7 +115,7 @@ fn read_goldens_reproduces_rows() {
     }
 
     // Empty database: zero tables, and a missing table reads as None.
-    let empty = Database::from_image(&fixture("empty_db.adb")).unwrap();
+    let empty = Database::from_image(&fixture("empty_db.jed")).unwrap();
     assert!(empty.table("t").is_none());
 }
 
@@ -123,7 +123,7 @@ fn read_goldens_reproduces_rows() {
 /// bug in an unexercised flag would otherwise slip past a rows-only check).
 #[test]
 fn read_golden_reconstructs_catalog() {
-    let loaded = Database::from_image(&fixture("pk_table.adb")).unwrap();
+    let loaded = Database::from_image(&fixture("pk_table.jed")).unwrap();
     let t = loaded.table("t").expect("table t");
     assert_eq!(t.name, "t");
     assert_eq!(t.columns.len(), 2);

@@ -4,7 +4,7 @@
 > load-bearing record of architectural decisions. Read it before making changes.
 > When a decision here is revised, update this file in the same change.
 
-The project name is TBD. This document refers to it as "the engine."
+The project name is **jed**. This document also refers to it descriptively as "the engine."
 
 ---
 

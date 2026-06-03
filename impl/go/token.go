@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // TokenKind classifies a lexed token.
 type TokenKind int

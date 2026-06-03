@@ -1,4 +1,4 @@
-# The engine (name TBD)
+# jed
 
 An **embedded SQL database** — *SQLite's footprint, PostgreSQL's behavior, and a real
 (strict, static) type system.* Single-file storage and in-process embedding from SQLite;

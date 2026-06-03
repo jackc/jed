@@ -2,10 +2,10 @@
 //! match the canonical spec data tables (CLAUDE.md §5). TOML is a test-time-only
 //! dependency. If the spec changes and the core doesn't (or vice versa), this fails.
 
-use abide::costs::COSTS;
-use abide::error::SqlState;
-use abide::operators::OPERATORS;
-use abide::types::{ScalarType, is_boolean_type_name};
+use jed::costs::COSTS;
+use jed::error::SqlState;
+use jed::operators::OPERATORS;
+use jed::types::{ScalarType, is_boolean_type_name};
 use std::path::Path;
 
 fn spec(rel: &str) -> String {

@@ -52,7 +52,7 @@ Two slots for torn-write-safe atomic publish (the bbolt model — storage.md §4
 
 | offset | size | field |
 |---|---|---|
-| 0  | 4 | `magic` = `41 42 44 42` (ASCII `ABDB`; working magic, revisit when the project is named) |
+| 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
 | 4  | 2 | `format_version` (u16) — current = `1` |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
@@ -209,12 +209,12 @@ by the independent Ruby reference in [verify.rb](verify.rb) (run via `rake verif
 
 | fixture | exercises |
 |---|---|
-| `empty_db.adb` | zero tables; catalog `item_count = 0` |
-| `one_table_empty.adb` | one table, zero rows (`root_data_page = 0`) |
-| `pk_table.adb` | a PK table with rows spanning **>1** data page; a NULL value in a row |
-| `nopk_table.adb` | a table with no PK — exercises the stored synthetic `int64` rowid key |
-| `torn_meta_slot0.adb` | slot 0 checksum corrupted → loader falls back to slot 1 |
-| `torn_meta_slot1.adb` | slot 1 checksum corrupted → loader falls back to slot 0 |
+| `empty_db.jed` | zero tables; catalog `item_count = 0` |
+| `one_table_empty.jed` | one table, zero rows (`root_data_page = 0`) |
+| `pk_table.jed` | a PK table with rows spanning **>1** data page; a NULL value in a row |
+| `nopk_table.jed` | a table with no PK — exercises the stored synthetic `int64` rowid key |
+| `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
+| `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |
 
 The "highest `txid` wins" selection (vs. the torn-write fallback) is covered by per-core
 unit tests that craft two valid slots with differing `txid`, since a fresh whole-image write

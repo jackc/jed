@@ -1,12 +1,12 @@
 [package]
-name = "abide"
+name = "jed"
 version = "0.0.0"
 edition = "2024"
 publish = false
 description = "Rust core of the engine — a downstream consumer of /spec (CLAUDE.md §2)."
 
 [lib]
-name = "abide"
+name = "jed"
 path = "src/lib.rs"
 
 # The conformance harness: runs the shared corpus under spec/conformance.

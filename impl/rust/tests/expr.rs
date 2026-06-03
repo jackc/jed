@@ -3,8 +3,8 @@
 //! connectives, operator precedence, and parentheses. These complement the conformance
 //! corpus (spec/conformance/suites/expr/) with finer-grained per-feature assertions.
 
-use abide::value::Value;
-use abide::{Database, Outcome, execute};
+use jed::value::Value;
+use jed::{Database, Outcome, execute};
 
 fn db_with(stmts: &[&str]) -> Database {
     let mut db = Database::new();

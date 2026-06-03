@@ -14,8 +14,8 @@ use crate::storage::Row;
 use crate::types::ScalarType;
 use crate::value::Value;
 
-/// File magic — ASCII "ABDB" (working magic; revisit when the project is named).
-const MAGIC: [u8; 4] = *b"ABDB";
+/// File magic — ASCII "JEDB" (the engine is named `jed`).
+const MAGIC: [u8; 4] = *b"JEDB";
 /// On-disk format version.
 const FORMAT_VERSION: u16 = 1;
 /// Bytes of the page header on catalog / data pages.

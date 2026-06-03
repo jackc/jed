@@ -4,7 +4,7 @@
 # not here — these are git worktrees of those mirrors.
 /references/
 
-# Rust build artifacts (Cargo.lock IS committed — abide is an app, not a library).
+# Rust build artifacts (Cargo.lock IS committed — jed is an app, not a library).
 /impl/rust/target/
 
 # Go build artifacts. NOTE: do not ignore "*.test" — the conformance corpus files

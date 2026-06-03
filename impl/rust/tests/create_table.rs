@@ -1,11 +1,11 @@
 //! Phase B: CREATE TABLE — parse, analyze, register in the catalog. Driven by unit
 //! tests until the `core` profile is complete and the corpus runs (Phase E).
 
-use abide::catalog::Table;
-use abide::types::ScalarType;
-use abide::{Database, Outcome, execute};
+use jed::catalog::Table;
+use jed::types::ScalarType;
+use jed::{Database, Outcome, execute};
 
-fn create(db: &mut Database, sql: &str) -> abide::Result<Outcome> {
+fn create(db: &mut Database, sql: &str) -> jed::Result<Outcome> {
     execute(db, sql)
 }
 

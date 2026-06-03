@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Phase 1: the general expression evaluator — integer arithmetic (+ - * / %, unary
 // minus), the expression-only boolean type, comparisons-as-values, AND/OR/NOT Kleene

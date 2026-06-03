@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Step 6: UPDATE — in-place value replacement, old-row assignment semantics, the
 // two-phase all-or-nothing guarantee, and the rejected cases (PK column, duplicate

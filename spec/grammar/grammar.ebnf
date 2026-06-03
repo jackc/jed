@@ -1,5 +1,5 @@
 /* ===========================================================================
- * Abide SQL grammar — CANONICAL (CLAUDE.md §5, §6).
+ * Jed SQL grammar — CANONICAL (CLAUDE.md §5, §6).
  *
  * One language-neutral EBNF. The hand-written parsers (impl/rust, impl/go,
  * impl/ts) are *downstream consumers* of this grammar, never the source of it;

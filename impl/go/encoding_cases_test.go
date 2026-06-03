@@ -1,4 +1,4 @@
-package abide
+package jed
 
 // Line scanner for the encoding fixtures' case rows (spec/encoding/integers.toml).
 // The cases are inline tables inside a multi-line `cases = [ ... ]` array under each
