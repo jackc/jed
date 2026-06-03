@@ -246,7 +246,10 @@ impl Database {
                     Literal::Bool(_) => {
                         return Err(EngineError::new(
                             SqlState::DatatypeMismatch,
-                            format!("cannot store a boolean value in integer column {}", col.name),
+                            format!(
+                                "cannot store a boolean value in integer column {}",
+                                col.name
+                            ),
                         ));
                     }
                 };
