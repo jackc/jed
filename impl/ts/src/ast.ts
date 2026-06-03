@@ -81,6 +81,12 @@ export type CreateTable = {
   columns: ColumnDef[];
 };
 
+// DropTable is a DROP TABLE statement. Removes a table — its definition and all its
+// rows — from the catalog. Dropping a table that does not exist is an error (42P01);
+// there is no IF EXISTS this slice. Single table only; no CASCADE/RESTRICT (no dependent
+// objects exist yet). See spec/design/grammar.md §13.
+export type DropTable = { kind: "dropTable"; name: string };
+
 // Insert is an INSERT ... VALUES with one or more rows of literals, each in column
 // order. A multi-row INSERT is two-phase / all-or-nothing — every row is validated
 // before any is stored (spec/design/grammar.md §12). `rows` is always non-empty (the
@@ -119,4 +125,4 @@ export type Update = {
 export type Delete = { kind: "delete"; table: string; filter: Expr | null };
 
 // Statement is a parsed top-level statement.
-export type Statement = CreateTable | Insert | Select | Update | Delete;
+export type Statement = CreateTable | DropTable | Insert | Select | Update | Delete;

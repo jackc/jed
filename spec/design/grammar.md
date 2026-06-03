@@ -316,3 +316,46 @@ left-to-right. This keeps the assignment deterministic and identical across the 
 **Cost is unchanged — zero.** Literal rows read no storage and evaluate no expression tree,
 so a multi-row `INSERT` accrues the same zero cost as the single-row form
 ([cost.md](cost.md); `DEFAULT` expressions, when added, will accrue here).
+
+## 13. `DROP TABLE`
+
+`DROP TABLE t` removes a table — **its definition and all its rows** — from the catalog
+(`drop_table` in the grammar). It is the inverse of `CREATE TABLE`: where CREATE registers
+a name in the catalog (and rejects a name already taken, §1, `42P07`), DROP removes one
+(and rejects a name not present). Both stores the table touches — the catalog entry and the
+per-table row store — are dropped together, keyed by the table's lower-cased name (§3,
+case-insensitive: `DROP TABLE T` drops `t`). After a drop the name is free again, so
+`DROP TABLE t` then `CREATE TABLE t (...)` re-creates it from empty.
+
+**A missing table is an error — no `IF EXISTS`.** Dropping a table that does not exist
+raises `42P01` (`undefined_table`, *"table does not exist: t"*) — the same code a
+`SELECT` / `INSERT` / `UPDATE` / `DELETE` against an unknown table already raises. This
+mirrors `CREATE TABLE`'s `42P07`-on-duplicate (§1) and matches PostgreSQL's bare
+`DROP TABLE`. The idempotent **`IF EXISTS`** form (PostgreSQL turns the missing-table error
+into a notice) is **deliberately deferred** this slice, kept symmetric with the
+still-missing `CREATE TABLE IF NOT EXISTS`; both `IF [NOT] EXISTS` forms can land together
+later ([../../TODO.md](../../TODO.md)).
+
+**Deliberate narrowings (each relaxable later, §5).** As with the rest of the surface, the
+form is minimal:
+
+- **One table per statement** — no `DROP TABLE a, b, c`. (When multi-table drop lands it
+  inherits the two-phase / all-or-nothing discipline §12 uses for multi-row work: validate
+  every name exists before removing any.)
+- **No `CASCADE` / `RESTRICT`** — there are no dependent objects yet (no views, foreign
+  keys, or secondary indexes), so PostgreSQL's default `RESTRICT` is vacuous and the
+  keywords are simply not part of the surface. They become meaningful only once
+  dependencies exist (Phase 4, [../../TODO.md](../../TODO.md)).
+
+**Cost is zero.** Like `CREATE TABLE`, a drop reads no rows and evaluates no expression
+tree — it is a pure catalog edit — so it accrues zero cost ([cost.md](cost.md)). Removing a
+populated table does **not** charge per dropped row: the cost model meters query/row
+*work*, and a drop discards the store wholesale rather than scanning it.
+
+**Persistence.** Within a session the drop mutates the live catalog directly (the §3
+single-committed-state model; the staging-buffer commit is still future), exactly as
+`CREATE TABLE` and the DML statements do today. On the whole-image on-disk format
+([../fileformat/format.md](../fileformat/format.md)) a subsequent commit simply serializes
+the post-drop catalog, so the dropped table's bytes are gone from the next image — no
+free-list or page-reclamation work is involved (that is deferred until incremental
+copy-on-write, Phase 6).

@@ -5,6 +5,7 @@
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Statement {
     CreateTable(CreateTable),
+    DropTable(DropTable),
     Insert(Insert),
     Select(Select),
     Update(Update),
@@ -15,6 +16,15 @@ pub enum Statement {
 pub struct CreateTable {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+}
+
+/// `DROP TABLE <name>`. Removes a table — its definition and all its rows — from the
+/// catalog. Dropping a table that does not exist is an error (42P01); there is no
+/// `IF EXISTS` this slice. Single table only; no `CASCADE` / `RESTRICT` (no dependent
+/// objects exist yet). See spec/design/grammar.md §13.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DropTable {
+    pub name: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

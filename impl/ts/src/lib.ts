@@ -14,6 +14,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // CREATE TABLE with typed columns + single-column PRIMARY KEY.
   "ddl.create_table",
   "ddl.primary_key",
+  // DROP TABLE — remove a table (definition + rows) from the catalog (grammar.md §13).
+  "ddl.drop_table",
   // INSERT ... VALUES with positional type-checking + overflow trap.
   "dml.insert",
   // Multi-row INSERT ... VALUES (..),(..) — two-phase / all-or-nothing (grammar.md §12).

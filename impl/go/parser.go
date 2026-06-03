@@ -71,6 +71,12 @@ func (p *Parser) parseStatement() (Statement, error) {
 			return Statement{}, err
 		}
 		return Statement{CreateTable: ct}, nil
+	case "drop":
+		dt, err := p.parseDropTable()
+		if err != nil {
+			return Statement{}, err
+		}
+		return Statement{DropTable: dt}, nil
 	case "insert":
 		ins, err := p.parseInsert()
 		if err != nil {
@@ -160,6 +166,23 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		primaryKey = true
 	}
 	return ColumnDef{Name: name, TypeName: typeName, PrimaryKey: primaryKey}, nil
+}
+
+// parseDropTable parses `DROP TABLE <name>`. A missing table is rejected at execution
+// time (42P01), not here. Single table; no IF EXISTS, no CASCADE/RESTRICT this slice
+// (spec/design/grammar.md §13).
+func (p *Parser) parseDropTable() (*DropTable, error) {
+	if err := p.expectKeyword("drop"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("table"); err != nil {
+		return nil, err
+	}
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	return &DropTable{Name: name}, nil
 }
 
 // parseInsert parses `INSERT INTO <table> VALUES <row> [, <row>]*`, where each <row>

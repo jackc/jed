@@ -37,6 +37,7 @@
 /* --- entry point --------------------------------------------------------- */
 
 sql_statement  ::= create_table
+                 | drop_table
                  | insert
                  | select
                  | update
@@ -48,6 +49,14 @@ create_table   ::= "CREATE" "TABLE" identifier
                    "(" column_def ("," column_def)* ")"
 
 column_def     ::= identifier type_name ("PRIMARY" "KEY")?
+
+/* DROP TABLE removes a table — its definition and all its rows — from the
+ * catalog. The surface is deliberately minimal (../design/grammar.md §13): ONE
+ * table (no "DROP TABLE a, b"), no "IF EXISTS" (dropping a table that does not
+ * exist is a 42P01 undefined_table error, mirroring CREATE TABLE's 42P07 on a
+ * duplicate), and no "CASCADE" / "RESTRICT" (there are no dependent objects yet).
+ * Each omission is relaxable later (../../TODO.md). */
+drop_table     ::= "DROP" "TABLE" identifier
 
 /* type_name is parsed as a bare identifier and resolved by the catalog
  * (case-insensitively). The accepted names this slice are:

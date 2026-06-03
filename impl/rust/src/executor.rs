@@ -5,8 +5,8 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    BinaryOp, CreateTable, Delete, Expr, Insert, Literal, Select, SelectItems, Statement, UnaryOp,
-    Update,
+    BinaryOp, CreateTable, Delete, DropTable, Expr, Insert, Literal, Select, SelectItems,
+    Statement, UnaryOp, Update,
 };
 use crate::catalog::{Column, Table};
 use crate::cost::Meter;
@@ -102,6 +102,7 @@ impl Database {
     pub fn execute_stmt(&mut self, stmt: Statement) -> Result<Outcome> {
         match stmt {
             Statement::CreateTable(ct) => self.execute_create_table(ct),
+            Statement::DropTable(dt) => self.execute_drop_table(dt),
             Statement::Insert(ins) => self.execute_insert(ins),
             Statement::Select(sel) => self.execute_select(sel),
             Statement::Update(upd) => self.execute_update(upd),
@@ -155,6 +156,24 @@ impl Database {
             columns,
         });
         // DDL touches no rows and evaluates no expressions: zero cost.
+        Ok(Outcome::Statement { cost: 0 })
+    }
+
+    /// Run a DROP TABLE: remove the table's definition and its row store from the
+    /// catalog (both keyed by the lower-cased name). A table that does not exist is the
+    /// same 42P01 the DML paths raise — there is no `IF EXISTS` this slice
+    /// (spec/design/grammar.md §13). Like CREATE TABLE it touches no rows and evaluates
+    /// no expression tree (the store is discarded wholesale), so it accrues zero cost.
+    fn execute_drop_table(&mut self, dt: DropTable) -> Result<Outcome> {
+        if self.table(&dt.name).is_none() {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("table does not exist: {}", dt.name),
+            ));
+        }
+        let key = dt.name.to_ascii_lowercase();
+        self.tables.remove(&key);
+        self.stores.remove(&key);
         Ok(Outcome::Statement { cost: 0 })
     }
 

@@ -8,6 +8,7 @@ import type {
   BinaryOp,
   CreateTable,
   Delete,
+  DropTable,
   Expr,
   Insert,
   Select,
@@ -81,6 +82,8 @@ export class Database {
     switch (stmt.kind) {
       case "createTable":
         return this.executeCreateTable(stmt);
+      case "dropTable":
+        return this.executeDropTable(stmt);
       case "insert":
         return this.executeInsert(stmt);
       case "select":
@@ -134,6 +137,21 @@ export class Database {
 
     this.putTable({ name: ct.name, columns });
     // DDL touches no rows and evaluates no expressions: zero cost.
+    return { kind: "statement", cost: 0n };
+  }
+
+  // executeDropTable removes the table's definition and its row store from the catalog
+  // (both keyed by the lower-cased name). A table that does not exist is the same 42P01
+  // the DML paths raise — there is no IF EXISTS this slice (spec/design/grammar.md §13).
+  // Like CREATE TABLE it touches no rows and evaluates no expression tree (the store is
+  // discarded wholesale), so it accrues zero cost.
+  private executeDropTable(dt: DropTable): Outcome {
+    if (!this.table(dt.name)) {
+      throw engineError("undefined_table", "table does not exist: " + dt.name);
+    }
+    const key = dt.name.toLowerCase();
+    this.tables.delete(key);
+    this.stores.delete(key);
     return { kind: "statement", cost: 0n };
   }
 

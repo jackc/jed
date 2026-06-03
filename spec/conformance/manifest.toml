@@ -29,6 +29,10 @@ id = "ddl.primary_key"
 description = "PRIMARY KEY column constraint (enables point lookup by key)"
 
 [[capability]]
+id = "ddl.drop_table"
+description = "DROP TABLE — remove a table (definition + rows) from the catalog; missing table is 42P01 (grammar.md §13)"
+
+[[capability]]
 id = "dml.insert"
 description = "INSERT ... VALUES"
 

@@ -5,8 +5,8 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, Expr, Insert, Literal, OrderKey, Select,
-    SelectItem, SelectItems, Statement, UnaryOp, Update,
+    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert, Literal,
+    OrderKey, Select, SelectItem, SelectItems, Statement, UnaryOp, Update,
 };
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
@@ -35,6 +35,7 @@ impl Parser {
         // Dispatch on the leading keyword. Remaining productions land in Phases D–E.
         match self.peek_keyword().as_deref() {
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
+            Some("drop") => Ok(Statement::DropTable(self.parse_drop_table()?)),
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("select") => Ok(Statement::Select(self.parse_select()?)),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
@@ -84,6 +85,16 @@ impl Parser {
             type_name,
             primary_key,
         })
+    }
+
+    /// `DROP TABLE <name>`. Removes the named table. A missing table is rejected at
+    /// execution time (42P01), not here. Single table; no `IF EXISTS`, no
+    /// `CASCADE` / `RESTRICT` this slice (spec/design/grammar.md §13).
+    fn parse_drop_table(&mut self) -> Result<DropTable> {
+        self.expect_keyword("drop")?;
+        self.expect_keyword("table")?;
+        let name = self.expect_identifier()?;
+        Ok(DropTable { name })
     }
 
     /// `INSERT INTO <table> VALUES <row> [, <row>]*`, where each `<row>` is

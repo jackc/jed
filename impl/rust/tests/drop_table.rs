@@ -1,0 +1,95 @@
+//! DROP TABLE — remove a table (its definition + all its rows) from the catalog. The
+//! inverse of CREATE TABLE: a missing table is 42P01 and there is no IF EXISTS this
+//! slice; single table, no CASCADE/RESTRICT (spec/design/grammar.md §13).
+
+use abide::{Database, Outcome, execute};
+
+fn run(db: &mut Database, sql: &str) -> abide::Result<Outcome> {
+    execute(db, sql)
+}
+
+#[test]
+fn drop_removes_table_and_rows() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)").unwrap();
+    run(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    assert!(db.table("t").is_some());
+
+    let out = run(&mut db, "DROP TABLE t").unwrap();
+    assert_eq!(out, Outcome::Statement { cost: 0 });
+    assert!(db.table("t").is_none(), "catalog entry gone");
+    assert!(db.rows_in_key_order("t").is_none(), "row store gone");
+}
+
+#[test]
+fn access_after_drop_is_undefined_table() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)").unwrap();
+    run(&mut db, "DROP TABLE t").unwrap();
+    // Every access path shares the same catalog lookup, so all four trap 42P01.
+    for sql in [
+        "SELECT id FROM t",
+        "INSERT INTO t VALUES (1, 1)",
+        "UPDATE t SET v = 0",
+        "DELETE FROM t",
+    ] {
+        assert_eq!(run(&mut db, sql).unwrap_err().code(), "42P01", "{sql}");
+    }
+}
+
+#[test]
+fn dropping_a_missing_table_traps_42p01() {
+    let mut db = Database::new();
+    assert_eq!(run(&mut db, "DROP TABLE nope").unwrap_err().code(), "42P01");
+    // No IF EXISTS this slice: a second drop of the same name also errors.
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+    run(&mut db, "DROP TABLE t").unwrap();
+    assert_eq!(run(&mut db, "DROP TABLE t").unwrap_err().code(), "42P01");
+}
+
+#[test]
+fn name_is_free_to_recreate_after_drop() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)").unwrap();
+    run(&mut db, "INSERT INTO t VALUES (1, 10)").unwrap();
+    run(&mut db, "DROP TABLE t").unwrap();
+    // Re-create the freed name with a different shape; the new table starts empty.
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, w int64)").unwrap();
+    assert_eq!(db.rows_in_key_order("t").unwrap().len(), 0);
+    assert_eq!(db.table("t").unwrap().columns[1].name, "w");
+}
+
+#[test]
+fn drop_is_case_insensitive() {
+    let mut db = Database::new();
+    run(&mut db, "create table T (id int32 primary key)").unwrap();
+    run(&mut db, "DROP TABLE t").unwrap();
+    assert!(db.table("t").is_none());
+}
+
+#[test]
+fn drop_leaves_other_tables_intact() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE a (id int32 PRIMARY KEY)").unwrap();
+    run(&mut db, "CREATE TABLE b (id int32 PRIMARY KEY)").unwrap();
+    run(&mut db, "INSERT INTO b VALUES (2)").unwrap();
+    run(&mut db, "DROP TABLE a").unwrap();
+    assert!(db.table("a").is_none());
+    assert!(db.table("b").is_some());
+    assert_eq!(db.rows_in_key_order("b").unwrap().len(), 1);
+}
+
+#[test]
+fn syntax_errors_are_reported() {
+    let mut db = Database::new();
+    // A bare DROP TABLE with no name.
+    assert_eq!(run(&mut db, "DROP TABLE").unwrap_err().code(), "42601");
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+    // Trailing input after the table name.
+    assert_eq!(
+        run(&mut db, "DROP TABLE t extra").unwrap_err().code(),
+        "42601"
+    );
+    // DROP of anything other than a TABLE is not part of the surface yet.
+    assert_eq!(run(&mut db, "DROP INDEX x").unwrap_err().code(), "42601");
+}

@@ -205,7 +205,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **`INSERT ... SELECT`** — insert the rows a query produces (the second half of the
       original multi-row-INSERT item). Needs the executor to feed a SELECT result set
       through the same two-phase, all-or-nothing INSERT validation. _(size: M; deps: SELECT ✓)_
-- [ ] **`DROP TABLE`.** _(size: S)_
+- [x] **`DROP TABLE`.** Done: `DROP TABLE t` removes a table — its definition **and** all
+      its rows — from the catalog (both the catalog entry and the per-table store, keyed by
+      the lower-cased name; case-insensitive). The inverse of `CREATE TABLE`: dropping a
+      table that does not exist traps **`42P01`** (`undefined_table`, the same code the DML
+      paths raise), mirroring CREATE's `42P07`-on-duplicate. After a drop the name is free to
+      re-create from empty. Cost is **zero** (a pure catalog edit — no rows read, no
+      expression tree, the store discarded wholesale). Deliberate narrowings, each relaxable
+      later: **no `IF EXISTS`** (kept symmetric with the still-missing `CREATE TABLE IF NOT
+      EXISTS`), **single table** (no `DROP TABLE a, b`), and **no `CASCADE`/`RESTRICT`** (no
+      dependent objects exist yet). Authored in [grammar.ebnf](spec/grammar/grammar.ebnf)
+      (`sql_statement` / `drop_table`) + [grammar.md §13](spec/design/grammar.md), capability
+      `ddl.drop_table` in [manifest.toml](spec/conformance/manifest.toml), all three cores in
+      lockstep, pinned by
+      [spec/conformance/suites/ddl/drop_table.test](spec/conformance/suites/ddl/drop_table.test)
+      (the first `ddl/` suite). _(size: S)_
 
 ---
 

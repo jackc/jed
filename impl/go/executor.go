@@ -69,6 +69,8 @@ func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
 	switch {
 	case stmt.CreateTable != nil:
 		return db.executeCreateTable(stmt.CreateTable)
+	case stmt.DropTable != nil:
+		return db.executeDropTable(stmt.DropTable)
 	case stmt.Insert != nil:
 		return db.executeInsert(stmt.Insert)
 	case stmt.Select != nil:
@@ -119,6 +121,21 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 
 	db.putTable(&Table{Name: ct.Name, Columns: columns})
 	// DDL touches no rows and evaluates no expressions: zero cost.
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// executeDropTable runs a DROP TABLE: remove the table's definition and its row store
+// from the catalog (both keyed by the lower-cased name). A table that does not exist is
+// the same 42P01 the DML paths raise — there is no IF EXISTS this slice
+// (spec/design/grammar.md §13). Like CREATE TABLE it touches no rows and evaluates no
+// expression tree (the store is discarded wholesale), so it accrues zero cost.
+func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
+	if _, ok := db.Table(dt.Name); !ok {
+		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+dt.Name)
+	}
+	key := strings.ToLower(dt.Name)
+	delete(db.tables, key)
+	delete(db.stores, key)
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 

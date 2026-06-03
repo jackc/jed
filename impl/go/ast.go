@@ -6,6 +6,7 @@ package abide
 // Statement is a parsed top-level statement (exactly one of the fields is set).
 type Statement struct {
 	CreateTable *CreateTable
+	DropTable   *DropTable
 	Insert      *Insert
 	Select      *Select
 	Update      *Update
@@ -16,6 +17,14 @@ type Statement struct {
 type CreateTable struct {
 	Name    string
 	Columns []ColumnDef
+}
+
+// DropTable is a DROP TABLE statement. Removes a table — its definition and all its
+// rows — from the catalog. Dropping a table that does not exist is an error (42P01);
+// there is no IF EXISTS this slice. Single table only; no CASCADE/RESTRICT (no
+// dependent objects exist yet). See spec/design/grammar.md §13.
+type DropTable struct {
+	Name string
 }
 
 // ColumnDef is a column definition in a CREATE TABLE.

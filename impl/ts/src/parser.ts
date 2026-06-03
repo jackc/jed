@@ -69,6 +69,8 @@ class Parser {
     switch (this.peekKeyword()) {
       case "create":
         return this.parseCreateTable();
+      case "drop":
+        return this.parseDropTable();
       case "insert":
         return this.parseInsert();
       case "select":
@@ -117,6 +119,16 @@ class Parser {
       primaryKey = true;
     }
     return { name, typeName, primaryKey };
+  }
+
+  // parseDropTable parses `DROP TABLE <name>`. A missing table is rejected at execution
+  // time (42P01), not here. Single table; no IF EXISTS, no CASCADE/RESTRICT this slice
+  // (spec/design/grammar.md §13).
+  private parseDropTable(): Statement {
+    this.expectKeyword("drop");
+    this.expectKeyword("table");
+    const name = this.expectIdentifier();
+    return { kind: "dropTable", name };
   }
 
   // parseInsert parses `INSERT INTO <table> VALUES <row> [, <row>]*`, where each <row>
