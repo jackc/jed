@@ -241,6 +241,22 @@ func (p *Parser) parseSelect() (*Select, error) {
 	if err := p.expectKeyword("select"); err != nil {
 		return nil, err
 	}
+
+	// DISTINCT is not reserved (a column may be named `distinct`), and it is the only
+	// modifier before the select list, so it takes a two-token lookahead: the leading
+	// `DISTINCT` is the modifier iff the next token is neither FROM nor end-of-input —
+	// otherwise the word is a column named `distinct` (spec/design/grammar.md §11). This
+	// rule must be byte-identical across cores.
+	distinct := false
+	if p.peekKeyword() == "distinct" {
+		next := p.tokens[p.pos+1]
+		modifier := next.Kind != TokEof && !(next.Kind == TokWord && toLowerASCII(next.Word) == "from")
+		if modifier {
+			p.advance()
+			distinct = true
+		}
+	}
+
 	items, err := p.parseSelectItems()
 	if err != nil {
 		return nil, err
@@ -253,7 +269,7 @@ func (p *Parser) parseSelect() (*Select, error) {
 		return nil, err
 	}
 
-	sel := &Select{Items: items, From: from}
+	sel := &Select{Distinct: distinct, Items: items, From: from}
 
 	filter, err := p.parseOptionalWhere()
 	if err != nil {

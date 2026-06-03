@@ -81,6 +81,32 @@ TS; any deviation diverges the count and fails the corpus.
   comparisons' internal `lt3 OR eq3` combinators, are covered by their owning node's
   single `operator_eval`. They are not `RExpr` nodes.
 
+### `SELECT DISTINCT` — the projection-vs-produce asymmetry
+
+`DISTINCT` ([grammar.md](grammar.md) §11) deduplicates the **projected** output, so it must
+project *every* filtered row to compute its dedup key — there is no way to know a row is a
+duplicate without evaluating its select list. That splits two charges the un-`DISTINCT` path
+keeps together:
+
+- **Projection `operator_eval` is charged per *filtered* row**, not per windowed row — for
+  each filtered row, every interior projection node fires once. This is independent of
+  `LIMIT`/`OFFSET` and of how many rows turn out to be duplicates; the work is genuinely
+  done. (Leaf `column`/constant projections still charge nothing, so a bare-column
+  `SELECT DISTINCT a` adds no projection cost at all.)
+- **`row_produced` is charged per *emitted* row** — the rows surviving dedup **and** the
+  window — unchanged from its "one per row in the result set, post-`LIMIT`/`OFFSET`"
+  definition (now also post-`DISTINCT`). So `row_produced` always equals the output row
+  count.
+- **Dedup itself is unmetered**, like the `ORDER BY` sort and the `LIMIT` slice (a dedicated
+  dedup-comparison unit could be added later, as for the sort).
+
+A consequence worth stating because it is observable and is a cross-core abort-point contract
+(§6): because all filtered rows are projected, a projection that traps fires **even under a
+`LIMIT` that would exclude the offending row**. `SELECT DISTINCT 1/a FROM t LIMIT 1` traps
+`22012` if *any* filtered row has `a = 0`, whereas un-`DISTINCT` `SELECT 1/a FROM t LIMIT 1`
+windows first and does not. The trapping row is deterministic (primary-key scan order), so
+all three cores trap identically.
+
 ### What is NOT metered (defined boundary)
 
 Metering covers **execution** — per-row scans, per-row produced, per-row expression
@@ -97,6 +123,10 @@ evaluation. It deliberately does **not** meter:
   already-sorted rows, not evaluation work; like the sort it is unmetered. Its only cost
   effect is *fewer* `row_produced`/projection charges (the excluded rows are never
   projected — see the `row_produced` rule above).
+- **`DISTINCT` dedup** — testing whether a projected tuple has been seen is set membership,
+  not evaluation, so it is unmetered like the sort and the slice. Its cost effect is the
+  asymmetry above: projection `operator_eval` is charged for every filtered row, but
+  `row_produced` only for the surviving distinct, windowed rows.
 - **Phase-2 row writes** in `UPDATE`/`DELETE` — the two-phase mutation's write pass does
   no eval and produces no row.
 

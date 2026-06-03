@@ -322,6 +322,29 @@ export class Database {
       order.push({ idx, descending: key.descending, nullsFirst: key.nullsFirst });
     }
 
+    // SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates are
+    // collapsed, an ORDER BY key not in the projected output has no single value per row,
+    // so each key must appear as a bare column in the select list (or the list is `*`).
+    // Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8), so an aliased
+    // bare column still counts as projecting its underlying column.
+    if (sel.distinct && order.length > 0 && sel.items.kind === "list") {
+      const projected = new Set<number>();
+      for (const it of sel.items.items) {
+        if (it.expr.kind === "column") {
+          const idx = columnIndex(table, it.expr.name);
+          if (idx >= 0) projected.add(idx);
+        }
+      }
+      for (const key of order) {
+        if (!projected.has(key.idx)) {
+          throw engineError(
+            "invalid_column_reference",
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+          );
+        }
+      }
+    }
+
     // Scan in primary-key order, then filter. A WHERE arithmetic can throw
     // (22003/22012); the throw propagates naturally. Each scanned row and the filter
     // evaluation accrue cost; the row-produced charge is below, at projection
@@ -347,24 +370,76 @@ export class Database {
       });
     }
 
-    // LIMIT / OFFSET: window the sorted rows BEFORE projection, so rows skipped by OFFSET
-    // or excluded by LIMIT accrue no rowProduced/projection cost (they were still scanned
-    // + filtered above). Clamp in the bigint domain against the row count, then index —
-    // never let a huge count cross 2^53 via Number (CLAUDE.md §8; grammar.md §9). The
-    // counts are already non-negative (parser).
-    const n = BigInt(rows.length);
-    const start = sel.offset === null ? 0n : sel.offset < n ? sel.offset : n;
-    const end = sel.limit !== null && sel.limit < n - start ? start + sel.limit : n;
-    const windowed = rows.slice(Number(start), Number(end));
+    // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the bigint domain
+    // against the row count, then index — never let a huge count cross 2^53 via Number
+    // (CLAUDE.md §8; grammar.md §9). The counts are already non-negative (parser).
+    const windowBounds = (len: number): [number, number] => {
+      const n = BigInt(len);
+      const start = sel.offset === null ? 0n : sel.offset < n ? sel.offset : n;
+      const end = sel.limit !== null && sel.limit < n - start ? start + sel.limit : n;
+      return [Number(start), Number(end)];
+    };
 
-    // Project each windowed row. Producing a row, and each projection-list evaluation,
-    // accrue cost. (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
-    const out: Value[][] = windowed.map((row) => {
-      meter.charge(COSTS.rowProduced);
-      return projections.map((p) => evalExpr(p, row, meter));
-    });
+    // Build the output rows. The two paths differ in pipeline order
+    // (spec/design/grammar.md §11): without DISTINCT the window slices the sorted source
+    // rows and ONLY the windowed rows are projected; with DISTINCT every (sorted) filtered
+    // row is projected — dedup must see them all — duplicates drop by first occurrence, and
+    // the window then slices the DISTINCT rows.
+    let out: Value[][];
+    if (sel.distinct) {
+      // Project every filtered row (charging projection cost per row, the §3 asymmetry),
+      // keeping first occurrences. `seen` is membership-only: output order comes from the
+      // deterministic source iteration, never from Set iteration (no order leak — §8/§10).
+      const seen = new Set<string>();
+      const distinctRows: Value[][] = [];
+      for (const row of rows) {
+        const tuple = projections.map((p) => evalExpr(p, row, meter));
+        const key = distinctRowKey(tuple);
+        if (!seen.has(key)) {
+          seen.add(key);
+          distinctRows.push(tuple);
+        }
+      }
+      // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge
+      // rowProduced (spec/design/cost.md §3).
+      const [start, end] = windowBounds(distinctRows.length);
+      out = distinctRows.slice(start, end).map((tuple) => {
+        meter.charge(COSTS.rowProduced);
+        return tuple;
+      });
+    } else {
+      // Window the sorted rows BEFORE projection, so rows skipped by OFFSET or excluded by
+      // LIMIT accrue no rowProduced/projection cost (they were still scanned + filtered
+      // above). Producing a row, and each projection-list evaluation, accrue cost.
+      // (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
+      const [start, end] = windowBounds(rows.length);
+      out = rows.slice(start, end).map((row) => {
+        meter.charge(COSTS.rowProduced);
+        return projections.map((p) => evalExpr(p, row, meter));
+      });
+    }
     return { kind: "query", columnNames, rows: out, cost: meter.accrued };
   }
+}
+
+// distinctRowKey encodes a projected row into a collision-free string key for DISTINCT
+// dedup. Each field carries a type tag (n/i/b) and a payload, joined by a separator no
+// field can contain, so e.g. (1,23) and (12,3) do not collide (spec/design/grammar.md §11).
+// NULL == NULL falls out (both encode "n"), matching the NULL-safe DISTINCT rule. Ints use
+// bigint.toString() — exact, never the lossy `number` path (CLAUDE.md §8).
+function distinctRowKey(row: Value[]): string {
+  return row
+    .map((v) => {
+      switch (v.kind) {
+        case "null":
+          return "n";
+        case "int":
+          return "i" + v.int.toString();
+        case "bool":
+          return v.value ? "b1" : "b0";
+      }
+    })
+    .join("|");
 }
 
 // ============================================================================

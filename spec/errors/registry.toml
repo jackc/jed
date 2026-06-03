@@ -82,6 +82,12 @@ class = "syntax error or access rule violation"
 template = "{kind} does not exist: {name}"
 
 [[error]]
+code = "42P10"
+name = "invalid_column_reference"
+class = "syntax error or access rule violation"
+template = "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+
+[[error]]
 code = "42804"
 name = "datatype_mismatch"
 class = "syntax error or access rule violation"

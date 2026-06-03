@@ -1,0 +1,291 @@
+# SELECT DISTINCT (spec/design/grammar.md §11): deduplicate the PROJECTED output rows,
+# NULL-safe (two NULLs collapse — the IS NOT DISTINCT FROM rule, not three-valued `=`).
+# DISTINCT runs after ORDER BY and BEFORE LIMIT/OFFSET, so the window slices the distinct
+# rows. Output order is deterministic (CLAUDE.md §8/§10): with no ORDER BY it is
+# first-occurrence over the primary-key scan (the key-order default LIMIT documents, §9);
+# with ORDER BY the keys order the distinct rows and ties keep that first-occurrence order.
+#
+# Cost asymmetry (cost.md §3): DISTINCT must project EVERY filtered row to compute its dedup
+# key, so projection operator_eval is charged per filtered row (independent of LIMIT and of
+# duplicates), while row_produced counts only the emitted distinct+windowed rows. Dedup
+# itself is unmetered, like the sort and the slice.
+#
+# ORDER BY under DISTINCT takes the PostgreSQL restriction: every key must appear as a bare
+# column in the select list (or the list is `*`), else 42P10 — once duplicates collapse, a
+# key not in the output has no single value per row. (The engine keeps its own SQLite NULL
+# ordering, §10 — only the list-membership rule is borrowed from PG.)
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.distinct, query.order_by, query.select_star, query.column_alias, query.comparison_order, query.limit, query.offset, expr.arithmetic, expr.comparison_value, types.int32, types.boolean, error.division_by_zero, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+
+# Deliberate duplicate values in `a` (rows 1,2,4 share a=10), a duplicate `(a,b)=(10,5)`
+# pair (rows 1,2), and NULLs in both `a` (row 5) and `b` (rows 4,5) to exercise dedup,
+# NULL == NULL collapse, and tie order.
+statement ok
+INSERT INTO t VALUES (1, 10, 5)
+
+statement ok
+INSERT INTO t VALUES (2, 10, 5)
+
+statement ok
+INSERT INTO t VALUES (3, 20, 7)
+
+statement ok
+INSERT INTO t VALUES (4, 10, NULL)
+
+statement ok
+INSERT INTO t VALUES (5, NULL, NULL)
+
+# Basic dedup, no ORDER BY: distinct `a` in FIRST-OCCURRENCE primary-key order (row1 a=10,
+# row3 a=20, row5 a=NULL) — deterministic without ORDER BY, like LIMIT's key-order default.
+# `a` is a bare column (a leaf) so projection charges no operator_eval: 5 scanned + 3
+# produced = 8.
+# names: a
+# cost: 8
+query I nosort
+SELECT DISTINCT a FROM t
+----
+10
+20
+NULL
+
+# NULL == NULL collapse: `b` is 5,5,7,NULL,NULL; the two NULL rows (4 and 5) collapse to a
+# single NULL (NULL-safe equality, not three-valued `=`). First-occurrence order: 5,7,NULL.
+# 5 scanned + 3 produced = 8.
+# names: b
+# cost: 8
+query I nosort
+SELECT DISTINCT b FROM t
+----
+5
+7
+NULL
+
+# DISTINCT + ORDER BY (allowed — `a` is bare-projected). ASC defaults to NULLS FIRST (the
+# SQLite model, §10): NULL leads, then 10, then 20. 5 scanned + 3 produced = 8.
+# names: a
+# cost: 8
+query I nosort
+SELECT DISTINCT a FROM t ORDER BY a
+----
+NULL
+10
+20
+
+# Multi-column dedup ordered by `a`: distinct `(a,b)` pairs. Within the a=10 group the
+# distinct pairs (10,5) and (10,NULL) keep first-occurrence order (row1 before row4); the
+# (10,5) duplicate (rows 1,2) collapses, and (NULL,NULL) sorts first. 5 scanned + 4
+# produced = 9.
+# names: a, b
+# cost: 9
+query II nosort
+SELECT DISTINCT a, b FROM t ORDER BY a
+----
+NULL
+NULL
+10
+5
+10
+NULL
+20
+7
+
+# DISTINCT * — every row is distinct (the PK makes rows unique), so DISTINCT is a no-op over
+# the projected output. `*` auto-satisfies the ORDER BY restriction. 5 scanned + 5
+# produced = 10.
+# names: id, a, b
+# cost: 10
+query III nosort
+SELECT DISTINCT * FROM t ORDER BY id
+----
+1
+10
+5
+2
+10
+5
+3
+20
+7
+4
+10
+NULL
+5
+NULL
+NULL
+
+# DISTINCT * ORDER BY b: the key `b` is not "bare-projected" by name, but `*` projects every
+# column, so the restriction passes. Orders by b with NULLS FIRST (rows 4,5), then b=5
+# (rows 1,2), then b=7 (row 3). 5 scanned + 5 produced = 10.
+# names: id, a, b
+# cost: 10
+query III nosort
+SELECT DISTINCT * FROM t ORDER BY b
+----
+4
+10
+NULL
+5
+NULL
+NULL
+1
+10
+5
+2
+10
+5
+3
+20
+7
+
+# Expression projection pins the cost asymmetry: `a + 0` is an interior Add node, charged
+# once per FILTERED row (5), even though only 3 distinct rows are produced and even though
+# duplicates collapse. NULL + 0 is NULL. The un-aliased expression names the column ?column?.
+# 5 scanned + 5 projection operator_eval + 3 produced = 13.
+# names: ?column?
+# cost: 13
+query I nosort
+SELECT DISTINCT a + 0 FROM t
+----
+10
+20
+NULL
+
+# DISTINCT + WHERE: the filter runs on every scanned row (5 `>=` evals); WHERE keeps rows
+# 2..5, whose distinct `a` is 10,20,NULL in first-occurrence order. 5 scanned + 5 filter +
+# 3 produced = 13.
+# names: a
+# cost: 13
+query I nosort
+SELECT DISTINCT a FROM t WHERE id >= 2
+----
+10
+20
+NULL
+
+# LIMIT/OFFSET window the DISTINCT rows, not the source rows: distinct `a` ordered is
+# NULL,10,20; OFFSET 1 LIMIT 1 yields just 10. Only the one emitted row charges
+# row_produced. 5 scanned + 1 produced = 6.
+# names: a
+# cost: 6
+query I nosort
+SELECT DISTINCT a FROM t ORDER BY a LIMIT 1 OFFSET 1
+----
+10
+
+# Boolean projection: `a = b` is false for rows 1,2,3 and unknown (NULL) for rows 4,5; the
+# distinct booleans are false then NULL (the two unknowns collapse). One compare per filtered
+# row. 5 scanned + 5 projection operator_eval + 2 produced = 12.
+# names: ?column?
+# cost: 12
+query B nosort
+SELECT DISTINCT a = b FROM t
+----
+false
+NULL
+
+# An alias is just an output label: `ORDER BY a` references the underlying bare-projected
+# column `a` (the alias `x` is invisible to ORDER BY, §8), so this is allowed and names the
+# column `x`. 5 scanned + 3 produced = 8.
+# names: x
+# cost: 8
+query I nosort
+SELECT DISTINCT a AS x FROM t ORDER BY a
+----
+NULL
+10
+20
+
+# 42P10: ORDER BY key `b` is not in the select list (only `a` is) — rejected under DISTINCT.
+statement error 42P10
+SELECT DISTINCT a FROM t ORDER BY b
+
+# 42P10: an alias does not satisfy the rule. `a AS b` bare-projects column `a`, not `b`;
+# ORDER BY `b` resolves to the real column `b`, which is not projected.
+statement error 42P10
+SELECT DISTINCT a AS b FROM t ORDER BY b
+
+# Encoding guard: two distinct pairs whose naive concatenation would collide ((1,23) vs
+# (12,3) → "i1i23" == "i12i3"). The tagged, separator-joined dedup key keeps them apart, so
+# DISTINCT returns BOTH rows. 2 scanned + 2 produced = 4.
+statement ok
+CREATE TABLE t2 (id int32 PRIMARY KEY, x int32, y int32)
+
+statement ok
+INSERT INTO t2 VALUES (1, 1, 23)
+
+statement ok
+INSERT INTO t2 VALUES (2, 12, 3)
+
+# names: x, y
+# cost: 4
+query II nosort
+SELECT DISTINCT x, y FROM t2
+----
+1
+23
+12
+3
+
+# Trap asymmetry: DISTINCT projects EVERY filtered row for dedup, so `1 / c` traps 22012 on
+# the c=0 row (id 2) even though LIMIT 1 would window it out. (The un-DISTINCT counterpart
+# below windows first and does not trap — same data.)
+statement ok
+CREATE TABLE t3 (id int32 PRIMARY KEY, c int32)
+
+statement ok
+INSERT INTO t3 VALUES (1, 2)
+
+statement ok
+INSERT INTO t3 VALUES (2, 0)
+
+statement ok
+INSERT INTO t3 VALUES (3, 4)
+
+statement error 22012
+SELECT DISTINCT 1 / c FROM t3 LIMIT 1
+
+# The un-DISTINCT counterpart: windowing before projection means only the first row (c=2,
+# 1/2 = 0) is evaluated, so there is no division-by-zero. 3 scanned + 1 projection
+# operator_eval + 1 produced = 5.
+# names: ?column?
+# cost: 5
+query I nosort
+SELECT 1 / c FROM t3 ORDER BY id LIMIT 1
+----
+0
+
+# Parser disambiguation: DISTINCT is not reserved. `distinct` is a legal column name.
+statement ok
+CREATE TABLE tk (id int32 PRIMARY KEY, distinct int32)
+
+statement ok
+INSERT INTO tk VALUES (1, 100)
+
+statement ok
+INSERT INTO tk VALUES (2, 100)
+
+statement ok
+INSERT INTO tk VALUES (3, 200)
+
+# `SELECT distinct FROM tk`: the word before FROM is the COLUMN `distinct`, not the modifier
+# (two-token lookahead). No dedup — all three rows are returned. 3 scanned + 3 produced = 6.
+# names: distinct
+# cost: 6
+query I nosort
+SELECT distinct FROM tk
+----
+100
+100
+200
+
+# `SELECT DISTINCT distinct FROM tk`: the FIRST `distinct` is the modifier (next token is not
+# FROM), the second is the column. Now the 100s collapse. 3 scanned + 2 produced = 5.
+# names: distinct
+# cost: 5
+query I nosort
+SELECT DISTINCT distinct FROM tk
+----
+100
+200

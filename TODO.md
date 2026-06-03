@@ -162,7 +162,25 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       three cores in lockstep, pinned by
       [spec/conformance/suites/query/order_by.test](spec/conformance/suites/query/order_by.test).
       _(size: M)_
-- [ ] **`DISTINCT`.** _(size: S–M)_
+- [x] **`DISTINCT`.** Done: `SELECT DISTINCT` deduplicates the **projected** output rows
+      (NULL-safe — two NULLs collapse, the `IS NOT DISTINCT FROM` rule, not three-valued `=`).
+      It runs **after `ORDER BY`, before `LIMIT`/`OFFSET`** (the window slices the *distinct*
+      rows), inverting the un-DISTINCT pipeline. Output order is deterministic: first-occurrence
+      over the primary-key scan with no `ORDER BY`, else the keys order the distinct rows.
+      `ORDER BY` under DISTINCT takes the **PostgreSQL restriction** — each key must be a bare
+      column in the select list (or `*`), else the new **`42P10`**
+      (`invalid_column_reference`, [registry.toml](spec/errors/registry.toml)); the engine keeps
+      its own SQLite NULL ordering (only the list-membership rule is borrowed). The cost
+      asymmetry ([cost.md §3](spec/design/cost.md)) is a cross-core contract: projection
+      `operator_eval` is charged per **filtered** row (dedup must evaluate all), `row_produced`
+      only per emitted distinct+windowed row, dedup unmetered — so `SELECT DISTINCT 1/a … LIMIT 1`
+      traps `22012` where the un-DISTINCT form does not. `DISTINCT` is non-reserved (a column may
+      be named `distinct`), disambiguated by a **two-token lookahead** byte-identical across the
+      three parsers. Authored in [grammar.ebnf](spec/grammar/grammar.ebnf) (`select`) +
+      [grammar.md §11](spec/design/grammar.md), capability `query.distinct` in
+      [manifest.toml](spec/conformance/manifest.toml), all three cores in lockstep, pinned by
+      [spec/conformance/suites/query/distinct.test](spec/conformance/suites/query/distinct.test).
+      _(size: S–M)_
 - [ ] **Predicate forms** — `IN (list)`, `BETWEEN`, `LIKE` (text-dependent), `CASE`
       expressions. _(size: M; LIKE deps: text type)_
 - [ ] **Aggregates** `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` + **`GROUP BY`** + **`HAVING`**.

@@ -226,3 +226,54 @@ resolved at parse time to `explicit ? … : !descending` and applied independent
 `ASC`/`DESC` value flip), so all three cores order NULLs byte-identically. The sort itself is
 **unmetered**, like `LIMIT`/`OFFSET` slicing ([cost.md](cost.md) §3); only the scanned and
 produced rows accrue cost.
+
+## 11. `DISTINCT`
+
+`SELECT DISTINCT` removes duplicate rows from the result by **deduplicating the projected
+output** — the select-list values, *not* the source rows. So `SELECT DISTINCT a FROM t`
+collapses rows that share an `a` even when their other columns differ, and
+`SELECT DISTINCT a, b` keys on the `(a, b)` pair. `DISTINCT` with no qualifier is the only
+form; `DISTINCT ON (...)` (the PostgreSQL extension) is out of scope.
+
+**Where it applies — before the window, after the sort.** Dedup is the SQL "is this output
+row new?" step, so it must run on projected values and **before** `LIMIT`/`OFFSET`:
+`SELECT DISTINCT x FROM t LIMIT 2` returns *two distinct* rows, so the window slices the
+**distinct** rows, not the scanned rows. This is the reverse of the un-`DISTINCT` pipeline
+(which windows the sorted source rows and projects last). The executor keeps the existing
+`ORDER BY` sort of the source rows, then — when `DISTINCT` is set — projects every filtered
+row, dedups by **first occurrence**, windows the distinct rows, and emits.
+
+**NULL-safe equality.** Two rows are duplicates under the engine's NULL-safe equality (the
+`IS NOT DISTINCT FROM` semantics — [functions.md](functions.md) §3, [types.md](types.md) §4),
+*not* the three-valued `=`: two NULLs **are** the same for `DISTINCT`, so all-NULL rows
+collapse to one. This is the standard SQL `DISTINCT` rule and the same total NULL handling
+the engine already uses for `IS [NOT] DISTINCT FROM`.
+
+**Output order is deterministic** (CLAUDE.md §10). With no `ORDER BY`, the distinct rows come
+out in **first-occurrence order** over the primary-key scan — the same key-order default
+`LIMIT` documents (§9). With `ORDER BY`, the keys order the distinct rows; ties within an
+ordered group keep that first-occurrence order (the stable sort over the source rows). Both
+are a CLAUDE.md §8 cross-core contract and are asserted in the corpus.
+
+**`ORDER BY` under `DISTINCT` — the PostgreSQL restriction.** Once duplicates collapse, an
+`ORDER BY` key that is *not* in the select list no longer has a single value per output row
+(which of the merged rows' values would it use?). So, matching PostgreSQL, **every `ORDER BY`
+key must appear as a bare column in the select list** (or the list is `*`); otherwise it is
+`42P10` (`invalid_column_reference`, [../errors/registry.toml](../errors/registry.toml)),
+*"for SELECT DISTINCT, ORDER BY expressions must appear in select list."* An alias does not
+satisfy this — `ORDER BY` resolves against table columns, never aliases (§8), so
+`SELECT DISTINCT a AS b FROM t ORDER BY b` orders by the real column `b` and is rejected
+unless `b` is itself bare-projected, while `SELECT DISTINCT a AS x FROM t ORDER BY a` is
+accepted (`a` is bare-projected; the alias is just its output label). This restriction is the
+only behavior borrowed from PostgreSQL here — the engine keeps its **SQLite NULL ordering**
+(NULL smallest, ASC → NULLS FIRST, §10); do not conflate the two.
+
+**`DISTINCT` is not a reserved word** (§3): a column may be named `distinct`, and
+`SELECT distinct FROM t` must keep selecting it. Because `DISTINCT` is the lone modifier
+*before* the select list, the parsers resolve it with a **two-token lookahead** — the leading
+`DISTINCT` is the modifier iff the next token is **not** `FROM` and not end-of-input. So
+`SELECT DISTINCT a FROM t` is the modifier, `SELECT distinct FROM t` is the column,
+`SELECT DISTINCT distinct FROM t` is the modifier over a column named `distinct`, and
+`SELECT DISTINCT FROM t` (the only valid parse being the column) selects `distinct`. This
+lookahead is a CLAUDE.md §8 determinism surface: it must be byte-identical across the three
+hand-written parsers.

@@ -88,6 +88,9 @@ export type Insert = { kind: "insert"; table: string; values: Literal[] };
 // projection (grammar.md §9); null means the clause is absent.
 export type Select = {
   kind: "select";
+  // SELECT DISTINCT — deduplicate the projected output rows (NULL-safe), applied after
+  // ORDER BY and before LIMIT/OFFSET (spec/design/grammar.md §11).
+  distinct: boolean;
   items: SelectItems;
   from: string;
   filter: Expr | null;

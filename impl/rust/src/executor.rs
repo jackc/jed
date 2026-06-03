@@ -413,6 +413,30 @@ impl Database {
             order.push((idx, key.descending, key.nulls_first));
         }
 
+        // SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates are
+        // collapsed, an ORDER BY key that is not in the projected output has no single
+        // value per row, so each key must appear as a bare column in the select list (or
+        // the list is `*`). Matches PostgreSQL (42P10); the engine keeps its own SQLite
+        // NULL ordering separately. Aliases are invisible to ORDER BY (§8), so an aliased
+        // bare column still counts as projecting its underlying column.
+        if sel.distinct && !order.is_empty() {
+            if let SelectItems::Items(items) = &sel.items {
+                let projected: std::collections::HashSet<usize> = items
+                    .iter()
+                    .filter_map(|it| match &it.expr {
+                        Expr::Column(name) => table.column_index(name),
+                        _ => None,
+                    })
+                    .collect();
+                if order.iter().any(|&(idx, _, _)| !projected.contains(&idx)) {
+                    return Err(EngineError::new(
+                        SqlState::InvalidColumnReference,
+                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                    ));
+                }
+            }
+        }
+
         // Scan in primary-key order (the order-preserving encoding makes this the
         // logical key order), then filter. A WHERE arithmetic can trap (22003/22012),
         // so this is an explicit loop that propagates the error. Each scanned row and the
@@ -447,30 +471,67 @@ impl Database {
             });
         }
 
-        // LIMIT / OFFSET: window the sorted rows BEFORE projection, so rows skipped by
-        // OFFSET or excluded by LIMIT accrue no row_produced/projection cost (they were
-        // still scanned + filtered above). Clamp in the integer domain against the row
-        // count before indexing — never truncate a huge count into usize (CLAUDE.md §8;
-        // spec/design/grammar.md §9). The counts are already non-negative (parser).
-        let start = sel.offset.unwrap_or(0).min(rows.len() as i64) as usize;
-        let end = match sel.limit {
-            Some(lim) if lim < (rows.len() - start) as i64 => start + lim as usize,
-            _ => rows.len(),
+        // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the integer
+        // domain against the row count before indexing — never truncate a huge count into
+        // usize (CLAUDE.md §8; spec/design/grammar.md §9). The counts are already
+        // non-negative (parser).
+        let window_bounds = |len: usize| -> (usize, usize) {
+            let start = sel.offset.unwrap_or(0).min(len as i64) as usize;
+            let end = match sel.limit {
+                Some(lim) if lim < (len - start) as i64 => start + lim as usize,
+                _ => len,
+            };
+            (start, end)
         };
-        let window = &rows[start..end];
 
-        // Project each windowed row. Producing a row, and each projection-list
-        // evaluation, accrue cost. (ORDER BY's sort comparisons are not metered —
-        // spec/design/cost.md §3.)
-        let mut out_rows = Vec::with_capacity(window.len());
-        for row in window {
-            meter.charge(COSTS.row_produced);
-            let mut out = Vec::with_capacity(projections.len());
-            for p in &projections {
-                out.push(p.eval(row, &mut meter)?);
+        // Build the output rows. The two paths differ in pipeline order
+        // (spec/design/grammar.md §11): without DISTINCT the window slices the sorted
+        // source rows and ONLY the windowed rows are projected; with DISTINCT every
+        // (sorted) filtered row is projected — dedup must see them all — duplicates drop
+        // by first occurrence, and the window then slices the DISTINCT rows.
+        let out_rows = if sel.distinct {
+            // Project every filtered row (charging projection cost per row, the §3
+            // asymmetry), keeping first occurrences. `seen` is membership-only: the
+            // output order comes from the deterministic source iteration, never from set
+            // iteration (no hashmap-order leak — CLAUDE.md §8/§10).
+            let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
+            let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
+            for row in &rows {
+                let mut out = Vec::with_capacity(projections.len());
+                for p in &projections {
+                    out.push(p.eval(row, &mut meter)?);
+                }
+                if seen.insert(out.clone()) {
+                    distinct_rows.push(out);
+                }
             }
-            out_rows.push(out);
-        }
+            // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge
+            // row_produced (spec/design/cost.md §3).
+            let (start, end) = window_bounds(distinct_rows.len());
+            let mut out_rows = Vec::with_capacity(end - start);
+            for row in distinct_rows.drain(start..end) {
+                meter.charge(COSTS.row_produced);
+                out_rows.push(row);
+            }
+            out_rows
+        } else {
+            // Window the sorted rows BEFORE projection, so rows skipped by OFFSET or
+            // excluded by LIMIT accrue no row_produced/projection cost (they were still
+            // scanned + filtered above). Producing a row, and each projection-list
+            // evaluation, accrue cost. (ORDER BY's sort comparisons are not metered —
+            // spec/design/cost.md §3.)
+            let (start, end) = window_bounds(rows.len());
+            let mut out_rows = Vec::with_capacity(end - start);
+            for row in &rows[start..end] {
+                meter.charge(COSTS.row_produced);
+                let mut out = Vec::with_capacity(projections.len());
+                for p in &projections {
+                    out.push(p.eval(row, &mut meter)?);
+                }
+                out_rows.push(out);
+            }
+            out_rows
+        };
 
         Ok(Outcome::Query {
             column_names,

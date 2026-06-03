@@ -17,6 +17,7 @@ export type SqlState =
   | "undefined_table" // 42P01
   | "undefined_column" // 42703
   | "undefined_object" // 42704 — e.g. an unknown type name
+  | "invalid_column_reference" // 42P10 — SELECT DISTINCT ORDER BY key not in select list
   | "datatype_mismatch" // 42804
   | "duplicate_table" // 42P07
   | "duplicate_column" // 42701
@@ -35,6 +36,7 @@ const CODES: Record<SqlState, string> = {
   undefined_table: "42P01",
   undefined_column: "42703",
   undefined_object: "42704",
+  invalid_column_reference: "42P10",
   datatype_mismatch: "42804",
   duplicate_table: "42P07",
   duplicate_column: "42701",

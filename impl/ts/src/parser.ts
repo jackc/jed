@@ -166,6 +166,22 @@ class Parser {
   // [LIMIT <count>] [OFFSET <count>]`. LIMIT/OFFSET may appear in either order (§9).
   private parseSelect(): Select {
     this.expectKeyword("select");
+
+    // DISTINCT is not reserved (a column may be named `distinct`), and it is the only
+    // modifier before the select list, so it takes a two-token lookahead: the leading
+    // `DISTINCT` is the modifier iff the next token is neither FROM nor end-of-input —
+    // otherwise the word is a column named `distinct` (spec/design/grammar.md §11). This
+    // rule must be byte-identical across cores.
+    let distinct = false;
+    if (this.peekKeyword() === "distinct") {
+      const next = this.tokens[this.pos + 1]!;
+      const modifier = next.kind !== "eof" && !(next.kind === "word" && lower(next.word!) === "from");
+      if (modifier) {
+        this.advance();
+        distinct = true;
+      }
+    }
+
     const items = this.parseSelectItems();
     this.expectKeyword("from");
     const from = this.expectIdentifier();
@@ -191,7 +207,7 @@ class Parser {
       }
     }
 
-    return { kind: "select", items, from, filter, orderBy, limit, offset };
+    return { kind: "select", distinct, items, from, filter, orderBy, limit, offset };
   }
 
   // parseOrderBy parses an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare

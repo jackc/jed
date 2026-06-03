@@ -59,9 +59,12 @@ type Delete struct {
 // Select is a single-table SELECT. Filter (the WHERE expression) must resolve to
 // boolean.
 type Select struct {
-	Items  SelectItems
-	From   string
-	Filter *Expr
+	// Distinct is SELECT DISTINCT — deduplicate the projected output rows (NULL-safe),
+	// applied after ORDER BY and before LIMIT/OFFSET (spec/design/grammar.md §11).
+	Distinct bool
+	Items    SelectItems
+	From     string
+	Filter   *Expr
 	// OrderBy holds the ORDER BY sort keys, applied left to right; nil/empty means no
 	// ORDER BY (spec/design/grammar.md §10).
 	OrderBy []OrderKey

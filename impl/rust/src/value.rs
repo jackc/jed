@@ -11,7 +11,7 @@
 /// is produced by comparisons and logical connectives and can be projected/rendered,
 /// but is never stored in a column. A NULL boolean (unknown) is represented as
 /// `Value::Null`, so `{Bool(true), Bool(false), Null}` is the three-valued domain.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Value {
     Null,
     Int(i64),

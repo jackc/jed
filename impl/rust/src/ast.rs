@@ -60,6 +60,9 @@ pub struct Delete {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Select {
+    /// `SELECT DISTINCT` — deduplicate the projected output rows (NULL-safe), applied
+    /// after ORDER BY and before LIMIT/OFFSET (spec/design/grammar.md §11).
+    pub distinct: bool,
     /// Projected expressions, or `*` for all (`SelectItems::All`).
     pub items: SelectItems,
     pub from: String,

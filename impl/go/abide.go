@@ -31,6 +31,8 @@ var SupportedCapabilities = []string{
 	// LIMIT / OFFSET row windowing, applied after ORDER BY, before projection (grammar.md §9).
 	"query.limit",
 	"query.offset",
+	// SELECT DISTINCT: deduplicate projected output rows, NULL-safe (grammar.md §11).
+	"query.distinct",
 	"null.three_valued",
 	"compare.promotion",
 	"cast.explicit",

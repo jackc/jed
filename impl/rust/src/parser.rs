@@ -139,11 +139,33 @@ impl Parser {
         }
     }
 
-    /// `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <key> [, <key>]*]
-    /// [LIMIT <count>] [OFFSET <count>]`, where `<items>` is `*` or a comma-separated
-    /// list of column refs / CASTs. LIMIT/OFFSET may appear in either order (§9).
+    /// `SELECT [DISTINCT] <items> FROM <table> [WHERE <predicate>] [ORDER BY <key> [,
+    /// <key>]*] [LIMIT <count>] [OFFSET <count>]`, where `<items>` is `*` or a
+    /// comma-separated list of column refs / CASTs. LIMIT/OFFSET may appear in either
+    /// order (§9).
+    ///
+    /// `DISTINCT` is not a reserved word (a column may be named `distinct`), and it is
+    /// the only modifier before the select list, so it takes a two-token lookahead: the
+    /// leading `DISTINCT` is the modifier iff the next token is neither `FROM` nor
+    /// end-of-input — otherwise the word is a column named `distinct`
+    /// (spec/design/grammar.md §11). This rule must be byte-identical across cores.
     fn parse_select(&mut self) -> Result<Select> {
         self.expect_keyword("select")?;
+
+        let distinct = if self.peek_keyword().as_deref() == Some("distinct") {
+            let modifier = match self.tokens.get(self.pos + 1) {
+                Some(Token::Word(w)) => !w.eq_ignore_ascii_case("from"),
+                Some(Token::Eof) | None => false,
+                Some(_) => true,
+            };
+            if modifier {
+                self.advance();
+            }
+            modifier
+        } else {
+            false
+        };
+
         let items = self.parse_select_items()?;
         self.expect_keyword("from")?;
         let from = self.expect_identifier()?;
@@ -155,6 +177,7 @@ impl Parser {
         let (limit, offset) = self.parse_limit_offset()?;
 
         Ok(Select {
+            distinct,
             items,
             from,
             filter,

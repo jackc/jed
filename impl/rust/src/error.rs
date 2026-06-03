@@ -30,6 +30,9 @@ pub enum SqlState {
     UndefinedColumn,
     /// 42704 — undefined object (e.g. an unknown type name).
     UndefinedObject,
+    /// 42P10 — invalid column reference (a SELECT DISTINCT ORDER BY key not in the
+    /// select list).
+    InvalidColumnReference,
     /// 42804 — datatype mismatch (a value's type is wrong for its context).
     DatatypeMismatch,
     /// 42P07 — duplicate table (CREATE TABLE of an existing name).
@@ -57,6 +60,7 @@ impl SqlState {
             SqlState::UndefinedTable => "42P01",
             SqlState::UndefinedColumn => "42703",
             SqlState::UndefinedObject => "42704",
+            SqlState::InvalidColumnReference => "42P10",
             SqlState::DatatypeMismatch => "42804",
             SqlState::DuplicateTable => "42P07",
             SqlState::DuplicateColumn => "42701",

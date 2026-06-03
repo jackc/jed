@@ -31,6 +31,9 @@ const (
 	UndefinedColumn
 	// UndefinedObject is 42704 (e.g. an unknown type name).
 	UndefinedObject
+	// InvalidColumnReference is 42P10 — a SELECT DISTINCT ORDER BY key not in the
+	// select list.
+	InvalidColumnReference
 	// DatatypeMismatch is 42804.
 	DatatypeMismatch
 	// DuplicateTable is 42P07 (CREATE TABLE of an existing name).
@@ -68,6 +71,8 @@ func (s SqlState) Code() string {
 		return "42703"
 	case UndefinedObject:
 		return "42704"
+	case InvalidColumnReference:
+		return "42P10"
 	case DatatypeMismatch:
 		return "42804"
 	case DuplicateTable:

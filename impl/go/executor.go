@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -374,6 +375,28 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		order = append(order, orderKeyPlan{idx: idx, descending: key.Descending, nullsFirst: key.NullsFirst})
 	}
 
+	// SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates are
+	// collapsed, an ORDER BY key not in the projected output has no single value per row,
+	// so each key must appear as a bare column in the select list (or the list is `*`).
+	// Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8), so an aliased
+	// bare column still counts as projecting its underlying column.
+	if sel.Distinct && len(order) > 0 && !sel.Items.All {
+		projected := make(map[int]bool)
+		for _, it := range sel.Items.Items {
+			if it.Expr.Kind == ExprColumn {
+				if idx := table.ColumnIndex(it.Expr.Column); idx >= 0 {
+					projected[idx] = true
+				}
+			}
+		}
+		for _, key := range order {
+			if !projected[key.idx] {
+				return Outcome{}, NewError(InvalidColumnReference,
+					"for SELECT DISTINCT, ORDER BY expressions must appear in select list")
+			}
+		}
+	}
+
 	// Scan in primary-key order, then filter. A WHERE arithmetic can trap
 	// (22003/22012), so the error is propagated rather than swallowed in a predicate.
 	// Each scanned row and the filter evaluation accrue cost; the row-produced charge is
@@ -411,41 +434,109 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		})
 	}
 
-	// LIMIT / OFFSET: window the sorted rows BEFORE projection, so rows skipped by OFFSET
-	// or excluded by LIMIT accrue no row_produced/projection cost (they were still scanned
-	// + filtered above). Clamp in the int64 domain against the row count before indexing —
-	// never truncate a huge count (CLAUDE.md §8; spec/design/grammar.md §9). The counts are
-	// already non-negative (parser).
-	n := int64(len(rows))
-	start := int64(0)
-	if sel.Offset != nil && *sel.Offset < n {
-		start = *sel.Offset
-	} else if sel.Offset != nil {
-		start = n
-	}
-	end := n
-	if sel.Limit != nil && *sel.Limit < n-start {
-		end = start + *sel.Limit
-	}
-	rows = rows[start:end]
-
-	// Project each windowed row. Producing a row, and each projection-list evaluation,
-	// accrue cost. (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
-	out := make([][]Value, 0, len(rows))
-	for _, row := range rows {
-		meter.Charge(Costs.RowProduced)
-		projected := make([]Value, len(projections))
-		for i, p := range projections {
-			v, err := p.eval(row, meter)
-			if err != nil {
-				return Outcome{}, err
-			}
-			projected[i] = v
+	// LIMIT / OFFSET window bounds over a result of n rows. Clamp in the int64 domain
+	// against the row count before indexing — never truncate a huge count (CLAUDE.md §8;
+	// spec/design/grammar.md §9). The counts are already non-negative (parser).
+	windowBounds := func(n int64) (int64, int64) {
+		start := int64(0)
+		if sel.Offset != nil && *sel.Offset < n {
+			start = *sel.Offset
+		} else if sel.Offset != nil {
+			start = n
 		}
-		out = append(out, projected)
+		end := n
+		if sel.Limit != nil && *sel.Limit < n-start {
+			end = start + *sel.Limit
+		}
+		return start, end
+	}
+
+	// Build the output rows. The two paths differ in pipeline order
+	// (spec/design/grammar.md §11): without DISTINCT the window slices the sorted source
+	// rows and ONLY the windowed rows are projected; with DISTINCT every (sorted) filtered
+	// row is projected — dedup must see them all — duplicates drop by first occurrence, and
+	// the window then slices the DISTINCT rows.
+	var out [][]Value
+	if sel.Distinct {
+		// Project every filtered row (charging projection cost per row, the §3 asymmetry),
+		// keeping first occurrences. `seen` is membership-only: output order comes from the
+		// deterministic source iteration, never from map iteration (no map-order leak —
+		// CLAUDE.md §8/§10).
+		seen := make(map[string]bool)
+		var distinctRows [][]Value
+		for _, row := range rows {
+			projected := make([]Value, len(projections))
+			for i, p := range projections {
+				v, err := p.eval(row, meter)
+				if err != nil {
+					return Outcome{}, err
+				}
+				projected[i] = v
+			}
+			if key := distinctRowKey(projected); !seen[key] {
+				seen[key] = true
+				distinctRows = append(distinctRows, projected)
+			}
+		}
+		// LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge
+		// RowProduced (spec/design/cost.md §3).
+		start, end := windowBounds(int64(len(distinctRows)))
+		out = make([][]Value, 0, end-start)
+		for _, row := range distinctRows[start:end] {
+			meter.Charge(Costs.RowProduced)
+			out = append(out, row)
+		}
+	} else {
+		// Window the sorted rows BEFORE projection, so rows skipped by OFFSET or excluded by
+		// LIMIT accrue no row_produced/projection cost (they were still scanned + filtered
+		// above). Producing a row, and each projection-list evaluation, accrue cost.
+		// (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
+		start, end := windowBounds(int64(len(rows)))
+		windowed := rows[start:end]
+		out = make([][]Value, 0, len(windowed))
+		for _, row := range windowed {
+			meter.Charge(Costs.RowProduced)
+			projected := make([]Value, len(projections))
+			for i, p := range projections {
+				v, err := p.eval(row, meter)
+				if err != nil {
+					return Outcome{}, err
+				}
+				projected[i] = v
+			}
+			out = append(out, projected)
+		}
 	}
 
 	return Outcome{Kind: OutcomeQuery, ColumnNames: columnNames, Rows: out, Cost: meter.Accrued}, nil
+}
+
+// distinctRowKey encodes a projected row into a collision-free string key for DISTINCT
+// dedup. Each field carries a type tag (n/i/b) and a payload, joined by a separator that
+// no field can contain, so e.g. (1,23) and (12,3) do not collide (spec/design/grammar.md
+// §11). NULL == NULL falls out (both encode to "n"), matching the NULL-safe DISTINCT rule.
+func distinctRowKey(row []Value) string {
+	var b strings.Builder
+	for i, v := range row {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		switch v.Kind {
+		case ValNull:
+			b.WriteByte('n')
+		case ValInt:
+			b.WriteByte('i')
+			b.WriteString(strconv.FormatInt(v.Int, 10))
+		case ValBool:
+			b.WriteByte('b')
+			if v.Bool {
+				b.WriteByte('1')
+			} else {
+				b.WriteByte('0')
+			}
+		}
+	}
+	return b.String()
 }
 
 // ============================================================================

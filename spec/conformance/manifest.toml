@@ -85,6 +85,10 @@ id = "query.offset"
 description = "OFFSET clause: skip leading rows of the result (non-negative integer literal)"
 
 [[capability]]
+id = "query.distinct"
+description = "SELECT DISTINCT: deduplicate projected output rows (NULL-safe), with the PostgreSQL ORDER-BY-in-select-list restriction"
+
+[[capability]]
 id = "types.int16"
 description = "int16 / smallint scalar type"
 

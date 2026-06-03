@@ -70,10 +70,20 @@ delete         ::= "DELETE" "FROM" identifier where_clause?
 
 /* --- queries ------------------------------------------------------------- */
 
-select         ::= "SELECT" select_items "FROM" identifier
+select         ::= "SELECT" "DISTINCT"? select_items "FROM" identifier
                    where_clause?
                    order_by?
                    limit_offset?
+
+/* "DISTINCT" removes duplicate PROJECTED output rows (dedup on the select-list
+ * values, NULL-safe so two all-NULL rows collapse — ../design/grammar.md §11). It
+ * is NOT reserved (a column may be named "distinct", §3), and it is the only
+ * modifier that precedes the select list, so the parsers disambiguate it with a
+ * TWO-token lookahead: the leading "DISTINCT" is the modifier iff the token after it
+ * is NOT "FROM" and not end-of-input. So "SELECT distinct FROM t" selects a column
+ * named distinct, "SELECT DISTINCT a FROM t" is the modifier, and "SELECT DISTINCT
+ * distinct FROM t" is the modifier applied over a column named distinct. The rule is
+ * a CLAUDE.md §8 determinism surface — it must be byte-identical across cores. */
 
 /* A select item is a general expression with an optional output-name alias. The
  * "*" glob is a STANDALONE alternative — it is the whole select list, never mixed
