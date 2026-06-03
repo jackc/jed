@@ -260,9 +260,27 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       is rejected `0A000`); `varchar(n)` length limits (`22001`); text⇄other casts; string
       functions (`||`, `length`, `lower`/`upper`, `substring`) + `LIKE`; multi-collation / ICU
       (a per-column catalog collation field + `COLLATE`).
-- [ ] **Exact `decimal`** — *the* headline type. Forces decimal **rounding mode + scale**
-      and keeps binary floats out of the comparison/text paths (§8). `numeric.c` (Postgres)
-      is the reference. Hard, high-value. _(size: XL; §4/§8)_
+- [x] **Exact `decimal`** — *the* headline type. Done across Rust/Go/TS: an exact base-10
+      numeric held as hand-rolled sign + base-10⁹ coefficient + scale (no bignum lib, no float),
+      the engine's **first parameterized type** (`numeric`, `numeric(p)`, `numeric(p,s)`;
+      `1≤p≤1000`, `0≤s≤p`, bad typmod `22023`). Settles the §8 **decimal-rounding** hotspot:
+      **round half away from zero** (PG `numeric`), one mode engine-wide, with PG-faithful
+      result **scales** (add/sub `max(s1,s2)`, mul `s1+s2`, div `select_div_scale`, mod
+      `max(s1,s2)`). Comparison/order by exact value (`1.5 = 1.50`), the first cross-family
+      `integer↔decimal` promotion, casts (`int→decimal` implicit, `decimal→int` explicit-only —
+      stricter than PG), arithmetic `+ − * / %` + unary `−`, on-disk value codec (type code 5,
+      base-10⁴ groups), render tag `D`. **Finite only** — no NaN/±Infinity (documented PG
+      divergence). Authored in [spec/design/decimal.md](spec/design/decimal.md) + the type/
+      function/error/grammar data, capabilities `types.decimal` + `expr.decimal_arithmetic`,
+      pinned by `spec/conformance/suites/types/decimal.test`,
+      `spec/conformance/suites/expr/decimal_arithmetic.test`, and the byte-exact golden
+      `spec/fileformat/fixtures/decimal_table.jed` (read/written identically by all three cores +
+      the Ruby reference). `numeric.c` (Postgres) was the reference. _(was: XL; §4/§8)_
+      **Deferred follow-ups:** decimal in a `PRIMARY KEY`/index (the order-preserving
+      `decimal-order-preserving` key encoding is authored in `encoding.md §2.5` but unexercised
+      — decimal PK is rejected `0A000`); scientific `e`-notation literals (`1.5e3`); negative /
+      `s>p` scale typmods (PG 15+); `round(x,n)` and other decimal functions; raising the
+      1000-digit / scale-1000 cap once over-page values (overflow pages / TOAST) land (Phase 6).
 - [ ] **`timestamp` / `timestamptz`.** Forces a defined epoch, range, and tz model;
       determinism-sensitive (no wall-clock in tests). _(size: L; §4)_
 - [ ] **`bytea`.** Order-preserving encoding is straightforward (raw bytes). _(size: M; §4)_

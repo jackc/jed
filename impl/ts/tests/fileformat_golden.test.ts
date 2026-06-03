@@ -79,6 +79,18 @@ function boolTableDB(): Database {
   return db;
 }
 
+// decimalTableDB has a decimal column — exercises the value codec's decimal branch (flags +
+// u16 scale + u16 ndigits + base-10^4 groups) and the catalog typmod: an unconstrained numeric
+// column `d` and a constrained numeric(10,2) column `m` (values already at scale 2, a no-op
+// coercion). Covers positive, negative, zero, a multi-group coefficient, and a NULL.
+function decimalTableDB(): Database {
+  const db = new Database();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, d numeric, m numeric(10,2))");
+  run(db, "INSERT INTO t VALUES (1, 1.50, 1.50), (2, -12345.6789, -12.34), " +
+    "(3, 0.00, 0.00), (4, 100000000.000001, 100.00), (5, NULL, NULL)");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -87,6 +99,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
     { name: "bool_table.jed", build: boolTableDB },
+    { name: "decimal_table.jed", build: decimalTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
   ];
   for (const c of cases) {
@@ -107,6 +120,7 @@ test("read goldens reproduces rows", () => {
     { name: "pk_table.jed", build: pkTableDB, table: "t" },
     { name: "text_table.jed", build: textTableDB, table: "t" },
     { name: "bool_table.jed", build: boolTableDB, table: "t" },
+    { name: "decimal_table.jed", build: decimalTableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },
@@ -132,8 +146,8 @@ test("read golden reconstructs catalog", () => {
   assert.equal(tbl!.name, "t");
   assert.equal(tbl!.columns.length, 2);
   const [id, v] = tbl!.columns;
-  assert.deepStrictEqual(id, { name: "id", type: "int32", primaryKey: true, notNull: true });
-  assert.deepStrictEqual(v, { name: "v", type: "int16", primaryKey: false, notNull: false });
+  assert.deepStrictEqual(id, { name: "id", type: "int32", decimal: null, primaryKey: true, notNull: true });
+  assert.deepStrictEqual(v, { name: "v", type: "int16", decimal: null, primaryKey: false, notNull: false });
   // A NULL value round-trips (id 3's v).
   const rows = loaded.rowsInKeyOrder("t");
   assert.deepStrictEqual(rows[2], [{ kind: "int", int: 3n }, { kind: "null" }]);

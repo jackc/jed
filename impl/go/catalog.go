@@ -4,8 +4,12 @@ import "strings"
 
 // Column is a column definition: name, declared type, nullability, primary-key flag.
 type Column struct {
-	Name       string
-	Type       ScalarType
+	Name string
+	Type ScalarType
+	// Decimal is the numeric(p,s) typmod for a decimal column, or nil for a non-decimal column
+	// OR an unconstrained numeric (spec/design/decimal.md §2). A constrained decimal column
+	// coerces stored values to this precision/scale.
+	Decimal    *DecimalTypmod
 	PrimaryKey bool
 	// NotNull is implied true for a PRIMARY KEY column.
 	NotNull bool

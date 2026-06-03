@@ -109,6 +109,8 @@ Each **table entry**:
 | &nbsp;&nbsp;`col_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`type_code` | u8 (stable, see below) |
 | &nbsp;&nbsp;`flags` | u8 — bit0 `primary_key`, bit1 `not_null` (reader trusts the bits) |
+| &nbsp;&nbsp;`precision` | u16 — **only present when `type_code == 6` (decimal)**; `0` = unconstrained |
+| &nbsp;&nbsp;`scale` | u16 — **only present when `type_code == 6` (decimal)** |
 | `root_data_page` | u32 — first data page of this table's chain, or 0 if it has no rows |
 
 Columns are emitted in declaration order.
@@ -125,10 +127,19 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 3 | `int64` |
 | 4 | `text` |
 | 5 | `boolean` |
+| 6 | `decimal` |
 
 A column's collation is **not** stored: there is one collation (`C`) for all text this slice
 (../design/types.md §11). A per-column collation field is a forward extension that will claim a
 spare `flags` bit or a new field under a `format_version` bump when multi-collation lands.
+
+A **decimal** column carries a **typmod** (the `numeric(p,s)` precision/scale) that constrains
+future writes, so it **must** persist. It is appended to the column entry **only when
+`type_code == 6`** — two extra big-endian `u16`s, `precision` then `scale` — so non-decimal
+column entries are byte-unchanged (existing int/text fixtures are untouched). `precision == 0`
+means **unconstrained** `numeric` (no typmod; `scale` is then `0` and ignored); a constrained
+`numeric(p,s)` stores `precision = p` (`1 … 1000`) and `scale = s`. The reader, having read
+`type_code == 6`, reads the two `u16`s; for any other type code it reads neither.
 
 ## Data pages (one chain per non-empty table)
 
@@ -183,9 +194,24 @@ alone. The present-value body depends on the type:
   (false `<` true), but as a stored value it never needs to sort (a boolean PRIMARY KEY is
   rejected this slice — types.md §9).
 
+- **`decimal`** — also self-describing (its whole point is exactness, not ordering), so like
+  text it uses a compact codec, **not** the order-preserving key encoding (encoding.md §2.5).
+  The present body is, in order: a **`u8` `flags`** (bit0 = sign, `1` = negative; bits 1–7
+  reserved `0`); a **`u16` `scale`** (big-endian, the value's display scale `s`); a **`u16`
+  `ndigits`** (big-endian, the number of base-10⁴ digit groups in the coefficient); then
+  **`ndigits` × `u16`** (big-endian) coefficient groups, **most-significant group first**, each
+  `0 … 9999` (base 10000 — PG's on-disk digit size, and `u16`-clean / reviewable in the
+  fixtures). The in-core base-10⁹ coefficient is regrouped to base-10⁴ on write and back on
+  read (a pure power-of-ten split). **Canonical zero** is `flags=0, scale=s, ndigits=0` (no
+  groups; the sign bit is forced `0` when the coefficient is zero — there is no negative zero),
+  so a given scale has exactly one byte form for zero. The reader reads the tag, then flags,
+  scale, ndigits, then that many `u16` groups — its width is fully self-describing. A value
+  exceeding the page (impossible under the 1000-digit cap for a 256-byte fixture only at the
+  extreme) trips the oversized-item rule below.
+
 There is no per-record payload length: the reader walks the columns in declaration order,
 deriving each value's width from its type (fixed for integers and the 1-byte boolean;
-self-describing via the `u16` length for text).
+self-describing via the `u16` length for text, and via `ndigits` for decimal).
 
 ## Packing and page allocation (must be byte-identical across cores)
 
@@ -221,6 +247,7 @@ by the independent Ruby reference in [verify.rb](verify.rb) (run via `rake verif
 | `pk_table.jed` | a PK table with rows spanning **>1** data page; a NULL value in a row |
 | `text_table.jed` | a text column — the value codec's text branch (`u16` length + UTF-8), empty string, embedded quote, multi-byte and astral chars, and a NULL text value |
 | `bool_table.jed` | a boolean column — the value codec's `bool-byte` branch (`00` false / `01` true) and a NULL boolean |
+| `decimal_table.jed` | a `decimal` column — the value codec's decimal branch (flags + scale + base-10⁴ groups), the per-column `numeric(p,s)` typmod, and positive/negative/zero/multi-group/NULL |
 | `nopk_table.jed` | a table with no PK — exercises the stored synthetic `int64` rowid key |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |

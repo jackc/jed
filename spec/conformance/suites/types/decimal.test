@@ -1,0 +1,187 @@
+# Exact decimal / numeric type (spec/design/decimal.md): storage, decimal literals, display-scale
+# preservation, comparison/ordering by VALUE (1.5 = 1.50), the first cross-family integer<->decimal
+# comparison, casts (int->decimal implicit, decimal->int explicit half-away), numeric(p,s) coercion
+# (round half away from zero) on store, and the typmod / decimal-PK narrowings. Arithmetic is in
+# expr/decimal_arithmetic.test. Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, query.distinct, cast.explicit, types.int32, types.decimal
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO t VALUES (1, 1.50), (2, 1.5), (3, 0.00), (4, -0.013), (5, 123), (6, NULL)
+
+# a decimal renders as its canonical base-10 string, PRESERVING its display scale: 1.50 stays
+# 1.50, distinct in display from 1.5 though equal in value (spec/design/decimal.md §6).
+query D nosort
+SELECT v FROM t WHERE id = 1
+----
+1.50
+
+query D nosort
+SELECT v FROM t WHERE id = 2
+----
+1.5
+
+# the zero value keeps its scale; a leading-dot/0 integer part renders as 0
+query D nosort
+SELECT v FROM t WHERE id = 3
+----
+0.00
+
+query D nosort
+SELECT v FROM t WHERE id = 4
+----
+-0.013
+
+# an integer literal into a numeric column widens (int -> decimal, scale 0)
+query D nosort
+SELECT v FROM t WHERE id = 5
+----
+123
+
+# equality is by VALUE, independent of display scale: both 1.50 (row 1) and 1.5 (row 2) equal
+# 1.5, and they equal 1.500 too — display scale never affects equality
+query I nosort
+SELECT id FROM t WHERE v = 1.5 ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM t WHERE v = 1.500 ORDER BY id
+----
+1
+2
+
+# the first cross-family comparison: an integer literal promotes to decimal, so `v = 123`
+# matches the row stored from the integer literal 123
+query I nosort
+SELECT id FROM t WHERE v = 123
+----
+5
+
+# = NULL is UNKNOWN, never a match (three-valued logic), for decimal as for integers
+query I nosort
+SELECT id FROM t WHERE v = NULL
+----
+
+query I nosort
+SELECT id FROM t WHERE v IS NULL
+----
+6
+
+# ORDER BY decimal is NUMERIC order (not lexicographic), NULLs last (the PostgreSQL model):
+# -0.013 < 0.00 < 1.5(=1.50) ... but two rows are equal in value (1 and 2). A stable sort keeps
+# the primary-key scan order for the tie, so 1 precedes 2. Expected by value:
+# -0.013(4) < 0(3) < 1.5(1) = 1.5(2) < 123(5), NULL(6) last.
+query I nosort
+SELECT id FROM t ORDER BY v
+----
+4
+3
+1
+2
+5
+6
+
+# IS [NOT] DISTINCT FROM: NULL-safe equality on decimal
+query I nosort
+SELECT id FROM t WHERE v IS NOT DISTINCT FROM NULL
+----
+6
+
+# --- numeric(p,s): rounding (half away from zero) + precision-overflow on store ---------------
+statement ok
+CREATE TABLE money (id int32 PRIMARY KEY, amt numeric(10,2))
+
+statement ok
+INSERT INTO money VALUES (1, 1.5), (2, 1.555), (3, 1.554), (4, 5), (5, -2.5)
+
+# stored values are rounded to scale 2 (half away from zero) and zero-padded to exactly 2 places
+query D nosort
+SELECT amt FROM money ORDER BY id
+----
+1.50
+1.56
+1.55
+5.00
+-2.50
+
+# numeric(3,2): the integer part may have at most p - s = 1 digit.
+statement ok
+CREATE TABLE tight (id int32 PRIMARY KEY, x numeric(3,2))
+
+# 12.34 has a 2-digit integer part -> 22003 overflow
+statement error 22003
+INSERT INTO tight VALUES (1, 12.34)
+
+# 9.999 ROUNDS UP to 10.00, whose integer part is now 2 digits -> also 22003
+statement error 22003
+INSERT INTO tight VALUES (2, 9.999)
+
+# --- casts: int <-> decimal -------------------------------------------------------------------
+statement ok
+CREATE TABLE c (id int32 PRIMARY KEY, i int32, d numeric)
+
+statement ok
+INSERT INTO c VALUES (1, 7, 2.5)
+
+# int -> decimal is implicit/lossless; with a typmod it coerces (pads to scale)
+query D nosort
+SELECT CAST(i AS numeric(10,2)) FROM c WHERE id = 1
+----
+7.00
+
+# decimal -> int is explicit; it ROUNDS half away from zero (2.5 -> 3, -2.5 -> -3)
+query I nosort
+SELECT CAST(d AS int32) FROM c WHERE id = 1
+----
+3
+
+query I nosort
+SELECT CAST(-2.5 AS int32) FROM c WHERE id = 1
+----
+-3
+
+# --- type errors and the deliberate narrowings ------------------------------------------------
+# decimal vs text is not comparable (a 42804 type error, like bool = int)
+statement error 42804
+SELECT id FROM c WHERE d = '2.5'
+
+# a decimal literal stored into an integer column is a type error: decimal->int is explicit
+# CAST only (stricter than PostgreSQL) — 42804
+statement error 42804
+INSERT INTO c VALUES (2, 1.5, 9.9)
+
+# a bad numeric typmod traps 22023 (PostgreSQL's invalid_parameter_value)
+statement error 22023
+CREATE TABLE bad1 (x numeric(0))
+
+statement error 22023
+CREATE TABLE bad2 (x numeric(1001))
+
+statement error 22023
+CREATE TABLE bad3 (x numeric(5,7))
+
+# a type modifier on a non-decimal type is unsupported this slice (varchar(n) etc. deferred): 0A000
+statement error 0A000
+CREATE TABLE bad4 (x int32(5))
+
+# a decimal PRIMARY KEY is rejected this slice (documented narrowing, like text PK): 0A000
+statement error 0A000
+CREATE TABLE bad5 (k numeric PRIMARY KEY)
+
+# --- DISTINCT collapses values equal across display scale --------------------------------------
+statement ok
+CREATE TABLE d2 (id int32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO d2 VALUES (1, 1.5), (2, 1.50), (3, 1.500), (4, 2.0)
+
+# 1.5, 1.50, 1.500 are one VALUE; DISTINCT keeps the first occurrence (1.5)
+query D nosort
+SELECT DISTINCT v FROM d2 ORDER BY v
+----
+1.5
+2.0

@@ -101,6 +101,19 @@ func boolTableDB(t *testing.T) *Database {
 	return db
 }
 
+// decimalTableDB has a decimal column — exercises the value codec's decimal branch (flags +
+// u16 scale + u16 ndigits + base-10^4 groups) and the catalog typmod: an unconstrained numeric
+// column `d` and a constrained numeric(10,2) column `m` (whose values are already at scale 2,
+// so storing them is a no-op coercion). Covers positive, negative, zero, a multi-group
+// coefficient, and a NULL. The PK stays int32 (no decimal key this slice).
+func decimalTableDB(t *testing.T) *Database {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, d numeric, m numeric(10,2))")
+	run(t, db, "INSERT INTO t VALUES (1, 1.50, 1.50), (2, -12345.6789, -12.34), "+
+		"(3, 0.00, 0.00), (4, 100000000.000001, 100.00), (5, NULL, NULL)")
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -112,6 +125,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"pk_table.jed", pkTableDB},
 		{"text_table.jed", textTableDB},
 		{"bool_table.jed", boolTableDB},
+		{"decimal_table.jed", decimalTableDB},
 		{"nopk_table.jed", nopkTableDB},
 	}
 	for _, c := range cases {
@@ -137,6 +151,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"pk_table.jed", pkTableDB, "t"},
 		{"text_table.jed", textTableDB, "t"},
 		{"bool_table.jed", boolTableDB, "t"},
+		{"decimal_table.jed", decimalTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

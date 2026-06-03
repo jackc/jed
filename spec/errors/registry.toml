@@ -43,6 +43,12 @@ name = "invalid_row_count_in_offset_clause"
 class = "data exception"
 template = "OFFSET must not be negative"
 
+[[error]]
+code = "22023"
+name = "invalid_parameter_value"
+class = "data exception"
+template = "invalid parameter value: {detail}"
+
 # --- integrity constraint violation (class 23) ------------------------------
 [[error]]
 code = "23502"

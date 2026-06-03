@@ -76,6 +76,13 @@ Two lexer facts are easy to get subtly wrong across cores, so the grammar pins t
   `=`, `<`, `>`, `<=`, `>=`; **`<>` and `!=` still do not exist** in this surface. The
   arithmetic operators `+ - * / %` are each single-character tokens; `*` is shared with the
   `SELECT *` glob and disambiguated by grammatical position (only the first select item).
+- **A `.` makes a `number` a decimal literal** (§14). The lexer scans one run of digits and,
+  if a `.` follows (or leads, `.5`), continues into the fractional digits and emits a
+  **decimal** token; with no `.` it emits an **integer** token. So the `2^63` magnitude bound
+  applies to the *integer* form only — a decimal literal's size is bounded by `max_precision` /
+  `max_scale` and checked at resolve (`22003`), not by `42601`. A `.` with no digit on either
+  side, or a second `.` in one number, is a `42601` syntax error. There is **no** `t.col`
+  qualified-name syntax yet, so `.` appears only inside a numeric literal.
 
 ## 5. Deliberate narrowings (each relaxable later)
 
@@ -99,10 +106,11 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   order, each at most once (§9). There is **no `LIMIT ALL`**, **no `OFFSET … ROWS` /
   `FETCH NEXT … ROWS ONLY`**, and **no SQLite `LIMIT off, cnt` comma form**.
 - **ASCII-only identifiers**, no quoted identifiers (§3).
-- **No string or decimal literals.** Integer, `TRUE`/`FALSE`, and `NULL` are the literal
-  forms. `boolean` exists only as an *expression* type this slice — there are boolean
-  literals and comparison/logical results, but no boolean *column* (see
-  [types.md](types.md) §1).
+- **Literal forms.** Integer, **decimal** (`1.50`, `.5` — §14), **single-quoted string**
+  (the `text` type, `'alice'`, with `''` for an embedded quote), `TRUE`/`FALSE`, and `NULL`.
+  Scientific `e`-notation for decimals (`1.5e3`) is **deferred**. `boolean` exists only as an
+  *expression* type this slice — there are boolean literals and comparison/logical results,
+  but no boolean *column* (see [types.md](types.md) §1).
 - **No function calls.** The expression grammar has operators and parentheses but no
   `f(args)` call syntax — no scalar functions are defined yet.
 - **No `;` statement terminator** and **no SQL comment syntax** in the input.
@@ -110,15 +118,23 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   design — see [conformance.md](conformance.md); bound parameters are an
   implementation-API concern, not part of the parsed grammar.
 
-## 6. Type names stay as `identifier`
+## 6. Type names: an `identifier` plus an optional type modifier
 
-The grammar parses a column's and a `CAST`'s type as a bare `identifier` rather than
-enumerating `int16 | smallint | …` as a production. The catalog owns the type lattice
-and resolves the name case-insensitively, rejecting unknowns at execution time
-(`42704`). Keeping resolution out of the grammar means the scalar set can grow
-([types.md](types.md)) without touching the grammar, and a misspelled type yields a
+The grammar parses a column's and a `CAST`'s type as a bare `identifier` — the catalog
+owns the type lattice and resolves the name case-insensitively, rejecting unknowns at
+execution time (`42704`). Keeping resolution out of the grammar means the scalar set can
+grow ([types.md](types.md)) without touching the grammar, and a misspelled type yields a
 clean structured error instead of a parse failure. The accepted names are listed as an
 informative comment beside the `type_name` rule.
+
+With `decimal` the rule gains an **optional parenthesized type modifier** —
+`type_name ::= identifier ("(" integer ("," integer)? ")")?` — the engine's **first
+parameterized type**. The grammar accepts the typmod *shape* for any type name (it is one
+production), but the **semantics** are owned by resolution: a typmod is meaningful only for
+`decimal`/`numeric` (precision, optional scale; §14), and a typmod on a type that takes
+none — `int32(5)` — is rejected at resolve. Empty parens (`numeric()`) and a non-integer
+inside are `42601`. This mirrors §6's standing split: the grammar stays small and
+permissive about *shape*, the type system enforces *meaning*.
 
 ## 7. Growth rule
 
@@ -359,3 +375,38 @@ single-committed-state model; the staging-buffer commit is still future), exactl
 the post-drop catalog, so the dropped table's bytes are gone from the next image — no
 free-list or page-reclamation work is involved (that is deferred until incremental
 copy-on-write, Phase 6).
+
+## 14. Decimal literals and the `numeric(p,s)` type modifier
+
+The `decimal` type ([types.md](types.md) §12, [decimal.md](decimal.md)) adds two pieces of
+surface syntax, both pinned here because they are CLAUDE.md §8 determinism surfaces the three
+hand-written lexers/parsers must agree on byte-for-byte.
+
+**The decimal literal** (`decimal` token, §4). A numeric literal containing a `.` is a
+decimal: `1.5`, `1.50`, `1.`, `.5`, `0.00`. Its written form fixes **both** its value and its
+**scale** — `1.50` is the coefficient `150` at scale `2`, distinct in *display* from `1.5`
+(scale `1`) though equal in *value*. `1.` is the integer `1` at scale `0`; `.5` is `5` at
+scale `1` (an empty integer part reads as `0`). Like a bare integer literal, a decimal literal
+is an **untyped constant** that adapts to its context ([types.md](types.md) §6, extended to
+decimal): into a `numeric(p,s)` target it is rounded to scale `s` (half away from zero) and
+precision-checked (`22003`); with no decimal context it keeps its written scale. A decimal
+literal against an **integer** column is well-typed (the integer promotes to decimal —
+[../types/compare.toml](../types/compare.toml)), so `WHERE int_col = 1.5` simply never matches
+rather than erroring; but a decimal literal **stored into** an integer column is a `42804`
+type error (the strict matrix has no decimal→integer assignment cast —
+[../types/casts.toml](../types/casts.toml)). Scientific `e`-notation (`1.5e3`) is **deferred**;
+a coefficient beyond `max_precision` significant digits, or a scale beyond `max_scale`
+([../types/scalars.toml](../types/scalars.toml)), traps `22003` at resolve.
+
+**The `numeric(p,s)` type modifier** (§6). `numeric` (unconstrained), `numeric(p)`
+(= `numeric(p,0)`), and `numeric(p,s)` are the three forms, in both a column type and a
+`CAST` target. `p` is the total significant digits (`1 ≤ p ≤ 1000`) and `s` the digits after
+the point (`0 ≤ s ≤ p`); an out-of-range or malformed typmod — `numeric(0)`, `numeric(1001)`,
+`numeric(5,7)` — traps **`22023`** (`invalid_parameter_value`,
+[../errors/registry.toml](../errors/registry.toml)), PostgreSQL's SQLSTATE. The grammar
+accepts the typmod shape on *any* type name (one production, §6); a typmod on a type that
+takes none (`int32(5)`, `text(10)`) is a resolve-time error this slice (`0A000` — `varchar(n)`
+length limits and other parameterized types are deferred, [types.md](types.md) §11). The
+limits, the p/s interaction (integer-part digits ≤ `p − s`), and the rounding-on-coercion rule
+are the type system's, detailed in [decimal.md](decimal.md) §2–3; the grammar fixes only that
+the *syntax* is `identifier "(" integer ("," integer)? ")"`.

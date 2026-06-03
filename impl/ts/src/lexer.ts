@@ -98,19 +98,48 @@ export function lex(sql: string): Token[] {
       }
       tokens.push({ kind: "str", str: s });
     } else if (isDigit(c)) {
-      // Integer literal: an unsigned magnitude (the sign is the "minus" operator). The
-      // magnitude must be <= 2^63 so that -(2^63) = int64's minimum is reachable;
-      // anything larger cannot be represented (42601).
+      // A numeric literal. Scan the integer digits; if a "." follows it is a DECIMAL literal
+      // (scan the fractional digits), else an INTEGER literal.
       const start = i;
       while (i < n && isDigit(sql[i]!)) {
         i++;
       }
-      const text = sql.slice(start, i);
-      const v = BigInt(text);
-      if (v > MAX_MAGNITUDE) {
-        throw engineError("syntax_error", `integer literal out of range: ${text}`);
+      if (i < n && sql[i] === ".") {
+        // Decimal: `123.`, `123.45`. The fractional part may be empty (`1.`).
+        const intPart = sql.slice(start, i);
+        i++; // consume "."
+        const fracStart = i;
+        while (i < n && isDigit(sql[i]!)) {
+          i++;
+        }
+        const frac = sql.slice(fracStart, i);
+        tokens.push({ kind: "decimal", decDigits: intPart + frac, decScale: frac.length });
+      } else {
+        // Integer literal: an unsigned magnitude (the sign is the "minus" operator). The
+        // magnitude must be <= 2^63 so that -(2^63) = int64's minimum is reachable; anything
+        // larger cannot be represented (42601).
+        const text = sql.slice(start, i);
+        const v = BigInt(text);
+        if (v > MAX_MAGNITUDE) {
+          throw engineError("syntax_error", `integer literal out of range: ${text}`);
+        }
+        tokens.push({ kind: "int", int: v });
       }
-      tokens.push({ kind: "int", int: v });
+    } else if (c === ".") {
+      // A leading-dot decimal literal (`.5`). A "." must have a digit on at least one side; a
+      // bare "." is a syntax error. There is no t.col qualified-name syntax yet, so "." appears
+      // only in a numeric literal.
+      if (i + 1 < n && isDigit(sql[i + 1]!)) {
+        i++; // consume "."
+        const fracStart = i;
+        while (i < n && isDigit(sql[i]!)) {
+          i++;
+        }
+        const frac = sql.slice(fracStart, i);
+        tokens.push({ kind: "decimal", decDigits: frac, decScale: frac.length });
+      } else {
+        throw engineError("syntax_error", "unexpected character '.'");
+      }
     } else if (isAlpha(c)) {
       const start = i;
       while (i < n && (isAlpha(sql[i]!) || isDigit(sql[i]!))) {

@@ -90,6 +90,55 @@ fn scalar_types_match_spec() {
             "alias {a} resolves to boolean"
         );
     }
+
+    // text: storable, variable-width; its aliases resolve to ScalarType::Text.
+    let text = types
+        .iter()
+        .find(|t| t["id"].as_str() == Some("text"))
+        .expect("text type present");
+    assert_eq!(text["storable"].as_bool(), Some(true));
+    assert_eq!(ScalarType::from_name("text"), Some(ScalarType::Text));
+    for alias in text["aliases"].as_array().unwrap() {
+        assert_eq!(
+            ScalarType::from_name(alias.as_str().unwrap()),
+            Some(ScalarType::Text)
+        );
+    }
+
+    // decimal: storable, the decimal family; aliases resolve; the precision/scale caps match
+    // the decimal module's constants (a cross-core contract, spec/design/decimal.md §2).
+    let decimal = types
+        .iter()
+        .find(|t| t["id"].as_str() == Some("decimal"))
+        .expect("decimal type present");
+    assert_eq!(
+        decimal["family"].as_str(),
+        Some("decimal"),
+        "decimal family"
+    );
+    assert_eq!(
+        decimal["storable"].as_bool(),
+        Some(true),
+        "decimal storable"
+    );
+    assert_eq!(ScalarType::Decimal.canonical_name(), "decimal");
+    for name in ["decimal", "numeric", "dec"] {
+        assert_eq!(
+            ScalarType::from_name(name),
+            Some(ScalarType::Decimal),
+            "{name} resolves to decimal"
+        );
+    }
+    assert_eq!(
+        decimal["max_precision"].as_integer().unwrap() as u32,
+        jed::decimal::MAX_PRECISION,
+        "max_precision matches the decimal module"
+    );
+    assert_eq!(
+        decimal["max_scale"].as_integer().unwrap() as u32,
+        jed::decimal::MAX_SCALE,
+        "max_scale matches the decimal module"
+    );
 }
 
 #[test]
@@ -106,6 +155,7 @@ fn error_codes_are_registered() {
     for st in [
         SqlState::NumericValueOutOfRange,
         SqlState::DivisionByZero,
+        SqlState::InvalidParameterValue,
         SqlState::NotNullViolation,
         SqlState::UniqueViolation,
         SqlState::SyntaxError,

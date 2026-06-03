@@ -31,6 +31,14 @@ strategy = "none"
 family = "boolean"
 strategy = "none"
 
+# decimal has no within-family promotion tower — there is one decimal type and a value
+# carries its own scale, so two decimal operands need no reconciliation (strategy =
+# "none"; scale is aligned per-operation, not by promotion). The integer<->decimal
+# CROSS-family reconciliation is the `via = "promote-to-decimal"` comparable rule below.
+[[promotion]]
+family = "decimal"
+strategy = "none"
+
 # --- comparability -----------------------------------------------------------
 # Which (family, family) pairs may be compared at all. Anything not listed is a
 # type error. Step 1 has exactly one family, so there is one rule. Cross-family
@@ -58,6 +66,29 @@ left_family = "boolean"
 right_family = "boolean"
 via = "none"
 
+# decimal × decimal. via = "none": one decimal type, no promotion; compare by aligning
+# the two scales (multiply the lower-scale coefficient up — exact, no rounding) and
+# comparing coefficients, so 1.5 = 1.50 is true and decimals order by numeric value.
+[[comparable]]
+left_family = "decimal"
+right_family = "decimal"
+via = "none"
+
+# integer × decimal and decimal × integer — the first CROSS-family comparability (the
+# slot anticipated above). via = "promote-to-decimal": the integer operand converts to
+# decimal (scale 0, lossless), then both compare as decimals. This is PostgreSQL's
+# numeric comparison (an integer and a numeric compare by value). So `int_col = 1.5` is
+# well-typed (and simply never matches a non-integral 1.5), not a 42804 error.
+[[comparable]]
+left_family = "integer"
+right_family = "decimal"
+via = "promote-to-decimal"
+
+[[comparable]]
+left_family = "decimal"
+right_family = "integer"
+via = "promote-to-decimal"
+
 # --- value ordering ----------------------------------------------------------
 # The total order over non-NULL integers used by ORDER BY and by index/key
 # iteration. Plain signed numeric order; matches the order-preserving key
@@ -74,6 +105,11 @@ text = "codepoint-ascending"
 # this order in raw bytes. NULL sorts last in ascending order, as for every type
 # (null_ordering below). PostgreSQL orders booleans the same way (false < true).
 boolean = "false-before-true"
+# decimal orders by exact numeric value, independent of stored scale (1.5 and 1.50 are
+# equal; -10 < -1 < 0 < 0.5 < 1 < 10). The order-preserving key encoding (scalars.toml
+# "decimal-order-preserving") reproduces this in raw bytes — authored but unexercised
+# this slice (decimal is not yet a key; ../design/encoding.md §2.5).
+decimal = "numeric-ascending"
 
 # NULL's position in the physical total order of encoded keys (index/key
 # iteration), RATIFIED with the key-encoding spec (CLAUDE.md §11 step 4) and

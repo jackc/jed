@@ -6,8 +6,9 @@
 
 use crate::ast::{
     Assignment, BinaryOp, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert, Literal,
-    OrderKey, Select, SelectItem, SelectItems, Statement, UnaryOp, Update,
+    OrderKey, Select, SelectItem, SelectItems, Statement, TypeMod, UnaryOp, Update,
 };
+use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
 use crate::token::Token;
@@ -72,6 +73,7 @@ impl Parser {
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
         let name = self.expect_identifier()?;
         let type_name = self.expect_identifier()?;
+        let type_mod = self.parse_type_mod()?;
         // Optional `PRIMARY KEY`.
         let primary_key = if self.peek_keyword().as_deref() == Some("primary") {
             self.advance();
@@ -83,8 +85,39 @@ impl Parser {
         Ok(ColumnDef {
             name,
             type_name,
+            type_mod,
             primary_key,
         })
+    }
+
+    /// Parse an optional parenthesized type modifier `"(" integer ("," integer)? ")"` that
+    /// follows a type name (the first parameterized type, decimal — spec/grammar/grammar.ebnf
+    /// `type_name`). The shape is accepted for any type name; whether a typmod is *meaningful*
+    /// (decimal only) and in range (1..=1000, 0..=p) is decided at resolve. Empty parens or a
+    /// non-integer inside is a 42601 syntax error.
+    fn parse_type_mod(&mut self) -> Result<Option<TypeMod>> {
+        if !matches!(self.peek(), Token::LParen) {
+            return Ok(None);
+        }
+        self.advance(); // '('
+        let precision = self.expect_typmod_int()?;
+        let scale = if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            Some(self.expect_typmod_int()?)
+        } else {
+            None
+        };
+        self.expect(&Token::RParen)?;
+        Ok(Some(TypeMod { precision, scale }))
+    }
+
+    fn expect_typmod_int(&mut self) -> Result<u64> {
+        match self.advance() {
+            Token::Int(m) => Ok(m),
+            other => Err(syntax(format!(
+                "expected an integer type modifier, found {other:?}"
+            ))),
+        }
     }
 
     /// `DROP TABLE <name>`. Removes the named table. A missing table is rejected at
@@ -156,6 +189,13 @@ impl Parser {
                         "value out of range: integer literal exceeds the maximum signed 64-bit value",
                     )
                 })
+            }
+            Token::Decimal(digits, scale) => {
+                // A decimal literal carries the unscaled coefficient + scale; the leading
+                // unary minus (if any) folds into the sign. Cap checks are at resolve.
+                Ok(Literal::Decimal(Decimal::from_digits_scale(
+                    negate, &digits, scale,
+                )))
             }
             Token::Str(s) if !negate => Ok(Literal::Text(s)),
             Token::Word(w) if !negate && w.eq_ignore_ascii_case("null") => Ok(Literal::Null),
@@ -553,6 +593,15 @@ impl Parser {
                 let folded = -(m as i128); // m <= 2^63 ⇒ folded ∈ [-2^63, 0] ⊆ i64
                 return Ok(Expr::Literal(Literal::Int(folded as i64)));
             }
+            // Fold unary-minus of a decimal literal into one negative decimal literal (like
+            // the integer fold). Decimal negation never overflows.
+            if matches!(self.peek(), Token::Decimal(..)) {
+                if let Token::Decimal(digits, scale) = self.advance() {
+                    return Ok(Expr::Literal(Literal::Decimal(Decimal::from_digits_scale(
+                        true, &digits, scale,
+                    ))));
+                }
+            }
             let operand = self.parse_unary()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
@@ -577,10 +626,12 @@ impl Parser {
             let inner = self.parse_expr()?;
             self.expect_keyword("as")?;
             let type_name = self.expect_identifier()?;
+            let type_mod = self.parse_type_mod()?;
             self.expect(&Token::RParen)?;
             return Ok(Expr::Cast {
                 inner: Box::new(inner),
                 type_name,
+                type_mod,
             });
         }
         match self.peek() {
@@ -615,6 +666,15 @@ impl Parser {
                     Ok(Expr::Literal(Literal::Text(s)))
                 } else {
                     unreachable!("peeked a string literal")
+                }
+            }
+            Token::Decimal(..) => {
+                if let Token::Decimal(digits, scale) = self.advance() {
+                    Ok(Expr::Literal(Literal::Decimal(Decimal::from_digits_scale(
+                        false, &digits, scale,
+                    ))))
+                } else {
+                    unreachable!("peeked a decimal literal")
                 }
             }
             Token::Word(_) => Ok(Expr::Column(self.expect_identifier()?)),

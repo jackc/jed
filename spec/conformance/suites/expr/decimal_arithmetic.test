@@ -1,0 +1,106 @@
+# Decimal arithmetic in the general expression evaluator: + - * / %, unary -, with PostgreSQL's
+# exact result-scale rules and half-away-from-zero division rounding (spec/design/decimal.md §4).
+# add/sub -> max(s1,s2); mul -> s1+s2; div -> select_div_scale (>=16 sig digits, rounded); mod ->
+# max(s1,s2) with the dividend's sign. Computation is exact (no binary float). Division/modulo by
+# zero is a defined trap, 22012. Mixed integer<->decimal arithmetic promotes the integer to decimal.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.int32, types.decimal, expr.decimal_arithmetic, error.division_by_zero
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a numeric, b numeric)
+
+statement ok
+INSERT INTO t VALUES (1, 1.50, 1.5), (2, 2.0, 3.000), (3, 1.234, 1.2), (4, 1, 3), (5, 10.0, 4.0), (6, -5.5, 2)
+
+# add / sub: result scale is max(s1, s2)
+query D nosort
+SELECT a + b FROM t WHERE id = 1
+----
+3.00
+
+query D nosort
+SELECT a - b FROM t WHERE id = 3
+----
+0.034
+
+# mul: result scale is s1 + s2 (exact, no rounding)
+query D nosort
+SELECT a * b FROM t WHERE id = 1
+----
+2.250
+
+query D nosort
+SELECT a * b FROM t WHERE id = 2
+----
+6.0000
+
+# div: PostgreSQL select_div_scale + half-away rounding. 2/3 rounds the last (20th) digit up.
+query D nosort
+SELECT a / b FROM t WHERE id = 1
+----
+1.00000000000000000000
+
+query D nosort
+SELECT a / b FROM t WHERE id = 4
+----
+0.33333333333333333333
+
+# 10.0 / 4.0 = 2.5 with 16 fractional digits (the larger input scale lifts rscale to 16)
+query D nosort
+SELECT a / b FROM t WHERE id = 5
+----
+2.5000000000000000
+
+# mod: result scale max(s1,s2), sign of the DIVIDEND (matches integer %). -5.5 % 2 = -1.5
+query D nosort
+SELECT a % b FROM t WHERE id = 6
+----
+-1.5
+
+# unary minus on a decimal (scale unchanged, never overflows)
+query D nosort
+SELECT -a FROM t WHERE id = 1
+----
+-1.50
+
+# arithmetic in a WHERE predicate: a + b = 3.00 holds only for row 1
+query I nosort
+SELECT id FROM t WHERE a + b = 3 ORDER BY id
+----
+1
+
+# division by zero is a defined trap, 22012
+statement error 22012
+SELECT a / 0 FROM t WHERE id = 1
+
+# modulo by zero likewise
+statement error 22012
+SELECT a % 0 FROM t WHERE id = 1
+
+# --- mixed integer <-> decimal arithmetic (the integer promotes to decimal) --------------------
+statement ok
+CREATE TABLE m (id int32 PRIMARY KEY, d numeric, i int32)
+
+statement ok
+INSERT INTO m VALUES (1, 1.5, 3)
+
+query D nosort
+SELECT d + i FROM m WHERE id = 1
+----
+4.5
+
+query D nosort
+SELECT i - d FROM m WHERE id = 1
+----
+1.5
+
+query D nosort
+SELECT d * i FROM m WHERE id = 1
+----
+4.5
+
+# a decimal literal mixed with an integer column also promotes
+query D nosort
+SELECT i + 0.25 FROM m WHERE id = 1
+----
+3.25

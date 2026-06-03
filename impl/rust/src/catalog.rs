@@ -1,12 +1,16 @@
 //! The catalog: table and column definitions (CLAUDE.md §4 strict static types).
 
-use crate::types::ScalarType;
+use crate::types::{DecimalTypmod, ScalarType};
 
 /// A column definition: name, declared type, nullability, primary-key flag.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Column {
     pub name: String,
     pub ty: ScalarType,
+    /// The `numeric(p,s)` type modifier for a decimal column, or `None` for a non-decimal
+    /// column OR an unconstrained `numeric` (spec/design/decimal.md §2). A constrained
+    /// decimal column coerces stored values to this precision/scale.
+    pub decimal: Option<DecimalTypmod>,
     pub primary_key: bool,
     /// A PRIMARY KEY column is implicitly NOT NULL.
     pub not_null: bool,

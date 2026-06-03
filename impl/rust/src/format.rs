@@ -7,11 +7,12 @@
 //! (CLAUDE.md §8). All multi-byte integers are big-endian.
 
 use crate::catalog::{Column, Table};
+use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::Database;
 use crate::storage::Row;
-use crate::types::ScalarType;
+use crate::types::{DecimalTypmod, ScalarType};
 use crate::value::Value;
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
@@ -36,6 +37,7 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Int64 => 3,
         ScalarType::Text => 4,
         ScalarType::Bool => 5,
+        ScalarType::Decimal => 6,
     }
 }
 
@@ -47,6 +49,7 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         3 => Some(ScalarType::Int64),
         4 => Some(ScalarType::Text),
         5 => Some(ScalarType::Bool),
+        6 => Some(ScalarType::Decimal),
         _ => None,
     }
 }
@@ -87,6 +90,20 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
             out
         }
         Value::Bool(b) => vec![0x00, u8::from(*b)], // present tag + bool-byte (0x00 false, 0x01 true)
+        // Decimal value codec (spec/fileformat/format.md): tag, flags (sign), u16 scale,
+        // u16 ndigits, then that many big-endian base-10^4 coefficient groups (MS-first).
+        Value::Decimal(d) => {
+            let (neg, scale, groups) = d.to_codec();
+            let mut out = Vec::with_capacity(6 + groups.len() * 2);
+            out.push(0x00); // present
+            out.push(if neg { 1 } else { 0 }); // flags: bit0 = sign
+            out.extend_from_slice(&(scale as u16).to_be_bytes());
+            out.extend_from_slice(&(groups.len() as u16).to_be_bytes());
+            for g in groups {
+                out.extend_from_slice(&g.to_be_bytes());
+            }
+            out
+        }
     }
 }
 
@@ -311,6 +328,17 @@ fn table_entry_bytes(table: &Table, root_data_page: u32) -> Vec<u8> {
             flags |= 0b10;
         }
         out.push(flags);
+        // A decimal column appends its typmod (precision, scale) — only for type_code 6, so
+        // non-decimal entries are byte-unchanged (spec/fileformat/format.md). `precision 0`
+        // = unconstrained `numeric`.
+        if col.ty.is_decimal() {
+            let (precision, scale) = match col.decimal {
+                Some(t) => (t.precision, t.scale),
+                None => (0u16, 0u16),
+            };
+            out.extend_from_slice(&precision.to_be_bytes());
+            out.extend_from_slice(&scale.to_be_bytes());
+        }
     }
     out.extend_from_slice(&root_data_page.to_be_bytes());
     out
@@ -453,9 +481,22 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32)> {
         let tc = read_u8(buf, pos)?;
         let ty = scalar_for_type_code(tc).ok_or_else(|| corrupt("unknown type code"))?;
         let flags = read_u8(buf, pos)?;
+        // A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
+        let decimal = if ty.is_decimal() {
+            let precision = read_u16(buf, pos)?;
+            let scale = read_u16(buf, pos)?;
+            if precision == 0 {
+                None
+            } else {
+                Some(DecimalTypmod { precision, scale })
+            }
+        } else {
+            None
+        };
         columns.push(Column {
             name: cname,
             ty,
+            decimal,
             primary_key: flags & 0b01 != 0,
             not_null: flags & 0b10 != 0,
         });
@@ -491,6 +532,17 @@ fn read_value(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
                     0x01 => Ok(Value::Bool(true)),
                     _ => Err(corrupt("invalid boolean value byte")),
                 }
+            } else if ty.is_decimal() {
+                // flags (sign), u16 scale, u16 ndigits, then that many base-10^4 groups.
+                let flags = read_u8(buf, pos)?;
+                let neg = flags & 1 != 0;
+                let scale = read_u16(buf, pos)? as u32;
+                let ndigits = read_u16(buf, pos)? as usize;
+                let mut groups = Vec::with_capacity(ndigits);
+                for _ in 0..ndigits {
+                    groups.push(read_u16(buf, pos)?);
+                }
+                Ok(Value::Decimal(Decimal::from_codec(neg, scale, &groups)))
             } else {
                 let w = ty.width_bytes();
                 let vb = take(buf, pos, w)?;

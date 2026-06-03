@@ -1,13 +1,17 @@
 // Table metadata: column definitions and lookups. Data-shaped (a type + free
 // functions) to match the boring/explicit style (CLAUDE.md §10).
 
-import type { ScalarType } from "./types.ts";
+import type { DecimalTypmod, ScalarType } from "./types.ts";
 
 // Column is a column definition: name, declared type, nullability, primary-key flag.
 // notNull is implied true for a PRIMARY KEY column.
 export type Column = {
   name: string;
   type: ScalarType;
+  // The numeric(p,s) typmod for a decimal column, or null for a non-decimal column OR an
+  // unconstrained numeric (spec/design/decimal.md §2). A constrained decimal column coerces
+  // stored values to this precision/scale.
+  decimal: DecimalTypmod | null;
   primaryKey: boolean;
   notNull: boolean;
 };

@@ -219,9 +219,15 @@ biases below are where an overriding reason *does* steer away from PG.
 
 - **Float formatting** — every language prints `f64` differently. Decision bias: keep
   binary floats **out of the comparison and text-output paths entirely**; lean on exact
-  `decimal`. This aligns with "a real type system" and kills the worst offender.
-- **Decimal rounding** — define mode and scale.
-- **NaN / infinity ordering** — define it.
+  `decimal`. This aligns with "a real type system" and kills the worst offender. ✅ `decimal`
+  has landed (`spec/design/decimal.md`) as that exact path; binary `float` stays deferred.
+- **Decimal rounding** — ✅ **decided: round half away from zero** (PostgreSQL `numeric`;
+  `0.125 → 0.13`, `2.5 → 3`), one mode engine-wide, applied to scale coercion / casts /
+  division (`spec/design/decimal.md` §3). Result **scale** follows PG's per-operator rules
+  (add/sub `max(s1,s2)`, mul `s1+s2`, div `select_div_scale`; §4).
+- **NaN / infinity ordering** — for `decimal`: **excluded**, the type is always finite (no
+  float source; `x/0` traps `22012`), so there is no NaN/∞ to order (a documented PG
+  divergence — `spec/design/decimal.md` §2). Revisit only if a binary `float` type lands.
 - **Collation** — start with ONE defined collation (byte/codepoint order is simplest);
   ICU-style collation is an explicit later feature.
 - **Integer overflow** — defined wrap vs. trap.

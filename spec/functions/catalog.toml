@@ -385,6 +385,97 @@ null           = "null_safe"
 precedence     = 35
 errors         = []
 
+# --- comparison operators (decimal) ------------------------------------------
+# The decimal-family OVERLOAD of the comparisons: same names/symbols over decimal×decimal.
+# arg_resolution = "none" — one decimal type, no promotion (compare.toml); operands compare
+# by EXACT NUMERIC VALUE after aligning their scales (1.5 = 1.50 is true). A mixed
+# integer×decimal pair is reconciled by compare.toml's `promote-to-decimal` rule (the integer
+# widens to decimal scale 0) and then evaluated here, so `int_col = 1.5` is well-typed; a
+# decimal vs text pair is NOT comparable (42804). Same precedence (35) and NULL discipline as
+# the integer/text comparisons. No overflow is possible in a comparison, so errors = [].
+
+[[operator]]
+name           = "eq"
+symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "lt"
+symbol         = "<"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "gt"
+symbol         = ">"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "le"
+symbol         = "<="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ge"
+symbol         = ">="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_not_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
 # --- null tests --------------------------------------------------------------
 # Unary null-detection over any nullable value of any type. Unlike comparisons
 # these never propagate: the result is ALWAYS a definite boolean, never unknown —
@@ -498,3 +589,88 @@ result         = "promoted"
 null           = "propagates"
 precedence     = 60
 errors         = ["22003"]
+
+# --- arithmetic operators (decimal) ------------------------------------------
+# The decimal-family OVERLOAD of the arithmetic operators. Computation is EXACT in limbs;
+# the RESULT SCALE follows PostgreSQL's numeric rules (../design/decimal.md §4): add/sub →
+# max(s1,s2); mul → s1+s2; div → select_div_scale (>= the larger input scale, with enough
+# extra digits for >=16 significant figures, rounded HALF AWAY FROM ZERO); mod → max(s1,s2),
+# remainder takes the dividend's sign (toward-zero quotient), matching integer `%`. result =
+# "promoted" = the common operand type (decimal; the per-call scale is computed by the rules
+# above). A mixed integer×decimal pair promotes the integer to decimal (scale 0) first
+# (compare.toml). add/sub/mul/div trap 22003 only at the unconstrained cap (max_precision /
+# max_scale, scalars.toml) or when the result is coerced into a constrained numeric(p,s);
+# div/mod by zero trap 22012 (the defined, deterministic abort). Unary `neg` only flips the
+# sign of a sign-magnitude value, so it can never overflow (errors = []).
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+precedence     = 40
+errors         = ["22003"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+precedence     = 40
+errors         = ["22003"]
+
+[[operator]]
+name           = "mul"
+symbol         = "*"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+precedence     = 50
+errors         = ["22003"]
+
+[[operator]]
+name           = "div"
+symbol         = "/"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+precedence     = 50
+errors         = ["22003", "22012"]
+
+[[operator]]
+name           = "mod"
+symbol         = "%"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+precedence     = 50
+errors         = ["22012"]
+
+[[operator]]
+name           = "neg"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+precedence     = 60
+errors         = []

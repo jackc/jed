@@ -6,15 +6,16 @@
 
 use crate::ast::{
     BinaryOp, CreateTable, Delete, DropTable, Expr, Insert, Literal, Select, SelectItems,
-    Statement, UnaryOp, Update,
+    Statement, TypeMod, UnaryOp, Update,
 };
 use crate::catalog::{Column, Table};
 use crate::cost::Meter;
 use crate::costs::COSTS;
+use crate::decimal::{Decimal, MAX_PRECISION, MAX_SCALE};
 use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
 use crate::storage::{Row, TableStore};
-use crate::types::ScalarType;
+use crate::types::{DecimalTypmod, ScalarType};
 use crate::value::{Value, and3, from3, not3, or3};
 use std::collections::{HashMap, HashSet};
 
@@ -133,15 +134,16 @@ impl Database {
                     format!("duplicate column name: {}", def.name),
                 ));
             }
-            let ty = resolve_storable_type(&def.type_name)?;
+            let (ty, decimal) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
             if def.primary_key {
-                // Text is not allowed in a key this slice: the order-preserving text key
-                // encoding (spec/design/encoding.md §2.4) is authored but unexercised, so a
-                // text PRIMARY KEY is a documented 0A000 narrowing (spec/design/types.md §11).
-                if ty.is_text() {
+                // Only integers may be a key this slice. The order-preserving text and decimal
+                // key encodings (spec/design/encoding.md §2.4/§2.5) are authored but
+                // unexercised, so a text or decimal PRIMARY KEY is a documented 0A000 narrowing
+                // (spec/design/types.md §11/§12).
+                if !ty.is_integer() {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
-                        "a text primary key is not supported yet",
+                        format!("a {} primary key is not supported yet", ty.canonical_name()),
                     ));
                 }
                 // Likewise boolean: the bool-byte key encoding rule is authored but
@@ -164,6 +166,7 @@ impl Database {
             columns.push(Column {
                 name: def.name.clone(),
                 ty,
+                decimal,
                 primary_key: def.primary_key,
                 not_null: def.primary_key, // PRIMARY KEY ⇒ NOT NULL
             });
@@ -237,72 +240,12 @@ impl Database {
 
             let mut row = Vec::with_capacity(columns.len());
             for (col, lit) in columns.iter().zip(lits) {
-                let value = match lit {
-                    Literal::Null => {
-                        if col.not_null {
-                            return Err(EngineError::new(
-                                SqlState::NotNullViolation,
-                                format!(
-                                    "null value in column {} violates not-null constraint",
-                                    col.name
-                                ),
-                            ));
-                        }
-                        Value::Null
-                    }
-                    Literal::Int(n) => {
-                        // An integer literal targets an integer column; into a non-integer
-                        // column (text or boolean) it is a 42804 type error (no implicit
-                        // coercion — types.md §5/§11).
-                        if col.ty.is_text() || col.ty.is_bool() {
-                            return Err(EngineError::new(
-                                SqlState::DatatypeMismatch,
-                                format!(
-                                    "cannot store an integer value in {} column {}",
-                                    col.ty.canonical_name(),
-                                    col.name
-                                ),
-                            ));
-                        }
-                        if !col.ty.in_range(*n) {
-                            return Err(EngineError::new(
-                                SqlState::NumericValueOutOfRange,
-                                format!("value out of range for type {}", col.ty.canonical_name()),
-                            ));
-                        }
-                        Value::Int(*n)
-                    }
-                    // A boolean literal targets a boolean column; into a non-boolean column
-                    // it is a 42804 type error (no implicit coercion).
-                    Literal::Bool(b) => {
-                        if !col.ty.is_bool() {
-                            return Err(EngineError::new(
-                                SqlState::DatatypeMismatch,
-                                format!(
-                                    "cannot store a boolean value in {} column {}",
-                                    col.ty.canonical_name(),
-                                    col.name
-                                ),
-                            ));
-                        }
-                        Value::Bool(*b)
-                    }
-                    // A text literal targets a text column; into an integer column it is a
-                    // 42804 type error (no implicit text→int).
-                    Literal::Text(s) => {
-                        if !col.ty.is_text() {
-                            return Err(EngineError::new(
-                                SqlState::DatatypeMismatch,
-                                format!(
-                                    "cannot store a text value in {} column {}",
-                                    col.ty.canonical_name(),
-                                    col.name
-                                ),
-                            ));
-                        }
-                        Value::Text(s.clone())
-                    }
-                };
+                // The literal adapts/coerces to its target column: an integer literal into a
+                // decimal column widens (int→decimal, then to the typmod); a decimal literal
+                // into a decimal column rounds to its scale; a cross-family pair is 42804
+                // (spec/design/decimal.md §6, types.md §5).
+                let raw = literal_to_value(lit);
+                let value = store_value(raw, col.ty, col.decimal, col.not_null, &col.name)?;
                 row.push(value);
             }
 
@@ -316,9 +259,10 @@ impl Database {
                         Value::Bool(_) => {
                             unreachable!("a boolean primary key is rejected at CREATE TABLE")
                         }
-                        // Unreachable: a text PRIMARY KEY is rejected at CREATE TABLE (0A000).
-                        Value::Text(_) => {
-                            unreachable!("a text primary key is rejected at CREATE TABLE")
+                        // Unreachable: a text/decimal PRIMARY KEY is rejected at CREATE TABLE
+                        // (0A000).
+                        Value::Text(_) | Value::Decimal(_) => {
+                            unreachable!("a non-integer primary key is rejected at CREATE TABLE")
                         }
                     };
                     if seen_keys.contains(&k) || self.store(&ins.table).get(&k).is_some() {
@@ -426,14 +370,16 @@ impl Database {
             }
             let col = &table.columns[idx];
             // The RHS is a general expression evaluated against the *old* row; a literal
-            // operand adapts to the target column's type. The result must be an integer
-            // (or NULL) — assigning a boolean to an integer column is a 42804.
+            // operand adapts to the target column's type. The result must be assignable to
+            // the column's family (integer/decimal/text or NULL; never boolean; decimal→int
+            // is explicit-CAST only) — spec/design/decimal.md §6.
             let (source, ty) = resolve(table, &a.value, Some(col.ty))?;
             require_assignable(ty, col.ty, &a.column)?;
             plans.push(AssignPlan {
                 idx,
                 name: col.name.clone(),
                 target: col.ty,
+                decimal: col.decimal,
                 not_null: col.not_null,
                 source,
             });
@@ -671,6 +617,8 @@ enum ResolvedType {
     Int(ScalarType),
     Bool,
     Text,
+    /// The decimal family (one type; the per-column typmod is carried separately, not here).
+    Decimal,
     Null,
 }
 
@@ -700,10 +648,13 @@ enum RExpr {
     ConstInt(i64),
     ConstBool(bool),
     ConstText(String),
+    ConstDecimal(Decimal),
     ConstNull,
     Cast {
         inner: Box<RExpr>,
         target: ScalarType,
+        /// For a decimal target, the optional `numeric(p,s)` typmod to coerce to.
+        typmod: Option<DecimalTypmod>,
     },
     Neg {
         operand: Box<RExpr>,
@@ -782,7 +733,7 @@ fn resolve_boolean_filter(table: &Table, e: &Expr) -> Result<RExpr> {
     let (node, ty) = resolve(table, e, None)?;
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(node),
-        ResolvedType::Int(_) | ResolvedType::Text => {
+        ResolvedType::Int(_) | ResolvedType::Text | ResolvedType::Decimal => {
             Err(type_error("argument of WHERE must be boolean"))
         }
     }
@@ -800,6 +751,8 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
                 ResolvedType::Text
             } else if ty.is_bool() {
                 ResolvedType::Bool
+            } else if ty.is_decimal() {
+                ResolvedType::Decimal
             } else {
                 ResolvedType::Int(ty)
             };
@@ -808,12 +761,12 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
         Expr::Literal(Literal::Int(n)) => {
-            // An integer literal adapts to its integer context; a non-integer context
-            // (e.g. a text column on the other side, or a text assignment target) does
-            // not apply — it defaults to int64 and the surrounding type-check then
-            // reports the family mismatch (42804), never a panic on a text range.
+            // An integer literal adapts only to an *integer* context; a non-integer context
+            // (a text/decimal column or assignment target) does not apply — it defaults to
+            // int64, and the surrounding check then reports the family mismatch (42804) or
+            // widens it (int→decimal), never panics on a non-integer range.
             let ty = match ctx {
-                Some(t) if !t.is_text() => t,
+                Some(t) if t.is_integer() => t,
                 _ => ScalarType::Int64,
             };
             if !ty.in_range(*n) {
@@ -825,8 +778,19 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             // A text literal is always text (collation `C`); it does not adapt to context.
             Ok((RExpr::ConstText(s.clone()), ResolvedType::Text))
         }
-        Expr::Cast { inner, type_name } => {
-            let target = resolve_storable_type(type_name)?;
+        Expr::Literal(Literal::Decimal(d)) => {
+            // A decimal literal is always decimal; it does not adapt to context (like text).
+            // Cap-check it here (an over-long coefficient/scale traps 22003 at resolve —
+            // spec/design/decimal.md §6).
+            let d = d.clone().check_cap()?;
+            Ok((RExpr::ConstDecimal(d), ResolvedType::Decimal))
+        }
+        Expr::Cast {
+            inner,
+            type_name,
+            type_mod,
+        } => {
+            let (target, typmod) = resolve_type_and_typmod(type_name, type_mod)?;
             // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
             // casting TO text is a 0A000 this slice.
             if target.is_text() {
@@ -837,18 +801,20 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             }
             // Boolean casts are likewise deferred (boolean⇄integer is a later cast slice —
             // spec/types/casts.toml): casting TO boolean is a 0A000 this slice. Without this
-            // guard `resolve_storable_type` now returns boolean, so it must be caught here.
+            // guard `resolve_type_and_typmod` now returns boolean, so it must be caught here.
             if target.is_bool() {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "casting to boolean is not supported yet",
                 ));
             }
-            // The inner value is range-checked against `target` at eval (its own
-            // context), so it resolves with no literal context here.
+            // The inner value is range-checked / coerced against `target` at eval, so it
+            // resolves with no literal context here.
             let (rinner, ity) = resolve(table, inner, None)?;
             match ity {
-                ResolvedType::Int(_) | ResolvedType::Null => {}
+                // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
+                // decimal→decimal (re-scale), and NULL are all castable.
+                ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null => {}
                 ResolvedType::Bool => {
                     return Err(type_error(format!(
                         "cannot cast boolean to {}",
@@ -863,12 +829,18 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
                     ));
                 }
             }
+            let result_ty = if target.is_decimal() {
+                ResolvedType::Decimal
+            } else {
+                ResolvedType::Int(target)
+            };
             Ok((
                 RExpr::Cast {
                     inner: Box::new(rinner),
                     target,
+                    typmod,
                 },
-                ResolvedType::Int(target),
+                result_ty,
             ))
         }
         Expr::Unary {
@@ -878,17 +850,23 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             let (rop, ty) = resolve(table, operand, ctx)?;
             let result = match ty {
                 ResolvedType::Int(t) => t,
+                ResolvedType::Decimal => ScalarType::Decimal,
                 ResolvedType::Null => ScalarType::Int64, // -NULL = NULL
                 ResolvedType::Bool | ResolvedType::Text => {
-                    return Err(type_error("unary minus requires an integer operand"));
+                    return Err(type_error("unary minus requires a numeric operand"));
                 }
+            };
+            let rty = if result.is_decimal() {
+                ResolvedType::Decimal
+            } else {
+                ResolvedType::Int(result)
             };
             Ok((
                 RExpr::Neg {
                     operand: Box::new(rop),
                     result,
                 },
-                ResolvedType::Int(result),
+                rty,
             ))
         }
         Expr::Unary {
@@ -938,8 +916,14 @@ fn resolve_binary(
 ) -> Result<(RExpr, ResolvedType)> {
     match op {
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-            let (rl, lt, rr, rt) = resolve_int_pair(table, lhs, rhs)?;
-            let result = promote(lt, rt);
+            // Arithmetic is overloaded across integer and decimal. Resolve the operand pair
+            // (an integer literal adapts to an integer sibling), then pick the family: both
+            // integer → integer arithmetic (promotion tower); at least one decimal → decimal
+            // arithmetic (the integer operand widens at eval); a text/boolean operand is a
+            // 42804 (spec/design/decimal.md §4).
+            let (rl, lt, rr, rt) = resolve_operand_pair(table, lhs, rhs)?;
+            require_numeric_operand(lt)?;
+            require_numeric_operand(rt)?;
             let aop = match op {
                 BinaryOp::Add => ArithOp::Add,
                 BinaryOp::Sub => ArithOp::Sub,
@@ -948,6 +932,12 @@ fn resolve_binary(
                 BinaryOp::Mod => ArithOp::Mod,
                 _ => unreachable!(),
             };
+            let (result, rty) = if lt == ResolvedType::Decimal || rt == ResolvedType::Decimal {
+                (ScalarType::Decimal, ResolvedType::Decimal)
+            } else {
+                let p = promote(lt, rt);
+                (p, ResolvedType::Int(p))
+            };
             Ok((
                 RExpr::Arith {
                     op: aop,
@@ -955,7 +945,7 @@ fn resolve_binary(
                     rhs: Box::new(rr),
                     result,
                 },
-                ResolvedType::Int(result),
+                rty,
             ))
         }
         BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
@@ -1032,36 +1022,40 @@ fn resolve_operand_pair(
     Ok((rl, lt, rr, rt))
 }
 
-/// Resolve the two operands of an *arithmetic* operator: both must be integer (or NULL);
-/// a boolean or text operand is a 42804 type error.
-fn resolve_int_pair(
-    table: &Table,
-    lhs: &Expr,
-    rhs: &Expr,
-) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
-    let (rl, lt, rr, rt) = resolve_operand_pair(table, lhs, rhs)?;
-    require_int_operand(lt)?;
-    require_int_operand(rt)?;
-    Ok((rl, lt, rr, rt))
+/// Require that an arithmetic operand is numeric (integer or decimal, or NULL); a boolean or
+/// text operand is a 42804 type error.
+fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
+    match ty {
+        ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null => Ok(()),
+        ResolvedType::Bool | ResolvedType::Text => {
+            Err(type_error("arithmetic operators require numeric operands"))
+        }
+    }
 }
 
 /// Require that a comparison operand pair is comparable (spec/types/compare.toml): both
-/// from the integer family (NULL counts as either), both text, or both boolean. A mixed
-/// pair (integer/text, or boolean with either) is a 42804 type error — comparison is
-/// overloaded across these families but never compares across them.
+/// numeric (integer and/or decimal — the integer promotes to decimal), both text, or both
+/// boolean (NULL counts as either). A mixed numeric/text pair, or a boolean with a
+/// non-boolean, is a 42804 type error — comparison is overloaded across these families but
+/// never compares across them.
 fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
-    use ResolvedType::{Bool, Int, Null, Text};
+    use ResolvedType::{Bool, Decimal, Int, Text};
     match (lt, rt) {
-        // Boolean compares only with boolean (or NULL); boolean with int/text is a mismatch.
-        (Bool, Int(_)) | (Int(_), Bool) | (Bool, Text) | (Text, Bool) => Err(type_error(
+        // Boolean compares only with boolean (or NULL); boolean with a number/text is a mismatch.
+        (Bool, Int(_))
+        | (Int(_), Bool)
+        | (Bool, Text)
+        | (Text, Bool)
+        | (Bool, Decimal)
+        | (Decimal, Bool) => Err(type_error(
             "cannot compare a boolean value with a non-boolean value",
         )),
-        (Int(_), Text) | (Text, Int(_)) => Err(type_error(
-            "cannot compare a text value with an integer value",
+        (Int(_), Text) | (Text, Int(_)) | (Decimal, Text) | (Text, Decimal) => Err(type_error(
+            "cannot compare a text value with a numeric value",
         )),
-        // Same-family pairs (Int/Int, Text/Text, Bool/Bool) and any pairing with a bare
-        // NULL literal are comparable.
-        (Int(_) | Text | Bool | Null, Int(_) | Text | Bool | Null) => Ok(()),
+        // Same-family pairs (numeric/numeric incl. int↔decimal, text/text, bool/bool) and any
+        // pairing with a bare NULL literal are comparable.
+        _ => Ok(()),
     }
 }
 
@@ -1091,19 +1085,10 @@ fn promote(a: ResolvedType, b: ResolvedType) -> ScalarType {
     }
 }
 
-fn require_int_operand(ty: ResolvedType) -> Result<()> {
-    match ty {
-        ResolvedType::Int(_) | ResolvedType::Null => Ok(()),
-        ResolvedType::Bool | ResolvedType::Text => {
-            Err(type_error("arithmetic operators require integer operands"))
-        }
-    }
-}
-
 fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(()),
-        ResolvedType::Int(_) | ResolvedType::Text => Err(type_error(msg)),
+        ResolvedType::Int(_) | ResolvedType::Text | ResolvedType::Decimal => Err(type_error(msg)),
     }
 }
 
@@ -1112,12 +1097,20 @@ fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
 /// takes a boolean (or NULL) value. Any cross-family pair is a 42804 type error. Mirrors
 /// the INSERT literal type-check, generalized to expressions.
 fn require_assignable(ty: ResolvedType, col_ty: ScalarType, col: &str) -> Result<()> {
-    let ok = if col_ty.is_text() {
-        matches!(ty, ResolvedType::Text | ResolvedType::Null)
+    let ok = if col_ty.is_integer() {
+        matches!(ty, ResolvedType::Int(_) | ResolvedType::Null)
+    } else if col_ty.is_decimal() {
+        // int → decimal is implicit (lossless); decimal → decimal re-scales. A decimal value
+        // into an integer column is NOT assignable (decimal→int is explicit-CAST only).
+        matches!(
+            ty,
+            ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null
+        )
     } else if col_ty.is_bool() {
         matches!(ty, ResolvedType::Bool | ResolvedType::Null)
     } else {
-        matches!(ty, ResolvedType::Int(_) | ResolvedType::Null)
+        // text column
+        matches!(ty, ResolvedType::Text | ResolvedType::Null)
     };
     if ok {
         Ok(())
@@ -1138,16 +1131,64 @@ fn col_idx(table: &Table, name: &str) -> Result<usize> {
     })
 }
 
-/// Resolve a type name used in a column definition or a CAST target to its `ScalarType`.
-/// All canonical names and aliases (including `boolean`/`bool`) resolve here; a genuinely
-/// unknown name is a 42704. (Type-specific narrowings — a text/boolean PRIMARY KEY, a
-/// CAST to text/boolean — are enforced at the call site, not here.)
-fn resolve_storable_type(name: &str) -> Result<ScalarType> {
-    ScalarType::from_name(name).ok_or_else(|| {
-        EngineError::new(
+/// Resolve a type name + optional type modifier used in a column definition or a CAST target.
+/// All canonical names and aliases (including `boolean`/`bool` and `numeric`/`decimal`/`dec`)
+/// resolve here; a genuinely unknown name is a 42704. A type modifier is meaningful only for
+/// decimal (validated to `numeric(p,s)` — 22023); on any other type it is `0A000` (varchar(n)
+/// and other parameterized types are deferred — spec/design/grammar.md §14). Type-specific
+/// narrowings (a text/boolean/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the
+/// call site, not here.
+fn resolve_type_and_typmod(
+    name: &str,
+    type_mod: &Option<TypeMod>,
+) -> Result<(ScalarType, Option<DecimalTypmod>)> {
+    let ty = if let Some(ty) = ScalarType::from_name(name) {
+        ty
+    } else {
+        return Err(EngineError::new(
             SqlState::UndefinedObject,
             format!("type does not exist: {name}"),
-        )
+        ));
+    };
+    let typmod = match type_mod {
+        None => None,
+        Some(tm) => {
+            if ty.is_decimal() {
+                Some(validate_decimal_typmod(tm)?)
+            } else {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "a type modifier is not supported for type {}",
+                        ty.canonical_name()
+                    ),
+                ));
+            }
+        }
+    };
+    Ok((ty, typmod))
+}
+
+/// Validate a decimal `numeric(p[,s])` type modifier: `1 <= p <= 1000`, `0 <= s <= p`; else
+/// trap 22023 (spec/design/decimal.md §2). `numeric(p)` means scale 0.
+fn validate_decimal_typmod(tm: &TypeMod) -> Result<DecimalTypmod> {
+    let p = tm.precision;
+    if p < 1 || p > MAX_PRECISION as u64 {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("NUMERIC precision {p} must be between 1 and {MAX_PRECISION}"),
+        ));
+    }
+    let s = tm.scale.unwrap_or(0);
+    if s > p || s > MAX_SCALE as u64 {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("NUMERIC scale {s} must be between 0 and precision {p}"),
+        ));
+    }
+    Ok(DecimalTypmod {
+        precision: p as u16,
+        scale: s as u16,
     })
 }
 
@@ -1169,47 +1210,115 @@ struct AssignPlan {
     idx: usize,
     name: String,
     target: ScalarType,
+    decimal: Option<DecimalTypmod>,
     not_null: bool,
     source: RExpr,
 }
 
 impl AssignPlan {
-    /// Type-check a candidate value against this column: NULL into NOT NULL traps
-    /// 23502; an integer outside the target range traps 22003 (CLAUDE.md §8); a text
-    /// value into a text column and a boolean value into a boolean column are accepted
-    /// as-is (no further constraint) — mirrors INSERT's per-value checks. The resolver
-    /// already proved the value's family matches the column (never a cross-family pair),
-    /// so the mismatched variants are unreachable.
+    /// Type-check + coerce a candidate value against this column — the same `store_value`
+    /// path INSERT uses (NULL into NOT NULL → 23502; an integer outside range → 22003; an
+    /// integer into a decimal column widens and coerces to the typmod; a decimal into a
+    /// decimal column rounds to its scale; a boolean into a boolean column is accepted
+    /// as-is). The resolver already proved the value's family is assignable (never
+    /// decimal→int implicitly).
     fn check(&self, v: Value) -> Result<Value> {
-        match v {
-            Value::Null => {
-                if self.not_null {
-                    return Err(EngineError::new(
-                        SqlState::NotNullViolation,
-                        format!(
-                            "null value in column {} violates not-null constraint",
-                            self.name
-                        ),
-                    ));
-                }
-                Ok(Value::Null)
+        store_value(v, self.target, self.decimal, self.not_null, &self.name)
+    }
+}
+
+/// Coerce a value into a column for storage (shared by INSERT and UPDATE). NULL honours NOT
+/// NULL (23502); an integer into an integer column is range-checked (22003); an integer into
+/// a decimal column widens (int→decimal) then coerces to the typmod; a decimal into a decimal
+/// column coerces to the typmod (rounds to scale, precision-checks → 22003); a cross-family
+/// value (decimal→int, text→int, etc.) is a 42804 (decimal→int is explicit-CAST only).
+fn store_value(
+    v: Value,
+    col_ty: ScalarType,
+    typmod: Option<DecimalTypmod>,
+    not_null: bool,
+    col_name: &str,
+) -> Result<Value> {
+    match v {
+        Value::Null => {
+            if not_null {
+                return Err(EngineError::new(
+                    SqlState::NotNullViolation,
+                    format!("null value in column {col_name} violates not-null constraint"),
+                ));
             }
-            Value::Int(n) => {
-                if self.target.in_range(n) {
+            Ok(Value::Null)
+        }
+        Value::Int(n) => {
+            if col_ty.is_integer() {
+                if col_ty.in_range(n) {
                     Ok(Value::Int(n))
                 } else {
-                    Err(overflow(self.target))
+                    Err(overflow(col_ty))
                 }
-            }
-            Value::Text(s) => {
-                debug_assert!(self.target.is_text());
-                Ok(Value::Text(s))
-            }
-            Value::Bool(b) => {
-                debug_assert!(self.target.is_bool());
-                Ok(Value::Bool(b))
+            } else if col_ty.is_decimal() {
+                Ok(Value::Decimal(coerce_decimal(
+                    Decimal::from_i64(n),
+                    typmod,
+                )?))
+            } else {
+                Err(type_error(format!(
+                    "cannot store an integer value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
             }
         }
+        Value::Decimal(d) => {
+            if col_ty.is_decimal() {
+                Ok(Value::Decimal(coerce_decimal(d, typmod)?))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a decimal value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+        Value::Text(s) => {
+            if col_ty.is_text() {
+                Ok(Value::Text(s))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a text value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+        Value::Bool(b) => {
+            if col_ty.is_bool() {
+                Ok(Value::Bool(b))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a boolean value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+    }
+}
+
+/// Coerce a decimal into a column's typmod: round to the declared scale and precision-check
+/// (22003) for `numeric(p,s)`; for an unconstrained `numeric` column just cap-check
+/// (spec/design/decimal.md §2).
+fn coerce_decimal(d: Decimal, typmod: Option<DecimalTypmod>) -> Result<Decimal> {
+    match typmod {
+        Some(t) => d.coerce_to_typmod(t.precision as u32, t.scale as u32),
+        None => d.check_cap(),
+    }
+}
+
+/// Wrap a parsed literal as a runtime value (the type-check/coercion is `store_value`).
+fn literal_to_value(lit: &Literal) -> Value {
+    match lit {
+        Literal::Null => Value::Null,
+        Literal::Int(n) => Value::Int(*n),
+        Literal::Bool(b) => Value::Bool(*b),
+        Literal::Text(s) => Value::Text(s.clone()),
+        Literal::Decimal(d) => Value::Decimal(d.clone()),
     }
 }
 
@@ -1230,16 +1339,42 @@ impl RExpr {
             RExpr::ConstInt(n) => Ok(Value::Int(*n)),
             RExpr::ConstBool(b) => Ok(Value::Bool(*b)),
             RExpr::ConstText(s) => Ok(Value::Text(s.clone())),
+            RExpr::ConstDecimal(d) => Ok(Value::Decimal(d.clone())),
             RExpr::ConstNull => Ok(Value::Null),
-            RExpr::Cast { inner, target } => {
+            RExpr::Cast {
+                inner,
+                target,
+                typmod,
+            } => {
                 m.charge(COSTS.operator_eval);
                 match inner.eval(row, m)? {
                     Value::Null => Ok(Value::Null),
                     Value::Int(n) => {
-                        if target.in_range(n) {
+                        if target.is_decimal() {
+                            // int → decimal (lossless), then coerce to the typmod.
+                            Ok(Value::Decimal(coerce_decimal(
+                                Decimal::from_i64(n),
+                                *typmod,
+                            )?))
+                        } else if target.in_range(n) {
                             Ok(Value::Int(n))
                         } else {
                             Err(overflow(*target))
+                        }
+                    }
+                    Value::Decimal(d) => {
+                        if target.is_decimal() {
+                            // decimal → decimal: re-scale to the target typmod.
+                            Ok(Value::Decimal(coerce_decimal(d, *typmod)?))
+                        } else {
+                            // decimal → int (explicit): round half-away to scale 0, then
+                            // range-check the target integer type (22003).
+                            let v = d.to_i64_round().ok_or_else(|| overflow(*target))?;
+                            if target.in_range(v) {
+                                Ok(Value::Int(v))
+                            } else {
+                                Err(overflow(*target))
+                            }
                         }
                     }
                     Value::Bool(_) => unreachable!("resolver rejects a boolean cast operand"),
@@ -1250,6 +1385,9 @@ impl RExpr {
                 m.charge(COSTS.operator_eval);
                 match operand.eval(row, m)? {
                     Value::Null => Ok(Value::Null),
+                    Value::Int(n) if result.is_decimal() => {
+                        Ok(Value::Decimal(Decimal::from_i64(n).neg()))
+                    }
                     Value::Int(n) => {
                         // checked_neg guards i64::MIN; then range-check the result type.
                         let v = n.checked_neg().ok_or_else(|| overflow(*result))?;
@@ -1259,6 +1397,7 @@ impl RExpr {
                             Err(overflow(*result))
                         }
                     }
+                    Value::Decimal(d) => Ok(Value::Decimal(d.neg())),
                     Value::Bool(_) => unreachable!("resolver rejects a boolean unary minus"),
                     Value::Text(_) => unreachable!("resolver rejects a text unary minus"),
                 }
@@ -1277,10 +1416,18 @@ impl RExpr {
                 m.charge(COSTS.operator_eval);
                 let a = lhs.eval(row, m)?;
                 let b = rhs.eval(row, m)?;
-                match (a, b) {
-                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    (Value::Int(x), Value::Int(y)) => eval_arith(*op, x, y, *result),
-                    _ => unreachable!("resolver rejects non-integer arithmetic operands"),
+                if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                if result.is_decimal() {
+                    // Decimal arithmetic: widen any integer operand to decimal, then apply the
+                    // op with PG's scale rules (spec/design/decimal.md §4).
+                    eval_decimal_arith(*op, to_decimal(a), to_decimal(b))
+                } else {
+                    match (a, b) {
+                        (Value::Int(x), Value::Int(y)) => eval_arith(*op, x, y, *result),
+                        _ => unreachable!("resolver rejects non-integer arithmetic operands"),
+                    }
                 }
             }
             RExpr::Compare { op, lhs, rhs } => {
@@ -1364,6 +1511,28 @@ fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> 
     }
 }
 
+/// Widen a numeric value to `Decimal` (an integer operand of decimal arithmetic).
+fn to_decimal(v: Value) -> Decimal {
+    match v {
+        Value::Decimal(d) => d,
+        Value::Int(n) => Decimal::from_i64(n),
+        _ => unreachable!("resolver guarantees a numeric operand here"),
+    }
+}
+
+/// Evaluate decimal arithmetic with PG's result-scale rules (spec/design/decimal.md §4),
+/// trapping 22003 at the cap and 22012 on a zero divisor/modulus.
+fn eval_decimal_arith(op: ArithOp, a: Decimal, b: Decimal) -> Result<Value> {
+    let r = match op {
+        ArithOp::Add => a.add(&b)?,
+        ArithOp::Sub => a.sub(&b)?,
+        ArithOp::Mul => a.mul(&b)?,
+        ArithOp::Div => a.div(&b)?,
+        ArithOp::Mod => a.rem(&b)?,
+    };
+    Ok(Value::Decimal(r))
+}
+
 /// One ORDER BY key's total-order comparison. NULL placement is governed by `nulls_first`
 /// and applied INDEPENDENTLY of the value-direction flip (`descending`), so an explicit
 /// `NULLS FIRST|LAST` overrides the direction default (spec/design/grammar.md §10). The
@@ -1404,12 +1573,24 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Decimal(x), Value::Decimal(y)) => x.cmp_value(y),
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        (Value::Bool(_), _) => Ordering::Less,
-        (_, Value::Bool(_)) => Ordering::Greater,
-        (Value::Int(_), Value::Text(_)) => Ordering::Less,
-        (Value::Text(_), Value::Int(_)) => Ordering::Greater,
-        (Value::Null, _) | (_, Value::Null) => Ordering::Equal,
+        (Value::Null, Value::Null) => Ordering::Equal,
+        // Cross-family arms exist only for totality — ORDER BY is over a single typed column,
+        // so a mixed pair is unreachable. A fixed family order keeps the comparator total.
+        _ => family_rank(a).cmp(&family_rank(b)),
+    }
+}
+
+/// A fixed total order across value families, used only to keep `value_cmp` total for the
+/// unreachable cross-family case (ORDER BY is single-column-typed).
+fn family_rank(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int(_) => 2,
+        Value::Decimal(_) => 3,
+        Value::Text(_) => 4,
     }
 }

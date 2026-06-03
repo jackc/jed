@@ -14,19 +14,24 @@ import type {
   Select,
   SelectItems,
   Statement,
+  TypeMod,
   Update,
 } from "./ast.ts";
 import { type Column, type Table, columnIndex, primaryKeyIndex } from "./catalog.ts";
 import { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
+import { Decimal, MAX_PRECISION, MAX_SCALE } from "./decimal.ts";
 import { encodeInt } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { type Row, TableStore } from "./storage.ts";
 import {
+  type DecimalTypmod,
   type ScalarType,
   canonicalName,
   inRange,
   isBool,
+  isDecimal,
+  isInteger,
   isText,
   rank,
   scalarTypeFromName,
@@ -38,6 +43,7 @@ import {
   boolOr,
   boolValue,
   compareTextC,
+  decimalValue,
   eq3,
   from3,
   gt3,
@@ -121,13 +127,16 @@ export class Database {
           throw engineError("duplicate_column", "duplicate column name: " + def.name);
         }
       }
-      const ty = resolveStorableType(def.typeName);
+      const [ty, decimal] = resolveTypeAndTypmod(def.typeName, def.typeMod);
       if (def.primaryKey) {
-        // Text is not allowed in a key this slice: the order-preserving text key encoding
-        // (spec/design/encoding.md §2.4) is authored but unexercised, so a text PRIMARY KEY
-        // is a documented 0A000 narrowing (spec/design/types.md §11).
-        if (isText(ty)) {
-          throw engineError("feature_not_supported", "a text primary key is not supported yet");
+        // Only integers may be a key this slice. The order-preserving text and decimal key
+        // encodings (spec/design/encoding.md §2.4/§2.5) are authored but unexercised, so a
+        // text or decimal PRIMARY KEY is a documented 0A000 narrowing (types.md §11/§12).
+        if (!isInteger(ty)) {
+          throw engineError(
+            "feature_not_supported",
+            "a " + canonicalName(ty) + " primary key is not supported yet",
+          );
         }
         // Likewise boolean: the bool-byte key encoding rule is authored but unexercised, so a
         // boolean PRIMARY KEY is a documented 0A000 narrowing (spec/design/types.md §9).
@@ -145,6 +154,7 @@ export class Database {
       columns.push({
         name: def.name,
         type: ty,
+        decimal,
         primaryKey: def.primaryKey,
         notNull: def.primaryKey, // PRIMARY KEY ⇒ NOT NULL
       });
@@ -201,52 +211,10 @@ export class Database {
       const row: Row = new Array(table.columns.length);
       for (let i = 0; i < table.columns.length; i++) {
         const col = table.columns[i]!;
-        const lit = lits[i]!;
-        if (lit.kind === "null") {
-          if (col.notNull) {
-            throw engineError(
-              "not_null_violation",
-              "null value in column " + col.name + " violates not-null constraint",
-            );
-          }
-          row[i] = nullValue();
-        } else if (lit.kind === "int") {
-          // An integer literal targets an integer column; into a non-integer column (text or
-          // boolean) it is a 42804 type error (no implicit coercion — types.md §5/§11).
-          if (isText(col.type) || isBool(col.type)) {
-            throw engineError(
-              "datatype_mismatch",
-              "cannot store an integer value in " + canonicalName(col.type) + " column " + col.name,
-            );
-          }
-          if (!inRange(col.type, lit.int)) {
-            throw engineError(
-              "numeric_value_out_of_range",
-              "value out of range for type " + canonicalName(col.type),
-            );
-          }
-          row[i] = intValue(lit.int);
-        } else if (lit.kind === "text") {
-          // A text literal targets a text column; into an integer column it is a 42804 type
-          // error (no implicit text→int).
-          if (!isText(col.type)) {
-            throw engineError(
-              "datatype_mismatch",
-              "cannot store a text value in " + canonicalName(col.type) + " column " + col.name,
-            );
-          }
-          row[i] = textValue(lit.text);
-        } else {
-          // A boolean literal targets a boolean column; into a non-boolean column it is a
-          // 42804 type error (no implicit coercion).
-          if (!isBool(col.type)) {
-            throw engineError(
-              "datatype_mismatch",
-              "cannot store a boolean value in " + canonicalName(col.type) + " column " + col.name,
-            );
-          }
-          row[i] = boolValue(lit.value);
-        }
+        // The literal adapts/coerces to its target column: an integer literal into a decimal
+        // column widens (int→decimal, then to the typmod); a decimal literal into a decimal
+        // column rounds to its scale; a cross-family pair is 42804 (decimal.md §6, types.md §5).
+        row[i] = storeValue(literalToValue(lits[i]!), col.type, col.decimal, col.notNull, col.name);
       }
 
       let key: Uint8Array | null = null;
@@ -340,11 +308,11 @@ export class Database {
       }
       const col = table.columns[idx]!;
       // The RHS is a general expression evaluated against the OLD row; a literal operand
-      // adapts to the target column's type. The result must be an integer (or NULL) —
-      // assigning a boolean to an integer column is a 42804.
+      // adapts to the target column's type. The result must be assignable to the column's
+      // family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
       const { node, type } = resolve(table, a.value, col.type);
       requireAssignable(type, col.type, a.column);
-      plans.push({ idx, name: col.name, target: col.type, notNull: col.notNull, source: node });
+      plans.push({ idx, name: col.name, target: col.type, decimal: col.decimal, notNull: col.notNull, source: node });
     }
 
     const filter = upd.filter ? resolveBooleanFilter(table, upd.filter) : null;
@@ -513,6 +481,9 @@ function distinctRowKey(row: Value[]): string {
           // Length-prefix the content so the separator byte cannot be confused with a text
           // value that contains it (the value is arbitrary UTF-8).
           return "t" + v.text.length.toString() + ":" + v.text;
+        case "decimal":
+          // Value-canonical key so 1.5 and 1.50 collapse to one DISTINCT bucket (decimal.md §5).
+          return "d" + v.dec.canonicalString();
       }
     })
     .join("|");
@@ -533,6 +504,7 @@ type ResolvedType =
   | { kind: "int"; ty: ScalarType }
   | { kind: "bool" }
   | { kind: "text" } // the text family (one collation, C); does not promote
+  | { kind: "decimal" } // the decimal family (one type; the per-column typmod is separate)
   | { kind: "null" };
 
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
@@ -542,8 +514,9 @@ type RExpr =
   | { kind: "constInt"; value: bigint }
   | { kind: "constBool"; value: boolean }
   | { kind: "constText"; value: string }
+  | { kind: "constDecimal"; value: Decimal }
   | { kind: "constNull" }
-  | { kind: "cast"; target: ScalarType; operand: RExpr }
+  | { kind: "cast"; target: ScalarType; typmod: DecimalTypmod | null; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
   | { kind: "not"; operand: RExpr }
   | { kind: "arith"; op: BinaryOp; result: ScalarType; lhs: RExpr; rhs: RExpr }
@@ -616,7 +589,9 @@ function resolve(
         ? { kind: "text" }
         : isBool(colTy)
           ? { kind: "bool" }
-          : { kind: "int", ty: colTy };
+          : isDecimal(colTy)
+            ? { kind: "decimal" }
+            : { kind: "int", ty: colTy };
       return { node: { kind: "column", index: idx }, type };
     }
     case "literal":
@@ -628,18 +603,22 @@ function resolve(
         case "text":
           // A text literal is always text (collation C); it does not adapt to context.
           return { node: { kind: "constText", value: e.literal.text }, type: { kind: "text" } };
+        case "decimal":
+          // A decimal literal is always decimal; it does not adapt to context (like text).
+          // Cap-check it here (an over-long coefficient/scale traps 22003 at resolve).
+          return { node: { kind: "constDecimal", value: e.literal.dec.checkCap() }, type: { kind: "decimal" } };
         default: {
-          // An integer literal adapts to its integer context; a non-integer context (a text
-          // column on the other side, or a text assignment target) does not apply — it
-          // defaults to int64 and the surrounding type-check then reports the family
-          // mismatch (42804), never a wrong range check on a text type.
-          const ty = ctx !== null && !isText(ctx) ? ctx : "int64";
+          // An integer literal adapts only to an integer context; a non-integer context (a
+          // text/decimal column or assignment target) does not apply — it defaults to int64,
+          // and the surrounding check then reports the family mismatch (42804) or widens it
+          // (int→decimal), never a wrong range check on a non-integer type.
+          const ty = ctx !== null && isInteger(ctx) ? ctx : "int64";
           if (!inRange(ty, e.literal.int)) throw overflow(ty);
           return { node: { kind: "constInt", value: e.literal.int }, type: { kind: "int", ty } };
         }
       }
     case "cast": {
-      const target = resolveStorableType(e.typeName);
+      const [target, typmod] = resolveTypeAndTypmod(e.typeName, e.typeMod);
       // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
       // casting TO text is a 0A000 this slice.
       if (isText(target)) {
@@ -647,7 +626,7 @@ function resolve(
       }
       // Boolean casts are likewise deferred (boolean⇄integer is a later cast slice —
       // spec/types/casts.toml): casting TO boolean is a 0A000 this slice. Without this guard
-      // resolveStorableType now returns boolean, so it must be caught here.
+      // resolveTypeAndTypmod now returns boolean, so it must be caught here.
       if (isBool(target)) {
         throw engineError("feature_not_supported", "casting to boolean is not supported yet");
       }
@@ -659,15 +638,21 @@ function resolve(
       if (inner.type.kind === "text") {
         throw engineError("feature_not_supported", "casting from text is not supported yet");
       }
-      return { node: { kind: "cast", target, operand: inner.node }, type: { kind: "int", ty: target } };
+      // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
+      // decimal→decimal (re-scale), and NULL are all castable.
+      const resultType: ResolvedType = isDecimal(target) ? { kind: "decimal" } : { kind: "int", ty: target };
+      return { node: { kind: "cast", target, typmod, operand: inner.node }, type: resultType };
     }
     case "unary":
       if (e.op === "neg") {
         const { node, type } = resolve(table, e.operand, ctx);
+        if (type.kind === "decimal") {
+          return { node: { kind: "neg", result: "decimal", operand: node }, type: { kind: "decimal" } };
+        }
         let result: ScalarType;
         if (type.kind === "int") result = type.ty;
         else if (type.kind === "null") result = "int64"; // -NULL = NULL
-        else throw typeError("unary minus requires an integer operand");
+        else throw typeError("unary minus requires a numeric operand");
         return { node: { kind: "neg", result, operand: node }, type: { kind: "int", ty: result } };
       }
       {
@@ -705,7 +690,16 @@ function resolveBinary(
     case "mul":
     case "div":
     case "mod": {
-      const p = resolveIntPair(table, lhs, rhs);
+      // Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
+      // integer literal adapts to an integer sibling), then pick the family: both integer →
+      // integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
+      // widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
+      const p = resolveOperandPair(table, lhs, rhs);
+      requireNumericOperand(p.lt);
+      requireNumericOperand(p.rt);
+      if (p.lt.kind === "decimal" || p.rt.kind === "decimal") {
+        return { node: { kind: "arith", op, result: "decimal", lhs: p.rl, rhs: p.rr }, type: { kind: "decimal" } };
+      }
       const result = promote(p.lt, p.rt);
       return { node: { kind: "arith", op, result, lhs: p.rl, rhs: p.rr }, type: { kind: "int", ty: result } };
     }
@@ -767,31 +761,22 @@ function resolveOperandPair(
 
 // resolveIntPair resolves the two operands of an *arithmetic* operator: both must be
 // integer (or NULL); a boolean or text operand is a 42804 type error.
-function resolveIntPair(
-  table: Table,
-  lhs: Expr,
-  rhs: Expr,
-): { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType } {
-  const p = resolveOperandPair(table, lhs, rhs);
-  requireIntOperand(p.lt);
-  requireIntOperand(p.rt);
-  return p;
-}
-
 // classifyComparable requires that a comparison operand pair is comparable
-// (spec/types/compare.toml): both from the integer family (NULL counts as either), both
-// text, or both boolean. A mixed pair (integer/text, or boolean with either) is a 42804
-// type error — comparison is overloaded across these families but never compares across
-// them. A bare NULL pairs with any family.
+// (spec/types/compare.toml): both numeric (integer and/or decimal — the integer promotes to
+// decimal), both text, or both boolean (NULL counts as either). A mixed numeric/text pair, or
+// a boolean with a non-boolean, is a 42804 type error — comparison is overloaded across these
+// families but never compares across them.
 function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
-  // Boolean compares only with boolean (or NULL); boolean with int/text is a mismatch.
+  // Boolean compares only with boolean (or NULL); boolean with a number/text is a mismatch.
   const boolL = lt.kind === "bool";
   const boolR = rt.kind === "bool";
   if (boolL !== boolR && lt.kind !== "null" && rt.kind !== "null") {
     throw typeError("cannot compare a boolean value with a non-boolean value");
   }
-  if ((lt.kind === "int" && rt.kind === "text") || (lt.kind === "text" && rt.kind === "int")) {
-    throw typeError("cannot compare a text value with an integer value");
+  const lNum = lt.kind === "int" || lt.kind === "decimal";
+  const rNum = rt.kind === "int" || rt.kind === "decimal";
+  if ((lNum && rt.kind === "text") || (lt.kind === "text" && rNum)) {
+    throw typeError("cannot compare a text value with a numeric value");
   }
 }
 
@@ -815,39 +800,118 @@ function promote(a: ResolvedType, b: ResolvedType): ScalarType {
   return "int64";
 }
 
-function requireIntOperand(t: ResolvedType): void {
+// requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
+// or NULL); a boolean or text operand is a 42804 type error.
+function requireNumericOperand(t: ResolvedType): void {
   if (t.kind === "bool" || t.kind === "text") {
-    throw typeError("arithmetic operators require integer operands");
+    throw typeError("arithmetic operators require numeric operands");
   }
 }
 
 function requireBool(t: ResolvedType, msg: string): void {
-  if (t.kind === "int" || t.kind === "text") throw typeError(msg);
+  if (t.kind === "int" || t.kind === "text" || t.kind === "decimal") throw typeError(msg);
 }
 
 // requireAssignable: a value assigned to a column must match its family — an integer column
-// takes an integer (or NULL) value; a text column takes a text (or NULL) value; a boolean
-// column takes a boolean (or NULL) value. Any cross-family pair is a 42804 type error.
-// Mirrors the INSERT literal type-check, generalized to expressions.
+// takes an integer (or NULL); a decimal column takes an integer (int→decimal implicit) or
+// decimal (or NULL); a text column takes a text (or NULL); a boolean column takes a boolean
+// (or NULL). A decimal value into an integer column is NOT assignable (decimal→int is
+// explicit-CAST only). Any cross-family pair is a 42804 type error. Mirrors the INSERT literal
+// type-check, generalized to expressions.
 function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): void {
-  const ok = isText(colTy)
-    ? t.kind === "text" || t.kind === "null"
-    : isBool(colTy)
-      ? t.kind === "bool" || t.kind === "null"
-      : t.kind === "int" || t.kind === "null";
+  let ok: boolean;
+  if (isInteger(colTy)) ok = t.kind === "int" || t.kind === "null";
+  else if (isDecimal(colTy)) ok = t.kind === "int" || t.kind === "decimal" || t.kind === "null";
+  else if (isBool(colTy)) ok = t.kind === "bool" || t.kind === "null";
+  else ok = t.kind === "text" || t.kind === "null";
   if (!ok) {
     throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
   }
 }
 
-// resolveStorableType resolves a column-definition or CAST target type name to its
-// ScalarType. All canonical names and aliases (including boolean/bool) resolve here; a
-// genuinely unknown name is a 42704. Type-specific narrowings (a text/boolean PRIMARY KEY,
-// a CAST to text/boolean) are enforced at the call site, not here.
-function resolveStorableType(name: string): ScalarType {
+// resolveTypeAndTypmod resolves a column-definition or CAST target type name + optional type
+// modifier. All canonical names and aliases (including boolean/bool and numeric/decimal/dec)
+// resolve here; a genuinely unknown name is a 42704. A type modifier is meaningful only for
+// decimal (validated to numeric(p,s) — 22023); on any other type it is 0A000 (varchar(n) and
+// other parameterized types are deferred — spec/design/grammar.md §14). Type-specific narrowings
+// (a text/boolean/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the call site.
+function resolveTypeAndTypmod(name: string, typeMod: TypeMod | null): [ScalarType, DecimalTypmod | null] {
   const ty = scalarTypeFromName(name);
-  if (ty !== undefined) return ty;
-  throw engineError("undefined_object", "type does not exist: " + name);
+  if (ty === undefined) {
+    throw engineError("undefined_object", "type does not exist: " + name);
+  }
+  if (typeMod === null) return [ty, null];
+  if (!isDecimal(ty)) {
+    throw engineError("feature_not_supported", "a type modifier is not supported for type " + canonicalName(ty));
+  }
+  return [ty, validateDecimalTypmod(typeMod)];
+}
+
+// validateDecimalTypmod validates a decimal numeric(p[,s]) type modifier: 1 <= p <= 1000,
+// 0 <= s <= p; else trap 22023 (spec/design/decimal.md §2). numeric(p) means scale 0.
+function validateDecimalTypmod(tm: TypeMod): DecimalTypmod {
+  const p = tm.precision;
+  if (p < 1n || p > BigInt(MAX_PRECISION)) {
+    throw engineError("invalid_parameter_value", `NUMERIC precision ${p} must be between 1 and ${MAX_PRECISION}`);
+  }
+  const s = tm.scale ?? 0n;
+  if (s > p || s > BigInt(MAX_SCALE)) {
+    throw engineError("invalid_parameter_value", `NUMERIC scale ${s} must be between 0 and precision ${p}`);
+  }
+  return { precision: Number(p), scale: Number(s) };
+}
+
+// storeValue coerces a value into a column for storage (shared by INSERT and UPDATE). NULL
+// honours NOT NULL (23502); an integer into an integer column is range-checked (22003); an
+// integer into a decimal column widens (int→decimal) then coerces to the typmod; a decimal into
+// a decimal column coerces to the typmod (rounds, precision-checks → 22003); a boolean into a
+// boolean column is accepted as-is; a cross-family value (decimal→int, text→int, etc.) is 42804.
+function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, notNull: boolean, colName: string): Value {
+  switch (v.kind) {
+    case "null":
+      if (notNull) {
+        throw engineError("not_null_violation", "null value in column " + colName + " violates not-null constraint");
+      }
+      return nullValue();
+    case "int":
+      if (isInteger(colTy)) {
+        if (!inRange(colTy, v.int)) throw overflow(colTy);
+        return intValue(v.int);
+      }
+      if (isDecimal(colTy)) return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
+      throw typeError("cannot store an integer value in " + canonicalName(colTy) + " column " + colName);
+    case "decimal":
+      if (isDecimal(colTy)) return decimalValue(coerceDecimal(v.dec, typmod));
+      throw typeError("cannot store a decimal value in " + canonicalName(colTy) + " column " + colName);
+    case "text":
+      if (isText(colTy)) return v;
+      throw typeError("cannot store a text value in " + canonicalName(colTy) + " column " + colName);
+    default: // bool
+      if (isBool(colTy)) return v;
+      throw typeError("cannot store a boolean value in " + canonicalName(colTy) + " column " + colName);
+  }
+}
+
+// coerceDecimal coerces a decimal into a column's typmod: round to the declared scale and
+// precision-check (22003) for numeric(p,s); for an unconstrained numeric column just cap-check.
+function coerceDecimal(d: Decimal, typmod: DecimalTypmod | null): Decimal {
+  return typmod !== null ? d.coerceToTypmod(typmod.precision, typmod.scale) : d.checkCap();
+}
+
+// literalToValue wraps a parsed literal as a runtime value (type-check/coercion is storeValue).
+function literalToValue(lit: Insert["rows"][number][number]): Value {
+  switch (lit.kind) {
+    case "null":
+      return nullValue();
+    case "int":
+      return intValue(lit.int);
+    case "bool":
+      return { kind: "bool", value: lit.value };
+    case "text":
+      return textValue(lit.text);
+    default: // decimal
+      return decimalValue(lit.dec);
+  }
 }
 
 function overflow(ty: ScalarType): Error {
@@ -879,20 +943,23 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
       return { kind: "bool", value: e.value };
     case "constText":
       return textValue(e.value);
+    case "constDecimal":
+      return decimalValue(e.value);
     case "constNull":
       return nullValue();
     case "cast": {
       m.charge(COSTS.operatorEval);
       const v = evalExpr(e.operand, row, m);
       if (v.kind === "null") return nullValue();
-      if (v.kind !== "int") throw typeError("internal: boolean cast operand");
-      if (!inRange(e.target, v.int)) throw overflow(e.target);
-      return intValue(v.int);
+      return evalCast(v, e.target, e.typmod);
     }
     case "neg": {
       m.charge(COSTS.operatorEval);
       const v = evalExpr(e.operand, row, m);
       if (v.kind === "null") return nullValue();
+      if (isDecimal(e.result)) {
+        return decimalValue((v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec).negate());
+      }
       if (v.kind !== "int") throw typeError("internal: boolean unary minus");
       const n = -v.int;
       if (!inRange(e.result, n)) throw overflow(e.result);
@@ -907,7 +974,12 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
       const a = evalExpr(e.lhs, row, m);
       const b = evalExpr(e.rhs, row, m);
       if (a.kind === "null" || b.kind === "null") return nullValue();
-      if (a.kind !== "int" || b.kind !== "int") throw typeError("internal: boolean arithmetic");
+      if (isDecimal(e.result)) {
+        // Decimal arithmetic: widen any integer operand to decimal, then apply the op with
+        // PG's scale rules (spec/design/decimal.md §4).
+        return decimalValue(evalDecimalArith(e.op, toDecimal(a), toDecimal(b)));
+      }
+      if (a.kind !== "int" || b.kind !== "int") throw typeError("internal: non-integer arithmetic");
       return evalArith(e.op, a.int, b.int, e.result);
     }
     case "compare": {
@@ -986,6 +1058,46 @@ function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Valu
   return intValue(v);
 }
 
+// evalCast evaluates a (non-NULL) CAST to target. int→int range-checks (22003); int→decimal
+// widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
+// (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
+function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): Value {
+  if (v.kind === "int") {
+    if (isDecimal(target)) return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
+    if (!inRange(target, v.int)) throw overflow(target);
+    return intValue(v.int);
+  }
+  if (v.kind !== "decimal") throw typeError("internal: non-numeric cast operand");
+  if (isDecimal(target)) return decimalValue(coerceDecimal(v.dec, typmod));
+  const n = v.dec.toBigIntRound();
+  if (n === null || !inRange(target, n)) throw overflow(target);
+  return intValue(n);
+}
+
+// toDecimal widens a numeric value to Decimal (an integer operand of decimal arithmetic).
+function toDecimal(v: Value): Decimal {
+  if (v.kind === "decimal") return v.dec;
+  if (v.kind === "int") return Decimal.fromBigInt(v.int);
+  throw typeError("internal: non-numeric decimal operand");
+}
+
+// evalDecimalArith evaluates decimal arithmetic with PG's result-scale rules
+// (spec/design/decimal.md §4), throwing 22003 at the cap and 22012 on a zero divisor/modulus.
+function evalDecimalArith(op: BinaryOp, a: Decimal, b: Decimal): Decimal {
+  switch (op) {
+    case "add":
+      return a.add(b);
+    case "sub":
+      return a.sub(b);
+    case "mul":
+      return a.mul(b);
+    case "div":
+      return a.div(b);
+    default: // "mod"
+      return a.rem(b);
+  }
+}
+
 // or3 is three-valued OR (Kleene): used to build <= / >= from < / > and =, so a NULL
 // operand yields UNKNOWN rather than a wrong FALSE (CLAUDE.md §4).
 function or3(a: "true" | "false" | "unknown", b: "true" | "false" | "unknown"): "true" | "false" | "unknown" {
@@ -1014,21 +1126,33 @@ function keyCmp(a: Value, b: Value, descending: boolean, nullsFirst: boolean): n
 // over a single typed column, so a mixed pair is unreachable from SELECT. NULLs are handled
 // by keyCmp before this is reached. Returns <0, 0, >0.
 function valueCmp(a: Value, b: Value): number {
-  if (a.kind === "text" || b.kind === "text") {
-    if (a.kind === "text" && b.kind === "text") return compareTextC(a.text, b.text);
-    return a.kind === "text" ? 1 : -1; // text sorts after any non-text value
+  if (a.kind === "int" && b.kind === "int") return a.int < b.int ? -1 : a.int > b.int ? 1 : 0;
+  if (a.kind === "decimal" && b.kind === "decimal") return a.dec.cmpValue(b.dec);
+  if (a.kind === "text" && b.kind === "text") return compareTextC(a.text, b.text);
+  if (a.kind === "bool" && b.kind === "bool") {
+    return a.value === b.value ? 0 : a.value ? 1 : -1;
   }
-  const x = orderKey(a);
-  const y = orderKey(b);
-  if (x < y) return -1;
-  if (x > y) return 1;
-  return 0;
+  // Cross-family arms exist only for totality — ORDER BY is over a single typed column, so a
+  // mixed pair is unreachable. A fixed family order keeps the comparator total.
+  const fr = familyRank(a) - familyRank(b);
+  return fr < 0 ? -1 : fr > 0 ? 1 : 0;
 }
 
-function orderKey(v: Value): bigint {
-  if (v.kind === "bool") return v.value ? 1n : 0n;
-  if (v.kind === "int") return v.int;
-  return 0n;
+// familyRank is a fixed total order across value families, for the unreachable cross-family
+// case of valueCmp (ORDER BY is single-column-typed).
+function familyRank(v: Value): number {
+  switch (v.kind) {
+    case "null":
+      return 0;
+    case "bool":
+      return 1;
+    case "int":
+      return 2;
+    case "decimal":
+      return 3;
+    default: // text
+      return 4;
+  }
 }
 
 // AssignPlan is a resolved UPDATE assignment: target column index, its type and
@@ -1038,34 +1162,15 @@ type AssignPlan = {
   idx: number;
   name: string;
   target: ScalarType;
+  decimal: DecimalTypmod | null;
   notNull: boolean;
   source: RExpr;
 };
 
-// checkAssign type-checks a candidate value against a column: NULL into NOT NULL traps
-// 23502; an integer outside the target range traps 22003 — mirrors INSERT's checks. A text
-// value into a text column and a boolean value into a boolean column are accepted as-is.
-// The resolver proved the value's family matches the column, so no cross-family value
-// reaches here.
+// checkAssign type-checks + coerces a candidate value against a column — the same storeValue
+// path INSERT uses (NULL into NOT NULL → 23502; an integer out of range → 22003; a decimal
+// rounds to scale; a boolean into a boolean column is accepted as-is). The resolver proved the
+// value's family is assignable.
 function checkAssign(p: AssignPlan, v: Value): Value {
-  if (v.kind === "null") {
-    if (p.notNull) {
-      throw engineError(
-        "not_null_violation",
-        "null value in column " + p.name + " violates not-null constraint",
-      );
-    }
-    return nullValue();
-  }
-  if (v.kind === "text") {
-    // A text value into a text column is accepted as-is (the C collation imposes no
-    // constraint).
-    return v;
-  }
-  if (v.kind === "bool") {
-    // A boolean value into a boolean column, accepted as-is.
-    return v;
-  }
-  if (!inRange(p.target, v.int)) throw overflow(p.target);
-  return intValue(v.int);
+  return storeValue(v, p.target, p.decimal, p.notNull, p.name);
 }

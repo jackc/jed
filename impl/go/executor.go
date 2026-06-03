@@ -100,17 +100,17 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, NewError(DuplicateColumn, "duplicate column name: "+def.Name)
 			}
 		}
-		ty, err := resolveStorableType(def.TypeName)
+		ty, decimal, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
 		if err != nil {
 			return Outcome{}, err
 		}
 		if def.PrimaryKey {
-			// Text is not allowed in a key this slice: the order-preserving text key
-			// encoding (spec/design/encoding.md §2.4) is authored but unexercised, so a
-			// text PRIMARY KEY is a documented 0A000 narrowing (spec/design/types.md §11).
-			if ty.IsText() {
+			// Only integers may be a key this slice. The order-preserving text and decimal key
+			// encodings (spec/design/encoding.md §2.4/§2.5) are authored but unexercised, so a
+			// text or decimal PRIMARY KEY is a documented 0A000 narrowing (types.md §11/§12).
+			if !ty.IsInteger() {
 				return Outcome{}, NewError(FeatureNotSupported,
-					"a text primary key is not supported yet")
+					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
 			// Likewise boolean: the bool-byte key encoding rule is authored but
 			// unexercised, so a boolean PRIMARY KEY is a documented 0A000 narrowing
@@ -128,6 +128,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		columns = append(columns, Column{
 			Name:       def.Name,
 			Type:       ty,
+			Decimal:    decimal,
 			PrimaryKey: def.PrimaryKey,
 			NotNull:    def.PrimaryKey, // PRIMARY KEY ⇒ NOT NULL
 		})
@@ -188,43 +189,15 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 
 		row := make(Row, len(table.Columns))
 		for i, col := range table.Columns {
-			lit := lits[i]
-			switch lit.Kind {
-			case LiteralNull:
-				if col.NotNull {
-					return Outcome{}, NewError(NotNullViolation,
-						"null value in column "+col.Name+" violates not-null constraint")
-				}
-				row[i] = NullValue()
-			case LiteralInt:
-				// An integer literal targets an integer column; into a non-integer column
-				// (text or boolean) it is a 42804 type error (no implicit coercion — §5/§11).
-				if col.Type.IsText() || col.Type.IsBool() {
-					return Outcome{}, NewError(DatatypeMismatch,
-						"cannot store an integer value in "+col.Type.CanonicalName()+" column "+col.Name)
-				}
-				if !col.Type.InRange(lit.Int) {
-					return Outcome{}, NewError(NumericValueOutOfRange,
-						"value out of range for type "+col.Type.CanonicalName())
-				}
-				row[i] = IntValue(lit.Int)
-			case LiteralBool:
-				// A boolean literal targets a boolean column; into a non-boolean column it
-				// is a 42804 type error (no implicit coercion).
-				if !col.Type.IsBool() {
-					return Outcome{}, NewError(DatatypeMismatch,
-						"cannot store a boolean value in "+col.Type.CanonicalName()+" column "+col.Name)
-				}
-				row[i] = BoolValue(lit.Bool)
-			case LiteralText:
-				// A text literal targets a text column; into an integer column it is a
-				// 42804 type error (no implicit text→int).
-				if !col.Type.IsText() {
-					return Outcome{}, NewError(DatatypeMismatch,
-						"cannot store a text value in "+col.Type.CanonicalName()+" column "+col.Name)
-				}
-				row[i] = TextValue(lit.Str)
+			// The literal adapts/coerces to its target column: an integer literal into a
+			// decimal column widens (int→decimal, then to the typmod); a decimal literal into a
+			// decimal column rounds to its scale; a cross-family pair is 42804
+			// (spec/design/decimal.md §6, types.md §5).
+			v, err := storeValue(literalToValue(lits[i]), col.Type, col.Decimal, col.NotNull, col.Name)
+			if err != nil {
+				return Outcome{}, err
 			}
+			row[i] = v
 		}
 
 		var key []byte
@@ -335,9 +308,9 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 			}
 		}
 		col := table.Columns[idx]
-		// The RHS is a general expression evaluated against the *old* row; a literal
-		// operand adapts to the target column's type. The result must be an integer (or
-		// NULL) — assigning a boolean to an integer column is a 42804.
+		// The RHS is a general expression evaluated against the *old* row; a literal operand
+		// adapts to the target column's type. The result must be assignable to the column's
+		// family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
 		src, ty, err := resolve(table, a.Value, &col.Type)
 		if err != nil {
 			return Outcome{}, err
@@ -346,7 +319,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 			return Outcome{}, err
 		}
 		plans = append(plans, assignPlan{
-			idx: idx, name: col.Name, target: col.Type, notNull: col.NotNull, source: src,
+			idx: idx, name: col.Name, target: col.Type, decimal: col.Decimal, notNull: col.NotNull, source: src,
 		})
 	}
 
@@ -619,6 +592,11 @@ func distinctRowKey(row []Value) string {
 			b.WriteString(strconv.Itoa(len(v.Str)))
 			b.WriteByte(':')
 			b.WriteString(v.Str)
+		case ValDecimal:
+			// Value-canonical key so 1.5 and 1.50 collapse to one DISTINCT bucket
+			// (spec/design/decimal.md §5).
+			b.WriteByte('d')
+			b.WriteString(v.Dec.CanonicalString())
 		}
 	}
 	return b.String()
@@ -639,7 +617,8 @@ const (
 	rtNull rtKind = iota // an untyped NULL literal
 	rtInt                // integer; intTy carries the ScalarType
 	rtBool
-	rtText // text (one family, collation C); does not promote
+	rtText    // text (one family, collation C); does not promote
+	rtDecimal // decimal (one family; the per-column typmod is carried separately)
 )
 
 type resolvedType struct {
@@ -672,6 +651,7 @@ const (
 	reConstInt
 	reConstBool
 	reConstText
+	reConstDecimal
 	reConstNull
 	reCast
 	reNeg
@@ -689,16 +669,18 @@ const (
 // computed value can be range-checked against it.
 type rExpr struct {
 	kind    rExprKind
-	index   int        // reColumn
-	cInt    int64      // reConstInt
-	cBool   bool       // reConstBool
-	cText   string     // reConstText
-	op      BinaryOp   // reArith, reCompare
-	result  ScalarType // reCast target; reNeg / reArith result type
-	lhs     *rExpr     // reArith, reCompare, reAnd, reOr, reDistinct
-	rhs     *rExpr     // reArith, reCompare, reAnd, reOr, reDistinct
-	operand *rExpr     // reCast, reNeg, reNot, reIsNull
-	negated bool       // reIsNull, reDistinct
+	index   int            // reColumn
+	cInt    int64          // reConstInt
+	cBool   bool           // reConstBool
+	cText   string         // reConstText
+	cDec    Decimal        // reConstDecimal
+	op      BinaryOp       // reArith, reCompare
+	result  ScalarType     // reCast target; reNeg / reArith result type
+	typmod  *DecimalTypmod // reCast: a decimal target's numeric(p,s) typmod
+	lhs     *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
+	rhs     *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
+	operand *rExpr         // reCast, reNeg, reNot, reIsNull
+	negated bool           // reIsNull, reDistinct
 }
 
 // resolveProjections resolves SELECT items into evaluable projections (any result type
@@ -776,6 +758,8 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 			rt = resolvedType{kind: rtText}
 		} else if colTy.IsBool() {
 			rt = resolvedType{kind: rtBool}
+		} else if colTy.IsDecimal() {
+			rt = resolvedType{kind: rtDecimal}
 		}
 		return &rExpr{kind: reColumn, index: idx}, rt, nil
 	case ExprLiteral:
@@ -787,13 +771,21 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		case LiteralText:
 			// A text literal is always text (collation C); it does not adapt to context.
 			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
+		case LiteralDecimal:
+			// A decimal literal is always decimal; it does not adapt to context (like text).
+			// Cap-check it here (an over-long coefficient/scale traps 22003 at resolve).
+			d, err := e.Literal.Dec.CheckCap()
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			return &rExpr{kind: reConstDecimal, cDec: d}, resolvedType{kind: rtDecimal}, nil
 		default: // LiteralInt
-			// An integer literal adapts to its integer context; a non-integer context
-			// (a text column on the other side, or a text assignment target) does not
-			// apply — it defaults to int64 and the surrounding type-check then reports the
-			// family mismatch (42804), never a wrong range check on a text type.
+			// An integer literal adapts only to an integer context; a non-integer context
+			// (a text/decimal column or assignment target) does not apply — it defaults to
+			// int64, and the surrounding check then reports the family mismatch (42804) or
+			// widens it (int→decimal), never a wrong range check on a non-integer type.
 			ty := Int64
-			if ctx != nil && !ctx.IsText() {
+			if ctx != nil && ctx.IsInteger() {
 				ty = *ctx
 			}
 			if !ty.InRange(e.Literal.Int) {
@@ -803,7 +795,7 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 				resolvedType{kind: rtInt, intTy: ty}, nil
 		}
 	case ExprCast:
-		target, err := resolveStorableType(e.Cast.TypeName)
+		target, typmod, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -814,7 +806,7 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		}
 		// Boolean casts are likewise deferred (boolean⇄integer is a later cast slice —
 		// spec/types/casts.toml): casting TO boolean is a 0A000 this slice. Without this
-		// guard resolveStorableType now returns boolean, so it must be caught here.
+		// guard resolveTypeAndTypmod now returns boolean, so it must be caught here.
 		if target.IsBool() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to boolean is not supported yet")
 		}
@@ -829,25 +821,32 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		if ity.kind == rtText {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from text is not supported yet")
 		}
-		return &rExpr{kind: reCast, operand: inner, result: target},
-			resolvedType{kind: rtInt, intTy: target}, nil
+		// int→int (range check), int→decimal (widen), decimal→int (explicit, round),
+		// decimal→decimal (re-scale), and NULL are all castable.
+		resultRt := resolvedType{kind: rtInt, intTy: target}
+		if target.IsDecimal() {
+			resultRt = resolvedType{kind: rtDecimal}
+		}
+		return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod}, resultRt, nil
 	case ExprUnary:
 		if e.Unary.Op == OpNeg {
 			rop, ty, err := resolve(table, e.Unary.Operand, ctx)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			result := Int64
 			switch ty.kind {
 			case rtInt:
-				result = ty.intTy
+				return &rExpr{kind: reNeg, operand: rop, result: ty.intTy},
+					resolvedType{kind: rtInt, intTy: ty.intTy}, nil
+			case rtDecimal:
+				return &rExpr{kind: reNeg, operand: rop, result: DecimalType},
+					resolvedType{kind: rtDecimal}, nil
 			case rtNull:
-				result = Int64 // -NULL = NULL
-			default: // rtBool
-				return nil, resolvedType{}, typeError("unary minus requires an integer operand")
+				return &rExpr{kind: reNeg, operand: rop, result: Int64}, // -NULL = NULL
+					resolvedType{kind: rtInt, intTy: Int64}, nil
+			default: // rtBool, rtText
+				return nil, resolvedType{}, typeError("unary minus requires a numeric operand")
 			}
-			return &rExpr{kind: reNeg, operand: rop, result: result},
-				resolvedType{kind: rtInt, intTy: result}, nil
 		}
 		// OpNot
 		rop, ty, err := resolve(table, e.Unary.Operand, nil)
@@ -887,9 +886,23 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 func resolveBinary(table *Table, b *BinaryExpr) (*rExpr, resolvedType, error) {
 	switch b.Op {
 	case OpAdd, OpSub, OpMul, OpDiv, OpMod:
-		rl, lt, rr, rt, err := resolveIntPair(table, b.Lhs, b.Rhs)
+		// Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
+		// integer literal adapts to an integer sibling), then pick the family: both integer →
+		// integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
+		// widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
+		rl, lt, rr, rt, err := resolveOperandPair(table, b.Lhs, b.Rhs)
 		if err != nil {
 			return nil, resolvedType{}, err
+		}
+		if err := requireNumericOperand(lt); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := requireNumericOperand(rt); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if lt.kind == rtDecimal || rt.kind == rtDecimal {
+			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: DecimalType},
+				resolvedType{kind: rtDecimal}, nil
 		}
 		result := promote(lt, rt)
 		return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: result},
@@ -973,35 +986,30 @@ func resolveOperandPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rEx
 	return rl, lt, rr, rt, nil
 }
 
-// resolveIntPair resolves the two operands of an *arithmetic* operator: both must be
-// integer (or NULL); a boolean or text operand is a 42804 type error.
-func resolveIntPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
-	rl, lt, rr, rt, err := resolveOperandPair(table, lhs, rhs)
-	if err != nil {
-		return nil, resolvedType{}, nil, resolvedType{}, err
+// requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
+// or NULL); a boolean or text operand is a 42804 type error.
+func requireNumericOperand(t resolvedType) error {
+	if t.kind == rtBool || t.kind == rtText {
+		return typeError("arithmetic operators require numeric operands")
 	}
-	if err := requireIntOperand(lt); err != nil {
-		return nil, resolvedType{}, nil, resolvedType{}, err
-	}
-	if err := requireIntOperand(rt); err != nil {
-		return nil, resolvedType{}, nil, resolvedType{}, err
-	}
-	return rl, lt, rr, rt, nil
+	return nil
 }
 
 // classifyComparable requires that a comparison operand pair is comparable
-// (spec/types/compare.toml): both from the integer family (NULL counts as either), both
-// text, or both boolean. A mixed pair (integer/text, or boolean with either) is a 42804
-// type error — comparison is overloaded across these families but never compares across
-// them. A bare NULL pairs with any family.
+// (spec/types/compare.toml): both numeric (integer and/or decimal — the integer promotes to
+// decimal), both text, or both boolean (NULL counts as either). A mixed numeric/text pair, or
+// a boolean with a non-boolean, is a 42804 type error — comparison is overloaded across these
+// families but never compares across them.
 func classifyComparable(lt, rt resolvedType) error {
-	// Boolean compares only with boolean (or NULL); boolean with int/text is a mismatch.
+	// Boolean compares only with boolean (or NULL); boolean with a number/text is a mismatch.
 	boolL, boolR := lt.kind == rtBool, rt.kind == rtBool
 	if boolL != boolR && (lt.kind != rtNull && rt.kind != rtNull) {
 		return typeError("cannot compare a boolean value with a non-boolean value")
 	}
-	if (lt.kind == rtInt && rt.kind == rtText) || (lt.kind == rtText && rt.kind == rtInt) {
-		return typeError("cannot compare a text value with an integer value")
+	lNum := lt.kind == rtInt || lt.kind == rtDecimal
+	rNum := rt.kind == rtInt || rt.kind == rtDecimal
+	if (lNum && rt.kind == rtText) || (lt.kind == rtText && rNum) {
+		return typeError("cannot compare a text value with a numeric value")
 	}
 	return nil
 }
@@ -1030,33 +1038,30 @@ func promote(a, b resolvedType) ScalarType {
 	}
 }
 
-func requireIntOperand(t resolvedType) error {
-	if t.kind == rtBool || t.kind == rtText {
-		return typeError("arithmetic operators require integer operands")
-	}
-	return nil
-}
-
 func requireBool(t resolvedType, msg string) error {
-	if t.kind == rtInt || t.kind == rtText {
+	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal {
 		return typeError(msg)
 	}
 	return nil
 }
 
-// requireAssignable: a value assigned to a column must match its family — an integer
-// column takes an integer (or NULL) value; a text column takes a text (or NULL) value; a
-// boolean column takes a boolean (or NULL) value. Any cross-family pair is a 42804 type
-// error. Mirrors the INSERT literal type-check, generalized to expressions.
+// requireAssignable: a value assigned to a column must match its family — an integer column
+// takes an integer (or NULL) value; a decimal column takes an integer (int→decimal implicit) or
+// decimal (or NULL) value; a text column takes a text (or NULL) value; a boolean column takes a
+// boolean (or NULL) value. A decimal value into an integer column is NOT assignable (decimal→int
+// is explicit-CAST only). Any cross-family pair is a 42804 type error. Mirrors the INSERT literal
+// type-check, generalized to expressions.
 func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
 	var ok bool
 	switch {
-	case colTy.IsText():
-		ok = t.kind == rtText || t.kind == rtNull
 	case colTy.IsBool():
 		ok = t.kind == rtBool || t.kind == rtNull
-	default:
+	case colTy.IsInteger():
 		ok = t.kind == rtInt || t.kind == rtNull
+	case colTy.IsDecimal():
+		ok = t.kind == rtInt || t.kind == rtDecimal || t.kind == rtNull
+	default: // text
+		ok = t.kind == rtText || t.kind == rtNull
 	}
 	if !ok {
 		return typeError("cannot assign a value to column " + col + " of type " + colTy.CanonicalName())
@@ -1064,15 +1069,48 @@ func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
 	return nil
 }
 
-// resolveStorableType resolves a column-definition or CAST target type name to its
-// ScalarType. All canonical names and aliases (including boolean/bool) resolve here; a
-// genuinely unknown name is a 42704. Type-specific narrowings (a text/boolean PRIMARY KEY,
-// a CAST to text/boolean) are enforced at the call site, not here.
-func resolveStorableType(name string) (ScalarType, error) {
-	if ty, ok := ScalarTypeFromName(name); ok {
-		return ty, nil
+// resolveTypeAndTypmod resolves a column-definition or CAST target type name + optional type
+// modifier. All canonical names and aliases (including boolean/bool and numeric/decimal/dec)
+// resolve here; a genuinely unknown name is a 42704. A type modifier is meaningful only for
+// decimal (validated to numeric(p,s) — 22023); on any other type it is 0A000 (varchar(n) and
+// other parameterized types are deferred — spec/design/grammar.md §14). Type-specific narrowings
+// (a text/boolean/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the call site.
+func resolveTypeAndTypmod(name string, tm *TypeMod) (ScalarType, *DecimalTypmod, error) {
+	ty, ok := ScalarTypeFromName(name)
+	if !ok {
+		return 0, nil, NewError(UndefinedObject, "type does not exist: "+name)
 	}
-	return 0, NewError(UndefinedObject, "type does not exist: "+name)
+	if tm == nil {
+		return ty, nil, nil
+	}
+	if !ty.IsDecimal() {
+		return 0, nil, NewError(FeatureNotSupported,
+			"a type modifier is not supported for type "+ty.CanonicalName())
+	}
+	typmod, err := validateDecimalTypmod(tm)
+	if err != nil {
+		return 0, nil, err
+	}
+	return ty, typmod, nil
+}
+
+// validateDecimalTypmod validates a decimal numeric(p[,s]) type modifier: 1 <= p <= 1000,
+// 0 <= s <= p; else trap 22023 (spec/design/decimal.md §2). numeric(p) means scale 0.
+func validateDecimalTypmod(tm *TypeMod) (*DecimalTypmod, error) {
+	p := tm.Precision
+	if p < 1 || p > MaxPrecision {
+		return nil, NewError(InvalidParameterValue,
+			fmt.Sprintf("NUMERIC precision %d must be between 1 and %d", p, MaxPrecision))
+	}
+	var s uint64
+	if tm.Scale != nil {
+		s = *tm.Scale
+	}
+	if s > p || s > MaxScale {
+		return nil, NewError(InvalidParameterValue,
+			fmt.Sprintf("NUMERIC scale %d must be between 0 and precision %d", s, p))
+	}
+	return &DecimalTypmod{Precision: uint16(p), Scale: uint16(s)}, nil
 }
 
 func overflowErr(ty ScalarType) error {
@@ -1100,6 +1138,8 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		return BoolValue(e.cBool), nil
 	case reConstText:
 		return TextValue(e.cText), nil
+	case reConstDecimal:
+		return DecimalValue(e.cDec), nil
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
@@ -1111,10 +1151,7 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		if v.Kind == ValNull {
 			return NullValue(), nil
 		}
-		if !e.result.InRange(v.Int) {
-			return Value{}, overflowErr(e.result)
-		}
-		return IntValue(v.Int), nil
+		return evalCast(v, e.result, e.typmod)
 	case reNeg:
 		m.Charge(Costs.OperatorEval)
 		v, err := e.operand.eval(row, m)
@@ -1123,6 +1160,12 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		}
 		if v.Kind == ValNull {
 			return NullValue(), nil
+		}
+		if e.result.IsDecimal() {
+			if v.Kind == ValInt {
+				return DecimalValue(DecimalFromInt64(v.Int).Negate()), nil
+			}
+			return DecimalValue(v.Dec.Negate()), nil
 		}
 		if v.Int == math.MinInt64 { // negating int64's minimum overflows int64
 			return Value{}, overflowErr(e.result)
@@ -1151,6 +1194,11 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		}
 		if a.Kind == ValNull || b.Kind == ValNull {
 			return NullValue(), nil
+		}
+		if e.result.IsDecimal() {
+			// Decimal arithmetic: widen any integer operand to decimal, then apply the op with
+			// PG's scale rules (spec/design/decimal.md §4).
+			return evalDecimalArith(e.op, toDecimal(a), toDecimal(b))
 		}
 		return evalArith(e.op, a.Int, b.Int, e.result)
 	case reCompare:
@@ -1266,6 +1314,71 @@ func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
 	return IntValue(v), nil
 }
 
+// evalCast evaluates a (non-NULL) CAST to target. int→int range-checks (22003); int→decimal
+// widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
+// (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
+func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) {
+	if v.Kind == ValInt {
+		if target.IsDecimal() {
+			d, err := coerceDecimal(DecimalFromInt64(v.Int), typmod)
+			if err != nil {
+				return Value{}, err
+			}
+			return DecimalValue(d), nil
+		}
+		if !target.InRange(v.Int) {
+			return Value{}, overflowErr(target)
+		}
+		return IntValue(v.Int), nil
+	}
+	// v.Kind == ValDecimal
+	if target.IsDecimal() {
+		d, err := coerceDecimal(*v.Dec, typmod)
+		if err != nil {
+			return Value{}, err
+		}
+		return DecimalValue(d), nil
+	}
+	n, ok := v.Dec.ToInt64Round()
+	if !ok || !target.InRange(n) {
+		return Value{}, overflowErr(target)
+	}
+	return IntValue(n), nil
+}
+
+// toDecimal widens a numeric value to Decimal (an integer operand of decimal arithmetic).
+func toDecimal(v Value) Decimal {
+	if v.Kind == ValDecimal {
+		return *v.Dec
+	}
+	return DecimalFromInt64(v.Int)
+}
+
+// evalDecimalArith evaluates decimal arithmetic with PG's result-scale rules
+// (spec/design/decimal.md §4), trapping 22003 at the cap and 22012 on a zero divisor/modulus.
+func evalDecimalArith(op BinaryOp, a, b Decimal) (Value, error) {
+	var (
+		r   Decimal
+		err error
+	)
+	switch op {
+	case OpAdd:
+		r, err = a.Add(b)
+	case OpSub:
+		r, err = a.Sub(b)
+	case OpMul:
+		r, err = a.Mul(b)
+	case OpDiv:
+		r, err = a.Div(b)
+	default: // OpMod
+		r, err = a.Rem(b)
+	}
+	if err != nil {
+		return Value{}, err
+	}
+	return DecimalValue(r), nil
+}
+
 // or3 is three-valued OR (Kleene): used to build <= / >= from < / > and =, so a NULL
 // operand yields UNKNOWN rather than a wrong FALSE (CLAUDE.md §4).
 func or3(a, b ThreeValued) ThreeValued {
@@ -1313,16 +1426,23 @@ func keyCmp(a, b Value, descending, nullsFirst bool) int {
 // unreachable from SELECT. NULLs are handled by keyCmp before this is reached. Returns
 // <0, 0, >0.
 func valueCmp(a, b Value) int {
-	if a.Kind == ValText || b.Kind == ValText {
-		if a.Kind == ValText && b.Kind == ValText {
-			return strings.Compare(a.Str, b.Str)
-		}
-		if a.Kind == ValText {
-			return 1 // text sorts after any non-text value
-		}
-		return -1
+	switch {
+	case a.Kind == ValInt && b.Kind == ValInt:
+		return cmpInt64(a.Int, b.Int)
+	case a.Kind == ValDecimal && b.Kind == ValDecimal:
+		return a.Dec.CmpValue(*b.Dec)
+	case a.Kind == ValText && b.Kind == ValText:
+		return strings.Compare(a.Str, b.Str)
+	case a.Kind == ValBool && b.Kind == ValBool:
+		return cmpInt64(orderKey(a), orderKey(b))
+	default:
+		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
+		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.
+		return cmpInt64(int64(familyRank(a)), int64(familyRank(b)))
 	}
-	x, y := orderKey(a), orderKey(b)
+}
+
+func cmpInt64(x, y int64) int {
 	switch {
 	case x < y:
 		return -1
@@ -1343,6 +1463,23 @@ func orderKey(v Value) int64 {
 	return v.Int
 }
 
+// familyRank is a fixed total order across value families, for the unreachable cross-family
+// case of valueCmp (ORDER BY is single-column-typed).
+func familyRank(v Value) int {
+	switch v.Kind {
+	case ValNull:
+		return 0
+	case ValBool:
+		return 1
+	case ValInt:
+		return 2
+	case ValDecimal:
+		return 3
+	default: // ValText
+		return 4
+	}
+}
+
 // assignPlan is a resolved UPDATE assignment: the target column index, its type and
 // nullability for re-checking, and the resolved RHS expression (evaluated against the
 // old row).
@@ -1350,33 +1487,90 @@ type assignPlan struct {
 	idx     int
 	name    string
 	target  ScalarType
+	decimal *DecimalTypmod
 	notNull bool
 	source  *rExpr
 }
 
-// check type-checks a candidate value against this column: NULL into NOT NULL traps
-// 23502; an integer outside the target range traps 22003 (CLAUDE.md §8) — mirrors
-// INSERT's per-value checks. A text value into a text column and a boolean value into a
-// boolean column are accepted as-is. The resolver proved the value's family matches the
-// column, so no cross-family value reaches here.
+// check type-checks + coerces a candidate value against this column — the same storeValue path
+// INSERT uses (NULL into NOT NULL → 23502; an integer out of range → 22003; an integer into a
+// decimal column widens to the typmod; a decimal rounds to scale; a boolean into a boolean
+// column is accepted as-is). The resolver proved the value's family is assignable.
 func (p assignPlan) check(v Value) (Value, error) {
+	return storeValue(v, p.target, p.decimal, p.notNull, p.name)
+}
+
+// storeValue coerces a value into a column for storage (shared by INSERT and UPDATE). NULL
+// honours NOT NULL (23502); an integer into an integer column is range-checked (22003); an
+// integer into a decimal column widens (int→decimal) then coerces to the typmod; a decimal into
+// a decimal column coerces to the typmod (rounds to scale, precision-checks → 22003); a
+// cross-family value (decimal→int, text→int, etc.) is a 42804 (decimal→int is explicit-CAST only).
+func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, colName string) (Value, error) {
 	switch v.Kind {
 	case ValNull:
-		if p.notNull {
+		if notNull {
 			return Value{}, NewError(NotNullViolation,
-				"null value in column "+p.name+" violates not-null constraint")
+				"null value in column "+colName+" violates not-null constraint")
 		}
 		return NullValue(), nil
 	case ValInt:
-		if !p.target.InRange(v.Int) {
-			return Value{}, overflowErr(p.target)
+		if colTy.IsInteger() {
+			if !colTy.InRange(v.Int) {
+				return Value{}, overflowErr(colTy)
+			}
+			return IntValue(v.Int), nil
 		}
-		return IntValue(v.Int), nil
+		if colTy.IsDecimal() {
+			d, err := coerceDecimal(DecimalFromInt64(v.Int), typmod)
+			if err != nil {
+				return Value{}, err
+			}
+			return DecimalValue(d), nil
+		}
+		return Value{}, typeError("cannot store an integer value in " + colTy.CanonicalName() + " column " + colName)
+	case ValDecimal:
+		if colTy.IsDecimal() {
+			d, err := coerceDecimal(*v.Dec, typmod)
+			if err != nil {
+				return Value{}, err
+			}
+			return DecimalValue(d), nil
+		}
+		return Value{}, typeError("cannot store a decimal value in " + colTy.CanonicalName() + " column " + colName)
 	case ValText:
-		// A text value into a text column is accepted as-is (the C collation imposes no
-		// constraint).
-		return TextValue(v.Str), nil
-	default: // ValBool — a boolean value into a boolean column, accepted as-is.
-		return BoolValue(v.Bool), nil
+		if colTy.IsText() {
+			return TextValue(v.Str), nil
+		}
+		return Value{}, typeError("cannot store a text value in " + colTy.CanonicalName() + " column " + colName)
+	default: // ValBool
+		if colTy.IsBool() {
+			return BoolValue(v.Bool), nil
+		}
+		return Value{}, typeError("cannot store a boolean value in " + colTy.CanonicalName() + " column " + colName)
+	}
+}
+
+// coerceDecimal coerces a decimal into a column's typmod: round to the declared scale and
+// precision-check (22003) for numeric(p,s); for an unconstrained numeric column just cap-check.
+func coerceDecimal(d Decimal, typmod *DecimalTypmod) (Decimal, error) {
+	if typmod != nil {
+		return d.CoerceToTypmod(uint32(typmod.Precision), uint32(typmod.Scale))
+	}
+	return d.CheckCap()
+}
+
+// literalToValue wraps a parsed literal as a runtime value (type-check/coercion is storeValue).
+func literalToValue(lit Literal) Value {
+	switch lit.Kind {
+	case LiteralNull:
+		return NullValue()
+	case LiteralInt:
+		return IntValue(lit.Int)
+	case LiteralBool:
+		return BoolValue(lit.Bool)
+	case LiteralText:
+		return TextValue(lit.Str)
+	default: // LiteralDecimal
+		return DecimalValue(lit.Dec)
 	}
 }

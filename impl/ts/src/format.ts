@@ -11,12 +11,13 @@
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
 import { type Column, type Table, primaryKeyIndex } from "./catalog.ts";
+import { Decimal } from "./decimal.ts";
 import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database } from "./executor.ts";
 import type { Row } from "./storage.ts";
-import { type ScalarType, isBool, isText, widthBytes } from "./types.ts";
-import { type Value, boolValue, intValue, nullValue, textValue } from "./value.ts";
+import { type DecimalTypmod, type ScalarType, isBool, isText, widthBytes } from "./types.ts";
+import { type Value, boolValue, decimalValue, intValue, nullValue, textValue } from "./value.ts";
 
 const FORMAT_VERSION = 1; // on-disk format version
 const PAGE_HEADER = 12; // bytes of the catalog/data page header
@@ -41,6 +42,8 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 4;
     case "boolean":
       return 5;
+    case "decimal":
+      return 6;
   }
 }
 
@@ -57,6 +60,8 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "text";
     case 5:
       return "boolean";
+    case 6:
+      return "decimal";
     default:
       return undefined;
   }
@@ -98,6 +103,23 @@ function encodeValue(ty: ScalarType, v: Value): Uint8Array {
   }
   if (v.kind === "bool") {
     return new Uint8Array([0x00, v.value ? 0x01 : 0x00]); // present tag + bool-byte
+  }
+  if (v.kind === "decimal") {
+    // Decimal value codec (spec/fileformat/format.md): tag, flags (sign), u16 scale, u16
+    // ndigits, then that many big-endian base-10^4 coefficient groups (MS-first).
+    const [neg, scale, groups] = v.dec.toCodec();
+    const out = new Uint8Array(6 + groups.length * 2);
+    out[0] = 0x00; // present
+    out[1] = neg ? 1 : 0; // flags: bit0 = sign
+    out[2] = (scale >>> 8) & 0xff;
+    out[3] = scale & 0xff;
+    out[4] = (groups.length >>> 8) & 0xff;
+    out[5] = groups.length & 0xff;
+    for (let i = 0; i < groups.length; i++) {
+      out[6 + i * 2] = (groups[i]! >>> 8) & 0xff;
+      out[7 + i * 2] = groups[i]! & 0xff;
+    }
+    return out;
   }
   if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");
   return encodeNullable(ty, v.int);
@@ -162,6 +184,12 @@ function tableEntryBytes(table: Table, rootDataPage: number): Uint8Array {
     if (col.primaryKey) flags |= 0b01;
     if (col.notNull) flags |= 0b10;
     w.u8(flags);
+    // A decimal column appends its typmod (precision, scale) — only for type_code 6, so
+    // non-decimal entries are byte-unchanged (format.md). precision 0 = unconstrained numeric.
+    if (col.type === "decimal") {
+      w.u16(col.decimal ? col.decimal.precision : 0);
+      w.u16(col.decimal ? col.decimal.scale : 0);
+    }
   }
   w.u32(rootDataPage);
   return w.toBytes();
@@ -443,9 +471,17 @@ function decodeTableEntry(buf: Uint8Array, cur: Cursor): { table: Table; root: n
       throw engineError("data_corrupted", "unknown type code");
     }
     const flags = readU8(buf, cur);
+    // A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
+    let decimal: DecimalTypmod | null = null;
+    if (ty === "decimal") {
+      const precision = readU16(buf, cur);
+      const scale = readU16(buf, cur);
+      if (precision !== 0) decimal = { precision, scale };
+    }
     columns.push({
       name: cname,
       type: ty,
+      decimal,
       primaryKey: (flags & 0b01) !== 0,
       notNull: (flags & 0b10) !== 0,
     });
@@ -482,6 +518,15 @@ function readValue(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
       if (b === 0x00) return boolValue(false);
       if (b === 0x01) return boolValue(true);
       throw engineError("data_corrupted", "invalid boolean value byte");
+    }
+    if (ty === "decimal") {
+      // flags (sign), u16 scale, u16 ndigits, then that many base-10^4 groups.
+      const flags = readU8(buf, cur);
+      const scale = readU16(buf, cur);
+      const ndigits = readU16(buf, cur);
+      const groups: number[] = new Array(ndigits);
+      for (let i = 0; i < ndigits; i++) groups[i] = readU16(buf, cur);
+      return decimalValue(Decimal.fromCodec((flags & 1) !== 0, scale, groups));
     }
     return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
   }

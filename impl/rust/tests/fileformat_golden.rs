@@ -90,6 +90,24 @@ fn bool_table_db() -> Database {
     db
 }
 
+/// A table with a decimal column — exercises the value codec's decimal branch (flags + u16
+/// scale + u16 ndigits + base-10⁴ groups) and the catalog typmod: an unconstrained `numeric`
+/// column `d` and a constrained `numeric(10,2)` column `m` (values already at scale 2, so a
+/// no-op coercion). Covers positive, negative, zero, a multi-group coefficient, and a NULL.
+fn decimal_table_db() -> Database {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, d numeric, m numeric(10,2))",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, 1.50, 1.50), (2, -12345.6789, -12.34), \
+         (3, 0.00, 0.00), (4, 100000000.000001, 100.00), (5, NULL, NULL)",
+    );
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -99,6 +117,7 @@ fn write_matches_goldens() {
         ("pk_table.jed", pk_table_db),
         ("text_table.jed", text_table_db),
         ("bool_table.jed", bool_table_db),
+        ("decimal_table.jed", decimal_table_db),
         ("nopk_table.jed", nopk_table_db),
     ];
     for (name, build) in cases {
@@ -116,6 +135,7 @@ fn read_goldens_reproduces_rows() {
         ("pk_table.jed", pk_table_db, "t"),
         ("text_table.jed", text_table_db, "t"),
         ("bool_table.jed", bool_table_db, "t"),
+        ("decimal_table.jed", decimal_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),

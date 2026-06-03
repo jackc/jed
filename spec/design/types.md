@@ -31,14 +31,18 @@ order); see §11 for the collation decision and its deferred features. **`boolea
 logical connectives and the type of the `TRUE`/`FALSE` literals, and is now **storable** as a
 column (`storable = true` in [../types/scalars.toml](../types/scalars.toml)) — `CREATE TABLE
 t(flag boolean)`, INSERT/store/retrieve, `boolean × boolean` comparison and `ORDER BY` all work
-(§9). Two narrowings remain, mirroring text: a boolean **PRIMARY KEY** is rejected `0A000`, and
-`CAST(x AS boolean)` (and boolean⇄integer casts) are deferred `0A000` (§9, §10). The remaining
-scalars (`decimal`, `timestamp`/`timestamptz`, `bytea`, `json`/`jsonb`) are still **deferred**,
-so the float-formatting, decimal-rounding, and NaN/∞-ordering decisions in CLAUDE.md §8 still do
-**not** bind — there are no floats or decimals yet. The **collation** decision (§8) *does* now
-bind, and is settled in §11: one collation, `C`. Boolean and text each add real
-divergence-prone behavior (a render form beyond `I`, three-valued Kleene connectives — §10;
-and UTF-8 vs. UTF-16 ordering — §11) on the smallest possible surfaces.
+(§9); a boolean **PRIMARY KEY** is rejected `0A000`, and `CAST(x AS boolean)` (and
+boolean⇄integer casts) are deferred `0A000` (§9, §10). **`decimal`** (aliases `numeric`, `dec`)
+is the third storable non-integer scalar — an exact base-10 numeric (§12,
+[decimal.md](decimal.md)); its landing **binds the decimal-rounding decision** of CLAUDE.md §8
+(settled: round **half away from zero**) and keeps binary floats out of the compare/text paths
+entirely. The remaining scalars (`timestamp`/`timestamptz`, `bytea`, `json`/`jsonb`, and any
+`float`) are still **deferred**, so the float-formatting and NaN/∞ decisions in CLAUDE.md §8
+still do **not** bind — there are no floats (decimal is finite and exact, never NaN/∞ — §12).
+The **collation** decision (§8) is settled in §11: one collation, `C`. Boolean, text, and
+decimal each add real divergence-prone behavior (a render form beyond `I`, three-valued Kleene
+connectives — §10; UTF-8 vs. UTF-16 ordering — §11; exact base-10 arithmetic + display-scale —
+§12) on the smallest possible surfaces.
 
 ## 2. Canonical names vs. aliases
 
@@ -297,6 +301,12 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
 - **`text`** — ✅ landed as the first storable non-integer scalar, with one collation `C`
   (§11). Its deferred sub-features (`varchar(n)` length limits, text⇄other casts, string
   functions / `||` / `LIKE`, text in keys, and locale/ICU multi-collation) are enumerated in §11.
+- **`decimal`** — ✅ landed (§12, [decimal.md](decimal.md)): exact base-10 numeric, the first
+  parameterized type (`numeric(p,s)`), rounding half-away (settling the §8 decimal-rounding
+  hotspot), comparison + casts + storage + arithmetic. Deferred sub-features: decimal in a key
+  (`0A000`; the order-preserving encoding is authored, [encoding.md](encoding.md) §2.5),
+  scientific `e`-notation literals, negative/over-precision scale typmods, and raising the
+  1000-digit cap once over-page values land.
 - **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4.
 
 ## 11. The text type and its collation
@@ -362,3 +372,31 @@ files it.
 larger than one page trips the existing whole-image `feature_not_supported` (`0A000`) narrowing
 (format.md "Oversized item") — with integers that was unreachable; with text it becomes a real,
 documented limit until overflow pages land.
+
+## 12. The decimal type
+
+`decimal` (aliases `numeric`, `dec`) is the exact base-10 numeric and the headline of the type
+system (CLAUDE.md §4) — the full reasoning and the precise arithmetic are in
+[decimal.md](decimal.md); this section records the type-system-level facts and the §8 decisions
+it settles.
+
+- **Exact, base-10, finite.** A value is `(sign, base-10⁹ coefficient, scale)` =
+  `(−1)^sign · coefficient · 10^(−scale)`; no binary float touches it (CLAUDE.md §8). It is
+  **always finite** — no NaN/±Infinity (a documented PG divergence: no float source exists and
+  `x/0` traps `22012`).
+- **The first parameterized type.** `numeric` (unconstrained), `numeric(p)`, and
+  `numeric(p,s)` — `1 ≤ p ≤ 1000`, `0 ≤ s ≤ p`; a bad typmod traps `22023`. This adds an
+  optional type modifier to the grammar's `type_name` ([grammar.md](grammar.md) §6, §14).
+- **Rounding (settles CLAUDE.md §8).** Coercing to a scale rounds **half away from zero** (PG
+  `numeric`): `0.125 → 0.13`, `2.5 → 3`. One rounding mode engine-wide (decimal.md §3).
+- **Comparison/promotion.** `decimal × decimal` compares by exact value (scale-aligned, so
+  `1.5 = 1.50`); `integer × decimal` is the first **cross-family** comparable pair, resolved by
+  promoting the integer to decimal ([../types/compare.toml](../types/compare.toml)). Decimal
+  forms no integer-style promotion tower (one type; a value carries its scale).
+- **Casts (stricter than PG).** `int → decimal` is implicit (lossless); `decimal → int` is
+  **explicit CAST only** (rounds half-away, traps `22003`) — jed forbids the silent decimal→int
+  narrowing PG allows, consistent with the strict matrix (§5, [../types/casts.toml](../types/casts.toml)).
+- **Storage.** On-disk value codec, type code 5 ([../fileformat/format.md](../fileformat/format.md));
+  rendered under the new **`D`** conformance tag. A decimal **key** (`PRIMARY KEY`/index) is
+  rejected `0A000` this slice — the order-preserving rule is authored in
+  [encoding.md](encoding.md) §2.5 but unexercised, the text-PK precedent.

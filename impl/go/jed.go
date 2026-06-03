@@ -50,6 +50,11 @@ var SupportedCapabilities = []string{
 	// comparison and ORDER BY. Non-key column only (boolean PRIMARY KEY → 0A000); casts
 	// deferred (spec/design/types.md §9).
 	"types.boolean_storable",
+	// decimal / numeric scalar type — exact base-10, the first parameterized type
+	// (numeric(p,s)), comparison/ordering/casts/storage + arithmetic. Non-key column this
+	// slice (decimal PRIMARY KEY → 0A000).
+	"types.decimal",
+	"expr.decimal_arithmetic",
 	// General expression substrate — integer arithmetic, the boolean type, and the
 	// AND/OR/NOT Kleene connectives (the `expression` profile).
 	"types.boolean",

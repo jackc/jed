@@ -1,18 +1,19 @@
-//! Scalar types (CLAUDE.md §4). Storable: the three signed integers + `text` + `boolean`.
+//! Scalar types (CLAUDE.md §4). Storable: the three signed integers + `text` + `boolean`
+//! + `decimal`.
 //!
 //! Hand-written per CLAUDE.md §5 (the parser/types are irreducibly per-language),
 //! but cross-checked against the canonical spec/types/scalars.toml in tests so the
 //! two never drift.
 
-/// The storable scalar types: three signed integers, `text`, and `boolean`. Canonical
-/// integer names state width in bits (int16/int32/int64); SQL-standard names
-/// (smallint/integer/bigint) are accepted aliases. `text` is variable-width UTF-8 with
-/// one collation, `C` (byte / code-point order) — spec/design/types.md §11. `boolean`
-/// (alias `bool`) stores false/true behind the value codec's 1-byte `bool-byte` body
-/// (spec/design/types.md §9). The integer-only accessors
-/// (`width_bytes`/`min`/`max`/`rank`/`in_range`) panic on `Text`/`Bool`; callers route
-/// those through their own paths (the value codec, the comparators), never these, so the
-/// panic is an internal-invariant guard.
+/// The storable scalar types: three signed integers, `text`, `boolean`, and `decimal`.
+/// Canonical integer names state width in bits (int16/int32/int64); SQL-standard names
+/// (smallint/integer/bigint) are accepted aliases. `text` is variable-width UTF-8 with one
+/// collation, `C` (byte / code-point order) — spec/design/types.md §11. `boolean` (alias
+/// `bool`) stores false/true behind the value codec's 1-byte `bool-byte` body (types.md §9).
+/// `decimal` (aliases `numeric`/`dec`) is the exact base-10 numeric (decimal.md). The
+/// integer-only accessors (`width_bytes`/`min`/`max`/`rank`/`in_range`) panic on
+/// `Text`/`Bool`/`Decimal`; callers route those through their own paths (the value codec, the
+/// comparators), never these, so the panic is an internal-invariant guard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScalarType {
     Int16,
@@ -20,6 +21,9 @@ pub enum ScalarType {
     Int64,
     Text,
     Bool,
+    /// Exact base-10 `decimal` / `numeric` (spec/design/decimal.md). Variable-width and
+    /// non-integer; the per-column typmod (precision/scale) lives on the `Column`, not here.
+    Decimal,
 }
 
 impl ScalarType {
@@ -31,6 +35,7 @@ impl ScalarType {
             ScalarType::Int64 => "int64",
             ScalarType::Text => "text",
             ScalarType::Bool => "boolean",
+            ScalarType::Decimal => "decimal",
         }
     }
 
@@ -46,6 +51,7 @@ impl ScalarType {
             "int64" | "bigint" => Some(ScalarType::Int64),
             "text" | "varchar" | "string" | "character varying" => Some(ScalarType::Text),
             "boolean" | "bool" => Some(ScalarType::Bool),
+            "decimal" | "numeric" | "dec" => Some(ScalarType::Decimal),
             _ => None,
         }
     }
@@ -60,17 +66,31 @@ impl ScalarType {
         matches!(self, ScalarType::Bool)
     }
 
-    /// Fixed storage width in bytes (the key-encoding width). Integer-only — `text`
-    /// is variable-width and is never serialized through this path (it carries its
-    /// own length; spec/fileformat/format.md), so calling it on `Text` is a bug.
+    /// Whether this is the exact `decimal` type.
+    pub fn is_decimal(self) -> bool {
+        matches!(self, ScalarType::Decimal)
+    }
+
+    /// Whether this is one of the fixed-width signed integer types.
+    pub fn is_integer(self) -> bool {
+        matches!(
+            self,
+            ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64
+        )
+    }
+
+    /// Fixed storage width in bytes (the key-encoding width). Integer-only — `text`/`boolean`/
+    /// `decimal` are never serialized through this path (they carry their own length or use a
+    /// dedicated codec; spec/fileformat/format.md), so calling it on them is a bug.
     pub fn width_bytes(self) -> usize {
         match self {
             ScalarType::Int16 => 2,
             ScalarType::Int32 => 4,
             ScalarType::Int64 => 8,
-            ScalarType::Text => unreachable!("text is variable-width; width_bytes is integer-only"),
-            ScalarType::Bool => {
-                unreachable!("boolean uses the bool-byte codec; width_bytes is integer-only")
+            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal => {
+                unreachable!(
+                    "text/boolean/decimal are not fixed-width integers; width_bytes is integer-only"
+                )
             }
         }
     }
@@ -81,8 +101,9 @@ impl ScalarType {
             ScalarType::Int16 => i16::MIN as i64,
             ScalarType::Int32 => i32::MIN as i64,
             ScalarType::Int64 => i64::MIN,
-            ScalarType::Text => unreachable!("text has no integer range"),
-            ScalarType::Bool => unreachable!("boolean has no integer range"),
+            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal => {
+                unreachable!("text/boolean/decimal have no integer range")
+            }
         }
     }
 
@@ -92,20 +113,22 @@ impl ScalarType {
             ScalarType::Int16 => i16::MAX as i64,
             ScalarType::Int32 => i32::MAX as i64,
             ScalarType::Int64 => i64::MAX,
-            ScalarType::Text => unreachable!("text has no integer range"),
-            ScalarType::Bool => unreachable!("boolean has no integer range"),
+            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal => {
+                unreachable!("text/boolean/decimal have no integer range")
+            }
         }
     }
 
     /// Promotion-tower rank: int16 < int32 < int64 (spec/types/compare.toml).
-    /// Integer-only — text does not promote (there is one text type).
+    /// Integer-only — text, boolean, and decimal do not form an integer promotion tower.
     pub fn rank(self) -> u8 {
         match self {
             ScalarType::Int16 => 1,
             ScalarType::Int32 => 2,
             ScalarType::Int64 => 3,
-            ScalarType::Text => unreachable!("text has no promotion rank"),
-            ScalarType::Bool => unreachable!("boolean has no promotion rank"),
+            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal => {
+                unreachable!("text/boolean/decimal have no integer promotion rank")
+            }
         }
     }
 
@@ -115,13 +138,23 @@ impl ScalarType {
     }
 
     /// All types, for exhaustive iteration in tests.
-    pub fn all() -> [ScalarType; 5] {
+    pub fn all() -> [ScalarType; 6] {
         [
             ScalarType::Int16,
             ScalarType::Int32,
             ScalarType::Int64,
             ScalarType::Text,
             ScalarType::Bool,
+            ScalarType::Decimal,
         ]
     }
+}
+
+/// A decimal column's type modifier — `numeric(precision, scale)`. `precision >= 1`; an
+/// unconstrained `numeric` column carries `None` (spec/design/decimal.md §2). Validated at
+/// resolve (1 <= precision <= 1000, 0 <= scale <= precision; else 22023).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DecimalTypmod {
+    pub precision: u16,
+    pub scale: u16,
 }

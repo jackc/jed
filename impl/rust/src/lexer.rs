@@ -104,22 +104,53 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::Str(s));
             }
             b'0'..=b'9' => {
-                // Integer literal: an unsigned magnitude. The sign is the `Minus`
-                // operator. The magnitude must be <= 2^63 so that -(2^63) = int64::MIN
-                // is reachable; anything larger cannot be represented (42601). i64
-                // cannot hold 2^63, so carry it unsigned and let the parser convert.
+                // A numeric literal. Scan the integer digits; if a `.` follows it is a
+                // DECIMAL literal (scan the fractional digits), else an INTEGER literal.
                 let start = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                let text = &sql[start..i];
-                let n: u64 = text
-                    .parse()
-                    .map_err(|_| syntax(format!("integer literal out of range: {text}")))?;
-                if n > (1u64 << 63) {
-                    return Err(syntax(format!("integer literal out of range: {text}")));
+                if i < bytes.len() && bytes[i] == b'.' {
+                    // Decimal: `123.`, `123.45`. The fractional part may be empty (`1.`).
+                    let int_part = &sql[start..i];
+                    i += 1; // consume '.'
+                    let frac_start = i;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    let frac = &sql[frac_start..i];
+                    let digits = format!("{int_part}{frac}");
+                    tokens.push(Token::Decimal(digits, frac.len() as u32));
+                } else {
+                    // Integer literal: an unsigned magnitude. The sign is the `Minus`
+                    // operator. The magnitude must be <= 2^63 so that -(2^63) = int64::MIN
+                    // is reachable; anything larger cannot be represented (42601). i64
+                    // cannot hold 2^63, so carry it unsigned and let the parser convert.
+                    let text = &sql[start..i];
+                    let n: u64 = text
+                        .parse()
+                        .map_err(|_| syntax(format!("integer literal out of range: {text}")))?;
+                    if n > (1u64 << 63) {
+                        return Err(syntax(format!("integer literal out of range: {text}")));
+                    }
+                    tokens.push(Token::Int(n));
                 }
-                tokens.push(Token::Int(n));
+            }
+            b'.' => {
+                // A leading-dot decimal literal (`.5`). A `.` must have a digit on at least
+                // one side; a bare `.` (no following digit) is a syntax error. There is no
+                // `t.col` qualified-name syntax yet, so `.` appears only in a numeric literal.
+                if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+                    i += 1; // consume '.'
+                    let frac_start = i;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    let frac = &sql[frac_start..i];
+                    tokens.push(Token::Decimal(frac.to_string(), frac.len() as u32));
+                } else {
+                    return Err(syntax("unexpected character '.'".to_string()));
+                }
             }
             _ if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = i;

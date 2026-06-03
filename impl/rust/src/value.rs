@@ -2,9 +2,12 @@
 //!
 //! An integer value is held as an `i64` regardless of its declared column type (the
 //! type governs range checks and key-encoding width, not the representation); a `text`
-//! value holds its UTF-8 `String`. Because `Text` owns a `String`, `Value` is `Clone`,
+//! value holds its UTF-8 `String`; a `decimal` value holds an exact `Decimal`
+//! (spec/design/decimal.md). Because `Text`/`Decimal` own heap data, `Value` is `Clone`,
 //! not `Copy` — the comparison/render helpers borrow (`&self`, `&Value`) rather than
 //! consume, and the executor clones a value only when reading it out of a stored row.
+
+use crate::decimal::Decimal;
 
 /// A runtime value: SQL NULL, an integer, a boolean, or a text string.
 ///
@@ -20,6 +23,23 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     Text(String),
+    /// An exact base-10 decimal (spec/design/decimal.md). Its `PartialEq`/`Eq`/`Hash` are
+    /// **value-canonical** (`1.5 == 1.50`), so DISTINCT/GROUP BY over decimals compare by
+    /// value while `render` still preserves the display scale.
+    Decimal(Decimal),
+}
+
+/// Compare two numeric values by value, promoting an integer operand to decimal when its
+/// sibling is decimal (the `integer ↔ decimal` cross-family rule — spec/types/compare.toml).
+/// `None` for any non-numeric pair (text, boolean, NULL), which the callers treat as UNKNOWN.
+fn numeric_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
+        (Value::Decimal(x), Value::Decimal(y)) => Some(x.cmp_value(y)),
+        (Value::Int(x), Value::Decimal(y)) => Some(Decimal::from_i64(*x).cmp_value(y)),
+        (Value::Decimal(x), Value::Int(y)) => Some(x.cmp_value(&Decimal::from_i64(*y))),
+        _ => None,
+    }
 }
 
 /// The result of a three-valued comparison (CLAUDE.md §4): TRUE / FALSE / UNKNOWN.
@@ -62,6 +82,9 @@ impl Value {
             Value::Bool(true) => "true".to_string(),
             Value::Bool(false) => "false".to_string(),
             Value::Text(s) => s.clone(),
+            // Decimal renders as its canonical base-10 string, preserving display scale
+            // (the `D` tag — spec/design/decimal.md §6).
+            Value::Decimal(d) => d.render(),
         }
     }
 
@@ -79,30 +102,36 @@ impl Value {
     /// cross-family pair never reaches here — the resolver rejects it (42804) — so any
     /// non-matching variant pair is a NULL operand.
     pub fn eq3(&self, other: &Value) -> ThreeValued {
+        if let Some(ord) = numeric_cmp(self, other) {
+            return bool3(ord == std::cmp::Ordering::Equal);
+        }
         match (self, other) {
-            (Value::Int(a), Value::Int(b)) => bool3(a == b),
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() == b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a == b),
             _ => ThreeValued::Unknown,
         }
     }
 
-    /// Three-valued ordering predicate `self < other` (text by `C` collation = UTF-8
-    /// byte order; boolean by value, false < true).
+    /// Three-valued ordering predicate `self < other` (numerics by value with int↔decimal
+    /// promotion; text by `C` collation = UTF-8 byte order; boolean by value, false < true).
     pub fn lt3(&self, other: &Value) -> ThreeValued {
+        if let Some(ord) = numeric_cmp(self, other) {
+            return bool3(ord == std::cmp::Ordering::Less);
+        }
         match (self, other) {
-            (Value::Int(a), Value::Int(b)) => bool3(a < b),
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() < b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a < b),
             _ => ThreeValued::Unknown,
         }
     }
 
-    /// Three-valued ordering predicate `self > other` (text by `C` collation = UTF-8
-    /// byte order; boolean by value, false < true).
+    /// Three-valued ordering predicate `self > other` (numerics by value with int↔decimal
+    /// promotion; text by `C` collation = UTF-8 byte order; boolean by value, false < true).
     pub fn gt3(&self, other: &Value) -> ThreeValued {
+        if let Some(ord) = numeric_cmp(self, other) {
+            return bool3(ord == std::cmp::Ordering::Greater);
+        }
         match (self, other) {
-            (Value::Int(a), Value::Int(b)) => bool3(a > b),
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() > b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a > b),
             _ => ThreeValued::Unknown,

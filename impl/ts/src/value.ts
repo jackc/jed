@@ -8,6 +8,8 @@
 // column; a NULL boolean (unknown) is the "null" Value, so {true, false, NULL} is the
 // three-valued domain, ordered false < true.
 
+import { Decimal } from "./decimal.ts";
+
 export type Value =
   | { kind: "null" }
   | { kind: "int"; int: bigint }
@@ -15,7 +17,10 @@ export type Value =
   // The first stored non-integer value; compares by the C collation (UTF-8 byte /
   // code-point order — spec/design/types.md §11). NOT compared with JS `<`/localeCompare,
   // which use UTF-16 code-unit order and disagree above U+FFFF (see compareTextC below).
-  | { kind: "text"; text: string };
+  | { kind: "text"; text: string }
+  // An exact base-10 decimal (spec/design/decimal.md). Value-equality is scale-insensitive
+  // (1.5 == 1.50) and goes through eq3/cmpValue / the DISTINCT value-canonical key.
+  | { kind: "decimal"; dec: Decimal };
 
 // intValue builds a non-null integer value.
 export function intValue(n: bigint): Value {
@@ -35,6 +40,23 @@ export function boolValue(b: boolean): Value {
 // textValue builds a non-null text value.
 export function textValue(s: string): Value {
   return { kind: "text", text: s };
+}
+
+// decimalValue builds a non-null decimal value.
+export function decimalValue(d: Decimal): Value {
+  return { kind: "decimal", dec: d };
+}
+
+// numericCmp compares two numeric values by value, promoting an integer operand to decimal
+// when its sibling is decimal (the integer↔decimal cross-family rule — spec/types/compare.toml).
+// Returns undefined for any non-numeric pair (text, boolean, NULL), which callers treat as
+// UNKNOWN.
+function numericCmp(a: Value, b: Value): number | undefined {
+  if (a.kind === "int" && b.kind === "int") return a.int < b.int ? -1 : a.int > b.int ? 1 : 0;
+  if (a.kind === "decimal" && b.kind === "decimal") return a.dec.cmpValue(b.dec);
+  if (a.kind === "int" && b.kind === "decimal") return Decimal.fromBigInt(a.int).cmpValue(b.dec);
+  if (a.kind === "decimal" && b.kind === "int") return a.dec.cmpValue(Decimal.fromBigInt(b.int));
+  return undefined;
 }
 
 // compareTextC compares two strings by the `C` collation: the lexicographic order of
@@ -82,6 +104,10 @@ export function render(v: Value): string {
       return v.value ? "true" : "false";
     case "text":
       return v.text;
+    case "decimal":
+      // Decimal renders as its canonical base-10 string, preserving display scale
+      // (the D tag — spec/design/decimal.md §6).
+      return v.dec.render();
     default:
       return v.int.toString();
   }
@@ -95,28 +121,31 @@ export function render(v: Value): string {
 // 42804); any other variant pair is a NULL.
 export function eq3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
+  const c = numericCmp(a, b);
+  if (c !== undefined) return bool3(c === 0);
   if (a.kind === "text" && b.kind === "text") return bool3(a.text === b.text);
-  if (a.kind === "int" && b.kind === "int") return bool3(a.int === b.int);
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value === b.value);
   return "unknown";
 }
 
-// lt3 is the three-valued ordering predicate a < b (text by C collation = UTF-8 byte order;
-// boolean by value, false < true).
+// lt3 is the three-valued ordering predicate a < b (numerics by value with int↔decimal
+// promotion; text by C collation = UTF-8 byte order; boolean by value, false < true).
 export function lt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
+  const c = numericCmp(a, b);
+  if (c !== undefined) return bool3(c < 0);
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) < 0);
-  if (a.kind === "int" && b.kind === "int") return bool3(a.int < b.int);
   if (a.kind === "bool" && b.kind === "bool") return bool3(!a.value && b.value);
   return "unknown";
 }
 
-// gt3 is the three-valued ordering predicate a > b (text by C collation = UTF-8 byte order;
-// boolean by value, false < true).
+// gt3 is the three-valued ordering predicate a > b (numerics by value with int↔decimal
+// promotion; text by C collation = UTF-8 byte order; boolean by value, false < true).
 export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
+  const c = numericCmp(a, b);
+  if (c !== undefined) return bool3(c > 0);
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) > 0);
-  if (a.kind === "int" && b.kind === "int") return bool3(a.int > b.int);
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value && !b.value);
   return "unknown";
 }

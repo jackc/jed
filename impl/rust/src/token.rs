@@ -13,6 +13,11 @@ pub enum Token {
     /// strips the surrounding quotes and collapses each doubled `''` to one `'`
     /// (standard_conforming_strings; no backslash escapes). See spec/design/types.md §11.
     Str(String),
+    /// A decimal literal (a numeric literal containing a `.`): the unscaled coefficient as a
+    /// decimal-digit string (leading zeros allowed, no sign) and the scale (fractional digit
+    /// count). `1.50` → `("150", 2)`, `.5` → `("5", 1)`, `1.` → `("1", 0)`. The sign is the
+    /// `Minus` operator; the cap check is at resolve (spec/design/grammar.md §14).
+    Decimal(String, u32),
     Comma,
     LParen,
     RParen,

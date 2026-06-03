@@ -3,6 +3,7 @@
 export type TokenKind =
   | "word" // a bare word: keyword or identifier (compared case-insensitively)
   | "int" // an integer literal's unsigned magnitude (the sign is "minus")
+  | "decimal" // a decimal literal (a numeric literal with a "."); see `decDigits`/`decScale`
   | "str" // a single-quoted string literal's decoded content (the text type)
   | "comma" // ,
   | "lparen" // (
@@ -27,4 +28,9 @@ export type Token = {
   word?: string;
   int?: bigint;
   str?: string; // decoded content for "str"
+  // For "decimal": the unscaled coefficient as a decimal-digit string (leading zeros allowed,
+  // no sign) and the scale (fractional digit count). 1.50 → ("150", 2). The sign is "minus";
+  // the cap check is at resolve (spec/design/grammar.md §14).
+  decDigits?: string;
+  decScale?: number;
 };

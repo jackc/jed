@@ -61,3 +61,56 @@ to = "int32"
 mode = "explicit"
 on_overflow = "trap"
 overflow_error = "22003"
+
+# --- integer -> decimal: lossless (every integer is an exact decimal), implicit -------
+# An integer widens to decimal with scale 0 and no rounding, so it is implicit, like the
+# integer widenings above. This is what lets a bare integer literal land in a decimal
+# column and an `int_col <op> decimal` pair promote the integer to decimal (compare.toml).
+[[cast]]
+from = "int16"
+to = "decimal"
+mode = "implicit"
+
+[[cast]]
+from = "int32"
+to = "decimal"
+mode = "implicit"
+
+[[cast]]
+from = "int64"
+to = "decimal"
+mode = "implicit"
+
+# --- decimal -> integer: lossy, explicit CAST only, traps on overflow -----------------
+# A decimal is rounded to scale 0 (HALF AWAY FROM ZERO — the one engine rounding mode,
+# ../design/decimal.md §3; so 2.5 -> 3, -2.5 -> -3, matching PG numeric->int), then
+# range-checked against the integer type and trapped (22003) if it does not fit. EXPLICIT
+# only — STRICTER than PostgreSQL, which assignment-casts numeric->int; jed forbids the
+# silent narrowing, consistent with its strict matrix (CLAUDE.md §4, design/types.md).
+[[cast]]
+from = "decimal"
+to = "int16"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "decimal"
+to = "int32"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "decimal"
+to = "int64"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+# decimal -> decimal is the identity cast (implicit, always succeeds), like every identity
+# pair, so it is NOT listed. Re-scaling to a TARGET TYPMOD — `CAST(x AS numeric(p,s))` or
+# assignment into a numeric(p,s) column — is not a distinct (from,to) type pair (decimal is
+# one type; p/s are parameters): the executor rounds x to scale s half-away and traps 22003
+# if the integer-part digits exceed p-s (../design/decimal.md §2). It is the assignment/
+# explicit coercion the casts vocabulary reserves, applied within the decimal type.

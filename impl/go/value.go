@@ -14,6 +14,8 @@ const (
 	ValBool
 	// ValText is a text string (the text column type); Str holds its UTF-8 content.
 	ValText
+	// ValDecimal is an exact decimal (spec/design/decimal.md); Dec holds the value.
+	ValDecimal
 )
 
 // Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers
@@ -29,6 +31,12 @@ type Value struct {
 	Int  int64
 	Bool bool
 	Str  string
+	// Dec holds an exact decimal value when Kind == ValDecimal. It is a POINTER so that Value
+	// stays comparable (the coefficient is a slice): `==` on two NON-decimal values still works
+	// (Dec is nil). Decimal VALUE-equality is scale-insensitive (1.5 == 1.50) and must go
+	// through Eq3 / CmpValue / the DISTINCT value-canonical key — never `==` on two decimal
+	// Values (that compares pointers). See spec/design/decimal.md §5.
+	Dec *Decimal
 }
 
 // IntValue builds a non-null integer value.
@@ -42,6 +50,9 @@ func BoolValue(b bool) Value { return Value{Kind: ValBool, Bool: b} }
 
 // TextValue builds a non-null text value.
 func TextValue(s string) Value { return Value{Kind: ValText, Str: s} }
+
+// DecimalValue builds a non-null decimal value.
+func DecimalValue(d Decimal) Value { return Value{Kind: ValDecimal, Dec: &d} }
 
 // IsNull reports whether the value is SQL NULL.
 func (v Value) IsNull() bool { return v.Kind == ValNull }
@@ -81,6 +92,10 @@ func (v Value) Render() string {
 		return "false"
 	case ValText:
 		return v.Str
+	case ValDecimal:
+		// Decimal renders as its canonical base-10 string, preserving display scale
+		// (the D tag — spec/design/decimal.md §6).
+		return v.Dec.Render()
 	default:
 		return strconv.FormatInt(v.Int, 10)
 	}
@@ -91,6 +106,31 @@ func bool3(b bool) ThreeValued {
 		return True
 	}
 	return False
+}
+
+// numericCmp compares two numeric values by value, promoting an integer operand to decimal
+// when its sibling is decimal (the integer↔decimal cross-family rule — spec/types/compare.toml).
+// ok=false for any non-numeric pair (text, boolean, NULL), which callers treat as UNKNOWN.
+func numericCmp(a, b Value) (int, bool) {
+	switch {
+	case a.Kind == ValInt && b.Kind == ValInt:
+		switch {
+		case a.Int < b.Int:
+			return -1, true
+		case a.Int > b.Int:
+			return 1, true
+		default:
+			return 0, true
+		}
+	case a.Kind == ValDecimal && b.Kind == ValDecimal:
+		return a.Dec.CmpValue(*b.Dec), true
+	case a.Kind == ValInt && b.Kind == ValDecimal:
+		return DecimalFromInt64(a.Int).CmpValue(*b.Dec), true
+	case a.Kind == ValDecimal && b.Kind == ValInt:
+		return a.Dec.CmpValue(DecimalFromInt64(b.Int)), true
+	default:
+		return 0, false
+	}
 }
 
 // Eq3 is three-valued equality. NULL compared with anything (including NULL) is
@@ -104,43 +144,52 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
 	}
-	if v.Kind == ValText || o.Kind == ValText {
+	if c, ok := numericCmp(v, o); ok {
+		return bool3(c == 0)
+	}
+	if v.Kind == ValText && o.Kind == ValText {
 		return bool3(v.Str == o.Str)
 	}
 	if v.Kind == ValBool || o.Kind == ValBool {
 		return bool3(v.Bool == o.Bool)
 	}
-	return bool3(v.Int == o.Int)
+	return Unknown
 }
 
-// Lt3 is the three-valued ordering predicate v < o (text by C collation = byte order;
-// boolean by value, false < true).
+// Lt3 is the three-valued ordering predicate v < o (numerics by value with int↔decimal
+// promotion; text by C collation = byte order; boolean by value, false < true).
 func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
 	}
-	if v.Kind == ValText || o.Kind == ValText {
+	if c, ok := numericCmp(v, o); ok {
+		return bool3(c < 0)
+	}
+	if v.Kind == ValText && o.Kind == ValText {
 		return bool3(v.Str < o.Str)
 	}
 	if v.Kind == ValBool || o.Kind == ValBool {
 		return bool3(!v.Bool && o.Bool)
 	}
-	return bool3(v.Int < o.Int)
+	return Unknown
 }
 
-// Gt3 is the three-valued ordering predicate v > o (text by C collation = byte order;
-// boolean by value, false < true).
+// Gt3 is the three-valued ordering predicate v > o (numerics by value with int↔decimal
+// promotion; text by C collation = byte order; boolean by value, false < true).
 func (v Value) Gt3(o Value) ThreeValued {
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
 	}
-	if v.Kind == ValText || o.Kind == ValText {
+	if c, ok := numericCmp(v, o); ok {
+		return bool3(c > 0)
+	}
+	if v.Kind == ValText && o.Kind == ValText {
 		return bool3(v.Str > o.Str)
 	}
 	if v.Kind == ValBool || o.Kind == ValBool {
 		return bool3(v.Bool && !o.Bool)
 	}
-	return bool3(v.Int > o.Int)
+	return Unknown
 }
 
 // NotDistinctFrom is NULL-safe equality — the `IS NOT DISTINCT FROM` primitive

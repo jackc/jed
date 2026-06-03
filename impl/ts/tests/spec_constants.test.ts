@@ -14,6 +14,7 @@ import {
   scalarTypeFromName,
   widthBytes,
 } from "../src/types.ts";
+import { MAX_PRECISION, MAX_SCALE } from "../src/decimal.ts";
 import { OPERATORS } from "../src/operators.ts";
 import { COSTS } from "../src/costs.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
@@ -54,6 +55,22 @@ test("scalar types match spec/types/scalars.toml", () => {
   for (const alias of boolean!.strs("aliases")) {
     assert.equal(scalarTypeFromName(alias), boolTy, `alias ${alias} should resolve to boolean`);
   }
+
+  // text: storable; its aliases resolve. decimal: storable, the decimal family; aliases
+  // resolve; caps match the decimal module's constants (a cross-core contract, decimal.md §2).
+  const text = rows.find((r) => r.str("id") === "text");
+  assert.equal(text!.bool("storable"), true, "text storable");
+  assert.equal(scalarTypeFromName("text"), "text");
+
+  const decimal = rows.find((r) => r.str("id") === "decimal");
+  assert.notEqual(decimal, undefined, "decimal type present");
+  assert.equal(decimal!.str("family"), "decimal", "decimal family");
+  assert.equal(decimal!.bool("storable"), true, "decimal storable");
+  for (const name of ["decimal", "numeric", "dec"]) {
+    assert.equal(scalarTypeFromName(name), "decimal", `${name} resolves to decimal`);
+  }
+  assert.equal(decimal!.big("max_precision"), BigInt(MAX_PRECISION), "max_precision matches module");
+  assert.equal(decimal!.big("max_scale"), BigInt(MAX_SCALE), "max_scale matches module");
 });
 
 test("error codes are registered in spec/errors/registry.toml", () => {
@@ -64,6 +81,7 @@ test("error codes are registered in spec/errors/registry.toml", () => {
   const states: SqlState[] = [
     "numeric_value_out_of_range",
     "division_by_zero",
+    "invalid_parameter_value",
     "invalid_row_count_in_limit_clause",
     "invalid_row_count_in_offset_clause",
     "not_null_violation",

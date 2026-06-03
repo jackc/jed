@@ -114,6 +114,41 @@ UTF-8, no order-preservation needed — [../fileformat/format.md](../fileformat/
 Lifting the narrowing (text in a key / secondary index) adds the `(value → bytes)` fixtures to
 [../encoding/](../encoding/) and the executor path then.
 
+### 2.5 Decimal — `decimal-order-preserving` (authored; unexercised this slice)
+
+`decimal` is variable-width and signed with a varying exponent, so its order-preserving key —
+like text's — must be self-delimiting and sort byte-for-byte by **numeric value**, independent
+of stored display scale (`1.5` and `1.50` must encode identically — they are equal). The rule
+follows CockroachDB's decimal encoding (CLAUDE.md §8/§12). Normalize the value first to
+`(sign, mantissa, E)` where the mantissa is the coefficient's significant decimal digits with
+**trailing zero digit-pairs removed** and `E` is the base-100 exponent of the most-significant
+digit-pair (value ≈ `0.dd dd … × 100^E`, mantissa in `[0.01, 1)`). Encode **ascending**:
+
+1. **Sign/class byte**: `0x03` negative, `0x04` zero, `0x05` positive — so
+   `neg < zero < pos` by raw byte. (Zero is the single byte `0x04`; `0x02`/`0x06` are reserved
+   should ±∞ ever be needed — decimal has neither, §12 of [types.md](types.md).)
+2. **Exponent `E`**, order-preserving: a bias+big-endian varint that sorts ascending, so for
+   positives a larger `E` (larger magnitude) sorts later.
+3. **Mantissa**: the digit-pairs most-significant first, each emitted as a byte in
+   `[0x01, 0x64]` (`pair + 1`, reserving `0x00` for the terminator), so big-endian pair order
+   is `memcmp` order within an exponent.
+4. **Terminator `0x00`** (a shorter mantissa sorts before a longer one that extends it, since
+   `0x00 <` any pair byte).
+
+For **negative** values steps 2–4 are **bitwise-complemented** (so "more negative" sorts
+first), the same mirror §2.3 uses for descending. This composes with the §2.2 nullable
+presence tag (`0x00` present ‖ encoding, or `0x01` NULL) and the §2.3 descending inversion
+unchanged. Because the key encodes the **value, not the display scale**, `1.5` and `1.50`
+produce identical key bytes — they index as equal, matching `1.5 = 1.50`.
+
+**Status — authored, not yet exercised.** This slice keeps decimal out of keys: a decimal
+`PRIMARY KEY` is rejected `0A000` (a documented, relaxable narrowing — [types.md](types.md)
+§12), exactly as text's. No decimal key fixtures or executor key path exist yet; lifting the
+narrowing (decimal in a key / secondary index) adds `(value → bytes)` fixtures to
+[../encoding/](../encoding/) and the executor path then. Stored decimal *values* use the
+separate, simpler **value codec** (sign + scale + base-10⁴ groups, no order-preservation —
+[../fileformat/format.md](../fileformat/format.md)).
+
 ## 3. Where this is used today
 
 The bare integer rule is exercised by every stored key. The on-disk **value codec**

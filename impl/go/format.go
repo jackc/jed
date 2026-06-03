@@ -41,6 +41,8 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 4
 	case Bool:
 		return 5
+	case DecimalType:
+		return 6
 	default:
 		return 0
 	}
@@ -59,6 +61,8 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return Text, true
 	case 5:
 		return Bool, true
+	case 6:
+		return DecimalType, true
 	default:
 		return 0, false
 	}
@@ -102,6 +106,23 @@ func encodeValue(ty ScalarType, v Value) []byte {
 			b = 0x01
 		}
 		return []byte{0x00, b} // present tag + bool-byte (0x00 false, 0x01 true)
+	case ValDecimal:
+		// Decimal value codec (spec/fileformat/format.md): tag, flags (sign), u16 scale, u16
+		// ndigits, then that many big-endian base-10^4 coefficient groups (MS-first).
+		neg, scale, groups := v.Dec.ToCodec()
+		out := make([]byte, 0, 6+len(groups)*2)
+		out = append(out, 0x00) // present
+		var flags byte
+		if neg {
+			flags = 1 // bit0 = sign
+		}
+		out = append(out, flags)
+		out = appendU16(out, uint16(scale))
+		out = appendU16(out, uint16(len(groups)))
+		for _, g := range groups {
+			out = appendU16(out, g)
+		}
+		return out
 	default:
 		n := v.Int
 		return EncodeNullable(ty, &n)
@@ -322,6 +343,17 @@ func tableEntryBytes(table *Table, rootDataPage uint32) []byte {
 			flags |= 0b10
 		}
 		out = append(out, flags)
+		// A decimal column appends its typmod (precision, scale) — only for type_code 6, so
+		// non-decimal entries are byte-unchanged (spec/fileformat/format.md). precision 0 =
+		// unconstrained numeric.
+		if col.Type.IsDecimal() {
+			var precision, scale uint16
+			if col.Decimal != nil {
+				precision, scale = col.Decimal.Precision, col.Decimal.Scale
+			}
+			out = appendU16(out, precision)
+			out = appendU16(out, scale)
+		}
 	}
 	out = appendU32(out, rootDataPage)
 	return out
@@ -473,9 +505,25 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, error) {
 		if err != nil {
 			return nil, 0, err
 		}
+		// A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
+		var decimal *DecimalTypmod
+		if ty.IsDecimal() {
+			precision, err := readU16(buf, pos)
+			if err != nil {
+				return nil, 0, err
+			}
+			scale, err := readU16(buf, pos)
+			if err != nil {
+				return nil, 0, err
+			}
+			if precision != 0 {
+				decimal = &DecimalTypmod{Precision: precision, Scale: scale}
+			}
+		}
 		columns = append(columns, Column{
 			Name:       cname,
 			Type:       ty,
+			Decimal:    decimal,
 			PrimaryKey: flags&0b01 != 0,
 			NotNull:    flags&0b10 != 0,
 		})
@@ -541,6 +589,30 @@ func readValue(ty ScalarType, buf []byte, pos *int) (Value, error) {
 			default:
 				return Value{}, NewError(DataCorrupted, "invalid boolean value byte")
 			}
+		}
+		if ty.IsDecimal() {
+			// flags (sign), u16 scale, u16 ndigits, then that many base-10^4 groups.
+			flags, err := readU8(buf, pos)
+			if err != nil {
+				return Value{}, err
+			}
+			scale, err := readU16(buf, pos)
+			if err != nil {
+				return Value{}, err
+			}
+			ndigits, err := readU16(buf, pos)
+			if err != nil {
+				return Value{}, err
+			}
+			groups := make([]uint16, ndigits)
+			for i := range groups {
+				g, err := readU16(buf, pos)
+				if err != nil {
+					return Value{}, err
+				}
+				groups[i] = g
+			}
+			return DecimalValue(DecimalFromCodec(flags&1 != 0, uint32(scale), groups)), nil
 		}
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {

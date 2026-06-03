@@ -157,6 +157,10 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	if err != nil {
 		return ColumnDef{}, err
 	}
+	typeMod, err := p.parseTypeMod()
+	if err != nil {
+		return ColumnDef{}, err
+	}
 	primaryKey := false
 	if p.peekKeyword() == "primary" {
 		p.advance()
@@ -165,7 +169,43 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		}
 		primaryKey = true
 	}
-	return ColumnDef{Name: name, TypeName: typeName, PrimaryKey: primaryKey}, nil
+	return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey}, nil
+}
+
+// parseTypeMod parses an optional parenthesized type modifier "(" integer ("," integer)? ")"
+// after a type name (the first parameterized type, decimal — spec/grammar/grammar.ebnf
+// type_name). The shape is accepted for any type name; whether a typmod is meaningful (decimal
+// only) and in range is decided at resolve. Empty parens or a non-integer inside is 42601.
+func (p *Parser) parseTypeMod() (*TypeMod, error) {
+	if p.peek().Kind != TokLParen {
+		return nil, nil
+	}
+	p.advance() // '('
+	precision, err := p.expectTypmodInt()
+	if err != nil {
+		return nil, err
+	}
+	var scale *uint64
+	if p.peek().Kind == TokComma {
+		p.advance()
+		s, err := p.expectTypmodInt()
+		if err != nil {
+			return nil, err
+		}
+		scale = &s
+	}
+	if err := p.expect(TokRParen); err != nil {
+		return nil, err
+	}
+	return &TypeMod{Precision: precision, Scale: scale}, nil
+}
+
+func (p *Parser) expectTypmodInt() (uint64, error) {
+	t := p.advance()
+	if t.Kind != TokInt {
+		return 0, NewError(SyntaxError, "expected an integer type modifier")
+	}
+	return t.Int, nil
 }
 
 // parseDropTable parses `DROP TABLE <name>`. A missing table is rejected at execution
@@ -265,6 +305,10 @@ func (p *Parser) parseLiteral() (Literal, error) {
 				"value out of range: integer literal exceeds the maximum signed 64-bit value")
 		}
 		return Literal{Kind: LiteralInt, Int: v}, nil
+	case t.Kind == TokDecimal:
+		// A decimal literal carries the unscaled coefficient + scale; the leading unary minus
+		// (if any) folds into the sign. Cap checks are at resolve.
+		return Literal{Kind: LiteralDecimal, Dec: DecimalFromDigitsScale(negate, t.Word, uint32(t.Int))}, nil
 	case !negate && t.Kind == TokStr:
 		return Literal{Kind: LiteralText, Str: t.Word}, nil
 	case !negate && t.Kind == TokWord && toLowerASCII(t.Word) == "null":
@@ -729,6 +773,14 @@ func (p *Parser) parseUnary() (Expr, error) {
 			}
 			return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralInt, Int: v}}, nil
 		}
+		// Fold unary-minus of a decimal literal into one negative decimal literal (decimal
+		// negation never overflows).
+		if p.peek().Kind == TokDecimal {
+			t := p.advance()
+			return Expr{Kind: ExprLiteral, Literal: &Literal{
+				Kind: LiteralDecimal, Dec: DecimalFromDigitsScale(true, t.Word, uint32(t.Int)),
+			}}, nil
+		}
 		operand, err := p.parseUnary()
 		if err != nil {
 			return Expr{}, err
@@ -768,10 +820,14 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		if err != nil {
 			return Expr{}, err
 		}
+		typeMod, err := p.parseTypeMod()
+		if err != nil {
+			return Expr{}, err
+		}
 		if err := p.expect(TokRParen); err != nil {
 			return Expr{}, err
 		}
-		return Expr{Kind: ExprCast, Cast: &CastExpr{Inner: inner, TypeName: typeName}}, nil
+		return Expr{Kind: ExprCast, Cast: &CastExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod}}, nil
 	}
 	t := p.peek()
 	switch {
@@ -784,6 +840,11 @@ func (p *Parser) parsePrimary() (Expr, error) {
 				"value out of range: integer literal exceeds the maximum signed 64-bit value")
 		}
 		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralInt, Int: v}}, nil
+	case t.Kind == TokDecimal:
+		p.advance()
+		return Expr{Kind: ExprLiteral, Literal: &Literal{
+			Kind: LiteralDecimal, Dec: DecimalFromDigitsScale(false, t.Word, uint32(t.Int)),
+		}}, nil
 	case t.Kind == TokStr:
 		p.advance()
 		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralText, Str: t.Word}}, nil

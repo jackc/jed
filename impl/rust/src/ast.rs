@@ -1,6 +1,8 @@
 //! Abstract syntax for the step-1 SQL surface. Boring, explicit shapes
 //! (CLAUDE.md §10); the hand-written parser produces these.
 
+use crate::decimal::Decimal;
+
 /// A parsed top-level statement.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Statement {
@@ -32,7 +34,19 @@ pub struct ColumnDef {
     pub name: String,
     /// The type name as written (canonical or alias); resolved during analysis.
     pub type_name: String,
+    /// An optional parenthesized type modifier, `numeric(p[,s])` — the first parameterized
+    /// type. Meaningful only for decimal; validated at resolve (spec/design/grammar.md §14).
+    pub type_mod: Option<TypeMod>,
     pub primary_key: bool,
+}
+
+/// A parsed type modifier: a precision and an optional scale, as written
+/// (`numeric(p)` → `scale = None`, `numeric(p,s)` → `scale = Some(s)`). The values are the
+/// raw lexed magnitudes; range validation (1..=1000, 0..=p; else 22023) is at resolve.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TypeMod {
+    pub precision: u64,
+    pub scale: Option<u64>,
 }
 
 /// `INSERT INTO <table> VALUES (..)[, (..)]*`. One or more rows of literal values,
@@ -120,6 +134,8 @@ pub enum Expr {
     Cast {
         inner: Box<Expr>,
         type_name: String,
+        /// An optional `numeric(p[,s])` type modifier on the CAST target.
+        type_mod: Option<TypeMod>,
     },
     Unary {
         op: UnaryOp,
@@ -202,4 +218,9 @@ pub enum Literal {
     /// (the one collation, `C`); it does not adapt to context like an integer literal
     /// does (spec/design/types.md §11).
     Text(String),
+    /// A decimal literal (a numeric literal with a `.`). Carries the constructed value (the
+    /// parser folds a leading unary minus into its sign); it is an untyped decimal constant
+    /// that adapts to context and whose precision/scale caps are checked at resolve
+    /// (spec/design/grammar.md §14, decimal.md §6).
+    Decimal(Decimal),
 }

@@ -102,6 +102,54 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 			t.Errorf("alias %q should resolve to boolean", alias)
 		}
 	}
+
+	// decimal: storable, the decimal family; aliases resolve; the precision/scale caps match
+	// the decimal module's constants (a cross-core contract, spec/design/decimal.md §2).
+	var decimal *tomlRow
+	var text *tomlRow
+	for i := range tables {
+		switch tables[i].str("id") {
+		case "decimal":
+			decimal = &tables[i]
+		case "text":
+			text = &tables[i]
+		}
+	}
+	if text == nil || !text.boolVal("storable") || mustType(t, "text") != Text {
+		t.Error("text type missing or not storable")
+	}
+	if decimal == nil {
+		t.Fatal("decimal type missing from scalars.toml")
+	}
+	if decimal.str("family") != "decimal" {
+		t.Errorf("decimal: family mismatch")
+	}
+	if !decimal.boolVal("storable") {
+		t.Errorf("decimal must be storable")
+	}
+	if DecimalType.CanonicalName() != "decimal" {
+		t.Errorf("decimal canonical name mismatch")
+	}
+	for _, name := range []string{"decimal", "numeric", "dec"} {
+		if got, ok := ScalarTypeFromName(name); !ok || got != DecimalType {
+			t.Errorf("%q should resolve to decimal", name)
+		}
+	}
+	if got, want := decimal.int("max_precision"), int64(MaxPrecision); got != want {
+		t.Errorf("max_precision: spec %d, module %d", got, want)
+	}
+	if got, want := decimal.int("max_scale"), int64(MaxScale); got != want {
+		t.Errorf("max_scale: spec %d, module %d", got, want)
+	}
+}
+
+func mustType(t *testing.T, name string) ScalarType {
+	t.Helper()
+	ty, ok := ScalarTypeFromName(name)
+	if !ok {
+		t.Fatalf("type %q should resolve", name)
+	}
+	return ty
 }
 
 func TestErrorCodesAreRegistered(t *testing.T) {
@@ -111,7 +159,7 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 		codes[row.str("code")] = row.str("name")
 	}
 	for _, st := range []SqlState{
-		NumericValueOutOfRange, DivisionByZero,
+		NumericValueOutOfRange, DivisionByZero, InvalidParameterValue,
 		InvalidRowCountInLimitClause, InvalidRowCountInOffsetClause,
 		NotNullViolation, UniqueViolation,
 		SyntaxError, UndefinedTable, UndefinedColumn, UndefinedObject,

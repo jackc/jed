@@ -94,20 +94,49 @@ func Lex(sql string) ([]Token, error) {
 			}
 			tokens = append(tokens, Token{Kind: TokStr, Word: string(sb)})
 		case isDigit(c):
-			// Integer literal: an unsigned magnitude. The sign is TokMinus. The
-			// magnitude must be <= 2^63 so that -(2^63) = int64's minimum is reachable;
-			// anything larger cannot be represented (42601). int64 cannot hold 2^63, so
-			// carry it unsigned and let the parser convert.
+			// A numeric literal. Scan the integer digits; if a '.' follows it is a DECIMAL
+			// literal (scan the fractional digits), else an INTEGER literal.
 			start := i
 			for i < len(b) && isDigit(b[i]) {
 				i++
 			}
-			text := sql[start:i]
-			n, err := strconv.ParseUint(text, 10, 64)
-			if err != nil || n > (uint64(1)<<63) {
-				return nil, NewError(SyntaxError, fmt.Sprintf("integer literal out of range: %s", text))
+			if i < len(b) && b[i] == '.' {
+				// Decimal: `123.`, `123.45`. The fractional part may be empty (`1.`).
+				intPart := sql[start:i]
+				i++ // consume '.'
+				fracStart := i
+				for i < len(b) && isDigit(b[i]) {
+					i++
+				}
+				frac := sql[fracStart:i]
+				tokens = append(tokens, Token{Kind: TokDecimal, Word: intPart + frac, Int: uint64(len(frac))})
+			} else {
+				// Integer literal: an unsigned magnitude. The sign is TokMinus. The magnitude
+				// must be <= 2^63 so that -(2^63) = int64's minimum is reachable; anything
+				// larger cannot be represented (42601). int64 cannot hold 2^63, so carry it
+				// unsigned and let the parser convert.
+				text := sql[start:i]
+				n, err := strconv.ParseUint(text, 10, 64)
+				if err != nil || n > (uint64(1)<<63) {
+					return nil, NewError(SyntaxError, fmt.Sprintf("integer literal out of range: %s", text))
+				}
+				tokens = append(tokens, Token{Kind: TokInt, Int: n})
 			}
-			tokens = append(tokens, Token{Kind: TokInt, Int: n})
+		case c == '.':
+			// A leading-dot decimal literal (`.5`). A '.' must have a digit on at least one
+			// side; a bare '.' is a syntax error. There is no t.col qualified-name syntax yet,
+			// so '.' appears only in a numeric literal.
+			if i+1 < len(b) && isDigit(b[i+1]) {
+				i++ // consume '.'
+				fracStart := i
+				for i < len(b) && isDigit(b[i]) {
+					i++
+				}
+				frac := sql[fracStart:i]
+				tokens = append(tokens, Token{Kind: TokDecimal, Word: frac, Int: uint64(len(frac))})
+			} else {
+				return nil, NewError(SyntaxError, "unexpected character '.'")
+			}
 		case isAlpha(c):
 			start := i
 			for i < len(b) && (isAlpha(b[i]) || isDigit(b[i])) {

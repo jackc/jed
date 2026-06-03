@@ -31,8 +31,19 @@ type DropTable struct {
 type ColumnDef struct {
 	Name string
 	// TypeName as written (canonical or alias); resolved during analysis.
-	TypeName   string
+	TypeName string
+	// TypeMod is an optional parenthesized type modifier, numeric(p[,s]) — the first
+	// parameterized type. Meaningful only for decimal; validated at resolve (grammar.md §14).
+	TypeMod    *TypeMod
 	PrimaryKey bool
+}
+
+// TypeMod is a parsed type modifier: a precision and an optional scale, as written
+// (numeric(p) → Scale nil, numeric(p,s) → Scale set). The values are the raw lexed magnitudes;
+// range validation (1..=1000, 0..=p; else 22023) is at resolve.
+type TypeMod struct {
+	Precision uint64
+	Scale     *uint64
 }
 
 // Insert is an INSERT ... VALUES with one or more rows of literals, each in column
@@ -180,10 +191,11 @@ type Expr struct {
 	IsDistinct *IsDistinctExpr // ExprIsDistinct
 }
 
-// CastExpr is CAST(Inner AS TypeName).
+// CastExpr is CAST(Inner AS TypeName). TypeMod is the optional numeric(p[,s]) modifier.
 type CastExpr struct {
 	Inner    Expr
 	TypeName string
+	TypeMod  *TypeMod
 }
 
 // UnaryExpr is Op applied to Operand.
@@ -240,6 +252,10 @@ const (
 	// type is always text (collation C); it does not adapt to context like an integer
 	// literal does (spec/design/types.md §11).
 	LiteralText
+	// LiteralDecimal is a decimal literal (Dec holds the constructed value, sign folded). An
+	// untyped decimal constant that adapts to context; caps are checked at resolve
+	// (spec/design/grammar.md §14, decimal.md §6).
+	LiteralDecimal
 )
 
 // Literal is a literal value as written in SQL. A bare integer literal is an *untyped
@@ -251,5 +267,6 @@ type Literal struct {
 	Kind LiteralKind
 	Int  int64
 	Bool bool
-	Str  string // LiteralText
+	Str  string  // LiteralText
+	Dec  Decimal // LiteralDecimal
 }

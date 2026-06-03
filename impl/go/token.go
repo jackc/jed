@@ -12,6 +12,11 @@ const (
 	// lexer strips the quotes and collapses each doubled '' to one ' (no backslash
 	// escapes — standard_conforming_strings, spec/design/types.md §11).
 	TokStr
+	// TokDecimal is a decimal literal (a numeric literal containing a '.'): Word holds the
+	// unscaled coefficient as a decimal-digit string (leading zeros allowed, no sign) and Int
+	// holds the scale (fractional digit count). 1.50 → ("150", 2). The sign is TokMinus; the
+	// cap check is at resolve (spec/design/grammar.md §14).
+	TokDecimal
 	// TokComma is ",".
 	TokComma
 	// TokLParen is "(".

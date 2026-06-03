@@ -20,13 +20,16 @@ ROOT_PAGE = 2
 TXID = 1
 
 WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8 }.freeze
-TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5 }.freeze
+TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6 }.freeze
 CODETYPE = TYPECODE.invert.freeze
 
 # --- declarative fixtures (mirror what the cores build via SQL) --------------
 
-def col(name, type, pk: false)
-  { name: name, type: type, pk: pk, not_null: pk } # PRIMARY KEY => NOT NULL
+# A column. `precision`/`scale` are the decimal typmod (only meaningful for type "decimal";
+# nil = an unconstrained `numeric` column, or a non-decimal column). Always carried so the
+# decode-side column hash compares equal (format.md stores the typmod only for type_code 6).
+def col(name, type, pk: false, precision: nil, scale: nil)
+  { name: name, type: type, pk: pk, not_null: pk, precision: precision, scale: scale }
 end
 
 PK_TABLE = {
@@ -55,6 +58,19 @@ BOOL_TABLE = {
   rows: [[1, true], [2, false], [3, nil]]
 }.freeze
 
+# A table with a decimal column: exercises the value codec's decimal branch (flags + u16 scale
+# + u16 ndigits + base-10^4 groups), positive/negative/zero, a multi-group coefficient, a NULL,
+# AND the catalog typmod (an unconstrained `numeric` column `d` and a constrained numeric(10,2)
+# column `m`). The `m` values are already at scale 2, so storing them is a no-op coercion — the
+# stored bytes equal what the cores write when they INSERT the same literals. PK is an int32
+# (decimal is not allowed in a key this slice).
+DECIMAL_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("d", "decimal"), col("m", "decimal", precision: 10, scale: 2)],
+  rows: [[1, "1.50", "1.50"], [2, "-12345.6789", "-12.34"], [3, "0.00", "0.00"],
+         [4, "100000000.000001", "100.00"], [5, nil, nil]]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "one_table_empty.jed", page_size: 256,
@@ -62,6 +78,7 @@ FIXTURES = [
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
   { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
   { file: "bool_table.jed",      page_size: 256, tables: [BOOL_TABLE] },
+  { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
@@ -113,9 +130,46 @@ def encode_value(type, v)
     "\x00".b + u16(bytes.bytesize) + bytes
   when "boolean"
     "\x00".b + (v ? "\x01".b : "\x00".b)
+  when "decimal"
+    "\x00".b + encode_decimal(v)
   else
     "\x00".b + encode_int(WIDTH.fetch(type), v)
   end
+end
+
+# Parse a decimal STRING ("[-]int[.frac]") into (neg, scale, coefficient). The coefficient is a
+# Ruby integer (arbitrary precision); scale is the fractional digit count. No negative zero.
+def parse_decimal(s)
+  neg = s.start_with?("-")
+  body = neg ? s[1..] : s
+  int, frac = body.split(".", 2)
+  frac ||= ""
+  coeff = (int + frac).to_i # leading zeros are harmless to_i
+  { neg: neg && coeff != 0, scale: frac.length, coeff: coeff }
+end
+
+# Render (neg, scale, coefficient) to the canonical decimal string (spec/design/decimal.md §6).
+def render_decimal(neg, scale, coeff)
+  digits = coeff.to_s # "0" for zero, no leading zeros
+  sign = neg ? "-" : ""
+  return sign + digits if scale.zero?
+
+  digits = digits.rjust(scale + 1, "0")
+  point = digits.length - scale
+  "#{sign}#{digits[0...point]}.#{digits[point..]}"
+end
+
+# Decimal value codec body (format.md): flags (bit0 sign), u16 scale, u16 ndigits, then that
+# many big-endian base-10^4 coefficient groups, most-significant first. Zero carries no groups.
+def encode_decimal(s)
+  d = parse_decimal(s)
+  groups = []
+  c = d[:coeff]
+  while c.positive?
+    groups.unshift(c % 10_000)
+    c /= 10_000
+  end
+  [d[:neg] ? 1 : 0].pack("C") + u16(d[:scale]) + u16(groups.size) + groups.map { |g| u16(g) }.join
 end
 
 # --- encoding (reference serializer) ----------------------------------------
@@ -131,6 +185,9 @@ def table_entry_bytes(table, root_data_page)
     flags |= 0b01 if c[:pk]
     flags |= 0b10 if c[:not_null]
     out << [flags].pack("C")
+    # A decimal column appends its typmod (precision, scale) — only for type_code 6, so
+    # non-decimal entries are byte-unchanged. precision 0 = unconstrained numeric.
+    out << u16(c[:precision] || 0) << u16(c[:scale] || 0) if c[:type] == "decimal"
   end
   out << u32(root_data_page)
   out
@@ -302,8 +359,18 @@ def decode_table_entry(buf, pos)
     tc, pos = take(buf, pos, 1)
     flags, pos = take(buf, pos, 1)
     f = flags.getbyte(0)
-    columns << { name: cname, type: CODETYPE.fetch(tc.getbyte(0)),
-                 pk: (f & 0b01) != 0, not_null: (f & 0b10) != 0 }
+    type = CODETYPE.fetch(tc.getbyte(0))
+    precision = nil
+    scale = nil
+    if type == "decimal"
+      pb, pos = take(buf, pos, 2)
+      sb, pos = take(buf, pos, 2)
+      p = pb.unpack1("n")
+      precision = p.zero? ? nil : p
+      scale = p.zero? ? nil : sb.unpack1("n")
+    end
+    columns << { name: cname, type: type, pk: (f & 0b01) != 0, not_null: (f & 0b10) != 0,
+                 precision: precision, scale: scale }
   end
   root, pos = take(buf, pos, 4)
   [{ name: name, columns: columns, root_data_page: root.unpack1("N") }, pos]
@@ -324,6 +391,16 @@ def decode_record(columns, buf, pos)
       when "boolean"
         bb, pos = take(buf, pos, 1)
         row << (bb.getbyte(0) == 1)
+      when "decimal"
+        fb, pos = take(buf, pos, 1)
+        scb, pos = take(buf, pos, 2)
+        ndb, pos = take(buf, pos, 2)
+        coeff = 0
+        ndb.unpack1("n").times do
+          gb, pos = take(buf, pos, 2)
+          coeff = coeff * 10_000 + gb.unpack1("n")
+        end
+        row << render_decimal((fb.getbyte(0) & 1) != 0, scb.unpack1("n"), coeff)
       else
         vb, pos = take(buf, pos, WIDTH.fetch(c[:type]))
         row << decode_int(WIDTH.fetch(c[:type]), vb)
@@ -372,7 +449,10 @@ end
 def expected_tables(fx)
   fx[:tables].sort_by { |t| t[:name].downcase }.map do |t|
     { name: t[:name],
-      columns: t[:columns].map { |c| { name: c[:name], type: c[:type], pk: c[:pk], not_null: c[:not_null] } },
+      columns: t[:columns].map do |c|
+        { name: c[:name], type: c[:type], pk: c[:pk], not_null: c[:not_null],
+          precision: c[:precision], scale: c[:scale] }
+      end,
       rows: table_entries(t).map { |_key, row| row } }
   end
 end

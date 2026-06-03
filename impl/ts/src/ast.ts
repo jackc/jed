@@ -8,13 +8,23 @@
 // operand, the compared column in a WHERE predicate — and traps 22003 if it does not
 // fit; with no context it defaults to int64 (spec/design/types.md §6). A boolean literal
 // is expression-only this slice (it cannot be stored).
+import type { Decimal } from "./decimal.ts";
+
 export type Literal =
   | { kind: "null" }
   | { kind: "int"; int: bigint }
   | { kind: "bool"; value: boolean }
   // A single-quoted text literal (decoded content). Its type is always text (collation C);
   // it does not adapt to context like an integer literal does (spec/design/types.md §11).
-  | { kind: "text"; text: string };
+  | { kind: "text"; text: string }
+  // A decimal literal (carries the constructed value, sign folded). An untyped decimal
+  // constant that adapts to context; caps are checked at resolve (grammar.md §14, decimal.md §6).
+  | { kind: "decimal"; dec: Decimal };
+
+// TypeMod is a parsed type modifier: a precision and an optional scale, as written
+// (numeric(p) → scale null, numeric(p,s) → scale set). The values are the raw lexed magnitudes;
+// range validation (1..=1000, 0..=p; else 22023) is at resolve.
+export type TypeMod = { precision: bigint; scale: bigint | null };
 
 // UnaryOp: arithmetic negation `-x` or logical negation `NOT x`.
 export type UnaryOp = "neg" | "not";
@@ -42,7 +52,7 @@ export type BinaryOp =
 export type Expr =
   | { kind: "column"; name: string }
   | { kind: "literal"; literal: Literal }
-  | { kind: "cast"; inner: Expr; typeName: string }
+  | { kind: "cast"; inner: Expr; typeName: string; typeMod: TypeMod | null }
   | { kind: "unary"; op: UnaryOp; operand: Expr }
   | { kind: "binary"; op: BinaryOp; lhs: Expr; rhs: Expr }
   | { kind: "isNull"; operand: Expr; negated: boolean }
@@ -71,7 +81,7 @@ export type OrderKey = { column: string; descending: boolean; nullsFirst: boolea
 
 // ColumnDef is a column definition in a CREATE TABLE. typeName is kept as written and
 // resolved during analysis (the catalog owns the type lattice).
-export type ColumnDef = { name: string; typeName: string; primaryKey: boolean };
+export type ColumnDef = { name: string; typeName: string; typeMod: TypeMod | null; primaryKey: boolean };
 
 // Assignment is one `SET <column> = <value>` clause; value is a general expression
 // evaluated against the pre-update row (so `SET a = b, b = a` swaps).

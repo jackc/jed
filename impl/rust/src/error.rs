@@ -14,6 +14,8 @@ pub enum SqlState {
     NumericValueOutOfRange,
     /// 22012 — division (or modulo) by zero.
     DivisionByZero,
+    /// 22023 — invalid parameter value (e.g. a bad numeric typmod, `numeric(0)`).
+    InvalidParameterValue,
     /// 2201W — invalid row count in a LIMIT clause (a negative LIMIT).
     InvalidRowCountInLimitClause,
     /// 2201X — invalid row count in an OFFSET clause (a negative OFFSET).
@@ -52,6 +54,7 @@ impl SqlState {
         match self {
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::DivisionByZero => "22012",
+            SqlState::InvalidParameterValue => "22023",
             SqlState::InvalidRowCountInLimitClause => "2201W",
             SqlState::InvalidRowCountInOffsetClause => "2201X",
             SqlState::NotNullViolation => "23502",

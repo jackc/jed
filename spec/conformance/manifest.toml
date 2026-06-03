@@ -117,6 +117,14 @@ id = "types.boolean_storable"
 description = "storable boolean column: CREATE/INSERT/SELECT of false/true/NULL, boolean×boolean comparison and ORDER BY (false < true). Non-key column only — a boolean PRIMARY KEY is rejected 0A000; boolean⇄integer casts are deferred (spec/design/types.md §9)"
 
 [[capability]]
+id = "types.decimal"
+description = "decimal / numeric scalar type (exact base-10): the first parameterized type (numeric(p,s)), storage, literals, comparison/ordering, casts (int<->decimal). Non-key column this slice — a decimal PRIMARY KEY is rejected 0A000 (spec/design/decimal.md)"
+
+[[capability]]
+id = "expr.decimal_arithmetic"
+description = "Decimal arithmetic operators + - * / % and unary - with PostgreSQL result-scale rules and half-away-from-zero rounding (spec/design/decimal.md §4)"
+
+[[capability]]
 id = "null.three_valued"
 description = "Three-valued NULL logic in comparisons (CLAUDE.md §4)"
 
@@ -228,3 +236,9 @@ capabilities = [
   "query.is_distinct_from",
   "error.division_by_zero",
 ]
+
+[[profile]]
+id = "decimal"
+title = "expression + the exact decimal / numeric type (numeric(p,s), comparison, casts, arithmetic)"
+includes = "expression"
+capabilities = ["types.decimal", "expr.decimal_arithmetic"]

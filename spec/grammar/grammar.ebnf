@@ -58,11 +58,18 @@ column_def     ::= identifier type_name ("PRIMARY" "KEY")?
  * Each omission is relaxable later (../../TODO.md). */
 drop_table     ::= "DROP" "TABLE" identifier
 
-/* type_name is parsed as a bare identifier and resolved by the catalog
- * (case-insensitively). The accepted names this slice are:
+/* type_name is an identifier, optionally followed by a parenthesized type modifier
+ * (precision, optional scale) — `decimal` is the FIRST parameterized type. The name is
+ * resolved by the catalog (case-insensitively); accepted names:
  *   int16 | smallint | int32 | int | integer | int64 | bigint
- * An unknown name is rejected at execution time (42704), not by the grammar. */
-type_name      ::= identifier
+ *   text | varchar | "character varying" | string
+ *   decimal | numeric | dec
+ * An unknown name is rejected at execution time (42704), not by the grammar. The typmod
+ * is accepted ONLY for decimal/numeric: numeric(p) (= numeric(p,0)) and numeric(p,s),
+ * with 1 <= p <= 1000 and 0 <= s <= p (a bad typmod traps 22023; ../design/grammar.md).
+ * A typmod on a non-decimal type, or empty parens `numeric()`, is a 42601 syntax error.
+ * type_name appears in a column_def and in CAST(expr AS type_name). */
+type_name      ::= identifier ("(" integer ("," integer)? ")")?
 
 /* --- DML ----------------------------------------------------------------- */
 
@@ -198,7 +205,8 @@ multiplicative ::= unary ( ("*" | "/" | "%") unary )*
 unary          ::= "-" unary
                  | primary
 
-primary        ::= integer
+primary        ::= number
+                 | string
                  | "TRUE" | "FALSE"
                  | "NULL"
                  | "CAST" "(" expr "AS" type_name ")"
@@ -206,28 +214,54 @@ primary        ::= integer
                  | identifier
 
 /* INSERT takes literals only (no expressions, no columns). A leading "-" before
- * an integer here is the unary-minus operator applied to the literal, folded at
- * parse time. TRUE/FALSE/NULL are the non-integer literal forms; a TRUE/FALSE
- * literal stores into a boolean column (boolean is storable — ../design/types.md
- * §9) but into an integer or text column is a 42804 type error at execution. */
-literal        ::= "-"? integer
+ * a number here is the unary-minus operator applied to the literal, folded at
+ * parse time. A `number` is an integer or a decimal (with a "." fractional part);
+ * a decimal literal lands in a decimal column (rounded to its scale) and is a 42804
+ * type error against an integer column. TRUE/FALSE/NULL are the non-numeric literal
+ * forms; a TRUE/FALSE literal stores into a boolean column (boolean is storable —
+ * ../design/types.md §9) but into a non-boolean column is a 42804 type error. */
+literal        ::= "-"? number
+                 | string
                  | "TRUE" | "FALSE"
                  | "NULL"
 
 /* --- lexical (token) layer ----------------------------------------------- */
 
-/* An integer is an UNSIGNED magnitude of digits; the sign, if any, is the
- * unary-minus operator (so "- 5" with a space is now legal, and "-5" is the
- * operator applied to "5", folded to a single literal at parse time). The
- * magnitude must be <= 2^63 (9223372036854775808); a larger magnitude is a
- * syntax error (42601, cannot be represented). The single value 2^63 is in
- * range only as the operand of unary minus, where it folds to int64's minimum
- * (-9223372036854775808); a bare 2^63 fits no signed integer type and traps
- * 22003 at resolve time. */
+/* A `number` is an UNSIGNED numeric literal: either an integer or a decimal. The
+ * sign, if any, is the unary-minus operator (so "- 5" with a space is legal, and
+ * "-5" is the operator applied to "5", folded at parse time). The lexer scans one
+ * run of digits-and-an-optional-point and emits an INTEGER token if there is no
+ * "." and a DECIMAL token otherwise — so the integer paths (LIMIT/OFFSET `count`,
+ * the typmod, array arity) are unaffected. */
+number         ::= decimal | integer
+
+/* An integer is an UNSIGNED magnitude of digits; its magnitude must be <= 2^63
+ * (9223372036854775808); a larger magnitude is a syntax error (42601, cannot be
+ * represented). The single value 2^63 is in range only as the operand of unary
+ * minus, where it folds to int64's minimum (-9223372036854775808); a bare 2^63
+ * fits no signed integer type and traps 22003 at resolve time. */
 integer        ::= digit+
+
+/* A decimal literal has a "." with digits on at least one side (`1.5`, `1.`, `.5`,
+ * `0.00`). Its written form fixes its value AND its scale (number of fractional
+ * digits): `1.50` is coefficient 150, scale 2 — distinct in display from `1.5`
+ * (scale 1) though equal in value. The coefficient's significant-digit count must be
+ * <= max_precision and the scale <= max_scale (../types/scalars.toml; else 22003 at
+ * resolve). A decimal literal is an untyped decimal constant that adapts to its
+ * context (../design/types.md §6, extended to decimal). Scientific `e`-notation
+ * (`1.5e3`) is DEFERRED (../design/grammar.md). */
+decimal        ::= digit+ "." digit*
+                 | "." digit+
+
+/* A single-quoted string literal (the `text` type). An embedded single quote is written
+ * by doubling it (`''`) — standard_conforming_strings; there are NO backslash escapes. The
+ * content is UTF-8 and compares by the `C` collation (../design/types.md §11). `char` is any
+ * character other than a single quote. */
+string         ::= "'" ( char | "''" )* "'"
 
 /* Identifiers are ASCII only; there is no quoted-identifier syntax. */
 identifier     ::= (letter | "_") (letter | digit | "_")*
 
 letter         ::= [A-Za-z]
 digit          ::= [0-9]
+char           ::= /* any character except "'" */

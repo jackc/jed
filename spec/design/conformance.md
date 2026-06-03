@@ -26,11 +26,12 @@ problem (CLAUDE.md §7). We use the standard record types:
 
 Conventions, fixed here so every implementation renders identically:
 
-- **coltypes** — one letter per result column: `I` integer, `B` boolean, `T` text, `R`
-  real. The corpus uses `I`, `B`, and `T` (integers, boolean, and text — all storable,
-  CLAUDE.md §4); `R` is reserved for floats. The letter is a **rendering** tag (how a value
+- **coltypes** — one letter per result column: `I` integer, `B` boolean, `T` text, `D`
+  decimal, `R` real. The corpus uses `I`, `B`, `T`, and `D` (integers, boolean, text, and the
+  exact decimal — all storable, CLAUDE.md §4); `R` (binary float) is reserved and may never be
+  used until a float type exists (§4). The letter is a **rendering** tag (how a value
   is printed), *not* a type assertion — asserting the precise declared type (`int16` vs
-  `int32`) is a planned directive, deferred (§7).
+  `int32`, or a decimal's `numeric(p,s)`) is a planned directive, deferred (§7).
 - **values** — printed one per line, **row-major** (row 1's columns, then row 2's, …). A
   single integer renders as its shortest decimal form (no leading zeros, leading `-` for
   negatives). A **boolean renders as the literal `true` or `false`** (lowercase; never
@@ -147,8 +148,11 @@ Every corpus entry MUST obey:
 - **One canonical name, one code.** Types print under their canonical id; each error
   condition has exactly one SQLSTATE.
 - **No nondeterminism.** No wall-clock, no random, no hashmap-order leakage.
-- **No floats.** The scalar set is integers, text, and boolean (no floats or decimals yet),
-  so the float-formatting divergence (CLAUDE.md §8) cannot arise.
+- **No floats.** The scalar set is integers, text, boolean, and the exact `decimal` — **no
+  binary float** (`R`), so the float-formatting divergence (CLAUDE.md §8) cannot arise.
+  `decimal` renders deterministically as a canonical base-10 string preserving its display
+  scale (`1.50` prints `1.50`; [decimal.md](decimal.md) §6), so it is a `D`-tag value, never an
+  `R`-tag one.
 - **Canonical boolean spelling.** A boolean prints as exactly `true`/`false` (NULL as
   `NULL`); no core may emit `t`/`f`, `0`/`1`, or host-cased variants.
 
@@ -185,5 +189,5 @@ profile's capabilities passes. Harnesses arrive with the first vertical slice
   general expression substrate. Rendered under the `B` tag (§1); the `expression` profile (§3)
   gates them; coverage in `suites/expr/`. Boolean as a *storable column type* remains
   deferred (types.md §10).
-- **Render-tag breadth** — `B` joins `I`; `T` (text) and `R` (real) are still reserved for
-  the deferred `text`/float decisions (CLAUDE.md §8).
+- **Render-tag breadth** — `I`, `B`, `T` (text), and `D` (decimal) are in use; `R` (binary
+  float) stays reserved and unused until a float type exists, if ever (CLAUDE.md §8).

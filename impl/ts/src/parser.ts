@@ -15,8 +15,10 @@ import type {
   SelectItem,
   SelectItems,
   Statement,
+  TypeMod,
   Update,
 } from "./ast.ts";
+import { Decimal } from "./decimal.ts";
 import { engineError } from "./errors.ts";
 import { lex } from "./lexer.ts";
 import type { Token, TokenKind } from "./token.ts";
@@ -112,13 +114,37 @@ class Parser {
   private parseColumnDef(): ColumnDef {
     const name = this.expectIdentifier();
     const typeName = this.expectIdentifier();
+    const typeMod = this.parseTypeMod();
     let primaryKey = false;
     if (this.peekKeyword() === "primary") {
       this.advance();
       this.expectKeyword("key");
       primaryKey = true;
     }
-    return { name, typeName, primaryKey };
+    return { name, typeName, typeMod, primaryKey };
+  }
+
+  // parseTypeMod parses an optional parenthesized type modifier `"(" integer ("," integer)? ")"`
+  // after a type name (the first parameterized type, decimal — spec/grammar/grammar.ebnf
+  // type_name). The shape is accepted for any type name; whether a typmod is meaningful (decimal
+  // only) and in range is decided at resolve. Empty parens or a non-integer inside is 42601.
+  private parseTypeMod(): TypeMod | null {
+    if (this.peek().kind !== "lparen") return null;
+    this.advance(); // "("
+    const precision = this.expectTypmodInt();
+    let scale: bigint | null = null;
+    if (this.peek().kind === "comma") {
+      this.advance();
+      scale = this.expectTypmodInt();
+    }
+    this.expect("rparen");
+    return { precision, scale };
+  }
+
+  private expectTypmodInt(): bigint {
+    const t = this.advance();
+    if (t.kind !== "int") throw engineError("syntax_error", "expected an integer type modifier");
+    return t.int!;
   }
 
   // parseDropTable parses `DROP TABLE <name>`. A missing table is rejected at execution
@@ -180,6 +206,11 @@ class Parser {
     }
     const t = this.advance();
     if (t.kind === "int") return { kind: "int", int: foldInt(t.int!, negate) };
+    if (t.kind === "decimal") {
+      // A decimal literal carries the unscaled coefficient + scale; the leading unary minus
+      // (if any) folds into the sign. Cap checks are at resolve.
+      return { kind: "decimal", dec: Decimal.fromDigitsScale(negate, t.decDigits!, t.decScale!) };
+    }
     if (!negate && t.kind === "str") return { kind: "text", text: t.str! };
     if (!negate && t.kind === "word") {
       const w = lower(t.word!);
@@ -496,6 +527,12 @@ class Parser {
         const v = foldInt(this.advance().int!, true);
         return { kind: "literal", literal: { kind: "int", int: v } };
       }
+      // Fold unary-minus of a decimal literal into one negative decimal literal (decimal
+      // negation never overflows).
+      if (this.peek().kind === "decimal") {
+        const t = this.advance();
+        return { kind: "literal", literal: { kind: "decimal", dec: Decimal.fromDigitsScale(true, t.decDigits!, t.decScale!) } };
+      }
       return { kind: "unary", op: "neg", operand: this.parseUnary() };
     }
     return this.parsePrimary();
@@ -516,8 +553,9 @@ class Parser {
       const inner = this.parseExpr();
       this.expectKeyword("as");
       const typeName = this.expectIdentifier();
+      const typeMod = this.parseTypeMod();
       this.expect("rparen");
-      return { kind: "cast", inner, typeName };
+      return { kind: "cast", inner, typeName, typeMod };
     }
     const t = this.peek();
     if (t.kind === "int") {
@@ -525,6 +563,10 @@ class Parser {
       // integer type unless negated (handled by the unary-minus fold).
       const v = foldInt(this.advance().int!, false);
       return { kind: "literal", literal: { kind: "int", int: v } };
+    }
+    if (t.kind === "decimal") {
+      this.advance();
+      return { kind: "literal", literal: { kind: "decimal", dec: Decimal.fromDigitsScale(false, t.decDigits!, t.decScale!) } };
     }
     if (t.kind === "str") {
       this.advance();

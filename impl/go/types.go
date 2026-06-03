@@ -22,7 +22,19 @@ const (
 	// Bool is boolean / bool: false/true stored as the value codec's 1-byte bool-byte
 	// (spec/design/types.md §9).
 	Bool
+	// DecimalType is the exact base-10 decimal / numeric (spec/design/decimal.md). Variable-
+	// width and non-integer; the per-column typmod (precision/scale) lives on the Column, not
+	// here. (Named DecimalType, not Decimal, because Decimal is the value struct.)
+	DecimalType
 )
+
+// DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. Precision >= 1;
+// an unconstrained numeric column carries no typmod (spec/design/decimal.md §2). Validated at
+// resolve (1 <= precision <= 1000, 0 <= scale <= precision; else 22023).
+type DecimalTypmod struct {
+	Precision uint16
+	Scale     uint16
+}
 
 // CanonicalName is the single name used in all output (determinism — CLAUDE.md §10).
 func (t ScalarType) CanonicalName() string {
@@ -37,6 +49,8 @@ func (t ScalarType) CanonicalName() string {
 		return "text"
 	case Bool:
 		return "boolean"
+	case DecimalType:
+		return "decimal"
 	default:
 		return "?"
 	}
@@ -58,6 +72,8 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return Text, true
 	case "boolean", "bool":
 		return Bool, true
+	case "decimal", "numeric", "dec":
+		return DecimalType, true
 	default:
 		return 0, false
 	}
@@ -68,6 +84,12 @@ func (t ScalarType) IsText() bool { return t == Text }
 
 // IsBool reports whether this is the boolean type.
 func (t ScalarType) IsBool() bool { return t == Bool }
+
+// IsDecimal reports whether this is the exact decimal type.
+func (t ScalarType) IsDecimal() bool { return t == DecimalType }
+
+// IsInteger reports whether this is one of the fixed-width signed integer types.
+func (t ScalarType) IsInteger() bool { return t == Int16 || t == Int32 || t == Int64 }
 
 // WidthBytes is the fixed storage width in bytes (the key-encoding width). Integer-only —
 // text is variable-width and carries its own length (spec/fileformat/format.md), so this
@@ -134,5 +156,5 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text, Bool}
+	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType}
 }

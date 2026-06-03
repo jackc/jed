@@ -32,9 +32,16 @@ schema_version = 1
 #               inverted; "bool-byte" = a single byte 0x00 (false) < 0x01 (true);
 #               "text-terminated-escape" = UTF-8 bytes (the `C` collation), each
 #               0x00 escaped to 0x00 0xFF and the string terminated with 0x00 0x01
-#               (order-preserving + self-delimiting — see ../design/encoding.md §2.4).
-#               All sort byte-for-byte identically to logical order. width_bytes is
-#               omitted for variable-width types (text).
+#               (order-preserving + self-delimiting — see ../design/encoding.md §2.4);
+#               "decimal-order-preserving" = sign/class byte + order-preserving
+#               exponent + big-endian base-100 mantissa pairs + terminator (CockroachDB
+#               style — ../design/encoding.md §2.5). All sort byte-for-byte identically
+#               to logical order. width_bytes is omitted for variable-width types
+#               (text, decimal).
+# max_precision for decimal only: the maximum total significant digits a value may carry
+#               (precision p of numeric(p,s)). 1000, PG's declarable max. An unconstrained
+#               `numeric` (no typmod) is capped here too (../design/decimal.md §2).
+# max_scale     for decimal only: the maximum digits after the point (scale s). 1000.
 # rank          position in the integer promotion tower; the common type of two
 #               integers is the one with the higher rank (see compare.toml). Omitted
 #               for non-integer types (boolean and text do not promote).
@@ -127,3 +134,30 @@ family = "text"
 storable = true
 encoding = { method = "text-terminated-escape" }
 collation = "C"
+
+# --- decimal: the exact arbitrary-precision numeric (CLAUDE.md §4) ------------
+# An EXACT base-10 numeric: value = (-1)^sign * coefficient * 10^(-scale), held as a
+# hand-rolled sign + base-10^9 limb coefficient + scale (no binary float anywhere —
+# CLAUDE.md §8). STORABLE this slice with the on-disk value codec (type code 5 —
+# ../fileformat/format.md). The first PARAMETERIZED type: `numeric` (unconstrained),
+# `numeric(p)` (= numeric(p,0)), and `numeric(p,s)` where p = total significant digits
+# (1..=max_precision) and s = digits after the point (0..=p); a bad typmod traps 22023.
+# Coercion to a scale ROUNDS HALF AWAY FROM ZERO (PG numeric; ../design/decimal.md §3),
+# the rounding decision CLAUDE.md §8 deferred. ALWAYS FINITE — no NaN/±Infinity (a
+# documented PG divergence: there is no float source and 0/0 traps 22012). Canonical id
+# is `decimal`; `numeric`/`dec` are accepted aliases. The order-preserving KEY encoding
+# (decimal-order-preserving) is authored (encoding.md §2.5) but UNEXERCISED this slice —
+# a decimal PRIMARY KEY is rejected 0A000 (the text-PK narrowing). No bits/min/max/rank
+# (decimal forms no integer-style promotion tower); no collation; no width_bytes
+# (variable-width). max_precision/max_scale bound an unconstrained value too
+# (../design/decimal.md §2); relax when over-page values land (TODO.md Phase 6).
+[[type]]
+id = "decimal"
+aliases = ["numeric", "dec"]
+family = "decimal"
+storable = true
+overflow = "trap"
+overflow_error = "22003"
+encoding = { method = "decimal-order-preserving" }
+max_precision = 1000
+max_scale = 1000
