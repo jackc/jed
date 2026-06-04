@@ -260,6 +260,16 @@ pub enum Expr {
         rhs: Box<Expr>,
         negated: bool,
     },
+    /// A `CASE` expression (grammar.md §23). Searched form: `operand` is `None`, each `whens`
+    /// condition must be boolean. Simple form: `operand` is `Some(x)`, each branch matches when
+    /// `x = val`. `whens` is `(condition_or_value, result)` pairs (≥1). `els` is the `ELSE`
+    /// result, or `None` for an implicit `ELSE NULL`. Lazily evaluated: the first TRUE branch
+    /// wins; result-arm types unify to a common type.
+    Case {
+        operand: Option<Box<Expr>>,
+        whens: Vec<(Expr, Expr)>,
+        els: Option<Box<Expr>>,
+    },
     /// An aggregate function call — the engine's first function-call syntax (grammar.md §17).
     /// `name` is the spelling as written (resolved case-insensitively against the aggregate
     /// catalog; an unknown name is 42883). `star` is the `COUNT(*)` row-count form (then `arg`

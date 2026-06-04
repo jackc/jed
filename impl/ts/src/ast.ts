@@ -81,6 +81,11 @@ export type Expr =
   // operands must be text; NULL propagates. A genuine operator (not desugared) with a
   // hand-written matcher. `negated` carries the NOT keyword.
   | { kind: "like"; lhs: Expr; rhs: Expr; negated: boolean }
+  // A CASE expression (spec/design/grammar.md §23). Searched form: `operand` is null and each
+  // `whens` condition must be boolean. Simple form: `operand` is non-null and each branch matches
+  // when `operand = cond`. `whens` has ≥1 entry; `els` is the ELSE result, or null for an implicit
+  // `ELSE NULL`. Lazily evaluated: the first TRUE branch wins; result-arm types unify.
+  | { kind: "case"; operand: Expr | null; whens: { cond: Expr; result: Expr }[]; els: Expr | null }
   // An aggregate function call — the engine's first function-call syntax (grammar.md §17).
   // `name` is the spelling as written (resolved case-insensitively against the aggregate
   // catalog; an unknown name is 42883). `star` is the COUNT(*) row-count form (then `arg` is

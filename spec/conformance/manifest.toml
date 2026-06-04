@@ -239,6 +239,10 @@ id = "expr.like"
 description = "text LIKE pattern / NOT LIKE — % matches any run, _ one code point, default \\ escape; text×text→boolean, NULL propagates, non-text 42804; a pattern ending in a lone escape reached during matching is 22025; code-point (not UTF-16) iteration (spec/design/grammar.md §22)"
 
 [[capability]]
+id = "expr.case"
+description = "CASE expression (searched + simple forms): lazy first-match evaluation (later arms not evaluated — the one short-circuit exception); searched WHEN must be boolean (42804); result-arm types unify to a common type (numeric promote; cross-family 42804; all-NULL → text); no match + no ELSE → NULL; output name ?column? (spec/design/grammar.md §23)"
+
+[[capability]]
 id = "error.division_by_zero"
 description = "Integer division / modulo by zero is defined and traps SQLSTATE 22012"
 
@@ -376,4 +380,5 @@ capabilities = [
   "expr.in_list",
   "expr.between",
   "expr.like",
+  "expr.case",
 ]

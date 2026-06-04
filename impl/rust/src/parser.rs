@@ -874,6 +874,39 @@ impl Parser {
                 type_mod,
             });
         }
+        if self.peek_keyword().as_deref() == Some("case") {
+            self.advance();
+            // Simple form has an operand between CASE and the first WHEN; the searched form
+            // starts directly with WHEN (grammar.md §23).
+            let operand = if self.peek_keyword().as_deref() == Some("when") {
+                None
+            } else {
+                Some(Box::new(self.parse_expr()?))
+            };
+            let mut whens = Vec::new();
+            while self.peek_keyword().as_deref() == Some("when") {
+                self.advance();
+                let cond = self.parse_expr()?;
+                self.expect_keyword("then")?;
+                let res = self.parse_expr()?;
+                whens.push((cond, res));
+            }
+            if whens.is_empty() {
+                return Err(syntax("CASE requires at least one WHEN clause"));
+            }
+            let els = if self.peek_keyword().as_deref() == Some("else") {
+                self.advance();
+                Some(Box::new(self.parse_expr()?))
+            } else {
+                None
+            };
+            self.expect_keyword("end")?;
+            return Ok(Expr::Case {
+                operand,
+                whens,
+                els,
+            });
+        }
         match self.peek() {
             Token::Int(m) => {
                 let m = *m;

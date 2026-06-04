@@ -767,7 +767,8 @@ type RExpr =
   | { kind: "or"; lhs: RExpr; rhs: RExpr }
   | { kind: "isNull"; operand: RExpr; negated: boolean }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
-  | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean };
+  | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean }
+  | { kind: "case"; arms: { cond: RExpr; result: RExpr }[]; els: RExpr; coerceDecimal: boolean };
 
 // ============================================================================
 // Aggregate resolution + accumulation (spec/design/aggregates.md).
@@ -906,6 +907,12 @@ function exprHasFuncCall(e: Expr): boolean {
       return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.lo) || exprHasFuncCall(e.hi);
     case "like":
       return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.rhs);
+    case "case":
+      return (
+        (e.operand !== null && exprHasFuncCall(e.operand)) ||
+        e.whens.some((w) => exprHasFuncCall(w.cond) || exprHasFuncCall(w.result)) ||
+        (e.els !== null && exprHasFuncCall(e.els))
+      );
     default:
       return false;
   }
@@ -1311,6 +1318,42 @@ function resolve(
       requireTextOrNull(p.rt);
       return { node: { kind: "like", lhs: p.rl, rhs: p.rr, negated: e.negated }, type: { kind: "bool" } };
     }
+    case "case": {
+      // Resolve each branch's condition: searched form requires a boolean WHEN (42804
+      // otherwise); simple form desugars to `operand = value` (reusing the `=` operand pairing +
+      // comparability check, so the value adapts to the operand's type). The operand is evaluated
+      // once per tested branch (the desugar model, like IN).
+      const arms: { cond: RExpr; result: RExpr }[] = [];
+      const resultTypes: ResolvedType[] = [];
+      for (const w of e.whens) {
+        let cond: RExpr;
+        if (e.operand !== null) {
+          const eq: Expr = { kind: "binary", op: "eq", lhs: e.operand, rhs: w.cond };
+          cond = resolve(scope, eq, null, ag).node;
+        } else {
+          const rc = resolve(scope, w.cond, null, ag);
+          requireBool(rc.type, "CASE WHEN condition must be boolean");
+          cond = rc.node;
+        }
+        const rres = resolve(scope, w.result, null, ag);
+        resultTypes.push(rres.type);
+        arms.push({ cond, result: rres.node });
+      }
+      let els: RExpr;
+      if (e.els !== null) {
+        const re = resolve(scope, e.els, null, ag);
+        els = re.node;
+        resultTypes.push(re.type);
+      } else {
+        els = { kind: "constNull" };
+        resultTypes.push({ kind: "null" });
+      }
+      const unified = unifyCaseTypes(resultTypes);
+      return {
+        node: { kind: "case", arms, els, coerceDecimal: unified.kind === "decimal" },
+        type: unified,
+      };
+    }
   }
 }
 
@@ -1485,6 +1528,46 @@ function requireBool(t: ResolvedType, msg: string): void {
 // type error (spec/design/grammar.md §22).
 function requireTextOrNull(t: ResolvedType): void {
   if (t.kind !== "text" && t.kind !== "null") throw typeError("LIKE requires text operands");
+}
+
+// unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or "null" for an
+// implicit ELSE) into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped
+// (they adapt); an all-NULL CASE is text (PostgreSQL). The non-NULL arms must share a family — all
+// numeric unify to decimal if any is decimal, else the widest integer (the promotion tower);
+// otherwise they must all be the same non-numeric family (text/boolean/bytea). A cross-family mix
+// is 42804.
+function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
+  const nonNull = arms.filter((t) => t.kind !== "null");
+  if (nonNull.length === 0) return { kind: "text" }; // every arm NULL/untyped → text
+  let allNumeric = true;
+  let anyDecimal = false;
+  for (const t of nonNull) {
+    if (t.kind !== "int" && t.kind !== "decimal") allNumeric = false;
+    if (t.kind === "decimal") anyDecimal = true;
+  }
+  if (allNumeric) {
+    if (anyDecimal) return { kind: "decimal" };
+    // All integer: the widest via the promotion tower (width is unobservable in output — every
+    // integer renders under the `I` tag — but the fold keeps the type precise).
+    let acc = nonNull[0]!;
+    for (const t of nonNull.slice(1)) acc = { kind: "int", ty: promote(acc, t) };
+    return acc;
+  }
+  // Non-numeric: every arm must be the same family as the first (cross-family is 42804).
+  const first = nonNull[0]!;
+  for (const t of nonNull.slice(1)) {
+    if (t.kind !== first.kind) throw typeError("CASE result types must be compatible");
+  }
+  return first;
+}
+
+// coerceCaseValue coerces a CASE arm's value to the unified result type. The only runtime
+// coercion needed is widening an integer result to decimal when the unified type is decimal —
+// integer-width unification needs none (all integers are bigint), and an all-NULL CASE is text but
+// every arm evaluates to NULL anyway.
+function coerceCaseValue(v: Value, toDecimal: boolean): Value {
+  if (toDecimal && v.kind === "int") return decimalValue(Decimal.fromBigInt(v.int));
+  return v;
 }
 
 // requireAssignable: a value assigned to a column must match its family — an integer column
@@ -1720,6 +1803,21 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
       }
       // negated carries NOT LIKE: matched !== negated flips the result for NOT LIKE.
       return { kind: "bool", value: likeMatch(subject.text, pattern.text) !== e.negated };
+    }
+    case "case": {
+      // CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are
+      // evaluated in order and evaluation STOPS at the first TRUE — a FALSE or NULL/UNKNOWN
+      // condition falls through, and later arms (and their results) are NOT evaluated. Required
+      // for PG semantics (e.g. `CASE WHEN a=0 THEN 0 ELSE 1/a END` must not divide by zero).
+      // Charge the node, then only the conditions up to the match plus the selected result.
+      m.charge(COSTS.operatorEval);
+      for (const arm of e.arms) {
+        const cv = evalExpr(arm.cond, row, m);
+        if (cv.kind === "bool" && cv.value) {
+          return coerceCaseValue(evalExpr(arm.result, row, m), e.coerceDecimal);
+        }
+      }
+      return coerceCaseValue(evalExpr(e.els, row, m), e.coerceDecimal);
     }
   }
 }

@@ -797,6 +797,30 @@ class Parser {
       this.expect("rparen");
       return { kind: "cast", inner, typeName, typeMod };
     }
+    if (this.peekKeyword() === "case") {
+      this.advance();
+      // Simple form has an operand between CASE and the first WHEN; the searched form starts
+      // directly with WHEN (grammar.md §23).
+      const operand = this.peekKeyword() === "when" ? null : this.parseExpr();
+      const whens: { cond: Expr; result: Expr }[] = [];
+      while (this.peekKeyword() === "when") {
+        this.advance();
+        const cond = this.parseExpr();
+        this.expectKeyword("then");
+        const result = this.parseExpr();
+        whens.push({ cond, result });
+      }
+      if (whens.length === 0) {
+        throw engineError("syntax_error", "CASE requires at least one WHEN clause");
+      }
+      let els: Expr | null = null;
+      if (this.peekKeyword() === "else") {
+        this.advance();
+        els = this.parseExpr();
+      }
+      this.expectKeyword("end");
+      return { kind: "case", operand, whens, els };
+    }
     const t = this.peek();
     if (t.kind === "int") {
       // The only magnitude > int64 max the lexer admits is 2^63, which fits no signed

@@ -779,3 +779,39 @@ operator (one `[[operator]]` catalog row, `name = "like"`, text×text → boolea
 - **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the `like` node (like a `compare`);
   the match loop itself is unmetered, like `eq3` and the `ORDER BY` sort. Output name for a
   bare `SELECT s LIKE …` is `?column?` (§8).
+
+## 23. `CASE`
+
+`CASE` is the SQL conditional expression, a primary like `CAST`
+(`case_expr ::= "CASE" expr? ( "WHEN" expr "THEN" expr )+ ( "ELSE" expr )? "END"`). It comes in
+two forms and is the **first deliberately lazy** expression in the engine.
+
+- **Two forms.** The **searched** form `CASE WHEN cond THEN r … [ELSE e] END` has no operand
+  before the first `WHEN`; each `cond` must resolve to **boolean** (`42804` otherwise, like
+  `WHERE`). The **simple** form `CASE x WHEN v THEN r … [ELSE e] END` has an operand `x`; each
+  branch matches when **`x = v`**. The simple form desugars each branch to the equality
+  `x = v` at resolve, reusing the `=` operand pairing and comparability check (the value `v`
+  adapts to `x`'s type; an incomparable `v` is `42804`). At least one `WHEN` is required (a
+  `CASE … END` with none is a `42601` syntax error).
+- **Lazy first-match evaluation — the one short-circuit.** Conditions are evaluated in source
+  order and evaluation **stops at the first TRUE** branch, returning that `THEN`. A FALSE or
+  NULL/UNKNOWN condition falls through (a NULL `WHEN` is *not* true — like `WHERE`). With no
+  matching branch, the `ELSE` result is returned, or **NULL** if there is no `ELSE` (an implicit
+  `ELSE NULL`). Later arms are **never evaluated**, so `CASE WHEN a = 0 THEN 0 ELSE 1 / a END`
+  does not divide by zero on the `a = 0` rows — this is the sanctioned exception to the
+  no-short-circuit cost rule ([cost.md](cost.md) §3), and it stays deterministic because the
+  order is fixed.
+- **Result-arm type unification.** The `THEN` results and the `ELSE` (or NULL for an implicit
+  ELSE) unify to one **common type** — the CASE's output type. The rule: NULL-typed arms are
+  dropped (they adapt); an **all-NULL CASE is `text`** (PostgreSQL — verified against the live
+  oracle); the remaining arms must share a family — all numeric unify to `decimal` if any is
+  decimal else the widest integer (the promotion tower), and a numeric integer result widens to
+  decimal at eval when the common type is decimal (so `CASE WHEN c THEN 1 ELSE 1.5 END` renders
+  `1` / `1.5`); a non-numeric family (text/boolean/bytea) must be homogeneous. A **cross-family**
+  mix — e.g. an integer `THEN` and a text `ELSE` — is **`42804`** ("CASE types … cannot be
+  matched"). Bare integer-literal arms keep their natural width (defaulting to int64), so width
+  differences from PostgreSQL are unobservable (every integer renders under the `I` tag).
+- **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the CASE node, plus the
+  `operator_eval`s of the conditions tested up to the match and of the selected result only
+  (the lazy-eval exception). Output name for a bare `SELECT CASE … END` is `?column?` (§8) —
+  any non-column expression.

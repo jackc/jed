@@ -1047,6 +1047,7 @@ const (
 	reIsNull
 	reDistinct
 	reLike
+	reCase
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -1067,6 +1068,20 @@ type rExpr struct {
 	rhs     *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
 	operand *rExpr         // reCast, reNeg, reNot, reIsNull
 	negated bool           // reIsNull, reDistinct
+
+	// reCase: (condition, result) arms, the ELSE result (constNull for an implicit ELSE), and
+	// whether the unified result type is decimal (so integer results widen to decimal at eval).
+	caseArms    []rCaseArm
+	caseEls     *rExpr
+	caseDecimal bool
+}
+
+// rCaseArm is one resolved (condition, result) branch of a reCase node (spec/design/grammar.md
+// §23). The condition is the searched boolean predicate, or the simple form's resolved
+// `operand = value` equality.
+type rCaseArm struct {
+	cond   *rExpr
+	result *rExpr
 }
 
 // ============================================================================
@@ -1261,6 +1276,16 @@ func exprHasFuncCall(e Expr) bool {
 		return exprHasFuncCall(e.Between.Lhs) || exprHasFuncCall(e.Between.Lo) || exprHasFuncCall(e.Between.Hi)
 	case ExprLike:
 		return exprHasFuncCall(e.Like.Lhs) || exprHasFuncCall(e.Like.Rhs)
+	case ExprCase:
+		if e.Case.Operand != nil && exprHasFuncCall(*e.Case.Operand) {
+			return true
+		}
+		for _, w := range e.Case.Whens {
+			if exprHasFuncCall(w.Cond) || exprHasFuncCall(w.Result) {
+				return true
+			}
+		}
+		return e.Case.Els != nil && exprHasFuncCall(*e.Case.Els)
 	default:
 		return false
 	}
@@ -1743,6 +1768,57 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		}
 		return &rExpr{kind: reLike, lhs: rl, rhs: rr, negated: e.Like.Negated},
 			resolvedType{kind: rtBool}, nil
+	case ExprCase:
+		// Resolve each branch's condition: searched form requires a boolean WHEN (42804
+		// otherwise); simple form desugars to `operand = value` (reusing the `=` operand pairing
+		// + comparability check, so the value adapts to the operand's type). The operand is
+		// evaluated once per tested branch (the desugar model, like IN).
+		arms := make([]rCaseArm, 0, len(e.Case.Whens))
+		resultTypes := make([]resolvedType, 0, len(e.Case.Whens)+1)
+		for _, w := range e.Case.Whens {
+			var rcond *rExpr
+			if e.Case.Operand != nil {
+				eq := binaryExpr(OpEq, *e.Case.Operand, w.Cond)
+				rc, _, err := resolve(s, eq, nil, ag)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				rcond = rc
+			} else {
+				rc, cty, err := resolve(s, w.Cond, nil, ag)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				if err := requireBool(cty, "CASE WHEN condition must be boolean"); err != nil {
+					return nil, resolvedType{}, err
+				}
+				rcond = rc
+			}
+			rres, rty, err := resolve(s, w.Result, nil, ag)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			resultTypes = append(resultTypes, rty)
+			arms = append(arms, rCaseArm{cond: rcond, result: rres})
+		}
+		var rels *rExpr
+		if e.Case.Els != nil {
+			r, ety, err := resolve(s, *e.Case.Els, nil, ag)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			rels = r
+			resultTypes = append(resultTypes, ety)
+		} else {
+			rels = &rExpr{kind: reConstNull}
+			resultTypes = append(resultTypes, resolvedType{kind: rtNull})
+		}
+		unified, err := unifyCaseTypes(resultTypes)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reCase, caseArms: arms, caseEls: rels, caseDecimal: unified.kind == rtDecimal},
+			unified, nil
 	default: // ExprBinary
 		return resolveBinary(s, e.Binary, ag)
 	}
@@ -1938,6 +2014,65 @@ func requireTextOrNull(t resolvedType) error {
 		return nil
 	}
 	return typeError("LIKE requires text operands")
+}
+
+// unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or rtNull for an
+// implicit ELSE) into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped
+// (they adapt); an all-NULL CASE is text (PostgreSQL). The non-NULL arms must share a family — all
+// numeric unify to decimal if any is decimal, else the widest integer (the promotion tower);
+// otherwise they must all be the same non-numeric family (text/boolean/bytea). A cross-family mix
+// is 42804.
+func unifyCaseTypes(arms []resolvedType) (resolvedType, error) {
+	nonNull := make([]resolvedType, 0, len(arms))
+	for _, t := range arms {
+		if t.kind != rtNull {
+			nonNull = append(nonNull, t)
+		}
+	}
+	if len(nonNull) == 0 {
+		// Every arm is NULL/untyped — PostgreSQL types the CASE as text.
+		return resolvedType{kind: rtText}, nil
+	}
+	allNumeric, anyDecimal := true, false
+	for _, t := range nonNull {
+		if t.kind != rtInt && t.kind != rtDecimal {
+			allNumeric = false
+		}
+		if t.kind == rtDecimal {
+			anyDecimal = true
+		}
+	}
+	if allNumeric {
+		if anyDecimal {
+			return resolvedType{kind: rtDecimal}, nil
+		}
+		// All integer: the widest via the promotion tower (width is unobservable in output —
+		// every integer renders under the `I` tag — but the fold keeps the type precise).
+		acc := nonNull[0]
+		for _, t := range nonNull[1:] {
+			acc = resolvedType{kind: rtInt, intTy: promote(acc, t)}
+		}
+		return acc, nil
+	}
+	// Non-numeric: every arm must be the same family as the first (cross-family is 42804).
+	first := nonNull[0]
+	for _, t := range nonNull[1:] {
+		if t.kind != first.kind {
+			return resolvedType{}, typeError("CASE result types must be compatible")
+		}
+	}
+	return first, nil
+}
+
+// coerceCase coerces a CASE arm's value to the unified result type. The only runtime coercion
+// needed is widening an integer result to decimal when the unified type is decimal — integer-width
+// unification needs none (all integers are int64), and an all-NULL CASE is text but every arm
+// evaluates to NULL anyway.
+func coerceCase(v Value, toDecimal bool) Value {
+	if toDecimal && v.Kind == ValInt {
+		return DecimalValue(DecimalFromInt64(v.Int))
+	}
+	return v
 }
 
 // requireAssignable: a value assigned to a column must match its family — an integer column
@@ -2173,6 +2308,31 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		}
 		// negated carries NOT LIKE: matched != negated flips the result for NOT LIKE.
 		return BoolValue(matched != e.negated), nil
+	case reCase:
+		// CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are
+		// evaluated in order and evaluation STOPS at the first TRUE — a FALSE or NULL/UNKNOWN
+		// condition falls through, and later arms (and their results) are NOT evaluated. Required
+		// for PG semantics (e.g. `CASE WHEN a=0 THEN 0 ELSE 1/a END` must not divide by zero).
+		// Charge the node, then only the conditions up to the match plus the selected result.
+		m.Charge(Costs.OperatorEval)
+		for _, arm := range e.caseArms {
+			cv, err := arm.cond.eval(row, m)
+			if err != nil {
+				return Value{}, err
+			}
+			if cv.Kind == ValBool && cv.Bool {
+				rv, err := arm.result.eval(row, m)
+				if err != nil {
+					return Value{}, err
+				}
+				return coerceCase(rv, e.caseDecimal), nil
+			}
+		}
+		ev, err := e.caseEls.eval(row, m)
+		if err != nil {
+			return Value{}, err
+		}
+		return coerceCase(ev, e.caseDecimal), nil
 	default: // reDistinct
 		m.Charge(Costs.OperatorEval)
 		a, err := e.lhs.eval(row, m)

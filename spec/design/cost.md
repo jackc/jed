@@ -73,6 +73,20 @@ TS; any deviation diverges the count and fails the corpus.
   are pure functions over already-computed operand values, never control flow. The seam
   **must not introduce** a short-circuit: skipping the RHS in one core when the LHS is
   FALSE/NULL would drop that core's operand evals and diverge the count.
+- **`CASE` is the one deliberate exception to no-short-circuit.** A `CASE`
+  ([grammar.md](grammar.md) §23) charges its own `operator_eval` for the node, then evaluates
+  its `WHEN` conditions **in source order, stopping at the first one that is TRUE** — a FALSE
+  or NULL/UNKNOWN condition falls through. Only the conditions tested **up to and including the
+  match**, plus the **selected** result (the matching `THEN`, or the `ELSE`, or nothing for an
+  implicit `ELSE NULL`), are evaluated and charged; later arms are **not** evaluated. This
+  short-circuit is *required* by PostgreSQL semantics — `CASE WHEN a = 0 THEN 0 ELSE 1 / a END`
+  must not divide by zero on the `a = 0` rows — so it is a sanctioned exception, not a seam
+  violation. It stays deterministic per `(query, db state)` because the evaluation order (first
+  match wins, conditions left to right) is fixed across cores, so which arms accrue is itself
+  deterministic. (A consequence, like `DISTINCT`'s, is observable: `CASE WHEN true THEN 0 ELSE
+  1/0 END` succeeds and costs *less* than the eager form would, because the `1/0` arm is never
+  reached. The simple form `CASE x WHEN v …` desugars each branch to `x = v`, so the operand is
+  evaluated once per tested branch — the same per-branch model as `IN`'s LHS.)
 - **Pre-order, LHS-before-RHS.** A node charges itself, then evaluates its left operand,
   then its right. The order does not change the **total** (a sum is order-independent),
   but it fixes the deterministic **abort point** for the deferred ceiling (§6) identically

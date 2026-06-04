@@ -293,9 +293,21 @@ primary        ::= number
                  | "TRUE" | "FALSE"
                  | "NULL"
                  | "CAST" "(" expr "AS" type_name ")"
+                 | case_expr
                  | function_call
                  | "(" expr ")"
                  | column_ref
+
+/* A CASE expression (../design/grammar.md §23), a primary like CAST. Two forms: the SEARCHED
+ * form has no operand before the first WHEN and each WHEN takes a boolean predicate; the SIMPLE
+ * form has an operand and each WHEN takes a value compared for equality to it (`CASE x WHEN v
+ * ...` is `x = v`). At least one WHEN is required (zero is a 42601 syntax error). With no
+ * matching branch and no ELSE the result is NULL. The result-arm types (the THENs and ELSE)
+ * unify to one common type (42804 if incompatible); an all-NULL CASE is text. CASE is the one
+ * deliberately LAZY expression: the first TRUE branch wins and later arms are not evaluated
+ * (../design/cost.md §3). CASE/WHEN/THEN/ELSE/END are not reserved (§3), disambiguated
+ * positionally. */
+case_expr      ::= "CASE" expr? ( "WHEN" expr "THEN" expr )+ ( "ELSE" expr )? "END"
 
 /* The engine's FIRST function-call syntax. This slice introduces ONLY the AGGREGATE
  * functions (../functions/catalog.toml, kind = "aggregate") — COUNT/SUM/MIN/MAX/AVG; an

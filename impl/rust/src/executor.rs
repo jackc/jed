@@ -1115,6 +1115,16 @@ enum RExpr {
         rhs: Box<RExpr>,
         negated: bool,
     },
+    /// A resolved `CASE` (grammar.md §23). `arms` is `(condition, result)` pairs — the condition
+    /// is the searched boolean predicate, or the simple form's resolved `operand = value`
+    /// equality. `els` is the ELSE result (`ConstNull` for an implicit ELSE). Evaluated lazily:
+    /// the first TRUE condition's result wins. `coerce_decimal` is set when the unified result
+    /// type is decimal, so integer results widen to decimal at eval.
+    Case {
+        arms: Vec<(RExpr, RExpr)>,
+        els: Box<RExpr>,
+        coerce_decimal: bool,
+    },
 }
 
 // ============================================================================
@@ -1325,6 +1335,17 @@ fn expr_has_funccall(e: &Expr) -> bool {
             expr_has_funccall(lhs) || expr_has_funccall(lo) || expr_has_funccall(hi)
         }
         Expr::Like { lhs, rhs, .. } => expr_has_funccall(lhs) || expr_has_funccall(rhs),
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            operand.as_deref().is_some_and(expr_has_funccall)
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_has_funccall(c) || expr_has_funccall(r))
+                || els.as_deref().is_some_and(expr_has_funccall)
+        }
     }
 }
 
@@ -1829,6 +1850,49 @@ fn resolve(
                 ResolvedType::Bool,
             ))
         }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            // Resolve each branch's condition: searched form requires a boolean WHEN (42804
+            // otherwise); simple form desugars to `operand = value` (reusing the `=` operand
+            // pairing + comparability check, so the value adapts to the operand's type). The
+            // operand is evaluated once per tested branch (the desugar model, like IN).
+            let mut arms: Vec<(RExpr, RExpr)> = Vec::with_capacity(whens.len());
+            let mut result_types: Vec<ResolvedType> = Vec::with_capacity(whens.len() + 1);
+            for (cond, res) in whens {
+                let rcond = match operand {
+                    Some(op) => {
+                        let eq = binary_expr(BinaryOp::Eq, (**op).clone(), cond.clone());
+                        resolve(scope, &eq, None, agg)?.0
+                    }
+                    None => {
+                        let (rc, cty) = resolve(scope, cond, None, agg)?;
+                        require_bool(cty, "CASE WHEN condition must be boolean")?;
+                        rc
+                    }
+                };
+                let (rres, rty) = resolve(scope, res, None, agg)?;
+                result_types.push(rty);
+                arms.push((rcond, rres));
+            }
+            let (rels, ety) = match els {
+                Some(e) => resolve(scope, e, None, agg)?,
+                None => (RExpr::ConstNull, ResolvedType::Null),
+            };
+            result_types.push(ety);
+            // Unify the THEN/ELSE result types into the CASE's common type (the render type).
+            let unified = unify_case_types(&result_types)?;
+            Ok((
+                RExpr::Case {
+                    arms,
+                    els: Box::new(rels),
+                    coerce_decimal: unified == ResolvedType::Decimal,
+                },
+                unified,
+            ))
+        }
     }
 }
 
@@ -2051,6 +2115,57 @@ fn require_text_or_null(ty: ResolvedType) -> Result<()> {
     match ty {
         ResolvedType::Text | ResolvedType::Null => Ok(()),
         _ => Err(type_error("LIKE requires text operands")),
+    }
+}
+
+/// Unify a CASE's result-arm types (the THEN results + the ELSE, or `Null` for an implicit
+/// ELSE) into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped (they
+/// adapt); an all-NULL CASE is `text` (PostgreSQL). The non-NULL arms must share a family — all
+/// numeric unify to `decimal` if any is decimal, else the widest integer (the promotion tower);
+/// otherwise they must all be the same non-numeric family (text/boolean/bytea). A cross-family
+/// mix (e.g. integer and text) is 42804.
+fn unify_case_types(arms: &[ResolvedType]) -> Result<ResolvedType> {
+    let non_null: Vec<ResolvedType> = arms
+        .iter()
+        .copied()
+        .filter(|t| *t != ResolvedType::Null)
+        .collect();
+    let Some(&first) = non_null.first() else {
+        // Every arm is NULL/untyped — PostgreSQL types the CASE as text.
+        return Ok(ResolvedType::Text);
+    };
+    let all_numeric = non_null
+        .iter()
+        .all(|t| matches!(t, ResolvedType::Int(_) | ResolvedType::Decimal));
+    if all_numeric {
+        if non_null.iter().any(|t| *t == ResolvedType::Decimal) {
+            return Ok(ResolvedType::Decimal);
+        }
+        // All integer: the widest via the promotion tower (width is unobservable in output —
+        // every integer renders under the `I` tag — but the fold keeps the type precise).
+        let mut acc = first;
+        for t in &non_null[1..] {
+            acc = ResolvedType::Int(promote(acc, *t));
+        }
+        return Ok(acc);
+    }
+    // Non-numeric: every arm must be the same family as the first (cross-family is 42804).
+    for t in &non_null[1..] {
+        if std::mem::discriminant(t) != std::mem::discriminant(&first) {
+            return Err(type_error("CASE result types must be compatible"));
+        }
+    }
+    Ok(first)
+}
+
+/// Coerce a CASE arm's value to the unified result type. The only runtime coercion needed is
+/// widening an integer result to decimal when the unified type is decimal — integer-width
+/// unification needs none (all integers are `i64`), and an all-NULL CASE is text but every arm
+/// evaluates to NULL anyway.
+fn coerce_case(v: Value, to_decimal: bool) -> Value {
+    match (to_decimal, v) {
+        (true, Value::Int(n)) => Value::Decimal(Decimal::from_i64(n)),
+        (_, v) => v,
     }
 }
 
@@ -2512,6 +2627,25 @@ impl RExpr {
                 let matched = like_match(s, p)?;
                 // `negated` carries NOT LIKE: matched != negated flips the result for NOT LIKE.
                 Ok(Value::Bool(matched != *negated))
+            }
+            RExpr::Case {
+                arms,
+                els,
+                coerce_decimal,
+            } => {
+                // CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3):
+                // conditions are evaluated in order and evaluation STOPS at the first TRUE — a
+                // FALSE or NULL/UNKNOWN condition falls through, and later arms (and their
+                // results) are NOT evaluated. This is required for PG semantics (e.g.
+                // `CASE WHEN a=0 THEN 0 ELSE 1/a END` must not divide by zero). Charge the node,
+                // then only the conditions up to the match plus the selected result accrue.
+                m.charge(COSTS.operator_eval);
+                for (cond, result) in arms {
+                    if cond.eval(row, m)?.is_true() {
+                        return Ok(coerce_case(result.eval(row, m)?, *coerce_decimal));
+                    }
+                }
+                Ok(coerce_case(els.eval(row, m)?, *coerce_decimal))
             }
         }
     }

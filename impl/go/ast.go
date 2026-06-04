@@ -217,6 +217,9 @@ const (
 	// ExprLike is `lhs LIKE rhs` / `lhs NOT LIKE rhs` — a text pattern match with a dedicated
 	// matcher (spec/design/grammar.md §22).
 	ExprLike
+	// ExprCase is a CASE expression (searched or simple form), lazily evaluated
+	// (spec/design/grammar.md §23).
+	ExprCase
 )
 
 // UnaryOp is a unary operator.
@@ -276,6 +279,7 @@ type Expr struct {
 	In         *InExpr         // ExprIn
 	Between    *BetweenExpr    // ExprBetween
 	Like       *LikeExpr       // ExprLike
+	Case       *CaseExpr       // ExprCase
 }
 
 // CastExpr is CAST(Inner AS TypeName). TypeMod is the optional numeric(p[,s]) modifier.
@@ -357,6 +361,23 @@ type LikeExpr struct {
 	Lhs     Expr
 	Rhs     Expr
 	Negated bool
+}
+
+// CaseExpr is a CASE expression (spec/design/grammar.md §23). Searched form: Operand is nil and
+// each When.Cond must be boolean. Simple form: Operand is non-nil and each branch matches when
+// `Operand = When.Cond`. Whens has ≥1 entry. Els is the ELSE result, or nil for an implicit
+// `ELSE NULL`. Lazily evaluated: the first TRUE branch wins; result-arm types unify.
+type CaseExpr struct {
+	Operand *Expr
+	Whens   []CaseWhen
+	Els     *Expr
+}
+
+// CaseWhen is one `WHEN cond THEN result` branch of a CaseExpr (Cond is the searched predicate,
+// or the simple form's value compared for equality to the operand).
+type CaseWhen struct {
+	Cond   Expr
+	Result Expr
 }
 
 // OrderKey is one ORDER BY sort key: a bare table column, a sort direction, and a resolved

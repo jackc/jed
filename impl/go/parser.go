@@ -1128,6 +1128,51 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		}
 		return Expr{Kind: ExprCast, Cast: &CastExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod}}, nil
 	}
+	if p.peekKeyword() == "case" {
+		p.advance()
+		// Simple form has an operand between CASE and the first WHEN; the searched form starts
+		// directly with WHEN (grammar.md §23).
+		var operand *Expr
+		if p.peekKeyword() != "when" {
+			op, err := p.parseExpr()
+			if err != nil {
+				return Expr{}, err
+			}
+			operand = &op
+		}
+		var whens []CaseWhen
+		for p.peekKeyword() == "when" {
+			p.advance()
+			cond, err := p.parseExpr()
+			if err != nil {
+				return Expr{}, err
+			}
+			if err := p.expectKeyword("then"); err != nil {
+				return Expr{}, err
+			}
+			res, err := p.parseExpr()
+			if err != nil {
+				return Expr{}, err
+			}
+			whens = append(whens, CaseWhen{Cond: cond, Result: res})
+		}
+		if len(whens) == 0 {
+			return Expr{}, NewError(SyntaxError, "CASE requires at least one WHEN clause")
+		}
+		var els *Expr
+		if p.peekKeyword() == "else" {
+			p.advance()
+			e, err := p.parseExpr()
+			if err != nil {
+				return Expr{}, err
+			}
+			els = &e
+		}
+		if err := p.expectKeyword("end"); err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprCase, Case: &CaseExpr{Operand: operand, Whens: whens, Els: els}}, nil
+	}
 	t := p.peek()
 	switch {
 	case t.Kind == TokInt:

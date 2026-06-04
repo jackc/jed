@@ -1,0 +1,94 @@
+# CASE expression — searched and simple forms (spec/design/grammar.md §23). The first TRUE
+# branch wins; a FALSE or NULL/UNKNOWN WHEN falls through; no match with no ELSE is NULL. CASE
+# is the one deliberately LAZY expression: later arms are NOT evaluated, so a `1/0` in an
+# unreached arm does not trap (and costs nothing). Result-arm types unify (numeric promote;
+# cross-family 42804; all-NULL → text). The simple form `CASE x WHEN v …` is `x = v` per branch.
+# Verified against PostgreSQL 18.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, expr.case, expr.comparison_value, expr.arithmetic, error.division_by_zero, types.int32, types.text, types.decimal, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 0), (3, 20), (4, NULL)
+
+# Searched CASE: the first TRUE branch wins; the NULL `a` row matches no WHEN (UNKNOWN is not
+# true) and takes the ELSE. Cost is DATA-DEPENDENT and proves laziness: row a=20 matches the
+# first WHEN, so the second condition is not evaluated (cost 2, not 3). Per row: 1 (case node) +
+# 1 per condition TESTED + 0 (leaf result). a=10:3, a=0:3, a=20:2, a=NULL:3 = 11; +4 scan +4
+# produced = 19.
+# names: ?column?
+# cost: 19
+query I nosort
+SELECT CASE WHEN a > 15 THEN 2 WHEN a > 5 THEN 1 ELSE 0 END FROM t ORDER BY id
+----
+1
+0
+2
+0
+
+# No matching branch and no ELSE → NULL.
+query I nosort
+SELECT CASE WHEN a > 100 THEN 1 END FROM t ORDER BY id
+----
+NULL
+NULL
+NULL
+NULL
+
+# Simple form: `CASE a WHEN v …` matches when `a = v`. The NULL `a` row falls through to ELSE
+# (a NULL = v is UNKNOWN, not a match).
+query T nosort
+SELECT CASE a WHEN 0 THEN 'zero' WHEN 10 THEN 'ten' ELSE 'other' END FROM t ORDER BY id
+----
+ten
+zero
+other
+other
+
+# Result-arm unification: an integer THEN and a decimal ELSE unify to decimal, and the integer
+# arm widens (renders '1', not '1.0'); the decimal arm keeps its scale ('1.5').
+query D nosort
+SELECT CASE WHEN a > 5 THEN 1 ELSE 1.5 END FROM t ORDER BY id
+----
+1
+1.5
+1
+1.5
+
+# All-NULL arms unify to text (the PostgreSQL rule); every row is NULL, rendered under T.
+query T nosort
+SELECT CASE WHEN a > 5 THEN NULL ELSE NULL END FROM t ORDER BY id
+----
+NULL
+NULL
+NULL
+NULL
+
+# A one-row table to prove laziness directly: the first WHEN is TRUE, so neither the later WHEN
+# (whose `1/0` would trap 22012) nor the ELSE is evaluated — the query succeeds and the cost
+# reflects only the case node + the first (constant, leaf) condition = 1 per row.
+statement ok
+CREATE TABLE one (id int32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# names: ?column?
+# cost: 3
+query I nosort
+SELECT CASE WHEN true THEN 100 WHEN 1 / 0 = 0 THEN 200 ELSE 300 END FROM one
+----
+100
+
+# A searched WHEN that is not boolean is a type error (the column `a` is int32).
+statement error 42804
+SELECT CASE WHEN a THEN 1 ELSE 0 END FROM t
+
+# Cross-family result arms (an integer column and a text column) cannot be unified — 42804.
+statement ok
+CREATE TABLE m (id int32 PRIMARY KEY, i int32, s text)
+
+statement error 42804
+SELECT CASE WHEN true THEN i ELSE s END FROM m
