@@ -251,18 +251,26 @@ and_expr       ::= not_expr ("AND" not_expr)*
 not_expr       ::= "NOT" not_expr
                  | comparison
 
-/* Comparison, IS [NOT] NULL, and IS [NOT] DISTINCT FROM are NON-associative: at
- * most one of them applies to a pair/operand of additive expressions, so
- * "a = b = c" and "a IS DISTINCT FROM b IS DISTINCT FROM c" are syntax errors
- * (42601). IS [NOT] NULL is a postfix test binding at the comparison level, so
- * "a + 1 IS NULL" parses as "(a + 1) IS NULL". IS [NOT] DISTINCT FROM is NULL-safe
- * equality (a comparison with total NULL handling — functions.md §3); both its
+/* Comparison, IS [NOT] NULL, IS [NOT] DISTINCT FROM, and the predicate forms
+ * [NOT] IN are all NON-associative: at most one of them applies to a pair/operand of
+ * additive expressions, so "a = b = c" and "a IS DISTINCT FROM b IS DISTINCT FROM c"
+ * are syntax errors (42601). IS [NOT] NULL is a postfix test binding at the comparison
+ * level, so "a + 1 IS NULL" parses as "(a + 1) IS NULL". IS [NOT] DISTINCT FROM is
+ * NULL-safe equality (a comparison with total NULL handling — functions.md §3); both its
  * operands are additive, so "a IS DISTINCT FROM b + 1" parses as
  * "a IS DISTINCT FROM (b + 1)". The leading "IS" is shared: after "IS" "NOT"? the
- * parser dispatches on "NULL" vs "DISTINCT". */
+ * parser dispatches on "NULL" vs "DISTINCT".
+ *   "NOT"? "IN" "(" ... ")" is the membership predicate (../design/grammar.md §20),
+ * also at the comparison level. A "NOT" before "IN" is the predicate negation (NOT IN);
+ * the parsers take it with a two-token lookahead (the prefix "NOT" was already consumed
+ * by not_expr) and only when "IN" follows. The list is one or more additive expressions;
+ * an empty "IN ()" is a 42601 syntax error. PostgreSQL binds IN slightly tighter than the
+ * comparison operators; collapsing it into this one non-associative level is a documented
+ * narrowing (unobservable, since chaining comparisons is already a syntax error here). */
 comparison     ::= additive ( compare_op additive
                             | "IS" "NOT"? "NULL"
-                            | "IS" "NOT"? "DISTINCT" "FROM" additive )?
+                            | "IS" "NOT"? "DISTINCT" "FROM" additive
+                            | "NOT"? "IN" "(" additive ("," additive)* ")" )?
 
 compare_op     ::= "=" | "<" | ">" | "<=" | ">="   /* no "<>" and no "!=" */
 

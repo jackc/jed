@@ -899,6 +899,8 @@ function exprHasFuncCall(e: Expr): boolean {
     case "binary":
     case "isDistinct":
       return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.rhs);
+    case "in":
+      return exprHasFuncCall(e.lhs) || e.list.some(exprHasFuncCall);
     default:
       return false;
   }
@@ -1261,6 +1263,26 @@ function resolve(
     }
     case "binary":
       return resolveBinary(scope, e.op, e.lhs, e.rhs, ag);
+    case "in": {
+      // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` is
+      // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list is
+      // non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree reuses the
+      // `=`/OR/NOT machinery verbatim, so the three-valued NULL semantics, per-element operand
+      // typing (a too-wide literal → 22003, a cross-family element → 42804), and cost all fall
+      // out. The LHS is evaluated once per element (the OR-chain model — a documented cost
+      // consequence, cost.md §3).
+      let folded: Expr | null = null;
+      for (const elem of e.list) {
+        const eq: Expr = { kind: "binary", op: "eq", lhs: e.lhs, rhs: elem };
+        folded = folded === null ? eq : { kind: "binary", op: "or", lhs: folded, rhs: eq };
+      }
+      // folded is non-null: the parser guarantees a non-empty list.
+      let desugared = folded as Expr;
+      if (e.negated) {
+        desugared = { kind: "unary", op: "not", operand: desugared };
+      }
+      return resolve(scope, desugared, ctx, ag);
+    }
   }
 }
 

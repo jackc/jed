@@ -720,6 +720,31 @@ impl Parser {
                 negated,
             });
         }
+        // `NOT`? `IN` (...) — a `NOT` here is consumed only when followed by the `IN`
+        // keyword (two-token lookahead; the prefix `NOT` was already taken by parse_not).
+        // These postfix predicates bind at the comparison level (35), non-associative
+        // (grammar.md §20).
+        let negated = self.peek_keyword().as_deref() == Some("not")
+            && self.peek_keyword_at(1).as_deref() == Some("in");
+        if negated {
+            self.advance(); // NOT
+        }
+        if self.peek_keyword().as_deref() == Some("in") {
+            self.advance();
+            self.expect(&Token::LParen)?;
+            // A non-empty value list (`IN ()` is rejected: parse_additive on `)` is 42601).
+            let mut list = vec![self.parse_additive()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                list.push(self.parse_additive()?);
+            }
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::In {
+                lhs: Box::new(lhs),
+                list,
+                negated,
+            });
+        }
         let op = match self.peek() {
             Token::Eq => Some(BinaryOp::Eq),
             Token::Lt => Some(BinaryOp::Lt),
@@ -929,6 +954,16 @@ impl Parser {
     pub fn peek_keyword(&self) -> Option<String> {
         match self.peek() {
             Token::Word(w) => Some(w.to_ascii_lowercase()),
+            _ => None,
+        }
+    }
+
+    /// The keyword (lowercased) `offset` tokens ahead of the cursor, if that token is a word.
+    /// Used for the two-token `NOT IN`/`NOT BETWEEN`/`NOT LIKE` lookahead (a CLAUDE.md §8
+    /// determinism surface — byte-identical across the three parsers).
+    pub fn peek_keyword_at(&self, offset: usize) -> Option<String> {
+        match self.tokens.get(self.pos + offset) {
+            Some(Token::Word(w)) => Some(w.to_ascii_lowercase()),
             _ => None,
         }
     }

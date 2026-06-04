@@ -64,6 +64,12 @@ export type Expr =
   // keyword: true is `IS NOT DISTINCT FROM` (NULL-safe `=`), false is `IS DISTINCT FROM`
   // (its negation). Always boolean-valued, never unknown (spec/design/functions.md §3).
   | { kind: "isDistinct"; lhs: Expr; rhs: Expr; negated: boolean }
+  // `lhs IN (list)` / `lhs NOT IN (list)` — membership over a non-empty value list
+  // (spec/design/grammar.md §20). Desugared at resolve into the OR-chain PostgreSQL defines it
+  // as (`x IN (a,b)` is `x = a OR x = b`; NOT IN is its negation), inheriting the three-valued
+  // NULL semantics and per-element operand typing from `=`/OR/NOT. The parser guarantees `list`
+  // is non-empty (`IN ()` is 42601).
+  | { kind: "in"; lhs: Expr; list: Expr[]; negated: boolean }
   // An aggregate function call — the engine's first function-call syntax (grammar.md §17).
   // `name` is the spelling as written (resolved case-insensitively against the aggregate
   // catalog; an unknown name is 42883). `star` is the COUNT(*) row-count form (then `arg` is

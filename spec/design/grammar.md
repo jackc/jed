@@ -671,3 +671,41 @@ it, like `WHERE`). Semantics live in [aggregates.md](aggregates.md) §8; this is
   **group** evaluated (every group, since the filter must test each); a dropped group then
   charges no `row_produced` — the same project-vs-produce asymmetry `DISTINCT` has. The filter
   itself (the keep/drop decision) is unmetered.
+
+## 20. `IN (list)` / `NOT IN`
+
+`x IN (v1, v2, …)` is the **membership predicate**: TRUE iff `x` equals any list element. It
+extends `comparison` with `"NOT"? "IN" "(" additive ("," additive)* ")"`, a **non-associative
+postfix form at the comparison level** (precedence 35), alongside `=`/`IS NULL`/`IS DISTINCT
+FROM`. `NOT IN` is the negation. The whole form is the first of the Phase-2 predicate forms
+(§20–§23); it is built on the Phase-1 expression substrate and adds no new value type.
+
+- **Semantics = the OR-chain PostgreSQL defines it as.** `x IN (a,b,c)` is exactly
+  `x = a OR x = b OR x = c`, and `x NOT IN (a,b,c)` is its negation `NOT (x = a OR …)` =
+  `x <> a AND x <> b AND …`. The engine **desugars** to that tree at resolve time
+  (`Expr::In` → `Binary{Or, …}` of `Binary{Eq}`, wrapped in `Unary{Not}` when negated), so
+  every property below is inherited from `=`/`OR`/`NOT` rather than re-specified.
+- **Three-valued NULL** falls out of the Kleene OR. A NULL `x`, or a non-matching list with a
+  NULL element, yields UNKNOWN (rendered NULL): `1 IN (2, NULL)` is NULL, `NULL IN (1,2)` is
+  NULL. But a matching element still wins (TRUE dominates): `1 IN (1, NULL)` is TRUE. `NOT IN`
+  propagates the same way: `1 NOT IN (2, NULL)` is NULL, `1 NOT IN (1, NULL)` is FALSE. This is
+  the classic SQL `NOT IN`-with-NULL gotcha, and it matches PostgreSQL by construction.
+- **Per-element typing** reuses the `=` operand contract (the promotion tower + literal
+  adaptation): each element is paired with `x`, so a bare integer literal element adapts to
+  `x`'s type and a value too wide for it traps **22003** at resolve (`int16col IN (100000)`),
+  and a cross-family element (`intcol IN (1, 'a')`) is **42804**. A decimal element compares by
+  exact value (`1.5 IN (1.50)` is TRUE), an int↔decimal mix promotes, text compares by the `C`
+  collation.
+- **The list is non-empty.** `x IN ()` is a **42601** syntax error (the parser requires at
+  least one element; PostgreSQL rejects the empty list too). The `IN (subquery)` form is a
+  separate, later feature (Phase 4 subqueries) — this slice is the value-list form only.
+- **Precedence narrowing.** PostgreSQL binds `IN` slightly tighter than the comparison
+  operators; the engine collapses it into the single non-associative comparison level. This is
+  unobservable here because chaining comparisons (`a = b IN (…)`) is already a 42601 syntax
+  error regardless of the relative precedence.
+- **Cost** ([cost.md](cost.md) §3): the desugared tree's interior nodes are charged normally —
+  `n` `eq` nodes + `n−1` `or` nodes (+1 `not` for `NOT IN`). Because the OR-chain re-uses `x`
+  in every comparison, **the LHS is evaluated once per list element** (a deliberate consequence
+  of the desugar model); for a bare-column `x` that is a free leaf, so the cost is just the
+  comparison/connective nodes. Output column name for a bare `SELECT x IN (…)` is the fixed
+  `?column?` (§8), like any non-column expression.

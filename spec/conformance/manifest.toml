@@ -224,6 +224,12 @@ description = "Comparisons produce boolean values usable in the SELECT list and 
 id = "query.logical_connectives"
 description = "AND / OR / NOT with three-valued (Kleene) truth tables"
 
+# Predicate forms (Phase 2, spec/design/grammar.md §20-§23). IN/BETWEEN are sugar over the
+# existing =/OR/AND/NOT machinery; LIKE is a text operator; CASE is a primary-level form.
+[[capability]]
+id = "expr.in_list"
+description = "x IN (list) / NOT IN — membership over a non-empty value list, desugared to the OR-chain (x = a OR x = b …); three-valued NULL (1 IN (2,NULL) is NULL); per-element typing (too-wide literal 22003, cross-family 42804); empty IN () is 42601 (spec/design/grammar.md §20)"
+
 [[capability]]
 id = "error.division_by_zero"
 description = "Integer division / modulo by zero is defined and traps SQLSTATE 22012"
@@ -352,4 +358,12 @@ title = "grouping + HAVING — a boolean filter over grouped rows, after aggrega
 includes = "grouping"
 capabilities = [
   "query.having",
+]
+
+[[profile]]
+id = "predicates"
+title = "decimal + the predicate forms IN / BETWEEN / LIKE / CASE (Phase 2, spec/design/grammar.md §20-§23)"
+includes = "decimal"
+capabilities = [
+  "expr.in_list",
 ]

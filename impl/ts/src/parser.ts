@@ -671,6 +671,25 @@ class Parser {
       this.expectKeyword("null");
       return { kind: "isNull", operand: lhs, negated };
     }
+    // `NOT`? `IN` (...) — a `NOT` here is consumed only when followed by the `IN` keyword
+    // (two-token lookahead; the prefix `NOT` was already taken by parseNot). A non-associative
+    // postfix predicate at the comparison level (spec/design/grammar.md §20).
+    const inNegated = this.peekKeyword() === "not" && this.peekKeywordAt(1) === "in";
+    if (inNegated) {
+      this.advance(); // NOT
+    }
+    if (this.peekKeyword() === "in") {
+      this.advance();
+      this.expect("lparen");
+      // A non-empty value list (`IN ()` — parseAdditive on `)` is a 42601 syntax error).
+      const list = [this.parseAdditive()];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        list.push(this.parseAdditive());
+      }
+      this.expect("rparen");
+      return { kind: "in", lhs, list, negated: inNegated };
+    }
     let op: BinaryOp;
     switch (this.peek().kind) {
       case "eq":
@@ -834,6 +853,14 @@ class Parser {
   private peekKeyword(): string {
     const t = this.peek();
     return t.kind === "word" ? lower(t.word!) : "";
+  }
+
+  // peekKeywordAt returns the keyword (lowercased) `offset` tokens ahead of the cursor if that
+  // token is a word, else "". Used for the two-token NOT IN/BETWEEN/LIKE lookahead (a
+  // CLAUDE.md §8 determinism surface — byte-identical across the three parsers).
+  private peekKeywordAt(offset: number): string {
+    const t = this.tokens[this.pos + offset];
+    return t !== undefined && t.kind === "word" ? lower(t.word!) : "";
   }
 
   private advance(): Token {

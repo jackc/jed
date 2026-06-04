@@ -231,6 +231,16 @@ pub enum Expr {
         rhs: Box<Expr>,
         negated: bool,
     },
+    /// `lhs IN (list)` / `lhs NOT IN (list)` — membership over a non-empty value list
+    /// (grammar.md §20). Desugared at resolve into the OR-chain PostgreSQL defines it as
+    /// (`x IN (a,b)` ≡ `x = a OR x = b`; `NOT IN` is its negation), so the three-valued NULL
+    /// semantics and per-element operand typing are inherited from `=`/OR/NOT. The parser
+    /// guarantees `list` is non-empty (`IN ()` is 42601).
+    In {
+        lhs: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
     /// An aggregate function call — the engine's first function-call syntax (grammar.md §17).
     /// `name` is the spelling as written (resolved case-insensitively against the aggregate
     /// catalog; an unknown name is 42883). `star` is the `COUNT(*)` row-count form (then `arg`

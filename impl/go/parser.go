@@ -928,6 +928,37 @@ func (p *Parser) parseComparison() (Expr, error) {
 		}
 		return Expr{Kind: ExprIsNull, IsNullOf: &IsNullExpr{Operand: lhs, Negated: negated}}, nil
 	}
+	// `NOT`? `IN` (...) — a `NOT` here is consumed only when followed by the `IN` keyword
+	// (two-token lookahead; the prefix `NOT` was already taken by parseNot). A non-associative
+	// postfix predicate at the comparison level (spec/design/grammar.md §20).
+	inNegated := p.peekKeyword() == "not" && p.peekKeywordAt(1) == "in"
+	if inNegated {
+		p.advance() // NOT
+	}
+	if p.peekKeyword() == "in" {
+		p.advance()
+		if err := p.expect(TokLParen); err != nil {
+			return Expr{}, err
+		}
+		// A non-empty value list (`IN ()` — parseAdditive on `)` is a 42601 syntax error).
+		first, err := p.parseAdditive()
+		if err != nil {
+			return Expr{}, err
+		}
+		list := []Expr{first}
+		for p.peek().Kind == TokComma {
+			p.advance()
+			elem, err := p.parseAdditive()
+			if err != nil {
+				return Expr{}, err
+			}
+			list = append(list, elem)
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprIn, In: &InExpr{Lhs: lhs, List: list, Negated: inNegated}}, nil
+	}
 	var op BinaryOp
 	switch p.peek().Kind {
 	case TokEq:
@@ -1178,6 +1209,18 @@ func (p *Parser) peekKeyword() string {
 	t := p.peek()
 	if t.Kind == TokWord {
 		return toLowerASCII(t.Word)
+	}
+	return ""
+}
+
+// peekKeywordAt returns the keyword (lowercased) offset tokens ahead of the cursor if that
+// token is a word, else "". Used for the two-token NOT IN/BETWEEN/LIKE lookahead (a
+// CLAUDE.md §8 determinism surface — byte-identical across the three parsers).
+func (p *Parser) peekKeywordAt(offset int) string {
+	if p.pos+offset < len(p.tokens) {
+		if t := p.tokens[p.pos+offset]; t.Kind == TokWord {
+			return toLowerASCII(t.Word)
+		}
 	}
 	return ""
 }

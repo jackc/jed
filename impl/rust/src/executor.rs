@@ -1309,6 +1309,18 @@ fn expr_has_funccall(e: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             expr_has_funccall(lhs) || expr_has_funccall(rhs)
         }
+        Expr::In { lhs, list, .. } => {
+            expr_has_funccall(lhs) || list.iter().any(expr_has_funccall)
+        }
+    }
+}
+
+/// Build a binary-operator `Expr` node (used by the IN/BETWEEN desugar in `resolve`).
+fn binary_expr(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+    Expr::Binary {
+        op,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
     }
 }
 
@@ -1740,6 +1752,31 @@ fn resolve(
             ))
         }
         Expr::Binary { op, lhs, rhs } => resolve_binary(scope, *op, lhs, rhs, agg),
+        Expr::In { lhs, list, negated } => {
+            // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` ≡
+            // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list
+            // is non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree
+            // reuses the `=`/OR/NOT machinery verbatim, so the three-valued NULL semantics,
+            // per-element operand typing (a too-wide literal → 22003, a cross-family element →
+            // 42804), and cost all fall out. The LHS is evaluated once per element (the
+            // OR-chain model — a documented cost consequence, cost.md §3).
+            let mut folded: Option<Expr> = None;
+            for elem in list {
+                let eq = binary_expr(BinaryOp::Eq, (**lhs).clone(), elem.clone());
+                folded = Some(match folded {
+                    None => eq,
+                    Some(acc) => binary_expr(BinaryOp::Or, acc, eq),
+                });
+            }
+            let mut desugared = folded.expect("IN list is non-empty (parser guarantees ≥1)");
+            if *negated {
+                desugared = Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(desugared),
+                };
+            }
+            resolve(scope, &desugared, ctx, agg)
+        }
     }
 }
 

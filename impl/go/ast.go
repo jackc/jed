@@ -208,6 +208,9 @@ const (
 	// ExprFuncCall is an aggregate function call — the first function-call syntax
 	// (spec/design/grammar.md §17). Only aggregates resolve this slice.
 	ExprFuncCall
+	// ExprIn is `lhs IN (list)` / `lhs NOT IN (list)` — membership over a non-empty
+	// value list, desugared at resolve to the OR-chain (spec/design/grammar.md §20).
+	ExprIn
 )
 
 // UnaryOp is a unary operator.
@@ -264,6 +267,7 @@ type Expr struct {
 	IsNullOf   *IsNullExpr     // ExprIsNull
 	IsDistinct *IsDistinctExpr // ExprIsDistinct
 	FuncCall   *FuncCallExpr   // ExprFuncCall
+	In         *InExpr         // ExprIn
 }
 
 // CastExpr is CAST(Inner AS TypeName). TypeMod is the optional numeric(p[,s]) modifier.
@@ -312,6 +316,17 @@ type FuncCallExpr struct {
 	Name string
 	Arg  *Expr
 	Star bool
+}
+
+// InExpr is `Lhs IN (List)` / `Lhs NOT IN (List)` — membership over a non-empty value list
+// (spec/design/grammar.md §20). Desugared at resolve into the OR-chain PostgreSQL defines it
+// as (`x IN (a,b)` is `x = a OR x = b`; NOT IN is its negation), inheriting the three-valued
+// NULL semantics and per-element operand typing from `=`/OR/NOT. The parser guarantees List is
+// non-empty (`IN ()` is 42601).
+type InExpr struct {
+	Lhs     Expr
+	List    []Expr
+	Negated bool
 }
 
 // OrderKey is one ORDER BY sort key: a bare table column, a sort direction, and a resolved

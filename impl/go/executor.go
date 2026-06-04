@@ -1246,6 +1246,16 @@ func exprHasFuncCall(e Expr) bool {
 		return exprHasFuncCall(e.Binary.Lhs) || exprHasFuncCall(e.Binary.Rhs)
 	case ExprIsDistinct:
 		return exprHasFuncCall(e.IsDistinct.Lhs) || exprHasFuncCall(e.IsDistinct.Rhs)
+	case ExprIn:
+		if exprHasFuncCall(e.In.Lhs) {
+			return true
+		}
+		for _, elem := range e.In.List {
+			if exprHasFuncCall(elem) {
+				return true
+			}
+		}
+		return false
 	default:
 		return false
 	}
@@ -1678,6 +1688,27 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		}
 		return &rExpr{kind: reDistinct, lhs: rl, rhs: rr, negated: e.IsDistinct.Negated},
 			resolvedType{kind: rtBool}, nil
+	case ExprIn:
+		// Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` is
+		// `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list is
+		// non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree reuses
+		// the `=`/OR/NOT machinery verbatim, so the three-valued NULL semantics, per-element
+		// operand typing (a too-wide literal → 22003, a cross-family element → 42804), and cost
+		// all fall out. The LHS is evaluated once per element (the OR-chain model — a documented
+		// cost consequence, cost.md §3).
+		var folded Expr
+		for i, elem := range e.In.List {
+			eq := binaryExpr(OpEq, e.In.Lhs, elem)
+			if i == 0 {
+				folded = eq
+			} else {
+				folded = binaryExpr(OpOr, folded, eq)
+			}
+		}
+		if e.In.Negated {
+			folded = Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: folded}}
+		}
+		return resolve(s, folded, ctx, ag)
 	default: // ExprBinary
 		return resolveBinary(s, e.Binary, ag)
 	}
