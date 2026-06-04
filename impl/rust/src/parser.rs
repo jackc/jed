@@ -296,6 +296,8 @@ impl Parser {
 
         let group_by = self.parse_group_by()?;
 
+        let having = self.parse_having()?;
+
         let order_by = self.parse_order_by()?;
 
         let (limit, offset) = self.parse_limit_offset()?;
@@ -307,10 +309,22 @@ impl Parser {
             joins,
             filter,
             group_by,
+            having,
             order_by,
             limit,
             offset,
         })
+    }
+
+    /// `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and before ORDER BY.
+    /// `HAVING` is not reserved, so it is a clause only in this position; the predicate is a
+    /// general expression (it may reference aggregates) checked for boolean at resolve.
+    fn parse_having(&mut self) -> Result<Option<Expr>> {
+        if self.peek_keyword().as_deref() != Some("having") {
+            return Ok(None);
+        }
+        self.advance(); // HAVING
+        Ok(Some(self.parse_expr()?))
     }
 
     /// `group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` (grammar.md §18). Parsed after
@@ -979,6 +993,7 @@ fn is_table_ref_stop_keyword(kw: &str) -> bool {
         kw,
         "where"
             | "group"
+            | "having"
             | "order"
             | "limit"
             | "offset"

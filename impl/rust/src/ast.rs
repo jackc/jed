@@ -157,6 +157,10 @@ pub struct Select {
     /// empty means no GROUP BY. Each is a `Column` or `QualifiedColumn` (the parser restricts
     /// it to `column_ref`). With keys present the query groups (spec/design/grammar.md §18).
     pub group_by: Vec<Expr>,
+    /// The HAVING predicate (a boolean filter over the grouped rows), if any. May reference
+    /// aggregates and grouping keys; evaluated after aggregation, before ORDER BY. HAVING makes
+    /// a query an aggregate query even with no GROUP BY (spec/design/grammar.md §19).
+    pub having: Option<Expr>,
     /// ORDER BY sort keys, applied left to right; empty means no ORDER BY
     /// (spec/design/grammar.md §10).
     pub order_by: Vec<OrderKey>,

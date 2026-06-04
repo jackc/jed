@@ -548,7 +548,10 @@ impl Database {
         // resolves in Collect mode — aggregates collect into synthetic slots and a non-grouped
         // column is 42803 (spec/design/aggregates.md §4/§6); a plain query resolves in Forbidden
         // mode (columns normal; a stray aggregate would be 42803). Output names per grammar.md §8.
-        let is_agg = !group_keys.is_empty() || items_have_aggregate(&sel.items);
+        // GROUP BY, an aggregate in the select list, OR a HAVING clause all make this an
+        // aggregate query (HAVING alone groups the whole table — grammar.md §19).
+        let is_agg =
+            !group_keys.is_empty() || items_have_aggregate(&sel.items) || sel.having.is_some();
         let mut agg_ctx = if is_agg {
             AggCtx::Collect {
                 group_keys: group_keys.clone(),
@@ -558,6 +561,20 @@ impl Database {
             AggCtx::Forbidden
         };
         let (projections, column_names) = resolve_projections(&scope, &sel.items, &mut agg_ctx)?;
+        // HAVING resolves against the same grouped scope (Collect) — it may reference aggregates
+        // (collected into the SAME specs, so their slots follow the projection's) and grouping
+        // keys; a non-grouped column is 42803. It must be boolean (42804). Resolved after the
+        // projection so the synthetic row is [group_keys..., projection aggs..., HAVING aggs...].
+        let having = match &sel.having {
+            Some(h) => {
+                let (node, ty) = resolve(&scope, h, None, &mut agg_ctx)?;
+                match ty {
+                    ResolvedType::Bool | ResolvedType::Null => Some(node),
+                    _ => return Err(type_error("argument of HAVING must be boolean")),
+                }
+            }
+            None => None,
+        };
         let agg_specs: Vec<AggSpec> = match agg_ctx {
             AggCtx::Collect { specs, .. } => specs,
             AggCtx::Forbidden => Vec::new(),
@@ -811,6 +828,19 @@ impl Database {
                     srow.push(acc.finalize()?);
                 }
                 group_rows.push(srow);
+            }
+            // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The
+            // predicate is evaluated against each group's synthetic row (charging its
+            // operator_evals per group); only a TRUE result keeps the group. A dropped group
+            // then charges no row_produced (spec/design/aggregates.md §8).
+            if let Some(h) = &having {
+                let mut kept: Vec<Vec<Value>> = Vec::with_capacity(group_rows.len());
+                for srow in group_rows {
+                    if h.eval(&srow, &mut meter)?.is_true() {
+                        kept.push(srow);
+                    }
+                }
+                group_rows = kept;
             }
             // ORDER BY over the grouped output (keys are synthetic group-key slots).
             if !order.is_empty() {

@@ -43,6 +43,7 @@ function isTableRefStopKeyword(kw: string): boolean {
   switch (kw) {
     case "where":
     case "group":
+    case "having":
     case "order":
     case "limit":
     case "offset":
@@ -326,6 +327,8 @@ class Parser {
 
     const groupBy = this.parseGroupBy();
 
+    const having = this.parseHaving();
+
     const orderBy = this.parseOrderBy();
 
     let limit: bigint | null = null;
@@ -345,7 +348,16 @@ class Parser {
       }
     }
 
-    return { kind: "select", distinct, items, from, joins, filter, groupBy, orderBy, limit, offset };
+    return { kind: "select", distinct, items, from, joins, filter, groupBy, having, orderBy, limit, offset };
+  }
+
+  // parseHaving parses `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and
+  // before ORDER BY. `HAVING` is not reserved; the predicate is a general expression (it may
+  // reference aggregates) checked for boolean at resolve.
+  private parseHaving(): Expr | null {
+    if (this.peekKeyword() !== "having") return null;
+    this.advance(); // HAVING
+    return this.parseExpr();
   }
 
   // parseGroupBy parses `group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` (grammar.md

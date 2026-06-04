@@ -188,10 +188,11 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   (after aggregation, before `LIMIT`/`OFFSET`); a non-grouping column is `42803`
   ([grammar.md](grammar.md) §18). `SELECT DISTINCT` in an aggregate query is still deferred
   (`0A000`).
-- **`HAVING`** (slice 3) — a boolean predicate over grouped rows, evaluated after
-  aggregation and before `ORDER BY`; may reference aggregates (even ones not projected) and
-  grouping keys; non-boolean is `42804`. Allowed with no `GROUP BY` (filters the single
-  whole-table group). Full §section lands with the slice.
+- **`HAVING`** (landed) — a boolean predicate over grouped rows (§8), evaluated after
+  aggregation and before `ORDER BY`; may reference aggregates (even ones not projected — they
+  collect into the same synthetic row) and grouping keys; a non-grouped column is `42803`,
+  non-boolean is `42804`. Allowed with no `GROUP BY` (filters the single whole-table group),
+  and HAVING alone makes a query an aggregate query ([grammar.md](grammar.md) §19).
 - **Deferred / out of scope**: `COUNT(DISTINCT x)` and any `DISTINCT` inside an aggregate;
   `GROUP BY` by expression / ordinal / output alias; the PG **functional-dependency**
   relaxation of the grouping rule (a column functionally dependent on a grouped PK); and

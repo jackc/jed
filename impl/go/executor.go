@@ -515,11 +515,28 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	// resolves in collect mode — aggregates collect into synthetic slots and a non-grouped
 	// column is 42803 (spec/design/aggregates.md §4/§6); a plain query resolves in Forbidden
 	// mode (columns normal). Output names per grammar.md §8.
-	isAgg := len(groupKeys) > 0 || itemsHaveAggregate(sel.Items)
+	// GROUP BY, an aggregate in the select list, OR a HAVING clause all make this an aggregate
+	// query (HAVING alone groups the whole table — grammar.md §19).
+	isAgg := len(groupKeys) > 0 || itemsHaveAggregate(sel.Items) || sel.Having != nil
 	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys}
 	projections, columnNames, err := resolveProjections(s, sel.Items, projAgg)
 	if err != nil {
 		return Outcome{}, err
+	}
+	// HAVING resolves against the same grouped scope (collect) — it may reference aggregates
+	// (collected into the SAME specs, so their slots follow the projection's) and grouping keys;
+	// a non-grouped column is 42803. It must be boolean (42804). Resolved after the projection so
+	// the synthetic row is [group_keys..., projection aggs..., HAVING aggs...].
+	var having *rExpr
+	if sel.Having != nil {
+		node, ty, herr := resolve(s, *sel.Having, nil, projAgg)
+		if herr != nil {
+			return Outcome{}, herr
+		}
+		if ty.kind != rtBool && ty.kind != rtNull {
+			return Outcome{}, typeError("argument of HAVING must be boolean")
+		}
+		having = node
 	}
 	aggSpecs := projAgg.specs
 	// SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
@@ -813,6 +830,22 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 				srow = append(srow, v)
 			}
 			groupRows = append(groupRows, srow)
+		}
+		// HAVING: filter the grouped rows (after aggregation, before ORDER BY). The predicate is
+		// evaluated against each group's synthetic row (charging its operator_evals per group);
+		// only a TRUE result keeps the group. A dropped group charges no row_produced (§8).
+		if having != nil {
+			kept := groupRows[:0:0]
+			for _, srow := range groupRows {
+				v, herr := having.eval(srow, meter)
+				if herr != nil {
+					return Outcome{}, herr
+				}
+				if v.IsTrue() {
+					kept = append(kept, srow)
+				}
+			}
+			groupRows = kept
 		}
 		// ORDER BY over the grouped output (keys are synthetic group-key slots).
 		if len(order) > 0 {

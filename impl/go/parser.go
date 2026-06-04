@@ -429,6 +429,10 @@ func (p *Parser) parseSelect() (*Select, error) {
 		return nil, err
 	}
 
+	if err := p.parseHaving(sel); err != nil {
+		return nil, err
+	}
+
 	if err := p.parseOrderBy(sel); err != nil {
 		return nil, err
 	}
@@ -557,7 +561,7 @@ func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
 // CLAUDE.md §8 cross-core determinism surface (spec/design/grammar.md §15).
 func isTableRefStopKeyword(kw string) bool {
 	switch kw {
-	case "where", "group", "order", "limit", "offset",
+	case "where", "group", "having", "order", "limit", "offset",
 		"join", "inner", "cross", "left", "right", "full", "outer", "on", "as":
 		return true
 	default:
@@ -600,6 +604,22 @@ func (p *Parser) parseGroupBy(sel *Select) error {
 		}
 		break
 	}
+	return nil
+}
+
+// parseHaving parses `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and
+// before ORDER BY. `HAVING` is not reserved; the predicate is a general expression (it may
+// reference aggregates) checked for boolean at resolve.
+func (p *Parser) parseHaving(sel *Select) error {
+	if p.peekKeyword() != "having" {
+		return nil
+	}
+	p.advance() // HAVING
+	h, err := p.parseExpr()
+	if err != nil {
+		return err
+	}
+	sel.Having = &h
 	return nil
 }
 

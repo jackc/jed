@@ -1,0 +1,62 @@
+# HAVING — a boolean filter over the GROUPED rows, after aggregation and before ORDER BY
+# (spec/design/aggregates.md §8, grammar.md §19). It may reference aggregates (even ones not in
+# the SELECT list) and grouping keys; a non-grouped column is 42803, a non-boolean HAVING is
+# 42804. HAVING with no GROUP BY filters the single whole-table group, and HAVING alone makes a
+# query an aggregate query. Each aggregate call is its own accumulator (the projected COUNT(*)
+# and a HAVING COUNT(*) are two specs), and HAVING's predicate is evaluated per group (cost.md).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.having, query.order_by, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, g int32, a int32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 50)
+
+# HAVING on a projected aggregate: keep groups with COUNT(*) > 1 (g=1, g=2; g=3 has count 1).
+# 5 scanned + 2 specs x 5 accumulate (projected COUNT + HAVING COUNT) + 3 HAVING evals (one per
+# group) + 2 produced = 20.
+# names: g, count
+# cost: 20
+query II nosort
+SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 1 ORDER BY g
+----
+1
+2
+2
+2
+
+# HAVING on an aggregate NOT in the SELECT list: SUM(a) is computed only for the filter.
+# 5 scanned + 1 spec x 5 accumulate + 3 HAVING evals + 1 produced = 14.
+# names: g
+# cost: 14
+query I nosort
+SELECT g FROM t GROUP BY g HAVING SUM(a) > 60 ORDER BY g
+----
+2
+
+# HAVING with no GROUP BY filters the single whole-table group: 5 > 10 is false -> zero rows.
+# 5 scanned + 2 specs x 5 accumulate + 1 HAVING eval + 0 produced = 16.
+# names: count
+# cost: 16
+query I nosort
+SELECT COUNT(*) FROM t HAVING COUNT(*) > 10
+----
+
+# ... and the same filter passing keeps the one row.
+# names: count
+query I nosort
+SELECT COUNT(*) FROM t HAVING COUNT(*) > 0
+----
+5
+
+# A non-boolean HAVING is 42804 (like WHERE).
+statement error 42804
+SELECT g FROM t GROUP BY g HAVING SUM(a)
+
+# A non-grouped column in HAVING is 42803 (the grouping-error rule).
+statement error 42803
+SELECT g, COUNT(*) FROM t GROUP BY g HAVING a > 0
+
+# HAVING alone makes a query an aggregate query: a non-grouped SELECT column is then 42803.
+statement error 42803
+SELECT a FROM t HAVING COUNT(*) > 0

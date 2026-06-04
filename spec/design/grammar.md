@@ -646,4 +646,28 @@ sorts the output rows by that group value; a key that is **not** a grouping colu
 `42803` (the grouping-error rule again). The sort runs on the group rows after aggregation,
 before `LIMIT`/`OFFSET`. (`ORDER BY` by an aggregate or an ordinal stays out — `sort_key` is
 a bare `column_ref`, §10.) **Still narrowed:** `SELECT DISTINCT` in an aggregate query
-(needs output-row dedup) is deferred (`0A000`); `HAVING` is §19.
+(needs output-row dedup) is deferred (`0A000`).
+
+## 19. `HAVING`
+
+`having_clause ::= "HAVING" expr` slots between `GROUP BY` and `ORDER BY`. It is a boolean
+predicate over the **grouped** rows — evaluated **after** grouping/aggregation and **before**
+`ORDER BY` — keeping a group iff the predicate is `TRUE` (three-valued: `FALSE`/`NULL` drop
+it, like `WHERE`). Semantics live in [aggregates.md](aggregates.md) §8; this is the rule:
+
+- **It may reference aggregates and grouping keys.** `HAVING COUNT(*) > 1` and
+  `HAVING SUM(x) > 10` are the point of the clause — filtering on an aggregate is what `WHERE`
+  *cannot* do (`WHERE` filters input rows, before grouping; an aggregate there is `42803`,
+  §17). A HAVING aggregate need **not** appear in the SELECT list (it is computed regardless).
+  A non-aggregated column that is not a grouping key is `42803` — the same grouping-error rule
+  as the SELECT list (§18). It resolves against the same synthetic group row, so its
+  aggregates collect into the same set and its column references map to grouping-key slots.
+- **It must resolve to boolean** (`42804` otherwise), exactly like `WHERE`.
+- **HAVING with no `GROUP BY`** filters the single whole-table group: `SELECT COUNT(*) FROM t
+  HAVING COUNT(*) > 5` yields one row or zero. **HAVING makes a query an aggregate query**
+  even with no `GROUP BY` and no select-list aggregate (`SELECT a FROM t HAVING true` is
+  `42803` on `a`, just as a bare `a` alongside an aggregate is).
+- **Cost** ([cost.md](cost.md) §3): the HAVING predicate's `operator_eval`s are charged per
+  **group** evaluated (every group, since the filter must test each); a dropped group then
+  charges no `row_produced` — the same project-vs-produce asymmetry `DISTINCT` has. The filter
+  itself (the keep/drop decision) is unmetered.

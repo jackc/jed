@@ -150,6 +150,10 @@ type Select struct {
 	// aliases / ordinals); nil/empty means no GROUP BY. Each is an ExprColumn or
 	// ExprQualifiedColumn (the parser restricts it to column_ref). spec/design/grammar.md §18.
 	GroupBy []Expr
+	// Having is the HAVING predicate (a boolean filter over the grouped rows), if any. May
+	// reference aggregates and grouping keys; evaluated after aggregation, before ORDER BY.
+	// HAVING makes a query an aggregate query even with no GROUP BY (spec/design/grammar.md §19).
+	Having *Expr
 	// OrderBy holds the ORDER BY sort keys, applied left to right; nil/empty means no
 	// ORDER BY (spec/design/grammar.md §10).
 	OrderBy []OrderKey

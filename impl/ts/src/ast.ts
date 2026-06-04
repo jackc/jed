@@ -181,6 +181,10 @@ export type Select = {
   // empty means no GROUP BY. Each is a "column" or "qualifiedColumn" (the parser restricts it
   // to column_ref). With keys present the query groups (spec/design/grammar.md §18).
   groupBy: Expr[];
+  // The HAVING predicate (a boolean filter over the grouped rows), or null. May reference
+  // aggregates and grouping keys; evaluated after aggregation, before ORDER BY. HAVING makes a
+  // query an aggregate query even with no GROUP BY (spec/design/grammar.md §19).
+  having: Expr | null;
   // ORDER BY sort keys, applied left to right; empty means no ORDER BY (grammar.md §10).
   orderBy: OrderKey[];
   limit: bigint | null;

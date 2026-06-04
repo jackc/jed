@@ -115,8 +115,19 @@ delete         ::= "DELETE" "FROM" identifier where_clause?
 select         ::= "SELECT" "DISTINCT"? select_items "FROM" from_clause
                    where_clause?
                    group_by?
+                   having_clause?
                    order_by?
                    limit_offset?
+
+/* HAVING filters GROUPED rows: a general expression that must resolve to boolean (42804
+ * otherwise), evaluated AFTER grouping/aggregation and BEFORE ORDER BY. Unlike WHERE (which
+ * filters input rows and may NOT contain an aggregate — 42803), HAVING MAY reference
+ * aggregates (HAVING COUNT(*) > 1, HAVING SUM(x) > 10 — even ones not in the SELECT list) and
+ * the grouping keys; a non-aggregated column that is not a grouping key is 42803, the same
+ * grouping-error rule the SELECT list takes. HAVING with no GROUP BY filters the single
+ * whole-table aggregate row (../design/aggregates.md §8). HAVING makes a query an aggregate
+ * query even with no GROUP BY and no select-list aggregate. */
+having_clause  ::= "HAVING" expr
 
 /* GROUP BY partitions the post-WHERE rows into groups that share a value on every grouping
  * key, producing one result row per group (../design/aggregates.md §5). A grouping key is a

@@ -439,9 +439,23 @@ export class Database {
     // resolves in collect mode — aggregates collect into synthetic slots and a non-grouped
     // column is 42803 (spec/design/aggregates.md §4/§6); a plain query resolves in Forbidden
     // mode (columns normal). Output names per grammar.md §8.
-    const isAgg = groupKeys.length > 0 || itemsHaveAggregate(sel.items);
+    // GROUP BY, an aggregate in the select list, OR a HAVING clause all make this an aggregate
+    // query (HAVING alone groups the whole table — grammar.md §19).
+    const isAgg = groupKeys.length > 0 || itemsHaveAggregate(sel.items) || sel.having !== null;
     const projAgg: AggCtx = { collecting: isAgg, groupKeys, specs: [] };
     const { nodes: projections, names: columnNames } = resolveProjections(scope, sel.items, projAgg);
+    // HAVING resolves against the same grouped scope (collect) — it may reference aggregates
+    // (collected into the SAME specs, so their slots follow the projection's) and grouping keys;
+    // a non-grouped column is 42803. It must be boolean (42804). Resolved after the projection so
+    // the synthetic row is [group_keys..., projection aggs..., HAVING aggs...].
+    let having: RExpr | null = null;
+    if (sel.having !== null) {
+      const { node, type } = resolve(scope, sel.having, null, projAgg);
+      if (type.kind !== "bool" && type.kind !== "null") {
+        throw typeError("argument of HAVING must be boolean");
+      }
+      having = node;
+    }
     const aggSpecs = projAgg.specs;
     // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
     if (isAgg && sel.distinct) {
@@ -625,7 +639,13 @@ export class Database {
         });
       }
       // Build one synthetic row per group: [group_key_values..., aggregate_results...].
-      const groupRows = groups.map((g) => [...g.keys, ...g.accs.map((a) => finalizeAcc(a))]);
+      let groupRows = groups.map((g) => [...g.keys, ...g.accs.map((a) => finalizeAcc(a))]);
+      // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The predicate is
+      // evaluated against each group's synthetic row (charging its operatorEvals per group);
+      // only a TRUE result keeps the group. A dropped group charges no rowProduced (§8).
+      if (having !== null) {
+        groupRows = groupRows.filter((srow) => isTrue(evalExpr(having!, srow, meter)));
+      }
       // ORDER BY over the grouped output (keys are synthetic group-key slots).
       if (order.length > 0) {
         groupRows.sort((a, b) => {

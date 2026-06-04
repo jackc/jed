@@ -57,6 +57,9 @@ var SupportedCapabilities = []string{
 	// GROUP BY: one row per grouping-key combination + the grouping-error rule + ORDER BY over
 	// grouping keys (spec/design/aggregates.md §5-6, grammar.md §18).
 	"query.group_by",
+	// HAVING: a boolean filter over grouped rows, after aggregation, before ORDER BY
+	// (spec/design/aggregates.md §8, grammar.md §19).
+	"query.having",
 	"null.three_valued",
 	"compare.promotion",
 	"cast.explicit",

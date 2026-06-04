@@ -187,9 +187,29 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       _(size: S–M)_
 - [ ] **Predicate forms** — `IN (list)`, `BETWEEN`, `LIKE` (text-dependent), `CASE`
       expressions. _(size: M; LIKE deps: text type)_
-- [ ] **Aggregates** `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` + **`GROUP BY`** + **`HAVING`**.
-      `AVG`/`SUM` interact with overflow & with decimal — sequence after `decimal` or define
-      integer-only semantics first. _(size: L; deps: expression evaluator)_
+- [x] **Aggregates** `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` + **`GROUP BY`** + **`HAVING`**.
+      Done in **three vertical slices** (all three cores in lockstep): (1) the engine's first
+      **function-call syntax** (`name ( * | expr )`, one-token lookahead so names stay
+      non-reserved; only aggregates resolve, unknown → `42883`, `DISTINCT`-in-aggregate →
+      `42601`) + **whole-table aggregation** (one result row, even over an empty table); (2)
+      **`GROUP BY`** (bare/qualified columns, value-canonical bucketing so `1.5`/`1.50` and NULL
+      group correctly, first-occurrence order, the **grouping-error rule** `42803`, `ORDER BY`
+      over grouping keys); (3) **`HAVING`** (boolean filter over grouped rows, after aggregation
+      before ORDER BY, may reference unprojected aggregates). **PostgreSQL widening** (verified
+      against the live `postgres:18` oracle): `COUNT`→`int64`; `SUM(int16/int32)`→`int64`,
+      `SUM(int64)`→`decimal`, `SUM(decimal)`→`decimal`; `AVG(any numeric)`→`decimal` via the
+      exact decimal division; `MIN`/`MAX`→input type; NULL inputs skipped (COUNT(\*) counts
+      rows), overflow traps `22003`. New canonical data: a `[[aggregate]]` array
+      (`kind = "aggregate"`) in [catalog.toml](spec/functions/catalog.toml) with its own
+      verify.rb branch + codegen `AGGREGATES` table; errors `42803`/`42883`; cost unit
+      `aggregate_accumulate`; design doc [aggregates.md](spec/design/aggregates.md);
+      [grammar.md](spec/design/grammar.md) §17–§19; capabilities `query.aggregates` /
+      `query.group_by` / `query.having` + profiles `aggregates`/`grouping`/`having`; conformance
+      [suites/aggregates/](spec/conformance/suites/aggregates/) (`count`/`sum`/`min_max`/`avg`/
+      `whole_table`/`group_by`/`having`), 46/0/0 byte-identical in Rust, Go, and TS with
+      `# cost:` / `# names:` pinned. Deferred: `COUNT(DISTINCT x)`, `SELECT DISTINCT` in an
+      aggregate query, GROUP BY by expression/ordinal/alias, the functional-dependency grouping
+      relaxation, `GROUPING SETS`/`FILTER`/ordered-set aggregates. _(size: L; deps: expression evaluator)_
 - [x] **Multi-row `INSERT`** (`VALUES (..),(..)`). Done: `INSERT INTO t VALUES (..),(..)`
       accepts one or more parenthesized rows, **two-phase / all-or-nothing** like `UPDATE`
       (CLAUDE.md §11 step 6) — every row is fully validated (arity → `42601`, type/range →
