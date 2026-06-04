@@ -52,6 +52,11 @@ const (
 	DuplicateAlias
 	// InvalidTableDefinition is 42P16 (e.g. more than one primary key).
 	InvalidTableDefinition
+	// GroupingError is 42803 — a non-aggregated column not in GROUP BY, or an aggregate in a
+	// context that disallows one (WHERE / ON / nested; spec/design/aggregates.md §6).
+	GroupingError
+	// UndefinedFunction is 42883 — an unknown function name in a call (aggregates.md §5).
+	UndefinedFunction
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
 	// DataCorrupted is XX001 — a malformed on-disk database file (CLAUDE.md §8).
@@ -99,6 +104,10 @@ func (s SqlState) Code() string {
 		return "42712"
 	case InvalidTableDefinition:
 		return "42P16"
+	case GroupingError:
+		return "42803"
+	case UndefinedFunction:
+		return "42883"
 	case FeatureNotSupported:
 		return "0A000"
 	case DataCorrupted:

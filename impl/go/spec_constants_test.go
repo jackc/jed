@@ -239,16 +239,56 @@ func TestOperatorsMatchSpec(t *testing.T) {
 	}
 }
 
+func TestAggregatesMatchSpec(t *testing.T) {
+	// The generated aggregate descriptor table must match the canonical catalog's
+	// [[aggregate]] rows field-for-field (codegen middle path, CLAUDE.md §5). Aggregates are
+	// overloaded across operand families (one row per (name, arg_families)), like operators.
+	rows := readTomlTables(t, specPath(t, "functions/catalog.toml"), "aggregate")
+	if len(rows) != len(Aggregates) {
+		t.Fatalf("aggregate count: spec %d, generated %d", len(rows), len(Aggregates))
+	}
+	find := func(name string, fams []string) (AggregateDesc, bool) {
+		for _, d := range Aggregates {
+			if d.Name == name && strings.Join(d.ArgFamilies, ",") == strings.Join(fams, ",") {
+				return d, true
+			}
+		}
+		return AggregateDesc{}, false
+	}
+	for _, row := range rows {
+		name := row.str("name")
+		desc, ok := find(name, row.strs("arg_families"))
+		if !ok {
+			t.Fatalf("generated table missing aggregate %q %v", name, row.strs("arg_families"))
+		}
+		if row.str("kind") != "aggregate" {
+			t.Errorf("%s: kind got %q want aggregate", name, row.str("kind"))
+		}
+		if desc.Surface != row.str("surface") {
+			t.Errorf("%s: surface mismatch", name)
+		}
+		if desc.Arg != row.str("arg") {
+			t.Errorf("%s: arg mismatch", name)
+		}
+		if desc.Result != row.str("result") {
+			t.Errorf("%s: result mismatch", name)
+		}
+		if desc.Null != row.str("null") {
+			t.Errorf("%s: null mismatch", name)
+		}
+		if strings.Join(desc.Errors, ",") != strings.Join(row.strs("errors"), ",") {
+			t.Errorf("%s: errors mismatch", name)
+		}
+	}
+}
+
 func TestCostScheduleMatchesSpec(t *testing.T) {
 	// The generated cost schedule (codegen middle path, CLAUDE.md §5/§13) must match the
 	// canonical schedule.toml weight-for-weight. Cost is a cross-core contract (§8):
 	// every core reads these weights.
 	rows := readTomlTables(t, specPath(t, "cost/schedule.toml"), "unit")
-	if len(rows) != 3 {
-		t.Fatalf("expected the three phase-1 cost units, got %d", len(rows))
-	}
-	// Every unit id maps to a field on Costs; a new unit forces this cross-check to be
-	// updated (so a core cannot silently ignore a unit the schedule adds).
+	// The weight() switch below forces this cross-check to be updated whenever a unit is added
+	// (a new unit with no Costs field fails), so we don't pin an exact count here.
 	weight := func(id string) int64 {
 		switch id {
 		case "storage_row_read":
@@ -257,6 +297,8 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.RowProduced
 		case "operator_eval":
 			return Costs.OperatorEval
+		case "aggregate_accumulate":
+			return Costs.AggregateAccumulate
 		default:
 			t.Fatalf("cost unit %q has no Costs field — update this cross-check", id)
 			return 0

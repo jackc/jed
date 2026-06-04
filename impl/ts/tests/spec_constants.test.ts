@@ -15,7 +15,7 @@ import {
   widthBytes,
 } from "../src/types.ts";
 import { MAX_PRECISION, MAX_SCALE } from "../src/decimal.ts";
-import { OPERATORS } from "../src/operators.ts";
+import { AGGREGATES, OPERATORS } from "../src/operators.ts";
 import { COSTS } from "../src/costs.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
 
@@ -137,14 +137,36 @@ test("operators match spec/functions/catalog.toml", () => {
   }
 });
 
+test("aggregates match spec/functions/catalog.toml", () => {
+  // The generated aggregate descriptor table must match the canonical catalog's [[aggregate]]
+  // rows field-for-field (codegen middle path, CLAUDE.md §5). Aggregates are overloaded across
+  // operand families (one row per (name, arg_families)), like operators.
+  const rows = readTomlTables(specPath("functions/catalog.toml"), "aggregate");
+  assert.equal(rows.length, AGGREGATES.length, "aggregate count");
+  for (const row of rows) {
+    const name = row.str("name");
+    const fams = row.strs("arg_families");
+    const desc = AGGREGATES.find(
+      (d) => d.name === name && [...d.argFamilies].join(",") === fams.join(","),
+    );
+    assert.notEqual(desc, undefined, `generated table missing aggregate ${name} ${fams.join(",")}`);
+    const d = desc!;
+    assert.equal(row.str("kind"), "aggregate", `${name}: kind`);
+    assert.equal(d.surface, row.str("surface"), `${name}: surface`);
+    assert.equal(d.arg, row.str("arg"), `${name}: arg`);
+    assert.equal(d.result, row.str("result"), `${name}: result`);
+    assert.equal(d.null, row.str("null"), `${name}: null`);
+    assert.deepEqual([...d.errors], row.strs("errors"), `${name}: errors`);
+  }
+});
+
 test("cost schedule matches spec/cost/schedule.toml", () => {
   // The generated cost schedule (codegen middle path, CLAUDE.md §5/§13) must match the
   // canonical schedule.toml weight-for-weight. Cost is a cross-core contract (§8): every
   // core reads these weights.
   const rows = readTomlTables(specPath("cost/schedule.toml"), "unit");
-  assert.equal(rows.length, 3, "the three phase-1 cost units");
-  // Every unit id maps to a field on COSTS; a new unit forces this cross-check to be
-  // updated (so a core cannot silently ignore a unit the schedule adds).
+  // The weight() switch below forces this cross-check to be updated whenever a unit is added
+  // (a new unit with no COSTS field throws), so we don't pin an exact count here.
   const weight = (id: string): bigint => {
     switch (id) {
       case "storage_row_read":
@@ -153,6 +175,8 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.rowProduced;
       case "operator_eval":
         return COSTS.operatorEval;
+      case "aggregate_accumulate":
+        return COSTS.aggregateAccumulate;
       default:
         throw new Error(`cost unit ${id} has no COSTS field — update this cross-check`);
     }

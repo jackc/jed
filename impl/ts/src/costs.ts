@@ -11,6 +11,7 @@ export interface CostSchedule {
   storageRowRead: bigint;
   rowProduced: bigint;
   operatorEval: bigint;
+  aggregateAccumulate: bigint;
 }
 
 // The canonical cost schedule — weights accrued per unit during query execution.
@@ -18,4 +19,5 @@ export const COSTS: CostSchedule = {
   storageRowRead: 1n,
   rowProduced: 1n,
   operatorEval: 1n,
+  aggregateAccumulate: 1n,
 };

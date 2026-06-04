@@ -63,7 +63,14 @@ export type Expr =
   // `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
   // keyword: true is `IS NOT DISTINCT FROM` (NULL-safe `=`), false is `IS DISTINCT FROM`
   // (its negation). Always boolean-valued, never unknown (spec/design/functions.md §3).
-  | { kind: "isDistinct"; lhs: Expr; rhs: Expr; negated: boolean };
+  | { kind: "isDistinct"; lhs: Expr; rhs: Expr; negated: boolean }
+  // An aggregate function call — the engine's first function-call syntax (grammar.md §17).
+  // `name` is the spelling as written (resolved case-insensitively against the aggregate
+  // catalog; an unknown name is 42883). `star` is the COUNT(*) row-count form (then `arg` is
+  // null); otherwise `arg` is the single argument expression. DISTINCT inside the parens is
+  // rejected at parse (42601). Only aggregates resolve this slice; an aggregate in WHERE/ON
+  // or nested in another aggregate is 42803 (spec/design/aggregates.md).
+  | { kind: "funcCall"; name: string; arg: Expr | null; star: boolean };
 
 // SelectItem is one select-list expression with its optional output-name alias
 // (expr AS name). The alias is an output label only — it never enters resolution

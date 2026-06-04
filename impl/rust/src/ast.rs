@@ -223,6 +223,17 @@ pub enum Expr {
         rhs: Box<Expr>,
         negated: bool,
     },
+    /// An aggregate function call — the engine's first function-call syntax (grammar.md §17).
+    /// `name` is the spelling as written (resolved case-insensitively against the aggregate
+    /// catalog; an unknown name is 42883). `star` is the `COUNT(*)` row-count form (then `arg`
+    /// is `None`); otherwise `arg` is the single argument expression. DISTINCT inside the
+    /// parens is rejected at parse (42601). Only aggregates resolve this slice; an aggregate
+    /// in WHERE/ON or nested in another aggregate is 42803 (spec/design/aggregates.md).
+    FuncCall {
+        name: String,
+        arg: Option<Box<Expr>>,
+        star: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

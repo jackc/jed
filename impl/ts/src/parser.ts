@@ -752,12 +752,41 @@ class Parser {
         this.advance();
         return { kind: "literal", literal: { kind: "bool", value: false } };
       }
+      // Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
+      // first call syntax — grammar.md §17). The one-token lookahead keeps function names
+      // non-reserved (a column may be named `count`); a qualified name is never a call. Only
+      // aggregates resolve (42883 otherwise).
+      if (this.tokens[this.pos + 1]?.kind === "lparen") {
+        return this.parseFunctionCall();
+      }
       const [qualifier, name] = this.parseColumnRef();
       return qualifier !== null
         ? { kind: "qualifiedColumn", qualifier, name }
         : { kind: "column", name };
     }
     throw engineError("syntax_error", "expected an expression");
+  }
+
+  // parseFunctionCall parses `function_call ::= identifier "(" ( "*" | expr ) ")"` — the
+  // aggregate call syntax (grammar.md §17). COUNT(*) is the star form; every other call takes
+  // one general expression argument. DISTINCT inside the parens is deferred (rejected 42601).
+  private parseFunctionCall(): Expr {
+    const name = this.expectIdentifier();
+    this.expect("lparen");
+    // DISTINCT inside an aggregate (COUNT(DISTINCT x)) is deferred — reject at parse.
+    if (this.peekKeyword() === "distinct") {
+      throw engineError("syntax_error", "DISTINCT inside an aggregate is not supported yet");
+    }
+    let arg: Expr | null = null;
+    let star = false;
+    if (this.peek().kind === "star") {
+      this.advance();
+      star = true;
+    } else {
+      arg = this.parseExpr();
+    }
+    this.expect("rparen");
+    return { kind: "funcCall", name, arg, star };
   }
 
   // --- cursor helpers ---

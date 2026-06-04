@@ -46,3 +46,13 @@ event  = "one function/operator (interior expression node) evaluation"
 # is_null/distinct); leaf nodes (column/constant) charge nothing. A single uniform
 # weight this slice; the per-operator `cost` field in ../functions/catalog.toml stays
 # reserved as the additive tuning hook (functions.md §8).
+
+[[unit]]
+id     = "aggregate_accumulate"
+weight = 1
+event  = "one aggregate accumulator update — one (input row x aggregate) folded into a group"
+# Charged once per aggregate per post-WHERE input row folded into its group (or the single
+# whole-table group when there is no GROUP BY). The aggregate's ARGUMENT expression is
+# evaluated through the normal evaluator (charging its own operator_eval); each emitted
+# group row charges row_produced; the bucketing and the finalize step (e.g. AVG's division)
+# are UNMETERED, like the ORDER BY sort and the DISTINCT dedup (../design/cost.md §3).

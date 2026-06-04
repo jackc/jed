@@ -122,8 +122,11 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   Scientific `e`-notation for decimals (`1.5e3`) is **deferred**. `boolean` exists only as an
   *expression* type this slice — there are boolean literals and comparison/logical results,
   but no boolean *column* (see [types.md](types.md) §1).
-- **No function calls.** The expression grammar has operators and parentheses but no
-  `f(args)` call syntax — no scalar functions are defined yet.
+- **Function calls — aggregates only.** The expression grammar now has a `function_call`
+  production (`name ( * | expr )`), but it resolves **only** the five aggregate functions
+  (`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`; §17, [aggregates.md](aggregates.md)). **Scalar**
+  functions (`length`, `lower`, …) and **`COUNT(DISTINCT x)`** stay deferred; an unknown
+  function name is `42883`, and `DISTINCT` inside a call is `42601`.
 - **No `;` statement terminator** and **no SQL comment syntax** in the input.
 - **No parameter placeholders** (`$1`, `?`). The conformance corpus uses literal SQL by
   design — see [conformance.md](conformance.md); bound parameters are an
@@ -180,7 +183,12 @@ this order:
    match case-insensitively — §3 — so the user's casing must not leak into the output.)
 3. **`*`** → expands to each underlying column's canonical name, in column order — the same
    expansion that produces the projections.
-4. **Any other un-aliased expression** (arithmetic, comparison, `CAST`, a literal, `IS NULL`,
+4. **An un-aliased aggregate function call** → the **lowercased function name**
+   (`COUNT(*)` and `COUNT(a)` → `count`, `SUM(x)` → `sum`, likewise `min`/`max`/`avg`),
+   matching PostgreSQL (CLAUDE.md §1). This is the one expression form that gets a
+   meaningful default name rather than `?column?`, because the name is the catalog
+   surface lowercased — no expression printer is needed (§17, [aggregates.md](aggregates.md)).
+5. **Any other un-aliased expression** (arithmetic, comparison, `CAST`, a literal, `IS NULL`,
    a unary/logical expression, …) → the fixed literal **`?column?`**.
 
 Case 4 is deliberately a constant placeholder rather than a re-rendering of the expression
@@ -555,3 +563,46 @@ the column count) is `42601`. Then the usual per-value checks apply in declarati
 INSERT is substituting a constant — no expression is evaluated and cost stays zero (§12). A
 general-expression default (`DEFAULT now()`) and `INSERT ... SELECT` stay deferred
 ([../../TODO.md](../../TODO.md)).
+
+## 17. Function-call syntax and aggregate functions
+
+The `primary` rule gains a `function_call` production — `function_call ::= identifier "("
+( "*" | expr ")"` — the engine's **first** call syntax. The *semantics* (what each
+aggregate computes, the SUM/AVG widening, the NULL / empty-set rules, the grouping rules)
+live in [aggregates.md](aggregates.md); this section is the **syntax** and the
+disambiguation, the established grammar.md/semantics split (§15 does the same for joins).
+
+**Aggregates only.** Only the five aggregate functions resolve — `COUNT`, `SUM`, `MIN`,
+`MAX`, `AVG` ([../functions/catalog.toml](../functions/catalog.toml), `kind = "aggregate"`).
+Any other function name is **`42883`** (`undefined_function`,
+[../errors/registry.toml](../errors/registry.toml)), resolved like an unknown type name
+(§6). **Scalar** functions are a later slice (they will fit the operator result/NULL mold —
+[functions.md](functions.md) §8); aggregates do not, so they are their own catalog kind.
+
+**The argument.** `COUNT(*)` is the row counter — the `*` argument is accepted **only** by
+`COUNT`; `*` to any other aggregate is a resolve error. Every other aggregate takes exactly
+one **general expression** (`SUM(a + 1)`, `MIN(t.c)`). `COUNT(expr)` also takes one
+expression. There are no zero-argument or multi-argument aggregates this slice, and
+**`DISTINCT` inside the parens** (`COUNT(DISTINCT x)`) is **deferred** — the parsers reject
+the `DISTINCT` token in an argument position as `42601` (it is added as a follow-on).
+
+**The `*` token.** `*` is the same token as the `SELECT *` glob and the `mul` operator,
+disambiguated by position (§4): inside a function call's argument it is the `COUNT(*)`
+row-count form, nothing else. A `*` argument to a non-`COUNT` aggregate, or `*` mixed with
+other arguments, never parses to anything meaningful and is rejected.
+
+**Names are not reserved — a one-token lookahead.** Like `DISTINCT`/`AS`/the join keywords
+(§3, §11, §15), aggregate names are ordinary identifiers: a column may be named `count`,
+and `SELECT count FROM t` must keep selecting it. In `primary`, after reading an
+`identifier`, the parser peeks **one** token — if it is `"("`, this is a `function_call`;
+otherwise it falls back to `column_ref`. So `SELECT count FROM t` is the column (no `(`
+follows) and `SELECT count(*) FROM t` is the aggregate. The lookahead is a CLAUDE.md §8
+determinism surface — **byte-identical** across the three hand-written parsers. A qualified
+name followed by `(` (`t.count(...)`) is **not** a call (the call form binds only a *bare*
+identifier immediately followed by `(`); it is left to fail as a malformed reference.
+
+**Where aggregates may not appear.** An aggregate folds a *set* of rows, so it is undefined
+per input row: an aggregate in a `WHERE` clause, a `JOIN ON`, or (later) a `GROUP BY` key,
+and an aggregate **nested** in another aggregate, are all **`42803`** (`grouping_error`).
+Filtering on an aggregate is `HAVING`'s job (a later slice). The output name of an
+un-aliased aggregate is its lowercased function name (§8).

@@ -1,0 +1,69 @@
+# Aggregate COUNT — whole-table (no GROUP BY): a single result row (spec/design/aggregates.md
+# §2/§4). COUNT(*) counts every ROW (NULLs included); COUNT(expr) counts non-NULL inputs. Over
+# an empty table both return 0 as a SINGLE row (not the empty result — the §4 single-group
+# rule). Output name is the lowercased function name `count` (grammar.md §8). Cost = rows
+# scanned (storage_row_read) + rows x aggregates (aggregate_accumulate) + 1 produced (§8).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30)
+
+# COUNT(*) counts all 3 rows (the NULL row included). 3 scanned + 3 accumulate + 1 produced.
+# names: count
+# cost: 7
+query I nosort
+SELECT COUNT(*) FROM t
+----
+3
+
+# COUNT(a) skips the NULL row -> 2. Bare-column argument is a leaf (no operator_eval).
+# names: count
+# cost: 7
+query I nosort
+SELECT COUNT(a) FROM t
+----
+2
+
+# COUNT is not reserved: a column may be named count. With no "(", it is a column_ref,
+# not the aggregate (grammar.md §17 one-token lookahead).
+statement ok
+CREATE TABLE c (id int32 PRIMARY KEY, count int32)
+
+statement ok
+INSERT INTO c VALUES (1, 100), (2, 200)
+
+# names: count
+query I nosort
+SELECT count FROM c ORDER BY id
+----
+100
+200
+
+# ... and COUNT(*) over that same table is the aggregate (3 -> 2 here).
+# names: count
+query I nosort
+SELECT COUNT(*) FROM c
+----
+2
+
+# Empty table: COUNT(*) -> 0 as ONE row (not the empty result). 0 scanned, 0 accumulate,
+# 1 produced (the §4 single-group rule).
+statement ok
+CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+
+# names: count
+# cost: 1
+query I nosort
+SELECT COUNT(*) FROM e
+----
+0
+
+# COUNT(a) over the empty table is likewise 0 (one row).
+# names: count
+query I nosort
+SELECT COUNT(a) FROM e
+----
+0

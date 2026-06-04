@@ -26,8 +26,13 @@ The catalog now lists:
 | `comparison` (NULL-safe) | `IS DISTINCT FROM`, `IS NOT DISTINCT FROM` | `boolean` |
 | `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` |
 | `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` |
+| `aggregate` | `COUNT` `SUM` `MIN` `MAX` `AVG` | `int64` / `decimal` / widened (§8) |
 
-`<>` / `!=` are deliberately absent — they do not exist in the engine (see
+The **aggregates** are not operators — they collapse a set of rows into one value, have no
+infix symbol or precedence, and widen their result type by the operand type — so they live
+in a **separate `[[aggregate]]` array** with their own field set, not as `[[operator]]`
+rows (§8, [aggregates.md](aggregates.md)). `<>` / `!=` are deliberately absent — they do
+not exist in the engine (see
 [grammar.md](grammar.md) §4). The catalog must stay descriptive: it must not list an
 operator no core implements, nor omit one a core has — and a new operator is added here
 **first**, in the same change that adds its parser/executor code and conformance entries.
@@ -188,7 +193,25 @@ One field is designed but **deliberately not authored yet**, so its absence is i
 Reserved values and kinds still to be authored spec-first with their own executor slices
 ([../../TODO.md](../../TODO.md)):
 
-- named `function` entries (the `function` kind).
+- named **scalar** `function` entries (the `function` kind) — `length`, `lower`, and the
+  like. These take a scalar argument and return a scalar, fitting the operator
+  `result`/`null` mold, so when they land they reuse the operator fields. The `function`
+  kind stays reserved for them.
+
+**Aggregates are authored (`kind = "aggregate"`).** `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` landed
+in a **separate `[[aggregate]]` array**, not as `[[operator]]` rows, because they do not fit
+the operator mold on three counts: (1) the **result widens by the operand type** —
+`SUM(int16/int32) → int64`, `SUM(int64) → decimal`, `MIN/MAX → the input type` — expressed
+by two reserved result ids, `sum_widen` and `same_as_input`, alongside the concrete `int64`
+/`decimal` (`COUNT → int64`, `AVG → decimal`); (2) a fifth **NULL discipline**, `aggregate`
+— NULL inputs are *skipped* (except `COUNT(*)`, which counts every row), and an empty or
+all-NULL group yields `NULL` for `SUM/AVG/MIN/MAX` but `0` for `COUNT`; (3) **`COUNT(*)`
+takes no expression** (`arg = "star"`), and there is no infix symbol, precedence, or
+`arg_resolution`. The coherence checker validates aggregates on a separate branch
+([../functions/verify.rb](../functions/verify.rb)), and the codegen emits a separate
+`AGGREGATES` descriptor table. The full semantics — the widening table, the empty-set
+rules, the `GROUP BY` / `HAVING` rules, the cost accrual — live in
+[aggregates.md](aggregates.md). DISTINCT inside an aggregate is deferred (rejected `42601`).
 
 The `null_safe` discipline is now **authored**: `IS [NOT] DISTINCT FROM` (`kind =
 "comparison"`, `null = "null_safe"`) landed once the `boolean` type gave the result a

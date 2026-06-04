@@ -823,6 +823,13 @@ impl Parser {
                 }
             }
             Token::Word(_) => {
+                // Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the
+                // engine's first call syntax — grammar.md §17). The one-token lookahead keeps
+                // function names non-reserved (a column may be named `count`); a qualified
+                // name (`t.col`) is never a call. Only aggregates resolve (42883 otherwise).
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) {
+                    return self.parse_function_call();
+                }
                 let (qualifier, name) = self.parse_column_ref()?;
                 Ok(match qualifier {
                     Some(qualifier) => Expr::QualifiedColumn { qualifier, name },
@@ -831,6 +838,27 @@ impl Parser {
             }
             other => Err(syntax(format!("expected an expression, found {other:?}"))),
         }
+    }
+
+    /// `function_call ::= identifier "(" ( "*" | expr ) ")"` — the aggregate call syntax
+    /// (grammar.md §17). `COUNT(*)` is the `star` form; every other call takes one general
+    /// expression argument. DISTINCT inside the parens is deferred (rejected 42601). The
+    /// function name is resolved (case-insensitively) against the aggregate catalog later.
+    fn parse_function_call(&mut self) -> Result<Expr> {
+        let name = self.expect_identifier()?;
+        self.expect(&Token::LParen)?;
+        // DISTINCT inside an aggregate (COUNT(DISTINCT x)) is deferred — reject at parse.
+        if self.peek_keyword().as_deref() == Some("distinct") {
+            return Err(syntax("DISTINCT inside an aggregate is not supported yet"));
+        }
+        let (arg, star) = if matches!(self.peek(), Token::Star) {
+            self.advance();
+            (None, true)
+        } else {
+            (Some(Box::new(self.parse_expr()?)), false)
+        };
+        self.expect(&Token::RParen)?;
+        Ok(Expr::FuncCall { name, arg, star })
     }
 
     /// `column_ref ::= identifier ("." identifier)?` — a bare column name, or a qualified

@@ -1,0 +1,80 @@
+# Aggregate MIN / MAX — over any ordered scalar; result is the INPUT type (spec/design/
+# aggregates.md §2/§3). Ordering follows the family's compare rule (integers numeric, text
+# C-collation, boolean false<true). NULL inputs are skipped; an empty/all-NULL group -> NULL.
+# Output names `min` / `max`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.int32, types.text, types.boolean_storable, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'banana'), (2, NULL, 'apple'), (3, 30, 'cherry')
+
+# MIN/MAX over int32 skip the NULL row. Result type is int32 (I tag).
+# names: min
+# cost: 7
+query I nosort
+SELECT MIN(a) FROM t
+----
+10
+
+# names: max
+query I nosort
+SELECT MAX(a) FROM t
+----
+30
+
+# MIN and MAX together — one row, two aggregates: 3 scanned + 3x2 accumulate + 1 produced.
+# names: min, max
+# cost: 10
+query II nosort
+SELECT MIN(a), MAX(a) FROM t
+----
+10
+30
+
+# MIN/MAX over text use the C collation (byte/code-point order): apple < banana < cherry.
+# names: min, max
+query TT nosort
+SELECT MIN(s), MAX(s) FROM t
+----
+apple
+cherry
+
+# MIN/MAX over boolean: false < true.
+statement ok
+CREATE TABLE tb (id int32 PRIMARY KEY, f boolean)
+
+statement ok
+INSERT INTO tb VALUES (1, TRUE), (2, FALSE), (3, NULL)
+
+# names: min, max
+query BB nosort
+SELECT MIN(f), MAX(f) FROM tb
+----
+false
+true
+
+# All-NULL group: MIN/MAX -> NULL (a single row).
+statement ok
+CREATE TABLE tnull (id int32 PRIMARY KEY, a int32)
+
+statement ok
+INSERT INTO tnull VALUES (1, NULL), (2, NULL)
+
+# names: min, max
+query II nosort
+SELECT MIN(a), MAX(a) FROM tnull
+----
+NULL
+NULL
+
+# Empty table: MIN/MAX -> NULL as ONE row.
+statement ok
+CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+
+# names: min
+query I nosort
+SELECT MIN(a) FROM e
+----
+NULL

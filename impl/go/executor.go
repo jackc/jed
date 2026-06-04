@@ -382,7 +382,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 		// The RHS is a general expression evaluated against the *old* row; a literal operand
 		// adapts to the target column's type. The result must be assignable to the column's
 		// family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-		src, ty, err := resolve(s, a.Value, &col.Type)
+		src, ty, err := resolve(s, a.Value, &col.Type, &aggCtx{collecting: false})
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -494,9 +494,26 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	// Resolve projections (paired with output names — §8), the optional WHERE (must be
 	// boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
 	// relations is 42702; an unknown qualifier is 42P01 (§15).
-	projections, columnNames, err := resolveProjections(s, sel.Items)
+	// Detect an aggregate query (any select item contains an aggregate call). Its projection
+	// resolves in collect mode — aggregates collect into synthetic slots and a bare non-grouped
+	// column is 42803 (spec/design/aggregates.md §4); a non-aggregate query resolves in
+	// Forbidden mode (columns normal; a stray aggregate would be 42803).
+	isAgg := itemsHaveAggregate(sel.Items)
+	projAgg := &aggCtx{collecting: isAgg}
+	projections, columnNames, err := resolveProjections(s, sel.Items, projAgg)
 	if err != nil {
 		return Outcome{}, err
+	}
+	aggSpecs := projAgg.specs
+	// Slice-1 narrowing: ORDER BY / DISTINCT over an aggregate query's output need output-scope
+	// resolution (the synthetic group row), which lands with GROUP BY (aggregates.md §10).
+	if isAgg {
+		if len(sel.OrderBy) > 0 {
+			return Outcome{}, NewError(FeatureNotSupported, "ORDER BY with aggregates is not supported yet")
+		}
+		if sel.Distinct {
+			return Outcome{}, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
+		}
 	}
 	var filter *rExpr
 	if sel.Filter != nil {
@@ -701,7 +718,57 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	// row is projected — dedup must see them all — duplicates drop by first occurrence, and
 	// the window then slices the DISTINCT rows.
 	var out [][]Value
-	if sel.Distinct {
+	if isAgg {
+		// Aggregate query (slice 1: one group, no GROUP BY). Fold every filtered row into the
+		// accumulators — charging aggregate_accumulate per (row × aggregate) and the operand's
+		// own operator_evals — then finalize to the synthetic row [agg_0..] and project it. Even
+		// an empty input yields ONE group row (COUNT 0, others NULL — aggregates.md §4). The
+		// bucketing/finalize is unmetered (cost.md §3).
+		accs := make([]*acc, len(aggSpecs))
+		for i, spec := range aggSpecs {
+			accs[i] = newAcc(spec.plan)
+		}
+		for _, row := range rows {
+			for i, spec := range aggSpecs {
+				meter.Charge(Costs.AggregateAccumulate)
+				v := NullValue() // COUNT(*) ignores the value
+				if spec.operand != nil {
+					var verr error
+					if v, verr = spec.operand.eval(row, meter); verr != nil {
+						return Outcome{}, verr
+					}
+				}
+				if ferr := accs[i].fold(v); ferr != nil {
+					return Outcome{}, ferr
+				}
+			}
+		}
+		synthetic := make([]Value, len(accs))
+		for i, a := range accs {
+			v, ferr := a.finalize()
+			if ferr != nil {
+				return Outcome{}, ferr
+			}
+			synthetic[i] = v
+		}
+		// The single group row, then the LIMIT/OFFSET window over it (LIMIT 0 → no rows). Only an
+		// emitted row charges row_produced + its projection operator_evals (cost.md §3).
+		groupRows := [][]Value{synthetic}
+		start, end := windowBounds(int64(len(groupRows)))
+		out = make([][]Value, 0, end-start)
+		for _, srow := range groupRows[start:end] {
+			meter.Charge(Costs.RowProduced)
+			projected := make([]Value, len(projections))
+			for i, p := range projections {
+				v, perr := p.eval(srow, meter)
+				if perr != nil {
+					return Outcome{}, perr
+				}
+				projected[i] = v
+			}
+			out = append(out, projected)
+		}
+	} else if sel.Distinct {
 		// Project every filtered row (charging projection cost per row, the §3 asymmetry),
 		// keeping first occurrences. `seen` is membership-only: output order comes from the
 		// deterministic source iteration, never from map iteration (no map-order leak —
@@ -896,6 +963,259 @@ type rExpr struct {
 }
 
 // ============================================================================
+// Aggregate resolution + accumulation (spec/design/aggregates.md).
+//
+// An aggregate query's select list resolves in "collect" mode: each aggregate call is
+// collected into an aggSpec (its plan + resolved argument) and replaced by a reference to a
+// synthetic-row slot (an reColumn indexing the finalized aggregate results), so the existing
+// evaluator projects the result with no new node. Outside collect mode (WHERE / ON / an
+// aggregate's own argument / any non-aggregate query) a column resolves normally and an
+// aggregate call is a 42803 grouping error.
+// ============================================================================
+
+// aggCtx threads the aggregate-resolution mode through resolve. collecting == false is the
+// Forbidden mode (a FuncCall is 42803; columns resolve normally); collecting == true is an
+// aggregate query's projection (a FuncCall collects into specs; a bare column is 42803).
+type aggCtx struct {
+	collecting bool
+	specs      []aggSpec
+}
+
+// aggPlan is the runtime plan for one aggregate, fixed at resolve from the function + operand
+// type (the PG widening — spec/design/aggregates.md §3).
+type aggPlan int
+
+const (
+	planCountStar  aggPlan = iota // COUNT(*) — count every row
+	planCount                     // COUNT(expr) — count non-NULL inputs
+	planSumInt                    // SUM(int16|int32) — accumulate i64, result int64 (trap at int64)
+	planSumDecimal                // SUM(int64|decimal) — accumulate decimal, result decimal
+	planAvg                       // AVG — decimal sum + i64 count; result sum/count (NULL if 0)
+	planMin
+	planMax
+)
+
+// aggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
+// row against the real row). operand is nil for COUNT(*).
+type aggSpec struct {
+	plan    aggPlan
+	operand *rExpr
+}
+
+// acc is a running aggregate accumulator (one per aggSpec), folded per input row then finalized.
+type acc struct {
+	plan   aggPlan
+	count  int64
+	sumInt int64
+	sumDec Decimal
+	seen   bool
+	cur    Value
+	hasCur bool
+}
+
+func newAcc(plan aggPlan) *acc {
+	a := &acc{plan: plan}
+	if plan == planSumDecimal || plan == planAvg {
+		a.sumDec = DecimalFromInt64(0)
+	}
+	return a
+}
+
+// fold folds one input value into the accumulator. NULL arguments are skipped (COUNT(*)
+// ignores the value and always counts). Traps 22003 on SUM/AVG overflow at the result bound.
+func (a *acc) fold(v Value) error {
+	switch a.plan {
+	case planCountStar:
+		a.count++
+	case planCount:
+		if !v.IsNull() {
+			a.count++
+		}
+	case planSumInt:
+		if !v.IsNull() {
+			s := a.sumInt + v.Int
+			if (v.Int > 0 && s < a.sumInt) || (v.Int < 0 && s > a.sumInt) {
+				return overflowErr(Int64)
+			}
+			a.sumInt = s
+			a.seen = true
+		}
+	case planSumDecimal:
+		if !v.IsNull() {
+			d, err := a.sumDec.Add(toDecimal(v))
+			if err != nil {
+				return err
+			}
+			a.sumDec = d
+			a.seen = true
+		}
+	case planAvg:
+		if !v.IsNull() {
+			d, err := a.sumDec.Add(toDecimal(v))
+			if err != nil {
+				return err
+			}
+			a.sumDec = d
+			a.count++
+		}
+	case planMin, planMax:
+		if !v.IsNull() {
+			if !a.hasCur {
+				a.cur, a.hasCur = v, true
+			} else {
+				c := valueCmp(a.cur, v)
+				keepCur := (a.plan == planMin && c <= 0) || (a.plan == planMax && c >= 0)
+				if !keepCur {
+					a.cur = v
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// finalize produces the aggregate's final value over the group. COUNT → its count (0 over
+// empty); SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
+func (a *acc) finalize() (Value, error) {
+	switch a.plan {
+	case planCountStar, planCount:
+		return IntValue(a.count), nil
+	case planSumInt:
+		if a.seen {
+			return IntValue(a.sumInt), nil
+		}
+		return NullValue(), nil
+	case planSumDecimal:
+		if a.seen {
+			return DecimalValue(a.sumDec), nil
+		}
+		return NullValue(), nil
+	case planAvg:
+		if a.count == 0 {
+			return NullValue(), nil
+		}
+		d, err := a.sumDec.Div(DecimalFromInt64(a.count))
+		if err != nil {
+			return NullValue(), err
+		}
+		return DecimalValue(d), nil
+	default: // planMin, planMax
+		if a.hasCur {
+			return a.cur, nil
+		}
+		return NullValue(), nil
+	}
+}
+
+// itemsHaveAggregate reports whether any select item contains an aggregate call.
+func itemsHaveAggregate(items SelectItems) bool {
+	if items.All {
+		return false
+	}
+	for _, it := range items.Items {
+		if exprHasFuncCall(it.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// exprHasFuncCall reports whether an expression tree contains a function (aggregate) call.
+func exprHasFuncCall(e Expr) bool {
+	switch e.Kind {
+	case ExprFuncCall:
+		return true
+	case ExprCast:
+		return exprHasFuncCall(e.Cast.Inner)
+	case ExprUnary:
+		return exprHasFuncCall(e.Unary.Operand)
+	case ExprIsNull:
+		return exprHasFuncCall(e.IsNullOf.Operand)
+	case ExprBinary:
+		return exprHasFuncCall(e.Binary.Lhs) || exprHasFuncCall(e.Binary.Rhs)
+	case ExprIsDistinct:
+		return exprHasFuncCall(e.IsDistinct.Lhs) || exprHasFuncCall(e.IsDistinct.Rhs)
+	default:
+		return false
+	}
+}
+
+// resolveAggregate resolves an aggregate call into a synthetic-row reference, collecting its
+// aggSpec. Valid only in collect mode; in Forbidden mode (WHERE/ON/nested) it is 42803. The
+// operand resolves in a fresh Forbidden sub-context (a nested aggregate is 42803; its columns
+// resolve against the real row). The result type follows the PG widening (aggregates.md §3).
+func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedType, error) {
+	if !ag.collecting {
+		return nil, resolvedType{}, NewError(GroupingError, "aggregate functions are not allowed here")
+	}
+	name := toLowerASCII(fc.Name)
+	sub := &aggCtx{collecting: false}
+	var (
+		plan    aggPlan
+		operand *rExpr
+		result  resolvedType
+	)
+	switch name {
+	case "count":
+		if fc.Star {
+			plan, operand, result = planCountStar, nil, resolvedType{kind: rtInt, intTy: Int64}
+		} else {
+			r, _, err := resolve(s, *fc.Arg, nil, sub)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			plan, operand, result = planCount, r, resolvedType{kind: rtInt, intTy: Int64}
+		}
+	case "sum", "avg", "min", "max":
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		r, t, err := resolve(s, *fc.Arg, nil, sub)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		switch name {
+		case "sum":
+			switch {
+			case t.kind == rtInt && t.intTy == Int64:
+				plan, operand, result = planSumDecimal, r, resolvedType{kind: rtDecimal}
+			case t.kind == rtInt:
+				plan, operand, result = planSumInt, r, resolvedType{kind: rtInt, intTy: Int64}
+			case t.kind == rtDecimal:
+				plan, operand, result = planSumDecimal, r, resolvedType{kind: rtDecimal}
+			default:
+				return nil, resolvedType{}, noAggOverload("sum")
+			}
+		case "avg":
+			if t.kind == rtInt || t.kind == rtDecimal {
+				plan, operand, result = planAvg, r, resolvedType{kind: rtDecimal}
+			} else {
+				return nil, resolvedType{}, noAggOverload("avg")
+			}
+		case "min":
+			plan, operand, result = planMin, r, t
+		case "max":
+			plan, operand, result = planMax, r, t
+		}
+	default:
+		return nil, resolvedType{}, NewError(UndefinedFunction, "function does not exist: "+fc.Name)
+	}
+	slot := len(ag.specs)
+	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand})
+	return &rExpr{kind: reColumn, index: slot}, result, nil
+}
+
+// noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
+func noAggOverload(fn string) error {
+	return NewError(UndefinedFunction, "no "+fn+" aggregate for that argument type")
+}
+
+// groupingErrorColumn is the 42803 for a non-aggregated column with no GROUP BY.
+func groupingErrorColumn(name string) error {
+	return NewError(GroupingError, "column "+name+" must appear in the GROUP BY clause or be used in an aggregate function")
+}
+
+// ============================================================================
 // Resolution scope (multi-table FROM — spec/design/grammar.md §15).
 //
 // A scope is the ordered list of relations a SELECT's FROM clause puts in scope, each
@@ -1008,7 +1328,7 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
 // each relation's columns in catalog order (§15).
-func resolveProjections(s *scope, items SelectItems) ([]*rExpr, []string, error) {
+func resolveProjections(s *scope, items SelectItems, ag *aggCtx) ([]*rExpr, []string, error) {
 	if items.All {
 		var ps []*rExpr
 		var names []string
@@ -1023,7 +1343,7 @@ func resolveProjections(s *scope, items SelectItems) ([]*rExpr, []string, error)
 	ps := make([]*rExpr, 0, len(items.Items))
 	names := make([]string, 0, len(items.Items))
 	for _, it := range items.Items {
-		node, _, err := resolve(s, it.Expr, nil)
+		node, _, err := resolve(s, it.Expr, nil, ag)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1053,6 +1373,9 @@ func outputName(s *scope, e Expr) string {
 			return s.columnAt(idx).Name
 		}
 		return e.Column
+	case ExprFuncCall:
+		// An un-aliased aggregate call is named by its lowercased function name (PG; §8).
+		return toLowerASCII(e.FuncCall.Name)
 	default:
 		return "?column?"
 	}
@@ -1061,7 +1384,8 @@ func outputName(s *scope, e Expr) string {
 // resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an
 // untyped NULL, which is always unknown → no rows). An integer- or text-valued one is 42804.
 func resolveBooleanFilter(s *scope, e *Expr) (*rExpr, error) {
-	node, ty, err := resolve(s, *e, nil)
+	// WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
+	node, ty, err := resolve(s, *e, nil, &aggCtx{collecting: false})
 	if err != nil {
 		return nil, err
 	}
@@ -1074,12 +1398,17 @@ func resolveBooleanFilter(s *scope, e *Expr) (*rExpr, error) {
 // resolve resolves one Expr into an rExpr plus its static type. ctx (non-nil) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); nil
 // defaults a bare literal to int64.
-func resolve(s *scope, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
+func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedType, error) {
 	switch e.Kind {
 	case ExprColumn:
+		// Resolve for existence first (42703/42702 take priority, matching PostgreSQL); then
+		// in an aggregate query's projection a bare non-grouped column is 42803.
 		idx, err := s.resolveBare(e.Column)
 		if err != nil {
 			return nil, resolvedType{}, err
+		}
+		if ag.collecting {
+			return nil, resolvedType{}, groupingErrorColumn(e.Column)
 		}
 		return &rExpr{kind: reColumn, index: idx}, resolvedTypeOf(s.columnAt(idx).Type), nil
 	case ExprQualifiedColumn:
@@ -1087,7 +1416,12 @@ func resolve(s *scope, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		if ag.collecting {
+			return nil, resolvedType{}, groupingErrorColumn(e.Column)
+		}
 		return &rExpr{kind: reColumn, index: idx}, resolvedTypeOf(s.columnAt(idx).Type), nil
+	case ExprFuncCall:
+		return resolveAggregate(s, e.FuncCall, ag)
 	case ExprLiteral:
 		switch e.Literal.Kind {
 		case LiteralNull:
@@ -1149,7 +1483,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
 		if target.IsBytea() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to bytea is not supported yet")
 		}
-		inner, ity, err := resolve(s, e.Cast.Inner, nil)
+		inner, ity, err := resolve(s, e.Cast.Inner, nil, ag)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1173,7 +1507,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
 		return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod}, resultRt, nil
 	case ExprUnary:
 		if e.Unary.Op == OpNeg {
-			rop, ty, err := resolve(s, e.Unary.Operand, ctx)
+			rop, ty, err := resolve(s, e.Unary.Operand, ctx, ag)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1192,7 +1526,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
 			}
 		}
 		// OpNot
-		rop, ty, err := resolve(s, e.Unary.Operand, nil)
+		rop, ty, err := resolve(s, e.Unary.Operand, nil, ag)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1201,7 +1535,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
 		}
 		return &rExpr{kind: reNot, operand: rop}, resolvedType{kind: rtBool}, nil
 	case ExprIsNull:
-		rop, _, err := resolve(s, e.IsNullOf.Operand, nil)
+		rop, _, err := resolve(s, e.IsNullOf.Operand, nil, ag)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1212,7 +1546,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
 		// literal adapts to its sibling; a text literal stays text), then require the
 		// operands be comparable (both integer-ish or both text-ish; a mixed pair is
 		// 42804). The result is always a definite boolean (functions.md §3).
-		rl, lt, rr, rt, err := resolveOperandPair(s, e.IsDistinct.Lhs, e.IsDistinct.Rhs)
+		rl, lt, rr, rt, err := resolveOperandPair(s, e.IsDistinct.Lhs, e.IsDistinct.Rhs, ag)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1222,18 +1556,18 @@ func resolve(s *scope, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
 		return &rExpr{kind: reDistinct, lhs: rl, rhs: rr, negated: e.IsDistinct.Negated},
 			resolvedType{kind: rtBool}, nil
 	default: // ExprBinary
-		return resolveBinary(s, e.Binary)
+		return resolveBinary(s, e.Binary, ag)
 	}
 }
 
-func resolveBinary(s *scope, b *BinaryExpr) (*rExpr, resolvedType, error) {
+func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx) (*rExpr, resolvedType, error) {
 	switch b.Op {
 	case OpAdd, OpSub, OpMul, OpDiv, OpMod:
 		// Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
 		// integer literal adapts to an integer sibling), then pick the family: both integer →
 		// integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
 		// widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
-		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs)
+		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs, ag)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1255,7 +1589,7 @@ func resolveBinary(s *scope, b *BinaryExpr) (*rExpr, resolvedType, error) {
 		// the operands (a literal adapts to its sibling; text literals stay text), then
 		// require they be comparable — a mixed integer/text pair is 42804. The runtime
 		// comparison (Eq3/Lt3/Gt3) dispatches on the value kinds.
-		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs)
+		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs, ag)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1265,11 +1599,11 @@ func resolveBinary(s *scope, b *BinaryExpr) (*rExpr, resolvedType, error) {
 		return &rExpr{kind: reCompare, op: b.Op, lhs: rl, rhs: rr},
 			resolvedType{kind: rtBool}, nil
 	default: // OpAnd, OpOr
-		rl, lt, err := resolve(s, b.Lhs, nil)
+		rl, lt, err := resolve(s, b.Lhs, nil, ag)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		rr, rt, err := resolve(s, b.Rhs, nil)
+		rr, rt, err := resolve(s, b.Rhs, nil, ag)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1294,7 +1628,7 @@ func resolveBinary(s *scope, b *BinaryExpr) (*rExpr, resolvedType, error) {
 // context (ctxOf returns nil) and defaults to int64 — the caller's family check then
 // reports the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
 // classifyComparable (comparison) layer that on top.
-func resolveOperandPair(s *scope, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
+func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
 	lhsLit := isAdaptableLiteral(lhs)
 	rhsLit := isAdaptableLiteral(rhs)
 	var rl, rr *rExpr
@@ -1303,25 +1637,25 @@ func resolveOperandPair(s *scope, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, 
 	switch {
 	case lhsLit && rhsLit:
 		i64 := Int64
-		if rl, lt, err = resolve(s, lhs, &i64); err != nil {
+		if rl, lt, err = resolve(s, lhs, &i64, ag); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rr, rt, err = resolve(s, rhs, &i64)
+		rr, rt, err = resolve(s, rhs, &i64, ag)
 	case lhsLit:
-		if rr, rt, err = resolve(s, rhs, nil); err != nil {
+		if rr, rt, err = resolve(s, rhs, nil, ag); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rl, lt, err = resolve(s, lhs, ctxOf(rt))
+		rl, lt, err = resolve(s, lhs, ctxOf(rt), ag)
 	case rhsLit:
-		if rl, lt, err = resolve(s, lhs, nil); err != nil {
+		if rl, lt, err = resolve(s, lhs, nil, ag); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rr, rt, err = resolve(s, rhs, ctxOf(lt))
+		rr, rt, err = resolve(s, rhs, ctxOf(lt), ag)
 	default:
-		if rl, lt, err = resolve(s, lhs, nil); err != nil {
+		if rl, lt, err = resolve(s, lhs, nil, ag); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rr, rt, err = resolve(s, rhs, nil)
+		rr, rt, err = resolve(s, rhs, nil, ag)
 	}
 	if err != nil {
 		return nil, resolvedType{}, nil, resolvedType{}, err

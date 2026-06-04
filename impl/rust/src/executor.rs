@@ -442,7 +442,7 @@ impl Database {
             // operand adapts to the target column's type. The result must be assignable to
             // the column's family (integer/decimal/text or NULL; never boolean; decimal→int
             // is explicit-CAST only) — spec/design/decimal.md §6.
-            let (source, ty) = resolve(&scope, &a.value, Some(col.ty))?;
+            let (source, ty) = resolve(&scope, &a.value, Some(col.ty), &mut AggCtx::Forbidden)?;
             require_assignable(ty, col.ty, &a.column)?;
             plans.push(AssignPlan {
                 idx,
@@ -533,7 +533,38 @@ impl Database {
         // Resolve projections (paired with output column names — grammar.md §8), the optional
         // WHERE (must be boolean), and the ORDER BY keys against the full scope. A bare key
         // ambiguous across relations is 42702; an unknown qualifier is 42P01 (§15).
-        let (projections, column_names) = resolve_projections(&scope, &sel.items)?;
+        // Detect an aggregate query (any select item contains an aggregate call). Its
+        // projection resolves in Collect mode — aggregates collect into synthetic slots and a
+        // bare non-grouped column is 42803 (spec/design/aggregates.md §4); a non-aggregate
+        // query resolves in Forbidden mode (columns normal; a stray aggregate would be 42803).
+        let is_agg = items_have_aggregate(&sel.items);
+        let mut agg_ctx = if is_agg {
+            AggCtx::Collect(Vec::new())
+        } else {
+            AggCtx::Forbidden
+        };
+        let (projections, column_names) = resolve_projections(&scope, &sel.items, &mut agg_ctx)?;
+        let agg_specs: Vec<AggSpec> = match agg_ctx {
+            AggCtx::Collect(specs) => specs,
+            AggCtx::Forbidden => Vec::new(),
+        };
+        // Slice-1 narrowing: ORDER BY / DISTINCT over an aggregate query's output need
+        // output-scope resolution (the synthetic group row), which lands with GROUP BY
+        // (spec/design/aggregates.md §10). Reject them for now.
+        if is_agg {
+            if !sel.order_by.is_empty() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "ORDER BY with aggregates is not supported yet",
+                ));
+            }
+            if sel.distinct {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "SELECT DISTINCT with aggregates is not supported yet",
+                ));
+            }
+        }
         let filter = match &sel.filter {
             Some(p) => Some(resolve_boolean_filter(&scope, p)?),
             None => None,
@@ -712,7 +743,42 @@ impl Database {
         // source rows and ONLY the windowed rows are projected; with DISTINCT every
         // (sorted) filtered row is projected — dedup must see them all — duplicates drop
         // by first occurrence, and the window then slices the DISTINCT rows.
-        let out_rows = if sel.distinct {
+        let out_rows = if is_agg {
+            // Aggregate query (slice 1: one group, no GROUP BY). Fold every filtered row into
+            // the accumulators — charging aggregate_accumulate per (row × aggregate) and the
+            // operand's own operator_evals — then finalize to the synthetic row [agg_0..] and
+            // project it. Even an empty input yields ONE group row (COUNT 0, others NULL —
+            // spec/design/aggregates.md §4). The bucketing/finalize is unmetered (cost.md §3).
+            let mut accs: Vec<Acc> = agg_specs.iter().map(|s| Acc::new(s.plan)).collect();
+            for row in &rows {
+                for (spec, acc) in agg_specs.iter().zip(accs.iter_mut()) {
+                    meter.charge(COSTS.aggregate_accumulate);
+                    let v = match &spec.operand {
+                        Some(op) => op.eval(row, &mut meter)?,
+                        None => Value::Null, // COUNT(*) ignores the value
+                    };
+                    acc.fold(v)?;
+                }
+            }
+            let mut synthetic = Vec::with_capacity(accs.len());
+            for acc in accs {
+                synthetic.push(acc.finalize()?);
+            }
+            // The single group row, then the LIMIT/OFFSET window over it (LIMIT 0 → no rows).
+            // Only an emitted row charges row_produced + its projection operator_evals (§3).
+            let group_rows = vec![synthetic];
+            let (start, end) = window_bounds(group_rows.len());
+            let mut out_rows = Vec::with_capacity(end - start);
+            for srow in &group_rows[start..end] {
+                meter.charge(COSTS.row_produced);
+                let mut out = Vec::with_capacity(projections.len());
+                for p in &projections {
+                    out.push(p.eval(srow, &mut meter)?);
+                }
+                out_rows.push(out);
+            }
+            out_rows
+        } else if sel.distinct {
             // Project every filtered row (charging projection cost per row, the §3
             // asymmetry), keeping first occurrences. `seen` is membership-only: the
             // output order comes from the deterministic source iteration, never from set
@@ -954,11 +1020,335 @@ enum RExpr {
     },
 }
 
+// ============================================================================
+// Aggregate resolution + accumulation (spec/design/aggregates.md).
+//
+// An aggregate query's select list resolves in `Collect` mode: each aggregate call is
+// collected into an `AggSpec` (its plan + resolved argument) and replaced by a reference to
+// a synthetic-row slot (an `RExpr::Column(slot)` indexing the finalized aggregate results),
+// so the existing evaluator projects the result with no new node. Outside Collect mode
+// (`Forbidden`: WHERE / ON / an aggregate's own argument / any non-aggregate query) a column
+// resolves normally and an aggregate call is a 42803 grouping error.
+// ============================================================================
+
+/// The aggregate-resolution context threaded through `resolve`.
+enum AggCtx {
+    /// Aggregates are not allowed here (a FuncCall is 42803); columns resolve normally.
+    Forbidden,
+    /// An aggregate query's projection: a FuncCall collects into `0` and resolves to a
+    /// synthetic slot; a bare column (not grouped — no GROUP BY this slice) is 42803.
+    Collect(Vec<AggSpec>),
+}
+
+/// The five aggregate functions, parsed from a call name (case-insensitive).
+#[derive(Clone, Copy)]
+enum AggFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+/// The runtime plan for one aggregate, fixed at resolve from the function + operand type
+/// (the PG widening — spec/design/aggregates.md §3).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AggPlan {
+    /// COUNT(*) — count every row (NULLs included).
+    CountStar,
+    /// COUNT(expr) — count non-NULL inputs.
+    Count,
+    /// SUM(int16|int32) — accumulate i64, result int64 (traps 22003 at the int64 bound).
+    SumInt,
+    /// SUM(int64|decimal) — accumulate decimal, result decimal (traps 22003 at the cap).
+    SumDecimal,
+    /// AVG — accumulate a decimal sum + i64 count; result sum/count (decimal), NULL if count 0.
+    Avg,
+    Min,
+    Max,
+}
+
+/// One resolved aggregate: its plan and its resolved argument expression (evaluated per
+/// input row against the real row). `operand` is `None` for COUNT(*).
+struct AggSpec {
+    plan: AggPlan,
+    operand: Option<RExpr>,
+}
+
+/// A running aggregate accumulator (one per AggSpec), folded per input row then finalized.
+enum Acc {
+    CountStar(i64),
+    Count(i64),
+    SumInt { sum: i64, seen: bool },
+    SumDecimal { sum: Decimal, seen: bool },
+    Avg { sum: Decimal, count: i64 },
+    MinMax { cur: Option<Value>, is_min: bool },
+}
+
+impl Acc {
+    fn new(plan: AggPlan) -> Acc {
+        match plan {
+            AggPlan::CountStar => Acc::CountStar(0),
+            AggPlan::Count => Acc::Count(0),
+            AggPlan::SumInt => Acc::SumInt {
+                sum: 0,
+                seen: false,
+            },
+            AggPlan::SumDecimal => Acc::SumDecimal {
+                sum: Decimal::from_i64(0),
+                seen: false,
+            },
+            AggPlan::Avg => Acc::Avg {
+                sum: Decimal::from_i64(0),
+                count: 0,
+            },
+            AggPlan::Min => Acc::MinMax {
+                cur: None,
+                is_min: true,
+            },
+            AggPlan::Max => Acc::MinMax {
+                cur: None,
+                is_min: false,
+            },
+        }
+    }
+
+    /// Fold one input value into the accumulator. NULL arguments are skipped (COUNT(*) ignores
+    /// the value and always counts). Traps 22003 on SUM/AVG overflow at the result bound.
+    fn fold(&mut self, value: Value) -> Result<()> {
+        match self {
+            Acc::CountStar(n) => *n += 1,
+            Acc::Count(n) => {
+                if !matches!(value, Value::Null) {
+                    *n += 1;
+                }
+            }
+            Acc::SumInt { sum, seen } => {
+                if let Value::Int(v) = value {
+                    *sum = sum
+                        .checked_add(v)
+                        .ok_or_else(|| overflow(ScalarType::Int64))?;
+                    *seen = true;
+                }
+            }
+            Acc::SumDecimal { sum, seen } => {
+                if !matches!(value, Value::Null) {
+                    *sum = sum.add(&to_decimal(value))?;
+                    *seen = true;
+                }
+            }
+            Acc::Avg { sum, count } => {
+                if !matches!(value, Value::Null) {
+                    *sum = sum.add(&to_decimal(value))?;
+                    *count += 1;
+                }
+            }
+            Acc::MinMax { cur, is_min } => {
+                if !matches!(value, Value::Null) {
+                    let next = match cur.take() {
+                        None => value,
+                        Some(c) => {
+                            let ord = value_cmp(&c, &value);
+                            let keep_current = if *is_min {
+                                ord != std::cmp::Ordering::Greater
+                            } else {
+                                ord != std::cmp::Ordering::Less
+                            };
+                            if keep_current { c } else { value }
+                        }
+                    };
+                    *cur = Some(next);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Produce the aggregate's final value over the group. COUNT → its count (0 over empty);
+    /// SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
+    fn finalize(self) -> Result<Value> {
+        Ok(match self {
+            Acc::CountStar(n) | Acc::Count(n) => Value::Int(n),
+            Acc::SumInt { sum, seen } => {
+                if seen {
+                    Value::Int(sum)
+                } else {
+                    Value::Null
+                }
+            }
+            Acc::SumDecimal { sum, seen } => {
+                if seen {
+                    Value::Decimal(sum)
+                } else {
+                    Value::Null
+                }
+            }
+            Acc::Avg { sum, count } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Decimal(sum.div(&Decimal::from_i64(count))?)
+                }
+            }
+            Acc::MinMax { cur, .. } => cur.unwrap_or(Value::Null),
+        })
+    }
+}
+
+/// Whether any select item contains an aggregate call — i.e. this is an aggregate query.
+fn items_have_aggregate(items: &SelectItems) -> bool {
+    match items {
+        SelectItems::All => false,
+        SelectItems::Items(items) => items.iter().any(|it| expr_has_funccall(&it.expr)),
+    }
+}
+
+/// Whether an expression tree contains a function (aggregate) call anywhere.
+fn expr_has_funccall(e: &Expr) -> bool {
+    match e {
+        Expr::FuncCall { .. } => true,
+        Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::Literal(_) => false,
+        Expr::Cast { inner, .. } => expr_has_funccall(inner),
+        Expr::Unary { operand, .. } => expr_has_funccall(operand),
+        Expr::IsNull { operand, .. } => expr_has_funccall(operand),
+        Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+            expr_has_funccall(lhs) || expr_has_funccall(rhs)
+        }
+    }
+}
+
+/// Parse an aggregate function name (case-insensitive); an unknown name is 42883.
+fn parse_agg_func(name: &str) -> Result<AggFunc> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "count" => AggFunc::Count,
+        "sum" => AggFunc::Sum,
+        "min" => AggFunc::Min,
+        "max" => AggFunc::Max,
+        "avg" => AggFunc::Avg,
+        _ => {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                format!("function does not exist: {name}"),
+            ));
+        }
+    })
+}
+
+/// Resolve an aggregate call into a synthetic-row reference, collecting its `AggSpec`. Only
+/// valid in `Collect` mode; in `Forbidden` mode (WHERE/ON/nested) it is 42803. The operand is
+/// resolved in a fresh `Forbidden` sub-context (a nested aggregate is 42803; its columns
+/// resolve against the real row). The result type follows the PG widening (aggregates.md §3).
+fn resolve_aggregate(
+    scope: &Scope,
+    name: &str,
+    arg: Option<&Expr>,
+    star: bool,
+    agg: &mut AggCtx,
+) -> Result<(RExpr, ResolvedType)> {
+    if matches!(agg, AggCtx::Forbidden) {
+        return Err(EngineError::new(
+            SqlState::GroupingError,
+            "aggregate functions are not allowed here",
+        ));
+    }
+    let func = parse_agg_func(name)?;
+    let mut sub = AggCtx::Forbidden;
+    let (plan, operand, result) = match func {
+        AggFunc::Count if star => (
+            AggPlan::CountStar,
+            None,
+            ResolvedType::Int(ScalarType::Int64),
+        ),
+        AggFunc::Count => {
+            let (r, _t) = resolve(scope, expect_arg(arg)?, None, &mut sub)?;
+            (
+                AggPlan::Count,
+                Some(r),
+                ResolvedType::Int(ScalarType::Int64),
+            )
+        }
+        _ if star => {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        AggFunc::Sum => {
+            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub)?;
+            match t {
+                // int16/int32 -> int64 (accumulate i64); int64 -> decimal (PG widening).
+                ResolvedType::Int(it) if it == ScalarType::Int64 => {
+                    (AggPlan::SumDecimal, Some(r), ResolvedType::Decimal)
+                }
+                ResolvedType::Int(_) => (
+                    AggPlan::SumInt,
+                    Some(r),
+                    ResolvedType::Int(ScalarType::Int64),
+                ),
+                ResolvedType::Decimal => (AggPlan::SumDecimal, Some(r), ResolvedType::Decimal),
+                _ => return Err(no_agg_overload("sum")),
+            }
+        }
+        AggFunc::Avg => {
+            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub)?;
+            match t {
+                ResolvedType::Int(_) | ResolvedType::Decimal => {
+                    (AggPlan::Avg, Some(r), ResolvedType::Decimal)
+                }
+                _ => return Err(no_agg_overload("avg")),
+            }
+        }
+        // MIN/MAX accept any ordered scalar; the result is the argument's type.
+        AggFunc::Min => {
+            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub)?;
+            (AggPlan::Min, Some(r), t)
+        }
+        AggFunc::Max => {
+            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub)?;
+            (AggPlan::Max, Some(r), t)
+        }
+    };
+    if let AggCtx::Collect(specs) = agg {
+        let slot = specs.len();
+        specs.push(AggSpec { plan, operand });
+        Ok((RExpr::Column(slot), result))
+    } else {
+        unreachable!("an aggregate in a non-Collect context is handled above")
+    }
+}
+
+/// The single argument of a non-star aggregate call (the parser guarantees one is present).
+fn expect_arg(arg: Option<&Expr>) -> Result<&Expr> {
+    arg.ok_or_else(|| EngineError::new(SqlState::SyntaxError, "aggregate requires an argument"))
+}
+
+/// An aggregate over an operand family it has no overload for (e.g. SUM(text)) — 42883.
+fn no_agg_overload(func: &str) -> EngineError {
+    EngineError::new(
+        SqlState::UndefinedFunction,
+        format!("no {func} aggregate for that argument type"),
+    )
+}
+
+/// The 42803 raised for a non-aggregated column outside an aggregate with no GROUP BY.
+fn grouping_error_column(name: &str) -> EngineError {
+    EngineError::new(
+        SqlState::GroupingError,
+        format!(
+            "column {name} must appear in the GROUP BY clause or be used in an aggregate function"
+        ),
+    )
+}
+
 /// Resolve `SELECT` items against the FROM scope into evaluable projections (any result type
 /// is allowed in the select list, including boolean — `SELECT a = b`), each paired with its
 /// output column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM
 /// order, each relation's columns in catalog order (§15).
-fn resolve_projections(scope: &Scope, items: &SelectItems) -> Result<(Vec<RExpr>, Vec<String>)> {
+fn resolve_projections(
+    scope: &Scope,
+    items: &SelectItems,
+    agg: &mut AggCtx,
+) -> Result<(Vec<RExpr>, Vec<String>)> {
     match items {
         SelectItems::All => {
             let mut nodes = Vec::new();
@@ -975,7 +1365,7 @@ fn resolve_projections(scope: &Scope, items: &SelectItems) -> Result<(Vec<RExpr>
             let mut nodes = Vec::with_capacity(items.len());
             let mut names = Vec::with_capacity(items.len());
             for it in items {
-                let (node, _) = resolve(scope, &it.expr, None)?;
+                let (node, _) = resolve(scope, &it.expr, None, agg)?;
                 names.push(match &it.alias {
                     Some(a) => a.clone(),
                     None => output_name(scope, &it.expr),
@@ -1003,6 +1393,9 @@ fn output_name(scope: &Scope, e: &Expr) -> String {
             Ok(idx) => scope.column_at(idx).name.clone(),
             Err(_) => name.clone(),
         },
+        // An un-aliased aggregate call is named by its lowercased function name (PG;
+        // spec/design/grammar.md §8). Any other expression takes the fixed `?column?`.
+        Expr::FuncCall { name, .. } => name.to_ascii_lowercase(),
         _ => "?column?".to_string(),
     }
 }
@@ -1010,7 +1403,9 @@ fn output_name(scope: &Scope, e: &Expr) -> String {
 /// Resolve a WHERE / ON expression: it must resolve to boolean (or an untyped NULL, which
 /// is always unknown → no rows). An integer-valued WHERE/ON is a 42804 type error.
 fn resolve_boolean_filter(scope: &Scope, e: &Expr) -> Result<RExpr> {
-    let (node, ty) = resolve(scope, e, None)?;
+    // WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
+    let mut agg = AggCtx::Forbidden;
+    let (node, ty) = resolve(scope, e, None, &mut agg)?;
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(node),
         ResolvedType::Int(_) | ResolvedType::Text | ResolvedType::Decimal | ResolvedType::Bytea => {
@@ -1039,17 +1434,33 @@ fn resolved_type_of(ty: ScalarType) -> ResolvedType {
 /// defaults a bare literal to int64. A column reference resolves to a flat row index via the
 /// scope — a bare name ambiguous across relations is 42702, an unknown qualifier is 42P01
 /// (spec/design/grammar.md §15).
-fn resolve(scope: &Scope, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, ResolvedType)> {
+fn resolve(
+    scope: &Scope,
+    e: &Expr,
+    ctx: Option<ScalarType>,
+    agg: &mut AggCtx,
+) -> Result<(RExpr, ResolvedType)> {
     match e {
         Expr::Column(name) => {
+            // Resolve for existence first (42703/42702 take priority, matching PostgreSQL);
+            // then in an aggregate query's projection a bare non-grouped column is 42803.
             let idx = scope.resolve_bare(name)?;
+            if matches!(agg, AggCtx::Collect(_)) {
+                return Err(grouping_error_column(name));
+            }
             let ty = scope.column_at(idx).ty;
             Ok((RExpr::Column(idx), resolved_type_of(ty)))
         }
         Expr::QualifiedColumn { qualifier, name } => {
             let idx = scope.resolve_qualified(qualifier, name)?;
+            if matches!(agg, AggCtx::Collect(_)) {
+                return Err(grouping_error_column(name));
+            }
             let ty = scope.column_at(idx).ty;
             Ok((RExpr::Column(idx), resolved_type_of(ty)))
+        }
+        Expr::FuncCall { name, arg, star } => {
+            resolve_aggregate(scope, name, arg.as_deref(), *star, agg)
         }
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
@@ -1119,7 +1530,7 @@ fn resolve(scope: &Scope, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             }
             // The inner value is range-checked / coerced against `target` at eval, so it
             // resolves with no literal context here.
-            let (rinner, ity) = resolve(scope, inner, None)?;
+            let (rinner, ity) = resolve(scope, inner, None, agg)?;
             match ity {
                 // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
                 // decimal→decimal (re-scale), and NULL are all castable.
@@ -1163,7 +1574,7 @@ fn resolve(scope: &Scope, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             op: UnaryOp::Neg,
             operand,
         } => {
-            let (rop, ty) = resolve(scope, operand, ctx)?;
+            let (rop, ty) = resolve(scope, operand, ctx, agg)?;
             let result = match ty {
                 ResolvedType::Int(t) => t,
                 ResolvedType::Decimal => ScalarType::Decimal,
@@ -1189,13 +1600,13 @@ fn resolve(scope: &Scope, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             op: UnaryOp::Not,
             operand,
         } => {
-            let (rop, ty) = resolve(scope, operand, None)?;
+            let (rop, ty) = resolve(scope, operand, None, agg)?;
             require_bool(ty, "NOT requires a boolean operand")?;
             Ok((RExpr::Not(Box::new(rop)), ResolvedType::Bool))
         }
         Expr::IsNull { operand, negated } => {
             // IS [NOT] NULL accepts any operand type and always yields a definite boolean.
-            let (rop, _ty) = resolve(scope, operand, None)?;
+            let (rop, _ty) = resolve(scope, operand, None, agg)?;
             Ok((
                 RExpr::IsNull {
                     operand: Box::new(rop),
@@ -1209,7 +1620,7 @@ fn resolve(scope: &Scope, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             // (a literal adapts to its sibling; a text literal stays text), then require
             // the operands be comparable (both integer-ish or both text-ish; a mixed pair
             // is 42804). The result is always a definite boolean (functions.md §3).
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs)?;
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg)?;
             classify_comparable(lt, rt)?;
             Ok((
                 RExpr::Distinct {
@@ -1220,7 +1631,7 @@ fn resolve(scope: &Scope, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
                 ResolvedType::Bool,
             ))
         }
-        Expr::Binary { op, lhs, rhs } => resolve_binary(scope, *op, lhs, rhs),
+        Expr::Binary { op, lhs, rhs } => resolve_binary(scope, *op, lhs, rhs, agg),
     }
 }
 
@@ -1229,6 +1640,7 @@ fn resolve_binary(
     op: BinaryOp,
     lhs: &Expr,
     rhs: &Expr,
+    agg: &mut AggCtx,
 ) -> Result<(RExpr, ResolvedType)> {
     match op {
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
@@ -1237,7 +1649,7 @@ fn resolve_binary(
             // integer → integer arithmetic (promotion tower); at least one decimal → decimal
             // arithmetic (the integer operand widens at eval); a text/boolean operand is a
             // 42804 (spec/design/decimal.md §4).
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs)?;
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg)?;
             require_numeric_operand(lt)?;
             require_numeric_operand(rt)?;
             let aop = match op {
@@ -1269,7 +1681,7 @@ fn resolve_binary(
             // Resolve the operands (a literal adapts to its sibling; text literals stay
             // text), then require they be comparable — a mixed integer/text pair is 42804.
             // The runtime comparison (eq3/lt3/gt3) dispatches on the value variants.
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs)?;
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg)?;
             classify_comparable(lt, rt)?;
             let cop = match op {
                 BinaryOp::Eq => CmpOp::Eq,
@@ -1289,8 +1701,8 @@ fn resolve_binary(
             ))
         }
         BinaryOp::And | BinaryOp::Or => {
-            let (rl, lt) = resolve(scope, lhs, None)?;
-            let (rr, rt) = resolve(scope, rhs, None)?;
+            let (rl, lt) = resolve(scope, lhs, None, agg)?;
+            let (rr, rt) = resolve(scope, rhs, None, agg)?;
             require_bool(lt, "AND/OR requires boolean operands")?;
             require_bool(rt, "AND/OR requires boolean operands")?;
             let node = if matches!(op, BinaryOp::And) {
@@ -1314,26 +1726,27 @@ fn resolve_operand_pair(
     scope: &Scope,
     lhs: &Expr,
     rhs: &Expr,
+    agg: &mut AggCtx,
 ) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
     let lhs_lit = is_adaptable_literal(lhs);
     let rhs_lit = is_adaptable_literal(rhs);
     let (rl, lt, rr, rt) = if lhs_lit && rhs_lit {
         // Two bare literals: no column context. Default an integer literal to int64; a string
         // literal stays text (no bytea context to decode it — types.md §6).
-        let (rl, lt) = resolve(scope, lhs, Some(ScalarType::Int64))?;
-        let (rr, rt) = resolve(scope, rhs, Some(ScalarType::Int64))?;
+        let (rl, lt) = resolve(scope, lhs, Some(ScalarType::Int64), agg)?;
+        let (rr, rt) = resolve(scope, rhs, Some(ScalarType::Int64), agg)?;
         (rl, lt, rr, rt)
     } else if lhs_lit {
-        let (rr, rt) = resolve(scope, rhs, None)?;
-        let (rl, lt) = resolve(scope, lhs, ctx_of(rt))?;
+        let (rr, rt) = resolve(scope, rhs, None, agg)?;
+        let (rl, lt) = resolve(scope, lhs, ctx_of(rt), agg)?;
         (rl, lt, rr, rt)
     } else if rhs_lit {
-        let (rl, lt) = resolve(scope, lhs, None)?;
-        let (rr, rt) = resolve(scope, rhs, ctx_of(lt))?;
+        let (rl, lt) = resolve(scope, lhs, None, agg)?;
+        let (rr, rt) = resolve(scope, rhs, ctx_of(lt), agg)?;
         (rl, lt, rr, rt)
     } else {
-        let (rl, lt) = resolve(scope, lhs, None)?;
-        let (rr, rt) = resolve(scope, rhs, None)?;
+        let (rl, lt) = resolve(scope, lhs, None, agg)?;
+        let (rr, rt) = resolve(scope, rhs, None, agg)?;
         (rl, lt, rr, rt)
     };
     Ok((rl, lt, rr, rt))

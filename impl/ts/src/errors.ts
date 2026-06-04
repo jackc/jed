@@ -26,6 +26,8 @@ export type SqlState =
   | "duplicate_column" // 42701
   | "duplicate_alias" // 42712 — two FROM relations share a label (a self-join needs aliases; §15)
   | "invalid_table_definition" // 42P16 — e.g. more than one primary key
+  | "grouping_error" // 42803 — non-aggregated column not in GROUP BY, or aggregate in WHERE/ON/nested
+  | "undefined_function" // 42883 — an unknown function name in a call (aggregates.md §5)
   | "feature_not_supported" // 0A000
   | "data_corrupted"; // XX001 — a malformed on-disk database file (CLAUDE.md §8)
 
@@ -49,6 +51,8 @@ const CODES: Record<SqlState, string> = {
   duplicate_column: "42701",
   duplicate_alias: "42712",
   invalid_table_definition: "42P16",
+  grouping_error: "42803",
+  undefined_function: "42883",
   feature_not_supported: "0A000",
   data_corrupted: "XX001",
 };

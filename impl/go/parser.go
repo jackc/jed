@@ -1042,6 +1042,13 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		p.advance()
 		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralBool, Bool: false}}, nil
 	case t.Kind == TokWord:
+		// Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
+		// first call syntax — grammar.md §17). The one-token lookahead keeps function names
+		// non-reserved (a column may be named `count`); a qualified name is never a call. Only
+		// aggregates resolve (42883 otherwise).
+		if p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == TokLParen {
+			return p.parseFunctionCall()
+		}
 		qualifier, name, err := p.parseColumnRef()
 		if err != nil {
 			return Expr{}, err
@@ -1053,6 +1060,38 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	default:
 		return Expr{}, NewError(SyntaxError, "expected an expression")
 	}
+}
+
+// parseFunctionCall parses `function_call ::= identifier "(" ( "*" | expr ) ")"` — the
+// aggregate call syntax (grammar.md §17). COUNT(*) is the star form; every other call takes
+// one general expression argument. DISTINCT inside the parens is deferred (rejected 42601).
+func (p *Parser) parseFunctionCall() (Expr, error) {
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return Expr{}, err
+	}
+	if err := p.expect(TokLParen); err != nil {
+		return Expr{}, err
+	}
+	// DISTINCT inside an aggregate (COUNT(DISTINCT x)) is deferred — reject at parse.
+	if p.peekKeyword() == "distinct" {
+		return Expr{}, NewError(SyntaxError, "DISTINCT inside an aggregate is not supported yet")
+	}
+	fc := &FuncCallExpr{Name: name}
+	if p.peek().Kind == TokStar {
+		p.advance()
+		fc.Star = true
+	} else {
+		arg, err := p.parseExpr()
+		if err != nil {
+			return Expr{}, err
+		}
+		fc.Arg = &arg
+	}
+	if err := p.expect(TokRParen); err != nil {
+		return Expr{}, err
+	}
+	return Expr{Kind: ExprFuncCall, FuncCall: fc}, nil
 }
 
 // parseColumnRef parses `column_ref ::= identifier ("." identifier)?` — a bare column name, or

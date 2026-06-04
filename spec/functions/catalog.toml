@@ -28,7 +28,9 @@ schema_version = 1
 #                 the IS [NOT] NULL tests and the keyword connectives AND/OR/NOT.
 #                 Shared across an operator's overload rows (one `=` token, two rows).
 # kind            operator class: "comparison" | "null_test" | "arithmetic" |
-#                 "logical". Reserved for a later slice: "function".
+#                 "logical". Reserved for a later slice: "function" (scalar functions).
+#                 AGGREGATE functions (COUNT/SUM/MIN/MAX/AVG) are NOT operators and live
+#                 in a separate [[aggregate]] array with kind = "aggregate" (end of file).
 # arity           operand count (2 = binary, 1 = unary).
 # arg_families    required family of each operand, by position, referencing a
 #                 `family` in ../types/scalars.toml. "any" = unconstrained.
@@ -766,3 +768,116 @@ result         = "promoted"
 null           = "propagates"
 precedence     = 60
 errors         = []
+
+# === aggregate functions =====================================================
+# Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
+# SINGLE value. They are NOT operators — no infix symbol, no precedence, no
+# arg_resolution/promotion — so they live in their OWN array with kind = "aggregate" and
+# their own field set (verify.rb validates them on a separate branch; gen_catalog.rb emits
+# a separate AGGREGATES descriptor table cross-checked per core). The reserved "function"
+# kind stays for future SCALAR functions (length/lower/…), which fit the operator
+# result/NULL mold; aggregates do not. Semantics, the SUM/AVG widening table, the NULL /
+# empty-set rules, and the GROUP BY / HAVING rules live in ../design/aggregates.md.
+#
+# field doc (aggregate) -------------------------------------------------------
+# name          internal identity + AST aggregate selector. Overloaded across operand
+#               families like operators (one row per (name, arg_families)); (name,
+#               arg_families) is unique. COUNT has two rows: count_star (the COUNT(*) row
+#               counter) and count (COUNT(expr)).
+# kind          always "aggregate".
+# surface       SQL spelling, uppercase canonical (COUNT/SUM/MIN/MAX/AVG); resolved
+#               case-insensitively — aggregate names are not reserved (grammar.md §3).
+# arg           "star" = the COUNT(*) no-expression row counter; "expr" = one general
+#               expression argument. (DISTINCT inside an aggregate is deferred — 42601.)
+# arg_families  required family of the expression argument ("any" = unconstrained).
+#               Omitted for arg = "star". SUM/AVG take a numeric family (integer/decimal —
+#               one row per family); COUNT(expr)/MIN/MAX take "any".
+# result        a scalar id (int64, decimal) OR a reserved widening id — "sum_widen"
+#               (SUM: int16/int32 -> int64, int64 -> decimal) or "same_as_input" (MIN/MAX
+#               -> the argument's type). COUNT -> int64; AVG -> decimal (sum::decimal /
+#               count::decimal, the exact decimal division, ../design/decimal.md §4).
+# null          always "aggregate": NULL inputs are SKIPPED (COUNT(*) excepted — it counts
+#               every row); over an empty/all-NULL group SUM/AVG/MIN/MAX return NULL and
+#               COUNT returns 0.
+# errors        SQLSTATE codes the aggregate may raise; SUM/AVG carry 22003 (overflow at
+#               the result type's bound — the decimal cap or int64), COUNT/MIN/MAX [].
+# -----------------------------------------------------------------------------
+
+[[aggregate]]
+name    = "count_star"
+kind    = "aggregate"
+surface = "COUNT"
+arg     = "star"
+result  = "int64"
+null    = "aggregate"
+errors  = []
+
+[[aggregate]]
+name         = "count"
+kind         = "aggregate"
+surface      = "COUNT"
+arg          = "expr"
+arg_families = ["any"]
+result       = "int64"
+null         = "aggregate"
+errors       = []
+
+[[aggregate]]
+name         = "sum"
+kind         = "aggregate"
+surface      = "SUM"
+arg          = "expr"
+arg_families = ["integer"]
+result       = "sum_widen"
+null         = "aggregate"
+errors       = ["22003"]
+
+[[aggregate]]
+name         = "sum"
+kind         = "aggregate"
+surface      = "SUM"
+arg          = "expr"
+arg_families = ["decimal"]
+result       = "decimal"
+null         = "aggregate"
+errors       = ["22003"]
+
+[[aggregate]]
+name         = "avg"
+kind         = "aggregate"
+surface      = "AVG"
+arg          = "expr"
+arg_families = ["integer"]
+result       = "decimal"
+null         = "aggregate"
+errors       = ["22003"]
+
+[[aggregate]]
+name         = "avg"
+kind         = "aggregate"
+surface      = "AVG"
+arg          = "expr"
+arg_families = ["decimal"]
+result       = "decimal"
+null         = "aggregate"
+errors       = ["22003"]
+
+[[aggregate]]
+name         = "min"
+kind         = "aggregate"
+surface      = "MIN"
+arg          = "expr"
+arg_families = ["any"]
+result       = "same_as_input"
+null         = "aggregate"
+errors       = []
+
+[[aggregate]]
+name         = "max"
+kind         = "aggregate"
+surface      = "MAX"
+arg          = "expr"
+arg_families = ["any"]
+result       = "same_as_input"
+null         = "aggregate"
+errors       = []

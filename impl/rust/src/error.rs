@@ -51,6 +51,13 @@ pub enum SqlState {
     DuplicateAlias,
     /// 42P16 — invalid table definition (e.g. more than one primary key).
     InvalidTableDefinition,
+    /// 42803 — grouping error: a non-aggregated column not in GROUP BY, or an aggregate in
+    /// a context that disallows one (WHERE / ON / nested in another aggregate;
+    /// spec/design/aggregates.md §6).
+    GroupingError,
+    /// 42883 — undefined function (an unknown function name in a call;
+    /// spec/design/aggregates.md §5).
+    UndefinedFunction,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
     /// XX001 — data corrupted (a malformed on-disk database file; CLAUDE.md §8).
@@ -79,6 +86,8 @@ impl SqlState {
             SqlState::DuplicateColumn => "42701",
             SqlState::DuplicateAlias => "42712",
             SqlState::InvalidTableDefinition => "42P16",
+            SqlState::GroupingError => "42803",
+            SqlState::UndefinedFunction => "42883",
             SqlState::FeatureNotSupported => "0A000",
             SqlState::DataCorrupted => "XX001",
         }

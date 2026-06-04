@@ -372,7 +372,7 @@ export class Database {
       // The RHS is a general expression evaluated against the OLD row; a literal operand
       // adapts to the target column's type. The result must be assignable to the column's
       // family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-      const { node, type } = resolve(scope, a.value, col.type);
+      const { node, type } = resolve(scope, a.value, col.type, { collecting: false, specs: [] });
       requireAssignable(type, col.type, a.column);
       plans.push({ idx, name: col.name, target: col.type, decimal: col.decimal, notNull: col.notNull, source: node });
     }
@@ -427,7 +427,24 @@ export class Database {
     // Resolve projections (paired with output names — §8), the optional WHERE (must be
     // boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
     // relations is 42702; an unknown qualifier is 42P01 (§15).
-    const { nodes: projections, names: columnNames } = resolveProjections(scope, sel.items);
+    // Detect an aggregate query (any select item contains an aggregate call). Its projection
+    // resolves in collect mode — aggregates collect into synthetic slots and a bare non-grouped
+    // column is 42803 (spec/design/aggregates.md §4); a non-aggregate query resolves in
+    // Forbidden mode (columns normal; a stray aggregate would be 42803).
+    const isAgg = itemsHaveAggregate(sel.items);
+    const projAgg: AggCtx = { collecting: isAgg, specs: [] };
+    const { nodes: projections, names: columnNames } = resolveProjections(scope, sel.items, projAgg);
+    const aggSpecs = projAgg.specs;
+    // Slice-1 narrowing: ORDER BY / DISTINCT over an aggregate query's output need output-scope
+    // resolution (the synthetic group row), which lands with GROUP BY (aggregates.md §10).
+    if (isAgg) {
+      if (sel.orderBy.length > 0) {
+        throw engineError("feature_not_supported", "ORDER BY with aggregates is not supported yet");
+      }
+      if (sel.distinct) {
+        throw engineError("feature_not_supported", "SELECT DISTINCT with aggregates is not supported yet");
+      }
+    }
     const filter = sel.filter ? resolveBooleanFilter(scope, sel.filter) : null;
     const order: { idx: number; descending: boolean; nullsFirst: boolean }[] = [];
     for (const key of sel.orderBy) {
@@ -562,7 +579,30 @@ export class Database {
     // row is projected — dedup must see them all — duplicates drop by first occurrence, and
     // the window then slices the DISTINCT rows.
     let out: Value[][];
-    if (sel.distinct) {
+    if (isAgg) {
+      // Aggregate query (slice 1: one group, no GROUP BY). Fold every filtered row into the
+      // accumulators — charging aggregateAccumulate per (row × aggregate) and the operand's
+      // own operatorEvals — then finalize to the synthetic row [agg_0..] and project it. Even
+      // an empty input yields ONE group row (COUNT 0, others NULL — aggregates.md §4). The
+      // bucketing/finalize is unmetered (cost.md §3).
+      const accs = aggSpecs.map((s) => newAcc(s.plan));
+      for (const row of rows) {
+        aggSpecs.forEach((spec, i) => {
+          meter.charge(COSTS.aggregateAccumulate);
+          const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, meter);
+          foldAcc(accs[i]!, v);
+        });
+      }
+      const synthetic = accs.map((a) => finalizeAcc(a));
+      // The single group row, then the LIMIT/OFFSET window over it (LIMIT 0 → no rows). Only an
+      // emitted row charges rowProduced + its projection operatorEvals (cost.md §3).
+      const groupRows = [synthetic];
+      const [start, end] = windowBounds(groupRows.length);
+      out = groupRows.slice(start, end).map((srow) => {
+        meter.charge(COSTS.rowProduced);
+        return projections.map((p) => evalExpr(p, srow, meter));
+      });
+    } else if (sel.distinct) {
       // Project every filtered row (charging projection cost per row, the §3 asymmetry),
       // keeping first occurrences. `seen` is membership-only: output order comes from the
       // deterministic source iteration, never from Set iteration (no order leak — §8/§10).
@@ -669,6 +709,219 @@ type RExpr =
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean };
 
 // ============================================================================
+// Aggregate resolution + accumulation (spec/design/aggregates.md).
+//
+// An aggregate query's select list resolves in "collect" mode: each aggregate call is
+// collected into an AggSpec (its plan + resolved argument) and replaced by a reference to a
+// synthetic-row slot (a "column" RExpr indexing the finalized aggregate results), so the
+// existing evaluator projects the result with no new node. Outside collect mode (WHERE / ON /
+// an aggregate's own argument / any non-aggregate query) a column resolves normally and an
+// aggregate call is a 42803 grouping error.
+// ============================================================================
+
+// AggPlan is the runtime plan for one aggregate, fixed at resolve from the function + operand
+// type (the PG widening — spec/design/aggregates.md §3).
+type AggPlan =
+  | "countStar" // COUNT(*) — count every row
+  | "count" // COUNT(expr) — count non-NULL inputs
+  | "sumInt" // SUM(int16|int32) — accumulate int64, result int64 (trap at int64)
+  | "sumDecimal" // SUM(int64|decimal) — accumulate decimal, result decimal
+  | "avg" // AVG — decimal sum + count; result sum/count (NULL if count 0)
+  | "min"
+  | "max";
+
+// AggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
+// row against the real row). operand is null for COUNT(*).
+type AggSpec = { plan: AggPlan; operand: RExpr | null };
+
+// AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
+// Forbidden mode (a funcCall is 42803; columns resolve normally); collecting === true is an
+// aggregate query's projection (a funcCall collects into specs; a bare column is 42803).
+type AggCtx = { collecting: boolean; specs: AggSpec[] };
+
+// Acc is a running aggregate accumulator (one per AggSpec), folded per input row then finalized.
+type Acc = {
+  plan: AggPlan;
+  count: bigint;
+  sumInt: bigint;
+  sumDec: Decimal;
+  seen: boolean;
+  cur: Value | null;
+};
+
+function newAcc(plan: AggPlan): Acc {
+  return { plan, count: 0n, sumInt: 0n, sumDec: Decimal.fromBigInt(0n), seen: false, cur: null };
+}
+
+// foldAcc folds one input value into the accumulator. NULL arguments are skipped (COUNT(*)
+// ignores the value and always counts). Traps 22003 on SUM overflow at the result bound.
+function foldAcc(a: Acc, v: Value): void {
+  switch (a.plan) {
+    case "countStar":
+      a.count += 1n;
+      break;
+    case "count":
+      if (v.kind !== "null") a.count += 1n;
+      break;
+    case "sumInt":
+      if (v.kind === "int") {
+        const s = a.sumInt + v.int;
+        if (!inRange("int64", s)) throw overflow("int64");
+        a.sumInt = s;
+        a.seen = true;
+      }
+      break;
+    case "sumDecimal":
+      if (v.kind !== "null") {
+        a.sumDec = a.sumDec.add(toDecimal(v));
+        a.seen = true;
+      }
+      break;
+    case "avg":
+      if (v.kind !== "null") {
+        a.sumDec = a.sumDec.add(toDecimal(v));
+        a.count += 1n;
+      }
+      break;
+    case "min":
+    case "max":
+      if (v.kind !== "null") {
+        if (a.cur === null) a.cur = v;
+        else {
+          const c = valueCmp(a.cur, v);
+          const keepCur = a.plan === "min" ? c <= 0 : c >= 0;
+          if (!keepCur) a.cur = v;
+        }
+      }
+      break;
+  }
+}
+
+// finalizeAcc produces the aggregate's final value over the group. COUNT → its count (0 over
+// empty); SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
+function finalizeAcc(a: Acc): Value {
+  switch (a.plan) {
+    case "countStar":
+    case "count":
+      return intValue(a.count);
+    case "sumInt":
+      return a.seen ? intValue(a.sumInt) : nullValue();
+    case "sumDecimal":
+      return a.seen ? decimalValue(a.sumDec) : nullValue();
+    case "avg":
+      return a.count === 0n ? nullValue() : decimalValue(a.sumDec.div(Decimal.fromBigInt(a.count)));
+    case "min":
+    case "max":
+      return a.cur ?? nullValue();
+  }
+}
+
+// itemsHaveAggregate reports whether any select item contains an aggregate call.
+function itemsHaveAggregate(items: SelectItems): boolean {
+  if (items.kind === "all") return false;
+  return items.items.some((it) => exprHasFuncCall(it.expr));
+}
+
+// exprHasFuncCall reports whether an expression tree contains a function (aggregate) call.
+function exprHasFuncCall(e: Expr): boolean {
+  switch (e.kind) {
+    case "funcCall":
+      return true;
+    case "cast":
+      return exprHasFuncCall(e.inner);
+    case "unary":
+      return exprHasFuncCall(e.operand);
+    case "isNull":
+      return exprHasFuncCall(e.operand);
+    case "binary":
+    case "isDistinct":
+      return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.rhs);
+    default:
+      return false;
+  }
+}
+
+// resolveAggregate resolves an aggregate call into a synthetic-row reference, collecting its
+// AggSpec. Valid only in collect mode; in Forbidden mode (WHERE/ON/nested) it is 42803. The
+// operand resolves in a fresh Forbidden sub-context (a nested aggregate is 42803; its columns
+// resolve against the real row). The result type follows the PG widening (aggregates.md §3).
+function resolveAggregate(
+  scope: Scope,
+  e: { name: string; arg: Expr | null; star: boolean },
+  ag: AggCtx,
+): { node: RExpr; type: ResolvedType } {
+  if (!ag.collecting) {
+    throw engineError("grouping_error", "aggregate functions are not allowed here");
+  }
+  const name = e.name.toLowerCase();
+  const sub: AggCtx = { collecting: false, specs: [] };
+  let plan: AggPlan;
+  let operand: RExpr | null;
+  let result: ResolvedType;
+  const arg = (): Expr => {
+    if (e.arg === null) throw engineError("syntax_error", "aggregate requires an argument");
+    return e.arg;
+  };
+  if (name === "count") {
+    if (e.star) {
+      plan = "countStar";
+      operand = null;
+      result = { kind: "int", ty: "int64" };
+    } else {
+      operand = resolve(scope, arg(), null, sub).node;
+      plan = "count";
+      result = { kind: "int", ty: "int64" };
+    }
+  } else if (name === "sum" || name === "avg" || name === "min" || name === "max") {
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    const r = resolve(scope, arg(), null, sub);
+    operand = r.node;
+    if (name === "sum") {
+      if (r.type.kind === "int" && r.type.ty === "int64") {
+        plan = "sumDecimal";
+        result = { kind: "decimal" };
+      } else if (r.type.kind === "int") {
+        plan = "sumInt";
+        result = { kind: "int", ty: "int64" };
+      } else if (r.type.kind === "decimal") {
+        plan = "sumDecimal";
+        result = { kind: "decimal" };
+      } else {
+        throw noAggOverload("sum");
+      }
+    } else if (name === "avg") {
+      if (r.type.kind === "int" || r.type.kind === "decimal") {
+        plan = "avg";
+        result = { kind: "decimal" };
+      } else {
+        throw noAggOverload("avg");
+      }
+    } else {
+      plan = name; // "min" | "max"
+      result = r.type;
+    }
+  } else {
+    throw engineError("undefined_function", "function does not exist: " + e.name);
+  }
+  const slot = ag.specs.length;
+  ag.specs.push({ plan, operand });
+  return { node: { kind: "column", index: slot }, type: result };
+}
+
+// noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
+function noAggOverload(fn: string): EngineError {
+  return engineError("undefined_function", "no " + fn + " aggregate for that argument type");
+}
+
+// groupingErrorColumn is the 42803 for a non-aggregated column with no GROUP BY.
+function groupingErrorColumn(name: string): EngineError {
+  return engineError(
+    "grouping_error",
+    "column " + name + " must appear in the GROUP BY clause or be used in an aggregate function",
+  );
+}
+
+// ============================================================================
 // Resolution scope (multi-table FROM — spec/design/grammar.md §15).
 //
 // A Scope is the ordered list of relations a SELECT's FROM clause puts in scope, each
@@ -767,6 +1020,7 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
 function resolveProjections(
   scope: Scope,
   items: SelectItems,
+  ag: AggCtx,
 ): { nodes: RExpr[]; names: string[] } {
   if (items.kind === "all") {
     const nodes: RExpr[] = [];
@@ -782,7 +1036,7 @@ function resolveProjections(
   const nodes: RExpr[] = [];
   const names: string[] = [];
   for (const it of items.items) {
-    nodes.push(resolve(scope, it.expr, null).node);
+    nodes.push(resolve(scope, it.expr, null, ag).node);
     names.push(it.alias ?? outputName(scope, it.expr));
   }
   return { nodes, names };
@@ -795,13 +1049,16 @@ function resolveProjections(
 function outputName(scope: Scope, e: Expr): string {
   if (e.kind === "column") return scope.columnAt(scope.resolveBare(e.name)).name;
   if (e.kind === "qualifiedColumn") return scope.columnAt(scope.resolveQualified(e.qualifier, e.name)).name;
+  // An un-aliased aggregate call is named by its lowercased function name (PG; §8).
+  if (e.kind === "funcCall") return e.name.toLowerCase();
   return "?column?";
 }
 
 // resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an
 // untyped NULL, always unknown → no rows). An integer- or text-valued one is a 42804.
 function resolveBooleanFilter(scope: Scope, e: Expr): RExpr {
-  const { node, type } = resolve(scope, e, null);
+  // WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
+  const { node, type } = resolve(scope, e, null, { collecting: false, specs: [] });
   if (type.kind !== "bool" && type.kind !== "null") {
     throw typeError("argument of WHERE must be boolean");
   }
@@ -815,16 +1072,23 @@ function resolve(
   scope: Scope,
   e: Expr,
   ctx: ScalarType | null,
+  ag: AggCtx,
 ): { node: RExpr; type: ResolvedType } {
   switch (e.kind) {
     case "column": {
+      // Resolve for existence first (42703/42702 take priority, matching PostgreSQL); then in
+      // an aggregate query's projection a bare non-grouped column is 42803.
       const idx = scope.resolveBare(e.name);
+      if (ag.collecting) throw groupingErrorColumn(e.name);
       return { node: { kind: "column", index: idx }, type: resolvedTypeOf(scope.columnAt(idx).type) };
     }
     case "qualifiedColumn": {
       const idx = scope.resolveQualified(e.qualifier, e.name);
+      if (ag.collecting) throw groupingErrorColumn(e.name);
       return { node: { kind: "column", index: idx }, type: resolvedTypeOf(scope.columnAt(idx).type) };
     }
+    case "funcCall":
+      return resolveAggregate(scope, e, ag);
     case "literal":
       switch (e.literal.kind) {
         case "null":
@@ -874,7 +1138,7 @@ function resolve(
       if (isBytea(target)) {
         throw engineError("feature_not_supported", "casting to bytea is not supported yet");
       }
-      const inner = resolve(scope, e.inner, null);
+      const inner = resolve(scope, e.inner, null, ag);
       if (inner.type.kind === "bool") {
         throw typeError("cannot cast boolean to " + canonicalName(target));
       }
@@ -893,7 +1157,7 @@ function resolve(
     }
     case "unary":
       if (e.op === "neg") {
-        const { node, type } = resolve(scope, e.operand, ctx);
+        const { node, type } = resolve(scope, e.operand, ctx, ag);
         if (type.kind === "decimal") {
           return { node: { kind: "neg", result: "decimal", operand: node }, type: { kind: "decimal" } };
         }
@@ -904,12 +1168,12 @@ function resolve(
         return { node: { kind: "neg", result, operand: node }, type: { kind: "int", ty: result } };
       }
       {
-        const { node, type } = resolve(scope, e.operand, null);
+        const { node, type } = resolve(scope, e.operand, null, ag);
         requireBool(type, "NOT requires a boolean operand");
         return { node: { kind: "not", operand: node }, type: { kind: "bool" } };
       }
     case "isNull": {
-      const { node } = resolve(scope, e.operand, null);
+      const { node } = resolve(scope, e.operand, null, ag);
       return { node: { kind: "isNull", operand: node, negated: e.negated }, type: { kind: "bool" } };
     }
     case "isDistinct": {
@@ -917,12 +1181,12 @@ function resolve(
       // adapts to its sibling; a text literal stays text), then require the operands be
       // comparable (both integer-ish or both text-ish; a mixed pair is 42804). The result
       // is always a definite boolean (functions.md §3).
-      const p = resolveOperandPair(scope, e.lhs, e.rhs);
+      const p = resolveOperandPair(scope, e.lhs, e.rhs, ag);
       classifyComparable(p.lt, p.rt);
       return { node: { kind: "distinct", lhs: p.rl, rhs: p.rr, negated: e.negated }, type: { kind: "bool" } };
     }
     case "binary":
-      return resolveBinary(scope, e.op, e.lhs, e.rhs);
+      return resolveBinary(scope, e.op, e.lhs, e.rhs, ag);
   }
 }
 
@@ -931,6 +1195,7 @@ function resolveBinary(
   op: BinaryOp,
   lhs: Expr,
   rhs: Expr,
+  ag: AggCtx,
 ): { node: RExpr; type: ResolvedType } {
   switch (op) {
     case "add":
@@ -942,7 +1207,7 @@ function resolveBinary(
       // integer literal adapts to an integer sibling), then pick the family: both integer →
       // integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
       // widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
-      const p = resolveOperandPair(scope, lhs, rhs);
+      const p = resolveOperandPair(scope, lhs, rhs, ag);
       requireNumericOperand(p.lt);
       requireNumericOperand(p.rt);
       if (p.lt.kind === "decimal" || p.rt.kind === "decimal") {
@@ -960,14 +1225,14 @@ function resolveBinary(
       // operands (a literal adapts to its sibling; text literals stay text), then require
       // they be comparable — a mixed integer/text pair is 42804. The runtime comparison
       // (eq3/lt3/gt3) dispatches on the value kinds.
-      const p = resolveOperandPair(scope, lhs, rhs);
+      const p = resolveOperandPair(scope, lhs, rhs, ag);
       classifyComparable(p.lt, p.rt);
       return { node: { kind: "compare", op, lhs: p.rl, rhs: p.rr }, type: { kind: "bool" } };
     }
     default: {
       // "and" | "or"
-      const l = resolve(scope, lhs, null);
-      const r = resolve(scope, rhs, null);
+      const l = resolve(scope, lhs, null, ag);
+      const r = resolve(scope, rhs, null, ag);
       requireBool(l.type, "AND/OR requires boolean operands");
       requireBool(r.type, "AND/OR requires boolean operands");
       return { node: { kind: op === "and" ? "and" : "or", lhs: l.node, rhs: r.node }, type: { kind: "bool" } };
@@ -986,23 +1251,24 @@ function resolveOperandPair(
   scope: Scope,
   lhs: Expr,
   rhs: Expr,
+  ag: AggCtx,
 ): { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType } {
   const lhsLit = isAdaptableLiteral(lhs);
   const rhsLit = isAdaptableLiteral(rhs);
   let l: { node: RExpr; type: ResolvedType };
   let r: { node: RExpr; type: ResolvedType };
   if (lhsLit && rhsLit) {
-    l = resolve(scope, lhs, "int64");
-    r = resolve(scope, rhs, "int64");
+    l = resolve(scope, lhs, "int64", ag);
+    r = resolve(scope, rhs, "int64", ag);
   } else if (lhsLit) {
-    r = resolve(scope, rhs, null);
-    l = resolve(scope, lhs, ctxOf(r.type));
+    r = resolve(scope, rhs, null, ag);
+    l = resolve(scope, lhs, ctxOf(r.type), ag);
   } else if (rhsLit) {
-    l = resolve(scope, lhs, null);
-    r = resolve(scope, rhs, ctxOf(l.type));
+    l = resolve(scope, lhs, null, ag);
+    r = resolve(scope, rhs, ctxOf(l.type), ag);
   } else {
-    l = resolve(scope, lhs, null);
-    r = resolve(scope, rhs, null);
+    l = resolve(scope, lhs, null, ag);
+    r = resolve(scope, rhs, null, ag);
   }
   return { rl: l.node, lt: l.type, rr: r.node, rt: r.type };
 }

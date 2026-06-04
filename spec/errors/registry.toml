@@ -135,6 +135,18 @@ name = "invalid_table_definition"
 class = "syntax error or access rule violation"
 template = "invalid table definition: {detail}"
 
+[[error]]
+code = "42803"
+name = "grouping_error"
+class = "syntax error or access rule violation"
+template = "column {name} must appear in the GROUP BY clause or be used in an aggregate function"
+
+[[error]]
+code = "42883"
+name = "undefined_function"
+class = "syntax error or access rule violation"
+template = "function does not exist: {name}"
+
 # --- feature not supported (class 0A) ---------------------------------------
 [[error]]
 code = "0A000"

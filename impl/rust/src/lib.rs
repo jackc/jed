@@ -86,6 +86,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.join_full",
     "query.table_alias",
     "query.qualified_column",
+    // Scalar aggregates COUNT/SUM/MIN/MAX/AVG over the whole table — no GROUP BY yet
+    // (spec/design/aggregates.md).
+    "query.aggregates",
     "null.three_valued",
     "compare.promotion",
     "cast.explicit",

@@ -197,6 +197,9 @@ const (
 	ExprIsNull
 	// ExprIsDistinct is `lhs IS [NOT] DISTINCT FROM rhs` (NULL-safe equality).
 	ExprIsDistinct
+	// ExprFuncCall is an aggregate function call — the first function-call syntax
+	// (spec/design/grammar.md §17). Only aggregates resolve this slice.
+	ExprFuncCall
 )
 
 // UnaryOp is a unary operator.
@@ -252,6 +255,7 @@ type Expr struct {
 	Binary     *BinaryExpr
 	IsNullOf   *IsNullExpr     // ExprIsNull
 	IsDistinct *IsDistinctExpr // ExprIsDistinct
+	FuncCall   *FuncCallExpr   // ExprFuncCall
 }
 
 // CastExpr is CAST(Inner AS TypeName). TypeMod is the optional numeric(p[,s]) modifier.
@@ -288,6 +292,18 @@ type IsDistinctExpr struct {
 	Lhs     Expr
 	Rhs     Expr
 	Negated bool
+}
+
+// FuncCallExpr is an aggregate function call — the engine's first function-call syntax
+// (spec/design/grammar.md §17). Name is the spelling as written (resolved case-insensitively
+// against the aggregate catalog; an unknown name is 42883). Star is the COUNT(*) row-count
+// form (then Arg is nil); otherwise Arg is the single argument expression. DISTINCT inside the
+// parens is rejected at parse (42601). Only aggregates resolve this slice; an aggregate in
+// WHERE/ON or nested in another aggregate is 42803 (spec/design/aggregates.md).
+type FuncCallExpr struct {
+	Name string
+	Arg  *Expr
+	Star bool
 }
 
 // OrderKey is one ORDER BY sort key: a bare table column, a sort direction, and a resolved

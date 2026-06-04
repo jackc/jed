@@ -4,7 +4,7 @@
 
 use jed::costs::COSTS;
 use jed::error::SqlState;
-use jed::operators::OPERATORS;
+use jed::operators::{AGGREGATES, OPERATORS};
 use jed::types::ScalarType;
 use std::path::Path;
 
@@ -264,6 +264,51 @@ fn operators_match_spec() {
 }
 
 #[test]
+fn aggregates_match_spec() {
+    // The generated aggregate descriptor table must match the canonical catalog's
+    // [[aggregate]] rows field-for-field (the codegen middle path, CLAUDE.md §5). Aggregates
+    // are overloaded across operand families (one row per (name, arg_families)), like operators.
+    let v: toml::Value = toml::from_str(&spec("functions/catalog.toml")).unwrap();
+    let aggs = v["aggregate"].as_array().expect("[[aggregate]] array");
+    assert_eq!(aggs.len(), AGGREGATES.len(), "aggregate count");
+
+    for row in aggs {
+        let name = row["name"].as_str().unwrap();
+        let fams: Vec<&str> = row
+            .get("arg_families")
+            .and_then(|f| f.as_array())
+            .map(|a| a.iter().map(|x| x.as_str().unwrap()).collect())
+            .unwrap_or_default();
+        let desc = AGGREGATES
+            .iter()
+            .find(|d| d.name == name && d.arg_families == fams.as_slice())
+            .unwrap_or_else(|| panic!("generated table missing aggregate {name} {fams:?}"));
+
+        assert_eq!(row["kind"].as_str().unwrap(), "aggregate", "{name} kind");
+        assert_eq!(
+            desc.surface,
+            row["surface"].as_str().unwrap(),
+            "{name} surface"
+        );
+        assert_eq!(desc.arg, row["arg"].as_str().unwrap(), "{name} arg");
+        assert_eq!(
+            desc.result,
+            row["result"].as_str().unwrap(),
+            "{name} result"
+        );
+        assert_eq!(desc.null, row["null"].as_str().unwrap(), "{name} null");
+
+        let errs: Vec<&str> = row["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(desc.errors, errs.as_slice(), "{name} errors");
+    }
+}
+
+#[test]
 fn cost_schedule_matches_spec() {
     // The generated cost schedule (codegen middle path, CLAUDE.md §5/§13) must match the
     // canonical schedule.toml weight-for-weight. This also compiles the generated table
@@ -278,11 +323,13 @@ fn cost_schedule_matches_spec() {
             "storage_row_read" => COSTS.storage_row_read,
             "row_produced" => COSTS.row_produced,
             "operator_eval" => COSTS.operator_eval,
+            "aggregate_accumulate" => COSTS.aggregate_accumulate,
             other => panic!("cost unit {other} has no COSTS field — update this cross-check"),
         }
     };
 
-    assert_eq!(units.len(), 3, "the three phase-1 cost units");
+    // The weight() closure above forces this cross-check to be updated whenever a unit is
+    // added (a new unit with no COSTS field panics), so we don't pin an exact count here.
     for u in units {
         let id = u["id"].as_str().unwrap();
         assert_eq!(weight(id), u["weight"].as_integer().unwrap(), "{id} weight");

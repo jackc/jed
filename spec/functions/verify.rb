@@ -24,6 +24,11 @@
 #      for integer×integer and text×text) — so name/symbol alone need not be unique.
 #  10. precedence, if present, is an integer (the parser precedence tower; absent for
 #      operators with no infix/prefix precedence, e.g. future named functions)
+#  11. each [[aggregate]] (kind = "aggregate") has its own field set (name/kind/surface/
+#      arg/result/null/errors, + arg_families unless arg = "star"); result is a scalar id
+#      or a reserved aggregate result (sum_widen | same_as_input); null is "aggregate";
+#      (name, arg_families) is unique. Aggregates are NOT operators (no symbol/precedence/
+#      arg_resolution/arity), so they skip the operator-only checks above (functions.md).
 #
 # Exit 0 = catalog is internally coherent and cross-references resolve; nonzero =
 # the offending problem.
@@ -40,6 +45,14 @@ KNOWN_KINDS      = %w[comparison null_test arithmetic logical function].to_set
 NULL_BEHAVIORS   = %w[propagates detects null_safe kleene].to_set
 RESOLUTIONS      = %w[promote none].to_set
 REQUIRED_FIELDS  = %w[name kind arity arg_families arg_resolution result null errors].freeze
+
+# Aggregate functions (kind = "aggregate") use a distinct field set and validation
+# branch — they are not operators (functions.md). `result` accepts a scalar id or one of
+# these reserved widening ids; `null` is the single "aggregate" skip-NULL discipline.
+RESERVED_AGG_RESULTS = %w[sum_widen same_as_input].to_set
+AGG_ARGS             = %w[star expr].to_set
+AGG_NULL_BEHAVIORS   = %w[aggregate].to_set
+AGG_REQUIRED_FIELDS  = %w[name kind surface arg result null errors].freeze
 
 def fail!(msg)
   warn "FAIL: #{msg}"
@@ -144,7 +157,51 @@ def main
     fail!("duplicate (symbol, kind, arity, arg_families): #{dup_syms.map { |s, k, ar, a| "#{s} #{k}/arity-#{ar} #{a.inspect}" }.join(', ')}")
   end
 
-  puts "OK: #{operators.length} operators — catalog coherent"
+  # (11) aggregates (kind = "aggregate") — a separate array + field set. Aggregates are
+  # not operators, so they skip the symbol/precedence/arg_resolution/arity checks above.
+  aggregates = catalog["aggregate"] || []
+  agg_sigs = [] # [name, arg_families] — unique per overload, like operators
+  aggregates.each do |ag|
+    id = ag["name"] || "(unnamed)"
+
+    AGG_REQUIRED_FIELDS.each do |f|
+      fail!("aggregate #{id}: missing field `#{f}`") unless ag.key?(f)
+    end
+    fail!("aggregate #{id}: kind must be \"aggregate\"") unless ag["kind"] == "aggregate"
+    fail!("aggregate #{id}: surface must be a non-empty string") unless ag["surface"].is_a?(String) && !ag["surface"].empty?
+
+    arg = ag["arg"]
+    fail!("aggregate #{id}: arg #{arg.inspect} not in (#{AGG_ARGS.to_a.join('|')})") unless AGG_ARGS.include?(arg)
+    fams = ag["arg_families"]
+    if arg == "expr"
+      fail!("aggregate #{id}: arg=expr needs a non-empty arg_families") unless fams.is_a?(Array) && !fams.empty?
+      fams.each do |fam|
+        next if fam == "any"
+        fail!("aggregate #{id}: arg family #{fam.inspect} is not a family in scalars.toml") unless families.include?(fam)
+      end
+    elsif fams && !fams.empty?
+      fail!("aggregate #{id}: arg=star takes no arg_families")
+    end
+
+    result = ag["result"]
+    unless scalar_ids.include?(result) || RESERVED_AGG_RESULTS.include?(result)
+      fail!("aggregate #{id}: result #{result.inspect} is neither a scalar id nor a reserved aggregate result (#{RESERVED_AGG_RESULTS.to_a.join('|')})")
+    end
+
+    fail!("aggregate #{id}: null #{ag['null'].inspect} must be \"aggregate\"") unless AGG_NULL_BEHAVIORS.include?(ag["null"])
+
+    (ag["errors"] || []).each do |code|
+      fail!("aggregate #{id}: error code #{code.inspect} is not in registry.toml") unless error_codes.include?(code)
+    end
+
+    agg_sigs << [ag["name"], (fams || [])]
+  end
+  dup_aggs = agg_sigs.tally.select { |_, n| n > 1 }.keys
+  unless dup_aggs.empty?
+    fail!("duplicate aggregate (name, arg_families): #{dup_aggs.map { |n, a| "#{n}#{a.inspect}" }.join(', ')}")
+  end
+
+  puts "OK: #{operators.length} operators, #{aggregates.length} aggregates — catalog coherent"
 end
 
 main

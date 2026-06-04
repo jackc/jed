@@ -1,0 +1,85 @@
+# Aggregate SUM — PostgreSQL widening (spec/design/aggregates.md §3): SUM(int16/int32) ->
+# int64, SUM(int64) -> decimal, SUM(decimal) -> decimal. NULL inputs are skipped; an
+# empty/all-NULL group sums to NULL (never 0 — that is COUNT). Output name `sum`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.int16, types.int32, types.int64, types.decimal, resource.cost_metering
+
+# SUM(int16) widens to int64: 30000 + 30000 + 10000 = 70000 (exceeds int16 max 32767 but
+# the result type is int64, so NO trap — the boundary is the result type, §3).
+statement ok
+CREATE TABLE t16 (id int32 PRIMARY KEY, s int16)
+
+statement ok
+INSERT INTO t16 VALUES (1, 30000), (2, 30000), (3, 10000)
+
+# names: sum
+# cost: 7
+query I nosort
+SELECT SUM(s) FROM t16
+----
+70000
+
+# SUM(int64) widens to decimal (PG model): int64 max + 3 overflows int64 but is exact in
+# decimal -> rendered with the D tag, no trap.
+statement ok
+CREATE TABLE t64 (id int32 PRIMARY KEY, big int64)
+
+statement ok
+INSERT INTO t64 VALUES (1, 9223372036854775807), (2, 3)
+
+# names: sum
+# cost: 5
+query D nosort
+SELECT SUM(big) FROM t64
+----
+9223372036854775810
+
+# SUM(decimal) -> decimal, scale = max(operand scales). 1.50 + 2.25 = 3.75.
+statement ok
+CREATE TABLE tdec (id int32 PRIMARY KEY, d numeric(10,2))
+
+statement ok
+INSERT INTO tdec VALUES (1, 1.50), (2, 2.25)
+
+# names: sum
+# cost: 5
+query D nosort
+SELECT SUM(d) FROM tdec
+----
+3.75
+
+# NULL inputs are skipped: SUM over the present rows only.
+statement ok
+CREATE TABLE tmix (id int32 PRIMARY KEY, a int32)
+
+statement ok
+INSERT INTO tmix VALUES (1, 10), (2, NULL), (3, 30)
+
+# names: sum
+query I nosort
+SELECT SUM(a) FROM tmix
+----
+40
+
+# All-NULL group: SUM -> NULL (a single row), never 0.
+statement ok
+CREATE TABLE tnull (id int32 PRIMARY KEY, a int32)
+
+statement ok
+INSERT INTO tnull VALUES (1, NULL), (2, NULL)
+
+# names: sum
+# cost: 5
+query I nosort
+SELECT SUM(a) FROM tnull
+----
+NULL
+
+# Empty table: SUM -> NULL as ONE row.
+statement ok
+CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+
+# names: sum
+query I nosort
+SELECT SUM(a) FROM e
+----
+NULL
