@@ -168,7 +168,7 @@ impl Database {
                 ty,
                 decimal,
                 primary_key: def.primary_key,
-                not_null: def.primary_key, // PRIMARY KEY ⇒ NOT NULL
+                not_null: def.primary_key || def.not_null, // PRIMARY KEY ⇒ NOT NULL
             });
         }
 

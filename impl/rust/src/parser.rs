@@ -75,19 +75,31 @@ impl Parser {
         let name = self.expect_identifier()?;
         let type_name = self.expect_identifier()?;
         let type_mod = self.parse_type_mod()?;
-        // Optional `PRIMARY KEY`.
-        let primary_key = if self.peek_keyword().as_deref() == Some("primary") {
-            self.advance();
-            self.expect_keyword("key")?;
-            true
-        } else {
-            false
-        };
+        // Zero or more order-free column constraints: `PRIMARY KEY` and `NOT NULL`. A
+        // constraint may be repeated harmlessly (the flags are idempotent).
+        let mut primary_key = false;
+        let mut not_null = false;
+        loop {
+            match self.peek_keyword().as_deref() {
+                Some("primary") => {
+                    self.advance();
+                    self.expect_keyword("key")?;
+                    primary_key = true;
+                }
+                Some("not") => {
+                    self.advance();
+                    self.expect_keyword("null")?;
+                    not_null = true;
+                }
+                _ => break,
+            }
+        }
         Ok(ColumnDef {
             name,
             type_name,
             type_mod,
             primary_key,
+            not_null,
         })
     }
 

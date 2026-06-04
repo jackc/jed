@@ -12,6 +12,8 @@ var SupportedCapabilities = []string{
 	"ddl.primary_key",
 	// DROP TABLE — remove a table (definition + rows) from the catalog (grammar.md §13).
 	"ddl.drop_table",
+	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
+	"ddl.not_null",
 	// Phase C — INSERT ... VALUES with positional type-checking + overflow trap.
 	"dml.insert",
 	// Multi-row INSERT ... VALUES (..),(..) — two-phase / all-or-nothing (grammar.md §12).

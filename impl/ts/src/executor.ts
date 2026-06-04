@@ -161,7 +161,7 @@ export class Database {
         type: ty,
         decimal,
         primaryKey: def.primaryKey,
-        notNull: def.primaryKey, // PRIMARY KEY ⇒ NOT NULL
+        notNull: def.primaryKey || def.notNull, // PRIMARY KEY ⇒ NOT NULL
       });
     }
 

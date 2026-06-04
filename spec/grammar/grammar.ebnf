@@ -48,7 +48,16 @@ sql_statement  ::= create_table
 create_table   ::= "CREATE" "TABLE" identifier
                    "(" column_def ("," column_def)* ")"
 
-column_def     ::= identifier type_name ("PRIMARY" "KEY")?
+/* A column definition is a name, a type, and zero or more column constraints. The
+ * constraints are order-free (the parsers accept them in any order, deduplicating —
+ * "x int NOT NULL PRIMARY KEY" = "x int PRIMARY KEY NOT NULL"). "PRIMARY KEY" makes the
+ * column the table's single-column key and implies NOT NULL. "NOT NULL" forbids a NULL
+ * value in the column: storing one — directly, or via an applied/omitted default — traps
+ * 23502 (../design/constraints.md). The constraint keywords are NOT reserved (§3). */
+column_def     ::= identifier type_name column_constraint*
+
+column_constraint ::= "PRIMARY" "KEY"
+                 | "NOT" "NULL"
 
 /* DROP TABLE removes a table — its definition and all its rows — from the
  * catalog. The surface is deliberately minimal (../design/grammar.md §13): ONE

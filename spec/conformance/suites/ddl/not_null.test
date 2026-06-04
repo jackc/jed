@@ -1,0 +1,95 @@
+# NOT NULL column constraint — storing NULL into a NOT NULL column traps 23502, whether the
+# NULL is written directly, comes from an UPDATE, or (later) from an applied/omitted default.
+# A PRIMARY KEY column is implicitly NOT NULL; a column without the constraint is nullable.
+# Constraints are order-free. spec/design/constraints.md §1. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.is_null, query.order_by, types.int16, types.int32, types.text
+
+# id is PRIMARY KEY (implicitly NOT NULL), name is explicitly NOT NULL, note is nullable
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, name text NOT NULL, note text)
+
+# a fully-specified row is fine; a NULL in the nullable column (note) is fine
+statement ok
+INSERT INTO t VALUES (1, 'a', 'x')
+
+statement ok
+INSERT INTO t VALUES (2, 'b', NULL)
+
+# NULL into the explicitly NOT NULL column traps 23502
+statement error 23502
+INSERT INTO t VALUES (3, NULL, 'y')
+
+# NULL into the PRIMARY KEY column (implicitly NOT NULL) traps 23502 too
+statement error 23502
+INSERT INTO t VALUES (NULL, 'c', 'z')
+
+# only the two valid rows landed; the nullable column kept its NULL
+query ITT nosort
+SELECT id, name, note FROM t ORDER BY id
+----
+1
+a
+x
+2
+b
+NULL
+
+# IS NULL still works against the nullable column
+query I nosort
+SELECT id FROM t WHERE note IS NULL
+----
+2
+
+# multi-row INSERT is two-phase / all-or-nothing: a 23502 in the second row stores neither
+statement error 23502
+INSERT INTO t VALUES (5, 'e', 'q'), (6, NULL, 'r')
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+
+# UPDATE that sets a NOT NULL column to NULL traps 23502 (UPDATE's own type-check pass)
+statement error 23502
+UPDATE t SET name = NULL WHERE id = 1
+
+# the failed UPDATE changed nothing
+query IT nosort
+SELECT id, name FROM t ORDER BY id
+----
+1
+a
+2
+b
+
+# UPDATE setting the nullable column to NULL is fine
+statement ok
+UPDATE t SET note = NULL WHERE id = 1
+
+query I nosort
+SELECT id FROM t WHERE note IS NULL ORDER BY id
+----
+1
+2
+
+# constraints are order-free: NOT NULL PRIMARY KEY and PRIMARY KEY NOT NULL both parse,
+# and a redundant repeat is harmless
+statement ok
+CREATE TABLE t2 (a int32 NOT NULL PRIMARY KEY, b int16 NOT NULL)
+
+statement ok
+CREATE TABLE t3 (a int32 PRIMARY KEY NOT NULL, b int16 NOT NULL NOT NULL)
+
+# a non-key column with no NOT NULL is nullable — it accepts and stores NULL
+statement ok
+INSERT INTO t2 VALUES (1, 10)
+
+statement error 23502
+INSERT INTO t2 VALUES (2, NULL)
+
+query II nosort
+SELECT a, b FROM t2 ORDER BY a
+----
+1
+10

@@ -130,7 +130,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			Type:       ty,
 			Decimal:    decimal,
 			PrimaryKey: def.PrimaryKey,
-			NotNull:    def.PrimaryKey, // PRIMARY KEY ⇒ NOT NULL
+			NotNull:    def.PrimaryKey || def.NotNull, // PRIMARY KEY ⇒ NOT NULL
 		})
 	}
 

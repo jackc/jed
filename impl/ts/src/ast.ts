@@ -90,8 +90,16 @@ export type OrderKey = {
 };
 
 // ColumnDef is a column definition in a CREATE TABLE. typeName is kept as written and
-// resolved during analysis (the catalog owns the type lattice).
-export type ColumnDef = { name: string; typeName: string; typeMod: TypeMod | null; primaryKey: boolean };
+// resolved during analysis (the catalog owns the type lattice). notNull is an explicit
+// NOT NULL constraint; a PRIMARY KEY column is implicitly NOT NULL regardless, so the
+// executor ORs the two (spec/design/constraints.md).
+export type ColumnDef = {
+  name: string;
+  typeName: string;
+  typeMod: TypeMod | null;
+  primaryKey: boolean;
+  notNull: boolean;
+};
 
 // Assignment is one `SET <column> = <value>` clause; value is a general expression
 // evaluated against the pre-update row (so `SET a = b, b = a` swaps).

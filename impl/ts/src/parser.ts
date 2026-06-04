@@ -144,13 +144,25 @@ class Parser {
     const name = this.expectIdentifier();
     const typeName = this.expectIdentifier();
     const typeMod = this.parseTypeMod();
+    // Zero or more order-free column constraints: PRIMARY KEY and NOT NULL. A constraint
+    // may be repeated harmlessly (the flags are idempotent).
     let primaryKey = false;
-    if (this.peekKeyword() === "primary") {
-      this.advance();
-      this.expectKeyword("key");
-      primaryKey = true;
+    let notNull = false;
+    for (;;) {
+      const kw = this.peekKeyword();
+      if (kw === "primary") {
+        this.advance();
+        this.expectKeyword("key");
+        primaryKey = true;
+      } else if (kw === "not") {
+        this.advance();
+        this.expectKeyword("null");
+        notNull = true;
+      } else {
+        break;
+      }
     }
-    return { name, typeName, typeMod, primaryKey };
+    return { name, typeName, typeMod, primaryKey, notNull };
   }
 
   // parseTypeMod parses an optional parenthesized type modifier `"(" integer ("," integer)? ")"`

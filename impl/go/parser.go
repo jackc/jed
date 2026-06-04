@@ -161,15 +161,28 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	if err != nil {
 		return ColumnDef{}, err
 	}
+	// Zero or more order-free column constraints: PRIMARY KEY and NOT NULL. A constraint
+	// may be repeated harmlessly (the flags are idempotent).
 	primaryKey := false
-	if p.peekKeyword() == "primary" {
-		p.advance()
-		if err := p.expectKeyword("key"); err != nil {
-			return ColumnDef{}, err
+	notNull := false
+	for {
+		switch p.peekKeyword() {
+		case "primary":
+			p.advance()
+			if err := p.expectKeyword("key"); err != nil {
+				return ColumnDef{}, err
+			}
+			primaryKey = true
+		case "not":
+			p.advance()
+			if err := p.expectKeyword("null"); err != nil {
+				return ColumnDef{}, err
+			}
+			notNull = true
+		default:
+			return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull}, nil
 		}
-		primaryKey = true
 	}
-	return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey}, nil
 }
 
 // parseTypeMod parses an optional parenthesized type modifier "(" integer ("," integer)? ")"

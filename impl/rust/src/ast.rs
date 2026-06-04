@@ -38,6 +38,9 @@ pub struct ColumnDef {
     /// type. Meaningful only for decimal; validated at resolve (spec/design/grammar.md §14).
     pub type_mod: Option<TypeMod>,
     pub primary_key: bool,
+    /// An explicit `NOT NULL` column constraint. A PRIMARY KEY column is implicitly NOT NULL
+    /// regardless of this flag; the executor ORs the two (spec/design/constraints.md).
+    pub not_null: bool,
 }
 
 /// A parsed type modifier: a precision and an optional scale, as written

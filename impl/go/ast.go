@@ -36,6 +36,9 @@ type ColumnDef struct {
 	// parameterized type. Meaningful only for decimal; validated at resolve (grammar.md §14).
 	TypeMod    *TypeMod
 	PrimaryKey bool
+	// NotNull is an explicit NOT NULL column constraint. A PRIMARY KEY column is implicitly
+	// NOT NULL regardless of this flag; the executor ORs the two (spec/design/constraints.md).
+	NotNull bool
 }
 
 // TypeMod is a parsed type modifier: a precision and an optional scale, as written

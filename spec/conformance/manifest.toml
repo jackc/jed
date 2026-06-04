@@ -33,6 +33,10 @@ id = "ddl.drop_table"
 description = "DROP TABLE — remove a table (definition + rows) from the catalog; missing table is 42P01 (grammar.md §13)"
 
 [[capability]]
+id = "ddl.not_null"
+description = "NOT NULL column constraint — storing NULL (direct, defaulted, or omitted) traps 23502 (spec/design/constraints.md §1)"
+
+[[capability]]
 id = "dml.insert"
 description = "INSERT ... VALUES"
 
@@ -294,4 +298,12 @@ capabilities = [
   "query.join_left",
   "query.join_right",
   "query.join_full",
+]
+
+[[profile]]
+id = "constraints"
+title = "outer_joins + the NOT NULL / DEFAULT column constraints (spec/design/constraints.md)"
+includes = "outer_joins"
+capabilities = [
+  "ddl.not_null",
 ]
