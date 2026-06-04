@@ -169,20 +169,25 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
 - **`SUM` overflow boundary** — at the **result** type (int64 for the int16/int32 case, the
   decimal cap for the int64/decimal cases); pinned with a value that widens without trapping
   and one that traps.
-- **Group ordering / value-canonical keys** (slice 2) — groups emit in first-occurrence
-  order over the deterministic source scan (the `DISTINCT` mechanism), keyed by the
-  **value-canonical** form so `1.5` and `1.50` share one group and `NULL` is its own group
-  ([decimal.md](decimal.md) §5). No hash-map iteration order may leak.
+- **Group ordering / value-canonical keys** — with no `ORDER BY`, groups emit in
+  first-occurrence order over the deterministic source scan (the `DISTINCT` mechanism),
+  keyed by the **value-canonical** form so `1.5` and `1.50` share one group and `NULL` is
+  its own group ([decimal.md](decimal.md) §5). No hash-map iteration order may leak — every
+  core iterates an explicit insertion-ordered list, never a map.
 
 ## 10. Staging & deferred
 
-- **`GROUP BY`** (slice 2) — partitions the post-`WHERE` rows by one or more grouping keys
+- **`GROUP BY`** (landed) — partitions the post-`WHERE` rows by one or more grouping keys
   (bare/qualified **columns** only, mirroring the `ORDER BY` narrowing — general
   expressions, ordinals, and output-alias keys deferred), emitting one row per distinct key
-  combination. The **grouping-error rule**: every non-aggregated column in the select list
-  (and `HAVING`/`ORDER BY`) must be a grouping key, else `42803`. `NULL` forms its own
-  group; decimal keys bucket value-canonically. `GROUP BY` over an empty table → zero rows.
-  Full §section lands with the slice.
+  combination (§5). The **grouping-error rule** (§6): every non-aggregated column in the
+  select list (and `ORDER BY`) must be a grouping key, else `42803`. `NULL` forms its own
+  group; decimal keys bucket value-canonically (the displayed key is the first occurrence's
+  value). `GROUP BY` over an empty table → zero rows. **`ORDER BY` over the grouped output**
+  resolves each key against the grouping keys — a grouping column sorts the group rows
+  (after aggregation, before `LIMIT`/`OFFSET`); a non-grouping column is `42803`
+  ([grammar.md](grammar.md) §18). `SELECT DISTINCT` in an aggregate query is still deferred
+  (`0A000`).
 - **`HAVING`** (slice 3) — a boolean predicate over grouped rows, evaluated after
   aggregation and before `ORDER BY`; may reference aggregates (even ones not projected) and
   grouping keys; non-boolean is `42804`. Allowed with no `GROUP BY` (filters the single

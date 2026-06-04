@@ -602,7 +602,48 @@ name followed by `(` (`t.count(...)`) is **not** a call (the call form binds onl
 identifier immediately followed by `(`); it is left to fail as a malformed reference.
 
 **Where aggregates may not appear.** An aggregate folds a *set* of rows, so it is undefined
-per input row: an aggregate in a `WHERE` clause, a `JOIN ON`, or (later) a `GROUP BY` key,
-and an aggregate **nested** in another aggregate, are all **`42803`** (`grouping_error`).
-Filtering on an aggregate is `HAVING`'s job (a later slice). The output name of an
-un-aliased aggregate is its lowercased function name (§8).
+per input row: an aggregate in a `WHERE` clause, a `JOIN ON`, or a `GROUP BY` key, and an
+aggregate **nested** in another aggregate, are all **`42803`** (`grouping_error`). Filtering
+on an aggregate is `HAVING`'s job (a later slice). The output name of an un-aliased aggregate
+is its lowercased function name (§8).
+
+## 18. `GROUP BY`
+
+`group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` slots between `WHERE` and
+`ORDER BY`. It partitions the post-`WHERE` rows into groups sharing a value on every grouping
+key and produces **one result row per group**; the select list then projects the grouping
+keys and aggregates over each group. Semantics live in [aggregates.md](aggregates.md) §5–§6;
+this section is the syntax + the two narrowings.
+
+**Keys are bare/qualified columns only.** A grouping key is a `column_ref` (`g` or `t.g`) —
+**not** a general expression (`GROUP BY a + 1`), an output alias, or an ordinal
+(`GROUP BY 1`). This is exactly the `ORDER BY` narrowing (§5/§10), and relaxable later. A
+key that names no column is `42703`; an ambiguous bare key across joined relations is
+`42702` (the usual column resolution, §15).
+
+**The grouping-error rule.** With `GROUP BY` present, every column in the select list (and
+in `HAVING`/`ORDER BY`) that is **not** inside an aggregate must appear among the grouping
+keys, else **`42803`** (`grouping_error`). Membership is by resolved column identity (the
+flat index), so `SELECT g, COUNT(*) … GROUP BY g` is legal and `SELECT g, a … GROUP BY g`
+is `42803` on `a`. The PostgreSQL functional-dependency relaxation (a column dependent on a
+grouped primary key) is **deferred** — the rule is a simple set-membership check. This
+generalizes the no-`GROUP BY` degenerate case (§17: with no keys, only aggregates and
+constants are legal outside an aggregate).
+
+**Output order and NULL/decimal grouping** are determinism surfaces (CLAUDE.md §8/§10):
+with no `ORDER BY`, groups emit in **first-occurrence order** over the primary-key source
+scan (the same default `DISTINCT`/`LIMIT` use, §9/§11). `NULL` forms its **own single
+group** (NULL groups with NULL — the NULL-safe equality `DISTINCT` uses, not three-valued
+`=`), and `decimal` keys bucket by **value-canonical** form (`1.5` and `1.50` share one
+group — [decimal.md](decimal.md) §5); the group's displayed key is the first occurrence's
+value. `GROUP BY` over an **empty** table produces **zero** rows (contrast §17's
+whole-table single row). The grouping itself is unmetered, like the sort and `DISTINCT`
+dedup ([cost.md](cost.md) §3); `row_produced` is charged per emitted group.
+
+**`ORDER BY` over the grouped output.** In an aggregate query, an `ORDER BY` key resolves
+against the **grouping keys** (not the raw FROM columns): a key that is a grouping column
+sorts the output rows by that group value; a key that is **not** a grouping column is
+`42803` (the grouping-error rule again). The sort runs on the group rows after aggregation,
+before `LIMIT`/`OFFSET`. (`ORDER BY` by an aggregate or an ordinal stays out — `sort_key` is
+a bare `column_ref`, §10.) **Still narrowed:** `SELECT DISTINCT` in an aggregate query
+(needs output-row dedup) is deferred (`0A000`); `HAVING` is §19.

@@ -177,6 +177,10 @@ export type Select = {
   // The left-deep JOINs after `from` (empty = a single-table SELECT). grammar.md §15.
   joins: JoinClause[];
   filter: Expr | null;
+  // GROUP BY keys — bare or qualified table columns (never expressions/aliases/ordinals);
+  // empty means no GROUP BY. Each is a "column" or "qualifiedColumn" (the parser restricts it
+  // to column_ref). With keys present the query groups (spec/design/grammar.md §18).
+  groupBy: Expr[];
   // ORDER BY sort keys, applied left to right; empty means no ORDER BY (grammar.md §10).
   orderBy: OrderKey[];
   limit: bigint | null;

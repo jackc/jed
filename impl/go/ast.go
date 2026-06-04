@@ -146,6 +146,10 @@ type Select struct {
 	// Joins holds the left-deep JOINs after From (nil/empty = a single-table SELECT).
 	Joins  []JoinClause
 	Filter *Expr
+	// GroupBy holds the GROUP BY keys — bare or qualified table columns (never expressions /
+	// aliases / ordinals); nil/empty means no GROUP BY. Each is an ExprColumn or
+	// ExprQualifiedColumn (the parser restricts it to column_ref). spec/design/grammar.md §18.
+	GroupBy []Expr
 	// OrderBy holds the ORDER BY sort keys, applied left to right; nil/empty means no
 	// ORDER BY (spec/design/grammar.md §10).
 	OrderBy []OrderKey

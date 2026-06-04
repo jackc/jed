@@ -1,0 +1,97 @@
+# GROUP BY — one result row per distinct grouping-key combination (spec/design/aggregates.md
+# §5-6, grammar.md §18). NULL is its own single group; decimal keys bucket value-canonically;
+# a non-aggregated SELECT/ORDER BY column not in GROUP BY is 42803. ORDER BY over a grouping
+# column sorts the group rows. Cost = rows scanned + rows x aggregates accumulated + 1 per
+# emitted group (the bucketing/sort is unmetered — cost.md §3).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.order_by, types.int32, types.decimal, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, g int32, a int32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, NULL, 50), (6, NULL, 60)
+
+# One row per g group; NULL rows collapse into ONE group (NULL groups with NULL). ORDER BY g
+# sorts the groups, NULLs last (PG model). 6 scanned + 6x2 accumulate + 3 produced = 21.
+# names: g, count, sum
+# cost: 21
+query III nosort
+SELECT g, COUNT(*), SUM(a) FROM t GROUP BY g ORDER BY g
+----
+1
+2
+30
+2
+2
+70
+NULL
+2
+110
+
+# A qualified grouping key (t.g) resolves the same way.
+# names: g, count
+query II nosort
+SELECT t.g, COUNT(*) FROM t GROUP BY t.g ORDER BY t.g
+----
+1
+2
+2
+2
+NULL
+2
+
+# Decimal keys bucket by VALUE-canonical form: 1.5 and 1.50 (unconstrained numeric, distinct
+# stored scales) share ONE group of count 2; the displayed key is the first occurrence (1.5).
+statement ok
+CREATE TABLE td (id int32 PRIMARY KEY, d numeric)
+
+statement ok
+INSERT INTO td VALUES (1, 1.5), (2, 1.50), (3, 2.00)
+
+# names: d, count
+# cost: 8
+query DI nosort
+SELECT d, COUNT(*) FROM td GROUP BY d ORDER BY d
+----
+1.5
+2
+2.00
+1
+
+# Composite grouping key (x, y): group by the pair.
+statement ok
+CREATE TABLE tc (id int32 PRIMARY KEY, x int32, y int32)
+
+statement ok
+INSERT INTO tc VALUES (1, 1, 1), (2, 1, 1), (3, 1, 2), (4, 2, 1)
+
+# names: x, y, count
+# cost: 11
+query III nosort
+SELECT x, y, COUNT(*) FROM tc GROUP BY x, y ORDER BY x, y
+----
+1
+1
+2
+1
+2
+1
+2
+1
+1
+
+# Grouping error: `a` is neither grouped nor aggregated -> 42803.
+statement error 42803
+SELECT g, a FROM t GROUP BY g
+
+# ORDER BY a non-grouping column in a grouped query -> 42803 (the grouping-error rule again).
+statement error 42803
+SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY a
+
+# GROUP BY over an empty table yields ZERO rows (contrast whole-table aggregation's one row).
+statement ok
+CREATE TABLE e (id int32 PRIMARY KEY, g int32)
+
+query II nosort
+SELECT g, COUNT(*) FROM e GROUP BY g ORDER BY g
+----

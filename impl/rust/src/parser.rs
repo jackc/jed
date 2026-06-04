@@ -294,6 +294,8 @@ impl Parser {
 
         let filter = self.parse_optional_where()?;
 
+        let group_by = self.parse_group_by()?;
+
         let order_by = self.parse_order_by()?;
 
         let (limit, offset) = self.parse_limit_offset()?;
@@ -304,10 +306,37 @@ impl Parser {
             from,
             joins,
             filter,
+            group_by,
             order_by,
             limit,
             offset,
         })
+    }
+
+    /// `group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` (grammar.md §18). Parsed after
+    /// WHERE, before ORDER BY. Empty when absent. Each key is a bare/qualified column (never an
+    /// expression/alias/ordinal — the same narrowing ORDER BY makes). `GROUP` is not reserved,
+    /// so it is a clause only when immediately followed by `BY`.
+    fn parse_group_by(&mut self) -> Result<Vec<Expr>> {
+        if self.peek_keyword().as_deref() != Some("group") {
+            return Ok(Vec::new());
+        }
+        self.advance(); // GROUP
+        self.expect_keyword("by")?;
+        let mut keys = Vec::new();
+        loop {
+            let (qualifier, name) = self.parse_column_ref()?;
+            keys.push(match qualifier {
+                Some(qualifier) => Expr::QualifiedColumn { qualifier, name },
+                None => Expr::Column(name),
+            });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(keys)
     }
 
     /// `from_clause ::= table_ref join_clause*` (spec/grammar/grammar.ebnf, grammar.md §15).
@@ -949,6 +978,7 @@ fn is_table_ref_stop_keyword(kw: &str) -> bool {
     matches!(
         kw,
         "where"
+            | "group"
             | "order"
             | "limit"
             | "offset"

@@ -153,6 +153,10 @@ pub struct Select {
     pub joins: Vec<JoinClause>,
     /// The WHERE expression (must resolve to boolean), if any.
     pub filter: Option<Expr>,
+    /// GROUP BY keys — bare or qualified table columns (never expressions/aliases/ordinals);
+    /// empty means no GROUP BY. Each is a `Column` or `QualifiedColumn` (the parser restricts
+    /// it to `column_ref`). With keys present the query groups (spec/design/grammar.md §18).
+    pub group_by: Vec<Expr>,
     /// ORDER BY sort keys, applied left to right; empty means no ORDER BY
     /// (spec/design/grammar.md §10).
     pub order_by: Vec<OrderKey>,

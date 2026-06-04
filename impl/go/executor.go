@@ -494,26 +494,37 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	// Resolve projections (paired with output names — §8), the optional WHERE (must be
 	// boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
 	// relations is 42702; an unknown qualifier is 42P01 (§15).
-	// Detect an aggregate query (any select item contains an aggregate call). Its projection
-	// resolves in collect mode — aggregates collect into synthetic slots and a bare non-grouped
-	// column is 42803 (spec/design/aggregates.md §4); a non-aggregate query resolves in
-	// Forbidden mode (columns normal; a stray aggregate would be 42803).
-	isAgg := itemsHaveAggregate(sel.Items)
-	projAgg := &aggCtx{collecting: isAgg}
+	// Resolve GROUP BY keys to flat row indices (a key is a bare/qualified column — grammar.md
+	// §18). An unknown column is 42703, an ambiguous bare key 42702.
+	var err error
+	groupKeys := make([]int, 0, len(sel.GroupBy))
+	for _, key := range sel.GroupBy {
+		var idx int
+		if key.Kind == ExprQualifiedColumn {
+			idx, err = s.resolveQualified(key.Qualifier, key.Column)
+		} else {
+			idx, err = s.resolveBare(key.Column)
+		}
+		if err != nil {
+			return Outcome{}, err
+		}
+		groupKeys = append(groupKeys, idx)
+	}
+
+	// An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
+	// resolves in collect mode — aggregates collect into synthetic slots and a non-grouped
+	// column is 42803 (spec/design/aggregates.md §4/§6); a plain query resolves in Forbidden
+	// mode (columns normal). Output names per grammar.md §8.
+	isAgg := len(groupKeys) > 0 || itemsHaveAggregate(sel.Items)
+	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys}
 	projections, columnNames, err := resolveProjections(s, sel.Items, projAgg)
 	if err != nil {
 		return Outcome{}, err
 	}
 	aggSpecs := projAgg.specs
-	// Slice-1 narrowing: ORDER BY / DISTINCT over an aggregate query's output need output-scope
-	// resolution (the synthetic group row), which lands with GROUP BY (aggregates.md §10).
-	if isAgg {
-		if len(sel.OrderBy) > 0 {
-			return Outcome{}, NewError(FeatureNotSupported, "ORDER BY with aggregates is not supported yet")
-		}
-		if sel.Distinct {
-			return Outcome{}, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
-		}
+	// SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
+	if isAgg && sel.Distinct {
+		return Outcome{}, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
 	}
 	var filter *rExpr
 	if sel.Filter != nil {
@@ -527,6 +538,10 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		descending bool
 		nullsFirst bool
 	}
+	// ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
+	// grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
+	// grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
+	// keys resolve against the FROM scope (a flat row index).
 	order := make([]orderKeyPlan, 0, len(sel.OrderBy))
 	for _, key := range sel.OrderBy {
 		var idx int
@@ -538,7 +553,20 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		if err != nil {
 			return Outcome{}, err
 		}
-		order = append(order, orderKeyPlan{idx: idx, descending: key.Descending, nullsFirst: key.NullsFirst})
+		slot := idx
+		if isAgg {
+			slot = -1
+			for pos, gk := range groupKeys {
+				if gk == idx {
+					slot = pos
+					break
+				}
+			}
+			if slot < 0 {
+				return Outcome{}, groupingErrorColumn(key.Column)
+			}
+		}
+		order = append(order, orderKeyPlan{idx: slot, descending: key.Descending, nullsFirst: key.NullsFirst})
 	}
 
 	// SELECT DISTINCT restriction (spec/design/grammar.md §11): each ORDER BY key must appear
@@ -682,8 +710,10 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 
 	// ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
 	// and a full tie keeps the scan order (SliceStable). Each key's NULL placement is decoupled
-	// from its value-direction flip (spec/design/grammar.md §10).
-	if len(order) > 0 {
+	// from its value-direction flip (spec/design/grammar.md §10). Aggregate queries sort their
+	// GROUP rows in the aggregate branch below — not these pre-aggregation rows — so this is
+	// gated to plain queries.
+	if !isAgg && len(order) > 0 {
 		sort.SliceStable(rows, func(a, b int) bool {
 			for _, key := range order {
 				c := keyCmp(rows[a][key.idx], rows[b][key.idx], key.descending, key.nullsFirst)
@@ -719,16 +749,43 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	// the window then slices the DISTINCT rows.
 	var out [][]Value
 	if isAgg {
-		// Aggregate query (slice 1: one group, no GROUP BY). Fold every filtered row into the
-		// accumulators — charging aggregate_accumulate per (row × aggregate) and the operand's
-		// own operator_evals — then finalize to the synthetic row [agg_0..] and project it. Even
-		// an empty input yields ONE group row (COUNT 0, others NULL — aggregates.md §4). The
-		// bucketing/finalize is unmetered (cost.md §3).
-		accs := make([]*acc, len(aggSpecs))
-		for i, spec := range aggSpecs {
-			accs[i] = newAcc(spec.plan)
+		// Aggregate query — group + accumulate (aggregates.md §5). Bucket the post-WHERE rows by
+		// their group-key values; the bucket key is the value-canonical distinctRowKey (it
+		// collapses 1.5/1.50 and groups NULL with NULL), and the map is only an index — output
+		// order comes from the insertion-ordered `groups`, never map iteration (no map-order leak
+		// — CLAUDE.md §8/§10). Whole-table aggregation (no GROUP BY) is one pre-created empty-key
+		// group, so it emits ONE row even over zero input; GROUP BY over an empty table creates no
+		// groups -> zero rows. Each (row × aggregate) charges aggregate_accumulate; the operand's
+		// own operator_evals accrue via eval; the bucketing/finalize is unmetered (cost.md §3).
+		type group struct {
+			keys []Value
+			accs []*acc
+		}
+		newAccs := func() []*acc {
+			a := make([]*acc, len(aggSpecs))
+			for i, spec := range aggSpecs {
+				a[i] = newAcc(spec.plan)
+			}
+			return a
+		}
+		index := make(map[string]int)
+		var groups []group
+		if len(groupKeys) == 0 {
+			groups = append(groups, group{keys: nil, accs: newAccs()})
+			index[""] = 0
 		}
 		for _, row := range rows {
+			keys := make([]Value, len(groupKeys))
+			for i, gk := range groupKeys {
+				keys[i] = row[gk]
+			}
+			k := distinctRowKey(keys)
+			gi, ok := index[k]
+			if !ok {
+				gi = len(groups)
+				index[k] = gi
+				groups = append(groups, group{keys: keys, accs: newAccs()})
+			}
 			for i, spec := range aggSpecs {
 				meter.Charge(Costs.AggregateAccumulate)
 				v := NullValue() // COUNT(*) ignores the value
@@ -738,22 +795,38 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 						return Outcome{}, verr
 					}
 				}
-				if ferr := accs[i].fold(v); ferr != nil {
+				if ferr := groups[gi].accs[i].fold(v); ferr != nil {
 					return Outcome{}, ferr
 				}
 			}
 		}
-		synthetic := make([]Value, len(accs))
-		for i, a := range accs {
-			v, ferr := a.finalize()
-			if ferr != nil {
-				return Outcome{}, ferr
+		// Build one synthetic row per group: [group_key_values..., aggregate_results...].
+		groupRows := make([][]Value, 0, len(groups))
+		for _, g := range groups {
+			srow := make([]Value, 0, len(g.keys)+len(g.accs))
+			srow = append(srow, g.keys...)
+			for _, a := range g.accs {
+				v, ferr := a.finalize()
+				if ferr != nil {
+					return Outcome{}, ferr
+				}
+				srow = append(srow, v)
 			}
-			synthetic[i] = v
+			groupRows = append(groupRows, srow)
 		}
-		// The single group row, then the LIMIT/OFFSET window over it (LIMIT 0 → no rows). Only an
-		// emitted row charges row_produced + its projection operator_evals (cost.md §3).
-		groupRows := [][]Value{synthetic}
+		// ORDER BY over the grouped output (keys are synthetic group-key slots).
+		if len(order) > 0 {
+			sort.SliceStable(groupRows, func(a, b int) bool {
+				for _, key := range order {
+					c := keyCmp(groupRows[a][key.idx], groupRows[b][key.idx], key.descending, key.nullsFirst)
+					if c != 0 {
+						return c < 0
+					}
+				}
+				return false
+			})
+		}
+		// Window + project; only an emitted row charges row_produced + its projection cost.
 		start, end := windowBounds(int64(len(groupRows)))
 		out = make([][]Value, 0, end-start)
 		for _, srow := range groupRows[start:end] {
@@ -975,9 +1048,14 @@ type rExpr struct {
 
 // aggCtx threads the aggregate-resolution mode through resolve. collecting == false is the
 // Forbidden mode (a FuncCall is 42803; columns resolve normally); collecting == true is an
-// aggregate query's projection (a FuncCall collects into specs; a bare column is 42803).
+// aggregate query's projection (a FuncCall collects into specs and resolves to a synthetic
+// slot len(groupKeys)+index; a column resolves to its position among groupKeys if it is a
+// grouping key, else 42803). groupKeys holds the resolved flat indices of the GROUP BY
+// columns (empty for whole-table aggregation). The synthetic row the projection evaluates
+// against is [group_key_values..., agg_results...].
 type aggCtx struct {
 	collecting bool
+	groupKeys  []int
 	specs      []aggSpec
 }
 
@@ -1200,7 +1278,8 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedT
 	default:
 		return nil, resolvedType{}, NewError(UndefinedFunction, "function does not exist: "+fc.Name)
 	}
-	slot := len(ag.specs)
+	// Aggregate results follow the group-key values in the synthetic row.
+	slot := len(ag.groupKeys) + len(ag.specs)
 	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
@@ -1210,9 +1289,26 @@ func noAggOverload(fn string) error {
 	return NewError(UndefinedFunction, "no "+fn+" aggregate for that argument type")
 }
 
-// groupingErrorColumn is the 42803 for a non-aggregated column with no GROUP BY.
+// groupingErrorColumn is the 42803 for a non-aggregated column not in GROUP BY.
 func groupingErrorColumn(name string) error {
 	return NewError(GroupingError, "column "+name+" must appear in the GROUP BY clause or be used in an aggregate function")
+}
+
+// collectColumn resolves a column reference (already at real flat index idx) under an
+// aggregate context. In Forbidden mode it reads the real row directly; in collect mode it must
+// be a grouping key — resolved to its synthetic-row slot (its position among the group keys) —
+// else 42803.
+func collectColumn(s *scope, ag *aggCtx, idx int, name string) (*rExpr, resolvedType, error) {
+	ty := resolvedTypeOf(s.columnAt(idx).Type)
+	if !ag.collecting {
+		return &rExpr{kind: reColumn, index: idx}, ty, nil
+	}
+	for pos, gk := range ag.groupKeys {
+		if gk == idx {
+			return &rExpr{kind: reColumn, index: pos}, ty, nil
+		}
+	}
+	return nil, resolvedType{}, groupingErrorColumn(name)
 }
 
 // ============================================================================
@@ -1402,24 +1498,18 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 	switch e.Kind {
 	case ExprColumn:
 		// Resolve for existence first (42703/42702 take priority, matching PostgreSQL); then
-		// in an aggregate query's projection a bare non-grouped column is 42803.
+		// in an aggregate query's projection the column must be a grouping key (else 42803).
 		idx, err := s.resolveBare(e.Column)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		if ag.collecting {
-			return nil, resolvedType{}, groupingErrorColumn(e.Column)
-		}
-		return &rExpr{kind: reColumn, index: idx}, resolvedTypeOf(s.columnAt(idx).Type), nil
+		return collectColumn(s, ag, idx, e.Column)
 	case ExprQualifiedColumn:
 		idx, err := s.resolveQualified(e.Qualifier, e.Column)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		if ag.collecting {
-			return nil, resolvedType{}, groupingErrorColumn(e.Column)
-		}
-		return &rExpr{kind: reColumn, index: idx}, resolvedTypeOf(s.columnAt(idx).Type), nil
+		return collectColumn(s, ag, idx, e.Column)
 	case ExprFuncCall:
 		return resolveAggregate(s, e.FuncCall, ag)
 	case ExprLiteral:

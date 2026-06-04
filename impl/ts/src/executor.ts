@@ -372,7 +372,7 @@ export class Database {
       // The RHS is a general expression evaluated against the OLD row; a literal operand
       // adapts to the target column's type. The result must be assignable to the column's
       // family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-      const { node, type } = resolve(scope, a.value, col.type, { collecting: false, specs: [] });
+      const { node, type } = resolve(scope, a.value, col.type, { collecting: false, groupKeys: [], specs: [] });
       requireAssignable(type, col.type, a.column);
       plans.push({ idx, name: col.name, target: col.type, decimal: col.decimal, notNull: col.notNull, source: node });
     }
@@ -427,31 +427,42 @@ export class Database {
     // Resolve projections (paired with output names — §8), the optional WHERE (must be
     // boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
     // relations is 42702; an unknown qualifier is 42P01 (§15).
-    // Detect an aggregate query (any select item contains an aggregate call). Its projection
-    // resolves in collect mode — aggregates collect into synthetic slots and a bare non-grouped
-    // column is 42803 (spec/design/aggregates.md §4); a non-aggregate query resolves in
-    // Forbidden mode (columns normal; a stray aggregate would be 42803).
-    const isAgg = itemsHaveAggregate(sel.items);
-    const projAgg: AggCtx = { collecting: isAgg, specs: [] };
+    // Resolve GROUP BY keys to flat row indices (a key is a bare/qualified column — grammar.md
+    // §18). An unknown column is 42703, an ambiguous bare key 42702.
+    const groupKeys: number[] = sel.groupBy.map((key) =>
+      key.kind === "qualifiedColumn"
+        ? scope.resolveQualified(key.qualifier, key.name)
+        : scope.resolveBare((key as { name: string }).name),
+    );
+
+    // An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
+    // resolves in collect mode — aggregates collect into synthetic slots and a non-grouped
+    // column is 42803 (spec/design/aggregates.md §4/§6); a plain query resolves in Forbidden
+    // mode (columns normal). Output names per grammar.md §8.
+    const isAgg = groupKeys.length > 0 || itemsHaveAggregate(sel.items);
+    const projAgg: AggCtx = { collecting: isAgg, groupKeys, specs: [] };
     const { nodes: projections, names: columnNames } = resolveProjections(scope, sel.items, projAgg);
     const aggSpecs = projAgg.specs;
-    // Slice-1 narrowing: ORDER BY / DISTINCT over an aggregate query's output need output-scope
-    // resolution (the synthetic group row), which lands with GROUP BY (aggregates.md §10).
-    if (isAgg) {
-      if (sel.orderBy.length > 0) {
-        throw engineError("feature_not_supported", "ORDER BY with aggregates is not supported yet");
-      }
-      if (sel.distinct) {
-        throw engineError("feature_not_supported", "SELECT DISTINCT with aggregates is not supported yet");
-      }
+    // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
+    if (isAgg && sel.distinct) {
+      throw engineError("feature_not_supported", "SELECT DISTINCT with aggregates is not supported yet");
     }
     const filter = sel.filter ? resolveBooleanFilter(scope, sel.filter) : null;
+    // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
+    // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
+    // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
+    // keys resolve against the FROM scope (a flat row index).
     const order: { idx: number; descending: boolean; nullsFirst: boolean }[] = [];
     for (const key of sel.orderBy) {
       const idx = key.qualifier !== null
         ? scope.resolveQualified(key.qualifier, key.column)
         : scope.resolveBare(key.column);
-      order.push({ idx, descending: key.descending, nullsFirst: key.nullsFirst });
+      let slot = idx;
+      if (isAgg) {
+        slot = groupKeys.indexOf(idx);
+        if (slot < 0) throw groupingErrorColumn(key.column);
+      }
+      order.push({ idx: slot, descending: key.descending, nullsFirst: key.nullsFirst });
     }
 
     // SELECT DISTINCT restriction (spec/design/grammar.md §11): each ORDER BY key must appear
@@ -552,8 +563,10 @@ export class Database {
 
     // ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
     // and a full tie keeps the scan order (JS Array#sort is stable). Each key's NULL placement
-    // is decoupled from its value-direction flip (spec/design/grammar.md §10).
-    if (order.length > 0) {
+    // is decoupled from its value-direction flip (spec/design/grammar.md §10). Aggregate queries
+    // sort their GROUP rows in the aggregate branch below — not these pre-aggregation rows — so
+    // this is gated to plain queries.
+    if (!isAgg && order.length > 0) {
       rows.sort((a, b) => {
         for (const key of order) {
           const c = keyCmp(a[key.idx]!, b[key.idx]!, key.descending, key.nullsFirst);
@@ -580,23 +593,50 @@ export class Database {
     // the window then slices the DISTINCT rows.
     let out: Value[][];
     if (isAgg) {
-      // Aggregate query (slice 1: one group, no GROUP BY). Fold every filtered row into the
-      // accumulators — charging aggregateAccumulate per (row × aggregate) and the operand's
-      // own operatorEvals — then finalize to the synthetic row [agg_0..] and project it. Even
-      // an empty input yields ONE group row (COUNT 0, others NULL — aggregates.md §4). The
-      // bucketing/finalize is unmetered (cost.md §3).
-      const accs = aggSpecs.map((s) => newAcc(s.plan));
+      // Aggregate query — group + accumulate (aggregates.md §5). Bucket the post-WHERE rows by
+      // their group-key values; the bucket key is the value-canonical distinctRowKey (it
+      // collapses 1.5/1.50 and groups NULL with NULL), and the Map is only an index — output
+      // order comes from the insertion-ordered `groups`, never Map iteration (no order leak —
+      // §8/§10). Whole-table aggregation (no GROUP BY) is one pre-created empty-key group, so it
+      // emits ONE row even over zero input; GROUP BY over an empty table creates no groups ->
+      // zero rows. Each (row × aggregate) charges aggregateAccumulate; the bucketing/finalize is
+      // unmetered (cost.md §3).
+      const newAccs = (): Acc[] => aggSpecs.map((s) => newAcc(s.plan));
+      const index = new Map<string, number>();
+      const groups: { keys: Value[]; accs: Acc[] }[] = [];
+      if (groupKeys.length === 0) {
+        groups.push({ keys: [], accs: newAccs() });
+        index.set("", 0);
+      }
       for (const row of rows) {
+        const keys = groupKeys.map((gk) => row[gk]!);
+        const k = distinctRowKey(keys);
+        let gi = index.get(k);
+        if (gi === undefined) {
+          gi = groups.length;
+          index.set(k, gi);
+          groups.push({ keys, accs: newAccs() });
+        }
+        const accs = groups[gi]!.accs;
         aggSpecs.forEach((spec, i) => {
           meter.charge(COSTS.aggregateAccumulate);
           const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, meter);
           foldAcc(accs[i]!, v);
         });
       }
-      const synthetic = accs.map((a) => finalizeAcc(a));
-      // The single group row, then the LIMIT/OFFSET window over it (LIMIT 0 → no rows). Only an
-      // emitted row charges rowProduced + its projection operatorEvals (cost.md §3).
-      const groupRows = [synthetic];
+      // Build one synthetic row per group: [group_key_values..., aggregate_results...].
+      const groupRows = groups.map((g) => [...g.keys, ...g.accs.map((a) => finalizeAcc(a))]);
+      // ORDER BY over the grouped output (keys are synthetic group-key slots).
+      if (order.length > 0) {
+        groupRows.sort((a, b) => {
+          for (const key of order) {
+            const c = keyCmp(a[key.idx]!, b[key.idx]!, key.descending, key.nullsFirst);
+            if (c !== 0) return c;
+          }
+          return 0;
+        });
+      }
+      // Window + project; only an emitted row charges rowProduced + its projection cost.
       const [start, end] = windowBounds(groupRows.length);
       out = groupRows.slice(start, end).map((srow) => {
         meter.charge(COSTS.rowProduced);
@@ -736,8 +776,11 @@ type AggSpec = { plan: AggPlan; operand: RExpr | null };
 
 // AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
 // Forbidden mode (a funcCall is 42803; columns resolve normally); collecting === true is an
-// aggregate query's projection (a funcCall collects into specs; a bare column is 42803).
-type AggCtx = { collecting: boolean; specs: AggSpec[] };
+// aggregate query's projection (a funcCall collects into specs and resolves to a synthetic slot
+// groupKeys.length + index; a column resolves to its position among groupKeys if it is a
+// grouping key, else 42803). groupKeys holds the resolved flat indices of the GROUP BY columns
+// (empty for whole-table aggregation). The synthetic row is [group_key_values..., agg_results...].
+type AggCtx = { collecting: boolean; groupKeys: number[]; specs: AggSpec[] };
 
 // Acc is a running aggregate accumulator (one per AggSpec), folded per input row then finalized.
 type Acc = {
@@ -854,7 +897,7 @@ function resolveAggregate(
     throw engineError("grouping_error", "aggregate functions are not allowed here");
   }
   const name = e.name.toLowerCase();
-  const sub: AggCtx = { collecting: false, specs: [] };
+  const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
   let plan: AggPlan;
   let operand: RExpr | null;
   let result: ResolvedType;
@@ -903,9 +946,22 @@ function resolveAggregate(
   } else {
     throw engineError("undefined_function", "function does not exist: " + e.name);
   }
-  const slot = ag.specs.length;
+  // Aggregate results follow the group-key values in the synthetic row.
+  const slot = ag.groupKeys.length + ag.specs.length;
   ag.specs.push({ plan, operand });
   return { node: { kind: "column", index: slot }, type: result };
+}
+
+// collectColumn resolves a column reference (already at real flat index `idx`) under an
+// aggregate context. In Forbidden mode it reads the real row directly; in collect mode it must
+// be a grouping key — resolved to its synthetic-row slot (its position among the group keys) —
+// else 42803.
+function collectColumn(scope: Scope, ag: AggCtx, idx: number, name: string): { node: RExpr; type: ResolvedType } {
+  const type = resolvedTypeOf(scope.columnAt(idx).type);
+  if (!ag.collecting) return { node: { kind: "column", index: idx }, type };
+  const pos = ag.groupKeys.indexOf(idx);
+  if (pos < 0) throw groupingErrorColumn(name);
+  return { node: { kind: "column", index: pos }, type };
 }
 
 // noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
@@ -1058,7 +1114,7 @@ function outputName(scope: Scope, e: Expr): string {
 // untyped NULL, always unknown → no rows). An integer- or text-valued one is a 42804.
 function resolveBooleanFilter(scope: Scope, e: Expr): RExpr {
   // WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
-  const { node, type } = resolve(scope, e, null, { collecting: false, specs: [] });
+  const { node, type } = resolve(scope, e, null, { collecting: false, groupKeys: [], specs: [] });
   if (type.kind !== "bool" && type.kind !== "null") {
     throw typeError("argument of WHERE must be boolean");
   }
@@ -1077,15 +1133,13 @@ function resolve(
   switch (e.kind) {
     case "column": {
       // Resolve for existence first (42703/42702 take priority, matching PostgreSQL); then in
-      // an aggregate query's projection a bare non-grouped column is 42803.
+      // an aggregate query's projection the column must be a grouping key (else 42803).
       const idx = scope.resolveBare(e.name);
-      if (ag.collecting) throw groupingErrorColumn(e.name);
-      return { node: { kind: "column", index: idx }, type: resolvedTypeOf(scope.columnAt(idx).type) };
+      return collectColumn(scope, ag, idx, e.name);
     }
     case "qualifiedColumn": {
       const idx = scope.resolveQualified(e.qualifier, e.name);
-      if (ag.collecting) throw groupingErrorColumn(e.name);
-      return { node: { kind: "column", index: idx }, type: resolvedTypeOf(scope.columnAt(idx).type) };
+      return collectColumn(scope, ag, idx, e.name);
     }
     case "funcCall":
       return resolveAggregate(scope, e, ag);

@@ -42,6 +42,7 @@ function lower(s: string): string {
 function isTableRefStopKeyword(kw: string): boolean {
   switch (kw) {
     case "where":
+    case "group":
     case "order":
     case "limit":
     case "offset":
@@ -323,6 +324,8 @@ class Parser {
 
     const filter = this.parseOptionalWhere();
 
+    const groupBy = this.parseGroupBy();
+
     const orderBy = this.parseOrderBy();
 
     let limit: bigint | null = null;
@@ -342,7 +345,28 @@ class Parser {
       }
     }
 
-    return { kind: "select", distinct, items, from, joins, filter, orderBy, limit, offset };
+    return { kind: "select", distinct, items, from, joins, filter, groupBy, orderBy, limit, offset };
+  }
+
+  // parseGroupBy parses `group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` (grammar.md
+  // §18), after WHERE and before ORDER BY. Each key is a bare/qualified column (never an
+  // expression/alias/ordinal). `GROUP` is not reserved, so it is a clause only when immediately
+  // followed by `BY`.
+  private parseGroupBy(): Expr[] {
+    if (this.peekKeyword() !== "group") return [];
+    this.advance(); // GROUP
+    this.expectKeyword("by");
+    const keys: Expr[] = [];
+    for (;;) {
+      const [qualifier, name] = this.parseColumnRef();
+      keys.push(qualifier !== null ? { kind: "qualifiedColumn", qualifier, name } : { kind: "column", name });
+      if (this.peek().kind === "comma") {
+        this.advance();
+        continue;
+      }
+      break;
+    }
+    return keys;
   }
 
   // parseFromClause parses `from_clause ::= table_ref join_clause*` (grammar.md §15): the first

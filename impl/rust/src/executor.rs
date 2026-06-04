@@ -530,52 +530,68 @@ impl Database {
         }
         let scope = Scope { rels };
 
-        // Resolve projections (paired with output column names — grammar.md §8), the optional
-        // WHERE (must be boolean), and the ORDER BY keys against the full scope. A bare key
-        // ambiguous across relations is 42702; an unknown qualifier is 42P01 (§15).
-        // Detect an aggregate query (any select item contains an aggregate call). Its
-        // projection resolves in Collect mode — aggregates collect into synthetic slots and a
-        // bare non-grouped column is 42803 (spec/design/aggregates.md §4); a non-aggregate
-        // query resolves in Forbidden mode (columns normal; a stray aggregate would be 42803).
-        let is_agg = items_have_aggregate(&sel.items);
+        // Resolve GROUP BY keys to flat row indices (a key is a bare/qualified column —
+        // grammar.md §18). An unknown column is 42703, an ambiguous bare key 42702.
+        let mut group_keys: Vec<usize> = Vec::with_capacity(sel.group_by.len());
+        for key in &sel.group_by {
+            let idx = match key {
+                Expr::Column(name) => scope.resolve_bare(name)?,
+                Expr::QualifiedColumn { qualifier, name } => {
+                    scope.resolve_qualified(qualifier, name)?
+                }
+                _ => unreachable!("the parser restricts GROUP BY keys to column references"),
+            };
+            group_keys.push(idx);
+        }
+
+        // An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
+        // resolves in Collect mode — aggregates collect into synthetic slots and a non-grouped
+        // column is 42803 (spec/design/aggregates.md §4/§6); a plain query resolves in Forbidden
+        // mode (columns normal; a stray aggregate would be 42803). Output names per grammar.md §8.
+        let is_agg = !group_keys.is_empty() || items_have_aggregate(&sel.items);
         let mut agg_ctx = if is_agg {
-            AggCtx::Collect(Vec::new())
+            AggCtx::Collect {
+                group_keys: group_keys.clone(),
+                specs: Vec::new(),
+            }
         } else {
             AggCtx::Forbidden
         };
         let (projections, column_names) = resolve_projections(&scope, &sel.items, &mut agg_ctx)?;
         let agg_specs: Vec<AggSpec> = match agg_ctx {
-            AggCtx::Collect(specs) => specs,
+            AggCtx::Collect { specs, .. } => specs,
             AggCtx::Forbidden => Vec::new(),
         };
-        // Slice-1 narrowing: ORDER BY / DISTINCT over an aggregate query's output need
-        // output-scope resolution (the synthetic group row), which lands with GROUP BY
-        // (spec/design/aggregates.md §10). Reject them for now.
-        if is_agg {
-            if !sel.order_by.is_empty() {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "ORDER BY with aggregates is not supported yet",
-                ));
-            }
-            if sel.distinct {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "SELECT DISTINCT with aggregates is not supported yet",
-                ));
-            }
+        // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
+        if is_agg && sel.distinct {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "SELECT DISTINCT with aggregates is not supported yet",
+            ));
         }
         let filter = match &sel.filter {
             Some(p) => Some(resolve_boolean_filter(&scope, p)?),
             None => None,
         };
+        // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
+        // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
+        // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain
+        // query keys resolve against the FROM scope (a flat row index).
         let mut order: Vec<(usize, bool, bool)> = Vec::with_capacity(sel.order_by.len());
         for key in &sel.order_by {
             let idx = match &key.qualifier {
                 Some(q) => scope.resolve_qualified(q, &key.column)?,
                 None => scope.resolve_bare(&key.column)?,
             };
-            order.push((idx, key.descending, key.nulls_first));
+            let slot = if is_agg {
+                group_keys
+                    .iter()
+                    .position(|&gk| gk == idx)
+                    .ok_or_else(|| grouping_error_column(&key.column))?
+            } else {
+                idx
+            };
+            order.push((slot, key.descending, key.nulls_first));
         }
 
         // SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates are
@@ -713,7 +729,9 @@ impl Database {
         // decides, and a full tie keeps the scan order (the sort is stable). Each key's NULL
         // placement is decoupled from its value-direction flip, so an explicit NULLS
         // FIRST|LAST overrides the default (spec/design/grammar.md §10).
-        if !order.is_empty() {
+        // (Aggregate queries sort their GROUP rows in the aggregate branch below — not these
+        // pre-aggregation rows — so the sort here is gated to plain queries.)
+        if !is_agg && !order.is_empty() {
             rows.sort_by(|a, b| {
                 for &(idx, descending, nulls_first) in &order {
                     let ord = key_cmp(&a[idx], &b[idx], descending, nulls_first);
@@ -744,29 +762,69 @@ impl Database {
         // (sorted) filtered row is projected — dedup must see them all — duplicates drop
         // by first occurrence, and the window then slices the DISTINCT rows.
         let out_rows = if is_agg {
-            // Aggregate query (slice 1: one group, no GROUP BY). Fold every filtered row into
+            // Aggregate query — group + accumulate (aggregates.md §5). Fold every filtered row into
             // the accumulators — charging aggregate_accumulate per (row × aggregate) and the
             // operand's own operator_evals — then finalize to the synthetic row [agg_0..] and
             // project it. Even an empty input yields ONE group row (COUNT 0, others NULL —
             // spec/design/aggregates.md §4). The bucketing/finalize is unmetered (cost.md §3).
-            let mut accs: Vec<Acc> = agg_specs.iter().map(|s| Acc::new(s.plan)).collect();
+            // Bucket the post-WHERE rows by their group-key values. The bucket key is the
+            // value-canonical Vec<Value> (its Eq/Hash collapse 1.5/1.50 and group NULL with
+            // NULL — value.rs); the map is only an index, never iterated, so output order comes
+            // from the insertion-ordered `groups` (no hashmap-order leak — CLAUDE.md §8/§10).
+            // Whole-table aggregation (no GROUP BY) is one pre-created empty-key group, so it
+            // emits ONE row even over zero input (COUNT 0, others NULL); GROUP BY over an empty
+            // table creates no groups -> zero rows.
+            let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
+            let mut groups: Vec<(Vec<Value>, Vec<Acc>)> = Vec::new();
+            if group_keys.is_empty() {
+                groups.push((
+                    Vec::new(),
+                    agg_specs.iter().map(|s| Acc::new(s.plan)).collect(),
+                ));
+                index.insert(Vec::new(), 0);
+            }
             for row in &rows {
-                for (spec, acc) in agg_specs.iter().zip(accs.iter_mut()) {
+                let key: Vec<Value> = group_keys.iter().map(|&gk| row[gk].clone()).collect();
+                let gi = match index.get(&key) {
+                    Some(&i) => i,
+                    None => {
+                        let i = groups.len();
+                        index.insert(key.clone(), i);
+                        groups.push((key, agg_specs.iter().map(|s| Acc::new(s.plan)).collect()));
+                        i
+                    }
+                };
+                for (si, spec) in agg_specs.iter().enumerate() {
                     meter.charge(COSTS.aggregate_accumulate);
                     let v = match &spec.operand {
                         Some(op) => op.eval(row, &mut meter)?,
                         None => Value::Null, // COUNT(*) ignores the value
                     };
-                    acc.fold(v)?;
+                    groups[gi].1[si].fold(v)?;
                 }
             }
-            let mut synthetic = Vec::with_capacity(accs.len());
-            for acc in accs {
-                synthetic.push(acc.finalize()?);
+            // Build one synthetic row per group: [group_key_values..., aggregate_results...].
+            let mut group_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+            for (key, accs) in groups {
+                let mut srow = key;
+                for acc in accs {
+                    srow.push(acc.finalize()?);
+                }
+                group_rows.push(srow);
             }
-            // The single group row, then the LIMIT/OFFSET window over it (LIMIT 0 → no rows).
-            // Only an emitted row charges row_produced + its projection operator_evals (§3).
-            let group_rows = vec![synthetic];
+            // ORDER BY over the grouped output (keys are synthetic group-key slots).
+            if !order.is_empty() {
+                group_rows.sort_by(|a, b| {
+                    for &(slot, descending, nulls_first) in &order {
+                        let ord = key_cmp(&a[slot], &b[slot], descending, nulls_first);
+                        if ord.is_ne() {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            // Window + project; only an emitted row charges row_produced + projection cost.
             let (start, end) = window_bounds(group_rows.len());
             let mut out_rows = Vec::with_capacity(end - start);
             for srow in &group_rows[start..end] {
@@ -1035,9 +1093,16 @@ enum RExpr {
 enum AggCtx {
     /// Aggregates are not allowed here (a FuncCall is 42803); columns resolve normally.
     Forbidden,
-    /// An aggregate query's projection: a FuncCall collects into `0` and resolves to a
-    /// synthetic slot; a bare column (not grouped — no GROUP BY this slice) is 42803.
-    Collect(Vec<AggSpec>),
+    /// An aggregate query's projection: a FuncCall collects into `specs` and resolves to a
+    /// synthetic slot (group_keys.len() + its index); a column resolves to its position among
+    /// `group_keys` (a synthetic slot in 0..group_keys.len()) if it is a grouping key, else
+    /// 42803. `group_keys` holds the resolved flat indices of the GROUP BY columns (empty for
+    /// whole-table aggregation — then every bare column is 42803). The synthetic row the
+    /// projection evaluates against is `[group_key_values…, aggregate_results…]`.
+    Collect {
+        group_keys: Vec<usize>,
+        specs: Vec<AggSpec>,
+    },
 }
 
 /// The five aggregate functions, parsed from a call name (case-insensitive).
@@ -1308,12 +1373,32 @@ fn resolve_aggregate(
             (AggPlan::Max, Some(r), t)
         }
     };
-    if let AggCtx::Collect(specs) = agg {
-        let slot = specs.len();
+    if let AggCtx::Collect { group_keys, specs } = agg {
+        // Aggregate results follow the group-key values in the synthetic row.
+        let slot = group_keys.len() + specs.len();
         specs.push(AggSpec { plan, operand });
         Ok((RExpr::Column(slot), result))
     } else {
         unreachable!("an aggregate in a non-Collect context is handled above")
+    }
+}
+
+/// Resolve a column reference (already at real flat index `idx`) under an aggregate context.
+/// In Forbidden mode it reads the real row directly; in Collect mode it must be a grouping key
+/// — resolved to its synthetic-row slot (its position among the group keys) — else 42803.
+fn collect_column(
+    scope: &Scope,
+    agg: &AggCtx,
+    idx: usize,
+    name: &str,
+) -> Result<(RExpr, ResolvedType)> {
+    let ty = resolved_type_of(scope.column_at(idx).ty);
+    match agg {
+        AggCtx::Forbidden => Ok((RExpr::Column(idx), ty)),
+        AggCtx::Collect { group_keys, .. } => match group_keys.iter().position(|&gk| gk == idx) {
+            Some(pos) => Ok((RExpr::Column(pos), ty)),
+            None => Err(grouping_error_column(name)),
+        },
     }
 }
 
@@ -1443,21 +1528,14 @@ fn resolve(
     match e {
         Expr::Column(name) => {
             // Resolve for existence first (42703/42702 take priority, matching PostgreSQL);
-            // then in an aggregate query's projection a bare non-grouped column is 42803.
+            // then in an aggregate query's projection the column must be a grouping key
+            // (resolved to its synthetic slot) else 42803.
             let idx = scope.resolve_bare(name)?;
-            if matches!(agg, AggCtx::Collect(_)) {
-                return Err(grouping_error_column(name));
-            }
-            let ty = scope.column_at(idx).ty;
-            Ok((RExpr::Column(idx), resolved_type_of(ty)))
+            collect_column(scope, agg, idx, name)
         }
         Expr::QualifiedColumn { qualifier, name } => {
             let idx = scope.resolve_qualified(qualifier, name)?;
-            if matches!(agg, AggCtx::Collect(_)) {
-                return Err(grouping_error_column(name));
-            }
-            let ty = scope.column_at(idx).ty;
-            Ok((RExpr::Column(idx), resolved_type_of(ty)))
+            collect_column(scope, agg, idx, name)
         }
         Expr::FuncCall { name, arg, star } => {
             resolve_aggregate(scope, name, arg.as_deref(), *star, agg)

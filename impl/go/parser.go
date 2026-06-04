@@ -425,6 +425,10 @@ func (p *Parser) parseSelect() (*Select, error) {
 	}
 	sel.Filter = filter
 
+	if err := p.parseGroupBy(sel); err != nil {
+		return nil, err
+	}
+
 	if err := p.parseOrderBy(sel); err != nil {
 		return nil, err
 	}
@@ -553,7 +557,7 @@ func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
 // CLAUDE.md §8 cross-core determinism surface (spec/design/grammar.md §15).
 func isTableRefStopKeyword(kw string) bool {
 	switch kw {
-	case "where", "order", "limit", "offset",
+	case "where", "group", "order", "limit", "offset",
 		"join", "inner", "cross", "left", "right", "full", "outer", "on", "as":
 		return true
 	default:
@@ -566,6 +570,39 @@ func isTableRefStopKeyword(kw string) bool {
 // sel. NullsFirst is resolved here: explicit if given, else the direction default (ASC ->
 // last, DESC -> first). A bare NULLS not followed by FIRST/LAST is a syntax error (42601).
 // Leaves sel.OrderBy nil when there is no ORDER BY (spec/grammar/grammar.ebnf `order_by`).
+// parseGroupBy parses `group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` (grammar.md
+// §18), after WHERE and before ORDER BY. Each key is a bare/qualified column (never an
+// expression/alias/ordinal). `GROUP` is not reserved, so it is a clause only when immediately
+// followed by `BY`.
+func (p *Parser) parseGroupBy(sel *Select) error {
+	if p.peekKeyword() != "group" {
+		return nil
+	}
+	p.advance() // GROUP
+	if err := p.expectKeyword("by"); err != nil {
+		return err
+	}
+	for {
+		qualifier, col, err := p.parseColumnRef()
+		if err != nil {
+			return err
+		}
+		var key Expr
+		if qualifier != "" {
+			key = Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: col}
+		} else {
+			key = Expr{Kind: ExprColumn, Column: col}
+		}
+		sel.GroupBy = append(sel.GroupBy, key)
+		if p.peek().Kind == TokComma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	return nil
+}
+
 func (p *Parser) parseOrderBy(sel *Select) error {
 	if p.peekKeyword() != "order" {
 		return nil

@@ -114,8 +114,21 @@ delete         ::= "DELETE" "FROM" identifier where_clause?
 
 select         ::= "SELECT" "DISTINCT"? select_items "FROM" from_clause
                    where_clause?
+                   group_by?
                    order_by?
                    limit_offset?
+
+/* GROUP BY partitions the post-WHERE rows into groups that share a value on every grouping
+ * key, producing one result row per group (../design/aggregates.md §5). A grouping key is a
+ * bare or qualified table column (column_ref) — NOT a general expression (GROUP BY a + 1), an
+ * output alias, or an ordinal (GROUP BY 1); those stay deferred, exactly the ORDER BY
+ * narrowing (§10, ../design/grammar.md §5). With GROUP BY present, every column referenced in
+ * the SELECT list (and HAVING/ORDER BY) that is NOT inside an aggregate MUST be a grouping
+ * key, else 42803 grouping_error. NULL is its own single group (NULL groups with NULL, not
+ * three-valued); decimal keys bucket by VALUE-canonical form so 1.5 and 1.50 share one group
+ * (../design/decimal.md §5). Output group order with no ORDER BY is first-occurrence over the
+ * source scan (the DISTINCT mechanism — grammar.md §11). */
+group_by       ::= "GROUP" "BY" column_ref ("," column_ref)*
 
 /* The FROM clause is a left-deep chain: a first table_ref followed by zero or more
  * join_clauses. With no join_clause it is the single-table SELECT the rest of the
