@@ -901,6 +901,8 @@ function exprHasFuncCall(e: Expr): boolean {
       return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.rhs);
     case "in":
       return exprHasFuncCall(e.lhs) || e.list.some(exprHasFuncCall);
+    case "between":
+      return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.lo) || exprHasFuncCall(e.hi);
     default:
       return false;
   }
@@ -1278,6 +1280,20 @@ function resolve(
       }
       // folded is non-null: the parser guarantees a non-empty list.
       let desugared = folded as Expr;
+      if (e.negated) {
+        desugared = { kind: "unary", op: "not", operand: desugared };
+      }
+      return resolve(scope, desugared, ctx, ag);
+    }
+    case "between": {
+      // Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
+      // result for a NULL bound: `5 BETWEEN 10 AND NULL` is `FALSE AND NULL` = FALSE (a FALSE
+      // operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND NULL` = NULL. NOT BETWEEN
+      // negates the whole conjunction. The LHS is evaluated twice (the desugar model — a
+      // documented cost consequence, cost.md §3).
+      const ge: Expr = { kind: "binary", op: "ge", lhs: e.lhs, rhs: e.lo };
+      const le: Expr = { kind: "binary", op: "le", lhs: e.lhs, rhs: e.hi };
+      let desugared: Expr = { kind: "binary", op: "and", lhs: ge, rhs: le };
       if (e.negated) {
         desugared = { kind: "unary", op: "not", operand: desugared };
       }

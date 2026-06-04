@@ -928,11 +928,11 @@ func (p *Parser) parseComparison() (Expr, error) {
 		}
 		return Expr{Kind: ExprIsNull, IsNullOf: &IsNullExpr{Operand: lhs, Negated: negated}}, nil
 	}
-	// `NOT`? `IN` (...) — a `NOT` here is consumed only when followed by the `IN` keyword
-	// (two-token lookahead; the prefix `NOT` was already taken by parseNot). A non-associative
-	// postfix predicate at the comparison level (spec/design/grammar.md §20).
-	inNegated := p.peekKeyword() == "not" && p.peekKeywordAt(1) == "in"
-	if inNegated {
+	// `NOT`? (`IN` (...) | `BETWEEN` lo `AND` hi) — a `NOT` here is consumed only when followed
+	// by one of these postfix-predicate keywords (two-token lookahead; the prefix `NOT` was
+	// already taken by parseNot). Non-associative, at the comparison level (grammar.md §20-§21).
+	predNegated := p.peekKeyword() == "not" && (p.peekKeywordAt(1) == "in" || p.peekKeywordAt(1) == "between")
+	if predNegated {
 		p.advance() // NOT
 	}
 	if p.peekKeyword() == "in" {
@@ -957,7 +957,25 @@ func (p *Parser) parseComparison() (Expr, error) {
 		if err := p.expect(TokRParen); err != nil {
 			return Expr{}, err
 		}
-		return Expr{Kind: ExprIn, In: &InExpr{Lhs: lhs, List: list, Negated: inNegated}}, nil
+		return Expr{Kind: ExprIn, In: &InExpr{Lhs: lhs, List: list, Negated: predNegated}}, nil
+	}
+	if p.peekKeyword() == "between" {
+		p.advance()
+		// Both bounds parse at the ADDITIVE level, which never consumes `AND` (a looser level
+		// owned by parseAnd). So the BETWEEN's structural `AND` is matched here and
+		// `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c` (grammar.md §21).
+		lo, err := p.parseAdditive()
+		if err != nil {
+			return Expr{}, err
+		}
+		if err := p.expectKeyword("and"); err != nil {
+			return Expr{}, err
+		}
+		hi, err := p.parseAdditive()
+		if err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprBetween, Between: &BetweenExpr{Lhs: lhs, Lo: lo, Hi: hi, Negated: predNegated}}, nil
 	}
 	var op BinaryOp
 	switch p.peek().Kind {

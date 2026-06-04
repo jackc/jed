@@ -70,6 +70,12 @@ export type Expr =
   // NULL semantics and per-element operand typing from `=`/OR/NOT. The parser guarantees `list`
   // is non-empty (`IN ()` is 42601).
   | { kind: "in"; lhs: Expr; list: Expr[]; negated: boolean }
+  // `lhs BETWEEN lo AND hi` / `lhs NOT BETWEEN lo AND hi` — a range test
+  // (spec/design/grammar.md §21). Desugared at resolve into `lhs >= lo AND lhs <= hi` (NOT
+  // BETWEEN negates), inheriting the three-valued NULL semantics from the comparisons and the
+  // Kleene AND. The bounds parse at the additive level so the structural `AND` is not the
+  // logical connective.
+  | { kind: "between"; lhs: Expr; lo: Expr; hi: Expr; negated: boolean }
   // An aggregate function call — the engine's first function-call syntax (grammar.md §17).
   // `name` is the spelling as written (resolved case-insensitively against the aggregate
   // catalog; an unknown name is 42883). `star` is the COUNT(*) row-count form (then `arg` is

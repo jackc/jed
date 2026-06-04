@@ -211,6 +211,9 @@ const (
 	// ExprIn is `lhs IN (list)` / `lhs NOT IN (list)` — membership over a non-empty
 	// value list, desugared at resolve to the OR-chain (spec/design/grammar.md §20).
 	ExprIn
+	// ExprBetween is `lhs BETWEEN lo AND hi` / `lhs NOT BETWEEN lo AND hi` — a range test
+	// desugared at resolve to `lhs >= lo AND lhs <= hi` (spec/design/grammar.md §21).
+	ExprBetween
 )
 
 // UnaryOp is a unary operator.
@@ -268,6 +271,7 @@ type Expr struct {
 	IsDistinct *IsDistinctExpr // ExprIsDistinct
 	FuncCall   *FuncCallExpr   // ExprFuncCall
 	In         *InExpr         // ExprIn
+	Between    *BetweenExpr    // ExprBetween
 }
 
 // CastExpr is CAST(Inner AS TypeName). TypeMod is the optional numeric(p[,s]) modifier.
@@ -326,6 +330,18 @@ type FuncCallExpr struct {
 type InExpr struct {
 	Lhs     Expr
 	List    []Expr
+	Negated bool
+}
+
+// BetweenExpr is `Lhs BETWEEN Lo AND Hi` / `Lhs NOT BETWEEN Lo AND Hi` — a range test
+// (spec/design/grammar.md §21). Desugared at resolve into `Lhs >= Lo AND Lhs <= Hi` (NOT
+// BETWEEN negates), inheriting the three-valued NULL semantics from the comparisons and the
+// Kleene AND. The bounds parse at the additive level so the structural `AND` is not the
+// logical connective.
+type BetweenExpr struct {
+	Lhs     Expr
+	Lo      Expr
+	Hi      Expr
 	Negated bool
 }
 

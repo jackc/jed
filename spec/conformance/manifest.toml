@@ -231,6 +231,10 @@ id = "expr.in_list"
 description = "x IN (list) / NOT IN — membership over a non-empty value list, desugared to the OR-chain (x = a OR x = b …); three-valued NULL (1 IN (2,NULL) is NULL); per-element typing (too-wide literal 22003, cross-family 42804); empty IN () is 42601 (spec/design/grammar.md §20)"
 
 [[capability]]
+id = "expr.between"
+description = "x BETWEEN lo AND hi / NOT BETWEEN — range test desugared to (x >= lo AND x <= hi); Kleene AND gives 5 BETWEEN 10 AND NULL = FALSE but 5 BETWEEN 1 AND NULL = NULL; bounds parse at the additive level so the structural AND is not the connective (spec/design/grammar.md §21)"
+
+[[capability]]
 id = "error.division_by_zero"
 description = "Integer division / modulo by zero is defined and traps SQLSTATE 22012"
 
@@ -366,4 +370,5 @@ title = "decimal + the predicate forms IN / BETWEEN / LIKE / CASE (Phase 2, spec
 includes = "decimal"
 capabilities = [
   "expr.in_list",
+  "expr.between",
 ]

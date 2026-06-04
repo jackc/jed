@@ -241,6 +241,16 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+    /// `lhs BETWEEN lo AND hi` / `lhs NOT BETWEEN lo AND hi` — range test (grammar.md §21).
+    /// Desugared at resolve into `lhs >= lo AND lhs <= hi` (NOT BETWEEN negates), inheriting the
+    /// three-valued NULL semantics from the comparisons and Kleene AND. The bounds are parsed at
+    /// the additive level so the structural `AND` is not the logical connective.
+    Between {
+        lhs: Box<Expr>,
+        lo: Box<Expr>,
+        hi: Box<Expr>,
+        negated: bool,
+    },
     /// An aggregate function call — the engine's first function-call syntax (grammar.md §17).
     /// `name` is the spelling as written (resolved case-insensitively against the aggregate
     /// catalog; an unknown name is 42883). `star` is the `COUNT(*)` row-count form (then `arg`

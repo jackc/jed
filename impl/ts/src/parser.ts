@@ -671,11 +671,13 @@ class Parser {
       this.expectKeyword("null");
       return { kind: "isNull", operand: lhs, negated };
     }
-    // `NOT`? `IN` (...) — a `NOT` here is consumed only when followed by the `IN` keyword
-    // (two-token lookahead; the prefix `NOT` was already taken by parseNot). A non-associative
-    // postfix predicate at the comparison level (spec/design/grammar.md §20).
-    const inNegated = this.peekKeyword() === "not" && this.peekKeywordAt(1) === "in";
-    if (inNegated) {
+    // `NOT`? (`IN` (...) | `BETWEEN` lo `AND` hi) — a `NOT` here is consumed only when followed
+    // by one of these postfix-predicate keywords (two-token lookahead; the prefix `NOT` was
+    // already taken by parseNot). Non-associative, at the comparison level (grammar.md §20-§21).
+    const predNegated =
+      this.peekKeyword() === "not" &&
+      (this.peekKeywordAt(1) === "in" || this.peekKeywordAt(1) === "between");
+    if (predNegated) {
       this.advance(); // NOT
     }
     if (this.peekKeyword() === "in") {
@@ -688,7 +690,17 @@ class Parser {
         list.push(this.parseAdditive());
       }
       this.expect("rparen");
-      return { kind: "in", lhs, list, negated: inNegated };
+      return { kind: "in", lhs, list, negated: predNegated };
+    }
+    if (this.peekKeyword() === "between") {
+      this.advance();
+      // Both bounds parse at the ADDITIVE level, which never consumes `AND` (a looser level
+      // owned by parseAnd). So the BETWEEN's structural `AND` is matched here and
+      // `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c` (grammar.md §21).
+      const lo = this.parseAdditive();
+      this.expectKeyword("and");
+      const hi = this.parseAdditive();
+      return { kind: "between", lhs, lo, hi, negated: predNegated };
     }
     let op: BinaryOp;
     switch (this.peek().kind) {

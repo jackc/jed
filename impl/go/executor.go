@@ -1256,6 +1256,8 @@ func exprHasFuncCall(e Expr) bool {
 			}
 		}
 		return false
+	case ExprBetween:
+		return exprHasFuncCall(e.Between.Lhs) || exprHasFuncCall(e.Between.Lo) || exprHasFuncCall(e.Between.Hi)
 	default:
 		return false
 	}
@@ -1706,6 +1708,19 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 			}
 		}
 		if e.In.Negated {
+			folded = Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: folded}}
+		}
+		return resolve(s, folded, ctx, ag)
+	case ExprBetween:
+		// Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
+		// result for a NULL bound: `5 BETWEEN 10 AND NULL` is `FALSE AND NULL` = FALSE (a FALSE
+		// operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND NULL` = NULL. NOT BETWEEN
+		// negates the whole conjunction. The LHS is evaluated twice (the desugar model — a
+		// documented cost consequence, cost.md §3).
+		ge := binaryExpr(OpGe, e.Between.Lhs, e.Between.Lo)
+		le := binaryExpr(OpLe, e.Between.Lhs, e.Between.Hi)
+		folded := binaryExpr(OpAnd, ge, le)
+		if e.Between.Negated {
 			folded = Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: folded}}
 		}
 		return resolve(s, folded, ctx, ag)

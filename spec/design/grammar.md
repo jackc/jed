@@ -709,3 +709,33 @@ FROM`. `NOT IN` is the negation. The whole form is the first of the Phase-2 pred
   of the desugar model); for a bare-column `x` that is a free leaf, so the cost is just the
   comparison/connective nodes. Output column name for a bare `SELECT x IN (…)` is the fixed
   `?column?` (§8), like any non-column expression.
+
+## 21. `BETWEEN` / `NOT BETWEEN`
+
+`x BETWEEN lo AND hi` is the **range predicate**: TRUE iff `lo <= x <= hi`. It extends
+`comparison` with `"NOT"? "BETWEEN" additive "AND" additive`, the same non-associative
+comparison-level (precedence 35) postfix slot as `IN` (§20). `NOT BETWEEN` is the negation.
+
+- **Semantics = the AND form.** `x BETWEEN lo AND hi` is exactly `x >= lo AND x <= hi`, and
+  `x NOT BETWEEN lo AND hi` is its negation `NOT (x >= lo AND x <= hi)` (= `x < lo OR x > hi`
+  under Kleene). The engine **desugars** to that tree at resolve (`Expr::Between` →
+  `Binary{And, Binary{Ge}, Binary{Le}}`, wrapped in `Unary{Not}` when negated), inheriting
+  every property from `>=`/`<=`/`AND`/`NOT`.
+- **Three-valued NULL via the Kleene AND** — and this is the subtle case. The connective is the
+  three-valued AND, where a FALSE operand **dominates** (it is not plain propagation). So
+  `5 BETWEEN 10 AND NULL` is `(5 >= 10) AND (5 <= NULL)` = `FALSE AND UNKNOWN` = **FALSE**,
+  whereas `5 BETWEEN 1 AND NULL` is `TRUE AND UNKNOWN` = **NULL**. A NULL `x` makes both
+  comparisons UNKNOWN, so the whole thing is NULL. This matches PostgreSQL exactly (verified
+  against the live oracle) and is why BETWEEN cannot be a naive null-propagating macro.
+- **The `BETWEEN`/`AND` ambiguity** is resolved by parsing **both bounds at the `additive`
+  level**. `additive` never consumes the `AND` keyword (a looser precedence level owned by the
+  `AND` connective), so the `AND` separating the two bounds is matched structurally by BETWEEN,
+  and a trailing logical `AND` binds outside: `x BETWEEN a AND b AND c` parses as
+  `(x BETWEEN a AND b) AND c`. The bounds are therefore not full expressions — they stop at the
+  comparison level — exactly PostgreSQL's `b_expr` restriction.
+- **Typing** reuses the `>=`/`<=` operand contract per bound: an integer-literal bound adapts to
+  `x`'s type (a too-wide one traps **22003**), a cross-family bound is **42804**, decimal/int
+  mixes promote, text compares by the `C` collation.
+- **Cost** ([cost.md](cost.md) §3): the desugared `And(Ge, Le)` is three interior nodes (1
+  `and` + 2 `compare`); **the LHS is evaluated twice** (once per bound — the desugar
+  consequence). Output name for a bare `SELECT x BETWEEN …` is `?column?` (§8).

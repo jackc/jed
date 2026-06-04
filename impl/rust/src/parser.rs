@@ -720,12 +720,12 @@ impl Parser {
                 negated,
             });
         }
-        // `NOT`? `IN` (...) — a `NOT` here is consumed only when followed by the `IN`
-        // keyword (two-token lookahead; the prefix `NOT` was already taken by parse_not).
-        // These postfix predicates bind at the comparison level (35), non-associative
-        // (grammar.md §20).
+        // `NOT`? (`IN` (...) | `BETWEEN` lo `AND` hi) — a `NOT` here is consumed only when
+        // followed by one of these postfix-predicate keywords (two-token lookahead; the prefix
+        // `NOT` was already taken by parse_not). They bind at the comparison level (35),
+        // non-associative (grammar.md §20-§21).
         let negated = self.peek_keyword().as_deref() == Some("not")
-            && self.peek_keyword_at(1).as_deref() == Some("in");
+            && matches!(self.peek_keyword_at(1).as_deref(), Some("in") | Some("between"));
         if negated {
             self.advance(); // NOT
         }
@@ -742,6 +742,21 @@ impl Parser {
             return Ok(Expr::In {
                 lhs: Box::new(lhs),
                 list,
+                negated,
+            });
+        }
+        if self.peek_keyword().as_deref() == Some("between") {
+            self.advance();
+            // Both bounds parse at the ADDITIVE level, which never consumes `AND` (a looser
+            // level owned by parse_and). So the BETWEEN's structural `AND` is matched here and
+            // `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c` (grammar.md §21).
+            let lo = self.parse_additive()?;
+            self.expect_keyword("and")?;
+            let hi = self.parse_additive()?;
+            return Ok(Expr::Between {
+                lhs: Box::new(lhs),
+                lo: Box::new(lo),
+                hi: Box::new(hi),
                 negated,
             });
         }

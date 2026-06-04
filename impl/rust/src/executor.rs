@@ -1312,6 +1312,9 @@ fn expr_has_funccall(e: &Expr) -> bool {
         Expr::In { lhs, list, .. } => {
             expr_has_funccall(lhs) || list.iter().any(expr_has_funccall)
         }
+        Expr::Between { lhs, lo, hi, .. } => {
+            expr_has_funccall(lhs) || expr_has_funccall(lo) || expr_has_funccall(hi)
+        }
     }
 }
 
@@ -1769,6 +1772,28 @@ fn resolve(
                 });
             }
             let mut desugared = folded.expect("IN list is non-empty (parser guarantees ≥1)");
+            if *negated {
+                desugared = Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(desugared),
+                };
+            }
+            resolve(scope, &desugared, ctx, agg)
+        }
+        Expr::Between {
+            lhs,
+            lo,
+            hi,
+            negated,
+        } => {
+            // Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
+            // result for a NULL bound: `5 BETWEEN 10 AND NULL` is `FALSE AND NULL` = FALSE (a
+            // FALSE operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND NULL` = NULL.
+            // `NOT BETWEEN` negates the whole conjunction. The LHS is evaluated twice (the
+            // desugar model — a documented cost consequence, cost.md §3).
+            let ge = binary_expr(BinaryOp::Ge, (**lhs).clone(), (**lo).clone());
+            let le = binary_expr(BinaryOp::Le, (**lhs).clone(), (**hi).clone());
+            let mut desugared = binary_expr(BinaryOp::And, ge, le);
             if *negated {
                 desugared = Expr::Unary {
                     op: UnaryOp::Not,

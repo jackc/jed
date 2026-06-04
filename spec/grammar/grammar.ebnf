@@ -260,17 +260,22 @@ not_expr       ::= "NOT" not_expr
  * operands are additive, so "a IS DISTINCT FROM b + 1" parses as
  * "a IS DISTINCT FROM (b + 1)". The leading "IS" is shared: after "IS" "NOT"? the
  * parser dispatches on "NULL" vs "DISTINCT".
- *   "NOT"? "IN" "(" ... ")" is the membership predicate (../design/grammar.md §20),
- * also at the comparison level. A "NOT" before "IN" is the predicate negation (NOT IN);
- * the parsers take it with a two-token lookahead (the prefix "NOT" was already consumed
- * by not_expr) and only when "IN" follows. The list is one or more additive expressions;
- * an empty "IN ()" is a 42601 syntax error. PostgreSQL binds IN slightly tighter than the
- * comparison operators; collapsing it into this one non-associative level is a documented
- * narrowing (unobservable, since chaining comparisons is already a syntax error here). */
+ *   "NOT"? "IN" "(" ... ")" is the membership predicate (../design/grammar.md §20) and
+ * "NOT"? "BETWEEN" lo "AND" hi is the range predicate (§21), both at the comparison level.
+ * A "NOT" before "IN"/"BETWEEN" is the predicate negation; the parsers take it with a
+ * two-token lookahead (the prefix "NOT" was already consumed by not_expr) and only when the
+ * predicate keyword follows. The IN list is one or more additive expressions; an empty
+ * "IN ()" is a 42601 syntax error. BETWEEN's two bounds are additive expressions: parsing
+ * them at the additive level (which never consumes "AND", a looser level) is what lets the
+ * structural "AND" be matched here, so "x BETWEEN a AND b AND c" is "(x BETWEEN a AND b)
+ * AND c". PostgreSQL binds IN/BETWEEN slightly tighter than the comparison operators;
+ * collapsing them into this one non-associative level is a documented narrowing
+ * (unobservable, since chaining comparisons is already a syntax error here). */
 comparison     ::= additive ( compare_op additive
                             | "IS" "NOT"? "NULL"
                             | "IS" "NOT"? "DISTINCT" "FROM" additive
-                            | "NOT"? "IN" "(" additive ("," additive)* ")" )?
+                            | "NOT"? "IN" "(" additive ("," additive)* ")"
+                            | "NOT"? "BETWEEN" additive "AND" additive )?
 
 compare_op     ::= "=" | "<" | ">" | "<=" | ">="   /* no "<>" and no "!=" */
 

@@ -94,6 +94,7 @@ var SupportedCapabilities = []string{
 	"error.division_by_zero",
 	// Predicate forms (Phase 2, spec/design/grammar.md §20-§23).
 	"expr.in_list",
+	"expr.between",
 	// Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
 	// accrued cost via the `# cost:` directive (CLAUDE.md §13).
 	"resource.cost_metering",
