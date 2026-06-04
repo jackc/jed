@@ -1,13 +1,21 @@
 # Cores vs. wrappers — design
 
-> When does a new implementation earn its place, and which languages are worth the cost?
-> CLAUDE.md §2 commits to **multiple native cores, no reference implementation**, with a
-> priority list (Rust → Go → JS/TS → Java/C# → Swift) and a noted exception for wrapping
-> Rust. This doc makes the *selection rule* behind that list explicit: a new
-> implementation is judged by **how much new divergence it can surface**, not by how
-> popular its language is or how likely it is to ship. It exists to stop a plausible-but-
-> wrong instinct ("more implementations = more coverage, so add Ruby/JS early") before it
-> costs N-times implementation effort for ~zero contract value.
+> When does a new implementation earn its place, and should it be a native core or a wrap
+> of the Rust core? There are **two independent goals**, and conflating them is the trap
+> this doc exists to prevent:
+>
+> 1. **Harden the spec** (CLAUDE.md §2) — served by a *small differential core set* of
+>    maximally-different reimplementations, judged by **how much new divergence they
+>    surface**. Rust + Go + the native TS core already do this; it is essentially done.
+> 2. **Reach a language** — give that language's users the **best experience**, judged by
+>    performance and integration cleanliness, *not* by divergence. Native and wrapped are
+>    **both first-class** here; wrapping is frequently the *best* answer, not a fallback.
+>
+> §1 below is the rule for goal 1 — it stops "more implementations = more coverage, so add
+> Ruby/JS early" before it costs N-times effort for ~zero contract value. §2 adds goal 2 and
+> the native-vs-wrap rule that follows from it. The old instinct this doc fought (don't add
+> cores for ~zero *contract* value) was right about goal 1 and silent about goal 2 — which
+> is the gap this revision closes.
 
 The honesty mechanism (CLAUDE.md §2) is **divergence under a shared contract**: two
 maximally-different implementations evolving together turn every spec ambiguity into a
@@ -30,23 +38,162 @@ is an acceptable *deliberate exception*, not a continuation of the rule"). This 
 generalizes it: the rule is not "Swift is special," it is "wrappers don't harden the
 contract — only independent reimplementations do."
 
-## 2. Two buckets: conformance participants vs. distribution artifacts
+## 2. Two goals, two buckets — and why a wrapper is first-class for the second
 
-Keep these separate; they answer different questions and are funded by different budgets.
+Keep the goals separate; they answer different questions and are funded by different
+budgets. A given artifact serves one or the other.
 
-| Artifact | Purpose | New divergence | Counts as a "core"? |
+| Artifact | Goal it serves | New divergence | Conformance voice? |
 |---|---|---|---|
 | Rust core, Go core | Harden the spec (§2) | High — the point | Yes |
-| A *native* TS / Java / C# core | Harden the spec | Medium — **if** new axis (§3) | Yes |
-| Ruby gem → Rust | Ship to Ruby | None | No — distribution |
-| JS package → Rust-WASM | Ship to browser/Node | None | No — distribution |
+| Native TS core | Harden the spec | Medium — the new axes (§3) | Yes |
+| A native Java / C# / Swift core | **Reach that language** well | Low (the axes are taken) | Yes — it still conforms |
+| Rust core wrapped for Swift/Ruby/… | **Reach that language** well | None — it *is* Rust | No — echoes Rust |
 
-A distribution artifact is still worth building — *when you want the ecosystem*. It is
-tested as a binding/packaging layer, and it **never** participates in the conformance
-corpus as an independent voice (it would only ever echo the core it wraps). Do not write a
-native engine in a language *for the spec* unless that language clears the §3 bar.
+The first two rows are the **differential core set** (goal 1); their worth is the divergence
+they surface, and §3–§5 are about choosing and timing them. Everything below the line serves
+**goal 2 — best experience for that language** — and is judged on entirely different terms.
+
+**For goal 2, native and wrapped are both first-class.** The old framing ("distribution
+artifact," a grudging fallback) undersold it: wrapping the Rust core is frequently the
+*best* answer for a language, not a consolation prize. The decision is a real per-language
+engineering judgment between two poles:
+
+- **Wrap the Rust core** when **performance** and **byte-exact-behavior-for-free** dominate.
+  The engine runs at Rust speed and conforms by construction; you build a binding +
+  packaging layer, not an engine. Wrap the **safe Rust** core (memory safety, CLAUDE.md §13).
+- **Write a native core** when **cleaner, simpler integration** dominates: no FFI boundary,
+  idiomatic in-process host-defined functions, a pure single-language package, and none of
+  the per-platform native-artifact build/sign/ship burden.
+
+Two invariants hold regardless of which pole you pick:
+
+1. **Conformance still binds.** A native core must pass the corpus and the byte-exact
+   on-disk round-trip (CLAUDE.md §7/§8); a wrapped core inherits both from Rust. The choice
+   is *which approach*, never *whether to conform*. With persistence the dominant mode (§9),
+   this also covers **durable commit + crash recovery** — hard to get right, owned by each
+   native core but inherited free by a wrap.
+2. **A wrapper is never a conformance voice.** It can only ever echo the core it wraps (§1),
+   so it does not vote in the corpus — but that is a fact about goal 1, not a demerit for
+   goal 2.
+
+Which pole wins is decided mainly by **two factors that can pull in opposite directions** —
+how host functions are called (§2.1) and how the workload parallelizes (§2.2). Weigh both
+per use case; a host-function-heavy workload pushes toward native while a
+parallelism-heavy one pushes toward wrap, and many workloads want both.
+
+### 2.1 Deciding factor — host-defined functions
+
+Across Swift, .NET, and the JVM the native-vs-wrap call turns in part on how the host
+registers its own SQL functions:
+
+- **Native core** → a host function is an ordinary in-process closure/delegate/lambda:
+  inlinable, no marshaling, no boundary, clean memory safety. If host functions are
+  **hot-path per-row**, native wins decisively.
+- **Wrapped core** → every host-function call is an **upcall** back across the FFI boundary
+  (engine → host), marshaling each argument and return value. For managed runtimes (JVM,
+  .NET) this is worse than for Swift: the upcall also pays **thread-attachment** and
+  **GC-safepoint** costs. If host functions are **occasional/coarse**, the engine-at-Rust-
+  speed wrap wins and the upcall tax never matters.
+
+The mitigation that keeps a wrap viable: **design the host-function API vectorized /
+batched** (a column of values per crossing, not one row at a time), so the boundary is
+amortized. Decide this early — it is what determines whether wrapping is on the table at all.
+
+### 2.2 Deciding factor — parallelism (where the threads live)
+
+jed's §3 model does most of the work here, and it changes the question. A writer stages
+privately and commits by an atomic root swap, so the committed state readers see is
+**immutable while they run**. The read path is therefore **nearly lock-free by
+construction** — the only synchronization is the commit swap (a single atomic / brief
+writer-exclusive window). So the differentiator is *not* "how good are the language's
+locks"; it is two other things:
+
+- **How cheaply can the language share immutable state across threads?** Rust shares an
+  `Arc` snapshot for one atomic bump per *query* (traversal then borrows — no per-node
+  refcount); a GC runtime (Go, C#, Java) shares plain references for free. **Swift's ARC is
+  the outlier** — every traversal touches an *atomic* refcount on the shared nodes, and
+  atomic refcount traffic on hot shared objects across many cores is exactly the cache-line
+  contention that kills parallel read scaling.
+- **Where do the worker threads live?** This splits the two kinds of parallelism:
+
+**Inter-query** (N read queries at once — the common case, implied by §3). The *host* spawns
+the concurrency; the engine need only be **safe to call concurrently against one immutable
+snapshot**.
+- *Native* uses the host's own primitive directly (goroutines / `Task` / threads / Java
+  virtual threads), sharing the snapshot as ordinary references. Clean; slight edge to native.
+- *Wrapped* works too (immutable snapshot, concurrent downcalls), but pays **marshaling
+  throughput under concurrency** and the burden of *proving* the C API safe for concurrent
+  calls (Rust's `Send`/`Sync` guarantees stop at the FFI boundary). Host-function upcalls
+  compound the per-thread attach/safepoint cost.
+
+**Intra-query** (split one expensive scan/join across cores). Now the *engine* owns the
+threads — and this is where wrapping shines:
+- *Wrapped Rust* gets **Rayon-grade data parallelism for free, in every host, invisibly** —
+  the host calls `Execute` once; Rust fans out internally over Rust-owned memory and returns
+  one result. The host's concurrency model is irrelevant, and the parallel work **never
+  touches the host's GC or ARC**. For **Swift this is decisive**: wrapping *sidesteps Swift's
+  single worst characteristic for this workload* (ARC contention on shared structure).
+- *Native* must reimplement it in-language, and quality varies sharply: **Go** (goroutines),
+  **C#** (TPL / `Parallel` / PLINQ), and **Java** (ForkJoinPool / parallel streams) are all
+  strong with GC-cheap sharing; **Swift** is the weak case (async/actor model is I/O-shaped,
+  `Sendable` makes sharing fussy, ARC contention); the native **TS** core has effectively
+  *none* (single-threaded event loop; `worker_threads` can't cheaply share the snapshot) —
+  fine for its conformance-core role, but the browser/Node target is serial.
+
+The relevant axis for **read parallelism** is **CPU fan-out, not async I/O**: persistence is
+the dominant mode (§9), but the dataset is RAM-sized and warm reads are served from memory, so
+steady-state read work stays CPU/memory-bound. `async`/`await` (Swift, C#, TS) addresses the
+*other* axis — overlapping I/O — which here lives on the **commit/durability** path (fsync per
+write) and **cold load**, both single-writer (§3), not on the parallel read path. So the
+CPU-fan-out analysis above holds for reads. (The exception is the **larger-than-RAM regime**
+— §9's TB-scale non-foreclosure: once reads miss a buffer pool and fetch from disk, read work
+becomes I/O-bound and async prefetch *does* matter. A wrapped Rust core absorbs that paging
+internally — async/io_uring in Rust, invisible to the host — one more hard part inherited by a
+wrap rather than rebuilt per native core.)
+
+**Determinism tax (both kinds).** Parallel execution is just another schedule, and §10/§13
+forbid the schedule from changing anything: identical row order *and* byte-identical cost as
+the serial run. So any intra-query parallelism needs a **deterministic partition + ordered
+merge** and **schedule-invariant cost accrual**. Wrapping solves this **once, in Rust, and
+every host inherits it**; a native core must re-solve it *and* match the other cores' cost
+byte-for-byte (§13 cross-core identity) — a real conformance burden. The differential set
+already hardens it from two directions (Rust threads vs. Go goroutines) before any reach
+language inherits or re-proves it.
+
+### 2.3 Per-language leanings (current judgment)
+
+- **C# / .NET — strongest *native* candidate, and parallelism confirms it.** Specialized
+  generics over value types, `Span<T>`, `ref struct`, SIMD intrinsics, and NativeAOT let a
+  native core run within ~1.5–2× of Rust *and* ship as a clean pure-managed NuGet package (no
+  per-RID native asset, no P/Invoke boundary, in-process host functions). On parallelism it
+  is strong both ways: TPL/`Parallel`/PLINQ for intra-query fan-out, and GC-cheap sharing of
+  the immutable snapshot for inter-query — no marshaling chokepoint under high read
+  concurrency. Native here is plausibly the *best experience*, not merely the honest one.
+- **Swift — leans *wrap*, and parallelism strengthens that.** A wrapped Rust core (UniFFI +
+  XCFramework) presents a clean Swift API, runs at Rust speed, and Apple's
+  static-link/packaging path is well-trodden (the old CLAUDE.md §2 "asterisk"). ARC makes a
+  native Swift core slower on hot paths *and* is its worst liability under parallel reads
+  (atomic-refcount contention on shared structure, §2.2); wrapping sidesteps that entirely by
+  doing the fan-out in Rust. The only thing that flips Swift to native is **hot-path per-row
+  host functions** outweighing the parallelism win.
+- **Java — most conflicted, now tilting a little toward native on parallelism.** Pre-Valhalla,
+  erased generics force boxing or off-heap (Panama `MemorySegment`) to go fast, and JIT warmup
+  hurts short-lived embedded use — so **wrap for performance**. But a native core ships as a
+  clean pure-JAR with in-process host functions and no JNI/upcall tax, *and* the JVM has
+  top-tier concurrency: ForkJoinPool/parallel streams for intra-query, virtual threads (Loom)
+  for cheap massive inter-query concurrency, all with GC-cheap sharing. Valhalla (value
+  classes) tips it further toward native over time.
+
+None of these is final; each is a per-use-case call recorded when the core is actually
+scheduled (TODO.md Phase 9). The two pivots can disagree — e.g. Swift with hot per-row host
+functions *and* heavy intra-query parallelism is genuinely torn — so resolve them against the
+specific workload, not in the abstract.
 
 ## 3. "Which language" = "which new axis of divergence"
+
+*(This section is about **goal 1** — adding a core to harden the spec. For goal 2, best
+experience per language, see §2. The two use different selection rules.)*
 
 The marginal value of core #3 is not "another language" — it is **a data model the
 current cores cannot disagree about because they agree by construction.** The axes that
@@ -125,18 +272,24 @@ from the §1 principle.
 
 ## 6. Current recommendation / status
 
-As of CLAUDE.md §11 step 5b (integers only, `CREATE`/`INSERT`/`SELECT` alive, file-format
-round-trip done):
+The differential core set is **in place**: Rust + Go + the native TS core run in lockstep,
+byte-exact (`rust == go == ts == ruby`), through the type system as it has grown past
+integers (`text`, `decimal`, `bytea` — the axes §3 predicted would bite). **Goal 1 (harden
+the spec) is essentially satisfied** by these three; a fourth core would mostly re-prove
+what they already prove.
 
-1. **Do not build any wrapper-destined core for the spec.** Ship Ruby/JS as wrappers
-   (gem→Rust, package→Rust-WASM) *when the ecosystem is wanted*; treat them as
-   distribution + binding-seam tests, never as conformance voices.
-2. **Hold at two cores (Rust + Go) through the integer-only slices.** They are saturating
-   the divergence available there.
-3. **When `text` and `decimal` land, add a *native* TS core** as core #3 — highest new-axis
-   yield (UTF-16 + f64/BigInt) plus tooling for the one distinct runtime (browser).
-4. **Decide §5 explicitly** at that point: native-TS-for-conformance *and* WASM-for-shipping,
-   versus WASM-only with the browser untested for divergence.
+The live question is now **goal 2 — language reach**, governed by §2, not §1:
+
+1. **Do not add another core *for the spec*.** A fourth differential core has low marginal
+   divergence yield (§3's axes are taken). New languages are now justified by **best
+   experience for their users**, not by spec-hardening.
+2. **Java / C# / Swift are reach decisions** (TODO.md Phase 9): native or wrapped per the §2
+   rule, with **two pivots** — host-function hotness (§2.1) and parallelism (§2.2). Current
+   leanings in §2.3 — C# native, Swift wrap, Java conflicted (tilting native on parallelism).
+3. **Ship Ruby / browser-JS as wrappers** (gem → Rust, package → Rust-WASM) when the
+   ecosystem is wanted; the native TS core already covers the JS *conformance* voice (§5).
+4. **Browser build** remains the §5 split: native-TS-for-conformance *and*
+   Rust-WASM-for-shipping.
 
 This doc records the *rule*; CLAUDE.md §2 remains the canonical priority list. If the rule
 here and §2 ever conflict, fix both in the same change (per the CLAUDE.md preamble).

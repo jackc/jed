@@ -5,9 +5,11 @@ load-bearing conformance test: a database file written by the Rust core must be
 byte-readable by the Go core and vice versa (CLAUDE.md §8). That one round-trip catches an
 entire class of cross-implementation divergence automatically.
 
-Storage design targets **in-RAM datasets with SSD-backed persistence** (CLAUDE.md §9):
-the in-memory representation is first-class, and on-disk layout/block size are chosen for
-SSD characteristics. Writes batch in a private staging area and land at commit (CLAUDE.md
+Storage design targets **durable on-disk databases whose dataset is RAM-sized** (CLAUDE.md
+§9): persistent disk storage is the dominant mode (durability is core; a pure in-memory
+database is a minority mode), while the dataset is typically fully resident — so the
+in-memory representation is first-class and on-disk layout/block size are chosen for SSD
+characteristics. Writes batch in a private staging area and land durably at commit (CLAUDE.md
 §3).
 
 The **storage architecture** — the block-device seam, the page model, and the

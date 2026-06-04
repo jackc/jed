@@ -225,7 +225,10 @@ Not built in this slice; recorded here so the seam shape can be confirmed agains
 - **A real `page_read` unit.** Storage is whole-image / row-granular today
   ([storage.md](storage.md) §6); `storage_row_read` is the structural storage unit. When a
   paged store lands, **add** a `page_read` unit to the schedule — do not rename
-  `storage_row_read` (a row read and a page read are distinct events).
+  `storage_row_read` (a row read and a page read are distinct events). Count it as a
+  **logical** page access (pages the query touches), **not** a physical disk fetch — so a
+  buffer pool / cache for larger-than-RAM files (CLAUDE.md §9) cannot perturb the
+  deterministic, cache-independent cost (§13).
 - **Per-operator `cost` weights.** A uniform `operator_eval` weight now; the per-operator
   `cost` field in [../functions/catalog.toml](../functions/catalog.toml) stays reserved
   ([functions.md](functions.md) §8). Authoring it later (evaluator preferring the

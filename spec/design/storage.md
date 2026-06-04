@@ -14,10 +14,29 @@ everywhere" real rather than retrofitted (CLAUDE.md §9).
 
 ## 1. Design targets (CLAUDE.md §9)
 
-- **In-RAM dataset is the common case.** The whole dataset resident in memory is expected,
-  so the in-memory representation is a **first-class concern**, not a cache over disk. The
-  core operates on in-memory structures; persistence is how those structures are made
-  durable, not how they are accessed.
+- **Durable on-disk storage is the dominant mode; the dataset is RAM-sized.** Two facts at
+  once (CLAUDE.md §9). Persistent disk databases are the overwhelming-majority case — *not*
+  ephemeral in-memory ones — so **durability is core** (crash recovery, ordered writes, fsync
+  at commit); a pure in-memory database is a real but minority mode. And the dataset is
+  typically small enough to be **fully resident**, so the in-memory representation is still a
+  **first-class concern** (a fully-resident working set, not a partial cache) and warm reads
+  are served from memory. The core operates on in-memory structures; persistence is how those
+  structures are made durable, and for the dominant use case it is **always present**, not
+  optional.
+- **Must not preclude larger-than-RAM (TB-scale) datasets.** RAM-sized is the dominant case,
+  not a hard limit (CLAUDE.md §9): the engine must eventually serve a **TB-scale file far
+  larger than RAM without falling over**, and nothing here may foreclose it. The
+  non-foreclosure hooks are the page-structured format (§5), the page/block storage seam
+  (§2), order-preserving keys (encoding.md), and *logical* per-page cost metering (cost.md).
+  The deferred path (all Phase 6, none foreclosed): demand paging / a bounded **buffer pool**
+  (resident set = a cache of pages with eviction), incremental COW commit (dirty pages only;
+  large write sets stage to disk pages, not all RAM — §4), B-tree interior pages (replace the
+  flat record chain — §6), and streaming + **spill-to-disk** blocking operators (sort / hash
+  join / aggregate / DISTINCT under a memory budget). **Binding rule for present work:** no
+  code above the storage seam may assume full residency — no "load = whole file into one
+  buffer," no operator that requires its whole input/output in RAM. The whole-image
+  load/commit and flat record chain (§6) are deliberately-narrowed current forms, not the
+  permanent shape.
 - **SSD-backed persistence.** Persistence targets SSDs: page-aligned I/O,
   write-amplification awareness, no HDD seek-minimization heuristics.
 - **Single file per database.** One database = one file (plus possibly a transient

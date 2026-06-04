@@ -75,8 +75,14 @@ Rust and Go are about as far apart as two systems languages get, so this pairing
 the bulk of the honesty work. Build these two in genuine lockstep from the first
 vertical slice.
 
-Later consumers of an already-hardened spec (reveal far fewer new ambiguities; mostly
-prove portability and expand coverage):
+**Two distinct goals, kept separate.** The honesty mechanism above justifies a *small
+differential core set* — the maximally-different reimplementations whose disagreement
+hardens the spec. That job is essentially done: Rust + Go do the bulk, and the native TS
+core (#3 below) closed the two axes they agreed on by construction (`f64`+`BigInt` integers,
+UTF-16 strings). Supporting **any further language is a different goal: give that language's
+users the best experience.** The two goals are independent, and the second is *not* argued
+on the first's terms — "it surfaces little new divergence" is not a mark against a reach
+language, because hardening the spec was never the reason to add it.
 
 3. **JS / TypeScript** — ✅ **landed as a native core** (`impl/ts`), at full parity with
    Rust and Go (all 17 capabilities, all 7 conformance suites, and the byte-exact on-disk
@@ -85,13 +91,44 @@ prove portability and expand coverage):
    via uniform `bigint` (JS numbers are f64), names are UTF-8 (JS strings are UTF-16), and
    bytes are big-endian via `DataView`. Runs on modern Node by **native type-stripping**
    (no build step), TS limited to the erasable subset. Browser/OPFS storage host (CLAUDE.md
-   §9) is still later; the engine is kept host-agnostic so it slots in.
-4. **Java**, **C#** — native.
-5. **Swift** — the one asterisk. If Swift's Rust-interop story makes a native port
-   impractical, wrapping the Rust core is an acceptable *deliberate exception* to the
-   native-implementation rule, not a continuation of it.
+   §9) is still later; the engine is kept host-agnostic so it slots in. Rust, Go, and this
+   TS core **are** the differential set; the honesty work is theirs.
 
-With Java/C#/Swift covered, essentially every modern environment has a native engine.
+**Beyond the differential set — best experience per language.** For every language past
+core #3 the question is not "how much new divergence does it surface" (usually little) but
+**"what gives this language's users the best experience?"** — a real per-language
+engineering judgment between two first-class options:
+
+- **Wrap the Rust core** when *performance* and *byte-exact-behavior-for-free* dominate: the
+  engine runs at Rust speed and conforms by construction. Wrapping is a **first-class
+  choice, not a fallback exception.** When wrapping, wrap the **safe Rust** core (§13).
+- **Write a native core** when *cleaner, simpler integration* dominates: no FFI boundary,
+  idiomatic in-process host-defined functions, a pure single-language package, and none of
+  the per-platform native-artifact build/sign/ship burden.
+
+Either way the **conformance contract still binds** (§7/§8): a native core must pass the
+corpus and the byte-exact on-disk round-trip; a wrapped core inherits both from Rust. The
+choice governs *which approach*, never *whether to conform* — though a wrapped core is a
+distribution artifact, never an independent conformance voice (it can only echo Rust).
+Decide per language, on the merits, and record the call in `spec/design/cores.md`.
+
+4. **Java**, **C#**, **Swift** (and later reach languages) — **native or wrapped, chosen
+   per language on best-experience grounds**, not by a blanket rule. Current leanings
+   (`spec/design/cores.md` §2): **C#** is the strongest *native* candidate (value-type
+   generics, `Span<T>`, NativeAOT → near-Rust speed with the cleanest managed packaging);
+   **Swift** leans **wrap** (Apple packaging is well-trodden; native's one real edge is
+   in-process host functions); **Java** is the most conflicted (wrap for performance
+   pre-Valhalla, native for clean pure-JAR packaging). Two pivots decide it, and can pull
+   apart: (a) **host-defined functions** — hot-path per-row favors native (no FFI/upcall per
+   call), occasional/coarse favors wrap (engine at Rust speed); (b) **parallelism** — the §3
+   immutable-snapshot read path is near-lock-free, so the question is cheap cross-thread
+   sharing + CPU fan-out, where **wrapping Rust gives every host Rayon-grade intra-query
+   parallelism for free** (and notably sidesteps Swift's ARC-contention problem), while
+   native is strong for Go/C#/Java (GC-cheap sharing) and weak for Swift. Design the
+   host-function API **vectorized/batched** so a wrap stays viable.
+
+With Java/C#/Swift covered — native or wrapped — essentially every modern environment has a
+first-class jed.
 
 ---
 
@@ -258,13 +295,40 @@ biases below are where an overriding reason *does* steer away from PG.
 ## 9. Storage
 
 - **Single file** per database.
-- **Design target: in-RAM datasets, SSD-backed persistence.** As an embedded database,
-  the *entire dataset resident in memory* is a common — often the expected — case, so the
-  in-memory representation is a **first-class concern**, not merely a cache over disk.
-  Persistence targets **SSDs**, not spinning disks: choose block/page size, on-disk
-  layout, and write patterns for SSD characteristics (page-aligned I/O,
-  write-amplification awareness) rather than HDD seek-minimization. This pairs with the
-  staging-buffer commit model (§3): writes batch in memory and land on the SSD at commit.
+- **Design target: durable on-disk databases whose dataset is RAM-sized.** Two facts hold
+  at once, and neither alone is the picture. (a) **Persistent on-disk storage is the dominant
+  mode** — the overwhelming majority of databases are durable files on disk, *not* ephemeral
+  in-memory ones, so **durability is core** (crash recovery, ordered writes, fsync at commit),
+  not an optional add-on; a pure in-memory database (no backing file) is a real but
+  **minority** mode. (b) The dataset is **typically small enough to be fully resident in
+  RAM** — so the in-memory representation stays a **first-class concern** (a fully-resident
+  working set, not a partial cache of a larger-than-RAM file), and steady-state reads are
+  served from memory. In short: a *durable disk database that happens to fit in memory*, not
+  an in-memory engine with optional persistence. Persistence targets **SSDs**, not spinning
+  disks: choose block/page size, on-disk layout, and write patterns for SSD characteristics
+  (page-aligned I/O, write-amplification awareness) rather than HDD seek-minimization. This
+  pairs with the staging-buffer commit model (§3): writes batch in memory and land **durably**
+  on the SSD at commit.
+- **Must not preclude larger-than-RAM (TB-scale) operation.** RAM-sized is the dominant
+  case, *not* a hard assumption: the engine must eventually handle a **TB-scale file whose
+  data far exceeds available RAM without falling over**, and **nothing in the current design
+  may foreclose that** — a standing non-foreclosure rule, like the encryption/compression
+  doors below. The hooks that keep it open are already load-bearing and must stay so: the
+  **page-structured on-disk format** (fixed pages, header-recorded page size, root pointer),
+  the **storage seam** as a block/page interface, **order-preserving key encoding** (§8), and
+  **per-page cost metering** counted as *logical* page accesses (so a cache/buffer pool stays
+  invisible to the deterministic cost — §13). The concrete path — all **deferred** (Phase 6),
+  none foreclosed — is: **demand paging / a bounded buffer pool** (the resident set becomes a
+  cache of pages with eviction, not the whole file), **incremental copy-on-write commit**
+  (write only dirty pages; a large write set stages to disk pages, not all in RAM), **B-tree
+  interior pages** (replace the flat record chain so lookup and scan are logarithmic and
+  page-local), and **streaming + spill-to-disk operators** (sort / hash join / aggregate /
+  DISTINCT bounded by a memory budget, spilling when exceeded). The binding constraint on
+  present work: **no code above the storage seam may harden a full-residency assumption** — no
+  "load = read the whole file into one buffer," no operator that *requires* its entire input
+  or output to fit in RAM. Today's whole-image load/commit and flat record chain are
+  deliberately-narrowed *current forms* (§11 step 5b), replaceable behind these seams — not
+  the permanent shape.
 - The core defines a **storage seam** (a block/file interface) that each host
   implements: `os.File` in Go, OPFS in the browser, direct file access natively.
   Designing this seam early is what makes "single-file, embeddable, everywhere" work.
@@ -424,7 +488,7 @@ the engine is *reasonably* safe against malicious input without special hardenin
 query cannot trigger a buffer overrun, use-after-free, or out-of-bounds read. Treat memory
 safety as a **standing requirement**, not an accident — any future `unsafe` / cgo / FFI path
 (or a non-memory-safe core) must be justified against this property (and against the
-dependency policy, §14). It is also one more reason the Swift exception (§2) wraps the
+dependency policy, §14). It is also one more reason a **wrapped** core (§2) wraps the
 *safe Rust* core rather than dropping to C.
 
 This covers memory safety **only**. It does not bound resource consumption — that is next.

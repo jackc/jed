@@ -448,6 +448,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > Can lag the feature work until write volume makes whole-image rewrites costly. The
 > forward-compatible hooks (two meta slots, checksum, root pointer, write-ordering) are
 > already in place.
+>
+> **TB-scale non-foreclosure (CLAUDE.md §9):** these items are also the path to a
+> **larger-than-RAM file that does not fall over**. RAM-sized is the dominant case but not a
+> hard limit — present work must not foreclose >>RAM operation (no full-residency assumption
+> above the storage seam; no operator that requires its whole input/output in RAM).
 
 - [ ] **Incremental copy-on-write commit** — replace the whole-image serialize with
       dirty-page-only writes + meta-page root swap (§9, storage.md §4). _(size: XL; deps: staging area)_
@@ -455,6 +460,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       (not version GC; still not MVCC). _(size: L; deps: incremental commit)_
 - [ ] **B-tree interior pages + slotted page layout** — current layout is a flat sorted
       record chain (storage.md §6). Needed for scale. _(size: XL; deps: incremental commit)_
+- [ ] **Buffer pool / demand paging** — make the resident set a **bounded cache of pages**
+      with eviction (not the whole file), so a file far larger than RAM is served by paging in
+      on demand. The `page_read` cost unit must count **logical** page accesses so the cache
+      stays invisible to deterministic cost (§13, cost.md). _(size: XL; deps: B-tree pages +
+      incremental commit; §9/§13)_
+- [ ] **Streaming + spill-to-disk operators** — bound blocking operators (`ORDER BY`, hash
+      `JOIN`, `GROUP BY`/aggregate, `DISTINCT`) by a memory budget and **spill to disk** when
+      exceeded (external merge sort, grace hash join), so a query over larger-than-RAM data
+      never materializes its whole input/output in memory. Pull-based row iteration is the
+      enabler. _(size: XL; deps: paged storage; §9/§13)_
 - [ ] **Compression of large values (LZ4).** Transparently compress large
       `text`/`bytea`/`json` values at the storage layer — likely **LZ4** (fast, streaming,
       cross-language). Pairs with the overflow-page path (a value larger than one page
@@ -500,17 +515,33 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ---
 
-## Phase 9 — Portability: more native cores (§2)
+## Phase 9 — Language reach: more supported languages (§2)
 
-> After the spec has hardened further. These mostly prove portability + expand coverage
-> rather than surfacing new ambiguities (TS already did the heavy lifting).
+> **Goal here is best experience per language, not spec-hardening** — the differential core
+> set (Rust + Go + TS) already does the honesty work (CLAUDE.md §2, spec/design/cores.md).
+> Each language is **native or wrapped** per the best-experience rule (performance vs. clean
+> integration). **Two pivots** decide it (spec/design/cores.md §2.1–§2.2): (1) host-function
+> hotness — hot-path per-row favors native, coarse favors wrap; (2) parallelism — the §3
+> immutable-snapshot read path is near-lock-free, so wrapping Rust hands every host
+> Rayon-grade intra-query parallelism free (and dodges Swift's ARC-contention), while native
+> is strong for C#/Java (GC-cheap sharing) and weak for Swift. Wrapping the safe Rust core is
+> a **first-class** choice here, not an exception. Any native core still passes the full
+> conformance contract (§7/§8); a wrap inherits it from Rust.
 
-- [ ] **Java** core (native). _(size: XL; §2)_
-- [ ] **C#** core (native). _(size: XL; §2)_
-- [ ] **Swift** core — **prefer embedding/wrapping the Rust core** (good Swift↔Rust interop,
-      and Rust is memory-safe so it preserves the untrusted-query safety property, §13). Fall
-      back to a **native** core only if Rust embedding proves insufficient — the one
-      explicitly-allowed deliberate exception to the native rule (§2). _(size: L wrap / XL native; §2)_
+- [ ] **C#** core — **lean native** (value-type generics, `Span<T>`, NativeAOT → near-Rust
+      speed *and* a clean pure-managed NuGet package; in-process host functions). Strongest
+      native candidate. _(size: XL native / L wrap; §2)_
+- [ ] **Swift** core — **lean wrap** (UniFFI + XCFramework over the safe Rust core: Rust
+      speed, well-trodden Apple packaging, untrusted-query safety preserved §13). Go native
+      only if hot-path per-row host functions make the FFI upcall tax dominant.
+      _(size: L wrap / XL native; §2/§13)_
+- [ ] **Java** core — **conflicted**: wrap for performance (pre-Valhalla boxing + JIT warmup
+      hurt a native core), native for clean pure-JAR packaging + in-process host functions
+      (no JNI/upcall tax). Decide at scheduling time; Valhalla shifts it toward native.
+      _(size: XL native / L wrap; §2)_
+- [ ] **Design the host-function API vectorized/batched** up front — the single decision
+      that keeps wrapping viable for any of the above (amortizes the per-row FFI upcall).
+      _(size: M; §2, cross-cutting)_
 
 ---
 
