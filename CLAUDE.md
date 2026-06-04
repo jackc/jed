@@ -275,8 +275,14 @@ biases below are where an overriding reason *does* steer away from PG.
 - **Collation** — start with ONE defined collation (byte/codepoint order is simplest);
   ICU-style collation is an explicit later feature.
 - **Integer overflow** — defined wrap vs. trap.
-- **Iteration-order leaks** — no hashmap iteration order may leak into results. Defined
-  ordering everywhere.
+- **Iteration-order leaks** — no hashmap iteration order may leak into the result *multiset*,
+  values, types, names, errors, or cost. **Row sequence, however, is defined only by `ORDER
+  BY`**: a query with no `ORDER BY` returns the correct *set* of rows in an **unspecified
+  order** (SQL-standard and PostgreSQL behavior — §1; and what lets a query parallelize
+  without a forced final sort). The determinism that matters is preserved — the multiset is
+  exact and byte-identical cross-core, and the conformance harness compares such queries
+  order-insensitively (`rowsort`). *With* `ORDER BY` the order is **fully** deterministic, ties
+  included (broken by primary key).
 
 ### Byte fixtures make the two worst subsystems verifiable, not hoped-for
 
@@ -371,9 +377,12 @@ The design is optimized for AI agents even more than for humans. In practice:
   entries pass." A feature = one SQL construct, parsed + planned + executed + tested, as
   a **vertical slice**. That is the unit of agent work and the unit of cross-language
   porting.
-- **Determinism everywhere** — defined result ordering, deterministic error messages, no
-  wall-clock or iteration-order nondeterminism in tests. The agent loop and cross-impl
-  sync both depend on bit-reproducibility.
+- **Determinism everywhere** — deterministic results (exact multiset, values, types, errors,
+  cost), deterministic error messages, no wall-clock nondeterminism. **Row order is
+  deterministic iff `ORDER BY` is present** (§8): without it the order is unspecified (the
+  harness compares `rowsort`), so a query need not be force-ordered just to be testable — but
+  everything *else* stays bit-reproducible, which is what the agent loop and cross-impl sync
+  depend on.
 - **Structured errors**, not free text — so failures are machine-legible and
   `statement error` matching is stable.
 - **Boring, explicit code over clever abstraction.** In Rust, resist deep generics and

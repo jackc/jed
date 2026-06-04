@@ -1,7 +1,7 @@
 # Self-joins and multi-table chains (spec/design/grammar.md §15). A self-join joins a table to
 # itself under two distinct aliases (each is its own scope relation, with its own column offset).
-# A 3-table chain mixes INNER and CROSS, left-deep. Output is deterministic with NO ORDER BY:
-# the nested loop iterates the running (left) side then the right side, each in primary-key order.
+# A 3-table chain mixes INNER and CROSS, left-deep. With NO ORDER BY the row order is
+# unspecified (CLAUDE.md §8) — multi-row results are compared rowsort; ORDER BY pins a sequence.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, query.join_inner, query.cross_join, query.table_alias, query.qualified_column, types.int32, types.text, resource.cost_metering
 
 statement ok
@@ -30,11 +30,11 @@ vp
 eng2
 vp
 
-# Deterministic order with NO ORDER BY: running (e) in id order, then right (m) in id order.
+# No ORDER BY -> order unspecified, compared rowsort (the exact row set is the contract).
 # e1 (mgr NULL) yields nothing; then e2->m1, e3->m2, e4->m2. 8 + 16 ON + 3 produced = 27.
 # names: id, id
 # cost: 27
-query II nosort
+query II rowsort
 SELECT e.id, m.id FROM emp AS e JOIN emp AS m ON e.mgr = m.id
 ----
 2

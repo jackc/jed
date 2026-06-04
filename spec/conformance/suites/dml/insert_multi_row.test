@@ -99,7 +99,7 @@ CREATE TABLE log (a int32, b int16)
 statement ok
 INSERT INTO log VALUES (30, 3), (10, 1), (20, 2)
 
-query II nosort
+query II rowsort
 SELECT a, b FROM log
 ----
 30
@@ -113,7 +113,7 @@ SELECT a, b FROM log
 statement ok
 INSERT INTO log VALUES (40, NULL), (50, 5)
 
-query II nosort
+query II rowsort
 SELECT a, b FROM log
 ----
 30

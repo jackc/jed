@@ -42,10 +42,12 @@ Conventions, fixed here so every implementation renders identically:
   printed `NULL`, not `false`).
 - **empty result** — the `----` separator followed by no value lines (the record ends at
   the next blank line).
-- **sortmode** — `nosort` (compare in returned order), `rowsort`, or `valuesort`. We
-  **prefer `nosort` with an explicit `ORDER BY`** so the SQL, not the harness, fixes the
-  order (determinism — CLAUDE.md §8/§10). `rowsort` is acceptable when order is genuinely
-  irrelevant.
+- **sortmode** — `nosort` (compare in returned order), `rowsort` (compare as multisets — sort
+  both sides first), or `valuesort`. **Row order is part of the contract only under `ORDER
+  BY`** (CLAUDE.md §8/§10), so: a query **with** an order-determining `ORDER BY` uses `nosort`
+  (the SQL fixes the order); a multi-row query **without** one uses **`rowsort`** (exact rows,
+  order not asserted). Never pin row order with `nosort` on a query that lacks `ORDER BY` —
+  that would test storage/iteration order the engine does not promise.
 - **hashing** — large result sets may be replaced by `<N> values hashing to <md5>` with a
   `hash-threshold <N>` control record. Unused in tiers 1–3 (result sets are tiny); listed
   here so the format is complete.
@@ -145,8 +147,10 @@ Current profiles:
 The agent loop and cross-impl sync both depend on bit-reproducibility (CLAUDE.md §10).
 Every corpus entry MUST obey:
 
-- **Ordered output.** Any query returning more than one row carries an `ORDER BY` (or uses
-  `rowsort`/`valuesort`). No entry may depend on storage or iteration order (CLAUDE.md §8).
+- **Ordered output.** A multi-row query either carries an order-determining `ORDER BY` (and
+  uses `nosort`) **or** uses `rowsort` (exact multiset, order unasserted). No `nosort` entry
+  may depend on storage or iteration order — row order is contractual only under `ORDER BY`
+  (CLAUDE.md §8).
 - **One canonical name, one code.** Types print under their canonical id; each error
   condition has exactly one SQLSTATE.
 - **No nondeterminism.** No wall-clock, no random, no hashmap-order leakage.

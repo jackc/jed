@@ -29,14 +29,14 @@ SELECT flag FROM t WHERE id = 3
 ----
 NULL
 
-# equality on boolean: flag = TRUE / flag = FALSE select the matching rows (scan order)
-query I nosort
+# equality on boolean: flag = TRUE / flag = FALSE select the matching rows (rowsort — no ORDER BY)
+query I rowsort
 SELECT id FROM t WHERE flag = TRUE
 ----
 1
 4
 
-query I nosort
+query I rowsort
 SELECT id FROM t WHERE flag = FALSE
 ----
 2
@@ -44,7 +44,7 @@ SELECT id FROM t WHERE flag = FALSE
 
 # a boolean column is itself a predicate: WHERE flag keeps a row iff it is TRUE (FALSE and
 # NULL/unknown both exclude — Kleene)
-query I nosort
+query I rowsort
 SELECT id FROM t WHERE flag
 ----
 1
@@ -121,7 +121,7 @@ NULL
 # an integer comparison. 5 scanned + 5 filter (one `=` per row) + 2 produced + 0 projection
 # (bare column) = 12.
 # cost: 12
-query I nosort
+query I rowsort
 SELECT id FROM t WHERE flag = TRUE
 ----
 1

@@ -169,11 +169,13 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
 - **`SUM` overflow boundary** — at the **result** type (int64 for the int16/int32 case, the
   decimal cap for the int64/decimal cases); pinned with a value that widens without trapping
   and one that traps.
-- **Group ordering / value-canonical keys** — with no `ORDER BY`, groups emit in
-  first-occurrence order over the deterministic source scan (the `DISTINCT` mechanism),
-  keyed by the **value-canonical** form so `1.5` and `1.50` share one group and `NULL` is
-  its own group ([decimal.md](decimal.md) §5). No hash-map iteration order may leak — every
-  core iterates an explicit insertion-ordered list, never a map.
+- **Group ordering / value-canonical keys** — with no `ORDER BY`, group **emission order is
+  unspecified** (the corpus compares `rowsort` or adds an explicit `ORDER BY`); the grouping
+  itself is deterministic, keyed by the **value-canonical** form so `1.5` and `1.50` share one
+  group and `NULL` is its own group ([decimal.md](decimal.md) §5). No hash-map iteration order
+  may leak into the *grouping* (which rows group together, the per-group aggregates) — every
+  core iterates an explicit insertion-ordered list, never a map — so that result is
+  byte-identical cross-core even though emission order is free.
 
 ## 10. Staging & deferred
 

@@ -99,12 +99,13 @@ SELECT id FROM t WHERE id >= 2 ORDER BY id LIMIT 2
 2
 3
 
-# LIMIT without ORDER BY is deterministic here because the scan is in primary-key order
-# (CLAUDE.md §10); ORDER BY is still the portable way to pin which rows a LIMIT returns.
+# LIMIT without ORDER BY returns an arbitrary subset (CLAUDE.md §8) — to assert WHICH rows,
+# an order-determining ORDER BY is required. ORDER BY id LIMIT 2 -> the two smallest ids. The
+# sort is unmetered (cost.md §3), so cost is unchanged: 5 scanned + 2 produced = 7.
 # names: id
 # cost: 7
 query I nosort
-SELECT id FROM t LIMIT 2
+SELECT id FROM t ORDER BY id LIMIT 2
 ----
 1
 2

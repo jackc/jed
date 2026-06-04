@@ -1,9 +1,9 @@
 # SELECT DISTINCT (spec/design/grammar.md §11): deduplicate the PROJECTED output rows,
 # NULL-safe (two NULLs collapse — the IS NOT DISTINCT FROM rule, not three-valued `=`).
 # DISTINCT runs after ORDER BY and BEFORE LIMIT/OFFSET, so the window slices the distinct
-# rows. Output order is deterministic (CLAUDE.md §8/§10): with no ORDER BY it is
-# first-occurrence over the primary-key scan (the key-order default LIMIT documents, §9);
-# with ORDER BY the keys order the distinct rows and ties keep that first-occurrence order.
+# rows. Output order (CLAUDE.md §8/§10): with no ORDER BY it is UNSPECIFIED (these queries are
+# compared rowsort — the exact distinct set is the contract); with ORDER BY the keys order the
+# distinct rows and a full tie keeps the stable first-occurrence order (retained, §10).
 #
 # Cost asymmetry (cost.md §3): DISTINCT must project EVERY filtered row to compute its dedup
 # key, so projection operator_eval is charged per filtered row (independent of LIMIT and of
@@ -37,13 +37,13 @@ INSERT INTO t VALUES (4, 10, NULL)
 statement ok
 INSERT INTO t VALUES (5, NULL, NULL)
 
-# Basic dedup, no ORDER BY: distinct `a` in FIRST-OCCURRENCE primary-key order (row1 a=10,
-# row3 a=20, row5 a=NULL) — deterministic without ORDER BY, like LIMIT's key-order default.
+# Basic dedup, no ORDER BY: the distinct `a` values are 10, 20, NULL — compared rowsort, so
+# the set is asserted but not the order (no ORDER BY -> order unspecified, CLAUDE.md §8).
 # `a` is a bare column (a leaf) so projection charges no operator_eval: 5 scanned + 3
 # produced = 8.
 # names: a
 # cost: 8
-query I nosort
+query I rowsort
 SELECT DISTINCT a FROM t
 ----
 10
@@ -51,11 +51,11 @@ SELECT DISTINCT a FROM t
 NULL
 
 # NULL == NULL collapse: `b` is 5,5,7,NULL,NULL; the two NULL rows (4 and 5) collapse to a
-# single NULL (NULL-safe equality, not three-valued `=`). First-occurrence order: 5,7,NULL.
+# single NULL (NULL-safe equality, not three-valued `=`). Distinct values 5, 7, NULL (rowsort).
 # 5 scanned + 3 produced = 8.
 # names: b
 # cost: 8
-query I nosort
+query I rowsort
 SELECT DISTINCT b FROM t
 ----
 5
@@ -145,7 +145,7 @@ NULL
 # 5 scanned + 5 projection operator_eval + 3 produced = 13.
 # names: ?column?
 # cost: 13
-query I nosort
+query I rowsort
 SELECT DISTINCT a + 0 FROM t
 ----
 10
@@ -153,11 +153,11 @@ SELECT DISTINCT a + 0 FROM t
 NULL
 
 # DISTINCT + WHERE: the filter runs on every scanned row (5 `>=` evals); WHERE keeps rows
-# 2..5, whose distinct `a` is 10,20,NULL in first-occurrence order. 5 scanned + 5 filter +
+# 2..5, whose distinct `a` is 10, 20, NULL (rowsort — order not asserted). 5 scanned + 5 filter +
 # 3 produced = 13.
 # names: a
 # cost: 13
-query I nosort
+query I rowsort
 SELECT DISTINCT a FROM t WHERE id >= 2
 ----
 10
@@ -179,7 +179,7 @@ SELECT DISTINCT a FROM t ORDER BY a LIMIT 1 OFFSET 1
 # row. 5 scanned + 5 projection operator_eval + 2 produced = 12.
 # names: ?column?
 # cost: 12
-query B nosort
+query B rowsort
 SELECT DISTINCT a = b FROM t
 ----
 false
@@ -220,7 +220,7 @@ INSERT INTO t2 VALUES (2, 12, 3)
 
 # names: x, y
 # cost: 4
-query II nosort
+query II rowsort
 SELECT DISTINCT x, y FROM t2
 ----
 1
@@ -273,7 +273,7 @@ INSERT INTO tk VALUES (3, 200)
 # (two-token lookahead). No dedup — all three rows are returned. 3 scanned + 3 produced = 6.
 # names: distinct
 # cost: 6
-query I nosort
+query I rowsort
 SELECT distinct FROM tk
 ----
 100
@@ -284,7 +284,7 @@ SELECT distinct FROM tk
 # FROM), the second is the column. Now the 100s collapse. 3 scanned + 2 produced = 5.
 # names: distinct
 # cost: 5
-query I nosort
+query I rowsort
 SELECT DISTINCT distinct FROM tk
 ----
 100

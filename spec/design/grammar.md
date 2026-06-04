@@ -225,18 +225,24 @@ lexer's magnitude rules still hold: a magnitude `> 2^63` is a `42601` syntax err
 positive magnitude of `2^63` (over `int64`'s max) traps `22003` (§4). `LIMIT 0` is valid and
 yields the empty result; an `OFFSET` past the end yields the empty result.
 
-Without `ORDER BY` the window is still **deterministic** here — the scan is in primary-key
-order (CLAUDE.md §10) — but `ORDER BY` is the portable way to pin *which* rows a `LIMIT`
-returns, and the corpus uses it for all but the one test that documents the key-order
-default.
+Without `ORDER BY`, **which rows a `LIMIT` returns is unspecified** — `LIMIT` windows an
+unordered result, so it selects an arbitrary subset (SQL-standard and PostgreSQL behavior —
+CLAUDE.md §1/§8). To pin *which* rows (not just how many), add an `ORDER BY` that fully
+determines the order; the corpus does this for every `LIMIT`/`OFFSET` query whose specific
+rows are asserted.
 
 ## 10. `ORDER BY`
 
 `ORDER BY` is **one or more sort keys** (`order_by` / `sort_key` in the grammar), each a
 **bare table column** with an optional direction (`ASC` / `DESC`, default `ASC`) and an
 optional explicit NULL placement (`NULLS FIRST | LAST`). Keys apply **left to right**: the
-first is primary, the next breaks its ties, and a full tie across all keys keeps the
-primary-key scan order via a **stable** sort. Resolution is against the *table's* columns and
+first is primary, the next breaks its ties, and **a full tie across all keys is broken by the
+primary key** — so `ORDER BY` fixes the order *completely*, ties included. (That last tie-break
+is a deliberate, documented determinism choice beyond the SQL standard — CLAUDE.md §8/§10:
+unlike row order *without* `ORDER BY` (now unspecified), order *under* `ORDER BY` is fully
+deterministic. Today it is realized by a **stable** sort over the primary-key scan; under
+future parallel execution it is the same observable result via an implicit primary-key
+tie-break, so it stays parallelism-compatible.) Resolution is against the *table's* columns and
 is independent of the select list — an `AS` alias is invisible here (§8), and a key need not
 appear in the projection.
 
@@ -286,11 +292,11 @@ row, dedups by **first occurrence**, windows the distinct rows, and emits.
 collapse to one. This is the standard SQL `DISTINCT` rule and the same total NULL handling
 the engine already uses for `IS [NOT] DISTINCT FROM`.
 
-**Output order is deterministic** (CLAUDE.md §10). With no `ORDER BY`, the distinct rows come
-out in **first-occurrence order** over the primary-key scan — the same key-order default
-`LIMIT` documents (§9). With `ORDER BY`, the keys order the distinct rows; ties within an
-ordered group keep that first-occurrence order (the stable sort over the source rows). Both
-are a CLAUDE.md §8 cross-core contract and are asserted in the corpus.
+**Output order follows the general rule** (CLAUDE.md §8/§10). With no `ORDER BY`, the distinct
+rows come out in an **unspecified order** (the corpus compares them `rowsort`); the *set* of
+distinct rows is of course exact and identical across cores. With `ORDER BY`, the keys order
+the distinct rows; a tie on all keys keeps the **stable first-occurrence order** over the
+source scan — the same retained determinism `ORDER BY` has generally (§10).
 
 **`ORDER BY` under `DISTINCT` — the PostgreSQL restriction.** Once duplicates collapse, an
 `ORDER BY` key that is *not* in the select list no longer has a single value per output row
@@ -481,8 +487,9 @@ Evaluating each `ON` **at its own join node** (not folding all `ON`s into the tr
 deliberate: for INNER it is observationally identical to a WHERE, but it is the executor shape the
 deferred OUTER joins need (an unmatched row is NULL-extended *at the node*, before any later
 filter — the classic ON-vs-WHERE distinction). WHERE stays the separate trailing filter it
-already is. Output order is deterministic with **no** `ORDER BY` (CLAUDE.md §10): the nested loop
-iterates the left/running side then the right side, each in primary-key order.
+already is. With **no** `ORDER BY` the join's output order is **unspecified** (CLAUDE.md §8/§10
+— the corpus compares such joins `rowsort`); the produced row *set* is exact and identical
+across cores. Add `ORDER BY` to pin a sequence.
 
 **Keywords stay non-reserved (§3).** `JOIN`, `INNER`, `CROSS`, `ON`, `LEFT`, `RIGHT`, `FULL`,
 `OUTER`, and `AS` are **not** reserved — a column or table may be named any of them. The
@@ -630,9 +637,10 @@ grouped primary key) is **deferred** — the rule is a simple set-membership che
 generalizes the no-`GROUP BY` degenerate case (§17: with no keys, only aggregates and
 constants are legal outside an aggregate).
 
-**Output order and NULL/decimal grouping** are determinism surfaces (CLAUDE.md §8/§10):
-with no `ORDER BY`, groups emit in **first-occurrence order** over the primary-key source
-scan (the same default `DISTINCT`/`LIMIT` use, §9/§11). `NULL` forms its **own single
+**Group emission order and NULL/decimal grouping** (CLAUDE.md §8/§10): with no `ORDER BY`,
+groups emit in an **unspecified order** (the corpus compares them `rowsort` or adds an explicit
+`ORDER BY`). The grouping *itself* stays deterministic and semantic, independent of emission
+order: `NULL` forms its **own single
 group** (NULL groups with NULL — the NULL-safe equality `DISTINCT` uses, not three-valued
 `=`), and `decimal` keys bucket by **value-canonical** form (`1.5` and `1.50` share one
 group — [decimal.md](decimal.md) §5); the group's displayed key is the first occurrence's
