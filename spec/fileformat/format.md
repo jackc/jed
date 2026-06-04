@@ -108,9 +108,10 @@ Each **table entry**:
 | &nbsp;&nbsp;`col_name_len` | u16 |
 | &nbsp;&nbsp;`col_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`type_code` | u8 (stable, see below) |
-| &nbsp;&nbsp;`flags` | u8 — bit0 `primary_key`, bit1 `not_null` (reader trusts the bits) |
+| &nbsp;&nbsp;`flags` | u8 — bit0 `primary_key`, bit1 `not_null`, bit2 `has_default` (reader trusts the bits) |
 | &nbsp;&nbsp;`precision` | u16 — **only present when `type_code == 6` (decimal)**; `0` = unconstrained |
 | &nbsp;&nbsp;`scale` | u16 — **only present when `type_code == 6` (decimal)** |
+| &nbsp;&nbsp;`default` | value-codec bytes — **only present when `flags` bit2 (`has_default`)**; written *after* the typmod |
 | `root_data_page` | u32 — first data page of this table's chain, or 0 if it has no rows |
 
 Columns are emitted in declaration order.
@@ -142,6 +143,18 @@ column entries are byte-unchanged (existing int/text fixtures are untouched). `p
 means **unconstrained** `numeric` (no typmod; `scale` is then `0` and ignored); a constrained
 `numeric(p,s)` stores `precision = p` (`1 … 1000`) and `scale = s`. The reader, having read
 `type_code == 6`, reads the two `u16`s; for any other type code it reads neither.
+
+A column with a **`DEFAULT`** (../design/constraints.md §2) persists its pre-evaluated default
+value. When `flags` **bit2 (`has_default`)** is set, the default is appended **after** the typmod
+(so a decimal-with-default reads typmod then default), encoded with the **same value codec rows
+use** (presence tag + body — see below): a present default is `0x00` + the type body, a
+`DEFAULT NULL` is the lone `0x01`. The field is presence-gated, so a column without a default is
+byte-unchanged — every fixture predating defaults is untouched. This is an **additive,
+backward-compatible extension** at `format_version == 1`, exactly like the decimal typmod: an old
+file (no `has_default` bit anywhere) still loads. The one asymmetry to note: a v1 file that *does*
+carry a default is not readable by a core built before defaults existed — the writer's surface
+grew, the version did not. The reader keys entirely off bit2; a column whose bit2 is clear reads
+no default bytes.
 
 ## Data pages (one chain per non-empty table)
 
@@ -258,6 +271,7 @@ by the independent Ruby reference in [verify.rb](verify.rb) (run via `rake verif
 | `bool_table.jed` | a boolean column — the value codec's `bool-byte` branch (`00` false / `01` true) and a NULL boolean |
 | `decimal_table.jed` | a `decimal` column — the value codec's decimal branch (flags + scale + base-10⁴ groups), the per-column `numeric(p,s)` typmod, and positive/negative/zero/multi-group/NULL |
 | `bytea_table.jed` | a bytea column — the value codec's bytea branch (`u16` len + raw bytes); empty value, embedded `0x00`, a high byte, a NULL |
+| `default_table.jed` | columns with `DEFAULT` — the `has_default` flag (bit2) + the default value codec written after the typmod; an int/text/decimal default, a `DEFAULT NULL`, a NOT NULL column with a default, a plain no-default column |
 | `nopk_table.jed` | a table with no PK — exercises the stored synthetic `int64` rowid key |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |

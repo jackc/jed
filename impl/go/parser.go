@@ -161,10 +161,11 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	if err != nil {
 		return ColumnDef{}, err
 	}
-	// Zero or more order-free column constraints: PRIMARY KEY and NOT NULL. A constraint
-	// may be repeated harmlessly (the flags are idempotent).
+	// Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, and DEFAULT <literal>.
+	// A boolean constraint may be repeated harmlessly; a repeated DEFAULT keeps the last.
 	primaryKey := false
 	notNull := false
+	var def *Literal
 	for {
 		switch p.peekKeyword() {
 		case "primary":
@@ -179,8 +180,15 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 				return ColumnDef{}, err
 			}
 			notNull = true
+		case "default":
+			p.advance()
+			lit, err := p.parseLiteral()
+			if err != nil {
+				return ColumnDef{}, err
+			}
+			def = &lit
 		default:
-			return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull}, nil
+			return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def}, nil
 		}
 	}
 }
@@ -238,10 +246,11 @@ func (p *Parser) parseDropTable() (*DropTable, error) {
 	return &DropTable{Name: name}, nil
 }
 
-// parseInsert parses `INSERT INTO <table> VALUES <row> [, <row>]*`, where each <row>
-// is `( <literal> [, <literal>]* )`. Values map positionally to columns; the executor
-// type-checks each row against the catalog and inserts all-or-nothing
-// (spec/design/grammar.md §12).
+// parseInsert parses `INSERT INTO <table> [( <col> [, <col>]* )] VALUES <row> [, <row>]*`,
+// where each <row> is `( <value> [, <value>]* )` and each <value> is a literal or the DEFAULT
+// keyword. The optional column list names the target columns; unlisted columns take their
+// default. The executor resolves names + type-checks each row and inserts all-or-nothing
+// (spec/design/grammar.md §12, constraints.md §2).
 func (p *Parser) parseInsert() (*Insert, error) {
 	if err := p.expectKeyword("insert"); err != nil {
 		return nil, err
@@ -253,11 +262,34 @@ func (p *Parser) parseInsert() (*Insert, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected (the
+	// first expectIdentifier errors 42601 on `)`).
+	var columns []string
+	if p.peek().Kind == TokLParen {
+		p.advance() // '('
+		for {
+			name, err := p.expectIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			columns = append(columns, name)
+			switch p.advance().Kind {
+			case TokComma:
+				continue
+			case TokRParen:
+			default:
+				return nil, NewError(SyntaxError, "expected ',' or ')'")
+			}
+			break
+		}
+	}
+
 	if err := p.expectKeyword("values"); err != nil {
 		return nil, err
 	}
 
-	var rows [][]Literal
+	var rows [][]InsertValue
 	for {
 		row, err := p.parseInsertRow()
 		if err != nil {
@@ -270,21 +302,21 @@ func (p *Parser) parseInsert() (*Insert, error) {
 		}
 		break
 	}
-	return &Insert{Table: table, Rows: rows}, nil
+	return &Insert{Table: table, Columns: columns, Rows: rows}, nil
 }
 
-// parseInsertRow parses one parenthesized `( <literal> [, <literal>]* )` row of an INSERT.
-func (p *Parser) parseInsertRow() ([]Literal, error) {
+// parseInsertRow parses one parenthesized `( <value> [, <value>]* )` row of an INSERT.
+func (p *Parser) parseInsertRow() ([]InsertValue, error) {
 	if err := p.expect(TokLParen); err != nil {
 		return nil, err
 	}
-	var values []Literal
+	var values []InsertValue
 	for {
-		lit, err := p.parseLiteral()
+		v, err := p.parseInsertValue()
 		if err != nil {
 			return nil, err
 		}
-		values = append(values, lit)
+		values = append(values, v)
 		switch p.advance().Kind {
 		case TokComma:
 			continue
@@ -298,6 +330,20 @@ func (p *Parser) parseInsertRow() ([]Literal, error) {
 		return nil, NewError(SyntaxError, "a VALUES row must have at least one value")
 	}
 	return values, nil
+}
+
+// parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3),
+// else a literal.
+func (p *Parser) parseInsertValue() (InsertValue, error) {
+	if p.peekKeyword() == "default" {
+		p.advance()
+		return InsertValue{IsDefault: true}, nil
+	}
+	lit, err := p.parseLiteral()
+	if err != nil {
+		return InsertValue{}, err
+	}
+	return InsertValue{Lit: lit}, nil
 }
 
 // parseLiteral parses a literal value for INSERT: an integer (with an optional leading

@@ -14,6 +14,10 @@ var SupportedCapabilities = []string{
 	"ddl.drop_table",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
+	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).
+	"ddl.column_default",
+	// INSERT with an explicit column list + the DEFAULT keyword (grammar.md §12).
+	"dml.insert_column_list",
 	// Phase C — INSERT ... VALUES with positional type-checking + overflow trap.
 	"dml.insert",
 	// Multi-row INSERT ... VALUES (..),(..) — two-phase / all-or-nothing (grammar.md §12).

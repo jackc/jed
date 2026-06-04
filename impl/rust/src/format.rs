@@ -338,6 +338,9 @@ fn table_entry_bytes(table: &Table, root_data_page: u32) -> Vec<u8> {
         if col.not_null {
             flags |= 0b10;
         }
+        if col.default.is_some() {
+            flags |= 0b100;
+        }
         out.push(flags);
         // A decimal column appends its typmod (precision, scale) — only for type_code 6, so
         // non-decimal entries are byte-unchanged (spec/fileformat/format.md). `precision 0`
@@ -349,6 +352,12 @@ fn table_entry_bytes(table: &Table, root_data_page: u32) -> Vec<u8> {
             };
             out.extend_from_slice(&precision.to_be_bytes());
             out.extend_from_slice(&scale.to_be_bytes());
+        }
+        // A column with a DEFAULT (flags bit2) appends its pre-evaluated default value via the
+        // same value codec rows use — AFTER the typmod, presence-gated, so a column without a
+        // default is byte-unchanged (spec/fileformat/format.md). A `DEFAULT NULL` is one 0x01.
+        if let Some(d) = &col.default {
+            out.extend_from_slice(&encode_value(col.ty, d));
         }
     }
     out.extend_from_slice(&root_data_page.to_be_bytes());
@@ -504,12 +513,20 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32)> {
         } else {
             None
         };
+        // The default value follows the typmod, present iff flags bit2 (same value codec as
+        // rows). Absent → no bytes consumed (spec/fileformat/format.md).
+        let default = if flags & 0b100 != 0 {
+            Some(read_value(ty, buf, pos)?)
+        } else {
+            None
+        };
         columns.push(Column {
             name: cname,
             ty,
             decimal,
             primary_key: flags & 0b01 != 0,
             not_null: flags & 0b10 != 0,
+            default,
         });
     }
     let root_data_page = read_u32(buf, pos)?;

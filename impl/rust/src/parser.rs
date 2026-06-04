@@ -5,9 +5,9 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert, JoinClause,
-    JoinKind, Literal, OrderKey, Select, SelectItem, SelectItems, Statement, TableRef, TypeMod,
-    UnaryOp, Update,
+    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert, InsertValue,
+    JoinClause, JoinKind, Literal, OrderKey, Select, SelectItem, SelectItems, Statement, TableRef,
+    TypeMod, UnaryOp, Update,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -75,10 +75,12 @@ impl Parser {
         let name = self.expect_identifier()?;
         let type_name = self.expect_identifier()?;
         let type_mod = self.parse_type_mod()?;
-        // Zero or more order-free column constraints: `PRIMARY KEY` and `NOT NULL`. A
-        // constraint may be repeated harmlessly (the flags are idempotent).
+        // Zero or more order-free column constraints: `PRIMARY KEY`, `NOT NULL`, and
+        // `DEFAULT <literal>`. A boolean constraint may be repeated harmlessly; a repeated
+        // `DEFAULT` just keeps the last (the catalog stores one default).
         let mut primary_key = false;
         let mut not_null = false;
+        let mut default = None;
         loop {
             match self.peek_keyword().as_deref() {
                 Some("primary") => {
@@ -91,6 +93,10 @@ impl Parser {
                     self.expect_keyword("null")?;
                     not_null = true;
                 }
+                Some("default") => {
+                    self.advance();
+                    default = Some(self.parse_literal()?);
+                }
                 _ => break,
             }
         }
@@ -100,6 +106,7 @@ impl Parser {
             type_mod,
             primary_key,
             not_null,
+            default,
         })
     }
 
@@ -143,14 +150,34 @@ impl Parser {
         Ok(DropTable { name })
     }
 
-    /// `INSERT INTO <table> VALUES <row> [, <row>]*`, where each `<row>` is
-    /// `( <literal> [, <literal>]* )`. Values map positionally to columns; the
-    /// executor type-checks each row against the catalog and inserts all-or-nothing
-    /// (spec/design/grammar.md §12).
+    /// `INSERT INTO <table> [( <col> [, <col>]* )] VALUES <row> [, <row>]*`, where each
+    /// `<row>` is `( <value> [, <value>]* )` and each `<value>` is a literal or the `DEFAULT`
+    /// keyword. The optional column list names the target columns; unlisted columns take their
+    /// default. The executor resolves names + type-checks each row and inserts all-or-nothing
+    /// (spec/design/grammar.md §12, constraints.md §2).
     fn parse_insert(&mut self) -> Result<Insert> {
         self.expect_keyword("insert")?;
         self.expect_keyword("into")?;
         let table = self.expect_identifier()?;
+
+        // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected
+        // (the first `expect_identifier` errors 42601 on `)`).
+        let columns = if matches!(self.peek(), Token::LParen) {
+            self.advance(); // '('
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_identifier()?);
+                match self.advance() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
+                }
+            }
+            Some(names)
+        } else {
+            None
+        };
+
         self.expect_keyword("values")?;
 
         let mut rows = Vec::new();
@@ -162,15 +189,19 @@ impl Parser {
             }
             break;
         }
-        Ok(Insert { table, rows })
+        Ok(Insert {
+            table,
+            columns,
+            rows,
+        })
     }
 
-    /// One parenthesized `( <literal> [, <literal>]* )` row of an INSERT.
-    fn parse_insert_row(&mut self) -> Result<Vec<Literal>> {
+    /// One parenthesized `( <value> [, <value>]* )` row of an INSERT.
+    fn parse_insert_row(&mut self) -> Result<Vec<InsertValue>> {
         self.expect(&Token::LParen)?;
         let mut values = Vec::new();
         loop {
-            values.push(self.parse_literal()?);
+            values.push(self.parse_insert_value()?);
             match self.advance() {
                 Token::Comma => continue,
                 Token::RParen => break,
@@ -181,6 +212,16 @@ impl Parser {
             return Err(syntax("a VALUES row must have at least one value"));
         }
         Ok(values)
+    }
+
+    /// One INSERT value slot: the `DEFAULT` keyword (not reserved — §3), else a literal.
+    fn parse_insert_value(&mut self) -> Result<InsertValue> {
+        if self.peek_keyword().as_deref() == Some("default") {
+            self.advance();
+            Ok(InsertValue::Default)
+        } else {
+            Ok(InsertValue::Lit(self.parse_literal()?))
+        }
     }
 
     /// A literal value for INSERT: an integer (with an optional leading unary minus,

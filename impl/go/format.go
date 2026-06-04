@@ -348,6 +348,9 @@ func tableEntryBytes(table *Table, rootDataPage uint32) []byte {
 		if col.NotNull {
 			flags |= 0b10
 		}
+		if col.Default != nil {
+			flags |= 0b100
+		}
 		out = append(out, flags)
 		// A decimal column appends its typmod (precision, scale) — only for type_code 6, so
 		// non-decimal entries are byte-unchanged (spec/fileformat/format.md). precision 0 =
@@ -359,6 +362,12 @@ func tableEntryBytes(table *Table, rootDataPage uint32) []byte {
 			}
 			out = appendU16(out, precision)
 			out = appendU16(out, scale)
+		}
+		// A column with a DEFAULT (flags bit2) appends its pre-evaluated default value via the
+		// same value codec rows use — AFTER the typmod, presence-gated, so a column without a
+		// default is byte-unchanged (spec/fileformat/format.md). A DEFAULT NULL is one 0x01.
+		if col.Default != nil {
+			out = append(out, encodeValue(col.Type, *col.Default)...)
 		}
 	}
 	out = appendU32(out, rootDataPage)
@@ -526,12 +535,23 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, error) {
 				decimal = &DecimalTypmod{Precision: precision, Scale: scale}
 			}
 		}
+		// The default value follows the typmod, present iff flags bit2 (same value codec as
+		// rows). Absent → no bytes consumed (spec/fileformat/format.md).
+		var defaultVal *Value
+		if flags&0b100 != 0 {
+			dv, err := readValue(ty, buf, pos)
+			if err != nil {
+				return nil, 0, err
+			}
+			defaultVal = &dv
+		}
 		columns = append(columns, Column{
 			Name:       cname,
 			Type:       ty,
 			Decimal:    decimal,
 			PrimaryKey: flags&0b01 != 0,
 			NotNull:    flags&0b10 != 0,
+			Default:    defaultVal,
 		})
 	}
 	root, err := readU32(buf, pos)

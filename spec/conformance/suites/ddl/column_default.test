@@ -1,0 +1,115 @@
+# DEFAULT column constraint — a column's DEFAULT literal fills a column omitted at INSERT or
+# a `DEFAULT`-keyword value slot. The default is evaluated + type-coerced once at CREATE TABLE,
+# so a bad default fails there (22003 out of range, 42804 cross-family). DEFAULT NULL on a NOT
+# NULL column is accepted at CREATE and traps 23502 only when applied. spec/design/constraints.md §2.
+# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, query.select, query.is_null, query.order_by, types.int16, types.int32, types.text, types.decimal, error.overflow_trap, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, n int32 DEFAULT 0, note text DEFAULT 'none')
+
+# a column omitted from the list takes its default (n -> 0, note -> 'none')
+statement ok
+INSERT INTO t (id) VALUES (1)
+
+# the DEFAULT keyword takes the column's default in a positional slot
+statement ok
+INSERT INTO t VALUES (2, DEFAULT, 'hi')
+
+# a provided value overrides the default
+statement ok
+INSERT INTO t (id, n, note) VALUES (3, 7, 'set')
+
+# the DEFAULT keyword works at any position, even reordered by the column list
+statement ok
+INSERT INTO t (id, note, n) VALUES (4, DEFAULT, DEFAULT)
+
+query IIT nosort
+SELECT id, n, note FROM t ORDER BY id
+----
+1
+0
+none
+2
+0
+hi
+3
+7
+set
+4
+0
+none
+
+# applying defaults adds no cost — they are pre-evaluated constants, like literal rows
+# cost: 0
+statement ok
+INSERT INTO t (id) VALUES (9)
+
+# a negative default literal works (the leading minus folds into the literal)
+statement ok
+CREATE TABLE neg (id int32 PRIMARY KEY, x int16 DEFAULT -5)
+
+statement ok
+INSERT INTO neg (id) VALUES (1)
+
+query II nosort
+SELECT id, x FROM neg
+----
+1
+-5
+
+# a decimal default coerces to the column's typmod at CREATE TABLE (rounds to scale 2)
+statement ok
+CREATE TABLE d (id int32 PRIMARY KEY, amt numeric(6,2) DEFAULT 1.5)
+
+statement ok
+INSERT INTO d (id) VALUES (1)
+
+query ID nosort
+SELECT id, amt FROM d
+----
+1
+1.50
+
+# a default out of the column type's range is rejected at CREATE TABLE (22003)
+statement error 22003
+CREATE TABLE bad1 (id int32 PRIMARY KEY, s int16 DEFAULT 99999)
+
+# a cross-family default is a type error at CREATE TABLE (42804)
+statement error 42804
+CREATE TABLE bad2 (id int32 PRIMARY KEY, n int32 DEFAULT 'x')
+
+# DEFAULT NULL on a NOT NULL column: accepted at CREATE, but applying it traps 23502
+statement ok
+CREATE TABLE nn (id int32 PRIMARY KEY, v int32 NOT NULL DEFAULT NULL)
+
+statement error 23502
+INSERT INTO nn (id) VALUES (1)
+
+statement error 23502
+INSERT INTO nn VALUES (2, DEFAULT)
+
+# providing a value is fine
+statement ok
+INSERT INTO nn VALUES (3, 42)
+
+query II nosort
+SELECT id, v FROM nn
+----
+3
+42
+
+# a nullable column with no default, omitted or filled with DEFAULT, is NULL
+statement ok
+CREATE TABLE nd (id int32 PRIMARY KEY, maybe int32)
+
+statement ok
+INSERT INTO nd (id) VALUES (1)
+
+statement ok
+INSERT INTO nd (id, maybe) VALUES (2, DEFAULT)
+
+query I nosort
+SELECT id FROM nd WHERE maybe IS NULL ORDER BY id
+----
+1
+2

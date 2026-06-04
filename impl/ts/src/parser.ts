@@ -9,6 +9,7 @@ import type {
   Delete,
   Expr,
   Insert,
+  InsertValue,
   JoinClause,
   JoinKind,
   Literal,
@@ -144,10 +145,11 @@ class Parser {
     const name = this.expectIdentifier();
     const typeName = this.expectIdentifier();
     const typeMod = this.parseTypeMod();
-    // Zero or more order-free column constraints: PRIMARY KEY and NOT NULL. A constraint
-    // may be repeated harmlessly (the flags are idempotent).
+    // Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, and DEFAULT <literal>.
+    // A boolean constraint may be repeated harmlessly; a repeated DEFAULT keeps the last.
     let primaryKey = false;
     let notNull = false;
+    let def: Literal | null = null;
     for (;;) {
       const kw = this.peekKeyword();
       if (kw === "primary") {
@@ -158,11 +160,14 @@ class Parser {
         this.advance();
         this.expectKeyword("null");
         notNull = true;
+      } else if (kw === "default") {
+        this.advance();
+        def = this.parseLiteral();
       } else {
         break;
       }
     }
-    return { name, typeName, typeMod, primaryKey, notNull };
+    return { name, typeName, typeMod, primaryKey, notNull, default: def };
   }
 
   // parseTypeMod parses an optional parenthesized type modifier `"(" integer ("," integer)? ")"`
@@ -198,16 +203,35 @@ class Parser {
     return { kind: "dropTable", name };
   }
 
-  // parseInsert parses `INSERT INTO <table> VALUES <row> [, <row>]*`, where each <row>
-  // is `( <literal> [, <literal>]* )`. Values map positionally to columns; the executor
-  // type-checks each row against the catalog and inserts all-or-nothing (grammar.md §12).
+  // parseInsert parses `INSERT INTO <table> [( <col> [, <col>]* )] VALUES <row> [, <row>]*`,
+  // where each <row> is `( <value> [, <value>]* )` and each <value> is a literal or the DEFAULT
+  // keyword. The optional column list names the target columns; unlisted columns take their
+  // default. The executor resolves names + type-checks each row and inserts all-or-nothing
+  // (grammar.md §12, constraints.md §2).
   private parseInsert(): Insert {
     this.expectKeyword("insert");
     this.expectKeyword("into");
     const table = this.expectIdentifier();
+
+    // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected (the
+    // first expectIdentifier errors 42601 on `)`).
+    let columns: string[] | null = null;
+    if (this.peek().kind === "lparen") {
+      this.advance(); // '('
+      const names: string[] = [];
+      for (;;) {
+        names.push(this.expectIdentifier());
+        const k = this.advance().kind;
+        if (k === "comma") continue;
+        if (k === "rparen") break;
+        throw engineError("syntax_error", "expected ',' or ')'");
+      }
+      columns = names;
+    }
+
     this.expectKeyword("values");
 
-    const rows: Literal[][] = [];
+    const rows: InsertValue[][] = [];
     for (;;) {
       rows.push(this.parseInsertRow());
       if (this.peek().kind === "comma") {
@@ -216,15 +240,15 @@ class Parser {
       }
       break;
     }
-    return { kind: "insert", table, rows };
+    return { kind: "insert", table, columns, rows };
   }
 
-  // parseInsertRow parses one parenthesized `( <literal> [, <literal>]* )` row.
-  private parseInsertRow(): Literal[] {
+  // parseInsertRow parses one parenthesized `( <value> [, <value>]* )` row.
+  private parseInsertRow(): InsertValue[] {
     this.expect("lparen");
-    const values: Literal[] = [];
+    const values: InsertValue[] = [];
     for (;;) {
-      values.push(this.parseLiteral());
+      values.push(this.parseInsertValue());
       const k = this.advance().kind;
       if (k === "comma") continue;
       if (k === "rparen") break;
@@ -234,6 +258,16 @@ class Parser {
       throw engineError("syntax_error", "a VALUES row must have at least one value");
     }
     return values;
+  }
+
+  // parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3),
+  // else a literal.
+  private parseInsertValue(): InsertValue {
+    if (this.peekKeyword() === "default") {
+      this.advance();
+      return { kind: "default" };
+    }
+    return { kind: "lit", lit: this.parseLiteral() };
   }
 
   // parseLiteral parses a literal value for INSERT: an integer (with an optional leading

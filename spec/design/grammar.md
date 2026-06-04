@@ -104,9 +104,10 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   `SELECT` is now **multi-table** via `JOIN` (§15): `INNER JOIN ... ON`, `CROSS JOIN`, and the
   `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` family all execute. **Subqueries** (derived tables,
   `IN`/`EXISTS`, correlated) and **`USING`/`NATURAL`** join forms remain deferred.
-- **Positional `INSERT`** — no column list, no `DEFAULT`, and the values are *literals
-  only* (not general expressions; see the `literal` production). Multi-row `VALUES`
-  *did* land (§12); a column list and `DEFAULT` stay deferred.
+- **`INSERT` values are *literals only*** (not general expressions; see the `literal`
+  production) — but the `DEFAULT` keyword is now also a value slot, and an explicit **column
+  list** (`INSERT INTO t (a, c) VALUES ...`) landed alongside `DEFAULT` (§12, §16). What stays
+  deferred is `INSERT ... SELECT` and general expressions in a value slot.
 - **`ORDER BY` keys are bare columns** — a sort key is a table column, never a general
   expression (`ORDER BY a + 1`), an output alias, or an ordinal position (`ORDER BY 1`);
   those stay deferred. The richer surface that *did* land — multiple keys, per-key
@@ -311,13 +312,15 @@ hand-written parsers.
 `INSERT INTO t VALUES (...)` accepts **one or more** parenthesized rows
 (`insert` / `row` in the grammar): `INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)` inserts
 three rows in one statement. It is the obvious PostgreSQL surface and a near-free extension
-of the single-row form — one extra parse loop and one validation pass. A column list,
-`DEFAULT`, and `INSERT ... SELECT` stay deferred (§5, [../../TODO.md](../../TODO.md)).
+of the single-row form — one extra parse loop and one validation pass. The optional **column
+list** and the **`DEFAULT` keyword** are covered in §16; `INSERT ... SELECT` and general
+expressions in a value slot stay deferred (§5, [../../TODO.md](../../TODO.md)).
 
-**Every row has the table's column count.** Each `row` is validated against the catalog
-independently; a row whose arity differs from the column count is a syntax error (`42601`),
-the same code the single-row form already raised for a count mismatch. There is no per-row
-column list, so all rows necessarily share the column set.
+**Every row has the same arity.** Each `row` is validated against the catalog independently; a
+row whose arity differs from the column count (or, with a column list, the list length) is a
+syntax error (`42601`), the same code the single-row form already raised for a count mismatch.
+The column list (if any) is shared by all rows, so all rows necessarily map to the same column
+set.
 
 **Two-phase / all-or-nothing — the UPDATE precedent.** A multi-row `INSERT` is atomic per
 statement, mirroring `UPDATE`'s two-phase pass (CLAUDE.md §11 step 6) and PostgreSQL: the
@@ -339,9 +342,10 @@ phase two, after every row has validated, and proceeds in `VALUES` order — so 
 fails validation burns no rowids, and a batch that succeeds assigns consecutive rowids
 left-to-right. This keeps the assignment deterministic and identical across the three cores.
 
-**Cost is unchanged — zero.** Literal rows read no storage and evaluate no expression tree,
-so a multi-row `INSERT` accrues the same zero cost as the single-row form
-([cost.md](cost.md); `DEFAULT` expressions, when added, will accrue here).
+**Cost is unchanged — zero.** A row's values are literals and **pre-evaluated constant
+defaults** (folded to a value at CREATE TABLE — §16), so an `INSERT` reads no storage and
+evaluates no expression tree: it accrues the same zero cost as before
+([cost.md](cost.md)). Only a future *expression* default would change this.
 
 ## 13. `DROP TABLE`
 
@@ -521,3 +525,33 @@ grammar/AST/parser reshape was needed. Semantics (PostgreSQL by default, [../../
   `t.*`** qualified-star, **no parenthesized / derived-table FROM**, **no subqueries**.
 - **`UPDATE` / `DELETE` stay single-table** — they keep one table name and gain nothing here
   (though a qualified `WHERE t.a = 1` referencing their sole table now resolves, harmlessly).
+
+## 16. `INSERT` column list and the `DEFAULT` keyword
+
+`INSERT` gained two related, PostgreSQL-faithful surfaces (`insert` / `insert_value` in the
+grammar) so a column can be **omitted** and take its `DEFAULT` ([constraints.md](constraints.md)
+§2). The constraint semantics — when a default is evaluated, the `DEFAULT NULL`/`NOT NULL`
+interaction — live in that doc; this section is the grammar/mapping rule.
+
+**The optional column list** names the target columns: `INSERT INTO t (a, c) VALUES (1, 3)`.
+The values map to the *named* columns, in list order (not declaration order), so the list may
+reorder and may omit columns. With **no list**, the values map positionally to every column in
+declaration order (the prior behavior). Either way the engine builds each stored row in
+declaration order; a column that the list omits takes its default, else NULL, else `23502` if
+it is `NOT NULL`.
+
+**The `DEFAULT` keyword** is a value slot: `INSERT INTO t VALUES (1, DEFAULT, 'x')` puts the
+target column's declared default in that position (or NULL, then `23502` if NOT NULL and no
+default). It works at any position, including under a reordering column list. `DEFAULT` is not
+reserved (§3) — a column may be named `default`; it is a keyword only in a value slot.
+
+**Errors, resolved deterministically left-to-right.** Statement-level, once before the rows: an
+unknown column name in the list is `42703` (`undefined_column`), a column named twice is `42701`
+(`duplicate_column`). Per row: an arity that does not match the list length (or, with no list,
+the column count) is `42601`. Then the usual per-value checks apply in declaration order
+(`22003` / `42804` / `23502`), inside the same two-phase / all-or-nothing pass as §12.
+
+**Defaults are literal-only this slice** and pre-evaluated at CREATE TABLE, so applying one at
+INSERT is substituting a constant — no expression is evaluated and cost stays zero (§12). A
+general-expression default (`DEFAULT now()`) and `INSERT ... SELECT` stay deferred
+([../../TODO.md](../../TODO.md)).

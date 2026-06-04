@@ -130,6 +130,19 @@ func byteaTableDB(t *testing.T) *Database {
 	return db
 }
 
+// defaultTableDB exercises the DEFAULT column constraint on disk — the catalog flags bit2 + the
+// pre-evaluated default value (written after the typmod). Covers an int default, a text default,
+// a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to numeric(6,2),
+// and a plain no-default column. Row 1 takes every default; row 2 provides all values.
+func defaultTableDB(t *testing.T) *Database {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, n int32 DEFAULT 0, note text DEFAULT 'none', "+
+		"maybe int32 DEFAULT NULL, req int32 NOT NULL DEFAULT 7, amt numeric(6,2) DEFAULT 1.5, plain int16)")
+	run(t, db, "INSERT INTO t (id) VALUES (1)")
+	run(t, db, "INSERT INTO t VALUES (2, 42, 'hi', 5, 9, 2.00, 100)")
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -143,6 +156,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"bool_table.jed", boolTableDB},
 		{"decimal_table.jed", decimalTableDB},
 		{"bytea_table.jed", byteaTableDB},
+		{"default_table.jed", defaultTableDB},
 		{"nopk_table.jed", nopkTableDB},
 	}
 	for _, c := range cases {
@@ -170,6 +184,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"bool_table.jed", boolTableDB, "t"},
 		{"decimal_table.jed", decimalTableDB, "t"},
 		{"bytea_table.jed", byteaTableDB, "t"},
+		{"default_table.jed", defaultTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},
@@ -242,6 +257,24 @@ func TestRowidCounterSurvivesLoad(t *testing.T) {
 	}
 	if got := len(loaded.RowsInKeyOrder("r")); got != 4 {
 		t.Errorf("expected 4 rows after load+insert, got %d", got)
+	}
+}
+
+// A column DEFAULT survives serialize→load: a fresh INSERT omitting the defaulted columns
+// applies the *persisted* defaults — proving the default value (not just its byte length)
+// round-trips through the catalog (constraints.md §2).
+func TestDefaultSurvivesLoad(t *testing.T) {
+	loaded, err := LoadDatabase(fixture(t, "default_table.jed"))
+	if err != nil {
+		t.Fatalf("load default_table: %v", err)
+	}
+	run(t, loaded, "INSERT INTO t (id) VALUES (3)")
+	rows := loaded.RowsInKeyOrder("t")
+	last := rows[len(rows)-1]
+	// id=3 takes every persisted default: n=0, note='none', maybe=NULL, req=7, plain=NULL.
+	if last[0].Int != 3 || last[1].Int != 0 || last[2].Str != "none" ||
+		last[3].Kind != ValNull || last[4].Int != 7 || last[6].Kind != ValNull {
+		t.Errorf("persisted defaults not applied: %v", last)
 	}
 }
 

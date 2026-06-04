@@ -107,6 +107,22 @@ function byteaTableDB(): Database {
   return db;
 }
 
+// defaultTableDB exercises the DEFAULT column constraint on disk — the catalog flags bit2 + the
+// pre-evaluated default value (written after the typmod). Covers an int default, a text default,
+// a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to numeric(6,2),
+// and a plain no-default column. Row 1 takes every default; row 2 provides all values.
+function defaultTableDB(): Database {
+  const db = new Database();
+  run(
+    db,
+    "CREATE TABLE t (id int32 PRIMARY KEY, n int32 DEFAULT 0, note text DEFAULT 'none', " +
+      "maybe int32 DEFAULT NULL, req int32 NOT NULL DEFAULT 7, amt numeric(6,2) DEFAULT 1.5, plain int16)",
+  );
+  run(db, "INSERT INTO t (id) VALUES (1)");
+  run(db, "INSERT INTO t VALUES (2, 42, 'hi', 5, 9, 2.00, 100)");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -117,6 +133,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "bool_table.jed", build: boolTableDB },
     { name: "decimal_table.jed", build: decimalTableDB },
     { name: "bytea_table.jed", build: byteaTableDB },
+    { name: "default_table.jed", build: defaultTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
   ];
   for (const c of cases) {
@@ -139,6 +156,7 @@ test("read goldens reproduces rows", () => {
     { name: "bool_table.jed", build: boolTableDB, table: "t" },
     { name: "decimal_table.jed", build: decimalTableDB, table: "t" },
     { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
+    { name: "default_table.jed", build: defaultTableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },
@@ -164,8 +182,8 @@ test("read golden reconstructs catalog", () => {
   assert.equal(tbl!.name, "t");
   assert.equal(tbl!.columns.length, 2);
   const [id, v] = tbl!.columns;
-  assert.deepStrictEqual(id, { name: "id", type: "int32", decimal: null, primaryKey: true, notNull: true });
-  assert.deepStrictEqual(v, { name: "v", type: "int16", decimal: null, primaryKey: false, notNull: false });
+  assert.deepStrictEqual(id, { name: "id", type: "int32", decimal: null, primaryKey: true, notNull: true, default: null });
+  assert.deepStrictEqual(v, { name: "v", type: "int16", decimal: null, primaryKey: false, notNull: false, default: null });
   // A NULL value round-trips (id 3's v).
   const rows = loaded.rowsInKeyOrder("t");
   assert.deepStrictEqual(rows[2], [{ kind: "int", int: 3n }, { kind: "null" }]);
@@ -179,6 +197,23 @@ test("rowid counter survives load", () => {
   // The next insert must get rowid 3, not 0 — otherwise it collides (23505).
   execute(loaded, "INSERT INTO r VALUES (10, 100)");
   assert.equal(loaded.rowsInKeyOrder("r").length, 4);
+});
+
+// A column DEFAULT survives serialize→load: a fresh INSERT omitting the defaulted columns
+// applies the *persisted* defaults — proving the default value (not just its byte length)
+// round-trips through the catalog (constraints.md §2).
+test("default survives load", () => {
+  const loaded = loadDatabase(fixture("default_table.jed"));
+  run(loaded, "INSERT INTO t (id) VALUES (3)");
+  const rows = loaded.rowsInKeyOrder("t")!;
+  const last = rows[rows.length - 1]!;
+  // id=3 takes every persisted default: n=0, note='none', maybe=NULL, req=7, plain=NULL.
+  assert.deepStrictEqual(last[0], { kind: "int", int: 3n });
+  assert.deepStrictEqual(last[1], { kind: "int", int: 0n });
+  assert.deepStrictEqual(last[2], { kind: "text", text: "none" });
+  assert.deepStrictEqual(last[3], { kind: "null" });
+  assert.deepStrictEqual(last[4], { kind: "int", int: 7n });
+  assert.deepStrictEqual(last[6], { kind: "null" });
 });
 
 // The default 8 KiB page size also round-trips, and re-serializing is deterministic.

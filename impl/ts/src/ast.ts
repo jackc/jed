@@ -99,6 +99,10 @@ export type ColumnDef = {
   typeMod: TypeMod | null;
   primaryKey: boolean;
   notNull: boolean;
+  // An optional DEFAULT <literal> — the value for this column when a row omits it (or uses the
+  // DEFAULT keyword). Literal-only this slice; evaluated + type-coerced once at CREATE TABLE
+  // (spec/design/constraints.md §2). null = no default.
+  default: Literal | null;
 };
 
 // Assignment is one `SET <column> = <value>` clause; value is a general expression
@@ -118,11 +122,23 @@ export type CreateTable = {
 // objects exist yet). See spec/design/grammar.md §13.
 export type DropTable = { kind: "dropTable"; name: string };
 
-// Insert is an INSERT ... VALUES with one or more rows of literals, each in column
-// order. A multi-row INSERT is two-phase / all-or-nothing — every row is validated
-// before any is stored (spec/design/grammar.md §12). `rows` is always non-empty (the
-// parser requires ≥1 row).
-export type Insert = { kind: "insert"; table: string; rows: Literal[][] };
+// Insert is an INSERT ... [(col, ..)] VALUES with one or more rows, each value either a
+// literal or the DEFAULT keyword. A multi-row INSERT is two-phase / all-or-nothing — every
+// row is validated before any is stored (spec/design/grammar.md §12). `rows` is non-empty.
+// `columns` is the optional explicit column list (`INSERT INTO t (a, c) VALUES ...`); null is
+// the positional form (every column, in declaration order). Names resolve at execution time
+// (unknown → 42703, duplicate → 42701); an unlisted column takes its default else NULL.
+export type Insert = {
+  kind: "insert";
+  table: string;
+  columns: string[] | null;
+  rows: InsertValue[][];
+};
+
+// InsertValue is one value slot in an INSERT VALUES row: a literal, or the DEFAULT keyword —
+// which substitutes the target column's declared default (or NULL if it has none). The DEFAULT
+// keyword is not reserved (spec/design/grammar.md §3). See spec/design/constraints.md §2.
+export type InsertValue = { kind: "lit"; lit: Literal } | { kind: "default" };
 
 // TableRef is a table reference in a FROM clause: a table name with an optional alias
 // (`orders o` or `orders AS o`). The alias, or the table name when there is none, is the

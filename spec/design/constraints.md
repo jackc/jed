@@ -15,6 +15,7 @@ A `column_def` is a name, a type, and zero or more **column constraints**:
 column_def        ::= identifier type_name column_constraint*
 column_constraint ::= "PRIMARY" "KEY"
                     | "NOT" "NULL"
+                    | "DEFAULT" literal
 ```
 
 Constraints are **order-free** and idempotent: the parsers accept the keywords in any order
@@ -61,3 +62,46 @@ primary-key nullability).
 
 **Cost.** Declaring or enforcing `NOT NULL` adds nothing to query cost — the check is a branch
 inside an evaluation step that is already metered (CLAUDE.md §13).
+
+## 2. `DEFAULT`
+
+A `DEFAULT` gives a column the value to use when a row **omits** it. It is exercised through the
+`INSERT` column list and the `DEFAULT` keyword (grammar.md §16): an unlisted column, or a
+`DEFAULT` value slot, takes the column's default.
+
+**Literal-only this slice.** A `DEFAULT` takes a single `literal` — exactly the grammar an
+`INSERT` value accepts (int / decimal / text / bytea-as-text / boolean / `NULL`, with an
+optional leading `-`). A general-expression default (`DEFAULT 1 + 1`, `DEFAULT now()`) is
+deferred; literal-only keeps the value a deterministic constant with no evaluation at INSERT.
+
+**Evaluated + coerced once, at CREATE TABLE.** The default literal is converted to a value and
+**type-coerced to the column** at `CREATE TABLE` — the same `store_value` path INSERT uses — and
+the coerced value is stored in the catalog. So a bad default fails *at CREATE TABLE*, not at the
+first INSERT:
+
+- a default outside the column type's range traps **`22003`** (`DEFAULT 99999` on `int16`);
+- a cross-family default traps **`42804`** (`DEFAULT 'x'` on `int32`);
+- a decimal default is rounded to the column's typmod there (`DEFAULT 1.5` on `numeric(6,2)`
+  stores `1.50`), so the stored default is already in the column's exact form.
+
+**`NOT NULL` is *not* checked at CREATE TABLE.** The default is coerced with the NOT NULL check
+disabled, so `DEFAULT NULL` on a `NOT NULL` column is **accepted at CREATE** and stored as NULL
+(matching PostgreSQL). The `23502` fires only if that default is actually *applied* — when a row
+omits the column or uses the `DEFAULT` keyword (§1).
+
+**Applying a default.** At INSERT, the candidate value for each column is: the value the row
+provides; or, for a `DEFAULT` slot or an omitted column, the column's stored default; or NULL
+when the column has no default. That candidate then goes through the one `store_value`
+chokepoint, which re-applies the column's real `NOT NULL` — so an applied `DEFAULT NULL`, or an
+omitted no-default `NOT NULL` column (including an omitted `PRIMARY KEY`, which is NOT NULL),
+traps **`23502`**. A column with **no default** that is omitted is simply NULL (allowed iff the
+column is nullable).
+
+**Persistence.** A default is stored in the per-column catalog entry: flags **`bit2 has_default`**
+plus, when set, the coerced value via the row value codec, written after the decimal typmod
+([../fileformat/format.md](../fileformat/format.md)). A `DEFAULT NULL` is the lone presence tag
+`0x01`. The default survives serialize→load and is applied to inserts after a reload.
+
+**Cost.** A default is a pre-evaluated constant, so applying one evaluates no expression tree —
+an `INSERT` with defaults accrues the same zero cost as one with literal values (grammar.md §12,
+CLAUDE.md §13).

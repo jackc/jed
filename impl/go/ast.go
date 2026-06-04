@@ -39,6 +39,10 @@ type ColumnDef struct {
 	// NotNull is an explicit NOT NULL column constraint. A PRIMARY KEY column is implicitly
 	// NOT NULL regardless of this flag; the executor ORs the two (spec/design/constraints.md).
 	NotNull bool
+	// Default is an optional DEFAULT <literal> — the value for this column when a row omits it
+	// (or uses the DEFAULT keyword). Literal-only this slice; evaluated + type-coerced once at
+	// CREATE TABLE (spec/design/constraints.md §2). nil = no default.
+	Default *Literal
 }
 
 // TypeMod is a parsed type modifier: a precision and an optional scale, as written
@@ -49,13 +53,26 @@ type TypeMod struct {
 	Scale     *uint64
 }
 
-// Insert is an INSERT ... VALUES with one or more rows of literals, each in column
-// order. A multi-row INSERT is two-phase / all-or-nothing — every row is validated
-// before any is stored (spec/design/grammar.md §12). Rows is always non-empty (the
-// parser requires ≥1 row).
+// Insert is an INSERT ... [(col, ..)] VALUES with one or more rows, each value either a
+// literal or the DEFAULT keyword. A multi-row INSERT is two-phase / all-or-nothing — every
+// row is validated before any is stored (spec/design/grammar.md §12). Rows is always non-empty.
 type Insert struct {
 	Table string
-	Rows  [][]Literal
+	// Columns is the optional explicit column list (`INSERT INTO t (a, c) VALUES ...`); nil is
+	// the positional form (every column, in declaration order). Names resolve at execution time
+	// (unknown → 42703, duplicate → 42701); an unlisted column takes its default else NULL.
+	Columns []string
+	// Rows are the rows to insert; each inner slice is one row's values in the order of Columns
+	// (or column order when Columns is nil).
+	Rows [][]InsertValue
+}
+
+// InsertValue is one value slot in an INSERT VALUES row: a literal, or the DEFAULT keyword
+// (IsDefault) — which substitutes the target column's declared default (or NULL if it has
+// none). The DEFAULT keyword is not reserved (spec/design/grammar.md §3). constraints.md §2.
+type InsertValue struct {
+	IsDefault bool
+	Lit       Literal // valid when !IsDefault
 }
 
 // Update is `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each

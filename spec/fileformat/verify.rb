@@ -26,10 +26,14 @@ CODETYPE = TYPECODE.invert.freeze
 # --- declarative fixtures (mirror what the cores build via SQL) --------------
 
 # A column. `precision`/`scale` are the decimal typmod (only meaningful for type "decimal";
-# nil = an unconstrained `numeric` column, or a non-decimal column). Always carried so the
-# decode-side column hash compares equal (format.md stores the typmod only for type_code 6).
-def col(name, type, pk: false, precision: nil, scale: nil)
-  { name: name, type: type, pk: pk, not_null: pk, precision: precision, scale: scale }
+# nil = an unconstrained `numeric` column, or a non-decimal column). `not_null` defaults to the
+# pk flag (a PRIMARY KEY is implicitly NOT NULL). `default` is the column's DEFAULT value as the
+# cores store it (already type-coerced): the sentinel :none = no default (flags bit2 off), `nil`
+# = an explicit DEFAULT NULL, any other value = that default. Always carried so the decode-side
+# column hash compares equal (format.md stores the typmod/default only when their bit is set).
+def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, default: :none)
+  { name: name, type: type, pk: pk, not_null: not_null.nil? ? pk : not_null,
+    precision: precision, scale: scale, default: default }
 end
 
 PK_TABLE = {
@@ -83,6 +87,28 @@ BYTEA_TABLE = {
          [4, "\xFF".b], [5, nil], [6, "\x00".b]]
 }.freeze
 
+# A table exercising the DEFAULT column constraint on disk (format.md): the catalog flags bit2
+# + the column's pre-evaluated default value via the value codec, written AFTER the decimal
+# typmod. Covers an int default, a text default, a DEFAULT NULL (the lone 0x01 tag), a NOT NULL
+# column with a default (bit1 + bit2), a decimal default coerced to numeric(6,2), and a plain
+# no-default column (bit2 off, no extra bytes). The stored defaults and row values are exactly
+# what the cores write when they CREATE the table and INSERT (row 1 takes every default; row 2
+# provides all values). PK is an int32.
+DEFAULT_TABLE = {
+  name: "t",
+  columns: [
+    col("id", "int32", pk: true),
+    col("n", "int32", default: 0),
+    col("note", "text", default: "none"),
+    col("maybe", "int32", default: nil),
+    col("req", "int32", not_null: true, default: 7),
+    col("amt", "decimal", precision: 6, scale: 2, default: "1.50"),
+    col("plain", "int16")
+  ],
+  rows: [[1, 0, "none", nil, 7, "1.50", nil],
+         [2, 42, "hi", 5, 9, "2.00", 100]]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "one_table_empty.jed", page_size: 256,
@@ -92,6 +118,7 @@ FIXTURES = [
   { file: "bool_table.jed",      page_size: 256, tables: [BOOL_TABLE] },
   { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
+  { file: "default_table.jed",   page_size: 256, tables: [DEFAULT_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
@@ -195,13 +222,18 @@ def table_entry_bytes(table, root_data_page)
   table[:columns].each do |c|
     out << u16(c[:name].bytesize) << c[:name].b
     out << [TYPECODE.fetch(c[:type])].pack("C")
+    has_default = c[:default] != :none
     flags = 0
     flags |= 0b01 if c[:pk]
     flags |= 0b10 if c[:not_null]
+    flags |= 0b100 if has_default
     out << [flags].pack("C")
     # A decimal column appends its typmod (precision, scale) — only for type_code 6, so
     # non-decimal entries are byte-unchanged. precision 0 = unconstrained numeric.
     out << u16(c[:precision] || 0) << u16(c[:scale] || 0) if c[:type] == "decimal"
+    # A column with a DEFAULT (flags bit2) appends its pre-evaluated default value via the same
+    # value codec rows use — AFTER the typmod, presence-gated. A DEFAULT NULL is one 0x01.
+    out << encode_value(c[:type], c[:default]) if has_default
   end
   out << u32(root_data_page)
   out
@@ -383,11 +415,48 @@ def decode_table_entry(buf, pos)
       precision = p.zero? ? nil : p
       scale = p.zero? ? nil : sb.unpack1("n")
     end
+    # The default value follows the typmod, present iff flags bit2 (same value codec as rows).
+    default = :none
+    default, pos = decode_value(type, buf, pos) if (f & 0b100) != 0
     columns << { name: cname, type: type, pk: (f & 0b01) != 0, not_null: (f & 0b10) != 0,
-                 precision: precision, scale: scale }
+                 precision: precision, scale: scale, default: default }
   end
   root, pos = take(buf, pos, 4)
   [{ name: name, columns: columns, root_data_page: root.unpack1("N") }, pos]
+end
+
+# Read one value via the value codec (inverse of encode_value): a presence tag, then — when
+# present — the type's body. 0x01 = NULL. Shared by row records and the catalog default.
+def decode_value(type, buf, pos)
+  tag, pos = take(buf, pos, 1)
+  return [nil, pos] unless tag.getbyte(0).zero? # 0x01 = NULL
+
+  case type
+  when "text"
+    len, pos = take(buf, pos, 2)
+    sb, pos = take(buf, pos, len.unpack1("n"))
+    [sb.dup.force_encoding("UTF-8"), pos]
+  when "boolean"
+    bb, pos = take(buf, pos, 1)
+    [bb.getbyte(0) == 1, pos]
+  when "decimal"
+    fb, pos = take(buf, pos, 1)
+    scb, pos = take(buf, pos, 2)
+    ndb, pos = take(buf, pos, 2)
+    coeff = 0
+    ndb.unpack1("n").times do
+      gb, pos = take(buf, pos, 2)
+      coeff = coeff * 10_000 + gb.unpack1("n")
+    end
+    [render_decimal((fb.getbyte(0) & 1) != 0, scb.unpack1("n"), coeff), pos]
+  when "bytea"
+    len, pos = take(buf, pos, 2)
+    bb, pos = take(buf, pos, len.unpack1("n"))
+    [bb.dup.force_encoding("ASCII-8BIT"), pos] # raw bytes, no UTF-8 assertion
+  else
+    vb, pos = take(buf, pos, WIDTH.fetch(type))
+    [decode_int(WIDTH.fetch(type), vb), pos]
+  end
 end
 
 def decode_record(columns, buf, pos)
@@ -395,37 +464,8 @@ def decode_record(columns, buf, pos)
   _key, pos = take(buf, pos, key_len.unpack1("n"))
   row = []
   columns.each do |c|
-    tag, pos = take(buf, pos, 1)
-    if tag.getbyte(0).zero? # 0x00 = present, 0x01 = NULL
-      case c[:type]
-      when "text"
-        len, pos = take(buf, pos, 2)
-        sb, pos = take(buf, pos, len.unpack1("n"))
-        row << sb.dup.force_encoding("UTF-8")
-      when "boolean"
-        bb, pos = take(buf, pos, 1)
-        row << (bb.getbyte(0) == 1)
-      when "decimal"
-        fb, pos = take(buf, pos, 1)
-        scb, pos = take(buf, pos, 2)
-        ndb, pos = take(buf, pos, 2)
-        coeff = 0
-        ndb.unpack1("n").times do
-          gb, pos = take(buf, pos, 2)
-          coeff = coeff * 10_000 + gb.unpack1("n")
-        end
-        row << render_decimal((fb.getbyte(0) & 1) != 0, scb.unpack1("n"), coeff)
-      when "bytea"
-        len, pos = take(buf, pos, 2)
-        bb, pos = take(buf, pos, len.unpack1("n"))
-        row << bb.dup.force_encoding("ASCII-8BIT") # raw bytes, no UTF-8 assertion
-      else
-        vb, pos = take(buf, pos, WIDTH.fetch(c[:type]))
-        row << decode_int(WIDTH.fetch(c[:type]), vb)
-      end
-    else
-      row << nil
-    end
+    v, pos = decode_value(c[:type], buf, pos)
+    row << v
   end
   [row, pos]
 end
@@ -469,7 +509,7 @@ def expected_tables(fx)
     { name: t[:name],
       columns: t[:columns].map do |c|
         { name: c[:name], type: c[:type], pk: c[:pk], not_null: c[:not_null],
-          precision: c[:precision], scale: c[:scale] }
+          precision: c[:precision], scale: c[:scale], default: c[:default] }
       end,
       rows: table_entries(t).map { |_key, row| row } }
   end

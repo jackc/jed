@@ -37,6 +37,14 @@ id = "ddl.not_null"
 description = "NOT NULL column constraint — storing NULL (direct, defaulted, or omitted) traps 23502 (spec/design/constraints.md §1)"
 
 [[capability]]
+id = "ddl.column_default"
+description = "DEFAULT <literal> column constraint — evaluated + type-coerced once at CREATE TABLE (bad default traps 22003/42804 there), applied for an omitted column or the DEFAULT keyword (spec/design/constraints.md §2)"
+
+[[capability]]
+id = "dml.insert_column_list"
+description = "INSERT with an explicit column list `(a, c)` — unlisted columns take their default else NULL; the DEFAULT keyword in a value slot; unknown column 42703, duplicate 42701 (spec/design/grammar.md §12)"
+
+[[capability]]
 id = "dml.insert"
 description = "INSERT ... VALUES"
 
@@ -302,8 +310,10 @@ capabilities = [
 
 [[profile]]
 id = "constraints"
-title = "outer_joins + the NOT NULL / DEFAULT column constraints (spec/design/constraints.md)"
+title = "outer_joins + the NOT NULL / DEFAULT column constraints + INSERT column list (spec/design/constraints.md)"
 includes = "outer_joins"
 capabilities = [
   "ddl.not_null",
+  "ddl.column_default",
+  "dml.insert_column_list",
 ]

@@ -1,8 +1,9 @@
 //! The catalog: table and column definitions (CLAUDE.md §4 strict static types).
 
 use crate::types::{DecimalTypmod, ScalarType};
+use crate::value::Value;
 
-/// A column definition: name, declared type, nullability, primary-key flag.
+/// A column definition: name, declared type, nullability, primary-key flag, default.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Column {
     pub name: String,
@@ -14,6 +15,10 @@ pub struct Column {
     pub primary_key: bool,
     /// A PRIMARY KEY column is implicitly NOT NULL.
     pub not_null: bool,
+    /// The column's `DEFAULT` value, pre-evaluated and type-coerced at CREATE TABLE, or
+    /// `None` if it has no default. `Some(Value::Null)` is an explicit `DEFAULT NULL`. Applied
+    /// for an omitted column or a `DEFAULT` keyword at INSERT (spec/design/constraints.md §2).
+    pub default: Option<Value>,
 }
 
 /// A table definition.

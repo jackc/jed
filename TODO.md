@@ -352,9 +352,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         deferred. _(was: M; deps: INNER/CROSS slice)_
 - [ ] **Subqueries** — scalar, `IN (subquery)`, `EXISTS`, then correlated. _(size: L; deps: joins)_
 - [ ] **Set operations** — `UNION [ALL]`, `INTERSECT`, `EXCEPT`. _(size: M)_
-- [ ] **Constraints** — `NOT NULL`, `DEFAULT`, `UNIQUE`, `CHECK`, **composite `PRIMARY KEY`**
-      (key encoding already composes — types.md §7), `FOREIGN KEY`. NOT NULL/DEFAULT are
-      easy and could be pulled into Phase 2; UNIQUE/CHECK/FK are heavier. _(size: S→L each)_
+- [x] **`NOT NULL`** — explicit column constraint; storing NULL (direct, omitted, or applied
+      default) traps `23502`. PRIMARY KEY still implies it (spec/design/constraints.md §1).
+- [x] **`DEFAULT`** (literal) — `DEFAULT <literal>` column constraint, evaluated + coerced once
+      at CREATE TABLE; applied for an omitted column or the `DEFAULT` keyword; persisted via flags
+      bit2 + the value codec. Landed with the **`INSERT` column list** + the `DEFAULT` value
+      keyword (grammar.md §16, constraints.md §2). A general-expression default stays deferred.
+- [ ] **Constraints (remaining)** — `UNIQUE`, `CHECK`, **composite `PRIMARY KEY`** (key encoding
+      already composes — types.md §7), `FOREIGN KEY`. These are heavier. _(size: M→L each)_
 - [ ] **Secondary indexes** (`CREATE INDEX`) — also a planner + storage concern (index
       pages, index maintenance on write). _(size: L; deps: storage maturation)_
 - [ ] **`RETURNING`** clause; **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE)_
@@ -460,7 +465,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   most type work depends on the expression/operator substrate from Phase 1, and `decimal`
   (XL) shouldn't gate the SQL-shape features in Phase 2.
 - **Tensions to decide:**
-  - `NOT NULL` / `DEFAULT` are fundamental and easy — pull them into Phase 2?
+  - `NOT NULL` / `DEFAULT` are fundamental and easy — **done** (landed with the `INSERT` column
+    list + `DEFAULT` keyword; constraints.md). (Was: pull them into Phase 2?)
   - `JOIN`s are arguably core SQL — **done** for `INNER`/`CROSS` (Phase 4); outer joins +
     aggregates remain. (Was: promote `JOIN`s ahead of aggregates?)
   - Transactions (Phase 5) could move earlier if multi-statement atomicity is wanted

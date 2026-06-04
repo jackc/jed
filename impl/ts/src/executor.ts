@@ -11,6 +11,7 @@ import type {
   DropTable,
   Expr,
   Insert,
+  Literal,
   Select,
   SelectItems,
   Statement,
@@ -156,12 +157,21 @@ export class Database {
         }
         pkSeen = true;
       }
+      // Evaluate + type-coerce the DEFAULT literal once, here. A bad default fails at CREATE
+      // TABLE: out of range 22003, cross-family 42804, decimal over-precision 22003. NOT NULL
+      // is NOT enforced here (notNull=false), so a DEFAULT NULL on a NOT NULL column is accepted
+      // and traps 23502 only when applied (constraints.md §2).
+      const def_default =
+        def.default === null
+          ? null
+          : storeValue(literalToValue(def.default), ty, decimal, false, def.name);
       columns.push({
         name: def.name,
         type: ty,
         decimal,
         primaryKey: def.primaryKey,
         notNull: def.primaryKey || def.notNull, // PRIMARY KEY ⇒ NOT NULL
+        default: def_default,
       });
     }
 
@@ -185,12 +195,13 @@ export class Database {
     return { kind: "statement", cost: 0n };
   }
 
-  // executeInsert maps each row's literal values positionally to columns and type-checks
-  // them (NULL into NOT NULL traps 23502; an integer outside the column type's range traps
-  // 22003 — CLAUDE.md §8); a duplicate primary key traps 23505. A multi-row INSERT is
-  // two-phase / all-or-nothing (grammar.md §12), mirroring UPDATE: every row is validated —
-  // including its storage key checked against both the stored rows and earlier rows in the
-  // same statement — before any row is inserted, so a mid-batch failure stores nothing.
+  // executeInsert runs an INSERT of one or more rows. An optional column list names the target
+  // columns (unknown → 42703, duplicate → 42701); an unlisted column, or a DEFAULT keyword slot,
+  // takes the column's stored default else NULL. Each value is type-checked (NULL into NOT NULL
+  // traps 23502; an integer outside the column type's range traps 22003 — CLAUDE.md §8); a
+  // duplicate primary key traps 23505. A multi-row INSERT is two-phase / all-or-nothing
+  // (grammar.md §12, constraints.md §2), mirroring UPDATE: every row is validated — including its
+  // storage key — before any row is inserted, so a mid-batch failure stores nothing.
   private executeInsert(ins: Insert): Outcome {
     const table = this.table(ins.table);
     if (!table) {
@@ -199,27 +210,67 @@ export class Database {
     const store = this.stores.get(ins.table.toLowerCase())!;
     const pk = primaryKeyIndex(table);
 
+    // Resolve the optional column list once. provided[i] >= 0 means table column i takes that
+    // value position in each row; -1 means column i is omitted (its default, else NULL). With no
+    // list it is the identity over all columns. arity is how many values each row must carry.
+    const n = table.columns.length;
+    const provided: number[] = new Array(n);
+    let arity = n;
+    if (ins.columns !== null) {
+      provided.fill(-1);
+      for (let p = 0; p < ins.columns.length; p++) {
+        const name = ins.columns[p]!;
+        const idx = columnIndex(table, name);
+        if (idx < 0) {
+          throw engineError(
+            "undefined_column",
+            `column ${name} of relation ${table.name} does not exist`,
+          );
+        }
+        if (provided[idx]! >= 0) {
+          throw engineError(
+            "duplicate_column",
+            "column " + table.columns[idx]!.name + " specified more than once",
+          );
+        }
+        provided[idx] = p;
+      }
+      arity = ins.columns.length;
+    } else {
+      for (let i = 0; i < n; i++) provided[i] = i;
+    }
+
     // Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
     // table with a primary key, the encoded key is checked for a duplicate (within the
     // batch via seenKeys, and against the store) up front; for a table with none, key is
     // null and a fresh monotonic rowid is allocated in phase 2.
     const prepared: { key: Uint8Array | null; row: Row }[] = [];
     const seenKeys = new Set<string>();
-    for (const lits of ins.rows) {
-      if (lits.length !== table.columns.length) {
+    for (const values of ins.rows) {
+      if (values.length !== arity) {
+        const which = ins.columns !== null ? "target columns are" : "columns are";
         throw engineError(
           "syntax_error",
-          `INSERT row has ${lits.length} values but table ${table.name} has ${table.columns.length} columns`,
+          `INSERT row has ${values.length} values but ${arity} ${which} expected for table ${table.name}`,
         );
       }
 
-      const row: Row = new Array(table.columns.length);
-      for (let i = 0; i < table.columns.length; i++) {
+      // Build the row in declaration order: each column takes its provided value (a literal, or
+      // a DEFAULT keyword → the column default else NULL), or — when the column is omitted — its
+      // default else NULL. storeValue then type-coerces and enforces NOT NULL (23502) uniformly,
+      // so a NULL into a NOT NULL column traps here, before key encoding.
+      const row: Row = new Array(n);
+      for (let i = 0; i < n; i++) {
         const col = table.columns[i]!;
-        // The literal adapts/coerces to its target column: an integer literal into a decimal
-        // column widens (int→decimal, then to the typmod); a decimal literal into a decimal
-        // column rounds to its scale; a cross-family pair is 42804 (decimal.md §6, types.md §5).
-        row[i] = storeValue(literalToValue(lits[i]!), col.type, col.decimal, col.notNull, col.name);
+        const p = provided[i]!;
+        let candidate: Value;
+        if (p >= 0) {
+          const iv = values[p]!;
+          candidate = iv.kind === "default" ? col.default ?? nullValue() : literalToValue(iv.lit);
+        } else {
+          candidate = col.default ?? nullValue();
+        }
+        row[i] = storeValue(candidate, col.type, col.decimal, col.notNull, col.name);
       }
 
       let key: Uint8Array | null = null;
@@ -247,8 +298,8 @@ export class Database {
         throw new Error("pre-validated INSERT key must be unique");
       }
     }
-    // INSERT of literal rows reads no rows and evaluates no expression tree: zero cost
-    // (DEFAULT expressions, when added, will accrue here).
+    // INSERT reads no rows and evaluates no expression tree — its values are literals and
+    // pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves: zero cost.
     return { kind: "statement", cost: 0n };
   }
 
@@ -1133,7 +1184,7 @@ function coerceDecimal(d: Decimal, typmod: DecimalTypmod | null): Decimal {
 }
 
 // literalToValue wraps a parsed literal as a runtime value (type-check/coercion is storeValue).
-function literalToValue(lit: Insert["rows"][number][number]): Value {
+function literalToValue(lit: Literal): Value {
   switch (lit.kind) {
     case "null":
       return nullValue();

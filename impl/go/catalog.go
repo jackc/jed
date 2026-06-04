@@ -13,6 +13,10 @@ type Column struct {
 	PrimaryKey bool
 	// NotNull is implied true for a PRIMARY KEY column.
 	NotNull bool
+	// Default is the column's DEFAULT value, pre-evaluated and type-coerced at CREATE TABLE, or
+	// nil if it has no default. A non-nil pointer to a ValNull value is an explicit DEFAULT NULL.
+	// Applied for an omitted column or a DEFAULT keyword at INSERT (spec/design/constraints.md §2).
+	Default *Value
 }
 
 // Table is a table definition.

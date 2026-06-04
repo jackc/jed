@@ -196,12 +196,19 @@ function tableEntryBytes(table: Table, rootDataPage: number): Uint8Array {
     let flags = 0;
     if (col.primaryKey) flags |= 0b01;
     if (col.notNull) flags |= 0b10;
+    if (col.default !== null) flags |= 0b100;
     w.u8(flags);
     // A decimal column appends its typmod (precision, scale) — only for type_code 6, so
     // non-decimal entries are byte-unchanged (format.md). precision 0 = unconstrained numeric.
     if (col.type === "decimal") {
       w.u16(col.decimal ? col.decimal.precision : 0);
       w.u16(col.decimal ? col.decimal.scale : 0);
+    }
+    // A column with a DEFAULT (flags bit2) appends its pre-evaluated default value via the same
+    // value codec rows use — AFTER the typmod, presence-gated, so a column without a default is
+    // byte-unchanged (format.md). A DEFAULT NULL is one 0x01.
+    if (col.default !== null) {
+      w.bytes(encodeValue(col.type, col.default));
     }
   }
   w.u32(rootDataPage);
@@ -491,12 +498,16 @@ function decodeTableEntry(buf: Uint8Array, cur: Cursor): { table: Table; root: n
       const scale = readU16(buf, cur);
       if (precision !== 0) decimal = { precision, scale };
     }
+    // The default value follows the typmod, present iff flags bit2 (same value codec as rows).
+    // Absent → no bytes consumed (format.md).
+    const colDefault = (flags & 0b100) !== 0 ? readValue(ty, buf, cur) : null;
     columns.push({
       name: cname,
       type: ty,
       decimal,
       primaryKey: (flags & 0b01) !== 0,
       notNull: (flags & 0b10) !== 0,
+      default: colDefault,
     });
   }
   const root = readU32(buf, cur);

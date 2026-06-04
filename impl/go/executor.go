@@ -125,12 +125,25 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			}
 			pkSeen = true
 		}
+		// Evaluate + type-coerce the DEFAULT literal once, here. A bad default fails at CREATE
+		// TABLE: out of range 22003, cross-family 42804, decimal over-precision 22003. NOT NULL
+		// is NOT enforced here (notNull=false), so a DEFAULT NULL on a NOT NULL column is
+		// accepted and traps 23502 only when applied (constraints.md §2).
+		var defaultVal *Value
+		if def.Default != nil {
+			dv, err := storeValue(literalToValue(*def.Default), ty, decimal, false, def.Name)
+			if err != nil {
+				return Outcome{}, err
+			}
+			defaultVal = &dv
+		}
 		columns = append(columns, Column{
 			Name:       def.Name,
 			Type:       ty,
 			Decimal:    decimal,
 			PrimaryKey: def.PrimaryKey,
 			NotNull:    def.PrimaryKey || def.NotNull, // PRIMARY KEY ⇒ NOT NULL
+			Default:    defaultVal,
 		})
 	}
 
@@ -154,13 +167,13 @@ func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
-// executeInsert analyzes and runs an INSERT of one or more rows. Each row maps its
-// literal values positionally to columns and is type-checked (NULL into NOT NULL traps
-// 23502; an integer outside the column type's range traps 22003 — CLAUDE.md §8); a
-// duplicate primary key traps 23505. A multi-row INSERT is two-phase / all-or-nothing
-// (spec/design/grammar.md §12), mirroring UPDATE: every row is validated — including its
-// storage key checked against both the stored rows and earlier rows in the same statement
-// — before any row is inserted, so a mid-batch failure stores nothing.
+// executeInsert analyzes and runs an INSERT of one or more rows. An optional column list names
+// the target columns (unknown → 42703, duplicate → 42701); an unlisted column, or a DEFAULT
+// keyword slot, takes the column's stored default else NULL. Each value is type-checked (NULL
+// into NOT NULL traps 23502; an integer outside the column type's range traps 22003 — CLAUDE.md
+// §8); a duplicate primary key traps 23505. A multi-row INSERT is two-phase / all-or-nothing
+// (spec/design/grammar.md §12, constraints.md §2), mirroring UPDATE: every row is validated —
+// including its storage key — before any row is inserted, so a mid-batch failure stores nothing.
 func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 	table, ok := db.Table(ins.Table)
 	if !ok {
@@ -168,6 +181,36 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 	}
 	store := db.stores[strings.ToLower(ins.Table)]
 	pk := table.PrimaryKeyIndex()
+
+	// Resolve the optional column list once. provided[i] >= 0 means table column i takes that
+	// value position in each row; -1 means column i is omitted (its default, else NULL). With no
+	// list it is the identity over all columns. arity is how many values each row must carry.
+	n := len(table.Columns)
+	provided := make([]int, n)
+	arity := n
+	if ins.Columns != nil {
+		for i := range provided {
+			provided[i] = -1
+		}
+		for p, name := range ins.Columns {
+			idx := table.ColumnIndex(name)
+			if idx < 0 {
+				return Outcome{}, NewError(UndefinedColumn, fmt.Sprintf(
+					"column %s of relation %s does not exist", name, table.Name,
+				))
+			}
+			if provided[idx] >= 0 {
+				return Outcome{}, NewError(DuplicateColumn,
+					"column "+table.Columns[idx].Name+" specified more than once")
+			}
+			provided[idx] = p
+		}
+		arity = len(ins.Columns)
+	} else {
+		for i := range provided {
+			provided[i] = i
+		}
+	}
 
 	// Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
 	// table with a primary key, the encoded key is checked for a duplicate (within the
@@ -179,21 +222,35 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 	}
 	prepared := make([]preparedRow, 0, len(ins.Rows))
 	seenKeys := make(map[string]struct{})
-	for _, lits := range ins.Rows {
-		if len(lits) != len(table.Columns) {
+	for _, values := range ins.Rows {
+		if len(values) != arity {
+			expected := "columns are"
+			if ins.Columns != nil {
+				expected = "target columns are"
+			}
 			return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
-				"INSERT row has %d values but table %s has %d columns",
-				len(lits), table.Name, len(table.Columns),
+				"INSERT row has %d values but %d %s expected for table %s",
+				len(values), arity, expected, table.Name,
 			))
 		}
 
-		row := make(Row, len(table.Columns))
+		// Build the row in declaration order: each column takes its provided value (a literal,
+		// or a DEFAULT keyword → the column default else NULL), or — when the column is omitted
+		// — its default else NULL. storeValue then type-coerces and enforces NOT NULL (23502)
+		// uniformly, so a NULL into a NOT NULL column traps here, before key encoding.
+		row := make(Row, n)
 		for i, col := range table.Columns {
-			// The literal adapts/coerces to its target column: an integer literal into a
-			// decimal column widens (int→decimal, then to the typmod); a decimal literal into a
-			// decimal column rounds to its scale; a cross-family pair is 42804
-			// (spec/design/decimal.md §6, types.md §5).
-			v, err := storeValue(literalToValue(lits[i]), col.Type, col.Decimal, col.NotNull, col.Name)
+			var candidate Value
+			if p := provided[i]; p >= 0 {
+				if iv := values[p]; iv.IsDefault {
+					candidate = defaultOrNull(col)
+				} else {
+					candidate = literalToValue(iv.Lit)
+				}
+			} else {
+				candidate = defaultOrNull(col)
+			}
+			v, err := storeValue(candidate, col.Type, col.Decimal, col.NotNull, col.Name)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -228,9 +285,18 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 			panic("pre-validated INSERT key must be unique")
 		}
 	}
-	// INSERT of literal rows reads no rows and evaluates no expression tree: zero cost
-	// (DEFAULT expressions, when added, will accrue here).
+	// INSERT reads no rows and evaluates no expression tree — its values are literals and
+	// pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves: zero cost.
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// defaultOrNull is the column's stored default value, or a NULL value when it has none —
+// the candidate for an omitted column or a DEFAULT keyword slot (constraints.md §2).
+func defaultOrNull(col Column) Value {
+	if col.Default != nil {
+		return *col.Default
+	}
+	return NullValue()
 }
 
 // executeDelete analyzes and runs a DELETE: resolve the table and optional predicate,

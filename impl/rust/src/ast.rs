@@ -41,6 +41,10 @@ pub struct ColumnDef {
     /// An explicit `NOT NULL` column constraint. A PRIMARY KEY column is implicitly NOT NULL
     /// regardless of this flag; the executor ORs the two (spec/design/constraints.md).
     pub not_null: bool,
+    /// An optional `DEFAULT <literal>` — the value for this column when a row omits it (or
+    /// uses the `DEFAULT` keyword). Literal-only this slice; evaluated + type-coerced once at
+    /// CREATE TABLE (spec/design/constraints.md §2).
+    pub default: Option<Literal>,
 }
 
 /// A parsed type modifier: a precision and an optional scale, as written
@@ -52,15 +56,29 @@ pub struct TypeMod {
     pub scale: Option<u64>,
 }
 
-/// `INSERT INTO <table> VALUES (..)[, (..)]*`. One or more rows of literal values,
-/// each in column order. A multi-row INSERT is two-phase / all-or-nothing — every
-/// row is validated before any is stored (spec/design/grammar.md §12).
+/// `INSERT INTO <table> [(col, ..)] VALUES (..)[, (..)]*`. One or more rows of values,
+/// each value either a literal or the `DEFAULT` keyword. A multi-row INSERT is two-phase /
+/// all-or-nothing — every row is validated before any is stored (spec/design/grammar.md §12).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Insert {
     pub table: String,
-    /// The rows to insert, in statement order; each inner vec is one row's literal
-    /// values in column order. Always non-empty (the parser requires ≥1 row).
-    pub rows: Vec<Vec<Literal>>,
+    /// An optional explicit column list (`INSERT INTO t (a, c) VALUES ...`). `None` is the
+    /// positional form — every column, in declaration order. Names resolve at execution time
+    /// (unknown → 42703, duplicate → 42701); an unlisted column takes its default else NULL
+    /// (spec/design/constraints.md §2).
+    pub columns: Option<Vec<String>>,
+    /// The rows to insert, in statement order; each inner vec is one row's values in the
+    /// order of `columns` (or column order when `columns` is `None`). Always non-empty.
+    pub rows: Vec<Vec<InsertValue>>,
+}
+
+/// One value slot in an INSERT `VALUES` row: a literal, or the `DEFAULT` keyword — which
+/// substitutes the target column's declared default (or NULL if it has none). The `DEFAULT`
+/// keyword is not reserved (spec/design/grammar.md §3). See spec/design/constraints.md §2.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InsertValue {
+    Lit(Literal),
+    Default,
 }
 
 /// `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each assignment's

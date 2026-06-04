@@ -124,6 +124,26 @@ fn bytea_table_db() -> Database {
     db
 }
 
+/// A table exercising the DEFAULT column constraint on disk — the catalog flags bit2 + the
+/// pre-evaluated default value (written after the typmod). Covers an int default, a text
+/// default, a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to
+/// numeric(6,2), and a plain no-default column. Row 1 takes every default; row 2 provides all.
+fn default_table_db() -> Database {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, n int32 DEFAULT 0, note text DEFAULT 'none', \
+         maybe int32 DEFAULT NULL, req int32 NOT NULL DEFAULT 7, amt numeric(6,2) DEFAULT 1.5, \
+         plain int16)",
+    );
+    run(&mut db, "INSERT INTO t (id) VALUES (1)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (2, 42, 'hi', 5, 9, 2.00, 100)",
+    );
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -135,6 +155,7 @@ fn write_matches_goldens() {
         ("bool_table.jed", bool_table_db),
         ("decimal_table.jed", decimal_table_db),
         ("bytea_table.jed", bytea_table_db),
+        ("default_table.jed", default_table_db),
         ("nopk_table.jed", nopk_table_db),
     ];
     for (name, build) in cases {
@@ -154,6 +175,7 @@ fn read_goldens_reproduces_rows() {
         ("bool_table.jed", bool_table_db, "t"),
         ("decimal_table.jed", decimal_table_db, "t"),
         ("bytea_table.jed", bytea_table_db, "t"),
+        ("default_table.jed", default_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),
@@ -196,6 +218,25 @@ fn read_golden_reconstructs_catalog() {
     // A NULL value round-trips (id 3's v).
     let rows = loaded.rows_in_key_order("t").unwrap();
     assert_eq!(rows[2], vec![Value::Int(3), Value::Null]);
+}
+
+/// A column DEFAULT survives serialize→load: after loading the golden, a fresh INSERT that
+/// omits the defaulted columns applies the *persisted* defaults — proving the default value
+/// (not just its byte length) round-trips through the catalog (constraints.md §2).
+#[test]
+fn default_survives_load() {
+    let mut loaded = Database::from_image(&fixture("default_table.jed")).unwrap();
+    run(&mut loaded, "INSERT INTO t (id) VALUES (3)");
+    let rows = loaded.rows_in_key_order("t").unwrap();
+    let last = rows.last().expect("a row");
+    // id=3 (last in key order) takes every persisted default: n=0, note='none', maybe=NULL,
+    // req=7, plain=NULL (and amt=1.50, not asserted here).
+    assert_eq!(last[0], Value::Int(3));
+    assert_eq!(last[1], Value::Int(0));
+    assert_eq!(last[2], Value::Text("none".to_string()));
+    assert_eq!(last[3], Value::Null);
+    assert_eq!(last[4], Value::Int(7));
+    assert_eq!(last[6], Value::Null);
 }
 
 /// A no-PK table's monotonic rowid counter must be reconstructed on load, so inserts

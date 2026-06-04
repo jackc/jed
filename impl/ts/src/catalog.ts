@@ -2,8 +2,9 @@
 // functions) to match the boring/explicit style (CLAUDE.md §10).
 
 import type { DecimalTypmod, ScalarType } from "./types.ts";
+import type { Value } from "./value.ts";
 
-// Column is a column definition: name, declared type, nullability, primary-key flag.
+// Column is a column definition: name, declared type, nullability, primary-key flag, default.
 // notNull is implied true for a PRIMARY KEY column.
 export type Column = {
   name: string;
@@ -14,6 +15,10 @@ export type Column = {
   decimal: DecimalTypmod | null;
   primaryKey: boolean;
   notNull: boolean;
+  // The column's DEFAULT value, pre-evaluated and type-coerced at CREATE TABLE, or null if it
+  // has no default. A `{ kind: "null" }` value is an explicit DEFAULT NULL. Applied for an
+  // omitted column or a DEFAULT keyword at INSERT (spec/design/constraints.md §2).
+  default: Value | null;
 };
 
 // Table is a table definition.

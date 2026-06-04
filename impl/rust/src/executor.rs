@@ -5,8 +5,8 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    BinaryOp, CreateTable, Delete, DropTable, Expr, Insert, JoinKind, Literal, Select, SelectItems,
-    Statement, TypeMod, UnaryOp, Update,
+    BinaryOp, CreateTable, Delete, DropTable, Expr, Insert, InsertValue, JoinKind, Literal, Select,
+    SelectItems, Statement, TypeMod, UnaryOp, Update,
 };
 use crate::catalog::{Column, Table};
 use crate::cost::Meter;
@@ -163,12 +163,27 @@ impl Database {
                 }
                 pk_seen = true;
             }
+            // Evaluate + type-coerce the DEFAULT literal once, here. A bad default fails at
+            // CREATE TABLE: out of range 22003, cross-family 42804, decimal over-precision
+            // 22003. NOT NULL is NOT enforced here (not_null=false), so a `DEFAULT NULL` on a
+            // NOT NULL column is accepted and traps 23502 only when applied (constraints.md §2).
+            let default = match &def.default {
+                Some(lit) => Some(store_value(
+                    literal_to_value(lit),
+                    ty,
+                    decimal,
+                    false,
+                    &def.name,
+                )?),
+                None => None,
+            };
             columns.push(Column {
                 name: def.name.clone(),
                 ty,
                 decimal,
                 primary_key: def.primary_key,
                 not_null: def.primary_key || def.not_null, // PRIMARY KEY ⇒ NOT NULL
+                default,
             });
         }
 
@@ -198,13 +213,14 @@ impl Database {
         Ok(Outcome::Statement { cost: 0 })
     }
 
-    /// Analyze and run an INSERT of one or more rows. Each row maps its literal values
-    /// positionally to columns and is type-checked (NULL into NOT NULL traps 23502; an
-    /// integer outside the column type's range traps 22003 — CLAUDE.md §8); a duplicate
-    /// primary key traps 23505. A multi-row INSERT is **two-phase / all-or-nothing**
-    /// (spec/design/grammar.md §12), mirroring UPDATE: every row is validated — including
-    /// its storage key checked against both the stored rows and earlier rows in the same
-    /// statement — before any row is inserted, so a mid-batch failure stores nothing.
+    /// Analyze and run an INSERT of one or more rows. An optional column list names the target
+    /// columns (unknown → 42703, duplicate → 42701); an unlisted column, or a `DEFAULT` keyword
+    /// slot, takes the column's stored default, else NULL. Each value is type-checked (NULL into
+    /// NOT NULL traps 23502; an integer outside the column type's range traps 22003 — CLAUDE.md
+    /// §8); a duplicate primary key traps 23505. A multi-row INSERT is **two-phase /
+    /// all-or-nothing** (spec/design/grammar.md §12, constraints.md §2), mirroring UPDATE: every
+    /// row is validated — including its storage key — before any row is inserted, so a mid-batch
+    /// failure stores nothing.
     fn execute_insert(&mut self, ins: Insert) -> Result<Outcome> {
         let table = self.table(&ins.table).ok_or_else(|| {
             EngineError::new(
@@ -219,34 +235,82 @@ impl Database {
         let columns: Vec<Column> = table.columns.clone();
         let pk = table.primary_key_index().map(|i| (i, table.columns[i].ty));
 
+        // Resolve the optional column list once. `provided[i] = Some(p)` means table column i
+        // takes value position `p` in each row; `None` means column i is omitted (its default,
+        // else NULL). With no list it is the identity over all columns. `arity` is how many
+        // values each row must carry.
+        let n = columns.len();
+        let (provided, arity): (Vec<Option<usize>>, usize) = match &ins.columns {
+            Some(names) => {
+                let mut provided = vec![None; n];
+                for (p, name) in names.iter().enumerate() {
+                    let idx = columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| {
+                            EngineError::new(
+                                SqlState::UndefinedColumn,
+                                format!("column {name} of relation {table_name} does not exist"),
+                            )
+                        })?;
+                    if provided[idx].is_some() {
+                        return Err(EngineError::new(
+                            SqlState::DuplicateColumn,
+                            format!("column {} specified more than once", columns[idx].name),
+                        ));
+                    }
+                    provided[idx] = Some(p);
+                }
+                (provided, names.len())
+            }
+            None => ((0..n).map(Some).collect(), n),
+        };
+
         // Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
         // table with a primary key, `key` is Some(encoded) and is checked for a duplicate
         // (within the batch via `seen_keys`, and against the store) up front; for a table
         // with none it is None and a fresh monotonic rowid is allocated in phase 2.
         let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(ins.rows.len());
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
-        for lits in &ins.rows {
-            if lits.len() != columns.len() {
+        for values in &ins.rows {
+            if values.len() != arity {
                 return Err(EngineError::new(
                     SqlState::SyntaxError,
                     format!(
-                        "INSERT row has {} values but table {} has {} columns",
-                        lits.len(),
+                        "INSERT row has {} values but {} {} expected for table {}",
+                        values.len(),
+                        arity,
+                        if ins.columns.is_some() {
+                            "target columns are"
+                        } else {
+                            "columns are"
+                        },
                         table_name,
-                        columns.len()
                     ),
                 ));
             }
 
-            let mut row = Vec::with_capacity(columns.len());
-            for (col, lit) in columns.iter().zip(lits) {
-                // The literal adapts/coerces to its target column: an integer literal into a
-                // decimal column widens (int→decimal, then to the typmod); a decimal literal
-                // into a decimal column rounds to its scale; a cross-family pair is 42804
-                // (spec/design/decimal.md §6, types.md §5).
-                let raw = literal_to_value(lit);
-                let value = store_value(raw, col.ty, col.decimal, col.not_null, &col.name)?;
-                row.push(value);
+            // Build the row in declaration order: each column takes its provided value (a
+            // literal, or a `DEFAULT` keyword → the column default else NULL), or — when the
+            // column is omitted — its default else NULL. `store_value` then type-coerces and
+            // enforces NOT NULL (23502) uniformly, so a NULL into a NOT NULL column (omitted
+            // with no default, or DEFAULT NULL) traps here, before key encoding.
+            let mut row = Vec::with_capacity(n);
+            for (i, col) in columns.iter().enumerate() {
+                let candidate = match provided[i] {
+                    Some(p) => match &values[p] {
+                        InsertValue::Lit(lit) => literal_to_value(lit),
+                        InsertValue::Default => col.default.clone().unwrap_or(Value::Null),
+                    },
+                    None => col.default.clone().unwrap_or(Value::Null),
+                };
+                row.push(store_value(
+                    candidate,
+                    col.ty,
+                    col.decimal,
+                    col.not_null,
+                    &col.name,
+                )?);
             }
 
             let key = match pk {
@@ -290,8 +354,8 @@ impl Database {
                 "pre-validated INSERT key must be unique"
             );
         }
-        // INSERT of literal rows reads no rows and evaluates no expression tree: zero
-        // cost (DEFAULT expressions, when added, will accrue here).
+        // INSERT reads no rows and evaluates no expression tree — its values are literals and
+        // pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves: zero cost.
         Ok(Outcome::Statement { cost: 0 })
     }
 
