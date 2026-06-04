@@ -20,8 +20,18 @@ ROOT_PAGE = 2
 TXID = 1
 
 WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8 }.freeze
-TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6, "bytea" => 7 }.freeze
+TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6, "bytea" => 7, "uuid" => 8 }.freeze
 CODETYPE = TYPECODE.invert.freeze
+
+# uuid-raw16 (encoding.md §2.7): the 16 raw bytes of the canonical 8-4-4-4-12 form. Used both
+# as the value-codec body (fixed 16 bytes, no length prefix) and as the PRIMARY-KEY bytes
+# (uuid is the first non-integer key — no sign-flip, escape, or terminator).
+def uuid_to_bytes(s) = [s.delete("-")].pack("H*")
+
+def uuid_from_bytes(bytes)
+  h = bytes.unpack1("H*")
+  "#{h[0, 8]}-#{h[8, 4]}-#{h[12, 4]}-#{h[16, 4]}-#{h[20, 12]}"
+end
 
 # --- declarative fixtures (mirror what the cores build via SQL) --------------
 
@@ -87,6 +97,20 @@ BYTEA_TABLE = {
          [4, "\xFF".b], [5, nil], [6, "\x00".b]]
 }.freeze
 
+# A table with a uuid PRIMARY KEY (the first golden with a NON-integer stored key — the
+# load-bearing §8 cross-core key-path proof) plus a nullable uuid column. Exercises the value
+# codec's fixed-16-byte uuid branch (no length prefix), the uuid key encoding (bare 16 bytes,
+# uuid-raw16), a present and a NULL uuid value, and the nil/max boundary UUIDs. Rows are written
+# in key (byte) order. The cores build this via `CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)`.
+UUID_TABLE = {
+  name: "t",
+  columns: [col("id", "uuid", pk: true), col("ref", "uuid")],
+  rows: [["00000000-0000-0000-0000-000000000000", "550e8400-e29b-41d4-a716-446655440000"],
+         ["550e8400-e29b-41d4-a716-446655440000", nil],
+         ["f47ac10b-58cc-4372-a567-0e02b2c3d479", "00000000-0000-0000-0000-000000000000"],
+         ["ffffffff-ffff-ffff-ffff-ffffffffffff", "ffffffff-ffff-ffff-ffff-ffffffffffff"]]
+}.freeze
+
 # A table exercising the DEFAULT column constraint on disk (format.md): the catalog flags bit2
 # + the column's pre-evaluated default value via the value codec, written AFTER the decimal
 # typmod. Covers an int default, a text default, a DEFAULT NULL (the lone 0x01 tag), a NOT NULL
@@ -118,6 +142,7 @@ FIXTURES = [
   { file: "bool_table.jed",      page_size: 256, tables: [BOOL_TABLE] },
   { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
+  { file: "uuid_table.jed",      page_size: 256, tables: [UUID_TABLE] },
   { file: "default_table.jed",   page_size: 256, tables: [DEFAULT_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
@@ -173,6 +198,8 @@ def encode_value(type, v)
     "\x00".b + (v ? "\x01".b : "\x00".b)
   when "decimal"
     "\x00".b + encode_decimal(v)
+  when "uuid"
+    "\x00".b + uuid_to_bytes(v) # fixed 16 bytes, NO length prefix
   else
     "\x00".b + encode_int(WIDTH.fetch(type), v)
   end
@@ -245,7 +272,14 @@ def table_entries(table)
   pk_idx = table[:columns].index { |c| c[:pk] }
   pairs = table[:rows].each_with_index.map do |row, i|
     key = if pk_idx
-            encode_int(WIDTH.fetch(table[:columns][pk_idx][:type]), row[pk_idx])
+            pk_type = table[:columns][pk_idx][:type]
+            # uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16),
+            # not the sign-flipped int encoding. A PK is NOT NULL, so no presence tag.
+            if pk_type == "uuid"
+              uuid_to_bytes(row[pk_idx])
+            else
+              encode_int(WIDTH.fetch(pk_type), row[pk_idx])
+            end
           else
             encode_int(8, i)
           end
@@ -453,6 +487,9 @@ def decode_value(type, buf, pos)
     len, pos = take(buf, pos, 2)
     bb, pos = take(buf, pos, len.unpack1("n"))
     [bb.dup.force_encoding("ASCII-8BIT"), pos] # raw bytes, no UTF-8 assertion
+  when "uuid"
+    ub, pos = take(buf, pos, 16) # fixed 16 bytes, no length prefix
+    [uuid_from_bytes(ub), pos]
   else
     vb, pos = take(buf, pos, WIDTH.fetch(type))
     [decode_int(WIDTH.fetch(type), vb), pos]

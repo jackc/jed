@@ -107,6 +107,25 @@ function byteaTableDB(): Database {
   return db;
 }
 
+// uuidTableDB has a uuid PRIMARY KEY (the first golden with a NON-integer stored key — the
+// load-bearing §8 cross-core key-path proof) plus a nullable uuid column. Exercises the value
+// codec's fixed-16-byte uuid branch (no length prefix), the uuid key encoding (bare 16 bytes),
+// a present and a NULL uuid value, and the nil/max boundary UUIDs. Must match the Ruby
+// reference's UUID_TABLE (spec/fileformat/verify.rb).
+function uuidTableDB(): Database {
+  const db = new Database();
+  run(db, "CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)");
+  run(
+    db,
+    "INSERT INTO t VALUES " +
+      "('00000000-0000-0000-0000-000000000000', '550e8400-e29b-41d4-a716-446655440000'), " +
+      "('550e8400-e29b-41d4-a716-446655440000', NULL), " +
+      "('f47ac10b-58cc-4372-a567-0e02b2c3d479', '00000000-0000-0000-0000-000000000000'), " +
+      "('ffffffff-ffff-ffff-ffff-ffffffffffff', 'ffffffff-ffff-ffff-ffff-ffffffffffff')",
+  );
+  return db;
+}
+
 // defaultTableDB exercises the DEFAULT column constraint on disk — the catalog flags bit2 + the
 // pre-evaluated default value (written after the typmod). Covers an int default, a text default,
 // a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to numeric(6,2),
@@ -133,6 +152,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "bool_table.jed", build: boolTableDB },
     { name: "decimal_table.jed", build: decimalTableDB },
     { name: "bytea_table.jed", build: byteaTableDB },
+    { name: "uuid_table.jed", build: uuidTableDB },
     { name: "default_table.jed", build: defaultTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
   ];
@@ -156,6 +176,7 @@ test("read goldens reproduces rows", () => {
     { name: "bool_table.jed", build: boolTableDB, table: "t" },
     { name: "decimal_table.jed", build: decimalTableDB, table: "t" },
     { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
+    { name: "uuid_table.jed", build: uuidTableDB, table: "t" },
     { name: "default_table.jed", build: defaultTableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },

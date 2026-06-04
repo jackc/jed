@@ -181,6 +181,10 @@ id = "types.bytea"
 description = "bytea scalar type (variable-width raw bytes): storage, hex-input literals, and unsigned-byte comparison/ordering. Non-key column only this slice — a bytea PRIMARY KEY is rejected 0A000 (spec/design/types.md §13)"
 
 [[capability]]
+id = "types.uuid"
+description = "uuid scalar type (fixed 16-byte RFC 4122 value): storage, PostgreSQL-flexible input literals (braces/hyphens-anywhere/32-hex, any case; canonical 8-4-4-4-12 lowercase output), and unsigned-byte comparison/ordering. uuid is the FIRST non-integer type usable as a PRIMARY KEY — its uuid-raw16 key encoding is exercised (spec/design/types.md §14, encoding.md §2.7)"
+
+[[capability]]
 id = "null.three_valued"
 description = "Three-valued NULL logic in comparisons (CLAUDE.md §4)"
 

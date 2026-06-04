@@ -16,8 +16,17 @@ import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database } from "./executor.ts";
 import type { Row } from "./storage.ts";
-import { type DecimalTypmod, type ScalarType, isBool, isBytea, isText, widthBytes } from "./types.ts";
-import { type Value, boolValue, byteaValue, decimalValue, intValue, nullValue, textValue } from "./value.ts";
+import { type DecimalTypmod, type ScalarType, isBool, isBytea, isText, isUuid, widthBytes } from "./types.ts";
+import {
+  type Value,
+  boolValue,
+  byteaValue,
+  decimalValue,
+  intValue,
+  nullValue,
+  textValue,
+  uuidValue,
+} from "./value.ts";
 
 const FORMAT_VERSION = 1; // on-disk format version
 const PAGE_HEADER = 12; // bytes of the catalog/data page header
@@ -46,6 +55,8 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 6;
     case "bytea":
       return 7;
+    case "uuid":
+      return 8;
   }
 }
 
@@ -66,6 +77,8 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "decimal";
     case 7:
       return "bytea";
+    case 8:
+      return "uuid";
     default:
       return undefined;
   }
@@ -112,6 +125,14 @@ function encodeValue(ty: ScalarType, v: Value): Uint8Array {
     out[1] = (v.bytes.length >>> 8) & 0xff;
     out[2] = v.bytes.length & 0xff;
     out.set(v.bytes, 3);
+    return out;
+  }
+  if (v.kind === "uuid") {
+    // Fixed 16-byte body, NO length prefix (the first fixed-width non-integer value) —
+    // spec/fileformat/format.md.
+    const out = new Uint8Array(1 + 16);
+    out[0] = 0x00; // present
+    out.set(v.bytes, 1);
     return out;
   }
   if (v.kind === "bool") {
@@ -556,6 +577,11 @@ function readValue(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
       const n = readU16(buf, cur);
       // .slice() copies out of the page buffer so the value owns its bytes (no UTF-8 check).
       return byteaValue(take(buf, cur, n).slice());
+    }
+    if (isUuid(ty)) {
+      // Fixed 16 raw bytes, no length prefix. Must branch before the integer path —
+      // decodeInt would sign-flip and widthBytes is 16 there too. .slice() copies out.
+      return uuidValue(take(buf, cur, 16).slice());
     }
     return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
   }

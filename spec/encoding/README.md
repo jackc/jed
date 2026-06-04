@@ -34,5 +34,8 @@ model (NULL is the largest value), ratifying the NULL sort-position decision tha
 [../types/compare.toml](../types/compare.toml) deferred to this step
 (`null_ordering = "nulls-last-ascending"` — see [../design/encoding.md §4](../design/encoding.md)).
 
-> Status: rule defined and fixtures authored + verified (30 vectors). Composite-key and
-> non-integer (decimal/text/bytea) vectors follow when those features land.
+> Status: rule defined and fixtures authored + verified. The first NON-integer key vectors —
+> `uuid` (method `uuid-raw16`: fixed 16 raw bytes, no sign-flip/escape/terminator;
+> [../design/encoding.md §2.7](../design/encoding.md)) — are now present and **exercised**
+> (uuid is the first non-integer type usable as a `PRIMARY KEY`). The remaining non-integer
+> key vectors (decimal/text/bytea) and composite keys follow when those features exercise keys.

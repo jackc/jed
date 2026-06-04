@@ -16,7 +16,7 @@ use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
 use crate::storage::{Row, TableStore};
 use crate::types::{DecimalTypmod, ScalarType};
-use crate::value::{Value, and3, from3, not3, or3, parse_bytea_hex};
+use crate::value::{Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid};
 use std::collections::{HashMap, HashSet};
 
 /// The outcome of executing one statement. Both variants carry the deterministic
@@ -136,23 +136,16 @@ impl Database {
             }
             let (ty, decimal) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
             if def.primary_key {
-                // Only integers may be a key this slice. The order-preserving text and decimal
-                // key encodings (spec/design/encoding.md §2.4/§2.5) are authored but
-                // unexercised, so a text or decimal PRIMARY KEY is a documented 0A000 narrowing
-                // (spec/design/types.md §11/§12).
-                if !ty.is_integer() {
+                // Integers and uuid may be a key. uuid is the FIRST non-integer key type — its
+                // fixed `uuid-raw16` encoding (spec/design/encoding.md §2.7) is exercised. The
+                // other non-integer types' order-preserving key encodings (text §2.4, decimal
+                // §2.5, bytea §2.6, boolean's bool-byte) are authored but unexercised, so a
+                // text/decimal/bytea/boolean PRIMARY KEY is a documented 0A000 narrowing
+                // (spec/design/types.md §9/§11/§12/§13), relaxable in a later in-key slice.
+                if !ty.is_integer() && !ty.is_uuid() {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         format!("a {} primary key is not supported yet", ty.canonical_name()),
-                    ));
-                }
-                // Likewise boolean: the bool-byte key encoding rule is authored but
-                // unexercised, so a boolean PRIMARY KEY is a documented 0A000 narrowing
-                // (spec/design/types.md §9), relaxable in a later boolean-in-key slice.
-                if ty.is_bool() {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "a boolean primary key is not supported yet",
                     ));
                 }
                 if pk_seen {
@@ -317,6 +310,9 @@ impl Database {
                 Some((i, pk_ty)) => {
                     let k = match &row[i] {
                         Value::Int(n) => encode_int(pk_ty, *n),
+                        // uuid is the first non-integer key: its key is the bare 16 bytes
+                        // (uuid-raw16, encoding.md §2.7) — a PK is NOT NULL, so no presence tag.
+                        Value::Uuid(u) => u.to_vec(),
                         // Unreachable: a PK column is NOT NULL, enforced above.
                         Value::Null => unreachable!("primary key column is NOT NULL"),
                         // Unreachable: a boolean PRIMARY KEY is rejected at CREATE TABLE (0A000).
@@ -324,9 +320,11 @@ impl Database {
                             unreachable!("a boolean primary key is rejected at CREATE TABLE")
                         }
                         // Unreachable: a text/decimal/bytea PRIMARY KEY is rejected at CREATE
-                        // TABLE (0A000) — non-integer PKs are caught by `!is_integer()`.
+                        // TABLE (0A000) — those non-integer PKs are caught by the CREATE gate.
                         Value::Text(_) | Value::Decimal(_) | Value::Bytea(_) => {
-                            unreachable!("a non-integer primary key is rejected at CREATE TABLE")
+                            unreachable!(
+                                "a text/decimal/bytea primary key is rejected at CREATE TABLE"
+                            )
                         }
                     };
                     if seen_keys.contains(&k) || self.store(&ins.table).get(&k).is_some() {
@@ -1038,6 +1036,8 @@ enum ResolvedType {
     Decimal,
     /// The bytea family (raw bytes); does not promote.
     Bytea,
+    /// The uuid family (fixed 16 bytes); does not promote. The first non-integer key type.
+    Uuid,
     Null,
 }
 
@@ -1069,6 +1069,7 @@ enum RExpr {
     ConstText(String),
     ConstDecimal(Decimal),
     ConstBytea(Vec<u8>),
+    ConstUuid([u8; 16]),
     ConstNull,
     Cast {
         inner: Box<RExpr>,
@@ -1328,9 +1329,7 @@ fn expr_has_funccall(e: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             expr_has_funccall(lhs) || expr_has_funccall(rhs)
         }
-        Expr::In { lhs, list, .. } => {
-            expr_has_funccall(lhs) || list.iter().any(expr_has_funccall)
-        }
+        Expr::In { lhs, list, .. } => expr_has_funccall(lhs) || list.iter().any(expr_has_funccall),
         Expr::Between { lhs, lo, hi, .. } => {
             expr_has_funccall(lhs) || expr_has_funccall(lo) || expr_has_funccall(hi)
         }
@@ -1569,9 +1568,11 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr) -> Result<RExpr> {
     let (node, ty) = resolve(scope, e, None, &mut agg)?;
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(node),
-        ResolvedType::Int(_) | ResolvedType::Text | ResolvedType::Decimal | ResolvedType::Bytea => {
-            Err(type_error("argument of WHERE must be boolean"))
-        }
+        ResolvedType::Int(_)
+        | ResolvedType::Text
+        | ResolvedType::Decimal
+        | ResolvedType::Bytea
+        | ResolvedType::Uuid => Err(type_error("argument of WHERE must be boolean")),
     }
 }
 
@@ -1585,6 +1586,8 @@ fn resolved_type_of(ty: ScalarType) -> ResolvedType {
         ResolvedType::Decimal
     } else if ty.is_bytea() {
         ResolvedType::Bytea
+    } else if ty.is_uuid() {
+        ResolvedType::Uuid
     } else {
         ResolvedType::Int(ty)
     }
@@ -1633,13 +1636,19 @@ fn resolve(
             Ok((RExpr::ConstInt(*n), ResolvedType::Int(ty)))
         }
         Expr::Literal(Literal::Text(s)) => {
-            // A string literal is text by default (collation `C`). It adapts to a BYTEA
-            // context only (types.md §6/§13): decode the hex input form there (22P02 on
-            // malformed hex). Any other context — including none — keeps it text.
+            // A string literal is text by default (collation `C`). It adapts to a BYTEA or a
+            // UUID context (types.md §6/§13/§14): decode the hex input form (bytea) or the
+            // PG-flexible uuid input (uuid) there — 22P02 on malformed input. Any other
+            // context — including none — keeps it text.
             if matches!(ctx, Some(t) if t.is_bytea()) {
                 Ok((
                     RExpr::ConstBytea(decode_bytea_literal(s)?),
                     ResolvedType::Bytea,
+                ))
+            } else if matches!(ctx, Some(t) if t.is_uuid()) {
+                Ok((
+                    RExpr::ConstUuid(decode_uuid_literal(s)?),
+                    ResolvedType::Uuid,
                 ))
             } else {
                 Ok((RExpr::ConstText(s.clone()), ResolvedType::Text))
@@ -1682,6 +1691,13 @@ fn resolve(
                     "casting to bytea is not supported yet",
                 ));
             }
+            // uuid casts are likewise deferred (types.md §5/§14): casting TO uuid is 0A000.
+            if target.is_uuid() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "casting to uuid is not supported yet",
+                ));
+            }
             // The inner value is range-checked / coerced against `target` at eval, so it
             // resolves with no literal context here.
             let (rinner, ity) = resolve(scope, inner, None, agg)?;
@@ -1709,6 +1725,13 @@ fn resolve(
                         "casting from bytea is not supported yet",
                     ));
                 }
+                // Casting FROM uuid is likewise deferred (0A000).
+                ResolvedType::Uuid => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting from uuid is not supported yet",
+                    ));
+                }
             }
             let result_ty = if target.is_decimal() {
                 ResolvedType::Decimal
@@ -1733,7 +1756,10 @@ fn resolve(
                 ResolvedType::Int(t) => t,
                 ResolvedType::Decimal => ScalarType::Decimal,
                 ResolvedType::Null => ScalarType::Int64, // -NULL = NULL
-                ResolvedType::Bool | ResolvedType::Text | ResolvedType::Bytea => {
+                ResolvedType::Bool
+                | ResolvedType::Text
+                | ResolvedType::Bytea
+                | ResolvedType::Uuid => {
                     return Err(type_error("unary minus requires a numeric operand"));
                 }
             };
@@ -2029,6 +2055,7 @@ fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
     match ty {
         ResolvedType::Int(t) => Some(t),
         ResolvedType::Bytea => Some(ScalarType::Bytea),
+        ResolvedType::Uuid => Some(ScalarType::Uuid),
         ResolvedType::Text => Some(ScalarType::Text),
         ResolvedType::Bool | ResolvedType::Decimal | ResolvedType::Null => None,
     }
@@ -2039,7 +2066,7 @@ fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
 fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
     match ty {
         ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null => Ok(()),
-        ResolvedType::Bool | ResolvedType::Text | ResolvedType::Bytea => {
+        ResolvedType::Bool | ResolvedType::Text | ResolvedType::Bytea | ResolvedType::Uuid => {
             Err(type_error("arithmetic operators require numeric operands"))
         }
     }
@@ -2051,9 +2078,9 @@ fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
 /// boolean/non-boolean, bytea/non-bytea, …) is a 42804 type error — comparison is overloaded
 /// across these families but never compares across them.
 fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
-    use ResolvedType::{Bool, Bytea, Decimal, Int, Text};
+    use ResolvedType::{Bool, Bytea, Decimal, Int, Text, Uuid};
     match (lt, rt) {
-        // Boolean compares only with boolean (or NULL); boolean with a number/text/bytea is a mismatch.
+        // Boolean compares only with boolean (or NULL); boolean with a number/text/bytea/uuid is a mismatch.
         (Bool, Int(_))
         | (Int(_), Bool)
         | (Bool, Text)
@@ -2061,23 +2088,37 @@ fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
         | (Bool, Decimal)
         | (Decimal, Bool)
         | (Bool, Bytea)
-        | (Bytea, Bool) => Err(type_error(
+        | (Bytea, Bool)
+        | (Bool, Uuid)
+        | (Uuid, Bool) => Err(type_error(
             "cannot compare a boolean value with a non-boolean value",
         )),
         (Int(_), Text) | (Text, Int(_)) | (Decimal, Text) | (Text, Decimal) => Err(type_error(
             "cannot compare a text value with a numeric value",
         )),
-        // bytea compares only with bytea (or NULL); bytea with a number or text is a mismatch.
+        // bytea compares only with bytea (or NULL); bytea with a number, text, or uuid is a mismatch.
         (Bytea, Int(_))
         | (Int(_), Bytea)
         | (Bytea, Decimal)
         | (Decimal, Bytea)
         | (Bytea, Text)
-        | (Text, Bytea) => Err(type_error(
+        | (Text, Bytea)
+        | (Bytea, Uuid)
+        | (Uuid, Bytea) => Err(type_error(
             "cannot compare a bytea value with a non-bytea value",
         )),
+        // uuid compares only with uuid (or NULL); uuid with a number or text is a mismatch
+        // (the uuid/bool and uuid/bytea pairs are caught above).
+        (Uuid, Int(_))
+        | (Int(_), Uuid)
+        | (Uuid, Decimal)
+        | (Decimal, Uuid)
+        | (Uuid, Text)
+        | (Text, Uuid) => Err(type_error(
+            "cannot compare a uuid value with a non-uuid value",
+        )),
         // Same-family pairs (numeric/numeric incl. int↔decimal, text/text, bool/bool,
-        // bytea/bytea) and any pairing with a bare NULL literal are comparable.
+        // bytea/bytea, uuid/uuid) and any pairing with a bare NULL literal are comparable.
         _ => Ok(()),
     }
 }
@@ -2172,9 +2213,11 @@ fn coerce_case(v: Value, to_decimal: bool) -> Value {
 fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(()),
-        ResolvedType::Int(_) | ResolvedType::Text | ResolvedType::Decimal | ResolvedType::Bytea => {
-            Err(type_error(msg))
-        }
+        ResolvedType::Int(_)
+        | ResolvedType::Text
+        | ResolvedType::Decimal
+        | ResolvedType::Bytea
+        | ResolvedType::Uuid => Err(type_error(msg)),
     }
 }
 
@@ -2196,6 +2239,8 @@ fn require_assignable(ty: ResolvedType, col_ty: ScalarType, col: &str) -> Result
         matches!(ty, ResolvedType::Bool | ResolvedType::Null)
     } else if col_ty.is_bytea() {
         matches!(ty, ResolvedType::Bytea | ResolvedType::Null)
+    } else if col_ty.is_uuid() {
+        matches!(ty, ResolvedType::Uuid | ResolvedType::Null)
     } else {
         // text column
         matches!(ty, ResolvedType::Text | ResolvedType::Null)
@@ -2325,6 +2370,19 @@ fn decode_bytea_literal(s: &str) -> Result<Vec<u8>> {
     })
 }
 
+/// Decode a single-quoted literal's content as a uuid value via PostgreSQL-flexible input
+/// (`value::parse_uuid`), mapping malformed input to a `22P02` (invalid_text_representation).
+/// Used when a string literal adapts to a uuid context (types.md §6/§14); the trap is
+/// deterministic and fires at resolve time, before any scan.
+fn decode_uuid_literal(s: &str) -> Result<[u8; 16]> {
+    parse_uuid(s).map_err(|detail| {
+        EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            format!("invalid input syntax for type uuid: {detail}"),
+        )
+    })
+}
+
 /// A resolved UPDATE assignment: which column to write, the target type/nullability so
 /// the new value is re-checked exactly like INSERT, and the resolved RHS expression
 /// (evaluated against the *old* row).
@@ -2407,6 +2465,10 @@ fn store_value(
                 // A string literal adapts to a bytea column, decoding the hex input form
                 // (types.md §6/§13); malformed hex traps 22P02.
                 Ok(Value::Bytea(decode_bytea_literal(&s)?))
+            } else if col_ty.is_uuid() {
+                // A string literal adapts to a uuid column via the PG-flexible input
+                // (types.md §6/§14); malformed input traps 22P02.
+                Ok(Value::Uuid(decode_uuid_literal(&s)?))
             } else {
                 Err(type_error(format!(
                     "cannot store a text value in {} column {col_name}",
@@ -2420,6 +2482,16 @@ fn store_value(
             } else {
                 Err(type_error(format!(
                     "cannot store a bytea value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+        Value::Uuid(u) => {
+            if col_ty.is_uuid() {
+                Ok(Value::Uuid(u))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a uuid value in {} column {col_name}",
                     col_ty.canonical_name()
                 )))
             }
@@ -2477,6 +2549,7 @@ impl RExpr {
             RExpr::ConstText(s) => Ok(Value::Text(s.clone())),
             RExpr::ConstDecimal(d) => Ok(Value::Decimal(d.clone())),
             RExpr::ConstBytea(b) => Ok(Value::Bytea(b.clone())),
+            RExpr::ConstUuid(u) => Ok(Value::Uuid(*u)),
             RExpr::ConstNull => Ok(Value::Null),
             RExpr::Cast {
                 inner,
@@ -2517,6 +2590,7 @@ impl RExpr {
                     Value::Bool(_) => unreachable!("resolver rejects a boolean cast operand"),
                     Value::Text(_) => unreachable!("resolver rejects a text cast operand"),
                     Value::Bytea(_) => unreachable!("resolver rejects a bytea cast operand"),
+                    Value::Uuid(_) => unreachable!("resolver rejects a uuid cast operand"),
                 }
             }
             RExpr::Neg { operand, result } => {
@@ -2539,6 +2613,7 @@ impl RExpr {
                     Value::Bool(_) => unreachable!("resolver rejects a boolean unary minus"),
                     Value::Text(_) => unreachable!("resolver rejects a text unary minus"),
                     Value::Bytea(_) => unreachable!("resolver rejects a bytea unary minus"),
+                    Value::Uuid(_) => unreachable!("resolver rejects a uuid unary minus"),
                 }
             }
             RExpr::Not(e) => {
@@ -2814,6 +2889,7 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
+        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
         // Cross-family arms exist only for totality — ORDER BY is over a single typed column,
         // so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -2831,5 +2907,6 @@ fn family_rank(v: &Value) -> u8 {
         Value::Decimal(_) => 3,
         Value::Text(_) => 4,
         Value::Bytea(_) => 5,
+        Value::Uuid(_) => 6,
     }
 }

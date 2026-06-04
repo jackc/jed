@@ -267,9 +267,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 > The **real type system** is the product (§4) — PostgreSQL's behavior, stricter than its
 > typing, and nothing like SQLite's runtime affinity. Each item is a vertical slice that
-> forces a §8 divergence decision into the open (default: match PG — §1). `text` is done
-> (the collation §8 decision landed: PostgreSQL `C`) and `bytea` is done (unsigned byte order,
-> `\x`-hex literals); `decimal` is the next headline item.
+> forces a §8 divergence decision into the open (default: match PG — §1). `text` (collation
+> `C`), `decimal` (exact base-10, half-away rounding), `bytea` (unsigned byte order, `\x`-hex
+> literals), and `uuid` (fixed 16 bytes, PG-flexible input, and the **first non-integer
+> `PRIMARY KEY`**) are all done; `timestamp` and `json`/`array` are the remaining headline items.
 
 - [x] **Storable `boolean` column type** — done & committed across Rust/Go/TS. `boolean` was
       expression-only (Phase 1); it is now a *column* type: `CREATE TABLE t(flag boolean)`,
@@ -339,11 +340,29 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       but unexercised — bytea PK is rejected `0A000`); the traditional escape input format
       (`\nnn`); bytea⇄other casts; binary functions (`length`, `||`, `substring`,
       `encode`/`decode`, `get_byte`).
-- [ ] **`uuid`** — a fixed **16-byte** value (RFC 4122). Order-preserving key encoding is
-      the raw 16 bytes (compared unsigned/bytewise); the canonical text form is the
-      `8-4-4-4-12` **lowercase**-hex spelling (PostgreSQL accepts more input spellings —
-      match its canonical *output*). No arithmetic. Cheap once the value-codec/key-encoding
-      machinery is in place. _(size: M; §4/§8)_
+- [x] **`uuid`** — done & committed across Rust/Go/TS. A fixed **16-byte** value (RFC 4122),
+      compared by **unsigned byte order** over the 16 bytes. Storage + comparison/ordering
+      (`= < > <= >=`, `IS [NOT] DISTINCT FROM`); on-disk type code **8** with the engine's first
+      **fixed-width non-integer** value codec (16 raw bytes, **no** length prefix), byte-exact
+      across cores (golden `uuid_table.jed`). Another comparison-operator **overload**
+      (`catalog.toml` carries `uuid`-family rows). A uuid literal is a single-quoted string that
+      **adapts to a uuid context** (the §6 string-adaptation rule, like bytea), with
+      **PostgreSQL-flexible input** replicating `uuid_in` (optional `{}`, any case, an optional
+      hyphen after each whole byte-pair — canonical `8-4-4-4-12`, hyphen-less 32-hex, and the
+      every-4-digit grouping all accepted; a misplaced hyphen is rejected), normalized to the
+      canonical **lowercase** `8-4-4-4-12` on **output**; malformed input traps **`22P02`**
+      pre-scan. Rendered under the `T` tag. **First non-integer `PRIMARY KEY`** — uuid lifts the
+      key narrowing the other non-integer types defer: its `uuid-raw16` order-preserving key
+      encoding (bare 16 bytes — no escape/terminator/sign-flip) is **exercised** (CREATE/INSERT/
+      point-lookup/`ORDER BY`/duplicate-key over a uuid PK), proving the executor key path
+      generalizes beyond integers. Authored spec-first: `spec/design/types.md §14`,
+      `encoding.md §2.7` (+ uuid key vectors in `encoding/integers.toml`), `format.md` (type code
+      8 + value codec), `catalog.toml` (+ codegen), capability `types.uuid`; pinned by
+      `spec/conformance/suites/types/uuid.test` (51/0/0 byte-identical in Rust, Go, TS, with
+      `# cost:` asserted) and the byte-exact golden `uuid_table.jed`. _(was: M; §4/§8;
+      spec/design/types.md §14, encoding.md §2.7)_ **Deferred follow-ups:** uuid⇄other casts
+      (`text ⇄ uuid`, `bytea ⇄ uuid` — rejected `0A000`/`42804`, a later cast slice); uuid
+      functions (`gen_random_uuid()`, `uuid_generate_v*`).
 - [ ] **`json` / `jsonb`** — optional headline feature (§1). Large surface. _(size: XL; §4)_
 - [ ] **Composite `array` type** — a **container** over the scalar set: a new type *axis*,
       not another scalar (CLAUDE.md §4). Array literals, element-type rules, `NULL` element

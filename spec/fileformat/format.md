@@ -130,11 +130,14 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 5 | `boolean` |
 | 6 | `decimal` |
 | 7 | `bytea` |
+| 8 | `uuid` |
 
 A column's collation is **not** stored: there is one collation (`C`) for all text this slice
 (../design/types.md §11). A per-column collation field is a forward extension that will claim a
 spare `flags` bit or a new field under a `format_version` bump when multi-collation lands.
-`bytea` has no collation (it is raw bytes, not text), so the same field-free encoding applies.
+`bytea` and `uuid` have no collation (they are bytes, not text), so the same field-free encoding
+applies. A `uuid` PRIMARY KEY needs no extra catalog field either — it is the first non-integer
+key, but the key bytes live in the data-page record (below), not the catalog.
 
 A **decimal** column carries a **typmod** (the `numeric(p,s)` precision/scale) that constrains
 future writes, so it **must** persist. It is appended to the column entry **only when
@@ -171,8 +174,9 @@ by inserting in file order). Each **record**:
 The key is **stored, not derived**: a table without a primary key uses a synthetic
 `int64` rowid that is not reconstructable from row data, so the key bytes are persisted
 verbatim. There is no per-record payload length — the reader walks the columns in declaration
-order and takes each value's width from its type: fixed for the integers, and for `text` /
-`bytea` from the `u16` length the value carries (see the value codec below).
+order and takes each value's width from its type: fixed for the integers and the 16-byte
+`uuid`, and for `text` / `bytea` from the `u16` length the value carries (see the value codec
+below).
 
 **Rowid reconstruction (no-PK tables).** The synthetic rowid is allocated from a
 **monotonic counter** that is never reused (so a `DELETE` followed by an `INSERT` cannot
@@ -231,9 +235,17 @@ alone. The present-value body depends on the type:
   `0x00`, is allowed. The empty value is `00`(tag)`00 00`(len). The `> 0xFFFF` and oversized-item
   rules are identical to text.
 
+- **`uuid`** — a **fixed 16-byte** body: the 16 raw bytes of the value (big-endian, the same
+  `uuid-raw16` bytes the key uses — encoding.md §2.7), with **NO `u16` length prefix** (the
+  width is fixed at 16, implied by the column type). A present uuid is `00`(tag) + 16 bytes (17
+  bytes total); a NULL uuid is the lone `01` tag. This is the **first fixed-width non-integer**
+  value — for uuid the stored value body and the order-preserving key body coincide (both the
+  raw 16 bytes), so reusing one codec is exact rather than merely convenient.
+
 There is no per-record payload length: the reader walks the columns in declaration order,
-deriving each value's width from its type (fixed for integers and the 1-byte boolean;
-self-describing via the `u16` length for text and bytea, and via `ndigits` for decimal).
+deriving each value's width from its type (fixed for the integers, the 1-byte boolean, and the
+16-byte uuid; self-describing via the `u16` length for text and bytea, and via `ndigits` for
+decimal).
 
 ## Packing and page allocation (must be byte-identical across cores)
 
@@ -271,6 +283,7 @@ by the independent Ruby reference in [verify.rb](verify.rb) (run via `rake verif
 | `bool_table.jed` | a boolean column — the value codec's `bool-byte` branch (`00` false / `01` true) and a NULL boolean |
 | `decimal_table.jed` | a `decimal` column — the value codec's decimal branch (flags + scale + base-10⁴ groups), the per-column `numeric(p,s)` typmod, and positive/negative/zero/multi-group/NULL |
 | `bytea_table.jed` | a bytea column — the value codec's bytea branch (`u16` len + raw bytes); empty value, embedded `0x00`, a high byte, a NULL |
+| `uuid_table.jed` | a **uuid PRIMARY KEY** (the first golden with a non-integer stored key — the load-bearing §8 cross-core key-path proof) + a nullable uuid column — the value codec's fixed-16-byte branch (no length prefix) and a NULL uuid |
 | `default_table.jed` | columns with `DEFAULT` — the `has_default` flag (bit2) + the default value codec written after the typmod; an int/text/decimal default, a `DEFAULT NULL`, a NOT NULL column with a default, a plain no-default column |
 | `nopk_table.jed` | a table with no PK — exercises the stored synthetic `int64` rowid key |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |

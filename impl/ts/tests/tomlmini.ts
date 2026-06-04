@@ -135,6 +135,7 @@ export type EncCase = {
   kind: "bare" | "nullable" | "descending";
   typ: string;
   value: bigint;
+  strValue: string; // a quoted value (uuid's canonical string); "" for integer cases
   isNull: boolean;
   bytes: string;
 };
@@ -176,6 +177,7 @@ function parseEncCaseLine(line: string, kind: EncCase["kind"] | "", typ: string)
   const cl = inner.indexOf("}");
   if (cl >= 0) inner = inner.slice(0, cl);
   let value = 0n;
+  let strValue = "";
   let isNull = false;
   let bytes = "";
   for (const part of inner.split(",")) {
@@ -183,10 +185,13 @@ function parseEncCaseLine(line: string, kind: EncCase["kind"] | "", typ: string)
     if (idx < 0) continue;
     const k = part.slice(0, idx).trim();
     const v = part.slice(idx + 1).trim();
-    if (k === "value") value = BigInt(v);
-    else if (k === "null") isNull = v === "true";
+    // A quoted value is a uuid's canonical string; an unquoted one is an integer.
+    if (k === "value") {
+      if (v.startsWith('"')) strValue = unquote(v);
+      else value = BigInt(v);
+    } else if (k === "null") isNull = v === "true";
     else if (k === "bytes") bytes = unquote(v);
   }
   if (bytes === "") return null;
-  return { kind, typ, value, isNull, bytes };
+  return { kind, typ, value, strValue, isNull, bytes };
 }

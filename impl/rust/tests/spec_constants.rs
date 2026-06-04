@@ -139,6 +139,23 @@ fn scalar_types_match_spec() {
         jed::decimal::MAX_SCALE,
         "max_scale matches the decimal module"
     );
+
+    // uuid: storable, the uuid family, fixed-width (the first non-integer with a width_bytes).
+    // Its on-disk width (16) is a cross-core contract, so cross-check it against the spec.
+    let uuid = types
+        .iter()
+        .find(|t| t["id"].as_str() == Some("uuid"))
+        .expect("uuid type present");
+    assert_eq!(uuid["family"].as_str(), Some("uuid"), "uuid family");
+    assert_eq!(uuid["storable"].as_bool(), Some(true), "uuid storable");
+    assert_eq!(ScalarType::from_name("uuid"), Some(ScalarType::Uuid));
+    assert_eq!(ScalarType::Uuid.canonical_name(), "uuid");
+    assert_eq!(ScalarType::Uuid.width_bytes(), 16, "uuid is fixed 16 bytes");
+    assert_eq!(
+        ScalarType::Uuid.width_bytes() as i64,
+        uuid["encoding"]["width_bytes"].as_integer().unwrap(),
+        "uuid encoding width matches the spec"
+    );
 }
 
 #[test]

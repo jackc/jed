@@ -29,6 +29,9 @@ const (
 	// Bytea is a variable-width binary string (raw bytes), compared by unsigned byte
 	// order — spec/design/types.md §13.
 	Bytea
+	// Uuid is a fixed 16-byte value (RFC 4122), compared by unsigned byte order —
+	// spec/design/types.md §14. The first non-integer type usable as a key (WidthBytes 16).
+	Uuid
 )
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. Precision >= 1;
@@ -56,6 +59,8 @@ func (t ScalarType) CanonicalName() string {
 		return "decimal"
 	case Bytea:
 		return "bytea"
+	case Uuid:
+		return "uuid"
 	default:
 		return "?"
 	}
@@ -81,6 +86,8 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return DecimalType, true
 	case "bytea":
 		return Bytea, true
+	case "uuid":
+		return Uuid, true
 	default:
 		return 0, false
 	}
@@ -98,12 +105,17 @@ func (t ScalarType) IsDecimal() bool { return t == DecimalType }
 // IsBytea reports whether this is the variable-width bytea type (raw bytes).
 func (t ScalarType) IsBytea() bool { return t == Bytea }
 
+// IsUuid reports whether this is the fixed 16-byte uuid type.
+func (t ScalarType) IsUuid() bool { return t == Uuid }
+
 // IsInteger reports whether this is one of the fixed-width signed integer types.
 func (t ScalarType) IsInteger() bool { return t == Int16 || t == Int32 || t == Int64 }
 
-// WidthBytes is the fixed storage width in bytes (the key-encoding width). Integer-only —
-// text is variable-width and carries its own length (spec/fileformat/format.md), so this
-// returns 0 for Text and is never used on that path.
+// WidthBytes is the fixed storage width in bytes (the key-encoding / value-codec width for
+// the fixed-width types: the three integers and uuid). text/decimal/bytea are variable-width
+// (return 0) — they carry their own length (spec/fileformat/format.md) and never use this.
+// uuid (16) is the first non-integer fixed-width type; callers branch on IsUuid before the
+// integer decode path, since decode_int would sign-flip its bytes.
 func (t ScalarType) WidthBytes() int {
 	switch t {
 	case Int16:
@@ -112,6 +124,8 @@ func (t ScalarType) WidthBytes() int {
 		return 4
 	case Int64:
 		return 8
+	case Uuid:
+		return 16
 	default:
 		return 0
 	}
@@ -166,5 +180,5 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea}
+	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid}
 }

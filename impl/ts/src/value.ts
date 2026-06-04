@@ -23,7 +23,11 @@ export type Value =
   | { kind: "decimal"; dec: Decimal }
   // A raw byte string (the bytea column type); compares by UNSIGNED byte order (§13). It
   // holds a Uint8Array — already raw bytes, so unlike text there is NO UTF-16 trap here.
-  | { kind: "bytea"; bytes: Uint8Array };
+  | { kind: "bytea"; bytes: Uint8Array }
+  // A fixed 16-byte UUID (RFC 4122); compares by UNSIGNED byte order over the 16 bytes (§14).
+  // Holds a 16-byte Uint8Array — a distinct kind from bytea (renders 8-4-4-4-12, its own
+  // comparison family), so a uuid never equals a bytea even with identical bytes.
+  | { kind: "uuid"; bytes: Uint8Array };
 
 // intValue builds a non-null integer value.
 export function intValue(n: bigint): Value {
@@ -53,6 +57,11 @@ export function decimalValue(d: Decimal): Value {
 // byteaValue builds a non-null bytea value from raw bytes.
 export function byteaValue(b: Uint8Array): Value {
   return { kind: "bytea", bytes: b };
+}
+
+// uuidValue builds a non-null uuid value from its 16 raw bytes (parseUuid guarantees 16).
+export function uuidValue(b: Uint8Array): Value {
+  return { kind: "uuid", bytes: b };
 }
 
 // compareBytea compares two byte strings by UNSIGNED byte order (Uint8Array elements are
@@ -113,6 +122,50 @@ function hexVal(c: number): number {
   if (c >= 97 && c <= 102) return c - 97 + 10; // a-f
   if (c >= 65 && c <= 70) return c - 65 + 10; // A-F
   return -1;
+}
+
+// renderUuid formats 16 bytes as the canonical RFC 4122 text form: 32 LOWERCASE hex digits in
+// the 8-4-4-4-12 grouping joined by hyphens (PostgreSQL uuid_out). Byte-identical across cores
+// (CLAUDE.md §8), so the case and grouping are fixed here.
+export function renderUuid(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < 16; i++) {
+    if (i === 4 || i === 6 || i === 8 || i === 10) s += "-";
+    const byte = bytes[i]!;
+    s += HEX_DIGITS[byte >> 4]! + HEX_DIGITS[byte & 0xf]!;
+  }
+  return s;
+}
+
+// parseUuid decodes a uuid literal replicating PostgreSQL's uuid_in (spec/design/types.md §14):
+// an optional surrounding `{ }`, then 16 bytes as two hex digits each (case-insensitive), with an
+// optional hyphen consumed only after a whole pair of bytes (odd byte index, never the last) — so
+// the canonical 8-4-4-4-12 form, a hyphen-less 32-hex run, and the every-4-digit grouping all
+// parse, while a hyphen elsewhere is rejected (PG's exact algorithm, not a looser strip-all). The
+// inverse of renderUuid for the canonical form, so a value round-trips. Returns the bytes, or
+// { error } describing malformed input (the caller raises it as a 22P02).
+export function parseUuid(s: string): { bytes: Uint8Array } | { error: string } {
+  let pos = 0;
+  const braces = s.length > 0 && s[0] === "{";
+  if (braces) pos = 1;
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) {
+    if (pos + 1 >= s.length) return { error: "invalid uuid: too few hexadecimal digits" };
+    const hi = hexVal(s.charCodeAt(pos));
+    const lo = hexVal(s.charCodeAt(pos + 1));
+    if (hi < 0 || lo < 0) return { error: "invalid hexadecimal digit in uuid" };
+    out[i] = (hi << 4) | lo;
+    pos += 2;
+    // A hyphen is consumed only after a whole pair of bytes (odd byte index) and never after
+    // the last byte — exactly PostgreSQL's string_to_uuid rule.
+    if (i % 2 === 1 && i < 15 && s[pos] === "-") pos++;
+  }
+  if (braces) {
+    if (s[pos] !== "}") return { error: "invalid uuid: missing or misplaced closing brace" };
+    pos++;
+  }
+  if (pos !== s.length) return { error: "invalid uuid: trailing characters after the 16 bytes" };
+  return { bytes: out };
 }
 
 // numericCmp compares two numeric values by value, promoting an integer operand to decimal
@@ -178,6 +231,9 @@ export function render(v: Value): string {
       return v.dec.render();
     case "bytea":
       return renderByteaHex(v.bytes);
+    case "uuid":
+      // Canonical 8-4-4-4-12 lowercase-hex form (PG uuid_out).
+      return renderUuid(v.bytes);
     default:
       return v.int.toString();
   }
@@ -195,6 +251,7 @@ export function eq3(a: Value, b: Value): ThreeValued {
   if (c !== undefined) return bool3(c === 0);
   if (a.kind === "text" && b.kind === "text") return bool3(a.text === b.text);
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) === 0);
+  if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) === 0);
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value === b.value);
   return "unknown";
 }
@@ -207,6 +264,7 @@ export function lt3(a: Value, b: Value): ThreeValued {
   if (c !== undefined) return bool3(c < 0);
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) < 0);
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) < 0);
+  if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) < 0);
   if (a.kind === "bool" && b.kind === "bool") return bool3(!a.value && b.value);
   return "unknown";
 }
@@ -219,6 +277,7 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (c !== undefined) return bool3(c > 0);
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) > 0);
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) > 0);
+  if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) > 0);
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value && !b.value);
   return "unknown";
 }

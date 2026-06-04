@@ -15,6 +15,12 @@
 # are asymmetric (bool->int yes, int->bool no), so they are authored deliberately in a
 # later slice rather than falling out of making boolean storable.
 #
+# bytea and uuid (scalars.toml) are likewise NEITHER a cast source NOR a cast target here:
+# CAST(x AS bytea) / CAST(x AS uuid) trap 0A000 and casting FROM a bytea/uuid value is a
+# forbidden pair (42804). text/bytea/uuid inter-casts are deferred to a dedicated cast slice
+# (PostgreSQL has text<->uuid etc., authored deliberately later rather than falling out of
+# making the types storable).
+#
 # mode:
 #   implicit    inserted automatically anywhere a value of `to` is wanted (safe, lossless)
 #   assignment  inserted on INSERT/UPDATE into a column of `to` (safe, lossless)

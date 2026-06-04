@@ -6,7 +6,8 @@
 //! (spec/design/decimal.md); a `bytea` value holds its raw `Vec<u8>`. Because
 //! `Text`/`Decimal`/`Bytea` own heap data, `Value` is `Clone`, not `Copy` — the
 //! comparison/render helpers borrow (`&self`, `&Value`) rather than consume, and the
-//! executor clones a value only when reading it out of a stored row.
+//! executor clones a value only when reading it out of a stored row. A `uuid` value holds a
+//! fixed `[u8; 16]` (stack, `Copy`-able, but `Value` stays `Clone` for the heap variants).
 
 use crate::decimal::Decimal;
 
@@ -31,6 +32,10 @@ pub enum Value {
     Decimal(Decimal),
     /// A raw byte string (the bytea column type); compares by unsigned byte order (types.md §13).
     Bytea(Vec<u8>),
+    /// A fixed 16-byte UUID (RFC 4122); compares by unsigned byte order over the 16 bytes
+    /// (types.md §14). Held as `[u8; 16]`, so `PartialEq`/`Eq`/`Hash` (DISTINCT/GROUP BY) and
+    /// `<` (ORDER BY) are the natural byte-wise unsigned operations.
+    Uuid([u8; 16]),
 }
 
 /// Compare two numeric values by value, promoting an integer operand to decimal when its
@@ -91,6 +96,8 @@ impl Value {
             Value::Decimal(d) => d.render(),
             // Bytea renders as `\x` + lowercase hex (PG `bytea_output = hex`; empty → `\x`).
             Value::Bytea(b) => render_bytea_hex(b),
+            // Uuid renders as the canonical 8-4-4-4-12 lowercase-hex form (PG `uuid_out`).
+            Value::Uuid(u) => render_uuid(u),
         }
     }
 
@@ -115,6 +122,7 @@ impl Value {
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() == b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a == b),
             (Value::Bytea(a), Value::Bytea(b)) => bool3(a == b),
+            (Value::Uuid(a), Value::Uuid(b)) => bool3(a == b),
             _ => ThreeValued::Unknown,
         }
     }
@@ -129,6 +137,7 @@ impl Value {
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() < b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a < b),
             (Value::Bytea(a), Value::Bytea(b)) => bool3(a < b),
+            (Value::Uuid(a), Value::Uuid(b)) => bool3(a < b),
             _ => ThreeValued::Unknown,
         }
     }
@@ -143,6 +152,7 @@ impl Value {
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() > b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a > b),
             (Value::Bytea(a), Value::Bytea(b)) => bool3(a > b),
+            (Value::Uuid(a), Value::Uuid(b)) => bool3(a > b),
             _ => ThreeValued::Unknown,
         }
     }
@@ -219,6 +229,62 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Render a UUID as its canonical RFC 4122 text form: 32 **lowercase** hex digits in the
+/// 8-4-4-4-12 grouping joined by hyphens (PostgreSQL `uuid_out`). The spelling must be
+/// byte-identical across cores (CLAUDE.md §8), so the case and grouping are fixed here.
+fn render_uuid(u: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(36);
+    for (i, b) in u.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Decode a UUID from its textual form, replicating PostgreSQL's `uuid_in` (spec/design/types.md
+/// §14): an optional surrounding `{ }`, then 16 bytes as two hex digits each (case-insensitive),
+/// with an optional hyphen consumed only after a whole pair of bytes (odd byte index, never the
+/// last) — so the canonical 8-4-4-4-12 form, a hyphen-less 32-hex run, and the every-4-digit
+/// grouping all parse, while a hyphen at any other position is rejected (PG's exact algorithm,
+/// not a looser strip-all). On malformed input returns the reason string; the caller raises a
+/// `22P02`. Inverse of `render_uuid` for the canonical form, so a value round-trips. Used when a
+/// single-quoted literal adapts to a uuid context (the executor), never at parse time.
+pub fn parse_uuid(s: &str) -> Result<[u8; 16], &'static str> {
+    let b = s.as_bytes();
+    let mut pos = 0usize;
+    let braces = b.first() == Some(&b'{');
+    if braces {
+        pos += 1;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        if pos + 1 >= b.len() {
+            return Err("invalid uuid: too few hexadecimal digits");
+        }
+        let hi = hex_val(b[pos]).ok_or("invalid hexadecimal digit in uuid")?;
+        let lo = hex_val(b[pos + 1]).ok_or("invalid hexadecimal digit in uuid")?;
+        out[i] = (hi << 4) | lo;
+        pos += 2;
+        // A hyphen is consumed only after a whole pair of bytes (odd byte index) and never
+        // after the last byte — exactly PostgreSQL's `string_to_uuid` rule.
+        if i % 2 == 1 && i < 15 && b.get(pos) == Some(&b'-') {
+            pos += 1;
+        }
+    }
+    if braces {
+        if b.get(pos) != Some(&b'}') {
+            return Err("invalid uuid: missing or misplaced closing brace");
+        }
+        pos += 1;
+    }
+    if pos != b.len() {
+        return Err("invalid uuid: trailing characters after the 16 bytes");
+    }
+    Ok(out)
 }
 
 // --- boolean Value <-> ThreeValued bridges, and the Kleene connectives ----------

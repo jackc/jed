@@ -26,6 +26,26 @@ func TestEncodingVectors(t *testing.T) {
 			t.Fatalf("unknown type %q", c.typ)
 		}
 		var got []byte
+		if c.typ == "uuid" {
+			// uuid is the first non-integer key: a uuid key is the bare 16 bytes ParseUUID
+			// produces (encoding.md §2.7); nullable/descending use the shared tag/inversion.
+			switch c.kind {
+			case "bare":
+				got, _ = ParseUUID(c.strValue)
+				if UuidValue(got).Render() != c.strValue {
+					t.Errorf("bare uuid %s: round-trip got %s", c.strValue, UuidValue(got).Render())
+				}
+			case "nullable":
+				got = nullableUUIDBytes(c)
+			case "descending":
+				got = invertBytes(nullableUUIDBytes(c))
+			}
+			if h := hex.EncodeToString(got); h != c.bytes {
+				t.Errorf("%s uuid value=%q null=%v: got %s want %s", c.kind, c.strValue, c.isNull, h, c.bytes)
+			}
+			checked++
+			continue
+		}
 		switch c.kind {
 		case "bare":
 			got = EncodeInt(st, c.value)

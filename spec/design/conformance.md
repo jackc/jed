@@ -31,7 +31,9 @@ Conventions, fixed here so every implementation renders identically:
   exact decimal — all storable, CLAUDE.md §4); `R` (binary float) is reserved and may never be
   used until a float type exists (§4). The letter is a **rendering** tag (how a value
   is printed), *not* a type assertion — asserting the precise declared type (`int16` vs
-  `int32`, or a decimal's `numeric(p,s)`) is a planned directive, deferred (§7).
+  `int32`, or a decimal's `numeric(p,s)`) is a planned directive, deferred (§7). Types that
+  render as a printable-ASCII string reuse the `T` tag accordingly: `bytea` (the `\x…`
+  lowercase-hex form) and `uuid` (the canonical `8-4-4-4-12` lowercase form) are `T`-tag values.
 - **values** — printed one per line, **row-major** (row 1's columns, then row 2's, …). A
   single integer renders as its shortest decimal form (no leading zeros, leading `-` for
   negatives). A **boolean renders as the literal `true` or `false`** (lowercase; never

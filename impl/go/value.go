@@ -22,6 +22,10 @@ const (
 	// ValBytea is a byte string (the bytea column type); Str holds its raw bytes (a Go
 	// string is an immutable byte sequence — any byte, incl 0x00; keeps Value ==-comparable).
 	ValBytea
+	// ValUuid is a fixed 16-byte UUID (the uuid column type); Str holds the 16 raw bytes (like
+	// ValBytea, but a distinct kind: a uuid renders 8-4-4-4-12 and is its own comparison family,
+	// so a uuid never equals a bytea even with identical bytes — spec/design/types.md §14).
+	ValUuid
 )
 
 // Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers
@@ -63,6 +67,10 @@ func DecimalValue(d Decimal) Value { return Value{Kind: ValDecimal, Dec: &d} }
 // ByteaValue builds a non-null bytea value from raw bytes (stored as a byte-holding string).
 func ByteaValue(b []byte) Value { return Value{Kind: ValBytea, Str: string(b)} }
 
+// UuidValue builds a non-null uuid value from its 16 raw bytes (stored as a byte-holding string,
+// like bytea, but tagged ValUuid). The caller must pass exactly 16 bytes (ParseUUID guarantees).
+func UuidValue(b []byte) Value { return Value{Kind: ValUuid, Str: string(b)} }
+
 // ParseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
 // a `\x` prefix followed by an even count of hexadecimal digits (case-insensitive), each
 // pair one byte; `\x` alone is the empty byte string. The inverse of the bytea render form,
@@ -101,6 +109,64 @@ func hexVal(b byte) (byte, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// ParseUUID decodes a uuid literal replicating PostgreSQL's uuid_in (spec/design/types.md §14):
+// an optional surrounding `{ }`, then 16 bytes as two hex digits each (case-insensitive), with an
+// optional hyphen consumed only after a whole pair of bytes (odd byte index, never the last) — so
+// the canonical 8-4-4-4-12 form, a hyphen-less 32-hex run, and the every-4-digit grouping all
+// parse, while a hyphen elsewhere is rejected (PG's exact algorithm, not a looser strip-all). On
+// success the reason is ""; on malformed input the bytes are nil and the reason explains why (the
+// caller raises it as a 22P02). The inverse of renderUUID for the canonical form, so it round-trips.
+func ParseUUID(s string) (b []byte, reason string) {
+	pos := 0
+	braces := len(s) > 0 && s[0] == '{'
+	if braces {
+		pos = 1
+	}
+	out := make([]byte, 16)
+	for i := 0; i < 16; i++ {
+		if pos+1 >= len(s) {
+			return nil, "invalid uuid: too few hexadecimal digits"
+		}
+		hi, okHi := hexVal(s[pos])
+		lo, okLo := hexVal(s[pos+1])
+		if !okHi || !okLo {
+			return nil, "invalid hexadecimal digit in uuid"
+		}
+		out[i] = hi<<4 | lo
+		pos += 2
+		// A hyphen is consumed only after a whole pair of bytes (odd byte index) and never
+		// after the last byte — exactly PostgreSQL's string_to_uuid rule.
+		if i%2 == 1 && i < 15 && pos < len(s) && s[pos] == '-' {
+			pos++
+		}
+	}
+	if braces {
+		if pos >= len(s) || s[pos] != '}' {
+			return nil, "invalid uuid: missing or misplaced closing brace"
+		}
+		pos++
+	}
+	if pos != len(s) {
+		return nil, "invalid uuid: trailing characters after the 16 bytes"
+	}
+	return out, ""
+}
+
+// renderUUID formats 16 bytes as the canonical RFC 4122 text form: 32 lowercase hex digits in
+// the 8-4-4-4-12 grouping joined by hyphens (PostgreSQL uuid_out). Byte-identical across cores
+// (CLAUDE.md §8), so case and grouping are fixed here.
+func renderUUID(b []byte) string {
+	const hexd = "0123456789abcdef"
+	out := make([]byte, 0, 36)
+	for i, by := range b {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			out = append(out, '-')
+		}
+		out = append(out, hexd[by>>4], hexd[by&0x0f])
+	}
+	return string(out)
 }
 
 // IsNull reports whether the value is SQL NULL.
@@ -147,6 +213,9 @@ func (v Value) Render() string {
 		return v.Dec.Render()
 	case ValBytea:
 		return "\\x" + hex.EncodeToString([]byte(v.Str))
+	case ValUuid:
+		// Canonical 8-4-4-4-12 lowercase-hex form (PG uuid_out).
+		return renderUUID([]byte(v.Str))
 	default:
 		return strconv.FormatInt(v.Int, 10)
 	}
@@ -207,6 +276,9 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValBytea || o.Kind == ValBytea {
 		return bool3(v.Str == o.Str)
 	}
+	if v.Kind == ValUuid || o.Kind == ValUuid {
+		return bool3(v.Str == o.Str)
+	}
 	return Unknown
 }
 
@@ -228,6 +300,9 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValBytea || o.Kind == ValBytea {
 		return bool3(v.Str < o.Str)
 	}
+	if v.Kind == ValUuid || o.Kind == ValUuid {
+		return bool3(v.Str < o.Str)
+	}
 	return Unknown
 }
 
@@ -247,6 +322,9 @@ func (v Value) Gt3(o Value) ThreeValued {
 		return bool3(v.Bool && !o.Bool)
 	}
 	if v.Kind == ValBytea || o.Kind == ValBytea {
+		return bool3(v.Str > o.Str)
+	}
+	if v.Kind == ValUuid || o.Kind == ValUuid {
 		return bool3(v.Str > o.Str)
 	}
 	return Unknown

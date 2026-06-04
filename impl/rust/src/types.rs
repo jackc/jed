@@ -1,5 +1,5 @@
 //! Scalar types (CLAUDE.md §4). Storable: the three signed integers + `text` + `boolean`
-//! + `decimal` + `bytea`.
+//! + `decimal` + `bytea` + `uuid`.
 //!
 //! Hand-written per CLAUDE.md §5 (the parser/types are irreducibly per-language),
 //! but cross-checked against the canonical spec/types/scalars.toml in tests so the
@@ -27,6 +27,9 @@ pub enum ScalarType {
     Decimal,
     /// Variable-width binary string (raw bytes), compared by unsigned byte order — types.md §13.
     Bytea,
+    /// Fixed 16-byte value (RFC 4122), compared by unsigned byte order — types.md §14. The first
+    /// non-integer type usable as a key; `width_bytes` returns 16 (it is genuinely fixed-width).
+    Uuid,
 }
 
 impl ScalarType {
@@ -40,6 +43,7 @@ impl ScalarType {
             ScalarType::Bool => "boolean",
             ScalarType::Decimal => "decimal",
             ScalarType::Bytea => "bytea",
+            ScalarType::Uuid => "uuid",
         }
     }
 
@@ -57,6 +61,7 @@ impl ScalarType {
             "boolean" | "bool" => Some(ScalarType::Bool),
             "decimal" | "numeric" | "dec" => Some(ScalarType::Decimal),
             "bytea" => Some(ScalarType::Bytea),
+            "uuid" => Some(ScalarType::Uuid),
             _ => None,
         }
     }
@@ -81,6 +86,11 @@ impl ScalarType {
         matches!(self, ScalarType::Bytea)
     }
 
+    /// Whether this is the fixed 16-byte `uuid` type.
+    pub fn is_uuid(self) -> bool {
+        matches!(self, ScalarType::Uuid)
+    }
+
     /// Whether this is one of the fixed-width signed integer types.
     pub fn is_integer(self) -> bool {
         matches!(
@@ -89,17 +99,20 @@ impl ScalarType {
         )
     }
 
-    /// Fixed storage width in bytes (the key-encoding width). Integer-only — `text`/`boolean`/
-    /// `decimal` are never serialized through this path (they carry their own length or use a
-    /// dedicated codec; spec/fileformat/format.md), so calling it on them is a bug.
+    /// Fixed storage width in bytes (the key-encoding / value-codec width for the fixed-width
+    /// types). The three integers and `uuid` (16 bytes) are fixed-width; `text`/`boolean`/
+    /// `decimal` are not (`boolean` is a 1-byte special case; text/decimal/bytea carry their own
+    /// length or use a dedicated codec; spec/fileformat/format.md), so calling it on those is a
+    /// bug. `uuid` is the first non-integer fixed-width type (its 16-byte key/value body).
     pub fn width_bytes(self) -> usize {
         match self {
             ScalarType::Int16 => 2,
             ScalarType::Int32 => 4,
             ScalarType::Int64 => 8,
+            ScalarType::Uuid => 16,
             ScalarType::Text | ScalarType::Bool | ScalarType::Decimal | ScalarType::Bytea => {
                 unreachable!(
-                    "text/boolean/decimal are not fixed-width integers; width_bytes is integer-only"
+                    "text/boolean/decimal/bytea are not fixed-width; width_bytes covers integers + uuid"
                 )
             }
         }
@@ -111,8 +124,12 @@ impl ScalarType {
             ScalarType::Int16 => i16::MIN as i64,
             ScalarType::Int32 => i32::MIN as i64,
             ScalarType::Int64 => i64::MIN,
-            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal | ScalarType::Bytea => {
-                unreachable!("text/boolean/decimal have no integer range")
+            ScalarType::Text
+            | ScalarType::Bool
+            | ScalarType::Decimal
+            | ScalarType::Bytea
+            | ScalarType::Uuid => {
+                unreachable!("text/boolean/decimal/bytea/uuid have no integer range")
             }
         }
     }
@@ -123,8 +140,12 @@ impl ScalarType {
             ScalarType::Int16 => i16::MAX as i64,
             ScalarType::Int32 => i32::MAX as i64,
             ScalarType::Int64 => i64::MAX,
-            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal | ScalarType::Bytea => {
-                unreachable!("text/boolean/decimal have no integer range")
+            ScalarType::Text
+            | ScalarType::Bool
+            | ScalarType::Decimal
+            | ScalarType::Bytea
+            | ScalarType::Uuid => {
+                unreachable!("text/boolean/decimal/bytea/uuid have no integer range")
             }
         }
     }
@@ -136,8 +157,12 @@ impl ScalarType {
             ScalarType::Int16 => 1,
             ScalarType::Int32 => 2,
             ScalarType::Int64 => 3,
-            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal | ScalarType::Bytea => {
-                unreachable!("text/boolean/decimal have no integer promotion rank")
+            ScalarType::Text
+            | ScalarType::Bool
+            | ScalarType::Decimal
+            | ScalarType::Bytea
+            | ScalarType::Uuid => {
+                unreachable!("text/boolean/decimal/bytea/uuid have no integer promotion rank")
             }
         }
     }
@@ -148,7 +173,7 @@ impl ScalarType {
     }
 
     /// All types, for exhaustive iteration in tests.
-    pub fn all() -> [ScalarType; 7] {
+    pub fn all() -> [ScalarType; 8] {
         [
             ScalarType::Int16,
             ScalarType::Int32,
@@ -157,6 +182,7 @@ impl ScalarType {
             ScalarType::Bool,
             ScalarType::Decimal,
             ScalarType::Bytea,
+            ScalarType::Uuid,
         ]
     }
 }

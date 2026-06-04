@@ -7,7 +7,15 @@
 // exceeds JS's safe-integer range, so every integer flows through bigint — uniform,
 // exact at all widths).
 
-export type ScalarType = "int16" | "int32" | "int64" | "text" | "boolean" | "decimal" | "bytea";
+export type ScalarType =
+  | "int16"
+  | "int32"
+  | "int64"
+  | "text"
+  | "boolean"
+  | "decimal"
+  | "bytea"
+  | "uuid";
 
 export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "int16",
@@ -17,6 +25,7 @@ export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "boolean",
   "decimal",
   "bytea",
+  "uuid",
 ];
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. precision >= 1;
@@ -47,6 +56,12 @@ export function isDecimal(t: ScalarType): boolean {
 // unsigned byte order — spec/design/types.md §13.
 export function isBytea(t: ScalarType): boolean {
   return t === "bytea";
+}
+
+// isUuid reports whether this is the fixed 16-byte uuid type (compared by unsigned byte
+// order — spec/design/types.md §14). The first non-integer type usable as a key.
+export function isUuid(t: ScalarType): boolean {
+  return t === "uuid";
 }
 
 // isInteger reports whether this is one of the fixed-width signed integer types.
@@ -90,14 +105,18 @@ export function scalarTypeFromName(name: string): ScalarType | undefined {
       return "decimal";
     case "bytea":
       return "bytea";
+    case "uuid":
+      return "uuid";
     default:
       return undefined;
   }
 }
 
-// widthBytes is the fixed storage width in bytes (the key-encoding width). Integer-only —
-// text is variable-width and carries its own length (spec/fileformat/format.md), so this
-// throws on "text" and is never used on that path.
+// widthBytes is the fixed storage width in bytes (the key-encoding / value-codec width for the
+// fixed-width types: the three integers and uuid (16)). text/decimal/bytea are variable-width
+// and throw — they carry their own length (spec/fileformat/format.md). uuid is the first
+// non-integer fixed-width type; callers branch on isUuid before the integer decode path, since
+// decodeInt would sign-flip its bytes.
 export function widthBytes(t: ScalarType): number {
   switch (t) {
     case "int16":
@@ -106,6 +125,8 @@ export function widthBytes(t: ScalarType): number {
       return 4;
     case "int64":
       return 8;
+    case "uuid":
+      return 16;
     case "text":
       throw new Error("text is variable-width; widthBytes is integer-only");
     case "boolean":
@@ -134,6 +155,8 @@ export function minOf(t: ScalarType): bigint {
       throw new Error("decimal has no integer range");
     case "bytea":
       throw new Error("bytea has no integer range");
+    case "uuid":
+      throw new Error("uuid has no integer range");
   }
 }
 
@@ -154,6 +177,8 @@ export function maxOf(t: ScalarType): bigint {
       throw new Error("decimal has no integer range");
     case "bytea":
       throw new Error("bytea has no integer range");
+    case "uuid":
+      throw new Error("uuid has no integer range");
   }
 }
 
@@ -175,6 +200,8 @@ export function rank(t: ScalarType): number {
       throw new Error("decimal has no integer promotion rank");
     case "bytea":
       throw new Error("bytea has no promotion rank");
+    case "uuid":
+      throw new Error("uuid has no promotion rank");
   }
 }
 

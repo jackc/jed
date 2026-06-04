@@ -188,6 +188,42 @@ key path exist yet. Stored bytea *values* use the compact length-prefixed **valu
 bytes, no order-preservation needed — [../fileformat/format.md](../fileformat/format.md)).
 Lifting the narrowing adds the `(value → bytes)` fixtures and the executor path then.
 
+### 2.7 UUID — `uuid-raw16` (the first EXERCISED non-integer key)
+
+`uuid` is a fixed **16-byte** value (RFC 4122 — [types.md §14](types.md)). Unlike the
+variable-width types above, it needs **no escape, terminator, or length prefix**: it is
+fixed-width, so it is self-delimiting by width alone, exactly like the bare integers (§2.1).
+The rule is the simplest in this doc:
+
+1. The value's bytes are its **16 raw bytes**, big-endian (RFC 4122 stores the fields in
+   network byte order, so the canonical `8-4-4-4-12` text form's hex, read left to right, is
+   already the big-endian byte order).
+2. **No sign-flip** (uuid is unsigned), **no escape, no terminator.**
+
+Unsigned `memcmp` over the 16 bytes **is** the type's logical order (`uuid = "byte-ascending"`,
+[types.md §14](types.md); [../types/compare.toml](../types/compare.toml)), so the bytes already
+sort correctly with no transformation. Because every value is exactly 16 bytes there is **no
+prefix/length case** to worry about (the wrinkle §2.4/§2.6 solve for variable-width types
+simply cannot arise). Worked bytes:
+
+| value | encoded key bytes |
+|---|---|
+| `00000000-0000-0000-0000-000000000000` | `00000000000000000000000000000000` |
+| `00000000-0000-0000-0000-000000000001` | `00000000000000000000000000000001` |
+| `550e8400-e29b-41d4-a716-446655440000` | `550e8400e29b41d4a716446655440000` |
+| `ffffffff-ffff-ffff-ffff-ffffffffffff` | `ffffffffffffffffffffffffffffffff` |
+
+The **nullable** slot is the §2.2 tag (`0x00` present ‖ the 16 bytes, or `0x01` for NULL) and
+**descending** is the §2.3 whole-component bitwise inversion — both unchanged.
+
+**Status — EXERCISED.** This is the difference from §2.4–§2.6: uuid **is** allowed in a
+`PRIMARY KEY` / key this slice ([types.md §14](types.md)), making it the **first non-integer
+key type**. So uuid key vectors are authored in [../encoding/integers.toml](../encoding/integers.toml)
+and the executor encodes a uuid PK to these bytes (the stored key is the bare 16 bytes — a PK
+is NOT NULL, so no presence tag). A stored uuid *value* reuses the same 16 bytes behind the
+value-codec presence tag ([../fileformat/format.md](../fileformat/format.md)); for uuid the key
+and value bodies coincide (both the raw 16 bytes), the simplest case of the §3 key/value seam.
+
 ## 3. Where this is used today
 
 The bare integer rule is exercised by every stored key. The on-disk **value codec**
@@ -197,11 +233,14 @@ irrelevant, but reusing one codec keeps key and value bytes consistent and is wh
 seam diverge cleanly if a future type ever needs distinct key/value forms. The text type is
 the first such divergence: text *values* are stored with a compact length-prefixed value codec
 (format.md), while the order-preserving text *key* rule (§2.4) is authored but unexercised —
-text is not yet allowed in a key. `bytea` (§2.5) is the same: raw-byte *values* stored via the
-compact value codec, the order-preserving *key* rule authored but unexercised. The remaining
-non-integer scalars (`decimal`, …) and composite keys will add their own §2 rules and fixtures
-when those features land; nullable *secondary indexes* — the first place §2.2's sort order
-becomes load-bearing rather than spec-only — follow then too.
+text is not yet allowed in a key. `bytea` (§2.6) is the same: raw-byte *values* stored via the
+compact value codec, the order-preserving *key* rule authored but unexercised. `uuid` (§2.7) is
+the **exception and the first non-integer key actually exercised**: a uuid `PRIMARY KEY` stores
+the bare 16 bytes as its key (so the BTree/sorted store iterates uuid PKs in correct logical
+order with no comparator), proving the executor key path generalizes beyond integers. The
+remaining non-integer scalars (`decimal`, …) and composite keys will add their own §2 rules and
+fixtures when those features land; nullable *secondary indexes* — the first place §2.2's sort
+order becomes load-bearing rather than spec-only — follow then too.
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)
 

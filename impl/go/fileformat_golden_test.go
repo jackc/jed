@@ -130,6 +130,22 @@ func byteaTableDB(t *testing.T) *Database {
 	return db
 }
 
+// uuidTableDB has a uuid PRIMARY KEY (the first golden with a NON-integer stored key — the
+// load-bearing §8 cross-core key-path proof) plus a nullable uuid column. Exercises the value
+// codec's fixed-16-byte uuid branch (no length prefix), the uuid key encoding (bare 16 bytes),
+// a present and a NULL uuid value, and the nil/max boundary UUIDs. Must match the Ruby
+// reference's UUID_TABLE (spec/fileformat/verify.rb).
+func uuidTableDB(t *testing.T) *Database {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)")
+	run(t, db, "INSERT INTO t VALUES "+
+		"('00000000-0000-0000-0000-000000000000', '550e8400-e29b-41d4-a716-446655440000'), "+
+		"('550e8400-e29b-41d4-a716-446655440000', NULL), "+
+		"('f47ac10b-58cc-4372-a567-0e02b2c3d479', '00000000-0000-0000-0000-000000000000'), "+
+		"('ffffffff-ffff-ffff-ffff-ffffffffffff', 'ffffffff-ffff-ffff-ffff-ffffffffffff')")
+	return db
+}
+
 // defaultTableDB exercises the DEFAULT column constraint on disk — the catalog flags bit2 + the
 // pre-evaluated default value (written after the typmod). Covers an int default, a text default,
 // a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to numeric(6,2),
@@ -156,6 +172,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"bool_table.jed", boolTableDB},
 		{"decimal_table.jed", decimalTableDB},
 		{"bytea_table.jed", byteaTableDB},
+		{"uuid_table.jed", uuidTableDB},
 		{"default_table.jed", defaultTableDB},
 		{"nopk_table.jed", nopkTableDB},
 	}
@@ -184,6 +201,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"bool_table.jed", boolTableDB, "t"},
 		{"decimal_table.jed", decimalTableDB, "t"},
 		{"bytea_table.jed", byteaTableDB, "t"},
+		{"uuid_table.jed", uuidTableDB, "t"},
 		{"default_table.jed", defaultTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},

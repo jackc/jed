@@ -81,6 +81,9 @@ var SupportedCapabilities = []string{
 	// bytea scalar type (variable-width raw bytes): storage, hex-input literals, and
 	// unsigned-byte comparison/ordering. Non-key column only this slice (bytea PK → 0A000).
 	"types.bytea",
+	// uuid scalar type (fixed 16-byte RFC 4122): storage, PG-flexible input literals, and
+	// unsigned-byte comparison/ordering. The FIRST non-integer type usable as a PRIMARY KEY.
+	"types.uuid",
 	// General expression substrate — integer arithmetic, the boolean type, and the
 	// AND/OR/NOT Kleene connectives (the `expression` profile).
 	"types.boolean",

@@ -12,10 +12,10 @@ system — "like SQLite, but with a real type system." It is designed as data, b
 executor, so that every implementation tests against one shared contract instead of
 discovering semantics in code.
 
-## 1. Scope: signed integers + text + boolean + decimal + bytea (all storable)
+## 1. Scope: signed integers + text + boolean + decimal + bytea + uuid (all storable)
 
 The storable scalar types are three signed integers (CLAUDE.md §4) plus `text`, `boolean`,
-`decimal`, and `bytea`:
+`decimal`, `bytea`, and `uuid`:
 
 | Canonical id | Aliases | Bits | Range |
 |---|---|---|---|
@@ -26,6 +26,7 @@ The storable scalar types are three signed integers (CLAUDE.md §4) plus `text`,
 | `boolean` | `bool` | — | `{false, true}`, ordered false `<` true |
 | `decimal` | `numeric`, `dec` | — | exact base-10 (`numeric(p,s)`, `1≤p≤1000`, `0≤s≤p`) |
 | `bytea` | — | — | variable-width raw bytes (unsigned byte order) |
+| `uuid` | — | 128 | fixed 16-byte value, RFC 4122 (unsigned byte order) |
 
 The integers are signed, two's-complement. **`text`** is the first storable non-integer
 scalar — a variable-width UTF-8 string with one defined collation, `C` (byte / code-point
@@ -40,14 +41,18 @@ is the third storable non-integer scalar — an exact base-10 numeric (§12,
 [decimal.md](decimal.md)); its landing **binds the decimal-rounding decision** of CLAUDE.md §8
 (settled: round **half away from zero**) and keeps binary floats out of the compare/text paths
 entirely. **`bytea`** (§13) is the fourth storable non-integer scalar — a variable-width binary
-string (raw bytes), compared by unsigned byte order. The remaining scalars
+string (raw bytes), compared by unsigned byte order. **`uuid`** (§14) is the fifth — a fixed
+16-byte value (RFC 4122), compared by unsigned byte order, and the **first non-integer type
+usable as a `PRIMARY KEY`** (its fixed-width key encoding is exercised, lifting the key narrowing
+the other non-integer types still defer). The remaining scalars
 (`timestamp`/`timestamptz`, `json`/`jsonb`, and any `float`) are still **deferred**, so the
 float-formatting and NaN/∞ decisions in CLAUDE.md §8 still do **not** bind — there are no floats
 (decimal is finite and exact, never NaN/∞ — §12). The **collation** decision (§8) is settled in
-§11: one collation, `C`. Boolean, text, decimal, and bytea each add real divergence-prone
+§11: one collation, `C`. Boolean, text, decimal, bytea, and uuid each add real divergence-prone
 behavior (a render form beyond `I`, three-valued Kleene connectives — §10; UTF-8 vs. UTF-16
-ordering — §11; exact base-10 arithmetic + display-scale — §12; and a hex literal/render form —
-§13) on the smallest possible surfaces.
+ordering — §11; exact base-10 arithmetic + display-scale — §12; a hex literal/render form — §13;
+and PG-flexible uuid input + a fixed-width non-integer key — §14) on the smallest possible
+surfaces.
 
 ## 2. Canonical names vs. aliases
 
@@ -206,7 +211,7 @@ literal, has a context it can adapt to: in a **bytea** context — `INSERT`/`UPD
 column, or a comparison against a bytea column (`WHERE b = '\xab'`) — the string literal is
 read as a **bytea** value via the bytea hex input form (`\x` + an even count of hex digits),
 exactly as PostgreSQL applies bytea's input function to a string constant in a bytea context.
-This is the only context a string literal adapts to; with no bytea context it stays `text`. An
+An
 ill-formed hex literal in a bytea context (no `\x` prefix, odd digit count, a non-hex
 character) is a **`22P02`** (`invalid_text_representation`) raised **deterministically at
 resolve time, before any row is scanned** — the precise analogue of the `22003` an out-of-range
@@ -214,6 +219,14 @@ integer literal raises in a comparison context. A string literal in a *non-bytea
 never decoded, so `'\xZZ'` compared with a `text` column is the ordinary 4-character text value
 `\xZZ`, never a `22P02`. The decode is a value-checked coercion at resolve time, never a silent
 reinterpretation — the same discipline as the integer rule above.
+
+A string literal adapts to a **`uuid`** context the same way (§14): in a uuid context —
+`INSERT`/`UPDATE` into a uuid column, or a comparison against one (`WHERE id = '550e8400-…'`)
+— the string is read as a **uuid** value via uuid's input function (PostgreSQL-flexible —
+optional surrounding `{}`, hyphens optional/at any position, or hyphen-less 32-hex, any case),
+trapping `22P02` at resolve time on malformed input. With no uuid context the string stays
+`text`. So `bytea` and `uuid` are the two types a single-quoted literal adapts to; the decode is
+a value-checked coercion either way.
 
 ## 7. Order-preserving key encoding
 
@@ -331,10 +344,13 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
 - **`bytea`** — ✅ landed as the fourth storable non-integer scalar — variable-width raw bytes,
   unsigned byte-order comparison (§13). Its deferred sub-features (the traditional escape input
   format, bytea⇄other casts, binary functions, and bytea in keys) are enumerated in §13.
-- **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4. Includes
-  **`uuid`** (a fixed 16-byte value; bytewise comparison, raw-16-byte order-preserving key
-  encoding, canonical `8-4-4-4-12` lowercase-hex text form — match PostgreSQL's canonical
-  *output*).
+- **`uuid`** — ✅ landed as the fifth storable non-integer scalar (§14) — a fixed 16-byte value,
+  unsigned byte-order comparison, PostgreSQL-flexible input + canonical `8-4-4-4-12` lowercase
+  output, and the **first non-integer type usable as a `PRIMARY KEY`** (its `uuid-raw16` key
+  encoding is exercised, [encoding.md §2.7](encoding.md)). Deferred sub-features (uuid⇄other casts,
+  uuid functions like `gen_random_uuid()`) are enumerated in §14.
+- **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4 (e.g.
+  `timestamp`/`timestamptz`, `json`/`jsonb`, `float`).
 - **Composite `array` type** — a *container* over the scalar set, a separate later type
   axis rather than another scalar (CLAUDE.md §4): its own value codec, order-preserving key
   encoding, element-type and `NULL`-element rules, and equality/ordering. Deferred; match
@@ -497,3 +513,74 @@ like an oversized text value, trips the whole-image oversized-item `0A000` narro
 
 **Practical size note.** As for text (§11), a single stored bytea value (or row) larger than one
 page trips the whole-image `0A000` oversized-item narrowing until overflow pages land.
+
+## 14. The uuid type
+
+`uuid` (no aliases) is a **fixed 16-byte value** (RFC 4122) and the fifth storable non-integer
+scalar. It is *not* text and *not* bytea: it is its own type and family, with a fixed width and a
+canonical textual spelling. Like bytea it carries no collation; unlike bytea it is fixed-width
+(always exactly 16 bytes). This is PostgreSQL's `uuid`, borrowed because §1 makes PG the default
+and a UUID is an extremely common key/identifier the strict type system should model explicitly
+(a fixed 16-byte value) rather than smuggle through `text` or `bytea`.
+
+**Comparison and ordering: unsigned byte order (`memcmp`) over the 16 bytes** — exactly
+PostgreSQL's `uuid` comparison. Because every value is the same width there is no prefix/length
+case. `uuid` is its own comparison family: `uuid` vs `text`, `bytea`, or an integer are **not**
+comparable — each is a `42804` type error (compare.toml lists only `uuid × uuid`); a uuid is not
+a bytea even when the 16 bytes coincide. The ordering operators (`= < > <= >=`) and the NULL-safe
+`IS [NOT] DISTINCT FROM` are another of the catalog's comparison operator overloads, alongside
+integer, text, boolean, decimal, and bytea (catalog.toml).
+
+**Cross-core determinism — like bytea, no UTF-16 trap.** A uuid **is** 16 raw bytes in every core
+(Rust `[u8; 16]`, Go a 16-byte string, TS `Uint8Array`), and unsigned `memcmp` is natively
+identical across all three. The one determinism surface is the **input parser** and the **output
+spelling**, both pinned below and in the corpus.
+
+**Literals: a string in a uuid context, PostgreSQL-flexible input.** There is no distinct uuid
+literal token; a uuid value is written as a single-quoted string literal that **adapts to a uuid
+context** (§6) — `INSERT INTO t VALUES ('550e8400-e29b-41d4-a716-446655440000', NULL)`,
+`UPDATE t SET ref = '…'`, and `WHERE id = '…'`. Input replicates **PostgreSQL's `uuid_in`**: an
+optional surrounding `{ }`, then the 16 bytes as two hex digits each in **any case**, with an
+**optional hyphen permitted after each whole pair of bytes** (every 4 hex digits). So the canonical
+`8-4-4-4-12` form, a fully hyphen-less 32-hex run, the every-4-digit grouping
+(`550e-8400-…-0000`), and any `{}`-wrapped variant all normalize to the same 16 bytes — but a
+hyphen at a *non*-group position (e.g. `5-50e…`) is **rejected**, exactly as PG rejects it (this is
+PG's algorithm, not a looser strip-all). (This is a deliberate contrast with bytea, whose
+alternative input format we deferred: for uuid, matching PG's lenient `uuid_in` is the §1 default
+and the spellings are common in practice.) Malformed input (wrong digit count, a non-hex
+character, a misplaced hyphen, an unbalanced brace) traps **`22P02`**
+(`invalid_text_representation`) deterministically at resolve time, before any row is scanned (§6).
+An integer/boolean literal in a uuid context, and a string literal into a non-uuid column, are
+`42804` type errors. A string literal in a *non-uuid* context is never decoded.
+
+**Rendering: canonical lowercase `8-4-4-4-12`.** A uuid renders in the conformance corpus as the
+canonical RFC 4122 spelling — five lowercase-hex groups of 8-4-4-4-12 digits joined by hyphens
+(e.g. `550e8400-e29b-41d4-a716-446655440000`) — PostgreSQL's `uuid_out`. Input is flexible but
+**output is always this one form**, so the corpus is deterministic. This reuses the `T` render tag
+(a *rendering* tag, not a type assertion — conformance.md §1; a uuid renders as a printable ASCII
+string). Every core must emit the identical spelling (a CLAUDE.md §8 decision, like bytea's hex
+and boolean's `true`/`false`).
+
+**uuid IS a valid `PRIMARY KEY` — the first non-integer key.** Unlike text (§11), boolean (§9),
+decimal (§12), and bytea (§13) — all of which reject a PK `0A000` and leave their key encoding
+authored-but-unexercised — a `uuid` column **may be a `PRIMARY KEY`** this slice. Its
+order-preserving key encoding (`uuid-raw16`, encoding.md §2.7) is the bare 16 bytes: fixed-width,
+unsigned, no escape/terminator/sign-flip, so unsigned `memcmp` over the stored key bytes *is* the
+logical order and the sorted store iterates uuid PKs correctly with no comparator. This makes uuid
+the proof that the executor key path generalizes beyond integers (the narrowing lift those other
+types defer). A uuid PK is NOT NULL (every PK is), so its key carries no nullable presence tag.
+
+**On-disk.** Stable type code `8` (format.md). The stored value uses a **fixed 16-byte** body
+behind the presence tag — **no `u16` length prefix** (the width is implied by the type), the first
+fixed-width non-integer value. For uuid the stored value body and the key body coincide (both the
+raw 16 bytes), so reusing one codec is exact. A uuid is always 16 bytes, far below the page limit,
+so the oversized-item narrowing never applies.
+
+**Deferred uuid sub-features** (relaxable narrowings, each its own follow-up):
+
+- **uuid ⇄ other casts** (§5) — `text ⇄ uuid` and `bytea ⇄ uuid` casts are deferred to a cast
+  slice (PostgreSQL has `text ⇄ uuid`); `CAST(x AS uuid)` and casting from a uuid trap `0A000` /
+  `42804` this slice, exactly as bytea's casts are deferred.
+- **uuid functions** — `gen_random_uuid()` (generation), `uuid_generate_v*`, and any uuid
+  accessor functions are deferred; this slice is comparison + storage only (`= < > <= >=`,
+  `IS [NOT] DISTINCT FROM`), with values supplied as literals.

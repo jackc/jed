@@ -71,6 +71,16 @@ test("scalar types match spec/types/scalars.toml", () => {
   }
   assert.equal(decimal!.big("max_precision"), BigInt(MAX_PRECISION), "max_precision matches module");
   assert.equal(decimal!.big("max_scale"), BigInt(MAX_SCALE), "max_scale matches module");
+
+  // uuid: storable, the uuid family, fixed-width (the first non-integer with a width_bytes).
+  // Its on-disk width (16) is a cross-core contract, so cross-check it against the spec.
+  const uuid = rows.find((r) => r.str("id") === "uuid");
+  assert.notEqual(uuid, undefined, "uuid type present");
+  assert.equal(uuid!.str("family"), "uuid", "uuid family");
+  assert.equal(uuid!.bool("storable"), true, "uuid storable");
+  assert.equal(scalarTypeFromName("uuid"), "uuid", "uuid resolves");
+  assert.equal(canonicalName("uuid"), "uuid", "uuid canonical name");
+  assert.equal(widthBytes("uuid"), 16, "uuid is fixed 16 bytes");
 });
 
 test("error codes are registered in spec/errors/registry.toml", () => {

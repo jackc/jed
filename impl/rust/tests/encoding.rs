@@ -1,9 +1,15 @@
 //! Cross-check: the Rust key encoder must reproduce the byte-exact vectors in
 //! spec/encoding/integers.toml (CLAUDE.md §8). This is what guarantees the Rust and
 //! Go cores iterate keys in the same order. TOML is a test-time-only dependency.
+//!
+//! The file also carries the first NON-integer key vectors, `uuid` (method `uuid-raw16`):
+//! a uuid key is the bare 16 bytes — exactly what `parse_uuid` produces and the executor
+//! stores for a uuid PRIMARY KEY (encoding.md §2.7). The nullable/descending uuid vectors
+//! follow the shared §2.2/§2.3 framing (presence tag, one's-complement).
 
 use jed::encoding::{decode_int, encode_int, encode_nullable};
 use jed::types::ScalarType;
+use jed::value::{Value, parse_uuid};
 use std::path::Path;
 
 fn spec(rel: &str) -> String {
@@ -25,14 +31,43 @@ fn invert(bytes: &[u8]) -> Vec<u8> {
     bytes.iter().map(|b| b ^ 0xFF).collect()
 }
 
+fn is_null(case: &toml::Value) -> bool {
+    case.get("null").and_then(|b| b.as_bool()) == Some(true)
+}
+
+/// The nullable key slot for a uuid case: `0x01` for NULL, else `0x00` + the 16 raw bytes.
+fn nullable_uuid(case: &toml::Value) -> Vec<u8> {
+    if is_null(case) {
+        return vec![0x01];
+    }
+    let u = parse_uuid(case["value"].as_str().unwrap()).unwrap();
+    let mut out = vec![0x00];
+    out.extend_from_slice(&u);
+    out
+}
+
 #[test]
 fn bare_vectors_match_and_roundtrip() {
     let v: toml::Value = toml::from_str(&spec("encoding/integers.toml")).unwrap();
     for group in v["bare"].as_array().unwrap() {
-        let t = ty(group["type"].as_str().unwrap());
+        let name = group["type"].as_str().unwrap();
         for case in group["cases"].as_array().unwrap() {
-            let value = case["value"].as_integer().unwrap();
             let want = case["bytes"].as_str().unwrap();
+            if name == "uuid" {
+                // A uuid key is the bare 16 bytes `parse_uuid` produces (and the executor
+                // stores). Round-trip is the public render (canonical form ↔ bytes).
+                let value = case["value"].as_str().unwrap();
+                let bytes = parse_uuid(value).unwrap();
+                assert_eq!(hex(&bytes), want, "uuid value {value}");
+                assert_eq!(
+                    Value::Uuid(bytes).render(),
+                    value,
+                    "uuid round-trip {value}"
+                );
+                continue;
+            }
+            let t = ty(name);
+            let value = case["value"].as_integer().unwrap();
             let bytes = encode_int(t, value);
             assert_eq!(hex(&bytes), want, "{} value {value}", t.canonical_name());
             assert_eq!(decode_int(t, &bytes), value, "round-trip {value}");
@@ -44,10 +79,15 @@ fn bare_vectors_match_and_roundtrip() {
 fn nullable_vectors_match() {
     let v: toml::Value = toml::from_str(&spec("encoding/integers.toml")).unwrap();
     for group in v["nullable"].as_array().unwrap() {
-        let t = ty(group["type"].as_str().unwrap());
+        let name = group["type"].as_str().unwrap();
         for case in group["cases"].as_array().unwrap() {
             let want = case["bytes"].as_str().unwrap();
-            let value = if case.get("null").and_then(|b| b.as_bool()) == Some(true) {
+            if name == "uuid" {
+                assert_eq!(hex(&nullable_uuid(case)), want, "nullable uuid");
+                continue;
+            }
+            let t = ty(name);
+            let value = if is_null(case) {
                 None
             } else {
                 Some(case["value"].as_integer().unwrap())
@@ -61,10 +101,15 @@ fn nullable_vectors_match() {
 fn descending_is_inverted_nullable() {
     let v: toml::Value = toml::from_str(&spec("encoding/integers.toml")).unwrap();
     for group in v["descending"].as_array().unwrap() {
-        let t = ty(group["type"].as_str().unwrap());
+        let name = group["type"].as_str().unwrap();
         for case in group["cases"].as_array().unwrap() {
             let want = case["bytes"].as_str().unwrap();
-            let value = if case.get("null").and_then(|b| b.as_bool()) == Some(true) {
+            if name == "uuid" {
+                assert_eq!(hex(&invert(&nullable_uuid(case))), want, "descending uuid");
+                continue;
+            }
+            let t = ty(name);
+            let value = if is_null(case) {
                 None
             } else {
                 Some(case["value"].as_integer().unwrap())

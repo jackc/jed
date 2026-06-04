@@ -13,10 +13,24 @@
 require "bundler/setup"
 require "toml-rb"
 
-WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8 }.freeze
+WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "uuid" => 16 }.freeze
 
-# bare int-be-signflip: add bias 2^(bits-1), emit as unsigned big-endian.
+# uuid-raw16: the 16 raw bytes of the canonical 8-4-4-4-12 form (no sign-flip, no
+# escape/terminator — encoding.md §2.7). encode = strip hyphens, pack the 32 hex digits.
+def uuid_to_bytes(s)
+  [s.delete("-")].pack("H*")
+end
+
+def uuid_from_bytes(bytes)
+  h = bytes.unpack1("H*")
+  "#{h[0, 8]}-#{h[8, 4]}-#{h[12, 4]}-#{h[16, 4]}-#{h[20, 12]}"
+end
+
+# bare key encoding. For integers: int-be-signflip (add bias 2^(bits-1), unsigned BE).
+# For uuid (a String value): the raw 16 bytes verbatim, no sign-flip.
 def enc_bare(value, width)
+  return uuid_to_bytes(value) if value.is_a?(String)
+
   bias = 1 << (width * 8 - 1)
   u = value + bias
   raise "value #{value} out of range for width #{width}" unless u.between?(0, (1 << (width * 8)) - 1)
@@ -26,6 +40,8 @@ def enc_bare(value, width)
 end
 
 def dec_bare(bytes, width)
+  return uuid_from_bytes(bytes) if width == 16 # uuid is the only 16-byte key
+
   bytes.bytes.reduce(0) { |acc, b| (acc << 8) | b } - (1 << (width * 8 - 1))
 end
 

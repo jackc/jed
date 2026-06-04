@@ -105,19 +105,15 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			return Outcome{}, err
 		}
 		if def.PrimaryKey {
-			// Only integers may be a key this slice. The order-preserving text and decimal key
-			// encodings (spec/design/encoding.md §2.4/§2.5) are authored but unexercised, so a
-			// text or decimal PRIMARY KEY is a documented 0A000 narrowing (types.md §11/§12).
-			if !ty.IsInteger() {
+			// Integers and uuid may be a key. uuid is the FIRST non-integer key type — its
+			// fixed uuid-raw16 encoding (spec/design/encoding.md §2.7) is exercised. The other
+			// non-integer types' order-preserving key encodings (text §2.4, decimal §2.5,
+			// bytea §2.6, boolean's bool-byte) are authored but unexercised, so a
+			// text/decimal/bytea/boolean PRIMARY KEY is a documented 0A000 narrowing
+			// (types.md §9/§11/§12/§13), relaxable in a later in-key slice.
+			if !ty.IsInteger() && !ty.IsUuid() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
-			}
-			// Likewise boolean: the bool-byte key encoding rule is authored but
-			// unexercised, so a boolean PRIMARY KEY is a documented 0A000 narrowing
-			// (spec/design/types.md §9), relaxable in a later boolean-in-key slice.
-			if ty.IsBool() {
-				return Outcome{}, NewError(FeatureNotSupported,
-					"a boolean primary key is not supported yet")
 			}
 			if pkSeen {
 				return Outcome{}, NewError(InvalidTableDefinition,
@@ -259,7 +255,13 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 
 		var key []byte
 		if pk >= 0 {
-			key = EncodeInt(table.Columns[pk].Type, row[pk].Int)
+			if table.Columns[pk].Type.IsUuid() {
+				// uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16,
+				// encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
+				key = []byte(row[pk].Str)
+			} else {
+				key = EncodeInt(table.Columns[pk].Type, row[pk].Int)
+			}
 			if _, dup := seenKeys[string(key)]; dup {
 				return Outcome{}, NewError(UniqueViolation,
 					"duplicate key value violates primary key uniqueness")
@@ -970,6 +972,13 @@ func distinctRowKey(row []Value) string {
 			b.WriteString(strconv.Itoa(len(v.Str)))
 			b.WriteByte(':')
 			b.WriteString(v.Str)
+		case ValUuid:
+			// The 16 raw bytes (held in Str), under a distinct 'u' tag so a uuid never collides
+			// with a bytea/text of the same bytes. Fixed-width, but length-prefixed for symmetry.
+			b.WriteByte('u')
+			b.WriteString(strconv.Itoa(len(v.Str)))
+			b.WriteByte(':')
+			b.WriteString(v.Str)
 		}
 	}
 	return b.String()
@@ -993,6 +1002,7 @@ const (
 	rtText    // text (one family, collation C); does not promote
 	rtDecimal // decimal (one family; the per-column typmod is carried separately)
 	rtBytea   // bytea (one family, raw bytes); does not promote
+	rtUuid    // uuid (one family, fixed 16 bytes); does not promote. The first non-integer key.
 )
 
 type resolvedType struct {
@@ -1018,6 +1028,9 @@ func ctxOf(t resolvedType) *ScalarType {
 	case rtBytea:
 		ty := Bytea
 		return &ty
+	case rtUuid:
+		ty := Uuid
+		return &ty
 	case rtText:
 		ty := Text
 		return &ty
@@ -1036,6 +1049,7 @@ const (
 	reConstText
 	reConstDecimal
 	reConstBytea
+	reConstUuid
 	reConstNull
 	reCast
 	reNeg
@@ -1488,6 +1502,8 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 		return resolvedType{kind: rtDecimal}
 	case ty.IsBytea():
 		return resolvedType{kind: rtBytea}
+	case ty.IsUuid():
+		return resolvedType{kind: rtUuid}
 	default:
 		return resolvedType{kind: rtInt, intTy: ty}
 	}
@@ -1592,15 +1608,22 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		case LiteralBool:
 			return &rExpr{kind: reConstBool, cBool: e.Literal.Bool}, resolvedType{kind: rtBool}, nil
 		case LiteralText:
-			// A string literal is text by default (collation C). It adapts to a BYTEA context
-			// only (types.md §6/§13): decode the hex input there (22P02 on bad hex); any other
-			// context — including none — keeps it text.
+			// A string literal is text by default (collation C). It adapts to a BYTEA or a UUID
+			// context (types.md §6/§13/§14): decode the hex input (bytea) or the PG-flexible uuid
+			// input (uuid) — 22P02 on malformed; any other context — including none — keeps it text.
 			if ctx != nil && ctx.IsBytea() {
 				b, err := decodeByteaLiteral(e.Literal.Str)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
 				return &rExpr{kind: reConstBytea, cBytea: b}, resolvedType{kind: rtBytea}, nil
+			}
+			if ctx != nil && ctx.IsUuid() {
+				b, err := decodeUUIDLiteral(e.Literal.Str)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return &rExpr{kind: reConstUuid, cBytea: b}, resolvedType{kind: rtUuid}, nil
 			}
 			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
 		case LiteralDecimal:
@@ -1646,6 +1669,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		if target.IsBytea() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to bytea is not supported yet")
 		}
+		// uuid casts are likewise deferred (types.md §5/§14): casting TO uuid is 0A000.
+		if target.IsUuid() {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to uuid is not supported yet")
+		}
 		inner, ity, err := resolve(s, e.Cast.Inner, nil, ag)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -1660,6 +1687,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		// Casting FROM bytea is likewise deferred (0A000).
 		if ity.kind == rtBytea {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from bytea is not supported yet")
+		}
+		// Casting FROM uuid is likewise deferred (0A000).
+		if ity.kind == rtUuid {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from uuid is not supported yet")
 		}
 		// int→int (range check), int→decimal (widen), decimal→int (explicit, round),
 		// decimal→decimal (re-scale), and NULL are all castable.
@@ -1930,7 +1961,7 @@ func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx) (*rExpr, resolvedTy
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
 // or NULL); a boolean or text operand is a 42804 type error.
 func requireNumericOperand(t resolvedType) error {
-	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea {
+	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea || t.kind == rtUuid {
 		return typeError("arithmetic operators require numeric operands")
 	}
 	return nil
@@ -1957,6 +1988,11 @@ func classifyComparable(lt, rt resolvedType) error {
 	if byteaL != byteaR && lt.kind != rtNull && rt.kind != rtNull {
 		return typeError("cannot compare a bytea value with a non-bytea value")
 	}
+	// uuid compares only with uuid (or NULL); uuid with anything else is a mismatch.
+	uuidL, uuidR := lt.kind == rtUuid, rt.kind == rtUuid
+	if uuidL != uuidR && lt.kind != rtNull && rt.kind != rtNull {
+		return typeError("cannot compare a uuid value with a non-uuid value")
+	}
 	return nil
 }
 
@@ -1975,6 +2011,17 @@ func decodeByteaLiteral(s string) ([]byte, error) {
 	b, reason := ParseByteaHex(s)
 	if reason != "" {
 		return nil, NewError(InvalidTextRepresentation, "invalid input syntax for type bytea: "+reason)
+	}
+	return b, nil
+}
+
+// decodeUUIDLiteral decodes a single-quoted literal's content as a uuid value via the
+// PG-flexible input (ParseUUID), mapping malformed input to a 22P02. Used when a string literal
+// adapts to a uuid context (types.md §6/§14); deterministic, fires at resolve time before any scan.
+func decodeUUIDLiteral(s string) ([]byte, error) {
+	b, reason := ParseUUID(s)
+	if reason != "" {
+		return nil, NewError(InvalidTextRepresentation, "invalid input syntax for type uuid: "+reason)
 	}
 	return b, nil
 }
@@ -2000,7 +2047,7 @@ func promote(a, b resolvedType) ScalarType {
 }
 
 func requireBool(t resolvedType, msg string) error {
-	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal || t.kind == rtBytea {
+	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal || t.kind == rtBytea || t.kind == rtUuid {
 		return typeError(msg)
 	}
 	return nil
@@ -2092,6 +2139,8 @@ func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
 		ok = t.kind == rtInt || t.kind == rtDecimal || t.kind == rtNull
 	case colTy.IsBytea():
 		ok = t.kind == rtBytea || t.kind == rtNull
+	case colTy.IsUuid():
+		ok = t.kind == rtUuid || t.kind == rtNull
 	default: // text
 		ok = t.kind == rtText || t.kind == rtNull
 	}
@@ -2174,6 +2223,8 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		return DecimalValue(e.cDec), nil
 	case reConstBytea:
 		return ByteaValue(e.cBytea), nil
+	case reConstUuid:
+		return UuidValue(e.cBytea), nil
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
@@ -2573,6 +2624,9 @@ func valueCmp(a, b Value) int {
 	case a.Kind == ValBytea && b.Kind == ValBytea:
 		// bytea is held in Str (raw bytes); strings.Compare is unsigned byte order.
 		return strings.Compare(a.Str, b.Str)
+	case a.Kind == ValUuid && b.Kind == ValUuid:
+		// uuid's 16 raw bytes are held in Str; strings.Compare is unsigned byte order.
+		return strings.Compare(a.Str, b.Str)
 	case a.Kind == ValBool && b.Kind == ValBool:
 		return cmpInt64(orderKey(a), orderKey(b))
 	default:
@@ -2617,8 +2671,10 @@ func familyRank(v Value) int {
 		return 3
 	case ValText:
 		return 4
-	default: // ValBytea
+	case ValBytea:
 		return 5
+	default: // ValUuid
+		return 6
 	}
 }
 
@@ -2692,12 +2748,26 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			}
 			return ByteaValue(b), nil
 		}
+		if colTy.IsUuid() {
+			// A string literal adapts to a uuid column via the PG-flexible input
+			// (types.md §6/§14); malformed input traps 22P02.
+			b, err := decodeUUIDLiteral(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return UuidValue(b), nil
+		}
 		return Value{}, typeError("cannot store a text value in " + colTy.CanonicalName() + " column " + colName)
 	case ValBytea:
 		if colTy.IsBytea() {
 			return v, nil
 		}
 		return Value{}, typeError("cannot store a bytea value in " + colTy.CanonicalName() + " column " + colName)
+	case ValUuid:
+		if colTy.IsUuid() {
+			return v, nil
+		}
+		return Value{}, typeError("cannot store a uuid value in " + colTy.CanonicalName() + " column " + colName)
 	default: // ValBool
 		if colTy.IsBool() {
 			return BoolValue(v.Bool), nil

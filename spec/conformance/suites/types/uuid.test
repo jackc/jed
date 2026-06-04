@@ -1,0 +1,219 @@
+# UUID scalar type (spec/design/types.md §14): storage, PostgreSQL-flexible input literals
+# (braces / hyphens-anywhere / 32-hex, any case → canonical 8-4-4-4-12 LOWERCASE output),
+# equality, ordering (UNSIGNED byte order over the 16 bytes = memcmp), and NULL. uuid is the
+# FIRST non-integer type usable as a PRIMARY KEY — its uuid-raw16 key encoding (encoding.md §2.7)
+# is exercised here (CREATE/INSERT/point-lookup/ORDER BY/duplicate-key all over a uuid PK). The
+# nil UUID (all-zero) is a distinct, non-NULL value. A single-quoted literal adapts to a uuid
+# context (§6); malformed input traps 22P02. A literal in a NON-uuid context stays text. uuid
+# renders under the `T` tag. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.int32, types.text, types.uuid, resource.cost_metering
+
+# uuid is a valid PRIMARY KEY (the first non-integer key type) — this CREATE succeeds.
+statement ok
+CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)
+
+# Insert order is A, D, nil, C — deliberately NOT the byte order (nil < A < C < D), so the
+# ORDER BY below proves the key encoding, not insertion order. The nil UUID is a real value
+# (A's ref); one ref is NULL (the nil-id row).
+statement ok
+INSERT INTO t VALUES
+  ('550e8400-e29b-41d4-a716-446655440000', '00000000-0000-0000-0000-000000000000'),
+  ('ffffffff-ffff-ffff-ffff-ffffffffffff', '550e8400-e29b-41d4-a716-446655440000'),
+  ('00000000-0000-0000-0000-000000000000', NULL),
+  ('f47ac10b-58cc-4372-a567-0e02b2c3d479', '550e8400-e29b-41d4-a716-446655440000')
+
+# a uuid renders as the canonical 8-4-4-4-12 LOWERCASE form under the `T` tag (PG uuid_out)
+query T nosort
+SELECT id FROM t WHERE id = '550e8400-e29b-41d4-a716-446655440000'
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# --- PostgreSQL-flexible INPUT — all spellings normalize to the same 16 bytes -------------
+# uppercase input matches the value stored from the lowercase literal (and renders lowercase)
+query T nosort
+SELECT id FROM t WHERE id = '550E8400-E29B-41D4-A716-446655440000'
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# hyphen-less 32-hex input
+query T nosort
+SELECT id FROM t WHERE id = '550e8400e29b41d4a716446655440000'
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# braced input
+query T nosort
+SELECT id FROM t WHERE id = '{550e8400-e29b-41d4-a716-446655440000}'
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# braced + uppercase + hyphen-less, combined — still the same value
+query T nosort
+SELECT id FROM t WHERE id = '{550E8400E29B41D4A716446655440000}'
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# hyphens are accepted after each whole pair of bytes (every 4 hex digits), not just the
+# canonical 8-4-4-4-12 split — this every-4 grouping is PG-valid and normalizes the same value
+query T nosort
+SELECT id FROM t WHERE id = '550e-8400-e29b-41d4-a716-4466-5544-0000'
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# ... but a hyphen at a NON-group position is rejected — this is PG's uuid_in algorithm, NOT a
+# looser strip-all-hyphens (which would wrongly accept it) → 22P02
+statement error 22P02
+SELECT id FROM t WHERE id = '5-50e8400e29b41d4a716446655440000'
+
+# --- ordering: UNSIGNED byte order over the 16 bytes (the uuid PK iterates in key order) ---
+# byte order is nil < 55.. < f4.. < ff.. → ids in ascending id:
+query T nosort
+SELECT id FROM t ORDER BY id
+----
+00000000-0000-0000-0000-000000000000
+550e8400-e29b-41d4-a716-446655440000
+f47ac10b-58cc-4372-a567-0e02b2c3d479
+ffffffff-ffff-ffff-ffff-ffffffffffff
+
+# ordering predicate (unsigned byte order): id < 550e8400... → only the nil UUID
+query T nosort
+SELECT id FROM t WHERE id < '550e8400-e29b-41d4-a716-446655440000' ORDER BY id
+----
+00000000-0000-0000-0000-000000000000
+
+# --- the nil UUID is a distinct, non-NULL value ------------------------------------------
+# A's ref is the nil UUID — a real value, matched by equality and NOT NULL
+query T nosort
+SELECT id FROM t WHERE ref = '00000000-0000-0000-0000-000000000000'
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# --- NULL handling on the nullable ref column --------------------------------------------
+# only the nil-id row has a NULL ref
+query T nosort
+SELECT id FROM t WHERE ref IS NULL
+----
+00000000-0000-0000-0000-000000000000
+
+query T nosort
+SELECT id FROM t WHERE ref IS NOT NULL ORDER BY id
+----
+550e8400-e29b-41d4-a716-446655440000
+f47ac10b-58cc-4372-a567-0e02b2c3d479
+ffffffff-ffff-ffff-ffff-ffffffffffff
+
+# = NULL is UNKNOWN, never a match (three-valued logic), for uuid as for every type
+query T nosort
+SELECT id FROM t WHERE ref = NULL
+----
+
+# IS [NOT] DISTINCT FROM: NULL-safe equality on uuid — NULL is a comparable value here
+query T nosort
+SELECT id FROM t WHERE ref IS NOT DISTINCT FROM NULL
+----
+00000000-0000-0000-0000-000000000000
+
+# ref IS DISTINCT FROM 550e8400... → ref ≠ that value, INCLUDING a NULL ref. A's ref is the
+# nil UUID (distinct) and the nil-id row's ref is NULL (distinct); the two 550e8400 refs are not.
+query T nosort
+SELECT id FROM t WHERE ref IS DISTINCT FROM '550e8400-e29b-41d4-a716-446655440000' ORDER BY id
+----
+00000000-0000-0000-0000-000000000000
+550e8400-e29b-41d4-a716-446655440000
+
+# --- input case is normalized on STORE, not just on compare ------------------------------
+statement ok
+CREATE TABLE n (id uuid PRIMARY KEY)
+
+# insert an UPPERCASE literal; it must read back as the canonical LOWERCASE form
+statement ok
+INSERT INTO n VALUES ('AABBCCDD-EEFF-0011-2233-445566778899')
+
+query T nosort
+SELECT id FROM n WHERE id = 'aabbccdd-eeff-0011-2233-445566778899'
+----
+aabbccdd-eeff-0011-2233-445566778899
+
+# --- PRIMARY KEY uniqueness over the uuid key --------------------------------------------
+# the same uuid (already present as A) is a duplicate → 23505
+statement error 23505
+INSERT INTO t VALUES ('550e8400-e29b-41d4-a716-446655440000', NULL)
+
+# ... and a DIFFERENT input spelling of the same uuid still collides (input is normalized
+# before the key is formed) → 23505
+statement error 23505
+INSERT INTO t VALUES ('550E8400E29B41D4A716446655440000', NULL)
+
+# a uuid PRIMARY KEY is NOT NULL (every PK is): a NULL id traps 23502
+statement error 23502
+INSERT INTO t VALUES (NULL, NULL)
+
+# --- malformed uuid input in a uuid context traps 22P02, deterministically pre-scan -------
+# too few hex digits ...
+statement error 22P02
+INSERT INTO t VALUES ('550e8400', NULL)
+
+# ... a non-hex character ...
+statement error 22P02
+INSERT INTO t VALUES ('550e8400-e29b-41d4-a716-44665544000g', NULL)
+
+# ... 33 hex digits (one too many) ...
+statement error 22P02
+INSERT INTO t VALUES ('550e8400-e29b-41d4-a716-4466554400000', NULL)
+
+# ... an unbalanced brace ...
+statement error 22P02
+INSERT INTO t VALUES ('{550e8400-e29b-41d4-a716-446655440000', NULL)
+
+# ... and a comparison literal traps the same way (pre-scan)
+statement error 22P02
+SELECT id FROM t WHERE id = 'not-a-uuid'
+
+# --- type errors: uuid is its own family -------------------------------------------------
+# uuid vs a non-uuid operand is NOT comparable: 42804 (like text = int)
+statement error 42804
+SELECT id FROM t WHERE id = 1
+
+# an integer literal into a uuid column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES (1, NULL)
+
+# a string with NO uuid context stays text and is never decoded: a uuid-shaped string compared
+# with a text column is the ordinary text value, NOT a 22P02 (and here it matches). A
+# malformed-uuid-shaped string in a text context is likewise fine (text is never decoded).
+statement ok
+CREATE TABLE txt (id int32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO txt VALUES (1, '550e8400-e29b-41d4-a716-446655440000'), (2, 'not-a-uuid')
+
+query I nosort
+SELECT id FROM txt WHERE s = '550e8400-e29b-41d4-a716-446655440000'
+----
+1
+
+# a string literal into an integer column is a type error: 42804
+statement error 42804
+INSERT INTO txt VALUES ('550e8400-e29b-41d4-a716-446655440000', 'x')
+
+# --- deterministic, cross-core cost ------------------------------------------------------
+statement ok
+CREATE TABLE w (id uuid PRIMARY KEY, ref uuid)
+
+statement ok
+INSERT INTO w VALUES
+  ('00000000-0000-0000-0000-000000000001', '550e8400-e29b-41d4-a716-446655440000'),
+  ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000003', '550e8400-e29b-41d4-a716-446655440000'),
+  ('00000000-0000-0000-0000-000000000004', 'f47ac10b-58cc-4372-a567-0e02b2c3d479'),
+  ('00000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-000000000000'),
+  ('00000000-0000-0000-0000-000000000006', 'ffffffff-ffff-ffff-ffff-ffffffffffff')
+
+# a uuid comparison is ONE operator_eval (weight 1), like an integer/bytea comparison —
+# independent of the 16-byte width. 6 scanned + 6 filter (one `=` per row) + 1 produced
+# + 0 projection (bare column) = 13.
+# cost: 13
+query T nosort
+SELECT id FROM w WHERE ref = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
+----
+00000000-0000-0000-0000-000000000004

@@ -35,6 +35,7 @@ import {
   isDecimal,
   isInteger,
   isText,
+  isUuid,
   rank,
   scalarTypeFromName,
 } from "./types.ts";
@@ -57,8 +58,11 @@ import {
   notDistinctFrom,
   nullValue,
   parseByteaHex,
+  parseUuid,
   renderByteaHex,
+  renderUuid,
   textValue,
+  uuidValue,
 } from "./value.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
@@ -135,19 +139,16 @@ export class Database {
       }
       const [ty, decimal] = resolveTypeAndTypmod(def.typeName, def.typeMod);
       if (def.primaryKey) {
-        // Only integers may be a key this slice. The order-preserving text and decimal key
-        // encodings (spec/design/encoding.md §2.4/§2.5) are authored but unexercised, so a
-        // text or decimal PRIMARY KEY is a documented 0A000 narrowing (types.md §11/§12).
-        if (!isInteger(ty)) {
+        // Integers and uuid may be a key. uuid is the FIRST non-integer key type — its fixed
+        // uuid-raw16 encoding (spec/design/encoding.md §2.7) is exercised. The other non-integer
+        // types' order-preserving key encodings (text §2.4, decimal §2.5, bytea §2.6, boolean's
+        // bool-byte) are authored but unexercised, so a text/decimal/bytea/boolean PRIMARY KEY is
+        // a documented 0A000 narrowing (types.md §9/§11/§12/§13), relaxable in a later in-key slice.
+        if (!isInteger(ty) && !isUuid(ty)) {
           throw engineError(
             "feature_not_supported",
             "a " + canonicalName(ty) + " primary key is not supported yet",
           );
-        }
-        // Likewise boolean: the bool-byte key encoding rule is authored but unexercised, so a
-        // boolean PRIMARY KEY is a documented 0A000 narrowing (spec/design/types.md §9).
-        if (isBool(ty)) {
-          throw engineError("feature_not_supported", "a boolean primary key is not supported yet");
         }
         if (pkSeen) {
           throw engineError(
@@ -276,7 +277,15 @@ export class Database {
       let key: Uint8Array | null = null;
       if (pk >= 0) {
         const pkv = row[pk]!; // non-null: a PK column is NOT NULL and was checked above
-        key = encodeInt(table.columns[pk]!.type, pkv.kind === "int" ? pkv.int : 0n);
+        if (pkv.kind === "uuid") {
+          // uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16,
+          // encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
+          key = pkv.bytes.slice();
+        } else if (pkv.kind === "int") {
+          key = encodeInt(table.columns[pk]!.type, pkv.int);
+        } else {
+          throw engineError("data_corrupted", "a primary key must be an integer or uuid value");
+        }
         const seen = key.join(",");
         if (seenKeys.has(seen) || store.get(key) !== undefined) {
           throw engineError(
@@ -724,6 +733,10 @@ function distinctRowKey(row: Value[]): string {
           // A distinct 'y' tag over the hex form (collision-free), so a bytea never collides
           // with a text value of the same bytes.
           return "y" + renderByteaHex(v.bytes);
+        case "uuid":
+          // A distinct 'u' tag over the canonical form, so a uuid never collides with a
+          // bytea/text of the same bytes.
+          return "u" + renderUuid(v.bytes);
       }
     })
     .join("|");
@@ -746,6 +759,7 @@ type ResolvedType =
   | { kind: "text" } // the text family (one collation, C); does not promote
   | { kind: "decimal" } // the decimal family (one type; the per-column typmod is separate)
   | { kind: "bytea" } // the bytea family (raw bytes); does not promote
+  | { kind: "uuid" } // the uuid family (fixed 16 bytes); does not promote. The first non-integer key.
   | { kind: "null" };
 
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
@@ -757,6 +771,7 @@ type RExpr =
   | { kind: "constText"; value: string }
   | { kind: "constDecimal"; value: Decimal }
   | { kind: "constBytea"; value: Uint8Array }
+  | { kind: "constUuid"; value: Uint8Array }
   | { kind: "constNull" }
   | { kind: "cast"; target: ScalarType; typmod: DecimalTypmod | null; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
@@ -1100,6 +1115,7 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
   if (isBool(ty)) return { kind: "bool" };
   if (isDecimal(ty)) return { kind: "decimal" };
   if (isBytea(ty)) return { kind: "bytea" };
+  if (isUuid(ty)) return { kind: "uuid" };
   return { kind: "int", ty };
 }
 
@@ -1184,13 +1200,19 @@ function resolve(
         case "bool":
           return { node: { kind: "constBool", value: e.literal.value }, type: { kind: "bool" } };
         case "text": {
-          // A string literal is text by default (collation C). It adapts to a BYTEA context
-          // only (types.md §6/§13): decode the hex input there (22P02 on bad hex); any other
-          // context — including none — keeps it text.
+          // A string literal is text by default (collation C). It adapts to a BYTEA or a UUID
+          // context (types.md §6/§13/§14): decode the hex input (bytea) or the PG-flexible uuid
+          // input (uuid) — 22P02 on malformed; any other context — including none — keeps it text.
           if (ctx !== null && isBytea(ctx)) {
             return {
               node: { kind: "constBytea", value: decodeByteaLiteral(e.literal.text) },
               type: { kind: "bytea" },
+            };
+          }
+          if (ctx !== null && isUuid(ctx)) {
+            return {
+              node: { kind: "constUuid", value: decodeUuidLiteral(e.literal.text) },
+              type: { kind: "uuid" },
             };
           }
           return { node: { kind: "constText", value: e.literal.text }, type: { kind: "text" } };
@@ -1226,6 +1248,10 @@ function resolve(
       if (isBytea(target)) {
         throw engineError("feature_not_supported", "casting to bytea is not supported yet");
       }
+      // uuid casts are likewise deferred (types.md §5/§14): casting TO uuid is 0A000.
+      if (isUuid(target)) {
+        throw engineError("feature_not_supported", "casting to uuid is not supported yet");
+      }
       const inner = resolve(scope, e.inner, null, ag);
       if (inner.type.kind === "bool") {
         throw typeError("cannot cast boolean to " + canonicalName(target));
@@ -1237,6 +1263,10 @@ function resolve(
       // Casting FROM bytea is likewise deferred (0A000).
       if (inner.type.kind === "bytea") {
         throw engineError("feature_not_supported", "casting from bytea is not supported yet");
+      }
+      // Casting FROM uuid is likewise deferred (0A000).
+      if (inner.type.kind === "uuid") {
+        throw engineError("feature_not_supported", "casting from uuid is not supported yet");
       }
       // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
       // decimal→decimal (re-scale), and NULL are all castable.
@@ -1465,6 +1495,12 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   if (byteaL !== byteaR && lt.kind !== "null" && rt.kind !== "null") {
     throw typeError("cannot compare a bytea value with a non-bytea value");
   }
+  // uuid compares only with uuid (or NULL); uuid with anything else is a mismatch.
+  const uuidL = lt.kind === "uuid";
+  const uuidR = rt.kind === "uuid";
+  if (uuidL !== uuidR && lt.kind !== "null" && rt.kind !== "null") {
+    throw typeError("cannot compare a uuid value with a non-uuid value");
+  }
 }
 
 // isAdaptableLiteral reports whether e is a literal that adapts to its sibling operand's type
@@ -1479,6 +1515,7 @@ function isAdaptableLiteral(e: Expr): boolean {
 function ctxOf(t: ResolvedType): ScalarType | null {
   if (t.kind === "int") return t.ty;
   if (t.kind === "bytea") return "bytea";
+  if (t.kind === "uuid") return "uuid";
   if (t.kind === "text") return "text";
   return null;
 }
@@ -1500,6 +1537,17 @@ function decodeByteaLiteral(str: string): Uint8Array {
   return r.bytes;
 }
 
+// decodeUuidLiteral decodes a single-quoted literal's content as a uuid value via the
+// PG-flexible input (parseUuid), mapping malformed input to a 22P02. Used when a string literal
+// adapts to a uuid context (types.md §6/§14); deterministic, fires at resolve before any scan.
+function decodeUuidLiteral(str: string): Uint8Array {
+  const r = parseUuid(str);
+  if ("error" in r) {
+    throw engineError("invalid_text_representation", "invalid input syntax for type uuid: " + r.error);
+  }
+  return r.bytes;
+}
+
 // promote is the promotion-tower result type of two arithmetic operands: the
 // higher-ranked integer type, or int64 when both are untyped NULLs.
 function promote(a: ResolvedType, b: ResolvedType): ScalarType {
@@ -1514,13 +1562,21 @@ function promote(a: ResolvedType, b: ResolvedType): ScalarType {
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
 // or NULL); a boolean or text operand is a 42804 type error.
 function requireNumericOperand(t: ResolvedType): void {
-  if (t.kind === "bool" || t.kind === "text" || t.kind === "bytea") {
+  if (t.kind === "bool" || t.kind === "text" || t.kind === "bytea" || t.kind === "uuid") {
     throw typeError("arithmetic operators require numeric operands");
   }
 }
 
 function requireBool(t: ResolvedType, msg: string): void {
-  if (t.kind === "int" || t.kind === "text" || t.kind === "decimal" || t.kind === "bytea") throw typeError(msg);
+  if (
+    t.kind === "int" ||
+    t.kind === "text" ||
+    t.kind === "decimal" ||
+    t.kind === "bytea" ||
+    t.kind === "uuid"
+  ) {
+    throw typeError(msg);
+  }
 }
 
 // requireTextOrNull: LIKE requires both operands be text (or a bare NULL literal, which is
@@ -1582,6 +1638,7 @@ function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): voi
   else if (isDecimal(colTy)) ok = t.kind === "int" || t.kind === "decimal" || t.kind === "null";
   else if (isBool(colTy)) ok = t.kind === "bool" || t.kind === "null";
   else if (isBytea(colTy)) ok = t.kind === "bytea" || t.kind === "null";
+  else if (isUuid(colTy)) ok = t.kind === "uuid" || t.kind === "null";
   else ok = t.kind === "text" || t.kind === "null";
   if (!ok) {
     throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
@@ -1647,10 +1704,15 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
       // A string literal adapts to a bytea column, decoding the hex input (types.md §6/§13);
       // malformed hex traps 22P02.
       if (isBytea(colTy)) return byteaValue(decodeByteaLiteral(v.text));
+      // ... and to a uuid column via the PG-flexible uuid input (types.md §6/§14); 22P02 on bad input.
+      if (isUuid(colTy)) return uuidValue(decodeUuidLiteral(v.text));
       throw typeError("cannot store a text value in " + canonicalName(colTy) + " column " + colName);
     case "bytea":
       if (isBytea(colTy)) return v;
       throw typeError("cannot store a bytea value in " + canonicalName(colTy) + " column " + colName);
+    case "uuid":
+      if (isUuid(colTy)) return v;
+      throw typeError("cannot store a uuid value in " + canonicalName(colTy) + " column " + colName);
     default: // bool
       if (isBool(colTy)) return v;
       throw typeError("cannot store a boolean value in " + canonicalName(colTy) + " column " + colName);
@@ -1712,6 +1774,8 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
       return decimalValue(e.value);
     case "constBytea":
       return byteaValue(e.value);
+    case "constUuid":
+      return uuidValue(e.value);
     case "constNull":
       return nullValue();
     case "cast": {
@@ -1982,6 +2046,7 @@ function valueCmp(a: Value, b: Value): number {
   if (a.kind === "decimal" && b.kind === "decimal") return a.dec.cmpValue(b.dec);
   if (a.kind === "text" && b.kind === "text") return compareTextC(a.text, b.text);
   if (a.kind === "bytea" && b.kind === "bytea") return compareBytea(a.bytes, b.bytes);
+  if (a.kind === "uuid" && b.kind === "uuid") return compareBytea(a.bytes, b.bytes);
   if (a.kind === "bool" && b.kind === "bool") {
     return a.value === b.value ? 0 : a.value ? 1 : -1;
   }
@@ -2005,8 +2070,10 @@ function familyRank(v: Value): number {
       return 3;
     case "text":
       return 4;
-    default: // bytea
+    case "bytea":
       return 5;
+    default: // uuid
+      return 6;
   }
 }
 

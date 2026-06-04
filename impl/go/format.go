@@ -45,6 +45,8 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 6
 	case Bytea:
 		return 7
+	case Uuid:
+		return 8
 	default:
 		return 0
 	}
@@ -67,6 +69,8 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return DecimalType, true
 	case 7:
 		return Bytea, true
+	case 8:
+		return Uuid, true
 	default:
 		return 0, false
 	}
@@ -105,6 +109,12 @@ func encodeValue(ty ScalarType, v Value) []byte {
 		out := make([]byte, 0, 3+len(v.Str))
 		out = append(out, 0x00) // present
 		out = appendU16(out, uint16(len(v.Str)))
+		return append(out, v.Str...)
+	case ValUuid:
+		// Fixed 16-byte body, NO length prefix (the first fixed-width non-integer value) —
+		// spec/fileformat/format.md. The 16 raw bytes live in Str.
+		out := make([]byte, 0, 1+16)
+		out = append(out, 0x00) // present
 		return append(out, v.Str...)
 	case ValBool:
 		b := byte(0x00)
@@ -651,6 +661,15 @@ func readValue(ty ScalarType, buf []byte, pos *int) (Value, error) {
 			}
 			// ByteaValue copies the bytes into a string, so the value owns its content.
 			return ByteaValue(bb), nil
+		}
+		if ty.IsUuid() {
+			// Fixed 16 raw bytes, no length prefix. Must branch before the integer path —
+			// DecodeInt would sign-flip and WidthBytes is 16 there too.
+			ub, err := take(buf, pos, 16)
+			if err != nil {
+				return Value{}, err
+			}
+			return UuidValue(ub), nil
 		}
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {

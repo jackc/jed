@@ -124,6 +124,25 @@ fn bytea_table_db() -> Database {
     db
 }
 
+/// A table with a uuid PRIMARY KEY (the first golden with a NON-integer stored key — the
+/// load-bearing §8 cross-core key-path proof) plus a nullable uuid column. Exercises the value
+/// codec's fixed-16-byte uuid branch (no length prefix), the uuid key encoding (bare 16 bytes),
+/// a present and a NULL uuid value, and the nil/max boundary UUIDs. Rows go in via INSERT and
+/// the store sorts them into key (byte) order. Must match spec/fileformat/verify.rb's UUID_TABLE.
+fn uuid_table_db() -> Database {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES \
+         ('00000000-0000-0000-0000-000000000000', '550e8400-e29b-41d4-a716-446655440000'), \
+         ('550e8400-e29b-41d4-a716-446655440000', NULL), \
+         ('f47ac10b-58cc-4372-a567-0e02b2c3d479', '00000000-0000-0000-0000-000000000000'), \
+         ('ffffffff-ffff-ffff-ffff-ffffffffffff', 'ffffffff-ffff-ffff-ffff-ffffffffffff')",
+    );
+    db
+}
+
 /// A table exercising the DEFAULT column constraint on disk — the catalog flags bit2 + the
 /// pre-evaluated default value (written after the typmod). Covers an int default, a text
 /// default, a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to
@@ -155,6 +174,7 @@ fn write_matches_goldens() {
         ("bool_table.jed", bool_table_db),
         ("decimal_table.jed", decimal_table_db),
         ("bytea_table.jed", bytea_table_db),
+        ("uuid_table.jed", uuid_table_db),
         ("default_table.jed", default_table_db),
         ("nopk_table.jed", nopk_table_db),
     ];
@@ -175,6 +195,7 @@ fn read_goldens_reproduces_rows() {
         ("bool_table.jed", bool_table_db, "t"),
         ("decimal_table.jed", decimal_table_db, "t"),
         ("bytea_table.jed", bytea_table_db, "t"),
+        ("uuid_table.jed", uuid_table_db, "t"),
         ("default_table.jed", default_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),

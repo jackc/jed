@@ -37,9 +37,12 @@ schema_version = 1
 #               value's RAW bytes (no UTF-8 / collation framing — ../design/encoding.md
 #               §2.6); "decimal-order-preserving" = sign/class byte + order-preserving
 #               exponent + big-endian base-100 mantissa pairs + terminator (CockroachDB
-#               style — ../design/encoding.md §2.5). All sort byte-for-byte identically
-#               to logical order. width_bytes is omitted for variable-width types
-#               (text, bytea, decimal).
+#               style — ../design/encoding.md §2.5); "uuid-raw16" = the 16 raw bytes of
+#               the value, big-endian, with NO sign-flip, escape, or terminator (fixed-
+#               width, so unsigned memcmp over the bytes IS the order — ../design/encoding.md
+#               §2.7). All sort byte-for-byte identically to logical order. width_bytes is
+#               omitted for the variable-width types (text, bytea, decimal) but PRESENT for
+#               uuid (fixed 16 bytes — uuid is the first non-integer type usable as a key).
 # max_precision for decimal only: the maximum total significant digits a value may carry
 #               (precision p of numeric(p,s)). 1000, PG's declarable max. An unconstrained
 #               `numeric` (no typmod) is capped here too (../design/decimal.md §2).
@@ -185,3 +188,26 @@ aliases = []
 family = "bytea"
 storable = true
 encoding = { method = "bytea-terminated-escape" }
+
+# --- uuid: a fixed 16-byte value (RFC 4122) ----------------------------------
+# STORABLE this slice: `CREATE TABLE t(id uuid)` works, values are stored on disk (on-disk
+# type code 8 — ../fileformat/format.md), and uuid columns compare/order/dedup by UNSIGNED
+# byte order over the 16 bytes (memcmp — exactly PostgreSQL's uuid comparison). There is NO
+# collation (uuid is bytes, not text) and NO alias (PostgreSQL spells it only `uuid`). A uuid
+# literal is written as a single-quoted string in a uuid context (../design/types.md §6/§14):
+# input replicates PostgreSQL's `uuid_in` — optional surrounding braces `{}`, any case, and an
+# optional hyphen after each whole pair of bytes (canonical 8-4-4-4-12, hyphen-less 32-hex, and
+# every-4-digit grouping all accepted; a misplaced hyphen is rejected) — normalizing to 16 bytes; rendered
+# back as the canonical `8-4-4-4-12` LOWERCASE-hex spelling (PG uuid_out). Malformed input
+# traps 22P02. No arithmetic; uuid⇄other casts and uuid functions (gen_random_uuid) are
+# deferred. UNLIKE the other non-integer types, uuid IS allowed in a PRIMARY KEY / key: it is
+# the FIRST non-integer key type, because its order-preserving `uuid-raw16` encoding is the 16
+# raw bytes (fixed-width — no escape/terminator, no sign-flip), exercised this slice
+# (encoding.md §2.7). It is also the first fixed-width non-integer value, so `width_bytes` is
+# present (16). No bits/min/max/overflow/rank (integer-family fields); no collation.
+[[type]]
+id = "uuid"
+aliases = []
+family = "uuid"
+storable = true
+encoding = { method = "uuid-raw16", width_bytes = 16 }

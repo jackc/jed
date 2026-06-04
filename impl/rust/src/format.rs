@@ -39,6 +39,7 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Bool => 5,
         ScalarType::Decimal => 6,
         ScalarType::Bytea => 7,
+        ScalarType::Uuid => 8,
     }
 }
 
@@ -52,6 +53,7 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         5 => Some(ScalarType::Bool),
         6 => Some(ScalarType::Decimal),
         7 => Some(ScalarType::Bytea),
+        8 => Some(ScalarType::Uuid),
         _ => None,
     }
 }
@@ -98,6 +100,14 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
             out.push(0x00); // present
             out.extend_from_slice(&(b.len() as u16).to_be_bytes());
             out.extend_from_slice(b);
+            out
+        }
+        // Uuid: a fixed 16-byte body, NO length prefix (the first fixed-width non-integer
+        // value) — spec/fileformat/format.md.
+        Value::Uuid(u) => {
+            let mut out = Vec::with_capacity(1 + 16);
+            out.push(0x00); // present
+            out.extend_from_slice(u);
             out
         }
         Value::Bool(b) => vec![0x00, u8::from(*b)], // present tag + bool-byte (0x00 false, 0x01 true)
@@ -575,6 +585,13 @@ fn read_value(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
                 let len = read_u16(buf, pos)? as usize;
                 let bytes = take(buf, pos, len)?.to_vec();
                 Ok(Value::Bytea(bytes))
+            } else if ty.is_uuid() {
+                // Fixed 16 raw bytes, no length prefix (must branch before the integer path —
+                // decode_int would sign-flip and width_bytes is 16 there too).
+                let b: [u8; 16] = take(buf, pos, 16)?
+                    .try_into()
+                    .map_err(|_| corrupt("invalid uuid length"))?;
+                Ok(Value::Uuid(b))
             } else {
                 let w = ty.width_bytes();
                 let vb = take(buf, pos, w)?;

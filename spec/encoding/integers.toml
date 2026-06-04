@@ -8,6 +8,11 @@
 #                      byte strings are strictly increasing under memcmp
 # Reasoning + the encoding rules live in ../design/encoding.md.
 # Test-time only; bytes are lowercase hex, no 0x prefix, no separators.
+#
+# Despite the filename, this file also carries the first NON-integer key vectors: `uuid`
+# (method `uuid-raw16`, ../design/encoding.md §2.7) — a fixed 16-byte value, NO sign-flip,
+# escape, or terminator, so the bytes ARE the value. uuid is the first non-integer type
+# actually usable as a key, so its vectors are exercised, not merely authored.
 
 schema_version = 1
 
@@ -80,4 +85,39 @@ cases = [
   { value = 1,    bytes = "ff7ffe" },
   { value = 0,    bytes = "ff7fff" },
   { value = -1,   bytes = "ff8000" },
+]
+
+# --- uuid (width 16, method `uuid-raw16`) ------------------------------------
+# The 16 raw bytes of the canonical 8-4-4-4-12 form, big-endian, NO sign-flip / escape /
+# terminator (../design/encoding.md §2.7). Cases are in ascending logical order, so the
+# byte strings are strictly increasing under memcmp (invariant 3). Values are the canonical
+# LOWERCASE hyphenated spelling so round-trip decode(encode(v)) == v holds.
+[[bare]]
+type = "uuid"
+cases = [
+  { value = "00000000-0000-0000-0000-000000000000", bytes = "00000000000000000000000000000000" },  # MIN (nil UUID)
+  { value = "00000000-0000-0000-0000-000000000001", bytes = "00000000000000000000000000000001" },
+  { value = "550e8400-e29b-41d4-a716-446655440000", bytes = "550e8400e29b41d4a716446655440000" },
+  { value = "f47ac10b-58cc-4372-a567-0e02b2c3d479", bytes = "f47ac10b58cc4372a5670e02b2c3d479" },
+  { value = "ffffffff-ffff-ffff-ffff-ffffffffffff", bytes = "ffffffffffffffffffffffffffffffff" },  # MAX (max UUID)
+]
+
+# nullable uuid slot: 0x00 present + 16 bytes, 0x01 NULL (NULL sorts last ascending).
+[[nullable]]
+type = "uuid"
+cases = [
+  { value = "00000000-0000-0000-0000-000000000000", bytes = "0000000000000000000000000000000000" },
+  { value = "550e8400-e29b-41d4-a716-446655440000", bytes = "00550e8400e29b41d4a716446655440000" },
+  { null = true,                                     bytes = "01" },  # NULL sorts last
+]
+
+# descending uuid: bitwise inversion of the nullable encoding, tag included. NULL lands
+# first; listed in ascending byte order (= descending logical order) so invariant (3) holds.
+[[descending]]
+type = "uuid"
+base = "nullable"
+cases = [
+  { null = true,                                     bytes = "fe" },  # NULL sorts first under descending
+  { value = "550e8400-e29b-41d4-a716-446655440000", bytes = "ffaaf17bff1d64be2b58e9bb99aabbffff" },
+  { value = "00000000-0000-0000-0000-000000000000", bytes = "ffffffffffffffffffffffffffffffffff" },
 ]

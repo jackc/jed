@@ -72,7 +72,10 @@ drop_table     ::= "DROP" "TABLE" identifier
  * resolved by the catalog (case-insensitively); accepted names:
  *   int16 | smallint | int32 | int | integer | int64 | bigint
  *   text | varchar | "character varying" | string
+ *   boolean | bool
  *   decimal | numeric | dec
+ *   bytea
+ *   uuid
  * An unknown name is rejected at execution time (42704), not by the grammar. The typmod
  * is accepted ONLY for decimal/numeric: numeric(p) (= numeric(p,0)) and numeric(p,s),
  * with 1 <= p <= 1000 and 0 <= s <= p (a bad typmod traps 22023; ../design/grammar.md).

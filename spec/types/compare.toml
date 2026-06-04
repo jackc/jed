@@ -45,6 +45,12 @@ strategy = "none"
 family = "bytea"
 strategy = "none"
 
+# uuid, like bytea, has a single type with no promotion tower (strategy = "none"): two uuid
+# operands compare directly by unsigned byte order over the 16 bytes, no reconciliation.
+[[promotion]]
+family = "uuid"
+strategy = "none"
+
 # --- comparability -----------------------------------------------------------
 # Which (family, family) pairs may be compared at all. Anything not listed is a
 # type error. Step 1 has exactly one family, so there is one rule. Cross-family
@@ -103,6 +109,15 @@ left_family = "bytea"
 right_family = "bytea"
 via = "none"
 
+# uuid × uuid only. via = "none": compare by unsigned byte order (memcmp over the 16 raw
+# bytes — exactly PostgreSQL's uuid comparison). uuid × bytea / uuid × text / uuid × integer
+# are NOT listed, so they are 42804 type errors (uuid is its own family — a uuid is not a
+# bytea even when the bytes coincide).
+[[comparable]]
+left_family = "uuid"
+right_family = "uuid"
+via = "none"
+
 # --- value ordering ----------------------------------------------------------
 # The total order over non-NULL integers used by ORDER BY and by index/key
 # iteration. Plain signed numeric order; matches the order-preserving key
@@ -130,6 +145,12 @@ decimal = "numeric-ascending"
 # key encoding (scalars.toml "bytea-terminated-escape") reproduces this order in raw
 # bytes, so stored byte order == logical order.
 bytea = "byte-ascending"
+# uuid orders by unsigned byte order over its 16 bytes (memcmp), exactly PostgreSQL's uuid
+# comparison. Fixed-width, so there is no prefix/length case (every value is 16 bytes). The
+# order-preserving key encoding (scalars.toml "uuid-raw16") is literally those 16 bytes, so
+# stored byte order == logical order — and uuid is the first non-integer type that EXERCISES
+# this as a real key (../design/encoding.md §2.7).
+uuid = "byte-ascending"
 
 # NULL's position in the physical total order of encoded keys (index/key
 # iteration), RATIFIED with the key-encoding spec (CLAUDE.md §11 step 4) and

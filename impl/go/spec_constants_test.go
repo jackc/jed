@@ -141,6 +141,33 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 	if got, want := decimal.int("max_scale"), int64(MaxScale); got != want {
 		t.Errorf("max_scale: spec %d, module %d", got, want)
 	}
+
+	// uuid: storable, the uuid family, fixed-width (the first non-integer with a width_bytes).
+	// Its on-disk width (16) is a cross-core contract, so cross-check it against the spec.
+	var uuid *tomlRow
+	for i := range tables {
+		if tables[i].str("id") == "uuid" {
+			uuid = &tables[i]
+		}
+	}
+	if uuid == nil {
+		t.Fatal("uuid type missing from scalars.toml")
+	}
+	if uuid.str("family") != "uuid" {
+		t.Errorf("uuid: family mismatch")
+	}
+	if !uuid.boolVal("storable") {
+		t.Errorf("uuid must be storable")
+	}
+	if got, ok := ScalarTypeFromName("uuid"); !ok || got != Uuid {
+		t.Errorf("\"uuid\" should resolve to Uuid")
+	}
+	if Uuid.CanonicalName() != "uuid" {
+		t.Errorf("uuid canonical name mismatch")
+	}
+	if Uuid.WidthBytes() != 16 {
+		t.Errorf("uuid should be fixed 16 bytes, got %d", Uuid.WidthBytes())
+	}
 }
 
 func mustType(t *testing.T, name string) ScalarType {
