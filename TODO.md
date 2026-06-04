@@ -185,8 +185,27 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       [manifest.toml](spec/conformance/manifest.toml), all three cores in lockstep, pinned by
       [spec/conformance/suites/query/distinct.test](spec/conformance/suites/query/distinct.test).
       _(size: S–M)_
-- [ ] **Predicate forms** — `IN (list)`, `BETWEEN`, `LIKE` (text-dependent), `CASE`
-      expressions. _(size: M; LIKE deps: text type)_
+- [x] **Predicate forms** — `IN (list)`, `BETWEEN`, `LIKE`, `CASE`. Done in **four vertical
+      slices** (all three cores in lockstep), all edge cases verified against the live `postgres:18`
+      oracle. (1) **`IN (list)` / `NOT IN`** and (2) **`BETWEEN` / `NOT BETWEEN`** are non-associative
+      postfix forms at the comparison level (a two-token `NOT` lookahead), **desugared at resolve**
+      into the existing `=`/`OR`/`AND`/`NOT` nodes — so three-valued NULL (`1 IN (2,NULL)` is NULL;
+      the Kleene-AND `5 BETWEEN 10 AND NULL` is FALSE), per-element/bound typing (22003/42804), and
+      cost all fall out (the LHS is re-evaluated per element/bound). BETWEEN's bounds parse at the
+      additive level so the structural `AND` is not the connective. (3) **`LIKE` / `NOT LIKE`** is a
+      genuine catalog operator (text×text→boolean) with a hand-written **code-point** matcher (`%`/`_`,
+      default `\` escape) — `'😀x' LIKE '_x'` is TRUE; a pattern ending in a lone escape *reached
+      during matching* traps the new **`22025`** lazily (matching PG). (4) **`CASE`** (searched +
+      simple) is the engine's first **lazy** expression and the one sanctioned no-short-circuit
+      exception (cost.md §3): first-TRUE wins, later arms unevaluated; result arms unify (numeric
+      promote, all-NULL → text, cross-family 42804). Authored spec-first: grammar.ebnf + grammar.md
+      §20–§23, cost.md §3 (CASE exception), error `22025`, the `like` catalog operator (+ codegen,
+      verify.rb), capabilities `expr.{in_list,between,like,case}` + the `predicates` profile; pinned
+      by `spec/conformance/suites/expr/{in_list,between,like,case}.test` (50/0/0 byte-identical in
+      Rust, Go, TS, `# cost:`/`# names:` asserted). **Deferred narrowings:** `IN (subquery)` (Phase 4
+      subqueries); LIKE `ESCAPE 'c'` clause, `ILIKE`, `SIMILAR TO`; CASE integer-arm width follows our
+      default (int64) rather than PG's exact promoted width (unobservable — all integers render `I`).
+      _(was: M; LIKE deps: text type ✓)_
 - [x] **Aggregates** `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` + **`GROUP BY`** + **`HAVING`**.
       Done in **three vertical slices** (all three cores in lockstep): (1) the engine's first
       **function-call syntax** (`name ( * | expr )`, one-token lookahead so names stay
