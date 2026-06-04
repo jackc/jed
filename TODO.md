@@ -337,11 +337,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       capabilities `query.join_inner` / `query.cross_join` / `query.table_alias` /
       `query.qualified_column` + the `joins` profile in [manifest.toml](spec/conformance/manifest.toml),
       pinned by `spec/conformance/suites/joins/*.test`. _(was: L; deps: expression evaluator)_
-  - [ ] **Outer joins — `LEFT`/`RIGHT`/`FULL [OUTER] JOIN`** — the syntax **parses** and the AST
-        carries the join kind, but executing one is a documented **`0A000`** narrowing this slice.
-        The fast-follow is **executor-only**: add the "unmatched row → NULL-extend the absent side"
-        branch at the existing join node (the flat-row model + per-node `ON` already support it).
-        `USING` / `NATURAL` / comma-`FROM` / `t.*` stay deferred too. _(size: M; deps: this slice)_
+  - [x] **Outer joins — `LEFT`/`RIGHT`/`FULL [OUTER] JOIN`** — done & committed across Rust/Go/TS.
+        **Executor-only** follow-on as planned: the existing left-deep nested-loop gained an
+        "unmatched row → NULL-extend the absent side" branch (LEFT/FULL preserve unmatched left rows,
+        RIGHT/FULL preserve unmatched right rows), with NULL-pad widths taken from the **scope** (not a
+        sampled row, so an empty intermediate result pads correctly). The three-valued `ON` is unchanged
+        (a NULL key NULL-extends rather than drops), `WHERE` still runs post-join (the PG "WHERE on the
+        nullable side downgrades to inner" behavior falls out for free), and cost matches the inner join
+        except for the extra preserved rows — NULL-extension charges no `operator_eval`
+        ([cost.md §3](spec/design/cost.md)). New capabilities `query.join_left` / `query.join_right` /
+        `query.join_full` + the `outer_joins` profile in [manifest.toml](spec/conformance/manifest.toml),
+        pinned by `spec/conformance/suites/joins/{left,right,full}.test`; semantics documented in
+        [grammar.md §15](spec/design/grammar.md). `USING` / `NATURAL` / comma-`FROM` / `t.*` stay
+        deferred. _(was: M; deps: INNER/CROSS slice)_
 - [ ] **Subqueries** — scalar, `IN (subquery)`, `EXISTS`, then correlated. _(size: L; deps: joins)_
 - [ ] **Set operations** — `UNION [ALL]`, `INTERSECT`, `EXCEPT`. _(size: M)_
 - [ ] **Constraints** — `NOT NULL`, `DEFAULT`, `UNIQUE`, `CHECK`, **composite `PRIMARY KEY`**

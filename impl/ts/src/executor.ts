@@ -409,12 +409,10 @@ export class Database {
 
     // Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
     // relations joined so far — rels[0..k+1]), so a forward reference to a not-yet-joined table
-    // is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON. The OUTER
-    // kinds parse but are rejected here (0A000) — only INNER/CROSS execute this slice (§15).
+    // is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON; INNER and
+    // the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the same way — the join kind only
+    // changes how unmatched rows are handled in the loop below (§15).
     const joinOns: (RExpr | null)[] = sel.joins.map((j, k) => {
-      if (j.kind !== "inner" && j.kind !== "cross") {
-        throw engineError("feature_not_supported", "outer joins (LEFT/RIGHT/FULL) are not supported yet");
-      }
       if (j.on === null) return null;
       const partial = new Scope(scope.rels.slice(0, k + 2));
       return resolveBooleanFilter(partial, j.on);
@@ -436,17 +434,42 @@ export class Database {
     // Left-deep nested-loop join. `running` holds the combined rows over the relations joined
     // so far (starting with the first table's rows). For each join, concatenate every running
     // row with every right-table row; CROSS keeps all pairs, INNER keeps a pair iff its ON
-    // predicate is TRUE (three-valued — a NULL join key never matches). Output order is
-    // deterministic: running order (outer) then right key order (inner) (CLAUDE.md §10).
+    // predicate is TRUE (three-valued — a NULL join key never matches). LEFT/FULL additionally
+    // emit each unmatched left row NULL-extended over the right side; RIGHT/FULL emit each
+    // unmatched right row NULL-extended over the left side. The NULL-extension pushes evaluate
+    // no ON (no operator_eval — spec/design/cost.md §3). Output order is deterministic: running
+    // order (outer) then right key order (inner), each unmatched left row after its (empty)
+    // match run, all unmatched right rows last in right key order (CLAUDE.md §10).
+    const nullRow = (n: number): Row => Array.from({ length: n }, () => nullValue());
     let running: Row[] = materialized[0]!;
     for (let k = 0; k < sel.joins.length; k++) {
       const rightRows = materialized[k + 1]!;
       const on = joinOns[k]!;
+      const kind = sel.joins[k]!.kind;
+      const emitLeft = kind === "left" || kind === "full";
+      const emitRight = kind === "right" || kind === "full";
+      // NULL-pad widths come from the SCOPE, never a sampled row, so they are correct even when
+      // `running`/`rightRows` is empty: the right table begins at flat offset rels[k+1].offset
+      // (= the width of every running row) and is that many columns wide.
+      const leftPad = scope.rels[k + 1]!.offset;
+      const rightPad = scope.rels[k + 1]!.table.columns.length;
       const next: Row[] = [];
+      const rightMatched: boolean[] = new Array(rightRows.length).fill(false);
       for (const left of running) {
-        for (const right of rightRows) {
-          const combined = left.concat(right);
-          if (on === null || isTrue(evalExpr(on, combined, meter))) next.push(combined);
+        let leftMatched = false;
+        for (let ri = 0; ri < rightRows.length; ri++) {
+          const combined = left.concat(rightRows[ri]!);
+          if (on === null || isTrue(evalExpr(on, combined, meter))) {
+            next.push(combined);
+            leftMatched = true;
+            rightMatched[ri] = true;
+          }
+        }
+        if (emitLeft && !leftMatched) next.push(left.concat(nullRow(rightPad)));
+      }
+      if (emitRight) {
+        for (let ri = 0; ri < rightRows.length; ri++) {
+          if (!rightMatched[ri]) next.push(nullRow(leftPad).concat(rightRows[ri]!));
         }
       }
       running = next;

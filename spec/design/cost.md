@@ -141,6 +141,17 @@ cost is pinned here because, with no reference implementation, the count is a cr
 charge nothing); 2 emitted rows → 2 `row_produced`. **Total = 3 + 2 + 6 + 2 = 13.** A
 `CROSS JOIN` of the same tables emits all 6 pairs and evaluates no `ON`: 3 + 2 + 0 + 6 = **11**.
 
+**OUTER joins charge identically — only the produced-row count grows.** `LEFT`/`RIGHT`/`FULL [OUTER]
+JOIN` ([grammar.md](grammar.md) §15) evaluate the `ON` over the **same** `|running| × |right|`
+candidate set (so the `ON` `operator_eval` count is unchanged from an INNER join of the same tables);
+a row that matches nothing is then **NULL-extended on the absent side and added to the surviving set
+without re-evaluating `ON`** — the NULL-extension itself is unmetered, like row concatenation. Those
+NULL-extended rows are ordinary surviving combined rows, so they incur WHERE `operator_eval` and
+`row_produced` exactly like matched rows. So for the example tables with `SELECT * FROM a LEFT JOIN b
+ON a.k = b.k` where 1 `a`-row matches 1 `b`-row and the other 2 `a`-rows match nothing: 3 + 2
+materialize, 6 `ON`, no WHERE, and 1 matched + 2 NULL-extended = 3 emitted rows → **3 + 2 + 6 + 3 =
+14** (the INNER form of the same query is `… + 1 = 12`; the +2 is the two preserved-left rows).
+
 ### What is NOT metered (defined boundary)
 
 Metering covers **execution** — per-row scans, per-row produced, per-row expression

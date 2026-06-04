@@ -485,16 +485,11 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 
 	// Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
 	// relations joined so far — rels[:k+2]), so a forward reference to a not-yet-joined table
-	// is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON. The OUTER
-	// kinds parse but are rejected here (0A000) — only INNER/CROSS execute this slice (§15).
+	// is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON; INNER and
+	// the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the same way — the join kind only
+	// changes how unmatched rows are handled in the loop below (§15).
 	joinOns := make([]*rExpr, len(sel.Joins))
 	for k, j := range sel.Joins {
-		switch j.Kind {
-		case JoinInner, JoinCross:
-		default:
-			return Outcome{}, NewError(FeatureNotSupported,
-				"outer joins (LEFT/RIGHT/FULL) are not supported yet")
-		}
 		if j.On != nil {
 			partial := &scope{rels: s.rels[:k+2]}
 			on, oerr := resolveBooleanFilter(partial, j.On)
@@ -522,15 +517,28 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	// Left-deep nested-loop join. `running` holds the combined rows over the relations joined
 	// so far (starting with the first table's rows). For each join, concatenate every running
 	// row with every right-table row; CROSS keeps all pairs, INNER keeps a pair iff its ON
-	// predicate is TRUE (three-valued — a NULL join key never matches). Output order is
-	// deterministic: running order (outer) then right key order (inner) (CLAUDE.md §10).
+	// predicate is TRUE (three-valued — a NULL join key never matches). LEFT/FULL additionally
+	// emit each unmatched left row NULL-extended over the right side; RIGHT/FULL emit each
+	// unmatched right row NULL-extended over the left side. The NULL-extension appends evaluate
+	// no ON (no operator_eval — spec/design/cost.md §3). Output order is deterministic: running
+	// order (outer) then right key order (inner), each unmatched left row after its (empty)
+	// match run, all unmatched right rows last in right key order (CLAUDE.md §10).
 	running := materialized[0]
 	for k := range sel.Joins {
 		rightRows := materialized[k+1]
 		on := joinOns[k]
+		emitLeft := sel.Joins[k].Kind == JoinLeft || sel.Joins[k].Kind == JoinFull
+		emitRight := sel.Joins[k].Kind == JoinRight || sel.Joins[k].Kind == JoinFull
+		// NULL-pad widths come from the SCOPE, never a sampled row, so they are correct even when
+		// `running`/`rightRows` is empty: the right table begins at flat offset rels[k+1].offset
+		// (= the width of every running row) and is that many columns wide.
+		leftPad := s.rels[k+1].offset
+		rightPad := len(s.rels[k+1].table.Columns)
 		var next []Row
+		rightMatched := make([]bool, len(rightRows))
 		for _, left := range running {
-			for _, right := range rightRows {
+			leftMatched := false
+			for ri, right := range rightRows {
 				combined := make(Row, 0, len(left)+len(right))
 				combined = append(combined, left...)
 				combined = append(combined, right...)
@@ -543,6 +551,28 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 					keep = v.IsTrue()
 				}
 				if keep {
+					next = append(next, combined)
+					leftMatched = true
+					rightMatched[ri] = true
+				}
+			}
+			if emitLeft && !leftMatched {
+				combined := make(Row, 0, len(left)+rightPad)
+				combined = append(combined, left...)
+				for i := 0; i < rightPad; i++ {
+					combined = append(combined, NullValue())
+				}
+				next = append(next, combined)
+			}
+		}
+		if emitRight {
+			for ri, right := range rightRows {
+				if !rightMatched[ri] {
+					combined := make(Row, 0, leftPad+len(right))
+					for i := 0; i < leftPad; i++ {
+						combined = append(combined, NullValue())
+					}
+					combined = append(combined, right...)
 					next = append(next, combined)
 				}
 			}

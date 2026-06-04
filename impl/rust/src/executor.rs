@@ -515,19 +515,11 @@ impl Database {
         // Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
         // relations joined so far — scope.rels[..=k+1]), so a forward reference to a
         // not-yet-joined table is a clean 42P01/42703 instead of an out-of-range row index.
-        // CROSS has no ON. The OUTER kinds parse but are rejected here (0A000) — only
-        // INNER/CROSS execute this slice (spec/design/grammar.md §15).
+        // CROSS has no ON; INNER and the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the
+        // same way — the join kind only changes how unmatched rows are handled in the loop below
+        // (spec/design/grammar.md §15).
         let mut join_ons: Vec<Option<RExpr>> = Vec::with_capacity(sel.joins.len());
         for (k, j) in sel.joins.iter().enumerate() {
-            match j.kind {
-                JoinKind::Inner | JoinKind::Cross => {}
-                JoinKind::Left | JoinKind::Right | JoinKind::Full => {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "outer joins (LEFT/RIGHT/FULL) are not supported yet",
-                    ));
-                }
-            }
             match &j.on {
                 None => join_ons.push(None),
                 Some(on_expr) => {
@@ -557,15 +549,28 @@ impl Database {
         // joined so far (starting with the first table's rows). For each join, concatenate
         // every running row with every right-table row; CROSS keeps all pairs, INNER keeps a
         // pair iff its ON predicate is TRUE (three-valued — a NULL join key never matches).
+        // LEFT/FULL additionally emit each unmatched left row NULL-extended over the right
+        // side; RIGHT/FULL emit each unmatched right row NULL-extended over the left side.
+        // The NULL-extension pushes evaluate no ON (no operator_eval — spec/design/cost.md §3).
         // Output order is deterministic: running order (outer) then right key order (inner),
-        // so a join is deterministic even with no ORDER BY (CLAUDE.md §10).
+        // each unmatched left row after its (empty) match run, all unmatched right rows last in
+        // right key order — so a join is deterministic even with no ORDER BY (CLAUDE.md §10).
         let mut running: Vec<Row> = std::mem::take(&mut materialized[0]);
-        for (k, _j) in sel.joins.iter().enumerate() {
+        for (k, j) in sel.joins.iter().enumerate() {
             let right_rows = &materialized[k + 1];
             let on = &join_ons[k];
+            let emit_left = matches!(j.kind, JoinKind::Left | JoinKind::Full);
+            let emit_right = matches!(j.kind, JoinKind::Right | JoinKind::Full);
+            // NULL-pad widths come from the SCOPE, never a sampled row, so they are correct even
+            // when `running`/`right_rows` is empty: the right table begins at flat offset
+            // rels[k+1].offset (= the width of every running row) and is that many columns wide.
+            let left_pad = scope.rels[k + 1].offset;
+            let right_pad = scope.rels[k + 1].table.columns.len();
             let mut next: Vec<Row> = Vec::new();
+            let mut right_matched = vec![false; right_rows.len()];
             for left in &running {
-                for right in right_rows {
+                let mut left_matched = false;
+                for (ri, right) in right_rows.iter().enumerate() {
                     let mut combined = left.clone();
                     combined.extend_from_slice(right);
                     let keep = match on {
@@ -573,6 +578,22 @@ impl Database {
                         Some(pred) => pred.eval(&combined, &mut meter)?.is_true(),
                     };
                     if keep {
+                        next.push(combined);
+                        left_matched = true;
+                        right_matched[ri] = true;
+                    }
+                }
+                if emit_left && !left_matched {
+                    let mut combined = left.clone();
+                    combined.resize(combined.len() + right_pad, Value::Null);
+                    next.push(combined);
+                }
+            }
+            if emit_right {
+                for (ri, right) in right_rows.iter().enumerate() {
+                    if !right_matched[ri] {
+                        let mut combined: Row = vec![Value::Null; left_pad];
+                        combined.extend_from_slice(right);
                         next.push(combined);
                     }
                 }

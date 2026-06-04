@@ -101,9 +101,9 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   Before the joins slice the only `AS` in the surface was inside `CAST(expr AS type)` and a
   select-item alias; `table_ref` now adds the optional `AS` of a **table** alias (§15).
 - **Single-table `UPDATE` / `DELETE`** — those two still take one table (no `JOIN`, no `USING`).
-  `SELECT` is now **multi-table** via `JOIN` (§15): `INNER JOIN ... ON` and `CROSS JOIN` execute;
-  `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` parse but are a `0A000` narrowing this slice. **Subqueries**
-  (derived tables, `IN`/`EXISTS`, correlated) and **`USING`/`NATURAL`** join forms remain deferred.
+  `SELECT` is now **multi-table** via `JOIN` (§15): `INNER JOIN ... ON`, `CROSS JOIN`, and the
+  `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` family all execute. **Subqueries** (derived tables,
+  `IN`/`EXISTS`, correlated) and **`USING`/`NATURAL`** join forms remain deferred.
 - **Positional `INSERT`** — no column list, no `DEFAULT`, and the values are *literals
   only* (not general expressions; see the `literal` production). Multi-row `VALUES`
   *did* land (§12); a column list and `DEFAULT` stay deferred.
@@ -425,9 +425,10 @@ the *syntax* is `identifier "(" integer ("," integer)? ")"`.
 
 The `SELECT` `FROM` clause grows from a single table name to a **left-deep chain** —
 `from_clause ::= table_ref join_clause*` — adding table aliases, qualified column references
-(`t.col`), and the first multi-table relational operator. This slice executes **`INNER JOIN
-... ON`** and **`CROSS JOIN`**; the OUTER family parses but is deferred (a `0A000` narrowing,
-below). The reasoning lives here; the cost contract is in [cost.md](cost.md) §7.
+(`t.col`), and the first multi-table relational operators. The engine executes **`INNER JOIN
+... ON`**, **`CROSS JOIN`**, and the **`LEFT`/`RIGHT`/`FULL [OUTER] JOIN`** family (outer joins
+landed as an executor-only follow-on — see "Outer joins" below). The reasoning lives here; the
+cost contract is in [cost.md](cost.md) §7.
 
 **Table references and aliases.** `table_ref ::= identifier ("AS"? identifier)?` — a table name
 with an optional alias, the `AS` optional (`FROM orders o` = `FROM orders AS o`). The alias, or
@@ -486,13 +487,33 @@ use, and the lookahead must be **byte-identical** across cores (a CLAUDE.md §8 
   unconditionally. So `FROM t WHERE ...` (no alias) and `FROM t x JOIN ...` (alias `x`) both parse.
   This is the same precedent as the select-item `AS` and the `SELECT DISTINCT` two-token lookahead.
 
+**Outer joins (`LEFT`/`RIGHT`/`FULL [OUTER] JOIN`).** An outer join preserves rows that an inner
+join would drop, **NULL-extending the absent side**. The `OUTER` keyword is optional noise
+(`LEFT JOIN` = `LEFT OUTER JOIN`). It is an **executor-only** addition over the INNER/CROSS slice —
+the grammar, AST, and parser already carried the join kind, and the flat-row model (a joined row is
+each relation's row concatenated) plus the per-node three-valued `ON` already support it; no
+grammar/AST/parser reshape was needed. Semantics (PostgreSQL by default, [../../CLAUDE.md](../../CLAUDE.md) §1):
+
+- **`LEFT`** keeps every left (running) row: a left row that matches no right row is emitted once with
+  every right-side column **NULL**. **`RIGHT`** is the mirror (every right row kept, left side
+  NULL-extended). **`FULL`** keeps both — matched pairs, then unmatched-left rows, then unmatched-right
+  rows. In a left-deep chain the "left" side of join *k* is the **entire accumulated result** of the
+  joins before it, so a RIGHT/FULL join NULL-extends *all* prior columns; the pad widths come from the
+  scope (the right relation's flat offset and column count), so an empty intermediate result pads
+  correctly rather than crashing.
+- **The `ON` is three-valued and unchanged.** Only a `TRUE` result is a match; a NULL join key (or any
+  `NULL`/`FALSE` `ON`) is a non-match, so in an outer join it **NULL-extends** exactly as it is dropped
+  in an inner join. Outer joins evaluate `ON` over the same candidate set as the inner join would, so
+  their cost matches except for the extra preserved rows ([cost.md](cost.md) §3).
+- **`WHERE` still applies after the join**, to the combined rows including the NULL-extended ones — so a
+  `WHERE` predicate on the nullable side (`WHERE b.x = 5`) sees `NULL` for an unmatched row and drops it,
+  the familiar PostgreSQL behavior where a `WHERE` on the outer side effectively downgrades the outer
+  join to an inner one; put the predicate in the `ON` to preserve the unmatched rows, or test the
+  nullable key with `IS NULL` for an anti-join. No special-casing — column resolution is positional and
+  never folds on a column's declared nullability.
+
 **Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
 
-- **Outer joins parse but do not execute.** `LEFT`/`RIGHT`/`FULL [OUTER] JOIN ... ON` is accepted
-  by the grammar and the AST carries the join kind, but executing one is **`0A000`**
-  (`feature_not_supported`) this slice — the established deferral pattern (a text `PRIMARY KEY`,
-  a deferred `CAST`). The fast-follow OUTER slice is then **executor-only** (add the NULL-extension
-  branch); no grammar/AST/parser reshape.
 - **No comma-`FROM`.** `FROM a, b` (the old implicit cross join) is **dropped**, not deferred:
   `CROSS JOIN` covers the same semantics and comma-`FROM`'s precedence-vs-`JOIN` interaction is a
   future trap. A `,` after the first `table_ref` is a `42601`.

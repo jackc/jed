@@ -1,0 +1,137 @@
+# LEFT [OUTER] JOIN ... ON (spec/design/grammar.md §15): a left-deep nested-loop join that
+# preserves EVERY left (running) row — a left row matching no right row is emitted once with the
+# right side NULL-extended. The OUTER keyword is optional (LEFT JOIN = LEFT OUTER JOIN). The ON is
+# three-valued and unchanged: only a TRUE keeps a pair, so a NULL join key (a.k NULL, b.k NULL)
+# never matches and its left row NULL-extends (PostgreSQL semantics). WHERE applies AFTER the join,
+# to the combined rows including the NULL-extended ones — so a predicate on the nullable side in
+# WHERE drops unmatched rows (effectively an inner join), while the same predicate in ON preserves
+# them; IS NULL on the nullable key is the anti-join. Cost is the cost.md §3 contract: an outer
+# join evaluates ON over the same |running|×|right| candidate set as an inner join (NULL-extension
+# charges no operator_eval) and only the produced-row count grows.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.is_null, query.logical_connectives, query.order_by, query.order_by_keys, query.join_left, query.qualified_column, null.three_valued, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE b (id int32 PRIMARY KEY, k int32, label text)
+
+statement ok
+CREATE TABLE empt (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30), (4, NULL)
+
+# b has a row with a NULL join key (id 30) — it matches no left row (3-valued ON).
+statement ok
+INSERT INTO b VALUES (10, 10, 'ten'), (20, 20, 'twenty'), (21, 20, 'twentyish'), (30, NULL, 'nullk')
+
+# Equi-join on k, LEFT. a.k=10 → b(10); a.k=20 → b(20),b(21); a.k=30 → no b (preserved, NULL);
+# a.k=NULL → no b (preserved, NULL). The two unmatched a rows (id 3, 4) NULL-extend the b side.
+# A 4x4 nested loop: 4+4 materialized (8) + 16 ON `=` evals + 5 produced (3 matched + 2 extended) = 29.
+# names: id, label
+# cost: 29
+query IT nosort
+SELECT a.id, b.label FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id, b.id
+----
+1
+ten
+2
+twenty
+2
+twentyish
+3
+NULL
+4
+NULL
+
+# SELECT * expands a(id, k) then b(id, k, label) — five columns. The two unmatched a rows carry
+# NULLs across all three b columns. 8 materialize + 16 ON + 5 produced = 29.
+# names: id, k, id, k, label
+# cost: 29
+query IIIIT nosort
+SELECT * FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id, b.id
+----
+1
+10
+10
+10
+ten
+2
+20
+20
+20
+twenty
+2
+20
+21
+20
+twentyish
+3
+30
+NULL
+NULL
+NULL
+4
+NULL
+NULL
+NULL
+NULL
+
+# Predicate in the ON: an unmatched left row is still PRESERVED (the extra condition only filters
+# which right rows match). `a.k=b.k AND b.label='twenty'` matches only a(2)↔b(20); a(1)/a(3)/a(4)
+# match nothing and NULL-extend. ON has 3 interior nodes (and + two compares), 16 pairs → 48;
+# 8 materialize + 48 ON + 4 produced = 60.
+# names: id, id
+# cost: 60
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND b.label = 'twenty' ORDER BY a.id, b.id
+----
+1
+NULL
+2
+20
+3
+NULL
+4
+NULL
+
+# The SAME predicate moved to WHERE turns the LEFT JOIN effectively INNER: the join produces 5
+# combined rows (3 matched + 2 NULL-extended), then `b.label='twenty'` is evaluated on each (5)
+# and a NULL-extended row's b.label is NULL → NULL='twenty' → dropped. Only a(2)↔b(20) survives.
+# 8 materialize + 16 ON + 5 WHERE + 1 produced = 30.
+# names: id, id
+# cost: 30
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.id, b.id
+----
+2
+20
+
+# IS NULL on the nullable key is the anti-join: keep only the left rows that matched no right row.
+# 5 combined rows; `b.id IS NULL` (1 is_null) on each (5) keeps the two NULL-extended rows (a id 3,4).
+# 8 materialize + 16 ON + 5 WHERE + 2 produced = 31.
+# names: id
+# cost: 31
+query I nosort
+SELECT a.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.id IS NULL ORDER BY a.id
+----
+3
+4
+
+# An empty right table preserves every left row, NULL-extended (the NULL-pad width comes from the
+# scope, not a sampled right row, so an empty right side does not crash). The 4x0 loop evaluates
+# the ON zero times. 4+0 materialize + 0 ON + 4 produced = 8.
+# names: id, v
+# cost: 8
+query II nosort
+SELECT a.id, empt.v FROM a LEFT JOIN empt ON a.k = empt.v ORDER BY a.id
+----
+1
+NULL
+2
+NULL
+3
+NULL
+4
+NULL

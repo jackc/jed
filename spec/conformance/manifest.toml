@@ -105,6 +105,18 @@ id = "query.cross_join"
 description = "CROSS JOIN — the Cartesian product of two tables (no ON)"
 
 [[capability]]
+id = "query.join_left"
+description = "LEFT [OUTER] JOIN ... ON <expr> — every left row preserved; an unmatched left row is emitted once with the right side NULL-extended (3-valued ON; a NULL join key never matches → NULL-extends). spec/design/grammar.md §15"
+
+[[capability]]
+id = "query.join_right"
+description = "RIGHT [OUTER] JOIN ... ON <expr> — every right row preserved; an unmatched right row is emitted with the left side NULL-extended. spec/design/grammar.md §15"
+
+[[capability]]
+id = "query.join_full"
+description = "FULL [OUTER] JOIN ... ON <expr> — every row from both sides preserved; unmatched rows on either side are NULL-extended on the absent side. spec/design/grammar.md §15"
+
+[[capability]]
 id = "query.table_alias"
 description = "Table aliases in FROM — `t AS a` / `t a`; the alias (else the table name) is the relation label, distinct per query (a self-join needs aliases; duplicate label is 42712)"
 
@@ -272,4 +284,14 @@ capabilities = [
   "query.cross_join",
   "query.table_alias",
   "query.qualified_column",
+]
+
+[[profile]]
+id = "outer_joins"
+title = "joins + LEFT/RIGHT/FULL [OUTER] JOIN — unmatched rows NULL-extended on the absent side (Phase 4)"
+includes = "joins"
+capabilities = [
+  "query.join_left",
+  "query.join_right",
+  "query.join_full",
 ]
