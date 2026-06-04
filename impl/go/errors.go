@@ -19,6 +19,8 @@ const (
 	InvalidParameterValue
 	// InvalidTextRepresentation is 22P02 — malformed text input (e.g. bytea hex).
 	InvalidTextRepresentation
+	// InvalidEscapeSequence is 22025 — a LIKE pattern ending in a lone escape character.
+	InvalidEscapeSequence
 	// InvalidRowCountInLimitClause is 2201W — a negative LIMIT count.
 	InvalidRowCountInLimitClause
 	// InvalidRowCountInOffsetClause is 2201X — a negative OFFSET count.
@@ -74,6 +76,8 @@ func (s SqlState) Code() string {
 		return "22023"
 	case InvalidTextRepresentation:
 		return "22P02"
+	case InvalidEscapeSequence:
+		return "22025"
 	case InvalidRowCountInLimitClause:
 		return "2201W"
 	case InvalidRowCountInOffsetClause:

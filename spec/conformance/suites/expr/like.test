@@ -1,0 +1,124 @@
+# LIKE / NOT LIKE — text pattern match (spec/design/grammar.md §22). `%` matches any run of
+# characters, `_` exactly one character (one Unicode code point), with PostgreSQL's default `\`
+# escape. text×text → boolean, NULL propagates (a NULL operand short-circuits to NULL before
+# the matcher), a non-text operand is 42804. A pattern ending in a lone escape char REACHED
+# during matching (with subject left) traps 22025 — but an earlier mismatch returns FALSE
+# first. The matcher iterates by code point so astral chars match `_`. Verified against
+# PostgreSQL 18.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, expr.like, expr.comparison_value, types.int32, types.text, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol'), (4, NULL)
+
+# `%` matches any (possibly empty) run; here a leading 'a'. Cost: 4 scanned, the LIKE node is
+# one operator_eval per scanned row (the match loop is unmetered) = 4, plus 1 produced.
+# cost: 9
+query I nosort
+SELECT id FROM t WHERE s LIKE 'a%' ORDER BY id
+----
+1
+
+# `_` matches exactly one character: '_o_' matches the 3-char 'bob', not 5-char 'carol'.
+query I nosort
+SELECT id FROM t WHERE s LIKE '_o_' ORDER BY id
+----
+2
+
+# `%o%` matches any string containing an 'o'.
+query I nosort
+SELECT id FROM t WHERE s LIKE '%o%' ORDER BY id
+----
+2
+3
+
+# NOT LIKE keeps the present non-matches; the NULL row stays UNKNOWN (dropped).
+query I nosort
+SELECT id FROM t WHERE s NOT LIKE '%o%' ORDER BY id
+----
+1
+
+# A one-row table to evaluate constant patterns (escapes, astral, edges).
+statement ok
+CREATE TABLE one (id int32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# Default `\` escape: `\%` matches a literal percent sign.
+# names: ?column?
+query B nosort
+SELECT '100%' LIKE '100\%' FROM one
+----
+true
+
+# `\_` matches a literal underscore (not the single-char wildcard).
+query B nosort
+SELECT 'a_b' LIKE 'a\_b' FROM one
+----
+true
+
+# A backslash before a non-special character matches that character literally.
+query B nosort
+SELECT 'a' LIKE '\a' FROM one
+----
+true
+
+# `_` matches one Unicode CODE POINT — the astral 😀 is one code point, so `_x` matches `😀x`.
+# A core iterating UTF-16 units would see 😀 as two units and get this wrong.
+query B nosort
+SELECT '😀x' LIKE '_x' FROM one
+----
+true
+
+# NULL on either side yields NULL (propagates).
+query B nosort
+SELECT NULL LIKE 'a' FROM one
+----
+NULL
+
+query B nosort
+SELECT 'a' LIKE NULL FROM one
+----
+NULL
+
+# Empty-string edges.
+query B nosort
+SELECT '' LIKE '' FROM one
+----
+true
+
+query B nosort
+SELECT 'a' LIKE '' FROM one
+----
+false
+
+query B nosort
+SELECT '' LIKE '%' FROM one
+----
+true
+
+# Trailing-escape error (22025) is raised LAZILY: this pattern's escape is reached while the
+# subject still has 'x' to match, so it traps.
+statement error 22025
+SELECT 'ax' LIKE 'a\' FROM one
+
+# But an earlier mismatch returns FALSE before the escape is ever reached (no error).
+query B nosort
+SELECT 'x' LIKE 'a\' FROM one
+----
+false
+
+# And if the subject runs out before the escape, also FALSE (no error) — the escape is never
+# reached as "an escape with a character to match".
+query B nosort
+SELECT 'a' LIKE 'a\' FROM one
+----
+false
+
+# A non-text operand (an integer subject) is a type error.
+statement error 42804
+SELECT 5 LIKE '5' FROM one

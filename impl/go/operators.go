@@ -229,6 +229,18 @@ var Operators = []OperatorDesc{
 		Errors:        []string{},
 	},
 	{
+		Name:          "like",
+		Symbol:        "",
+		Kind:          "comparison",
+		Arity:         2,
+		ArgFamilies:   []string{"text", "text"},
+		ArgResolution: "none",
+		Result:        "boolean",
+		Null:          "propagates",
+		Precedence:    35,
+		Errors:        []string{"22025"},
+	},
+	{
 		Name:          "eq",
 		Symbol:        "=",
 		Kind:          "comparison",

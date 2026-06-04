@@ -676,7 +676,9 @@ class Parser {
     // already taken by parseNot). Non-associative, at the comparison level (grammar.md §20-§21).
     const predNegated =
       this.peekKeyword() === "not" &&
-      (this.peekKeywordAt(1) === "in" || this.peekKeywordAt(1) === "between");
+      (this.peekKeywordAt(1) === "in" ||
+        this.peekKeywordAt(1) === "between" ||
+        this.peekKeywordAt(1) === "like");
     if (predNegated) {
       this.advance(); // NOT
     }
@@ -701,6 +703,11 @@ class Parser {
       this.expectKeyword("and");
       const hi = this.parseAdditive();
       return { kind: "between", lhs, lo, hi, negated: predNegated };
+    }
+    if (this.peekKeyword() === "like") {
+      this.advance();
+      const rhs = this.parseAdditive();
+      return { kind: "like", lhs, rhs, negated: predNegated };
     }
     let op: BinaryOp;
     switch (this.peek().kind) {

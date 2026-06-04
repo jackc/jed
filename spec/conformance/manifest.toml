@@ -235,6 +235,10 @@ id = "expr.between"
 description = "x BETWEEN lo AND hi / NOT BETWEEN — range test desugared to (x >= lo AND x <= hi); Kleene AND gives 5 BETWEEN 10 AND NULL = FALSE but 5 BETWEEN 1 AND NULL = NULL; bounds parse at the additive level so the structural AND is not the connective (spec/design/grammar.md §21)"
 
 [[capability]]
+id = "expr.like"
+description = "text LIKE pattern / NOT LIKE — % matches any run, _ one code point, default \\ escape; text×text→boolean, NULL propagates, non-text 42804; a pattern ending in a lone escape reached during matching is 22025; code-point (not UTF-16) iteration (spec/design/grammar.md §22)"
+
+[[capability]]
 id = "error.division_by_zero"
 description = "Integer division / modulo by zero is defined and traps SQLSTATE 22012"
 
@@ -371,4 +375,5 @@ includes = "decimal"
 capabilities = [
   "expr.in_list",
   "expr.between",
+  "expr.like",
 ]

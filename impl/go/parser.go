@@ -931,7 +931,8 @@ func (p *Parser) parseComparison() (Expr, error) {
 	// `NOT`? (`IN` (...) | `BETWEEN` lo `AND` hi) — a `NOT` here is consumed only when followed
 	// by one of these postfix-predicate keywords (two-token lookahead; the prefix `NOT` was
 	// already taken by parseNot). Non-associative, at the comparison level (grammar.md §20-§21).
-	predNegated := p.peekKeyword() == "not" && (p.peekKeywordAt(1) == "in" || p.peekKeywordAt(1) == "between")
+	predNegated := p.peekKeyword() == "not" &&
+		(p.peekKeywordAt(1) == "in" || p.peekKeywordAt(1) == "between" || p.peekKeywordAt(1) == "like")
 	if predNegated {
 		p.advance() // NOT
 	}
@@ -976,6 +977,14 @@ func (p *Parser) parseComparison() (Expr, error) {
 			return Expr{}, err
 		}
 		return Expr{Kind: ExprBetween, Between: &BetweenExpr{Lhs: lhs, Lo: lo, Hi: hi, Negated: predNegated}}, nil
+	}
+	if p.peekKeyword() == "like" {
+		p.advance()
+		rhs, err := p.parseAdditive()
+		if err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprLike, Like: &LikeExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated}}, nil
 	}
 	var op BinaryOp
 	switch p.peek().Kind {

@@ -18,6 +18,8 @@ pub enum SqlState {
     InvalidParameterValue,
     /// 22P02 — invalid text representation (e.g. malformed bytea hex input).
     InvalidTextRepresentation,
+    /// 22025 — invalid escape sequence (a LIKE pattern ending in a lone escape character).
+    InvalidEscapeSequence,
     /// 2201W — invalid row count in a LIMIT clause (a negative LIMIT).
     InvalidRowCountInLimitClause,
     /// 2201X — invalid row count in an OFFSET clause (a negative OFFSET).
@@ -71,6 +73,7 @@ impl SqlState {
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidParameterValue => "22023",
             SqlState::InvalidTextRepresentation => "22P02",
+            SqlState::InvalidEscapeSequence => "22025",
             SqlState::InvalidRowCountInLimitClause => "2201W",
             SqlState::InvalidRowCountInOffsetClause => "2201X",
             SqlState::NotNullViolation => "23502",

@@ -214,6 +214,9 @@ const (
 	// ExprBetween is `lhs BETWEEN lo AND hi` / `lhs NOT BETWEEN lo AND hi` — a range test
 	// desugared at resolve to `lhs >= lo AND lhs <= hi` (spec/design/grammar.md §21).
 	ExprBetween
+	// ExprLike is `lhs LIKE rhs` / `lhs NOT LIKE rhs` — a text pattern match with a dedicated
+	// matcher (spec/design/grammar.md §22).
+	ExprLike
 )
 
 // UnaryOp is a unary operator.
@@ -272,6 +275,7 @@ type Expr struct {
 	FuncCall   *FuncCallExpr   // ExprFuncCall
 	In         *InExpr         // ExprIn
 	Between    *BetweenExpr    // ExprBetween
+	Like       *LikeExpr       // ExprLike
 }
 
 // CastExpr is CAST(Inner AS TypeName). TypeMod is the optional numeric(p[,s]) modifier.
@@ -342,6 +346,16 @@ type BetweenExpr struct {
 	Lhs     Expr
 	Lo      Expr
 	Hi      Expr
+	Negated bool
+}
+
+// LikeExpr is `Lhs LIKE Rhs` / `Lhs NOT LIKE Rhs` — a text pattern match (spec/design/grammar.md
+// §22). `%` matches any run of characters, `_` one code point, with the default `\` escape. Both
+// operands must be text; NULL propagates. A genuine operator (not desugared) with a hand-written
+// matcher. Negated carries the NOT keyword.
+type LikeExpr struct {
+	Lhs     Expr
+	Rhs     Expr
 	Negated bool
 }
 

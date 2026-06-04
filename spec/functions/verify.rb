@@ -98,9 +98,11 @@ def main
     fail!("operator #{id}: null_test must have arity 1") if kind == "null_test" && op["arity"] != 1
     fail!("operator #{id}: comparison must have arity 2") if kind == "comparison" && op["arity"] != 2
     # A comparison spelled with punctuation (= < > <= >=) must carry its `symbol` (catches
-    # a forgotten spelling). The keyword-form NULL-safe comparisons (IS [NOT] DISTINCT
-    # FROM, null = "null_safe") have no punctuation symbol — exempt them, like null tests.
-    if kind == "comparison" && op["null"] != "null_safe" && !op.key?("symbol")
+    # a forgotten spelling). Keyword-form comparisons have no punctuation symbol — exempt
+    # them, like null tests: the NULL-safe comparisons (IS [NOT] DISTINCT FROM,
+    # null = "null_safe") and the keyword pattern operator LIKE (name "like").
+    keyword_comparison = op["null"] == "null_safe" || op["name"] == "like"
+    if kind == "comparison" && !keyword_comparison && !op.key?("symbol")
       fail!("operator #{id}: comparison must have a `symbol`")
     end
 

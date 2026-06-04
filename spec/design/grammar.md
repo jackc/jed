@@ -739,3 +739,43 @@ comparison-level (precedence 35) postfix slot as `IN` (§20). `NOT BETWEEN` is t
 - **Cost** ([cost.md](cost.md) §3): the desugared `And(Ge, Le)` is three interior nodes (1
   `and` + 2 `compare`); **the LHS is evaluated twice** (once per bound — the desugar
   consequence). Output name for a bare `SELECT x BETWEEN …` is `?column?` (§8).
+
+## 22. `LIKE` / `NOT LIKE`
+
+`s LIKE pattern` is the **text pattern match**: TRUE iff the whole subject `s` matches
+`pattern`, where `%` matches any (possibly empty) run of characters and `_` matches exactly
+one character. It extends `comparison` with `"NOT"? "LIKE" additive`, the same
+non-associative comparison-level (precedence 35) postfix slot as `IN`/`BETWEEN`. `NOT LIKE`
+is the negation. Unlike `IN`/`BETWEEN`, `LIKE` is **not** desugared — it is a genuine
+operator (one `[[operator]]` catalog row, `name = "like"`, text×text → boolean,
+`null = "propagates"`) with a dedicated resolved node and a hand-written matcher.
+
+- **Text only.** Both operands must be `text` (a single-quoted string literal stays text); a
+  non-text operand (`5 LIKE '5'`) is **42804** — `compare.toml` lists only text×text for the
+  pattern operator, exactly like the text comparisons. NULL on either side yields NULL
+  (`null = "propagates"`): `NULL LIKE 'a'` and `'a' LIKE NULL` are both NULL, and a NULL
+  operand short-circuits to NULL **before** the matcher runs (so a malformed pattern against a
+  NULL subject is still NULL, not an error — verified against PostgreSQL 18).
+- **Wildcards and the default `\` escape.** `%` = any run, `_` = one character. The default
+  escape character is **backslash** (PostgreSQL's default): `\%`, `\_`, and `\\` match a
+  literal `%`, `_`, and `\`; a `\` before any other character matches that character literally
+  (`'a' LIKE '\a'` is TRUE). String literals have no backslash escapes
+  (`standard_conforming_strings`, §3 / [types.md](types.md) §11), so a `\` written in a
+  pattern literal is a literal backslash byte the matcher then interprets. The explicit
+  `ESCAPE 'c'` clause, `ILIKE`, and `SIMILAR TO` are deferred (relaxable later).
+- **Code-point matching — a §8 determinism surface.** `_` matches one **Unicode code point**,
+  not one byte and not one UTF-16 unit, so `'😀x' LIKE '_x'` is TRUE. Every core iterates the
+  subject and pattern by code point (Rust `chars()`, Go `[]rune`, **TS `Array.from` / spread —
+  never `str[i]`/`charCodeAt`**, the same UTF-8-vs-UTF-16 trap text comparison already avoids,
+  [types.md](types.md) §11). Pinned by an astral-character conformance case.
+- **Trailing-escape error (22025), raised lazily during matching.** A pattern whose escape
+  character is its **last** character is invalid — but PostgreSQL only raises it when the
+  matcher actually **reaches** that escape with subject still to match. So `'ax' LIKE 'a\'`
+  traps **22025** (`invalid_escape_sequence`), but `'a' LIKE 'a\'` is FALSE (the subject runs
+  out first) and `'x' LIKE 'a\'` is FALSE (the leading `a` mismatches before the escape is
+  reached). The matcher therefore raises 22025 from the eval walk, data-dependently and
+  deterministically (the trapping case is fixed by the subject/pattern), **not** as a
+  pre-validation of the pattern. (Verified against PostgreSQL 18.)
+- **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the `like` node (like a `compare`);
+  the match loop itself is unmetered, like `eq3` and the `ORDER BY` sort. Output name for a
+  bare `SELECT s LIKE …` is `?column?` (§8).

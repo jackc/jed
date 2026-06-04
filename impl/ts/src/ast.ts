@@ -76,6 +76,11 @@ export type Expr =
   // Kleene AND. The bounds parse at the additive level so the structural `AND` is not the
   // logical connective.
   | { kind: "between"; lhs: Expr; lo: Expr; hi: Expr; negated: boolean }
+  // `lhs LIKE rhs` / `lhs NOT LIKE rhs` — text pattern match (spec/design/grammar.md §22). `%`
+  // matches any run of characters, `_` one code point, with the default `\` escape. Both
+  // operands must be text; NULL propagates. A genuine operator (not desugared) with a
+  // hand-written matcher. `negated` carries the NOT keyword.
+  | { kind: "like"; lhs: Expr; rhs: Expr; negated: boolean }
   // An aggregate function call — the engine's first function-call syntax (grammar.md §17).
   // `name` is the spelling as written (resolved case-insensitively against the aggregate
   // catalog; an unknown name is 42883). `star` is the COUNT(*) row-count form (then `arg` is

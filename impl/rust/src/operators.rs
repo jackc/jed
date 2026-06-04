@@ -227,6 +227,18 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
     },
     OperatorDesc {
+        name: "like",
+        symbol: None,
+        kind: "comparison",
+        arity: 2,
+        arg_families: &["text", "text"],
+        arg_resolution: "none",
+        result: "boolean",
+        null: "propagates",
+        precedence: 35,
+        errors: &["22025"],
+    },
+    OperatorDesc {
         name: "eq",
         symbol: Some("="),
         kind: "comparison",

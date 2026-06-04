@@ -766,7 +766,8 @@ type RExpr =
   | { kind: "and"; lhs: RExpr; rhs: RExpr }
   | { kind: "or"; lhs: RExpr; rhs: RExpr }
   | { kind: "isNull"; operand: RExpr; negated: boolean }
-  | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean };
+  | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
+  | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean };
 
 // ============================================================================
 // Aggregate resolution + accumulation (spec/design/aggregates.md).
@@ -903,6 +904,8 @@ function exprHasFuncCall(e: Expr): boolean {
       return exprHasFuncCall(e.lhs) || e.list.some(exprHasFuncCall);
     case "between":
       return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.lo) || exprHasFuncCall(e.hi);
+    case "like":
+      return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.rhs);
     default:
       return false;
   }
@@ -1299,6 +1302,15 @@ function resolve(
       }
       return resolve(scope, desugared, ctx, ag);
     }
+    case "like": {
+      // LIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal stays
+      // text), then require BOTH operands be text (or a bare NULL); a non-text operand is 42804.
+      // We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
+      const p = resolveOperandPair(scope, e.lhs, e.rhs, ag);
+      requireTextOrNull(p.lt);
+      requireTextOrNull(p.rt);
+      return { node: { kind: "like", lhs: p.rl, rhs: p.rr, negated: e.negated }, type: { kind: "bool" } };
+    }
   }
 }
 
@@ -1466,6 +1478,13 @@ function requireNumericOperand(t: ResolvedType): void {
 
 function requireBool(t: ResolvedType, msg: string): void {
   if (t.kind === "int" || t.kind === "text" || t.kind === "decimal" || t.kind === "bytea") throw typeError(msg);
+}
+
+// requireTextOrNull: LIKE requires both operands be text (or a bare NULL literal, which is
+// comparable with anything and makes the result NULL at eval). A non-text operand is a 42804
+// type error (spec/design/grammar.md §22).
+function requireTextOrNull(t: ResolvedType): void {
+  if (t.kind !== "text" && t.kind !== "null") throw typeError("LIKE requires text operands");
 }
 
 // requireAssignable: a value assigned to a column must match its family — an integer column
@@ -1689,7 +1708,77 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
       // unknown (the null_safe discipline, functions.md §3).
       return { kind: "bool", value: same === e.negated };
     }
+    case "like": {
+      m.charge(COSTS.operatorEval);
+      const subject = evalExpr(e.lhs, row, m);
+      const pattern = evalExpr(e.rhs, row, m);
+      // NULL propagates BEFORE the matcher runs, so a malformed pattern against a NULL operand
+      // is still NULL, never 22025 (matches PG — grammar.md §22).
+      if (subject.kind === "null" || pattern.kind === "null") return nullValue();
+      if (subject.kind !== "text" || pattern.kind !== "text") {
+        throw new Error("unreachable: resolver requires text LIKE operands");
+      }
+      // negated carries NOT LIKE: matched !== negated flips the result for NOT LIKE.
+      return { kind: "bool", value: likeMatch(subject.text, pattern.text) !== e.negated };
+    }
   }
+}
+
+// likeMatch is the SQL LIKE matcher (spec/design/grammar.md §22): `%` matches any (possibly
+// empty) run of characters, `_` exactly one character, and `\` (the default escape) makes the
+// next pattern character literal. It iterates by Unicode CODE POINT via Array.from (NOT `str[i]`
+// / charCodeAt, the UTF-16 trap) so astral characters match `_` — a CLAUDE.md §8 determinism
+// surface. Two-pointer greedy backtracking, identical across cores. It throws a 22025 error when
+// the escape character is the LAST pattern character reached during matching (PostgreSQL's "LIKE
+// pattern must not end with escape character") — data-dependent, since an earlier mismatch
+// returns false first.
+function likeMatch(subject: string, pattern: string): boolean {
+  const s = Array.from(subject);
+  const p = Array.from(pattern);
+  let si = 0;
+  let pi = 0;
+  // The last '%' position in the pattern (a backtrack point) and the subject index when it was
+  // taken; -1 until a '%' has been seen.
+  let starPi = -1;
+  let starSi = 0;
+  while (si < s.length) {
+    if (pi < p.length && p[pi] === "\\") {
+      // Escape: the next pattern character must match the subject literally.
+      if (pi + 1 >= p.length) {
+        throw engineError("invalid_escape_sequence", "LIKE pattern must not end with escape character");
+      }
+      if (s[si] === p[pi + 1]) {
+        si++;
+        pi += 2;
+        continue;
+      }
+      // literal mismatch → fall through to backtrack
+    } else if (pi < p.length && p[pi] === "_") {
+      si++;
+      pi++;
+      continue;
+    } else if (pi < p.length && p[pi] === "%") {
+      starPi = pi;
+      starSi = si;
+      pi++;
+      continue;
+    } else if (pi < p.length && p[pi] === s[si]) {
+      si++;
+      pi++;
+      continue;
+    }
+    // Mismatch: backtrack to the last '%' (it absorbs one more subject character), else no.
+    if (starPi >= 0) {
+      pi = starPi + 1;
+      starSi++;
+      si = starSi;
+      continue;
+    }
+    return false;
+  }
+  // Subject consumed: any pattern remainder must be all '%' to match.
+  while (pi < p.length && p[pi] === "%") pi++;
+  return pi === p.length;
 }
 
 // evalArith computes an integer op with exact bigint, throwing 22012 on a zero divisor

@@ -220,6 +220,17 @@ export const OPERATORS: readonly OperatorDesc[] = [
     errors: [],
   },
   {
+    name: "like",
+    kind: "comparison",
+    arity: 2,
+    argFamilies: ["text", "text"],
+    argResolution: "none",
+    result: "boolean",
+    null: "propagates",
+    precedence: 35,
+    errors: ["22025"],
+  },
+  {
     name: "eq",
     symbol: "=",
     kind: "comparison",

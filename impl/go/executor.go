@@ -1046,6 +1046,7 @@ const (
 	reOr
 	reIsNull
 	reDistinct
+	reLike
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -1258,6 +1259,8 @@ func exprHasFuncCall(e Expr) bool {
 		return false
 	case ExprBetween:
 		return exprHasFuncCall(e.Between.Lhs) || exprHasFuncCall(e.Between.Lo) || exprHasFuncCall(e.Between.Hi)
+	case ExprLike:
+		return exprHasFuncCall(e.Like.Lhs) || exprHasFuncCall(e.Like.Rhs)
 	default:
 		return false
 	}
@@ -1724,6 +1727,22 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 			folded = Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: folded}}
 		}
 		return resolve(s, folded, ctx, ag)
+	case ExprLike:
+		// LIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal stays
+		// text), then require BOTH operands be text (or a bare NULL); a non-text operand is
+		// 42804. We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
+		rl, lt, rr, rt, err := resolveOperandPair(s, e.Like.Lhs, e.Like.Rhs, ag)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := requireTextOrNull(lt); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := requireTextOrNull(rt); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reLike, lhs: rl, rhs: rr, negated: e.Like.Negated},
+			resolvedType{kind: rtBool}, nil
 	default: // ExprBinary
 		return resolveBinary(s, e.Binary, ag)
 	}
@@ -1909,6 +1928,16 @@ func requireBool(t resolvedType, msg string) error {
 		return typeError(msg)
 	}
 	return nil
+}
+
+// requireTextOrNull: LIKE requires both operands be text (or a bare NULL literal, which is
+// comparable with anything and makes the result NULL at eval). A non-text operand is a 42804
+// type error (spec/design/grammar.md §22).
+func requireTextOrNull(t resolvedType) error {
+	if t.kind == rtText || t.kind == rtNull {
+		return nil
+	}
+	return typeError("LIKE requires text operands")
 }
 
 // requireAssignable: a value assigned to a column must match its family — an integer column
@@ -2123,6 +2152,27 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		}
 		isNull := v.Kind == ValNull
 		return BoolValue(isNull != e.negated), nil
+	case reLike:
+		m.Charge(Costs.OperatorEval)
+		subject, err := e.lhs.eval(row, m)
+		if err != nil {
+			return Value{}, err
+		}
+		pattern, err := e.rhs.eval(row, m)
+		if err != nil {
+			return Value{}, err
+		}
+		// NULL propagates BEFORE the matcher runs, so a malformed pattern against a NULL operand
+		// is still NULL, never 22025 (matches PG — grammar.md §22).
+		if subject.Kind == ValNull || pattern.Kind == ValNull {
+			return NullValue(), nil
+		}
+		matched, err := likeMatch(subject.Str, pattern.Str)
+		if err != nil {
+			return Value{}, err
+		}
+		// negated carries NOT LIKE: matched != negated flips the result for NOT LIKE.
+		return BoolValue(matched != e.negated), nil
 	default: // reDistinct
 		m.Charge(Costs.OperatorEval)
 		a, err := e.lhs.eval(row, m)
@@ -2138,6 +2188,63 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		// unknown (the null_safe discipline, functions.md §3).
 		return BoolValue(a.NotDistinctFrom(b) == e.negated), nil
 	}
+}
+
+// likeMatch is the SQL LIKE matcher (spec/design/grammar.md §22): `%` matches any (possibly
+// empty) run of characters, `_` exactly one character, and `\` (the default escape) makes the
+// next pattern character literal. It iterates by Unicode code point (via []rune) so astral
+// characters match `_` (a CLAUDE.md §8 determinism surface), via a two-pointer greedy
+// backtracking walk identical across cores. It returns a 22025 error when the escape character
+// is the LAST pattern character reached during matching (PostgreSQL's "LIKE pattern must not end
+// with escape character") — data-dependent, since an earlier mismatch returns false first.
+func likeMatch(subject, pattern string) (bool, error) {
+	s := []rune(subject)
+	p := []rune(pattern)
+	si, pi := 0, 0
+	// The last '%' position in the pattern (a backtrack point) and the subject index when it
+	// was taken; -1 until a '%' has been seen.
+	starPi, starSi := -1, 0
+	for si < len(s) {
+		switch {
+		case pi < len(p) && p[pi] == '\\':
+			// Escape: the next pattern character must match the subject literally.
+			if pi+1 >= len(p) {
+				return false, NewError(InvalidEscapeSequence, "LIKE pattern must not end with escape character")
+			}
+			if s[si] == p[pi+1] {
+				si++
+				pi += 2
+				continue
+			}
+			// literal mismatch → fall through to backtrack
+		case pi < len(p) && p[pi] == '_':
+			si++
+			pi++
+			continue
+		case pi < len(p) && p[pi] == '%':
+			starPi = pi
+			starSi = si
+			pi++
+			continue
+		case pi < len(p) && p[pi] == s[si]:
+			si++
+			pi++
+			continue
+		}
+		// Mismatch: backtrack to the last '%' (it absorbs one more subject character), else no.
+		if starPi >= 0 {
+			pi = starPi + 1
+			starSi++
+			si = starSi
+			continue
+		}
+		return false, nil
+	}
+	// Subject consumed: any pattern remainder must be all '%' to match.
+	for pi < len(p) && p[pi] == '%' {
+		pi++
+	}
+	return pi == len(p), nil
 }
 
 // evalArith evaluates an integer arithmetic op in 64-bit, trapping 22012 on a zero

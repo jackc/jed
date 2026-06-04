@@ -294,6 +294,29 @@ null           = "null_safe"
 precedence     = 35
 errors         = []
 
+# --- pattern matching (text) -------------------------------------------------
+# LIKE is a text pattern match: `%` matches any (possibly empty) run of characters, `_`
+# matches exactly one character (one Unicode CODE POINT — not a byte/UTF-16 unit, a §8
+# determinism surface), with PostgreSQL's default `\` escape (`\%` `\_` `\\` match literal).
+# It is a KEYWORD operator with no punctuation `symbol` (like IS [NOT] DISTINCT FROM):
+# text×text → boolean, null = "propagates" (a NULL operand yields NULL — never the
+# pattern-error). It binds at the comparison level (precedence 35), non-associative, and
+# `NOT LIKE` is its negation (carried by the AST, not a separate operator). A pattern that
+# ENDS in a lone escape char, reached during matching while subject remains, traps 22025
+# (../design/grammar.md §22; verified against PostgreSQL 18). text vs a non-text operand is a
+# 42804 (compare.toml lists only text×text). Deferred: ESCAPE clause, ILIKE, SIMILAR TO.
+
+[[operator]]
+name           = "like"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = ["22025"]
+
 # --- comparison operators (boolean) ------------------------------------------
 # The boolean-family OVERLOAD of the comparisons above: the same operator names/symbols
 # (`=` < > <= >=, and IS [NOT] DISTINCT FROM) applied to boolean × boolean. arg_resolution

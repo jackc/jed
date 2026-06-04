@@ -50,6 +50,12 @@ class = "data exception"
 template = "invalid parameter value: {detail}"
 
 [[error]]
+code = "22025"
+name = "invalid_escape_sequence"
+class = "data exception"
+template = "LIKE pattern must not end with escape character"
+
+[[error]]
 code = "22P02"
 name = "invalid_text_representation"
 class = "data exception"

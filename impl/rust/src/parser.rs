@@ -725,7 +725,10 @@ impl Parser {
         // `NOT` was already taken by parse_not). They bind at the comparison level (35),
         // non-associative (grammar.md §20-§21).
         let negated = self.peek_keyword().as_deref() == Some("not")
-            && matches!(self.peek_keyword_at(1).as_deref(), Some("in") | Some("between"));
+            && matches!(
+                self.peek_keyword_at(1).as_deref(),
+                Some("in") | Some("between") | Some("like")
+            );
         if negated {
             self.advance(); // NOT
         }
@@ -757,6 +760,15 @@ impl Parser {
                 lhs: Box::new(lhs),
                 lo: Box::new(lo),
                 hi: Box::new(hi),
+                negated,
+            });
+        }
+        if self.peek_keyword().as_deref() == Some("like") {
+            self.advance();
+            let rhs = self.parse_additive()?;
+            return Ok(Expr::Like {
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
                 negated,
             });
         }

@@ -1106,6 +1106,15 @@ enum RExpr {
         rhs: Box<RExpr>,
         negated: bool,
     },
+    /// `lhs LIKE rhs` / `lhs NOT LIKE rhs` — text pattern match (grammar.md §22). Both operands
+    /// resolve to text (or NULL); a NULL operand makes the result NULL. The matcher runs over
+    /// Unicode code points and traps 22025 on a pattern ending in a lone escape reached during
+    /// matching. `negated` carries the NOT keyword (NOT LIKE = the negation of the match).
+    Like {
+        lhs: Box<RExpr>,
+        rhs: Box<RExpr>,
+        negated: bool,
+    },
 }
 
 // ============================================================================
@@ -1315,6 +1324,7 @@ fn expr_has_funccall(e: &Expr) -> bool {
         Expr::Between { lhs, lo, hi, .. } => {
             expr_has_funccall(lhs) || expr_has_funccall(lo) || expr_has_funccall(hi)
         }
+        Expr::Like { lhs, rhs, .. } => expr_has_funccall(lhs) || expr_has_funccall(rhs),
     }
 }
 
@@ -1802,6 +1812,23 @@ fn resolve(
             }
             resolve(scope, &desugared, ctx, agg)
         }
+        Expr::Like { lhs, rhs, negated } => {
+            // LIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal
+            // stays text), then require BOTH operands be text (or a bare NULL); a non-text
+            // operand is 42804. We do NOT use classify_comparable here — it would wrongly accept
+            // bytea×bytea, which LIKE does not define.
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg)?;
+            require_text_or_null(lt)?;
+            require_text_or_null(rt)?;
+            Ok((
+                RExpr::Like {
+                    lhs: Box::new(rl),
+                    rhs: Box::new(rr),
+                    negated: *negated,
+                },
+                ResolvedType::Bool,
+            ))
+        }
     }
 }
 
@@ -2014,6 +2041,16 @@ fn promote(a: ResolvedType, b: ResolvedType) -> ScalarType {
         (Some(x), None) => x,
         (None, Some(y)) => y,
         (None, None) => ScalarType::Int64,
+    }
+}
+
+/// LIKE requires both operands be `text` (or a bare NULL literal, which is comparable with
+/// anything and makes the result NULL at eval). A non-text operand is a 42804 type error
+/// (spec/design/grammar.md §22).
+fn require_text_or_null(ty: ResolvedType) -> Result<()> {
+    match ty {
+        ResolvedType::Text | ResolvedType::Null => Ok(()),
+        _ => Err(type_error("LIKE requires text operands")),
     }
 }
 
@@ -2459,8 +2496,87 @@ impl RExpr {
                 // discipline, functions.md §3).
                 Ok(Value::Bool(same == *negated))
             }
+            RExpr::Like { lhs, rhs, negated } => {
+                m.charge(COSTS.operator_eval);
+                let subject = lhs.eval(row, m)?;
+                let pattern = rhs.eval(row, m)?;
+                // NULL propagates BEFORE the matcher runs, so a malformed pattern against a
+                // NULL operand is still NULL, never 22025 (matches PG — grammar.md §22).
+                if matches!(subject, Value::Null) || matches!(pattern, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let (s, p) = match (&subject, &pattern) {
+                    (Value::Text(s), Value::Text(p)) => (s.as_str(), p.as_str()),
+                    _ => unreachable!("resolver requires text LIKE operands"),
+                };
+                let matched = like_match(s, p)?;
+                // `negated` carries NOT LIKE: matched != negated flips the result for NOT LIKE.
+                Ok(Value::Bool(matched != *negated))
+            }
         }
     }
+}
+
+/// The SQL `LIKE` matcher (spec/design/grammar.md §22): `%` matches any (possibly empty) run
+/// of characters, `_` matches exactly one character, and `\` (the default escape) makes the
+/// next pattern character literal. It iterates by Unicode **code point** (so astral characters
+/// match `_` correctly — a CLAUDE.md §8 determinism surface), via a two-pointer greedy
+/// backtracking walk identical across the cores. It returns `Err(22025)` when the escape
+/// character is the **last** pattern character *reached during matching* (PostgreSQL's "LIKE
+/// pattern must not end with escape character") — data-dependent, since an earlier mismatch
+/// returns `false` before the escape is reached.
+fn like_match(subject: &str, pattern: &str) -> Result<bool> {
+    let s: Vec<char> = subject.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let mut si = 0usize;
+    let mut pi = 0usize;
+    // The last '%' position in the pattern (a backtrack point) and the subject index when it
+    // was taken; `None` until a '%' has been seen.
+    let mut star_pi: Option<usize> = None;
+    let mut star_si = 0usize;
+    while si < s.len() {
+        if pi < p.len() && p[pi] == '\\' {
+            // Escape: the next pattern character must match the subject literally.
+            if pi + 1 >= p.len() {
+                return Err(EngineError::new(
+                    SqlState::InvalidEscapeSequence,
+                    "LIKE pattern must not end with escape character",
+                ));
+            }
+            if s[si] == p[pi + 1] {
+                si += 1;
+                pi += 2;
+                continue;
+            }
+            // literal mismatch → fall through to backtrack
+        } else if pi < p.len() && p[pi] == '_' {
+            si += 1;
+            pi += 1;
+            continue;
+        } else if pi < p.len() && p[pi] == '%' {
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+            continue;
+        } else if pi < p.len() && p[pi] == s[si] {
+            si += 1;
+            pi += 1;
+            continue;
+        }
+        // Mismatch: backtrack to the last '%' (it absorbs one more subject character), else no.
+        if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+            continue;
+        }
+        return Ok(false);
+    }
+    // Subject consumed: any pattern remainder must be all '%' to match.
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    Ok(pi == p.len())
 }
 
 /// Evaluate an integer arithmetic op in 64-bit, trapping 22012 on a zero divisor and

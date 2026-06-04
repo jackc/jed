@@ -251,6 +251,15 @@ pub enum Expr {
         hi: Box<Expr>,
         negated: bool,
     },
+    /// `lhs LIKE rhs` / `lhs NOT LIKE rhs` — text pattern match (grammar.md §22). `%` matches
+    /// any run of characters, `_` one code point, with the default `\` escape. Both operands
+    /// must be text; NULL propagates. A genuine operator (not desugared) with a hand-written
+    /// matcher. `negated` carries the NOT keyword.
+    Like {
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        negated: bool,
+    },
     /// An aggregate function call — the engine's first function-call syntax (grammar.md §17).
     /// `name` is the spelling as written (resolved case-insensitively against the aggregate
     /// catalog; an unknown name is 42883). `star` is the `COUNT(*)` row-count form (then `arg`
