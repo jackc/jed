@@ -228,7 +228,14 @@ version of them adds nothing — unless the native runtime's data model is uniqu
 divergent.** That is true for JS (UTF-16 + f64/BigInt + the browser) and false for Ruby.
 JS is the interesting case; Ruby is not.
 
-## 4. Timing: "early" means *type-system-early*, not *calendar-early*
+## 4. Timing — two different questions
+
+Goal 1 and goal 2 each have a *when*, and the answers are **opposite**, so do not run them
+together. §4.1 is when to add a **hardening** core (parallel, early); §4.2 is when to build a
+**reach** core (sequential, late). Conflating them — e.g. building C# "in lockstep" the way
+Rust/Go/TS were — pays the parallel cost for none of the parallel benefit.
+
+### 4.1 A hardening core (goal 1): type-system-early, not calendar-early
 
 Both directions of the §2 logic are real; name them honestly.
 
@@ -251,7 +258,49 @@ already proves, while taxing every slice.
 **Trigger, therefore, is a milestone, not a date:** add core #3 when the type system grows
 past integers — specifically when `text` (encoding/collation) and `decimal`/`timestamp`
 (formatting) land (CLAUDE.md §4 deferred scalars). That expansion is the first moment a
-native UTF-16, `f64`-only core catches what the current pair structurally cannot.
+native UTF-16, `f64`-only core catches what the current pair structurally cannot. **(Settled:
+the native TS core landed on exactly this trigger; the differential set is now complete — §6.)**
+
+### 4.2 A reach core (goal 2): sequential, triggered by contract maturity
+
+A reach core (C#, Java, native Swift) surfaces little new divergence (§3), so the §4.1 "add
+it early so ambiguities show up" logic **does not apply** — there is no hardening benefit to
+buy with the parallel-porting tax. The economics invert:
+
+- **Sequential, not parallel.** Building a reach core in lockstep would pay the §5 per-slice
+  porting tax on *every* churning slice (`timestamp`, `array`, transactions, …) for **zero**
+  hardening return (Rust/Go/TS already saturate it). Build it *against a stable contract*, not
+  alongside a moving one.
+- **Trigger = contract maturity — not project completion, and not now.** You do not need the
+  engine "finished"; you need the parts that *reshape* to have settled: the **type system**
+  (the product, CLAUDE.md §4), the **core query / DML / expression surface**, and the **file
+  format + key encoding** (frozen, golden fixtures). Once those stop moving, later features
+  *extend* the contract without reshaping it, and a reach core catches up on them cheaply (the
+  surface no longer thrashes). That milestone is **earlier than "finished"** (don't wait for
+  the last feature) but **later than now** (`timestamp`, `array`, and transactions are still
+  foundational and ahead — a reach core today would spend its life chasing reshapes).
+- **The build is an AI grind against the frozen contract — and doubles as a
+  spec-completeness proof.** "Produce a conforming core from the spec + corpus + the three
+  reference implementations" is exactly the well-specified, objectively-verifiable task agents
+  are best at (the §10 loop, scaled). A successful from-spec build *is* evidence the spec is
+  complete and unambiguous — the vindication of "the spec is the project" (CLAUDE.md §2). Done
+  **once**, against a mature contract; not run continuously against a moving target.
+- **"Pass the corpus" is necessary but not sufficient — differential-test the new core
+  against the existing three.** The one real risk of building late: a corpus blind spot lets a
+  reach core "pass" while subtly wrong in an uncovered area, and you have stopped looking for
+  divergence (the differential set catches bugs only *because* three cores run every slice as
+  it is written). Mitigation that turns the risk into an asset — run the new core through
+  **generative / differential testing against Rust/Go/TS** (the Phase 8 oracle work, TODO.md),
+  not just the static `.test` files: generated queries where all four must agree flush out both
+  core bugs *and* corpus gaps, so a late core still contributes hardening.
+- **Wraps ship anytime; only native reach cores wait.** A wrapped core inherits behavior,
+  format, durability, and cost byte-for-byte (§2), so it is correct against *any* spec version
+  by construction — ship it whenever a language is wanted. Reserve the build-it-native-from-
+  the-spec project for when the contract is frozen *and* the §2 best-experience analysis says
+  native (C# first — §2.3).
+- **If the goal is more hardening, build the Phase 8 generative harness, not a 4th core.**
+  More cores have diminishing divergence yield (§3); more *coverage* does not. Test
+  infrastructure is the higher-leverage hardening investment in the meantime.
 
 ## 5. The one genuinely open choice: native TS vs. Rust→WASM for the browser
 
@@ -286,9 +335,16 @@ The live question is now **goal 2 — language reach**, governed by §2, not §1
 2. **Java / C# / Swift are reach decisions** (TODO.md Phase 9): native or wrapped per the §2
    rule, with **two pivots** — host-function hotness (§2.1) and parallelism (§2.2). Current
    leanings in §2.3 — C# native, Swift wrap, Java conflicted (tilting native on parallelism).
-3. **Ship Ruby / browser-JS as wrappers** (gem → Rust, package → Rust-WASM) when the
+3. **When to build a native reach core — sequential, on contract maturity (§4.2), not in
+   parallel.** Build it *after* the type system + relational core + format/encoding freeze
+   (past `timestamp`/`array`/transactions), against the frozen corpus **and** the three
+   reference cores — **differential-tested against them**, not just the static `.test` files,
+   so a corpus blind spot can't hide a subtle bug. A successful from-spec build doubles as a
+   spec-completeness proof. Wraps can ship earlier (they conform by construction, §2); for more
+   hardening *meanwhile*, build the Phase 8 generative harness, not a 4th core.
+4. **Ship Ruby / browser-JS as wrappers** (gem → Rust, package → Rust-WASM) when the
    ecosystem is wanted; the native TS core already covers the JS *conformance* voice (§5).
-4. **Browser build** remains the §5 split: native-TS-for-conformance *and*
+5. **Browser build** remains the §5 split: native-TS-for-conformance *and*
    Rust-WASM-for-shipping.
 
 This doc records the *rule*; CLAUDE.md §2 remains the canonical priority list. If the rule
