@@ -71,6 +71,12 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.offset",
     // SELECT DISTINCT: deduplicate projected output rows, NULL-safe (grammar.md §11).
     "query.distinct",
+    // Phase 4 — multi-table FROM: INNER/CROSS JOIN, table aliases, qualified columns
+    // (grammar.md §15). Outer joins parse but execute 0A000.
+    "query.join_inner",
+    "query.cross_join",
+    "query.table_alias",
+    "query.qualified_column",
     "null.three_valued",
     "compare.promotion",
     "cast.explicit",

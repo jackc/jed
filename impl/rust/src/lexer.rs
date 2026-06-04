@@ -137,9 +137,13 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 }
             }
             b'.' => {
-                // A leading-dot decimal literal (`.5`). A `.` must have a digit on at least
-                // one side; a bare `.` (no following digit) is a syntax error. There is no
-                // `t.col` qualified-name syntax yet, so `.` appears only in a numeric literal.
+                // A `.` has two roles, disambiguated on the FOLLOWING byte alone (no
+                // preceding-token context, so the rule is trivially identical across cores —
+                // spec/design/grammar.md §4): a digit immediately after starts a leading-dot
+                // decimal literal (`.5`); otherwise it is the `Dot` token of a qualified column
+                // reference (`t.col`, §15). The lone overlap — an identifier then `.<digit>`
+                // (`t.5`) — is invalid either way (a column name is never numeric) and lexes
+                // here as a decimal, rejected at parse.
                 if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
                     i += 1; // consume '.'
                     let frac_start = i;
@@ -149,7 +153,8 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                     let frac = &sql[frac_start..i];
                     tokens.push(Token::Decimal(frac.to_string(), frac.len() as u32));
                 } else {
-                    return Err(syntax("unexpected character '.'".to_string()));
+                    tokens.push(Token::Dot);
+                    i += 1;
                 }
             }
             _ if c.is_ascii_alphabetic() || c == b'_' => {

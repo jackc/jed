@@ -353,12 +353,12 @@ func (p *Parser) parseSelect() (*Select, error) {
 	if err := p.expectKeyword("from"); err != nil {
 		return nil, err
 	}
-	from, err := p.expectIdentifier()
+	from, joins, err := p.parseFromClause()
 	if err != nil {
 		return nil, err
 	}
 
-	sel := &Select{Distinct: distinct, Items: items, From: from}
+	sel := &Select{Distinct: distinct, Items: items, From: from, Joins: joins}
 
 	filter, err := p.parseOptionalWhere()
 	if err != nil {
@@ -377,6 +377,131 @@ func (p *Parser) parseSelect() (*Select, error) {
 	return sel, nil
 }
 
+// parseFromClause parses `from_clause ::= table_ref join_clause*` (grammar.md §15): the first
+// table reference followed by a left-deep chain of zero or more joins. The join keywords are
+// not reserved (§3); the loop recognizes a join only by a leading join keyword, so any other
+// trailing word ends the FROM clause.
+func (p *Parser) parseFromClause() (TableRef, []JoinClause, error) {
+	from, err := p.parseTableRef()
+	if err != nil {
+		return TableRef{}, nil, err
+	}
+	var joins []JoinClause
+	for {
+		j, ok, err := p.parseJoinClause()
+		if err != nil {
+			return TableRef{}, nil, err
+		}
+		if !ok {
+			break
+		}
+		joins = append(joins, j)
+	}
+	return from, joins, nil
+}
+
+// parseTableRef parses `table_ref ::= identifier ("AS"? identifier)?` — a table name with an
+// optional alias. An explicit AS takes the next identifier unconditionally; an implicit alias
+// is taken only when the next token is a word that is NOT a clause/join keyword (so `FROM t
+// WHERE` and `FROM t JOIN ...` keep no alias). The stop-keyword set is a §8 cross-core surface.
+func (p *Parser) parseTableRef() (TableRef, error) {
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return TableRef{}, err
+	}
+	var alias *string
+	if p.peekKeyword() == "as" {
+		p.advance()
+		a, err := p.expectIdentifier()
+		if err != nil {
+			return TableRef{}, err
+		}
+		alias = &a
+	} else if t := p.peek(); t.Kind == TokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
+		a := t.Word
+		p.advance()
+		alias = &a
+	}
+	return TableRef{Name: name, Alias: alias}, nil
+}
+
+// parseJoinClause parses one join_clause if a join keyword begins here (returns ok=false to end
+// the FROM chain). CROSS JOIN has no ON; the INNER/outer kinds require ON <expr> (a missing ON
+// is 42601). The outer kinds (LEFT/RIGHT/FULL [OUTER]) parse into the AST but are rejected at
+// execution (0A000) — spec/design/grammar.md §15.
+func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
+	kw := p.peekKeyword()
+	var kind JoinKind
+	isCross := false
+	switch kw {
+	case "join": // a bare JOIN is INNER
+		p.advance()
+		kind = JoinInner
+	case "inner":
+		p.advance()
+		if err := p.expectKeyword("join"); err != nil {
+			return JoinClause{}, false, err
+		}
+		kind = JoinInner
+	case "cross":
+		p.advance()
+		if err := p.expectKeyword("join"); err != nil {
+			return JoinClause{}, false, err
+		}
+		kind = JoinCross
+		isCross = true
+	case "left", "right", "full":
+		p.advance()
+		if p.peekKeyword() == "outer" { // optional OUTER
+			p.advance()
+		}
+		if err := p.expectKeyword("join"); err != nil {
+			return JoinClause{}, false, err
+		}
+		switch kw {
+		case "left":
+			kind = JoinLeft
+		case "right":
+			kind = JoinRight
+		default:
+			kind = JoinFull
+		}
+	default: // not a join keyword: the FROM chain ends here
+		return JoinClause{}, false, nil
+	}
+	table, err := p.parseTableRef()
+	if err != nil {
+		return JoinClause{}, false, err
+	}
+	var on *Expr
+	if !isCross {
+		if err := p.expectKeyword("on"); err != nil {
+			return JoinClause{}, false, err
+		}
+		e, err := p.parseExpr()
+		if err != nil {
+			return JoinClause{}, false, err
+		}
+		on = &e
+	}
+	return JoinClause{Kind: kind, Table: table, On: on}, true, nil
+}
+
+// isTableRefStopKeyword reports whether kw (already lower-cased) is a keyword that may legally
+// follow a table_ref, and so must NOT be swallowed as an implicit table alias: a trailing
+// clause keyword (where/order/limit/offset) or any join-machinery keyword
+// (join/inner/cross/left/right/full/outer/on). `as` is handled separately. This set is a
+// CLAUDE.md §8 cross-core determinism surface (spec/design/grammar.md §15).
+func isTableRefStopKeyword(kw string) bool {
+	switch kw {
+	case "where", "order", "limit", "offset",
+		"join", "inner", "cross", "left", "right", "full", "outer", "on", "as":
+		return true
+	default:
+		return false
+	}
+}
+
 // parseOrderBy parses an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare
 // column with an optional ASC/DESC and an optional NULLS FIRST|LAST, setting the keys on
 // sel. NullsFirst is resolved here: explicit if given, else the direction default (ASC ->
@@ -391,7 +516,7 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 		return err
 	}
 	for {
-		col, err := p.expectIdentifier()
+		qualifier, col, err := p.parseColumnRef()
 		if err != nil {
 			return err
 		}
@@ -419,7 +544,7 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 				return NewError(SyntaxError, "NULLS must be followed by FIRST or LAST")
 			}
 		}
-		sel.OrderBy = append(sel.OrderBy, OrderKey{Column: col, Descending: descending, NullsFirst: nullsFirst})
+		sel.OrderBy = append(sel.OrderBy, OrderKey{Qualifier: qualifier, Column: col, Descending: descending, NullsFirst: nullsFirst})
 		if p.peek().Kind == TokComma {
 			p.advance()
 			continue
@@ -858,14 +983,36 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		p.advance()
 		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralBool, Bool: false}}, nil
 	case t.Kind == TokWord:
-		col, err := p.expectIdentifier()
+		qualifier, name, err := p.parseColumnRef()
 		if err != nil {
 			return Expr{}, err
 		}
-		return Expr{Kind: ExprColumn, Column: col}, nil
+		if qualifier != "" {
+			return Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: name}, nil
+		}
+		return Expr{Kind: ExprColumn, Column: name}, nil
 	default:
 		return Expr{}, NewError(SyntaxError, "expected an expression")
 	}
+}
+
+// parseColumnRef parses `column_ref ::= identifier ("." identifier)?` — a bare column name, or
+// a qualified `rel.col` (the "." is TokDot). Returns (qualifier, name); qualifier is "" for a
+// bare column (spec/grammar/grammar.ebnf `column_ref`, grammar.md §15).
+func (p *Parser) parseColumnRef() (string, string, error) {
+	first, err := p.expectIdentifier()
+	if err != nil {
+		return "", "", err
+	}
+	if p.peek().Kind == TokDot {
+		p.advance()
+		second, err := p.expectIdentifier()
+		if err != nil {
+			return "", "", err
+		}
+		return first, second, nil
+	}
+	return "", first, nil
 }
 
 // peek returns the current token without consuming it.

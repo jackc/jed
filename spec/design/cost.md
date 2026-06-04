@@ -107,6 +107,40 @@ A consequence worth stating because it is observable and is a cross-core abort-p
 windows first and does not. The trapping row is deterministic (primary-key scan order), so
 all three cores trap identically.
 
+### JOIN — multi-table FROM (the nested-loop contract)
+
+A multi-table `SELECT` ([grammar.md](grammar.md) §15) is a **left-deep nested-loop** join. Its
+cost is pinned here because, with no reference implementation, the count is a cross-core contract
+(§1). Three rules, each a small extension of the single-table rules above:
+
+- **`storage_row_read` is charged once per physical row as each base table is materialized** —
+  total = the **sum of the table cardinalities** (`|A| + |B| + …`), independent of join order or
+  fan-out. A row is pulled from its store exactly once (each table is scanned into memory in
+  primary-key order); the nested loop then re-reads from that **in-memory** buffer, which is not a
+  store and charges nothing. This keeps the existing rule verbatim ("once per row pulled from a
+  store, in the executor loop not the storage iterator" — so the Rust lazy-iterator vs Go/TS
+  materialized-slice split stays neutralized) and keeps single-table cost identical (one table →
+  its cardinality).
+- **The `ON`-predicate `operator_eval` is charged per candidate combination** the join evaluates
+  it against — for an `INNER JOIN`, once per (running-row × right-row) pair, the `ON` tree's
+  interior nodes firing pre-order with **no short-circuit**, exactly like a WHERE. A `CROSS JOIN`
+  has no `ON` and charges no join `operator_eval` (it keeps every pair). So `ON` cost =
+  |running| × |right| × (interior nodes in the `ON`), deterministic and fan-out-explicit. The
+  iteration order — running/left side outer in PK order, right side inner in PK order, left-deep —
+  is fixed so the per-combination evals accrue in the same sequence in every core (a §8 surface;
+  it fixes the future abort point even though only the total is asserted today).
+- **WHERE `operator_eval`** is charged per **surviving combined row** (post-join), and
+  **`row_produced`** per emitted output row (post-`LIMIT`/`OFFSET`) — both unchanged; the combined
+  row is simply wider. Join materialization buffering, the nested-loop control flow, and row
+  concatenation are **unmetered**, like the `ORDER BY` sort and the `LIMIT` slice.
+
+**Worked example.** Tables `a` (3 rows), `b` (2 rows); `SELECT * FROM a JOIN b ON a.k = b.k`, with
+2 pairs surviving the `ON`. Materialize `a` → 3 `storage_row_read`; materialize `b` → 2; the `ON`
+(`a.k = b.k`, one interior `compare` node — its operands are leaf columns, charging nothing) over
+3 × 2 = 6 candidate pairs → 6 `operator_eval`; no WHERE; `*` is bare-column projection (leaves,
+charge nothing); 2 emitted rows → 2 `row_produced`. **Total = 3 + 2 + 6 + 2 = 13.** A
+`CROSS JOIN` of the same tables emits all 6 pairs and evaluates no `ON`: 3 + 2 + 0 + 6 = **11**.
+
 ### What is NOT metered (defined boundary)
 
 Metering covers **execution** — per-row scans, per-row produced, per-row expression
@@ -129,6 +163,10 @@ evaluation. It deliberately does **not** meter:
   `row_produced` only for the surviving distinct, windowed rows.
 - **Phase-2 row writes** in `UPDATE`/`DELETE` — the two-phase mutation's write pass does
   no eval and produces no row.
+- **JOIN nested-loop control flow** — buffering each materialized table, iterating the
+  Cartesian/left-deep combinations, and concatenating left+right rows are bookkeeping, not
+  evaluation; only `storage_row_read` (per materialized row), the `ON`/WHERE/projection
+  `operator_eval`s, and `row_produced` accrue (see the JOIN subsection above).
 
 ## 4. Counter representation — exactness across cores (CLAUDE.md §8)
 

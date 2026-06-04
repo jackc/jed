@@ -5,8 +5,9 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert, Literal,
-    OrderKey, Select, SelectItem, SelectItems, Statement, TypeMod, UnaryOp, Update,
+    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert, JoinClause,
+    JoinKind, Literal, OrderKey, Select, SelectItem, SelectItems, Statement, TableRef, TypeMod,
+    UnaryOp, Update,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -236,7 +237,7 @@ impl Parser {
 
         let items = self.parse_select_items()?;
         self.expect_keyword("from")?;
-        let from = self.expect_identifier()?;
+        let (from, joins) = self.parse_from_clause()?;
 
         let filter = self.parse_optional_where()?;
 
@@ -248,11 +249,101 @@ impl Parser {
             distinct,
             items,
             from,
+            joins,
             filter,
             order_by,
             limit,
             offset,
         })
+    }
+
+    /// `from_clause ::= table_ref join_clause*` (spec/grammar/grammar.ebnf, grammar.md §15).
+    /// The first table reference followed by a left-deep chain of zero or more joins. The
+    /// join keywords are not reserved (§3); the loop recognizes a join only by a leading
+    /// join keyword (`JOIN` / `INNER`/`CROSS`/`LEFT`/`RIGHT`/`FULL` ... `JOIN`), so any other
+    /// trailing word ends the FROM clause.
+    fn parse_from_clause(&mut self) -> Result<(TableRef, Vec<JoinClause>)> {
+        let from = self.parse_table_ref()?;
+        let mut joins = Vec::new();
+        while let Some(j) = self.parse_join_clause()? {
+            joins.push(j);
+        }
+        Ok((from, joins))
+    }
+
+    /// `table_ref ::= identifier ("AS"? identifier)?` — a table name with an optional alias.
+    /// An explicit `AS` takes the next identifier unconditionally; an implicit alias is taken
+    /// only when the next token is a word that is NOT a clause/join keyword (so `FROM t WHERE`
+    /// and `FROM t JOIN ...` keep no alias). The stop-keyword set is a §8 cross-core surface
+    /// (grammar.md §15).
+    fn parse_table_ref(&mut self) -> Result<TableRef> {
+        let name = self.expect_identifier()?;
+        let alias = if self.peek_keyword().as_deref() == Some("as") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            match self.peek() {
+                Token::Word(w) if !is_table_ref_stop_keyword(&w.to_ascii_lowercase()) => {
+                    let alias = w.clone();
+                    self.advance();
+                    Some(alias)
+                }
+                _ => None,
+            }
+        };
+        Ok(TableRef { name, alias })
+    }
+
+    /// Parse one `join_clause` if a join keyword begins here, else `None` (ending the FROM
+    /// chain). `CROSS JOIN` has no `ON`; the `INNER`/outer kinds require `ON <expr>` (a missing
+    /// `ON` is 42601). The outer kinds (`LEFT`/`RIGHT`/`FULL [OUTER]`) parse into the AST but
+    /// are rejected at execution (0A000) — spec/design/grammar.md §15.
+    fn parse_join_clause(&mut self) -> Result<Option<JoinClause>> {
+        let kw = match self.peek_keyword() {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let (kind, is_cross) = match kw.as_str() {
+            // A bare JOIN is INNER.
+            "join" => {
+                self.advance();
+                (JoinKind::Inner, false)
+            }
+            "inner" => {
+                self.advance();
+                self.expect_keyword("join")?;
+                (JoinKind::Inner, false)
+            }
+            "cross" => {
+                self.advance();
+                self.expect_keyword("join")?;
+                (JoinKind::Cross, true)
+            }
+            "left" | "right" | "full" => {
+                self.advance();
+                // Optional OUTER.
+                if self.peek_keyword().as_deref() == Some("outer") {
+                    self.advance();
+                }
+                self.expect_keyword("join")?;
+                let kind = match kw.as_str() {
+                    "left" => JoinKind::Left,
+                    "right" => JoinKind::Right,
+                    _ => JoinKind::Full,
+                };
+                (kind, false)
+            }
+            // Not a join keyword: the FROM chain ends here.
+            _ => return Ok(None),
+        };
+        let table = self.parse_table_ref()?;
+        let on = if is_cross {
+            None
+        } else {
+            self.expect_keyword("on")?;
+            Some(self.parse_expr()?)
+        };
+        Ok(Some(JoinClause { kind, table, on }))
     }
 
     /// Parse an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare column with
@@ -268,7 +359,7 @@ impl Parser {
         self.advance();
         self.expect_keyword("by")?;
         loop {
-            let column = self.expect_identifier()?;
+            let (qualifier, column) = self.parse_column_ref()?;
             let descending = match self.peek_keyword().as_deref() {
                 Some("asc") => {
                     self.advance();
@@ -304,6 +395,7 @@ impl Parser {
                 descending
             };
             keys.push(OrderKey {
+                qualifier,
                 column,
                 descending,
                 nulls_first,
@@ -677,8 +769,28 @@ impl Parser {
                     unreachable!("peeked a decimal literal")
                 }
             }
-            Token::Word(_) => Ok(Expr::Column(self.expect_identifier()?)),
+            Token::Word(_) => {
+                let (qualifier, name) = self.parse_column_ref()?;
+                Ok(match qualifier {
+                    Some(qualifier) => Expr::QualifiedColumn { qualifier, name },
+                    None => Expr::Column(name),
+                })
+            }
             other => Err(syntax(format!("expected an expression, found {other:?}"))),
+        }
+    }
+
+    /// `column_ref ::= identifier ("." identifier)?` — a bare column name, or a qualified
+    /// `rel.col` (the `.` is the `Dot` token). Returns `(qualifier, name)`; `qualifier` is
+    /// `None` for a bare column (spec/grammar/grammar.ebnf `column_ref`, grammar.md §15).
+    fn parse_column_ref(&mut self) -> Result<(Option<String>, String)> {
+        let first = self.expect_identifier()?;
+        if matches!(self.peek(), Token::Dot) {
+            self.advance();
+            let second = self.expect_identifier()?;
+            Ok((Some(first), second))
+        } else {
+            Ok((None, first))
         }
     }
 
@@ -744,6 +856,31 @@ impl Parser {
 
 fn syntax(msg: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::SyntaxError, msg.into())
+}
+
+/// Whether `kw` (already lower-cased) is a keyword that may legally follow a `table_ref`,
+/// and so must NOT be swallowed as an implicit table alias: a trailing clause keyword
+/// (`where`/`order`/`limit`/`offset`) or any join-machinery keyword
+/// (`join`/`inner`/`cross`/`left`/`right`/`full`/`outer`/`on`). `as` is handled separately
+/// (explicit alias). This set is a CLAUDE.md §8 cross-core determinism surface
+/// (spec/design/grammar.md §15).
+fn is_table_ref_stop_keyword(kw: &str) -> bool {
+    matches!(
+        kw,
+        "where"
+            | "order"
+            | "limit"
+            | "offset"
+            | "join"
+            | "inner"
+            | "cross"
+            | "left"
+            | "right"
+            | "full"
+            | "outer"
+            | "on"
+            | "as"
+    )
 }
 
 /// Build a binary-operator expression node.

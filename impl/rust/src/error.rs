@@ -32,6 +32,9 @@ pub enum SqlState {
     UndefinedTable,
     /// 42703 — undefined column.
     UndefinedColumn,
+    /// 42702 — ambiguous column (a bare column name that matches more than one relation
+    /// in scope; spec/design/grammar.md §15).
+    AmbiguousColumn,
     /// 42704 — undefined object (e.g. an unknown type name).
     UndefinedObject,
     /// 42P10 — invalid column reference (a SELECT DISTINCT ORDER BY key not in the
@@ -43,6 +46,9 @@ pub enum SqlState {
     DuplicateTable,
     /// 42701 — duplicate column (two columns with the same name).
     DuplicateColumn,
+    /// 42712 — duplicate alias (two FROM relations share a label; a self-join needs
+    /// distinct aliases; spec/design/grammar.md §15).
+    DuplicateAlias,
     /// 42P16 — invalid table definition (e.g. more than one primary key).
     InvalidTableDefinition,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
@@ -65,11 +71,13 @@ impl SqlState {
             SqlState::SyntaxError => "42601",
             SqlState::UndefinedTable => "42P01",
             SqlState::UndefinedColumn => "42703",
+            SqlState::AmbiguousColumn => "42702",
             SqlState::UndefinedObject => "42704",
             SqlState::InvalidColumnReference => "42P10",
             SqlState::DatatypeMismatch => "42804",
             SqlState::DuplicateTable => "42P07",
             SqlState::DuplicateColumn => "42701",
+            SqlState::DuplicateAlias => "42712",
             SqlState::InvalidTableDefinition => "42P16",
             SqlState::FeatureNotSupported => "0A000",
             SqlState::DataCorrupted => "XX001",

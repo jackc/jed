@@ -88,6 +88,12 @@ class = "syntax error or access rule violation"
 template = "column does not exist: {name}"
 
 [[error]]
+code = "42702"
+name = "ambiguous_column"
+class = "syntax error or access rule violation"
+template = "column reference {name} is ambiguous"
+
+[[error]]
 code = "42704"
 name = "undefined_object"
 class = "syntax error or access rule violation"
@@ -110,6 +116,12 @@ code = "42701"
 name = "duplicate_column"
 class = "syntax error or access rule violation"
 template = "duplicate column name: {name}"
+
+[[error]]
+code = "42712"
+name = "duplicate_alias"
+class = "syntax error or access rule violation"
+template = "table name {name} specified more than once"
 
 [[error]]
 code = "42P07"

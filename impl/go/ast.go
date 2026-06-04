@@ -79,15 +79,53 @@ type Delete struct {
 	Filter *Expr
 }
 
-// Select is a single-table SELECT. Filter (the WHERE expression) must resolve to
-// boolean.
+// TableRef is a table reference in a FROM clause: a table name with an optional alias
+// (`orders o` or `orders AS o`). The alias, or the table name when there is none, is the
+// relation's LABEL — it qualifies columns (o.col) and must be distinct within one query (a
+// self-join needs aliases; a duplicate label is 42712). See spec/design/grammar.md §15.
+type TableRef struct {
+	Name  string
+	Alias *string
+}
+
+// JoinKind is the kind of a join. Inner and Cross execute this slice; the Left/Right/Full
+// outer kinds parse and are carried in the AST but executing one is a documented 0A000
+// narrowing (the OUTER family is a fast-follow — spec/design/grammar.md §15).
+type JoinKind int
+
+const (
+	// JoinInner is INNER JOIN (a bare JOIN is INNER).
+	JoinInner JoinKind = iota
+	// JoinCross is CROSS JOIN (a Cartesian product, no ON).
+	JoinCross
+	// JoinLeft is LEFT [OUTER] JOIN (deferred — 0A000 at execution).
+	JoinLeft
+	// JoinRight is RIGHT [OUTER] JOIN (deferred — 0A000).
+	JoinRight
+	// JoinFull is FULL [OUTER] JOIN (deferred — 0A000).
+	JoinFull
+)
+
+// JoinClause is one JOIN step in the left-deep FROM chain: the join kind, the right-hand
+// table reference, and the optional ON predicate (nil for CROSS JOIN; set for INNER/outer,
+// which require an ON). See spec/design/grammar.md §15.
+type JoinClause struct {
+	Kind  JoinKind
+	Table TableRef
+	On    *Expr
+}
+
+// Select is a SELECT. The FROM clause is a left-deep chain: From followed by zero or more
+// Joins (empty = single-table). Filter (the WHERE expression) must resolve to boolean.
 type Select struct {
 	// Distinct is SELECT DISTINCT — deduplicate the projected output rows (NULL-safe),
 	// applied after ORDER BY and before LIMIT/OFFSET (spec/design/grammar.md §11).
 	Distinct bool
 	Items    SelectItems
-	From     string
-	Filter   *Expr
+	From     TableRef
+	// Joins holds the left-deep JOINs after From (nil/empty = a single-table SELECT).
+	Joins  []JoinClause
+	Filter *Expr
 	// OrderBy holds the ORDER BY sort keys, applied left to right; nil/empty means no
 	// ORDER BY (spec/design/grammar.md §10).
 	OrderBy []OrderKey
@@ -121,8 +159,12 @@ type SelectItem struct {
 type ExprKind int
 
 const (
-	// ExprColumn is a column reference.
+	// ExprColumn is a bare (unqualified) column reference (Column holds the name).
 	ExprColumn ExprKind = iota
+	// ExprQualifiedColumn is a qualified reference `rel.col` (Qualifier holds the relation
+	// label, Column the column name); resolved against exactly that one relation, never
+	// ambiguous (spec/design/grammar.md §15).
+	ExprQualifiedColumn
 	// ExprLiteral is a literal value.
 	ExprLiteral
 	// ExprCast is CAST(inner AS type).
@@ -182,7 +224,8 @@ const (
 // boolean-valued; arithmetic and columns/integer-literals are integer-valued.
 type Expr struct {
 	Kind       ExprKind
-	Column     string     // ExprColumn
+	Column     string     // ExprColumn, ExprQualifiedColumn (the column name)
+	Qualifier  string     // ExprQualifiedColumn (the relation label)
 	Literal    *Literal   // ExprLiteral
 	Cast       *CastExpr  // ExprCast
 	Unary      *UnaryExpr // ExprUnary
@@ -233,6 +276,8 @@ type IsDistinctExpr struct {
 // NULL is the largest value) — and is applied independently of the Descending value flip
 // (spec/design/grammar.md §10).
 type OrderKey struct {
+	// Qualifier is an optional relation qualifier (`ORDER BY t.a`); "" is a bare column.
+	Qualifier  string
 	Column     string
 	Descending bool
 	NullsFirst bool

@@ -126,9 +126,12 @@ export function lex(sql: string): Token[] {
         tokens.push({ kind: "int", int: v });
       }
     } else if (c === ".") {
-      // A leading-dot decimal literal (`.5`). A "." must have a digit on at least one side; a
-      // bare "." is a syntax error. There is no t.col qualified-name syntax yet, so "." appears
-      // only in a numeric literal.
+      // A "." has two roles, disambiguated on the FOLLOWING char alone (no preceding-token
+      // context, so the rule is trivially identical across cores — grammar.md §4): a digit
+      // immediately after starts a leading-dot decimal literal (`.5`); otherwise it is the
+      // "dot" token of a qualified column reference (`t.col`, §15). The lone overlap — an
+      // identifier then `.<digit>` (`t.5`) — is invalid either way and lexes as a decimal,
+      // rejected at parse.
       if (i + 1 < n && isDigit(sql[i + 1]!)) {
         i++; // consume "."
         const fracStart = i;
@@ -138,7 +141,8 @@ export function lex(sql: string): Token[] {
         const frac = sql.slice(fracStart, i);
         tokens.push({ kind: "decimal", decDigits: frac, decScale: frac.length });
       } else {
-        throw engineError("syntax_error", "unexpected character '.'");
+        tokens.push({ kind: "dot" });
+        i++;
       }
     } else if (isAlpha(c)) {
       const start = i;

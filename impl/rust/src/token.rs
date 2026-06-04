@@ -19,6 +19,10 @@ pub enum Token {
     /// `Minus` operator; the cap check is at resolve (spec/design/grammar.md §14).
     Decimal(String, u32),
     Comma,
+    /// The `.` separator of a qualified column reference (`t.col`). Emitted only when a
+    /// `.` is NOT part of a numeric literal — i.e. with no digit immediately after it
+    /// (spec/design/grammar.md §4/§15).
+    Dot,
     LParen,
     RParen,
     Star,

@@ -6,6 +6,8 @@ export type TokenKind =
   | "decimal" // a decimal literal (a numeric literal with a "."); see `decDigits`/`decScale`
   | "str" // a single-quoted string literal's decoded content (the text type)
   | "comma" // ,
+  | "dot" // . — the separator of a qualified column reference (t.col); emitted only when a
+  //         "." is NOT part of a numeric literal (spec/design/grammar.md §4/§15)
   | "lparen" // (
   | "rparen" // )
   | "star" // *

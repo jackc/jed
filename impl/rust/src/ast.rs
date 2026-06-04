@@ -86,6 +86,38 @@ pub struct Delete {
     pub filter: Option<Expr>,
 }
 
+/// A table reference in a FROM clause: a table name with an optional alias (`orders o`
+/// or `orders AS o`). The alias, or the table name when there is none, is the relation's
+/// **label** — it qualifies columns (`o.col`) and must be distinct within one query
+/// (a self-join needs aliases; a duplicate label is `42712`). See spec/design/grammar.md §15.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+/// The kind of a join. `Inner` and `Cross` execute this slice; the `Left`/`Right`/`Full`
+/// outer kinds parse and are carried in the AST but executing one is a documented `0A000`
+/// narrowing (the OUTER family is a fast-follow — spec/design/grammar.md §15).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JoinKind {
+    Inner,
+    Cross,
+    Left,
+    Right,
+    Full,
+}
+
+/// One `JOIN` step in the left-deep FROM chain: the join kind, the right-hand table
+/// reference, and the optional `ON` predicate (`None` for `CROSS JOIN`; `Some(expr)` for
+/// the `INNER`/outer kinds, which require an `ON`). See spec/design/grammar.md §15.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub table: TableRef,
+    pub on: Option<Expr>,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Select {
     /// `SELECT DISTINCT` — deduplicate the projected output rows (NULL-safe), applied
@@ -93,7 +125,11 @@ pub struct Select {
     pub distinct: bool,
     /// Projected expressions, or `*` for all (`SelectItems::All`).
     pub items: SelectItems,
-    pub from: String,
+    /// The first table reference of the FROM clause.
+    pub from: TableRef,
+    /// Zero or more left-deep JOINs after `from` (empty = a single-table SELECT).
+    /// spec/design/grammar.md §15.
+    pub joins: Vec<JoinClause>,
     /// The WHERE expression (must resolve to boolean), if any.
     pub filter: Option<Expr>,
     /// ORDER BY sort keys, applied left to right; empty means no ORDER BY
@@ -130,6 +166,13 @@ pub struct SelectItem {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Expr {
     Column(String),
+    /// A qualified column reference `rel.col`, where `rel` is a relation label in the FROM
+    /// clause (its alias, else its table name). Resolved against exactly that one relation —
+    /// never ambiguous (spec/design/grammar.md §15). Bare `Column` stays the unqualified form.
+    QualifiedColumn {
+        qualifier: String,
+        name: String,
+    },
     Literal(Literal),
     Cast {
         inner: Box<Expr>,
@@ -195,6 +238,8 @@ pub enum BinaryOp {
 /// is applied independently of the `descending` value flip (spec/design/grammar.md §10).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OrderKey {
+    /// An optional relation qualifier (`ORDER BY t.a`); `None` is a bare column.
+    pub qualifier: Option<String>,
     pub column: String,
     pub descending: bool,
     pub nulls_first: bool,

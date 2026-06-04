@@ -95,10 +95,37 @@ delete         ::= "DELETE" "FROM" identifier where_clause?
 
 /* --- queries ------------------------------------------------------------- */
 
-select         ::= "SELECT" "DISTINCT"? select_items "FROM" identifier
+select         ::= "SELECT" "DISTINCT"? select_items "FROM" from_clause
                    where_clause?
                    order_by?
                    limit_offset?
+
+/* The FROM clause is a left-deep chain: a first table_ref followed by zero or more
+ * join_clauses. With no join_clause it is the single-table SELECT the rest of the
+ * engine already supported (../design/grammar.md §5/§15). A table_ref is a table name
+ * with an optional alias — "AS" optional ("orders o" = "orders AS o"). The alias (or,
+ * with none, the table name) is the relation's LABEL, used to qualify columns (t.col);
+ * two relations with the same label (a self-join with no aliases, "t JOIN t") is a
+ * 42712 duplicate_alias. */
+from_clause    ::= table_ref join_clause*
+
+table_ref      ::= identifier ("AS"? identifier)?
+
+/* A join_clause is INNER JOIN ... ON <expr> (the "INNER" keyword is optional — a bare
+ * "JOIN" is INNER) or CROSS JOIN (a Cartesian product, no "ON"). The "ON" predicate is a
+ * general expression that must resolve to boolean (42804 otherwise), exactly like WHERE,
+ * evaluated at the join (../design/grammar.md §15). An "INNER"/"JOIN" with no "ON" is a
+ * 42601 syntax error; "CROSS JOIN ... ON ..." is likewise 42601.
+ *   join_type is parsed for the OUTER family too (LEFT/RIGHT/FULL [OUTER]) so the grammar
+ * carries the full shape, but executing an outer join is a documented 0A000 narrowing this
+ * slice (only INNER and CROSS run — ../design/grammar.md §15, the text-PK/deferred-cast
+ * deferral pattern). The join keywords are NOT reserved (§3): a column or table may be
+ * named "join"/"inner"/"cross"/"on"/"left"/..., disambiguated positionally by the parser. */
+join_clause    ::= "CROSS" "JOIN" table_ref
+                 | join_type? "JOIN" table_ref "ON" expr
+
+join_type      ::= "INNER"
+                 | ("LEFT" | "RIGHT" | "FULL") "OUTER"?
 
 /* "DISTINCT" removes duplicate PROJECTED output rows (dedup on the select-list
  * values, NULL-safe so two all-NULL rows collapse — ../design/grammar.md §11). It
@@ -138,7 +165,7 @@ select_item    ::= expr ("AS" identifier)?
  * of direction. "NULLS" not followed by FIRST | LAST is a syntax error (42601). */
 order_by       ::= "ORDER" "BY" sort_key ("," sort_key)*
 
-sort_key       ::= identifier ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
+sort_key       ::= column_ref ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
 
 /* LIMIT and OFFSET cap and skip output rows. They may appear in EITHER order, and
  * each clause AT MOST ONCE — a repeat (e.g. "LIMIT 1 LIMIT 2") is a syntax error
@@ -211,7 +238,16 @@ primary        ::= number
                  | "NULL"
                  | "CAST" "(" expr "AS" type_name ")"
                  | "(" expr ")"
-                 | identifier
+                 | column_ref
+
+/* A column reference is a bare column ("col") or a qualified column ("rel.col") where
+ * `rel` is a relation's LABEL in the FROM clause (its alias, else its table name). A bare
+ * name is resolved against every relation in scope: no match is 42703 undefined_column, a
+ * match in two or more relations is 42702 ambiguous_column, exactly one match resolves. A
+ * qualified name names exactly one relation (an unknown label is 42P01, a label with no
+ * such column is 42703) and is never ambiguous (../design/grammar.md §15). The "." is the
+ * `Dot` token (see the lexical layer); there is no "rel.*" qualified-star this slice. */
+column_ref     ::= identifier ("." identifier)?
 
 /* INSERT takes literals only (no expressions, no columns). A leading "-" before
  * a number here is the unary-minus operator applied to the literal, folded at
@@ -252,6 +288,17 @@ integer        ::= digit+
  * (`1.5e3`) is DEFERRED (../design/grammar.md). */
 decimal        ::= digit+ "." digit*
                  | "." digit+
+
+/* The "." token has two roles, resolved by the lexer on the FOLLOWING byte alone (no
+ * preceding-token context, so the rule is trivially identical across cores — §4):
+ *   - a "." with a DIGIT immediately after starts/continues a numeric literal (`.5`, and
+ *     `123.` / `123.45` from the digit run above);
+ *   - any other "." is the standalone `Dot` token, consumed only by `column_ref` (`t.col`).
+ * The single overlap — an identifier immediately followed by `.<digit>` (`t.5`) — is
+ * invalid SQL either way (a column name is never numeric), so it is left to lex as
+ * `<word> <decimal>` and rejected at parse (42601); no qualified form needs it. A bare "."
+ * with no digit after and no identifier before/after is still a 42601. */
+dot            ::= "."
 
 /* A single-quoted string literal (the `text` type). An embedded single quote is written
  * by doubling it (`''`) — standard_conforming_strings; there are NO backslash escapes. The

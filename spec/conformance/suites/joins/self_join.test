@@ -1,0 +1,72 @@
+# Self-joins and multi-table chains (spec/design/grammar.md §15). A self-join joins a table to
+# itself under two distinct aliases (each is its own scope relation, with its own column offset).
+# A 3-table chain mixes INNER and CROSS, left-deep. Output is deterministic with NO ORDER BY:
+# the nested loop iterates the running (left) side then the right side, each in primary-key order.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, query.join_inner, query.cross_join, query.table_alias, query.qualified_column, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE emp (id int32 PRIMARY KEY, name text, mgr int32)
+
+statement ok
+CREATE TABLE region (id int32 PRIMARY KEY, rname text)
+
+statement ok
+INSERT INTO emp VALUES (1, 'ceo', NULL), (2, 'vp', 1), (3, 'eng', 2), (4, 'eng2', 2)
+
+statement ok
+INSERT INTO region VALUES (1, 'us'), (2, 'eu')
+
+# Employee-to-manager self-join: e.mgr = m.id. The CEO (mgr NULL) matches no manager (3-valued
+# ON). 4 + 4 materialized (emp read twice = 8) + 16 ON `=` evals + 3 produced = 27.
+# names: name, name
+# cost: 27
+query TT nosort
+SELECT e.name, m.name FROM emp AS e JOIN emp AS m ON e.mgr = m.id ORDER BY e.id
+----
+vp
+ceo
+eng
+vp
+eng2
+vp
+
+# Deterministic order with NO ORDER BY: running (e) in id order, then right (m) in id order.
+# e1 (mgr NULL) yields nothing; then e2->m1, e3->m2, e4->m2. 8 + 16 ON + 3 produced = 27.
+# names: id, id
+# cost: 27
+query II nosort
+SELECT e.id, m.id FROM emp AS e JOIN emp AS m ON e.mgr = m.id
+----
+2
+1
+3
+2
+4
+2
+
+# 3-table chain: (emp e JOIN emp m ON e.mgr = m.id) CROSS JOIN region. The self-join yields 3
+# rows, CROSS region (2) gives 6. Materialize emp+emp+region = 4+4+2 = 10; ON on the first join
+# = 4x4 = 16; the CROSS adds no ON eval; 6 produced. 10 + 16 + 6 = 32.
+# names: name, name, rname
+# cost: 32
+query TTT nosort
+SELECT e.name, m.name, region.rname FROM emp AS e JOIN emp AS m ON e.mgr = m.id CROSS JOIN region ORDER BY e.id, region.id
+----
+vp
+ceo
+us
+vp
+ceo
+eu
+eng
+vp
+us
+eng
+vp
+eu
+eng2
+vp
+us
+eng2
+vp
+eu

@@ -123,9 +123,12 @@ func Lex(sql string) ([]Token, error) {
 				tokens = append(tokens, Token{Kind: TokInt, Int: n})
 			}
 		case c == '.':
-			// A leading-dot decimal literal (`.5`). A '.' must have a digit on at least one
-			// side; a bare '.' is a syntax error. There is no t.col qualified-name syntax yet,
-			// so '.' appears only in a numeric literal.
+			// A '.' has two roles, disambiguated on the FOLLOWING byte alone (no preceding-token
+			// context, so the rule is trivially identical across cores — grammar.md §4): a digit
+			// immediately after starts a leading-dot decimal literal (`.5`); otherwise it is the
+			// TokDot of a qualified column reference (`t.col`, §15). The lone overlap — an
+			// identifier then `.<digit>` (`t.5`) — is invalid either way and lexes as a decimal,
+			// rejected at parse.
 			if i+1 < len(b) && isDigit(b[i+1]) {
 				i++ // consume '.'
 				fracStart := i
@@ -135,7 +138,8 @@ func Lex(sql string) ([]Token, error) {
 				frac := sql[fracStart:i]
 				tokens = append(tokens, Token{Kind: TokDecimal, Word: frac, Int: uint64(len(frac))})
 			} else {
-				return nil, NewError(SyntaxError, "unexpected character '.'")
+				tokens = append(tokens, Token{Kind: TokDot})
+				i++
 			}
 		case isAlpha(c):
 			start := i

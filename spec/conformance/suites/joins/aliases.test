@@ -1,0 +1,54 @@
+# Table aliases (spec/design/grammar.md §15): `t AS a` and the implicit `t a`. The alias (else
+# the table name) is the relation's LABEL, used to qualify columns. Labels must be distinct: a
+# self-join without aliases is 42712 duplicate_alias, and an alias SHADOWS the table name (the
+# bare table name is no longer a valid qualifier once aliased — PostgreSQL behaviour).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.join_inner, query.table_alias, query.qualified_column, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE emp (id int32 PRIMARY KEY, name text, dept int32)
+
+statement ok
+CREATE TABLE dept (id int32 PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO emp VALUES (1, 'ann', 10), (2, 'bob', 20), (3, 'cy', 10)
+
+statement ok
+INSERT INTO dept VALUES (10, 'eng'), (20, 'sales')
+
+# Explicit AS aliases; both tables have a `name` column, so the references MUST be qualified.
+# 3 + 2 materialized (5) + 6 ON `=` evals + 3 produced = 14.
+# names: name, name
+# cost: 14
+query TT nosort
+SELECT e.name, d.name FROM emp AS e JOIN dept AS d ON e.dept = d.id ORDER BY e.id
+----
+ann
+eng
+bob
+sales
+cy
+eng
+
+# Implicit aliases (no AS) — `emp e` / `dept d`. Identical result and cost.
+# names: name
+# cost: 14
+query T nosort
+SELECT e.name FROM emp e JOIN dept d ON e.dept = d.id ORDER BY e.id
+----
+ann
+bob
+cy
+
+# An alias shadows the table name: once `emp AS e` is in scope, `emp` is no longer a valid
+# qualifier (42P01 missing FROM-clause entry).
+statement error 42P01
+SELECT emp.name FROM emp AS e JOIN dept AS d ON e.dept = d.id
+
+# A self-join with no aliases gives two relations both labelled `emp` — 42712 duplicate_alias.
+statement error 42712
+SELECT emp.id FROM emp JOIN emp ON emp.id = emp.id
+
+# Two relations explicitly aliased to the SAME label is likewise 42712.
+statement error 42712
+SELECT e.id FROM emp AS e JOIN dept AS e ON e.id = e.id

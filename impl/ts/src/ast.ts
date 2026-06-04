@@ -51,6 +51,10 @@ export type BinaryOp =
 // columns/integer-literals are integer-valued.
 export type Expr =
   | { kind: "column"; name: string }
+  // A qualified column reference `rel.col`, where `rel` is a relation label in the FROM clause
+  // (its alias, else its table name). Resolved against exactly that one relation, never
+  // ambiguous (spec/design/grammar.md §15). Bare "column" stays the unqualified form.
+  | { kind: "qualifiedColumn"; qualifier: string; name: string }
   | { kind: "literal"; literal: Literal }
   | { kind: "cast"; inner: Expr; typeName: string; typeMod: TypeMod | null }
   | { kind: "unary"; op: UnaryOp; operand: Expr }
@@ -77,7 +81,13 @@ export type SelectItems =
 // the direction default (descending: ASC -> last, DESC -> first, the PostgreSQL model where
 // NULL is the largest value) — and is applied independently of the descending value flip
 // (spec/design/grammar.md §10).
-export type OrderKey = { column: string; descending: boolean; nullsFirst: boolean };
+export type OrderKey = {
+  // An optional relation qualifier (`ORDER BY t.a`); null is a bare column.
+  qualifier: string | null;
+  column: string;
+  descending: boolean;
+  nullsFirst: boolean;
+};
 
 // ColumnDef is a column definition in a CREATE TABLE. typeName is kept as written and
 // resolved during analysis (the catalog owns the type lattice).
@@ -106,16 +116,35 @@ export type DropTable = { kind: "dropTable"; name: string };
 // parser requires ≥1 row).
 export type Insert = { kind: "insert"; table: string; rows: Literal[][] };
 
-// Select is a single-table SELECT. limit caps the result at `limit` rows; offset skips
-// the first `offset` rows. Both are non-negative counts, applied after ORDER BY, before
-// projection (grammar.md §9); null means the clause is absent.
+// TableRef is a table reference in a FROM clause: a table name with an optional alias
+// (`orders o` or `orders AS o`). The alias, or the table name when there is none, is the
+// relation's LABEL — it qualifies columns (o.col) and must be distinct within one query (a
+// self-join needs aliases; a duplicate label is 42712). See spec/design/grammar.md §15.
+export type TableRef = { name: string; alias: string | null };
+
+// JoinKind is the kind of a join. "inner"/"cross" execute this slice; the "left"/"right"/"full"
+// outer kinds parse and are carried in the AST but executing one is a documented 0A000
+// narrowing (the OUTER family is a fast-follow — spec/design/grammar.md §15).
+export type JoinKind = "inner" | "cross" | "left" | "right" | "full";
+
+// JoinClause is one JOIN step in the left-deep FROM chain: the join kind, the right-hand
+// table reference, and the optional ON predicate (null for CROSS JOIN; set for INNER/outer,
+// which require an ON). See spec/design/grammar.md §15.
+export type JoinClause = { kind: JoinKind; table: TableRef; on: Expr | null };
+
+// Select is a SELECT. The FROM clause is a left-deep chain: `from` followed by zero or more
+// `joins` (empty = single-table). limit caps the result at `limit` rows; offset skips the
+// first `offset` rows. Both are non-negative counts, applied after ORDER BY, before projection
+// (grammar.md §9); null means the clause is absent.
 export type Select = {
   kind: "select";
   // SELECT DISTINCT — deduplicate the projected output rows (NULL-safe), applied after
   // ORDER BY and before LIMIT/OFFSET (spec/design/grammar.md §11).
   distinct: boolean;
   items: SelectItems;
-  from: string;
+  from: TableRef;
+  // The left-deep JOINs after `from` (empty = a single-table SELECT). grammar.md §15.
+  joins: JoinClause[];
   filter: Expr | null;
   // ORDER BY sort keys, applied left to right; empty means no ORDER BY (grammar.md §10).
   orderBy: OrderKey[];

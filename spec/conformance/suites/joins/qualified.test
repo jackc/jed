@@ -1,0 +1,69 @@
+# Qualified column references (spec/design/grammar.md §15): a bare column is searched across
+# every relation in scope (no match 42703, two+ matches 42702 ambiguous, exactly one resolves);
+# a qualified `rel.col` names exactly one relation (unknown qualifier 42P01, known relation with
+# no such column 42703) and is never ambiguous. ORDER BY may use a qualified key.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.qualified_column, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE t1 (id int32 PRIMARY KEY, shared int32, only1 int32)
+
+statement ok
+CREATE TABLE t2 (id int32 PRIMARY KEY, shared int32, only2 int32)
+
+statement ok
+INSERT INTO t1 VALUES (1, 100, 11), (2, 200, 22)
+
+statement ok
+INSERT INTO t2 VALUES (1, 100, 33), (2, 999, 44)
+
+# `only1` / `only2` each exist in exactly one relation, so they resolve UNQUALIFIED. The join
+# t1.shared = t2.shared matches only (t1.1, t2.1). 2 + 2 materialized (4) + 4 ON + 1 produced = 9.
+# names: only1, only2
+# cost: 9
+query II nosort
+SELECT only1, only2 FROM t1 JOIN t2 ON t1.shared = t2.shared ORDER BY only1
+----
+11
+33
+
+# Qualified `id` references resolve to their named relation (both tables have an `id`).
+# names: id, id
+# cost: 9
+query II nosort
+SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.shared = t2.shared
+----
+1
+1
+
+# A bare `shared` matches both relations → 42702 ambiguous_column.
+statement error 42702
+SELECT shared FROM t1 JOIN t2 ON t1.shared = t2.shared
+
+# A bare `id` is likewise ambiguous.
+statement error 42702
+SELECT id FROM t1 JOIN t2 ON t1.id = t2.id
+
+# An ambiguous bare column inside the ON predicate is also 42702.
+statement error 42702
+SELECT t1.id FROM t1 JOIN t2 ON shared = 100
+
+# An unknown qualifier (no such relation in FROM) is 42P01.
+statement error 42P01
+SELECT t3.id FROM t1 JOIN t2 ON t1.shared = t2.shared
+
+# A known qualifier with no such column is 42703 undefined_column.
+statement error 42703
+SELECT t1.nope FROM t1 JOIN t2 ON t1.shared = t2.shared
+
+# ORDER BY a qualified key from the right relation. The join t1.id = t2.id matches both rows;
+# ordering by t2.shared DESC puts 999 (t1.id 2) before 100 (t1.id 1). 4 materialize + 4 ON +
+# 2 produced = 10 (the sort is unmetered).
+# names: id, shared
+# cost: 10
+query II nosort
+SELECT t1.id, t1.shared FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t2.shared DESC
+----
+2
+200
+1
+100

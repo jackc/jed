@@ -1,0 +1,95 @@
+# INNER JOIN ... ON (spec/design/grammar.md §15): a left-deep nested-loop join combining two
+# tables on a boolean ON predicate. A bare JOIN is INNER. The ON is three-valued — only a TRUE
+# result keeps a candidate pair, so a NULL on either side of the join key never matches (the
+# PostgreSQL inner-join semantics). Qualified (t.col) and bare column references both resolve
+# through the FROM scope. Cost is the CROSS-CORE contract of cost.md §3 (JOIN): storage_row_read
+# once per row as each table is materialized (sum of cardinalities), ON operator_eval per
+# candidate combination, WHERE per surviving combined row, row_produced per emitted row.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.table_alias, query.qualified_column, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE b (id int32 PRIMARY KEY, k int32, label text)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30), (4, NULL)
+
+# b has a row with a NULL join key (id 30) — it must match no left row (3-valued ON).
+statement ok
+INSERT INTO b VALUES (10, 10, 'ten'), (20, 20, 'twenty'), (21, 20, 'twentyish'), (30, NULL, 'nullk')
+
+# Equi-join on k. a.k=10 → b(10); a.k=20 → b(20) and b(21); a.k=30 → no b; a.k=NULL → none.
+# A 4x4 nested loop: 4+4 materialized (8 storage_row_read) + 16 ON `=` evals + 3 produced = 27.
+# Projection is two bare/qualified columns (leaves), so it adds no operator_eval.
+# names: id, label
+# cost: 27
+query IT nosort
+SELECT a.id, b.label FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id
+----
+1
+ten
+2
+twenty
+2
+twentyish
+
+# An explicit INNER keyword is identical to a bare JOIN. Same 4x4 loop: 8 + 16 + 3 = 27.
+# names: id
+# cost: 27
+query I nosort
+SELECT a.id FROM a INNER JOIN b ON a.k = b.k ORDER BY a.id, b.id
+----
+1
+2
+2
+
+# WHERE applies AFTER the join, to the combined rows. The ON produces 3 matched rows; WHERE
+# `b.label = 'twenty'` evaluates on each (3 operator_eval) and keeps one. 8 + 16 + 3 + 1 = 28.
+# names: id, k
+# cost: 28
+query II nosort
+SELECT a.id, b.k FROM a JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.id
+----
+2
+20
+
+# An ON predicate may reference a single side. `a.k > 25` is TRUE only for a row k=30 (a.id 3;
+# a NULL k is unknown), which then pairs with every b row → 4 results. 8 + 16 ON + 4 produced = 28.
+# Both output columns are named `id` (duplicate output names across tables are allowed).
+# names: id, id
+# cost: 28
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k > 25 ORDER BY a.id, b.id
+----
+3
+10
+3
+20
+3
+21
+3
+30
+
+# A join with no surviving pair yields the empty result. ON matches 3, WHERE drops all 3.
+# 8 materialize + 16 ON + 3 WHERE + 0 produced = 27.
+# cost: 27
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 999
+----
+
+# SELECT * expands across BOTH tables in FROM order, each in catalog order:
+# a(id, k) then b(id, k, label). Five output columns. ON matches 3 rows; WHERE `a.id = 1`
+# evaluates on each (3) and keeps one. 8 materialize + 16 ON + 3 WHERE + 1 produced = 28.
+# The star projection columns are all leaves (no operator_eval).
+# names: id, k, id, k, label
+# cost: 28
+query IIIIT nosort
+SELECT * FROM a JOIN b ON a.k = b.k WHERE a.id = 1
+----
+1
+10
+10
+10
+ten

@@ -18,11 +18,13 @@ export type SqlState =
   | "syntax_error" // 42601
   | "undefined_table" // 42P01
   | "undefined_column" // 42703
+  | "ambiguous_column" // 42702 — a bare column matching more than one relation in scope (§15)
   | "undefined_object" // 42704 — e.g. an unknown type name
   | "invalid_column_reference" // 42P10 — SELECT DISTINCT ORDER BY key not in select list
   | "datatype_mismatch" // 42804
   | "duplicate_table" // 42P07
   | "duplicate_column" // 42701
+  | "duplicate_alias" // 42712 — two FROM relations share a label (a self-join needs aliases; §15)
   | "invalid_table_definition" // 42P16 — e.g. more than one primary key
   | "feature_not_supported" // 0A000
   | "data_corrupted"; // XX001 — a malformed on-disk database file (CLAUDE.md §8)
@@ -39,11 +41,13 @@ const CODES: Record<SqlState, string> = {
   syntax_error: "42601",
   undefined_table: "42P01",
   undefined_column: "42703",
+  ambiguous_column: "42702",
   undefined_object: "42704",
   invalid_column_reference: "42P10",
   datatype_mismatch: "42804",
   duplicate_table: "42P07",
   duplicate_column: "42701",
+  duplicate_alias: "42712",
   invalid_table_definition: "42P16",
   feature_not_supported: "0A000",
   data_corrupted: "XX001",

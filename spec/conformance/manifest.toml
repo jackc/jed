@@ -97,6 +97,22 @@ id = "query.distinct"
 description = "SELECT DISTINCT: deduplicate projected output rows (NULL-safe), with the PostgreSQL ORDER-BY-in-select-list restriction"
 
 [[capability]]
+id = "query.join_inner"
+description = "INNER JOIN ... ON <expr> — combine rows from two tables on a boolean predicate (left-deep nested loop, 3-valued ON). A bare JOIN is INNER; an INNER JOIN with no ON is 42601 (spec/design/grammar.md §15)"
+
+[[capability]]
+id = "query.cross_join"
+description = "CROSS JOIN — the Cartesian product of two tables (no ON)"
+
+[[capability]]
+id = "query.table_alias"
+description = "Table aliases in FROM — `t AS a` / `t a`; the alias (else the table name) is the relation label, distinct per query (a self-join needs aliases; duplicate label is 42712)"
+
+[[capability]]
+id = "query.qualified_column"
+description = "Qualified column references `rel.col` — resolved against the named relation; a bare column ambiguous across relations is 42702, unknown relation is 42P01 (spec/design/grammar.md §15)"
+
+[[capability]]
 id = "types.int16"
 description = "int16 / smallint scalar type"
 
@@ -246,3 +262,14 @@ id = "decimal"
 title = "expression + the exact decimal / numeric type (numeric(p,s), comparison, casts, arithmetic)"
 includes = "expression"
 capabilities = ["types.decimal", "expr.decimal_arithmetic"]
+
+[[profile]]
+id = "joins"
+title = "decimal + multi-table FROM with INNER/CROSS JOIN, table aliases, and qualified columns (Phase 4)"
+includes = "decimal"
+capabilities = [
+  "query.join_inner",
+  "query.cross_join",
+  "query.table_alias",
+  "query.qualified_column",
+]

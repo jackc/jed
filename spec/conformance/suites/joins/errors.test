@@ -1,0 +1,64 @@
+# JOIN error surface (spec/design/grammar.md §15). A non-boolean ON is 42804 (the WHERE rule).
+# An INNER/bare JOIN requires ON (a missing ON is 42601); a CROSS JOIN takes no ON. Comma-FROM
+# (`FROM a, b`) is dropped (42601). An unknown table in FROM is 42P01. The OUTER family
+# (LEFT/RIGHT/FULL [OUTER] JOIN) parses but executing one is a documented 0A000 narrowing.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.join_inner, query.cross_join, query.qualified_column, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE p (id int32 PRIMARY KEY, v int32)
+
+statement ok
+CREATE TABLE q (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO p VALUES (1, 10)
+
+statement ok
+INSERT INTO q VALUES (1, 10)
+
+# A valid INNER join works (sanity). 1 + 1 materialized + 1 ON + 1 produced = 4.
+# names: id
+# cost: 4
+query I nosort
+SELECT p.id FROM p JOIN q ON p.id = q.id
+----
+1
+
+# A non-boolean ON (an integer expression) is 42804, exactly as a non-boolean WHERE.
+statement error 42804
+SELECT p.id FROM p JOIN q ON p.v
+
+statement error 42804
+SELECT p.id FROM p JOIN q ON p.v + q.v
+
+# An INNER / bare JOIN with no ON is a syntax error (42601). USING / NATURAL are not in scope.
+statement error 42601
+SELECT p.id FROM p JOIN q
+
+# A CROSS JOIN takes no ON; a trailing ON is a syntax error.
+statement error 42601
+SELECT p.id FROM p CROSS JOIN q ON p.id = q.id
+
+# Comma-separated FROM (the old implicit cross join) is dropped — use CROSS JOIN.
+statement error 42601
+SELECT p.id FROM p, q
+
+# An unknown table anywhere in the FROM chain is 42P01.
+statement error 42P01
+SELECT p.id FROM p JOIN nope ON p.id = nope.id
+
+statement error 42P01
+SELECT x FROM nope JOIN q ON nope.id = q.id
+
+# The OUTER join family parses (the AST carries the kind) but executing one is 0A000 this slice.
+statement error 0A000
+SELECT p.id FROM p LEFT JOIN q ON p.id = q.id
+
+statement error 0A000
+SELECT p.id FROM p LEFT OUTER JOIN q ON p.id = q.id
+
+statement error 0A000
+SELECT p.id FROM p RIGHT JOIN q ON p.id = q.id
+
+statement error 0A000
+SELECT p.id FROM p FULL OUTER JOIN q ON p.id = q.id

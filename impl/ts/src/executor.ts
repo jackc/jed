@@ -22,7 +22,7 @@ import { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import { Decimal, MAX_PRECISION, MAX_SCALE } from "./decimal.ts";
 import { encodeInt } from "./encoding.ts";
-import { engineError } from "./errors.ts";
+import { type EngineError, engineError } from "./errors.ts";
 import { type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -260,7 +260,9 @@ export class Database {
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + del.table);
     }
-    const filter = del.filter ? resolveBooleanFilter(table, del.filter) : null;
+    // DELETE is single-table; resolve its WHERE against a one-relation scope.
+    const scope = Scope.single(table);
+    const filter = del.filter ? resolveBooleanFilter(scope, del.filter) : null;
 
     // Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13;
     // spec/design/cost.md §3). Keys are collected before mutating.
@@ -289,6 +291,10 @@ export class Database {
       throw engineError("undefined_table", "table does not exist: " + upd.table);
     }
 
+    // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
+    // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
+    const scope = Scope.single(table);
+
     // Resolve assignments up front (fail fast, deterministic).
     const pkIdx = primaryKeyIndex(table);
     const plans: AssignPlan[] = [];
@@ -315,12 +321,12 @@ export class Database {
       // The RHS is a general expression evaluated against the OLD row; a literal operand
       // adapts to the target column's type. The result must be assignable to the column's
       // family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-      const { node, type } = resolve(table, a.value, col.type);
+      const { node, type } = resolve(scope, a.value, col.type);
       requireAssignable(type, col.type, a.column);
       plans.push({ idx, name: col.name, target: col.type, decimal: col.decimal, notNull: col.notNull, source: node });
     }
 
-    const filter = upd.filter ? resolveBooleanFilter(table, upd.filter) : null;
+    const filter = upd.filter ? resolveBooleanFilter(scope, upd.filter) : null;
 
     // Phase 1: build + validate every matching row's new values; no writes yet. Each
     // scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes do
@@ -347,37 +353,48 @@ export class Database {
   // catalog, scans in primary-key order, filters (three-valued — only TRUE keeps a
   // row), optionally re-sorts by ORDER BY, then projects.
   private executeSelect(sel: Select): Outcome {
-    const table = this.table(sel.from);
-    if (!table) {
-      throw engineError("undefined_table", "table does not exist: " + sel.from);
+    // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
+    // relation's flat column offset in FROM order, and reject a duplicate label — a self-join
+    // without distinct aliases is 42712 (spec/design/grammar.md §15).
+    const tableRefs = [sel.from, ...sel.joins.map((j) => j.table)];
+    const rels: ScopeRel[] = [];
+    const seenLabels = new Set<string>();
+    let offset = 0;
+    for (const tref of tableRefs) {
+      const t = this.table(tref.name);
+      if (!t) throw engineError("undefined_table", "table does not exist: " + tref.name);
+      const label = (tref.alias ?? t.name).toLowerCase();
+      if (seenLabels.has(label)) {
+        throw engineError("duplicate_alias", "table name " + label + " specified more than once");
+      }
+      seenLabels.add(label);
+      rels.push({ label, table: t, offset });
+      offset += t.columns.length;
     }
+    const scope = new Scope(rels);
 
-    const { nodes: projections, names: columnNames } = resolveProjections(table, sel.items);
-    const filter = sel.filter ? resolveBooleanFilter(table, sel.filter) : null;
-
-    // Resolve each ORDER BY key to (column index, descending, nullsFirst). An unknown column
-    // is the existing undefined_column (42703); nullsFirst was resolved at parse time (explicit
-    // clause, else the direction default).
+    // Resolve projections (paired with output names — §8), the optional WHERE (must be
+    // boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
+    // relations is 42702; an unknown qualifier is 42P01 (§15).
+    const { nodes: projections, names: columnNames } = resolveProjections(scope, sel.items);
+    const filter = sel.filter ? resolveBooleanFilter(scope, sel.filter) : null;
     const order: { idx: number; descending: boolean; nullsFirst: boolean }[] = [];
     for (const key of sel.orderBy) {
-      const idx = columnIndex(table, key.column);
-      if (idx < 0) {
-        throw engineError("undefined_column", "column does not exist: " + key.column);
-      }
+      const idx = key.qualifier !== null
+        ? scope.resolveQualified(key.qualifier, key.column)
+        : scope.resolveBare(key.column);
       order.push({ idx, descending: key.descending, nullsFirst: key.nullsFirst });
     }
 
-    // SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates are
-    // collapsed, an ORDER BY key not in the projected output has no single value per row,
-    // so each key must appear as a bare column in the select list (or the list is `*`).
-    // Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8), so an aliased
-    // bare column still counts as projecting its underlying column.
+    // SELECT DISTINCT restriction (spec/design/grammar.md §11): each ORDER BY key must appear
+    // as a bare/qualified column in the select list (resolved to the same flat index; or the
+    // list is `*`). Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8).
     if (sel.distinct && order.length > 0 && sel.items.kind === "list") {
       const projected = new Set<number>();
       for (const it of sel.items.items) {
-        if (it.expr.kind === "column") {
-          const idx = columnIndex(table, it.expr.name);
-          if (idx >= 0) projected.add(idx);
+        if (it.expr.kind === "column") projected.add(scope.resolveBare(it.expr.name));
+        else if (it.expr.kind === "qualifiedColumn") {
+          projected.add(scope.resolveQualified(it.expr.qualifier, it.expr.name));
         }
       }
       for (const key of order) {
@@ -390,21 +407,61 @@ export class Database {
       }
     }
 
-    // Scan in primary-key order, then filter. A WHERE arithmetic can throw
-    // (22003/22012); the throw propagates naturally. Each scanned row and the filter
-    // evaluation accrue cost; the row-produced charge is below, at projection
-    // (CLAUDE.md §13; spec/design/cost.md §3).
+    // Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
+    // relations joined so far — rels[0..k+1]), so a forward reference to a not-yet-joined table
+    // is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON. The OUTER
+    // kinds parse but are rejected here (0A000) — only INNER/CROSS execute this slice (§15).
+    const joinOns: (RExpr | null)[] = sel.joins.map((j, k) => {
+      if (j.kind !== "inner" && j.kind !== "cross") {
+        throw engineError("feature_not_supported", "outer joins (LEFT/RIGHT/FULL) are not supported yet");
+      }
+      if (j.on === null) return null;
+      const partial = new Scope(scope.rels.slice(0, k + 2));
+      return resolveBooleanFilter(partial, j.on);
+    });
+
+    // Materialize each base table once, in primary-key order, charging storageRowRead per
+    // physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these in-memory
+    // buffers, which are not stores and charge nothing.
     const meter = new Meter();
+    const materialized: Row[][] = scope.rels.map((rel) => {
+      const tableRows: Row[] = [];
+      for (const row of this.rowsInKeyOrder(rel.table.name)) {
+        meter.charge(COSTS.storageRowRead);
+        tableRows.push(row);
+      }
+      return tableRows;
+    });
+
+    // Left-deep nested-loop join. `running` holds the combined rows over the relations joined
+    // so far (starting with the first table's rows). For each join, concatenate every running
+    // row with every right-table row; CROSS keeps all pairs, INNER keeps a pair iff its ON
+    // predicate is TRUE (three-valued — a NULL join key never matches). Output order is
+    // deterministic: running order (outer) then right key order (inner) (CLAUDE.md §10).
+    let running: Row[] = materialized[0]!;
+    for (let k = 0; k < sel.joins.length; k++) {
+      const rightRows = materialized[k + 1]!;
+      const on = joinOns[k]!;
+      const next: Row[] = [];
+      for (const left of running) {
+        for (const right of rightRows) {
+          const combined = left.concat(right);
+          if (on === null || isTrue(evalExpr(on, combined, meter))) next.push(combined);
+        }
+      }
+      running = next;
+    }
+
+    // WHERE over the combined rows. A WHERE arithmetic can throw (22003/22012); each surviving
+    // combined row's filter accrues operator_eval.
     const rows: Row[] = [];
-    for (const row of this.rowsInKeyOrder(sel.from)) {
-      meter.charge(COSTS.storageRowRead);
+    for (const row of running) {
       if (filter === null || isTrue(evalExpr(filter, row, meter))) rows.push(row);
     }
 
     // ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
-    // and a full tie keeps the primary-key scan order (JS Array#sort is stable, matching Go's
-    // SliceStable). Each key's NULL placement is decoupled from its value-direction flip, so an
-    // explicit NULLS FIRST|LAST overrides the default (spec/design/grammar.md §10).
+    // and a full tie keeps the scan order (JS Array#sort is stable). Each key's NULL placement
+    // is decoupled from its value-direction flip (spec/design/grammar.md §10).
     if (order.length > 0) {
       rows.sort((a, b) => {
         for (const key of order) {
@@ -537,46 +594,140 @@ type RExpr =
   | { kind: "isNull"; operand: RExpr; negated: boolean }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean };
 
-// resolveProjections resolves SELECT items into evaluable projections (any result type
-// is allowed in the select list, including boolean — SELECT a = b), each paired with its
-// output column name (spec/design/grammar.md §8).
+// ============================================================================
+// Resolution scope (multi-table FROM — spec/design/grammar.md §15).
+//
+// A Scope is the ordered list of relations a SELECT's FROM clause puts in scope, each
+// carrying the flat COLUMN OFFSET at which its columns begin in the concatenated (joined)
+// row. A resolved column reference bakes a single flat index offset+local into "column", so
+// the joined row is just each relation's row concatenated in FROM order and the evaluator is
+// unchanged. A single-table SELECT / UPDATE / DELETE is a one-relation scope (offset 0).
+//
+// NOTE (forward-compat): the scope keys resolution ONLY on column name and type — never on a
+// column's notNull / primaryKey flags. A column on the nullable side of a future outer join
+// is NULL-extended at runtime regardless of its declared nullability (grammar.md §15).
+// ============================================================================
+
+// ScopeRel is one relation in a FROM scope: its label (alias, else table name, lower-cased
+// for case-insensitive matching), the table, and the flat offset of its first column.
+type ScopeRel = { label: string; table: Table; offset: number };
+
+class Scope {
+  rels: ScopeRel[];
+  constructor(rels: ScopeRel[]) {
+    this.rels = rels;
+  }
+
+  // single builds a one-relation scope (the single-table SELECT / UPDATE / DELETE case).
+  static single(t: Table): Scope {
+    return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }]);
+  }
+
+  // resolveBare resolves a bare column name to a flat row index: no relation has it → 42703;
+  // two or more relations have it → 42702 ambiguous; exactly one → its flat index.
+  resolveBare(name: string): number {
+    let found = -1;
+    for (const r of this.rels) {
+      const local = columnIndex(r.table, name);
+      if (local >= 0) {
+        if (found >= 0) throw ambiguousColumn(name);
+        found = r.offset + local;
+      }
+    }
+    if (found < 0) throw undefinedColumn(name);
+    return found;
+  }
+
+  // resolveQualified resolves a qualified rel.col to a flat row index: an unknown rel is 42P01,
+  // a known rel with no such column is 42703. Never ambiguous (it names one relation).
+  resolveQualified(qualifier: string, name: string): number {
+    const q = qualifier.toLowerCase();
+    for (const r of this.rels) {
+      if (r.label === q) {
+        const local = columnIndex(r.table, name);
+        if (local < 0) throw undefinedColumn(name);
+        return r.offset + local;
+      }
+    }
+    throw missingFromEntry(qualifier);
+  }
+
+  // columnAt returns the column at a flat index (the index is known valid — resolution made it).
+  columnAt(flat: number): Column {
+    for (const r of this.rels) {
+      const n = r.table.columns.length;
+      if (flat >= r.offset && flat < r.offset + n) return r.table.columns[flat - r.offset]!;
+    }
+    throw new Error("a resolved flat column index is always in range");
+  }
+}
+
+// undefinedColumn is 42703 — a column name that no relation in scope defines.
+function undefinedColumn(name: string): EngineError {
+  return engineError("undefined_column", "column does not exist: " + name);
+}
+
+// ambiguousColumn is 42702 — a bare column name that more than one relation in scope defines.
+function ambiguousColumn(name: string): EngineError {
+  return engineError("ambiguous_column", "column reference " + name + " is ambiguous");
+}
+
+// missingFromEntry is 42P01 — a qualifier that names no relation in the FROM clause.
+function missingFromEntry(qualifier: string): EngineError {
+  return engineError("undefined_table", "missing FROM-clause entry for table " + qualifier);
+}
+
+// resolvedTypeOf is the resolved (static) type of a column of scalar type ty.
+function resolvedTypeOf(ty: ScalarType): ResolvedType {
+  if (isText(ty)) return { kind: "text" };
+  if (isBool(ty)) return { kind: "bool" };
+  if (isDecimal(ty)) return { kind: "decimal" };
+  if (isBytea(ty)) return { kind: "bytea" };
+  return { kind: "int", ty };
+}
+
+// resolveProjections resolves SELECT items into evaluable projections (any result type is
+// allowed in the select list, including boolean — SELECT a = b), each paired with its output
+// column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
+// each relation's columns in catalog order (§15).
 function resolveProjections(
-  table: Table,
+  scope: Scope,
   items: SelectItems,
 ): { nodes: RExpr[]; names: string[] } {
   if (items.kind === "all") {
-    return {
-      nodes: table.columns.map((_c, i): RExpr => ({ kind: "column", index: i })),
-      names: table.columns.map((c) => c.name),
-    };
+    const nodes: RExpr[] = [];
+    const names: string[] = [];
+    for (const r of scope.rels) {
+      r.table.columns.forEach((c, i) => {
+        nodes.push({ kind: "column", index: r.offset + i });
+        names.push(c.name);
+      });
+    }
+    return { nodes, names };
   }
   const nodes: RExpr[] = [];
   const names: string[] = [];
   for (const it of items.items) {
-    nodes.push(resolve(table, it.expr, null).node);
-    names.push(it.alias ?? outputName(table, it.expr));
+    nodes.push(resolve(scope, it.expr, null).node);
+    names.push(it.alias ?? outputName(scope, it.expr));
   }
   return { nodes, names };
 }
 
-// outputName is the output column name of an un-aliased select item
-// (spec/design/grammar.md §8): a bare column reference takes the catalog's canonical name
-// (the CREATE TABLE spelling, not the SELECT spelling, so the user's casing never leaks);
-// every other expression takes the fixed "?column?". The column is known to exist —
-// resolve validated it.
-function outputName(table: Table, e: Expr): string {
-  if (e.kind === "column") {
-    const idx = columnIndex(table, e.name);
-    if (idx >= 0) return table.columns[idx]!.name;
-    return e.name;
-  }
+// outputName is the output column name of an un-aliased select item (grammar.md §8/§15): a
+// bare or qualified column reference takes the catalog's canonical name (never the qualifier,
+// never the SELECT spelling); every other expression takes the fixed "?column?". The column is
+// known to exist — resolve validated it.
+function outputName(scope: Scope, e: Expr): string {
+  if (e.kind === "column") return scope.columnAt(scope.resolveBare(e.name)).name;
+  if (e.kind === "qualifiedColumn") return scope.columnAt(scope.resolveQualified(e.qualifier, e.name)).name;
   return "?column?";
 }
 
-// resolveBooleanFilter resolves a WHERE expression; it must resolve to boolean (or an
-// untyped NULL, always unknown → no rows). An integer- or text-valued WHERE is a 42804.
-function resolveBooleanFilter(table: Table, e: Expr): RExpr {
-  const { node, type } = resolve(table, e, null);
+// resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an
+// untyped NULL, always unknown → no rows). An integer- or text-valued one is a 42804.
+function resolveBooleanFilter(scope: Scope, e: Expr): RExpr {
+  const { node, type } = resolve(scope, e, null);
   if (type.kind !== "bool" && type.kind !== "null") {
     throw typeError("argument of WHERE must be boolean");
   }
@@ -587,25 +738,18 @@ function resolveBooleanFilter(table: Table, e: Expr): RExpr {
 // type an untyped integer literal should adapt to (spec/design/types.md §6); null
 // defaults a bare literal to int64.
 function resolve(
-  table: Table,
+  scope: Scope,
   e: Expr,
   ctx: ScalarType | null,
 ): { node: RExpr; type: ResolvedType } {
   switch (e.kind) {
     case "column": {
-      const idx = columnIndex(table, e.name);
-      if (idx < 0) throw engineError("undefined_column", "column does not exist: " + e.name);
-      const colTy = table.columns[idx]!.type;
-      const type: ResolvedType = isText(colTy)
-        ? { kind: "text" }
-        : isBool(colTy)
-          ? { kind: "bool" }
-          : isDecimal(colTy)
-            ? { kind: "decimal" }
-            : isBytea(colTy)
-              ? { kind: "bytea" }
-              : { kind: "int", ty: colTy };
-      return { node: { kind: "column", index: idx }, type };
+      const idx = scope.resolveBare(e.name);
+      return { node: { kind: "column", index: idx }, type: resolvedTypeOf(scope.columnAt(idx).type) };
+    }
+    case "qualifiedColumn": {
+      const idx = scope.resolveQualified(e.qualifier, e.name);
+      return { node: { kind: "column", index: idx }, type: resolvedTypeOf(scope.columnAt(idx).type) };
     }
     case "literal":
       switch (e.literal.kind) {
@@ -656,7 +800,7 @@ function resolve(
       if (isBytea(target)) {
         throw engineError("feature_not_supported", "casting to bytea is not supported yet");
       }
-      const inner = resolve(table, e.inner, null);
+      const inner = resolve(scope, e.inner, null);
       if (inner.type.kind === "bool") {
         throw typeError("cannot cast boolean to " + canonicalName(target));
       }
@@ -675,7 +819,7 @@ function resolve(
     }
     case "unary":
       if (e.op === "neg") {
-        const { node, type } = resolve(table, e.operand, ctx);
+        const { node, type } = resolve(scope, e.operand, ctx);
         if (type.kind === "decimal") {
           return { node: { kind: "neg", result: "decimal", operand: node }, type: { kind: "decimal" } };
         }
@@ -686,12 +830,12 @@ function resolve(
         return { node: { kind: "neg", result, operand: node }, type: { kind: "int", ty: result } };
       }
       {
-        const { node, type } = resolve(table, e.operand, null);
+        const { node, type } = resolve(scope, e.operand, null);
         requireBool(type, "NOT requires a boolean operand");
         return { node: { kind: "not", operand: node }, type: { kind: "bool" } };
       }
     case "isNull": {
-      const { node } = resolve(table, e.operand, null);
+      const { node } = resolve(scope, e.operand, null);
       return { node: { kind: "isNull", operand: node, negated: e.negated }, type: { kind: "bool" } };
     }
     case "isDistinct": {
@@ -699,17 +843,17 @@ function resolve(
       // adapts to its sibling; a text literal stays text), then require the operands be
       // comparable (both integer-ish or both text-ish; a mixed pair is 42804). The result
       // is always a definite boolean (functions.md §3).
-      const p = resolveOperandPair(table, e.lhs, e.rhs);
+      const p = resolveOperandPair(scope, e.lhs, e.rhs);
       classifyComparable(p.lt, p.rt);
       return { node: { kind: "distinct", lhs: p.rl, rhs: p.rr, negated: e.negated }, type: { kind: "bool" } };
     }
     case "binary":
-      return resolveBinary(table, e.op, e.lhs, e.rhs);
+      return resolveBinary(scope, e.op, e.lhs, e.rhs);
   }
 }
 
 function resolveBinary(
-  table: Table,
+  scope: Scope,
   op: BinaryOp,
   lhs: Expr,
   rhs: Expr,
@@ -724,7 +868,7 @@ function resolveBinary(
       // integer literal adapts to an integer sibling), then pick the family: both integer →
       // integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
       // widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
-      const p = resolveOperandPair(table, lhs, rhs);
+      const p = resolveOperandPair(scope, lhs, rhs);
       requireNumericOperand(p.lt);
       requireNumericOperand(p.rt);
       if (p.lt.kind === "decimal" || p.rt.kind === "decimal") {
@@ -742,14 +886,14 @@ function resolveBinary(
       // operands (a literal adapts to its sibling; text literals stay text), then require
       // they be comparable — a mixed integer/text pair is 42804. The runtime comparison
       // (eq3/lt3/gt3) dispatches on the value kinds.
-      const p = resolveOperandPair(table, lhs, rhs);
+      const p = resolveOperandPair(scope, lhs, rhs);
       classifyComparable(p.lt, p.rt);
       return { node: { kind: "compare", op, lhs: p.rl, rhs: p.rr }, type: { kind: "bool" } };
     }
     default: {
       // "and" | "or"
-      const l = resolve(table, lhs, null);
-      const r = resolve(table, rhs, null);
+      const l = resolve(scope, lhs, null);
+      const r = resolve(scope, rhs, null);
       requireBool(l.type, "AND/OR requires boolean operands");
       requireBool(r.type, "AND/OR requires boolean operands");
       return { node: { kind: op === "and" ? "and" : "or", lhs: l.node, rhs: r.node }, type: { kind: "bool" } };
@@ -765,7 +909,7 @@ function resolveBinary(
 // the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
 // classifyComparable (comparison) layer that on top.
 function resolveOperandPair(
-  table: Table,
+  scope: Scope,
   lhs: Expr,
   rhs: Expr,
 ): { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType } {
@@ -774,17 +918,17 @@ function resolveOperandPair(
   let l: { node: RExpr; type: ResolvedType };
   let r: { node: RExpr; type: ResolvedType };
   if (lhsLit && rhsLit) {
-    l = resolve(table, lhs, "int64");
-    r = resolve(table, rhs, "int64");
+    l = resolve(scope, lhs, "int64");
+    r = resolve(scope, rhs, "int64");
   } else if (lhsLit) {
-    r = resolve(table, rhs, null);
-    l = resolve(table, lhs, ctxOf(r.type));
+    r = resolve(scope, rhs, null);
+    l = resolve(scope, lhs, ctxOf(r.type));
   } else if (rhsLit) {
-    l = resolve(table, lhs, null);
-    r = resolve(table, rhs, ctxOf(l.type));
+    l = resolve(scope, lhs, null);
+    r = resolve(scope, rhs, ctxOf(l.type));
   } else {
-    l = resolve(table, lhs, null);
-    r = resolve(table, rhs, null);
+    l = resolve(scope, lhs, null);
+    r = resolve(scope, rhs, null);
   }
   return { rl: l.node, lt: l.type, rr: r.node, rt: r.type };
 }

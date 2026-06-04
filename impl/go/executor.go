@@ -242,9 +242,11 @@ func (db *Database) executeDelete(del *Delete) (Outcome, error) {
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
 	}
+	// DELETE is single-table; resolve its WHERE against a one-relation scope.
+	s := singleScope(table)
 	var filter *rExpr
 	if del.Filter != nil {
-		f, err := resolveBooleanFilter(table, del.Filter)
+		f, err := resolveBooleanFilter(s, del.Filter)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -288,6 +290,9 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+upd.Table)
 	}
+	// UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
+	// shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
+	s := singleScope(table)
 
 	// Resolve assignments up front (fail fast, deterministic).
 	pkIdx := table.PrimaryKeyIndex()
@@ -311,7 +316,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 		// The RHS is a general expression evaluated against the *old* row; a literal operand
 		// adapts to the target column's type. The result must be assignable to the column's
 		// family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-		src, ty, err := resolve(table, a.Value, &col.Type)
+		src, ty, err := resolve(s, a.Value, &col.Type)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -325,7 +330,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 
 	var filter *rExpr
 	if upd.Filter != nil {
-		f, err := resolveBooleanFilter(table, upd.Filter)
+		f, err := resolveBooleanFilter(s, upd.Filter)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -391,27 +396,49 @@ func (db *Database) RowsInKeyOrder(name string) []Row {
 // filter by the predicate (three-valued — only TRUE keeps a row), optionally re-sort
 // by ORDER BY, then project. Rows are produced deterministically (CLAUDE.md §10).
 func (db *Database) executeSelect(sel *Select) (Outcome, error) {
-	table, ok := db.Table(sel.From)
-	if !ok {
-		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+sel.From)
+	// Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
+	// relation's flat column offset in FROM order, and reject a duplicate label — a self-join
+	// without distinct aliases is 42712 (spec/design/grammar.md §15).
+	tableRefs := make([]TableRef, 0, 1+len(sel.Joins))
+	tableRefs = append(tableRefs, sel.From)
+	for _, j := range sel.Joins {
+		tableRefs = append(tableRefs, j.Table)
 	}
+	var rels []scopeRel
+	seenLabels := make(map[string]bool)
+	offset := 0
+	for _, tref := range tableRefs {
+		t, ok := db.Table(tref.Name)
+		if !ok {
+			return Outcome{}, NewError(UndefinedTable, "table does not exist: "+tref.Name)
+		}
+		label := strings.ToLower(t.Name)
+		if tref.Alias != nil {
+			label = strings.ToLower(*tref.Alias)
+		}
+		if seenLabels[label] {
+			return Outcome{}, NewError(DuplicateAlias, "table name "+label+" specified more than once")
+		}
+		seenLabels[label] = true
+		rels = append(rels, scopeRel{label: label, table: t, offset: offset})
+		offset += len(t.Columns)
+	}
+	s := &scope{rels: rels}
 
-	projections, columnNames, err := resolveProjections(table, sel.Items)
+	// Resolve projections (paired with output names — §8), the optional WHERE (must be
+	// boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
+	// relations is 42702; an unknown qualifier is 42P01 (§15).
+	projections, columnNames, err := resolveProjections(s, sel.Items)
 	if err != nil {
 		return Outcome{}, err
 	}
-
 	var filter *rExpr
 	if sel.Filter != nil {
-		filter, err = resolveBooleanFilter(table, sel.Filter)
+		filter, err = resolveBooleanFilter(s, sel.Filter)
 		if err != nil {
 			return Outcome{}, err
 		}
 	}
-
-	// Resolve each ORDER BY key to its column index (keeping its direction + NULL placement).
-	// An unknown column is the existing UndefinedColumn (42703); NullsFirst was resolved at
-	// parse time (explicit clause, else the direction default).
 	type orderKeyPlan struct {
 		idx        int
 		descending bool
@@ -419,23 +446,31 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	}
 	order := make([]orderKeyPlan, 0, len(sel.OrderBy))
 	for _, key := range sel.OrderBy {
-		idx := table.ColumnIndex(key.Column)
-		if idx < 0 {
-			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+key.Column)
+		var idx int
+		if key.Qualifier != "" {
+			idx, err = s.resolveQualified(key.Qualifier, key.Column)
+		} else {
+			idx, err = s.resolveBare(key.Column)
+		}
+		if err != nil {
+			return Outcome{}, err
 		}
 		order = append(order, orderKeyPlan{idx: idx, descending: key.Descending, nullsFirst: key.NullsFirst})
 	}
 
-	// SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates are
-	// collapsed, an ORDER BY key not in the projected output has no single value per row,
-	// so each key must appear as a bare column in the select list (or the list is `*`).
-	// Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8), so an aliased
-	// bare column still counts as projecting its underlying column.
+	// SELECT DISTINCT restriction (spec/design/grammar.md §11): each ORDER BY key must appear
+	// as a bare/qualified column in the select list (resolved to the same flat index; or the
+	// list is `*`). Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8).
 	if sel.Distinct && len(order) > 0 && !sel.Items.All {
 		projected := make(map[int]bool)
 		for _, it := range sel.Items.Items {
-			if it.Expr.Kind == ExprColumn {
-				if idx := table.ColumnIndex(it.Expr.Column); idx >= 0 {
+			switch it.Expr.Kind {
+			case ExprColumn:
+				if idx, e := s.resolveBare(it.Expr.Column); e == nil {
+					projected[idx] = true
+				}
+			case ExprQualifiedColumn:
+				if idx, e := s.resolveQualified(it.Expr.Qualifier, it.Expr.Column); e == nil {
 					projected[idx] = true
 				}
 			}
@@ -448,14 +483,77 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		}
 	}
 
-	// Scan in primary-key order, then filter. A WHERE arithmetic can trap
-	// (22003/22012), so the error is propagated rather than swallowed in a predicate.
-	// Each scanned row and the filter evaluation accrue cost; the row-produced charge is
-	// below, at projection (CLAUDE.md §13; spec/design/cost.md §3).
+	// Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
+	// relations joined so far — rels[:k+2]), so a forward reference to a not-yet-joined table
+	// is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON. The OUTER
+	// kinds parse but are rejected here (0A000) — only INNER/CROSS execute this slice (§15).
+	joinOns := make([]*rExpr, len(sel.Joins))
+	for k, j := range sel.Joins {
+		switch j.Kind {
+		case JoinInner, JoinCross:
+		default:
+			return Outcome{}, NewError(FeatureNotSupported,
+				"outer joins (LEFT/RIGHT/FULL) are not supported yet")
+		}
+		if j.On != nil {
+			partial := &scope{rels: s.rels[:k+2]}
+			on, oerr := resolveBooleanFilter(partial, j.On)
+			if oerr != nil {
+				return Outcome{}, oerr
+			}
+			joinOns[k] = on
+		}
+	}
+
+	// Materialize each base table once, in primary-key order, charging storage_row_read per
+	// physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these in-memory
+	// buffers, which are not stores and charge nothing.
 	meter := NewMeter()
+	materialized := make([][]Row, len(s.rels))
+	for ri, rel := range s.rels {
+		var tableRows []Row
+		for _, row := range db.RowsInKeyOrder(rel.table.Name) {
+			meter.Charge(Costs.StorageRowRead)
+			tableRows = append(tableRows, row)
+		}
+		materialized[ri] = tableRows
+	}
+
+	// Left-deep nested-loop join. `running` holds the combined rows over the relations joined
+	// so far (starting with the first table's rows). For each join, concatenate every running
+	// row with every right-table row; CROSS keeps all pairs, INNER keeps a pair iff its ON
+	// predicate is TRUE (three-valued — a NULL join key never matches). Output order is
+	// deterministic: running order (outer) then right key order (inner) (CLAUDE.md §10).
+	running := materialized[0]
+	for k := range sel.Joins {
+		rightRows := materialized[k+1]
+		on := joinOns[k]
+		var next []Row
+		for _, left := range running {
+			for _, right := range rightRows {
+				combined := make(Row, 0, len(left)+len(right))
+				combined = append(combined, left...)
+				combined = append(combined, right...)
+				keep := true
+				if on != nil {
+					v, err := on.eval(combined, meter)
+					if err != nil {
+						return Outcome{}, err
+					}
+					keep = v.IsTrue()
+				}
+				if keep {
+					next = append(next, combined)
+				}
+			}
+		}
+		running = next
+	}
+
+	// WHERE over the combined rows. A WHERE arithmetic can trap (22003/22012); each surviving
+	// combined row's filter accrues operator_eval.
 	var rows []Row
-	for _, row := range db.RowsInKeyOrder(sel.From) {
-		meter.Charge(Costs.StorageRowRead)
+	for _, row := range running {
 		keep := true
 		if filter != nil {
 			v, err := filter.eval(row, meter)
@@ -470,9 +568,8 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	}
 
 	// ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
-	// and a full tie keeps the primary-key scan order (SliceStable). Each key's NULL placement
-	// is decoupled from its value-direction flip, so an explicit NULLS FIRST|LAST overrides the
-	// default (spec/design/grammar.md §10).
+	// and a full tie keeps the scan order (SliceStable). Each key's NULL placement is decoupled
+	// from its value-direction flip (spec/design/grammar.md §10).
 	if len(order) > 0 {
 		sort.SliceStable(rows, func(a, b int) bool {
 			for _, key := range order {
@@ -702,23 +799,135 @@ type rExpr struct {
 	negated bool           // reIsNull, reDistinct
 }
 
-// resolveProjections resolves SELECT items into evaluable projections (any result type
-// is allowed in the select list, including boolean — SELECT a = b), each paired with its
-// output column name (spec/design/grammar.md §8).
-func resolveProjections(table *Table, items SelectItems) ([]*rExpr, []string, error) {
+// ============================================================================
+// Resolution scope (multi-table FROM — spec/design/grammar.md §15).
+//
+// A scope is the ordered list of relations a SELECT's FROM clause puts in scope, each
+// carrying the flat COLUMN OFFSET at which its columns begin in the concatenated (joined)
+// row. A resolved column reference bakes a single flat index offset+local into reColumn, so
+// the joined row is just each relation's row concatenated in FROM order and the evaluator is
+// unchanged. A single-table SELECT / UPDATE / DELETE is a one-relation scope (offset 0).
+//
+// NOTE (forward-compat): the scope keys resolution ONLY on column name and type — never on a
+// column's NotNull / PrimaryKey flags. A column on the nullable side of a future outer join
+// is NULL-extended at runtime regardless of its declared nullability (grammar.md §15).
+// ============================================================================
+
+// scopeRel is one relation in a FROM scope: its label (alias, else table name, lower-cased
+// for case-insensitive matching), the table, and the flat offset of its first column.
+type scopeRel struct {
+	label  string
+	table  *Table
+	offset int
+}
+
+// scope is the relations a query's FROM clause puts in scope, in FROM order.
+type scope struct {
+	rels []scopeRel
+}
+
+// singleScope is a one-relation scope (the single-table SELECT / UPDATE / DELETE case).
+func singleScope(t *Table) *scope {
+	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}}
+}
+
+// resolveBare resolves a bare column name to a flat row index: no relation has it → 42703;
+// two or more relations have it → 42702 ambiguous; exactly one → its flat index.
+func (s *scope) resolveBare(name string) (int, error) {
+	found := -1
+	for _, r := range s.rels {
+		if local := r.table.ColumnIndex(name); local >= 0 {
+			if found >= 0 {
+				return 0, ambiguousColumn(name)
+			}
+			found = r.offset + local
+		}
+	}
+	if found < 0 {
+		return 0, undefinedColumn(name)
+	}
+	return found, nil
+}
+
+// resolveQualified resolves a qualified rel.col to a flat row index: an unknown rel is 42P01,
+// a known rel with no such column is 42703. Never ambiguous (it names one relation).
+func (s *scope) resolveQualified(qualifier, name string) (int, error) {
+	q := strings.ToLower(qualifier)
+	for _, r := range s.rels {
+		if r.label == q {
+			local := r.table.ColumnIndex(name)
+			if local < 0 {
+				return 0, undefinedColumn(name)
+			}
+			return r.offset + local, nil
+		}
+	}
+	return 0, missingFromEntry(qualifier)
+}
+
+// columnAt returns the column at a flat index (the index is known valid — resolution made it).
+func (s *scope) columnAt(flat int) *Column {
+	for i := range s.rels {
+		r := s.rels[i]
+		n := len(r.table.Columns)
+		if flat >= r.offset && flat < r.offset+n {
+			return &r.table.Columns[flat-r.offset]
+		}
+	}
+	panic("a resolved flat column index is always in range")
+}
+
+// undefinedColumn is 42703 — a column name that no relation in scope defines.
+func undefinedColumn(name string) error {
+	return NewError(UndefinedColumn, "column does not exist: "+name)
+}
+
+// ambiguousColumn is 42702 — a bare column name that more than one relation in scope defines.
+func ambiguousColumn(name string) error {
+	return NewError(AmbiguousColumn, "column reference "+name+" is ambiguous")
+}
+
+// missingFromEntry is 42P01 — a qualifier that names no relation in the FROM clause.
+func missingFromEntry(qualifier string) error {
+	return NewError(UndefinedTable, "missing FROM-clause entry for table "+qualifier)
+}
+
+// resolvedTypeOf is the resolved (static) type of a column of scalar type ty.
+func resolvedTypeOf(ty ScalarType) resolvedType {
+	switch {
+	case ty.IsText():
+		return resolvedType{kind: rtText}
+	case ty.IsBool():
+		return resolvedType{kind: rtBool}
+	case ty.IsDecimal():
+		return resolvedType{kind: rtDecimal}
+	case ty.IsBytea():
+		return resolvedType{kind: rtBytea}
+	default:
+		return resolvedType{kind: rtInt, intTy: ty}
+	}
+}
+
+// resolveProjections resolves SELECT items into evaluable projections (any result type is
+// allowed in the select list, including boolean — SELECT a = b), each paired with its output
+// column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
+// each relation's columns in catalog order (§15).
+func resolveProjections(s *scope, items SelectItems) ([]*rExpr, []string, error) {
 	if items.All {
-		ps := make([]*rExpr, len(table.Columns))
-		names := make([]string, len(table.Columns))
-		for i := range table.Columns {
-			ps[i] = &rExpr{kind: reColumn, index: i}
-			names[i] = table.Columns[i].Name
+		var ps []*rExpr
+		var names []string
+		for _, r := range s.rels {
+			for i := range r.table.Columns {
+				ps = append(ps, &rExpr{kind: reColumn, index: r.offset + i})
+				names = append(names, r.table.Columns[i].Name)
+			}
 		}
 		return ps, names, nil
 	}
 	ps := make([]*rExpr, 0, len(items.Items))
 	names := make([]string, 0, len(items.Items))
 	for _, it := range items.Items {
-		node, _, err := resolve(table, it.Expr, nil)
+		node, _, err := resolve(s, it.Expr, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -726,32 +935,37 @@ func resolveProjections(table *Table, items SelectItems) ([]*rExpr, []string, er
 		if it.Alias != nil {
 			names = append(names, *it.Alias)
 		} else {
-			names = append(names, outputName(table, it.Expr))
+			names = append(names, outputName(s, it.Expr))
 		}
 	}
 	return ps, names, nil
 }
 
-// outputName is the output column name of an un-aliased select item
-// (spec/design/grammar.md §8): a bare column reference takes the catalog's canonical name
-// (the CREATE TABLE spelling, not the SELECT spelling, so the user's casing never leaks);
-// every other expression takes the fixed "?column?". The column is known to exist —
-// resolve validated it.
-func outputName(table *Table, e Expr) string {
-	if e.Kind == ExprColumn {
-		if idx := table.ColumnIndex(e.Column); idx >= 0 {
-			return table.Columns[idx].Name
+// outputName is the output column name of an un-aliased select item (grammar.md §8/§15): a
+// bare or qualified column reference takes the catalog's canonical name (never the qualifier,
+// never the SELECT spelling); every other expression takes the fixed "?column?". The column
+// is known to exist — resolve validated it.
+func outputName(s *scope, e Expr) string {
+	switch e.Kind {
+	case ExprColumn:
+		if idx, err := s.resolveBare(e.Column); err == nil {
+			return s.columnAt(idx).Name
 		}
 		return e.Column
+	case ExprQualifiedColumn:
+		if idx, err := s.resolveQualified(e.Qualifier, e.Column); err == nil {
+			return s.columnAt(idx).Name
+		}
+		return e.Column
+	default:
+		return "?column?"
 	}
-	return "?column?"
 }
 
-// resolveBooleanFilter resolves a WHERE expression; it must resolve to boolean (or an
-// untyped NULL, which is always unknown → no rows). An integer- or text-valued WHERE is a
-// 42804.
-func resolveBooleanFilter(table *Table, e *Expr) (*rExpr, error) {
-	node, ty, err := resolve(table, *e, nil)
+// resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an
+// untyped NULL, which is always unknown → no rows). An integer- or text-valued one is 42804.
+func resolveBooleanFilter(s *scope, e *Expr) (*rExpr, error) {
+	node, ty, err := resolve(s, *e, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -764,25 +978,20 @@ func resolveBooleanFilter(table *Table, e *Expr) (*rExpr, error) {
 // resolve resolves one Expr into an rExpr plus its static type. ctx (non-nil) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); nil
 // defaults a bare literal to int64.
-func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
+func resolve(s *scope, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error) {
 	switch e.Kind {
 	case ExprColumn:
-		idx := table.ColumnIndex(e.Column)
-		if idx < 0 {
-			return nil, resolvedType{}, NewError(UndefinedColumn, "column does not exist: "+e.Column)
+		idx, err := s.resolveBare(e.Column)
+		if err != nil {
+			return nil, resolvedType{}, err
 		}
-		colTy := table.Columns[idx].Type
-		rt := resolvedType{kind: rtInt, intTy: colTy}
-		if colTy.IsText() {
-			rt = resolvedType{kind: rtText}
-		} else if colTy.IsBool() {
-			rt = resolvedType{kind: rtBool}
-		} else if colTy.IsDecimal() {
-			rt = resolvedType{kind: rtDecimal}
-		} else if colTy.IsBytea() {
-			rt = resolvedType{kind: rtBytea}
+		return &rExpr{kind: reColumn, index: idx}, resolvedTypeOf(s.columnAt(idx).Type), nil
+	case ExprQualifiedColumn:
+		idx, err := s.resolveQualified(e.Qualifier, e.Column)
+		if err != nil {
+			return nil, resolvedType{}, err
 		}
-		return &rExpr{kind: reColumn, index: idx}, rt, nil
+		return &rExpr{kind: reColumn, index: idx}, resolvedTypeOf(s.columnAt(idx).Type), nil
 	case ExprLiteral:
 		switch e.Literal.Kind {
 		case LiteralNull:
@@ -844,7 +1053,7 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		if target.IsBytea() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to bytea is not supported yet")
 		}
-		inner, ity, err := resolve(table, e.Cast.Inner, nil)
+		inner, ity, err := resolve(s, e.Cast.Inner, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -868,7 +1077,7 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod}, resultRt, nil
 	case ExprUnary:
 		if e.Unary.Op == OpNeg {
-			rop, ty, err := resolve(table, e.Unary.Operand, ctx)
+			rop, ty, err := resolve(s, e.Unary.Operand, ctx)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -887,7 +1096,7 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 			}
 		}
 		// OpNot
-		rop, ty, err := resolve(table, e.Unary.Operand, nil)
+		rop, ty, err := resolve(s, e.Unary.Operand, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -896,7 +1105,7 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		}
 		return &rExpr{kind: reNot, operand: rop}, resolvedType{kind: rtBool}, nil
 	case ExprIsNull:
-		rop, _, err := resolve(table, e.IsNullOf.Operand, nil)
+		rop, _, err := resolve(s, e.IsNullOf.Operand, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -907,7 +1116,7 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		// literal adapts to its sibling; a text literal stays text), then require the
 		// operands be comparable (both integer-ish or both text-ish; a mixed pair is
 		// 42804). The result is always a definite boolean (functions.md §3).
-		rl, lt, rr, rt, err := resolveOperandPair(table, e.IsDistinct.Lhs, e.IsDistinct.Rhs)
+		rl, lt, rr, rt, err := resolveOperandPair(s, e.IsDistinct.Lhs, e.IsDistinct.Rhs)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -917,18 +1126,18 @@ func resolve(table *Table, e Expr, ctx *ScalarType) (*rExpr, resolvedType, error
 		return &rExpr{kind: reDistinct, lhs: rl, rhs: rr, negated: e.IsDistinct.Negated},
 			resolvedType{kind: rtBool}, nil
 	default: // ExprBinary
-		return resolveBinary(table, e.Binary)
+		return resolveBinary(s, e.Binary)
 	}
 }
 
-func resolveBinary(table *Table, b *BinaryExpr) (*rExpr, resolvedType, error) {
+func resolveBinary(s *scope, b *BinaryExpr) (*rExpr, resolvedType, error) {
 	switch b.Op {
 	case OpAdd, OpSub, OpMul, OpDiv, OpMod:
 		// Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
 		// integer literal adapts to an integer sibling), then pick the family: both integer →
 		// integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
 		// widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
-		rl, lt, rr, rt, err := resolveOperandPair(table, b.Lhs, b.Rhs)
+		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -950,7 +1159,7 @@ func resolveBinary(table *Table, b *BinaryExpr) (*rExpr, resolvedType, error) {
 		// the operands (a literal adapts to its sibling; text literals stay text), then
 		// require they be comparable — a mixed integer/text pair is 42804. The runtime
 		// comparison (Eq3/Lt3/Gt3) dispatches on the value kinds.
-		rl, lt, rr, rt, err := resolveOperandPair(table, b.Lhs, b.Rhs)
+		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -960,11 +1169,11 @@ func resolveBinary(table *Table, b *BinaryExpr) (*rExpr, resolvedType, error) {
 		return &rExpr{kind: reCompare, op: b.Op, lhs: rl, rhs: rr},
 			resolvedType{kind: rtBool}, nil
 	default: // OpAnd, OpOr
-		rl, lt, err := resolve(table, b.Lhs, nil)
+		rl, lt, err := resolve(s, b.Lhs, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		rr, rt, err := resolve(table, b.Rhs, nil)
+		rr, rt, err := resolve(s, b.Rhs, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -989,7 +1198,7 @@ func resolveBinary(table *Table, b *BinaryExpr) (*rExpr, resolvedType, error) {
 // context (ctxOf returns nil) and defaults to int64 — the caller's family check then
 // reports the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
 // classifyComparable (comparison) layer that on top.
-func resolveOperandPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
+func resolveOperandPair(s *scope, lhs, rhs Expr) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
 	lhsLit := isAdaptableLiteral(lhs)
 	rhsLit := isAdaptableLiteral(rhs)
 	var rl, rr *rExpr
@@ -998,25 +1207,25 @@ func resolveOperandPair(table *Table, lhs, rhs Expr) (*rExpr, resolvedType, *rEx
 	switch {
 	case lhsLit && rhsLit:
 		i64 := Int64
-		if rl, lt, err = resolve(table, lhs, &i64); err != nil {
+		if rl, lt, err = resolve(s, lhs, &i64); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rr, rt, err = resolve(table, rhs, &i64)
+		rr, rt, err = resolve(s, rhs, &i64)
 	case lhsLit:
-		if rr, rt, err = resolve(table, rhs, nil); err != nil {
+		if rr, rt, err = resolve(s, rhs, nil); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rl, lt, err = resolve(table, lhs, ctxOf(rt))
+		rl, lt, err = resolve(s, lhs, ctxOf(rt))
 	case rhsLit:
-		if rl, lt, err = resolve(table, lhs, nil); err != nil {
+		if rl, lt, err = resolve(s, lhs, nil); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rr, rt, err = resolve(table, rhs, ctxOf(lt))
+		rr, rt, err = resolve(s, rhs, ctxOf(lt))
 	default:
-		if rl, lt, err = resolve(table, lhs, nil); err != nil {
+		if rl, lt, err = resolve(s, lhs, nil); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rr, rt, err = resolve(table, rhs, nil)
+		rr, rt, err = resolve(s, rhs, nil)
 	}
 	if err != nil {
 		return nil, resolvedType{}, nil, resolvedType{}, err

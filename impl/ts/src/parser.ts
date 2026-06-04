@@ -9,12 +9,15 @@ import type {
   Delete,
   Expr,
   Insert,
+  JoinClause,
+  JoinKind,
   Literal,
   OrderKey,
   Select,
   SelectItem,
   SelectItems,
   Statement,
+  TableRef,
   TypeMod,
   Update,
 } from "./ast.ts";
@@ -28,6 +31,32 @@ const I64_MAX = 9223372036854775807n;
 
 function lower(s: string): string {
   return s.toLowerCase();
+}
+
+// isTableRefStopKeyword reports whether kw (already lower-cased) is a keyword that may legally
+// follow a table_ref, and so must NOT be swallowed as an implicit table alias: a trailing clause
+// keyword (where/order/limit/offset) or any join-machinery keyword
+// (join/inner/cross/left/right/full/outer/on). `as` is handled separately. This set is a
+// CLAUDE.md §8 cross-core determinism surface (spec/design/grammar.md §15).
+function isTableRefStopKeyword(kw: string): boolean {
+  switch (kw) {
+    case "where":
+    case "order":
+    case "limit":
+    case "offset":
+    case "join":
+    case "inner":
+    case "cross":
+    case "left":
+    case "right":
+    case "full":
+    case "outer":
+    case "on":
+    case "as":
+      return true;
+    default:
+      return false;
+  }
 }
 
 // foldInt converts a lexed unsigned magnitude (<= 2^63) and a sign into a signed
@@ -244,7 +273,7 @@ class Parser {
 
     const items = this.parseSelectItems();
     this.expectKeyword("from");
-    const from = this.expectIdentifier();
+    const { from, joins } = this.parseFromClause();
 
     const filter = this.parseOptionalWhere();
 
@@ -267,7 +296,98 @@ class Parser {
       }
     }
 
-    return { kind: "select", distinct, items, from, filter, orderBy, limit, offset };
+    return { kind: "select", distinct, items, from, joins, filter, orderBy, limit, offset };
+  }
+
+  // parseFromClause parses `from_clause ::= table_ref join_clause*` (grammar.md §15): the first
+  // table reference followed by a left-deep chain of zero or more joins. The join keywords are
+  // not reserved (§3); the loop recognizes a join only by a leading join keyword, so any other
+  // trailing word ends the FROM clause.
+  private parseFromClause(): { from: TableRef; joins: JoinClause[] } {
+    const from = this.parseTableRef();
+    const joins: JoinClause[] = [];
+    for (;;) {
+      const j = this.parseJoinClause();
+      if (j === null) break;
+      joins.push(j);
+    }
+    return { from, joins };
+  }
+
+  // parseTableRef parses `table_ref ::= identifier ("AS"? identifier)?` — a table name with an
+  // optional alias. An explicit AS takes the next identifier unconditionally; an implicit alias
+  // is taken only when the next token is a word that is NOT a clause/join keyword (so `FROM t
+  // WHERE` and `FROM t JOIN ...` keep no alias). The stop-keyword set is a §8 cross-core surface.
+  private parseTableRef(): TableRef {
+    const name = this.expectIdentifier();
+    let alias: string | null = null;
+    if (this.peekKeyword() === "as") {
+      this.advance();
+      alias = this.expectIdentifier();
+    } else {
+      const t = this.peek();
+      if (t.kind === "word" && !isTableRefStopKeyword(lower(t.word!))) {
+        alias = t.word!;
+        this.advance();
+      }
+    }
+    return { name, alias };
+  }
+
+  // parseJoinClause parses one join_clause if a join keyword begins here (returns null to end
+  // the FROM chain). CROSS JOIN has no ON; the INNER/outer kinds require ON <expr> (a missing ON
+  // is 42601). The outer kinds (LEFT/RIGHT/FULL [OUTER]) parse into the AST but are rejected at
+  // execution (0A000) — spec/design/grammar.md §15.
+  private parseJoinClause(): JoinClause | null {
+    const kw = this.peekKeyword();
+    let kind: JoinKind;
+    let isCross = false;
+    switch (kw) {
+      case "join": // a bare JOIN is INNER
+        this.advance();
+        kind = "inner";
+        break;
+      case "inner":
+        this.advance();
+        this.expectKeyword("join");
+        kind = "inner";
+        break;
+      case "cross":
+        this.advance();
+        this.expectKeyword("join");
+        kind = "cross";
+        isCross = true;
+        break;
+      case "left":
+      case "right":
+      case "full":
+        this.advance();
+        if (this.peekKeyword() === "outer") this.advance(); // optional OUTER
+        this.expectKeyword("join");
+        kind = kw;
+        break;
+      default: // not a join keyword: the FROM chain ends here
+        return null;
+    }
+    const table = this.parseTableRef();
+    let on: Expr | null = null;
+    if (!isCross) {
+      this.expectKeyword("on");
+      on = this.parseExpr();
+    }
+    return { kind, table, on };
+  }
+
+  // parseColumnRef parses `column_ref ::= identifier ("." identifier)?` — a bare column name, or
+  // a qualified `rel.col` (the "." is the "dot" token). Returns [qualifier, name]; qualifier is
+  // null for a bare column (spec/grammar/grammar.ebnf `column_ref`, grammar.md §15).
+  private parseColumnRef(): [string | null, string] {
+    const first = this.expectIdentifier();
+    if (this.peek().kind === "dot") {
+      this.advance();
+      return [first, this.expectIdentifier()];
+    }
+    return [null, first];
   }
 
   // parseOrderBy parses an optional `ORDER BY <key> ("," <key>)*`, where each key is a bare
@@ -281,7 +401,7 @@ class Parser {
     this.advance();
     this.expectKeyword("by");
     for (;;) {
-      const column = this.expectIdentifier();
+      const [qualifier, column] = this.parseColumnRef();
       let descending = false;
       if (this.peekKeyword() === "asc") {
         this.advance();
@@ -304,7 +424,7 @@ class Parser {
           throw engineError("syntax_error", "NULLS must be followed by FIRST or LAST");
         }
       }
-      keys.push({ column, descending, nullsFirst });
+      keys.push({ qualifier, column, descending, nullsFirst });
       if (this.peek().kind === "comma") {
         this.advance();
         continue;
@@ -586,7 +706,10 @@ class Parser {
         this.advance();
         return { kind: "literal", literal: { kind: "bool", value: false } };
       }
-      return { kind: "column", name: this.expectIdentifier() };
+      const [qualifier, name] = this.parseColumnRef();
+      return qualifier !== null
+        ? { kind: "qualifiedColumn", qualifier, name }
+        : { kind: "column", name };
     }
     throw engineError("syntax_error", "expected an expression");
   }

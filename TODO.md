@@ -320,8 +320,28 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 > The meaty planner/executor work and the rest of the integrity story.
 
-- [ ] **`JOIN`** — inner first, then `LEFT`/`RIGHT`/`FULL OUTER`, `CROSS`. Needs multi-table
-      FROM + a join executor. _(size: L; deps: expression evaluator)_
+- [x] **`JOIN` — multi-table FROM + `INNER`/`CROSS`** — done & committed across Rust/Go/TS. The
+      `SELECT` FROM clause grew from a single table name to a **left-deep chain**
+      (`from_clause ::= table_ref join_clause*`): **table aliases** (`t AS a` / `t a`), **qualified
+      column references** (`t.col`, via a new `Dot` token), a **scope resolver** (an ordered list
+      of `(label, table, column-offset)` that bakes a flat index into the existing `Column` node —
+      so the joined row is each relation's row **concatenated** and the whole expression evaluator
+      is untouched), and a **left-deep nested-loop** executor. Bare column ambiguous across
+      relations → **`42702`** (`ambiguous_column`, new), unknown qualifier → `42P01`, self-join
+      without distinct aliases → **`42712`** (`duplicate_alias`, new), non-boolean `ON` → `42804`.
+      The `ON` is three-valued (a NULL join key never matches) and evaluated **at its join node**
+      (not folded into WHERE), so outer joins are a clean executor-only follow-on. Cost is the
+      cross-core contract ([cost.md §3](spec/design/cost.md)): `storage_row_read` per materialized
+      row (Σ cardinalities), `operator_eval` per `ON` candidate combination, `row_produced` per
+      emitted row. Authored in [grammar.ebnf](spec/grammar/grammar.ebnf) + [grammar.md §15](spec/design/grammar.md),
+      capabilities `query.join_inner` / `query.cross_join` / `query.table_alias` /
+      `query.qualified_column` + the `joins` profile in [manifest.toml](spec/conformance/manifest.toml),
+      pinned by `spec/conformance/suites/joins/*.test`. _(was: L; deps: expression evaluator)_
+  - [ ] **Outer joins — `LEFT`/`RIGHT`/`FULL [OUTER] JOIN`** — the syntax **parses** and the AST
+        carries the join kind, but executing one is a documented **`0A000`** narrowing this slice.
+        The fast-follow is **executor-only**: add the "unmatched row → NULL-extend the absent side"
+        branch at the existing join node (the flat-row model + per-node `ON` already support it).
+        `USING` / `NATURAL` / comma-`FROM` / `t.*` stay deferred too. _(size: M; deps: this slice)_
 - [ ] **Subqueries** — scalar, `IN (subquery)`, `EXISTS`, then correlated. _(size: L; deps: joins)_
 - [ ] **Set operations** — `UNION [ALL]`, `INTERSECT`, `EXCEPT`. _(size: M)_
 - [ ] **Constraints** — `NOT NULL`, `DEFAULT`, `UNIQUE`, `CHECK`, **composite `PRIMARY KEY`**
@@ -433,7 +453,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   (XL) shouldn't gate the SQL-shape features in Phase 2.
 - **Tensions to decide:**
   - `NOT NULL` / `DEFAULT` are fundamental and easy — pull them into Phase 2?
-  - `JOIN`s are arguably core SQL — promote ahead of aggregates?
+  - `JOIN`s are arguably core SQL — **done** for `INNER`/`CROSS` (Phase 4); outer joins +
+    aggregates remain. (Was: promote `JOIN`s ahead of aggregates?)
   - Transactions (Phase 5) could move earlier if multi-statement atomicity is wanted
     before storage maturation; it's only placed here because it couples with Phase 6.
   - `text` vs `decimal` ordering within Phase 3 — `text` is the bigger immediate unlock

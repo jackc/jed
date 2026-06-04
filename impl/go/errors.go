@@ -33,6 +33,9 @@ const (
 	UndefinedTable
 	// UndefinedColumn is 42703.
 	UndefinedColumn
+	// AmbiguousColumn is 42702 — a bare column matching more than one relation in scope
+	// (spec/design/grammar.md §15).
+	AmbiguousColumn
 	// UndefinedObject is 42704 (e.g. an unknown type name).
 	UndefinedObject
 	// InvalidColumnReference is 42P10 — a SELECT DISTINCT ORDER BY key not in the
@@ -44,6 +47,9 @@ const (
 	DuplicateTable
 	// DuplicateColumn is 42701 (two columns with the same name).
 	DuplicateColumn
+	// DuplicateAlias is 42712 — two FROM relations share a label (a self-join needs distinct
+	// aliases; spec/design/grammar.md §15).
+	DuplicateAlias
 	// InvalidTableDefinition is 42P16 (e.g. more than one primary key).
 	InvalidTableDefinition
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
@@ -77,6 +83,8 @@ func (s SqlState) Code() string {
 		return "42P01"
 	case UndefinedColumn:
 		return "42703"
+	case AmbiguousColumn:
+		return "42702"
 	case UndefinedObject:
 		return "42704"
 	case InvalidColumnReference:
@@ -87,6 +95,8 @@ func (s SqlState) Code() string {
 		return "42P07"
 	case DuplicateColumn:
 		return "42701"
+	case DuplicateAlias:
+		return "42712"
 	case InvalidTableDefinition:
 		return "42P16"
 	case FeatureNotSupported:

@@ -19,6 +19,10 @@ const (
 	TokDecimal
 	// TokComma is ",".
 	TokComma
+	// TokDot is the "." separator of a qualified column reference (t.col). Emitted only when
+	// a "." is NOT part of a numeric literal — i.e. with no digit immediately after it
+	// (spec/design/grammar.md §4/§15).
+	TokDot
 	// TokLParen is "(".
 	TokLParen
 	// TokRParen is ")".

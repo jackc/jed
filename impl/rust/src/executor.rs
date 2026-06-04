@@ -5,7 +5,7 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    BinaryOp, CreateTable, Delete, DropTable, Expr, Insert, Literal, Select, SelectItems,
+    BinaryOp, CreateTable, Delete, DropTable, Expr, Insert, JoinKind, Literal, Select, SelectItems,
     Statement, TypeMod, UnaryOp, Update,
 };
 use crate::catalog::{Column, Table};
@@ -306,8 +306,10 @@ impl Database {
                 format!("table does not exist: {}", del.table),
             )
         })?;
+        // DELETE is single-table; resolve its WHERE against a one-relation scope.
+        let scope = Scope::single(table);
         let filter = match &del.filter {
-            Some(p) => Some(resolve_boolean_filter(table, p)?),
+            Some(p) => Some(resolve_boolean_filter(&scope, p)?),
             None => None,
         };
 
@@ -350,6 +352,9 @@ impl Database {
                 format!("table does not exist: {}", upd.table),
             )
         })?;
+        // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
+        // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
+        let scope = Scope::single(table);
 
         // Resolve assignments up front (fail fast, deterministic).
         let pk_idx = table.primary_key_index();
@@ -373,7 +378,7 @@ impl Database {
             // operand adapts to the target column's type. The result must be assignable to
             // the column's family (integer/decimal/text or NULL; never boolean; decimal→int
             // is explicit-CAST only) — spec/design/decimal.md §6.
-            let (source, ty) = resolve(table, &a.value, Some(col.ty))?;
+            let (source, ty) = resolve(&scope, &a.value, Some(col.ty))?;
             require_assignable(ty, col.ty, &a.column)?;
             plans.push(AssignPlan {
                 idx,
@@ -386,7 +391,7 @@ impl Database {
         }
 
         let filter = match &upd.filter {
-            Some(p) => Some(resolve_boolean_filter(table, p)?),
+            Some(p) => Some(resolve_boolean_filter(&scope, p)?),
             None => None,
         };
 
@@ -428,52 +433,76 @@ impl Database {
     /// ORDER BY, then project. Rows are produced in a deterministic order
     /// (CLAUDE.md §10).
     fn execute_select(&mut self, sel: Select) -> Result<Outcome> {
-        let table = self.table(&sel.from).ok_or_else(|| {
-            EngineError::new(
-                SqlState::UndefinedTable,
-                format!("table does not exist: {}", sel.from),
-            )
-        })?;
-
-        // Resolve projections to evaluable expression trees against the table, paired
-        // with their output column names (spec/design/grammar.md §8).
-        let (projections, column_names) = resolve_projections(table, &sel.items)?;
-
-        // Resolve the optional WHERE expression; it must resolve to boolean.
-        let filter = match &sel.filter {
-            Some(p) => Some(resolve_boolean_filter(table, p)?),
-            None => None,
-        };
-
-        // Resolve each ORDER BY key to (column index, descending, nulls_first). An unknown
-        // column is the existing UndefinedColumn (42703); nulls_first was resolved at parse
-        // time (explicit clause, else the direction default).
-        let mut order: Vec<(usize, bool, bool)> = Vec::with_capacity(sel.order_by.len());
-        for key in &sel.order_by {
-            let idx = table.column_index(&key.column).ok_or_else(|| {
+        // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
+        // relation's flat column offset in FROM order, and reject a duplicate label — a
+        // self-join without distinct aliases is 42712 (spec/design/grammar.md §15).
+        let mut rels: Vec<ScopeRel> = Vec::with_capacity(1 + sel.joins.len());
+        let mut seen_labels: HashSet<String> = HashSet::new();
+        let mut offset = 0usize;
+        for tref in std::iter::once(&sel.from).chain(sel.joins.iter().map(|j| &j.table)) {
+            let table = self.table(&tref.name).ok_or_else(|| {
                 EngineError::new(
-                    SqlState::UndefinedColumn,
-                    format!("column does not exist: {}", key.column),
+                    SqlState::UndefinedTable,
+                    format!("table does not exist: {}", tref.name),
                 )
             })?;
+            let label = tref
+                .alias
+                .clone()
+                .unwrap_or_else(|| table.name.clone())
+                .to_ascii_lowercase();
+            if !seen_labels.insert(label.clone()) {
+                return Err(EngineError::new(
+                    SqlState::DuplicateAlias,
+                    format!("table name {label} specified more than once"),
+                ));
+            }
+            rels.push(ScopeRel {
+                label,
+                table,
+                offset,
+            });
+            offset += table.columns.len();
+        }
+        let scope = Scope { rels };
+
+        // Resolve projections (paired with output column names — grammar.md §8), the optional
+        // WHERE (must be boolean), and the ORDER BY keys against the full scope. A bare key
+        // ambiguous across relations is 42702; an unknown qualifier is 42P01 (§15).
+        let (projections, column_names) = resolve_projections(&scope, &sel.items)?;
+        let filter = match &sel.filter {
+            Some(p) => Some(resolve_boolean_filter(&scope, p)?),
+            None => None,
+        };
+        let mut order: Vec<(usize, bool, bool)> = Vec::with_capacity(sel.order_by.len());
+        for key in &sel.order_by {
+            let idx = match &key.qualifier {
+                Some(q) => scope.resolve_qualified(q, &key.column)?,
+                None => scope.resolve_bare(&key.column)?,
+            };
             order.push((idx, key.descending, key.nulls_first));
         }
 
         // SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates are
-        // collapsed, an ORDER BY key that is not in the projected output has no single
-        // value per row, so each key must appear as a bare column in the select list (or
-        // the list is `*`). Matches PostgreSQL (42P10); the engine keeps its own SQLite
-        // NULL ordering separately. Aliases are invisible to ORDER BY (§8), so an aliased
-        // bare column still counts as projecting its underlying column.
+        // collapsed, an ORDER BY key not in the projected output has no single value per row,
+        // so each key must appear as a bare/qualified column in the select list (resolved to
+        // the same flat index; or the list is `*`). Matches PostgreSQL (42P10). Aliases are
+        // invisible to ORDER BY (§8), so an aliased bare column still counts as projecting it.
         if sel.distinct && !order.is_empty() {
             if let SelectItems::Items(items) = &sel.items {
-                let projected: std::collections::HashSet<usize> = items
-                    .iter()
-                    .filter_map(|it| match &it.expr {
-                        Expr::Column(name) => table.column_index(name),
+                let mut projected: HashSet<usize> = HashSet::new();
+                for it in items {
+                    let idx = match &it.expr {
+                        Expr::Column(name) => scope.resolve_bare(name).ok(),
+                        Expr::QualifiedColumn { qualifier, name } => {
+                            scope.resolve_qualified(qualifier, name).ok()
+                        }
                         _ => None,
-                    })
-                    .collect();
+                    };
+                    if let Some(i) = idx {
+                        projected.insert(i);
+                    }
+                }
                 if order.iter().any(|&(idx, _, _)| !projected.contains(&idx)) {
                     return Err(EngineError::new(
                         SqlState::InvalidColumnReference,
@@ -483,28 +512,91 @@ impl Database {
             }
         }
 
-        // Scan in primary-key order (the order-preserving encoding makes this the
-        // logical key order), then filter. A WHERE arithmetic can trap (22003/22012),
-        // so this is an explicit loop that propagates the error. Each scanned row and the
-        // filter evaluation accrue cost; the row-produced charge is below, at projection
-        // (CLAUDE.md §13; spec/design/cost.md §3).
+        // Resolve each JOIN's ON predicate against the PARTIAL scope visible at that node (the
+        // relations joined so far — scope.rels[..=k+1]), so a forward reference to a
+        // not-yet-joined table is a clean 42P01/42703 instead of an out-of-range row index.
+        // CROSS has no ON. The OUTER kinds parse but are rejected here (0A000) — only
+        // INNER/CROSS execute this slice (spec/design/grammar.md §15).
+        let mut join_ons: Vec<Option<RExpr>> = Vec::with_capacity(sel.joins.len());
+        for (k, j) in sel.joins.iter().enumerate() {
+            match j.kind {
+                JoinKind::Inner | JoinKind::Cross => {}
+                JoinKind::Left | JoinKind::Right | JoinKind::Full => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "outer joins (LEFT/RIGHT/FULL) are not supported yet",
+                    ));
+                }
+            }
+            match &j.on {
+                None => join_ons.push(None),
+                Some(on_expr) => {
+                    let partial = Scope {
+                        rels: scope.rels[..=k + 1].to_vec(),
+                    };
+                    join_ons.push(Some(resolve_boolean_filter(&partial, on_expr)?));
+                }
+            }
+        }
+
+        // Materialize each base table once, in primary-key order, charging storage_row_read
+        // per physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these
+        // in-memory buffers, which are not stores and charge nothing.
         let mut meter = Meter::new();
+        let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(scope.rels.len());
+        for rel in &scope.rels {
+            let mut table_rows: Vec<Row> = Vec::new();
+            for row in self.store(&rel.table.name).iter_in_key_order() {
+                meter.charge(COSTS.storage_row_read);
+                table_rows.push(row.clone());
+            }
+            materialized.push(table_rows);
+        }
+
+        // Left-deep nested-loop join. `running` holds the combined rows over the relations
+        // joined so far (starting with the first table's rows). For each join, concatenate
+        // every running row with every right-table row; CROSS keeps all pairs, INNER keeps a
+        // pair iff its ON predicate is TRUE (three-valued — a NULL join key never matches).
+        // Output order is deterministic: running order (outer) then right key order (inner),
+        // so a join is deterministic even with no ORDER BY (CLAUDE.md §10).
+        let mut running: Vec<Row> = std::mem::take(&mut materialized[0]);
+        for (k, _j) in sel.joins.iter().enumerate() {
+            let right_rows = &materialized[k + 1];
+            let on = &join_ons[k];
+            let mut next: Vec<Row> = Vec::new();
+            for left in &running {
+                for right in right_rows {
+                    let mut combined = left.clone();
+                    combined.extend_from_slice(right);
+                    let keep = match on {
+                        None => true,
+                        Some(pred) => pred.eval(&combined, &mut meter)?.is_true(),
+                    };
+                    if keep {
+                        next.push(combined);
+                    }
+                }
+            }
+            running = next;
+        }
+
+        // WHERE over the combined rows (consume `running`, no extra clone). A WHERE arithmetic
+        // can trap (22003/22012); each surviving combined row's filter accrues operator_eval.
         let mut rows: Vec<Row> = Vec::new();
-        for row in self.store(&sel.from).iter_in_key_order() {
-            meter.charge(COSTS.storage_row_read);
+        for row in running {
             let keep = match &filter {
                 None => true,
-                Some(f) => f.eval(row, &mut meter)?.is_true(),
+                Some(f) => f.eval(&row, &mut meter)?.is_true(),
             };
             if keep {
-                rows.push(row.clone());
+                rows.push(row);
             }
         }
 
         // ORDER BY: a stable sort applying each key left to right — the first non-equal key
-        // decides, and a full tie keeps the primary-key scan order (the sort is stable).
-        // Each key's NULL placement is decoupled from its value-direction flip, so an
-        // explicit NULLS FIRST|LAST overrides the default (spec/design/grammar.md §10).
+        // decides, and a full tie keeps the scan order (the sort is stable). Each key's NULL
+        // placement is decoupled from its value-direction flip, so an explicit NULLS
+        // FIRST|LAST overrides the default (spec/design/grammar.md §10).
         if !order.is_empty() {
             rows.sort_by(|a, b| {
                 for &(idx, descending, nulls_first) in &order {
@@ -602,6 +694,92 @@ impl Database {
 }
 
 // ============================================================================
+// Resolution scope (multi-table FROM — spec/design/grammar.md §15).
+//
+// A `Scope` is the ordered list of relations a SELECT's FROM clause puts in scope, each
+// carrying the flat COLUMN OFFSET at which its columns begin in the concatenated (joined)
+// row. A resolved column reference bakes a single flat index `offset + local` into
+// `RExpr::Column`, so the joined row is just each relation's row concatenated in FROM order
+// and the expression evaluator is unchanged. A single-table SELECT / UPDATE / DELETE is a
+// one-relation scope (offset 0), so the same resolver serves every statement.
+//
+// NOTE (forward-compat): the scope keys resolution ONLY on column name and type — never on a
+// column's NOT NULL / PRIMARY KEY flags. A column on the nullable side of a future outer join
+// is NULL-extended at runtime regardless of its declared nullability, so no resolver shortcut
+// may fold on it (spec/design/grammar.md §15).
+// ============================================================================
+
+/// One relation in a FROM scope: its label (alias, else table name — lower-cased for
+/// case-insensitive matching), the table, and the flat offset of its first column in the
+/// joined row.
+#[derive(Clone)]
+struct ScopeRel<'a> {
+    label: String,
+    table: &'a Table,
+    offset: usize,
+}
+
+/// The relations a query's FROM clause puts in scope, in FROM order.
+struct Scope<'a> {
+    rels: Vec<ScopeRel<'a>>,
+}
+
+impl<'a> Scope<'a> {
+    /// A one-relation scope (the single-table SELECT / UPDATE / DELETE case).
+    fn single(table: &'a Table) -> Scope<'a> {
+        Scope {
+            rels: vec![ScopeRel {
+                label: table.name.to_ascii_lowercase(),
+                table,
+                offset: 0,
+            }],
+        }
+    }
+
+    /// Resolve a bare column name to a flat row index: no relation has it → 42703; two or
+    /// more relations have it → 42702 ambiguous; exactly one → its flat index.
+    fn resolve_bare(&self, name: &str) -> Result<usize> {
+        let mut found: Option<usize> = None;
+        for r in &self.rels {
+            if let Some(local) = r.table.column_index(name) {
+                if found.is_some() {
+                    return Err(ambiguous_column(name));
+                }
+                found = Some(r.offset + local);
+            }
+        }
+        found.ok_or_else(|| undefined_column(name))
+    }
+
+    /// Resolve a qualified `rel.col` to a flat row index: an unknown `rel` is 42P01, a known
+    /// `rel` with no such column is 42703. Never ambiguous (it names one relation).
+    fn resolve_qualified(&self, qualifier: &str, name: &str) -> Result<usize> {
+        let q = qualifier.to_ascii_lowercase();
+        let rel = self
+            .rels
+            .iter()
+            .find(|r| r.label == q)
+            .ok_or_else(|| missing_from_entry(qualifier))?;
+        let local = rel
+            .table
+            .column_index(name)
+            .ok_or_else(|| undefined_column(name))?;
+        Ok(rel.offset + local)
+    }
+
+    /// The column at a flat index (the index is known valid — resolution produced it).
+    fn column_at(&self, flat: usize) -> &Column {
+        for r in &self.rels {
+            let n = r.table.columns.len();
+            if flat >= r.offset && flat < r.offset + n {
+                return &r.table.columns[flat - r.offset];
+            }
+        }
+        unreachable!("a resolved flat column index is always in range")
+    }
+}
+
+// ============================================================================
 // Resolved expression layer.
 //
 // Parse → `Expr` (names) → resolve → `RExpr` (column indices, known result types,
@@ -691,23 +869,31 @@ enum RExpr {
     },
 }
 
-/// Resolve `SELECT` items against a table into evaluable projections (any result type
-/// is allowed in the select list, including boolean — `SELECT a = b`), each paired with
-/// its output column name (spec/design/grammar.md §8).
-fn resolve_projections(table: &Table, items: &SelectItems) -> Result<(Vec<RExpr>, Vec<String>)> {
+/// Resolve `SELECT` items against the FROM scope into evaluable projections (any result type
+/// is allowed in the select list, including boolean — `SELECT a = b`), each paired with its
+/// output column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM
+/// order, each relation's columns in catalog order (§15).
+fn resolve_projections(scope: &Scope, items: &SelectItems) -> Result<(Vec<RExpr>, Vec<String>)> {
     match items {
-        SelectItems::All => Ok((
-            (0..table.columns.len()).map(RExpr::Column).collect(),
-            table.columns.iter().map(|c| c.name.clone()).collect(),
-        )),
+        SelectItems::All => {
+            let mut nodes = Vec::new();
+            let mut names = Vec::new();
+            for rel in &scope.rels {
+                for (i, c) in rel.table.columns.iter().enumerate() {
+                    nodes.push(RExpr::Column(rel.offset + i));
+                    names.push(c.name.clone());
+                }
+            }
+            Ok((nodes, names))
+        }
         SelectItems::Items(items) => {
             let mut nodes = Vec::with_capacity(items.len());
             let mut names = Vec::with_capacity(items.len());
             for it in items {
-                let (node, _) = resolve(table, &it.expr, None)?;
+                let (node, _) = resolve(scope, &it.expr, None)?;
                 names.push(match &it.alias {
                     Some(a) => a.clone(),
-                    None => output_name(table, &it.expr),
+                    None => output_name(scope, &it.expr),
                 });
                 nodes.push(node);
             }
@@ -716,24 +902,30 @@ fn resolve_projections(table: &Table, items: &SelectItems) -> Result<(Vec<RExpr>
     }
 }
 
-/// The output column name of an un-aliased select item (spec/design/grammar.md §8): a
-/// bare column reference takes the catalog's canonical name (the `CREATE TABLE` spelling,
-/// not the SELECT spelling, so the user's casing never leaks); every other expression
-/// takes the fixed `?column?`. The column is known to exist — `resolve` validated it.
-fn output_name(table: &Table, e: &Expr) -> String {
+/// The output column name of an un-aliased select item (spec/design/grammar.md §8/§15): a
+/// bare or qualified column reference takes the catalog's canonical name (the `CREATE TABLE`
+/// spelling, not the SELECT spelling, and never the qualifier — so casing/qualifier never
+/// leaks); every other expression takes the fixed `?column?`. The column is known to exist —
+/// `resolve` validated it.
+fn output_name(scope: &Scope, e: &Expr) -> String {
     match e {
-        Expr::Column(name) => match table.column_index(name) {
-            Some(idx) => table.columns[idx].name.clone(),
-            None => name.clone(),
+        Expr::Column(name) => match scope.resolve_bare(name) {
+            Ok(idx) => scope.column_at(idx).name.clone(),
+            Err(_) => name.clone(),
+        },
+        Expr::QualifiedColumn { qualifier, name } => match scope.resolve_qualified(qualifier, name)
+        {
+            Ok(idx) => scope.column_at(idx).name.clone(),
+            Err(_) => name.clone(),
         },
         _ => "?column?".to_string(),
     }
 }
 
-/// Resolve a WHERE expression: it must resolve to boolean (or an untyped NULL, which
-/// is always unknown → no rows). An integer-valued WHERE is a 42804 type error.
-fn resolve_boolean_filter(table: &Table, e: &Expr) -> Result<RExpr> {
-    let (node, ty) = resolve(table, e, None)?;
+/// Resolve a WHERE / ON expression: it must resolve to boolean (or an untyped NULL, which
+/// is always unknown → no rows). An integer-valued WHERE/ON is a 42804 type error.
+fn resolve_boolean_filter(scope: &Scope, e: &Expr) -> Result<RExpr> {
+    let (node, ty) = resolve(scope, e, None)?;
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(node),
         ResolvedType::Int(_) | ResolvedType::Text | ResolvedType::Decimal | ResolvedType::Bytea => {
@@ -742,26 +934,37 @@ fn resolve_boolean_filter(table: &Table, e: &Expr) -> Result<RExpr> {
     }
 }
 
-/// Resolve one `Expr` into an `RExpr` plus its static type. `ctx` is the type an
-/// untyped integer literal should adapt to (spec/design/types.md §6); `None` defaults
-/// a bare literal to int64.
-fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, ResolvedType)> {
+/// The resolved (static) type of a column of scalar type `ty`.
+fn resolved_type_of(ty: ScalarType) -> ResolvedType {
+    if ty.is_text() {
+        ResolvedType::Text
+    } else if ty.is_bool() {
+        ResolvedType::Bool
+    } else if ty.is_decimal() {
+        ResolvedType::Decimal
+    } else if ty.is_bytea() {
+        ResolvedType::Bytea
+    } else {
+        ResolvedType::Int(ty)
+    }
+}
+
+/// Resolve one `Expr` into an `RExpr` plus its static type, against the FROM `scope`. `ctx`
+/// is the type an untyped integer literal should adapt to (spec/design/types.md §6); `None`
+/// defaults a bare literal to int64. A column reference resolves to a flat row index via the
+/// scope — a bare name ambiguous across relations is 42702, an unknown qualifier is 42P01
+/// (spec/design/grammar.md §15).
+fn resolve(scope: &Scope, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, ResolvedType)> {
     match e {
         Expr::Column(name) => {
-            let idx = col_idx(table, name)?;
-            let ty = table.columns[idx].ty;
-            let rty = if ty.is_text() {
-                ResolvedType::Text
-            } else if ty.is_bool() {
-                ResolvedType::Bool
-            } else if ty.is_decimal() {
-                ResolvedType::Decimal
-            } else if ty.is_bytea() {
-                ResolvedType::Bytea
-            } else {
-                ResolvedType::Int(ty)
-            };
-            Ok((RExpr::Column(idx), rty))
+            let idx = scope.resolve_bare(name)?;
+            let ty = scope.column_at(idx).ty;
+            Ok((RExpr::Column(idx), resolved_type_of(ty)))
+        }
+        Expr::QualifiedColumn { qualifier, name } => {
+            let idx = scope.resolve_qualified(qualifier, name)?;
+            let ty = scope.column_at(idx).ty;
+            Ok((RExpr::Column(idx), resolved_type_of(ty)))
         }
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
@@ -831,7 +1034,7 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             }
             // The inner value is range-checked / coerced against `target` at eval, so it
             // resolves with no literal context here.
-            let (rinner, ity) = resolve(table, inner, None)?;
+            let (rinner, ity) = resolve(scope, inner, None)?;
             match ity {
                 // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
                 // decimal→decimal (re-scale), and NULL are all castable.
@@ -875,7 +1078,7 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             op: UnaryOp::Neg,
             operand,
         } => {
-            let (rop, ty) = resolve(table, operand, ctx)?;
+            let (rop, ty) = resolve(scope, operand, ctx)?;
             let result = match ty {
                 ResolvedType::Int(t) => t,
                 ResolvedType::Decimal => ScalarType::Decimal,
@@ -901,13 +1104,13 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             op: UnaryOp::Not,
             operand,
         } => {
-            let (rop, ty) = resolve(table, operand, None)?;
+            let (rop, ty) = resolve(scope, operand, None)?;
             require_bool(ty, "NOT requires a boolean operand")?;
             Ok((RExpr::Not(Box::new(rop)), ResolvedType::Bool))
         }
         Expr::IsNull { operand, negated } => {
             // IS [NOT] NULL accepts any operand type and always yields a definite boolean.
-            let (rop, _ty) = resolve(table, operand, None)?;
+            let (rop, _ty) = resolve(scope, operand, None)?;
             Ok((
                 RExpr::IsNull {
                     operand: Box::new(rop),
@@ -921,7 +1124,7 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
             // (a literal adapts to its sibling; a text literal stays text), then require
             // the operands be comparable (both integer-ish or both text-ish; a mixed pair
             // is 42804). The result is always a definite boolean (functions.md §3).
-            let (rl, lt, rr, rt) = resolve_operand_pair(table, lhs, rhs)?;
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs)?;
             classify_comparable(lt, rt)?;
             Ok((
                 RExpr::Distinct {
@@ -932,12 +1135,12 @@ fn resolve(table: &Table, e: &Expr, ctx: Option<ScalarType>) -> Result<(RExpr, R
                 ResolvedType::Bool,
             ))
         }
-        Expr::Binary { op, lhs, rhs } => resolve_binary(table, *op, lhs, rhs),
+        Expr::Binary { op, lhs, rhs } => resolve_binary(scope, *op, lhs, rhs),
     }
 }
 
 fn resolve_binary(
-    table: &Table,
+    scope: &Scope,
     op: BinaryOp,
     lhs: &Expr,
     rhs: &Expr,
@@ -949,7 +1152,7 @@ fn resolve_binary(
             // integer → integer arithmetic (promotion tower); at least one decimal → decimal
             // arithmetic (the integer operand widens at eval); a text/boolean operand is a
             // 42804 (spec/design/decimal.md §4).
-            let (rl, lt, rr, rt) = resolve_operand_pair(table, lhs, rhs)?;
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs)?;
             require_numeric_operand(lt)?;
             require_numeric_operand(rt)?;
             let aop = match op {
@@ -981,7 +1184,7 @@ fn resolve_binary(
             // Resolve the operands (a literal adapts to its sibling; text literals stay
             // text), then require they be comparable — a mixed integer/text pair is 42804.
             // The runtime comparison (eq3/lt3/gt3) dispatches on the value variants.
-            let (rl, lt, rr, rt) = resolve_operand_pair(table, lhs, rhs)?;
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs)?;
             classify_comparable(lt, rt)?;
             let cop = match op {
                 BinaryOp::Eq => CmpOp::Eq,
@@ -1001,8 +1204,8 @@ fn resolve_binary(
             ))
         }
         BinaryOp::And | BinaryOp::Or => {
-            let (rl, lt) = resolve(table, lhs, None)?;
-            let (rr, rt) = resolve(table, rhs, None)?;
+            let (rl, lt) = resolve(scope, lhs, None)?;
+            let (rr, rt) = resolve(scope, rhs, None)?;
             require_bool(lt, "AND/OR requires boolean operands")?;
             require_bool(rt, "AND/OR requires boolean operands")?;
             let node = if matches!(op, BinaryOp::And) {
@@ -1023,7 +1226,7 @@ fn resolve_binary(
 /// its own family and the caller's family check reports the mismatch. This does NOT enforce a
 /// family — `resolve_int_pair`/arithmetic and `classify_comparable` (comparison) layer that on top.
 fn resolve_operand_pair(
-    table: &Table,
+    scope: &Scope,
     lhs: &Expr,
     rhs: &Expr,
 ) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
@@ -1032,20 +1235,20 @@ fn resolve_operand_pair(
     let (rl, lt, rr, rt) = if lhs_lit && rhs_lit {
         // Two bare literals: no column context. Default an integer literal to int64; a string
         // literal stays text (no bytea context to decode it — types.md §6).
-        let (rl, lt) = resolve(table, lhs, Some(ScalarType::Int64))?;
-        let (rr, rt) = resolve(table, rhs, Some(ScalarType::Int64))?;
+        let (rl, lt) = resolve(scope, lhs, Some(ScalarType::Int64))?;
+        let (rr, rt) = resolve(scope, rhs, Some(ScalarType::Int64))?;
         (rl, lt, rr, rt)
     } else if lhs_lit {
-        let (rr, rt) = resolve(table, rhs, None)?;
-        let (rl, lt) = resolve(table, lhs, ctx_of(rt))?;
+        let (rr, rt) = resolve(scope, rhs, None)?;
+        let (rl, lt) = resolve(scope, lhs, ctx_of(rt))?;
         (rl, lt, rr, rt)
     } else if rhs_lit {
-        let (rl, lt) = resolve(table, lhs, None)?;
-        let (rr, rt) = resolve(table, rhs, ctx_of(lt))?;
+        let (rl, lt) = resolve(scope, lhs, None)?;
+        let (rr, rt) = resolve(scope, rhs, ctx_of(lt))?;
         (rl, lt, rr, rt)
     } else {
-        let (rl, lt) = resolve(table, lhs, None)?;
-        let (rr, rt) = resolve(table, rhs, None)?;
+        let (rl, lt) = resolve(scope, lhs, None)?;
+        let (rr, rt) = resolve(scope, rhs, None)?;
         (rl, lt, rr, rt)
     };
     Ok((rl, lt, rr, rt))
@@ -1188,12 +1391,33 @@ fn require_assignable(ty: ResolvedType, col_ty: ScalarType, col: &str) -> Result
 }
 
 fn col_idx(table: &Table, name: &str) -> Result<usize> {
-    table.column_index(name).ok_or_else(|| {
-        EngineError::new(
-            SqlState::UndefinedColumn,
-            format!("column does not exist: {name}"),
-        )
-    })
+    table
+        .column_index(name)
+        .ok_or_else(|| undefined_column(name))
+}
+
+/// 42703 — a column name that no relation in scope defines.
+fn undefined_column(name: &str) -> EngineError {
+    EngineError::new(
+        SqlState::UndefinedColumn,
+        format!("column does not exist: {name}"),
+    )
+}
+
+/// 42702 — a bare column name that more than one relation in scope defines (grammar.md §15).
+fn ambiguous_column(name: &str) -> EngineError {
+    EngineError::new(
+        SqlState::AmbiguousColumn,
+        format!("column reference {name} is ambiguous"),
+    )
+}
+
+/// 42P01 — a qualifier that names no relation in the FROM clause (grammar.md §15).
+fn missing_from_entry(qualifier: &str) -> EngineError {
+    EngineError::new(
+        SqlState::UndefinedTable,
+        format!("missing FROM-clause entry for table {qualifier}"),
+    )
 }
 
 /// Resolve a type name + optional type modifier used in a column definition or a CAST target.
