@@ -18,8 +18,10 @@ const NegInfinity int64 = -9223372036854775808
 // PosInfinity is the +infinity sentinel — the largest int64, sorts after every finite instant.
 const PosInfinity int64 = 9223372036854775807
 
-const microsPerSec = 1_000_000
-const secsPerDay = 86_400
+const (
+	microsPerSec = 1_000_000
+	secsPerDay   = 86_400
+)
 
 // floorDiv is integer division rounding toward negative infinity (Go's `/` truncates).
 func floorDiv(a, b int64) int64 {
