@@ -72,6 +72,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.union",
   "query.intersect",
   "query.except",
+  // Uncorrelated subqueries: scalar / IN / EXISTS — spec/design/grammar.md §26.
+  "query.subquery_scalar",
+  "query.subquery_in",
+  "query.subquery_exists",
   // Scalar functions abs / round (per-row, valid anywhere an expression is) —
   // spec/design/functions.md §9.
   "func.abs",

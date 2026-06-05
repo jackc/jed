@@ -304,8 +304,10 @@ not_expr       ::= "NOT" not_expr
  * "NOT"? "BETWEEN" lo "AND" hi is the range predicate (§21), and "NOT"? "LIKE" pattern is the
  * text pattern match (§22) — all at the comparison level. A "NOT" before "IN"/"BETWEEN"/"LIKE"
  * is the predicate negation; the parsers take it with a two-token lookahead (the prefix "NOT"
- * was already consumed by not_expr) and only when the predicate keyword follows. The IN list
- * is one or more additive expressions; an empty "IN ()" is a 42601 syntax error. BETWEEN's two
+ * was already consumed by not_expr) and only when the predicate keyword follows. The IN operand
+ * is EITHER a parenthesized query_expr (the uncorrelated IN-subquery, §26 — disambiguated by a
+ * leading "SELECT" after "(") OR a value list of one or more additive expressions; an empty
+ * "IN ()" value list is a 42601 syntax error (an empty subquery RESULT is valid → FALSE). BETWEEN's two
  * bounds are additive expressions: parsing them at the additive level (which never consumes
  * "AND", a looser level) is what lets the structural "AND" be matched here, so
  * "x BETWEEN a AND b AND c" is "(x BETWEEN a AND b) AND c". LIKE's pattern is one additive
@@ -315,7 +317,7 @@ not_expr       ::= "NOT" not_expr
 comparison     ::= additive ( compare_op additive
                             | "IS" "NOT"? "NULL"
                             | "IS" "NOT"? "DISTINCT" "FROM" additive
-                            | "NOT"? "IN" "(" additive ("," additive)* ")"
+                            | "NOT"? "IN" "(" ( query_expr | additive ("," additive)* ) ")"
                             | "NOT"? "BETWEEN" additive "AND" additive
                             | "NOT"? "LIKE" additive )?
 
@@ -328,6 +330,11 @@ multiplicative ::= unary ( ("*" | "/" | "%") unary )*
 unary          ::= "-" unary
                  | primary
 
+/* A "(" begins either a parenthesized expression "(" expr ")" or a SCALAR SUBQUERY
+ * "(" query_expr ")" (../design/grammar.md §26) — disambiguated by a leading "SELECT" after the
+ * "(". "EXISTS" "(" query_expr ")" is the existence predicate. Both subquery forms (and the
+ * IN-subquery above) are UNCORRELATED this slice: a reference to an outer-query column, or a bind
+ * parameter "$N", inside the subquery is a 0A000 (../design/grammar.md §26). */
 primary        ::= number
                  | string
                  | "TRUE" | "FALSE"
@@ -336,7 +343,8 @@ primary        ::= number
                  | "CAST" "(" expr "AS" type_name ")"
                  | case_expr
                  | function_call
-                 | "(" expr ")"
+                 | "EXISTS" "(" query_expr ")"
+                 | "(" ( query_expr | expr ) ")"
                  | column_ref
 
 /* A bind parameter — "$" followed by a 1-based decimal index ($1, $2, …). NOT part of

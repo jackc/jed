@@ -2,6 +2,8 @@
 //! (CLAUDE.md §10); the hand-written parser produces these.
 
 use crate::decimal::Decimal;
+use crate::types::ScalarType;
+use crate::value::Value;
 
 /// A parsed top-level statement.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -343,6 +345,30 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
         star: bool,
+    },
+    /// A scalar subquery `( query_expr )` in expression position (grammar.md §26). Uncorrelated:
+    /// `run_select`'s pre-pass executes it once and replaces this node with a `FoldedConst`, so
+    /// resolution never sees it. A correlated reference or a `$N` inside is a `0A000`.
+    ScalarSubquery(Box<QueryExpr>),
+    /// `EXISTS ( query_expr )` (grammar.md §26) — the bare existence predicate (a leading `NOT`
+    /// is the ordinary unary connective wrapping this). Folded to a boolean literal by the
+    /// pre-pass.
+    Exists(Box<QueryExpr>),
+    /// `lhs [NOT] IN ( query_expr )` (grammar.md §26). The pre-pass folds it to the literal-`IN`
+    /// OR-chain over the subquery's result values (or, for an empty result, an empty `In` that
+    /// resolves to the constant FALSE/TRUE).
+    InSubquery {
+        lhs: Box<Expr>,
+        query: Box<QueryExpr>,
+        negated: bool,
+    },
+    /// INTERNAL — never produced by the parser. A subquery folded to a constant by the pre-pass
+    /// (grammar.md §26): the executed value plus its output type (`None` is the untyped-NULL
+    /// type). `resolve` maps it to the matching `RExpr` constant with that EXACT type and NO
+    /// context adaptation (a folded `bigint` stays `bigint`, unlike a bare integer literal).
+    FoldedConst {
+        value: Value,
+        ty: Option<ScalarType>,
     },
 }
 

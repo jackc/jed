@@ -793,7 +793,17 @@ impl Database {
     /// accrued cost. The `&mut self` borrow ends when this returns owned rows, so a caller may
     /// then mutate the store (e.g. `INSERT INTO t SELECT ... FROM t` reads the pre-insert
     /// snapshot, then writes).
-    fn run_select(&mut self, sel: Select, params: &[Value]) -> Result<SelectResult> {
+    fn run_select(&mut self, mut sel: Select, params: &[Value]) -> Result<SelectResult> {
+        // Uncorrelated subquery folding (spec/design/grammar.md §26). Before resolving any clause,
+        // execute each uncorrelated subquery in WHERE / the select list / HAVING / a JOIN ON once
+        // and replace it with a constant (scalar -> its value; EXISTS -> a boolean; IN -> the value
+        // list, or an empty `In` for an empty result). The per-row evaluator is never involved. A
+        // correlated reference or a bind parameter inside a subquery is a 0A000. The subqueries'
+        // accrued cost is added once to this query's cost (cost.md §3).
+        let outer_cols = self.select_rel_cols(&sel);
+        let mut subquery_cost: i64 = 0;
+        self.fold_select_subqueries(&mut sel, &outer_cols, &mut subquery_cost)?;
+
         // Accumulates the inferred type of each `$N` across every clause of this SELECT, then is
         // finalized + bound once all resolution is done (spec/design/api.md §5).
         let mut ptypes = ParamTypes::default();
@@ -1224,8 +1234,263 @@ impl Database {
             column_names,
             column_types,
             rows: out_rows,
-            cost: meter.accrued,
+            // The scan/eval cost plus each uncorrelated subquery's cost, counted once (cost.md §3).
+            cost: meter.accrued + subquery_cost,
         })
+    }
+
+    // ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------
+    //
+    // A pre-pass over `run_select` (before scope/resolution): each scalar / IN / EXISTS subquery
+    // is UNCORRELATED, so it is executed exactly once here and replaced by a constant the ordinary
+    // resolver/evaluator already handles. This keeps the per-row evaluator unchanged and is the
+    // seam the future correlated slice will extend (it would resolve an outer reference against the
+    // outer row instead of rejecting it). A correlated reference or a `$N` inside is a 0A000.
+
+    /// The relation labels and column names a query expression's FROM clause(s) put in scope,
+    /// lower-cased — used by the correlation check (no flat offsets needed). A set operation
+    /// contributes the union of its operands' relations.
+    fn select_rel_cols(&self, sel: &Select) -> RelCols {
+        let mut rc = RelCols::default();
+        self.collect_select_rel_cols(sel, &mut rc);
+        rc
+    }
+
+    fn query_rel_cols(&self, q: &QueryExpr) -> RelCols {
+        let mut rc = RelCols::default();
+        self.collect_query_rel_cols(q, &mut rc);
+        rc
+    }
+
+    fn collect_query_rel_cols(&self, q: &QueryExpr, rc: &mut RelCols) {
+        match q {
+            QueryExpr::Select(s) => self.collect_select_rel_cols(s, rc),
+            QueryExpr::SetOp(so) => {
+                self.collect_query_rel_cols(&so.lhs, rc);
+                self.collect_query_rel_cols(&so.rhs, rc);
+            }
+        }
+    }
+
+    fn collect_select_rel_cols(&self, sel: &Select, rc: &mut RelCols) {
+        for tref in std::iter::once(&sel.from).chain(sel.joins.iter().map(|j| &j.table)) {
+            if let Some(t) = self.table(&tref.name) {
+                let label = tref
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| t.name.clone())
+                    .to_ascii_lowercase();
+                rc.labels.insert(label);
+                for c in &t.columns {
+                    rc.bare.insert(c.name.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+
+    /// Reject the two narrowings before running a subquery (spec/design/grammar.md §26): a bind
+    /// parameter anywhere inside (params are inferred per-SELECT, not shared across scopes), and a
+    /// correlated reference — a direct-clause column that does not resolve against the subquery's
+    /// own FROM but does match an OUTER relation. Both are `0A000`.
+    fn reject_correlation_and_params(&self, inner: &QueryExpr, outer: &RelCols) -> Result<()> {
+        if query_has_param(inner) {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "bind parameters inside a subquery are not supported yet",
+            ));
+        }
+        let inner_cols = self.query_rel_cols(inner);
+        let mut direct: Vec<&Expr> = Vec::new();
+        query_clause_exprs(inner, &mut direct);
+        let mut refs: Vec<(Option<&str>, &str)> = Vec::new();
+        for e in &direct {
+            collect_colrefs(e, &mut refs);
+        }
+        for (qual, name) in refs {
+            let correlated = match qual {
+                Some(q) => {
+                    let q = q.to_ascii_lowercase();
+                    !inner_cols.labels.contains(&q) && outer.labels.contains(&q)
+                }
+                None => {
+                    let n = name.to_ascii_lowercase();
+                    !inner_cols.bare.contains(&n) && outer.bare.contains(&n)
+                }
+            };
+            if correlated {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "correlated subqueries are not supported yet",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold every subquery in a SELECT's clauses (WHERE / select list / HAVING / each JOIN ON).
+    /// GROUP BY and ORDER BY keys are column references only (grammar.md §18), so they cannot hold
+    /// a subquery.
+    fn fold_select_subqueries(
+        &mut self,
+        sel: &mut Select,
+        outer: &RelCols,
+        cost: &mut i64,
+    ) -> Result<()> {
+        if let SelectItems::Items(items) = &mut sel.items {
+            for it in items {
+                self.fold_in_expr(&mut it.expr, outer, cost)?;
+            }
+        }
+        if let Some(f) = &mut sel.filter {
+            self.fold_in_expr(f, outer, cost)?;
+        }
+        if let Some(h) = &mut sel.having {
+            self.fold_in_expr(h, outer, cost)?;
+        }
+        for j in &mut sel.joins {
+            if let Some(on) = &mut j.on {
+                self.fold_in_expr(on, outer, cost)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold this expression node if it is a subquery, else recurse into its children. A subquery's
+    /// own inner expressions are NOT walked here — running it (which recurses into `run_select`)
+    /// folds its internals, so nested subqueries fall out for free.
+    fn fold_in_expr(&mut self, e: &mut Expr, outer: &RelCols, cost: &mut i64) -> Result<()> {
+        match e {
+            Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {
+                let taken = std::mem::replace(e, Expr::Literal(Literal::Null));
+                *e = self.fold_subquery_node(taken, outer, cost)?;
+            }
+            Expr::Cast { inner, .. } => self.fold_in_expr(inner, outer, cost)?,
+            Expr::Unary { operand, .. } => self.fold_in_expr(operand, outer, cost)?,
+            Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+                self.fold_in_expr(lhs, outer, cost)?;
+                self.fold_in_expr(rhs, outer, cost)?;
+            }
+            Expr::IsNull { operand, .. } => self.fold_in_expr(operand, outer, cost)?,
+            Expr::In { lhs, list, .. } => {
+                self.fold_in_expr(lhs, outer, cost)?;
+                for x in list {
+                    self.fold_in_expr(x, outer, cost)?;
+                }
+            }
+            Expr::Between { lhs, lo, hi, .. } => {
+                self.fold_in_expr(lhs, outer, cost)?;
+                self.fold_in_expr(lo, outer, cost)?;
+                self.fold_in_expr(hi, outer, cost)?;
+            }
+            Expr::Like { lhs, rhs, .. } => {
+                self.fold_in_expr(lhs, outer, cost)?;
+                self.fold_in_expr(rhs, outer, cost)?;
+            }
+            Expr::Case {
+                operand,
+                whens,
+                els,
+            } => {
+                if let Some(o) = operand {
+                    self.fold_in_expr(o, outer, cost)?;
+                }
+                for (c, r) in whens {
+                    self.fold_in_expr(c, outer, cost)?;
+                    self.fold_in_expr(r, outer, cost)?;
+                }
+                if let Some(el) = els {
+                    self.fold_in_expr(el, outer, cost)?;
+                }
+            }
+            Expr::FuncCall { args, .. } => {
+                for a in args {
+                    self.fold_in_expr(a, outer, cost)?;
+                }
+            }
+            Expr::Column(_)
+            | Expr::QualifiedColumn { .. }
+            | Expr::Literal(_)
+            | Expr::Param(_)
+            | Expr::FoldedConst { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Execute one subquery node and return the constant `Expr` it folds to (spec/design/grammar.md
+    /// §26). The subquery runs with NO bind parameters (they are rejected inside), so the outer
+    /// statement's `params` are not threaded in.
+    fn fold_subquery_node(&mut self, node: Expr, outer: &RelCols, cost: &mut i64) -> Result<Expr> {
+        match node {
+            Expr::ScalarSubquery(q) => {
+                self.reject_correlation_and_params(&q, outer)?;
+                let r = self.run_query_expr(*q, &[])?;
+                *cost += r.cost;
+                if r.column_types.len() != 1 {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        "subquery must return only one column",
+                    ));
+                }
+                if r.rows.len() > 1 {
+                    return Err(EngineError::new(
+                        SqlState::CardinalityViolation,
+                        "more than one row returned by a subquery used as an expression",
+                    ));
+                }
+                // 0 rows -> a TYPED NULL (the value is NULL, the type is the output column's), so a
+                // cross-family comparison still errors (grammar.md §26).
+                let ty = scalar_type_of(r.column_types[0]);
+                let value = r
+                    .rows
+                    .into_iter()
+                    .next()
+                    .map(|mut row| row.swap_remove(0))
+                    .unwrap_or(Value::Null);
+                Ok(Expr::FoldedConst { value, ty })
+            }
+            Expr::Exists(q) => {
+                self.reject_correlation_and_params(&q, outer)?;
+                let r = self.run_query_expr(*q, &[])?;
+                *cost += r.cost;
+                // EXISTS ignores the select list entirely and is never NULL.
+                Ok(Expr::Literal(Literal::Bool(!r.rows.is_empty())))
+            }
+            Expr::InSubquery {
+                mut lhs,
+                query,
+                negated,
+            } => {
+                // The LHS belongs to the OUTER query — fold any subqueries inside it too.
+                self.fold_in_expr(&mut lhs, outer, cost)?;
+                self.reject_correlation_and_params(&query, outer)?;
+                let r = self.run_query_expr(*query, &[])?;
+                *cost += r.cost;
+                if r.column_types.len() != 1 {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        "subquery has too many columns",
+                    ));
+                }
+                let ty = scalar_type_of(r.column_types[0]);
+                // Non-empty -> the literal-IN OR-chain over the result values (3VL inherited). An
+                // empty result -> an empty `In` that resolves to the constant FALSE (IN) / TRUE
+                // (NOT IN), independent of the LHS value (grammar.md §26).
+                let list: Vec<Expr> = r
+                    .rows
+                    .into_iter()
+                    .map(|mut row| Expr::FoldedConst {
+                        value: row.swap_remove(0),
+                        ty,
+                    })
+                    .collect();
+                Ok(Expr::In {
+                    lhs,
+                    list,
+                    negated,
+                })
+            }
+            _ => unreachable!("fold_subquery_node called on a non-subquery node"),
+        }
     }
 
     /// Shared read access to a table's store (the table is known to exist).
@@ -1755,6 +2020,184 @@ fn expr_has_aggregate(e: &Expr) -> bool {
                     .iter()
                     .any(|(c, r)| expr_has_aggregate(c) || expr_has_aggregate(r))
                 || els.as_deref().is_some_and(expr_has_aggregate)
+        }
+        // A subquery is an independent query: an aggregate INSIDE it does not make the OUTER query
+        // an aggregate query. (And these are folded away by the pre-pass before this runs.) The
+        // pre-pass leaves a `FoldedConst`, a leaf.
+        Expr::ScalarSubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::FoldedConst { .. } => false,
+    }
+}
+
+/// The relation labels and column names a query puts in scope (lower-cased), for the §26
+/// correlation check.
+#[derive(Default)]
+struct RelCols {
+    labels: std::collections::HashSet<String>,
+    bare: std::collections::HashSet<String>,
+}
+
+/// Map a resolved column/output type back to its `ScalarType` (`None` = the untyped-NULL type) —
+/// the inverse of `resolved_type_of`, used to type a folded scalar-subquery constant (§26).
+fn scalar_type_of(rt: ResolvedType) -> Option<ScalarType> {
+    match rt {
+        ResolvedType::Int(st) => Some(st),
+        ResolvedType::Bool => Some(ScalarType::Bool),
+        ResolvedType::Text => Some(ScalarType::Text),
+        ResolvedType::Decimal => Some(ScalarType::Decimal),
+        ResolvedType::Bytea => Some(ScalarType::Bytea),
+        ResolvedType::Uuid => Some(ScalarType::Uuid),
+        ResolvedType::Timestamp => Some(ScalarType::Timestamp),
+        ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
+        ResolvedType::Null => None,
+    }
+}
+
+/// Build the constant `RExpr` for a folded subquery value (§26). The static type is carried
+/// separately (the node's `ty`), so a NULL value here is just `ConstNull`.
+fn value_to_rexpr(v: &Value) -> RExpr {
+    match v {
+        Value::Null => RExpr::ConstNull,
+        Value::Int(n) => RExpr::ConstInt(*n),
+        Value::Bool(b) => RExpr::ConstBool(*b),
+        Value::Text(s) => RExpr::ConstText(s.clone()),
+        Value::Decimal(d) => RExpr::ConstDecimal(d.clone()),
+        Value::Bytea(b) => RExpr::ConstBytea(b.clone()),
+        Value::Uuid(u) => RExpr::ConstUuid(*u),
+        Value::Timestamp(m) => RExpr::ConstTimestamp(*m),
+        Value::Timestamptz(m) => RExpr::ConstTimestamptz(*m),
+    }
+}
+
+/// Collect a query's direct-clause expressions (select list / WHERE / HAVING / each JOIN ON) for
+/// the §26 correlation scan — NOT descending into nested subqueries (those are folded separately).
+/// A set operation contributes both operands' clauses.
+fn query_clause_exprs<'a>(q: &'a QueryExpr, out: &mut Vec<&'a Expr>) {
+    match q {
+        QueryExpr::Select(s) => select_clause_exprs(s, out),
+        QueryExpr::SetOp(so) => {
+            query_clause_exprs(&so.lhs, out);
+            query_clause_exprs(&so.rhs, out);
+        }
+    }
+}
+
+fn select_clause_exprs<'a>(s: &'a Select, out: &mut Vec<&'a Expr>) {
+    if let SelectItems::Items(items) = &s.items {
+        for it in items {
+            out.push(&it.expr);
+        }
+    }
+    if let Some(f) = &s.filter {
+        out.push(f);
+    }
+    if let Some(h) = &s.having {
+        out.push(h);
+    }
+    for j in &s.joins {
+        if let Some(on) = &j.on {
+            out.push(on);
+        }
+    }
+}
+
+/// Whether an expression tree contains a bind parameter anywhere — INCLUDING inside nested
+/// subqueries (a `$N` at any depth inside a subquery is rejected, §26).
+fn expr_has_param(e: &Expr) -> bool {
+    match e {
+        Expr::Param(_) => true,
+        Expr::ScalarSubquery(q) | Expr::Exists(q) => query_has_param(q),
+        Expr::InSubquery { lhs, query, .. } => expr_has_param(lhs) || query_has_param(query),
+        Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::FoldedConst { .. } => false,
+        Expr::Cast { inner, .. } => expr_has_param(inner),
+        Expr::Unary { operand, .. } => expr_has_param(operand),
+        Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+            expr_has_param(lhs) || expr_has_param(rhs)
+        }
+        Expr::IsNull { operand, .. } => expr_has_param(operand),
+        Expr::In { lhs, list, .. } => expr_has_param(lhs) || list.iter().any(expr_has_param),
+        Expr::Between { lhs, lo, hi, .. } => {
+            expr_has_param(lhs) || expr_has_param(lo) || expr_has_param(hi)
+        }
+        Expr::Like { lhs, rhs, .. } => expr_has_param(lhs) || expr_has_param(rhs),
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            operand.as_deref().is_some_and(expr_has_param)
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_has_param(c) || expr_has_param(r))
+                || els.as_deref().is_some_and(expr_has_param)
+        }
+        Expr::FuncCall { args, .. } => args.iter().any(expr_has_param),
+    }
+}
+
+fn query_has_param(q: &QueryExpr) -> bool {
+    let mut exprs: Vec<&Expr> = Vec::new();
+    query_clause_exprs(q, &mut exprs);
+    exprs.iter().any(|e| expr_has_param(e))
+}
+
+/// Collect every column reference `(qualifier, name)` in an expression for the §26 correlation
+/// scan — NOT descending into nested subqueries (a deeper subquery's references are its own
+/// concern, checked when it is folded). The IN-subquery's LHS IS at this level, so it is walked.
+fn collect_colrefs<'a>(e: &'a Expr, out: &mut Vec<(Option<&'a str>, &'a str)>) {
+    match e {
+        Expr::Column(n) => out.push((None, n)),
+        Expr::QualifiedColumn { qualifier, name } => out.push((Some(qualifier), name)),
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => {}
+        Expr::InSubquery { lhs, .. } => collect_colrefs(lhs, out),
+        Expr::Literal(_) | Expr::Param(_) | Expr::FoldedConst { .. } => {}
+        Expr::Cast { inner, .. } => collect_colrefs(inner, out),
+        Expr::Unary { operand, .. } => collect_colrefs(operand, out),
+        Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+            collect_colrefs(lhs, out);
+            collect_colrefs(rhs, out);
+        }
+        Expr::IsNull { operand, .. } => collect_colrefs(operand, out),
+        Expr::In { lhs, list, .. } => {
+            collect_colrefs(lhs, out);
+            for x in list {
+                collect_colrefs(x, out);
+            }
+        }
+        Expr::Between { lhs, lo, hi, .. } => {
+            collect_colrefs(lhs, out);
+            collect_colrefs(lo, out);
+            collect_colrefs(hi, out);
+        }
+        Expr::Like { lhs, rhs, .. } => {
+            collect_colrefs(lhs, out);
+            collect_colrefs(rhs, out);
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            if let Some(o) = operand {
+                collect_colrefs(o, out);
+            }
+            for (c, r) in whens {
+                collect_colrefs(c, out);
+                collect_colrefs(r, out);
+            }
+            if let Some(el) = els {
+                collect_colrefs(el, out);
+            }
+        }
+        Expr::FuncCall { args, .. } => {
+            for a in args {
+                collect_colrefs(a, out);
+            }
         }
     }
 }
@@ -2307,6 +2750,27 @@ fn resolve(
             let d = d.clone().check_cap()?;
             Ok((RExpr::ConstDecimal(d), ResolvedType::Decimal))
         }
+        Expr::FoldedConst { value, ty } => {
+            // A subquery already executed + folded by the pre-pass (grammar.md §26). It resolves to
+            // the matching constant with its EXACT output type (`None` = untyped NULL) — NO context
+            // adaptation, so a folded `bigint` keeps `bigint` (unlike a bare integer literal) and a
+            // typed-NULL from an empty scalar still participates in cross-type checks.
+            let rty = match ty {
+                Some(st) => resolved_type_of(*st),
+                None => ResolvedType::Null,
+            };
+            Ok((value_to_rexpr(value), rty))
+        }
+        // A subquery in expression position is folded by `run_select`'s pre-pass before resolution
+        // (grammar.md §26), so resolve never sees one inside a SELECT. Reaching here means a
+        // subquery in a non-SELECT context (an UPDATE SET / INSERT VALUES / DELETE WHERE
+        // expression, which run no fold pre-pass) — supported only in SELECT this slice (0A000).
+        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => Err(
+            EngineError::new(
+                SqlState::FeatureNotSupported,
+                "subqueries are only supported in a SELECT statement",
+            ),
+        ),
         Expr::Cast {
             inner,
             type_name,
@@ -2476,6 +2940,15 @@ fn resolve(
         }
         Expr::Binary { op, lhs, rhs } => resolve_binary(scope, *op, lhs, rhs, agg, params),
         Expr::In { lhs, list, negated } => {
+            // An EMPTY list reaches here only from folding an IN-subquery whose result was empty
+            // (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant
+            // — `x IN (empty)` = FALSE, `x NOT IN (empty)` = TRUE — for every x including NULL.
+            // Still resolve the LHS so an undefined column / aggregate-context error fires, then
+            // return the constant (a leaf — no operator_eval, cost.md §3).
+            if list.is_empty() {
+                let _ = resolve(scope, lhs, None, agg, params)?;
+                return Ok((RExpr::ConstBool(*negated), ResolvedType::Bool));
+            }
             // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` ≡
             // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list
             // is non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree

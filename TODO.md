@@ -462,7 +462,33 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         pinned by `spec/conformance/suites/joins/{left,right,full}.test`; semantics documented in
         [grammar.md §15](spec/design/grammar.md). `USING` / `NATURAL` / comma-`FROM` / `t.*` stay
         deferred. _(was: M; deps: INNER/CROSS slice)_
-- [ ] **Subqueries** — scalar, `IN (subquery)`, `EXISTS`, then correlated. _(size: L; deps: joins)_
+- [x] **Subqueries (uncorrelated)** — done & committed across Rust/Go/TS: a **scalar**
+      `(SELECT …)` in expression position, `x [NOT] IN (SELECT …)`, and `[NOT] EXISTS (SELECT …)`.
+      The key move is **plan-time folding** ([grammar.md §26](spec/design/grammar.md)): because an
+      uncorrelated subquery's result is independent of any outer row, a **pre-pass at the top of
+      `run_select`** (before scope/resolution, where the db is already in hand) executes each
+      subquery **exactly once** and replaces it with a constant the ordinary resolver/evaluator
+      already handle — **the per-row expression evaluator is untouched** (the whole reason the slice
+      is small, and the seam the correlated half will extend). Fold rules: scalar → a `FoldedConst`
+      carrying the value **and its output type** (so it promotes/compares like that type; 0 rows → a
+      **typed** NULL, >1 row → **`21000`** cardinality_violation [new error, class 21], >1 col →
+      `42601`); EXISTS → a boolean literal `(rows>0)` (select list ignored, never NULL); IN → the
+      literal-`IN` OR-chain over the result values (3VL inherited verbatim), an **empty** result →
+      an empty `In` that resolves to constant FALSE/TRUE. **Cost** = the enclosing query's cost **+**
+      each subquery's cost counted **once** (the folded constant is a leaf — no `operator_eval`;
+      mirrors the set-op / `INSERT … SELECT` precedent, [cost.md §3](spec/design/cost.md)). New
+      capabilities `query.subquery_scalar` / `query.subquery_in` / `query.subquery_exists` + the
+      `subqueries` profile in [manifest.toml](spec/conformance/manifest.toml), pinned by
+      `spec/conformance/suites/subquery/{scalar,in,exists,errors}.test` (64/0/0 all cores,
+      byte-identical incl. cost). Semantics verified against the live `postgres:18` oracle.
+      **Deferred narrowings (each → `0A000`, relaxable):** a **correlated** reference (a subquery
+      column resolving to an outer relation, bare or qualified) and a **bind parameter `$N` inside**
+      a subquery; subqueries are **SELECT-only** for now (one in an UPDATE/INSERT/DELETE expression is
+      `0A000`). _(was: L; deps: joins)_
+  - [ ] **Correlated subqueries** — the next half: thread the executor + the outer row through the
+        expression evaluator (turning the §26 correlation *detection* into real outer-row resolution),
+        so a subquery re-evaluates per outer row. **Derived tables** (`FROM (SELECT …) AS t`),
+        **`ANY`/`ALL`**, and row-valued subqueries remain separate later slices. _(size: L)_
 - [x] **Set operations** — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` — done & committed across
       Rust/Go/TS. The top-level query grew from a single `select` to a **query expression**
       (`query_expr ::= set_expr order_by? limit_offset?`): a two-level precedence tree

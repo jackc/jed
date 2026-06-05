@@ -999,3 +999,65 @@ is exact and identical across cores regardless.
 - **No set operation in an `INSERT … SELECT` source** (§24) — the source stays a single `select`.
 
 **Cost** is `lhs + rhs`, the combine itself unmetered — see [cost.md](cost.md) §3.
+
+## 26. Uncorrelated subqueries (scalar / `IN` / `EXISTS`)
+
+A **subquery** is a parenthesized `query_expr` (a `SELECT`, or a set operation — §25) used
+inside an expression. This slice implements the three **uncorrelated** forms; correlated
+subqueries (a subquery referencing an outer-query column) are the next slice.
+
+- **Scalar subquery** — `( query_expr )` in expression position, anywhere a `primary` is
+  allowed: `WHERE x = (SELECT max(id) FROM t)`, in the select list, or nested in a larger
+  expression `(SELECT …) + 1`. It yields the value of the subquery's single row and single
+  column.
+- **`x [NOT] IN ( query_expr )`** — membership of `x` in the subquery's single output column.
+- **`[NOT] EXISTS ( query_expr )`** — whether the subquery produces at least one row.
+
+**Disambiguation.** A `(` that begins a `primary` starts a scalar subquery when the next token
+is `SELECT`, otherwise a parenthesized expression. `IN (` likewise: a leading `SELECT` is the
+IN-subquery, otherwise the §20 value list. `EXISTS` is a keyword prefix taking `( query_expr )`.
+Because the operand is a full `query_expr`, `IN (SELECT … UNION …)` and `EXISTS (… INTERSECT …)`
+parse.
+
+### Evaluation model — execute once, fold to a constant
+
+An uncorrelated subquery's result does **not** depend on any outer row, so the engine executes
+it **exactly once**, at plan setup (before the outer scan), and folds it into a constant the
+ordinary evaluator already handles. This is observably identical to PostgreSQL (where a single
+execution and per-row re-execution agree precisely because there is no correlation), and it keeps
+the per-row expression evaluator unchanged.
+
+- **Scalar** — the subquery must produce **exactly one column** (else `42601`, "subquery must
+  return only one column") and **at most one row** (more than one → **`21000`**,
+  cardinality_violation). **Zero** rows → a **typed NULL** (the value is NULL but the type is the
+  subquery's output-column type, so `1 = (SELECT 'x' WHERE false)` is still a type error, not
+  NULL). The folded constant carries the subquery's resolved output type, so it participates in
+  cross-type comparison/promotion exactly as a column of that type would (`int = (SELECT bigint)`
+  → `bigint`).
+- **`IN`** — the subquery must produce **exactly one column** (else `42601`, "subquery has too
+  many columns"). A **non-empty** result folds to the same OR-chain `x IN (v1, v2, …)` desugars
+  to (§20), so the three-valued NULL semantics are inherited verbatim: a NULL in the result with
+  no positive match yields NULL (unknown), not FALSE. An **empty** result folds directly to
+  `FALSE` (`IN`) / `TRUE` (`NOT IN`), **regardless of whether `x` is NULL** — there is no list,
+  so the OR-chain is not used.
+- **`EXISTS`** — folds to the boolean `(rows > 0)` XOR the `NOT`. The select list is **ignored
+  entirely** (`EXISTS (SELECT 1, 2, 3)` and `EXISTS (SELECT *)` are both legal — column count and
+  types are irrelevant), and the result is **never NULL**.
+
+**Cost** is the enclosing query's own cost **plus** each subquery's cost, counted **once** (the
+subquery ran once). The folded constant is a leaf and charges no `operator_eval` —
+see [cost.md](cost.md) §3.
+
+### Deferred narrowings (each relaxable later)
+
+- **Correlated subqueries** — a reference to an **outer-query** column inside the subquery (bare
+  or qualified) is **`0A000`** ("correlated subqueries are not supported yet"). This is the seam
+  the next slice turns into real outer-row resolution.
+- **Bind parameters inside a subquery** — a `$N` anywhere inside the subquery is **`0A000`**
+  (parameter type inference is per-`SELECT`; sharing a `$N` across the outer and subquery scopes
+  is not yet supported).
+- **Derived tables** — `FROM ( query_expr ) AS t` (a subquery as a relation) is a separate later
+  slice; it is not part of this one.
+- **`ANY` / `ALL`** and **row-valued** subqueries are not implemented.
+- **Subqueries in `GROUP BY`** are not reachable — a `GROUP BY` key is grammatically a
+  `column_ref` only (§18), so `(SELECT …)` there is a `42601` syntax error by the existing rule.

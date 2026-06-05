@@ -328,6 +328,17 @@ class Parser {
     return { ...node, orderBy, limit, offset };
   }
 
+  // parseSubquery parses a parenthesized subquery's inner query_expr (grammar.md §26): a full
+  // set-expression plus an optional trailing ORDER BY / LIMIT / OFFSET folded onto the node.
+  // Mirrors parseQueryExpr but yields a QueryExpr. The caller has consumed the opening "(" and
+  // consumes the closing ")".
+  private parseSubquery(): QueryExpr {
+    const node = this.parseSetExpr();
+    const orderBy = this.parseOrderBy();
+    const { limit, offset } = this.parseLimitOffsetClauses();
+    return { ...node, orderBy, limit, offset };
+  }
+
   // parseSetExpr parses the lower-precedence, left-associative UNION/EXCEPT level. INTERSECT binds
   // tighter (parsed inside parseIntersectExpr), so `a UNION b INTERSECT c` becomes
   // `a UNION (b INTERSECT c)`.
@@ -787,7 +798,13 @@ class Parser {
     if (this.peekKeyword() === "in") {
       this.advance();
       this.expect("lparen");
-      // A non-empty value list (`IN ()` — parseAdditive on `)` is a 42601 syntax error).
+      // `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by a
+      // leading `SELECT`; otherwise a non-empty value list (`IN ()` is a 42601 syntax error).
+      if (this.peekKeyword() === "select") {
+        const query = this.parseSubquery();
+        this.expect("rparen");
+        return { kind: "inSubquery", lhs, query, negated: predNegated };
+      }
       const list = [this.parseAdditive()];
       while (this.peek().kind === "comma") {
         this.advance();
@@ -885,9 +902,29 @@ class Parser {
   private parsePrimary(): Expr {
     if (this.peek().kind === "lparen") {
       this.advance();
+      // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading `SELECT`
+      // after the `(`; otherwise this is a parenthesized expression.
+      if (this.peekKeyword() === "select") {
+        const query = this.parseSubquery();
+        this.expect("rparen");
+        return { kind: "scalarSubquery", query };
+      }
       const e = this.parseExpr();
       this.expect("rparen");
       return e;
+    }
+    // `EXISTS ( SELECT ... )` — the existence predicate (grammar.md §26). Recognized only when an
+    // open-paren + `SELECT` follows, so `exists` stays usable as a column / function name.
+    if (
+      this.peekKeyword() === "exists" &&
+      this.tokens[this.pos + 1]?.kind === "lparen" &&
+      this.peekKeywordAt(2) === "select"
+    ) {
+      this.advance(); // EXISTS
+      this.expect("lparen");
+      const query = this.parseSubquery();
+      this.expect("rparen");
+      return { kind: "exists", query };
     }
     if (this.peekKeyword() === "cast") {
       this.advance();

@@ -617,6 +617,16 @@ export class Database {
   // resolved TYPE (the types let INSERT ... SELECT gate assignability up front — §24) and the
   // accrued cost.
   private runSelect(sel: Select, params: Value[]): SelectResult {
+    // Uncorrelated subquery folding (spec/design/grammar.md §26). Before resolving any clause,
+    // execute each uncorrelated subquery in WHERE / the select list / HAVING / a JOIN ON once and
+    // replace it with a constant (scalar -> its value; EXISTS -> a boolean; IN -> the value list,
+    // or an empty "in" for an empty result). The per-row evaluator is never involved. A correlated
+    // reference or a bind parameter inside a subquery is a 0A000. The subqueries' accrued cost is
+    // added once to this query's cost (cost.md §3).
+    const outerCols = this.selectRelCols(sel);
+    const subqueryCost = { value: 0n };
+    this.foldSelectSubqueries(sel, outerCols, subqueryCost);
+
     // Accumulates the inferred type of each $N across every clause of this SELECT, then is
     // finalized + bound once all resolution is done (spec/design/api.md §5).
     const ptypes = new ParamTypes();
@@ -915,7 +925,356 @@ export class Database {
         return projections.map((p) => evalExpr(p, row, bound, meter));
       });
     }
-    return { columnNames, columnTypes, rows: out, cost: meter.accrued };
+    // The scan/eval cost plus each uncorrelated subquery's cost, counted once (cost.md §3).
+    return { columnNames, columnTypes, rows: out, cost: meter.accrued + subqueryCost.value };
+  }
+
+  // ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------
+  //
+  // A pre-pass over runSelect (before scope/resolution): each scalar / IN / EXISTS subquery is
+  // UNCORRELATED, so it is executed exactly once here and replaced by a constant the ordinary
+  // resolver/evaluator already handles. This keeps the per-row evaluator unchanged and is the seam
+  // the future correlated slice will extend. A correlated reference or a `$N` inside is a 0A000.
+
+  private selectRelCols(sel: Select): RelCols {
+    const rc: RelCols = { labels: new Set(), bare: new Set() };
+    this.collectSelectRelCols(sel, rc);
+    return rc;
+  }
+
+  private queryRelCols(q: QueryExpr): RelCols {
+    const rc: RelCols = { labels: new Set(), bare: new Set() };
+    this.collectQueryRelCols(q, rc);
+    return rc;
+  }
+
+  private collectQueryRelCols(q: QueryExpr, rc: RelCols): void {
+    if (q.kind === "select") {
+      this.collectSelectRelCols(q, rc);
+      return;
+    }
+    this.collectQueryRelCols(q.lhs, rc);
+    this.collectQueryRelCols(q.rhs, rc);
+  }
+
+  private collectSelectRelCols(sel: Select, rc: RelCols): void {
+    for (const tref of [sel.from, ...sel.joins.map((j) => j.table)]) {
+      const t = this.table(tref.name);
+      if (!t) continue;
+      rc.labels.add((tref.alias ?? t.name).toLowerCase());
+      for (const c of t.columns) rc.bare.add(c.name.toLowerCase());
+    }
+  }
+
+  // rejectCorrelationAndParams rejects the two narrowings before running a subquery (grammar.md
+  // §26): a bind parameter anywhere inside, and a correlated reference — a direct-clause column
+  // that does not resolve against the subquery's own FROM but does match an OUTER relation. Both
+  // are 0A000.
+  private rejectCorrelationAndParams(inner: QueryExpr, outer: RelCols): void {
+    if (queryHasParam(inner)) {
+      throw engineError("feature_not_supported", "bind parameters inside a subquery are not supported yet");
+    }
+    const innerCols = this.queryRelCols(inner);
+    const refs: { q: string | null; name: string }[] = [];
+    for (const e of queryClauseExprs(inner)) collectColRefs(e, refs);
+    for (const r of refs) {
+      const correlated =
+        r.q !== null
+          ? !innerCols.labels.has(r.q.toLowerCase()) && outer.labels.has(r.q.toLowerCase())
+          : !innerCols.bare.has(r.name.toLowerCase()) && outer.bare.has(r.name.toLowerCase());
+      if (correlated) {
+        throw engineError("feature_not_supported", "correlated subqueries are not supported yet");
+      }
+    }
+  }
+
+  // foldSelectSubqueries folds every subquery in a SELECT's clauses (WHERE / select list / HAVING /
+  // each JOIN ON). GROUP BY and ORDER BY keys are column references only (grammar.md §18).
+  private foldSelectSubqueries(sel: Select, outer: RelCols, cost: { value: bigint }): void {
+    if (sel.items.kind === "list") {
+      for (const it of sel.items.items) it.expr = this.foldInExpr(it.expr, outer, cost);
+    }
+    if (sel.filter !== null) sel.filter = this.foldInExpr(sel.filter, outer, cost);
+    if (sel.having !== null) sel.having = this.foldInExpr(sel.having, outer, cost);
+    for (const j of sel.joins) if (j.on !== null) j.on = this.foldInExpr(j.on, outer, cost);
+  }
+
+  // foldInExpr folds this expression node if it is a subquery, else recurses into its children
+  // (rewriting them in place) and returns the node. A subquery's own inner expressions are NOT
+  // walked — running it (which recurses into runSelect) folds its internals, so nested subqueries
+  // fall out for free.
+  private foldInExpr(e: Expr, outer: RelCols, cost: { value: bigint }): Expr {
+    switch (e.kind) {
+      case "scalarSubquery":
+      case "exists":
+      case "inSubquery":
+        return this.foldSubqueryNode(e, outer, cost);
+      case "cast":
+        e.inner = this.foldInExpr(e.inner, outer, cost);
+        return e;
+      case "unary":
+        e.operand = this.foldInExpr(e.operand, outer, cost);
+        return e;
+      case "binary":
+        e.lhs = this.foldInExpr(e.lhs, outer, cost);
+        e.rhs = this.foldInExpr(e.rhs, outer, cost);
+        return e;
+      case "isNull":
+        e.operand = this.foldInExpr(e.operand, outer, cost);
+        return e;
+      case "isDistinct":
+        e.lhs = this.foldInExpr(e.lhs, outer, cost);
+        e.rhs = this.foldInExpr(e.rhs, outer, cost);
+        return e;
+      case "in":
+        e.lhs = this.foldInExpr(e.lhs, outer, cost);
+        e.list = e.list.map((x) => this.foldInExpr(x, outer, cost));
+        return e;
+      case "between":
+        e.lhs = this.foldInExpr(e.lhs, outer, cost);
+        e.lo = this.foldInExpr(e.lo, outer, cost);
+        e.hi = this.foldInExpr(e.hi, outer, cost);
+        return e;
+      case "like":
+        e.lhs = this.foldInExpr(e.lhs, outer, cost);
+        e.rhs = this.foldInExpr(e.rhs, outer, cost);
+        return e;
+      case "case":
+        if (e.operand !== null) e.operand = this.foldInExpr(e.operand, outer, cost);
+        for (const w of e.whens) {
+          w.cond = this.foldInExpr(w.cond, outer, cost);
+          w.result = this.foldInExpr(w.result, outer, cost);
+        }
+        if (e.els !== null) e.els = this.foldInExpr(e.els, outer, cost);
+        return e;
+      case "funcCall":
+        e.args = e.args.map((a) => this.foldInExpr(a, outer, cost));
+        return e;
+      default:
+        return e; // column, qualifiedColumn, literal, param, foldedConst
+    }
+  }
+
+  // foldSubqueryNode executes one subquery node and returns the constant Expr it folds to
+  // (grammar.md §26). The subquery runs with NO bind parameters (they are rejected inside).
+  private foldSubqueryNode(
+    node: Extract<Expr, { kind: "scalarSubquery" | "exists" | "inSubquery" }>,
+    outer: RelCols,
+    cost: { value: bigint },
+  ): Expr {
+    if (node.kind === "scalarSubquery") {
+      this.rejectCorrelationAndParams(node.query, outer);
+      const r = this.runQueryExpr(node.query, []);
+      cost.value += r.cost;
+      if (r.columnTypes.length !== 1) throw engineError("syntax_error", "subquery must return only one column");
+      if (r.rows.length > 1) {
+        throw engineError("cardinality_violation", "more than one row returned by a subquery used as an expression");
+      }
+      // 0 rows -> a TYPED NULL (value NULL, type the output column's), so a cross-family
+      // comparison still errors (grammar.md §26).
+      const type = scalarTypeOf(r.columnTypes[0]!);
+      const value: Value = r.rows.length === 1 ? r.rows[0]![0]! : { kind: "null" };
+      return { kind: "foldedConst", value, type };
+    }
+    if (node.kind === "exists") {
+      this.rejectCorrelationAndParams(node.query, outer);
+      const r = this.runQueryExpr(node.query, []);
+      cost.value += r.cost;
+      // EXISTS ignores the select list entirely and is never NULL.
+      return { kind: "literal", literal: { kind: "bool", value: r.rows.length > 0 } };
+    }
+    // inSubquery: the LHS belongs to the OUTER query — fold any subqueries inside it too.
+    const lhs = this.foldInExpr(node.lhs, outer, cost);
+    this.rejectCorrelationAndParams(node.query, outer);
+    const r = this.runQueryExpr(node.query, []);
+    cost.value += r.cost;
+    if (r.columnTypes.length !== 1) throw engineError("syntax_error", "subquery has too many columns");
+    const type = scalarTypeOf(r.columnTypes[0]!);
+    // Non-empty -> the literal-IN OR-chain over the result values (3VL inherited). An empty result
+    // -> an empty "in" that resolves to the constant FALSE (IN) / TRUE (NOT IN), independent of the
+    // LHS value (grammar.md §26).
+    const list: Expr[] = r.rows.map((row): Expr => ({ kind: "foldedConst", value: row[0]!, type }));
+    return { kind: "in", lhs, list, negated: node.negated };
+  }
+}
+
+// ---- Uncorrelated subquery folding helpers (spec/design/grammar.md §26) ----------------------
+
+// RelCols holds the relation labels and column names a query puts in scope (lower-cased), for the
+// §26 correlation check.
+type RelCols = { labels: Set<string>; bare: Set<string> };
+
+// scalarTypeOf maps a resolved column/output type back to its ScalarType (null = the untyped-NULL
+// type) — used to type a folded scalar-subquery constant (§26).
+function scalarTypeOf(rt: ResolvedType): ScalarType | null {
+  switch (rt.kind) {
+    case "int":
+      return rt.ty;
+    case "bool":
+      return "boolean";
+    case "text":
+      return "text";
+    case "decimal":
+      return "decimal";
+    case "bytea":
+      return "bytea";
+    case "uuid":
+      return "uuid";
+    case "timestamp":
+      return "timestamp";
+    case "timestamptz":
+      return "timestamptz";
+    default:
+      return null; // "null"
+  }
+}
+
+// valueToRExpr builds the constant rExpr for a folded subquery value (§26). The static type is
+// carried separately (the node's type), so a NULL value here is just constNull.
+function valueToRExpr(v: Value): RExpr {
+  switch (v.kind) {
+    case "int":
+      return { kind: "constInt", value: v.int };
+    case "bool":
+      return { kind: "constBool", value: v.value };
+    case "text":
+      return { kind: "constText", value: v.text };
+    case "decimal":
+      return { kind: "constDecimal", value: v.dec };
+    case "bytea":
+      return { kind: "constBytea", value: v.bytes };
+    case "uuid":
+      return { kind: "constUuid", value: v.bytes };
+    case "timestamp":
+      return { kind: "constTimestamp", value: v.micros };
+    case "timestamptz":
+      return { kind: "constTimestamptz", value: v.micros };
+    default:
+      return { kind: "constNull" };
+  }
+}
+
+// queryClauseExprs collects a query's direct-clause expressions (select list / WHERE / HAVING /
+// each JOIN ON) for the §26 correlation scan — NOT descending into nested subqueries. A set
+// operation contributes both operands' clauses.
+function queryClauseExprs(q: QueryExpr): Expr[] {
+  const out: Expr[] = [];
+  collectQueryClauseExprs(q, out);
+  return out;
+}
+
+function collectQueryClauseExprs(q: QueryExpr, out: Expr[]): void {
+  if (q.kind === "select") {
+    if (q.items.kind === "list") for (const it of q.items.items) out.push(it.expr);
+    if (q.filter !== null) out.push(q.filter);
+    if (q.having !== null) out.push(q.having);
+    for (const j of q.joins) if (j.on !== null) out.push(j.on);
+    return;
+  }
+  collectQueryClauseExprs(q.lhs, out);
+  collectQueryClauseExprs(q.rhs, out);
+}
+
+// exprHasParam reports whether an expression tree contains a bind parameter anywhere — INCLUDING
+// inside nested subqueries (a $N at any depth inside a subquery is rejected, §26).
+function exprHasParam(e: Expr): boolean {
+  switch (e.kind) {
+    case "param":
+      return true;
+    case "scalarSubquery":
+    case "exists":
+      return queryHasParam(e.query);
+    case "inSubquery":
+      return exprHasParam(e.lhs) || queryHasParam(e.query);
+    case "cast":
+      return exprHasParam(e.inner);
+    case "unary":
+      return exprHasParam(e.operand);
+    case "binary":
+    case "isDistinct":
+      return exprHasParam(e.lhs) || exprHasParam(e.rhs);
+    case "isNull":
+      return exprHasParam(e.operand);
+    case "in":
+      return exprHasParam(e.lhs) || e.list.some(exprHasParam);
+    case "between":
+      return exprHasParam(e.lhs) || exprHasParam(e.lo) || exprHasParam(e.hi);
+    case "like":
+      return exprHasParam(e.lhs) || exprHasParam(e.rhs);
+    case "case":
+      return (
+        (e.operand !== null && exprHasParam(e.operand)) ||
+        e.whens.some((w) => exprHasParam(w.cond) || exprHasParam(w.result)) ||
+        (e.els !== null && exprHasParam(e.els))
+      );
+    case "funcCall":
+      return e.args.some(exprHasParam);
+    default:
+      return false;
+  }
+}
+
+function queryHasParam(q: QueryExpr): boolean {
+  return queryClauseExprs(q).some(exprHasParam);
+}
+
+// collectColRefs collects every column reference in an expression for the §26 correlation scan —
+// NOT descending into nested subqueries (a deeper subquery's references are its own concern). The
+// IN-subquery's LHS IS at this level, so it is walked.
+function collectColRefs(e: Expr, out: { q: string | null; name: string }[]): void {
+  switch (e.kind) {
+    case "column":
+      out.push({ q: null, name: e.name });
+      return;
+    case "qualifiedColumn":
+      out.push({ q: e.qualifier, name: e.name });
+      return;
+    case "inSubquery":
+      collectColRefs(e.lhs, out);
+      return;
+    case "scalarSubquery":
+    case "exists":
+      return;
+    case "cast":
+      collectColRefs(e.inner, out);
+      return;
+    case "unary":
+      collectColRefs(e.operand, out);
+      return;
+    case "binary":
+    case "isDistinct":
+      collectColRefs(e.lhs, out);
+      collectColRefs(e.rhs, out);
+      return;
+    case "isNull":
+      collectColRefs(e.operand, out);
+      return;
+    case "in":
+      collectColRefs(e.lhs, out);
+      for (const x of e.list) collectColRefs(x, out);
+      return;
+    case "between":
+      collectColRefs(e.lhs, out);
+      collectColRefs(e.lo, out);
+      collectColRefs(e.hi, out);
+      return;
+    case "like":
+      collectColRefs(e.lhs, out);
+      collectColRefs(e.rhs, out);
+      return;
+    case "case":
+      if (e.operand !== null) collectColRefs(e.operand, out);
+      for (const w of e.whens) {
+        collectColRefs(w.cond, out);
+        collectColRefs(w.result, out);
+      }
+      if (e.els !== null) collectColRefs(e.els, out);
+      return;
+    case "funcCall":
+      for (const a of e.args) collectColRefs(a, out);
+      return;
+    default:
+      return; // literal, param, foldedConst
   }
 }
 
@@ -1698,6 +2057,21 @@ function resolve(
           return { node: { kind: "constInt", value: e.literal.int }, type: { kind: "int", ty } };
         }
       }
+    case "foldedConst": {
+      // A subquery already executed + folded by the pre-pass (grammar.md §26). It resolves to the
+      // matching constant with its EXACT output type (null = untyped NULL) — NO context adaptation,
+      // so a folded bigint keeps bigint (unlike a bare integer literal) and a typed-NULL from an
+      // empty scalar still participates in cross-type checks.
+      const type: ResolvedType = e.type !== null ? resolvedTypeOf(e.type) : { kind: "null" };
+      return { node: valueToRExpr(e.value), type };
+    }
+    case "scalarSubquery":
+    case "exists":
+    case "inSubquery":
+      // Folded by runSelect's pre-pass before resolution (grammar.md §26), so resolve never sees
+      // one inside a SELECT. Reaching here means a subquery in a non-SELECT context (an UPDATE SET
+      // / INSERT VALUES / DELETE WHERE expression, which run no fold pre-pass) — SELECT only.
+      throw engineError("feature_not_supported", "subqueries are only supported in a SELECT statement");
     case "cast": {
       const [target, typmod] = resolveTypeAndTypmod(e.typeName, e.typeMod);
       // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
@@ -1781,6 +2155,15 @@ function resolve(
     case "binary":
       return resolveBinary(scope, e.op, e.lhs, e.rhs, ag, params);
     case "in": {
+      // An EMPTY list reaches here only from folding an IN-subquery whose result was empty
+      // (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant —
+      // `x IN (empty)` = FALSE, `x NOT IN (empty)` = TRUE — for every x including NULL. Still
+      // resolve the LHS so an undefined column / aggregate-context error fires, then return the
+      // constant (a leaf — no operator_eval, cost.md §3).
+      if (e.list.length === 0) {
+        resolve(scope, e.lhs, null, ag, params);
+        return { node: { kind: "constBool", value: e.negated }, type: { kind: "bool" } };
+      }
       // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` is
       // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list is
       // non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree reuses the

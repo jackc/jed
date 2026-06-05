@@ -1,0 +1,73 @@
+# Uncorrelated `x [NOT] IN ( SELECT … )` (spec/design/grammar.md §26). The subquery's single
+# column is executed once and folded into the literal-IN OR-chain (§20), so the three-valued NULL
+# semantics are inherited verbatim: a NULL in the result with no positive match yields NULL, not
+# FALSE. An EMPTY result folds to FALSE (IN) / TRUE (NOT IN), independent of the LHS (even NULL). A
+# >1-column subquery is 42601 (see errors.test). Verified against the live PostgreSQL 18 oracle.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, expr.in_list, expr.comparison_value, query.subquery_in, types.int32, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE vals (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)
+
+statement ok
+INSERT INTO vals VALUES (1, 10), (2, NULL)
+
+# a.k {10,20,30} that are also in b.k {20,30,40}: 20,30 -> ids 2,3.
+query I nosort
+SELECT id FROM a WHERE k IN (SELECT k FROM b) ORDER BY id
+----
+2
+3
+
+# NOT IN is the complement (no NULLs in b.k, so it is a clean negation): only id 1 (k=10).
+query I nosort
+SELECT id FROM a WHERE k NOT IN (SELECT k FROM b) ORDER BY id
+----
+1
+
+# IN as a projected boolean: a.k 10 not in {20,30,40} -> false; 20,30 -> true.
+# names: ?column?
+query B nosort
+SELECT k IN (SELECT k FROM b) FROM a ORDER BY id
+----
+false
+true
+true
+
+# An EMPTY subquery result -> IN is FALSE for every row (no rows survive in WHERE).
+query I nosort
+SELECT id FROM a WHERE k IN (SELECT k FROM b WHERE id = 99) ORDER BY id
+----
+
+# An EMPTY subquery result -> NOT IN is TRUE for every row (all survive), independent of k.
+query I nosort
+SELECT id FROM a WHERE k NOT IN (SELECT k FROM b WHERE id = 99) ORDER BY id
+----
+1
+2
+3
+
+# A NULL in the subquery result makes a non-matching value UNKNOWN, not FALSE (the NOT-IN-with-NULL
+# gotcha). vals.v = {10, NULL}. For a: k=10 matches -> TRUE (kept); k=20,30 match nothing but the
+# NULL makes them UNKNOWN -> dropped. Only id 1 survives.
+query I nosort
+SELECT id FROM a WHERE k IN (SELECT v FROM vals) ORDER BY id
+----
+1
+
+# NOT IN against a result containing NULL keeps NO rows: k=10 is a match (NOT IN false); k=20,30 are
+# UNKNOWN against the NULL element. Same as a literal `NOT IN (10, NULL)`.
+query I nosort
+SELECT id FROM a WHERE k NOT IN (SELECT v FROM vals) ORDER BY id
+----

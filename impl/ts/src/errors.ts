@@ -7,6 +7,7 @@
 // enums), and the union member IS the canonical snake_case name from the registry.
 
 export type SqlState =
+  | "cardinality_violation" // 21000 — a scalar subquery used as an expression returned >1 row (§26)
   | "numeric_value_out_of_range" // 22003 — integer overflow (CLAUDE.md §8)
   | "invalid_datetime_format" // 22007 — malformed timestamp/timestamptz input
   | "datetime_field_overflow" // 22008 — out-of-range datetime field or value beyond int64 µs
@@ -39,6 +40,7 @@ export type SqlState =
   | "data_corrupted"; // XX001 — a malformed on-disk database file (CLAUDE.md §8)
 
 const CODES: Record<SqlState, string> = {
+  cardinality_violation: "21000",
   numeric_value_out_of_range: "22003",
   invalid_datetime_format: "22007",
   datetime_field_overflow: "22008",

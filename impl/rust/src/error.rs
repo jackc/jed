@@ -10,6 +10,9 @@ use std::fmt;
 /// code; it must match spec/errors/registry.toml (cross-checked in tests).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SqlState {
+    /// 21000 — cardinality violation: a scalar subquery used as an expression returned
+    /// more than one row (spec/design/grammar.md §26).
+    CardinalityViolation,
     /// 22003 — numeric value out of range (integer overflow; CLAUDE.md §8).
     NumericValueOutOfRange,
     /// 22007 — invalid datetime format (malformed timestamp / timestamptz input).
@@ -84,6 +87,7 @@ pub enum SqlState {
 impl SqlState {
     pub fn code(self) -> &'static str {
         match self {
+            SqlState::CardinalityViolation => "21000",
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::InvalidDatetimeFormat => "22007",
             SqlState::DatetimeFieldOverflow => "22008",

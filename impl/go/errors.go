@@ -11,8 +11,11 @@ import "fmt"
 type SqlState int
 
 const (
+	// CardinalityViolation is 21000 — a scalar subquery used as an expression returned more than
+	// one row (spec/design/grammar.md §26).
+	CardinalityViolation SqlState = iota
 	// NumericValueOutOfRange is 22003 — integer overflow (CLAUDE.md §8).
-	NumericValueOutOfRange SqlState = iota
+	NumericValueOutOfRange
 	// InvalidDatetimeFormat is 22007 — malformed timestamp/timestamptz input.
 	InvalidDatetimeFormat
 	// DatetimeFieldOverflow is 22008 — an out-of-range datetime field or a value beyond the
@@ -82,6 +85,8 @@ const (
 // Code returns the canonical SQLSTATE string.
 func (s SqlState) Code() string {
 	switch s {
+	case CardinalityViolation:
+		return "21000"
 	case NumericValueOutOfRange:
 		return "22003"
 	case InvalidDatetimeFormat:

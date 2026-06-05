@@ -165,6 +165,18 @@ id = "query.except"
 description = "EXCEPT / EXCEPT ALL — rows in the left operand not in the right; the bare form is distinct, ALL keeps max(0,m-n) multiplicities; same column/type unification and trailing ORDER BY rules as UNION (spec/design/grammar.md §25)"
 
 [[capability]]
+id = "query.subquery_scalar"
+description = "Uncorrelated scalar subquery (SELECT ...) in expression position — yields the single row/single column value; 0 rows -> typed NULL, >1 row -> 21000, >1 column -> 42601; executed once at plan time and folded to a constant carrying its output type (so it promotes/compares like that type); a correlated reference or a bind parameter inside -> 0A000 (spec/design/grammar.md §26)"
+
+[[capability]]
+id = "query.subquery_in"
+description = "x [NOT] IN (SELECT ...) — uncorrelated membership over the subquery's single column; folds to the literal-IN OR-chain so the three-valued NULL logic is inherited (a NULL in the result with no match -> NULL); an empty result -> FALSE (IN) / TRUE (NOT IN) regardless of x; >1 column -> 42601; correlated / param inside -> 0A000 (spec/design/grammar.md §26)"
+
+[[capability]]
+id = "query.subquery_exists"
+description = "[NOT] EXISTS (SELECT ...) — uncorrelated existence test; boolean (rows>0) XOR negated, the select list is ignored entirely (even SELECT * / SELECT 1,2,3), never NULL; correlated / param inside -> 0A000 (spec/design/grammar.md §26)"
+
+[[capability]]
 id = "types.int16"
 description = "int16 / smallint scalar type"
 
@@ -449,4 +461,18 @@ capabilities = [
   "query.union",
   "query.intersect",
   "query.except",
+]
+
+[[profile]]
+id = "subqueries"
+title = "having + joins + uncorrelated subqueries: scalar (SELECT ...), x [NOT] IN (SELECT ...), [NOT] EXISTS (SELECT ...) — executed once at plan time and folded to a constant; correlated/param-inside -> 0A000 (Phase 4, spec/design/grammar.md §26)"
+includes = "having"
+capabilities = [
+  "query.join_inner",
+  "query.table_alias",
+  "query.qualified_column",
+  "expr.in_list",
+  "query.subquery_scalar",
+  "query.subquery_in",
+  "query.subquery_exists",
 ]

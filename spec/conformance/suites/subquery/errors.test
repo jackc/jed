@@ -1,0 +1,48 @@
+# Subquery error cases + the deliberate uncorrelated-only narrowings (spec/design/grammar.md §26).
+# A scalar subquery returning >1 ROW is 21000 (cardinality_violation); a scalar or IN subquery
+# returning >1 COLUMN is 42601. A correlated reference (a subquery column resolving to an OUTER
+# relation) — bare or qualified — is a 0A000, as is a bind parameter `$N` inside a subquery. These
+# are the seams the next slice (correlated subqueries) will lift. Verified against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.subquery_scalar, query.subquery_in, query.subquery_exists, types.int32
+
+statement ok
+CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE one (id int32 PRIMARY KEY)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# Scalar subquery returning more than one row -> 21000 (cardinality_violation).
+statement error 21000
+SELECT (SELECT k FROM b) FROM one
+
+# Scalar subquery returning more than one column -> 42601 ("subquery must return only one column").
+statement error 42601
+SELECT (SELECT id, k FROM b WHERE id = 1) FROM one
+
+# IN subquery returning more than one column -> 42601 ("subquery has too many columns").
+statement error 42601
+SELECT id FROM a WHERE k IN (SELECT id, k FROM b)
+
+# Correlated reference (bare outer column) inside the subquery -> 0A000 (not supported yet).
+statement error 0A000
+SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE k = a.k)
+
+# Correlated reference (qualified outer label) in a scalar subquery -> 0A000.
+statement error 0A000
+SELECT (SELECT max(k) FROM b WHERE b.id = a.id) FROM a
+
+# A bind parameter inside a subquery -> 0A000 (params are inferred per-SELECT, not shared).
+statement error 0A000
+SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)

@@ -18,6 +18,13 @@
 
 schema_version = 1
 
+# --- cardinality violation (class 21) ---------------------------------------
+[[error]]
+code = "21000"
+name = "cardinality_violation"
+class = "cardinality violation"
+template = "more than one row returned by a subquery used as an expression"
+
 # --- data exception (class 22) ----------------------------------------------
 [[error]]
 code = "22003"

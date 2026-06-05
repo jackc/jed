@@ -908,6 +908,18 @@ func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
 // deterministically (CLAUDE.md §10). Returns the rows with each output column's NAME and resolved
 // TYPE (the types let INSERT ... SELECT gate assignability up front — §24) and the accrued cost.
 func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error) {
+	// Uncorrelated subquery folding (spec/design/grammar.md §26). Before resolving any clause,
+	// execute each uncorrelated subquery in WHERE / the select list / HAVING / a JOIN ON once and
+	// replace it with a constant (scalar -> its value; EXISTS -> a boolean; IN -> the value list,
+	// or an empty In for an empty result). The per-row evaluator is never involved. A correlated
+	// reference or a bind parameter inside a subquery is a 0A000. The subqueries' accrued cost is
+	// added once to this query's cost (cost.md §3).
+	outerCols := db.selectRelCols(sel)
+	var subqueryCost int64
+	if err := db.foldSelectSubqueries(sel, outerCols, &subqueryCost); err != nil {
+		return selectResult{}, err
+	}
+
 	// Accumulates the inferred type of each $N across every clause of this SELECT, then is
 	// finalized + bound once all resolution is done (spec/design/api.md §5).
 	ptypes := &paramTypes{}
@@ -1386,7 +1398,483 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 		}
 	}
 
-	return selectResult{columnNames: columnNames, columnTypes: columnTypes, rows: out, cost: meter.Accrued}, nil
+	// The scan/eval cost plus each uncorrelated subquery's cost, counted once (cost.md §3).
+	return selectResult{columnNames: columnNames, columnTypes: columnTypes, rows: out, cost: meter.Accrued + subqueryCost}, nil
+}
+
+// ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------
+//
+// A pre-pass over runSelect (before scope/resolution): each scalar / IN / EXISTS subquery is
+// UNCORRELATED, so it is executed exactly once here and replaced by a constant the ordinary
+// resolver/evaluator already handles. This keeps the per-row evaluator unchanged and is the seam
+// the future correlated slice will extend. A correlated reference or a `$N` inside is a 0A000.
+
+// relCols holds the relation labels and column names a query puts in scope (lower-cased), for the
+// §26 correlation check.
+type relCols struct {
+	labels map[string]bool
+	bare   map[string]bool
+}
+
+func newRelCols() relCols {
+	return relCols{labels: map[string]bool{}, bare: map[string]bool{}}
+}
+
+func (db *Database) selectRelCols(sel *Select) relCols {
+	rc := newRelCols()
+	db.collectSelectRelCols(sel, rc)
+	return rc
+}
+
+func (db *Database) queryRelCols(q QueryExpr) relCols {
+	rc := newRelCols()
+	db.collectQueryRelCols(q, rc)
+	return rc
+}
+
+func (db *Database) collectQueryRelCols(q QueryExpr, rc relCols) {
+	if q.Select != nil {
+		db.collectSelectRelCols(q.Select, rc)
+		return
+	}
+	db.collectQueryRelCols(q.SetOp.Lhs, rc)
+	db.collectQueryRelCols(q.SetOp.Rhs, rc)
+}
+
+func (db *Database) collectSelectRelCols(sel *Select, rc relCols) {
+	trefs := []TableRef{sel.From}
+	for _, j := range sel.Joins {
+		trefs = append(trefs, j.Table)
+	}
+	for _, tref := range trefs {
+		t, ok := db.Table(tref.Name)
+		if !ok {
+			continue
+		}
+		label := strings.ToLower(t.Name)
+		if tref.Alias != nil {
+			label = strings.ToLower(*tref.Alias)
+		}
+		rc.labels[label] = true
+		for _, c := range t.Columns {
+			rc.bare[strings.ToLower(c.Name)] = true
+		}
+	}
+}
+
+// rejectCorrelationAndParams rejects the two narrowings before running a subquery (grammar.md §26):
+// a bind parameter anywhere inside (params are inferred per-SELECT, not shared across scopes), and a
+// correlated reference — a direct-clause column that does not resolve against the subquery's own
+// FROM but does match an OUTER relation. Both are 0A000.
+func (db *Database) rejectCorrelationAndParams(inner QueryExpr, outer relCols) error {
+	if queryHasParam(inner) {
+		return NewError(FeatureNotSupported, "bind parameters inside a subquery are not supported yet")
+	}
+	innerCols := db.queryRelCols(inner)
+	var refs []colRef
+	for _, e := range queryClauseExprs(inner) {
+		collectColRefs(e, &refs)
+	}
+	for _, r := range refs {
+		correlated := false
+		if r.qualified {
+			q := strings.ToLower(r.qualifier)
+			correlated = !innerCols.labels[q] && outer.labels[q]
+		} else {
+			n := strings.ToLower(r.name)
+			correlated = !innerCols.bare[n] && outer.bare[n]
+		}
+		if correlated {
+			return NewError(FeatureNotSupported, "correlated subqueries are not supported yet")
+		}
+	}
+	return nil
+}
+
+// foldSelectSubqueries folds every subquery in a SELECT's clauses (WHERE / select list / HAVING /
+// each JOIN ON). GROUP BY and ORDER BY keys are column references only (grammar.md §18).
+func (db *Database) foldSelectSubqueries(sel *Select, outer relCols, cost *int64) error {
+	for i := range sel.Items.Items {
+		if err := db.foldInExpr(&sel.Items.Items[i].Expr, outer, cost); err != nil {
+			return err
+		}
+	}
+	if sel.Filter != nil {
+		if err := db.foldInExpr(sel.Filter, outer, cost); err != nil {
+			return err
+		}
+	}
+	if sel.Having != nil {
+		if err := db.foldInExpr(sel.Having, outer, cost); err != nil {
+			return err
+		}
+	}
+	for k := range sel.Joins {
+		if sel.Joins[k].On != nil {
+			if err := db.foldInExpr(sel.Joins[k].On, outer, cost); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// foldInExpr folds this expression node if it is a subquery, else recurses into its children. A
+// subquery's own inner expressions are NOT walked here — running it (which recurses into runSelect)
+// folds its internals, so nested subqueries fall out for free.
+func (db *Database) foldInExpr(e *Expr, outer relCols, cost *int64) error {
+	switch e.Kind {
+	case ExprScalarSubquery, ExprExists, ExprInSubquery:
+		folded, err := db.foldSubqueryNode(*e, outer, cost)
+		if err != nil {
+			return err
+		}
+		*e = folded
+	case ExprCast:
+		return db.foldInExpr(&e.Cast.Inner, outer, cost)
+	case ExprUnary:
+		return db.foldInExpr(&e.Unary.Operand, outer, cost)
+	case ExprBinary:
+		if err := db.foldInExpr(&e.Binary.Lhs, outer, cost); err != nil {
+			return err
+		}
+		return db.foldInExpr(&e.Binary.Rhs, outer, cost)
+	case ExprIsNull:
+		return db.foldInExpr(&e.IsNullOf.Operand, outer, cost)
+	case ExprIsDistinct:
+		if err := db.foldInExpr(&e.IsDistinct.Lhs, outer, cost); err != nil {
+			return err
+		}
+		return db.foldInExpr(&e.IsDistinct.Rhs, outer, cost)
+	case ExprIn:
+		if err := db.foldInExpr(&e.In.Lhs, outer, cost); err != nil {
+			return err
+		}
+		for i := range e.In.List {
+			if err := db.foldInExpr(&e.In.List[i], outer, cost); err != nil {
+				return err
+			}
+		}
+	case ExprBetween:
+		if err := db.foldInExpr(&e.Between.Lhs, outer, cost); err != nil {
+			return err
+		}
+		if err := db.foldInExpr(&e.Between.Lo, outer, cost); err != nil {
+			return err
+		}
+		return db.foldInExpr(&e.Between.Hi, outer, cost)
+	case ExprLike:
+		if err := db.foldInExpr(&e.Like.Lhs, outer, cost); err != nil {
+			return err
+		}
+		return db.foldInExpr(&e.Like.Rhs, outer, cost)
+	case ExprCase:
+		if e.Case.Operand != nil {
+			if err := db.foldInExpr(e.Case.Operand, outer, cost); err != nil {
+				return err
+			}
+		}
+		for i := range e.Case.Whens {
+			if err := db.foldInExpr(&e.Case.Whens[i].Cond, outer, cost); err != nil {
+				return err
+			}
+			if err := db.foldInExpr(&e.Case.Whens[i].Result, outer, cost); err != nil {
+				return err
+			}
+		}
+		if e.Case.Els != nil {
+			return db.foldInExpr(e.Case.Els, outer, cost)
+		}
+	case ExprFuncCall:
+		for _, a := range e.FuncCall.Args {
+			if err := db.foldInExpr(a, outer, cost); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// foldSubqueryNode executes one subquery node and returns the constant Expr it folds to
+// (grammar.md §26). The subquery runs with NO bind parameters (they are rejected inside).
+func (db *Database) foldSubqueryNode(node Expr, outer relCols, cost *int64) (Expr, error) {
+	switch node.Kind {
+	case ExprScalarSubquery:
+		if err := db.rejectCorrelationAndParams(*node.Subquery, outer); err != nil {
+			return Expr{}, err
+		}
+		r, err := db.runQueryExpr(*node.Subquery, nil)
+		if err != nil {
+			return Expr{}, err
+		}
+		*cost += r.cost
+		if len(r.columnTypes) != 1 {
+			return Expr{}, NewError(SyntaxError, "subquery must return only one column")
+		}
+		if len(r.rows) > 1 {
+			return Expr{}, NewError(CardinalityViolation, "more than one row returned by a subquery used as an expression")
+		}
+		// 0 rows -> a TYPED NULL (value NULL, type the output column's), so a cross-family
+		// comparison still errors (grammar.md §26).
+		ty := scalarTypeOf(r.columnTypes[0])
+		val := NullValue()
+		if len(r.rows) == 1 {
+			val = r.rows[0][0]
+		}
+		return Expr{Kind: ExprFoldedConst, Folded: &FoldedConstExpr{Value: val, Type: ty}}, nil
+	case ExprExists:
+		if err := db.rejectCorrelationAndParams(*node.Subquery, outer); err != nil {
+			return Expr{}, err
+		}
+		r, err := db.runQueryExpr(*node.Subquery, nil)
+		if err != nil {
+			return Expr{}, err
+		}
+		*cost += r.cost
+		// EXISTS ignores the select list entirely and is never NULL.
+		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralBool, Bool: len(r.rows) > 0}}, nil
+	default: // ExprInSubquery
+		is := node.InSubquery
+		// The LHS belongs to the OUTER query — fold any subqueries inside it too.
+		if err := db.foldInExpr(&is.Lhs, outer, cost); err != nil {
+			return Expr{}, err
+		}
+		if err := db.rejectCorrelationAndParams(is.Query, outer); err != nil {
+			return Expr{}, err
+		}
+		r, err := db.runQueryExpr(is.Query, nil)
+		if err != nil {
+			return Expr{}, err
+		}
+		*cost += r.cost
+		if len(r.columnTypes) != 1 {
+			return Expr{}, NewError(SyntaxError, "subquery has too many columns")
+		}
+		ty := scalarTypeOf(r.columnTypes[0])
+		// Non-empty -> the literal-IN OR-chain over the result values (3VL inherited). An empty
+		// result -> an empty In that resolves to the constant FALSE (IN) / TRUE (NOT IN),
+		// independent of the LHS value (grammar.md §26).
+		list := make([]Expr, 0, len(r.rows))
+		for _, row := range r.rows {
+			list = append(list, Expr{Kind: ExprFoldedConst, Folded: &FoldedConstExpr{Value: row[0], Type: ty}})
+		}
+		return Expr{Kind: ExprIn, In: &InExpr{Lhs: is.Lhs, List: list, Negated: is.Negated}}, nil
+	}
+}
+
+// scalarTypeOf maps a resolved column/output type back to its ScalarType (nil = the untyped-NULL
+// type) — used to type a folded scalar-subquery constant (§26).
+func scalarTypeOf(rt resolvedType) *ScalarType {
+	switch rt.kind {
+	case rtInt:
+		t := rt.intTy
+		return &t
+	case rtBool:
+		t := Bool
+		return &t
+	case rtText:
+		t := Text
+		return &t
+	case rtDecimal:
+		t := DecimalType
+		return &t
+	case rtBytea:
+		t := Bytea
+		return &t
+	case rtUuid:
+		t := Uuid
+		return &t
+	case rtTimestamp:
+		t := Timestamp
+		return &t
+	case rtTimestamptz:
+		t := Timestamptz
+		return &t
+	default: // rtNull
+		return nil
+	}
+}
+
+// valueToRExpr builds the constant rExpr for a folded subquery value (§26). The static type is
+// carried separately (the node's Type), so a NULL value here is just reConstNull.
+func valueToRExpr(v Value) *rExpr {
+	switch v.Kind {
+	case ValInt:
+		return &rExpr{kind: reConstInt, cInt: v.Int}
+	case ValBool:
+		return &rExpr{kind: reConstBool, cBool: v.Bool}
+	case ValText:
+		return &rExpr{kind: reConstText, cText: v.Str}
+	case ValDecimal:
+		return &rExpr{kind: reConstDecimal, cDec: *v.Dec}
+	case ValBytea:
+		return &rExpr{kind: reConstBytea, cBytea: []byte(v.Str)}
+	case ValUuid:
+		return &rExpr{kind: reConstUuid, cBytea: []byte(v.Str)}
+	case ValTimestamp:
+		return &rExpr{kind: reConstTimestamp, cInt: v.Int}
+	case ValTimestamptz:
+		return &rExpr{kind: reConstTimestamptz, cInt: v.Int}
+	default: // ValNull
+		return &rExpr{kind: reConstNull}
+	}
+}
+
+// colRef is a column reference (qualifier + name) collected for the §26 correlation scan.
+type colRef struct {
+	qualified bool
+	qualifier string
+	name      string
+}
+
+// queryClauseExprs collects a query's direct-clause expressions (select list / WHERE / HAVING /
+// each JOIN ON) for the §26 correlation scan — NOT descending into nested subqueries (those are
+// folded separately). A set operation contributes both operands' clauses.
+func queryClauseExprs(q QueryExpr) []*Expr {
+	var out []*Expr
+	collectQueryClauseExprs(q, &out)
+	return out
+}
+
+func collectQueryClauseExprs(q QueryExpr, out *[]*Expr) {
+	if q.Select != nil {
+		s := q.Select
+		for i := range s.Items.Items {
+			*out = append(*out, &s.Items.Items[i].Expr)
+		}
+		if s.Filter != nil {
+			*out = append(*out, s.Filter)
+		}
+		if s.Having != nil {
+			*out = append(*out, s.Having)
+		}
+		for k := range s.Joins {
+			if s.Joins[k].On != nil {
+				*out = append(*out, s.Joins[k].On)
+			}
+		}
+		return
+	}
+	collectQueryClauseExprs(q.SetOp.Lhs, out)
+	collectQueryClauseExprs(q.SetOp.Rhs, out)
+}
+
+// exprHasParam reports whether an expression tree contains a bind parameter anywhere — INCLUDING
+// inside nested subqueries (a $N at any depth inside a subquery is rejected, §26).
+func exprHasParam(e Expr) bool {
+	switch e.Kind {
+	case ExprParam:
+		return true
+	case ExprScalarSubquery, ExprExists:
+		return queryHasParam(*e.Subquery)
+	case ExprInSubquery:
+		return exprHasParam(e.InSubquery.Lhs) || queryHasParam(e.InSubquery.Query)
+	case ExprCast:
+		return exprHasParam(e.Cast.Inner)
+	case ExprUnary:
+		return exprHasParam(e.Unary.Operand)
+	case ExprBinary:
+		return exprHasParam(e.Binary.Lhs) || exprHasParam(e.Binary.Rhs)
+	case ExprIsNull:
+		return exprHasParam(e.IsNullOf.Operand)
+	case ExprIsDistinct:
+		return exprHasParam(e.IsDistinct.Lhs) || exprHasParam(e.IsDistinct.Rhs)
+	case ExprIn:
+		if exprHasParam(e.In.Lhs) {
+			return true
+		}
+		for _, elem := range e.In.List {
+			if exprHasParam(elem) {
+				return true
+			}
+		}
+		return false
+	case ExprBetween:
+		return exprHasParam(e.Between.Lhs) || exprHasParam(e.Between.Lo) || exprHasParam(e.Between.Hi)
+	case ExprLike:
+		return exprHasParam(e.Like.Lhs) || exprHasParam(e.Like.Rhs)
+	case ExprCase:
+		if e.Case.Operand != nil && exprHasParam(*e.Case.Operand) {
+			return true
+		}
+		for _, w := range e.Case.Whens {
+			if exprHasParam(w.Cond) || exprHasParam(w.Result) {
+				return true
+			}
+		}
+		return e.Case.Els != nil && exprHasParam(*e.Case.Els)
+	case ExprFuncCall:
+		for _, a := range e.FuncCall.Args {
+			if exprHasParam(*a) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func queryHasParam(q QueryExpr) bool {
+	for _, e := range queryClauseExprs(q) {
+		if exprHasParam(*e) {
+			return true
+		}
+	}
+	return false
+}
+
+// collectColRefs collects every column reference in an expression for the §26 correlation scan —
+// NOT descending into nested subqueries (a deeper subquery's references are its own concern). The
+// IN-subquery's LHS IS at this level, so it is walked.
+func collectColRefs(e *Expr, out *[]colRef) {
+	switch e.Kind {
+	case ExprColumn:
+		*out = append(*out, colRef{name: e.Column})
+	case ExprQualifiedColumn:
+		*out = append(*out, colRef{qualified: true, qualifier: e.Qualifier, name: e.Column})
+	case ExprInSubquery:
+		collectColRefs(&e.InSubquery.Lhs, out)
+	case ExprCast:
+		collectColRefs(&e.Cast.Inner, out)
+	case ExprUnary:
+		collectColRefs(&e.Unary.Operand, out)
+	case ExprBinary:
+		collectColRefs(&e.Binary.Lhs, out)
+		collectColRefs(&e.Binary.Rhs, out)
+	case ExprIsNull:
+		collectColRefs(&e.IsNullOf.Operand, out)
+	case ExprIsDistinct:
+		collectColRefs(&e.IsDistinct.Lhs, out)
+		collectColRefs(&e.IsDistinct.Rhs, out)
+	case ExprIn:
+		collectColRefs(&e.In.Lhs, out)
+		for i := range e.In.List {
+			collectColRefs(&e.In.List[i], out)
+		}
+	case ExprBetween:
+		collectColRefs(&e.Between.Lhs, out)
+		collectColRefs(&e.Between.Lo, out)
+		collectColRefs(&e.Between.Hi, out)
+	case ExprLike:
+		collectColRefs(&e.Like.Lhs, out)
+		collectColRefs(&e.Like.Rhs, out)
+	case ExprCase:
+		if e.Case.Operand != nil {
+			collectColRefs(e.Case.Operand, out)
+		}
+		for i := range e.Case.Whens {
+			collectColRefs(&e.Case.Whens[i].Cond, out)
+			collectColRefs(&e.Case.Whens[i].Result, out)
+		}
+		if e.Case.Els != nil {
+			collectColRefs(e.Case.Els, out)
+		}
+	case ExprFuncCall:
+		for _, a := range e.FuncCall.Args {
+			collectColRefs(a, out)
+		}
+	}
 }
 
 // distinctRowKey encodes a projected row into a collision-free string key for DISTINCT
@@ -2461,6 +2949,24 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return &rExpr{kind: reConstInt, cInt: e.Literal.Int},
 				resolvedType{kind: rtInt, intTy: ty}, nil
 		}
+	case ExprFoldedConst:
+		// A subquery already executed + folded by the pre-pass (grammar.md §26). It resolves to
+		// the matching constant with its EXACT output type (nil = untyped NULL) — NO context
+		// adaptation, so a folded bigint keeps bigint (unlike a bare integer literal) and a
+		// typed-NULL from an empty scalar still participates in cross-type checks.
+		var rty resolvedType
+		if e.Folded.Type != nil {
+			rty = resolvedTypeOf(*e.Folded.Type)
+		} else {
+			rty = resolvedType{kind: rtNull}
+		}
+		return valueToRExpr(e.Folded.Value), rty, nil
+	case ExprScalarSubquery, ExprExists, ExprInSubquery:
+		// A subquery in expression position is folded by runSelect's pre-pass before resolution
+		// (grammar.md §26), so resolve never sees one inside a SELECT. Reaching here means a
+		// subquery in a non-SELECT context (an UPDATE SET / INSERT VALUES / DELETE WHERE
+		// expression, which run no fold pre-pass) — supported only in SELECT this slice (0A000).
+		return nil, resolvedType{}, NewError(FeatureNotSupported, "subqueries are only supported in a SELECT statement")
 	case ExprCast:
 		target, typmod, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod)
 		if err != nil {
@@ -2570,6 +3076,17 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		return &rExpr{kind: reDistinct, lhs: rl, rhs: rr, negated: e.IsDistinct.Negated},
 			resolvedType{kind: rtBool}, nil
 	case ExprIn:
+		// An EMPTY list reaches here only from folding an IN-subquery whose result was empty
+		// (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant —
+		// `x IN (empty)` = FALSE, `x NOT IN (empty)` = TRUE — for every x including NULL. Still
+		// resolve the LHS so an undefined column / aggregate-context error fires, then return the
+		// constant (a leaf — no operator_eval, cost.md §3).
+		if len(e.In.List) == 0 {
+			if _, _, err := resolve(s, e.In.Lhs, nil, ag, params); err != nil {
+				return nil, resolvedType{}, err
+			}
+			return &rExpr{kind: reConstBool, cBool: e.In.Negated}, resolvedType{kind: rtBool}, nil
+		}
 		// Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` is
 		// `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list is
 		// non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree reuses

@@ -308,6 +308,30 @@ impl Parser {
         }
     }
 
+    /// Parse a parenthesized subquery's inner `query_expr` (grammar.md §26): a full set-expression
+    /// plus an optional trailing `ORDER BY` / `LIMIT` / `OFFSET` folded onto the node. Mirrors
+    /// `parse_query_expr` but yields a `QueryExpr` (the subquery operand) rather than a `Statement`.
+    /// The caller has already consumed the opening `(` and consumes the closing `)`.
+    fn parse_subquery(&mut self) -> Result<QueryExpr> {
+        let node = self.parse_set_expr()?;
+        let order_by = self.parse_order_by()?;
+        let (limit, offset) = self.parse_limit_offset()?;
+        Ok(match node {
+            QueryExpr::Select(mut sel) => {
+                sel.order_by = order_by;
+                sel.limit = limit;
+                sel.offset = offset;
+                QueryExpr::Select(sel)
+            }
+            QueryExpr::SetOp(mut so) => {
+                so.order_by = order_by;
+                so.limit = limit;
+                so.offset = offset;
+                QueryExpr::SetOp(so)
+            }
+        })
+    }
+
     /// `set_expr ::= intersect_expr (("UNION" | "EXCEPT") ("ALL"|"DISTINCT")? intersect_expr)*` —
     /// the lower-precedence, left-associative level. `INTERSECT` binds tighter (parsed inside
     /// `parse_intersect_expr`), so `a UNION b INTERSECT c` becomes `a UNION (b INTERSECT c)`.
@@ -847,7 +871,18 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("in") {
             self.advance();
             self.expect(&Token::LParen)?;
-            // A non-empty value list (`IN ()` is rejected: parse_additive on `)` is 42601).
+            // `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by
+            // a leading `SELECT`; otherwise a non-empty value list (`IN ()` is rejected:
+            // parse_additive on `)` is 42601).
+            if self.peek_keyword().as_deref() == Some("select") {
+                let q = self.parse_subquery()?;
+                self.expect(&Token::RParen)?;
+                return Ok(Expr::InSubquery {
+                    lhs: Box::new(lhs),
+                    query: Box::new(q),
+                    negated,
+                });
+            }
             let mut list = vec![self.parse_additive()?];
             while matches!(self.peek(), Token::Comma) {
                 self.advance();
@@ -968,9 +1003,28 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr> {
         if matches!(self.peek(), Token::LParen) {
             self.advance();
+            // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
+            // `SELECT` after the `(`; otherwise this is a parenthesized expression.
+            if self.peek_keyword().as_deref() == Some("select") {
+                let q = self.parse_subquery()?;
+                self.expect(&Token::RParen)?;
+                return Ok(Expr::ScalarSubquery(Box::new(q)));
+            }
             let e = self.parse_expr()?;
             self.expect(&Token::RParen)?;
             return Ok(e);
+        }
+        // `EXISTS ( SELECT ... )` — the existence predicate (grammar.md §26). Recognized only when
+        // an open-paren + `SELECT` follows, so `exists` stays usable as a column / function name.
+        if self.peek_keyword().as_deref() == Some("exists")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::Word(w)) if w.eq_ignore_ascii_case("select"))
+        {
+            self.advance(); // EXISTS
+            self.expect(&Token::LParen)?;
+            let q = self.parse_subquery()?;
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::Exists(Box::new(q)));
         }
         if self.peek_keyword().as_deref() == Some("cast") {
             self.advance();

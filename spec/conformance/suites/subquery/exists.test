@@ -1,0 +1,72 @@
+# Uncorrelated `[NOT] EXISTS ( SELECT … )` (spec/design/grammar.md §26). EXISTS folds to the
+# boolean `(rows > 0)` (NOT EXISTS is its negation via the ordinary unary NOT). The subquery's
+# select list is IGNORED entirely — a multi-column or `SELECT *` list is legal, column count and
+# types are irrelevant — and the result is NEVER NULL. Verified against the live PostgreSQL 18 oracle.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.subquery_exists, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE one (id int32 PRIMARY KEY)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# b has rows -> EXISTS is TRUE -> a whole-query gate keeps every a row.
+query I nosort
+SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b) ORDER BY id
+----
+1
+2
+3
+
+# An empty subquery -> EXISTS FALSE -> no rows.
+query I nosort
+SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE id = 99) ORDER BY id
+----
+
+# NOT EXISTS over the empty subquery -> TRUE -> all rows.
+query I nosort
+SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE id = 99) ORDER BY id
+----
+1
+2
+3
+
+# EXISTS ignores the select list: a multi-column list is legal (columns irrelevant).
+query I nosort
+SELECT id FROM a WHERE EXISTS (SELECT 1, 2, 3 FROM b) ORDER BY id
+----
+1
+2
+3
+
+# `SELECT *` under EXISTS is likewise legal.
+query I nosort
+SELECT id FROM a WHERE EXISTS (SELECT * FROM b) ORDER BY id
+----
+1
+2
+3
+
+# EXISTS as a projected boolean is never NULL.
+# names: ?column?
+query B nosort
+SELECT EXISTS (SELECT 1 FROM b) FROM one
+----
+true
+
+query B nosort
+SELECT EXISTS (SELECT 1 FROM b WHERE id = 99) FROM one
+----
+false

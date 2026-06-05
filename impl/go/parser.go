@@ -428,6 +428,34 @@ func (p *Parser) parseQueryExpr() (Statement, error) {
 	return Statement{SetOp: so}, nil
 }
 
+// parseSubquery parses a parenthesized subquery's inner query_expr (grammar.md §26): a full
+// set-expression plus an optional trailing ORDER BY / LIMIT / OFFSET folded onto the node. Mirrors
+// parseQueryExpr but yields a QueryExpr (the subquery operand) rather than a Statement. The caller
+// has consumed the opening "(" and consumes the closing ")".
+func (p *Parser) parseSubquery() (QueryExpr, error) {
+	node, err := p.parseSetExpr()
+	if err != nil {
+		return QueryExpr{}, err
+	}
+	var trailing Select
+	if err := p.parseOrderBy(&trailing); err != nil {
+		return QueryExpr{}, err
+	}
+	if err := p.parseLimitOffset(&trailing); err != nil {
+		return QueryExpr{}, err
+	}
+	if node.Select != nil {
+		node.Select.OrderBy = trailing.OrderBy
+		node.Select.Limit = trailing.Limit
+		node.Select.Offset = trailing.Offset
+	} else {
+		node.SetOp.OrderBy = trailing.OrderBy
+		node.SetOp.Limit = trailing.Limit
+		node.SetOp.Offset = trailing.Offset
+	}
+	return node, nil
+}
+
 // parseSetExpr parses the lower-precedence, left-associative UNION/EXCEPT level. INTERSECT binds
 // tighter (parsed inside parseIntersectExpr), so `a UNION b INTERSECT c` becomes
 // `a UNION (b INTERSECT c)`.
@@ -1060,6 +1088,18 @@ func (p *Parser) parseComparison() (Expr, error) {
 		if err := p.expect(TokLParen); err != nil {
 			return Expr{}, err
 		}
+		// `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by a
+		// leading `SELECT`; otherwise a non-empty value list (`IN ()` is a 42601 syntax error).
+		if p.peekKeyword() == "select" {
+			q, err := p.parseSubquery()
+			if err != nil {
+				return Expr{}, err
+			}
+			if err := p.expect(TokRParen); err != nil {
+				return Expr{}, err
+			}
+			return Expr{Kind: ExprInSubquery, InSubquery: &InSubqueryExpr{Lhs: lhs, Query: q, Negated: predNegated}}, nil
+		}
 		// A non-empty value list (`IN ()` — parseAdditive on `)` is a 42601 syntax error).
 		first, err := p.parseAdditive()
 		if err != nil {
@@ -1213,6 +1253,18 @@ func (p *Parser) parseUnary() (Expr, error) {
 func (p *Parser) parsePrimary() (Expr, error) {
 	if p.peek().Kind == TokLParen {
 		p.advance()
+		// `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
+		// `SELECT` after the `(`; otherwise this is a parenthesized expression.
+		if p.peekKeyword() == "select" {
+			q, err := p.parseSubquery()
+			if err != nil {
+				return Expr{}, err
+			}
+			if err := p.expect(TokRParen); err != nil {
+				return Expr{}, err
+			}
+			return Expr{Kind: ExprScalarSubquery, Subquery: &q}, nil
+		}
 		e, err := p.parseExpr()
 		if err != nil {
 			return Expr{}, err
@@ -1221,6 +1273,22 @@ func (p *Parser) parsePrimary() (Expr, error) {
 			return Expr{}, err
 		}
 		return e, nil
+	}
+	// `EXISTS ( SELECT ... )` — the existence predicate (grammar.md §26). Recognized only when an
+	// open-paren + `SELECT` follows, so `exists` stays usable as a column / function name.
+	if p.peekKeyword() == "exists" && p.peekKindAt(1) == TokLParen && p.peekKeywordAt(2) == "select" {
+		p.advance() // EXISTS
+		if err := p.expect(TokLParen); err != nil {
+			return Expr{}, err
+		}
+		q, err := p.parseSubquery()
+		if err != nil {
+			return Expr{}, err
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprExists, Subquery: &q}, nil
 	}
 	if p.peekKeyword() == "cast" {
 		p.advance()
@@ -1423,6 +1491,15 @@ func (p *Parser) peekKeywordAt(offset int) string {
 		}
 	}
 	return ""
+}
+
+// peekKindAt returns the token kind offset tokens ahead of the cursor, or TokEof past the end.
+// Used by the EXISTS / scalar-subquery lookahead (grammar.md §26).
+func (p *Parser) peekKindAt(offset int) TokenKind {
+	if p.pos+offset < len(p.tokens) {
+		return p.tokens[p.pos+offset].Kind
+	}
+	return TokEof
 }
 
 // advance consumes and returns the current token.

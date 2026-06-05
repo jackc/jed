@@ -268,6 +268,19 @@ const (
 	// ExprCase is a CASE expression (searched or simple form), lazily evaluated
 	// (spec/design/grammar.md §23).
 	ExprCase
+	// ExprScalarSubquery is a scalar subquery `( query_expr )` in expression position
+	// (spec/design/grammar.md §26). Uncorrelated: runSelect's pre-pass executes it once and
+	// replaces it with an ExprFoldedConst, so resolve never sees it inside a SELECT.
+	ExprScalarSubquery
+	// ExprExists is `EXISTS ( query_expr )` (a leading NOT is the ordinary unary connective).
+	// Folded to a boolean literal by the pre-pass (spec/design/grammar.md §26).
+	ExprExists
+	// ExprInSubquery is `lhs [NOT] IN ( query_expr )` (spec/design/grammar.md §26). The pre-pass
+	// folds it to the literal-IN OR-chain over the subquery's result values (or an empty In).
+	ExprInSubquery
+	// ExprFoldedConst is INTERNAL — never produced by the parser. A subquery folded to a constant
+	// by the pre-pass (spec/design/grammar.md §26): the value plus its output type.
+	ExprFoldedConst
 )
 
 // UnaryOp is a unary operator.
@@ -322,13 +335,33 @@ type Expr struct {
 	Cast       *CastExpr  // ExprCast
 	Unary      *UnaryExpr // ExprUnary
 	Binary     *BinaryExpr
-	IsNullOf   *IsNullExpr     // ExprIsNull
-	IsDistinct *IsDistinctExpr // ExprIsDistinct
-	FuncCall   *FuncCallExpr   // ExprFuncCall
-	In         *InExpr         // ExprIn
-	Between    *BetweenExpr    // ExprBetween
-	Like       *LikeExpr       // ExprLike
-	Case       *CaseExpr       // ExprCase
+	IsNullOf   *IsNullExpr      // ExprIsNull
+	IsDistinct *IsDistinctExpr  // ExprIsDistinct
+	FuncCall   *FuncCallExpr    // ExprFuncCall
+	In         *InExpr          // ExprIn
+	Between    *BetweenExpr     // ExprBetween
+	Like       *LikeExpr        // ExprLike
+	Case       *CaseExpr        // ExprCase
+	Subquery   *QueryExpr       // ExprScalarSubquery, ExprExists (the inner query)
+	InSubquery *InSubqueryExpr  // ExprInSubquery
+	Folded     *FoldedConstExpr // ExprFoldedConst
+}
+
+// InSubqueryExpr is `Lhs [NOT] IN ( Query )` — an uncorrelated IN-subquery (spec/design/grammar.md
+// §26). The pre-pass executes Query once and folds this node into the literal-IN OR-chain.
+type InSubqueryExpr struct {
+	Lhs     Expr
+	Query   QueryExpr
+	Negated bool
+}
+
+// FoldedConstExpr is INTERNAL — a subquery already executed + folded by the pre-pass
+// (spec/design/grammar.md §26): the resulting Value plus its output type (Type is nil for the
+// untyped-NULL type). resolve maps it to the matching constant rExpr with that EXACT type, with no
+// context adaptation (a folded bigint stays bigint, unlike a bare integer literal).
+type FoldedConstExpr struct {
+	Value Value
+	Type  *ScalarType
 }
 
 // CastExpr is CAST(Inner AS TypeName). TypeMod is the optional numeric(p[,s]) modifier.
