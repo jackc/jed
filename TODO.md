@@ -269,8 +269,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > typing, and nothing like SQLite's runtime affinity. Each item is a vertical slice that
 > forces a §8 divergence decision into the open (default: match PG — §1). `text` (collation
 > `C`), `decimal` (exact base-10, half-away rounding), `bytea` (unsigned byte order, `\x`-hex
-> literals), and `uuid` (fixed 16 bytes, PG-flexible input, and the **first non-integer
-> `PRIMARY KEY`**) are all done; `timestamp` and `json`/`array` are the remaining headline items.
+> literals), `uuid` (fixed 16 bytes, PG-flexible input, and the **first non-integer `PRIMARY
+> KEY`**), and `timestamp`/`timestamptz` (int64-µs instant model, no tz database) are all done;
+> `json`/`array` are the remaining headline items.
 
 - [x] **Storable `boolean` column type** — done & committed across Rust/Go/TS. `boolean` was
       expression-only (Phase 1); it is now a *column* type: `CREATE TABLE t(flag boolean)`,
@@ -322,8 +323,32 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       — decimal PK is rejected `0A000`); scientific `e`-notation literals (`1.5e3`); negative /
       `s>p` scale typmods (PG 15+); `round(x,n)` and other decimal functions; raising the
       1000-digit / scale-1000 cap once over-page values (overflow pages / TOAST) land (Phase 6).
-- [ ] **`timestamp` / `timestamptz`.** Forces a defined epoch, range, and tz model;
-      determinism-sensitive (no wall-clock in tests). _(size: L; §4)_
+- [x] **`timestamp` / `timestamptz`** — done & committed across Rust/Go/TS (`1ee7027`). The
+      PostgreSQL **instant** model (not the SQL-standard offset-bearing one): `timestamp` is a
+      zoneless wall clock, `timestamptz` a UTC instant whose input offset normalizes to UTC then
+      is **discarded**. Both are **int64 microseconds** since the Unix epoch (proleptic Gregorian,
+      no leap seconds) — two distinct types sharing one physical representation (on-disk type codes
+      **9** / **10**; they never compare or cast to each other → `42804`). Deliberately **no
+      time-zone database / named zones** — kept deterministic + dependency-free (§8/§14, no
+      wall-clock in tests); named-zone handling is left to the host. Calendar math is Hinnant
+      `days_from_civil` / `civil_from_days`, authored once in
+      [spec/design/timestamp.md](spec/design/timestamp.md) and transcribed identically into all
+      three cores (the §8 determinism hotspot: civil↔days truncating, instant↔civil floor).
+      `infinity` / `-infinity` are first-class (`i64::MIN`/`MAX` sentinels, totally ordered), so
+      ordering, key encoding, and the on-disk codec handle them for free; **timestamp/timestamptz
+      `PRIMARY KEY`** is supported (reuses the int64 order-preserving key codec). New errors
+      `22007` / `22008`; capabilities `types.timestamp` / `types.timestamptz` + the `timestamps`
+      profile; pinned by `spec/conformance/suites/types/{timestamp,timestamptz}.test` (38/0/0
+      byte-identical in Rust, Go, TS) and the byte-exact goldens
+      `{timestamp,timestamptz}_table.jed` (rust==go==ts==ruby). Oracle-verified vs PG 18.3 (all
+      epoch values + renders match). **Two documented divergences (by design):** sub-µs rounding is
+      **half-away** (jed's one rounding mode, no float in the value path) vs PG's half-even; a `:60`
+      seconds field is **rejected** (strict) vs PG's roll-to-next-minute. _(was: L; §4;
+      spec/design/timestamp.md, encoding/timestamps.toml)_ **Deferred follow-ups:** an `interval`
+      type + timestamp arithmetic; date/time functions (`now()`/`current_timestamp`, `EXTRACT`,
+      `date_trunc`, `age`); separate `date` / `time` types; named-zone `AT TIME ZONE` (needs the
+      host-supplied tz database); timestamp⇄text/date casts; sub-second precision typmods
+      (`timestamp(p)`).
 - [x] **`bytea`** — done & committed across Rust/Go/TS. A variable-width binary string (raw
       bytes), compared by **unsigned byte order** (PostgreSQL's bytea comparison). Storage +
       `\x`-hex literals + comparison/ordering (`= < > <= >=`, `IS [NOT] DISTINCT FROM`); on-disk
