@@ -141,6 +141,20 @@ and a deliberate **divergence from SQLite** (where NULL is the smallest, so SQLi
 `ASC` to NULLs first); an explicit `NULLS FIRST|LAST` overrides the default regardless of
 direction.
 
+**Set-operation column unification.** A set operation (`UNION`/`INTERSECT`/`EXCEPT` —
+grammar.md §25) must reconcile each output column's type across its operands into one result
+type. This is the **result-type** analogue of the comparability matrix above (and of `CASE`'s
+arm unification), folded over all operands of a column position: two integer types give the
+**max-rank** integer (`promote`); integer with `decimal` gives `decimal` (`promote-to-decimal`,
+the integer's values converted scale-0 before row matching); a `NULL` type takes the other
+operand's type; a column that is `NULL`-typed in **every** operand resolves to **`text`** (the
+PostgreSQL unknown-literal rule); a same-family non-integer pair (`text`/`boolean`/`bytea`/
+`uuid`/`timestamp`/`timestamptz`) gives that type; anything else is `42804`. The *set* of
+unifiable pairs is exactly the `comparable` matrix in [../types/compare.toml](../types/compare.toml)
+(plus the all-NULL→`text` rule), so unification never admits a pairing the engine could not also
+compare. The full contract — value conversion, per-value display scale, NULL-safe row identity —
+is in grammar.md §25 and [cost.md](cost.md) §3.
+
 ## 5. Coercion / casts
 
 See [../types/casts.toml](../types/casts.toml). The matrix is **strict**: any `(from, to)`

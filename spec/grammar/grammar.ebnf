@@ -39,7 +39,7 @@
 sql_statement  ::= create_table
                  | drop_table
                  | insert
-                 | select
+                 | query_expr
                  | update
                  | delete
 
@@ -121,12 +121,43 @@ delete         ::= "DELETE" "FROM" identifier where_clause?
 
 /* --- queries ------------------------------------------------------------- */
 
-select         ::= "SELECT" "DISTINCT"? select_items "FROM" from_clause
+/* A query expression is the top-level query form (../design/grammar.md §25): one or more SELECT
+ * cores combined by the set operators UNION / INTERSECT / EXCEPT, with an optional trailing
+ * ORDER BY / LIMIT / OFFSET that applies to the WHOLE combined result. With no set operator it is
+ * a single SELECT — exactly the form the rest of the engine already supported, the trailing
+ * clauses folding back onto the lone core.
+ *   PRECEDENCE (PostgreSQL): INTERSECT binds TIGHTER than UNION and EXCEPT, so it is its own inner
+ * level (intersect_expr); UNION and EXCEPT share one outer level and are LEFT-ASSOCIATIVE. Thus
+ * "a UNION b INTERSECT c" = "a UNION (b INTERSECT c)" and "a UNION b EXCEPT c" =
+ * "(a UNION b) EXCEPT c".
+ *   Each operator's bare form deduplicates (UNION = UNION DISTINCT); an "ALL" suffix keeps
+ * multiplicities (multiset union / intersection / difference); a "DISTINCT" suffix is the explicit
+ * spelling of the default. Output columns take the LEFT operand's count and NAMES; the operands
+ * must have the same column count (else 42601) and per-column unifiable types (else 42804 —
+ * ../design/grammar.md §25, ../design/cost.md §3).
+ *   Two deferred narrowings (../design/grammar.md §25): an operand may NOT carry its own
+ * ORDER BY / LIMIT / OFFSET (one such operand clause surfaces as a leftover-token 42601), and
+ * operands may NOT be parenthesized "(SELECT ...)". UNION / INTERSECT / EXCEPT / ALL / DISTINCT
+ * are NOT reserved (§3), disambiguated positionally. */
+query_expr     ::= set_expr order_by? limit_offset?
+
+set_expr       ::= intersect_expr (("UNION" | "EXCEPT") ("ALL" | "DISTINCT")? intersect_expr)*
+
+intersect_expr ::= select_core ("INTERSECT" ("ALL" | "DISTINCT")? select_core)*
+
+/* A SELECT core is one SELECT WITHOUT a trailing ORDER BY / LIMIT / OFFSET — the operand form of
+ * a set operation. A lone query_expr (no set operator) folds the trailing clauses back onto this
+ * core, recovering the single-table / joined SELECT unchanged. */
+select_core    ::= "SELECT" "DISTINCT"? select_items "FROM" from_clause
                    where_clause?
                    group_by?
                    having_clause?
-                   order_by?
-                   limit_offset?
+
+/* A SELECT with its own optional trailing ORDER BY / LIMIT / OFFSET — behaviorally identical to
+ * the pre-set-operations `select`. This is the form an INSERT ... SELECT source takes; a set
+ * operation is NOT allowed in an INSERT source this slice (a deferred narrowing,
+ * ../design/grammar.md §25). */
+select         ::= select_core order_by? limit_offset?
 
 /* HAVING filters GROUPED rows: a general expression that must resolve to boolean (42804
  * otherwise), evaluated AFTER grouping/aggregation and BEFORE ORDER BY. Unlike WHERE (which

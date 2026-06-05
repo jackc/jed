@@ -109,6 +109,8 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 		return db.executeInsert(stmt.Insert, params)
 	case stmt.Select != nil:
 		return db.executeSelect(stmt.Select, params)
+	case stmt.SetOp != nil:
+		return db.executeSetOp(stmt.SetOp, params)
 	case stmt.Update != nil:
 		return db.executeUpdate(stmt.Update, params)
 	case stmt.Delete != nil:
@@ -634,6 +636,270 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 		return Outcome{}, err
 	}
 	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, Rows: r.rows, Cost: r.cost}, nil
+}
+
+// executeSetOp runs a set operation as a top-level statement: runSetOp, then wrap as a query
+// Outcome. Cost is lhs.cost + rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
+func (db *Database) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
+	r, err := db.runSetOp(so, params)
+	if err != nil {
+		return Outcome{}, err
+	}
+	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, Rows: r.rows, Cost: r.cost}, nil
+}
+
+// runQueryExpr runs a query expression to a selectResult — a lone SELECT via runSelect, or a set
+// operation via runSetOp (recursively, so a chain `a UNION b INTERSECT c` evaluates as the parsed
+// precedence tree).
+func (db *Database) runQueryExpr(qe QueryExpr, params []Value) (selectResult, error) {
+	if qe.Select != nil {
+		return db.runSelect(qe.Select, params)
+	}
+	return db.runSetOp(qe.SetOp, params)
+}
+
+func (db *Database) runSetOp(so *SetOp, params []Value) (selectResult, error) {
+	left, err := db.runQueryExpr(so.Lhs, params)
+	if err != nil {
+		return selectResult{}, err
+	}
+	right, err := db.runQueryExpr(so.Rhs, params)
+	if err != nil {
+		return selectResult{}, err
+	}
+
+	// Arity: both operands must produce the same number of columns. Checked before any row is
+	// matched, so it fires over empty operands too. PostgreSQL uses 42601 here.
+	if len(left.columnTypes) != len(right.columnTypes) {
+		return selectResult{}, NewError(SyntaxError, fmt.Sprintf(
+			"each %s query must have the same number of columns", setopName(so.Op),
+		))
+	}
+
+	// Per-column type unification (42804 on an incompatible pair). Output NAMES are the LEFT
+	// operand's (PostgreSQL).
+	outTypes := make([]resolvedType, len(left.columnTypes))
+	for i := range outTypes {
+		t, err := unifySetopColumn(left.columnTypes[i], right.columnTypes[i], so.Op)
+		if err != nil {
+			return selectResult{}, err
+		}
+		outTypes[i] = t
+	}
+
+	// Convert each operand's values to the unified column types BEFORE matching — the only runtime
+	// conversion is integer -> decimal (so an int value and a decimal value compare equal).
+	coerceSetopRows(left.rows, left.columnTypes, outTypes)
+	coerceSetopRows(right.rows, right.columnTypes, outTypes)
+
+	rows := combineSetop(so.Op, so.All, left.rows, right.rows)
+	cost := left.cost + right.cost
+
+	// Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
+	// operation): a qualified key is 42P01, an unknown name is 42703. Reuse keyCmp; SliceStable
+	// keeps the combine order (left rows before right) on a full tie.
+	type orderSlot struct {
+		idx        int
+		descending bool
+		nullsFirst bool
+	}
+	order := make([]orderSlot, 0, len(so.OrderBy))
+	for i := range so.OrderBy {
+		key := &so.OrderBy[i]
+		idx, err := resolveSetopOrderKey(key, left.columnNames)
+		if err != nil {
+			return selectResult{}, err
+		}
+		order = append(order, orderSlot{idx: idx, descending: key.Descending, nullsFirst: key.NullsFirst})
+	}
+	if len(order) > 0 {
+		sort.SliceStable(rows, func(a, b int) bool {
+			for _, k := range order {
+				c := keyCmp(rows[a][k.idx], rows[b][k.idx], k.descending, k.nullsFirst)
+				if c != 0 {
+					return c < 0
+				}
+			}
+			return false
+		})
+	}
+
+	// LIMIT / OFFSET window — clamp in the int64 domain (counts are non-negative, parser).
+	n := int64(len(rows))
+	start := int64(0)
+	if so.Offset != nil && *so.Offset < n {
+		start = *so.Offset
+	} else if so.Offset != nil {
+		start = n
+	}
+	end := n
+	if so.Limit != nil && *so.Limit < n-start {
+		end = start + *so.Limit
+	}
+	rows = rows[start:end]
+
+	return selectResult{columnNames: left.columnNames, columnTypes: outTypes, rows: rows, cost: cost}, nil
+}
+
+// setopName is the operator's name for an error message (PostgreSQL phrasing).
+func setopName(op SetOpKind) string {
+	switch op {
+	case SetOpUnion:
+		return "UNION"
+	case SetOpIntersect:
+		return "INTERSECT"
+	default:
+		return "EXCEPT"
+	}
+}
+
+// unifySetopColumn unifies one output column's type across the two operands of a set operation
+// (spec/design/grammar.md §25, types.md §4): integer widths promote to the widest; integer with
+// decimal -> decimal; a NULL-typed operand takes the other's type (an all-NULL column stays NULL —
+// PostgreSQL would call a top-level one text, but the type is never observed in output); a
+// same-family non-numeric pair gives that type; anything else is 42804. The set of unifiable pairs
+// mirrors the comparability matrix (compare.toml).
+func unifySetopColumn(a, b resolvedType, op SetOpKind) (resolvedType, error) {
+	switch {
+	case a.kind == rtNull && b.kind == rtNull:
+		return resolvedType{kind: rtNull}, nil
+	case a.kind == rtNull:
+		return b, nil
+	case b.kind == rtNull:
+		return a, nil
+	case a.kind == rtInt && b.kind == rtInt:
+		return resolvedType{kind: rtInt, intTy: promote(a, b)}, nil
+	case (a.kind == rtInt || a.kind == rtDecimal) && (b.kind == rtInt || b.kind == rtDecimal):
+		// at least one decimal (both-int handled above) -> decimal
+		return resolvedType{kind: rtDecimal}, nil
+	case a.kind == b.kind:
+		return a, nil
+	default:
+		return resolvedType{}, NewError(DatatypeMismatch, fmt.Sprintf(
+			"%s types %s and %s cannot be matched", setopName(op), rtName(a), rtName(b),
+		))
+	}
+}
+
+// coerceSetopRows converts each row's values in place to the unified set-operation column types —
+// the only runtime change is integer -> decimal (a NULL stays NULL; integer-width promotion is a
+// value no-op since every integer is int64). Same conversion coerceCase uses for CASE.
+func coerceSetopRows(rows [][]Value, from, to []resolvedType) {
+	for i := range to {
+		if from[i].kind == rtInt && to[i].kind == rtDecimal {
+			for r := range rows {
+				if rows[r][i].Kind == ValInt {
+					rows[r][i] = DecimalValue(DecimalFromInt64(rows[r][i].Int))
+				}
+			}
+		}
+	}
+}
+
+// combineSetop combines the operands' rows per the set operator + ALL flag (spec/design/grammar.md
+// §25). Rows match by the NULL-safe, value-canonical distinctRowKey (two NULLs match, 1.5 == 1.50,
+// and a converted int matches the decimal). The emitted representative for a matched / deduplicated
+// key is its FIRST occurrence scanning the LEFT operand then the right, and emitted rows keep that
+// left-then-right scan order — deterministic and identical across cores. (A later ORDER BY
+// re-sorts; without one, output order is unspecified and the corpus compares rowsort.)
+func combineSetop(op SetOpKind, all bool, left, right [][]Value) [][]Value {
+	switch {
+	case op == SetOpUnion && all:
+		out := make([][]Value, 0, len(left)+len(right))
+		out = append(out, left...)
+		out = append(out, right...)
+		return out
+	case op == SetOpUnion:
+		seen := make(map[string]bool)
+		out := make([][]Value, 0)
+		for _, row := range left {
+			if k := distinctRowKey(row); !seen[k] {
+				seen[k] = true
+				out = append(out, row)
+			}
+		}
+		for _, row := range right {
+			if k := distinctRowKey(row); !seen[k] {
+				seen[k] = true
+				out = append(out, row)
+			}
+		}
+		return out
+	case op == SetOpIntersect && all:
+		counts := make(map[string]int)
+		for _, row := range right {
+			counts[distinctRowKey(row)]++
+		}
+		out := make([][]Value, 0)
+		for _, row := range left {
+			k := distinctRowKey(row)
+			if counts[k] > 0 {
+				counts[k]--
+				out = append(out, row)
+			}
+		}
+		return out
+	case op == SetOpIntersect:
+		rightSet := make(map[string]bool)
+		for _, row := range right {
+			rightSet[distinctRowKey(row)] = true
+		}
+		emitted := make(map[string]bool)
+		out := make([][]Value, 0)
+		for _, row := range left {
+			k := distinctRowKey(row)
+			if rightSet[k] && !emitted[k] {
+				emitted[k] = true
+				out = append(out, row)
+			}
+		}
+		return out
+	case op == SetOpExcept && all:
+		counts := make(map[string]int)
+		for _, row := range right {
+			counts[distinctRowKey(row)]++
+		}
+		out := make([][]Value, 0)
+		for _, row := range left {
+			k := distinctRowKey(row)
+			if counts[k] > 0 {
+				counts[k]--
+			} else {
+				out = append(out, row)
+			}
+		}
+		return out
+	default: // EXCEPT, distinct
+		rightSet := make(map[string]bool)
+		for _, row := range right {
+			rightSet[distinctRowKey(row)] = true
+		}
+		emitted := make(map[string]bool)
+		out := make([][]Value, 0)
+		for _, row := range left {
+			k := distinctRowKey(row)
+			if !rightSet[k] && !emitted[k] {
+				emitted[k] = true
+				out = append(out, row)
+			}
+		}
+		return out
+	}
+}
+
+// resolveSetopOrderKey resolves a trailing ORDER BY key for a set operation against the OUTPUT
+// column names (the left operand's). A qualified key is 42P01 (no relation scope after a set
+// operation); an unknown name is 42703. Returns the output column index.
+func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
+	if key.Qualifier != "" {
+		return 0, NewError(UndefinedTable, "missing FROM-clause entry for table "+key.Qualifier)
+	}
+	for i, n := range names {
+		if strings.EqualFold(n, key.Column) {
+			return i, nil
+		}
+	}
+	return 0, NewError(UndefinedColumn, "column "+key.Column+" does not exist")
 }
 
 // runSelect analyzes and runs a SELECT: resolve projected columns and the WHERE/ORDER BY columns

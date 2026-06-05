@@ -166,6 +166,41 @@ ON a.k = b.k` where 1 `a`-row matches 1 `b`-row and the other 2 `a`-rows match n
 materialize, 6 `ON`, no WHERE, and 1 matched + 2 NULL-extended = 3 emitted rows → **3 + 2 + 6 + 3 =
 14** (the INNER form of the same query is `… + 1 = 12`; the +2 is the two preserved-left rows).
 
+### Set operations — `lhs + rhs`, the combine unmetered
+
+A set operation ([grammar.md](grammar.md) §25) — `UNION`/`INTERSECT`/`EXCEPT`, each with an
+optional `ALL` — combines the result sets of two operand queries. Its cost is the **sum of the
+operand costs and nothing more**:
+
+> `cost(a ⊕ b) = cost(a) + cost(b)`
+
+Each operand is a full `select_core` (or a nested set operation) run through the ordinary query
+path, so it **already** charges `storage_row_read` per scanned row, the `operator_eval`s of its
+own clauses, and `row_produced` per row it emits (its *pre-combine* output). The set-operation
+layer then consumes those materialized rows and does **only set-membership work** — match rows by
+the NULL-safe value-canonical key, take the multiset union / intersection / difference, emit the
+representative rows — which is **unmetered**, exactly like `DISTINCT` dedup (above), the
+`ORDER BY` sort, and the `LIMIT`/`OFFSET` slice. The trailing `ORDER BY` and `LIMIT`/`OFFSET` of a
+set operation are likewise unmetered (§ "What is NOT metered"). The integer→`decimal` value
+conversion that type unification may apply before keying (§25) is structural, like a JOIN's
+NULL-extension, and charges nothing. **No new cost unit** is introduced.
+
+This **follows the `INSERT … SELECT` precedent** (§24, where the wrapping statement adds nothing
+to the embedded `SELECT`'s cost), not the single-`SELECT` shape. A deliberate consequence: the
+`DISTINCT` invariant "`row_produced` equals the output row count" **does not hold** for a set
+operation — the operands charge `row_produced` for their *pre-combine* rows, and the combine that
+drops/duplicates rows is unmetered, so the accrued `row_produced` reflects what the operands
+produced, not the set operation's final output. This is correct and intended: cost composes from
+the independently-metered subqueries.
+
+**Worked example.** Tables `a` (3 rows) and `b` (2 rows); `SELECT x FROM a UNION SELECT x FROM b`.
+The left operand materializes `a` → 3 `storage_row_read` and emits 3 rows → 3 `row_produced` (a
+bare-column projection is a leaf, charging no `operator_eval`): 6. The right operand: 2 + 2 = 4.
+The `UNION` dedup is unmetered. **Total = 6 + 4 = 10**, whatever the number of distinct output
+rows. `UNION ALL` (no dedup) costs the **same** 10 — the dedup was already free, so dropping it
+changes nothing. The cross-core contract is trivially identical: it is literally the sum of two
+independently-deterministic operand costs.
+
 ### What is NOT metered (defined boundary)
 
 Metering covers **execution** — per-row scans, per-row produced, per-row expression
@@ -192,6 +227,11 @@ evaluation. It deliberately does **not** meter:
   Cartesian/left-deep combinations, and concatenating left+right rows are bookkeeping, not
   evaluation; only `storage_row_read` (per materialized row), the `ON`/WHERE/projection
   `operator_eval`s, and `row_produced` accrue (see the JOIN subsection above).
+- **Set-operation combine** — matching rows by the NULL-safe value-canonical key, the multiset
+  union/intersection/difference, the integer→`decimal` unification conversion, and the trailing
+  `ORDER BY`/`LIMIT`/`OFFSET` are all set-membership / bookkeeping, not evaluation; a set
+  operation accrues only its operands' costs (`lhs + rhs`, see the set-operations subsection
+  above).
 
 ## 4. Counter representation — exactness across cores (CLAUDE.md §8)
 

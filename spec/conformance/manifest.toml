@@ -153,6 +153,18 @@ id = "query.having"
 description = "HAVING <predicate>: boolean filter over grouped rows, after aggregation and before ORDER BY; may reference aggregates (even ones not projected) and grouping keys; a non-grouped column is 42803, non-boolean is 42804; HAVING alone makes a query an aggregate query; HAVING with no GROUP BY filters the single whole-table group (spec/design/aggregates.md §8, grammar.md §19)"
 
 [[capability]]
+id = "query.union"
+description = "UNION / UNION ALL — combine two SELECTs' result rows; the bare form deduplicates (NULL-safe, value-canonical), ALL keeps multiplicities; output column count + names come from the left operand; per-column type unification (integer max-rank, integer<->decimal, all-NULL->text); arity mismatch 42601, type mismatch 42804; INTERSECT binds tighter; optional trailing ORDER BY/LIMIT/OFFSET resolves by output column name (spec/design/grammar.md §25)"
+
+[[capability]]
+id = "query.intersect"
+description = "INTERSECT / INTERSECT ALL — rows present in both operands; the bare form is distinct, ALL keeps min(m,n) multiplicities; same column/type unification and trailing ORDER BY rules as UNION; binds tighter than UNION/EXCEPT (spec/design/grammar.md §25)"
+
+[[capability]]
+id = "query.except"
+description = "EXCEPT / EXCEPT ALL — rows in the left operand not in the right; the bare form is distinct, ALL keeps max(0,m-n) multiplicities; same column/type unification and trailing ORDER BY rules as UNION (spec/design/grammar.md §25)"
+
+[[capability]]
 id = "types.int16"
 description = "int16 / smallint scalar type"
 
@@ -427,4 +439,14 @@ includes = "outer_joins"
 capabilities = [
   "types.timestamp",
   "types.timestamptz",
+]
+
+[[profile]]
+id = "set_operations"
+title = "decimal + set operations UNION/INTERSECT/EXCEPT (each [ALL]) with PG precedence, column-type unification, and a trailing ORDER BY by output name (Phase 4, spec/design/grammar.md §25)"
+includes = "decimal"
+capabilities = [
+  "query.union",
+  "query.intersect",
+  "query.except",
 ]

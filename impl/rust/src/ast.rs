@@ -10,6 +10,11 @@ pub enum Statement {
     DropTable(DropTable),
     Insert(Insert),
     Select(Select),
+    /// A set operation (`UNION`/`INTERSECT`/`EXCEPT`) combining two query expressions
+    /// (spec/design/grammar.md §25). A lone `SELECT` stays `Statement::Select` — this variant
+    /// appears only when at least one set operator is present, so the plain-query path and the
+    /// host API are untouched.
+    SetOp(SetOp),
     Update(Update),
     Delete(Delete),
 }
@@ -184,6 +189,41 @@ pub struct Select {
     /// ORDER BY, before projection (spec/design/grammar.md §9).
     pub limit: Option<i64>,
     /// `OFFSET m` — skip the first `m` rows of the result (a non-negative count).
+    pub offset: Option<i64>,
+}
+
+/// A query expression — the operand of a set operation (spec/design/grammar.md §25). Either a
+/// single `SELECT` core or a nested set operation, so chains like `a UNION b INTERSECT c` form a
+/// tree. Boxed at each arm to keep the recursive type sized.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum QueryExpr {
+    Select(Box<Select>),
+    SetOp(Box<SetOp>),
+}
+
+/// The three set operators (spec/design/grammar.md §25).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// A set operation combining two query expressions (spec/design/grammar.md §25). `all` is the
+/// `ALL` (multiset) flag — `false` is the deduplicating default. The optional trailing
+/// `ORDER BY` / `LIMIT` / `OFFSET` apply to the WHOLE combined result and live on the OUTERMOST
+/// node only (an operand carries none — a deferred narrowing); `order_by` keys resolve against
+/// the output column names (the left operand's). Precedence is handled by the parser:
+/// `INTERSECT` binds tighter than `UNION`/`EXCEPT`, which are left-associative.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SetOp {
+    pub op: SetOpKind,
+    pub all: bool,
+    pub lhs: QueryExpr,
+    pub rhs: QueryExpr,
+    /// Trailing ORDER BY over the combined result (empty = none); keys resolve by output name.
+    pub order_by: Vec<OrderKey>,
+    pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
 

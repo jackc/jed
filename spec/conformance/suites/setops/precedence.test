@@ -1,0 +1,98 @@
+# Set-operation precedence, associativity, and chained type unification (spec/design/grammar.md
+# §25). PostgreSQL precedence: INTERSECT binds TIGHTER than UNION/EXCEPT, which share one level
+# and are LEFT-associative. Type unification folds left to right across a chain (integer widths
+# to the widest; integer with decimal to decimal). Cost = sum of all operand costs (cost.md §3).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.intersect, query.except, query.order_by, types.int16, types.int32, types.int64, types.decimal, resource.cost_metering
+
+statement ok
+CREATE TABLE p (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE q (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE s (id int32 PRIMARY KEY, k int32)
+
+statement ok
+INSERT INTO p VALUES (1, 1)
+
+statement ok
+INSERT INTO q VALUES (1, 2), (2, 3)
+
+statement ok
+INSERT INTO s VALUES (1, 3), (2, 4)
+
+# INTERSECT binds tighter: `p UNION q INTERSECT s` = `p UNION (q INTERSECT s)`.
+# q INTERSECT s = {3}; p UNION {3} = {1, 3}. (Left-assoc would give ({1,2,3} INTERSECT {3,4}) =
+# {3} — so the result {1,3} proves INTERSECT first.) cost = 2*1 + 2*2 + 2*2 = 10.
+# names: k
+# cost: 10
+query I rowsort
+SELECT k FROM p UNION SELECT k FROM q INTERSECT SELECT k FROM s
+----
+1
+3
+
+# UNION / EXCEPT are left-associative: `s EXCEPT q UNION p` = `(s EXCEPT q) UNION p`.
+# (s EXCEPT q) = {3,4} \ {2,3} = {4}; {4} UNION {1} = {1, 4}. (Right-assoc would give {4}.)
+# cost = 2*2 + 2*2 + 2*1 = 10.
+# names: k
+# cost: 10
+query I rowsort
+SELECT k FROM s EXCEPT SELECT k FROM q UNION SELECT k FROM p
+----
+1
+4
+
+# Three-operand UNION chain, deduplicated across the whole chain: {1} U {2,3} U {3,4} = {1,2,3,4}.
+# cost = 2 + 4 + 4 = 10.
+# names: k
+# cost: 10
+query I nosort
+SELECT k FROM p UNION SELECT k FROM q UNION SELECT k FROM s ORDER BY k
+----
+1
+2
+3
+4
+
+# --- chained type unification -----------------------------------------------------------------
+statement ok
+CREATE TABLE ci (id int32 PRIMARY KEY, n int16)
+
+statement ok
+CREATE TABLE ck (id int32 PRIMARY KEY, n int64)
+
+statement ok
+CREATE TABLE cd (id int32 PRIMARY KEY, n decimal(10,2))
+
+statement ok
+INSERT INTO ci VALUES (1, 5)
+
+statement ok
+INSERT INTO ck VALUES (1, 7)
+
+statement ok
+INSERT INTO cd VALUES (1, 8.25)
+
+# int16 UNION int64 folds to int64 (the widest integer); values stay integers. Output type I.
+# cost = 2 + 2 = 4.
+# names: n
+# cost: 4
+query I rowsort
+SELECT n FROM ci UNION SELECT n FROM ck
+----
+5
+7
+
+# A chain reaching a decimal operand folds the WHOLE column to decimal: every integer operand's
+# values convert (rendered at scale 0), the decimal keeps its scale. {5, 7, 8.25}, output type D.
+# cost = 2 + 2 + 2 = 6.
+# names: n
+# cost: 6
+query D rowsort
+SELECT n FROM ci UNION SELECT n FROM ck UNION SELECT n FROM cd
+----
+5
+7
+8.25

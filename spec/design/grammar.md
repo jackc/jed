@@ -898,3 +898,104 @@ deterministic, cross-core cost is exactly what the source query accrues — unli
 identical across cores (key-ordered scans, insertion-ordered grouping/distinct, left-deep
 joins — [encoding.md](encoding.md), CLAUDE.md §8), so the rowids assigned to
 a no-PK target are byte-identical across the three cores.
+
+## 25. Set operations (`UNION` / `INTERSECT` / `EXCEPT`)
+
+A **query expression** is the top-level query form: one or more `SELECT` cores combined by the
+set operators `UNION`, `INTERSECT`, `EXCEPT` — the first construct where a query is built from
+two sub-queries rather than a single `SELECT`. Each operator has a bare (distinct) form and an
+`ALL` (multiset) form: `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]`. PostgreSQL is the
+behavioral default (CLAUDE.md §1); the semantics below are pinned against `postgres:18`.
+
+The grammar ([../grammar/grammar.ebnf](../grammar/grammar.ebnf)) is a two-level precedence tree
+over `select_core` (a `SELECT` with no trailing `ORDER BY`/`LIMIT`/`OFFSET`), with the trailing
+clauses lifted to the whole expression:
+
+```
+query_expr     ::= set_expr order_by? limit_offset?
+set_expr       ::= intersect_expr (("UNION" | "EXCEPT") ("ALL" | "DISTINCT")? intersect_expr)*
+intersect_expr ::= select_core ("INTERSECT" ("ALL" | "DISTINCT")? select_core)*
+```
+
+A lone query (no set operator) is a single `select_core` whose trailing clauses fold back onto
+it — byte-for-byte the pre-set-operations `SELECT`. `UNION`/`INTERSECT`/`EXCEPT`/`ALL`/`DISTINCT`
+are **not reserved** (§3), disambiguated positionally.
+
+**Precedence — PostgreSQL.** `INTERSECT` **binds tighter** than `UNION` and `EXCEPT`, so it is
+its own inner level; `UNION` and `EXCEPT` share one outer level and are **left-associative**.
+Thus `a UNION b INTERSECT c` parses as `a UNION (b INTERSECT c)` and `a UNION b EXCEPT c` as
+`(a UNION b) EXCEPT c`. (Oracle: `(VALUES 1) UNION (VALUES 2,3) INTERSECT (VALUES 3,4)` →
+`{1, 3}`, confirming `INTERSECT` first.) `DISTINCT` after an operator is the explicit spelling of
+the bare (deduplicating) default.
+
+**Result columns — count and names from the LEFT operand.** Both operands must produce the
+**same number of columns**, else `42601` (PostgreSQL: "each UNION query must have the same number
+of columns"); the check fires **before any row is produced**, so it errors even over empty
+operands. The output column **names** are the left operand's (the right operand's names and
+aliases are discarded). For a chain, "left" is the leftmost `SELECT` — names propagate up the
+left spine.
+
+**Column types — unified per position, full PG fidelity.** Each output column's type is the
+fold of the operands' types at that position ([cost.md](cost.md) §3 records the same lattice as a
+cross-core contract):
+
+- integer widths **promote** to the widest (`int16` < `int32` < `int64`);
+- integer and `decimal` unify to **`decimal`** (oracle: `int2 ∪ int4` → `integer`, `int4 ∪ int8`
+  → `bigint`, `int ∪ numeric` → `numeric`);
+- a column that is **`NULL`-typed in every operand** unifies to **`text`** (PostgreSQL's
+  unknown-literal resolution — oracle: `(SELECT NULL) UNION (SELECT NULL)` → `text`); a `NULL`
+  type alongside any concrete type takes the concrete type;
+- otherwise the operands must share a base type (`text`/`boolean`/`bytea`/`uuid`/`timestamp`/
+  `timestamptz`), giving that type;
+- any other pairing is **`42804`** (PostgreSQL: "UNION types `X` and `Y` cannot be matched").
+
+When the unified type is `decimal`, an integer operand's **values are converted** to `decimal`
+(scale 0) *before* rows are matched — this is load-bearing for correctness, not just for the
+output type tag: the engine's row identity keys an `int` and a `decimal` value distinctly, so
+without the conversion `SELECT 1 … INTERSECT SELECT 1.0 …` would wrongly find no match. Each
+value keeps its **own** display scale (unconstrained `numeric`, the per-value model of
+[decimal.md](decimal.md) §6) — a converted integer renders at scale 0 (`1`), a decimal keeps its
+scale (`2.50`); the engine does **not** normalize the column to a uniform scale (oracle:
+`SELECT 1 UNION ALL SELECT 2.50` → `1`, `2.50`). Integer width promotion needs no value
+conversion (every integer is one internal 64-bit value).
+
+**Row identity — NULL-safe, value-canonical, exactly as `DISTINCT`.** Two rows are "the same row"
+under the engine's NULL-safe equality (`IS NOT DISTINCT FROM` — §11): `NULL` matches `NULL`
+(oracle: `(VALUES NULL) INTERSECT (VALUES NULL)` → one `NULL` row) and decimals match by
+value-canonical form (`1.5` ≡ `1.50`). The **representative** emitted for a matched/deduplicated
+key is the **first occurrence scanning the left operand then the right** — so its display scale is
+the left's where they tie (oracle: `SELECT 1.0 INTERSECT SELECT 1` → `1.0`; `SELECT 1 UNION
+SELECT 1.0` → `1`). This first-occurrence rule is deterministic and identical across cores.
+
+**Multiset semantics** (let *m*, *n* be a row key's multiplicity in the left and right operand):
+
+| form | result multiplicity per key | bare form (no `ALL`) |
+|---|---|---|
+| `UNION ALL` | all left rows then all right rows | `UNION` — one per key present in either |
+| `INTERSECT ALL` | `min(m, n)` | `INTERSECT` — one per key with `m>0 ∧ n>0` |
+| `EXCEPT ALL` | `max(0, m − n)` | `EXCEPT` — one per key with `m>0 ∧ n=0` |
+
+(Oracle: `{1,1} INTERSECT ALL {1,1,1}` → `{1,1}`; `{1,1,2} EXCEPT ALL {1}` → `{1,2}`;
+`{1,1,2} EXCEPT {1}` → `{2}`.)
+
+**Trailing `ORDER BY` / `LIMIT` / `OFFSET` apply to the whole result**, after the combine. Keys
+resolve against the **output columns by name** (the left operand's names) — there is no relation
+scope after a set operation, so a **qualified** key (`ORDER BY t.x`) is an error (PostgreSQL:
+"missing FROM-clause entry"; the engine reports `42P01`/undefined). **Ordinals** (`ORDER BY 1`)
+stay deferred, consistent with the engine deferring ordinals everywhere (§5, §10). Direction and
+`NULLS FIRST|LAST` work exactly as §10 (the same `key_cmp` over the output-row value). `LIMIT`/
+`OFFSET` then window the ordered result (§9). Output order **without** a trailing `ORDER BY` is
+unspecified (CLAUDE.md §8/§10; the corpus compares such queries `rowsort`); the result *multiset*
+is exact and identical across cores regardless.
+
+**Deferred narrowings (each relaxable later).**
+
+- **No parenthesized operands** — `(SELECT …) UNION …` is not accepted.
+- **No `ORDER BY`/`LIMIT`/`OFFSET` inside an operand** — only on the whole result. Because a
+  `select_core` does not consume those clauses, an operand `ORDER BY` is left dangling and the
+  statement fails to consume all input → `42601` (the leftover-token rule). To order *then*
+  combine, the parenthesized-operand relaxation above is the eventual path.
+- **No ordinals** in the trailing `ORDER BY` (above).
+- **No set operation in an `INSERT … SELECT` source** (§24) — the source stays a single `select`.
+
+**Cost** is `lhs + rhs`, the combine itself unmetered — see [cost.md](cost.md) §3.

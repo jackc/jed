@@ -14,9 +14,11 @@ import type {
   JoinKind,
   Literal,
   OrderKey,
+  QueryExpr,
   Select,
   SelectItem,
   SelectItems,
+  SetOpKind,
   Statement,
   TableRef,
   TypeMod,
@@ -56,6 +58,11 @@ function isTableRefStopKeyword(kw: string): boolean {
     case "outer":
     case "on":
     case "as":
+    // set operators end a SELECT core — they must not be swallowed as an implicit table alias
+    // (`FROM a UNION ...` is a UNION, not a table `a` aliased `union`). §25.
+    case "union":
+    case "intersect":
+    case "except":
       return true;
     default:
       return false;
@@ -108,7 +115,7 @@ class Parser {
       case "insert":
         return this.parseInsert();
       case "select":
-        return this.parseSelect();
+        return this.parseQueryExpr();
       case "update":
         return this.parseUpdate();
       case "delete":
@@ -309,10 +316,101 @@ class Parser {
     throw engineError("syntax_error", "expected a literal value");
   }
 
-  // parseSelect parses
-  // `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <key> [, <key>]*]
-  // [LIMIT <count>] [OFFSET <count>]`. LIMIT/OFFSET may appear in either order (§9).
+  // parseQueryExpr parses a top-level query expression (spec/design/grammar.md §25): one or more
+  // SELECT cores combined by UNION/INTERSECT/EXCEPT, with an optional trailing ORDER BY/LIMIT/OFFSET
+  // applying to the whole result. A lone query (no set operator) folds the trailing clauses back
+  // onto the single Select, leaving the plain-query path untouched; otherwise a SetOp is returned.
+  private parseQueryExpr(): Statement {
+    const node = this.parseSetExpr();
+    const orderBy = this.parseOrderBy();
+    const { limit, offset } = this.parseLimitOffsetClauses();
+    // Both Select and SetOp carry orderBy/limit/offset; the spread keeps the `kind` discriminant.
+    return { ...node, orderBy, limit, offset };
+  }
+
+  // parseSetExpr parses the lower-precedence, left-associative UNION/EXCEPT level. INTERSECT binds
+  // tighter (parsed inside parseIntersectExpr), so `a UNION b INTERSECT c` becomes
+  // `a UNION (b INTERSECT c)`.
+  private parseSetExpr(): QueryExpr {
+    let left = this.parseIntersectExpr();
+    for (;;) {
+      const kw = this.peekKeyword();
+      let op: SetOpKind;
+      if (kw === "union") op = "union";
+      else if (kw === "except") op = "except";
+      else return left;
+      this.advance(); // UNION | EXCEPT
+      const all = this.parseSetOpQuantifier();
+      const right = this.parseIntersectExpr();
+      left = { kind: "setOp", op, all, lhs: left, rhs: right, orderBy: [], limit: null, offset: null };
+    }
+  }
+
+  // parseIntersectExpr parses the higher-precedence, left-associative INTERSECT level.
+  private parseIntersectExpr(): QueryExpr {
+    let left: QueryExpr = this.parseSelectCore();
+    while (this.peekKeyword() === "intersect") {
+      this.advance(); // INTERSECT
+      const all = this.parseSetOpQuantifier();
+      const right = this.parseSelectCore();
+      left = { kind: "setOp", op: "intersect", all, lhs: left, rhs: right, orderBy: [], limit: null, offset: null };
+    }
+    return left;
+  }
+
+  // parseSetOpQuantifier consumes the optional ALL (multiset) or DISTINCT (explicit default)
+  // quantifier after a set operator, returning whether ALL was given.
+  private parseSetOpQuantifier(): boolean {
+    const kw = this.peekKeyword();
+    if (kw === "all") {
+      this.advance();
+      return true;
+    }
+    if (kw === "distinct") {
+      this.advance();
+      return false;
+    }
+    return false;
+  }
+
+  // parseLimitOffsetClauses parses an optional `LIMIT <count>` / `OFFSET <count>` pair, in either
+  // order, each at most once (§9). Returns nulls when absent.
+  private parseLimitOffsetClauses(): { limit: bigint | null; offset: bigint | null } {
+    let limit: bigint | null = null;
+    let offset: bigint | null = null;
+    for (;;) {
+      const kw = this.peekKeyword();
+      if (kw === "limit") {
+        if (limit !== null) throw engineError("syntax_error", "duplicate LIMIT clause");
+        this.advance();
+        limit = this.parseCount(true);
+      } else if (kw === "offset") {
+        if (offset !== null) throw engineError("syntax_error", "duplicate OFFSET clause");
+        this.advance();
+        offset = this.parseCount(false);
+      } else {
+        break;
+      }
+    }
+    return { limit, offset };
+  }
+
+  // parseSelect parses a complete SELECT with its own trailing ORDER BY/LIMIT/OFFSET — the form an
+  // INSERT ... SELECT source takes (spec/design/grammar.md §24). Behaviorally identical to the
+  // pre-set-operations parseSelect: a select_core plus the trailing clauses.
   private parseSelect(): Select {
+    const sel = this.parseSelectCore();
+    sel.orderBy = this.parseOrderBy();
+    const { limit, offset } = this.parseLimitOffsetClauses();
+    sel.limit = limit;
+    sel.offset = offset;
+    return sel;
+  }
+
+  // parseSelectCore parses a SELECT without a trailing ORDER BY/LIMIT/OFFSET — the operand form of
+  // a set operation (spec/design/grammar.md §25). The returned Select has empty orderBy and null
+  // limit/offset.
+  private parseSelectCore(): Select {
     this.expectKeyword("select");
 
     // DISTINCT is not reserved (a column may be named `distinct`), and it is the only
@@ -340,26 +438,19 @@ class Parser {
 
     const having = this.parseHaving();
 
-    const orderBy = this.parseOrderBy();
-
-    let limit: bigint | null = null;
-    let offset: bigint | null = null;
-    for (;;) {
-      const kw = this.peekKeyword();
-      if (kw === "limit") {
-        if (limit !== null) throw engineError("syntax_error", "duplicate LIMIT clause");
-        this.advance();
-        limit = this.parseCount(true);
-      } else if (kw === "offset") {
-        if (offset !== null) throw engineError("syntax_error", "duplicate OFFSET clause");
-        this.advance();
-        offset = this.parseCount(false);
-      } else {
-        break;
-      }
-    }
-
-    return { kind: "select", distinct, items, from, joins, filter, groupBy, having, orderBy, limit, offset };
+    return {
+      kind: "select",
+      distinct,
+      items,
+      from,
+      joins,
+      filter,
+      groupBy,
+      having,
+      orderBy: [],
+      limit: null,
+      offset: null,
+    };
   }
 
   // parseHaving parses `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and

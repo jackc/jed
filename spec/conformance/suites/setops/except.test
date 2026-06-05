@@ -1,0 +1,109 @@
+# EXCEPT / EXCEPT ALL (spec/design/grammar.md §25): rows in the LEFT operand not in the right.
+# The bare form is distinct (one row per left key absent from the right); EXCEPT ALL keeps
+# max(0, m - n) copies, where m, n are a row's multiplicity in the left and right operand.
+# Matching is NULL-safe (NULL == NULL) and value-canonical. Output columns count + names from
+# the left operand. Cost = lhs.cost + rhs.cost (the difference is unmetered) — cost.md §3.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.except, query.where_eq, query.comparison_order, query.order_by, types.int32, types.decimal, resource.cost_metering
+
+statement ok
+CREATE TABLE l (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE r (id int32 PRIMARY KEY, k int32)
+
+# l.k multiplicities: 1->3, 2->1, 3->1 ; r.k multiplicities: 1->1, 2->1
+statement ok
+INSERT INTO l VALUES (1, 1), (2, 1), (3, 1), (4, 2), (5, 3)
+
+statement ok
+INSERT INTO r VALUES (1, 1), (2, 2)
+
+# EXCEPT (distinct): left keys {1,2,3} minus right keys {1,2} = {3}. cost = 2*5 + 2*2 = 14.
+# names: k
+# cost: 14
+query I rowsort
+SELECT k FROM l EXCEPT SELECT k FROM r
+----
+3
+
+# EXCEPT DISTINCT — explicit spelling of the bare form.
+# names: k
+query I rowsort
+SELECT k FROM l EXCEPT DISTINCT SELECT k FROM r
+----
+3
+
+# EXCEPT ALL keeps max(0, m - n): key 1 -> max(0,3-1)=2, key 2 -> max(0,1-1)=0,
+# key 3 -> max(0,1-0)=1. Result {1, 1, 3}. cost still 14.
+# names: k
+# cost: 14
+query I rowsort
+SELECT k FROM l EXCEPT ALL SELECT k FROM r
+----
+1
+1
+3
+
+# Trailing ORDER BY over the combined result.
+# names: k
+# cost: 14
+query I nosort
+SELECT k FROM l EXCEPT ALL SELECT k FROM r ORDER BY k
+----
+1
+1
+3
+
+# Right operand empty -> EXCEPT is just the left's distinct rows {1,2,3}. left = 2*5 = 10;
+# right = 2 scan + 2 compare + 0 produced = 4; total 14.
+# names: k
+# cost: 14
+query I rowsort
+SELECT k FROM l EXCEPT SELECT k FROM r WHERE k > 100
+----
+1
+2
+3
+
+# --- NULL identity: a NULL on the right removes the left NULL ----------------------------------
+statement ok
+CREATE TABLE ln (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE rn (id int32 PRIMARY KEY, k int32)
+
+statement ok
+INSERT INTO ln VALUES (1, 5), (2, NULL)
+
+statement ok
+INSERT INTO rn VALUES (1, NULL), (2, 9)
+
+# left {5, NULL} EXCEPT right {NULL, 9}: the NULL matches and is removed; 5 stays. cost = 8.
+# names: k
+# cost: 8
+query I rowsort
+SELECT k FROM ln EXCEPT SELECT k FROM rn
+----
+5
+
+# --- integer <-> decimal: matched rows convert; the survivor keeps the LEFT operand's value ----
+statement ok
+CREATE TABLE ld (id int32 PRIMARY KEY, n decimal(10,1))
+
+statement ok
+CREATE TABLE ri (id int32 PRIMARY KEY, n int32)
+
+statement ok
+INSERT INTO ld VALUES (1, 1.0), (2, 2.5)
+
+statement ok
+INSERT INTO ri VALUES (1, 1)
+
+# ld {1.0, 2.5} EXCEPT ri-as-decimal {1}: 1.0 == 1 removed, 2.5 survives (left value `2.5`).
+# Output type decimal. cost = 2*2 + 2*1 = 6.
+# names: n
+# cost: 6
+query D rowsort
+SELECT n FROM ld EXCEPT SELECT n FROM ri
+----
+2.5

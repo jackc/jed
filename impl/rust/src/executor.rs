@@ -6,7 +6,8 @@
 
 use crate::ast::{
     BinaryOp, CreateTable, Delete, DropTable, Expr, Insert, InsertSource, InsertValue, JoinKind,
-    Literal, Select, SelectItems, Statement, TypeMod, UnaryOp, Update,
+    Literal, OrderKey, QueryExpr, Select, SelectItems, SetOp, SetOpKind, Statement, TypeMod,
+    UnaryOp, Update,
 };
 use crate::catalog::{Column, Table};
 use crate::cost::Meter;
@@ -167,6 +168,7 @@ impl Database {
             }
             Statement::Insert(ins) => self.execute_insert(ins, params),
             Statement::Select(sel) => self.execute_select(sel, params),
+            Statement::SetOp(so) => self.execute_set_op(so, params),
             Statement::Update(upd) => self.execute_update(upd, params),
             Statement::Delete(del) => self.execute_delete(del, params),
         }
@@ -673,6 +675,112 @@ impl Database {
             column_names: r.column_names,
             rows: r.rows,
             cost: r.cost,
+        })
+    }
+
+    /// Execute a set operation (spec/design/grammar.md §25): run the operand query expressions,
+    /// unify their column types, combine the rows per the operator + ALL flag, then apply the
+    /// trailing ORDER BY / LIMIT / OFFSET. Cost is `lhs.cost + rhs.cost` — the combine, sort, and
+    /// window are unmetered (spec/design/cost.md §3).
+    fn execute_set_op(&mut self, so: SetOp, params: &[Value]) -> Result<Outcome> {
+        let r = self.run_set_op(so, params)?;
+        Ok(Outcome::Query {
+            column_names: r.column_names,
+            rows: r.rows,
+            cost: r.cost,
+        })
+    }
+
+    /// Run a query expression to a `SelectResult` — a lone `SELECT` via `run_select`, or a set
+    /// operation via `run_set_op` (recursively, so a chain `a UNION b INTERSECT c` evaluates as
+    /// the parsed precedence tree).
+    fn run_query_expr(&mut self, qe: QueryExpr, params: &[Value]) -> Result<SelectResult> {
+        match qe {
+            QueryExpr::Select(sel) => self.run_select(*sel, params),
+            QueryExpr::SetOp(so) => self.run_set_op(*so, params),
+        }
+    }
+
+    fn run_set_op(&mut self, so: SetOp, params: &[Value]) -> Result<SelectResult> {
+        let SetOp {
+            op,
+            all,
+            lhs,
+            rhs,
+            order_by,
+            limit,
+            offset,
+        } = so;
+        let left = self.run_query_expr(lhs, params)?;
+        let right = self.run_query_expr(rhs, params)?;
+
+        // Arity: both operands must produce the same number of columns. Checked before any row is
+        // matched, so it fires over empty operands too. PostgreSQL uses 42601 here.
+        if left.column_types.len() != right.column_types.len() {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                format!(
+                    "each {} query must have the same number of columns",
+                    setop_name(op)
+                ),
+            ));
+        }
+
+        // Per-column type unification (42804 on an incompatible pair). Output column NAMES are the
+        // LEFT operand's (PostgreSQL).
+        let out_types: Vec<ResolvedType> = left
+            .column_types
+            .iter()
+            .zip(right.column_types.iter())
+            .map(|(&l, &r)| unify_setop_column(l, r, op))
+            .collect::<Result<_>>()?;
+
+        // Convert each operand's values to the unified column types BEFORE matching — the only
+        // runtime conversion is integer -> decimal (so an int value and a decimal value compare
+        // equal). Integer width promotion needs none (every integer is i64).
+        let mut left_rows = left.rows;
+        let mut right_rows = right.rows;
+        coerce_setop_rows(&mut left_rows, &left.column_types, &out_types);
+        coerce_setop_rows(&mut right_rows, &right.column_types, &out_types);
+
+        let mut rows = combine_setop(op, all, left_rows, right_rows);
+        let cost = left.cost + right.cost;
+
+        // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
+        // operation): a qualified key is 42P01, an unknown name is 42703. Reuse key_cmp; the sort
+        // is stable, so a full tie keeps the combine order (left rows before right).
+        let mut order: Vec<(usize, bool, bool)> = Vec::with_capacity(order_by.len());
+        for key in &order_by {
+            let slot = resolve_setop_order_key(key, &left.column_names)?;
+            order.push((slot, key.descending, key.nulls_first));
+        }
+        if !order.is_empty() {
+            rows.sort_by(|a, b| {
+                for &(idx, descending, nulls_first) in &order {
+                    let ord = key_cmp(&a[idx], &b[idx], descending, nulls_first);
+                    if ord.is_ne() {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        // LIMIT / OFFSET window — clamp in the integer domain (counts are non-negative, parser),
+        // applied AFTER the sort; unmetered, like every window.
+        let len = rows.len();
+        let start = offset.unwrap_or(0).min(len as i64) as usize;
+        let end = match limit {
+            Some(lim) if lim < (len - start) as i64 => start + lim as usize,
+            _ => len,
+        };
+        let rows = rows[start..end].to_vec();
+
+        Ok(SelectResult {
+            column_names: left.column_names,
+            column_types: out_types,
+            rows,
+            cost,
         })
     }
 
@@ -2786,6 +2894,175 @@ fn coerce_case(v: Value, to_decimal: bool) -> Value {
         (true, Value::Int(n)) => Value::Decimal(Decimal::from_i64(n)),
         (_, v) => v,
     }
+}
+
+/// The operator's name for an error message (PostgreSQL phrasing).
+fn setop_name(op: SetOpKind) -> &'static str {
+    match op {
+        SetOpKind::Union => "UNION",
+        SetOpKind::Intersect => "INTERSECT",
+        SetOpKind::Except => "EXCEPT",
+    }
+}
+
+/// Unify one output column's type across the two operands of a set operation
+/// (spec/design/grammar.md §25, types.md §4): integer widths promote to the widest; integer with
+/// decimal -> decimal; a NULL-typed operand takes the other's type (an all-NULL column stays NULL
+/// — PostgreSQL would call a top-level one `text`, but the type is never observed in output); a
+/// same-family non-numeric pair gives that type; anything else is 42804. The set of unifiable
+/// pairs mirrors the comparability matrix (compare.toml).
+fn unify_setop_column(a: ResolvedType, b: ResolvedType, op: SetOpKind) -> Result<ResolvedType> {
+    use ResolvedType::*;
+    let out = match (a, b) {
+        (Null, Null) => Null,
+        (Null, x) | (x, Null) => x,
+        (Int(_), Int(_)) => Int(promote(a, b)),
+        (Decimal, Decimal) | (Int(_), Decimal) | (Decimal, Int(_)) => Decimal,
+        (Text, Text) => Text,
+        (Bool, Bool) => Bool,
+        (Bytea, Bytea) => Bytea,
+        (Uuid, Uuid) => Uuid,
+        (Timestamp, Timestamp) => Timestamp,
+        (Timestamptz, Timestamptz) => Timestamptz,
+        _ => {
+            return Err(EngineError::new(
+                SqlState::DatatypeMismatch,
+                format!(
+                    "{} types {} and {} cannot be matched",
+                    setop_name(op),
+                    a.type_name(),
+                    b.type_name()
+                ),
+            ));
+        }
+    };
+    Ok(out)
+}
+
+/// Convert each row's values in place to the unified set-operation column types — the only runtime
+/// change is integer -> decimal (a NULL stays NULL; integer-width promotion is a value no-op since
+/// every integer is i64). Same conversion `coerce_case` uses for CASE.
+fn coerce_setop_rows(rows: &mut [Vec<Value>], from: &[ResolvedType], to: &[ResolvedType]) {
+    for (i, (&f, &t)) in from.iter().zip(to.iter()).enumerate() {
+        if matches!(f, ResolvedType::Int(_)) && t == ResolvedType::Decimal {
+            for row in rows.iter_mut() {
+                if let Value::Int(n) = &row[i] {
+                    let n = *n;
+                    row[i] = Value::Decimal(Decimal::from_i64(n));
+                }
+            }
+        }
+    }
+}
+
+/// Combine the operands' rows per the set operator + ALL flag (spec/design/grammar.md §25). Rows
+/// match by NULL-safe, value-canonical equality (the `Value` Eq/Hash — two NULLs match, 1.5 ==
+/// 1.50, and a converted int matches the decimal). The emitted representative for a matched /
+/// deduplicated key is its FIRST occurrence scanning the LEFT operand then the right, and emitted
+/// rows keep that left-then-right scan order — deterministic and identical across cores. (A later
+/// ORDER BY re-sorts; without one, output order is unspecified and the corpus compares rowsort.)
+fn combine_setop(
+    op: SetOpKind,
+    all: bool,
+    left: Vec<Vec<Value>>,
+    right: Vec<Vec<Value>>,
+) -> Vec<Vec<Value>> {
+    match (op, all) {
+        // UNION ALL: every left row then every right row, no dedup.
+        (SetOpKind::Union, true) => {
+            let mut rows = left;
+            rows.extend(right);
+            rows
+        }
+        // UNION: one copy per key present in either, first occurrence (left scanned first).
+        (SetOpKind::Union, false) => {
+            let mut seen: HashSet<Vec<Value>> = HashSet::new();
+            let mut out = Vec::new();
+            for row in left.into_iter().chain(right) {
+                if seen.insert(row.clone()) {
+                    out.push(row);
+                }
+            }
+            out
+        }
+        // INTERSECT ALL: min(m, n) copies — emit a left row while the right still has budget.
+        (SetOpKind::Intersect, true) => {
+            let mut counts: HashMap<Vec<Value>, usize> = HashMap::new();
+            for row in right {
+                *counts.entry(row).or_insert(0) += 1;
+            }
+            let mut out = Vec::new();
+            for row in left {
+                if let Some(c) = counts.get_mut(&row) {
+                    if *c > 0 {
+                        *c -= 1;
+                        out.push(row);
+                    }
+                }
+            }
+            out
+        }
+        // INTERSECT: one copy per distinct left key also present in the right.
+        (SetOpKind::Intersect, false) => {
+            let right_set: HashSet<Vec<Value>> = right.into_iter().collect();
+            let mut emitted: HashSet<Vec<Value>> = HashSet::new();
+            let mut out = Vec::new();
+            for row in left {
+                if right_set.contains(&row) && emitted.insert(row.clone()) {
+                    out.push(row);
+                }
+            }
+            out
+        }
+        // EXCEPT ALL: max(0, m - n) copies — the right cancels the first n left occurrences.
+        (SetOpKind::Except, true) => {
+            let mut counts: HashMap<Vec<Value>, usize> = HashMap::new();
+            for row in right {
+                *counts.entry(row).or_insert(0) += 1;
+            }
+            let mut out = Vec::new();
+            for row in left {
+                match counts.get_mut(&row) {
+                    Some(c) if *c > 0 => *c -= 1,
+                    _ => out.push(row),
+                }
+            }
+            out
+        }
+        // EXCEPT: one copy per distinct left key absent from the right.
+        (SetOpKind::Except, false) => {
+            let right_set: HashSet<Vec<Value>> = right.into_iter().collect();
+            let mut emitted: HashSet<Vec<Value>> = HashSet::new();
+            let mut out = Vec::new();
+            for row in left {
+                if !right_set.contains(&row) && emitted.insert(row.clone()) {
+                    out.push(row);
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Resolve a trailing ORDER BY key for a set operation against the OUTPUT column names (the left
+/// operand's). A qualified key is 42P01 (no relation scope after a set operation); an unknown name
+/// is 42703. Returns the output column index.
+fn resolve_setop_order_key(key: &OrderKey, names: &[String]) -> Result<usize> {
+    if let Some(q) = &key.qualifier {
+        return Err(EngineError::new(
+            SqlState::UndefinedTable,
+            format!("missing FROM-clause entry for table {q}"),
+        ));
+    }
+    names
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(&key.column))
+        .ok_or_else(|| {
+            EngineError::new(
+                SqlState::UndefinedColumn,
+                format!("column {} does not exist", key.column),
+            )
+        })
 }
 
 fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {

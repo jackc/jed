@@ -463,7 +463,34 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         [grammar.md §15](spec/design/grammar.md). `USING` / `NATURAL` / comma-`FROM` / `t.*` stay
         deferred. _(was: M; deps: INNER/CROSS slice)_
 - [ ] **Subqueries** — scalar, `IN (subquery)`, `EXISTS`, then correlated. _(size: L; deps: joins)_
-- [ ] **Set operations** — `UNION [ALL]`, `INTERSECT`, `EXCEPT`. _(size: M)_
+- [x] **Set operations** — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` — done & committed across
+      Rust/Go/TS. The top-level query grew from a single `select` to a **query expression**
+      (`query_expr ::= set_expr order_by? limit_offset?`): a two-level precedence tree
+      (`INTERSECT` binds **tighter** than `UNION`/`EXCEPT`, which are equal-precedence and
+      left-associative — the PostgreSQL precedence) over `select_core`s (a SELECT with **no**
+      trailing ORDER BY/LIMIT/OFFSET, which hoist to the whole result). AST is **additive** —
+      `Statement::SetOp` + a recursive `QueryExpr { Select | SetOp }`; a lone SELECT stays
+      `Statement::Select`, so the plain-query path and host API are byte-unchanged. The set
+      operators were added to the **table-ref stop-keyword** set so `FROM a UNION …` is not
+      swallowed as an implicit alias. Per-column **type unification** is full-PG: integer width
+      promotion, integer↔decimal → decimal (the narrower operand's **values are converted before
+      row-keying** — load-bearing so `1 INTERSECT 1.0` matches), all-NULL → text; output **column
+      count + names come from the left operand**. Row identity is **NULL-safe + value-canonical**
+      (reusing the DISTINCT key machinery), with multiset semantics `min(m,n)` / `max(0,m−n)` for
+      the `ALL` variants and the emitted representative = first occurrence (left scanned first). A
+      trailing `ORDER BY` resolves keys by **output column name** (qualified key → `42P01`, unknown
+      → `42703`; ordinals stay deferred). Arity mismatch → **`42601`**, type mismatch → **`42804`**
+      (no new error codes). Cost is the cross-core contract ([cost.md §3](spec/design/cost.md)):
+      **`lhs.cost + rhs.cost`** — the combine/dedup, the trailing sort, and the LIMIT/OFFSET window
+      are unmetered (mirrors `INSERT … SELECT`), so a LIMIT does **not** lower the cost. Semantics
+      pinned against the live `postgres:18` oracle. Authored in
+      [grammar.ebnf](spec/grammar/grammar.ebnf) + [grammar.md §25](spec/design/grammar.md),
+      [types.md §4](spec/design/types.md), capabilities `query.union` / `query.intersect` /
+      `query.except` + the `set_operations` profile in [manifest.toml](spec/conformance/manifest.toml),
+      pinned by `spec/conformance/suites/setops/*.test` (60/0/0 all cores). **Deferred narrowings**
+      (relaxable later): no parenthesized operands `(SELECT …) UNION …`, no ORDER BY/LIMIT inside an
+      operand (→ `42601`), no ORDER BY ordinals, and no set operation in an `INSERT … SELECT` source.
+      _(was: M)_
 - [x] **`NOT NULL`** — explicit column constraint; storing NULL (direct, omitted, or applied
       default) traps `23502`. PRIMARY KEY still implies it (spec/design/constraints.md §1).
 - [x] **`DEFAULT`** (literal) — `DEFAULT <literal>` column constraint, evaluated + coerced once

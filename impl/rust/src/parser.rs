@@ -6,8 +6,8 @@
 
 use crate::ast::{
     Assignment, BinaryOp, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert, InsertSource,
-    InsertValue, JoinClause, JoinKind, Literal, OrderKey, Select, SelectItem, SelectItems,
-    Statement, TableRef, TypeMod, UnaryOp, Update,
+    InsertValue, JoinClause, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItem,
+    SelectItems, SetOp, SetOpKind, Statement, TableRef, TypeMod, UnaryOp, Update,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -39,7 +39,7 @@ impl Parser {
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
             Some("drop") => Ok(Statement::DropTable(self.parse_drop_table()?)),
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
-            Some("select") => Ok(Statement::Select(self.parse_select()?)),
+            Some("select") => self.parse_query_expr(),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
             Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
             Some(other) => Err(syntax(format!("unexpected keyword '{other}'"))),
@@ -283,7 +283,111 @@ impl Parser {
     /// leading `DISTINCT` is the modifier iff the next token is neither `FROM` nor
     /// end-of-input — otherwise the word is a column named `distinct`
     /// (spec/design/grammar.md §11). This rule must be byte-identical across cores.
+    /// Parse a top-level query expression (spec/design/grammar.md §25): one or more `select_core`s
+    /// combined by `UNION`/`INTERSECT`/`EXCEPT`, with an optional trailing `ORDER BY`/`LIMIT`/
+    /// `OFFSET` applying to the whole result. A lone query (no set operator) folds the trailing
+    /// clauses back onto the single `Select` and is returned as `Statement::Select`, leaving the
+    /// plain-query path untouched; otherwise it is a `Statement::SetOp`.
+    fn parse_query_expr(&mut self) -> Result<Statement> {
+        let node = self.parse_set_expr()?;
+        let order_by = self.parse_order_by()?;
+        let (limit, offset) = self.parse_limit_offset()?;
+        match node {
+            QueryExpr::Select(mut sel) => {
+                sel.order_by = order_by;
+                sel.limit = limit;
+                sel.offset = offset;
+                Ok(Statement::Select(*sel))
+            }
+            QueryExpr::SetOp(mut so) => {
+                so.order_by = order_by;
+                so.limit = limit;
+                so.offset = offset;
+                Ok(Statement::SetOp(*so))
+            }
+        }
+    }
+
+    /// `set_expr ::= intersect_expr (("UNION" | "EXCEPT") ("ALL"|"DISTINCT")? intersect_expr)*` —
+    /// the lower-precedence, left-associative level. `INTERSECT` binds tighter (parsed inside
+    /// `parse_intersect_expr`), so `a UNION b INTERSECT c` becomes `a UNION (b INTERSECT c)`.
+    fn parse_set_expr(&mut self) -> Result<QueryExpr> {
+        let mut left = self.parse_intersect_expr()?;
+        loop {
+            let op = match self.peek_keyword().as_deref() {
+                Some("union") => SetOpKind::Union,
+                Some("except") => SetOpKind::Except,
+                _ => break,
+            };
+            self.advance(); // UNION | EXCEPT
+            let all = self.parse_setop_quantifier();
+            let right = self.parse_intersect_expr()?;
+            left = QueryExpr::SetOp(Box::new(SetOp {
+                op,
+                all,
+                lhs: left,
+                rhs: right,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            }));
+        }
+        Ok(left)
+    }
+
+    /// `intersect_expr ::= select_core ("INTERSECT" ("ALL"|"DISTINCT")? select_core)*` — the
+    /// higher-precedence, left-associative `INTERSECT` level.
+    fn parse_intersect_expr(&mut self) -> Result<QueryExpr> {
+        let mut left = QueryExpr::Select(Box::new(self.parse_select_core()?));
+        while self.peek_keyword().as_deref() == Some("intersect") {
+            self.advance(); // INTERSECT
+            let all = self.parse_setop_quantifier();
+            let right = QueryExpr::Select(Box::new(self.parse_select_core()?));
+            left = QueryExpr::SetOp(Box::new(SetOp {
+                op: SetOpKind::Intersect,
+                all,
+                lhs: left,
+                rhs: right,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            }));
+        }
+        Ok(left)
+    }
+
+    /// The optional quantifier after a set operator: `ALL` (multiset) or `DISTINCT` (the explicit
+    /// spelling of the deduplicating default). Returns whether `ALL` was given.
+    fn parse_setop_quantifier(&mut self) -> bool {
+        match self.peek_keyword().as_deref() {
+            Some("all") => {
+                self.advance();
+                true
+            }
+            Some("distinct") => {
+                self.advance();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// A complete `SELECT` with its own optional trailing `ORDER BY`/`LIMIT`/`OFFSET` — the form an
+    /// `INSERT ... SELECT` source takes (spec/design/grammar.md §24). Behaviorally identical to the
+    /// pre-set-operations `select`: a `select_core` plus the trailing clauses.
     fn parse_select(&mut self) -> Result<Select> {
+        let mut sel = self.parse_select_core()?;
+        sel.order_by = self.parse_order_by()?;
+        let (limit, offset) = self.parse_limit_offset()?;
+        sel.limit = limit;
+        sel.offset = offset;
+        Ok(sel)
+    }
+
+    /// `select_core ::= "SELECT" "DISTINCT"? select_items "FROM" from_clause where? group_by?
+    /// having?` — a `SELECT` WITHOUT a trailing `ORDER BY`/`LIMIT`/`OFFSET` (the operand form of a
+    /// set operation). The returned `Select` has empty `order_by` and no `limit`/`offset`.
+    fn parse_select_core(&mut self) -> Result<Select> {
         self.expect_keyword("select")?;
 
         let distinct = if self.peek_keyword().as_deref() == Some("distinct") {
@@ -310,10 +414,6 @@ impl Parser {
 
         let having = self.parse_having()?;
 
-        let order_by = self.parse_order_by()?;
-
-        let (limit, offset) = self.parse_limit_offset()?;
-
         Ok(Select {
             distinct,
             items,
@@ -322,9 +422,9 @@ impl Parser {
             filter,
             group_by,
             having,
-            order_by,
-            limit,
-            offset,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
         })
     }
 
@@ -1124,6 +1224,11 @@ fn is_table_ref_stop_keyword(kw: &str) -> bool {
             | "outer"
             | "on"
             | "as"
+            // set operators end a SELECT core — they must not be swallowed as an implicit table
+            // alias (`FROM a UNION ...` is a UNION, not a table `a` aliased `union`). §25.
+            | "union"
+            | "intersect"
+            | "except"
     )
 }
 

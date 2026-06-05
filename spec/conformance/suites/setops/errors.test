@@ -1,0 +1,62 @@
+# Set-operation error cases (spec/design/grammar.md §25). Column-count (arity) mismatch is
+# 42601; per-column type mismatch is 42804 (PostgreSQL: "UNION types X and Y cannot be matched").
+# An ORDER BY on an operand is a 42601 (leftover token — operands carry no trailing clauses); a
+# trailing ORDER BY resolves by OUTPUT column name only, so a qualified key is 42P01 and an
+# unknown name is 42703.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.intersect, query.except, query.order_by, types.int32, types.text
+
+statement ok
+CREATE TABLE x (id int32 PRIMARY KEY, a int32, b int32)
+
+statement ok
+CREATE TABLE y (id int32 PRIMARY KEY, a int32, t text)
+
+statement ok
+INSERT INTO x VALUES (1, 10, 20)
+
+statement ok
+INSERT INTO y VALUES (1, 30, 'hi')
+
+# Arity mismatch: 2 columns UNION 1 column -> 42601.
+statement error 42601
+SELECT a, b FROM x UNION SELECT a FROM y
+
+# Arity mismatch the other way, and for INTERSECT / EXCEPT too.
+statement error 42601
+SELECT a FROM x INTERSECT SELECT a, t FROM y
+
+statement error 42601
+SELECT a, b FROM x EXCEPT SELECT a FROM y
+
+# Type mismatch: integer column UNION text column -> 42804 (cross-family, not unifiable).
+statement error 42804
+SELECT a FROM x UNION SELECT t FROM y
+
+# Type mismatch in the second position (col 1 int matches int; col 2 int vs text) -> 42804.
+statement error 42804
+SELECT a, b FROM x UNION SELECT a, t FROM y
+
+# Same for INTERSECT / EXCEPT.
+statement error 42804
+SELECT a FROM x INTERSECT SELECT t FROM y
+
+statement error 42804
+SELECT t FROM y EXCEPT SELECT a FROM x
+
+# An ORDER BY on an OPERAND (before the set operator) is rejected: the operand grammar carries no
+# trailing clauses, so the UNION keyword is left unconsumed -> 42601.
+statement error 42601
+SELECT a FROM x ORDER BY a UNION SELECT a FROM y
+
+# A LIMIT on an operand is likewise 42601.
+statement error 42601
+SELECT a FROM x LIMIT 1 UNION SELECT a FROM y
+
+# A trailing ORDER BY resolves against the OUTPUT columns (no relation scope after a set
+# operation): a qualified key is 42P01 (no such FROM-clause entry).
+statement error 42P01
+SELECT a FROM x UNION SELECT a FROM y ORDER BY x.a
+
+# An unknown output column name in the trailing ORDER BY is 42703.
+statement error 42703
+SELECT a FROM x UNION SELECT a FROM y ORDER BY nope

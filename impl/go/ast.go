@@ -9,8 +9,12 @@ type Statement struct {
 	DropTable   *DropTable
 	Insert      *Insert
 	Select      *Select
-	Update      *Update
-	Delete      *Delete
+	// SetOp is a set operation (UNION/INTERSECT/EXCEPT) combining two query expressions
+	// (spec/design/grammar.md §25). Non-nil only when at least one set operator is present; a
+	// lone SELECT stays in Select, so the plain-query path and host API are untouched.
+	SetOp  *SetOp
+	Update *Update
+	Delete *Delete
 }
 
 // CreateTable is a CREATE TABLE statement.
@@ -170,6 +174,38 @@ type Select struct {
 	// nil pointer means the clause is absent.
 	Limit  *int64
 	Offset *int64
+}
+
+// QueryExpr is the operand of a set operation (spec/design/grammar.md §25): either a single
+// SELECT core or a nested set operation, so a chain like `a UNION b INTERSECT c` forms a tree.
+// Exactly one field is non-nil.
+type QueryExpr struct {
+	Select *Select
+	SetOp  *SetOp
+}
+
+// SetOpKind is the set operator (spec/design/grammar.md §25).
+type SetOpKind int
+
+const (
+	SetOpUnion SetOpKind = iota
+	SetOpIntersect
+	SetOpExcept
+)
+
+// SetOp combines two query expressions (spec/design/grammar.md §25). All is the ALL (multiset)
+// flag — false is the deduplicating default. The optional trailing ORDER BY / LIMIT / OFFSET apply
+// to the WHOLE combined result and live on the outermost node only (an operand carries none — a
+// deferred narrowing); OrderBy keys resolve against the output column names (the left operand's).
+// Precedence is handled by the parser: INTERSECT binds tighter than UNION/EXCEPT (left-associative).
+type SetOp struct {
+	Op      SetOpKind
+	All     bool
+	Lhs     QueryExpr
+	Rhs     QueryExpr
+	OrderBy []OrderKey
+	Limit   *int64
+	Offset  *int64
 }
 
 // SelectItems is either all columns (*) or a list of projected expressions.

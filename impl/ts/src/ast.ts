@@ -240,5 +240,29 @@ export type Update = {
 // expression must resolve to boolean.
 export type Delete = { kind: "delete"; table: string; filter: Expr | null };
 
-// Statement is a parsed top-level statement.
-export type Statement = CreateTable | DropTable | Insert | Select | Update | Delete;
+// SetOpKind is the set operator (spec/design/grammar.md §25).
+export type SetOpKind = "union" | "intersect" | "except";
+
+// QueryExpr is the operand of a set operation (spec/design/grammar.md §25): either a single SELECT
+// core or a nested set operation, so a chain like `a UNION b INTERSECT c` forms a tree.
+export type QueryExpr = Select | SetOp;
+
+// SetOp combines two query expressions (spec/design/grammar.md §25). `all` is the ALL (multiset)
+// flag — false is the deduplicating default. The optional trailing ORDER BY / LIMIT / OFFSET apply
+// to the WHOLE combined result and live on the outermost node only (an operand carries none — a
+// deferred narrowing); orderBy keys resolve against the output column names (the left operand's).
+// Precedence is handled by the parser: INTERSECT binds tighter than UNION/EXCEPT (left-associative).
+export type SetOp = {
+  kind: "setOp";
+  op: SetOpKind;
+  all: boolean;
+  lhs: QueryExpr;
+  rhs: QueryExpr;
+  orderBy: OrderKey[];
+  limit: bigint | null;
+  offset: bigint | null;
+};
+
+// Statement is a parsed top-level statement. A lone SELECT stays `Select`; `SetOp` appears only
+// when at least one set operator is present, so the plain-query path and host API are untouched.
+export type Statement = CreateTable | DropTable | Insert | Select | SetOp | Update | Delete;

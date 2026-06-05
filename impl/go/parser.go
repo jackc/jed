@@ -84,11 +84,7 @@ func (p *Parser) parseStatement() (Statement, error) {
 		}
 		return Statement{Insert: ins}, nil
 	case "select":
-		sel, err := p.parseSelect()
-		if err != nil {
-			return Statement{}, err
-		}
-		return Statement{Select: sel}, nil
+		return p.parseQueryExpr()
 	case "update":
 		upd, err := p.parseUpdate()
 		if err != nil {
@@ -399,7 +395,121 @@ func (p *Parser) parseLiteral() (Literal, error) {
 // `SELECT <items> FROM <table> [WHERE <predicate>] [ORDER BY <key> [, <key>]*]
 // [LIMIT <count>] [OFFSET <count>]`, where <items> is `*` or a comma-separated list of
 // column refs / CASTs. LIMIT/OFFSET may appear in either order (§9).
+// parseQueryExpr parses a top-level query expression (spec/design/grammar.md §25): one or more
+// SELECT cores combined by UNION/INTERSECT/EXCEPT, with an optional trailing ORDER BY/LIMIT/OFFSET
+// applying to the whole result. A lone query (no set operator) folds the trailing clauses back onto
+// the single Select and is returned as Statement{Select}, leaving the plain-query path untouched;
+// otherwise it is Statement{SetOp}.
+func (p *Parser) parseQueryExpr() (Statement, error) {
+	node, err := p.parseSetExpr()
+	if err != nil {
+		return Statement{}, err
+	}
+	// Trailing ORDER BY / LIMIT / OFFSET parse once, onto a scratch Select, then move onto the
+	// outermost node (the lone Select, or the outermost SetOp).
+	var trailing Select
+	if err := p.parseOrderBy(&trailing); err != nil {
+		return Statement{}, err
+	}
+	if err := p.parseLimitOffset(&trailing); err != nil {
+		return Statement{}, err
+	}
+	if node.Select != nil {
+		sel := node.Select
+		sel.OrderBy = trailing.OrderBy
+		sel.Limit = trailing.Limit
+		sel.Offset = trailing.Offset
+		return Statement{Select: sel}, nil
+	}
+	so := node.SetOp
+	so.OrderBy = trailing.OrderBy
+	so.Limit = trailing.Limit
+	so.Offset = trailing.Offset
+	return Statement{SetOp: so}, nil
+}
+
+// parseSetExpr parses the lower-precedence, left-associative UNION/EXCEPT level. INTERSECT binds
+// tighter (parsed inside parseIntersectExpr), so `a UNION b INTERSECT c` becomes
+// `a UNION (b INTERSECT c)`.
+func (p *Parser) parseSetExpr() (QueryExpr, error) {
+	left, err := p.parseIntersectExpr()
+	if err != nil {
+		return QueryExpr{}, err
+	}
+	for {
+		var op SetOpKind
+		switch p.peekKeyword() {
+		case "union":
+			op = SetOpUnion
+		case "except":
+			op = SetOpExcept
+		default:
+			return left, nil
+		}
+		p.advance() // UNION | EXCEPT
+		all := p.parseSetOpQuantifier()
+		right, err := p.parseIntersectExpr()
+		if err != nil {
+			return QueryExpr{}, err
+		}
+		left = QueryExpr{SetOp: &SetOp{Op: op, All: all, Lhs: left, Rhs: right}}
+	}
+}
+
+// parseIntersectExpr parses the higher-precedence, left-associative INTERSECT level.
+func (p *Parser) parseIntersectExpr() (QueryExpr, error) {
+	core, err := p.parseSelectCore()
+	if err != nil {
+		return QueryExpr{}, err
+	}
+	left := QueryExpr{Select: core}
+	for p.peekKeyword() == "intersect" {
+		p.advance() // INTERSECT
+		all := p.parseSetOpQuantifier()
+		right, err := p.parseSelectCore()
+		if err != nil {
+			return QueryExpr{}, err
+		}
+		left = QueryExpr{SetOp: &SetOp{Op: SetOpIntersect, All: all, Lhs: left, Rhs: QueryExpr{Select: right}}}
+	}
+	return left, nil
+}
+
+// parseSetOpQuantifier consumes the optional ALL (multiset) or DISTINCT (explicit default)
+// quantifier after a set operator, returning whether ALL was given.
+func (p *Parser) parseSetOpQuantifier() bool {
+	switch p.peekKeyword() {
+	case "all":
+		p.advance()
+		return true
+	case "distinct":
+		p.advance()
+		return false
+	default:
+		return false
+	}
+}
+
+// parseSelect parses a complete SELECT with its own trailing ORDER BY/LIMIT/OFFSET — the form an
+// INSERT ... SELECT source takes (spec/design/grammar.md §24). Behaviorally identical to the
+// pre-set-operations select: a select_core plus the trailing clauses.
 func (p *Parser) parseSelect() (*Select, error) {
+	sel, err := p.parseSelectCore()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.parseOrderBy(sel); err != nil {
+		return nil, err
+	}
+	if err := p.parseLimitOffset(sel); err != nil {
+		return nil, err
+	}
+	return sel, nil
+}
+
+// parseSelectCore parses a SELECT without a trailing ORDER BY/LIMIT/OFFSET — the operand form of a
+// set operation (spec/design/grammar.md §25). The returned Select has no OrderBy/Limit/Offset set.
+func (p *Parser) parseSelectCore() (*Select, error) {
 	if err := p.expectKeyword("select"); err != nil {
 		return nil, err
 	}
@@ -444,14 +554,6 @@ func (p *Parser) parseSelect() (*Select, error) {
 	}
 
 	if err := p.parseHaving(sel); err != nil {
-		return nil, err
-	}
-
-	if err := p.parseOrderBy(sel); err != nil {
-		return nil, err
-	}
-
-	if err := p.parseLimitOffset(sel); err != nil {
 		return nil, err
 	}
 
@@ -576,7 +678,10 @@ func (p *Parser) parseJoinClause() (JoinClause, bool, error) {
 func isTableRefStopKeyword(kw string) bool {
 	switch kw {
 	case "where", "group", "having", "order", "limit", "offset",
-		"join", "inner", "cross", "left", "right", "full", "outer", "on", "as":
+		"join", "inner", "cross", "left", "right", "full", "outer", "on", "as",
+		// set operators end a SELECT core — they must not be swallowed as an implicit table
+		// alias (`FROM a UNION ...` is a UNION, not a table `a` aliased `union`). §25.
+		"union", "intersect", "except":
 		return true
 	default:
 		return false

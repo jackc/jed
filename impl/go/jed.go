@@ -63,6 +63,10 @@ var SupportedCapabilities = []string{
 	// HAVING: a boolean filter over grouped rows, after aggregation, before ORDER BY
 	// (spec/design/aggregates.md §8, grammar.md §19).
 	"query.having",
+	// Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
+	"query.union",
+	"query.intersect",
+	"query.except",
 	// Scalar functions abs / round (per-row, valid anywhere an expression is) —
 	// spec/design/functions.md §9.
 	"func.abs",

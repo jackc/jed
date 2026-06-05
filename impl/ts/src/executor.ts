@@ -12,8 +12,12 @@ import type {
   Expr,
   Insert,
   Literal,
+  OrderKey,
+  QueryExpr,
   Select,
   SelectItems,
+  SetOp,
+  SetOpKind,
   Statement,
   TypeMod,
   Update,
@@ -146,6 +150,8 @@ export class Database {
         return this.executeInsert(stmt, params);
       case "select":
         return this.executeSelect(stmt, params);
+      case "setOp":
+        return this.executeSetOp(stmt, params);
       case "update":
         return this.executeUpdate(stmt, params);
       case "delete":
@@ -537,6 +543,72 @@ export class Database {
   private executeSelect(sel: Select, params: Value[]): Outcome {
     const r = this.runSelect(sel, params);
     return { kind: "query", columnNames: r.columnNames, rows: r.rows, cost: r.cost };
+  }
+
+  // executeSetOp runs a set operation as a top-level statement: runSetOp, then wrap as a query
+  // Outcome. Cost is lhs.cost + rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
+  private executeSetOp(so: SetOp, params: Value[]): Outcome {
+    const r = this.runSetOp(so, params);
+    return { kind: "query", columnNames: r.columnNames, rows: r.rows, cost: r.cost };
+  }
+
+  // runQueryExpr runs a query expression to a SelectResult — a lone SELECT via runSelect, or a set
+  // operation via runSetOp (recursively, so a chain `a UNION b INTERSECT c` evaluates as the parsed
+  // precedence tree).
+  private runQueryExpr(qe: QueryExpr, params: Value[]): SelectResult {
+    return qe.kind === "select" ? this.runSelect(qe, params) : this.runSetOp(qe, params);
+  }
+
+  private runSetOp(so: SetOp, params: Value[]): SelectResult {
+    const left = this.runQueryExpr(so.lhs, params);
+    const right = this.runQueryExpr(so.rhs, params);
+
+    // Arity: both operands must produce the same number of columns. Checked before any row is
+    // matched, so it fires over empty operands too. PostgreSQL uses 42601 here.
+    if (left.columnTypes.length !== right.columnTypes.length) {
+      throw engineError(
+        "syntax_error",
+        `each ${setopName(so.op)} query must have the same number of columns`,
+      );
+    }
+
+    // Per-column type unification (42804 on an incompatible pair). Output NAMES are the LEFT
+    // operand's (PostgreSQL).
+    const outTypes = left.columnTypes.map((l, i) => unifySetopColumn(l, right.columnTypes[i]!, so.op));
+
+    // Convert each operand's values to the unified column types BEFORE matching — the only runtime
+    // conversion is integer -> decimal (so an int value and a decimal value compare equal).
+    coerceSetopRows(left.rows, left.columnTypes, outTypes);
+    coerceSetopRows(right.rows, right.columnTypes, outTypes);
+
+    let rows = combineSetop(so.op, so.all, left.rows, right.rows);
+    const cost = left.cost + right.cost;
+
+    // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
+    // operation): a qualified key is 42P01, an unknown name is 42703. Reuse keyCmp; JS Array#sort
+    // is stable, so a full tie keeps the combine order (left rows before right).
+    const order = so.orderBy.map((key) => ({
+      idx: resolveSetopOrderKey(key, left.columnNames),
+      descending: key.descending,
+      nullsFirst: key.nullsFirst,
+    }));
+    if (order.length > 0) {
+      rows.sort((a, b) => {
+        for (const k of order) {
+          const c = keyCmp(a[k.idx]!, b[k.idx]!, k.descending, k.nullsFirst);
+          if (c !== 0) return c;
+        }
+        return 0;
+      });
+    }
+
+    // LIMIT / OFFSET window — clamp in the bigint domain (counts are non-negative, parser).
+    const n = BigInt(rows.length);
+    const start = so.offset === null ? 0n : so.offset < n ? so.offset : n;
+    const end = so.limit !== null && so.limit < n - start ? start + so.limit : n;
+    rows = rows.slice(Number(start), Number(end));
+
+    return { columnNames: left.columnNames, columnTypes: outTypes, rows, cost };
   }
 
   // runSelect resolves projected columns and the WHERE/ORDER BY columns against the catalog,
@@ -2054,6 +2126,140 @@ function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
 function coerceCaseValue(v: Value, toDecimal: boolean): Value {
   if (toDecimal && v.kind === "int") return decimalValue(Decimal.fromBigInt(v.int));
   return v;
+}
+
+// setopName is the operator's name for an error message (PostgreSQL phrasing).
+function setopName(op: SetOpKind): string {
+  return op === "union" ? "UNION" : op === "intersect" ? "INTERSECT" : "EXCEPT";
+}
+
+// unifySetopColumn unifies one output column's type across the two operands of a set operation
+// (spec/design/grammar.md §25, types.md §4): integer widths promote to the widest; integer with
+// decimal -> decimal; a NULL-typed operand takes the other's type (an all-NULL column stays "null"
+// — PostgreSQL would call a top-level one text, but the type is never observed in output); a
+// same-family non-numeric pair gives that type; anything else is 42804. The set of unifiable pairs
+// mirrors the comparability matrix (compare.toml).
+function unifySetopColumn(a: ResolvedType, b: ResolvedType, op: SetOpKind): ResolvedType {
+  if (a.kind === "null" && b.kind === "null") return { kind: "null" };
+  if (a.kind === "null") return b;
+  if (b.kind === "null") return a;
+  if (a.kind === "int" && b.kind === "int") return { kind: "int", ty: promote(a, b) };
+  if ((a.kind === "int" || a.kind === "decimal") && (b.kind === "int" || b.kind === "decimal")) {
+    // at least one decimal (both-int handled above) -> decimal
+    return { kind: "decimal" };
+  }
+  if (a.kind === b.kind) return a;
+  throw engineError(
+    "datatype_mismatch",
+    `${setopName(op)} types ${rtName(a)} and ${rtName(b)} cannot be matched`,
+  );
+}
+
+// coerceSetopRows converts each row's values in place to the unified set-operation column types —
+// the only runtime change is integer -> decimal (a NULL stays NULL; integer-width promotion is a
+// value no-op since every integer is bigint). Same conversion coerceCaseValue uses for CASE.
+function coerceSetopRows(rows: Value[][], from: ResolvedType[], to: ResolvedType[]): void {
+  for (let i = 0; i < to.length; i++) {
+    if (from[i]!.kind === "int" && to[i]!.kind === "decimal") {
+      for (const row of rows) {
+        const v = row[i]!;
+        if (v.kind === "int") row[i] = decimalValue(Decimal.fromBigInt(v.int));
+      }
+    }
+  }
+}
+
+// combineSetop combines the operands' rows per the set operator + ALL flag (spec/design/grammar.md
+// §25). Rows match by the NULL-safe, value-canonical distinctRowKey (two NULLs match, 1.5 == 1.50,
+// and a converted int matches the decimal). The emitted representative for a matched / deduplicated
+// key is its FIRST occurrence scanning the LEFT operand then the right, and emitted rows keep that
+// left-then-right scan order — deterministic and identical across cores. (A later ORDER BY
+// re-sorts; without one, output order is unspecified and the corpus compares rowsort.)
+function combineSetop(op: SetOpKind, all: boolean, left: Value[][], right: Value[][]): Value[][] {
+  if (op === "union" && all) return left.concat(right);
+  if (op === "union") {
+    const seen = new Set<string>();
+    const out: Value[][] = [];
+    for (const row of left.concat(right)) {
+      const k = distinctRowKey(row);
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(row);
+      }
+    }
+    return out;
+  }
+  if (op === "intersect" && all) {
+    const counts = new Map<string, number>();
+    for (const row of right) {
+      const k = distinctRowKey(row);
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
+    const out: Value[][] = [];
+    for (const row of left) {
+      const k = distinctRowKey(row);
+      const c = counts.get(k) ?? 0;
+      if (c > 0) {
+        counts.set(k, c - 1);
+        out.push(row);
+      }
+    }
+    return out;
+  }
+  if (op === "intersect") {
+    const rightSet = new Set<string>();
+    for (const row of right) rightSet.add(distinctRowKey(row));
+    const emitted = new Set<string>();
+    const out: Value[][] = [];
+    for (const row of left) {
+      const k = distinctRowKey(row);
+      if (rightSet.has(k) && !emitted.has(k)) {
+        emitted.add(k);
+        out.push(row);
+      }
+    }
+    return out;
+  }
+  if (op === "except" && all) {
+    const counts = new Map<string, number>();
+    for (const row of right) {
+      const k = distinctRowKey(row);
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
+    const out: Value[][] = [];
+    for (const row of left) {
+      const k = distinctRowKey(row);
+      const c = counts.get(k) ?? 0;
+      if (c > 0) counts.set(k, c - 1);
+      else out.push(row);
+    }
+    return out;
+  }
+  // EXCEPT, distinct
+  const rightSet = new Set<string>();
+  for (const row of right) rightSet.add(distinctRowKey(row));
+  const emitted = new Set<string>();
+  const out: Value[][] = [];
+  for (const row of left) {
+    const k = distinctRowKey(row);
+    if (!rightSet.has(k) && !emitted.has(k)) {
+      emitted.add(k);
+      out.push(row);
+    }
+  }
+  return out;
+}
+
+// resolveSetopOrderKey resolves a trailing ORDER BY key for a set operation against the OUTPUT
+// column names (the left operand's). A qualified key is 42P01 (no relation scope after a set
+// operation); an unknown name is 42703. Returns the output column index.
+function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
+  if (key.qualifier !== null) {
+    throw engineError("undefined_table", "missing FROM-clause entry for table " + key.qualifier);
+  }
+  const idx = names.findIndex((n) => n.toLowerCase() === key.column.toLowerCase());
+  if (idx < 0) throw engineError("undefined_column", "column " + key.column + " does not exist");
+  return idx;
 }
 
 // requireAssignable: a value assigned to a column must match its family — an integer column

@@ -1,0 +1,224 @@
+# UNION / UNION ALL (spec/design/grammar.md §25): combine two SELECTs' result rows. The bare
+# form deduplicates (NULL-safe, value-canonical — two NULLs collapse, 1.5 == 1.50), UNION ALL
+# keeps every row. Output column count + NAMES come from the LEFT operand. Output order with no
+# ORDER BY is unspecified (compared rowsort); a trailing ORDER BY/LIMIT/OFFSET applies to the
+# whole combined result and resolves keys by OUTPUT column name. Cost is the cross-core contract
+# of cost.md §3: cost = lhs.cost + rhs.cost; the dedup, the ORDER BY sort, and the LIMIT/OFFSET
+# slice are all unmetered — so a bare-column `SELECT col FROM t` operand costs 2*|t|
+# (storage_row_read + row_produced per row), and LIMIT does NOT lower the cost.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.column_alias, query.limit, query.offset, types.int32, types.decimal, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)
+
+# UNION ALL keeps multiplicities: a.k {10,20,30} ++ b.k {20,30,40} = 6 rows. rowsort (no ORDER
+# BY -> order unspecified). cost = 2*3 + 2*3 = 12.
+# names: k
+# cost: 12
+query I rowsort
+SELECT k FROM a UNION ALL SELECT k FROM b
+----
+10
+20
+30
+20
+30
+40
+
+# UNION (bare) deduplicates across both operands: distinct {10,20,30,40}. Dedup is unmetered,
+# so the cost is the SAME 12 as UNION ALL.
+# names: k
+# cost: 12
+query I rowsort
+SELECT k FROM a UNION SELECT k FROM b
+----
+10
+20
+30
+40
+
+# UNION DISTINCT is the explicit spelling of the bare form — identical result.
+# names: k
+query I rowsort
+SELECT k FROM a UNION DISTINCT SELECT k FROM b
+----
+10
+20
+30
+40
+
+# Trailing ORDER BY applies to the whole combined result (ascending: NULLS LAST default, none
+# here). cost unchanged at 12.
+# names: k
+# cost: 12
+query I nosort
+SELECT k FROM a UNION SELECT k FROM b ORDER BY k
+----
+10
+20
+30
+40
+
+# ORDER BY DESC over a UNION ALL — the window is the full multiset, ordered descending.
+# names: k
+# cost: 12
+query I nosort
+SELECT k FROM a UNION ALL SELECT k FROM b ORDER BY k DESC
+----
+40
+30
+30
+20
+20
+10
+
+# Output column NAMES come from the LEFT operand, and a trailing ORDER BY resolves by that
+# OUTPUT name (the left's alias `code`), not by any table column.
+# names: code
+# cost: 12
+query I nosort
+SELECT k AS code FROM a UNION SELECT k FROM b ORDER BY code
+----
+10
+20
+30
+40
+
+# LIMIT / OFFSET window the ordered combined result. They are UNMETERED and the operands still
+# produce all their rows, so the cost stays 12 even though only two rows are emitted.
+# names: k
+# cost: 12
+query I nosort
+SELECT k FROM a UNION SELECT k FROM b ORDER BY k LIMIT 2
+----
+10
+20
+
+# names: k
+# cost: 12
+query I nosort
+SELECT k FROM a UNION SELECT k FROM b ORDER BY k LIMIT 2 OFFSET 1
+----
+20
+30
+
+# An empty operand still contributes its full scan/filter cost. Left `WHERE k > 100` scans 3,
+# evaluates 3 compares, produces 0 (3+3+0 = 6); right is 2*3 = 6; total 12. Result = b.k.
+# names: k
+# cost: 12
+query I rowsort
+SELECT k FROM a WHERE k > 100 UNION SELECT k FROM b
+----
+20
+30
+40
+
+# A multi-column UNION ALL: rows are (id, k) pairs; rowsort orders by whole rows.
+# names: id, k
+# cost: 12
+query II rowsort
+SELECT id, k FROM a UNION ALL SELECT id, k FROM b
+----
+1
+10
+2
+20
+3
+30
+1
+20
+2
+30
+3
+40
+
+# --- NULL identity: NULL matches NULL in set-op dedup (not three-valued =) --------------------
+statement ok
+CREATE TABLE an (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE bn (id int32 PRIMARY KEY, k int32)
+
+statement ok
+INSERT INTO an VALUES (1, 10), (2, NULL)
+
+statement ok
+INSERT INTO bn VALUES (1, NULL), (2, 20)
+
+# UNION collapses the two NULLs into one: distinct {10, 20, NULL}. cost = 2*2 + 2*2 = 8.
+# names: k
+# cost: 8
+query I rowsort
+SELECT k FROM an UNION SELECT k FROM bn
+----
+10
+20
+NULL
+
+# UNION ALL keeps both NULLs: {10, NULL, NULL, 20} = 4 rows.
+# names: k
+# cost: 8
+query I rowsort
+SELECT k FROM an UNION ALL SELECT k FROM bn
+----
+10
+NULL
+NULL
+20
+
+# --- integer <-> decimal unification: the int operand's values convert to decimal before -------
+# --- row matching, so 5 (int) and 5.00 (decimal) are the SAME row. Output type is decimal (D). --
+statement ok
+CREATE TABLE ai (id int32 PRIMARY KEY, n int32)
+
+statement ok
+CREATE TABLE ad (id int32 PRIMARY KEY, n decimal(10,2))
+
+statement ok
+INSERT INTO ai VALUES (1, 5), (2, 7)
+
+statement ok
+INSERT INTO ad VALUES (1, 5.0), (2, 9.50)
+
+# UNION distinct: int 5 (rendered scale-0 `5`) == decimal 5.00 -> one row, representative is the
+# LEFT (first-scanned) operand's value `5`. Distinct set {5, 7, 9.50}, output type decimal.
+# cost = 2*2 + 2*2 = 8.
+# names: n
+# cost: 8
+query D rowsort
+SELECT n FROM ai UNION SELECT n FROM ad
+----
+5
+7
+9.50
+
+# Ordered, deduplicated (no ties survive dedup): 5, 7, 9.50.
+# names: n
+# cost: 8
+query D nosort
+SELECT n FROM ai UNION SELECT n FROM ad ORDER BY n
+----
+5
+7
+9.50
+
+# UNION ALL keeps all four; the int values render at scale 0 (`5`, `7`), the decimals at their
+# stored scale (`5.00`, `9.50`). rowsort over the decimal-typed column.
+# names: n
+# cost: 8
+query D rowsort
+SELECT n FROM ai UNION ALL SELECT n FROM ad
+----
+5
+7
+5.00
+9.50
