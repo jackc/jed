@@ -1,9 +1,11 @@
-//! Uncorrelated subqueries — scalar `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS
-//! (SELECT …)`. These complement the conformance corpus (spec/conformance/suites/subquery) with
-//! finer-grained per-feature assertions: plan-time folding semantics (execute once → constant),
-//! the typed-NULL of an empty scalar, three-valued `IN`, EXISTS ignoring the select list, the
-//! cost contract (the subquery's cost added once, the fold is a leaf), and the error / narrowing
-//! codes (21000 / 42601 / 0A000). See spec/design/grammar.md §26.
+//! Subqueries — scalar `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (SELECT …)`, both
+//! uncorrelated and CORRELATED. These complement the conformance corpus
+//! (spec/conformance/suites/subquery) with finer-grained per-feature assertions: the uncorrelated
+//! fold (execute once → constant, cost added once), the typed-NULL of an empty scalar, three-valued
+//! `IN`, EXISTS ignoring the select list; and for correlated subqueries the scope-chain resolution,
+//! per-outer-row execution + cost, correlation in a JOIN ON and inside an aggregate argument,
+//! multi-level + skip-level (grandparent) correlation, and the error / narrowing codes
+//! (21000 / 42601 / 0A000). See spec/design/grammar.md §26.
 
 use jed::value::Value;
 use jed::{Database, Outcome, execute};
@@ -277,22 +279,156 @@ fn subquery_error_codes() {
         ),
         // IN subquery returning more than one column -> 42601
         ("SELECT id FROM a WHERE k IN (SELECT id, k FROM b)", "42601"),
-        // correlated reference (bare) -> 0A000
+        // the >1-column check is plan-time, so it fires even over an empty subquery result
         (
-            "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE k = a.k)",
-            "0A000",
+            "SELECT (SELECT id, k FROM b WHERE id = 99) FROM a WHERE id = 1",
+            "42601",
         ),
-        // correlated reference (qualified outer label) in a scalar subquery -> 0A000
-        (
-            "SELECT (SELECT max(k) FROM b WHERE b.id = a.id) FROM a",
-            "0A000",
-        ),
-        // bind parameter inside a subquery -> 0A000
+        // bind parameter inside a subquery -> 0A000 (an orthogonal narrowing, §26)
         ("SELECT id FROM a WHERE k = (SELECT $1 FROM a LIMIT 1)", "0A000"),
-        // subquery outside a SELECT (DELETE WHERE) -> 0A000 this slice
+        // subquery outside a SELECT (DELETE WHERE) -> 0A000 this slice (SELECT-only)
         ("DELETE FROM a WHERE k IN (SELECT k FROM b)", "0A000"),
+        // grouping / ordering a subquery BY an enclosing-query column -> 0A000 (degenerate, §26)
+        (
+            "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b GROUP BY a.k)",
+            "0A000",
+        ),
+        (
+            "SELECT id FROM a WHERE EXISTS (SELECT k FROM b ORDER BY a.k)",
+            "0A000",
+        ),
     ];
     for (sql, code) in cases {
         assert_eq!(execute(&mut db, sql).unwrap_err().code(), code, "{sql}");
     }
+}
+
+// ---- correlated subqueries (spec/design/grammar.md §26) -------------------------------------
+
+fn t123() -> Database {
+    db_with(&[
+        "CREATE TABLE t1 (id int32 PRIMARY KEY, v int32)",
+        "CREATE TABLE t2 (id int32 PRIMARY KEY, v int32)",
+        "CREATE TABLE t3 (id int32 PRIMARY KEY, v int32)",
+        "INSERT INTO t1 VALUES (1, 10), (2, 20)",
+        "INSERT INTO t2 VALUES (1, 10), (2, 30)",
+        "INSERT INTO t3 VALUES (1, 10), (2, 20)",
+    ])
+}
+
+#[test]
+fn correlated_exists() {
+    let mut db = t123();
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v) ORDER BY t1.id"
+        ),
+        vec![1]
+    );
+    assert_eq!(
+        ints(&mut db, "SELECT t1.id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v) ORDER BY t1.id"),
+        vec![2]
+    );
+}
+
+#[test]
+fn correlated_scalar_and_empty_is_null() {
+    let mut db = t123();
+    // count over a correlated WHERE (the outer ref is a constant in the inner WHERE).
+    assert_eq!(
+        query(&mut db, "SELECT t1.id, (SELECT count(*) FROM t2 WHERE t2.v > t1.v) FROM t1 ORDER BY t1.id"),
+        vec![
+            vec![Value::Int(1), Value::Int(1)],
+            vec![Value::Int(2), Value::Int(1)],
+        ]
+    );
+    // a 0-row correlated scalar is NULL, evaluated per outer row.
+    assert_eq!(
+        query(&mut db, "SELECT t1.id, (SELECT t2.v FROM t2 WHERE t2.v = t1.v * 100) FROM t1 ORDER BY t1.id"),
+        vec![
+            vec![Value::Int(1), Value::Null],
+            vec![Value::Int(2), Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn correlated_in() {
+    let mut db = t123();
+    assert_eq!(
+        ints(&mut db, "SELECT t1.id FROM t1 WHERE t1.v IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id) ORDER BY t1.id"),
+        vec![1]
+    );
+    assert_eq!(
+        ints(&mut db, "SELECT t1.id FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id) ORDER BY t1.id"),
+        vec![2]
+    );
+}
+
+#[test]
+fn correlated_in_join_on() {
+    let mut db = t123();
+    // the inner self-join's ON predicate references the OUTER t1 (correlation in a JOIN ON).
+    assert_eq!(
+        ints(&mut db, "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 JOIN t2 AS t2b ON t2b.v = t1.v WHERE t2.id = t1.id) ORDER BY t1.id"),
+        vec![1]
+    );
+}
+
+#[test]
+fn correlated_multi_level_and_skip_level() {
+    let mut db = t123();
+    // two-level nesting, each level correlating to its IMMEDIATE parent.
+    assert_eq!(
+        ints(&mut db, "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v AND EXISTS (SELECT 1 FROM t3 WHERE t3.v = t2.v)) ORDER BY t1.id"),
+        vec![1]
+    );
+    // skip-level: the innermost references the GRANDPARENT t1, skipping t2.
+    assert_eq!(
+        ints(&mut db, "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.v = t1.v)) ORDER BY t1.id"),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn correlated_outer_ref_in_aggregate_arg() {
+    let mut db = t123();
+    // An outer reference inside an aggregate ARGUMENT, mixed with an inner column:
+    // sum(t2.v + t1.v) over t2 for each t1 row -> (10+10)+(30+10)=60 ; (10+20)+(30+20)=80.
+    assert_eq!(
+        query(&mut db, "SELECT t1.id, (SELECT sum(t2.v + t1.v) FROM t2) FROM t1 ORDER BY t1.id"),
+        vec![
+            vec![Value::Int(1), Value::Int(60)],
+            vec![Value::Int(2), Value::Int(80)],
+        ]
+    );
+}
+
+#[test]
+fn correlated_subquery_cost_is_per_outer_row() {
+    let mut db = t123();
+    // A correlated subquery re-runs once per outer row (unlike the uncorrelated fold-once). The
+    // derivation is in spec/conformance/suites/subquery/correlated.test (cost = 14).
+    assert_eq!(
+        cost(&mut db, "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)"),
+        14
+    );
+}
+
+#[test]
+fn correlated_inner_error_raised_over_empty_outer() {
+    // The subquery is PLANNED once, so a structural error (here >1 column) is raised even when the
+    // outer query is empty and the subquery never executes (PostgreSQL parity).
+    let mut db = db_with(&[
+        "CREATE TABLE e (id int32 PRIMARY KEY, v int32)",
+        "CREATE TABLE f (id int32 PRIMARY KEY, v int32)",
+        "INSERT INTO f VALUES (1, 1)",
+    ]);
+    assert_eq!(
+        execute(&mut db, "SELECT (SELECT id, v FROM f WHERE v = e.v) FROM e")
+            .unwrap_err()
+            .code(),
+        "42601"
+    );
 }

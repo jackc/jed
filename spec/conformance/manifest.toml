@@ -177,6 +177,10 @@ id = "query.subquery_exists"
 description = "[NOT] EXISTS (SELECT ...) — uncorrelated existence test; boolean (rows>0) XOR negated, the select list is ignored entirely (even SELECT * / SELECT 1,2,3), never NULL; correlated / param inside -> 0A000 (spec/design/grammar.md §26)"
 
 [[capability]]
+id = "query.subquery_correlated"
+description = "Correlated scalar / IN / EXISTS — the subquery references a column of an enclosing query, resolved via a scope chain (inner FROM first, then outward; nearest scope shadows). Planned once (type/structure errors raised even over an empty outer) and re-executed per outer row. Any correlation depth (parent, grandparent, ...); outer refs allowed inside an aggregate arg/select-list/HAVING as a per-row constant. Narrowings: a $N inside a subquery, and a correlated GROUP BY / ORDER BY key, are 0A000 (spec/design/grammar.md §26)"
+
+[[capability]]
 id = "types.int16"
 description = "int16 / smallint scalar type"
 
@@ -465,7 +469,7 @@ capabilities = [
 
 [[profile]]
 id = "subqueries"
-title = "having + joins + uncorrelated subqueries: scalar (SELECT ...), x [NOT] IN (SELECT ...), [NOT] EXISTS (SELECT ...) — executed once at plan time and folded to a constant; correlated/param-inside -> 0A000 (Phase 4, spec/design/grammar.md §26)"
+title = "having + joins + subqueries: scalar (SELECT ...), x [NOT] IN (SELECT ...), [NOT] EXISTS (SELECT ...), both uncorrelated (folded once at plan time) and correlated (planned once, re-executed per outer row, any depth); $N-inside / correlated GROUP BY|ORDER BY key -> 0A000 (Phase 4, spec/design/grammar.md §26)"
 includes = "having"
 capabilities = [
   "query.join_inner",
@@ -475,4 +479,5 @@ capabilities = [
   "query.subquery_scalar",
   "query.subquery_in",
   "query.subquery_exists",
+  "query.subquery_correlated",
 ]

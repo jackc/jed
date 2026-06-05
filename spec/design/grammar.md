@@ -1000,11 +1000,14 @@ is exact and identical across cores regardless.
 
 **Cost** is `lhs + rhs`, the combine itself unmetered — see [cost.md](cost.md) §3.
 
-## 26. Uncorrelated subqueries (scalar / `IN` / `EXISTS`)
+## 26. Subqueries (scalar / `IN` / `EXISTS`)
 
 A **subquery** is a parenthesized `query_expr` (a `SELECT`, or a set operation — §25) used
-inside an expression. This slice implements the three **uncorrelated** forms; correlated
-subqueries (a subquery referencing an outer-query column) are the next slice.
+inside an expression. The three forms below work both **uncorrelated** (the subquery's result
+is independent of the enclosing query) and **correlated** (the subquery references a column of
+an enclosing query — see [Correlated subqueries](#correlated-subqueries) below). They are
+available in a `SELECT` only; a subquery in an `UPDATE` / `DELETE` / `INSERT` expression is
+`0A000` (a future slice).
 
 - **Scalar subquery** — `( query_expr )` in expression position, anywhere a `primary` is
   allowed: `WHERE x = (SELECT max(id) FROM t)`, in the select list, or nested in a larger
@@ -1019,13 +1022,24 @@ IN-subquery, otherwise the §20 value list. `EXISTS` is a keyword prefix taking 
 Because the operand is a full `query_expr`, `IN (SELECT … UNION …)` and `EXISTS (… INTERSECT …)`
 parse.
 
-### Evaluation model — execute once, fold to a constant
+### Evaluation model — plan once, then fold or re-execute
 
-An uncorrelated subquery's result does **not** depend on any outer row, so the engine executes
-it **exactly once**, at plan setup (before the outer scan), and folds it into a constant the
-ordinary evaluator already handles. This is observably identical to PostgreSQL (where a single
-execution and per-row re-execution agree precisely because there is no correlation), and it keeps
-the per-row expression evaluator unchanged.
+Every subquery is **planned exactly once** — resolved to a plan against a *scope chain* (its
+own FROM, then each enclosing query's FROM outward), so structural and type errors are raised
+at plan time **whether or not the outer query produces any rows** (matching PostgreSQL, which
+resolves a subquery during planning). What happens next depends on correlation:
+
+- An **uncorrelated** subquery's result does **not** depend on any outer row, so the engine
+  **executes it once** and folds it into a constant the ordinary evaluator already handles
+  (PostgreSQL's "initplan"). This keeps the per-row evaluator unchanged for the common case
+  and the cost (below) trivially once-only.
+- A **correlated** subquery is **re-executed per outer row** that reaches its node, reading the
+  enclosing-row values its plan references. The two agree with PostgreSQL because a single
+  uncorrelated execution and per-row correlated execution are exactly what PG does.
+
+The fold/validation rules (column count, cardinality, the typed empty NULL, IN three-valued
+membership, EXISTS ignoring the select list) are identical for both — they constrain the
+subquery's *result*, which is independent of how many times it ran.
 
 - **Scalar** — the subquery must produce **exactly one column** (else `42601`, "subquery must
   return only one column") and **at most one row** (more than one → **`21000`**,
@@ -1044,18 +1058,46 @@ the per-row expression evaluator unchanged.
   entirely** (`EXISTS (SELECT 1, 2, 3)` and `EXISTS (SELECT *)` are both legal — column count and
   types are irrelevant), and the result is **never NULL**.
 
-**Cost** is the enclosing query's own cost **plus** each subquery's cost, counted **once** (the
-subquery ran once). The folded constant is a leaf and charges no `operator_eval` —
-see [cost.md](cost.md) §3.
+**Cost** for an **uncorrelated** subquery is the enclosing query's own cost **plus** the
+subquery's cost, counted **once** (it ran once); the folded constant is a leaf and charges no
+`operator_eval`. For a **correlated** subquery it is the enclosing query's cost **plus** the
+subquery's cost **per outer row** the node evaluates, plus one `operator_eval` for the
+subquery node itself each time — see [cost.md](cost.md) §3.
 
-### Deferred narrowings (each relaxable later)
+### Correlated subqueries
 
-- **Correlated subqueries** — a reference to an **outer-query** column inside the subquery (bare
-  or qualified) is **`0A000`** ("correlated subqueries are not supported yet"). This is the seam
-  the next slice turns into real outer-row resolution.
+A **correlated** subquery references a column of an enclosing query. Resolution uses a **scope
+chain**: a column name is resolved against the subquery's own FROM first (the ordinary
+42703/42702 rules), and only on a clean miss is it sought in the **enclosing** query's scope,
+then its enclosing scope, and so on outward. A name found in an ancestor is an **outer
+reference**; PostgreSQL's nearest-scope rule holds, so a name present in the inner FROM shadows
+the same name outside. Correlation may reach **any** depth — a subquery may reference its
+immediate parent, a grandparent, or higher — and nesting composes (each level resolves against
+the full chain visible at that level).
+
+- An outer reference is a **constant within the subquery's own evaluation** for a given outer
+  row. It is therefore allowed inside an aggregate subquery's select list, `HAVING`, or an
+  aggregate **argument** without being subject to the grouping-key rule (§18) — that rule
+  constrains the subquery's *own* columns, not values borrowed from outside.
+  - **Documented divergence:** an aggregate is always associated with the query in whose select
+    list it textually appears, so `(SELECT sum(outer.col) FROM inner)` sums the outer constant
+    over the *inner* rows. PostgreSQL instead binds an aggregate whose arguments are **purely**
+    outer references to the *outer* query level (so the bare-`sum(outer.col)` form raises an
+    outer grouping error there). The common, unambiguous case — an argument that mixes an inner
+    column with an outer reference, e.g. `sum(inner.v + outer.v)` — agrees with PostgreSQL.
+- The subquery is **planned once** (so a type/structure error in it is raised even when the
+  outer produces zero rows) and **re-executed per outer row** that reaches its expression node,
+  reading the enclosing-row values its plan references.
+
+**Deferred narrowings (each relaxable later)**
+
 - **Bind parameters inside a subquery** — a `$N` anywhere inside the subquery is **`0A000`**
-  (parameter type inference is per-`SELECT`; sharing a `$N` across the outer and subquery scopes
-  is not yet supported).
+  (an orthogonal parameter-inference concern: a `$N` whose only type context is the enclosing
+  comparison would need bidirectional inference into the subquery, not yet supported).
+- **A correlated reference as a `GROUP BY` / `ORDER BY` key** — grouping or ordering a subquery
+  *by an enclosing-query column* (a per-outer-row constant — degenerate) is **`0A000`**; the
+  key machinery is flat local indices. WHERE / HAVING / `ON` / select-list correlation is fully
+  supported.
 - **Derived tables** — `FROM ( query_expr ) AS t` (a subquery as a relation) is a separate later
   slice; it is not part of this one.
 - **`ANY` / `ALL`** and **row-valued** subqueries are not implemented.

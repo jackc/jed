@@ -201,25 +201,37 @@ rows. `UNION ALL` (no dedup) costs the **same** 10 — the dedup was already fre
 changes nothing. The cross-core contract is trivially identical: it is literally the sum of two
 independently-deterministic operand costs.
 
-### Uncorrelated subqueries — the operand cost, added once
+### Subqueries — initplan once, correlated per outer row
 
-An uncorrelated subquery ([grammar.md](grammar.md) §26) — scalar `(SELECT …)`,
-`x IN (SELECT …)`, or `EXISTS (SELECT …)` — is executed **exactly once**, at plan setup, and
-folded into a constant. Its cost is its operand query's cost, added **once** to the enclosing
-query:
+A subquery ([grammar.md](grammar.md) §26) — scalar `(SELECT …)`, `x IN (SELECT …)`, or
+`EXISTS (SELECT …)` — composes its operand query's cost into the enclosing query with **no new
+cost unit**. The subquery runs through the ordinary query path, so it **already** charges its
+own `storage_row_read` / `operator_eval` / `row_produced` exactly as any `SELECT` does; the
+folding/membership/cardinality machinery is **unmetered**, like `DISTINCT` dedup and the
+set-operation combine. How many times that operand cost lands depends on correlation:
 
-> `cost(query with subquery s) = cost(query) + cost(s)`
+- **Uncorrelated** (an "initplan") — executed **exactly once**, at plan setup, and folded into a
+  constant. Its cost is added **once**, and the folded constant is a **leaf** (charges no
+  `operator_eval` when the outer row evaluates), so a scalar subquery referenced once in `WHERE`
+  adds its operand cost once, not once per outer row:
 
-The subquery runs through the ordinary query path, so it **already** charges its own
-`storage_row_read` / `operator_eval` / `row_produced` exactly as any `SELECT` does; the folding
-machinery (the cardinality/column-count check, the membership/exists test) is **unmetered**, like
-`DISTINCT` dedup and the set-operation combine. The **folded constant is a leaf** in the outer
-expression — it charges **no `operator_eval`** when the outer row evaluates (cost.md §3, "leaf
-nodes charge nothing"), so a scalar subquery referenced once in `WHERE` adds its operand cost
-once, not once per outer row. This follows the same `INSERT … SELECT` / set-operation precedent:
-**no new cost unit**, cost composes from the independently-metered subquery. Because correlation
-is rejected (`0A000`, §26), there is never a per-outer-row re-execution this slice — the single
-execution makes the cost trivially deterministic and identical across cores.
+  > `cost(query with uncorrelated s) = cost(query) + cost(s)`
+
+  A globally-uncorrelated subquery is folded once **even when it is nested inside a correlated
+  one** (its value never changes), so it too is counted once.
+
+- **Correlated** — re-executed once **per outer row** that reaches its expression node, reading
+  the enclosing-row values its plan references. Each execution adds that execution's full
+  operand cost (which can vary per outer row, since the correlated values filter the inner scan
+  differently), and the subquery node itself — being a real interior operator now, not a folded
+  leaf — charges **one `operator_eval`** each time it evaluates. A correlated `IN` additionally
+  charges one `operator_eval` per inner result value its membership test compares (the §26 IN
+  model). So for a correlated subquery `s` reached by outer rows `R`:
+
+  > `cost(query with correlated s) = cost(query) + Σ_{r ∈ R} (operator_eval + cost(s | r))`
+
+Both are fully deterministic and identical across cores: the same `(query, database)` always
+visits the same outer rows in the same order and runs the subquery the same number of times.
 
 ### What is NOT metered (defined boundary)
 

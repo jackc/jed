@@ -9,8 +9,6 @@
 // fit; with no context it defaults to int64 (spec/design/types.md §6). A boolean literal
 // is expression-only this slice (it cannot be stored).
 import type { Decimal } from "./decimal.ts";
-import type { ScalarType } from "./types.ts";
-import type { Value } from "./value.ts";
 
 export type Literal =
   | { kind: "null" }
@@ -99,20 +97,15 @@ export type Expr =
   // rejected at parse (42601). An aggregate in WHERE/ON or nested in another aggregate is 42803
   // (spec/design/aggregates.md); a scalar function is legal anywhere an expression is.
   | { kind: "funcCall"; name: string; args: Expr[]; star: boolean }
-  // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26).
-  // Uncorrelated: runSelect's pre-pass executes it once and replaces it with a "foldedConst", so
-  // resolve never sees it inside a SELECT. A correlated reference or a `$N` inside is a 0A000.
+  // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26). resolve
+  // plans it once against the scope chain; an uncorrelated one is then folded to a constant, a
+  // correlated one is re-executed per outer row. A `$N` inside is a 0A000.
   | { kind: "scalarSubquery"; query: QueryExpr }
-  // `EXISTS ( query_expr )` (a leading NOT is the ordinary unary connective). Folded to a boolean
-  // literal by the pre-pass (spec/design/grammar.md §26).
+  // `EXISTS ( query_expr )` (a leading NOT is the ordinary unary connective). grammar.md §26.
   | { kind: "exists"; query: QueryExpr }
-  // `lhs [NOT] IN ( query_expr )` (spec/design/grammar.md §26). The pre-pass folds it to the
-  // literal-IN OR-chain over the subquery's result values (or an empty "in" for an empty result).
-  | { kind: "inSubquery"; lhs: Expr; query: QueryExpr; negated: boolean }
-  // INTERNAL — never produced by the parser. A subquery folded to a constant by the pre-pass
-  // (spec/design/grammar.md §26): the value plus its output type (null = the untyped-NULL type).
-  // resolve maps it to the matching constant with that EXACT type and no context adaptation.
-  | { kind: "foldedConst"; value: Value; type: ScalarType | null };
+  // `lhs [NOT] IN ( query_expr )` (spec/design/grammar.md §26) — membership of lhs in the
+  // subquery's single output column (three-valued, like a literal IN).
+  | { kind: "inSubquery"; lhs: Expr; query: QueryExpr; negated: boolean };
 
 // SelectItem is one select-list expression with its optional output-name alias
 // (expr AS name). The alias is an output label only — it never enters resolution

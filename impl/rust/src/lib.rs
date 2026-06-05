@@ -106,10 +106,12 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.union",
     "query.intersect",
     "query.except",
-    // Uncorrelated subqueries: scalar / IN / EXISTS — spec/design/grammar.md §26.
+    // Subqueries: scalar / IN / EXISTS, both uncorrelated (folded once) and correlated
+    // (re-executed per outer row, any depth) — spec/design/grammar.md §26.
     "query.subquery_scalar",
     "query.subquery_in",
     "query.subquery_exists",
+    "query.subquery_correlated",
     // Scalar functions abs / round (per-row, valid anywhere an expression is) —
     // spec/design/functions.md §9.
     "func.abs",

@@ -481,14 +481,33 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `subqueries` profile in [manifest.toml](spec/conformance/manifest.toml), pinned by
       `spec/conformance/suites/subquery/{scalar,in,exists,errors}.test` (64/0/0 all cores,
       byte-identical incl. cost). Semantics verified against the live `postgres:18` oracle.
-      **Deferred narrowings (each → `0A000`, relaxable):** a **correlated** reference (a subquery
-      column resolving to an outer relation, bare or qualified) and a **bind parameter `$N` inside**
-      a subquery; subqueries are **SELECT-only** for now (one in an UPDATE/INSERT/DELETE expression is
-      `0A000`). _(was: L; deps: joins)_
-  - [ ] **Correlated subqueries** — the next half: thread the executor + the outer row through the
-        expression evaluator (turning the §26 correlation *detection* into real outer-row resolution),
-        so a subquery re-evaluates per outer row. **Derived tables** (`FROM (SELECT …) AS t`),
-        **`ANY`/`ALL`**, and row-valued subqueries remain separate later slices. _(size: L)_
+      **Deferred narrowings (each → `0A000`, relaxable):** a **correlated** reference (now landed —
+      see below); a **bind parameter `$N` inside** a subquery; subqueries are **SELECT-only** (one in
+      an UPDATE/INSERT/DELETE expression is `0A000`). _(was: L; deps: joins)_
+  - [x] **Correlated subqueries** — done & committed across Rust/Go/TS (the **principled, multi-level**
+        slice). `run_select` was **split into a resolve phase (`plan_query`) and an execute phase
+        (`exec_query_plan`)** so a subquery is resolved **once** into an owned plan — its column-count /
+        type errors fire even over an **empty** outer (PG parity) — yet **re-executed per outer row**.
+        Resolution gained a **scope chain**: `Scope` carries a `parent` + the catalog, and
+        `resolve_bare`/`resolve_qualified` walk outward, returning `Local(idx)` or `Outer{level,index}`
+        (a correlated ref → an `OuterColumn` leaf; **any** depth — parent, grandparent, …; nearest
+        scope shadows). The per-row evaluator now takes an **`EvalEnv`** (the engine + bound params +
+        the stack of enclosing rows): an `OuterColumn` reads the stack, and a surviving (correlated)
+        `Subquery` node pushes the current row and runs its inner plan. A post-bind **`fold_uncorrelated`
+        pass** keeps a globally-uncorrelated subquery (a PG "initplan") folded **once** (an uncorrelated
+        `IN` → an `InValues` node), so the committed once-only cost is unchanged. **Cost** (cost.md §3):
+        a correlated subquery adds one `operator_eval` + its inner plan's cost **per outer row** it
+        evaluates; deterministic + byte-identical cross-core (pinned `# cost:` in
+        `spec/conformance/suites/subquery/correlated.test`, 65/0/0 all cores). New capability
+        `query.subquery_correlated`. Outer refs work in WHERE / HAVING / select-list / aggregate args /
+        a nested JOIN `ON`. **Remaining narrowings (→ `0A000`):** a **`$N` inside** a subquery
+        (orthogonal param inference); a **correlated `GROUP BY` / `ORDER BY` key** (degenerate);
+        subqueries are **SELECT-only**. A pure-outer aggregate arg (`sum(outer.col)`) is a documented
+        divergence (jed sums at the inner level; PG binds it to the outer query — grammar.md §26).
+        Semantics verified against the live `postgres:18` oracle. _(was: L)_
+  - [ ] **Subqueries — remaining seams:** `$N` inside a subquery (statement-wide param inference
+        across the boundary); subqueries in **UPDATE / DELETE / INSERT** expressions; **derived tables**
+        (`FROM (SELECT …) AS t`); **`ANY` / `ALL`** and row-valued subqueries. _(size: M)_
 - [x] **Set operations** — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` — done & committed across
       Rust/Go/TS. The top-level query grew from a single `select` to a **query expression**
       (`query_expr ::= set_expr order_by? limit_offset?`): a two-level precedence tree

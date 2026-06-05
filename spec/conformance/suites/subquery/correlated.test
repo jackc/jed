@@ -1,0 +1,116 @@
+# Correlated subqueries (spec/design/grammar.md §26): a subquery referencing a column of an
+# enclosing query, resolved via the scope chain (inner FROM first, then outward) and re-executed
+# per outer row. Covers correlated EXISTS / scalar / IN, correlation in a JOIN ON, an outer
+# reference inside an aggregate argument, multi-level + skip-level (grandparent) correlation, and
+# the degenerate GROUP BY / ORDER BY-outer-key narrowing (0A000). Results verified against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.qualified_column, query.table_alias, query.join_inner, query.aggregates, expr.arithmetic, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE t1 (id int32 PRIMARY KEY, v int32)
+
+statement ok
+CREATE TABLE t2 (id int32 PRIMARY KEY, v int32)
+
+statement ok
+CREATE TABLE t3 (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10), (2, 20)
+
+statement ok
+INSERT INTO t2 VALUES (1, 10), (2, 30)
+
+statement ok
+INSERT INTO t3 VALUES (1, 10), (2, 20)
+
+# Correlated EXISTS — keep a t1 row iff some t2 row has the same v. t1.v=10 matches t2 (v=10);
+# t1.v=20 has no match. Cost (per-outer-row, cost.md §3): scan t1 (2). For each t1 row the WHERE
+# evaluates the subquery node (1 operator_eval) + its run: scan t2 (2) + `t2.v=t1.v` per t2 row (2
+# operator_eval) + row_produced per inner match (1 for v=10, 0 for v=20). So row1 = 1+(2+2+1)=6,
+# row2 = 1+(2+2+0)=5. Plus 1 row_produced for the surviving t1 row. 2+6+5+1 = 14.
+# cost: 14
+query I rowsort
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)
+----
+1
+
+# Correlated NOT EXISTS is the complement.
+query I rowsort
+SELECT t1.id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)
+----
+2
+
+# Correlated scalar with an aggregate over a correlated WHERE — count the t2 rows whose v exceeds
+# this t1 row's v. (count(*) > 10 -> 1 row [v=30]; > 20 -> 1 row [v=30].)
+query II nosort
+SELECT t1.id, (SELECT count(*) FROM t2 WHERE t2.v > t1.v) FROM t1 ORDER BY t1.id
+----
+1
+1
+2
+1
+
+# A correlated scalar with no matching row yields NULL (the typed empty scalar), per outer row.
+query II nosort
+SELECT t1.id, (SELECT t2.v FROM t2 WHERE t2.v = t1.v * 100) FROM t1 ORDER BY t1.id
+----
+1
+NULL
+2
+NULL
+
+# An outer reference inside an aggregate ARGUMENT (mixed with an inner column) — sum(t2.v + t1.v)
+# over t2 for each t1 row: (10+10)+(30+10)=60 ; (10+20)+(30+20)=80. (A PURELY-outer argument like
+# sum(t1.v) is a documented divergence — jed sums it at the inner level; see grammar.md §26.)
+query II nosort
+SELECT t1.id, (SELECT sum(t2.v + t1.v) FROM t2) FROM t1 ORDER BY t1.id
+----
+1
+60
+2
+80
+
+# Correlated IN — t1.v in the t2 values selected for this t1 row. id=1: t2.id=1 -> {10}, 10 in -> yes.
+# id=2: t2.id=2 -> {30}, 20 in -> no. Cost: scan t1 (2). Per t1 row the IN node (1 operator_eval)
+# runs its subquery [scan t2 (2) + `t2.id=t1.id` per row (2) + 1 produced = 5] then tests membership
+# (1 operator_eval per result element, 1 here). So each row = 1+5+1 = 7. Plus 1 row_produced. 2+7+7+1 = 17.
+# cost: 17
+query I rowsort
+SELECT t1.id FROM t1 WHERE t1.v IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id)
+----
+1
+
+# Correlated NOT IN.
+query I rowsort
+SELECT t1.id FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id)
+----
+2
+
+# Correlation in a nested JOIN's ON predicate — the inner self-join's ON references the outer t1.
+# id=1 (v=10): t2b has a v=10 row, so the join is non-empty -> EXISTS. id=2 (v=20): no t2b.v=20.
+query I rowsort
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 JOIN t2 AS t2b ON t2b.v = t1.v WHERE t2.id = t1.id)
+----
+1
+
+# Two-level nesting, each level correlating to its IMMEDIATE parent: t1.v -> t2.v, then t2.v -> t3.v.
+# t1.id=1 (v=10): t2 has v=10, and t3 has v=10 -> yes. t1.id=2 (v=20): t2 has no v=20 -> no.
+query I rowsort
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v AND EXISTS (SELECT 1 FROM t3 WHERE t3.v = t2.v))
+----
+1
+
+# Skip-level (grandparent) correlation — the innermost references t1, skipping t2. Both t1 rows
+# have a matching t3 (v=10 and v=20), and t2 is non-empty, so both survive.
+query I rowsort
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.v = t1.v))
+----
+1
+2
+
+# Degenerate narrowings: grouping or ordering a subquery BY an enclosing-query column is 0A000.
+statement error 0A000
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 GROUP BY t1.v)
+
+statement error 0A000
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT t2.v FROM t2 ORDER BY t1.v)

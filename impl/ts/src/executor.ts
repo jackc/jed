@@ -11,6 +11,7 @@ import type {
   DropTable,
   Expr,
   Insert,
+  JoinKind,
   Literal,
   OrderKey,
   QueryExpr,
@@ -445,20 +446,22 @@ export class Database {
       throw engineError("undefined_table", "table does not exist: " + del.table);
     }
     // DELETE is single-table; resolve its WHERE against a one-relation scope.
-    const scope = Scope.single(table);
+    const scope = Scope.single(this, table);
     const ptypes = new ParamTypes();
     const filter = del.filter ? resolveBooleanFilter(scope, del.filter, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize());
 
     // Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13;
-    // spec/design/cost.md §3). Keys are collected before mutating.
+    // spec/design/cost.md §3). Keys are collected before mutating. DELETE has no outer query /
+    // subqueries: an empty outer-row stack (the subquery runner is never invoked).
     const meter = new Meter();
+    const env: EvalEnv = { params: bound, outer: [], runSubquery: () => unreachableSubquery() };
     const store = this.stores.get(del.table.toLowerCase())!;
     const keys: Uint8Array[] = [];
     for (const e of store.entriesInKeyOrder()) {
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
       meter.charge(COSTS.storageRowRead);
-      if (filter === null || isTrue(evalExpr(filter, e.row, bound, meter))) {
+      if (filter === null || isTrue(evalExpr(filter, e.row, env, meter))) {
         keys.push(e.key);
       }
     }
@@ -479,7 +482,7 @@ export class Database {
 
     // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
     // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
-    const scope = Scope.single(table);
+    const scope = Scope.single(this, table);
     const ptypes = new ParamTypes();
 
     // Resolve assignments up front (fail fast, deterministic).
@@ -521,14 +524,16 @@ export class Database {
     // scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes do
     // not — they evaluate nothing; spec/design/cost.md §3).
     const meter = new Meter();
+    // UPDATE has no outer query / subqueries (resolve rejects them here): an empty outer stack.
+    const env: EvalEnv = { params: bound, outer: [], runSubquery: () => unreachableSubquery() };
     const store = this.stores.get(upd.table.toLowerCase())!;
     const updates: { key: Uint8Array; row: Row }[] = [];
     for (const e of store.entriesInKeyOrder()) {
       meter.charge(COSTS.storageRowRead);
-      if (filter !== null && !isTrue(evalExpr(filter, e.row, bound, meter))) continue;
+      if (filter !== null && !isTrue(evalExpr(filter, e.row, env, meter))) continue;
       const newRow = e.row.slice();
       for (const p of plans) {
-        newRow[p.idx] = checkAssign(p, evalExpr(p.source, e.row, bound, meter));
+        newRow[p.idx] = checkAssign(p, evalExpr(p.source, e.row, env, meter));
       }
       updates.push({ key: e.key, row: newRow });
     }
@@ -555,46 +560,99 @@ export class Database {
   // runQueryExpr runs a query expression to a SelectResult — a lone SELECT via runSelect, or a set
   // operation via runSetOp (recursively, so a chain `a UNION b INTERSECT c` evaluates as the parsed
   // precedence tree).
+  // runQueryExpr is the top-level orchestrator (spec/design/grammar.md §26): PLAN the whole
+  // expression tree once against an empty scope chain (threading one ParamTypes so $N inference is
+  // statement-wide), bind the parameters, then the foldUncorrelated pass executes each
+  // globally-uncorrelated subquery once and folds it to a constant (preserving the once-only cost),
+  // and finally EXECUTE against an empty outer-row environment. Correlated subqueries that survive
+  // the fold are re-executed per outer row by the evaluator.
   private runQueryExpr(qe: QueryExpr, params: Value[]): SelectResult {
-    return qe.kind === "select" ? this.runSelect(qe, params) : this.runSetOp(qe, params);
+    const ptypes = new ParamTypes();
+    const plan = this.planQuery(qe, null, ptypes);
+    const bound = bindParams(params, ptypes.finalize());
+    const subqueryCost = { value: 0n };
+    this.foldUncorrelatedInPlan(plan, bound, subqueryCost);
+    const r = this.execQueryPlan(plan, [], bound);
+    return { ...r, cost: r.cost + subqueryCost.value };
   }
 
-  private runSetOp(so: SetOp, params: Value[]): SelectResult {
-    const left = this.runQueryExpr(so.lhs, params);
-    const right = this.runQueryExpr(so.rhs, params);
+  // runSelect runs a lone SELECT — the entry point executeSelect and INSERT ... SELECT use.
+  private runSelect(sel: Select, params: Value[]): SelectResult {
+    return this.runQueryExpr(sel, params);
+  }
 
-    // Arity: both operands must produce the same number of columns. Checked before any row is
-    // matched, so it fires over empty operands too. PostgreSQL uses 42601 here.
-    if (left.columnTypes.length !== right.columnTypes.length) {
+  // runSetOp runs a set operation as a top-level statement.
+  private runSetOp(so: SetOp, params: Value[]): SelectResult {
+    return this.runQueryExpr(so, params);
+  }
+
+  // planQuery resolves a query expression into an owned QueryPlan against the scope chain (parent =
+  // the enclosing query's scope, null at top level). A subquery is planned here, once (§26).
+  // Not private: the free function planSubquery calls it through scope.catalog (an internal seam).
+  planQuery(qe: QueryExpr, parent: Scope | null, ptypes: ParamTypes): QueryPlan {
+    return qe.kind === "select"
+      ? this.planSelect(qe, parent, ptypes)
+      : this.planSetOp(qe, parent, ptypes);
+  }
+
+  // execQueryPlan executes a resolved plan against an outer-row environment (outer = the enclosing
+  // rows, innermost last; empty at top level) and the bound parameters.
+  private execQueryPlan(plan: QueryPlan, outer: Row[], params: Value[]): SelectResult {
+    return plan.kind === "select"
+      ? this.execSelectPlan(plan, outer, params)
+      : this.execSetOpPlan(plan, outer, params);
+  }
+
+  // planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
+  // parent scope, check arity + unify column types up front (so the 42601/42804 fire even over
+  // empty operands), and resolve the trailing ORDER BY by output column name.
+  private planSetOp(so: SetOp, parent: Scope | null, ptypes: ParamTypes): SetOpPlan {
+    const lhs = this.planQuery(so.lhs, parent, ptypes);
+    const rhs = this.planQuery(so.rhs, parent, ptypes);
+
+    if (lhs.columnTypes.length !== rhs.columnTypes.length) {
       throw engineError(
         "syntax_error",
         `each ${setopName(so.op)} query must have the same number of columns`,
       );
     }
-
-    // Per-column type unification (42804 on an incompatible pair). Output NAMES are the LEFT
-    // operand's (PostgreSQL).
-    const outTypes = left.columnTypes.map((l, i) => unifySetopColumn(l, right.columnTypes[i]!, so.op));
-
-    // Convert each operand's values to the unified column types BEFORE matching — the only runtime
-    // conversion is integer -> decimal (so an int value and a decimal value compare equal).
-    coerceSetopRows(left.rows, left.columnTypes, outTypes);
-    coerceSetopRows(right.rows, right.columnTypes, outTypes);
-
-    let rows = combineSetop(so.op, so.all, left.rows, right.rows);
-    const cost = left.cost + right.cost;
-
-    // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
-    // operation): a qualified key is 42P01, an unknown name is 42703. Reuse keyCmp; JS Array#sort
-    // is stable, so a full tie keeps the combine order (left rows before right).
-    const order = so.orderBy.map((key) => ({
-      idx: resolveSetopOrderKey(key, left.columnNames),
+    const columnTypes = lhs.columnTypes.map((l, i) => unifySetopColumn(l, rhs.columnTypes[i]!, so.op));
+    const columnNames = lhs.columnNames;
+    const order: OrderSlot[] = so.orderBy.map((key) => ({
+      idx: resolveSetopOrderKey(key, columnNames),
       descending: key.descending,
       nullsFirst: key.nullsFirst,
     }));
-    if (order.length > 0) {
+    return {
+      kind: "setOp",
+      op: so.op,
+      all: so.all,
+      lhs,
+      rhs,
+      columnNames,
+      columnTypes,
+      order,
+      limit: so.limit,
+      offset: so.offset,
+    };
+  }
+
+  // execSetOpPlan executes a resolved set operation: run both operands against the outer
+  // environment, coerce to the unified types, combine, then sort + window. Cost is lhs.cost +
+  // rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
+  private execSetOpPlan(plan: SetOpPlan, outer: Row[], params: Value[]): SelectResult {
+    const left = this.execQueryPlan(plan.lhs, outer, params);
+    const right = this.execQueryPlan(plan.rhs, outer, params);
+
+    coerceSetopRows(left.rows, left.columnTypes, plan.columnTypes);
+    coerceSetopRows(right.rows, right.columnTypes, plan.columnTypes);
+
+    let rows = combineSetop(plan.op, plan.all, left.rows, right.rows);
+    const cost = left.cost + right.cost;
+
+    if (plan.order.length > 0) {
       rows.sort((a, b) => {
-        for (const k of order) {
+        for (const k of plan.order) {
           const c = keyCmp(a[k.idx]!, b[k.idx]!, k.descending, k.nullsFirst);
           if (c !== 0) return c;
         }
@@ -602,13 +660,12 @@ export class Database {
       });
     }
 
-    // LIMIT / OFFSET window — clamp in the bigint domain (counts are non-negative, parser).
     const n = BigInt(rows.length);
-    const start = so.offset === null ? 0n : so.offset < n ? so.offset : n;
-    const end = so.limit !== null && so.limit < n - start ? start + so.limit : n;
+    const start = plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
+    const end = plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
     rows = rows.slice(Number(start), Number(end));
 
-    return { columnNames: left.columnNames, columnTypes: outTypes, rows, cost };
+    return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows, cost };
   }
 
   // runSelect resolves projected columns and the WHERE/ORDER BY columns against the catalog,
@@ -616,23 +673,15 @@ export class Database {
   // re-sorts by ORDER BY, then projects. Returns the rows with each output column's NAME and
   // resolved TYPE (the types let INSERT ... SELECT gate assignability up front — §24) and the
   // accrued cost.
-  private runSelect(sel: Select, params: Value[]): SelectResult {
-    // Uncorrelated subquery folding (spec/design/grammar.md §26). Before resolving any clause,
-    // execute each uncorrelated subquery in WHERE / the select list / HAVING / a JOIN ON once and
-    // replace it with a constant (scalar -> its value; EXISTS -> a boolean; IN -> the value list,
-    // or an empty "in" for an empty result). The per-row evaluator is never involved. A correlated
-    // reference or a bind parameter inside a subquery is a 0A000. The subqueries' accrued cost is
-    // added once to this query's cost (cost.md §3).
-    const outerCols = this.selectRelCols(sel);
-    const subqueryCost = { value: 0n };
-    this.foldSelectSubqueries(sel, outerCols, subqueryCost);
-
-    // Accumulates the inferred type of each $N across every clause of this SELECT, then is
-    // finalized + bound once all resolution is done (spec/design/api.md §5).
-    const ptypes = new ParamTypes();
+  // planSelect resolves a SELECT into a SelectPlan against the scope chain (parent = the enclosing
+  // query's scope, for correlated references — grammar.md §26). The resolve half of the old
+  // runSelect: build the FROM scope, resolve every clause, infer $N types into ptypes. No row is
+  // touched and no parameter is bound here (runQueryExpr binds once, after the whole tree is planned).
+  private planSelect(sel: Select, parent: Scope | null, ptypes: ParamTypes): SelectPlan {
     // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
     // relation's flat column offset in FROM order, and reject a duplicate label — a self-join
-    // without distinct aliases is 42712 (spec/design/grammar.md §15).
+    // without distinct aliases is 42712 (spec/design/grammar.md §15). The scope links to `parent`
+    // (correlation) + the catalog (so a subquery resolves its own FROM); allowSubquery is true.
     const tableRefs = [sel.from, ...sel.joins.map((j) => j.table)];
     const rels: ScopeRel[] = [];
     const seenLabels = new Set<string>();
@@ -648,18 +697,21 @@ export class Database {
       rels.push({ label, table: t, offset });
       offset += t.columns.length;
     }
-    const scope = new Scope(rels);
+    const scope = new Scope(rels, this, parent, true);
 
-    // Resolve projections (paired with output names — §8), the optional WHERE (must be
-    // boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
-    // relations is 42702; an unknown qualifier is 42P01 (§15).
     // Resolve GROUP BY keys to flat row indices (a key is a bare/qualified column — grammar.md
-    // §18). An unknown column is 42703, an ambiguous bare key 42702.
-    const groupKeys: number[] = sel.groupBy.map((key) =>
-      key.kind === "qualifiedColumn"
-        ? scope.resolveQualified(key.qualifier, key.name)
-        : scope.resolveBare((key as { name: string }).name),
-    );
+    // §18). An unknown column is 42703, an ambiguous bare key 42702. An outer (correlated) key —
+    // grouping by an enclosing-query constant — is degenerate and 0A000 (§26).
+    const groupKeys: number[] = sel.groupBy.map((key) => {
+      const r =
+        key.kind === "qualifiedColumn"
+          ? scope.resolveQualified(key.qualifier, key.name)
+          : scope.resolveBare((key as { name: string }).name);
+      if (r.level !== 0) {
+        throw engineError("feature_not_supported", "GROUP BY may not reference an outer query column");
+      }
+      return r.index;
+    });
 
     // An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
     // resolves in collect mode — aggregates collect into synthetic slots and a non-grouped
@@ -692,11 +744,17 @@ export class Database {
     // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
     // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
     // keys resolve against the FROM scope (a flat row index).
-    const order: { idx: number; descending: boolean; nullsFirst: boolean }[] = [];
+    // An outer (correlated) ORDER BY key — ordering by an enclosing-query constant — is degenerate
+    // and 0A000 (§26).
+    const order: OrderSlot[] = [];
     for (const key of sel.orderBy) {
-      const idx = key.qualifier !== null
+      const r = key.qualifier !== null
         ? scope.resolveQualified(key.qualifier, key.column)
         : scope.resolveBare(key.column);
+      if (r.level !== 0) {
+        throw engineError("feature_not_supported", "ORDER BY may not reference an outer query column");
+      }
+      const idx = r.index;
       let slot = idx;
       if (isAgg) {
         slot = groupKeys.indexOf(idx);
@@ -707,13 +765,17 @@ export class Database {
 
     // SELECT DISTINCT restriction (spec/design/grammar.md §11): each ORDER BY key must appear
     // as a bare/qualified column in the select list (resolved to the same flat index; or the
-    // list is `*`). Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8).
+    // list is `*`). Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8). Only a
+    // local match counts as "projected" (an outer reference has no per-row value).
     if (sel.distinct && order.length > 0 && sel.items.kind === "list") {
       const projected = new Set<number>();
       for (const it of sel.items.items) {
-        if (it.expr.kind === "column") projected.add(scope.resolveBare(it.expr.name));
-        else if (it.expr.kind === "qualifiedColumn") {
-          projected.add(scope.resolveQualified(it.expr.qualifier, it.expr.name));
+        if (it.expr.kind === "column") {
+          const r = scope.resolveBare(it.expr.name);
+          if (r.level === 0) projected.add(r.index);
+        } else if (it.expr.kind === "qualifiedColumn") {
+          const r = scope.resolveQualified(it.expr.qualifier, it.expr.name);
+          if (r.level === 0) projected.add(r.index);
         }
       }
       for (const key of order) {
@@ -730,25 +792,59 @@ export class Database {
     // relations joined so far — rels[0..k+1]), so a forward reference to a not-yet-joined table
     // is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON; INNER and
     // the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the same way — the join kind only
-    // changes how unmatched rows are handled in the loop below (§15).
-    const joinOns: (RExpr | null)[] = sel.joins.map((j, k) => {
-      if (j.on === null) return null;
-      const partial = new Scope(scope.rels.slice(0, k + 2));
-      return resolveBooleanFilter(partial, j.on, ptypes);
+    // changes how unmatched rows are handled in the loop below (§15). The partial scope keeps the
+    // same parent chain, so a correlated reference in an ON predicate resolves outward (§26).
+    const joins: PlanJoin[] = sel.joins.map((j, k) => {
+      if (j.on === null) return { kind: j.kind, on: null };
+      const partial = new Scope(scope.rels.slice(0, k + 2), this, parent, true);
+      return { kind: j.kind, on: resolveBooleanFilter(partial, j.on, ptypes) };
     });
 
-    // All clauses resolved: finalize the inferred parameter types and bind the supplied values
-    // (count mismatch 42601; out-of-range/family errors 22003/42804) BEFORE scanning any rows
-    // (spec/design/api.md §5).
-    const bound = bindParams(params, ptypes.finalize());
+    // Assemble the owned plan (table NAMES + offsets/widths replace the scope's tables, so the
+    // plan outlives the scope and a correlated subquery can re-execute it per row).
+    const planRels: PlanRel[] = scope.rels.map((rel) => ({
+      tableName: rel.table.name,
+      offset: rel.offset,
+      colCount: rel.table.columns.length,
+    }));
+    return {
+      kind: "select",
+      rels: planRels,
+      joins,
+      filter,
+      isAgg,
+      groupKeys,
+      aggSpecs,
+      having,
+      order,
+      projections,
+      columnNames,
+      columnTypes,
+      distinct: sel.distinct,
+      limit: sel.limit,
+      offset: sel.offset,
+    };
+  }
+
+  // execSelectPlan executes a resolved SELECT against an outer-row environment (outer = the
+  // enclosing rows, innermost last; empty at top level) and the bound parameters. The execute half
+  // of the old runSelect: materialize, nested-loop join, WHERE, then aggregate / DISTINCT / window
+  // + project. The per-row evaluator gets an EvalEnv carrying the outer rows + a runSubquery
+  // callback, so a correlated subquery in any clause re-executes against them (grammar.md §26).
+  private execSelectPlan(plan: SelectPlan, outer: Row[], params: Value[]): SelectResult {
+    const env: EvalEnv = {
+      params,
+      outer,
+      runSubquery: (p, o) => this.execQueryPlan(p, o, params),
+    };
 
     // Materialize each base table once, in primary-key order, charging storageRowRead per
     // physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these in-memory
     // buffers, which are not stores and charge nothing.
     const meter = new Meter();
-    const materialized: Row[][] = scope.rels.map((rel) => {
+    const materialized: Row[][] = plan.rels.map((rel) => {
       const tableRows: Row[] = [];
-      for (const row of this.rowsInKeyOrder(rel.table.name)) {
+      for (const row of this.rowsInKeyOrder(rel.tableName)) {
         meter.charge(COSTS.storageRowRead);
         tableRows.push(row);
       }
@@ -766,24 +862,24 @@ export class Database {
     // match run, all unmatched right rows last in right key order (CLAUDE.md §10).
     const nullRow = (n: number): Row => Array.from({ length: n }, () => nullValue());
     let running: Row[] = materialized[0]!;
-    for (let k = 0; k < sel.joins.length; k++) {
+    for (let k = 0; k < plan.joins.length; k++) {
       const rightRows = materialized[k + 1]!;
-      const on = joinOns[k]!;
-      const kind = sel.joins[k]!.kind;
+      const on = plan.joins[k]!.on;
+      const kind = plan.joins[k]!.kind;
       const emitLeft = kind === "left" || kind === "full";
       const emitRight = kind === "right" || kind === "full";
-      // NULL-pad widths come from the SCOPE, never a sampled row, so they are correct even when
+      // NULL-pad widths come from the PLAN, never a sampled row, so they are correct even when
       // `running`/`rightRows` is empty: the right table begins at flat offset rels[k+1].offset
       // (= the width of every running row) and is that many columns wide.
-      const leftPad = scope.rels[k + 1]!.offset;
-      const rightPad = scope.rels[k + 1]!.table.columns.length;
+      const leftPad = plan.rels[k + 1]!.offset;
+      const rightPad = plan.rels[k + 1]!.colCount;
       const next: Row[] = [];
       const rightMatched: boolean[] = new Array(rightRows.length).fill(false);
       for (const left of running) {
         let leftMatched = false;
         for (let ri = 0; ri < rightRows.length; ri++) {
           const combined = left.concat(rightRows[ri]!);
-          if (on === null || isTrue(evalExpr(on, combined, bound, meter))) {
+          if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
             next.push(combined);
             leftMatched = true;
             rightMatched[ri] = true;
@@ -803,7 +899,7 @@ export class Database {
     // combined row's filter accrues operator_eval.
     const rows: Row[] = [];
     for (const row of running) {
-      if (filter === null || isTrue(evalExpr(filter, row, bound, meter))) rows.push(row);
+      if (plan.filter === null || isTrue(evalExpr(plan.filter, row, env, meter))) rows.push(row);
     }
 
     // ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
@@ -811,9 +907,9 @@ export class Database {
     // is decoupled from its value-direction flip (spec/design/grammar.md §10). Aggregate queries
     // sort their GROUP rows in the aggregate branch below — not these pre-aggregation rows — so
     // this is gated to plain queries.
-    if (!isAgg && order.length > 0) {
+    if (!plan.isAgg && plan.order.length > 0) {
       rows.sort((a, b) => {
-        for (const key of order) {
+        for (const key of plan.order) {
           const c = keyCmp(a[key.idx]!, b[key.idx]!, key.descending, key.nullsFirst);
           if (c !== 0) return c;
         }
@@ -826,8 +922,8 @@ export class Database {
     // (CLAUDE.md §8; grammar.md §9). The counts are already non-negative (parser).
     const windowBounds = (len: number): [number, number] => {
       const n = BigInt(len);
-      const start = sel.offset === null ? 0n : sel.offset < n ? sel.offset : n;
-      const end = sel.limit !== null && sel.limit < n - start ? start + sel.limit : n;
+      const start = plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
+      const end = plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
       return [Number(start), Number(end)];
     };
 
@@ -837,7 +933,7 @@ export class Database {
     // row is projected — dedup must see them all — duplicates drop by first occurrence, and
     // the window then slices the DISTINCT rows.
     let out: Value[][];
-    if (isAgg) {
+    if (plan.isAgg) {
       // Aggregate query — group + accumulate (aggregates.md §5). Bucket the post-WHERE rows by
       // their group-key values; the bucket key is the value-canonical distinctRowKey (it
       // collapses 1.5/1.50 and groups NULL with NULL), and the Map is only an index — output
@@ -846,15 +942,15 @@ export class Database {
       // emits ONE row even over zero input; GROUP BY over an empty table creates no groups ->
       // zero rows. Each (row × aggregate) charges aggregateAccumulate; the bucketing/finalize is
       // unmetered (cost.md §3).
-      const newAccs = (): Acc[] => aggSpecs.map((s) => newAcc(s.plan));
+      const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAcc(s.plan));
       const index = new Map<string, number>();
       const groups: { keys: Value[]; accs: Acc[] }[] = [];
-      if (groupKeys.length === 0) {
+      if (plan.groupKeys.length === 0) {
         groups.push({ keys: [], accs: newAccs() });
         index.set("", 0);
       }
       for (const row of rows) {
-        const keys = groupKeys.map((gk) => row[gk]!);
+        const keys = plan.groupKeys.map((gk) => row[gk]!);
         const k = distinctRowKey(keys);
         let gi = index.get(k);
         if (gi === undefined) {
@@ -863,9 +959,9 @@ export class Database {
           groups.push({ keys, accs: newAccs() });
         }
         const accs = groups[gi]!.accs;
-        aggSpecs.forEach((spec, i) => {
+        plan.aggSpecs.forEach((spec, i) => {
           meter.charge(COSTS.aggregateAccumulate);
-          const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, bound, meter);
+          const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
           foldAcc(accs[i]!, v);
         });
       }
@@ -874,13 +970,13 @@ export class Database {
       // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The predicate is
       // evaluated against each group's synthetic row (charging its operatorEvals per group);
       // only a TRUE result keeps the group. A dropped group charges no rowProduced (§8).
-      if (having !== null) {
-        groupRows = groupRows.filter((srow) => isTrue(evalExpr(having!, srow, bound, meter)));
+      if (plan.having !== null) {
+        groupRows = groupRows.filter((srow) => isTrue(evalExpr(plan.having!, srow, env, meter)));
       }
       // ORDER BY over the grouped output (keys are synthetic group-key slots).
-      if (order.length > 0) {
+      if (plan.order.length > 0) {
         groupRows.sort((a, b) => {
-          for (const key of order) {
+          for (const key of plan.order) {
             const c = keyCmp(a[key.idx]!, b[key.idx]!, key.descending, key.nullsFirst);
             if (c !== 0) return c;
           }
@@ -891,16 +987,16 @@ export class Database {
       const [start, end] = windowBounds(groupRows.length);
       out = groupRows.slice(start, end).map((srow) => {
         meter.charge(COSTS.rowProduced);
-        return projections.map((p) => evalExpr(p, srow, bound, meter));
+        return plan.projections.map((p) => evalExpr(p, srow, env, meter));
       });
-    } else if (sel.distinct) {
+    } else if (plan.distinct) {
       // Project every filtered row (charging projection cost per row, the §3 asymmetry),
       // keeping first occurrences. `seen` is membership-only: output order comes from the
       // deterministic source iteration, never from Set iteration (no order leak — §8/§10).
       const seen = new Set<string>();
       const distinctRows: Value[][] = [];
       for (const row of rows) {
-        const tuple = projections.map((p) => evalExpr(p, row, bound, meter));
+        const tuple = plan.projections.map((p) => evalExpr(p, row, env, meter));
         const key = distinctRowKey(tuple);
         if (!seen.has(key)) {
           seen.add(key);
@@ -922,210 +1018,158 @@ export class Database {
       const [start, end] = windowBounds(rows.length);
       out = rows.slice(start, end).map((row) => {
         meter.charge(COSTS.rowProduced);
-        return projections.map((p) => evalExpr(p, row, bound, meter));
+        return plan.projections.map((p) => evalExpr(p, row, env, meter));
       });
     }
-    // The scan/eval cost plus each uncorrelated subquery's cost, counted once (cost.md §3).
-    return { columnNames, columnTypes, rows: out, cost: meter.accrued + subqueryCost.value };
+    // The scan/eval cost (correlated subqueries fold their per-row cost in via the evaluator;
+    // globally-uncorrelated ones are folded once before exec, their cost added at runQueryExpr).
+    return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.accrued };
   }
 
   // ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------
   //
-  // A pre-pass over runSelect (before scope/resolution): each scalar / IN / EXISTS subquery is
-  // UNCORRELATED, so it is executed exactly once here and replaced by a constant the ordinary
-  // resolver/evaluator already handles. This keeps the per-row evaluator unchanged and is the seam
-  // the future correlated slice will extend. A correlated reference or a `$N` inside is a 0A000.
+  // After the whole statement tree is planned + the parameters bound, this bottom-up pass walks
+  // every "subquery" RExpr node in the plan tree: it first folds within the node's own sub-plan,
+  // then — if the subquery references NO enclosing scope (a global constant, PG's "initplan") —
+  // executes it ONCE and replaces it with a constant (scalar -> its value; EXISTS -> a boolean; IN
+  // -> an "inValues" over the result column), accruing the subquery's cost once (preserving the
+  // committed once-only cost — cost.md §3). A CORRELATED subquery is left in place; the evaluator
+  // re-executes it per outer row. So after this pass the only surviving "subquery" nodes are correlated.
 
-  private selectRelCols(sel: Select): RelCols {
-    const rc: RelCols = { labels: new Set(), bare: new Set() };
-    this.collectSelectRelCols(sel, rc);
-    return rc;
-  }
-
-  private queryRelCols(q: QueryExpr): RelCols {
-    const rc: RelCols = { labels: new Set(), bare: new Set() };
-    this.collectQueryRelCols(q, rc);
-    return rc;
-  }
-
-  private collectQueryRelCols(q: QueryExpr, rc: RelCols): void {
-    if (q.kind === "select") {
-      this.collectSelectRelCols(q, rc);
+  private foldUncorrelatedInPlan(plan: QueryPlan, bound: Value[], cost: { value: bigint }): void {
+    if (plan.kind === "select") {
+      this.foldUncorrelatedInSelect(plan, bound, cost);
       return;
     }
-    this.collectQueryRelCols(q.lhs, rc);
-    this.collectQueryRelCols(q.rhs, rc);
+    this.foldUncorrelatedInPlan(plan.lhs, bound, cost);
+    this.foldUncorrelatedInPlan(plan.rhs, bound, cost);
   }
 
-  private collectSelectRelCols(sel: Select, rc: RelCols): void {
-    for (const tref of [sel.from, ...sel.joins.map((j) => j.table)]) {
-      const t = this.table(tref.name);
-      if (!t) continue;
-      rc.labels.add((tref.alias ?? t.name).toLowerCase());
-      for (const c of t.columns) rc.bare.add(c.name.toLowerCase());
+  private foldUncorrelatedInSelect(sp: SelectPlan, bound: Value[], cost: { value: bigint }): void {
+    for (const j of sp.joins) if (j.on !== null) j.on = this.foldUncorrelatedInRExpr(j.on, bound, cost);
+    if (sp.filter !== null) sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, cost);
+    if (sp.having !== null) sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, cost);
+    for (const s of sp.aggSpecs) {
+      if (s.operand !== null) s.operand = this.foldUncorrelatedInRExpr(s.operand, bound, cost);
     }
+    sp.projections = sp.projections.map((p) => this.foldUncorrelatedInRExpr(p, bound, cost));
   }
 
-  // rejectCorrelationAndParams rejects the two narrowings before running a subquery (grammar.md
-  // §26): a bind parameter anywhere inside, and a correlated reference — a direct-clause column
-  // that does not resolve against the subquery's own FROM but does match an OUTER relation. Both
-  // are 0A000.
-  private rejectCorrelationAndParams(inner: QueryExpr, outer: RelCols): void {
-    if (queryHasParam(inner)) {
-      throw engineError("feature_not_supported", "bind parameters inside a subquery are not supported yet");
-    }
-    const innerCols = this.queryRelCols(inner);
-    const refs: { q: string | null; name: string }[] = [];
-    for (const e of queryClauseExprs(inner)) collectColRefs(e, refs);
-    for (const r of refs) {
-      const correlated =
-        r.q !== null
-          ? !innerCols.labels.has(r.q.toLowerCase()) && outer.labels.has(r.q.toLowerCase())
-          : !innerCols.bare.has(r.name.toLowerCase()) && outer.bare.has(r.name.toLowerCase());
-      if (correlated) {
-        throw engineError("feature_not_supported", "correlated subqueries are not supported yet");
-      }
-    }
-  }
-
-  // foldSelectSubqueries folds every subquery in a SELECT's clauses (WHERE / select list / HAVING /
-  // each JOIN ON). GROUP BY and ORDER BY keys are column references only (grammar.md §18).
-  private foldSelectSubqueries(sel: Select, outer: RelCols, cost: { value: bigint }): void {
-    if (sel.items.kind === "list") {
-      for (const it of sel.items.items) it.expr = this.foldInExpr(it.expr, outer, cost);
-    }
-    if (sel.filter !== null) sel.filter = this.foldInExpr(sel.filter, outer, cost);
-    if (sel.having !== null) sel.having = this.foldInExpr(sel.having, outer, cost);
-    for (const j of sel.joins) if (j.on !== null) j.on = this.foldInExpr(j.on, outer, cost);
-  }
-
-  // foldInExpr folds this expression node if it is a subquery, else recurses into its children
-  // (rewriting them in place) and returns the node. A subquery's own inner expressions are NOT
-  // walked — running it (which recurses into runSelect) folds its internals, so nested subqueries
-  // fall out for free.
-  private foldInExpr(e: Expr, outer: RelCols, cost: { value: bigint }): Expr {
+  // foldUncorrelatedInRExpr folds this node if it is an uncorrelated "subquery", else recurses into
+  // its children. It RETURNS the (possibly replaced) node; the caller reassigns the field.
+  private foldUncorrelatedInRExpr(e: RExpr, bound: Value[], cost: { value: bigint }): RExpr {
     switch (e.kind) {
-      case "scalarSubquery":
-      case "exists":
-      case "inSubquery":
-        return this.foldSubqueryNode(e, outer, cost);
+      case "subquery": {
+        // Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
+        // globally-uncorrelated subquery nested inside it is already a constant before we run it.
+        if (e.lhs !== null) e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
+        this.foldUncorrelatedInPlan(e.plan, bound, cost);
+        if (queryPlanReferencesOuter(e.plan, 0)) return e; // correlated — re-run per outer row
+        // Uncorrelated: execute ONCE and fold to a constant / inValues.
+        const r = this.execQueryPlan(e.plan, [], bound);
+        cost.value += r.cost;
+        if (e.subKind === "scalar") {
+          if (r.rows.length > 1) {
+            throw engineError(
+              "cardinality_violation",
+              "more than one row returned by a subquery used as an expression",
+            );
+          }
+          return valueToRExpr(r.rows.length === 1 ? r.rows[0]![0]! : nullValue());
+        }
+        if (e.subKind === "exists") {
+          return { kind: "constBool", value: r.rows.length > 0 !== e.negated };
+        }
+        // in
+        const list = r.rows.map((row) => row[0]!);
+        return { kind: "inValues", lhs: e.lhs!, list, negated: e.negated };
+      }
       case "cast":
-        e.inner = this.foldInExpr(e.inner, outer, cost);
-        return e;
-      case "unary":
-        e.operand = this.foldInExpr(e.operand, outer, cost);
-        return e;
-      case "binary":
-        e.lhs = this.foldInExpr(e.lhs, outer, cost);
-        e.rhs = this.foldInExpr(e.rhs, outer, cost);
-        return e;
+      case "neg":
+      case "not":
       case "isNull":
-        e.operand = this.foldInExpr(e.operand, outer, cost);
+        e.operand = this.foldUncorrelatedInRExpr(e.operand, bound, cost);
         return e;
-      case "isDistinct":
-        e.lhs = this.foldInExpr(e.lhs, outer, cost);
-        e.rhs = this.foldInExpr(e.rhs, outer, cost);
-        return e;
-      case "in":
-        e.lhs = this.foldInExpr(e.lhs, outer, cost);
-        e.list = e.list.map((x) => this.foldInExpr(x, outer, cost));
-        return e;
-      case "between":
-        e.lhs = this.foldInExpr(e.lhs, outer, cost);
-        e.lo = this.foldInExpr(e.lo, outer, cost);
-        e.hi = this.foldInExpr(e.hi, outer, cost);
-        return e;
+      case "arith":
+      case "compare":
+      case "and":
+      case "or":
+      case "distinct":
       case "like":
-        e.lhs = this.foldInExpr(e.lhs, outer, cost);
-        e.rhs = this.foldInExpr(e.rhs, outer, cost);
+        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
+        e.rhs = this.foldUncorrelatedInRExpr(e.rhs, bound, cost);
         return e;
       case "case":
-        if (e.operand !== null) e.operand = this.foldInExpr(e.operand, outer, cost);
-        for (const w of e.whens) {
-          w.cond = this.foldInExpr(w.cond, outer, cost);
-          w.result = this.foldInExpr(w.result, outer, cost);
-        }
-        if (e.els !== null) e.els = this.foldInExpr(e.els, outer, cost);
+        e.arms = e.arms.map((arm) => ({
+          cond: this.foldUncorrelatedInRExpr(arm.cond, bound, cost),
+          result: this.foldUncorrelatedInRExpr(arm.result, bound, cost),
+        }));
+        e.els = this.foldUncorrelatedInRExpr(e.els, bound, cost);
         return e;
-      case "funcCall":
-        e.args = e.args.map((a) => this.foldInExpr(a, outer, cost));
+      case "scalarFunc":
+        e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, cost));
+        return e;
+      case "inValues":
+        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
         return e;
       default:
-        return e; // column, qualifiedColumn, literal, param, foldedConst
+        return e; // leaves: column, outerColumn, param, const*
     }
-  }
-
-  // foldSubqueryNode executes one subquery node and returns the constant Expr it folds to
-  // (grammar.md §26). The subquery runs with NO bind parameters (they are rejected inside).
-  private foldSubqueryNode(
-    node: Extract<Expr, { kind: "scalarSubquery" | "exists" | "inSubquery" }>,
-    outer: RelCols,
-    cost: { value: bigint },
-  ): Expr {
-    if (node.kind === "scalarSubquery") {
-      this.rejectCorrelationAndParams(node.query, outer);
-      const r = this.runQueryExpr(node.query, []);
-      cost.value += r.cost;
-      if (r.columnTypes.length !== 1) throw engineError("syntax_error", "subquery must return only one column");
-      if (r.rows.length > 1) {
-        throw engineError("cardinality_violation", "more than one row returned by a subquery used as an expression");
-      }
-      // 0 rows -> a TYPED NULL (value NULL, type the output column's), so a cross-family
-      // comparison still errors (grammar.md §26).
-      const type = scalarTypeOf(r.columnTypes[0]!);
-      const value: Value = r.rows.length === 1 ? r.rows[0]![0]! : { kind: "null" };
-      return { kind: "foldedConst", value, type };
-    }
-    if (node.kind === "exists") {
-      this.rejectCorrelationAndParams(node.query, outer);
-      const r = this.runQueryExpr(node.query, []);
-      cost.value += r.cost;
-      // EXISTS ignores the select list entirely and is never NULL.
-      return { kind: "literal", literal: { kind: "bool", value: r.rows.length > 0 } };
-    }
-    // inSubquery: the LHS belongs to the OUTER query — fold any subqueries inside it too.
-    const lhs = this.foldInExpr(node.lhs, outer, cost);
-    this.rejectCorrelationAndParams(node.query, outer);
-    const r = this.runQueryExpr(node.query, []);
-    cost.value += r.cost;
-    if (r.columnTypes.length !== 1) throw engineError("syntax_error", "subquery has too many columns");
-    const type = scalarTypeOf(r.columnTypes[0]!);
-    // Non-empty -> the literal-IN OR-chain over the result values (3VL inherited). An empty result
-    // -> an empty "in" that resolves to the constant FALSE (IN) / TRUE (NOT IN), independent of the
-    // LHS value (grammar.md §26).
-    const list: Expr[] = r.rows.map((row): Expr => ({ kind: "foldedConst", value: row[0]!, type }));
-    return { kind: "in", lhs, list, negated: node.negated };
   }
 }
 
-// ---- Uncorrelated subquery folding helpers (spec/design/grammar.md §26) ----------------------
+// ---- Subquery helpers (spec/design/grammar.md §26) ----------------------
 
-// RelCols holds the relation labels and column names a query puts in scope (lower-cased), for the
-// §26 correlation check.
-type RelCols = { labels: Set<string>; bare: Set<string> };
+// queryPlanReferencesOuter reports whether a plan references any scope STRICTLY OUTSIDE itself —
+// i.e. it is correlated (spec/design/grammar.md §26). depth is how many nested-subquery frames we
+// have descended INTO this plan (0 = its own clauses); an outerColumn at level points above iff
+// level > depth. The fold pass calls it with depth 0 on a subquery's sub-plan to fold (uncorrelated)
+// or leave (correlated) it.
+function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
+  if (plan.kind === "setOp") {
+    return queryPlanReferencesOuter(plan.lhs, depth) || queryPlanReferencesOuter(plan.rhs, depth);
+  }
+  for (const j of plan.joins) if (j.on !== null && rexprReferencesOuter(j.on, depth)) return true;
+  if (plan.filter !== null && rexprReferencesOuter(plan.filter, depth)) return true;
+  if (plan.having !== null && rexprReferencesOuter(plan.having, depth)) return true;
+  for (const s of plan.aggSpecs) if (s.operand !== null && rexprReferencesOuter(s.operand, depth)) return true;
+  for (const p of plan.projections) if (rexprReferencesOuter(p, depth)) return true;
+  return false;
+}
 
-// scalarTypeOf maps a resolved column/output type back to its ScalarType (null = the untyped-NULL
-// type) — used to type a folded scalar-subquery constant (§26).
-function scalarTypeOf(rt: ResolvedType): ScalarType | null {
-  switch (rt.kind) {
-    case "int":
-      return rt.ty;
-    case "bool":
-      return "boolean";
-    case "text":
-      return "text";
-    case "decimal":
-      return "decimal";
-    case "bytea":
-      return "bytea";
-    case "uuid":
-      return "uuid";
-    case "timestamp":
-      return "timestamp";
-    case "timestamptz":
-      return "timestamptz";
+function rexprReferencesOuter(e: RExpr, depth: number): boolean {
+  switch (e.kind) {
+    case "outerColumn":
+      return e.level > depth;
+    case "subquery":
+      // A nested subquery's own clauses are one frame deeper; its IN lhs is at this frame.
+      return (
+        (e.lhs !== null && rexprReferencesOuter(e.lhs, depth)) ||
+        queryPlanReferencesOuter(e.plan, depth + 1)
+      );
+    case "inValues":
+      return rexprReferencesOuter(e.lhs, depth);
+    case "cast":
+    case "neg":
+    case "not":
+    case "isNull":
+      return rexprReferencesOuter(e.operand, depth);
+    case "arith":
+    case "compare":
+    case "and":
+    case "or":
+    case "distinct":
+    case "like":
+      return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth);
+    case "case":
+      return (
+        e.arms.some((arm) => rexprReferencesOuter(arm.cond, depth) || rexprReferencesOuter(arm.result, depth)) ||
+        rexprReferencesOuter(e.els, depth)
+      );
+    case "scalarFunc":
+      return e.args.some((a) => rexprReferencesOuter(a, depth));
     default:
-      return null; // "null"
+      return false; // leaves: column, param, const*
   }
 }
 
@@ -1218,65 +1262,6 @@ function queryHasParam(q: QueryExpr): boolean {
   return queryClauseExprs(q).some(exprHasParam);
 }
 
-// collectColRefs collects every column reference in an expression for the §26 correlation scan —
-// NOT descending into nested subqueries (a deeper subquery's references are its own concern). The
-// IN-subquery's LHS IS at this level, so it is walked.
-function collectColRefs(e: Expr, out: { q: string | null; name: string }[]): void {
-  switch (e.kind) {
-    case "column":
-      out.push({ q: null, name: e.name });
-      return;
-    case "qualifiedColumn":
-      out.push({ q: e.qualifier, name: e.name });
-      return;
-    case "inSubquery":
-      collectColRefs(e.lhs, out);
-      return;
-    case "scalarSubquery":
-    case "exists":
-      return;
-    case "cast":
-      collectColRefs(e.inner, out);
-      return;
-    case "unary":
-      collectColRefs(e.operand, out);
-      return;
-    case "binary":
-    case "isDistinct":
-      collectColRefs(e.lhs, out);
-      collectColRefs(e.rhs, out);
-      return;
-    case "isNull":
-      collectColRefs(e.operand, out);
-      return;
-    case "in":
-      collectColRefs(e.lhs, out);
-      for (const x of e.list) collectColRefs(x, out);
-      return;
-    case "between":
-      collectColRefs(e.lhs, out);
-      collectColRefs(e.lo, out);
-      collectColRefs(e.hi, out);
-      return;
-    case "like":
-      collectColRefs(e.lhs, out);
-      collectColRefs(e.rhs, out);
-      return;
-    case "case":
-      if (e.operand !== null) collectColRefs(e.operand, out);
-      for (const w of e.whens) {
-        collectColRefs(w.cond, out);
-        collectColRefs(w.result, out);
-      }
-      if (e.els !== null) collectColRefs(e.els, out);
-      return;
-    case "funcCall":
-      for (const a of e.args) collectColRefs(a, out);
-      return;
-    default:
-      return; // literal, param, foldedConst
-  }
-}
 
 // distinctRowKey encodes a projected row into a collision-free string key for DISTINCT
 // dedup. Each field carries a type tag (n/i/b) and a payload, joined by a separator no
@@ -1366,7 +1351,92 @@ type RExpr =
   // A scalar-function call (abs/round, spec/design/functions.md §9), evaluated per row in any
   // context. `result` is the static result type — for abs over an integer it is the operand's
   // integer type, so the magnitude is range-checked at that boundary; otherwise decimal.
-  | { kind: "scalarFunc"; func: "abs" | "round"; args: RExpr[]; result: ScalarType };
+  | { kind: "scalarFunc"; func: "abs" | "round"; args: RExpr[]; result: ScalarType }
+  // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
+  // row `level` hops out (1 = immediate parent). A leaf — reads from the outer-row environment.
+  | { kind: "outerColumn"; level: number; index: number }
+  // A CORRELATED subquery, re-executed once per outer row at eval (uncorrelated ones are folded to
+  // a constant / inValues before exec). `lhs`/`negated` apply to the IN form.
+  | { kind: "subquery"; plan: QueryPlan; subKind: SubqueryKind; lhs: RExpr | null; negated: boolean }
+  // A folded uncorrelated `IN (subquery)`: the subquery ran once yielding `list`; per row it tests
+  // `lhs` for three-valued membership (empty → negated; a NULL with no positive match → NULL).
+  | { kind: "inValues"; lhs: RExpr; list: Value[]; negated: boolean };
+
+// SubqueryKind selects which subquery form a "subquery" RExpr is (spec/design/grammar.md §26).
+type SubqueryKind = "scalar" | "exists" | "in";
+
+// ============================================================================
+// Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
+// subquery is re-run once per outer row). planQuery (the resolve half of the old runSelect)
+// produces a QueryPlan; execQueryPlan (the execute half) consumes it against an outer-row
+// environment. The split lets a subquery be resolved ONCE — so its structural/type errors fire
+// even over an empty outer — yet executed many times (spec/design/grammar.md §26).
+// ============================================================================
+
+// PlanRel is one relation in a SELECT plan: the table name (looked up in the store at exec), the
+// flat offset of its first column, and its column count (for NULL-padding).
+type PlanRel = { tableName: string; offset: number; colCount: number };
+
+// PlanJoin is one join in a SELECT plan: its kind and resolved ON predicate (null for CROSS). The
+// right relation is rels[k+1].
+type PlanJoin = { kind: JoinKind; on: RExpr | null };
+
+// OrderSlot is a resolved ORDER BY key: a flat/synthetic slot + per-key direction flags.
+type OrderSlot = { idx: number; descending: boolean; nullsFirst: boolean };
+
+// SelectPlan is a resolved SELECT, executable against an outer-row environment (the execute half
+// of the old runSelect, lifted to a value so a correlated subquery can re-run it per outer row).
+type SelectPlan = {
+  kind: "select";
+  rels: PlanRel[];
+  joins: PlanJoin[];
+  filter: RExpr | null;
+  isAgg: boolean;
+  groupKeys: number[];
+  aggSpecs: AggSpec[];
+  having: RExpr | null;
+  order: OrderSlot[];
+  projections: RExpr[];
+  columnNames: string[];
+  columnTypes: ResolvedType[];
+  distinct: boolean;
+  limit: bigint | null;
+  offset: bigint | null;
+};
+
+// SetOpPlan is a resolved set operation: both operands planned with the same parent scope, the
+// unified output types, and the trailing ORDER BY / LIMIT / OFFSET resolved by output column.
+type SetOpPlan = {
+  kind: "setOp";
+  op: SetOpKind;
+  all: boolean;
+  lhs: QueryPlan;
+  rhs: QueryPlan;
+  columnNames: string[];
+  columnTypes: ResolvedType[];
+  order: OrderSlot[];
+  limit: bigint | null;
+  offset: bigint | null;
+};
+
+// QueryPlan is a resolved query expression: a SELECT plan or a set-op plan (mirrors QueryExpr).
+type QueryPlan = SelectPlan | SetOpPlan;
+
+// EvalEnv is the environment threaded into the per-row evaluator (spec/design/grammar.md §26): the
+// bound parameters, the stack of enclosing rows (innermost LAST) a correlated reference reads, and
+// a runSubquery callback (a correlated subquery re-runs its inner plan against the pushed stack).
+// outer is empty at the top level; an outerColumn at frame `level` reads outer[outer.length-level].
+type EvalEnv = {
+  params: Value[];
+  outer: Row[];
+  runSubquery(plan: QueryPlan, outer: Row[]): SelectResult;
+};
+
+// unreachableSubquery is the runSubquery stub for UPDATE/DELETE, where the resolver rejects
+// subqueries (0A000), so the evaluator never encounters a "subquery" node and never calls it.
+function unreachableSubquery(): never {
+  throw new Error("a subquery cannot appear in an UPDATE/DELETE expression");
+}
 
 // ============================================================================
 // Aggregate resolution + accumulation (spec/design/aggregates.md).
@@ -1715,20 +1785,44 @@ function groupingErrorColumn(name: string): EngineError {
 // for case-insensitive matching), the table, and the flat offset of its first column.
 type ScopeRel = { label: string; table: Table; offset: number };
 
+// Resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
+// §26): level === 0 is a LOCAL column of this query (a flat index into the joined row); level >= 1
+// is a correlated OUTER reference to an enclosing query (level hops outward, index the flat column
+// index within that ancestor's row).
+type Resolved = { level: number; index: number };
+
+// outerOf lifts a parent-scope resolution into the child's frame: one more hop outward.
+function outerOf(r: Resolved): Resolved {
+  return { level: r.level + 1, index: r.index };
+}
+
 class Scope {
   rels: ScopeRel[];
-  constructor(rels: ScopeRel[]) {
+  // parent is the enclosing query's scope, for correlated resolution (null at top level).
+  parent: Scope | null;
+  // catalog lets a subquery's inner FROM tables be looked up during planning.
+  catalog: Database;
+  // allowSubquery is true inside a SELECT (and its nested subqueries), false for UPDATE/DELETE
+  // (a subquery there is 0A000 this slice).
+  allowSubquery: boolean;
+  constructor(rels: ScopeRel[], catalog: Database, parent: Scope | null, allowSubquery: boolean) {
     this.rels = rels;
+    this.catalog = catalog;
+    this.parent = parent;
+    this.allowSubquery = allowSubquery;
   }
 
-  // single builds a one-relation scope (the single-table SELECT / UPDATE / DELETE case).
-  static single(t: Table): Scope {
-    return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }]);
+  // single builds a one-relation scope with no parent and no subqueries (the single-table
+  // UPDATE / DELETE case). SELECT builds its own scope in planSelect.
+  static single(catalog: Database, t: Table): Scope {
+    return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }], catalog, null, false);
   }
 
-  // resolveBare resolves a bare column name to a flat row index: no relation has it → 42703;
-  // two or more relations have it → 42702 ambiguous; exactly one → its flat index.
-  resolveBare(name: string): number {
+  // resolveBare resolves a bare column name against THIS scope, then OUTWARD through the parent
+  // chain. Within one scope: two+ relations have it → 42702 ambiguous; exactly one → local; none
+  // → fall through to the parent. A name found only in an ancestor is an outer reference (nearest
+  // scope wins). 42703 only if no scope in the chain has it.
+  resolveBare(name: string): Resolved {
     let found = -1;
     for (const r of this.rels) {
       const local = columnIndex(r.table, name);
@@ -1737,31 +1831,46 @@ class Scope {
         found = r.offset + local;
       }
     }
-    if (found < 0) throw undefinedColumn(name);
-    return found;
+    if (found >= 0) return { level: 0, index: found };
+    if (this.parent !== null) return outerOf(this.parent.resolveBare(name));
+    throw undefinedColumn(name);
   }
 
-  // resolveQualified resolves a qualified rel.col to a flat row index: an unknown rel is 42P01,
-  // a known rel with no such column is 42703. Never ambiguous (it names one relation).
-  resolveQualified(qualifier: string, name: string): number {
+  // resolveQualified resolves a qualified rel.col against THIS scope, then outward. A qualifier
+  // naming a relation here binds — a missing column is then 42703 (no fall-through). Only an
+  // unknown qualifier walks outward (42P01 if no ancestor has it).
+  resolveQualified(qualifier: string, name: string): Resolved {
     const q = qualifier.toLowerCase();
     for (const r of this.rels) {
       if (r.label === q) {
         const local = columnIndex(r.table, name);
         if (local < 0) throw undefinedColumn(name);
-        return r.offset + local;
+        return { level: 0, index: r.offset + local };
       }
     }
+    if (this.parent !== null) return outerOf(this.parent.resolveQualified(qualifier, name));
     throw missingFromEntry(qualifier);
   }
 
-  // columnAt returns the column at a flat index (the index is known valid — resolution made it).
+  // columnAt returns the column at a flat index in THIS scope (index known valid).
   columnAt(flat: number): Column {
     for (const r of this.rels) {
       const n = r.table.columns.length;
       if (flat >= r.offset && flat < r.offset + n) return r.table.columns[flat - r.offset]!;
     }
     throw new Error("a resolved flat column index is always in range");
+  }
+
+  // ancestor returns the scope `level` hops outward (1 = immediate parent).
+  ancestor(level: number): Scope {
+    let s: Scope = this;
+    for (let i = 0; i < level; i++) s = s.parent!;
+    return s;
+  }
+
+  // columnOf returns the column a resolution refers to — local here, or outer in an ancestor.
+  columnOf(r: Resolved): Column {
+    return this.ancestor(r.level).columnAt(r.index);
   }
 }
 
@@ -1954,8 +2063,10 @@ function resolveProjections(
 // never the SELECT spelling); every other expression takes the fixed "?column?". The column is
 // known to exist — resolve validated it.
 function outputName(scope: Scope, e: Expr): string {
-  if (e.kind === "column") return scope.columnAt(scope.resolveBare(e.name)).name;
-  if (e.kind === "qualifiedColumn") return scope.columnAt(scope.resolveQualified(e.qualifier, e.name)).name;
+  // A bare/qualified column takes the catalog's canonical name, whether it resolves to a local
+  // relation or (correlated) an enclosing one — columnOf handles both.
+  if (e.kind === "column") return scope.columnOf(scope.resolveBare(e.name)).name;
+  if (e.kind === "qualifiedColumn") return scope.columnOf(scope.resolveQualified(e.qualifier, e.name)).name;
   // An un-aliased aggregate call is named by its lowercased function name (PG; §8).
   if (e.kind === "funcCall") return e.name.toLowerCase();
   return "?column?";
@@ -1972,6 +2083,34 @@ function resolveBooleanFilter(scope: Scope, e: Expr, params: ParamTypes): RExpr 
   return node;
 }
 
+// resolveColumnRef turns a chain resolution into a resolved node + type (§26). A Local column
+// obeys the grouping rule (collectColumn); an Outer (correlated) reference is a per-outer-row
+// CONSTANT, so it bypasses that rule and resolves to an outerColumn reading the enclosing row at
+// eval; its type is the ancestor column's.
+function resolveColumnRef(
+  scope: Scope,
+  ag: AggCtx,
+  r: Resolved,
+  name: string,
+): { node: RExpr; type: ResolvedType } {
+  if (r.level === 0) return collectColumn(scope, ag, r.index, name);
+  return { node: { kind: "outerColumn", level: r.level, index: r.index }, type: resolvedTypeOf(scope.columnOf(r).type) };
+}
+
+// planSubquery plans a subquery operand against the scope chain (§26). Rejects a non-SELECT context
+// (UPDATE/DELETE/INSERT — allowSubquery false) and any $N inside (an orthogonal parameter-inference
+// narrowing), both 0A000. The inner query is resolved ONCE, with `scope` as its parent, so
+// correlated references become outerColumn and errors fire even over an empty outer.
+function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): QueryPlan {
+  if (!scope.allowSubquery) {
+    throw engineError("feature_not_supported", "subqueries are only supported in a SELECT statement");
+  }
+  if (queryHasParam(inner)) {
+    throw engineError("feature_not_supported", "bind parameters inside a subquery are not supported yet");
+  }
+  return scope.catalog.planQuery(inner, scope, params);
+}
+
 // resolve resolves one Expr into an RExpr plus its static type. ctx (non-null) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); null
 // defaults a bare literal to int64.
@@ -1984,14 +2123,12 @@ function resolve(
 ): { node: RExpr; type: ResolvedType } {
   switch (e.kind) {
     case "column": {
-      // Resolve for existence first (42703/42702 take priority, matching PostgreSQL); then in
-      // an aggregate query's projection the column must be a grouping key (else 42803).
-      const idx = scope.resolveBare(e.name);
-      return collectColumn(scope, ag, idx, e.name);
+      // Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
+      // (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
+      return resolveColumnRef(scope, ag, scope.resolveBare(e.name), e.name);
     }
     case "qualifiedColumn": {
-      const idx = scope.resolveQualified(e.qualifier, e.name);
-      return collectColumn(scope, ag, idx, e.name);
+      return resolveColumnRef(scope, ag, scope.resolveQualified(e.qualifier, e.name), e.name);
     }
     case "param": {
       // A bind parameter is an adaptable operand (like an integer/string literal): it takes its
@@ -2057,21 +2194,44 @@ function resolve(
           return { node: { kind: "constInt", value: e.literal.int }, type: { kind: "int", ty } };
         }
       }
-    case "foldedConst": {
-      // A subquery already executed + folded by the pre-pass (grammar.md §26). It resolves to the
-      // matching constant with its EXACT output type (null = untyped NULL) — NO context adaptation,
-      // so a folded bigint keeps bigint (unlike a bare integer literal) and a typed-NULL from an
-      // empty scalar still participates in cross-type checks.
-      const type: ResolvedType = e.type !== null ? resolvedTypeOf(e.type) : { kind: "null" };
-      return { node: valueToRExpr(e.value), type };
+    case "scalarSubquery": {
+      // A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so its
+      // column-count / type errors fire even over an empty outer. planSubquery rejects a non-SELECT
+      // context and a $N inside (both 0A000). The fold pass folds an uncorrelated one to a constant;
+      // a correlated one is re-executed per outer row by the evaluator.
+      const plan = planSubquery(scope, e.query, params);
+      if (plan.columnTypes.length !== 1) {
+        throw engineError("syntax_error", "subquery must return only one column");
+      }
+      return {
+        node: { kind: "subquery", plan, subKind: "scalar", lhs: null, negated: false },
+        type: plan.columnTypes[0]!,
+      };
     }
-    case "scalarSubquery":
-    case "exists":
-    case "inSubquery":
-      // Folded by runSelect's pre-pass before resolution (grammar.md §26), so resolve never sees
-      // one inside a SELECT. Reaching here means a subquery in a non-SELECT context (an UPDATE SET
-      // / INSERT VALUES / DELETE WHERE expression, which run no fold pre-pass) — SELECT only.
-      throw engineError("feature_not_supported", "subqueries are only supported in a SELECT statement");
+    case "exists": {
+      // EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT EXISTS
+      // parses as the unary NOT wrapping this, so negated here is always false.
+      const plan = planSubquery(scope, e.query, params);
+      return {
+        node: { kind: "subquery", plan, subKind: "exists", lhs: null, negated: false },
+        type: { kind: "bool" },
+      };
+    }
+    case "inSubquery": {
+      // The LHS is an OUTER expression (resolved in the current scope / agg context); the subquery
+      // yields the single membership column. The test is `lhs = element`, so the pair must be
+      // comparable (42804), exactly like a literal IN.
+      const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
+      const plan = planSubquery(scope, e.query, params);
+      if (plan.columnTypes.length !== 1) {
+        throw engineError("syntax_error", "subquery has too many columns");
+      }
+      classifyComparable(lt, plan.columnTypes[0]!);
+      return {
+        node: { kind: "subquery", plan, subKind: "in", lhs, negated: e.negated },
+        type: { kind: "bool" },
+      };
+    }
     case "cast": {
       const [target, typmod] = resolveTypeAndTypmod(e.typeName, e.typeMod);
       // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
@@ -2790,14 +2950,40 @@ const I64_MIN = -9223372036854775808n;
 // operands LHS-before-RHS — JS evaluates arguments left-to-right); leaf nodes
 // (column/constants) charge nothing. Both operands are always evaluated — there is no
 // short-circuit, so the count never depends on operand values (spec/design/cost.md §3).
-function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
+// inMembership is three-valued `lhs IN (list)` membership (spec/design/grammar.md §26), charging
+// one operator_eval per element compared. An EMPTY list is `negated` (x IN () = FALSE, x NOT IN ()
+// = TRUE) independent of lv. Otherwise: a positive match -> TRUE; else a NULL element (or NULL lv)
+// -> NULL; else FALSE. NOT IN is the Kleene negation. Shared by the folded "inValues" node and the
+// correlated "subquery"/in eval.
+function inMembership(lv: Value, list: Value[], negated: boolean, m: Meter): Value {
+  if (list.length === 0) return { kind: "bool", value: negated };
+  let anyMatch = false;
+  let anyNull = false;
+  for (const v of list) {
+    m.charge(COSTS.operatorEval);
+    const t = eq3(lv, v);
+    if (t === "true") anyMatch = true;
+    else if (t === "unknown") anyNull = true;
+  }
+  const inVal: Value = anyMatch
+    ? { kind: "bool", value: true }
+    : anyNull
+      ? nullValue()
+      : { kind: "bool", value: false };
+  return negated ? boolNot(inVal) : inVal;
+}
+
+function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
   switch (e.kind) {
     case "column":
       return row[e.index]!;
+    case "outerColumn":
+      // A correlated reference: column `index` of the enclosing row `level` hops out (§26).
+      return env.outer[env.outer.length - e.level]![e.index]!;
     case "param":
       // The supplied value, already coerced to its inferred type by bindParams before execution
       // (spec/design/api.md §5).
-      return params[e.index]!;
+      return env.params[e.index]!;
     case "constInt":
       return intValue(e.value);
     case "constBool":
@@ -2818,13 +3004,13 @@ function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
       return nullValue();
     case "cast": {
       m.charge(COSTS.operatorEval);
-      const v = evalExpr(e.operand, row, params, m);
+      const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
       return evalCast(v, e.target, e.typmod);
     }
     case "neg": {
       m.charge(COSTS.operatorEval);
-      const v = evalExpr(e.operand, row, params, m);
+      const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
       if (isDecimal(e.result)) {
         return decimalValue((v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec).negate());
@@ -2836,12 +3022,12 @@ function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
     }
     case "not": {
       m.charge(COSTS.operatorEval);
-      return boolNot(evalExpr(e.operand, row, params, m));
+      return boolNot(evalExpr(e.operand, row, env, m));
     }
     case "arith": {
       m.charge(COSTS.operatorEval);
-      const a = evalExpr(e.lhs, row, params, m);
-      const b = evalExpr(e.rhs, row, params, m);
+      const a = evalExpr(e.lhs, row, env, m);
+      const b = evalExpr(e.rhs, row, env, m);
       if (a.kind === "null" || b.kind === "null") return nullValue();
       if (isDecimal(e.result)) {
         // Decimal arithmetic: widen any integer operand to decimal, then apply the op with
@@ -2853,8 +3039,8 @@ function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
     }
     case "compare": {
       m.charge(COSTS.operatorEval);
-      const a = evalExpr(e.lhs, row, params, m);
-      const b = evalExpr(e.rhs, row, params, m);
+      const a = evalExpr(e.lhs, row, env, m);
+      const b = evalExpr(e.rhs, row, env, m);
       switch (e.op) {
         case "eq":
           return from3(eq3(a, b));
@@ -2870,24 +3056,24 @@ function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
     }
     case "and": {
       m.charge(COSTS.operatorEval);
-      const a = evalExpr(e.lhs, row, params, m);
-      const b = evalExpr(e.rhs, row, params, m);
+      const a = evalExpr(e.lhs, row, env, m);
+      const b = evalExpr(e.rhs, row, env, m);
       return boolAnd(a, b);
     }
     case "or": {
       m.charge(COSTS.operatorEval);
-      const a = evalExpr(e.lhs, row, params, m);
-      const b = evalExpr(e.rhs, row, params, m);
+      const a = evalExpr(e.lhs, row, env, m);
+      const b = evalExpr(e.rhs, row, env, m);
       return boolOr(a, b);
     }
     case "isNull": {
       m.charge(COSTS.operatorEval);
-      const isNull = evalExpr(e.operand, row, params, m).kind === "null";
+      const isNull = evalExpr(e.operand, row, env, m).kind === "null";
       return { kind: "bool", value: isNull !== e.negated };
     }
     case "distinct": {
       m.charge(COSTS.operatorEval);
-      const same = notDistinctFrom(evalExpr(e.lhs, row, params, m), evalExpr(e.rhs, row, params, m));
+      const same = notDistinctFrom(evalExpr(e.lhs, row, env, m), evalExpr(e.rhs, row, env, m));
       // negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
       // the same?"; IS DISTINCT FROM asks the opposite. Always a definite boolean — never
       // unknown (the null_safe discipline, functions.md §3).
@@ -2895,8 +3081,8 @@ function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
     }
     case "like": {
       m.charge(COSTS.operatorEval);
-      const subject = evalExpr(e.lhs, row, params, m);
-      const pattern = evalExpr(e.rhs, row, params, m);
+      const subject = evalExpr(e.lhs, row, env, m);
+      const pattern = evalExpr(e.rhs, row, env, m);
       // NULL propagates BEFORE the matcher runs, so a malformed pattern against a NULL operand
       // is still NULL, never 22025 (matches PG — grammar.md §22).
       if (subject.kind === "null" || pattern.kind === "null") return nullValue();
@@ -2914,19 +3100,19 @@ function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
       // Charge the node, then only the conditions up to the match plus the selected result.
       m.charge(COSTS.operatorEval);
       for (const arm of e.arms) {
-        const cv = evalExpr(arm.cond, row, params, m);
+        const cv = evalExpr(arm.cond, row, env, m);
         if (cv.kind === "bool" && cv.value) {
-          return coerceCaseValue(evalExpr(arm.result, row, params, m), e.coerceDecimal);
+          return coerceCaseValue(evalExpr(arm.result, row, env, m), e.coerceDecimal);
         }
       }
-      return coerceCaseValue(evalExpr(e.els, row, params, m), e.coerceDecimal);
+      return coerceCaseValue(evalExpr(e.els, row, env, m), e.coerceDecimal);
     }
     case "scalarFunc": {
       // One operator_eval per call (the uniform weight); arguments charge their own.
       m.charge(COSTS.operatorEval);
       const vals: Value[] = [];
       for (const a of e.args) {
-        const v = evalExpr(a, row, params, m);
+        const v = evalExpr(a, row, env, m);
         if (v.kind === "null") return nullValue(); // NULL propagates
         vals.push(v);
       }
@@ -2946,6 +3132,38 @@ function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
       const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
       const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
       return decimalValue(d.roundPlaces(places));
+    }
+    case "subquery": {
+      // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row. Push
+      // the current row onto the outer-row stack, run the inner plan, fold its accrued cost into
+      // this meter, plus one operator_eval for the node.
+      m.charge(COSTS.operatorEval);
+      const r = env.runSubquery(e.plan, [...env.outer, row]);
+      m.charge(r.cost);
+      if (e.subKind === "scalar") {
+        if (r.rows.length > 1) {
+          throw engineError(
+            "cardinality_violation",
+            "more than one row returned by a subquery used as an expression",
+          );
+        }
+        // 0 rows -> NULL (the static type was settled at resolve).
+        return r.rows.length === 0 ? nullValue() : r.rows[0]![0]!;
+      }
+      if (e.subKind === "exists") {
+        // EXISTS ignores the select list entirely and is never NULL.
+        return { kind: "bool", value: r.rows.length > 0 !== e.negated };
+      }
+      // in
+      const lv = evalExpr(e.lhs!, row, env, m);
+      const list = r.rows.map((rr) => rr[0]!);
+      return inMembership(lv, list, e.negated, m);
+    }
+    case "inValues": {
+      // A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.
+      m.charge(COSTS.operatorEval);
+      const lv = evalExpr(e.lhs, row, env, m);
+      return inMembership(lv, e.list, e.negated, m);
     }
   }
 }

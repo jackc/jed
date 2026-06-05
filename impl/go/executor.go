@@ -450,7 +450,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
 	}
 	// DELETE is single-table; resolve its WHERE against a one-relation scope.
-	s := singleScope(table)
+	s := singleScope(db, table)
 	ptypes := &paramTypes{}
 	var filter *rExpr
 	if del.Filter != nil {
@@ -471,15 +471,16 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 
 	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13;
 	// spec/design/cost.md §3). Keys are collected before mutating (so the map is not
-	// modified mid-scan).
+	// modified mid-scan). DELETE has no outer query / subqueries: an empty outer-row stack.
 	meter := NewMeter()
+	env := &evalEnv{exec: db, params: bound}
 	store := db.stores[strings.ToLower(del.Table)]
 	var keys [][]byte
 	for _, e := range store.EntriesInKeyOrder() {
 		meter.Charge(Costs.StorageRowRead)
 		matched := true
 		if filter != nil {
-			v, err := filter.eval(e.Row, bound, meter)
+			v, err := filter.eval(e.Row, env, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -508,7 +509,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	}
 	// UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
 	// shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
-	s := singleScope(table)
+	s := singleScope(db, table)
 	ptypes := &paramTypes{}
 
 	// Resolve assignments up front (fail fast, deterministic).
@@ -567,6 +568,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	// scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes
 	// do not — they evaluate nothing; spec/design/cost.md §3).
 	meter := NewMeter()
+	env := &evalEnv{exec: db, params: bound}
 	store := db.stores[strings.ToLower(upd.Table)]
 	type pending struct {
 		key []byte
@@ -576,7 +578,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	for _, e := range store.EntriesInKeyOrder() {
 		meter.Charge(Costs.StorageRowRead)
 		if filter != nil {
-			v, err := filter.eval(e.Row, bound, meter)
+			v, err := filter.eval(e.Row, env, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -587,7 +589,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		newRow := make(Row, len(e.Row))
 		copy(newRow, e.Row)
 		for _, p := range plans {
-			raw, err := p.source.eval(e.Row, bound, meter)
+			raw, err := p.source.eval(e.Row, env, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -651,70 +653,146 @@ func (db *Database) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
 // runQueryExpr runs a query expression to a selectResult — a lone SELECT via runSelect, or a set
 // operation via runSetOp (recursively, so a chain `a UNION b INTERSECT c` evaluates as the parsed
 // precedence tree).
+// runQueryExpr is the top-level orchestrator (spec/design/grammar.md §26): PLAN the whole
+// expression tree once against an empty scope chain (threading one paramTypes so $N inference is
+// statement-wide), bind the parameters, then the foldUncorrelated pass executes each
+// globally-uncorrelated subquery once and folds it to a constant (preserving the once-only cost),
+// and finally EXECUTE against an empty outer-row environment. Correlated subqueries that survive
+// the fold are re-executed per outer row by the evaluator.
 func (db *Database) runQueryExpr(qe QueryExpr, params []Value) (selectResult, error) {
-	if qe.Select != nil {
-		return db.runSelect(qe.Select, params)
+	ptypes := &paramTypes{}
+	plan, err := db.planQuery(qe, nil, ptypes)
+	if err != nil {
+		return selectResult{}, err
 	}
-	return db.runSetOp(qe.SetOp, params)
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return selectResult{}, err
+	}
+	bound, err := bindParams(params, ptys)
+	if err != nil {
+		return selectResult{}, err
+	}
+	var subqueryCost int64
+	if err := db.foldUncorrelatedInPlan(&plan, bound, &subqueryCost); err != nil {
+		return selectResult{}, err
+	}
+	r, err := db.execQueryPlan(&plan, nil, bound)
+	if err != nil {
+		return selectResult{}, err
+	}
+	r.cost += subqueryCost
+	return r, nil
 }
 
+// runSelect runs a lone SELECT — the entry point executeSelect and INSERT ... SELECT use.
+func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error) {
+	return db.runQueryExpr(QueryExpr{Select: sel}, params)
+}
+
+// runSetOp runs a set operation as a top-level statement.
 func (db *Database) runSetOp(so *SetOp, params []Value) (selectResult, error) {
-	left, err := db.runQueryExpr(so.Lhs, params)
-	if err != nil {
-		return selectResult{}, err
+	return db.runQueryExpr(QueryExpr{SetOp: so}, params)
+}
+
+// planQuery resolves a query expression into an owned queryPlan against the scope chain (parent
+// = the enclosing query's scope, nil at top level). A subquery is planned here, once (§26).
+func (db *Database) planQuery(qe QueryExpr, parent *scope, ptypes *paramTypes) (queryPlan, error) {
+	if qe.Select != nil {
+		sp, err := db.planSelect(qe.Select, parent, ptypes)
+		if err != nil {
+			return queryPlan{}, err
+		}
+		return queryPlan{sel: sp}, nil
 	}
-	right, err := db.runQueryExpr(so.Rhs, params)
+	sop, err := db.planSetOp(qe.SetOp, parent, ptypes)
 	if err != nil {
-		return selectResult{}, err
+		return queryPlan{}, err
+	}
+	return queryPlan{setop: sop}, nil
+}
+
+// execQueryPlan executes a resolved plan against an outer-row environment (outer = the enclosing
+// rows, innermost last; nil at top level) and the bound parameters.
+func (db *Database) execQueryPlan(plan *queryPlan, outer []Row, params []Value) (selectResult, error) {
+	if plan.sel != nil {
+		return db.execSelectPlan(plan.sel, outer, params)
+	}
+	return db.execSetOpPlan(plan.setop, outer, params)
+}
+
+// planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
+// parent scope, check arity + unify column types up front (so the 42601/42804 fire even over
+// empty operands), and resolve the trailing ORDER BY by output column name.
+func (db *Database) planSetOp(so *SetOp, parent *scope, ptypes *paramTypes) (*setOpPlan, error) {
+	lhs, err := db.planQuery(so.Lhs, parent, ptypes)
+	if err != nil {
+		return nil, err
+	}
+	rhs, err := db.planQuery(so.Rhs, parent, ptypes)
+	if err != nil {
+		return nil, err
 	}
 
-	// Arity: both operands must produce the same number of columns. Checked before any row is
-	// matched, so it fires over empty operands too. PostgreSQL uses 42601 here.
-	if len(left.columnTypes) != len(right.columnTypes) {
-		return selectResult{}, NewError(SyntaxError, fmt.Sprintf(
+	if len(lhs.columnTypes()) != len(rhs.columnTypes()) {
+		return nil, NewError(SyntaxError, fmt.Sprintf(
 			"each %s query must have the same number of columns", setopName(so.Op),
 		))
 	}
-
-	// Per-column type unification (42804 on an incompatible pair). Output NAMES are the LEFT
-	// operand's (PostgreSQL).
-	outTypes := make([]resolvedType, len(left.columnTypes))
-	for i := range outTypes {
-		t, err := unifySetopColumn(left.columnTypes[i], right.columnTypes[i], so.Op)
+	columnTypes := make([]resolvedType, len(lhs.columnTypes()))
+	for i := range columnTypes {
+		t, err := unifySetopColumn(lhs.columnTypes()[i], rhs.columnTypes()[i], so.Op)
 		if err != nil {
-			return selectResult{}, err
+			return nil, err
 		}
-		outTypes[i] = t
+		columnTypes[i] = t
+	}
+	var columnNames []string
+	if lhs.sel != nil {
+		columnNames = lhs.sel.columnNames
+	} else {
+		columnNames = lhs.setop.columnNames
 	}
 
-	// Convert each operand's values to the unified column types BEFORE matching — the only runtime
-	// conversion is integer -> decimal (so an int value and a decimal value compare equal).
-	coerceSetopRows(left.rows, left.columnTypes, outTypes)
-	coerceSetopRows(right.rows, right.columnTypes, outTypes)
-
-	rows := combineSetop(so.Op, so.All, left.rows, right.rows)
-	cost := left.cost + right.cost
-
-	// Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
-	// operation): a qualified key is 42P01, an unknown name is 42703. Reuse keyCmp; SliceStable
-	// keeps the combine order (left rows before right) on a full tie.
-	type orderSlot struct {
-		idx        int
-		descending bool
-		nullsFirst bool
-	}
 	order := make([]orderSlot, 0, len(so.OrderBy))
 	for i := range so.OrderBy {
 		key := &so.OrderBy[i]
-		idx, err := resolveSetopOrderKey(key, left.columnNames)
+		idx, err := resolveSetopOrderKey(key, columnNames)
 		if err != nil {
-			return selectResult{}, err
+			return nil, err
 		}
 		order = append(order, orderSlot{idx: idx, descending: key.Descending, nullsFirst: key.NullsFirst})
 	}
-	if len(order) > 0 {
+
+	return &setOpPlan{
+		op: so.Op, all: so.All, lhs: lhs, rhs: rhs,
+		columnNames: columnNames, columnTypes: columnTypes,
+		order: order, limit: so.Limit, offset: so.Offset,
+	}, nil
+}
+
+// execSetOpPlan executes a resolved set operation: run both operands against the outer
+// environment, coerce to the unified types, combine, then sort + window. Cost is lhs.cost +
+// rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
+func (db *Database) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value) (selectResult, error) {
+	left, err := db.execQueryPlan(&plan.lhs, outer, params)
+	if err != nil {
+		return selectResult{}, err
+	}
+	right, err := db.execQueryPlan(&plan.rhs, outer, params)
+	if err != nil {
+		return selectResult{}, err
+	}
+
+	coerceSetopRows(left.rows, left.columnTypes, plan.columnTypes)
+	coerceSetopRows(right.rows, right.columnTypes, plan.columnTypes)
+
+	rows := combineSetop(plan.op, plan.all, left.rows, right.rows)
+	cost := left.cost + right.cost
+
+	if len(plan.order) > 0 {
 		sort.SliceStable(rows, func(a, b int) bool {
-			for _, k := range order {
+			for _, k := range plan.order {
 				c := keyCmp(rows[a][k.idx], rows[b][k.idx], k.descending, k.nullsFirst)
 				if c != 0 {
 					return c < 0
@@ -724,21 +802,20 @@ func (db *Database) runSetOp(so *SetOp, params []Value) (selectResult, error) {
 		})
 	}
 
-	// LIMIT / OFFSET window — clamp in the int64 domain (counts are non-negative, parser).
 	n := int64(len(rows))
 	start := int64(0)
-	if so.Offset != nil && *so.Offset < n {
-		start = *so.Offset
-	} else if so.Offset != nil {
+	if plan.offset != nil && *plan.offset < n {
+		start = *plan.offset
+	} else if plan.offset != nil {
 		start = n
 	}
 	end := n
-	if so.Limit != nil && *so.Limit < n-start {
-		end = start + *so.Limit
+	if plan.limit != nil && *plan.limit < n-start {
+		end = start + *plan.limit
 	}
 	rows = rows[start:end]
 
-	return selectResult{columnNames: left.columnNames, columnTypes: outTypes, rows: rows, cost: cost}, nil
+	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: rows, cost: cost}, nil
 }
 
 // setopName is the operator's name for an error message (PostgreSQL phrasing).
@@ -907,25 +984,15 @@ func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
 // — only TRUE keeps a row), optionally re-sort by ORDER BY, then project. Rows are produced
 // deterministically (CLAUDE.md §10). Returns the rows with each output column's NAME and resolved
 // TYPE (the types let INSERT ... SELECT gate assignability up front — §24) and the accrued cost.
-func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error) {
-	// Uncorrelated subquery folding (spec/design/grammar.md §26). Before resolving any clause,
-	// execute each uncorrelated subquery in WHERE / the select list / HAVING / a JOIN ON once and
-	// replace it with a constant (scalar -> its value; EXISTS -> a boolean; IN -> the value list,
-	// or an empty In for an empty result). The per-row evaluator is never involved. A correlated
-	// reference or a bind parameter inside a subquery is a 0A000. The subqueries' accrued cost is
-	// added once to this query's cost (cost.md §3).
-	outerCols := db.selectRelCols(sel)
-	var subqueryCost int64
-	if err := db.foldSelectSubqueries(sel, outerCols, &subqueryCost); err != nil {
-		return selectResult{}, err
-	}
-
-	// Accumulates the inferred type of each $N across every clause of this SELECT, then is
-	// finalized + bound once all resolution is done (spec/design/api.md §5).
-	ptypes := &paramTypes{}
+// planSelect resolves a SELECT into a *selectPlan against the scope chain (parent = the enclosing
+// query's scope, for correlated references — grammar.md §26). The resolve half of the old
+// runSelect: build the FROM scope, resolve every clause, infer $N types into ptypes. No row is
+// touched and no parameter is bound here (runQueryExpr binds once, after the whole tree is planned).
+func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (*selectPlan, error) {
 	// Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
 	// relation's flat column offset in FROM order, and reject a duplicate label — a self-join
-	// without distinct aliases is 42712 (spec/design/grammar.md §15).
+	// without distinct aliases is 42712 (spec/design/grammar.md §15). The scope links to `parent`
+	// (correlation) + the catalog (so a subquery resolves its own FROM); allowSubquery is true.
 	tableRefs := make([]TableRef, 0, 1+len(sel.Joins))
 	tableRefs = append(tableRefs, sel.From)
 	for _, j := range sel.Joins {
@@ -937,20 +1004,20 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 	for _, tref := range tableRefs {
 		t, ok := db.Table(tref.Name)
 		if !ok {
-			return selectResult{}, NewError(UndefinedTable, "table does not exist: "+tref.Name)
+			return nil, NewError(UndefinedTable, "table does not exist: "+tref.Name)
 		}
 		label := strings.ToLower(t.Name)
 		if tref.Alias != nil {
 			label = strings.ToLower(*tref.Alias)
 		}
 		if seenLabels[label] {
-			return selectResult{}, NewError(DuplicateAlias, "table name "+label+" specified more than once")
+			return nil, NewError(DuplicateAlias, "table name "+label+" specified more than once")
 		}
 		seenLabels[label] = true
 		rels = append(rels, scopeRel{label: label, table: t, offset: offset})
 		offset += len(t.Columns)
 	}
-	s := &scope{rels: rels}
+	s := &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true}
 
 	// Resolve projections (paired with output names — §8), the optional WHERE (must be
 	// boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
@@ -960,16 +1027,21 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 	var err error
 	groupKeys := make([]int, 0, len(sel.GroupBy))
 	for _, key := range sel.GroupBy {
-		var idx int
+		var r resolved
 		if key.Kind == ExprQualifiedColumn {
-			idx, err = s.resolveQualified(key.Qualifier, key.Column)
+			r, err = s.resolveQualified(key.Qualifier, key.Column)
 		} else {
-			idx, err = s.resolveBare(key.Column)
+			r, err = s.resolveBare(key.Column)
 		}
 		if err != nil {
-			return selectResult{}, err
+			return nil, err
 		}
-		groupKeys = append(groupKeys, idx)
+		// Grouping by an enclosing-query column (a per-outer-row constant) is degenerate and
+		// unsupported this slice — the key machinery is flat local indices (§26).
+		if r.level != 0 {
+			return nil, NewError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
+		}
+		groupKeys = append(groupKeys, r.index)
 	}
 
 	// An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
@@ -982,7 +1054,7 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys}
 	projections, columnNames, columnTypes, err := resolveProjections(s, sel.Items, projAgg, ptypes)
 	if err != nil {
-		return selectResult{}, err
+		return nil, err
 	}
 	// HAVING resolves against the same grouped scope (collect) — it may reference aggregates
 	// (collected into the SAME specs, so their slots follow the projection's) and grouping keys;
@@ -992,45 +1064,45 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 	if sel.Having != nil {
 		node, ty, herr := resolve(s, *sel.Having, nil, projAgg, ptypes)
 		if herr != nil {
-			return selectResult{}, herr
+			return nil, herr
 		}
 		if ty.kind != rtBool && ty.kind != rtNull {
-			return selectResult{}, typeError("argument of HAVING must be boolean")
+			return nil, typeError("argument of HAVING must be boolean")
 		}
 		having = node
 	}
 	aggSpecs := projAgg.specs
 	// SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
 	if isAgg && sel.Distinct {
-		return selectResult{}, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
+		return nil, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
 	}
 	var filter *rExpr
 	if sel.Filter != nil {
 		filter, err = resolveBooleanFilter(s, sel.Filter, ptypes)
 		if err != nil {
-			return selectResult{}, err
+			return nil, err
 		}
-	}
-	type orderKeyPlan struct {
-		idx        int
-		descending bool
-		nullsFirst bool
 	}
 	// ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
 	// grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
 	// grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
-	// keys resolve against the FROM scope (a flat row index).
-	order := make([]orderKeyPlan, 0, len(sel.OrderBy))
+	// keys resolve against the FROM scope (a flat row index). An outer (correlated) ORDER BY key
+	// — ordering by an enclosing-query constant — is degenerate and 0A000 (§26).
+	order := make([]orderSlot, 0, len(sel.OrderBy))
 	for _, key := range sel.OrderBy {
-		var idx int
+		var r resolved
 		if key.Qualifier != "" {
-			idx, err = s.resolveQualified(key.Qualifier, key.Column)
+			r, err = s.resolveQualified(key.Qualifier, key.Column)
 		} else {
-			idx, err = s.resolveBare(key.Column)
+			r, err = s.resolveBare(key.Column)
 		}
 		if err != nil {
-			return selectResult{}, err
+			return nil, err
 		}
+		if r.level != 0 {
+			return nil, NewError(FeatureNotSupported, "ORDER BY may not reference an outer query column")
+		}
+		idx := r.index
 		slot := idx
 		if isAgg {
 			slot = -1
@@ -1041,32 +1113,33 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 				}
 			}
 			if slot < 0 {
-				return selectResult{}, groupingErrorColumn(key.Column)
+				return nil, groupingErrorColumn(key.Column)
 			}
 		}
-		order = append(order, orderKeyPlan{idx: slot, descending: key.Descending, nullsFirst: key.NullsFirst})
+		order = append(order, orderSlot{idx: slot, descending: key.Descending, nullsFirst: key.NullsFirst})
 	}
 
 	// SELECT DISTINCT restriction (spec/design/grammar.md §11): each ORDER BY key must appear
 	// as a bare/qualified column in the select list (resolved to the same flat index; or the
-	// list is `*`). Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8).
+	// list is `*`). Matches PostgreSQL (42P10). Aliases are invisible to ORDER BY (§8). Only a
+	// local match counts as "projected" (an outer reference has no per-row value).
 	if sel.Distinct && len(order) > 0 && !sel.Items.All {
 		projected := make(map[int]bool)
 		for _, it := range sel.Items.Items {
 			switch it.Expr.Kind {
 			case ExprColumn:
-				if idx, e := s.resolveBare(it.Expr.Column); e == nil {
-					projected[idx] = true
+				if r, e := s.resolveBare(it.Expr.Column); e == nil && r.level == 0 {
+					projected[r.index] = true
 				}
 			case ExprQualifiedColumn:
-				if idx, e := s.resolveQualified(it.Expr.Qualifier, it.Expr.Column); e == nil {
-					projected[idx] = true
+				if r, e := s.resolveQualified(it.Expr.Qualifier, it.Expr.Column); e == nil && r.level == 0 {
+					projected[r.index] = true
 				}
 			}
 		}
 		for _, key := range order {
 			if !projected[key.idx] {
-				return selectResult{}, NewError(InvalidColumnReference,
+				return nil, NewError(InvalidColumnReference,
 					"for SELECT DISTINCT, ORDER BY expressions must appear in select list")
 			}
 		}
@@ -1076,39 +1149,51 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 	// relations joined so far — rels[:k+2]), so a forward reference to a not-yet-joined table
 	// is a clean 42P01/42703 instead of an out-of-range row index. CROSS has no ON; INNER and
 	// the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the same way — the join kind only
-	// changes how unmatched rows are handled in the loop below (§15).
-	joinOns := make([]*rExpr, len(sel.Joins))
+	// changes how unmatched rows are handled in the loop below (§15). The partial scope keeps the
+	// same parent chain, so a correlated reference in an ON predicate resolves outward (§26).
+	joins := make([]planJoin, len(sel.Joins))
 	for k, j := range sel.Joins {
+		var on *rExpr
 		if j.On != nil {
-			partial := &scope{rels: s.rels[:k+2]}
-			on, oerr := resolveBooleanFilter(partial, j.On, ptypes)
-			if oerr != nil {
-				return selectResult{}, oerr
+			partial := &scope{rels: s.rels[:k+2], parent: parent, catalog: db, allowSubquery: true}
+			on, err = resolveBooleanFilter(partial, j.On, ptypes)
+			if err != nil {
+				return nil, err
 			}
-			joinOns[k] = on
 		}
+		joins[k] = planJoin{kind: j.Kind, on: on}
 	}
 
-	// All clauses resolved: finalize the inferred parameter types and bind the supplied values
-	// (count mismatch 42601; out-of-range/family errors 22003/42804) BEFORE scanning any rows
-	// (spec/design/api.md §5).
-	ptys, err := ptypes.finalize()
-	if err != nil {
-		return selectResult{}, err
+	// Assemble the owned plan (table NAMES + offsets/widths replace the scope's *Table, so the
+	// plan outlives the scope and a correlated subquery can re-execute it per row).
+	planRels := make([]planRel, len(s.rels))
+	for i, rel := range s.rels {
+		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns)}
 	}
-	bound, err := bindParams(params, ptys)
-	if err != nil {
-		return selectResult{}, err
-	}
+	return &selectPlan{
+		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
+		aggSpecs: aggSpecs, having: having, order: order, projections: projections,
+		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
+		limit: sel.Limit, offset: sel.Offset,
+	}, nil
+}
+
+// execSelectPlan executes a resolved SELECT against an outer-row environment (outer = the
+// enclosing rows, innermost last; nil at top level) and the bound parameters. The execute half
+// of the old runSelect: materialize, nested-loop join, WHERE, then aggregate / DISTINCT / window
+// + project. The per-row evaluator gets an evalEnv carrying the engine + outer rows, so a
+// correlated subquery in any clause re-executes against them (grammar.md §26).
+func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value) (selectResult, error) {
+	env := &evalEnv{exec: db, params: params, outer: outer}
 
 	// Materialize each base table once, in primary-key order, charging storage_row_read per
 	// physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these in-memory
 	// buffers, which are not stores and charge nothing.
 	meter := NewMeter()
-	materialized := make([][]Row, len(s.rels))
-	for ri, rel := range s.rels {
+	materialized := make([][]Row, len(plan.rels))
+	for ri, rel := range plan.rels {
 		var tableRows []Row
-		for _, row := range db.RowsInKeyOrder(rel.table.Name) {
+		for _, row := range db.RowsInKeyOrder(rel.tableName) {
 			meter.Charge(Costs.StorageRowRead)
 			tableRows = append(tableRows, row)
 		}
@@ -1125,16 +1210,16 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 	// order (outer) then right key order (inner), each unmatched left row after its (empty)
 	// match run, all unmatched right rows last in right key order (CLAUDE.md §10).
 	running := materialized[0]
-	for k := range sel.Joins {
+	for k := range plan.joins {
 		rightRows := materialized[k+1]
-		on := joinOns[k]
-		emitLeft := sel.Joins[k].Kind == JoinLeft || sel.Joins[k].Kind == JoinFull
-		emitRight := sel.Joins[k].Kind == JoinRight || sel.Joins[k].Kind == JoinFull
-		// NULL-pad widths come from the SCOPE, never a sampled row, so they are correct even when
+		on := plan.joins[k].on
+		emitLeft := plan.joins[k].kind == JoinLeft || plan.joins[k].kind == JoinFull
+		emitRight := plan.joins[k].kind == JoinRight || plan.joins[k].kind == JoinFull
+		// NULL-pad widths come from the PLAN, never a sampled row, so they are correct even when
 		// `running`/`rightRows` is empty: the right table begins at flat offset rels[k+1].offset
 		// (= the width of every running row) and is that many columns wide.
-		leftPad := s.rels[k+1].offset
-		rightPad := len(s.rels[k+1].table.Columns)
+		leftPad := plan.rels[k+1].offset
+		rightPad := plan.rels[k+1].colCount
 		var next []Row
 		rightMatched := make([]bool, len(rightRows))
 		for _, left := range running {
@@ -1145,7 +1230,7 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 				combined = append(combined, right...)
 				keep := true
 				if on != nil {
-					v, err := on.eval(combined, bound, meter)
+					v, err := on.eval(combined, env, meter)
 					if err != nil {
 						return selectResult{}, err
 					}
@@ -1186,8 +1271,8 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 	var rows []Row
 	for _, row := range running {
 		keep := true
-		if filter != nil {
-			v, err := filter.eval(row, bound, meter)
+		if plan.filter != nil {
+			v, err := plan.filter.eval(row, env, meter)
 			if err != nil {
 				return selectResult{}, err
 			}
@@ -1203,9 +1288,9 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 	// from its value-direction flip (spec/design/grammar.md §10). Aggregate queries sort their
 	// GROUP rows in the aggregate branch below — not these pre-aggregation rows — so this is
 	// gated to plain queries.
-	if !isAgg && len(order) > 0 {
+	if !plan.isAgg && len(plan.order) > 0 {
 		sort.SliceStable(rows, func(a, b int) bool {
-			for _, key := range order {
+			for _, key := range plan.order {
 				c := keyCmp(rows[a][key.idx], rows[b][key.idx], key.descending, key.nullsFirst)
 				if c != 0 {
 					return c < 0
@@ -1220,14 +1305,14 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 	// spec/design/grammar.md §9). The counts are already non-negative (parser).
 	windowBounds := func(n int64) (int64, int64) {
 		start := int64(0)
-		if sel.Offset != nil && *sel.Offset < n {
-			start = *sel.Offset
-		} else if sel.Offset != nil {
+		if plan.offset != nil && *plan.offset < n {
+			start = *plan.offset
+		} else if plan.offset != nil {
 			start = n
 		}
 		end := n
-		if sel.Limit != nil && *sel.Limit < n-start {
-			end = start + *sel.Limit
+		if plan.limit != nil && *plan.limit < n-start {
+			end = start + *plan.limit
 		}
 		return start, end
 	}
@@ -1238,7 +1323,7 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 	// row is projected — dedup must see them all — duplicates drop by first occurrence, and
 	// the window then slices the DISTINCT rows.
 	var out [][]Value
-	if isAgg {
+	if plan.isAgg {
 		// Aggregate query — group + accumulate (aggregates.md §5). Bucket the post-WHERE rows by
 		// their group-key values; the bucket key is the value-canonical distinctRowKey (it
 		// collapses 1.5/1.50 and groups NULL with NULL), and the map is only an index — output
@@ -1252,21 +1337,21 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 			accs []*acc
 		}
 		newAccs := func() []*acc {
-			a := make([]*acc, len(aggSpecs))
-			for i, spec := range aggSpecs {
+			a := make([]*acc, len(plan.aggSpecs))
+			for i, spec := range plan.aggSpecs {
 				a[i] = newAcc(spec.plan)
 			}
 			return a
 		}
 		index := make(map[string]int)
 		var groups []group
-		if len(groupKeys) == 0 {
+		if len(plan.groupKeys) == 0 {
 			groups = append(groups, group{keys: nil, accs: newAccs()})
 			index[""] = 0
 		}
 		for _, row := range rows {
-			keys := make([]Value, len(groupKeys))
-			for i, gk := range groupKeys {
+			keys := make([]Value, len(plan.groupKeys))
+			for i, gk := range plan.groupKeys {
 				keys[i] = row[gk]
 			}
 			k := distinctRowKey(keys)
@@ -1276,12 +1361,12 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 				index[k] = gi
 				groups = append(groups, group{keys: keys, accs: newAccs()})
 			}
-			for i, spec := range aggSpecs {
+			for i, spec := range plan.aggSpecs {
 				meter.Charge(Costs.AggregateAccumulate)
 				v := NullValue() // COUNT(*) ignores the value
 				if spec.operand != nil {
 					var verr error
-					if v, verr = spec.operand.eval(row, bound, meter); verr != nil {
+					if v, verr = spec.operand.eval(row, env, meter); verr != nil {
 						return selectResult{}, verr
 					}
 				}
@@ -1307,10 +1392,10 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 		// HAVING: filter the grouped rows (after aggregation, before ORDER BY). The predicate is
 		// evaluated against each group's synthetic row (charging its operator_evals per group);
 		// only a TRUE result keeps the group. A dropped group charges no row_produced (§8).
-		if having != nil {
+		if plan.having != nil {
 			kept := groupRows[:0:0]
 			for _, srow := range groupRows {
-				v, herr := having.eval(srow, bound, meter)
+				v, herr := plan.having.eval(srow, env, meter)
 				if herr != nil {
 					return selectResult{}, herr
 				}
@@ -1321,9 +1406,9 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 			groupRows = kept
 		}
 		// ORDER BY over the grouped output (keys are synthetic group-key slots).
-		if len(order) > 0 {
+		if len(plan.order) > 0 {
 			sort.SliceStable(groupRows, func(a, b int) bool {
-				for _, key := range order {
+				for _, key := range plan.order {
 					c := keyCmp(groupRows[a][key.idx], groupRows[b][key.idx], key.descending, key.nullsFirst)
 					if c != 0 {
 						return c < 0
@@ -1337,9 +1422,9 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 		out = make([][]Value, 0, end-start)
 		for _, srow := range groupRows[start:end] {
 			meter.Charge(Costs.RowProduced)
-			projected := make([]Value, len(projections))
-			for i, p := range projections {
-				v, perr := p.eval(srow, bound, meter)
+			projected := make([]Value, len(plan.projections))
+			for i, p := range plan.projections {
+				v, perr := p.eval(srow, env, meter)
 				if perr != nil {
 					return selectResult{}, perr
 				}
@@ -1347,7 +1432,7 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 			}
 			out = append(out, projected)
 		}
-	} else if sel.Distinct {
+	} else if plan.distinct {
 		// Project every filtered row (charging projection cost per row, the §3 asymmetry),
 		// keeping first occurrences. `seen` is membership-only: output order comes from the
 		// deterministic source iteration, never from map iteration (no map-order leak —
@@ -1355,9 +1440,9 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 		seen := make(map[string]bool)
 		var distinctRows [][]Value
 		for _, row := range rows {
-			projected := make([]Value, len(projections))
-			for i, p := range projections {
-				v, err := p.eval(row, bound, meter)
+			projected := make([]Value, len(plan.projections))
+			for i, p := range plan.projections {
+				v, err := p.eval(row, env, meter)
 				if err != nil {
 					return selectResult{}, err
 				}
@@ -1386,9 +1471,9 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 		out = make([][]Value, 0, len(windowed))
 		for _, row := range windowed {
 			meter.Charge(Costs.RowProduced)
-			projected := make([]Value, len(projections))
-			for i, p := range projections {
-				v, err := p.eval(row, bound, meter)
+			projected := make([]Value, len(plan.projections))
+			for i, p := range plan.projections {
+				v, err := p.eval(row, env, meter)
 				if err != nil {
 					return selectResult{}, err
 				}
@@ -1398,301 +1483,254 @@ func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error)
 		}
 	}
 
-	// The scan/eval cost plus each uncorrelated subquery's cost, counted once (cost.md §3).
-	return selectResult{columnNames: columnNames, columnTypes: columnTypes, rows: out, cost: meter.Accrued + subqueryCost}, nil
+	// The scan/eval cost (correlated subqueries fold their per-row cost in via the evaluator;
+	// globally-uncorrelated ones are folded once before exec, their cost added at runQueryExpr).
+	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
 }
 
 // ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------
 //
-// A pre-pass over runSelect (before scope/resolution): each scalar / IN / EXISTS subquery is
-// UNCORRELATED, so it is executed exactly once here and replaced by a constant the ordinary
-// resolver/evaluator already handles. This keeps the per-row evaluator unchanged and is the seam
-// the future correlated slice will extend. A correlated reference or a `$N` inside is a 0A000.
+// After the whole statement tree is planned + the parameters bound, this bottom-up pass walks
+// every reSubquery node in the plan tree: it first folds within the node's own sub-plan, then —
+// if the subquery references NO enclosing scope (a global constant, PG's "initplan") — executes
+// it ONCE and replaces it with a constant (scalar -> its value; EXISTS -> a boolean; IN -> an
+// reInValues over the result column), accruing the subquery's cost once (preserving the committed
+// once-only cost — cost.md §3). A CORRELATED subquery is left in place; the evaluator re-executes
+// it per outer row. So after this pass the only surviving reSubquery nodes are correlated.
 
-// relCols holds the relation labels and column names a query puts in scope (lower-cased), for the
-// §26 correlation check.
-type relCols struct {
-	labels map[string]bool
-	bare   map[string]bool
-}
-
-func newRelCols() relCols {
-	return relCols{labels: map[string]bool{}, bare: map[string]bool{}}
-}
-
-func (db *Database) selectRelCols(sel *Select) relCols {
-	rc := newRelCols()
-	db.collectSelectRelCols(sel, rc)
-	return rc
-}
-
-func (db *Database) queryRelCols(q QueryExpr) relCols {
-	rc := newRelCols()
-	db.collectQueryRelCols(q, rc)
-	return rc
-}
-
-func (db *Database) collectQueryRelCols(q QueryExpr, rc relCols) {
-	if q.Select != nil {
-		db.collectSelectRelCols(q.Select, rc)
-		return
+func (db *Database) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, cost *int64) error {
+	if plan.sel != nil {
+		return db.foldUncorrelatedInSelect(plan.sel, bound, cost)
 	}
-	db.collectQueryRelCols(q.SetOp.Lhs, rc)
-	db.collectQueryRelCols(q.SetOp.Rhs, rc)
+	if err := db.foldUncorrelatedInPlan(&plan.setop.lhs, bound, cost); err != nil {
+		return err
+	}
+	return db.foldUncorrelatedInPlan(&plan.setop.rhs, bound, cost)
 }
 
-func (db *Database) collectSelectRelCols(sel *Select, rc relCols) {
-	trefs := []TableRef{sel.From}
-	for _, j := range sel.Joins {
-		trefs = append(trefs, j.Table)
-	}
-	for _, tref := range trefs {
-		t, ok := db.Table(tref.Name)
-		if !ok {
-			continue
-		}
-		label := strings.ToLower(t.Name)
-		if tref.Alias != nil {
-			label = strings.ToLower(*tref.Alias)
-		}
-		rc.labels[label] = true
-		for _, c := range t.Columns {
-			rc.bare[strings.ToLower(c.Name)] = true
+func (db *Database) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, cost *int64) error {
+	for k := range sp.joins {
+		if sp.joins[k].on != nil {
+			if err := db.foldUncorrelatedInRExpr(sp.joins[k].on, bound, cost); err != nil {
+				return err
+			}
 		}
 	}
-}
-
-// rejectCorrelationAndParams rejects the two narrowings before running a subquery (grammar.md §26):
-// a bind parameter anywhere inside (params are inferred per-SELECT, not shared across scopes), and a
-// correlated reference — a direct-clause column that does not resolve against the subquery's own
-// FROM but does match an OUTER relation. Both are 0A000.
-func (db *Database) rejectCorrelationAndParams(inner QueryExpr, outer relCols) error {
-	if queryHasParam(inner) {
-		return NewError(FeatureNotSupported, "bind parameters inside a subquery are not supported yet")
-	}
-	innerCols := db.queryRelCols(inner)
-	var refs []colRef
-	for _, e := range queryClauseExprs(inner) {
-		collectColRefs(e, &refs)
-	}
-	for _, r := range refs {
-		correlated := false
-		if r.qualified {
-			q := strings.ToLower(r.qualifier)
-			correlated = !innerCols.labels[q] && outer.labels[q]
-		} else {
-			n := strings.ToLower(r.name)
-			correlated = !innerCols.bare[n] && outer.bare[n]
+	if sp.filter != nil {
+		if err := db.foldUncorrelatedInRExpr(sp.filter, bound, cost); err != nil {
+			return err
 		}
-		if correlated {
-			return NewError(FeatureNotSupported, "correlated subqueries are not supported yet")
+	}
+	if sp.having != nil {
+		if err := db.foldUncorrelatedInRExpr(sp.having, bound, cost); err != nil {
+			return err
+		}
+	}
+	for i := range sp.aggSpecs {
+		if sp.aggSpecs[i].operand != nil {
+			if err := db.foldUncorrelatedInRExpr(sp.aggSpecs[i].operand, bound, cost); err != nil {
+				return err
+			}
+		}
+	}
+	for _, p := range sp.projections {
+		if err := db.foldUncorrelatedInRExpr(p, bound, cost); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// foldSelectSubqueries folds every subquery in a SELECT's clauses (WHERE / select list / HAVING /
-// each JOIN ON). GROUP BY and ORDER BY keys are column references only (grammar.md §18).
-func (db *Database) foldSelectSubqueries(sel *Select, outer relCols, cost *int64) error {
-	for i := range sel.Items.Items {
-		if err := db.foldInExpr(&sel.Items.Items[i].Expr, outer, cost); err != nil {
-			return err
-		}
-	}
-	if sel.Filter != nil {
-		if err := db.foldInExpr(sel.Filter, outer, cost); err != nil {
-			return err
-		}
-	}
-	if sel.Having != nil {
-		if err := db.foldInExpr(sel.Having, outer, cost); err != nil {
-			return err
-		}
-	}
-	for k := range sel.Joins {
-		if sel.Joins[k].On != nil {
-			if err := db.foldInExpr(sel.Joins[k].On, outer, cost); err != nil {
+// foldUncorrelatedInRExpr folds this node if it is an uncorrelated reSubquery, else recurses into
+// its children. A reSubquery is mutated IN PLACE (*e = ...) so every pointer to it sees the fold.
+func (db *Database) foldUncorrelatedInRExpr(e *rExpr, bound []Value, cost *int64) error {
+	if e.kind == reSubquery {
+		// Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
+		// globally-uncorrelated subquery nested inside it is already a constant before we run it.
+		if e.lhs != nil {
+			if err := db.foldUncorrelatedInRExpr(e.lhs, bound, cost); err != nil {
 				return err
 			}
 		}
-	}
-	return nil
-}
-
-// foldInExpr folds this expression node if it is a subquery, else recurses into its children. A
-// subquery's own inner expressions are NOT walked here — running it (which recurses into runSelect)
-// folds its internals, so nested subqueries fall out for free.
-func (db *Database) foldInExpr(e *Expr, outer relCols, cost *int64) error {
-	switch e.Kind {
-	case ExprScalarSubquery, ExprExists, ExprInSubquery:
-		folded, err := db.foldSubqueryNode(*e, outer, cost)
+		if err := db.foldUncorrelatedInPlan(e.subPlan, bound, cost); err != nil {
+			return err
+		}
+		if queryPlanReferencesOuter(e.subPlan, 0) {
+			return nil // correlated — re-executed per outer row at eval
+		}
+		// Uncorrelated: execute ONCE and fold to a constant / reInValues.
+		r, err := db.execQueryPlan(e.subPlan, nil, bound)
 		if err != nil {
 			return err
-		}
-		*e = folded
-	case ExprCast:
-		return db.foldInExpr(&e.Cast.Inner, outer, cost)
-	case ExprUnary:
-		return db.foldInExpr(&e.Unary.Operand, outer, cost)
-	case ExprBinary:
-		if err := db.foldInExpr(&e.Binary.Lhs, outer, cost); err != nil {
-			return err
-		}
-		return db.foldInExpr(&e.Binary.Rhs, outer, cost)
-	case ExprIsNull:
-		return db.foldInExpr(&e.IsNullOf.Operand, outer, cost)
-	case ExprIsDistinct:
-		if err := db.foldInExpr(&e.IsDistinct.Lhs, outer, cost); err != nil {
-			return err
-		}
-		return db.foldInExpr(&e.IsDistinct.Rhs, outer, cost)
-	case ExprIn:
-		if err := db.foldInExpr(&e.In.Lhs, outer, cost); err != nil {
-			return err
-		}
-		for i := range e.In.List {
-			if err := db.foldInExpr(&e.In.List[i], outer, cost); err != nil {
-				return err
-			}
-		}
-	case ExprBetween:
-		if err := db.foldInExpr(&e.Between.Lhs, outer, cost); err != nil {
-			return err
-		}
-		if err := db.foldInExpr(&e.Between.Lo, outer, cost); err != nil {
-			return err
-		}
-		return db.foldInExpr(&e.Between.Hi, outer, cost)
-	case ExprLike:
-		if err := db.foldInExpr(&e.Like.Lhs, outer, cost); err != nil {
-			return err
-		}
-		return db.foldInExpr(&e.Like.Rhs, outer, cost)
-	case ExprCase:
-		if e.Case.Operand != nil {
-			if err := db.foldInExpr(e.Case.Operand, outer, cost); err != nil {
-				return err
-			}
-		}
-		for i := range e.Case.Whens {
-			if err := db.foldInExpr(&e.Case.Whens[i].Cond, outer, cost); err != nil {
-				return err
-			}
-			if err := db.foldInExpr(&e.Case.Whens[i].Result, outer, cost); err != nil {
-				return err
-			}
-		}
-		if e.Case.Els != nil {
-			return db.foldInExpr(e.Case.Els, outer, cost)
-		}
-	case ExprFuncCall:
-		for _, a := range e.FuncCall.Args {
-			if err := db.foldInExpr(a, outer, cost); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// foldSubqueryNode executes one subquery node and returns the constant Expr it folds to
-// (grammar.md §26). The subquery runs with NO bind parameters (they are rejected inside).
-func (db *Database) foldSubqueryNode(node Expr, outer relCols, cost *int64) (Expr, error) {
-	switch node.Kind {
-	case ExprScalarSubquery:
-		if err := db.rejectCorrelationAndParams(*node.Subquery, outer); err != nil {
-			return Expr{}, err
-		}
-		r, err := db.runQueryExpr(*node.Subquery, nil)
-		if err != nil {
-			return Expr{}, err
 		}
 		*cost += r.cost
-		if len(r.columnTypes) != 1 {
-			return Expr{}, NewError(SyntaxError, "subquery must return only one column")
+		switch e.subKind {
+		case sqScalar:
+			if len(r.rows) > 1 {
+				return NewError(CardinalityViolation, "more than one row returned by a subquery used as an expression")
+			}
+			val := NullValue()
+			if len(r.rows) == 1 {
+				val = r.rows[0][0]
+			}
+			*e = *valueToRExpr(val)
+		case sqExists:
+			*e = rExpr{kind: reConstBool, cBool: (len(r.rows) > 0) != e.negated}
+		default: // sqIn
+			list := make([]Value, len(r.rows))
+			for i, row := range r.rows {
+				list[i] = row[0]
+			}
+			*e = rExpr{kind: reInValues, lhs: e.lhs, list: list, negated: e.negated}
 		}
-		if len(r.rows) > 1 {
-			return Expr{}, NewError(CardinalityViolation, "more than one row returned by a subquery used as an expression")
-		}
-		// 0 rows -> a TYPED NULL (value NULL, type the output column's), so a cross-family
-		// comparison still errors (grammar.md §26).
-		ty := scalarTypeOf(r.columnTypes[0])
-		val := NullValue()
-		if len(r.rows) == 1 {
-			val = r.rows[0][0]
-		}
-		return Expr{Kind: ExprFoldedConst, Folded: &FoldedConstExpr{Value: val, Type: ty}}, nil
-	case ExprExists:
-		if err := db.rejectCorrelationAndParams(*node.Subquery, outer); err != nil {
-			return Expr{}, err
-		}
-		r, err := db.runQueryExpr(*node.Subquery, nil)
-		if err != nil {
-			return Expr{}, err
-		}
-		*cost += r.cost
-		// EXISTS ignores the select list entirely and is never NULL.
-		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralBool, Bool: len(r.rows) > 0}}, nil
-	default: // ExprInSubquery
-		is := node.InSubquery
-		// The LHS belongs to the OUTER query — fold any subqueries inside it too.
-		if err := db.foldInExpr(&is.Lhs, outer, cost); err != nil {
-			return Expr{}, err
-		}
-		if err := db.rejectCorrelationAndParams(is.Query, outer); err != nil {
-			return Expr{}, err
-		}
-		r, err := db.runQueryExpr(is.Query, nil)
-		if err != nil {
-			return Expr{}, err
-		}
-		*cost += r.cost
-		if len(r.columnTypes) != 1 {
-			return Expr{}, NewError(SyntaxError, "subquery has too many columns")
-		}
-		ty := scalarTypeOf(r.columnTypes[0])
-		// Non-empty -> the literal-IN OR-chain over the result values (3VL inherited). An empty
-		// result -> an empty In that resolves to the constant FALSE (IN) / TRUE (NOT IN),
-		// independent of the LHS value (grammar.md §26).
-		list := make([]Expr, 0, len(r.rows))
-		for _, row := range r.rows {
-			list = append(list, Expr{Kind: ExprFoldedConst, Folded: &FoldedConstExpr{Value: row[0], Type: ty}})
-		}
-		return Expr{Kind: ExprIn, In: &InExpr{Lhs: is.Lhs, List: list, Negated: is.Negated}}, nil
-	}
-}
-
-// scalarTypeOf maps a resolved column/output type back to its ScalarType (nil = the untyped-NULL
-// type) — used to type a folded scalar-subquery constant (§26).
-func scalarTypeOf(rt resolvedType) *ScalarType {
-	switch rt.kind {
-	case rtInt:
-		t := rt.intTy
-		return &t
-	case rtBool:
-		t := Bool
-		return &t
-	case rtText:
-		t := Text
-		return &t
-	case rtDecimal:
-		t := DecimalType
-		return &t
-	case rtBytea:
-		t := Bytea
-		return &t
-	case rtUuid:
-		t := Uuid
-		return &t
-	case rtTimestamp:
-		t := Timestamp
-		return &t
-	case rtTimestamptz:
-		t := Timestamptz
-		return &t
-	default: // rtNull
 		return nil
 	}
+	// Recurse into the children of every other node (a subquery may nest anywhere). The fields
+	// are only set for the relevant node kinds, so this is exhaustive without a per-kind switch.
+	if e.operand != nil {
+		if err := db.foldUncorrelatedInRExpr(e.operand, bound, cost); err != nil {
+			return err
+		}
+	}
+	if e.lhs != nil {
+		if err := db.foldUncorrelatedInRExpr(e.lhs, bound, cost); err != nil {
+			return err
+		}
+	}
+	if e.rhs != nil {
+		if err := db.foldUncorrelatedInRExpr(e.rhs, bound, cost); err != nil {
+			return err
+		}
+	}
+	for _, arm := range e.caseArms {
+		if err := db.foldUncorrelatedInRExpr(arm.cond, bound, cost); err != nil {
+			return err
+		}
+		if err := db.foldUncorrelatedInRExpr(arm.result, bound, cost); err != nil {
+			return err
+		}
+	}
+	if e.caseEls != nil {
+		if err := db.foldUncorrelatedInRExpr(e.caseEls, bound, cost); err != nil {
+			return err
+		}
+	}
+	for _, a := range e.sargs {
+		if err := db.foldUncorrelatedInRExpr(a, bound, cost); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// queryPlanReferencesOuter reports whether a plan references any scope STRICTLY OUTSIDE itself —
+// i.e. it is correlated (spec/design/grammar.md §26). depth is how many nested-subquery frames we
+// have descended INTO this plan (0 = its own clauses); an reOuterColumn at level points above iff
+// level > depth. The fold pass calls it with depth 0 on a subquery's sub-plan to fold (uncorrelated)
+// or leave (correlated) it.
+func queryPlanReferencesOuter(plan *queryPlan, depth int) bool {
+	if plan.sel != nil {
+		return selectPlanReferencesOuter(plan.sel, depth)
+	}
+	return queryPlanReferencesOuter(&plan.setop.lhs, depth) || queryPlanReferencesOuter(&plan.setop.rhs, depth)
+}
+
+func selectPlanReferencesOuter(sp *selectPlan, depth int) bool {
+	for k := range sp.joins {
+		if sp.joins[k].on != nil && rexprReferencesOuter(sp.joins[k].on, depth) {
+			return true
+		}
+	}
+	if sp.filter != nil && rexprReferencesOuter(sp.filter, depth) {
+		return true
+	}
+	if sp.having != nil && rexprReferencesOuter(sp.having, depth) {
+		return true
+	}
+	for i := range sp.aggSpecs {
+		if sp.aggSpecs[i].operand != nil && rexprReferencesOuter(sp.aggSpecs[i].operand, depth) {
+			return true
+		}
+	}
+	for _, p := range sp.projections {
+		if rexprReferencesOuter(p, depth) {
+			return true
+		}
+	}
+	return false
+}
+
+func rexprReferencesOuter(e *rExpr, depth int) bool {
+	switch e.kind {
+	case reOuterColumn:
+		return e.level > depth
+	case reSubquery:
+		// A nested subquery's own clauses are one frame deeper; its IN lhs is at this frame.
+		if e.lhs != nil && rexprReferencesOuter(e.lhs, depth) {
+			return true
+		}
+		return queryPlanReferencesOuter(e.subPlan, depth+1)
+	case reInValues:
+		return rexprReferencesOuter(e.lhs, depth)
+	}
+	if e.operand != nil && rexprReferencesOuter(e.operand, depth) {
+		return true
+	}
+	if e.lhs != nil && rexprReferencesOuter(e.lhs, depth) {
+		return true
+	}
+	if e.rhs != nil && rexprReferencesOuter(e.rhs, depth) {
+		return true
+	}
+	for _, arm := range e.caseArms {
+		if rexprReferencesOuter(arm.cond, depth) || rexprReferencesOuter(arm.result, depth) {
+			return true
+		}
+	}
+	if e.caseEls != nil && rexprReferencesOuter(e.caseEls, depth) {
+		return true
+	}
+	for _, a := range e.sargs {
+		if rexprReferencesOuter(a, depth) {
+			return true
+		}
+	}
+	return false
+}
+
+// inMembership is three-valued `lhs IN (list)` membership (spec/design/grammar.md §26), charging
+// one operator_eval per element compared. An EMPTY list is `negated` (x IN () = FALSE, x NOT IN ()
+// = TRUE) independent of lv. Otherwise: a positive match -> TRUE; else a NULL element (or NULL lv)
+// -> NULL; else FALSE. NOT IN is the Kleene negation. Shared by reInValues and the correlated
+// reSubquery/sqIn eval.
+func inMembership(lv Value, list []Value, negated bool, m *Meter) Value {
+	if len(list) == 0 {
+		return BoolValue(negated)
+	}
+	anyMatch := false
+	anyNull := false
+	for _, v := range list {
+		m.Charge(Costs.OperatorEval)
+		switch lv.Eq3(v) {
+		case True:
+			anyMatch = true
+		case Unknown:
+			anyNull = true
+		}
+	}
+	var inVal Value
+	switch {
+	case anyMatch:
+		inVal = BoolValue(true)
+	case anyNull:
+		inVal = NullValue()
+	default:
+		inVal = BoolValue(false)
+	}
+	if negated {
+		return boolNot(inVal)
+	}
+	return inVal
 }
 
 // valueToRExpr builds the constant rExpr for a folded subquery value (§26). The static type is
@@ -1718,13 +1756,6 @@ func valueToRExpr(v Value) *rExpr {
 	default: // ValNull
 		return &rExpr{kind: reConstNull}
 	}
-}
-
-// colRef is a column reference (qualifier + name) collected for the §26 correlation scan.
-type colRef struct {
-	qualified bool
-	qualifier string
-	name      string
 }
 
 // queryClauseExprs collects a query's direct-clause expressions (select list / WHERE / HAVING /
@@ -1822,59 +1853,6 @@ func queryHasParam(q QueryExpr) bool {
 		}
 	}
 	return false
-}
-
-// collectColRefs collects every column reference in an expression for the §26 correlation scan —
-// NOT descending into nested subqueries (a deeper subquery's references are its own concern). The
-// IN-subquery's LHS IS at this level, so it is walked.
-func collectColRefs(e *Expr, out *[]colRef) {
-	switch e.Kind {
-	case ExprColumn:
-		*out = append(*out, colRef{name: e.Column})
-	case ExprQualifiedColumn:
-		*out = append(*out, colRef{qualified: true, qualifier: e.Qualifier, name: e.Column})
-	case ExprInSubquery:
-		collectColRefs(&e.InSubquery.Lhs, out)
-	case ExprCast:
-		collectColRefs(&e.Cast.Inner, out)
-	case ExprUnary:
-		collectColRefs(&e.Unary.Operand, out)
-	case ExprBinary:
-		collectColRefs(&e.Binary.Lhs, out)
-		collectColRefs(&e.Binary.Rhs, out)
-	case ExprIsNull:
-		collectColRefs(&e.IsNullOf.Operand, out)
-	case ExprIsDistinct:
-		collectColRefs(&e.IsDistinct.Lhs, out)
-		collectColRefs(&e.IsDistinct.Rhs, out)
-	case ExprIn:
-		collectColRefs(&e.In.Lhs, out)
-		for i := range e.In.List {
-			collectColRefs(&e.In.List[i], out)
-		}
-	case ExprBetween:
-		collectColRefs(&e.Between.Lhs, out)
-		collectColRefs(&e.Between.Lo, out)
-		collectColRefs(&e.Between.Hi, out)
-	case ExprLike:
-		collectColRefs(&e.Like.Lhs, out)
-		collectColRefs(&e.Like.Rhs, out)
-	case ExprCase:
-		if e.Case.Operand != nil {
-			collectColRefs(e.Case.Operand, out)
-		}
-		for i := range e.Case.Whens {
-			collectColRefs(&e.Case.Whens[i].Cond, out)
-			collectColRefs(&e.Case.Whens[i].Result, out)
-		}
-		if e.Case.Els != nil {
-			collectColRefs(e.Case.Els, out)
-		}
-	case ExprFuncCall:
-		for _, a := range e.FuncCall.Args {
-			collectColRefs(a, out)
-		}
-	}
 }
 
 // distinctRowKey encodes a projected row into a collision-free string key for DISTINCT
@@ -2119,6 +2097,24 @@ const (
 	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
 	// evaluated per row in any context.
 	reScalarFunc
+	// reOuterColumn is a correlated column reference (spec/design/grammar.md §26): the column
+	// `index` of the enclosing row `level` hops out (1 = immediate parent). A leaf.
+	reOuterColumn
+	// reSubquery is a CORRELATED subquery, re-executed per outer row at eval (uncorrelated ones
+	// are folded to a constant / reInValues before exec).
+	reSubquery
+	// reInValues is a folded uncorrelated `IN (subquery)`: the subquery ran once yielding `list`;
+	// per row it tests `lhs` for three-valued membership.
+	reInValues
+)
+
+// subqueryKind selects which subquery form an reSubquery node is (spec/design/grammar.md §26).
+type subqueryKind int
+
+const (
+	sqScalar subqueryKind = iota
+	sqExists
+	sqIn
 )
 
 // scalarFunc selects a scalar function (kind = "function"). The overload (integer vs decimal)
@@ -2160,6 +2156,104 @@ type rExpr struct {
 	// magnitude is range-checked at that boundary; otherwise decimal.
 	sfunc scalarFunc
 	sargs []*rExpr
+
+	// reOuterColumn: the number of frames out (`index` reuses the column index field).
+	level int
+	// reSubquery: the resolved inner plan, which form, and (for sqIn) the resolved lhs (`lhs`)
+	// + the NOT flag (`negated`). reInValues: `lhs` + the constant `list` + `negated`.
+	subPlan *queryPlan
+	subKind subqueryKind
+	list    []Value
+}
+
+// ============================================================================
+// Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
+// subquery is re-run once per outer row). planQuery (the resolve half of the old runSelect)
+// produces a queryPlan; execQueryPlan (the execute half) consumes it against an outer-row
+// environment. The split lets a subquery be resolved ONCE — so its structural/type errors fire
+// even over an empty outer — yet executed many times (spec/design/grammar.md §26).
+// ============================================================================
+
+// queryPlan is a resolved query expression: a SELECT plan or a set-op plan (mirrors QueryExpr).
+// Exactly one of sel / setop is non-nil.
+type queryPlan struct {
+	sel   *selectPlan
+	setop *setOpPlan
+}
+
+// columnTypes returns the plan's output column types (for a subquery's plan-time column-count
+// check + element type).
+func (p *queryPlan) columnTypes() []resolvedType {
+	if p.sel != nil {
+		return p.sel.columnTypes
+	}
+	return p.setop.columnTypes
+}
+
+// planRel is one relation in a SELECT plan: the table name (looked up in the store at exec), the
+// flat offset of its first column, and its column count (for NULL-padding).
+type planRel struct {
+	tableName string
+	offset    int
+	colCount  int
+}
+
+// planJoin is one join in a SELECT plan: its kind and resolved ON predicate (nil for CROSS). The
+// right relation is rels[k+1].
+type planJoin struct {
+	kind JoinKind
+	on   *rExpr
+}
+
+// orderSlot is a resolved ORDER BY key: a flat/synthetic slot + the per-key direction flags.
+type orderSlot struct {
+	idx        int
+	descending bool
+	nullsFirst bool
+}
+
+// selectPlan is a resolved SELECT, executable against an outer-row environment (the execute half
+// of the old runSelect, lifted to a value so a correlated subquery can re-run it per outer row).
+type selectPlan struct {
+	rels        []planRel
+	joins       []planJoin
+	filter      *rExpr
+	isAgg       bool
+	groupKeys   []int
+	aggSpecs    []aggSpec
+	having      *rExpr
+	order       []orderSlot
+	projections []*rExpr
+	columnNames []string
+	columnTypes []resolvedType
+	distinct    bool
+	limit       *int64
+	offset      *int64
+}
+
+// setOpPlan is a resolved set operation: both operands planned with the same parent scope, the
+// unified output types, and the trailing ORDER BY / LIMIT / OFFSET resolved by output column.
+type setOpPlan struct {
+	op          SetOpKind
+	all         bool
+	lhs         queryPlan
+	rhs         queryPlan
+	columnNames []string
+	columnTypes []resolvedType
+	order       []orderSlot
+	limit       *int64
+	offset      *int64
+}
+
+// evalEnv is the environment threaded into the per-row evaluator (spec/design/grammar.md §26):
+// the engine (to run a correlated subquery's plan), the bound parameters, and the stack of
+// enclosing rows (innermost LAST) a correlated reference reads. outer is empty at the top level;
+// a correlated subquery pushes the current row before running its inner plan, so an reOuterColumn
+// at frame `level` reads outer[len(outer)-level][index].
+type evalEnv struct {
+	exec   *Database
+	params []Value
+	outer  []Row
 }
 
 // rCaseArm is one resolved (condition, result) branch of a reCase node (spec/design/grammar.md
@@ -2601,51 +2695,91 @@ type scopeRel struct {
 	offset int
 }
 
-// scope is the relations a query's FROM clause puts in scope, in FROM order.
+// resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
+// §26): level==0 is a LOCAL column of this query (a flat index into the joined row); level>=1
+// is a correlated OUTER reference to an enclosing query (level hops outward, index the flat
+// column index within that ancestor's row).
+type resolved struct {
+	level int
+	index int
+}
+
+// scope is the relations a query's FROM clause puts in scope, in FROM order, plus the enclosing
+// scope chain (for correlated references) and the catalog (so a subquery's own FROM resolves).
 type scope struct {
 	rels []scopeRel
+	// parent is the enclosing query's scope, for correlated resolution (nil at top level).
+	parent *scope
+	// catalog lets a subquery's inner FROM tables be looked up during planning.
+	catalog *Database
+	// allowSubquery is true inside a SELECT (and its nested subqueries), false for UPDATE/DELETE
+	// (a subquery there is 0A000 this slice).
+	allowSubquery bool
 }
 
-// singleScope is a one-relation scope (the single-table SELECT / UPDATE / DELETE case).
-func singleScope(t *Table) *scope {
-	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}}
+// singleScope is a one-relation scope with no parent and no subqueries (the single-table
+// UPDATE / DELETE case). SELECT builds its own scope in planSelect.
+func singleScope(catalog *Database, t *Table) *scope {
+	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}, catalog: catalog}
 }
 
-// resolveBare resolves a bare column name to a flat row index: no relation has it → 42703;
-// two or more relations have it → 42702 ambiguous; exactly one → its flat index.
-func (s *scope) resolveBare(name string) (int, error) {
+// outerOf lifts a parent-scope resolution into the child's frame: one more hop outward.
+func outerOf(r resolved) resolved {
+	return resolved{level: r.level + 1, index: r.index}
+}
+
+// resolveBare resolves a bare column name against THIS scope, then OUTWARD through the parent
+// chain. Within one scope: two+ relations have it → 42702 ambiguous; exactly one → local; none
+// → fall through to the parent. A name found only in an ancestor is an outer reference (nearest
+// scope wins — an inner match shadows an outer one). 42703 only if no scope in the chain has it.
+func (s *scope) resolveBare(name string) (resolved, error) {
 	found := -1
 	for _, r := range s.rels {
 		if local := r.table.ColumnIndex(name); local >= 0 {
 			if found >= 0 {
-				return 0, ambiguousColumn(name)
+				return resolved{}, ambiguousColumn(name)
 			}
 			found = r.offset + local
 		}
 	}
-	if found < 0 {
-		return 0, undefinedColumn(name)
+	if found >= 0 {
+		return resolved{level: 0, index: found}, nil
 	}
-	return found, nil
+	if s.parent != nil {
+		r, err := s.parent.resolveBare(name)
+		if err != nil {
+			return resolved{}, err
+		}
+		return outerOf(r), nil
+	}
+	return resolved{}, undefinedColumn(name)
 }
 
-// resolveQualified resolves a qualified rel.col to a flat row index: an unknown rel is 42P01,
-// a known rel with no such column is 42703. Never ambiguous (it names one relation).
-func (s *scope) resolveQualified(qualifier, name string) (int, error) {
+// resolveQualified resolves a qualified rel.col against THIS scope, then outward. A qualifier
+// naming a relation here binds — a missing column is then 42703 (no fall-through). Only an
+// unknown qualifier walks outward (42P01 if no ancestor has it).
+func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 	q := strings.ToLower(qualifier)
 	for _, r := range s.rels {
 		if r.label == q {
 			local := r.table.ColumnIndex(name)
 			if local < 0 {
-				return 0, undefinedColumn(name)
+				return resolved{}, undefinedColumn(name)
 			}
-			return r.offset + local, nil
+			return resolved{level: 0, index: r.offset + local}, nil
 		}
 	}
-	return 0, missingFromEntry(qualifier)
+	if s.parent != nil {
+		r, err := s.parent.resolveQualified(qualifier, name)
+		if err != nil {
+			return resolved{}, err
+		}
+		return outerOf(r), nil
+	}
+	return resolved{}, missingFromEntry(qualifier)
 }
 
-// columnAt returns the column at a flat index (the index is known valid — resolution made it).
+// columnAt returns the column at a flat index in THIS scope (index known valid).
 func (s *scope) columnAt(flat int) *Column {
 	for i := range s.rels {
 		r := s.rels[i]
@@ -2655,6 +2789,20 @@ func (s *scope) columnAt(flat int) *Column {
 		}
 	}
 	panic("a resolved flat column index is always in range")
+}
+
+// ancestor returns the scope `level` hops outward (1 = immediate parent).
+func (s *scope) ancestor(level int) *scope {
+	cur := s
+	for i := 0; i < level; i++ {
+		cur = cur.parent
+	}
+	return cur
+}
+
+// columnOf returns the column a resolution refers to — local here, or outer in an ancestor.
+func (s *scope) columnOf(r resolved) *Column {
+	return s.ancestor(r.level).columnAt(r.index)
 }
 
 // undefinedColumn is 42703 — a column name that no relation in scope defines.
@@ -2819,13 +2967,13 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 func outputName(s *scope, e Expr) string {
 	switch e.Kind {
 	case ExprColumn:
-		if idx, err := s.resolveBare(e.Column); err == nil {
-			return s.columnAt(idx).Name
+		if r, err := s.resolveBare(e.Column); err == nil {
+			return s.columnOf(r).Name
 		}
 		return e.Column
 	case ExprQualifiedColumn:
-		if idx, err := s.resolveQualified(e.Qualifier, e.Column); err == nil {
-			return s.columnAt(idx).Name
+		if r, err := s.resolveQualified(e.Qualifier, e.Column); err == nil {
+			return s.columnOf(r).Name
 		}
 		return e.Column
 	case ExprFuncCall:
@@ -2850,6 +2998,31 @@ func resolveBooleanFilter(s *scope, e *Expr, params *paramTypes) (*rExpr, error)
 	return node, nil
 }
 
+// resolveColumnRef turns a chain resolution into a resolved node + type (§26). A Local column
+// obeys the grouping rule (collectColumn); an Outer (correlated) reference is a per-outer-row
+// CONSTANT, so it bypasses that rule and resolves to an reOuterColumn reading the enclosing row at
+// eval; its type is the ancestor column's.
+func resolveColumnRef(s *scope, ag *aggCtx, r resolved, name string) (*rExpr, resolvedType, error) {
+	if r.level == 0 {
+		return collectColumn(s, ag, r.index, name)
+	}
+	return &rExpr{kind: reOuterColumn, level: r.level, index: r.index}, resolvedTypeOf(s.columnOf(r).Type), nil
+}
+
+// planSubquery plans a subquery operand against the scope chain (§26). Rejects a non-SELECT
+// context (UPDATE/DELETE/INSERT — allowSubquery=false) and any $N inside (an orthogonal
+// parameter-inference narrowing), both 0A000. The inner query is resolved ONCE, with `s` as its
+// parent, so correlated references become reOuterColumn and errors fire even over an empty outer.
+func planSubquery(s *scope, inner QueryExpr, params *paramTypes) (queryPlan, error) {
+	if !s.allowSubquery {
+		return queryPlan{}, NewError(FeatureNotSupported, "subqueries are only supported in a SELECT statement")
+	}
+	if queryHasParam(inner) {
+		return queryPlan{}, NewError(FeatureNotSupported, "bind parameters inside a subquery are not supported yet")
+	}
+	return s.catalog.planQuery(inner, s, params)
+}
+
 // resolve resolves one Expr into an rExpr plus its static type. ctx (non-nil) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); nil
 // defaults a bare literal to int64.
@@ -2871,19 +3044,19 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reParam, index: idx0}, rty, nil
 	case ExprColumn:
-		// Resolve for existence first (42703/42702 take priority, matching PostgreSQL); then
-		// in an aggregate query's projection the column must be a grouping key (else 42803).
-		idx, err := s.resolveBare(e.Column)
+		// Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
+		// (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
+		r, err := s.resolveBare(e.Column)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		return collectColumn(s, ag, idx, e.Column)
+		return resolveColumnRef(s, ag, r, e.Column)
 	case ExprQualifiedColumn:
-		idx, err := s.resolveQualified(e.Qualifier, e.Column)
+		r, err := s.resolveQualified(e.Qualifier, e.Column)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		return collectColumn(s, ag, idx, e.Column)
+		return resolveColumnRef(s, ag, r, e.Column)
 	case ExprFuncCall:
 		return resolveFuncCall(s, e.FuncCall, ag, params)
 	case ExprLiteral:
@@ -2949,24 +3122,48 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return &rExpr{kind: reConstInt, cInt: e.Literal.Int},
 				resolvedType{kind: rtInt, intTy: ty}, nil
 		}
-	case ExprFoldedConst:
-		// A subquery already executed + folded by the pre-pass (grammar.md §26). It resolves to
-		// the matching constant with its EXACT output type (nil = untyped NULL) — NO context
-		// adaptation, so a folded bigint keeps bigint (unlike a bare integer literal) and a
-		// typed-NULL from an empty scalar still participates in cross-type checks.
-		var rty resolvedType
-		if e.Folded.Type != nil {
-			rty = resolvedTypeOf(*e.Folded.Type)
-		} else {
-			rty = resolvedType{kind: rtNull}
+	case ExprScalarSubquery:
+		// A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so
+		// its column-count / type errors fire even over an empty outer. planSubquery rejects a
+		// non-SELECT context and a $N inside (both 0A000). The fold pass folds an uncorrelated one
+		// to a constant; a correlated one is re-executed per outer row by the evaluator.
+		plan, err := planSubquery(s, *e.Subquery, params)
+		if err != nil {
+			return nil, resolvedType{}, err
 		}
-		return valueToRExpr(e.Folded.Value), rty, nil
-	case ExprScalarSubquery, ExprExists, ExprInSubquery:
-		// A subquery in expression position is folded by runSelect's pre-pass before resolution
-		// (grammar.md §26), so resolve never sees one inside a SELECT. Reaching here means a
-		// subquery in a non-SELECT context (an UPDATE SET / INSERT VALUES / DELETE WHERE
-		// expression, which run no fold pre-pass) — supported only in SELECT this slice (0A000).
-		return nil, resolvedType{}, NewError(FeatureNotSupported, "subqueries are only supported in a SELECT statement")
+		if len(plan.columnTypes()) != 1 {
+			return nil, resolvedType{}, NewError(SyntaxError, "subquery must return only one column")
+		}
+		outType := plan.columnTypes()[0]
+		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqScalar}, outType, nil
+	case ExprExists:
+		// EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT
+		// EXISTS parses as the unary NOT wrapping this, so negated here is always false.
+		plan, err := planSubquery(s, *e.Subquery, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqExists}, resolvedType{kind: rtBool}, nil
+	case ExprInSubquery:
+		// The LHS is an OUTER expression (resolved in the current scope / agg context); the
+		// subquery yields the single membership column. The test is `lhs = element`, so the pair
+		// must be comparable (42804), exactly like a literal IN.
+		is := e.InSubquery
+		rlhs, lt, err := resolve(s, is.Lhs, nil, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		plan, err := planSubquery(s, is.Query, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if len(plan.columnTypes()) != 1 {
+			return nil, resolvedType{}, NewError(SyntaxError, "subquery has too many columns")
+		}
+		if err := classifyComparable(lt, plan.columnTypes()[0]); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated}, resolvedType{kind: rtBool}, nil
 	case ExprCast:
 		target, typmod, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod)
 		if err != nil {
@@ -3563,14 +3760,17 @@ func typeError(msg string) error { return NewError(DatatypeMismatch, msg) }
 // operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both operands
 // are always evaluated — there is no short-circuit, so the count never depends on operand
 // values (spec/design/cost.md §3).
-func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
+func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	switch e.kind {
 	case reColumn:
 		return row[e.index], nil
+	case reOuterColumn:
+		// A correlated reference: column `index` of the enclosing row `level` hops out (§26).
+		return env.outer[len(env.outer)-e.level][e.index], nil
 	case reParam:
 		// The supplied value, already coerced to its inferred type by bindParams before
 		// execution (spec/design/api.md §5).
-		return params[e.index], nil
+		return env.params[e.index], nil
 	case reConstInt:
 		return IntValue(e.cInt), nil
 	case reConstBool:
@@ -3591,7 +3791,7 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 		return NullValue(), nil
 	case reCast:
 		m.Charge(Costs.OperatorEval)
-		v, err := e.operand.eval(row, params, m)
+		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -3601,7 +3801,7 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 		return evalCast(v, e.result, e.typmod)
 	case reNeg:
 		m.Charge(Costs.OperatorEval)
-		v, err := e.operand.eval(row, params, m)
+		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -3624,18 +3824,18 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 		return IntValue(n), nil
 	case reNot:
 		m.Charge(Costs.OperatorEval)
-		v, err := e.operand.eval(row, params, m)
+		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return boolNot(v), nil
 	case reArith:
 		m.Charge(Costs.OperatorEval)
-		a, err := e.lhs.eval(row, params, m)
+		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row, params, m)
+		b, err := e.rhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -3650,11 +3850,11 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 		return evalArith(e.op, a.Int, b.Int, e.result)
 	case reCompare:
 		m.Charge(Costs.OperatorEval)
-		a, err := e.lhs.eval(row, params, m)
+		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row, params, m)
+		b, err := e.rhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -3672,29 +3872,29 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 		}
 	case reAnd:
 		m.Charge(Costs.OperatorEval)
-		a, err := e.lhs.eval(row, params, m)
+		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row, params, m)
+		b, err := e.rhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return boolAnd(a, b), nil
 	case reOr:
 		m.Charge(Costs.OperatorEval)
-		a, err := e.lhs.eval(row, params, m)
+		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row, params, m)
+		b, err := e.rhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return boolOr(a, b), nil
 	case reIsNull:
 		m.Charge(Costs.OperatorEval)
-		v, err := e.operand.eval(row, params, m)
+		v, err := e.operand.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -3702,11 +3902,11 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 		return BoolValue(isNull != e.negated), nil
 	case reLike:
 		m.Charge(Costs.OperatorEval)
-		subject, err := e.lhs.eval(row, params, m)
+		subject, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
-		pattern, err := e.rhs.eval(row, params, m)
+		pattern, err := e.rhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -3729,19 +3929,19 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 		// Charge the node, then only the conditions up to the match plus the selected result.
 		m.Charge(Costs.OperatorEval)
 		for _, arm := range e.caseArms {
-			cv, err := arm.cond.eval(row, params, m)
+			cv, err := arm.cond.eval(row, env, m)
 			if err != nil {
 				return Value{}, err
 			}
 			if cv.Kind == ValBool && cv.Bool {
-				rv, err := arm.result.eval(row, params, m)
+				rv, err := arm.result.eval(row, env, m)
 				if err != nil {
 					return Value{}, err
 				}
 				return coerceCase(rv, e.caseDecimal), nil
 			}
 		}
-		ev, err := e.caseEls.eval(row, params, m)
+		ev, err := e.caseEls.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -3751,7 +3951,7 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 		m.Charge(Costs.OperatorEval)
 		vals := make([]Value, 0, len(e.sargs))
 		for _, a := range e.sargs {
-			v, err := a.eval(row, params, m)
+			v, err := a.eval(row, env, m)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3791,13 +3991,57 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 			}
 			return DecimalValue(d.RoundPlaces(places)), nil
 		}
-	default: // reDistinct
+	case reSubquery:
+		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
+		// Push the current row onto the outer-row stack, run the inner plan, fold its accrued
+		// cost into this meter, plus one operator_eval for the node.
 		m.Charge(Costs.OperatorEval)
-		a, err := e.lhs.eval(row, params, m)
+		child := make([]Row, len(env.outer)+1)
+		copy(child, env.outer)
+		child[len(env.outer)] = row
+		r, err := env.exec.execQueryPlan(e.subPlan, child, env.params)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row, params, m)
+		m.Charge(r.cost)
+		switch e.subKind {
+		case sqScalar:
+			if len(r.rows) > 1 {
+				return Value{}, NewError(CardinalityViolation, "more than one row returned by a subquery used as an expression")
+			}
+			if len(r.rows) == 0 {
+				return NullValue(), nil // 0 rows -> NULL (the static type was settled at resolve)
+			}
+			return r.rows[0][0], nil
+		case sqExists:
+			// EXISTS ignores the select list entirely and is never NULL.
+			return BoolValue((len(r.rows) > 0) != e.negated), nil
+		default: // sqIn
+			lv, lerr := e.lhs.eval(row, env, m)
+			if lerr != nil {
+				return Value{}, lerr
+			}
+			list := make([]Value, len(r.rows))
+			for i, rr := range r.rows {
+				list[i] = rr[0]
+			}
+			return inMembership(lv, list, e.negated, m), nil
+		}
+	case reInValues:
+		// A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.
+		m.Charge(Costs.OperatorEval)
+		lv, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		return inMembership(lv, e.list, e.negated, m), nil
+	default: // reDistinct
+		m.Charge(Costs.OperatorEval)
+		a, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		b, err := e.rhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
 		}

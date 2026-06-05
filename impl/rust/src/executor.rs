@@ -18,7 +18,7 @@ use crate::error::{EngineError, Result, SqlState};
 use crate::storage::{Row, TableStore};
 use crate::timestamp::{parse_timestamp, parse_timestamptz};
 use crate::types::{DecimalTypmod, ScalarType};
-use crate::value::{Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid};
+use crate::value::{ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid};
 use std::collections::{HashMap, HashSet};
 
 /// The outcome of executing one statement. Both variants carry the deterministic
@@ -536,7 +536,7 @@ impl Database {
             )
         })?;
         // DELETE is single-table; resolve its WHERE against a one-relation scope.
-        let scope = Scope::single(table);
+        let scope = Scope::single(self, table);
         let mut ptypes = ParamTypes::default();
         let filter = match &del.filter {
             Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
@@ -550,11 +550,18 @@ impl Database {
         // filter evaluation accrues cost (CLAUDE.md §13; spec/design/cost.md §3).
         let mut meter = Meter::new();
         let mut keys: Vec<Vec<u8>> = Vec::new();
+        // DELETE has no outer query and no subqueries (resolve rejects them here), so the eval
+        // environment carries only the bound params and an empty outer-row stack.
+        let env = EvalEnv {
+            exec: self,
+            params: &bound,
+            outer: &[],
+        };
         for (k, row) in self.store(&del.table).iter_entries() {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
-                Some(f) => f.eval(row, &bound, &mut meter)?.is_true(),
+                Some(f) => f.eval(row, &env, &mut meter)?.is_true(),
             };
             if matched {
                 keys.push(k.clone());
@@ -585,7 +592,7 @@ impl Database {
         })?;
         // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
         // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
-        let scope = Scope::single(table);
+        let scope = Scope::single(self, table);
 
         // Resolve assignments up front (fail fast, deterministic).
         let pk_idx = table.primary_key_index();
@@ -640,18 +647,24 @@ impl Database {
         // do not — they evaluate nothing; spec/design/cost.md §3).
         let mut meter = Meter::new();
         let mut updates: Vec<(Vec<u8>, Row)> = Vec::new();
+        // UPDATE has no outer query and no subqueries (resolve rejects them here): empty outer.
+        let env = EvalEnv {
+            exec: self,
+            params: &bound,
+            outer: &[],
+        };
         for (key, row) in self.store(&upd.table).iter_entries() {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
-                Some(f) => f.eval(row, &bound, &mut meter)?.is_true(),
+                Some(f) => f.eval(row, &env, &mut meter)?.is_true(),
             };
             if !matched {
                 continue;
             }
             let mut new_row = row.clone();
             for plan in &plans {
-                let raw = plan.source.eval(row, &bound, &mut meter)?;
+                let raw = plan.source.eval(row, &env, &mut meter)?;
                 new_row[plan.idx] = plan.check(raw)?;
             }
             updates.push((key.clone(), new_row));
@@ -691,72 +704,148 @@ impl Database {
         })
     }
 
-    /// Run a query expression to a `SelectResult` — a lone `SELECT` via `run_select`, or a set
-    /// operation via `run_set_op` (recursively, so a chain `a UNION b INTERSECT c` evaluates as
-    /// the parsed precedence tree).
-    fn run_query_expr(&mut self, qe: QueryExpr, params: &[Value]) -> Result<SelectResult> {
+    /// Run a query expression to a `SelectResult`. The top-level orchestrator (CLAUDE.md §2):
+    /// (1) PLAN the whole expression tree once against an empty scope chain, threading one
+    /// `ParamTypes` so `$N` inference is statement-wide; (2) finalize + bind the parameters;
+    /// (3) the `fold_uncorrelated` pass executes each globally-uncorrelated subquery once and
+    /// folds it to a constant (preserving the once-only cost — spec/design/cost.md §3);
+    /// (4) EXECUTE the plan against an empty outer-row environment. Correlated subqueries that
+    /// survive the fold are re-executed per outer row by the evaluator (grammar.md §26).
+    fn run_query_expr(&self, qe: QueryExpr, params: &[Value]) -> Result<SelectResult> {
+        let mut ptypes = ParamTypes::default();
+        let mut plan = self.plan_query(&qe, None, &mut ptypes)?;
+        let bound = bind_params(params, &ptypes.finalize()?)?;
+        let mut subquery_cost: i64 = 0;
+        self.fold_uncorrelated_in_plan(&mut plan, &bound, &mut subquery_cost)?;
+        let mut r = self.exec_query_plan(&plan, &[], &bound)?;
+        r.cost += subquery_cost;
+        Ok(r)
+    }
+
+    /// Run a lone `SELECT` — the entry point `execute_select` and `INSERT ... SELECT` use.
+    fn run_select(&self, sel: Select, params: &[Value]) -> Result<SelectResult> {
+        self.run_query_expr(QueryExpr::Select(Box::new(sel)), params)
+    }
+
+    /// Run a set operation as a top-level statement.
+    fn run_set_op(&self, so: SetOp, params: &[Value]) -> Result<SelectResult> {
+        self.run_query_expr(QueryExpr::SetOp(Box::new(so)), params)
+    }
+
+    /// Resolve a query expression into an owned `QueryPlan` against the scope chain (`parent` =
+    /// the enclosing query's scope, `None` at top level). A subquery is planned here, once
+    /// (spec/design/grammar.md §26).
+    fn plan_query(
+        &self,
+        qe: &QueryExpr,
+        parent: Option<&Scope>,
+        ptypes: &mut ParamTypes,
+    ) -> Result<QueryPlan> {
         match qe {
-            QueryExpr::Select(sel) => self.run_select(*sel, params),
-            QueryExpr::SetOp(so) => self.run_set_op(*so, params),
+            QueryExpr::Select(sel) => Ok(QueryPlan::Select(self.plan_select(sel, parent, ptypes)?)),
+            QueryExpr::SetOp(so) => {
+                Ok(QueryPlan::SetOp(Box::new(self.plan_set_op(so, parent, ptypes)?)))
+            }
         }
     }
 
-    fn run_set_op(&mut self, so: SetOp, params: &[Value]) -> Result<SelectResult> {
-        let SetOp {
-            op,
-            all,
-            lhs,
-            rhs,
-            order_by,
-            limit,
-            offset,
-        } = so;
-        let left = self.run_query_expr(lhs, params)?;
-        let right = self.run_query_expr(rhs, params)?;
+    /// Execute a resolved plan against an outer-row environment (`outer` = the enclosing rows,
+    /// innermost last; empty at top level) and the bound parameters.
+    fn exec_query_plan(
+        &self,
+        plan: &QueryPlan,
+        outer: &[&[Value]],
+        params: &[Value],
+    ) -> Result<SelectResult> {
+        match plan {
+            QueryPlan::Select(sp) => self.exec_select_plan(sp, outer, params),
+            QueryPlan::SetOp(sop) => self.exec_set_op_plan(sop, outer, params),
+        }
+    }
 
-        // Arity: both operands must produce the same number of columns. Checked before any row is
-        // matched, so it fires over empty operands too. PostgreSQL uses 42601 here.
-        if left.column_types.len() != right.column_types.len() {
+    /// Plan a set operation (spec/design/grammar.md §25): plan both operands with the same
+    /// parent scope, check arity + unify column types up front (so the 42601/42804 fire even
+    /// over empty operands), and resolve the trailing ORDER BY by output column name.
+    fn plan_set_op(
+        &self,
+        so: &SetOp,
+        parent: Option<&Scope>,
+        ptypes: &mut ParamTypes,
+    ) -> Result<SetOpPlan> {
+        let lhs = self.plan_query(&so.lhs, parent, ptypes)?;
+        let rhs = self.plan_query(&so.rhs, parent, ptypes)?;
+
+        // Arity: both operands must produce the same number of columns. PostgreSQL uses 42601.
+        if lhs.column_types().len() != rhs.column_types().len() {
             return Err(EngineError::new(
                 SqlState::SyntaxError,
                 format!(
                     "each {} query must have the same number of columns",
-                    setop_name(op)
+                    setop_name(so.op)
                 ),
             ));
         }
 
-        // Per-column type unification (42804 on an incompatible pair). Output column NAMES are the
-        // LEFT operand's (PostgreSQL).
-        let out_types: Vec<ResolvedType> = left
-            .column_types
+        // Per-column type unification (42804 on an incompatible pair). Output column NAMES are
+        // the LEFT operand's (PostgreSQL).
+        let column_types: Vec<ResolvedType> = lhs
+            .column_types()
             .iter()
-            .zip(right.column_types.iter())
-            .map(|(&l, &r)| unify_setop_column(l, r, op))
+            .zip(rhs.column_types().iter())
+            .map(|(&l, &r)| unify_setop_column(l, r, so.op))
             .collect::<Result<_>>()?;
+        let column_names = match &lhs {
+            QueryPlan::Select(s) => s.column_names.clone(),
+            QueryPlan::SetOp(s) => s.column_names.clone(),
+        };
+
+        // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
+        // operation): a qualified key is 42P01, an unknown name is 42703.
+        let mut order: Vec<(usize, bool, bool)> = Vec::with_capacity(so.order_by.len());
+        for key in &so.order_by {
+            let slot = resolve_setop_order_key(key, &column_names)?;
+            order.push((slot, key.descending, key.nulls_first));
+        }
+
+        Ok(SetOpPlan {
+            op: so.op,
+            all: so.all,
+            lhs,
+            rhs,
+            column_names,
+            column_types,
+            order,
+            limit: so.limit,
+            offset: so.offset,
+        })
+    }
+
+    /// Execute a resolved set operation: run both operands against the outer environment,
+    /// coerce to the unified types, combine per the operator + ALL flag, then sort + window.
+    /// Cost is `lhs.cost + rhs.cost` — the combine, sort, and window are unmetered (cost.md §3).
+    fn exec_set_op_plan(
+        &self,
+        plan: &SetOpPlan,
+        outer: &[&[Value]],
+        params: &[Value],
+    ) -> Result<SelectResult> {
+        let left = self.exec_query_plan(&plan.lhs, outer, params)?;
+        let right = self.exec_query_plan(&plan.rhs, outer, params)?;
 
         // Convert each operand's values to the unified column types BEFORE matching — the only
         // runtime conversion is integer -> decimal (so an int value and a decimal value compare
         // equal). Integer width promotion needs none (every integer is i64).
         let mut left_rows = left.rows;
         let mut right_rows = right.rows;
-        coerce_setop_rows(&mut left_rows, &left.column_types, &out_types);
-        coerce_setop_rows(&mut right_rows, &right.column_types, &out_types);
+        coerce_setop_rows(&mut left_rows, &left.column_types, &plan.column_types);
+        coerce_setop_rows(&mut right_rows, &right.column_types, &plan.column_types);
 
-        let mut rows = combine_setop(op, all, left_rows, right_rows);
+        let mut rows = combine_setop(plan.op, plan.all, left_rows, right_rows);
         let cost = left.cost + right.cost;
 
-        // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
-        // operation): a qualified key is 42P01, an unknown name is 42703. Reuse key_cmp; the sort
-        // is stable, so a full tie keeps the combine order (left rows before right).
-        let mut order: Vec<(usize, bool, bool)> = Vec::with_capacity(order_by.len());
-        for key in &order_by {
-            let slot = resolve_setop_order_key(key, &left.column_names)?;
-            order.push((slot, key.descending, key.nulls_first));
-        }
-        if !order.is_empty() {
+        if !plan.order.is_empty() {
             rows.sort_by(|a, b| {
-                for &(idx, descending, nulls_first) in &order {
+                for &(idx, descending, nulls_first) in &plan.order {
                     let ord = key_cmp(&a[idx], &b[idx], descending, nulls_first);
                     if ord.is_ne() {
                         return ord;
@@ -769,16 +858,16 @@ impl Database {
         // LIMIT / OFFSET window — clamp in the integer domain (counts are non-negative, parser),
         // applied AFTER the sort; unmetered, like every window.
         let len = rows.len();
-        let start = offset.unwrap_or(0).min(len as i64) as usize;
-        let end = match limit {
+        let start = plan.offset.unwrap_or(0).min(len as i64) as usize;
+        let end = match plan.limit {
             Some(lim) if lim < (len - start) as i64 => start + lim as usize,
             _ => len,
         };
         let rows = rows[start..end].to_vec();
 
         Ok(SelectResult {
-            column_names: left.column_names,
-            column_types: out_types,
+            column_names: plan.column_names.clone(),
+            column_types: plan.column_types.clone(),
             rows,
             cost,
         })
@@ -793,23 +882,23 @@ impl Database {
     /// accrued cost. The `&mut self` borrow ends when this returns owned rows, so a caller may
     /// then mutate the store (e.g. `INSERT INTO t SELECT ... FROM t` reads the pre-insert
     /// snapshot, then writes).
-    fn run_select(&mut self, mut sel: Select, params: &[Value]) -> Result<SelectResult> {
-        // Uncorrelated subquery folding (spec/design/grammar.md §26). Before resolving any clause,
-        // execute each uncorrelated subquery in WHERE / the select list / HAVING / a JOIN ON once
-        // and replace it with a constant (scalar -> its value; EXISTS -> a boolean; IN -> the value
-        // list, or an empty `In` for an empty result). The per-row evaluator is never involved. A
-        // correlated reference or a bind parameter inside a subquery is a 0A000. The subqueries'
-        // accrued cost is added once to this query's cost (cost.md §3).
-        let outer_cols = self.select_rel_cols(&sel);
-        let mut subquery_cost: i64 = 0;
-        self.fold_select_subqueries(&mut sel, &outer_cols, &mut subquery_cost)?;
-
-        // Accumulates the inferred type of each `$N` across every clause of this SELECT, then is
-        // finalized + bound once all resolution is done (spec/design/api.md §5).
-        let mut ptypes = ParamTypes::default();
+    /// Resolve a SELECT into a `SelectPlan` against the scope chain (`parent` = the enclosing
+    /// query's scope, for correlated references — grammar.md §26). The resolve half of the old
+    /// `run_select`: build the FROM scope, resolve every clause to `RExpr`, infer `$N` types
+    /// into `ptypes`. No row is touched and no parameter is bound here (the top-level
+    /// `run_query_expr` binds once, after the whole tree is planned).
+    fn plan_select(
+        &self,
+        sel: &Select,
+        parent: Option<&Scope>,
+        ptypes: &mut ParamTypes,
+    ) -> Result<SelectPlan> {
         // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
         // relation's flat column offset in FROM order, and reject a duplicate label — a
-        // self-join without distinct aliases is 42712 (spec/design/grammar.md §15).
+        // self-join without distinct aliases is 42712 (spec/design/grammar.md §15). The scope
+        // links to `parent` (for correlation) and the catalog (so a subquery can resolve its own
+        // FROM); `allow_subquery` is true (subqueries are legal in a SELECT — UPDATE/DELETE pass
+        // a `Scope::single` with it false).
         let mut rels: Vec<ScopeRel> = Vec::with_capacity(1 + sel.joins.len());
         let mut seen_labels: HashSet<String> = HashSet::new();
         let mut offset = 0usize;
@@ -838,20 +927,35 @@ impl Database {
             });
             offset += table.columns.len();
         }
-        let scope = Scope { rels };
+        let scope = Scope {
+            rels,
+            parent,
+            catalog: self,
+            allow_subquery: true,
+        };
 
         // Resolve GROUP BY keys to flat row indices (a key is a bare/qualified column —
         // grammar.md §18). An unknown column is 42703, an ambiguous bare key 42702.
         let mut group_keys: Vec<usize> = Vec::with_capacity(sel.group_by.len());
         for key in &sel.group_by {
-            let idx = match key {
+            let r = match key {
                 Expr::Column(name) => scope.resolve_bare(name)?,
                 Expr::QualifiedColumn { qualifier, name } => {
                     scope.resolve_qualified(qualifier, name)?
                 }
                 _ => unreachable!("the parser restricts GROUP BY keys to column references"),
             };
-            group_keys.push(idx);
+            match r {
+                Resolved::Local(idx) => group_keys.push(idx),
+                // Grouping by an enclosing-query column (a per-outer-row constant) is degenerate
+                // and unsupported this slice — the key machinery is flat local indices (§26).
+                Resolved::Outer { .. } => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "GROUP BY may not reference an outer query column",
+                    ));
+                }
+            }
         }
 
         // An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
@@ -871,14 +975,14 @@ impl Database {
             AggCtx::Forbidden
         };
         let (projections, column_names, column_types) =
-            resolve_projections(&scope, &sel.items, &mut agg_ctx, &mut ptypes)?;
+            resolve_projections(&scope, &sel.items, &mut agg_ctx, ptypes)?;
         // HAVING resolves against the same grouped scope (Collect) — it may reference aggregates
         // (collected into the SAME specs, so their slots follow the projection's) and grouping
         // keys; a non-grouped column is 42803. It must be boolean (42804). Resolved after the
         // projection so the synthetic row is [group_keys..., projection aggs..., HAVING aggs...].
         let having = match &sel.having {
             Some(h) => {
-                let (node, ty) = resolve(&scope, h, None, &mut agg_ctx, &mut ptypes)?;
+                let (node, ty) = resolve(&scope, h, None, &mut agg_ctx, ptypes)?;
                 match ty {
                     ResolvedType::Bool | ResolvedType::Null => Some(node),
                     _ => return Err(type_error("argument of HAVING must be boolean")),
@@ -898,18 +1002,28 @@ impl Database {
             ));
         }
         let filter = match &sel.filter {
-            Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
+            Some(p) => Some(resolve_boolean_filter(&scope, p, ptypes)?),
             None => None,
         };
         // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
         // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
         // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain
-        // query keys resolve against the FROM scope (a flat row index).
+        // query keys resolve against the FROM scope (a flat row index). An outer (correlated)
+        // ORDER BY key — ordering by an enclosing-query constant — is degenerate and 0A000 (§26).
         let mut order: Vec<(usize, bool, bool)> = Vec::with_capacity(sel.order_by.len());
         for key in &sel.order_by {
-            let idx = match &key.qualifier {
+            let r = match &key.qualifier {
                 Some(q) => scope.resolve_qualified(q, &key.column)?,
                 None => scope.resolve_bare(&key.column)?,
+            };
+            let idx = match r {
+                Resolved::Local(i) => i,
+                Resolved::Outer { .. } => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "ORDER BY may not reference an outer query column",
+                    ));
+                }
             };
             let slot = if is_agg {
                 group_keys
@@ -927,14 +1041,21 @@ impl Database {
         // so each key must appear as a bare/qualified column in the select list (resolved to
         // the same flat index; or the list is `*`). Matches PostgreSQL (42P10). Aliases are
         // invisible to ORDER BY (§8), so an aliased bare column still counts as projecting it.
+        // Only a Local match counts as "projected" (an outer reference has no per-row value).
         if sel.distinct && !order.is_empty() {
             if let SelectItems::Items(items) = &sel.items {
                 let mut projected: HashSet<usize> = HashSet::new();
                 for it in items {
                     let idx = match &it.expr {
-                        Expr::Column(name) => scope.resolve_bare(name).ok(),
+                        Expr::Column(name) => match scope.resolve_bare(name) {
+                            Ok(Resolved::Local(i)) => Some(i),
+                            _ => None,
+                        },
                         Expr::QualifiedColumn { qualifier, name } => {
-                            scope.resolve_qualified(qualifier, name).ok()
+                            match scope.resolve_qualified(qualifier, name) {
+                                Ok(Resolved::Local(i)) => Some(i),
+                                _ => None,
+                            }
                         }
                         _ => None,
                     };
@@ -956,37 +1077,79 @@ impl Database {
         // not-yet-joined table is a clean 42P01/42703 instead of an out-of-range row index.
         // CROSS has no ON; INNER and the OUTER kinds (LEFT/RIGHT/FULL) all resolve their ON the
         // same way — the join kind only changes how unmatched rows are handled in the loop below
-        // (spec/design/grammar.md §15).
-        let mut join_ons: Vec<Option<RExpr>> = Vec::with_capacity(sel.joins.len());
+        // (spec/design/grammar.md §15). The partial scope keeps the same `parent` chain, so a
+        // correlated reference in an ON predicate resolves outward (§26).
+        let mut joins: Vec<PlanJoin> = Vec::with_capacity(sel.joins.len());
         for (k, j) in sel.joins.iter().enumerate() {
-            match &j.on {
-                None => join_ons.push(None),
+            let on = match &j.on {
+                None => None,
                 Some(on_expr) => {
                     let partial = Scope {
                         rels: scope.rels[..=k + 1].to_vec(),
+                        parent,
+                        catalog: self,
+                        allow_subquery: true,
                     };
-                    join_ons.push(Some(resolve_boolean_filter(
-                        &partial,
-                        on_expr,
-                        &mut ptypes,
-                    )?));
+                    Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
                 }
-            }
+            };
+            joins.push(PlanJoin { kind: j.kind, on });
         }
 
-        // All clauses resolved: finalize the inferred parameter types and bind the supplied
-        // values (count mismatch 42601; out-of-range/family errors 22003/42804) BEFORE scanning
-        // any rows (spec/design/api.md §5).
-        let bound = bind_params(params, &ptypes.finalize()?)?;
+        // Assemble the owned plan (table NAMES + offsets/widths replace the scope's `&Table`s,
+        // so the plan outlives the scope and a correlated subquery can re-execute it per row).
+        let rels: Vec<PlanRel> = scope
+            .rels
+            .iter()
+            .map(|r| PlanRel {
+                table_name: r.table.name.clone(),
+                offset: r.offset,
+                col_count: r.table.columns.len(),
+            })
+            .collect();
+        Ok(SelectPlan {
+            rels,
+            joins,
+            filter,
+            is_agg,
+            group_keys,
+            agg_specs,
+            having,
+            order,
+            projections,
+            column_names,
+            column_types,
+            distinct: sel.distinct,
+            limit: sel.limit,
+            offset: sel.offset,
+        })
+    }
+
+    /// Execute a resolved SELECT against an outer-row environment (`outer` = the enclosing
+    /// rows, innermost last; empty at top level) and the bound parameters. The execute half of
+    /// the old `run_select`: materialize, nested-loop join, WHERE, then aggregate / DISTINCT /
+    /// window + project. The per-row evaluator gets an `EvalEnv` carrying the engine + outer
+    /// rows, so a correlated subquery in any clause re-executes against them (grammar.md §26).
+    fn exec_select_plan(
+        &self,
+        plan: &SelectPlan,
+        outer: &[&[Value]],
+        params: &[Value],
+    ) -> Result<SelectResult> {
+        let env = EvalEnv {
+            exec: self,
+            params,
+            outer,
+        };
 
         // Materialize each base table once, in primary-key order, charging storage_row_read
         // per physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these
         // in-memory buffers, which are not stores and charge nothing.
         let mut meter = Meter::new();
-        let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(scope.rels.len());
-        for rel in &scope.rels {
+        let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
+        for rel in &plan.rels {
             let mut table_rows: Vec<Row> = Vec::new();
-            for row in self.store(&rel.table.name).iter_in_key_order() {
+            for row in self.store(&rel.table_name).iter_in_key_order() {
                 meter.charge(COSTS.storage_row_read);
                 table_rows.push(row.clone());
             }
@@ -1004,16 +1167,16 @@ impl Database {
         // each unmatched left row after its (empty) match run, all unmatched right rows last in
         // right key order — so a join is deterministic even with no ORDER BY (CLAUDE.md §10).
         let mut running: Vec<Row> = std::mem::take(&mut materialized[0]);
-        for (k, j) in sel.joins.iter().enumerate() {
+        for (k, pj) in plan.joins.iter().enumerate() {
             let right_rows = &materialized[k + 1];
-            let on = &join_ons[k];
-            let emit_left = matches!(j.kind, JoinKind::Left | JoinKind::Full);
-            let emit_right = matches!(j.kind, JoinKind::Right | JoinKind::Full);
-            // NULL-pad widths come from the SCOPE, never a sampled row, so they are correct even
+            let on = &pj.on;
+            let emit_left = matches!(pj.kind, JoinKind::Left | JoinKind::Full);
+            let emit_right = matches!(pj.kind, JoinKind::Right | JoinKind::Full);
+            // NULL-pad widths come from the PLAN, never a sampled row, so they are correct even
             // when `running`/`right_rows` is empty: the right table begins at flat offset
             // rels[k+1].offset (= the width of every running row) and is that many columns wide.
-            let left_pad = scope.rels[k + 1].offset;
-            let right_pad = scope.rels[k + 1].table.columns.len();
+            let left_pad = plan.rels[k + 1].offset;
+            let right_pad = plan.rels[k + 1].col_count;
             let mut next: Vec<Row> = Vec::new();
             let mut right_matched = vec![false; right_rows.len()];
             for left in &running {
@@ -1023,7 +1186,7 @@ impl Database {
                     combined.extend_from_slice(right);
                     let keep = match on {
                         None => true,
-                        Some(pred) => pred.eval(&combined, &bound, &mut meter)?.is_true(),
+                        Some(pred) => pred.eval(&combined, &env, &mut meter)?.is_true(),
                     };
                     if keep {
                         next.push(combined);
@@ -1053,9 +1216,9 @@ impl Database {
         // can trap (22003/22012); each surviving combined row's filter accrues operator_eval.
         let mut rows: Vec<Row> = Vec::new();
         for row in running {
-            let keep = match &filter {
+            let keep = match &plan.filter {
                 None => true,
-                Some(f) => f.eval(&row, &bound, &mut meter)?.is_true(),
+                Some(f) => f.eval(&row, &env, &mut meter)?.is_true(),
             };
             if keep {
                 rows.push(row);
@@ -1068,9 +1231,9 @@ impl Database {
         // FIRST|LAST overrides the default (spec/design/grammar.md §10).
         // (Aggregate queries sort their GROUP rows in the aggregate branch below — not these
         // pre-aggregation rows — so the sort here is gated to plain queries.)
-        if !is_agg && !order.is_empty() {
+        if !plan.is_agg && !plan.order.is_empty() {
             rows.sort_by(|a, b| {
-                for &(idx, descending, nulls_first) in &order {
+                for &(idx, descending, nulls_first) in &plan.order {
                     let ord = key_cmp(&a[idx], &b[idx], descending, nulls_first);
                     if ord.is_ne() {
                         return ord;
@@ -1085,8 +1248,8 @@ impl Database {
         // usize (CLAUDE.md §8; spec/design/grammar.md §9). The counts are already
         // non-negative (parser).
         let window_bounds = |len: usize| -> (usize, usize) {
-            let start = sel.offset.unwrap_or(0).min(len as i64) as usize;
-            let end = match sel.limit {
+            let start = plan.offset.unwrap_or(0).min(len as i64) as usize;
+            let end = match plan.limit {
                 Some(lim) if lim < (len - start) as i64 => start + lim as usize,
                 _ => len,
             };
@@ -1098,7 +1261,7 @@ impl Database {
         // source rows and ONLY the windowed rows are projected; with DISTINCT every
         // (sorted) filtered row is projected — dedup must see them all — duplicates drop
         // by first occurrence, and the window then slices the DISTINCT rows.
-        let out_rows = if is_agg {
+        let out_rows = if plan.is_agg {
             // Aggregate query — group + accumulate (aggregates.md §5). Fold every filtered row into
             // the accumulators — charging aggregate_accumulate per (row × aggregate) and the
             // operand's own operator_evals — then finalize to the synthetic row [agg_0..] and
@@ -1113,28 +1276,31 @@ impl Database {
             // table creates no groups -> zero rows.
             let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
             let mut groups: Vec<(Vec<Value>, Vec<Acc>)> = Vec::new();
-            if group_keys.is_empty() {
+            if plan.group_keys.is_empty() {
                 groups.push((
                     Vec::new(),
-                    agg_specs.iter().map(|s| Acc::new(s.plan)).collect(),
+                    plan.agg_specs.iter().map(|s| Acc::new(s.plan)).collect(),
                 ));
                 index.insert(Vec::new(), 0);
             }
             for row in &rows {
-                let key: Vec<Value> = group_keys.iter().map(|&gk| row[gk].clone()).collect();
+                let key: Vec<Value> = plan.group_keys.iter().map(|&gk| row[gk].clone()).collect();
                 let gi = match index.get(&key) {
                     Some(&i) => i,
                     None => {
                         let i = groups.len();
                         index.insert(key.clone(), i);
-                        groups.push((key, agg_specs.iter().map(|s| Acc::new(s.plan)).collect()));
+                        groups.push((
+                            key,
+                            plan.agg_specs.iter().map(|s| Acc::new(s.plan)).collect(),
+                        ));
                         i
                     }
                 };
-                for (si, spec) in agg_specs.iter().enumerate() {
+                for (si, spec) in plan.agg_specs.iter().enumerate() {
                     meter.charge(COSTS.aggregate_accumulate);
                     let v = match &spec.operand {
-                        Some(op) => op.eval(row, &bound, &mut meter)?,
+                        Some(op) => op.eval(row, &env, &mut meter)?,
                         None => Value::Null, // COUNT(*) ignores the value
                     };
                     groups[gi].1[si].fold(v)?;
@@ -1153,19 +1319,19 @@ impl Database {
             // predicate is evaluated against each group's synthetic row (charging its
             // operator_evals per group); only a TRUE result keeps the group. A dropped group
             // then charges no row_produced (spec/design/aggregates.md §8).
-            if let Some(h) = &having {
+            if let Some(h) = &plan.having {
                 let mut kept: Vec<Vec<Value>> = Vec::with_capacity(group_rows.len());
                 for srow in group_rows {
-                    if h.eval(&srow, &bound, &mut meter)?.is_true() {
+                    if h.eval(&srow, &env, &mut meter)?.is_true() {
                         kept.push(srow);
                     }
                 }
                 group_rows = kept;
             }
             // ORDER BY over the grouped output (keys are synthetic group-key slots).
-            if !order.is_empty() {
+            if !plan.order.is_empty() {
                 group_rows.sort_by(|a, b| {
-                    for &(slot, descending, nulls_first) in &order {
+                    for &(slot, descending, nulls_first) in &plan.order {
                         let ord = key_cmp(&a[slot], &b[slot], descending, nulls_first);
                         if ord.is_ne() {
                             return ord;
@@ -1179,14 +1345,14 @@ impl Database {
             let mut out_rows = Vec::with_capacity(end - start);
             for srow in &group_rows[start..end] {
                 meter.charge(COSTS.row_produced);
-                let mut out = Vec::with_capacity(projections.len());
-                for p in &projections {
-                    out.push(p.eval(srow, &bound, &mut meter)?);
+                let mut out = Vec::with_capacity(plan.projections.len());
+                for p in &plan.projections {
+                    out.push(p.eval(srow, &env, &mut meter)?);
                 }
                 out_rows.push(out);
             }
             out_rows
-        } else if sel.distinct {
+        } else if plan.distinct {
             // Project every filtered row (charging projection cost per row, the §3
             // asymmetry), keeping first occurrences. `seen` is membership-only: the
             // output order comes from the deterministic source iteration, never from set
@@ -1194,9 +1360,9 @@ impl Database {
             let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
             let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
             for row in &rows {
-                let mut out = Vec::with_capacity(projections.len());
-                for p in &projections {
-                    out.push(p.eval(row, &bound, &mut meter)?);
+                let mut out = Vec::with_capacity(plan.projections.len());
+                for p in &plan.projections {
+                    out.push(p.eval(row, &env, &mut meter)?);
                 }
                 if seen.insert(out.clone()) {
                     distinct_rows.push(out);
@@ -1221,9 +1387,9 @@ impl Database {
             let mut out_rows = Vec::with_capacity(end - start);
             for row in &rows[start..end] {
                 meter.charge(COSTS.row_produced);
-                let mut out = Vec::with_capacity(projections.len());
-                for p in &projections {
-                    out.push(p.eval(row, &bound, &mut meter)?);
+                let mut out = Vec::with_capacity(plan.projections.len());
+                for p in &plan.projections {
+                    out.push(p.eval(row, &env, &mut meter)?);
                 }
                 out_rows.push(out);
             }
@@ -1231,265 +1397,180 @@ impl Database {
         };
 
         Ok(SelectResult {
-            column_names,
-            column_types,
+            column_names: plan.column_names.clone(),
+            column_types: plan.column_types.clone(),
             rows: out_rows,
-            // The scan/eval cost plus each uncorrelated subquery's cost, counted once (cost.md §3).
-            cost: meter.accrued + subquery_cost,
+            // The scan/eval cost (correlated subqueries fold their per-row cost in via the
+            // evaluator). Globally-uncorrelated subqueries are folded once before exec and their
+            // cost is added at the `run_query_expr` level (spec/design/cost.md §3).
+            cost: meter.accrued,
         })
     }
 
     // ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------
     //
-    // A pre-pass over `run_select` (before scope/resolution): each scalar / IN / EXISTS subquery
-    // is UNCORRELATED, so it is executed exactly once here and replaced by a constant the ordinary
-    // resolver/evaluator already handles. This keeps the per-row evaluator unchanged and is the
-    // seam the future correlated slice will extend (it would resolve an outer reference against the
-    // outer row instead of rejecting it). A correlated reference or a `$N` inside is a 0A000.
+    // After the whole statement tree is planned + the parameters bound, this bottom-up pass
+    // walks every `RExpr::Subquery` node in the plan tree: it first folds within the node's own
+    // sub-plan, then — if the subquery references NO enclosing scope (a global constant, PG's
+    // "initplan") — executes it ONCE and replaces it with a constant (scalar -> its value;
+    // EXISTS -> a boolean; IN -> an `InValues` over the result column), accruing the subquery's
+    // cost once (preserving the committed once-only cost — cost.md §3). A CORRELATED subquery is
+    // left in place; the evaluator re-executes it per outer row. So after this pass the only
+    // surviving `Subquery` nodes are correlated.
 
-    /// The relation labels and column names a query expression's FROM clause(s) put in scope,
-    /// lower-cased — used by the correlation check (no flat offsets needed). A set operation
-    /// contributes the union of its operands' relations.
-    fn select_rel_cols(&self, sel: &Select) -> RelCols {
-        let mut rc = RelCols::default();
-        self.collect_select_rel_cols(sel, &mut rc);
-        rc
-    }
-
-    fn query_rel_cols(&self, q: &QueryExpr) -> RelCols {
-        let mut rc = RelCols::default();
-        self.collect_query_rel_cols(q, &mut rc);
-        rc
-    }
-
-    fn collect_query_rel_cols(&self, q: &QueryExpr, rc: &mut RelCols) {
-        match q {
-            QueryExpr::Select(s) => self.collect_select_rel_cols(s, rc),
-            QueryExpr::SetOp(so) => {
-                self.collect_query_rel_cols(&so.lhs, rc);
-                self.collect_query_rel_cols(&so.rhs, rc);
-            }
-        }
-    }
-
-    fn collect_select_rel_cols(&self, sel: &Select, rc: &mut RelCols) {
-        for tref in std::iter::once(&sel.from).chain(sel.joins.iter().map(|j| &j.table)) {
-            if let Some(t) = self.table(&tref.name) {
-                let label = tref
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| t.name.clone())
-                    .to_ascii_lowercase();
-                rc.labels.insert(label);
-                for c in &t.columns {
-                    rc.bare.insert(c.name.to_ascii_lowercase());
-                }
-            }
-        }
-    }
-
-    /// Reject the two narrowings before running a subquery (spec/design/grammar.md §26): a bind
-    /// parameter anywhere inside (params are inferred per-SELECT, not shared across scopes), and a
-    /// correlated reference — a direct-clause column that does not resolve against the subquery's
-    /// own FROM but does match an OUTER relation. Both are `0A000`.
-    fn reject_correlation_and_params(&self, inner: &QueryExpr, outer: &RelCols) -> Result<()> {
-        if query_has_param(inner) {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "bind parameters inside a subquery are not supported yet",
-            ));
-        }
-        let inner_cols = self.query_rel_cols(inner);
-        let mut direct: Vec<&Expr> = Vec::new();
-        query_clause_exprs(inner, &mut direct);
-        let mut refs: Vec<(Option<&str>, &str)> = Vec::new();
-        for e in &direct {
-            collect_colrefs(e, &mut refs);
-        }
-        for (qual, name) in refs {
-            let correlated = match qual {
-                Some(q) => {
-                    let q = q.to_ascii_lowercase();
-                    !inner_cols.labels.contains(&q) && outer.labels.contains(&q)
-                }
-                None => {
-                    let n = name.to_ascii_lowercase();
-                    !inner_cols.bare.contains(&n) && outer.bare.contains(&n)
-                }
-            };
-            if correlated {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "correlated subqueries are not supported yet",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Fold every subquery in a SELECT's clauses (WHERE / select list / HAVING / each JOIN ON).
-    /// GROUP BY and ORDER BY keys are column references only (grammar.md §18), so they cannot hold
-    /// a subquery.
-    fn fold_select_subqueries(
-        &mut self,
-        sel: &mut Select,
-        outer: &RelCols,
+    fn fold_uncorrelated_in_plan(
+        &self,
+        plan: &mut QueryPlan,
+        bound: &[Value],
         cost: &mut i64,
     ) -> Result<()> {
-        if let SelectItems::Items(items) = &mut sel.items {
-            for it in items {
-                self.fold_in_expr(&mut it.expr, outer, cost)?;
+        match plan {
+            QueryPlan::Select(sp) => self.fold_uncorrelated_in_select(sp, bound, cost),
+            QueryPlan::SetOp(sop) => {
+                self.fold_uncorrelated_in_plan(&mut sop.lhs, bound, cost)?;
+                self.fold_uncorrelated_in_plan(&mut sop.rhs, bound, cost)
             }
         }
-        if let Some(f) = &mut sel.filter {
-            self.fold_in_expr(f, outer, cost)?;
-        }
-        if let Some(h) = &mut sel.having {
-            self.fold_in_expr(h, outer, cost)?;
-        }
-        for j in &mut sel.joins {
+    }
+
+    fn fold_uncorrelated_in_select(
+        &self,
+        sp: &mut SelectPlan,
+        bound: &[Value],
+        cost: &mut i64,
+    ) -> Result<()> {
+        for j in &mut sp.joins {
             if let Some(on) = &mut j.on {
-                self.fold_in_expr(on, outer, cost)?;
+                self.fold_uncorrelated_in_rexpr(on, bound, cost)?;
             }
+        }
+        if let Some(f) = &mut sp.filter {
+            self.fold_uncorrelated_in_rexpr(f, bound, cost)?;
+        }
+        if let Some(h) = &mut sp.having {
+            self.fold_uncorrelated_in_rexpr(h, bound, cost)?;
+        }
+        for s in &mut sp.agg_specs {
+            if let Some(op) = &mut s.operand {
+                self.fold_uncorrelated_in_rexpr(op, bound, cost)?;
+            }
+        }
+        for p in &mut sp.projections {
+            self.fold_uncorrelated_in_rexpr(p, bound, cost)?;
         }
         Ok(())
     }
 
-    /// Fold this expression node if it is a subquery, else recurse into its children. A subquery's
-    /// own inner expressions are NOT walked here — running it (which recurses into `run_select`)
-    /// folds its internals, so nested subqueries fall out for free.
-    fn fold_in_expr(&mut self, e: &mut Expr, outer: &RelCols, cost: &mut i64) -> Result<()> {
-        match e {
-            Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {
-                let taken = std::mem::replace(e, Expr::Literal(Literal::Null));
-                *e = self.fold_subquery_node(taken, outer, cost)?;
-            }
-            Expr::Cast { inner, .. } => self.fold_in_expr(inner, outer, cost)?,
-            Expr::Unary { operand, .. } => self.fold_in_expr(operand, outer, cost)?,
-            Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
-                self.fold_in_expr(lhs, outer, cost)?;
-                self.fold_in_expr(rhs, outer, cost)?;
-            }
-            Expr::IsNull { operand, .. } => self.fold_in_expr(operand, outer, cost)?,
-            Expr::In { lhs, list, .. } => {
-                self.fold_in_expr(lhs, outer, cost)?;
-                for x in list {
-                    self.fold_in_expr(x, outer, cost)?;
+    /// Fold this node if it is an uncorrelated `Subquery`, else recurse into its children.
+    fn fold_uncorrelated_in_rexpr(
+        &self,
+        e: &mut RExpr,
+        bound: &[Value],
+        cost: &mut i64,
+    ) -> Result<()> {
+        if matches!(e, RExpr::Subquery { .. }) {
+            // Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
+            // globally-uncorrelated subquery nested inside it is already a constant before we run
+            // it. Then leave it untouched if it is correlated (re-run per outer row at eval).
+            if let RExpr::Subquery { plan, lhs, .. } = e {
+                if let Some(l) = lhs {
+                    self.fold_uncorrelated_in_rexpr(l, bound, cost)?;
+                }
+                self.fold_uncorrelated_in_plan(plan, bound, cost)?;
+                if query_plan_references_outer(plan, 0) {
+                    return Ok(());
                 }
             }
-            Expr::Between { lhs, lo, hi, .. } => {
-                self.fold_in_expr(lhs, outer, cost)?;
-                self.fold_in_expr(lo, outer, cost)?;
-                self.fold_in_expr(hi, outer, cost)?;
-            }
-            Expr::Like { lhs, rhs, .. } => {
-                self.fold_in_expr(lhs, outer, cost)?;
-                self.fold_in_expr(rhs, outer, cost)?;
-            }
-            Expr::Case {
-                operand,
-                whens,
-                els,
-            } => {
-                if let Some(o) = operand {
-                    self.fold_in_expr(o, outer, cost)?;
-                }
-                for (c, r) in whens {
-                    self.fold_in_expr(c, outer, cost)?;
-                    self.fold_in_expr(r, outer, cost)?;
-                }
-                if let Some(el) = els {
-                    self.fold_in_expr(el, outer, cost)?;
-                }
-            }
-            Expr::FuncCall { args, .. } => {
-                for a in args {
-                    self.fold_in_expr(a, outer, cost)?;
-                }
-            }
-            Expr::Column(_)
-            | Expr::QualifiedColumn { .. }
-            | Expr::Literal(_)
-            | Expr::Param(_)
-            | Expr::FoldedConst { .. } => {}
-        }
-        Ok(())
-    }
-
-    /// Execute one subquery node and return the constant `Expr` it folds to (spec/design/grammar.md
-    /// §26). The subquery runs with NO bind parameters (they are rejected inside), so the outer
-    /// statement's `params` are not threaded in.
-    fn fold_subquery_node(&mut self, node: Expr, outer: &RelCols, cost: &mut i64) -> Result<Expr> {
-        match node {
-            Expr::ScalarSubquery(q) => {
-                self.reject_correlation_and_params(&q, outer)?;
-                let r = self.run_query_expr(*q, &[])?;
-                *cost += r.cost;
-                if r.column_types.len() != 1 {
-                    return Err(EngineError::new(
-                        SqlState::SyntaxError,
-                        "subquery must return only one column",
-                    ));
-                }
-                if r.rows.len() > 1 {
-                    return Err(EngineError::new(
-                        SqlState::CardinalityViolation,
-                        "more than one row returned by a subquery used as an expression",
-                    ));
-                }
-                // 0 rows -> a TYPED NULL (the value is NULL, the type is the output column's), so a
-                // cross-family comparison still errors (grammar.md §26).
-                let ty = scalar_type_of(r.column_types[0]);
-                let value = r
-                    .rows
-                    .into_iter()
-                    .next()
-                    .map(|mut row| row.swap_remove(0))
-                    .unwrap_or(Value::Null);
-                Ok(Expr::FoldedConst { value, ty })
-            }
-            Expr::Exists(q) => {
-                self.reject_correlation_and_params(&q, outer)?;
-                let r = self.run_query_expr(*q, &[])?;
-                *cost += r.cost;
-                // EXISTS ignores the select list entirely and is never NULL.
-                Ok(Expr::Literal(Literal::Bool(!r.rows.is_empty())))
-            }
-            Expr::InSubquery {
-                mut lhs,
-                query,
+            // Uncorrelated: execute ONCE and fold to a constant / InValues. Take ownership so the
+            // sub-plan can be moved/run without aliasing the node we are about to overwrite.
+            let taken = std::mem::replace(e, RExpr::ConstNull);
+            let RExpr::Subquery {
+                plan,
+                kind,
+                lhs,
                 negated,
-            } => {
-                // The LHS belongs to the OUTER query — fold any subqueries inside it too.
-                self.fold_in_expr(&mut lhs, outer, cost)?;
-                self.reject_correlation_and_params(&query, outer)?;
-                let r = self.run_query_expr(*query, &[])?;
-                *cost += r.cost;
-                if r.column_types.len() != 1 {
-                    return Err(EngineError::new(
-                        SqlState::SyntaxError,
-                        "subquery has too many columns",
-                    ));
+            } = taken
+            else {
+                unreachable!("guarded by matches! above")
+            };
+            let r = self.exec_query_plan(&plan, &[], bound)?;
+            *cost += r.cost;
+            *e = match kind {
+                SubqueryKind::Scalar => {
+                    if r.rows.len() > 1 {
+                        return Err(EngineError::new(
+                            SqlState::CardinalityViolation,
+                            "more than one row returned by a subquery used as an expression",
+                        ));
+                    }
+                    let value = r
+                        .rows
+                        .into_iter()
+                        .next()
+                        .map(|mut row| row.swap_remove(0))
+                        .unwrap_or(Value::Null);
+                    value_to_rexpr(&value)
                 }
-                let ty = scalar_type_of(r.column_types[0]);
-                // Non-empty -> the literal-IN OR-chain over the result values (3VL inherited). An
-                // empty result -> an empty `In` that resolves to the constant FALSE (IN) / TRUE
-                // (NOT IN), independent of the LHS value (grammar.md §26).
-                let list: Vec<Expr> = r
-                    .rows
-                    .into_iter()
-                    .map(|mut row| Expr::FoldedConst {
-                        value: row.swap_remove(0),
-                        ty,
-                    })
-                    .collect();
-                Ok(Expr::In {
-                    lhs,
-                    list,
-                    negated,
-                })
+                SubqueryKind::Exists => RExpr::ConstBool(!r.rows.is_empty() != negated),
+                SubqueryKind::In => {
+                    let list: Vec<Value> = r
+                        .rows
+                        .into_iter()
+                        .map(|mut row| row.swap_remove(0))
+                        .collect();
+                    RExpr::InValues {
+                        lhs: lhs.expect("an IN subquery carries its resolved lhs"),
+                        list,
+                        negated,
+                    }
+                }
+            };
+            return Ok(());
+        }
+        match e {
+            RExpr::Cast { inner, .. } => self.fold_uncorrelated_in_rexpr(inner, bound, cost),
+            RExpr::Neg { operand, .. } => self.fold_uncorrelated_in_rexpr(operand, bound, cost),
+            RExpr::Not(x) => self.fold_uncorrelated_in_rexpr(x, bound, cost),
+            RExpr::Arith { lhs, rhs, .. }
+            | RExpr::Compare { lhs, rhs, .. }
+            | RExpr::Distinct { lhs, rhs, .. }
+            | RExpr::Like { lhs, rhs, .. } => {
+                self.fold_uncorrelated_in_rexpr(lhs, bound, cost)?;
+                self.fold_uncorrelated_in_rexpr(rhs, bound, cost)
             }
-            _ => unreachable!("fold_subquery_node called on a non-subquery node"),
+            RExpr::And(l, r) | RExpr::Or(l, r) => {
+                self.fold_uncorrelated_in_rexpr(l, bound, cost)?;
+                self.fold_uncorrelated_in_rexpr(r, bound, cost)
+            }
+            RExpr::IsNull { operand, .. } => self.fold_uncorrelated_in_rexpr(operand, bound, cost),
+            RExpr::Case { arms, els, .. } => {
+                for (c, res) in arms {
+                    self.fold_uncorrelated_in_rexpr(c, bound, cost)?;
+                    self.fold_uncorrelated_in_rexpr(res, bound, cost)?;
+                }
+                self.fold_uncorrelated_in_rexpr(els, bound, cost)
+            }
+            RExpr::ScalarFunc { args, .. } => {
+                for a in args {
+                    self.fold_uncorrelated_in_rexpr(a, bound, cost)?;
+                }
+                Ok(())
+            }
+            RExpr::InValues { lhs, .. } => self.fold_uncorrelated_in_rexpr(lhs, bound, cost),
+            // Leaves and the (already-handled) Subquery: nothing to recurse into.
+            RExpr::Subquery { .. }
+            | RExpr::Column(_)
+            | RExpr::OuterColumn { .. }
+            | RExpr::Param(_)
+            | RExpr::ConstInt(_)
+            | RExpr::ConstBool(_)
+            | RExpr::ConstText(_)
+            | RExpr::ConstDecimal(_)
+            | RExpr::ConstBytea(_)
+            | RExpr::ConstUuid(_)
+            | RExpr::ConstTimestamp(_)
+            | RExpr::ConstTimestamptz(_)
+            | RExpr::ConstNull => Ok(()),
         }
     }
 
@@ -1534,26 +1615,52 @@ struct ScopeRel<'a> {
     offset: usize,
 }
 
-/// The relations a query's FROM clause puts in scope, in FROM order.
+/// How a column reference resolved against the scope CHAIN (spec/design/grammar.md §26).
+/// `Local` is a column of one of THIS query's relations (a flat row index into the joined
+/// row); `Outer` is a correlated reference to an enclosing query — `level` hops outward
+/// (1 = immediate parent) and `index` is the flat column index within that ancestor's row.
+#[derive(Clone, Copy)]
+enum Resolved {
+    Local(usize),
+    Outer { level: usize, index: usize },
+}
+
+/// The relations a query's FROM clause puts in scope, in FROM order, plus the enclosing
+/// scope chain (for correlated references — grammar.md §26) and the catalog (so resolving a
+/// subquery can look up its own FROM tables).
 struct Scope<'a> {
     rels: Vec<ScopeRel<'a>>,
+    /// The enclosing query's scope, for correlated-reference resolution (None at top level).
+    parent: Option<&'a Scope<'a>>,
+    /// The catalog, so a subquery's inner FROM tables can be resolved during planning.
+    catalog: &'a Database,
+    /// Whether a subquery is allowed in this scope's expressions: true inside a SELECT (and
+    /// its nested subqueries), false for UPDATE/DELETE (a subquery there is 0A000 this slice).
+    allow_subquery: bool,
 }
 
 impl<'a> Scope<'a> {
-    /// A one-relation scope (the single-table SELECT / UPDATE / DELETE case).
-    fn single(table: &'a Table) -> Scope<'a> {
+    /// A one-relation scope with no parent and no subqueries (the single-table UPDATE / DELETE
+    /// case). SELECT builds its own scope in `plan_select` (with a parent + subqueries allowed).
+    fn single(catalog: &'a Database, table: &'a Table) -> Scope<'a> {
         Scope {
             rels: vec![ScopeRel {
                 label: table.name.to_ascii_lowercase(),
                 table,
                 offset: 0,
             }],
+            parent: None,
+            catalog,
+            allow_subquery: false,
         }
     }
 
-    /// Resolve a bare column name to a flat row index: no relation has it → 42703; two or
-    /// more relations have it → 42702 ambiguous; exactly one → its flat index.
-    fn resolve_bare(&self, name: &str) -> Result<usize> {
+    /// Resolve a bare column name against THIS scope, then OUTWARD through the parent chain.
+    /// Within one scope: two+ relations have it → 42702 ambiguous; exactly one → `Local`; none
+    /// → fall through to the parent. A name found only in an ancestor is an `Outer` reference
+    /// (nearest scope wins — an inner match shadows an outer one, matching PostgreSQL). 42703
+    /// only if no scope in the chain has it.
+    fn resolve_bare(&self, name: &str) -> Result<Resolved> {
         let mut found: Option<usize> = None;
         for r in &self.rels {
             if let Some(local) = r.table.column_index(name) {
@@ -1563,26 +1670,35 @@ impl<'a> Scope<'a> {
                 found = Some(r.offset + local);
             }
         }
-        found.ok_or_else(|| undefined_column(name))
+        if let Some(idx) = found {
+            return Ok(Resolved::Local(idx));
+        }
+        match self.parent {
+            Some(p) => Ok(outer_of(p.resolve_bare(name)?)),
+            None => Err(undefined_column(name)),
+        }
     }
 
-    /// Resolve a qualified `rel.col` to a flat row index: an unknown `rel` is 42P01, a known
-    /// `rel` with no such column is 42703. Never ambiguous (it names one relation).
-    fn resolve_qualified(&self, qualifier: &str, name: &str) -> Result<usize> {
+    /// Resolve a qualified `rel.col` against THIS scope, then outward. A qualifier that names a
+    /// relation in this scope binds here — a missing column is then 42703 (no fall-through, so
+    /// an inner relation shadows a same-named outer one). Only an unknown qualifier walks
+    /// outward (42P01 if no ancestor has it).
+    fn resolve_qualified(&self, qualifier: &str, name: &str) -> Result<Resolved> {
         let q = qualifier.to_ascii_lowercase();
-        let rel = self
-            .rels
-            .iter()
-            .find(|r| r.label == q)
-            .ok_or_else(|| missing_from_entry(qualifier))?;
-        let local = rel
-            .table
-            .column_index(name)
-            .ok_or_else(|| undefined_column(name))?;
-        Ok(rel.offset + local)
+        if let Some(rel) = self.rels.iter().find(|r| r.label == q) {
+            let local = rel
+                .table
+                .column_index(name)
+                .ok_or_else(|| undefined_column(name))?;
+            return Ok(Resolved::Local(rel.offset + local));
+        }
+        match self.parent {
+            Some(p) => Ok(outer_of(p.resolve_qualified(qualifier, name)?)),
+            None => Err(missing_from_entry(qualifier)),
+        }
     }
 
-    /// The column at a flat index (the index is known valid — resolution produced it).
+    /// The column at a flat index in THIS scope (the index is known valid — resolution made it).
     fn column_at(&self, flat: usize) -> &Column {
         for r in &self.rels {
             let n = r.table.columns.len();
@@ -1591,6 +1707,37 @@ impl<'a> Scope<'a> {
             }
         }
         unreachable!("a resolved flat column index is always in range")
+    }
+
+    /// The ancestor scope `level` hops outward (1 = immediate parent).
+    fn ancestor(&self, level: usize) -> &Scope<'a> {
+        let mut s = self;
+        for _ in 0..level {
+            s = s
+                .parent
+                .expect("a correlated level is within the scope-chain depth");
+        }
+        s
+    }
+
+    /// The column a resolution refers to — `Local` in this scope, or `Outer` in an ancestor.
+    fn column_of(&self, r: Resolved) -> &Column {
+        match r {
+            Resolved::Local(idx) => self.column_at(idx),
+            Resolved::Outer { level, index } => self.ancestor(level).column_at(index),
+        }
+    }
+}
+
+/// Lift a parent-scope resolution into the child's frame: a `Local` in the parent is one hop
+/// out (`level` 1); an `Outer` in the parent is one deeper hop (`level + 1`).
+fn outer_of(r: Resolved) -> Resolved {
+    match r {
+        Resolved::Local(index) => Resolved::Outer { level: 1, index },
+        Resolved::Outer { level, index } => Resolved::Outer {
+            level: level + 1,
+            index,
+        },
     }
 }
 
@@ -1797,6 +1944,117 @@ enum RExpr {
         args: Vec<RExpr>,
         result: ScalarType,
     },
+    /// A correlated column reference (spec/design/grammar.md §26): the column `index` of the
+    /// enclosing-query row `level` hops out (1 = immediate parent). A **leaf** — charges no
+    /// `operator_eval`, like `Column`; at eval it reads from the outer-row environment.
+    OuterColumn { level: usize, index: usize },
+    /// A subquery resolved once against the scope chain (spec/design/grammar.md §26). After the
+    /// `fold_uncorrelated` pass only CORRELATED subqueries survive as this node (uncorrelated
+    /// ones are folded to a constant / `InValues`). At eval the inner `plan` is re-executed
+    /// against the pushed outer-row environment, once per outer row that reaches this node.
+    /// (The element/scalar static type was settled at resolve — the value alone suffices here.)
+    Subquery {
+        plan: Box<QueryPlan>,
+        kind: SubqueryKind,
+        /// For `In`: the outer value tested for membership. `None` for Scalar/Exists.
+        lhs: Option<Box<RExpr>>,
+        /// For `In` / `Exists`: the `NOT` flag.
+        negated: bool,
+    },
+    /// A folded **uncorrelated** `IN (subquery)` (spec/design/grammar.md §26): the subquery ran
+    /// once (at the fold pass) yielding the constant `list`; per row it tests `lhs` for 3-valued
+    /// membership (empty → `negated`; a NULL with no positive match → NULL). One `operator_eval`
+    /// for the node plus one per element compared.
+    InValues {
+        lhs: Box<RExpr>,
+        list: Vec<Value>,
+        negated: bool,
+    },
+}
+
+/// Which subquery form an `RExpr::Subquery` is (spec/design/grammar.md §26).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubqueryKind {
+    Scalar,
+    Exists,
+    In,
+}
+
+// ============================================================================
+// Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
+// subquery is re-run once per outer row). `plan_query` (the resolve half of the old
+// `run_select`) produces a `QueryPlan`; `exec_query_plan` (the execute half) consumes it
+// against an outer-row environment. The split lets a subquery be resolved ONCE — so its
+// structural/type errors surface even when the outer produces zero rows — yet executed many
+// times (spec/design/grammar.md §26).
+// ============================================================================
+
+/// A resolved query expression: a SELECT plan or a set-operation plan (mirrors `QueryExpr`).
+enum QueryPlan {
+    Select(SelectPlan),
+    SetOp(Box<SetOpPlan>),
+}
+
+impl QueryPlan {
+    /// The output column types — for a scalar/IN subquery's plan-time column-count check (42601)
+    /// and its folded/element type.
+    fn column_types(&self) -> &[ResolvedType] {
+        match self {
+            QueryPlan::Select(s) => &s.column_types,
+            QueryPlan::SetOp(s) => &s.column_types,
+        }
+    }
+}
+
+/// One relation in a SELECT plan: the table name (looked up in the store at exec), the flat
+/// offset of its first column in the joined row, and its column count (for NULL-padding).
+struct PlanRel {
+    table_name: String,
+    offset: usize,
+    col_count: usize,
+}
+
+/// One join in a SELECT plan: its kind and resolved ON predicate (`None` for CROSS). The right
+/// relation is `rels[k+1]`.
+struct PlanJoin {
+    kind: JoinKind,
+    on: Option<RExpr>,
+}
+
+/// A resolved SELECT, executable against an outer-row environment (the execute half of the old
+/// `run_select`, lifted to a value so a correlated subquery can re-run it per outer row).
+struct SelectPlan {
+    rels: Vec<PlanRel>,
+    joins: Vec<PlanJoin>,
+    filter: Option<RExpr>,
+    is_agg: bool,
+    group_keys: Vec<usize>,
+    agg_specs: Vec<AggSpec>,
+    having: Option<RExpr>,
+    /// (flat slot, descending, nulls_first) per ORDER BY key.
+    order: Vec<(usize, bool, bool)>,
+    projections: Vec<RExpr>,
+    column_names: Vec<String>,
+    column_types: Vec<ResolvedType>,
+    distinct: bool,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// A resolved set operation (spec/design/grammar.md §25): both operands planned with the same
+/// parent scope (so a correlated set-op subquery works), the unified output types, and the
+/// trailing ORDER BY / LIMIT / OFFSET resolved by output column.
+struct SetOpPlan {
+    op: SetOpKind,
+    all: bool,
+    lhs: QueryPlan,
+    rhs: QueryPlan,
+    column_names: Vec<String>,
+    column_types: Vec<ResolvedType>,
+    /// (output slot, descending, nulls_first) — the trailing ORDER BY resolved by output name.
+    order: Vec<(usize, bool, bool)>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 // ============================================================================
@@ -2022,41 +2280,24 @@ fn expr_has_aggregate(e: &Expr) -> bool {
                 || els.as_deref().is_some_and(expr_has_aggregate)
         }
         // A subquery is an independent query: an aggregate INSIDE it does not make the OUTER query
-        // an aggregate query. (And these are folded away by the pre-pass before this runs.) The
-        // pre-pass leaves a `FoldedConst`, a leaf.
-        Expr::ScalarSubquery(_)
-        | Expr::Exists(_)
-        | Expr::InSubquery { .. }
-        | Expr::FoldedConst { .. } => false,
+        // an aggregate query (the outer reference, if any, is just a constant to the subquery).
+        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => false,
     }
 }
 
-/// The relation labels and column names a query puts in scope (lower-cased), for the §26
-/// correlation check.
-#[derive(Default)]
-struct RelCols {
-    labels: std::collections::HashSet<String>,
-    bare: std::collections::HashSet<String>,
+/// The environment threaded into the per-row evaluator (spec/design/grammar.md §26): the
+/// engine (to run a correlated subquery's plan), the bound parameters, and the stack of
+/// enclosing rows (innermost LAST) a correlated reference reads. `outer` is empty at the top
+/// level; a correlated subquery pushes the current row before running its inner plan, so an
+/// `OuterColumn { level, index }` reads `outer[outer.len() - level][index]`.
+struct EvalEnv<'a> {
+    exec: &'a Database,
+    params: &'a [Value],
+    outer: &'a [&'a [Value]],
 }
 
-/// Map a resolved column/output type back to its `ScalarType` (`None` = the untyped-NULL type) —
-/// the inverse of `resolved_type_of`, used to type a folded scalar-subquery constant (§26).
-fn scalar_type_of(rt: ResolvedType) -> Option<ScalarType> {
-    match rt {
-        ResolvedType::Int(st) => Some(st),
-        ResolvedType::Bool => Some(ScalarType::Bool),
-        ResolvedType::Text => Some(ScalarType::Text),
-        ResolvedType::Decimal => Some(ScalarType::Decimal),
-        ResolvedType::Bytea => Some(ScalarType::Bytea),
-        ResolvedType::Uuid => Some(ScalarType::Uuid),
-        ResolvedType::Timestamp => Some(ScalarType::Timestamp),
-        ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
-        ResolvedType::Null => None,
-    }
-}
-
-/// Build the constant `RExpr` for a folded subquery value (§26). The static type is carried
-/// separately (the node's `ty`), so a NULL value here is just `ConstNull`.
+/// Build the constant `RExpr` for a folded uncorrelated-subquery value (§26). The static type
+/// was settled at resolve, so a NULL value here is just `ConstNull`.
 fn value_to_rexpr(v: &Value) -> RExpr {
     match v {
         Value::Null => RExpr::ConstNull,
@@ -2110,10 +2351,7 @@ fn expr_has_param(e: &Expr) -> bool {
         Expr::Param(_) => true,
         Expr::ScalarSubquery(q) | Expr::Exists(q) => query_has_param(q),
         Expr::InSubquery { lhs, query, .. } => expr_has_param(lhs) || query_has_param(query),
-        Expr::Column(_)
-        | Expr::QualifiedColumn { .. }
-        | Expr::Literal(_)
-        | Expr::FoldedConst { .. } => false,
+        Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::Literal(_) => false,
         Expr::Cast { inner, .. } => expr_has_param(inner),
         Expr::Unary { operand, .. } => expr_has_param(operand),
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
@@ -2146,59 +2384,114 @@ fn query_has_param(q: &QueryExpr) -> bool {
     exprs.iter().any(|e| expr_has_param(e))
 }
 
-/// Collect every column reference `(qualifier, name)` in an expression for the §26 correlation
-/// scan — NOT descending into nested subqueries (a deeper subquery's references are its own
-/// concern, checked when it is folded). The IN-subquery's LHS IS at this level, so it is walked.
-fn collect_colrefs<'a>(e: &'a Expr, out: &mut Vec<(Option<&'a str>, &'a str)>) {
+/// Whether a resolved plan references any scope STRICTLY OUTSIDE itself — i.e. it is correlated
+/// (spec/design/grammar.md §26). `depth` is how many nested-subquery frames we have descended
+/// INTO this plan (0 = the plan's own clauses); an `OuterColumn { level }` points above this
+/// plan iff `level > depth`. The `fold_uncorrelated` pass calls this with `depth = 0` on a
+/// subquery's sub-plan to decide whether to fold it (uncorrelated) or leave it (correlated).
+fn query_plan_references_outer(plan: &QueryPlan, depth: usize) -> bool {
+    match plan {
+        QueryPlan::Select(sp) => select_plan_references_outer(sp, depth),
+        QueryPlan::SetOp(sop) => {
+            query_plan_references_outer(&sop.lhs, depth)
+                || query_plan_references_outer(&sop.rhs, depth)
+        }
+    }
+}
+
+fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> bool {
+    sp.joins
+        .iter()
+        .any(|j| j.on.as_ref().is_some_and(|on| rexpr_references_outer(on, depth)))
+        || sp
+            .filter
+            .as_ref()
+            .is_some_and(|f| rexpr_references_outer(f, depth))
+        || sp
+            .having
+            .as_ref()
+            .is_some_and(|h| rexpr_references_outer(h, depth))
+        || sp.agg_specs.iter().any(|s| {
+            s.operand
+                .as_ref()
+                .is_some_and(|op| rexpr_references_outer(op, depth))
+        })
+        || sp.projections.iter().any(|p| rexpr_references_outer(p, depth))
+}
+
+fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
     match e {
-        Expr::Column(n) => out.push((None, n)),
-        Expr::QualifiedColumn { qualifier, name } => out.push((Some(qualifier), name)),
-        Expr::ScalarSubquery(_) | Expr::Exists(_) => {}
-        Expr::InSubquery { lhs, .. } => collect_colrefs(lhs, out),
-        Expr::Literal(_) | Expr::Param(_) | Expr::FoldedConst { .. } => {}
-        Expr::Cast { inner, .. } => collect_colrefs(inner, out),
-        Expr::Unary { operand, .. } => collect_colrefs(operand, out),
-        Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
-            collect_colrefs(lhs, out);
-            collect_colrefs(rhs, out);
+        RExpr::OuterColumn { level, .. } => *level > depth,
+        // A nested subquery's own clauses are one frame deeper; its IN lhs is at this frame.
+        RExpr::Subquery { plan, lhs, .. } => {
+            lhs.as_ref()
+                .is_some_and(|l| rexpr_references_outer(l, depth))
+                || query_plan_references_outer(plan, depth + 1)
         }
-        Expr::IsNull { operand, .. } => collect_colrefs(operand, out),
-        Expr::In { lhs, list, .. } => {
-            collect_colrefs(lhs, out);
-            for x in list {
-                collect_colrefs(x, out);
-            }
+        RExpr::InValues { lhs, .. } => rexpr_references_outer(lhs, depth),
+        RExpr::Cast { inner, .. } => rexpr_references_outer(inner, depth),
+        RExpr::Neg { operand, .. } => rexpr_references_outer(operand, depth),
+        RExpr::Not(x) => rexpr_references_outer(x, depth),
+        RExpr::Arith { lhs, rhs, .. }
+        | RExpr::Compare { lhs, rhs, .. }
+        | RExpr::Distinct { lhs, rhs, .. }
+        | RExpr::Like { lhs, rhs, .. } => {
+            rexpr_references_outer(lhs, depth) || rexpr_references_outer(rhs, depth)
         }
-        Expr::Between { lhs, lo, hi, .. } => {
-            collect_colrefs(lhs, out);
-            collect_colrefs(lo, out);
-            collect_colrefs(hi, out);
+        RExpr::And(l, r) | RExpr::Or(l, r) => {
+            rexpr_references_outer(l, depth) || rexpr_references_outer(r, depth)
         }
-        Expr::Like { lhs, rhs, .. } => {
-            collect_colrefs(lhs, out);
-            collect_colrefs(rhs, out);
+        RExpr::IsNull { operand, .. } => rexpr_references_outer(operand, depth),
+        RExpr::Case { arms, els, .. } => {
+            arms.iter()
+                .any(|(c, r)| rexpr_references_outer(c, depth) || rexpr_references_outer(r, depth))
+                || rexpr_references_outer(els, depth)
         }
-        Expr::Case {
-            operand,
-            whens,
-            els,
-        } => {
-            if let Some(o) = operand {
-                collect_colrefs(o, out);
-            }
-            for (c, r) in whens {
-                collect_colrefs(c, out);
-                collect_colrefs(r, out);
-            }
-            if let Some(el) = els {
-                collect_colrefs(el, out);
-            }
+        RExpr::ScalarFunc { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
+        RExpr::Column(_)
+        | RExpr::Param(_)
+        | RExpr::ConstInt(_)
+        | RExpr::ConstBool(_)
+        | RExpr::ConstText(_)
+        | RExpr::ConstDecimal(_)
+        | RExpr::ConstBytea(_)
+        | RExpr::ConstUuid(_)
+        | RExpr::ConstTimestamp(_)
+        | RExpr::ConstTimestamptz(_)
+        | RExpr::ConstNull => false,
+    }
+}
+
+/// Three-valued `lhs IN (list)` membership (spec/design/grammar.md §26), charging one
+/// `operator_eval` per element compared. An EMPTY list is `negated` (`x IN ()` = FALSE,
+/// `x NOT IN ()` = TRUE) independent of `lv`. Otherwise: a positive match → TRUE; else a NULL
+/// element (or NULL `lv`) → NULL (unknown); else FALSE. `NOT IN` is the Kleene negation. Shared
+/// by the folded `InValues` node and the correlated `Subquery { In }` eval.
+fn in_membership(lv: &Value, list: &[Value], negated: bool, m: &mut Meter) -> Value {
+    if list.is_empty() {
+        return Value::Bool(negated);
+    }
+    let mut any_match = false;
+    let mut any_null = false;
+    for v in list {
+        m.charge(COSTS.operator_eval);
+        match lv.eq3(v) {
+            ThreeValued::True => any_match = true,
+            ThreeValued::Unknown => any_null = true,
+            ThreeValued::False => {}
         }
-        Expr::FuncCall { args, .. } => {
-            for a in args {
-                collect_colrefs(a, out);
-            }
-        }
+    }
+    let in_val = if any_match {
+        Value::Bool(true)
+    } else if any_null {
+        Value::Null
+    } else {
+        Value::Bool(false)
+    };
+    if negated {
+        not3(&in_val)
+    } else {
+        in_val
     }
 }
 
@@ -2503,13 +2796,15 @@ fn resolve_projections(
 /// `resolve` validated it.
 fn output_name(scope: &Scope, e: &Expr) -> String {
     match e {
+        // A bare/qualified column takes the catalog's canonical name, whether it resolves to a
+        // local relation or (correlated) an enclosing one — `column_of` handles both.
         Expr::Column(name) => match scope.resolve_bare(name) {
-            Ok(idx) => scope.column_at(idx).name.clone(),
+            Ok(r) => scope.column_of(r).name.clone(),
             Err(_) => name.clone(),
         },
         Expr::QualifiedColumn { qualifier, name } => match scope.resolve_qualified(qualifier, name)
         {
-            Ok(idx) => scope.column_at(idx).name.clone(),
+            Ok(r) => scope.column_of(r).name.clone(),
             Err(_) => name.clone(),
         },
         // An un-aliased aggregate call is named by its lowercased function name (PG;
@@ -2667,6 +2962,47 @@ fn resolved_type_of(ty: ScalarType) -> ResolvedType {
 /// defaults a bare literal to int64. A column reference resolves to a flat row index via the
 /// scope — a bare name ambiguous across relations is 42702, an unknown qualifier is 42P01
 /// (spec/design/grammar.md §15).
+/// Turn a chain resolution into a resolved node + type. A `Local` column obeys the grouping
+/// rule (a synthetic-slot reference in an aggregate projection, else 42803). An `Outer`
+/// (correlated) reference is a per-outer-row CONSTANT, so it bypasses the grouping rule and
+/// resolves to an `OuterColumn` reading the enclosing row at eval; its type is the ancestor
+/// column's (spec/design/grammar.md §26).
+fn resolve_column_ref(
+    scope: &Scope,
+    agg: &AggCtx,
+    r: Resolved,
+    name: &str,
+) -> Result<(RExpr, ResolvedType)> {
+    match r {
+        Resolved::Local(idx) => collect_column(scope, agg, idx, name),
+        Resolved::Outer { level, index } => {
+            let ty = resolved_type_of(scope.column_of(r).ty);
+            Ok((RExpr::OuterColumn { level, index }, ty))
+        }
+    }
+}
+
+/// Plan a subquery operand against the scope chain (spec/design/grammar.md §26). Rejects a
+/// non-SELECT context (UPDATE/DELETE/INSERT — `allow_subquery=false`) and any `$N` inside (an
+/// orthogonal parameter-inference narrowing), both 0A000. The inner query is resolved ONCE,
+/// with `scope` as its parent, so correlated references become `OuterColumn` and errors fire
+/// even over an empty outer.
+fn plan_subquery(scope: &Scope, inner: &QueryExpr, params: &mut ParamTypes) -> Result<QueryPlan> {
+    if !scope.allow_subquery {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "subqueries are only supported in a SELECT statement",
+        ));
+    }
+    if query_has_param(inner) {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "bind parameters inside a subquery are not supported yet",
+        ));
+    }
+    scope.catalog.plan_query(inner, Some(scope), params)
+}
+
 fn resolve(
     scope: &Scope,
     e: &Expr,
@@ -2676,15 +3012,15 @@ fn resolve(
 ) -> Result<(RExpr, ResolvedType)> {
     match e {
         Expr::Column(name) => {
-            // Resolve for existence first (42703/42702 take priority, matching PostgreSQL);
-            // then in an aggregate query's projection the column must be a grouping key
-            // (resolved to its synthetic slot) else 42803.
-            let idx = scope.resolve_bare(name)?;
-            collect_column(scope, agg, idx, name)
+            // Resolve against the scope CHAIN (§26). Existence first (42703/42702 take priority,
+            // matching PostgreSQL); a Local match then obeys the grouping rule, an Outer
+            // (correlated) match is a per-outer-row constant exempt from it (see helper).
+            let r = scope.resolve_bare(name)?;
+            resolve_column_ref(scope, agg, r, name)
         }
         Expr::QualifiedColumn { qualifier, name } => {
-            let idx = scope.resolve_qualified(qualifier, name)?;
-            collect_column(scope, agg, idx, name)
+            let r = scope.resolve_qualified(qualifier, name)?;
+            resolve_column_ref(scope, agg, r, name)
         }
         Expr::Param(n1) => {
             // A bind parameter is an adaptable operand (like an integer/string literal): it
@@ -2750,27 +3086,71 @@ fn resolve(
             let d = d.clone().check_cap()?;
             Ok((RExpr::ConstDecimal(d), ResolvedType::Decimal))
         }
-        Expr::FoldedConst { value, ty } => {
-            // A subquery already executed + folded by the pre-pass (grammar.md §26). It resolves to
-            // the matching constant with its EXACT output type (`None` = untyped NULL) — NO context
-            // adaptation, so a folded `bigint` keeps `bigint` (unlike a bare integer literal) and a
-            // typed-NULL from an empty scalar still participates in cross-type checks.
-            let rty = match ty {
-                Some(st) => resolved_type_of(*st),
-                None => ResolvedType::Null,
-            };
-            Ok((value_to_rexpr(value), rty))
+        // A subquery in expression position (spec/design/grammar.md §26): PLANNED ONCE against the
+        // scope chain here, so its column-count / type errors fire even over an empty outer.
+        // `plan_subquery` rejects a non-SELECT context and a `$N` inside (both 0A000). The fold
+        // pass folds an uncorrelated one to a constant; a correlated one (an OuterColumn in its
+        // plan) is re-executed per outer row by the evaluator.
+        Expr::ScalarSubquery(inner) => {
+            let plan = plan_subquery(scope, inner, params)?;
+            if plan.column_types().len() != 1 {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    "subquery must return only one column",
+                ));
+            }
+            let out_type = plan.column_types()[0];
+            Ok((
+                RExpr::Subquery {
+                    plan: Box::new(plan),
+                    kind: SubqueryKind::Scalar,
+                    lhs: None,
+                    negated: false,
+                },
+                out_type,
+            ))
         }
-        // A subquery in expression position is folded by `run_select`'s pre-pass before resolution
-        // (grammar.md §26), so resolve never sees one inside a SELECT. Reaching here means a
-        // subquery in a non-SELECT context (an UPDATE SET / INSERT VALUES / DELETE WHERE
-        // expression, which run no fold pre-pass) — supported only in SELECT this slice (0A000).
-        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => Err(
-            EngineError::new(
-                SqlState::FeatureNotSupported,
-                "subqueries are only supported in a SELECT statement",
-            ),
-        ),
+        Expr::Exists(inner) => {
+            // EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT
+            // EXISTS parses as the unary `NOT` wrapping this, so `negated` here is always false.
+            let plan = plan_subquery(scope, inner, params)?;
+            Ok((
+                RExpr::Subquery {
+                    plan: Box::new(plan),
+                    kind: SubqueryKind::Exists,
+                    lhs: None,
+                    negated: false,
+                },
+                ResolvedType::Bool,
+            ))
+        }
+        Expr::InSubquery {
+            lhs,
+            query,
+            negated,
+        } => {
+            // The LHS is an OUTER expression (resolved in the current scope / agg context); the
+            // subquery yields the single membership column. The test is `lhs = element`, so the
+            // pair must be comparable (42804), exactly like a literal IN.
+            let (rlhs, lt) = resolve(scope, lhs, None, agg, params)?;
+            let plan = plan_subquery(scope, query, params)?;
+            if plan.column_types().len() != 1 {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    "subquery has too many columns",
+                ));
+            }
+            classify_comparable(lt, plan.column_types()[0])?;
+            Ok((
+                RExpr::Subquery {
+                    plan: Box::new(plan),
+                    kind: SubqueryKind::In,
+                    lhs: Some(Box::new(rlhs)),
+                    negated: *negated,
+                },
+                ResolvedType::Bool,
+            ))
+        }
         Expr::Cast {
             inner,
             type_name,
@@ -3899,14 +4279,17 @@ impl RExpr {
     /// its operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both
     /// operands are always evaluated — there is no short-circuit, so the count never
     /// depends on operand values (spec/design/cost.md §3).
-    fn eval(&self, row: &[Value], params: &[Value], m: &mut Meter) -> Result<Value> {
+    fn eval(&self, row: &[Value], env: &EvalEnv, m: &mut Meter) -> Result<Value> {
         match self {
             // The value is read out of a borrowed stored row, so it is cloned (Value is
             // Clone, not Copy, now that a text value owns a String).
             RExpr::Column(i) => Ok(row[*i].clone()),
+            // A correlated reference: the column `index` of the enclosing row `level` hops out
+            // (1 = immediate parent). A leaf — reads from the outer-row environment (§26).
+            RExpr::OuterColumn { level, index } => Ok(env.outer[env.outer.len() - level][*index].clone()),
             // A bind parameter — the supplied value, already coerced to its inferred type by
             // `bind_params` before execution (spec/design/api.md §5).
-            RExpr::Param(i) => Ok(params[*i].clone()),
+            RExpr::Param(i) => Ok(env.params[*i].clone()),
             RExpr::ConstInt(n) => Ok(Value::Int(*n)),
             RExpr::ConstBool(b) => Ok(Value::Bool(*b)),
             RExpr::ConstText(s) => Ok(Value::Text(s.clone())),
@@ -3922,7 +4305,7 @@ impl RExpr {
                 typmod,
             } => {
                 m.charge(COSTS.operator_eval);
-                match inner.eval(row, params, m)? {
+                match inner.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
                     Value::Int(n) => {
                         if target.is_decimal() {
@@ -3963,7 +4346,7 @@ impl RExpr {
             }
             RExpr::Neg { operand, result } => {
                 m.charge(COSTS.operator_eval);
-                match operand.eval(row, params, m)? {
+                match operand.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
                     Value::Int(n) if result.is_decimal() => {
                         Ok(Value::Decimal(Decimal::from_i64(n).neg()))
@@ -3989,7 +4372,7 @@ impl RExpr {
             }
             RExpr::Not(e) => {
                 m.charge(COSTS.operator_eval);
-                let v = e.eval(row, params, m)?;
+                let v = e.eval(row, env, m)?;
                 Ok(not3(&v))
             }
             RExpr::Arith {
@@ -3999,8 +4382,8 @@ impl RExpr {
                 result,
             } => {
                 m.charge(COSTS.operator_eval);
-                let a = lhs.eval(row, params, m)?;
-                let b = rhs.eval(row, params, m)?;
+                let a = lhs.eval(row, env, m)?;
+                let b = rhs.eval(row, env, m)?;
                 if matches!(a, Value::Null) || matches!(b, Value::Null) {
                     return Ok(Value::Null);
                 }
@@ -4017,8 +4400,8 @@ impl RExpr {
             }
             RExpr::Compare { op, lhs, rhs } => {
                 m.charge(COSTS.operator_eval);
-                let a = lhs.eval(row, params, m)?;
-                let b = rhs.eval(row, params, m)?;
+                let a = lhs.eval(row, env, m)?;
+                let b = rhs.eval(row, env, m)?;
                 let tv = match op {
                     CmpOp::Eq => a.eq3(&b),
                     CmpOp::Lt => a.lt3(&b),
@@ -4030,26 +4413,26 @@ impl RExpr {
             }
             RExpr::And(l, r) => {
                 m.charge(COSTS.operator_eval);
-                let lv = l.eval(row, params, m)?;
-                let rv = r.eval(row, params, m)?;
+                let lv = l.eval(row, env, m)?;
+                let rv = r.eval(row, env, m)?;
                 Ok(and3(&lv, &rv))
             }
             RExpr::Or(l, r) => {
                 m.charge(COSTS.operator_eval);
-                let lv = l.eval(row, params, m)?;
-                let rv = r.eval(row, params, m)?;
+                let lv = l.eval(row, env, m)?;
+                let rv = r.eval(row, env, m)?;
                 Ok(or3(&lv, &rv))
             }
             RExpr::IsNull { operand, negated } => {
                 m.charge(COSTS.operator_eval);
-                let is_null = matches!(operand.eval(row, params, m)?, Value::Null);
+                let is_null = matches!(operand.eval(row, env, m)?, Value::Null);
                 // IS [NOT] NULL is always a definite boolean, never unknown (CLAUDE.md §4).
                 Ok(Value::Bool(is_null != *negated))
             }
             RExpr::Distinct { lhs, rhs, negated } => {
                 m.charge(COSTS.operator_eval);
-                let lv = lhs.eval(row, params, m)?;
-                let rv = rhs.eval(row, params, m)?;
+                let lv = lhs.eval(row, env, m)?;
+                let rv = rhs.eval(row, env, m)?;
                 let same = lv.not_distinct_from(&rv);
                 // `negated` carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks
                 // "are they the same?" → `same`; IS DISTINCT FROM asks the opposite. Either
@@ -4059,8 +4442,8 @@ impl RExpr {
             }
             RExpr::Like { lhs, rhs, negated } => {
                 m.charge(COSTS.operator_eval);
-                let subject = lhs.eval(row, params, m)?;
-                let pattern = rhs.eval(row, params, m)?;
+                let subject = lhs.eval(row, env, m)?;
+                let pattern = rhs.eval(row, env, m)?;
                 // NULL propagates BEFORE the matcher runs, so a malformed pattern against a
                 // NULL operand is still NULL, never 22025 (matches PG — grammar.md §22).
                 if matches!(subject, Value::Null) || matches!(pattern, Value::Null) {
@@ -4087,18 +4470,18 @@ impl RExpr {
                 // then only the conditions up to the match plus the selected result accrue.
                 m.charge(COSTS.operator_eval);
                 for (cond, result) in arms {
-                    if cond.eval(row, params, m)?.is_true() {
-                        return Ok(coerce_case(result.eval(row, params, m)?, *coerce_decimal));
+                    if cond.eval(row, env, m)?.is_true() {
+                        return Ok(coerce_case(result.eval(row, env, m)?, *coerce_decimal));
                     }
                 }
-                Ok(coerce_case(els.eval(row, params, m)?, *coerce_decimal))
+                Ok(coerce_case(els.eval(row, env, m)?, *coerce_decimal))
             }
             RExpr::ScalarFunc { func, args, result } => {
                 // One operator_eval per call (the uniform weight); arguments charge their own.
                 m.charge(COSTS.operator_eval);
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
-                    let v = a.eval(row, params, m)?;
+                    let v = a.eval(row, env, m)?;
                     if matches!(v, Value::Null) {
                         return Ok(Value::Null); // NULL propagates
                     }
@@ -4135,6 +4518,56 @@ impl RExpr {
                         Ok(Value::Decimal(d.round_places(places)))
                     }
                 }
+            }
+            // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
+            // Push the current row onto the outer-row stack, run the inner plan against it, fold
+            // its accrued cost into this meter, plus one operator_eval for the node. (Uncorrelated
+            // subqueries were folded to a constant / `InValues` before exec, so this is correlated.)
+            RExpr::Subquery {
+                plan,
+                kind,
+                lhs,
+                negated,
+            } => {
+                m.charge(COSTS.operator_eval);
+                let mut child: Vec<&[Value]> = env.outer.to_vec();
+                child.push(row);
+                let r = env.exec.exec_query_plan(plan, &child, env.params)?;
+                m.charge(r.cost);
+                match kind {
+                    SubqueryKind::Scalar => {
+                        if r.rows.len() > 1 {
+                            return Err(EngineError::new(
+                                SqlState::CardinalityViolation,
+                                "more than one row returned by a subquery used as an expression",
+                            ));
+                        }
+                        // 0 rows -> NULL (the static type was settled at resolve via the column
+                        // type, so a cross-family comparison already errored at plan time).
+                        Ok(r.rows
+                            .into_iter()
+                            .next()
+                            .map(|mut row| row.swap_remove(0))
+                            .unwrap_or(Value::Null))
+                    }
+                    // EXISTS ignores the select list entirely and is never NULL.
+                    SubqueryKind::Exists => Ok(Value::Bool(!r.rows.is_empty() != *negated)),
+                    SubqueryKind::In => {
+                        let lv = lhs
+                            .as_ref()
+                            .expect("an IN subquery carries its resolved lhs")
+                            .eval(row, env, m)?;
+                        let list: Vec<Value> =
+                            r.rows.into_iter().map(|mut row| row.swap_remove(0)).collect();
+                        Ok(in_membership(&lv, &list, *negated, m))
+                    }
+                }
+            }
+            // A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.
+            RExpr::InValues { lhs, list, negated } => {
+                m.charge(COSTS.operator_eval);
+                let lv = lhs.eval(row, env, m)?;
+                Ok(in_membership(&lv, list, *negated, m))
             }
         }
     }
