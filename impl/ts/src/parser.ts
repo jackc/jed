@@ -879,26 +879,31 @@ class Parser {
     throw engineError("syntax_error", "expected an expression");
   }
 
-  // parseFunctionCall parses `function_call ::= identifier "(" ( "*" | expr ) ")"` — the
-  // aggregate call syntax (grammar.md §17). COUNT(*) is the star form; every other call takes
-  // one general expression argument. DISTINCT inside the parens is deferred (rejected 42601).
+  // parseFunctionCall parses `function_call ::= identifier "(" ( "*" | expr ("," expr)* ) ")"` —
+  // the shared aggregate/scalar call syntax (grammar.md §17). COUNT(*) is the star form; every
+  // other call takes a comma-separated argument list (resolution checks the per-function arity).
+  // DISTINCT inside the parens is deferred (rejected 42601).
   private parseFunctionCall(): Expr {
     const name = this.expectIdentifier();
     this.expect("lparen");
-    // DISTINCT inside an aggregate (COUNT(DISTINCT x)) is deferred — reject at parse.
+    // DISTINCT inside a function call (COUNT(DISTINCT x)) is deferred — reject at parse.
     if (this.peekKeyword() === "distinct") {
       throw engineError("syntax_error", "DISTINCT inside an aggregate is not supported yet");
     }
-    let arg: Expr | null = null;
+    const args: Expr[] = [];
     let star = false;
     if (this.peek().kind === "star") {
       this.advance();
       star = true;
     } else {
-      arg = this.parseExpr();
+      args.push(this.parseExpr());
+      while (this.peek().kind === "comma") {
+        this.advance();
+        args.push(this.parseExpr());
+      }
     }
     this.expect("rparen");
-    return { kind: "funcCall", name, arg, star };
+    return { kind: "funcCall", name, args, star };
   }
 
   // --- cursor helpers ---

@@ -89,13 +89,14 @@ export type Expr =
   // when `operand = cond`. `whens` has ≥1 entry; `els` is the ELSE result, or null for an implicit
   // `ELSE NULL`. Lazily evaluated: the first TRUE branch wins; result-arm types unify.
   | { kind: "case"; operand: Expr | null; whens: { cond: Expr; result: Expr }[]; els: Expr | null }
-  // An aggregate function call — the engine's first function-call syntax (grammar.md §17).
-  // `name` is the spelling as written (resolved case-insensitively against the aggregate
-  // catalog; an unknown name is 42883). `star` is the COUNT(*) row-count form (then `arg` is
-  // null); otherwise `arg` is the single argument expression. DISTINCT inside the parens is
-  // rejected at parse (42601). Only aggregates resolve this slice; an aggregate in WHERE/ON
-  // or nested in another aggregate is 42803 (spec/design/aggregates.md).
-  | { kind: "funcCall"; name: string; arg: Expr | null; star: boolean };
+  // A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is the
+  // spelling as written, resolved case-insensitively: an aggregate (COUNT/SUM/MIN/MAX/AVG), a
+  // scalar function (abs/round, kind = "function", spec/design/functions.md §9), or 42883. `star`
+  // is the COUNT(*) row-count form (then `args` is empty); otherwise `args` is the comma-separated
+  // argument list — aggregates and abs take one, round one or two. DISTINCT inside the parens is
+  // rejected at parse (42601). An aggregate in WHERE/ON or nested in another aggregate is 42803
+  // (spec/design/aggregates.md); a scalar function is legal anywhere an expression is.
+  | { kind: "funcCall"; name: string; args: Expr[]; star: boolean };
 
 // SelectItem is one select-list expression with its optional output-name alias
 // (expr AS name). The alias is an output label only — it never enters resolution

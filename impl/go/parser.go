@@ -1238,9 +1238,10 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	}
 }
 
-// parseFunctionCall parses `function_call ::= identifier "(" ( "*" | expr ) ")"` — the
-// aggregate call syntax (grammar.md §17). COUNT(*) is the star form; every other call takes
-// one general expression argument. DISTINCT inside the parens is deferred (rejected 42601).
+// parseFunctionCall parses `function_call ::= identifier "(" ( "*" | expr ("," expr)* ) ")"` —
+// the shared aggregate/scalar call syntax (grammar.md §17). COUNT(*) is the star form; every
+// other call takes a comma-separated argument list (resolution checks the per-function arity).
+// DISTINCT inside the parens is deferred (rejected 42601).
 func (p *Parser) parseFunctionCall() (Expr, error) {
 	name, err := p.expectIdentifier()
 	if err != nil {
@@ -1249,7 +1250,7 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 	if err := p.expect(TokLParen); err != nil {
 		return Expr{}, err
 	}
-	// DISTINCT inside an aggregate (COUNT(DISTINCT x)) is deferred — reject at parse.
+	// DISTINCT inside a function call (COUNT(DISTINCT x)) is deferred — reject at parse.
 	if p.peekKeyword() == "distinct" {
 		return Expr{}, NewError(SyntaxError, "DISTINCT inside an aggregate is not supported yet")
 	}
@@ -1258,11 +1259,17 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 		p.advance()
 		fc.Star = true
 	} else {
-		arg, err := p.parseExpr()
-		if err != nil {
-			return Expr{}, err
+		for {
+			arg, err := p.parseExpr()
+			if err != nil {
+				return Expr{}, err
+			}
+			fc.Args = append(fc.Args, &arg)
+			if p.peek().Kind != TokComma {
+				break
+			}
+			p.advance()
 		}
-		fc.Arg = &arg
 	}
 	if err := p.expect(TokRParen); err != nil {
 		return Expr{}, err

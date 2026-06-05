@@ -242,6 +242,39 @@ func (d Decimal) RoundToScale(target uint32) Decimal {
 	return newDecimal(d.Neg, target, q)
 }
 
+// Abs is the magnitude, preserving scale — the abs(numeric) scalar function
+// (spec/design/functions.md §9). Cannot overflow.
+func (d Decimal) Abs() Decimal {
+	return newDecimal(false, d.Scale, append([]uint32(nil), d.Limbs...))
+}
+
+// RoundPlaces is PG round(numeric, n) (spec/design/functions.md §9): round half away from zero
+// to n fractional places. n >= 0 rounds to scale n (delegating to RoundToScale, capped at
+// MaxScale); n < 0 rounds to the LEFT of the point — result scale 0, value a multiple of 10^-n
+// (round(150, -2) = 200). RoundPlaces(0) is round(x).
+func (d Decimal) RoundPlaces(n int64) Decimal {
+	if n >= 0 {
+		target := uint32(n)
+		if n > int64(MaxScale) {
+			target = MaxScale
+		}
+		return d.RoundToScale(target)
+	}
+	// Drop d.Scale + k digits of the magnitude (rounding half away), then re-append the k
+	// integer zeros. k is capped at the digit count + 1: beyond that every value rounds to 0
+	// (or a single carried 1), so the clamp changes no result but bounds the work.
+	k := uint32(-n)
+	if cap := d.Precision() + 1; k > cap {
+		k = cap
+	}
+	pow := magPow10(d.Scale + k)
+	q, r := magDivMod(d.Limbs, pow)
+	if magCmp(magAdd(r, r), pow) >= 0 {
+		q = magAdd(q, []uint32{1})
+	}
+	return newDecimal(d.Neg, 0, magMulPow10(q, k))
+}
+
 // CoerceToTypmod coerces into numeric(precision, scale): round to scale (half away), then trap
 // 22003 if the integer-part digits exceed precision-scale (spec/design/decimal.md §2).
 func (d Decimal) CoerceToTypmod(precision, scale uint32) (Decimal, error) {

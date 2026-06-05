@@ -193,6 +193,31 @@ export class Decimal {
     return Decimal.fromParts(this.neg, target, quo);
   }
 
+  // abs is the magnitude, preserving scale — the abs(numeric) scalar function
+  // (spec/design/functions.md §9). Cannot overflow.
+  abs(): Decimal {
+    return Decimal.fromParts(false, this.scale, this.limbs.slice());
+  }
+
+  // roundPlaces is PG round(numeric, n) (spec/design/functions.md §9): round half away from zero
+  // to n fractional places. n >= 0 rounds to scale n (delegating to roundToScale, capped at
+  // MAX_SCALE); n < 0 rounds to the LEFT of the point — result scale 0, value a multiple of
+  // 10^-n (round(150, -2) = 200). roundPlaces(0) is round(x).
+  roundPlaces(n: number): Decimal {
+    if (n >= 0) {
+      return this.roundToScale(Math.min(n, MAX_SCALE));
+    }
+    // Drop this.scale + k digits of the magnitude (rounding half away), then re-append the k
+    // integer zeros. k is capped at the digit count + 1: beyond that every value rounds to 0
+    // (or a single carried 1), so the clamp changes no result but bounds the work.
+    const k = Math.min(-n, this.precision() + 1);
+    const pow = magPow10(this.scale + k);
+    const [q, r] = magDivMod(this.limbs, pow);
+    let quo = q;
+    if (magCmp(magAdd(r, r), pow) >= 0) quo = magAdd(quo, [1]);
+    return Decimal.fromParts(this.neg, 0, magMulPow10(quo, k));
+  }
+
   // coerceToTypmod coerces into numeric(precision, scale): round to scale (half away), then
   // trap 22003 if the integer-part digits exceed precision-scale (spec/design/decimal.md §2).
   coerceToTypmod(precision: number, scale: number): Decimal {

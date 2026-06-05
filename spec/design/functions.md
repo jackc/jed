@@ -26,6 +26,7 @@ The catalog now lists:
 | `comparison` (NULL-safe) | `IS DISTINCT FROM`, `IS NOT DISTINCT FROM` | `boolean` |
 | `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` |
 | `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` |
+| `function` (scalar) | `abs` `round` | `promoted` / `decimal` (§9) |
 | `aggregate` | `COUNT` `SUM` `MIN` `MAX` `AVG` | `int64` / `decimal` / widened (§8) |
 
 The **aggregates** are not operators — they collapse a set of rows into one value, have no
@@ -193,10 +194,10 @@ One field is designed but **deliberately not authored yet**, so its absence is i
 Reserved values and kinds still to be authored spec-first with their own executor slices
 ([../../TODO.md](../../TODO.md)):
 
-- named **scalar** `function` entries (the `function` kind) — `length`, `lower`, and the
-  like. These take a scalar argument and return a scalar, fitting the operator
-  `result`/`null` mold, so when they land they reuse the operator fields. The `function`
-  kind stays reserved for them.
+- The `function` kind is now **partly authored**: the first scalar functions, `abs` and
+  `round`, landed as `[[operator]]` rows with `kind = "function"` (§9). Further scalar
+  functions — `ceil`, `floor`, `mod`, `sign`, the text `length`/`lower`/`upper`, and the
+  like — are follow-on slices that reuse the same mold.
 
 **Aggregates are authored (`kind = "aggregate"`).** `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` landed
 in a **separate `[[aggregate]]` array**, not as `[[operator]]` rows, because they do not fit
@@ -218,3 +219,58 @@ The `null_safe` discipline is now **authored**: `IS [NOT] DISTINCT FROM` (`kind 
 home (§3). Like the null tests it is a keyword operator with no punctuation `symbol`, so
 the catalog checker exempts a `null_safe` comparison from the "comparison must carry a
 symbol" rule ([../functions/verify.rb](../functions/verify.rb)).
+
+## 9. Scalar functions (`abs`, `round`)
+
+Scalar functions are named `f(args)` calls evaluated **per row** — the first being `abs`
+and `round`. As §8 reserved, they **reuse the operator mold**: they are `[[operator]]` rows
+with `kind = "function"`, sharing the operator field set (`name`, `arity`, `arg_families`,
+`arg_resolution`, `result`, `null`, `errors`) and the same overload model — one row per
+`(name, arg_families)` signature. Two operator fields are simply **absent**: a function has
+no infix `symbol` and no `precedence` (it is called by name, not parsed in the precedence
+tower). The coherence checker already accepts this — `function` is in `KNOWN_KINDS`, and the
+symbol/precedence requirements are not imposed on it — and the codegen emits the rows into
+the generated `OPERATORS` table unchanged (no `gen_catalog.rb`/`verify.rb` change).
+
+**Not operators, not aggregates — a third shape.** A scalar function differs from an
+operator only syntactically (call form vs. infix), but differs from an **aggregate**
+*semantically*: an aggregate folds a *set* of rows into one value and is legal only in a
+projection/`HAVING` over a group (§8, [aggregates.md](aggregates.md)); a scalar function
+maps its argument values to one value **per row** and is therefore legal **anywhere an
+expression is** — projection, `WHERE`, `JOIN ON`. The shared `function_call` grammar
+([grammar.md](grammar.md) §17) is disambiguated at resolve time: an aggregate name collects
+into the aggregate context; a scalar-function name resolves to an ordinary per-row
+expression node in the current context; any other name is `42883` (`undefined_function`).
+A scalar function may still *contain* an aggregate (`abs(sum(x))`) — its argument resolves
+in the same context the call sits in, so `sum` inside it is collected in a projection and
+rejected `42803` in a `WHERE`.
+
+**`arg_resolution = "none"`.** Unlike a binary arithmetic/comparison operator, a scalar
+function does **not** reconcile its arguments to one common type: `round(numeric, integer)`
+keeps a decimal value and an integer count side by side. Each argument is matched to its
+declared family directly; there is no promotion *between* arguments. (A general implicit
+*argument* coercion — e.g. silently widening an `int` argument to `decimal` — is deliberately
+**not** built; PG's `round(5)` convenience is provided by explicit integer overloads
+instead, below, keeping the type system honest, CLAUDE.md §4.)
+
+**`abs`** carries `result = "promoted"` — for a one-argument function the promoted operand
+type is just the operand's own type, so `abs(int16) → int16`, `abs(int64) → int64`,
+`abs(numeric) → numeric` (exactly as unary `neg`, §7). Over the integer family the magnitude
+is **range-checked at the result type's boundary**: `abs(int16 -32768)` has no positive
+`int16` and traps `22003` — the same overflow discipline as `-(int16 -32768)` — so `abs`
+carries `errors = ["22003"]`. Over `decimal` it clears the sign and cannot overflow
+(`errors = []`).
+
+**`round`** carries `result = "decimal"` and rounds **half away from zero** — the one
+engine-wide decimal rounding mode ([decimal.md](decimal.md) §3) — reusing the existing
+decimal scale-coercion routine. `round(numeric)` rounds to **scale 0**; `round(numeric, n)`
+rounds to **`n` fractional places** (PG parity includes a negative `n`, rounding to the left
+of the point: `round(150, -2) → 200`). Two **integer overloads**, `round(integer)` and
+`round(integer, integer)`, return `numeric` so that PostgreSQL's `round(5) → 5` works
+without an implicit coercion pass — they are authored as concrete catalog rows. All of
+`round`'s forms `propagate` NULL (any NULL argument → NULL), as does `abs`.
+
+**Cost.** A scalar-function call charges one `operator_eval` ([cost.md](cost.md)) — the same
+uniform per-evaluation weight every operator charges — with its arguments charging their own
+costs recursively. The cost is deterministic and cross-core-identical (CLAUDE.md §13), and
+is asserted in the conformance corpus alongside the rows.

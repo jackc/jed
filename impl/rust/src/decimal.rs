@@ -248,6 +248,34 @@ impl Decimal {
         Decimal::from_parts(self.neg, target, q)
     }
 
+    /// The magnitude (`abs`), preserving scale — the `abs(numeric)` scalar function
+    /// (spec/design/functions.md §9). Cannot overflow.
+    pub fn abs(&self) -> Decimal {
+        Decimal::from_parts(false, self.scale, self.limbs.clone())
+    }
+
+    /// PG `round(numeric, n)` (spec/design/functions.md §9): round half away from zero to `n`
+    /// fractional places. `n >= 0` rounds to scale `n` (delegating to `round_to_scale`, capped
+    /// at `MAX_SCALE`); `n < 0` rounds to the LEFT of the point — result scale 0, value a
+    /// multiple of `10^-n` (`round(150, -2) = 200`). `round(x)` is `round_places(0)`.
+    pub fn round_places(&self, n: i64) -> Decimal {
+        if n >= 0 {
+            return self.round_to_scale((n as u32).min(MAX_SCALE));
+        }
+        // Drop `self.scale + k` digits of the magnitude (rounding half away), then re-append
+        // the k integer zeros. `k` is capped at the digit count + 1: beyond that every value
+        // rounds to 0 (or a single carried `1`), so the clamp changes no result but bounds work.
+        let k = ((-n) as u32).min(self.precision() + 1);
+        let drop = self.scale + k;
+        let pow = mag_pow10(drop);
+        let (mut q, r) = mag_divmod(&self.limbs, &pow);
+        if mag_cmp(&mag_add(&r, &r), &pow) != std::cmp::Ordering::Less {
+            q = mag_add(&q, &[1]);
+        }
+        let scaled = mag_mul_pow10(&q, k);
+        Decimal::from_parts(self.neg, 0, scaled)
+    }
+
     /// Coerce into `numeric(precision, scale)`: round to `scale` (half away), then trap 22003
     /// if the integer-part digits exceed `precision - scale` (spec/design/decimal.md §2).
     pub fn coerce_to_typmod(&self, precision: u32, scale: u32) -> Result<Decimal> {

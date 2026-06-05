@@ -328,21 +328,25 @@ parameter      ::= "$" digit+
  * positionally. */
 case_expr      ::= "CASE" expr? ( "WHEN" expr "THEN" expr )+ ( "ELSE" expr )? "END"
 
-/* The engine's FIRST function-call syntax. This slice introduces ONLY the AGGREGATE
- * functions (../functions/catalog.toml, kind = "aggregate") — COUNT/SUM/MIN/MAX/AVG; an
- * unknown function name is 42883 (undefined_function). The argument is either the "*"
- * glob (accepted ONLY by COUNT — COUNT(*) counts rows; "*" to any other aggregate is a
- * resolve error) or a single general expression. DISTINCT inside the parens
- * (COUNT(DISTINCT x)) is DEFERRED and rejected (42601). An aggregate is not allowed in
- * WHERE / a JOIN ON / a GROUP BY key, nor nested in another aggregate (42803) — see
- * ../design/aggregates.md.
- *   Function names are NOT reserved (§3): a column may be named "count", disambiguated by
- * a ONE-token lookahead — a bare identifier IMMEDIATELY followed by "(" is a call,
- * otherwise it is a column_ref. So "SELECT count FROM t" selects a column named count and
- * "SELECT count(*) FROM t" is the aggregate. The "*" here (the COUNT(*) row-count form) is
- * distinct from the SELECT-list "*" glob. This lookahead is a CLAUDE.md §8 determinism
- * surface — byte-identical across the three hand-written parsers (../design/grammar.md §17). */
-function_call  ::= identifier "(" ( "*" | expr ) ")"
+/* The shared function-call syntax. A name resolves to an AGGREGATE function
+ * (../functions/catalog.toml, kind = "aggregate" — COUNT/SUM/MIN/MAX/AVG) or a SCALAR
+ * function (kind = "function" — abs/round, ../design/functions.md §9); any other name is
+ * 42883 (undefined_function). The argument is either the "*" glob (accepted ONLY by
+ * COUNT — COUNT(*) counts rows; "*" to any other function is a resolve error) or a
+ * COMMA-SEPARATED list of general expressions: aggregates take exactly one (a second
+ * argument is no such aggregate, 42883), abs takes one, round takes one or two. DISTINCT
+ * inside the parens (COUNT(DISTINCT x)) is DEFERRED and rejected (42601). An AGGREGATE is
+ * not allowed in WHERE / a JOIN ON / a GROUP BY key, nor nested in another aggregate
+ * (42803); a SCALAR function is legal anywhere an expression is — see ../design/functions.md
+ * §9 and ../design/aggregates.md.
+ *   Function names are NOT reserved (§3): a column may be named "count" or "abs",
+ * disambiguated by a ONE-token lookahead — a bare identifier IMMEDIATELY followed by "(" is
+ * a call, otherwise it is a column_ref. So "SELECT count FROM t" selects a column named
+ * count and "SELECT count(*) FROM t" is the aggregate. The "*" here (the COUNT(*) row-count
+ * form) is distinct from the SELECT-list "*" glob. This lookahead is a CLAUDE.md §8
+ * determinism surface — byte-identical across the three hand-written parsers
+ * (../design/grammar.md §17). */
+function_call  ::= identifier "(" ( "*" | expr ( "," expr )* ) ")"
 
 /* A column reference is a bare column ("col") or a qualified column ("rel.col") where
  * `rel` is a relation's LABEL in the FROM clause (its alias, else its table name). A bare

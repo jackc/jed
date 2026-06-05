@@ -931,7 +931,11 @@ type RExpr =
   | { kind: "isNull"; operand: RExpr; negated: boolean }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
   | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean }
-  | { kind: "case"; arms: { cond: RExpr; result: RExpr }[]; els: RExpr; coerceDecimal: boolean };
+  | { kind: "case"; arms: { cond: RExpr; result: RExpr }[]; els: RExpr; coerceDecimal: boolean }
+  // A scalar-function call (abs/round, spec/design/functions.md §9), evaluated per row in any
+  // context. `result` is the static result type — for abs over an integer it is the operand's
+  // integer type, so the magnitude is range-checked at that boundary; otherwise decimal.
+  | { kind: "scalarFunc"; func: "abs" | "round"; args: RExpr[]; result: ScalarType };
 
 // ============================================================================
 // Aggregate resolution + accumulation (spec/design/aggregates.md).
@@ -1047,34 +1051,50 @@ function finalizeAcc(a: Acc): Value {
 // itemsHaveAggregate reports whether any select item contains an aggregate call.
 function itemsHaveAggregate(items: SelectItems): boolean {
   if (items.kind === "all") return false;
-  return items.items.some((it) => exprHasFuncCall(it.expr));
+  return items.items.some((it) => exprHasAggregate(it.expr));
 }
 
-// exprHasFuncCall reports whether an expression tree contains a function (aggregate) call.
-function exprHasFuncCall(e: Expr): boolean {
+// isAggregateName reports whether name (case-insensitive) is one of the five aggregates.
+function isAggregateName(name: string): boolean {
+  switch (name.toLowerCase()) {
+    case "count":
+    case "sum":
+    case "min":
+    case "max":
+    case "avg":
+      return true;
+    default:
+      return false;
+  }
+}
+
+// exprHasAggregate reports whether an expression tree contains an AGGREGATE call anywhere. A
+// scalar-function call is not itself an aggregate but may CONTAIN one (abs(sum(x))), so its
+// arguments are walked.
+function exprHasAggregate(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall":
-      return true;
+      return isAggregateName(e.name) || e.args.some(exprHasAggregate);
     case "cast":
-      return exprHasFuncCall(e.inner);
+      return exprHasAggregate(e.inner);
     case "unary":
-      return exprHasFuncCall(e.operand);
+      return exprHasAggregate(e.operand);
     case "isNull":
-      return exprHasFuncCall(e.operand);
+      return exprHasAggregate(e.operand);
     case "binary":
     case "isDistinct":
-      return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.rhs);
+      return exprHasAggregate(e.lhs) || exprHasAggregate(e.rhs);
     case "in":
-      return exprHasFuncCall(e.lhs) || e.list.some(exprHasFuncCall);
+      return exprHasAggregate(e.lhs) || e.list.some(exprHasAggregate);
     case "between":
-      return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.lo) || exprHasFuncCall(e.hi);
+      return exprHasAggregate(e.lhs) || exprHasAggregate(e.lo) || exprHasAggregate(e.hi);
     case "like":
-      return exprHasFuncCall(e.lhs) || exprHasFuncCall(e.rhs);
+      return exprHasAggregate(e.lhs) || exprHasAggregate(e.rhs);
     case "case":
       return (
-        (e.operand !== null && exprHasFuncCall(e.operand)) ||
-        e.whens.some((w) => exprHasFuncCall(w.cond) || exprHasFuncCall(w.result)) ||
-        (e.els !== null && exprHasFuncCall(e.els))
+        (e.operand !== null && exprHasAggregate(e.operand)) ||
+        e.whens.some((w) => exprHasAggregate(w.cond) || exprHasAggregate(w.result)) ||
+        (e.els !== null && exprHasAggregate(e.els))
       );
     default:
       return false;
@@ -1087,7 +1107,7 @@ function exprHasFuncCall(e: Expr): boolean {
 // resolve against the real row). The result type follows the PG widening (aggregates.md §3).
 function resolveAggregate(
   scope: Scope,
-  e: { name: string; arg: Expr | null; star: boolean },
+  e: { name: string; args: Expr[]; star: boolean },
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
@@ -1099,9 +1119,13 @@ function resolveAggregate(
   let plan: AggPlan;
   let operand: RExpr | null;
   let result: ResolvedType;
+  // Each aggregate takes exactly one argument; a different count matches no aggregate overload
+  // and is 42883 (PG).
   const arg = (): Expr => {
-    if (e.arg === null) throw engineError("syntax_error", "aggregate requires an argument");
-    return e.arg;
+    if (e.args.length !== 1) {
+      throw engineError("undefined_function", "no aggregate function matches the given argument count");
+    }
+    return e.args[0];
   };
   if (name === "count") {
     if (e.star) {
@@ -1165,6 +1189,73 @@ function collectColumn(scope: Scope, ag: AggCtx, idx: number, name: string): { n
 // noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
 function noAggOverload(fn: string): EngineError {
   return engineError("undefined_function", "no " + fn + " aggregate for that argument type");
+}
+
+// noFuncOverload is 42883 — a scalar function over argument types it has no overload for.
+function noFuncOverload(fn: string): EngineError {
+  return engineError("undefined_function", "no " + fn + " function for those argument types");
+}
+
+// resolveFuncCall resolves a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar
+// function (abs/round, spec/design/functions.md §9), or 42883 for any other name. Aggregates and
+// scalar functions share the call syntax (grammar.md §17); they are distinguished here.
+function resolveFuncCall(
+  scope: Scope,
+  e: { name: string; args: Expr[]; star: boolean },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  switch (e.name.toLowerCase()) {
+    case "count":
+    case "sum":
+    case "min":
+    case "max":
+    case "avg":
+      return resolveAggregate(scope, e, ag, params);
+    case "abs":
+    case "round":
+      return resolveScalarFunc(scope, e, ag, params);
+    default:
+      throw engineError("undefined_function", "function does not exist: " + e.name);
+  }
+}
+
+// resolveScalarFunc resolves a scalar-function call (abs/round) into a per-row scalarFunc node.
+// Unlike an aggregate it is legal in any context, so its arguments resolve in the SAME ag
+// context (a nested aggregate is still collected in a projection and 42803 in WHERE). The
+// overload is picked by the argument families; no match is 42883. spec/design/functions.md §9.
+function resolveScalarFunc(
+  scope: Scope,
+  e: { name: string; args: Expr[]; star: boolean },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  const name = e.name.toLowerCase() as "abs" | "round";
+  const rargs: RExpr[] = [];
+  const tys: ResolvedType[] = [];
+  for (const a of e.args) {
+    const r = resolve(scope, a, null, ag, params);
+    rargs.push(r.node);
+    tys.push(r.type);
+  }
+  const numeric = (t: ResolvedType): boolean => t.kind === "int" || t.kind === "decimal";
+  let result: ScalarType;
+  if (name === "abs" && tys.length === 1 && tys[0].kind === "int") {
+    // abs: result is the operand's own type (range-checked at its boundary for integers).
+    result = tys[0].ty;
+  } else if (name === "abs" && tys.length === 1 && tys[0].kind === "decimal") {
+    result = "decimal";
+  } else if (
+    // round: always decimal; integer overloads return numeric (PG round(5)).
+    name === "round" &&
+    ((tys.length === 1 && numeric(tys[0])) || (tys.length === 2 && numeric(tys[0]) && tys[1].kind === "int"))
+  ) {
+    result = "decimal";
+  } else {
+    throw noFuncOverload(name);
+  }
+  return { node: { kind: "scalarFunc", func: name, args: rargs, result }, type: resolvedTypeOf(result) };
 }
 
 // groupingErrorColumn is the 42803 for a non-aggregated column with no GROUP BY.
@@ -1481,7 +1572,7 @@ function resolve(
       return { node: { kind: "param", index: idx0 }, type };
     }
     case "funcCall":
-      return resolveAggregate(scope, e, ag, params);
+      return resolveFuncCall(scope, e, ag, params);
     case "literal":
       switch (e.literal.kind) {
         case "null":
@@ -2240,6 +2331,32 @@ function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
         }
       }
       return coerceCaseValue(evalExpr(e.els, row, params, m), e.coerceDecimal);
+    }
+    case "scalarFunc": {
+      // One operator_eval per call (the uniform weight); arguments charge their own.
+      m.charge(COSTS.operatorEval);
+      const vals: Value[] = [];
+      for (const a of e.args) {
+        const v = evalExpr(a, row, params, m);
+        if (v.kind === "null") return nullValue(); // NULL propagates
+        vals.push(v);
+      }
+      const v0 = vals[0];
+      if (e.func === "abs") {
+        if (v0.kind === "int") {
+          // abs over an integer: |x| then range-check at the result type's boundary
+          // (abs(int16 -32768) → 22003), exactly like neg.
+          let n = v0.int;
+          if (n < 0n) n = -n;
+          if (!inRange(e.result, n)) throw overflow(e.result);
+          return intValue(n);
+        }
+        return decimalValue((v0 as { dec: Decimal }).dec.abs());
+      }
+      // round
+      const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
+      const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
+      return decimalValue(d.roundPlaces(places));
     }
   }
 }

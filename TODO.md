@@ -229,6 +229,23 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `# cost:` / `# names:` pinned. Deferred: `COUNT(DISTINCT x)`, `SELECT DISTINCT` in an
       aggregate query, GROUP BY by expression/ordinal/alias, the functional-dependency grouping
       relaxation, `GROUPING SETS`/`FILTER`/ordered-set aggregates. _(size: L; deps: expression evaluator)_
+- [x] **Scalar functions** `abs` / `round` — the first named per-row functions. Done across
+      Rust/Go/TS (conformance 54/54 byte-identical, PG-oracle-verified).
+      Authored as `[[operator]]` rows with `kind = "function"` (reusing the operator mold,
+      [functions.md](spec/design/functions.md) §9; no symbol/precedence), so codegen +
+      verify.rb + the `spec_constants` drift tests accept them unchanged. The shared
+      `function_call` grammar generalizes its argument to a **comma-separated list**
+      (`abs(x)`, `round(x)`, `round(x, n)`) — the `FuncCall`/`FuncCallExpr` AST node goes from
+      a single `arg` to an `args` list across all three cores — and the resolver splits
+      aggregate vs scalar vs unknown (`42883`). `abs` → operand type, range-checks at the
+      result boundary (`abs(int16 -32768)` → `22003`); `round` → numeric, half-away to scale 0
+      or `n`, with explicit integer overloads so PG's `round(5)` works (no implicit coercion).
+      Scalar functions are valid **anywhere an expression is** (incl. `WHERE`), unlike
+      aggregates; one `operator_eval` per call. Capabilities `func.abs`/`func.round` + profile
+      `functions`; conformance
+      [suites/expr/scalar_functions.test](spec/conformance/suites/expr/scalar_functions.test).
+      No new type / on-disk-format change. Follow-ons: `ceil`/`floor`/`mod`/`sign`, text
+      `length`/`lower`/`upper`, a general implicit argument-coercion pass. _(size: M; deps: expression evaluator, decimal)_
 - [x] **Multi-row `INSERT`** (`VALUES (..),(..)`). Done: `INSERT INTO t VALUES (..),(..)`
       accepts one or more parenthesized rows, **two-phase / all-or-nothing** like `UPDATE`
       (CLAUDE.md §11 step 6) — every row is fully validated (arity → `42601`, type/range →

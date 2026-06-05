@@ -583,27 +583,36 @@ INSERT is substituting a constant — no expression is evaluated and cost stays 
 general-expression default (`DEFAULT now()`) stays deferred ([../../TODO.md](../../TODO.md)); the
 column list and `DEFAULT` keyword apply unchanged when the source is a `SELECT` (§24).
 
-## 17. Function-call syntax and aggregate functions
+## 17. Function-call syntax, aggregate and scalar functions
 
 The `primary` rule gains a `function_call` production — `function_call ::= identifier "("
-( "*" | expr ")"` — the engine's **first** call syntax. The *semantics* (what each
-aggregate computes, the SUM/AVG widening, the NULL / empty-set rules, the grouping rules)
-live in [aggregates.md](aggregates.md); this section is the **syntax** and the
-disambiguation, the established grammar.md/semantics split (§15 does the same for joins).
+( "*" | expr ( "," expr )* ) ")"` — the engine's call syntax, shared by aggregate and
+scalar functions. The *semantics* (what each aggregate computes, the SUM/AVG widening, the
+NULL / empty-set rules, the grouping rules) live in [aggregates.md](aggregates.md), and the
+scalar-function semantics in [functions.md](functions.md) §9; this section is the **syntax**
+and the disambiguation, the established grammar.md/semantics split (§15 does the same for
+joins).
 
-**Aggregates only.** Only the five aggregate functions resolve — `COUNT`, `SUM`, `MIN`,
-`MAX`, `AVG` ([../functions/catalog.toml](../functions/catalog.toml), `kind = "aggregate"`).
-Any other function name is **`42883`** (`undefined_function`,
+**Aggregate and scalar names resolve.** A function name resolves to one of the five
+aggregates — `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`
+([../functions/catalog.toml](../functions/catalog.toml), `kind = "aggregate"`) — or to a
+scalar function — `abs`, `round` (`kind = "function"`, [functions.md](functions.md) §9).
+Any other name is **`42883`** (`undefined_function`,
 [../errors/registry.toml](../errors/registry.toml)), resolved like an unknown type name
-(§6). **Scalar** functions are a later slice (they will fit the operator result/NULL mold —
-[functions.md](functions.md) §8); aggregates do not, so they are their own catalog kind.
+(§6). The two kinds are syntactically identical and disambiguated at **resolve** time: an
+aggregate folds a set of rows and is constrained to projection/`HAVING` contexts (an
+aggregate in `WHERE` / a `JOIN ON` / a `GROUP BY` key, or nested in another aggregate, is
+`42803`); a scalar function maps values **per row** and is legal **anywhere an expression
+is**.
 
-**The argument.** `COUNT(*)` is the row counter — the `*` argument is accepted **only** by
-`COUNT`; `*` to any other aggregate is a resolve error. Every other aggregate takes exactly
-one **general expression** (`SUM(a + 1)`, `MIN(t.c)`). `COUNT(expr)` also takes one
-expression. There are no zero-argument or multi-argument aggregates this slice, and
-**`DISTINCT` inside the parens** (`COUNT(DISTINCT x)`) is **deferred** — the parsers reject
-the `DISTINCT` token in an argument position as `42601` (it is added as a follow-on).
+**The argument(s).** `COUNT(*)` is the row counter — the `*` argument is accepted **only**
+by `COUNT`; `*` to any other function is a resolve error. Otherwise a call takes a
+**comma-separated list of general expressions**: each aggregate takes exactly **one**
+(`SUM(a + 1)`, `MIN(t.c)`, `COUNT(expr)`) — a second argument matches no aggregate overload
+and is `42883`; `abs` takes **one** (`abs(a - b)`); `round` takes **one or two**
+(`round(x)`, `round(x, 2)`). **`DISTINCT` inside the parens** (`COUNT(DISTINCT x)`) is
+**deferred** — the parsers reject the `DISTINCT` token in an argument position as `42601`
+(it is added as a follow-on).
 
 **The `*` token.** `*` is the same token as the `SELECT *` glob and the `mul` operator,
 disambiguated by position (§4): inside a function call's argument it is the `COUNT(*)`

@@ -258,6 +258,17 @@ description = "text LIKE pattern / NOT LIKE — % matches any run, _ one code po
 id = "expr.case"
 description = "CASE expression (searched + simple forms): lazy first-match evaluation (later arms not evaluated — the one short-circuit exception); searched WHEN must be boolean (42804); result-arm types unify to a common type (numeric promote; cross-family 42804; all-NULL → text); no match + no ELSE → NULL; output name ?column? (spec/design/grammar.md §23)"
 
+# Scalar functions (kind = "function", spec/design/functions.md §9) — named f(args) calls
+# evaluated per row, valid anywhere an expression is (unlike aggregates). One capability per
+# function so a core can land them independently.
+[[capability]]
+id = "func.abs"
+description = "abs(x) scalar function — abs(int16|int32|int64) → same int type (abs(INT_MIN) overflows, 22003); abs(numeric) → numeric; NULL propagates (spec/design/functions.md §9)"
+
+[[capability]]
+id = "func.round"
+description = "round(x[, n]) scalar function — numeric/integer → numeric, half-away-from-zero to scale 0 or n places; integer overloads return numeric (PG round(5)); NULL propagates (spec/design/functions.md §9)"
+
 [[capability]]
 id = "error.division_by_zero"
 description = "Integer division / modulo by zero is defined and traps SQLSTATE 22012"
@@ -332,6 +343,15 @@ id = "decimal"
 title = "expression + the exact decimal / numeric type (numeric(p,s), comparison, casts, arithmetic)"
 includes = "expression"
 capabilities = ["types.decimal", "expr.decimal_arithmetic"]
+
+[[profile]]
+id = "functions"
+title = "decimal + scalar functions abs / round (per-row, valid anywhere an expression is)"
+includes = "decimal"
+capabilities = [
+  "func.abs",
+  "func.round",
+]
 
 [[profile]]
 id = "joins"

@@ -1,0 +1,234 @@
+# Scalar functions abs / round — the engine's first named per-row functions
+# (spec/design/functions.md §9, kind = "function"). abs over the integer family (range-checked
+# at the result type's boundary) and over decimal; round half-away-from-zero to scale 0 or n
+# places (decimal.md §3), with explicit integer overloads returning numeric (PG round(5)).
+# Scalar functions are valid anywhere an expression is (incl. WHERE), unlike aggregates, and
+# charge one operator_eval per call. PostgreSQL-oracle-verified (postgres:18). Note: PG's
+# one-arg round(integer) is double precision; jed has no float type, so it returns numeric —
+# value-identical. A bare untyped NULL / parameter as an argument (ambiguous overload) is out
+# of scope; NULL is exercised here through typed NULL columns, which propagate.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.int16, types.int32, types.int64, types.decimal, types.text, func.abs, func.round, resource.cost_metering
+
+statement ok
+CREATE TABLE n (id int32 PRIMARY KEY, i32 int32, i16 int16, i64 int64, d numeric)
+
+statement ok
+INSERT INTO n VALUES
+  (1, -5, -7, -100, -1.5),
+  (2, 5, 7, 100, 2.567),
+  (3, 0, 0, 0, 0.0),
+  (4, NULL, NULL, NULL, NULL)
+
+# --- abs over the integer family: |x|, same type out; NULL propagates -------------------
+query I rowsort
+SELECT abs(i32) FROM n
+----
+0
+5
+5
+NULL
+
+query I rowsort
+SELECT abs(i16) FROM n
+----
+0
+7
+7
+NULL
+
+query I rowsort
+SELECT abs(i64) FROM n
+----
+0
+100
+100
+NULL
+
+# --- abs over decimal: magnitude, scale preserved; NULL propagates ----------------------
+query D rowsort
+SELECT abs(d) FROM n
+----
+0.0
+1.5
+2.567
+NULL
+
+# --- abs(int_min) has no positive counterpart → overflow 22003 at the result boundary ---
+statement ok
+CREATE TABLE mins (id int32 PRIMARY KEY, i32 int32, i16 int16, i64 int64)
+
+statement ok
+INSERT INTO mins VALUES (1, -2147483648, -32768, -9223372036854775808)
+
+statement error 22003
+SELECT abs(i32) FROM mins
+
+statement error 22003
+SELECT abs(i16) FROM mins
+
+statement error 22003
+SELECT abs(i64) FROM mins
+
+# --- round: half away from zero, to scale 0 (1-arg) or n places (2-arg) -----------------
+statement ok
+CREATE TABLE r (id int32 PRIMARY KEY, d numeric, places int32)
+
+statement ok
+INSERT INTO r VALUES
+  (1, 0.125, 2),
+  (2, 2.5, 0),
+  (3, 3.5, 0),
+  (4, 1234.5, -2),
+  (5, 1250, -2),
+  (6, 1.005, 2),
+  (7, 150, -2),
+  (8, 5, -1),
+  (9, 2.567, NULL)
+
+# round(d) — to scale 0
+query D nosort
+SELECT round(d) FROM r WHERE id = 2
+----
+3
+
+query D nosort
+SELECT round(d) FROM r WHERE id = 3
+----
+4
+
+# round(d, n) where n is a literal — n places (incl. negative n: round to the left)
+query D nosort
+SELECT round(d, 2) FROM r WHERE id = 1
+----
+0.13
+
+query D nosort
+SELECT round(d, 2) FROM r WHERE id = 6
+----
+1.01
+
+query D nosort
+SELECT round(d, -2) FROM r WHERE id = 4
+----
+1200
+
+query D nosort
+SELECT round(d, -2) FROM r WHERE id = 5
+----
+1300
+
+query D nosort
+SELECT round(d, -2) FROM r WHERE id = 7
+----
+200
+
+query D nosort
+SELECT round(d, -1) FROM r WHERE id = 8
+----
+10
+
+# round(d, n) where n is a column — same per-row count
+query D nosort
+SELECT round(d, places) FROM r WHERE id = 1
+----
+0.13
+
+# a NULL count (typed column) propagates
+query D nosort
+SELECT round(d, places) FROM r WHERE id = 9
+----
+NULL
+
+# --- round's integer overloads — return numeric (PG round(5)) ---------------------------
+query D nosort
+SELECT round(i32) FROM n WHERE id = 1
+----
+-5
+
+query D nosort
+SELECT round(i32, 2) FROM n WHERE id = 2
+----
+5.00
+
+# --- NULL propagation through round over a typed NULL column ----------------------------
+query D nosort
+SELECT round(d) FROM n WHERE id = 4
+----
+NULL
+
+query D nosort
+SELECT round(d, 2) FROM n WHERE id = 4
+----
+NULL
+
+# --- a scalar function is valid in WHERE (an aggregate there would be 42803) ------------
+query I nosort
+SELECT id FROM n WHERE abs(i32) = 5 ORDER BY id
+----
+1
+2
+
+# --- a scalar function may wrap an arithmetic sub-expression ----------------------------
+query I nosort
+SELECT abs(i32 - i16) FROM n WHERE id = 2
+----
+2
+
+# --- function names are NOT reserved: a column may be named abs / round -----------------
+statement ok
+CREATE TABLE c (id int32 PRIMARY KEY, abs int32, round numeric)
+
+statement ok
+INSERT INTO c VALUES (1, -8, -3.5)
+
+query I nosort
+SELECT abs FROM c WHERE id = 1
+----
+-8
+
+query I nosort
+SELECT abs(abs) FROM c WHERE id = 1
+----
+8
+
+query D nosort
+SELECT round(round) FROM c WHERE id = 1
+----
+-4
+
+# --- cost: one operator_eval per call. 3 scanned + 3 produced + 3 abs evals = 9 ---------
+statement ok
+CREATE TABLE k (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO k VALUES (1, -5), (2, 5), (3, 0)
+
+# cost: 9
+query I rowsort
+SELECT abs(v) FROM k
+----
+0
+5
+5
+
+# --- errors: unknown name, no matching overload, wrong arity, DISTINCT in args ----------
+statement error 42883
+SELECT foo(i32) FROM n
+
+statement error 42883
+SELECT abs(d, d) FROM n
+
+statement error 42883
+SELECT round(d, d) FROM n
+
+statement ok
+CREATE TABLE tx (id int32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO tx VALUES (1, 'hi')
+
+statement error 42883
+SELECT abs(s) FROM tx
+
+statement error 42601
+SELECT abs(DISTINCT i32) FROM n

@@ -968,10 +968,10 @@ impl Parser {
                 }
             }
             Token::Word(_) => {
-                // Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the
-                // engine's first call syntax — grammar.md §17). The one-token lookahead keeps
-                // function names non-reserved (a column may be named `count`); a qualified
-                // name (`t.col`) is never a call. Only aggregates resolve (42883 otherwise).
+                // Function call: a BARE identifier IMMEDIATELY followed by "(" is a call
+                // (grammar.md §17). The one-token lookahead keeps function names non-reserved
+                // (a column may be named `count`/`abs`); a qualified name (`t.col`) is never a
+                // call. Aggregate and scalar names resolve; any other name is 42883.
                 if matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) {
                     return self.parse_function_call();
                 }
@@ -985,25 +985,31 @@ impl Parser {
         }
     }
 
-    /// `function_call ::= identifier "(" ( "*" | expr ) ")"` — the aggregate call syntax
-    /// (grammar.md §17). `COUNT(*)` is the `star` form; every other call takes one general
-    /// expression argument. DISTINCT inside the parens is deferred (rejected 42601). The
-    /// function name is resolved (case-insensitively) against the aggregate catalog later.
+    /// `function_call ::= identifier "(" ( "*" | expr ("," expr)* ) ")"` — the shared
+    /// aggregate/scalar call syntax (grammar.md §17). `COUNT(*)` is the `star` form; every
+    /// other call takes a comma-separated argument list (resolution checks the per-function
+    /// arity). DISTINCT inside the parens is deferred (rejected 42601). The function name is
+    /// resolved (case-insensitively) against the catalog later.
     fn parse_function_call(&mut self) -> Result<Expr> {
         let name = self.expect_identifier()?;
         self.expect(&Token::LParen)?;
-        // DISTINCT inside an aggregate (COUNT(DISTINCT x)) is deferred — reject at parse.
+        // DISTINCT inside a function call (COUNT(DISTINCT x)) is deferred — reject at parse.
         if self.peek_keyword().as_deref() == Some("distinct") {
             return Err(syntax("DISTINCT inside an aggregate is not supported yet"));
         }
-        let (arg, star) = if matches!(self.peek(), Token::Star) {
+        let (args, star) = if matches!(self.peek(), Token::Star) {
             self.advance();
-            (None, true)
+            (Vec::new(), true)
         } else {
-            (Some(Box::new(self.parse_expr()?)), false)
+            let mut args = vec![self.parse_expr()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                args.push(self.parse_expr()?);
+            }
+            (args, false)
         };
         self.expect(&Token::RParen)?;
-        Ok(Expr::FuncCall { name, arg, star })
+        Ok(Expr::FuncCall { name, args, star })
     }
 
     /// `column_ref ::= identifier ("." identifier)?` — a bare column name, or a qualified

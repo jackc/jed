@@ -291,15 +291,17 @@ pub enum Expr {
         whens: Vec<(Expr, Expr)>,
         els: Option<Box<Expr>>,
     },
-    /// An aggregate function call — the engine's first function-call syntax (grammar.md §17).
-    /// `name` is the spelling as written (resolved case-insensitively against the aggregate
-    /// catalog; an unknown name is 42883). `star` is the `COUNT(*)` row-count form (then `arg`
-    /// is `None`); otherwise `arg` is the single argument expression. DISTINCT inside the
-    /// parens is rejected at parse (42601). Only aggregates resolve this slice; an aggregate
-    /// in WHERE/ON or nested in another aggregate is 42803 (spec/design/aggregates.md).
+    /// A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is
+    /// the spelling as written, resolved case-insensitively: an aggregate (COUNT/SUM/MIN/MAX/
+    /// AVG, kind = "aggregate"), a scalar function (abs/round, kind = "function",
+    /// spec/design/functions.md §9), or 42883 (undefined_function). `star` is the `COUNT(*)`
+    /// row-count form (then `args` is empty); otherwise `args` is the comma-separated argument
+    /// list — aggregates and `abs` take one, `round` one or two. DISTINCT inside the parens is
+    /// rejected at parse (42601). An aggregate in WHERE/ON or nested in another aggregate is
+    /// 42803 (spec/design/aggregates.md); a scalar function is legal anywhere an expression is.
     FuncCall {
         name: String,
-        arg: Option<Box<Expr>>,
+        args: Vec<Expr>,
         star: bool,
     },
 }

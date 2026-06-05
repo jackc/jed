@@ -28,10 +28,12 @@ schema_version = 1
 #                 the IS [NOT] NULL tests and the keyword connectives AND/OR/NOT.
 #                 Shared across an operator's overload rows (one `=` token, two rows).
 # kind            operator class: "comparison" | "null_test" | "arithmetic" |
-#                 "logical". Reserved for a later slice: "function" (scalar functions).
-#                 AGGREGATE functions (COUNT/SUM/MIN/MAX/AVG) are NOT operators and live
-#                 in a separate [[aggregate]] array with kind = "aggregate" (end of file).
-# arity           operand count (2 = binary, 1 = unary).
+#                 "logical". SCALAR functions reuse this array with kind = "function" (no
+#                 symbol/precedence; called by name) — abs/round are authored at the end of
+#                 the [[operator]] section (functions.md §9). AGGREGATE functions (COUNT/SUM/
+#                 MIN/MAX/AVG) are NOT operators and live in a separate [[aggregate]] array
+#                 with kind = "aggregate" (end of file).
+# arity           operand count (2 = binary, 1 = unary; scalar functions also use 1 or 2).
 # arg_families    required family of each operand, by position, referencing a
 #                 `family` in ../types/scalars.toml. "any" = unconstrained.
 # arg_resolution  how a mixed-type operand pair is reconciled before the operator
@@ -1058,6 +1060,85 @@ arg_resolution = "none"
 result         = "promoted"
 null           = "propagates"
 precedence     = 60
+errors         = []
+
+# === scalar functions ========================================================
+# Named scalar functions (kind = "function", functions.md §9). They take scalar argument(s)
+# and return a scalar, fitting the operator result/NULL mold, so they REUSE the [[operator]]
+# field set — but with no `symbol` and no `precedence` (called by name, not infix), and
+# arg_resolution = "none" (each argument keeps its own family; the value and a `round`
+# count are NOT reconciled to one type). Like operators they are OVERLOADED across operand
+# families: one row per (name, arg_families). Unlike aggregates they are evaluated PER ROW
+# and are valid anywhere an expression is (projection, WHERE, JOIN ON). The hand-written
+# resolver dispatches them; verify.rb already lists "function" in KNOWN_KINDS and validates
+# these rows on the operator branch (no symbol/precedence required), and gen_catalog.rb
+# emits them into the OPERATORS table unchanged.
+#
+# abs: result "promoted" = the operand's own type (like unary neg). abs over the integer
+# family range-checks at the result type's boundary — abs(int16 -32768) has no positive
+# int16 → 22003 (the neg overflow path). abs over decimal clears the sign (cannot overflow).
+# round: result "decimal", half-away-from-zero (decimal.md §3) to scale 0 (1-arg) or the
+# given count (2-arg). Integer overloads return numeric — PostgreSQL's round(5) → 5::numeric
+# — authored as explicit rows rather than an implicit int→decimal coercion (strict typing).
+
+[[operator]]
+name           = "abs"
+kind           = "function"
+arity          = 1
+arg_families   = ["integer"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+errors         = ["22003"]
+
+[[operator]]
+name           = "abs"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "round"
+kind           = "function"
+arity          = 1
+arg_families   = ["decimal"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "round"
+kind           = "function"
+arity          = 2
+arg_families   = ["decimal", "integer"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "round"
+kind           = "function"
+arity          = 1
+arg_families   = ["integer"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "round"
+kind           = "function"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "none"
+result         = "decimal"
+null           = "propagates"
 errors         = []
 
 # === aggregate functions =====================================================

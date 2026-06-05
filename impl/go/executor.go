@@ -1362,6 +1362,18 @@ const (
 	reDistinct
 	reLike
 	reCase
+	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
+	// evaluated per row in any context.
+	reScalarFunc
+)
+
+// scalarFunc selects a scalar function (kind = "function"). The overload (integer vs decimal)
+// is recovered at eval from the argument's runtime value.
+type scalarFunc int
+
+const (
+	sfAbs scalarFunc = iota
+	sfRound
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -1388,6 +1400,12 @@ type rExpr struct {
 	caseArms    []rCaseArm
 	caseEls     *rExpr
 	caseDecimal bool
+
+	// reScalarFunc: the scalar function (abs/round) and its argument nodes. `result` holds the
+	// static result type — for abs over an integer it is the operand's integer type, so the
+	// magnitude is range-checked at that boundary; otherwise decimal.
+	sfunc scalarFunc
+	sargs []*rExpr
 }
 
 // rCaseArm is one resolved (condition, result) branch of a reCase node (spec/design/grammar.md
@@ -1554,52 +1572,72 @@ func itemsHaveAggregate(items SelectItems) bool {
 		return false
 	}
 	for _, it := range items.Items {
-		if exprHasFuncCall(it.Expr) {
+		if exprHasAggregate(it.Expr) {
 			return true
 		}
 	}
 	return false
 }
 
-// exprHasFuncCall reports whether an expression tree contains a function (aggregate) call.
-func exprHasFuncCall(e Expr) bool {
+// isAggregateName reports whether name (case-insensitive) is one of the five aggregates.
+func isAggregateName(name string) bool {
+	switch toLowerASCII(name) {
+	case "count", "sum", "min", "max", "avg":
+		return true
+	default:
+		return false
+	}
+}
+
+// exprHasAggregate reports whether an expression tree contains an AGGREGATE call anywhere. A
+// scalar-function call is not itself an aggregate but may CONTAIN one (abs(sum(x))), so its
+// arguments are walked.
+func exprHasAggregate(e Expr) bool {
 	switch e.Kind {
 	case ExprFuncCall:
-		return true
+		if isAggregateName(e.FuncCall.Name) {
+			return true
+		}
+		for _, a := range e.FuncCall.Args {
+			if exprHasAggregate(*a) {
+				return true
+			}
+		}
+		return false
 	case ExprCast:
-		return exprHasFuncCall(e.Cast.Inner)
+		return exprHasAggregate(e.Cast.Inner)
 	case ExprUnary:
-		return exprHasFuncCall(e.Unary.Operand)
+		return exprHasAggregate(e.Unary.Operand)
 	case ExprIsNull:
-		return exprHasFuncCall(e.IsNullOf.Operand)
+		return exprHasAggregate(e.IsNullOf.Operand)
 	case ExprBinary:
-		return exprHasFuncCall(e.Binary.Lhs) || exprHasFuncCall(e.Binary.Rhs)
+		return exprHasAggregate(e.Binary.Lhs) || exprHasAggregate(e.Binary.Rhs)
 	case ExprIsDistinct:
-		return exprHasFuncCall(e.IsDistinct.Lhs) || exprHasFuncCall(e.IsDistinct.Rhs)
+		return exprHasAggregate(e.IsDistinct.Lhs) || exprHasAggregate(e.IsDistinct.Rhs)
 	case ExprIn:
-		if exprHasFuncCall(e.In.Lhs) {
+		if exprHasAggregate(e.In.Lhs) {
 			return true
 		}
 		for _, elem := range e.In.List {
-			if exprHasFuncCall(elem) {
+			if exprHasAggregate(elem) {
 				return true
 			}
 		}
 		return false
 	case ExprBetween:
-		return exprHasFuncCall(e.Between.Lhs) || exprHasFuncCall(e.Between.Lo) || exprHasFuncCall(e.Between.Hi)
+		return exprHasAggregate(e.Between.Lhs) || exprHasAggregate(e.Between.Lo) || exprHasAggregate(e.Between.Hi)
 	case ExprLike:
-		return exprHasFuncCall(e.Like.Lhs) || exprHasFuncCall(e.Like.Rhs)
+		return exprHasAggregate(e.Like.Lhs) || exprHasAggregate(e.Like.Rhs)
 	case ExprCase:
-		if e.Case.Operand != nil && exprHasFuncCall(*e.Case.Operand) {
+		if e.Case.Operand != nil && exprHasAggregate(*e.Case.Operand) {
 			return true
 		}
 		for _, w := range e.Case.Whens {
-			if exprHasFuncCall(w.Cond) || exprHasFuncCall(w.Result) {
+			if exprHasAggregate(w.Cond) || exprHasAggregate(w.Result) {
 				return true
 			}
 		}
-		return e.Case.Els != nil && exprHasFuncCall(*e.Case.Els)
+		return e.Case.Els != nil && exprHasAggregate(*e.Case.Els)
 	default:
 		return false
 	}
@@ -1625,7 +1663,11 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		if fc.Star {
 			plan, operand, result = planCountStar, nil, resolvedType{kind: rtInt, intTy: Int64}
 		} else {
-			r, _, err := resolve(s, *fc.Arg, nil, sub, params)
+			arg, err := aggArg(fc)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			r, _, err := resolve(s, arg, nil, sub, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1635,7 +1677,11 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		if fc.Star {
 			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
-		r, t, err := resolve(s, *fc.Arg, nil, sub, params)
+		arg, err := aggArg(fc)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		r, t, err := resolve(s, arg, nil, sub, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1671,9 +1717,90 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 
+// aggArg returns the single argument of a non-star aggregate call. Each aggregate takes
+// exactly one argument; a different count matches no aggregate overload and is 42883 (PG).
+func aggArg(fc *FuncCallExpr) (Expr, error) {
+	if len(fc.Args) != 1 {
+		return Expr{}, NewError(UndefinedFunction, "no aggregate function matches the given argument count")
+	}
+	return *fc.Args[0], nil
+}
+
 // noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
 func noAggOverload(fn string) error {
 	return NewError(UndefinedFunction, "no "+fn+" aggregate for that argument type")
+}
+
+// noFuncOverload is 42883 — a scalar function over argument types it has no overload for.
+func noFuncOverload(fn string) error {
+	return NewError(UndefinedFunction, "no "+fn+" function for those argument types")
+}
+
+// resolveFuncCall resolves a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar
+// function (abs/round, spec/design/functions.md §9), or 42883 for any other name. Aggregates
+// and scalar functions share the call syntax (grammar.md §17); they are distinguished here.
+func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	switch toLowerASCII(fc.Name) {
+	case "count", "sum", "min", "max", "avg":
+		return resolveAggregate(s, fc, ag, params)
+	case "abs", "round":
+		return resolveScalarFunc(s, fc, ag, params)
+	default:
+		return nil, resolvedType{}, NewError(UndefinedFunction, "function does not exist: "+fc.Name)
+	}
+}
+
+// resolveScalarFunc resolves a scalar-function call (abs/round) into a per-row reScalarFunc
+// node. Unlike an aggregate it is legal in any context, so its arguments resolve in the SAME
+// agg context (a nested aggregate is still collected in a projection and 42803 in WHERE). The
+// overload is picked by the argument families; no match is 42883. spec/design/functions.md §9.
+func resolveScalarFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if fc.Star {
+		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+	}
+	name := toLowerASCII(fc.Name)
+	rargs := make([]*rExpr, 0, len(fc.Args))
+	tys := make([]resolvedType, 0, len(fc.Args))
+	for _, a := range fc.Args {
+		r, t, err := resolve(s, *a, nil, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		rargs = append(rargs, r)
+		tys = append(tys, t)
+	}
+	var (
+		fn     scalarFunc
+		result ScalarType
+	)
+	switch {
+	// abs: result is the operand's own type (range-checked at its boundary for integers).
+	case name == "abs" && len(tys) == 1 && tys[0].kind == rtInt:
+		fn, result = sfAbs, tys[0].intTy
+	case name == "abs" && len(tys) == 1 && tys[0].kind == rtDecimal:
+		fn, result = sfAbs, DecimalType
+	// round: always decimal; integer overloads return numeric (PG round(5)).
+	case name == "round" && roundArgsOK(tys):
+		fn, result = sfRound, DecimalType
+	default:
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	rt := resolvedTypeOf(result)
+	return &rExpr{kind: reScalarFunc, sfunc: fn, sargs: rargs, result: result}, rt, nil
+}
+
+// roundArgsOK reports whether the argument types match a round overload: a numeric value
+// (integer or decimal) and an optional integer count.
+func roundArgsOK(tys []resolvedType) bool {
+	numeric := func(t resolvedType) bool { return t.kind == rtInt || t.kind == rtDecimal }
+	switch len(tys) {
+	case 1:
+		return numeric(tys[0])
+	case 2:
+		return numeric(tys[0]) && tys[1].kind == rtInt
+	default:
+		return false
+	}
 }
 
 // groupingErrorColumn is the 42803 for a non-aggregated column not in GROUP BY.
@@ -2004,7 +2131,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return collectColumn(s, ag, idx, e.Column)
 	case ExprFuncCall:
-		return resolveAggregate(s, e.FuncCall, ag, params)
+		return resolveFuncCall(s, e.FuncCall, ag, params)
 	case ExprLiteral:
 		switch e.Literal.Kind {
 		case LiteralNull:
@@ -2836,6 +2963,51 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 			return Value{}, err
 		}
 		return coerceCase(ev, e.caseDecimal), nil
+	case reScalarFunc:
+		// One operator_eval per call (the uniform weight); arguments charge their own.
+		m.Charge(Costs.OperatorEval)
+		vals := make([]Value, 0, len(e.sargs))
+		for _, a := range e.sargs {
+			v, err := a.eval(row, params, m)
+			if err != nil {
+				return Value{}, err
+			}
+			if v.Kind == ValNull {
+				return NullValue(), nil // NULL propagates
+			}
+			vals = append(vals, v)
+		}
+		switch e.sfunc {
+		case sfAbs:
+			if vals[0].Kind == ValInt {
+				// abs over an integer: |x| then range-check at the result type's boundary
+				// (abs(int16 -32768) → 22003), exactly like reNeg.
+				n := vals[0].Int
+				if n == math.MinInt64 {
+					return Value{}, overflowErr(e.result)
+				}
+				if n < 0 {
+					n = -n
+				}
+				if !e.result.InRange(n) {
+					return Value{}, overflowErr(e.result)
+				}
+				return IntValue(n), nil
+			}
+			return DecimalValue(vals[0].Dec.Abs()), nil
+		default: // sfRound
+			var d Decimal
+			if vals[0].Kind == ValInt {
+				d = DecimalFromInt64(vals[0].Int)
+			} else {
+				d = *vals[0].Dec
+			}
+			places := int64(0)
+			if len(vals) > 1 {
+				places = vals[1].Int
+			}
+			return DecimalValue(d.RoundPlaces(places)), nil
+		}
 	default: // reDistinct
 		m.Charge(Costs.OperatorEval)
 		a, err := e.lhs.eval(row, params, m)

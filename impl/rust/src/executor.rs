@@ -1331,6 +1331,15 @@ enum CmpOp {
     Ge,
 }
 
+/// The scalar functions (kind = "function", spec/design/functions.md §9), parsed from a call
+/// name (case-insensitive). Evaluated per row; the overload (integer vs decimal) is recovered
+/// at eval from the argument's runtime value.
+#[derive(Clone, Copy)]
+enum ScalarFunc {
+    Abs,
+    Round,
+}
+
 /// A resolved expression: a tree over fixed column indices, ready to evaluate against
 /// a row. Arithmetic nodes carry their (promotion-tower) result type so the computed
 /// value can be range-checked against it (the int16+int16 → int16 boundary).
@@ -1404,6 +1413,16 @@ enum RExpr {
         arms: Vec<(RExpr, RExpr)>,
         els: Box<RExpr>,
         coerce_decimal: bool,
+    },
+    /// A scalar-function call (abs/round, spec/design/functions.md §9), evaluated per row in
+    /// any context. `result` is the static result type — for `abs` over an integer it is the
+    /// operand's integer type, so the magnitude is range-checked at that boundary (the same
+    /// 22003 discipline as `Neg`); for `abs` over decimal and all `round` forms it is decimal.
+    /// Arguments propagate NULL.
+    ScalarFunc {
+        func: ScalarFunc,
+        args: Vec<RExpr>,
+        result: ScalarType,
     },
 }
 
@@ -1593,36 +1612,41 @@ impl Acc {
 fn items_have_aggregate(items: &SelectItems) -> bool {
     match items {
         SelectItems::All => false,
-        SelectItems::Items(items) => items.iter().any(|it| expr_has_funccall(&it.expr)),
+        SelectItems::Items(items) => items.iter().any(|it| expr_has_aggregate(&it.expr)),
     }
 }
 
-/// Whether an expression tree contains a function (aggregate) call anywhere.
-fn expr_has_funccall(e: &Expr) -> bool {
+/// Whether an expression tree contains an AGGREGATE call anywhere. A scalar-function call is
+/// not itself an aggregate, but may CONTAIN one (`abs(sum(x))`), so its arguments are walked.
+fn expr_has_aggregate(e: &Expr) -> bool {
     match e {
-        Expr::FuncCall { .. } => true,
+        Expr::FuncCall { name, args, .. } => {
+            is_aggregate_name(name) || args.iter().any(expr_has_aggregate)
+        }
         Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::Literal(_) | Expr::Param(_) => false,
-        Expr::Cast { inner, .. } => expr_has_funccall(inner),
-        Expr::Unary { operand, .. } => expr_has_funccall(operand),
-        Expr::IsNull { operand, .. } => expr_has_funccall(operand),
+        Expr::Cast { inner, .. } => expr_has_aggregate(inner),
+        Expr::Unary { operand, .. } => expr_has_aggregate(operand),
+        Expr::IsNull { operand, .. } => expr_has_aggregate(operand),
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
-            expr_has_funccall(lhs) || expr_has_funccall(rhs)
+            expr_has_aggregate(lhs) || expr_has_aggregate(rhs)
         }
-        Expr::In { lhs, list, .. } => expr_has_funccall(lhs) || list.iter().any(expr_has_funccall),
+        Expr::In { lhs, list, .. } => {
+            expr_has_aggregate(lhs) || list.iter().any(expr_has_aggregate)
+        }
         Expr::Between { lhs, lo, hi, .. } => {
-            expr_has_funccall(lhs) || expr_has_funccall(lo) || expr_has_funccall(hi)
+            expr_has_aggregate(lhs) || expr_has_aggregate(lo) || expr_has_aggregate(hi)
         }
-        Expr::Like { lhs, rhs, .. } => expr_has_funccall(lhs) || expr_has_funccall(rhs),
+        Expr::Like { lhs, rhs, .. } => expr_has_aggregate(lhs) || expr_has_aggregate(rhs),
         Expr::Case {
             operand,
             whens,
             els,
         } => {
-            operand.as_deref().is_some_and(expr_has_funccall)
+            operand.as_deref().is_some_and(expr_has_aggregate)
                 || whens
                     .iter()
-                    .any(|(c, r)| expr_has_funccall(c) || expr_has_funccall(r))
-                || els.as_deref().is_some_and(expr_has_funccall)
+                    .any(|(c, r)| expr_has_aggregate(c) || expr_has_aggregate(r))
+                || els.as_deref().is_some_and(expr_has_aggregate)
         }
     }
 }
@@ -1660,7 +1684,7 @@ fn parse_agg_func(name: &str) -> Result<AggFunc> {
 fn resolve_aggregate(
     scope: &Scope,
     name: &str,
-    arg: Option<&Expr>,
+    args: &[Expr],
     star: bool,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
@@ -1680,7 +1704,7 @@ fn resolve_aggregate(
             ResolvedType::Int(ScalarType::Int64),
         ),
         AggFunc::Count => {
-            let (r, _t) = resolve(scope, expect_arg(arg)?, None, &mut sub, params)?;
+            let (r, _t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
             (
                 AggPlan::Count,
                 Some(r),
@@ -1694,7 +1718,7 @@ fn resolve_aggregate(
             ));
         }
         AggFunc::Sum => {
-            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub, params)?;
+            let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
             match t {
                 // int16/int32 -> int64 (accumulate i64); int64 -> decimal (PG widening).
                 ResolvedType::Int(it) if it == ScalarType::Int64 => {
@@ -1710,7 +1734,7 @@ fn resolve_aggregate(
             }
         }
         AggFunc::Avg => {
-            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub, params)?;
+            let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
             match t {
                 ResolvedType::Int(_) | ResolvedType::Decimal => {
                     (AggPlan::Avg, Some(r), ResolvedType::Decimal)
@@ -1720,11 +1744,11 @@ fn resolve_aggregate(
         }
         // MIN/MAX accept any ordered scalar; the result is the argument's type.
         AggFunc::Min => {
-            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub, params)?;
+            let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
             (AggPlan::Min, Some(r), t)
         }
         AggFunc::Max => {
-            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub, params)?;
+            let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
             (AggPlan::Max, Some(r), t)
         }
     };
@@ -1757,9 +1781,16 @@ fn collect_column(
     }
 }
 
-/// The single argument of a non-star aggregate call (the parser guarantees one is present).
-fn expect_arg(arg: Option<&Expr>) -> Result<&Expr> {
-    arg.ok_or_else(|| EngineError::new(SqlState::SyntaxError, "aggregate requires an argument"))
+/// The single argument of a non-star aggregate call. Each aggregate takes exactly one
+/// argument; a different count matches no aggregate overload and is 42883 (PG).
+fn expect_arg(args: &[Expr]) -> Result<&Expr> {
+    match args {
+        [a] => Ok(a),
+        _ => Err(EngineError::new(
+            SqlState::UndefinedFunction,
+            "no aggregate function matches the given argument count",
+        )),
+    }
 }
 
 /// An aggregate over an operand family it has no overload for (e.g. SUM(text)) — 42883.
@@ -1768,6 +1799,98 @@ fn no_agg_overload(func: &str) -> EngineError {
         SqlState::UndefinedFunction,
         format!("no {func} aggregate for that argument type"),
     )
+}
+
+/// Whether `name` (case-insensitive) is one of the five aggregate functions.
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "count" | "sum" | "min" | "max" | "avg"
+    )
+}
+
+/// A scalar function over argument types it has no overload for (e.g. abs(text), round(int,
+/// text)) — 42883, like an aggregate with no matching overload.
+fn no_func_overload(func: &str) -> EngineError {
+    EngineError::new(
+        SqlState::UndefinedFunction,
+        format!("no {func} function for those argument types"),
+    )
+}
+
+/// Resolve a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar function
+/// (abs/round, spec/design/functions.md §9), or 42883 (undefined_function) for any other name.
+/// Aggregates and scalar functions share the call syntax (grammar.md §17); they are
+/// distinguished here, at resolve.
+fn resolve_func_call(
+    scope: &Scope,
+    name: &str,
+    args: &[Expr],
+    star: bool,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let lname = name.to_ascii_lowercase();
+    match lname.as_str() {
+        "count" | "sum" | "min" | "max" | "avg" => {
+            resolve_aggregate(scope, &lname, args, star, agg, params)
+        }
+        "abs" | "round" => resolve_scalar_func(scope, &lname, args, star, agg, params),
+        _ => Err(EngineError::new(
+            SqlState::UndefinedFunction,
+            format!("function does not exist: {name}"),
+        )),
+    }
+}
+
+/// Resolve a scalar-function call (abs/round) into a per-row `ScalarFunc` node. Unlike an
+/// aggregate it is legal in any context, so its arguments resolve in the SAME `agg` context
+/// (a nested aggregate is still collected in a projection and 42803 in WHERE). The overload is
+/// picked by the argument families; no match is 42883. spec/design/functions.md §9.
+fn resolve_scalar_func(
+    scope: &Scope,
+    name: &str, // already lowercased
+    args: &[Expr],
+    star: bool,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if star {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "* is only valid as the argument of COUNT",
+        ));
+    }
+    let mut rargs = Vec::with_capacity(args.len());
+    let mut tys = Vec::with_capacity(args.len());
+    for a in args {
+        let (r, t) = resolve(scope, a, None, agg, params)?;
+        rargs.push(r);
+        tys.push(t);
+    }
+    let result = match (name, tys.as_slice()) {
+        // abs: result is the operand's own type (range-checked at its boundary for integers).
+        ("abs", [ResolvedType::Int(it)]) => *it,
+        ("abs", [ResolvedType::Decimal]) => ScalarType::Decimal,
+        // round: always decimal; integer overloads return numeric (PG round(5)).
+        ("round", [ResolvedType::Decimal])
+        | ("round", [ResolvedType::Decimal, ResolvedType::Int(_)])
+        | ("round", [ResolvedType::Int(_)])
+        | ("round", [ResolvedType::Int(_), ResolvedType::Int(_)]) => ScalarType::Decimal,
+        _ => return Err(no_func_overload(name)),
+    };
+    let func = match name {
+        "abs" => ScalarFunc::Abs,
+        _ => ScalarFunc::Round,
+    };
+    Ok((
+        RExpr::ScalarFunc {
+            func,
+            args: rargs,
+            result,
+        },
+        resolved_type_of(result),
+    ))
 }
 
 /// The 42803 raised for a non-aggregated column outside an aggregate with no GROUP BY.
@@ -2025,8 +2148,8 @@ fn resolve(
             };
             Ok((RExpr::Param(idx0), rty))
         }
-        Expr::FuncCall { name, arg, star } => {
-            resolve_aggregate(scope, name, arg.as_deref(), *star, agg, params)
+        Expr::FuncCall { name, args, star } => {
+            resolve_func_call(scope, name, args, *star, agg, params)
         }
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
@@ -3219,6 +3342,49 @@ impl RExpr {
                     }
                 }
                 Ok(coerce_case(els.eval(row, params, m)?, *coerce_decimal))
+            }
+            RExpr::ScalarFunc { func, args, result } => {
+                // One operator_eval per call (the uniform weight); arguments charge their own.
+                m.charge(COSTS.operator_eval);
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    let v = a.eval(row, params, m)?;
+                    if matches!(v, Value::Null) {
+                        return Ok(Value::Null); // NULL propagates
+                    }
+                    vals.push(v);
+                }
+                match func {
+                    ScalarFunc::Abs => match &vals[0] {
+                        // abs over an integer: |x| then range-check at the result type's
+                        // boundary (abs(int16 -32768) → 22003), exactly like Neg.
+                        Value::Int(n) => {
+                            let v = n.checked_abs().ok_or_else(|| overflow(*result))?;
+                            if result.in_range(v) {
+                                Ok(Value::Int(v))
+                            } else {
+                                Err(overflow(*result))
+                            }
+                        }
+                        Value::Decimal(d) => Ok(Value::Decimal(d.abs())),
+                        _ => unreachable!("resolver restricts abs to integer/decimal operands"),
+                    },
+                    ScalarFunc::Round => {
+                        let d = match &vals[0] {
+                            Value::Int(n) => Decimal::from_i64(*n),
+                            Value::Decimal(d) => d.clone(),
+                            _ => {
+                                unreachable!("resolver restricts round to integer/decimal operands")
+                            }
+                        };
+                        let places = match vals.get(1) {
+                            None => 0,
+                            Some(Value::Int(k)) => *k,
+                            Some(_) => unreachable!("resolver restricts round's count to integer"),
+                        };
+                        Ok(Value::Decimal(d.round_places(places)))
+                    }
+                }
             }
         }
     }

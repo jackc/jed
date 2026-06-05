@@ -217,8 +217,8 @@ const (
 	ExprIsNull
 	// ExprIsDistinct is `lhs IS [NOT] DISTINCT FROM rhs` (NULL-safe equality).
 	ExprIsDistinct
-	// ExprFuncCall is an aggregate function call — the first function-call syntax
-	// (spec/design/grammar.md §17). Only aggregates resolve this slice.
+	// ExprFuncCall is a function call — the shared aggregate/scalar call syntax
+	// (spec/design/grammar.md §17): an aggregate or a scalar function (abs/round) resolve.
 	ExprFuncCall
 	// ExprIn is `lhs IN (list)` / `lhs NOT IN (list)` — membership over a non-empty
 	// value list, desugared at resolve to the OR-chain (spec/design/grammar.md §20).
@@ -331,15 +331,17 @@ type IsDistinctExpr struct {
 	Negated bool
 }
 
-// FuncCallExpr is an aggregate function call — the engine's first function-call syntax
-// (spec/design/grammar.md §17). Name is the spelling as written (resolved case-insensitively
-// against the aggregate catalog; an unknown name is 42883). Star is the COUNT(*) row-count
-// form (then Arg is nil); otherwise Arg is the single argument expression. DISTINCT inside the
-// parens is rejected at parse (42601). Only aggregates resolve this slice; an aggregate in
-// WHERE/ON or nested in another aggregate is 42803 (spec/design/aggregates.md).
+// FuncCallExpr is a function call — the shared aggregate/scalar call syntax
+// (spec/design/grammar.md §17). Name is the spelling as written, resolved case-insensitively:
+// an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar function (abs/round, kind = "function",
+// spec/design/functions.md §9), or 42883 (undefined_function). Star is the COUNT(*) row-count
+// form (then Args is empty); otherwise Args is the comma-separated argument list — aggregates
+// and abs take one, round one or two. DISTINCT inside the parens is rejected at parse (42601).
+// An aggregate in WHERE/ON or nested in another aggregate is 42803 (spec/design/aggregates.md);
+// a scalar function is legal anywhere an expression is.
 type FuncCallExpr struct {
 	Name string
-	Arg  *Expr
+	Args []*Expr
 	Star bool
 }
 
