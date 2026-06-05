@@ -266,6 +266,10 @@ func LoadDatabase(image []byte) (*Database, error) {
 	}
 
 	db := NewDatabase()
+	// Adopt the file's serialization parameters so a later commit round-trips them
+	// (spec/design/api.md §2).
+	db.pageSize = uint32(pageSize)
+	db.txid = mt.txid
 	catPage := mt.rootPage
 	for catPage != 0 {
 		pg, err := readPage(image, pageSize, catPage)

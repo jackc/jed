@@ -6,6 +6,7 @@
 //!
 //! Boring, explicit modules with small footprints (CLAUDE.md §10).
 
+pub mod api;
 pub mod ast;
 pub mod catalog;
 pub mod cost;
@@ -14,6 +15,7 @@ pub mod decimal;
 pub mod encoding;
 pub mod error;
 pub mod executor;
+pub mod file;
 pub mod format;
 pub mod lexer;
 pub mod operators;
@@ -23,9 +25,11 @@ pub mod token;
 pub mod types;
 pub mod value;
 
+pub use api::{PreparedStatement, Rows};
 pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
-pub use executor::{Database, Outcome};
+pub use executor::{DEFAULT_PAGE_SIZE, Database, Outcome};
+pub use file::DatabaseOptions;
 pub use parser::Parser;
 pub use value::Value;
 
@@ -139,8 +143,17 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "resource.cost_metering",
 ];
 
-/// Parse and execute one SQL statement against `db`.
+/// Parse and execute one SQL statement against `db` (no bind parameters).
 pub fn execute(db: &mut Database, sql: &str) -> Result<Outcome> {
     let stmt = Parser::parse_sql(sql)?;
     db.execute_stmt(stmt)
+}
+
+/// Parse and execute one SQL statement against `db`, binding `params` to its `$N`
+/// placeholders (spec/design/api.md §5). A count mismatch is `42601`; a parameter whose type
+/// cannot be inferred is `42P18`; a bound value out of range / of the wrong family fails like a
+/// literal (22003/42804/…).
+pub fn execute_params(db: &mut Database, sql: &str, params: &[Value]) -> Result<Outcome> {
+    let stmt = Parser::parse_sql(sql)?;
+    db.execute_stmt_params(stmt, params)
 }

@@ -59,8 +59,17 @@ const (
 	GroupingError
 	// UndefinedFunction is 42883 — an unknown function name in a call (aggregates.md §5).
 	UndefinedFunction
+	// IndeterminateDatatype is 42P18 — a bind parameter $N whose type cannot be inferred from
+	// context (spec/design/api.md §5).
+	IndeterminateDatatype
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
+	// IoError is 58030 — an I/O error from the host file layer (spec/design/api.md §2).
+	IoError
+	// UndefinedFile is 58P01 — open of a database path that does not exist.
+	UndefinedFile
+	// DuplicateFile is 58P02 — create of a database path that already exists.
+	DuplicateFile
 	// DataCorrupted is XX001 — a malformed on-disk database file (CLAUDE.md §8).
 	DataCorrupted
 )
@@ -112,8 +121,16 @@ func (s SqlState) Code() string {
 		return "42803"
 	case UndefinedFunction:
 		return "42883"
+	case IndeterminateDatatype:
+		return "42P18"
 	case FeatureNotSupported:
 		return "0A000"
+	case IoError:
+		return "58030"
+	case UndefinedFile:
+		return "58P01"
+	case DuplicateFile:
+		return "58P02"
 	case DataCorrupted:
 		return "XX001"
 	default:

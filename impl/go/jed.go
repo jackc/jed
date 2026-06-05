@@ -105,11 +105,23 @@ var SupportedCapabilities = []string{
 	"resource.cost_metering",
 }
 
-// Execute parses and executes one SQL statement against db.
+// Execute parses and executes one SQL statement against db (no bind parameters).
 func Execute(db *Database, sql string) (Outcome, error) {
 	stmt, err := ParseSQL(sql)
 	if err != nil {
 		return Outcome{}, err
 	}
 	return db.ExecuteStmt(stmt)
+}
+
+// ExecuteParams parses and executes one SQL statement against db, binding params to its $N
+// placeholders (spec/design/api.md §5). A count mismatch is 42601; a parameter whose type
+// cannot be inferred is 42P18; a bound value out of range / of the wrong family fails like a
+// literal (22003/42804/…).
+func ExecuteParams(db *Database, sql string, params []Value) (Outcome, error) {
+	stmt, err := ParseSQL(sql)
+	if err != nil {
+		return Outcome{}, err
+	}
+	return db.ExecuteStmtParams(stmt, params)
 }

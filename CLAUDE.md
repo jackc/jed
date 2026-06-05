@@ -366,6 +366,12 @@ biases below are where an overriding reason *does* steer away from PG.
   `UPDATE`/`DELETE`:** incremental copy-on-write, free-list/page reclamation, and B-tree
   interior pages. The double-buffered meta page + root pointer are the forward-compatible
   hooks for the live incremental commit model (§3).
+- **Host file API (Phase 7).** The embedding surface (`spec/design/api.md`) `open`s/`create`s
+  a database file and `commit`s the whole image **durably** via temp-file + fsync + atomic
+  rename + dir fsync (whole-image rewrite ⇒ rename gives all-or-nothing for free). `commit` is
+  **explicit** and `close` does **not** auto-flush (uncommitted changes are discarded); an
+  in-memory `commit` is a no-op success, so the operation stays uniform and forward-compatible
+  with the future §3 staging-buffer transactions. Same shape across all three cores.
 
 ---
 

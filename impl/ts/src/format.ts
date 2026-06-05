@@ -348,6 +348,10 @@ export function loadDatabase(image: Uint8Array): Database {
   const mt = selectMeta(image, dv, pageSize);
 
   const db = new Database();
+  // Adopt the file's serialization parameters so a later commit round-trips them
+  // (spec/design/api.md §2).
+  db.pageSize = pageSize;
+  db.txid = mt.txid;
   let catPage = mt.rootPage;
   while (catPage !== 0) {
     const pg = readPage(image, dv, pageSize, catPage);

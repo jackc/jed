@@ -483,17 +483,25 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Phase 7 — Embedding / host API surface
 
-> The north star is an **embeddable library** (§1). Today the only entry point is
-> `Execute(db, sql)`. Parallelizable with most feature work.
+> The north star is an **embeddable library** (§1). The formal API + bind parameters have
+> **landed** (`spec/design/api.md`); the browser/OPFS host remains. Parallelizable with most
+> feature work.
 
-- [ ] **Formal public API** — open/close a database file, prepare a statement, execute,
-      iterate result rows, statement/lifecycle + structured error surface — designed to be
-      *the same shape* across cores. _(size: L; §1)_
-- [ ] **Parameterized queries (`$1`)** end-to-end — the `WHERE pk = $1` API implied by
-      §11 step 5. Per-impl surface (corpus stays literal-only, conformance.md §1.2). _(size: M)_
-- [ ] **Storage hosts** — Node `fs` host exists; build the **browser/OPFS** host
-      (`FileSystemSyncAccessHandle`) and confirm native file-host parity (§9, storage.md §2).
-      _(size: L; §9)_
+- [x] **Formal public API** — ✅ **landed** (`spec/design/api.md`): `create`/`open` a database
+      file, crash-safe explicit `commit` (temp + fsync + atomic rename + dir fsync) / `close`,
+      `prepare` a statement, execute, iterate result rows via a `Rows` cursor, structured-error
+      surface (+ class-58 host codes). Same shape across all three cores; back-compat
+      `execute(db, sql)` kept. _(was: size L; §1)_
+- [x] **Parameterized queries (`$1`)** end-to-end — ✅ **landed**: `$N` is lexed/parsed,
+      context-typed at resolve (42P18 if indeterminate), bound two-phase before any scan, run
+      through `prepare`/`execute`/`execute_params`. Per-impl surface — corpus stays literal-only
+      (conformance.md §1.2); tested in-impl (`params` test per core). _(was: size M)_
+- [ ] **Storage hosts** — Node `fs` host **built** (Phase 7, `impl/ts/src/file.ts`; Rust/Go use
+      `std::fs`/`os` directly); build the **browser/OPFS** host (`FileSystemSyncAccessHandle`)
+      and confirm native file-host parity (§9, storage.md §2). _(size: L; §9)_
+- [ ] **Cost ceiling (`max_cost`) + deterministic abort** — the metering seam exists (cost.md
+      §6, `Outcome` carries `cost`); the host API shape reserves an options object on
+      `prepare`/`execute` for it. Wire it + register a resource-limit SQLSTATE. _(size: M; §13)_
 - [ ] **(Open question, not scheduled)** low-level direct access API beneath SQL
       (`getValue("table", key)`) — keep the seam open, don't build yet (§9). _(size: —)_
 

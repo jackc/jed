@@ -53,12 +53,29 @@ impl Outcome {
     }
 }
 
+/// The default serialization page size (8 KiB — spec/design/storage.md §3), used for a fresh
+/// in-memory or newly-created database when no explicit size is given.
+pub const DEFAULT_PAGE_SIZE: u32 = 8192;
+
 /// The whole database: catalog + per-table in-memory stores. Single committed
 /// state (CLAUDE.md §3); the staging-buffer commit model lands with persistence.
-#[derive(Default)]
 pub struct Database {
     tables: HashMap<String, Table>,
     stores: HashMap<String, TableStore>,
+    /// The backing file path (`None` for an in-memory database). Set by the host API
+    /// `open`/`create` (spec/design/api.md §2); `commit` writes here.
+    pub(crate) path: Option<std::path::PathBuf>,
+    /// The monotonic commit counter: read from the file on open, bumped by 1 per `commit`.
+    pub(crate) txid: u64,
+    /// The page size this database serializes with (from the file on open, from create opts,
+    /// else `DEFAULT_PAGE_SIZE`). Fixed for the life of a file.
+    pub(crate) page_size: u32,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Database {
@@ -66,7 +83,26 @@ impl Database {
         Database {
             tables: HashMap::new(),
             stores: HashMap::new(),
+            path: None,
+            txid: 0,
+            page_size: DEFAULT_PAGE_SIZE,
         }
+    }
+
+    /// The monotonic commit counter (spec/design/api.md §2): 0 for a fresh in-memory database,
+    /// the file's value on open, bumped by 1 per `commit`.
+    pub fn txid(&self) -> u64 {
+        self.txid
+    }
+
+    /// The page size this database serializes with (spec/design/api.md §2).
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
+    /// The backing file path, or `None` for an in-memory database.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
     }
 
     /// Look up a table definition by name (case-insensitive).
@@ -99,15 +135,28 @@ impl Database {
             .collect()
     }
 
-    /// Execute one parsed statement.
+    /// Execute one parsed statement with no bind parameters.
     pub fn execute_stmt(&mut self, stmt: Statement) -> Result<Outcome> {
+        self.execute_stmt_params(stmt, &[])
+    }
+
+    /// Execute one parsed statement, binding `params` to its `$N` placeholders (an empty slice
+    /// for an unparameterized statement). The DDL statements take no parameters — supplying any
+    /// is a 42601 (spec/design/api.md §5).
+    pub fn execute_stmt_params(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
         match stmt {
-            Statement::CreateTable(ct) => self.execute_create_table(ct),
-            Statement::DropTable(dt) => self.execute_drop_table(dt),
-            Statement::Insert(ins) => self.execute_insert(ins),
-            Statement::Select(sel) => self.execute_select(sel),
-            Statement::Update(upd) => self.execute_update(upd),
-            Statement::Delete(del) => self.execute_delete(del),
+            Statement::CreateTable(ct) => {
+                reject_params_for_ddl(params)?;
+                self.execute_create_table(ct)
+            }
+            Statement::DropTable(dt) => {
+                reject_params_for_ddl(params)?;
+                self.execute_drop_table(dt)
+            }
+            Statement::Insert(ins) => self.execute_insert(ins, params),
+            Statement::Select(sel) => self.execute_select(sel, params),
+            Statement::Update(upd) => self.execute_update(upd, params),
+            Statement::Delete(del) => self.execute_delete(del, params),
         }
     }
 
@@ -214,7 +263,7 @@ impl Database {
     /// all-or-nothing** (spec/design/grammar.md §12, constraints.md §2), mirroring UPDATE: every
     /// row is validated — including its storage key — before any row is inserted, so a mid-batch
     /// failure stores nothing.
-    fn execute_insert(&mut self, ins: Insert) -> Result<Outcome> {
+    fn execute_insert(&mut self, ins: Insert, params: &[Value]) -> Result<Outcome> {
         let table = self.table(&ins.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
@@ -259,6 +308,21 @@ impl Database {
             None => ((0..n).map(Some).collect(), n),
         };
 
+        // A `$N` in a VALUES slot is typed as its TARGET COLUMN's type. Collect those types
+        // across every row (a `$N` reused under two columns unifies; spec/design/api.md §5),
+        // then bind the supplied values up front so a bad bind fails before any row is stored.
+        let mut ptypes = ParamTypes::default();
+        for values in &ins.rows {
+            for (i, col) in columns.iter().enumerate() {
+                if let Some(p) = provided[i] {
+                    if let Some(InsertValue::Param(nn)) = values.get(p) {
+                        ptypes.note((*nn as usize) - 1, Some(col.ty))?;
+                    }
+                }
+            }
+        }
+        let bound = bind_params(params, &ptypes.finalize()?)?;
+
         // Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
         // table with a primary key, `key` is Some(encoded) and is checked for a duplicate
         // (within the batch via `seen_keys`, and against the store) up front; for a table
@@ -293,6 +357,9 @@ impl Database {
                 let candidate = match provided[i] {
                     Some(p) => match &values[p] {
                         InsertValue::Lit(lit) => literal_to_value(lit),
+                        // A bound `$N` value; its target-column coercion is the `store_value`
+                        // below, identical to a literal in this slot (spec/design/api.md §5).
+                        InsertValue::Param(nn) => bound[(*nn as usize) - 1].clone(),
                         InsertValue::Default => col.default.clone().unwrap_or(Value::Null),
                     },
                     None => col.default.clone().unwrap_or(Value::Null),
@@ -361,7 +428,7 @@ impl Database {
     /// the keys of matching rows (only a TRUE predicate matches — Kleene), then
     /// remove them. No WHERE deletes every row. Keys are collected before mutating
     /// so the map is not modified while iterating.
-    fn execute_delete(&mut self, del: Delete) -> Result<Outcome> {
+    fn execute_delete(&mut self, del: Delete, params: &[Value]) -> Result<Outcome> {
         let table = self.table(&del.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
@@ -370,10 +437,12 @@ impl Database {
         })?;
         // DELETE is single-table; resolve its WHERE against a one-relation scope.
         let scope = Scope::single(table);
+        let mut ptypes = ParamTypes::default();
         let filter = match &del.filter {
-            Some(p) => Some(resolve_boolean_filter(&scope, p)?),
+            Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
             None => None,
         };
+        let bound = bind_params(params, &ptypes.finalize()?)?;
 
         // Collect matching keys before mutating (so the map is not modified mid-scan).
         // A WHERE arithmetic can trap (22003/22012), so this is an explicit loop that
@@ -385,7 +454,7 @@ impl Database {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
-                Some(f) => f.eval(row, &mut meter)?.is_true(),
+                Some(f) => f.eval(row, &bound, &mut meter)?.is_true(),
             };
             if matched {
                 keys.push(k.clone());
@@ -407,7 +476,7 @@ impl Database {
     /// writes. Phase 2 applies. Assigning a PRIMARY KEY column traps `0A000` (the
     /// storage key must not change this slice); a duplicate target column traps
     /// `42701`. No WHERE updates every row.
-    fn execute_update(&mut self, upd: Update) -> Result<Outcome> {
+    fn execute_update(&mut self, upd: Update, params: &[Value]) -> Result<Outcome> {
         let table = self.table(&upd.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
@@ -420,6 +489,7 @@ impl Database {
 
         // Resolve assignments up front (fail fast, deterministic).
         let pk_idx = table.primary_key_index();
+        let mut ptypes = ParamTypes::default();
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
         for a in &upd.assignments {
             let idx = col_idx(table, &a.column)?;
@@ -440,7 +510,13 @@ impl Database {
             // operand adapts to the target column's type. The result must be assignable to
             // the column's family (integer/decimal/text or NULL; never boolean; decimal→int
             // is explicit-CAST only) — spec/design/decimal.md §6.
-            let (source, ty) = resolve(&scope, &a.value, Some(col.ty), &mut AggCtx::Forbidden)?;
+            let (source, ty) = resolve(
+                &scope,
+                &a.value,
+                Some(col.ty),
+                &mut AggCtx::Forbidden,
+                &mut ptypes,
+            )?;
             require_assignable(ty, col.ty, &a.column)?;
             plans.push(AssignPlan {
                 idx,
@@ -453,9 +529,11 @@ impl Database {
         }
 
         let filter = match &upd.filter {
-            Some(p) => Some(resolve_boolean_filter(&scope, p)?),
+            Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
             None => None,
         };
+        // All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
+        let bound = bind_params(params, &ptypes.finalize()?)?;
 
         // Phase 1: build + validate every matching row's new values; no writes yet. Each
         // scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes
@@ -466,14 +544,14 @@ impl Database {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
-                Some(f) => f.eval(row, &mut meter)?.is_true(),
+                Some(f) => f.eval(row, &bound, &mut meter)?.is_true(),
             };
             if !matched {
                 continue;
             }
             let mut new_row = row.clone();
             for plan in &plans {
-                let raw = plan.source.eval(row, &mut meter)?;
+                let raw = plan.source.eval(row, &bound, &mut meter)?;
                 new_row[plan.idx] = plan.check(raw)?;
             }
             updates.push((key.clone(), new_row));
@@ -494,7 +572,10 @@ impl Database {
     /// the predicate (three-valued — only TRUE keeps a row), optionally re-sort by
     /// ORDER BY, then project. Rows are produced in a deterministic order
     /// (CLAUDE.md §10).
-    fn execute_select(&mut self, sel: Select) -> Result<Outcome> {
+    fn execute_select(&mut self, sel: Select, params: &[Value]) -> Result<Outcome> {
+        // Accumulates the inferred type of each `$N` across every clause of this SELECT, then is
+        // finalized + bound once all resolution is done (spec/design/api.md §5).
+        let mut ptypes = ParamTypes::default();
         // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
         // relation's flat column offset in FROM order, and reject a duplicate label — a
         // self-join without distinct aliases is 42712 (spec/design/grammar.md §15).
@@ -558,14 +639,15 @@ impl Database {
         } else {
             AggCtx::Forbidden
         };
-        let (projections, column_names) = resolve_projections(&scope, &sel.items, &mut agg_ctx)?;
+        let (projections, column_names) =
+            resolve_projections(&scope, &sel.items, &mut agg_ctx, &mut ptypes)?;
         // HAVING resolves against the same grouped scope (Collect) — it may reference aggregates
         // (collected into the SAME specs, so their slots follow the projection's) and grouping
         // keys; a non-grouped column is 42803. It must be boolean (42804). Resolved after the
         // projection so the synthetic row is [group_keys..., projection aggs..., HAVING aggs...].
         let having = match &sel.having {
             Some(h) => {
-                let (node, ty) = resolve(&scope, h, None, &mut agg_ctx)?;
+                let (node, ty) = resolve(&scope, h, None, &mut agg_ctx, &mut ptypes)?;
                 match ty {
                     ResolvedType::Bool | ResolvedType::Null => Some(node),
                     _ => return Err(type_error("argument of HAVING must be boolean")),
@@ -585,7 +667,7 @@ impl Database {
             ));
         }
         let filter = match &sel.filter {
-            Some(p) => Some(resolve_boolean_filter(&scope, p)?),
+            Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
             None => None,
         };
         // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
@@ -652,10 +734,19 @@ impl Database {
                     let partial = Scope {
                         rels: scope.rels[..=k + 1].to_vec(),
                     };
-                    join_ons.push(Some(resolve_boolean_filter(&partial, on_expr)?));
+                    join_ons.push(Some(resolve_boolean_filter(
+                        &partial,
+                        on_expr,
+                        &mut ptypes,
+                    )?));
                 }
             }
         }
+
+        // All clauses resolved: finalize the inferred parameter types and bind the supplied
+        // values (count mismatch 42601; out-of-range/family errors 22003/42804) BEFORE scanning
+        // any rows (spec/design/api.md §5).
+        let bound = bind_params(params, &ptypes.finalize()?)?;
 
         // Materialize each base table once, in primary-key order, charging storage_row_read
         // per physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these
@@ -701,7 +792,7 @@ impl Database {
                     combined.extend_from_slice(right);
                     let keep = match on {
                         None => true,
-                        Some(pred) => pred.eval(&combined, &mut meter)?.is_true(),
+                        Some(pred) => pred.eval(&combined, &bound, &mut meter)?.is_true(),
                     };
                     if keep {
                         next.push(combined);
@@ -733,7 +824,7 @@ impl Database {
         for row in running {
             let keep = match &filter {
                 None => true,
-                Some(f) => f.eval(&row, &mut meter)?.is_true(),
+                Some(f) => f.eval(&row, &bound, &mut meter)?.is_true(),
             };
             if keep {
                 rows.push(row);
@@ -812,7 +903,7 @@ impl Database {
                 for (si, spec) in agg_specs.iter().enumerate() {
                     meter.charge(COSTS.aggregate_accumulate);
                     let v = match &spec.operand {
-                        Some(op) => op.eval(row, &mut meter)?,
+                        Some(op) => op.eval(row, &bound, &mut meter)?,
                         None => Value::Null, // COUNT(*) ignores the value
                     };
                     groups[gi].1[si].fold(v)?;
@@ -834,7 +925,7 @@ impl Database {
             if let Some(h) = &having {
                 let mut kept: Vec<Vec<Value>> = Vec::with_capacity(group_rows.len());
                 for srow in group_rows {
-                    if h.eval(&srow, &mut meter)?.is_true() {
+                    if h.eval(&srow, &bound, &mut meter)?.is_true() {
                         kept.push(srow);
                     }
                 }
@@ -859,7 +950,7 @@ impl Database {
                 meter.charge(COSTS.row_produced);
                 let mut out = Vec::with_capacity(projections.len());
                 for p in &projections {
-                    out.push(p.eval(srow, &mut meter)?);
+                    out.push(p.eval(srow, &bound, &mut meter)?);
                 }
                 out_rows.push(out);
             }
@@ -874,7 +965,7 @@ impl Database {
             for row in &rows {
                 let mut out = Vec::with_capacity(projections.len());
                 for p in &projections {
-                    out.push(p.eval(row, &mut meter)?);
+                    out.push(p.eval(row, &bound, &mut meter)?);
                 }
                 if seen.insert(out.clone()) {
                     distinct_rows.push(out);
@@ -901,7 +992,7 @@ impl Database {
                 meter.charge(COSTS.row_produced);
                 let mut out = Vec::with_capacity(projections.len());
                 for p in &projections {
-                    out.push(p.eval(row, &mut meter)?);
+                    out.push(p.eval(row, &bound, &mut meter)?);
                 }
                 out_rows.push(out);
             }
@@ -1071,6 +1162,10 @@ enum RExpr {
     ConstBytea(Vec<u8>),
     ConstUuid([u8; 16]),
     ConstNull,
+    /// A bind parameter, by 0-based index into the bound-values slice passed to `eval`. Its
+    /// static type was inferred from context at resolve (spec/design/api.md §5); the value
+    /// is supplied (and coerced to that type) before evaluation.
+    Param(usize),
     Cast {
         inner: Box<RExpr>,
         target: ScalarType,
@@ -1322,7 +1417,7 @@ fn items_have_aggregate(items: &SelectItems) -> bool {
 fn expr_has_funccall(e: &Expr) -> bool {
     match e {
         Expr::FuncCall { .. } => true,
-        Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::Literal(_) => false,
+        Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::Literal(_) | Expr::Param(_) => false,
         Expr::Cast { inner, .. } => expr_has_funccall(inner),
         Expr::Unary { operand, .. } => expr_has_funccall(operand),
         Expr::IsNull { operand, .. } => expr_has_funccall(operand),
@@ -1384,6 +1479,7 @@ fn resolve_aggregate(
     arg: Option<&Expr>,
     star: bool,
     agg: &mut AggCtx,
+    params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     if matches!(agg, AggCtx::Forbidden) {
         return Err(EngineError::new(
@@ -1400,7 +1496,7 @@ fn resolve_aggregate(
             ResolvedType::Int(ScalarType::Int64),
         ),
         AggFunc::Count => {
-            let (r, _t) = resolve(scope, expect_arg(arg)?, None, &mut sub)?;
+            let (r, _t) = resolve(scope, expect_arg(arg)?, None, &mut sub, params)?;
             (
                 AggPlan::Count,
                 Some(r),
@@ -1414,7 +1510,7 @@ fn resolve_aggregate(
             ));
         }
         AggFunc::Sum => {
-            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub)?;
+            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub, params)?;
             match t {
                 // int16/int32 -> int64 (accumulate i64); int64 -> decimal (PG widening).
                 ResolvedType::Int(it) if it == ScalarType::Int64 => {
@@ -1430,7 +1526,7 @@ fn resolve_aggregate(
             }
         }
         AggFunc::Avg => {
-            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub)?;
+            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub, params)?;
             match t {
                 ResolvedType::Int(_) | ResolvedType::Decimal => {
                     (AggPlan::Avg, Some(r), ResolvedType::Decimal)
@@ -1440,11 +1536,11 @@ fn resolve_aggregate(
         }
         // MIN/MAX accept any ordered scalar; the result is the argument's type.
         AggFunc::Min => {
-            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub)?;
+            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub, params)?;
             (AggPlan::Min, Some(r), t)
         }
         AggFunc::Max => {
-            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub)?;
+            let (r, t) = resolve(scope, expect_arg(arg)?, None, &mut sub, params)?;
             (AggPlan::Max, Some(r), t)
         }
     };
@@ -1508,6 +1604,7 @@ fn resolve_projections(
     scope: &Scope,
     items: &SelectItems,
     agg: &mut AggCtx,
+    params: &mut ParamTypes,
 ) -> Result<(Vec<RExpr>, Vec<String>)> {
     match items {
         SelectItems::All => {
@@ -1525,7 +1622,7 @@ fn resolve_projections(
             let mut nodes = Vec::with_capacity(items.len());
             let mut names = Vec::with_capacity(items.len());
             for it in items {
-                let (node, _) = resolve(scope, &it.expr, None, agg)?;
+                let (node, _) = resolve(scope, &it.expr, None, agg, params)?;
                 names.push(match &it.alias {
                     Some(a) => a.clone(),
                     None => output_name(scope, &it.expr),
@@ -1562,10 +1659,10 @@ fn output_name(scope: &Scope, e: &Expr) -> String {
 
 /// Resolve a WHERE / ON expression: it must resolve to boolean (or an untyped NULL, which
 /// is always unknown → no rows). An integer-valued WHERE/ON is a 42804 type error.
-fn resolve_boolean_filter(scope: &Scope, e: &Expr) -> Result<RExpr> {
+fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> Result<RExpr> {
     // WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
     let mut agg = AggCtx::Forbidden;
-    let (node, ty) = resolve(scope, e, None, &mut agg)?;
+    let (node, ty) = resolve(scope, e, None, &mut agg, params)?;
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(node),
         ResolvedType::Int(_)
@@ -1573,6 +1670,110 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr) -> Result<RExpr> {
         | ResolvedType::Decimal
         | ResolvedType::Bytea
         | ResolvedType::Uuid => Err(type_error("argument of WHERE must be boolean")),
+    }
+}
+
+/// Per-statement accumulator of bind-parameter types, inferred from context during resolve
+/// (spec/design/api.md §5). `types[i]` is the inferred scalar type of `$(i+1)`; `None` marks a
+/// parameter referenced before any context fixed its type. Shared across every clause of a
+/// statement (so a `$1` used in both WHERE and the select list unifies), then `finalize`d.
+#[derive(Default)]
+struct ParamTypes {
+    types: Vec<Option<ScalarType>>,
+}
+
+impl ParamTypes {
+    /// Record that `$(idx0+1)` appears with context type `ty` (`None` = no context here).
+    /// Unifies with any prior inference for the same index: equal types agree, two integer
+    /// widths widen to the wider, an incompatible concrete pair is 42804.
+    fn note(&mut self, idx0: usize, ty: Option<ScalarType>) -> Result<()> {
+        if idx0 >= self.types.len() {
+            self.types.resize(idx0 + 1, None);
+        }
+        if let Some(new) = ty {
+            self.types[idx0] = Some(match self.types[idx0] {
+                None => new,
+                Some(old) => unify_param_type(old, new, idx0)?,
+            });
+        }
+        Ok(())
+    }
+
+    /// Finalize to the ordered parameter types. A slot referenced but never typed — including a
+    /// gap in `$1..$N` — is 42P18 indeterminate_datatype.
+    fn finalize(self) -> Result<Vec<ScalarType>> {
+        let mut out = Vec::with_capacity(self.types.len());
+        for (i, t) in self.types.into_iter().enumerate() {
+            match t {
+                Some(ty) => out.push(ty),
+                None => {
+                    return Err(EngineError::new(
+                        SqlState::IndeterminateDatatype,
+                        format!("could not determine data type of parameter ${}", i + 1),
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Unify two inferred types for the same bind parameter: equal agrees; two integer widths
+/// widen to the wider (so `$1` works against both an int16 and an int32 column); any other
+/// mismatch is 42804 (spec/design/api.md §5).
+fn unify_param_type(a: ScalarType, b: ScalarType, idx0: usize) -> Result<ScalarType> {
+    if a == b {
+        return Ok(a);
+    }
+    if a.is_integer() && b.is_integer() {
+        return Ok(if a.rank() >= b.rank() { a } else { b });
+    }
+    Err(EngineError::new(
+        SqlState::DatatypeMismatch,
+        format!("inconsistent types inferred for parameter ${}", idx0 + 1),
+    ))
+}
+
+/// Coerce each supplied bind value to its inferred parameter type, two-phase / all-or-nothing
+/// like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value is validated
+/// up front (22003/42804/22P02/23502 via `store_value`) before any row is touched.
+fn bind_params(supplied: &[Value], types: &[ScalarType]) -> Result<Vec<Value>> {
+    if supplied.len() != types.len() {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            format!(
+                "bind parameter count mismatch: statement expects {}, got {}",
+                types.len(),
+                supplied.len()
+            ),
+        ));
+    }
+    let mut bound = Vec::with_capacity(types.len());
+    for (i, (v, ty)) in supplied.iter().zip(types).enumerate() {
+        // A bound parameter is coerced exactly like a literal in that position: typmod is
+        // unconstrained (a comparison/insert against a column re-applies the column typmod),
+        // not_null is false (NULL is a legal bound value; a NOT NULL target re-checks at store).
+        bound.push(store_value(
+            v.clone(),
+            *ty,
+            None,
+            false,
+            &format!("${}", i + 1),
+        )?);
+    }
+    Ok(bound)
+}
+
+/// A DDL statement (CREATE/DROP TABLE) has no expressions and so takes no bind parameters;
+/// supplying any is a 42601 (spec/design/api.md §5).
+fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
+    if params.is_empty() {
+        Ok(())
+    } else {
+        Err(EngineError::new(
+            SqlState::SyntaxError,
+            "bind parameters are not allowed in a DDL statement",
+        ))
     }
 }
 
@@ -1603,6 +1804,7 @@ fn resolve(
     e: &Expr,
     ctx: Option<ScalarType>,
     agg: &mut AggCtx,
+    params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     match e {
         Expr::Column(name) => {
@@ -1616,8 +1818,21 @@ fn resolve(
             let idx = scope.resolve_qualified(qualifier, name)?;
             collect_column(scope, agg, idx, name)
         }
+        Expr::Param(n1) => {
+            // A bind parameter is an adaptable operand (like an integer/string literal): it
+            // takes its type from `ctx` — the sibling operand, target column, or CAST target.
+            // Record the inferred type (None = no context here; `finalize` 42P18s a parameter
+            // that never gets one). spec/design/api.md §5.
+            let idx0 = (*n1 as usize) - 1;
+            params.note(idx0, ctx)?;
+            let rty = match ctx {
+                Some(t) => resolved_type_of(t),
+                None => ResolvedType::Null,
+            };
+            Ok((RExpr::Param(idx0), rty))
+        }
         Expr::FuncCall { name, arg, star } => {
-            resolve_aggregate(scope, name, arg.as_deref(), *star, agg)
+            resolve_aggregate(scope, name, arg.as_deref(), *star, agg, params)
         }
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
@@ -1700,7 +1915,7 @@ fn resolve(
             }
             // The inner value is range-checked / coerced against `target` at eval, so it
             // resolves with no literal context here.
-            let (rinner, ity) = resolve(scope, inner, None, agg)?;
+            let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
             match ity {
                 // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
                 // decimal→decimal (re-scale), and NULL are all castable.
@@ -1751,7 +1966,7 @@ fn resolve(
             op: UnaryOp::Neg,
             operand,
         } => {
-            let (rop, ty) = resolve(scope, operand, ctx, agg)?;
+            let (rop, ty) = resolve(scope, operand, ctx, agg, params)?;
             let result = match ty {
                 ResolvedType::Int(t) => t,
                 ResolvedType::Decimal => ScalarType::Decimal,
@@ -1780,13 +1995,13 @@ fn resolve(
             op: UnaryOp::Not,
             operand,
         } => {
-            let (rop, ty) = resolve(scope, operand, None, agg)?;
+            let (rop, ty) = resolve(scope, operand, None, agg, params)?;
             require_bool(ty, "NOT requires a boolean operand")?;
             Ok((RExpr::Not(Box::new(rop)), ResolvedType::Bool))
         }
         Expr::IsNull { operand, negated } => {
             // IS [NOT] NULL accepts any operand type and always yields a definite boolean.
-            let (rop, _ty) = resolve(scope, operand, None, agg)?;
+            let (rop, _ty) = resolve(scope, operand, None, agg, params)?;
             Ok((
                 RExpr::IsNull {
                     operand: Box::new(rop),
@@ -1800,7 +2015,7 @@ fn resolve(
             // (a literal adapts to its sibling; a text literal stays text), then require
             // the operands be comparable (both integer-ish or both text-ish; a mixed pair
             // is 42804). The result is always a definite boolean (functions.md §3).
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg)?;
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
             classify_comparable(lt, rt)?;
             Ok((
                 RExpr::Distinct {
@@ -1811,7 +2026,7 @@ fn resolve(
                 ResolvedType::Bool,
             ))
         }
-        Expr::Binary { op, lhs, rhs } => resolve_binary(scope, *op, lhs, rhs, agg),
+        Expr::Binary { op, lhs, rhs } => resolve_binary(scope, *op, lhs, rhs, agg, params),
         Expr::In { lhs, list, negated } => {
             // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` ≡
             // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list
@@ -1835,7 +2050,7 @@ fn resolve(
                     operand: Box::new(desugared),
                 };
             }
-            resolve(scope, &desugared, ctx, agg)
+            resolve(scope, &desugared, ctx, agg, params)
         }
         Expr::Between {
             lhs,
@@ -1857,14 +2072,14 @@ fn resolve(
                     operand: Box::new(desugared),
                 };
             }
-            resolve(scope, &desugared, ctx, agg)
+            resolve(scope, &desugared, ctx, agg, params)
         }
         Expr::Like { lhs, rhs, negated } => {
             // LIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal
             // stays text), then require BOTH operands be text (or a bare NULL); a non-text
             // operand is 42804. We do NOT use classify_comparable here — it would wrongly accept
             // bytea×bytea, which LIKE does not define.
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg)?;
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
             require_text_or_null(lt)?;
             require_text_or_null(rt)?;
             Ok((
@@ -1891,20 +2106,20 @@ fn resolve(
                 let rcond = match operand {
                     Some(op) => {
                         let eq = binary_expr(BinaryOp::Eq, (**op).clone(), cond.clone());
-                        resolve(scope, &eq, None, agg)?.0
+                        resolve(scope, &eq, None, agg, params)?.0
                     }
                     None => {
-                        let (rc, cty) = resolve(scope, cond, None, agg)?;
+                        let (rc, cty) = resolve(scope, cond, None, agg, params)?;
                         require_bool(cty, "CASE WHEN condition must be boolean")?;
                         rc
                     }
                 };
-                let (rres, rty) = resolve(scope, res, None, agg)?;
+                let (rres, rty) = resolve(scope, res, None, agg, params)?;
                 result_types.push(rty);
                 arms.push((rcond, rres));
             }
             let (rels, ety) = match els {
-                Some(e) => resolve(scope, e, None, agg)?,
+                Some(e) => resolve(scope, e, None, agg, params)?,
                 None => (RExpr::ConstNull, ResolvedType::Null),
             };
             result_types.push(ety);
@@ -1928,6 +2143,7 @@ fn resolve_binary(
     lhs: &Expr,
     rhs: &Expr,
     agg: &mut AggCtx,
+    params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     match op {
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
@@ -1936,7 +2152,7 @@ fn resolve_binary(
             // integer → integer arithmetic (promotion tower); at least one decimal → decimal
             // arithmetic (the integer operand widens at eval); a text/boolean operand is a
             // 42804 (spec/design/decimal.md §4).
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg)?;
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
             require_numeric_operand(lt)?;
             require_numeric_operand(rt)?;
             let aop = match op {
@@ -1968,7 +2184,7 @@ fn resolve_binary(
             // Resolve the operands (a literal adapts to its sibling; text literals stay
             // text), then require they be comparable — a mixed integer/text pair is 42804.
             // The runtime comparison (eq3/lt3/gt3) dispatches on the value variants.
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg)?;
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
             classify_comparable(lt, rt)?;
             let cop = match op {
                 BinaryOp::Eq => CmpOp::Eq,
@@ -1988,8 +2204,8 @@ fn resolve_binary(
             ))
         }
         BinaryOp::And | BinaryOp::Or => {
-            let (rl, lt) = resolve(scope, lhs, None, agg)?;
-            let (rr, rt) = resolve(scope, rhs, None, agg)?;
+            let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
+            let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
             require_bool(lt, "AND/OR requires boolean operands")?;
             require_bool(rt, "AND/OR requires boolean operands")?;
             let node = if matches!(op, BinaryOp::And) {
@@ -2014,50 +2230,56 @@ fn resolve_operand_pair(
     lhs: &Expr,
     rhs: &Expr,
     agg: &mut AggCtx,
+    params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
-    let lhs_lit = is_adaptable_literal(lhs);
-    let rhs_lit = is_adaptable_literal(rhs);
+    let lhs_lit = is_adaptable_operand(lhs);
+    let rhs_lit = is_adaptable_operand(rhs);
     let (rl, lt, rr, rt) = if lhs_lit && rhs_lit {
-        // Two bare literals: no column context. Default an integer literal to int64; a string
-        // literal stays text (no bytea context to decode it — types.md §6).
-        let (rl, lt) = resolve(scope, lhs, Some(ScalarType::Int64), agg)?;
-        let (rr, rt) = resolve(scope, rhs, Some(ScalarType::Int64), agg)?;
+        // Two bare adaptable operands: no column context. Default an integer literal (and a
+        // bind parameter) to int64; a string literal stays text (no bytea context — types.md §6).
+        let (rl, lt) = resolve(scope, lhs, Some(ScalarType::Int64), agg, params)?;
+        let (rr, rt) = resolve(scope, rhs, Some(ScalarType::Int64), agg, params)?;
         (rl, lt, rr, rt)
     } else if lhs_lit {
-        let (rr, rt) = resolve(scope, rhs, None, agg)?;
-        let (rl, lt) = resolve(scope, lhs, ctx_of(rt), agg)?;
+        let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
+        let (rl, lt) = resolve(scope, lhs, ctx_of(rt), agg, params)?;
         (rl, lt, rr, rt)
     } else if rhs_lit {
-        let (rl, lt) = resolve(scope, lhs, None, agg)?;
-        let (rr, rt) = resolve(scope, rhs, ctx_of(lt), agg)?;
+        let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
+        let (rr, rt) = resolve(scope, rhs, ctx_of(lt), agg, params)?;
         (rl, lt, rr, rt)
     } else {
-        let (rl, lt) = resolve(scope, lhs, None, agg)?;
-        let (rr, rt) = resolve(scope, rhs, None, agg)?;
+        let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
+        let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
         (rl, lt, rr, rt)
     };
     Ok((rl, lt, rr, rt))
 }
 
-/// Whether `e` is a literal that adapts to its sibling operand's type (an integer or string
-/// literal). NULL, boolean, and decimal literals do not take a sibling's context here.
-fn is_adaptable_literal(e: &Expr) -> bool {
+/// Whether `e` is an *adaptable operand* — one that takes its type from its sibling: an integer
+/// or string literal, or a bind parameter `$N` (spec/design/api.md §5). NULL, boolean, and
+/// decimal literals do not take a sibling's context here.
+fn is_adaptable_operand(e: &Expr) -> bool {
     matches!(
         e,
-        Expr::Literal(Literal::Int(_)) | Expr::Literal(Literal::Text(_))
+        Expr::Literal(Literal::Int(_)) | Expr::Literal(Literal::Text(_)) | Expr::Param(_)
     )
 }
 
-/// The context type a sibling operand offers an adaptable literal: an integer type (so an
-/// integer literal adopts that width), or `bytea`/`text` (so a string literal can decode to
-/// bytea, else stay text). `None` for bool/decimal/NULL — no useful literal context.
+/// The context type a sibling operand offers an adaptable operand. For an integer literal this
+/// is the integer width it adopts; for a string literal, `bytea`/`uuid`/`text` (so it can decode
+/// the hex/uuid input); a bind parameter additionally adopts a `decimal`/`boolean` sibling (a
+/// literal ignores those — its arm keeps int64/text — so widening the mapping is safe). Only a
+/// bare NULL offers no context.
 fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
     match ty {
         ResolvedType::Int(t) => Some(t),
         ResolvedType::Bytea => Some(ScalarType::Bytea),
         ResolvedType::Uuid => Some(ScalarType::Uuid),
         ResolvedType::Text => Some(ScalarType::Text),
-        ResolvedType::Bool | ResolvedType::Decimal | ResolvedType::Null => None,
+        ResolvedType::Bool => Some(ScalarType::Bool),
+        ResolvedType::Decimal => Some(ScalarType::Decimal),
+        ResolvedType::Null => None,
     }
 }
 
@@ -2539,11 +2761,14 @@ impl RExpr {
     /// its operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both
     /// operands are always evaluated — there is no short-circuit, so the count never
     /// depends on operand values (spec/design/cost.md §3).
-    fn eval(&self, row: &[Value], m: &mut Meter) -> Result<Value> {
+    fn eval(&self, row: &[Value], params: &[Value], m: &mut Meter) -> Result<Value> {
         match self {
             // The value is read out of a borrowed stored row, so it is cloned (Value is
             // Clone, not Copy, now that a text value owns a String).
             RExpr::Column(i) => Ok(row[*i].clone()),
+            // A bind parameter — the supplied value, already coerced to its inferred type by
+            // `bind_params` before execution (spec/design/api.md §5).
+            RExpr::Param(i) => Ok(params[*i].clone()),
             RExpr::ConstInt(n) => Ok(Value::Int(*n)),
             RExpr::ConstBool(b) => Ok(Value::Bool(*b)),
             RExpr::ConstText(s) => Ok(Value::Text(s.clone())),
@@ -2557,7 +2782,7 @@ impl RExpr {
                 typmod,
             } => {
                 m.charge(COSTS.operator_eval);
-                match inner.eval(row, m)? {
+                match inner.eval(row, params, m)? {
                     Value::Null => Ok(Value::Null),
                     Value::Int(n) => {
                         if target.is_decimal() {
@@ -2595,7 +2820,7 @@ impl RExpr {
             }
             RExpr::Neg { operand, result } => {
                 m.charge(COSTS.operator_eval);
-                match operand.eval(row, m)? {
+                match operand.eval(row, params, m)? {
                     Value::Null => Ok(Value::Null),
                     Value::Int(n) if result.is_decimal() => {
                         Ok(Value::Decimal(Decimal::from_i64(n).neg()))
@@ -2618,7 +2843,7 @@ impl RExpr {
             }
             RExpr::Not(e) => {
                 m.charge(COSTS.operator_eval);
-                let v = e.eval(row, m)?;
+                let v = e.eval(row, params, m)?;
                 Ok(not3(&v))
             }
             RExpr::Arith {
@@ -2628,8 +2853,8 @@ impl RExpr {
                 result,
             } => {
                 m.charge(COSTS.operator_eval);
-                let a = lhs.eval(row, m)?;
-                let b = rhs.eval(row, m)?;
+                let a = lhs.eval(row, params, m)?;
+                let b = rhs.eval(row, params, m)?;
                 if matches!(a, Value::Null) || matches!(b, Value::Null) {
                     return Ok(Value::Null);
                 }
@@ -2646,8 +2871,8 @@ impl RExpr {
             }
             RExpr::Compare { op, lhs, rhs } => {
                 m.charge(COSTS.operator_eval);
-                let a = lhs.eval(row, m)?;
-                let b = rhs.eval(row, m)?;
+                let a = lhs.eval(row, params, m)?;
+                let b = rhs.eval(row, params, m)?;
                 let tv = match op {
                     CmpOp::Eq => a.eq3(&b),
                     CmpOp::Lt => a.lt3(&b),
@@ -2659,26 +2884,26 @@ impl RExpr {
             }
             RExpr::And(l, r) => {
                 m.charge(COSTS.operator_eval);
-                let lv = l.eval(row, m)?;
-                let rv = r.eval(row, m)?;
+                let lv = l.eval(row, params, m)?;
+                let rv = r.eval(row, params, m)?;
                 Ok(and3(&lv, &rv))
             }
             RExpr::Or(l, r) => {
                 m.charge(COSTS.operator_eval);
-                let lv = l.eval(row, m)?;
-                let rv = r.eval(row, m)?;
+                let lv = l.eval(row, params, m)?;
+                let rv = r.eval(row, params, m)?;
                 Ok(or3(&lv, &rv))
             }
             RExpr::IsNull { operand, negated } => {
                 m.charge(COSTS.operator_eval);
-                let is_null = matches!(operand.eval(row, m)?, Value::Null);
+                let is_null = matches!(operand.eval(row, params, m)?, Value::Null);
                 // IS [NOT] NULL is always a definite boolean, never unknown (CLAUDE.md §4).
                 Ok(Value::Bool(is_null != *negated))
             }
             RExpr::Distinct { lhs, rhs, negated } => {
                 m.charge(COSTS.operator_eval);
-                let lv = lhs.eval(row, m)?;
-                let rv = rhs.eval(row, m)?;
+                let lv = lhs.eval(row, params, m)?;
+                let rv = rhs.eval(row, params, m)?;
                 let same = lv.not_distinct_from(&rv);
                 // `negated` carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks
                 // "are they the same?" → `same`; IS DISTINCT FROM asks the opposite. Either
@@ -2688,8 +2913,8 @@ impl RExpr {
             }
             RExpr::Like { lhs, rhs, negated } => {
                 m.charge(COSTS.operator_eval);
-                let subject = lhs.eval(row, m)?;
-                let pattern = rhs.eval(row, m)?;
+                let subject = lhs.eval(row, params, m)?;
+                let pattern = rhs.eval(row, params, m)?;
                 // NULL propagates BEFORE the matcher runs, so a malformed pattern against a
                 // NULL operand is still NULL, never 22025 (matches PG — grammar.md §22).
                 if matches!(subject, Value::Null) || matches!(pattern, Value::Null) {
@@ -2716,11 +2941,11 @@ impl RExpr {
                 // then only the conditions up to the match plus the selected result accrue.
                 m.charge(COSTS.operator_eval);
                 for (cond, result) in arms {
-                    if cond.eval(row, m)?.is_true() {
-                        return Ok(coerce_case(result.eval(row, m)?, *coerce_decimal));
+                    if cond.eval(row, params, m)?.is_true() {
+                        return Ok(coerce_case(result.eval(row, params, m)?, *coerce_decimal));
                     }
                 }
-                Ok(coerce_case(els.eval(row, m)?, *coerce_decimal))
+                Ok(coerce_case(els.eval(row, params, m)?, *coerce_decimal))
             }
         }
     }

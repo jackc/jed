@@ -191,7 +191,8 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 		NotNullViolation, UniqueViolation,
 		SyntaxError, UndefinedTable, UndefinedColumn, UndefinedObject,
 		DatatypeMismatch, DuplicateTable, DuplicateColumn,
-		InvalidTableDefinition, FeatureNotSupported, DataCorrupted,
+		InvalidTableDefinition, IndeterminateDatatype, FeatureNotSupported,
+		IoError, UndefinedFile, DuplicateFile, DataCorrupted,
 	} {
 		if _, ok := codes[st.Code()]; !ok {
 			t.Errorf("code %s missing from registry", st.Code())

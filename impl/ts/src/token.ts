@@ -20,6 +20,7 @@ export type TokenKind =
   | "gt" // >
   | "le" // <=
   | "ge" // >=
+  | "param" // a bind parameter $N — `paramIndex` holds the 1-based index (spec/design/api.md §5)
   | "eof"; // end of input
 
 // Token is a lexed token. `word` holds the text for "word"; `int` holds the unsigned
@@ -35,4 +36,5 @@ export type Token = {
   // the cap check is at resolve (spec/design/grammar.md §14).
   decDigits?: string;
   decScale?: number;
+  paramIndex?: number; // for "param": the 1-based bind-parameter index
 };

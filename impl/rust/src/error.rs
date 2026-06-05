@@ -60,8 +60,18 @@ pub enum SqlState {
     /// 42883 — undefined function (an unknown function name in a call;
     /// spec/design/aggregates.md §5).
     UndefinedFunction,
+    /// 42P18 — indeterminate datatype: a bind parameter `$N` whose type cannot be inferred
+    /// from context (spec/design/api.md §5).
+    IndeterminateDatatype,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
+    /// 58030 — I/O error from the host file layer (read/write/fsync/rename;
+    /// spec/design/api.md §2).
+    IoError,
+    /// 58P01 — undefined file: `open` of a database path that does not exist.
+    UndefinedFile,
+    /// 58P02 — duplicate file: `create` of a database path that already exists.
+    DuplicateFile,
     /// XX001 — data corrupted (a malformed on-disk database file; CLAUDE.md §8).
     DataCorrupted,
 }
@@ -91,7 +101,11 @@ impl SqlState {
             SqlState::InvalidTableDefinition => "42P16",
             SqlState::GroupingError => "42803",
             SqlState::UndefinedFunction => "42883",
+            SqlState::IndeterminateDatatype => "42P18",
             SqlState::FeatureNotSupported => "0A000",
+            SqlState::IoError => "58030",
+            SqlState::UndefinedFile => "58P01",
+            SqlState::DuplicateFile => "58P02",
             SqlState::DataCorrupted => "XX001",
         }
     }

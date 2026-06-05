@@ -332,12 +332,16 @@ func (p *Parser) parseInsertRow() ([]InsertValue, error) {
 	return values, nil
 }
 
-// parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3),
-// else a literal.
+// parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3), a
+// bind parameter ($N, bound at execute — spec/design/api.md §5), else a literal.
 func (p *Parser) parseInsertValue() (InsertValue, error) {
 	if p.peekKeyword() == "default" {
 		p.advance()
 		return InsertValue{IsDefault: true}, nil
+	}
+	if p.peek().Kind == TokParam {
+		n := p.advance().Int
+		return InsertValue{IsParam: true, Param: n}, nil
 	}
 	lit, err := p.parseLiteral()
 	if err != nil {
@@ -1175,6 +1179,8 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	}
 	t := p.peek()
 	switch {
+	case t.Kind == TokParam:
+		return Expr{Kind: ExprParam, Param: p.advance().Int}, nil
 	case t.Kind == TokInt:
 		v, ok := foldInt(p.advance().Int, false)
 		if !ok {

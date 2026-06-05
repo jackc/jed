@@ -6,6 +6,7 @@
 import { Database } from "./executor.ts";
 import type { Outcome } from "./executor.ts";
 import { parseSQL } from "./parser.ts";
+import type { Value } from "./value.ts";
 
 // SUPPORTED_CAPABILITIES lists the capabilities this core implements (spec/conformance:
 // the gating axis). The harness runs a corpus file iff every capability in the file's
@@ -109,13 +110,20 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "resource.cost_metering",
 ];
 
-// execute parses and executes one SQL statement against db.
+// execute parses and executes one SQL statement against db (no bind parameters).
 export function execute(db: Database, sql: string): Outcome {
   return db.executeStmt(parseSQL(sql));
 }
 
+// executeParams parses and executes one SQL statement against db, binding params to its $N
+// placeholders (spec/design/api.md §5). A count mismatch is 42601; a parameter whose type cannot
+// be inferred is 42P18; a bound value out of range / of the wrong family fails like a literal.
+export function executeParams(db: Database, sql: string, params: Value[]): Outcome {
+  return db.executeStmtParams(parseSQL(sql), params);
+}
+
 // --- public surface (re-exports) ---
-export { Database } from "./executor.ts";
+export { Database, DEFAULT_PAGE_SIZE } from "./executor.ts";
 export type { Outcome } from "./executor.ts";
 export { parseSQL } from "./parser.ts";
 export { EngineError, sqlStateCode } from "./errors.ts";
@@ -124,3 +132,6 @@ export { intValue, nullValue, render } from "./value.ts";
 export type { ThreeValued, Value } from "./value.ts";
 export { loadDatabase, toImage } from "./format.ts";
 export type { Statement } from "./ast.ts";
+export { PreparedStatement, Rows, prepare, query, querySql } from "./api.ts";
+export { create, open, commit, close } from "./file.ts";
+export type { DatabaseOptions } from "./file.ts";

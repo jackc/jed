@@ -103,7 +103,7 @@ insert         ::= "INSERT" "INTO" identifier ("(" identifier ("," identifier)* 
 
 row            ::= "(" insert_value ("," insert_value)* ")"
 
-insert_value   ::= "DEFAULT" | literal
+insert_value   ::= "DEFAULT" | parameter | literal
 
 update         ::= "UPDATE" identifier "SET"
                    assignment ("," assignment)*
@@ -295,11 +295,21 @@ primary        ::= number
                  | string
                  | "TRUE" | "FALSE"
                  | "NULL"
+                 | parameter
                  | "CAST" "(" expr "AS" type_name ")"
                  | case_expr
                  | function_call
                  | "(" expr ")"
                  | column_ref
+
+/* A bind parameter — "$" followed by a 1-based decimal index ($1, $2, …). NOT part of
+ * the conformance corpus (which is literal-only, ../design/conformance.md §1.2): a
+ * parameter is bound by the host API (../design/api.md), and its type is inferred from
+ * context (sibling operand, target column, or CAST target; 42P18 if indeterminate). The
+ * lexer rejects "$0", a leading zero ("$01"), and "$" with no following digit (42601).
+ * Allowed anywhere `primary` is and as an `insert_value`; NOT in LIMIT/OFFSET, GROUP BY,
+ * or a type modifier this slice (../design/grammar.md §5). */
+parameter      ::= "$" digit+
 
 /* A CASE expression (../design/grammar.md §23), a primary like CAST. Two forms: the SEARCHED
  * form has no operand before the first WHEN and each WHEN takes a boolean predicate; the SIMPLE

@@ -67,12 +67,15 @@ type Insert struct {
 	Rows [][]InsertValue
 }
 
-// InsertValue is one value slot in an INSERT VALUES row: a literal, or the DEFAULT keyword
-// (IsDefault) — which substitutes the target column's declared default (or NULL if it has
-// none). The DEFAULT keyword is not reserved (spec/design/grammar.md §3). constraints.md §2.
+// InsertValue is one value slot in an INSERT VALUES row: a literal, a bind parameter ($N,
+// bound at execute — spec/design/api.md §5), or the DEFAULT keyword (IsDefault) — which
+// substitutes the target column's declared default (or NULL if it has none). The DEFAULT
+// keyword is not reserved (spec/design/grammar.md §3). constraints.md §2.
 type InsertValue struct {
 	IsDefault bool
-	Lit       Literal // valid when !IsDefault
+	IsParam   bool    // a $N bind parameter; Param holds the 1-based index
+	Param     uint64  // valid when IsParam
+	Lit       Literal // valid when !IsDefault && !IsParam
 }
 
 // Update is `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each
@@ -195,6 +198,10 @@ const (
 	ExprQualifiedColumn
 	// ExprLiteral is a literal value.
 	ExprLiteral
+	// ExprParam is a bind parameter $N (Param holds the 1-based index). Like an adaptable
+	// literal it takes its type from context at resolve; the host binds a value at execute
+	// (spec/design/api.md §5).
+	ExprParam
 	// ExprCast is CAST(inner AS type).
 	ExprCast
 	// ExprUnary is a unary operator applied to one operand.
@@ -269,6 +276,7 @@ type Expr struct {
 	Kind       ExprKind
 	Column     string     // ExprColumn, ExprQualifiedColumn (the column name)
 	Qualifier  string     // ExprQualifiedColumn (the relation label)
+	Param      uint64     // ExprParam (the 1-based bind-parameter index)
 	Literal    *Literal   // ExprLiteral
 	Cast       *CastExpr  // ExprCast
 	Unary      *UnaryExpr // ExprUnary

@@ -56,6 +56,9 @@ export type Expr =
   // ambiguous (spec/design/grammar.md §15). Bare "column" stays the unqualified form.
   | { kind: "qualifiedColumn"; qualifier: string; name: string }
   | { kind: "literal"; literal: Literal }
+  // A bind parameter $N (1-based index). Like an adaptable literal it takes its type from
+  // context at resolve; the host binds a value at execute (spec/design/api.md §5).
+  | { kind: "param"; index: number }
   | { kind: "cast"; inner: Expr; typeName: string; typeMod: TypeMod | null }
   | { kind: "unary"; op: UnaryOp; operand: Expr }
   | { kind: "binary"; op: BinaryOp; lhs: Expr; rhs: Expr }
@@ -167,7 +170,11 @@ export type Insert = {
 // InsertValue is one value slot in an INSERT VALUES row: a literal, or the DEFAULT keyword —
 // which substitutes the target column's declared default (or NULL if it has none). The DEFAULT
 // keyword is not reserved (spec/design/grammar.md §3). See spec/design/constraints.md §2.
-export type InsertValue = { kind: "lit"; lit: Literal } | { kind: "default" };
+export type InsertValue =
+  | { kind: "lit"; lit: Literal }
+  // A bind parameter $N (1-based), bound at execute — spec/design/api.md §5.
+  | { kind: "param"; index: number }
+  | { kind: "default" };
 
 // TableRef is a table reference in a FROM clause: a table name with an optional alias
 // (`orders o` or `orders AS o`). The alias, or the table name when there is none, is the

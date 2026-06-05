@@ -76,13 +76,26 @@ export type Outcome =
 // Database is the whole database: catalog + per-table in-memory stores. Single
 // committed state (CLAUDE.md §3); the staging-buffer commit model lands later. Names
 // are keyed case-insensitively (lowercased).
+// DEFAULT_PAGE_SIZE is the default serialization page size (8 KiB — spec/design/storage.md §3),
+// used for a fresh in-memory or newly-created database when no explicit size is given.
+export const DEFAULT_PAGE_SIZE = 8192;
+
 export class Database {
   readonly tables: Map<string, Table>;
   readonly stores: Map<string, TableStore>;
+  // Persistence identity (spec/design/api.md §2): the backing file path (null for in-memory),
+  // the monotonic commit counter, and the page size this database serializes with. Set by the
+  // host API open/create; commit writes here.
+  path: string | null;
+  txid: bigint;
+  pageSize: number;
 
   constructor() {
     this.tables = new Map();
     this.stores = new Map();
+    this.path = null;
+    this.txid = 0n;
+    this.pageSize = DEFAULT_PAGE_SIZE;
   }
 
   // table looks up a table definition by name (case-insensitive).
@@ -97,21 +110,30 @@ export class Database {
     this.tables.set(key, t);
   }
 
-  // executeStmt executes one parsed statement.
+  // executeStmt executes one parsed statement with no bind parameters.
   executeStmt(stmt: Statement): Outcome {
+    return this.executeStmtParams(stmt, []);
+  }
+
+  // executeStmtParams executes one parsed statement, binding params to its $N placeholders (an
+  // empty array for an unparameterized statement). DDL statements take no parameters — supplying
+  // any is a 42601 (spec/design/api.md §5).
+  executeStmtParams(stmt: Statement, params: Value[]): Outcome {
     switch (stmt.kind) {
       case "createTable":
+        rejectParamsForDDL(params);
         return this.executeCreateTable(stmt);
       case "dropTable":
+        rejectParamsForDDL(params);
         return this.executeDropTable(stmt);
       case "insert":
-        return this.executeInsert(stmt);
+        return this.executeInsert(stmt, params);
       case "select":
-        return this.executeSelect(stmt);
+        return this.executeSelect(stmt, params);
       case "update":
-        return this.executeUpdate(stmt);
+        return this.executeUpdate(stmt, params);
       case "delete":
-        return this.executeDelete(stmt);
+        return this.executeDelete(stmt, params);
     }
   }
 
@@ -203,7 +225,7 @@ export class Database {
   // duplicate primary key traps 23505. A multi-row INSERT is two-phase / all-or-nothing
   // (grammar.md §12, constraints.md §2), mirroring UPDATE: every row is validated — including its
   // storage key — before any row is inserted, so a mid-batch failure stores nothing.
-  private executeInsert(ins: Insert): Outcome {
+  private executeInsert(ins: Insert, params: Value[]): Outcome {
     const table = this.table(ins.table);
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + ins.table);
@@ -241,6 +263,21 @@ export class Database {
       for (let i = 0; i < n; i++) provided[i] = i;
     }
 
+    // A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those types across
+    // every row (a $N reused under two columns unifies; spec/design/api.md §5), then bind the
+    // supplied values up front so a bad bind fails before any row is stored.
+    const ptypes = new ParamTypes();
+    for (const values of ins.rows) {
+      for (let i = 0; i < n; i++) {
+        const p = provided[i]!;
+        if (p >= 0 && p < values.length) {
+          const iv = values[p]!;
+          if (iv.kind === "param") ptypes.note(iv.index - 1, table.columns[i]!.type);
+        }
+      }
+    }
+    const bound = bindParams(params, ptypes.finalize());
+
     // Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
     // table with a primary key, the encoded key is checked for a duplicate (within the
     // batch via seenKeys, and against the store) up front; for a table with none, key is
@@ -267,7 +304,11 @@ export class Database {
         let candidate: Value;
         if (p >= 0) {
           const iv = values[p]!;
-          candidate = iv.kind === "default" ? col.default ?? nullValue() : literalToValue(iv.lit);
+          if (iv.kind === "default") candidate = col.default ?? nullValue();
+          // A bound $N value; its target-column coercion is the storeValue below, identical to a
+          // literal in this slot (spec/design/api.md §5).
+          else if (iv.kind === "param") candidate = bound[iv.index - 1]!;
+          else candidate = literalToValue(iv.lit);
         } else {
           candidate = col.default ?? nullValue();
         }
@@ -315,14 +356,16 @@ export class Database {
   // executeDelete resolves the table and optional predicate, collects the keys of
   // matching rows (only a TRUE predicate matches — Kleene), then removes them. No WHERE
   // deletes every row. Keys are collected before mutating.
-  private executeDelete(del: Delete): Outcome {
+  private executeDelete(del: Delete, params: Value[]): Outcome {
     const table = this.table(del.table);
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + del.table);
     }
     // DELETE is single-table; resolve its WHERE against a one-relation scope.
     const scope = Scope.single(table);
-    const filter = del.filter ? resolveBooleanFilter(scope, del.filter) : null;
+    const ptypes = new ParamTypes();
+    const filter = del.filter ? resolveBooleanFilter(scope, del.filter, ptypes) : null;
+    const bound = bindParams(params, ptypes.finalize());
 
     // Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13;
     // spec/design/cost.md §3). Keys are collected before mutating.
@@ -332,7 +375,7 @@ export class Database {
     for (const e of store.entriesInKeyOrder()) {
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
       meter.charge(COSTS.storageRowRead);
-      if (filter === null || isTrue(evalExpr(filter, e.row, meter))) {
+      if (filter === null || isTrue(evalExpr(filter, e.row, bound, meter))) {
         keys.push(e.key);
       }
     }
@@ -345,7 +388,7 @@ export class Database {
   // `SET a = b, b = a` swaps); a 22003/23502 aborts with no writes. Phase 2 applies.
   // Assigning a PRIMARY KEY column traps 0A000 (the storage key must not change this
   // slice); a duplicate target column traps 42701. No WHERE updates every row.
-  private executeUpdate(upd: Update): Outcome {
+  private executeUpdate(upd: Update, params: Value[]): Outcome {
     const table = this.table(upd.table);
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + upd.table);
@@ -354,6 +397,7 @@ export class Database {
     // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
     // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
     const scope = Scope.single(table);
+    const ptypes = new ParamTypes();
 
     // Resolve assignments up front (fail fast, deterministic).
     const pkIdx = primaryKeyIndex(table);
@@ -381,12 +425,14 @@ export class Database {
       // The RHS is a general expression evaluated against the OLD row; a literal operand
       // adapts to the target column's type. The result must be assignable to the column's
       // family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-      const { node, type } = resolve(scope, a.value, col.type, { collecting: false, groupKeys: [], specs: [] });
+      const { node, type } = resolve(scope, a.value, col.type, { collecting: false, groupKeys: [], specs: [] }, ptypes);
       requireAssignable(type, col.type, a.column);
       plans.push({ idx, name: col.name, target: col.type, decimal: col.decimal, notNull: col.notNull, source: node });
     }
 
-    const filter = upd.filter ? resolveBooleanFilter(scope, upd.filter) : null;
+    const filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
+    // All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
+    const bound = bindParams(params, ptypes.finalize());
 
     // Phase 1: build + validate every matching row's new values; no writes yet. Each
     // scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes do
@@ -396,10 +442,10 @@ export class Database {
     const updates: { key: Uint8Array; row: Row }[] = [];
     for (const e of store.entriesInKeyOrder()) {
       meter.charge(COSTS.storageRowRead);
-      if (filter !== null && !isTrue(evalExpr(filter, e.row, meter))) continue;
+      if (filter !== null && !isTrue(evalExpr(filter, e.row, bound, meter))) continue;
       const newRow = e.row.slice();
       for (const p of plans) {
-        newRow[p.idx] = checkAssign(p, evalExpr(p.source, e.row, meter));
+        newRow[p.idx] = checkAssign(p, evalExpr(p.source, e.row, bound, meter));
       }
       updates.push({ key: e.key, row: newRow });
     }
@@ -412,7 +458,10 @@ export class Database {
   // executeSelect resolves projected columns and the WHERE/ORDER BY columns against the
   // catalog, scans in primary-key order, filters (three-valued — only TRUE keeps a
   // row), optionally re-sorts by ORDER BY, then projects.
-  private executeSelect(sel: Select): Outcome {
+  private executeSelect(sel: Select, params: Value[]): Outcome {
+    // Accumulates the inferred type of each $N across every clause of this SELECT, then is
+    // finalized + bound once all resolution is done (spec/design/api.md §5).
+    const ptypes = new ParamTypes();
     // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
     // relation's flat column offset in FROM order, and reject a duplicate label — a self-join
     // without distinct aliases is 42712 (spec/design/grammar.md §15).
@@ -452,14 +501,14 @@ export class Database {
     // query (HAVING alone groups the whole table — grammar.md §19).
     const isAgg = groupKeys.length > 0 || itemsHaveAggregate(sel.items) || sel.having !== null;
     const projAgg: AggCtx = { collecting: isAgg, groupKeys, specs: [] };
-    const { nodes: projections, names: columnNames } = resolveProjections(scope, sel.items, projAgg);
+    const { nodes: projections, names: columnNames } = resolveProjections(scope, sel.items, projAgg, ptypes);
     // HAVING resolves against the same grouped scope (collect) — it may reference aggregates
     // (collected into the SAME specs, so their slots follow the projection's) and grouping keys;
     // a non-grouped column is 42803. It must be boolean (42804). Resolved after the projection so
     // the synthetic row is [group_keys..., projection aggs..., HAVING aggs...].
     let having: RExpr | null = null;
     if (sel.having !== null) {
-      const { node, type } = resolve(scope, sel.having, null, projAgg);
+      const { node, type } = resolve(scope, sel.having, null, projAgg, ptypes);
       if (type.kind !== "bool" && type.kind !== "null") {
         throw typeError("argument of HAVING must be boolean");
       }
@@ -470,7 +519,7 @@ export class Database {
     if (isAgg && sel.distinct) {
       throw engineError("feature_not_supported", "SELECT DISTINCT with aggregates is not supported yet");
     }
-    const filter = sel.filter ? resolveBooleanFilter(scope, sel.filter) : null;
+    const filter = sel.filter ? resolveBooleanFilter(scope, sel.filter, ptypes) : null;
     // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
     // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
     // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
@@ -517,8 +566,13 @@ export class Database {
     const joinOns: (RExpr | null)[] = sel.joins.map((j, k) => {
       if (j.on === null) return null;
       const partial = new Scope(scope.rels.slice(0, k + 2));
-      return resolveBooleanFilter(partial, j.on);
+      return resolveBooleanFilter(partial, j.on, ptypes);
     });
+
+    // All clauses resolved: finalize the inferred parameter types and bind the supplied values
+    // (count mismatch 42601; out-of-range/family errors 22003/42804) BEFORE scanning any rows
+    // (spec/design/api.md §5).
+    const bound = bindParams(params, ptypes.finalize());
 
     // Materialize each base table once, in primary-key order, charging storageRowRead per
     // physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these in-memory
@@ -561,7 +615,7 @@ export class Database {
         let leftMatched = false;
         for (let ri = 0; ri < rightRows.length; ri++) {
           const combined = left.concat(rightRows[ri]!);
-          if (on === null || isTrue(evalExpr(on, combined, meter))) {
+          if (on === null || isTrue(evalExpr(on, combined, bound, meter))) {
             next.push(combined);
             leftMatched = true;
             rightMatched[ri] = true;
@@ -581,7 +635,7 @@ export class Database {
     // combined row's filter accrues operator_eval.
     const rows: Row[] = [];
     for (const row of running) {
-      if (filter === null || isTrue(evalExpr(filter, row, meter))) rows.push(row);
+      if (filter === null || isTrue(evalExpr(filter, row, bound, meter))) rows.push(row);
     }
 
     // ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
@@ -643,7 +697,7 @@ export class Database {
         const accs = groups[gi]!.accs;
         aggSpecs.forEach((spec, i) => {
           meter.charge(COSTS.aggregateAccumulate);
-          const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, meter);
+          const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, bound, meter);
           foldAcc(accs[i]!, v);
         });
       }
@@ -653,7 +707,7 @@ export class Database {
       // evaluated against each group's synthetic row (charging its operatorEvals per group);
       // only a TRUE result keeps the group. A dropped group charges no rowProduced (§8).
       if (having !== null) {
-        groupRows = groupRows.filter((srow) => isTrue(evalExpr(having!, srow, meter)));
+        groupRows = groupRows.filter((srow) => isTrue(evalExpr(having!, srow, bound, meter)));
       }
       // ORDER BY over the grouped output (keys are synthetic group-key slots).
       if (order.length > 0) {
@@ -669,7 +723,7 @@ export class Database {
       const [start, end] = windowBounds(groupRows.length);
       out = groupRows.slice(start, end).map((srow) => {
         meter.charge(COSTS.rowProduced);
-        return projections.map((p) => evalExpr(p, srow, meter));
+        return projections.map((p) => evalExpr(p, srow, bound, meter));
       });
     } else if (sel.distinct) {
       // Project every filtered row (charging projection cost per row, the §3 asymmetry),
@@ -678,7 +732,7 @@ export class Database {
       const seen = new Set<string>();
       const distinctRows: Value[][] = [];
       for (const row of rows) {
-        const tuple = projections.map((p) => evalExpr(p, row, meter));
+        const tuple = projections.map((p) => evalExpr(p, row, bound, meter));
         const key = distinctRowKey(tuple);
         if (!seen.has(key)) {
           seen.add(key);
@@ -700,7 +754,7 @@ export class Database {
       const [start, end] = windowBounds(rows.length);
       out = rows.slice(start, end).map((row) => {
         meter.charge(COSTS.rowProduced);
-        return projections.map((p) => evalExpr(p, row, meter));
+        return projections.map((p) => evalExpr(p, row, bound, meter));
       });
     }
     return { kind: "query", columnNames, rows: out, cost: meter.accrued };
@@ -766,6 +820,10 @@ type ResolvedType =
 // their (promotion-tower) result type so the computed value can be range-checked.
 type RExpr =
   | { kind: "column"; index: number }
+  // A bind parameter, by 0-based index into the bound-values array passed to evalExpr. Its
+  // static type was inferred from context at resolve (spec/design/api.md §5); the value is
+  // supplied (and coerced) before evaluation.
+  | { kind: "param"; index: number }
   | { kind: "constInt"; value: bigint }
   | { kind: "constBool"; value: boolean }
   | { kind: "constText"; value: string }
@@ -941,6 +999,7 @@ function resolveAggregate(
   scope: Scope,
   e: { name: string; arg: Expr | null; star: boolean },
   ag: AggCtx,
+  params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (!ag.collecting) {
     throw engineError("grouping_error", "aggregate functions are not allowed here");
@@ -960,13 +1019,13 @@ function resolveAggregate(
       operand = null;
       result = { kind: "int", ty: "int64" };
     } else {
-      operand = resolve(scope, arg(), null, sub).node;
+      operand = resolve(scope, arg(), null, sub, params).node;
       plan = "count";
       result = { kind: "int", ty: "int64" };
     }
   } else if (name === "sum" || name === "avg" || name === "min" || name === "max") {
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-    const r = resolve(scope, arg(), null, sub);
+    const r = resolve(scope, arg(), null, sub, params);
     operand = r.node;
     if (name === "sum") {
       if (r.type.kind === "int" && r.type.ty === "int64") {
@@ -1119,6 +1178,70 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
   return { kind: "int", ty };
 }
 
+// ParamTypes accumulates the inferred type of each bind parameter ($N) across every clause of a
+// statement (spec/design/api.md §5). types[i] is the inferred scalar type of $(i+1); a null entry
+// marks a parameter referenced before any context fixed its type. Shared across every clause so a
+// $1 used in both WHERE and the select list unifies, then finalized.
+class ParamTypes {
+  types: (ScalarType | null)[] = [];
+
+  // note records that $(idx0+1) appears with context type ty (null = no context here). It unifies
+  // with any prior inference: equal types agree, two integer widths widen to the wider, an
+  // incompatible concrete pair is 42804.
+  note(idx0: number, ty: ScalarType | null): void {
+    while (idx0 >= this.types.length) this.types.push(null);
+    if (ty === null) return;
+    const prev = this.types[idx0]!;
+    this.types[idx0] = prev === null ? ty : unifyParamType(prev, ty, idx0);
+  }
+
+  // finalize returns the ordered parameter types. A slot referenced but never typed — including a
+  // gap in $1..$N — is 42P18 indeterminate_datatype.
+  finalize(): ScalarType[] {
+    const out: ScalarType[] = [];
+    for (let i = 0; i < this.types.length; i++) {
+      const t = this.types[i]!;
+      if (t === null) {
+        throw engineError(
+          "indeterminate_datatype",
+          `could not determine data type of parameter $${i + 1}`,
+        );
+      }
+      out.push(t);
+    }
+    return out;
+  }
+}
+
+// unifyParamType unifies two inferred types for the same parameter: equal agrees; two integer
+// widths widen to the wider; any other mismatch is 42804 (spec/design/api.md §5).
+function unifyParamType(a: ScalarType, b: ScalarType, idx0: number): ScalarType {
+  if (a === b) return a;
+  if (isInteger(a) && isInteger(b)) return rank(a) >= rank(b) ? a : b;
+  throw engineError("datatype_mismatch", `inconsistent types inferred for parameter $${idx0 + 1}`);
+}
+
+// bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
+// all-or-nothing like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value
+// is validated up front (22003/42804/22P02/23502 via storeValue) before any row is touched.
+function bindParams(supplied: Value[], types: ScalarType[]): Value[] {
+  if (supplied.length !== types.length) {
+    throw engineError(
+      "syntax_error",
+      `bind parameter count mismatch: statement expects ${types.length}, got ${supplied.length}`,
+    );
+  }
+  return types.map((ty, i) => storeValue(supplied[i]!, ty, null, false, `$${i + 1}`));
+}
+
+// rejectParamsForDDL throws 42601 if bind parameters are supplied to a CREATE/DROP TABLE (which
+// has no expressions to bind — spec/design/api.md §5).
+function rejectParamsForDDL(params: Value[]): void {
+  if (params.length > 0) {
+    throw engineError("syntax_error", "bind parameters are not allowed in a DDL statement");
+  }
+}
+
 // resolveProjections resolves SELECT items into evaluable projections (any result type is
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
@@ -1127,6 +1250,7 @@ function resolveProjections(
   scope: Scope,
   items: SelectItems,
   ag: AggCtx,
+  params: ParamTypes,
 ): { nodes: RExpr[]; names: string[] } {
   if (items.kind === "all") {
     const nodes: RExpr[] = [];
@@ -1142,7 +1266,7 @@ function resolveProjections(
   const nodes: RExpr[] = [];
   const names: string[] = [];
   for (const it of items.items) {
-    nodes.push(resolve(scope, it.expr, null, ag).node);
+    nodes.push(resolve(scope, it.expr, null, ag, params).node);
     names.push(it.alias ?? outputName(scope, it.expr));
   }
   return { nodes, names };
@@ -1162,9 +1286,9 @@ function outputName(scope: Scope, e: Expr): string {
 
 // resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an
 // untyped NULL, always unknown → no rows). An integer- or text-valued one is a 42804.
-function resolveBooleanFilter(scope: Scope, e: Expr): RExpr {
+function resolveBooleanFilter(scope: Scope, e: Expr, params: ParamTypes): RExpr {
   // WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
-  const { node, type } = resolve(scope, e, null, { collecting: false, groupKeys: [], specs: [] });
+  const { node, type } = resolve(scope, e, null, { collecting: false, groupKeys: [], specs: [] }, params);
   if (type.kind !== "bool" && type.kind !== "null") {
     throw typeError("argument of WHERE must be boolean");
   }
@@ -1179,6 +1303,7 @@ function resolve(
   e: Expr,
   ctx: ScalarType | null,
   ag: AggCtx,
+  params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   switch (e.kind) {
     case "column": {
@@ -1191,8 +1316,17 @@ function resolve(
       const idx = scope.resolveQualified(e.qualifier, e.name);
       return collectColumn(scope, ag, idx, e.name);
     }
+    case "param": {
+      // A bind parameter is an adaptable operand (like an integer/string literal): it takes its
+      // type from ctx — the sibling operand, target column, or CAST target. Record the inferred
+      // type (null = no context here; finalize 42P18s a parameter that never gets one).
+      const idx0 = e.index - 1;
+      params.note(idx0, ctx);
+      const type: ResolvedType = ctx !== null ? resolvedTypeOf(ctx) : { kind: "null" };
+      return { node: { kind: "param", index: idx0 }, type };
+    }
     case "funcCall":
-      return resolveAggregate(scope, e, ag);
+      return resolveAggregate(scope, e, ag, params);
     case "literal":
       switch (e.literal.kind) {
         case "null":
@@ -1252,7 +1386,7 @@ function resolve(
       if (isUuid(target)) {
         throw engineError("feature_not_supported", "casting to uuid is not supported yet");
       }
-      const inner = resolve(scope, e.inner, null, ag);
+      const inner = resolve(scope, e.inner, null, ag, params);
       if (inner.type.kind === "bool") {
         throw typeError("cannot cast boolean to " + canonicalName(target));
       }
@@ -1275,7 +1409,7 @@ function resolve(
     }
     case "unary":
       if (e.op === "neg") {
-        const { node, type } = resolve(scope, e.operand, ctx, ag);
+        const { node, type } = resolve(scope, e.operand, ctx, ag, params);
         if (type.kind === "decimal") {
           return { node: { kind: "neg", result: "decimal", operand: node }, type: { kind: "decimal" } };
         }
@@ -1286,12 +1420,12 @@ function resolve(
         return { node: { kind: "neg", result, operand: node }, type: { kind: "int", ty: result } };
       }
       {
-        const { node, type } = resolve(scope, e.operand, null, ag);
+        const { node, type } = resolve(scope, e.operand, null, ag, params);
         requireBool(type, "NOT requires a boolean operand");
         return { node: { kind: "not", operand: node }, type: { kind: "bool" } };
       }
     case "isNull": {
-      const { node } = resolve(scope, e.operand, null, ag);
+      const { node } = resolve(scope, e.operand, null, ag, params);
       return { node: { kind: "isNull", operand: node, negated: e.negated }, type: { kind: "bool" } };
     }
     case "isDistinct": {
@@ -1299,12 +1433,12 @@ function resolve(
       // adapts to its sibling; a text literal stays text), then require the operands be
       // comparable (both integer-ish or both text-ish; a mixed pair is 42804). The result
       // is always a definite boolean (functions.md §3).
-      const p = resolveOperandPair(scope, e.lhs, e.rhs, ag);
+      const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
       classifyComparable(p.lt, p.rt);
       return { node: { kind: "distinct", lhs: p.rl, rhs: p.rr, negated: e.negated }, type: { kind: "bool" } };
     }
     case "binary":
-      return resolveBinary(scope, e.op, e.lhs, e.rhs, ag);
+      return resolveBinary(scope, e.op, e.lhs, e.rhs, ag, params);
     case "in": {
       // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` is
       // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list is
@@ -1323,7 +1457,7 @@ function resolve(
       if (e.negated) {
         desugared = { kind: "unary", op: "not", operand: desugared };
       }
-      return resolve(scope, desugared, ctx, ag);
+      return resolve(scope, desugared, ctx, ag, params);
     }
     case "between": {
       // Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
@@ -1337,13 +1471,13 @@ function resolve(
       if (e.negated) {
         desugared = { kind: "unary", op: "not", operand: desugared };
       }
-      return resolve(scope, desugared, ctx, ag);
+      return resolve(scope, desugared, ctx, ag, params);
     }
     case "like": {
       // LIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal stays
       // text), then require BOTH operands be text (or a bare NULL); a non-text operand is 42804.
       // We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
-      const p = resolveOperandPair(scope, e.lhs, e.rhs, ag);
+      const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
       requireTextOrNull(p.lt);
       requireTextOrNull(p.rt);
       return { node: { kind: "like", lhs: p.rl, rhs: p.rr, negated: e.negated }, type: { kind: "bool" } };
@@ -1359,19 +1493,19 @@ function resolve(
         let cond: RExpr;
         if (e.operand !== null) {
           const eq: Expr = { kind: "binary", op: "eq", lhs: e.operand, rhs: w.cond };
-          cond = resolve(scope, eq, null, ag).node;
+          cond = resolve(scope, eq, null, ag, params).node;
         } else {
-          const rc = resolve(scope, w.cond, null, ag);
+          const rc = resolve(scope, w.cond, null, ag, params);
           requireBool(rc.type, "CASE WHEN condition must be boolean");
           cond = rc.node;
         }
-        const rres = resolve(scope, w.result, null, ag);
+        const rres = resolve(scope, w.result, null, ag, params);
         resultTypes.push(rres.type);
         arms.push({ cond, result: rres.node });
       }
       let els: RExpr;
       if (e.els !== null) {
-        const re = resolve(scope, e.els, null, ag);
+        const re = resolve(scope, e.els, null, ag, params);
         els = re.node;
         resultTypes.push(re.type);
       } else {
@@ -1393,6 +1527,7 @@ function resolveBinary(
   lhs: Expr,
   rhs: Expr,
   ag: AggCtx,
+  params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   switch (op) {
     case "add":
@@ -1404,7 +1539,7 @@ function resolveBinary(
       // integer literal adapts to an integer sibling), then pick the family: both integer →
       // integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
       // widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
-      const p = resolveOperandPair(scope, lhs, rhs, ag);
+      const p = resolveOperandPair(scope, lhs, rhs, ag, params);
       requireNumericOperand(p.lt);
       requireNumericOperand(p.rt);
       if (p.lt.kind === "decimal" || p.rt.kind === "decimal") {
@@ -1422,14 +1557,14 @@ function resolveBinary(
       // operands (a literal adapts to its sibling; text literals stay text), then require
       // they be comparable — a mixed integer/text pair is 42804. The runtime comparison
       // (eq3/lt3/gt3) dispatches on the value kinds.
-      const p = resolveOperandPair(scope, lhs, rhs, ag);
+      const p = resolveOperandPair(scope, lhs, rhs, ag, params);
       classifyComparable(p.lt, p.rt);
       return { node: { kind: "compare", op, lhs: p.rl, rhs: p.rr }, type: { kind: "bool" } };
     }
     default: {
       // "and" | "or"
-      const l = resolve(scope, lhs, null, ag);
-      const r = resolve(scope, rhs, null, ag);
+      const l = resolve(scope, lhs, null, ag, params);
+      const r = resolve(scope, rhs, null, ag, params);
       requireBool(l.type, "AND/OR requires boolean operands");
       requireBool(r.type, "AND/OR requires boolean operands");
       return { node: { kind: op === "and" ? "and" : "or", lhs: l.node, rhs: r.node }, type: { kind: "bool" } };
@@ -1449,23 +1584,24 @@ function resolveOperandPair(
   lhs: Expr,
   rhs: Expr,
   ag: AggCtx,
+  params: ParamTypes,
 ): { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType } {
-  const lhsLit = isAdaptableLiteral(lhs);
-  const rhsLit = isAdaptableLiteral(rhs);
+  const lhsLit = isAdaptableOperand(lhs);
+  const rhsLit = isAdaptableOperand(rhs);
   let l: { node: RExpr; type: ResolvedType };
   let r: { node: RExpr; type: ResolvedType };
   if (lhsLit && rhsLit) {
-    l = resolve(scope, lhs, "int64", ag);
-    r = resolve(scope, rhs, "int64", ag);
+    l = resolve(scope, lhs, "int64", ag, params);
+    r = resolve(scope, rhs, "int64", ag, params);
   } else if (lhsLit) {
-    r = resolve(scope, rhs, null, ag);
-    l = resolve(scope, lhs, ctxOf(r.type), ag);
+    r = resolve(scope, rhs, null, ag, params);
+    l = resolve(scope, lhs, ctxOf(r.type), ag, params);
   } else if (rhsLit) {
-    l = resolve(scope, lhs, null, ag);
-    r = resolve(scope, rhs, ctxOf(l.type), ag);
+    l = resolve(scope, lhs, null, ag, params);
+    r = resolve(scope, rhs, ctxOf(l.type), ag, params);
   } else {
-    l = resolve(scope, lhs, null, ag);
-    r = resolve(scope, rhs, null, ag);
+    l = resolve(scope, lhs, null, ag, params);
+    r = resolve(scope, rhs, null, ag, params);
   }
   return { rl: l.node, lt: l.type, rr: r.node, rt: r.type };
 }
@@ -1503,20 +1639,26 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   }
 }
 
-// isAdaptableLiteral reports whether e is a literal that adapts to its sibling operand's type
-// (an integer or string literal). NULL, boolean, and decimal literals do not take a sibling's context.
-function isAdaptableLiteral(e: Expr): boolean {
+// isAdaptableOperand reports whether e is an adaptable operand — one that takes its type from its
+// sibling: an integer or string literal, or a bind parameter $N (spec/design/api.md §5). NULL,
+// boolean, and decimal literals do not take a sibling's context.
+function isAdaptableOperand(e: Expr): boolean {
+  if (e.kind === "param") return true;
   return e.kind === "literal" && (e.literal.kind === "int" || e.literal.kind === "text");
 }
 
-// ctxOf returns the type a sibling operand offers an adaptable literal: an integer type (so an
-// integer literal adopts that width), or bytea/text (so a string literal can decode to bytea,
-// else stay text). null for bool/decimal/NULL — no useful literal context.
+// ctxOf returns the type a sibling operand offers an adaptable operand. For an integer literal
+// this is the integer width it adopts; for a string literal, bytea/uuid/text (so it can decode
+// the hex/uuid input); a bind parameter additionally adopts a decimal/boolean sibling (a literal
+// ignores those — its arm keeps int64/text — so widening the mapping is safe). Only a bare NULL
+// offers no context (spec/design/api.md §5).
 function ctxOf(t: ResolvedType): ScalarType | null {
   if (t.kind === "int") return t.ty;
   if (t.kind === "bytea") return "bytea";
   if (t.kind === "uuid") return "uuid";
   if (t.kind === "text") return "text";
+  if (t.kind === "bool") return "boolean";
+  if (t.kind === "decimal") return "decimal";
   return null;
 }
 
@@ -1760,10 +1902,14 @@ const I64_MIN = -9223372036854775808n;
 // operands LHS-before-RHS — JS evaluates arguments left-to-right); leaf nodes
 // (column/constants) charge nothing. Both operands are always evaluated — there is no
 // short-circuit, so the count never depends on operand values (spec/design/cost.md §3).
-function evalExpr(e: RExpr, row: Row, m: Meter): Value {
+function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
   switch (e.kind) {
     case "column":
       return row[e.index]!;
+    case "param":
+      // The supplied value, already coerced to its inferred type by bindParams before execution
+      // (spec/design/api.md §5).
+      return params[e.index]!;
     case "constInt":
       return intValue(e.value);
     case "constBool":
@@ -1780,13 +1926,13 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
       return nullValue();
     case "cast": {
       m.charge(COSTS.operatorEval);
-      const v = evalExpr(e.operand, row, m);
+      const v = evalExpr(e.operand, row, params, m);
       if (v.kind === "null") return nullValue();
       return evalCast(v, e.target, e.typmod);
     }
     case "neg": {
       m.charge(COSTS.operatorEval);
-      const v = evalExpr(e.operand, row, m);
+      const v = evalExpr(e.operand, row, params, m);
       if (v.kind === "null") return nullValue();
       if (isDecimal(e.result)) {
         return decimalValue((v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec).negate());
@@ -1798,12 +1944,12 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
     }
     case "not": {
       m.charge(COSTS.operatorEval);
-      return boolNot(evalExpr(e.operand, row, m));
+      return boolNot(evalExpr(e.operand, row, params, m));
     }
     case "arith": {
       m.charge(COSTS.operatorEval);
-      const a = evalExpr(e.lhs, row, m);
-      const b = evalExpr(e.rhs, row, m);
+      const a = evalExpr(e.lhs, row, params, m);
+      const b = evalExpr(e.rhs, row, params, m);
       if (a.kind === "null" || b.kind === "null") return nullValue();
       if (isDecimal(e.result)) {
         // Decimal arithmetic: widen any integer operand to decimal, then apply the op with
@@ -1815,8 +1961,8 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
     }
     case "compare": {
       m.charge(COSTS.operatorEval);
-      const a = evalExpr(e.lhs, row, m);
-      const b = evalExpr(e.rhs, row, m);
+      const a = evalExpr(e.lhs, row, params, m);
+      const b = evalExpr(e.rhs, row, params, m);
       switch (e.op) {
         case "eq":
           return from3(eq3(a, b));
@@ -1832,24 +1978,24 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
     }
     case "and": {
       m.charge(COSTS.operatorEval);
-      const a = evalExpr(e.lhs, row, m);
-      const b = evalExpr(e.rhs, row, m);
+      const a = evalExpr(e.lhs, row, params, m);
+      const b = evalExpr(e.rhs, row, params, m);
       return boolAnd(a, b);
     }
     case "or": {
       m.charge(COSTS.operatorEval);
-      const a = evalExpr(e.lhs, row, m);
-      const b = evalExpr(e.rhs, row, m);
+      const a = evalExpr(e.lhs, row, params, m);
+      const b = evalExpr(e.rhs, row, params, m);
       return boolOr(a, b);
     }
     case "isNull": {
       m.charge(COSTS.operatorEval);
-      const isNull = evalExpr(e.operand, row, m).kind === "null";
+      const isNull = evalExpr(e.operand, row, params, m).kind === "null";
       return { kind: "bool", value: isNull !== e.negated };
     }
     case "distinct": {
       m.charge(COSTS.operatorEval);
-      const same = notDistinctFrom(evalExpr(e.lhs, row, m), evalExpr(e.rhs, row, m));
+      const same = notDistinctFrom(evalExpr(e.lhs, row, params, m), evalExpr(e.rhs, row, params, m));
       // negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
       // the same?"; IS DISTINCT FROM asks the opposite. Always a definite boolean — never
       // unknown (the null_safe discipline, functions.md §3).
@@ -1857,8 +2003,8 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
     }
     case "like": {
       m.charge(COSTS.operatorEval);
-      const subject = evalExpr(e.lhs, row, m);
-      const pattern = evalExpr(e.rhs, row, m);
+      const subject = evalExpr(e.lhs, row, params, m);
+      const pattern = evalExpr(e.rhs, row, params, m);
       // NULL propagates BEFORE the matcher runs, so a malformed pattern against a NULL operand
       // is still NULL, never 22025 (matches PG — grammar.md §22).
       if (subject.kind === "null" || pattern.kind === "null") return nullValue();
@@ -1876,12 +2022,12 @@ function evalExpr(e: RExpr, row: Row, m: Meter): Value {
       // Charge the node, then only the conditions up to the match plus the selected result.
       m.charge(COSTS.operatorEval);
       for (const arm of e.arms) {
-        const cv = evalExpr(arm.cond, row, m);
+        const cv = evalExpr(arm.cond, row, params, m);
         if (cv.kind === "bool" && cv.value) {
-          return coerceCaseValue(evalExpr(arm.result, row, m), e.coerceDecimal);
+          return coerceCaseValue(evalExpr(arm.result, row, params, m), e.coerceDecimal);
         }
       }
-      return coerceCaseValue(evalExpr(e.els, row, m), e.coerceDecimal);
+      return coerceCaseValue(evalExpr(e.els, row, params, m), e.coerceDecimal);
     }
   }
 }

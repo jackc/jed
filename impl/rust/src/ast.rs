@@ -72,12 +72,15 @@ pub struct Insert {
     pub rows: Vec<Vec<InsertValue>>,
 }
 
-/// One value slot in an INSERT `VALUES` row: a literal, or the `DEFAULT` keyword — which
-/// substitutes the target column's declared default (or NULL if it has none). The `DEFAULT`
-/// keyword is not reserved (spec/design/grammar.md §3). See spec/design/constraints.md §2.
+/// One value slot in an INSERT `VALUES` row: a literal, a bind parameter (`$N`, bound at
+/// execute time — spec/design/api.md §5), or the `DEFAULT` keyword — which substitutes the
+/// target column's declared default (or NULL if it has none). The `DEFAULT` keyword is not
+/// reserved (spec/design/grammar.md §3). See spec/design/constraints.md §2.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InsertValue {
     Lit(Literal),
+    /// A bind parameter `$N` (1-based); typed against the target column at resolve.
+    Param(u32),
     Default,
 }
 
@@ -203,6 +206,11 @@ pub enum Expr {
         name: String,
     },
     Literal(Literal),
+    /// A bind parameter `$N` (1-based index). Like an integer/string literal it is an
+    /// *adaptable* operand: its type is inferred from context at resolve (sibling operand,
+    /// target column, or CAST target), and the host binds a value at execute time
+    /// (spec/design/api.md §5). An indeterminate type is 42P18.
+    Param(u32),
     Cast {
         inner: Box<Expr>,
         type_name: String,

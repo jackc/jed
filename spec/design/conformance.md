@@ -78,9 +78,12 @@ would reject.
 ### 1.2 Parameters
 
 The corpus uses **literal SQL** (`WHERE id = 1`), never bound parameters. The
-parameterized lookup API implied by CLAUDE.md §11 step 5 (`SELECT ... WHERE pk = $1`) is
-each implementation's own surface and is tested in-impl; the corpus fixes **semantics**,
-not the binding API.
+parameterized lookup API implied by CLAUDE.md §11 step 5 (`SELECT ... WHERE pk = $1`) has
+**landed** as each implementation's own host-API surface ([api.md](api.md), grammar.md §5):
+`$N` placeholders are parsed and bound through `prepare`/`execute`, with a parameter's type
+inferred from context (`42P18` if indeterminate). That surface — and its `42P18` code — is
+tested **in-impl**, not by the shared corpus, which still fixes **semantics** with literal
+SQL only, not the binding API.
 
 ## 2. Structured-error matching
 

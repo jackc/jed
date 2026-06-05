@@ -153,12 +153,40 @@ name = "undefined_function"
 class = "syntax error or access rule violation"
 template = "function does not exist: {name}"
 
+[[error]]
+code = "42P18"
+name = "indeterminate_datatype"
+class = "syntax error or access rule violation"
+template = "could not determine data type of parameter ${index}"
+
 # --- feature not supported (class 0A) ---------------------------------------
 [[error]]
 code = "0A000"
 name = "feature_not_supported"
 class = "feature not supported"
 template = "feature not supported: {detail}"
+
+# --- system error / host filesystem (class 58) ------------------------------
+# Raised by the host API's file layer (spec/design/api.md), never by the SQL
+# executor: open/create/commit touch the filesystem. Per-impl surface — the
+# shared conformance corpus does not assert these (it is in-memory).
+[[error]]
+code = "58030"
+name = "io_error"
+class = "system error"
+template = "I/O error: {detail}"
+
+[[error]]
+code = "58P01"
+name = "undefined_file"
+class = "system error"
+template = "database file does not exist: {path}"
+
+[[error]]
+code = "58P02"
+name = "duplicate_file"
+class = "system error"
+template = "database file already exists: {path}"
 
 # --- internal error (class XX) ----------------------------------------------
 [[error]]

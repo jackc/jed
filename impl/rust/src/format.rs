@@ -253,6 +253,10 @@ impl Database {
         let meta = select_meta(image, page_size)?;
 
         let mut db = Database::new();
+        // Adopt the file's serialization parameters so a later commit round-trips them
+        // (spec/design/api.md §2).
+        db.page_size = page_size as u32;
+        db.txid = meta.txid;
         let mut cat_page = meta.root_page;
         while cat_page != 0 {
             let page = read_page(image, page_size, cat_page)?;

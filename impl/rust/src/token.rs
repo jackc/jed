@@ -18,6 +18,10 @@ pub enum Token {
     /// count). `1.50` → `("150", 2)`, `.5` → `("5", 1)`, `1.` → `("1", 0)`. The sign is the
     /// `Minus` operator; the cap check is at resolve (spec/design/grammar.md §14).
     Decimal(String, u32),
+    /// A bind parameter `$N` — its 1-based index. The lexer rejects `$0`, a leading zero
+    /// (`$01`), and `$` not followed by a digit (42601). Bound by the host API, not the
+    /// corpus (spec/design/api.md, grammar.md §5).
+    Param(u32),
     Comma,
     /// The `.` separator of a qualified column reference (`t.col`). Emitted only when a
     /// `.` is NOT part of a numeric literal — i.e. with no digit immediately after it

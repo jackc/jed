@@ -29,7 +29,11 @@ export type SqlState =
   | "invalid_table_definition" // 42P16 — e.g. more than one primary key
   | "grouping_error" // 42803 — non-aggregated column not in GROUP BY, or aggregate in WHERE/ON/nested
   | "undefined_function" // 42883 — an unknown function name in a call (aggregates.md §5)
+  | "indeterminate_datatype" // 42P18 — a bind parameter $N whose type cannot be inferred (api.md §5)
   | "feature_not_supported" // 0A000
+  | "io_error" // 58030 — an I/O error from the host file layer (spec/design/api.md §2)
+  | "undefined_file" // 58P01 — open of a database path that does not exist
+  | "duplicate_file" // 58P02 — create of a database path that already exists
   | "data_corrupted"; // XX001 — a malformed on-disk database file (CLAUDE.md §8)
 
 const CODES: Record<SqlState, string> = {
@@ -55,7 +59,11 @@ const CODES: Record<SqlState, string> = {
   invalid_table_definition: "42P16",
   grouping_error: "42803",
   undefined_function: "42883",
+  indeterminate_datatype: "42P18",
   feature_not_supported: "0A000",
+  io_error: "58030",
+  undefined_file: "58P01",
+  duplicate_file: "58P02",
   data_corrupted: "XX001",
 };
 

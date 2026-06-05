@@ -120,6 +120,13 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 > an additive change, not a reshape. The whole-image writer fills both meta slots with the
 > same `txid`; slot alternation belongs to the future incremental path. The byte layout is
 > [../fileformat/format.md](../fileformat/format.md).
+>
+> The **host API** ([api.md](api.md)) makes whole-image durability crash-safe at the file
+> level with a temp-file + `fsync` + atomic `rename` + directory `fsync` sequence (since a
+> commit rewrites the entire file, rename gives all-or-nothing replacement for free). The
+> double-meta slots above remain the hook for the future *incremental in-place* commit; they
+> are not needed for whole-image durability. `commit` is **explicit** and `close` does not
+> auto-flush (api.md §2).
 
 ## 5. Pluggability (keep the door open — CLAUDE.md §9)
 

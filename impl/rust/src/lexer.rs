@@ -157,6 +157,29 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                     i += 1;
                 }
             }
+            b'$' => {
+                // A bind parameter `$N` — `$` then a 1-based decimal index (spec/design/api.md
+                // §5, grammar.md §5). `$` with no following digit, `$0`, and a leading zero
+                // (`$01`) are all 42601; an index overflowing u32 is too.
+                i += 1; // consume '$'
+                let digit_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let digits = &sql[digit_start..i];
+                if digits.is_empty() {
+                    return Err(syntax("expected a parameter number after '$'".to_string()));
+                }
+                if digits.as_bytes()[0] == b'0' {
+                    return Err(syntax(format!(
+                        "invalid parameter number ${digits}: parameters are 1-based with no leading zero"
+                    )));
+                }
+                let n: u32 = digits
+                    .parse()
+                    .map_err(|_| syntax(format!("parameter number out of range: ${digits}")))?;
+                tokens.push(Token::Param(n));
+            }
             _ if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = i;
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {

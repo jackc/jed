@@ -47,6 +47,10 @@ const (
 	TokLe
 	// TokGe is ">=".
 	TokGe
+	// TokParam is a bind parameter $N — Int holds the 1-based index. The lexer rejects $0, a
+	// leading zero ($01), and $ with no following digit (42601). Bound by the host API, not the
+	// corpus (spec/design/api.md, grammar.md §5).
+	TokParam
 	// TokEof marks end of input.
 	TokEof
 )

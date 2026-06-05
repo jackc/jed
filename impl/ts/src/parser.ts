@@ -262,12 +262,15 @@ class Parser {
     return values;
   }
 
-  // parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3),
-  // else a literal.
+  // parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3), a
+  // bind parameter ($N, bound at execute — spec/design/api.md §5), else a literal.
   private parseInsertValue(): InsertValue {
     if (this.peekKeyword() === "default") {
       this.advance();
       return { kind: "default" };
+    }
+    if (this.peek().kind === "param") {
+      return { kind: "param", index: this.advance().paramIndex! };
     }
     return { kind: "lit", lit: this.parseLiteral() };
   }
@@ -822,6 +825,9 @@ class Parser {
       return { kind: "case", operand, whens, els };
     }
     const t = this.peek();
+    if (t.kind === "param") {
+      return { kind: "param", index: this.advance().paramIndex! };
+    }
     if (t.kind === "int") {
       // The only magnitude > int64 max the lexer admits is 2^63, which fits no signed
       // integer type unless negated (handled by the unary-minus fold).

@@ -214,11 +214,16 @@ impl Parser {
         Ok(values)
     }
 
-    /// One INSERT value slot: the `DEFAULT` keyword (not reserved — §3), else a literal.
+    /// One INSERT value slot: the `DEFAULT` keyword (not reserved — §3), a bind parameter
+    /// (`$N`, bound at execute — spec/design/api.md §5), else a literal.
     fn parse_insert_value(&mut self) -> Result<InsertValue> {
         if self.peek_keyword().as_deref() == Some("default") {
             self.advance();
             Ok(InsertValue::Default)
+        } else if let Token::Param(n) = self.peek() {
+            let n = *n;
+            self.advance();
+            Ok(InsertValue::Param(n))
         } else {
             Ok(InsertValue::Lit(self.parse_literal()?))
         }
@@ -908,6 +913,11 @@ impl Parser {
             });
         }
         match self.peek() {
+            Token::Param(n) => {
+                let n = *n;
+                self.advance();
+                Ok(Expr::Param(n))
+            }
             Token::Int(m) => {
                 let m = *m;
                 self.advance();

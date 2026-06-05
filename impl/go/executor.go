@@ -35,21 +35,42 @@ type Outcome struct {
 	Cost        int64
 }
 
+// DefaultPageSize is the default serialization page size (8 KiB — spec/design/storage.md §3),
+// used for a fresh in-memory or newly-created database when no explicit size is given.
+const DefaultPageSize uint32 = 8192
+
 // Database is the whole database: catalog + per-table in-memory stores. Single
 // committed state (CLAUDE.md §3); the staging-buffer commit model lands with
 // persistence.
 type Database struct {
 	tables map[string]*Table
 	stores map[string]*TableStore
+	// path is the backing file (empty for an in-memory database). Set by the host API
+	// Open/Create (spec/design/api.md §2); Commit writes here.
+	path string
+	// txid is the monotonic commit counter: read from the file on open, bumped per Commit.
+	txid uint64
+	// pageSize is the page size this database serializes with (fixed for the life of a file).
+	pageSize uint32
 }
 
-// NewDatabase builds an empty database.
+// NewDatabase builds an empty in-memory database.
 func NewDatabase() *Database {
 	return &Database{
-		tables: make(map[string]*Table),
-		stores: make(map[string]*TableStore),
+		tables:   make(map[string]*Table),
+		stores:   make(map[string]*TableStore),
+		pageSize: DefaultPageSize,
 	}
 }
+
+// Txid is the monotonic commit counter (spec/design/api.md §2).
+func (db *Database) Txid() uint64 { return db.txid }
+
+// PageSize is the page size this database serializes with (spec/design/api.md §2).
+func (db *Database) PageSize() uint32 { return db.pageSize }
+
+// Path is the backing file path, or "" for an in-memory database.
+func (db *Database) Path() string { return db.path }
 
 // Table looks up a table definition by name (case-insensitive).
 func (db *Database) Table(name string) (*Table, bool) {
@@ -64,24 +85,46 @@ func (db *Database) putTable(t *Table) {
 	db.tables[key] = t
 }
 
-// ExecuteStmt executes one parsed statement.
+// ExecuteStmt executes one parsed statement with no bind parameters.
 func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
+	return db.ExecuteStmtParams(stmt, nil)
+}
+
+// ExecuteStmtParams executes one parsed statement, binding params to its $N placeholders (nil
+// for an unparameterized statement). DDL statements take no parameters — supplying any is a
+// 42601 (spec/design/api.md §5).
+func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, error) {
 	switch {
 	case stmt.CreateTable != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return Outcome{}, err
+		}
 		return db.executeCreateTable(stmt.CreateTable)
 	case stmt.DropTable != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return Outcome{}, err
+		}
 		return db.executeDropTable(stmt.DropTable)
 	case stmt.Insert != nil:
-		return db.executeInsert(stmt.Insert)
+		return db.executeInsert(stmt.Insert, params)
 	case stmt.Select != nil:
-		return db.executeSelect(stmt.Select)
+		return db.executeSelect(stmt.Select, params)
 	case stmt.Update != nil:
-		return db.executeUpdate(stmt.Update)
+		return db.executeUpdate(stmt.Update, params)
 	case stmt.Delete != nil:
-		return db.executeDelete(stmt.Delete)
+		return db.executeDelete(stmt.Delete, params)
 	default:
 		return Outcome{}, NewError(SyntaxError, "empty statement")
 	}
+}
+
+// rejectParamsForDDL errors (42601) if bind parameters are supplied to a CREATE/DROP TABLE
+// (which has no expressions to bind — spec/design/api.md §5).
+func rejectParamsForDDL(params []Value) error {
+	if len(params) > 0 {
+		return NewError(SyntaxError, "bind parameters are not allowed in a DDL statement")
+	}
+	return nil
 }
 
 // executeCreateTable analyzes and runs a CREATE TABLE: resolve each column's type
@@ -170,7 +213,7 @@ func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
 // §8); a duplicate primary key traps 23505. A multi-row INSERT is two-phase / all-or-nothing
 // (spec/design/grammar.md §12, constraints.md §2), mirroring UPDATE: every row is validated —
 // including its storage key — before any row is inserted, so a mid-batch failure stores nothing.
-func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
+func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) {
 	table, ok := db.Table(ins.Table)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ins.Table)
@@ -208,6 +251,31 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 		}
 	}
 
+	// A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those types across
+	// every row (a $N reused under two columns unifies; spec/design/api.md §5), then bind the
+	// supplied values up front so a bad bind fails before any row is stored.
+	ptypes := &paramTypes{}
+	for _, values := range ins.Rows {
+		for i, col := range table.Columns {
+			if p := provided[i]; p >= 0 && p < len(values) {
+				if iv := values[p]; iv.IsParam {
+					ct := col.Type
+					if err := ptypes.note(int(iv.Param)-1, &ct); err != nil {
+						return Outcome{}, err
+					}
+				}
+			}
+		}
+	}
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return Outcome{}, err
+	}
+	bound, err := bindParams(params, ptys)
+	if err != nil {
+		return Outcome{}, err
+	}
+
 	// Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
 	// table with a primary key, the encoded key is checked for a duplicate (within the
 	// batch via seenKeys, and against the store) up front; for a table with none, key is
@@ -238,9 +306,14 @@ func (db *Database) executeInsert(ins *Insert) (Outcome, error) {
 		for i, col := range table.Columns {
 			var candidate Value
 			if p := provided[i]; p >= 0 {
-				if iv := values[p]; iv.IsDefault {
+				switch iv := values[p]; {
+				case iv.IsDefault:
 					candidate = defaultOrNull(col)
-				} else {
+				case iv.IsParam:
+					// A bound $N value; its target-column coercion is the storeValue below,
+					// identical to a literal in this slot (spec/design/api.md §5).
+					candidate = bound[int(iv.Param)-1]
+				default:
 					candidate = literalToValue(iv.Lit)
 				}
 			} else {
@@ -305,20 +378,29 @@ func defaultOrNull(col Column) Value {
 // collect the keys of matching rows (only a TRUE predicate matches — Kleene), then
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
-func (db *Database) executeDelete(del *Delete) (Outcome, error) {
+func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) {
 	table, ok := db.Table(del.Table)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
 	}
 	// DELETE is single-table; resolve its WHERE against a one-relation scope.
 	s := singleScope(table)
+	ptypes := &paramTypes{}
 	var filter *rExpr
 	if del.Filter != nil {
-		f, err := resolveBooleanFilter(s, del.Filter)
+		f, err := resolveBooleanFilter(s, del.Filter, ptypes)
 		if err != nil {
 			return Outcome{}, err
 		}
 		filter = f
+	}
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return Outcome{}, err
+	}
+	bound, err := bindParams(params, ptys)
+	if err != nil {
+		return Outcome{}, err
 	}
 
 	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13;
@@ -331,7 +413,7 @@ func (db *Database) executeDelete(del *Delete) (Outcome, error) {
 		meter.Charge(Costs.StorageRowRead)
 		matched := true
 		if filter != nil {
-			v, err := filter.eval(e.Row, meter)
+			v, err := filter.eval(e.Row, bound, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -353,7 +435,7 @@ func (db *Database) executeDelete(del *Delete) (Outcome, error) {
 // writes. Phase 2 applies. Assigning a PRIMARY KEY column traps 0A000 (the storage
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
-func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
+func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) {
 	table, ok := db.Table(upd.Table)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+upd.Table)
@@ -361,6 +443,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 	// UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
 	// shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
 	s := singleScope(table)
+	ptypes := &paramTypes{}
 
 	// Resolve assignments up front (fail fast, deterministic).
 	pkIdx := table.PrimaryKeyIndex()
@@ -384,7 +467,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 		// The RHS is a general expression evaluated against the *old* row; a literal operand
 		// adapts to the target column's type. The result must be assignable to the column's
 		// family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-		src, ty, err := resolve(s, a.Value, &col.Type, &aggCtx{collecting: false})
+		src, ty, err := resolve(s, a.Value, &col.Type, &aggCtx{collecting: false}, ptypes)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -398,11 +481,20 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 
 	var filter *rExpr
 	if upd.Filter != nil {
-		f, err := resolveBooleanFilter(s, upd.Filter)
+		f, err := resolveBooleanFilter(s, upd.Filter, ptypes)
 		if err != nil {
 			return Outcome{}, err
 		}
 		filter = f
+	}
+	// All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return Outcome{}, err
+	}
+	bound, err := bindParams(params, ptys)
+	if err != nil {
+		return Outcome{}, err
 	}
 
 	// Phase 1: build + validate every matching row's new values; no writes yet. Each
@@ -418,7 +510,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 	for _, e := range store.EntriesInKeyOrder() {
 		meter.Charge(Costs.StorageRowRead)
 		if filter != nil {
-			v, err := filter.eval(e.Row, meter)
+			v, err := filter.eval(e.Row, bound, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -429,7 +521,7 @@ func (db *Database) executeUpdate(upd *Update) (Outcome, error) {
 		newRow := make(Row, len(e.Row))
 		copy(newRow, e.Row)
 		for _, p := range plans {
-			raw, err := p.source.eval(e.Row, meter)
+			raw, err := p.source.eval(e.Row, bound, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -463,7 +555,10 @@ func (db *Database) RowsInKeyOrder(name string) []Row {
 // WHERE/ORDER BY columns against the catalog, scan the table in primary-key order,
 // filter by the predicate (three-valued — only TRUE keeps a row), optionally re-sort
 // by ORDER BY, then project. Rows are produced deterministically (CLAUDE.md §10).
-func (db *Database) executeSelect(sel *Select) (Outcome, error) {
+func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) {
+	// Accumulates the inferred type of each $N across every clause of this SELECT, then is
+	// finalized + bound once all resolution is done (spec/design/api.md §5).
+	ptypes := &paramTypes{}
 	// Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
 	// relation's flat column offset in FROM order, and reject a duplicate label — a self-join
 	// without distinct aliases is 42712 (spec/design/grammar.md §15).
@@ -521,7 +616,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	// query (HAVING alone groups the whole table — grammar.md §19).
 	isAgg := len(groupKeys) > 0 || itemsHaveAggregate(sel.Items) || sel.Having != nil
 	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys}
-	projections, columnNames, err := resolveProjections(s, sel.Items, projAgg)
+	projections, columnNames, err := resolveProjections(s, sel.Items, projAgg, ptypes)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -531,7 +626,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	// the synthetic row is [group_keys..., projection aggs..., HAVING aggs...].
 	var having *rExpr
 	if sel.Having != nil {
-		node, ty, herr := resolve(s, *sel.Having, nil, projAgg)
+		node, ty, herr := resolve(s, *sel.Having, nil, projAgg, ptypes)
 		if herr != nil {
 			return Outcome{}, herr
 		}
@@ -547,7 +642,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	}
 	var filter *rExpr
 	if sel.Filter != nil {
-		filter, err = resolveBooleanFilter(s, sel.Filter)
+		filter, err = resolveBooleanFilter(s, sel.Filter, ptypes)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -622,12 +717,24 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	for k, j := range sel.Joins {
 		if j.On != nil {
 			partial := &scope{rels: s.rels[:k+2]}
-			on, oerr := resolveBooleanFilter(partial, j.On)
+			on, oerr := resolveBooleanFilter(partial, j.On, ptypes)
 			if oerr != nil {
 				return Outcome{}, oerr
 			}
 			joinOns[k] = on
 		}
+	}
+
+	// All clauses resolved: finalize the inferred parameter types and bind the supplied values
+	// (count mismatch 42601; out-of-range/family errors 22003/42804) BEFORE scanning any rows
+	// (spec/design/api.md §5).
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return Outcome{}, err
+	}
+	bound, err := bindParams(params, ptys)
+	if err != nil {
+		return Outcome{}, err
 	}
 
 	// Materialize each base table once, in primary-key order, charging storage_row_read per
@@ -674,7 +781,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 				combined = append(combined, right...)
 				keep := true
 				if on != nil {
-					v, err := on.eval(combined, meter)
+					v, err := on.eval(combined, bound, meter)
 					if err != nil {
 						return Outcome{}, err
 					}
@@ -716,7 +823,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 	for _, row := range running {
 		keep := true
 		if filter != nil {
-			v, err := filter.eval(row, meter)
+			v, err := filter.eval(row, bound, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -810,7 +917,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 				v := NullValue() // COUNT(*) ignores the value
 				if spec.operand != nil {
 					var verr error
-					if v, verr = spec.operand.eval(row, meter); verr != nil {
+					if v, verr = spec.operand.eval(row, bound, meter); verr != nil {
 						return Outcome{}, verr
 					}
 				}
@@ -839,7 +946,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		if having != nil {
 			kept := groupRows[:0:0]
 			for _, srow := range groupRows {
-				v, herr := having.eval(srow, meter)
+				v, herr := having.eval(srow, bound, meter)
 				if herr != nil {
 					return Outcome{}, herr
 				}
@@ -868,7 +975,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 			meter.Charge(Costs.RowProduced)
 			projected := make([]Value, len(projections))
 			for i, p := range projections {
-				v, perr := p.eval(srow, meter)
+				v, perr := p.eval(srow, bound, meter)
 				if perr != nil {
 					return Outcome{}, perr
 				}
@@ -886,7 +993,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 		for _, row := range rows {
 			projected := make([]Value, len(projections))
 			for i, p := range projections {
-				v, err := p.eval(row, meter)
+				v, err := p.eval(row, bound, meter)
 				if err != nil {
 					return Outcome{}, err
 				}
@@ -917,7 +1024,7 @@ func (db *Database) executeSelect(sel *Select) (Outcome, error) {
 			meter.Charge(Costs.RowProduced)
 			projected := make([]Value, len(projections))
 			for i, p := range projections {
-				v, err := p.eval(row, meter)
+				v, err := p.eval(row, bound, meter)
 				if err != nil {
 					return Outcome{}, err
 				}
@@ -1017,9 +1124,11 @@ func intType(t resolvedType) (ScalarType, bool) {
 	return 0, false
 }
 
-// ctxOf returns the type a sibling operand offers an adaptable literal: an integer type
-// (so an integer literal adopts that width), or bytea/text (so a string literal can decode
-// to bytea, else stay text). nil for bool/decimal/NULL — no useful literal context.
+// ctxOf returns the type a sibling operand offers an adaptable operand. For an integer literal
+// this is the integer width it adopts; for a string literal, bytea/uuid/text (so it can decode
+// the hex/uuid input); a bind parameter additionally adopts a decimal/boolean sibling (a literal
+// ignores those — its arm keeps int64/text — so widening the mapping is safe). Only a bare NULL
+// offers no context (spec/design/api.md §5).
 func ctxOf(t resolvedType) *ScalarType {
 	switch t.kind {
 	case rtInt:
@@ -1034,6 +1143,12 @@ func ctxOf(t resolvedType) *ScalarType {
 	case rtText:
 		ty := Text
 		return &ty
+	case rtBool:
+		ty := Bool
+		return &ty
+	case rtDecimal:
+		ty := DecimalType
+		return &ty
 	default:
 		return nil
 	}
@@ -1044,6 +1159,10 @@ type rExprKind int
 
 const (
 	reColumn rExprKind = iota
+	// reParam is a bind parameter, by 0-based index into the bound-values slice passed to eval.
+	// Its static type was inferred from context at resolve (spec/design/api.md §5); the value is
+	// supplied (and coerced) before evaluation.
+	reParam
 	reConstInt
 	reConstBool
 	reConstText
@@ -1309,7 +1428,7 @@ func exprHasFuncCall(e Expr) bool {
 // aggSpec. Valid only in collect mode; in Forbidden mode (WHERE/ON/nested) it is 42803. The
 // operand resolves in a fresh Forbidden sub-context (a nested aggregate is 42803; its columns
 // resolve against the real row). The result type follows the PG widening (aggregates.md §3).
-func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedType, error) {
+func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if !ag.collecting {
 		return nil, resolvedType{}, NewError(GroupingError, "aggregate functions are not allowed here")
 	}
@@ -1325,7 +1444,7 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedT
 		if fc.Star {
 			plan, operand, result = planCountStar, nil, resolvedType{kind: rtInt, intTy: Int64}
 		} else {
-			r, _, err := resolve(s, *fc.Arg, nil, sub)
+			r, _, err := resolve(s, *fc.Arg, nil, sub, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1335,7 +1454,7 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx) (*rExpr, resolvedT
 		if fc.Star {
 			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
-		r, t, err := resolve(s, *fc.Arg, nil, sub)
+		r, t, err := resolve(s, *fc.Arg, nil, sub, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1491,6 +1610,87 @@ func missingFromEntry(qualifier string) error {
 	return NewError(UndefinedTable, "missing FROM-clause entry for table "+qualifier)
 }
 
+// paramTypes accumulates the inferred type of each bind parameter ($N) across every clause of a
+// statement (spec/design/api.md §5). types[i] is the inferred scalar type of $(i+1); a nil entry
+// marks a parameter referenced before any context fixed its type.
+type paramTypes struct {
+	types []*ScalarType
+}
+
+// note records that $(idx0+1) appears with context type ty (nil = no context here). It unifies
+// with any prior inference: equal types agree, two integer widths widen to the wider, an
+// incompatible concrete pair is 42804.
+func (p *paramTypes) note(idx0 int, ty *ScalarType) error {
+	for idx0 >= len(p.types) {
+		p.types = append(p.types, nil)
+	}
+	if ty == nil {
+		return nil
+	}
+	if p.types[idx0] == nil {
+		t := *ty
+		p.types[idx0] = &t
+		return nil
+	}
+	u, err := unifyParamType(*p.types[idx0], *ty, idx0)
+	if err != nil {
+		return err
+	}
+	p.types[idx0] = &u
+	return nil
+}
+
+// finalize returns the ordered parameter types. A slot referenced but never typed — including a
+// gap in $1..$N — is 42P18 indeterminate_datatype.
+func (p *paramTypes) finalize() ([]ScalarType, error) {
+	out := make([]ScalarType, 0, len(p.types))
+	for i, t := range p.types {
+		if t == nil {
+			return nil, NewError(IndeterminateDatatype,
+				fmt.Sprintf("could not determine data type of parameter $%d", i+1))
+		}
+		out = append(out, *t)
+	}
+	return out, nil
+}
+
+// unifyParamType unifies two inferred types for the same parameter: equal agrees; two integer
+// widths widen to the wider; any other mismatch is 42804 (spec/design/api.md §5).
+func unifyParamType(a, b ScalarType, idx0 int) (ScalarType, error) {
+	if a == b {
+		return a, nil
+	}
+	if a.IsInteger() && b.IsInteger() {
+		if a.Rank() >= b.Rank() {
+			return a, nil
+		}
+		return b, nil
+	}
+	var zero ScalarType
+	return zero, NewError(DatatypeMismatch,
+		fmt.Sprintf("inconsistent types inferred for parameter $%d", idx0+1))
+}
+
+// bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
+// all-or-nothing like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value
+// is validated up front (22003/42804/22P02/23502 via storeValue) before any row is touched.
+func bindParams(supplied []Value, types []ScalarType) ([]Value, error) {
+	if len(supplied) != len(types) {
+		return nil, NewError(SyntaxError, fmt.Sprintf(
+			"bind parameter count mismatch: statement expects %d, got %d", len(types), len(supplied),
+		))
+	}
+	bound := make([]Value, len(types))
+	for i, ty := range types {
+		v, err := storeValue(supplied[i], ty, nil, false, fmt.Sprintf("$%d", i+1))
+		if err != nil {
+			return nil, err
+		}
+		bound[i] = v
+	}
+	return bound, nil
+}
+
 // resolvedTypeOf is the resolved (static) type of a column of scalar type ty.
 func resolvedTypeOf(ty ScalarType) resolvedType {
 	switch {
@@ -1513,7 +1713,7 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
 // each relation's columns in catalog order (§15).
-func resolveProjections(s *scope, items SelectItems, ag *aggCtx) ([]*rExpr, []string, error) {
+func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, error) {
 	if items.All {
 		var ps []*rExpr
 		var names []string
@@ -1528,7 +1728,7 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx) ([]*rExpr, []st
 	ps := make([]*rExpr, 0, len(items.Items))
 	names := make([]string, 0, len(items.Items))
 	for _, it := range items.Items {
-		node, _, err := resolve(s, it.Expr, nil, ag)
+		node, _, err := resolve(s, it.Expr, nil, ag, params)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1568,9 +1768,9 @@ func outputName(s *scope, e Expr) string {
 
 // resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an
 // untyped NULL, which is always unknown → no rows). An integer- or text-valued one is 42804.
-func resolveBooleanFilter(s *scope, e *Expr) (*rExpr, error) {
+func resolveBooleanFilter(s *scope, e *Expr, params *paramTypes) (*rExpr, error) {
 	// WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
-	node, ty, err := resolve(s, *e, nil, &aggCtx{collecting: false})
+	node, ty, err := resolve(s, *e, nil, &aggCtx{collecting: false}, params)
 	if err != nil {
 		return nil, err
 	}
@@ -1583,8 +1783,23 @@ func resolveBooleanFilter(s *scope, e *Expr) (*rExpr, error) {
 // resolve resolves one Expr into an rExpr plus its static type. ctx (non-nil) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); nil
 // defaults a bare literal to int64.
-func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedType, error) {
+func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	switch e.Kind {
+	case ExprParam:
+		// A bind parameter is an adaptable operand (like an integer/string literal): it takes its
+		// type from ctx — the sibling operand, target column, or CAST target. Record the inferred
+		// type (nil = no context here; finalize 42P18s a parameter that never gets one).
+		idx0 := int(e.Param) - 1
+		if err := params.note(idx0, ctx); err != nil {
+			return nil, resolvedType{}, err
+		}
+		var rty resolvedType
+		if ctx != nil {
+			rty = resolvedTypeOf(*ctx)
+		} else {
+			rty = resolvedType{kind: rtNull}
+		}
+		return &rExpr{kind: reParam, index: idx0}, rty, nil
 	case ExprColumn:
 		// Resolve for existence first (42703/42702 take priority, matching PostgreSQL); then
 		// in an aggregate query's projection the column must be a grouping key (else 42803).
@@ -1600,7 +1815,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		}
 		return collectColumn(s, ag, idx, e.Column)
 	case ExprFuncCall:
-		return resolveAggregate(s, e.FuncCall, ag)
+		return resolveAggregate(s, e.FuncCall, ag, params)
 	case ExprLiteral:
 		switch e.Literal.Kind {
 		case LiteralNull:
@@ -1673,7 +1888,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		if target.IsUuid() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to uuid is not supported yet")
 		}
-		inner, ity, err := resolve(s, e.Cast.Inner, nil, ag)
+		inner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1701,7 +1916,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod}, resultRt, nil
 	case ExprUnary:
 		if e.Unary.Op == OpNeg {
-			rop, ty, err := resolve(s, e.Unary.Operand, ctx, ag)
+			rop, ty, err := resolve(s, e.Unary.Operand, ctx, ag, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1720,7 +1935,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 			}
 		}
 		// OpNot
-		rop, ty, err := resolve(s, e.Unary.Operand, nil, ag)
+		rop, ty, err := resolve(s, e.Unary.Operand, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1729,7 +1944,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		}
 		return &rExpr{kind: reNot, operand: rop}, resolvedType{kind: rtBool}, nil
 	case ExprIsNull:
-		rop, _, err := resolve(s, e.IsNullOf.Operand, nil, ag)
+		rop, _, err := resolve(s, e.IsNullOf.Operand, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1740,7 +1955,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		// literal adapts to its sibling; a text literal stays text), then require the
 		// operands be comparable (both integer-ish or both text-ish; a mixed pair is
 		// 42804). The result is always a definite boolean (functions.md §3).
-		rl, lt, rr, rt, err := resolveOperandPair(s, e.IsDistinct.Lhs, e.IsDistinct.Rhs, ag)
+		rl, lt, rr, rt, err := resolveOperandPair(s, e.IsDistinct.Lhs, e.IsDistinct.Rhs, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1769,7 +1984,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		if e.In.Negated {
 			folded = Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: folded}}
 		}
-		return resolve(s, folded, ctx, ag)
+		return resolve(s, folded, ctx, ag, params)
 	case ExprBetween:
 		// Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
 		// result for a NULL bound: `5 BETWEEN 10 AND NULL` is `FALSE AND NULL` = FALSE (a FALSE
@@ -1782,12 +1997,12 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		if e.Between.Negated {
 			folded = Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: folded}}
 		}
-		return resolve(s, folded, ctx, ag)
+		return resolve(s, folded, ctx, ag, params)
 	case ExprLike:
 		// LIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal stays
 		// text), then require BOTH operands be text (or a bare NULL); a non-text operand is
 		// 42804. We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
-		rl, lt, rr, rt, err := resolveOperandPair(s, e.Like.Lhs, e.Like.Rhs, ag)
+		rl, lt, rr, rt, err := resolveOperandPair(s, e.Like.Lhs, e.Like.Rhs, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1810,13 +2025,13 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 			var rcond *rExpr
 			if e.Case.Operand != nil {
 				eq := binaryExpr(OpEq, *e.Case.Operand, w.Cond)
-				rc, _, err := resolve(s, eq, nil, ag)
+				rc, _, err := resolve(s, eq, nil, ag, params)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
 				rcond = rc
 			} else {
-				rc, cty, err := resolve(s, w.Cond, nil, ag)
+				rc, cty, err := resolve(s, w.Cond, nil, ag, params)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
@@ -1825,7 +2040,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 				}
 				rcond = rc
 			}
-			rres, rty, err := resolve(s, w.Result, nil, ag)
+			rres, rty, err := resolve(s, w.Result, nil, ag, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1834,7 +2049,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		}
 		var rels *rExpr
 		if e.Case.Els != nil {
-			r, ety, err := resolve(s, *e.Case.Els, nil, ag)
+			r, ety, err := resolve(s, *e.Case.Els, nil, ag, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1851,18 +2066,18 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx) (*rExpr, resolvedTyp
 		return &rExpr{kind: reCase, caseArms: arms, caseEls: rels, caseDecimal: unified.kind == rtDecimal},
 			unified, nil
 	default: // ExprBinary
-		return resolveBinary(s, e.Binary, ag)
+		return resolveBinary(s, e.Binary, ag, params)
 	}
 }
 
-func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx) (*rExpr, resolvedType, error) {
+func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	switch b.Op {
 	case OpAdd, OpSub, OpMul, OpDiv, OpMod:
 		// Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
 		// integer literal adapts to an integer sibling), then pick the family: both integer →
 		// integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
 		// widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
-		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs, ag)
+		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1884,7 +2099,7 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx) (*rExpr, resolvedType, e
 		// the operands (a literal adapts to its sibling; text literals stay text), then
 		// require they be comparable — a mixed integer/text pair is 42804. The runtime
 		// comparison (Eq3/Lt3/Gt3) dispatches on the value kinds.
-		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs, ag)
+		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1894,11 +2109,11 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx) (*rExpr, resolvedType, e
 		return &rExpr{kind: reCompare, op: b.Op, lhs: rl, rhs: rr},
 			resolvedType{kind: rtBool}, nil
 	default: // OpAnd, OpOr
-		rl, lt, err := resolve(s, b.Lhs, nil, ag)
+		rl, lt, err := resolve(s, b.Lhs, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		rr, rt, err := resolve(s, b.Rhs, nil, ag)
+		rr, rt, err := resolve(s, b.Rhs, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1923,34 +2138,34 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx) (*rExpr, resolvedType, e
 // context (ctxOf returns nil) and defaults to int64 — the caller's family check then
 // reports the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
 // classifyComparable (comparison) layer that on top.
-func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
-	lhsLit := isAdaptableLiteral(lhs)
-	rhsLit := isAdaptableLiteral(rhs)
+func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
+	lhsLit := isAdaptableOperand(lhs)
+	rhsLit := isAdaptableOperand(rhs)
 	var rl, rr *rExpr
 	var lt, rt resolvedType
 	var err error
 	switch {
 	case lhsLit && rhsLit:
 		i64 := Int64
-		if rl, lt, err = resolve(s, lhs, &i64, ag); err != nil {
+		if rl, lt, err = resolve(s, lhs, &i64, ag, params); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rr, rt, err = resolve(s, rhs, &i64, ag)
+		rr, rt, err = resolve(s, rhs, &i64, ag, params)
 	case lhsLit:
-		if rr, rt, err = resolve(s, rhs, nil, ag); err != nil {
+		if rr, rt, err = resolve(s, rhs, nil, ag, params); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rl, lt, err = resolve(s, lhs, ctxOf(rt), ag)
+		rl, lt, err = resolve(s, lhs, ctxOf(rt), ag, params)
 	case rhsLit:
-		if rl, lt, err = resolve(s, lhs, nil, ag); err != nil {
+		if rl, lt, err = resolve(s, lhs, nil, ag, params); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rr, rt, err = resolve(s, rhs, ctxOf(lt), ag)
+		rr, rt, err = resolve(s, rhs, ctxOf(lt), ag, params)
 	default:
-		if rl, lt, err = resolve(s, lhs, nil, ag); err != nil {
+		if rl, lt, err = resolve(s, lhs, nil, ag, params); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rr, rt, err = resolve(s, rhs, nil, ag)
+		rr, rt, err = resolve(s, rhs, nil, ag, params)
 	}
 	if err != nil {
 		return nil, resolvedType{}, nil, resolvedType{}, err
@@ -1996,10 +2211,13 @@ func classifyComparable(lt, rt resolvedType) error {
 	return nil
 }
 
-// isAdaptableLiteral reports whether e is a literal that adapts to its sibling operand's
-// type (an integer or string literal). NULL, boolean, and decimal literals do not take a
-// sibling's context here.
-func isAdaptableLiteral(e Expr) bool {
+// isAdaptableOperand reports whether e is an adaptable operand — one that takes its type from
+// its sibling: an integer or string literal, or a bind parameter $N (spec/design/api.md §5).
+// NULL, boolean, and decimal literals do not take a sibling's context here.
+func isAdaptableOperand(e Expr) bool {
+	if e.Kind == ExprParam {
+		return true
+	}
 	return e.Kind == ExprLiteral && (e.Literal.Kind == LiteralInt || e.Literal.Kind == LiteralText)
 }
 
@@ -2209,10 +2427,14 @@ func typeError(msg string) error { return NewError(DatatypeMismatch, msg) }
 // operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both operands
 // are always evaluated — there is no short-circuit, so the count never depends on operand
 // values (spec/design/cost.md §3).
-func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
+func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 	switch e.kind {
 	case reColumn:
 		return row[e.index], nil
+	case reParam:
+		// The supplied value, already coerced to its inferred type by bindParams before
+		// execution (spec/design/api.md §5).
+		return params[e.index], nil
 	case reConstInt:
 		return IntValue(e.cInt), nil
 	case reConstBool:
@@ -2229,7 +2451,7 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		return NullValue(), nil
 	case reCast:
 		m.Charge(Costs.OperatorEval)
-		v, err := e.operand.eval(row, m)
+		v, err := e.operand.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -2239,7 +2461,7 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		return evalCast(v, e.result, e.typmod)
 	case reNeg:
 		m.Charge(Costs.OperatorEval)
-		v, err := e.operand.eval(row, m)
+		v, err := e.operand.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -2262,18 +2484,18 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		return IntValue(n), nil
 	case reNot:
 		m.Charge(Costs.OperatorEval)
-		v, err := e.operand.eval(row, m)
+		v, err := e.operand.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return boolNot(v), nil
 	case reArith:
 		m.Charge(Costs.OperatorEval)
-		a, err := e.lhs.eval(row, m)
+		a, err := e.lhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row, m)
+		b, err := e.rhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -2288,11 +2510,11 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		return evalArith(e.op, a.Int, b.Int, e.result)
 	case reCompare:
 		m.Charge(Costs.OperatorEval)
-		a, err := e.lhs.eval(row, m)
+		a, err := e.lhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row, m)
+		b, err := e.rhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -2310,29 +2532,29 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		}
 	case reAnd:
 		m.Charge(Costs.OperatorEval)
-		a, err := e.lhs.eval(row, m)
+		a, err := e.lhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row, m)
+		b, err := e.rhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return boolAnd(a, b), nil
 	case reOr:
 		m.Charge(Costs.OperatorEval)
-		a, err := e.lhs.eval(row, m)
+		a, err := e.lhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row, m)
+		b, err := e.rhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return boolOr(a, b), nil
 	case reIsNull:
 		m.Charge(Costs.OperatorEval)
-		v, err := e.operand.eval(row, m)
+		v, err := e.operand.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -2340,11 +2562,11 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		return BoolValue(isNull != e.negated), nil
 	case reLike:
 		m.Charge(Costs.OperatorEval)
-		subject, err := e.lhs.eval(row, m)
+		subject, err := e.lhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
-		pattern, err := e.rhs.eval(row, m)
+		pattern, err := e.rhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -2367,30 +2589,30 @@ func (e *rExpr) eval(row Row, m *Meter) (Value, error) {
 		// Charge the node, then only the conditions up to the match plus the selected result.
 		m.Charge(Costs.OperatorEval)
 		for _, arm := range e.caseArms {
-			cv, err := arm.cond.eval(row, m)
+			cv, err := arm.cond.eval(row, params, m)
 			if err != nil {
 				return Value{}, err
 			}
 			if cv.Kind == ValBool && cv.Bool {
-				rv, err := arm.result.eval(row, m)
+				rv, err := arm.result.eval(row, params, m)
 				if err != nil {
 					return Value{}, err
 				}
 				return coerceCase(rv, e.caseDecimal), nil
 			}
 		}
-		ev, err := e.caseEls.eval(row, m)
+		ev, err := e.caseEls.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
 		return coerceCase(ev, e.caseDecimal), nil
 	default: // reDistinct
 		m.Charge(Costs.OperatorEval)
-		a, err := e.lhs.eval(row, m)
+		a, err := e.lhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}
-		b, err := e.rhs.eval(row, m)
+		b, err := e.rhs.eval(row, params, m)
 		if err != nil {
 			return Value{}, err
 		}

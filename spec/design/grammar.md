@@ -128,9 +128,17 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   functions (`length`, `lower`, …) and **`COUNT(DISTINCT x)`** stay deferred; an unknown
   function name is `42883`, and `DISTINCT` inside a call is `42601`.
 - **No `;` statement terminator** and **no SQL comment syntax** in the input.
-- **No parameter placeholders** (`$1`, `?`). The conformance corpus uses literal SQL by
-  design — see [conformance.md](conformance.md); bound parameters are an
-  implementation-API concern, not part of the parsed grammar.
+- **Parameter placeholders (`$N`) are parsed, but bound by the host API, not the corpus.**
+  The lexer accepts `$` followed by ≥1 ASCII digits as a 1-based bind parameter (`$1`,
+  `$2`, …); `$0`, a leading zero (`$01`), and `$` not followed by a digit are `42601`. A
+  `$N` is a primary expression usable anywhere an expression is (WHERE / HAVING / ON /
+  select list / UPDATE SET RHS / arithmetic / `CAST` inner / `IN` / `BETWEEN` / `LIKE` /
+  `CASE`) and as an `INSERT` value slot — but **not** in LIMIT/OFFSET, GROUP BY, or a type
+  modifier this slice. A parameter's type is **inferred from context** (its sibling operand,
+  target column, or `CAST` target); a parameter with no derivable type is `42P18`. Binding a
+  value to `$N` is each implementation's own host-API surface ([api.md](api.md)) — the
+  conformance corpus still uses **literal SQL only** (see [conformance.md](conformance.md));
+  `?`-style placeholders remain unsupported.
 
 ## 6. Type names: an `identifier` plus an optional type modifier
 

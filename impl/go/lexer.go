@@ -141,6 +141,29 @@ func Lex(sql string) ([]Token, error) {
 				tokens = append(tokens, Token{Kind: TokDot})
 				i++
 			}
+		case c == '$':
+			// A bind parameter $N — '$' then a 1-based decimal index (spec/design/api.md §5,
+			// grammar.md §5). '$' with no following digit, $0, and a leading zero ($01) are 42601;
+			// an index overflowing uint32 is too.
+			i++ // consume '$'
+			digitStart := i
+			for i < len(b) && isDigit(b[i]) {
+				i++
+			}
+			digits := sql[digitStart:i]
+			if len(digits) == 0 {
+				return nil, NewError(SyntaxError, "expected a parameter number after '$'")
+			}
+			if digits[0] == '0' {
+				return nil, NewError(SyntaxError, fmt.Sprintf(
+					"invalid parameter number $%s: parameters are 1-based with no leading zero", digits,
+				))
+			}
+			n, err := strconv.ParseUint(digits, 10, 32)
+			if err != nil {
+				return nil, NewError(SyntaxError, fmt.Sprintf("parameter number out of range: $%s", digits))
+			}
+			tokens = append(tokens, Token{Kind: TokParam, Int: n})
 		case isAlpha(c):
 			start := i
 			for i < len(b) && (isAlpha(b[i]) || isDigit(b[i])) {

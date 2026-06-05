@@ -144,6 +144,30 @@ export function lex(sql: string): Token[] {
         tokens.push({ kind: "dot" });
         i++;
       }
+    } else if (c === "$") {
+      // A bind parameter $N — "$" then a 1-based decimal index (spec/design/api.md §5,
+      // grammar.md §5). "$" with no following digit, $0, and a leading zero ($01) are 42601;
+      // an index overflowing a 32-bit range is too.
+      i++; // consume "$"
+      const digitStart = i;
+      while (i < n && isDigit(sql[i]!)) {
+        i++;
+      }
+      const digits = sql.slice(digitStart, i);
+      if (digits.length === 0) {
+        throw engineError("syntax_error", "expected a parameter number after '$'");
+      }
+      if (digits[0] === "0") {
+        throw engineError(
+          "syntax_error",
+          `invalid parameter number $${digits}: parameters are 1-based with no leading zero`,
+        );
+      }
+      const idx = Number(digits);
+      if (!Number.isSafeInteger(idx) || idx > 0xffffffff) {
+        throw engineError("syntax_error", `parameter number out of range: $${digits}`);
+      }
+      tokens.push({ kind: "param", paramIndex: idx });
     } else if (isAlpha(c)) {
       const start = i;
       while (i < n && (isAlpha(sql[i]!) || isDigit(sql[i]!))) {

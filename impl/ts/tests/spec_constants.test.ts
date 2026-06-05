@@ -104,7 +104,11 @@ test("error codes are registered in spec/errors/registry.toml", () => {
     "duplicate_table",
     "duplicate_column",
     "invalid_table_definition",
+    "indeterminate_datatype",
     "feature_not_supported",
+    "io_error",
+    "undefined_file",
+    "duplicate_file",
     "data_corrupted",
   ];
   for (const st of states) {

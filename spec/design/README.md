@@ -25,6 +25,9 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   order.
 - [storage.md](storage.md) — the storage seam: block interface, page model, and the
   root-pointer-swap commit model (CLAUDE.md §3/§9).
+- [api.md](api.md) — the host/embedding API: open/create/commit/close a database file,
+  prepare/execute/query, the `Rows` cursor, `$N` bind parameters, and the structured-error
+  surface — the same shape across cores (CLAUDE.md §1/§2).
 - [cost.md](cost.md) — the deterministic cost-accounting seam: the unit schedule as data,
   the cross-core accrual rules, the counter representation, and the deferred ceiling/abort
   (CLAUDE.md §13).

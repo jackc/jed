@@ -183,7 +183,11 @@ fn error_codes_are_registered() {
         SqlState::DuplicateTable,
         SqlState::DuplicateColumn,
         SqlState::InvalidTableDefinition,
+        SqlState::IndeterminateDatatype,
         SqlState::FeatureNotSupported,
+        SqlState::IoError,
+        SqlState::UndefinedFile,
+        SqlState::DuplicateFile,
         SqlState::DataCorrupted,
     ] {
         assert!(
