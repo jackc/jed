@@ -26,6 +26,11 @@ const (
 	// ValBytea, but a distinct kind: a uuid renders 8-4-4-4-12 and is its own comparison family,
 	// so a uuid never equals a bytea even with identical bytes — spec/design/types.md §14).
 	ValUuid
+	// ValTimestamp is a zoneless timestamp; Int holds the int64 microsecond instant (the
+	// sentinels NegInfinity/PosInfinity are -infinity/+infinity — spec/design/timestamp.md).
+	ValTimestamp
+	// ValTimestamptz is a UTC-instant timestamptz; Int holds the int64 microsecond instant.
+	ValTimestamptz
 )
 
 // Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers
@@ -70,6 +75,12 @@ func ByteaValue(b []byte) Value { return Value{Kind: ValBytea, Str: string(b)} }
 // UuidValue builds a non-null uuid value from its 16 raw bytes (stored as a byte-holding string,
 // like bytea, but tagged ValUuid). The caller must pass exactly 16 bytes (ParseUUID guarantees).
 func UuidValue(b []byte) Value { return Value{Kind: ValUuid, Str: string(b)} }
+
+// TimestampValue builds a non-null timestamp from its int64 microsecond instant.
+func TimestampValue(m int64) Value { return Value{Kind: ValTimestamp, Int: m} }
+
+// TimestamptzValue builds a non-null timestamptz from its int64 microsecond instant.
+func TimestamptzValue(m int64) Value { return Value{Kind: ValTimestamptz, Int: m} }
 
 // ParseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
 // a `\x` prefix followed by an even count of hexadecimal digits (case-insensitive), each
@@ -216,6 +227,10 @@ func (v Value) Render() string {
 	case ValUuid:
 		// Canonical 8-4-4-4-12 lowercase-hex form (PG uuid_out).
 		return renderUUID([]byte(v.Str))
+	case ValTimestamp:
+		return RenderTimestamp(v.Int)
+	case ValTimestamptz:
+		return RenderTimestamptz(v.Int)
 	default:
 		return strconv.FormatInt(v.Int, 10)
 	}
@@ -279,6 +294,13 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValUuid || o.Kind == ValUuid {
 		return bool3(v.Str == o.Str)
 	}
+	// Timestamps compare by the int64 instant (infinity is just an extreme value).
+	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
+		return bool3(v.Int == o.Int)
+	}
+	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
+		return bool3(v.Int == o.Int)
+	}
 	return Unknown
 }
 
@@ -303,6 +325,12 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValUuid || o.Kind == ValUuid {
 		return bool3(v.Str < o.Str)
 	}
+	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
+		return bool3(v.Int < o.Int)
+	}
+	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
+		return bool3(v.Int < o.Int)
+	}
 	return Unknown
 }
 
@@ -326,6 +354,12 @@ func (v Value) Gt3(o Value) ThreeValued {
 	}
 	if v.Kind == ValUuid || o.Kind == ValUuid {
 		return bool3(v.Str > o.Str)
+	}
+	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
+		return bool3(v.Int > o.Int)
+	}
+	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
+		return bool3(v.Int > o.Int)
 	}
 	return Unknown
 }

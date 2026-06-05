@@ -51,6 +51,19 @@ strategy = "none"
 family = "uuid"
 strategy = "none"
 
+# timestamp / timestamptz each have a single type with no promotion tower (strategy =
+# "none"): two same-type datetime operands compare directly by their int64 instant, no
+# reconciliation. The two families do NOT reconcile with EACH OTHER (that would require a
+# zone) — there is deliberately no cross comparable rule below, so timestamp × timestamptz
+# is a 42804 type error (../design/timestamp.md).
+[[promotion]]
+family = "timestamp"
+strategy = "none"
+
+[[promotion]]
+family = "timestamptz"
+strategy = "none"
+
 # --- comparability -----------------------------------------------------------
 # Which (family, family) pairs may be compared at all. Anything not listed is a
 # type error. Step 1 has exactly one family, so there is one rule. Cross-family
@@ -118,6 +131,21 @@ left_family = "uuid"
 right_family = "uuid"
 via = "none"
 
+# timestamp × timestamp and timestamptz × timestamptz only. via = "none": one type per
+# family, no promotion; compare by the int64 instant (signed numeric order), which places
+# -infinity < every finite < infinity for free (../design/timestamp.md). There is NO
+# timestamp × timestamptz rule (it would require a zone), so a mixed datetime pair is a
+# 42804 type error — likewise timestamp × {integer,decimal,text,bool,bytea}.
+[[comparable]]
+left_family = "timestamp"
+right_family = "timestamp"
+via = "none"
+
+[[comparable]]
+left_family = "timestamptz"
+right_family = "timestamptz"
+via = "none"
+
 # --- value ordering ----------------------------------------------------------
 # The total order over non-NULL integers used by ORDER BY and by index/key
 # iteration. Plain signed numeric order; matches the order-preserving key
@@ -151,6 +179,14 @@ bytea = "byte-ascending"
 # stored byte order == logical order — and uuid is the first non-integer type that EXERCISES
 # this as a real key (../design/encoding.md §2.7).
 uuid = "byte-ascending"
+# timestamp / timestamptz order by their int64 microsecond instant (signed numeric order),
+# so -infinity (i64::MIN) < every finite value < infinity (i64::MAX). The order-preserving
+# key encoding (scalars.toml "int-be-signflip", the same as int64) reproduces this in raw
+# bytes — and unlike text/bytea/decimal it is EXERCISED this slice (a timestamp PRIMARY KEY
+# is allowed), so stored byte order == logical order. No NaN exists for timestamps, so the
+# order is total (contrast decimal/float).
+timestamp = "numeric-ascending"
+timestamptz = "numeric-ascending"
 
 # NULL's position in the physical total order of encoded keys (index/key
 # iteration), RATIFIED with the key-encoding spec (CLAUDE.md §11 step 4) and

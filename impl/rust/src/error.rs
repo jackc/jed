@@ -12,6 +12,11 @@ use std::fmt;
 pub enum SqlState {
     /// 22003 — numeric value out of range (integer overflow; CLAUDE.md §8).
     NumericValueOutOfRange,
+    /// 22007 — invalid datetime format (malformed timestamp / timestamptz input).
+    InvalidDatetimeFormat,
+    /// 22008 — datetime field overflow (an out-of-range datetime field or a value
+    /// beyond the representable int64-microsecond range; spec/design/timestamp.md).
+    DatetimeFieldOverflow,
     /// 22012 — division (or modulo) by zero.
     DivisionByZero,
     /// 22023 — invalid parameter value (e.g. a bad numeric typmod, `numeric(0)`).
@@ -80,6 +85,8 @@ impl SqlState {
     pub fn code(self) -> &'static str {
         match self {
             SqlState::NumericValueOutOfRange => "22003",
+            SqlState::InvalidDatetimeFormat => "22007",
+            SqlState::DatetimeFieldOverflow => "22008",
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidParameterValue => "22023",
             SqlState::InvalidTextRepresentation => "22P02",

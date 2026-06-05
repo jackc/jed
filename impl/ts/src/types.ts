@@ -15,7 +15,9 @@ export type ScalarType =
   | "boolean"
   | "decimal"
   | "bytea"
-  | "uuid";
+  | "uuid"
+  | "timestamp"
+  | "timestamptz";
 
 export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "int16",
@@ -26,6 +28,8 @@ export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "decimal",
   "bytea",
   "uuid",
+  "timestamp",
+  "timestamptz",
 ];
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. precision >= 1;
@@ -62,6 +66,16 @@ export function isBytea(t: ScalarType): boolean {
 // order — spec/design/types.md §14). The first non-integer type usable as a key.
 export function isUuid(t: ScalarType): boolean {
   return t === "uuid";
+}
+
+// isTimestamp reports whether this is the zoneless timestamp type (spec/design/timestamp.md).
+export function isTimestamp(t: ScalarType): boolean {
+  return t === "timestamp";
+}
+
+// isTimestamptz reports whether this is the UTC-instant timestamptz type.
+export function isTimestamptz(t: ScalarType): boolean {
+  return t === "timestamptz";
 }
 
 // isInteger reports whether this is one of the fixed-width signed integer types.
@@ -107,6 +121,12 @@ export function scalarTypeFromName(name: string): ScalarType | undefined {
       return "bytea";
     case "uuid":
       return "uuid";
+    case "timestamp":
+    case "timestamp without time zone":
+      return "timestamp";
+    case "timestamptz":
+    case "timestamp with time zone":
+      return "timestamptz";
     default:
       return undefined;
   }
@@ -124,6 +144,10 @@ export function widthBytes(t: ScalarType): number {
     case "int32":
       return 4;
     case "int64":
+    // The two timestamps are int64-microsecond instants — fixed-width 8-byte, reusing the
+    // int64 key/value codec (spec/design/timestamp.md §6).
+    case "timestamp":
+    case "timestamptz":
       return 8;
     case "uuid":
       return 16;
@@ -157,6 +181,9 @@ export function minOf(t: ScalarType): bigint {
       throw new Error("bytea has no integer range");
     case "uuid":
       throw new Error("uuid has no integer range");
+    case "timestamp":
+    case "timestamptz":
+      throw new Error("timestamp has no integer range");
   }
 }
 
@@ -179,6 +206,9 @@ export function maxOf(t: ScalarType): bigint {
       throw new Error("bytea has no integer range");
     case "uuid":
       throw new Error("uuid has no integer range");
+    case "timestamp":
+    case "timestamptz":
+      throw new Error("timestamp has no integer range");
   }
 }
 
@@ -202,6 +232,9 @@ export function rank(t: ScalarType): number {
       throw new Error("bytea has no promotion rank");
     case "uuid":
       throw new Error("uuid has no promotion rank");
+    case "timestamp":
+    case "timestamptz":
+      throw new Error("timestamp has no promotion rank");
   }
 }
 

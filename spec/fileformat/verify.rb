@@ -19,8 +19,9 @@ PAGE_HEADER = 12
 ROOT_PAGE = 2
 TXID = 1
 
-WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8 }.freeze
-TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6, "bytea" => 7, "uuid" => 8 }.freeze
+WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "timestamp" => 8, "timestamptz" => 8 }.freeze
+TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
+             "bytea" => 7, "uuid" => 8, "timestamp" => 9, "timestamptz" => 10 }.freeze
 CODETYPE = TYPECODE.invert.freeze
 
 # uuid-raw16 (encoding.md §2.7): the 16 raw bytes of the canonical 8-4-4-4-12 form. Used both
@@ -133,6 +134,27 @@ DEFAULT_TABLE = {
          [2, 42, "hi", 5, 9, "2.00", 100]]
 }.freeze
 
+# A table with a timestamp column: exercises the value codec's timestamp branch (the int64
+# microsecond instant, the same 8-byte int-be-signflip body as int64 — type code 8). Covers a
+# positive instant (2024-01-01 12:00:00), a pre-1970 negative one (1969-12-31 23:59:59.5), a
+# BC-era one (0001-01-01 00:00:00 BC), the -infinity/+infinity sentinels (i64::MIN/MAX), and a
+# NULL. Values are the raw micros the cores compute from the corresponding literals. PK is int32.
+TIMESTAMP_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("ts", "timestamp")],
+  rows: [[1, 1_704_110_400_000_000], [2, -500_000], [3, -62_167_219_200_000_000],
+         [4, -9_223_372_036_854_775_808], [5, 9_223_372_036_854_775_807], [6, nil]]
+}.freeze
+
+# A table with a timestamptz column (type code 10): same 8-byte int64 body. The +05 literal
+# normalizes to UTC (12:00+05 -> 07:00Z -> 1_704_092_400_000_000).
+TIMESTAMPTZ_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("ts", "timestamptz")],
+  rows: [[1, 1_704_110_400_000_000], [2, 1_704_092_400_000_000], [3, -500_000],
+         [4, -9_223_372_036_854_775_808], [5, 9_223_372_036_854_775_807], [6, nil]]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "one_table_empty.jed", page_size: 256,
@@ -144,6 +166,8 @@ FIXTURES = [
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
   { file: "uuid_table.jed",      page_size: 256, tables: [UUID_TABLE] },
   { file: "default_table.jed",   page_size: 256, tables: [DEFAULT_TABLE] },
+  { file: "timestamp_table.jed",   page_size: 256, tables: [TIMESTAMP_TABLE] },
+  { file: "timestamptz_table.jed", page_size: 256, tables: [TIMESTAMPTZ_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },

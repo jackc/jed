@@ -90,6 +90,8 @@ test("error codes are registered in spec/errors/registry.toml", () => {
 
   const states: SqlState[] = [
     "numeric_value_out_of_range",
+    "invalid_datetime_format",
+    "datetime_field_overflow",
     "division_by_zero",
     "invalid_parameter_value",
     "invalid_row_count_in_limit_clause",

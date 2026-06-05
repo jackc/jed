@@ -13,6 +13,11 @@ type SqlState int
 const (
 	// NumericValueOutOfRange is 22003 — integer overflow (CLAUDE.md §8).
 	NumericValueOutOfRange SqlState = iota
+	// InvalidDatetimeFormat is 22007 — malformed timestamp/timestamptz input.
+	InvalidDatetimeFormat
+	// DatetimeFieldOverflow is 22008 — an out-of-range datetime field or a value beyond the
+	// representable int64-microsecond range (spec/design/timestamp.md).
+	DatetimeFieldOverflow
 	// DivisionByZero is 22012 — division or modulo by zero.
 	DivisionByZero
 	// InvalidParameterValue is 22023 — a bad numeric typmod (e.g. numeric(0)).
@@ -79,6 +84,10 @@ func (s SqlState) Code() string {
 	switch s {
 	case NumericValueOutOfRange:
 		return "22003"
+	case InvalidDatetimeFormat:
+		return "22007"
+	case DatetimeFieldOverflow:
+		return "22008"
 	case DivisionByZero:
 		return "22012"
 	case InvalidParameterValue:

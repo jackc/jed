@@ -159,6 +159,35 @@ func defaultTableDB(t *testing.T) *Database {
 	return db
 }
 
+// timestampTableDB exercises the value codec's int64-instant branch (type code 8): a
+// positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a
+// NULL. The literals parse to the same micros the golden stores. The PK stays int32.
+func timestampTableDB(t *testing.T) *Database {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamp)")
+	run(t, db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')")
+	run(t, db, "INSERT INTO t VALUES (2, '1969-12-31 23:59:59.5')")
+	run(t, db, "INSERT INTO t VALUES (3, '0001-01-01 00:00:00 BC')")
+	run(t, db, "INSERT INTO t VALUES (4, '-infinity')")
+	run(t, db, "INSERT INTO t VALUES (5, 'infinity')")
+	run(t, db, "INSERT INTO t VALUES (6, NULL)")
+	return db
+}
+
+// timestamptzTableDB exercises the same 8-byte branch under type code 9; the +05 literal
+// normalizes to UTC before storage.
+func timestamptzTableDB(t *testing.T) *Database {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamptz)")
+	run(t, db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00+00')")
+	run(t, db, "INSERT INTO t VALUES (2, '2024-01-01 12:00:00+05')")
+	run(t, db, "INSERT INTO t VALUES (3, '1969-12-31 23:59:59.5+00')")
+	run(t, db, "INSERT INTO t VALUES (4, '-infinity')")
+	run(t, db, "INSERT INTO t VALUES (5, 'infinity')")
+	run(t, db, "INSERT INTO t VALUES (6, NULL)")
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -174,6 +203,8 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"bytea_table.jed", byteaTableDB},
 		{"uuid_table.jed", uuidTableDB},
 		{"default_table.jed", defaultTableDB},
+		{"timestamp_table.jed", timestampTableDB},
+		{"timestamptz_table.jed", timestamptzTableDB},
 		{"nopk_table.jed", nopkTableDB},
 	}
 	for _, c := range cases {
@@ -203,6 +234,8 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"bytea_table.jed", byteaTableDB, "t"},
 		{"uuid_table.jed", uuidTableDB, "t"},
 		{"default_table.jed", defaultTableDB, "t"},
+		{"timestamp_table.jed", timestampTableDB, "t"},
+		{"timestamptz_table.jed", timestamptzTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},
@@ -338,8 +371,8 @@ func TestTypeCodesRoundTrip(t *testing.T) {
 	if _, ok := scalarForTypeCode(0); ok {
 		t.Errorf("type code 0 (reserved) should be unknown")
 	}
-	if _, ok := scalarForTypeCode(9); ok {
-		t.Errorf("type code 9 should be unknown")
+	if _, ok := scalarForTypeCode(11); ok {
+		t.Errorf("type code 11 should be unknown")
 	}
 }
 

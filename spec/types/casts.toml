@@ -21,6 +21,14 @@
 # (PostgreSQL has text<->uuid etc., authored deliberately later rather than falling out of
 # making the types storable).
 #
+# timestamp / timestamptz (scalars.toml) are likewise STORABLE but have NO cast rules here:
+# they are NEITHER a cast source NOR a cast target this slice. A single-quoted string lands
+# in a timestamp column by LITERAL ADAPTATION (parsed to the int64 instant in a timestamp
+# context — like bytea), which is the executor's resolve-time coercion, NOT a (text,
+# timestamp) cast pair. `CAST(x AS timestamp)`, text<->timestamp, and the zone-requiring
+# timestamp<->timestamptz conversion are all DEFERRED to a later cast slice (and the latter
+# needs a zone, so timestamp and timestamptz never reconcile — see compare.toml).
+#
 # mode:
 #   implicit    inserted automatically anywhere a value of `to` is wanted (safe, lossless)
 #   assignment  inserted on INSERT/UPDATE into a column of `to` (safe, lossless)

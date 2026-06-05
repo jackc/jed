@@ -169,6 +169,51 @@ export function readEncodingCases(path: string): EncCase[] {
   return out;
 }
 
+// A timestamp vector row (spec/encoding/timestamps.toml). `fields` holds the inline-table
+// keys (input / micros / error / text) with surrounding quotes already stripped.
+export type TsCase = {
+  section: "parse" | "parse_error" | "render";
+  typ: string;
+  fields: Record<string, string>;
+};
+
+// readTimestampCases scans the inline-table case rows under each [[parse]] / [[parse_error]]
+// / [[render]] group (the tiny reader above does not capture nested case arrays).
+export function readTimestampCases(path: string): TsCase[] {
+  const data = readFileSync(path, "utf8");
+  const out: TsCase[] = [];
+  let section: TsCase["section"] | "" = "";
+  let typ = "";
+  for (const raw of data.split("\n")) {
+    const line = raw.trim();
+    if (line === "[[parse]]") {
+      section = "parse";
+      typ = "";
+    } else if (line === "[[parse_error]]") {
+      section = "parse_error";
+      typ = "";
+    } else if (line === "[[render]]") {
+      section = "render";
+      typ = "";
+    } else if (line.startsWith("type =")) {
+      typ = unquote(stripComment(line.slice("type =".length)).trim());
+    } else if (line.startsWith("{") && section !== "" && typ !== "") {
+      let inner = line;
+      const o = inner.indexOf("{");
+      if (o >= 0) inner = inner.slice(o + 1);
+      const cl = inner.indexOf("}");
+      if (cl >= 0) inner = inner.slice(0, cl);
+      const fields: Record<string, string> = {};
+      for (const part of inner.split(",")) {
+        const idx = part.indexOf("=");
+        if (idx >= 0) fields[part.slice(0, idx).trim()] = unquote(part.slice(idx + 1).trim());
+      }
+      out.push({ section, typ, fields });
+    }
+  }
+  return out;
+}
+
 function parseEncCaseLine(line: string, kind: EncCase["kind"] | "", typ: string): EncCase | null {
   if (kind === "" || typ === "") return null;
   let inner = line;

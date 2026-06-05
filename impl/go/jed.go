@@ -84,6 +84,11 @@ var SupportedCapabilities = []string{
 	// uuid scalar type (fixed 16-byte RFC 4122): storage, PG-flexible input literals, and
 	// unsigned-byte comparison/ordering. The FIRST non-integer type usable as a PRIMARY KEY.
 	"types.uuid",
+	// timestamp / timestamptz datetime types (int64 microseconds, instant model, no time
+	// zone db): storage, literals (offset→UTC for tz), comparison/ordering, infinity, and a
+	// timestamp PRIMARY KEY (key encoding = int64). spec/design/timestamp.md.
+	"types.timestamp",
+	"types.timestamptz",
 	// General expression substrate — integer arithmetic, the boolean type, and the
 	// AND/OR/NOT Kleene connectives (the `expression` profile).
 	"types.boolean",

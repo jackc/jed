@@ -47,6 +47,10 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 7
 	case Uuid:
 		return 8
+	case Timestamp:
+		return 9
+	case Timestamptz:
+		return 10
 	default:
 		return 0
 	}
@@ -71,6 +75,10 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return Bytea, true
 	case 8:
 		return Uuid, true
+	case 9:
+		return Timestamp, true
+	case 10:
+		return Timestamptz, true
 	default:
 		return 0, false
 	}
@@ -674,6 +682,17 @@ func readValue(ty ScalarType, buf []byte, pos *int) (Value, error) {
 				return Value{}, err
 			}
 			return UuidValue(ub), nil
+		}
+		if ty.IsTimestamp() || ty.IsTimestamptz() {
+			vb, err := take(buf, pos, ty.WidthBytes())
+			if err != nil {
+				return Value{}, err
+			}
+			m := DecodeInt(ty, vb)
+			if ty.IsTimestamp() {
+				return TimestampValue(m), nil
+			}
+			return TimestamptzValue(m), nil
 		}
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {

@@ -32,6 +32,11 @@ const (
 	// Uuid is a fixed 16-byte value (RFC 4122), compared by unsigned byte order —
 	// spec/design/types.md §14. The first non-integer type usable as a key (WidthBytes 16).
 	Uuid
+	// Timestamp is the zoneless wall clock, int64 microseconds since the Unix epoch
+	// (spec/design/timestamp.md).
+	Timestamp
+	// Timestamptz is the UTC instant, int64 microseconds since the Unix epoch.
+	Timestamptz
 )
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. Precision >= 1;
@@ -61,6 +66,10 @@ func (t ScalarType) CanonicalName() string {
 		return "bytea"
 	case Uuid:
 		return "uuid"
+	case Timestamp:
+		return "timestamp"
+	case Timestamptz:
+		return "timestamptz"
 	default:
 		return "?"
 	}
@@ -88,6 +97,10 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return Bytea, true
 	case "uuid":
 		return Uuid, true
+	case "timestamp", "timestamp without time zone":
+		return Timestamp, true
+	case "timestamptz", "timestamp with time zone":
+		return Timestamptz, true
 	default:
 		return 0, false
 	}
@@ -108,6 +121,12 @@ func (t ScalarType) IsBytea() bool { return t == Bytea }
 // IsUuid reports whether this is the fixed 16-byte uuid type.
 func (t ScalarType) IsUuid() bool { return t == Uuid }
 
+// IsTimestamp reports whether this is the zoneless timestamp type.
+func (t ScalarType) IsTimestamp() bool { return t == Timestamp }
+
+// IsTimestamptz reports whether this is the UTC-instant timestamptz type.
+func (t ScalarType) IsTimestamptz() bool { return t == Timestamptz }
+
 // IsInteger reports whether this is one of the fixed-width signed integer types.
 func (t ScalarType) IsInteger() bool { return t == Int16 || t == Int32 || t == Int64 }
 
@@ -122,7 +141,9 @@ func (t ScalarType) WidthBytes() int {
 		return 2
 	case Int32:
 		return 4
-	case Int64:
+	case Int64, Timestamp, Timestamptz:
+		// The two timestamps are int64-microsecond instants — fixed-width 8-byte, reusing the
+		// int64 key/value codec (spec/design/timestamp.md §6).
 		return 8
 	case Uuid:
 		return 16
@@ -180,5 +201,5 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid}
+	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz}
 }

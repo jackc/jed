@@ -686,6 +686,181 @@ null           = "null_safe"
 precedence     = 35
 errors         = []
 
+# --- comparison operators (timestamp / timestamptz) --------------------------
+# The datetime-family OVERLOADS of the comparisons: the same operator names/symbols
+# (`=` < > <= >=, and IS [NOT] DISTINCT FROM) applied to timestamp×timestamp and to
+# timestamptz×timestamptz. arg_resolution = "none" — one type per family, no promotion
+# (compare.toml). Operands compare by their int64 microsecond instant (signed numeric
+# order), which places -infinity < every finite < infinity for free. A MIXED timestamp ×
+# timestamptz pair is NOT comparable (it would need a zone — compare.toml lists neither
+# cross pair), so it is a 42804 type error; likewise a datetime vs any other family. Same
+# precedence (35) and NULL discipline as the other comparisons: propagating for ordering/
+# equality, null_safe for IS [NOT] DISTINCT FROM. No failure is possible, so errors = [].
+
+[[operator]]
+name           = "eq"
+symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "lt"
+symbol         = "<"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "gt"
+symbol         = ">"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "le"
+symbol         = "<="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ge"
+symbol         = ">="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_not_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "eq"
+symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "lt"
+symbol         = "<"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "gt"
+symbol         = ">"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "le"
+symbol         = "<="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ge"
+symbol         = ">="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_not_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
 # --- null tests --------------------------------------------------------------
 # Unary null-detection over any nullable value of any type. Unlike comparisons
 # these never propagate: the result is ALWAYS a definite boolean, never unknown —

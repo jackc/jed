@@ -131,6 +131,8 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 6 | `decimal` |
 | 7 | `bytea` |
 | 8 | `uuid` |
+| 9 | `timestamp` |
+| 10 | `timestamptz` |
 
 A column's collation is **not** stored: there is one collation (`C`) for all text this slice
 (../design/types.md §11). A per-column collation field is a forward extension that will claim a
@@ -242,10 +244,20 @@ alone. The present-value body depends on the type:
   value — for uuid the stored value body and the order-preserving key body coincide (both the
   raw 16 bytes), so reusing one codec is exact rather than merely convenient.
 
+- **`timestamp` / `timestamptz`** — both store an **`int64` microsecond instant** (since the
+  Unix epoch; ../design/timestamp.md), so they use the **same order-preserving 8-byte integer
+  body as `int64`** (big-endian, sign-bit flipped), behind the shared presence tag. A present
+  datetime is `00`(tag) + 8 bytes; a NULL is the tag alone. The two type codes (9, 10) differ
+  only in semantics, not bytes — and the infinity sentinels are ordinary extreme `int64`
+  values (`-infinity` = `i64::MIN` → `00…00`, `+infinity` = `i64::MAX` → `ff…ff` after the
+  sign-flip), so they need no special encoding. This is the one new type this slice that is a
+  fixed-width key codec rather than a self-describing one, so a timestamp `PRIMARY KEY` is
+  **supported** (the bytes already sort correctly).
+
 There is no per-record payload length: the reader walks the columns in declaration order,
-deriving each value's width from its type (fixed for the integers, the 1-byte boolean, and the
-16-byte uuid; self-describing via the `u16` length for text and bytea, and via `ndigits` for
-decimal).
+deriving each value's width from its type (fixed for the integers, the two 8-byte timestamps,
+the 1-byte boolean, and the 16-byte uuid; self-describing via the `u16` length for text and
+bytea, and via `ndigits` for decimal).
 
 ## Packing and page allocation (must be byte-identical across cores)
 
@@ -285,6 +297,8 @@ by the independent Ruby reference in [verify.rb](verify.rb) (run via `rake verif
 | `bytea_table.jed` | a bytea column — the value codec's bytea branch (`u16` len + raw bytes); empty value, embedded `0x00`, a high byte, a NULL |
 | `uuid_table.jed` | a **uuid PRIMARY KEY** (the first golden with a non-integer stored key — the load-bearing §8 cross-core key-path proof) + a nullable uuid column — the value codec's fixed-16-byte branch (no length prefix) and a NULL uuid |
 | `default_table.jed` | columns with `DEFAULT` — the `has_default` flag (bit2) + the default value codec written after the typmod; an int/text/decimal default, a `DEFAULT NULL`, a NOT NULL column with a default, a plain no-default column |
+| `timestamp_table.jed` | a timestamp column — the value codec's 8-byte int64 branch; an epoch value, a pre-1970 (negative) instant, a BC-era instant, `infinity`/`-infinity` sentinels, a NULL |
+| `timestamptz_table.jed` | a timestamptz column — the same 8-byte branch under type code 10; a UTC instant, a pre-1970 instant, `infinity`/`-infinity`, a NULL |
 | `nopk_table.jed` | a table with no PK — exercises the stored synthetic `int64` rowid key |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |

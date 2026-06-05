@@ -36,9 +36,12 @@ import {
   isInteger,
   isText,
   isUuid,
+  isTimestamp,
+  isTimestamptz,
   rank,
   scalarTypeFromName,
 } from "./types.ts";
+import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
 import {
   type Value,
   boolAnd,
@@ -63,6 +66,8 @@ import {
   renderUuid,
   textValue,
   uuidValue,
+  timestampValue,
+  timestamptzValue,
 } from "./value.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
@@ -166,7 +171,9 @@ export class Database {
         // types' order-preserving key encodings (text §2.4, decimal §2.5, bytea §2.6, boolean's
         // bool-byte) are authored but unexercised, so a text/decimal/bytea/boolean PRIMARY KEY is
         // a documented 0A000 narrowing (types.md §9/§11/§12/§13), relaxable in a later in-key slice.
-        if (!isInteger(ty) && !isUuid(ty)) {
+        // timestamp / timestamptz are also allowed — they share the int64 int-be-signflip key
+        // encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
+        if (!isInteger(ty) && !isUuid(ty) && !isTimestamp(ty) && !isTimestamptz(ty)) {
           throw engineError(
             "feature_not_supported",
             "a " + canonicalName(ty) + " primary key is not supported yet",
@@ -324,8 +331,11 @@ export class Database {
           key = pkv.bytes.slice();
         } else if (pkv.kind === "int") {
           key = encodeInt(table.columns[pk]!.type, pkv.int);
+        } else if (pkv.kind === "timestamp" || pkv.kind === "timestamptz") {
+          // A timestamp / timestamptz PK encodes its int64 instant (spec/design/timestamp.md §6).
+          key = encodeInt(table.columns[pk]!.type, pkv.micros);
         } else {
-          throw engineError("data_corrupted", "a primary key must be an integer or uuid value");
+          throw engineError("data_corrupted", "a primary key must be an integer, uuid, or timestamp value");
         }
         const seen = key.join(",");
         if (seenKeys.has(seen) || store.get(key) !== undefined) {
@@ -814,6 +824,8 @@ type ResolvedType =
   | { kind: "decimal" } // the decimal family (one type; the per-column typmod is separate)
   | { kind: "bytea" } // the bytea family (raw bytes); does not promote
   | { kind: "uuid" } // the uuid family (fixed 16 bytes); does not promote. The first non-integer key.
+  | { kind: "timestamp" } // zoneless instant; does not compare/cast to timestamptz
+  | { kind: "timestamptz" } // UTC instant; does not compare/cast to timestamp
   | { kind: "null" };
 
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
@@ -830,6 +842,8 @@ type RExpr =
   | { kind: "constDecimal"; value: Decimal }
   | { kind: "constBytea"; value: Uint8Array }
   | { kind: "constUuid"; value: Uint8Array }
+  | { kind: "constTimestamp"; value: bigint }
+  | { kind: "constTimestamptz"; value: bigint }
   | { kind: "constNull" }
   | { kind: "cast"; target: ScalarType; typmod: DecimalTypmod | null; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
@@ -1175,6 +1189,8 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
   if (isDecimal(ty)) return { kind: "decimal" };
   if (isBytea(ty)) return { kind: "bytea" };
   if (isUuid(ty)) return { kind: "uuid" };
+  if (isTimestamp(ty)) return { kind: "timestamp" };
+  if (isTimestamptz(ty)) return { kind: "timestamptz" };
   return { kind: "int", ty };
 }
 
@@ -1337,6 +1353,9 @@ function resolve(
           // A string literal is text by default (collation C). It adapts to a BYTEA or a UUID
           // context (types.md §6/§13/§14): decode the hex input (bytea) or the PG-flexible uuid
           // input (uuid) — 22P02 on malformed; any other context — including none — keeps it text.
+          // A string literal is text by default (collation C). It adapts to a BYTEA context
+          // (decode the hex input, 22P02 on bad hex) or a TIMESTAMP/TIMESTAMPTZ context (parse
+          // the datetime, 22007/22008 — spec/design/timestamp.md). Any other context keeps it text.
           if (ctx !== null && isBytea(ctx)) {
             return {
               node: { kind: "constBytea", value: decodeByteaLiteral(e.literal.text) },
@@ -1347,6 +1366,18 @@ function resolve(
             return {
               node: { kind: "constUuid", value: decodeUuidLiteral(e.literal.text) },
               type: { kind: "uuid" },
+            };
+          }
+          if (ctx !== null && isTimestamp(ctx)) {
+            return {
+              node: { kind: "constTimestamp", value: parseTimestamp(e.literal.text) },
+              type: { kind: "timestamp" },
+            };
+          }
+          if (ctx !== null && isTimestamptz(ctx)) {
+            return {
+              node: { kind: "constTimestamptz", value: parseTimestamptz(e.literal.text) },
+              type: { kind: "timestamptz" },
             };
           }
           return { node: { kind: "constText", value: e.literal.text }, type: { kind: "text" } };
@@ -1386,6 +1417,10 @@ function resolve(
       if (isUuid(target)) {
         throw engineError("feature_not_supported", "casting to uuid is not supported yet");
       }
+      // timestamp casts are deferred (spec/design/timestamp.md §6): casting TO a datetime is 0A000.
+      if (isTimestamp(target) || isTimestamptz(target)) {
+        throw engineError("feature_not_supported", "casting to a timestamp type is not supported yet");
+      }
       const inner = resolve(scope, e.inner, null, ag, params);
       if (inner.type.kind === "bool") {
         throw typeError("cannot cast boolean to " + canonicalName(target));
@@ -1401,6 +1436,10 @@ function resolve(
       // Casting FROM uuid is likewise deferred (0A000).
       if (inner.type.kind === "uuid") {
         throw engineError("feature_not_supported", "casting from uuid is not supported yet");
+      }
+      // Casting FROM a timestamp is likewise deferred (0A000).
+      if (inner.type.kind === "timestamp" || inner.type.kind === "timestamptz") {
+        throw engineError("feature_not_supported", "casting from a timestamp type is not supported yet");
       }
       // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
       // decimal→decimal (re-scale), and NULL are all castable.
@@ -1637,6 +1676,14 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   if (uuidL !== uuidR && lt.kind !== "null" && rt.kind !== "null") {
     throw typeError("cannot compare a uuid value with a non-uuid value");
   }
+  // timestamp / timestamptz compare only within their own family (or with NULL). A mixed
+  // timestamp × timestamptz pair, or a datetime vs any other family, would need a zone, so it
+  // is a 42804 type error (spec/design/timestamp.md §5).
+  const tsL = lt.kind === "timestamp" || lt.kind === "timestamptz";
+  const tsR = rt.kind === "timestamp" || rt.kind === "timestamptz";
+  if ((tsL || tsR) && lt.kind !== rt.kind && lt.kind !== "null" && rt.kind !== "null") {
+    throw typeError("cannot compare a timestamp value with a value of a different type");
+  }
 }
 
 // isAdaptableOperand reports whether e is an adaptable operand — one that takes its type from its
@@ -1659,6 +1706,8 @@ function ctxOf(t: ResolvedType): ScalarType | null {
   if (t.kind === "text") return "text";
   if (t.kind === "bool") return "boolean";
   if (t.kind === "decimal") return "decimal";
+  if (t.kind === "timestamp") return "timestamp";
+  if (t.kind === "timestamptz") return "timestamptz";
   return null;
 }
 
@@ -1704,7 +1753,14 @@ function promote(a: ResolvedType, b: ResolvedType): ScalarType {
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
 // or NULL); a boolean or text operand is a 42804 type error.
 function requireNumericOperand(t: ResolvedType): void {
-  if (t.kind === "bool" || t.kind === "text" || t.kind === "bytea" || t.kind === "uuid") {
+  if (
+    t.kind === "bool" ||
+    t.kind === "text" ||
+    t.kind === "bytea" ||
+    t.kind === "uuid" ||
+    t.kind === "timestamp" ||
+    t.kind === "timestamptz"
+  ) {
     throw typeError("arithmetic operators require numeric operands");
   }
 }
@@ -1715,7 +1771,9 @@ function requireBool(t: ResolvedType, msg: string): void {
     t.kind === "text" ||
     t.kind === "decimal" ||
     t.kind === "bytea" ||
-    t.kind === "uuid"
+    t.kind === "uuid" ||
+    t.kind === "timestamp" ||
+    t.kind === "timestamptz"
   ) {
     throw typeError(msg);
   }
@@ -1781,6 +1839,8 @@ function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): voi
   else if (isBool(colTy)) ok = t.kind === "bool" || t.kind === "null";
   else if (isBytea(colTy)) ok = t.kind === "bytea" || t.kind === "null";
   else if (isUuid(colTy)) ok = t.kind === "uuid" || t.kind === "null";
+  else if (isTimestamp(colTy)) ok = t.kind === "timestamp" || t.kind === "null";
+  else if (isTimestamptz(colTy)) ok = t.kind === "timestamptz" || t.kind === "null";
   else ok = t.kind === "text" || t.kind === "null";
   if (!ok) {
     throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
@@ -1848,6 +1908,9 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
       if (isBytea(colTy)) return byteaValue(decodeByteaLiteral(v.text));
       // ... and to a uuid column via the PG-flexible uuid input (types.md §6/§14); 22P02 on bad input.
       if (isUuid(colTy)) return uuidValue(decodeUuidLiteral(v.text));
+      // ... or to a timestamp column (spec/design/timestamp.md); bad input traps 22007/22008.
+      if (isTimestamp(colTy)) return timestampValue(parseTimestamp(v.text));
+      if (isTimestamptz(colTy)) return timestamptzValue(parseTimestamptz(v.text));
       throw typeError("cannot store a text value in " + canonicalName(colTy) + " column " + colName);
     case "bytea":
       if (isBytea(colTy)) return v;
@@ -1855,6 +1918,12 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
     case "uuid":
       if (isUuid(colTy)) return v;
       throw typeError("cannot store a uuid value in " + canonicalName(colTy) + " column " + colName);
+    case "timestamp":
+      if (isTimestamp(colTy)) return v;
+      throw typeError("cannot store a timestamp value in " + canonicalName(colTy) + " column " + colName);
+    case "timestamptz":
+      if (isTimestamptz(colTy)) return v;
+      throw typeError("cannot store a timestamptz value in " + canonicalName(colTy) + " column " + colName);
     default: // bool
       if (isBool(colTy)) return v;
       throw typeError("cannot store a boolean value in " + canonicalName(colTy) + " column " + colName);
@@ -1922,6 +1991,10 @@ function evalExpr(e: RExpr, row: Row, params: Value[], m: Meter): Value {
       return byteaValue(e.value);
     case "constUuid":
       return uuidValue(e.value);
+    case "constTimestamp":
+      return timestampValue(e.value);
+    case "constTimestamptz":
+      return timestamptzValue(e.value);
     case "constNull":
       return nullValue();
     case "cast": {
@@ -2196,6 +2269,13 @@ function valueCmp(a: Value, b: Value): number {
   if (a.kind === "bool" && b.kind === "bool") {
     return a.value === b.value ? 0 : a.value ? 1 : -1;
   }
+  // Timestamps order by the int64 instant (-infinity < finite < infinity).
+  if (a.kind === "timestamp" && b.kind === "timestamp") {
+    return a.micros < b.micros ? -1 : a.micros > b.micros ? 1 : 0;
+  }
+  if (a.kind === "timestamptz" && b.kind === "timestamptz") {
+    return a.micros < b.micros ? -1 : a.micros > b.micros ? 1 : 0;
+  }
   // Cross-family arms exist only for totality — ORDER BY is over a single typed column, so a
   // mixed pair is unreachable. A fixed family order keeps the comparator total.
   const fr = familyRank(a) - familyRank(b);
@@ -2218,8 +2298,14 @@ function familyRank(v: Value): number {
       return 4;
     case "bytea":
       return 5;
-    default: // uuid
+    case "uuid":
       return 6;
+    case "timestamp":
+      return 7;
+    case "timestamptz":
+      return 8;
+    default:
+      return 9;
   }
 }
 

@@ -1,0 +1,130 @@
+# timestamptz scalar type (spec/design/timestamp.md): an absolute UTC instant, int64
+# microseconds. Input text MAY carry a numeric offset (Z / +HH / +HH:MM / +HH:MM:SS) which
+# normalizes the wall clock to UTC (utc = wallclock - offset) and is then DISCARDED — only the
+# UTC instant is stored. Rendering is always UTC with a fixed +00 suffix (infinity is bare). No
+# named zones, no time-zone database. A timestamptz PRIMARY KEY is supported (key = int64 codec).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.int32, types.timestamptz, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, ts timestamptz)
+
+statement ok
+INSERT INTO t VALUES (1, '2024-01-01 12:00:00+00'), (2, '2024-01-01 12:00:00+05'), (3, '2024-01-01 12:00:00-08'), (4, '2024-01-01 12:00:00Z'), (5, NULL), (6, 'infinity'), (7, '2024-01-01 12:00:00+05:30')
+
+# rendering: always UTC, fixed +00 suffix
+query T nosort
+SELECT ts FROM t WHERE id = 1
+----
+2024-01-01 12:00:00+00
+
+# +05 is subtracted to reach UTC: 12:00 at +05 is 07:00 UTC
+query T nosort
+SELECT ts FROM t WHERE id = 2
+----
+2024-01-01 07:00:00+00
+
+# -08 is subtracted (i.e. added) to reach UTC: 12:00 at -08 is 20:00 UTC
+query T nosort
+SELECT ts FROM t WHERE id = 3
+----
+2024-01-01 20:00:00+00
+
+# Z is exactly +00, so id 4 equals id 1
+query T nosort
+SELECT ts FROM t WHERE id = 4
+----
+2024-01-01 12:00:00+00
+
+# a fractional-hour offset (+05:30) subtracts 5h30m: 12:00 -> 06:30 UTC
+query T nosort
+SELECT ts FROM t WHERE id = 7
+----
+2024-01-01 06:30:00+00
+
+# infinity renders bare (no +00 suffix)
+query T nosort
+SELECT ts FROM t WHERE id = 6
+----
+infinity
+
+# the discarded offset means +00 and Z denote the same instant
+query I nosort
+SELECT id FROM t WHERE ts = '2024-01-01 12:00:00+00' ORDER BY id
+----
+1
+4
+
+# comparison is by the normalized UTC instant: 12:00+05 (=07:00Z) < 12:00Z
+query I nosort
+SELECT id FROM t WHERE ts < '2024-01-01 12:00:00+00' ORDER BY id
+----
+2
+7
+
+# ordering over the UTC instant (NULL excluded). UTC instants: id2 07:00, id7 06:30, id1/id4
+# 12:00, id3 20:00, id6 infinity. Ascending: id7(06:30) < id2(07:00) < id1=id4(12:00) < id3 < inf.
+# id1 and id4 tie on the instant; with a single ORDER BY key the tie is broken by storage key
+# (id), so 1 before 4.
+query I nosort
+SELECT id FROM t WHERE ts IS NOT NULL ORDER BY ts
+----
+7
+2
+1
+4
+3
+6
+
+query I nosort
+SELECT id FROM t WHERE ts IS NULL
+----
+5
+
+# = NULL is UNKNOWN (three-valued logic)
+query I nosort
+SELECT id FROM t WHERE ts = NULL
+----
+
+query I nosort
+SELECT id FROM t WHERE ts IS NOT DISTINCT FROM NULL
+----
+5
+
+# --- type errors -------------------------------------------------------------
+statement error 42804
+INSERT INTO t VALUES (8, 123)
+
+statement error 22007
+INSERT INTO t VALUES (9, 'garbage')
+
+# an offset out of range is a field overflow: 22008
+statement error 22008
+INSERT INTO t VALUES (10, '2024-01-01 12:00:00+99')
+
+# --- timestamptz PRIMARY KEY is supported ------------------------------------
+statement ok
+CREATE TABLE k (ts timestamptz PRIMARY KEY)
+
+statement ok
+INSERT INTO k VALUES ('2024-01-01 00:00:00+00'), ('-infinity'), ('infinity')
+
+query T nosort
+SELECT ts FROM k ORDER BY ts
+----
+-infinity
+2024-01-01 00:00:00+00
+infinity
+
+# --- deterministic, cross-core cost ------------------------------------------
+statement ok
+CREATE TABLE c (id int32 PRIMARY KEY, ts timestamptz)
+
+statement ok
+INSERT INTO c VALUES (1, '2020-01-01 00:00:00+00'), (2, '2021-01-01 00:00:00+00'), (3, '2022-01-01 00:00:00+00'), (4, '2023-01-01 00:00:00+00'), (5, '2024-01-01 00:00:00+00'), (6, '2025-01-01 00:00:00+00')
+
+# one operator_eval per comparison: 6 scanned + 6 filter + 1 produced + 0 projection = 13.
+# cost: 13
+query I nosort
+SELECT id FROM c WHERE ts = '2023-01-01 00:00:00+00'
+----
+4

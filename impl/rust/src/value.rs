@@ -10,6 +10,7 @@
 //! fixed `[u8; 16]` (stack, `Copy`-able, but `Value` stays `Clone` for the heap variants).
 
 use crate::decimal::Decimal;
+use crate::timestamp;
 
 /// A runtime value: SQL NULL, an integer, a boolean, a text string, a decimal, or a byte string.
 ///
@@ -36,6 +37,12 @@ pub enum Value {
     /// (types.md §14). Held as `[u8; 16]`, so `PartialEq`/`Eq`/`Hash` (DISTINCT/GROUP BY) and
     /// `<` (ORDER BY) are the natural byte-wise unsigned operations.
     Uuid([u8; 16]),
+    /// A zoneless `timestamp` — int64 microseconds since the Unix epoch (the two sentinels
+    /// i64::MIN/i64::MAX are -infinity/+infinity). Compares by the instant (spec/design/timestamp.md).
+    Timestamp(i64),
+    /// A UTC-instant `timestamptz` — int64 microseconds since the Unix epoch. Distinct from
+    /// `Timestamp` (it renders with a +00 suffix and never compares cross-family).
+    Timestamptz(i64),
 }
 
 /// Compare two numeric values by value, promoting an integer operand to decimal when its
@@ -98,6 +105,10 @@ impl Value {
             Value::Bytea(b) => render_bytea_hex(b),
             // Uuid renders as the canonical 8-4-4-4-12 lowercase-hex form (PG `uuid_out`).
             Value::Uuid(u) => render_uuid(u),
+            // Timestamps render via the shared calendar formatter (spec/design/timestamp.md):
+            // `YYYY-MM-DD HH:MM:SS[.ffffff]`, timestamptz with a `+00` suffix, ±infinity bare.
+            Value::Timestamp(m) => timestamp::render_timestamp(*m),
+            Value::Timestamptz(m) => timestamp::render_timestamptz(*m),
         }
     }
 
@@ -123,6 +134,9 @@ impl Value {
             (Value::Bool(a), Value::Bool(b)) => bool3(a == b),
             (Value::Bytea(a), Value::Bytea(b)) => bool3(a == b),
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a == b),
+            // Timestamps compare by the int64 instant; infinity is just an extreme value.
+            (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a == b),
+            (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a == b),
             _ => ThreeValued::Unknown,
         }
     }
@@ -138,6 +152,8 @@ impl Value {
             (Value::Bool(a), Value::Bool(b)) => bool3(a < b),
             (Value::Bytea(a), Value::Bytea(b)) => bool3(a < b),
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a < b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a < b),
+            (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a < b),
             _ => ThreeValued::Unknown,
         }
     }
@@ -153,6 +169,8 @@ impl Value {
             (Value::Bool(a), Value::Bool(b)) => bool3(a > b),
             (Value::Bytea(a), Value::Bytea(b)) => bool3(a > b),
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a > b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a > b),
+            (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a > b),
             _ => ThreeValued::Unknown,
         }
     }

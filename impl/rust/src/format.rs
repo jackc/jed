@@ -40,6 +40,8 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Decimal => 6,
         ScalarType::Bytea => 7,
         ScalarType::Uuid => 8,
+        ScalarType::Timestamp => 9,
+        ScalarType::Timestamptz => 10,
     }
 }
 
@@ -54,6 +56,8 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         6 => Some(ScalarType::Decimal),
         7 => Some(ScalarType::Bytea),
         8 => Some(ScalarType::Uuid),
+        9 => Some(ScalarType::Timestamp),
+        10 => Some(ScalarType::Timestamptz),
         _ => None,
     }
 }
@@ -85,6 +89,9 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
     match v {
         Value::Null => encode_nullable(ty, None),
         Value::Int(n) => encode_nullable(ty, Some(*n)),
+        // Timestamps store their int64 microsecond instant via the same fixed-width codec as
+        // int64 (the sentinels are ordinary extreme values; spec/design/timestamp.md).
+        Value::Timestamp(m) | Value::Timestamptz(m) => encode_nullable(ty, Some(*m)),
         Value::Text(s) => {
             let bytes = s.as_bytes();
             let mut out = Vec::with_capacity(3 + bytes.len());
@@ -596,6 +603,12 @@ fn read_value(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
                     .try_into()
                     .map_err(|_| corrupt("invalid uuid length"))?;
                 Ok(Value::Uuid(b))
+            } else if ty.is_timestamp() {
+                let vb = take(buf, pos, ty.width_bytes())?;
+                Ok(Value::Timestamp(decode_int(ty, vb)))
+            } else if ty.is_timestamptz() {
+                let vb = take(buf, pos, ty.width_bytes())?;
+                Ok(Value::Timestamptz(decode_int(ty, vb)))
             } else {
                 let w = ty.width_bytes();
                 let vb = take(buf, pos, w)?;
@@ -666,7 +679,7 @@ mod tests {
             assert_eq!(scalar_for_type_code(type_code_for_scalar(ty)), Some(ty));
         }
         assert_eq!(scalar_for_type_code(0), None);
-        assert_eq!(scalar_for_type_code(9), None);
+        assert_eq!(scalar_for_type_code(11), None);
     }
 
     fn sample_db() -> Database {

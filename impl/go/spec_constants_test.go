@@ -186,7 +186,8 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 		codes[row.str("code")] = row.str("name")
 	}
 	for _, st := range []SqlState{
-		NumericValueOutOfRange, DivisionByZero, InvalidParameterValue,
+		NumericValueOutOfRange, InvalidDatetimeFormat, DatetimeFieldOverflow,
+		DivisionByZero, InvalidParameterValue,
 		InvalidRowCountInLimitClause, InvalidRowCountInOffsetClause,
 		NotNullViolation, UniqueViolation,
 		SyntaxError, UndefinedTable, UndefinedColumn, UndefinedObject,

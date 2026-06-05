@@ -8,6 +8,8 @@
 
 export type SqlState =
   | "numeric_value_out_of_range" // 22003 — integer overflow (CLAUDE.md §8)
+  | "invalid_datetime_format" // 22007 — malformed timestamp/timestamptz input
+  | "datetime_field_overflow" // 22008 — out-of-range datetime field or value beyond int64 µs
   | "division_by_zero" // 22012 — division or modulo by zero
   | "invalid_parameter_value" // 22023 — a bad numeric typmod (e.g. numeric(0))
   | "invalid_text_representation" // 22P02 — malformed text input (e.g. bytea hex)
@@ -38,6 +40,8 @@ export type SqlState =
 
 const CODES: Record<SqlState, string> = {
   numeric_value_out_of_range: "22003",
+  invalid_datetime_format: "22007",
+  datetime_field_overflow: "22008",
   division_by_zero: "22012",
   invalid_parameter_value: "22023",
   invalid_text_representation: "22P02",

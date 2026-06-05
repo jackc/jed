@@ -26,6 +26,18 @@ class = "data exception"
 template = "value out of range for type {type}"
 
 [[error]]
+code = "22007"
+name = "invalid_datetime_format"
+class = "data exception"
+template = "invalid input syntax for type {type}: {detail}"
+
+[[error]]
+code = "22008"
+name = "datetime_field_overflow"
+class = "data exception"
+template = "date/time field value out of range: {detail}"
+
+[[error]]
 code = "22012"
 name = "division_by_zero"
 class = "data exception"

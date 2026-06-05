@@ -16,7 +16,17 @@ import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database } from "./executor.ts";
 import type { Row } from "./storage.ts";
-import { type DecimalTypmod, type ScalarType, isBool, isBytea, isText, isUuid, widthBytes } from "./types.ts";
+import {
+  type DecimalTypmod,
+  type ScalarType,
+  isBool,
+  isBytea,
+  isText,
+  isTimestamp,
+  isTimestamptz,
+  isUuid,
+  widthBytes,
+} from "./types.ts";
 import {
   type Value,
   boolValue,
@@ -25,6 +35,8 @@ import {
   intValue,
   nullValue,
   textValue,
+  timestampValue,
+  timestamptzValue,
   uuidValue,
 } from "./value.ts";
 
@@ -57,6 +69,10 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 7;
     case "uuid":
       return 8;
+    case "timestamp":
+      return 9;
+    case "timestamptz":
+      return 10;
   }
 }
 
@@ -79,6 +95,10 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "bytea";
     case 8:
       return "uuid";
+    case 9:
+      return "timestamp";
+    case 10:
+      return "timestamptz";
     default:
       return undefined;
   }
@@ -154,6 +174,11 @@ function encodeValue(ty: ScalarType, v: Value): Uint8Array {
       out[7 + i * 2] = groups[i]! & 0xff;
     }
     return out;
+  }
+  if (v.kind === "timestamp" || v.kind === "timestamptz") {
+    // Timestamps store their int64 microsecond instant via the same fixed-width codec as
+    // int64 (spec/design/timestamp.md §6).
+    return encodeNullable(ty, v.micros);
   }
   if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");
   return encodeNullable(ty, v.int);
@@ -587,6 +612,8 @@ function readValue(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
       // decodeInt would sign-flip and widthBytes is 16 there too. .slice() copies out.
       return uuidValue(take(buf, cur, 16).slice());
     }
+    if (isTimestamp(ty)) return timestampValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
+    if (isTimestamptz(ty)) return timestamptzValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
     return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
   }
   if (tag === 0x01) return nullValue();

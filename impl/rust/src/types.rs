@@ -30,6 +30,10 @@ pub enum ScalarType {
     /// Fixed 16-byte value (RFC 4122), compared by unsigned byte order — types.md §14. The first
     /// non-integer type usable as a key; `width_bytes` returns 16 (it is genuinely fixed-width).
     Uuid,
+    /// Zoneless wall clock, int64 microseconds since the Unix epoch (spec/design/timestamp.md).
+    Timestamp,
+    /// UTC instant, int64 microseconds since the Unix epoch (spec/design/timestamp.md).
+    Timestamptz,
 }
 
 impl ScalarType {
@@ -44,6 +48,8 @@ impl ScalarType {
             ScalarType::Decimal => "decimal",
             ScalarType::Bytea => "bytea",
             ScalarType::Uuid => "uuid",
+            ScalarType::Timestamp => "timestamp",
+            ScalarType::Timestamptz => "timestamptz",
         }
     }
 
@@ -62,6 +68,8 @@ impl ScalarType {
             "decimal" | "numeric" | "dec" => Some(ScalarType::Decimal),
             "bytea" => Some(ScalarType::Bytea),
             "uuid" => Some(ScalarType::Uuid),
+            "timestamp" | "timestamp without time zone" => Some(ScalarType::Timestamp),
+            "timestamptz" | "timestamp with time zone" => Some(ScalarType::Timestamptz),
             _ => None,
         }
     }
@@ -91,6 +99,16 @@ impl ScalarType {
         matches!(self, ScalarType::Uuid)
     }
 
+    /// Whether this is the zoneless `timestamp` type.
+    pub fn is_timestamp(self) -> bool {
+        matches!(self, ScalarType::Timestamp)
+    }
+
+    /// Whether this is the UTC-instant `timestamptz` type.
+    pub fn is_timestamptz(self) -> bool {
+        matches!(self, ScalarType::Timestamptz)
+    }
+
     /// Whether this is one of the fixed-width signed integer types.
     pub fn is_integer(self) -> bool {
         matches!(
@@ -100,19 +118,19 @@ impl ScalarType {
     }
 
     /// Fixed storage width in bytes (the key-encoding / value-codec width for the fixed-width
-    /// types). The three integers and `uuid` (16 bytes) are fixed-width; `text`/`boolean`/
-    /// `decimal` are not (`boolean` is a 1-byte special case; text/decimal/bytea carry their own
-    /// length or use a dedicated codec; spec/fileformat/format.md), so calling it on those is a
-    /// bug. `uuid` is the first non-integer fixed-width type (its 16-byte key/value body).
+    /// types): the three integers, the two `int64`-microsecond timestamps (which reuse the int64
+    /// codec — spec/design/timestamp.md), and `uuid` (16 bytes). The variable-width `text`/`bytea`
+    /// and the self-describing `boolean`/`decimal` are never serialized through this path
+    /// (spec/fileformat/format.md), so calling it on them is a bug.
     pub fn width_bytes(self) -> usize {
         match self {
             ScalarType::Int16 => 2,
             ScalarType::Int32 => 4,
-            ScalarType::Int64 => 8,
+            ScalarType::Int64 | ScalarType::Timestamp | ScalarType::Timestamptz => 8,
             ScalarType::Uuid => 16,
             ScalarType::Text | ScalarType::Bool | ScalarType::Decimal | ScalarType::Bytea => {
                 unreachable!(
-                    "text/boolean/decimal/bytea are not fixed-width; width_bytes covers integers + uuid"
+                    "text/boolean/decimal/bytea are not fixed-width; width_bytes covers integers + uuid + timestamps"
                 )
             }
         }
@@ -128,8 +146,10 @@ impl ScalarType {
             | ScalarType::Bool
             | ScalarType::Decimal
             | ScalarType::Bytea
-            | ScalarType::Uuid => {
-                unreachable!("text/boolean/decimal/bytea/uuid have no integer range")
+            | ScalarType::Uuid
+            | ScalarType::Timestamp
+            | ScalarType::Timestamptz => {
+                unreachable!("text/boolean/decimal/bytea/uuid/timestamp have no integer range")
             }
         }
     }
@@ -144,8 +164,10 @@ impl ScalarType {
             | ScalarType::Bool
             | ScalarType::Decimal
             | ScalarType::Bytea
-            | ScalarType::Uuid => {
-                unreachable!("text/boolean/decimal/bytea/uuid have no integer range")
+            | ScalarType::Uuid
+            | ScalarType::Timestamp
+            | ScalarType::Timestamptz => {
+                unreachable!("text/boolean/decimal/bytea/uuid/timestamp have no integer range")
             }
         }
     }
@@ -161,8 +183,12 @@ impl ScalarType {
             | ScalarType::Bool
             | ScalarType::Decimal
             | ScalarType::Bytea
-            | ScalarType::Uuid => {
-                unreachable!("text/boolean/decimal/bytea/uuid have no integer promotion rank")
+            | ScalarType::Uuid
+            | ScalarType::Timestamp
+            | ScalarType::Timestamptz => {
+                unreachable!(
+                    "text/boolean/decimal/bytea/uuid/timestamp have no integer promotion rank"
+                )
             }
         }
     }
@@ -173,7 +199,7 @@ impl ScalarType {
     }
 
     /// All types, for exhaustive iteration in tests.
-    pub fn all() -> [ScalarType; 8] {
+    pub fn all() -> [ScalarType; 10] {
         [
             ScalarType::Int16,
             ScalarType::Int32,
@@ -183,6 +209,8 @@ impl ScalarType {
             ScalarType::Decimal,
             ScalarType::Bytea,
             ScalarType::Uuid,
+            ScalarType::Timestamp,
+            ScalarType::Timestamptz,
         ]
     }
 }

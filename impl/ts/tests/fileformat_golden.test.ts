@@ -142,6 +142,35 @@ function defaultTableDB(): Database {
   return db;
 }
 
+// timestampTableDB exercises the value codec's int64-instant branch (type code 8): a positive
+// instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a NULL. The
+// literals parse to the same micros the golden stores. The PK stays int32.
+function timestampTableDB(): Database {
+  const db = new Database();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamp)");
+  run(db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')");
+  run(db, "INSERT INTO t VALUES (2, '1969-12-31 23:59:59.5')");
+  run(db, "INSERT INTO t VALUES (3, '0001-01-01 00:00:00 BC')");
+  run(db, "INSERT INTO t VALUES (4, '-infinity')");
+  run(db, "INSERT INTO t VALUES (5, 'infinity')");
+  run(db, "INSERT INTO t VALUES (6, NULL)");
+  return db;
+}
+
+// timestamptzTableDB exercises the same 8-byte branch under type code 9; the +05 literal
+// normalizes to UTC before storage.
+function timestamptzTableDB(): Database {
+  const db = new Database();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamptz)");
+  run(db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00+00')");
+  run(db, "INSERT INTO t VALUES (2, '2024-01-01 12:00:00+05')");
+  run(db, "INSERT INTO t VALUES (3, '1969-12-31 23:59:59.5+00')");
+  run(db, "INSERT INTO t VALUES (4, '-infinity')");
+  run(db, "INSERT INTO t VALUES (5, 'infinity')");
+  run(db, "INSERT INTO t VALUES (6, NULL)");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -154,6 +183,8 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "bytea_table.jed", build: byteaTableDB },
     { name: "uuid_table.jed", build: uuidTableDB },
     { name: "default_table.jed", build: defaultTableDB },
+    { name: "timestamp_table.jed", build: timestampTableDB },
+    { name: "timestamptz_table.jed", build: timestamptzTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
   ];
   for (const c of cases) {
@@ -178,6 +209,8 @@ test("read goldens reproduces rows", () => {
     { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
     { name: "uuid_table.jed", build: uuidTableDB, table: "t" },
     { name: "default_table.jed", build: defaultTableDB, table: "t" },
+    { name: "timestamp_table.jed", build: timestampTableDB, table: "t" },
+    { name: "timestamptz_table.jed", build: timestamptzTableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },

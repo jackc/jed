@@ -163,6 +163,54 @@ fn default_table_db() -> Database {
     db
 }
 
+/// A table with a timestamp column — exercises the value codec's int64-instant branch (type
+/// code 8): a positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels,
+/// and a NULL. The literals parse to the same micros the golden stores. The PK stays int32 (a
+/// timestamp PK is supported, but the value-codec branch is the point here).
+fn timestamp_table_db() -> Database {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamp)",
+    );
+    run(&mut db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')");
+    run(&mut db, "INSERT INTO t VALUES (2, '1969-12-31 23:59:59.5')");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (3, '0001-01-01 00:00:00 BC')",
+    );
+    run(&mut db, "INSERT INTO t VALUES (4, '-infinity')");
+    run(&mut db, "INSERT INTO t VALUES (5, 'infinity')");
+    run(&mut db, "INSERT INTO t VALUES (6, NULL)");
+    db
+}
+
+/// A table with a timestamptz column (type code 9) — the same 8-byte branch; the `+05` literal
+/// normalizes to UTC before storage.
+fn timestamptz_table_db() -> Database {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamptz)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, '2024-01-01 12:00:00+00')",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (2, '2024-01-01 12:00:00+05')",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (3, '1969-12-31 23:59:59.5+00')",
+    );
+    run(&mut db, "INSERT INTO t VALUES (4, '-infinity')");
+    run(&mut db, "INSERT INTO t VALUES (5, 'infinity')");
+    run(&mut db, "INSERT INTO t VALUES (6, NULL)");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -176,6 +224,8 @@ fn write_matches_goldens() {
         ("bytea_table.jed", bytea_table_db),
         ("uuid_table.jed", uuid_table_db),
         ("default_table.jed", default_table_db),
+        ("timestamp_table.jed", timestamp_table_db),
+        ("timestamptz_table.jed", timestamptz_table_db),
         ("nopk_table.jed", nopk_table_db),
     ];
     for (name, build) in cases {
@@ -197,6 +247,8 @@ fn read_goldens_reproduces_rows() {
         ("bytea_table.jed", bytea_table_db, "t"),
         ("uuid_table.jed", uuid_table_db, "t"),
         ("default_table.jed", default_table_db, "t"),
+        ("timestamp_table.jed", timestamp_table_db, "t"),
+        ("timestamptz_table.jed", timestamptz_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),

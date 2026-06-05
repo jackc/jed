@@ -154,7 +154,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// bytea §2.6, boolean's bool-byte) are authored but unexercised, so a
 			// text/decimal/bytea/boolean PRIMARY KEY is a documented 0A000 narrowing
 			// (types.md §9/§11/§12/§13), relaxable in a later in-key slice.
-			if !ty.IsInteger() && !ty.IsUuid() {
+			if !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -1106,10 +1106,12 @@ const (
 	rtNull rtKind = iota // an untyped NULL literal
 	rtInt                // integer; intTy carries the ScalarType
 	rtBool
-	rtText    // text (one family, collation C); does not promote
-	rtDecimal // decimal (one family; the per-column typmod is carried separately)
-	rtBytea   // bytea (one family, raw bytes); does not promote
-	rtUuid    // uuid (one family, fixed 16 bytes); does not promote. The first non-integer key.
+	rtText        // text (one family, collation C); does not promote
+	rtDecimal     // decimal (one family; the per-column typmod is carried separately)
+	rtBytea       // bytea (one family, raw bytes); does not promote
+	rtUuid        // uuid (one family, fixed 16 bytes); does not promote. First non-integer key.
+	rtTimestamp   // timestamp (zoneless instant); does not compare/cast to timestamptz
+	rtTimestamptz // timestamptz (UTC instant); does not compare/cast to timestamp
 )
 
 type resolvedType struct {
@@ -1149,6 +1151,12 @@ func ctxOf(t resolvedType) *ScalarType {
 	case rtDecimal:
 		ty := DecimalType
 		return &ty
+	case rtTimestamp:
+		ty := Timestamp
+		return &ty
+	case rtTimestamptz:
+		ty := Timestamptz
+		return &ty
 	default:
 		return nil
 	}
@@ -1169,6 +1177,8 @@ const (
 	reConstDecimal
 	reConstBytea
 	reConstUuid
+	reConstTimestamp
+	reConstTimestamptz
 	reConstNull
 	reCast
 	reNeg
@@ -1704,6 +1714,10 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 		return resolvedType{kind: rtBytea}
 	case ty.IsUuid():
 		return resolvedType{kind: rtUuid}
+	case ty.IsTimestamp():
+		return resolvedType{kind: rtTimestamp}
+	case ty.IsTimestamptz():
+		return resolvedType{kind: rtTimestamptz}
 	default:
 		return resolvedType{kind: rtInt, intTy: ty}
 	}
@@ -1826,19 +1840,34 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			// A string literal is text by default (collation C). It adapts to a BYTEA or a UUID
 			// context (types.md §6/§13/§14): decode the hex input (bytea) or the PG-flexible uuid
 			// input (uuid) — 22P02 on malformed; any other context — including none — keeps it text.
-			if ctx != nil && ctx.IsBytea() {
+			// A string literal is text by default (collation C). It adapts to a BYTEA context (hex
+			// input, 22P02), a UUID context (PG-flexible input, 22P02 — types.md §6/§13/§14), or a
+			// TIMESTAMP/TIMESTAMPTZ context (parse the datetime, 22007/22008 — spec/design/timestamp.md).
+			switch {
+			case ctx != nil && ctx.IsBytea():
 				b, err := decodeByteaLiteral(e.Literal.Str)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
 				return &rExpr{kind: reConstBytea, cBytea: b}, resolvedType{kind: rtBytea}, nil
-			}
-			if ctx != nil && ctx.IsUuid() {
+			case ctx != nil && ctx.IsUuid():
 				b, err := decodeUUIDLiteral(e.Literal.Str)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
 				return &rExpr{kind: reConstUuid, cBytea: b}, resolvedType{kind: rtUuid}, nil
+			case ctx != nil && ctx.IsTimestamp():
+				m, err := ParseTimestamp(e.Literal.Str)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return &rExpr{kind: reConstTimestamp, cInt: m}, resolvedType{kind: rtTimestamp}, nil
+			case ctx != nil && ctx.IsTimestamptz():
+				m, err := ParseTimestamptz(e.Literal.Str)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return &rExpr{kind: reConstTimestamptz, cInt: m}, resolvedType{kind: rtTimestamptz}, nil
 			}
 			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
 		case LiteralDecimal:
@@ -1888,6 +1917,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if target.IsUuid() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to uuid is not supported yet")
 		}
+		// timestamp casts are deferred (spec/design/timestamp.md §6): casting TO a datetime is 0A000.
+		if target.IsTimestamp() || target.IsTimestamptz() {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to a timestamp type is not supported yet")
+		}
 		inner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -1906,6 +1939,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// Casting FROM uuid is likewise deferred (0A000).
 		if ity.kind == rtUuid {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from uuid is not supported yet")
+		}
+		// Casting FROM a timestamp is likewise deferred (0A000).
+		if ity.kind == rtTimestamp || ity.kind == rtTimestamptz {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from a timestamp type is not supported yet")
 		}
 		// int→int (range check), int→decimal (widen), decimal→int (explicit, round),
 		// decimal→decimal (re-scale), and NULL are all castable.
@@ -2176,7 +2213,8 @@ func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes)
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
 // or NULL); a boolean or text operand is a 42804 type error.
 func requireNumericOperand(t resolvedType) error {
-	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea || t.kind == rtUuid {
+	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea || t.kind == rtUuid ||
+		t.kind == rtTimestamp || t.kind == rtTimestamptz {
 		return typeError("arithmetic operators require numeric operands")
 	}
 	return nil
@@ -2207,6 +2245,14 @@ func classifyComparable(lt, rt resolvedType) error {
 	uuidL, uuidR := lt.kind == rtUuid, rt.kind == rtUuid
 	if uuidL != uuidR && lt.kind != rtNull && rt.kind != rtNull {
 		return typeError("cannot compare a uuid value with a non-uuid value")
+	}
+	// timestamp / timestamptz compare only within their own family (or with NULL). A mixed
+	// timestamp × timestamptz pair, or a datetime vs any other family, would need a zone, so
+	// it is a 42804 type error (spec/design/timestamp.md §5).
+	tsL := lt.kind == rtTimestamp || lt.kind == rtTimestamptz
+	tsR := rt.kind == rtTimestamp || rt.kind == rtTimestamptz
+	if (tsL || tsR) && lt.kind != rt.kind && lt.kind != rtNull && rt.kind != rtNull {
+		return typeError("cannot compare a timestamp value with a value of a different type")
 	}
 	return nil
 }
@@ -2265,7 +2311,8 @@ func promote(a, b resolvedType) ScalarType {
 }
 
 func requireBool(t resolvedType, msg string) error {
-	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal || t.kind == rtBytea || t.kind == rtUuid {
+	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal || t.kind == rtBytea || t.kind == rtUuid ||
+		t.kind == rtTimestamp || t.kind == rtTimestamptz {
 		return typeError(msg)
 	}
 	return nil
@@ -2359,6 +2406,10 @@ func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
 		ok = t.kind == rtBytea || t.kind == rtNull
 	case colTy.IsUuid():
 		ok = t.kind == rtUuid || t.kind == rtNull
+	case colTy.IsTimestamp():
+		ok = t.kind == rtTimestamp || t.kind == rtNull
+	case colTy.IsTimestamptz():
+		ok = t.kind == rtTimestamptz || t.kind == rtNull
 	default: // text
 		ok = t.kind == rtText || t.kind == rtNull
 	}
@@ -2447,6 +2498,10 @@ func (e *rExpr) eval(row Row, params []Value, m *Meter) (Value, error) {
 		return ByteaValue(e.cBytea), nil
 	case reConstUuid:
 		return UuidValue(e.cBytea), nil
+	case reConstTimestamp:
+		return TimestampValue(e.cInt), nil
+	case reConstTimestamptz:
+		return TimestamptzValue(e.cInt), nil
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
@@ -2851,6 +2906,10 @@ func valueCmp(a, b Value) int {
 		return strings.Compare(a.Str, b.Str)
 	case a.Kind == ValBool && b.Kind == ValBool:
 		return cmpInt64(orderKey(a), orderKey(b))
+	case a.Kind == ValTimestamp && b.Kind == ValTimestamp:
+		return cmpInt64(a.Int, b.Int)
+	case a.Kind == ValTimestamptz && b.Kind == ValTimestamptz:
+		return cmpInt64(a.Int, b.Int)
 	default:
 		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
 		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -2895,8 +2954,14 @@ func familyRank(v Value) int {
 		return 4
 	case ValBytea:
 		return 5
-	default: // ValUuid
+	case ValUuid:
 		return 6
+	case ValTimestamp:
+		return 7
+	case ValTimestamptz:
+		return 8
+	default:
+		return 9
 	}
 }
 
@@ -2979,6 +3044,22 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			}
 			return UuidValue(b), nil
 		}
+		if colTy.IsTimestamp() {
+			// A string literal adapts to a timestamp column (spec/design/timestamp.md);
+			// malformed input traps 22007, an out-of-range field 22008.
+			m, err := ParseTimestamp(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return TimestampValue(m), nil
+		}
+		if colTy.IsTimestamptz() {
+			m, err := ParseTimestamptz(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return TimestamptzValue(m), nil
+		}
 		return Value{}, typeError("cannot store a text value in " + colTy.CanonicalName() + " column " + colName)
 	case ValBytea:
 		if colTy.IsBytea() {
@@ -2990,6 +3071,16 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			return v, nil
 		}
 		return Value{}, typeError("cannot store a uuid value in " + colTy.CanonicalName() + " column " + colName)
+	case ValTimestamp:
+		if colTy.IsTimestamp() {
+			return v, nil
+		}
+		return Value{}, typeError("cannot store a timestamp value in " + colTy.CanonicalName() + " column " + colName)
+	case ValTimestamptz:
+		if colTy.IsTimestamptz() {
+			return v, nil
+		}
+		return Value{}, typeError("cannot store a timestamptz value in " + colTy.CanonicalName() + " column " + colName)
 	default: // ValBool
 		if colTy.IsBool() {
 			return BoolValue(v.Bool), nil

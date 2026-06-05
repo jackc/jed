@@ -15,6 +15,7 @@ use crate::decimal::{Decimal, MAX_PRECISION, MAX_SCALE};
 use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
 use crate::storage::{Row, TableStore};
+use crate::timestamp::{parse_timestamp, parse_timestamptz};
 use crate::types::{DecimalTypmod, ScalarType};
 use crate::value::{Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid};
 use std::collections::{HashMap, HashSet};
@@ -191,7 +192,9 @@ impl Database {
                 // §2.5, bytea §2.6, boolean's bool-byte) are authored but unexercised, so a
                 // text/decimal/bytea/boolean PRIMARY KEY is a documented 0A000 narrowing
                 // (spec/design/types.md §9/§11/§12/§13), relaxable in a later in-key slice.
-                if !ty.is_integer() && !ty.is_uuid() {
+                // timestamp / timestamptz are also allowed — they share the int64 `int-be-signflip`
+                // key encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
+                if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         format!("a {} primary key is not supported yet", ty.canonical_name()),
@@ -380,6 +383,9 @@ impl Database {
                         // uuid is the first non-integer key: its key is the bare 16 bytes
                         // (uuid-raw16, encoding.md §2.7) — a PK is NOT NULL, so no presence tag.
                         Value::Uuid(u) => u.to_vec(),
+                        // A timestamp / timestamptz PRIMARY KEY is supported: its key bytes are
+                        // the int64 instant codec (spec/design/timestamp.md §6).
+                        Value::Timestamp(m) | Value::Timestamptz(m) => encode_int(pk_ty, *m),
                         // Unreachable: a PK column is NOT NULL, enforced above.
                         Value::Null => unreachable!("primary key column is NOT NULL"),
                         // Unreachable: a boolean PRIMARY KEY is rejected at CREATE TABLE (0A000).
@@ -1129,6 +1135,10 @@ enum ResolvedType {
     Bytea,
     /// The uuid family (fixed 16 bytes); does not promote. The first non-integer key type.
     Uuid,
+    /// The `timestamp` family (zoneless instant). Does not compare/cast to `Timestamptz`.
+    Timestamp,
+    /// The `timestamptz` family (UTC instant). Does not compare/cast to `Timestamp`.
+    Timestamptz,
     Null,
 }
 
@@ -1161,6 +1171,9 @@ enum RExpr {
     ConstDecimal(Decimal),
     ConstBytea(Vec<u8>),
     ConstUuid([u8; 16]),
+    /// A parsed `timestamp` / `timestamptz` literal: the int64 microsecond instant.
+    ConstTimestamp(i64),
+    ConstTimestamptz(i64),
     ConstNull,
     /// A bind parameter, by 0-based index into the bound-values slice passed to `eval`. Its
     /// static type was inferred from context at resolve (spec/design/api.md §5); the value
@@ -1669,7 +1682,9 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> R
         | ResolvedType::Text
         | ResolvedType::Decimal
         | ResolvedType::Bytea
-        | ResolvedType::Uuid => Err(type_error("argument of WHERE must be boolean")),
+        | ResolvedType::Uuid
+        | ResolvedType::Timestamp
+        | ResolvedType::Timestamptz => Err(type_error("argument of WHERE must be boolean")),
     }
 }
 
@@ -1789,6 +1804,10 @@ fn resolved_type_of(ty: ScalarType) -> ResolvedType {
         ResolvedType::Bytea
     } else if ty.is_uuid() {
         ResolvedType::Uuid
+    } else if ty.is_timestamp() {
+        ResolvedType::Timestamp
+    } else if ty.is_timestamptz() {
+        ResolvedType::Timestamptz
     } else {
         ResolvedType::Int(ty)
     }
@@ -1851,22 +1870,28 @@ fn resolve(
             Ok((RExpr::ConstInt(*n), ResolvedType::Int(ty)))
         }
         Expr::Literal(Literal::Text(s)) => {
-            // A string literal is text by default (collation `C`). It adapts to a BYTEA or a
-            // UUID context (types.md §6/§13/§14): decode the hex input form (bytea) or the
-            // PG-flexible uuid input (uuid) there — 22P02 on malformed input. Any other
-            // context — including none — keeps it text.
-            if matches!(ctx, Some(t) if t.is_bytea()) {
-                Ok((
+            // A string literal is text by default (collation `C`). It adapts to a BYTEA context
+            // (decode the hex input, 22P02), a UUID context (PG-flexible uuid input, 22P02 —
+            // types.md §6/§13/§14), or a TIMESTAMP/TIMESTAMPTZ context (parse the datetime,
+            // 22007/22008 — spec/design/timestamp.md). Any other context keeps it text.
+            match ctx {
+                Some(t) if t.is_bytea() => Ok((
                     RExpr::ConstBytea(decode_bytea_literal(s)?),
                     ResolvedType::Bytea,
-                ))
-            } else if matches!(ctx, Some(t) if t.is_uuid()) {
-                Ok((
+                )),
+                Some(t) if t.is_uuid() => Ok((
                     RExpr::ConstUuid(decode_uuid_literal(s)?),
                     ResolvedType::Uuid,
-                ))
-            } else {
-                Ok((RExpr::ConstText(s.clone()), ResolvedType::Text))
+                )),
+                Some(t) if t.is_timestamp() => Ok((
+                    RExpr::ConstTimestamp(parse_timestamp(s)?),
+                    ResolvedType::Timestamp,
+                )),
+                Some(t) if t.is_timestamptz() => Ok((
+                    RExpr::ConstTimestamptz(parse_timestamptz(s)?),
+                    ResolvedType::Timestamptz,
+                )),
+                _ => Ok((RExpr::ConstText(s.clone()), ResolvedType::Text)),
             }
         }
         Expr::Literal(Literal::Decimal(d)) => {
@@ -1913,6 +1938,14 @@ fn resolve(
                     "casting to uuid is not supported yet",
                 ));
             }
+            // timestamp casts are deferred (spec/design/timestamp.md §6): casting TO a datetime
+            // is 0A000 (a string lands in a timestamp column by literal adaptation, not a CAST).
+            if target.is_timestamp() || target.is_timestamptz() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "casting to a timestamp type is not supported yet",
+                ));
+            }
             // The inner value is range-checked / coerced against `target` at eval, so it
             // resolves with no literal context here.
             let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
@@ -1947,6 +1980,13 @@ fn resolve(
                         "casting from uuid is not supported yet",
                     ));
                 }
+                // Casting FROM a timestamp is likewise deferred (0A000).
+                ResolvedType::Timestamp | ResolvedType::Timestamptz => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting from a timestamp type is not supported yet",
+                    ));
+                }
             }
             let result_ty = if target.is_decimal() {
                 ResolvedType::Decimal
@@ -1974,7 +2014,9 @@ fn resolve(
                 ResolvedType::Bool
                 | ResolvedType::Text
                 | ResolvedType::Bytea
-                | ResolvedType::Uuid => {
+                | ResolvedType::Uuid
+                | ResolvedType::Timestamp
+                | ResolvedType::Timestamptz => {
                     return Err(type_error("unary minus requires a numeric operand"));
                 }
             };
@@ -2280,6 +2322,9 @@ fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
         ResolvedType::Bool => Some(ScalarType::Bool),
         ResolvedType::Decimal => Some(ScalarType::Decimal),
         ResolvedType::Null => None,
+        // A datetime sibling offers its type so a string literal parses as that datetime.
+        ResolvedType::Timestamp => Some(ScalarType::Timestamp),
+        ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
     }
 }
 
@@ -2288,7 +2333,12 @@ fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
 fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
     match ty {
         ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null => Ok(()),
-        ResolvedType::Bool | ResolvedType::Text | ResolvedType::Bytea | ResolvedType::Uuid => {
+        ResolvedType::Bool
+        | ResolvedType::Text
+        | ResolvedType::Bytea
+        | ResolvedType::Uuid
+        | ResolvedType::Timestamp
+        | ResolvedType::Timestamptz => {
             Err(type_error("arithmetic operators require numeric operands"))
         }
     }
@@ -2300,9 +2350,17 @@ fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
 /// boolean/non-boolean, bytea/non-bytea, …) is a 42804 type error — comparison is overloaded
 /// across these families but never compares across them.
 fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
-    use ResolvedType::{Bool, Bytea, Decimal, Int, Text, Uuid};
+    use ResolvedType::{Bool, Bytea, Decimal, Int, Null, Text, Timestamp, Timestamptz, Uuid};
     match (lt, rt) {
-        // Boolean compares only with boolean (or NULL); boolean with a number/text/bytea/uuid is a mismatch.
+        // timestamp / timestamptz compare only within their own family (or with a bare NULL).
+        // A mixed timestamp × timestamptz pair — or a datetime vs any other family — would need
+        // a zone, so it is a 42804 type error (spec/design/timestamp.md §5).
+        (Timestamp, Timestamp) | (Timestamptz, Timestamptz) => Ok(()),
+        (Timestamp, Null) | (Null, Timestamp) | (Timestamptz, Null) | (Null, Timestamptz) => Ok(()),
+        (Timestamp, _) | (_, Timestamp) | (Timestamptz, _) | (_, Timestamptz) => Err(type_error(
+            "cannot compare a timestamp value with a value of a different type",
+        )),
+        // Boolean compares only with boolean (or NULL); boolean with a number/text/bytea is a mismatch.
         (Bool, Int(_))
         | (Int(_), Bool)
         | (Bool, Text)
@@ -2439,7 +2497,9 @@ fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
         | ResolvedType::Text
         | ResolvedType::Decimal
         | ResolvedType::Bytea
-        | ResolvedType::Uuid => Err(type_error(msg)),
+        | ResolvedType::Uuid
+        | ResolvedType::Timestamp
+        | ResolvedType::Timestamptz => Err(type_error(msg)),
     }
 }
 
@@ -2463,6 +2523,10 @@ fn require_assignable(ty: ResolvedType, col_ty: ScalarType, col: &str) -> Result
         matches!(ty, ResolvedType::Bytea | ResolvedType::Null)
     } else if col_ty.is_uuid() {
         matches!(ty, ResolvedType::Uuid | ResolvedType::Null)
+    } else if col_ty.is_timestamp() {
+        matches!(ty, ResolvedType::Timestamp | ResolvedType::Null)
+    } else if col_ty.is_timestamptz() {
+        matches!(ty, ResolvedType::Timestamptz | ResolvedType::Null)
     } else {
         // text column
         matches!(ty, ResolvedType::Text | ResolvedType::Null)
@@ -2691,6 +2755,12 @@ fn store_value(
                 // A string literal adapts to a uuid column via the PG-flexible input
                 // (types.md §6/§14); malformed input traps 22P02.
                 Ok(Value::Uuid(decode_uuid_literal(&s)?))
+            } else if col_ty.is_timestamp() {
+                // A string literal adapts to a timestamp column (spec/design/timestamp.md);
+                // malformed input traps 22007, an out-of-range field 22008.
+                Ok(Value::Timestamp(parse_timestamp(&s)?))
+            } else if col_ty.is_timestamptz() {
+                Ok(Value::Timestamptz(parse_timestamptz(&s)?))
             } else {
                 Err(type_error(format!(
                     "cannot store a text value in {} column {col_name}",
@@ -2714,6 +2784,26 @@ fn store_value(
             } else {
                 Err(type_error(format!(
                     "cannot store a uuid value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+        Value::Timestamp(m) => {
+            if col_ty.is_timestamp() {
+                Ok(Value::Timestamp(m))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a timestamp value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+        Value::Timestamptz(m) => {
+            if col_ty.is_timestamptz() {
+                Ok(Value::Timestamptz(m))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a timestamptz value in {} column {col_name}",
                     col_ty.canonical_name()
                 )))
             }
@@ -2775,6 +2865,8 @@ impl RExpr {
             RExpr::ConstDecimal(d) => Ok(Value::Decimal(d.clone())),
             RExpr::ConstBytea(b) => Ok(Value::Bytea(b.clone())),
             RExpr::ConstUuid(u) => Ok(Value::Uuid(*u)),
+            RExpr::ConstTimestamp(m) => Ok(Value::Timestamp(*m)),
+            RExpr::ConstTimestamptz(m) => Ok(Value::Timestamptz(*m)),
             RExpr::ConstNull => Ok(Value::Null),
             RExpr::Cast {
                 inner,
@@ -2816,6 +2908,9 @@ impl RExpr {
                     Value::Text(_) => unreachable!("resolver rejects a text cast operand"),
                     Value::Bytea(_) => unreachable!("resolver rejects a bytea cast operand"),
                     Value::Uuid(_) => unreachable!("resolver rejects a uuid cast operand"),
+                    Value::Timestamp(_) | Value::Timestamptz(_) => {
+                        unreachable!("resolver rejects a timestamp cast operand")
+                    }
                 }
             }
             RExpr::Neg { operand, result } => {
@@ -2839,6 +2934,9 @@ impl RExpr {
                     Value::Text(_) => unreachable!("resolver rejects a text unary minus"),
                     Value::Bytea(_) => unreachable!("resolver rejects a bytea unary minus"),
                     Value::Uuid(_) => unreachable!("resolver rejects a uuid unary minus"),
+                    Value::Timestamp(_) | Value::Timestamptz(_) => {
+                        unreachable!("resolver rejects a timestamp unary minus")
+                    }
                 }
             }
             RExpr::Not(e) => {
@@ -3115,6 +3213,9 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        // Timestamps order by the int64 instant (-infinity < finite < infinity).
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
         // Cross-family arms exist only for totality — ORDER BY is over a single typed column,
         // so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -3133,5 +3234,7 @@ fn family_rank(v: &Value) -> u8 {
         Value::Text(_) => 4,
         Value::Bytea(_) => 5,
         Value::Uuid(_) => 6,
+        Value::Timestamp(_) => 6,
+        Value::Timestamptz(_) => 7,
     }
 }

@@ -9,11 +9,17 @@
 // three-valued domain, ordered false < true.
 
 import { Decimal } from "./decimal.ts";
+import { renderTimestamp, renderTimestamptz } from "./timestamp.ts";
 
 export type Value =
   | { kind: "null" }
   | { kind: "int"; int: bigint }
   | { kind: "bool"; value: boolean }
+  // A zoneless timestamp / UTC-instant timestamptz; micros is the int64 microsecond instant
+  // (held as `bigint`, never `number` — the sentinels NEG_INFINITY/POS_INFINITY are
+  // -infinity/+infinity). They compare by the instant and never cross-family (timestamp.ts).
+  | { kind: "timestamp"; micros: bigint }
+  | { kind: "timestamptz"; micros: bigint }
   // The first stored non-integer value; compares by the C collation (UTF-8 byte /
   // code-point order — spec/design/types.md §11). NOT compared with JS `<`/localeCompare,
   // which use UTF-16 code-unit order and disagree above U+FFFF (see compareTextC below).
@@ -62,6 +68,16 @@ export function byteaValue(b: Uint8Array): Value {
 // uuidValue builds a non-null uuid value from its 16 raw bytes (parseUuid guarantees 16).
 export function uuidValue(b: Uint8Array): Value {
   return { kind: "uuid", bytes: b };
+}
+
+// timestampValue builds a non-null timestamp from its int64 microsecond instant.
+export function timestampValue(m: bigint): Value {
+  return { kind: "timestamp", micros: m };
+}
+
+// timestamptzValue builds a non-null timestamptz from its int64 microsecond instant.
+export function timestamptzValue(m: bigint): Value {
+  return { kind: "timestamptz", micros: m };
 }
 
 // compareBytea compares two byte strings by UNSIGNED byte order (Uint8Array elements are
@@ -234,6 +250,10 @@ export function render(v: Value): string {
     case "uuid":
       // Canonical 8-4-4-4-12 lowercase-hex form (PG uuid_out).
       return renderUuid(v.bytes);
+    case "timestamp":
+      return renderTimestamp(v.micros);
+    case "timestamptz":
+      return renderTimestamptz(v.micros);
     default:
       return v.int.toString();
   }
@@ -253,6 +273,9 @@ export function eq3(a: Value, b: Value): ThreeValued {
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) === 0);
   if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) === 0);
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value === b.value);
+  // Timestamps compare by the int64 instant (infinity is just an extreme value).
+  if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros === b.micros);
+  if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros === b.micros);
   return "unknown";
 }
 
@@ -266,6 +289,8 @@ export function lt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) < 0);
   if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) < 0);
   if (a.kind === "bool" && b.kind === "bool") return bool3(!a.value && b.value);
+  if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros < b.micros);
+  if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros < b.micros);
   return "unknown";
 }
 
@@ -279,6 +304,8 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) > 0);
   if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) > 0);
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value && !b.value);
+  if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros > b.micros);
+  if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros > b.micros);
   return "unknown";
 }
 

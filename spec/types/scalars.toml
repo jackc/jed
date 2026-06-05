@@ -211,3 +211,42 @@ aliases = []
 family = "uuid"
 storable = true
 encoding = { method = "uuid-raw16", width_bytes = 16 }
+
+# --- timestamp / timestamptz: the datetime types (../design/timestamp.md) ----
+# Two DISTINCT types that share ONE physical representation: int64 MICROSECONDS since
+# the Unix epoch (1970-01-01 00:00:00), proleptic Gregorian, NO leap seconds. They are
+# the PostgreSQL *instant* model, not the SQL-standard *offset-bearing* model, and this
+# slice ships NO time-zone database and NO named zones (a deliberate divergence, kept
+# deterministic + dependency-free — CLAUDE.md §8/§13):
+#   timestamp    a zoneless WALL CLOCK; no zone, ever, never converted.
+#   timestamptz  an absolute UTC INSTANT; input text MAY carry a numeric offset
+#                (Z, +HH, +HH:MM, +HH:MM:SS) which normalizes the value to UTC and is
+#                then DISCARDED (only the UTC instant is stored — no offset retained).
+# STORABLE this slice (on-disk type code 8 timestamp / 9 timestamptz —
+# ../fileformat/format.md). Both are FIXED-WIDTH 8-byte and reuse the int64 order-
+# preserving KEY encoding (int-be-signflip) verbatim — so unlike text/bytea/decimal a
+# timestamp PRIMARY KEY is SUPPORTED this slice (the encoding is already exercised). The
+# two families do NOT compare or cast to each other (that needs a zone): timestamp ×
+# timestamptz is 42804 (compare.toml). A value is written as a single-quoted string in a
+# timestamp context (literal adaptation, like bytea — ../design/types.md, timestamp.md):
+# ISO-8601-ish `YYYY-MM-DD[ T]HH:MM:SS[.ffffff][offset]` with optional BC/AD era; the
+# special values `infinity`/`-infinity` are first-class (the i64::MAX/i64::MIN sentinels —
+# unlike decimal, which EXCLUDES ±Infinity as a float artifact, decimal.md §2; a timestamp
+# infinity is a genuine, totally-ordered sentinel). Sub-microsecond input ROUNDS to µs
+# half-away-from-zero (decimal.md §3). Malformed input traps 22007; out-of-range fields /
+# representable-range overflow trap 22008. now()/CURRENT_TIMESTAMP, the timestamp(p)
+# modifier, interval arithmetic, CAST, and named zones are all DEFERRED. No bits/min/max/
+# overflow/rank (not the integer family); no collation.
+[[type]]
+id = "timestamp"
+aliases = ["timestamp without time zone"]
+family = "timestamp"
+storable = true
+encoding = { method = "int-be-signflip", width_bytes = 8 }
+
+[[type]]
+id = "timestamptz"
+aliases = ["timestamp with time zone"]
+family = "timestamptz"
+storable = true
+encoding = { method = "int-be-signflip", width_bytes = 8 }
