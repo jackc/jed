@@ -2,7 +2,7 @@
 //! NOT NULL (23502) and unique-PK (23505) enforcement, storage in PK order.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Database, Outcome, execute, execute_params};
 
 fn db_with(sql: &[&str]) -> Database {
     let mut db = Database::new();
@@ -238,4 +238,92 @@ fn no_pk_multi_row_insert_is_all_or_nothing() {
         .collect();
     // Only 1, 3, 4 landed; the failed batch's 2 is absent.
     assert_eq!(vals, vec![Value::Int(1), Value::Int(3), Value::Int(4)]);
+}
+
+// --- INSERT ... SELECT (grammar.md §24) ------------------------------------------------
+// Most behavior is pinned by the shared corpus (suites/dml/insert_select.test). These cover
+// the param-in-source case (the corpus is literal-only) and assert the cost number directly.
+
+#[test]
+fn insert_select_param_in_source_where() {
+    let mut db = db_with(&[
+        "CREATE TABLE src (id int32 PRIMARY KEY, a int16)",
+        "INSERT INTO src VALUES (1, 10), (2, 20), (3, 30)",
+        "CREATE TABLE dst (id int32 PRIMARY KEY, a int16)",
+    ]);
+    // A `$1` inside the source SELECT binds through the SELECT's own resolver.
+    execute_params(
+        &mut db,
+        "INSERT INTO dst SELECT id, a FROM src WHERE id >= $1",
+        &[Value::Int(2)],
+    )
+    .unwrap();
+    let ids: Vec<Value> = db
+        .rows_in_key_order("dst")
+        .unwrap()
+        .iter()
+        .map(|r| r[0].clone())
+        .collect();
+    assert_eq!(ids, vec![Value::Int(2), Value::Int(3)]);
+}
+
+#[test]
+fn insert_select_cost_is_the_embedded_select_cost() {
+    let mut db = db_with(&[
+        "CREATE TABLE src (id int32 PRIMARY KEY, a int16, b int64)",
+        "INSERT INTO src VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
+        "CREATE TABLE dst (id int32 PRIMARY KEY, a int16, b int64)",
+    ]);
+    // 3 scanned + 3 produced + 0 projection (bare columns) = 6; storing the rows is unmetered.
+    assert_eq!(
+        execute(&mut db, "INSERT INTO dst SELECT id, a, b FROM src").unwrap(),
+        Outcome::Statement { cost: 6 }
+    );
+}
+
+#[test]
+fn insert_select_self_insert_reads_pre_insert_snapshot() {
+    let mut db = db_with(&[
+        "CREATE TABLE t (id int32 PRIMARY KEY, a int16)",
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+    ]);
+    // The source is materialized first, so the new (shifted) rows never feed back in.
+    execute(&mut db, "INSERT INTO t SELECT id + 100, a FROM t").unwrap();
+    let ids: Vec<Value> = db
+        .rows_in_key_order("t")
+        .unwrap()
+        .iter()
+        .map(|r| r[0].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(101),
+            Value::Int(102),
+            Value::Int(103),
+        ]
+    );
+}
+
+#[test]
+fn insert_select_empty_source_type_mismatch_traps_42804() {
+    let mut db = db_with(&[
+        "CREATE TABLE src (id int32 PRIMARY KEY, name text)",
+        "INSERT INTO src VALUES (1, 'alice')",
+        "CREATE TABLE dst (n int32)",
+    ]);
+    // text -> int32 is rejected UP FRONT (42804) even though the source returns zero rows.
+    assert_eq!(
+        execute(
+            &mut db,
+            "INSERT INTO dst SELECT name FROM src WHERE id > 100"
+        )
+        .unwrap_err()
+        .code(),
+        "42804"
+    );
+    assert_eq!(db.rows_in_key_order("dst").unwrap().len(), 0);
 }

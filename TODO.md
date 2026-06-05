@@ -242,9 +242,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       [manifest.toml](spec/conformance/manifest.toml), all three cores in lockstep, pinned by
       [spec/conformance/suites/dml/insert_multi_row.test](spec/conformance/suites/dml/insert_multi_row.test).
       _(size: S)_
-- [ ] **`INSERT ... SELECT`** — insert the rows a query produces (the second half of the
-      original multi-row-INSERT item). Needs the executor to feed a SELECT result set
-      through the same two-phase, all-or-nothing INSERT validation. _(size: M; deps: SELECT ✓)_
+- [x] **`INSERT ... SELECT`** — insert the rows a query produces (the second half of the
+      original multi-row-INSERT item). Done: the `insert` grammar source is now
+      `( VALUES ... | select )` ([grammar.ebnf](spec/grammar/grammar.ebnf),
+      [grammar.md](spec/design/grammar.md) §24); the executor feeds the SELECT result set through
+      the same two-phase, all-or-nothing validation as VALUES (a shared `insertRows` /
+      `insert_rows` helper across all three cores). Two checks run **up front, before any row is
+      produced** (so they fire even over an empty source — the full-PG behaviour): output **arity**
+      must match the target (`42601`) and each projected column's **type** must be assignable to its
+      target (`42804`, the family-level subset of `store_value`, surfaced by threading projection
+      types out of `resolveProjections` via an internal `runSelect`/`SelectResult` — the public
+      `Outcome` is unchanged). Cost = the embedded SELECT's accrued cost (not the VALUES form's
+      zero); the source is materialized first, so a self-insert reads the pre-insert snapshot. New
+      capability `dml.insert_select` (in the `constraints` profile); pinned by
+      [spec/conformance/suites/dml/insert_select.test](spec/conformance/suites/dml/insert_select.test)
+      (52/52 byte-identical across Rust/Go/TS). _(size: M; deps: SELECT ✓)_
 - [x] **`DROP TABLE`.** Done: `DROP TABLE t` removes a table — its definition **and** all
       its rows — from the catalog (both the catalog entry and the per-table store, keyed by
       the lower-cased name; case-insensitive). The inverse of `CREATE TABLE`: dropping a

@@ -206,13 +206,17 @@ func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
-// executeInsert analyzes and runs an INSERT of one or more rows. An optional column list names
-// the target columns (unknown → 42703, duplicate → 42701); an unlisted column, or a DEFAULT
-// keyword slot, takes the column's stored default else NULL. Each value is type-checked (NULL
-// into NOT NULL traps 23502; an integer outside the column type's range traps 22003 — CLAUDE.md
-// §8); a duplicate primary key traps 23505. A multi-row INSERT is two-phase / all-or-nothing
-// (spec/design/grammar.md §12, constraints.md §2), mirroring UPDATE: every row is validated —
+// executeInsert analyzes and runs an INSERT whose rows come from a VALUES list or a SELECT
+// (spec/design/grammar.md §12 / §24). An optional column list names the target columns (unknown
+// → 42703, duplicate → 42701); an unlisted column, or a DEFAULT keyword slot, takes the column's
+// stored default else NULL. Each value is type-checked (NULL into NOT NULL traps 23502; an integer
+// outside the column type's range traps 22003 — CLAUDE.md §8); a duplicate primary key traps
+// 23505. An INSERT is two-phase / all-or-nothing, mirroring UPDATE: every row is validated —
 // including its storage key — before any row is inserted, so a mid-batch failure stores nothing.
+// The two sources differ only in where the candidate rows come from and in cost: VALUES is zero
+// (literals + constant defaults), SELECT is the embedded query's accrued cost. The SELECT source
+// additionally validates output arity (42601) and per-column type assignability (42804) up front,
+// before any row is produced — so both fire even over an empty source.
 func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) {
 	table, ok := db.Table(ins.Table)
 	if !ok {
@@ -223,7 +227,8 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 
 	// Resolve the optional column list once. provided[i] >= 0 means table column i takes that
 	// value position in each row; -1 means column i is omitted (its default, else NULL). With no
-	// list it is the identity over all columns. arity is how many values each row must carry.
+	// list it is the identity over all columns. arity is how many values each row must carry (for
+	// a SELECT source, how many columns it must project).
 	n := len(table.Columns)
 	provided := make([]int, n)
 	arity := n
@@ -251,9 +256,50 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		}
 	}
 
-	// A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those types across
-	// every row (a $N reused under two columns unifies; spec/design/api.md §5), then bind the
-	// supplied values up front so a bad bind fails before any row is stored.
+	if ins.Select != nil {
+		// SELECT source (§24). Run the source query first; it returns OWNED rows, so a
+		// self-insert (INSERT INTO t SELECT ... FROM t) reads the pre-insert snapshot, then
+		// writes. Params bind through the SELECT's own resolver.
+		q, err := db.runSelect(ins.Select, params)
+		if err != nil {
+			return Outcome{}, err
+		}
+		// Arity: the SELECT's output column count must match the target — checked before any
+		// row is produced, so it fires even when the source returns zero rows.
+		if len(q.columnNames) != arity {
+			noun := "columns"
+			if arity == 1 {
+				noun = "column"
+			}
+			return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
+				"INSERT into table %s has %d target %s but SELECT produces %d",
+				table.Name, arity, noun, len(q.columnNames),
+			))
+		}
+		// Type-assignability, the up-front PostgreSQL gate (§24): each projected column's TYPE
+		// must be assignable to its target column. Fires even at zero rows (this is the difference
+		// from per-row checking). The per-row storeValue in insertRows then still range-checks
+		// values (22003) and enforces NOT NULL.
+		for i, col := range table.Columns {
+			if p := provided[i]; p >= 0 {
+				if !assignableTo(q.columnTypes[p], col.Type) {
+					return Outcome{}, typeError(fmt.Sprintf(
+						"column %s is of type %s but expression is of type %s",
+						col.Name, col.Type.CanonicalName(), rtName(q.columnTypes[p]),
+					))
+				}
+			}
+		}
+		if err := db.insertRows(table, store, pk, provided, q.rows); err != nil {
+			return Outcome{}, err
+		}
+		// Cost = the embedded SELECT's accrued cost (§24); storing rows is unmetered.
+		return Outcome{Kind: OutcomeStatement, Cost: q.cost}, nil
+	}
+
+	// VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
+	// types across every row (a $N reused under two columns unifies; spec/design/api.md §5), then
+	// bind the supplied values up front so a bad bind fails before any row is stored.
 	ptypes := &paramTypes{}
 	for _, values := range ins.Rows {
 		for i, col := range table.Columns {
@@ -276,16 +322,10 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		return Outcome{}, err
 	}
 
-	// Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
-	// table with a primary key, the encoded key is checked for a duplicate (within the
-	// batch via seenKeys, and against the store) up front; for a table with none, key is
-	// left nil and a fresh monotonic rowid is allocated in phase 2.
-	type preparedRow struct {
-		key []byte // nil for a no-PK table (rowid allocated in phase 2)
-		row Row
-	}
-	prepared := make([]preparedRow, 0, len(ins.Rows))
-	seenKeys := make(map[string]struct{})
+	// Materialize each row into its value-position-indexed candidates (length arity), checking
+	// arity (42601) and resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that
+	// column's default else NULL. The shared insertRows then builds the declaration-order row.
+	rows := make([][]Value, 0, len(ins.Rows))
 	for _, values := range ins.Rows {
 		if len(values) != arity {
 			expected := "columns are"
@@ -297,31 +337,57 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 				len(values), arity, expected, table.Name,
 			))
 		}
+		rv := make([]Value, arity)
+		for i, col := range table.Columns {
+			if p := provided[i]; p >= 0 {
+				switch iv := values[p]; {
+				case iv.IsDefault:
+					rv[p] = defaultOrNull(col)
+				case iv.IsParam:
+					rv[p] = bound[int(iv.Param)-1]
+				default:
+					rv[p] = literalToValue(iv.Lit)
+				}
+			}
+		}
+		rows = append(rows, rv)
+	}
+	if err := db.insertRows(table, store, pk, provided, rows); err != nil {
+		return Outcome{}, err
+	}
+	// INSERT ... VALUES reads no rows and evaluates no expression tree — its values are literals
+	// and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves: zero cost.
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
 
-		// Build the row in declaration order: each column takes its provided value (a literal,
-		// or a DEFAULT keyword → the column default else NULL), or — when the column is omitted
-		// — its default else NULL. storeValue then type-coerces and enforces NOT NULL (23502)
-		// uniformly, so a NULL into a NOT NULL column traps here, before key encoding.
+// insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
+// element of rows is one row's candidate values indexed by VALUE POSITION p (length arity); the
+// declaration-order stored row is built via provided (an omitted column takes its default else
+// NULL) and each value is type-coerced + range-checked by storeValue (23502 / 22003 / 22P02 /
+// 42804). The storage key is computed and checked for a duplicate (23505 — within this batch via
+// seenKeys AND against the store) BEFORE any row is written; only once every row validates are
+// they all inserted (phase 2), allocating a fresh monotonic rowid in row order for a no-PK table.
+// All-or-nothing: a failure leaves the store untouched and burns no rowids.
+func (db *Database) insertRows(table *Table, store *TableStore, pk int, provided []int, rows [][]Value) error {
+	n := len(table.Columns)
+	type preparedRow struct {
+		key []byte // nil for a no-PK table (rowid allocated in phase 2)
+		row Row
+	}
+	prepared := make([]preparedRow, 0, len(rows))
+	seenKeys := make(map[string]struct{})
+	for _, values := range rows {
 		row := make(Row, n)
 		for i, col := range table.Columns {
 			var candidate Value
 			if p := provided[i]; p >= 0 {
-				switch iv := values[p]; {
-				case iv.IsDefault:
-					candidate = defaultOrNull(col)
-				case iv.IsParam:
-					// A bound $N value; its target-column coercion is the storeValue below,
-					// identical to a literal in this slot (spec/design/api.md §5).
-					candidate = bound[int(iv.Param)-1]
-				default:
-					candidate = literalToValue(iv.Lit)
-				}
+				candidate = values[p]
 			} else {
 				candidate = defaultOrNull(col)
 			}
 			v, err := storeValue(candidate, col.Type, col.Decimal, col.NotNull, col.Name)
 			if err != nil {
-				return Outcome{}, err
+				return err
 			}
 			row[i] = v
 		}
@@ -336,11 +402,11 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 				key = EncodeInt(table.Columns[pk].Type, row[pk].Int)
 			}
 			if _, dup := seenKeys[string(key)]; dup {
-				return Outcome{}, NewError(UniqueViolation,
+				return NewError(UniqueViolation,
 					"duplicate key value violates primary key uniqueness")
 			}
 			if _, exists := store.Get(key); exists {
-				return Outcome{}, NewError(UniqueViolation,
+				return NewError(UniqueViolation,
 					"duplicate key value violates primary key uniqueness")
 			}
 			seenKeys[string(key)] = struct{}{}
@@ -360,9 +426,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 			panic("pre-validated INSERT key must be unique")
 		}
 	}
-	// INSERT reads no rows and evaluates no expression tree — its values are literals and
-	// pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves: zero cost.
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return nil
 }
 
 // defaultOrNull is the column's stored default value, or a NULL value when it has none —
@@ -551,11 +615,33 @@ func (db *Database) RowsInKeyOrder(name string) []Row {
 	return store.IterInKeyOrder()
 }
 
-// executeSelect analyzes and runs a SELECT: resolve projected columns and the
-// WHERE/ORDER BY columns against the catalog, scan the table in primary-key order,
-// filter by the predicate (three-valued — only TRUE keeps a row), optionally re-sort
-// by ORDER BY, then project. Rows are produced deterministically (CLAUDE.md §10).
+// selectResult is the full result of running a SELECT (runSelect): the output column names and
+// their resolved types, the rows in result order, and the accrued cost. Internal to the
+// executor — executeSelect drops the types into the public Outcome, while INSERT ... SELECT uses
+// the types to gate assignability up front (spec/design/grammar.md §24).
+type selectResult struct {
+	columnNames []string
+	columnTypes []resolvedType
+	rows        [][]Value
+	cost        int64
+}
+
+// executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query Outcome
+// (the projection types are internal — only INSERT ... SELECT consumes them).
 func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) {
+	r, err := db.runSelect(sel, params)
+	if err != nil {
+		return Outcome{}, err
+	}
+	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, Rows: r.rows, Cost: r.cost}, nil
+}
+
+// runSelect analyzes and runs a SELECT: resolve projected columns and the WHERE/ORDER BY columns
+// against the catalog, scan the table in primary-key order, filter by the predicate (three-valued
+// — only TRUE keeps a row), optionally re-sort by ORDER BY, then project. Rows are produced
+// deterministically (CLAUDE.md §10). Returns the rows with each output column's NAME and resolved
+// TYPE (the types let INSERT ... SELECT gate assignability up front — §24) and the accrued cost.
+func (db *Database) runSelect(sel *Select, params []Value) (selectResult, error) {
 	// Accumulates the inferred type of each $N across every clause of this SELECT, then is
 	// finalized + bound once all resolution is done (spec/design/api.md §5).
 	ptypes := &paramTypes{}
@@ -573,14 +659,14 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 	for _, tref := range tableRefs {
 		t, ok := db.Table(tref.Name)
 		if !ok {
-			return Outcome{}, NewError(UndefinedTable, "table does not exist: "+tref.Name)
+			return selectResult{}, NewError(UndefinedTable, "table does not exist: "+tref.Name)
 		}
 		label := strings.ToLower(t.Name)
 		if tref.Alias != nil {
 			label = strings.ToLower(*tref.Alias)
 		}
 		if seenLabels[label] {
-			return Outcome{}, NewError(DuplicateAlias, "table name "+label+" specified more than once")
+			return selectResult{}, NewError(DuplicateAlias, "table name "+label+" specified more than once")
 		}
 		seenLabels[label] = true
 		rels = append(rels, scopeRel{label: label, table: t, offset: offset})
@@ -603,7 +689,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 			idx, err = s.resolveBare(key.Column)
 		}
 		if err != nil {
-			return Outcome{}, err
+			return selectResult{}, err
 		}
 		groupKeys = append(groupKeys, idx)
 	}
@@ -616,9 +702,9 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 	// query (HAVING alone groups the whole table — grammar.md §19).
 	isAgg := len(groupKeys) > 0 || itemsHaveAggregate(sel.Items) || sel.Having != nil
 	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys}
-	projections, columnNames, err := resolveProjections(s, sel.Items, projAgg, ptypes)
+	projections, columnNames, columnTypes, err := resolveProjections(s, sel.Items, projAgg, ptypes)
 	if err != nil {
-		return Outcome{}, err
+		return selectResult{}, err
 	}
 	// HAVING resolves against the same grouped scope (collect) — it may reference aggregates
 	// (collected into the SAME specs, so their slots follow the projection's) and grouping keys;
@@ -628,23 +714,23 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 	if sel.Having != nil {
 		node, ty, herr := resolve(s, *sel.Having, nil, projAgg, ptypes)
 		if herr != nil {
-			return Outcome{}, herr
+			return selectResult{}, herr
 		}
 		if ty.kind != rtBool && ty.kind != rtNull {
-			return Outcome{}, typeError("argument of HAVING must be boolean")
+			return selectResult{}, typeError("argument of HAVING must be boolean")
 		}
 		having = node
 	}
 	aggSpecs := projAgg.specs
 	// SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
 	if isAgg && sel.Distinct {
-		return Outcome{}, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
+		return selectResult{}, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
 	}
 	var filter *rExpr
 	if sel.Filter != nil {
 		filter, err = resolveBooleanFilter(s, sel.Filter, ptypes)
 		if err != nil {
-			return Outcome{}, err
+			return selectResult{}, err
 		}
 	}
 	type orderKeyPlan struct {
@@ -665,7 +751,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 			idx, err = s.resolveBare(key.Column)
 		}
 		if err != nil {
-			return Outcome{}, err
+			return selectResult{}, err
 		}
 		slot := idx
 		if isAgg {
@@ -677,7 +763,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 				}
 			}
 			if slot < 0 {
-				return Outcome{}, groupingErrorColumn(key.Column)
+				return selectResult{}, groupingErrorColumn(key.Column)
 			}
 		}
 		order = append(order, orderKeyPlan{idx: slot, descending: key.Descending, nullsFirst: key.NullsFirst})
@@ -702,7 +788,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 		}
 		for _, key := range order {
 			if !projected[key.idx] {
-				return Outcome{}, NewError(InvalidColumnReference,
+				return selectResult{}, NewError(InvalidColumnReference,
 					"for SELECT DISTINCT, ORDER BY expressions must appear in select list")
 			}
 		}
@@ -719,7 +805,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 			partial := &scope{rels: s.rels[:k+2]}
 			on, oerr := resolveBooleanFilter(partial, j.On, ptypes)
 			if oerr != nil {
-				return Outcome{}, oerr
+				return selectResult{}, oerr
 			}
 			joinOns[k] = on
 		}
@@ -730,11 +816,11 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 	// (spec/design/api.md §5).
 	ptys, err := ptypes.finalize()
 	if err != nil {
-		return Outcome{}, err
+		return selectResult{}, err
 	}
 	bound, err := bindParams(params, ptys)
 	if err != nil {
-		return Outcome{}, err
+		return selectResult{}, err
 	}
 
 	// Materialize each base table once, in primary-key order, charging storage_row_read per
@@ -783,7 +869,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 				if on != nil {
 					v, err := on.eval(combined, bound, meter)
 					if err != nil {
-						return Outcome{}, err
+						return selectResult{}, err
 					}
 					keep = v.IsTrue()
 				}
@@ -825,7 +911,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 		if filter != nil {
 			v, err := filter.eval(row, bound, meter)
 			if err != nil {
-				return Outcome{}, err
+				return selectResult{}, err
 			}
 			keep = v.IsTrue()
 		}
@@ -918,11 +1004,11 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 				if spec.operand != nil {
 					var verr error
 					if v, verr = spec.operand.eval(row, bound, meter); verr != nil {
-						return Outcome{}, verr
+						return selectResult{}, verr
 					}
 				}
 				if ferr := groups[gi].accs[i].fold(v); ferr != nil {
-					return Outcome{}, ferr
+					return selectResult{}, ferr
 				}
 			}
 		}
@@ -934,7 +1020,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 			for _, a := range g.accs {
 				v, ferr := a.finalize()
 				if ferr != nil {
-					return Outcome{}, ferr
+					return selectResult{}, ferr
 				}
 				srow = append(srow, v)
 			}
@@ -948,7 +1034,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 			for _, srow := range groupRows {
 				v, herr := having.eval(srow, bound, meter)
 				if herr != nil {
-					return Outcome{}, herr
+					return selectResult{}, herr
 				}
 				if v.IsTrue() {
 					kept = append(kept, srow)
@@ -977,7 +1063,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 			for i, p := range projections {
 				v, perr := p.eval(srow, bound, meter)
 				if perr != nil {
-					return Outcome{}, perr
+					return selectResult{}, perr
 				}
 				projected[i] = v
 			}
@@ -995,7 +1081,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 			for i, p := range projections {
 				v, err := p.eval(row, bound, meter)
 				if err != nil {
-					return Outcome{}, err
+					return selectResult{}, err
 				}
 				projected[i] = v
 			}
@@ -1026,7 +1112,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 			for i, p := range projections {
 				v, err := p.eval(row, bound, meter)
 				if err != nil {
-					return Outcome{}, err
+					return selectResult{}, err
 				}
 				projected[i] = v
 			}
@@ -1034,7 +1120,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 		}
 	}
 
-	return Outcome{Kind: OutcomeQuery, ColumnNames: columnNames, Rows: out, Cost: meter.Accrued}, nil
+	return selectResult{columnNames: columnNames, columnTypes: columnTypes, rows: out, cost: meter.Accrued}, nil
 }
 
 // distinctRowKey encodes a projected row into a collision-free string key for DISTINCT
@@ -1124,6 +1210,91 @@ func intType(t resolvedType) (ScalarType, bool) {
 		return t.intTy, true
 	}
 	return 0, false
+}
+
+// resolvedOfColumn is the resolved type of a stored column of ty — the output type of a bare
+// column projection (SELECT * / SELECT col). A column always has a concrete type, never rtNull.
+func resolvedOfColumn(ty ScalarType) resolvedType {
+	if ty.IsInteger() {
+		return resolvedType{kind: rtInt, intTy: ty}
+	}
+	switch {
+	case ty.IsBool():
+		return resolvedType{kind: rtBool}
+	case ty.IsText():
+		return resolvedType{kind: rtText}
+	case ty.IsDecimal():
+		return resolvedType{kind: rtDecimal}
+	case ty.IsBytea():
+		return resolvedType{kind: rtBytea}
+	case ty.IsTimestamp():
+		return resolvedType{kind: rtTimestamp}
+	case ty.IsTimestamptz():
+		return resolvedType{kind: rtTimestamptz}
+	default: // uuid
+		return resolvedType{kind: rtUuid}
+	}
+}
+
+// assignableTo reports whether a projected value of type t is assignable to a colTy column for
+// storage — the FAMILY-level gate INSERT ... SELECT applies up front (spec/design/grammar.md
+// §24), before any row is produced (so it fires even over an empty source). It is the
+// family-level subset of storeValue and MUST agree with it: an integer assigns to an integer
+// or decimal column (int→decimal widens), a decimal only to a decimal column (decimal→int is
+// explicit-CAST only), text to text/uuid/bytea/timestamp/timestamptz (the documented text
+// adaptation — the per-row store then parses, trapping 22P02/22007 on malformed input),
+// boolean→boolean, uuid→uuid, bytea→bytea, a timestamp only to a timestamp column and a
+// timestamptz only to a timestamptz column (the two never cross — they do not even compare,
+// timestamp.md), and a NULL-typed projection to any column (a NOT NULL target then traps 23502
+// per row). A non-assignable pair is a 42804.
+func assignableTo(t resolvedType, colTy ScalarType) bool {
+	switch t.kind {
+	case rtNull:
+		return true
+	case rtInt:
+		return colTy.IsInteger() || colTy.IsDecimal()
+	case rtDecimal:
+		return colTy.IsDecimal()
+	case rtBool:
+		return colTy.IsBool()
+	case rtText:
+		return colTy.IsText() || colTy.IsUuid() || colTy.IsBytea() ||
+			colTy.IsTimestamp() || colTy.IsTimestamptz()
+	case rtBytea:
+		return colTy.IsBytea()
+	case rtUuid:
+		return colTy.IsUuid()
+	case rtTimestamp:
+		return colTy.IsTimestamp()
+	case rtTimestamptz:
+		return colTy.IsTimestamptz()
+	default:
+		return false
+	}
+}
+
+// rtName is t's type name, for a 42804 assignability message (the integer width is exact).
+func rtName(t resolvedType) string {
+	switch t.kind {
+	case rtInt:
+		return t.intTy.CanonicalName()
+	case rtBool:
+		return "boolean"
+	case rtText:
+		return "text"
+	case rtDecimal:
+		return "decimal"
+	case rtBytea:
+		return "bytea"
+	case rtUuid:
+		return "uuid"
+	case rtTimestamp:
+		return "timestamp"
+	case rtTimestamptz:
+		return "timestamptz"
+	default:
+		return "unknown"
+	}
 }
 
 // ctxOf returns the type a sibling operand offers an adaptable operand. For an integer literal
@@ -1727,33 +1898,37 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
 // each relation's columns in catalog order (§15).
-func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, error) {
+func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, []resolvedType, error) {
 	if items.All {
 		var ps []*rExpr
 		var names []string
+		var types []resolvedType
 		for _, r := range s.rels {
 			for i := range r.table.Columns {
 				ps = append(ps, &rExpr{kind: reColumn, index: r.offset + i})
 				names = append(names, r.table.Columns[i].Name)
+				types = append(types, resolvedOfColumn(r.table.Columns[i].Type))
 			}
 		}
-		return ps, names, nil
+		return ps, names, types, nil
 	}
 	ps := make([]*rExpr, 0, len(items.Items))
 	names := make([]string, 0, len(items.Items))
+	types := make([]resolvedType, 0, len(items.Items))
 	for _, it := range items.Items {
-		node, _, err := resolve(s, it.Expr, nil, ag, params)
+		node, ty, err := resolve(s, it.Expr, nil, ag, params)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		ps = append(ps, node)
+		types = append(types, ty)
 		if it.Alias != nil {
 			names = append(names, *it.Alias)
 		} else {
 			names = append(names, outputName(s, it.Expr))
 		}
 	}
-	return ps, names, nil
+	return ps, names, types, nil
 }
 
 // outputName is the output column name of an un-aliased select item (grammar.md §8/§15): a

@@ -5,8 +5,8 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    BinaryOp, CreateTable, Delete, DropTable, Expr, Insert, InsertValue, JoinKind, Literal, Select,
-    SelectItems, Statement, TypeMod, UnaryOp, Update,
+    BinaryOp, CreateTable, Delete, DropTable, Expr, Insert, InsertSource, InsertValue, JoinKind,
+    Literal, Select, SelectItems, Statement, TypeMod, UnaryOp, Update,
 };
 use crate::catalog::{Column, Table};
 use crate::cost::Meter;
@@ -52,6 +52,17 @@ impl Outcome {
             Outcome::Statement { .. } => &[],
         }
     }
+}
+
+/// The full result of running a SELECT (`run_select`): the output column names and their
+/// resolved types, the rows in result order, and the accrued cost. Internal to the executor —
+/// `execute_select` drops the types into the public `Outcome::Query`, while `INSERT ... SELECT`
+/// uses the types to gate assignability up front (spec/design/grammar.md §24).
+struct SelectResult {
+    column_names: Vec<String>,
+    column_types: Vec<ResolvedType>,
+    rows: Vec<Vec<Value>>,
+    cost: i64,
 }
 
 /// The default serialization page size (8 KiB — spec/design/storage.md §3), used for a fresh
@@ -258,34 +269,45 @@ impl Database {
         Ok(Outcome::Statement { cost: 0 })
     }
 
-    /// Analyze and run an INSERT of one or more rows. An optional column list names the target
-    /// columns (unknown → 42703, duplicate → 42701); an unlisted column, or a `DEFAULT` keyword
-    /// slot, takes the column's stored default, else NULL. Each value is type-checked (NULL into
-    /// NOT NULL traps 23502; an integer outside the column type's range traps 22003 — CLAUDE.md
-    /// §8); a duplicate primary key traps 23505. A multi-row INSERT is **two-phase /
-    /// all-or-nothing** (spec/design/grammar.md §12, constraints.md §2), mirroring UPDATE: every
-    /// row is validated — including its storage key — before any row is inserted, so a mid-batch
-    /// failure stores nothing.
+    /// Analyze and run an INSERT whose rows come from a `VALUES` list or a `SELECT`
+    /// (spec/design/grammar.md §12 / §24). An optional column list names the target columns
+    /// (unknown → 42703, duplicate → 42701); an unlisted column, or a `DEFAULT` keyword slot,
+    /// takes the column's stored default, else NULL. Each value is type-checked (NULL into NOT
+    /// NULL traps 23502; an integer outside the column type's range traps 22003 — CLAUDE.md §8);
+    /// a duplicate primary key traps 23505. An INSERT is **two-phase / all-or-nothing**, mirroring
+    /// UPDATE: every row is validated — including its storage key — before any row is inserted,
+    /// so a mid-batch failure stores nothing. The two sources differ only in where the candidate
+    /// rows come from and in cost: `VALUES` is zero (literals + constant defaults), `SELECT` is
+    /// the embedded query's accrued cost. The `SELECT` source additionally validates output
+    /// arity (42601) and per-column type assignability (42804) **up front**, before any row is
+    /// produced — so both fire even over an empty source.
     fn execute_insert(&mut self, ins: Insert, params: &[Value]) -> Result<Outcome> {
-        let table = self.table(&ins.table).ok_or_else(|| {
+        let Insert {
+            table,
+            columns: col_list,
+            source,
+        } = ins;
+
+        let tdef = self.table(&table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
-                format!("table does not exist: {}", ins.table),
+                format!("table does not exist: {table}"),
             )
         })?;
 
-        // Snapshot the catalog data each row is validated against, ending the `table`
+        // Snapshot the catalog data each row is validated against, ending the `tdef`
         // borrow so phase 1 can read the store (dup-key check) and phase 2 can mutate it.
-        let table_name = table.name.clone();
-        let columns: Vec<Column> = table.columns.clone();
-        let pk = table.primary_key_index().map(|i| (i, table.columns[i].ty));
+        let table_name = tdef.name.clone();
+        let columns: Vec<Column> = tdef.columns.clone();
+        let pk = tdef.primary_key_index().map(|i| (i, tdef.columns[i].ty));
 
         // Resolve the optional column list once. `provided[i] = Some(p)` means table column i
         // takes value position `p` in each row; `None` means column i is omitted (its default,
         // else NULL). With no list it is the identity over all columns. `arity` is how many
-        // values each row must carry.
+        // values each row must carry (for a SELECT source, how many columns it must project).
         let n = columns.len();
-        let (provided, arity): (Vec<Option<usize>>, usize) = match &ins.columns {
+        let has_list = col_list.is_some();
+        let (provided, arity): (Vec<Option<usize>>, usize) = match &col_list {
             Some(names) => {
                 let mut provided = vec![None; n];
                 for (p, name) in names.iter().enumerate() {
@@ -311,60 +333,132 @@ impl Database {
             None => ((0..n).map(Some).collect(), n),
         };
 
-        // A `$N` in a VALUES slot is typed as its TARGET COLUMN's type. Collect those types
-        // across every row (a `$N` reused under two columns unifies; spec/design/api.md §5),
-        // then bind the supplied values up front so a bad bind fails before any row is stored.
-        let mut ptypes = ParamTypes::default();
-        for values in &ins.rows {
-            for (i, col) in columns.iter().enumerate() {
-                if let Some(p) = provided[i] {
-                    if let Some(InsertValue::Param(nn)) = values.get(p) {
-                        ptypes.note((*nn as usize) - 1, Some(col.ty))?;
+        match source {
+            InsertSource::Values(rows_in) => {
+                // A `$N` in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
+                // types across every row (a `$N` reused under two columns unifies; api.md §5),
+                // then bind the supplied values up front so a bad bind fails before any store.
+                let mut ptypes = ParamTypes::default();
+                for values in &rows_in {
+                    for (i, col) in columns.iter().enumerate() {
+                        if let Some(p) = provided[i] {
+                            if let Some(InsertValue::Param(nn)) = values.get(p) {
+                                ptypes.note((*nn as usize) - 1, Some(col.ty))?;
+                            }
+                        }
                     }
                 }
+                let bound = bind_params(params, &ptypes.finalize()?)?;
+
+                // Materialize each row into its value-position-indexed candidates (length
+                // `arity`), checking arity (42601) and resolving each slot: a literal, a bound
+                // `$N`, or a `DEFAULT` keyword → that column's default else NULL. The shared
+                // `insert_rows` then builds the declaration-order row and validates it.
+                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rows_in.len());
+                for values in &rows_in {
+                    if values.len() != arity {
+                        return Err(EngineError::new(
+                            SqlState::SyntaxError,
+                            format!(
+                                "INSERT row has {} values but {} {} expected for table {}",
+                                values.len(),
+                                arity,
+                                if has_list {
+                                    "target columns are"
+                                } else {
+                                    "columns are"
+                                },
+                                table_name,
+                            ),
+                        ));
+                    }
+                    let mut rv = vec![Value::Null; arity];
+                    for (i, col) in columns.iter().enumerate() {
+                        if let Some(p) = provided[i] {
+                            rv[p] = match &values[p] {
+                                InsertValue::Lit(lit) => literal_to_value(lit),
+                                InsertValue::Param(nn) => bound[(*nn as usize) - 1].clone(),
+                                InsertValue::Default => col.default.clone().unwrap_or(Value::Null),
+                            };
+                        }
+                    }
+                    rows.push(rv);
+                }
+                self.insert_rows(&table, &columns, pk, &provided, rows)?;
+                // INSERT ... VALUES reads no rows and evaluates no expression tree — its values
+                // are literals and pre-evaluated constant defaults (leaves): zero cost.
+                Ok(Outcome::Statement { cost: 0 })
+            }
+            InsertSource::Select(sel) => {
+                // Run the source query first; it returns OWNED rows, so the `&mut self` borrow
+                // ends here and phase 2 may mutate the store (a self-insert reads the pre-insert
+                // snapshot — §24). Params bind through the SELECT's own resolver.
+                let q = self.run_select(*sel, params)?;
+
+                // Arity: the SELECT's output column count must match the target — checked before
+                // any row is produced, so it fires even when the source returns zero rows.
+                if q.column_names.len() != arity {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        format!(
+                            "INSERT into table {} has {} target {} but SELECT produces {}",
+                            table_name,
+                            arity,
+                            if arity == 1 { "column" } else { "columns" },
+                            q.column_names.len(),
+                        ),
+                    ));
+                }
+
+                // Type-assignability, the up-front PostgreSQL gate (§24): each projected
+                // column's TYPE must be assignable to its target column. Fires even at zero rows
+                // (this is the difference from per-row checking). The per-row `store_value` in
+                // `insert_rows` then still range-checks values (22003) and enforces NOT NULL.
+                for (i, col) in columns.iter().enumerate() {
+                    if let Some(p) = provided[i] {
+                        if !q.column_types[p].assignable_to(col.ty) {
+                            return Err(type_error(format!(
+                                "column {} is of type {} but expression is of type {}",
+                                col.name,
+                                col.ty.canonical_name(),
+                                q.column_types[p].type_name(),
+                            )));
+                        }
+                    }
+                }
+
+                self.insert_rows(&table, &columns, pk, &provided, q.rows)?;
+                // Cost = the embedded SELECT's accrued cost (§24); storing rows is unmetered.
+                Ok(Outcome::Statement { cost: q.cost })
             }
         }
-        let bound = bind_params(params, &ptypes.finalize()?)?;
+    }
 
-        // Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
-        // table with a primary key, `key` is Some(encoded) and is checked for a duplicate
-        // (within the batch via `seen_keys`, and against the store) up front; for a table
-        // with none it is None and a fresh monotonic rowid is allocated in phase 2.
-        let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(ins.rows.len());
+    /// Phase 1 + phase 2 of an INSERT, shared by the `VALUES` and `SELECT` sources. Each element
+    /// of `rows` is one row's candidate values indexed by VALUE POSITION `p` (length `arity`);
+    /// the declaration-order stored row is built via `provided` (an omitted column takes its
+    /// default else NULL) and each value is type-coerced + range-checked by `store_value`
+    /// (23502 / 22003 / 22P02 / 42804). The storage key is computed and checked for a duplicate
+    /// (23505 — within this batch via `seen_keys` AND against the store) BEFORE any row is
+    /// written; only once every row validates are they all inserted (phase 2), allocating a
+    /// fresh monotonic rowid in row order for a table with no primary key. All-or-nothing: a
+    /// failure leaves the store untouched and burns no rowids.
+    fn insert_rows(
+        &mut self,
+        table: &str,
+        columns: &[Column],
+        pk: Option<(usize, ScalarType)>,
+        provided: &[Option<usize>],
+        rows: Vec<Vec<Value>>,
+    ) -> Result<()> {
+        let n = columns.len();
+        let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(rows.len());
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
-        for values in &ins.rows {
-            if values.len() != arity {
-                return Err(EngineError::new(
-                    SqlState::SyntaxError,
-                    format!(
-                        "INSERT row has {} values but {} {} expected for table {}",
-                        values.len(),
-                        arity,
-                        if ins.columns.is_some() {
-                            "target columns are"
-                        } else {
-                            "columns are"
-                        },
-                        table_name,
-                    ),
-                ));
-            }
-
-            // Build the row in declaration order: each column takes its provided value (a
-            // literal, or a `DEFAULT` keyword → the column default else NULL), or — when the
-            // column is omitted — its default else NULL. `store_value` then type-coerces and
-            // enforces NOT NULL (23502) uniformly, so a NULL into a NOT NULL column (omitted
-            // with no default, or DEFAULT NULL) traps here, before key encoding.
+        for values in &rows {
             let mut row = Vec::with_capacity(n);
             for (i, col) in columns.iter().enumerate() {
                 let candidate = match provided[i] {
-                    Some(p) => match &values[p] {
-                        InsertValue::Lit(lit) => literal_to_value(lit),
-                        // A bound `$N` value; its target-column coercion is the `store_value`
-                        // below, identical to a literal in this slot (spec/design/api.md §5).
-                        InsertValue::Param(nn) => bound[(*nn as usize) - 1].clone(),
-                        InsertValue::Default => col.default.clone().unwrap_or(Value::Null),
-                    },
+                    Some(p) => values[p].clone(),
                     None => col.default.clone().unwrap_or(Value::Null),
                 };
                 row.push(store_value(
@@ -379,7 +473,7 @@ impl Database {
             let key = match pk {
                 Some((i, pk_ty)) => {
                     let k = match &row[i] {
-                        Value::Int(n) => encode_int(pk_ty, *n),
+                        Value::Int(nn) => encode_int(pk_ty, *nn),
                         // uuid is the first non-integer key: its key is the bare 16 bytes
                         // (uuid-raw16, encoding.md §2.7) — a PK is NOT NULL, so no presence tag.
                         Value::Uuid(u) => u.to_vec(),
@@ -400,7 +494,7 @@ impl Database {
                             )
                         }
                     };
-                    if seen_keys.contains(&k) || self.store(&ins.table).get(&k).is_some() {
+                    if seen_keys.contains(&k) || self.store(table).get(&k).is_some() {
                         return Err(EngineError::new(
                             SqlState::UniqueViolation,
                             "duplicate key value violates primary key uniqueness",
@@ -414,10 +508,10 @@ impl Database {
             prepared.push((key, row));
         }
 
-        // Phase 2 — every row validated, so each insert is guaranteed to succeed. A
-        // synthetic rowid is allocated here, in row order, so a failed validation pass
-        // burns none (spec/fileformat/format.md, spec/design/grammar.md §12).
-        let store = self.store_mut(&ins.table);
+        // Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
+        // rowid is allocated here, in row order, so a failed validation pass burns none
+        // (spec/fileformat/format.md, spec/design/grammar.md §12).
+        let store = self.store_mut(table);
         for (key, row) in prepared {
             let key = key.unwrap_or_else(|| encode_int(ScalarType::Int64, store.alloc_rowid()));
             assert!(
@@ -425,9 +519,7 @@ impl Database {
                 "pre-validated INSERT key must be unique"
             );
         }
-        // INSERT reads no rows and evaluates no expression tree — its values are literals and
-        // pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves: zero cost.
-        Ok(Outcome::Statement { cost: 0 })
+        Ok(())
     }
 
     /// Analyze and run a DELETE: resolve the table and optional predicate, collect
@@ -573,12 +665,27 @@ impl Database {
         })
     }
 
+    /// Run a SELECT as a top-level statement: `run_select`, then wrap as a query Outcome
+    /// (the projection types are internal — only `INSERT ... SELECT` consumes them).
+    fn execute_select(&mut self, sel: Select, params: &[Value]) -> Result<Outcome> {
+        let r = self.run_select(sel, params)?;
+        Ok(Outcome::Query {
+            column_names: r.column_names,
+            rows: r.rows,
+            cost: r.cost,
+        })
+    }
+
     /// Analyze and run a SELECT: resolve projected columns and the WHERE/ORDER BY
     /// columns against the catalog, scan the table in primary-key order, filter by
     /// the predicate (three-valued — only TRUE keeps a row), optionally re-sort by
     /// ORDER BY, then project. Rows are produced in a deterministic order
-    /// (CLAUDE.md §10).
-    fn execute_select(&mut self, sel: Select, params: &[Value]) -> Result<Outcome> {
+    /// (CLAUDE.md §10). Returns the rows together with each output column's NAME and resolved
+    /// TYPE (the types let `INSERT ... SELECT` gate assignability up front — §24) and the
+    /// accrued cost. The `&mut self` borrow ends when this returns owned rows, so a caller may
+    /// then mutate the store (e.g. `INSERT INTO t SELECT ... FROM t` reads the pre-insert
+    /// snapshot, then writes).
+    fn run_select(&mut self, sel: Select, params: &[Value]) -> Result<SelectResult> {
         // Accumulates the inferred type of each `$N` across every clause of this SELECT, then is
         // finalized + bound once all resolution is done (spec/design/api.md §5).
         let mut ptypes = ParamTypes::default();
@@ -645,7 +752,7 @@ impl Database {
         } else {
             AggCtx::Forbidden
         };
-        let (projections, column_names) =
+        let (projections, column_names, column_types) =
             resolve_projections(&scope, &sel.items, &mut agg_ctx, &mut ptypes)?;
         // HAVING resolves against the same grouped scope (Collect) — it may reference aggregates
         // (collected into the SAME specs, so their slots follow the projection's) and grouping
@@ -1005,8 +1112,9 @@ impl Database {
             out_rows
         };
 
-        Ok(Outcome::Query {
+        Ok(SelectResult {
             column_names,
+            column_types,
             rows: out_rows,
             cost: meter.accrued,
         })
@@ -1140,6 +1248,69 @@ enum ResolvedType {
     /// The `timestamptz` family (UTC instant). Does not compare/cast to `Timestamp`.
     Timestamptz,
     Null,
+}
+
+impl ResolvedType {
+    /// The resolved type of a stored column of `ty` — used for the output type of a bare column
+    /// projection (`SELECT *` / `SELECT col`). A column always has a concrete type, never `Null`.
+    fn of_column(ty: ScalarType) -> ResolvedType {
+        match ty {
+            ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64 => ResolvedType::Int(ty),
+            ScalarType::Bool => ResolvedType::Bool,
+            ScalarType::Text => ResolvedType::Text,
+            ScalarType::Decimal => ResolvedType::Decimal,
+            ScalarType::Bytea => ResolvedType::Bytea,
+            ScalarType::Uuid => ResolvedType::Uuid,
+            ScalarType::Timestamp => ResolvedType::Timestamp,
+            ScalarType::Timestamptz => ResolvedType::Timestamptz,
+        }
+    }
+
+    /// This type's name, for a `42804` assignability message (the integer width is exact).
+    fn type_name(self) -> &'static str {
+        match self {
+            ResolvedType::Int(st) => st.canonical_name(),
+            ResolvedType::Bool => "boolean",
+            ResolvedType::Text => "text",
+            ResolvedType::Decimal => "decimal",
+            ResolvedType::Bytea => "bytea",
+            ResolvedType::Uuid => "uuid",
+            ResolvedType::Timestamp => "timestamp",
+            ResolvedType::Timestamptz => "timestamptz",
+            ResolvedType::Null => "unknown",
+        }
+    }
+
+    /// Whether a projected value of this type is assignable to a `col_ty` column for storage —
+    /// the FAMILY-level gate `INSERT ... SELECT` applies up front (spec/design/grammar.md §24),
+    /// before any row is produced (so it fires even over an empty source). It is the
+    /// family-level subset of `store_value` and MUST agree with it: an integer assigns to an
+    /// integer or decimal column (int→decimal widens), a decimal only to a decimal column
+    /// (decimal→int is explicit-CAST only), text to text/uuid/bytea/timestamp/timestamptz (the
+    /// documented text adaptation — the per-row store then parses, trapping 22P02/22007 on
+    /// malformed input), boolean→boolean, uuid→uuid, bytea→bytea, a timestamp only to a timestamp
+    /// column and a timestamptz only to a timestamptz column (the two never cross — they do not
+    /// even compare, timestamp.md), and a NULL-typed projection to any column (a NOT NULL target
+    /// then traps 23502 per row). A non-assignable pair is a 42804.
+    fn assignable_to(self, col_ty: ScalarType) -> bool {
+        match self {
+            ResolvedType::Null => true,
+            ResolvedType::Int(_) => col_ty.is_integer() || col_ty.is_decimal(),
+            ResolvedType::Decimal => col_ty.is_decimal(),
+            ResolvedType::Bool => col_ty.is_bool(),
+            ResolvedType::Text => {
+                col_ty.is_text()
+                    || col_ty.is_uuid()
+                    || col_ty.is_bytea()
+                    || col_ty.is_timestamp()
+                    || col_ty.is_timestamptz()
+            }
+            ResolvedType::Bytea => col_ty.is_bytea(),
+            ResolvedType::Uuid => col_ty.is_uuid(),
+            ResolvedType::Timestamp => col_ty.is_timestamp(),
+            ResolvedType::Timestamptz => col_ty.is_timestamptz(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1618,31 +1789,35 @@ fn resolve_projections(
     items: &SelectItems,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
-) -> Result<(Vec<RExpr>, Vec<String>)> {
+) -> Result<(Vec<RExpr>, Vec<String>, Vec<ResolvedType>)> {
     match items {
         SelectItems::All => {
             let mut nodes = Vec::new();
             let mut names = Vec::new();
+            let mut types = Vec::new();
             for rel in &scope.rels {
                 for (i, c) in rel.table.columns.iter().enumerate() {
                     nodes.push(RExpr::Column(rel.offset + i));
                     names.push(c.name.clone());
+                    types.push(ResolvedType::of_column(c.ty));
                 }
             }
-            Ok((nodes, names))
+            Ok((nodes, names, types))
         }
         SelectItems::Items(items) => {
             let mut nodes = Vec::with_capacity(items.len());
             let mut names = Vec::with_capacity(items.len());
+            let mut types = Vec::with_capacity(items.len());
             for it in items {
-                let (node, _) = resolve(scope, &it.expr, None, agg, params)?;
+                let (node, ty) = resolve(scope, &it.expr, None, agg, params)?;
                 names.push(match &it.alias {
                     Some(a) => a.clone(),
                     None => output_name(scope, &it.expr),
                 });
                 nodes.push(node);
+                types.push(ty);
             }
-            Ok((nodes, names))
+            Ok((nodes, names, types))
         }
     }
 }

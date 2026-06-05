@@ -5,9 +5,9 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert, InsertValue,
-    JoinClause, JoinKind, Literal, OrderKey, Select, SelectItem, SelectItems, Statement, TableRef,
-    TypeMod, UnaryOp, Update,
+    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert, InsertSource,
+    InsertValue, JoinClause, JoinKind, Literal, OrderKey, Select, SelectItem, SelectItems,
+    Statement, TableRef, TypeMod, UnaryOp, Update,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -150,11 +150,12 @@ impl Parser {
         Ok(DropTable { name })
     }
 
-    /// `INSERT INTO <table> [( <col> [, <col>]* )] VALUES <row> [, <row>]*`, where each
-    /// `<row>` is `( <value> [, <value>]* )` and each `<value>` is a literal or the `DEFAULT`
-    /// keyword. The optional column list names the target columns; unlisted columns take their
-    /// default. The executor resolves names + type-checks each row and inserts all-or-nothing
-    /// (spec/design/grammar.md §12, constraints.md §2).
+    /// `INSERT INTO <table> [( <col> [, <col>]* )] ( VALUES <row> [, <row>]* | <select> )`. The
+    /// source is either a VALUES list (each `<row>` is `( <value> [, <value>]* )`, each `<value>`
+    /// a literal or the `DEFAULT` keyword) or a SELECT (INSERT ... SELECT — §24). The optional
+    /// column list names the target columns; unlisted columns take their default. The executor
+    /// resolves names + type-checks each row and inserts all-or-nothing (spec/design/grammar.md
+    /// §12 / §24, constraints.md §2).
     fn parse_insert(&mut self) -> Result<Insert> {
         self.expect_keyword("insert")?;
         self.expect_keyword("into")?;
@@ -178,21 +179,27 @@ impl Parser {
             None
         };
 
-        self.expect_keyword("values")?;
-
-        let mut rows = Vec::new();
-        loop {
-            rows.push(self.parse_insert_row()?);
-            if matches!(self.peek(), Token::Comma) {
-                self.advance();
-                continue;
+        // The source is EITHER a SELECT (INSERT ... SELECT — §24) OR a VALUES list. `VALUES`
+        // and `SELECT` are disjoint leading keywords, so a peek decides without lookahead.
+        let source = if self.peek_keyword().as_deref() == Some("select") {
+            InsertSource::Select(Box::new(self.parse_select()?))
+        } else {
+            self.expect_keyword("values")?;
+            let mut rows = Vec::new();
+            loop {
+                rows.push(self.parse_insert_row()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
             }
-            break;
-        }
+            InsertSource::Values(rows)
+        };
         Ok(Insert {
             table,
             columns,
-            rows,
+            source,
         })
     }
 

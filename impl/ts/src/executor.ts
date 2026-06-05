@@ -78,6 +78,17 @@ export type Outcome =
   | { kind: "statement"; cost: bigint }
   | { kind: "query"; columnNames: string[]; rows: Value[][]; cost: bigint };
 
+// SelectResult is the full result of running a SELECT (runSelect): the output column names and
+// their resolved types, the rows in result order, and the accrued cost. Internal — executeSelect
+// drops the types into the public Outcome, while INSERT ... SELECT uses the types to gate
+// assignability up front (spec/design/grammar.md §24).
+type SelectResult = {
+  columnNames: string[];
+  columnTypes: ResolvedType[];
+  rows: Value[][];
+  cost: bigint;
+};
+
 // Database is the whole database: catalog + per-table in-memory stores. Single
 // committed state (CLAUDE.md §3); the staging-buffer commit model lands later. Names
 // are keyed case-insensitively (lowercased).
@@ -225,13 +236,17 @@ export class Database {
     return { kind: "statement", cost: 0n };
   }
 
-  // executeInsert runs an INSERT of one or more rows. An optional column list names the target
-  // columns (unknown → 42703, duplicate → 42701); an unlisted column, or a DEFAULT keyword slot,
-  // takes the column's stored default else NULL. Each value is type-checked (NULL into NOT NULL
-  // traps 23502; an integer outside the column type's range traps 22003 — CLAUDE.md §8); a
-  // duplicate primary key traps 23505. A multi-row INSERT is two-phase / all-or-nothing
-  // (grammar.md §12, constraints.md §2), mirroring UPDATE: every row is validated — including its
-  // storage key — before any row is inserted, so a mid-batch failure stores nothing.
+  // executeInsert runs an INSERT whose rows come from a VALUES list or a SELECT (grammar.md
+  // §12 / §24). An optional column list names the target columns (unknown → 42703, duplicate →
+  // 42701); an unlisted column, or a DEFAULT keyword slot, takes the column's stored default
+  // else NULL. Each value is type-checked (NULL into NOT NULL traps 23502; an integer outside the
+  // column type's range traps 22003 — CLAUDE.md §8); a duplicate primary key traps 23505. An
+  // INSERT is two-phase / all-or-nothing, mirroring UPDATE: every row is validated — including its
+  // storage key — before any row is inserted, so a mid-batch failure stores nothing. The two
+  // sources differ only in where the candidate rows come from and in cost: VALUES is zero
+  // (literals + constant defaults), SELECT is the embedded query's accrued cost. The SELECT
+  // source additionally validates output arity (42601) and per-column type assignability (42804)
+  // up front, before any row is produced — so both fire even over an empty source.
   private executeInsert(ins: Insert, params: Value[]): Outcome {
     const table = this.table(ins.table);
     if (!table) {
@@ -242,7 +257,8 @@ export class Database {
 
     // Resolve the optional column list once. provided[i] >= 0 means table column i takes that
     // value position in each row; -1 means column i is omitted (its default, else NULL). With no
-    // list it is the identity over all columns. arity is how many values each row must carry.
+    // list it is the identity over all columns. arity is how many values each row must carry (for
+    // a SELECT source, how many columns it must project).
     const n = table.columns.length;
     const provided: number[] = new Array(n);
     let arity = n;
@@ -270,11 +286,44 @@ export class Database {
       for (let i = 0; i < n; i++) provided[i] = i;
     }
 
-    // A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those types across
-    // every row (a $N reused under two columns unifies; spec/design/api.md §5), then bind the
-    // supplied values up front so a bad bind fails before any row is stored.
+    if (ins.source.kind === "select") {
+      // SELECT source (§24). Run the source query first; it returns OWNED rows, so a self-insert
+      // (INSERT INTO t SELECT ... FROM t) reads the pre-insert snapshot, then writes. Params bind
+      // through the SELECT's own resolver.
+      const q = this.runSelect(ins.source.select, params);
+      // Arity: the SELECT's output column count must match the target — checked before any row is
+      // produced, so it fires even when the source returns zero rows.
+      if (q.columnNames.length !== arity) {
+        const noun = arity === 1 ? "column" : "columns";
+        throw engineError(
+          "syntax_error",
+          `INSERT into table ${table.name} has ${arity} target ${noun} but SELECT produces ${q.columnNames.length}`,
+        );
+      }
+      // Type-assignability, the up-front PostgreSQL gate (§24): each projected column's TYPE must
+      // be assignable to its target column. Fires even at zero rows (the difference from per-row
+      // checking). The per-row storeValue in insertRows then still range-checks values (22003)
+      // and enforces NOT NULL.
+      for (let i = 0; i < n; i++) {
+        const p = provided[i]!;
+        if (p >= 0 && !assignableTo(q.columnTypes[p]!, table.columns[i]!.type)) {
+          const col = table.columns[i]!;
+          throw typeError(
+            `column ${col.name} is of type ${canonicalName(col.type)} but expression is of type ${rtName(q.columnTypes[p]!)}`,
+          );
+        }
+      }
+      this.insertRows(table, store, pk, provided, q.rows);
+      // Cost = the embedded SELECT's accrued cost (§24); storing rows is unmetered.
+      return { kind: "statement", cost: q.cost };
+    }
+
+    // VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
+    // types across every row (a $N reused under two columns unifies; spec/design/api.md §5), then
+    // bind the supplied values up front so a bad bind fails before any row is stored.
+    const rowsIn = ins.source.rows;
     const ptypes = new ParamTypes();
-    for (const values of ins.rows) {
+    for (const values of rowsIn) {
       for (let i = 0; i < n; i++) {
         const p = provided[i]!;
         if (p >= 0 && p < values.length) {
@@ -285,13 +334,11 @@ export class Database {
     }
     const bound = bindParams(params, ptypes.finalize());
 
-    // Phase 1 — validate every row and compute its key. Nothing is stored yet. For a
-    // table with a primary key, the encoded key is checked for a duplicate (within the
-    // batch via seenKeys, and against the store) up front; for a table with none, key is
-    // null and a fresh monotonic rowid is allocated in phase 2.
-    const prepared: { key: Uint8Array | null; row: Row }[] = [];
-    const seenKeys = new Set<string>();
-    for (const values of ins.rows) {
+    // Materialize each row into its value-position-indexed candidates (length arity), checking
+    // arity (42601) and resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that
+    // column's default else NULL. The shared insertRows then builds the declaration-order row.
+    const rows: Value[][] = [];
+    for (const values of rowsIn) {
       if (values.length !== arity) {
         const which = ins.columns !== null ? "target columns are" : "columns are";
         throw engineError(
@@ -299,26 +346,49 @@ export class Database {
           `INSERT row has ${values.length} values but ${arity} ${which} expected for table ${table.name}`,
         );
       }
+      const rv: Value[] = new Array(arity);
+      for (let i = 0; i < n; i++) {
+        const col = table.columns[i]!;
+        const p = provided[i]!;
+        if (p >= 0) {
+          const iv = values[p]!;
+          if (iv.kind === "default") rv[p] = col.default ?? nullValue();
+          else if (iv.kind === "param") rv[p] = bound[iv.index - 1]!;
+          else rv[p] = literalToValue(iv.lit);
+        }
+      }
+      rows.push(rv);
+    }
+    this.insertRows(table, store, pk, provided, rows);
+    // INSERT ... VALUES reads no rows and evaluates no expression tree — its values are literals
+    // and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves: zero cost.
+    return { kind: "statement", cost: 0n };
+  }
 
-      // Build the row in declaration order: each column takes its provided value (a literal, or
-      // a DEFAULT keyword → the column default else NULL), or — when the column is omitted — its
-      // default else NULL. storeValue then type-coerces and enforces NOT NULL (23502) uniformly,
-      // so a NULL into a NOT NULL column traps here, before key encoding.
+  // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
+  // element of rows is one row's candidate values indexed by VALUE POSITION p (length arity); the
+  // declaration-order stored row is built via provided (an omitted column takes its default else
+  // NULL) and each value is type-coerced + range-checked by storeValue (23502 / 22003 / 22P02 /
+  // 42804). The storage key is computed and checked for a duplicate (23505 — within this batch via
+  // seenKeys AND against the store) BEFORE any row is written; only once every row validates are
+  // they all inserted (phase 2), allocating a fresh monotonic rowid in row order for a no-PK
+  // table. All-or-nothing: a failure leaves the store untouched and burns no rowids.
+  private insertRows(
+    table: Table,
+    store: TableStore,
+    pk: number,
+    provided: number[],
+    rows: Value[][],
+  ): void {
+    const n = table.columns.length;
+    const prepared: { key: Uint8Array | null; row: Row }[] = [];
+    const seenKeys = new Set<string>();
+    for (const values of rows) {
       const row: Row = new Array(n);
       for (let i = 0; i < n; i++) {
         const col = table.columns[i]!;
         const p = provided[i]!;
-        let candidate: Value;
-        if (p >= 0) {
-          const iv = values[p]!;
-          if (iv.kind === "default") candidate = col.default ?? nullValue();
-          // A bound $N value; its target-column coercion is the storeValue below, identical to a
-          // literal in this slot (spec/design/api.md §5).
-          else if (iv.kind === "param") candidate = bound[iv.index - 1]!;
-          else candidate = literalToValue(iv.lit);
-        } else {
-          candidate = col.default ?? nullValue();
-        }
+        const candidate: Value = p >= 0 ? values[p]! : (col.default ?? nullValue());
         row[i] = storeValue(candidate, col.type, col.decimal, col.notNull, col.name);
       }
 
@@ -358,9 +428,6 @@ export class Database {
         throw new Error("pre-validated INSERT key must be unique");
       }
     }
-    // INSERT reads no rows and evaluates no expression tree — its values are literals and
-    // pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves: zero cost.
-    return { kind: "statement", cost: 0n };
   }
 
   // executeDelete resolves the table and optional predicate, collects the keys of
@@ -465,10 +532,19 @@ export class Database {
     return { kind: "statement", cost: meter.accrued };
   }
 
-  // executeSelect resolves projected columns and the WHERE/ORDER BY columns against the
-  // catalog, scans in primary-key order, filters (three-valued — only TRUE keeps a
-  // row), optionally re-sorts by ORDER BY, then projects.
+  // executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query
+  // Outcome (the projection types are internal — only INSERT ... SELECT consumes them).
   private executeSelect(sel: Select, params: Value[]): Outcome {
+    const r = this.runSelect(sel, params);
+    return { kind: "query", columnNames: r.columnNames, rows: r.rows, cost: r.cost };
+  }
+
+  // runSelect resolves projected columns and the WHERE/ORDER BY columns against the catalog,
+  // scans in primary-key order, filters (three-valued — only TRUE keeps a row), optionally
+  // re-sorts by ORDER BY, then projects. Returns the rows with each output column's NAME and
+  // resolved TYPE (the types let INSERT ... SELECT gate assignability up front — §24) and the
+  // accrued cost.
+  private runSelect(sel: Select, params: Value[]): SelectResult {
     // Accumulates the inferred type of each $N across every clause of this SELECT, then is
     // finalized + bound once all resolution is done (spec/design/api.md §5).
     const ptypes = new ParamTypes();
@@ -511,7 +587,7 @@ export class Database {
     // query (HAVING alone groups the whole table — grammar.md §19).
     const isAgg = groupKeys.length > 0 || itemsHaveAggregate(sel.items) || sel.having !== null;
     const projAgg: AggCtx = { collecting: isAgg, groupKeys, specs: [] };
-    const { nodes: projections, names: columnNames } = resolveProjections(scope, sel.items, projAgg, ptypes);
+    const { nodes: projections, names: columnNames, types: columnTypes } = resolveProjections(scope, sel.items, projAgg, ptypes);
     // HAVING resolves against the same grouped scope (collect) — it may reference aggregates
     // (collected into the SAME specs, so their slots follow the projection's) and grouping keys;
     // a non-grouped column is 42803. It must be boolean (42804). Resolved after the projection so
@@ -767,7 +843,7 @@ export class Database {
         return projections.map((p) => evalExpr(p, row, bound, meter));
       });
     }
-    return { kind: "query", columnNames, rows: out, cost: meter.accrued };
+    return { columnNames, columnTypes, rows: out, cost: meter.accrued };
   }
 }
 
@@ -1194,6 +1270,64 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
   return { kind: "int", ty };
 }
 
+// assignableTo reports whether a projected value of type `t` is assignable to a `colTy` column
+// for storage — the FAMILY-level gate INSERT ... SELECT applies up front (spec/design/grammar.md
+// §24), before any row is produced (so it fires even over an empty source). It is the
+// family-level subset of storeValue and MUST agree with it: an integer assigns to an integer or
+// decimal column (int→decimal widens), a decimal only to a decimal column (decimal→int is
+// explicit-CAST only), text to text/uuid/bytea/timestamp/timestamptz (the documented text
+// adaptation — the per-row store then parses, trapping 22P02/22007 on malformed input),
+// boolean→boolean, uuid→uuid, bytea→bytea, a timestamp only to a timestamp column and a
+// timestamptz only to a timestamptz column (the two never cross — they do not even compare,
+// timestamp.md), and a NULL-typed projection to any column (a NOT NULL target then traps 23502
+// per row). A non-assignable pair is a 42804.
+function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
+  switch (t.kind) {
+    case "null":
+      return true;
+    case "int":
+      return isInteger(colTy) || isDecimal(colTy);
+    case "decimal":
+      return isDecimal(colTy);
+    case "bool":
+      return isBool(colTy);
+    case "text":
+      return isText(colTy) || isUuid(colTy) || isBytea(colTy) || isTimestamp(colTy) || isTimestamptz(colTy);
+    case "bytea":
+      return isBytea(colTy);
+    case "uuid":
+      return isUuid(colTy);
+    case "timestamp":
+      return isTimestamp(colTy);
+    case "timestamptz":
+      return isTimestamptz(colTy);
+  }
+}
+
+// rtName is `t`'s type name, for a 42804 assignability message (the integer width is exact).
+function rtName(t: ResolvedType): string {
+  switch (t.kind) {
+    case "int":
+      return canonicalName(t.ty);
+    case "bool":
+      return "boolean";
+    case "text":
+      return "text";
+    case "decimal":
+      return "decimal";
+    case "bytea":
+      return "bytea";
+    case "uuid":
+      return "uuid";
+    case "timestamp":
+      return "timestamp";
+    case "timestamptz":
+      return "timestamptz";
+    case "null":
+      return "unknown";
+  }
+}
+
 // ParamTypes accumulates the inferred type of each bind parameter ($N) across every clause of a
 // statement (spec/design/api.md §5). types[i] is the inferred scalar type of $(i+1); a null entry
 // marks a parameter referenced before any context fixed its type. Shared across every clause so a
@@ -1267,25 +1401,30 @@ function resolveProjections(
   items: SelectItems,
   ag: AggCtx,
   params: ParamTypes,
-): { nodes: RExpr[]; names: string[] } {
+): { nodes: RExpr[]; names: string[]; types: ResolvedType[] } {
   if (items.kind === "all") {
     const nodes: RExpr[] = [];
     const names: string[] = [];
+    const types: ResolvedType[] = [];
     for (const r of scope.rels) {
       r.table.columns.forEach((c, i) => {
         nodes.push({ kind: "column", index: r.offset + i });
         names.push(c.name);
+        types.push(resolvedTypeOf(c.type));
       });
     }
-    return { nodes, names };
+    return { nodes, names, types };
   }
   const nodes: RExpr[] = [];
   const names: string[] = [];
+  const types: ResolvedType[] = [];
   for (const it of items.items) {
-    nodes.push(resolve(scope, it.expr, null, ag, params).node);
+    const { node, type } = resolve(scope, it.expr, null, ag, params);
+    nodes.push(node);
+    types.push(type);
     names.push(it.alias ?? outputName(scope, it.expr));
   }
-  return { nodes, names };
+  return { nodes, names, types };
 }
 
 // outputName is the output column name of an un-aliased select item (grammar.md §8/§15): a

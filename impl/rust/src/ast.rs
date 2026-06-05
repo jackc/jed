@@ -56,20 +56,33 @@ pub struct TypeMod {
     pub scale: Option<u64>,
 }
 
-/// `INSERT INTO <table> [(col, ..)] VALUES (..)[, (..)]*`. One or more rows of values,
-/// each value either a literal or the `DEFAULT` keyword. A multi-row INSERT is two-phase /
-/// all-or-nothing — every row is validated before any is stored (spec/design/grammar.md §12).
+/// `INSERT INTO <table> [(col, ..)] ( VALUES (..)[, (..)]* | <select> )`. The rows come from
+/// either a `VALUES` list (each value a literal or the `DEFAULT` keyword) or a `SELECT`
+/// (spec/design/grammar.md §24). An INSERT is two-phase / all-or-nothing — every row is
+/// validated before any is stored (spec/design/grammar.md §12).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Insert {
     pub table: String,
-    /// An optional explicit column list (`INSERT INTO t (a, c) VALUES ...`). `None` is the
-    /// positional form — every column, in declaration order. Names resolve at execution time
-    /// (unknown → 42703, duplicate → 42701); an unlisted column takes its default else NULL
-    /// (spec/design/constraints.md §2).
+    /// An optional explicit column list (`INSERT INTO t (a, c) VALUES ...` / `... SELECT ...`).
+    /// `None` is the positional form — every column, in declaration order. Names resolve at
+    /// execution time (unknown → 42703, duplicate → 42701); an unlisted column takes its default
+    /// else NULL (spec/design/constraints.md §2).
     pub columns: Option<Vec<String>>,
-    /// The rows to insert, in statement order; each inner vec is one row's values in the
-    /// order of `columns` (or column order when `columns` is `None`). Always non-empty.
-    pub rows: Vec<Vec<InsertValue>>,
+    /// Where the rows come from: a `VALUES` list or a `SELECT`.
+    pub source: InsertSource,
+}
+
+/// The source of an INSERT's rows (spec/design/grammar.md §24): a literal `VALUES` list, or a
+/// query whose result rows are inserted.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InsertSource {
+    /// `VALUES (..)[, (..)]*` — one or more rows, in statement order; each inner vec is one
+    /// row's values in the order of `columns` (or column order when `columns` is `None`).
+    /// Always non-empty.
+    Values(Vec<Vec<InsertValue>>),
+    /// `SELECT ...` — the rows the query produces, in its output order. Boxed to keep `Insert`
+    /// (and so `Statement`) small, since the SELECT source is the rarer form.
+    Select(Box<Select>),
 }
 
 /// One value slot in an INSERT `VALUES` row: a literal, a bind parameter (`$N`, bound at

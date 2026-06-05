@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { Database, execute, executeParams, intValue } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 function nums(): Database {
@@ -125,4 +125,62 @@ test("no-PK multi-row INSERT keeps insertion order; a failed batch stores nothin
   // A failing batch (second row overflows) stores neither row.
   assert.equal(errCode(() => execute(db, "INSERT INTO log VALUES (40), (99999)")), "22003");
   assert.deepStrictEqual(query(db, "SELECT a FROM log"), [["30"], ["10"], ["20"]]);
+});
+
+// --- INSERT ... SELECT (spec/design/grammar.md §24) -----------------------------------
+// Most behaviour is pinned by the shared corpus (suites/dml/insert_select.test). These cover
+// the param-in-source case (the corpus is literal-only) and assert the cost number directly.
+
+test("INSERT ... SELECT binds a $N inside the source query", () => {
+  const db = dbWith([
+    "CREATE TABLE src (id int32 PRIMARY KEY, a int16)",
+    "INSERT INTO src VALUES (1, 10), (2, 20), (3, 30)",
+    "CREATE TABLE dst (id int32 PRIMARY KEY, a int16)",
+  ]);
+  // A $1 inside the source SELECT binds through the SELECT's own resolver.
+  executeParams(db, "INSERT INTO dst SELECT id, a FROM src WHERE id >= $1", [intValue(2n)]);
+  assert.deepStrictEqual(query(db, "SELECT id FROM dst ORDER BY id"), [["2"], ["3"]]);
+});
+
+test("INSERT ... SELECT cost is the embedded SELECT's accrued cost", () => {
+  const db = dbWith([
+    "CREATE TABLE src (id int32 PRIMARY KEY, a int16, b int64)",
+    "INSERT INTO src VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
+    "CREATE TABLE dst (id int32 PRIMARY KEY, a int16, b int64)",
+  ]);
+  // 3 scanned + 3 produced + 0 projection (bare columns) = 6; storing the rows is unmetered.
+  const o = execute(db, "INSERT INTO dst SELECT id, a, b FROM src");
+  assert.equal(o.kind, "statement");
+  assert.equal(o.cost, 6n);
+});
+
+test("INSERT ... SELECT self-insert reads the pre-insert snapshot", () => {
+  const db = dbWith([
+    "CREATE TABLE t (id int32 PRIMARY KEY, a int16)",
+    "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+  ]);
+  // The source is materialized first, so the new (shifted) rows never feed back in.
+  execute(db, "INSERT INTO t SELECT id + 100, a FROM t");
+  assert.deepStrictEqual(query(db, "SELECT id FROM t ORDER BY id"), [
+    ["1"],
+    ["2"],
+    ["3"],
+    ["101"],
+    ["102"],
+    ["103"],
+  ]);
+});
+
+test("INSERT ... SELECT rejects a type-incompatible projection up front, even at 0 rows", () => {
+  const db = dbWith([
+    "CREATE TABLE src (id int32 PRIMARY KEY, name text)",
+    "INSERT INTO src VALUES (1, 'alice')",
+    "CREATE TABLE dst (n int32)",
+  ]);
+  // text -> int32 is rejected up front (42804) even though the source returns zero rows.
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO dst SELECT name FROM src WHERE id > 100")),
+    "42804",
+  );
+  assert.equal(query(db, "SELECT n FROM dst").length, 0);
 });

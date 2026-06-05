@@ -53,6 +53,10 @@ id = "dml.insert_multi_row"
 description = "Multi-row INSERT ... VALUES (..),(..) — two-phase / all-or-nothing (grammar.md §12)"
 
 [[capability]]
+id = "dml.insert_select"
+description = "INSERT ... SELECT — insert the rows a query produces, through the same two-phase / all-or-nothing validation; output arity must match the target (42601) and projected types must be assignable up front (42804, even over an empty source); cost = the embedded SELECT's accrued cost (grammar.md §24)"
+
+[[capability]]
 id = "dml.update"
 description = "UPDATE ... SET ... [WHERE] (in-place value replacement)"
 
@@ -352,12 +356,13 @@ capabilities = [
 
 [[profile]]
 id = "constraints"
-title = "outer_joins + the NOT NULL / DEFAULT column constraints + INSERT column list (spec/design/constraints.md)"
+title = "outer_joins + the NOT NULL / DEFAULT column constraints + INSERT column list / INSERT ... SELECT (spec/design/constraints.md)"
 includes = "outer_joins"
 capabilities = [
   "ddl.not_null",
   "ddl.column_default",
   "dml.insert_column_list",
+  "dml.insert_select",
 ]
 
 [[profile]]

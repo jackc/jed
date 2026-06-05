@@ -182,3 +182,65 @@ func TestNoPKMultiRowInsertIsAllOrNothing(t *testing.T) {
 		t.Errorf("got %v want [1 3 4]", got)
 	}
 }
+
+// --- INSERT ... SELECT (spec/design/grammar.md §24) -----------------------------------
+// Most behavior is pinned by the shared corpus (suites/dml/insert_select.test). These cover
+// the param-in-source case (the corpus is literal-only) and assert the cost number directly.
+
+func TestInsertSelectParamInSourceWhere(t *testing.T) {
+	db := dbWith(
+		t,
+		"CREATE TABLE src (id int32 PRIMARY KEY, a int16)",
+		"INSERT INTO src VALUES (1, 10), (2, 20), (3, 30)",
+		"CREATE TABLE dst (id int32 PRIMARY KEY, a int16)",
+	)
+	// A $1 inside the source SELECT binds through the SELECT's own resolver.
+	if _, err := ExecuteParams(db, "INSERT INTO dst SELECT id, a FROM src WHERE id >= $1",
+		[]Value{IntValue(2)}); err != nil {
+		t.Fatalf("INSERT ... SELECT with param: %v", err)
+	}
+	if got := ids(db.RowsInKeyOrder("dst")); !eqInts(got, 2, 3) {
+		t.Errorf("got %v want [2 3]", got)
+	}
+}
+
+func TestInsertSelectCostIsEmbeddedSelectCost(t *testing.T) {
+	db := dbWith(
+		t,
+		"CREATE TABLE src (id int32 PRIMARY KEY, a int16, b int64)",
+		"INSERT INTO src VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
+		"CREATE TABLE dst (id int32 PRIMARY KEY, a int16, b int64)",
+	)
+	// 3 scanned + 3 produced + 0 projection (bare columns) = 6; storing the rows is unmetered.
+	out := mustCreate(t, db, "INSERT INTO dst SELECT id, a, b FROM src")
+	if out.Kind != OutcomeStatement || out.Cost != 6 {
+		t.Errorf("got kind=%v cost=%d, want statement cost=6", out.Kind, out.Cost)
+	}
+}
+
+func TestInsertSelectSelfInsertReadsSnapshot(t *testing.T) {
+	db := dbWith(
+		t,
+		"CREATE TABLE t (id int32 PRIMARY KEY, a int16)",
+		"INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+	)
+	// The source is materialized first, so the new (shifted) rows never feed back in.
+	mustCreate(t, db, "INSERT INTO t SELECT id + 100, a FROM t")
+	if got := ids(db.RowsInKeyOrder("t")); !eqInts(got, 1, 2, 3, 101, 102, 103) {
+		t.Errorf("got %v want [1 2 3 101 102 103]", got)
+	}
+}
+
+func TestInsertSelectEmptySourceTypeMismatchTraps42804(t *testing.T) {
+	db := dbWith(
+		t,
+		"CREATE TABLE src (id int32 PRIMARY KEY, name text)",
+		"INSERT INTO src VALUES (1, 'alice')",
+		"CREATE TABLE dst (n int32)",
+	)
+	// text -> int32 is rejected UP FRONT (42804) even though the source returns zero rows.
+	wantErr(t, db, "INSERT INTO dst SELECT name FROM src WHERE id > 100", "42804")
+	if n := len(db.RowsInKeyOrder("dst")); n != 0 {
+		t.Errorf("expected 0 rows stored, got %d", n)
+	}
+}

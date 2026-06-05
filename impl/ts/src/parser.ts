@@ -205,11 +205,12 @@ class Parser {
     return { kind: "dropTable", name };
   }
 
-  // parseInsert parses `INSERT INTO <table> [( <col> [, <col>]* )] VALUES <row> [, <row>]*`,
-  // where each <row> is `( <value> [, <value>]* )` and each <value> is a literal or the DEFAULT
-  // keyword. The optional column list names the target columns; unlisted columns take their
-  // default. The executor resolves names + type-checks each row and inserts all-or-nothing
-  // (grammar.md §12, constraints.md §2).
+  // parseInsert parses `INSERT INTO <table> [( <col> [, <col>]* )] ( VALUES <row> [, <row>]* |
+  // <select> )`. The source is either a VALUES list (each <row> is `( <value> [, <value>]* )`,
+  // each <value> a literal or the DEFAULT keyword) or a SELECT (INSERT ... SELECT — §24). The
+  // optional column list names the target columns; unlisted columns take their default. The
+  // executor resolves names + type-checks each row and inserts all-or-nothing (grammar.md §12 /
+  // §24, constraints.md §2).
   private parseInsert(): Insert {
     this.expectKeyword("insert");
     this.expectKeyword("into");
@@ -231,6 +232,13 @@ class Parser {
       columns = names;
     }
 
+    // The source is EITHER a SELECT (INSERT ... SELECT — §24) OR a VALUES list. `VALUES` and
+    // `SELECT` are disjoint leading keywords, so a peek decides without lookahead.
+    if (this.peekKeyword() === "select") {
+      const select = this.parseSelect();
+      return { kind: "insert", table, columns, source: { kind: "select", select } };
+    }
+
     this.expectKeyword("values");
 
     const rows: InsertValue[][] = [];
@@ -242,7 +250,7 @@ class Parser {
       }
       break;
     }
-    return { kind: "insert", table, columns, rows };
+    return { kind: "insert", table, columns, source: { kind: "values", rows } };
   }
 
   // parseInsertRow parses one parenthesized `( <value> [, <value>]* )` row.

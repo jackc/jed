@@ -27,6 +27,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "dml.insert",
   // Multi-row INSERT ... VALUES (..),(..) — two-phase / all-or-nothing (grammar.md §12).
   "dml.insert_multi_row",
+  // INSERT ... SELECT — insert the rows a query produces; up-front arity (42601) +
+  // type-assignability (42804) gates, then the same two-phase validation (grammar.md §24).
+  "dml.insert_select",
   "error.overflow_trap",
   // Row mutation: UPDATE (in-place) + DELETE.
   "dml.update",

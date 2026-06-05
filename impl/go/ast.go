@@ -53,18 +53,23 @@ type TypeMod struct {
 	Scale     *uint64
 }
 
-// Insert is an INSERT ... [(col, ..)] VALUES with one or more rows, each value either a
-// literal or the DEFAULT keyword. A multi-row INSERT is two-phase / all-or-nothing — every
-// row is validated before any is stored (spec/design/grammar.md §12). Rows is always non-empty.
+// Insert is an INSERT ... [(col, ..)] whose rows come from EITHER a VALUES list (each value a
+// literal or the DEFAULT keyword) OR a SELECT (INSERT ... SELECT — spec/design/grammar.md §24).
+// An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
+// (spec/design/grammar.md §12).
 type Insert struct {
 	Table string
-	// Columns is the optional explicit column list (`INSERT INTO t (a, c) VALUES ...`); nil is
-	// the positional form (every column, in declaration order). Names resolve at execution time
-	// (unknown → 42703, duplicate → 42701); an unlisted column takes its default else NULL.
+	// Columns is the optional explicit column list (`INSERT INTO t (a, c) VALUES ...` /
+	// `... SELECT ...`); nil is the positional form (every column, in declaration order). Names
+	// resolve at execution time (unknown → 42703, duplicate → 42701); an unlisted column takes
+	// its default else NULL.
 	Columns []string
-	// Rows are the rows to insert; each inner slice is one row's values in the order of Columns
-	// (or column order when Columns is nil).
-	Rows [][]InsertValue
+	// EXACTLY ONE of Rows / Select is set (the parser guarantees it). Rows is the VALUES source:
+	// each inner slice is one row's values in the order of Columns (or column order when Columns
+	// is nil); non-empty when set, nil when Select is set. Select is the SELECT source: nil when
+	// Rows is set.
+	Rows   [][]InsertValue
+	Select *Select
 }
 
 // InsertValue is one value slot in an INSERT VALUES row: a literal, a bind parameter ($N,

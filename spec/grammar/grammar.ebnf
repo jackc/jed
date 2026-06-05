@@ -85,21 +85,27 @@ type_name      ::= identifier ("(" integer ("," integer)? ")")?
 
 /* --- DML ----------------------------------------------------------------- */
 
-/* INSERT is multi-row: "VALUES" is one or more parenthesized rows. An optional column list
- * names the target columns (`INSERT INTO t (a, c) VALUES ...`); with no list the values map
- * positionally to every column in declaration order. Each row's arity must match the list (or
- * the column count); a mismatch is 42601. Each value is a `literal` or the "DEFAULT" keyword,
- * which substitutes the target column's declared default. A column not named in the list — or a
- * "DEFAULT" slot — takes that column's default, else NULL, else 23502 if it is NOT NULL
- * (../design/constraints.md §2). An unknown column in the list is 42703, a duplicate is 42701.
+/* INSERT's source is EITHER a "VALUES" list of one or more parenthesized rows OR a `select`
+ * (INSERT ... SELECT — ../design/grammar.md §24). An optional column list names the target
+ * columns (`INSERT INTO t (a, c) VALUES ...` / `... SELECT ...`); with no list the values map
+ * positionally to every column in declaration order. Each VALUES row's arity — or the SELECT's
+ * output column count — must match the list (or the column count); a mismatch is 42601 (for the
+ * SELECT source this is checked even when it produces zero rows). Each VALUES value is a
+ * `literal` or the "DEFAULT" keyword, which substitutes the target column's declared default.
+ * A column not named in the list — or a "DEFAULT" slot — takes that column's default, else NULL,
+ * else 23502 if it is NOT NULL (../design/constraints.md §2). An unknown column in the list is
+ * 42703, a duplicate is 42701.
  *   A multi-row INSERT is two-phase / all-or-nothing, exactly like UPDATE (../design/grammar.md
  * §12): every row is fully validated — arity, type/range (22003), NOT NULL (23502) — and every
  * storage key checked for a duplicate (23505), both against existing rows AND earlier rows in
- * the same statement, BEFORE any row is inserted. If any check fails, no row is inserted.
+ * the same statement, BEFORE any row is inserted. If any check fails, no row is inserted. An
+ * INSERT ... SELECT additionally validates each projected column's TYPE is assignable to its
+ * target up front (42804, even over an empty source — §24), and its cost is the embedded
+ * SELECT's accrued cost (not zero).
  *   "DEFAULT" is NOT reserved (§3): a column may be named "default", disambiguated positionally
  * (it is a keyword only in a VALUES slot). */
 insert         ::= "INSERT" "INTO" identifier ("(" identifier ("," identifier)* ")")?
-                   "VALUES" row ("," row)*
+                   ( "VALUES" row ("," row)* | select )
 
 row            ::= "(" insert_value ("," insert_value)* ")"
 

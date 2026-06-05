@@ -154,17 +154,22 @@ export type CreateTable = {
 // objects exist yet). See spec/design/grammar.md §13.
 export type DropTable = { kind: "dropTable"; name: string };
 
-// Insert is an INSERT ... [(col, ..)] VALUES with one or more rows, each value either a
-// literal or the DEFAULT keyword. A multi-row INSERT is two-phase / all-or-nothing — every
-// row is validated before any is stored (spec/design/grammar.md §12). `rows` is non-empty.
-// `columns` is the optional explicit column list (`INSERT INTO t (a, c) VALUES ...`); null is
-// the positional form (every column, in declaration order). Names resolve at execution time
-// (unknown → 42703, duplicate → 42701); an unlisted column takes its default else NULL.
+// Insert is an INSERT ... [(col, ..)] whose rows come from EITHER a VALUES list (each value a
+// literal or the DEFAULT keyword) OR a SELECT (INSERT ... SELECT — spec/design/grammar.md §24).
+// An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
+// (spec/design/grammar.md §12).
+// `columns` is the optional explicit column list (`INSERT INTO t (a, c) VALUES ...` /
+// `... SELECT ...`); null is the positional form (every column, in declaration order). Names
+// resolve at execution time (unknown → 42703, duplicate → 42701); an unlisted column takes its
+// default else NULL.
+// `source` is the VALUES list (rows, non-empty) or the SELECT whose result rows are inserted.
 export type Insert = {
   kind: "insert";
   table: string;
   columns: string[] | null;
-  rows: InsertValue[][];
+  source:
+    | { kind: "values"; rows: InsertValue[][] }
+    | { kind: "select"; select: Select };
 };
 
 // InsertValue is one value slot in an INSERT VALUES row: a literal, or the DEFAULT keyword —

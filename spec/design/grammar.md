@@ -106,8 +106,9 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   `IN`/`EXISTS`, correlated) and **`USING`/`NATURAL`** join forms remain deferred.
 - **`INSERT` values are *literals only*** (not general expressions; see the `literal`
   production) — but the `DEFAULT` keyword is now also a value slot, and an explicit **column
-  list** (`INSERT INTO t (a, c) VALUES ...`) landed alongside `DEFAULT` (§12, §16). What stays
-  deferred is `INSERT ... SELECT` and general expressions in a value slot.
+  list** (`INSERT INTO t (a, c) VALUES ...`) landed alongside `DEFAULT` (§12, §16).
+  `INSERT ... SELECT` — inserting the rows a query produces — now also lands (§24). What stays
+  deferred is **general expressions in a `VALUES` value slot**.
 - **`ORDER BY` keys are bare columns** — a sort key is a table column, never a general
   expression (`ORDER BY a + 1`), an output alias, or an ordinal position (`ORDER BY 1`);
   those stay deferred. The richer surface that *did* land — multiple keys, per-key
@@ -335,8 +336,9 @@ hand-written parsers.
 (`insert` / `row` in the grammar): `INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)` inserts
 three rows in one statement. It is the obvious PostgreSQL surface and a near-free extension
 of the single-row form — one extra parse loop and one validation pass. The optional **column
-list** and the **`DEFAULT` keyword** are covered in §16; `INSERT ... SELECT` and general
-expressions in a value slot stay deferred (§5, [../../TODO.md](../../TODO.md)).
+list** and the **`DEFAULT` keyword** are covered in §16; inserting the rows a query produces
+(`INSERT ... SELECT`) is §24. General expressions in a `VALUES` value slot stay deferred
+(§5, [../../TODO.md](../../TODO.md)).
 
 **Every row has the same arity.** Each `row` is validated against the catalog independently; a
 row whose arity differs from the column count (or, with a column list, the list length) is a
@@ -364,10 +366,12 @@ phase two, after every row has validated, and proceeds in `VALUES` order — so 
 fails validation burns no rowids, and a batch that succeeds assigns consecutive rowids
 left-to-right. This keeps the assignment deterministic and identical across the three cores.
 
-**Cost is unchanged — zero.** A row's values are literals and **pre-evaluated constant
-defaults** (folded to a value at CREATE TABLE — §16), so an `INSERT` reads no storage and
-evaluates no expression tree: it accrues the same zero cost as before
-([cost.md](cost.md)). Only a future *expression* default would change this.
+**Cost is unchanged — zero (for the `VALUES` source).** A row's values are literals and
+**pre-evaluated constant defaults** (folded to a value at CREATE TABLE — §16), so an
+`INSERT ... VALUES` reads no storage and evaluates no expression tree: it accrues the same
+zero cost as before ([cost.md](cost.md)). Only a future *expression* default would change
+this. An `INSERT ... SELECT` is different: it accrues exactly the embedded `SELECT`'s cost
+(§24).
 
 ## 13. `DROP TABLE`
 
@@ -576,8 +580,8 @@ the column count) is `42601`. Then the usual per-value checks apply in declarati
 
 **Defaults are literal-only this slice** and pre-evaluated at CREATE TABLE, so applying one at
 INSERT is substituting a constant — no expression is evaluated and cost stays zero (§12). A
-general-expression default (`DEFAULT now()`) and `INSERT ... SELECT` stay deferred
-([../../TODO.md](../../TODO.md)).
+general-expression default (`DEFAULT now()`) stays deferred ([../../TODO.md](../../TODO.md)); the
+column list and `DEFAULT` keyword apply unchanged when the source is a `SELECT` (§24).
 
 ## 17. Function-call syntax and aggregate functions
 
@@ -831,3 +835,57 @@ two forms and is the **first deliberately lazy** expression in the engine.
   `operator_eval`s of the conditions tested up to the match and of the selected result only
   (the lazy-eval exception). Output name for a bare `SELECT CASE … END` is `?column?` (§8) —
   any non-column expression.
+
+## 24. `INSERT ... SELECT`
+
+`INSERT` may take its rows from a **query** instead of a `VALUES` list: the `insert`
+production's source is now `( "VALUES" row ("," row)* | select )`. `INSERT INTO dst SELECT a, b
+FROM src WHERE …` inserts whatever the embedded `SELECT` produces. The whole `SELECT` surface
+is reachable as a source — `WHERE`, `JOIN`, `GROUP BY`/`HAVING`, `DISTINCT`, `ORDER BY`,
+`LIMIT`/`OFFSET`, aggregates, `CASE` — because the source *is* a `select`, parsed and executed
+by the same path as a top-level query. The optional **column list** and **`DEFAULT`-for-omitted
+columns** (§16) apply unchanged; a `DEFAULT` *keyword* value slot is a `VALUES`-only thing and
+does not exist in the SELECT source.
+
+**Arity — the `SELECT`'s output column count must match the target**, exactly as a `VALUES`
+row's arity must (§12): the number of projected columns must equal the column-list length, or
+the table's column count with no list, else `42601`. This is checked **once, before any row is
+produced** — so it fires even when the `SELECT` returns **zero rows**.
+
+**Type-assignability — checked up front, PostgreSQL-faithful.** Beyond the per-value checks the
+`VALUES` path already does, `INSERT ... SELECT` validates each projected column's **type** is
+assignable to its target column **before** producing rows, mirroring PostgreSQL's plan-time type
+analysis. So a type-incompatible projection is rejected with `42804` **even over an empty
+source** (`INSERT INTO t(int_col) SELECT text_col FROM src WHERE 1=0` errors; it does not
+silently insert nothing). The assignability test is the **family-level subset of the per-value
+store coercion** ([constraints.md](constraints.md) §2) and must agree with it: an integer
+projection is assignable to an integer **or** decimal column (int→decimal widens), a decimal
+only to a decimal column (decimal→int is explicit-`CAST` only), a text projection to text/uuid/
+bytea (the documented text-adaptation, [types.md](types.md) §6), boolean→boolean, uuid→uuid,
+bytea→bytea, and a **NULL-typed** projection to **any** column (a `NOT NULL` target then traps
+`23502` per row, if any). A column the list omits is not type-checked — it takes its default
+else NULL.
+
+**Same two-phase / all-or-nothing pass as §12.** Once arity and assignability pass, every
+produced row runs through the identical validation the `VALUES` path uses: each value is
+type-coerced and range-checked in declaration order (`22003` overflow, `23502` NOT NULL,
+`22P02` malformed text→uuid/bytea), each storage key is computed and checked for a duplicate
+(`23505`, both against stored rows and earlier rows of this statement), and **only if every row
+passes** are any inserted. Synthetic rowids (a no-PK target) are allocated in phase two in the
+`SELECT`'s output-row order.
+
+**The source is fully materialized before any write — self-insert is well-defined.** The
+embedded `SELECT` runs to completion (its rows owned) before phase two mutates the store, so
+`INSERT INTO t SELECT … FROM t` reads the **pre-insert snapshot** of `t` and never feeds its own
+new rows back (no Halloween problem). A self-insert whose keys collide with the existing rows
+traps `23505` and stores nothing; a key-shifting self-insert (`INSERT INTO t SELECT id + 100, a
+FROM t`) doubles the table.
+
+**Cost = the embedded `SELECT`'s accrued cost** ([cost.md](cost.md)). The `SELECT` already
+charges `storage_row_read` per scanned row and `row_produced` per emitted row (plus expression
+`operator_eval`s); storing the rows is unmetered, like every `INSERT`. So the statement's
+deterministic, cross-core cost is exactly what the source query accrues — unlike the
+`VALUES` source's zero (§12). The output order the `SELECT` produces is itself deterministic and
+identical across cores (key-ordered scans, insertion-ordered grouping/distinct, left-deep
+joins — [encoding.md](encoding.md), CLAUDE.md §8), so the rowids assigned to
+a no-PK target are byte-identical across the three cores.

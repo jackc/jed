@@ -285,6 +285,16 @@ func (p *Parser) parseInsert() (*Insert, error) {
 		}
 	}
 
+	// The source is EITHER a SELECT (INSERT ... SELECT — §24) OR a VALUES list. `VALUES` and
+	// `SELECT` are disjoint leading keywords, so a peek decides without lookahead.
+	if p.peekKeyword() == "select" {
+		sel, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		return &Insert{Table: table, Columns: columns, Select: sel}, nil
+	}
+
 	if err := p.expectKeyword("values"); err != nil {
 		return nil, err
 	}
