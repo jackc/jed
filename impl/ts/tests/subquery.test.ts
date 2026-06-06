@@ -9,7 +9,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { execute } from "../src/lib.ts";
+import { EngineError, execute, executeParams, intValue } from "../src/lib.ts";
+import type { Value } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 function ab() {
@@ -99,8 +100,10 @@ test("subquery error codes and narrowings", () => {
     ["SELECT id FROM a WHERE k IN (SELECT id, k FROM b)", "42601"],
     // the >1-column check is plan-time, so it fires even over an empty subquery result
     ["SELECT (SELECT id, k FROM b WHERE id = 99) FROM one", "42601"],
-    // $N inside a subquery remains a 0A000 narrowing (§26)
-    ["SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", "0A000"],
+    // A $N inside a subquery is now allowed (see the params tests below); a $N with NO type
+    // context anywhere (here a bare select-list $1) stays uninferable -> 42P18 (PG instead
+    // defaults it to text, then `int = text` errors — a documented divergence, §26).
+    ["SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", "42P18"],
     // grouping / ordering a subquery BY an enclosing-query column -> 0A000 (degenerate)
     ["SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b GROUP BY a.k)", "0A000"],
     ["SELECT id FROM a WHERE EXISTS (SELECT k FROM b ORDER BY a.k)", "0A000"],
@@ -265,4 +268,49 @@ test("a correlated mutation subquery's cost is per row, not folded once", () => 
   const corr = execute(ab(), "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)").cost;
   const uncorr = execute(ab(), "DELETE FROM a WHERE k IN (SELECT k FROM b)").cost;
   assert.ok(corr > uncorr, `correlated ${corr} should exceed uncorrelated ${uncorr}`);
+});
+
+// ---- bind parameters inside a subquery (spec/design/grammar.md §26) -------------------------
+// A $N inside a subquery is allowed once it gets a type from an INNER context; inference is
+// statement-wide (one ParamTypes threaded through the whole plan tree), so the same $N may be used
+// inside and outside, and a correlated subquery may compare a $N against the outer row.
+
+function idsP(db: ReturnType<typeof ab>, sql: string, params: Value[]): bigint[] {
+  const o = executeParams(db, sql, params);
+  if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
+  return o.rows.map((r) => (r[0]!.kind === "int" ? r[0]!.int : -1n));
+}
+
+test("a $N inside a subquery, typed by an inner context", () => {
+  const db = ab();
+  // $1 typed by `b.k = $1` (inner) AND correlated to the outer a.k: survive iff some b.k equals
+  // both $1 and a.k. a.k ∈ {10,20,30}, b.k ∈ {20,30,40}; with $1=20 only a.id=2 survives.
+  assert.deepStrictEqual(
+    idsP(db, "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = $1 AND b.k = a.k) ORDER BY id", [intValue(20n)]),
+    [2n],
+  );
+  // $1 typed by `b.id = $1` inside an IN subquery (b.id=1 -> b.k=20 -> a.id=2).
+  assert.deepStrictEqual(
+    idsP(db, "SELECT id FROM a WHERE k IN (SELECT b.k FROM b WHERE b.id = $1) ORDER BY id", [intValue(1n)]),
+    [2n],
+  );
+  // The same $1 used OUTSIDE and INSIDE the subquery — one statement-wide inference.
+  assert.deepStrictEqual(
+    idsP(db, "SELECT id FROM a WHERE k > $1 AND EXISTS (SELECT 1 FROM b WHERE b.k = $1 + 10) ORDER BY id", [intValue(10n)]),
+    [2n, 3n],
+  );
+});
+
+test("a $N with no type context anywhere is 42P18", () => {
+  // A $N whose only position is a context-free select-list slot can't be typed -> 42P18, even with
+  // a value bound (the type, not the value, is missing). PG diverges (defaults to text).
+  const db = ab();
+  let code = "";
+  try {
+    executeParams(db, "SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", [intValue(10n)]);
+  } catch (e) {
+    if (e instanceof EngineError) code = e.code();
+    else throw e;
+  }
+  assert.strictEqual(code, "42P18");
 });

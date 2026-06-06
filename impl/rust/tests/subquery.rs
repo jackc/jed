@@ -8,7 +8,7 @@
 //! (21000 / 42601 / 0A000). See spec/design/grammar.md §26.
 
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Database, Outcome, execute, execute_params};
 
 fn db_with(stmts: &[&str]) -> Database {
     let mut db = Database::new();
@@ -299,10 +299,12 @@ fn subquery_error_codes() {
             "SELECT (SELECT id, k FROM b WHERE id = 99) FROM a WHERE id = 1",
             "42601",
         ),
-        // bind parameter inside a subquery -> 0A000 (an orthogonal narrowing, §26)
+        // A bind parameter inside a subquery is now allowed (see params tests below); a $N with NO
+        // type context anywhere (here a bare select-list $1) stays uninferable -> 42P18 (PG instead
+        // defaults it to text, then `int = text` errors — a documented divergence, §26).
         (
             "SELECT id FROM a WHERE k = (SELECT $1 FROM a LIMIT 1)",
-            "0A000",
+            "42P18",
         ),
         // grouping / ordering a subquery BY an enclosing-query column -> 0A000 (degenerate, §26)
         (
@@ -586,5 +588,73 @@ fn delete_correlated_subquery_cost_is_per_row() {
     assert!(
         corr > uncorr,
         "correlated {corr} should exceed uncorrelated {uncorr}"
+    );
+}
+
+// ---- bind parameters inside a subquery (spec/design/grammar.md §26) -------------------------
+// A $N inside a subquery is allowed once it gets a type from an INNER context; inference is
+// statement-wide (one ParamTypes threaded through the whole plan tree), so the same $N may be
+// used inside and outside, and a correlated subquery may compare a $N against the outer row.
+
+#[test]
+fn param_inside_subquery_inner_context() {
+    let mut db = ab();
+    let i = |v: i64| Value::Int(v);
+    let run = |db: &mut Database, sql: &str, p: &[Value]| -> Vec<i64> {
+        match execute_params(db, sql, p).unwrap() {
+            Outcome::Query { rows, .. } => rows
+                .into_iter()
+                .map(|r| match r[0] {
+                    Value::Int(n) => n,
+                    ref v => panic!("expected int, got {v:?}"),
+                })
+                .collect(),
+            _ => panic!("expected query"),
+        }
+    };
+    // $1 typed by `b.k = $1` (inner); also correlated to the outer a.k. a.k ∈ {10,20,30},
+    // b.k ∈ {20,30,40}; the row survives iff some b.k equals BOTH $1 and a.k.
+    assert_eq!(
+        run(
+            &mut db,
+            "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = $1 AND b.k = a.k) ORDER BY id",
+            &[i(20)]
+        ),
+        vec![2]
+    );
+    // $1 typed by `b.id = $1` inside an IN subquery.
+    assert_eq!(
+        run(
+            &mut db,
+            "SELECT id FROM a WHERE k IN (SELECT b.k FROM b WHERE b.id = $1) ORDER BY id",
+            &[i(1)]
+        ),
+        vec![2]
+    );
+    // The same $1 used both OUTSIDE and INSIDE the subquery — one statement-wide inference.
+    assert_eq!(
+        run(
+            &mut db,
+            "SELECT id FROM a WHERE k > $1 AND EXISTS (SELECT 1 FROM b WHERE b.k = $1 + 10) ORDER BY id",
+            &[i(10)]
+        ),
+        vec![2, 3]
+    );
+}
+
+#[test]
+fn param_inside_subquery_uninferable_is_42p18() {
+    // A $N whose ONLY position is a context-free select-list slot can't be typed -> 42P18, even
+    // with a value bound (the type, not the value, is what's missing). PG diverges (defaults text).
+    let mut db = ab();
+    assert_eq!(
+        execute_params(
+            &mut db,
+            "SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)",
+            &[Value::Int(10)]
+        )
+        .unwrap_err()
+        .code(),
+        "42P18"
     );
 }

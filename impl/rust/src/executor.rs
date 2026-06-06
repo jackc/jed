@@ -2339,78 +2339,6 @@ fn value_to_rexpr(v: &Value) -> RExpr {
     }
 }
 
-/// Collect a query's direct-clause expressions (select list / WHERE / HAVING / each JOIN ON) for
-/// the §26 correlation scan — NOT descending into nested subqueries (those are folded separately).
-/// A set operation contributes both operands' clauses.
-fn query_clause_exprs<'a>(q: &'a QueryExpr, out: &mut Vec<&'a Expr>) {
-    match q {
-        QueryExpr::Select(s) => select_clause_exprs(s, out),
-        QueryExpr::SetOp(so) => {
-            query_clause_exprs(&so.lhs, out);
-            query_clause_exprs(&so.rhs, out);
-        }
-    }
-}
-
-fn select_clause_exprs<'a>(s: &'a Select, out: &mut Vec<&'a Expr>) {
-    if let SelectItems::Items(items) = &s.items {
-        for it in items {
-            out.push(&it.expr);
-        }
-    }
-    if let Some(f) = &s.filter {
-        out.push(f);
-    }
-    if let Some(h) = &s.having {
-        out.push(h);
-    }
-    for j in &s.joins {
-        if let Some(on) = &j.on {
-            out.push(on);
-        }
-    }
-}
-
-/// Whether an expression tree contains a bind parameter anywhere — INCLUDING inside nested
-/// subqueries (a `$N` at any depth inside a subquery is rejected, §26).
-fn expr_has_param(e: &Expr) -> bool {
-    match e {
-        Expr::Param(_) => true,
-        Expr::ScalarSubquery(q) | Expr::Exists(q) => query_has_param(q),
-        Expr::InSubquery { lhs, query, .. } => expr_has_param(lhs) || query_has_param(query),
-        Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::Literal(_) => false,
-        Expr::Cast { inner, .. } => expr_has_param(inner),
-        Expr::Unary { operand, .. } => expr_has_param(operand),
-        Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
-            expr_has_param(lhs) || expr_has_param(rhs)
-        }
-        Expr::IsNull { operand, .. } => expr_has_param(operand),
-        Expr::In { lhs, list, .. } => expr_has_param(lhs) || list.iter().any(expr_has_param),
-        Expr::Between { lhs, lo, hi, .. } => {
-            expr_has_param(lhs) || expr_has_param(lo) || expr_has_param(hi)
-        }
-        Expr::Like { lhs, rhs, .. } => expr_has_param(lhs) || expr_has_param(rhs),
-        Expr::Case {
-            operand,
-            whens,
-            els,
-        } => {
-            operand.as_deref().is_some_and(expr_has_param)
-                || whens
-                    .iter()
-                    .any(|(c, r)| expr_has_param(c) || expr_has_param(r))
-                || els.as_deref().is_some_and(expr_has_param)
-        }
-        Expr::FuncCall { args, .. } => args.iter().any(expr_has_param),
-    }
-}
-
-fn query_has_param(q: &QueryExpr) -> bool {
-    let mut exprs: Vec<&Expr> = Vec::new();
-    query_clause_exprs(q, &mut exprs);
-    exprs.iter().any(|e| expr_has_param(e))
-}
-
 /// Whether a resolved plan references any scope STRICTLY OUTSIDE itself — i.e. it is correlated
 /// (spec/design/grammar.md §26). `depth` is how many nested-subquery frames we have descended
 /// INTO this plan (0 = the plan's own clauses); an `OuterColumn { level }` points above this
@@ -3009,21 +2937,19 @@ fn resolve_column_ref(
 }
 
 /// Plan a subquery operand against the scope chain (spec/design/grammar.md §26). Rejects a
-/// non-SELECT context (UPDATE/DELETE/INSERT — `allow_subquery=false`) and any `$N` inside (an
-/// orthogonal parameter-inference narrowing), both 0A000. The inner query is resolved ONCE,
-/// with `scope` as its parent, so correlated references become `OuterColumn` and errors fire
-/// even over an empty outer.
+/// non-SELECT context (UPDATE/DELETE/INSERT — `allow_subquery=false`) with 0A000. A `$N` inside
+/// the subquery is allowed: the shared `params` table is threaded into the inner plan, so a
+/// parameter typed by an inner context (`WHERE inner.col = $1`) infers statement-wide and is
+/// unified with any outer use of the same `$N`. A parameter with **no** type context anywhere
+/// stays uninferred and `finalize` raises 42P18 (a documented divergence from PostgreSQL, which
+/// defaults such a `$N` to text — grammar.md §26). The inner query is resolved ONCE, with `scope`
+/// as its parent, so correlated references become `OuterColumn` and errors fire even over an
+/// empty outer.
 fn plan_subquery(scope: &Scope, inner: &QueryExpr, params: &mut ParamTypes) -> Result<QueryPlan> {
     if !scope.allow_subquery {
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
             "subqueries are only supported in a SELECT statement",
-        ));
-    }
-    if query_has_param(inner) {
-        return Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            "bind parameters inside a subquery are not supported yet",
         ));
     }
     scope.catalog.plan_query(inner, Some(scope), params)

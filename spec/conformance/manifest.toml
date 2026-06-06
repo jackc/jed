@@ -166,19 +166,19 @@ description = "EXCEPT / EXCEPT ALL — rows in the left operand not in the right
 
 [[capability]]
 id = "query.subquery_scalar"
-description = "Uncorrelated scalar subquery (SELECT ...) in expression position — yields the single row/single column value; 0 rows -> typed NULL, >1 row -> 21000, >1 column -> 42601; executed once at plan time and folded to a constant carrying its output type (so it promotes/compares like that type); a correlated reference or a bind parameter inside -> 0A000 (spec/design/grammar.md §26)"
+description = "Uncorrelated scalar subquery (SELECT ...) in expression position — yields the single row/single column value; 0 rows -> typed NULL, >1 row -> 21000, >1 column -> 42601; executed once at plan time and folded to a constant carrying its output type (so it promotes/compares like that type); correlation is layered by query.subquery_correlated; a bind parameter inside is allowed, typed by its inner context (uninferable -> 42P18) (spec/design/grammar.md §26)"
 
 [[capability]]
 id = "query.subquery_in"
-description = "x [NOT] IN (SELECT ...) — uncorrelated membership over the subquery's single column; folds to the literal-IN OR-chain so the three-valued NULL logic is inherited (a NULL in the result with no match -> NULL); an empty result -> FALSE (IN) / TRUE (NOT IN) regardless of x; >1 column -> 42601; correlated / param inside -> 0A000 (spec/design/grammar.md §26)"
+description = "x [NOT] IN (SELECT ...) — uncorrelated membership over the subquery's single column; folds to the literal-IN OR-chain so the three-valued NULL logic is inherited (a NULL in the result with no match -> NULL); an empty result -> FALSE (IN) / TRUE (NOT IN) regardless of x; >1 column -> 42601; correlation via query.subquery_correlated; a param inside is typed by its inner context (uninferable -> 42P18) (spec/design/grammar.md §26)"
 
 [[capability]]
 id = "query.subquery_exists"
-description = "[NOT] EXISTS (SELECT ...) — uncorrelated existence test; boolean (rows>0) XOR negated, the select list is ignored entirely (even SELECT * / SELECT 1,2,3), never NULL; correlated / param inside -> 0A000 (spec/design/grammar.md §26)"
+description = "[NOT] EXISTS (SELECT ...) — uncorrelated existence test; boolean (rows>0) XOR negated, the select list is ignored entirely (even SELECT * / SELECT 1,2,3), never NULL; correlation via query.subquery_correlated; a param inside is typed by its inner context (uninferable -> 42P18) (spec/design/grammar.md §26)"
 
 [[capability]]
 id = "query.subquery_correlated"
-description = "Correlated scalar / IN / EXISTS — the subquery references a column of an enclosing query, resolved via a scope chain (inner FROM first, then outward; nearest scope shadows). Planned once (type/structure errors raised even over an empty outer) and re-executed per outer row. Any correlation depth (parent, grandparent, ...); outer refs allowed inside an aggregate arg/select-list/HAVING as a per-row constant. Narrowings: a $N inside a subquery, and a correlated GROUP BY / ORDER BY key, are 0A000 (spec/design/grammar.md §26)"
+description = "Correlated scalar / IN / EXISTS — the subquery references a column of an enclosing query, resolved via a scope chain (inner FROM first, then outward; nearest scope shadows). Planned once (type/structure errors raised even over an empty outer) and re-executed per outer row. Any correlation depth (parent, grandparent, ...); outer refs allowed inside an aggregate arg/select-list/HAVING as a per-row constant. A $N inside is allowed, typed by an inner context (uninferable -> 42P18). Narrowing: a correlated GROUP BY / ORDER BY key is 0A000 (degenerate) (spec/design/grammar.md §26)"
 
 [[capability]]
 id = "types.int16"
@@ -469,7 +469,7 @@ capabilities = [
 
 [[profile]]
 id = "subqueries"
-title = "having + joins + subqueries: scalar (SELECT ...), x [NOT] IN (SELECT ...), [NOT] EXISTS (SELECT ...), both uncorrelated (folded once at plan time) and correlated (planned once, re-executed per outer row, any depth); $N-inside / correlated GROUP BY|ORDER BY key -> 0A000 (Phase 4, spec/design/grammar.md §26)"
+title = "having + joins + subqueries: scalar (SELECT ...), x [NOT] IN (SELECT ...), [NOT] EXISTS (SELECT ...), both uncorrelated (folded once at plan time) and correlated (planned once, re-executed per outer row, any depth); a $N inside is typed by an inner context (uninferable -> 42P18); a correlated GROUP BY|ORDER BY key -> 0A000 (Phase 4, spec/design/grammar.md §26)"
 includes = "having"
 capabilities = [
   "query.join_inner",

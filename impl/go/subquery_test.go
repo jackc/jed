@@ -145,8 +145,10 @@ func TestSubqueryErrorCodes(t *testing.T) {
 		{"SELECT id FROM a WHERE k IN (SELECT id, k FROM b)", "42601"},
 		// the >1-column check is plan-time, so it fires even over an empty subquery result
 		{"SELECT (SELECT id, k FROM b WHERE id = 99) FROM one", "42601"},
-		// $N inside a subquery remains a 0A000 narrowing (§26)
-		{"SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", "0A000"},
+		// A $N inside a subquery is now allowed (see the params tests below); a $N with NO type
+		// context anywhere (here a bare select-list $1) stays uninferable -> 42P18 (PG instead
+		// defaults it to text, then `int = text` errors — a documented divergence, §26).
+		{"SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", "42P18"},
 		// grouping / ordering a subquery BY an enclosing-query column -> 0A000 (degenerate)
 		{"SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b GROUP BY a.k)", "0A000"},
 		{"SELECT id FROM a WHERE EXISTS (SELECT k FROM b ORDER BY a.k)", "0A000"},
@@ -331,5 +333,36 @@ func TestDeleteCorrelatedSubqueryCostIsPerRow(t *testing.T) {
 	uncorr, _ := Execute(subqueryAB(t), "DELETE FROM a WHERE k IN (SELECT k FROM b)")
 	if corr.Cost <= uncorr.Cost {
 		t.Errorf("correlated cost %d should exceed uncorrelated %d", corr.Cost, uncorr.Cost)
+	}
+}
+
+// ---- bind parameters inside a subquery (spec/design/grammar.md §26) -------------------------
+// A $N inside a subquery is allowed once it gets a type from an INNER context; inference is
+// statement-wide (one paramTypes threaded through the whole plan tree), so the same $N may be used
+// inside and outside, and a correlated subquery may compare a $N against the outer row.
+
+func TestParamInsideSubqueryInnerContext(t *testing.T) {
+	db := subqueryAB(t)
+	// $1 typed by `b.k = $1` (inner) AND correlated to the outer a.k: survive iff some b.k equals
+	// both $1 and a.k. a.k ∈ {10,20,30}, b.k ∈ {20,30,40}; with $1=20 only a.id=2 survives.
+	if got := firstInts(queryRows(t, db, "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = $1 AND b.k = a.k) ORDER BY id", IntValue(20))); !eqInts(got, 2) {
+		t.Errorf("inner EXISTS param got %v want [2]", got)
+	}
+	// $1 typed by `b.id = $1` inside an IN subquery (b.id=1 -> b.k=20 -> a.id=2).
+	if got := firstInts(queryRows(t, db, "SELECT id FROM a WHERE k IN (SELECT b.k FROM b WHERE b.id = $1) ORDER BY id", IntValue(1))); !eqInts(got, 2) {
+		t.Errorf("inner IN param got %v want [2]", got)
+	}
+	// The same $1 used OUTSIDE and INSIDE — one statement-wide inference.
+	if got := firstInts(queryRows(t, db, "SELECT id FROM a WHERE k > $1 AND EXISTS (SELECT 1 FROM b WHERE b.k = $1 + 10) ORDER BY id", IntValue(10))); !eqInts(got, 2, 3) {
+		t.Errorf("shared param got %v want [2 3]", got)
+	}
+}
+
+func TestParamInsideSubqueryUninferableIs42P18(t *testing.T) {
+	// A $N whose only position is a context-free select-list slot can't be typed -> 42P18, even
+	// with a value bound (the type, not the value, is missing). PG diverges (defaults to text).
+	db := subqueryAB(t)
+	if c := paramErrCode(t, db, "SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", IntValue(10)); c != "42P18" {
+		t.Errorf("uninferable subquery param got %s want 42P18", c)
 	}
 }

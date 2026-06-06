@@ -500,9 +500,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         evaluates; deterministic + byte-identical cross-core (pinned `# cost:` in
         `spec/conformance/suites/subquery/correlated.test`, 65/0/0 all cores). New capability
         `query.subquery_correlated`. Outer refs work in WHERE / HAVING / select-list / aggregate args /
-        a nested JOIN `ON`. **Remaining narrowings (→ `0A000`):** a **`$N` inside** a subquery
-        (orthogonal param inference); a **correlated `GROUP BY` / `ORDER BY` key** (degenerate).
-        (Subqueries were **SELECT-only** here; that is now lifted — see UPDATE/DELETE below.)
+        a nested JOIN `ON`. **Remaining narrowing (→ `0A000`):** a **correlated `GROUP BY` /
+        `ORDER BY` key** (degenerate). (Two narrowings here are now lifted: subqueries were
+        **SELECT-only** — see UPDATE/DELETE below — and a **`$N` inside** was rejected — see $N below.)
         A pure-outer aggregate arg (`sum(outer.col)`) is a documented
         divergence (jed sums at the inner level; PG binds it to the outer query — grammar.md §26).
         Semantics verified against the live `postgres:18` oracle. _(was: L)_
@@ -520,10 +520,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `spec/conformance/suites/subquery/mutation.test` (66/0/0 all cores). No new capability (reuses
         `query.subquery_*` + `dml.delete`/`dml.update`). Semantics verified against the live `postgres:18`
         oracle. _(was: part of M)_
-  - [ ] **Subqueries — remaining seams:** `$N` inside a subquery (statement-wide param inference
-        across the boundary); subqueries in an **`INSERT ... VALUES`** slot (blocked on VALUES holding a
-        general expression — a separate narrowing; `INSERT ... SELECT` already admits them); **derived
-        tables** (`FROM (SELECT …) AS t`); **`ANY` / `ALL`** and row-valued subqueries. _(size: M)_
+  - [x] **`$N` inside a subquery** — done & committed across Rust/Go/TS. The `plan_subquery` guard
+        that rejected any bind parameter inside a subquery (`0A000`) is gone — the original blocker
+        (per-`run_select` param inference) was already removed by the correlated slice, which threads
+        **one** `ParamTypes` through the whole plan tree. So a `$N` typed by an **inner** context
+        (`WHERE inner.col = $1`, `… IN (SELECT … WHERE x = $1)`) infers statement-wide, the **same**
+        `$N` can appear inside and outside the subquery (the uses unify), and a correlated subquery may
+        compare a `$N` against the outer row. The lone gap: a `$N` whose **only** type context is the
+        *enclosing* query (`k = (SELECT $1 …)`) would need **bidirectional** inference into the
+        subquery — jed doesn't, so it stays uninferred and `finalize` raises **`42P18`**. Documented
+        divergence (PG defaults such a `$N` to `text` → `42883`); jed's `42P18` names the real cause
+        and fits its strict, no-guessing type system (CLAUDE.md §4). Dead `expr_has_param`/
+        `query_has_param`/clause-walk helpers removed in all three cores. No new capability; corpus
+        `subquery/errors.test` now pins the `42P18` (uninferable) + `42601` (inner-typed, no value)
+        cases. Semantics verified against the live `postgres:18` oracle. _(was: part of M)_
+  - [ ] **Subqueries — remaining seams:** subqueries in an **`INSERT ... VALUES`** slot (blocked on
+        VALUES holding a general expression — a separate narrowing; `INSERT ... SELECT` already admits
+        them); **derived tables** (`FROM (SELECT …) AS t`); **`ANY` / `ALL`** and row-valued subqueries.
+        _(size: M)_
 - [x] **Set operations** — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` — done & committed across
       Rust/Go/TS. The top-level query grew from a single `select` to a **query expression**
       (`query_expr ::= set_expr order_by? limit_offset?`): a two-level precedence tree

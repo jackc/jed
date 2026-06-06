@@ -1212,71 +1212,6 @@ function valueToRExpr(v: Value): RExpr {
   }
 }
 
-// queryClauseExprs collects a query's direct-clause expressions (select list / WHERE / HAVING /
-// each JOIN ON) for the §26 correlation scan — NOT descending into nested subqueries. A set
-// operation contributes both operands' clauses.
-function queryClauseExprs(q: QueryExpr): Expr[] {
-  const out: Expr[] = [];
-  collectQueryClauseExprs(q, out);
-  return out;
-}
-
-function collectQueryClauseExprs(q: QueryExpr, out: Expr[]): void {
-  if (q.kind === "select") {
-    if (q.items.kind === "list") for (const it of q.items.items) out.push(it.expr);
-    if (q.filter !== null) out.push(q.filter);
-    if (q.having !== null) out.push(q.having);
-    for (const j of q.joins) if (j.on !== null) out.push(j.on);
-    return;
-  }
-  collectQueryClauseExprs(q.lhs, out);
-  collectQueryClauseExprs(q.rhs, out);
-}
-
-// exprHasParam reports whether an expression tree contains a bind parameter anywhere — INCLUDING
-// inside nested subqueries (a $N at any depth inside a subquery is rejected, §26).
-function exprHasParam(e: Expr): boolean {
-  switch (e.kind) {
-    case "param":
-      return true;
-    case "scalarSubquery":
-    case "exists":
-      return queryHasParam(e.query);
-    case "inSubquery":
-      return exprHasParam(e.lhs) || queryHasParam(e.query);
-    case "cast":
-      return exprHasParam(e.inner);
-    case "unary":
-      return exprHasParam(e.operand);
-    case "binary":
-    case "isDistinct":
-      return exprHasParam(e.lhs) || exprHasParam(e.rhs);
-    case "isNull":
-      return exprHasParam(e.operand);
-    case "in":
-      return exprHasParam(e.lhs) || e.list.some(exprHasParam);
-    case "between":
-      return exprHasParam(e.lhs) || exprHasParam(e.lo) || exprHasParam(e.hi);
-    case "like":
-      return exprHasParam(e.lhs) || exprHasParam(e.rhs);
-    case "case":
-      return (
-        (e.operand !== null && exprHasParam(e.operand)) ||
-        e.whens.some((w) => exprHasParam(w.cond) || exprHasParam(w.result)) ||
-        (e.els !== null && exprHasParam(e.els))
-      );
-    case "funcCall":
-      return e.args.some(exprHasParam);
-    default:
-      return false;
-  }
-}
-
-function queryHasParam(q: QueryExpr): boolean {
-  return queryClauseExprs(q).some(exprHasParam);
-}
-
-
 // distinctRowKey encodes a projected row into a collision-free string key for DISTINCT
 // dedup. Each field carries a type tag (n/i/b) and a payload, joined by a separator no
 // field can contain, so e.g. (1,23) and (12,3) do not collide (spec/design/grammar.md §11).
@@ -2108,15 +2043,16 @@ function resolveColumnRef(
 }
 
 // planSubquery plans a subquery operand against the scope chain (§26). Rejects a non-SELECT context
-// (UPDATE/DELETE/INSERT — allowSubquery false) and any $N inside (an orthogonal parameter-inference
-// narrowing), both 0A000. The inner query is resolved ONCE, with `scope` as its parent, so
-// correlated references become outerColumn and errors fire even over an empty outer.
+// (UPDATE/DELETE/INSERT — allowSubquery false) with 0A000. A $N inside the subquery is allowed: the
+// shared params table is threaded into the inner plan, so a parameter typed by an inner context
+// (WHERE inner.col = $1) infers statement-wide and unifies with any outer use of the same $N. A
+// parameter with NO type context anywhere stays uninferred and finalize raises 42P18 (a documented
+// divergence from PostgreSQL, which defaults such a $N to text — grammar.md §26). The inner query is
+// resolved ONCE, with `scope` as its parent, so correlated references become outerColumn and errors
+// fire even over an empty outer.
 function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): QueryPlan {
   if (!scope.allowSubquery) {
     throw engineError("feature_not_supported", "subqueries are only supported in a SELECT statement");
-  }
-  if (queryHasParam(inner)) {
-    throw engineError("feature_not_supported", "bind parameters inside a subquery are not supported yet");
   }
   return scope.catalog.planQuery(inner, scope, params);
 }

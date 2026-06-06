@@ -1095,11 +1095,21 @@ the full chain visible at that level).
   outer produces zero rows) and **re-executed per outer row** that reaches its expression node,
   reading the enclosing-row values its plan references.
 
+**Bind parameters inside a subquery** are **allowed**. Type inference is statement-wide — one
+parameter-type table threads through the entire plan tree — so a `$N` typed by an **inner** context
+(`WHERE inner.col = $1`, `inner.id IN (SELECT … WHERE x = $1)`) infers correctly, and the **same**
+`$N` may appear both inside and outside the subquery (the uses unify). A correlated subquery may
+also compare a `$N` against the outer row. The one gap is a `$N` whose **only** type context is the
+*enclosing* query — e.g. `k = (SELECT $1 FROM t LIMIT 1)`, where `$1`'s type would have to flow
+*into* the subquery from the outer `k = …`. jed does not do that **bidirectional** inference, so the
+parameter stays uninferred and `finalize` raises **`42P18`** (indeterminate parameter type). This is
+a **documented divergence**: PostgreSQL instead defaults such a `$N` to `text`, then fails the outer
+comparison (`operator does not exist: integer = text`, `42883`). Both error; jed's `42P18` names the
+real cause (the type can't be determined) and is consistent with its strict, no-guessing type system
+(CLAUDE.md §4) — the overriding reason not to mimic PG's `text` default here.
+
 **Deferred narrowings (each relaxable later)**
 
-- **Bind parameters inside a subquery** — a `$N` anywhere inside the subquery is **`0A000`**
-  (an orthogonal parameter-inference concern: a `$N` whose only type context is the enclosing
-  comparison would need bidirectional inference into the subquery, not yet supported).
 - **A correlated reference as a `GROUP BY` / `ORDER BY` key** — grouping or ordering a subquery
   *by an enclosing-query column* (a per-outer-row constant — degenerate) is **`0A000`**; the
   key machinery is flat local indices. WHERE / HAVING / `ON` / select-list correlation is fully

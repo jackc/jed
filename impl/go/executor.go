@@ -1779,103 +1779,6 @@ func valueToRExpr(v Value) *rExpr {
 	}
 }
 
-// queryClauseExprs collects a query's direct-clause expressions (select list / WHERE / HAVING /
-// each JOIN ON) for the §26 correlation scan — NOT descending into nested subqueries (those are
-// folded separately). A set operation contributes both operands' clauses.
-func queryClauseExprs(q QueryExpr) []*Expr {
-	var out []*Expr
-	collectQueryClauseExprs(q, &out)
-	return out
-}
-
-func collectQueryClauseExprs(q QueryExpr, out *[]*Expr) {
-	if q.Select != nil {
-		s := q.Select
-		for i := range s.Items.Items {
-			*out = append(*out, &s.Items.Items[i].Expr)
-		}
-		if s.Filter != nil {
-			*out = append(*out, s.Filter)
-		}
-		if s.Having != nil {
-			*out = append(*out, s.Having)
-		}
-		for k := range s.Joins {
-			if s.Joins[k].On != nil {
-				*out = append(*out, s.Joins[k].On)
-			}
-		}
-		return
-	}
-	collectQueryClauseExprs(q.SetOp.Lhs, out)
-	collectQueryClauseExprs(q.SetOp.Rhs, out)
-}
-
-// exprHasParam reports whether an expression tree contains a bind parameter anywhere — INCLUDING
-// inside nested subqueries (a $N at any depth inside a subquery is rejected, §26).
-func exprHasParam(e Expr) bool {
-	switch e.Kind {
-	case ExprParam:
-		return true
-	case ExprScalarSubquery, ExprExists:
-		return queryHasParam(*e.Subquery)
-	case ExprInSubquery:
-		return exprHasParam(e.InSubquery.Lhs) || queryHasParam(e.InSubquery.Query)
-	case ExprCast:
-		return exprHasParam(e.Cast.Inner)
-	case ExprUnary:
-		return exprHasParam(e.Unary.Operand)
-	case ExprBinary:
-		return exprHasParam(e.Binary.Lhs) || exprHasParam(e.Binary.Rhs)
-	case ExprIsNull:
-		return exprHasParam(e.IsNullOf.Operand)
-	case ExprIsDistinct:
-		return exprHasParam(e.IsDistinct.Lhs) || exprHasParam(e.IsDistinct.Rhs)
-	case ExprIn:
-		if exprHasParam(e.In.Lhs) {
-			return true
-		}
-		for _, elem := range e.In.List {
-			if exprHasParam(elem) {
-				return true
-			}
-		}
-		return false
-	case ExprBetween:
-		return exprHasParam(e.Between.Lhs) || exprHasParam(e.Between.Lo) || exprHasParam(e.Between.Hi)
-	case ExprLike:
-		return exprHasParam(e.Like.Lhs) || exprHasParam(e.Like.Rhs)
-	case ExprCase:
-		if e.Case.Operand != nil && exprHasParam(*e.Case.Operand) {
-			return true
-		}
-		for _, w := range e.Case.Whens {
-			if exprHasParam(w.Cond) || exprHasParam(w.Result) {
-				return true
-			}
-		}
-		return e.Case.Els != nil && exprHasParam(*e.Case.Els)
-	case ExprFuncCall:
-		for _, a := range e.FuncCall.Args {
-			if exprHasParam(*a) {
-				return true
-			}
-		}
-		return false
-	default:
-		return false
-	}
-}
-
-func queryHasParam(q QueryExpr) bool {
-	for _, e := range queryClauseExprs(q) {
-		if exprHasParam(*e) {
-			return true
-		}
-	}
-	return false
-}
-
 // distinctRowKey encodes a projected row into a collision-free string key for DISTINCT
 // dedup. Each field carries a type tag (n/i/b) and a payload, joined by a separator that
 // no field can contain, so e.g. (1,23) and (12,3) do not collide (spec/design/grammar.md
@@ -3033,15 +2936,16 @@ func resolveColumnRef(s *scope, ag *aggCtx, r resolved, name string) (*rExpr, re
 }
 
 // planSubquery plans a subquery operand against the scope chain (§26). Rejects a non-SELECT
-// context (UPDATE/DELETE/INSERT — allowSubquery=false) and any $N inside (an orthogonal
-// parameter-inference narrowing), both 0A000. The inner query is resolved ONCE, with `s` as its
-// parent, so correlated references become reOuterColumn and errors fire even over an empty outer.
+// context (UPDATE/DELETE/INSERT — allowSubquery=false) with 0A000. A $N inside the subquery is
+// allowed: the shared params table is threaded into the inner plan, so a parameter typed by an
+// inner context (WHERE inner.col = $1) infers statement-wide and unifies with any outer use of the
+// same $N. A parameter with NO type context anywhere stays uninferred and finalize raises 42P18 (a
+// documented divergence from PostgreSQL, which defaults such a $N to text — grammar.md §26). The
+// inner query is resolved ONCE, with `s` as its parent, so correlated references become
+// reOuterColumn and errors fire even over an empty outer.
 func planSubquery(s *scope, inner QueryExpr, params *paramTypes) (queryPlan, error) {
 	if !s.allowSubquery {
 		return queryPlan{}, NewError(FeatureNotSupported, "subqueries are only supported in a SELECT statement")
-	}
-	if queryHasParam(inner) {
-		return queryPlan{}, NewError(FeatureNotSupported, "bind parameters inside a subquery are not supported yet")
 	}
 	return s.catalog.planQuery(inner, s, params)
 }
