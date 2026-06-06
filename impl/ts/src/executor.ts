@@ -2190,7 +2190,7 @@ function rejectParamsForDDL(params: Value[]): void {
 // stmtIsWrite reports whether a statement mutates the database (so autocommit must capture +
 // durably persist it). Reads (SELECT, set operations) run with no transaction (transactions.md
 // §4.1).
-function stmtIsWrite(stmt: Statement): boolean {
+export function stmtIsWrite(stmt: Statement): boolean {
   return (
     stmt.kind === "createTable" ||
     stmt.kind === "dropTable" ||

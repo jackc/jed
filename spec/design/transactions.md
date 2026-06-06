@@ -266,17 +266,26 @@ value on rollback); jed has no such observable to preserve. Any future transacti
 (e.g. an `IDENTITY`/sequence, if ever added) would have to decide burn-vs-restore explicitly;
 the internal rowid restores.
 
-## 8. The reader-liveness watermark (forward hook for Phase 6)
+## 8. The reader-liveness watermark (realized in the shared handle; forward hook for Phase 6)
 
-Every `Snapshot` carries its `txid`. The handle tracks the set of **live** snapshots
-(`committed`, any open write tx's `working`, and any held by read transactions / `Rows`
-cursors) and can report the **oldest live txid**. In Phase 5 this watermark does no work —
-memory reclamation is the language's job (§3). It is built now because **Phase 6's page
-free-list needs it**: a page freed at commit `T` may be reused only once `oldest_live_txid > T`,
-otherwise a still-open reader holding an older snapshot would observe a recycled page. The
-explicit read transactions of §4.3 are precisely the long-lived readers this guards. Tracking
-liveness in Phase 5 (where it is nearly free) is what keeps Phase 6 reclamation safe without a
-retrofit — the single tightest coupling between the two phases.
+Every `Snapshot` carries its `txid` (its **version**). The **oldest live version** is the
+minimum version any still-open reader has pinned, or the committed version when no reader is
+live. In Phase 5 this watermark does no work — memory reclamation is the language's job (§3). It
+is built now because **Phase 6's page free-list needs it**: a page freed at commit `T` may be
+reused only once `oldest_live_txid > T`, otherwise a still-open reader holding an older snapshot
+would observe a recycled page. Tracking liveness now (where it is nearly free) is what keeps
+Phase 6 reclamation safe without a retrofit — the single tightest coupling between the two phases.
+
+**P5.3b realizes the watermark in the shared handle (§10).** A single-handle `Database` has only
+one live snapshot at a time (`committed`, or an open tx's `working`), so its `oldest_live_txid`
+is trivially the committed version. The interesting case is the **shared handle**: it owns a
+**live-reader registry** — a multiset of pinned versions (`version → refcount`, several readers
+may pin the same version). A read handle, on open, pins the committed snapshot and registers its
+version; on close/drop it deregisters. `oldest_live_txid` is the registry's minimum, or the
+committed version when the registry is empty. The minimum is order-independent, so no hash-map
+iteration order leaks into it (CLAUDE.md §8). This is the exact structure Phase 6's free-list
+will consult before reusing a page; the per-core tests already assert it tracks pinned readers
+(a reader pinning an old version holds the watermark back; closing it lets the watermark advance).
 
 ## 9. Durability: the `synchronous` setting, this slice vs. Phase 6
 
@@ -313,6 +322,36 @@ refines CLAUDE.md §9's "writes … land durably on the SSD at commit": durably 
   takes the **exclusive write lock** at `begin`/`BEGIN` and holds it until commit/rollback, so
   at most one writer exists at a time (§3). Concurrency between cores' hosts is the host's
   problem (CLAUDE.md §3), now mediated by snapshots + this one lock.
+
+- **The shared handle (P5.3b) makes that real, not just describable.** The single-handle
+  `Database` is fast and simple but **not safe to share across threads**: its reads borrow the
+  handle while a write mutates it, so one handle cannot serve a reader thread and a writer thread
+  at once. Real parallelism — readers running *concurrently with* an in-flight writer — needs the
+  committed state behind a **thread-safe cell decoupled from any one thread's handle**. So each
+  core adds a **shared handle** with exactly the §3 shape:
+  - a **committed cell** holding the published snapshot — a reader pins it with a single cheap
+    read (an `Arc` clone under a momentary read lock in Rust; a lock-free `atomic.Pointer` load in
+    Go), a writer publishes a new one with a single swap (the §3 short commit window);
+  - a **single-writer gate** — a writer **blocks** until the prior writer ends (a `Mutex`/condvar
+    in Rust, a held `sync.Mutex` in Go), so at most one writer is ever open;
+  - the **live-reader registry** of §8.
+  A read handle pins the committed snapshot, registers its version, serves reads from that
+  immutable snapshot (a write through it is `25006`), and deregisters on drop/close. A write
+  handle captures the committed snapshot as a private working set (a `Database` with an open READ
+  WRITE block) and, on commit, publishes it at the next version. Isolation is free from the
+  persistent stores (§3): a pinned snapshot shares structure with later versions and is never
+  mutated, so pinning is a pointer copy, not a deep copy.
+
+- **Per-core reality differs, and that is expected (CLAUDE.md §2 — best experience per language,
+  not uniform parallelism).** Rust and Go get **true OS-thread parallelism**: reader threads run
+  on cores while a writer commits. The TS core has **no shared-memory threads for live objects**,
+  so it offers the *other* half of the model — snapshot **isolation** across async interleavings
+  (a pinned reader sees one stable version even as a writer commits between its calls) — via the
+  same machinery, minus the parallelism (and a second open writer is **rejected** rather than
+  blocked, since JS cannot block its one thread). This slice's shared handle is **in-memory**;
+  file-backed sharing reuses the same publish point plus the §9 persist chokepoint and is wired
+  when it lands (the concurrency mechanism and durability are orthogonal axes).
+
 - **Testing splits along the determinism line:**
   - **Logical transaction semantics → the shared conformance corpus.** A
     `BEGIN / INSERT / ROLLBACK / SELECT-shows-nothing` sequence, abort-poisoning (`25P02`), a
@@ -320,10 +359,12 @@ refines CLAUDE.md §9's "writes … land durably on the SSD at commit": durably 
     they are ordinary corpus entries (a `transactions` profile + `txn.*` capabilities in
     [../conformance/manifest.toml](../conformance/manifest.toml)).
   - **The concurrency mechanism → per-core tests.** "A reader does not block during a concurrent
-    commit," "the writer is exclusive," "a cursor opened before a commit still yields the
-    pre-commit rows" depend on thread scheduling and are **not** deterministic, so they live in
-    each core's own test suite — exactly as the `$N` bind parameters are tested per-core, not in
-    the corpus ([conformance.md](conformance.md) §1.2).
+    commit," "the writer is exclusive," "a reader pinned before a commit still yields the
+    pre-commit rows," and "the watermark tracks pinned readers" depend on scheduling (Rust/Go) or
+    interleaving (TS) and are **not** cross-core deterministic, so they live in each core's own
+    test suite — Rust/Go fan out real threads (Go under `-race`), TS asserts isolation across
+    interleaved calls — exactly as the `$N` bind parameters are tested per-core, not in the
+    corpus ([conformance.md](conformance.md) §1.2).
 
 ## 11. Deferred / explicitly not foreclosed
 

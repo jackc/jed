@@ -162,3 +162,4 @@ export type { Statement } from "./ast.ts";
 export { PreparedStatement, Rows, Transaction, prepare, query, querySql, begin, view, update } from "./api.ts";
 export { create, open, commit, rollback, close } from "./file.ts";
 export type { DatabaseOptions } from "./file.ts";
+export { ReadHandle, SharedDb, WriteHandle } from "./shared.ts";

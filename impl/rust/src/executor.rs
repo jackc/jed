@@ -183,6 +183,20 @@ impl Database {
         }
     }
 
+    /// Build an in-memory handle whose committed state **is** `snap` (no file backing). The
+    /// thread-safe shared layer ([`crate::shared`]) uses this to run the unchanged executor against
+    /// a snapshot it has pinned from the shared committed cell: a read handle keeps one of these
+    /// with no open transaction (reads hit `committed` = the pinned snapshot); a write handle keeps
+    /// one with an open READ WRITE block and publishes its working set back to the shared cell.
+    pub(crate) fn from_snapshot(snap: Snapshot) -> Self {
+        Database {
+            committed: snap,
+            tx: None,
+            path: None,
+            page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+
     /// The snapshot a read sees: the open transaction's `working` (read-your-writes for a
     /// writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
     fn read_snap(&self) -> &Snapshot {
@@ -220,6 +234,14 @@ impl Database {
     /// §4.2). False under autocommit. Used by the host `Transaction` surface (api.md §6).
     pub fn in_transaction(&self) -> bool {
         self.tx.is_some()
+    }
+
+    /// Whether the open transaction has been aborted (a statement errored → it is in the failed
+    /// state, §6). False under autocommit or for a clean block. The shared write handle
+    /// ([`crate::shared`]) reads this at commit to know whether to publish (a failed block
+    /// publishes nothing — a failed COMMIT is a ROLLBACK, PostgreSQL).
+    pub(crate) fn tx_failed(&self) -> bool {
+        self.tx.as_ref().is_some_and(|t| t.failed)
     }
 
     /// The monotonic commit counter (spec/design/api.md §2): 0 for a fresh in-memory database,
@@ -3138,7 +3160,7 @@ fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
 /// and a READ ONLY transaction must reject it — spec/design/transactions.md §4.1/§4.3). Reads
 /// (`SELECT`, set operations) and transaction control run against the committed state / handle
 /// state with no data mutation.
-fn stmt_is_write(stmt: &Statement) -> bool {
+pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
     matches!(
         stmt,
         Statement::CreateTable(_)

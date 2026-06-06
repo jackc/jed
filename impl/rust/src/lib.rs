@@ -21,6 +21,7 @@ pub mod lexer;
 pub mod operators;
 pub mod parser;
 pub mod pmap;
+pub mod shared;
 pub mod storage;
 pub mod timestamp;
 pub mod token;
@@ -33,6 +34,7 @@ pub use error::{EngineError, Result, SqlState};
 pub use executor::{DEFAULT_PAGE_SIZE, Database, Outcome, Snapshot};
 pub use file::DatabaseOptions;
 pub use parser::Parser;
+pub use shared::{ReadHandle, SharedDb, WriteHandle};
 pub use value::Value;
 
 /// The capabilities this implementation currently supports (spec/conformance:

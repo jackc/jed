@@ -40,7 +40,7 @@ pub struct Rows {
 }
 
 impl Rows {
-    fn from_outcome(outcome: Outcome) -> Result<Rows> {
+    pub(crate) fn from_outcome(outcome: Outcome) -> Result<Rows> {
         match outcome {
             Outcome::Query {
                 column_names,

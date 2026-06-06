@@ -585,9 +585,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Phase 5 — Transactions & the §3 commit model
 
-> The real concurrency story. Currently only **per-statement** atomicity exists (UPDATE's
-> two-phase pass); the §3 single-writer staging buffer is still future. Couples tightly
-> with Phase 6 (the staging buffer *is* the in-memory pending set the COW commit flushes).
+> The real concurrency story. ✅ **Phase 5 is landed (P5.0–P5.3, all three cores):** autocommit
+> + multi-statement `BEGIN`/`COMMIT`/`ROLLBACK` + the immutable-`Snapshot` / working-root commit
+> model + the shared handle (concurrent readers + a single writer) + the oldest-live-txid
+> watermark. Couples tightly with Phase 6 (the staging buffer *is* the in-memory pending set the
+> COW commit flushes); the watermark registry is the free-list gate Phase 6 will consult.
 >
 > **Design landed** ([spec/design/transactions.md](spec/design/transactions.md)): the model
 > is immutable **`Snapshot`**s + a writer's **working root**, unifying the staging area, the
@@ -654,13 +656,35 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       byte-identical all cores; `rake verify` + `fmt:check` clean. **The explicit `working`-snapshot
       object landed here** (the per-block captured base + the `tables`/`stores` working set). _(size:
       L; deps: P5.1)_
-- [ ] **P5.3 — reader/writer concurrency + the watermark.** Single-writer lock (write tx exclusive;
-      read tx lock-free, never blocks except the swap) + the **oldest-live-txid watermark** (§8,
-      the Phase-6 free-list gate; trivially the committed txid until concurrent readers exist). The
-      **abort semantics** (failed-block `25P02`, autocommit rolls back only the failed statement)
-      already landed with **P5.2**; P5.3 is the **non-deterministic** half — a reader not blocking
-      during a concurrent commit, writer exclusivity, a cursor stable across a commit — tested
-      **per-core** (not the corpus — scheduling isn't deterministic, like `$N`). _(size: L; §3; deps: P5.2)_
+- [x] **P5.3 — reader/writer concurrency + the watermark.** ✅ Done across Rust/Go/TS, split into
+      two sub-slices.
+  - **P5.3a — immutable-`Snapshot` foundation.** Refactored the handle into an immutable
+    `Snapshot{txid, tables, stores}` + a `Database{committed, tx}` split: reads run against a
+    chosen snapshot (`read_snap`/`working` delegation, so the planner/executor were untouched),
+    commit swaps `committed := working`, rollback drops `working`, and **every** write — autocommit
+    included — runs as a transaction. The persistent (CoW) stores make `committed.clone()` an O(1)
+    structurally-shared snapshot. The `oldest_live_txid` **seam** landed here (trivially the
+    committed version single-handle). 72/0/0 all cores.
+  - **P5.3b — the shared handle (concurrency + the watermark registry).** A separate **`SharedDb`**
+    handle (Rust/Go/TS) realizes the §3 model for **concurrent readers + a single writer**: a
+    **committed cell** (Rust `RwLock<Arc<Snapshot>>`, Go `atomic.Pointer[Snapshot]`, TS a field), a
+    **single-writer gate** (Rust `Mutex<bool>`+`Condvar` / Go held `sync.Mutex` — both **block** a
+    second writer; TS **rejects** it `25001`, no thread to block), and the **live-reader registry**
+    (`version → refcount`; its minimum is `oldest_live_txid`, the Phase-6 free-list gate, §8).
+    `db.read() -> ReadHandle` pins the committed snapshot, serves reads from that immutable version
+    (a write through it → `25006`), and deregisters on drop/`close`; `db.write() -> WriteHandle`
+    captures a private working set and `commit` publishes it at the next version. **Per-core
+    reality** (CLAUDE.md §2 — best experience per language): Rust/Go give **true OS-thread
+    parallelism** (reader threads run while a writer commits; Go tested under `-race`), TS gives
+    snapshot **isolation** across async interleavings (no shared-memory threads). In-memory this
+    slice; file-backed sharing reuses the §9 persist chokepoint, wired later. **Stdlib-only** sync
+    primitives (no new deps). The concurrency mechanism is tested **per-core** (not the corpus —
+    scheduling/interleaving isn't cross-core deterministic, like `$N`): Rust 7 tests incl. a
+    multi-thread reader/writer fan-out, Go 7 under `-race`, TS 6 isolation/watermark tests. Spec:
+    [transactions.md §8/§10](spec/design/transactions.md) (watermark registry + the realized
+    concurrency mechanism + the per-core split) and [api.md §2.5](spec/design/api.md) (the shared-
+    handle surface). 72/0/0 byte-identical all cores; `rake verify` + per-core fmt/vet/typecheck
+    clean. _(size: L; §3; deps: P5.2)_
 
 ---
 

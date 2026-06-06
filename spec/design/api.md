@@ -111,6 +111,31 @@ commit. `close` is idempotent.
   prepare-then-run (autocommit). The pre-API free function `execute(db, sql)` is kept unchanged
   (zero parameters) — the conformance harnesses depend on it.
 
+### 2.5 Shared handle: parallel readers + a single writer (P5.3b)
+
+The handle of §2.1–§2.4 is single-threaded: it is the simple, fast path and is **not** safe to
+share across threads. For **concurrent readers running alongside a writer** there is a separate
+**shared handle** (`SharedDb` — Rust/Go/TS), the faithful realization of the §3 model
+(transactions.md §10). It is cheap to clone/share, and mints two kinds of per-caller handle:
+
+- **`db.read() -> ReadHandle`** pins the committed snapshot *now* and serves reads from that one
+  stable, immutable version for its life — never blocked by, and never blocking, a writer. A
+  write attempted through it is `25006`. It registers in the live-reader set (transactions.md §8);
+  **`read.close()`** (Go/TS — no destructor) / dropping it (Rust) deregisters, advancing the
+  watermark. `db.oldest_live_txid()` reports the oldest version any open reader still pins.
+- **`db.write() -> WriteHandle`** opens the single writer: it captures the committed snapshot as a
+  private working set, runs statements with full transaction semantics (read-your-writes, failed-
+  block poisoning), and **`commit()`** publishes the working set at the next version (the §3
+  commit window) / **`rollback()`** discards it. At most one writer is open at a time — a second
+  `write()` **blocks** until the first ends (Rust/Go) or is **rejected `25001`** (TS, which cannot
+  block its one thread).
+
+**Per-core reality** (CLAUDE.md §2 — best experience per language): Rust and Go give true
+OS-thread parallelism (reader threads run while a writer commits); TS gives snapshot **isolation**
+across async interleavings (no shared-memory threads). This slice's shared handle is **in-memory**;
+file-backed sharing reuses the §3 publish point + the §9 persist chokepoint and is wired later.
+The single-handle surface (§2.1–§2.4) is unchanged and remains the default.
+
 ## 3. Persistence & durability
 
 The on-disk model is **whole-image** ([storage.md](storage.md) §4 step-5b status): a commit
