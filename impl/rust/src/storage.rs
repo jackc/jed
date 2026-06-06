@@ -1,23 +1,25 @@
 //! In-memory storage seam (CLAUDE.md §9).
 //!
-//! Step-5a is in-memory only; on-disk persistence (the block device, the byte
-//! format, the Rust↔Go round-trip) is step-5b behind this same seam. Rows are held
-//! keyed by their primary-key encoding (spec/design/encoding.md) in a sorted map, so
-//! iteration is in key order — the order-preserving encoding is what makes that the
-//! correct logical order with no comparator.
+//! A table's rows are held in a [`PMap`](crate::pmap) — a persistent (copy-on-write) ordered
+//! map keyed by the primary-key encoding (spec/design/encoding.md), so iteration is in key
+//! order (the order-preserving encoding makes that the correct logical order with no
+//! comparator) **and** the whole store is an O(1) `Clone` that snapshots independently of its
+//! source. That cheap, structurally-shared clone is what carries the §3 staging-buffer /
+//! transaction model (spec/design/transactions.md §2): a `TableStore` clone is the committed
+//! version a reader holds while a writer mutates its own copy.
 
-use std::collections::BTreeMap;
-
+use crate::pmap::PMap;
 use crate::value::Value;
 
 /// A stored row: one value per column, in column order.
 pub type Row = Vec<Value>;
 
-/// A single table's rows, keyed by encoded primary key. `BTreeMap<Vec<u8>, _>`
-/// orders by raw byte order — exactly the order-preserving key encoding's contract.
-#[derive(Default)]
+/// A single table's rows, keyed by encoded primary key. Cloning is O(1) and yields an
+/// independent snapshot (the [`PMap`] shares structure; mutating one leaves the other
+/// untouched) — the foundation of the transaction model (spec/design/transactions.md §2).
+#[derive(Clone, Default)]
 pub struct TableStore {
-    rows: BTreeMap<Vec<u8>, Row>,
+    rows: PMap,
     /// Next synthetic rowid for a table with no primary key. Monotonic — never
     /// reused, so a DELETE-then-INSERT cannot collide with a freed key. Unused for
     /// tables that have a primary key. Reconstructed on load (spec/fileformat).
@@ -27,7 +29,7 @@ pub struct TableStore {
 impl TableStore {
     pub fn new() -> Self {
         TableStore {
-            rows: BTreeMap::new(),
+            rows: PMap::new(),
             next_rowid: 0,
         }
     }
@@ -35,7 +37,7 @@ impl TableStore {
     /// Insert a row under its encoded key. Returns false if the key already exists
     /// (primary-key uniqueness); the caller decides how to surface that.
     pub fn insert(&mut self, key: Vec<u8>, row: Row) -> bool {
-        if self.rows.contains_key(&key) {
+        if self.rows.get(&key).is_some() {
             return false;
         }
         self.rows.insert(key, row);
@@ -59,11 +61,10 @@ impl TableStore {
     }
 
     /// Replace the row stored at an existing key (UPDATE). The key is unchanged, so
-    /// key order and the rowid counter are untouched. Panics if the key is absent —
-    /// the caller only replaces keys it just found.
+    /// key order and the rowid counter are untouched. The caller only replaces keys it
+    /// just found, so the overwrite always lands on a present key.
     pub fn replace(&mut self, key: &[u8], row: Row) {
-        let slot = self.rows.get_mut(key).expect("replace at an existing key");
-        *slot = row;
+        self.rows.insert(key.to_vec(), row);
     }
 
     /// Remove the row at `key` (DELETE). Returns whether a row was present.
@@ -78,7 +79,7 @@ impl TableStore {
 
     /// Iterate rows in primary-key (encoded byte) order.
     pub fn iter_in_key_order(&self) -> impl Iterator<Item = &Row> {
-        self.rows.values()
+        self.rows.iter().map(|(_, v)| v)
     }
 
     /// Iterate `(encoded key, row)` pairs in key order. Used by the on-disk

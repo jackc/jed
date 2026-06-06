@@ -20,6 +20,7 @@ pub mod format;
 pub mod lexer;
 pub mod operators;
 pub mod parser;
+pub mod pmap;
 pub mod storage;
 pub mod timestamp;
 pub mod token;

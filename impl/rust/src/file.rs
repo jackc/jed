@@ -42,7 +42,7 @@ impl Database {
         db.path = Some(path.to_path_buf());
         db.page_size = opts.page_size;
         db.txid = 0;
-        db.commit()?; // materialize the empty image (txid 0 -> 1)
+        db.persist()?; // materialize the empty image (txid 0 -> 1)
         Ok(db)
     }
 
@@ -66,9 +66,12 @@ impl Database {
         Ok(db)
     }
 
-    /// Durably persist the whole current image to the backing file and increment `txid`. An
-    /// in-memory database (no path) is a **no-op success** (spec/design/api.md §2).
-    pub fn commit(&mut self) -> Result<()> {
+    /// Durably persist the whole current image to the backing file and increment `txid` — the
+    /// single synchronous-commit chokepoint (spec/design/transactions.md §9). Called by
+    /// `create` (the initial image) and by the autocommit path after every successful write
+    /// statement. An in-memory database (no path) is a **no-op success**. The future
+    /// `synchronous=off` mode (batched/deferred fsync) gates here.
+    pub(crate) fn persist(&mut self) -> Result<()> {
         let path = match &self.path {
             None => return Ok(()),
             Some(p) => p.clone(),
@@ -80,8 +83,25 @@ impl Database {
         Ok(())
     }
 
-    /// Release the handle. Does **not** commit — uncommitted changes since the last `commit`
-    /// are discarded (spec/design/api.md §2). Idempotent.
+    /// Commit the current transaction (spec/design/api.md §2.2). jed **autocommits** each
+    /// statement (transactions.md §4.1), so in this slice there is no open explicit transaction
+    /// to publish — `commit` is a **lenient no-op success** (transactions.md §4.2). Explicit
+    /// `BEGIN … COMMIT` blocks, where `commit` does the durable publish, arrive in P5.2.
+    pub fn commit(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Roll back the current transaction (spec/design/api.md §2.2). With autocommit and no open
+    /// explicit transaction (this slice), there is nothing uncommitted to discard — a **no-op
+    /// success**. Discarding an open explicit block's working set arrives with `BEGIN` in P5.2.
+    pub fn rollback(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Release the handle (spec/design/api.md §2.3). Under autocommit, every prior statement is
+    /// already durable, so — unlike the original model — `close` does **not** drop committed
+    /// work; it would roll back an open explicit transaction (none in this slice). Durability is
+    /// never hidden in a destructor. Idempotent.
     pub fn close(mut self) -> Result<()> {
         self.path = None;
         Ok(())

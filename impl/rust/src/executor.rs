@@ -156,7 +156,35 @@ impl Database {
     /// Execute one parsed statement, binding `params` to its `$N` placeholders (an empty slice
     /// for an unparameterized statement). The DDL statements take no parameters — supplying any
     /// is a 42601 (spec/design/api.md §5).
+    ///
+    /// **Autocommit** (spec/design/transactions.md §4.1): a read runs against the committed
+    /// state directly; a write is its own transaction — the committed state is captured first
+    /// (the stores are O(1) clones via the persistent map, [`crate::pmap`]), the statement
+    /// runs, and on success the change is made durable (synchronous, the single `persist`
+    /// chokepoint). Any failure — in the statement or in the durable write — restores the
+    /// captured state (rollback-on-error), discarding partial work and any rowid allocations
+    /// (transactions.md §7). For an in-memory database `persist` is a no-op, so autocommit is
+    /// pure in-memory visibility.
     pub fn execute_stmt_params(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
+        if !stmt_is_write(&stmt) {
+            return self.dispatch_stmt(stmt, params);
+        }
+        let saved_tables = self.tables.clone();
+        let saved_stores = self.stores.clone();
+        let result = match self.dispatch_stmt(stmt, params) {
+            Ok(outcome) => self.persist().map(|()| outcome),
+            Err(e) => Err(e),
+        };
+        if result.is_err() {
+            self.tables = saved_tables;
+            self.stores = saved_stores;
+        }
+        result
+    }
+
+    /// Dispatch one parsed statement to its executor. The autocommit transaction handling
+    /// (capture / durable commit / rollback-on-error) lives in `execute_stmt_params`.
+    fn dispatch_stmt(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
         match stmt {
             Statement::CreateTable(ct) => {
                 reject_params_for_ddl(params)?;
@@ -2888,6 +2916,20 @@ fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
             "bind parameters are not allowed in a DDL statement",
         ))
     }
+}
+
+/// Whether a statement mutates the database (so autocommit must capture + durably persist it).
+/// Reads (`SELECT`, set operations) run against the committed state with no transaction
+/// (spec/design/transactions.md §4.1).
+fn stmt_is_write(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::CreateTable(_)
+            | Statement::DropTable(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+    )
 }
 
 /// The resolved (static) type of a column of scalar type `ty`.

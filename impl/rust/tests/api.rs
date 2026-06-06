@@ -75,19 +75,41 @@ fn create_with_custom_page_size_round_trips() {
 }
 
 #[test]
-fn close_without_commit_discards() {
-    let path = tmp("discard.jed");
+fn autocommit_persists_each_write_across_close() {
+    // jed autocommits (spec/design/transactions.md §4.1): a write is durable as soon as it
+    // succeeds, so it survives a `close` with no explicit `commit` — the opposite of the
+    // original "no autocommit" model this test used to assert.
+    let path = tmp("autocommit.jed");
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
     execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
-    db.commit().unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1)").unwrap(); // not committed
+    execute(&mut db, "INSERT INTO t VALUES (1)").unwrap(); // autocommitted, no explicit commit
     db.close().unwrap();
 
     let mut db = Database::open(&path).unwrap();
     match execute(&mut db, "SELECT id FROM t").unwrap() {
-        Outcome::Query { rows, .. } => assert!(rows.is_empty(), "uncommitted insert must be gone"),
+        Outcome::Query { rows, .. } => {
+            assert_eq!(
+                rows,
+                vec![vec![Value::Int(1)]],
+                "autocommitted insert must persist"
+            )
+        }
         _ => panic!("expected a query"),
+    }
+}
+
+#[test]
+fn commit_and_rollback_are_noops_under_autocommit() {
+    // With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
+    let mut db = Database::new();
+    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
+    db.commit().unwrap();
+    db.rollback().unwrap(); // does NOT undo the autocommitted insert
+    match db.query("SELECT id FROM t", &[]).unwrap().next() {
+        Some(row) => assert_eq!(row, vec![Value::Int(1)]),
+        None => panic!("autocommitted row must remain"),
     }
 }
 
