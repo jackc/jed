@@ -54,27 +54,47 @@ In-memory databases use the **existing constructors** (`Database::new()` / `NewD
 conformance harnesses and unit suites use them). An in-memory database never touches the
 filesystem.
 
-### 2.2 Commit
+### 2.2 Transactions, autocommit, and durability
 
-**`commit()`** is a *uniform* operation:
+The full transaction model is [transactions.md](transactions.md); this section fixes the API
+shape. **jed autocommits by default** (PostgreSQL behavior — CLAUDE.md §1; this **supersedes**
+the original "no autocommit" rule, which was an accident of the whole-image writer —
+transactions.md §1). The commit boundary and durability are **decoupled** (transactions.md §9):
 
-- **File-backed** → durably persist the whole current image and increment `txid` (§3).
-- **In-memory** → a **no-op success** (there is no path to write). This keeps `commit` a
-  single operation across both modes and forward-compatible with the future §3
-  staging-buffer transactions, whose `commit`/`rollback` will apply to in-memory databases
-  too. It is **not** an error to commit an in-memory database.
+- **Autocommit (default).** Each statement run directly on the handle is its own transaction —
+  it commits on success / rolls back on error. The engine infers the access mode from the
+  statement kind (read → a snapshot, no write lock; write → the write lock). `db.execute(sql,
+  params)` / `db.query(sql, params)` are the autocommit one-shots.
+- **Explicit transactions.** **`db.begin(writable) -> Transaction`** opens a read
+  (`writable=false`) or read-write (`writable=true`) transaction; statements run on it
+  (`tx.execute`/`tx.query`); **`tx.commit()`** / **`tx.rollback()`** end it. A write on a read
+  transaction is `25006`. The **closure wrappers** **`db.view(fn)`** (read) and
+  **`db.update(fn)`** (read-write) open the transaction, run `fn(tx)`, and **auto-commit on
+  success / auto-rollback on error or panic** — the safe default, recommended over a raw
+  `begin`. SQL `BEGIN [READ ONLY|READ WRITE]` / `COMMIT` / `ROLLBACK` drive the handle's implicit
+  current transaction equivalently.
+- **`commit` / `rollback` are uniform across modes.** **In-memory** → commit is a **no-op
+  success** (no path to write; never an error); rollback discards the working set. **File-backed**
+  → commit publishes + makes durable per the **`synchronous`** setting (below).
+- **Durability — `synchronous` (default `on`).** `on` makes a commit durable **before it
+  returns** (the §3 crash-safe recipe). `off`/relaxed makes the commit visible immediately and
+  **batches/defers** the fsync — faster, may lose the last few commits on a crash, **never
+  corrupts** (the on-disk image is always a valid older snapshot). The seam is built now, default
+  `on`; the `off` batching policy can land later (transactions.md §9). Set at `create`/`open`
+  via `opts`.
 
-Commit is **explicit**. There is no autocommit: a mutation made by `execute` is in the
-in-memory state immediately but is not durable until `commit()`. (With no cross-statement
-transactions yet — the §3 staging buffer is future — this is the simplest correct model and
-the one that the future transaction model extends without a reshape.)
+The staging buffer + `Transaction` surface + SQL `BEGIN`/`COMMIT`/`ROLLBACK` **land in Phase 5**
+([../../TODO.md](../../TODO.md)); their semantics are fixed in transactions.md so this doc stays
+the shape-of-the-API record.
 
 ### 2.3 Close
 
-**`close()`** releases the handle. It does **NOT** commit — uncommitted changes since the
-last `commit()` are discarded. This is the single most surprising rule and is deliberate:
-durability is the caller's explicit decision, never hidden in a destructor (which is
-especially error-prone in the GC'd Go/TS cores). `close` is idempotent.
+**`close()`** releases the handle. It **rolls back any open explicit transaction** (its
+in-progress work is discarded) and does **not** itself start or commit one. Under autocommit,
+every prior statement is already committed and durable (per `synchronous`, §2.2), so — unlike
+the original surprising rule — `close` does **not** drop committed work; durability is never
+hidden in a destructor (error-prone in the GC'd Go/TS cores), it is the explicit result of each
+commit. `close` is idempotent.
 
 ### 2.4 Prepare / execute / query
 
@@ -84,16 +104,26 @@ especially error-prone in the GC'd Go/TS cores). `close` is idempotent.
   count-mismatch check.)
 - **`statement.execute(params) -> Outcome`** runs a (possibly mutating) statement and
   returns the materialized outcome. `statement.query(params) -> Rows` runs a query and
-  returns a cursor. `params` is empty when the statement has no placeholders.
+  returns a cursor. `params` is empty when the statement has no placeholders. A prepared
+  statement runs **within a transaction** — an explicit one (on a `Transaction`) or, on the
+  handle directly, the autocommit single-statement transaction of §2.2.
 - One-shot convenience: `db.execute(sql, params)` / `db.query(sql, params)` are sugar for
-  prepare-then-run. The pre-API free function `execute(db, sql)` is kept unchanged (zero
-  parameters) — the conformance harnesses depend on it.
+  prepare-then-run (autocommit). The pre-API free function `execute(db, sql)` is kept unchanged
+  (zero parameters) — the conformance harnesses depend on it.
 
 ## 3. Persistence & durability
 
 The on-disk model is **whole-image** ([storage.md](storage.md) §4 step-5b status): a commit
 serializes the entire database to one byte image. Incremental copy-on-write stays deferred;
 nothing here forecloses it (CLAUDE.md §9).
+
+The recipe below is the **`synchronous=on`** durable-commit path (§2.2, transactions.md §9): it
+fires at **every** durable commit — each autocommit write statement and each explicit `COMMIT`
+alike. Under `synchronous=off` the commit is visible immediately and this recipe is **batched /
+deferred** (still all-or-nothing when it does run). Under whole-image, autocommit therefore
+rewrites the file per write statement at `synchronous=on` — the expected SQLite/PG cost, with
+explicit `BEGIN…COMMIT` (one rewrite for many statements) and Phase 6's incremental COW as the
+two escape hatches.
 
 **Crash-safe commit recipe** (identical across cores):
 
@@ -161,7 +191,11 @@ only and the engine has no wire protocol).
 | create file | `Database::create(path, opts) -> Result<Database>` | `Create(path, opts) (*Database, error)` | `create(path, opts): Database` |
 | open file | `Database::open(path) -> Result<Database>` | `Open(path) (*Database, error)` | `open(path): Database` |
 | open in-memory | `Database::new()` | `NewDatabase()` | `new Database()` |
-| commit | `db.commit() -> Result<()>` | `db.Commit() error` | `commit(db): void` |
+| commit (current tx) | `db.commit() -> Result<()>` | `db.Commit() error` | `commit(db): void` |
+| rollback (current tx) _(Phase 5)_ | `db.rollback() -> Result<()>` | `db.Rollback() error` | `rollback(db): void` |
+| begin _(Phase 5)_ | `db.begin(writable) -> Result<Transaction>` | `db.Begin(writable) (*Transaction, error)` | `begin(db, writable): Transaction` |
+| view / update (closures) _(Phase 5)_ | `db.view(\|tx\| …)` / `db.update(\|tx\| …)` | `db.View(fn) error` / `db.Update(fn) error` | `view(db, fn)` / `update(db, fn)` |
+| tx commit / rollback _(Phase 5)_ | `tx.commit()` / `tx.rollback()` | `tx.Commit()` / `tx.Rollback() error` | `tx.commit()` / `tx.rollback()` |
 | close | `db.close()` + `Drop` | `db.Close() error` | `close(db): void` |
 | prepare | `db.prepare(sql) -> Result<PreparedStatement>` | `db.Prepare(sql) (*PreparedStatement, error)` | `prepare(db, sql): PreparedStatement` |
 | stmt execute | `stmt.execute(&mut db, &params) -> Result<Outcome>` | `stmt.Execute(params) (Outcome, error)` | `stmt.execute(params): Outcome` |
@@ -190,8 +224,10 @@ only and the engine has no wire protocol).
 and a message; `.code()` returns the SQLSTATE. Idiomatic surfacing: Rust `Result<T,
 EngineError>`, Go `(T, error)` with a `*EngineError`, TS `throw EngineError`. SQL errors keep
 their existing codes; the API adds the host-filesystem class-58 codes (`58P01`/`58P02`/
-`58030`, §2.1) and the parameter code `42P18` (§5). The SQLSTATE class (first two chars) is a
-stable category (`22` data, `23` integrity, `42` syntax/access, `58` system, `XX` internal).
+`58030`, §2.1), the parameter code `42P18` (§5), and the transaction-state class-25 codes
+(`25001`/`25006`/`25P02`, transactions.md §6). The SQLSTATE class (first two chars) is a stable
+category (`22` data, `23` integrity, `25` transaction state, `42` syntax/access, `58` system,
+`XX` internal).
 
 ## 8. Non-goals this slice
 
@@ -199,8 +235,13 @@ stable category (`22` data, `23` integrity, `42` syntax/access, `58` system, `XX
   caller-supplied `max_cost` that aborts is deferred (cost.md §6). The shape is kept open: an
   options object on `prepare`/`execute` can carry it later without changing the surface.
 - **No streaming rows** — the cursor walks materialized rows (§4).
-- **No transactions** — `commit`/`close` are per the single-writer, no-staging model (§2.2);
-  `rollback` and multi-statement transactions arrive with the §3 staging buffer.
+- **Transactions are IN, not a non-goal.** The §3 staging buffer, autocommit, the `Transaction`
+  surface (`begin`/`view`/`update`), the `synchronous` durability setting, and SQL
+  `BEGIN`/`COMMIT`/`ROLLBACK` are **specified** in [transactions.md](transactions.md) and land in
+  **Phase 5**; §2.2–§2.3 above are revised accordingly (autocommit replaces the original "no
+  autocommit" rule; `close` no longer drops committed work). What stays deferred is only
+  `SAVEPOINT`/nested transactions, `synchronous=off` batching, and group-commit (transactions.md
+  §11).
 - **No browser/OPFS host** — the Node `fs` host is built here; the OPFS host is a sibling
   storage host added later ([storage.md](storage.md) §2, CLAUDE.md §9).
 - **No low-level direct-access API** — kept open, not built ([storage.md](storage.md) §5).

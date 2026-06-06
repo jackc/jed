@@ -1,0 +1,344 @@
+# Transactions & the commit model — design
+
+> How the engine realizes the CLAUDE.md §3 concurrency rule — single writer, readers
+> blocked only during the commit window, exactly one committed version plus one writer's
+> pending set, **not** MVCC. This is a *design* doc and the canonical record for the
+> transaction model. The SQL surface (`BEGIN`/`COMMIT`/`ROLLBACK`) and its conformance
+> corpus land in a later sub-slice (§4); this doc fixes the model they implement. The
+> per-impl host API (the `Transaction` handle, `view`/`update`, the `synchronous` setting) is
+> in [api.md](api.md); the storage realization is in [storage.md](storage.md) §4. When a
+> decision here changes, update [CLAUDE.md](../../CLAUDE.md) §3/§9, [storage.md](storage.md)
+> §4, and [api.md](api.md) in the same edit.
+>
+> **This doc supersedes the old "no autocommit" policy** ([api.md](api.md) §2.2 as first
+> shipped). That policy was an accident of the whole-image writer (durability cost dictated
+> the transaction model), not a purposeful choice; jed now adopts **PostgreSQL autocommit**
+> (CLAUDE.md §1) and **decouples the commit boundary from durability** (§9).
+
+## 1. What this realizes, and the accident it corrects
+
+CLAUDE.md §3 fixes the concurrency model: **at most one writer**; a writer accumulates all
+its changes in a **private in-memory staging area** (the pending write set) while the last
+committed state stays continuously readable; readers **never block** against an in-flight
+writer; the only globally-exclusive moment is the **commit** itself, which publishes the
+staged changes atomically. There is exactly **one committed version plus one writer's
+pending set** — no version chains, no per-row timestamps, no vacuum.
+
+**The accident this corrects.** The first host API fused two different things into one
+`commit()` call: the **transaction boundary** (when changes become atomic and visible) and
+**durability** (the `fsync`). Because durability was a whole-image rewrite (expensive), the
+path of least resistance was "make the host call `commit` explicitly and rarely" — so the
+*cost of durability dictated the transaction model*. That is backwards, and it produced two
+surprises: no autocommit (every mutation needed a manual `commit` to persist), and a `close`
+that silently discarded committed-looking work.
+
+The correction is to **un-fuse the two concerns** (§9):
+
+- **Transaction commit** = the snapshot swap (§2). Atomic, visible, cheap; happens at the end
+  of *every* transaction, including an autocommit single-statement one.
+- **Durability** = the `fsync`, governed by a `synchronous` setting (default **on**), orthogonal
+  to the commit boundary.
+
+Once un-fused, **autocommit is just the PostgreSQL default** (§4): each statement is its own
+transaction that commits on success / rolls back on error, unless inside an explicit
+`BEGIN … COMMIT`. This is what hosts expect (SQLite, MySQL, PG all autocommit by default) and
+what CLAUDE.md §1 selects (the prior "no autocommit" was an undocumented divergence with no
+overriding reason). The remaining job of this slice is to make the pending set **first-class,
+rollback-able, and snapshot-isolated** — the three properties the always-mutate-live model
+lacked.
+
+## 2. The model: immutable snapshots + a working root
+
+The committed state is an **immutable `Snapshot`**. A transaction is *a view of a `Snapshot`*
+— a **read** transaction is a reference to a committed snapshot; a **write** transaction is a
+*working* snapshot built from it that has not been swapped in yet. So the §3 "staging area,"
+the "read snapshot," and the "pending write set" are **one structure**, not three.
+
+```
+Snapshot (immutable) = { txid, tables: PersistentMap<name → TableEntry> }
+TableEntry           = { def, store: PersistentTree<key,Row>, next_rowid }
+
+Database handle      = { committed: ref<Snapshot>,   # last committed, what fresh readers see
+                         current_tx,                  # the open transaction, if any (§4)
+                         write_lock,                  # held by the one write tx (§10)
+                         live_snapshots,              # liveness registry (§8)
+                         synchronous }                # durability mode (§9)
+
+Transaction          = read:  { snapshot: ref<Snapshot> }                 # no write lock
+                       write: { working: Snapshot, base_txid, … }          # holds write_lock
+```
+
+- A **write** transaction builds each statement's effect against `working` — the persistent
+  structures (§3) copy only the touched paths, so producing the new `working` does **not**
+  mutate `committed`. After the statement's two-phase validation (§6) the new root is adopted
+  into `working`. Read-your-writes within the transaction falls out: a write is immediately
+  visible to the next statement on the same transaction because that statement reads `working`.
+- A **read** transaction holds a committed `Snapshot` by reference and never builds a working
+  root — it cannot mutate (§4.3). Many may be open at once.
+- **Commit** (of a write tx) publishes `working` — `committed := working`, **a single pointer
+  swap** (the §3 short commit window) — makes it durable per the `synchronous` setting (§9),
+  releases the write lock, and bumps `txid`. Committing a read tx is a no-op.
+- **Rollback** drops the pending root (`working` discarded) and releases the write lock. For a
+  read tx it just releases the snapshot.
+- A `Rows` cursor captures its transaction's `Snapshot` and is thereby stable for its life and
+  lock-free; the writer cannot disturb it because the writer never mutates a published snapshot
+  in place.
+
+This is the bbolt model (a read tx is a `View`, a write tx is an `Update` owning its own root;
+commit swaps the meta root), here realized in memory first ([storage.md](storage.md) §4,
+CLAUDE.md §12).
+
+## 3. The persistent ordered map
+
+The one new primitive. It replaces the current per-table store (a mutable
+`BTreeMap`/hash-map-plus-sort) with a **persistent (immutable, structurally-shared) ordered
+map** keyed by the encoded-key bytes (memcmp order — [encoding.md](encoding.md)). Required
+operations: `get`, `insert→new`, `remove→new`, in-order `iter`, and `range` (for later).
+Each mutation **path-copies** root→leaf and shares the untouched siblings, so the prior root
+is provably unchanged and a snapshot is an O(1) reference clone.
+
+**Recommended shape: a copy-on-write B-tree.** Chosen deliberately as the in-memory
+precursor of the on-disk B-tree (Phase 6, [storage.md](storage.md) §6): when incremental
+copy-on-write commit lands, it **page-backs the tree we already have** rather than building
+one — which collapses the two separate Phase-6 XL items ("incremental COW commit" and
+"B-tree interior pages") into one coherent slice ([TODO.md](../../TODO.md) Phase 6). *Decided:
+B-tree, not a persistent BST* — a binary node never maps to a page, so a BST would still
+force a re-pack at Phase 6; the B-tree avoids it. (A persistent BST remains the documented
+fallback if the B-tree proves too costly to keep in lockstep across three cores; it preserves
+every §2 guarantee and only forfeits the Phase-6 convergence.)
+
+**Cross-core contract — narrower than it looks.** Only **iteration order** (ascending
+encoded key) and the **serialized on-disk bytes** are contractual across cores; the in-RAM
+node structure (fan-out, split points) is a **private per-core detail this slice**. The cores
+already differ in in-memory representation today (Rust `BTreeMap` vs Go/TS hash-map-plus-sort)
+for exactly this reason — only observable order and persisted bytes bind. **This changes at
+Phase 6:** once the tree is the *on-disk* B-tree, its node layout and split rules become a
+byte contract — a new §8 divergence hotspot that must be spec'd with golden fixtures
+([../fileformat/format.md](../fileformat/format.md)) at that time, not now.
+
+**In-memory reclamation is free.** An old `Snapshot` is reclaimed by the language's own
+mechanism the instant nothing references it — `Arc` refcount in Rust, GC in Go/TS — so the
+§3 "old version becomes free after commit" is automatic in memory. The explicit free-list
+that replaces it for *pages* is Phase 6, and it leans on the §8 watermark.
+
+## 4. Modes, control surface, and access modes
+
+> The grammar ([../grammar/grammar.ebnf](../grammar/grammar.ebnf), [grammar.md](grammar.md)),
+> the parsers, and the conformance corpus for the SQL statements land in the **P5.2 sub-slice**
+> ([TODO.md](../../TODO.md) Phase 5), spec-first as always. This section fixes their semantics;
+> the host-API equivalents are in [api.md](api.md).
+
+### 4.1 Autocommit (the default)
+
+Between explicit transactions the handle is in **autocommit** mode. Each statement runs in its
+own implicit single-statement transaction:
+
+- The engine **infers the access mode from the statement kind**: a read statement (`SELECT`, a
+  read-only query expression / set operation) → a **read** transaction (a committed snapshot,
+  no write lock); a write statement (`INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/…) → a **write**
+  transaction (a working root + the write lock).
+- On **success** the implicit transaction **commits** — snapshot swap + durability per the
+  `synchronous` setting (§9). On **error** it **rolls back** (the statement's two-phase pass
+  already guarantees no partial write — §6); autocommit continues and subsequent statements run
+  normally. This is PostgreSQL autocommit behavior, and because per-statement atomicity already
+  matched it, **the conformance harness stays green** (each statement commits, the next sees it
+  — read-your-writes across statements is preserved).
+
+### 4.2 Explicit transaction blocks
+
+`BEGIN [TRANSACTION] [READ ONLY | READ WRITE]` (also `START TRANSACTION …`; default access
+mode **READ WRITE**) opens an explicit block; subsequent statements run within it until it
+ends:
+
+- **`COMMIT`** (`COMMIT [TRANSACTION|WORK]`, `END`) publishes + makes durable (§9) and returns
+  to autocommit. Committing a **failed** block (§6) performs a `ROLLBACK` instead (PostgreSQL).
+- **`ROLLBACK`** (`ROLLBACK [TRANSACTION|WORK]`) discards `working` and returns to autocommit;
+  it also clears a **failed** block.
+- **`BEGIN` while already in an explicit block** has no defined action (no nesting without
+  `SAVEPOINT` — §11) → **`25001 active_sql_transaction`**.
+- **`COMMIT`/`ROLLBACK` in autocommit mode** (no open block) → a **lenient no-op success**.
+  PostgreSQL warns ("there is no transaction in progress"); jed has no warning channel
+  (CLAUDE.md §4), so it silently succeeds rather than raising — a documented, deliberate
+  divergence. (No `25P01` is raised.)
+
+The asymmetry — `BEGIN`-in-block errors, `COMMIT`/`ROLLBACK`-with-no-block do not — is
+principled: `COMMIT`/`ROLLBACK` always have a well-defined action (publish/discard the current
+work), while a nested `BEGIN` does not. Error where the action is undefined; succeed where it
+is defined.
+
+### 4.3 Access modes: read-only vs read-write
+
+The access mode is **load-bearing for concurrency** (§10): a **read** transaction takes **no
+write lock**, so any number run concurrently with each other and with the one writer; a
+**write** transaction takes the **exclusive write lock**. Because the lock cannot be acquired
+lazily mid-transaction without upgrade/deadlock hazards, the mode is **fixed when the
+transaction opens** — declared for explicit blocks, inferred for autocommit (§4.1):
+
+- **READ WRITE** (the default) may read and write; it takes the write lock at `BEGIN` and holds
+  it for the whole block (even across its read-only statements — a host wanting maximal read
+  concurrency should use READ ONLY).
+- **READ ONLY** may only read; it takes no write lock and pins **one committed snapshot across
+  all its statements** (the reason a host opens one even under single-writer: a multi-statement
+  *consistent* read — read a balance, then the matching ledger rows, against one snapshot). A
+  write statement attempted in a READ ONLY transaction → **`25006 read_only_sql_transaction`**
+  (PostgreSQL's code). A READ ONLY transaction needs no working root at all.
+
+These long-lived read snapshots are exactly the **live readers** the §8 watermark tracks, so
+this is also what makes Phase 6 page reclamation safe.
+
+### 4.4 The host API surface (api.md)
+
+The same model, programmatically (idiomatic per core — [api.md](api.md) §6):
+
+- **`db.begin(writable) -> Transaction`** opens an explicit transaction; statements run on it
+  (`tx.execute(…)`, `tx.query(…) -> Rows`); `tx.commit()` / `tx.rollback()` end it.
+- **`db.view(fn)`** (read) and **`db.update(fn)`** (read-write) are closure wrappers
+  (bbolt-style): open the transaction, run `fn(tx)`, **auto-commit on success / auto-rollback
+  on error or panic** — the safe default that cannot forget to end the transaction.
+- The **autocommit one-shots** `db.execute(sql)` / `db.query(sql)` wrap `begin → run → commit`
+  with the inferred access mode (§4.1) — they are how the conformance harness and simple hosts
+  drive the engine.
+- The **SQL** `BEGIN`/`COMMIT`/`ROLLBACK` drive the handle's implicit current transaction (for
+  SQL-string-only hosts and the corpus); they and the API forms are two surfaces over one
+  mechanism.
+
+### 4.5 DDL is transactional
+
+`CREATE TABLE` / `DROP TABLE` stage into `working` like any mutation and roll back with it
+(PostgreSQL behavior). The atomic unit a commit publishes is **catalog + every table's rows +
+the rowid counters** as one swappable `Snapshot` — which is also why Phase 6's incremental
+commit must copy-on-write the catalog page chain, not only data pages.
+
+## 5. Isolation & visibility
+
+- **Snapshot isolation, per transaction.** Every transaction sees a stable snapshot for its
+  life: a read transaction pins its committed snapshot across all its statements (§4.3); a write
+  transaction reads its own `working` root (read-your-writes). With a single writer (§10) there
+  are no write-write conflicts, so no serialization failures and no retry loop. We commit to
+  snapshot isolation and **nothing weaker** — there is no `READ UNCOMMITTED` (a reader never
+  sees another transaction's unpublished working set).
+- **Autocommit reads see the latest committed state.** Each autocommit `SELECT` is its own read
+  transaction, so consecutive autocommit reads may observe different committed states as the
+  writer advances. A host that needs several reads against *one* state uses an explicit
+  `READ ONLY` transaction (§4.3).
+- **A `Rows` cursor is snapshot-stable for its life** — its rows cannot change mid-iteration
+  even if a writer commits, because a published snapshot is never mutated in place.
+
+## 6. Error & abort semantics
+
+Statement-level atomicity is already two-phase / all-or-nothing (CLAUDE.md §11 step 6:
+`INSERT`/`UPDATE` validate every row before writing any). Transaction-level abort composes on
+top of it and **depends on the mode**, faithfully mirroring PostgreSQL:
+
+- **Autocommit** (§4.1): a statement error rolls back **only that statement** (its two-phase
+  pass guarantees it wrote nothing partial); autocommit continues and subsequent statements run
+  normally. This is PostgreSQL autocommit error behavior and exactly today's behavior — so the
+  corpus stays green.
+- **Explicit block** (§4.2): a statement error **aborts the transaction** — it enters the
+  **failed** state. Every subsequent statement except `ROLLBACK` (and `COMMIT`, treated as
+  `ROLLBACK`) is rejected with **`25P02 in_failed_sql_transaction`** until the block ends.
+  `ROLLBACK` clears the failed state. This matches PostgreSQL's "current transaction is aborted,
+  commands ignored until end of transaction block."
+
+New error codes (class 25, *invalid transaction state*), in
+[../errors/registry.toml](../errors/registry.toml):
+
+| code | name | raised when |
+|---|---|---|
+| `25001` | `active_sql_transaction` | `BEGIN` issued inside an explicit block (no nesting — §4.2) |
+| `25006` | `read_only_sql_transaction` | a write statement issued in a READ ONLY transaction (§4.3) |
+| `25P02` | `in_failed_sql_transaction` | any statement but `ROLLBACK`/`COMMIT` in a failed block (§6) |
+
+A `COMMIT`/`ROLLBACK` with no open block is a no-op success, **not** an error — so `25P01` is
+deliberately *not* registered (§4.2). These class-25 codes are a per-core SQL/API surface,
+asserted by the shared corpus only via the deterministic `BEGIN/…/ROLLBACK` visibility tests
+(§10).
+
+## 7. The rowid counter and other transactional state
+
+The no-PK synthetic rowid is a **monotonic counter** per table (`next_rowid`, reconstructed
+on load as `max(key)+1` — [../fileformat/format.md](../fileformat/format.md)). Under staging
+it is **part of the `Snapshot`** (per-`TableEntry`): pending `INSERT`s advance the `working`
+copy, and a **rollback** discards those allocations along with the rows (the counter returns to
+the committed value). Because the rowid is an **internal** key and never a user-visible
+sequence, this is correct and simpler than PostgreSQL sequences (which deliberately *burn* a
+value on rollback); jed has no such observable to preserve. Any future transactional counter
+(e.g. an `IDENTITY`/sequence, if ever added) would have to decide burn-vs-restore explicitly;
+the internal rowid restores.
+
+## 8. The reader-liveness watermark (forward hook for Phase 6)
+
+Every `Snapshot` carries its `txid`. The handle tracks the set of **live** snapshots
+(`committed`, any open write tx's `working`, and any held by read transactions / `Rows`
+cursors) and can report the **oldest live txid**. In Phase 5 this watermark does no work —
+memory reclamation is the language's job (§3). It is built now because **Phase 6's page
+free-list needs it**: a page freed at commit `T` may be reused only once `oldest_live_txid > T`,
+otherwise a still-open reader holding an older snapshot would observe a recycled page. The
+explicit read transactions of §4.3 are precisely the long-lived readers this guards. Tracking
+liveness in Phase 5 (where it is nearly free) is what keeps Phase 6 reclamation safe without a
+retrofit — the single tightest coupling between the two phases.
+
+## 9. Durability: the `synchronous` setting, this slice vs. Phase 6
+
+Commit (the snapshot swap, §2) and durability (the `fsync`) are **separate** (§1). A
+database-level **`synchronous`** setting governs *when* the fsync fires relative to the commit:
+
+- **`on` (default)** — a commit makes its changes durable **before it returns**: the existing
+  crash-safe recipe ([api.md](api.md) §3 — temp file + `fsync` + atomic `rename` + dir `fsync`
+  in the whole-image era; dirty-page write + meta-slot publish + `fsync` in Phase 6). Safe; the
+  per-statement cost under autocommit is the familiar SQLite/PG `synchronous_commit = on` cost,
+  and the escape hatch is an explicit `BEGIN … COMMIT` (one fsync for many statements).
+- **`off` / relaxed** — a commit is **visible in memory immediately** but the fsync is
+  **batched / deferred** (e.g. on a checkpoint, on `close`, or by a background flush). Faster;
+  a crash may lose the **last few committed transactions** but **never corrupts**, because the
+  on-disk image is always a valid *older* snapshot (the root is published atomically — §2,
+  [storage.md](storage.md) §4). This is the standard `PRAGMA synchronous=OFF` /
+  `synchronous_commit=off` trade.
+
+**This slice builds the seam, default `on`.** The fsync is already the single chokepoint at the
+commit boundary; `off` (batching/group-commit) is an additive change behind it and can land
+later. **Phase 5** keeps durability whole-image (the §3 recipe behind the §2 block seam);
+**Phase 6** changes only the materialization to incremental copy-on-write — write the dirty
+pages the new root introduced, publish the alternate meta slot — under a **frozen** transaction
+API, making the per-commit fsync cheap. The `synchronous` setting is orthogonal to both. (This
+refines CLAUDE.md §9's "writes … land durably on the SSD at commit": durably at commit under
+`synchronous=on`, batched under `off`.)
+
+## 10. Concurrency mechanism & the testing split
+
+- **Single writer, lock-free readers.** A read transaction takes **no** lock and never blocks —
+  not even during another transaction's commit swap, since it holds its own snapshot and does
+  not observe the pointer change (CLAUDE.md §3's "readers block only during commit" is the
+  conservative statement; the immutable-snapshot model does better). A read-write transaction
+  takes the **exclusive write lock** at `begin`/`BEGIN` and holds it until commit/rollback, so
+  at most one writer exists at a time (§3). Concurrency between cores' hosts is the host's
+  problem (CLAUDE.md §3), now mediated by snapshots + this one lock.
+- **Testing splits along the determinism line:**
+  - **Logical transaction semantics → the shared conformance corpus.** A
+    `BEGIN / INSERT / ROLLBACK / SELECT-shows-nothing` sequence, abort-poisoning (`25P02`), a
+    read-only-violation (`25006`), and visibility are all deterministic and single-handle, so
+    they are ordinary corpus entries (a `transactions` profile + `txn.*` capabilities in
+    [../conformance/manifest.toml](../conformance/manifest.toml)).
+  - **The concurrency mechanism → per-core tests.** "A reader does not block during a concurrent
+    commit," "the writer is exclusive," "a cursor opened before a commit still yields the
+    pre-commit rows" depend on thread scheduling and are **not** deterministic, so they live in
+    each core's own test suite — exactly as the `$N` bind parameters are tested per-core, not in
+    the corpus ([conformance.md](conformance.md) §1.2).
+
+## 11. Deferred / explicitly not foreclosed
+
+- **`SAVEPOINT` / nested transactions** — deferred. The structure anticipates them: `working`
+  becomes a **stack** of snapshots (a `SAVEPOINT` pushes, `ROLLBACK TO` pops to a marked root).
+  Until then a nested `BEGIN` is `25001` (§4.2). Not built; not foreclosed.
+- **Lazy write-lock acquisition** — a READ WRITE transaction takes the write lock at `begin`
+  (bbolt's model), holding it across any read-only prologue. Deferring acquisition until the
+  first write (more read concurrency) is a future optimization; not foreclosed, but it carries
+  upgrade/deadlock hazards a single up-front grab avoids.
+- **Group-commit / async durability** — the `synchronous=off` batching machinery beyond the
+  seam (background flusher, fsync coalescing across concurrent committers) is deferred (§9). The
+  seam is built; the policy is not.
+- **MVCC / multiple concurrent committed versions** — explicitly **not** this (CLAUDE.md §3):
+  one committed version plus one working set, period.
+- **Isolation levels other than snapshot** — no `SET TRANSACTION ISOLATION LEVEL`; snapshot
+  isolation is the single level (§5). `READ UNCOMMITTED` is impossible by construction.
+- **Two-phase commit / distributed transactions** — out of scope (single embedded file).

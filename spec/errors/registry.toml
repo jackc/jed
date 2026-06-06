@@ -93,6 +93,29 @@ name = "unique_violation"
 class = "integrity constraint violation"
 template = "duplicate key value violates primary key uniqueness"
 
+# --- invalid transaction state (class 25) -----------------------------------
+# Raised by the transaction-control surface (spec/design/transactions.md §4/§6):
+# BEGIN/COMMIT/ROLLBACK, the read-only access mode, and the failed-transaction
+# state. A per-core SQL/API surface — the shared corpus asserts these only via
+# deterministic BEGIN/…/ROLLBACK visibility tests, never the host-filesystem paths.
+[[error]]
+code = "25001"
+name = "active_sql_transaction"
+class = "invalid transaction state"
+template = "there is already a transaction in progress"
+
+[[error]]
+code = "25006"
+name = "read_only_sql_transaction"
+class = "invalid transaction state"
+template = "cannot execute {statement} in a read-only transaction"
+
+[[error]]
+code = "25P02"
+name = "in_failed_sql_transaction"
+class = "invalid transaction state"
+template = "current transaction is aborted, commands ignored until end of transaction block"
+
 # --- syntax error / access rule violation (class 42) ------------------------
 [[error]]
 code = "42601"

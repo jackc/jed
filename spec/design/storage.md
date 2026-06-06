@@ -128,6 +128,18 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 > are not needed for whole-image durability. `commit` is **explicit** and `close` does not
 > auto-flush (api.md §2).
 
+**The root swap, in two backings (transactions.md).** The §3 staging buffer + atomic publish
+this section describes is realized in [transactions.md](transactions.md): the writer's
+pending set is an **immutable in-memory `Snapshot`** (a working root built from the committed
+root via a persistent, structurally-shared ordered map), and the "root-pointer swap" of step
+3 is **the in-memory `Snapshot` swap in Phase 5** and **the meta-page root pointer in Phase
+6** — the same atomic publish, two backings. Phase 5 keeps durability whole-image (the recipe
+above, behind the §2 block seam); Phase 6 replaces only the materialization with incremental
+copy-on-write — write the dirty pages the new root introduced, `sync`, publish the alternate
+meta slot, `sync` — under a **frozen** transaction API. Because the in-memory store is already
+a copy-on-write B-tree (transactions.md §3), Phase 6's "B-tree interior pages" and "incremental
+COW commit" (§6 below) become one slice: page-backing the tree that already exists.
+
 ## 5. Pluggability (keep the door open — CLAUDE.md §9)
 
 SQL is the primary access path and everything must be reachable through it (CLAUDE.md §1),

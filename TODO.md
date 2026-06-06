@@ -588,14 +588,50 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > The real concurrency story. Currently only **per-statement** atomicity exists (UPDATE's
 > two-phase pass); the §3 single-writer staging buffer is still future. Couples tightly
 > with Phase 6 (the staging buffer *is* the in-memory pending set the COW commit flushes).
+>
+> **Design landed** ([spec/design/transactions.md](spec/design/transactions.md)): the model
+> is immutable **`Snapshot`**s + a writer's **working root**, unifying the staging area, the
+> read snapshot, and the pending set into one structure. The committed store becomes a
+> **persistent (copy-on-write) ordered B-tree** (decision **B1**) — chosen as the in-memory
+> precursor of the Phase-6 on-disk B-tree, so Phase 6 page-backs the tree rather than building
+> one. **jed adopts PostgreSQL autocommit** (correcting the accidental "no autocommit" policy,
+> which fell out of the whole-image writer) and **decouples the commit boundary from
+> durability** via a **`synchronous`** setting (default on; off batches the fsync). The host
+> declares a transaction's **access mode** — `BEGIN [READ ONLY|READ WRITE]` (SQL) or
+> `db.begin(writable)` / `db.view`/`db.update` (API); autocommit infers it from the statement
+> kind. Ships **fully durable + §3-correct on whole-image commit**; only on-disk *efficiency*
+> is deferred to Phase 6.
 
-- [ ] **In-memory staging area / pending write set** — accumulate a writer's changes off to
-      the side, last-committed state continuously readable (§3). _(size: L; §3)_
-- [ ] **`BEGIN` / `COMMIT` / `ROLLBACK`** — multi-statement transactions on top of the
-      staging buffer. _(size: L; deps: staging area)_
-- [ ] **Reader/writer concurrency semantics + tests** — readers never block except during
-      the commit root-swap window; single writer (§3). Determinism in tests is delicate.
-      _(size: L; §3)_
+- [x] **P5.0 — transaction model spec** — authored
+      [spec/design/transactions.md](spec/design/transactions.md) (snapshot/working-root model,
+      persistent-tree primitive, **autocommit + `synchronous` durability decoupling**,
+      **read-only vs read-write access modes** + the `Transaction`/`view`/`update` surface,
+      isolation, abort-on-error, the reader-liveness watermark, SAVEPOINT/nested
+      non-foreclosure); reconciled [storage.md §4](spec/design/storage.md),
+      [api.md](spec/design/api.md) (autocommit replaces "no autocommit"; `close` no longer drops
+      committed work; `begin`/`view`/`update`/`synchronous` added), and [CLAUDE.md §9](CLAUDE.md)
+      (durability decoupled from the commit boundary); registered class-25 errors **`25001`** /
+      **`25006`** / **`25P02`** in [registry.toml](spec/errors/registry.toml). _(size: S)_
+- [ ] **P5.1 — persistent ordered map + the snapshot refactor (no new SQL).** The load-bearing,
+      de-risked slice: introduce the copy-on-write ordered map and split `Database` into a
+      `committed` snapshot + a per-tx `working` root; **autocommit** each statement
+      (commit-on-success / rollback-on-error, mode inferred from the statement kind); commit
+      swaps + runs the **existing** whole-image durable write through a minimal block seam at the
+      single `synchronous`-gated fsync chokepoint; add `rollback`. **Corpus must stay green**
+      (autocommit preserves read-your-writes across statements). Carry now: per-snapshot `txid` +
+      the oldest-live-txid watermark (Phase 6's reclamation gate); the rowid counter as
+      transactional state (rollback discards pending allocations). _(size: L; §3; B1)_
+- [ ] **P5.2 — explicit transactions: SQL `BEGIN`/`COMMIT`/`ROLLBACK` + the `Transaction` API.**
+      `BEGIN [READ ONLY|READ WRITE]` (default read-write) + `db.begin(writable)` / `db.view` /
+      `db.update`; grammar + parsers + corpus. Errors: nested `BEGIN` → `25001`, write in a
+      read-only tx → `25006`. DDL is transactional. Shared corpus `transactions/` suite
+      (visibility/rollback/read-only-violation are deterministic, single-handle) + a
+      `transactions` profile / `txn.*` capabilities. _(size: L; deps: P5.1)_
+- [ ] **P5.3 — reader/writer concurrency + abort semantics + watermark.** Single-writer lock
+      (write tx exclusive; read tx lock-free, never blocks except the swap). Abort-on-error
+      poisons an explicit block (`25P02`); autocommit rolls back only the failed statement (=
+      today's behavior). Concurrency mechanism tested **per-core** (not the corpus — scheduling
+      isn't deterministic, like `$N`). _(size: L; §3; deps: P5.1)_
 
 ---
 
@@ -609,13 +645,29 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > **larger-than-RAM file that does not fall over**. RAM-sized is the dominant case but not a
 > hard limit — present work must not foreclose >>RAM operation (no full-residency assumption
 > above the storage seam; no operator that requires its whole input/output in RAM).
+>
+> **B1 collapses two XL items into one (transactions.md §3/§9).** Because Phase 5's committed
+> store is already a copy-on-write **B-tree** in memory, "incremental COW commit" and "B-tree
+> interior pages" below are **one slice (P6.1)**: page-back the existing tree — persisting only
+> its dirty nodes to free slots + a meta-root swap *is* the incremental commit. Lands behind a
+> **frozen** transaction API. The on-disk B-tree node layout/split rules become a **new §8 byte
+> contract** (golden fixtures required) — they are a private in-RAM detail in Phase 5.
 
-- [ ] **Incremental copy-on-write commit** — replace the whole-image serialize with
-      dirty-page-only writes + meta-page root swap (§9, storage.md §4). _(size: XL; deps: staging area)_
-- [ ] **Free-list / page reclamation** — reuse pages the new root no longer references
-      (not version GC; still not MVCC). _(size: L; deps: incremental commit)_
-- [ ] **B-tree interior pages + slotted page layout** — current layout is a flat sorted
-      record chain (storage.md §6). Needed for scale. _(size: XL; deps: incremental commit)_
+- [ ] **P6.1 — incremental COW commit = page-backed B-tree** _(merges ex "incremental COW
+      commit" + "B-tree interior pages")_ — replace the whole-image serialize with
+      dirty-page-only writes + meta-page root swap, the in-memory CoW B-tree persisted
+      node-for-page (§9, storage.md §4/§6, transactions.md §3/§9). New: the on-disk B-tree node
+      byte format + fixtures (a §8 hotspot). _(size: XL; deps: P5.1)_
+- [ ] **P6.2 — free-list / page reclamation** — reuse pages the new root no longer references
+      (not version GC; still not MVCC). **Gated on the oldest-live-snapshot txid watermark**
+      built in Phase 5 (transactions.md §8): a page freed at txid `T` is reusable only once
+      `oldest_live_txid > T`. Reconstruct-on-open first (diff reachable-vs-`page_count`); persist
+      later only for open speed. _(size: L; deps: P6.1)_
+- [ ] **P6.3 — `page_read` cost unit + corpus cost re-baseline** — when the B-tree leaf scan
+      replaces the flat chain, **add** `page_read` to [spec/cost/schedule.toml](spec/cost/schedule.toml)
+      (do **not** rename `storage_row_read` — they coexist, storage.md §6). Every `# cost:`
+      assertion in the corpus shifts; the re-baseline must land **atomically across all three
+      cores** (a §13 cross-core determinism contract). _(size: M; deps: P6.1; §13)_
 - [ ] **Buffer pool / demand paging** — make the resident set a **bounded cache of pages**
       with eviction (not the whole file), so a file far larger than RAM is served by paging in
       on demand. The `page_read` cost unit must count **logical** page accesses so the cache

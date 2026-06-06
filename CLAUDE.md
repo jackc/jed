@@ -314,7 +314,9 @@ biases below are where an overriding reason *does* steer away from PG.
   disks: choose block/page size, on-disk layout, and write patterns for SSD characteristics
   (page-aligned I/O, write-amplification awareness) rather than HDD seek-minimization. This
   pairs with the staging-buffer commit model (§3): writes batch in memory and land **durably**
-  on the SSD at commit.
+  on the SSD at commit — synchronously by default, or batched/deferred under a relaxed
+  `synchronous` setting that decouples the fsync from the (always-atomic) commit boundary
+  (`spec/design/transactions.md` §9; the commit *visibility* is unchanged, only fsync *timing*).
 - **Must not preclude larger-than-RAM (TB-scale) operation.** RAM-sized is the dominant
   case, *not* a hard assumption: the engine must eventually handle a **TB-scale file whose
   data far exceeds available RAM without falling over**, and **nothing in the current design
