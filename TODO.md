@@ -612,15 +612,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       committed work; `begin`/`view`/`update`/`synchronous` added), and [CLAUDE.md §9](CLAUDE.md)
       (durability decoupled from the commit boundary); registered class-25 errors **`25001`** /
       **`25006`** / **`25P02`** in [registry.toml](spec/errors/registry.toml). _(size: S)_
-- [ ] **P5.1 — persistent ordered map + the snapshot refactor (no new SQL).** The load-bearing,
-      de-risked slice: introduce the copy-on-write ordered map and split `Database` into a
-      `committed` snapshot + a per-tx `working` root; **autocommit** each statement
-      (commit-on-success / rollback-on-error, mode inferred from the statement kind); commit
-      swaps + runs the **existing** whole-image durable write through a minimal block seam at the
-      single `synchronous`-gated fsync chokepoint; add `rollback`. **Corpus must stay green**
-      (autocommit preserves read-your-writes across statements). Carry now: per-snapshot `txid` +
-      the oldest-live-txid watermark (Phase 6's reclamation gate); the rowid counter as
-      transactional state (rollback discards pending allocations). _(size: L; §3; B1)_
+- [x] **P5.1 — persistent ordered map + the snapshot refactor (no new SQL).** ✅ Done across
+      Rust/Go/TS (`ad68e54`/`4cd7778`/`3c2f3a0`). New `pmap.{rs,go,ts}`: a **copy-on-write
+      B-tree** (B1) whose O(1) clone is an independent, structurally-shared snapshot (insert
+      splits, delete rebalances — Cormen; unit-tested vs a reference map + a snapshot-independence
+      test). `TableStore` wraps it and is an O(1) clone, its API unchanged so the
+      executor/format/file are untouched. **Autocommit** (transactions.md §4.1): the statement
+      dispatcher captures the committed state cheaply, runs, and on success persists durably
+      through the **single `persist` chokepoint** (synchronous=on; TS injects it as a
+      `persistHook` storage seam), restoring on any error (rollback-on-error, incl. rolled-back
+      rowid allocations §7). `commit`/`rollback` are lenient no-op successes (§4.2); `close` no
+      longer drops committed work. Corpus stays green (66/0/0 all cores) + `rake verify` /
+      `fmt:check` clean. **Two pieces shifted to where they're first exercised:** the explicit
+      `working`-snapshot object lands with P5.2 (multi-statement blocks); the oldest-live-txid
+      **watermark** lands with P5.3 (concurrent read snapshots — until then it is trivially the
+      committed txid, with no reader to track and no page reclamation to gate). _(size: L; §3; B1)_
 - [ ] **P5.2 — explicit transactions: SQL `BEGIN`/`COMMIT`/`ROLLBACK` + the `Transaction` API.**
       `BEGIN [READ ONLY|READ WRITE]` (default read-write) + `db.begin(writable)` / `db.view` /
       `db.update`; grammar + parsers + corpus. Errors: nested `BEGIN` → `25001`, write in a
