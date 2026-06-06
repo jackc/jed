@@ -158,9 +158,17 @@ func appendU32(b []byte, v uint32) []byte {
 	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
-// ToImage serializes the whole database to one on-disk image (format.md). pageSize
-// is recorded in the meta page; txid is written into both meta slots.
+// ToImage serializes the whole committed state to one on-disk image (format.md). A thin wrapper
+// over Snapshot.ToImage for the committed snapshot — txid is written into both meta slots. (The
+// writer's working snapshot is serialized directly via Snapshot.ToImage at commit; this serves
+// callers/tests holding a *Database.)
 func (db *Database) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
+	return db.committed.ToImage(pageSize, txid)
+}
+
+// ToImage serializes this snapshot's whole state to one on-disk image (format.md). pageSize
+// is recorded in the meta page; txid is written into both meta slots.
+func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	ps := int(pageSize)
 	if ps < pageHeader+36 {
 		return nil, NewError(FeatureNotSupported, "page size too small for the format")
@@ -168,8 +176,8 @@ func (db *Database) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	capacity := ps - pageHeader
 
 	// Tables in ascending lowercased-name order (no map-iteration order leak).
-	keys := make([]string, 0, len(db.tables))
-	for k := range db.tables {
+	keys := make([]string, 0, len(s.tables))
+	for k := range s.tables {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
@@ -177,8 +185,8 @@ func (db *Database) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	// Per-table record bytes, in key order.
 	records := make([][][]byte, len(keys))
 	for ti, k := range keys {
-		table := db.tables[k]
-		for _, e := range db.stores[k].EntriesInKeyOrder() {
+		table := s.tables[k]
+		for _, e := range s.stores[k].EntriesInKeyOrder() {
 			records[ti] = append(records[ti], encodeRecord(table, e.Key, e.Row))
 		}
 	}
@@ -186,7 +194,7 @@ func (db *Database) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	// Catalog grouping depends only on entry sizes (independent of root_data_page).
 	entrySizes := make([]int, len(keys))
 	for ti, k := range keys {
-		entrySizes[ti] = len(tableEntryBytes(db.tables[k], 0))
+		entrySizes[ti] = len(tableEntryBytes(s.tables[k], 0))
 	}
 	catGroups, err := pack(entrySizes, capacity)
 	if err != nil {
@@ -233,7 +241,7 @@ func (db *Database) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 		}
 		var payload []byte
 		for _, ti := range group {
-			payload = append(payload, tableEntryBytes(db.tables[keys[ti]], rootDataPage[ti])...)
+			payload = append(payload, tableEntryBytes(s.tables[keys[ti]], rootDataPage[ti])...)
 		}
 		writePage(image, ps, int(index), pageCatalog, uint32(len(group)), next, payload)
 	}
@@ -273,11 +281,10 @@ func LoadDatabase(image []byte) (*Database, error) {
 		return nil, err
 	}
 
-	db := NewDatabase()
-	// Adopt the file's serialization parameters so a later commit round-trips them
-	// (spec/design/api.md §2).
-	db.pageSize = uint32(pageSize)
-	db.txid = mt.txid
+	// Build the committed snapshot from the image, then wrap it in a fresh handle that adopts the
+	// file's serialization parameters (spec/design/api.md §2).
+	snap := newSnapshot()
+	snap.txid = mt.txid
 	catPage := mt.rootPage
 	for catPage != 0 {
 		pg, err := readPage(image, pageSize, catPage)
@@ -299,13 +306,16 @@ func LoadDatabase(image []byte) (*Database, error) {
 			}
 			name := table.Name
 			hasPK := table.PrimaryKeyIndex() >= 0
-			db.putTable(table)
-			if err := readDataChain(image, pageSize, tableRoot, colTypes, hasPK, name, db); err != nil {
+			snap.putTable(table)
+			if err := readDataChain(image, pageSize, tableRoot, colTypes, hasPK, name, snap); err != nil {
 				return nil, err
 			}
 		}
 		catPage = pg.nextPage
 	}
+	db := NewDatabase()
+	db.pageSize = uint32(pageSize)
+	db.committed = snap
 	return db, nil
 }
 
@@ -313,8 +323,8 @@ func LoadDatabase(image []byte) (*Database, error) {
 // table with no primary key, the keys are synthetic int64 rowids; advance the store's
 // rowid counter past the largest so future inserts don't collide with a loaded key
 // (spec/fileformat/format.md). No format change — keys are stored verbatim.
-func readDataChain(image []byte, ps int, root uint32, colTypes []ScalarType, hasPK bool, name string, db *Database) error {
-	store := db.stores[strings.ToLower(name)]
+func readDataChain(image []byte, ps int, root uint32, colTypes []ScalarType, hasPK bool, name string, snap *Snapshot) error {
+	store := snap.stores[strings.ToLower(name)]
 	dp := root
 	for dp != 0 {
 		pg, err := readPage(image, ps, dp)

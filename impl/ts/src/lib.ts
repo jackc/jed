@@ -150,7 +150,7 @@ export function executeParams(db: Database, sql: string, params: Value[]): Outco
 }
 
 // --- public surface (re-exports) ---
-export { Database, DEFAULT_PAGE_SIZE } from "./executor.ts";
+export { Database, DEFAULT_PAGE_SIZE, Snapshot } from "./executor.ts";
 export type { Outcome } from "./executor.ts";
 export { parseSQL } from "./parser.ts";
 export { EngineError, sqlStateCode } from "./errors.ts";

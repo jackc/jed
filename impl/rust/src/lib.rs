@@ -30,7 +30,7 @@ pub mod value;
 pub use api::{PreparedStatement, Rows, Transaction};
 pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
-pub use executor::{DEFAULT_PAGE_SIZE, Database, Outcome};
+pub use executor::{DEFAULT_PAGE_SIZE, Database, Outcome, Snapshot};
 pub use file::DatabaseOptions;
 pub use parser::Parser;
 pub use value::Value;

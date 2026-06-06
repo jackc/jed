@@ -39,51 +39,117 @@ type Outcome struct {
 // used for a fresh in-memory or newly-created database when no explicit size is given.
 const DefaultPageSize uint32 = 8192
 
-// Database is the whole database: catalog + per-table in-memory stores. One committed state plus,
-// while an explicit block is open, the writer's working set (CLAUDE.md §3, transactions.md §2):
-// under autocommit tables/stores ARE the committed state; inside a READ WRITE block they are the
-// working set and tx.base* holds the committed state to restore on ROLLBACK.
-type Database struct {
+// Snapshot is an immutable committed (or in-progress working) database state — the catalog + each
+// table's store + the commit counter (spec/design/transactions.md §2). The committed state is one
+// of these; a write transaction builds a new one from it (the persistent stores clone O(1) —
+// pmap.go / §3). A reader holds a *Snapshot and is thereby stable for its life: a later commit
+// produces a new Snapshot and never mutates this one. (P5.3a is single-handle; sharing a *Snapshot
+// across goroutines is P5.3b.)
+type Snapshot struct {
+	// txid is the snapshot's version — the commit counter (transactions.md §8; the watermark unit).
+	txid   uint64
 	tables map[string]*Table
 	stores map[string]*TableStore
-	// tx is the open explicit transaction, or nil under autocommit (transactions.md §4.1/§4.2).
+}
+
+// newSnapshot builds an empty snapshot.
+func newSnapshot() *Snapshot {
+	return &Snapshot{tables: make(map[string]*Table), stores: make(map[string]*TableStore)}
+}
+
+// clone returns an independent copy: the catalog map is shallow (Table structs are never mutated
+// in place — only added/removed) and each store is an O(1) persistent-map clone (pmap.go).
+func (s *Snapshot) clone() *Snapshot {
+	tables := make(map[string]*Table, len(s.tables))
+	for k, v := range s.tables {
+		tables[k] = v
+	}
+	stores := make(map[string]*TableStore, len(s.stores))
+	for k, v := range s.stores {
+		stores[k] = v.clone()
+	}
+	return &Snapshot{txid: s.txid, tables: tables, stores: stores}
+}
+
+// table looks up a table definition by name (case-insensitive).
+func (s *Snapshot) table(name string) (*Table, bool) {
+	t, ok := s.tables[strings.ToLower(name)]
+	return t, ok
+}
+
+// store returns a table's store (the table is known to exist).
+func (s *Snapshot) store(name string) *TableStore { return s.stores[strings.ToLower(name)] }
+
+// putTable registers a new table and its empty store.
+func (s *Snapshot) putTable(t *Table) {
+	key := strings.ToLower(t.Name)
+	s.stores[key] = NewTableStore()
+	s.tables[key] = t
+}
+
+// removeTable removes a table's definition and its store (DROP TABLE).
+func (s *Snapshot) removeTable(key string) {
+	delete(s.tables, key)
+	delete(s.stores, key)
+}
+
+// Database is the database handle: the last committed Snapshot plus, while a transaction is open,
+// the writer's working snapshot (CLAUDE.md §3, transactions.md §2). Reads run against the visible
+// snapshot — the open transaction's working if any, else committed; a write mutates working and
+// commit swaps committed := working (rollback drops working, since committed was never touched).
+// Every write — autocommit included — runs as a transaction, which unifies the two paths.
+type Database struct {
+	committed *Snapshot
+	// tx is the open transaction, or nil under autocommit (transactions.md §4.1); a single-statement
+	// autocommit write opens one implicitly for its duration.
 	tx *activeTx
 	// path is the backing file (empty for an in-memory database). Set by the host API
 	// Open/Create (spec/design/api.md §2); Commit writes here.
 	path string
-	// txid is the monotonic commit counter: read from the file on open, bumped per Commit.
-	txid uint64
 	// pageSize is the page size this database serializes with (fixed for the life of a file).
 	pageSize uint32
 }
 
-// activeTx is an open explicit transaction block (spec/design/transactions.md §4.2). writable is
-// the access mode (READ WRITE vs READ ONLY — a write in a READ ONLY block is 25006); failed marks
-// an aborted block (every later statement but COMMIT/ROLLBACK is 25P02 — §6); base* is the
-// committed state captured at BEGIN, restored on ROLLBACK (and on COMMIT of a failed block). A
-// READ ONLY block never mutates, so it captures nothing.
+// activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
+// (READ WRITE vs READ ONLY — a write in a READ ONLY block is 25006); failed marks an aborted block
+// (every later statement but COMMIT/ROLLBACK is 25P02 — §6). working is the transaction's snapshot:
+// a writable tx mutates it in place and publishes it at commit; a read-only tx reads it unchanged
+// (read-your-snapshot, §4.3). committed is untouched until commit, so ROLLBACK just drops this.
 type activeTx struct {
-	writable   bool
-	failed     bool
-	baseTables map[string]*Table
-	baseStores map[string]*TableStore
+	writable bool
+	failed   bool
+	working  *Snapshot
 }
 
 // NewDatabase builds an empty in-memory database.
 func NewDatabase() *Database {
-	return &Database{
-		tables:   make(map[string]*Table),
-		stores:   make(map[string]*TableStore),
-		pageSize: DefaultPageSize,
-	}
+	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize}
 }
+
+// readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
+// writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
+func (db *Database) readSnap() *Snapshot {
+	if db.tx != nil {
+		return db.tx.working
+	}
+	return db.committed
+}
+
+// working is the snapshot a write mutates — the open transaction's working. A write only ever runs
+// with a transaction open (autocommit opens one implicitly), so tx is non-nil here.
+func (db *Database) working() *Snapshot { return db.tx.working }
 
 // InTransaction reports whether an explicit transaction block is currently open
 // (spec/design/transactions.md §4.2). False under autocommit. Used by the host Transaction surface.
 func (db *Database) InTransaction() bool { return db.tx != nil }
 
-// Txid is the monotonic commit counter (spec/design/api.md §2).
-func (db *Database) Txid() uint64 { return db.txid }
+// Txid is the monotonic commit counter (spec/design/api.md §2): the committed snapshot's version.
+func (db *Database) Txid() uint64 { return db.committed.txid }
+
+// OldestLiveTxid is the oldest still-live snapshot's txid (spec/design/transactions.md §8) — the
+// Phase-6 free-list reclamation gate. Single-handle (P5.3a) it is trivially the committed txid; the
+// P5.3b shared read snapshots make it meaningful.
+func (db *Database) OldestLiveTxid() uint64 { return db.committed.txid }
 
 // PageSize is the page size this database serializes with (spec/design/api.md §2).
 func (db *Database) PageSize() uint32 { return db.pageSize }
@@ -91,17 +157,15 @@ func (db *Database) PageSize() uint32 { return db.pageSize }
 // Path is the backing file path, or "" for an in-memory database.
 func (db *Database) Path() string { return db.path }
 
-// Table looks up a table definition by name (case-insensitive).
+// Table looks up a table definition by name (case-insensitive) in the visible snapshot.
 func (db *Database) Table(name string) (*Table, bool) {
-	t, ok := db.tables[strings.ToLower(name)]
-	return t, ok
+	return db.readSnap().table(name)
 }
 
-// putTable registers a new table and its empty store.
+// putTable registers a new table and its empty store in the working snapshot (DDL is
+// transactional — transactions.md §4.5).
 func (db *Database) putTable(t *Table) {
-	key := strings.ToLower(t.Name)
-	db.stores[key] = NewTableStore()
-	db.tables[key] = t
+	db.working().putTable(t)
 }
 
 // ExecuteStmt executes one parsed statement with no bind parameters.
@@ -161,82 +225,70 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 		return outcome, nil
 	}
 
-	// Autocommit (no open block).
+	// Autocommit (no open block): an autocommit write runs as an implicit single-statement
+	// transaction — open a working snapshot off committed, run, then commit on success / discard on
+	// error. Because the write mutates only working, an error leaves committed untouched (no restore
+	// needed); rolled-back rowid allocations vanish with working (§7).
 	if !stmtIsWrite(stmt) {
 		return db.dispatchStmt(stmt, params)
 	}
-	savedTables, savedStores := db.snapshotState()
+	db.tx = &activeTx{writable: true, working: db.committed.clone()}
 	outcome, err := db.dispatchStmt(stmt, params)
-	if err == nil {
-		err = db.persist()
-	}
 	if err != nil {
-		db.tables = savedTables
-		db.stores = savedStores
+		db.tx = nil
 		return Outcome{}, err
+	}
+	if _, cerr := db.commitTx(); cerr != nil {
+		return Outcome{}, cerr
 	}
 	return outcome, nil
 }
 
-// beginTx opens an explicit transaction block (spec/design/transactions.md §4.2). writable is the
-// access mode (READ WRITE vs READ ONLY). A nested BEGIN (a block is already open) is 25001. A
-// READ WRITE block captures the committed state so ROLLBACK can restore it; a READ ONLY block
-// never mutates, so it captures nothing. Returns a zero-cost statement outcome.
+// beginTx opens an explicit transaction (spec/design/transactions.md §4.2). A nested BEGIN (a block
+// is already open) is 25001. The committed snapshot is captured as the transaction's working
+// snapshot — a writable tx mutates it in place; a read-only tx reads it unchanged (read-your-
+// snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.go) and the catalog is shallow.
+// committed is untouched until commit.
 func (db *Database) beginTx(writable bool) (Outcome, error) {
 	if db.tx != nil {
 		return Outcome{}, NewError(ActiveSqlTransaction, "there is already a transaction in progress")
 	}
-	tx := &activeTx{writable: writable}
-	if writable {
-		tx.baseTables, tx.baseStores = db.snapshotState()
-	}
-	db.tx = tx
+	db.tx = &activeTx{writable: writable, working: db.committed.clone()}
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
 // commitTx commits the current transaction (spec/design/transactions.md §4.2). With no open block
-// it is a lenient no-op success. A failed block commits as a ROLLBACK (PostgreSQL). A READ WRITE
-// block publishes its working set durably (the single persist chokepoint, §9); a durable-write
-// failure restores the committed state and propagates. A READ ONLY block publishes nothing.
+// it is a lenient no-op success. A failed block, or any read-only tx, publishes nothing — the
+// working snapshot is dropped (a failed COMMIT is thus a ROLLBACK, PostgreSQL). A READ WRITE block
+// publishes its working snapshot: bump its txid (file-backed only — an in-memory database stays at
+// txid 0), make it durable (the single persist chokepoint, §9), then swap it in as committed. A
+// durable-write failure leaves committed untouched and propagates. Returns to autocommit.
 func (db *Database) commitTx() (Outcome, error) {
 	tx := db.tx
 	if tx == nil {
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 	}
 	db.tx = nil
-	if tx.failed {
-		// COMMIT of an aborted block silently rolls back (PostgreSQL).
-		if tx.writable {
-			db.tables = tx.baseTables
-			db.stores = tx.baseStores
-		}
+	if tx.failed || !tx.writable {
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 	}
-	if tx.writable {
-		if err := db.persist(); err != nil {
-			// The commit failed: roll back to the committed state and propagate.
-			db.tables = tx.baseTables
-			db.stores = tx.baseStores
-			return Outcome{}, err
-		}
+	working := tx.working
+	if db.path != "" {
+		working.txid = db.committed.txid + 1
 	}
+	if err := db.persist(working); err != nil { // no-op for an in-memory database
+		return Outcome{}, err
+	}
+	db.committed = working
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
 // rollbackTx rolls back the current transaction (spec/design/transactions.md §4.2). With no open
-// block it is a no-op success. A READ WRITE block discards its working set — every staged
-// INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7) — by restoring the
-// committed state captured at BEGIN; a READ ONLY block mutated nothing, so there is nothing to
-// restore.
+// block it is a no-op success. Otherwise the working snapshot is dropped — every staged
+// INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7), vanish with it;
+// committed was never mutated, so there is nothing to restore. Returns to autocommit.
 func (db *Database) rollbackTx() (Outcome, error) {
-	tx := db.tx
-	if tx != nil {
-		db.tx = nil
-		if tx.writable {
-			db.tables = tx.baseTables
-			db.stores = tx.baseStores
-		}
-	}
+	db.tx = nil
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
@@ -265,21 +317,6 @@ func stmtKind(stmt Statement) string {
 	default:
 		return "statement"
 	}
-}
-
-// snapshotState captures the committed catalog + stores cheaply for rollback-on-error: each
-// store is an O(1) persistent-map clone, and Table structs are never mutated in place (only
-// added/removed), so the catalog map is a shallow copy.
-func (db *Database) snapshotState() (map[string]*Table, map[string]*TableStore) {
-	tables := make(map[string]*Table, len(db.tables))
-	for k, v := range db.tables {
-		tables[k] = v
-	}
-	stores := make(map[string]*TableStore, len(db.stores))
-	for k, v := range db.stores {
-		stores[k] = v.clone()
-	}
-	return tables, stores
 }
 
 // dispatchStmt routes one parsed statement to its executor. The autocommit transaction handling
@@ -393,9 +430,7 @@ func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
 	if _, ok := db.Table(dt.Name); !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+dt.Name)
 	}
-	key := strings.ToLower(dt.Name)
-	delete(db.tables, key)
-	delete(db.stores, key)
+	db.working().removeTable(strings.ToLower(dt.Name))
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
@@ -415,7 +450,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ins.Table)
 	}
-	store := db.stores[strings.ToLower(ins.Table)]
+	store := db.working().store(ins.Table)
 	pk := table.PrimaryKeyIndex()
 
 	// Resolve the optional column list once. provided[i] >= 0 means table column i takes that
@@ -672,7 +707,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		}
 	}
 	env := &evalEnv{exec: db, params: bound}
-	store := db.stores[strings.ToLower(del.Table)]
+	store := db.working().store(del.Table)
 	var keys [][]byte
 	for _, e := range store.EntriesInKeyOrder() {
 		meter.Charge(Costs.StorageRowRead)
@@ -781,7 +816,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		}
 	}
 	env := &evalEnv{exec: db, params: bound}
-	store := db.stores[strings.ToLower(upd.Table)]
+	store := db.working().store(upd.Table)
 	type pending struct {
 		key []byte
 		row Row
@@ -821,10 +856,10 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
 }
 
-// RowsInKeyOrder returns a table's rows in primary-key (encoded byte) order, or nil
-// if the table does not exist. Used by SELECT and by tests.
+// RowsInKeyOrder returns a table's rows in primary-key (encoded byte) order in the visible
+// snapshot, or nil if the table does not exist. Used by SELECT and by tests.
 func (db *Database) RowsInKeyOrder(name string) []Row {
-	store, ok := db.stores[strings.ToLower(name)]
+	store, ok := db.readSnap().stores[strings.ToLower(name)]
 	if !ok {
 		return nil
 	}

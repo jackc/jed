@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 
-import { DEFAULT_PAGE_SIZE, Database } from "./executor.ts";
+import { DEFAULT_PAGE_SIZE, Database, Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import { loadDatabase, toImage } from "./format.ts";
 
@@ -34,9 +34,9 @@ export function create(path: string, opts: DatabaseOptions = {}): Database {
   const db = new Database();
   db.path = path;
   db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
-  db.txid = 0n;
-  db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
-  persistImpl(db); // materialize the empty image (txid 0 -> 1)
+  db.committed.txid = 1n; // the initial empty image is committed as txid 1
+  db.persistHook = persistImpl; // publish each later commit durably (transactions.md §4.1/§9)
+  persistImpl(db, db.committed); // materialize it durably
   return db;
 }
 
@@ -60,17 +60,15 @@ export function open(path: string): Database {
   return db;
 }
 
-// persistImpl durably writes the whole current image to the backing file and increments txid —
-// the single synchronous-commit chokepoint (spec/design/transactions.md §9), installed as the
-// Database.persistHook by create/open. The autocommit path calls it after every successful write
-// statement; create calls it for the initial image. An in-memory database (no path) is a no-op
-// success. The future synchronous=off mode (batched/deferred fsync) gates here.
-function persistImpl(db: Database): void {
+// persistImpl durably writes snap's whole image to the backing file — the single
+// synchronous-commit chokepoint (spec/design/transactions.md §9), installed as the
+// Database.persistHook by create/open. commitTx calls it with the working snapshot being published
+// (at the snapshot's own txid); create calls it for the initial committed image. It does not mutate
+// db (the txid lives in the snapshot, and the committed swap happens in commitTx only after this
+// returns). An in-memory database has no persistHook. The future synchronous=off mode gates here.
+function persistImpl(db: Database, snap: Snapshot): void {
   if (db.path === null) return;
-  const nextTxid = db.txid + 1n;
-  const bytes = toImage(db, db.pageSize, nextTxid);
-  writeAtomic(db.path, bytes);
-  db.txid = nextTxid;
+  writeAtomic(db.path, toImage(snap, db.pageSize, snap.txid));
 }
 
 // commit commits the current transaction (spec/design/api.md §2.2, transactions.md §4.2).

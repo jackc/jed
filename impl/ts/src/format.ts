@@ -14,7 +14,7 @@ import { type Column, type Table, primaryKeyIndex } from "./catalog.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
-import { Database } from "./executor.ts";
+import { Database, Snapshot } from "./executor.ts";
 import type { Row } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -288,9 +288,12 @@ function pack(sizes: number[], capacity: number): number[][] {
   return groups;
 }
 
-// toImage serializes the whole database to one on-disk image (format.md). pageSize is
-// recorded in the meta page; txid is written into both meta slots.
-export function toImage(db: Database, pageSize: number, txid: bigint): Uint8Array {
+// toImage serializes a snapshot's whole state to one on-disk image (format.md). pageSize is
+// recorded in the meta page; txid is written into both meta slots. Accepts a Snapshot directly
+// (the writer's working snapshot at commit) or a Database (serializing its committed snapshot —
+// the form callers/tests holding a Database use).
+export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint): Uint8Array {
+  const snap = src instanceof Snapshot ? src : src.committed;
   const ps = pageSize;
   if (ps < PAGE_HEADER + 36) {
     throw engineError("feature_not_supported", "page size too small for the format");
@@ -298,15 +301,15 @@ export function toImage(db: Database, pageSize: number, txid: bigint): Uint8Arra
   const capacity = ps - PAGE_HEADER;
 
   // Tables in ascending lowercased-name order (no map-iteration order leak).
-  const keys = [...db.tables.keys()].sort();
+  const keys = [...snap.tables.keys()].sort();
 
   // Per-table record bytes, in key order.
   const records: Uint8Array[][] = keys.map((k) =>
-    db.stores.get(k)!.entriesInKeyOrder().map((e) => encodeRecord(db.tables.get(k)!, e.key, e.row)),
+    snap.stores.get(k)!.entriesInKeyOrder().map((e) => encodeRecord(snap.tables.get(k)!, e.key, e.row)),
   );
 
   // Catalog grouping depends only on entry sizes (independent of root_data_page).
-  const entrySizes = keys.map((k) => tableEntryBytes(db.tables.get(k)!, 0).length);
+  const entrySizes = keys.map((k) => tableEntryBytes(snap.tables.get(k)!, 0).length);
   const catGroups = pack(entrySizes, capacity);
   const numCatPages = catGroups.length;
 
@@ -340,7 +343,7 @@ export function toImage(db: Database, pageSize: number, txid: bigint): Uint8Arra
     const group = catGroups[gi]!;
     const index = ROOT_PAGE + gi;
     const next = gi + 1 < catGroups.length ? index + 1 : 0;
-    const parts = group.map((ti) => tableEntryBytes(db.tables.get(keys[ti]!)!, rootDataPage[ti]!));
+    const parts = group.map((ti) => tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!));
     writePage(image, dv, ps, index, PAGE_CATALOG, group.length, next, concat(parts));
   }
 
@@ -372,11 +375,9 @@ export function loadDatabase(image: Uint8Array): Database {
   }
   const mt = selectMeta(image, dv, pageSize);
 
-  const db = new Database();
-  // Adopt the file's serialization parameters so a later commit round-trips them
-  // (spec/design/api.md §2).
-  db.pageSize = pageSize;
-  db.txid = mt.txid;
+  // Build the committed snapshot from the image, then wrap it in a fresh handle that adopts the
+  // file's serialization parameters (spec/design/api.md §2).
+  const snap = new Snapshot(mt.txid);
   let catPage = mt.rootPage;
   while (catPage !== 0) {
     const pg = readPage(image, dv, pageSize, catPage);
@@ -388,11 +389,14 @@ export function loadDatabase(image: Uint8Array): Database {
       const { table, root } = decodeTableEntry(pg.payload, cur);
       const colTypes = table.columns.map((c) => c.type);
       const hasPK = primaryKeyIndex(table) >= 0;
-      db.putTable(table);
-      readDataChain(image, dv, pageSize, root, colTypes, hasPK, table.name, db);
+      snap.putTable(table);
+      readDataChain(image, dv, pageSize, root, colTypes, hasPK, table.name, snap);
     }
     catPage = pg.nextPage;
   }
+  const db = new Database();
+  db.pageSize = pageSize;
+  db.committed = snap;
   return db;
 }
 
@@ -408,9 +412,9 @@ function readDataChain(
   colTypes: ScalarType[],
   hasPK: boolean,
   name: string,
-  db: Database,
+  snap: Snapshot,
 ): void {
-  const store = db.stores.get(name.toLowerCase())!;
+  const store = snap.stores.get(name.toLowerCase())!;
   let dp = root;
   while (dp !== 0) {
     const pg = readPage(image, dv, ps, dp);

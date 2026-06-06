@@ -37,8 +37,8 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 	db := NewDatabase()
 	db.path = path
 	db.pageSize = opts.PageSize
-	db.txid = 0
-	if err := db.persist(); err != nil { // materialize the empty image (txid 0 -> 1)
+	db.committed.txid = 1                            // the initial empty image is committed as txid 1
+	if err := db.persist(db.committed); err != nil { // materialize it durably
 		return nil, err
 	}
 	return db, nil
@@ -63,25 +63,21 @@ func Open(path string) (*Database, error) {
 	return db, nil
 }
 
-// persist durably writes the whole current image to the backing file and increments txid — the
-// single synchronous-commit chokepoint (spec/design/transactions.md §9). Called by Create (the
-// initial image) and by the autocommit path after every successful write statement. An
-// in-memory database (no path) is a no-op success. The future synchronous=off mode
-// (batched/deferred fsync) gates here.
-func (db *Database) persist() error {
+// persist durably writes snap's whole image to the backing file — the single synchronous-commit
+// chokepoint (spec/design/transactions.md §9). Called by Create (the initial committed image) and
+// by commitTx for the working snapshot being published, at the snapshot's own txid. An in-memory
+// database (no path) is a no-op success; it does not mutate db (the txid lives in the snapshot, and
+// the committed swap happens in commitTx only after this returns nil). The future synchronous=off
+// mode (batched/deferred fsync) gates here.
+func (db *Database) persist(snap *Snapshot) error {
 	if db.path == "" {
 		return nil
 	}
-	nextTxid := db.txid + 1
-	bytes, err := db.ToImage(db.pageSize, nextTxid)
+	bytes, err := snap.ToImage(db.pageSize, snap.txid)
 	if err != nil {
 		return err
 	}
-	if err := writeAtomic(db.path, bytes); err != nil {
-		return err
-	}
-	db.txid = nextTxid
-	return nil
+	return writeAtomic(db.path, bytes)
 }
 
 // Commit commits the current transaction (spec/design/api.md §2.2, transactions.md §4.2).

@@ -101,48 +101,121 @@ type SelectResult = {
 // used for a fresh in-memory or newly-created database when no explicit size is given.
 export const DEFAULT_PAGE_SIZE = 8192;
 
-// ActiveTx is an open explicit transaction block (spec/design/transactions.md §4.2). `writable` is
-// the access mode (READ WRITE vs READ ONLY — a write in a READ ONLY block is 25006); `failed` marks
-// an aborted block (every later statement but COMMIT/ROLLBACK is 25P02 — §6); base* is the
-// committed state captured at BEGIN, restored on ROLLBACK (and on COMMIT of a failed block). A READ
-// ONLY block never mutates, so it captures nothing.
+// Snapshot is an immutable committed (or in-progress working) database state — the catalog + each
+// table's store + the commit counter (spec/design/transactions.md §2). The committed state is one
+// of these; a write transaction builds a new one from it (the persistent stores clone O(1) —
+// pmap.ts / §3). A reader holds a Snapshot and is thereby stable for its life: a later commit
+// produces a new Snapshot and never mutates this one. (JavaScript has no shared-memory threads for
+// live objects, so P5.3b gives snapshot ISOLATION across async interleavings, not CPU parallelism.)
+export class Snapshot {
+  // txid is the snapshot's version — the commit counter (transactions.md §8; the watermark unit).
+  txid: bigint;
+  tables: Map<string, Table>;
+  stores: Map<string, TableStore>;
+
+  constructor(
+    txid: bigint = 0n,
+    tables: Map<string, Table> = new Map(),
+    stores: Map<string, TableStore> = new Map(),
+  ) {
+    this.txid = txid;
+    this.tables = tables;
+    this.stores = stores;
+  }
+
+  // clone returns an independent copy: the catalog map is shallow (Table objects are never mutated
+  // in place — only added/removed) and each store is an O(1) persistent-map clone (pmap.ts).
+  clone(): Snapshot {
+    return new Snapshot(this.txid, new Map(this.tables), cloneStores(this.stores));
+  }
+
+  // table looks up a table definition by name (case-insensitive).
+  table(name: string): Table | undefined {
+    return this.tables.get(name.toLowerCase());
+  }
+
+  // store returns a table's store (the table is known to exist).
+  store(name: string): TableStore {
+    return this.stores.get(name.toLowerCase())!;
+  }
+
+  // putTable registers a new table and its empty store.
+  putTable(t: Table): void {
+    const key = t.name.toLowerCase();
+    this.stores.set(key, new TableStore());
+    this.tables.set(key, t);
+  }
+
+  // removeTable removes a table's definition and its store (DROP TABLE).
+  removeTable(key: string): void {
+    this.tables.delete(key);
+    this.stores.delete(key);
+  }
+
+  // rowsInKeyOrder returns a table's rows in primary-key order, or [] if the table is absent.
+  rowsInKeyOrder(name: string): Row[] {
+    const store = this.stores.get(name.toLowerCase());
+    return store ? store.iterInKeyOrder() : [];
+  }
+}
+
+// ActiveTx is an open transaction (spec/design/transactions.md §4.2). `writable` is the access mode
+// (READ WRITE vs READ ONLY — a write in a READ ONLY block is 25006); `failed` marks an aborted block
+// (every later statement but COMMIT/ROLLBACK is 25P02 — §6). `working` is the transaction's
+// snapshot: a writable tx mutates it in place and publishes it at commit; a read-only tx reads it
+// unchanged (read-your-snapshot, §4.3). committed is untouched until commit, so ROLLBACK drops this.
 type ActiveTx = {
   writable: boolean;
   failed: boolean;
-  baseTables: Map<string, Table>;
-  baseStores: Map<string, TableStore>;
+  working: Snapshot;
 };
 
 export class Database {
-  // Not readonly: a write transaction's rollback restores these by reassignment (rollbackTx /
-  // executeStmtParams). The stores hold persistent maps, so a snapshot is an O(1) clone.
-  tables: Map<string, Table>;
-  stores: Map<string, TableStore>;
-  // The open explicit transaction, or null under autocommit (transactions.md §4.1/§4.2). Under
-  // autocommit `tables`/`stores` are the committed state; inside a READ WRITE block they are the
-  // working set and `tx.base*` holds the committed state to restore on ROLLBACK.
+  // The last committed, immutable state — what fresh readers (and autocommit reads) see.
+  committed: Snapshot;
+  // The open transaction, or null under autocommit (transactions.md §4.1/§4.2); a single-statement
+  // autocommit write opens one implicitly for its duration.
   tx: ActiveTx | null;
-  // Persistence identity (spec/design/api.md §2): the backing file path (null for in-memory),
-  // the monotonic commit counter, and the page size this database serializes with. Set by the
-  // host API open/create; commit writes here.
+  // Persistence identity (spec/design/api.md §2): the backing file path (null for in-memory) and
+  // the page size this database serializes with. The commit counter lives in `committed.txid`.
   path: string | null;
-  txid: bigint;
   pageSize: number;
   // persistHook is the durable-write seam (spec/design/storage.md §2): null for an in-memory
-  // database (autocommit is in-memory only), set by the file host (file.ts create/open) to the
-  // synchronous whole-image write. The autocommit path (executeStmtParams) calls it after a
-  // successful write statement (transactions.md §4.1/§9). Injecting it here keeps the executor
-  // free of a file-module dependency (no executor→file import cycle).
-  persistHook: ((db: Database) => void) | null;
+  // database, set by the file host (file.ts create/open) to the synchronous whole-image write. It
+  // is called by commitTx with the working snapshot being published (transactions.md §4.1/§9).
+  // Injecting it here keeps the executor free of a file-module dependency (no executor→file cycle).
+  persistHook: ((db: Database, snap: Snapshot) => void) | null;
 
   constructor() {
-    this.tables = new Map();
-    this.stores = new Map();
+    this.committed = new Snapshot();
     this.tx = null;
     this.path = null;
-    this.txid = 0n;
     this.pageSize = DEFAULT_PAGE_SIZE;
     this.persistHook = null;
+  }
+
+  // readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
+  // writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
+  private readSnap(): Snapshot {
+    return this.tx !== null ? this.tx.working : this.committed;
+  }
+
+  // working is the snapshot a write mutates — the open transaction's working. A write only ever
+  // runs with a transaction open (autocommit opens one implicitly), so tx is non-null here.
+  private working(): Snapshot {
+    return this.tx!.working;
+  }
+
+  // The monotonic commit counter (spec/design/api.md §2): the committed snapshot's version.
+  get txid(): bigint {
+    return this.committed.txid;
+  }
+
+  // oldestLiveTxid is the oldest still-live snapshot's txid (spec/design/transactions.md §8) — the
+  // Phase-6 free-list reclamation gate. Single-handle (P5.3a) it is trivially the committed txid;
+  // the P5.3b shared read snapshots make it meaningful.
+  oldestLiveTxid(): bigint {
+    return this.committed.txid;
   }
 
   // inTransaction reports whether an explicit transaction block is currently open
@@ -151,16 +224,15 @@ export class Database {
     return this.tx !== null;
   }
 
-  // table looks up a table definition by name (case-insensitive).
+  // table looks up a table definition by name (case-insensitive) in the visible snapshot.
   table(name: string): Table | undefined {
-    return this.tables.get(name.toLowerCase());
+    return this.readSnap().table(name);
   }
 
-  // putTable registers a new table and its empty store.
+  // putTable registers a new table and its empty store in the working snapshot (DDL is
+  // transactional — transactions.md §4.5).
   putTable(t: Table): void {
-    const key = t.name.toLowerCase();
-    this.stores.set(key, new TableStore());
-    this.tables.set(key, t);
+    this.working().putTable(t);
   }
 
   // executeStmt executes one parsed statement with no bind parameters.
@@ -222,83 +294,64 @@ export class Database {
       }
     }
 
-    // Autocommit (no open block).
+    // Autocommit (no open block): an autocommit write runs as an implicit single-statement
+    // transaction — open a working snapshot off committed, run, then commit on success / discard on
+    // error. Because the write mutates only working, an error leaves committed untouched (no restore
+    // needed); rolled-back rowid allocations vanish with working (§7).
     if (!stmtIsWrite(stmt)) {
       return this.dispatchStmt(stmt, params);
     }
-    const savedTables = new Map(this.tables);
-    const savedStores = cloneStores(this.stores);
+    this.tx = { writable: true, failed: false, working: this.committed.clone() };
+    let outcome: Outcome;
     try {
-      const outcome = this.dispatchStmt(stmt, params);
-      if (this.persistHook !== null) this.persistHook(this);
-      return outcome;
+      outcome = this.dispatchStmt(stmt, params);
     } catch (e) {
-      this.tables = savedTables;
-      this.stores = savedStores;
+      this.tx = null;
       throw e;
     }
+    this.commitTx();
+    return outcome;
   }
 
-  // beginTx opens an explicit transaction block (spec/design/transactions.md §4.2). writable is the
-  // access mode (READ WRITE vs READ ONLY). A nested BEGIN (a block is already open) is 25001. A READ
-  // WRITE block captures the committed state so ROLLBACK can restore it; a READ ONLY block never
-  // mutates, so it captures nothing. Returns a zero-cost statement outcome.
+  // beginTx opens an explicit transaction (spec/design/transactions.md §4.2). A nested BEGIN (a
+  // block is already open) is 25001. The committed snapshot is captured as the transaction's
+  // working snapshot — a writable tx mutates it in place; a read-only tx reads it unchanged
+  // (read-your-snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.ts) and the catalog is
+  // shallow. committed is untouched until commit.
   beginTx(writable: boolean): Outcome {
     if (this.tx !== null) {
       throw engineError("active_sql_transaction", "there is already a transaction in progress");
     }
-    this.tx = {
-      writable,
-      failed: false,
-      baseTables: writable ? new Map(this.tables) : new Map(),
-      baseStores: writable ? cloneStores(this.stores) : new Map(),
-    };
+    this.tx = { writable, failed: false, working: this.committed.clone() };
     return { kind: "statement", cost: 0n };
   }
 
   // commitTx commits the current transaction (spec/design/transactions.md §4.2). With no open block
-  // it is a lenient no-op success. A failed block commits as a ROLLBACK (PostgreSQL). A READ WRITE
-  // block publishes its working set durably (the persistHook, §9); a durable-write failure restores
-  // the committed state and rethrows. A READ ONLY block publishes nothing.
+  // it is a lenient no-op success. A failed block, or any read-only tx, publishes nothing — the
+  // working snapshot is dropped (a failed COMMIT is thus a ROLLBACK, PostgreSQL). A READ WRITE block
+  // publishes its working snapshot: bump its txid (file-backed only — an in-memory database stays at
+  // txid 0), make it durable (the persistHook, §9), then swap it in as committed. A durable-write
+  // failure leaves committed untouched and rethrows. Returns to autocommit.
   commitTx(): Outcome {
     const tx = this.tx;
     if (tx === null) return { kind: "statement", cost: 0n };
     this.tx = null;
-    if (tx.failed) {
-      // COMMIT of an aborted block silently rolls back (PostgreSQL).
-      if (tx.writable) {
-        this.tables = tx.baseTables;
-        this.stores = tx.baseStores;
-      }
-      return { kind: "statement", cost: 0n };
-    }
-    if (tx.writable && this.persistHook !== null) {
-      try {
-        this.persistHook(this);
-      } catch (e) {
-        // The commit failed: roll back to the committed state and rethrow.
-        this.tables = tx.baseTables;
-        this.stores = tx.baseStores;
-        throw e;
-      }
-    }
+    if (tx.failed || !tx.writable) return { kind: "statement", cost: 0n };
+    const working = tx.working;
+    if (this.path !== null) working.txid = this.committed.txid + 1n;
+    // persistHook (if any) throws on an I/O failure before committed is swapped, so committed is
+    // left untouched (the commit failed; the working snapshot is discarded).
+    if (this.persistHook !== null) this.persistHook(this, working);
+    this.committed = working;
     return { kind: "statement", cost: 0n };
   }
 
   // rollbackTx rolls back the current transaction (spec/design/transactions.md §4.2). With no open
-  // block it is a no-op success. A READ WRITE block discards its working set — every staged
-  // INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7) — by restoring the
-  // committed state captured at BEGIN; a READ ONLY block mutated nothing, so there is nothing to
-  // restore.
+  // block it is a no-op success. Otherwise the working snapshot is dropped — every staged
+  // INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7), vanish with it;
+  // committed was never mutated, so there is nothing to restore. Returns to autocommit.
   rollbackTx(): Outcome {
-    const tx = this.tx;
-    if (tx !== null) {
-      this.tx = null;
-      if (tx.writable) {
-        this.tables = tx.baseTables;
-        this.stores = tx.baseStores;
-      }
-    }
+    this.tx = null;
     return { kind: "statement", cost: 0n };
   }
 
@@ -329,11 +382,10 @@ export class Database {
     }
   }
 
-  // rowsInKeyOrder returns a table's rows in primary-key (encoded byte) order, or [] if
-  // the table does not exist.
+  // rowsInKeyOrder returns a table's rows in primary-key (encoded byte) order in the visible
+  // snapshot, or [] if the table does not exist.
   rowsInKeyOrder(name: string): Row[] {
-    const store = this.stores.get(name.toLowerCase());
-    return store ? store.iterInKeyOrder() : [];
+    return this.readSnap().rowsInKeyOrder(name);
   }
 
   // executeCreateTable resolves each column's type name, enforces a single primary key
@@ -406,9 +458,7 @@ export class Database {
     if (!this.table(dt.name)) {
       throw engineError("undefined_table", "table does not exist: " + dt.name);
     }
-    const key = dt.name.toLowerCase();
-    this.tables.delete(key);
-    this.stores.delete(key);
+    this.working().removeTable(dt.name.toLowerCase());
     return { kind: "statement", cost: 0n };
   }
 
@@ -428,7 +478,7 @@ export class Database {
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + ins.table);
     }
-    const store = this.stores.get(ins.table.toLowerCase())!;
+    const store = this.working().store(ins.table);
     const pk = primaryKeyIndex(table);
 
     // Resolve the optional column list once. provided[i] >= 0 means table column i takes that
@@ -632,7 +682,7 @@ export class Database {
       meter.charge(cost.value);
     }
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
-    const store = this.stores.get(del.table.toLowerCase())!;
+    const store = this.working().store(del.table);
     const keys: Uint8Array[] = [];
     for (const e of store.entriesInKeyOrder()) {
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
@@ -709,7 +759,7 @@ export class Database {
     if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, foldCost);
     meter.charge(foldCost.value);
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
-    const store = this.stores.get(upd.table.toLowerCase())!;
+    const store = this.working().store(upd.table);
     const updates: { key: Uint8Array; row: Row }[] = [];
     for (const e of store.entriesInKeyOrder()) {
       meter.charge(COSTS.storageRowRead);

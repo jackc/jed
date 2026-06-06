@@ -10,7 +10,7 @@ use crate::catalog::{Column, Table};
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
-use crate::executor::Database;
+use crate::executor::{Database, Snapshot};
 use crate::storage::Row;
 use crate::types::{DecimalTypmod, ScalarType};
 use crate::value::Value;
@@ -139,8 +139,8 @@ fn corrupt(msg: &str) -> EngineError {
     EngineError::new(SqlState::DataCorrupted, msg)
 }
 
-impl Database {
-    /// Serialize the whole database to a single on-disk image
+impl Snapshot {
+    /// Serialize this snapshot's whole state to a single on-disk image
     /// (spec/fileformat/format.md). `page_size` is recorded in the meta page;
     /// `txid` is the commit counter written into both meta slots.
     pub fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
@@ -246,6 +246,16 @@ impl Database {
 
         Ok(image)
     }
+}
+
+impl Database {
+    /// Serialize the whole committed state to a single on-disk image (spec/fileformat/format.md).
+    /// A thin wrapper over [`Snapshot::to_image`] for the committed snapshot — `txid` is written
+    /// into both meta slots. (The writer's working snapshot is serialized directly via
+    /// `Snapshot::to_image` at commit; this serves callers/tests holding a `Database`.)
+    pub fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
+        self.committed().to_image(page_size, txid)
+    }
 
     /// Reconstruct a database from an on-disk image (inverse of `to_image`). Returns
     /// a structured `data_corrupted` (XX001) error for any malformed input.
@@ -259,11 +269,10 @@ impl Database {
         }
         let meta = select_meta(image, page_size)?;
 
-        let mut db = Database::new();
-        // Adopt the file's serialization parameters so a later commit round-trips them
-        // (spec/design/api.md §2).
-        db.page_size = page_size as u32;
-        db.txid = meta.txid;
+        // Build the committed snapshot from the image, then wrap it in a fresh handle that
+        // adopts the file's serialization parameters (spec/design/api.md §2).
+        let mut snap = Snapshot::default();
+        snap.txid = meta.txid;
         let mut cat_page = meta.root_page;
         while cat_page != 0 {
             let page = read_page(image, page_size, cat_page)?;
@@ -276,7 +285,7 @@ impl Database {
                 let name = table.name.clone();
                 let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
                 let has_pk = table.primary_key_index().is_some();
-                db.put_table(table);
+                snap.put_table(table);
                 read_data_chain(
                     image,
                     page_size,
@@ -284,11 +293,14 @@ impl Database {
                     &col_types,
                     has_pk,
                     &name,
-                    &mut db,
+                    &mut snap,
                 )?;
             }
             cat_page = page.next_page;
         }
+        let mut db = Database::new();
+        db.page_size = page_size as u32;
+        db.committed = snap;
         Ok(db)
     }
 }
@@ -305,7 +317,7 @@ fn read_data_chain(
     col_types: &[ScalarType],
     has_pk: bool,
     name: &str,
-    db: &mut Database,
+    snap: &mut Snapshot,
 ) -> Result<()> {
     let mut dp = root_data_page;
     while dp != 0 {
@@ -317,10 +329,10 @@ fn read_data_chain(
         for _ in 0..page.item_count {
             let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
             if !has_pk && key.len() == ScalarType::Int64.width_bytes() {
-                db.store_mut(name)
+                snap.store_mut(name)
                     .bump_rowid_to(decode_int(ScalarType::Int64, &key) + 1);
             }
-            if !db.store_mut(name).insert(key, row) {
+            if !snap.store_mut(name).insert(key, row) {
                 return Err(corrupt("duplicate key in data page"));
             }
         }

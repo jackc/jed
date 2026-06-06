@@ -70,86 +70,42 @@ struct SelectResult {
 /// in-memory or newly-created database when no explicit size is given.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
 
-/// The whole database: catalog + per-table in-memory stores. One committed state plus, while an
-/// explicit block is open, the writer's working set (CLAUDE.md §3, spec/design/transactions.md
-/// §2): under autocommit `tables`/`stores` *are* the committed state; inside a READ WRITE block
-/// they are the working set and `tx.base_*` holds the committed state to restore on ROLLBACK.
-pub struct Database {
+/// An immutable committed (or in-progress working) database state — the catalog + each table's
+/// store + the commit counter (spec/design/transactions.md §2). The committed state is one of
+/// these; a write transaction builds a new one from it (path-copying the persistent stores, so the
+/// prior state is provably unchanged — pmap.rs / §3). A reader holds a `Snapshot` and is thereby
+/// stable for its life: a later commit produces a *new* `Snapshot` and never mutates this one.
+/// (P5.3a is single-handle; sharing a `Snapshot` across threads is P5.3b.)
+#[derive(Clone, Default)]
+pub struct Snapshot {
+    /// The snapshot's version — the commit counter (transactions.md §8; the watermark unit).
+    pub(crate) txid: u64,
     tables: HashMap<String, Table>,
     stores: HashMap<String, TableStore>,
-    /// The open explicit transaction, if any. `None` is autocommit — each statement is its own
-    /// transaction (transactions.md §4.1). `Some` is an open `BEGIN … COMMIT/ROLLBACK` block.
-    tx: Option<ActiveTx>,
-    /// The backing file path (`None` for an in-memory database). Set by the host API
-    /// `open`/`create` (spec/design/api.md §2); `commit` writes here.
-    pub(crate) path: Option<std::path::PathBuf>,
-    /// The monotonic commit counter: read from the file on open, bumped by 1 per `commit`.
-    pub(crate) txid: u64,
-    /// The page size this database serializes with (from the file on open, from create opts,
-    /// else `DEFAULT_PAGE_SIZE`). Fixed for the life of a file.
-    pub(crate) page_size: u32,
 }
 
-/// An open explicit transaction block (spec/design/transactions.md §4.2). `writable` is the
-/// access mode — READ WRITE may write, READ ONLY is read-only (a write inside → 25006). `failed`
-/// marks an aborted block: after a statement error every later statement but COMMIT/ROLLBACK is
-/// 25P02 (§6). `base_*` is the committed state captured at BEGIN, restored on ROLLBACK (and on
-/// COMMIT of a failed block); a READ ONLY block never mutates, so it captures nothing.
-struct ActiveTx {
-    writable: bool,
-    failed: bool,
-    base_tables: HashMap<String, Table>,
-    base_stores: HashMap<String, TableStore>,
-}
-
-impl Default for Database {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Database {
-    pub fn new() -> Self {
-        Database {
-            tables: HashMap::new(),
-            stores: HashMap::new(),
-            tx: None,
-            path: None,
-            txid: 0,
-            page_size: DEFAULT_PAGE_SIZE,
-        }
-    }
-
-    /// Whether an explicit transaction block is currently open (spec/design/transactions.md
-    /// §4.2). False under autocommit. Used by the host `Transaction` surface (api.md §6).
-    pub fn in_transaction(&self) -> bool {
-        self.tx.is_some()
-    }
-
-    /// The monotonic commit counter (spec/design/api.md §2): 0 for a fresh in-memory database,
-    /// the file's value on open, bumped by 1 per `commit`.
-    pub fn txid(&self) -> u64 {
-        self.txid
-    }
-
-    /// The page size this database serializes with (spec/design/api.md §2).
-    pub fn page_size(&self) -> u32 {
-        self.page_size
-    }
-
-    /// The backing file path, or `None` for an in-memory database.
-    pub fn path(&self) -> Option<&std::path::Path> {
-        self.path.as_deref()
-    }
-
+impl Snapshot {
     /// Look up a table definition by name (case-insensitive).
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.get(&name.to_ascii_lowercase())
     }
 
-    /// All rows of a table in primary-key (encoded byte) order, or None if the
-    /// table does not exist. Used by SELECT and by tests.
-    pub fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
+    /// The store for a table (panics if absent — callers resolve the table first).
+    fn store(&self, name: &str) -> &TableStore {
+        self.stores
+            .get(&name.to_ascii_lowercase())
+            .expect("store exists for a resolved table")
+    }
+
+    /// The store for a table, mutable (panics if absent).
+    pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
+        self.stores
+            .get_mut(&name.to_ascii_lowercase())
+            .expect("store exists for a resolved table")
+    }
+
+    /// All rows of a table in primary-key (encoded byte) order, or None if the table is absent.
+    fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
         self.stores
             .get(&name.to_ascii_lowercase())
             .map(|s| s.iter_in_key_order().cloned().collect())
@@ -162,14 +118,142 @@ impl Database {
         self.tables.insert(key, table);
     }
 
-    /// Every table with its store, as `(lowercased key, table, store)` tuples, for
-    /// the on-disk serializer (spec/fileformat/format.md). The serializer sorts by
-    /// the lowercased key so hash-map iteration order never leaks (CLAUDE.md §8).
+    /// Remove a table's definition and its store (DROP TABLE).
+    fn remove_table(&mut self, key: &str) {
+        self.tables.remove(key);
+        self.stores.remove(key);
+    }
+
+    /// Every table with its store, as `(lowercased key, table, store)` tuples, for the on-disk
+    /// serializer (spec/fileformat/format.md). The serializer sorts by the lowercased key so
+    /// hash-map iteration order never leaks (CLAUDE.md §8).
     pub(crate) fn catalog_and_stores(&self) -> Vec<(&str, &Table, &TableStore)> {
         self.tables
             .iter()
             .map(|(k, t)| (k.as_str(), t, self.stores.get(k).expect("store exists")))
             .collect()
+    }
+}
+
+/// The database handle: the last **committed** `Snapshot` plus, while a transaction is open, the
+/// writer's working snapshot (CLAUDE.md §3, spec/design/transactions.md §2). Reads run against the
+/// *visible* snapshot — the open transaction's `working` if any, else `committed`; a write mutates
+/// `working` and commit swaps `committed := working` (rollback just drops `working`, since
+/// `committed` was never touched). Every write — autocommit included — runs as a transaction, which
+/// unifies the two paths.
+pub struct Database {
+    /// The last committed, immutable state — what fresh readers (and autocommit reads) see.
+    pub(crate) committed: Snapshot,
+    /// The open transaction, if any. `None` is autocommit between statements (transactions.md
+    /// §4.1); a single-statement autocommit write opens one implicitly for its duration.
+    tx: Option<ActiveTx>,
+    /// The backing file path (`None` for an in-memory database). Set by the host API
+    /// `open`/`create` (spec/design/api.md §2); `commit` writes here.
+    pub(crate) path: Option<std::path::PathBuf>,
+    /// The page size this database serializes with (from the file on open, from create opts,
+    /// else `DEFAULT_PAGE_SIZE`). Fixed for the life of a file.
+    pub(crate) page_size: u32,
+}
+
+/// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
+/// WRITE may write, READ ONLY is read-only (a write inside → 25006). `failed` marks an aborted
+/// block (after a statement error every later statement but COMMIT/ROLLBACK is 25P02 — §6).
+/// `working` is the transaction's snapshot: for a writable tx it is mutated in place and published
+/// at commit; for a read-only tx it is the committed snapshot pinned at BEGIN (read-your-snapshot,
+/// never mutated). Either way `committed` is untouched until commit, so ROLLBACK just drops this.
+struct ActiveTx {
+    writable: bool,
+    failed: bool,
+    working: Snapshot,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Database {
+    pub fn new() -> Self {
+        Database {
+            committed: Snapshot::default(),
+            tx: None,
+            path: None,
+            page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+
+    /// The snapshot a read sees: the open transaction's `working` (read-your-writes for a
+    /// writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
+    fn read_snap(&self) -> &Snapshot {
+        match &self.tx {
+            Some(tx) => &tx.working,
+            None => &self.committed,
+        }
+    }
+
+    /// The working snapshot a write mutates — the open transaction's `working`. A write only ever
+    /// runs with a transaction open (autocommit opens one implicitly), so this never panics in a
+    /// correct flow.
+    fn working_mut(&mut self) -> &mut Snapshot {
+        &mut self
+            .tx
+            .as_mut()
+            .expect("a write statement runs within a transaction")
+            .working
+    }
+
+    /// The committed snapshot, immutable (spec/design/transactions.md §2). Exposed for the host
+    /// `Transaction`/read surfaces and for the on-disk serializer.
+    pub(crate) fn committed(&self) -> &Snapshot {
+        &self.committed
+    }
+
+    /// The oldest still-live snapshot's txid (spec/design/transactions.md §8) — the Phase-6
+    /// free-list reclamation gate. Single-handle (P5.3a) it is trivially the committed txid (no
+    /// other reader pins an older one yet); P5.3b's shared read snapshots make it meaningful.
+    pub fn oldest_live_txid(&self) -> u64 {
+        self.committed.txid
+    }
+
+    /// Whether an explicit transaction block is currently open (spec/design/transactions.md
+    /// §4.2). False under autocommit. Used by the host `Transaction` surface (api.md §6).
+    pub fn in_transaction(&self) -> bool {
+        self.tx.is_some()
+    }
+
+    /// The monotonic commit counter (spec/design/api.md §2): 0 for a fresh in-memory database,
+    /// the file's value on open, bumped by 1 per `commit`.
+    pub fn txid(&self) -> u64 {
+        self.committed.txid
+    }
+
+    /// The page size this database serializes with (spec/design/api.md §2).
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
+    /// The backing file path, or `None` for an in-memory database.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
+    /// Look up a table definition by name (case-insensitive) in the currently-visible snapshot
+    /// (the open transaction's working set, else the committed state).
+    pub fn table(&self, name: &str) -> Option<&Table> {
+        self.read_snap().table(name)
+    }
+
+    /// All rows of a table in primary-key (encoded byte) order, or None if the table does not
+    /// exist. Reads the visible snapshot. Used by SELECT and by tests.
+    pub fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
+        self.read_snap().rows_in_key_order(name)
+    }
+
+    /// Register a new table and its (empty) store in the working snapshot (DDL is transactional —
+    /// transactions.md §4.5).
+    pub(crate) fn put_table(&mut self, table: Table) {
+        self.working_mut().put_table(table);
     }
 
     /// Execute one parsed statement with no bind parameters.
@@ -236,27 +320,32 @@ impl Database {
             return result;
         }
 
-        // Autocommit (no open block).
+        // Autocommit (no open block): an autocommit write runs as an implicit single-statement
+        // transaction — open a working snapshot off `committed`, run, then commit on success /
+        // discard on error. Because the write mutates only `working`, an error leaves `committed`
+        // untouched (no restore needed); rolled-back rowid allocations vanish with `working` (§7).
         if !stmt_is_write(&stmt) {
             return self.dispatch_stmt(stmt, params);
         }
-        let saved_tables = self.tables.clone();
-        let saved_stores = self.stores.clone();
-        let result = match self.dispatch_stmt(stmt, params) {
-            Ok(outcome) => self.persist().map(|()| outcome),
-            Err(e) => Err(e),
-        };
-        if result.is_err() {
-            self.tables = saved_tables;
-            self.stores = saved_stores;
+        self.tx = Some(ActiveTx {
+            writable: true,
+            failed: false,
+            working: self.committed.clone(),
+        });
+        match self.dispatch_stmt(stmt, params) {
+            Ok(outcome) => self.commit_tx().map(|_| outcome),
+            Err(e) => {
+                self.tx = None;
+                Err(e)
+            }
         }
-        result
     }
 
-    /// Open an explicit transaction block (spec/design/transactions.md §4.2). `writable` is the
-    /// access mode (READ WRITE vs READ ONLY). A nested `BEGIN` (a block is already open) is
-    /// 25001. A READ WRITE block captures the committed state so ROLLBACK can restore it; a READ
-    /// ONLY block never mutates, so it captures nothing. Returns a zero-cost statement outcome.
+    /// Open an explicit transaction block (spec/design/transactions.md §4.2). A nested `BEGIN` (a
+    /// block is already open) is 25001. The committed snapshot is captured as the transaction's
+    /// working snapshot — a writable tx mutates it in place; a read-only tx reads it unchanged
+    /// (read-your-snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.rs) and the
+    /// catalog is a shallow copy. `committed` is untouched until commit.
     pub(crate) fn begin_tx(&mut self, writable: bool) -> Result<Outcome> {
         if self.tx.is_some() {
             return Err(EngineError::new(
@@ -264,61 +353,47 @@ impl Database {
                 "there is already a transaction in progress",
             ));
         }
-        let (base_tables, base_stores) = if writable {
-            (self.tables.clone(), self.stores.clone())
-        } else {
-            (HashMap::new(), HashMap::new())
-        };
         self.tx = Some(ActiveTx {
             writable,
             failed: false,
-            base_tables,
-            base_stores,
+            working: self.committed.clone(),
         });
         Ok(Outcome::Statement { cost: 0 })
     }
 
     /// Commit the current transaction (spec/design/transactions.md §4.2). With no open block it is
-    /// a lenient no-op success. A **failed** block commits as a ROLLBACK (PostgreSQL). A READ
-    /// WRITE block publishes its working set durably (the single `persist` chokepoint, §9); a
-    /// durable-write failure restores the committed state and propagates. A READ ONLY block
-    /// publishes nothing. Either way the handle returns to autocommit.
+    /// a lenient no-op success. A **failed** block, or any read-only tx, publishes nothing — the
+    /// working snapshot is simply dropped (a failed COMMIT is thus a ROLLBACK, PostgreSQL). A READ
+    /// WRITE block publishes its working snapshot: bump its txid, make it durable (the single
+    /// `persist` chokepoint, §9), then swap it in as the new `committed` — a single pointer swap,
+    /// the §3 short commit window. A durable-write failure leaves `committed` untouched and
+    /// propagates (the commit failed; the working set is discarded). Returns to autocommit.
     pub(crate) fn commit_tx(&mut self) -> Result<Outcome> {
         let tx = match self.tx.take() {
             None => return Ok(Outcome::Statement { cost: 0 }),
             Some(tx) => tx,
         };
-        if tx.failed {
-            // COMMIT of an aborted block silently rolls back (PostgreSQL).
-            if tx.writable {
-                self.tables = tx.base_tables;
-                self.stores = tx.base_stores;
-            }
+        if tx.failed || !tx.writable {
             return Ok(Outcome::Statement { cost: 0 });
         }
-        if tx.writable {
-            if let Err(e) = self.persist() {
-                // The commit failed: roll back to the committed state and propagate.
-                self.tables = tx.base_tables;
-                self.stores = tx.base_stores;
-                return Err(e);
-            }
+        let mut working = tx.working;
+        // The txid is the durable commit counter (spec/design/api.md §2): it advances only on a
+        // file-backed commit. An in-memory commit swaps the snapshot but leaves txid unchanged
+        // (an in-memory database stays at txid 0 — there is nothing to recover).
+        if self.path.is_some() {
+            working.txid = self.committed.txid + 1;
         }
+        self.persist(&working)?; // no-op for an in-memory database
+        self.committed = working;
         Ok(Outcome::Statement { cost: 0 })
     }
 
     /// Roll back the current transaction (spec/design/transactions.md §4.2). With no open block it
-    /// is a no-op success. A READ WRITE block discards its working set — every staged
-    /// INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7) — by restoring
-    /// the committed state captured at BEGIN; a READ ONLY block mutated nothing, so there is
-    /// nothing to restore. The handle returns to autocommit.
+    /// is a no-op success. Otherwise the working snapshot is **dropped** — every staged
+    /// INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7), vanish with it;
+    /// `committed` was never mutated, so there is nothing to restore. Returns to autocommit.
     pub(crate) fn rollback_tx(&mut self) -> Result<Outcome> {
-        if let Some(tx) = self.tx.take() {
-            if tx.writable {
-                self.tables = tx.base_tables;
-                self.stores = tx.base_stores;
-            }
-        }
+        self.tx = None;
         Ok(Outcome::Statement { cost: 0 })
     }
 
@@ -438,8 +513,7 @@ impl Database {
             ));
         }
         let key = dt.name.to_ascii_lowercase();
-        self.tables.remove(&key);
-        self.stores.remove(&key);
+        self.working_mut().remove_table(&key);
         Ok(Outcome::Statement { cost: 0 })
     }
 
@@ -1768,18 +1842,16 @@ impl Database {
         }
     }
 
-    /// Shared read access to a table's store (the table is known to exist).
+    /// Shared read access to a table's store in the visible snapshot (the table is known to
+    /// exist) — the open transaction's working set, else the committed state.
     fn store(&self, name: &str) -> &TableStore {
-        self.stores
-            .get(&name.to_ascii_lowercase())
-            .expect("store exists for a known table")
+        self.read_snap().store(name)
     }
 
-    /// Mutable access to a table's store (the table is known to exist).
+    /// Mutable access to a table's store in the working snapshot (the table is known to exist;
+    /// a write runs within a transaction, so the working set is present).
     pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
-        self.stores
-            .get_mut(&name.to_ascii_lowercase())
-            .expect("store exists for a known table")
+        self.working_mut().store_mut(name)
     }
 }
 

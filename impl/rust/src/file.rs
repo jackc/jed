@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::{EngineError, Result, SqlState};
-use crate::executor::{DEFAULT_PAGE_SIZE, Database};
+use crate::executor::{DEFAULT_PAGE_SIZE, Database, Snapshot};
 
 /// Settings for a newly-created database file (spec/design/api.md §2). `page_size` is fixed
 /// into the file's meta at creation and cannot change thereafter.
@@ -41,8 +41,8 @@ impl Database {
         let mut db = Database::new();
         db.path = Some(path.to_path_buf());
         db.page_size = opts.page_size;
-        db.txid = 0;
-        db.persist()?; // materialize the empty image (txid 0 -> 1)
+        db.committed.txid = 1; // the initial empty image is committed as txid 1
+        db.persist(&db.committed)?; // materialize it durably
         Ok(db)
     }
 
@@ -66,20 +66,19 @@ impl Database {
         Ok(db)
     }
 
-    /// Durably persist the whole current image to the backing file and increment `txid` — the
-    /// single synchronous-commit chokepoint (spec/design/transactions.md §9). Called by
-    /// `create` (the initial image) and by the autocommit path after every successful write
-    /// statement. An in-memory database (no path) is a **no-op success**. The future
-    /// `synchronous=off` mode (batched/deferred fsync) gates here.
-    pub(crate) fn persist(&mut self) -> Result<()> {
+    /// Durably write `snap`'s whole image to the backing file — the single synchronous-commit
+    /// chokepoint (spec/design/transactions.md §9). Called by `create` (the initial committed
+    /// image) and by `commit_tx` for the working snapshot being published, at the snapshot's own
+    /// `txid`. An in-memory database (no path) is a **no-op success**; it does not mutate `self`
+    /// (the txid lives in the snapshot, and the committed swap happens in `commit_tx` only after
+    /// this returns Ok). The future `synchronous=off` mode (batched/deferred fsync) gates here.
+    pub(crate) fn persist(&self, snap: &Snapshot) -> Result<()> {
         let path = match &self.path {
             None => return Ok(()),
             Some(p) => p.clone(),
         };
-        let next_txid = self.txid + 1;
-        let bytes = self.to_image(self.page_size, next_txid)?;
+        let bytes = snap.to_image(self.page_size, snap.txid)?;
         write_atomic(&path, &bytes)?;
-        self.txid = next_txid;
         Ok(())
     }
 
