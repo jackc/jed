@@ -308,6 +308,21 @@ description = "Integer division / modulo by zero is defined and traps SQLSTATE 2
 id = "resource.cost_metering"
 description = "Deterministic, cross-core-identical query cost accounting (CLAUDE.md §13)"
 
+# Transaction control (Phase 5, spec/design/transactions.md §4). The SQL surface
+# BEGIN/COMMIT/ROLLBACK over the handle's single current transaction; tested by deterministic,
+# single-handle visibility sequences (the harness runs a whole .test file against one Database).
+[[capability]]
+id = "txn.explicit"
+description = "Explicit transaction blocks — BEGIN [TRANSACTION|WORK] / START TRANSACTION ... COMMIT|END / ROLLBACK. A block's INSERT/UPDATE/DELETE and DDL CREATE/DROP commit atomically or roll back together (read-your-writes within the block); a nested BEGIN is 25001; a COMMIT/ROLLBACK with no open block is a lenient no-op success (no 25P01). spec/design/grammar.md §27"
+
+[[capability]]
+id = "txn.read_only"
+description = "Transaction access modes — BEGIN READ ONLY / READ WRITE (default READ WRITE). A write statement in a READ ONLY block is 25006 (read_only_sql_transaction); ROLLBACK clears it and autocommit resumes. spec/design/transactions.md §4.3"
+
+[[capability]]
+id = "txn.failed_state"
+description = "Failed-block poisoning — a statement error inside an explicit block aborts the transaction; every later statement but ROLLBACK/COMMIT is 25P02 (in_failed_sql_transaction), and COMMIT of a failed block acts as ROLLBACK (PostgreSQL). The whole working set is discarded, including statements that succeeded before the error. spec/design/transactions.md §6"
+
 # --- profiles ----------------------------------------------------------------
 # A named bundle of capabilities = a conformance level. `includes` (optional)
 # inherits another profile's capabilities transitively, so profiles are cumulative.
@@ -465,6 +480,17 @@ capabilities = [
   "query.union",
   "query.intersect",
   "query.except",
+]
+
+[[profile]]
+id = "transactions"
+title = "mutation + explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes, and failed-block poisoning (Phase 5, spec/design/transactions.md §4)"
+includes = "mutation"
+capabilities = [
+  "ddl.drop_table",
+  "txn.explicit",
+  "txn.read_only",
+  "txn.failed_state",
 ]
 
 [[profile]]

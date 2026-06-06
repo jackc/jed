@@ -130,6 +130,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
   // accrued cost via the `# cost:` directive (CLAUDE.md §13).
   "resource.cost_metering",
+  // Phase 5 — explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes,
+  // failed-block poisoning (spec/design/transactions.md §4, grammar.md §27).
+  "txn.explicit",
+  "txn.read_only",
+  "txn.failed_state",
 ];
 
 // execute parses and executes one SQL statement against db (no bind parameters).
@@ -154,6 +159,6 @@ export { intValue, nullValue, render } from "./value.ts";
 export type { ThreeValued, Value } from "./value.ts";
 export { loadDatabase, toImage } from "./format.ts";
 export type { Statement } from "./ast.ts";
-export { PreparedStatement, Rows, prepare, query, querySql } from "./api.ts";
+export { PreparedStatement, Rows, Transaction, prepare, query, querySql, begin, view, update } from "./api.ts";
 export { create, open, commit, rollback, close } from "./file.ts";
 export type { DatabaseOptions } from "./file.ts";

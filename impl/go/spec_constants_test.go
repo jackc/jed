@@ -190,6 +190,7 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 		DivisionByZero, InvalidParameterValue,
 		InvalidRowCountInLimitClause, InvalidRowCountInOffsetClause,
 		NotNullViolation, UniqueViolation,
+		ActiveSqlTransaction, ReadOnlySqlTransaction, InFailedSqlTransaction,
 		SyntaxError, UndefinedTable, UndefinedColumn, UndefinedObject,
 		DatatypeMismatch, DuplicateTable, DuplicateColumn,
 		InvalidTableDefinition, IndeterminateDatatype, FeatureNotSupported,

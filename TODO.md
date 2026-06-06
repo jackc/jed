@@ -627,17 +627,40 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `working`-snapshot object lands with P5.2 (multi-statement blocks); the oldest-live-txid
       **watermark** lands with P5.3 (concurrent read snapshots — until then it is trivially the
       committed txid, with no reader to track and no page reclamation to gate). _(size: L; §3; B1)_
-- [ ] **P5.2 — explicit transactions: SQL `BEGIN`/`COMMIT`/`ROLLBACK` + the `Transaction` API.**
-      `BEGIN [READ ONLY|READ WRITE]` (default read-write) + `db.begin(writable)` / `db.view` /
-      `db.update`; grammar + parsers + corpus. Errors: nested `BEGIN` → `25001`, write in a
-      read-only tx → `25006`. DDL is transactional. Shared corpus `transactions/` suite
-      (visibility/rollback/read-only-violation are deterministic, single-handle) + a
-      `transactions` profile / `txn.*` capabilities. _(size: L; deps: P5.1)_
-- [ ] **P5.3 — reader/writer concurrency + abort semantics + watermark.** Single-writer lock
-      (write tx exclusive; read tx lock-free, never blocks except the swap). Abort-on-error
-      poisons an explicit block (`25P02`); autocommit rolls back only the failed statement (=
-      today's behavior). Concurrency mechanism tested **per-core** (not the corpus — scheduling
-      isn't deterministic, like `$N`). _(size: L; §3; deps: P5.1)_
+- [x] **P5.2 — explicit transactions: SQL `BEGIN`/`COMMIT`/`ROLLBACK` + the `Transaction` API.** ✅
+      Done across Rust/Go/TS. **SQL surface** ([grammar.ebnf](spec/grammar/grammar.ebnf) +
+      [grammar.md §27](spec/design/grammar.md)): `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` /
+      `START TRANSACTION …` open a block (default **READ WRITE**); `COMMIT`/`END [TRANSACTION|WORK]`
+      publish; `ROLLBACK [TRANSACTION|WORK]` discard — all keywords non-reserved. New AST
+      `Begin{writable}`/`Commit`/`Rollback`; the executor gained a **current-transaction state
+      machine** layered on the P5.1 autocommit path: BEGIN captures the committed state (a READ
+      WRITE block only — O(1) store clones + shallow catalog), statements run against the **working
+      set in place** (read-your-writes; **no** per-statement durable write — the block publishes
+      once at COMMIT via the single `persist` chokepoint), and ROLLBACK restores the captured state
+      (DDL `CREATE`/`DROP` included, plus rolled-back rowid allocations §7). **Errors** (class 25,
+      already registered P5.0): nested `BEGIN` → **`25001`**; a write in a READ ONLY block →
+      **`25006`**; any statement error **aborts the block** (failed state) so every later statement
+      but `ROLLBACK`/`COMMIT` is **`25P02`**, and `COMMIT` of a failed block acts as `ROLLBACK`
+      (PostgreSQL) — discarding earlier successes too. `COMMIT`/`ROLLBACK` with no open block are
+      **lenient no-op successes** (no `25P01` — a documented PG divergence, §4.2). **Host API**
+      ([api.md §6](spec/design/api.md)): `db.begin(writable)` → `Transaction` (`execute`/`query`/
+      `commit`/`rollback`), the bbolt-style closure wrappers `db.view`/`db.update` (auto-commit on
+      success / auto-rollback on error or panic), and `db.commit`/`db.rollback`/`close` all drive
+      the **same** mechanism (`close` now rolls back an open block). Shared corpus
+      [suites/transactions/](spec/conformance/suites/transactions/) (commit/rollback/read_only/
+      nested/failed/syntax — visibility is deterministic + single-handle, the harness runs a whole
+      file against one handle) + the `transactions` profile / `txn.{explicit,read_only,failed_state}`
+      capabilities; the programmatic surface is pinned **per-core** (the corpus is SQL-only). 72/0/0
+      byte-identical all cores; `rake verify` + `fmt:check` clean. **The explicit `working`-snapshot
+      object landed here** (the per-block captured base + the `tables`/`stores` working set). _(size:
+      L; deps: P5.1)_
+- [ ] **P5.3 — reader/writer concurrency + the watermark.** Single-writer lock (write tx exclusive;
+      read tx lock-free, never blocks except the swap) + the **oldest-live-txid watermark** (§8,
+      the Phase-6 free-list gate; trivially the committed txid until concurrent readers exist). The
+      **abort semantics** (failed-block `25P02`, autocommit rolls back only the failed statement)
+      already landed with **P5.2**; P5.3 is the **non-deterministic** half — a reader not blocking
+      during a concurrent commit, writer exclusivity, a cursor stable across a commit — tested
+      **per-core** (not the corpus — scheduling isn't deterministic, like `$N`). _(size: L; §3; deps: P5.2)_
 
 ---
 

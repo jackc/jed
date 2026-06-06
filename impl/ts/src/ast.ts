@@ -249,6 +249,14 @@ export type Update = {
 // expression must resolve to boolean.
 export type Delete = { kind: "delete"; table: string; filter: Expr | null };
 
+// Begin/Commit/Rollback are the explicit transaction-control statements (grammar.md §27,
+// transactions.md §4.2). Begin's `writable` is the access mode: true is READ WRITE (the default),
+// false READ ONLY (a write inside → 25006). A nested BEGIN is 25001; a COMMIT/ROLLBACK with no
+// open block is a no-op success.
+export type Begin = { kind: "begin"; writable: boolean };
+export type Commit = { kind: "commit" };
+export type Rollback = { kind: "rollback" };
+
 // SetOpKind is the set operator (spec/design/grammar.md §25).
 export type SetOpKind = "union" | "intersect" | "except";
 
@@ -274,4 +282,14 @@ export type SetOp = {
 
 // Statement is a parsed top-level statement. A lone SELECT stays `Select`; `SetOp` appears only
 // when at least one set operator is present, so the plain-query path and host API are untouched.
-export type Statement = CreateTable | DropTable | Insert | Select | SetOp | Update | Delete;
+export type Statement =
+  | CreateTable
+  | DropTable
+  | Insert
+  | Select
+  | SetOp
+  | Update
+  | Delete
+  | Begin
+  | Commit
+  | Rollback;

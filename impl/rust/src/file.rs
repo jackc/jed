@@ -83,26 +83,28 @@ impl Database {
         Ok(())
     }
 
-    /// Commit the current transaction (spec/design/api.md §2.2). jed **autocommits** each
-    /// statement (transactions.md §4.1), so in this slice there is no open explicit transaction
-    /// to publish — `commit` is a **lenient no-op success** (transactions.md §4.2). Explicit
-    /// `BEGIN … COMMIT` blocks, where `commit` does the durable publish, arrive in P5.2.
+    /// Commit the current transaction (spec/design/api.md §2.2, transactions.md §4.2). Publishes
+    /// the open explicit block durably (per `synchronous`); a `commit` with no open block is a
+    /// **lenient no-op success** (under autocommit each statement already committed). Drives the
+    /// same mechanism as SQL `COMMIT`.
     pub fn commit(&mut self) -> Result<()> {
-        Ok(())
+        self.commit_tx().map(|_| ())
     }
 
-    /// Roll back the current transaction (spec/design/api.md §2.2). With autocommit and no open
-    /// explicit transaction (this slice), there is nothing uncommitted to discard — a **no-op
-    /// success**. Discarding an open explicit block's working set arrives with `BEGIN` in P5.2.
+    /// Roll back the current transaction (spec/design/api.md §2.2, transactions.md §4.2). Discards
+    /// the open explicit block's working set; a `rollback` with no open block is a **no-op
+    /// success**. Drives the same mechanism as SQL `ROLLBACK`.
     pub fn rollback(&mut self) -> Result<()> {
-        Ok(())
+        self.rollback_tx().map(|_| ())
     }
 
-    /// Release the handle (spec/design/api.md §2.3). Under autocommit, every prior statement is
-    /// already durable, so — unlike the original model — `close` does **not** drop committed
-    /// work; it would roll back an open explicit transaction (none in this slice). Durability is
-    /// never hidden in a destructor. Idempotent.
+    /// Release the handle (spec/design/api.md §2.3). It **rolls back any open explicit
+    /// transaction** (its in-progress work is discarded) and does not commit one. Under
+    /// autocommit every prior statement is already durable, so — unlike the original model —
+    /// `close` does **not** drop committed work; durability is never hidden in a destructor.
+    /// Idempotent.
     pub fn close(mut self) -> Result<()> {
+        let _ = self.rollback_tx();
         self.path = None;
         Ok(())
     }

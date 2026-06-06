@@ -42,8 +42,82 @@ impl Parser {
             Some("select") => self.parse_query_expr(),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
             Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
+            Some("begin") | Some("start") => self.parse_begin(),
+            Some("commit") | Some("end") => self.parse_commit(),
+            Some("rollback") => self.parse_rollback(),
             Some(other) => Err(syntax(format!("unexpected keyword '{other}'"))),
             None => Err(syntax("expected a SQL statement")),
+        }
+    }
+
+    /// `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` or `START TRANSACTION [READ ONLY|READ
+    /// WRITE]` — open an explicit transaction (spec/design/grammar.md §27). The access mode
+    /// defaults to READ WRITE.
+    fn parse_begin(&mut self) -> Result<Statement> {
+        match self.peek_keyword().as_deref() {
+            Some("start") => {
+                self.advance();
+                self.expect_keyword("transaction")?;
+            }
+            // plain BEGIN, with the optional noise word TRANSACTION | WORK
+            _ => {
+                self.advance(); // BEGIN
+                if matches!(
+                    self.peek_keyword().as_deref(),
+                    Some("transaction") | Some("work")
+                ) {
+                    self.advance();
+                }
+            }
+        }
+        Ok(Statement::Begin {
+            writable: self.parse_access_mode()?,
+        })
+    }
+
+    /// The optional access mode after a transaction opener: `READ ONLY` → false, `READ WRITE` →
+    /// true, absent → true (READ WRITE is the default — spec/design/transactions.md §4.3).
+    fn parse_access_mode(&mut self) -> Result<bool> {
+        if self.peek_keyword().as_deref() != Some("read") {
+            return Ok(true);
+        }
+        self.advance(); // READ
+        match self.peek_keyword().as_deref() {
+            Some("only") => {
+                self.advance();
+                Ok(false)
+            }
+            Some("write") => {
+                self.advance();
+                Ok(true)
+            }
+            other => Err(syntax(format!(
+                "expected ONLY or WRITE after READ, found {other:?}"
+            ))),
+        }
+    }
+
+    /// `COMMIT [TRANSACTION|WORK]` / `END [TRANSACTION|WORK]` (spec/design/grammar.md §27).
+    fn parse_commit(&mut self) -> Result<Statement> {
+        self.advance(); // COMMIT or END
+        self.consume_transaction_or_work();
+        Ok(Statement::Commit)
+    }
+
+    /// `ROLLBACK [TRANSACTION|WORK]` (spec/design/grammar.md §27).
+    fn parse_rollback(&mut self) -> Result<Statement> {
+        self.expect_keyword("rollback")?;
+        self.consume_transaction_or_work();
+        Ok(Statement::Rollback)
+    }
+
+    /// Consume the optional trailing `TRANSACTION` / `WORK` noise word on a COMMIT/ROLLBACK.
+    fn consume_transaction_or_work(&mut self) {
+        if matches!(
+            self.peek_keyword().as_deref(),
+            Some("transaction") | Some("work")
+        ) {
+            self.advance();
         }
     }
 

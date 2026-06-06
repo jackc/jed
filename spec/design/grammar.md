@@ -1119,3 +1119,64 @@ real cause (the type can't be determined) and is consistent with its strict, no-
 - **`ANY` / `ALL`** and **row-valued** subqueries are not implemented.
 - **Subqueries in `GROUP BY`** are not reachable — a `GROUP BY` key is grammatically a
   `column_ref` only (§18), so `(SELECT …)` there is a `42601` syntax error by the existing rule.
+
+## 27. Transaction control (`BEGIN` / `COMMIT` / `ROLLBACK`)
+
+The SQL surface for explicit transactions. This section fixes the **grammar**; the **model**
+(autocommit, the immutable-snapshot + working-root staging buffer, the access modes, the abort
+semantics, the `synchronous` durability setting) is [transactions.md](transactions.md) §4–§9,
+and the equivalent host-API forms (`db.begin`/`view`/`update`) are [api.md](api.md) §2.2/§6. The
+SQL statements and the API are **two surfaces over one mechanism** — both drive the handle's
+single current transaction.
+
+```
+begin    ::= ( "BEGIN" ("TRANSACTION" | "WORK")? | "START" "TRANSACTION" ) access_mode?
+access_mode ::= "READ" "ONLY" | "READ" "WRITE"
+commit   ::= ("COMMIT" | "END") ("TRANSACTION" | "WORK")?
+rollback ::= "ROLLBACK" ("TRANSACTION" | "WORK")?
+```
+
+**Autocommit is the default** (transactions.md §4.1): outside an explicit block every statement
+is its own transaction — it commits on success / rolls back on error — so the existing one-shot
+behavior, and the whole conformance corpus, are unchanged. `BEGIN` / `START TRANSACTION` opens an
+explicit block; the statements that follow run within it until `COMMIT` / `END` or `ROLLBACK`.
+
+- **Access mode.** `READ WRITE` (the default) may read and write. `READ ONLY` may only read; a
+  write statement (`INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`) inside it is **`25006`**
+  (read_only_sql_transaction). The mode is **fixed when the block opens** (it governs the write
+  lock — transactions.md §4.3/§10), declared here and inferred from the statement kind under
+  autocommit.
+- **`COMMIT` / `END`** publishes the block's changes atomically (the snapshot swap) and makes
+  them durable per the `synchronous` setting (transactions.md §9), returning to autocommit.
+  Committing a **failed** block (below) performs a `ROLLBACK` instead (PostgreSQL).
+- **`ROLLBACK`** discards the block's working set — every `INSERT`/`UPDATE`/`DELETE` **and DDL**
+  `CREATE`/`DROP` since `BEGIN`, plus any synthetic-rowid allocations (transactions.md §4.5/§7) —
+  and returns to autocommit. DDL is transactional: a table created in a rolled-back block does
+  not exist afterward; a table dropped in one is still there.
+- **Failed-block poisoning.** A statement error inside an explicit block **aborts the
+  transaction**: it enters the *failed* state, and every subsequent statement except
+  `ROLLBACK` (and `COMMIT`, treated as `ROLLBACK`) is rejected with **`25P02`**
+  (in_failed_sql_transaction) until the block ends. The statement that errored wrote nothing
+  partial (two-phase, §6); `ROLLBACK`/`COMMIT` then discards the whole working set. This matches
+  PostgreSQL's "current transaction is aborted, commands ignored until end of transaction block."
+
+**Two deliberate edges (transactions.md §4.2), each principled:**
+
+- A **nested `BEGIN`** — issued while a block is already open — is **`25001`**
+  (active_sql_transaction). There is no `SAVEPOINT`/nesting this slice; a nested `BEGIN` has no
+  defined action, so it errors.
+- A **`COMMIT`/`ROLLBACK` with no open block** is a **lenient no-op success** — it always has a
+  well-defined action (publish/discard the current work, of which there is none), so it succeeds
+  rather than erroring. PostgreSQL emits a *warning* here; jed has no warning channel
+  (CLAUDE.md §4), so `25P01` is deliberately **not** raised — a documented divergence.
+
+The asymmetry is the rule "error where the action is undefined, succeed where it is defined."
+
+**Keywords stay non-reserved (§3):** `BEGIN`, `START`, `COMMIT`, `END`, `ROLLBACK`, `WORK`,
+`TRANSACTION`, `READ`, `ONLY`, `WRITE` are recognized positionally — a column may still be named
+`begin` or `work`.
+
+**Deferred (transactions.md §11):** `SAVEPOINT` / `ROLLBACK TO` / nested transactions;
+`SET TRANSACTION ISOLATION LEVEL` (snapshot isolation is the single level); the
+`[NOT] DEFERRABLE` and `ISOLATION LEVEL` modifiers on `BEGIN`; `synchronous=off` batching. Only
+the access-mode modifier (`READ ONLY` / `READ WRITE`) is accepted on the opener.

@@ -1,0 +1,61 @@
+# Failed-block poisoning (spec/design/transactions.md §6). A statement error inside an explicit
+# block aborts the transaction: it enters the failed state, and every later statement but
+# ROLLBACK / COMMIT is rejected with 25P02 (in_failed_sql_transaction). ROLLBACK clears the
+# failed state; COMMIT of a failed block acts as a ROLLBACK (PostgreSQL). The whole working set
+# is discarded — including statements that SUCCEEDED before the error. The error that aborts the
+# block here is a duplicate primary key (23505). Format + the `requires` directive:
+# ../../../design/conformance.md.
+# requires: txn.failed_state, txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.int32
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+# --- ROLLBACK clears a failed block -----------------------------------------
+statement ok
+BEGIN
+
+statement error 23505
+INSERT INTO t VALUES (1)
+
+# the block is now failed: any statement but ROLLBACK/COMMIT is 25P02 — even a read
+statement error 25P02
+SELECT id FROM t
+
+statement error 25P02
+INSERT INTO t VALUES (2)
+
+statement ok
+ROLLBACK
+
+# ROLLBACK cleared the failed state; autocommit resumes normally
+query I rowsort
+SELECT id FROM t
+----
+1
+
+# --- COMMIT of a failed block acts as ROLLBACK, discarding earlier successes -
+statement ok
+BEGIN
+
+# this INSERT succeeds within the block...
+statement ok
+INSERT INTO t VALUES (2)
+
+# ...but this one aborts the block (duplicate key)
+statement error 23505
+INSERT INTO t VALUES (1)
+
+statement error 25P02
+SELECT id FROM t
+
+# COMMIT of a failed block rolls back: the earlier successful INSERT (2) is discarded too
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1

@@ -15,7 +15,28 @@ type Statement struct {
 	SetOp  *SetOp
 	Update *Update
 	Delete *Delete
+	// Begin/Commit/Rollback are the explicit transaction-control statements (grammar.md §27,
+	// transactions.md §4.2). Non-nil only for that statement.
+	Begin    *Begin
+	Commit   *Commit
+	Rollback *Rollback
 }
+
+// Begin is a BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE] / START TRANSACTION [...] statement
+// — open an explicit transaction block (spec/design/grammar.md §27). Writable is the access mode:
+// true is READ WRITE (the default), false READ ONLY (a write inside → 25006). A nested BEGIN is
+// 25001 (transactions.md §4.2).
+type Begin struct {
+	Writable bool
+}
+
+// Commit is a COMMIT [TRANSACTION|WORK] / END [...] statement — publish the open block durably and
+// return to autocommit; a COMMIT with no open block is a no-op success (transactions.md §4.2).
+type Commit struct{}
+
+// Rollback is a ROLLBACK [TRANSACTION|WORK] statement — discard the open block's working set and
+// return to autocommit; a ROLLBACK with no open block is a no-op success (transactions.md §4.2).
+type Rollback struct{}
 
 // CreateTable is a CREATE TABLE statement.
 type CreateTable struct {

@@ -97,10 +97,80 @@ func (p *Parser) parseStatement() (Statement, error) {
 			return Statement{}, err
 		}
 		return Statement{Delete: del}, nil
+	case "begin", "start":
+		return p.parseBegin()
+	case "commit", "end":
+		return p.parseCommit()
+	case "rollback":
+		return p.parseRollback()
 	case "":
 		return Statement{}, NewError(SyntaxError, "expected a SQL statement")
 	default:
 		return Statement{}, NewError(SyntaxError, fmt.Sprintf("unexpected keyword '%s'", p.peekKeyword()))
+	}
+}
+
+// parseBegin parses `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` or `START TRANSACTION
+// [READ ONLY|READ WRITE]` — open an explicit transaction (spec/design/grammar.md §27). The access
+// mode defaults to READ WRITE.
+func (p *Parser) parseBegin() (Statement, error) {
+	if p.peekKeyword() == "start" {
+		p.advance()
+		if err := p.expectKeyword("transaction"); err != nil {
+			return Statement{}, err
+		}
+	} else {
+		p.advance() // BEGIN
+		if kw := p.peekKeyword(); kw == "transaction" || kw == "work" {
+			p.advance()
+		}
+	}
+	writable, err := p.parseAccessMode()
+	if err != nil {
+		return Statement{}, err
+	}
+	return Statement{Begin: &Begin{Writable: writable}}, nil
+}
+
+// parseAccessMode parses the optional access mode after a transaction opener: `READ ONLY` → false,
+// `READ WRITE` → true, absent → true (READ WRITE is the default — transactions.md §4.3).
+func (p *Parser) parseAccessMode() (bool, error) {
+	if p.peekKeyword() != "read" {
+		return true, nil
+	}
+	p.advance() // READ
+	switch p.peekKeyword() {
+	case "only":
+		p.advance()
+		return false, nil
+	case "write":
+		p.advance()
+		return true, nil
+	default:
+		return false, NewError(SyntaxError, fmt.Sprintf("expected ONLY or WRITE after READ, found '%s'", p.peekKeyword()))
+	}
+}
+
+// parseCommit parses `COMMIT [TRANSACTION|WORK]` / `END [TRANSACTION|WORK]` (grammar.md §27).
+func (p *Parser) parseCommit() (Statement, error) {
+	p.advance() // COMMIT or END
+	p.consumeTransactionOrWork()
+	return Statement{Commit: &Commit{}}, nil
+}
+
+// parseRollback parses `ROLLBACK [TRANSACTION|WORK]` (grammar.md §27).
+func (p *Parser) parseRollback() (Statement, error) {
+	if err := p.expectKeyword("rollback"); err != nil {
+		return Statement{}, err
+	}
+	p.consumeTransactionOrWork()
+	return Statement{Rollback: &Rollback{}}, nil
+}
+
+// consumeTransactionOrWork consumes the optional trailing TRANSACTION / WORK noise word.
+func (p *Parser) consumeTransactionOrWork() {
+	if kw := p.peekKeyword(); kw == "transaction" || kw == "work" {
+		p.advance()
 	}
 }
 

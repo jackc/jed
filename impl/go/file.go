@@ -84,22 +84,29 @@ func (db *Database) persist() error {
 	return nil
 }
 
-// Commit commits the current transaction (spec/design/api.md §2.2). jed autocommits each
-// statement (transactions.md §4.1), so in this slice there is no open explicit transaction to
-// publish — Commit is a lenient no-op success (transactions.md §4.2). Explicit BEGIN … COMMIT
-// blocks, where Commit does the durable publish, arrive in P5.2.
-func (db *Database) Commit() error { return nil }
+// Commit commits the current transaction (spec/design/api.md §2.2, transactions.md §4.2).
+// Publishes the open explicit block durably (per synchronous); a Commit with no open block is a
+// lenient no-op success (under autocommit each statement already committed). Drives the same
+// mechanism as SQL COMMIT.
+func (db *Database) Commit() error {
+	_, err := db.commitTx()
+	return err
+}
 
-// Rollback rolls back the current transaction (spec/design/api.md §2.2). With autocommit and no
-// open explicit transaction (this slice), there is nothing uncommitted to discard — a no-op
-// success. Discarding an open explicit block's working set arrives with BEGIN in P5.2.
-func (db *Database) Rollback() error { return nil }
+// Rollback rolls back the current transaction (spec/design/api.md §2.2, transactions.md §4.2).
+// Discards the open explicit block's working set; a Rollback with no open block is a no-op
+// success. Drives the same mechanism as SQL ROLLBACK.
+func (db *Database) Rollback() error {
+	_, err := db.rollbackTx()
+	return err
+}
 
-// Close releases the handle (spec/design/api.md §2.3). Under autocommit, every prior statement
-// is already durable, so — unlike the original model — Close does NOT drop committed work; it
-// would roll back an open explicit transaction (none in this slice). Durability is never hidden
-// in a destructor. Idempotent.
+// Close releases the handle (spec/design/api.md §2.3). It rolls back any open explicit
+// transaction (its in-progress work is discarded) and does not commit one. Under autocommit every
+// prior statement is already durable, so — unlike the original model — Close does NOT drop
+// committed work; durability is never hidden in a destructor. Idempotent.
 func (db *Database) Close() error {
+	_, _ = db.rollbackTx()
 	db.path = ""
 	return nil
 }

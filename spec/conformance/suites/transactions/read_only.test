@@ -1,0 +1,75 @@
+# Transaction access modes — READ ONLY vs READ WRITE (spec/design/transactions.md §4.3). A
+# READ ONLY block may read but not write: a write statement inside it is 25006
+# (read_only_sql_transaction). ROLLBACK clears the block and autocommit resumes, so a later write
+# succeeds. READ WRITE is the default and may write. Format + the `requires` directive:
+# ../../../design/conformance.md.
+# requires: txn.read_only, txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, types.int32
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+statement ok
+BEGIN READ ONLY
+
+# reads are fine in a READ ONLY block
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+
+# every write kind is rejected with 25006 in a READ ONLY block
+statement error 25006
+INSERT INTO t VALUES (3, 30)
+
+statement ok
+ROLLBACK
+
+# ROLLBACK cleared the block; autocommit resumes and a write succeeds
+statement ok
+INSERT INTO t VALUES (3, 30)
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+
+# UPDATE and DELETE are also writes — rejected in a READ ONLY block
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+UPDATE t SET v = 0 WHERE id = 1
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+DELETE FROM t WHERE id = 1
+
+statement ok
+ROLLBACK
+
+# the explicit READ WRITE mode is the default and may write
+statement ok
+BEGIN READ WRITE
+
+statement ok
+UPDATE t SET v = 11 WHERE id = 1
+
+statement ok
+COMMIT
+
+query II nosort
+SELECT id, v FROM t WHERE id = 1 ORDER BY id
+----
+1
+11

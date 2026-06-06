@@ -39,12 +39,15 @@ type Outcome struct {
 // used for a fresh in-memory or newly-created database when no explicit size is given.
 const DefaultPageSize uint32 = 8192
 
-// Database is the whole database: catalog + per-table in-memory stores. Single
-// committed state (CLAUDE.md §3); the staging-buffer commit model lands with
-// persistence.
+// Database is the whole database: catalog + per-table in-memory stores. One committed state plus,
+// while an explicit block is open, the writer's working set (CLAUDE.md §3, transactions.md §2):
+// under autocommit tables/stores ARE the committed state; inside a READ WRITE block they are the
+// working set and tx.base* holds the committed state to restore on ROLLBACK.
 type Database struct {
 	tables map[string]*Table
 	stores map[string]*TableStore
+	// tx is the open explicit transaction, or nil under autocommit (transactions.md §4.1/§4.2).
+	tx *activeTx
 	// path is the backing file (empty for an in-memory database). Set by the host API
 	// Open/Create (spec/design/api.md §2); Commit writes here.
 	path string
@@ -52,6 +55,18 @@ type Database struct {
 	txid uint64
 	// pageSize is the page size this database serializes with (fixed for the life of a file).
 	pageSize uint32
+}
+
+// activeTx is an open explicit transaction block (spec/design/transactions.md §4.2). writable is
+// the access mode (READ WRITE vs READ ONLY — a write in a READ ONLY block is 25006); failed marks
+// an aborted block (every later statement but COMMIT/ROLLBACK is 25P02 — §6); base* is the
+// committed state captured at BEGIN, restored on ROLLBACK (and on COMMIT of a failed block). A
+// READ ONLY block never mutates, so it captures nothing.
+type activeTx struct {
+	writable   bool
+	failed     bool
+	baseTables map[string]*Table
+	baseStores map[string]*TableStore
 }
 
 // NewDatabase builds an empty in-memory database.
@@ -62,6 +77,10 @@ func NewDatabase() *Database {
 		pageSize: DefaultPageSize,
 	}
 }
+
+// InTransaction reports whether an explicit transaction block is currently open
+// (spec/design/transactions.md §4.2). False under autocommit. Used by the host Transaction surface.
+func (db *Database) InTransaction() bool { return db.tx != nil }
 
 // Txid is the monotonic commit counter (spec/design/api.md §2).
 func (db *Database) Txid() uint64 { return db.txid }
@@ -94,14 +113,55 @@ func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
 // for an unparameterized statement). DDL statements take no parameters — supplying any is a
 // 42601 (spec/design/api.md §5).
 //
-// Autocommit (spec/design/transactions.md §4.1): a read runs against the committed state
-// directly; a write is its own transaction — the committed state is captured first (the stores
-// are O(1) clones via the persistent map, pmap.go), the statement runs, and on success the
-// change is made durable (synchronous, the single persist chokepoint). Any failure — in the
-// statement or in the durable write — restores the captured state (rollback-on-error,
-// discarding partial work and any rowid allocations, §7). For an in-memory database persist is
-// a no-op, so autocommit is pure in-memory visibility.
+// Transaction control (BEGIN/COMMIT/ROLLBACK) drives the handle's current-transaction state
+// directly (spec/design/transactions.md §4.2). Otherwise the statement runs either inside the
+// open explicit block or, with none open, under autocommit (§4.1):
+//
+//   - Inside a block (§4.2/§6): an aborted block rejects every statement but COMMIT/ROLLBACK with
+//     25P02; a write in a READ ONLY block is 25006; otherwise the statement runs against the
+//     working set in place — no per-statement durable write (the block publishes once, at COMMIT).
+//     ANY statement error aborts the block (it enters the failed state); the statement's own
+//     two-phase pass already guarantees it wrote nothing partial (§6), so the whole working set is
+//     discarded only at ROLLBACK.
+//   - Autocommit (§4.1): a read runs against the committed state directly; a write is its own
+//     transaction — the committed state is captured first (the stores are O(1) clones via the
+//     persistent map, pmap.go), the statement runs, and on success the change is made durable
+//     (synchronous, the single persist chokepoint). Any failure — in the statement or in the
+//     durable write — restores the captured state (rollback-on-error, discarding partial work and
+//     any rowid allocations, §7). For an in-memory database persist is a no-op.
 func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, error) {
+	switch {
+	case stmt.Begin != nil:
+		return db.beginTx(stmt.Begin.Writable)
+	case stmt.Commit != nil:
+		return db.commitTx()
+	case stmt.Rollback != nil:
+		return db.rollbackTx()
+	}
+
+	// Inside an explicit block?
+	if db.tx != nil {
+		if db.tx.failed {
+			return Outcome{}, NewError(InFailedSqlTransaction,
+				"current transaction is aborted, commands ignored until end of transaction block")
+		}
+		// Run the statement; ANY error aborts the block (it enters the failed state — §6).
+		var outcome Outcome
+		var err error
+		if stmtIsWrite(stmt) && !db.tx.writable {
+			err = NewError(ReadOnlySqlTransaction,
+				"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
+		} else {
+			outcome, err = db.dispatchStmt(stmt, params)
+		}
+		if err != nil {
+			db.tx.failed = true
+			return Outcome{}, err
+		}
+		return outcome, nil
+	}
+
+	// Autocommit (no open block).
 	if !stmtIsWrite(stmt) {
 		return db.dispatchStmt(stmt, params)
 	}
@@ -118,12 +178,93 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 	return outcome, nil
 }
 
+// beginTx opens an explicit transaction block (spec/design/transactions.md §4.2). writable is the
+// access mode (READ WRITE vs READ ONLY). A nested BEGIN (a block is already open) is 25001. A
+// READ WRITE block captures the committed state so ROLLBACK can restore it; a READ ONLY block
+// never mutates, so it captures nothing. Returns a zero-cost statement outcome.
+func (db *Database) beginTx(writable bool) (Outcome, error) {
+	if db.tx != nil {
+		return Outcome{}, NewError(ActiveSqlTransaction, "there is already a transaction in progress")
+	}
+	tx := &activeTx{writable: writable}
+	if writable {
+		tx.baseTables, tx.baseStores = db.snapshotState()
+	}
+	db.tx = tx
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// commitTx commits the current transaction (spec/design/transactions.md §4.2). With no open block
+// it is a lenient no-op success. A failed block commits as a ROLLBACK (PostgreSQL). A READ WRITE
+// block publishes its working set durably (the single persist chokepoint, §9); a durable-write
+// failure restores the committed state and propagates. A READ ONLY block publishes nothing.
+func (db *Database) commitTx() (Outcome, error) {
+	tx := db.tx
+	if tx == nil {
+		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	}
+	db.tx = nil
+	if tx.failed {
+		// COMMIT of an aborted block silently rolls back (PostgreSQL).
+		if tx.writable {
+			db.tables = tx.baseTables
+			db.stores = tx.baseStores
+		}
+		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	}
+	if tx.writable {
+		if err := db.persist(); err != nil {
+			// The commit failed: roll back to the committed state and propagate.
+			db.tables = tx.baseTables
+			db.stores = tx.baseStores
+			return Outcome{}, err
+		}
+	}
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// rollbackTx rolls back the current transaction (spec/design/transactions.md §4.2). With no open
+// block it is a no-op success. A READ WRITE block discards its working set — every staged
+// INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7) — by restoring the
+// committed state captured at BEGIN; a READ ONLY block mutated nothing, so there is nothing to
+// restore.
+func (db *Database) rollbackTx() (Outcome, error) {
+	tx := db.tx
+	if tx != nil {
+		db.tx = nil
+		if tx.writable {
+			db.tables = tx.baseTables
+			db.stores = tx.baseStores
+		}
+	}
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
 // stmtIsWrite reports whether a statement mutates the database (so autocommit must capture +
-// durably persist it). Reads (SELECT, set operations) run with no transaction (transactions.md
-// §4.1).
+// durably persist it, and a READ ONLY transaction must reject it — transactions.md §4.1/§4.3).
+// Reads (SELECT, set operations) and transaction control run with no data mutation.
 func stmtIsWrite(stmt Statement) bool {
 	return stmt.CreateTable != nil || stmt.DropTable != nil ||
 		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil
+}
+
+// stmtKind is a short label for a statement kind, for the 25006 read-only-violation message (the
+// message text is informational — never matched; spec/design/conformance.md §2).
+func stmtKind(stmt Statement) string {
+	switch {
+	case stmt.CreateTable != nil:
+		return "CREATE TABLE"
+	case stmt.DropTable != nil:
+		return "DROP TABLE"
+	case stmt.Insert != nil:
+		return "INSERT"
+	case stmt.Update != nil:
+		return "UPDATE"
+	case stmt.Delete != nil:
+		return "DELETE"
+	default:
+		return "statement"
+	}
 }
 
 // snapshotState captures the committed catalog + stores cheaply for rollback-on-error: each

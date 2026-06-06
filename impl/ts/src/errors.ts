@@ -19,6 +19,9 @@ export type SqlState =
   | "invalid_row_count_in_offset_clause" // 2201X — a negative OFFSET count
   | "not_null_violation" // 23502
   | "unique_violation" // 23505 — primary-key uniqueness
+  | "active_sql_transaction" // 25001 — a nested BEGIN (no SAVEPOINT this slice; transactions.md §4.2)
+  | "read_only_sql_transaction" // 25006 — a write in a READ ONLY transaction (transactions.md §4.3)
+  | "in_failed_sql_transaction" // 25P02 — a statement in a failed/aborted block (transactions.md §6)
   | "syntax_error" // 42601
   | "undefined_table" // 42P01
   | "undefined_column" // 42703
@@ -52,6 +55,9 @@ const CODES: Record<SqlState, string> = {
   invalid_row_count_in_offset_clause: "2201X",
   not_null_violation: "23502",
   unique_violation: "23505",
+  active_sql_transaction: "25001",
+  read_only_sql_transaction: "25006",
+  in_failed_sql_transaction: "25P02",
   syntax_error: "42601",
   undefined_table: "42P01",
   undefined_column: "42703",

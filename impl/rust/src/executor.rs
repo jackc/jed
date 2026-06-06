@@ -70,11 +70,16 @@ struct SelectResult {
 /// in-memory or newly-created database when no explicit size is given.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
 
-/// The whole database: catalog + per-table in-memory stores. Single committed
-/// state (CLAUDE.md §3); the staging-buffer commit model lands with persistence.
+/// The whole database: catalog + per-table in-memory stores. One committed state plus, while an
+/// explicit block is open, the writer's working set (CLAUDE.md §3, spec/design/transactions.md
+/// §2): under autocommit `tables`/`stores` *are* the committed state; inside a READ WRITE block
+/// they are the working set and `tx.base_*` holds the committed state to restore on ROLLBACK.
 pub struct Database {
     tables: HashMap<String, Table>,
     stores: HashMap<String, TableStore>,
+    /// The open explicit transaction, if any. `None` is autocommit — each statement is its own
+    /// transaction (transactions.md §4.1). `Some` is an open `BEGIN … COMMIT/ROLLBACK` block.
+    tx: Option<ActiveTx>,
     /// The backing file path (`None` for an in-memory database). Set by the host API
     /// `open`/`create` (spec/design/api.md §2); `commit` writes here.
     pub(crate) path: Option<std::path::PathBuf>,
@@ -83,6 +88,18 @@ pub struct Database {
     /// The page size this database serializes with (from the file on open, from create opts,
     /// else `DEFAULT_PAGE_SIZE`). Fixed for the life of a file.
     pub(crate) page_size: u32,
+}
+
+/// An open explicit transaction block (spec/design/transactions.md §4.2). `writable` is the
+/// access mode — READ WRITE may write, READ ONLY is read-only (a write inside → 25006). `failed`
+/// marks an aborted block: after a statement error every later statement but COMMIT/ROLLBACK is
+/// 25P02 (§6). `base_*` is the committed state captured at BEGIN, restored on ROLLBACK (and on
+/// COMMIT of a failed block); a READ ONLY block never mutates, so it captures nothing.
+struct ActiveTx {
+    writable: bool,
+    failed: bool,
+    base_tables: HashMap<String, Table>,
+    base_stores: HashMap<String, TableStore>,
 }
 
 impl Default for Database {
@@ -96,10 +113,17 @@ impl Database {
         Database {
             tables: HashMap::new(),
             stores: HashMap::new(),
+            tx: None,
             path: None,
             txid: 0,
             page_size: DEFAULT_PAGE_SIZE,
         }
+    }
+
+    /// Whether an explicit transaction block is currently open (spec/design/transactions.md
+    /// §4.2). False under autocommit. Used by the host `Transaction` surface (api.md §6).
+    pub fn in_transaction(&self) -> bool {
+        self.tx.is_some()
     }
 
     /// The monotonic commit counter (spec/design/api.md §2): 0 for a fresh in-memory database,
@@ -157,15 +181,62 @@ impl Database {
     /// for an unparameterized statement). The DDL statements take no parameters — supplying any
     /// is a 42601 (spec/design/api.md §5).
     ///
-    /// **Autocommit** (spec/design/transactions.md §4.1): a read runs against the committed
-    /// state directly; a write is its own transaction — the committed state is captured first
-    /// (the stores are O(1) clones via the persistent map, [`crate::pmap`]), the statement
-    /// runs, and on success the change is made durable (synchronous, the single `persist`
-    /// chokepoint). Any failure — in the statement or in the durable write — restores the
-    /// captured state (rollback-on-error), discarding partial work and any rowid allocations
-    /// (transactions.md §7). For an in-memory database `persist` is a no-op, so autocommit is
-    /// pure in-memory visibility.
+    /// Transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) drives the handle's current-transaction
+    /// state directly (spec/design/transactions.md §4.2). Otherwise the statement runs either
+    /// inside the open explicit block or, with none open, under **autocommit** (§4.1):
+    ///
+    /// - **Inside a block** (§4.2/§6): an aborted block rejects every statement but COMMIT/ROLLBACK
+    ///   with 25P02; a write in a READ ONLY block is 25006; otherwise the statement runs against
+    ///   the working set in place — no per-statement durable write (the block publishes once, at
+    ///   COMMIT). **Any** statement error aborts the block (it enters the failed state); the
+    ///   statement's own two-phase pass already guarantees it wrote nothing partial (§6), so the
+    ///   whole working set is discarded only at ROLLBACK.
+    /// - **Autocommit** (§4.1): a read runs against the committed state directly; a write is its
+    ///   own transaction — the committed state is captured first (the stores are O(1) clones via
+    ///   the persistent map, [`crate::pmap`]), the statement runs, and on success the change is
+    ///   made durable (synchronous, the single `persist` chokepoint). Any failure — in the
+    ///   statement or in the durable write — restores the captured state (rollback-on-error),
+    ///   discarding partial work and any rowid allocations (§7). For an in-memory database
+    ///   `persist` is a no-op, so autocommit is pure in-memory visibility.
     pub fn execute_stmt_params(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
+        match stmt {
+            Statement::Begin { writable } => return self.begin_tx(writable),
+            Statement::Commit => return self.commit_tx(),
+            Statement::Rollback => return self.rollback_tx(),
+            _ => {}
+        }
+
+        // Inside an explicit block? Read the flags, dropping the borrow before dispatch.
+        if self.tx.is_some() {
+            let (failed, writable) = {
+                let tx = self.tx.as_ref().expect("tx is open");
+                (tx.failed, tx.writable)
+            };
+            if failed {
+                return Err(EngineError::new(
+                    SqlState::InFailedSqlTransaction,
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                ));
+            }
+            // Run the statement; ANY error aborts the block (it enters the failed state — §6).
+            let result = if stmt_is_write(&stmt) && !writable {
+                Err(EngineError::new(
+                    SqlState::ReadOnlySqlTransaction,
+                    format!(
+                        "cannot execute {} in a read-only transaction",
+                        stmt_kind(&stmt)
+                    ),
+                ))
+            } else {
+                self.dispatch_stmt(stmt, params)
+            };
+            if result.is_err() {
+                self.tx.as_mut().expect("tx is open").failed = true;
+            }
+            return result;
+        }
+
+        // Autocommit (no open block).
         if !stmt_is_write(&stmt) {
             return self.dispatch_stmt(stmt, params);
         }
@@ -180,6 +251,75 @@ impl Database {
             self.stores = saved_stores;
         }
         result
+    }
+
+    /// Open an explicit transaction block (spec/design/transactions.md §4.2). `writable` is the
+    /// access mode (READ WRITE vs READ ONLY). A nested `BEGIN` (a block is already open) is
+    /// 25001. A READ WRITE block captures the committed state so ROLLBACK can restore it; a READ
+    /// ONLY block never mutates, so it captures nothing. Returns a zero-cost statement outcome.
+    pub(crate) fn begin_tx(&mut self, writable: bool) -> Result<Outcome> {
+        if self.tx.is_some() {
+            return Err(EngineError::new(
+                SqlState::ActiveSqlTransaction,
+                "there is already a transaction in progress",
+            ));
+        }
+        let (base_tables, base_stores) = if writable {
+            (self.tables.clone(), self.stores.clone())
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+        self.tx = Some(ActiveTx {
+            writable,
+            failed: false,
+            base_tables,
+            base_stores,
+        });
+        Ok(Outcome::Statement { cost: 0 })
+    }
+
+    /// Commit the current transaction (spec/design/transactions.md §4.2). With no open block it is
+    /// a lenient no-op success. A **failed** block commits as a ROLLBACK (PostgreSQL). A READ
+    /// WRITE block publishes its working set durably (the single `persist` chokepoint, §9); a
+    /// durable-write failure restores the committed state and propagates. A READ ONLY block
+    /// publishes nothing. Either way the handle returns to autocommit.
+    pub(crate) fn commit_tx(&mut self) -> Result<Outcome> {
+        let tx = match self.tx.take() {
+            None => return Ok(Outcome::Statement { cost: 0 }),
+            Some(tx) => tx,
+        };
+        if tx.failed {
+            // COMMIT of an aborted block silently rolls back (PostgreSQL).
+            if tx.writable {
+                self.tables = tx.base_tables;
+                self.stores = tx.base_stores;
+            }
+            return Ok(Outcome::Statement { cost: 0 });
+        }
+        if tx.writable {
+            if let Err(e) = self.persist() {
+                // The commit failed: roll back to the committed state and propagate.
+                self.tables = tx.base_tables;
+                self.stores = tx.base_stores;
+                return Err(e);
+            }
+        }
+        Ok(Outcome::Statement { cost: 0 })
+    }
+
+    /// Roll back the current transaction (spec/design/transactions.md §4.2). With no open block it
+    /// is a no-op success. A READ WRITE block discards its working set — every staged
+    /// INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7) — by restoring
+    /// the committed state captured at BEGIN; a READ ONLY block mutated nothing, so there is
+    /// nothing to restore. The handle returns to autocommit.
+    pub(crate) fn rollback_tx(&mut self) -> Result<Outcome> {
+        if let Some(tx) = self.tx.take() {
+            if tx.writable {
+                self.tables = tx.base_tables;
+                self.stores = tx.base_stores;
+            }
+        }
+        Ok(Outcome::Statement { cost: 0 })
     }
 
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
@@ -199,6 +339,10 @@ impl Database {
             Statement::SetOp(so) => self.execute_set_op(so, params),
             Statement::Update(upd) => self.execute_update(upd, params),
             Statement::Delete(del) => self.execute_delete(del, params),
+            // Transaction control is handled by `execute_stmt_params` before dispatch.
+            Statement::Begin { .. } | Statement::Commit | Statement::Rollback => {
+                unreachable!("transaction control is handled before dispatch")
+            }
         }
     }
 
@@ -2918,9 +3062,10 @@ fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
     }
 }
 
-/// Whether a statement mutates the database (so autocommit must capture + durably persist it).
-/// Reads (`SELECT`, set operations) run against the committed state with no transaction
-/// (spec/design/transactions.md §4.1).
+/// Whether a statement mutates the database (so autocommit must capture + durably persist it,
+/// and a READ ONLY transaction must reject it — spec/design/transactions.md §4.1/§4.3). Reads
+/// (`SELECT`, set operations) and transaction control run against the committed state / handle
+/// state with no data mutation.
 fn stmt_is_write(stmt: &Statement) -> bool {
     matches!(
         stmt,
@@ -2930,6 +3075,22 @@ fn stmt_is_write(stmt: &Statement) -> bool {
             | Statement::Update(_)
             | Statement::Delete(_)
     )
+}
+
+/// A short label for a statement kind, for the 25006 read-only-violation message (the message
+/// text is informational — never matched; spec/design/conformance.md §2).
+fn stmt_kind(stmt: &Statement) -> &'static str {
+    match stmt {
+        Statement::CreateTable(_) => "CREATE TABLE",
+        Statement::DropTable(_) => "DROP TABLE",
+        Statement::Insert(_) => "INSERT",
+        Statement::Update(_) => "UPDATE",
+        Statement::Delete(_) => "DELETE",
+        Statement::Select(_) | Statement::SetOp(_) => "SELECT",
+        Statement::Begin { .. } => "BEGIN",
+        Statement::Commit => "COMMIT",
+        Statement::Rollback => "ROLLBACK",
+    }
 }
 
 /// The resolved (static) type of a column of scalar type `ty`.

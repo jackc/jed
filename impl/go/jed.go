@@ -125,6 +125,11 @@ var SupportedCapabilities = []string{
 	// Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
 	// accrued cost via the `# cost:` directive (CLAUDE.md §13).
 	"resource.cost_metering",
+	// Phase 5 — explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes,
+	// failed-block poisoning (spec/design/transactions.md §4, grammar.md §27).
+	"txn.explicit",
+	"txn.read_only",
+	"txn.failed_state",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

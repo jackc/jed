@@ -27,7 +27,7 @@ pub mod token;
 pub mod types;
 pub mod value;
 
-pub use api::{PreparedStatement, Rows};
+pub use api::{PreparedStatement, Rows, Transaction};
 pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{DEFAULT_PAGE_SIZE, Database, Outcome};
@@ -165,6 +165,11 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
     // accrued cost via the `# cost:` directive (CLAUDE.md §13).
     "resource.cost_metering",
+    // Phase 5 — explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes,
+    // failed-block poisoning (spec/design/transactions.md §4, grammar.md §27).
+    "txn.explicit",
+    "txn.read_only",
+    "txn.failed_state",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

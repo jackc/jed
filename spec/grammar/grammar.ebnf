@@ -42,6 +42,9 @@ sql_statement  ::= create_table
                  | query_expr
                  | update
                  | delete
+                 | begin
+                 | commit
+                 | rollback
 
 /* --- DDL ----------------------------------------------------------------- */
 
@@ -118,6 +121,25 @@ update         ::= "UPDATE" identifier "SET"
 assignment     ::= identifier "=" expr
 
 delete         ::= "DELETE" "FROM" identifier where_clause?
+
+/* --- transaction control (../design/transactions.md §4, ../design/grammar.md §27) --------- */
+
+/* An explicit transaction block. "BEGIN" (optionally "BEGIN TRANSACTION" / "BEGIN WORK") and
+ * "START TRANSACTION" are equivalent openers; the access mode defaults to READ WRITE. A nested
+ * BEGIN — one issued while a block is already open — is 25001 (no SAVEPOINT/nesting this slice).
+ * READ ONLY takes no write lock and pins a snapshot; a write statement inside it is 25006. */
+begin          ::= ("BEGIN" ("TRANSACTION" | "WORK")? | "START" "TRANSACTION") access_mode?
+
+access_mode    ::= "READ" "ONLY" | "READ" "WRITE"
+
+/* COMMIT publishes the block's changes (durably, per the `synchronous` setting); "END" and
+ * "COMMIT WORK"/"COMMIT TRANSACTION" are aliases. COMMIT of a *failed* block performs a ROLLBACK
+ * (PostgreSQL). ROLLBACK discards the block's working set and clears a failed block. A
+ * COMMIT/ROLLBACK with no open block is a lenient no-op success (no 25P01 — §4.2). The keywords
+ * BEGIN/START/COMMIT/END/ROLLBACK/WORK/READ/ONLY/WRITE are NOT reserved (§3). */
+commit         ::= ("COMMIT" | "END") ("TRANSACTION" | "WORK")?
+
+rollback       ::= "ROLLBACK" ("TRANSACTION" | "WORK")?
 
 /* --- queries ------------------------------------------------------------- */
 

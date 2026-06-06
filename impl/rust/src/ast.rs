@@ -17,6 +17,19 @@ pub enum Statement {
     SetOp(SetOp),
     Update(Update),
     Delete(Delete),
+    /// `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` / `START TRANSACTION [...]` — open an
+    /// explicit transaction block (spec/design/grammar.md §27). `writable` is the access mode:
+    /// `true` is READ WRITE (the default), `false` READ ONLY (a write inside → 25006). A nested
+    /// `BEGIN` is 25001 (transactions.md §4.2).
+    Begin {
+        writable: bool,
+    },
+    /// `COMMIT [TRANSACTION|WORK]` / `END [...]` — publish the open block durably and return to
+    /// autocommit; a `COMMIT` with no open block is a no-op success (transactions.md §4.2).
+    Commit,
+    /// `ROLLBACK [TRANSACTION|WORK]` — discard the open block's working set and return to
+    /// autocommit; a `ROLLBACK` with no open block is a no-op success (transactions.md §4.2).
+    Rollback,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

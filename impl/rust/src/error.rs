@@ -36,6 +36,14 @@ pub enum SqlState {
     NotNullViolation,
     /// 23505 — unique (primary key) constraint violation.
     UniqueViolation,
+    /// 25001 — a `BEGIN` issued while a transaction is already open (no nesting — there is no
+    /// SAVEPOINT this slice; spec/design/transactions.md §4.2).
+    ActiveSqlTransaction,
+    /// 25006 — a write statement issued in a READ ONLY transaction (transactions.md §4.3).
+    ReadOnlySqlTransaction,
+    /// 25P02 — a statement (other than ROLLBACK/COMMIT) issued in a failed/aborted transaction
+    /// block; it stays poisoned until the block ends (transactions.md §6).
+    InFailedSqlTransaction,
     /// 42601 — syntax error.
     SyntaxError,
     /// 42P01 — undefined table.
@@ -99,6 +107,9 @@ impl SqlState {
             SqlState::InvalidRowCountInOffsetClause => "2201X",
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
+            SqlState::ActiveSqlTransaction => "25001",
+            SqlState::ReadOnlySqlTransaction => "25006",
+            SqlState::InFailedSqlTransaction => "25P02",
             SqlState::SyntaxError => "42601",
             SqlState::UndefinedTable => "42P01",
             SqlState::UndefinedColumn => "42703",

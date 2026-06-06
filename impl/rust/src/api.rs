@@ -77,7 +77,94 @@ impl Iterator for Rows {
     }
 }
 
+/// An open explicit transaction (spec/design/api.md §2.2, transactions.md §4.4). Borrows the
+/// `Database` for the transaction's life; statements run through `execute`/`query`, and
+/// `commit`/`rollback` end it. Dropping it without an explicit end **rolls back** — an unfinished
+/// transaction never silently commits its work (the bbolt safety net).
+pub struct Transaction<'a> {
+    db: &'a mut Database,
+    done: bool,
+}
+
+impl Transaction<'_> {
+    /// Run a (possibly mutating) statement within this transaction, binding `params`. A write in
+    /// a READ ONLY transaction is `25006`; a statement error aborts the block (every later
+    /// statement but commit/rollback is then `25P02`).
+    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        self.db.execute(sql, params)
+    }
+
+    /// Run a query within this transaction, returning a row cursor.
+    pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
+        self.db.query(sql, params)
+    }
+
+    /// Commit the transaction — publish + make durable (per `synchronous`). Consumes the handle.
+    pub fn commit(mut self) -> Result<()> {
+        self.done = true;
+        self.db.commit()
+    }
+
+    /// Roll back the transaction — discard its working set. Consumes the handle.
+    pub fn rollback(mut self) -> Result<()> {
+        self.done = true;
+        self.db.rollback()
+    }
+}
+
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            // An un-ended transaction rolls back — durability is never implicit (bbolt's rule).
+            let _ = self.db.rollback();
+        }
+    }
+}
+
 impl Database {
+    /// Open an explicit transaction (spec/design/api.md §2.2). `writable` false is READ ONLY (a
+    /// write inside → `25006`); true is READ WRITE. A nested `begin` (a transaction is already
+    /// open) is `25001`. Prefer `view`/`update`, which cannot forget to end the transaction.
+    pub fn begin(&mut self, writable: bool) -> Result<Transaction<'_>> {
+        self.begin_tx(writable)?;
+        Ok(Transaction {
+            db: self,
+            done: false,
+        })
+    }
+
+    /// Run `f` in a READ ONLY transaction (bbolt-style): open it, run `f(tx)`, then auto-commit on
+    /// success / auto-rollback on error or panic. A write inside is `25006`.
+    pub fn view<R>(&mut self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
+        self.with_tx(false, f)
+    }
+
+    /// Run `f` in a READ WRITE transaction (bbolt-style): open it, run `f(tx)`, then auto-commit on
+    /// success / auto-rollback on error or panic — the safe default over a raw `begin`.
+    pub fn update<R>(&mut self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
+        self.with_tx(true, f)
+    }
+
+    fn with_tx<R>(
+        &mut self,
+        writable: bool,
+        f: impl FnOnce(&mut Transaction) -> Result<R>,
+    ) -> Result<R> {
+        let mut tx = self.begin(writable)?;
+        match f(&mut tx) {
+            Ok(r) => {
+                tx.commit()?;
+                Ok(r)
+            }
+            Err(e) => {
+                // Roll back the failed transaction (a panic is handled by `Drop`); surface the
+                // original error, not the rollback's result.
+                let _ = tx.rollback();
+                Err(e)
+            }
+        }
+    }
+
     /// Parse `sql` once into a reusable prepared statement (spec/design/api.md §2.4). Parse
     /// errors (`42601`, …) surface here.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {

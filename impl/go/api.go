@@ -4,6 +4,81 @@ package jed
 // query it (with optional $N bind parameters), and iterate result rows. Thin wrappers over the
 // parser + executor — the conformance contract still binds (the executor is unchanged).
 
+// Transaction is an open explicit transaction (spec/design/api.md §2.2, transactions.md §4.4).
+// Statements run through Execute/Query; Commit/Rollback end it. Go has no destructor, so a raw
+// Begin caller must end it explicitly — View/Update do that automatically (and are preferred).
+type Transaction struct {
+	db   *Database
+	done bool
+}
+
+// Execute runs a (possibly mutating) statement within this transaction, binding params. A write
+// in a READ ONLY transaction is 25006; a statement error aborts the block (every later statement
+// but commit/rollback is then 25P02).
+func (tx *Transaction) Execute(sql string, params []Value) (Outcome, error) {
+	return tx.db.ExecuteSQL(sql, params)
+}
+
+// Query runs a query within this transaction, returning a row cursor.
+func (tx *Transaction) Query(sql string, params []Value) (*Rows, error) {
+	return tx.db.QuerySQL(sql, params)
+}
+
+// Commit publishes the transaction durably (per synchronous). Idempotent after the transaction
+// has ended.
+func (tx *Transaction) Commit() error {
+	if tx.done {
+		return nil
+	}
+	tx.done = true
+	return tx.db.Commit()
+}
+
+// Rollback discards the transaction's working set. Idempotent after the transaction has ended, so
+// a `defer tx.Rollback()` after a Commit is a safe no-op (the View/Update wrappers rely on this).
+func (tx *Transaction) Rollback() error {
+	if tx.done {
+		return nil
+	}
+	tx.done = true
+	return tx.db.Rollback()
+}
+
+// Begin opens an explicit transaction (spec/design/api.md §2.2). writable false is READ ONLY (a
+// write inside → 25006); true is READ WRITE. A nested Begin (a transaction is already open) is
+// 25001. Prefer View/Update, which cannot forget to end the transaction.
+func (db *Database) Begin(writable bool) (*Transaction, error) {
+	if _, err := db.beginTx(writable); err != nil {
+		return nil, err
+	}
+	return &Transaction{db: db}, nil
+}
+
+// View runs fn in a READ ONLY transaction (bbolt-style): open it, run fn(tx), then auto-commit on
+// success / auto-rollback on error or panic. A write inside is 25006.
+func (db *Database) View(fn func(tx *Transaction) error) error {
+	return db.withTx(false, fn)
+}
+
+// Update runs fn in a READ WRITE transaction (bbolt-style): open it, run fn(tx), then auto-commit
+// on success / auto-rollback on error or panic — the safe default over a raw Begin.
+func (db *Database) Update(fn func(tx *Transaction) error) error {
+	return db.withTx(true, fn)
+}
+
+func (db *Database) withTx(writable bool, fn func(tx *Transaction) error) error {
+	tx, err := db.Begin(writable)
+	if err != nil {
+		return err
+	}
+	// Rolls back on an early return or panic; a no-op once Commit has ended the transaction.
+	defer func() { _ = tx.Rollback() }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4). It holds the
 // parsed AST and a back-pointer to the database it was prepared against (Go is GC'd, so binding
 // the database at prepare is safe — unlike Rust's borrow model, api.md §6).

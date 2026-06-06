@@ -1,0 +1,50 @@
+# Transaction control edges (spec/design/transactions.md §4.2). A nested BEGIN — one issued
+# while a block is already open — is 25001 (active_sql_transaction): there is no SAVEPOINT/
+# nesting this slice, so it has no defined action and errors. A COMMIT or ROLLBACK with no open
+# block is the opposite: a lenient no-op success (it always has a well-defined action, of which
+# there is none), so it succeeds rather than raising 25P01. Format + the `requires` directive:
+# ../../../design/conformance.md.
+# requires: txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.int32
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY)
+
+# COMMIT / ROLLBACK with no open block — lenient no-op successes (no 25P01)
+statement ok
+COMMIT
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+# a nested BEGIN (and the START TRANSACTION spelling) inside an open block is 25001
+statement error 25001
+BEGIN
+
+statement error 25001
+START TRANSACTION
+
+# a nested BEGIN with an access mode is still 25001
+statement error 25001
+BEGIN READ ONLY
+
+# the original block is still open and usable — the rejected nested BEGINs did not disturb it
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+COMMIT
+
+query I rowsort
+SELECT id FROM t
+----
+1
+
+# after the block ends, COMMIT/ROLLBACK are no-op successes again
+statement ok
+ROLLBACK
+
+statement ok
+COMMIT

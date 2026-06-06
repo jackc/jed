@@ -120,11 +120,74 @@ class Parser {
         return this.parseUpdate();
       case "delete":
         return this.parseDelete();
+      case "begin":
+      case "start":
+        return this.parseBegin();
+      case "commit":
+      case "end":
+        return this.parseCommit();
+      case "rollback":
+        return this.parseRollback();
       case "":
         throw engineError("syntax_error", "expected a SQL statement");
       default:
         throw engineError("syntax_error", `unexpected keyword '${this.peekKeyword()}'`);
     }
+  }
+
+  // parseBegin parses `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` or `START TRANSACTION
+  // [READ ONLY|READ WRITE]` — open an explicit transaction (spec/design/grammar.md §27). The
+  // access mode defaults to READ WRITE.
+  private parseBegin(): Statement {
+    if (this.peekKeyword() === "start") {
+      this.advance();
+      this.expectKeyword("transaction");
+    } else {
+      this.advance(); // BEGIN
+      const kw = this.peekKeyword();
+      if (kw === "transaction" || kw === "work") this.advance();
+    }
+    return { kind: "begin", writable: this.parseAccessMode() };
+  }
+
+  // parseAccessMode parses the optional access mode after a transaction opener: `READ ONLY` →
+  // false, `READ WRITE` → true, absent → true (READ WRITE is the default — transactions.md §4.3).
+  private parseAccessMode(): boolean {
+    if (this.peekKeyword() !== "read") return true;
+    this.advance(); // READ
+    switch (this.peekKeyword()) {
+      case "only":
+        this.advance();
+        return false;
+      case "write":
+        this.advance();
+        return true;
+      default:
+        throw engineError(
+          "syntax_error",
+          `expected ONLY or WRITE after READ, found '${this.peekKeyword()}'`,
+        );
+    }
+  }
+
+  // parseCommit parses `COMMIT [TRANSACTION|WORK]` / `END [TRANSACTION|WORK]` (grammar.md §27).
+  private parseCommit(): Statement {
+    this.advance(); // COMMIT or END
+    this.consumeTransactionOrWork();
+    return { kind: "commit" };
+  }
+
+  // parseRollback parses `ROLLBACK [TRANSACTION|WORK]` (grammar.md §27).
+  private parseRollback(): Statement {
+    this.expectKeyword("rollback");
+    this.consumeTransactionOrWork();
+    return { kind: "rollback" };
+  }
+
+  // consumeTransactionOrWork consumes the optional trailing TRANSACTION / WORK noise word.
+  private consumeTransactionOrWork(): void {
+    const kw = this.peekKeyword();
+    if (kw === "transaction" || kw === "work") this.advance();
   }
 
   // parseCreateTable parses `CREATE TABLE <name> ( <coldef> [, <coldef>]* )`, where

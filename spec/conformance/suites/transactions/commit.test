@@ -1,0 +1,61 @@
+# Explicit transaction — COMMIT publishes the block (spec/design/grammar.md §27,
+# transactions.md §4.2). BEGIN opens a READ WRITE block; the statements inside accumulate in a
+# private working set (read-your-writes within the block); COMMIT makes them visible. DDL
+# (CREATE TABLE) inside a committed block persists too. The harness runs every record against one
+# Database handle, so this BEGIN/.../COMMIT/SELECT sequence is an ordinary deterministic entry
+# (transactions.md §10). Format + the `requires` directive: ../../../design/conformance.md.
+# requires: txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, dml.update, query.select, query.where_eq, query.order_by, types.int32
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 10)
+
+statement ok
+INSERT INTO t VALUES (2, 20)
+
+# read-your-writes: a statement in the block sees the block's own earlier writes
+query II rowsort
+SELECT id, v FROM t
+----
+1
+10
+2
+20
+
+statement ok
+UPDATE t SET v = 99 WHERE id = 1
+
+statement ok
+COMMIT
+
+# committed — the block's net effect is visible after it ends
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+99
+2
+20
+
+# DDL inside a committed block persists: the new table is usable afterward
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE u (id int32 PRIMARY KEY)
+
+statement ok
+INSERT INTO u VALUES (7)
+
+statement ok
+COMMIT
+
+query I rowsort
+SELECT id FROM u
+----
+7

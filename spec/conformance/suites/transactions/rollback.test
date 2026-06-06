@@ -1,0 +1,76 @@
+# Explicit transaction — ROLLBACK discards the block (spec/design/grammar.md §27,
+# transactions.md §4.2). Every INSERT/UPDATE/DELETE and DDL CREATE/DROP since BEGIN is discarded,
+# restoring the committed state captured at BEGIN (including synthetic-rowid allocations — §7).
+# DDL is transactional: a table CREATEd in a rolled-back block does not exist afterward; a table
+# DROPped in one is still there. Format + the `requires` directive: ../../../design/conformance.md.
+# requires: txn.explicit, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, types.int32
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (3, 30)
+
+statement ok
+DELETE FROM t WHERE id = 1
+
+statement ok
+UPDATE t SET v = 0 WHERE id = 2
+
+# inside the block the working set reflects every change
+query II rowsort
+SELECT id, v FROM t
+----
+2
+0
+3
+30
+
+statement ok
+ROLLBACK
+
+# rollback discarded all of it — back to the pre-BEGIN committed state
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+10
+2
+20
+
+# DDL rollback: a table created in a rolled-back block leaves no trace
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE tmp (id int32 PRIMARY KEY)
+
+statement ok
+ROLLBACK
+
+statement error 42P01
+INSERT INTO tmp VALUES (1)
+
+# DDL rollback: a table dropped in a rolled-back block is still there
+statement ok
+BEGIN
+
+statement ok
+DROP TABLE t
+
+statement ok
+ROLLBACK
+
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+10
+2
+20

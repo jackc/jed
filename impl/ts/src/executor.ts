@@ -101,11 +101,27 @@ type SelectResult = {
 // used for a fresh in-memory or newly-created database when no explicit size is given.
 export const DEFAULT_PAGE_SIZE = 8192;
 
+// ActiveTx is an open explicit transaction block (spec/design/transactions.md §4.2). `writable` is
+// the access mode (READ WRITE vs READ ONLY — a write in a READ ONLY block is 25006); `failed` marks
+// an aborted block (every later statement but COMMIT/ROLLBACK is 25P02 — §6); base* is the
+// committed state captured at BEGIN, restored on ROLLBACK (and on COMMIT of a failed block). A READ
+// ONLY block never mutates, so it captures nothing.
+type ActiveTx = {
+  writable: boolean;
+  failed: boolean;
+  baseTables: Map<string, Table>;
+  baseStores: Map<string, TableStore>;
+};
+
 export class Database {
-  // Not readonly: a write transaction's rollback-on-error restores these by reassignment
-  // (executeStmtParams). The stores hold persistent maps, so a snapshot is an O(1) clone.
+  // Not readonly: a write transaction's rollback restores these by reassignment (rollbackTx /
+  // executeStmtParams). The stores hold persistent maps, so a snapshot is an O(1) clone.
   tables: Map<string, Table>;
   stores: Map<string, TableStore>;
+  // The open explicit transaction, or null under autocommit (transactions.md §4.1/§4.2). Under
+  // autocommit `tables`/`stores` are the committed state; inside a READ WRITE block they are the
+  // working set and `tx.base*` holds the committed state to restore on ROLLBACK.
+  tx: ActiveTx | null;
   // Persistence identity (spec/design/api.md §2): the backing file path (null for in-memory),
   // the monotonic commit counter, and the page size this database serializes with. Set by the
   // host API open/create; commit writes here.
@@ -122,10 +138,17 @@ export class Database {
   constructor() {
     this.tables = new Map();
     this.stores = new Map();
+    this.tx = null;
     this.path = null;
     this.txid = 0n;
     this.pageSize = DEFAULT_PAGE_SIZE;
     this.persistHook = null;
+  }
+
+  // inTransaction reports whether an explicit transaction block is currently open
+  // (spec/design/transactions.md §4.2). False under autocommit. Used by the host Transaction surface.
+  inTransaction(): boolean {
+    return this.tx !== null;
   }
 
   // table looks up a table definition by name (case-insensitive).
@@ -149,14 +172,57 @@ export class Database {
   // empty array for an unparameterized statement). DDL statements take no parameters — supplying
   // any is a 42601 (spec/design/api.md §5).
   //
-  // Autocommit (spec/design/transactions.md §4.1): a read runs against the committed state
-  // directly; a write is its own transaction — the committed state is captured first (the stores
-  // are O(1) clones via the persistent map, pmap.ts), the statement runs, and on success the
-  // change is made durable (the persistHook, synchronous=on). Any failure — in the statement or
-  // the durable write — restores the captured state (rollback-on-error, discarding partial work
-  // and any rowid allocations, §7). For an in-memory database persistHook is null, so autocommit
-  // is pure in-memory visibility.
+  // Transaction control (BEGIN/COMMIT/ROLLBACK) drives the handle's current-transaction state
+  // directly (spec/design/transactions.md §4.2). Otherwise the statement runs either inside the
+  // open explicit block or, with none open, under autocommit (§4.1):
+  //
+  //   - Inside a block (§4.2/§6): an aborted block rejects every statement but COMMIT/ROLLBACK with
+  //     25P02; a write in a READ ONLY block is 25006; otherwise the statement runs against the
+  //     working set in place — no per-statement durable write (the block publishes once, at COMMIT).
+  //     ANY statement error aborts the block (it enters the failed state); the statement's own
+  //     two-phase pass already guarantees it wrote nothing partial (§6), so the whole working set is
+  //     discarded only at ROLLBACK.
+  //   - Autocommit (§4.1): a read runs against the committed state directly; a write is its own
+  //     transaction — the committed state is captured first (the stores are O(1) clones via the
+  //     persistent map, pmap.ts), the statement runs, and on success the change is made durable (the
+  //     persistHook, synchronous=on). Any failure — in the statement or the durable write — restores
+  //     the captured state (rollback-on-error, discarding partial work and any rowid allocations,
+  //     §7). For an in-memory database persistHook is null, so autocommit is pure in-memory.
   executeStmtParams(stmt: Statement, params: Value[]): Outcome {
+    switch (stmt.kind) {
+      case "begin":
+        return this.beginTx(stmt.writable);
+      case "commit":
+        return this.commitTx();
+      case "rollback":
+        return this.rollbackTx();
+    }
+
+    // Inside an explicit block?
+    const tx = this.tx;
+    if (tx !== null) {
+      if (tx.failed) {
+        throw engineError(
+          "in_failed_sql_transaction",
+          "current transaction is aborted, commands ignored until end of transaction block",
+        );
+      }
+      // Run the statement; ANY error aborts the block (it enters the failed state — §6).
+      try {
+        if (stmtIsWrite(stmt) && !tx.writable) {
+          throw engineError(
+            "read_only_sql_transaction",
+            "cannot execute " + stmtKind(stmt) + " in a read-only transaction",
+          );
+        }
+        return this.dispatchStmt(stmt, params);
+      } catch (e) {
+        tx.failed = true;
+        throw e;
+      }
+    }
+
+    // Autocommit (no open block).
     if (!stmtIsWrite(stmt)) {
       return this.dispatchStmt(stmt, params);
     }
@@ -171,6 +237,69 @@ export class Database {
       this.stores = savedStores;
       throw e;
     }
+  }
+
+  // beginTx opens an explicit transaction block (spec/design/transactions.md §4.2). writable is the
+  // access mode (READ WRITE vs READ ONLY). A nested BEGIN (a block is already open) is 25001. A READ
+  // WRITE block captures the committed state so ROLLBACK can restore it; a READ ONLY block never
+  // mutates, so it captures nothing. Returns a zero-cost statement outcome.
+  beginTx(writable: boolean): Outcome {
+    if (this.tx !== null) {
+      throw engineError("active_sql_transaction", "there is already a transaction in progress");
+    }
+    this.tx = {
+      writable,
+      failed: false,
+      baseTables: writable ? new Map(this.tables) : new Map(),
+      baseStores: writable ? cloneStores(this.stores) : new Map(),
+    };
+    return { kind: "statement", cost: 0n };
+  }
+
+  // commitTx commits the current transaction (spec/design/transactions.md §4.2). With no open block
+  // it is a lenient no-op success. A failed block commits as a ROLLBACK (PostgreSQL). A READ WRITE
+  // block publishes its working set durably (the persistHook, §9); a durable-write failure restores
+  // the committed state and rethrows. A READ ONLY block publishes nothing.
+  commitTx(): Outcome {
+    const tx = this.tx;
+    if (tx === null) return { kind: "statement", cost: 0n };
+    this.tx = null;
+    if (tx.failed) {
+      // COMMIT of an aborted block silently rolls back (PostgreSQL).
+      if (tx.writable) {
+        this.tables = tx.baseTables;
+        this.stores = tx.baseStores;
+      }
+      return { kind: "statement", cost: 0n };
+    }
+    if (tx.writable && this.persistHook !== null) {
+      try {
+        this.persistHook(this);
+      } catch (e) {
+        // The commit failed: roll back to the committed state and rethrow.
+        this.tables = tx.baseTables;
+        this.stores = tx.baseStores;
+        throw e;
+      }
+    }
+    return { kind: "statement", cost: 0n };
+  }
+
+  // rollbackTx rolls back the current transaction (spec/design/transactions.md §4.2). With no open
+  // block it is a no-op success. A READ WRITE block discards its working set — every staged
+  // INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7) — by restoring the
+  // committed state captured at BEGIN; a READ ONLY block mutated nothing, so there is nothing to
+  // restore.
+  rollbackTx(): Outcome {
+    const tx = this.tx;
+    if (tx !== null) {
+      this.tx = null;
+      if (tx.writable) {
+        this.tables = tx.baseTables;
+        this.stores = tx.baseStores;
+      }
+    }
+    return { kind: "statement", cost: 0n };
   }
 
   // dispatchStmt routes one parsed statement to its executor. The autocommit transaction
@@ -193,6 +322,10 @@ export class Database {
         return this.executeUpdate(stmt, params);
       case "delete":
         return this.executeDelete(stmt, params);
+      default:
+        // Transaction control (begin/commit/rollback) is handled by executeStmtParams before
+        // dispatch; it never reaches here.
+        throw engineError("syntax_error", "unexpected statement kind");
     }
   }
 
@@ -2015,6 +2148,25 @@ function stmtIsWrite(stmt: Statement): boolean {
     stmt.kind === "update" ||
     stmt.kind === "delete"
   );
+}
+
+// stmtKind is a short label for a statement kind, for the 25006 read-only-violation message (the
+// message text is informational — never matched; spec/design/conformance.md §2).
+function stmtKind(stmt: Statement): string {
+  switch (stmt.kind) {
+    case "createTable":
+      return "CREATE TABLE";
+    case "dropTable":
+      return "DROP TABLE";
+    case "insert":
+      return "INSERT";
+    case "update":
+      return "UPDATE";
+    case "delete":
+      return "DELETE";
+    default:
+      return "statement";
+  }
 }
 
 // cloneStores captures the committed stores cheaply for rollback-on-error: each store is an O(1)

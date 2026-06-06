@@ -37,6 +37,15 @@ const (
 	NotNullViolation
 	// UniqueViolation is 23505 — unique (primary key) constraint violation.
 	UniqueViolation
+	// ActiveSqlTransaction is 25001 — a BEGIN issued while a transaction is already open (no
+	// nesting — there is no SAVEPOINT this slice; spec/design/transactions.md §4.2).
+	ActiveSqlTransaction
+	// ReadOnlySqlTransaction is 25006 — a write statement in a READ ONLY transaction
+	// (spec/design/transactions.md §4.3).
+	ReadOnlySqlTransaction
+	// InFailedSqlTransaction is 25P02 — a statement (other than ROLLBACK/COMMIT) in a failed
+	// transaction block; it stays poisoned until the block ends (transactions.md §6).
+	InFailedSqlTransaction
 	// SyntaxError is 42601.
 	SyntaxError
 	// UndefinedTable is 42P01.
@@ -109,6 +118,12 @@ func (s SqlState) Code() string {
 		return "23502"
 	case UniqueViolation:
 		return "23505"
+	case ActiveSqlTransaction:
+		return "25001"
+	case ReadOnlySqlTransaction:
+		return "25006"
+	case InFailedSqlTransaction:
+		return "25P02"
 	case SyntaxError:
 		return "42601"
 	case UndefinedTable:
