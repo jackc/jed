@@ -35,7 +35,8 @@ export function create(path: string, opts: DatabaseOptions = {}): Database {
   db.path = path;
   db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
   db.txid = 0n;
-  commit(db); // materialize the empty image (txid 0 -> 1)
+  db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
+  persistImpl(db); // materialize the empty image (txid 0 -> 1)
   return db;
 }
 
@@ -55,12 +56,16 @@ export function open(path: string): Database {
   }
   const db = loadDatabase(bytes);
   db.path = path;
+  db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
   return db;
 }
 
-// commit durably persists the whole current image to the backing file and increments txid. An
-// in-memory database (no path) is a no-op success (spec/design/api.md §2).
-export function commit(db: Database): void {
+// persistImpl durably writes the whole current image to the backing file and increments txid —
+// the single synchronous-commit chokepoint (spec/design/transactions.md §9), installed as the
+// Database.persistHook by create/open. The autocommit path calls it after every successful write
+// statement; create calls it for the initial image. An in-memory database (no path) is a no-op
+// success. The future synchronous=off mode (batched/deferred fsync) gates here.
+function persistImpl(db: Database): void {
   if (db.path === null) return;
   const nextTxid = db.txid + 1n;
   const bytes = toImage(db, db.pageSize, nextTxid);
@@ -68,8 +73,21 @@ export function commit(db: Database): void {
   db.txid = nextTxid;
 }
 
-// close releases the handle. It does NOT commit — uncommitted changes since the last commit are
-// discarded (spec/design/api.md §2). Idempotent.
+// commit commits the current transaction (spec/design/api.md §2.2). jed autocommits each
+// statement (transactions.md §4.1), so in this slice there is no open explicit transaction to
+// publish — commit is a lenient no-op success (§4.2). Explicit BEGIN … COMMIT blocks, where
+// commit does the durable publish, arrive in P5.2.
+export function commit(_db: Database): void {}
+
+// rollback rolls back the current transaction (spec/design/api.md §2.2). With autocommit and no
+// open explicit transaction (this slice), there is nothing uncommitted to discard — a no-op
+// success. Discarding an open explicit block's working set arrives with BEGIN in P5.2.
+export function rollback(_db: Database): void {}
+
+// close releases the handle (spec/design/api.md §2.3). Under autocommit, every prior statement is
+// already durable, so — unlike the original model — close does NOT drop committed work; it would
+// roll back an open explicit transaction (none in this slice). Durability is never hidden in a
+// destructor. Idempotent.
 export function close(db: Database): void {
   db.path = null;
 }

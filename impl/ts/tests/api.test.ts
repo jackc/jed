@@ -18,6 +18,7 @@ import {
   open,
   prepare,
   query,
+  rollback,
 } from "../src/lib.ts";
 import type { Value } from "../src/lib.ts";
 
@@ -95,22 +96,42 @@ test("create with custom page size round-trips", () => {
   }
 });
 
-test("close without commit discards", () => {
+test("autocommit persists each write across close", () => {
+  // jed autocommits (spec/design/transactions.md §4.1): a write is durable as soon as it
+  // succeeds, so it survives a close with no explicit commit — the opposite of the original
+  // "no autocommit" model this test used to assert.
   const dir = tmpDir();
   try {
-    const path = join(dir, "discard.jed");
+    const path = join(dir, "autocommit.jed");
     const db = create(path);
     execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
-    commit(db);
-    execute(db, "INSERT INTO t VALUES (1)"); // not committed
+    execute(db, "INSERT INTO t VALUES (1)"); // autocommitted, no explicit commit
     close(db);
 
     const db2 = open(path);
     const o = execute(db2, "SELECT id FROM t");
     assert.equal(o.kind, "query");
-    if (o.kind === "query") assert.equal(o.rows.length, 0);
+    if (o.kind === "query") {
+      assert.equal(o.rows.length, 1);
+      assert.deepEqual(o.rows[0][0], intValue(1n));
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("commit and rollback are no-ops under autocommit", () => {
+  // With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
+  const db = new Database();
+  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "INSERT INTO t VALUES (1)");
+  commit(db);
+  rollback(db); // does NOT undo the autocommitted insert
+  const o = execute(db, "SELECT id FROM t");
+  assert.equal(o.kind, "query");
+  if (o.kind === "query") {
+    assert.equal(o.rows.length, 1);
+    assert.deepEqual(o.rows[0][0], intValue(1n));
   }
 });
 

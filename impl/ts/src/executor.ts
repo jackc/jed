@@ -102,14 +102,22 @@ type SelectResult = {
 export const DEFAULT_PAGE_SIZE = 8192;
 
 export class Database {
-  readonly tables: Map<string, Table>;
-  readonly stores: Map<string, TableStore>;
+  // Not readonly: a write transaction's rollback-on-error restores these by reassignment
+  // (executeStmtParams). The stores hold persistent maps, so a snapshot is an O(1) clone.
+  tables: Map<string, Table>;
+  stores: Map<string, TableStore>;
   // Persistence identity (spec/design/api.md §2): the backing file path (null for in-memory),
   // the monotonic commit counter, and the page size this database serializes with. Set by the
   // host API open/create; commit writes here.
   path: string | null;
   txid: bigint;
   pageSize: number;
+  // persistHook is the durable-write seam (spec/design/storage.md §2): null for an in-memory
+  // database (autocommit is in-memory only), set by the file host (file.ts create/open) to the
+  // synchronous whole-image write. The autocommit path (executeStmtParams) calls it after a
+  // successful write statement (transactions.md §4.1/§9). Injecting it here keeps the executor
+  // free of a file-module dependency (no executor→file import cycle).
+  persistHook: ((db: Database) => void) | null;
 
   constructor() {
     this.tables = new Map();
@@ -117,6 +125,7 @@ export class Database {
     this.path = null;
     this.txid = 0n;
     this.pageSize = DEFAULT_PAGE_SIZE;
+    this.persistHook = null;
   }
 
   // table looks up a table definition by name (case-insensitive).
@@ -139,7 +148,34 @@ export class Database {
   // executeStmtParams executes one parsed statement, binding params to its $N placeholders (an
   // empty array for an unparameterized statement). DDL statements take no parameters — supplying
   // any is a 42601 (spec/design/api.md §5).
+  //
+  // Autocommit (spec/design/transactions.md §4.1): a read runs against the committed state
+  // directly; a write is its own transaction — the committed state is captured first (the stores
+  // are O(1) clones via the persistent map, pmap.ts), the statement runs, and on success the
+  // change is made durable (the persistHook, synchronous=on). Any failure — in the statement or
+  // the durable write — restores the captured state (rollback-on-error, discarding partial work
+  // and any rowid allocations, §7). For an in-memory database persistHook is null, so autocommit
+  // is pure in-memory visibility.
   executeStmtParams(stmt: Statement, params: Value[]): Outcome {
+    if (!stmtIsWrite(stmt)) {
+      return this.dispatchStmt(stmt, params);
+    }
+    const savedTables = new Map(this.tables);
+    const savedStores = cloneStores(this.stores);
+    try {
+      const outcome = this.dispatchStmt(stmt, params);
+      if (this.persistHook !== null) this.persistHook(this);
+      return outcome;
+    } catch (e) {
+      this.tables = savedTables;
+      this.stores = savedStores;
+      throw e;
+    }
+  }
+
+  // dispatchStmt routes one parsed statement to its executor. The autocommit transaction
+  // handling (capture / durable commit / rollback-on-error) lives in executeStmtParams.
+  private dispatchStmt(stmt: Statement, params: Value[]): Outcome {
     switch (stmt.kind) {
       case "createTable":
         rejectParamsForDDL(params);
@@ -1966,6 +2002,28 @@ function rejectParamsForDDL(params: Value[]): void {
   if (params.length > 0) {
     throw engineError("syntax_error", "bind parameters are not allowed in a DDL statement");
   }
+}
+
+// stmtIsWrite reports whether a statement mutates the database (so autocommit must capture +
+// durably persist it). Reads (SELECT, set operations) run with no transaction (transactions.md
+// §4.1).
+function stmtIsWrite(stmt: Statement): boolean {
+  return (
+    stmt.kind === "createTable" ||
+    stmt.kind === "dropTable" ||
+    stmt.kind === "insert" ||
+    stmt.kind === "update" ||
+    stmt.kind === "delete"
+  );
+}
+
+// cloneStores captures the committed stores cheaply for rollback-on-error: each store is an O(1)
+// persistent-map clone (the catalog map of Table objects is shallow-copied by the caller, since
+// Table objects are never mutated in place — only added/removed).
+function cloneStores(stores: Map<string, TableStore>): Map<string, TableStore> {
+  const out = new Map<string, TableStore>();
+  for (const [k, s] of stores) out.set(k, s.clone());
+  return out;
 }
 
 // resolveProjections resolves SELECT items into evaluable projections (any result type is

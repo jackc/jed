@@ -155,5 +155,5 @@ export type { ThreeValued, Value } from "./value.ts";
 export { loadDatabase, toImage } from "./format.ts";
 export type { Statement } from "./ast.ts";
 export { PreparedStatement, Rows, prepare, query, querySql } from "./api.ts";
-export { create, open, commit, close } from "./file.ts";
+export { create, open, commit, rollback, close } from "./file.ts";
 export type { DatabaseOptions } from "./file.ts";
