@@ -1006,8 +1006,14 @@ A **subquery** is a parenthesized `query_expr` (a `SELECT`, or a set operation �
 inside an expression. The three forms below work both **uncorrelated** (the subquery's result
 is independent of the enclosing query) and **correlated** (the subquery references a column of
 an enclosing query — see [Correlated subqueries](#correlated-subqueries) below). They are
-available in a `SELECT` only; a subquery in an `UPDATE` / `DELETE` / `INSERT` expression is
-`0A000` (a future slice).
+available wherever an expression resolves against a relation: a `SELECT`, and a **`DELETE`
+`WHERE` / `UPDATE` `WHERE` / `UPDATE` assignment RHS** (a correlated reference there names the
+**target row**, which the per-row evaluator supplies, so `DELETE FROM t WHERE id IN (SELECT …)`
+and `UPDATE t SET c = (SELECT … WHERE … = t.k)` both work). The mutation stays two-phase /
+all-or-nothing (§6): every subquery reads the **pre-statement snapshot** (`DELETE` collects its
+keys before removing; `UPDATE` validates all rows before writing). A subquery in an
+`INSERT ... VALUES` slot is not reachable — a `VALUES` slot is not yet a general expression
+(§12) — while `INSERT ... SELECT` (§24) already admits subqueries inside its source query.
 
 - **Scalar subquery** — `( query_expr )` in expression position, anywhere a `primary` is
   allowed: `WHERE x = (SELECT max(id) FROM t)`, in the select list, or nested in a larger

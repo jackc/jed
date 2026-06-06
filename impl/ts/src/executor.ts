@@ -448,14 +448,21 @@ export class Database {
     // DELETE is single-table; resolve its WHERE against a one-relation scope.
     const scope = Scope.single(this, table);
     const ptypes = new ParamTypes();
-    const filter = del.filter ? resolveBooleanFilter(scope, del.filter, ptypes) : null;
+    let filter = del.filter ? resolveBooleanFilter(scope, del.filter, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize());
 
-    // Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13;
-    // spec/design/cost.md §3). Keys are collected before mutating. DELETE has no outer query /
-    // subqueries: an empty outer-row stack (the subquery runner is never invoked).
+    // Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
+    // spec/design/grammar.md §26, cost.md §3); a correlated one stays and re-runs per row via the
+    // per-row outer environment below (it pushes the current row, so `target.col` reads it). The
+    // uncorrelated execution reads the pre-DELETE snapshot (keys are collected before mutating).
+    // Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
     const meter = new Meter();
-    const env: EvalEnv = { params: bound, outer: [], runSubquery: () => unreachableSubquery() };
+    if (filter !== null) {
+      const cost = { value: 0n };
+      filter = this.foldUncorrelatedInRExpr(filter, bound, cost);
+      meter.charge(cost.value);
+    }
+    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.stores.get(del.table.toLowerCase())!;
     const keys: Uint8Array[] = [];
     for (const e of store.entriesInKeyOrder()) {
@@ -516,16 +523,23 @@ export class Database {
       plans.push({ idx, name: col.name, target: col.type, decimal: col.decimal, notNull: col.notNull, source: node });
     }
 
-    const filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
+    let filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
     // All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
     const bound = bindParams(params, ptypes.finalize());
 
-    // Phase 1: build + validate every matching row's new values; no writes yet. Each
-    // scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes do
-    // not — they evaluate nothing; spec/design/cost.md §3).
+    // Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
+    // cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and re-runs
+    // per row via the outer environment (which pushes the current OLD row). The uncorrelated
+    // execution reads the pre-UPDATE snapshot (phase 1 only reads; phase 2 writes).
+    //
+    // Phase 1: build + validate every matching row's new values; no writes yet. Each scanned row,
+    // the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
     const meter = new Meter();
-    // UPDATE has no outer query / subqueries (resolve rejects them here): an empty outer stack.
-    const env: EvalEnv = { params: bound, outer: [], runSubquery: () => unreachableSubquery() };
+    const foldCost = { value: 0n };
+    for (const p of plans) p.source = this.foldUncorrelatedInRExpr(p.source, bound, foldCost);
+    if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, foldCost);
+    meter.charge(foldCost.value);
+    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.stores.get(upd.table.toLowerCase())!;
     const updates: { key: Uint8Array; row: Row }[] = [];
     for (const e of store.entriesInKeyOrder()) {
@@ -1432,12 +1446,6 @@ type EvalEnv = {
   runSubquery(plan: QueryPlan, outer: Row[]): SelectResult;
 };
 
-// unreachableSubquery is the runSubquery stub for UPDATE/DELETE, where the resolver rejects
-// subqueries (0A000), so the evaluator never encounters a "subquery" node and never calls it.
-function unreachableSubquery(): never {
-  throw new Error("a subquery cannot appear in an UPDATE/DELETE expression");
-}
-
 // ============================================================================
 // Aggregate resolution + accumulation (spec/design/aggregates.md).
 //
@@ -1812,10 +1820,12 @@ class Scope {
     this.allowSubquery = allowSubquery;
   }
 
-  // single builds a one-relation scope with no parent and no subqueries (the single-table
-  // UPDATE / DELETE case). SELECT builds its own scope in planSelect.
+  // single builds a one-relation scope with no parent (the single-table UPDATE / DELETE case).
+  // Subqueries ARE allowed: a correlated reference resolves to the target row via the per-row
+  // outer environment (the subquery's parent is this scope), an uncorrelated one folds once
+  // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
   static single(catalog: Database, t: Table): Scope {
-    return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }], catalog, null, false);
+    return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }], catalog, null, true);
   }
 
   // resolveBare resolves a bare column name against THIS scope, then OUTWARD through the parent

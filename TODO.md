@@ -501,13 +501,29 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `spec/conformance/suites/subquery/correlated.test`, 65/0/0 all cores). New capability
         `query.subquery_correlated`. Outer refs work in WHERE / HAVING / select-list / aggregate args /
         a nested JOIN `ON`. **Remaining narrowings (→ `0A000`):** a **`$N` inside** a subquery
-        (orthogonal param inference); a **correlated `GROUP BY` / `ORDER BY` key** (degenerate);
-        subqueries are **SELECT-only**. A pure-outer aggregate arg (`sum(outer.col)`) is a documented
+        (orthogonal param inference); a **correlated `GROUP BY` / `ORDER BY` key** (degenerate).
+        (Subqueries were **SELECT-only** here; that is now lifted — see UPDATE/DELETE below.)
+        A pure-outer aggregate arg (`sum(outer.col)`) is a documented
         divergence (jed sums at the inner level; PG binds it to the outer query — grammar.md §26).
         Semantics verified against the live `postgres:18` oracle. _(was: L)_
+  - [x] **Subqueries in UPDATE / DELETE** — done & committed across Rust/Go/TS. A subquery is now
+        legal in a `DELETE`/`UPDATE` `WHERE` and an `UPDATE` assignment RHS (the **SELECT-only**
+        narrowing above, lifted). The machinery was already in place from the correlated slice:
+        `Scope::single` (the one-relation UPDATE/DELETE scope) flips `allow_subquery` **true**, and the
+        mutation paths run the **`fold_uncorrelated` pass** over the resolved WHERE / assignment RHSs
+        before the scan, then build a real per-row `EvalEnv` (the engine + bound params). An
+        **uncorrelated** subquery folds once (cost added once); a **correlated** one names the **target
+        row** (its parent is the single scope, so `t.col` → `OuterColumn{level 1}`) and re-runs per
+        **scanned** row, reading the OLD row. Two-phase / all-or-nothing is preserved: the subquery sees
+        the **pre-statement snapshot** (DELETE collects keys before removing; UPDATE validates all before
+        writing). **Cost** (cost.md §3): same as the SELECT case — pinned `# cost:` in
+        `spec/conformance/suites/subquery/mutation.test` (66/0/0 all cores). No new capability (reuses
+        `query.subquery_*` + `dml.delete`/`dml.update`). Semantics verified against the live `postgres:18`
+        oracle. _(was: part of M)_
   - [ ] **Subqueries — remaining seams:** `$N` inside a subquery (statement-wide param inference
-        across the boundary); subqueries in **UPDATE / DELETE / INSERT** expressions; **derived tables**
-        (`FROM (SELECT …) AS t`); **`ANY` / `ALL`** and row-valued subqueries. _(size: M)_
+        across the boundary); subqueries in an **`INSERT ... VALUES`** slot (blocked on VALUES holding a
+        general expression — a separate narrowing; `INSERT ... SELECT` already admits them); **derived
+        tables** (`FROM (SELECT …) AS t`); **`ANY` / `ALL`** and row-valued subqueries. _(size: M)_
 - [x] **Set operations** — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]` — done & committed across
       Rust/Go/TS. The top-level query grew from a single `select` to a **query expression**
       (`query_expr ::= set_expr order_by? limit_offset?`): a two-level precedence tree

@@ -88,7 +88,10 @@ fn scalar_nested_and_in_expression() {
     );
     // Folded into a larger expression.
     assert_eq!(
-        ints(&mut db, "SELECT (SELECT max(k) FROM a) + 1 FROM a WHERE id = 1"),
+        ints(
+            &mut db,
+            "SELECT (SELECT max(k) FROM a) + 1 FROM a WHERE id = 1"
+        ),
         vec![31]
     );
     // Folded constant participating per-row in a projection expression.
@@ -133,7 +136,10 @@ fn scalar_cross_type_promotes() {
         "INSERT INTO big VALUES (1, 30)",
     ]);
     assert_eq!(
-        ints(&mut db, "SELECT id FROM t WHERE n = (SELECT m FROM big WHERE id = 1)"),
+        ints(
+            &mut db,
+            "SELECT id FROM t WHERE n = (SELECT m FROM big WHERE id = 1)"
+        ),
         vec![1]
     );
 }
@@ -215,7 +221,10 @@ fn exists_and_not_exists() {
     let mut db = ab();
     // EXISTS is a whole-query gate (uncorrelated): b has rows -> TRUE -> all a rows kept.
     assert_eq!(
-        ints(&mut db, "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b) ORDER BY id"),
+        ints(
+            &mut db,
+            "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b) ORDER BY id"
+        ),
         vec![1, 2, 3]
     );
     assert_eq!(
@@ -240,11 +249,17 @@ fn exists_ignores_select_list() {
     let mut db = ab();
     // Multi-column / star select lists are legal under EXISTS (columns are irrelevant).
     assert_eq!(
-        ints(&mut db, "SELECT id FROM a WHERE EXISTS (SELECT 1, 2, 3 FROM b) ORDER BY id"),
+        ints(
+            &mut db,
+            "SELECT id FROM a WHERE EXISTS (SELECT 1, 2, 3 FROM b) ORDER BY id"
+        ),
         vec![1, 2, 3]
     );
     assert_eq!(
-        ints(&mut db, "SELECT id FROM a WHERE EXISTS (SELECT * FROM b) ORDER BY id"),
+        ints(
+            &mut db,
+            "SELECT id FROM a WHERE EXISTS (SELECT * FROM b) ORDER BY id"
+        ),
         vec![1, 2, 3]
     );
 }
@@ -285,9 +300,10 @@ fn subquery_error_codes() {
             "42601",
         ),
         // bind parameter inside a subquery -> 0A000 (an orthogonal narrowing, §26)
-        ("SELECT id FROM a WHERE k = (SELECT $1 FROM a LIMIT 1)", "0A000"),
-        // subquery outside a SELECT (DELETE WHERE) -> 0A000 this slice (SELECT-only)
-        ("DELETE FROM a WHERE k IN (SELECT k FROM b)", "0A000"),
+        (
+            "SELECT id FROM a WHERE k = (SELECT $1 FROM a LIMIT 1)",
+            "0A000",
+        ),
         // grouping / ordering a subquery BY an enclosing-query column -> 0A000 (degenerate, §26)
         (
             "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b GROUP BY a.k)",
@@ -327,7 +343,10 @@ fn correlated_exists() {
         vec![1]
     );
     assert_eq!(
-        ints(&mut db, "SELECT t1.id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v) ORDER BY t1.id"),
+        ints(
+            &mut db,
+            "SELECT t1.id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v) ORDER BY t1.id"
+        ),
         vec![2]
     );
 }
@@ -337,7 +356,10 @@ fn correlated_scalar_and_empty_is_null() {
     let mut db = t123();
     // count over a correlated WHERE (the outer ref is a constant in the inner WHERE).
     assert_eq!(
-        query(&mut db, "SELECT t1.id, (SELECT count(*) FROM t2 WHERE t2.v > t1.v) FROM t1 ORDER BY t1.id"),
+        query(
+            &mut db,
+            "SELECT t1.id, (SELECT count(*) FROM t2 WHERE t2.v > t1.v) FROM t1 ORDER BY t1.id"
+        ),
         vec![
             vec![Value::Int(1), Value::Int(1)],
             vec![Value::Int(2), Value::Int(1)],
@@ -345,7 +367,10 @@ fn correlated_scalar_and_empty_is_null() {
     );
     // a 0-row correlated scalar is NULL, evaluated per outer row.
     assert_eq!(
-        query(&mut db, "SELECT t1.id, (SELECT t2.v FROM t2 WHERE t2.v = t1.v * 100) FROM t1 ORDER BY t1.id"),
+        query(
+            &mut db,
+            "SELECT t1.id, (SELECT t2.v FROM t2 WHERE t2.v = t1.v * 100) FROM t1 ORDER BY t1.id"
+        ),
         vec![
             vec![Value::Int(1), Value::Null],
             vec![Value::Int(2), Value::Null],
@@ -357,11 +382,17 @@ fn correlated_scalar_and_empty_is_null() {
 fn correlated_in() {
     let mut db = t123();
     assert_eq!(
-        ints(&mut db, "SELECT t1.id FROM t1 WHERE t1.v IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id) ORDER BY t1.id"),
+        ints(
+            &mut db,
+            "SELECT t1.id FROM t1 WHERE t1.v IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id) ORDER BY t1.id"
+        ),
         vec![1]
     );
     assert_eq!(
-        ints(&mut db, "SELECT t1.id FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id) ORDER BY t1.id"),
+        ints(
+            &mut db,
+            "SELECT t1.id FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id) ORDER BY t1.id"
+        ),
         vec![2]
     );
 }
@@ -371,7 +402,10 @@ fn correlated_in_join_on() {
     let mut db = t123();
     // the inner self-join's ON predicate references the OUTER t1 (correlation in a JOIN ON).
     assert_eq!(
-        ints(&mut db, "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 JOIN t2 AS t2b ON t2b.v = t1.v WHERE t2.id = t1.id) ORDER BY t1.id"),
+        ints(
+            &mut db,
+            "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 JOIN t2 AS t2b ON t2b.v = t1.v WHERE t2.id = t1.id) ORDER BY t1.id"
+        ),
         vec![1]
     );
 }
@@ -381,12 +415,18 @@ fn correlated_multi_level_and_skip_level() {
     let mut db = t123();
     // two-level nesting, each level correlating to its IMMEDIATE parent.
     assert_eq!(
-        ints(&mut db, "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v AND EXISTS (SELECT 1 FROM t3 WHERE t3.v = t2.v)) ORDER BY t1.id"),
+        ints(
+            &mut db,
+            "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v AND EXISTS (SELECT 1 FROM t3 WHERE t3.v = t2.v)) ORDER BY t1.id"
+        ),
         vec![1]
     );
     // skip-level: the innermost references the GRANDPARENT t1, skipping t2.
     assert_eq!(
-        ints(&mut db, "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.v = t1.v)) ORDER BY t1.id"),
+        ints(
+            &mut db,
+            "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.v = t1.v)) ORDER BY t1.id"
+        ),
         vec![1, 2]
     );
 }
@@ -397,7 +437,10 @@ fn correlated_outer_ref_in_aggregate_arg() {
     // An outer reference inside an aggregate ARGUMENT, mixed with an inner column:
     // sum(t2.v + t1.v) over t2 for each t1 row -> (10+10)+(30+10)=60 ; (10+20)+(30+20)=80.
     assert_eq!(
-        query(&mut db, "SELECT t1.id, (SELECT sum(t2.v + t1.v) FROM t2) FROM t1 ORDER BY t1.id"),
+        query(
+            &mut db,
+            "SELECT t1.id, (SELECT sum(t2.v + t1.v) FROM t2) FROM t1 ORDER BY t1.id"
+        ),
         vec![
             vec![Value::Int(1), Value::Int(60)],
             vec![Value::Int(2), Value::Int(80)],
@@ -411,7 +454,10 @@ fn correlated_subquery_cost_is_per_outer_row() {
     // A correlated subquery re-runs once per outer row (unlike the uncorrelated fold-once). The
     // derivation is in spec/conformance/suites/subquery/correlated.test (cost = 14).
     assert_eq!(
-        cost(&mut db, "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)"),
+        cost(
+            &mut db,
+            "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)"
+        ),
         14
     );
 }
@@ -430,5 +476,115 @@ fn correlated_inner_error_raised_over_empty_outer() {
             .unwrap_err()
             .code(),
         "42601"
+    );
+}
+
+// ---- subqueries in UPDATE / DELETE (spec/design/grammar.md §26) -----------------------------
+// A subquery is legal in a DELETE/UPDATE WHERE and an UPDATE assignment RHS. An uncorrelated one
+// folds once (cost added once); a correlated one references the TARGET row via the per-row outer
+// environment and re-runs per matching row. The mutation stays two-phase / all-or-nothing: the
+// subquery reads the pre-statement snapshot (DELETE collects keys first; UPDATE writes in phase 2).
+
+#[test]
+fn delete_where_uncorrelated_in_subquery() {
+    let mut db = ab();
+    // delete a's rows whose k is one of b's k values {20,30,40}: ids 2 (20) and 3 (30) go.
+    assert!(matches!(
+        execute(&mut db, "DELETE FROM a WHERE k IN (SELECT k FROM b)").unwrap(),
+        Outcome::Statement { .. }
+    ));
+    assert_eq!(ints(&mut db, "SELECT id FROM a ORDER BY id"), vec![1]);
+}
+
+#[test]
+fn delete_where_correlated_exists_subquery() {
+    let mut db = ab();
+    // EXISTS a b row whose k equals THIS a row's k: a.k ∈ {10,20,30}, b.k ∈ {20,30,40} -> 20,30 match.
+    assert!(matches!(
+        execute(
+            &mut db,
+            "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)"
+        )
+        .unwrap(),
+        Outcome::Statement { .. }
+    ));
+    assert_eq!(ints(&mut db, "SELECT id FROM a ORDER BY id"), vec![1]);
+    // NOT EXISTS is the complement.
+    let mut db = ab();
+    execute(
+        &mut db,
+        "DELETE FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+    )
+    .unwrap();
+    assert_eq!(ints(&mut db, "SELECT id FROM a ORDER BY id"), vec![2, 3]);
+}
+
+#[test]
+fn update_set_correlated_scalar_subquery() {
+    let mut db = ab();
+    // each a.k becomes max(b.k) over b rows with b.k > the OLD a.k: 10->40, 20->40, 30->40.
+    execute(
+        &mut db,
+        "UPDATE a SET k = (SELECT max(b.k) FROM b WHERE b.k > a.k)",
+    )
+    .unwrap();
+    assert_eq!(
+        ints(&mut db, "SELECT k FROM a ORDER BY id"),
+        vec![40, 40, 40]
+    );
+}
+
+#[test]
+fn update_set_correlated_scalar_empty_is_null() {
+    let mut db = db_with(&[
+        "CREATE TABLE a (id int32 PRIMARY KEY, k int32)",
+        "CREATE TABLE b (id int32 PRIMARY KEY, k int32)",
+        "INSERT INTO a VALUES (1, 5), (2, 100)",
+        "INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)",
+    ]);
+    // id1 (k=5): max(b.k>5)=40 ; id2 (k=100): no b.k>100 -> empty scalar -> NULL.
+    execute(
+        &mut db,
+        "UPDATE a SET k = (SELECT max(b.k) FROM b WHERE b.k > a.k)",
+    )
+    .unwrap();
+    assert_eq!(
+        query(&mut db, "SELECT id, k FROM a ORDER BY id"),
+        vec![
+            vec![Value::Int(1), Value::Int(40)],
+            vec![Value::Int(2), Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn update_where_correlated_with_uncorrelated_set() {
+    let mut db = ab();
+    // WHERE: a.k + 10 is one of b's k {20,30,40} -> all three rows (20,30,40). SET: uncorrelated
+    // min(b.k)=20, folded once. So every row -> 20.
+    execute(
+        &mut db,
+        "UPDATE a SET k = (SELECT min(k) FROM b) WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k + 10)",
+    )
+    .unwrap();
+    assert_eq!(
+        ints(&mut db, "SELECT k FROM a ORDER BY id"),
+        vec![20, 20, 20]
+    );
+}
+
+#[test]
+fn delete_correlated_subquery_cost_is_per_row() {
+    // A correlated DELETE subquery re-runs per scanned row; an uncorrelated one folds once. The
+    // correlated cost therefore exceeds the uncorrelated baseline on the same data — proving the
+    // per-row execution (not a fold). Both are deterministic + cross-core identical (CLAUDE.md §13).
+    let corr = cost(
+        &mut ab(),
+        "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+    );
+    let uncorr = cost(&mut ab(), "DELETE FROM a WHERE k IN (SELECT k FROM b)");
+    assert!(
+        corr > uncorr,
+        "correlated {corr} should exceed uncorrelated {uncorr}"
     );
 }

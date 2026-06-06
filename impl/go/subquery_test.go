@@ -145,9 +145,8 @@ func TestSubqueryErrorCodes(t *testing.T) {
 		{"SELECT id FROM a WHERE k IN (SELECT id, k FROM b)", "42601"},
 		// the >1-column check is plan-time, so it fires even over an empty subquery result
 		{"SELECT (SELECT id, k FROM b WHERE id = 99) FROM one", "42601"},
-		// $N inside a subquery, and a subquery in a non-SELECT, remain 0A000 narrowings (§26)
+		// $N inside a subquery remains a 0A000 narrowing (§26)
 		{"SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", "0A000"},
-		{"DELETE FROM a WHERE k IN (SELECT k FROM b)", "0A000"},
 		// grouping / ordering a subquery BY an enclosing-query column -> 0A000 (degenerate)
 		{"SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b GROUP BY a.k)", "0A000"},
 		{"SELECT id FROM a WHERE EXISTS (SELECT k FROM b ORDER BY a.k)", "0A000"},
@@ -256,5 +255,81 @@ func TestCorrelatedInnerErrorOverEmptyOuter(t *testing.T) {
 	)
 	if got := errCode(t, db, "SELECT (SELECT id, v FROM f WHERE v = e.v) FROM e"); got != "42601" {
 		t.Errorf("inner error over empty outer got %s want 42601", got)
+	}
+}
+
+// ---- subqueries in UPDATE / DELETE (spec/design/grammar.md §26) -----------------------------
+// A subquery is legal in a DELETE/UPDATE WHERE and an UPDATE assignment RHS. An uncorrelated one
+// folds once (cost added once); a correlated one references the TARGET row via the per-row outer
+// environment and re-runs per matching row. The mutation stays two-phase / all-or-nothing: the
+// subquery reads the pre-statement snapshot (DELETE collects keys first; UPDATE writes in phase 2).
+
+func TestDeleteWhereUncorrelatedInSubquery(t *testing.T) {
+	db := subqueryAB(t)
+	// delete a's rows whose k is one of b's k values {20,30,40}: ids 2 (20) and 3 (30) go.
+	mustExec(t, db, "DELETE FROM a WHERE k IN (SELECT k FROM b)")
+	if got := queryIDs(t, db, "SELECT id FROM a ORDER BY id"); !eqInts(got, 1) {
+		t.Errorf("after DELETE got %v want [1]", got)
+	}
+}
+
+func TestDeleteWhereCorrelatedExistsSubquery(t *testing.T) {
+	db := subqueryAB(t)
+	// EXISTS a b row whose k equals THIS a row's k: a.k ∈ {10,20,30}, b.k ∈ {20,30,40} -> 20,30 match.
+	mustExec(t, db, "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)")
+	if got := queryIDs(t, db, "SELECT id FROM a ORDER BY id"); !eqInts(got, 1) {
+		t.Errorf("correlated EXISTS DELETE got %v want [1]", got)
+	}
+	// NOT EXISTS is the complement.
+	db = subqueryAB(t)
+	mustExec(t, db, "DELETE FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)")
+	if got := queryIDs(t, db, "SELECT id FROM a ORDER BY id"); !eqInts(got, 2, 3) {
+		t.Errorf("correlated NOT EXISTS DELETE got %v want [2 3]", got)
+	}
+}
+
+func TestUpdateSetCorrelatedScalarSubquery(t *testing.T) {
+	db := subqueryAB(t)
+	// each a.k becomes max(b.k) over b rows with b.k > the OLD a.k: 10->40, 20->40, 30->40.
+	mustExec(t, db, "UPDATE a SET k = (SELECT max(b.k) FROM b WHERE b.k > a.k)")
+	if got := queryIDs(t, db, "SELECT k FROM a ORDER BY id"); !eqInts(got, 40, 40, 40) {
+		t.Errorf("correlated scalar UPDATE got %v want [40 40 40]", got)
+	}
+}
+
+func TestUpdateSetCorrelatedScalarEmptyIsNull(t *testing.T) {
+	db := dbWith(
+		t,
+		"CREATE TABLE a (id int32 PRIMARY KEY, k int32)",
+		"CREATE TABLE b (id int32 PRIMARY KEY, k int32)",
+		"INSERT INTO a VALUES (1, 5), (2, 100)",
+		"INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)",
+	)
+	// id1 (k=5): max(b.k>5)=40 ; id2 (k=100): no b.k>100 -> empty scalar -> NULL.
+	mustExec(t, db, "UPDATE a SET k = (SELECT max(b.k) FROM b WHERE b.k > a.k)")
+	rows := query(t, db, "SELECT id, k FROM a ORDER BY id")
+	if len(rows) != 2 || rows[0][1].Int != 40 || rows[1][1].Kind != ValNull {
+		t.Errorf("empty scalar UPDATE should NULL the unmatched row, got %+v", rows)
+	}
+}
+
+func TestUpdateWhereCorrelatedWithUncorrelatedSet(t *testing.T) {
+	db := subqueryAB(t)
+	// WHERE: a.k + 10 is one of b's k {20,30,40} -> all three rows. SET: uncorrelated min(b.k)=20,
+	// folded once. So every row -> 20.
+	mustExec(t, db, "UPDATE a SET k = (SELECT min(k) FROM b) WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k + 10)")
+	if got := queryIDs(t, db, "SELECT k FROM a ORDER BY id"); !eqInts(got, 20, 20, 20) {
+		t.Errorf("mixed UPDATE got %v want [20 20 20]", got)
+	}
+}
+
+func TestDeleteCorrelatedSubqueryCostIsPerRow(t *testing.T) {
+	// A correlated DELETE subquery re-runs per scanned row; an uncorrelated one folds once. The
+	// correlated cost therefore exceeds the uncorrelated baseline on the same data — proving the
+	// per-row execution. Both are deterministic + cross-core identical (CLAUDE.md §13).
+	corr, _ := Execute(subqueryAB(t), "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)")
+	uncorr, _ := Execute(subqueryAB(t), "DELETE FROM a WHERE k IN (SELECT k FROM b)")
+	if corr.Cost <= uncorr.Cost {
+		t.Errorf("correlated cost %d should exceed uncorrelated %d", corr.Cost, uncorr.Cost)
 	}
 }

@@ -233,6 +233,13 @@ set-operation combine. How many times that operand cost lands depends on correla
 Both are fully deterministic and identical across cores: the same `(query, database)` always
 visits the same outer rows in the same order and runs the subquery the same number of times.
 
+The same accounting applies when the enclosing statement is a **`DELETE` / `UPDATE`** (a
+subquery in its `WHERE`, or an `UPDATE` assignment RHS — grammar.md §26): an uncorrelated
+subquery folds once (operand cost added once, before the scan), and a correlated one re-runs
+per **scanned** row that reaches its node, adding `operator_eval + cost(s | r)` each time —
+identical to the `SELECT` case, since both mutations drive the same per-row evaluator. The
+phase-2 writes evaluate nothing and stay unmetered (below).
+
 ### What is NOT metered (defined boundary)
 
 Metering covers **execution** — per-row scans, per-row produced, per-row expression

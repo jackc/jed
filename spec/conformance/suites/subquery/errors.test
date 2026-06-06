@@ -1,9 +1,9 @@
 # Subquery error cases + the deliberate narrowings (spec/design/grammar.md §26). A scalar
 # subquery returning >1 ROW is 21000 (cardinality_violation); a scalar or IN subquery returning
-# >1 COLUMN is 42601. Correlation IS supported now (see correlated.test); the remaining
-# narrowings are a bind parameter `$N` inside a subquery and a subquery in a non-SELECT
-# (UPDATE/DELETE/INSERT) statement — both 0A000. Verified against PostgreSQL 18.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.delete, query.select, query.where_eq, query.subquery_scalar, query.subquery_in, query.subquery_exists, types.int32
+# >1 COLUMN is 42601. Correlation IS supported now (see correlated.test), as are subqueries in a
+# DELETE/UPDATE (see mutation.test); the remaining narrowing is a bind parameter `$N` inside a
+# subquery -> 0A000. Verified against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.subquery_scalar, query.subquery_in, query.subquery_exists, types.int32
 
 statement ok
 CREATE TABLE a (id int32 PRIMARY KEY, k int32)
@@ -43,7 +43,3 @@ SELECT (SELECT id, k FROM b WHERE id = 99) FROM one
 # A bind parameter inside a subquery -> 0A000 (parameter inference does not cross the boundary).
 statement error 0A000
 SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)
-
-# A subquery in a non-SELECT statement (here DELETE) is not supported yet -> 0A000 (SELECT-only).
-statement error 0A000
-DELETE FROM a WHERE k IN (SELECT k FROM b)

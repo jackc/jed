@@ -469,10 +469,17 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		return Outcome{}, err
 	}
 
-	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13;
-	// spec/design/cost.md §3). Keys are collected before mutating (so the map is not
-	// modified mid-scan). DELETE has no outer query / subqueries: an empty outer-row stack.
+	// Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
+	// spec/design/grammar.md §26, cost.md §3); a correlated one stays and re-runs per row via the
+	// per-row outer environment below (it pushes the current row, so `target.col` reads it). The
+	// uncorrelated execution reads the pre-DELETE snapshot (keys are collected before mutating).
+	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
 	meter := NewMeter()
+	if filter != nil {
+		if err := db.foldUncorrelatedInRExpr(filter, bound, &meter.Accrued); err != nil {
+			return Outcome{}, err
+		}
+	}
 	env := &evalEnv{exec: db, params: bound}
 	store := db.stores[strings.ToLower(del.Table)]
 	var keys [][]byte
@@ -564,10 +571,24 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		return Outcome{}, err
 	}
 
-	// Phase 1: build + validate every matching row's new values; no writes yet. Each
-	// scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes
-	// do not — they evaluate nothing; spec/design/cost.md §3).
+	// Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
+	// cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and re-runs
+	// per row via the outer environment (which pushes the current OLD row). The uncorrelated
+	// execution reads the pre-UPDATE snapshot (phase 1 only reads; phase 2 writes).
+	//
+	// Phase 1: build + validate every matching row's new values; no writes yet. Each scanned row,
+	// the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
 	meter := NewMeter()
+	for i := range plans {
+		if err := db.foldUncorrelatedInRExpr(plans[i].source, bound, &meter.Accrued); err != nil {
+			return Outcome{}, err
+		}
+	}
+	if filter != nil {
+		if err := db.foldUncorrelatedInRExpr(filter, bound, &meter.Accrued); err != nil {
+			return Outcome{}, err
+		}
+	}
 	env := &evalEnv{exec: db, params: bound}
 	store := db.stores[strings.ToLower(upd.Table)]
 	type pending struct {
@@ -2717,10 +2738,12 @@ type scope struct {
 	allowSubquery bool
 }
 
-// singleScope is a one-relation scope with no parent and no subqueries (the single-table
-// UPDATE / DELETE case). SELECT builds its own scope in planSelect.
+// singleScope is a one-relation scope with no parent (the single-table UPDATE / DELETE case).
+// Subqueries ARE allowed: a correlated reference resolves to the target row via the per-row
+// outer environment (the subquery's parent is this scope), an uncorrelated one folds once
+// (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
 func singleScope(catalog *Database, t *Table) *scope {
-	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}, catalog: catalog}
+	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}, catalog: catalog, allowSubquery: true}
 }
 
 // outerOf lifts a parent-scope resolution into the child's frame: one more hop outward.

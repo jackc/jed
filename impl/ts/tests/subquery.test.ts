@@ -99,9 +99,8 @@ test("subquery error codes and narrowings", () => {
     ["SELECT id FROM a WHERE k IN (SELECT id, k FROM b)", "42601"],
     // the >1-column check is plan-time, so it fires even over an empty subquery result
     ["SELECT (SELECT id, k FROM b WHERE id = 99) FROM one", "42601"],
-    // $N inside a subquery, and a subquery in a non-SELECT, remain 0A000 narrowings (§26)
+    // $N inside a subquery remains a 0A000 narrowing (§26)
     ["SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)", "0A000"],
-    ["DELETE FROM a WHERE k IN (SELECT k FROM b)", "0A000"],
     // grouping / ordering a subquery BY an enclosing-query column -> 0A000 (degenerate)
     ["SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b GROUP BY a.k)", "0A000"],
     ["SELECT id FROM a WHERE EXISTS (SELECT k FROM b ORDER BY a.k)", "0A000"],
@@ -208,4 +207,62 @@ test("a subquery's inner error is raised over an empty outer (plan-once)", () =>
     errCode(() => execute(db, "SELECT (SELECT id, v FROM f WHERE v = e.v) FROM e")),
     "42601",
   );
+});
+
+// ---- subqueries in UPDATE / DELETE (spec/design/grammar.md §26) -----------------------------
+// A subquery is legal in a DELETE/UPDATE WHERE and an UPDATE assignment RHS. An uncorrelated one
+// folds once (cost added once); a correlated one references the TARGET row via the per-row outer
+// environment and re-runs per matching row. The mutation stays two-phase / all-or-nothing: the
+// subquery reads the pre-statement snapshot (DELETE collects keys first; UPDATE writes in phase 2).
+
+test("DELETE WHERE uncorrelated IN subquery", () => {
+  const db = ab();
+  // delete a's rows whose k is one of b's k values {20,30,40}: ids 2 (20) and 3 (30) go.
+  execute(db, "DELETE FROM a WHERE k IN (SELECT k FROM b)");
+  assert.deepStrictEqual(query(db, "SELECT id FROM a ORDER BY id"), [["1"]]);
+});
+
+test("DELETE WHERE correlated EXISTS / NOT EXISTS subquery", () => {
+  const db = ab();
+  // EXISTS a b row whose k equals THIS a row's k: a.k ∈ {10,20,30}, b.k ∈ {20,30,40} -> 20,30 match.
+  execute(db, "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)");
+  assert.deepStrictEqual(query(db, "SELECT id FROM a ORDER BY id"), [["1"]]);
+  // NOT EXISTS is the complement.
+  const db2 = ab();
+  execute(db2, "DELETE FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)");
+  assert.deepStrictEqual(query(db2, "SELECT id FROM a ORDER BY id"), [["2"], ["3"]]);
+});
+
+test("UPDATE SET correlated scalar subquery", () => {
+  const db = ab();
+  // each a.k becomes max(b.k) over b rows with b.k > the OLD a.k: 10->40, 20->40, 30->40.
+  execute(db, "UPDATE a SET k = (SELECT max(b.k) FROM b WHERE b.k > a.k)");
+  assert.deepStrictEqual(query(db, "SELECT k FROM a ORDER BY id"), [["40"], ["40"], ["40"]]);
+});
+
+test("UPDATE SET correlated scalar with no match is NULL", () => {
+  const db = dbWith([
+    "CREATE TABLE a (id int32 PRIMARY KEY, k int32)",
+    "CREATE TABLE b (id int32 PRIMARY KEY, k int32)",
+    "INSERT INTO a VALUES (1, 5), (2, 100)",
+    "INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)",
+  ]);
+  // id1 (k=5): max(b.k>5)=40 ; id2 (k=100): no b.k>100 -> empty scalar -> NULL.
+  execute(db, "UPDATE a SET k = (SELECT max(b.k) FROM b WHERE b.k > a.k)");
+  assert.deepStrictEqual(query(db, "SELECT id, k FROM a ORDER BY id"), [["1", "40"], ["2", "NULL"]]);
+});
+
+test("UPDATE WHERE correlated with an uncorrelated SET", () => {
+  const db = ab();
+  // WHERE: a.k + 10 ∈ b's k {20,30,40} -> all three rows. SET: uncorrelated min(b.k)=20, folded once.
+  execute(db, "UPDATE a SET k = (SELECT min(k) FROM b) WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k + 10)");
+  assert.deepStrictEqual(query(db, "SELECT k FROM a ORDER BY id"), [["20"], ["20"], ["20"]]);
+});
+
+test("a correlated mutation subquery's cost is per row, not folded once", () => {
+  // A correlated DELETE subquery re-runs per scanned row; an uncorrelated one folds once, so the
+  // correlated cost exceeds the uncorrelated baseline — proving the per-row execution (CLAUDE.md §13).
+  const corr = execute(ab(), "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)").cost;
+  const uncorr = execute(ab(), "DELETE FROM a WHERE k IN (SELECT k FROM b)").cost;
+  assert.ok(corr > uncorr, `correlated ${corr} should exceed uncorrelated ${uncorr}`);
 });

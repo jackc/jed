@@ -538,20 +538,29 @@ impl Database {
         // DELETE is single-table; resolve its WHERE against a one-relation scope.
         let scope = Scope::single(self, table);
         let mut ptypes = ParamTypes::default();
-        let filter = match &del.filter {
+        let mut filter = match &del.filter {
             Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
             None => None,
         };
         let bound = bind_params(params, &ptypes.finalize()?)?;
 
+        // Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
+        // spec/design/grammar.md §26, cost.md §3); a correlated one stays and re-runs per row via
+        // the per-row outer environment below. The uncorrelated execution reads the pre-DELETE
+        // snapshot (we collect keys before mutating), matching PostgreSQL.
+        let mut meter = Meter::new();
+        if let Some(f) = &mut filter {
+            self.fold_uncorrelated_in_rexpr(f, &bound, &mut meter.accrued)?;
+        }
+
         // Collect matching keys before mutating (so the map is not modified mid-scan).
         // A WHERE arithmetic can trap (22003/22012), so this is an explicit loop that
         // propagates the error rather than a `.filter` closure. Each scanned row and each
         // filter evaluation accrues cost (CLAUDE.md §13; spec/design/cost.md §3).
-        let mut meter = Meter::new();
         let mut keys: Vec<Vec<u8>> = Vec::new();
-        // DELETE has no outer query and no subqueries (resolve rejects them here), so the eval
-        // environment carries only the bound params and an empty outer-row stack.
+        // A correlated subquery in the WHERE re-runs per row: the eval environment pushes the
+        // current row, so `target.col` (an `OuterColumn`) reads it. `outer` starts empty (DELETE
+        // is the top-level statement — no enclosing query).
         let env = EvalEnv {
             exec: self,
             params: &bound,
@@ -635,19 +644,32 @@ impl Database {
             });
         }
 
-        let filter = match &upd.filter {
+        let mut filter = match &upd.filter {
             Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
             None => None,
         };
         // All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
         let bound = bind_params(params, &ptypes.finalize()?)?;
 
+        // Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
+        // cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and
+        // re-runs per row via the outer environment. The uncorrelated execution reads the
+        // pre-UPDATE snapshot (phase 1 only reads; phase 2 writes), matching PostgreSQL.
+        let mut meter = Meter::new();
+        for plan in &mut plans {
+            self.fold_uncorrelated_in_rexpr(&mut plan.source, &bound, &mut meter.accrued)?;
+        }
+        if let Some(f) = &mut filter {
+            self.fold_uncorrelated_in_rexpr(f, &bound, &mut meter.accrued)?;
+        }
+
         // Phase 1: build + validate every matching row's new values; no writes yet. Each
         // scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes
         // do not — they evaluate nothing; spec/design/cost.md §3).
-        let mut meter = Meter::new();
         let mut updates: Vec<(Vec<u8>, Row)> = Vec::new();
-        // UPDATE has no outer query and no subqueries (resolve rejects them here): empty outer.
+        // A correlated subquery (in an RHS or the WHERE) re-runs per row: the eval environment
+        // pushes the current (old) row, so `target.col` (an `OuterColumn`) reads it. `outer`
+        // starts empty (UPDATE is the top-level statement — no enclosing query).
         let env = EvalEnv {
             exec: self,
             params: &bound,
@@ -743,9 +765,9 @@ impl Database {
     ) -> Result<QueryPlan> {
         match qe {
             QueryExpr::Select(sel) => Ok(QueryPlan::Select(self.plan_select(sel, parent, ptypes)?)),
-            QueryExpr::SetOp(so) => {
-                Ok(QueryPlan::SetOp(Box::new(self.plan_set_op(so, parent, ptypes)?)))
-            }
+            QueryExpr::SetOp(so) => Ok(QueryPlan::SetOp(Box::new(
+                self.plan_set_op(so, parent, ptypes)?,
+            ))),
         }
     }
 
@@ -1640,8 +1662,10 @@ struct Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
-    /// A one-relation scope with no parent and no subqueries (the single-table UPDATE / DELETE
-    /// case). SELECT builds its own scope in `plan_select` (with a parent + subqueries allowed).
+    /// A one-relation scope with no parent (the single-table UPDATE / DELETE case). Subqueries
+    /// ARE allowed: a correlated reference resolves to the target row via the per-row outer
+    /// environment (the subquery's parent is this scope), an uncorrelated one folds once
+    /// (spec/design/grammar.md §26). SELECT builds its own scope in `plan_select`.
     fn single(catalog: &'a Database, table: &'a Table) -> Scope<'a> {
         Scope {
             rels: vec![ScopeRel {
@@ -1651,7 +1675,7 @@ impl<'a> Scope<'a> {
             }],
             parent: None,
             catalog,
-            allow_subquery: false,
+            allow_subquery: true,
         }
     }
 
@@ -1947,7 +1971,10 @@ enum RExpr {
     /// A correlated column reference (spec/design/grammar.md §26): the column `index` of the
     /// enclosing-query row `level` hops out (1 = immediate parent). A **leaf** — charges no
     /// `operator_eval`, like `Column`; at eval it reads from the outer-row environment.
-    OuterColumn { level: usize, index: usize },
+    OuterColumn {
+        level: usize,
+        index: usize,
+    },
     /// A subquery resolved once against the scope chain (spec/design/grammar.md §26). After the
     /// `fold_uncorrelated` pass only CORRELATED subqueries survive as this node (uncorrelated
     /// ones are folded to a constant / `InValues`). At eval the inner `plan` is re-executed
@@ -2400,13 +2427,13 @@ fn query_plan_references_outer(plan: &QueryPlan, depth: usize) -> bool {
 }
 
 fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> bool {
-    sp.joins
-        .iter()
-        .any(|j| j.on.as_ref().is_some_and(|on| rexpr_references_outer(on, depth)))
-        || sp
-            .filter
-            .as_ref()
-            .is_some_and(|f| rexpr_references_outer(f, depth))
+    sp.joins.iter().any(|j| {
+        j.on.as_ref()
+            .is_some_and(|on| rexpr_references_outer(on, depth))
+    }) || sp
+        .filter
+        .as_ref()
+        .is_some_and(|f| rexpr_references_outer(f, depth))
         || sp
             .having
             .as_ref()
@@ -2416,7 +2443,10 @@ fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> bool {
                 .as_ref()
                 .is_some_and(|op| rexpr_references_outer(op, depth))
         })
-        || sp.projections.iter().any(|p| rexpr_references_outer(p, depth))
+        || sp
+            .projections
+            .iter()
+            .any(|p| rexpr_references_outer(p, depth))
 }
 
 fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
@@ -2488,11 +2518,7 @@ fn in_membership(lv: &Value, list: &[Value], negated: bool, m: &mut Meter) -> Va
     } else {
         Value::Bool(false)
     };
-    if negated {
-        not3(&in_val)
-    } else {
-        in_val
-    }
+    if negated { not3(&in_val) } else { in_val }
 }
 
 /// Build a binary-operator `Expr` node (used by the IN/BETWEEN desugar in `resolve`).
@@ -4286,7 +4312,9 @@ impl RExpr {
             RExpr::Column(i) => Ok(row[*i].clone()),
             // A correlated reference: the column `index` of the enclosing row `level` hops out
             // (1 = immediate parent). A leaf — reads from the outer-row environment (§26).
-            RExpr::OuterColumn { level, index } => Ok(env.outer[env.outer.len() - level][*index].clone()),
+            RExpr::OuterColumn { level, index } => {
+                Ok(env.outer[env.outer.len() - level][*index].clone())
+            }
             // A bind parameter — the supplied value, already coerced to its inferred type by
             // `bind_params` before execution (spec/design/api.md §5).
             RExpr::Param(i) => Ok(env.params[*i].clone()),
@@ -4557,8 +4585,11 @@ impl RExpr {
                             .as_ref()
                             .expect("an IN subquery carries its resolved lhs")
                             .eval(row, env, m)?;
-                        let list: Vec<Value> =
-                            r.rows.into_iter().map(|mut row| row.swap_remove(0)).collect();
+                        let list: Vec<Value> = r
+                            .rows
+                            .into_iter()
+                            .map(|mut row| row.swap_remove(0))
+                            .collect();
                         Ok(in_membership(&lv, &list, *negated, m))
                     }
                 }
