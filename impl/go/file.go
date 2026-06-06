@@ -38,7 +38,7 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 	db.path = path
 	db.pageSize = opts.PageSize
 	db.txid = 0
-	if err := db.Commit(); err != nil { // materialize the empty image (txid 0 -> 1)
+	if err := db.persist(); err != nil { // materialize the empty image (txid 0 -> 1)
 		return nil, err
 	}
 	return db, nil
@@ -63,9 +63,12 @@ func Open(path string) (*Database, error) {
 	return db, nil
 }
 
-// Commit durably persists the whole current image to the backing file and increments txid. An
-// in-memory database (no path) is a no-op success (spec/design/api.md §2).
-func (db *Database) Commit() error {
+// persist durably writes the whole current image to the backing file and increments txid — the
+// single synchronous-commit chokepoint (spec/design/transactions.md §9). Called by Create (the
+// initial image) and by the autocommit path after every successful write statement. An
+// in-memory database (no path) is a no-op success. The future synchronous=off mode
+// (batched/deferred fsync) gates here.
+func (db *Database) persist() error {
 	if db.path == "" {
 		return nil
 	}
@@ -81,8 +84,21 @@ func (db *Database) Commit() error {
 	return nil
 }
 
-// Close releases the handle. It does NOT commit — uncommitted changes since the last Commit are
-// discarded (spec/design/api.md §2). Idempotent.
+// Commit commits the current transaction (spec/design/api.md §2.2). jed autocommits each
+// statement (transactions.md §4.1), so in this slice there is no open explicit transaction to
+// publish — Commit is a lenient no-op success (transactions.md §4.2). Explicit BEGIN … COMMIT
+// blocks, where Commit does the durable publish, arrive in P5.2.
+func (db *Database) Commit() error { return nil }
+
+// Rollback rolls back the current transaction (spec/design/api.md §2.2). With autocommit and no
+// open explicit transaction (this slice), there is nothing uncommitted to discard — a no-op
+// success. Discarding an open explicit block's working set arrives with BEGIN in P5.2.
+func (db *Database) Rollback() error { return nil }
+
+// Close releases the handle (spec/design/api.md §2.3). Under autocommit, every prior statement
+// is already durable, so — unlike the original model — Close does NOT drop committed work; it
+// would roll back an open explicit transaction (none in this slice). Durability is never hidden
+// in a destructor. Idempotent.
 func (db *Database) Close() error {
 	db.path = ""
 	return nil

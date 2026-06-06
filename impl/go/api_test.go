@@ -81,15 +81,17 @@ func TestCreateWithCustomPageSizeRoundTrips(t *testing.T) {
 	}
 }
 
-func TestCloseWithoutCommitDiscards(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "discard.jed")
+func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
+	// jed autocommits (spec/design/transactions.md §4.1): a write is durable as soon as it
+	// succeeds, so it survives a Close with no explicit Commit — the opposite of the original
+	// "no autocommit" model this test used to assert.
+	path := filepath.Join(t.TempDir(), "autocommit.jed")
 	db, err := Create(path, DefaultDatabaseOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
 	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
-	db.Commit()
-	mustExec(t, db, "INSERT INTO t VALUES (1)") // not committed
+	mustExec(t, db, "INSERT INTO t VALUES (1)") // autocommitted, no explicit commit
 	db.Close()
 
 	db, err = Open(path)
@@ -97,8 +99,25 @@ func TestCloseWithoutCommitDiscards(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT id FROM t")
-	if len(rows) != 0 {
-		t.Fatalf("uncommitted insert must be gone, got %v", rows)
+	if len(rows) != 1 || rows[0][0].Int != 1 {
+		t.Fatalf("autocommitted insert must persist, got %v", rows)
+	}
+}
+
+func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
+	// With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
+	db := NewDatabase()
+	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	mustExec(t, db, "INSERT INTO t VALUES (1)")
+	if err := db.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Rollback(); err != nil { // does NOT undo the autocommitted insert
+		t.Fatal(err)
+	}
+	rows := queryRows(t, db, "SELECT id FROM t")
+	if len(rows) != 1 || rows[0][0].Int != 1 {
+		t.Fatalf("autocommitted row must remain, got %v", rows)
 	}
 }
 

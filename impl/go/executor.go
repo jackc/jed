@@ -93,7 +93,57 @@ func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
 // ExecuteStmtParams executes one parsed statement, binding params to its $N placeholders (nil
 // for an unparameterized statement). DDL statements take no parameters — supplying any is a
 // 42601 (spec/design/api.md §5).
+//
+// Autocommit (spec/design/transactions.md §4.1): a read runs against the committed state
+// directly; a write is its own transaction — the committed state is captured first (the stores
+// are O(1) clones via the persistent map, pmap.go), the statement runs, and on success the
+// change is made durable (synchronous, the single persist chokepoint). Any failure — in the
+// statement or in the durable write — restores the captured state (rollback-on-error,
+// discarding partial work and any rowid allocations, §7). For an in-memory database persist is
+// a no-op, so autocommit is pure in-memory visibility.
 func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, error) {
+	if !stmtIsWrite(stmt) {
+		return db.dispatchStmt(stmt, params)
+	}
+	savedTables, savedStores := db.snapshotState()
+	outcome, err := db.dispatchStmt(stmt, params)
+	if err == nil {
+		err = db.persist()
+	}
+	if err != nil {
+		db.tables = savedTables
+		db.stores = savedStores
+		return Outcome{}, err
+	}
+	return outcome, nil
+}
+
+// stmtIsWrite reports whether a statement mutates the database (so autocommit must capture +
+// durably persist it). Reads (SELECT, set operations) run with no transaction (transactions.md
+// §4.1).
+func stmtIsWrite(stmt Statement) bool {
+	return stmt.CreateTable != nil || stmt.DropTable != nil ||
+		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil
+}
+
+// snapshotState captures the committed catalog + stores cheaply for rollback-on-error: each
+// store is an O(1) persistent-map clone, and Table structs are never mutated in place (only
+// added/removed), so the catalog map is a shallow copy.
+func (db *Database) snapshotState() (map[string]*Table, map[string]*TableStore) {
+	tables := make(map[string]*Table, len(db.tables))
+	for k, v := range db.tables {
+		tables[k] = v
+	}
+	stores := make(map[string]*TableStore, len(db.stores))
+	for k, v := range db.stores {
+		stores[k] = v.clone()
+	}
+	return tables, stores
+}
+
+// dispatchStmt routes one parsed statement to its executor. The autocommit transaction handling
+// (capture / durable commit / rollback-on-error) lives in ExecuteStmtParams.
+func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error) {
 	switch {
 	case stmt.CreateTable != nil:
 		if err := rejectParamsForDDL(params); err != nil {
