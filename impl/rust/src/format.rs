@@ -17,6 +17,8 @@ use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{Database, Snapshot};
+use crate::pager::Pager;
+use crate::paging::SharedPaging;
 use crate::pmap::{Child, Node};
 use crate::storage::Row;
 use crate::types::{DecimalTypmod, ScalarType};
@@ -508,12 +510,10 @@ impl Database {
                     // No-PK keys are synthetic int64 rowids — advance the counter past the largest
                     // (the last entry in key order) so future inserts don't collide.
                     if !has_pk {
-                        let max = store
-                            .iter_entries()
-                            .last()
-                            .map(|(k, _)| decode_int(ScalarType::Int64, &k));
-                        if let Some(m) = max {
-                            store.bump_rowid_to(m + 1);
+                        // In-memory load (no paging) — `iter_entries` never faults, so `?` is inert.
+                        let entries = store.iter_entries()?;
+                        if let Some((k, _)) = entries.last() {
+                            store.bump_rowid_to(decode_int(ScalarType::Int64, k) + 1);
                         }
                     }
                 }
@@ -530,6 +530,156 @@ impl Database {
             .collect();
         db.committed = snap;
         Ok(db)
+    }
+
+    /// Open a file-backed database **demand-paged** (spec/design/pager.md, P6.4b): load only the
+    /// interior B-tree **skeleton** resident, leaving each leaf an `OnDisk` page faulted through the
+    /// bounded buffer pool on access — so the resident set is bounded by the pool, not the file size.
+    /// The inverse of an incremental commit, reading pages through `pager` instead of a whole image.
+    ///
+    /// This slice reads every leaf page once (to count its rows for `len` and mark it reachable for
+    /// the free-list), then discards it — memory stays bounded (only the skeleton is retained), but
+    /// open is O(pages). Making open O(skeleton) needs a per-subtree row count in the format (a
+    /// deferred follow-on, pager.md §6); the residency win — a bounded *resident* set — already holds.
+    pub(crate) fn open_paged(pager: Pager, capacity: usize) -> Result<Database> {
+        let page_size = pager.page_size() as usize;
+        if page_size < PAGE_HEADER + 36 {
+            return Err(corrupt("invalid page size"));
+        }
+        let paging = SharedPaging::new(pager, capacity);
+
+        // Select the live meta from slots 0 and 1 (highest valid txid; the lone valid slot on a torn
+        // write), read as individual blocks through the pager.
+        let meta = {
+            let mut pg = paging.pager();
+            let b0 = pg.read_block(0)?;
+            let b1 = pg.read_block(1)?;
+            match (parse_meta(&b0), parse_meta(&b1)) {
+                (Some(a), Some(b)) => {
+                    if b.txid > a.txid {
+                        b
+                    } else {
+                        a
+                    }
+                }
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => return Err(corrupt("no valid meta page")),
+            }
+        };
+
+        let mut snap = Snapshot::default();
+        snap.txid = meta.txid;
+        // Reconstruct the free-list (P6.2) from the pages the skeleton load marks reachable — every
+        // interior node, plus each leaf's page id (recorded without retaining the leaf).
+        let mut reached: HashSet<u32> = HashSet::new();
+        let mut cat_page = meta.root_page;
+        while cat_page != 0 {
+            reached.insert(cat_page);
+            let block = paging.pager().read_block(cat_page)?;
+            let page = parse_page(&block)?;
+            if page.page_type != PAGE_CATALOG {
+                return Err(corrupt("expected a catalog page"));
+            }
+            let mut pos = 0usize;
+            for _ in 0..page.item_count {
+                let (table, root_data_page) = decode_table_entry(page.payload, &mut pos)?;
+                let name = table.name.clone();
+                let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
+                let has_pk = table.primary_key_index().is_some();
+                snap.put_table(table, page_size as u32);
+                snap.store_mut(&name).attach_paging(paging.clone());
+                if root_data_page != 0 {
+                    let (root, len) =
+                        read_skeleton(&paging, root_data_page, &col_types, &mut reached)?;
+                    let store = snap.store_mut(&name);
+                    store.set_tree(Some(root), len);
+                    if !has_pk {
+                        // No-PK rowid reconstruction faults the leaves to find the largest key; only
+                        // for keyless tables (most have a PK), and bounded by the pool.
+                        let entries = store.iter_entries()?;
+                        if let Some((k, _)) = entries.last() {
+                            store.bump_rowid_to(decode_int(ScalarType::Int64, k) + 1);
+                        }
+                    }
+                }
+            }
+            cat_page = page.next_page;
+        }
+
+        let mut db = Database::new();
+        db.page_size = page_size as u32;
+        db.page_count = meta.page_count;
+        db.free_pages = (ROOT_PAGE..meta.page_count)
+            .filter(|p| !reached.contains(p))
+            .collect();
+        db.committed = snap;
+        db.paging = Some(paging);
+        Ok(db)
+    }
+}
+
+/// Read a table's on-disk B-tree (rooted at `root_page`) into a demand-paged **skeleton**: interior
+/// nodes resident, each leaf left `OnDisk`. Returns the root node and the total row count. A table
+/// whose root is itself a single leaf has no interior parent to hold an `OnDisk` reference, so the
+/// root leaf is faulted resident (spec/design/pager.md §1/§4).
+fn read_skeleton(
+    paging: &SharedPaging,
+    root_page: u32,
+    col_types: &[ScalarType],
+    reached: &mut HashSet<u32>,
+) -> Result<(Arc<Node>, usize)> {
+    let (child, len) = read_skeleton_node(paging, root_page, col_types, reached)?;
+    let root = match child {
+        Child::Resident(node) => node,
+        Child::OnDisk(page) => paging.fault_leaf(page, col_types)?,
+    };
+    Ok((root, len))
+}
+
+/// Read one B-tree node through the pager, **once**: a leaf becomes `Child::OnDisk` (its rows counted
+/// from the header, then dropped — not retained); an interior node becomes `Child::Resident` with its
+/// children resolved recursively. Returns the child reference and the subtree's row count.
+fn read_skeleton_node(
+    paging: &SharedPaging,
+    page_idx: u32,
+    col_types: &[ScalarType],
+    reached: &mut HashSet<u32>,
+) -> Result<(Child, usize)> {
+    reached.insert(page_idx);
+    let block = paging.pager().read_block(page_idx)?;
+    let page = parse_page(&block)?;
+    match page.page_type {
+        PAGE_LEAF => Ok((Child::OnDisk(page_idx), page.item_count as usize)),
+        PAGE_INTERIOR => {
+            let n = page.item_count as usize;
+            let mut pos = 0usize;
+            let mut children = Vec::with_capacity(n + 1);
+            let mut total = 0usize;
+            for _ in 0..=n {
+                let cp = read_u32(page.payload, &mut pos)?;
+                let (child, clen) = read_skeleton_node(paging, cp, col_types, reached)?;
+                children.push(child);
+                total += clen;
+            }
+            let (mut keys, mut vals, mut weights) = (
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+            );
+            for _ in 0..n {
+                let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
+                weights.push(record_size(col_types, &key, &row) as u32);
+                keys.push(key);
+                vals.push(row);
+            }
+            total += n;
+            Ok((
+                Child::Resident(Node::loaded(keys, vals, weights, children, page_idx)),
+                total,
+            ))
+        }
+        _ => Err(corrupt("expected a B-tree node page")),
     }
 }
 
@@ -754,13 +904,12 @@ struct Meta {
     page_count: u32,
 }
 
-/// Validate one meta slot; None if it is not a valid meta.
-fn read_meta(image: &[u8], ps: usize, slot: usize) -> Option<Meta> {
-    let off = slot * ps;
-    if off + ps > image.len() {
+/// Validate a standalone meta block; None if it is not a valid meta. Shared by `read_meta` (whole
+/// image) and the demand-paged loader (which reads meta slots 0/1 as individual blocks).
+fn parse_meta(m: &[u8]) -> Option<Meta> {
+    if m.len() < 36 {
         return None;
     }
-    let m = &image[off..off + ps];
     if m[0..4] != MAGIC {
         return None;
     }
@@ -779,6 +928,15 @@ fn read_meta(image: &[u8], ps: usize, slot: usize) -> Option<Meta> {
         root_page: u32::from_be_bytes(m[20..24].try_into().unwrap()),
         page_count: u32::from_be_bytes(m[24..28].try_into().unwrap()),
     })
+}
+
+/// Validate one meta slot of a whole image; None if it is not a valid meta.
+fn read_meta(image: &[u8], ps: usize, slot: usize) -> Option<Meta> {
+    let off = slot * ps;
+    if off + ps > image.len() {
+        return None;
+    }
+    parse_meta(&image[off..off + ps])
 }
 
 /// Pick the valid meta slot with the highest txid (tie → slot 0); the lone valid
@@ -800,18 +958,52 @@ struct Page<'a> {
     payload: &'a [u8],
 }
 
+/// Parse one standalone page block (header + borrowed payload). The single-block reader the demand-
+/// paged loader and fault path use (a page read through the pager is exactly one block); `read_page`
+/// slices it out of a whole image.
+fn parse_page(block: &[u8]) -> Result<Page<'_>> {
+    if block.len() < PAGE_HEADER {
+        return Err(corrupt("page shorter than its header"));
+    }
+    Ok(Page {
+        page_type: block[0],
+        item_count: u32::from_be_bytes([block[4], block[5], block[6], block[7]]),
+        next_page: u32::from_be_bytes([block[8], block[9], block[10], block[11]]),
+        payload: &block[PAGE_HEADER..],
+    })
+}
+
 fn read_page(image: &[u8], ps: usize, index: u32) -> Result<Page<'_>> {
     let off = index as usize * ps;
     if off + ps > image.len() {
         return Err(corrupt("page index out of range"));
     }
-    let p = &image[off..off + ps];
-    Ok(Page {
-        page_type: p[0],
-        item_count: u32::from_be_bytes([p[4], p[5], p[6], p[7]]),
-        next_page: u32::from_be_bytes([p[8], p[9], p[10], p[11]]),
-        payload: &p[PAGE_HEADER..],
-    })
+    parse_page(&image[off..off + ps])
+}
+
+/// Decode a single **leaf** page block into a resident node, for the demand-paging fault path
+/// (spec/design/pager.md §4; paging.rs `fault_leaf`). `block` is one page; `page` is its page id,
+/// stamped on the node so a later incremental commit keeps it clean. Weights are recomputed from the
+/// value codec (the exact size the writer used), so the loaded leaf is ready for further splits.
+pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ScalarType]) -> Result<Node> {
+    let parsed = parse_page(block)?;
+    if parsed.page_type != PAGE_LEAF {
+        return Err(corrupt("demand-paged a non-leaf page"));
+    }
+    let n = parsed.item_count as usize;
+    let (mut keys, mut vals, mut weights) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
+    let mut pos = 0usize;
+    for _ in 0..n {
+        let (key, row) = decode_record(col_types, parsed.payload, &mut pos)?;
+        weights.push(record_size(col_types, &key, &row) as u32);
+        keys.push(key);
+        vals.push(row);
+    }
+    Ok(Node::leaf_loaded(keys, vals, weights, page))
 }
 
 fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32)> {

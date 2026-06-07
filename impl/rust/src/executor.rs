@@ -104,11 +104,14 @@ impl Snapshot {
             .expect("store exists for a resolved table")
     }
 
-    /// All rows of a table in primary-key (encoded byte) order, or None if the table is absent.
+    /// All rows of a table in primary-key (encoded byte) order, or None if the table is absent. A
+    /// test/debug convenience (the SELECT path scans through `iter_in_key_order` directly, propagating
+    /// I/O errors). The inner fault-`Result` is unwrapped here — these callers are in-memory, where a
+    /// scan never faults.
     fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
         self.stores
             .get(&name.to_ascii_lowercase())
-            .map(|s| s.iter_in_key_order().collect())
+            .map(|s| s.iter_in_key_order().expect("in-memory read cannot fault"))
     }
 
     /// Register a new table and its (empty) store. Lower-cased name is the key. The store carries
@@ -169,11 +172,12 @@ pub struct Database {
     /// version, so it is reachable from no live snapshot and reuse is torn-write-safe. Empty for an
     /// in-memory database and for a freshly-created file (a from-scratch image leaks nothing).
     pub(crate) free_pages: Vec<u32>,
-    /// The block-device pager for a file-backed database — the open file kept for the handle's
-    /// life, through which the load and every commit read/write pages (spec/design/pager.md, P6.4a).
-    /// `None` for an in-memory database (`persist` is then a no-op); set by `open`/`create`, dropped
-    /// by `close`.
-    pub(crate) pager: Option<crate::pager::Pager>,
+    /// The shared paging context for a file-backed database (spec/design/pager.md): the open pager
+    /// (kept for the handle's life) + the bounded leaf buffer pool, shared (`Arc`) with every table
+    /// store so reads fault `OnDisk` leaves through the one pool. The load reads pages through it and
+    /// every commit writes through it. `None` for an in-memory database (`persist` is then a no-op);
+    /// set by `open`/`create`, dropped by `close`.
+    pub(crate) paging: Option<std::sync::Arc<crate::paging::SharedPaging>>,
 }
 
 /// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
@@ -211,7 +215,7 @@ impl Database {
             page_size,
             page_count: 0,
             free_pages: Vec::new(),
-            pager: None,
+            paging: None,
         }
     }
 
@@ -228,7 +232,7 @@ impl Database {
             page_size: DEFAULT_PAGE_SIZE,
             page_count: 0,
             free_pages: Vec::new(),
-            pager: None,
+            paging: None,
         }
     }
 
@@ -301,8 +305,10 @@ impl Database {
         self.read_snap().table(name)
     }
 
-    /// All rows of a table in primary-key (encoded byte) order, or None if the table does not
-    /// exist. Reads the visible snapshot. Used by SELECT and by tests.
+    /// All rows of a table in primary-key (encoded byte) order, or None if the table does not exist.
+    /// Reads the visible snapshot. A test/debug convenience — the SELECT path scans through
+    /// `iter_in_key_order` directly (propagating fault errors); this unwraps that `Result` for the
+    /// in-memory callers (tests), which never fault.
     pub fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
         self.read_snap().rows_in_key_order(name)
     }
@@ -800,7 +806,7 @@ impl Database {
                             )
                         }
                     };
-                    if seen_keys.contains(&k) || self.store(table).get(&k).is_some() {
+                    if seen_keys.contains(&k) || self.store(table).get(&k)?.is_some() {
                         return Err(EngineError::new(
                             SqlState::UniqueViolation,
                             "duplicate key value violates primary key uniqueness",
@@ -821,7 +827,7 @@ impl Database {
         for (key, row) in prepared {
             let key = key.unwrap_or_else(|| encode_int(ScalarType::Int64, store.alloc_rowid()));
             assert!(
-                store.insert(key, row),
+                store.insert(key, row)?,
                 "pre-validated INSERT key must be unique"
             );
         }
@@ -873,7 +879,7 @@ impl Database {
         // A full scan walks the table's whole B-tree: page_read per node (block, before the
         // rows), then storage_row_read per row (spec/design/cost.md §3 "page_read").
         meter.charge(COSTS.page_read * self.store(&del.table).node_count() as i64);
-        for (k, row) in self.store(&del.table).iter_entries() {
+        for (k, row) in self.store(&del.table).iter_entries()? {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
@@ -886,7 +892,7 @@ impl Database {
 
         let store = self.store_mut(&del.table);
         for k in &keys {
-            store.remove(k);
+            store.remove(k)?;
         }
         Ok(Outcome::Statement {
             cost: meter.accrued,
@@ -985,7 +991,7 @@ impl Database {
         // A full scan walks the table's whole B-tree: page_read per node (block, before the
         // rows), then storage_row_read per row (spec/design/cost.md §3 "page_read").
         meter.charge(COSTS.page_read * self.store(&upd.table).node_count() as i64);
-        for (key, row) in self.store(&upd.table).iter_entries() {
+        for (key, row) in self.store(&upd.table).iter_entries()? {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
@@ -1005,7 +1011,7 @@ impl Database {
         // Phase 2: apply (keys unchanged — a PK column can't be assigned).
         let store = self.store_mut(&upd.table);
         for (key, row) in updates {
-            store.replace(&key, row);
+            store.replace(&key, row)?;
         }
         Ok(Outcome::Statement {
             cost: meter.accrued,
@@ -1484,7 +1490,7 @@ impl Database {
             let store = self.store(&rel.table_name);
             meter.charge(COSTS.page_read * store.node_count() as i64);
             let mut table_rows: Vec<Row> = Vec::new();
-            for row in store.iter_in_key_order() {
+            for row in store.iter_in_key_order()? {
                 meter.charge(COSTS.storage_row_read);
                 table_rows.push(row);
             }

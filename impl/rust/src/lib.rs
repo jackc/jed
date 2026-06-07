@@ -8,9 +8,6 @@
 
 pub mod api;
 pub mod ast;
-// The CLOCK buffer pool is a tested foundation wired into pmap's leaf access in the next P6.4b
-// step (spec/design/pager.md §4); allow dead_code until then.
-#[allow(dead_code)]
 pub mod bufferpool;
 pub mod catalog;
 pub mod cost;
@@ -24,6 +21,7 @@ pub mod format;
 pub mod lexer;
 pub mod operators;
 pub mod pager;
+pub mod paging;
 pub mod parser;
 pub mod pmap;
 pub mod shared;

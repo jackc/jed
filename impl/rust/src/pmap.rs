@@ -27,6 +27,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+use crate::error::Result;
 use crate::storage::Row;
 
 /// A B-tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md §4) a
@@ -39,23 +40,42 @@ use crate::storage::Row;
 #[derive(Clone)]
 pub(crate) enum Child {
     Resident(Arc<Node>),
-    // Constructed by the demand-paged file load + leaf eviction in the next P6.4b step (B2,
-    // spec/design/pager.md §4); B1 threads the enum through the structure resident-only. The
-    // `node_count`/serialize/free-list arms already handle it, so B2 only adds the fault path.
-    #[allow(dead_code)]
     OnDisk(u32),
 }
 
 impl Child {
-    /// The resident node behind this child. Callers on the **read/mutation path** must resolve an
-    /// `OnDisk` leaf through the buffer pool first (B2); this accessor is for the fully-resident
-    /// paths — interior children (always resident) and in-memory databases. Panicking on `OnDisk`
-    /// would be a paging bug, never reachable for a fully-resident tree.
+    /// The resident node behind this child. For the fully-resident paths only — interior children
+    /// (always resident, §1) and in-memory databases. The read/mutation path resolves a possibly-
+    /// `OnDisk` child through [`child`] (which faults via the pool); panicking on `OnDisk` here would
+    /// be a paging bug, never reachable for a fully-resident tree.
     fn resident(&self) -> &Arc<Node> {
         match self {
             Child::Resident(n) => n,
             Child::OnDisk(p) => unreachable!("OnDisk child page {p} accessed without faulting"),
         }
+    }
+}
+
+/// Source for faulting a clean **leaf** page to a resident node on demand (spec/design/pager.md §4) —
+/// the buffer pool, behind the table's column types. Defined here so the B-tree traversal can fault
+/// without depending on the storage/format layers (they implement it); a fully-resident in-memory
+/// database passes `None` and never faults.
+pub(crate) trait LeafSource {
+    fn load_leaf(&self, page: u32) -> Result<Arc<Node>>;
+}
+
+/// Resolve child `i` to a resident node, faulting an `OnDisk` leaf through `src` (the buffer pool).
+/// A `Resident` child returns its `Arc` directly (a cheap bump); an `OnDisk` leaf with no source is a
+/// bug — an in-memory tree constructs no `OnDisk` child, and every file-backed traversal supplies one.
+fn child(node: &Node, i: usize, src: Option<&dyn LeafSource>) -> Result<Arc<Node>> {
+    match &node.children[i] {
+        Child::Resident(n) => Ok(n.clone()),
+        Child::OnDisk(p) => match src {
+            Some(s) => s.load_leaf(*p),
+            // An `OnDisk` child only exists in a file-backed store, which always supplies a source —
+            // an internal wiring invariant, not a data or user condition, so this is unreachable.
+            None => unreachable!("demand-paged leaf {p} reached with no buffer-pool source"),
+        },
     }
 }
 
@@ -109,6 +129,24 @@ impl Node {
             children,
             page: AtomicU32::new(page),
         })
+    }
+
+    /// A **leaf** node value reconstructed from disk at `page` for the demand-paging fault path
+    /// (format.rs `decode_leaf_node`). Returns the bare `Node` — the buffer pool wraps it in an `Arc`
+    /// (paging.rs). A leaf has no children.
+    pub(crate) fn leaf_loaded(
+        keys: Vec<Vec<u8>>,
+        vals: Vec<Row>,
+        weights: Vec<u32>,
+        page: u32,
+    ) -> Node {
+        Node {
+            keys,
+            vals,
+            weights,
+            children: Vec::new(),
+            page: AtomicU32::new(page),
+        }
     }
 
     pub(crate) fn is_leaf(&self) -> bool {
@@ -182,16 +220,21 @@ impl PMap {
     /// Look up the row at `key`, or `None`. Returns an **owned** row: under demand paging (P6.4b)
     /// the leaf holding it may live only in the buffer pool, not the resident tree, so a borrow
     /// could not outlive the pool lock — the read path clones the row out (spec/design/pager.md §4).
-    pub fn get(&self, key: &[u8]) -> Option<Row> {
-        let mut node = self.root.as_deref()?;
+    /// `src` faults an `OnDisk` leaf on the descent (`None` for a fully-resident in-memory tree).
+    pub(crate) fn get(&self, key: &[u8], src: Option<&dyn LeafSource>) -> Result<Option<Row>> {
+        // Hold an owned `Arc` to the current node so a faulted leaf outlives the step that reads it.
+        let mut cur = match &self.root {
+            None => return Ok(None),
+            Some(root) => root.clone(),
+        };
         loop {
-            match node.search(key) {
-                Ok(i) => return Some(node.vals[i].clone()),
+            match cur.search(key) {
+                Ok(i) => return Ok(Some(cur.vals[i].clone())),
                 Err(i) => {
-                    if node.is_leaf() {
-                        return None;
+                    if cur.is_leaf() {
+                        return Ok(None);
                     }
-                    node = node.children[i].resident();
+                    cur = child(&cur, i, src)?;
                 }
             }
         }
@@ -201,11 +244,18 @@ impl PMap {
     /// page payload capacity. Returns the previous row if `key` was present (an overwrite), else
     /// `None` (a new insert, which grows `len`). An overwrite can change the weight, so it too may
     /// overflow and split.
-    pub fn insert(&mut self, key: Vec<u8>, val: Row, weight: u32, cap: usize) -> Option<Row> {
+    pub(crate) fn insert(
+        &mut self,
+        key: Vec<u8>,
+        val: Row,
+        weight: u32,
+        cap: usize,
+        src: Option<&dyn LeafSource>,
+    ) -> Result<Option<Row>> {
         let mut old = None;
         let new_root = match &self.root {
             None => Node::new(vec![key], vec![val], vec![weight], Vec::new()),
-            Some(root) => match node_insert(root, key, val, weight, &mut old, cap) {
+            Some(root) => match node_insert(root, key, val, weight, &mut old, src, cap)? {
                 Ins::Whole(n) => n,
                 Ins::Split {
                     left,
@@ -225,13 +275,22 @@ impl PMap {
         if old.is_none() {
             self.len += 1;
         }
-        old
+        Ok(old)
     }
 
-    /// Remove `key`. Returns the removed row, or `None` if absent (then `self` is unchanged).
-    pub fn remove(&mut self, key: &[u8], cap: usize) -> Option<Row> {
-        let root = self.root.as_ref()?;
-        let (new_root, removed) = node_remove(root, key, cap);
+    /// Remove `key`. Returns the removed row, or `None` if absent (then `self` is unchanged). `src`
+    /// faults `OnDisk` leaves the delete descends into / rebalances against (spec/design/pager.md §4).
+    pub(crate) fn remove(
+        &mut self,
+        key: &[u8],
+        cap: usize,
+        src: Option<&dyn LeafSource>,
+    ) -> Result<Option<Row>> {
+        let root = match self.root.as_ref() {
+            None => return Ok(None),
+            Some(r) => r.clone(),
+        };
+        let (new_root, removed) = node_remove(&root, key, src, cap)?;
         if removed.is_some() {
             // The root may have drained to zero keys: an empty leaf becomes the empty map; an empty
             // internal node (one child) hands the root down a level (height shrinks). The root is
@@ -240,16 +299,16 @@ impl PMap {
                 if new_root.is_leaf() {
                     None
                 } else {
-                    // The lone surviving child becomes the new root. It is an interior node (this
-                    // node had keys before the drain), hence always `Resident` (only leaves page).
-                    Some(new_root.children[0].resident().clone())
+                    // The lone surviving child becomes the new root — fault it if it is an OnDisk leaf
+                    // (a tree of height 2 can collapse to its single bottom child).
+                    Some(child(&new_root, 0, src)?)
                 }
             } else {
                 Some(new_root)
             };
             self.len -= 1;
         }
-        removed
+        Ok(removed)
     }
 
     /// The number of B-tree nodes (pages) in this tree — the `page_read` count a full scan
@@ -281,12 +340,12 @@ impl PMap {
     /// node is free to be evicted, so the resident *node* set stays bounded by the pool even though
     /// the executor materializes the rows it scans (streaming the rows themselves is a deferred,
     /// out-of-scope follow-on — spec/design/pager.md §4/§6).
-    pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Row)> {
+    pub(crate) fn iter(&self, src: Option<&dyn LeafSource>) -> Result<Vec<(Vec<u8>, Row)>> {
         let mut out = Vec::with_capacity(self.len);
         if let Some(root) = &self.root {
-            collect(root, &mut out);
+            collect(root, src, &mut out)?;
         }
-        out.into_iter()
+        Ok(out)
     }
 }
 
@@ -361,15 +420,22 @@ fn node_insert(
     val: Row,
     weight: u32,
     old: &mut Option<Row>,
+    src: Option<&dyn LeafSource>,
     cap: usize,
-) -> Ins {
+) -> Result<Ins> {
     match node.search(&key) {
         Ok(i) => {
             let mut vals = node.vals.clone();
             *old = Some(std::mem::replace(&mut vals[i], val));
             let mut weights = node.weights.clone();
             weights[i] = weight;
-            build(node.keys.clone(), vals, weights, node.children.clone(), cap)
+            Ok(build(
+                node.keys.clone(),
+                vals,
+                weights,
+                node.children.clone(),
+                cap,
+            ))
         }
         Err(i) => {
             if node.is_leaf() {
@@ -379,19 +445,22 @@ fn node_insert(
                 keys.insert(i, key);
                 vals.insert(i, val);
                 weights.insert(i, weight);
-                build(keys, vals, weights, Vec::new(), cap)
+                Ok(build(keys, vals, weights, Vec::new(), cap))
             } else {
-                match node_insert(node.children[i].resident(), key, val, weight, old, cap) {
+                // Fault the target child (a `Resident` interior, or an `OnDisk` leaf brought in for
+                // mutation — it becomes a dirty resident node on the rebuilt path).
+                let c = child(node, i, src)?;
+                match node_insert(&c, key, val, weight, old, src, cap)? {
                     Ins::Whole(c) => {
                         // This node's separators are unchanged, so it cannot overflow — rebuild whole.
                         let mut children = node.children.clone();
                         children[i] = Child::Resident(c);
-                        Ins::Whole(Node::new(
+                        Ok(Ins::Whole(Node::new(
                             node.keys.clone(),
                             node.vals.clone(),
                             node.weights.clone(),
                             children,
-                        ))
+                        )))
                     }
                     Ins::Split {
                         left,
@@ -409,7 +478,7 @@ fn node_insert(
                         weights.insert(i, mw);
                         children[i] = Child::Resident(left);
                         children.insert(i + 1, Child::Resident(right));
-                        build(keys, vals, weights, children, cap)
+                        Ok(build(keys, vals, weights, children, cap))
                     }
                 }
             }
@@ -423,24 +492,31 @@ fn underfull(node: &Node, cap: usize) -> bool {
     node.payload() < cap / 2
 }
 
-/// The rightmost `(key, val, weight)` of a subtree — its in-order predecessor entry.
-fn max_kv(node: &Arc<Node>) -> (Vec<u8>, Row, u32) {
-    let mut n = node;
+/// The rightmost `(key, val, weight)` of a subtree — its in-order predecessor entry. Holds an owned
+/// `Arc` as it descends so a faulted rightmost leaf stays alive while it is read.
+fn max_kv(node: &Arc<Node>, src: Option<&dyn LeafSource>) -> Result<(Vec<u8>, Row, u32)> {
+    let mut n = node.clone();
     while !n.is_leaf() {
-        n = n.children.last().unwrap().resident();
+        let last = n.children.len() - 1;
+        n = child(&n, last, src)?;
     }
-    (
+    Ok((
         n.keys.last().unwrap().clone(),
         n.vals.last().unwrap().clone(),
         *n.weights.last().unwrap(),
-    )
+    ))
 }
 
 /// Recursive delete (copy-on-write). Returns the rebuilt subtree (possibly underfull — the caller
 /// rebalances it) and the removed row (or `None` if absent). A separator found in an interior node
 /// is replaced by its in-order **predecessor** (drawn from the left subtree), which is then deleted
 /// from that subtree; the touched child is rebalanced via [`rebalance_child`].
-fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<Row>) {
+fn node_remove(
+    node: &Arc<Node>,
+    key: &[u8],
+    src: Option<&dyn LeafSource>,
+    cap: usize,
+) -> Result<(Arc<Node>, Option<Row>)> {
     match node.search(key) {
         Ok(i) => {
             if node.is_leaf() {
@@ -450,11 +526,13 @@ fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<R
                 keys.remove(i);
                 let removed = vals.remove(i);
                 weights.remove(i);
-                (Node::new(keys, vals, weights, Vec::new()), Some(removed))
+                Ok((Node::new(keys, vals, weights, Vec::new()), Some(removed)))
             } else {
                 let removed = node.vals[i].clone();
-                let (pk, pv, pw) = max_kv(node.children[i].resident());
-                let (new_child, _) = node_remove(node.children[i].resident(), &pk, cap);
+                // Fault the left subtree once; both the predecessor lookup and its deletion descend it.
+                let left_child = child(node, i, src)?;
+                let (pk, pv, pw) = max_kv(&left_child, src)?;
+                let (new_child, _) = node_remove(&left_child, &pk, src, cap)?;
                 let mut keys = node.keys.clone();
                 let mut vals = node.vals.clone();
                 let mut weights = node.weights.clone();
@@ -464,16 +542,17 @@ fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<R
                 weights[i] = pw;
                 children[i] = Child::Resident(new_child);
                 let rebuilt = Node::new(keys, vals, weights, children);
-                (rebalance_child(&rebuilt, i, cap), Some(removed))
+                Ok((rebalance_child(&rebuilt, i, src, cap)?, Some(removed)))
             }
         }
         Err(i) => {
             if node.is_leaf() {
-                (node.clone(), None)
+                Ok((node.clone(), None))
             } else {
-                let (new_child, removed) = node_remove(node.children[i].resident(), key, cap);
+                let c = child(node, i, src)?;
+                let (new_child, removed) = node_remove(&c, key, src, cap)?;
                 if removed.is_none() {
-                    return (node.clone(), None);
+                    return Ok((node.clone(), None));
                 }
                 let mut children = node.children.clone();
                 children[i] = Child::Resident(new_child);
@@ -483,7 +562,7 @@ fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<R
                     node.weights.clone(),
                     children,
                 );
-                (rebalance_child(&rebuilt, i, cap), removed)
+                Ok((rebalance_child(&rebuilt, i, src, cap)?, removed))
             }
         }
     }
@@ -493,25 +572,38 @@ fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<R
 /// then split the merged node back if it overflows — the unified rebalance (no borrow). Returns the
 /// rebuilt parent (which may itself have lost a key and become underfull — its own parent handles
 /// that as the recursion unwinds).
-fn rebalance_child(node: &Arc<Node>, i: usize, cap: usize) -> Arc<Node> {
+fn rebalance_child(
+    node: &Arc<Node>,
+    i: usize,
+    src: Option<&dyn LeafSource>,
+    cap: usize,
+) -> Result<Arc<Node>> {
+    // `children[i]` was just rebuilt resident by `node_remove`, so inspecting it faults nothing.
     if !underfull(node.children[i].resident(), cap) {
-        return node.clone();
+        return Ok(node.clone());
     }
     let j = if i + 1 < node.children.len() {
         i
     } else {
         i - 1
     };
-    merge_at(node, j, cap)
+    merge_at(node, j, src, cap)
 }
 
 /// Merge `children[j]`, separator `j`, and `children[j+1]` into one node `M`. If `M` fits, it
 /// replaces the pair and the parent loses separator `j` and child `j+1`. If `M` overflows, it is
 /// split 2-way and the two halves + the new separator replace the pair (the parent's key count is
 /// unchanged). `M < 2·cap` always (format.md), so a single split restores fit.
-fn merge_at(node: &Arc<Node>, j: usize, cap: usize) -> Arc<Node> {
-    let left = node.children[j].resident();
-    let right = node.children[j + 1].resident();
+fn merge_at(
+    node: &Arc<Node>,
+    j: usize,
+    src: Option<&dyn LeafSource>,
+    cap: usize,
+) -> Result<Arc<Node>> {
+    // Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
+    // still be an `OnDisk` leaf the delete never touched.
+    let left = child(node, j, src)?;
+    let right = child(node, j + 1, src)?;
 
     let mut mkeys = left.keys.clone();
     let mut mvals = left.vals.clone();
@@ -537,7 +629,7 @@ fn merge_at(node: &Arc<Node>, j: usize, cap: usize) -> Arc<Node> {
             weights.remove(j);
             children[j] = Child::Resident(merged);
             children.remove(j + 1);
-            Node::new(keys, vals, weights, children)
+            Ok(Node::new(keys, vals, weights, children))
         }
         Ins::Split {
             left,
@@ -551,25 +643,30 @@ fn merge_at(node: &Arc<Node>, j: usize, cap: usize) -> Arc<Node> {
             weights[j] = weight;
             children[j] = Child::Resident(left);
             children[j + 1] = Child::Resident(right);
-            Node::new(keys, vals, weights, children)
+            Ok(Node::new(keys, vals, weights, children))
         }
     }
 }
 
 /// In-order walk: child[0], key[0], child[1], key[1], …, key[n-1], child[n]. Clones each
-/// `(key, row)` out (owned) — see [`PMap::iter`] for why the walk does not borrow.
-fn collect(node: &Node, out: &mut Vec<(Vec<u8>, Row)>) {
+/// `(key, row)` out (owned) — see [`PMap::iter`] for why the walk does not borrow. Faults each
+/// `OnDisk` leaf through `src`; the faulted `Arc` is dropped as soon as its rows are copied out, so
+/// the resident leaf set stays bounded by the pool, not the tree (pager.md §4).
+fn collect(node: &Node, src: Option<&dyn LeafSource>, out: &mut Vec<(Vec<u8>, Row)>) -> Result<()> {
     if node.is_leaf() {
         for i in 0..node.keys.len() {
             out.push((node.keys[i].clone(), node.vals[i].clone()));
         }
-        return;
+        return Ok(());
     }
     for i in 0..node.keys.len() {
-        collect(node.children[i].resident(), out);
+        let c = child(node, i, src)?;
+        collect(&c, src, out)?;
         out.push((node.keys[i].clone(), node.vals[i].clone()));
     }
-    collect(node.children[node.keys.len()].resident(), out);
+    let last = child(node, node.keys.len(), src)?;
+    collect(&last, src, out)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -647,74 +744,76 @@ mod tests {
 
         for k in shuffled(n) {
             assert_eq!(
-                pm.insert(key(k), row(k as i64), W, CAP),
+                pm.insert(key(k), row(k as i64), W, CAP, None).unwrap(),
                 bt.insert(key(k), row(k as i64))
             );
         }
         assert_eq!(pm.len(), bt.len());
         check_invariants(&pm);
         for k in 0..n {
-            assert_eq!(pm.get(&key(k)).as_ref(), bt.get(&key(k)));
+            assert_eq!(pm.get(&key(k), None).unwrap().as_ref(), bt.get(&key(k)));
         }
-        let got: Vec<_> = pm.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let got: Vec<_> = pm.iter(None).unwrap();
         let want: Vec<_> = bt.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         assert_eq!(got, want);
 
         // Overwrite returns the old value and does not change len.
         let before = pm.len();
         assert_eq!(
-            pm.insert(key(7), row(777), W, CAP),
+            pm.insert(key(7), row(777), W, CAP, None).unwrap(),
             bt.insert(key(7), row(777))
         );
         assert_eq!(pm.len(), before);
-        assert_eq!(pm.get(&key(7)), Some(row(777)));
+        assert_eq!(pm.get(&key(7), None).unwrap(), Some(row(777)));
 
         // Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
         for (step, k) in shuffled(n).into_iter().enumerate() {
-            assert_eq!(pm.remove(&key(k), CAP), bt.remove(&key(k)));
+            assert_eq!(pm.remove(&key(k), CAP, None).unwrap(), bt.remove(&key(k)));
             if step % 257 == 0 {
                 check_invariants(&pm);
             }
         }
         assert!(pm.is_empty());
-        assert_eq!(pm.iter().count(), 0);
-        assert_eq!(pm.remove(&key(123), CAP), None);
+        assert_eq!(pm.iter(None).unwrap().len(), 0);
+        assert_eq!(pm.remove(&key(123), CAP, None).unwrap(), None);
     }
 
     #[test]
     fn clone_is_an_independent_snapshot() {
         let mut base = PMap::new();
         for k in 0..2000 {
-            base.insert(key(k), row(k as i64), W, CAP);
+            base.insert(key(k), row(k as i64), W, CAP, None).unwrap();
         }
         let snap = base.clone();
 
         let mut other = base.clone();
         for k in 0..2000 {
-            other.insert(key(k), row(-(k as i64)), W, CAP); // overwrite every value
+            other
+                .insert(key(k), row(-(k as i64)), W, CAP, None)
+                .unwrap(); // overwrite every value
         }
         for k in 2000..3000 {
-            other.insert(key(k), row(k as i64), W, CAP); // and grow it
+            other.insert(key(k), row(k as i64), W, CAP, None).unwrap(); // and grow it
         }
         for k in 0..500 {
-            other.remove(&key(k), CAP); // and shrink it
+            other.remove(&key(k), CAP, None).unwrap(); // and shrink it
         }
 
         // `snap` still sees the original contents, untouched.
         assert_eq!(snap.len(), 2000);
         for k in 0..2000 {
-            assert_eq!(snap.get(&key(k)), Some(row(k as i64)));
+            assert_eq!(snap.get(&key(k), None).unwrap(), Some(row(k as i64)));
         }
-        let snap_rows: Vec<_> = snap.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let snap_rows: Vec<_> = snap.iter(None).unwrap();
         assert_eq!(snap_rows.len(), 2000);
         assert_eq!(snap_rows[0], (key(0), row(0)));
         assert_eq!(snap_rows[1999], (key(1999), row(1999)));
         check_invariants(&snap);
 
         assert_eq!(other.len(), 2500);
-        assert_eq!(other.get(&key(0)), None);
-        assert_eq!(other.get(&key(1000)), Some(row(-1000)));
-        assert_eq!(other.get(&key(2500)), Some(row(2500)));
+        assert_eq!(other.get(&key(0), None).unwrap(), None);
+        assert_eq!(other.get(&key(1000), None).unwrap(), Some(row(-1000)));
+        assert_eq!(other.get(&key(2500), None).unwrap(), Some(row(2500)));
         check_invariants(&other);
     }
 
@@ -722,11 +821,11 @@ mod tests {
     fn empty_and_single() {
         let mut pm = PMap::new();
         assert!(pm.is_empty());
-        assert_eq!(pm.get(&key(1)), None);
-        assert_eq!(pm.remove(&key(1), CAP), None);
-        assert_eq!(pm.insert(key(1), row(1), W, CAP), None);
-        assert_eq!(pm.get(&key(1)), Some(row(1)));
-        assert_eq!(pm.remove(&key(1), CAP), Some(row(1)));
+        assert_eq!(pm.get(&key(1), None).unwrap(), None);
+        assert_eq!(pm.remove(&key(1), CAP, None).unwrap(), None);
+        assert_eq!(pm.insert(key(1), row(1), W, CAP, None).unwrap(), None);
+        assert_eq!(pm.get(&key(1), None).unwrap(), Some(row(1)));
+        assert_eq!(pm.remove(&key(1), CAP, None).unwrap(), Some(row(1)));
         assert!(pm.is_empty());
         assert!(pm.root.is_none());
     }
@@ -739,12 +838,12 @@ mod tests {
         let mut pm = PMap::new();
         let mut bt: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
         for k in shuffled(300) {
-            pm.insert(key(k), row(k as i64), 110, CAP);
+            pm.insert(key(k), row(k as i64), 110, CAP, None).unwrap();
             bt.insert(key(k), row(k as i64));
             check_invariants(&pm);
         }
         for k in shuffled(300) {
-            pm.remove(&key(k), CAP);
+            pm.remove(&key(k), CAP, None).unwrap();
             bt.remove(&key(k));
             check_invariants(&pm);
         }

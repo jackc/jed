@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{DEFAULT_PAGE_SIZE, Database, Snapshot};
 use crate::pager::Pager;
+use crate::paging::{DEFAULT_LEAF_POOL_PAGES, SharedPaging};
 
 /// Settings for a newly-created database file (spec/design/api.md §2). `page_size` is fixed
 /// into the file's meta at creation and cannot change thereafter.
@@ -45,14 +46,19 @@ impl Database {
         db.page_size = opts.page_size;
         db.committed.txid = 1; // the initial empty image is committed as txid 1
         db.write_full_image()?; // lay down the from-scratch image; later commits are incremental
-        // Adopt the just-written file as the open pager, so later commits write through the seam
-        // without re-opening (spec/design/pager.md, P6.4a).
+        // Adopt the just-written file as the open pager + buffer pool, so later commits write through
+        // the seam without re-opening (spec/design/pager.md). A freshly-created database has no rows,
+        // so nothing is `OnDisk` yet — tables built in this session stay resident until a reopen
+        // demand-pages them.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(io_error)?;
-        db.pager = Some(Pager::from_file(file)?);
+        db.paging = Some(SharedPaging::new(
+            Pager::from_file(file)?,
+            DEFAULT_LEAF_POOL_PAGES,
+        ));
         Ok(db)
     }
 
@@ -62,8 +68,9 @@ impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Database> {
         let path = path.as_ref();
         // Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the
-        // load reads pages through the pager (P6.4a routes the whole-image load via `read_all`; the
-        // tree is still fully built — no residency change), and later commits write through it.
+        // demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf
+        // through the bounded buffer pool on access, so the resident set is bounded by the pool, not
+        // the file size (P6.4b). Later commits write through the same pager.
         let file = match OpenOptions::new().read(true).write(true).open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -74,12 +81,40 @@ impl Database {
             }
             Err(e) => return Err(io_error(e)),
         };
-        let mut pager = Pager::from_file(file)?;
-        let bytes = pager.read_all()?;
-        let mut db = Database::from_image(&bytes)?;
+        let pager = Pager::from_file(file)?;
+        let mut db = Database::open_paged(pager, DEFAULT_LEAF_POOL_PAGES)?;
         db.path = Some(path.to_path_buf());
-        db.pager = Some(pager);
         Ok(db)
+    }
+
+    /// Open an existing file-backed database with an explicit resident-leaf budget (the buffer-pool
+    /// capacity, in pages). Like [`open`] but with the budget the handle-level memory-budget API
+    /// (P6.4c) will expose; for now it backs the demand-paging tests. Capacity is clamped to ≥ 1.
+    #[allow(dead_code)]
+    pub(crate) fn open_with_capacity<P: AsRef<Path>>(path: P, capacity: usize) -> Result<Database> {
+        let path = path.as_ref();
+        let file = match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(EngineError::new(
+                    SqlState::UndefinedFile,
+                    format!("database file does not exist: {}", path.display()),
+                ));
+            }
+            Err(e) => return Err(io_error(e)),
+        };
+        let pager = Pager::from_file(file)?;
+        let mut db = Database::open_paged(pager, capacity)?;
+        db.path = Some(path.to_path_buf());
+        Ok(db)
+    }
+
+    /// The number of leaf pages currently resident in the buffer pool — `0` for an in-memory database.
+    /// The demand-paging tests assert this stays within the pool budget even for a database whose
+    /// data far exceeds it (spec/design/pager.md §3); P6.4c promotes it to the public surface.
+    #[allow(dead_code)]
+    pub(crate) fn resident_leaves(&self) -> usize {
+        self.paging.as_ref().map_or(0, |p| p.resident_leaves())
     }
 
     /// Lay down the whole from-scratch image of the committed snapshot (the all-dirty special case —
@@ -108,23 +143,26 @@ impl Database {
     /// after both syncs succeed, so a write failure leaves `self`, `committed`, and the file's prior
     /// meta untouched (the working snapshot is then discarded). The `synchronous=off` mode gates here.
     pub(crate) fn persist(&mut self, snap: &Snapshot) -> Result<()> {
-        // An in-memory database has no pager — a no-op success (the committed swap happens in
-        // `commit_tx` after this returns Ok). Compute the dirty-page set + meta before borrowing
-        // the pager (so `self.free_pages`/`page_size`/`page_count` are read first).
-        if self.pager.is_none() {
+        // An in-memory database has no paging context — a no-op success (the committed swap happens
+        // in `commit_tx` after this returns Ok). Compute the dirty-page set + meta before locking the
+        // pager (so `self.free_pages`/`page_size`/`page_count` are read first).
+        if self.paging.is_none() {
             return Ok(());
         }
         let free = self.free_pages.clone();
         let write = snap.incremental_image(self.page_size, self.page_count, &free)?;
         let meta =
             crate::format::meta_page(self.page_size, snap.txid, write.root_page, write.page_count);
-        let pager = self.pager.as_mut().expect("pager present");
-        for (index, bytes) in &write.pages {
-            pager.write_block(*index, bytes)?;
+        {
+            let paging = self.paging.as_ref().expect("paging present");
+            let mut pager = paging.pager();
+            for (index, bytes) in &write.pages {
+                pager.write_block(*index, bytes)?;
+            }
+            pager.sync()?; // body pages durable before the meta can reference them
+            pager.write_block((snap.txid & 1) as u32, &meta)?;
+            pager.sync()?; // the commit is published
         }
-        pager.sync()?; // body pages durable before the meta can reference them
-        pager.write_block((snap.txid & 1) as u32, &meta)?;
-        pager.sync()?; // the commit is published
         self.page_count = write.page_count;
         self.free_pages = write.free_remaining;
         Ok(())
@@ -153,7 +191,9 @@ impl Database {
     pub fn close(mut self) -> Result<()> {
         let _ = self.rollback_tx();
         self.path = None;
-        self.pager = None; // drop the open file (close it)
+        // Drop this handle's reference to the shared paging context; the file closes when the last
+        // reference (any store in the committed snapshot, dropped as `self` is consumed) goes away.
+        self.paging = None;
         Ok(())
     }
 }
@@ -192,4 +232,90 @@ fn tmp_path(path: &Path) -> PathBuf {
 
 fn io_error(e: std::io::Error) -> EngineError {
     EngineError::new(SqlState::IoError, format!("I/O error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execute;
+    use crate::value::Value;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
+    /// Demand paging (P6.4b, spec/design/pager.md §1/§4): a file-backed database with many leaf pages,
+    /// reopened with a tiny buffer-pool budget, still scans and mutates **correctly** while keeping
+    /// only a **bounded** number of leaves resident — the residency win, exercised end to end.
+    #[test]
+    fn demand_paging_scans_correctly_with_bounded_residency() {
+        let path = tmp("jed_p64b_paging.jed");
+        let _ = std::fs::remove_file(&path);
+        let n = 600i64;
+        const CAP: usize = 3;
+
+        // Build a multi-level tree at a small page size, so a few hundred rows span many pages.
+        {
+            let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            execute(&mut db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)").unwrap();
+            execute(&mut db, "BEGIN").unwrap(); // one commit, not 600
+            for k in 0..n {
+                execute(&mut db, &format!("INSERT INTO t VALUES ({k}, {})", k * 2)).unwrap();
+            }
+            execute(&mut db, "COMMIT").unwrap();
+            db.close().unwrap();
+        }
+
+        // Reopen demand-paged with a 3-leaf budget.
+        let db = Database::open_with_capacity(&path, CAP).unwrap();
+        // A PK table's skeleton load faults no leaves (it reads them only to count rows, uncached),
+        // so the pool starts empty — and the file holds many pages.
+        assert_eq!(db.resident_leaves(), 0, "skeleton load caches no leaf");
+        assert!(
+            db.page_count as usize > CAP * 5,
+            "file has many more pages ({}) than the pool budget",
+            db.page_count
+        );
+
+        // A full scan faults every leaf through the bounded pool: results are exact, residency bounded.
+        let rows = db.rows_in_key_order("t").unwrap();
+        assert_eq!(rows.len(), n as usize);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row[0], Value::Int(i as i64));
+            assert_eq!(row[1], Value::Int(i as i64 * 2));
+        }
+        assert!(
+            db.resident_leaves() <= CAP,
+            "resident leaves {} exceed the pool budget {CAP}",
+            db.resident_leaves()
+        );
+        db.close().unwrap();
+
+        // Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
+        {
+            let mut db = Database::open_with_capacity(&path, CAP).unwrap();
+            execute(&mut db, "DELETE FROM t WHERE k = 100").unwrap();
+            execute(&mut db, "UPDATE t SET v = 999 WHERE k = 200").unwrap();
+            execute(&mut db, "INSERT INTO t VALUES (600, 1200)").unwrap();
+            assert!(
+                db.resident_leaves() <= CAP,
+                "mutations keep residency bounded"
+            );
+            db.close().unwrap(); // autocommit already persisted each statement
+        }
+        let db = Database::open_with_capacity(&path, CAP).unwrap();
+        let rows = db.rows_in_key_order("t").unwrap();
+        assert_eq!(rows.len(), n as usize, "one deleted, one inserted");
+        assert!(
+            rows.iter().all(|r| r[0] != Value::Int(100)),
+            "k=100 was deleted"
+        );
+        let k200 = rows.iter().find(|r| r[0] == Value::Int(200)).unwrap();
+        assert_eq!(k200[1], Value::Int(999), "k=200 was updated");
+        let k600 = rows.iter().find(|r| r[0] == Value::Int(600)).unwrap();
+        assert_eq!(k600[1], Value::Int(1200), "k=600 was inserted");
+        db.close().unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

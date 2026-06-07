@@ -15,12 +15,42 @@
 
 use std::sync::Arc;
 
-use crate::pmap::{Node, PMap};
+use crate::error::Result;
+use crate::paging::SharedPaging;
+use crate::pmap::{LeafSource, Node, PMap};
 use crate::types::ScalarType;
 use crate::value::Value;
 
 /// A stored row: one value per column, in column order.
 pub type Row = Vec<Value>;
+
+/// The buffer-pool leaf source for one store (spec/design/pager.md §4): faults a clean leaf page
+/// through this database's shared pool, decoding it with this table's column types. Built per call
+/// from the store's `paging` + `col_types` (disjoint field borrows, so it composes with a `&mut`
+/// mutation of `rows`). A store with no `paging` (in-memory) builds none and never faults.
+struct PagedSource<'a> {
+    paging: &'a SharedPaging,
+    col_types: &'a [ScalarType],
+}
+
+impl LeafSource for PagedSource<'_> {
+    fn load_leaf(&self, page: u32) -> Result<Arc<Node>> {
+        self.paging.fault_leaf(page, self.col_types)
+    }
+}
+
+/// Build the leaf source from a store's paging context + column types (disjoint from `rows`). Free
+/// function (not a `&self` method) so the borrow is of `paging`/`col_types` only — `rows` stays free
+/// to be mutated alongside it.
+fn make_src<'a>(
+    paging: &'a Option<Arc<SharedPaging>>,
+    col_types: &'a [ScalarType],
+) -> Option<PagedSource<'a>> {
+    paging.as_ref().map(|p| PagedSource {
+        paging: p,
+        col_types,
+    })
+}
 
 /// A single table's rows, keyed by encoded primary key. Cloning is O(1) and yields an
 /// independent snapshot (the [`PMap`] shares structure; mutating one leaves the other
@@ -38,18 +68,31 @@ pub struct TableStore {
     /// The table's column types, for computing each row's on-disk record weight
     /// ([`crate::format::record_size`]). `Arc` so a snapshot clone stays O(1).
     col_types: Arc<Vec<ScalarType>>,
+    /// The shared pager + leaf buffer pool for a **file-backed** database (spec/design/pager.md):
+    /// the read/mutation path faults `OnDisk` leaves through it. `None` for an in-memory database
+    /// and for a table created in-session (fully resident until the file is reopened); attached by
+    /// the demand-paged file load. `Arc` so a snapshot clone shares the one pool per database.
+    paging: Option<Arc<SharedPaging>>,
 }
 
 impl TableStore {
     /// A new empty store for a table whose columns have the given types, serializing at page
-    /// payload `cap` (= `page_size − 12`).
+    /// payload `cap` (= `page_size − 12`). In-memory (no paging) until [`attach_paging`].
     pub fn new(cap: usize, col_types: Vec<ScalarType>) -> Self {
         TableStore {
             rows: PMap::new(),
             next_rowid: 0,
             cap,
             col_types: Arc::new(col_types),
+            paging: None,
         }
+    }
+
+    /// Attach this database's shared paging context (the demand-paged file load, format.rs): the
+    /// store's `OnDisk` leaves now fault through the pool. One pool per database, shared by every
+    /// store and snapshot.
+    pub(crate) fn attach_paging(&mut self, paging: Arc<SharedPaging>) {
+        self.paging = Some(paging);
     }
 
     /// This row's on-disk record size — the weight the page-backed B-tree splits on.
@@ -57,15 +100,18 @@ impl TableStore {
         crate::format::record_size(&self.col_types, key, row) as u32
     }
 
-    /// Insert a row under its encoded key. Returns false if the key already exists
-    /// (primary-key uniqueness); the caller decides how to surface that.
-    pub fn insert(&mut self, key: Vec<u8>, row: Row) -> bool {
-        if self.rows.get(&key).is_some() {
-            return false;
+    /// Insert a row under its encoded key. Returns `Ok(false)` if the key already exists
+    /// (primary-key uniqueness); the caller decides how to surface that. May fault the target leaf
+    /// through the buffer pool (an I/O error then propagates).
+    pub fn insert(&mut self, key: Vec<u8>, row: Row) -> Result<bool> {
+        let w = self.weight(&key, &row); // full `&self` borrow — taken before the leaf source
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        if self.rows.get(&key, src_ref)?.is_some() {
+            return Ok(false);
         }
-        let w = self.weight(&key, &row);
-        self.rows.insert(key, row, w, self.cap);
-        true
+        self.rows.insert(key, row, w, self.cap, src_ref)?;
+        Ok(true)
     }
 
     /// Allocate the next monotonic rowid (for a table with no primary key) and
@@ -86,27 +132,43 @@ impl TableStore {
 
     /// Replace the row stored at an existing key (UPDATE). The key is unchanged, so
     /// key order and the rowid counter are untouched. The caller only replaces keys it
-    /// just found, so the overwrite always lands on a present key.
-    pub fn replace(&mut self, key: &[u8], row: Row) {
+    /// just found, so the overwrite always lands on a present key. May fault the target leaf.
+    pub fn replace(&mut self, key: &[u8], row: Row) -> Result<()> {
         let w = self.weight(key, &row);
-        self.rows.insert(key.to_vec(), row, w, self.cap);
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.rows.insert(key.to_vec(), row, w, self.cap, src_ref)?;
+        Ok(())
     }
 
-    /// Remove the row at `key` (DELETE). Returns whether a row was present.
-    pub fn remove(&mut self, key: &[u8]) -> bool {
-        self.rows.remove(key, self.cap).is_some()
+    /// Remove the row at `key` (DELETE). Returns whether a row was present. May fault leaves the
+    /// delete descends into / rebalances against.
+    pub fn remove(&mut self, key: &[u8]) -> Result<bool> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        Ok(self.rows.remove(key, self.cap, src_ref)?.is_some())
     }
 
     /// Look up a row by its exact encoded key. Returns an **owned** row — under demand paging the
     /// holding leaf may live only in the buffer pool (spec/design/pager.md §4, [`PMap::get`]).
-    pub fn get(&self, key: &[u8]) -> Option<Row> {
-        self.rows.get(key)
+    pub fn get(&self, key: &[u8]) -> Result<Option<Row>> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.rows.get(key, src_ref)
     }
 
-    /// Iterate rows in primary-key (encoded byte) order, yielding **owned** rows
-    /// (spec/design/pager.md §4, [`PMap::iter`]).
-    pub fn iter_in_key_order(&self) -> impl Iterator<Item = Row> {
-        self.rows.iter().map(|(_, v)| v)
+    /// All rows in primary-key (encoded byte) order, as **owned** rows (spec/design/pager.md §4,
+    /// [`PMap::iter`]). Eager: leaves fault through the pool during the walk and are dropped as their
+    /// rows are copied out, so the resident leaf set stays bounded by the pool, not the table.
+    pub fn iter_in_key_order(&self) -> Result<Vec<Row>> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        Ok(self
+            .rows
+            .iter(src_ref)?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect())
     }
 
     /// The number of B-tree nodes (pages) in this store — the `page_read` count a full scan
@@ -115,11 +177,13 @@ impl TableStore {
         self.rows.node_count()
     }
 
-    /// Iterate `(encoded key, row)` pairs in key order, yielding **owned** pairs
-    /// (spec/design/pager.md §4, [`PMap::iter`]). Used by the executor's UPDATE/DELETE scan and the
-    /// on-disk free-list rowid reconstruction (spec/fileformat/format.md).
-    pub fn iter_entries(&self) -> impl Iterator<Item = (Vec<u8>, Row)> {
-        self.rows.iter()
+    /// All `(encoded key, row)` pairs in key order, as **owned** pairs (spec/design/pager.md §4,
+    /// [`PMap::iter`]). Used by the executor's UPDATE/DELETE scan and the on-disk free-list rowid
+    /// reconstruction (spec/fileformat/format.md). Eager; bounded resident leaves as `iter_in_key_order`.
+    pub fn iter_entries(&self) -> Result<Vec<(Vec<u8>, Row)>> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.rows.iter(src_ref)
     }
 
     /// The root B-tree node of this table's store, for the page-backed serializer

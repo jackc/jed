@@ -41,10 +41,10 @@ impl Pager {
         Ok(Pager { file, page_size })
     }
 
-    /// The number of whole pages the backing currently holds (`file_len / page_size`).
-    pub(crate) fn block_count(&self) -> Result<u32> {
-        let len = self.file.metadata().map_err(io_error)?.len();
-        Ok((len / self.page_size as u64) as u32)
+    /// The page size fixed into this file's meta header (format.md) — the block width the demand-
+    /// paged loader and fault path read at.
+    pub(crate) fn page_size(&self) -> u32 {
+        self.page_size
     }
 
     /// Read one page (block `index`) — random access, the demand-paging read path (P6.4b).
@@ -70,18 +70,6 @@ impl Pager {
     /// the body-before-meta write-ordering rule (format.md, file.rs `persist`).
     pub(crate) fn sync(&self) -> Result<()> {
         self.file.sync_all().map_err(io_error)
-    }
-
-    /// Assemble the whole image, page by page through `read_block` — the P6.4a load path (routes the
-    /// whole-image load through the seam without changing residency; P6.4b reads only the reachable
-    /// pages, on demand, instead).
-    pub(crate) fn read_all(&mut self) -> Result<Vec<u8>> {
-        let count = self.block_count()?;
-        let mut image = Vec::with_capacity(count as usize * self.page_size as usize);
-        for i in 0..count {
-            image.extend_from_slice(&self.read_block(i)?);
-        }
-        Ok(image)
     }
 }
 
