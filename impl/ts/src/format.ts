@@ -15,7 +15,9 @@ import { Decimal } from "./decimal.ts";
 import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database, Snapshot } from "./executor.ts";
-import type { PNode } from "./pmap.ts";
+import { onDiskRef, residentRef } from "./pmap.ts";
+import type { Child, PNode } from "./pmap.ts";
+import type { SharedPaging } from "./paging.ts";
 import type { Row } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -377,7 +379,12 @@ function serializeNode(
 ): { index: number; next: number } {
   const childPages: number[] = [];
   for (const c of n.children) {
-    const r = serializeNode(c, table, capacity, nextIndex, body);
+    // Whole-image serialize renumbers pages from scratch and runs only on a fully-resident in-memory
+    // database (create's empty image, the golden generator) — a paged file commits incrementally via
+    // serializeDirty. An OnDisk child would carry a page id from a different layout, so it must not
+    // appear here.
+    if (c.node === null) throw engineError("data_corrupted", "whole-image serialize hit an OnDisk leaf");
+    const r = serializeNode(c.node, table, capacity, nextIndex, body);
     childPages.push(r.index);
     nextIndex = r.next;
   }
@@ -505,7 +512,9 @@ function serializeDirty(
   }
   const childPages: number[] = [];
   for (const c of n.children) {
-    childPages.push(serializeDirty(c, table, capacity, ps, alloc, pages));
+    // A resident child recurses (dirty descendants get pages); an OnDisk child is a clean leaf already
+    // durable at its page — keep it, write nothing (the incremental-commit win).
+    childPages.push(c.node === null ? c.page : serializeDirty(c.node, table, capacity, ps, alloc, pages));
   }
   const w = new ByteWriter();
   let pageType = PAGE_LEAF;
@@ -591,7 +600,127 @@ export function loadDatabase(image: Uint8Array): Database {
 // [2, pageCount) (P6.2).
 function collectNodePages(n: PNode, reached: Set<number>): void {
   reached.add(n.page);
-  for (const c of n.children) collectNodePages(c, reached);
+  // An OnDisk leaf contributes its page without being loaded — the free-list walk reuses the resident
+  // interior skeleton (pager.md §4); a resident child recurses.
+  for (const c of n.children) {
+    if (c.node !== null) collectNodePages(c.node, reached);
+    else reached.add(c.page);
+  }
+}
+
+// loadDatabasePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
+// only the interior B-tree skeleton resident, leaving each leaf an OnDisk page faulted through the
+// bounded buffer pool on access — so the resident set is bounded by the pool, not the file size. The
+// inverse of an incremental commit, reading pages through the pager instead of a whole image. (This
+// slice reads every leaf page once to count its rows for length; an O(skeleton) open needs a
+// per-subtree row count in the format — a deferred follow-on, pager.md §6. Memory is already bounded.)
+export function loadDatabasePaged(paging: SharedPaging): Database {
+  const pageSize = paging.pageSize();
+  if (pageSize < PAGE_HEADER + 36) throw engineError("data_corrupted", "invalid page size");
+
+  // Select the live meta from slots 0 and 1 (highest valid txid; the lone valid slot on a torn write),
+  // read as individual blocks through the pager.
+  const a = parseMeta(paging.readBlock(0));
+  const b = parseMeta(paging.readBlock(1));
+  let mt: Meta | null = a;
+  if (b && (mt === null || b.txid > mt.txid)) mt = b;
+  if (mt === null) throw engineError("data_corrupted", "no valid meta page");
+
+  const snap = new Snapshot(mt.txid);
+  // Reconstruct the free-list (P6.2) from the pages the skeleton load marks reachable — every interior
+  // node, plus each leaf's page id (recorded without retaining the leaf).
+  const reached = new Set<number>();
+  let catPage = mt.rootPage;
+  while (catPage !== 0) {
+    reached.add(catPage);
+    const pg = parsePage(paging.readBlock(catPage));
+    if (pg.pageType !== PAGE_CATALOG) throw engineError("data_corrupted", "expected a catalog page");
+    const cur = { pos: 0 };
+    for (let i = 0; i < pg.itemCount; i++) {
+      const { table, root } = decodeTableEntry(pg.payload, cur);
+      const colTypes = table.columns.map((c) => c.type);
+      const hasPK = primaryKeyIndex(table) >= 0;
+      snap.putTable(table, pageSize);
+      const store = snap.stores.get(table.name.toLowerCase())!;
+      store.attachPaging(paging);
+      if (root !== 0) {
+        const t = readSkeleton(paging, root, colTypes, reached);
+        store.setTree(t.node, t.length);
+        if (!hasPK && t.length > 0) {
+          // No-PK rowid reconstruction faults the leaves to find the largest key; only for keyless
+          // tables (most have a PK), and bounded by the pool.
+          const entries = store.entriesInKeyOrder();
+          store.bumpRowidTo(decodeInt("int64", entries[entries.length - 1]!.key) + 1n);
+        }
+      }
+    }
+    catPage = pg.nextPage;
+  }
+
+  const db = new Database();
+  db.pageSize = pageSize;
+  db.pageCount = mt.pageCount;
+  for (let p = ROOT_PAGE; p < mt.pageCount; p++) {
+    if (!reached.has(p)) db.freePages.push(p);
+  }
+  db.committed = snap;
+  db.paging = paging;
+  return db;
+}
+
+// readSkeleton reads a table's on-disk B-tree (rooted at root) into a demand-paged skeleton: interior
+// nodes resident, each leaf left OnDisk. Returns the root node and the total row count. A table whose
+// root is itself a single leaf has no interior parent to hold an OnDisk reference, so the root leaf is
+// faulted resident (spec/design/pager.md §1/§4).
+function readSkeleton(
+  paging: SharedPaging,
+  root: number,
+  colTypes: ScalarType[],
+  reached: Set<number>,
+): { node: PNode; length: number } {
+  const r = readSkeletonNode(paging, root, colTypes, reached);
+  if (r.child.node !== null) return { node: r.child.node, length: r.length };
+  return { node: paging.faultLeaf(r.child.page, colTypes), length: r.length };
+}
+
+// readSkeletonNode reads one B-tree node through the pager, once: a leaf becomes an OnDisk child (its
+// rows counted from the header, then dropped — not retained); an interior node becomes a resident child
+// with its children resolved recursively. Returns the child reference and the subtree's row count.
+function readSkeletonNode(
+  paging: SharedPaging,
+  pageIdx: number,
+  colTypes: ScalarType[],
+  reached: Set<number>,
+): { child: Child; length: number } {
+  reached.add(pageIdx);
+  const pg = parsePage(paging.readBlock(pageIdx));
+  if (pg.pageType === PAGE_LEAF) {
+    return { child: onDiskRef(pageIdx), length: pg.itemCount };
+  }
+  if (pg.pageType === PAGE_INTERIOR) {
+    const n = pg.itemCount;
+    const cur = { pos: 0 };
+    const children: Child[] = [];
+    let total = 0;
+    for (let i = 0; i < n + 1; i++) {
+      const cp = readU32(pg.payload, cur);
+      const r = readSkeletonNode(paging, cp, colTypes, reached);
+      children.push(r.child);
+      total += r.length;
+    }
+    const keys: Uint8Array[] = [];
+    const vals: Row[] = [];
+    const weights: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const { key, row } = decodeRecord(colTypes, pg.payload, cur);
+      weights.push(recordSize(colTypes, key, row));
+      keys.push(key);
+      vals.push(row);
+    }
+    total += n;
+    return { child: residentRef({ keys, vals, weights, children, page: pageIdx }), length: total };
+  }
+  throw engineError("data_corrupted", "expected a B-tree node page");
 }
 
 // readTree reads a table's on-disk B-tree (rooted at pageIdx) into an in-memory tree, returning the
@@ -624,12 +753,14 @@ function readTree(
   if (pg.pageType === PAGE_INTERIOR) {
     const n = pg.itemCount;
     const cur = { pos: 0 };
-    const children: PNode[] = [];
+    const children: Child[] = [];
     let total = 0;
     for (let i = 0; i < n + 1; i++) {
       const cp = readU32(pg.payload, cur);
       const r = readTree(image, dv, ps, cp, colTypes);
-      children.push(r.node);
+      // The in-memory load is fully resident (no pager to fault from); the demand-paged file load
+      // (loadDatabasePaged) is a separate path that leaves leaf children OnDisk.
+      children.push(residentRef(r.node));
       total += r.length;
     }
     const keys: Uint8Array[] = [];
@@ -742,6 +873,31 @@ function readMeta(image: Uint8Array, dv: DataView, ps: number, slot: number): Me
   };
 }
 
+// parseMeta validates a standalone meta block; null if it is not a valid meta. Shared by the
+// demand-paged loader (which reads meta slots 0/1 as individual blocks).
+function parseMeta(block: Uint8Array): Meta | null {
+  if (block.length < 36) return null;
+  const dv = new DataView(block.buffer, block.byteOffset, block.byteLength);
+  if (!(block[0] === 0x4a && block[1] === 0x45 && block[2] === 0x44 && block[3] === 0x42)) return null;
+  if (dv.getUint16(4, false) !== FORMAT_VERSION) return null;
+  if (
+    block[6] !== 0 ||
+    block[7] !== 0 ||
+    block[28] !== 0 ||
+    block[29] !== 0 ||
+    block[30] !== 0 ||
+    block[31] !== 0
+  ) {
+    return null;
+  }
+  if (crc32Ieee(block.subarray(0, 32)) !== dv.getUint32(32, false)) return null;
+  return {
+    txid: dv.getBigUint64(12, false),
+    rootPage: dv.getUint32(20, false),
+    pageCount: dv.getUint32(24, false),
+  };
+}
+
 // selectMeta picks the valid slot with the highest txid (tie → slot 0); the lone valid
 // slot on a torn write; error if neither is valid (format.md).
 function selectMeta(image: Uint8Array, dv: DataView, ps: number): Meta {
@@ -767,6 +923,40 @@ function readPage(image: Uint8Array, dv: DataView, ps: number, index: number): P
     nextPage: dv.getUint32(off + 8, false),
     payload: image.subarray(off + PAGE_HEADER, off + ps),
   };
+}
+
+// parsePage parses one standalone page block (header + payload). The single-block reader the
+// demand-paged loader and fault path use (a page read through the pager is exactly one block);
+// readPage slices it out of a whole image.
+function parsePage(block: Uint8Array): Page {
+  if (block.length < PAGE_HEADER) throw engineError("data_corrupted", "page shorter than its header");
+  const dv = new DataView(block.buffer, block.byteOffset, block.byteLength);
+  return {
+    pageType: block[0]!,
+    itemCount: dv.getUint32(4, false),
+    nextPage: dv.getUint32(8, false),
+    payload: block.subarray(PAGE_HEADER),
+  };
+}
+
+// decodeLeafNode decodes a single leaf page block into a resident node, for the demand-paging fault
+// path (spec/design/pager.md §4; paging.ts faultLeaf). block is one page; page is its page id, stamped
+// on the node so a later incremental commit keeps it clean. Weights are recomputed from the value
+// codec (the exact size the writer used), so the loaded leaf is ready for further splits.
+export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ScalarType[]): PNode {
+  const pg = parsePage(block);
+  if (pg.pageType !== PAGE_LEAF) throw engineError("data_corrupted", "demand-paged a non-leaf page");
+  const keys: Uint8Array[] = [];
+  const vals: Row[] = [];
+  const weights: number[] = [];
+  const cur = { pos: 0 };
+  for (let i = 0; i < pg.itemCount; i++) {
+    const { key, row } = decodeRecord(colTypes, pg.payload, cur);
+    weights.push(recordSize(colTypes, key, row));
+    keys.push(key);
+    vals.push(row);
+  }
+  return { keys, vals, weights, children: [], page };
 }
 
 type Cursor = { pos: number };

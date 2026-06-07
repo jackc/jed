@@ -13,7 +13,8 @@
 import type { Value } from "./value.ts";
 import type { ScalarType } from "./types.ts";
 import { PMap, pmapFromLoaded } from "./pmap.ts";
-import type { PNode } from "./pmap.ts";
+import type { LeafSource, PNode } from "./pmap.ts";
+import type { SharedPaging } from "./paging.ts";
 import { recordSize } from "./format.ts";
 
 // Row is a stored row: one value per column, in column order.
@@ -21,6 +22,23 @@ export type Row = Value[];
 
 // Entry is one stored (encoded key, row) pair.
 export type Entry = { key: Uint8Array; row: Row };
+
+// PagedSource is the buffer-pool leaf source for one store (spec/design/pager.md §4): faults a clean
+// leaf page through this database's shared pool, decoding it with this table's column types. A store
+// with no paging (in-memory) builds none (null) and never faults.
+class PagedSource implements LeafSource {
+  private paging: SharedPaging;
+  private colTypes: ScalarType[];
+
+  constructor(paging: SharedPaging, colTypes: ScalarType[]) {
+    this.paging = paging;
+    this.colTypes = colTypes;
+  }
+
+  loadLeaf(page: number): PNode {
+    return this.paging.faultLeaf(page, this.colTypes);
+  }
+}
 
 // TableStore holds one table's rows, keyed by encoded primary key.
 export class TableStore {
@@ -33,19 +51,43 @@ export class TableStore {
   // column types, for computing record weights (recordSize).
   private cap: number;
   private colTypes: ScalarType[];
+  // paging is the shared pager + leaf buffer pool for a file-backed database (spec/design/pager.md):
+  // the read/mutation path faults OnDisk leaves through it. null for an in-memory database and for a
+  // table created in-session (fully resident until the file is reopened); attached by the demand-paged
+  // file load. Shared (reference) — a snapshot clone shares the one pool per database.
+  private paging: SharedPaging | null;
 
-  constructor(cap: number, colTypes: ScalarType[], rows: PMap = new PMap(), nextRowid = 0n) {
+  constructor(
+    cap: number,
+    colTypes: ScalarType[],
+    rows: PMap = new PMap(),
+    nextRowid = 0n,
+    paging: SharedPaging | null = null,
+  ) {
     this.cap = cap;
     this.colTypes = colTypes;
     this.rows = rows;
     this.nextRowid = nextRowid;
+    this.paging = paging;
   }
 
   // clone returns an independent O(1) snapshot of the store: the PMap clone shares structure
   // (nodes are immutable), so mutating one store leaves the clone untouched. The foundation of
-  // the transaction model (spec/design/transactions.md §2).
+  // the transaction model (spec/design/transactions.md §2). The shared paging context is shared, not
+  // copied (one pool per database).
   clone(): TableStore {
-    return new TableStore(this.cap, this.colTypes, this.rows.clone(), this.nextRowid);
+    return new TableStore(this.cap, this.colTypes, this.rows.clone(), this.nextRowid, this.paging);
+  }
+
+  // attachPaging attaches this database's shared paging context (the demand-paged file load,
+  // format.ts): the store's OnDisk leaves now fault through the pool. One pool per database.
+  attachPaging(paging: SharedPaging): void {
+    this.paging = paging;
+  }
+
+  // leafSrc builds this store's leaf source, or null for an in-memory store that never faults.
+  private leafSrc(): LeafSource | null {
+    return this.paging === null ? null : new PagedSource(this.paging, this.colTypes);
   }
 
   // weight is this row's on-disk record size — the weight the page-backed B-tree splits on.
@@ -54,10 +96,12 @@ export class TableStore {
   }
 
   // insert adds a row under its encoded key. Returns false if the key already exists
-  // (primary-key uniqueness); the caller decides how to surface that.
+  // (primary-key uniqueness); the caller decides how to surface that. May fault the target leaf
+  // through the buffer pool (an I/O error then throws).
   insert(key: Uint8Array, row: Row): boolean {
-    if (this.rows.get(key) !== undefined) return false;
-    this.rows.insert(key, row, this.weight(key, row), this.cap);
+    const src = this.leafSrc();
+    if (this.rows.get(key, src) !== undefined) return false;
+    this.rows.insert(key, row, this.weight(key, row), this.cap, src);
     return true;
   }
 
@@ -76,24 +120,27 @@ export class TableStore {
   }
 
   // replace overwrites the row stored at an existing key (UPDATE). The key is
-  // unchanged, so key order and the rowid counter are untouched.
+  // unchanged, so key order and the rowid counter are untouched. May fault the target leaf.
   replace(key: Uint8Array, row: Row): void {
-    this.rows.insert(key, row, this.weight(key, row), this.cap);
+    this.rows.insert(key, row, this.weight(key, row), this.cap, this.leafSrc());
   }
 
-  // remove deletes the row at key (DELETE). Returns whether a row was present.
+  // remove deletes the row at key (DELETE). Returns whether a row was present. May fault leaves the
+  // delete descends into / rebalances against.
   remove(key: Uint8Array): boolean {
-    return this.rows.remove(key, this.cap) !== undefined;
+    return this.rows.remove(key, this.cap, this.leafSrc()) !== undefined;
   }
 
-  // get looks up a row by its exact encoded key.
+  // get looks up a row by its exact encoded key. May fault the holding leaf through the buffer pool.
   get(key: Uint8Array): Row | undefined {
-    return this.rows.get(key);
+    return this.rows.get(key, this.leafSrc());
   }
 
-  // iterInKeyOrder returns the rows in primary-key (encoded byte) order.
+  // iterInKeyOrder returns the rows in primary-key (encoded byte) order. Eager: leaves fault through
+  // the pool during the walk and are dropped (GC) as their rows are collected, so the resident leaf
+  // set stays bounded by the pool, not the table (spec/design/pager.md §4).
   iterInKeyOrder(): Row[] {
-    return this.rows.inorder().vals;
+    return this.rows.inorder(this.leafSrc()).vals;
   }
 
   // nodeCount is the number of B-tree nodes (pages) in this store — the page_read count a full
@@ -106,7 +153,7 @@ export class TableStore {
   // on-disk serializer, which stores each row's key verbatim (the key is not always
   // reconstructable from the row — e.g. a no-PK table's synthetic rowid).
   entriesInKeyOrder(): Entry[] {
-    const { keys, vals } = this.rows.inorder();
+    const { keys, vals } = this.rows.inorder(this.leafSrc());
     return keys.map((k, i) => ({ key: k, row: vals[i] }));
   }
 

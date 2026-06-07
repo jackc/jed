@@ -59,7 +59,7 @@ function checkInvariants(pm: PMap): void {
     for (const w of n.weights) payload += w;
     if (n.children.length > 0) payload += 4 * n.children.length;
     assert.ok(payload <= CAP, `node payload ${payload} exceeds cap ${CAP}`);
-    for (const c of n.children) walk(c, false);
+    for (const c of n.children) walk(c.node, false);
   };
   walk(pm.rootNode(), true);
 }
@@ -70,7 +70,7 @@ test("pmap: insert/get/remove vs a reference map", () => {
   const n = 4000;
 
   for (const k of shuffled(n)) {
-    const had = pm.insert(key(k), row(k), W, CAP) !== undefined;
+    const had = pm.insert(key(k), row(k), W, CAP, null) !== undefined;
     const refHad = ref.has(keyStr(key(k)));
     assert.equal(had, refHad, `insert 'had' mismatch at ${k}`);
     ref.set(keyStr(key(k)), row(k));
@@ -78,11 +78,11 @@ test("pmap: insert/get/remove vs a reference map", () => {
   assert.equal(pm.size, ref.size);
   checkInvariants(pm);
   for (let k = 0; k < n; k++) {
-    assert.deepEqual(pm.get(key(k)), ref.get(keyStr(key(k))));
+    assert.deepEqual(pm.get(key(k), null), ref.get(keyStr(key(k))));
   }
 
   // Iteration is in ascending key order and matches the reference.
-  const { keys, vals } = pm.inorder();
+  const { keys, vals } = pm.inorder(null);
   assert.equal(keys.length, ref.size);
   for (let i = 1; i < keys.length; i++) {
     assert.ok(keyStr(keys[i - 1]) < keyStr(keys[i]), "iteration not in key order");
@@ -93,41 +93,41 @@ test("pmap: insert/get/remove vs a reference map", () => {
 
   // Overwrite returns the old value and does not change size (kept in sync with the reference).
   const before = pm.size;
-  assert.deepEqual(pm.insert(key(7), row(777), W, CAP), row(7));
+  assert.deepEqual(pm.insert(key(7), row(777), W, CAP, null), row(7));
   ref.set(keyStr(key(7)), row(777));
   assert.equal(pm.size, before);
 
   // Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
   let step = 0;
   for (const k of shuffled(n)) {
-    const got = pm.remove(key(k), CAP);
+    const got = pm.remove(key(k), CAP, null);
     const want = ref.get(keyStr(key(k)));
     ref.delete(keyStr(key(k)));
     assert.deepEqual(got, want, `remove mismatch at ${k}`);
     if (step++ % 257 === 0) checkInvariants(pm);
   }
   assert.equal(pm.size, 0);
-  assert.equal(pm.remove(key(123), CAP), undefined);
+  assert.equal(pm.remove(key(123), CAP, null), undefined);
 });
 
 test("pmap: clone is an independent snapshot", () => {
   const base = new PMap();
-  for (let k = 0; k < 2000; k++) base.insert(key(k), row(k), W, CAP);
+  for (let k = 0; k < 2000; k++) base.insert(key(k), row(k), W, CAP, null);
   const snap = base.clone();
 
   // Mutate a separate clone heavily; the snapshot must be untouched.
   const other = base.clone();
-  for (let k = 0; k < 2000; k++) other.insert(key(k), row(-k), W, CAP); // overwrite every value
-  for (let k = 2000; k < 3000; k++) other.insert(key(k), row(k), W, CAP); // grow
-  for (let k = 0; k < 500; k++) other.remove(key(k), CAP); // shrink
+  for (let k = 0; k < 2000; k++) other.insert(key(k), row(-k), W, CAP, null); // overwrite every value
+  for (let k = 2000; k < 3000; k++) other.insert(key(k), row(k), W, CAP, null); // grow
+  for (let k = 0; k < 500; k++) other.remove(key(k), CAP, null); // shrink
 
   assert.equal(snap.size, 2000);
-  for (let k = 0; k < 2000; k++) assert.deepEqual(snap.get(key(k)), row(k));
+  for (let k = 0; k < 2000; k++) assert.deepEqual(snap.get(key(k), null), row(k));
   checkInvariants(snap);
   assert.equal(other.size, 2500);
-  assert.equal(other.get(key(0)), undefined);
-  assert.deepEqual(other.get(key(1000)), row(-1000));
-  assert.deepEqual(other.get(key(2500)), row(2500));
+  assert.equal(other.get(key(0), null), undefined);
+  assert.deepEqual(other.get(key(1000), null), row(-1000));
+  assert.deepEqual(other.get(key(2500), null), row(2500));
   checkInvariants(other);
 });
 
@@ -136,11 +136,11 @@ test("pmap: clone is an independent snapshot", () => {
 test("pmap: wide values keep nodes valid", () => {
   const pm = new PMap();
   for (const k of shuffled(300)) {
-    pm.insert(key(k), row(k), 110, CAP);
+    pm.insert(key(k), row(k), 110, CAP, null);
     checkInvariants(pm);
   }
   for (const k of shuffled(300)) {
-    pm.remove(key(k), CAP);
+    pm.remove(key(k), CAP, null);
     checkInvariants(pm);
   }
   assert.equal(pm.size, 0);
@@ -149,10 +149,10 @@ test("pmap: wide values keep nodes valid", () => {
 test("pmap: empty and single", () => {
   const pm = new PMap();
   assert.equal(pm.size, 0);
-  assert.equal(pm.get(key(1)), undefined);
-  assert.equal(pm.remove(key(1), CAP), undefined);
-  assert.equal(pm.insert(key(1), row(1), W, CAP), undefined);
-  assert.deepEqual(pm.get(key(1)), row(1));
-  assert.deepEqual(pm.remove(key(1), CAP), row(1));
+  assert.equal(pm.get(key(1), null), undefined);
+  assert.equal(pm.remove(key(1), CAP, null), undefined);
+  assert.equal(pm.insert(key(1), row(1), W, CAP, null), undefined);
+  assert.deepEqual(pm.get(key(1), null), row(1));
+  assert.deepEqual(pm.remove(key(1), CAP, null), row(1));
   assert.equal(pm.size, 0);
 });

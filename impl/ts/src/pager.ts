@@ -8,7 +8,7 @@
 // The bounded buffer pool + lazy node loading that make the resident set bounded (P6.4b) read through
 // this same readBlock.
 
-import { closeSync, fstatSync, fsyncSync, readSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, readSync, writeSync } from "node:fs";
 
 import { engineError } from "./errors.ts";
 
@@ -39,11 +39,6 @@ export class Pager {
     return new Pager(fd, pageSize);
   }
 
-  // blockCount is the number of whole pages the backing currently holds (fileLen / pageSize).
-  blockCount(): number {
-    return Math.floor(fstatSync(this.fd).size / this.pageSize);
-  }
-
   // readBlock reads one page (block index) — random access, the demand-paging read path (P6.4b).
   readBlock(index: number): Uint8Array {
     const buf = new Uint8Array(this.pageSize);
@@ -66,17 +61,5 @@ export class Pager {
   // close closes the open fd (close()).
   close(): void {
     closeSync(this.fd);
-  }
-
-  // readAll assembles the whole image, page by page through readBlock — the P6.4a load path (routes
-  // the whole-image load through the seam without changing residency; P6.4b reads only the reachable
-  // pages, on demand, instead).
-  readAll(): Uint8Array {
-    const count = this.blockCount();
-    const image = new Uint8Array(count * this.pageSize);
-    for (let i = 0; i < count; i++) {
-      image.set(this.readBlock(i), i * this.pageSize);
-    }
-    return image;
   }
 }

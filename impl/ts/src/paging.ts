@@ -1,0 +1,75 @@
+// Shared paging context for a file-backed database (spec/design/pager.md §2/§3): the open pager plus
+// the bounded leaf BufferPool, shared by every table store and snapshot of one database. Page ids are
+// file-global (one page space per file), so there is exactly ONE pool and one pager per database; a
+// TableStore/Snapshot clone shares the same SharedPaging reference.
+//
+// The read path faults a clean leaf through faultLeaf: a pool hit returns the cached node, a miss
+// reads the page through the pager, decodes it (the node codec, format.ts) and caches it, evicting
+// under CLOCK when full. No pins (pager.md §4): eviction only drops the cache entry, and a clean leaf
+// is immutable so any node still referenced stays alive (GC) and a re-load is a harmless duplicate.
+//
+// Not a §8 byte contract (pager.md §3): the pool changes WHEN a page is resident, never WHAT a query
+// observes — so each core realizes it idiomatically (like P5.3's per-core concurrency). JS is
+// single-threaded, so unlike the Rust/Go cores this needs no lock between the read and commit paths.
+
+import type { ScalarType } from "./types.ts";
+import type { PNode } from "./pmap.ts";
+import { BufferPool } from "./bufferpool.ts";
+import { decodeLeafNode } from "./format.ts";
+import { Pager } from "./pager.ts";
+
+// DEFAULT_LEAF_POOL_PAGES is the default resident-leaf budget (pages). A handle-level memory-budget
+// API is P6.4c; until then this bounds the resident leaf set for every file-backed database. Sized so
+// a modest working set stays cache-resident while a larger-than-RAM file still pages within the bound.
+export const DEFAULT_LEAF_POOL_PAGES = 1024;
+
+// SharedPaging is one database's pager + leaf buffer pool, shared (reference) by all its stores and
+// snapshots.
+export class SharedPaging {
+  private pager: Pager;
+  private pool: BufferPool;
+
+  constructor(pager: Pager, capacity: number) {
+    this.pager = pager;
+    this.pool = new BufferPool(capacity);
+  }
+
+  // faultLeaf faults the clean leaf at page to a resident node, through the buffer pool: a hit returns
+  // the cached node, a miss reads + decodes the page (with this table's colTypes) and caches it,
+  // evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global page id
+  // with a caller-supplied decoder is consistent (pager.md §4).
+  faultLeaf(page: number, colTypes: ScalarType[]): PNode {
+    return this.pool.getOrLoad(page, () => decodeLeafNode(this.pager.readBlock(page), page, colTypes));
+  }
+
+  // readBlock reads one page through the pager — the demand-paged loader reads the meta, catalog, and
+  // interior skeleton this way (format.ts loadDatabasePaged).
+  readBlock(index: number): Uint8Array {
+    return this.pager.readBlock(index);
+  }
+
+  // writeBlock / sync / close drive the commit write path (file.ts persistImpl) and handle release.
+  writeBlock(index: number, bytes: Uint8Array): void {
+    this.pager.writeBlock(index, bytes);
+  }
+
+  sync(): void {
+    this.pager.sync();
+  }
+
+  close(): void {
+    this.pager.close();
+  }
+
+  // pageSize is fixed into the file's meta header (format.md) — the block width the loader reads at.
+  pageSize(): number {
+    return this.pager.pageSize;
+  }
+
+  // residentLeaves is the number of leaf pages currently resident in the pool — the bound the
+  // demand-paging tests assert stays below the budget even for a database far larger than it. P6.4c
+  // promotes it to the public memory-budget surface.
+  residentLeaves(): number {
+    return this.pool.resident();
+  }
+}

@@ -24,9 +24,41 @@ export type PNode = {
   keys: Uint8Array[];
   vals: Row[];
   weights: number[];
-  children: PNode[];
+  children: Child[];
   page: number;
 };
+
+// A B-tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md §4) a
+// clean leaf need not be resident: an interior node keeps an OnDisk page id for such a child and the
+// read path faults it through the buffer pool on access. node !== null ⇒ resident (a dirty node, a
+// resident interior skeleton node, or a materialized leaf); node === null ⇒ OnDisk(page) — always a
+// leaf, since only leaves page, which is what lets nodeCount avoid loading them. An in-memory database
+// constructs only resident refs.
+export type Child = { node: PNode | null; page: number };
+
+export function residentRef(n: PNode): Child {
+  return { node: n, page: 0 };
+}
+export function onDiskRef(page: number): Child {
+  return { node: null, page };
+}
+
+// LeafSource faults a clean leaf page to a resident node on demand (pager.md §4) — the buffer pool,
+// behind the table's column types. Defined here so the B-tree traversal can fault without importing
+// the storage/format layers (they implement it); a fully-resident in-memory database passes null and
+// never faults.
+export interface LeafSource {
+  loadLeaf(page: number): PNode;
+}
+
+// resolveChild resolves c to a resident node, faulting an OnDisk leaf through src. A resident ref
+// returns its node directly; an OnDisk leaf with no source is an internal wiring bug (an in-memory
+// tree builds no OnDisk ref, and every file-backed traversal supplies a source), so it throws.
+function resolveChild(c: Child, src: LeafSource | null): PNode {
+  if (c.node !== null) return c.node;
+  if (src === null) throw new Error(`demand-paged leaf ${c.page} reached with no buffer-pool source`);
+  return src.loadLeaf(c.page);
+}
 
 function isLeaf(n: PNode): boolean {
   return n.children.length === 0;
@@ -88,14 +120,15 @@ export class PMap {
     return this.root;
   }
 
-  // get looks up the row at key.
-  get(key: Uint8Array): Row | undefined {
+  // get looks up the row at key. src faults an OnDisk leaf on the descent (null for a fully-resident
+  // in-memory tree); an I/O error propagates as a thrown EngineError.
+  get(key: Uint8Array, src: LeafSource | null): Row | undefined {
     let n = this.root;
     while (n !== null) {
       const { index, found } = search(n, key);
       if (found) return n.vals[index];
       if (isLeaf(n)) return undefined;
-      n = n.children[index];
+      n = resolveChild(n.children[index], src);
     }
     return undefined;
   }
@@ -104,34 +137,43 @@ export class PMap {
   // capacity. Returns the previous row if key was present (an overwrite, size unchanged), else
   // undefined (a new insert, which grows the size). An overwrite can change the weight, so it too
   // may overflow and split.
-  insert(key: Uint8Array, val: Row, weight: number, cap: number): Row | undefined {
+  insert(key: Uint8Array, val: Row, weight: number, cap: number, src: LeafSource | null): Row | undefined {
     if (this.root === null) {
       this.root = { keys: [key], vals: [val], weights: [weight], children: [], page: 0 };
       this.length++;
       return undefined;
     }
     const ctx: InsCtx = { old: undefined, replaced: false };
-    const out = nodeInsert(this.root, key, val, weight, ctx, cap);
+    const out = nodeInsert(this.root, key, val, weight, ctx, src, cap);
     this.root =
       out.whole !== null
         ? out.whole
-        : { keys: [out.midK], vals: [out.midV], weights: [out.midW], children: [out.left, out.right], page: 0 };
+        : {
+            keys: [out.midK],
+            vals: [out.midV],
+            weights: [out.midW],
+            children: [residentRef(out.left), residentRef(out.right)],
+            page: 0,
+          };
     if (!ctx.replaced) this.length++;
     return ctx.old;
   }
 
   // remove deletes key. Returns the removed row, or undefined if absent (then the map is unchanged).
-  // cap is the page payload capacity (the rebalance threshold).
-  remove(key: Uint8Array, cap: number): Row | undefined {
+  // cap is the page payload capacity (the rebalance threshold). src faults OnDisk leaves the delete
+  // descends into / rebalances against (spec/design/pager.md §4).
+  remove(key: Uint8Array, cap: number, src: LeafSource | null): Row | undefined {
     if (this.root === null) return undefined;
-    const res = nodeRemove(this.root, key, cap);
+    const res = nodeRemove(this.root, key, src, cap);
     if (!res.ok) return undefined;
     const newRoot = res.node;
     // The root may have drained to zero keys: an empty leaf becomes the empty map; an empty internal
     // node (one child) hands the root down a level (height shrinks). The root is exempt from the
     // underfull rule, so no rebalance here.
     if (newRoot.keys.length === 0) {
-      this.root = isLeaf(newRoot) ? null : newRoot.children[0];
+      // The lone surviving child becomes the new root — fault it if it is an OnDisk leaf (a tree of
+      // height 2 can collapse to its single bottom child).
+      this.root = isLeaf(newRoot) ? null : resolveChild(newRoot.children[0], src);
     } else {
       this.root = newRoot;
     }
@@ -141,7 +183,10 @@ export class PMap {
 
   // inorder returns all (key, row) pairs in ascending key order. Eager (the cost contract charges
   // per row in the executor loop, not here — spec/design/cost.md), so laziness is unobservable.
-  inorder(): { keys: Uint8Array[]; vals: Row[] } {
+  // inorder returns all (key, row) pairs in ascending key order. Eager; src faults each OnDisk leaf
+  // through the pool, and the faulted node is dropped (GC) once its rows are collected, so the
+  // resident leaf set stays bounded by the pool, not the tree (pager.md §4).
+  inorder(src: LeafSource | null): { keys: Uint8Array[]; vals: Row[] } {
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
     const walk = (n: PNode | null): void => {
@@ -154,11 +199,11 @@ export class PMap {
         return;
       }
       for (let i = 0; i < n.keys.length; i++) {
-        walk(n.children[i]);
+        walk(resolveChild(n.children[i], src));
         keys.push(n.keys[i]);
         vals.push(n.vals[i]);
       }
-      walk(n.children[n.keys.length]);
+      walk(resolveChild(n.children[n.keys.length], src));
     };
     walk(this.root);
     return { keys, vals };
@@ -172,7 +217,10 @@ export class PMap {
     const count = (n: PNode | null): number => {
       if (n === null) return 0;
       let total = 1;
-      for (const c of n.children) total += count(c);
+      // A resident child is counted recursively; an OnDisk child is a clean leaf (only leaves page —
+      // pager.md §1/§4), counted as one node WITHOUT loading it — the resident-interior-skeleton
+      // dividend that keeps cost identical to P6.3 (pager.md §5).
+      for (const c of n.children) total += c.node !== null ? count(c.node) : 1;
       return total;
     };
     return count(this.root);
@@ -194,7 +242,7 @@ type InsOut =
 // one median. The split point m = min(largest m in [1,N-1] with leftpayload(m) ≤ cap, N-2) always
 // yields two non-empty, fitting halves under RECORD_MAX = (cap-12)/2 (format.md). The < 3 guard is
 // defensive against an oversized record — the oversize surfaces as 0A000 at serialize (format.ts).
-function build(keys: Uint8Array[], vals: Row[], weights: number[], children: PNode[], cap: number): InsOut {
+function build(keys: Uint8Array[], vals: Row[], weights: number[], children: Child[], cap: number): InsOut {
   const interior = children.length > 0;
   let total = 0;
   for (const w of weights) total += w;
@@ -239,7 +287,15 @@ function build(keys: Uint8Array[], vals: Row[], weights: number[], children: PNo
 // nodeInsert is the recursive insert. On overwrite it sets ctx and rebuilds the path with the
 // value+weight replaced (which may now overflow). On a new key it inserts into the leaf and splits
 // overflowing nodes back up the path.
-function nodeInsert(n: PNode, key: Uint8Array, val: Row, weight: number, ctx: InsCtx, cap: number): InsOut {
+function nodeInsert(
+  n: PNode,
+  key: Uint8Array,
+  val: Row,
+  weight: number,
+  ctx: InsCtx,
+  src: LeafSource | null,
+  cap: number,
+): InsOut {
   const { index, found } = search(n, key);
   if (found) {
     const vals = n.vals.slice();
@@ -253,24 +309,27 @@ function nodeInsert(n: PNode, key: Uint8Array, val: Row, weight: number, ctx: In
   if (isLeaf(n)) {
     return build(insertAt(n.keys, index, key), insertAt(n.vals, index, val), insertAt(n.weights, index, weight), [], cap);
   }
-  const child = nodeInsert(n.children[index], key, val, weight, ctx, cap);
-  if (child.whole !== null) {
+  // Fault the target child (a resident interior, or an OnDisk leaf brought in for mutation — it
+  // becomes a dirty resident node on the rebuilt path).
+  const sub = nodeInsert(resolveChild(n.children[index], src), key, val, weight, ctx, src, cap);
+  if (sub.whole !== null) {
     const children = n.children.slice();
-    children[index] = child.whole;
+    children[index] = residentRef(sub.whole);
     return { whole: { keys: n.keys.slice(), vals: n.vals.slice(), weights: n.weights.slice(), children, page: 0 } };
   }
-  const keys = insertAt(n.keys, index, child.midK);
-  const vals = insertAt(n.vals, index, child.midV);
-  const weights = insertAt(n.weights, index, child.midW);
+  const keys = insertAt(n.keys, index, sub.midK);
+  const vals = insertAt(n.vals, index, sub.midV);
+  const weights = insertAt(n.weights, index, sub.midW);
   let children = n.children.slice();
-  children[index] = child.left;
-  children = insertAt(children, index + 1, child.right);
+  children[index] = residentRef(sub.left);
+  children = insertAt(children, index + 1, residentRef(sub.right));
   return build(keys, vals, weights, children, cap);
 }
 
-// maxKV is the rightmost (largest) entry of a subtree — its in-order predecessor.
-function maxKV(n: PNode): { key: Uint8Array; val: Row; weight: number } {
-  while (!isLeaf(n)) n = n.children[n.children.length - 1];
+// maxKV is the rightmost (largest) entry of a subtree — its in-order predecessor. Faults the rightmost
+// leaf through src if it is OnDisk.
+function maxKV(n: PNode, src: LeafSource | null): { key: Uint8Array; val: Row; weight: number } {
+  while (!isLeaf(n)) n = resolveChild(n.children[n.children.length - 1], src);
   const i = n.keys.length - 1;
   return { key: n.keys[i], val: n.vals[i], weight: n.weights[i] };
 }
@@ -281,7 +340,7 @@ type RemOut = { ok: boolean; node: PNode; removed: Row | undefined };
 // underfull — the caller rebalances it) and the removed row. A separator found in an interior node
 // is replaced by its in-order predecessor (drawn from the left subtree), which is then deleted from
 // that subtree; the touched child is rebalanced via rebalanceChild.
-function nodeRemove(n: PNode, key: Uint8Array, cap: number): RemOut {
+function nodeRemove(n: PNode, key: Uint8Array, src: LeafSource | null, cap: number): RemOut {
   const { index, found } = search(n, key);
   if (found) {
     if (isLeaf(n)) {
@@ -293,8 +352,10 @@ function nodeRemove(n: PNode, key: Uint8Array, cap: number): RemOut {
       };
     }
     const removed = n.vals[index];
-    const pred = maxKV(n.children[index]);
-    const child = nodeRemove(n.children[index], pred.key, cap).node;
+    // Fault the left subtree once; both the predecessor lookup and its deletion descend it.
+    const leftChild = resolveChild(n.children[index], src);
+    const pred = maxKV(leftChild, src);
+    const child = nodeRemove(leftChild, pred.key, src, cap).node;
     const keys = n.keys.slice();
     const vals = n.vals.slice();
     const weights = n.weights.slice();
@@ -302,42 +363,45 @@ function nodeRemove(n: PNode, key: Uint8Array, cap: number): RemOut {
     keys[index] = pred.key;
     vals[index] = pred.val;
     weights[index] = pred.weight;
-    children[index] = child;
+    children[index] = residentRef(child);
     const rebuilt: PNode = { keys, vals, weights, children, page: 0 };
-    return { ok: true, node: rebalanceChild(rebuilt, index, cap), removed };
+    return { ok: true, node: rebalanceChild(rebuilt, index, src, cap), removed };
   }
   if (isLeaf(n)) {
     return { ok: false, node: n, removed: undefined };
   }
-  const res = nodeRemove(n.children[index], key, cap);
+  const res = nodeRemove(resolveChild(n.children[index], src), key, src, cap);
   if (!res.ok) return { ok: false, node: n, removed: undefined };
   const children = n.children.slice();
-  children[index] = res.node;
+  children[index] = residentRef(res.node);
   const rebuilt: PNode = { keys: n.keys.slice(), vals: n.vals.slice(), weights: n.weights.slice(), children, page: 0 };
-  return { ok: true, node: rebalanceChild(rebuilt, index, cap), removed: res.removed };
+  return { ok: true, node: rebalanceChild(rebuilt, index, src, cap), removed: res.removed };
 }
 
 // rebalanceChild: if children[i] is underfull (payload < cap/2), merge it with an adjacent sibling
 // (prefer the right one), then split the merged node back if it overflows — the unified rebalance
 // (no borrow). The returned parent may itself have lost a key and become underfull; its own parent
 // handles that as the recursion unwinds.
-function rebalanceChild(n: PNode, i: number, cap: number): PNode {
-  if (payload(n.children[i]) >= cap / 2) return n;
+function rebalanceChild(n: PNode, i: number, src: LeafSource | null, cap: number): PNode {
+  // children[i] was just rebuilt resident by nodeRemove, so inspecting it faults nothing.
+  if (payload(resolveChild(n.children[i], src)) >= cap / 2) return n;
   const j = i + 1 < n.children.length ? i : i - 1;
-  return mergeAt(n, j, cap);
+  return mergeAt(n, j, src, cap);
 }
 
 // mergeAt merges children[j], separator j, and children[j+1] into one node M. If M fits, it replaces
 // the pair and the parent loses separator j and child j+1. If M overflows, it is split 2-way and the
 // two halves + the new separator replace the pair (the parent's key count is unchanged). M < 2·cap
 // always (format.md), so a single split restores fit.
-function mergeAt(n: PNode, j: number, cap: number): PNode {
-  const left = n.children[j];
-  const right = n.children[j + 1];
+function mergeAt(n: PNode, j: number, src: LeafSource | null, cap: number): PNode {
+  // Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
+  // still be an OnDisk leaf the delete never touched.
+  const left = resolveChild(n.children[j], src);
+  const right = resolveChild(n.children[j + 1], src);
   const mkeys = [...left.keys, n.keys[j], ...right.keys];
   const mvals = [...left.vals, n.vals[j], ...right.vals];
   const mweights = [...left.weights, n.weights[j], ...right.weights];
-  const mchildren = isLeaf(left) ? [] : [...left.children, ...right.children];
+  const mchildren: Child[] = isLeaf(left) ? [] : [...left.children, ...right.children];
 
   const keys = n.keys.slice();
   const vals = n.vals.slice();
@@ -349,15 +413,15 @@ function mergeAt(n: PNode, j: number, cap: number): PNode {
     keys.splice(j, 1);
     vals.splice(j, 1);
     weights.splice(j, 1);
-    children[j] = out.whole;
+    children[j] = residentRef(out.whole);
     children.splice(j + 1, 1);
     return { keys, vals, weights, children, page: 0 };
   }
   keys[j] = out.midK;
   vals[j] = out.midV;
   weights[j] = out.midW;
-  children[j] = out.left;
-  children[j + 1] = out.right;
+  children[j] = residentRef(out.left);
+  children[j + 1] = residentRef(out.right);
   return { keys, vals, weights, children, page: 0 };
 }
 

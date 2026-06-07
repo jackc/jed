@@ -10,7 +10,8 @@ import { dirname } from "node:path";
 
 import { DEFAULT_PAGE_SIZE, Database, Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
-import { incrementalImage, loadDatabase, metaPage, toImage } from "./format.ts";
+import { incrementalImage, loadDatabasePaged, metaPage, toImage } from "./format.ts";
+import { DEFAULT_LEAF_POOL_PAGES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
@@ -30,15 +31,16 @@ export function create(path: string, opts: DatabaseOptions = {}): Database {
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
   db.persistHook = persistImpl; // publish each later commit incrementally (transactions.md §4.1/§9)
   writeFullImage(db); // lay down the from-scratch image; later commits are incremental
-  // Adopt the just-written file as the open pager, so later commits write through the seam without
-  // re-opening (spec/design/pager.md, P6.4a).
+  // Adopt the just-written file as the open pager + buffer pool, so later commits write through the
+  // seam without re-opening (spec/design/pager.md). A freshly-created database has no rows, so nothing
+  // is OnDisk yet — tables built in this session stay resident until a reopen demand-pages them.
   let fd: number;
   try {
     fd = openSync(path, "r+");
   } catch (e) {
     throw ioError(e);
   }
-  db.pager = Pager.fromFd(fd); // the just-written file has a valid header
+  db.paging = new SharedPaging(Pager.fromFd(fd), DEFAULT_LEAF_POOL_PAGES); // the file has a valid header
   return db;
 }
 
@@ -57,12 +59,20 @@ function writeFullImage(db: Database): void {
 // its page size / txid). The path must exist — 58P01 otherwise; a malformed file is XX001, a read
 // failure 58030 (api.md §2).
 export function open(path: string): Database {
+  return openWithCapacity(path, DEFAULT_LEAF_POOL_PAGES);
+}
+
+// openWithCapacity opens an existing file-backed database with an explicit resident-leaf budget (the
+// buffer-pool capacity, in pages) — the budget the handle-level memory-budget API (P6.4c) will expose;
+// for now open uses the default and the demand-paging tests use a small one.
+export function openWithCapacity(path: string, capacity: number): Database {
   if (!existsSync(path)) {
     throw engineError("undefined_file", "database file does not exist: " + path);
   }
-  // Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the load
-  // reads pages through the pager (P6.4a routes the whole-image load via readAll; the tree is still
-  // fully built — no residency change), and later commits write through it.
+  // Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the
+  // demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf through
+  // the bounded buffer pool on access, so the resident set is bounded by the pool, not the file size
+  // (P6.4b). Later commits write through the same pager.
   let fd: number;
   try {
     fd = openSync(path, "r+");
@@ -70,11 +80,9 @@ export function open(path: string): Database {
     throw ioError(e);
   }
   try {
-    const pager = Pager.fromFd(fd);
-    const db = loadDatabase(pager.readAll());
+    const db = loadDatabasePaged(new SharedPaging(Pager.fromFd(fd), capacity));
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
-    db.pager = pager;
     return db;
   } catch (e) {
     closeSync(fd); // a malformed file / read failure must not leak the fd
@@ -94,18 +102,26 @@ export function open(path: string): Database {
 // only after both fsyncs succeed, so a write failure leaves db, committed, and the file's prior meta
 // untouched (the working snapshot is then discarded). The future synchronous=off mode gates here.
 function persistImpl(db: Database, snap: Snapshot): void {
-  // An in-memory database has no pager — a no-op success (committed swaps in commitTx after this).
-  if (db.pager === null) return;
+  // An in-memory database has no paging context — a no-op success (committed swaps in commitTx after
+  // this). JS is single-threaded, so the read (fault) and this commit-write path never overlap.
+  if (db.paging === null) return;
   const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages);
   for (const pg of write.pages) {
-    db.pager.writeBlock(pg.index, pg.bytes);
+    db.paging.writeBlock(pg.index, pg.bytes);
   }
-  db.pager.sync(); // body pages durable before the meta can reference them
+  db.paging.sync(); // body pages durable before the meta can reference them
   const meta = metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount);
-  db.pager.writeBlock(Number(snap.txid & 1n), meta);
-  db.pager.sync(); // the commit is published
+  db.paging.writeBlock(Number(snap.txid & 1n), meta);
+  db.paging.sync(); // the commit is published
   db.pageCount = write.pageCount;
   db.freePages = write.freeRemaining;
+}
+
+// residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
+// in-memory database. The demand-paging tests assert this stays within the pool budget even for a
+// database whose data far exceeds it (spec/design/pager.md §3); P6.4c promotes it to the public surface.
+export function residentLeaves(db: Database): number {
+  return db.paging === null ? 0 : db.paging.residentLeaves();
 }
 
 // commit commits the current transaction (spec/design/api.md §2.2, transactions.md §4.2).
@@ -130,9 +146,9 @@ export function rollback(db: Database): void {
 export function close(db: Database): void {
   db.rollbackTx();
   db.path = null;
-  if (db.pager !== null) {
-    db.pager.close(); // drop the open fd (close it)
-    db.pager = null;
+  if (db.paging !== null) {
+    db.paging.close(); // drop the open fd (close it)
+    db.paging = null;
   }
 }
 

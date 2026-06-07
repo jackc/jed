@@ -29,7 +29,7 @@ import { COSTS } from "./costs.ts";
 import { Decimal, MAX_PRECISION, MAX_SCALE } from "./decimal.ts";
 import { encodeInt } from "./encoding.ts";
 import { type EngineError, engineError } from "./errors.ts";
-import type { Pager } from "./pager.ts";
+import type { SharedPaging } from "./paging.ts";
 import { type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -200,11 +200,12 @@ export class Database {
   // is called by commitTx with the working snapshot being published (transactions.md §4.1/§9).
   // Injecting it here keeps the executor free of a file-module dependency (no executor→file cycle).
   persistHook: ((db: Database, snap: Snapshot) => void) | null;
-  // pager is the block-device pager for a file-backed database — the open file kept for the handle's
-  // life, through which the load and every commit read/write pages (spec/design/pager.md, P6.4a).
-  // null for an in-memory database (persistHook is then null too); set by file.ts open/create,
-  // dropped by close. A type-only import keeps the executor free of a file-module dependency.
-  pager: Pager | null;
+  // paging is the shared paging context for a file-backed database (spec/design/pager.md): the open
+  // pager (kept for the handle's life) + the bounded leaf buffer pool, shared with every table store
+  // so reads fault OnDisk leaves through the one pool. The load reads pages through it and every commit
+  // writes through it. null for an in-memory database (persistHook is then null too); set by file.ts
+  // open/create, dropped by close. A type-only import keeps the executor free of a file-module dependency.
+  paging: SharedPaging | null;
 
   constructor() {
     this.committed = new Snapshot();
@@ -214,7 +215,7 @@ export class Database {
     this.pageCount = 0;
     this.freePages = [];
     this.persistHook = null;
-    this.pager = null;
+    this.paging = null;
   }
 
   // readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
