@@ -22,7 +22,7 @@ INSERT INTO y VALUES (1, 10), (2, 20)
 # 3 x 2 = 6 pairs, every pair kept. 3 + 2 materialized (5 storage_row_read) + 6 produced = 11
 # (the cost.md §3 worked example). No ON, so no operator_eval; projection is bare columns.
 # names: id, id
-# cost: 11
+# cost: 13
 query II nosort
 SELECT x.id, y.id FROM x CROSS JOIN y ORDER BY x.id, y.id
 ----
@@ -41,7 +41,7 @@ SELECT x.id, y.id FROM x CROSS JOIN y ORDER BY x.id, y.id
 
 # An empty right table makes the product empty. 3 + 0 materialized + 0 produced = 3.
 # names: id, id
-# cost: 3
+# cost: 4
 query II nosort
 SELECT x.id, z.id FROM x CROSS JOIN z
 ----
@@ -49,7 +49,7 @@ SELECT x.id, z.id FROM x CROSS JOIN z
 # WHERE applies after the product. 6 combined rows, `x.v = 200` evaluated on each (6) keeps the
 # two y-pairs of x row 2. 5 materialize + 0 ON + 6 WHERE + 2 produced = 13.
 # names: v, w
-# cost: 13
+# cost: 15
 query II nosort
 SELECT x.v, y.w FROM x CROSS JOIN y WHERE x.v = 200 ORDER BY y.w
 ----

@@ -29,7 +29,7 @@ INSERT INTO t VALUES (5, 50)
 # LIMIT n returns the first n rows of the ordered result. 5 scanned + 2 produced = 7;
 # the 3 rows past the LIMIT are scanned but not produced.
 # names: id
-# cost: 7
+# cost: 8
 query I nosort
 SELECT id FROM t ORDER BY id LIMIT 2
 ----
@@ -38,7 +38,7 @@ SELECT id FROM t ORDER BY id LIMIT 2
 
 # OFFSET m skips m rows, then LIMIT n takes the next n. 5 scanned + 2 produced = 7.
 # names: id
-# cost: 7
+# cost: 8
 query I nosort
 SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1
 ----
@@ -47,7 +47,7 @@ SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1
 
 # The two clauses commute: OFFSET-before-LIMIT is the same window as LIMIT-before-OFFSET.
 # names: id
-# cost: 7
+# cost: 8
 query I nosort
 SELECT id FROM t ORDER BY id OFFSET 1 LIMIT 2
 ----
@@ -56,7 +56,7 @@ SELECT id FROM t ORDER BY id OFFSET 1 LIMIT 2
 
 # OFFSET without LIMIT skips the leading rows and returns the rest. 5 scanned + 2 produced = 7.
 # names: id
-# cost: 7
+# cost: 8
 query I nosort
 SELECT id FROM t ORDER BY id OFFSET 3
 ----
@@ -65,21 +65,21 @@ SELECT id FROM t ORDER BY id OFFSET 3
 
 # LIMIT 0 is valid and yields the empty result: 5 scanned + 0 produced = 5 (no row_produced).
 # names: id
-# cost: 5
+# cost: 6
 query I nosort
 SELECT id FROM t ORDER BY id LIMIT 0
 ----
 
 # OFFSET past the end yields the empty result, still scanning every row: 5 + 0 = 5.
 # names: id
-# cost: 5
+# cost: 6
 query I nosort
 SELECT id FROM t ORDER BY id OFFSET 10
 ----
 
 # A LIMIT larger than the row count returns every row (clamped, not an error): 5 + 5 = 10.
 # names: id
-# cost: 10
+# cost: 11
 query I nosort
 SELECT id FROM t ORDER BY id LIMIT 100
 ----
@@ -92,7 +92,7 @@ SELECT id FROM t ORDER BY id LIMIT 100
 # LIMIT after a WHERE + ORDER BY: the filter runs on every scanned row (one `>=` compare each,
 # even the rows the LIMIT later drops). 5 scanned + 5 filter + 2 produced = 12.
 # names: id
-# cost: 12
+# cost: 13
 query I nosort
 SELECT id FROM t WHERE id >= 2 ORDER BY id LIMIT 2
 ----
@@ -103,7 +103,7 @@ SELECT id FROM t WHERE id >= 2 ORDER BY id LIMIT 2
 # an order-determining ORDER BY is required. ORDER BY id LIMIT 2 -> the two smallest ids. The
 # sort is unmetered (cost.md §3), so cost is unchanged: 5 scanned + 2 produced = 7.
 # names: id
-# cost: 7
+# cost: 8
 query I nosort
 SELECT id FROM t ORDER BY id LIMIT 2
 ----
@@ -113,7 +113,7 @@ SELECT id FROM t ORDER BY id LIMIT 2
 # LIMIT does not change output column naming: `*` still expands to canonical names. The single
 # windowed row is projected (id and val are leaves): 5 scanned + 1 produced = 6.
 # names: id, val
-# cost: 6
+# cost: 7
 query II nosort
 SELECT * FROM t ORDER BY id LIMIT 1
 ----

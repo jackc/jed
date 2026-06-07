@@ -28,7 +28,7 @@ INSERT INTO t3 VALUES (1, 10), (2, 20)
 # evaluates the subquery node (1 operator_eval) + its run: scan t2 (2) + `t2.v=t1.v` per t2 row (2
 # operator_eval) + row_produced per inner match (1 for v=10, 0 for v=20). So row1 = 1+(2+2+1)=6,
 # row2 = 1+(2+2+0)=5. Plus 1 row_produced for the surviving t1 row. 2+6+5+1 = 14.
-# cost: 14
+# cost: 17
 query I rowsort
 SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)
 ----
@@ -74,7 +74,7 @@ SELECT t1.id, (SELECT sum(t2.v + t1.v) FROM t2) FROM t1 ORDER BY t1.id
 # id=2: t2.id=2 -> {30}, 20 in -> no. Cost: scan t1 (2). Per t1 row the IN node (1 operator_eval)
 # runs its subquery [scan t2 (2) + `t2.id=t1.id` per row (2) + 1 produced = 5] then tests membership
 # (1 operator_eval per result element, 1 here). So each row = 1+5+1 = 7. Plus 1 row_produced. 2+7+7+1 = 17.
-# cost: 17
+# cost: 20
 query I rowsort
 SELECT t1.id FROM t1 WHERE t1.v IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id)
 ----

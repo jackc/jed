@@ -30,7 +30,7 @@ INSERT INTO b VALUES (10, 10, 'ten'), (20, 20, 'twenty'), (21, 20, 'twentyish'),
 # a.k=NULL → no b (preserved, NULL). The two unmatched a rows (id 3, 4) NULL-extend the b side.
 # A 4x4 nested loop: 4+4 materialized (8) + 16 ON `=` evals + 5 produced (3 matched + 2 extended) = 29.
 # names: id, label
-# cost: 29
+# cost: 31
 query IT nosort
 SELECT a.id, b.label FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id, b.id
 ----
@@ -48,7 +48,7 @@ NULL
 # SELECT * expands a(id, k) then b(id, k, label) — five columns. The two unmatched a rows carry
 # NULLs across all three b columns. 8 materialize + 16 ON + 5 produced = 29.
 # names: id, k, id, k, label
-# cost: 29
+# cost: 31
 query IIIIT nosort
 SELECT * FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id, b.id
 ----
@@ -83,7 +83,7 @@ NULL
 # match nothing and NULL-extend. ON has 3 interior nodes (and + two compares), 16 pairs → 48;
 # 8 materialize + 48 ON + 4 produced = 60.
 # names: id, id
-# cost: 60
+# cost: 62
 query II nosort
 SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND b.label = 'twenty' ORDER BY a.id, b.id
 ----
@@ -101,7 +101,7 @@ NULL
 # and a NULL-extended row's b.label is NULL → NULL='twenty' → dropped. Only a(2)↔b(20) survives.
 # 8 materialize + 16 ON + 5 WHERE + 1 produced = 30.
 # names: id, id
-# cost: 30
+# cost: 32
 query II nosort
 SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.id, b.id
 ----
@@ -112,7 +112,7 @@ SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER
 # 5 combined rows; `b.id IS NULL` (1 is_null) on each (5) keeps the two NULL-extended rows (a id 3,4).
 # 8 materialize + 16 ON + 5 WHERE + 2 produced = 31.
 # names: id
-# cost: 31
+# cost: 33
 query I nosort
 SELECT a.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.id IS NULL ORDER BY a.id
 ----
@@ -123,7 +123,7 @@ SELECT a.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.id IS NULL ORDER BY a.id
 # scope, not a sampled right row, so an empty right side does not crash). The 4x0 loop evaluates
 # the ON zero times. 4+0 materialize + 0 ON + 4 produced = 8.
 # names: id, v
-# cost: 8
+# cost: 9
 query II nosort
 SELECT a.id, empt.v FROM a LEFT JOIN empt ON a.k = empt.v ORDER BY a.id
 ----

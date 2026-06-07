@@ -128,10 +128,10 @@ func TestSubqueryCostAddedOnce(t *testing.T) {
 	db := subqueryAB(t)
 	base, _ := Execute(db, "SELECT id FROM a WHERE k = 999")
 	withSub, _ := Execute(db, "SELECT id FROM a WHERE k = (SELECT max(k) FROM b)")
-	// The folded constant is a leaf, so the only delta is the subquery's own cost (3 scan + 3
-	// accumulate + 1 produced = 7), added exactly once.
-	if d := withSub.Cost - base.Cost; d != 7 {
-		t.Errorf("subquery cost delta got %d want 7", d)
+	// The folded constant is a leaf, so the only delta is the subquery's own cost (1 page_read +
+	// 3 scan + 3 accumulate + 1 produced = 8), added exactly once.
+	if d := withSub.Cost - base.Cost; d != 8 {
+		t.Errorf("subquery cost delta got %d want 8", d)
 	}
 }
 
@@ -238,11 +238,12 @@ func TestCorrelatedOuterRefInAggregateArg(t *testing.T) {
 
 func TestCorrelatedSubqueryCostIsPerOuterRow(t *testing.T) {
 	db := t123DB(t)
-	// A correlated subquery re-runs once per outer row (unlike the uncorrelated fold-once). The
-	// derivation is in spec/conformance/suites/subquery/correlated.test (cost = 14).
+	// A correlated subquery re-runs once per outer row (unlike the uncorrelated fold-once), and
+	// each re-scan of the inner table charges its page_read too. The derivation is in
+	// spec/conformance/suites/subquery/correlated.test (cost = 17).
 	out, _ := Execute(db, "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)")
-	if out.Cost != 14 {
-		t.Errorf("correlated subquery cost got %d want 14", out.Cost)
+	if out.Cost != 17 {
+		t.Errorf("correlated subquery cost got %d want 17", out.Cost)
 	}
 }
 

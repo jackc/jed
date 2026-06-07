@@ -149,7 +149,7 @@ fn limit_caps_and_offset_skips() {
 #[test]
 fn limit_offset_window_reduces_produced_cost() {
     // The slice runs before projection, so only windowed rows charge row_produced:
-    // 5 scanned + 2 produced = 7 (spec/design/cost.md §3).
+    // 1 page_read (t is one leaf) + 5 scanned + 2 produced = 8 (spec/design/cost.md §3).
     let mut db = db_with(&[
         "CREATE TABLE t (id int32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1)",
@@ -161,7 +161,7 @@ fn limit_offset_window_reduces_produced_cost() {
     let cost = execute(&mut db, "SELECT id FROM t ORDER BY id LIMIT 2")
         .unwrap()
         .cost();
-    assert_eq!(cost, 7);
+    assert_eq!(cost, 8);
 }
 
 #[test]

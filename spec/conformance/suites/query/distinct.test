@@ -42,7 +42,7 @@ INSERT INTO t VALUES (5, NULL, NULL)
 # `a` is a bare column (a leaf) so projection charges no operator_eval: 5 scanned + 3
 # produced = 8.
 # names: a
-# cost: 8
+# cost: 9
 query I rowsort
 SELECT DISTINCT a FROM t
 ----
@@ -54,7 +54,7 @@ NULL
 # single NULL (NULL-safe equality, not three-valued `=`). Distinct values 5, 7, NULL (rowsort).
 # 5 scanned + 3 produced = 8.
 # names: b
-# cost: 8
+# cost: 9
 query I rowsort
 SELECT DISTINCT b FROM t
 ----
@@ -65,7 +65,7 @@ NULL
 # DISTINCT + ORDER BY (allowed — `a` is bare-projected). ASC defaults to NULLS LAST (the
 # PostgreSQL model, §10): 10, then 20, then NULL last. 5 scanned + 3 produced = 8.
 # names: a
-# cost: 8
+# cost: 9
 query I nosort
 SELECT DISTINCT a FROM t ORDER BY a
 ----
@@ -78,7 +78,7 @@ NULL
 # (10,5) duplicate (rows 1,2) collapses, and (NULL,NULL) sorts last. 5 scanned + 4
 # produced = 9.
 # names: a, b
-# cost: 9
+# cost: 10
 query II nosort
 SELECT DISTINCT a, b FROM t ORDER BY a
 ----
@@ -95,7 +95,7 @@ NULL
 # the projected output. `*` auto-satisfies the ORDER BY restriction. 5 scanned + 5
 # produced = 10.
 # names: id, a, b
-# cost: 10
+# cost: 11
 query III nosort
 SELECT DISTINCT * FROM t ORDER BY id
 ----
@@ -119,7 +119,7 @@ NULL
 # column, so the restriction passes. Orders by b ASC, default NULLS LAST: b=5 (rows 1,2),
 # then b=7 (row 3), then b NULL (rows 4,5). 5 scanned + 5 produced = 10.
 # names: id, a, b
-# cost: 10
+# cost: 11
 query III nosort
 SELECT DISTINCT * FROM t ORDER BY b
 ----
@@ -144,7 +144,7 @@ NULL
 # duplicates collapse. NULL + 0 is NULL. The un-aliased expression names the column ?column?.
 # 5 scanned + 5 projection operator_eval + 3 produced = 13.
 # names: ?column?
-# cost: 13
+# cost: 14
 query I rowsort
 SELECT DISTINCT a + 0 FROM t
 ----
@@ -156,7 +156,7 @@ NULL
 # 2..5, whose distinct `a` is 10, 20, NULL (rowsort — order not asserted). 5 scanned + 5 filter +
 # 3 produced = 13.
 # names: a
-# cost: 13
+# cost: 14
 query I rowsort
 SELECT DISTINCT a FROM t WHERE id >= 2
 ----
@@ -168,7 +168,7 @@ NULL
 # 10,20,NULL; OFFSET 1 LIMIT 1 yields just 20. Only the one emitted row charges
 # row_produced. 5 scanned + 1 produced = 6.
 # names: a
-# cost: 6
+# cost: 7
 query I nosort
 SELECT DISTINCT a FROM t ORDER BY a LIMIT 1 OFFSET 1
 ----
@@ -178,7 +178,7 @@ SELECT DISTINCT a FROM t ORDER BY a LIMIT 1 OFFSET 1
 # distinct booleans are false then NULL (the two unknowns collapse). One compare per filtered
 # row. 5 scanned + 5 projection operator_eval + 2 produced = 12.
 # names: ?column?
-# cost: 12
+# cost: 13
 query B rowsort
 SELECT DISTINCT a = b FROM t
 ----
@@ -189,7 +189,7 @@ NULL
 # column `a` (the alias `x` is invisible to ORDER BY, §8), so this is allowed and names the
 # column `x`. 5 scanned + 3 produced = 8.
 # names: x
-# cost: 8
+# cost: 9
 query I nosort
 SELECT DISTINCT a AS x FROM t ORDER BY a
 ----
@@ -219,7 +219,7 @@ statement ok
 INSERT INTO t2 VALUES (2, 12, 3)
 
 # names: x, y
-# cost: 4
+# cost: 5
 query II rowsort
 SELECT DISTINCT x, y FROM t2
 ----
@@ -250,7 +250,7 @@ SELECT DISTINCT 1 / c FROM t3 LIMIT 1
 # 1/2 = 0) is evaluated, so there is no division-by-zero. 3 scanned + 1 projection
 # operator_eval + 1 produced = 5.
 # names: ?column?
-# cost: 5
+# cost: 6
 query I nosort
 SELECT 1 / c FROM t3 ORDER BY id LIMIT 1
 ----
@@ -272,7 +272,7 @@ INSERT INTO tk VALUES (3, 200)
 # `SELECT distinct FROM tk`: the word before FROM is the COLUMN `distinct`, not the modifier
 # (two-token lookahead). No dedup — all three rows are returned. 3 scanned + 3 produced = 6.
 # names: distinct
-# cost: 6
+# cost: 7
 query I rowsort
 SELECT distinct FROM tk
 ----
@@ -283,7 +283,7 @@ SELECT distinct FROM tk
 # `SELECT DISTINCT distinct FROM tk`: the FIRST `distinct` is the modifier (next token is not
 # FROM), the second is the column. Now the 100s collapse. 3 scanned + 2 produced = 5.
 # names: distinct
-# cost: 5
+# cost: 6
 query I rowsort
 SELECT DISTINCT distinct FROM tk
 ----

@@ -269,14 +269,15 @@ fn exists_ignores_select_list() {
 #[test]
 fn cost_adds_the_subquery_once() {
     let mut db = ab();
-    // Baseline: scan a (3 storage_row_read) + filter `k = const` per row (3 operator_eval) +
-    // produce 0 rows (the const 40 matches nothing). The scalar subquery `(SELECT max(k) FROM b)`
-    // runs ONCE: scan b (3) + accumulate max over 3 rows (3) + produce 1 row (1) = 7.
+    // Baseline: 1 page_read (a) + scan a (3 storage_row_read) + filter `k = const` per row (3
+    // operator_eval) + produce 0 rows (the const 40 matches nothing). The scalar subquery
+    // `(SELECT max(k) FROM b)` runs ONCE: 1 page_read (b is one leaf) + scan b (3) + accumulate
+    // max over 3 rows (3) + produce 1 row (1) = 8.
     let base = cost(&mut db, "SELECT id FROM a WHERE k = 999");
     let with_sub = cost(&mut db, "SELECT id FROM a WHERE k = (SELECT max(k) FROM b)");
     // The folded constant is a leaf (no extra operator_eval), so the only delta is the
     // subquery's own cost — added exactly once, not once per outer row.
-    assert_eq!(with_sub - base, 7);
+    assert_eq!(with_sub - base, 8);
 }
 
 // ---- errors + narrowings --------------------------------------------------------------------
@@ -453,14 +454,15 @@ fn correlated_outer_ref_in_aggregate_arg() {
 #[test]
 fn correlated_subquery_cost_is_per_outer_row() {
     let mut db = t123();
-    // A correlated subquery re-runs once per outer row (unlike the uncorrelated fold-once). The
-    // derivation is in spec/conformance/suites/subquery/correlated.test (cost = 14).
+    // A correlated subquery re-runs once per outer row (unlike the uncorrelated fold-once), and
+    // each re-scan of the inner table charges its page_read too. The derivation is in
+    // spec/conformance/suites/subquery/correlated.test (cost = 17).
     assert_eq!(
         cost(
             &mut db,
             "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)"
         ),
-        14
+        17
     );
 }
 

@@ -19,7 +19,7 @@ INSERT INTO t2 VALUES (1, 100, 33), (2, 999, 44)
 # `only1` / `only2` each exist in exactly one relation, so they resolve UNQUALIFIED. The join
 # t1.shared = t2.shared matches only (t1.1, t2.1). 2 + 2 materialized (4) + 4 ON + 1 produced = 9.
 # names: only1, only2
-# cost: 9
+# cost: 11
 query II nosort
 SELECT only1, only2 FROM t1 JOIN t2 ON t1.shared = t2.shared ORDER BY only1
 ----
@@ -28,7 +28,7 @@ SELECT only1, only2 FROM t1 JOIN t2 ON t1.shared = t2.shared ORDER BY only1
 
 # Qualified `id` references resolve to their named relation (both tables have an `id`).
 # names: id, id
-# cost: 9
+# cost: 11
 query II nosort
 SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.shared = t2.shared
 ----
@@ -59,7 +59,7 @@ SELECT t1.nope FROM t1 JOIN t2 ON t1.shared = t2.shared
 # ordering by t2.shared DESC puts 999 (t1.id 2) before 100 (t1.id 1). 4 materialize + 4 ON +
 # 2 produced = 10 (the sort is unmetered).
 # names: id, shared
-# cost: 10
+# cost: 12
 query II nosort
 SELECT t1.id, t1.shared FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t2.shared DESC
 ----

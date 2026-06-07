@@ -19,7 +19,7 @@ INSERT INTO dept VALUES (10, 'eng'), (20, 'sales')
 # Explicit AS aliases; both tables have a `name` column, so the references MUST be qualified.
 # 3 + 2 materialized (5) + 6 ON `=` evals + 3 produced = 14.
 # names: name, name
-# cost: 14
+# cost: 16
 query TT nosort
 SELECT e.name, d.name FROM emp AS e JOIN dept AS d ON e.dept = d.id ORDER BY e.id
 ----
@@ -32,7 +32,7 @@ eng
 
 # Implicit aliases (no AS) — `emp e` / `dept d`. Identical result and cost.
 # names: name
-# cost: 14
+# cost: 16
 query T nosort
 SELECT e.name FROM emp e JOIN dept d ON e.dept = d.id ORDER BY e.id
 ----

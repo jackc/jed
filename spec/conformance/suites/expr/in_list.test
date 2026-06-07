@@ -45,7 +45,7 @@ NULL
 # In WHERE, only rows whose predicate is TRUE survive: a=10 and a=20 match; a=NULL is dropped
 # (UNKNOWN). Cost: 3 scanned, the desugared `Or(Eq(a,10),Eq(a,20))` is 3 interior nodes per
 # scanned row (1 or + 2 eq, leaf column/constant operands free) = 9, plus 2 produced = 14.
-# cost: 14
+# cost: 15
 query I nosort
 SELECT id FROM t WHERE a IN (10, 20) ORDER BY id
 ----

@@ -177,6 +177,25 @@ func (m *PMap) inorder() ([][]byte, []Row) {
 	return keys, vals
 }
 
+// nodeCount is the number of B-tree nodes (pages) in this tree — the page_read count a full scan
+// charges (spec/design/cost.md §3 "page_read"). A scan walks every node, so this is the structural
+// node count (interior + leaf); 0 for an empty map. Deterministic and byte-identical across cores
+// (the node boundaries are a §8 byte contract — format.md).
+func (m *PMap) nodeCount() int {
+	var count func(n *pnode) int
+	count = func(n *pnode) int {
+		if n == nil {
+			return 0
+		}
+		total := 1
+		for _, c := range n.children {
+			total += count(c)
+		}
+		return total
+	}
+	return count(m.root)
+}
+
 // insOut is the result of inserting into a subtree: a whole rebuilt node, or a split.
 type insOut struct {
 	whole *pnode // non-nil ⇒ no split

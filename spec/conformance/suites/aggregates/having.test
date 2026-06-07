@@ -16,7 +16,7 @@ INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 50)
 # 5 scanned + 2 specs x 5 accumulate (projected COUNT + HAVING COUNT) + 3 HAVING evals (one per
 # group) + 2 produced = 20.
 # names: g, count
-# cost: 20
+# cost: 21
 query II nosort
 SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 1 ORDER BY g
 ----
@@ -28,7 +28,7 @@ SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 1 ORDER BY g
 # HAVING on an aggregate NOT in the SELECT list: SUM(a) is computed only for the filter.
 # 5 scanned + 1 spec x 5 accumulate + 3 HAVING evals + 1 produced = 14.
 # names: g
-# cost: 14
+# cost: 15
 query I nosort
 SELECT g FROM t GROUP BY g HAVING SUM(a) > 60 ORDER BY g
 ----
@@ -37,7 +37,7 @@ SELECT g FROM t GROUP BY g HAVING SUM(a) > 60 ORDER BY g
 # HAVING with no GROUP BY filters the single whole-table group: 5 > 10 is false -> zero rows.
 # 5 scanned + 2 specs x 5 accumulate + 1 HAVING eval + 0 produced = 16.
 # names: count
-# cost: 16
+# cost: 17
 query I nosort
 SELECT COUNT(*) FROM t HAVING COUNT(*) > 10
 ----

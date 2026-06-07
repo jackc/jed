@@ -15,7 +15,7 @@ INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, NULL)
 
 # Range test: only a=15 falls in [10,20]; a=NULL is UNKNOWN (dropped). Cost: 4 scanned, the
 # desugared `And(Ge(a,10), Le(a,20))` is 3 interior nodes per scanned row = 12, plus 1 produced.
-# cost: 17
+# cost: 18
 query I nosort
 SELECT id FROM t WHERE a BETWEEN 10 AND 20 ORDER BY id
 ----

@@ -28,10 +28,23 @@ schema_version = 1
 id     = "storage_row_read"
 weight = 1
 event  = "one row read from a table store during a scan"
-# Storage is whole-image / row-granular today (../design/storage.md §6): a scan reads
-# N rows from a store, so the structural storage unit is the row read. When a real
-# paged store lands, ADD a separate `page_read` unit here — do NOT rename this one (a
-# row read and a page read are distinct events; both can coexist).
+# The store is a page-backed B-tree (P6.1, ../design/storage.md §6): a scan reads N rows
+# from it, so the row read is still a distinct structural unit — it coexists with
+# `page_read` below (a row read and a page read are different events). Charged in the
+# executor scan loop, not the storage iterator (../design/cost.md §3).
+
+[[unit]]
+id     = "page_read"
+weight = 1
+event  = "one B-tree node (page) touched while scanning a table store"
+# Landed P6.3 (../design/cost.md §3 "page_read"). The store is a page-backed B-tree
+# (P6.1) whose node boundaries are a §8 byte contract — identical across cores — so the
+# node count a scan touches is deterministic and cross-core identical. A full table scan
+# walks the whole tree, so it charges `page_read` once per node (interior + leaf); an
+# empty table (no root) charges none. ADDED alongside `storage_row_read`, NOT a rename.
+# Counted as a LOGICAL page access (the tree's structural node count), NOT a physical disk
+# fetch, so a future buffer pool / cache (CLAUDE.md §9) cannot perturb the deterministic
+# cost (§13, ../design/cost.md §3).
 
 [[unit]]
 id     = "row_produced"

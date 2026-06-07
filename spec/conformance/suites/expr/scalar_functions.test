@@ -203,7 +203,7 @@ CREATE TABLE k (id int32 PRIMARY KEY, v int32)
 statement ok
 INSERT INTO k VALUES (1, -5), (2, 5), (3, 0)
 
-# cost: 9
+# cost: 10
 query I rowsort
 SELECT abs(v) FROM k
 ----

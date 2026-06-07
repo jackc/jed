@@ -215,10 +215,12 @@ sits so the options stay open (CLAUDE.md §9).
   trips the `0A000` oversized-item narrowing ([types.md §11](types.md),
   [../fileformat/format.md](../fileformat/format.md)). Any compression library is a
   third-party dependency, added under CLAUDE.md §14.
-- **Cost unit for storage reads** — the cost-accounting seam (CLAUDE.md §13,
-  [cost.md](cost.md)) meters storage with a `storage_row_read` unit (one row read from a
-  store during a scan), because the store is whole-image / row-granular today (§6 above —
-  a scan reads N rows; there is no page abstraction yet). When a real paged store lands, a
-  distinct `page_read` unit is **added** to [../cost/schedule.toml](../cost/schedule.toml)
-  — `storage_row_read` is **not** renamed (a row read and a page read are distinct events
-  that can coexist).
+- **Cost unit for storage reads** — ✅ the store is now a page-backed B-tree, so the
+  cost-accounting seam (CLAUDE.md §13, [cost.md](cost.md)) meters a scan with **two** coexisting
+  units: `storage_row_read` (one row read from a store during a scan) **and** `page_read` (one
+  B-tree node/page touched), added in **P6.3**. A full table scan walks the whole tree, so it
+  charges `page_read` once per node (the tree's structural node count) — an empty table charges
+  none. `storage_row_read` was **not** renamed (a row read and a page read are distinct events).
+  `page_read` counts a **logical** page access (the structural node count), not a physical disk
+  fetch, so a future buffer pool / cache (§1, larger-than-RAM) stays invisible to the
+  deterministic cost. Accrual rules: [cost.md](cost.md) §3 "`page_read`".

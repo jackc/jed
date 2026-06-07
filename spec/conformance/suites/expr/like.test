@@ -16,7 +16,7 @@ INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol'), (4, NULL)
 
 # `%` matches any (possibly empty) run; here a leading 'a'. Cost: 4 scanned, the LIKE node is
 # one operator_eval per scanned row (the match loop is unmetered) = 4, plus 1 produced.
-# cost: 9
+# cost: 10
 query I nosort
 SELECT id FROM t WHERE s LIKE 'a%' ORDER BY id
 ----

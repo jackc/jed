@@ -27,7 +27,7 @@ INSERT INTO one VALUES (1)
 # Scalar in WHERE: only the a-row whose k equals max(a.k)=30. The subquery runs once: scan b/a (3
 # storage_row_read) + 3 aggregate_accumulate + 1 row_produced = 7. The outer scans a (3) + filters
 # `k = <const>` per row (3 operator_eval) + produces 1 row (1) = 7. cost = 7 + 7 = 14.
-# cost: 14
+# cost: 16
 query I nosort
 SELECT id FROM a WHERE k = (SELECT max(k) FROM a) ORDER BY id
 ----

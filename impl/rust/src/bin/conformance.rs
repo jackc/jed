@@ -9,6 +9,11 @@
 //! Needs no TOML: the per-impl gate is the file's `# requires:` header vs this
 //! core's declared capability set. The manifest/profile data is validated
 //! separately by `rake verify`. Exit code is nonzero if any run file fails.
+//!
+//! `--rebaseline` rewrites every `# cost: N` directive in place to the cost this core
+//! accrues (the tool for re-baselining the corpus after a cost-schedule change). This
+//! core is the writer; the Go/TS harnesses stay pure verifiers, so re-running them is the
+//! independent cross-core check that all cores agree on the new costs (CLAUDE.md §8).
 
 use jed::{Database, Outcome, SUPPORTED_CAPABILITIES, Value};
 use std::collections::BTreeSet;
@@ -20,6 +25,26 @@ fn main() -> ExitCode {
     let mut files = Vec::new();
     collect_tests(&suites, &mut files);
     files.sort();
+
+    // `--rebaseline` rewrites each `# cost: N` directive in place to the cost this core
+    // actually accrues, then exits — the tool for re-baselining the corpus after a
+    // cost-schedule change (e.g. P6.3's `page_read`). The Rust harness is the **writer**;
+    // the Go and TS harnesses stay pure verifiers, so running them afterwards is the
+    // independent cross-core check that every core agrees on the new costs (CLAUDE.md §8).
+    if std::env::args().any(|a| a == "--rebaseline") {
+        let mut rewritten = 0u32;
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read .test file");
+            if let Some(updated) = rebaseline_file(&text) {
+                std::fs::write(file, updated).expect("write .test file");
+                let rel = file.strip_prefix(&suites).unwrap_or(file).display();
+                println!("rebaselined {rel}");
+                rewritten += 1;
+            }
+        }
+        println!("\n{rewritten} file(s) rebaselined");
+        return ExitCode::SUCCESS;
+    }
 
     let supported: BTreeSet<&str> = SUPPORTED_CAPABILITIES.iter().copied().collect();
     let (mut passed, mut failed, mut skipped) = (0u32, 0u32, 0u32);
@@ -239,6 +264,93 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Rewrite each `# cost: N` directive in `text` to the cost this core actually accrues,
+/// returning the updated text if anything changed (else `None`) — the engine of
+/// `--rebaseline`. Mirrors `run_file`'s record walk over an indexed line buffer, but instead
+/// of asserting cost it patches the pending `# cost:` line. Result/error assertions are
+/// skipped (only costs change); each statement still runs so later records see the same
+/// database state. A `# cost:` that binds to a record producing no cost (a `statement error`)
+/// is consumed but left untouched, exactly as `run_file` would ignore it.
+fn rebaseline_file(text: &str) -> Option<String> {
+    let mut out: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut db = Database::new();
+    let mut pending_cost_line: Option<usize> = None;
+    let mut changed = false;
+    let mut i = 0;
+    while i < out.len() {
+        let trimmed = out[i].trim().to_string();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            if parse_cost_directive(rest).is_some() {
+                pending_cost_line = Some(i);
+            }
+            i += 1;
+            continue;
+        }
+        // A record: collect its SQL (advancing `i` past the whole record) and run it to
+        // accrue cost + advance DB state.
+        let mut parts = trimmed.split_whitespace();
+        let kind = parts.next().unwrap();
+        let actual_cost: Option<i64> = match kind {
+            "statement" => {
+                let expect = parts.next().unwrap_or("");
+                i += 1;
+                let mut sql = Vec::new();
+                while i < out.len() && !out[i].trim().is_empty() {
+                    sql.push(out[i].clone());
+                    i += 1;
+                }
+                let result = jed::execute(&mut db, &sql.join("\n"));
+                // Only a `statement ok` carries a cost; an error record never does.
+                if expect == "ok" {
+                    result.ok().map(|o| o.cost())
+                } else {
+                    None
+                }
+            }
+            "query" => {
+                i += 1;
+                let mut sql = Vec::new();
+                while i < out.len() && out[i].trim() != "----" {
+                    sql.push(out[i].clone());
+                    i += 1;
+                }
+                // Skip the `----` separator and the expected rows (until a blank line).
+                if i < out.len() {
+                    i += 1;
+                }
+                while i < out.len() && !out[i].trim().is_empty() {
+                    i += 1;
+                }
+                jed::execute(&mut db, &sql.join("\n"))
+                    .ok()
+                    .map(|o| o.cost())
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if let (Some(line), Some(cost)) = (pending_cost_line.take(), actual_cost) {
+            let indent_len = out[line].len() - out[line].trim_start().len();
+            let new_line = format!("{}# cost: {cost}", &out[line][..indent_len]);
+            if out[line] != new_line {
+                out[line] = new_line;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let trailing = if text.ends_with('\n') { "\n" } else { "" };
+        Some(out.join("\n") + trailing)
+    } else {
+        None
+    }
 }
 
 /// Collect SQL lines for a `statement` (until a blank line or EOF).

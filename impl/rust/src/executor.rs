@@ -863,6 +863,9 @@ impl Database {
             params: &bound,
             outer: &[],
         };
+        // A full scan walks the table's whole B-tree: page_read per node (block, before the
+        // rows), then storage_row_read per row (spec/design/cost.md §3 "page_read").
+        meter.charge(COSTS.page_read * self.store(&del.table).node_count() as i64);
         for (k, row) in self.store(&del.table).iter_entries() {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
@@ -972,6 +975,9 @@ impl Database {
             params: &bound,
             outer: &[],
         };
+        // A full scan walks the table's whole B-tree: page_read per node (block, before the
+        // rows), then storage_row_read per row (spec/design/cost.md §3 "page_read").
+        meter.charge(COSTS.page_read * self.store(&upd.table).node_count() as i64);
         for (key, row) in self.store(&upd.table).iter_entries() {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
@@ -1461,14 +1467,17 @@ impl Database {
             outer,
         };
 
-        // Materialize each base table once, in primary-key order, charging storage_row_read
-        // per physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these
-        // in-memory buffers, which are not stores and charge nothing.
+        // Materialize each base table once, in primary-key order. A full scan walks the table's
+        // whole B-tree, so it charges page_read per node (block, before the rows) and
+        // storage_row_read per physical row (spec/design/cost.md §3 "page_read"/JOIN). The nested
+        // loop re-reads from these in-memory buffers, which are not stores and charge nothing.
         let mut meter = Meter::new();
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
         for rel in &plan.rels {
+            let store = self.store(&rel.table_name);
+            meter.charge(COSTS.page_read * store.node_count() as i64);
             let mut table_rows: Vec<Row> = Vec::new();
-            for row in self.store(&rel.table_name).iter_in_key_order() {
+            for row in store.iter_in_key_order() {
                 meter.charge(COSTS.storage_row_read);
                 table_rows.push(row.clone());
             }

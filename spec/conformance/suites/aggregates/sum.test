@@ -12,7 +12,7 @@ statement ok
 INSERT INTO t16 VALUES (1, 30000), (2, 30000), (3, 10000)
 
 # names: sum
-# cost: 7
+# cost: 8
 query I nosort
 SELECT SUM(s) FROM t16
 ----
@@ -27,7 +27,7 @@ statement ok
 INSERT INTO t64 VALUES (1, 9223372036854775807), (2, 3)
 
 # names: sum
-# cost: 5
+# cost: 6
 query D nosort
 SELECT SUM(big) FROM t64
 ----
@@ -41,7 +41,7 @@ statement ok
 INSERT INTO tdec VALUES (1, 1.50), (2, 2.25)
 
 # names: sum
-# cost: 5
+# cost: 6
 query D nosort
 SELECT SUM(d) FROM tdec
 ----
@@ -68,7 +68,7 @@ statement ok
 INSERT INTO tnull VALUES (1, NULL), (2, NULL)
 
 # names: sum
-# cost: 5
+# cost: 6
 query I nosort
 SELECT SUM(a) FROM tnull
 ----

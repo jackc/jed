@@ -24,7 +24,7 @@ INSERT INTO b VALUES (10, 10, 'ten'), (20, 20, 'twenty'), (21, 20, 'twentyish'),
 # A 4x4 nested loop: 4+4 materialized (8 storage_row_read) + 16 ON `=` evals + 3 produced = 27.
 # Projection is two bare/qualified columns (leaves), so it adds no operator_eval.
 # names: id, label
-# cost: 27
+# cost: 29
 query IT nosort
 SELECT a.id, b.label FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id
 ----
@@ -37,7 +37,7 @@ twentyish
 
 # An explicit INNER keyword is identical to a bare JOIN. Same 4x4 loop: 8 + 16 + 3 = 27.
 # names: id
-# cost: 27
+# cost: 29
 query I nosort
 SELECT a.id FROM a INNER JOIN b ON a.k = b.k ORDER BY a.id, b.id
 ----
@@ -48,7 +48,7 @@ SELECT a.id FROM a INNER JOIN b ON a.k = b.k ORDER BY a.id, b.id
 # WHERE applies AFTER the join, to the combined rows. The ON produces 3 matched rows; WHERE
 # `b.label = 'twenty'` evaluates on each (3 operator_eval) and keeps one. 8 + 16 + 3 + 1 = 28.
 # names: id, k
-# cost: 28
+# cost: 30
 query II nosort
 SELECT a.id, b.k FROM a JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.id
 ----
@@ -59,7 +59,7 @@ SELECT a.id, b.k FROM a JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.
 # a NULL k is unknown), which then pairs with every b row → 4 results. 8 + 16 ON + 4 produced = 28.
 # Both output columns are named `id` (duplicate output names across tables are allowed).
 # names: id, id
-# cost: 28
+# cost: 30
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k > 25 ORDER BY a.id, b.id
 ----
@@ -74,7 +74,7 @@ SELECT a.id, b.id FROM a JOIN b ON a.k > 25 ORDER BY a.id, b.id
 
 # A join with no surviving pair yields the empty result. ON matches 3, WHERE drops all 3.
 # 8 materialize + 16 ON + 3 WHERE + 0 produced = 27.
-# cost: 27
+# cost: 29
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 999
 ----
@@ -84,7 +84,7 @@ SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 999
 # evaluates on each (3) and keeps one. 8 materialize + 16 ON + 3 WHERE + 1 produced = 28.
 # The star projection columns are all leaves (no operator_eval).
 # names: id, k, id, k, label
-# cost: 28
+# cost: 30
 query IIIIT nosort
 SELECT * FROM a JOIN b ON a.k = b.k WHERE a.id = 1
 ----

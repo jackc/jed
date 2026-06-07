@@ -148,10 +148,11 @@ test("INSERT ... SELECT cost is the embedded SELECT's accrued cost", () => {
     "INSERT INTO src VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
     "CREATE TABLE dst (id int32 PRIMARY KEY, a int16, b int64)",
   ]);
-  // 3 scanned + 3 produced + 0 projection (bare columns) = 6; storing the rows is unmetered.
+  // 1 page_read (src is one leaf) + 3 scanned + 3 produced + 0 projection (bare columns) = 7;
+  // storing the rows is unmetered.
   const o = execute(db, "INSERT INTO dst SELECT id, a, b FROM src");
   assert.equal(o.kind, "statement");
-  assert.equal(o.cost, 6n);
+  assert.equal(o.cost, 7n);
 });
 
 test("INSERT ... SELECT self-insert reads the pre-insert snapshot", () => {

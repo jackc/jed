@@ -220,7 +220,7 @@ INSERT INTO c VALUES (1, '2020-01-01 00:00:00'), (2, '2021-01-01 00:00:00'), (3,
 
 # a timestamp comparison is ONE operator_eval (weight 1), like an integer/text comparison.
 # 6 scanned + 6 filter (one `=` per row) + 1 produced + 0 projection (bare column) = 13.
-# cost: 13
+# cost: 14
 query I nosort
 SELECT id FROM c WHERE ts = '2023-01-01 00:00:00'
 ----

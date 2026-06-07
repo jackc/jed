@@ -28,7 +28,7 @@ INSERT INTO t VALUES (3, 0, 0)
 
 # Plain full scan, bare-column projection: 3 scanned + 0 filter + 3 produced + 0
 # projection (column is a leaf) = 6. ORDER BY's sort comparisons are not metered.
-# cost: 6
+# cost: 7
 query I nosort
 SELECT a FROM t ORDER BY id
 ----
@@ -38,7 +38,7 @@ SELECT a FROM t ORDER BY id
 
 # Filtered scan, single match, one arithmetic op in the projection: 3 scanned + 3 filter
 # (one `=` compare per scanned row) + 1 produced + 1 projection (`a + b` = one Add) = 8.
-# cost: 8
+# cost: 9
 query I nosort
 SELECT a + b FROM t WHERE id = 1
 ----
@@ -46,7 +46,7 @@ SELECT a + b FROM t WHERE id = 1
 
 # Precedence: `a + b * 2` is Add(a, Mul(b, 2)) = two interior nodes. 3 scanned + 3 filter
 # + 1 produced + 2 projection = 9.
-# cost: 9
+# cost: 10
 query I nosort
 SELECT a + b * 2 FROM t WHERE id = 2
 ----
@@ -56,7 +56,7 @@ SELECT a + b * 2 FROM t WHERE id = 2
 # EVERY scanned row even when the left operand is false (row 3: a=0). 3 scanned + 9 filter
 # (3 nodes x 3 rows) + 2 produced + 0 projection = 14. A core that short-circuited AND
 # would skip row 3's `b>0` and report 13 — this pins the count to 14.
-# cost: 14
+# cost: 15
 query I nosort
 SELECT id FROM t WHERE a > 0 AND b > 0 ORDER BY id
 ----
@@ -66,7 +66,7 @@ SELECT id FROM t WHERE a > 0 AND b > 0 ORDER BY id
 # NO short-circuit, OR: Or(a>0, b>0) = 3 interior nodes per scanned row even when the left
 # operand is true (rows 1, 2). 3 scanned + 9 filter + 2 produced = 14. A core that
 # short-circuited OR would skip the right operand on rows 1 and 2 and report 12.
-# cost: 14
+# cost: 15
 query I nosort
 SELECT id FROM t WHERE a > 0 OR b > 0 ORDER BY id
 ----
@@ -75,6 +75,6 @@ SELECT id FROM t WHERE a > 0 OR b > 0 ORDER BY id
 
 # DML accrues scan + filter cost too (and no produced rows): the DELETE scans all 3 rows
 # and runs one `=` compare each = 3 + 3 = 6. (Run last — it mutates the table.)
-# cost: 6
+# cost: 7
 statement ok
 DELETE FROM t WHERE id = 3

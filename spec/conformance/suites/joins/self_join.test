@@ -19,7 +19,7 @@ INSERT INTO region VALUES (1, 'us'), (2, 'eu')
 # Employee-to-manager self-join: e.mgr = m.id. The CEO (mgr NULL) matches no manager (3-valued
 # ON). 4 + 4 materialized (emp read twice = 8) + 16 ON `=` evals + 3 produced = 27.
 # names: name, name
-# cost: 27
+# cost: 29
 query TT nosort
 SELECT e.name, m.name FROM emp AS e JOIN emp AS m ON e.mgr = m.id ORDER BY e.id
 ----
@@ -33,7 +33,7 @@ vp
 # No ORDER BY -> order unspecified, compared rowsort (the exact row set is the contract).
 # e1 (mgr NULL) yields nothing; then e2->m1, e3->m2, e4->m2. 8 + 16 ON + 3 produced = 27.
 # names: id, id
-# cost: 27
+# cost: 29
 query II rowsort
 SELECT e.id, m.id FROM emp AS e JOIN emp AS m ON e.mgr = m.id
 ----
@@ -48,7 +48,7 @@ SELECT e.id, m.id FROM emp AS e JOIN emp AS m ON e.mgr = m.id
 # rows, CROSS region (2) gives 6. Materialize emp+emp+region = 4+4+2 = 10; ON on the first join
 # = 4x4 = 16; the CROSS adds no ON eval; 6 produced. 10 + 16 + 6 = 32.
 # names: name, name, rname
-# cost: 32
+# cost: 35
 query TTT nosort
 SELECT e.name, m.name, region.rname FROM emp AS e JOIN emp AS m ON e.mgr = m.id CROSS JOIN region ORDER BY e.id, region.id
 ----

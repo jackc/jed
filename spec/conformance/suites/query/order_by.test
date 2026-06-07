@@ -32,7 +32,7 @@ INSERT INTO t VALUES (5, NULL, 9)
 # ASC with no NULLS clause defaults to NULLS LAST (NULL is the largest value): the a=10 group
 # in stable scan order, then a=20, then row 5 (a NULL) last. 5 scanned + 5 produced = 10.
 # names: a
-# cost: 10
+# cost: 11
 query I nosort
 SELECT a FROM t ORDER BY a
 ----
@@ -45,7 +45,7 @@ NULL
 # DESC with no NULLS clause defaults to NULLS FIRST (descending inverts the physical order):
 # NULL leads, then a=20, then the a=10 group. Matches PostgreSQL (NULL largest). 5 + 5 = 10.
 # names: a
-# cost: 10
+# cost: 11
 query I nosort
 SELECT a FROM t ORDER BY a DESC
 ----
@@ -59,7 +59,7 @@ NULL
 # descending and NULL goes last — the case that fails if NULL placement is not decoupled from
 # the direction reversal (grammar.md §10). 5 + 5 = 10.
 # names: a
-# cost: 10
+# cost: 11
 query I nosort
 SELECT a FROM t ORDER BY a DESC NULLS LAST
 ----
@@ -72,7 +72,7 @@ NULL
 # Explicit NULLS FIRST overrides the ASC default (now NULLS LAST): the non-NULL values stay
 # ascending and NULL leads. 5 + 5 = 10.
 # names: a
-# cost: 10
+# cost: 11
 query I nosort
 SELECT a FROM t ORDER BY a ASC NULLS FIRST
 ----
@@ -85,7 +85,7 @@ NULL
 # Two keys, mixed direction: primary `a` ASC (NULLs last by default), ties broken by `id`
 # DESC. Within a=10 the ids descend (4,2,1), then a=20, then row 5 (a NULL) last. 5 + 5 = 10.
 # names: id, a
-# cost: 10
+# cost: 11
 query II nosort
 SELECT id, a FROM t ORDER BY a ASC, id DESC
 ----
@@ -104,7 +104,7 @@ NULL
 # values are 5 (id1), NULL (id2), 5 (id4); NULLS LAST puts id2 after the two b=5 rows, which
 # keep stable scan order (id1 before id4). Then a=20, then the a NULL row (id5) last. 5 + 5 = 10.
 # names: id, a, b
-# cost: 10
+# cost: 11
 query III nosort
 SELECT id, a, b FROM t ORDER BY a ASC, b ASC NULLS LAST
 ----
@@ -128,7 +128,7 @@ NULL
 # ordering by `b` alone leaves the two b=5 rows in id order. WHERE keeps rows 1 and
 # 4 (b=5). 5 scanned + 5 filter + 2 produced = 12.
 # names: id
-# cost: 12
+# cost: 13
 query I nosort
 SELECT id FROM t WHERE b = 5 ORDER BY b
 ----
@@ -140,7 +140,7 @@ SELECT id FROM t WHERE b = 5 ORDER BY b
 # produce). WHERE a >= 10 drops row 5 (NULL >= 10 is unknown). Survivors ordered by a DESC then
 # id ASC are 3,1,2,4; LIMIT 2 keeps 3,1. 5 scanned + 5 filter + 2 produced = 12.
 # names: id
-# cost: 12
+# cost: 13
 query I nosort
 SELECT id FROM t WHERE a >= 10 ORDER BY a DESC, id ASC LIMIT 2
 ----

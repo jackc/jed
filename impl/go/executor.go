@@ -734,6 +734,9 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	env := &evalEnv{exec: db, params: bound}
 	store := db.working().store(del.Table)
 	var keys [][]byte
+	// A full scan walks the table's whole B-tree: page_read per node (block, before the rows),
+	// then storage_row_read per row (spec/design/cost.md §3 "page_read").
+	meter.Charge(Costs.PageRead * int64(store.NodeCount()))
 	for _, e := range store.EntriesInKeyOrder() {
 		meter.Charge(Costs.StorageRowRead)
 		matched := true
@@ -847,6 +850,9 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		row Row
 	}
 	var updates []pending
+	// A full scan walks the table's whole B-tree: page_read per node (block, before the rows),
+	// then storage_row_read per row (spec/design/cost.md §3 "page_read").
+	meter.Charge(Costs.PageRead * int64(store.NodeCount()))
 	for _, e := range store.EntriesInKeyOrder() {
 		meter.Charge(Costs.StorageRowRead)
 		if filter != nil {
@@ -1458,14 +1464,17 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer}
 
-	// Materialize each base table once, in primary-key order, charging storage_row_read per
-	// physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these in-memory
-	// buffers, which are not stores and charge nothing.
+	// Materialize each base table once, in primary-key order. A full scan walks the table's whole
+	// B-tree, so it charges page_read per node (block, before the rows) and storage_row_read per
+	// physical row (spec/design/cost.md §3 "page_read"/JOIN). The nested loop re-reads from these
+	// in-memory buffers, which are not stores and charge nothing.
 	meter := NewMeter()
 	materialized := make([][]Row, len(plan.rels))
 	for ri, rel := range plan.rels {
+		store := db.readSnap().store(rel.tableName)
+		meter.Charge(Costs.PageRead * int64(store.NodeCount()))
 		var tableRows []Row
-		for _, row := range db.RowsInKeyOrder(rel.tableName) {
+		for _, row := range store.IterInKeyOrder() {
 			meter.Charge(Costs.StorageRowRead)
 			tableRows = append(tableRows, row)
 		}

@@ -120,7 +120,7 @@ NULL
 # deterministic, cross-core cost: a boolean comparison is ONE operator_eval (weight 1), like
 # an integer comparison. 5 scanned + 5 filter (one `=` per row) + 2 produced + 0 projection
 # (bare column) = 12.
-# cost: 12
+# cost: 13
 query I rowsort
 SELECT id FROM t WHERE flag = TRUE
 ----

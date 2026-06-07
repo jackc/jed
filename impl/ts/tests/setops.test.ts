@@ -35,12 +35,12 @@ test("UNION deduplicates, UNION ALL keeps multiplicities", () => {
 });
 
 test("set-op cost is lhs+rhs; the window is unmetered", () => {
-  // 2*3 + 2*3; dedup unmetered.
-  assert.strictEqual(execute(ab(), "SELECT k FROM a UNION SELECT k FROM b").cost, 12n);
+  // (1 page_read + 3 scan + 3 produce) per operand = 7 + 7; dedup unmetered.
+  assert.strictEqual(execute(ab(), "SELECT k FROM a UNION SELECT k FROM b").cost, 14n);
   // LIMIT does not lower the cost: operands fully produce, the window is unmetered.
   assert.strictEqual(
     execute(ab(), "SELECT k FROM a UNION SELECT k FROM b ORDER BY k LIMIT 1").cost,
-    12n,
+    14n,
   );
 });
 

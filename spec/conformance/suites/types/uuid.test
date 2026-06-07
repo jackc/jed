@@ -212,7 +212,7 @@ INSERT INTO w VALUES
 # a uuid comparison is ONE operator_eval (weight 1), like an integer/bytea comparison —
 # independent of the 16-byte width. 6 scanned + 6 filter (one `=` per row) + 1 produced
 # + 0 projection (bare column) = 13.
-# cost: 13
+# cost: 14
 query T nosort
 SELECT id FROM w WHERE ref = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
 ----

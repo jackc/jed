@@ -163,6 +163,20 @@ export class PMap {
     walk(this.root);
     return { keys, vals };
   }
+
+  // nodeCount is the number of B-tree nodes (pages) in this tree — the page_read count a full
+  // scan charges (spec/design/cost.md §3 "page_read"). A scan walks every node, so this is the
+  // structural node count (interior + leaf); 0 for an empty map. Deterministic and byte-identical
+  // across cores (the node boundaries are a §8 byte contract — format.md).
+  nodeCount(): number {
+    const count = (n: PNode | null): number => {
+      if (n === null) return 0;
+      let total = 1;
+      for (const c of n.children) total += count(c);
+      return total;
+    };
+    return count(this.root);
+  }
 }
 
 // pmapFromLoaded reconstructs a map from a loaded root (format.ts loadDatabase).

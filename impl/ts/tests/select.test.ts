@@ -102,9 +102,9 @@ test("LIMIT caps and OFFSET skips; the two clauses commute", () => {
 });
 
 test("LIMIT/OFFSET window reduces produced cost (slice before projection)", () => {
-  // 5 scanned + 2 produced = 7 (spec/design/cost.md §3).
+  // 1 page_read (t is one leaf) + 5 scanned + 2 produced = 8 (spec/design/cost.md §3).
   const o = execute(limitDB(), "SELECT id FROM t ORDER BY id LIMIT 2");
-  assert.equal(o.cost, 7n);
+  assert.equal(o.cost, 8n);
 });
 
 test("a negative LIMIT traps 2201W and a negative OFFSET traps 2201X", () => {

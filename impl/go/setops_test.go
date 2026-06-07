@@ -40,15 +40,15 @@ func TestUnionDistinctAndAll(t *testing.T) {
 
 func TestSetOpCostIsSumOfOperands(t *testing.T) {
 	db := setopAB(t)
-	// 2*3 + 2*3; dedup unmetered.
+	// (1 page_read + 3 scan + 3 produce) per operand = 7 + 7; dedup unmetered.
 	out, _ := Execute(db, "SELECT k FROM a UNION SELECT k FROM b")
-	if out.Cost != 12 {
-		t.Errorf("UNION cost got %d want 12", out.Cost)
+	if out.Cost != 14 {
+		t.Errorf("UNION cost got %d want 14", out.Cost)
 	}
 	// LIMIT does not lower the cost: operands fully produce, the window is unmetered.
 	out2, _ := Execute(db, "SELECT k FROM a UNION SELECT k FROM b ORDER BY k LIMIT 1")
-	if out2.Cost != 12 {
-		t.Errorf("UNION+LIMIT cost got %d want 12", out2.Cost)
+	if out2.Cost != 14 {
+		t.Errorf("UNION+LIMIT cost got %d want 14", out2.Cost)
 	}
 }
 

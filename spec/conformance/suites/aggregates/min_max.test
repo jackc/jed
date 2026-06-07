@@ -12,7 +12,7 @@ INSERT INTO t VALUES (1, 10, 'banana'), (2, NULL, 'apple'), (3, 30, 'cherry')
 
 # MIN/MAX over int32 skip the NULL row. Result type is int32 (I tag).
 # names: min
-# cost: 7
+# cost: 8
 query I nosort
 SELECT MIN(a) FROM t
 ----
@@ -26,7 +26,7 @@ SELECT MAX(a) FROM t
 
 # MIN and MAX together — one row, two aggregates: 3 scanned + 3x2 accumulate + 1 produced.
 # names: min, max
-# cost: 10
+# cost: 11
 query II nosort
 SELECT MIN(a), MAX(a) FROM t
 ----

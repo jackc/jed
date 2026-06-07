@@ -211,6 +211,17 @@ impl PMap {
         removed
     }
 
+    /// The number of B-tree nodes (pages) in this tree — the `page_read` count a full scan
+    /// charges (spec/design/cost.md §3 "page_read"). A scan walks every node, so this is the
+    /// structural node count (interior + leaf); `0` for an empty map. Deterministic and
+    /// byte-identical across cores (the node boundaries are a §8 byte contract — format.md).
+    pub fn node_count(&self) -> usize {
+        fn count(node: &Node) -> usize {
+            1 + node.children.iter().map(|c| count(c)).sum::<usize>()
+        }
+        self.root.as_deref().map(count).unwrap_or(0)
+    }
+
     /// Iterate `(key, row)` pairs in ascending key order. Eagerly walks the tree into a vector of
     /// borrows (the cost contract charges per row in the executor loop, not here — cost.md), so
     /// laziness is unobservable and a deferred optimization.

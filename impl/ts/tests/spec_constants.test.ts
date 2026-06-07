@@ -190,6 +190,8 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
     switch (id) {
       case "storage_row_read":
         return COSTS.storageRowRead;
+      case "page_read":
+        return COSTS.pageRead;
       case "row_produced":
         return COSTS.rowProduced;
       case "operator_eval":

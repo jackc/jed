@@ -88,9 +88,9 @@ test("a subquery's cost is added once, the folded constant a leaf", () => {
   const db = ab();
   const base = execute(db, "SELECT id FROM a WHERE k = 999").cost;
   const withSub = execute(db, "SELECT id FROM a WHERE k = (SELECT max(k) FROM b)").cost;
-  // The folded constant is a leaf, so the only delta is the subquery's own cost (3 scan + 3
-  // accumulate + 1 produced = 7), added exactly once.
-  assert.strictEqual(withSub - base, 7n);
+  // The folded constant is a leaf, so the only delta is the subquery's own cost (1 page_read +
+  // 3 scan + 3 accumulate + 1 produced = 8), added exactly once.
+  assert.strictEqual(withSub - base, 8n);
 });
 
 test("subquery error codes and narrowings", () => {
@@ -192,10 +192,11 @@ test("outer reference inside an aggregate argument", () => {
 });
 
 test("a correlated subquery's cost is per outer row", () => {
-  // The derivation is in spec/conformance/suites/subquery/correlated.test (cost = 14).
+  // Each per-outer-row re-scan of the inner table charges its page_read too. The derivation is in
+  // spec/conformance/suites/subquery/correlated.test (cost = 17).
   assert.strictEqual(
     execute(t123(), "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)").cost,
-    14n,
+    17n,
   );
 });
 

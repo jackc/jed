@@ -94,6 +94,10 @@ func (s *TableStore) IterInKeyOrder() []Row {
 	return vals
 }
 
+// NodeCount is the number of B-tree nodes (pages) in this store — the page_read count a full
+// scan charges (spec/design/cost.md §3 "page_read"). 0 for an empty table.
+func (s *TableStore) NodeCount() int { return s.rows.nodeCount() }
+
 // Entry is one stored (encoded key, row) pair.
 type Entry struct {
 	Key []byte

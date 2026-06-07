@@ -107,6 +107,12 @@ impl TableStore {
         self.rows.iter().map(|(_, v)| v)
     }
 
+    /// The number of B-tree nodes (pages) in this store — the `page_read` count a full scan
+    /// charges (spec/design/cost.md §3 "page_read"). `0` for an empty table.
+    pub fn node_count(&self) -> usize {
+        self.rows.node_count()
+    }
+
     /// Iterate `(encoded key, row)` pairs in key order. Used by the on-disk
     /// serializer (spec/fileformat/format.md), which stores each row's key verbatim.
     pub fn iter_entries(&self) -> impl Iterator<Item = (&Vec<u8>, &Row)> {

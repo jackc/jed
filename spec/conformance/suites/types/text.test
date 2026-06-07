@@ -132,7 +132,7 @@ SELECT id FROM w WHERE s < 'b' ORDER BY id
 # deterministic, cross-core cost: a text comparison is ONE operator_eval (weight 1), like an
 # integer comparison — independent of string length. 6 scanned + 6 filter (one `=` per row) +
 # 1 produced + 0 projection (bare column) = 13.
-# cost: 13
+# cost: 14
 query I nosort
 SELECT id FROM w WHERE s = 'a'
 ----

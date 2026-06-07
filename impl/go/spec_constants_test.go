@@ -323,6 +323,8 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 		switch id {
 		case "storage_row_read":
 			return Costs.StorageRowRead
+		case "page_read":
+			return Costs.PageRead
 		case "row_produced":
 			return Costs.RowProduced
 		case "operator_eval":

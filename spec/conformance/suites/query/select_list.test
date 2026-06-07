@@ -92,7 +92,7 @@ SELECT a AS b FROM t WHERE b = 10
 # `# names:` and `# cost:` bind the same query independently. Cost: 2 scanned + 2 filter
 # (one `=` per scanned row) + 1 produced + 1 projection (`a + b` is one Add) = 6.
 # names: total
-# cost: 6
+# cost: 7
 query I nosort
 SELECT a + b AS total FROM t WHERE id = 1
 ----

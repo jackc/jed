@@ -181,14 +181,14 @@ func TestLimitCapsAndOffsetSkips(t *testing.T) {
 
 func TestLimitOffsetWindowReducesProducedCost(t *testing.T) {
 	// The slice runs before projection, so only windowed rows charge row_produced:
-	// 5 scanned + 2 produced = 7 (spec/design/cost.md §3).
+	// 1 page_read (t is one leaf) + 5 scanned + 2 produced = 8 (spec/design/cost.md §3).
 	db := limitDB(t)
 	out, err := Execute(db, "SELECT id FROM t ORDER BY id LIMIT 2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Cost != 7 {
-		t.Errorf("cost got %d want 7", out.Cost)
+	if out.Cost != 8 {
+		t.Errorf("cost got %d want 8", out.Cost)
 	}
 }
 

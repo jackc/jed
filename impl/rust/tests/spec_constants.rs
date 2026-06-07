@@ -347,6 +347,7 @@ fn cost_schedule_matches_spec() {
     let weight = |id: &str| -> i64 {
         match id {
             "storage_row_read" => COSTS.storage_row_read,
+            "page_read" => COSTS.page_read,
             "row_produced" => COSTS.row_produced,
             "operator_eval" => COSTS.operator_eval,
             "aggregate_accumulate" => COSTS.aggregate_accumulate,

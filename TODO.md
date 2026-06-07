@@ -747,11 +747,27 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       sharing — needs O(dirty) orphan tracking to keep the commit incremental, or an O(live)
       reachable-set recompute) and **on-disk free-list persistence** (claim meta offset 28 so open
       skips the reachable-set walk — *persist later only for open speed*). _(size: L; deps: P6.1)_
-- [ ] **P6.3 — `page_read` cost unit + corpus cost re-baseline** — when the B-tree leaf scan
-      replaces the flat chain, **add** `page_read` to [spec/cost/schedule.toml](spec/cost/schedule.toml)
-      (do **not** rename `storage_row_read` — they coexist, storage.md §6). Every `# cost:`
-      assertion in the corpus shifts; the re-baseline must land **atomically across all three
-      cores** (a §13 cross-core determinism contract). _(size: M; deps: P6.1; §13)_
+- [x] **P6.3 — `page_read` cost unit + corpus cost re-baseline** ✅ — the store is now a
+      page-backed B-tree (P6.1), so a distinct **`page_read`** unit was **added** to
+      [spec/cost/schedule.toml](spec/cost/schedule.toml) alongside `storage_row_read` (not a
+      rename — both fire on a scan; storage.md §6). Landed across all three cores. **Accrual rule**
+      ([cost.md §3](spec/design/cost.md) "page_read"): the executor has no index/point-lookup path,
+      so every `SELECT`/`DELETE`/`UPDATE` scan walks the table's **whole** B-tree → it charges
+      `page_read` once per **node** (interior + leaf) in that tree — the structural **node count** —
+      as a block **before** the table's `storage_row_read`s. An empty table (no root) charges none.
+      The count is **deterministic + byte-identical across cores** because the in-memory B-tree **is**
+      the on-disk one, node-for-page, whose node boundaries are a §8 byte contract (P6.1). It composes
+      exactly like `storage_row_read`: a JOIN charges each materialized base table's node count once
+      (self-join twice); a set op `lhs + rhs`; an uncorrelated subquery once (folded); a **correlated**
+      subquery's inner re-scan **per outer row**. Counted as a **logical** page access (the node count),
+      not a physical fetch, so a future buffer pool stays invisible to the deterministic cost (§13).
+      **Re-baseline** landed **atomically across all three cores** (a §13 cross-core determinism
+      contract): a new `--rebaseline` mode in the **Rust** conformance harness rewrote every `# cost:`
+      directive (40 of 41 corpus files; 1 unchanged — an INSERT applying defaults scans nothing), and
+      the unchanged Go/TS harnesses **independently re-verified 72/0/0** (the cross-core oracle — all
+      cores agree on the new costs by construction). Per-core cost-assertion tests (select/insert/
+      setops/subquery in each core) re-baselined to the same values. Byte format **untouched** (15
+      goldens still byte-exact; `rake verify` clean). _(size: M; deps: P6.1; §13)_
 - [ ] **Buffer pool / demand paging** — make the resident set a **bounded cache of pages**
       with eviction (not the whole file), so a file far larger than RAM is served by paging in
       on demand. The `page_read` cost unit must count **logical** page accesses so the cache

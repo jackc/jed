@@ -123,7 +123,7 @@ statement ok
 INSERT INTO c VALUES (1, '2020-01-01 00:00:00+00'), (2, '2021-01-01 00:00:00+00'), (3, '2022-01-01 00:00:00+00'), (4, '2023-01-01 00:00:00+00'), (5, '2024-01-01 00:00:00+00'), (6, '2025-01-01 00:00:00+00')
 
 # one operator_eval per comparison: 6 scanned + 6 filter + 1 produced + 0 projection = 13.
-# cost: 13
+# cost: 14
 query I nosort
 SELECT id FROM c WHERE ts = '2023-01-01 00:00:00+00'
 ----

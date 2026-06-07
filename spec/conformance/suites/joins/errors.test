@@ -18,7 +18,7 @@ INSERT INTO q VALUES (1, 10)
 
 # A valid INNER join works (sanity). 1 + 1 materialized + 1 ON + 1 produced = 4.
 # names: id
-# cost: 4
+# cost: 6
 query I nosort
 SELECT p.id FROM p JOIN q ON p.id = q.id
 ----

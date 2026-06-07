@@ -96,6 +96,12 @@ export class TableStore {
     return this.rows.inorder().vals;
   }
 
+  // nodeCount is the number of B-tree nodes (pages) in this store — the page_read count a full
+  // scan charges (spec/design/cost.md §3 "page_read"). 0 for an empty table.
+  nodeCount(): number {
+    return this.rows.nodeCount();
+  }
+
   // entriesInKeyOrder returns all (key, row) pairs in encoded-key order. Used by the
   // on-disk serializer, which stores each row's key verbatim (the key is not always
   // reconstructable from the row — e.g. a no-PK table's synthetic rowid).

@@ -13,7 +13,7 @@ INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30)
 
 # COUNT(*) counts all 3 rows (the NULL row included). 3 scanned + 3 accumulate + 1 produced.
 # names: count
-# cost: 7
+# cost: 8
 query I nosort
 SELECT COUNT(*) FROM t
 ----
@@ -21,7 +21,7 @@ SELECT COUNT(*) FROM t
 
 # COUNT(a) skips the NULL row -> 2. Bare-column argument is a leaf (no operator_eval).
 # names: count
-# cost: 7
+# cost: 8
 query I nosort
 SELECT COUNT(a) FROM t
 ----

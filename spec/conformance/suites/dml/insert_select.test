@@ -23,7 +23,7 @@ INSERT INTO src_c VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)
 statement ok
 CREATE TABLE dst_c (id int32 PRIMARY KEY, a int16, b int64)
 
-# cost: 6
+# cost: 7
 statement ok
 INSERT INTO dst_c SELECT id, a, b FROM src_c
 

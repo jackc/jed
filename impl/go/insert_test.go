@@ -211,10 +211,11 @@ func TestInsertSelectCostIsEmbeddedSelectCost(t *testing.T) {
 		"INSERT INTO src VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
 		"CREATE TABLE dst (id int32 PRIMARY KEY, a int16, b int64)",
 	)
-	// 3 scanned + 3 produced + 0 projection (bare columns) = 6; storing the rows is unmetered.
+	// 1 page_read (src is one leaf) + 3 scanned + 3 produced + 0 projection (bare columns) = 7;
+	// storing the rows is unmetered.
 	out := mustCreate(t, db, "INSERT INTO dst SELECT id, a, b FROM src")
-	if out.Kind != OutcomeStatement || out.Cost != 6 {
-		t.Errorf("got kind=%v cost=%d, want statement cost=6", out.Kind, out.Cost)
+	if out.Kind != OutcomeStatement || out.Cost != 7 {
+		t.Errorf("got kind=%v cost=%d, want statement cost=7", out.Kind, out.Cost)
 	}
 }
 

@@ -155,7 +155,7 @@ SELECT id FROM w WHERE b < '\x62' ORDER BY id
 # deterministic, cross-core cost: a bytea comparison is ONE operator_eval (weight 1), like an
 # integer/text comparison — independent of byte-string length. 6 scanned + 6 filter (one `=`
 # per row) + 1 produced + 0 projection (bare column) = 13.
-# cost: 13
+# cost: 14
 query I nosort
 SELECT id FROM w WHERE b = '\x61'
 ----

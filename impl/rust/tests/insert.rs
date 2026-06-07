@@ -274,10 +274,11 @@ fn insert_select_cost_is_the_embedded_select_cost() {
         "INSERT INTO src VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
         "CREATE TABLE dst (id int32 PRIMARY KEY, a int16, b int64)",
     ]);
-    // 3 scanned + 3 produced + 0 projection (bare columns) = 6; storing the rows is unmetered.
+    // 1 page_read (src is one leaf) + 3 scanned + 3 produced + 0 projection (bare columns) = 7;
+    // storing the rows is unmetered.
     assert_eq!(
         execute(&mut db, "INSERT INTO dst SELECT id, a, b FROM src").unwrap(),
-        Outcome::Statement { cost: 6 }
+        Outcome::Statement { cost: 7 }
     );
 }
 

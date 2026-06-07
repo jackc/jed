@@ -700,6 +700,9 @@ export class Database {
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.working().store(del.table);
     const keys: Uint8Array[] = [];
+    // A full scan walks the table's whole B-tree: page_read per node (block, before the rows),
+    // then storageRowRead per row (spec/design/cost.md §3 "page_read").
+    meter.charge(COSTS.pageRead * BigInt(store.nodeCount()));
     for (const e of store.entriesInKeyOrder()) {
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
       meter.charge(COSTS.storageRowRead);
@@ -777,6 +780,9 @@ export class Database {
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.working().store(upd.table);
     const updates: { key: Uint8Array; row: Row }[] = [];
+    // A full scan walks the table's whole B-tree: page_read per node (block, before the rows),
+    // then storageRowRead per row (spec/design/cost.md §3 "page_read").
+    meter.charge(COSTS.pageRead * BigInt(store.nodeCount()));
     for (const e of store.entriesInKeyOrder()) {
       meter.charge(COSTS.storageRowRead);
       if (filter !== null && !isTrue(evalExpr(filter, e.row, env, meter))) continue;
@@ -1087,13 +1093,16 @@ export class Database {
       runSubquery: (p, o) => this.execQueryPlan(p, o, params),
     };
 
-    // Materialize each base table once, in primary-key order, charging storageRowRead per
-    // physical row (spec/design/cost.md §3 JOIN). The nested loop re-reads from these in-memory
-    // buffers, which are not stores and charge nothing.
+    // Materialize each base table once, in primary-key order. A full scan walks the table's whole
+    // B-tree, so it charges pageRead per node (block, before the rows) and storageRowRead per
+    // physical row (spec/design/cost.md §3 "page_read"/JOIN). The nested loop re-reads from these
+    // in-memory buffers, which are not stores and charge nothing.
     const meter = new Meter();
     const materialized: Row[][] = plan.rels.map((rel) => {
+      const store = this.readSnap().store(rel.tableName);
+      meter.charge(COSTS.pageRead * BigInt(store.nodeCount()));
       const tableRows: Row[] = [];
-      for (const row of this.rowsInKeyOrder(rel.tableName)) {
+      for (const row of store.iterInKeyOrder()) {
         meter.charge(COSTS.storageRowRead);
         tableRows.push(row);
       }

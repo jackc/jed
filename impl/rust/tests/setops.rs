@@ -60,12 +60,12 @@ fn union_distinct_and_all() {
 #[test]
 fn cost_is_sum_of_operands_window_unmetered() {
     let mut db = ab();
-    // 2*3 + 2*3; dedup unmetered.
+    // (1 page_read + 3 scan + 3 produce) per operand = 7 + 7; dedup unmetered.
     assert_eq!(
         execute(&mut db, "SELECT k FROM a UNION SELECT k FROM b")
             .unwrap()
             .cost(),
-        12
+        14
     );
     // LIMIT does not lower the cost: operands fully produce, the window is unmetered.
     assert_eq!(
@@ -75,7 +75,7 @@ fn cost_is_sum_of_operands_window_unmetered() {
         )
         .unwrap()
         .cost(),
-        12
+        14
     );
 }
 
