@@ -768,11 +768,31 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       cores agree on the new costs by construction). Per-core cost-assertion tests (select/insert/
       setops/subquery in each core) re-baselined to the same values. Byte format **untouched** (15
       goldens still byte-exact; `rake verify` clean). _(size: M; deps: P6.1; §13)_
-- [ ] **Buffer pool / demand paging** — make the resident set a **bounded cache of pages**
+- [ ] **P6.4 — Buffer pool / demand paging** — make the resident set a **bounded cache of pages**
       with eviction (not the whole file), so a file far larger than RAM is served by paging in
-      on demand. The `page_read` cost unit must count **logical** page accesses so the cache
-      stays invisible to deterministic cost (§13, cost.md). _(size: XL; deps: B-tree pages +
-      incremental commit; §9/§13)_
+      on demand. **Design landed** ([spec/design/pager.md](spec/design/pager.md)). **Decisions:**
+      a **universal** buffer pool (every committed-tree read paged, no full-residency fast path —
+      one uniform path, results+cost the only contract, so the pool/eviction is NOT a §8 byte
+      contract, like P5.3's per-core concurrency); reached **seam-foundation-first**. The
+      `page_read` cost unit (P6.3) is already a **logical** count, so the cache stays invisible to
+      the deterministic cost — accrual moves from structural `node_count` to **per-node-visit**
+      (corpus-neutral: every metered query is a full scan, which visits every node = same total).
+      **Slices:**
+  - [ ] **P6.4a — the pager seam (no residency change).** Introduce the `Pager` (file + in-memory
+        backings, file kept open for the handle's life; `read_block`/`write_block`/`sync`) and
+        route the whole-image load **and** the incremental commit (P6.1) through it; a buffer-pool
+        scaffold exists but the loader still materializes the full tree, so results/cost/the 15
+        goldens are **byte-unchanged**. De-risks the seam + keep-file-open lifecycle (`close` now
+        closes the file). _(mergeable, no observable change)_
+  - [ ] **P6.4b — lazy nodes + the bounded pool (the residency win).** `pmap` children become a
+        lazy `ChildRef` (clean child = page id, loaded on demand through the bounded pool with
+        **CLOCK** eviction; dirty nodes pinned); `page_read` accrual moves to per-node-visit. The
+        resident set becomes bounded. _(the XL heart)_
+  - [ ] **P6.4c — budget config + hardening.** Handle-level memory-budget API, pin-safety
+        hardening, large-file tests (a DB far exceeding the pool budget opens / scans / mutates /
+        round-trips while resident page count stays bounded).
+
+      _(size: XL; deps: B-tree pages + incremental commit [P6.1] ✓; §9/§13)_
 - [ ] **Streaming + spill-to-disk operators** — bound blocking operators (`ORDER BY`, hash
       `JOIN`, `GROUP BY`/aggregate, `DISTINCT`) by a memory budget and **spill to disk** when
       exceeded (external merge sort, grace hash join), so a query over larger-than-RAM data

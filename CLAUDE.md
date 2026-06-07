@@ -325,13 +325,14 @@ biases below are where an overriding reason *does* steer away from PG.
   **page-structured on-disk format** (fixed pages, header-recorded page size, root pointer),
   the **storage seam** as a block/page interface, **order-preserving key encoding** (§8), and
   **per-page cost metering** counted as *logical* page accesses (so a cache/buffer pool stays
-  invisible to the deterministic cost — §13). The concrete path — all **deferred** (Phase 6),
-  none foreclosed — is: **demand paging / a bounded buffer pool** (the resident set becomes a
-  cache of pages with eviction, not the whole file), **incremental copy-on-write commit**
-  (write only dirty pages; a large write set stages to disk pages, not all in RAM), **B-tree
-  interior pages** (replace the flat record chain so lookup and scan are logarithmic and
-  page-local), and **streaming + spill-to-disk operators** (sort / hash join / aggregate /
-  DISTINCT bounded by a memory budget, spilling when exceeded). The binding constraint on
+  invisible to the deterministic cost — §13). The concrete path (Phase 6, none foreclosed) —
+  **incremental copy-on-write commit** (write only dirty pages) and **B-tree interior pages**
+  (logarithmic, page-local lookup/scan) **landed in P6.1**, **page reclamation** in P6.2, the
+  *logical* `page_read` cost unit in P6.3 — continues with: **demand paging / a bounded buffer
+  pool** (the resident set becomes a cache of pages with eviction, not the whole file — **design
+  landed**, [spec/design/pager.md](spec/design/pager.md), a *universal* pool reached
+  seam-foundation-first; P6.4) and **streaming + spill-to-disk operators** (sort / hash join /
+  aggregate / DISTINCT bounded by a memory budget, spilling when exceeded). The binding constraint on
   present work: **no code above the storage seam may harden a full-residency assumption** — no
   "load = read the whole file into one buffer," no operator that *requires* its entire input
   or output to fit in RAM. Today's whole-image load/commit and flat record chain are

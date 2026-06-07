@@ -195,6 +195,16 @@ sits so the options stay open (CLAUDE.md §9).
   the watermark gate then does real work, paired with file-backed reader sharing) and on-disk
   free-list persistence (so open skips the reachable-set walk —
   [../fileformat/format.md](../fileformat/format.md) *Reclamation*).
+- **Buffer pool / demand paging** — ⏳ **design landed** ([pager.md](pager.md)), implementation
+  in slices. Makes the resident set a **bounded cache of pages** with eviction instead of the
+  whole file (CLAUDE.md §9), so a database far larger than RAM is served by paging the working
+  set in on demand through the block seam (§2). Decision: a **universal** buffer pool (every
+  read paged, no full-residency fast path — pager.md §1), reached **seam-foundation-first**
+  (P6.4a routes the load/commit through the pager with no residency change; P6.4b makes `pmap`
+  nodes lazy + bounds the resident set; P6.4c adds the memory-budget API + hardening). The
+  `page_read` cost unit (P6.3) is already a **logical** count, so the cache stays invisible to
+  the deterministic cost (pager.md §5, cost.md §3). Today's whole-image load is the
+  deliberately-narrowed current form this replaces (§1).
 - **Within-page structure** — variable-length records packed contiguously into a B-tree node
   page (a record stores its key + each column's value); an interior node prefixes its records
   with `N+1` child pointers. Slotted-page layout (intra-page free space, in-place updates) is
