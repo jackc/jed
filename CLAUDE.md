@@ -361,13 +361,19 @@ biases below are where an overriding reason *does* steer away from PG.
   deferred overflow-page path for over-large values (storage.md). Any compression library
   is added under §14.
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
-  single-file on-disk format is authored (step 5b) in `spec/fileformat/format.md` in a
-  deliberately narrowed **whole-image** form — a commit serializes the entire database to
-  one byte image. Both the Rust and Go cores read/write byte-identical files, verified
-  against shared golden fixtures (the §8 cross-core round-trip). **Deferred until
-  `UPDATE`/`DELETE`:** incremental copy-on-write, free-list/page reclamation, and B-tree
-  interior pages. The double-buffered meta page + root pointer are the forward-compatible
-  hooks for the live incremental commit model (§3).
+  single-file on-disk format is authored in `spec/fileformat/format.md` and is now the
+  **page-backed copy-on-write B-tree** (`format_version` 2, Phase 6): each table's rows are an
+  on-disk B-tree (leaf + interior node pages) and a commit is **incremental** — it writes only
+  the dirty pages a mutation introduced and publishes the new root by alternating the meta slot
+  (P6.1), rather than rewriting the whole image. **Page reclamation** (P6.2) reconstructs a
+  **free-list** of dead pages on open and the commit allocator reuses them, so a file no longer
+  grows without bound. All three cores (Rust, Go, TS) **and** the Ruby reference read/write
+  byte-identical files, verified against shared golden fixtures (the §8 cross-core round-trip;
+  the goldens pin the clean *from-scratch* image). The double-buffered meta page + root pointer
+  are the hooks the incremental commit model (§3) uses. **Still deferred** (later Phase-6, none
+  foreclosed): continuous within-session reclamation + on-disk free-list persistence (P6.2
+  follow-ons), demand paging / a buffer pool, overflow pages, and compression. The from-scratch
+  whole-image serializer survives as `create`'s initial write and the golden generator.
 - **Host file API (Phase 7).** The embedding surface (`spec/design/api.md`) `open`s/`create`s
   a database file and `commit`s the whole image **durably** via temp-file + fsync + atomic
   rename + dir fsync (whole-image rewrite ⇒ rename gives all-or-nothing for free). `commit` is

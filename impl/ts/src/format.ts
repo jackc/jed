@@ -408,7 +408,36 @@ export type IncrementalWrite = {
   pages: { index: number; bytes: Uint8Array }[];
   rootPage: number;
   pageCount: number;
+  // freeRemaining is the free-list entries this commit did not consume — the new free-list (P6.2).
+  // file.ts stores it back on the handle for the next commit (spec/fileformat/format.md *Reclamation*).
+  freeRemaining: number[];
 };
+
+// PageAlloc hands out page indices for an incremental commit: the free-list first (lowest index, the
+// pages a prior root abandoned — spec/fileformat/format.md *Reclamation*), then fresh indices at the
+// high-water once the free-list is exhausted. The free-list is pre-sorted ascending, so lowest-first
+// allocation is deterministic and the bytes stay cross-core identical. Reusing a free page is
+// torn-write-safe: it left the free-list only here, becoming part of the new committed version, so it
+// is reachable from no fallback snapshot.
+class PageAlloc {
+  private free: number[];
+  cursor = 0;
+  next: number;
+
+  constructor(free: number[], next: number) {
+    this.free = free;
+    this.next = next;
+  }
+
+  take(): number {
+    if (this.cursor < this.free.length) return this.free[this.cursor++]!;
+    return this.next++;
+  }
+
+  remaining(): number[] {
+    return this.free.slice(this.cursor);
+  }
+}
 
 // incrementalImage assembles the dirty body pages + freshly-rewritten catalog for an incremental
 // commit, appending page allocation from startPage (the on-disk high-water) — the write path's
@@ -417,61 +446,66 @@ export type IncrementalWrite = {
 // catalog chain is always rewritten (it carries each table's possibly-moved root). The dirty nodes'
 // set-once page ids are assigned here. The page size was validated at file creation, so no size check
 // is repeated.
-export function incrementalImage(snap: Snapshot, pageSize: number, startPage: number): IncrementalWrite {
+export function incrementalImage(
+  snap: Snapshot,
+  pageSize: number,
+  startPage: number,
+  free: number[],
+): IncrementalWrite {
   const ps = pageSize;
   const capacity = ps - PAGE_HEADER;
 
   const keys = [...snap.tables.keys()].sort();
 
+  // Allocate from the free-list first (reclaiming dead pages), then extend the file.
+  const alloc = new PageAlloc(free, startPage);
+
   const pages: { index: number; bytes: Uint8Array }[] = [];
-  let next = startPage;
   const rootDataPage: number[] = new Array(keys.length).fill(0);
   for (let ti = 0; ti < keys.length; ti++) {
     const root = snap.stores.get(keys[ti]!)!.treeRoot();
     if (root !== null) {
-      const r = serializeDirty(root, snap.tables.get(keys[ti]!)!, capacity, ps, next, pages);
-      rootDataPage[ti] = r.index;
-      next = r.next;
+      rootDataPage[ti] = serializeDirty(root, snap.tables.get(keys[ti]!)!, capacity, ps, alloc, pages);
     }
   }
 
-  // The catalog chain is rewritten to fresh appended pages every commit (table roots move).
-  const catRoot = next;
+  // The catalog chain is rewritten to fresh pages every commit (table roots move). Allocate its page
+  // indices up front — they may be reused free pages, hence not contiguous — so each page can point at
+  // the next (`pack` always returns ≥ 1 group, so catPages is non-empty).
   const entrySizes = keys.map((k) => tableEntryBytes(snap.tables.get(k)!, 0).length);
   const catGroups = pack(entrySizes, capacity);
-  next += catGroups.length;
+  const catPages = catGroups.map(() => alloc.take());
+  const catRoot = catPages[0]!;
   for (let gi = 0; gi < catGroups.length; gi++) {
     const group = catGroups[gi]!;
-    const index = catRoot + gi;
-    const nextPage = gi + 1 < catGroups.length ? index + 1 : 0;
+    const nextPage = gi + 1 < catGroups.length ? catPages[gi + 1]! : 0;
     const parts = group.map((ti) => tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!));
-    pages.push({ index, bytes: makePage(ps, PAGE_CATALOG, group.length, nextPage, concat(parts)) });
+    pages.push({ index: catPages[gi]!, bytes: makePage(ps, PAGE_CATALOG, group.length, nextPage, concat(parts)) });
   }
 
-  return { pages, rootPage: catRoot, pageCount: next };
+  return { pages, rootPage: catRoot, pageCount: alloc.next, freeRemaining: alloc.remaining() };
 }
 
 // serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
-// each as a full pageSize page to `pages`, and returns this node's page index and the next free index.
-// A clean node (already persisted, page !== 0) short-circuits: its whole subtree is on disk unchanged
-// (copy-on-write only rebuilds the modified path), so nothing is written and its existing page is
-// returned. The node's set-once page id is stored here. Mirrors serializeNode for the byte layout.
+// each as a full pageSize page to `pages`, and returns this node's page index. A clean node (already
+// persisted, page !== 0) short-circuits: its whole subtree is on disk unchanged (copy-on-write only
+// rebuilds the modified path), so nothing is written and its existing page is returned. The node's
+// set-once page id is stored here. Page indices come from the allocator (free-list first, then the
+// high-water). Mirrors serializeNode for the byte layout.
 function serializeDirty(
   n: PNode,
   table: Table,
   capacity: number,
   ps: number,
-  nextIndex: number,
+  alloc: PageAlloc,
   pages: { index: number; bytes: Uint8Array }[],
-): { index: number; next: number } {
+): number {
   if (n.page !== 0) {
-    return { index: n.page, next: nextIndex };
+    return n.page;
   }
   const childPages: number[] = [];
   for (const c of n.children) {
-    const r = serializeDirty(c, table, capacity, ps, nextIndex, pages);
-    childPages.push(r.index);
-    nextIndex = r.next;
+    childPages.push(serializeDirty(c, table, capacity, ps, alloc, pages));
   }
   const w = new ByteWriter();
   let pageType = PAGE_LEAF;
@@ -486,11 +520,10 @@ function serializeDirty(
   if (payload.length > capacity) {
     throw engineError("feature_not_supported", "a record larger than the per-row limit is not supported");
   }
-  const index = nextIndex;
-  nextIndex++;
+  const index = alloc.take();
   n.page = index;
   pages.push({ index, bytes: makePage(ps, pageType, n.keys.length, 0, payload) });
-  return { index, next: nextIndex };
+  return index;
 }
 
 // loadDatabase reconstructs a database from an on-disk image (inverse of toImage).
@@ -509,8 +542,13 @@ export function loadDatabase(image: Uint8Array): Database {
   // Build the committed snapshot from the image, then wrap it in a fresh handle that adopts the
   // file's serialization parameters (spec/design/api.md §2).
   const snap = new Snapshot(mt.txid);
+  // Reconstruct the free-list (P6.2): collect every page reachable from the committed root — the
+  // catalog chain plus each table's B-tree nodes — as we load it; the rest of [2, pageCount) is dead
+  // space the next incremental commit may reuse (spec/fileformat/format.md *Reclamation*).
+  const reached = new Set<number>();
   let catPage = mt.rootPage;
   while (catPage !== 0) {
+    reached.add(catPage);
     const pg = readPage(image, dv, pageSize, catPage);
     if (pg.pageType !== PAGE_CATALOG) {
       throw engineError("data_corrupted", "expected a catalog page");
@@ -523,6 +561,7 @@ export function loadDatabase(image: Uint8Array): Database {
       snap.putTable(table, pageSize);
       if (root !== 0) {
         const t = readTree(image, dv, pageSize, root, colTypes);
+        collectNodePages(t.node, reached);
         const store = snap.stores.get(table.name.toLowerCase())!;
         store.setTree(t.node, t.length);
         // No-PK keys are synthetic int64 rowids — advance the counter past the largest (the last
@@ -538,8 +577,21 @@ export function loadDatabase(image: Uint8Array): Database {
   const db = new Database();
   db.pageSize = pageSize;
   db.pageCount = mt.pageCount; // the on-disk high-water for the next incremental commit
+  // The free-list: every body page [2, pageCount) the committed root does not reach (P6.2). Ascending
+  // by construction, so the allocator reuses lowest-first.
+  for (let p = ROOT_PAGE; p < mt.pageCount; p++) {
+    if (!reached.has(p)) db.freePages.push(p);
+  }
   db.committed = snap;
   return db;
+}
+
+// collectNodePages records the on-disk page index of node and every descendant (a loaded tree, all
+// pages set) into reached — the live set the free-list reconstruction subtracts from
+// [2, pageCount) (P6.2).
+function collectNodePages(n: PNode, reached: Set<number>): void {
+  reached.add(n.page);
+  for (const c of n.children) collectNodePages(c, reached);
 }
 
 // readTree reads a table's on-disk B-tree (rooted at pageIdx) into an in-memory tree, returning the

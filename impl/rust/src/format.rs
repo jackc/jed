@@ -8,6 +8,7 @@
 //! file written by this core is byte-identical to the Go, TS, and Ruby reference output (CLAUDE.md
 //! §8). All multi-byte integers are big-endian.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -291,6 +292,35 @@ pub(crate) struct IncrementalWrite {
     pub(crate) pages: Vec<(u32, Vec<u8>)>,
     pub(crate) root_page: u32,
     pub(crate) page_count: u32,
+    /// The free-list entries this commit did **not** consume — the new free-list (P6.2). `file.rs`
+    /// stores it back on the handle for the next commit (spec/fileformat/format.md *Reclamation*).
+    pub(crate) free_remaining: Vec<u32>,
+}
+
+/// Allocates page indices for an incremental commit: the **free-list** first (lowest index, the
+/// pages a prior root abandoned — spec/fileformat/format.md *Reclamation*), then fresh indices at
+/// the high-water once the free-list is exhausted. The free-list is pre-sorted ascending, so
+/// lowest-first allocation is deterministic and the bytes stay cross-core identical. Reusing a free
+/// page is torn-write-safe: it left the free-list only here, becoming part of the new committed
+/// version, so it is reachable from no fallback snapshot.
+struct PageAlloc<'a> {
+    free: &'a [u32],
+    cursor: usize,
+    next: u32,
+}
+
+impl PageAlloc<'_> {
+    fn take(&mut self) -> u32 {
+        if self.cursor < self.free.len() {
+            let p = self.free[self.cursor];
+            self.cursor += 1;
+            p
+        } else {
+            let p = self.next;
+            self.next += 1;
+            p
+        }
+    }
 }
 
 impl Snapshot {
@@ -305,6 +335,7 @@ impl Snapshot {
         &self,
         page_size: u32,
         start_page: u32,
+        free: &[u32],
     ) -> Result<IncrementalWrite> {
         let ps = page_size as usize;
         let cap = ps - PAGE_HEADER;
@@ -312,27 +343,34 @@ impl Snapshot {
         let mut tables = self.catalog_and_stores();
         tables.sort_by(|a, b| a.0.cmp(b.0));
 
+        // Allocate from the free-list first (reclaiming dead pages), then extend the file.
+        let mut alloc = PageAlloc {
+            free,
+            cursor: 0,
+            next: start_page,
+        };
+
         let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
-        let mut next = start_page;
         let mut root_data_page = vec![0u32; tables.len()];
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
-                root_data_page[ti] = serialize_dirty(root, table, cap, ps, &mut next, &mut pages)?;
+                root_data_page[ti] = serialize_dirty(root, table, cap, ps, &mut alloc, &mut pages)?;
             }
         }
 
-        // The catalog chain is rewritten to fresh appended pages every commit (table roots move).
-        let cat_root = next;
+        // The catalog chain is rewritten to fresh pages every commit (table roots move). Allocate
+        // its page indices up front — they may be reused free pages, hence not contiguous — so each
+        // page can point at the next (`pack` always returns ≥ 1 group, so `cat_pages` is non-empty).
         let entry_sizes: Vec<usize> = tables
             .iter()
             .map(|(_, t, _)| table_entry_bytes(t, 0).len())
             .collect();
         let cat_groups = pack(&entry_sizes, cap)?;
-        next += cat_groups.len() as u32;
+        let cat_pages: Vec<u32> = (0..cat_groups.len()).map(|_| alloc.take()).collect();
+        let cat_root = cat_pages[0];
         for (gi, group) in cat_groups.iter().enumerate() {
-            let index = cat_root + gi as u32;
             let next_page = if gi + 1 < cat_groups.len() {
-                index + 1
+                cat_pages[gi + 1]
             } else {
                 0
             };
@@ -341,7 +379,7 @@ impl Snapshot {
                 payload.extend_from_slice(&table_entry_bytes(tables[ti].1, root_data_page[ti]));
             }
             pages.push((
-                index,
+                cat_pages[gi],
                 make_page(ps, PAGE_CATALOG, group.len() as u32, next_page, &payload),
             ));
         }
@@ -349,7 +387,8 @@ impl Snapshot {
         Ok(IncrementalWrite {
             pages,
             root_page: cat_root,
-            page_count: next,
+            page_count: alloc.next,
+            free_remaining: alloc.free[alloc.cursor..].to_vec(),
         })
     }
 }
@@ -365,7 +404,7 @@ fn serialize_dirty(
     table: &Table,
     cap: usize,
     ps: usize,
-    next: &mut u32,
+    alloc: &mut PageAlloc,
     pages: &mut Vec<(u32, Vec<u8>)>,
 ) -> Result<u32> {
     let existing = node.page.load(Ordering::Acquire);
@@ -374,7 +413,7 @@ fn serialize_dirty(
     }
     let mut child_pages = Vec::with_capacity(node.children.len());
     for child in &node.children {
-        child_pages.push(serialize_dirty(child, table, cap, ps, next, pages)?);
+        child_pages.push(serialize_dirty(child, table, cap, ps, alloc, pages)?);
     }
     let n = node.keys.len() as u32;
     let mut payload = Vec::new();
@@ -395,8 +434,7 @@ fn serialize_dirty(
             "a record larger than the per-row limit is not supported",
         ));
     }
-    let index = *next;
-    *next += 1;
+    let index = alloc.take();
     node.page.store(index, Ordering::Release);
     pages.push((index, make_page(ps, page_type, n, 0, &payload)));
     Ok(index)
@@ -427,8 +465,14 @@ impl Database {
         // adopts the file's serialization parameters (spec/design/api.md §2).
         let mut snap = Snapshot::default();
         snap.txid = meta.txid;
+        // Reconstruct the free-list (P6.2): collect every page reachable from the committed root —
+        // the catalog chain plus each table's B-tree nodes — as we load it; the rest of `[2,
+        // page_count)` is dead space the next incremental commit may reuse
+        // (spec/fileformat/format.md *Reclamation*).
+        let mut reached: HashSet<u32> = HashSet::new();
         let mut cat_page = meta.root_page;
         while cat_page != 0 {
+            reached.insert(cat_page);
             let page = read_page(image, page_size, cat_page)?;
             if page.page_type != PAGE_CATALOG {
                 return Err(corrupt("expected a catalog page"));
@@ -442,6 +486,7 @@ impl Database {
                 snap.put_table(table, page_size as u32);
                 if root_data_page != 0 {
                     let (root, len) = read_tree(image, page_size, root_data_page, &col_types)?;
+                    collect_node_pages(&root, &mut reached);
                     let store = snap.store_mut(&name);
                     store.set_tree(Some(root), len);
                     // No-PK keys are synthetic int64 rowids — advance the counter past the largest
@@ -462,8 +507,22 @@ impl Database {
         let mut db = Database::new();
         db.page_size = page_size as u32;
         db.page_count = meta.page_count; // the on-disk high-water for the next incremental commit
+        // The free-list: every body page `[2, page_count)` the committed root does not reach
+        // (P6.2). Ascending by construction (the range is), so the allocator reuses lowest-first.
+        db.free_pages = (ROOT_PAGE..meta.page_count)
+            .filter(|p| !reached.contains(p))
+            .collect();
         db.committed = snap;
         Ok(db)
+    }
+}
+
+/// Collect the on-disk page index of `node` and every descendant (a loaded tree, all pages set) into
+/// `reached` — the live set the free-list reconstruction subtracts from `[2, page_count)` (P6.2).
+fn collect_node_pages(node: &Arc<Node>, reached: &mut HashSet<u32>) {
+    reached.insert(node.page.load(Ordering::Acquire));
+    for child in &node.children {
+        collect_node_pages(child, reached);
     }
 }
 

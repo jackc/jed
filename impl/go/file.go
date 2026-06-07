@@ -82,19 +82,20 @@ func (db *Database) writeFullImage() error {
 
 // persist durably publishes snap to the backing file via an incremental copy-on-write commit
 // (spec/fileformat/format.md *Allocation & incremental commit*; transactions.md §9) — the
-// synchronous-commit chokepoint. Append the dirty pages this transaction introduced, Sync, write the
-// alternate meta slot (snap.txid & 1), Sync. Clean pages are never rewritten; pages an old root drops
-// are leaked (P6.2 reclaims). A crash between the two syncs leaves the prior meta — and thus the prior
-// snapshot — intact (the body pages were only appended). An in-memory database (no path) is a no-op
-// success: it does not mutate db, and the committed swap happens in commitTx only after this returns
-// nil. db.pageCount advances only after both syncs succeed, so a write failure leaves db, committed,
-// and the file's prior meta untouched (the working snapshot is then discarded). The future
-// synchronous=off mode gates here.
+// synchronous-commit chokepoint. Write the dirty pages this transaction introduced — reusing free-list
+// pages a prior root abandoned before extending the file (P6.2) — Sync, write the alternate meta slot
+// (snap.txid & 1), Sync. Clean pages are never rewritten. A crash between the two syncs leaves the
+// prior meta — and thus the prior snapshot — intact (its pages were not overwritten: a reused free page
+// is reachable from no live snapshot). An in-memory database (no path) is a no-op success: it does not
+// mutate db, and the committed swap happens in commitTx only after this returns nil. db.pageCount /
+// db.freePages advance only after both syncs succeed, so a write failure leaves db, committed, and the
+// file's prior meta untouched (the working snapshot is then discarded). The future synchronous=off mode
+// gates here.
 func (db *Database) persist(snap *Snapshot) error {
 	if db.path == "" {
 		return nil
 	}
-	write, err := snap.incrementalImage(db.pageSize, db.pageCount)
+	write, err := snap.incrementalImage(db.pageSize, db.pageCount, db.freePages)
 	if err != nil {
 		return err
 	}
@@ -120,6 +121,7 @@ func (db *Database) persist(snap *Snapshot) error {
 		return ioError(err)
 	}
 	db.pageCount = write.pageCount
+	db.freePages = write.freeRemaining
 	return nil
 }
 

@@ -297,6 +297,32 @@ type incrementalWrite struct {
 	pages     []dirtyPage
 	rootPage  uint32
 	pageCount uint32
+	// freeRemaining is the free-list entries this commit did not consume — the new free-list (P6.2).
+	// file.go stores it back on the handle for the next commit (spec/fileformat/format.md *Reclamation*).
+	freeRemaining []uint32
+}
+
+// pageAlloc hands out page indices for an incremental commit: the free-list first (lowest index, the
+// pages a prior root abandoned — spec/fileformat/format.md *Reclamation*), then fresh indices at the
+// high-water once the free-list is exhausted. The free-list is pre-sorted ascending, so lowest-first
+// allocation is deterministic and the bytes stay cross-core identical. Reusing a free page is
+// torn-write-safe: it left the free-list only here, becoming part of the new committed version, so it
+// is reachable from no fallback snapshot.
+type pageAlloc struct {
+	free   []uint32
+	cursor int
+	next   uint32
+}
+
+func (a *pageAlloc) take() uint32 {
+	if a.cursor < len(a.free) {
+		p := a.free[a.cursor]
+		a.cursor++
+		return p
+	}
+	p := a.next
+	a.next++
+	return p
 }
 
 // incrementalImage assembles the dirty body pages + freshly-rewritten catalog for an incremental
@@ -306,7 +332,7 @@ type incrementalWrite struct {
 // catalog chain is always rewritten (it carries each table's possibly-moved root). The dirty nodes'
 // set-once page ids are assigned here. The page size was validated at file creation, so no size check
 // is repeated.
-func (s *Snapshot) incrementalImage(pageSize, startPage uint32) (incrementalWrite, error) {
+func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32) (incrementalWrite, error) {
 	ps := int(pageSize)
 	capacity := ps - pageHeader
 
@@ -316,22 +342,24 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32) (incrementalWrit
 	}
 	sort.Strings(keys)
 
+	// Allocate from the free-list first (reclaiming dead pages), then extend the file.
+	alloc := &pageAlloc{free: free, next: startPage}
+
 	var pages []dirtyPage
-	next := startPage
 	rootDataPage := make([]uint32, len(keys))
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, np, err := serializeDirty(root, s.tables[k], capacity, ps, next, &pages)
+			rp, err := serializeDirty(root, s.tables[k], capacity, ps, alloc, &pages)
 			if err != nil {
 				return incrementalWrite{}, err
 			}
 			rootDataPage[ti] = rp
-			next = np
 		}
 	}
 
-	// The catalog chain is rewritten to fresh appended pages every commit (table roots move).
-	catRoot := next
+	// The catalog chain is rewritten to fresh pages every commit (table roots move). Allocate its
+	// page indices up front — they may be reused free pages, hence not contiguous — so each page can
+	// point at the next (pack always returns ≥ 1 group, so catPages is non-empty).
 	entrySizes := make([]int, len(keys))
 	for ti, k := range keys {
 		entrySizes[ti] = len(tableEntryBytes(s.tables[k], 0))
@@ -340,41 +368,44 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32) (incrementalWrit
 	if err != nil {
 		return incrementalWrite{}, err
 	}
-	next += uint32(len(catGroups))
+	catPages := make([]uint32, len(catGroups))
+	for i := range catPages {
+		catPages[i] = alloc.take()
+	}
+	catRoot := catPages[0]
 	for gi, group := range catGroups {
-		index := catRoot + uint32(gi)
 		var nextPage uint32
 		if gi+1 < len(catGroups) {
-			nextPage = index + 1
+			nextPage = catPages[gi+1]
 		}
 		var payload []byte
 		for _, ti := range group {
 			payload = append(payload, tableEntryBytes(s.tables[keys[ti]], rootDataPage[ti])...)
 		}
-		pages = append(pages, dirtyPage{index: index, bytes: makePage(ps, pageCatalog, uint32(len(group)), nextPage, payload)})
+		pages = append(pages, dirtyPage{index: catPages[gi], bytes: makePage(ps, pageCatalog, uint32(len(group)), nextPage, payload)})
 	}
 
-	return incrementalWrite{pages: pages, rootPage: catRoot, pageCount: next}, nil
+	return incrementalWrite{pages: pages, rootPage: catRoot, pageCount: alloc.next, freeRemaining: alloc.free[alloc.cursor:]}, nil
 }
 
 // serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
-// each as a full pageSize page to *pages, and returns this node's page index and the next free index.
-// A clean node (already persisted, page != 0) short-circuits: its whole subtree is on disk unchanged
-// (copy-on-write only rebuilds the modified path), so nothing is written and its existing page is
-// returned. The node's set-once page id is stored here — safe, as the working tree is owned by the
-// single writer at commit. Mirrors serializeNode for the byte layout.
-func serializeDirty(n *pnode, table *Table, capacity, ps int, nextIndex uint32, pages *[]dirtyPage) (uint32, uint32, error) {
+// each as a full pageSize page to *pages, and returns this node's page index. A clean node (already
+// persisted, page != 0) short-circuits: its whole subtree is on disk unchanged (copy-on-write only
+// rebuilds the modified path), so nothing is written and its existing page is returned. The node's
+// set-once page id is stored here — safe, as the working tree is owned by the single writer at commit.
+// Page indices come from the allocator (free-list first, then the high-water). Mirrors serializeNode
+// for the byte layout.
+func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, pages *[]dirtyPage) (uint32, error) {
 	if n.page != 0 {
-		return n.page, nextIndex, nil
+		return n.page, nil
 	}
 	childPages := make([]uint32, len(n.children))
 	for i, c := range n.children {
-		cp, np, err := serializeDirty(c, table, capacity, ps, nextIndex, pages)
+		cp, err := serializeDirty(c, table, capacity, ps, alloc, pages)
 		if err != nil {
-			return 0, 0, err
+			return 0, err
 		}
 		childPages[i] = cp
-		nextIndex = np
 	}
 	var payload []byte
 	pageType := pageLeaf
@@ -388,13 +419,12 @@ func serializeDirty(n *pnode, table *Table, capacity, ps int, nextIndex uint32, 
 		payload = append(payload, encodeRecord(table, n.keys[i], n.vals[i])...)
 	}
 	if len(payload) > capacity {
-		return 0, 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
+		return 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
 	}
-	index := nextIndex
-	nextIndex++
+	index := alloc.take()
 	n.page = index
 	*pages = append(*pages, dirtyPage{index: index, bytes: makePage(ps, pageType, uint32(len(n.keys)), 0, payload)})
-	return index, nextIndex, nil
+	return index, nil
 }
 
 // LoadDatabase reconstructs a database from an on-disk image (inverse of ToImage).
@@ -416,8 +446,13 @@ func LoadDatabase(image []byte) (*Database, error) {
 	// file's serialization parameters (spec/design/api.md §2).
 	snap := newSnapshot()
 	snap.txid = mt.txid
+	// Reconstruct the free-list (P6.2): collect every page reachable from the committed root — the
+	// catalog chain plus each table's B-tree nodes — as we load it; the rest of [2, pageCount) is dead
+	// space the next incremental commit may reuse (spec/fileformat/format.md *Reclamation*).
+	reached := make(map[uint32]bool)
 	catPage := mt.rootPage
 	for catPage != 0 {
+		reached[catPage] = true
 		pg, err := readPage(image, pageSize, catPage)
 		if err != nil {
 			return nil, err
@@ -443,6 +478,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 				if err != nil {
 					return nil, err
 				}
+				collectNodePages(root, reached)
 				store := snap.stores[strings.ToLower(name)]
 				store.setTree(root, length)
 				// No-PK keys are synthetic int64 rowids — advance the counter past the largest (the
@@ -458,8 +494,25 @@ func LoadDatabase(image []byte) (*Database, error) {
 	db := NewDatabase()
 	db.pageSize = uint32(pageSize)
 	db.pageCount = mt.pageCount // the on-disk high-water for the next incremental commit
+	// The free-list: every body page [2, pageCount) the committed root does not reach (P6.2).
+	// Ascending by construction, so the allocator reuses lowest-first.
+	for p := rootPage; p < mt.pageCount; p++ {
+		if !reached[p] {
+			db.freePages = append(db.freePages, p)
+		}
+	}
 	db.committed = snap
 	return db, nil
+}
+
+// collectNodePages records the on-disk page index of node and every descendant (a loaded tree, all
+// pages set) into reached — the live set the free-list reconstruction subtracts from
+// [2, pageCount) (P6.2).
+func collectNodePages(n *pnode, reached map[uint32]bool) {
+	reached[n.page] = true
+	for _, c := range n.children {
+		collectNodePages(c, reached)
+	}
 }
 
 // readTree reads a table's on-disk B-tree (rooted at pageIdx) into an in-memory tree, returning the

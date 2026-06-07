@@ -83,12 +83,13 @@ impl Database {
 
     /// Durably publish `snap` to the backing file via an **incremental** copy-on-write commit
     /// (spec/fileformat/format.md *Allocation & incremental commit*; transactions.md §9) — the
-    /// synchronous-commit chokepoint. Append the dirty pages this transaction introduced, `sync`,
-    /// write the **alternate** meta slot (`snap.txid & 1`), `sync`. Clean pages are never rewritten;
-    /// pages an old root drops are leaked (P6.2 reclaims). A crash between the two syncs leaves the
-    /// prior meta — and thus the prior snapshot — intact (the body pages were only appended). An
-    /// in-memory database (no path) is a **no-op success**: it does not mutate `self`, and the
-    /// committed swap happens in `commit_tx` only after this returns Ok. `page_count` advances only
+    /// synchronous-commit chokepoint. Write the dirty pages this transaction introduced — reusing
+    /// free-list pages a prior root abandoned before extending the file (P6.2) — `sync`, write the
+    /// **alternate** meta slot (`snap.txid & 1`), `sync`. Clean pages are never rewritten. A crash
+    /// between the two syncs leaves the prior meta — and thus the prior snapshot — intact (its pages
+    /// were not overwritten: a reused free page is reachable from no live snapshot). An in-memory
+    /// database (no path) is a **no-op success**: it does not mutate `self`, and the committed swap
+    /// happens in `commit_tx` only after this returns Ok. `page_count` / `free_pages` advance only
     /// after both syncs succeed, so a write failure leaves `self`, `committed`, and the file's prior
     /// meta untouched (the working snapshot is then discarded). The `synchronous=off` mode gates here.
     pub(crate) fn persist(&mut self, snap: &Snapshot) -> Result<()> {
@@ -96,7 +97,8 @@ impl Database {
             None => return Ok(()),
             Some(p) => p.clone(),
         };
-        let write = snap.incremental_image(self.page_size, self.page_count)?;
+        let free = self.free_pages.clone();
+        let write = snap.incremental_image(self.page_size, self.page_count, &free)?;
         let ps = self.page_size as u64;
         let mut f = OpenOptions::new()
             .read(true)
@@ -116,6 +118,7 @@ impl Database {
         f.write_all(&meta).map_err(io_error)?;
         f.sync_all().map_err(io_error)?; // the commit is published
         self.page_count = write.page_count;
+        self.free_pages = write.free_remaining;
         Ok(())
     }
 

@@ -76,16 +76,16 @@ export function open(path: string): Database {
 // persistImpl durably publishes snap to the backing file via an incremental copy-on-write commit
 // (spec/fileformat/format.md *Allocation & incremental commit*; transactions.md §9), installed as the
 // Database.persistHook by create/open and called by commitTx with the working snapshot being
-// published. Append the dirty pages this transaction introduced, fsync, write the alternate meta slot
-// (snap.txid & 1), fsync. Clean pages are never rewritten; pages an old root drops are leaked (P6.2
-// reclaims). A crash between the two fsyncs leaves the prior meta — and thus the prior snapshot —
-// intact (the body pages were only appended). An in-memory database has no persistHook. db.pageCount
-// advances only after both fsyncs succeed, so a write failure leaves db, committed, and the file's
-// prior meta untouched (the working snapshot is then discarded). The future synchronous=off mode
-// gates here.
+// published. Write the dirty pages this transaction introduced — reusing free-list pages a prior root
+// abandoned before extending the file (P6.2) — fsync, write the alternate meta slot (snap.txid & 1),
+// fsync. Clean pages are never rewritten. A crash between the two fsyncs leaves the prior meta — and
+// thus the prior snapshot — intact (its pages were not overwritten: a reused free page is reachable
+// from no live snapshot). An in-memory database has no persistHook. db.pageCount / db.freePages advance
+// only after both fsyncs succeed, so a write failure leaves db, committed, and the file's prior meta
+// untouched (the working snapshot is then discarded). The future synchronous=off mode gates here.
 function persistImpl(db: Database, snap: Snapshot): void {
   if (db.path === null) return;
-  const write = incrementalImage(snap, db.pageSize, db.pageCount);
+  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages);
   const ps = db.pageSize;
   const fd = openSync(db.path, "r+");
   try {
@@ -100,6 +100,7 @@ function persistImpl(db: Database, snap: Snapshot): void {
     closeSync(fd);
   }
   db.pageCount = write.pageCount;
+  db.freePages = write.freeRemaining;
 }
 
 // commit commits the current transaction (spec/design/api.md §2.2, transactions.md §4.2).

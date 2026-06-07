@@ -121,11 +121,12 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 > ([../fileformat/format.md](../fileformat/format.md)). The block seam (§2) is real: a commit
 > writes individual pages in place / appends, rather than rewriting the whole file.
 >
-> **Still deferred** (later Phase-6 items, none foreclosed): free-list / page **reclamation**
-> (P6.2 — P6.1 *leaks* the pages an old root no longer references, so the file grows on every
-> commit; gated on the §8 watermark when it lands), demand paging / a bounded buffer pool,
-> overflow pages for over-large values (P6.1 caps a single row at `C/2` → `0A000`), and
-> compression. The whole-image `to_image` survives as the **from-scratch** serializer used by
+> **Free-list reclamation (P6.2) has since landed** (reconstruct-on-open): the commit allocator
+> reuses dead pages from a free-list rebuilt on open, so the file no longer grows without bound
+> (§6). **Still deferred** (later Phase-6 items, none foreclosed): continuous within-session
+> reclamation + on-disk free-list persistence (P6.2 follow-ons), demand paging / a bounded
+> buffer pool, overflow pages for over-large values (P6.1 caps a single row at `C/2` → `0A000`),
+> and compression. The whole-image `to_image` survives as the **from-scratch** serializer used by
 > `create`'s initial write and the golden fixtures (the special case where every node is
 > dirty); the live commit path is the incremental one.
 >
@@ -180,10 +181,20 @@ sits so the options stay open (CLAUDE.md §9).
   writes only the dirty path of the copy-on-write B-tree + the rewritten catalog to fresh
   appended pages, then publishes the alternate meta slot (§4 status note). The no-PK rowid is
   a **monotonic counter**, reconstructed on load as `max key + 1`.
-- **Free-list / page reclamation** — still deferred (**P6.2**). P6.1 *leaks* the pages an old
-  root no longer references (the file grows on every commit); reclamation reuses them, gated
-  on the oldest-live-snapshot watermark (transactions.md §8): a page freed at `txid T` is
-  reusable only once `oldest_live_txid > T`.
+- **Free-list / page reclamation** — ✅ **landed (P6.2), reconstruct-on-open form.** P6.1
+  *leaked* every page an old root dropped (the file grew on every commit); P6.2 reconstructs a
+  free-list — `[2, page_count)` minus the pages reachable from the committed root — **on open**,
+  and the commit allocator (§4) reuses them (lowest index first) before extending the file. A
+  page leaves the list only by being allocated into the new committed version, so it is never
+  reachable from a fallback snapshot and reuse is torn-write-safe; the oldest-live-snapshot
+  watermark (transactions.md §8 — a page freed at `txid T` is reusable only once
+  `oldest_live_txid > T`) holds trivially on a single file-backed handle
+  (`oldest_live_txid == committed.txid`). The free-list is **not persisted** (reserved meta
+  offset 28 stays `0`); orphans created *within* a session are reclaimed at the next open.
+  **Deferred follow-ons:** continuous within-session reclamation (return orphans immediately —
+  the watermark gate then does real work, paired with file-backed reader sharing) and on-disk
+  free-list persistence (so open skips the reachable-set walk —
+  [../fileformat/format.md](../fileformat/format.md) *Reclamation*).
 - **Within-page structure** — variable-length records packed contiguously into a B-tree node
   page (a record stores its key + each column's value); an interior node prefixes its records
   with `N+1` child pointers. Slotted-page layout (intra-page free space, in-place updates) is

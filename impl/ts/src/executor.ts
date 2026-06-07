@@ -183,10 +183,17 @@ export class Database {
   // the page size this database serializes with. The commit counter lives in `committed.txid`.
   path: string | null;
   pageSize: number;
-  // pageCount is the on-disk page high-water — the next free page an incremental commit appends at
-  // (spec/fileformat/format.md, P6.1 part B). Set from the file's meta on open, from the initial
-  // image on create; 0 (unused) for an in-memory database. Only grows this slice (pages leak).
+  // pageCount is the on-disk page high-water — the index an incremental commit extends at when the
+  // free-list is exhausted (spec/fileformat/format.md). Set from the file's meta on open, from the
+  // initial image on create; 0 (unused) for an in-memory database.
   pageCount: number;
+  // freePages is the free-list (P6.2): page indices a prior root abandoned, reusable by the next
+  // incremental commit (spec/fileformat/format.md *Reclamation*). Reconstructed on open as
+  // [2, pageCount) minus the committed root's reachable pages; drawn lowest-first before the file is
+  // extended. A page leaves the list only by being allocated into a new committed version, so it is
+  // reachable from no live snapshot and reuse is torn-write-safe. Empty for an in-memory database and
+  // for a freshly-created file (a from-scratch image leaks nothing).
+  freePages: number[];
   // persistHook is the durable-write seam (spec/design/storage.md §2): null for an in-memory
   // database, set by the file host (file.ts create/open) to the synchronous whole-image write. It
   // is called by commitTx with the working snapshot being published (transactions.md §4.1/§9).
@@ -199,6 +206,7 @@ export class Database {
     this.path = null;
     this.pageSize = DEFAULT_PAGE_SIZE;
     this.pageCount = 0;
+    this.freePages = [];
     this.persistHook = null;
   }
 

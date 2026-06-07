@@ -40,9 +40,12 @@ in-memory store (full residency; demand paging is a later Phase-6 item), so `sto
 and every `# cost:` corpus assertion are unchanged (a `page_read` cost unit is the separate
 item P6.3).
 
-**Deferred, not foreclosed** (later Phase-6 items): free-list / page **reclamation** (P6.2 —
-this slice **leaks** the pages an old root no longer references, so a file grows on every
-commit), demand paging / a buffer pool, overflow pages for over-large values, and compression.
+**Reclamation (P6.2) has since landed** — the allocator reuses dead pages from a free-list
+**reconstructed on open** (see *Reclamation* below), so a file no longer grows without bound
+across its lifetime (P6.1 alone *leaked* every page an old root dropped). **Still deferred, not
+foreclosed** (later Phase-6 items): continuous *within-session* reclamation + on-disk free-list
+persistence (P6.2 follow-ons), demand paging / a buffer pool, overflow pages for over-large
+values, and compression.
 
 ## Conventions
 
@@ -97,7 +100,7 @@ and slot selection):
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
 | 20 | 4 | `root_page` (u32) — the **catalog chain head** (relocatable; ≥ 2) |
 | 24 | 4 | `page_count` (u32) — total pages in the file |
-| 28 | 4 | reserved (0) — the P6.2 free-list head will claim this; written `0` this slice |
+| 28 | 4 | reserved (0) — an on-disk free-list head may claim this later; **still written `0`** (P6.2 reconstructs the free-list on open rather than persisting it — see *Allocation & incremental commit*) |
 | 32 | 4 | `crc32` (u32) — CRC-32/IEEE over meta bytes `[0, 32)` (excludes this field and the zero-fill tail) |
 
 `page_size` lives at a fixed offset so a reader can learn it before it knows where page 1
@@ -363,11 +366,15 @@ A commit materializes the writer's new committed `Snapshot` (transactions.md §2
 only its **dirty** pages, then publishing the new root. The §2 atomicity rests on a fixed
 **write ordering** (storage.md §4):
 
-1. **Allocate** a fresh page index (appended at the end of the file, bumping `page_count`) to
-   each dirty page. A page is **dirty** iff it was newly built by this transaction's
-   copy-on-write — i.e. it has no on-disk page id yet. Clean nodes (shared with the prior
-   committed tree via structural sharing) **keep their existing page** and are **not
-   rewritten** — that is the incremental win.
+1. **Allocate** a page index to each dirty page. A page is **dirty** iff it was newly built by
+   this transaction's copy-on-write — i.e. it has no on-disk page id yet. Clean nodes (shared
+   with the prior committed tree via structural sharing) **keep their existing page** and are
+   **not rewritten** — that is the incremental win. Allocation draws from the **free-list**
+   first — the **lowest** free page index, deterministically, so the bytes stay cross-core
+   identical — and **extends the file** (a fresh index at `page_count`, bumping it) only when
+   the free-list is exhausted. A page leaves the free-list **only** by being allocated here, so
+   it is immediately part of the new committed version and never of any older one (see
+   *Reclamation* below).
 2. **Write** the dirty body pages in this **deterministic order**, so the bytes are
    cross-core identical:
    - For each table in **lowercased-name order**, the dirty nodes of its B-tree in
@@ -386,10 +393,39 @@ body pages are simply unreferenced. A torn meta write at step 4 is caught by the
 falls back to the other slot. Either way the file is never corrupt — it is always a valid
 snapshot, the new one or the immediately prior one (storage.md §4, transactions.md §9).
 
-**Pages an old root no longer references are leaked this slice** (P6.1) — `page_count` only
-grows. **P6.2** adds the free-list that reuses them, gated on the oldest-live-snapshot
-watermark (transactions.md §8): a page freed at `txid T` is reusable only once
-`oldest_live_txid > T`.
+### Reclamation (the free-list, P6.2)
+
+P6.1 **leaked** every page an old root stopped referencing — `page_count` only grew. **P6.2
+reconstructs a free-list of those dead pages and the allocator (step 1) reuses them**, so a
+file's size is bounded by its live data plus a session's churn instead of growing on every
+commit. The free-list is **reconstructed on open, not persisted** (the TODO's
+*reconstruct-on-open first*; the meta's reserved offset-28 field stays `0` — an on-disk
+free-list head that lets open skip the walk is a later *open-speed* optimization):
+
+- **On open**, the free-list is `[2, page_count)` **minus the pages reachable from the
+  committed root** (the catalog chain plus every table B-tree node — both already walked while
+  loading). Those reachable pages are the only live ones; everything else in the file is dead
+  space left by earlier commits and is free.
+- **During a session**, the allocator (step 1) draws dirty/catalog pages from the free-list
+  (lowest index first) before extending the file. A page leaves the list **only** by being
+  allocated, which makes it live in the new committed version — so **a free-list page is never
+  reachable from the committed snapshot nor from the immediately-prior (fallback) snapshot**,
+  and overwriting it is torn-write-safe (a crash mid-commit falls back to a snapshot that does
+  not reference it — *Allocation & incremental commit* above).
+- Pages an old root orphans **during** the session are **not** returned to the free-list this
+  slice; they are reclaimed at the **next open** (when the free-list is reconstructed). A
+  long-lived writer therefore still grows within one session, then compacts on reopen.
+
+**The watermark (transactions.md §8).** A page freed at `txid T` is reusable only once
+`oldest_live_txid > T`. Every reconstructed free-list page was already dead at the committed
+version when the file was opened (`last-ref < committed.txid`), and on a single file-backed
+handle `oldest_live_txid == committed.txid`, so the gate holds trivially. It becomes
+load-bearing when **continuous (within-session) reclamation** and **file-backed reader
+sharing** land together: returning a just-orphaned page to the free-list must then wait until
+`oldest_live_txid` passes the version that last referenced it, lest a still-open reader on an
+older snapshot observe a recycled page. Continuous reclamation (return orphans immediately —
+needs O(dirty) orphan tracking so a commit stays incremental, or an O(live) reachable-set
+recompute) and on-disk free-list persistence are the documented follow-ons.
 
 **From-scratch image (`to_image`).** A clean, garbage-free image of a snapshot — used by
 `create`'s initial write and by the **golden tests / Ruby reference** — is the special case

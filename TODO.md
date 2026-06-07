@@ -724,11 +724,29 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       is P6.2). Verified per-core (not goldens — the bytes depend on commit history): incremental
       growth bounded by tree height, slot alternation, torn-meta fallback to the prior durable
       snapshot, delete-heavy reopen. _(size: XL; deps: P5.1)_
-- [ ] **P6.2 — free-list / page reclamation** — reuse pages the new root no longer references
-      (not version GC; still not MVCC). **Gated on the oldest-live-snapshot txid watermark**
-      built in Phase 5 (transactions.md §8): a page freed at txid `T` is reusable only once
-      `oldest_live_txid > T`. Reconstruct-on-open first (diff reachable-vs-`page_count`); persist
-      later only for open speed. _(size: L; deps: P6.1)_
+- [x] **P6.2 — free-list / page reclamation** ✅ _(reconstruct-on-open form)_ — reuse the pages
+      a new root no longer references (not version GC; still not MVCC). Landed across all three
+      cores + the Ruby reference (the byte **format is unchanged** — reserved meta offset 28 stays
+      `0`, so all 15 goldens and `format_version` 2 are untouched; reclamation only changes which
+      indices an *incremental* commit allocates, never the from-scratch image the goldens pin).
+      **On open** the free-list is reconstructed as `[2, page_count)` minus the pages reachable
+      from the committed root (catalog chain + every table B-tree node — both already walked while
+      loading). **During a commit** the allocator draws dirty/catalog pages from the free-list
+      (**lowest index first**, so the bytes stay cross-core identical) before extending the file;
+      a page leaves the list **only** by being allocated, which makes it live in the new committed
+      version — so a free-list page is never reachable from the committed *or* the immediately
+      prior (fallback) snapshot, and reuse stays **torn-write-safe**. **Gated on the
+      oldest-live-snapshot watermark** (transactions.md §8): every free-list page was dead at the
+      opened committed version and a single file-backed handle has
+      `oldest_live_txid == committed.txid`, so `oldest_live_txid > T` holds **trivially**. Verified
+      per-core (the bytes depend on commit history, like P6.1): a churn-then-reopen-then-churn
+      reuses dead pages so `page_count` does not grow, reuse round-trips correctly, and a torn
+      latest commit after reuse still falls back to the intact prior snapshot. **Deferred
+      follow-ons** (where the watermark does real work): continuous *within-session* reclamation
+      (return a commit's orphans to the free-list immediately, paired with file-backed reader
+      sharing — needs O(dirty) orphan tracking to keep the commit incremental, or an O(live)
+      reachable-set recompute) and **on-disk free-list persistence** (claim meta offset 28 so open
+      skips the reachable-set walk — *persist later only for open speed*). _(size: L; deps: P6.1)_
 - [ ] **P6.3 — `page_read` cost unit + corpus cost re-baseline** — when the B-tree leaf scan
       replaces the flat chain, **add** `page_read` to [spec/cost/schedule.toml](spec/cost/schedule.toml)
       (do **not** rename `storage_row_read` — they coexist, storage.md §6). Every `# cost:`

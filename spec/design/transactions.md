@@ -279,6 +279,18 @@ reused only once `oldest_live_txid > T`, otherwise a still-open reader holding a
 would observe a recycled page. Tracking liveness now (where it is nearly free) is what keeps
 Phase 6 reclamation safe without a retrofit — the single tightest coupling between the two phases.
 
+**P6.2 consumes the watermark (the free-list gate).** Phase 6's page free-list
+([../fileformat/format.md](../fileformat/format.md) *Reclamation*) is the consumer the watermark
+was built for: a page freed at `txid T` may be reused only once `oldest_live_txid > T`, else a
+still-open reader on an older snapshot would observe a recycled page. P6.2's first form
+**reconstructs the free-list on open** (the file's dead pages = `[2, page_count)` minus the
+committed root's reachable set) and reuses them during the session; every such page was already
+dead at the opened committed version, and a single file-backed handle has
+`oldest_live_txid == committed.txid`, so the gate holds **trivially**. It becomes load-bearing in
+the deferred follow-on — *continuous* within-session reclamation paired with file-backed reader
+sharing — where a just-orphaned page (last referenced by version `T`) must stay out of the
+free-list until `oldest_live_txid > T`.
+
 **P5.3b realizes the watermark in the shared handle (§10).** A single-handle `Database` has only
 one live snapshot at a time (`committed`, or an open tx's `working`), so its `oldest_live_txid`
 is trivially the committed version. The interesting case is the **shared handle**: it owns a

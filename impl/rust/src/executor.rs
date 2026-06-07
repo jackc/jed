@@ -158,11 +158,17 @@ pub struct Database {
     /// The page size this database serializes with (from the file on open, from create opts,
     /// else `DEFAULT_PAGE_SIZE`). Fixed for the life of a file.
     pub(crate) page_size: u32,
-    /// The on-disk page high-water mark — the next free page index an incremental commit appends
-    /// at (spec/fileformat/format.md, P6.1 part B). Set from the file's meta on `open`, from the
-    /// initial image on `create`; `0` (unused) for an in-memory database. Only grows this slice
-    /// (pages leak; P6.2 adds the free-list).
+    /// The on-disk page high-water mark — the page index an incremental commit extends at when the
+    /// free-list is exhausted (spec/fileformat/format.md). Set from the file's meta on `open`, from
+    /// the initial image on `create`; `0` (unused) for an in-memory database.
     pub(crate) page_count: u32,
+    /// The free-list (P6.2): page indices a prior root abandoned, reusable by the next incremental
+    /// commit (spec/fileformat/format.md *Reclamation*). **Reconstructed on open** as `[2,
+    /// page_count)` minus the committed root's reachable pages; drawn from lowest-first before the
+    /// file is extended. A page leaves the list only by being allocated into a new committed
+    /// version, so it is reachable from no live snapshot and reuse is torn-write-safe. Empty for an
+    /// in-memory database and for a freshly-created file (a from-scratch image leaks nothing).
+    pub(crate) free_pages: Vec<u32>,
 }
 
 /// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
@@ -199,6 +205,7 @@ impl Database {
             path: None,
             page_size,
             page_count: 0,
+            free_pages: Vec::new(),
         }
     }
 
@@ -214,6 +221,7 @@ impl Database {
             path: None,
             page_size: DEFAULT_PAGE_SIZE,
             page_count: 0,
+            free_pages: Vec::new(),
         }
     }
 

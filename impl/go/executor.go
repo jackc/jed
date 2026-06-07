@@ -114,10 +114,17 @@ type Database struct {
 	path string
 	// pageSize is the page size this database serializes with (fixed for the life of a file).
 	pageSize uint32
-	// pageCount is the on-disk page high-water — the next free page an incremental commit appends at
-	// (spec/fileformat/format.md, P6.1 part B). Set from the file's meta on Open, from the initial
-	// image on Create; 0 (unused) for an in-memory database. Only grows this slice (pages leak).
+	// pageCount is the on-disk page high-water — the index an incremental commit extends at when the
+	// free-list is exhausted (spec/fileformat/format.md). Set from the file's meta on Open, from the
+	// initial image on Create; 0 (unused) for an in-memory database.
 	pageCount uint32
+	// freePages is the free-list (P6.2): page indices a prior root abandoned, reusable by the next
+	// incremental commit (spec/fileformat/format.md *Reclamation*). Reconstructed on Open as
+	// [2, pageCount) minus the committed root's reachable pages; drawn lowest-first before the file is
+	// extended. A page leaves the list only by being allocated into a new committed version, so it is
+	// reachable from no live snapshot and reuse is torn-write-safe. nil for an in-memory database and
+	// for a freshly-created file (a from-scratch image leaks nothing).
+	freePages []uint32
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
