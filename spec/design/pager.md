@@ -42,6 +42,23 @@ This honors CLAUDE.md §9 read precisely: *RAM-sized is the dominant case, large
 not be foreclosed.* A universal pool sized to comfortably hold a RAM-sized working set **is**
 full residency for the common case, and is the *same* machinery that bounds a huge one.
 
+**Two scope refinements of "universal" (made when planning the implementation; §6).** The pool
+bounds what is *expensive* to hold and trivial to refault, and leaves resident what is cheap to
+keep and costly to recompute:
+
+- **In-memory databases stay fully resident.** A database with no backing file (the pure
+  in-memory mode, and the conformance harness's default) has nowhere to page *from*, so it keeps
+  its tree resident — the pool is the read path for **file-backed** databases. This is not the
+  rejected "fast path for small files"; it is the degenerate no-backing case (a query against an
+  in-memory database touches RAM either way). The dominant durable-disk mode is fully paged.
+- **The interior B-tree skeleton stays resident; only leaf pages are demand-paged** (P6.4b's
+  first form). Interior nodes are roughly `1/fan-out` of all pages (well under 1% at the default
+  page size), and keeping them resident is what lets `node_count` — and therefore cost (§5) — be
+  computed **without loading any leaf** (an interior node already lists its leaf children's page
+  ids). The leaves are the bulk and the part that must page to bound a larger-than-RAM file.
+  Paging the interior skeleton too (for a file whose *interior* alone exceeds RAM — a multi-TB
+  extreme) is a deferred follow-on (§6), not foreclosed.
+
 ## 2. The pager (the block device)
 
 The pager realizes the storage seam (storage.md §2) for **reads**, which today's whole-image
@@ -118,6 +135,15 @@ decodes it (the existing node codec, format.md), inserts it into the pool (evict
 and returns it. A `Resident(node)` is used directly. So the resident set is bounded by the pool
 budget, not by the tree size.
 
+**P6.4b's first form — interior skeleton resident, leaves `OnDisk` (§1).** In the landed slice,
+`open` materializes the **interior** nodes resident (`Resident`) and leaves each *leaf* child an
+`OnDisk(page_id)`; a full scan or lookup faults the leaf it needs through the pool, which bounds
+how many leaves are resident at once. Because eviction only drops the cache entry while any
+in-flight `Arc`/reference to a node keeps it alive (a clean node is immutable, so a re-load is a
+harmless duplicate), the pool needs **no pins** — the traversal holds at most a root-to-leaf path
+of nodes, a bound of tree height. Fully paging the interior too (so even the skeleton is bounded)
+is the deferred follow-on (§6).
+
 **Interaction with copy-on-write snapshots (the subtle part).** The persistent map's invariants
 are preserved:
 
@@ -144,20 +170,21 @@ physical disk fetches, so a cache cannot perturb the deterministic cost (cost.md
 CLAUDE.md §13). Demand paging is the reason that mattered, and it changes the **accrual site**
 but not the **totals**:
 
-- **Today (full residency):** `page_read` is charged as a structural block — `node_count()`,
-  computed by walking the already-resident tree — once per table scan.
-- **Under demand paging:** computing `node_count()` would mean loading the whole tree, defeating
-  the purpose. So accrual moves to **per node *visited* during the traversal** — each logical
-  node the scan/lookup steps onto charges one `page_read`, **whether it was a cache hit or a
-  miss**. A full table scan visits every node exactly once, so the per-visit total **equals** the
-  old structural `node_count` — the existing corpus `# cost:` values **do not shift again**. The
-  physical pool fetch (the I/O on a miss) is **unmetered**; only the logical visit is.
+- **`page_read` stays a structural block — `node_count()`, charged in the executor, unchanged
+  from P6.3.** This is the dividend of keeping the **interior skeleton resident** (§1/§4): an
+  interior node already lists its leaf children's page ids, so `node_count()` = (resident
+  interior nodes) + (their leaf-child counts) is computable by walking only the resident skeleton
+  — **without loading a single leaf**. A full scan still touches every node, so the count is the
+  same total; the corpus `# cost:` values **do not move**, and cost accrual does **not** have to
+  migrate into the pmap traversal (it stays in the executor, cost.md §3). Had we paged the
+  interior too, `node_count` would force-load the tree and accrual would have to move to
+  per-node-visit; keeping the skeleton resident is precisely what avoids that.
 
 So cost stays **deterministic, cross-core identical, and cache-independent**: the same
-`(query, db)` charges the same `page_read` total no matter the pool budget or eviction history.
-A future point-lookup path would visit fewer pages and legitimately cost less, but that is a
-separate feature; the move from structural to per-visit accrual is **corpus-neutral** today
-because every metered query is a full scan.
+`(query, db)` charges the same `page_read` total no matter the pool budget or eviction history —
+the pool changes only *when* a leaf is in RAM, never the count of pages the query logically
+touches. A future point-lookup path would visit fewer pages and legitimately cost less, but that
+is a separate feature.
 
 ## 6. Slicing (the mergeable steps)
 
@@ -171,13 +198,21 @@ change lands alone, on a frozen seam:
   goldens and `# cost:` values are untouched). This de-risks the seam and the keep-file-open
   lifecycle (`close` now closes the file) before any data-structure surgery. *Mergeable, no
   observable change.*
-- **P6.4b — lazy nodes + the bounded pool (the residency win).** `pmap` children become
-  `ChildRef`; clean children load on demand through the bounded pool with CLOCK eviction;
-  dirty nodes stay pinned; `page_read` accrual moves to per-node-visit (§5, corpus-neutral).
-  The resident set becomes bounded. *The XL heart; the slice the whole item exists for.*
-- **P6.4c — budget config + hardening.** The handle-level memory budget (API surface),
-  pin-safety hardening, and large-file tests (a database far exceeding the pool budget opens,
-  scans, mutates, and round-trips correctly while the resident page count stays bounded).
+- **P6.4b — leaf demand-paging + the bounded pool (the residency win).** `pmap` children become
+  a `ChildRef` (`Resident | OnDisk(page_id)`); for a **file-backed** database the interior
+  skeleton loads resident and each **leaf** is `OnDisk`, faulted through the bounded **CLOCK**
+  pool (no pins — §4) on access. In-memory databases stay fully resident (§1). `node_count`/cost
+  is unchanged (§5). The resident set becomes bounded by (interior skeleton + pool budget). *The
+  XL heart; the slice the whole item exists for.* Built Rust-first, then Go/TS (a `# cost:`
+  corpus-neutral change, so each core can land green independently — like P5.1).
+- **P6.4c — budget config + hardening.** The handle-level memory budget (API surface) and
+  large-file tests (a database far exceeding the pool budget opens, scans, mutates, and
+  round-trips correctly while the resident leaf count stays bounded).
+
+Deferred follow-ons (none foreclosed): **paging the interior skeleton too** (for a file whose
+interior alone exceeds RAM — a multi-TB extreme; needs `node_count`/cost to move to per-node-visit
+and the free-list to persist rather than reconstruct-on-open, P6.2's deferred item), and a Memory
+backing so in-memory databases page through the identical path (currently they stay resident, §1).
 
 Deferred and explicitly **out of this item** (separate TODO entries, none foreclosed):
 **streaming + spill-to-disk operators** (sort / hash join / aggregate / DISTINCT under a memory
