@@ -147,12 +147,14 @@ impl PMap {
         PMap { root, len }
     }
 
-    /// Look up the row at `key`, or `None`.
-    pub fn get(&self, key: &[u8]) -> Option<&Row> {
+    /// Look up the row at `key`, or `None`. Returns an **owned** row: under demand paging (P6.4b)
+    /// the leaf holding it may live only in the buffer pool, not the resident tree, so a borrow
+    /// could not outlive the pool lock — the read path clones the row out (spec/design/pager.md §4).
+    pub fn get(&self, key: &[u8]) -> Option<Row> {
         let mut node = self.root.as_deref()?;
         loop {
             match node.search(key) {
-                Ok(i) => return Some(&node.vals[i]),
+                Ok(i) => return Some(node.vals[i].clone()),
                 Err(i) => {
                     if node.is_leaf() {
                         return None;
@@ -222,10 +224,14 @@ impl PMap {
         self.root.as_deref().map(count).unwrap_or(0)
     }
 
-    /// Iterate `(key, row)` pairs in ascending key order. Eagerly walks the tree into a vector of
-    /// borrows (the cost contract charges per row in the executor loop, not here — cost.md), so
-    /// laziness is unobservable and a deferred optimization.
-    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Row)> + '_ {
+    /// Iterate `(key, row)` pairs in ascending key order, yielding **owned** pairs. Eagerly walks
+    /// the tree into a vector (the cost contract charges per row in the executor loop, not here —
+    /// cost.md). Owned, not borrowed, because under demand paging (P6.4b) a leaf may be faulted in
+    /// from the buffer pool only for the duration of this walk: the row is cloned out and the leaf
+    /// node is free to be evicted, so the resident *node* set stays bounded by the pool even though
+    /// the executor materializes the rows it scans (streaming the rows themselves is a deferred,
+    /// out-of-scope follow-on — spec/design/pager.md §4/§6).
+    pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Row)> {
         let mut out = Vec::with_capacity(self.len);
         if let Some(root) = &self.root {
             collect(root, &mut out);
@@ -500,17 +506,18 @@ fn merge_at(node: &Arc<Node>, j: usize, cap: usize) -> Arc<Node> {
     }
 }
 
-/// In-order walk: child[0], key[0], child[1], key[1], …, key[n-1], child[n].
-fn collect<'a>(node: &'a Node, out: &mut Vec<(&'a Vec<u8>, &'a Row)>) {
+/// In-order walk: child[0], key[0], child[1], key[1], …, key[n-1], child[n]. Clones each
+/// `(key, row)` out (owned) — see [`PMap::iter`] for why the walk does not borrow.
+fn collect(node: &Node, out: &mut Vec<(Vec<u8>, Row)>) {
     if node.is_leaf() {
         for i in 0..node.keys.len() {
-            out.push((&node.keys[i], &node.vals[i]));
+            out.push((node.keys[i].clone(), node.vals[i].clone()));
         }
         return;
     }
     for i in 0..node.keys.len() {
         collect(&node.children[i], out);
-        out.push((&node.keys[i], &node.vals[i]));
+        out.push((node.keys[i].clone(), node.vals[i].clone()));
     }
     collect(&node.children[node.keys.len()], out);
 }
@@ -597,7 +604,7 @@ mod tests {
         assert_eq!(pm.len(), bt.len());
         check_invariants(&pm);
         for k in 0..n {
-            assert_eq!(pm.get(&key(k)), bt.get(&key(k)));
+            assert_eq!(pm.get(&key(k)).as_ref(), bt.get(&key(k)));
         }
         let got: Vec<_> = pm.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let want: Vec<_> = bt.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -610,7 +617,7 @@ mod tests {
             bt.insert(key(7), row(777))
         );
         assert_eq!(pm.len(), before);
-        assert_eq!(pm.get(&key(7)), Some(&row(777)));
+        assert_eq!(pm.get(&key(7)), Some(row(777)));
 
         // Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
         for (step, k) in shuffled(n).into_iter().enumerate() {
@@ -646,7 +653,7 @@ mod tests {
         // `snap` still sees the original contents, untouched.
         assert_eq!(snap.len(), 2000);
         for k in 0..2000 {
-            assert_eq!(snap.get(&key(k)), Some(&row(k as i64)));
+            assert_eq!(snap.get(&key(k)), Some(row(k as i64)));
         }
         let snap_rows: Vec<_> = snap.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         assert_eq!(snap_rows.len(), 2000);
@@ -656,8 +663,8 @@ mod tests {
 
         assert_eq!(other.len(), 2500);
         assert_eq!(other.get(&key(0)), None);
-        assert_eq!(other.get(&key(1000)), Some(&row(-1000)));
-        assert_eq!(other.get(&key(2500)), Some(&row(2500)));
+        assert_eq!(other.get(&key(1000)), Some(row(-1000)));
+        assert_eq!(other.get(&key(2500)), Some(row(2500)));
         check_invariants(&other);
     }
 
@@ -668,7 +675,7 @@ mod tests {
         assert_eq!(pm.get(&key(1)), None);
         assert_eq!(pm.remove(&key(1), CAP), None);
         assert_eq!(pm.insert(key(1), row(1), W, CAP), None);
-        assert_eq!(pm.get(&key(1)), Some(&row(1)));
+        assert_eq!(pm.get(&key(1)), Some(row(1)));
         assert_eq!(pm.remove(&key(1), CAP), Some(row(1)));
         assert!(pm.is_empty());
         assert!(pm.root.is_none());

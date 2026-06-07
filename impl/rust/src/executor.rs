@@ -108,7 +108,7 @@ impl Snapshot {
     fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
         self.stores
             .get(&name.to_ascii_lowercase())
-            .map(|s| s.iter_in_key_order().cloned().collect())
+            .map(|s| s.iter_in_key_order().collect())
     }
 
     /// Register a new table and its (empty) store. Lower-cased name is the key. The store carries
@@ -877,10 +877,10 @@ impl Database {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
-                Some(f) => f.eval(row, &env, &mut meter)?.is_true(),
+                Some(f) => f.eval(&row, &env, &mut meter)?.is_true(),
             };
             if matched {
-                keys.push(k.clone());
+                keys.push(k);
             }
         }
 
@@ -989,17 +989,17 @@ impl Database {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
-                Some(f) => f.eval(row, &env, &mut meter)?.is_true(),
+                Some(f) => f.eval(&row, &env, &mut meter)?.is_true(),
             };
             if !matched {
                 continue;
             }
             let mut new_row = row.clone();
             for plan in &plans {
-                let raw = plan.source.eval(row, &env, &mut meter)?;
+                let raw = plan.source.eval(&row, &env, &mut meter)?;
                 new_row[plan.idx] = plan.check(raw)?;
             }
-            updates.push((key.clone(), new_row));
+            updates.push((key, new_row));
         }
 
         // Phase 2: apply (keys unchanged — a PK column can't be assigned).
@@ -1486,7 +1486,7 @@ impl Database {
             let mut table_rows: Vec<Row> = Vec::new();
             for row in store.iter_in_key_order() {
                 meter.charge(COSTS.storage_row_read);
-                table_rows.push(row.clone());
+                table_rows.push(row);
             }
             materialized.push(table_rows);
         }

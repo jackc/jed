@@ -97,13 +97,15 @@ impl TableStore {
         self.rows.remove(key, self.cap).is_some()
     }
 
-    /// Look up a row by its exact encoded key.
-    pub fn get(&self, key: &[u8]) -> Option<&Row> {
+    /// Look up a row by its exact encoded key. Returns an **owned** row — under demand paging the
+    /// holding leaf may live only in the buffer pool (spec/design/pager.md §4, [`PMap::get`]).
+    pub fn get(&self, key: &[u8]) -> Option<Row> {
         self.rows.get(key)
     }
 
-    /// Iterate rows in primary-key (encoded byte) order.
-    pub fn iter_in_key_order(&self) -> impl Iterator<Item = &Row> {
+    /// Iterate rows in primary-key (encoded byte) order, yielding **owned** rows
+    /// (spec/design/pager.md §4, [`PMap::iter`]).
+    pub fn iter_in_key_order(&self) -> impl Iterator<Item = Row> {
         self.rows.iter().map(|(_, v)| v)
     }
 
@@ -113,9 +115,10 @@ impl TableStore {
         self.rows.node_count()
     }
 
-    /// Iterate `(encoded key, row)` pairs in key order. Used by the on-disk
-    /// serializer (spec/fileformat/format.md), which stores each row's key verbatim.
-    pub fn iter_entries(&self) -> impl Iterator<Item = (&Vec<u8>, &Row)> {
+    /// Iterate `(encoded key, row)` pairs in key order, yielding **owned** pairs
+    /// (spec/design/pager.md §4, [`PMap::iter`]). Used by the executor's UPDATE/DELETE scan and the
+    /// on-disk free-list rowid reconstruction (spec/fileformat/format.md).
+    pub fn iter_entries(&self) -> impl Iterator<Item = (Vec<u8>, Row)> {
         self.rows.iter()
     }
 

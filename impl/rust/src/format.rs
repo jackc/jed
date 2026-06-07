@@ -495,7 +495,7 @@ impl Database {
                         let max = store
                             .iter_entries()
                             .last()
-                            .map(|(k, _)| decode_int(ScalarType::Int64, k));
+                            .map(|(k, _)| decode_int(ScalarType::Int64, &k));
                         if let Some(m) = max {
                             store.bump_rowid_to(m + 1);
                         }
