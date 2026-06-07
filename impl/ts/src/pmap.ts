@@ -1,36 +1,44 @@
-// Persistent (copy-on-write) ordered map — the in-memory store primitive (decision B1,
-// spec/design/transactions.md §3).
+// Persistent (copy-on-write) ordered map — the page-backed B-tree (decision B1,
+// spec/design/transactions.md §3; spec/fileformat/format.md "The per-table data B-tree").
 //
 // Keyed by the encoded key bytes (compared lexicographically = memcmp = the order-preserving
-// key encoding's contract, spec/design/encoding.md). Every mutation returns a new map that
-// shares structure with the old one; nodes are immutable by convention (never mutated after
-// construction), so `clone()` (which shares the root) is an O(1) independent snapshot — mutating
-// the clone leaves the original untouched. That cheap, structurally-shared snapshot carries the
-// §3 staging-buffer / transaction model (transactions.md §2). The concrete shape is a
-// copy-on-write B-tree: the in-memory precursor of the Phase-6 on-disk B-tree.
+// key encoding's contract, spec/design/encoding.md). Every mutation returns a new map that shares
+// structure with the old one; nodes are immutable by convention, so `clone()` (which shares the
+// root) is an O(1) independent snapshot. That cheap, structurally-shared snapshot carries the §3
+// staging-buffer / transaction model (transactions.md §2).
 //
-// Only the iteration order is a cross-core contract this slice; the in-RAM node shape (fan-out,
-// split points) is private (transactions.md §3). Delete rebalances (Cormen's algorithm) so
-// leaves stay non-empty.
+// Since Phase 6 (P6.1) this IS the on-disk B-tree, node-for-page: its fan-out is size-driven — a
+// node holds as many entries as fit a page payload cap (= page_size − 12) and splits when it would
+// overflow, so the node boundaries (and serialized bytes) are a §8 byte contract (format.md). The
+// caller supplies each entry's on-disk weight (record size); cap is passed per call (held by the
+// TableStore). Each node also carries a set-once on-disk page id (0 = dirty) for the incremental
+// commit (P6.1 part B). Delete rebalances by merge-then-maybe-split (no borrow — format.md "Delete").
 
 import type { Row } from "./storage.ts";
 
-// Minimum degree t: a node holds between t-1 and 2t-1 keys (the root may hold fewer) and
-// overflows at 2t. Private tuning — it changes only the in-RAM shape, never order.
-const T = 16;
-const MAX_KEYS = 2 * T - 1;
-const MIN_KEYS = T - 1;
-
 // One B-tree node. `children` is empty for a leaf; otherwise children.length === keys.length+1.
-// keys.length === vals.length always. Nodes are never mutated after construction.
-type PNode = {
+// keys.length === vals.length === weights.length always. weights[i] is entry i's on-disk record
+// size, for the size-driven split/merge. page is the on-disk page index (0 when dirty), set once at
+// the commit that first persists this node. Exported so the serializer (format.ts) can read/build it.
+export type PNode = {
   keys: Uint8Array[];
   vals: Row[];
+  weights: number[];
   children: PNode[];
+  page: number;
 };
 
 function isLeaf(n: PNode): boolean {
   return n.children.length === 0;
+}
+
+// payload is this node's serialized size (format.md): Σ weights plus, for an interior node,
+// 4·(N+1) for its child pointers.
+function payload(n: PNode): number {
+  let total = 0;
+  for (const w of n.weights) total += w;
+  if (!isLeaf(n)) total += 4 * n.children.length;
+  return total;
 }
 
 function compareBytes(a: Uint8Array, b: Uint8Array): number {
@@ -41,8 +49,8 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
   return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
 }
 
-// search returns the index and whether key is present: found ⇒ keys[index] === key, else index
-// is the child/insertion slot.
+// search returns the index and whether key is present: found ⇒ keys[index] === key, else index is
+// the child/insertion slot.
 function search(n: PNode, key: Uint8Array): { index: number; found: boolean } {
   let lo = 0;
   let hi = n.keys.length;
@@ -75,6 +83,11 @@ export class PMap {
     return this.length;
   }
 
+  // rootNode exposes the root node to the serializer (format.ts). null for an empty map.
+  rootNode(): PNode | null {
+    return this.root;
+  }
+
   // get looks up the row at key.
   get(key: Uint8Array): Row | undefined {
     let n = this.root;
@@ -87,33 +100,36 @@ export class PMap {
     return undefined;
   }
 
-  // insert inserts or overwrites key. Returns the previous row if key was present (an
-  // overwrite, leaving the size unchanged), else undefined (a new insert, which grows the size).
-  insert(key: Uint8Array, val: Row): Row | undefined {
+  // insert inserts or overwrites key with val (on-disk record size weight); cap is the page payload
+  // capacity. Returns the previous row if key was present (an overwrite, size unchanged), else
+  // undefined (a new insert, which grows the size). An overwrite can change the weight, so it too
+  // may overflow and split.
+  insert(key: Uint8Array, val: Row, weight: number, cap: number): Row | undefined {
     if (this.root === null) {
-      this.root = { keys: [key], vals: [val], children: [] };
+      this.root = { keys: [key], vals: [val], weights: [weight], children: [], page: 0 };
       this.length++;
       return undefined;
     }
     const ctx: InsCtx = { old: undefined, replaced: false };
-    const out = nodeInsert(this.root, key, val, ctx);
+    const out = nodeInsert(this.root, key, val, weight, ctx, cap);
     this.root =
       out.whole !== null
         ? out.whole
-        : { keys: [out.midK], vals: [out.midV], children: [out.left, out.right] };
+        : { keys: [out.midK], vals: [out.midV], weights: [out.midW], children: [out.left, out.right], page: 0 };
     if (!ctx.replaced) this.length++;
     return ctx.old;
   }
 
-  // remove deletes key. Returns the removed row, or undefined if absent (then the map is
-  // unchanged).
-  remove(key: Uint8Array): Row | undefined {
+  // remove deletes key. Returns the removed row, or undefined if absent (then the map is unchanged).
+  // cap is the page payload capacity (the rebalance threshold).
+  remove(key: Uint8Array, cap: number): Row | undefined {
     if (this.root === null) return undefined;
-    const res = nodeRemove(this.root, key);
+    const res = nodeRemove(this.root, key, cap);
     if (!res.ok) return undefined;
     const newRoot = res.node;
-    // The root may have drained to zero keys: an empty leaf becomes the empty map; an empty
-    // internal node (one child) hands the root down a level (height shrinks).
+    // The root may have drained to zero keys: an empty leaf becomes the empty map; an empty internal
+    // node (one child) hands the root down a level (height shrinks). The root is exempt from the
+    // underfull rule, so no rebalance here.
     if (newRoot.keys.length === 0) {
       this.root = isLeaf(newRoot) ? null : newRoot.children[0];
     } else {
@@ -123,9 +139,8 @@ export class PMap {
     return res.removed;
   }
 
-  // inorder returns all (key, row) pairs in ascending key order. Eager (the cost contract
-  // charges per row in the executor loop, not here — spec/design/cost.md), so laziness is
-  // unobservable.
+  // inorder returns all (key, row) pairs in ascending key order. Eager (the cost contract charges
+  // per row in the executor loop, not here — spec/design/cost.md), so laziness is unobservable.
   inorder(): { keys: Uint8Array[]; vals: Row[] } {
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
@@ -150,227 +165,186 @@ export class PMap {
   }
 }
 
+// pmapFromLoaded reconstructs a map from a loaded root (format.ts loadDatabase).
+export function pmapFromLoaded(root: PNode | null, length: number): PMap {
+  return new PMap(root, length);
+}
+
 type InsCtx = { old: Row | undefined; replaced: boolean };
 // The result of inserting into a subtree: a whole rebuilt node, or a split.
 type InsOut =
   | { whole: PNode }
-  | { whole: null; left: PNode; midK: Uint8Array; midV: Row; right: PNode };
+  | { whole: null; left: PNode; midK: Uint8Array; midV: Row; midW: number; right: PNode };
 
-// nodeInsert is the recursive insert. On overwrite it sets ctx and rebuilds the path with the
-// value replaced (no split). On a new key it inserts into the leaf and splits overflowing nodes
-// back up the path.
-function nodeInsert(n: PNode, key: Uint8Array, val: Row, ctx: InsCtx): InsOut {
-  const { index, found } = search(n, key);
-  if (found) {
-    const vals = n.vals.slice();
-    ctx.old = vals[index];
-    ctx.replaced = true;
-    vals[index] = val;
-    return { whole: { keys: n.keys.slice(), vals, children: n.children.slice() } };
+// build constructs a node from the parts; if its payload overflows cap it splits 2-way and promotes
+// one median. The split point m = min(largest m in [1,N-1] with leftpayload(m) ≤ cap, N-2) always
+// yields two non-empty, fitting halves under RECORD_MAX = (cap-12)/2 (format.md). The < 3 guard is
+// defensive against an oversized record — the oversize surfaces as 0A000 at serialize (format.ts).
+function build(keys: Uint8Array[], vals: Row[], weights: number[], children: PNode[], cap: number): InsOut {
+  const interior = children.length > 0;
+  let total = 0;
+  for (const w of weights) total += w;
+  if (interior) total += 4 * children.length;
+  if (total <= cap || keys.length < 3) {
+    return { whole: { keys, vals, weights, children, page: 0 } };
   }
-  if (isLeaf(n)) {
-    return splitIfNeeded(insertAt(n.keys, index, key), insertAt(n.vals, index, val), []);
-  }
-  const child = nodeInsert(n.children[index], key, val, ctx);
-  if (child.whole !== null) {
-    const children = n.children.slice();
-    children[index] = child.whole;
-    return { whole: { keys: n.keys.slice(), vals: n.vals.slice(), children } };
-  }
-  const keys = insertAt(n.keys, index, child.midK);
-  const vals = insertAt(n.vals, index, child.midV);
-  let children = n.children.slice();
-  children[index] = child.left;
-  children = insertAt(children, index + 1, child.right);
-  return splitIfNeeded(keys, vals, children);
-}
 
-// splitIfNeeded builds a node from the parts; if it overflows (> 2t-1 keys) it splits at the
-// midpoint and promotes the median. children empty ⇒ leaf. The split point is deterministic and
-// (being in-RAM only) free to choose (transactions.md §3).
-function splitIfNeeded(keys: Uint8Array[], vals: Row[], children: PNode[]): InsOut {
-  if (keys.length <= MAX_KEYS) {
-    return { whole: { keys, vals, children } };
+  const n = keys.length;
+  let best = 1;
+  let prefix = 0;
+  for (let m = 1; m < n; m++) {
+    prefix += weights[m - 1];
+    const lp = (interior ? 4 * (m + 1) : 0) + prefix;
+    if (lp <= cap) best = m;
   }
-  const mid = keys.length >> 1;
-  const leaf = children.length === 0;
+  let m = Math.min(best, n - 2);
+  if (m < 1) m = 1;
+
   return {
     whole: null,
     left: {
-      keys: keys.slice(0, mid),
-      vals: vals.slice(0, mid),
-      children: leaf ? [] : children.slice(0, mid + 1),
+      keys: keys.slice(0, m),
+      vals: vals.slice(0, m),
+      weights: weights.slice(0, m),
+      children: interior ? children.slice(0, m + 1) : [],
+      page: 0,
     },
-    midK: keys[mid],
-    midV: vals[mid],
+    midK: keys[m],
+    midV: vals[m],
+    midW: weights[m],
     right: {
-      keys: keys.slice(mid + 1),
-      vals: vals.slice(mid + 1),
-      children: leaf ? [] : children.slice(mid + 1),
+      keys: keys.slice(m + 1),
+      vals: vals.slice(m + 1),
+      weights: weights.slice(m + 1),
+      children: interior ? children.slice(m + 1) : [],
+      page: 0,
     },
   };
 }
 
-function canSpare(n: PNode): boolean {
-  return n.keys.length > MIN_KEYS;
-}
-
-// minKV is the leftmost (smallest) entry of a subtree — its in-order successor.
-function minKV(n: PNode): { key: Uint8Array; val: Row } {
-  while (!isLeaf(n)) n = n.children[0];
-  return { key: n.keys[0], val: n.vals[0] };
+// nodeInsert is the recursive insert. On overwrite it sets ctx and rebuilds the path with the
+// value+weight replaced (which may now overflow). On a new key it inserts into the leaf and splits
+// overflowing nodes back up the path.
+function nodeInsert(n: PNode, key: Uint8Array, val: Row, weight: number, ctx: InsCtx, cap: number): InsOut {
+  const { index, found } = search(n, key);
+  if (found) {
+    const vals = n.vals.slice();
+    const weights = n.weights.slice();
+    ctx.old = vals[index];
+    ctx.replaced = true;
+    vals[index] = val;
+    weights[index] = weight;
+    return build(n.keys.slice(), vals, weights, n.children.slice(), cap);
+  }
+  if (isLeaf(n)) {
+    return build(insertAt(n.keys, index, key), insertAt(n.vals, index, val), insertAt(n.weights, index, weight), [], cap);
+  }
+  const child = nodeInsert(n.children[index], key, val, weight, ctx, cap);
+  if (child.whole !== null) {
+    const children = n.children.slice();
+    children[index] = child.whole;
+    return { whole: { keys: n.keys.slice(), vals: n.vals.slice(), weights: n.weights.slice(), children, page: 0 } };
+  }
+  const keys = insertAt(n.keys, index, child.midK);
+  const vals = insertAt(n.vals, index, child.midV);
+  const weights = insertAt(n.weights, index, child.midW);
+  let children = n.children.slice();
+  children[index] = child.left;
+  children = insertAt(children, index + 1, child.right);
+  return build(keys, vals, weights, children, cap);
 }
 
 // maxKV is the rightmost (largest) entry of a subtree — its in-order predecessor.
-function maxKV(n: PNode): { key: Uint8Array; val: Row } {
+function maxKV(n: PNode): { key: Uint8Array; val: Row; weight: number } {
   while (!isLeaf(n)) n = n.children[n.children.length - 1];
-  return { key: n.keys[n.keys.length - 1], val: n.vals[n.vals.length - 1] };
+  const i = n.keys.length - 1;
+  return { key: n.keys[i], val: n.vals[i], weight: n.weights[i] };
 }
 
 type RemOut = { ok: boolean; node: PNode; removed: Row | undefined };
 
-// nodeRemove is the recursive delete (Cormen's B-tree deletion, copy-on-write). It maintains the
-// invariant that any node it descends into holds at least t keys, so a delete cannot underflow
-// it — a key in an internal node is replaced by a predecessor/successor drawn from a child that
-// can spare one (else the two children and the separator are merged first). That rebalancing
-// keeps every leaf non-empty, so minKV/maxKV are always well-defined.
-function nodeRemove(n: PNode, key: Uint8Array): RemOut {
+// nodeRemove is the recursive delete (copy-on-write). Returns the rebuilt subtree (possibly
+// underfull — the caller rebalances it) and the removed row. A separator found in an interior node
+// is replaced by its in-order predecessor (drawn from the left subtree), which is then deleted from
+// that subtree; the touched child is rebalanced via rebalanceChild.
+function nodeRemove(n: PNode, key: Uint8Array, cap: number): RemOut {
   const { index, found } = search(n, key);
   if (found) {
     if (isLeaf(n)) {
       const removed = n.vals[index];
-      return { ok: true, node: { keys: removeAt(n.keys, index), vals: removeAt(n.vals, index), children: [] }, removed };
+      return {
+        ok: true,
+        node: { keys: removeAt(n.keys, index), vals: removeAt(n.vals, index), weights: removeAt(n.weights, index), children: [], page: 0 },
+        removed,
+      };
     }
     const removed = n.vals[index];
-    if (canSpare(n.children[index])) {
-      const pred = maxKV(n.children[index]);
-      const child = nodeRemove(n.children[index], pred.key).node;
-      const keys = n.keys.slice();
-      const vals = n.vals.slice();
-      const children = n.children.slice();
-      keys[index] = pred.key;
-      vals[index] = pred.val;
-      children[index] = child;
-      return { ok: true, node: { keys, vals, children }, removed };
-    }
-    if (canSpare(n.children[index + 1])) {
-      const succ = minKV(n.children[index + 1]);
-      const child = nodeRemove(n.children[index + 1], succ.key).node;
-      const keys = n.keys.slice();
-      const vals = n.vals.slice();
-      const children = n.children.slice();
-      keys[index] = succ.key;
-      vals[index] = succ.val;
-      children[index + 1] = child;
-      return { ok: true, node: { keys, vals, children }, removed };
-    }
-    const merged = mergeAt(n, index);
-    const res = finishDescend(merged, index, key);
-    return { ok: true, node: res.node, removed };
+    const pred = maxKV(n.children[index]);
+    const child = nodeRemove(n.children[index], pred.key, cap).node;
+    const keys = n.keys.slice();
+    const vals = n.vals.slice();
+    const weights = n.weights.slice();
+    const children = n.children.slice();
+    keys[index] = pred.key;
+    vals[index] = pred.val;
+    weights[index] = pred.weight;
+    children[index] = child;
+    const rebuilt: PNode = { keys, vals, weights, children, page: 0 };
+    return { ok: true, node: rebalanceChild(rebuilt, index, cap), removed };
   }
   if (isLeaf(n)) {
     return { ok: false, node: n, removed: undefined };
   }
-  return descendRemove(n, index, key);
-}
-
-// descendRemove descends into child i to delete key, first ensuring that child holds at least t
-// keys — borrow from a sibling that can spare it, else merge with a sibling.
-function descendRemove(n: PNode, i: number, key: Uint8Array): RemOut {
-  if (n.children[i].keys.length >= T) {
-    return finishDescend(n, i, key);
-  }
-  if (i > 0 && canSpare(n.children[i - 1])) {
-    return finishDescend(borrowFromLeft(n, i), i, key);
-  }
-  if (i + 1 < n.children.length && canSpare(n.children[i + 1])) {
-    return finishDescend(borrowFromRight(n, i), i, key);
-  }
-  if (i > 0) {
-    return finishDescend(mergeAt(n, i - 1), i - 1, key);
-  }
-  return finishDescend(mergeAt(n, i), i, key);
-}
-
-// finishDescend recurses into child i (now guaranteed >= t keys) and splices the result back in.
-function finishDescend(n: PNode, i: number, key: Uint8Array): RemOut {
-  const res = nodeRemove(n.children[i], key);
+  const res = nodeRemove(n.children[index], key, cap);
   if (!res.ok) return { ok: false, node: n, removed: undefined };
   const children = n.children.slice();
-  children[i] = res.node;
-  return { ok: true, node: { keys: n.keys.slice(), vals: n.vals.slice(), children }, removed: res.removed };
+  children[index] = res.node;
+  const rebuilt: PNode = { keys: n.keys.slice(), vals: n.vals.slice(), weights: n.weights.slice(), children, page: 0 };
+  return { ok: true, node: rebalanceChild(rebuilt, index, cap), removed: res.removed };
 }
 
-// borrowFromLeft: child i borrows a key from its left sibling, rotating through separator i-1.
-function borrowFromLeft(n: PNode, i: number): PNode {
-  const left = n.children[i - 1];
-  const cur = n.children[i];
+// rebalanceChild: if children[i] is underfull (payload < cap/2), merge it with an adjacent sibling
+// (prefer the right one), then split the merged node back if it overflows — the unified rebalance
+// (no borrow). The returned parent may itself have lost a key and become underfull; its own parent
+// handles that as the recursion unwinds.
+function rebalanceChild(n: PNode, i: number, cap: number): PNode {
+  if (payload(n.children[i]) >= cap / 2) return n;
+  const j = i + 1 < n.children.length ? i : i - 1;
+  return mergeAt(n, j, cap);
+}
 
-  const upKey = left.keys[left.keys.length - 1];
-  const upVal = left.vals[left.vals.length - 1];
-  const newLeft: PNode = {
-    keys: left.keys.slice(0, -1),
-    vals: left.vals.slice(0, -1),
-    children: isLeaf(left) ? [] : left.children.slice(0, -1),
-  };
-  const newCur: PNode = {
-    keys: insertAt(cur.keys, 0, n.keys[i - 1]),
-    vals: insertAt(cur.vals, 0, n.vals[i - 1]),
-    children: isLeaf(left) ? [] : insertAt(cur.children, 0, left.children[left.children.length - 1]),
-  };
+// mergeAt merges children[j], separator j, and children[j+1] into one node M. If M fits, it replaces
+// the pair and the parent loses separator j and child j+1. If M overflows, it is split 2-way and the
+// two halves + the new separator replace the pair (the parent's key count is unchanged). M < 2·cap
+// always (format.md), so a single split restores fit.
+function mergeAt(n: PNode, j: number, cap: number): PNode {
+  const left = n.children[j];
+  const right = n.children[j + 1];
+  const mkeys = [...left.keys, n.keys[j], ...right.keys];
+  const mvals = [...left.vals, n.vals[j], ...right.vals];
+  const mweights = [...left.weights, n.weights[j], ...right.weights];
+  const mchildren = isLeaf(left) ? [] : [...left.children, ...right.children];
 
   const keys = n.keys.slice();
   const vals = n.vals.slice();
+  const weights = n.weights.slice();
   const children = n.children.slice();
-  keys[i - 1] = upKey;
-  vals[i - 1] = upVal;
-  children[i - 1] = newLeft;
-  children[i] = newCur;
-  return { keys, vals, children };
-}
 
-// borrowFromRight: child i borrows a key from its right sibling, rotating through separator i.
-function borrowFromRight(n: PNode, i: number): PNode {
-  const cur = n.children[i];
-  const right = n.children[i + 1];
-
-  const upKey = right.keys[0];
-  const upVal = right.vals[0];
-  const newRight: PNode = {
-    keys: right.keys.slice(1),
-    vals: right.vals.slice(1),
-    children: isLeaf(right) ? [] : right.children.slice(1),
-  };
-  const newCur: PNode = {
-    keys: insertAt(cur.keys, cur.keys.length, n.keys[i]),
-    vals: insertAt(cur.vals, cur.vals.length, n.vals[i]),
-    children: isLeaf(right) ? [] : insertAt(cur.children, cur.children.length, right.children[0]),
-  };
-
-  const keys = n.keys.slice();
-  const vals = n.vals.slice();
-  const children = n.children.slice();
-  keys[i] = upKey;
-  vals[i] = upVal;
-  children[i] = newCur;
-  children[i + 1] = newRight;
-  return { keys, vals, children };
-}
-
-// mergeAt merges children[i], separator i, and children[i+1] into one node (2t-1 keys), and
-// removes the separator and the absorbed right child from this node.
-function mergeAt(n: PNode, i: number): PNode {
-  const left = n.children[i];
-  const right = n.children[i + 1];
-  const merged: PNode = {
-    keys: [...left.keys, n.keys[i], ...right.keys],
-    vals: [...left.vals, n.vals[i], ...right.vals],
-    children: isLeaf(left) ? [] : [...left.children, ...right.children],
-  };
-  const children = n.children.slice();
-  children[i] = merged;
-  children.splice(i + 1, 1);
-  return { keys: removeAt(n.keys, i), vals: removeAt(n.vals, i), children };
+  const out = build(mkeys, mvals, mweights, mchildren, cap);
+  if (out.whole !== null) {
+    keys.splice(j, 1);
+    vals.splice(j, 1);
+    weights.splice(j, 1);
+    children[j] = out.whole;
+    children.splice(j + 1, 1);
+    return { keys, vals, weights, children, page: 0 };
+  }
+  keys[j] = out.midK;
+  vals[j] = out.midV;
+  weights[j] = out.midW;
+  children[j] = out.left;
+  children[j + 1] = out.right;
+  return { keys, vals, weights, children, page: 0 };
 }
 
 // --- immutable array helpers (each returns a fresh array, leaving the input untouched) -------

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -46,7 +47,7 @@ func run(t *testing.T, db *Database, sql string) {
 // pkTableDB is CREATE TABLE t (id int32 PRIMARY KEY, v int16) with 20 rows (id 3's v
 // is NULL) — enough to span more than one data page at page_size 256.
 func pkTableDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")
 	for i := int64(1); i <= 20; i++ {
 		v := fmt.Sprintf("%d", i*10)
@@ -59,17 +60,29 @@ func pkTableDB(t *testing.T) *Database {
 }
 
 func oneTableEmptyDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")
 	return db
 }
 
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 func nopkTableDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE r (a int16, b int64)")
 	for _, ab := range [][2]int64{{7, 70}, {8, 80}, {9, 90}} {
 		run(t, db, fmt.Sprintf("INSERT INTO r VALUES (%d, %d)", ab[0], ab[1]))
+	}
+	return db
+}
+
+// tallTreeDB's wide text padding forces a HEIGHT-2 tree (an interior node whose children are
+// themselves interior nodes) at page_size 256 — exercises interior-of-interior child pointers and
+// post-order page allocation across a deeper tree (spec/fileformat/format.md).
+func tallTreeDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)")
+	for i := int64(1); i <= 18; i++ {
+		run(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, 'row-%02d-%s')", i, i, strings.Repeat("x", 48)))
 	}
 	return db
 }
@@ -78,7 +91,7 @@ func nopkTableDB(t *testing.T) *Database {
 // UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text value,
 // and a 4-byte astral char (😀). The PK stays int32 (no text key this slice).
 func textTableDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, s text)")
 	run(t, db, "INSERT INTO t VALUES (1, 'alice')")
 	run(t, db, "INSERT INTO t VALUES (2, '')")
@@ -93,7 +106,7 @@ func textTableDB(t *testing.T) *Database {
 // bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (no boolean
 // key this slice).
 func boolTableDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)")
 	run(t, db, "INSERT INTO t VALUES (1, TRUE)")
 	run(t, db, "INSERT INTO t VALUES (2, FALSE)")
@@ -107,7 +120,7 @@ func boolTableDB(t *testing.T) *Database {
 // so storing them is a no-op coercion). Covers positive, negative, zero, a multi-group
 // coefficient, and a NULL. The PK stays int32 (no decimal key this slice).
 func decimalTableDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, d numeric, m numeric(10,2))")
 	run(t, db, "INSERT INTO t VALUES (1, 1.50, 1.50), (2, -12345.6789, -12.34), "+
 		"(3, 0.00, 0.00), (4, 100000000.000001, 100.00), (5, NULL, NULL)")
@@ -119,7 +132,7 @@ func decimalTableDB(t *testing.T) *Database {
 // NULL, and a lone 0x00. The PK stays int32 (no bytea key this slice). Literals are the `\x`
 // hex input form, adapting to the bytea column (spec/design/types.md §6).
 func byteaTableDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, b bytea)")
 	run(t, db, `INSERT INTO t VALUES (1, '\xdeadbeef')`)
 	run(t, db, `INSERT INTO t VALUES (2, '\x')`)
@@ -136,7 +149,7 @@ func byteaTableDB(t *testing.T) *Database {
 // a present and a NULL uuid value, and the nil/max boundary UUIDs. Must match the Ruby
 // reference's UUID_TABLE (spec/fileformat/verify.rb).
 func uuidTableDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)")
 	run(t, db, "INSERT INTO t VALUES "+
 		"('00000000-0000-0000-0000-000000000000', '550e8400-e29b-41d4-a716-446655440000'), "+
@@ -151,7 +164,7 @@ func uuidTableDB(t *testing.T) *Database {
 // a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to numeric(6,2),
 // and a plain no-default column. Row 1 takes every default; row 2 provides all values.
 func defaultTableDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, n int32 DEFAULT 0, note text DEFAULT 'none', "+
 		"maybe int32 DEFAULT NULL, req int32 NOT NULL DEFAULT 7, amt numeric(6,2) DEFAULT 1.5, plain int16)")
 	run(t, db, "INSERT INTO t (id) VALUES (1)")
@@ -163,7 +176,7 @@ func defaultTableDB(t *testing.T) *Database {
 // positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a
 // NULL. The literals parse to the same micros the golden stores. The PK stays int32.
 func timestampTableDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamp)")
 	run(t, db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')")
 	run(t, db, "INSERT INTO t VALUES (2, '1969-12-31 23:59:59.5')")
@@ -177,7 +190,7 @@ func timestampTableDB(t *testing.T) *Database {
 // timestamptzTableDB exercises the same 8-byte branch under type code 9; the +05 literal
 // normalizes to UTC before storage.
 func timestamptzTableDB(t *testing.T) *Database {
-	db := NewDatabase()
+	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamptz)")
 	run(t, db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00+00')")
 	run(t, db, "INSERT INTO t VALUES (2, '2024-01-01 12:00:00+05')")
@@ -194,7 +207,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		name  string
 		build func(*testing.T) *Database
 	}{
-		{"empty_db.jed", func(*testing.T) *Database { return NewDatabase() }},
+		{"empty_db.jed", func(*testing.T) *Database { return WithPageSize(goldenPageSize) }},
 		{"one_table_empty.jed", oneTableEmptyDB},
 		{"pk_table.jed", pkTableDB},
 		{"text_table.jed", textTableDB},
@@ -206,6 +219,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"timestamp_table.jed", timestampTableDB},
 		{"timestamptz_table.jed", timestamptzTableDB},
 		{"nopk_table.jed", nopkTableDB},
+		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
 		image, err := c.build(t).ToImage(goldenPageSize, 1)
@@ -237,6 +251,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"timestamp_table.jed", timestampTableDB, "t"},
 		{"timestamptz_table.jed", timestamptzTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
+		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},
 	}
@@ -293,8 +308,8 @@ func TestReadGoldenReconstructsCatalog(t *testing.T) {
 // A no-PK table's monotonic rowid counter must be reconstructed on load, so inserts
 // after a load don't collide with persisted rowids (the step-6 mutation fix).
 func TestRowidCounterSurvivesLoad(t *testing.T) {
-	db := nopkTableDB(t) // existing rows take rowids 0, 1, 2
-	image, err := db.ToImage(8192, 1)
+	db := nopkTableDB(t) // existing rows take rowids 0, 1, 2 (built at goldenPageSize)
+	image, err := db.ToImage(goldenPageSize, 1)
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
@@ -332,7 +347,16 @@ func TestDefaultSurvivesLoad(t *testing.T) {
 // The default 8 KiB page size also round-trips (goldens stay at 256 for reviewable
 // hex, but the real default must work too).
 func TestRoundTripAtDefaultPageSize(t *testing.T) {
-	db := pkTableDB(t)
+	// Built at 8192 so the in-memory tree is sized for it (fan-out tracks the page size — format.md).
+	db := WithPageSize(8192)
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")
+	for i := int64(1); i <= 20; i++ {
+		v := fmt.Sprintf("%d", i*10)
+		if i == 3 {
+			v = "NULL"
+		}
+		run(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %s)", i, v))
+	}
 	image, err := db.ToImage(8192, 1)
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
@@ -378,8 +402,8 @@ func TestTypeCodesRoundTrip(t *testing.T) {
 
 func TestSerializeIsDeterministic(t *testing.T) {
 	db := pkTableDB(t)
-	a, _ := db.ToImage(8192, 1)
-	b, _ := db.ToImage(8192, 1)
+	a, _ := db.ToImage(goldenPageSize, 1)
+	b, _ := db.ToImage(goldenPageSize, 1)
 	if !bytes.Equal(a, b) {
 		t.Errorf("serializing the same database twice produced different bytes")
 	}
@@ -387,9 +411,9 @@ func TestSerializeIsDeterministic(t *testing.T) {
 
 func TestCorruptImageIsRejected(t *testing.T) {
 	db := pkTableDB(t)
-	image, _ := db.ToImage(8192, 1)
-	image[0] ^= 0xFF    // smash slot 0 magic
-	image[8192] ^= 0xFF // smash slot 1 magic
+	image, _ := db.ToImage(goldenPageSize, 1)
+	image[0] ^= 0xFF              // smash slot 0 magic
+	image[goldenPageSize] ^= 0xFF // smash slot 1 magic
 	if _, err := LoadDatabase(image); err == nil {
 		t.Errorf("expected a data_corrupted error")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "XX001" {

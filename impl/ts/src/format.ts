@@ -15,6 +15,7 @@ import { Decimal } from "./decimal.ts";
 import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database, Snapshot } from "./executor.ts";
+import type { PNode } from "./pmap.ts";
 import type { Row } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -40,11 +41,12 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 1; // on-disk format version
-const PAGE_HEADER = 12; // bytes of the catalog/data page header
+const FORMAT_VERSION = 2; // on-disk format version (2 = page-backed CoW B-tree, P6.1)
+const PAGE_HEADER = 12; // bytes of the catalog/B-tree page header
 const PAGE_CATALOG = 1; // page_type for a catalog page
-const PAGE_DATA = 2; // page_type for a data page
-const ROOT_PAGE = 2; // catalog root (pages 0,1 are the meta slots)
+const PAGE_LEAF = 2; // page_type for a B-tree leaf node
+const PAGE_INTERIOR = 3; // page_type for a B-tree interior node
+const ROOT_PAGE = 2; // catalog root of a fresh empty db (relocatable thereafter)
 
 const UTF8 = new TextEncoder();
 const UTF8_DECODE = new TextDecoder("utf-8", { fatal: true });
@@ -216,6 +218,17 @@ function concat(parts: Uint8Array[]): Uint8Array {
   return out;
 }
 
+// recordSize is the on-disk size of a record (key_len(u16) | key | each column value) — the weight
+// the page-backed B-tree splits on (format.md). It must equal encodeRecord(...).length, so in-memory
+// node boundaries match serialized page boundaries; computed from the value codec to stay in lockstep.
+export function recordSize(colTypes: ScalarType[], key: Uint8Array, row: Row): number {
+  let n = 2 + key.length;
+  for (let i = 0; i < colTypes.length; i++) {
+    n += encodeValue(colTypes[i]!, row[i]!).length;
+  }
+  return n;
+}
+
 // encodeRecord builds one record: key_len(u16) | key | payload(each column value).
 function encodeRecord(table: Table, key: Uint8Array, row: Row): Uint8Array {
   const w = new ByteWriter();
@@ -303,63 +316,90 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   // Tables in ascending lowercased-name order (no map-iteration order leak).
   const keys = [...snap.tables.keys()].sort();
 
-  // Per-table record bytes, in key order.
-  const records: Uint8Array[][] = keys.map((k) =>
-    snap.stores.get(k)!.entriesInKeyOrder().map((e) => encodeRecord(snap.tables.get(k)!, e.key, e.row)),
-  );
+  // Serialize each table's B-tree post-order, body pages allocated from page 2. Each BodyPage is
+  // (index, pageType, itemCount, payload); children precede their parent so parent child-pointers
+  // reference already-allocated pages (format.md).
+  const body: BodyPage[] = [];
+  const rootDataPage: number[] = new Array(keys.length).fill(0);
+  let nextIndex = ROOT_PAGE;
+  for (let ti = 0; ti < keys.length; ti++) {
+    const root = snap.stores.get(keys[ti]!)!.treeRoot();
+    if (root !== null) {
+      const r = serializeNode(root, snap.tables.get(keys[ti]!)!, capacity, nextIndex, body);
+      rootDataPage[ti] = r.index;
+      nextIndex = r.next;
+    }
+  }
 
-  // Catalog grouping depends only on entry sizes (independent of root_data_page).
+  // The catalog chain follows the data; its head is the relocatable root_page.
+  const catRoot = nextIndex;
   const entrySizes = keys.map((k) => tableEntryBytes(snap.tables.get(k)!, 0).length);
   const catGroups = pack(entrySizes, capacity);
-  const numCatPages = catGroups.length;
-
-  // Assign data chains after the catalog; record each table's root page.
-  let nextIndex = ROOT_PAGE + numCatPages;
-  const rootDataPage: number[] = new Array(keys.length).fill(0);
-  const dataGroups: number[][][] = new Array(keys.length);
-  for (let ti = 0; ti < keys.length; ti++) {
-    const recs = records[ti]!;
-    if (recs.length === 0) {
-      dataGroups[ti] = [];
-      continue;
-    }
-    const groups = pack(recs.map((r) => r.length), capacity);
-    rootDataPage[ti] = nextIndex;
-    nextIndex += groups.length;
-    dataGroups[ti] = groups;
-  }
-  const pageCount = nextIndex;
+  const pageCount = catRoot + catGroups.length;
 
   const image = new Uint8Array(pageCount * ps);
   const dv = new DataView(image.buffer);
 
-  // Meta: both slots hold the current meta (a fresh whole-image commit has no distinct
-  // prior version — format.md).
-  writeMeta(image, dv, ps, 0, pageSize, txid, ROOT_PAGE, pageCount);
-  writeMeta(image, dv, ps, 1, pageSize, txid, ROOT_PAGE, pageCount);
+  // Meta: both slots hold the current meta (a fresh from-scratch image has no distinct prior
+  // version; slot alternation is the live incremental-commit path — format.md).
+  writeMeta(image, dv, ps, 0, pageSize, txid, catRoot, pageCount);
+  writeMeta(image, dv, ps, 1, pageSize, txid, catRoot, pageCount);
 
-  // Catalog pages.
+  // B-tree node pages.
+  for (const bp of body) {
+    writePage(image, dv, ps, bp.index, bp.pageType, bp.itemCount, 0, bp.payload);
+  }
+
+  // Catalog chain.
   for (let gi = 0; gi < catGroups.length; gi++) {
     const group = catGroups[gi]!;
-    const index = ROOT_PAGE + gi;
+    const index = catRoot + gi;
     const next = gi + 1 < catGroups.length ? index + 1 : 0;
     const parts = group.map((ti) => tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!));
     writePage(image, dv, ps, index, PAGE_CATALOG, group.length, next, concat(parts));
   }
 
-  // Data pages, one chain per non-empty table.
-  for (let ti = 0; ti < keys.length; ti++) {
-    const groups = dataGroups[ti]!;
-    for (let gi = 0; gi < groups.length; gi++) {
-      const group = groups[gi]!;
-      const index = rootDataPage[ti]! + gi;
-      const next = gi + 1 < groups.length ? index + 1 : 0;
-      const parts = group.map((ri) => records[ti]![ri]!);
-      writePage(image, dv, ps, index, PAGE_DATA, group.length, next, concat(parts));
-    }
-  }
-
   return image;
+}
+
+// BodyPage is one serialized B-tree node awaiting write: its index, type, key count, payload.
+type BodyPage = { index: number; pageType: number; itemCount: number; payload: Uint8Array };
+
+// serializeNode serializes one node and its subtree post-order, appending each to `body`, and
+// returns this node's assigned page index and the next free index. A leaf's payload is its records;
+// an interior's is its N+1 child pointers (big-endian u32) then its N records (format.md). A node
+// whose payload would exceed the page is an oversized record (over RECORD_MAX) → feature_not_supported.
+function serializeNode(
+  n: PNode,
+  table: Table,
+  capacity: number,
+  nextIndex: number,
+  body: BodyPage[],
+): { index: number; next: number } {
+  const childPages: number[] = [];
+  for (const c of n.children) {
+    const r = serializeNode(c, table, capacity, nextIndex, body);
+    childPages.push(r.index);
+    nextIndex = r.next;
+  }
+  const index = nextIndex;
+  nextIndex++;
+
+  const w = new ByteWriter();
+  let pageType = PAGE_LEAF;
+  if (n.children.length > 0) {
+    pageType = PAGE_INTERIOR;
+    for (const cp of childPages) w.u32(cp);
+  }
+  for (let i = 0; i < n.keys.length; i++) {
+    w.bytes(encodeRecord(table, n.keys[i]!, n.vals[i]!));
+  }
+  const payload = w.toBytes();
+  if (payload.length > capacity) {
+    throw engineError("feature_not_supported", "a record larger than the per-row limit is not supported");
+  }
+  body.push({ index, pageType, itemCount: n.keys.length, payload });
+  return { index, next: nextIndex };
 }
 
 // loadDatabase reconstructs a database from an on-disk image (inverse of toImage).
@@ -389,8 +429,18 @@ export function loadDatabase(image: Uint8Array): Database {
       const { table, root } = decodeTableEntry(pg.payload, cur);
       const colTypes = table.columns.map((c) => c.type);
       const hasPK = primaryKeyIndex(table) >= 0;
-      snap.putTable(table);
-      readDataChain(image, dv, pageSize, root, colTypes, hasPK, table.name, snap);
+      snap.putTable(table, pageSize);
+      if (root !== 0) {
+        const t = readTree(image, dv, pageSize, root, colTypes);
+        const store = snap.stores.get(table.name.toLowerCase())!;
+        store.setTree(t.node, t.length);
+        // No-PK keys are synthetic int64 rowids — advance the counter past the largest (the last
+        // entry in key order) so future inserts don't collide.
+        if (!hasPK && t.length > 0) {
+          const entries = store.entriesInKeyOrder();
+          store.bumpRowidTo(decodeInt("int64", entries[entries.length - 1]!.key) + 1n);
+        }
+      }
     }
     catPage = pg.nextPage;
   }
@@ -400,39 +450,57 @@ export function loadDatabase(image: Uint8Array): Database {
   return db;
 }
 
-// readDataChain reads every record in a table's data-page chain into its store. For a
-// table with no primary key, the keys are synthetic int64 rowids; advance the store's
-// rowid counter past the largest so future inserts don't collide (format.md). No format
-// change — keys are stored verbatim.
-function readDataChain(
+// readTree reads a table's on-disk B-tree (rooted at pageIdx) into an in-memory tree, returning the
+// root node and the total row count (spec/fileformat/format.md). An interior node's payload is its
+// N+1 child pointers then its N records; we recurse the pointers, then read the separators. Weights
+// are recomputed from the value codec (the exact size the writer used), so the loaded tree is ready
+// for further size-driven splits.
+function readTree(
   image: Uint8Array,
   dv: DataView,
   ps: number,
-  root: number,
+  pageIdx: number,
   colTypes: ScalarType[],
-  hasPK: boolean,
-  name: string,
-  snap: Snapshot,
-): void {
-  const store = snap.stores.get(name.toLowerCase())!;
-  let dp = root;
-  while (dp !== 0) {
-    const pg = readPage(image, dv, ps, dp);
-    if (pg.pageType !== PAGE_DATA) {
-      throw engineError("data_corrupted", "expected a data page");
-    }
+): { node: PNode; length: number } {
+  const pg = readPage(image, dv, ps, pageIdx);
+  if (pg.pageType === PAGE_LEAF) {
+    const n = pg.itemCount;
+    const keys: Uint8Array[] = [];
+    const vals: Row[] = [];
+    const weights: number[] = [];
     const cur = { pos: 0 };
-    for (let i = 0; i < pg.itemCount; i++) {
+    for (let i = 0; i < n; i++) {
       const { key, row } = decodeRecord(colTypes, pg.payload, cur);
-      if (!hasPK && key.length === widthBytes("int64")) {
-        store.bumpRowidTo(decodeInt("int64", key) + 1n);
-      }
-      if (!store.insert(key, row)) {
-        throw engineError("data_corrupted", "duplicate key in data page");
-      }
+      weights.push(recordSize(colTypes, key, row));
+      keys.push(key);
+      vals.push(row);
     }
-    dp = pg.nextPage;
+    return { node: { keys, vals, weights, children: [], page: pageIdx }, length: n };
   }
+  if (pg.pageType === PAGE_INTERIOR) {
+    const n = pg.itemCount;
+    const cur = { pos: 0 };
+    const children: PNode[] = [];
+    let total = 0;
+    for (let i = 0; i < n + 1; i++) {
+      const cp = readU32(pg.payload, cur);
+      const r = readTree(image, dv, ps, cp, colTypes);
+      children.push(r.node);
+      total += r.length;
+    }
+    const keys: Uint8Array[] = [];
+    const vals: Row[] = [];
+    const weights: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const { key, row } = decodeRecord(colTypes, pg.payload, cur);
+      weights.push(recordSize(colTypes, key, row));
+      keys.push(key);
+      vals.push(row);
+    }
+    total += n;
+    return { node: { keys, vals, weights, children, page: pageIdx }, length: total };
+  }
+  throw engineError("data_corrupted", "expected a B-tree node page");
 }
 
 // writeMeta writes a meta slot's bytes (and its CRC) into image. Reserved bytes are left

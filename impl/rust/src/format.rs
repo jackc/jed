@@ -1,10 +1,12 @@
 //! On-disk single-file format: serialize / load (spec/fileformat/format.md).
 //!
-//! Whole-image model (step-5b): a commit serializes the entire database to one byte
-//! image; loading reconstructs it. The byte layout is the canonical contract
-//! (spec/fileformat/format.md) and is verified byte-for-byte against shared goldens
-//! so a file written by this core is byte-identical to one written by the Go core
-//! (CLAUDE.md §8). All multi-byte integers are big-endian.
+//! `format_version` 2 — the page-backed copy-on-write B-tree (Phase 6, P6.1): each table's rows are
+//! an on-disk B-tree (leaf + interior node pages), the catalog is a relocatable page chain, and
+//! `to_image` lays the whole tree out post-order (the from-scratch image the goldens pin; the
+//! incremental dirty-page commit reuses the same node codec — storage.md §4). The byte layout is the
+//! canonical contract (spec/fileformat/format.md), verified byte-for-byte against shared goldens so a
+//! file written by this core is byte-identical to the Go, TS, and Ruby reference output (CLAUDE.md
+//! §8). All multi-byte integers are big-endian.
 
 use std::sync::Arc;
 
@@ -349,13 +351,21 @@ impl Database {
 /// `N+1` child pointers then its `N` records; we recurse the pointers, then read the separators.
 /// Weights are recomputed from the value codec (the exact size the writer used), so the loaded tree
 /// is ready for further size-driven splits.
-fn read_tree(image: &[u8], ps: usize, page_idx: u32, col_types: &[ScalarType]) -> Result<(Arc<Node>, usize)> {
+fn read_tree(
+    image: &[u8],
+    ps: usize,
+    page_idx: u32,
+    col_types: &[ScalarType],
+) -> Result<(Arc<Node>, usize)> {
     let page = read_page(image, ps, page_idx)?;
     match page.page_type {
         PAGE_LEAF => {
             let n = page.item_count as usize;
-            let (mut keys, mut vals, mut weights) =
-                (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+            let (mut keys, mut vals, mut weights) = (
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+            );
             let mut pos = 0usize;
             for _ in 0..n {
                 let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
@@ -376,8 +386,11 @@ fn read_tree(image: &[u8], ps: usize, page_idx: u32, col_types: &[ScalarType]) -
                 children.push(child);
                 total += clen;
             }
-            let (mut keys, mut vals, mut weights) =
-                (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+            let (mut keys, mut vals, mut weights) = (
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+            );
             for _ in 0..n {
                 let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
                 weights.push(record_size(col_types, &key, &row) as u32);

@@ -80,10 +80,16 @@ func (s *Snapshot) table(name string) (*Table, bool) {
 // store returns a table's store (the table is known to exist).
 func (s *Snapshot) store(name string) *TableStore { return s.stores[strings.ToLower(name)] }
 
-// putTable registers a new table and its empty store.
-func (s *Snapshot) putTable(t *Table) {
+// putTable registers a new table and its empty store. The store carries the page payload cap (=
+// page_size − 12) and the column types so the page-backed B-tree can weigh records for its
+// size-driven split (spec/fileformat/format.md).
+func (s *Snapshot) putTable(t *Table, pageSize uint32) {
 	key := strings.ToLower(t.Name)
-	s.stores[key] = NewTableStore()
+	colTypes := make([]ScalarType, len(t.Columns))
+	for i, c := range t.Columns {
+		colTypes[i] = c.Type
+	}
+	s.stores[key] = NewTableStore(int(pageSize)-12, colTypes) // 12 = pageHeader
 	s.tables[key] = t
 }
 
@@ -126,6 +132,14 @@ func NewDatabase() *Database {
 	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize}
 }
 
+// WithPageSize returns an in-memory handle that serializes at pageSize. The page-backed B-tree's
+// fan-out tracks the page size (spec/fileformat/format.md), so the in-memory tree must be built at
+// the size it will serialize to — this builds fixtures / tests a non-default page size; a normal
+// in-memory database uses NewDatabase (the default page size).
+func WithPageSize(pageSize uint32) *Database {
+	return &Database{committed: newSnapshot(), pageSize: pageSize}
+}
+
 // readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
 // writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
 func (db *Database) readSnap() *Snapshot {
@@ -165,7 +179,7 @@ func (db *Database) Table(name string) (*Table, bool) {
 // putTable registers a new table and its empty store in the working snapshot (DDL is
 // transactional — transactions.md §4.5).
 func (db *Database) putTable(t *Table) {
-	db.working().putTable(t)
+	db.working().putTable(t, db.pageSize)
 }
 
 // ExecuteStmt executes one parsed statement with no bind parameters.

@@ -11,7 +11,9 @@ package jed
 // Row is a stored row: one value per column, in column order.
 type Row []Value
 
-// TableStore holds one table's rows, keyed by encoded primary key.
+// TableStore holds one table's rows, keyed by encoded primary key. Since Phase 6 (P6.1) the PMap is
+// the page-backed B-tree, so the store carries the page payload cap (= page_size − 12) and the
+// column types to weigh each record (recordSize) for the size-driven split (spec/fileformat/format.md).
 type TableStore struct {
 	rows PMap
 	// nextRowid is the next synthetic rowid for a table with no primary key.
@@ -19,16 +21,28 @@ type TableStore struct {
 	// key. Unused for tables with a primary key. Reconstructed on load
 	// (spec/fileformat).
 	nextRowid int64
+	// cap is the page payload capacity C = page_size − 12 (the split threshold). Fixed for the
+	// database's life. colTypes are the column types, for computing record weights.
+	cap      int
+	colTypes []ScalarType
 }
 
-// NewTableStore builds an empty store.
-func NewTableStore() *TableStore { return &TableStore{} }
+// NewTableStore builds an empty store for a table whose columns have the given types, serializing at
+// page payload cap (= page_size − 12).
+func NewTableStore(cap int, colTypes []ScalarType) *TableStore {
+	return &TableStore{cap: cap, colTypes: colTypes}
+}
 
 // clone returns an independent O(1) snapshot of the store: the PMap value-copy shares structure
 // (nodes are immutable), so mutating one store leaves the clone untouched. The foundation of the
 // transaction model (spec/design/transactions.md §2).
 func (s *TableStore) clone() *TableStore {
-	return &TableStore{rows: s.rows, nextRowid: s.nextRowid}
+	return &TableStore{rows: s.rows, nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes}
+}
+
+// weight is this row's on-disk record size — the weight the page-backed B-tree splits on.
+func (s *TableStore) weight(key []byte, row Row) uint32 {
+	return uint32(recordSize(s.colTypes, key, row))
 }
 
 // Insert adds a row under its encoded key. Returns false if the key already exists
@@ -37,7 +51,7 @@ func (s *TableStore) Insert(key []byte, row Row) bool {
 	if _, ok := s.rows.Get(key); ok {
 		return false
 	}
-	s.rows.Insert(key, row)
+	s.rows.Insert(key, row, s.weight(key, row), s.cap)
 	return true
 }
 
@@ -60,12 +74,12 @@ func (s *TableStore) BumpRowidTo(n int64) {
 // Replace overwrites the row stored at an existing key (UPDATE). The key is
 // unchanged, so key order and the rowid counter are untouched.
 func (s *TableStore) Replace(key []byte, row Row) {
-	s.rows.Insert(key, row)
+	s.rows.Insert(key, row, s.weight(key, row), s.cap)
 }
 
 // Remove deletes the row at key (DELETE). Returns whether a row was present.
 func (s *TableStore) Remove(key []byte) bool {
-	_, ok := s.rows.Remove(key)
+	_, ok := s.rows.Remove(key, s.cap)
 	return ok
 }
 
@@ -98,6 +112,13 @@ func (s *TableStore) EntriesInKeyOrder() []Entry {
 	}
 	return out
 }
+
+// treeRoot is the root B-tree node of this store, for the page-backed serializer
+// (spec/fileformat/format.md). nil for an empty table.
+func (s *TableStore) treeRoot() *pnode { return s.rows.rootNode() }
+
+// setTree installs a loaded B-tree as this store's contents (format.go LoadDatabase).
+func (s *TableStore) setTree(root *pnode, length int) { s.rows = fromLoaded(root, length) }
 
 // Len returns the row count.
 func (s *TableStore) Len() int { return s.rows.Len() }

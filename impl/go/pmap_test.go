@@ -8,6 +8,14 @@ import (
 	"testing"
 )
 
+// A small page cap so a few-thousand-entry map is several levels deep — exercises split,
+// merge-then-split, root growth and collapse (the in-RAM analog of page_size 256). pmW is a
+// realistic per-entry weight (8-byte key + a ~5-byte int value record), well under RECORD_MAX.
+const (
+	pmCap = 244
+	pmW   = 15
+)
+
 func pmKey(n uint64) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, n)
@@ -32,13 +40,41 @@ func pmShuffled(n uint64) []uint64 {
 	return v
 }
 
+// pmCheckInvariants asserts every node (except the root) fits a page and stays non-empty — the
+// structural invariant the byte contract relies on (spec/fileformat/format.md).
+func pmCheckInvariants(t *testing.T, pm *PMap) {
+	t.Helper()
+	var walk func(n *pnode, isRoot bool)
+	walk = func(n *pnode, isRoot bool) {
+		if n == nil {
+			return
+		}
+		if len(n.keys) == 0 && !isRoot {
+			t.Fatal("non-root node is empty")
+		}
+		if len(n.keys) != len(n.vals) || len(n.keys) != len(n.weights) {
+			t.Fatal("keys/vals/weights length mismatch")
+		}
+		if !n.isLeaf() && len(n.children) != len(n.keys)+1 {
+			t.Fatal("interior child count")
+		}
+		if n.payload() > pmCap {
+			t.Fatalf("node payload %d exceeds cap %d", n.payload(), pmCap)
+		}
+		for _, c := range n.children {
+			walk(c, false)
+		}
+	}
+	walk(pm.root, true)
+}
+
 func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 	var pm PMap
 	ref := map[string]Row{}
 	const n = 4000
 
 	for _, k := range pmShuffled(n) {
-		_, had := pm.Insert(pmKey(k), pmRow(int64(k)))
+		_, had := pm.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap)
 		_, refHad := ref[string(pmKey(k))]
 		if had != refHad {
 			t.Fatalf("insert 'had' mismatch at %d: %v vs %v", k, had, refHad)
@@ -48,6 +84,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 	if pm.Len() != len(ref) {
 		t.Fatalf("len %d != %d", pm.Len(), len(ref))
 	}
+	pmCheckInvariants(t, &pm)
 	for k := uint64(0); k < n; k++ {
 		got, _ := pm.Get(pmKey(k))
 		if !reflect.DeepEqual(got, ref[string(pmKey(k))]) {
@@ -71,7 +108,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 
 	// Overwrite returns the old value and does not change len (kept in sync with the reference).
 	before := pm.Len()
-	old, replaced := pm.Insert(pmKey(7), pmRow(777))
+	old, replaced := pm.Insert(pmKey(7), pmRow(777), pmW, pmCap)
 	if !replaced || !reflect.DeepEqual(old, pmRow(7)) {
 		t.Fatalf("overwrite: old=%v replaced=%v", old, replaced)
 	}
@@ -80,18 +117,22 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 		t.Fatal("overwrite changed len")
 	}
 
-	for _, k := range pmShuffled(n) {
-		got, ok := pm.Remove(pmKey(k))
+	// Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
+	for step, k := range pmShuffled(n) {
+		got, ok := pm.Remove(pmKey(k), pmCap)
 		want, wok := ref[string(pmKey(k))]
 		delete(ref, string(pmKey(k)))
 		if ok != wok || !reflect.DeepEqual(got, want) {
 			t.Fatalf("remove mismatch at %d: got %v/%v want %v/%v", k, got, ok, want, wok)
 		}
+		if step%257 == 0 {
+			pmCheckInvariants(t, &pm)
+		}
 	}
 	if pm.Len() != 0 {
 		t.Fatalf("not empty after removing all: len %d", pm.Len())
 	}
-	if _, ok := pm.Remove(pmKey(123)); ok {
+	if _, ok := pm.Remove(pmKey(123), pmCap); ok {
 		t.Fatal("remove of absent key reported present")
 	}
 }
@@ -99,20 +140,20 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 	var base PMap
 	for k := uint64(0); k < 2000; k++ {
-		base.Insert(pmKey(k), pmRow(int64(k)))
+		base.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap)
 	}
 	snap := base // an O(1) value-copy snapshot
 
 	// Mutate a separate copy heavily; the snapshot must be untouched.
 	other := base
 	for k := uint64(0); k < 2000; k++ {
-		other.Insert(pmKey(k), pmRow(-int64(k))) // overwrite every value
+		other.Insert(pmKey(k), pmRow(-int64(k)), pmW, pmCap) // overwrite every value
 	}
 	for k := uint64(2000); k < 3000; k++ {
-		other.Insert(pmKey(k), pmRow(int64(k))) // grow
+		other.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap) // grow
 	}
 	for k := uint64(0); k < 500; k++ {
-		other.Remove(pmKey(k)) // shrink
+		other.Remove(pmKey(k), pmCap) // shrink
 	}
 
 	if snap.Len() != 2000 {
@@ -124,6 +165,7 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 			t.Fatalf("snapshot mutated at %d", k)
 		}
 	}
+	pmCheckInvariants(t, &snap)
 	if other.Len() != 2500 {
 		t.Fatalf("other len %d", other.Len())
 	}
@@ -136,6 +178,26 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 	if v, _ := other.Get(pmKey(2500)); !reflect.DeepEqual(v, pmRow(2500)) {
 		t.Fatal("other key 2500 wrong")
 	}
+	pmCheckInvariants(t, &other)
+}
+
+// Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and the
+// non-empty-halves guarantee. With weight 110 (≤ 116 cap) a node holds ~2 entries.
+func TestPMapWideValuesKeepNodesValid(t *testing.T) {
+	var pm PMap
+	ref := map[string]bool{}
+	for _, k := range pmShuffled(300) {
+		pm.Insert(pmKey(k), pmRow(int64(k)), 110, pmCap)
+		ref[string(pmKey(k))] = true
+		pmCheckInvariants(t, &pm)
+	}
+	for _, k := range pmShuffled(300) {
+		pm.Remove(pmKey(k), pmCap)
+		pmCheckInvariants(t, &pm)
+	}
+	if pm.Len() != 0 {
+		t.Fatalf("not empty: %d", pm.Len())
+	}
 }
 
 func TestPMapEmptyAndSingle(t *testing.T) {
@@ -146,16 +208,16 @@ func TestPMapEmptyAndSingle(t *testing.T) {
 	if _, ok := pm.Get(pmKey(1)); ok {
 		t.Fatal("get on empty")
 	}
-	if _, ok := pm.Remove(pmKey(1)); ok {
+	if _, ok := pm.Remove(pmKey(1), pmCap); ok {
 		t.Fatal("remove on empty")
 	}
-	if _, replaced := pm.Insert(pmKey(1), pmRow(1)); replaced {
+	if _, replaced := pm.Insert(pmKey(1), pmRow(1), pmW, pmCap); replaced {
 		t.Fatal("first insert reported overwrite")
 	}
 	if v, ok := pm.Get(pmKey(1)); !ok || !reflect.DeepEqual(v, pmRow(1)) {
 		t.Fatal("get after insert")
 	}
-	if v, ok := pm.Remove(pmKey(1)); !ok || !reflect.DeepEqual(v, pmRow(1)) {
+	if v, ok := pm.Remove(pmKey(1), pmCap); !ok || !reflect.DeepEqual(v, pmRow(1)) {
 		t.Fatal("remove returns the value")
 	}
 	if pm.Len() != 0 || pm.root != nil {

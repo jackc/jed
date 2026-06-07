@@ -24,10 +24,19 @@ function run(db: Database, sql: string): void {
   execute(db, sql);
 }
 
+// goldenDb is an in-memory handle serializing at the golden page size. The page-backed B-tree's
+// fan-out tracks the page size (spec/fileformat/format.md), so the in-memory tree must be built at
+// the size it will serialize to.
+function goldenDb(): Database {
+  const db = new Database();
+  db.pageSize = GOLDEN_PAGE_SIZE;
+  return db;
+}
+
 // pkTableDB: CREATE TABLE t (id int32 PRIMARY KEY, v int16) with 20 rows (id 3's v is
 // NULL) — enough to span more than one data page at page_size 256.
 function pkTableDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
   for (let i = 1; i <= 20; i++) {
     const v = i === 3 ? "NULL" : `${i * 10}`;
@@ -37,17 +46,30 @@ function pkTableDB(): Database {
 }
 
 function oneTableEmptyDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
   return db;
 }
 
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 function nopkTableDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(db, "CREATE TABLE r (a int16, b int64)");
   for (const [a, b] of [[7, 70], [8, 80], [9, 90]]) {
     run(db, `INSERT INTO r VALUES (${a}, ${b})`);
+  }
+  return db;
+}
+
+// tallTreeDB's wide text padding forces a HEIGHT-2 tree (an interior node whose children are
+// themselves interior nodes) at page_size 256 — exercises interior-of-interior child pointers and
+// post-order page allocation across a deeper tree (spec/fileformat/format.md).
+function tallTreeDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)");
+  for (let i = 1; i <= 18; i++) {
+    const pad = `row-${String(i).padStart(2, "0")}-${"x".repeat(48)}`;
+    run(db, `INSERT INTO t VALUES (${i}, '${pad}')`);
   }
   return db;
 }
@@ -56,7 +78,7 @@ function nopkTableDB(): Database {
 // UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text value,
 // and a 4-byte astral char (😀). The PK stays int32 (no text key this slice).
 function textTableDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(db, "CREATE TABLE t (id int32 PRIMARY KEY, s text)");
   run(db, "INSERT INTO t VALUES (1, 'alice')");
   run(db, "INSERT INTO t VALUES (2, '')");
@@ -71,7 +93,7 @@ function textTableDB(): Database {
 // bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (no boolean
 // key this slice).
 function boolTableDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(db, "CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)");
   run(db, "INSERT INTO t VALUES (1, TRUE)");
   run(db, "INSERT INTO t VALUES (2, FALSE)");
@@ -84,7 +106,7 @@ function boolTableDB(): Database {
 // column `d` and a constrained numeric(10,2) column `m` (values already at scale 2, a no-op
 // coercion). Covers positive, negative, zero, a multi-group coefficient, and a NULL.
 function decimalTableDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(db, "CREATE TABLE t (id int32 PRIMARY KEY, d numeric, m numeric(10,2))");
   run(db, "INSERT INTO t VALUES (1, 1.50, 1.50), (2, -12345.6789, -12.34), " +
     "(3, 0.00, 0.00), (4, 100000000.000001, 100.00), (5, NULL, NULL)");
@@ -96,7 +118,7 @@ function decimalTableDB(): Database {
 // NULL, and a lone 0x00. The PK stays int32 (no bytea key this slice). Literals are the `\x`
 // hex input form, adapting to the bytea column (spec/design/types.md §6).
 function byteaTableDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(db, "CREATE TABLE t (id int32 PRIMARY KEY, b bytea)");
   run(db, "INSERT INTO t VALUES (1, '\\xdeadbeef')");
   run(db, "INSERT INTO t VALUES (2, '\\x')");
@@ -113,7 +135,7 @@ function byteaTableDB(): Database {
 // a present and a NULL uuid value, and the nil/max boundary UUIDs. Must match the Ruby
 // reference's UUID_TABLE (spec/fileformat/verify.rb).
 function uuidTableDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(db, "CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)");
   run(
     db,
@@ -131,7 +153,7 @@ function uuidTableDB(): Database {
 // a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to numeric(6,2),
 // and a plain no-default column. Row 1 takes every default; row 2 provides all values.
 function defaultTableDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(
     db,
     "CREATE TABLE t (id int32 PRIMARY KEY, n int32 DEFAULT 0, note text DEFAULT 'none', " +
@@ -146,7 +168,7 @@ function defaultTableDB(): Database {
 // instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a NULL. The
 // literals parse to the same micros the golden stores. The PK stays int32.
 function timestampTableDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(db, "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamp)");
   run(db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')");
   run(db, "INSERT INTO t VALUES (2, '1969-12-31 23:59:59.5')");
@@ -160,7 +182,7 @@ function timestampTableDB(): Database {
 // timestamptzTableDB exercises the same 8-byte branch under type code 9; the +05 literal
 // normalizes to UTC before storage.
 function timestamptzTableDB(): Database {
-  const db = new Database();
+  const db = goldenDb();
   run(db, "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamptz)");
   run(db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00+00')");
   run(db, "INSERT INTO t VALUES (2, '2024-01-01 12:00:00+05')");
@@ -174,7 +196,7 @@ function timestamptzTableDB(): Database {
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
-    { name: "empty_db.jed", build: () => new Database() },
+    { name: "empty_db.jed", build: () => goldenDb() },
     { name: "one_table_empty.jed", build: oneTableEmptyDB },
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
@@ -186,6 +208,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "timestamp_table.jed", build: timestampTableDB },
     { name: "timestamptz_table.jed", build: timestamptzTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
+    { name: "tall_tree.jed", build: tallTreeDB },
   ];
   for (const c of cases) {
     const image = toImage(c.build(), GOLDEN_PAGE_SIZE, 1n);
@@ -212,6 +235,7 @@ test("read goldens reproduces rows", () => {
     { name: "timestamp_table.jed", build: timestampTableDB, table: "t" },
     { name: "timestamptz_table.jed", build: timestamptzTableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
+    { name: "tall_tree.jed", build: tallTreeDB, table: "t" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },
   ];
@@ -246,7 +270,7 @@ test("read golden reconstructs catalog", () => {
 // A no-PK table's monotonic rowid counter must be reconstructed on load, so inserts
 // after a load don't collide with persisted rowids (the step-6 mutation fix).
 test("rowid counter survives load", () => {
-  const image = toImage(nopkTableDB(), 8192, 1n); // existing rows take rowids 0, 1, 2
+  const image = toImage(nopkTableDB(), GOLDEN_PAGE_SIZE, 1n); // existing rows take rowids 0, 1, 2
   const loaded = loadDatabase(image);
   // The next insert must get rowid 3, not 0 — otherwise it collides (23505).
   execute(loaded, "INSERT INTO r VALUES (10, 100)");
@@ -270,9 +294,16 @@ test("default survives load", () => {
   assert.deepStrictEqual(last[6], { kind: "null" });
 });
 
-// The default 8 KiB page size also round-trips, and re-serializing is deterministic.
+// The default 8 KiB page size also round-trips, and re-serializing is deterministic. Built at 8192
+// so the in-memory tree is sized for it (fan-out tracks the page size — format.md).
 test("round trip at default page size", () => {
-  const db = pkTableDB();
+  const db = new Database();
+  db.pageSize = 8192;
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
+  for (let i = 1; i <= 20; i++) {
+    const v = i === 3 ? "NULL" : `${i * 10}`;
+    run(db, `INSERT INTO t VALUES (${i}, ${v})`);
+  }
   const image = toImage(db, 8192, 1n);
   const loaded = loadDatabase(image);
   assert.deepStrictEqual(loaded.rowsInKeyOrder("t"), db.rowsInKeyOrder("t"));
@@ -285,13 +316,13 @@ test("crc32 known vector", () => {
 
 test("serialize is deterministic", () => {
   const db = pkTableDB();
-  assert.ok(bytesEqual(toImage(db, 8192, 1n), toImage(db, 8192, 1n)));
+  assert.ok(bytesEqual(toImage(db, GOLDEN_PAGE_SIZE, 1n), toImage(db, GOLDEN_PAGE_SIZE, 1n)));
 });
 
 test("corrupt image is rejected with XX001", () => {
-  const image = toImage(pkTableDB(), 8192, 1n);
+  const image = toImage(pkTableDB(), GOLDEN_PAGE_SIZE, 1n);
   image[0] ^= 0xff; // smash slot 0 magic
-  image[8192] ^= 0xff; // smash slot 1 magic
+  image[GOLDEN_PAGE_SIZE] ^= 0xff; // smash slot 1 magic
   assert.throws(
     () => loadDatabase(image),
     (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),

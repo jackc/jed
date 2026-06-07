@@ -139,10 +139,13 @@ export class Snapshot {
     return this.stores.get(name.toLowerCase())!;
   }
 
-  // putTable registers a new table and its empty store.
-  putTable(t: Table): void {
+  // putTable registers a new table and its empty store. The store carries the page payload cap (=
+  // page_size − 12) and the column types so the page-backed B-tree can weigh records for its
+  // size-driven split (spec/fileformat/format.md).
+  putTable(t: Table, pageSize: number): void {
     const key = t.name.toLowerCase();
-    this.stores.set(key, new TableStore());
+    const colTypes = t.columns.map((c) => c.type);
+    this.stores.set(key, new TableStore(pageSize - 12, colTypes)); // 12 = PAGE_HEADER
     this.tables.set(key, t);
   }
 
@@ -232,7 +235,7 @@ export class Database {
   // putTable registers a new table and its empty store in the working snapshot (DDL is
   // transactional — transactions.md §4.5).
   putTable(t: Table): void {
-    this.working().putTable(t);
+    this.working().putTable(t, this.pageSize);
   }
 
   // executeStmt executes one parsed statement with no bind parameters.

@@ -20,11 +20,12 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion uint16 = 1  // on-disk format version
-	pageHeader           = 12 // bytes of the catalog/data page header
+	formatVersion uint16 = 2  // on-disk format version (2 = page-backed CoW B-tree, P6.1)
+	pageHeader           = 12 // bytes of the catalog/B-tree page header
 	pageCatalog   byte   = 1  // page_type for a catalog page
-	pageData      byte   = 2  // page_type for a data page
-	rootPage      uint32 = 2  // catalog root (pages 0,1 are the meta slots)
+	pageLeaf      byte   = 2  // page_type for a B-tree leaf node
+	pageInterior  byte   = 3  // page_type for a B-tree interior node
+	rootPage      uint32 = 2  // catalog root of a fresh empty db (relocatable thereafter)
 )
 
 // typeCodeForScalar maps a scalar type to its stable on-disk code, independent of
@@ -182,16 +183,25 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	}
 	sort.Strings(keys)
 
-	// Per-table record bytes, in key order.
-	records := make([][][]byte, len(keys))
+	// Serialize each table's B-tree post-order, body pages allocated from page 2. Each entry is
+	// (index, page_type, item_count, payload); children precede their parent so parent child-pointers
+	// reference already-allocated pages (format.md).
+	var body []bodyPage
+	rootDataPage := make([]uint32, len(keys))
+	nextIndex := rootPage
 	for ti, k := range keys {
-		table := s.tables[k]
-		for _, e := range s.stores[k].EntriesInKeyOrder() {
-			records[ti] = append(records[ti], encodeRecord(table, e.Key, e.Row))
+		if root := s.stores[k].treeRoot(); root != nil {
+			rp, np, err := serializeNode(root, s.tables[k], capacity, nextIndex, &body)
+			if err != nil {
+				return nil, err
+			}
+			rootDataPage[ti] = rp
+			nextIndex = np
 		}
 	}
 
-	// Catalog grouping depends only on entry sizes (independent of root_data_page).
+	// The catalog chain follows the data; its head is the relocatable root_page.
+	catRoot := nextIndex
 	entrySizes := make([]int, len(keys))
 	for ti, k := range keys {
 		entrySizes[ti] = len(tableEntryBytes(s.tables[k], 0))
@@ -200,41 +210,23 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	numCatPages := uint32(len(catGroups))
-
-	// Assign data chains after the catalog; record each table's root page.
-	nextIndex := rootPage + numCatPages
-	rootDataPage := make([]uint32, len(keys))
-	dataGroups := make([][][]int, len(keys))
-	for ti := range keys {
-		recs := records[ti]
-		if len(recs) == 0 {
-			continue
-		}
-		sizes := make([]int, len(recs))
-		for i, r := range recs {
-			sizes[i] = len(r)
-		}
-		groups, err := pack(sizes, capacity)
-		if err != nil {
-			return nil, err
-		}
-		rootDataPage[ti] = nextIndex
-		nextIndex += uint32(len(groups))
-		dataGroups[ti] = groups
-	}
-	pageCount := nextIndex
+	pageCount := catRoot + uint32(len(catGroups))
 
 	image := make([]byte, int(pageCount)*ps)
 
-	// Meta: both slots hold the current meta (a fresh whole-image commit has no
-	// distinct prior version — format.md).
-	writeMeta(image, ps, 0, pageSize, txid, rootPage, pageCount)
-	writeMeta(image, ps, 1, pageSize, txid, rootPage, pageCount)
+	// Meta: both slots hold the current meta (a fresh from-scratch image has no distinct prior
+	// version; slot alternation is the live incremental-commit path — format.md).
+	writeMeta(image, ps, 0, pageSize, txid, catRoot, pageCount)
+	writeMeta(image, ps, 1, pageSize, txid, catRoot, pageCount)
 
-	// Catalog pages.
+	// B-tree node pages.
+	for _, bp := range body {
+		writePage(image, ps, int(bp.index), bp.pageType, bp.itemCount, 0, bp.payload)
+	}
+
+	// Catalog chain.
 	for gi, group := range catGroups {
-		index := rootPage + uint32(gi)
+		index := catRoot + uint32(gi)
 		var next uint32
 		if gi+1 < len(catGroups) {
 			next = index + 1
@@ -246,24 +238,50 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 		writePage(image, ps, int(index), pageCatalog, uint32(len(group)), next, payload)
 	}
 
-	// Data pages, one chain per non-empty table.
-	for ti := range keys {
-		groups := dataGroups[ti]
-		for gi, group := range groups {
-			index := rootDataPage[ti] + uint32(gi)
-			var next uint32
-			if gi+1 < len(groups) {
-				next = index + 1
-			}
-			var payload []byte
-			for _, ri := range group {
-				payload = append(payload, records[ti][ri]...)
-			}
-			writePage(image, ps, int(index), pageData, uint32(len(group)), next, payload)
+	return image, nil
+}
+
+// bodyPage is one serialized B-tree node awaiting write: its assigned index, type, key count, payload.
+type bodyPage struct {
+	index     uint32
+	pageType  byte
+	itemCount uint32
+	payload   []byte
+}
+
+// serializeNode serializes one node and its subtree post-order, appending each to *body, and returns
+// this node's assigned page index and the next free index. A leaf's payload is its records; an
+// interior's is its N+1 child pointers (big-endian u32) then its N records (format.md). A node whose
+// payload would exceed the page is an oversized record (over RECORD_MAX) — feature_not_supported.
+func serializeNode(n *pnode, table *Table, capacity int, nextIndex uint32, body *[]bodyPage) (uint32, uint32, error) {
+	childPages := make([]uint32, len(n.children))
+	for i, c := range n.children {
+		cp, np, err := serializeNode(c, table, capacity, nextIndex, body)
+		if err != nil {
+			return 0, 0, err
+		}
+		childPages[i] = cp
+		nextIndex = np
+	}
+	index := nextIndex
+	nextIndex++
+
+	var payload []byte
+	pageType := pageLeaf
+	if len(n.children) > 0 {
+		pageType = pageInterior
+		for _, cp := range childPages {
+			payload = appendU32(payload, cp)
 		}
 	}
-
-	return image, nil
+	for i := range n.keys {
+		payload = append(payload, encodeRecord(table, n.keys[i], n.vals[i])...)
+	}
+	if len(payload) > capacity {
+		return 0, 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
+	}
+	*body = append(*body, bodyPage{index: index, pageType: pageType, itemCount: uint32(len(n.keys)), payload: payload})
+	return index, nextIndex, nil
 }
 
 // LoadDatabase reconstructs a database from an on-disk image (inverse of ToImage).
@@ -306,9 +324,20 @@ func LoadDatabase(image []byte) (*Database, error) {
 			}
 			name := table.Name
 			hasPK := table.PrimaryKeyIndex() >= 0
-			snap.putTable(table)
-			if err := readDataChain(image, pageSize, tableRoot, colTypes, hasPK, name, snap); err != nil {
-				return nil, err
+			snap.putTable(table, uint32(pageSize))
+			if tableRoot != 0 {
+				root, length, err := readTree(image, pageSize, tableRoot, colTypes)
+				if err != nil {
+					return nil, err
+				}
+				store := snap.stores[strings.ToLower(name)]
+				store.setTree(root, length)
+				// No-PK keys are synthetic int64 rowids — advance the counter past the largest (the
+				// last entry in key order) so future inserts don't collide.
+				if !hasPK && length > 0 {
+					keys, _ := store.rows.inorder()
+					store.BumpRowidTo(DecodeInt(Int64, keys[len(keys)-1]) + 1)
+				}
 			}
 		}
 		catPage = pg.nextPage
@@ -319,37 +348,74 @@ func LoadDatabase(image []byte) (*Database, error) {
 	return db, nil
 }
 
-// readDataChain reads every record in a table's data-page chain into its store. For a
-// table with no primary key, the keys are synthetic int64 rowids; advance the store's
-// rowid counter past the largest so future inserts don't collide with a loaded key
-// (spec/fileformat/format.md). No format change — keys are stored verbatim.
-func readDataChain(image []byte, ps int, root uint32, colTypes []ScalarType, hasPK bool, name string, snap *Snapshot) error {
-	store := snap.stores[strings.ToLower(name)]
-	dp := root
-	for dp != 0 {
-		pg, err := readPage(image, ps, dp)
-		if err != nil {
-			return err
-		}
-		if pg.pageType != pageData {
-			return NewError(DataCorrupted, "expected a data page")
-		}
+// readTree reads a table's on-disk B-tree (rooted at pageIdx) into an in-memory tree, returning the
+// root node and the total row count (spec/fileformat/format.md). An interior node's payload is its
+// N+1 child pointers then its N records; we recurse the pointers, then read the separators. Weights
+// are recomputed from the value codec (the exact size the writer used), so the loaded tree is ready
+// for further size-driven splits.
+func readTree(image []byte, ps int, pageIdx uint32, colTypes []ScalarType) (*pnode, int, error) {
+	pg, err := readPage(image, ps, pageIdx)
+	if err != nil {
+		return nil, 0, err
+	}
+	switch pg.pageType {
+	case pageLeaf:
+		n := int(pg.itemCount)
+		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
 		pos := 0
-		for i := uint32(0); i < pg.itemCount; i++ {
+		for i := 0; i < n; i++ {
 			key, row, err := decodeRecord(colTypes, pg.payload, &pos)
 			if err != nil {
-				return err
+				return nil, 0, err
 			}
-			if !hasPK && len(key) == Int64.WidthBytes() {
-				store.BumpRowidTo(DecodeInt(Int64, key) + 1)
-			}
-			if !store.Insert(key, row) {
-				return NewError(DataCorrupted, "duplicate key in data page")
-			}
+			weights = append(weights, uint32(recordSize(colTypes, key, row)))
+			keys = append(keys, key)
+			vals = append(vals, row)
 		}
-		dp = pg.nextPage
+		return &pnode{keys: keys, vals: vals, weights: weights, page: pageIdx}, n, nil
+	case pageInterior:
+		n := int(pg.itemCount)
+		pos := 0
+		children := make([]*pnode, 0, n+1)
+		total := 0
+		for i := 0; i < n+1; i++ {
+			cp, err := readU32(pg.payload, &pos)
+			if err != nil {
+				return nil, 0, err
+			}
+			child, clen, err := readTree(image, ps, cp, colTypes)
+			if err != nil {
+				return nil, 0, err
+			}
+			children = append(children, child)
+			total += clen
+		}
+		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
+		for i := 0; i < n; i++ {
+			key, row, err := decodeRecord(colTypes, pg.payload, &pos)
+			if err != nil {
+				return nil, 0, err
+			}
+			weights = append(weights, uint32(recordSize(colTypes, key, row)))
+			keys = append(keys, key)
+			vals = append(vals, row)
+		}
+		total += n
+		return &pnode{keys: keys, vals: vals, weights: weights, children: children, page: pageIdx}, total, nil
+	default:
+		return nil, 0, NewError(DataCorrupted, "expected a B-tree node page")
 	}
-	return nil
+}
+
+// recordSize is the on-disk size of a record (key_len(u16) | key | each column value) — the weight
+// the page-backed B-tree splits on (format.md). It must equal len(encodeRecord ...), so in-memory
+// node boundaries match serialized page boundaries; computed from the value codec to stay in lockstep.
+func recordSize(colTypes []ScalarType, key []byte, row Row) int {
+	n := 2 + len(key)
+	for i, ty := range colTypes {
+		n += len(encodeValue(ty, row[i]))
+	}
+	return n
 }
 
 // encodeRecord builds one record: key_len(u16) | key | payload(each column value).

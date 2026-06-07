@@ -24,8 +24,8 @@
 //! with split-on-overflow, recursive delete via in-order-predecessor replacement and
 //! **merge-then-maybe-split** rebalancing (no borrow — merge subsumes it; format.md "Delete").
 
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use crate::storage::Row;
 
@@ -48,7 +48,12 @@ pub(crate) struct Node {
 
 impl Node {
     /// A fresh **dirty** node (page `0`) — every copy-on-write rebuild goes through here.
-    fn new(keys: Vec<Vec<u8>>, vals: Vec<Row>, weights: Vec<u32>, children: Vec<Arc<Node>>) -> Arc<Node> {
+    fn new(
+        keys: Vec<Vec<u8>>,
+        vals: Vec<Row>,
+        weights: Vec<u32>,
+        children: Vec<Arc<Node>>,
+    ) -> Arc<Node> {
         Arc::new(Node {
             keys,
             vals,
@@ -83,7 +88,12 @@ impl Node {
     /// `4·(N+1)` for its child pointers.
     fn payload(&self) -> usize {
         let entries: usize = self.weights.iter().map(|&w| w as usize).sum();
-        entries + if self.is_leaf() { 0 } else { 4 * self.children.len() }
+        entries
+            + if self.is_leaf() {
+                0
+            } else {
+                4 * self.children.len()
+            }
     }
 
     /// Binary-search this node's keys: `Ok(i)` if `key` sits at index `i`, else `Err(i)` for the
@@ -218,10 +228,16 @@ impl PMap {
 /// median. The split point `m = min(largest m in [1,N-1] with leftpayload(m) ≤ cap, N-2)` always
 /// yields two non-empty, fitting halves under the `RECORD_MAX = (cap-12)/2` cap (format.md "Why the
 /// record cap"). `children` empty ⇒ leaf.
-fn build(keys: Vec<Vec<u8>>, vals: Vec<Row>, weights: Vec<u32>, children: Vec<Arc<Node>>, cap: usize) -> Ins {
+fn build(
+    keys: Vec<Vec<u8>>,
+    vals: Vec<Row>,
+    weights: Vec<u32>,
+    children: Vec<Arc<Node>>,
+    cap: usize,
+) -> Ins {
     let interior = !children.is_empty();
-    let payload: usize =
-        weights.iter().map(|&w| w as usize).sum::<usize>() + if interior { 4 * children.len() } else { 0 };
+    let payload: usize = weights.iter().map(|&w| w as usize).sum::<usize>()
+        + if interior { 4 * children.len() } else { 0 };
     // Under `RECORD_MAX = (cap-12)/2` a node with ≤ 2 keys never overflows (format.md), so a node
     // that overflows here always has ≥ 3 keys and splits cleanly. The `< 3` guard is purely
     // defensive against an oversized record (one larger than `RECORD_MAX`): it leaves the node
@@ -273,7 +289,14 @@ fn build(keys: Vec<Vec<u8>>, vals: Vec<Row>, weights: Vec<u32>, children: Vec<Ar
 /// Recursive insert. On overwrite, sets `*old` and rebuilds with the value+weight replaced (which
 /// may now overflow). On a new key, inserts into the target leaf and splits overflowing nodes back
 /// up the path.
-fn node_insert(node: &Arc<Node>, key: Vec<u8>, val: Row, weight: u32, old: &mut Option<Row>, cap: usize) -> Ins {
+fn node_insert(
+    node: &Arc<Node>,
+    key: Vec<u8>,
+    val: Row,
+    weight: u32,
+    old: &mut Option<Row>,
+    cap: usize,
+) -> Ins {
     match node.search(&key) {
         Ok(i) => {
             let mut vals = node.vals.clone();
@@ -388,7 +411,12 @@ fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<R
                 }
                 let mut children = node.children.clone();
                 children[i] = new_child;
-                let rebuilt = Node::new(node.keys.clone(), node.vals.clone(), node.weights.clone(), children);
+                let rebuilt = Node::new(
+                    node.keys.clone(),
+                    node.vals.clone(),
+                    node.weights.clone(),
+                    children,
+                );
                 (rebalance_child(&rebuilt, i, cap), removed)
             }
         }
@@ -403,7 +431,11 @@ fn rebalance_child(node: &Arc<Node>, i: usize, cap: usize) -> Arc<Node> {
     if !underfull(&node.children[i], cap) {
         return node.clone();
     }
-    let j = if i + 1 < node.children.len() { i } else { i - 1 };
+    let j = if i + 1 < node.children.len() {
+        i
+    } else {
+        i - 1
+    };
     merge_at(node, j, cap)
 }
 
@@ -517,10 +549,18 @@ mod tests {
             assert_eq!(node.keys.len(), node.vals.len());
             assert_eq!(node.keys.len(), node.weights.len());
             if !node.is_leaf() {
-                assert_eq!(node.children.len(), node.keys.len() + 1, "interior child count");
+                assert_eq!(
+                    node.children.len(),
+                    node.keys.len() + 1,
+                    "interior child count"
+                );
             }
-            let payload: usize =
-                node.weights.iter().map(|&w| w as usize).sum::<usize>() + if node.is_leaf() { 0 } else { 4 * node.children.len() };
+            let payload: usize = node.weights.iter().map(|&w| w as usize).sum::<usize>()
+                + if node.is_leaf() {
+                    0
+                } else {
+                    4 * node.children.len()
+                };
             assert!(payload <= cap, "node payload {payload} exceeds cap {cap}");
             for c in &node.children {
                 walk(c, false, cap);
@@ -539,7 +579,10 @@ mod tests {
         let n = 4000;
 
         for k in shuffled(n) {
-            assert_eq!(pm.insert(key(k), row(k as i64), W, CAP), bt.insert(key(k), row(k as i64)));
+            assert_eq!(
+                pm.insert(key(k), row(k as i64), W, CAP),
+                bt.insert(key(k), row(k as i64))
+            );
         }
         assert_eq!(pm.len(), bt.len());
         check_invariants(&pm);
@@ -552,7 +595,10 @@ mod tests {
 
         // Overwrite returns the old value and does not change len.
         let before = pm.len();
-        assert_eq!(pm.insert(key(7), row(777), W, CAP), bt.insert(key(7), row(777)));
+        assert_eq!(
+            pm.insert(key(7), row(777), W, CAP),
+            bt.insert(key(7), row(777))
+        );
         assert_eq!(pm.len(), before);
         assert_eq!(pm.get(&key(7)), Some(&row(777)));
 
