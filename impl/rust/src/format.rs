@@ -17,7 +17,7 @@ use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{Database, Snapshot};
-use crate::pmap::Node;
+use crate::pmap::{Child, Node};
 use crate::storage::Row;
 use crate::types::{DecimalTypmod, ScalarType};
 use crate::value::Value;
@@ -256,7 +256,17 @@ fn serialize_node(
 ) -> Result<u32> {
     let mut child_pages = Vec::with_capacity(node.children.len());
     for child in &node.children {
-        child_pages.push(serialize_node(child, table, cap, next_index, body)?);
+        // Whole-image serialize renumbers pages from scratch and runs only on a fully-resident
+        // in-memory database (create's empty image, the golden generator) — a paged file commits
+        // incrementally via `serialize_dirty`. An `OnDisk` child would carry a page id from a
+        // different layout, so it must not appear here.
+        let cp = match child {
+            Child::Resident(n) => serialize_node(n, table, cap, next_index, body)?,
+            Child::OnDisk(p) => {
+                unreachable!("whole-image serialize hit an OnDisk leaf (page {p})")
+            }
+        };
+        child_pages.push(cp);
     }
     let index = *next_index;
     *next_index += 1;
@@ -413,7 +423,13 @@ fn serialize_dirty(
     }
     let mut child_pages = Vec::with_capacity(node.children.len());
     for child in &node.children {
-        child_pages.push(serialize_dirty(child, table, cap, ps, alloc, pages)?);
+        // A `Resident` child recurses (dirty descendants get pages); an `OnDisk` child is a clean
+        // leaf already durable at its page — keep it, write nothing (the incremental-commit win).
+        let cp = match child {
+            Child::Resident(n) => serialize_dirty(n, table, cap, ps, alloc, pages)?,
+            Child::OnDisk(p) => *p,
+        };
+        child_pages.push(cp);
     }
     let n = node.keys.len() as u32;
     let mut payload = Vec::new();
@@ -522,7 +538,14 @@ impl Database {
 fn collect_node_pages(node: &Arc<Node>, reached: &mut HashSet<u32>) {
     reached.insert(node.page.load(Ordering::Acquire));
     for child in &node.children {
-        collect_node_pages(child, reached);
+        match child {
+            // An `OnDisk` leaf contributes its page without being loaded — the free-list walk reuses
+            // the resident interior skeleton (pager.md §4); a `Resident` child recurses.
+            Child::Resident(n) => collect_node_pages(n, reached),
+            Child::OnDisk(p) => {
+                reached.insert(*p);
+            }
+        }
     }
 }
 
@@ -563,7 +586,9 @@ fn read_tree(
             for _ in 0..=n {
                 let cp = read_u32(page.payload, &mut pos)?;
                 let (child, clen) = read_tree(image, ps, cp, col_types)?;
-                children.push(child);
+                // The in-memory load is fully resident (no pager to fault from); the demand-paged
+                // file load (B2) is a separate path that leaves leaf children `OnDisk`.
+                children.push(Child::Resident(child));
                 total += clen;
             }
             let (mut keys, mut vals, mut weights) = (

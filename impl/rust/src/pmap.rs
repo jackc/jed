@@ -29,6 +29,36 @@ use std::sync::atomic::AtomicU32;
 
 use crate::storage::Row;
 
+/// A B-tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md §4) a
+/// clean leaf need not be resident: an interior node keeps `OnDisk(page_id)` for such a child and
+/// the read path faults it through the buffer pool on access. A `Resident` child is an in-memory
+/// node — a dirty/uncommitted node, a resident interior skeleton node (interior nodes are *always*
+/// resident, §1), or a leaf currently materialized. Because only **leaves** are paged, an `OnDisk`
+/// child is always a leaf — which is exactly what lets `node_count` (cost §5) be computed without
+/// loading any leaf. An in-memory database constructs no `OnDisk` child (it is fully resident).
+#[derive(Clone)]
+pub(crate) enum Child {
+    Resident(Arc<Node>),
+    // Constructed by the demand-paged file load + leaf eviction in the next P6.4b step (B2,
+    // spec/design/pager.md §4); B1 threads the enum through the structure resident-only. The
+    // `node_count`/serialize/free-list arms already handle it, so B2 only adds the fault path.
+    #[allow(dead_code)]
+    OnDisk(u32),
+}
+
+impl Child {
+    /// The resident node behind this child. Callers on the **read/mutation path** must resolve an
+    /// `OnDisk` leaf through the buffer pool first (B2); this accessor is for the fully-resident
+    /// paths — interior children (always resident) and in-memory databases. Panicking on `OnDisk`
+    /// would be a paging bug, never reachable for a fully-resident tree.
+    fn resident(&self) -> &Arc<Node> {
+        match self {
+            Child::Resident(n) => n,
+            Child::OnDisk(p) => unreachable!("OnDisk child page {p} accessed without faulting"),
+        }
+    }
+}
+
 /// One B-tree node. `children` is empty for a leaf; otherwise `children.len() == keys.len() + 1`.
 /// `keys.len() == vals.len() == weights.len()` always. `weights[i]` is entry `i`'s on-disk record
 /// size (format.md), used only for the size-driven split/merge decisions. Nodes are shared behind
@@ -37,7 +67,7 @@ pub(crate) struct Node {
     pub(crate) keys: Vec<Vec<u8>>,
     pub(crate) vals: Vec<Row>,
     pub(crate) weights: Vec<u32>,
-    pub(crate) children: Vec<Arc<Node>>,
+    pub(crate) children: Vec<Child>,
     /// On-disk page index, or `0` when dirty (never persisted / changed since). Set once by the
     /// incremental commit that first persists this node (format.rs `serialize_dirty`, P6.1 part B);
     /// page 0 is a meta slot, never a node, so it doubles as the dirty sentinel. A clean node lets an
@@ -51,7 +81,7 @@ impl Node {
         keys: Vec<Vec<u8>>,
         vals: Vec<Row>,
         weights: Vec<u32>,
-        children: Vec<Arc<Node>>,
+        children: Vec<Child>,
     ) -> Arc<Node> {
         Arc::new(Node {
             keys,
@@ -62,12 +92,14 @@ impl Node {
         })
     }
 
-    /// A node reconstructed from disk at `page` (format.rs `from_image`), already persisted.
+    /// A node reconstructed from disk at `page` (format.rs `read_tree`), already persisted. Its
+    /// children may be `Resident` (the fully-resident in-memory load) or `OnDisk` (the demand-paged
+    /// skeleton load, B2) — the constructor is agnostic.
     pub(crate) fn loaded(
         keys: Vec<Vec<u8>>,
         vals: Vec<Row>,
         weights: Vec<u32>,
-        children: Vec<Arc<Node>>,
+        children: Vec<Child>,
         page: u32,
     ) -> Arc<Node> {
         Arc::new(Node {
@@ -159,7 +191,7 @@ impl PMap {
                     if node.is_leaf() {
                         return None;
                     }
-                    node = &node.children[i];
+                    node = node.children[i].resident();
                 }
             }
         }
@@ -181,7 +213,12 @@ impl PMap {
                     val,
                     weight,
                     right,
-                } => Node::new(vec![key], vec![val], vec![weight], vec![left, right]),
+                } => Node::new(
+                    vec![key],
+                    vec![val],
+                    vec![weight],
+                    vec![Child::Resident(left), Child::Resident(right)],
+                ),
             },
         };
         self.root = Some(new_root);
@@ -203,7 +240,9 @@ impl PMap {
                 if new_root.is_leaf() {
                     None
                 } else {
-                    Some(new_root.children[0].clone())
+                    // The lone surviving child becomes the new root. It is an interior node (this
+                    // node had keys before the drain), hence always `Resident` (only leaves page).
+                    Some(new_root.children[0].resident().clone())
                 }
             } else {
                 Some(new_root)
@@ -219,7 +258,18 @@ impl PMap {
     /// byte-identical across cores (the node boundaries are a §8 byte contract — format.md).
     pub fn node_count(&self) -> usize {
         fn count(node: &Node) -> usize {
-            1 + node.children.iter().map(|c| count(c)).sum::<usize>()
+            1 + node
+                .children
+                .iter()
+                .map(|c| match c {
+                    // A resident child is counted recursively; an `OnDisk` child is a clean **leaf**
+                    // (only leaves page — pager.md §1/§4), so it contributes exactly one node and is
+                    // counted *without loading it* — the dividend of the resident interior skeleton
+                    // that keeps cost (§5) identical to P6.3.
+                    Child::Resident(n) => count(n),
+                    Child::OnDisk(_) => 1,
+                })
+                .sum::<usize>()
         }
         self.root.as_deref().map(count).unwrap_or(0)
     }
@@ -248,7 +298,7 @@ fn build(
     keys: Vec<Vec<u8>>,
     vals: Vec<Row>,
     weights: Vec<u32>,
-    children: Vec<Arc<Node>>,
+    children: Vec<Child>,
     cap: usize,
 ) -> Ins {
     let interior = !children.is_empty();
@@ -331,11 +381,11 @@ fn node_insert(
                 weights.insert(i, weight);
                 build(keys, vals, weights, Vec::new(), cap)
             } else {
-                match node_insert(&node.children[i], key, val, weight, old, cap) {
+                match node_insert(node.children[i].resident(), key, val, weight, old, cap) {
                     Ins::Whole(c) => {
                         // This node's separators are unchanged, so it cannot overflow — rebuild whole.
                         let mut children = node.children.clone();
-                        children[i] = c;
+                        children[i] = Child::Resident(c);
                         Ins::Whole(Node::new(
                             node.keys.clone(),
                             node.vals.clone(),
@@ -357,8 +407,8 @@ fn node_insert(
                         keys.insert(i, mk);
                         vals.insert(i, mv);
                         weights.insert(i, mw);
-                        children[i] = left;
-                        children.insert(i + 1, right);
+                        children[i] = Child::Resident(left);
+                        children.insert(i + 1, Child::Resident(right));
                         build(keys, vals, weights, children, cap)
                     }
                 }
@@ -377,7 +427,7 @@ fn underfull(node: &Node, cap: usize) -> bool {
 fn max_kv(node: &Arc<Node>) -> (Vec<u8>, Row, u32) {
     let mut n = node;
     while !n.is_leaf() {
-        n = n.children.last().unwrap();
+        n = n.children.last().unwrap().resident();
     }
     (
         n.keys.last().unwrap().clone(),
@@ -403,8 +453,8 @@ fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<R
                 (Node::new(keys, vals, weights, Vec::new()), Some(removed))
             } else {
                 let removed = node.vals[i].clone();
-                let (pk, pv, pw) = max_kv(&node.children[i]);
-                let (new_child, _) = node_remove(&node.children[i], &pk, cap);
+                let (pk, pv, pw) = max_kv(node.children[i].resident());
+                let (new_child, _) = node_remove(node.children[i].resident(), &pk, cap);
                 let mut keys = node.keys.clone();
                 let mut vals = node.vals.clone();
                 let mut weights = node.weights.clone();
@@ -412,7 +462,7 @@ fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<R
                 keys[i] = pk;
                 vals[i] = pv;
                 weights[i] = pw;
-                children[i] = new_child;
+                children[i] = Child::Resident(new_child);
                 let rebuilt = Node::new(keys, vals, weights, children);
                 (rebalance_child(&rebuilt, i, cap), Some(removed))
             }
@@ -421,12 +471,12 @@ fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<R
             if node.is_leaf() {
                 (node.clone(), None)
             } else {
-                let (new_child, removed) = node_remove(&node.children[i], key, cap);
+                let (new_child, removed) = node_remove(node.children[i].resident(), key, cap);
                 if removed.is_none() {
                     return (node.clone(), None);
                 }
                 let mut children = node.children.clone();
-                children[i] = new_child;
+                children[i] = Child::Resident(new_child);
                 let rebuilt = Node::new(
                     node.keys.clone(),
                     node.vals.clone(),
@@ -444,7 +494,7 @@ fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<R
 /// rebuilt parent (which may itself have lost a key and become underfull — its own parent handles
 /// that as the recursion unwinds).
 fn rebalance_child(node: &Arc<Node>, i: usize, cap: usize) -> Arc<Node> {
-    if !underfull(&node.children[i], cap) {
+    if !underfull(node.children[i].resident(), cap) {
         return node.clone();
     }
     let j = if i + 1 < node.children.len() {
@@ -460,8 +510,8 @@ fn rebalance_child(node: &Arc<Node>, i: usize, cap: usize) -> Arc<Node> {
 /// split 2-way and the two halves + the new separator replace the pair (the parent's key count is
 /// unchanged). `M < 2·cap` always (format.md), so a single split restores fit.
 fn merge_at(node: &Arc<Node>, j: usize, cap: usize) -> Arc<Node> {
-    let left = &node.children[j];
-    let right = &node.children[j + 1];
+    let left = node.children[j].resident();
+    let right = node.children[j + 1].resident();
 
     let mut mkeys = left.keys.clone();
     let mut mvals = left.vals.clone();
@@ -485,7 +535,7 @@ fn merge_at(node: &Arc<Node>, j: usize, cap: usize) -> Arc<Node> {
             keys.remove(j);
             vals.remove(j);
             weights.remove(j);
-            children[j] = merged;
+            children[j] = Child::Resident(merged);
             children.remove(j + 1);
             Node::new(keys, vals, weights, children)
         }
@@ -499,8 +549,8 @@ fn merge_at(node: &Arc<Node>, j: usize, cap: usize) -> Arc<Node> {
             keys[j] = key;
             vals[j] = val;
             weights[j] = weight;
-            children[j] = left;
-            children[j + 1] = right;
+            children[j] = Child::Resident(left);
+            children[j + 1] = Child::Resident(right);
             Node::new(keys, vals, weights, children)
         }
     }
@@ -516,10 +566,10 @@ fn collect(node: &Node, out: &mut Vec<(Vec<u8>, Row)>) {
         return;
     }
     for i in 0..node.keys.len() {
-        collect(&node.children[i], out);
+        collect(node.children[i].resident(), out);
         out.push((node.keys[i].clone(), node.vals[i].clone()));
     }
-    collect(&node.children[node.keys.len()], out);
+    collect(node.children[node.keys.len()].resident(), out);
 }
 
 #[cfg(test)]
@@ -580,7 +630,7 @@ mod tests {
                 };
             assert!(payload <= cap, "node payload {payload} exceeds cap {cap}");
             for c in &node.children {
-                walk(c, false, cap);
+                walk(c.resident(), false, cap);
             }
         }
         if let Some(root) = &pm.root {
