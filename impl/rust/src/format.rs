@@ -9,6 +9,7 @@
 //! §8). All multi-byte integers are big-endian.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::catalog::{Column, Table};
 use crate::decimal::Decimal;
@@ -282,6 +283,125 @@ fn serialize_node(
     Ok(index)
 }
 
+/// The pages an incremental commit must write durably, plus the new catalog root and high-water for
+/// the meta slot (spec/fileformat/format.md, P6.1 part B). Each `pages` entry is a full `page_size`
+/// image keyed by its page index; `file.rs` pwrites them, then publishes `root_page`/`page_count` in
+/// the alternate meta slot.
+pub(crate) struct IncrementalWrite {
+    pub(crate) pages: Vec<(u32, Vec<u8>)>,
+    pub(crate) root_page: u32,
+    pub(crate) page_count: u32,
+}
+
+impl Snapshot {
+    /// Assemble the dirty body pages + freshly-rewritten catalog for an **incremental** commit,
+    /// appending page allocation from `start_page` (the on-disk high-water) — the write path's
+    /// counterpart to the whole-image `to_image` (spec/fileformat/format.md, *Allocation & incremental
+    /// commit*). Only **dirty** nodes are emitted (clean subtrees keep their pages — the incremental
+    /// win); the catalog chain is always rewritten (it carries each table's possibly-moved root). The
+    /// dirty nodes' set-once page ids are assigned here. The page size was validated at file
+    /// creation, so no size check is repeated.
+    pub(crate) fn incremental_image(
+        &self,
+        page_size: u32,
+        start_page: u32,
+    ) -> Result<IncrementalWrite> {
+        let ps = page_size as usize;
+        let cap = ps - PAGE_HEADER;
+
+        let mut tables = self.catalog_and_stores();
+        tables.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut next = start_page;
+        let mut root_data_page = vec![0u32; tables.len()];
+        for (ti, (_, table, store)) in tables.iter().enumerate() {
+            if let Some(root) = store.tree_root() {
+                root_data_page[ti] = serialize_dirty(root, table, cap, ps, &mut next, &mut pages)?;
+            }
+        }
+
+        // The catalog chain is rewritten to fresh appended pages every commit (table roots move).
+        let cat_root = next;
+        let entry_sizes: Vec<usize> = tables
+            .iter()
+            .map(|(_, t, _)| table_entry_bytes(t, 0).len())
+            .collect();
+        let cat_groups = pack(&entry_sizes, cap)?;
+        next += cat_groups.len() as u32;
+        for (gi, group) in cat_groups.iter().enumerate() {
+            let index = cat_root + gi as u32;
+            let next_page = if gi + 1 < cat_groups.len() {
+                index + 1
+            } else {
+                0
+            };
+            let mut payload = Vec::new();
+            for &ti in group {
+                payload.extend_from_slice(&table_entry_bytes(tables[ti].1, root_data_page[ti]));
+            }
+            pages.push((
+                index,
+                make_page(ps, PAGE_CATALOG, group.len() as u32, next_page, &payload),
+            ));
+        }
+
+        Ok(IncrementalWrite {
+            pages,
+            root_page: cat_root,
+            page_count: next,
+        })
+    }
+}
+
+/// Assign a page to one **dirty** node (and its dirty descendants) post-order, appending each as a
+/// full `page_size` page to `pages`, and return this node's page index. A **clean** node (already
+/// persisted, `page != 0`) short-circuits: its whole subtree is on disk unchanged (copy-on-write
+/// only rebuilds the modified path), so nothing is written and its existing page is returned. The
+/// node's set-once page id is stored here — safe on the shared tree, since a node is otherwise
+/// immutable (`AtomicU32`, P5.3b). Mirrors `serialize_node` for the byte layout.
+fn serialize_dirty(
+    node: &Arc<Node>,
+    table: &Table,
+    cap: usize,
+    ps: usize,
+    next: &mut u32,
+    pages: &mut Vec<(u32, Vec<u8>)>,
+) -> Result<u32> {
+    let existing = node.page.load(Ordering::Acquire);
+    if existing != 0 {
+        return Ok(existing);
+    }
+    let mut child_pages = Vec::with_capacity(node.children.len());
+    for child in &node.children {
+        child_pages.push(serialize_dirty(child, table, cap, ps, next, pages)?);
+    }
+    let n = node.keys.len() as u32;
+    let mut payload = Vec::new();
+    let page_type = if node.children.is_empty() {
+        PAGE_LEAF
+    } else {
+        for &cp in &child_pages {
+            payload.extend_from_slice(&cp.to_be_bytes());
+        }
+        PAGE_INTERIOR
+    };
+    for i in 0..node.keys.len() {
+        payload.extend_from_slice(&encode_record(table, &node.keys[i], &node.vals[i]));
+    }
+    if payload.len() > cap {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "a record larger than the per-row limit is not supported",
+        ));
+    }
+    let index = *next;
+    *next += 1;
+    node.page.store(index, Ordering::Release);
+    pages.push((index, make_page(ps, page_type, n, 0, &payload)));
+    Ok(index)
+}
+
 impl Database {
     /// Serialize the whole committed state to a single on-disk image (spec/fileformat/format.md).
     /// A thin wrapper over [`Snapshot::to_image`] for the committed snapshot — `txid` is written
@@ -341,6 +461,7 @@ impl Database {
         }
         let mut db = Database::new();
         db.page_size = page_size as u32;
+        db.page_count = meta.page_count; // the on-disk high-water for the next incremental commit
         db.committed = snap;
         Ok(db)
     }
@@ -485,7 +606,35 @@ fn pack(sizes: &[usize], cap: usize) -> Result<Vec<Vec<usize>>> {
     Ok(groups)
 }
 
-/// Write a meta slot's bytes (and its CRC) into `image`.
+/// One meta slot's full `page_size` bytes (the 36-byte header + its CRC, zero-padded): its only
+/// content. `to_image` copies it into both slots; an incremental commit pwrites it to the alternate
+/// slot (`file.rs`). Single-sources the meta byte layout (spec/fileformat/format.md).
+pub(crate) fn meta_page(page_size: u32, txid: u64, root_page: u32, page_count: u32) -> Vec<u8> {
+    let mut p = vec![0u8; page_size as usize];
+    p[0..4].copy_from_slice(&MAGIC);
+    p[4..6].copy_from_slice(&FORMAT_VERSION.to_be_bytes());
+    p[8..12].copy_from_slice(&page_size.to_be_bytes());
+    p[12..20].copy_from_slice(&txid.to_be_bytes());
+    p[20..24].copy_from_slice(&root_page.to_be_bytes());
+    p[24..28].copy_from_slice(&page_count.to_be_bytes());
+    let crc = crc32_ieee(&p[0..32]);
+    p[32..36].copy_from_slice(&crc.to_be_bytes());
+    p
+}
+
+/// A catalog / B-tree page's full `page_size` bytes (header + payload, zero-padded). `to_image`
+/// copies it into the image; an incremental commit pwrites it directly (`file.rs`). Single-sources
+/// the page byte layout.
+fn make_page(ps: usize, page_type: u8, item_count: u32, next_page: u32, payload: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; ps];
+    p[0] = page_type;
+    p[4..8].copy_from_slice(&item_count.to_be_bytes());
+    p[8..12].copy_from_slice(&next_page.to_be_bytes());
+    p[PAGE_HEADER..PAGE_HEADER + payload.len()].copy_from_slice(payload);
+    p
+}
+
+/// Write a meta slot into `image` (the whole-image path; `meta_page` is the single source).
 fn write_meta(
     image: &mut [u8],
     ps: usize,
@@ -496,17 +645,10 @@ fn write_meta(
     page_count: u32,
 ) {
     let off = slot * ps;
-    image[off..off + 4].copy_from_slice(&MAGIC);
-    image[off + 4..off + 6].copy_from_slice(&FORMAT_VERSION.to_be_bytes());
-    image[off + 8..off + 12].copy_from_slice(&page_size.to_be_bytes());
-    image[off + 12..off + 20].copy_from_slice(&txid.to_be_bytes());
-    image[off + 20..off + 24].copy_from_slice(&root_page.to_be_bytes());
-    image[off + 24..off + 28].copy_from_slice(&page_count.to_be_bytes());
-    let crc = crc32_ieee(&image[off..off + 32]);
-    image[off + 32..off + 36].copy_from_slice(&crc.to_be_bytes());
+    image[off..off + ps].copy_from_slice(&meta_page(page_size, txid, root_page, page_count));
 }
 
-/// Write a catalog / data page's header and payload into `image`.
+/// Write a catalog / data page into `image` (the whole-image path; `make_page` is the single source).
 fn write_page(
     image: &mut [u8],
     ps: usize,
@@ -517,16 +659,15 @@ fn write_page(
     payload: &[u8],
 ) {
     let off = index as usize * ps;
-    image[off] = page_type;
-    image[off + 4..off + 8].copy_from_slice(&item_count.to_be_bytes());
-    image[off + 8..off + 12].copy_from_slice(&next_page.to_be_bytes());
-    image[off + PAGE_HEADER..off + PAGE_HEADER + payload.len()].copy_from_slice(payload);
+    image[off..off + ps].copy_from_slice(&make_page(ps, page_type, item_count, next_page, payload));
 }
 
 /// A validated meta slot's salient fields.
 struct Meta {
     txid: u64,
     root_page: u32,
+    /// On-disk page high-water — the next free page an incremental commit appends at (P6.1 part B).
+    page_count: u32,
 }
 
 /// Validate one meta slot; None if it is not a valid meta.
@@ -552,6 +693,7 @@ fn read_meta(image: &[u8], ps: usize, slot: usize) -> Option<Meta> {
     Some(Meta {
         txid: u64::from_be_bytes(m[12..20].try_into().unwrap()),
         root_page: u32::from_be_bytes(m[20..24].try_into().unwrap()),
+        page_count: u32::from_be_bytes(m[24..28].try_into().unwrap()),
     })
 }
 

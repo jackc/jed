@@ -284,6 +284,119 @@ func serializeNode(n *pnode, table *Table, capacity int, nextIndex uint32, body 
 	return index, nextIndex, nil
 }
 
+// dirtyPage is one full pageSize image awaiting a pwrite at its index (P6.1 part B).
+type dirtyPage struct {
+	index uint32
+	bytes []byte
+}
+
+// incrementalWrite is the pages an incremental commit must write durably, plus the new catalog root
+// and high-water for the meta slot (spec/fileformat/format.md, P6.1 part B). file.go pwrites pages,
+// then publishes rootPage/pageCount in the alternate meta slot.
+type incrementalWrite struct {
+	pages     []dirtyPage
+	rootPage  uint32
+	pageCount uint32
+}
+
+// incrementalImage assembles the dirty body pages + freshly-rewritten catalog for an incremental
+// commit, appending page allocation from startPage (the on-disk high-water) — the write path's
+// counterpart to the whole-image ToImage (spec/fileformat/format.md, *Allocation & incremental
+// commit*). Only dirty nodes are emitted (clean subtrees keep their pages — the incremental win); the
+// catalog chain is always rewritten (it carries each table's possibly-moved root). The dirty nodes'
+// set-once page ids are assigned here. The page size was validated at file creation, so no size check
+// is repeated.
+func (s *Snapshot) incrementalImage(pageSize, startPage uint32) (incrementalWrite, error) {
+	ps := int(pageSize)
+	capacity := ps - pageHeader
+
+	keys := make([]string, 0, len(s.tables))
+	for k := range s.tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var pages []dirtyPage
+	next := startPage
+	rootDataPage := make([]uint32, len(keys))
+	for ti, k := range keys {
+		if root := s.stores[k].treeRoot(); root != nil {
+			rp, np, err := serializeDirty(root, s.tables[k], capacity, ps, next, &pages)
+			if err != nil {
+				return incrementalWrite{}, err
+			}
+			rootDataPage[ti] = rp
+			next = np
+		}
+	}
+
+	// The catalog chain is rewritten to fresh appended pages every commit (table roots move).
+	catRoot := next
+	entrySizes := make([]int, len(keys))
+	for ti, k := range keys {
+		entrySizes[ti] = len(tableEntryBytes(s.tables[k], 0))
+	}
+	catGroups, err := pack(entrySizes, capacity)
+	if err != nil {
+		return incrementalWrite{}, err
+	}
+	next += uint32(len(catGroups))
+	for gi, group := range catGroups {
+		index := catRoot + uint32(gi)
+		var nextPage uint32
+		if gi+1 < len(catGroups) {
+			nextPage = index + 1
+		}
+		var payload []byte
+		for _, ti := range group {
+			payload = append(payload, tableEntryBytes(s.tables[keys[ti]], rootDataPage[ti])...)
+		}
+		pages = append(pages, dirtyPage{index: index, bytes: makePage(ps, pageCatalog, uint32(len(group)), nextPage, payload)})
+	}
+
+	return incrementalWrite{pages: pages, rootPage: catRoot, pageCount: next}, nil
+}
+
+// serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
+// each as a full pageSize page to *pages, and returns this node's page index and the next free index.
+// A clean node (already persisted, page != 0) short-circuits: its whole subtree is on disk unchanged
+// (copy-on-write only rebuilds the modified path), so nothing is written and its existing page is
+// returned. The node's set-once page id is stored here — safe, as the working tree is owned by the
+// single writer at commit. Mirrors serializeNode for the byte layout.
+func serializeDirty(n *pnode, table *Table, capacity, ps int, nextIndex uint32, pages *[]dirtyPage) (uint32, uint32, error) {
+	if n.page != 0 {
+		return n.page, nextIndex, nil
+	}
+	childPages := make([]uint32, len(n.children))
+	for i, c := range n.children {
+		cp, np, err := serializeDirty(c, table, capacity, ps, nextIndex, pages)
+		if err != nil {
+			return 0, 0, err
+		}
+		childPages[i] = cp
+		nextIndex = np
+	}
+	var payload []byte
+	pageType := pageLeaf
+	if len(n.children) > 0 {
+		pageType = pageInterior
+		for _, cp := range childPages {
+			payload = appendU32(payload, cp)
+		}
+	}
+	for i := range n.keys {
+		payload = append(payload, encodeRecord(table, n.keys[i], n.vals[i])...)
+	}
+	if len(payload) > capacity {
+		return 0, 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
+	}
+	index := nextIndex
+	nextIndex++
+	n.page = index
+	*pages = append(*pages, dirtyPage{index: index, bytes: makePage(ps, pageType, uint32(len(n.keys)), 0, payload)})
+	return index, nextIndex, nil
+}
+
 // LoadDatabase reconstructs a database from an on-disk image (inverse of ToImage).
 // Returns a structured data_corrupted (XX001) error for malformed input.
 func LoadDatabase(image []byte) (*Database, error) {
@@ -344,6 +457,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 	}
 	db := NewDatabase()
 	db.pageSize = uint32(pageSize)
+	db.pageCount = mt.pageCount // the on-disk high-water for the next incremental commit
 	db.committed = snap
 	return db, nil
 }
@@ -496,32 +610,52 @@ func pack(sizes []int, capacity int) ([][]int, error) {
 	return groups, nil
 }
 
-// writeMeta writes a meta slot's bytes (and its CRC) into image.
-func writeMeta(image []byte, ps, slot int, pageSize uint32, txid uint64, root, pageCount uint32) {
-	off := slot * ps
-	copy(image[off:off+4], magic[:])
-	binary.BigEndian.PutUint16(image[off+4:], formatVersion)
-	binary.BigEndian.PutUint32(image[off+8:], pageSize)
-	binary.BigEndian.PutUint64(image[off+12:], txid)
-	binary.BigEndian.PutUint32(image[off+20:], root)
-	binary.BigEndian.PutUint32(image[off+24:], pageCount)
-	crc := crc32IEEE(image[off : off+32])
-	binary.BigEndian.PutUint32(image[off+32:], crc)
+// metaPage is one meta slot's full pageSize bytes (the 36-byte header + its CRC, zero-padded): its
+// only content. ToImage copies it into both slots; an incremental commit pwrites it to the alternate
+// slot (file.go). Single-sources the meta byte layout (spec/fileformat/format.md).
+func metaPage(pageSize uint32, txid uint64, root, pageCount uint32) []byte {
+	p := make([]byte, pageSize)
+	copy(p[0:4], magic[:])
+	binary.BigEndian.PutUint16(p[4:], formatVersion)
+	binary.BigEndian.PutUint32(p[8:], pageSize)
+	binary.BigEndian.PutUint64(p[12:], txid)
+	binary.BigEndian.PutUint32(p[20:], root)
+	binary.BigEndian.PutUint32(p[24:], pageCount)
+	binary.BigEndian.PutUint32(p[32:], crc32IEEE(p[0:32]))
+	return p
 }
 
-// writePage writes a catalog/data page's header and payload into image.
+// makePage is a catalog/B-tree page's full pageSize bytes (header + payload, zero-padded). ToImage
+// copies it into the image; an incremental commit pwrites it directly (file.go). Single-sources the
+// page byte layout.
+func makePage(ps int, pageType byte, itemCount, nextPage uint32, payload []byte) []byte {
+	p := make([]byte, ps)
+	p[0] = pageType
+	binary.BigEndian.PutUint32(p[4:], itemCount)
+	binary.BigEndian.PutUint32(p[8:], nextPage)
+	copy(p[pageHeader:], payload)
+	return p
+}
+
+// writeMeta writes a meta slot into image (the whole-image path; metaPage is the single source).
+func writeMeta(image []byte, ps, slot int, pageSize uint32, txid uint64, root, pageCount uint32) {
+	off := slot * ps
+	copy(image[off:off+ps], metaPage(pageSize, txid, root, pageCount))
+}
+
+// writePage writes a catalog/data page into image (the whole-image path; makePage is the single source).
 func writePage(image []byte, ps, index int, pageType byte, itemCount, nextPage uint32, payload []byte) {
 	off := index * ps
-	image[off] = pageType
-	binary.BigEndian.PutUint32(image[off+4:], itemCount)
-	binary.BigEndian.PutUint32(image[off+8:], nextPage)
-	copy(image[off+pageHeader:], payload)
+	copy(image[off:off+ps], makePage(ps, pageType, itemCount, nextPage, payload))
 }
 
 // meta holds a validated meta slot's salient fields.
 type meta struct {
 	txid     uint64
 	rootPage uint32
+	// pageCount is the on-disk page high-water — the next free page an incremental commit appends at
+	// (P6.1 part B).
+	pageCount uint32
 }
 
 // readMeta validates one meta slot; ok=false if it is not a valid meta.
@@ -544,8 +678,9 @@ func readMeta(image []byte, ps, slot int) (meta, bool) {
 		return meta{}, false
 	}
 	return meta{
-		txid:     binary.BigEndian.Uint64(m[12:20]),
-		rootPage: binary.BigEndian.Uint32(m[20:24]),
+		txid:      binary.BigEndian.Uint64(m[12:20]),
+		rootPage:  binary.BigEndian.Uint32(m[20:24]),
+		pageCount: binary.BigEndian.Uint32(m[24:28]),
 	}, true
 }
 

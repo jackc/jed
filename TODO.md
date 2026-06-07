@@ -706,11 +706,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > **frozen** transaction API. The on-disk B-tree node layout/split rules become a **new §8 byte
 > contract** (golden fixtures required) — they are a private in-RAM detail in Phase 5.
 
-- [ ] **P6.1 — incremental COW commit = page-backed B-tree** _(merges ex "incremental COW
-      commit" + "B-tree interior pages")_ — replace the whole-image serialize with
-      dirty-page-only writes + meta-page root swap, the in-memory CoW B-tree persisted
-      node-for-page (§9, storage.md §4/§6, transactions.md §3/§9). New: the on-disk B-tree node
-      byte format + fixtures (a §8 hotspot). _(size: XL; deps: P5.1)_
+- [x] **P6.1 — incremental COW commit = page-backed B-tree** ✅ _(merges ex "incremental COW
+      commit" + "B-tree interior pages")_ — replaced the whole-image serialize with
+      dirty-page-only writes + meta-slot root swap, the in-memory CoW B-tree persisted
+      node-for-page (§9, storage.md §4/§6, transactions.md §3/§9). Landed across all three cores +
+      the Ruby reference in two parts. **Part A — the on-disk byte contract** (a §8 hotspot, a
+      **clean break to format_version 2**): per-table page-backed B-tree (leaf + interior node
+      pages, `page_type` 2/3), relocatable catalog chain, **size-driven fan-out** (`RECORD_MAX =
+      (page_size−12−12)/2` so every overflow splits cleanly 2-way), full delete-rebalance
+      (merge-then-maybe-split). All 15 golden fixtures regenerated and byte-exact across
+      `rust == go == ts == ruby`; the from-scratch `to_image` is what the goldens pin. **Part B —
+      the incremental commit**: a block seam (pwrite per page) appends only the **dirty** nodes a
+      mutation introduced (clean subtrees keep their page id and are never rewritten) + the
+      always-rewritten catalog, then publishes the new root by writing the **alternate meta slot**
+      (`txid & 1`) — two fsyncs (body-before-meta) make a crash leave either the new snapshot or the
+      immediately-prior one. Pages an old root drops **leak** (`page_count` only grows; reclamation
+      is P6.2). Verified per-core (not goldens — the bytes depend on commit history): incremental
+      growth bounded by tree height, slot alternation, torn-meta fallback to the prior durable
+      snapshot, delete-heavy reopen. _(size: XL; deps: P5.1)_
 - [ ] **P6.2 — free-list / page reclamation** — reuse pages the new root no longer references
       (not version GC; still not MVCC). **Gated on the oldest-live-snapshot txid watermark**
       built in Phase 5 (transactions.md §8): a page freed at txid `T` is reusable only once

@@ -338,16 +338,15 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   const pageCount = catRoot + catGroups.length;
 
   const image = new Uint8Array(pageCount * ps);
-  const dv = new DataView(image.buffer);
 
   // Meta: both slots hold the current meta (a fresh from-scratch image has no distinct prior
   // version; slot alternation is the live incremental-commit path — format.md).
-  writeMeta(image, dv, ps, 0, pageSize, txid, catRoot, pageCount);
-  writeMeta(image, dv, ps, 1, pageSize, txid, catRoot, pageCount);
+  writeMeta(image, ps, 0, pageSize, txid, catRoot, pageCount);
+  writeMeta(image, ps, 1, pageSize, txid, catRoot, pageCount);
 
   // B-tree node pages.
   for (const bp of body) {
-    writePage(image, dv, ps, bp.index, bp.pageType, bp.itemCount, 0, bp.payload);
+    writePage(image, ps, bp.index, bp.pageType, bp.itemCount, 0, bp.payload);
   }
 
   // Catalog chain.
@@ -356,7 +355,7 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
     const index = catRoot + gi;
     const next = gi + 1 < catGroups.length ? index + 1 : 0;
     const parts = group.map((ti) => tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!));
-    writePage(image, dv, ps, index, PAGE_CATALOG, group.length, next, concat(parts));
+    writePage(image, ps, index, PAGE_CATALOG, group.length, next, concat(parts));
   }
 
   return image;
@@ -399,6 +398,98 @@ function serializeNode(
     throw engineError("feature_not_supported", "a record larger than the per-row limit is not supported");
   }
   body.push({ index, pageType, itemCount: n.keys.length, payload });
+  return { index, next: nextIndex };
+}
+
+// IncrementalWrite is the pages an incremental commit must write durably, plus the new catalog root
+// and high-water for the meta slot (spec/fileformat/format.md, P6.1 part B). file.ts pwrites pages,
+// then publishes rootPage/pageCount in the alternate meta slot.
+export type IncrementalWrite = {
+  pages: { index: number; bytes: Uint8Array }[];
+  rootPage: number;
+  pageCount: number;
+};
+
+// incrementalImage assembles the dirty body pages + freshly-rewritten catalog for an incremental
+// commit, appending page allocation from startPage (the on-disk high-water) — the write path's
+// counterpart to the whole-image toImage (spec/fileformat/format.md, *Allocation & incremental
+// commit*). Only dirty nodes are emitted (clean subtrees keep their pages — the incremental win); the
+// catalog chain is always rewritten (it carries each table's possibly-moved root). The dirty nodes'
+// set-once page ids are assigned here. The page size was validated at file creation, so no size check
+// is repeated.
+export function incrementalImage(snap: Snapshot, pageSize: number, startPage: number): IncrementalWrite {
+  const ps = pageSize;
+  const capacity = ps - PAGE_HEADER;
+
+  const keys = [...snap.tables.keys()].sort();
+
+  const pages: { index: number; bytes: Uint8Array }[] = [];
+  let next = startPage;
+  const rootDataPage: number[] = new Array(keys.length).fill(0);
+  for (let ti = 0; ti < keys.length; ti++) {
+    const root = snap.stores.get(keys[ti]!)!.treeRoot();
+    if (root !== null) {
+      const r = serializeDirty(root, snap.tables.get(keys[ti]!)!, capacity, ps, next, pages);
+      rootDataPage[ti] = r.index;
+      next = r.next;
+    }
+  }
+
+  // The catalog chain is rewritten to fresh appended pages every commit (table roots move).
+  const catRoot = next;
+  const entrySizes = keys.map((k) => tableEntryBytes(snap.tables.get(k)!, 0).length);
+  const catGroups = pack(entrySizes, capacity);
+  next += catGroups.length;
+  for (let gi = 0; gi < catGroups.length; gi++) {
+    const group = catGroups[gi]!;
+    const index = catRoot + gi;
+    const nextPage = gi + 1 < catGroups.length ? index + 1 : 0;
+    const parts = group.map((ti) => tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!));
+    pages.push({ index, bytes: makePage(ps, PAGE_CATALOG, group.length, nextPage, concat(parts)) });
+  }
+
+  return { pages, rootPage: catRoot, pageCount: next };
+}
+
+// serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
+// each as a full pageSize page to `pages`, and returns this node's page index and the next free index.
+// A clean node (already persisted, page !== 0) short-circuits: its whole subtree is on disk unchanged
+// (copy-on-write only rebuilds the modified path), so nothing is written and its existing page is
+// returned. The node's set-once page id is stored here. Mirrors serializeNode for the byte layout.
+function serializeDirty(
+  n: PNode,
+  table: Table,
+  capacity: number,
+  ps: number,
+  nextIndex: number,
+  pages: { index: number; bytes: Uint8Array }[],
+): { index: number; next: number } {
+  if (n.page !== 0) {
+    return { index: n.page, next: nextIndex };
+  }
+  const childPages: number[] = [];
+  for (const c of n.children) {
+    const r = serializeDirty(c, table, capacity, ps, nextIndex, pages);
+    childPages.push(r.index);
+    nextIndex = r.next;
+  }
+  const w = new ByteWriter();
+  let pageType = PAGE_LEAF;
+  if (n.children.length > 0) {
+    pageType = PAGE_INTERIOR;
+    for (const cp of childPages) w.u32(cp);
+  }
+  for (let i = 0; i < n.keys.length; i++) {
+    w.bytes(encodeRecord(table, n.keys[i]!, n.vals[i]!));
+  }
+  const payload = w.toBytes();
+  if (payload.length > capacity) {
+    throw engineError("feature_not_supported", "a record larger than the per-row limit is not supported");
+  }
+  const index = nextIndex;
+  nextIndex++;
+  n.page = index;
+  pages.push({ index, bytes: makePage(ps, pageType, n.keys.length, 0, payload) });
   return { index, next: nextIndex };
 }
 
@@ -446,6 +537,7 @@ export function loadDatabase(image: Uint8Array): Database {
   }
   const db = new Database();
   db.pageSize = pageSize;
+  db.pageCount = mt.pageCount; // the on-disk high-water for the next incremental commit
   db.committed = snap;
   return db;
 }
@@ -503,11 +595,48 @@ function readTree(
   throw engineError("data_corrupted", "expected a B-tree node page");
 }
 
-// writeMeta writes a meta slot's bytes (and its CRC) into image. Reserved bytes are left
-// zero (the image is zero-initialized) and are covered by the CRC over [off, off+32).
+// metaPage is one meta slot's full pageSize bytes (the 36-byte header + its CRC, zero-padded): its
+// only content. toImage copies it into both slots; an incremental commit pwrites it to the alternate
+// slot (file.ts). Single-sources the meta byte layout (spec/fileformat/format.md). Reserved bytes are
+// left zero and are covered by the CRC over [0, 32).
+export function metaPage(pageSize: number, txid: bigint, root: number, pageCount: number): Uint8Array {
+  const p = new Uint8Array(pageSize);
+  const dv = new DataView(p.buffer);
+  p[0] = 0x4a; // 'J'
+  p[1] = 0x45; // 'E'
+  p[2] = 0x44; // 'D'
+  p[3] = 0x42; // 'B'
+  dv.setUint16(4, FORMAT_VERSION, false);
+  dv.setUint32(8, pageSize, false);
+  dv.setBigUint64(12, txid, false);
+  dv.setUint32(20, root, false);
+  dv.setUint32(24, pageCount, false);
+  dv.setUint32(32, crc32Ieee(p.subarray(0, 32)), false);
+  return p;
+}
+
+// makePage is a catalog/B-tree page's full pageSize bytes (header + payload, zero-padded). toImage
+// copies it into the image; an incremental commit pwrites it directly (file.ts). Single-sources the
+// page byte layout.
+function makePage(
+  ps: number,
+  pageType: number,
+  itemCount: number,
+  nextPage: number,
+  payload: Uint8Array,
+): Uint8Array {
+  const p = new Uint8Array(ps);
+  const dv = new DataView(p.buffer);
+  p[0] = pageType;
+  dv.setUint32(4, itemCount, false);
+  dv.setUint32(8, nextPage, false);
+  p.set(payload, PAGE_HEADER);
+  return p;
+}
+
+// writeMeta writes a meta slot into image (the whole-image path; metaPage is the single source).
 function writeMeta(
   image: Uint8Array,
-  dv: DataView,
   ps: number,
   slot: number,
   pageSize: number,
@@ -515,24 +644,12 @@ function writeMeta(
   root: number,
   pageCount: number,
 ): void {
-  const off = slot * ps;
-  image[off] = 0x4a; // 'J'
-  image[off + 1] = 0x45; // 'E'
-  image[off + 2] = 0x44; // 'D'
-  image[off + 3] = 0x42; // 'B'
-  dv.setUint16(off + 4, FORMAT_VERSION, false);
-  dv.setUint32(off + 8, pageSize, false);
-  dv.setBigUint64(off + 12, txid, false);
-  dv.setUint32(off + 20, root, false);
-  dv.setUint32(off + 24, pageCount, false);
-  const crc = crc32Ieee(image.subarray(off, off + 32));
-  dv.setUint32(off + 32, crc, false);
+  image.set(metaPage(pageSize, txid, root, pageCount), slot * ps);
 }
 
-// writePage writes a catalog/data page's header and payload into image.
+// writePage writes a catalog/data page into image (the whole-image path; makePage is the single source).
 function writePage(
   image: Uint8Array,
-  dv: DataView,
   ps: number,
   index: number,
   pageType: number,
@@ -540,15 +657,12 @@ function writePage(
   nextPage: number,
   payload: Uint8Array,
 ): void {
-  const off = index * ps;
-  image[off] = pageType;
-  dv.setUint32(off + 4, itemCount, false);
-  dv.setUint32(off + 8, nextPage, false);
-  image.set(payload, off + PAGE_HEADER);
+  image.set(makePage(ps, pageType, itemCount, nextPage, payload), index * ps);
 }
 
-// meta holds a validated meta slot's salient fields.
-type Meta = { txid: bigint; rootPage: number };
+// meta holds a validated meta slot's salient fields. pageCount is the on-disk page high-water — the
+// next free page an incremental commit appends at (P6.1 part B).
+type Meta = { txid: bigint; rootPage: number; pageCount: number };
 
 // readMeta validates one meta slot; null if it is not a valid meta.
 function readMeta(image: Uint8Array, dv: DataView, ps: number, slot: number): Meta | null {
@@ -569,7 +683,11 @@ function readMeta(image: Uint8Array, dv: DataView, ps: number, slot: number): Me
     return null;
   }
   if (crc32Ieee(image.subarray(off, off + 32)) !== dv.getUint32(off + 32, false)) return null;
-  return { txid: dv.getBigUint64(off + 12, false), rootPage: dv.getUint32(off + 20, false) };
+  return {
+    txid: dv.getBigUint64(off + 12, false),
+    rootPage: dv.getUint32(off + 20, false),
+    pageCount: dv.getUint32(off + 24, false),
+  };
 }
 
 // selectMeta picks the valid slot with the highest txid (tie → slot 0); the lone valid

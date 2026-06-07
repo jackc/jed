@@ -157,7 +157,7 @@ fn query_on_non_query_statement_errors() {
 
 #[test]
 fn errors_surface_with_sqlstate() {
-    let mut db = Database::new();
+    let db = Database::new();
     assert_eq!(db.prepare("SELCT 1").err().unwrap().code(), "42601");
 }
 
@@ -171,14 +171,27 @@ fn commit_on_in_memory_is_noop_success() {
 }
 
 #[test]
-fn committed_file_matches_to_image() {
-    let path = tmp("byte_exact.jed");
+fn incremental_commit_round_trips_to_canonical_image() {
+    // A commit is now an *incremental* dirty-page write (P6.1 part B), so the on-disk file is no
+    // longer byte-identical to a from-scratch `to_image` (it carries leaked pages and only the
+    // alternate meta slot is bumped). The contract instead: reopening the incrementally-written
+    // file yields the identical *logical* tree — its canonical re-serialization matches the live
+    // db's, byte-for-byte (spec/fileformat/format.md, *Allocation & incremental commit*).
+    let path = tmp("incremental_canonical.jed");
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
     execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (5, 50)").unwrap();
     db.commit().unwrap();
-    let on_disk = std::fs::read(&path).unwrap();
-    let expected = db.to_image(db.page_size(), db.txid()).unwrap();
-    assert_eq!(on_disk, expected);
+    let canonical = db.to_image(db.page_size(), db.txid()).unwrap();
+    db.close().unwrap();
+
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .to_image(reopened.page_size(), reopened.txid())
+            .unwrap(),
+        canonical,
+        "the incremental file must decode to the identical canonical image"
+    );
 }

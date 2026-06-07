@@ -1,10 +1,11 @@
 package jed
 
-// Host file layer for the Go core (spec/design/api.md §2): open/create/commit/close a
-// single-file database durably (whole-image model). Pure os — no cgo, no FFI (CLAUDE.md §2),
-// fully memory-safe. The crash-safe commit is temp-file + fsync + atomic rename + directory
-// fsync (api.md §3); since a commit rewrites the whole file, rename gives all-or-nothing
-// replacement for free.
+// Host file layer for the Go core (spec/design/api.md §2): open/create/commit/close a single-file
+// database durably. Pure os — no cgo, no FFI (CLAUDE.md §2), fully memory-safe. Create lays down the
+// from-scratch image (temp-file + fsync + atomic rename + directory fsync, api.md §3); every later
+// commit is an incremental copy-on-write write of just the dirty pages, published by alternating the
+// meta slot (spec/fileformat/format.md, P6.1 part B) — the block seam below pwrites pages (WriteAt)
+// into the open file rather than rewriting it.
 
 import (
 	"errors"
@@ -37,8 +38,8 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 	db := NewDatabase()
 	db.path = path
 	db.pageSize = opts.PageSize
-	db.committed.txid = 1                            // the initial empty image is committed as txid 1
-	if err := db.persist(db.committed); err != nil { // materialize it durably
+	db.committed.txid = 1                       // the initial empty image is committed as txid 1
+	if err := db.writeFullImage(); err != nil { // lay down the from-scratch image; later commits are incremental
 		return nil, err
 	}
 	return db, nil
@@ -63,21 +64,63 @@ func Open(path string) (*Database, error) {
 	return db, nil
 }
 
-// persist durably writes snap's whole image to the backing file — the single synchronous-commit
-// chokepoint (spec/design/transactions.md §9). Called by Create (the initial committed image) and
-// by commitTx for the working snapshot being published, at the snapshot's own txid. An in-memory
-// database (no path) is a no-op success; it does not mutate db (the txid lives in the snapshot, and
-// the committed swap happens in commitTx only after this returns nil). The future synchronous=off
-// mode (batched/deferred fsync) gates here.
+// writeFullImage lays down the whole from-scratch image of the committed snapshot (the all-dirty
+// special case — spec/fileformat/format.md) durably via temp-file + rename, and records the on-disk
+// page high-water. Used by Create to establish a fresh file with both meta slots seeded; every later
+// commit is incremental (persist).
+func (db *Database) writeFullImage() error {
+	bytes, err := db.committed.ToImage(db.pageSize, db.committed.txid)
+	if err != nil {
+		return err
+	}
+	if err := writeAtomic(db.path, bytes); err != nil {
+		return err
+	}
+	db.pageCount = uint32(len(bytes) / int(db.pageSize))
+	return nil
+}
+
+// persist durably publishes snap to the backing file via an incremental copy-on-write commit
+// (spec/fileformat/format.md *Allocation & incremental commit*; transactions.md §9) — the
+// synchronous-commit chokepoint. Append the dirty pages this transaction introduced, Sync, write the
+// alternate meta slot (snap.txid & 1), Sync. Clean pages are never rewritten; pages an old root drops
+// are leaked (P6.2 reclaims). A crash between the two syncs leaves the prior meta — and thus the prior
+// snapshot — intact (the body pages were only appended). An in-memory database (no path) is a no-op
+// success: it does not mutate db, and the committed swap happens in commitTx only after this returns
+// nil. db.pageCount advances only after both syncs succeed, so a write failure leaves db, committed,
+// and the file's prior meta untouched (the working snapshot is then discarded). The future
+// synchronous=off mode gates here.
 func (db *Database) persist(snap *Snapshot) error {
 	if db.path == "" {
 		return nil
 	}
-	bytes, err := snap.ToImage(db.pageSize, snap.txid)
+	write, err := snap.incrementalImage(db.pageSize, db.pageCount)
 	if err != nil {
 		return err
 	}
-	return writeAtomic(db.path, bytes)
+	f, err := os.OpenFile(db.path, os.O_RDWR, 0)
+	if err != nil {
+		return ioError(err)
+	}
+	defer func() { _ = f.Close() }()
+	ps := int64(db.pageSize)
+	for _, pg := range write.pages {
+		if _, err := f.WriteAt(pg.bytes, int64(pg.index)*ps); err != nil {
+			return ioError(err)
+		}
+	}
+	if err := f.Sync(); err != nil { // body pages durable before the meta can reference them
+		return ioError(err)
+	}
+	meta := metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount)
+	if _, err := f.WriteAt(meta, int64(snap.txid&1)*ps); err != nil {
+		return ioError(err)
+	}
+	if err := f.Sync(); err != nil { // the commit is published
+		return ioError(err)
+	}
+	db.pageCount = write.pageCount
+	return nil
 }
 
 // Commit commits the current transaction (spec/design/api.md §2.2, transactions.md §4.2).

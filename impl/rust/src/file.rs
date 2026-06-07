@@ -1,11 +1,12 @@
 //! Host file layer for the Rust core (spec/design/api.md §2): open/create/commit/close a
-//! single-file database durably (whole-image model). Pure `std::fs` — no dependencies, fully
-//! memory-safe (CLAUDE.md §13). The crash-safe commit is temp-file + fsync + atomic rename +
-//! directory fsync (api.md §3); since a commit rewrites the whole file, rename gives
-//! all-or-nothing replacement for free.
+//! single-file database durably. Pure `std::fs` — no dependencies, fully memory-safe (CLAUDE.md
+//! §13). `create` lays down the from-scratch image (temp-file + fsync + atomic rename + directory
+//! fsync, api.md §3); every later commit is an **incremental** copy-on-write write of just the dirty
+//! pages, published by alternating the meta slot (spec/fileformat/format.md, P6.1 part B) — the
+//! block seam below pwrites pages into the open file rather than rewriting it.
 
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{EngineError, Result, SqlState};
@@ -42,7 +43,7 @@ impl Database {
         db.path = Some(path.to_path_buf());
         db.page_size = opts.page_size;
         db.committed.txid = 1; // the initial empty image is committed as txid 1
-        db.persist(&db.committed)?; // materialize it durably
+        db.write_full_image()?; // lay down the from-scratch image; later commits are incremental
         Ok(db)
     }
 
@@ -66,19 +67,55 @@ impl Database {
         Ok(db)
     }
 
-    /// Durably write `snap`'s whole image to the backing file — the single synchronous-commit
-    /// chokepoint (spec/design/transactions.md §9). Called by `create` (the initial committed
-    /// image) and by `commit_tx` for the working snapshot being published, at the snapshot's own
-    /// `txid`. An in-memory database (no path) is a **no-op success**; it does not mutate `self`
-    /// (the txid lives in the snapshot, and the committed swap happens in `commit_tx` only after
-    /// this returns Ok). The future `synchronous=off` mode (batched/deferred fsync) gates here.
-    pub(crate) fn persist(&self, snap: &Snapshot) -> Result<()> {
+    /// Lay down the whole from-scratch image of the committed snapshot (the all-dirty special case —
+    /// spec/fileformat/format.md) durably via temp-file + rename, and record the on-disk page
+    /// high-water. Used by `create` to establish a fresh file with both meta slots seeded; every later
+    /// commit is incremental (`persist`).
+    fn write_full_image(&mut self) -> Result<()> {
+        let path = self.path.clone().expect("write_full_image requires a path");
+        let bytes = self
+            .committed
+            .to_image(self.page_size, self.committed.txid)?;
+        write_atomic(&path, &bytes)?;
+        self.page_count = (bytes.len() / self.page_size as usize) as u32;
+        Ok(())
+    }
+
+    /// Durably publish `snap` to the backing file via an **incremental** copy-on-write commit
+    /// (spec/fileformat/format.md *Allocation & incremental commit*; transactions.md §9) — the
+    /// synchronous-commit chokepoint. Append the dirty pages this transaction introduced, `sync`,
+    /// write the **alternate** meta slot (`snap.txid & 1`), `sync`. Clean pages are never rewritten;
+    /// pages an old root drops are leaked (P6.2 reclaims). A crash between the two syncs leaves the
+    /// prior meta — and thus the prior snapshot — intact (the body pages were only appended). An
+    /// in-memory database (no path) is a **no-op success**: it does not mutate `self`, and the
+    /// committed swap happens in `commit_tx` only after this returns Ok. `page_count` advances only
+    /// after both syncs succeed, so a write failure leaves `self`, `committed`, and the file's prior
+    /// meta untouched (the working snapshot is then discarded). The `synchronous=off` mode gates here.
+    pub(crate) fn persist(&mut self, snap: &Snapshot) -> Result<()> {
         let path = match &self.path {
             None => return Ok(()),
             Some(p) => p.clone(),
         };
-        let bytes = snap.to_image(self.page_size, snap.txid)?;
-        write_atomic(&path, &bytes)?;
+        let write = snap.incremental_image(self.page_size, self.page_count)?;
+        let ps = self.page_size as u64;
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(io_error)?;
+        for (index, bytes) in &write.pages {
+            f.seek(SeekFrom::Start(*index as u64 * ps))
+                .map_err(io_error)?;
+            f.write_all(bytes).map_err(io_error)?;
+        }
+        f.sync_all().map_err(io_error)?; // body pages durable before the meta can reference them
+        let meta =
+            crate::format::meta_page(self.page_size, snap.txid, write.root_page, write.page_count);
+        f.seek(SeekFrom::Start((snap.txid & 1) * ps))
+            .map_err(io_error)?;
+        f.write_all(&meta).map_err(io_error)?;
+        f.sync_all().map_err(io_error)?; // the commit is published
+        self.page_count = write.page_count;
         Ok(())
     }
 

@@ -1,8 +1,9 @@
 // Host file layer for the TS core (spec/design/api.md §2): open/create/commit/close a single-file
-// database durably (whole-image model) on the Node `fs` host. Isolated here so the future
-// browser/OPFS host is a sibling, not a reshape (storage.md §2). The crash-safe commit is
-// temp-file + fsync + atomic rename + directory fsync (api.md §3); since a commit rewrites the
-// whole file, rename gives all-or-nothing replacement for free.
+// database durably on the Node `fs` host. Isolated here so the future browser/OPFS host is a sibling,
+// not a reshape (storage.md §2). create lays down the from-scratch image (temp-file + fsync + atomic
+// rename + directory fsync, api.md §3); every later commit is an incremental copy-on-write write of
+// just the dirty pages, published by alternating the meta slot (spec/fileformat/format.md, P6.1 part
+// B) — the block seam below pwrites pages (writeSync at a position) into the open file.
 
 import {
   closeSync,
@@ -13,12 +14,13 @@ import {
   renameSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
 
 import { DEFAULT_PAGE_SIZE, Database, Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
-import { loadDatabase, toImage } from "./format.ts";
+import { incrementalImage, loadDatabase, metaPage, toImage } from "./format.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
@@ -35,9 +37,20 @@ export function create(path: string, opts: DatabaseOptions = {}): Database {
   db.path = path;
   db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
-  db.persistHook = persistImpl; // publish each later commit durably (transactions.md §4.1/§9)
-  persistImpl(db, db.committed); // materialize it durably
+  db.persistHook = persistImpl; // publish each later commit incrementally (transactions.md §4.1/§9)
+  writeFullImage(db); // lay down the from-scratch image; later commits are incremental
   return db;
+}
+
+// writeFullImage lays down the whole from-scratch image of the committed snapshot (the all-dirty
+// special case — spec/fileformat/format.md) durably via temp-file + rename, and records the on-disk
+// page high-water. Used by create to establish a fresh file with both meta slots seeded; every later
+// commit is incremental (persistImpl).
+function writeFullImage(db: Database): void {
+  if (db.path === null) return;
+  const bytes = toImage(db.committed, db.pageSize, db.committed.txid);
+  writeAtomic(db.path, bytes);
+  db.pageCount = Math.floor(bytes.length / db.pageSize);
 }
 
 // open opens an existing file-backed database at path (loading its committed state and adopting
@@ -60,15 +73,33 @@ export function open(path: string): Database {
   return db;
 }
 
-// persistImpl durably writes snap's whole image to the backing file — the single
-// synchronous-commit chokepoint (spec/design/transactions.md §9), installed as the
-// Database.persistHook by create/open. commitTx calls it with the working snapshot being published
-// (at the snapshot's own txid); create calls it for the initial committed image. It does not mutate
-// db (the txid lives in the snapshot, and the committed swap happens in commitTx only after this
-// returns). An in-memory database has no persistHook. The future synchronous=off mode gates here.
+// persistImpl durably publishes snap to the backing file via an incremental copy-on-write commit
+// (spec/fileformat/format.md *Allocation & incremental commit*; transactions.md §9), installed as the
+// Database.persistHook by create/open and called by commitTx with the working snapshot being
+// published. Append the dirty pages this transaction introduced, fsync, write the alternate meta slot
+// (snap.txid & 1), fsync. Clean pages are never rewritten; pages an old root drops are leaked (P6.2
+// reclaims). A crash between the two fsyncs leaves the prior meta — and thus the prior snapshot —
+// intact (the body pages were only appended). An in-memory database has no persistHook. db.pageCount
+// advances only after both fsyncs succeed, so a write failure leaves db, committed, and the file's
+// prior meta untouched (the working snapshot is then discarded). The future synchronous=off mode
+// gates here.
 function persistImpl(db: Database, snap: Snapshot): void {
   if (db.path === null) return;
-  writeAtomic(db.path, toImage(snap, db.pageSize, snap.txid));
+  const write = incrementalImage(snap, db.pageSize, db.pageCount);
+  const ps = db.pageSize;
+  const fd = openSync(db.path, "r+");
+  try {
+    for (const pg of write.pages) {
+      writeSync(fd, pg.bytes, 0, pg.bytes.length, pg.index * ps);
+    }
+    fsyncSync(fd); // body pages durable before the meta can reference them
+    const meta = metaPage(ps, snap.txid, write.rootPage, write.pageCount);
+    writeSync(fd, meta, 0, meta.length, Number(snap.txid & 1n) * ps);
+    fsyncSync(fd); // the commit is published
+  } finally {
+    closeSync(fd);
+  }
+  db.pageCount = write.pageCount;
 }
 
 // commit commits the current transaction (spec/design/api.md §2.2, transactions.md §4.2).

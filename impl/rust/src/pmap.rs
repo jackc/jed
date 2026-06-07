@@ -38,11 +38,10 @@ pub(crate) struct Node {
     pub(crate) vals: Vec<Row>,
     pub(crate) weights: Vec<u32>,
     pub(crate) children: Vec<Arc<Node>>,
-    /// On-disk page index, or `0` when dirty (never persisted / changed since). Set once at the
-    /// commit that first persists this node; page 0 is a meta slot, never a node. Carried now so
-    /// the incremental dirty-page commit (P6.1 part B, storage.md §4) is a pure add — until then
-    /// the whole-image `to_image` ignores it.
-    #[allow(dead_code)]
+    /// On-disk page index, or `0` when dirty (never persisted / changed since). Set once by the
+    /// incremental commit that first persists this node (format.rs `serialize_dirty`, P6.1 part B);
+    /// page 0 is a meta slot, never a node, so it doubles as the dirty sentinel. A clean node lets an
+    /// incremental commit skip its whole (unchanged) subtree.
     pub(crate) page: AtomicU32,
 }
 
