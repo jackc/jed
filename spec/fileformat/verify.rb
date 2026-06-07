@@ -14,10 +14,13 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 1
+VERSION = 2 # format_version 2: page-backed copy-on-write B-tree (Phase 6, P6.1)
 PAGE_HEADER = 12
-ROOT_PAGE = 2
+ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
 TXID = 1
+PAGE_CATALOG = 1
+PAGE_LEAF = 2
+PAGE_INTERIOR = 3
 
 WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "timestamp" => 8, "timestamptz" => 8 }.freeze
 TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
@@ -50,8 +53,21 @@ end
 PK_TABLE = {
   name: "t",
   columns: [col("id", "int32", pk: true), col("v", "int16")],
-  # 20 rows so the data spans >1 page at page_size 256; id 3 has a NULL value.
+  # 20 rows: each record is 14 bytes, so a 256-byte page (cap 244) overflows at 18 rows and
+  # the tree becomes interior-root + two leaves (the load-bearing interior-node + split proof).
+  # id 3 has a NULL value. Inserted in ascending key order (the tree shape is order-sensitive).
   rows: (1..20).map { |i| [i, i == 3 ? nil : i * 10] }
+}.freeze
+
+# A table whose rows force a HEIGHT-2 tree (an interior node whose children are themselves
+# interior nodes) at page_size 256. A wide text padding column makes each record ~66 bytes, so a
+# leaf holds 3 records and the root interior overflows after ~5 leaves -> a two-level interior.
+# 18 rows, ascending int32 PK. Exercises interior-of-interior child pointers + post-order
+# page allocation across a deeper tree.
+TALL_TREE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("pad", "text")],
+  rows: (1..18).map { |i| [i, format("row-%02d-%s", i, "x" * 48)] }
 }.freeze
 
 # A table with a text column: exercises the value codec's text branch (u16 byte-length +
@@ -171,6 +187,7 @@ FIXTURES = [
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
+  { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
   { file: "torn_meta_slot1.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 1 }
@@ -357,45 +374,136 @@ def write_page(image, ps, index, type, item_count, next_page, payload)
   image[off + PAGE_HEADER, payload.bytesize] = payload unless payload.empty?
 end
 
+# --- size-driven B-tree (format.md "The per-table data B-tree") -------------
+#
+# Built the way the cores do: insert each (key, record) in ascending key order, splitting any
+# node whose serialized payload exceeds the page capacity C. A node is a Hash
+#   { keys: [binary-key, ...], recs: [record-bytes, ...], children: [node, ...] }
+# A leaf has children == []; an interior has children.size == keys.size + 1. recs[i] is the full
+# record bytes (key_len + key + values) for keys[i] — this B-tree stores a value with every key,
+# separators included. Split point and the RECORD_MAX = C/2 cap mirror format.md exactly.
+
+def node_leaf?(node) = node[:children].empty?
+
+def node_payload(node)
+  s = node[:recs].sum(&:bytesize)
+  s += 4 * node[:children].size unless node_leaf?(node) # (N+1) child pointers
+  s
+end
+
+# Split an overflowing node 2-way, promoting one separator: [:split, left, sep_key, sep_rec,
+# right]. Split point m = min(largest m in [1,N-1] with leftpayload(m) <= C, N-2).
+def split_node(node, cap)
+  return [:whole, node] if node_payload(node) <= cap
+
+  interior = !node_leaf?(node)
+  n = node[:keys].size
+  best = 1
+  (1...n).each do |m|
+    lp = (interior ? 4 * (m + 1) : 0) + node[:recs][0, m].sum(&:bytesize)
+    best = m if lp <= cap
+  end
+  m = [best, n - 2].min
+  left = { keys: node[:keys][0, m], recs: node[:recs][0, m],
+           children: interior ? node[:children][0, m + 1] : [] }
+  right = { keys: node[:keys][(m + 1)..], recs: node[:recs][(m + 1)..],
+            children: interior ? node[:children][(m + 1)..] : [] }
+  [:split, left, node[:keys][m], node[:recs][m], right]
+end
+
+# Insert (key, rec) into the subtree, rebuilding (copy-on-write) and splitting up the path.
+def tree_insert(node, key, rec, cap)
+  i = node[:keys].bsearch_index { |k| k >= key } || node[:keys].size
+  raise "duplicate key in fixture" if i < node[:keys].size && node[:keys][i] == key
+
+  if node_leaf?(node)
+    return split_node({ keys: node[:keys].dup.insert(i, key),
+                        recs: node[:recs].dup.insert(i, rec), children: [] }, cap)
+  end
+  res = tree_insert(node[:children][i], key, rec, cap)
+  if res[0] == :split
+    _, left, sk, sr, right = res
+    children = node[:children].dup
+    children[i] = left
+    children.insert(i + 1, right)
+    split_node({ keys: node[:keys].dup.insert(i, sk), recs: node[:recs].dup.insert(i, sr),
+                 children: children }, cap)
+  else
+    children = node[:children].dup
+    children[i] = res[1]
+    [:whole, { keys: node[:keys], recs: node[:recs], children: children }]
+  end
+end
+
+# Build a table's B-tree from its (key, record) pairs in key order. nil for an empty table.
+def build_tree(pairs, cap)
+  root = nil
+  record_max = (cap - 12) / 2 # see format.md "Why the record cap" (reserves a 2-key interior's child ptrs)
+  pairs.each do |key, rec|
+    raise "record of #{rec.bytesize}B exceeds RECORD_MAX #{record_max}" if rec.bytesize > record_max
+
+    if root.nil?
+      root = { keys: [key], recs: [rec], children: [] }
+      next
+    end
+    res = tree_insert(root, key, rec, cap)
+    root = res[0] == :split ? { keys: [res[2]], recs: [res[3]], children: [res[1], res[4]] } : res[1]
+  end
+  root
+end
+
+# Post-order page allocation: children before their parent (so a parent's child pointers
+# reference already-allocated pages). Fills `pages[index] = [page_type, item_count, payload]`.
+# Returns [root_page (0 for an empty tree), next free index].
+def serialize_tree(root, next_index, pages)
+  return [0, next_index] if root.nil?
+
+  child_pages = root[:children].map do |c|
+    cp, next_index = serialize_tree(c, next_index, pages)
+    cp
+  end
+  index = next_index
+  next_index += 1
+  n = root[:keys].size
+  pages[index] = if node_leaf?(root)
+                   [PAGE_LEAF, n, root[:recs].join.b]
+                 else
+                   [PAGE_INTERIOR, n, child_pages.map { |cp| u32(cp) }.join.b + root[:recs].join.b]
+                 end
+  [index, next_index]
+end
+
+# A from-scratch image (format.md "Allocation & incremental commit"): the special case where
+# every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
+# catalog chain, then both meta slots at txid 1.
 def build_image(tables, page_size)
   ps = page_size
   cap = ps - PAGE_HEADER
   sorted = tables.sort_by { |t| t[:name].downcase }
 
-  records = sorted.map { |t| table_entries(t).map { |key, row| record_bytes(t, key, row) } }
-
-  cat_groups = pack(sorted.map { |t| table_entry_bytes(t, 0).bytesize }, cap)
-  next_index = ROOT_PAGE + cat_groups.size
+  data_pages = {} # index => [page_type, item_count, payload]
   root_data = Array.new(sorted.size, 0)
-  data_groups = Array.new(sorted.size) { [] }
-  sorted.each_index do |ti|
-    next if records[ti].empty?
-
-    g = pack(records[ti].map(&:bytesize), cap)
-    root_data[ti] = next_index
-    next_index += g.size
-    data_groups[ti] = g
+  next_index = ROOT_PAGE
+  sorted.each_with_index do |t, ti|
+    pairs = table_entries(t).map { |key, row| [key, record_bytes(t, key, row)] }
+    root_data[ti], next_index = serialize_tree(build_tree(pairs, cap), next_index, data_pages)
   end
-  page_count = next_index
+
+  cat_root = next_index
+  cat_groups = pack(sorted.map.with_index { |t, ti| table_entry_bytes(t, root_data[ti]).bytesize }, cap)
+  page_count = cat_root + cat_groups.size
 
   image = "\x00".b * (page_count * ps)
-  write_meta(image, ps, 0, page_size, TXID, ROOT_PAGE, page_count)
-  write_meta(image, ps, 1, page_size, TXID, ROOT_PAGE, page_count)
+  write_meta(image, ps, 0, page_size, TXID, cat_root, page_count)
+  write_meta(image, ps, 1, page_size, TXID, cat_root, page_count)
+
+  data_pages.each { |index, (type, count, payload)| write_page(image, ps, index, type, count, 0, payload) }
 
   cat_groups.each_with_index do |group, gi|
-    index = ROOT_PAGE + gi
+    index = cat_root + gi
     nxt = gi + 1 < cat_groups.size ? index + 1 : 0
     payload = group.map { |ti| table_entry_bytes(sorted[ti], root_data[ti]) }.join.b
-    write_page(image, ps, index, 1, group.size, nxt, payload)
-  end
-
-  sorted.each_index do |ti|
-    data_groups[ti].each_with_index do |group, gi|
-      index = root_data[ti] + gi
-      nxt = gi + 1 < data_groups[ti].size ? index + 1 : 0
-      payload = group.map { |ri| records[ti][ri] }.join.b
-      write_page(image, ps, index, 2, group.size, nxt, payload)
-    end
+    write_page(image, ps, index, PAGE_CATALOG, group.size, nxt, payload)
   end
 
   image
@@ -531,6 +639,39 @@ def decode_record(columns, buf, pos)
   [row, pos]
 end
 
+# In-order walk of a table's B-tree -> rows in ascending key order (format.md interior layout:
+# (N+1) child pointers, then N records). Independent of how the tree was built.
+def read_tree_rows(image, ps, root_page, columns)
+  rows = []
+  walk = lambda do |idx|
+    return if idx.zero?
+
+    pg = read_page(image, ps, idx)
+    case pg[:type]
+    when PAGE_LEAF
+      pos = 0
+      pg[:item_count].times do
+        row, pos = decode_record(columns, pg[:payload], pos)
+        rows << row
+      end
+    when PAGE_INTERIOR
+      n = pg[:item_count]
+      children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }
+      pos = 4 * (n + 1)
+      n.times do |i|
+        walk.call(children[i])
+        row, pos = decode_record(columns, pg[:payload], pos)
+        rows << row
+      end
+      walk.call(children[n])
+    else
+      raise "expected a B-tree node page, got type #{pg[:type]}"
+    end
+  end
+  walk.call(root_page)
+  rows
+end
+
 def decode_image(image)
   ps = image.byteslice(8, 4).unpack1("N")
   meta = select_meta(image, ps)
@@ -538,24 +679,12 @@ def decode_image(image)
   cat = meta[:root_page]
   while cat != 0
     pg = read_page(image, ps, cat)
-    raise "expected a catalog page" unless pg[:type] == 1
+    raise "expected a catalog page" unless pg[:type] == PAGE_CATALOG
 
     pos = 0
     pg[:item_count].times do
       entry, pos = decode_table_entry(pg[:payload], pos)
-      rows = []
-      dp = entry[:root_data_page]
-      while dp != 0
-        d = read_page(image, ps, dp)
-        raise "expected a data page" unless d[:type] == 2
-
-        dpos = 0
-        d[:item_count].times do
-          rec, dpos = decode_record(entry[:columns], d[:payload], dpos)
-          rows << rec
-        end
-        dp = d[:next_page]
-      end
+      rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns])
       tables << { name: entry[:name], columns: entry[:columns], rows: rows }
     end
     cat = pg[:next_page]

@@ -7,8 +7,16 @@
 //! source. That cheap, structurally-shared clone is what carries the §3 staging-buffer /
 //! transaction model (spec/design/transactions.md §2): a `TableStore` clone is the committed
 //! version a reader holds while a writer mutates its own copy.
+//!
+//! Since Phase 6 (P6.1) the [`PMap`] is the **page-backed B-tree**: its fan-out is size-driven,
+//! so each entry's on-disk **weight** (record size) and the page payload `cap` (= `page_size − 12`)
+//! govern when a node splits (spec/fileformat/format.md). The store holds the column types and
+//! `cap` so it can compute weights ([`crate::format::record_size`]) the map itself never needs.
 
-use crate::pmap::PMap;
+use std::sync::Arc;
+
+use crate::pmap::{Node, PMap};
+use crate::types::ScalarType;
 use crate::value::Value;
 
 /// A stored row: one value per column, in column order.
@@ -17,21 +25,36 @@ pub type Row = Vec<Value>;
 /// A single table's rows, keyed by encoded primary key. Cloning is O(1) and yields an
 /// independent snapshot (the [`PMap`] shares structure; mutating one leaves the other
 /// untouched) — the foundation of the transaction model (spec/design/transactions.md §2).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TableStore {
     rows: PMap,
     /// Next synthetic rowid for a table with no primary key. Monotonic — never
     /// reused, so a DELETE-then-INSERT cannot collide with a freed key. Unused for
     /// tables that have a primary key. Reconstructed on load (spec/fileformat).
     next_rowid: i64,
+    /// Page payload capacity `C = page_size − 12` — the split threshold for the page-backed
+    /// B-tree (spec/fileformat/format.md). Fixed for the life of the database.
+    cap: usize,
+    /// The table's column types, for computing each row's on-disk record weight
+    /// ([`crate::format::record_size`]). `Arc` so a snapshot clone stays O(1).
+    col_types: Arc<Vec<ScalarType>>,
 }
 
 impl TableStore {
-    pub fn new() -> Self {
+    /// A new empty store for a table whose columns have the given types, serializing at page
+    /// payload `cap` (= `page_size − 12`).
+    pub fn new(cap: usize, col_types: Vec<ScalarType>) -> Self {
         TableStore {
             rows: PMap::new(),
             next_rowid: 0,
+            cap,
+            col_types: Arc::new(col_types),
         }
+    }
+
+    /// This row's on-disk record size — the weight the page-backed B-tree splits on.
+    fn weight(&self, key: &[u8], row: &Row) -> u32 {
+        crate::format::record_size(&self.col_types, key, row) as u32
     }
 
     /// Insert a row under its encoded key. Returns false if the key already exists
@@ -40,7 +63,8 @@ impl TableStore {
         if self.rows.get(&key).is_some() {
             return false;
         }
-        self.rows.insert(key, row);
+        let w = self.weight(&key, &row);
+        self.rows.insert(key, row, w, self.cap);
         true
     }
 
@@ -64,12 +88,13 @@ impl TableStore {
     /// key order and the rowid counter are untouched. The caller only replaces keys it
     /// just found, so the overwrite always lands on a present key.
     pub fn replace(&mut self, key: &[u8], row: Row) {
-        self.rows.insert(key.to_vec(), row);
+        let w = self.weight(key, &row);
+        self.rows.insert(key.to_vec(), row, w, self.cap);
     }
 
     /// Remove the row at `key` (DELETE). Returns whether a row was present.
     pub fn remove(&mut self, key: &[u8]) -> bool {
-        self.rows.remove(key).is_some()
+        self.rows.remove(key, self.cap).is_some()
     }
 
     /// Look up a row by its exact encoded key.
@@ -86,6 +111,17 @@ impl TableStore {
     /// serializer (spec/fileformat/format.md), which stores each row's key verbatim.
     pub fn iter_entries(&self) -> impl Iterator<Item = (&Vec<u8>, &Row)> {
         self.rows.iter()
+    }
+
+    /// The root B-tree node of this table's store, for the page-backed serializer
+    /// (spec/fileformat/format.md). `None` for an empty table.
+    pub(crate) fn tree_root(&self) -> Option<&Arc<Node>> {
+        self.rows.root()
+    }
+
+    /// Install a loaded B-tree as this store's contents (format.rs `from_image`).
+    pub(crate) fn set_tree(&mut self, root: Option<Arc<Node>>, len: usize) {
+        self.rows = PMap::from_loaded(root, len);
     }
 
     pub fn len(&self) -> usize {

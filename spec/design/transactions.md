@@ -107,14 +107,17 @@ force a re-pack at Phase 6; the B-tree avoids it. (A persistent BST remains the 
 fallback if the B-tree proves too costly to keep in lockstep across three cores; it preserves
 every §2 guarantee and only forfeits the Phase-6 convergence.)
 
-**Cross-core contract — narrower than it looks.** Only **iteration order** (ascending
-encoded key) and the **serialized on-disk bytes** are contractual across cores; the in-RAM
-node structure (fan-out, split points) is a **private per-core detail this slice**. The cores
-already differ in in-memory representation today (Rust `BTreeMap` vs Go/TS hash-map-plus-sort)
-for exactly this reason — only observable order and persisted bytes bind. **This changes at
-Phase 6:** once the tree is the *on-disk* B-tree, its node layout and split rules become a
-byte contract — a new §8 divergence hotspot that must be spec'd with golden fixtures
-([../fileformat/format.md](../fileformat/format.md)) at that time, not now.
+**Cross-core contract — widened at Phase 6.** Through Phase 5 only **iteration order**
+(ascending encoded key) and the **serialized on-disk bytes** were contractual; the in-RAM node
+structure (fan-out, split points) was a **private per-core detail**. **P6.1 closed that
+freedom:** the in-memory copy-on-write B-tree *is* the on-disk B-tree (node ↔ page), so its
+node layout and its **size-driven split/merge rules are now a §8 byte contract**, spec'd with
+golden fixtures in [../fileformat/format.md](../fileformat/format.md). All four
+implementations (Rust/Go/TS + the Ruby reference) run identical split (`payload > C` → 2-way
+median-promote, split point `m = min(largest m with leftpayload ≤ C, N-2)`) and rebalance
+(underfull `payload < C/2` → merge-then-maybe-split) rules over a `RECORD_MAX = (C-12)/2`
+single-record cap, so the trees — and therefore the bytes — are identical. Fan-out is now
+governed by **page fit**, not a tuning constant.
 
 **In-memory reclamation is free.** An old `Snapshot` is reclaimed by the language's own
 mechanism the instant nothing references it — `Arc` refcount in Rust, GC in Go/TS — so the
@@ -304,14 +307,15 @@ database-level **`synchronous`** setting governs *when* the fsync fires relative
   [storage.md](storage.md) §4). This is the standard `PRAGMA synchronous=OFF` /
   `synchronous_commit=off` trade.
 
-**This slice builds the seam, default `on`.** The fsync is already the single chokepoint at the
-commit boundary; `off` (batching/group-commit) is an additive change behind it and can land
-later. **Phase 5** keeps durability whole-image (the §3 recipe behind the §2 block seam);
-**Phase 6** changes only the materialization to incremental copy-on-write — write the dirty
-pages the new root introduced, publish the alternate meta slot — under a **frozen** transaction
-API, making the per-commit fsync cheap. The `synchronous` setting is orthogonal to both. (This
-refines CLAUDE.md §9's "writes … land durably on the SSD at commit": durably at commit under
-`synchronous=on`, batched under `off`.)
+**The seam, default `on`.** The fsync is the single chokepoint at the commit boundary; `off`
+(batching/group-commit) is an additive change behind it and can land later. **Phase 5** kept
+durability whole-image (the §3 recipe behind the §2 block seam); **P6.1** changed the
+materialization to incremental copy-on-write — write the dirty pages the new root introduced +
+the rewritten catalog, `sync`, publish the alternate meta slot, `sync` — under a **frozen**
+transaction API, making the per-commit fsync write `O(dirty path)` pages instead of the whole
+image ([../fileformat/format.md](../fileformat/format.md), *Allocation & incremental commit*).
+The `synchronous` setting is orthogonal to both. (This refines CLAUDE.md §9's "writes … land
+durably on the SSD at commit": durably at commit under `synchronous=on`, batched under `off`.)
 
 ## 10. Concurrency mechanism & the testing split
 

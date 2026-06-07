@@ -31,7 +31,7 @@ fn run(db: &mut Database, sql: &str) {
 /// `CREATE TABLE t (id int32 PRIMARY KEY, v int16)` with 20 rows (id 3 has a NULL
 /// value) — enough rows to span more than one data page at page_size 256.
 fn pk_table_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
     for i in 1..=20i64 {
         let v = if i == 3 {
@@ -45,17 +45,30 @@ fn pk_table_db() -> Database {
 }
 
 fn one_table_empty_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
     db
 }
 
 /// A table with no primary key — exercises the stored synthetic int64 rowid key.
 fn nopk_table_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE r (a int16, b int64)");
     for (a, b) in [(7, 70), (8, 80), (9, 90)] {
         run(&mut db, &format!("INSERT INTO r VALUES ({a}, {b})"));
+    }
+    db
+}
+
+/// 18 rows whose wide text padding forces a HEIGHT-2 tree (an interior node whose children are
+/// themselves interior nodes) at page_size 256 — exercises interior-of-interior child pointers and
+/// post-order page allocation across a deeper tree (spec/fileformat/format.md).
+fn tall_tree_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)");
+    for i in 1..=18i64 {
+        let pad = format!("row-{i:02}-{}", "x".repeat(48));
+        run(&mut db, &format!("INSERT INTO t VALUES ({i}, '{pad}')"));
     }
     db
 }
@@ -64,7 +77,7 @@ fn nopk_table_db() -> Database {
 /// UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text
 /// value, and a 4-byte astral char (😀). The PK stays int32 (no text key this slice).
 fn text_table_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, s text)");
     run(&mut db, "INSERT INTO t VALUES (1, 'alice')");
     run(&mut db, "INSERT INTO t VALUES (2, '')");
@@ -79,7 +92,7 @@ fn text_table_db() -> Database {
 /// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (no boolean
 /// key this slice).
 fn bool_table_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)",
@@ -95,7 +108,7 @@ fn bool_table_db() -> Database {
 /// column `d` and a constrained `numeric(10,2)` column `m` (values already at scale 2, so a
 /// no-op coercion). Covers positive, negative, zero, a multi-group coefficient, and a NULL.
 fn decimal_table_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id int32 PRIMARY KEY, d numeric, m numeric(10,2))",
@@ -113,7 +126,7 @@ fn decimal_table_db() -> Database {
 /// byte (0xFF), a NULL, and a lone 0x00. The PK stays int32 (no bytea key this slice).
 /// Literals are the `\x` hex input form, adapting to the bytea column (types.md §6).
 fn bytea_table_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, b bytea)");
     run(&mut db, "INSERT INTO t VALUES (1, '\\xdeadbeef')");
     run(&mut db, "INSERT INTO t VALUES (2, '\\x')");
@@ -130,7 +143,7 @@ fn bytea_table_db() -> Database {
 /// a present and a NULL uuid value, and the nil/max boundary UUIDs. Rows go in via INSERT and
 /// the store sorts them into key (byte) order. Must match spec/fileformat/verify.rb's UUID_TABLE.
 fn uuid_table_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(&mut db, "CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)");
     run(
         &mut db,
@@ -148,7 +161,7 @@ fn uuid_table_db() -> Database {
 /// default, a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to
 /// numeric(6,2), and a plain no-default column. Row 1 takes every default; row 2 provides all.
 fn default_table_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id int32 PRIMARY KEY, n int32 DEFAULT 0, note text DEFAULT 'none', \
@@ -168,7 +181,7 @@ fn default_table_db() -> Database {
 /// and a NULL. The literals parse to the same micros the golden stores. The PK stays int32 (a
 /// timestamp PK is supported, but the value-codec branch is the point here).
 fn timestamp_table_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamp)",
@@ -188,7 +201,7 @@ fn timestamp_table_db() -> Database {
 /// A table with a timestamptz column (type code 9) — the same 8-byte branch; the `+05` literal
 /// normalizes to UTC before storage.
 fn timestamptz_table_db() -> Database {
-    let mut db = Database::new();
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
         "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamptz)",
@@ -227,6 +240,7 @@ fn write_matches_goldens() {
         ("timestamp_table.jed", timestamp_table_db),
         ("timestamptz_table.jed", timestamptz_table_db),
         ("nopk_table.jed", nopk_table_db),
+        ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
         let image = build().to_image(GOLDEN_PAGE_SIZE, 1).unwrap();
@@ -250,6 +264,7 @@ fn read_goldens_reproduces_rows() {
         ("timestamp_table.jed", timestamp_table_db, "t"),
         ("timestamptz_table.jed", timestamptz_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
+        ("tall_tree.jed", tall_tree_db, "t"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),
     ];
@@ -316,19 +331,29 @@ fn default_survives_load() {
 /// after a load don't collide with persisted rowids (the step-6 mutation fix).
 #[test]
 fn rowid_counter_survives_serialize_and_load() {
-    let db = nopk_table_db(); // existing rows take rowids 0, 1, 2
-    let image = db.to_image(8192, 1).unwrap();
+    let db = nopk_table_db(); // existing rows take rowids 0, 1, 2 (built at GOLDEN_PAGE_SIZE)
+    let image = db.to_image(GOLDEN_PAGE_SIZE, 1).unwrap();
     let mut loaded = Database::from_image(&image).unwrap();
     // The next insert must get rowid 3, not 0 — otherwise it collides (23505).
     execute(&mut loaded, "INSERT INTO r VALUES (10, 100)").expect("insert after load");
     assert_eq!(loaded.rows_in_key_order("r").unwrap().len(), 4);
 }
 
-/// The default 8 KiB page size also round-trips (goldens stay at 256 for reviewable
-/// hex, but the real default must work too).
+/// The default 8 KiB page size also round-trips (goldens stay at 256 for reviewable hex, but the
+/// real default must work too). Built at 8192 so the in-memory tree is sized for it (the
+/// page-backed B-tree's fan-out tracks the page size — spec/fileformat/format.md).
 #[test]
 fn round_trip_at_default_page_size() {
-    let db = pk_table_db();
+    let mut db = Database::with_page_size(8192);
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
+    for i in 1..=20i64 {
+        let v = if i == 3 {
+            "NULL".to_string()
+        } else {
+            (i * 10).to_string()
+        };
+        run(&mut db, &format!("INSERT INTO t VALUES ({i}, {v})"));
+    }
     let image = db.to_image(8192, 1).unwrap();
     let loaded = Database::from_image(&image).unwrap();
     assert_eq!(

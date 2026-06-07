@@ -11,15 +11,38 @@ The load-bearing conformance test (CLAUDE.md §8): a file written by one core mu
 byte-readable by another. Because this format is **fully deterministic**, that is realized
 as golden-file tests — each core must (a) read a checked-in golden into the expected state,
 and (b) write the same logical database to bytes that equal the golden *exactly*. Then
-`rust-bytes == golden == go-bytes` by construction, so each core reads the other's output.
+`rust-bytes == golden == go-bytes == ts-bytes` by construction, so each core reads the
+other's output. A fourth independent encoder/decoder (the Ruby reference in
+[verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Step-5b scope
+## Phase-6 scope (`format_version` 2)
 
-This is the **whole-image** format: a commit serializes the entire database into one byte
-image (data is RAM-first — CLAUDE.md §9). Deliberately **deferred** until `UPDATE`/`DELETE`
-create pressure (CLAUDE.md §11): incremental copy-on-write, free-list / page reclamation,
-and B-tree interior pages. The double-meta page and root pointer below are the
-forward-looking hooks the live commit model (storage.md §4) will use.
+This is the **page-backed copy-on-write B-tree** format (Phase 6, P6.1). It supersedes the
+step-5b whole-image format (`format_version` 1) with a **clean break** — `format_version` 1
+is **not read** (we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md §1, "we own our
+surface"). Two things change from v1, and **only** these two:
+
+1. **Each table's rows live in a per-table on-disk B-tree** (interior + leaf node pages),
+   not a flat record chain. The B-tree's node layout and its **size-driven split/merge
+   rules** are now a §8 **byte contract** (they were a private in-RAM detail through Phase 5
+   — transactions.md §3). Fan-out is governed by **page fit**, not a key count, so a node
+   fills its page (the SSD / TB-scale goal — storage.md §1).
+2. **Commit is incremental copy-on-write.** A commit writes only the **dirty** pages a
+   mutation introduced (the path the copy-on-write B-tree copied, plus the rewritten catalog)
+   to fresh appended slots, then publishes the new root by writing the **alternate meta slot**
+   — not a whole-image rewrite. The meta page gains a **relocatable** catalog-root pointer and
+   real **slot alternation** (storage.md §4).
+
+Everything else is **byte-identical to v1**: the value codec, the stable type codes, the
+catalog table-entry encoding, the CRC, and the order-preserving keys. Execution, the planner,
+the evaluator, and the cost model are **untouched** — open still loads the whole tree into the
+in-memory store (full residency; demand paging is a later Phase-6 item), so `storage_row_read`
+and every `# cost:` corpus assertion are unchanged (a `page_read` cost unit is the separate
+item P6.3).
+
+**Deferred, not foreclosed** (later Phase-6 items): free-list / page **reclamation** (P6.2 —
+this slice **leaks** the pages an old root no longer references, so a file grows on every
+commit), demand paging / a buffer pool, overflow pages for over-large values, and compression.
 
 ## Conventions
 
@@ -28,38 +51,53 @@ forward-looking hooks the live commit model (storage.md §4) will use.
 - **Reserved fields are written as zero and required to be zero on read.** A nonzero
   reserved field, bad magic, unsupported version, or bad checksum is a structured
   `data_corrupted` (SQLSTATE `XX001`) error.
-- A page index of **0** means "none"/absent (`next_page`, `root_data_page`); real catalog
-  and data pages live at index ≥ 2, so 0 is an unambiguous sentinel.
+- A page index of **0** means "none"/absent (an absent child pointer, an empty table's root,
+  an end-of-chain `next_page`). Pages 0 and 1 are the meta slots, so 0 is an unambiguous
+  sentinel — no real body page ever lives at index 0 or 1.
+- **Page roles are not positional** (unlike v1). Page 0/1 are the meta slots; every other
+  page is a body page (a catalog-chain page or a B-tree node) whose role is discovered only
+  by following pointers from the meta — never by its index. On-disk, body pages appear in
+  **allocation order** (see *Allocation & incremental commit* below).
 
-## Page layout
+## Page model
 
 The file is a flat array of fixed-size **pages**; the page size is a format parameter
-recorded in the meta page (**default 8192**; the golden fixtures use **256** so the hex
-stays reviewable). Page roles:
+recorded in the meta page (**default 8192**; the golden fixtures use **256** so the hex stays
+reviewable). `page_count = file_size / page_size`. Every page is zero-filled to exactly
+`page_size`. Two page-payload capacities derive from the page size and recur throughout:
+
+```
+C          = page_size - 12       # PAGE_HEADER; the bytes a page body may hold
+RECORD_MAX = (C - 12) / 2 (floor) # the largest a single B-tree record may serialize to
+```
+
+The `- 12` inside `RECORD_MAX` reserves room for a **two-key interior** node's three child
+pointers (`4·3`): it makes `2·RECORD_MAX + 12 ≤ C`, so a two-record node — leaf *or* interior —
+**never** overflows. Overflow therefore happens only at `N ≥ 3` keys, which is what lets every
+split be a clean 2-way with two non-empty halves (see *Why the record cap* below).
 
 | page index | role |
 |---|---|
 | 0 | meta slot 0 |
 | 1 | meta slot 1 |
-| 2 … | catalog page chain (root = page 2) |
-| … | data page chains (one per non-empty table) |
-
-`page_count = file_size / page_size`. Every page is zero-filled to exactly `page_size`.
+| ≥ 2 | body pages: catalog-chain pages and per-table B-tree nodes, allocated dynamically |
 
 ## Meta page (pages 0 and 1)
 
-Two slots for torn-write-safe atomic publish (the bbolt model — storage.md §4). Fields:
+Two slots for torn-write-safe atomic publish (the bbolt model — storage.md §4). Fields
+(layout unchanged from v1 except `format_version` and the now-active meaning of `root_page`
+and slot selection):
 
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = `1` |
+| 4  | 2 | `format_version` (u16) — current = **`2`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
-| 20 | 4 | `root_page` (u32) — catalog root, = `2` |
-| 24 | 4 | `page_count` (u32) |
-| 28 | 4 | reserved (0) |
+| 20 | 4 | `root_page` (u32) — the **catalog chain head** (relocatable; ≥ 2) |
+| 24 | 4 | `page_count` (u32) — total pages in the file |
+| 28 | 4 | reserved (0) — the P6.2 free-list head will claim this; written `0` this slice |
 | 32 | 4 | `crc32` (u32) — CRC-32/IEEE over meta bytes `[0, 32)` (excludes this field and the zero-fill tail) |
 
 `page_size` lives at a fixed offset so a reader can learn it before it knows where page 1
@@ -69,35 +107,52 @@ begins (page 1 starts at byte `page_size`).
 `0xFFFFFFFF`) — the standard zlib CRC32, hand-rolled identically in every core (no runtime
 dependency). Pinned by the vector `crc32("123456789") == 0xCBF43926`.
 
-**Writing (whole image).** A whole-image commit writes the **same current meta into both
-slots** (a fresh image has no distinct prior version). The slot-alternation that storage.md
-§4 describes belongs to the future *incremental* commit path, not here.
+**`root_page` is relocatable.** In v1 the catalog root was fixed at page 2; in v2 the catalog
+chain is rewritten to fresh pages on every commit (it carries each table's B-tree root, which
+moves under copy-on-write — see below), so `root_page` is wherever the latest catalog head
+landed. A reader **must** follow `root_page`; it may not assume `2`.
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version`,
+**Slot alternation (writing).** A commit writes its meta to slot **`txid & 1`** (even `txid`
+→ slot 0, odd → slot 1). Because consecutive `txid`s alternate slots, a commit overwrites
+only the **older** slot, leaving the previously-published meta intact throughout the write —
+so a torn meta write always falls back to a complete prior snapshot whose body pages are still
+present (copy-on-write never overwrote them). `create` seeds **both** slots with the initial
+`txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
+then overwrites slot 0).
+
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 2`,
 reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
 slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
 
-## Page header (catalog and data pages, 12 bytes)
+## Page header (catalog and B-tree pages, 12 bytes)
 
 | offset | size | field |
 |---|---|---|
-| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = data |
+| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior** |
 | 1 | 1 | reserved (0) |
 | 2 | 2 | reserved (0) |
-| 4 | 4 | `item_count` (u32) — entries/records on this page |
-| 8 | 4 | `next_page` (u32) — next page of this chain, or 0 |
+| 4 | 4 | `item_count` (u32) — entries (catalog) / keys `N` (B-tree node) on this page |
+| 8 | 4 | `next_page` (u32) — **catalog only**: next page of the chain, or 0. B-tree nodes write `0` here (a node is reached by a child pointer, not a chain). |
 
-The payload (entries/records) follows immediately and is zero-filled to `page_size`.
+The payload follows immediately and is zero-filled to `page_size`.
 
-## Catalog (page chain rooted at page 2)
+## Catalog (relocatable page chain rooted at `root_page`)
 
-The catalog is a chain of `page_type = 1` pages. Tables are emitted in **ascending order of
-the lowercased table name** (the engine stores tables in a hash map keyed by lowercased
-name; sorting by that key removes any iteration-order leak — CLAUDE.md §8; names are unique
-after lowercasing, so there are no ties). Each page's `item_count` is the number of table
-entries it holds; the total table count is the sum across the chain.
+The catalog is a chain of `page_type = 1` pages, **rewritten to fresh pages on every commit**
+(transactions.md §4.5 requires the catalog be copied-on-write too, because each table's
+B-tree root moves). Its **encoding is byte-identical to v1**; only its location is dynamic
+(`root_page`) and `root_data_page` now points at a **B-tree root node** instead of a record
+chain head.
 
-Each **table entry**:
+Tables are emitted in **ascending order of the lowercased table name** (the engine stores
+tables in a hash map keyed by lowercased name; sorting by that key removes any iteration-order
+leak — CLAUDE.md §8; names are unique after lowercasing, so there are no ties). Each page's
+`item_count` is the number of table entries it holds; the total table count is the sum across
+the chain. Catalog entries are packed greedily (a single table entry must fit one page, i.e.
+≤ `C`, else `0A000`; the `RECORD_MAX = C/2` cap is a B-tree-record rule and does **not** apply
+to catalog entries, which never split).
+
+Each **table entry** (unchanged from v1):
 
 | field | encoding |
 |---|---|
@@ -112,7 +167,7 @@ Each **table entry**:
 | &nbsp;&nbsp;`precision` | u16 — **only present when `type_code == 6` (decimal)**; `0` = unconstrained |
 | &nbsp;&nbsp;`scale` | u16 — **only present when `type_code == 6` (decimal)** |
 | &nbsp;&nbsp;`default` | value-codec bytes — **only present when `flags` bit2 (`has_default`)**; written *after* the typmod |
-| `root_data_page` | u32 — first data page of this table's chain, or 0 if it has no rows |
+| `root_data_page` | u32 — the **root B-tree node** of this table, or 0 if it has no rows |
 
 Columns are emitted in declaration order.
 
@@ -135,37 +190,32 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 10 | `timestamptz` |
 
 A column's collation is **not** stored: there is one collation (`C`) for all text this slice
-(../design/types.md §11). A per-column collation field is a forward extension that will claim a
-spare `flags` bit or a new field under a `format_version` bump when multi-collation lands.
-`bytea` and `uuid` have no collation (they are bytes, not text), so the same field-free encoding
-applies. A `uuid` PRIMARY KEY needs no extra catalog field either — it is the first non-integer
-key, but the key bytes live in the data-page record (below), not the catalog.
+([../design/types.md](../design/types.md) §11). A per-column collation field is a forward
+extension that will claim a spare `flags` bit or a new field under a `format_version` bump when
+multi-collation lands. `bytea` and `uuid` have no collation. A non-integer PRIMARY KEY needs no
+extra catalog field — the key bytes live in the data-page record (below), not the catalog.
 
-A **decimal** column carries a **typmod** (the `numeric(p,s)` precision/scale) that constrains
-future writes, so it **must** persist. It is appended to the column entry **only when
-`type_code == 6`** — two extra big-endian `u16`s, `precision` then `scale` — so non-decimal
-column entries are byte-unchanged (existing int/text fixtures are untouched). `precision == 0`
-means **unconstrained** `numeric` (no typmod; `scale` is then `0` and ignored); a constrained
-`numeric(p,s)` stores `precision = p` (`1 … 1000`) and `scale = s`. The reader, having read
-`type_code == 6`, reads the two `u16`s; for any other type code it reads neither.
+A **decimal** column carries a **typmod** (the `numeric(p,s)` precision/scale) appended to the
+column entry **only when `type_code == 6`** — two big-endian `u16`s, `precision` then `scale`.
+`precision == 0` means **unconstrained** `numeric` (`scale` then `0` and ignored); a
+constrained `numeric(p,s)` stores `precision = p` (`1 … 1000`) and `scale = s`.
 
-A column with a **`DEFAULT`** (../design/constraints.md §2) persists its pre-evaluated default
-value. When `flags` **bit2 (`has_default`)** is set, the default is appended **after** the typmod
-(so a decimal-with-default reads typmod then default), encoded with the **same value codec rows
-use** (presence tag + body — see below): a present default is `0x00` + the type body, a
-`DEFAULT NULL` is the lone `0x01`. The field is presence-gated, so a column without a default is
-byte-unchanged — every fixture predating defaults is untouched. This is an **additive,
-backward-compatible extension** at `format_version == 1`, exactly like the decimal typmod: an old
-file (no `has_default` bit anywhere) still loads. The one asymmetry to note: a v1 file that *does*
-carry a default is not readable by a core built before defaults existed — the writer's surface
-grew, the version did not. The reader keys entirely off bit2; a column whose bit2 is clear reads
-no default bytes.
+A column with a **`DEFAULT`** ([../design/constraints.md](../design/constraints.md) §2)
+persists its pre-evaluated default value when `flags` **bit2** is set, appended **after** the
+typmod, via the **same value codec rows use** (presence tag + body): a present default is
+`0x00` + the type body, a `DEFAULT NULL` is the lone `0x01`. The field is presence-gated, so a
+column without a default is byte-unchanged.
 
-## Data pages (one chain per non-empty table)
+## The per-table data B-tree
 
-A chain of `page_type = 2` pages rooted at the table's `root_data_page`. Records are emitted
-in **ascending encoded-key order** (the store iterates in key order; the reader rebuilds it
-by inserting in file order). Each **record**:
+Each non-empty table's rows are an **ordered B-tree** keyed by the row's encoded storage key
+(memcmp order — [encoding.md](../design/encoding.md)), rooted at the table's `root_data_page`.
+It is the on-disk image of the in-memory copy-on-write B-tree (transactions.md §3, pmap):
+node ↔ page, one-to-one. A node holds keys **and** their row values at *every* level (a
+CLRS-style B-tree, not a B+-tree — values are not pushed to the leaves), plus child pointers
+when interior. The same record encoding serves leaves and interior separators.
+
+### Record (a key and its row), unchanged from v1
 
 | field | encoding |
 |---|---|
@@ -173,136 +223,217 @@ by inserting in file order). Each **record**:
 | `key` | `key_len` bytes — the row's storage key, exactly as the engine encoded it |
 | `payload` | each column's value, in declaration order, via the value codec |
 
-The key is **stored, not derived**: a table without a primary key uses a synthetic
-`int64` rowid that is not reconstructable from row data, so the key bytes are persisted
-verbatim. There is no per-record payload length — the reader walks the columns in declaration
-order and takes each value's width from its type: fixed for the integers and the 16-byte
-`uuid`, and for `text` / `bytea` from the `u16` length the value carries (see the value codec
-below).
+The key is **stored, not derived** (a no-PK synthetic rowid is not reconstructable from row
+data). There is no per-record payload length — the reader walks the columns in declaration
+order, taking each value's width from its type (fixed for integers / 8-byte timestamps /
+1-byte boolean / 16-byte uuid; self-describing for text/bytea via their `u16` length and for
+decimal via `ndigits`). The **on-disk size of a record** — `2 + key_len + Σ value_size` — is
+the quantity the split/merge rules below measure.
 
-**Rowid reconstruction (no-PK tables).** The synthetic rowid is allocated from a
-**monotonic counter** that is never reused (so a `DELETE` followed by an `INSERT` cannot
-collide with a freed key). The counter is **not stored** — on load it is set to
-`max(rowid) + 1` over the table's persisted keys (0 for an empty table), which is exact
-because a no-PK key is a bare `int64` rowid and the rowids issued are `0, 1, 2, …`. This
-needs no format change; it is a pure load-time derivation.
+**`RECORD_MAX`.** A single record's on-disk size must be ≤ `RECORD_MAX = (C-12)/2` (floor); a
+larger row is a write-side `feature_not_supported` (**`0A000`**). This is **tighter than v1's
+≤ `C`** rule, and it is what makes every node split clean (see *Why the record cap* below); it
+is lifted later by overflow pages (Phase 6). At the 8192 default, `RECORD_MAX = 4084`; the
+256-byte fixtures cap a record at 116 bytes (every fixture row is far smaller).
+
+### Leaf node (`page_type = 2`)
+
+Header (`item_count = N`, `next_page = 0`) followed by the payload: **`N` records** in
+**ascending key order**, packed contiguously. A leaf's payload size is `Σ record_size`. This
+payload is byte-identical to a v1 data page's payload — only the page's *role* (a tree node
+vs. a chain link) differs.
+
+### Interior node (`page_type = 3`)
+
+Header (`item_count = N`, `next_page = 0`) followed by the payload, in order:
+
+1. **`N + 1` child pointers** — each a big-endian `u32` page index, the roots of the `N + 1`
+   subtrees (`child[0] < key[0] < child[1] < key[1] < … < key[N-1] < child[N]`).
+2. **`N` records** — the separators, in ascending key order, each carrying its own row value
+   (this B-tree stores a value with every key, separators included).
+
+An interior node's payload size is `4·(N + 1) + Σ record_size`. To parse: read `N` from the
+header, read `N + 1` child pointers, then read `N` records.
+
+An empty table has `root_data_page = 0` and no node pages. A one-row table is a single leaf
+with `N = 1`. The root may be a leaf (small table) or an interior node (taller tree); it is
+distinguished by its `page_type`, never by its index.
+
+### Fan-out: the size-driven split/merge byte contract
+
+Fan-out is governed by **page fit**: a node may hold any number of keys whose serialized form
+fits the page payload `C`, and it splits when it would overflow. This makes the node
+boundaries — and therefore the on-disk bytes — a deterministic function of the **key set and
+the order of mutations** (not of any in-RAM tuning constant). Every core and the Ruby
+reference run the identical rules, so the trees are byte-identical. The rules:
+
+**A node "fits"** iff its payload size ≤ `C`. The invariant the writer maintains: every
+committed node fits, every committed node is **non-empty** (`N ≥ 1`), and every non-root node
+is **at least half full** where it can be (`payload ≥ C/2`) — "where it can be" because a row
+near `RECORD_MAX` may force an underfull node, which is correct, just not compact.
+
+**Insert.** Descend to the target leaf, insert the record in key order, then walk back up:
+whenever a node overflows (`payload > C`), **split it 2-way** and **promote one separator**
+to the parent (which may then overflow and split, etc.; a root split grows the height by one).
+
+**Split point.** For an overflowing node with records `r[0 … N)` (and, if interior, children
+`c[0 … N]`), define the left-payload after taking the first `m` records:
+
+```
+leftpayload(m) = (interior ? 4·(m + 1) : 0) + Σ_{i < m} record_size(i)
+```
+
+Choose `m = min( the largest m in [1, N-1] with leftpayload(m) ≤ C , N - 2 )`. Promote
+`r[m]`; the **left** node gets `r[0 … m)` (and `c[0 … m]`), the **right** node gets
+`r[m+1 … N)` (and `c[m+1 … N]`). The `RECORD_MAX = C/2` cap guarantees this `m` always yields
+two **non-empty** nodes that each **fit** (proof under *Why C/2*).
+
+**Delete.** Descend to the key (replacing an interior separator by its **in-order
+predecessor** — the rightmost record of the left subtree — and deleting that from the left
+child), remove the record, then walk back up rebalancing by **merge-then-maybe-split** (no
+borrow rotation — merge subsumes it):
+
+- A non-root child is **underfull** when its `payload < C/2`.
+- When a child is underfull, **merge** it with an adjacent sibling — prefer the **right**
+  sibling (`child[i+1]`) if it exists, else the **left** (`child[i-1]`) — by concatenating
+  `left records‖separator‖right records` (and the children, if interior) into one node `M`,
+  removing that separator and the absorbed child from the parent.
+  - If `M` fits (`payload(M) ≤ C`): `M` replaces the pair; the **parent loses one key**, so
+    the parent may itself become underfull — handled when it returns to *its* parent.
+  - If `M` overflows: **split `M` 2-way** by the rule above; the two halves and the new
+    separator replace the pair, so the **parent's key count is unchanged**.
+- **Root collapse:** if the root drains to `N = 0`, it is replaced by its single child
+  (interior root → height − 1) or becomes empty (leaf root → `root_data_page = 0`).
+
+Because a merged node is at most `(< C/2) + RECORD_MAX + (≤ C) < 2·C` (the underfull child is
+`< C/2`, the separator ≤ `RECORD_MAX`, the sibling ≤ `C`), a single 2-way split always restores
+fit — the same `≤ 2C ⇒ one split suffices` bound the insert path relies on.
+
+**Why the record cap.** Capping a record at `RECORD_MAX = (C-12)/2` makes a two-record node —
+leaf or interior — never exceed `C` (a leaf's two records are `≤ C-12 ≤ C`; an interior's two
+records plus three child pointers are `≤ (C-12) + 12 = C`), so a node overflows only at
+`N ≥ 3`, and the split point `m = min( largest m with leftpayload(m) ≤ C , N-2 )` always lands
+in `[1, N-2]` with both halves non-empty and ≤ `C`. Without the cap, a node could overflow on
+its **last**, oversized record, forcing an empty sibling (a degenerate node) or a multi-way
+spill — both of which complicate the byte contract across four implementations. The cap buys an
+all-2-way, no-empty-node scheme at the cost of a tighter (and later-liftable) oversized-row
+limit.
 
 ### Value codec
 
 A row value is encoded behind a named `encode_value`/`decode_value` seam, by column type. All
 forms begin with a 1-byte **presence tag** (`0x00` present, `0x01` NULL); a NULL is the tag
-alone. The present-value body depends on the type:
+alone. **Unchanged from v1.** The present-value body depends on the type:
 
 - **Integers** (`int16`/`int32`/`int64`) — the **same order-preserving bytes as keys**
-  ([encoding.md §2.1](../design/encoding.md)): fixed-width big-endian, sign-bit flipped. The
-  sign-flip is unnecessary for a stored value but harmless, and reusing the key codec keeps one
-  verified, byte-pinned ([../encoding/integers.toml](../encoding/integers.toml)) integer codec.
+  ([encoding.md §2.1](../design/encoding.md)): fixed-width big-endian, sign-bit flipped.
 
-- **`text`** — the seam **diverges** here (its whole purpose): a stored text value uses a
-  **compact length-prefixed** form, NOT the order-preserving key encoding (encoding.md §2.4),
-  because a stored value never needs to sort. The body is a **`u16` byte-length** (big-endian,
-  like every other length in this format) followed by exactly that many **UTF-8 bytes** (the
+- **`text`** — a **`u16` byte-length** (big-endian) then exactly that many **UTF-8 bytes** (the
   `C` collation's bytes, verbatim — no escaping, no terminator). The empty string is
-  `00`(tag)`00 00`(len), zero content bytes. A value whose UTF-8 length exceeds `0xFFFF` is a
-  write-side `feature_not_supported` (`0A000`) — and in practice such a value also exceeds a
-  page, tripping the oversized-item rule below. The reader reads the tag, then (if present) the
-  `u16` length, then that many bytes — the only value whose width is not fixed by the column
-  type alone.
+  `00`(tag)`00 00`(len). A value whose UTF-8 length exceeds `0xFFFF` is a write-side `0A000`.
 
 - **`boolean`** — a single **`bool-byte`** body: `00` false, `01` true (any other byte is
-  `data_corrupted`). A present boolean is two bytes total — `00`(tag)`00`/`01`(value); a NULL
-  boolean is the tag alone. This is the same order-preserving `bool-byte` the key encoding uses
-  (false `<` true), but as a stored value it never needs to sort (a boolean PRIMARY KEY is
-  rejected this slice — types.md §9).
+  `data_corrupted`).
 
-- **`decimal`** — also self-describing (its whole point is exactness, not ordering), so like
-  text it uses a compact codec, **not** the order-preserving key encoding (encoding.md §2.5).
-  The present body is, in order: a **`u8` `flags`** (bit0 = sign, `1` = negative; bits 1–7
-  reserved `0`); a **`u16` `scale`** (big-endian, the value's display scale `s`); a **`u16`
-  `ndigits`** (big-endian, the number of base-10⁴ digit groups in the coefficient); then
-  **`ndigits` × `u16`** (big-endian) coefficient groups, **most-significant group first**, each
-  `0 … 9999` (base 10000 — PG's on-disk digit size, and `u16`-clean / reviewable in the
-  fixtures). The in-core base-10⁹ coefficient is regrouped to base-10⁴ on write and back on
-  read (a pure power-of-ten split). **Canonical zero** is `flags=0, scale=s, ndigits=0` (no
-  groups; the sign bit is forced `0` when the coefficient is zero — there is no negative zero),
-  so a given scale has exactly one byte form for zero. The reader reads the tag, then flags,
-  scale, ndigits, then that many `u16` groups — its width is fully self-describing. A value
-  exceeding the page (impossible under the 1000-digit cap for a 256-byte fixture only at the
-  extreme) trips the oversized-item rule below.
+- **`decimal`** — a compact self-describing codec: a **`u8` `flags`** (bit0 = sign, `1` =
+  negative; bits 1–7 reserved `0`); a **`u16` `scale`** (the value's display scale `s`); a
+  **`u16` `ndigits`** (number of base-10⁴ groups); then `ndigits` × **`u16`** (big-endian)
+  groups, **most-significant first**, each `0 … 9999`. **Canonical zero** is
+  `flags=0, scale=s, ndigits=0`.
 
-- **`bytea`** — the **same compact length-prefixed** form as text (a stored value never needs
-  to sort, so not the order-preserving key encoding, encoding.md §2.6): a **`u16` byte-length**
-  (big-endian) followed by exactly that many **raw bytes**. The one difference from text is that
-  the bytes are written and read **verbatim with no UTF-8 validation** — any byte, including
-  `0x00`, is allowed. The empty value is `00`(tag)`00 00`(len). The `> 0xFFFF` and oversized-item
-  rules are identical to text.
+- **`bytea`** — a **`u16` byte-length** then that many **raw bytes** (no UTF-8 validation; any
+  byte allowed). The empty value is `00`(tag)`00 00`(len).
 
-- **`uuid`** — a **fixed 16-byte** body: the 16 raw bytes of the value (big-endian, the same
-  `uuid-raw16` bytes the key uses — encoding.md §2.7), with **NO `u16` length prefix** (the
-  width is fixed at 16, implied by the column type). A present uuid is `00`(tag) + 16 bytes (17
-  bytes total); a NULL uuid is the lone `01` tag. This is the **first fixed-width non-integer**
-  value — for uuid the stored value body and the order-preserving key body coincide (both the
-  raw 16 bytes), so reusing one codec is exact rather than merely convenient.
+- **`uuid`** — a **fixed 16-byte** body (the raw `uuid-raw16` bytes — encoding.md §2.7), with
+  **no length prefix**.
 
-- **`timestamp` / `timestamptz`** — both store an **`int64` microsecond instant** (since the
-  Unix epoch; ../design/timestamp.md), so they use the **same order-preserving 8-byte integer
-  body as `int64`** (big-endian, sign-bit flipped), behind the shared presence tag. A present
-  datetime is `00`(tag) + 8 bytes; a NULL is the tag alone. The two type codes (9, 10) differ
-  only in semantics, not bytes — and the infinity sentinels are ordinary extreme `int64`
-  values (`-infinity` = `i64::MIN` → `00…00`, `+infinity` = `i64::MAX` → `ff…ff` after the
-  sign-flip), so they need no special encoding. This is the one new type this slice that is a
-  fixed-width key codec rather than a self-describing one, so a timestamp `PRIMARY KEY` is
-  **supported** (the bytes already sort correctly).
+- **`timestamp` / `timestamptz`** — both store an **`int64` microsecond instant** via the
+  **same 8-byte order-preserving integer body as `int64`** (the two type codes 9/10 differ in
+  semantics, not bytes); the `±infinity` sentinels are the extreme `int64` values.
 
-There is no per-record payload length: the reader walks the columns in declaration order,
-deriving each value's width from its type (fixed for the integers, the two 8-byte timestamps,
-the 1-byte boolean, and the 16-byte uuid; self-describing via the `u16` length for text and
-bytea, and via `ndigits` for decimal).
+**Rowid reconstruction (no-PK tables).** The synthetic rowid is allocated from a **monotonic
+counter** that is never reused. It is **not stored** — on load it is set to `max(rowid) + 1`
+over the table's persisted keys (0 for an empty table), exact because a no-PK key is a bare
+`int64` rowid and the rowids issued are `0, 1, 2, …`. Walking the B-tree in key order yields
+the rowids in ascending order; the largest is the rightmost leaf's last key.
 
-## Packing and page allocation (must be byte-identical across cores)
+## Allocation & incremental commit
 
-Records and table entries are variable-length, so the packing rule is pinned: **greedily**
-append an item to the current page; when the next item's full on-disk size would exceed
-`page_size − 12` (the page header), start a new page and link it via `next_page`. Pages of a
-chain are **contiguous and ascending**; `next_page` is the literal next index, and the last
-page in a chain has `next_page = 0`.
+A commit materializes the writer's new committed `Snapshot` (transactions.md §2) by writing
+only its **dirty** pages, then publishing the new root. The §2 atomicity rests on a fixed
+**write ordering** (storage.md §4):
 
-Allocation order within the image: meta (0, 1), then the catalog chain (from page 2), then
-each non-empty table's data chain in table-sort order. A table's `root_data_page` is the
-first index of its data chain (or 0 if it has no rows).
+1. **Allocate** a fresh page index (appended at the end of the file, bumping `page_count`) to
+   each dirty page. A page is **dirty** iff it was newly built by this transaction's
+   copy-on-write — i.e. it has no on-disk page id yet. Clean nodes (shared with the prior
+   committed tree via structural sharing) **keep their existing page** and are **not
+   rewritten** — that is the incremental win.
+2. **Write** the dirty body pages in this **deterministic order**, so the bytes are
+   cross-core identical:
+   - For each table in **lowercased-name order**, the dirty nodes of its B-tree in
+     **post-order** (a node's children before the node — so a parent's child pointers
+     reference already-allocated pages), left to right.
+   - Then the **catalog chain** (always rewritten fresh: it carries the possibly-moved
+     `root_data_page` of every table), as consecutive pages.
+3. **`sync()`** — every body page is durable.
+4. **Write the meta** to slot `txid & 1` (new `txid`, new `root_page` = the new catalog head,
+   new `page_count`).
+5. **`sync()`** — the meta is durable; the commit is **published**.
 
-**Oversized item.** A single table entry or record that does not fit one page is **not**
-split (no overflow pages in step-5b) — it is a write-side `feature_not_supported`
-(`0A000`). Fixtures stay within one item per... within the page limit.
+A crash between steps 3 and 5 leaves the prior meta valid (its body pages are intact — copy-on-
+write never overwrote them), so the database opens at the prior snapshot; the freshly written
+body pages are simply unreferenced. A torn meta write at step 4 is caught by the checksum and
+falls back to the other slot. Either way the file is never corrupt — it is always a valid
+snapshot, the new one or the immediately prior one (storage.md §4, transactions.md §9).
+
+**Pages an old root no longer references are leaked this slice** (P6.1) — `page_count` only
+grows. **P6.2** adds the free-list that reuses them, gated on the oldest-live-snapshot
+watermark (transactions.md §8): a page freed at `txid T` is reusable only once
+`oldest_live_txid > T`.
+
+**From-scratch image (`to_image`).** A clean, garbage-free image of a snapshot — used by
+`create`'s initial write and by the **golden tests / Ruby reference** — is the special case
+where *every* node is dirty: allocate and write the whole tree (post-order per table, in
+name order) starting at page 2, then the catalog chain, then both meta slots at `txid = 1`.
+This is what the fixtures pin. (An incrementally-committed file additionally contains leaked
+pages from intermediate commits; its round-trip correctness is verified by per-core tests, not
+by a static golden, because it depends on the commit history.)
 
 ## Edge cases
 
-- **Empty database** (no tables): one catalog page with `item_count = 0`; `page_count = 3`
-  (two meta slots + the catalog page).
-- **Empty table** (no rows): `root_data_page = 0`; no data pages.
+- **Empty database** (no tables): one catalog page with `item_count = 0`; `root_page = 2`,
+  `page_count = 3` (two meta slots + the catalog page).
+- **Empty table** (no rows): `root_data_page = 0`; no node pages.
+- **Single-row table**: one leaf node, `N = 1`.
 
 ## Fixtures
 
-[fixtures/](fixtures/) holds byte-exact goldens at `page_size = 256`, generated and checked
-by the independent Ruby reference in [verify.rb](verify.rb) (run via `rake verify`):
+[fixtures/](fixtures/) holds byte-exact goldens at `page_size = 256`, generated and checked by
+the independent Ruby reference in [verify.rb](verify.rb) (run via `rake verify`). Each fixture
+is the **from-scratch image** of its logical content (built by inserting the rows in the
+listed order, then serialized clean). Fixtures sized to force a **multi-level tree** exercise
+the interior-node format and the split contract.
 
 | fixture | exercises |
 |---|---|
-| `empty_db.jed` | zero tables; catalog `item_count = 0` |
+| `empty_db.jed` | zero tables; catalog `item_count = 0`; `root_page = 2` |
 | `one_table_empty.jed` | one table, zero rows (`root_data_page = 0`) |
-| `pk_table.jed` | a PK table with rows spanning **>1** data page; a NULL value in a row |
-| `text_table.jed` | a text column — the value codec's text branch (`u16` len + UTF-8 bytes); empty string, embedded quote, multi-byte + astral chars, a NULL |
-| `bool_table.jed` | a boolean column — the value codec's `bool-byte` branch (`00` false / `01` true) and a NULL boolean |
-| `decimal_table.jed` | a `decimal` column — the value codec's decimal branch (flags + scale + base-10⁴ groups), the per-column `numeric(p,s)` typmod, and positive/negative/zero/multi-group/NULL |
-| `bytea_table.jed` | a bytea column — the value codec's bytea branch (`u16` len + raw bytes); empty value, embedded `0x00`, a high byte, a NULL |
-| `uuid_table.jed` | a **uuid PRIMARY KEY** (the first golden with a non-integer stored key — the load-bearing §8 cross-core key-path proof) + a nullable uuid column — the value codec's fixed-16-byte branch (no length prefix) and a NULL uuid |
-| `default_table.jed` | columns with `DEFAULT` — the `has_default` flag (bit2) + the default value codec written after the typmod; an int/text/decimal default, a `DEFAULT NULL`, a NOT NULL column with a default, a plain no-default column |
-| `timestamp_table.jed` | a timestamp column — the value codec's 8-byte int64 branch; an epoch value, a pre-1970 (negative) instant, a BC-era instant, `infinity`/`-infinity` sentinels, a NULL |
-| `timestamptz_table.jed` | a timestamptz column — the same 8-byte branch under type code 10; a UTC instant, a pre-1970 instant, `infinity`/`-infinity`, a NULL |
-| `nopk_table.jed` | a table with no PK — exercises the stored synthetic `int64` rowid key |
+| `pk_table.jed` | an int PK table whose rows force a **3-node tree** (interior root + two leaves) at page 256 — the load-bearing interior-node + split proof; includes a NULL value in a row |
+| `text_table.jed` | a text column — the value codec's text branch; empty string, embedded quote, multi-byte + astral chars, a NULL (single leaf) |
+| `bool_table.jed` | a boolean column — the `bool-byte` branch (single leaf) |
+| `decimal_table.jed` | a `decimal` column — the decimal branch + per-column `numeric(p,s)` typmod; positive/negative/zero/multi-group/NULL |
+| `bytea_table.jed` | a bytea column — the bytea branch; empty value, embedded `0x00`, a high byte, a NULL |
+| `uuid_table.jed` | a **uuid PRIMARY KEY** (the first non-integer stored key — the §8 cross-core key-path proof) + a nullable uuid column |
+| `default_table.jed` | columns with `DEFAULT` — the `has_default` flag + default value codec written after the typmod |
+| `timestamp_table.jed` | a timestamp column — the 8-byte int64 branch; epoch, pre-1970, BC-era, `±infinity`, NULL |
+| `timestamptz_table.jed` | a timestamptz column — the same 8-byte branch under type code 10 |
+| `nopk_table.jed` | a no-PK table — the stored synthetic `int64` rowid key |
+| `tall_tree.jed` | enough small int rows to force a **two-level interior** (height-2 tree) — exercises interior-of-interior child pointers and post-order page allocation |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |
 
-The "highest `txid` wins" selection (vs. the torn-write fallback) is covered by per-core
-unit tests that craft two valid slots with differing `txid`, since a fresh whole-image write
-gives both slots the same `txid`.
+The "highest `txid` wins" selection (vs. the torn-write fallback), the **slot alternation**
+across consecutive commits, and the **incremental dirty-page-only write** are covered by
+per-core unit tests that perform real multi-commit sequences against a file (a fresh
+whole-image write gives both slots the same `txid`, so these are not expressible as a static
+golden).

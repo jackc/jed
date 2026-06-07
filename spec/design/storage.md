@@ -109,36 +109,45 @@ depends on the meta-page write being all-or-nothing; the format reserves **two m
 (with a checksum) so a torn write during publish can always fall back to the previous valid
 meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 
-> **Step-5b status (whole-image commit).** Persistence has landed in a deliberately
-> narrowed form: a commit serializes the **entire database to one byte image** rather than
-> writing only changed pages. The incremental machinery this section describes —
-> copy-on-write of just the dirty path, the free-list, per-page reuse, B-tree interior
-> pages — is **deferred until `UPDATE`/`DELETE` exist** (nothing exercises it before then;
-> CLAUDE.md §11). What *is* built now and forward-compatible: the two meta slots, the
-> checksum, the root pointer, and the load-bearing **write-ordering rule** (write body
-> pages + `sync()`, *then* publish the meta + `sync()`), so the live incremental commit is
-> an additive change, not a reshape. The whole-image writer fills both meta slots with the
-> same `txid`; slot alternation belongs to the future incremental path. The byte layout is
-> [../fileformat/format.md](../fileformat/format.md).
+> **Status (P6.1, `format_version` 2): incremental copy-on-write has landed.** A commit now
+> writes only the **dirty** pages a mutation introduced — the path the copy-on-write B-tree
+> copied (root→leaf), plus the rewritten catalog chain — to fresh **appended** slots, then
+> publishes the new root by writing the **alternate meta slot** (`txid & 1`) and `sync`ing.
+> The two meta slots, the checksum, the root pointer, and the **write-ordering rule** (body
+> pages + `sync()`, *then* meta + `sync()`) carried forward from step-5b unchanged; P6.1
+> activated the **slot alternation** the whole-image writer had stubbed (both slots = same
+> `txid`). Each table's rows are now a per-table **on-disk B-tree** (interior + leaf node
+> pages) whose node layout and **size-driven split/merge** are a §8 byte contract
+> ([../fileformat/format.md](../fileformat/format.md)). The block seam (§2) is real: a commit
+> writes individual pages in place / appends, rather than rewriting the whole file.
 >
-> The **host API** ([api.md](api.md)) makes whole-image durability crash-safe at the file
-> level with a temp-file + `fsync` + atomic `rename` + directory `fsync` sequence (since a
-> commit rewrites the entire file, rename gives all-or-nothing replacement for free). The
-> double-meta slots above remain the hook for the future *incremental in-place* commit; they
-> are not needed for whole-image durability. `commit` is **explicit** and `close` does not
-> auto-flush (api.md §2).
+> **Still deferred** (later Phase-6 items, none foreclosed): free-list / page **reclamation**
+> (P6.2 — P6.1 *leaks* the pages an old root no longer references, so the file grows on every
+> commit; gated on the §8 watermark when it lands), demand paging / a bounded buffer pool,
+> overflow pages for over-large values (P6.1 caps a single row at `C/2` → `0A000`), and
+> compression. The whole-image `to_image` survives as the **from-scratch** serializer used by
+> `create`'s initial write and the golden fixtures (the special case where every node is
+> dirty); the live commit path is the incremental one.
+>
+> The **host API** ([api.md](api.md)): the durability recipe is now a **dirty-page write +
+> alternate-meta-slot publish + `fsync`** (replacing the step-5b temp-file + atomic-`rename`
+> whole-file swap, which only worked because the whole file was rewritten). Atomicity comes
+> from the meta-slot alternation + the checksum + the write ordering, exactly as this section
+> describes. `commit` is **explicit** and `close` does not auto-flush (api.md §2).
 
 **The root swap, in two backings (transactions.md).** The §3 staging buffer + atomic publish
 this section describes is realized in [transactions.md](transactions.md): the writer's
 pending set is an **immutable in-memory `Snapshot`** (a working root built from the committed
 root via a persistent, structurally-shared ordered map), and the "root-pointer swap" of step
 3 is **the in-memory `Snapshot` swap in Phase 5** and **the meta-page root pointer in Phase
-6** — the same atomic publish, two backings. Phase 5 keeps durability whole-image (the recipe
-above, behind the §2 block seam); Phase 6 replaces only the materialization with incremental
-copy-on-write — write the dirty pages the new root introduced, `sync`, publish the alternate
-meta slot, `sync` — under a **frozen** transaction API. Because the in-memory store is already
-a copy-on-write B-tree (transactions.md §3), Phase 6's "B-tree interior pages" and "incremental
-COW commit" (§6 below) become one slice: page-backing the tree that already exists.
+6** — the same atomic publish, two backings. P6.1 realized the Phase-6 backing: the in-memory
+store was already a copy-on-write B-tree (transactions.md §3), so "B-tree interior pages" and
+"incremental COW commit" collapsed into **one slice — page-backing the tree that already
+exists**. Each in-memory node carries an on-disk page id; copy-on-write leaves the new path
+nodes without one (dirty); commit writes exactly those, assigns them appended pages, rewrites
+the small catalog chain, and publishes the alternate meta slot. The transaction API is
+unchanged (frozen) across the switch — only the materialization moved from whole-image to
+dirty-page-only.
 
 ## 5. Pluggability (keep the door open — CLAUDE.md §9)
 
@@ -161,22 +170,24 @@ sits so the options stay open (CLAUDE.md §9).
 
 ## 6. Open / deferred
 
-- **On-disk byte format** — ✅ **authored** (step-5b) in [../fileformat/format.md](../fileformat/format.md):
-  magic/version, double-buffered meta with a checksum, catalog + data page chains, record
-  layout, value codec, byte-exact fixtures, and the cross-core golden round-trip (a file
-  written by Rust is byte-identical to one written by Go — CLAUDE.md §8). This doc fixes the
-  *model*; that fixes the *bytes*. **Whole-image** form for now (see the §4 status note).
-- **Incremental commit (COW path, free-list, page reclamation, B-tree interior pages)** —
-  still deferred. `UPDATE`/`DELETE` have **landed** (step 6) on the whole-image store: a
-  mutation is applied in memory and the next serialize rewrites the full image, so nothing
-  yet *requires* incremental copy-on-write or free-list reclamation — they remain a later
-  slice once write volume makes full-image rewrites costly. The data page layout is a
-  simple sorted-record chain, not yet a B-tree. (`DELETE` does free in-memory rows; the
-  no-PK rowid is a **monotonic counter**, reconstructed on load as `max key + 1`, so a
-  freed rowid is never reissued — see [../fileformat/format.md](../fileformat/format.md).)
-- **Within-page structure** — currently variable-length records packed greedily into the
-  page payload (a record stores its key + each column's value). Slotted pages / a B-tree
-  leaf layout arrive with the incremental commit path.
+- **On-disk byte format** — ✅ **authored** in [../fileformat/format.md](../fileformat/format.md):
+  magic/version, double-buffered meta with a checksum, the relocatable catalog chain, the
+  **per-table page-backed B-tree** (interior + leaf nodes), the size-driven split/merge byte
+  contract, record layout, value codec, byte-exact fixtures, and the cross-core golden
+  round-trip (CLAUDE.md §8). This doc fixes the *model*; that fixes the *bytes*. **`format_version`
+  2** (page-backed; the step-5b whole-image v1 is a clean break, not read).
+- **Incremental commit (COW path, B-tree interior pages)** — ✅ **landed (P6.1).** A commit
+  writes only the dirty path of the copy-on-write B-tree + the rewritten catalog to fresh
+  appended pages, then publishes the alternate meta slot (§4 status note). The no-PK rowid is
+  a **monotonic counter**, reconstructed on load as `max key + 1`.
+- **Free-list / page reclamation** — still deferred (**P6.2**). P6.1 *leaks* the pages an old
+  root no longer references (the file grows on every commit); reclamation reuses them, gated
+  on the oldest-live-snapshot watermark (transactions.md §8): a page freed at `txid T` is
+  reusable only once `oldest_live_txid > T`.
+- **Within-page structure** — variable-length records packed contiguously into a B-tree node
+  page (a record stores its key + each column's value); an interior node prefixes its records
+  with `N+1` child pointers. Slotted-page layout (intra-page free space, in-place updates) is
+  a later refinement; P6.1 rewrites a whole node page when it changes.
 - **Crash-recovery story** — the meta double-buffer (§4) gives atomic commit; whether a
   separate WAL is ever added is deferred (the copy-on-write + root-swap model does not
   require one for atomicity).

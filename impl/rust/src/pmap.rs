@@ -1,70 +1,114 @@
-//! Persistent (copy-on-write) ordered map — the in-memory store primitive
-//! (decision **B1**, spec/design/transactions.md §3).
+//! Persistent (copy-on-write) ordered map — the page-backed B-tree (decision **B1**,
+//! spec/design/transactions.md §3; spec/fileformat/format.md "The per-table data B-tree").
 //!
 //! Keyed by the encoded key bytes (`Vec<u8>`, whose `Ord` is lexicographic = the
-//! order-preserving key encoding's memcmp contract, spec/design/encoding.md). Every
-//! mutation returns a **new** map that shares structure with the old one — the old root
-//! is provably unchanged — so a snapshot is an O(1) `Arc` clone and a commit is a pointer
-//! swap (transactions.md §2). The concrete shape is a **copy-on-write B-tree**: the
-//! in-memory precursor of the Phase-6 on-disk B-tree, chosen so that page-backing it later
-//! is an additive change rather than a rebuild (transactions.md §3, TODO Phase 6).
+//! order-preserving key encoding's memcmp contract, spec/design/encoding.md). Every mutation
+//! returns a **new** map that shares structure with the old one — the old root is provably
+//! unchanged — so a snapshot is an O(1) `Arc` clone and a commit is a pointer swap
+//! (transactions.md §2).
 //!
-//! Only the **iteration order** is a cross-core contract this slice; the in-RAM node
-//! structure (fan-out, split points) is a private detail (transactions.md §3) — it becomes
-//! a byte contract only at Phase 6 when the tree is the on-disk format.
+//! **This is the on-disk B-tree, node-for-page (Phase 6, P6.1).** Its fan-out is **size-driven**:
+//! a node holds as many entries as fit a page payload `cap` (= `page_size − 12`) and **splits when
+//! it would overflow** — so the node boundaries, and therefore the serialized bytes, are a §8 byte
+//! contract (format.md). The caller supplies each entry's on-disk **weight** (its record size) so
+//! this map can sum payloads without knowing the value codec; `cap` is passed per call (it is a
+//! property of the database's page size, held by the [`crate::storage::TableStore`]).
 //!
-//! Boring and explicit (CLAUDE.md §10): one `Node` type (a leaf has no children), recursive
-//! insert with split-on-overflow, recursive delete via in-order-successor replacement.
-//! **Delete does not rebalance** this slice (a leaf may end underfull or empty) — correct
-//! for search and iteration; balance-on-delete is a deferred hardening (it never affects the
-//! logical contents or order, only node occupancy).
+//! Each [`Node`] also carries a set-once on-disk **page id** (`0` = dirty/unpersisted): an
+//! incremental commit writes only the dirty nodes a mutation introduced (format.rs / file.rs).
+//! Copy-on-write builds every new node dirty; a node persisted once is never rewritten while it
+//! stays shared. `AtomicU32` keeps the shared tree `Send + Sync` (P5.3b) under a relaxed set-once
+//! store — the node is otherwise immutable.
+//!
+//! Boring and explicit (CLAUDE.md §10): one `Node` type (a leaf has no children), recursive insert
+//! with split-on-overflow, recursive delete via in-order-predecessor replacement and
+//! **merge-then-maybe-split** rebalancing (no borrow — merge subsumes it; format.md "Delete").
 
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 use crate::storage::Row;
 
-/// Minimum degree `t`: every node holds between `t-1` and `2t-1` keys (the root may hold
-/// fewer). A node overflows at `2t` keys and is split. The value is a private tuning knob —
-/// it changes only the in-RAM shape, never the observable order (transactions.md §3).
-const T: usize = 16;
-const MAX_KEYS: usize = 2 * T - 1;
-
-/// One B-tree node. `children` is empty for a leaf; otherwise `children.len() ==
-/// keys.len() + 1`. `keys.len() == vals.len()` always. Nodes are shared behind `Arc`, so a
-/// mutation clones only the root→leaf path and shares every untouched subtree.
-struct Node {
-    keys: Vec<Vec<u8>>,
-    vals: Vec<Row>,
-    children: Vec<Arc<Node>>,
+/// One B-tree node. `children` is empty for a leaf; otherwise `children.len() == keys.len() + 1`.
+/// `keys.len() == vals.len() == weights.len()` always. `weights[i]` is entry `i`'s on-disk record
+/// size (format.md), used only for the size-driven split/merge decisions. Nodes are shared behind
+/// `Arc`; a mutation clones only the root→leaf path and shares every untouched subtree.
+pub(crate) struct Node {
+    pub(crate) keys: Vec<Vec<u8>>,
+    pub(crate) vals: Vec<Row>,
+    pub(crate) weights: Vec<u32>,
+    pub(crate) children: Vec<Arc<Node>>,
+    /// On-disk page index, or `0` when dirty (never persisted / changed since). Set once at the
+    /// commit that first persists this node; page 0 is a meta slot, never a node. Carried now so
+    /// the incremental dirty-page commit (P6.1 part B, storage.md §4) is a pure add — until then
+    /// the whole-image `to_image` ignores it.
+    #[allow(dead_code)]
+    pub(crate) page: AtomicU32,
 }
 
 impl Node {
-    fn is_leaf(&self) -> bool {
+    /// A fresh **dirty** node (page `0`) — every copy-on-write rebuild goes through here.
+    fn new(keys: Vec<Vec<u8>>, vals: Vec<Row>, weights: Vec<u32>, children: Vec<Arc<Node>>) -> Arc<Node> {
+        Arc::new(Node {
+            keys,
+            vals,
+            weights,
+            children,
+            page: AtomicU32::new(0),
+        })
+    }
+
+    /// A node reconstructed from disk at `page` (format.rs `from_image`), already persisted.
+    pub(crate) fn loaded(
+        keys: Vec<Vec<u8>>,
+        vals: Vec<Row>,
+        weights: Vec<u32>,
+        children: Vec<Arc<Node>>,
+        page: u32,
+    ) -> Arc<Node> {
+        Arc::new(Node {
+            keys,
+            vals,
+            weights,
+            children,
+            page: AtomicU32::new(page),
+        })
+    }
+
+    pub(crate) fn is_leaf(&self) -> bool {
         self.children.is_empty()
     }
 
-    /// Binary-search this node's keys: `Ok(i)` if `key` sits at index `i`, else `Err(i)` for
-    /// the child/insertion slot. `Vec<u8>::cmp` is lexicographic (memcmp) — the key contract.
+    /// This node's serialized payload size (format.md): `Σ weights` plus, for an interior node,
+    /// `4·(N+1)` for its child pointers.
+    fn payload(&self) -> usize {
+        let entries: usize = self.weights.iter().map(|&w| w as usize).sum();
+        entries + if self.is_leaf() { 0 } else { 4 * self.children.len() }
+    }
+
+    /// Binary-search this node's keys: `Ok(i)` if `key` sits at index `i`, else `Err(i)` for the
+    /// child/insertion slot. `Vec<u8>::cmp` is lexicographic (memcmp) — the key contract.
     fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
         self.keys.binary_search_by(|k| k.as_slice().cmp(key))
     }
 }
 
-/// The result of inserting into a subtree: either the rebuilt subtree, or a node that
-/// overflowed and split into `left`, a median `(key,val)` to promote, and `right`.
+/// The result of inserting into a subtree: either the rebuilt subtree, or a node that overflowed
+/// and split into `left`, a median `(key, val, weight)` to promote, and `right`.
 enum Ins {
     Whole(Arc<Node>),
     Split {
         left: Arc<Node>,
         key: Vec<u8>,
         val: Row,
+        weight: u32,
         right: Arc<Node>,
     },
 }
 
-/// A persistent ordered map from encoded key to [`Row`]. `Clone` is O(1) (an `Arc` bump on
-/// the root plus a length copy) and yields an independent snapshot: mutating the clone leaves
-/// this map untouched.
+/// A persistent ordered map from encoded key to [`Row`]. `Clone` is O(1) (an `Arc` bump on the root
+/// plus a length copy) and yields an independent snapshot: mutating the clone leaves this map
+/// untouched.
 #[derive(Clone, Default)]
 pub struct PMap {
     root: Option<Arc<Node>>,
@@ -84,6 +128,16 @@ impl PMap {
         self.len == 0
     }
 
+    /// The root node, for the serializer (format.rs). `None` for an empty map.
+    pub(crate) fn root(&self) -> Option<&Arc<Node>> {
+        self.root.as_ref()
+    }
+
+    /// Reconstruct a map from a loaded root (format.rs `from_image`).
+    pub(crate) fn from_loaded(root: Option<Arc<Node>>, len: usize) -> Self {
+        PMap { root, len }
+    }
+
     /// Look up the row at `key`, or `None`.
     pub fn get(&self, key: &[u8]) -> Option<&Row> {
         let mut node = self.root.as_deref()?;
@@ -100,24 +154,23 @@ impl PMap {
         }
     }
 
-    /// Insert or overwrite `key`. Returns the previous row if `key` was present (an
-    /// overwrite), else `None` (a new insert, which grows `len`).
-    pub fn insert(&mut self, key: Vec<u8>, val: Row) -> Option<Row> {
+    /// Insert or overwrite `key` with `val` (whose on-disk record size is `weight`); `cap` is the
+    /// page payload capacity. Returns the previous row if `key` was present (an overwrite), else
+    /// `None` (a new insert, which grows `len`). An overwrite can change the weight, so it too may
+    /// overflow and split.
+    pub fn insert(&mut self, key: Vec<u8>, val: Row, weight: u32, cap: usize) -> Option<Row> {
         let mut old = None;
         let new_root = match &self.root {
-            None => Node::leaf(vec![key], vec![val]),
-            Some(root) => match node_insert(root, key, val, &mut old) {
+            None => Node::new(vec![key], vec![val], vec![weight], Vec::new()),
+            Some(root) => match node_insert(root, key, val, weight, &mut old, cap) {
                 Ins::Whole(n) => n,
                 Ins::Split {
                     left,
                     key,
                     val,
+                    weight,
                     right,
-                } => Arc::new(Node {
-                    keys: vec![key],
-                    vals: vec![val],
-                    children: vec![left, right],
-                }),
+                } => Node::new(vec![key], vec![val], vec![weight], vec![left, right]),
             },
         };
         self.root = Some(new_root);
@@ -128,12 +181,13 @@ impl PMap {
     }
 
     /// Remove `key`. Returns the removed row, or `None` if absent (then `self` is unchanged).
-    pub fn remove(&mut self, key: &[u8]) -> Option<Row> {
+    pub fn remove(&mut self, key: &[u8], cap: usize) -> Option<Row> {
         let root = self.root.as_ref()?;
-        let (new_root, removed) = node_remove(root, key);
+        let (new_root, removed) = node_remove(root, key, cap);
         if removed.is_some() {
-            // The root may have drained to zero keys: an empty leaf becomes the empty map; an
-            // empty internal node (one child) hands the root down a level (height shrinks).
+            // The root may have drained to zero keys: an empty leaf becomes the empty map; an empty
+            // internal node (one child) hands the root down a level (height shrinks). The root is
+            // exempt from the underfull rule, so no rebalance here.
             self.root = if new_root.keys.is_empty() {
                 if new_root.is_leaf() {
                     None
@@ -148,9 +202,9 @@ impl PMap {
         removed
     }
 
-    /// Iterate `(key, row)` pairs in ascending key order. Eagerly walks the tree into a
-    /// vector of borrows (the cost contract charges per row in the executor loop, not here —
-    /// spec/design/cost.md), so laziness is unobservable and a deferred optimization.
+    /// Iterate `(key, row)` pairs in ascending key order. Eagerly walks the tree into a vector of
+    /// borrows (the cost contract charges per row in the executor loop, not here — cost.md), so
+    /// laziness is unobservable and a deferred optimization.
     pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Row)> + '_ {
         let mut out = Vec::with_capacity(self.len);
         if let Some(root) = &self.root {
@@ -160,62 +214,113 @@ impl PMap {
     }
 }
 
-impl Node {
-    fn leaf(keys: Vec<Vec<u8>>, vals: Vec<Row>) -> Arc<Node> {
-        Arc::new(Node {
-            keys,
-            vals,
-            children: Vec::new(),
-        })
+/// Build a node from its parts; if its payload overflows `cap`, split it 2-way and promote one
+/// median. The split point `m = min(largest m in [1,N-1] with leftpayload(m) ≤ cap, N-2)` always
+/// yields two non-empty, fitting halves under the `RECORD_MAX = (cap-12)/2` cap (format.md "Why the
+/// record cap"). `children` empty ⇒ leaf.
+fn build(keys: Vec<Vec<u8>>, vals: Vec<Row>, weights: Vec<u32>, children: Vec<Arc<Node>>, cap: usize) -> Ins {
+    let interior = !children.is_empty();
+    let payload: usize =
+        weights.iter().map(|&w| w as usize).sum::<usize>() + if interior { 4 * children.len() } else { 0 };
+    // Under `RECORD_MAX = (cap-12)/2` a node with ≤ 2 keys never overflows (format.md), so a node
+    // that overflows here always has ≥ 3 keys and splits cleanly. The `< 3` guard is purely
+    // defensive against an oversized record (one larger than `RECORD_MAX`): it leaves the node
+    // whole rather than splitting an unsplittable one — the oversize is then surfaced as `0A000`
+    // when the node is serialized (format.rs), matching the v1 behaviour.
+    if payload <= cap || keys.len() < 3 {
+        return Ins::Whole(Node::new(keys, vals, weights, children));
+    }
+
+    let n = keys.len();
+    // largest m in [1, n-1] with leftpayload(m) ≤ cap
+    let mut best = 1usize;
+    let mut prefix = 0usize;
+    for m in 1..n {
+        prefix += weights[m - 1] as usize;
+        let lp = if interior { 4 * (m + 1) } else { 0 } + prefix;
+        if lp <= cap {
+            best = m;
+        }
+    }
+    let m = best.min(n - 2).max(1);
+
+    let mut keys = keys;
+    let mut vals = vals;
+    let mut weights = weights;
+    let mut children = children;
+    let rkeys = keys.split_off(m + 1);
+    let mkey = keys.pop().unwrap();
+    let rvals = vals.split_off(m + 1);
+    let mval = vals.pop().unwrap();
+    let rweights = weights.split_off(m + 1);
+    let mweight = weights.pop().unwrap();
+    let (lchildren, rchildren) = if interior {
+        let rc = children.split_off(m + 1);
+        (children, rc)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    Ins::Split {
+        left: Node::new(keys, vals, weights, lchildren),
+        key: mkey,
+        val: mval,
+        weight: mweight,
+        right: Node::new(rkeys, rvals, rweights, rchildren),
     }
 }
 
-/// Recursive insert. On overwrite, sets `*old` and rebuilds the path with the value
-/// replaced (no count change, so never splits). On a new key, inserts into the target leaf
-/// and splits overflowing nodes back up the path.
-fn node_insert(node: &Arc<Node>, key: Vec<u8>, val: Row, old: &mut Option<Row>) -> Ins {
+/// Recursive insert. On overwrite, sets `*old` and rebuilds with the value+weight replaced (which
+/// may now overflow). On a new key, inserts into the target leaf and splits overflowing nodes back
+/// up the path.
+fn node_insert(node: &Arc<Node>, key: Vec<u8>, val: Row, weight: u32, old: &mut Option<Row>, cap: usize) -> Ins {
     match node.search(&key) {
         Ok(i) => {
             let mut vals = node.vals.clone();
             *old = Some(std::mem::replace(&mut vals[i], val));
-            Ins::Whole(Arc::new(Node {
-                keys: node.keys.clone(),
-                vals,
-                children: node.children.clone(),
-            }))
+            let mut weights = node.weights.clone();
+            weights[i] = weight;
+            build(node.keys.clone(), vals, weights, node.children.clone(), cap)
         }
         Err(i) => {
             if node.is_leaf() {
                 let mut keys = node.keys.clone();
                 let mut vals = node.vals.clone();
+                let mut weights = node.weights.clone();
                 keys.insert(i, key);
                 vals.insert(i, val);
-                split_if_needed(keys, vals, Vec::new())
+                weights.insert(i, weight);
+                build(keys, vals, weights, Vec::new(), cap)
             } else {
-                match node_insert(&node.children[i], key, val, old) {
+                match node_insert(&node.children[i], key, val, weight, old, cap) {
                     Ins::Whole(c) => {
+                        // This node's separators are unchanged, so it cannot overflow — rebuild whole.
                         let mut children = node.children.clone();
                         children[i] = c;
-                        Ins::Whole(Arc::new(Node {
-                            keys: node.keys.clone(),
-                            vals: node.vals.clone(),
+                        Ins::Whole(Node::new(
+                            node.keys.clone(),
+                            node.vals.clone(),
+                            node.weights.clone(),
                             children,
-                        }))
+                        ))
                     }
                     Ins::Split {
                         left,
                         key: mk,
                         val: mv,
+                        weight: mw,
                         right,
                     } => {
                         let mut keys = node.keys.clone();
                         let mut vals = node.vals.clone();
+                        let mut weights = node.weights.clone();
                         let mut children = node.children.clone();
                         keys.insert(i, mk);
                         vals.insert(i, mv);
+                        weights.insert(i, mw);
                         children[i] = left;
                         children.insert(i + 1, right);
-                        split_if_needed(keys, vals, children)
+                        build(keys, vals, weights, children, cap)
                     }
                 }
             }
@@ -223,72 +328,14 @@ fn node_insert(node: &Arc<Node>, key: Vec<u8>, val: Row, old: &mut Option<Row>) 
     }
 }
 
-/// Build a node from `keys`/`vals`/`children`; if it overflows (`> 2t-1` keys), split it at
-/// the midpoint and promote the median. `children` empty ⇒ leaf. The split point is
-/// `keys.len()/2` — deterministic, and (being in-RAM only) free to choose (transactions.md §3).
-fn split_if_needed(
-    mut keys: Vec<Vec<u8>>,
-    mut vals: Vec<Row>,
-    mut children: Vec<Arc<Node>>,
-) -> Ins {
-    if keys.len() <= MAX_KEYS {
-        return Ins::Whole(Arc::new(Node {
-            keys,
-            vals,
-            children,
-        }));
-    }
-    let mid = keys.len() / 2;
-    let leaf = children.is_empty();
-
-    // `split_off(mid+1)` leaves the left half plus the median; `pop` lifts the median out.
-    let rkeys = keys.split_off(mid + 1);
-    let mkey = keys.pop().unwrap();
-    let rvals = vals.split_off(mid + 1);
-    let mval = vals.pop().unwrap();
-
-    let (lchildren, rchildren) = if leaf {
-        (Vec::new(), Vec::new())
-    } else {
-        let rc = children.split_off(mid + 1);
-        (children, rc)
-    };
-
-    Ins::Split {
-        left: Arc::new(Node {
-            keys,
-            vals,
-            children: lchildren,
-        }),
-        key: mkey,
-        val: mval,
-        right: Arc::new(Node {
-            keys: rkeys,
-            vals: rvals,
-            children: rchildren,
-        }),
-    }
+/// A non-root node is **underfull** when its payload is below half a page (`cap/2`), the threshold
+/// at which delete rebalances it (format.md "Delete"). The root is exempt.
+fn underfull(node: &Node, cap: usize) -> bool {
+    node.payload() < cap / 2
 }
 
-/// Minimum keys a non-root node may hold. A node "can spare" a key when it holds strictly
-/// more, so handing one to a sibling still leaves it valid.
-const MIN_KEYS: usize = T - 1;
-
-fn can_spare(node: &Node) -> bool {
-    node.keys.len() > MIN_KEYS
-}
-
-/// The leftmost (smallest) `(key, val)` of a subtree — its in-order successor entry.
-fn min_kv(node: &Arc<Node>) -> (Vec<u8>, Row) {
-    let mut n = node;
-    while !n.is_leaf() {
-        n = &n.children[0];
-    }
-    (n.keys[0].clone(), n.vals[0].clone())
-}
-
-/// The rightmost (largest) `(key, val)` of a subtree — its in-order predecessor entry.
-fn max_kv(node: &Arc<Node>) -> (Vec<u8>, Row) {
+/// The rightmost `(key, val, weight)` of a subtree — its in-order predecessor entry.
+fn max_kv(node: &Arc<Node>) -> (Vec<u8>, Row, u32) {
     let mut n = node;
     while !n.is_leaf() {
         n = n.children.last().unwrap();
@@ -296,202 +343,119 @@ fn max_kv(node: &Arc<Node>) -> (Vec<u8>, Row) {
     (
         n.keys.last().unwrap().clone(),
         n.vals.last().unwrap().clone(),
+        *n.weights.last().unwrap(),
     )
 }
 
-/// Recursive delete (Cormen's B-tree deletion, copy-on-write). Returns the rebuilt subtree
-/// and the removed row (or `None` if absent). Maintains the invariant that any node it
-/// descends into holds at least `T` keys, so the deletion can never underflow it — a key in
-/// an internal node is replaced by a predecessor/successor drawn from a child that can spare
-/// one (else the two children and the separator are merged first). This rebalancing is what
-/// keeps every leaf non-empty, so [`min_kv`]/[`max_kv`] are always well-defined.
-fn node_remove(node: &Arc<Node>, key: &[u8]) -> (Arc<Node>, Option<Row>) {
+/// Recursive delete (copy-on-write). Returns the rebuilt subtree (possibly underfull — the caller
+/// rebalances it) and the removed row (or `None` if absent). A separator found in an interior node
+/// is replaced by its in-order **predecessor** (drawn from the left subtree), which is then deleted
+/// from that subtree; the touched child is rebalanced via [`rebalance_child`].
+fn node_remove(node: &Arc<Node>, key: &[u8], cap: usize) -> (Arc<Node>, Option<Row>) {
     match node.search(key) {
         Ok(i) => {
             if node.is_leaf() {
                 let mut keys = node.keys.clone();
                 let mut vals = node.vals.clone();
+                let mut weights = node.weights.clone();
                 keys.remove(i);
                 let removed = vals.remove(i);
-                (Node::leaf(keys, vals), Some(removed))
+                weights.remove(i);
+                (Node::new(keys, vals, weights, Vec::new()), Some(removed))
             } else {
                 let removed = node.vals[i].clone();
-                if can_spare(&node.children[i]) {
-                    // Replace with the predecessor, then delete it from the left subtree.
-                    let (pk, pv) = max_kv(&node.children[i]);
-                    let (new_child, _) = node_remove(&node.children[i], &pk);
-                    let mut keys = node.keys.clone();
-                    let mut vals = node.vals.clone();
-                    let mut children = node.children.clone();
-                    keys[i] = pk;
-                    vals[i] = pv;
-                    children[i] = new_child;
-                    (rebuild(keys, vals, children), Some(removed))
-                } else if can_spare(&node.children[i + 1]) {
-                    // Replace with the successor, then delete it from the right subtree.
-                    let (sk, sv) = min_kv(&node.children[i + 1]);
-                    let (new_child, _) = node_remove(&node.children[i + 1], &sk);
-                    let mut keys = node.keys.clone();
-                    let mut vals = node.vals.clone();
-                    let mut children = node.children.clone();
-                    keys[i] = sk;
-                    vals[i] = sv;
-                    children[i + 1] = new_child;
-                    (rebuild(keys, vals, children), Some(removed))
-                } else {
-                    // Both children are minimal: merge them around the separator, then delete.
-                    let parent = merge_at(node, i);
-                    let (new_parent, _) = finish_descend(parent, i, key);
-                    (new_parent, Some(removed))
-                }
+                let (pk, pv, pw) = max_kv(&node.children[i]);
+                let (new_child, _) = node_remove(&node.children[i], &pk, cap);
+                let mut keys = node.keys.clone();
+                let mut vals = node.vals.clone();
+                let mut weights = node.weights.clone();
+                let mut children = node.children.clone();
+                keys[i] = pk;
+                vals[i] = pv;
+                weights[i] = pw;
+                children[i] = new_child;
+                let rebuilt = Node::new(keys, vals, weights, children);
+                (rebalance_child(&rebuilt, i, cap), Some(removed))
             }
         }
         Err(i) => {
             if node.is_leaf() {
                 (node.clone(), None)
             } else {
-                descend_remove(node, i, key)
+                let (new_child, removed) = node_remove(&node.children[i], key, cap);
+                if removed.is_none() {
+                    return (node.clone(), None);
+                }
+                let mut children = node.children.clone();
+                children[i] = new_child;
+                let rebuilt = Node::new(node.keys.clone(), node.vals.clone(), node.weights.clone(), children);
+                (rebalance_child(&rebuilt, i, cap), removed)
             }
         }
     }
 }
 
-/// Descend into child `i` to delete `key`, first ensuring that child holds at least `T` keys
-/// — borrow one from an adjacent sibling that can spare it, else merge with a sibling (which
-/// shrinks this node by one key and one child).
-fn descend_remove(node: &Arc<Node>, i: usize, key: &[u8]) -> (Arc<Node>, Option<Row>) {
-    if node.children[i].keys.len() >= T {
-        finish_descend(node.clone(), i, key)
-    } else if i > 0 && can_spare(&node.children[i - 1]) {
-        finish_descend(borrow_from_left(node, i), i, key)
-    } else if i + 1 < node.children.len() && can_spare(&node.children[i + 1]) {
-        finish_descend(borrow_from_right(node, i), i, key)
-    } else if i > 0 {
-        // Merge with the left sibling; the merged child lands at i-1.
-        finish_descend(merge_at(node, i - 1), i - 1, key)
-    } else {
-        // Merge with the right sibling; the merged child stays at i.
-        finish_descend(merge_at(node, i), i, key)
+/// If `node.children[i]` is underfull, merge it with an adjacent sibling (prefer the right one),
+/// then split the merged node back if it overflows — the unified rebalance (no borrow). Returns the
+/// rebuilt parent (which may itself have lost a key and become underfull — its own parent handles
+/// that as the recursion unwinds).
+fn rebalance_child(node: &Arc<Node>, i: usize, cap: usize) -> Arc<Node> {
+    if !underfull(&node.children[i], cap) {
+        return node.clone();
     }
+    let j = if i + 1 < node.children.len() { i } else { i - 1 };
+    merge_at(node, j, cap)
 }
 
-/// Recurse into child `i` (now guaranteed `>= T` keys) and splice the result back in.
-fn finish_descend(node: Arc<Node>, i: usize, key: &[u8]) -> (Arc<Node>, Option<Row>) {
-    let (new_child, removed) = node_remove(&node.children[i], key);
-    if removed.is_none() {
-        return (node, None);
-    }
-    let mut children = node.children.clone();
-    children[i] = new_child;
-    (
-        rebuild(node.keys.clone(), node.vals.clone(), children),
-        removed,
-    )
-}
-
-/// Child `i` borrows a key from its left sibling, rotating through separator `i-1`.
-fn borrow_from_left(node: &Arc<Node>, i: usize) -> Arc<Node> {
-    let left = &node.children[i - 1];
-    let cur = &node.children[i];
-
-    let mut lkeys = left.keys.clone();
-    let mut lvals = left.vals.clone();
-    let mut lchildren = left.children.clone();
-    let up_key = lkeys.pop().unwrap();
-    let up_val = lvals.pop().unwrap();
-    let moved = if left.is_leaf() {
-        None
-    } else {
-        lchildren.pop()
-    };
-
-    let mut ckeys = cur.keys.clone();
-    let mut cvals = cur.vals.clone();
-    let mut cchildren = cur.children.clone();
-    ckeys.insert(0, node.keys[i - 1].clone());
-    cvals.insert(0, node.vals[i - 1].clone());
-    if let Some(c) = moved {
-        cchildren.insert(0, c);
-    }
-
-    let mut keys = node.keys.clone();
-    let mut vals = node.vals.clone();
-    let mut children = node.children.clone();
-    keys[i - 1] = up_key;
-    vals[i - 1] = up_val;
-    children[i - 1] = rebuild(lkeys, lvals, lchildren);
-    children[i] = rebuild(ckeys, cvals, cchildren);
-    rebuild(keys, vals, children)
-}
-
-/// Child `i` borrows a key from its right sibling, rotating through separator `i`.
-fn borrow_from_right(node: &Arc<Node>, i: usize) -> Arc<Node> {
-    let cur = &node.children[i];
-    let right = &node.children[i + 1];
-
-    let mut rkeys = right.keys.clone();
-    let mut rvals = right.vals.clone();
-    let mut rchildren = right.children.clone();
-    let up_key = rkeys.remove(0);
-    let up_val = rvals.remove(0);
-    let moved = if right.is_leaf() {
-        None
-    } else {
-        Some(rchildren.remove(0))
-    };
-
-    let mut ckeys = cur.keys.clone();
-    let mut cvals = cur.vals.clone();
-    let mut cchildren = cur.children.clone();
-    ckeys.push(node.keys[i].clone());
-    cvals.push(node.vals[i].clone());
-    if let Some(c) = moved {
-        cchildren.push(c);
-    }
-
-    let mut keys = node.keys.clone();
-    let mut vals = node.vals.clone();
-    let mut children = node.children.clone();
-    keys[i] = up_key;
-    vals[i] = up_val;
-    children[i] = rebuild(ckeys, cvals, cchildren);
-    children[i + 1] = rebuild(rkeys, rvals, rchildren);
-    rebuild(keys, vals, children)
-}
-
-/// Merge `children[i]`, separator `i`, and `children[i+1]` into one node (`2t-1` keys), and
-/// remove the separator and the now-absorbed right child from this node.
-fn merge_at(node: &Arc<Node>, i: usize) -> Arc<Node> {
-    let left = &node.children[i];
-    let right = &node.children[i + 1];
+/// Merge `children[j]`, separator `j`, and `children[j+1]` into one node `M`. If `M` fits, it
+/// replaces the pair and the parent loses separator `j` and child `j+1`. If `M` overflows, it is
+/// split 2-way and the two halves + the new separator replace the pair (the parent's key count is
+/// unchanged). `M < 2·cap` always (format.md), so a single split restores fit.
+fn merge_at(node: &Arc<Node>, j: usize, cap: usize) -> Arc<Node> {
+    let left = &node.children[j];
+    let right = &node.children[j + 1];
 
     let mut mkeys = left.keys.clone();
     let mut mvals = left.vals.clone();
-    let mut mchildren = left.children.clone();
-    mkeys.push(node.keys[i].clone());
-    mvals.push(node.vals[i].clone());
+    let mut mweights = left.weights.clone();
+    mkeys.push(node.keys[j].clone());
+    mvals.push(node.vals[j].clone());
+    mweights.push(node.weights[j]);
     mkeys.extend(right.keys.iter().cloned());
     mvals.extend(right.vals.iter().cloned());
+    mweights.extend(right.weights.iter().copied());
+    let mut mchildren = left.children.clone();
     mchildren.extend(right.children.iter().cloned());
-    let merged = rebuild(mkeys, mvals, mchildren);
 
     let mut keys = node.keys.clone();
     let mut vals = node.vals.clone();
+    let mut weights = node.weights.clone();
     let mut children = node.children.clone();
-    keys.remove(i);
-    vals.remove(i);
-    children[i] = merged;
-    children.remove(i + 1);
-    rebuild(keys, vals, children)
-}
 
-/// Allocate a node from its parts (leaf iff `children` is empty).
-fn rebuild(keys: Vec<Vec<u8>>, vals: Vec<Row>, children: Vec<Arc<Node>>) -> Arc<Node> {
-    Arc::new(Node {
-        keys,
-        vals,
-        children,
-    })
+    match build(mkeys, mvals, mweights, mchildren, cap) {
+        Ins::Whole(merged) => {
+            keys.remove(j);
+            vals.remove(j);
+            weights.remove(j);
+            children[j] = merged;
+            children.remove(j + 1);
+            Node::new(keys, vals, weights, children)
+        }
+        Ins::Split {
+            left,
+            key,
+            val,
+            weight,
+            right,
+        } => {
+            keys[j] = key;
+            vals[j] = val;
+            weights[j] = weight;
+            children[j] = left;
+            children[j + 1] = right;
+            Node::new(keys, vals, weights, children)
+        }
+    }
 }
 
 /// In-order walk: child[0], key[0], child[1], key[1], …, key[n-1], child[n].
@@ -514,6 +478,10 @@ mod tests {
     use super::*;
     use crate::value::Value;
 
+    // A small page cap so a few-thousand-entry map is several levels deep — exercises split,
+    // merge-then-split, root growth and collapse (the in-RAM analog of page_size 256).
+    const CAP: usize = 244;
+
     fn row(n: i64) -> Row {
         vec![Value::Int(n)]
     }
@@ -522,8 +490,12 @@ mod tests {
         n.to_be_bytes().to_vec()
     }
 
-    /// A deterministic permutation of `0..n` (an LCG-driven shuffle) — no wall-clock / RNG, so
-    /// the test is reproducible (CLAUDE.md §10).
+    /// A realistic per-entry weight: 8-byte key + a ~5-byte int value record ≈ 15 bytes, so a
+    /// 244-byte node holds ~16 entries before splitting (well under RECORD_MAX = (244-12)/2 = 116).
+    const W: u32 = 15;
+
+    /// A deterministic permutation of `0..n` (an LCG-driven shuffle) — no wall-clock / RNG, so the
+    /// test is reproducible (CLAUDE.md §10).
     fn shuffled(n: u64) -> Vec<u64> {
         let mut v: Vec<u64> = (0..n).collect();
         let mut state: u64 = 0x9e3779b97f4a7c15;
@@ -537,6 +509,28 @@ mod tests {
         v
     }
 
+    /// Every node (except the root) must fit a page and stay non-empty — the structural invariant
+    /// the byte contract relies on (format.md). Checked over the whole tree.
+    fn check_invariants(pm: &PMap) {
+        fn walk(node: &Node, is_root: bool, cap: usize) {
+            assert!(!node.keys.is_empty() || is_root, "non-root node is empty");
+            assert_eq!(node.keys.len(), node.vals.len());
+            assert_eq!(node.keys.len(), node.weights.len());
+            if !node.is_leaf() {
+                assert_eq!(node.children.len(), node.keys.len() + 1, "interior child count");
+            }
+            let payload: usize =
+                node.weights.iter().map(|&w| w as usize).sum::<usize>() + if node.is_leaf() { 0 } else { 4 * node.children.len() };
+            assert!(payload <= cap, "node payload {payload} exceeds cap {cap}");
+            for c in &node.children {
+                walk(c, false, cap);
+            }
+        }
+        if let Some(root) = &pm.root {
+            walk(root, true, CAP);
+        }
+    }
+
     #[test]
     fn insert_get_remove_against_reference() {
         use std::collections::BTreeMap;
@@ -545,57 +539,55 @@ mod tests {
         let n = 4000;
 
         for k in shuffled(n) {
-            assert_eq!(
-                pm.insert(key(k), row(k as i64)),
-                bt.insert(key(k), row(k as i64))
-            );
+            assert_eq!(pm.insert(key(k), row(k as i64), W, CAP), bt.insert(key(k), row(k as i64)));
         }
         assert_eq!(pm.len(), bt.len());
+        check_invariants(&pm);
         for k in 0..n {
             assert_eq!(pm.get(&key(k)), bt.get(&key(k)));
         }
-        // Iteration is in ascending key order and matches the reference exactly.
         let got: Vec<_> = pm.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let want: Vec<_> = bt.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         assert_eq!(got, want);
 
-        // Overwrite returns the old value and does not change len (kept in sync with the
-        // reference so the remove loop below still matches).
+        // Overwrite returns the old value and does not change len.
         let before = pm.len();
-        assert_eq!(pm.insert(key(7), row(777)), bt.insert(key(7), row(777)));
+        assert_eq!(pm.insert(key(7), row(777), W, CAP), bt.insert(key(7), row(777)));
         assert_eq!(pm.len(), before);
         assert_eq!(pm.get(&key(7)), Some(&row(777)));
 
-        for k in shuffled(n) {
-            assert_eq!(pm.remove(&key(k)), bt.remove(&key(k)));
+        // Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
+        for (step, k) in shuffled(n).into_iter().enumerate() {
+            assert_eq!(pm.remove(&key(k), CAP), bt.remove(&key(k)));
+            if step % 257 == 0 {
+                check_invariants(&pm);
+            }
         }
         assert!(pm.is_empty());
         assert_eq!(pm.iter().count(), 0);
-        assert_eq!(pm.remove(&key(123)), None);
+        assert_eq!(pm.remove(&key(123), CAP), None);
     }
 
     #[test]
     fn clone_is_an_independent_snapshot() {
-        // Build a base big enough to be several levels deep.
         let mut base = PMap::new();
         for k in 0..2000 {
-            base.insert(key(k), row(k as i64));
+            base.insert(key(k), row(k as i64), W, CAP);
         }
         let snap = base.clone();
 
-        // Mutate the clone heavily; the snapshot must be byte-for-byte unchanged.
         let mut other = base.clone();
         for k in 0..2000 {
-            other.insert(key(k), row(-(k as i64))); // overwrite every value
+            other.insert(key(k), row(-(k as i64)), W, CAP); // overwrite every value
         }
         for k in 2000..3000 {
-            other.insert(key(k), row(k as i64)); // and grow it
+            other.insert(key(k), row(k as i64), W, CAP); // and grow it
         }
         for k in 0..500 {
-            other.remove(&key(k)); // and shrink it
+            other.remove(&key(k), CAP); // and shrink it
         }
 
-        // `snap` still sees the original contents.
+        // `snap` still sees the original contents, untouched.
         assert_eq!(snap.len(), 2000);
         for k in 0..2000 {
             assert_eq!(snap.get(&key(k)), Some(&row(k as i64)));
@@ -604,12 +596,13 @@ mod tests {
         assert_eq!(snap_rows.len(), 2000);
         assert_eq!(snap_rows[0], (key(0), row(0)));
         assert_eq!(snap_rows[1999], (key(1999), row(1999)));
+        check_invariants(&snap);
 
-        // `other` reflects all of its own edits.
         assert_eq!(other.len(), 2500);
         assert_eq!(other.get(&key(0)), None);
         assert_eq!(other.get(&key(1000)), Some(&row(-1000)));
         assert_eq!(other.get(&key(2500)), Some(&row(2500)));
+        check_invariants(&other);
     }
 
     #[test]
@@ -617,11 +610,31 @@ mod tests {
         let mut pm = PMap::new();
         assert!(pm.is_empty());
         assert_eq!(pm.get(&key(1)), None);
-        assert_eq!(pm.remove(&key(1)), None);
-        assert_eq!(pm.insert(key(1), row(1)), None);
+        assert_eq!(pm.remove(&key(1), CAP), None);
+        assert_eq!(pm.insert(key(1), row(1), W, CAP), None);
         assert_eq!(pm.get(&key(1)), Some(&row(1)));
-        assert_eq!(pm.remove(&key(1)), Some(row(1)));
+        assert_eq!(pm.remove(&key(1), CAP), Some(row(1)));
         assert!(pm.is_empty());
         assert!(pm.root.is_none());
+    }
+
+    /// Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and
+    /// the non-empty-halves guarantee. With weight 110 (≤ 116 cap), a node holds ~2 entries.
+    #[test]
+    fn wide_values_keep_nodes_valid() {
+        use std::collections::BTreeMap;
+        let mut pm = PMap::new();
+        let mut bt: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
+        for k in shuffled(300) {
+            pm.insert(key(k), row(k as i64), 110, CAP);
+            bt.insert(key(k), row(k as i64));
+            check_invariants(&pm);
+        }
+        for k in shuffled(300) {
+            pm.remove(&key(k), CAP);
+            bt.remove(&key(k));
+            check_invariants(&pm);
+        }
+        assert!(pm.is_empty());
     }
 }

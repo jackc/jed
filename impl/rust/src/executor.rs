@@ -111,10 +111,15 @@ impl Snapshot {
             .map(|s| s.iter_in_key_order().cloned().collect())
     }
 
-    /// Register a new table and its (empty) store. Lower-cased name is the key.
-    pub(crate) fn put_table(&mut self, table: Table) {
+    /// Register a new table and its (empty) store. Lower-cased name is the key. The store carries
+    /// the page payload `cap` (= `page_size − 12`) and the column types so the page-backed B-tree
+    /// can weigh records for its size-driven split (spec/fileformat/format.md).
+    pub(crate) fn put_table(&mut self, table: Table, page_size: u32) {
         let key = table.name.to_ascii_lowercase();
-        self.stores.insert(key.clone(), TableStore::new());
+        let cap = page_size as usize - 12; // PAGE_HEADER
+        let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
+        self.stores
+            .insert(key.clone(), TableStore::new(cap, col_types));
         self.tables.insert(key, table);
     }
 
@@ -175,11 +180,19 @@ impl Default for Database {
 
 impl Database {
     pub fn new() -> Self {
+        Database::with_page_size(DEFAULT_PAGE_SIZE)
+    }
+
+    /// An in-memory handle that serializes at `page_size`. The page-backed B-tree's fan-out tracks
+    /// the page size (spec/fileformat/format.md), so the in-memory tree must be built at the size it
+    /// will serialize to — this builds fixtures / tests a non-default page size; a normal in-memory
+    /// database uses [`Database::new`] (the default page size).
+    pub fn with_page_size(page_size: u32) -> Self {
         Database {
             committed: Snapshot::default(),
             tx: None,
             path: None,
-            page_size: DEFAULT_PAGE_SIZE,
+            page_size,
         }
     }
 
@@ -275,7 +288,8 @@ impl Database {
     /// Register a new table and its (empty) store in the working snapshot (DDL is transactional —
     /// transactions.md §4.5).
     pub(crate) fn put_table(&mut self, table: Table) {
-        self.working_mut().put_table(table);
+        let ps = self.page_size;
+        self.working_mut().put_table(table, ps);
     }
 
     /// Execute one parsed statement with no bind parameters.

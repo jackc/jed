@@ -6,26 +6,32 @@
 //! so a file written by this core is byte-identical to one written by the Go core
 //! (CLAUDE.md §8). All multi-byte integers are big-endian.
 
+use std::sync::Arc;
+
 use crate::catalog::{Column, Table};
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{Database, Snapshot};
+use crate::pmap::Node;
 use crate::storage::Row;
 use crate::types::{DecimalTypmod, ScalarType};
 use crate::value::Value;
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version.
-const FORMAT_VERSION: u16 = 1;
-/// Bytes of the page header on catalog / data pages.
+/// On-disk format version — 2 = page-backed copy-on-write B-tree (Phase 6, P6.1).
+const FORMAT_VERSION: u16 = 2;
+/// Bytes of the page header on catalog / B-tree pages.
 const PAGE_HEADER: usize = 12;
 /// `page_type` for a catalog page.
 const PAGE_CATALOG: u8 = 1;
-/// `page_type` for a data page.
-const PAGE_DATA: u8 = 2;
-/// Catalog root page index (pages 0,1 are the meta slots).
+/// `page_type` for a B-tree leaf node.
+const PAGE_LEAF: u8 = 2;
+/// `page_type` for a B-tree interior node.
+const PAGE_INTERIOR: u8 = 3;
+/// Catalog root page index of a *fresh empty* database (pages 0,1 are the meta slots). The catalog
+/// root is **relocatable** thereafter — a reader follows `meta.root_page`, never assumes `2`.
 const ROOT_PAGE: u32 = 2;
 
 /// Stable on-disk type code for a scalar type — independent of the in-memory enum
@@ -135,14 +141,29 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
     }
 }
 
+/// The on-disk size of a record (`key_len(u16) | key | each column value`) — the **weight** the
+/// page-backed B-tree splits on (spec/fileformat/format.md). It must equal the length
+/// `encode_record` produces, so the in-memory node boundaries match the serialized page boundaries;
+/// computed directly from the value codec to keep the two in lockstep.
+pub(crate) fn record_size(col_types: &[ScalarType], key: &[u8], row: &Row) -> usize {
+    let mut n = 2 + key.len();
+    for (ty, v) in col_types.iter().zip(row.iter()) {
+        n += encode_value(*ty, v).len();
+    }
+    n
+}
+
 fn corrupt(msg: &str) -> EngineError {
     EngineError::new(SqlState::DataCorrupted, msg)
 }
 
 impl Snapshot {
-    /// Serialize this snapshot's whole state to a single on-disk image
-    /// (spec/fileformat/format.md). `page_size` is recorded in the meta page;
-    /// `txid` is the commit counter written into both meta slots.
+    /// Serialize this snapshot's whole state to a single, clean **from-scratch** on-disk image
+    /// (spec/fileformat/format.md, *Allocation & incremental commit*): every table's B-tree is
+    /// laid out post-order from page 2, then the catalog chain, then both meta slots at `txid`.
+    /// This is the special case where every node is dirty — the golden fixtures pin it, and it
+    /// backs `create`'s initial image and (this slice) whole-image commit. (Incremental dirty-page
+    /// commit reuses `serialize_node` but writes only the dirty path; storage.md §4.)
     pub fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
         let ps = page_size as usize;
         if ps < PAGE_HEADER + 36 {
@@ -157,52 +178,42 @@ impl Snapshot {
         let mut tables = self.catalog_and_stores();
         tables.sort_by(|a, b| a.0.cmp(b.0));
 
-        // Per-table record bytes, in key order.
-        let mut records: Vec<Vec<Vec<u8>>> = Vec::with_capacity(tables.len());
-        for (_, table, store) in &tables {
-            let recs = store
-                .iter_entries()
-                .map(|(key, row)| encode_record(table, key, row))
-                .collect();
-            records.push(recs);
+        // Serialize each table's B-tree post-order, body pages allocated from page 2. Each entry
+        // is `(index, page_type, item_count, payload)`; children precede their parent so parent
+        // child-pointers reference already-allocated pages (format.md).
+        let mut body: Vec<(u32, u8, u32, Vec<u8>)> = Vec::new();
+        let mut root_data_page = vec![0u32; tables.len()];
+        let mut next_index = ROOT_PAGE;
+        for (ti, (_, table, store)) in tables.iter().enumerate() {
+            if let Some(root) = store.tree_root() {
+                root_data_page[ti] = serialize_node(root, table, cap, &mut next_index, &mut body)?;
+            }
         }
 
-        // Catalog page grouping depends only on entry sizes, which are independent of
-        // root_data_page values — so group once, fill values later.
+        // The catalog chain follows the data; its head is the relocatable `root_page`.
+        let cat_root = next_index;
         let entry_sizes: Vec<usize> = tables
             .iter()
             .map(|(_, t, _)| table_entry_bytes(t, 0).len())
             .collect();
         let cat_groups = pack(&entry_sizes, cap)?;
-        let num_cat_pages = cat_groups.len() as u32;
-
-        // Assign data page chains after the catalog; record each table's root page.
-        let mut next_index = ROOT_PAGE + num_cat_pages;
-        let mut root_data_page = vec![0u32; tables.len()];
-        let mut data_groups: Vec<Vec<Vec<usize>>> = Vec::with_capacity(tables.len());
-        for (ti, recs) in records.iter().enumerate() {
-            if recs.is_empty() {
-                data_groups.push(Vec::new());
-                continue;
-            }
-            let sizes: Vec<usize> = recs.iter().map(Vec::len).collect();
-            let groups = pack(&sizes, cap)?;
-            root_data_page[ti] = next_index;
-            next_index += groups.len() as u32;
-            data_groups.push(groups);
-        }
-        let page_count = next_index;
+        let page_count = cat_root + cat_groups.len() as u32;
 
         let mut image = vec![0u8; page_count as usize * ps];
 
-        // Meta: both slots hold the current meta (a fresh whole-image commit has no
-        // distinct prior version — spec/fileformat/format.md).
-        write_meta(&mut image, ps, 0, page_size, txid, ROOT_PAGE, page_count);
-        write_meta(&mut image, ps, 1, page_size, txid, ROOT_PAGE, page_count);
+        // Meta: both slots hold the current meta (a fresh from-scratch image has no distinct prior
+        // version; slot alternation is the live incremental-commit path — format.md).
+        write_meta(&mut image, ps, 0, page_size, txid, cat_root, page_count);
+        write_meta(&mut image, ps, 1, page_size, txid, cat_root, page_count);
 
-        // Catalog pages.
+        // B-tree node pages.
+        for (index, page_type, item_count, payload) in &body {
+            write_page(&mut image, ps, *index, *page_type, *item_count, 0, payload);
+        }
+
+        // Catalog chain.
         for (gi, group) in cat_groups.iter().enumerate() {
-            let index = ROOT_PAGE + gi as u32;
+            let index = cat_root + gi as u32;
             let next = if gi + 1 < cat_groups.len() {
                 index + 1
             } else {
@@ -223,29 +234,50 @@ impl Snapshot {
             );
         }
 
-        // Data pages, one chain per non-empty table.
-        for (ti, groups) in data_groups.iter().enumerate() {
-            for (gi, group) in groups.iter().enumerate() {
-                let index = root_data_page[ti] + gi as u32;
-                let next = if gi + 1 < groups.len() { index + 1 } else { 0 };
-                let mut payload = Vec::new();
-                for &ri in group {
-                    payload.extend_from_slice(&records[ti][ri]);
-                }
-                write_page(
-                    &mut image,
-                    ps,
-                    index,
-                    PAGE_DATA,
-                    group.len() as u32,
-                    next,
-                    &payload,
-                );
-            }
-        }
-
         Ok(image)
     }
+}
+
+/// Serialize one B-tree node and its subtree post-order, appending `(index, page_type, item_count,
+/// payload)` for each node to `body` and returning this node's assigned page index. A leaf's payload
+/// is its records; an interior's payload is its `N+1` child pointers (big-endian `u32`) then its `N`
+/// records (format.md). A node whose payload would exceed the page is an oversized record (one over
+/// `RECORD_MAX`) — `feature_not_supported` (`0A000`), matching the v1 oversized-item rule.
+fn serialize_node(
+    node: &Arc<Node>,
+    table: &Table,
+    cap: usize,
+    next_index: &mut u32,
+    body: &mut Vec<(u32, u8, u32, Vec<u8>)>,
+) -> Result<u32> {
+    let mut child_pages = Vec::with_capacity(node.children.len());
+    for child in &node.children {
+        child_pages.push(serialize_node(child, table, cap, next_index, body)?);
+    }
+    let index = *next_index;
+    *next_index += 1;
+
+    let n = node.keys.len() as u32;
+    let mut payload = Vec::new();
+    let page_type = if node.children.is_empty() {
+        PAGE_LEAF
+    } else {
+        for &cp in &child_pages {
+            payload.extend_from_slice(&cp.to_be_bytes());
+        }
+        PAGE_INTERIOR
+    };
+    for i in 0..node.keys.len() {
+        payload.extend_from_slice(&encode_record(table, &node.keys[i], &node.vals[i]));
+    }
+    if payload.len() > cap {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "a record larger than the per-row limit is not supported",
+        ));
+    }
+    body.push((index, page_type, n, payload));
+    Ok(index)
 }
 
 impl Database {
@@ -285,16 +317,23 @@ impl Database {
                 let name = table.name.clone();
                 let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
                 let has_pk = table.primary_key_index().is_some();
-                snap.put_table(table);
-                read_data_chain(
-                    image,
-                    page_size,
-                    root_data_page,
-                    &col_types,
-                    has_pk,
-                    &name,
-                    &mut snap,
-                )?;
+                snap.put_table(table, page_size as u32);
+                if root_data_page != 0 {
+                    let (root, len) = read_tree(image, page_size, root_data_page, &col_types)?;
+                    let store = snap.store_mut(&name);
+                    store.set_tree(Some(root), len);
+                    // No-PK keys are synthetic int64 rowids — advance the counter past the largest
+                    // (the last entry in key order) so future inserts don't collide.
+                    if !has_pk {
+                        let max = store
+                            .iter_entries()
+                            .last()
+                            .map(|(k, _)| decode_int(ScalarType::Int64, k));
+                        if let Some(m) = max {
+                            store.bump_rowid_to(m + 1);
+                        }
+                    }
+                }
             }
             cat_page = page.next_page;
         }
@@ -305,40 +344,51 @@ impl Database {
     }
 }
 
-/// Read every record in a table's data-page chain into the store under `name`. For a
-/// table with no primary key, the keys are synthetic int64 rowids; advance the
-/// store's rowid counter past the largest so future inserts don't collide with a
-/// loaded key (spec/fileformat/format.md). No format change — keys are stored
-/// verbatim.
-fn read_data_chain(
-    image: &[u8],
-    ps: usize,
-    root_data_page: u32,
-    col_types: &[ScalarType],
-    has_pk: bool,
-    name: &str,
-    snap: &mut Snapshot,
-) -> Result<()> {
-    let mut dp = root_data_page;
-    while dp != 0 {
-        let page = read_page(image, ps, dp)?;
-        if page.page_type != PAGE_DATA {
-            return Err(corrupt("expected a data page"));
-        }
-        let mut pos = 0usize;
-        for _ in 0..page.item_count {
-            let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
-            if !has_pk && key.len() == ScalarType::Int64.width_bytes() {
-                snap.store_mut(name)
-                    .bump_rowid_to(decode_int(ScalarType::Int64, &key) + 1);
+/// Read a table's on-disk B-tree (rooted at `page_idx`) into an in-memory tree, returning the root
+/// node and the total row count (spec/fileformat/format.md). An interior node's payload is its
+/// `N+1` child pointers then its `N` records; we recurse the pointers, then read the separators.
+/// Weights are recomputed from the value codec (the exact size the writer used), so the loaded tree
+/// is ready for further size-driven splits.
+fn read_tree(image: &[u8], ps: usize, page_idx: u32, col_types: &[ScalarType]) -> Result<(Arc<Node>, usize)> {
+    let page = read_page(image, ps, page_idx)?;
+    match page.page_type {
+        PAGE_LEAF => {
+            let n = page.item_count as usize;
+            let (mut keys, mut vals, mut weights) =
+                (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+            let mut pos = 0usize;
+            for _ in 0..n {
+                let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
+                weights.push(record_size(col_types, &key, &row) as u32);
+                keys.push(key);
+                vals.push(row);
             }
-            if !snap.store_mut(name).insert(key, row) {
-                return Err(corrupt("duplicate key in data page"));
-            }
+            Ok((Node::loaded(keys, vals, weights, Vec::new(), page_idx), n))
         }
-        dp = page.next_page;
+        PAGE_INTERIOR => {
+            let n = page.item_count as usize;
+            let mut pos = 0usize;
+            let mut children = Vec::with_capacity(n + 1);
+            let mut total = 0usize;
+            for _ in 0..=n {
+                let cp = read_u32(page.payload, &mut pos)?;
+                let (child, clen) = read_tree(image, ps, cp, col_types)?;
+                children.push(child);
+                total += clen;
+            }
+            let (mut keys, mut vals, mut weights) =
+                (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+            for _ in 0..n {
+                let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
+                weights.push(record_size(col_types, &key, &row) as u32);
+                keys.push(key);
+                vals.push(row);
+            }
+            total += n;
+            Ok((Node::loaded(keys, vals, weights, children, page_idx), total))
+        }
+        _ => Err(corrupt("expected a B-tree node page")),
     }
-    Ok(())
 }
 
 /// One record's bytes: `key_len(u16) | key | payload(each column value)`.
