@@ -6,11 +6,12 @@
 //! block seam below pwrites pages into the open file rather than rewriting it.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{DEFAULT_PAGE_SIZE, Database, Snapshot};
+use crate::pager::Pager;
 
 /// Settings for a newly-created database file (spec/design/api.md §2). `page_size` is fixed
 /// into the file's meta at creation and cannot change thereafter.
@@ -44,6 +45,14 @@ impl Database {
         db.page_size = opts.page_size;
         db.committed.txid = 1; // the initial empty image is committed as txid 1
         db.write_full_image()?; // lay down the from-scratch image; later commits are incremental
+        // Adopt the just-written file as the open pager, so later commits write through the seam
+        // without re-opening (spec/design/pager.md, P6.4a).
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(io_error)?;
+        db.pager = Some(Pager::from_file(file)?);
         Ok(db)
     }
 
@@ -52,8 +61,11 @@ impl Database {
     /// is `XX001`, a read failure `58030` (api.md §2).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Database> {
         let path = path.as_ref();
-        let bytes = match fs::read(path) {
-            Ok(b) => b,
+        // Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the
+        // load reads pages through the pager (P6.4a routes the whole-image load via `read_all`; the
+        // tree is still fully built — no residency change), and later commits write through it.
+        let file = match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(EngineError::new(
                     SqlState::UndefinedFile,
@@ -62,8 +74,11 @@ impl Database {
             }
             Err(e) => return Err(io_error(e)),
         };
+        let mut pager = Pager::from_file(file)?;
+        let bytes = pager.read_all()?;
         let mut db = Database::from_image(&bytes)?;
         db.path = Some(path.to_path_buf());
+        db.pager = Some(pager);
         Ok(db)
     }
 
@@ -93,30 +108,23 @@ impl Database {
     /// after both syncs succeed, so a write failure leaves `self`, `committed`, and the file's prior
     /// meta untouched (the working snapshot is then discarded). The `synchronous=off` mode gates here.
     pub(crate) fn persist(&mut self, snap: &Snapshot) -> Result<()> {
-        let path = match &self.path {
-            None => return Ok(()),
-            Some(p) => p.clone(),
-        };
+        // An in-memory database has no pager — a no-op success (the committed swap happens in
+        // `commit_tx` after this returns Ok). Compute the dirty-page set + meta before borrowing
+        // the pager (so `self.free_pages`/`page_size`/`page_count` are read first).
+        if self.pager.is_none() {
+            return Ok(());
+        }
         let free = self.free_pages.clone();
         let write = snap.incremental_image(self.page_size, self.page_count, &free)?;
-        let ps = self.page_size as u64;
-        let mut f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(io_error)?;
-        for (index, bytes) in &write.pages {
-            f.seek(SeekFrom::Start(*index as u64 * ps))
-                .map_err(io_error)?;
-            f.write_all(bytes).map_err(io_error)?;
-        }
-        f.sync_all().map_err(io_error)?; // body pages durable before the meta can reference them
         let meta =
             crate::format::meta_page(self.page_size, snap.txid, write.root_page, write.page_count);
-        f.seek(SeekFrom::Start((snap.txid & 1) * ps))
-            .map_err(io_error)?;
-        f.write_all(&meta).map_err(io_error)?;
-        f.sync_all().map_err(io_error)?; // the commit is published
+        let pager = self.pager.as_mut().expect("pager present");
+        for (index, bytes) in &write.pages {
+            pager.write_block(*index, bytes)?;
+        }
+        pager.sync()?; // body pages durable before the meta can reference them
+        pager.write_block((snap.txid & 1) as u32, &meta)?;
+        pager.sync()?; // the commit is published
         self.page_count = write.page_count;
         self.free_pages = write.free_remaining;
         Ok(())
@@ -145,6 +153,7 @@ impl Database {
     pub fn close(mut self) -> Result<()> {
         let _ = self.rollback_tx();
         self.path = None;
+        self.pager = None; // drop the open file (close it)
         Ok(())
     }
 }

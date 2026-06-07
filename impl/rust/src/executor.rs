@@ -169,6 +169,11 @@ pub struct Database {
     /// version, so it is reachable from no live snapshot and reuse is torn-write-safe. Empty for an
     /// in-memory database and for a freshly-created file (a from-scratch image leaks nothing).
     pub(crate) free_pages: Vec<u32>,
+    /// The block-device pager for a file-backed database — the open file kept for the handle's
+    /// life, through which the load and every commit read/write pages (spec/design/pager.md, P6.4a).
+    /// `None` for an in-memory database (`persist` is then a no-op); set by `open`/`create`, dropped
+    /// by `close`.
+    pub(crate) pager: Option<crate::pager::Pager>,
 }
 
 /// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
@@ -206,6 +211,7 @@ impl Database {
             page_size,
             page_count: 0,
             free_pages: Vec::new(),
+            pager: None,
         }
     }
 
@@ -222,6 +228,7 @@ impl Database {
             page_size: DEFAULT_PAGE_SIZE,
             page_count: 0,
             free_pages: Vec::new(),
+            pager: None,
         }
     }
 

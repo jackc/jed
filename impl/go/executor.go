@@ -125,6 +125,11 @@ type Database struct {
 	// reachable from no live snapshot and reuse is torn-write-safe. nil for an in-memory database and
 	// for a freshly-created file (a from-scratch image leaks nothing).
 	freePages []uint32
+	// pager is the block-device pager for a file-backed database — the open file kept for the
+	// handle's life, through which the load and every commit read/write pages (spec/design/pager.md,
+	// P6.4a). nil for an in-memory database (persist is then a no-op); set by Open/Create, dropped by
+	// Close.
+	pager *pager
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode

@@ -5,22 +5,13 @@
 // just the dirty pages, published by alternating the meta slot (spec/fileformat/format.md, P6.1 part
 // B) — the block seam below pwrites pages (writeSync at a position) into the open file.
 
-import {
-  closeSync,
-  existsSync,
-  fsyncSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-  writeSync,
-} from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { DEFAULT_PAGE_SIZE, Database, Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import { incrementalImage, loadDatabase, metaPage, toImage } from "./format.ts";
+import { Pager } from "./pager.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
@@ -39,6 +30,15 @@ export function create(path: string, opts: DatabaseOptions = {}): Database {
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
   db.persistHook = persistImpl; // publish each later commit incrementally (transactions.md §4.1/§9)
   writeFullImage(db); // lay down the from-scratch image; later commits are incremental
+  // Adopt the just-written file as the open pager, so later commits write through the seam without
+  // re-opening (spec/design/pager.md, P6.4a).
+  let fd: number;
+  try {
+    fd = openSync(path, "r+");
+  } catch (e) {
+    throw ioError(e);
+  }
+  db.pager = Pager.fromFd(fd); // the just-written file has a valid header
   return db;
 }
 
@@ -57,20 +57,30 @@ function writeFullImage(db: Database): void {
 // its page size / txid). The path must exist — 58P01 otherwise; a malformed file is XX001, a read
 // failure 58030 (api.md §2).
 export function open(path: string): Database {
-  let bytes: Uint8Array;
+  if (!existsSync(path)) {
+    throw engineError("undefined_file", "database file does not exist: " + path);
+  }
+  // Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the load
+  // reads pages through the pager (P6.4a routes the whole-image load via readAll; the tree is still
+  // fully built — no residency change), and later commits write through it.
+  let fd: number;
   try {
-    if (!existsSync(path)) {
-      throw engineError("undefined_file", "database file does not exist: " + path);
-    }
-    bytes = readFileSync(path);
+    fd = openSync(path, "r+");
   } catch (e) {
+    throw ioError(e);
+  }
+  try {
+    const pager = Pager.fromFd(fd);
+    const db = loadDatabase(pager.readAll());
+    db.path = path;
+    db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
+    db.pager = pager;
+    return db;
+  } catch (e) {
+    closeSync(fd); // a malformed file / read failure must not leak the fd
     if (e instanceof Error && e.name === "EngineError") throw e;
     throw ioError(e);
   }
-  const db = loadDatabase(bytes);
-  db.path = path;
-  db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
-  return db;
 }
 
 // persistImpl durably publishes snap to the backing file via an incremental copy-on-write commit
@@ -84,21 +94,16 @@ export function open(path: string): Database {
 // only after both fsyncs succeed, so a write failure leaves db, committed, and the file's prior meta
 // untouched (the working snapshot is then discarded). The future synchronous=off mode gates here.
 function persistImpl(db: Database, snap: Snapshot): void {
-  if (db.path === null) return;
+  // An in-memory database has no pager — a no-op success (committed swaps in commitTx after this).
+  if (db.pager === null) return;
   const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages);
-  const ps = db.pageSize;
-  const fd = openSync(db.path, "r+");
-  try {
-    for (const pg of write.pages) {
-      writeSync(fd, pg.bytes, 0, pg.bytes.length, pg.index * ps);
-    }
-    fsyncSync(fd); // body pages durable before the meta can reference them
-    const meta = metaPage(ps, snap.txid, write.rootPage, write.pageCount);
-    writeSync(fd, meta, 0, meta.length, Number(snap.txid & 1n) * ps);
-    fsyncSync(fd); // the commit is published
-  } finally {
-    closeSync(fd);
+  for (const pg of write.pages) {
+    db.pager.writeBlock(pg.index, pg.bytes);
   }
+  db.pager.sync(); // body pages durable before the meta can reference them
+  const meta = metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount);
+  db.pager.writeBlock(Number(snap.txid & 1n), meta);
+  db.pager.sync(); // the commit is published
   db.pageCount = write.pageCount;
   db.freePages = write.freeRemaining;
 }
@@ -125,6 +130,10 @@ export function rollback(db: Database): void {
 export function close(db: Database): void {
   db.rollbackTx();
   db.path = null;
+  if (db.pager !== null) {
+    db.pager.close(); // drop the open fd (close it)
+    db.pager = null;
+  }
 }
 
 // writeAtomic writes bytes to path crash-safely (spec/design/api.md §3): a sibling temp file,

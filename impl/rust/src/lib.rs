@@ -19,6 +19,7 @@ pub mod file;
 pub mod format;
 pub mod lexer;
 pub mod operators;
+pub mod pager;
 pub mod parser;
 pub mod pmap;
 pub mod shared;

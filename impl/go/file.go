@@ -42,6 +42,18 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 	if err := db.writeFullImage(); err != nil { // lay down the from-scratch image; later commits are incremental
 		return nil, err
 	}
+	// Adopt the just-written file as the open pager, so later commits write through the seam
+	// without re-opening (spec/design/pager.md, P6.4a).
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, ioError(err)
+	}
+	p, err := pagerFromFile(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	db.pager = p
 	return db, nil
 }
 
@@ -49,18 +61,33 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 // its page size / txid). The path must exist — 58P01 otherwise; a malformed file is XX001, a
 // read failure 58030 (api.md §2).
 func Open(path string) (*Database, error) {
-	bytes, err := os.ReadFile(path)
+	// Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the load
+	// reads pages through the pager (P6.4a routes the whole-image load via readAll; the tree is still
+	// fully built — no residency change), and later commits write through it.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, NewError(UndefinedFile, "database file does not exist: "+path)
 		}
 		return nil, ioError(err)
 	}
+	p, err := pagerFromFile(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	bytes, err := p.readAll()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
 	db, err := LoadDatabase(bytes)
 	if err != nil {
+		_ = f.Close()
 		return nil, err
 	}
 	db.path = path
+	db.pager = p
 	return db, nil
 }
 
@@ -92,33 +119,29 @@ func (db *Database) writeFullImage() error {
 // file's prior meta untouched (the working snapshot is then discarded). The future synchronous=off mode
 // gates here.
 func (db *Database) persist(snap *Snapshot) error {
-	if db.path == "" {
+	// An in-memory database has no pager — a no-op success (the committed swap happens in commitTx
+	// after this returns nil).
+	if db.pager == nil {
 		return nil
 	}
 	write, err := snap.incrementalImage(db.pageSize, db.pageCount, db.freePages)
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(db.path, os.O_RDWR, 0)
-	if err != nil {
-		return ioError(err)
-	}
-	defer func() { _ = f.Close() }()
-	ps := int64(db.pageSize)
 	for _, pg := range write.pages {
-		if _, err := f.WriteAt(pg.bytes, int64(pg.index)*ps); err != nil {
-			return ioError(err)
+		if err := db.pager.writeBlock(pg.index, pg.bytes); err != nil {
+			return err
 		}
 	}
-	if err := f.Sync(); err != nil { // body pages durable before the meta can reference them
-		return ioError(err)
+	if err := db.pager.sync(); err != nil { // body pages durable before the meta can reference them
+		return err
 	}
 	meta := metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount)
-	if _, err := f.WriteAt(meta, int64(snap.txid&1)*ps); err != nil {
-		return ioError(err)
+	if err := db.pager.writeBlock(uint32(snap.txid&1), meta); err != nil {
+		return err
 	}
-	if err := f.Sync(); err != nil { // the commit is published
-		return ioError(err)
+	if err := db.pager.sync(); err != nil { // the commit is published
+		return err
 	}
 	db.pageCount = write.pageCount
 	db.freePages = write.freeRemaining
@@ -149,6 +172,10 @@ func (db *Database) Rollback() error {
 func (db *Database) Close() error {
 	_, _ = db.rollbackTx()
 	db.path = ""
+	if db.pager != nil {
+		_ = db.pager.close() // drop the open file (close it)
+		db.pager = nil
+	}
 	return nil
 }
 
