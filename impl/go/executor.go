@@ -125,11 +125,12 @@ type Database struct {
 	// reachable from no live snapshot and reuse is torn-write-safe. nil for an in-memory database and
 	// for a freshly-created file (a from-scratch image leaks nothing).
 	freePages []uint32
-	// pager is the block-device pager for a file-backed database — the open file kept for the
-	// handle's life, through which the load and every commit read/write pages (spec/design/pager.md,
-	// P6.4a). nil for an in-memory database (persist is then a no-op); set by Open/Create, dropped by
-	// Close.
-	pager *pager
+	// paging is the shared paging context for a file-backed database (spec/design/pager.md): the open
+	// pager (kept for the handle's life) + the bounded leaf buffer pool, shared with every table store
+	// so reads fault OnDisk leaves through the one pool. The load reads pages through it and every
+	// commit writes through it. nil for an in-memory database (persist is then a no-op); set by
+	// Open/Create, dropped by Close.
+	paging *sharedPaging
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
@@ -663,7 +664,9 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk int, provided
 				return NewError(UniqueViolation,
 					"duplicate key value violates primary key uniqueness")
 			}
-			if _, exists := store.Get(key); exists {
+			if _, exists, err := store.Get(key); err != nil {
+				return err
+			} else if exists {
 				return NewError(UniqueViolation,
 					"duplicate key value violates primary key uniqueness")
 			}
@@ -680,7 +683,11 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk int, provided
 		if key == nil {
 			key = EncodeInt(Int64, store.AllocRowid())
 		}
-		if !store.Insert(key, pr.row) {
+		ok, err := store.Insert(key, pr.row)
+		if err != nil {
+			return err
+		}
+		if !ok {
 			panic("pre-validated INSERT key must be unique")
 		}
 	}
@@ -742,7 +749,11 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	// A full scan walks the table's whole B-tree: page_read per node (block, before the rows),
 	// then storage_row_read per row (spec/design/cost.md §3 "page_read").
 	meter.Charge(Costs.PageRead * int64(store.NodeCount()))
-	for _, e := range store.EntriesInKeyOrder() {
+	entries, err := store.EntriesInKeyOrder()
+	if err != nil {
+		return Outcome{}, err
+	}
+	for _, e := range entries {
 		meter.Charge(Costs.StorageRowRead)
 		matched := true
 		if filter != nil {
@@ -757,7 +768,9 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		}
 	}
 	for _, k := range keys {
-		store.Remove(k)
+		if _, err := store.Remove(k); err != nil {
+			return Outcome{}, err
+		}
 	}
 	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
 }
@@ -858,7 +871,11 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	// A full scan walks the table's whole B-tree: page_read per node (block, before the rows),
 	// then storage_row_read per row (spec/design/cost.md §3 "page_read").
 	meter.Charge(Costs.PageRead * int64(store.NodeCount()))
-	for _, e := range store.EntriesInKeyOrder() {
+	entries, err := store.EntriesInKeyOrder()
+	if err != nil {
+		return Outcome{}, err
+	}
+	for _, e := range entries {
 		meter.Charge(Costs.StorageRowRead)
 		if filter != nil {
 			v, err := filter.eval(e.Row, env, meter)
@@ -887,19 +904,27 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 
 	// Phase 2: apply (keys unchanged — a PK column can't be assigned).
 	for _, u := range updates {
-		store.Replace(u.key, u.row)
+		if err := store.Replace(u.key, u.row); err != nil {
+			return Outcome{}, err
+		}
 	}
 	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
 }
 
-// RowsInKeyOrder returns a table's rows in primary-key (encoded byte) order in the visible
-// snapshot, or nil if the table does not exist. Used by SELECT and by tests.
+// RowsInKeyOrder returns a table's rows in primary-key (encoded byte) order in the visible snapshot,
+// or nil if the table does not exist. A test/debug convenience — the SELECT path scans through
+// IterInKeyOrder directly (propagating fault errors); these callers are in-memory, where a scan never
+// faults, so the error is inert and panicking on it surfaces a genuine bug rather than hiding it.
 func (db *Database) RowsInKeyOrder(name string) []Row {
 	store, ok := db.readSnap().stores[strings.ToLower(name)]
 	if !ok {
 		return nil
 	}
-	return store.IterInKeyOrder()
+	rows, err := store.IterInKeyOrder()
+	if err != nil {
+		panic(err)
+	}
+	return rows
 }
 
 // selectResult is the full result of running a SELECT (runSelect): the output column names and
@@ -1478,8 +1503,12 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	for ri, rel := range plan.rels {
 		store := db.readSnap().store(rel.tableName)
 		meter.Charge(Costs.PageRead * int64(store.NodeCount()))
+		rows, err := store.IterInKeyOrder()
+		if err != nil {
+			return selectResult{}, err
+		}
 		var tableRows []Row
-		for _, row := range store.IterInKeyOrder() {
+		for _, row := range rows {
 			meter.Charge(Costs.StorageRowRead)
 			tableRows = append(tableRows, row)
 		}

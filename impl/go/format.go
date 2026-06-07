@@ -256,7 +256,14 @@ type bodyPage struct {
 func serializeNode(n *pnode, table *Table, capacity int, nextIndex uint32, body *[]bodyPage) (uint32, uint32, error) {
 	childPages := make([]uint32, len(n.children))
 	for i, c := range n.children {
-		cp, np, err := serializeNode(c, table, capacity, nextIndex, body)
+		// Whole-image serialize renumbers pages from scratch and runs only on a fully-resident
+		// in-memory database (create's empty image, the golden generator) — a paged file commits
+		// incrementally via serializeDirty. An OnDisk child would carry a page id from a different
+		// layout, so it must not appear here.
+		if c.node == nil {
+			panic("whole-image serialize hit an OnDisk leaf")
+		}
+		cp, np, err := serializeNode(c.node, table, capacity, nextIndex, body)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -401,7 +408,13 @@ func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, 
 	}
 	childPages := make([]uint32, len(n.children))
 	for i, c := range n.children {
-		cp, err := serializeDirty(c, table, capacity, ps, alloc, pages)
+		// A resident child recurses (dirty descendants get pages); an OnDisk child is a clean leaf
+		// already durable at its page — keep it, write nothing (the incremental-commit win).
+		if c.node == nil {
+			childPages[i] = c.page
+			continue
+		}
+		cp, err := serializeDirty(c.node, table, capacity, ps, alloc, pages)
 		if err != nil {
 			return 0, err
 		}
@@ -482,9 +495,13 @@ func LoadDatabase(image []byte) (*Database, error) {
 				store := snap.stores[strings.ToLower(name)]
 				store.setTree(root, length)
 				// No-PK keys are synthetic int64 rowids — advance the counter past the largest (the
-				// last entry in key order) so future inserts don't collide.
+				// last entry in key order) so future inserts don't collide. In-memory load (nil
+				// source) never faults, so the error is inert.
 				if !hasPK && length > 0 {
-					keys, _ := store.rows.inorder()
+					keys, _, err := store.rows.inorder(nil)
+					if err != nil {
+						return nil, err
+					}
 					store.BumpRowidTo(DecodeInt(Int64, keys[len(keys)-1]) + 1)
 				}
 			}
@@ -511,7 +528,184 @@ func LoadDatabase(image []byte) (*Database, error) {
 func collectNodePages(n *pnode, reached map[uint32]bool) {
 	reached[n.page] = true
 	for _, c := range n.children {
-		collectNodePages(c, reached)
+		// An OnDisk leaf contributes its page without being loaded — the free-list walk reuses the
+		// resident interior skeleton (pager.md §4); a resident child recurses.
+		if c.node != nil {
+			collectNodePages(c.node, reached)
+		} else {
+			reached[c.page] = true
+		}
+	}
+}
+
+// LoadDatabasePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
+// only the interior B-tree skeleton resident, leaving each leaf an OnDisk page faulted through the
+// bounded buffer pool on access — so the resident set is bounded by the pool, not the file size. The
+// inverse of an incremental commit, reading pages through pgr instead of a whole image.
+//
+// This slice reads every leaf page once (to count its rows for length and mark it reachable for the
+// free-list), then discards it — memory stays bounded (only the skeleton is retained), but open is
+// O(pages). Making open O(skeleton) needs a per-subtree row count in the format (a deferred follow-on,
+// pager.md §6); the residency win — a bounded resident set — already holds.
+func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
+	pageSize := int(pgr.pageSize)
+	if pageSize < pageHeader+36 {
+		return nil, NewError(DataCorrupted, "invalid page size")
+	}
+	paging := newSharedPaging(pgr, capacity)
+
+	// Select the live meta from slots 0 and 1 (highest valid txid; the lone valid slot on a torn
+	// write), read as individual blocks through the pager.
+	b0, err := pgr.readBlock(0)
+	if err != nil {
+		return nil, err
+	}
+	b1, err := pgr.readBlock(1)
+	if err != nil {
+		return nil, err
+	}
+	mt, ok := parseMeta(b0)
+	if mb, okb := parseMeta(b1); okb && (!ok || mb.txid > mt.txid) {
+		mt, ok = mb, true
+	}
+	if !ok {
+		return nil, NewError(DataCorrupted, "no valid meta page")
+	}
+
+	snap := newSnapshot()
+	snap.txid = mt.txid
+	// Reconstruct the free-list (P6.2) from the pages the skeleton load marks reachable — every
+	// interior node, plus each leaf's page id (recorded without retaining the leaf).
+	reached := make(map[uint32]bool)
+	catPage := mt.rootPage
+	for catPage != 0 {
+		reached[catPage] = true
+		block, err := pgr.readBlock(catPage)
+		if err != nil {
+			return nil, err
+		}
+		pg, err := parsePage(block)
+		if err != nil {
+			return nil, err
+		}
+		if pg.pageType != pageCatalog {
+			return nil, NewError(DataCorrupted, "expected a catalog page")
+		}
+		pos := 0
+		for i := uint32(0); i < pg.itemCount; i++ {
+			table, tableRoot, err := decodeTableEntry(pg.payload, &pos)
+			if err != nil {
+				return nil, err
+			}
+			colTypes := make([]ScalarType, len(table.Columns))
+			for j, c := range table.Columns {
+				colTypes[j] = c.Type
+			}
+			name := strings.ToLower(table.Name)
+			hasPK := table.PrimaryKeyIndex() >= 0
+			snap.putTable(table, uint32(pageSize))
+			store := snap.stores[name]
+			store.attachPaging(paging)
+			if tableRoot != 0 {
+				root, length, err := readSkeleton(paging, tableRoot, colTypes, reached)
+				if err != nil {
+					return nil, err
+				}
+				store.setTree(root, length)
+				if !hasPK && length > 0 {
+					// No-PK rowid reconstruction faults the leaves to find the largest key; only for
+					// keyless tables (most have a PK), bounded by the pool.
+					keys, _, err := store.rows.inorder(store.leafSrc())
+					if err != nil {
+						return nil, err
+					}
+					store.BumpRowidTo(DecodeInt(Int64, keys[len(keys)-1]) + 1)
+				}
+			}
+		}
+		catPage = pg.nextPage
+	}
+
+	db := NewDatabase()
+	db.pageSize = uint32(pageSize)
+	db.pageCount = mt.pageCount
+	for p := rootPage; p < mt.pageCount; p++ {
+		if !reached[p] {
+			db.freePages = append(db.freePages, p)
+		}
+	}
+	db.committed = snap
+	db.paging = paging
+	return db, nil
+}
+
+// readSkeleton reads a table's on-disk B-tree (rooted at rootPage) into a demand-paged skeleton:
+// interior nodes resident, each leaf left OnDisk. Returns the root node and the total row count. A
+// table whose root is itself a single leaf has no interior parent to hold an OnDisk reference, so the
+// root leaf is faulted resident (spec/design/pager.md §1/§4).
+func readSkeleton(paging *sharedPaging, root uint32, colTypes []ScalarType, reached map[uint32]bool) (*pnode, int, error) {
+	c, length, err := readSkeletonNode(paging, root, colTypes, reached)
+	if err != nil {
+		return nil, 0, err
+	}
+	if c.node != nil {
+		return c.node, length, nil
+	}
+	node, err := paging.faultLeaf(c.page, colTypes)
+	if err != nil {
+		return nil, 0, err
+	}
+	return node, length, nil
+}
+
+// readSkeletonNode reads one B-tree node through the pager, once: a leaf becomes an OnDisk childRef
+// (its rows counted from the header, then dropped — not retained); an interior node becomes a resident
+// childRef with its children resolved recursively. Returns the child reference and the subtree's row
+// count.
+func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ScalarType, reached map[uint32]bool) (childRef, int, error) {
+	reached[pageIdx] = true
+	block, err := paging.pgr.readBlock(pageIdx)
+	if err != nil {
+		return childRef{}, 0, err
+	}
+	pg, err := parsePage(block)
+	if err != nil {
+		return childRef{}, 0, err
+	}
+	switch pg.pageType {
+	case pageLeaf:
+		return onDiskRef(pageIdx), int(pg.itemCount), nil
+	case pageInterior:
+		n := int(pg.itemCount)
+		pos := 0
+		children := make([]childRef, 0, n+1)
+		total := 0
+		for i := 0; i < n+1; i++ {
+			cp, err := readU32(pg.payload, &pos)
+			if err != nil {
+				return childRef{}, 0, err
+			}
+			child, clen, err := readSkeletonNode(paging, cp, colTypes, reached)
+			if err != nil {
+				return childRef{}, 0, err
+			}
+			children = append(children, child)
+			total += clen
+		}
+		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
+		for i := 0; i < n; i++ {
+			key, row, err := decodeRecord(colTypes, pg.payload, &pos)
+			if err != nil {
+				return childRef{}, 0, err
+			}
+			weights = append(weights, uint32(recordSize(colTypes, key, row)))
+			keys = append(keys, key)
+			vals = append(vals, row)
+		}
+		total += n
+		return residentRef(&pnode{keys: keys, vals: vals, weights: weights, children: children, page: pageIdx}), total, nil
+	default:
+		return childRef{}, 0, NewError(DataCorrupted, "expected a B-tree node page")
 	}
 }
 
@@ -543,7 +737,7 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ScalarType) (*pno
 	case pageInterior:
 		n := int(pg.itemCount)
 		pos := 0
-		children := make([]*pnode, 0, n+1)
+		children := make([]childRef, 0, n+1)
 		total := 0
 		for i := 0; i < n+1; i++ {
 			cp, err := readU32(pg.payload, &pos)
@@ -554,7 +748,9 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ScalarType) (*pno
 			if err != nil {
 				return nil, 0, err
 			}
-			children = append(children, child)
+			// The in-memory load is fully resident (no pager to fault from); the demand-paged file
+			// load (LoadDatabasePaged) is a separate path that leaves leaf children OnDisk.
+			children = append(children, residentRef(child))
 			total += clen
 		}
 		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
@@ -711,7 +907,32 @@ type meta struct {
 	pageCount uint32
 }
 
-// readMeta validates one meta slot; ok=false if it is not a valid meta.
+// parseMeta validates a standalone meta block; ok=false if it is not a valid meta. Shared by readMeta
+// (whole image) and the demand-paged loader (which reads meta slots 0/1 as individual blocks).
+func parseMeta(m []byte) (meta, bool) {
+	if len(m) < 36 {
+		return meta{}, false
+	}
+	if !bytes.Equal(m[0:4], magic[:]) {
+		return meta{}, false
+	}
+	if binary.BigEndian.Uint16(m[4:6]) != formatVersion {
+		return meta{}, false
+	}
+	if m[6] != 0 || m[7] != 0 || m[28] != 0 || m[29] != 0 || m[30] != 0 || m[31] != 0 {
+		return meta{}, false
+	}
+	if crc32IEEE(m[0:32]) != binary.BigEndian.Uint32(m[32:36]) {
+		return meta{}, false
+	}
+	return meta{
+		txid:      binary.BigEndian.Uint64(m[12:20]),
+		rootPage:  binary.BigEndian.Uint32(m[20:24]),
+		pageCount: binary.BigEndian.Uint32(m[24:28]),
+	}, true
+}
+
+// readMeta validates one meta slot of a whole image; ok=false if it is not a valid meta.
 func readMeta(image []byte, ps, slot int) (meta, bool) {
 	off := slot * ps
 	if off+ps > len(image) {
@@ -765,18 +986,54 @@ type page struct {
 	payload   []byte
 }
 
+// parsePage parses one standalone page block (header + payload). The single-block reader the
+// demand-paged loader and fault path use (a page read through the pager is exactly one block);
+// readPage slices it out of a whole image.
+func parsePage(block []byte) (page, error) {
+	if len(block) < pageHeader {
+		return page{}, NewError(DataCorrupted, "page shorter than its header")
+	}
+	return page{
+		pageType:  block[0],
+		itemCount: binary.BigEndian.Uint32(block[4:8]),
+		nextPage:  binary.BigEndian.Uint32(block[8:12]),
+		payload:   block[pageHeader:],
+	}, nil
+}
+
 func readPage(image []byte, ps int, index uint32) (page, error) {
 	off := int(index) * ps
 	if off+ps > len(image) {
 		return page{}, NewError(DataCorrupted, "page index out of range")
 	}
-	p := image[off : off+ps]
-	return page{
-		pageType:  p[0],
-		itemCount: binary.BigEndian.Uint32(p[4:8]),
-		nextPage:  binary.BigEndian.Uint32(p[8:12]),
-		payload:   p[pageHeader:],
-	}, nil
+	return parsePage(image[off : off+ps])
+}
+
+// decodeLeafNode decodes a single leaf page block into a resident node, for the demand-paging fault
+// path (spec/design/pager.md §4; paging.go faultLeaf). block is one page; page is its page id, stamped
+// on the node so a later incremental commit keeps it clean. Weights are recomputed from the value
+// codec (the exact size the writer used), so the loaded leaf is ready for further splits.
+func decodeLeafNode(block []byte, pageID uint32, colTypes []ScalarType) (*pnode, error) {
+	pg, err := parsePage(block)
+	if err != nil {
+		return nil, err
+	}
+	if pg.pageType != pageLeaf {
+		return nil, NewError(DataCorrupted, "demand-paged a non-leaf page")
+	}
+	n := int(pg.itemCount)
+	keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
+	pos := 0
+	for i := 0; i < n; i++ {
+		key, row, err := decodeRecord(colTypes, pg.payload, &pos)
+		if err != nil {
+			return nil, err
+		}
+		weights = append(weights, uint32(recordSize(colTypes, key, row)))
+		keys = append(keys, key)
+		vals = append(vals, row)
+	}
+	return &pnode{keys: keys, vals: vals, weights: weights, page: pageID}, nil
 }
 
 func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, error) {

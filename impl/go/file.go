@@ -42,8 +42,10 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 	if err := db.writeFullImage(); err != nil { // lay down the from-scratch image; later commits are incremental
 		return nil, err
 	}
-	// Adopt the just-written file as the open pager, so later commits write through the seam
-	// without re-opening (spec/design/pager.md, P6.4a).
+	// Adopt the just-written file as the open pager + buffer pool, so later commits write through the
+	// seam without re-opening (spec/design/pager.md). A freshly-created database has no rows, so
+	// nothing is OnDisk yet — tables built in this session stay resident until a reopen demand-pages
+	// them.
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return nil, ioError(err)
@@ -53,7 +55,7 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	db.pager = p
+	db.paging = newSharedPaging(p, DefaultLeafPoolPages)
 	return db, nil
 }
 
@@ -61,9 +63,17 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 // its page size / txid). The path must exist — 58P01 otherwise; a malformed file is XX001, a
 // read failure 58030 (api.md §2).
 func Open(path string) (*Database, error) {
-	// Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the load
-	// reads pages through the pager (P6.4a routes the whole-image load via readAll; the tree is still
-	// fully built — no residency change), and later commits write through it.
+	return openWithCapacity(path, DefaultLeafPoolPages)
+}
+
+// openWithCapacity opens an existing file-backed database with an explicit resident-leaf budget (the
+// buffer-pool capacity, in pages) — the budget the handle-level memory-budget API (P6.4c) will expose;
+// for now Open uses the default and the demand-paging tests use a small one.
+func openWithCapacity(path string, capacity int) (*Database, error) {
+	// Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the
+	// demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf through
+	// the bounded buffer pool on access, so the resident set is bounded by the pool, not the file size
+	// (P6.4b). Later commits write through the same pager.
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -76,18 +86,12 @@ func Open(path string) (*Database, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	bytes, err := p.readAll()
-	if err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	db, err := LoadDatabase(bytes)
+	db, err := LoadDatabasePaged(p, capacity)
 	if err != nil {
 		_ = f.Close()
 		return nil, err
 	}
 	db.path = path
-	db.pager = p
 	return db, nil
 }
 
@@ -119,33 +123,47 @@ func (db *Database) writeFullImage() error {
 // file's prior meta untouched (the working snapshot is then discarded). The future synchronous=off mode
 // gates here.
 func (db *Database) persist(snap *Snapshot) error {
-	// An in-memory database has no pager — a no-op success (the committed swap happens in commitTx
-	// after this returns nil).
-	if db.pager == nil {
+	// An in-memory database has no paging context — a no-op success (the committed swap happens in
+	// commitTx after this returns nil).
+	if db.paging == nil {
 		return nil
 	}
 	write, err := snap.incrementalImage(db.pageSize, db.pageCount, db.freePages)
 	if err != nil {
 		return err
 	}
-	for _, pg := range write.pages {
-		if err := db.pager.writeBlock(pg.index, pg.bytes); err != nil {
+	meta := metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount)
+	// Write the dirty pages + meta through the shared pager (under the pool lock, so a concurrent
+	// fault cannot race): body pages, Sync, then the alternate meta slot, Sync.
+	if err := db.paging.withPager(func(p *pager) error {
+		for _, pg := range write.pages {
+			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
+				return err
+			}
+		}
+		if err := p.sync(); err != nil { // body pages durable before the meta can reference them
 			return err
 		}
-	}
-	if err := db.pager.sync(); err != nil { // body pages durable before the meta can reference them
-		return err
-	}
-	meta := metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount)
-	if err := db.pager.writeBlock(uint32(snap.txid&1), meta); err != nil {
-		return err
-	}
-	if err := db.pager.sync(); err != nil { // the commit is published
+		if err := p.writeBlock(uint32(snap.txid&1), meta); err != nil {
+			return err
+		}
+		return p.sync() // the commit is published
+	}); err != nil {
 		return err
 	}
 	db.pageCount = write.pageCount
 	db.freePages = write.freeRemaining
 	return nil
+}
+
+// residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
+// in-memory database. The demand-paging tests assert this stays within the pool budget even for a
+// database whose data far exceeds it (spec/design/pager.md §3); P6.4c promotes it to the public surface.
+func (db *Database) residentLeaves() int {
+	if db.paging == nil {
+		return 0
+	}
+	return db.paging.residentLeaves()
 }
 
 // Commit commits the current transaction (spec/design/api.md §2.2, transactions.md §4.2).
@@ -172,9 +190,9 @@ func (db *Database) Rollback() error {
 func (db *Database) Close() error {
 	_, _ = db.rollbackTx()
 	db.path = ""
-	if db.pager != nil {
-		_ = db.pager.close() // drop the open file (close it)
-		db.pager = nil
+	if db.paging != nil {
+		_ = db.paging.close() // drop the open file (close it)
+		db.paging = nil
 	}
 	return nil
 }

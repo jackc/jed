@@ -1,0 +1,75 @@
+package jed
+
+// Shared paging context for a file-backed database (spec/design/pager.md §2/§3): the open pager plus
+// the bounded leaf bufferPool, shared by every table store and snapshot of one database. Page ids are
+// file-global (one page space per file), so there is exactly ONE pool and one pager per database; a
+// TableStore/Snapshot clone shares the same *sharedPaging pointer.
+//
+// The read path faults a clean leaf through faultLeaf: a pool hit returns the cached node, a miss
+// reads the page through the pager, decodes it (the node codec, format.go) and caches it, evicting
+// under CLOCK when full. No pins (pager.md §4): eviction only drops the cache entry, and a clean leaf
+// is immutable so any node still referenced stays alive (GC) and a re-load is a harmless duplicate.
+//
+// Not a §8 byte contract (pager.md §3): the pool changes WHEN a page is resident, never WHAT a query
+// observes — so each core realizes it idiomatically (like P5.3's per-core concurrency). One mutex
+// guards both the pager and the pool, so the read (fault) and commit (write) paths cannot race.
+
+import "sync"
+
+// DefaultLeafPoolPages is the default resident-leaf budget (pages). A handle-level memory-budget API
+// is P6.4c; until then this bounds the resident leaf set for every file-backed database. Sized so a
+// modest working set stays cache-resident while a larger-than-RAM file still pages within the bound.
+const DefaultLeafPoolPages = 1024
+
+// sharedPaging is one database's pager + leaf buffer pool, shared (pointer) by all its stores and
+// snapshots.
+type sharedPaging struct {
+	mu   sync.Mutex
+	pgr  *pager
+	pool *bufferPool
+}
+
+// newSharedPaging wraps an open pager with a CLOCK pool of capacity leaves.
+func newSharedPaging(p *pager, capacity int) *sharedPaging {
+	return &sharedPaging{pgr: p, pool: newBufferPool(capacity)}
+}
+
+// faultLeaf faults the clean leaf at page to a resident node, through the buffer pool: a hit returns
+// the cached node, a miss reads + decodes the page (with this table's colTypes) and caches it,
+// evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global page id
+// with a caller-supplied decoder is consistent (pager.md §4).
+func (s *sharedPaging) faultLeaf(page uint32, colTypes []ScalarType) (*pnode, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pool.getOrLoad(page, func() (*pnode, error) {
+		block, err := s.pgr.readBlock(page)
+		if err != nil {
+			return nil, err
+		}
+		return decodeLeafNode(block, page, colTypes)
+	})
+}
+
+// withPager runs fn with the pager locked — the commit write path (file.go persist pwrites dirty
+// pages + meta) takes the same lock the fault path does, so they cannot race.
+func (s *sharedPaging) withPager(fn func(*pager) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fn(s.pgr)
+}
+
+// close closes the backing file (Database.Close).
+func (s *sharedPaging) close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pgr.close()
+}
+
+// residentLeaves is the number of leaf pages currently resident in the pool — the bound the
+// demand-paging tests assert stays below the budget even for a database far larger than it. P6.4c
+// promotes it to the public memory-budget surface.
+func (s *sharedPaging) residentLeaves() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pool.resident()
+}

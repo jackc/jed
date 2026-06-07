@@ -43,15 +43,6 @@ func pagerFromFile(f *os.File) (*pager, error) {
 	return &pager{f: f, pageSize: pageSize}, nil
 }
 
-// blockCount is the number of whole pages the backing currently holds (fileLen / pageSize).
-func (p *pager) blockCount() (uint32, error) {
-	info, err := p.f.Stat()
-	if err != nil {
-		return 0, ioError(err)
-	}
-	return uint32(info.Size() / int64(p.pageSize)), nil
-}
-
 // readBlock reads one page (block index) — random access, the demand-paging read path (P6.4b).
 func (p *pager) readBlock(index uint32) ([]byte, error) {
 	buf := make([]byte, p.pageSize)
@@ -82,23 +73,4 @@ func (p *pager) sync() error {
 // close closes the open file (Database.Close).
 func (p *pager) close() error {
 	return p.f.Close()
-}
-
-// readAll assembles the whole image, page by page through readBlock — the P6.4a load path (routes the
-// whole-image load through the seam without changing residency; P6.4b reads only the reachable pages,
-// on demand, instead).
-func (p *pager) readAll() ([]byte, error) {
-	count, err := p.blockCount()
-	if err != nil {
-		return nil, err
-	}
-	image := make([]byte, 0, int(count)*int(p.pageSize))
-	for i := uint32(0); i < count; i++ {
-		b, err := p.readBlock(i)
-		if err != nil {
-			return nil, err
-		}
-		image = append(image, b...)
-	}
-	return image, nil
 }
