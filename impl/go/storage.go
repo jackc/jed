@@ -164,6 +164,13 @@ func (s *TableStore) RangeEntries(b keyBound) ([]Entry, error) {
 // charges (spec/design/cost.md §3). Equals NodeCount for the unbounded bound.
 func (s *TableStore) OverlapNodeCount(b keyBound) int { return s.rows.overlapNodeCount(b) }
 
+// ScanRange streams the rows whose primary key lies within the bound to visit, in key order, stopping
+// (without faulting further leaves) the moment visit returns a false `continue` — the genuine LIMIT
+// short-circuit (spec/design/cost.md §3 "LIMIT short-circuit").
+func (s *TableStore) ScanRange(b keyBound, visit func(key []byte, row Row) (bool, error)) error {
+	return s.rows.scanRange(b, s.leafSrc(), visit)
+}
+
 // Entry is one stored (encoded key, row) pair.
 type Entry struct {
 	Key []byte

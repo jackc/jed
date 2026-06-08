@@ -81,6 +81,10 @@ id = "query.point_lookup"
 description = "Primary-key predicate pushdown — a single-table WHERE on the primary key (`pk = c`, `pk < c`, BETWEEN, AND-combinations) seeks/ranges the storage B-tree instead of a full scan, so page_read drops to the nodes on the access path and storage_row_read to the rows in range (spec/design/cost.md §3 \"bounded scan / point lookup\"). A cost-visible optimization: a core lacking it would compute the higher full-scan cost, so cost-asserting tests over PK predicates require it."
 
 [[capability]]
+id = "query.limit_short_circuit"
+description = "LIMIT short-circuit — a single-table query with a LIMIT and no blocking operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the scan once the window is filled, so storage_row_read counts only the rows actually read (spec/design/cost.md §3 \"LIMIT short-circuit\"). A cost-visible optimization: a core lacking it scans every row and computes the higher cost, so cost-asserting LIMIT-without-ORDER-BY tests require it."
+
+[[capability]]
 id = "query.is_null"
 description = "IS NULL / IS NOT NULL predicates"
 

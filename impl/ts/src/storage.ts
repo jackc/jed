@@ -176,6 +176,13 @@ export class TableStore {
     return this.rows.overlapNodeCount(b);
   }
 
+  // scanRange streams the rows whose primary key lies within b to visit, in key order, stopping
+  // (without faulting further leaves) the moment visit returns false — the genuine LIMIT short-circuit
+  // (spec/design/cost.md §3 "LIMIT short-circuit").
+  scanRange(b: KeyBound, visit: (key: Uint8Array, row: Row) => boolean): void {
+    this.rows.scanRange(b, this.leafSrc(), visit);
+  }
+
   // treeRoot is the root B-tree node of this store, for the page-backed serializer
   // (spec/fileformat/format.md). null for an empty table.
   treeRoot(): PNode | null {

@@ -84,6 +84,38 @@ fn range_crosses_leaf_boundaries() {
 }
 
 #[test]
+fn limit_short_circuit_is_sublinear() {
+    let mut db = big_table(1000); // id 1..1000, v == id
+    // LIMIT without ORDER BY stops the scan early: `limit` rows at sublinear cost, the PK-order prefix.
+    assert_eq!(ids(&mut db, "SELECT v FROM t LIMIT 5"), vec![1, 2, 3, 4, 5]);
+    let point = cost(&mut db, "SELECT v FROM t LIMIT 5");
+    let full = cost(&mut db, "SELECT v FROM t");
+    assert!(
+        point < full,
+        "LIMIT cost {point} should be far below full-scan {full}"
+    );
+    assert!(
+        point <= 20,
+        "LIMIT 5 cost {point} should be sublinear (≈ limit + node count), not ~1000"
+    );
+    assert_eq!(
+        ids(&mut db, "SELECT v FROM t LIMIT 3 OFFSET 10"),
+        vec![11, 12, 13]
+    );
+
+    // Trap windowing: streaming projects ONLY the windowed rows, so a later trapping row is never
+    // reached under a LIMIT that excludes it (matches the eager window-before-project).
+    let mut dz = Database::new();
+    execute(&mut dz, "CREATE TABLE z (id int32 PRIMARY KEY, c int32)").unwrap();
+    execute(&mut dz, "INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)").unwrap();
+    assert_eq!(ids(&mut dz, "SELECT 100 / c FROM z LIMIT 1"), vec![20]);
+    assert!(
+        execute(&mut dz, "SELECT 100 / c FROM z LIMIT 2").is_err(),
+        "LIMIT 2 reaches the c=0 row and must trap"
+    );
+}
+
+#[test]
 fn mutation_pushdown_is_sublinear() {
     let mut db = big_table(1000);
     let d = cost(&mut db, "DELETE FROM t WHERE id = 500");

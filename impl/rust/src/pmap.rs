@@ -465,6 +465,23 @@ impl PMap {
             .map(|r| count(r, b, None, None))
             .unwrap_or(0)
     }
+
+    /// Visit the `(key, row)` pairs within the bound, in ascending key order, calling `visit` per
+    /// in-bound row. `visit` returns `Ok(false)` to STOP the traversal — and because a leaf is faulted
+    /// only when descended into, leaves past the stop point are never faulted (the genuine LIMIT
+    /// short-circuit — spec/design/cost.md §3 "LIMIT short-circuit"). Streams one row at a time (no
+    /// `Vec`), so a bounded result holds ~one leaf resident.
+    pub(crate) fn scan_range(
+        &self,
+        b: &KeyBound,
+        src: Option<&dyn LeafSource>,
+        visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
+    ) -> Result<()> {
+        if let Some(root) = &self.root {
+            walk_range_visit(root, b, None, None, src, visit)?;
+        }
+        Ok(())
+    }
 }
 
 /// Build a node from its parts; if its payload overflows `cap`, split it 2-way and promote one
@@ -827,6 +844,50 @@ fn collect_range(
         }
     }
     Ok(())
+}
+
+/// The early-stoppable, streaming `collect_range`: calls `visit` per in-bound row instead of pushing
+/// to a `Vec`, and stops the whole traversal (returning `Ok(false)`) when `visit` does — without
+/// faulting any leaf past the stop point. Mirrors `collect_range`'s prune.
+fn walk_range_visit(
+    node: &Node,
+    b: &KeyBound,
+    node_lo: Option<&[u8]>,
+    node_hi: Option<&[u8]>,
+    src: Option<&dyn LeafSource>,
+    visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
+) -> Result<bool> {
+    if node.is_leaf() {
+        for i in 0..node.keys.len() {
+            if b.contains(&node.keys[i]) && !visit(&node.keys[i], &node.vals[i])? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    for i in 0..=node.keys.len() {
+        let a = if i > 0 {
+            Some(node.keys[i - 1].as_slice())
+        } else {
+            node_lo
+        };
+        let c = if i < node.keys.len() {
+            Some(node.keys[i].as_slice())
+        } else {
+            node_hi
+        };
+        if b.child_overlaps(a, c) {
+            let ch = child(node, i, src)?;
+            if !walk_range_visit(&ch, b, a, c, src, visit)? {
+                return Ok(false);
+            }
+        }
+        if i < node.keys.len() && b.contains(&node.keys[i]) && !visit(&node.keys[i], &node.vals[i])?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

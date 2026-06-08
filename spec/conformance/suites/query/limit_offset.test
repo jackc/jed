@@ -6,7 +6,7 @@
 # window charges storage_row_read + its filter ops but no row_produced/projection cost. The
 # count is a non-negative integer literal; a negative value is a deterministic parse-time data
 # error (2201W for LIMIT, 2201X for OFFSET) raised before any scan.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.limit, query.offset, types.int32, query.point_lookup, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.limit, query.offset, types.int32, dml.insert_multi_row, query.point_lookup, query.limit_short_circuit, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, val int32)
@@ -137,3 +137,63 @@ SELECT id FROM t LIMIT 1 LIMIT 2
 # ... and likewise a duplicate OFFSET.
 statement error 42601
 SELECT id FROM t OFFSET 1 OFFSET 2
+
+# --- LIMIT short-circuit (spec/design/cost.md §3 "LIMIT short-circuit") --------------------
+#
+# A single-table query with a LIMIT and NO blocking operator (no join/aggregate/DISTINCT and,
+# crucially, no ORDER BY) STOPS the scan once the window is filled — so storage_row_read counts
+# only the rows actually read, not the whole table. (Every LIMIT query ABOVE has an ORDER BY, so
+# it must sort all rows and keeps the full scan; that is why those costs scan all 5.) To assert
+# a specific result WITHOUT an ORDER BY — whose subset is otherwise unspecified (CLAUDE.md §8) —
+# `u` gives every row the same `v`, so any 2-row subset is identically {7, 7}.
+statement ok
+CREATE TABLE u (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO u VALUES (1, 7), (2, 7), (3, 7), (4, 7), (5, 7)
+
+# LIMIT 2, no ORDER BY: the scan stops after 2 rows. 1 page + 2 scanned + 2 produced = 5 — NOT
+# the 1 + 5 + 2 = 8 an all-rows scan would charge.
+# cost: 5
+query I rowsort
+SELECT v FROM u LIMIT 2
+----
+7
+7
+
+# OFFSET 1 LIMIT 2: the first row is skipped (still scanned + counted) then 2 produced; the scan
+# stops after the third. 1 page + 3 scanned + 2 produced = 6.
+# cost: 6
+query I rowsort
+SELECT v FROM u LIMIT 2 OFFSET 1
+----
+7
+7
+
+# LIMIT 0 reads nothing — the scan never starts. 1 page + 0 = 1.
+# cost: 1
+query I rowsort
+SELECT v FROM u LIMIT 0
+----
+
+# A LIMIT at/above the row count cannot short-circuit — it reads every row. 1 page + 5 scanned +
+# 5 produced = 11.
+# cost: 11
+query I rowsort
+SELECT v FROM u LIMIT 10
+----
+7
+7
+7
+7
+7
+
+# Short-circuit composes with the primary-key range pushdown: `id >= 2` ranges to rows 2..5, the
+# filter runs per scanned row, and the scan still stops after 2 produced. 1 page + 2 scanned +
+# 2 filter + 2 produced = 7.
+# cost: 7
+query I rowsort
+SELECT v FROM u WHERE id >= 2 LIMIT 2
+----
+7
+7

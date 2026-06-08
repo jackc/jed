@@ -413,6 +413,60 @@ func (m *PMap) overlapNodeCount(b keyBound) int {
 	return count(m.root, nil, nil)
 }
 
+// scanRange visits the (key, row) pairs within the bound, in ascending key order, calling visit per
+// in-bound row. visit returns (continue, error): a false `continue` STOPS the traversal — and because
+// the traversal faults a leaf only when it descends into it, leaves past the stop point are never
+// faulted (the LIMIT short-circuit is genuine, not a post-hoc truncation — spec/design/cost.md §3
+// "LIMIT short-circuit"). Like rangeEntries it prunes non-overlapping subtrees; unlike it, it streams
+// (one row at a time, no Vec) so a bounded result holds ~one leaf resident.
+func (m *PMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row Row) (bool, error)) error {
+	var walk func(n *pnode, nodeLo, nodeHi []byte) (bool, error)
+	walk = func(n *pnode, nodeLo, nodeHi []byte) (bool, error) {
+		if n.isLeaf() {
+			for i, k := range n.keys {
+				if b.contains(k) {
+					cont, err := visit(k, n.vals[i])
+					if err != nil || !cont {
+						return cont, err
+					}
+				}
+			}
+			return true, nil
+		}
+		for i := 0; i <= len(n.keys); i++ {
+			a := nodeLo
+			if i > 0 {
+				a = n.keys[i-1]
+			}
+			c := nodeHi
+			if i < len(n.keys) {
+				c = n.keys[i]
+			}
+			if b.childOverlaps(a, c) {
+				child, err := resolveChild(n.children[i], src)
+				if err != nil {
+					return false, err
+				}
+				if cont, err := walk(child, a, c); err != nil || !cont {
+					return cont, err
+				}
+			}
+			if i < len(n.keys) && b.contains(n.keys[i]) {
+				cont, err := visit(n.keys[i], n.vals[i])
+				if err != nil || !cont {
+					return cont, err
+				}
+			}
+		}
+		return true, nil
+	}
+	if m.root == nil {
+		return nil
+	}
+	_, err := walk(m.root, nil, nil)
+	return err
+}
+
 // insOut is the result of inserting into a subtree: a whole rebuilt node, or a split.
 type insOut struct {
 	whole *pnode // non-nil ⇒ no split

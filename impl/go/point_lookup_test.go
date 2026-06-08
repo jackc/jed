@@ -112,6 +112,55 @@ func TestRangeScanCrossesLeafBoundaries(t *testing.T) {
 	}
 }
 
+func TestLimitShortCircuitMultiLeaf(t *testing.T) {
+	const n = 1000
+	db := bigTable(t, n) // id 1..1000, v == id
+
+	// LIMIT without ORDER BY stops the scan early: it returns `limit` rows at sublinear cost (it did
+	// NOT read all 1000). The rows are the primary-key-order prefix (our cores' deterministic choice).
+	out, err := Execute(db, "SELECT v FROM t LIMIT 5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Rows) != 5 {
+		t.Fatalf("LIMIT 5 got %d rows, want 5", len(out.Rows))
+	}
+	full, err := Execute(db, "SELECT v FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Cost >= full.Cost {
+		t.Errorf("LIMIT cost %d should be far below the full-scan cost %d", out.Cost, full.Cost)
+	}
+	if out.Cost > 20 {
+		t.Errorf("LIMIT 5 cost %d should be sublinear (≈ limit + node count), not ~%d", out.Cost, n)
+	}
+	got := queryIDs(t, db, "SELECT v FROM t LIMIT 5")
+	for i, v := range got {
+		if v != int64(i+1) {
+			t.Fatalf("LIMIT 5 row %d = %d, want %d", i, v, i+1)
+		}
+	}
+
+	// OFFSET skips then takes, still sublinear.
+	o := queryIDs(t, db, "SELECT v FROM t LIMIT 3 OFFSET 10")
+	if len(o) != 3 || o[0] != 11 || o[2] != 13 {
+		t.Errorf("LIMIT 3 OFFSET 10 got %v, want [11 12 13]", o)
+	}
+
+	// Trap windowing: streaming projects ONLY the windowed rows (like the eager path), so a later
+	// row that would trap is never reached under a LIMIT that excludes it.
+	dz := dbWith(t,
+		"CREATE TABLE z (id int32 PRIMARY KEY, c int32)",
+		"INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)")
+	if rows := query(t, dz, "SELECT 100 / c FROM z LIMIT 1"); len(rows) != 1 || rows[0][0].Int != 20 {
+		t.Errorf("LIMIT 1 should produce only the safe first row (100/5=20), got %v", rows)
+	}
+	if _, err := Execute(dz, "SELECT 100 / c FROM z LIMIT 2"); err == nil {
+		t.Errorf("LIMIT 2 reaches the c=0 row and must trap (division by zero)")
+	}
+}
+
 func TestMutationPushdownMultiLeaf(t *testing.T) {
 	const n = 1000
 	db := bigTable(t, n)

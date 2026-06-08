@@ -213,6 +213,19 @@ impl TableStore {
         self.rows.overlap_node_count(b)
     }
 
+    /// Stream the rows whose primary key lies within `b` to `visit`, in key order, stopping (without
+    /// faulting further leaves) the moment `visit` returns `Ok(false)` — the genuine LIMIT
+    /// short-circuit (spec/design/cost.md §3 "LIMIT short-circuit").
+    pub(crate) fn scan_range(
+        &self,
+        b: &KeyBound,
+        visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
+    ) -> Result<()> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.rows.scan_range(b, src_ref, visit)
+    }
+
     /// The root B-tree node of this table's store, for the page-backed serializer
     /// (spec/fileformat/format.md). `None` for an empty table.
     pub(crate) fn tree_root(&self) -> Option<&Arc<Node>> {

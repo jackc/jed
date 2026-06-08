@@ -103,6 +103,25 @@ test("range scan crosses leaf boundaries", () => {
   assert.strictEqual(cost(db, "SELECT id FROM t WHERE id > 700 AND id < 300"), 0n);
 });
 
+test("LIMIT short-circuit is sublinear", () => {
+  const db = bigTable(1000); // id 1..1000, v == id
+  // LIMIT without ORDER BY stops the scan early: `limit` rows at sublinear cost, the PK-order prefix.
+  assert.deepStrictEqual(ids(db, "SELECT v FROM t LIMIT 5"), [1, 2, 3, 4, 5]);
+  const point = cost(db, "SELECT v FROM t LIMIT 5");
+  const full = cost(db, "SELECT v FROM t");
+  assert.ok(point < full, `LIMIT cost ${point} should be far below full-scan ${full}`);
+  assert.ok(point <= 20n, `LIMIT 5 cost ${point} should be sublinear (≈ limit + node count), not ~1000`);
+  assert.deepStrictEqual(ids(db, "SELECT v FROM t LIMIT 3 OFFSET 10"), [11, 12, 13]);
+
+  // Trap windowing: streaming projects ONLY the windowed rows, so a later trapping row is never
+  // reached under a LIMIT that excludes it.
+  const dz = new Database();
+  execute(dz, "CREATE TABLE z (id int32 PRIMARY KEY, c int32)");
+  execute(dz, "INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)");
+  assert.deepStrictEqual(ids(dz, "SELECT 100 / c FROM z LIMIT 1"), [20]);
+  assert.throws(() => execute(dz, "SELECT 100 / c FROM z LIMIT 2"));
+});
+
 test("mutation pushdown is sublinear", () => {
   const db = bigTable(1000);
   const d = cost(db, "DELETE FROM t WHERE id = 500");

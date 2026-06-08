@@ -1114,19 +1114,76 @@ export class Database {
   // of the old runSelect: materialize, nested-loop join, WHERE, then aggregate / DISTINCT / window
   // + project. The per-row evaluator gets an EvalEnv carrying the outer rows + a runSubquery
   // callback, so a correlated subquery in any clause re-executes against them (grammar.md §26).
+  // execStreamingLimit executes the LIMIT short-circuit path (spec/design/cost.md §3): a single-table,
+  // no-blocking-operator query with a LIMIT streams scan→filter→project and stops the scan the instant
+  // the LIMIT/OFFSET window is filled, charging storageRowRead only for the rows actually read.
+  // Cost-equivalent to the eager path EXCEPT that it reads (and filters) fewer rows — the deliberate
+  // cost change. pageRead is the full block (the bound's node count); only the row reads short-circuit.
+  // Rows match the eager path exactly: the offset..offset+limit slice of the primary-key-ordered
+  // filtered rows.
+  private execStreamingLimit(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): SelectResult {
+    const store = this.readSnap().store(plan.rels[0]!.tableName);
+
+    // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead block.
+    let bound: KeyBound = unboundedBound();
+    let empty = false;
+    if (plan.pkBound !== null) {
+      const b = buildKeyBound(plan.pkBound, params);
+      if (b === null) empty = true;
+      else bound = b;
+    }
+    const overlap = empty ? 0 : store.overlapNodeCount(bound);
+    meter.charge(COSTS.pageRead * BigInt(overlap));
+
+    const limit = plan.limit!;
+    const offset = plan.offset ?? 0n;
+    const out: Value[][] = [];
+    if (!empty && limit > 0n) {
+      let passed = 0n;
+      store.scanRange(bound, (_key, row) => {
+        meter.charge(COSTS.storageRowRead);
+        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
+          return true;
+        }
+        passed += 1n;
+        if (passed <= offset) return true;
+        meter.charge(COSTS.rowProduced);
+        out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+        return BigInt(out.length) < limit; // stop once the window is filled
+      });
+    }
+    return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.accrued };
+  }
+
   private execSelectPlan(plan: SelectPlan, outer: Row[], params: Value[]): SelectResult {
     const env: EvalEnv = {
       params,
       outer,
       runSubquery: (p, o) => this.execQueryPlan(p, o, params),
     };
+    const meter = new Meter();
+
+    // LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
+    // operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the
+    // scan once the window is filled, so storageRowRead counts only the rows actually read. (ORDER BY/
+    // DISTINCT/aggregate must see every row, so they keep the eager path below.) pageRead stays the
+    // full block; only row reads short-circuit.
+    if (
+      plan.limit !== null &&
+      plan.rels.length === 1 &&
+      plan.joins.length === 0 &&
+      !plan.isAgg &&
+      !plan.distinct &&
+      plan.order.length === 0
+    ) {
+      return this.execStreamingLimit(plan, env, meter, params);
+    }
 
     // Materialize each base table once, in primary-key order, by draining a scanSource (the
     // pageRead block + per-row storageRowRead accrue inside the generator — spec/design/cost.md §3
     // "page_read"/JOIN). A primary-key bound (single base table only) seeks/ranges instead of walking
     // the whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. The
     // nested loop re-reads from these in-memory buffers, which are not stores and charge nothing.
-    const meter = new Meter();
     const materialized: Row[][] = plan.rels.map((rel) => {
       const store = this.readSnap().store(rel.tableName);
       let rows: Row[];

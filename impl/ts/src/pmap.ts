@@ -325,6 +325,30 @@ export class PMap {
     };
     return this.root === null ? 0 : count(this.root, null, null);
   }
+
+  // scanRange visits the (key, row) pairs within the bound, in ascending key order, calling visit per
+  // in-bound row. visit returns false to STOP the traversal — and because a leaf is faulted only when
+  // descended into, leaves past the stop point are never faulted (the genuine LIMIT short-circuit —
+  // spec/design/cost.md §3 "LIMIT short-circuit"). Streams one row at a time (no array), so a bounded
+  // result holds ~one leaf resident. An eval error propagates as a thrown exception.
+  scanRange(b: KeyBound, src: LeafSource | null, visit: (key: Uint8Array, row: Row) => boolean): void {
+    const walk = (n: PNode, nodeLo: Uint8Array | null, nodeHi: Uint8Array | null): boolean => {
+      if (isLeaf(n)) {
+        for (let i = 0; i < n.keys.length; i++) {
+          if (boundContains(b, n.keys[i]) && !visit(n.keys[i], n.vals[i])) return false;
+        }
+        return true;
+      }
+      for (let i = 0; i <= n.keys.length; i++) {
+        const a = i > 0 ? n.keys[i - 1] : nodeLo;
+        const c = i < n.keys.length ? n.keys[i] : nodeHi;
+        if (childOverlaps(b, a, c) && !walk(resolveChild(n.children[i], src), a, c)) return false;
+        if (i < n.keys.length && boundContains(b, n.keys[i]) && !visit(n.keys[i], n.vals[i])) return false;
+      }
+      return true;
+    };
+    if (this.root !== null) walk(this.root, null, null);
+  }
 }
 
 // pmapFromLoaded reconstructs a map from a loaded root (format.ts loadDatabase).

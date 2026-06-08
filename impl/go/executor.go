@@ -1804,14 +1804,90 @@ func boundEmpty(b keyBound) bool {
 // of the old runSelect: materialize, nested-loop join, WHERE, then aggregate / DISTINCT / window
 // + project. The per-row evaluator gets an evalEnv carrying the engine + outer rows, so a
 // correlated subquery in any clause re-executes against them (grammar.md §26).
+// execStreamingLimit executes the LIMIT short-circuit path (spec/design/cost.md §3): a single-table,
+// no-blocking-operator query with a LIMIT streams scan→filter→project and stops the scan the instant
+// the LIMIT/OFFSET window is filled, charging storage_row_read only for the rows actually read. It is
+// cost-equivalent to the eager path EXCEPT that it reads (and filters) fewer rows, which is the
+// deliberate cost change. page_read is the full block (the bound's node count) — it does not
+// short-circuit; only the row reads do. Rows match the eager path exactly: the offset..offset+limit
+// slice of the primary-key-ordered filtered rows.
+func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
+	store := db.readSnap().store(plan.rels[0].tableName)
+
+	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block.
+	b := unboundedBound()
+	empty := false
+	overlap := store.NodeCount()
+	if plan.pkBound != nil {
+		if b, empty = db.buildKeyBound(plan.pkBound, params); empty {
+			overlap = 0
+		} else {
+			overlap = store.OverlapNodeCount(b)
+		}
+	}
+	meter.Charge(Costs.PageRead * int64(overlap))
+
+	limit := *plan.limit
+	var offset int64
+	if plan.offset != nil {
+		offset = *plan.offset
+	}
+	out := make([][]Value, 0)
+	if !empty && limit > 0 {
+		var passed int64
+		err := store.ScanRange(b, func(_ []byte, row Row) (bool, error) {
+			meter.Charge(Costs.StorageRowRead)
+			if plan.filter != nil {
+				v, err := plan.filter.eval(row, env, meter)
+				if err != nil {
+					return false, err
+				}
+				if !v.IsTrue() {
+					return true, nil
+				}
+			}
+			passed++
+			if passed <= offset {
+				return true, nil
+			}
+			meter.Charge(Costs.RowProduced)
+			projected := make([]Value, len(plan.projections))
+			for i, p := range plan.projections {
+				v, err := p.eval(row, env, meter)
+				if err != nil {
+					return false, err
+				}
+				projected[i] = v
+			}
+			out = append(out, projected)
+			return int64(len(out)) < limit, nil // stop once the window is filled
+		})
+		if err != nil {
+			return selectResult{}, err
+		}
+	}
+	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
+}
+
 func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer}
+	meter := NewMeter()
+
+	// LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
+	// operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the
+	// scan once the window is filled, so storage_row_read counts only the rows actually read — a
+	// genuine early-out, not a post-hoc truncation. (ORDER BY/DISTINCT/aggregate must see every row, so
+	// they keep the eager path below.) page_read stays the full block (the bound's node count); only
+	// row reads short-circuit.
+	if plan.limit != nil && len(plan.rels) == 1 && len(plan.joins) == 0 &&
+		!plan.isAgg && !plan.distinct && len(plan.order) == 0 {
+		return db.execStreamingLimit(plan, env, meter, params)
+	}
 
 	// Materialize each base table once, in primary-key order, by draining a scanSource (the
 	// page_read block + per-row storage_row_read accrue inside next() — spec/design/cost.md §3
 	// "page_read"/JOIN). The nested loop re-reads from these in-memory buffers, which are not
 	// stores and charge nothing.
-	meter := NewMeter()
 	materialized := make([][]Row, len(plan.rels))
 	for ri, rel := range plan.rels {
 		store := db.readSnap().store(rel.tableName)

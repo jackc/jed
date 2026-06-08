@@ -66,9 +66,12 @@ TS; any deviation diverges the count and fails the corpus.
 - **`row_produced`** is charged once per row that survives the filter and is projected
   into a `SELECT` result set, at projection time (post-filter, post-`ORDER BY`, **and
   post-`LIMIT`/`OFFSET`**). `LIMIT`/`OFFSET` slice the sorted rows *before* the projection
-  loop, so a row skipped by `OFFSET` or excluded by `LIMIT` is scanned and filtered (it
-  pays `storage_row_read` + its filter `operator_eval`s) but charges **no** `row_produced`
-  or projection cost — only the windowed rows do. `DELETE` / `UPDATE` emit no rows and so
+  loop, so a row skipped by `OFFSET` or excluded by `LIMIT` charges **no** `row_produced`
+  or projection cost — only the windowed rows do. Whether such an excluded row still pays
+  `storage_row_read` + its filter `operator_eval`s depends on the plan: with a blocking
+  operator (an `ORDER BY`, `DISTINCT`, aggregate, or join) the scan must read every row
+  first, so it does; without one, the **LIMIT short-circuit** (subsection below) stops the
+  scan once the window is filled, so it does **not**. `DELETE` / `UPDATE` emit no rows and so
   charge no `row_produced`.
 - **`operator_eval`** is charged once per **interior** expression node — `cast`, `neg`,
   `not`, `arith`, `compare`, `and`, `or`, `is_null`, `distinct`. **Leaf nodes — `column`
@@ -170,6 +173,39 @@ deliberate, cost-visible optimization, gated by the `query.point_lookup` capabil
 `spec/conformance/suites/query/point_lookup.test` pins these costs cross-core; the bounded forms in
 `expr/cost.test`, `query/distinct.test`, `query/limit_offset.test`, and `query/select_list.test`
 exercise them in context.
+
+### LIMIT short-circuit — stopping the scan when the window is filled
+
+A `LIMIT` normally windows *after* the scan, so every scanned row pays `storage_row_read` even when
+the window excludes it (above). But when the query is a **single table with no blocking operator** —
+no join, aggregate, `DISTINCT`, or `ORDER BY` — there is nothing that needs to see all the rows, so
+the engine **streams** scan→filter→project and **stops the scan the instant the `LIMIT`/`OFFSET`
+window is filled.** This is the engine's first early-out, gated by the `query.limit_short_circuit`
+capability.
+
+- **`storage_row_read` counts only the rows actually read.** The scan reads in primary-key order,
+  skipping `OFFSET` passing rows and producing `LIMIT` rows, then **stops** — so it charges
+  `storage_row_read` (and the filter's `operator_eval`s) only for the rows up to that point, not the
+  whole table. `SELECT v FROM u LIMIT 2` over a 5-row table reads 2 rows, not 5. This is the
+  deliberate cost change; it is genuine (the scan really stops — leaves past the stop point are never
+  faulted), not a post-hoc truncation, so the cost honestly bounds the work (CLAUDE.md §13).
+- **`page_read` does NOT short-circuit** — it stays the full block (the scan bound's node count,
+  charged up front), so a `LIMIT` does not lower it. Keeping `page_read` the structural node count
+  preserves its "logical, buffer-pool-invisible" definition and one accrual model across all scans;
+  the row reads are where the early-out shows. (Tightening `page_read` to the leaves actually faulted
+  is a possible later refinement; it would only matter for a very large multi-leaf table.)
+- **An `ORDER BY` (or any blocking operator) keeps the full scan.** Those must materialize every row
+  before windowing, so they charge `storage_row_read` for all of them — the rule at the top of this
+  section. This is why every `LIMIT`-with-`ORDER BY` cost in `query/limit_offset.test` scans all
+  rows, while the `LIMIT`-without-`ORDER BY` cases short-circuit.
+- **Composes with the PK bound.** A `WHERE pk <range> ... LIMIT n` first bounds the scan to the key
+  range (above), then short-circuits within it once `n` rows are produced.
+- **The rows are identical** to the eager path: the `offset..offset+limit` slice of the
+  primary-key-ordered filtered rows. (The *result set* of a `LIMIT` with no `ORDER BY` is
+  SQL-unspecified — CLAUDE.md §8 — but our cores agree, scanning in primary-key order.)
+
+`query/limit_offset.test` pins these costs cross-core (a uniform-value table makes the no-`ORDER BY`
+subset deterministic so a specific result can be asserted alongside the `# cost:`).
 
 ### `SELECT DISTINCT` — the projection-vs-produce asymmetry
 

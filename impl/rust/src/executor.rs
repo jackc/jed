@@ -1524,6 +1524,72 @@ impl Database {
         })
     }
 
+    /// The LIMIT short-circuit path (spec/design/cost.md §3): a single-table, no-blocking-operator
+    /// query with a LIMIT streams scan→filter→project and stops the scan the instant the LIMIT/OFFSET
+    /// window is filled, charging storage_row_read only for the rows actually read. Cost-equivalent to
+    /// the eager path EXCEPT that it reads (and filters) fewer rows — the deliberate cost change.
+    /// page_read is the full block (the bound's node count); only the row reads short-circuit. Rows
+    /// match the eager path exactly: the offset..offset+limit slice of the primary-key-ordered
+    /// filtered rows.
+    fn exec_streaming_limit(
+        &self,
+        plan: &SelectPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+        params: &[Value],
+    ) -> Result<SelectResult> {
+        let store = self.store(&plan.rels[0].table_name);
+
+        // Resolve the scan bound (the PK pushdown, if any) and charge the page_read block.
+        let (bound, empty) = match &plan.pk_bound {
+            Some(bp) => match build_key_bound(bp, params) {
+                Some(b) => (b, false),
+                None => (KeyBound::unbounded(), true),
+            },
+            None => (KeyBound::unbounded(), false),
+        };
+        let overlap = if empty {
+            0
+        } else {
+            store.overlap_node_count(&bound) as i64
+        };
+        meter.charge(COSTS.page_read * overlap);
+
+        let limit = plan.limit.expect("streaming path is gated on a LIMIT");
+        let offset = plan.offset.unwrap_or(0);
+        let mut out: Vec<Vec<Value>> = Vec::new();
+        if !empty && limit > 0 {
+            let mut passed: i64 = 0;
+            store.scan_range(&bound, &mut |_key, row| {
+                meter.charge(COSTS.storage_row_read);
+                let keep = match &plan.filter {
+                    Some(f) => f.eval(row, env, meter)?.is_true(),
+                    None => true,
+                };
+                if !keep {
+                    return Ok(true);
+                }
+                passed += 1;
+                if passed <= offset {
+                    return Ok(true);
+                }
+                meter.charge(COSTS.row_produced);
+                let mut projected = Vec::with_capacity(plan.projections.len());
+                for p in &plan.projections {
+                    projected.push(p.eval(row, env, meter)?);
+                }
+                out.push(projected);
+                Ok((out.len() as i64) < limit) // stop once the window is filled
+            })?;
+        }
+        Ok(SelectResult {
+            column_names: plan.column_names.clone(),
+            column_types: plan.column_types.clone(),
+            rows: out,
+            cost: meter.accrued,
+        })
+    }
+
     /// Execute a resolved SELECT against an outer-row environment (`outer` = the enclosing
     /// rows, innermost last; empty at top level) and the bound parameters. The execute half of
     /// the old `run_select`: materialize, nested-loop join, WHERE, then aggregate / DISTINCT /
@@ -1540,12 +1606,27 @@ impl Database {
             params,
             outer,
         };
+        let mut meter = Meter::new();
+
+        // LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no
+        // blocking operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project
+        // and STOPS the scan once the window is filled, so storage_row_read counts only the rows
+        // actually read. (ORDER BY/DISTINCT/aggregate must see every row, so they keep the eager path
+        // below.) page_read stays the full block; only row reads short-circuit.
+        if plan.limit.is_some()
+            && plan.rels.len() == 1
+            && plan.joins.is_empty()
+            && !plan.is_agg
+            && !plan.distinct
+            && plan.order.is_empty()
+        {
+            return self.exec_streaming_limit(plan, &env, &mut meter, params);
+        }
 
         // Materialize each base table once, in primary-key order, by draining a ScanSource (the
         // page_read block + per-row storage_row_read accrue inside next() — spec/design/cost.md §3
         // "page_read"/JOIN). The nested loop re-reads from these in-memory buffers, which are not
         // stores and charge nothing.
-        let mut meter = Meter::new();
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
         for rel in &plan.rels {
             let store = self.store(&rel.table_name);
