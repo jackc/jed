@@ -768,29 +768,37 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       cores agree on the new costs by construction). Per-core cost-assertion tests (select/insert/
       setops/subquery in each core) re-baselined to the same values. Byte format **untouched** (15
       goldens still byte-exact; `rake verify` clean). _(size: M; deps: P6.1; §13)_
-- [ ] **P6.4 — Buffer pool / demand paging** — make the resident set a **bounded cache of pages**
+- [x] **P6.4 — Buffer pool / demand paging** — ✅ **landed (all 3 cores, merged + pushed,
+      `origin/master == febcc7c`).** The resident set is now a **bounded cache of leaf pages**
       with eviction (not the whole file), so a file far larger than RAM is served by paging in
-      on demand. **Design landed** ([spec/design/pager.md](spec/design/pager.md)). **Decisions:**
-      a **universal** buffer pool (every committed-tree read paged, no full-residency fast path —
-      one uniform path, results+cost the only contract, so the pool/eviction is NOT a §8 byte
-      contract, like P5.3's per-core concurrency); reached **seam-foundation-first**. The
-      `page_read` cost unit (P6.3) is already a **logical** count, so the cache stays invisible to
-      the deterministic cost — accrual moves from structural `node_count` to **per-node-visit**
-      (corpus-neutral: every metered query is a full scan, which visits every node = same total).
-      **Slices:**
-  - [ ] **P6.4a — the pager seam (no residency change).** Introduce the `Pager` (file + in-memory
+      on demand. **Design** ([spec/design/pager.md](spec/design/pager.md)). **Decisions as built:**
+      a **universal** buffer pool (every committed-tree leaf read paged, no full-residency fast
+      path — results+cost the only contract, so the pool/eviction is NOT a §8 byte contract, like
+      P5.3's per-core concurrency); reached **seam-foundation-first**. **Refinement that landed:**
+      only **leaves** page — the **interior skeleton stays resident** — so `node_count` is
+      computable from the resident skeleton (an OnDisk leaf counts as 1) **without faulting
+      leaves**, which kept `page_read` accrual **structural in the executor** and cost
+      **byte-identical to P6.3** (the predicted per-node-visit move was avoided; 72/0/0 unchanged).
+      **Slices (all complete):**
+  - [x] **P6.4a — the pager seam (no residency change).** Introduced the `Pager` (file + in-memory
         backings, file kept open for the handle's life; `read_block`/`write_block`/`sync`) and
-        route the whole-image load **and** the incremental commit (P6.1) through it; a buffer-pool
-        scaffold exists but the loader still materializes the full tree, so results/cost/the 15
-        goldens are **byte-unchanged**. De-risks the seam + keep-file-open lifecycle (`close` now
-        closes the file). _(mergeable, no observable change)_
-  - [ ] **P6.4b — lazy nodes + the bounded pool (the residency win).** `pmap` children become a
-        lazy `ChildRef` (clean child = page id, loaded on demand through the bounded pool with
-        **CLOCK** eviction; dirty nodes pinned); `page_read` accrual moves to per-node-visit. The
-        resident set becomes bounded. _(the XL heart)_
-  - [ ] **P6.4c — budget config + hardening.** Handle-level memory-budget API, pin-safety
-        hardening, large-file tests (a DB far exceeding the pool budget opens / scans / mutates /
-        round-trips while resident page count stays bounded).
+        routed the whole-image load **and** the incremental commit (P6.1) through it; a buffer-pool
+        scaffold existed but the loader still materialized the full tree, so results/cost/the 15
+        goldens stayed **byte-unchanged**. De-risked the seam + keep-file-open lifecycle (`close`
+        now closes the file).
+  - [x] **P6.4b — lazy leaves + the bounded pool (the residency win).** `pmap` children became a
+        lazy `Child` enum (`Resident | OnDisk(page_id)`; only leaves page); a clean leaf loads on
+        demand through the bounded pool with **CLOCK** (second-chance) eviction, **no pins** (an
+        in-flight reference + GC keeps an evicted-but-in-use node alive; clean nodes are immutable
+        so re-load is harmless). The skeleton-resident loader (`open_paged`/`read_skeleton`) builds
+        only interior pages resident. Rust needed an owned-rows step (a borrow can't outlive the
+        pool lock) + `Result` plumbing; Go/TS shed that via GC. The resident set is now bounded.
+  - [x] **P6.4c — budget config + hardening.** Handle-level **memory-budget API**:
+        `open(path, { cache_pages / CachePages / cachePages })` (budget in leaf pages, default 1024,
+        clamped ≥ 1) — a **handle setting**, not stored in the file (`spec/design/api.md` §2.1); a
+        read-only `resident_leaves` gauge (≤ budget by construction); large-file tests (a DB far
+        exceeding the budget opens / scans / mutates / round-trips with resident leaf count staying
+        bounded under a repeated point-query workload).
 
       _(size: XL; deps: B-tree pages + incremental commit [P6.1] ✓; §9/§13)_
 - [ ] **Streaming + spill-to-disk operators** — bound blocking operators (`ORDER BY`, hash
