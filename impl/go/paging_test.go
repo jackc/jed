@@ -39,14 +39,14 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	}
 
 	// Reopen demand-paged with a 3-leaf budget.
-	db, err = openWithCapacity(path, cap)
+	db, err = OpenWithOptions(path, OpenOptions{CachePages: cap})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// A PK table's skeleton load faults no leaves (it reads them only to count rows, uncached), so the
 	// pool starts empty — and the file holds many pages.
-	if db.residentLeaves() != 0 {
-		t.Fatalf("skeleton load should cache no leaf; resident = %d", db.residentLeaves())
+	if db.ResidentLeaves() != 0 {
+		t.Fatalf("skeleton load should cache no leaf; resident = %d", db.ResidentLeaves())
 	}
 	if int(db.pageCount) <= cap*5 {
 		t.Fatalf("file should have many more pages (%d) than the pool budget", db.pageCount)
@@ -62,15 +62,15 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 			t.Fatalf("row %d = (%d, %d)", i, row[0].Int, row[1].Int)
 		}
 	}
-	if db.residentLeaves() > cap {
-		t.Fatalf("resident leaves %d exceed the pool budget %d", db.residentLeaves(), cap)
+	if db.ResidentLeaves() > cap {
+		t.Fatalf("resident leaves %d exceed the pool budget %d", db.ResidentLeaves(), cap)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
-	db, err = openWithCapacity(path, cap)
+	db, err = OpenWithOptions(path, OpenOptions{CachePages: cap})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,14 +83,14 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if db.residentLeaves() > cap {
-		t.Fatalf("mutations should keep residency bounded; resident = %d", db.residentLeaves())
+	if db.ResidentLeaves() > cap {
+		t.Fatalf("mutations should keep residency bounded; resident = %d", db.ResidentLeaves())
 	}
 	if err := db.Close(); err != nil { // autocommit already persisted each statement
 		t.Fatal(err)
 	}
 
-	db, err = openWithCapacity(path, cap)
+	db, err = OpenWithOptions(path, OpenOptions{CachePages: cap})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +110,68 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 			if row[1].Int != 1200 {
 				t.Fatalf("k=600 v = %d, want 1200", row[1].Int)
 			}
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMemoryBudgetBoundsResidencyUnderLookups exercises P6.4c (memory-budget API + large-file
+// hardening, spec/design/pager.md §6): a database whose leaf pages far exceed a tiny CachePages budget
+// opens via the public API, and a repeated point-query workload keeps ResidentLeaves() within the
+// budget throughout (each scan faults leaves through the pool, which evicts under CLOCK).
+func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "budget.jed")
+	const n = 2000
+	const cap = 4
+
+	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Execute(db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Execute(db, "BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	for k := 0; k < n; k++ {
+		if _, err := Execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Execute(db, "COMMIT"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = OpenWithOptions(path, OpenOptions{CachePages: cap})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The data dwarfs the budget: far more pages than cap, yet nothing resident until a read.
+	if int(db.pageCount) <= cap*20 {
+		t.Fatalf("file (%d pages) should dwarf the %d-page budget", db.pageCount, cap)
+	}
+	if db.ResidentLeaves() != 0 {
+		t.Fatalf("skeleton load should cache no leaf; resident = %d", db.ResidentLeaves())
+	}
+
+	// A spread of point queries (each a full scan, no index) repeatedly faults leaves through the
+	// bounded pool; residency never exceeds the budget, and every answer is correct.
+	for k := 0; k < n; k += 97 {
+		out, err := Execute(db, fmt.Sprintf("SELECT v FROM t WHERE k = %d", k))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out.Rows) != 1 || out.Rows[0][0].Int != int64(k+1) {
+			t.Fatalf("query at k=%d: %v", k, out.Rows)
+		}
+		if db.ResidentLeaves() > cap {
+			t.Fatalf("resident leaves %d exceed the budget %d at k=%d", db.ResidentLeaves(), cap, k)
 		}
 	}
 	if err := db.Close(); err != nil {

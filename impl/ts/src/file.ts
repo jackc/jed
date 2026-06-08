@@ -55,24 +55,27 @@ function writeFullImage(db: Database): void {
   db.pageCount = Math.floor(bytes.length / db.pageSize);
 }
 
-// open opens an existing file-backed database at path (loading its committed state and adopting
-// its page size / txid). The path must exist — 58P01 otherwise; a malformed file is XX001, a read
-// failure 58030 (api.md §2).
-export function open(path: string): Database {
-  return openWithCapacity(path, DEFAULT_LEAF_POOL_PAGES);
-}
+// OpenOptions are open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
+// DatabaseOptions (create-time, fixed into the file), these are handle settings — not stored in the
+// file, so a different host may reopen the same file with different ones. cachePages is the buffer-pool
+// budget: the maximum number of leaf pages held resident at once (pager.md §3, P6.4b/c) — the bound
+// that lets a database far larger than RAM be served (pager.md §1); it never changes what a query
+// observes (§3/§5). Default DEFAULT_LEAF_POOL_PAGES; clamped to ≥ 1.
+export type OpenOptions = { cachePages?: number };
 
-// openWithCapacity opens an existing file-backed database with an explicit resident-leaf budget (the
-// buffer-pool capacity, in pages) — the budget the handle-level memory-budget API (P6.4c) will expose;
-// for now open uses the default and the demand-paging tests use a small one.
-export function openWithCapacity(path: string, capacity: number): Database {
+// open opens an existing file-backed database at path with optional open settings (the memory budget,
+// opts.cachePages). Loads its committed state, adopting its page size / txid. The path must exist —
+// 58P01 otherwise; a malformed file is XX001, a read failure 58030 (api.md §2.1).
+//
+// The demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf through
+// the bounded buffer pool on access, so the resident set is bounded by the pool — not the file size
+// (P6.4b). The budget is a handle setting, not stored in the file (§3). Later commits write through the
+// same pager kept open for the handle's life.
+export function open(path: string, opts: OpenOptions = {}): Database {
   if (!existsSync(path)) {
     throw engineError("undefined_file", "database file does not exist: " + path);
   }
-  // Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the
-  // demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf through
-  // the bounded buffer pool on access, so the resident set is bounded by the pool, not the file size
-  // (P6.4b). Later commits write through the same pager.
+  const capacity = opts.cachePages ?? DEFAULT_LEAF_POOL_PAGES;
   let fd: number;
   try {
     fd = openSync(path, "r+");
@@ -118,8 +121,8 @@ function persistImpl(db: Database, snap: Snapshot): void {
 }
 
 // residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
-// in-memory database. The demand-paging tests assert this stays within the pool budget even for a
-// database whose data far exceeds it (spec/design/pager.md §3); P6.4c promotes it to the public surface.
+// in-memory database (it is fully resident, nothing to page). The read-only gauge the
+// OpenOptions.cachePages budget bounds (≤ cachePages by construction; spec/design/pager.md §3).
 export function residentLeaves(db: Database): number {
   return db.paging === null ? 0 : db.paging.residentLeaves();
 }

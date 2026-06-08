@@ -98,10 +98,8 @@ impl<T> BufferPool<T> {
         }
     }
 
-    /// The number of pages currently resident — the bound the pool enforces (`≤ capacity`). The
-    /// demand-paging tests assert this stays within budget; P6.4c promotes it to the public
-    /// memory-budget surface.
-    #[allow(dead_code)]
+    /// The number of pages currently resident — the bound the pool enforces (`≤ capacity`), surfaced
+    /// publicly via [`crate::Database::resident_leaves`] (P6.4c, spec/design/pager.md §3).
     pub(crate) fn resident(&self) -> usize {
         self.slots.len()
     }

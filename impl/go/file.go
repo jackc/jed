@@ -59,21 +59,36 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 	return db, nil
 }
 
-// Open opens an existing file-backed database at path (loading its committed state and adopting
-// its page size / txid). The path must exist — 58P01 otherwise; a malformed file is XX001, a
-// read failure 58030 (api.md §2).
-func Open(path string) (*Database, error) {
-	return openWithCapacity(path, DefaultLeafPoolPages)
+// OpenOptions are open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
+// DatabaseOptions (create-time, fixed into the file), these are handle settings — not stored in the
+// file, so a different host may reopen the same file with different ones.
+type OpenOptions struct {
+	// CachePages is the buffer-pool budget: the maximum number of leaf pages held resident at once
+	// (spec/design/pager.md §3, P6.4b/c). The bound that lets a database far larger than RAM be served
+	// (pager.md §1); it never changes what a query observes (§3/§5). 0 → DefaultLeafPoolPages; clamped
+	// to ≥ 1.
+	CachePages int
 }
 
-// openWithCapacity opens an existing file-backed database with an explicit resident-leaf budget (the
-// buffer-pool capacity, in pages) — the budget the handle-level memory-budget API (P6.4c) will expose;
-// for now Open uses the default and the demand-paging tests use a small one.
-func openWithCapacity(path string, capacity int) (*Database, error) {
-	// Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the
-	// demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf through
-	// the bounded buffer pool on access, so the resident set is bounded by the pool, not the file size
-	// (P6.4b). Later commits write through the same pager.
+// Open opens an existing file-backed database at path with default open settings — the buffer-pool
+// budget defaults to DefaultLeafPoolPages. See OpenWithOptions to set the budget. The path must exist —
+// 58P01 otherwise; a malformed file is XX001, a read failure 58030 (api.md §2.1).
+func Open(path string) (*Database, error) {
+	return OpenWithOptions(path, OpenOptions{})
+}
+
+// OpenWithOptions opens an existing file-backed database at path with explicit open settings (the
+// memory budget, opts.CachePages). Loads its committed state, adopting its page size / txid.
+//
+// The demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf through
+// the bounded buffer pool on access, so the resident set is bounded by the pool — not the file size
+// (P6.4b). The budget is a handle setting, not stored in the file (§3). Later commits write through the
+// same pager kept open for the handle's life.
+func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
+	capacity := opts.CachePages
+	if capacity <= 0 {
+		capacity = DefaultLeafPoolPages
+	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -156,10 +171,10 @@ func (db *Database) persist(snap *Snapshot) error {
 	return nil
 }
 
-// residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
-// in-memory database. The demand-paging tests assert this stays within the pool budget even for a
-// database whose data far exceeds it (spec/design/pager.md §3); P6.4c promotes it to the public surface.
-func (db *Database) residentLeaves() int {
+// ResidentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
+// in-memory database (it is fully resident, nothing to page). The read-only gauge the
+// OpenOptions.CachePages budget bounds (≤ CachePages by construction; spec/design/pager.md §3).
+func (db *Database) ResidentLeaves() int {
 	if db.paging == nil {
 		return 0
 	}

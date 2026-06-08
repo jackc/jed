@@ -44,10 +44,24 @@ Two file constructors, deliberately split (open ≠ create):
   an initial empty durable image immediately (§3), so the file exists with its page size
   fixed. If the path **already exists**, it is `58P02 duplicate_file` — `create` never
   clobbers.
-- **`open(path)`** — open an **existing** file: load it ([../fileformat/format.md](../fileformat/format.md)),
+- **`open(path, opts?)`** — open an **existing** file: load it ([../fileformat/format.md](../fileformat/format.md)),
   adopting its recorded `page_size` and `txid`. If the path is **absent**, it is `58P01
   undefined_file` — `open` never creates. A malformed file is `XX001 data_corrupted`; an
-  underlying read failure is `58030 io_error`.
+  underlying read failure is `58030 io_error`. `opts` is optional open-time settings; today the only
+  field is the **memory budget** below.
+
+**Memory budget — a handle setting (P6.4c, [pager.md](pager.md) §3).** `open`'s `opts.cache_pages`
+sets the **buffer-pool budget**: the maximum number of leaf pages the demand-paging cache holds
+resident at once (the resident-set bound that lets a database far larger than RAM be served — pager.md
+§1). It is a **handle** setting, **not** stored in the file (unlike `page_size`): a different host may
+reopen the same file with a different budget. Default **1024** pages; clamped to ≥ 1. The budget bounds
+only the **leaf cache** — the interior B-tree skeleton is always resident (pager.md §1/§4) — and it
+**never changes what a query observes** (results and cost are invariant to it, pager.md §3/§5), so it
+is purely a memory/throughput knob. A read-only gauge, **`resident_leaves`** (`0` for an in-memory
+database), reports how many leaf pages are currently resident — `≤ cache_pages` by construction. An
+in-memory database ignores the budget (it is fully resident, nothing to page). Same shape across cores
+(Rust `OpenOptions { cache_pages }` / Go `OpenOptions { CachePages }` / TS `{ cachePages }`); the bare
+`open(path)` form uses the default.
 
 In-memory databases use the **existing constructors** (`Database::new()` / `NewDatabase()` /
 `new Database()`) — no backing file, default settings, kept verbatim for back-compat (the

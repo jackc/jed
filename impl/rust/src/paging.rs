@@ -63,10 +63,9 @@ impl SharedPaging {
         self.pager.lock().expect("pager mutex poisoned")
     }
 
-    /// The number of leaf pages currently resident in the pool — the bound the demand-paging tests
-    /// assert stays below the budget even for a database far larger than it. P6.4c promotes it to
-    /// the public memory-budget surface.
-    #[allow(dead_code)]
+    /// The number of leaf pages currently resident in the pool — the gauge the public
+    /// [`crate::Database::resident_leaves`] reports and the `cache_pages` budget bounds (P6.4c,
+    /// spec/design/pager.md §3).
     pub(crate) fn resident_leaves(&self) -> usize {
         self.pool
             .lock()

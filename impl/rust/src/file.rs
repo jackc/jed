@@ -5,7 +5,7 @@
 //! pages, published by alternating the meta slot (spec/fileformat/format.md, P6.1 part B) — the
 //! block seam below pwrites pages into the open file rather than rewriting it.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,26 @@ impl Default for DatabaseOptions {
     fn default() -> Self {
         DatabaseOptions {
             page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+}
+
+/// Open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
+/// [`DatabaseOptions`] (create-time, fixed into the file), these are **handle** settings — not stored
+/// in the file, so a different host may reopen the same file with different ones.
+#[derive(Clone, Copy, Debug)]
+pub struct OpenOptions {
+    /// The buffer-pool budget: the maximum number of **leaf** pages held resident at once
+    /// (spec/design/pager.md §3, P6.4b/c). The bound that lets a database far larger than RAM be
+    /// served (pager.md §1); it never changes what a query observes (§3/§5). Clamped to ≥ 1; default
+    /// [`DEFAULT_LEAF_POOL_PAGES`](crate::paging::DEFAULT_LEAF_POOL_PAGES).
+    pub cache_pages: usize,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        OpenOptions {
+            cache_pages: crate::paging::DEFAULT_LEAF_POOL_PAGES,
         }
     }
 }
@@ -50,7 +70,7 @@ impl Database {
         // the seam without re-opening (spec/design/pager.md). A freshly-created database has no rows,
         // so nothing is `OnDisk` yet — tables built in this session stay resident until a reopen
         // demand-pages them.
-        let file = OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
@@ -62,16 +82,25 @@ impl Database {
         Ok(db)
     }
 
-    /// Open an **existing** file-backed database at `path` (loading its committed state and
-    /// adopting its page size / txid). The path must exist — `58P01` otherwise; a malformed file
-    /// is `XX001`, a read failure `58030` (api.md §2).
+    /// Open an **existing** file-backed database at `path` with default open settings — the buffer-pool
+    /// budget defaults to [`DEFAULT_LEAF_POOL_PAGES`](crate::paging::DEFAULT_LEAF_POOL_PAGES). See
+    /// [`open_with_options`](Database::open_with_options) to set the budget.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Database> {
+        Database::open_with_options(path, OpenOptions::default())
+    }
+
+    /// Open an **existing** file-backed database at `path` with explicit open settings (the memory
+    /// budget, [`OpenOptions::cache_pages`]). Loads its committed state, adopting its page size / txid.
+    /// The path must exist — `58P01` otherwise; a malformed file is `XX001`, a read failure `58030`
+    /// (api.md §2.1).
+    ///
+    /// The demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf
+    /// through the bounded buffer pool on access, so the resident set is bounded by the pool — not the
+    /// file size (P6.4b, spec/design/pager.md). The budget is a **handle** setting, not stored in the
+    /// file (§3). Later commits write through the same pager kept open for the handle's life.
+    pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
         let path = path.as_ref();
-        // Open the backing read+write and keep it for the handle's life (spec/design/pager.md): the
-        // demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf
-        // through the bounded buffer pool on access, so the resident set is bounded by the pool, not
-        // the file size (P6.4b). Later commits write through the same pager.
-        let file = match OpenOptions::new().read(true).write(true).open(path) {
+        let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(EngineError::new(
@@ -82,38 +111,15 @@ impl Database {
             Err(e) => return Err(io_error(e)),
         };
         let pager = Pager::from_file(file)?;
-        let mut db = Database::open_paged(pager, DEFAULT_LEAF_POOL_PAGES)?;
+        let mut db = Database::open_paged(pager, opts.cache_pages)?;
         db.path = Some(path.to_path_buf());
         Ok(db)
     }
 
-    /// Open an existing file-backed database with an explicit resident-leaf budget (the buffer-pool
-    /// capacity, in pages). Like [`open`] but with the budget the handle-level memory-budget API
-    /// (P6.4c) will expose; for now it backs the demand-paging tests. Capacity is clamped to ≥ 1.
-    #[allow(dead_code)]
-    pub(crate) fn open_with_capacity<P: AsRef<Path>>(path: P, capacity: usize) -> Result<Database> {
-        let path = path.as_ref();
-        let file = match OpenOptions::new().read(true).write(true).open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(EngineError::new(
-                    SqlState::UndefinedFile,
-                    format!("database file does not exist: {}", path.display()),
-                ));
-            }
-            Err(e) => return Err(io_error(e)),
-        };
-        let pager = Pager::from_file(file)?;
-        let mut db = Database::open_paged(pager, capacity)?;
-        db.path = Some(path.to_path_buf());
-        Ok(db)
-    }
-
-    /// The number of leaf pages currently resident in the buffer pool — `0` for an in-memory database.
-    /// The demand-paging tests assert this stays within the pool budget even for a database whose
-    /// data far exceeds it (spec/design/pager.md §3); P6.4c promotes it to the public surface.
-    #[allow(dead_code)]
-    pub(crate) fn resident_leaves(&self) -> usize {
+    /// The number of leaf pages currently resident in the buffer pool — `0` for an in-memory database
+    /// (it is fully resident, nothing to page). The read-only gauge the [`OpenOptions::cache_pages`]
+    /// budget bounds (`≤ cache_pages` by construction; spec/design/pager.md §3).
+    pub fn resident_leaves(&self) -> usize {
         self.paging.as_ref().map_or(0, |p| p.resident_leaves())
     }
 
@@ -267,7 +273,7 @@ mod tests {
         }
 
         // Reopen demand-paged with a 3-leaf budget.
-        let db = Database::open_with_capacity(&path, CAP).unwrap();
+        let db = Database::open_with_options(&path, OpenOptions { cache_pages: CAP }).unwrap();
         // A PK table's skeleton load faults no leaves (it reads them only to count rows, uncached),
         // so the pool starts empty — and the file holds many pages.
         assert_eq!(db.resident_leaves(), 0, "skeleton load caches no leaf");
@@ -293,7 +299,8 @@ mod tests {
 
         // Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
         {
-            let mut db = Database::open_with_capacity(&path, CAP).unwrap();
+            let mut db =
+                Database::open_with_options(&path, OpenOptions { cache_pages: CAP }).unwrap();
             execute(&mut db, "DELETE FROM t WHERE k = 100").unwrap();
             execute(&mut db, "UPDATE t SET v = 999 WHERE k = 200").unwrap();
             execute(&mut db, "INSERT INTO t VALUES (600, 1200)").unwrap();
@@ -303,7 +310,7 @@ mod tests {
             );
             db.close().unwrap(); // autocommit already persisted each statement
         }
-        let db = Database::open_with_capacity(&path, CAP).unwrap();
+        let db = Database::open_with_options(&path, OpenOptions { cache_pages: CAP }).unwrap();
         let rows = db.rows_in_key_order("t").unwrap();
         assert_eq!(rows.len(), n as usize, "one deleted, one inserted");
         assert!(
@@ -316,6 +323,58 @@ mod tests {
         assert_eq!(k600[1], Value::Int(1200), "k=600 was inserted");
         db.close().unwrap();
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P6.4c memory-budget API + large-file hardening (spec/design/pager.md §6): a database whose leaf
+    /// pages far exceed a tiny `cache_pages` budget opens via the public API, and a repeated point-query
+    /// workload keeps `resident_leaves()` within the budget throughout (each scan faults leaves through
+    /// the pool, which evicts under CLOCK) — proving the resident set stays bounded under sustained reads.
+    #[test]
+    fn memory_budget_bounds_residency_under_lookups() {
+        let path = tmp("jed_p64c_budget.jed");
+        let _ = std::fs::remove_file(&path);
+        let n = 2000i64;
+        const CAP: usize = 4;
+
+        {
+            let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            execute(&mut db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)").unwrap();
+            execute(&mut db, "BEGIN").unwrap();
+            for k in 0..n {
+                execute(&mut db, &format!("INSERT INTO t VALUES ({k}, {})", k + 1)).unwrap();
+            }
+            execute(&mut db, "COMMIT").unwrap();
+            db.close().unwrap();
+        }
+
+        let mut db = Database::open_with_options(&path, OpenOptions { cache_pages: CAP }).unwrap();
+        // The data dwarfs the budget: far more pages than CAP, yet nothing is resident until a read.
+        assert!(
+            db.page_count as usize > CAP * 20,
+            "file ({} pages) should dwarf the {CAP}-page budget",
+            db.page_count
+        );
+        assert_eq!(db.resident_leaves(), 0);
+
+        // A spread of point queries (each a full scan, no index) repeatedly faults leaves through the
+        // bounded pool; residency never exceeds the budget, and every answer is correct.
+        for k in (0..n).step_by(97) {
+            let out = execute(&mut db, &format!("SELECT v FROM t WHERE k = {k}")).unwrap();
+            match out {
+                crate::Outcome::Query { rows, .. } => {
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0][0], Value::Int(k + 1), "value at k={k}");
+                }
+                _ => panic!("expected a query result"),
+            }
+            assert!(
+                db.resident_leaves() <= CAP,
+                "resident leaves {} exceed the budget {CAP} at k={k}",
+                db.resident_leaves()
+            );
+        }
+        db.close().unwrap();
         let _ = std::fs::remove_file(&path);
     }
 }

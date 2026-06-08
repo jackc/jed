@@ -205,9 +205,13 @@ change lands alone, on a frozen seam:
   is unchanged (§5). The resident set becomes bounded by (interior skeleton + pool budget). *The
   XL heart; the slice the whole item exists for.* Built Rust-first, then Go/TS (a `# cost:`
   corpus-neutral change, so each core can land green independently — like P5.1).
-- **P6.4c — budget config + hardening.** The handle-level memory budget (API surface) and
-  large-file tests (a database far exceeding the pool budget opens, scans, mutates, and
-  round-trips correctly while the resident leaf count stays bounded).
+- **P6.4c — budget config + hardening. ✅ landed.** The handle-level memory budget is now a public
+  **open-time** setting (`open(path, opts)` with `opts.cache_pages` — the buffer-pool capacity in leaf
+  pages, default 1024, clamped to ≥ 1; a **handle** setting, never stored in the file — api.md §2.1),
+  with a read-only **`resident_leaves`** gauge (`0` for in-memory). The internal `open_with_capacity`
+  seam was promoted to this public API. A large-file test in each core opens a database whose leaf
+  pages far exceed a tiny budget and confirms it scans, mutates, and round-trips correctly while the
+  resident leaf count stays `≤ cache_pages` throughout (including under a repeated-lookup workload).
 
 Deferred follow-ons (none foreclosed): **paging the interior skeleton too** (for a file whose
 interior alone exceeds RAM — a multi-TB extreme; needs `node_count`/cost to move to per-node-visit
