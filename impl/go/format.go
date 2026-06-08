@@ -20,12 +20,14 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion uint16 = 2  // on-disk format version (2 = page-backed CoW B-tree, P6.1)
-	pageHeader           = 12 // bytes of the catalog/B-tree page header
-	pageCatalog   byte   = 1  // page_type for a catalog page
-	pageLeaf      byte   = 2  // page_type for a B-tree leaf node
-	pageInterior  byte   = 3  // page_type for a B-tree interior node
-	rootPage      uint32 = 2  // catalog root of a fresh empty db (relocatable thereafter)
+	formatVersion uint16 = 2               // on-disk format version (2 = page-backed CoW B-tree, P6.1)
+	pageHeader           = 12              // bytes of the catalog/B-tree page header
+	pageCatalog   byte   = 1               // page_type for a catalog page
+	pageLeaf      byte   = 2               // page_type for a B-tree leaf node
+	pageInterior  byte   = 3               // page_type for a B-tree interior node
+	rootPage      uint32 = 2               // catalog root of a fresh empty db (relocatable thereafter)
+	minPageSize          = pageHeader + 36 // smallest valid page size (page + 36-byte meta header; format.md)
+	maxPageSize          = 65536           // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
 )
 
 // typeCodeForScalar maps a scalar type to its stable on-disk code, independent of
@@ -171,8 +173,11 @@ func (db *Database) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 // is recorded in the meta page; txid is written into both meta slots.
 func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	ps := int(pageSize)
-	if ps < pageHeader+36 {
+	if ps < minPageSize {
 		return nil, NewError(FeatureNotSupported, "page size too small for the format")
+	}
+	if ps > maxPageSize {
+		return nil, NewError(FeatureNotSupported, "page size too large for the format")
 	}
 	capacity := ps - pageHeader
 
@@ -447,7 +452,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 		return nil, NewError(DataCorrupted, "image smaller than a meta header")
 	}
 	pageSize := int(binary.BigEndian.Uint32(image[8:12]))
-	if pageSize < pageHeader+36 || len(image) < pageSize*2 {
+	if pageSize < minPageSize || pageSize > maxPageSize || len(image) < pageSize*2 {
 		return nil, NewError(DataCorrupted, "invalid page size")
 	}
 	mt, err := selectMeta(image, pageSize)
@@ -549,7 +554,7 @@ func collectNodePages(n *pnode, reached map[uint32]bool) {
 // pager.md §6); the residency win — a bounded resident set — already holds.
 func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 	pageSize := int(pgr.pageSize)
-	if pageSize < pageHeader+36 {
+	if pageSize < minPageSize || pageSize > maxPageSize {
 		return nil, NewError(DataCorrupted, "invalid page size")
 	}
 	paging := newSharedPaging(pgr, capacity)

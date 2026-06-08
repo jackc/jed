@@ -11,7 +11,7 @@ import { dirname } from "node:path";
 import { DEFAULT_PAGE_SIZE, Database, Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import { incrementalImage, loadDatabasePaged, metaPage, toImage } from "./format.ts";
-import { DEFAULT_LEAF_POOL_PAGES, SharedPaging } from "./paging.ts";
+import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
@@ -40,7 +40,7 @@ export function create(path: string, opts: DatabaseOptions = {}): Database {
   } catch (e) {
     throw ioError(e);
   }
-  db.paging = new SharedPaging(Pager.fromFd(fd), DEFAULT_LEAF_POOL_PAGES); // the file has a valid header
+  db.paging = new SharedPaging(Pager.fromFd(fd), cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize)); // valid header
   return db;
 }
 
@@ -57,25 +57,28 @@ function writeFullImage(db: Database): void {
 
 // OpenOptions are open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
 // DatabaseOptions (create-time, fixed into the file), these are handle settings — not stored in the
-// file, so a different host may reopen the same file with different ones. cachePages is the buffer-pool
-// budget: the maximum number of leaf pages held resident at once (pager.md §3, P6.4b/c) — the bound
-// that lets a database far larger than RAM be served (pager.md §1); it never changes what a query
-// observes (§3/§5). Default DEFAULT_LEAF_POOL_PAGES; clamped to ≥ 1.
-export type OpenOptions = { cachePages?: number };
+// file, so a different host may reopen the same file with different ones. cacheBytes is the buffer-pool
+// budget in bytes: roughly the maximum memory the resident leaf cache holds at once (pager.md §3,
+// P6.4b/c). Bytes, not a page count, so the budget does not silently scale with the file's page size;
+// the engine converts it to a leaf-page capacity by the file's page size as max(1, cacheBytes /
+// pageSize) (cacheLeaves). The bound that lets a database far larger than RAM be served (pager.md §1);
+// it never changes what a query observes (§3/§5). Default DEFAULT_CACHE_BYTES (8 MiB).
+export type OpenOptions = { cacheBytes?: number };
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,
-// opts.cachePages). Loads its committed state, adopting its page size / txid. The path must exist —
+// opts.cacheBytes). Loads its committed state, adopting its page size / txid. The path must exist —
 // 58P01 otherwise; a malformed file is XX001, a read failure 58030 (api.md §2.1).
 //
 // The demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf through
 // the bounded buffer pool on access, so the resident set is bounded by the pool — not the file size
-// (P6.4b). The budget is a handle setting, not stored in the file (§3). Later commits write through the
-// same pager kept open for the handle's life.
+// (P6.4b). The byte budget is converted to a leaf-page capacity by the file's page size (cacheLeaves).
+// The budget is a handle setting, not stored in the file (§3). Later commits write through the same
+// pager kept open for the handle's life.
 export function open(path: string, opts: OpenOptions = {}): Database {
   if (!existsSync(path)) {
     throw engineError("undefined_file", "database file does not exist: " + path);
   }
-  const capacity = opts.cachePages ?? DEFAULT_LEAF_POOL_PAGES;
+  const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
   let fd: number;
   try {
     fd = openSync(path, "r+");
@@ -83,7 +86,11 @@ export function open(path: string, opts: OpenOptions = {}): Database {
     throw ioError(e);
   }
   try {
-    const db = loadDatabasePaged(new SharedPaging(Pager.fromFd(fd), capacity));
+    // Read the file's page size first, then convert the byte budget to a leaf-page capacity; the loader
+    // rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
+    // page_size = 0 cannot divide by zero before that check runs).
+    const pager = Pager.fromFd(fd);
+    const db = loadDatabasePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     return db;
@@ -122,7 +129,7 @@ function persistImpl(db: Database, snap: Snapshot): void {
 
 // residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
 // in-memory database (it is fully resident, nothing to page). The read-only gauge the
-// OpenOptions.cachePages budget bounds (≤ cachePages by construction; spec/design/pager.md §3).
+// OpenOptions.cacheBytes budget bounds (≤ cacheBytes / pageSize by construction; spec/design/pager.md §3).
 export function residentLeaves(db: Database): number {
   return db.paging === null ? 0 : db.paging.residentLeaves();
 }

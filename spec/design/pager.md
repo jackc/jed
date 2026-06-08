@@ -90,9 +90,14 @@ above are per-host (storage.md §2).
 
 A fixed-capacity cache mapping `page_id → decoded page`, with:
 
-- **A memory budget** — a configurable maximum number of resident pages (the resident-set
-  bound). Default sized so a RAM-sized working set stays fully cache-resident (§1). The budget
-  is a *handle* setting, not an on-disk parameter.
+- **A memory budget** — a configurable bound on resident leaf memory (the resident-set bound),
+  stated in **bytes** at the handle (`open`'s `cache_bytes`, [api.md](api.md) §2.1) and converted
+  to a leaf-page capacity by the file's page size: `cache_leaves = max(1, cache_bytes / page_size)`.
+  Bytes, not a page count, so the caller's budget does not silently scale with the file's `page_size`
+  (a page count would mean a 256× different footprint across page sizes); the `max(1, …)` floor keeps
+  one leaf resident even when `cache_bytes < page_size`. Default sized so a RAM-sized working set stays
+  fully cache-resident (§1) — `DEFAULT_CACHE_BYTES = 8 MiB`. The budget is a *handle* setting, not an
+  on-disk parameter.
 - **Eviction — CLOCK (second-chance).** A simple per-core CLOCK over the resident pages: a
   reference bit set on access, a hand that sweeps and evicts the first unreferenced, unpinned,
   clean page. CLOCK over strict LRU because it needs no per-access list surgery and is the
@@ -206,12 +211,19 @@ change lands alone, on a frozen seam:
   XL heart; the slice the whole item exists for.* Built Rust-first, then Go/TS (a `# cost:`
   corpus-neutral change, so each core can land green independently — like P5.1).
 - **P6.4c — budget config + hardening. ✅ landed.** The handle-level memory budget is now a public
-  **open-time** setting (`open(path, opts)` with `opts.cache_pages` — the buffer-pool capacity in leaf
-  pages, default 1024, clamped to ≥ 1; a **handle** setting, never stored in the file — api.md §2.1),
-  with a read-only **`resident_leaves`** gauge (`0` for in-memory). The internal `open_with_capacity`
-  seam was promoted to this public API. A large-file test in each core opens a database whose leaf
-  pages far exceed a tiny budget and confirms it scans, mutates, and round-trips correctly while the
-  resident leaf count stays `≤ cache_pages` throughout (including under a repeated-lookup workload).
+  **open-time** setting (`open(path, opts)` with `opts.cache_bytes` — the buffer-pool budget in
+  **bytes**, default `DEFAULT_CACHE_BYTES = 8 MiB`, converted to a leaf-page capacity by the file's
+  page size as `max(1, cache_bytes / page_size)`; a **handle** setting, never stored in the file —
+  api.md §2.1), with a read-only **`resident_leaves`** gauge (`0` for in-memory). The internal
+  `open_with_capacity` seam was promoted to this public API. **Bytes, not a page count**, so the
+  caller's budget does not silently scale with the file's `page_size` (§3). **Page-size hardening:** the
+  page size is now bounded **`[48, 65536]`** (the meta-header floor through `MAX_PAGE_SIZE = 64 KiB`) and
+  rejected outside it on both paths — `0A000` on `create`, `XX001` on `open` — so a corrupt or hostile
+  file cannot record a multi-gigabyte `page_size` and force that allocation before its content is
+  validated (CLAUDE.md §13; format.md *Page model*). A large-file test in each core opens a database
+  whose leaf pages far exceed a tiny budget and confirms it scans, mutates, and round-trips correctly
+  while the resident leaf count stays `≤ cache_leaves` throughout (including under a repeated-lookup
+  workload), plus a `page_size > cache_bytes` case that keeps exactly one leaf resident.
 
 Deferred follow-ons (none foreclosed): **paging the interior skeleton too** (for a file whose
 interior alone exceeds RAM — a multi-TB extreme; needs `node_count`/cost to move to per-node-visit

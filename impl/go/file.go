@@ -55,7 +55,7 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	db.paging = newSharedPaging(p, DefaultLeafPoolPages)
+	db.paging = newSharedPaging(p, cacheLeaves(DefaultCacheBytes, db.pageSize))
 	return db, nil
 }
 
@@ -63,31 +63,34 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 // DatabaseOptions (create-time, fixed into the file), these are handle settings — not stored in the
 // file, so a different host may reopen the same file with different ones.
 type OpenOptions struct {
-	// CachePages is the buffer-pool budget: the maximum number of leaf pages held resident at once
-	// (spec/design/pager.md §3, P6.4b/c). The bound that lets a database far larger than RAM be served
-	// (pager.md §1); it never changes what a query observes (§3/§5). 0 → DefaultLeafPoolPages; clamped
-	// to ≥ 1.
-	CachePages int
+	// CacheBytes is the buffer-pool budget in bytes: roughly the maximum memory the resident leaf cache
+	// holds at once (spec/design/pager.md §3, P6.4b/c). Bytes, not a page count, so the budget does not
+	// silently scale with the file's page size; the engine converts it to a leaf-page capacity by the
+	// file's page size as max(1, CacheBytes / pageSize) (cacheLeaves). The bound that lets a database far
+	// larger than RAM be served (pager.md §1); it never changes what a query observes (§3/§5). 0 →
+	// DefaultCacheBytes (8 MiB).
+	CacheBytes int
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool
-// budget defaults to DefaultLeafPoolPages. See OpenWithOptions to set the budget. The path must exist —
-// 58P01 otherwise; a malformed file is XX001, a read failure 58030 (api.md §2.1).
+// budget defaults to DefaultCacheBytes (8 MiB). See OpenWithOptions to set the budget. The path must
+// exist — 58P01 otherwise; a malformed file is XX001, a read failure 58030 (api.md §2.1).
 func Open(path string) (*Database, error) {
 	return OpenWithOptions(path, OpenOptions{})
 }
 
 // OpenWithOptions opens an existing file-backed database at path with explicit open settings (the
-// memory budget, opts.CachePages). Loads its committed state, adopting its page size / txid.
+// memory budget, opts.CacheBytes). Loads its committed state, adopting its page size / txid.
 //
 // The demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf through
 // the bounded buffer pool on access, so the resident set is bounded by the pool — not the file size
-// (P6.4b). The budget is a handle setting, not stored in the file (§3). Later commits write through the
-// same pager kept open for the handle's life.
+// (P6.4b). The byte budget is converted to a leaf-page capacity by the file's page size (cacheLeaves).
+// The budget is a handle setting, not stored in the file (§3). Later commits write through the same
+// pager kept open for the handle's life.
 func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
-	capacity := opts.CachePages
-	if capacity <= 0 {
-		capacity = DefaultLeafPoolPages
+	cacheBytes := opts.CacheBytes
+	if cacheBytes <= 0 {
+		cacheBytes = DefaultCacheBytes
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -101,7 +104,10 @@ func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	db, err := LoadDatabasePaged(p, capacity)
+	// Convert the byte budget to a leaf-page capacity by the file's page size; LoadDatabasePaged
+	// rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
+	// pageSize = 0 cannot divide by zero before that check runs).
+	db, err := LoadDatabasePaged(p, cacheLeaves(cacheBytes, p.pageSize))
 	if err != nil {
 		_ = f.Close()
 		return nil, err
@@ -173,7 +179,7 @@ func (db *Database) persist(snap *Snapshot) error {
 
 // ResidentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
 // in-memory database (it is fully resident, nothing to page). The read-only gauge the
-// OpenOptions.CachePages budget bounds (≤ CachePages by construction; spec/design/pager.md §3).
+// OpenOptions.CacheBytes budget bounds (≤ CacheBytes / pageSize by construction; spec/design/pager.md §3).
 func (db *Database) ResidentLeaves() int {
 	if db.paging == nil {
 		return 0

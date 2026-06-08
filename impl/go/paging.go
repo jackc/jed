@@ -16,10 +16,26 @@ package jed
 
 import "sync"
 
-// DefaultLeafPoolPages is the default resident-leaf budget (pages). A handle-level memory-budget API
-// is P6.4c; until then this bounds the resident leaf set for every file-backed database. Sized so a
-// modest working set stays cache-resident while a larger-than-RAM file still pages within the bound.
-const DefaultLeafPoolPages = 1024
+// DefaultCacheBytes is the default memory budget for the resident leaf cache, in bytes (8 MiB) — the
+// OpenOptions.CacheBytes default (spec/design/pager.md §3, api.md §2.1). Exactly the historical
+// 1024-leaf default at the 8192 default page size; stated in bytes so the budget does not silently
+// scale with a file's page size. Converted to a leaf-page capacity by cacheLeaves.
+const DefaultCacheBytes = 8 * 1024 * 1024
+
+// cacheLeaves converts a byte budget to a resident-leaf-page capacity for a file of pageSize bytes:
+// max(1, cacheBytes / pageSize) (pager.md §3). The max(1, …) floor keeps one leaf resident even when
+// cacheBytes < pageSize — the minimum to walk a root→leaf path. The divisor is clamped to ≥ 1 so a
+// malformed pageSize = 0 cannot divide by zero (the loader rejects it separately as corrupt — format.go).
+func cacheLeaves(cacheBytes int, pageSize uint32) int {
+	div := int(pageSize)
+	if div < 1 {
+		div = 1
+	}
+	if n := cacheBytes / div; n > 1 {
+		return n
+	}
+	return 1
+}
 
 // sharedPaging is one database's pager + leaf buffer pool, shared (pointer) by all its stores and
 // snapshots.

@@ -49,6 +49,8 @@ const PAGE_CATALOG = 1; // page_type for a catalog page
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
 const PAGE_INTERIOR = 3; // page_type for a B-tree interior node
 const ROOT_PAGE = 2; // catalog root of a fresh empty db (relocatable thereafter)
+const MIN_PAGE_SIZE = PAGE_HEADER + 36; // smallest valid page size (page + 36-byte meta header; format.md)
+const MAX_PAGE_SIZE = 65536; // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
 
 const UTF8 = new TextEncoder();
 const UTF8_DECODE = new TextDecoder("utf-8", { fatal: true });
@@ -310,8 +312,11 @@ function pack(sizes: number[], capacity: number): number[][] {
 export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint): Uint8Array {
   const snap = src instanceof Snapshot ? src : src.committed;
   const ps = pageSize;
-  if (ps < PAGE_HEADER + 36) {
+  if (ps < MIN_PAGE_SIZE) {
     throw engineError("feature_not_supported", "page size too small for the format");
+  }
+  if (ps > MAX_PAGE_SIZE) {
+    throw engineError("feature_not_supported", "page size too large for the format");
   }
   const capacity = ps - PAGE_HEADER;
 
@@ -543,7 +548,7 @@ export function loadDatabase(image: Uint8Array): Database {
   }
   const dv = new DataView(image.buffer, image.byteOffset, image.byteLength);
   const pageSize = dv.getUint32(8, false);
-  if (pageSize < PAGE_HEADER + 36 || image.length < pageSize * 2) {
+  if (pageSize < MIN_PAGE_SIZE || pageSize > MAX_PAGE_SIZE || image.length < pageSize * 2) {
     throw engineError("data_corrupted", "invalid page size");
   }
   const mt = selectMeta(image, dv, pageSize);
@@ -616,7 +621,9 @@ function collectNodePages(n: PNode, reached: Set<number>): void {
 // per-subtree row count in the format — a deferred follow-on, pager.md §6. Memory is already bounded.)
 export function loadDatabasePaged(paging: SharedPaging): Database {
   const pageSize = paging.pageSize();
-  if (pageSize < PAGE_HEADER + 36) throw engineError("data_corrupted", "invalid page size");
+  if (pageSize < MIN_PAGE_SIZE || pageSize > MAX_PAGE_SIZE) {
+    throw engineError("data_corrupted", "invalid page size");
+  }
 
   // Select the live meta from slots 0 and 1 (highest valid txid; the lone valid slot on a torn write),
   // read as individual blocks through the pager.

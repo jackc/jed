@@ -30,6 +30,14 @@ const MAGIC: [u8; 4] = *b"JEDB";
 const FORMAT_VERSION: u16 = 2;
 /// Bytes of the page header on catalog / B-tree pages.
 const PAGE_HEADER: usize = 12;
+/// Smallest valid page size: the 36-byte meta header (plus the page header) must fit
+/// (spec/fileformat/format.md *Page model*). Below it a file cannot hold its own meta.
+const MIN_PAGE_SIZE: usize = PAGE_HEADER + 36;
+/// Largest valid page size — 64 KiB (`MAX_PAGE_SIZE`, format.md *Page model*). The cap bounds the
+/// largest single page allocation: without it a corrupt or hostile file could record a
+/// multi-gigabyte `page_size` and force that allocation before its content is validated (CLAUDE.md
+/// §13).
+const MAX_PAGE_SIZE: usize = 65536;
 /// `page_type` for a catalog page.
 const PAGE_CATALOG: u8 = 1;
 /// `page_type` for a B-tree leaf node.
@@ -172,10 +180,16 @@ impl Snapshot {
     /// commit reuses `serialize_node` but writes only the dirty path; storage.md §4.)
     pub fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
         let ps = page_size as usize;
-        if ps < PAGE_HEADER + 36 {
+        if ps < MIN_PAGE_SIZE {
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
                 "page size too small for the format",
+            ));
+        }
+        if ps > MAX_PAGE_SIZE {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "page size too large for the format",
             ));
         }
         let cap = ps - PAGE_HEADER;
@@ -474,7 +488,7 @@ impl Database {
             return Err(corrupt("image smaller than a meta header"));
         }
         let page_size = read_u32_at(image, 8)? as usize;
-        if page_size < PAGE_HEADER + 36 || image.len() < page_size * 2 {
+        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size) || image.len() < page_size * 2 {
             return Err(corrupt("invalid page size"));
         }
         let meta = select_meta(image, page_size)?;
@@ -543,7 +557,7 @@ impl Database {
     /// deferred follow-on, pager.md §6); the residency win — a bounded *resident* set — already holds.
     pub(crate) fn open_paged(pager: Pager, capacity: usize) -> Result<Database> {
         let page_size = pager.page_size() as usize;
-        if page_size < PAGE_HEADER + 36 {
+        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size) {
             return Err(corrupt("invalid page size"));
         }
         let paging = SharedPaging::new(pager, capacity);

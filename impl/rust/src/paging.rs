@@ -22,10 +22,20 @@ use crate::pager::Pager;
 use crate::pmap::Node;
 use crate::types::ScalarType;
 
-/// The default resident-leaf budget (pages). A handle-level memory-budget API is P6.4c; until then
-/// this bounds the resident leaf set for every file-backed database. Sized so a modest working set
-/// stays cache-resident while a larger-than-RAM file still pages within the bound (pager.md §3).
-pub(crate) const DEFAULT_LEAF_POOL_PAGES: usize = 1024;
+/// The default memory budget for the resident leaf cache, in **bytes** (8 MiB) — the
+/// [`crate::OpenOptions::cache_bytes`] default (spec/design/pager.md §3, api.md §2.1). Exactly the
+/// historical 1024-leaf default at the 8192 default page size; stated in bytes so the budget does not
+/// silently scale with a file's page size. Converted to a leaf-page capacity by [`cache_leaves`].
+pub(crate) const DEFAULT_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Convert a byte budget to a resident-leaf-page capacity for a file of `page_size` bytes:
+/// `max(1, cache_bytes / page_size)` (pager.md §3). The `max(1, …)` floor keeps one leaf resident even
+/// when `cache_bytes < page_size` — the minimum to walk a root→leaf path. The divisor is clamped to
+/// ≥ 1 so a malformed `page_size = 0` cannot divide by zero (the loader rejects it separately as
+/// corrupt — format.rs).
+pub(crate) fn cache_leaves(cache_bytes: usize, page_size: u32) -> usize {
+    (cache_bytes / (page_size as usize).max(1)).max(1)
+}
 
 /// One database's pager + leaf buffer pool, shared (`Arc`) by all its stores and snapshots.
 pub(crate) struct SharedPaging {

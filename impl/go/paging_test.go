@@ -1,8 +1,10 @@
 package jed
 
 import (
+	"encoding/binary"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -39,7 +41,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	}
 
 	// Reopen demand-paged with a 3-leaf budget.
-	db, err = OpenWithOptions(path, OpenOptions{CachePages: cap})
+	db, err = OpenWithOptions(path, OpenOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +72,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	}
 
 	// Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
-	db, err = OpenWithOptions(path, OpenOptions{CachePages: cap})
+	db, err = OpenWithOptions(path, OpenOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +92,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = OpenWithOptions(path, OpenOptions{CachePages: cap})
+	db, err = OpenWithOptions(path, OpenOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +120,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 }
 
 // TestMemoryBudgetBoundsResidencyUnderLookups exercises P6.4c (memory-budget API + large-file
-// hardening, spec/design/pager.md §6): a database whose leaf pages far exceed a tiny CachePages budget
+// hardening, spec/design/pager.md §6): a database whose leaf pages far exceed a tiny CacheBytes budget
 // opens via the public API, and a repeated point-query workload keeps ResidentLeaves() within the
 // budget throughout (each scan faults leaves through the pool, which evicts under CLOCK).
 func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
@@ -148,7 +150,7 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = OpenWithOptions(path, OpenOptions{CachePages: cap})
+	db, err = OpenWithOptions(path, OpenOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,5 +178,87 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestTinyBudgetKeepsOneLeafResident exercises P6.4c (spec/design/pager.md §3, api.md §2.1): a byte
+// budget smaller than a single page still keeps one leaf resident — the max(1, CacheBytes/pageSize)
+// floor — and still scans correctly. This is the pageSize > CacheBytes case.
+func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tiny.jed")
+	const n = 400
+
+	db, err := Create(path, DatabaseOptions{PageSize: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Execute(db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Execute(db, "BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	for k := 0; k < n; k++ {
+		if _, err := Execute(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Execute(db, "COMMIT"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A 1-byte budget is far below the 256-byte page size: it must clamp to one resident leaf, not zero.
+	db, err = OpenWithOptions(path, OpenOptions{CacheBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := db.RowsInKeyOrder("t")
+	if len(rows) != n {
+		t.Fatalf("row count %d != %d", len(rows), n)
+	}
+	for i, row := range rows {
+		if row[0].Int != int64(i) || row[1].Int != int64(i)+1 {
+			t.Fatalf("row %d = (%d, %d)", i, row[0].Int, row[1].Int)
+		}
+	}
+	if got := db.ResidentLeaves(); got != 1 {
+		t.Fatalf("a sub-page budget should keep exactly one leaf resident; got %d", got)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCreateRejectsOversizedPageSize exercises P6.4c page-size hardening (format.md *Page model*):
+// Create rejects a page size above maxPageSize (64 KiB) — without the cap a huge page size forces a
+// multi-gigabyte allocation.
+func TestCreateRejectsOversizedPageSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "huge.jed")
+	_, err := Create(path, DatabaseOptions{PageSize: 1 << 20})
+	ee, ok := err.(*EngineError)
+	if !ok || ee.Code() != "0A000" {
+		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
+	}
+	if got := ee.Message; !strings.Contains(got, "too large") {
+		t.Fatalf("message should name the cause, got %q", got)
+	}
+}
+
+// TestReadRejectsOversizedPageSize exercises P6.4c page-size hardening (format.md *Page model*): the
+// read path rejects a file whose meta records an out-of-range page_size as corrupt — the range check
+// runs before any allocation against that size, so a hostile file cannot force a giant allocation
+// (CLAUDE.md §13).
+func TestReadRejectsOversizedPageSize(t *testing.T) {
+	// A crafted meta header recording page_size = 70000 (> maxPageSize) in big-endian at offset 8.
+	image := make([]byte, 200)
+	copy(image[0:4], "JEDB")
+	binary.BigEndian.PutUint32(image[8:12], 70000)
+	_, err := LoadDatabase(image)
+	ee, ok := err.(*EngineError)
+	if !ok || ee.Code() != "XX001" {
+		t.Fatalf("want XX001 data_corrupted, got %v", err)
 	}
 }

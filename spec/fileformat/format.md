@@ -66,8 +66,15 @@ values, and compression.
 
 The file is a flat array of fixed-size **pages**; the page size is a format parameter
 recorded in the meta page (**default 8192**; the golden fixtures use **256** so the hex stays
-reviewable). `page_count = file_size / page_size`. Every page is zero-filled to exactly
-`page_size`. Two page-payload capacities derive from the page size and recur throughout:
+reviewable). It must lie in **`[48, 65536]`**: the minimum is `PAGE_HEADER + 36` (below it the
+36-byte meta header does not fit), the maximum is `MAX_PAGE_SIZE = 65536` (64 KiB). A core
+**rejects** a page size outside this range — `0A000` when serializing (`create`), `XX001` when
+reading a file's meta (`open`). The maximum bounds the largest single page allocation: without
+it a corrupt or hostile file could record a multi-gigabyte `page_size` and force that allocation
+before any content is validated (the untrusted-input concern, CLAUDE.md §13). Any value in range
+is accepted (power-of-two is **not** required). `page_count = file_size / page_size`. Every page
+is zero-filled to exactly `page_size`. Two page-payload capacities derive from the page size and
+recur throughout:
 
 ```
 C          = page_size - 12       # PAGE_HEADER; the bytes a page body may hold

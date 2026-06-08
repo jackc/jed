@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{DEFAULT_PAGE_SIZE, Database, Snapshot};
 use crate::pager::Pager;
-use crate::paging::{DEFAULT_LEAF_POOL_PAGES, SharedPaging};
+use crate::paging::{DEFAULT_CACHE_BYTES, SharedPaging, cache_leaves};
 
 /// Settings for a newly-created database file (spec/design/api.md §2). `page_size` is fixed
 /// into the file's meta at creation and cannot change thereafter.
@@ -34,17 +34,19 @@ impl Default for DatabaseOptions {
 /// in the file, so a different host may reopen the same file with different ones.
 #[derive(Clone, Copy, Debug)]
 pub struct OpenOptions {
-    /// The buffer-pool budget: the maximum number of **leaf** pages held resident at once
-    /// (spec/design/pager.md §3, P6.4b/c). The bound that lets a database far larger than RAM be
-    /// served (pager.md §1); it never changes what a query observes (§3/§5). Clamped to ≥ 1; default
-    /// [`DEFAULT_LEAF_POOL_PAGES`](crate::paging::DEFAULT_LEAF_POOL_PAGES).
-    pub cache_pages: usize,
+    /// The buffer-pool budget **in bytes**: roughly the maximum memory the resident leaf cache holds
+    /// at once (spec/design/pager.md §3, P6.4b/c). Bytes, not a page count, so the budget does not
+    /// silently scale with the file's page size; the engine converts it to a leaf-page capacity by the
+    /// file's page size as `max(1, cache_bytes / page_size)` ([`cache_leaves`](crate::paging)). The
+    /// bound that lets a database far larger than RAM be served (pager.md §1); it never changes what a
+    /// query observes (§3/§5). Default [`DEFAULT_CACHE_BYTES`](crate::paging) (8 MiB).
+    pub cache_bytes: usize,
 }
 
 impl Default for OpenOptions {
     fn default() -> Self {
         OpenOptions {
-            cache_pages: crate::paging::DEFAULT_LEAF_POOL_PAGES,
+            cache_bytes: DEFAULT_CACHE_BYTES,
         }
     }
 }
@@ -77,27 +79,28 @@ impl Database {
             .map_err(io_error)?;
         db.paging = Some(SharedPaging::new(
             Pager::from_file(file)?,
-            DEFAULT_LEAF_POOL_PAGES,
+            cache_leaves(DEFAULT_CACHE_BYTES, db.page_size),
         ));
         Ok(db)
     }
 
     /// Open an **existing** file-backed database at `path` with default open settings — the buffer-pool
-    /// budget defaults to [`DEFAULT_LEAF_POOL_PAGES`](crate::paging::DEFAULT_LEAF_POOL_PAGES). See
+    /// budget defaults to [`DEFAULT_CACHE_BYTES`](crate::paging) (8 MiB). See
     /// [`open_with_options`](Database::open_with_options) to set the budget.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Database> {
         Database::open_with_options(path, OpenOptions::default())
     }
 
     /// Open an **existing** file-backed database at `path` with explicit open settings (the memory
-    /// budget, [`OpenOptions::cache_pages`]). Loads its committed state, adopting its page size / txid.
+    /// budget, [`OpenOptions::cache_bytes`]). Loads its committed state, adopting its page size / txid.
     /// The path must exist — `58P01` otherwise; a malformed file is `XX001`, a read failure `58030`
     /// (api.md §2.1).
     ///
     /// The demand-paged loader builds only the interior B-tree skeleton resident, faulting each leaf
     /// through the bounded buffer pool on access, so the resident set is bounded by the pool — not the
-    /// file size (P6.4b, spec/design/pager.md). The budget is a **handle** setting, not stored in the
-    /// file (§3). Later commits write through the same pager kept open for the handle's life.
+    /// file size (P6.4b, spec/design/pager.md). The byte budget is converted to a leaf-page capacity by
+    /// the file's page size (`cache_leaves`). The budget is a **handle** setting, not stored in the file
+    /// (§3). Later commits write through the same pager kept open for the handle's life.
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
         let path = path.as_ref();
         let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
@@ -111,14 +114,18 @@ impl Database {
             Err(e) => return Err(io_error(e)),
         };
         let pager = Pager::from_file(file)?;
-        let mut db = Database::open_paged(pager, opts.cache_pages)?;
+        // Convert the byte budget to a leaf-page capacity by the file's page size; `open_paged`
+        // rejects an out-of-range page size as corrupt (`cache_leaves` clamps the divisor so a
+        // malformed `page_size = 0` cannot divide by zero before that check runs).
+        let capacity = cache_leaves(opts.cache_bytes, pager.page_size());
+        let mut db = Database::open_paged(pager, capacity)?;
         db.path = Some(path.to_path_buf());
         Ok(db)
     }
 
     /// The number of leaf pages currently resident in the buffer pool — `0` for an in-memory database
-    /// (it is fully resident, nothing to page). The read-only gauge the [`OpenOptions::cache_pages`]
-    /// budget bounds (`≤ cache_pages` by construction; spec/design/pager.md §3).
+    /// (it is fully resident, nothing to page). The read-only gauge the [`OpenOptions::cache_bytes`]
+    /// budget bounds (`≤ cache_bytes / page_size` by construction; spec/design/pager.md §3).
     pub fn resident_leaves(&self) -> usize {
         self.paging.as_ref().map_or(0, |p| p.resident_leaves())
     }
@@ -273,7 +280,13 @@ mod tests {
         }
 
         // Reopen demand-paged with a 3-leaf budget.
-        let db = Database::open_with_options(&path, OpenOptions { cache_pages: CAP }).unwrap();
+        let db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                cache_bytes: CAP * 256,
+            },
+        )
+        .unwrap();
         // A PK table's skeleton load faults no leaves (it reads them only to count rows, uncached),
         // so the pool starts empty — and the file holds many pages.
         assert_eq!(db.resident_leaves(), 0, "skeleton load caches no leaf");
@@ -299,8 +312,13 @@ mod tests {
 
         // Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
         {
-            let mut db =
-                Database::open_with_options(&path, OpenOptions { cache_pages: CAP }).unwrap();
+            let mut db = Database::open_with_options(
+                &path,
+                OpenOptions {
+                    cache_bytes: CAP * 256,
+                },
+            )
+            .unwrap();
             execute(&mut db, "DELETE FROM t WHERE k = 100").unwrap();
             execute(&mut db, "UPDATE t SET v = 999 WHERE k = 200").unwrap();
             execute(&mut db, "INSERT INTO t VALUES (600, 1200)").unwrap();
@@ -310,7 +328,13 @@ mod tests {
             );
             db.close().unwrap(); // autocommit already persisted each statement
         }
-        let db = Database::open_with_options(&path, OpenOptions { cache_pages: CAP }).unwrap();
+        let db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                cache_bytes: CAP * 256,
+            },
+        )
+        .unwrap();
         let rows = db.rows_in_key_order("t").unwrap();
         assert_eq!(rows.len(), n as usize, "one deleted, one inserted");
         assert!(
@@ -327,7 +351,7 @@ mod tests {
     }
 
     /// P6.4c memory-budget API + large-file hardening (spec/design/pager.md §6): a database whose leaf
-    /// pages far exceed a tiny `cache_pages` budget opens via the public API, and a repeated point-query
+    /// pages far exceed a tiny `cache_bytes` budget opens via the public API, and a repeated point-query
     /// workload keeps `resident_leaves()` within the budget throughout (each scan faults leaves through
     /// the pool, which evicts under CLOCK) — proving the resident set stays bounded under sustained reads.
     #[test]
@@ -348,7 +372,13 @@ mod tests {
             db.close().unwrap();
         }
 
-        let mut db = Database::open_with_options(&path, OpenOptions { cache_pages: CAP }).unwrap();
+        let mut db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                cache_bytes: CAP * 256,
+            },
+        )
+        .unwrap();
         // The data dwarfs the budget: far more pages than CAP, yet nothing is resident until a read.
         assert!(
             db.page_count as usize > CAP * 20,
@@ -376,5 +406,79 @@ mod tests {
         }
         db.close().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// P6.4c (spec/design/pager.md §3, api.md §2.1): a byte budget smaller than a single page still
+    /// keeps **one** leaf resident — the `max(1, cache_bytes / page_size)` floor — and still scans
+    /// correctly. This is the `page_size > cache_bytes` case.
+    #[test]
+    fn tiny_budget_keeps_one_leaf_resident() {
+        let path = tmp("jed_p64c_tiny_budget.jed");
+        let _ = std::fs::remove_file(&path);
+        let n = 400i64;
+
+        {
+            let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            execute(&mut db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)").unwrap();
+            execute(&mut db, "BEGIN").unwrap();
+            for k in 0..n {
+                execute(&mut db, &format!("INSERT INTO t VALUES ({k}, {})", k + 1)).unwrap();
+            }
+            execute(&mut db, "COMMIT").unwrap();
+            db.close().unwrap();
+        }
+
+        // A 1-byte budget is far below the 256-byte page size: it must clamp to one resident leaf,
+        // not zero (zero would be unable to walk a root→leaf path).
+        let db = Database::open_with_options(&path, OpenOptions { cache_bytes: 1 }).unwrap();
+        let rows = db.rows_in_key_order("t").unwrap();
+        assert_eq!(rows.len(), n as usize);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row[0], Value::Int(i as i64));
+            assert_eq!(row[1], Value::Int(i as i64 + 1));
+        }
+        assert_eq!(
+            db.resident_leaves(),
+            1,
+            "a sub-page budget keeps exactly one leaf resident"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P6.4c page-size hardening (format.md *Page model*): `create` rejects a page size above
+    /// `MAX_PAGE_SIZE` (64 KiB) — without the cap a huge page size forces a multi-gigabyte allocation.
+    #[test]
+    fn create_rejects_oversized_page_size() {
+        let path = tmp("jed_p64c_huge_page.jed");
+        let _ = std::fs::remove_file(&path);
+        let err = Database::create(&path, DatabaseOptions { page_size: 1 << 20 })
+            .err()
+            .expect("oversized page size must be rejected");
+        assert_eq!(err.state, SqlState::FeatureNotSupported);
+        assert!(
+            err.message.contains("too large"),
+            "message names the cause: {}",
+            err.message
+        );
+        // create must not leave a partial file behind on a rejected page size.
+        assert!(!path.exists(), "no file written on a rejected page size");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P6.4c page-size hardening (format.md *Page model*): the read path rejects a file whose meta
+    /// records an out-of-range `page_size` as corrupt — the range check runs *before* any allocation
+    /// against that size, so a hostile file cannot force a giant allocation (CLAUDE.md §13).
+    #[test]
+    fn open_rejects_oversized_page_size() {
+        // A crafted meta header recording page_size = 70000 (> MAX_PAGE_SIZE) in big-endian at offset 8.
+        let mut image = vec![0u8; 200];
+        image[0..4].copy_from_slice(b"JEDB");
+        image[8..12].copy_from_slice(&70000u32.to_be_bytes());
+        let err = Database::from_image(&image)
+            .err()
+            .expect("an out-of-range page size must be rejected");
+        assert_eq!(err.state, SqlState::DataCorrupted);
+        assert!(err.message.contains("page size"), "{}", err.message);
     }
 }
