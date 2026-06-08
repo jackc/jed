@@ -77,6 +77,10 @@ id = "query.comparison_order"
 description = "WHERE with an ordering predicate ( < , > , <= , >= )"
 
 [[capability]]
+id = "query.point_lookup"
+description = "Primary-key predicate pushdown — a single-table WHERE on the primary key (`pk = c`, `pk < c`, BETWEEN, AND-combinations) seeks/ranges the storage B-tree instead of a full scan, so page_read drops to the nodes on the access path and storage_row_read to the rows in range (spec/design/cost.md §3 \"bounded scan / point lookup\"). A cost-visible optimization: a core lacking it would compute the higher full-scan cost, so cost-asserting tests over PK predicates require it."
+
+[[capability]]
 id = "query.is_null"
 description = "IS NULL / IS NOT NULL predicates"
 

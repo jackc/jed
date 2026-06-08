@@ -13,7 +13,7 @@
 import type { Value } from "./value.ts";
 import type { ScalarType } from "./types.ts";
 import { PMap, pmapFromLoaded } from "./pmap.ts";
-import type { LeafSource, PNode } from "./pmap.ts";
+import type { KeyBound, LeafSource, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
 import { recordSize } from "./format.ts";
 
@@ -155,6 +155,25 @@ export class TableStore {
   entriesInKeyOrder(): Entry[] {
     const { keys, vals } = this.rows.inorder(this.leafSrc());
     return keys.map((k, i) => ({ key: k, row: vals[i] }));
+  }
+
+  // rangeRows returns the rows whose primary key lies within the bound, in key order — a bounded
+  // B-tree scan that faults only the leaves the bound spans (spec/design/cost.md §3 "bounded scan").
+  rangeRows(b: KeyBound): Row[] {
+    return this.rows.rangeEntries(b, this.leafSrc()).vals;
+  }
+
+  // rangeEntries returns the (key, row) pairs whose primary key lies within the bound, in key order
+  // (the mutation paths need the keys to remove/replace).
+  rangeEntries(b: KeyBound): Entry[] {
+    const { keys, vals } = this.rows.rangeEntries(b, this.leafSrc());
+    return keys.map((k, i) => ({ key: k, row: vals[i] }));
+  }
+
+  // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
+  // charges (cost.md §3). Equals nodeCount for the unbounded bound.
+  overlapNodeCount(b: KeyBound): number {
+    return this.rows.overlapNodeCount(b);
   }
 
   // treeRoot is the root B-tree node of this store, for the page-backed serializer

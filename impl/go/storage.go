@@ -139,6 +139,31 @@ func (s *TableStore) IterInKeyOrder() ([]Row, error) {
 // scan charges (spec/design/cost.md §3 "page_read"). 0 for an empty table.
 func (s *TableStore) NodeCount() int { return s.rows.nodeCount() }
 
+// RangeRows returns the rows whose primary key lies within the bound, in key order — a bounded
+// B-tree scan that faults only the leaves the bound spans (spec/design/cost.md §3 "bounded scan").
+func (s *TableStore) RangeRows(b keyBound) ([]Row, error) {
+	_, vals, err := s.rows.rangeEntries(b, s.leafSrc())
+	return vals, err
+}
+
+// RangeEntries returns the (key, row) pairs whose primary key lies within the bound, in key order
+// (the mutation paths need the keys to Remove/Replace).
+func (s *TableStore) RangeEntries(b keyBound) ([]Entry, error) {
+	keys, vals, err := s.rows.rangeEntries(b, s.leafSrc())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Entry, len(keys))
+	for i := range keys {
+		out[i] = Entry{Key: keys[i], Row: vals[i]}
+	}
+	return out, nil
+}
+
+// OverlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
+// charges (spec/design/cost.md §3). Equals NodeCount for the unbounded bound.
+func (s *TableStore) OverlapNodeCount(b keyBound) int { return s.rows.overlapNodeCount(b) }
+
 // Entry is one stored (encoded key, row) pair.
 type Entry struct {
 	Key []byte

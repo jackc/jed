@@ -44,7 +44,10 @@ event  = "one B-tree node (page) touched while scanning a table store"
 # empty table (no root) charges none. ADDED alongside `storage_row_read`, NOT a rename.
 # Counted as a LOGICAL page access (the tree's structural node count), NOT a physical disk
 # fetch, so a future buffer pool / cache (CLAUDE.md §9) cannot perturb the deterministic
-# cost (§13, ../design/cost.md §3).
+# cost (§13, ../design/cost.md §3). A single-table primary-key predicate now pushes down to
+# a BOUNDED scan (`query.point_lookup`): page_read charges only the nodes the key range
+# intersects (a point lookup ≈ the tree height), the unbounded range reproducing the full
+# scan exactly — so existing costs are unchanged (../design/cost.md §3 "Bounded scan").
 
 [[unit]]
 id     = "row_produced"

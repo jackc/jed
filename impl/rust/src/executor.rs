@@ -15,6 +15,7 @@ use crate::costs::COSTS;
 use crate::decimal::{Decimal, MAX_PRECISION, MAX_SCALE};
 use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
+use crate::pmap::KeyBound;
 use crate::storage::{Row, TableStore};
 use crate::timestamp::{parse_timestamp, parse_timestamptz};
 use crate::types::{DecimalTypmod, ScalarType};
@@ -845,6 +846,9 @@ impl Database {
                 format!("table does not exist: {}", del.table),
             )
         })?;
+        // Capture the PK (index, type) now, by value, so the primary-key pushdown can be detected
+        // after the `table` borrow ends (the mutate path takes `&mut self`).
+        let pk_info = table.primary_key_index().map(|i| (i, table.columns[i].ty));
         // DELETE is single-table; resolve its WHERE against a one-relation scope.
         let scope = Scope::single(self, table);
         let mut ptypes = ParamTypes::default();
@@ -876,10 +880,31 @@ impl Database {
             params: &bound,
             outer: &[],
         };
-        // A full scan walks the table's whole B-tree: page_read per node (block, before the
-        // rows), then storage_row_read per row (spec/design/cost.md §3 "page_read").
-        meter.charge(COSTS.page_read * self.store(&del.table).node_count() as i64);
-        for (k, row) in self.store(&del.table).iter_entries()? {
+        // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
+        // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
+        // page_read per visited node (block, before the rows), then storage_row_read per scanned row.
+        let pk_bound = match (&filter, pk_info) {
+            (Some(f), Some((pk_idx, pk_ty))) => detect_pk_bound(f, pk_idx, pk_ty),
+            _ => None,
+        };
+        let (entries, overlap) = match &pk_bound {
+            Some(bp) => match build_key_bound(bp, &bound) {
+                Some(b) => {
+                    let store = self.store(&del.table);
+                    (
+                        store.range_entries(&b)?,
+                        store.overlap_node_count(&b) as i64,
+                    )
+                }
+                None => (Vec::new(), 0),
+            },
+            None => {
+                let store = self.store(&del.table);
+                (store.iter_entries()?, store.node_count() as i64)
+            }
+        };
+        meter.charge(COSTS.page_read * overlap);
+        for (k, row) in entries {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
@@ -918,6 +943,9 @@ impl Database {
 
         // Resolve assignments up front (fail fast, deterministic).
         let pk_idx = table.primary_key_index();
+        // Capture the PK (index, type) by value for the primary-key pushdown (detected after the
+        // `table` borrow ends, since the mutate path takes `&mut self`).
+        let pk_info = pk_idx.map(|i| (i, table.columns[i].ty));
         let mut ptypes = ParamTypes::default();
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
         for a in &upd.assignments {
@@ -988,10 +1016,31 @@ impl Database {
             params: &bound,
             outer: &[],
         };
-        // A full scan walks the table's whole B-tree: page_read per node (block, before the
-        // rows), then storage_row_read per row (spec/design/cost.md §3 "page_read").
-        meter.charge(COSTS.page_read * self.store(&upd.table).node_count() as i64);
-        for (key, row) in self.store(&upd.table).iter_entries()? {
+        // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
+        // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
+        // page_read per visited node (block, before the rows), then storage_row_read per scanned row.
+        let pk_bound = match (&filter, pk_info) {
+            (Some(f), Some((pk_i, pk_ty))) => detect_pk_bound(f, pk_i, pk_ty),
+            _ => None,
+        };
+        let (entries, overlap) = match &pk_bound {
+            Some(bp) => match build_key_bound(bp, &bound) {
+                Some(b) => {
+                    let store = self.store(&upd.table);
+                    (
+                        store.range_entries(&b)?,
+                        store.overlap_node_count(&b) as i64,
+                    )
+                }
+                None => (Vec::new(), 0),
+            },
+            None => {
+                let store = self.store(&upd.table);
+                (store.iter_entries()?, store.node_count() as i64)
+            }
+        };
+        meter.charge(COSTS.page_read * overlap);
+        for (key, row) in entries {
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
@@ -1343,6 +1392,17 @@ impl Database {
             Some(p) => Some(resolve_boolean_filter(&scope, p, ptypes)?),
             None => None,
         };
+        // Primary-key predicate pushdown (single base table only): detect WHERE conjuncts that bound
+        // the storage key, so the scan seeks/ranges instead of walking the whole B-tree (cost.md §3
+        // "bounded scan"). Multi-table (join) and no-PK tables are excluded — a follow-on (the bound
+        // machinery is the substrate they reuse).
+        let pk_bound = match (&filter, scope.rels.as_slice()) {
+            (Some(f), [rel]) => rel
+                .table
+                .primary_key_index()
+                .and_then(|pk_idx| detect_pk_bound(f, pk_idx, rel.table.columns[pk_idx].ty)),
+            _ => None,
+        };
         // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
         // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
         // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain
@@ -1460,6 +1520,7 @@ impl Database {
             distinct: sel.distinct,
             limit: sel.limit,
             offset: sel.offset,
+            pk_bound,
         })
     }
 
@@ -1480,18 +1541,27 @@ impl Database {
             outer,
         };
 
-        // Materialize each base table once, in primary-key order. A full scan walks the table's
-        // whole B-tree, so it charges page_read per node (block, before the rows) and
-        // storage_row_read per physical row (spec/design/cost.md §3 "page_read"/JOIN). The nested
-        // loop re-reads from these in-memory buffers, which are not stores and charge nothing.
+        // Materialize each base table once, in primary-key order, by draining a ScanSource (the
+        // page_read block + per-row storage_row_read accrue inside next() — spec/design/cost.md §3
+        // "page_read"/JOIN). The nested loop re-reads from these in-memory buffers, which are not
+        // stores and charge nothing.
         let mut meter = Meter::new();
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
         for rel in &plan.rels {
             let store = self.store(&rel.table_name);
-            meter.charge(COSTS.page_read * store.node_count() as i64);
+            // A primary-key bound (single base table only) seeks/ranges instead of walking the whole
+            // B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. Otherwise
+            // the full scan is unchanged (cost.md §3 "bounded scan").
+            let (rows, node_count) = match &plan.pk_bound {
+                Some(bp) => match build_key_bound(bp, params) {
+                    Some(b) => (store.range_rows(&b)?, store.overlap_node_count(&b) as i64),
+                    None => (Vec::new(), 0),
+                },
+                None => (store.iter_in_key_order()?, store.node_count() as i64),
+            };
+            let mut src = ScanSource::new(rows, node_count);
             let mut table_rows: Vec<Row> = Vec::new();
-            for row in store.iter_in_key_order()? {
-                meter.charge(COSTS.storage_row_read);
+            while let Some(row) = src.next(&mut meter)? {
                 table_rows.push(row);
             }
             materialized.push(table_rows);
@@ -2383,6 +2453,219 @@ struct SelectPlan {
     distinct: bool,
     limit: Option<i64>,
     offset: Option<i64>,
+    /// Primary-key predicate pushdown (single base table only): the WHERE conjuncts that bound the
+    /// storage key, so the scan seeks/ranges instead of walking the whole B-tree (cost.md §3
+    /// "bounded scan"). `None` ⇒ full scan. The residual filter stays the WHOLE `filter`, re-applied
+    /// to each scanned row — the bound only narrows which rows are scanned.
+    pk_bound: Option<PkBound>,
+}
+
+// ---- Primary-key predicate pushdown (spec/design/cost.md §3 "bounded scan / point lookup") ----
+//
+// A single-table WHERE on the primary key bounds the storage-key range a scan must visit. Detection
+// is two-stage: `detect_pk_bound` at plan time (structural — which conjuncts are PK comparisons),
+// `build_key_bound` at exec time (the const values, and any $N, are known only then). The bound is a
+// SUPERSET of the matching keys: the whole WHERE stays the residual filter (re-applied to each scanned
+// row), so the result is always correct — the bound only narrows which rows are scanned, and the
+// page_read/storage_row_read drop to what it touches. The unbounded case keeps the full scan, so its
+// cost never moves.
+
+/// The constant data extracted from a bound term's const-source operand (avoids cloning the whole
+/// `RExpr` and keeps `PkBound` owned). `Timestamp` covers both timestamp and timestamptz (same
+/// encoding; the PK type disambiguates). `Param` resolves to a value at exec time.
+enum BoundSrc {
+    Int(i64),
+    Uuid([u8; 16]),
+    Timestamp(i64),
+    Null,
+    Param(usize),
+}
+
+/// One `pk <op> const-source` from a WHERE AND-chain, normalized so the PK is the LEFT side (a
+/// `5 < pk` flips to `pk > 5`).
+struct BoundTerm {
+    op: CmpOp,
+    src: BoundSrc,
+}
+
+/// The plan-time result of PK analysis: the PK's storage type + the bound terms. The concrete key
+/// range is built per execution by `build_key_bound`.
+struct PkBound {
+    pk_type: ScalarType,
+    terms: Vec<BoundTerm>,
+}
+
+/// The outcome of encoding a const-source into the PK key space.
+enum BoundKey {
+    /// A NULL const — the comparison is 3VL-unknown, so the range is provably empty.
+    Null,
+    /// An integer value outside the PK type's range — no key can equal it, so drop this half-bound.
+    OutOfRange,
+    Key(Vec<u8>),
+}
+
+/// Flatten the WHERE's top-level AND-chain (an OR is never descended — a disjunction is not a
+/// contiguous range) and collect every `pk <cmp> const-source` conjunct. `None` ⇒ no usable bound
+/// (full scan). Conservative + sound: an unrecognized conjunct contributes no bound and stays in the
+/// residual filter.
+fn detect_pk_bound(filter: &RExpr, pk_idx: usize, pk_type: ScalarType) -> Option<PkBound> {
+    let mut terms = Vec::new();
+    collect_bound_terms(filter, pk_idx, pk_type, &mut terms);
+    if terms.is_empty() {
+        None
+    } else {
+        Some(PkBound { pk_type, terms })
+    }
+}
+
+fn collect_bound_terms(e: &RExpr, pk_idx: usize, pk_type: ScalarType, terms: &mut Vec<BoundTerm>) {
+    match e {
+        RExpr::And(l, r) => {
+            collect_bound_terms(l, pk_idx, pk_type, terms);
+            collect_bound_terms(r, pk_idx, pk_type, terms);
+        }
+        RExpr::Compare { op, lhs, rhs } => {
+            let is_pk = |x: &RExpr| matches!(x, RExpr::Column(i) if *i == pk_idx);
+            // The PK on either side (op flipped when it is on the right); the other side a
+            // matching-type const-source. Anything else contributes no term.
+            let term = if is_pk(lhs) {
+                const_source(rhs, pk_type).map(|src| BoundTerm { op: *op, src })
+            } else if is_pk(rhs) {
+                const_source(lhs, pk_type).map(|src| BoundTerm {
+                    op: flip_cmp(*op),
+                    src,
+                })
+            } else {
+                None
+            };
+            if let Some(t) = term {
+                terms.push(t);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recognize a const-source operand whose static type matches the PK's storage type (a promoted
+/// comparison — e.g. `intpk = 2.5` → a `ConstDecimal` — does not match, so it stays residual). A
+/// correlated `OuterColumn`, a column, arithmetic, etc. are not const-sources.
+fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
+    match e {
+        RExpr::Param(i) => Some(BoundSrc::Param(*i)),
+        RExpr::ConstNull => Some(BoundSrc::Null),
+        RExpr::ConstInt(n) if pk_type.is_integer() => Some(BoundSrc::Int(*n)),
+        RExpr::ConstUuid(u) if pk_type.is_uuid() => Some(BoundSrc::Uuid(*u)),
+        RExpr::ConstTimestamp(m) if pk_type.is_timestamp() => Some(BoundSrc::Timestamp(*m)),
+        RExpr::ConstTimestamptz(m) if pk_type.is_timestamptz() => Some(BoundSrc::Timestamp(*m)),
+        _ => None,
+    }
+}
+
+/// Swap a comparison's sense (for `const <op> pk` ⇒ `pk <flipped> const`). Eq is symmetric.
+fn flip_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Ge => CmpOp::Le,
+        CmpOp::Eq => CmpOp::Eq,
+    }
+}
+
+/// Build the concrete key range at exec time: encode each const-source and intersect the half-bounds.
+/// `None` ⇒ the range admits no key (a NULL const — 3VL — or contradictory bounds), so the scan reads
+/// nothing. An out-of-range integer const drops only its own half-bound (a wider, still sound, scan).
+fn build_key_bound(bp: &PkBound, params: &[Value]) -> Option<KeyBound> {
+    let mut b = KeyBound::unbounded();
+    for t in &bp.terms {
+        let key = match encode_bound_key(bp.pk_type, &t.src, params) {
+            BoundKey::Null => return None,
+            BoundKey::OutOfRange => continue,
+            BoundKey::Key(k) => k,
+        };
+        match t.op {
+            CmpOp::Eq => {
+                intersect_lo(&mut b, &key, true);
+                intersect_hi(&mut b, &key, true);
+            }
+            CmpOp::Gt => intersect_lo(&mut b, &key, false),
+            CmpOp::Ge => intersect_lo(&mut b, &key, true),
+            CmpOp::Lt => intersect_hi(&mut b, &key, false),
+            CmpOp::Le => intersect_hi(&mut b, &key, true),
+        }
+    }
+    if bound_empty(&b) { None } else { Some(b) }
+}
+
+/// Encode a const-source's value into the PK's storage key (the same codec INSERT uses — `encode_int`
+/// for integer/timestamp widths, the raw 16 bytes for uuid).
+fn encode_bound_key(pk_ty: ScalarType, src: &BoundSrc, params: &[Value]) -> BoundKey {
+    match src {
+        BoundSrc::Null => BoundKey::Null,
+        BoundSrc::Int(n) => {
+            if pk_ty.in_range(*n) {
+                BoundKey::Key(encode_int(pk_ty, *n))
+            } else {
+                BoundKey::OutOfRange
+            }
+        }
+        BoundSrc::Uuid(u) => BoundKey::Key(u.to_vec()),
+        BoundSrc::Timestamp(m) => BoundKey::Key(encode_int(pk_ty, *m)),
+        BoundSrc::Param(i) => match &params[*i] {
+            Value::Null => BoundKey::Null,
+            Value::Uuid(u) => BoundKey::Key(u.to_vec()),
+            Value::Int(n) => {
+                if pk_ty.in_range(*n) {
+                    BoundKey::Key(encode_int(pk_ty, *n))
+                } else {
+                    BoundKey::OutOfRange
+                }
+            }
+            Value::Timestamp(m) | Value::Timestamptz(m) => BoundKey::Key(encode_int(pk_ty, *m)),
+            _ => BoundKey::OutOfRange,
+        },
+    }
+}
+
+/// Tighten `b`'s lower bound to the more restrictive of (current, key); at an equal key an exclusive
+/// bound (`inc=false`) wins.
+fn intersect_lo(b: &mut KeyBound, key: &[u8], inc: bool) {
+    let replace = match &b.lo {
+        None => true,
+        Some(cur) => key > cur.as_slice() || (key == cur.as_slice() && !inc),
+    };
+    if replace {
+        b.lo = Some(key.to_vec());
+        b.lo_inc = inc;
+    }
+}
+
+/// Tighten `b`'s upper bound to the more restrictive of (current, key); at an equal key an exclusive
+/// bound wins.
+fn intersect_hi(b: &mut KeyBound, key: &[u8], inc: bool) {
+    let replace = match &b.hi {
+        None => true,
+        Some(cur) => key < cur.as_slice() || (key == cur.as_slice() && !inc),
+    };
+    if replace {
+        b.hi = Some(key.to_vec());
+        b.hi_inc = inc;
+    }
+}
+
+/// Whether the bound admits no key: lo above hi, or lo == hi with a non-inclusive endpoint.
+fn bound_empty(b: &KeyBound) -> bool {
+    match (&b.lo, &b.hi) {
+        (Some(lo), Some(hi)) => {
+            use std::cmp::Ordering::{Equal, Greater};
+            match lo.cmp(hi) {
+                Greater => true,
+                Equal => !(b.lo_inc && b.hi_inc),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// A resolved set operation (spec/design/grammar.md §25): both operands planned with the same
@@ -2399,6 +2682,52 @@ struct SetOpPlan {
     order: Vec<(usize, bool, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+/// A pull-based row cursor (Volcano-style): `next` yields one row, `None` at end of stream. The
+/// cost meter is threaded IN per call rather than stored as a field, so the source holds no
+/// borrow of it and the one `&mut Meter` is charged down a single call path with no aliasing —
+/// the discipline that keeps this mirror-able with the Go/TS cores (CLAUDE.md §2). This is the
+/// seam the streaming + point-lookup work (TODO Phase 6) builds on; today only `ScanSource`
+/// exists and feeds the existing materialize-then-join pipeline unchanged, so results and cost
+/// are byte-identical.
+///
+/// Charges the page_read block (one per B-tree node — spec/design/cost.md §3 "page_read") once,
+/// before the first row, then storage_row_read per row yielded: the same units in the same order
+/// as the inline scan loop it replaced. `rows` is the in-key-order materialization (eager today,
+/// via `iter_in_key_order`; a lazy leaf walk later) — the charge accounting is identical either
+/// way because cost is the logical node/row count, not a physical leaf fetch (pager.md §5). The
+/// block fires on the first `next` even for an empty table (node_count 0 ⇒ a no-op charge), so
+/// the accrued total never moves. `next` returns `Result` so the later lazy walk's leaf-fault
+/// error has a home; the eager form never errors.
+struct ScanSource {
+    rows: std::vec::IntoIter<Row>,
+    node_count: i64,
+    charged_block: bool,
+}
+
+impl ScanSource {
+    fn new(rows: Vec<Row>, node_count: i64) -> Self {
+        ScanSource {
+            rows: rows.into_iter(),
+            node_count,
+            charged_block: false,
+        }
+    }
+
+    fn next(&mut self, m: &mut Meter) -> Result<Option<Row>> {
+        if !self.charged_block {
+            m.charge(COSTS.page_read * self.node_count);
+            self.charged_block = true;
+        }
+        match self.rows.next() {
+            Some(row) => {
+                m.charge(COSTS.storage_row_read);
+                Ok(Some(row))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 // ============================================================================

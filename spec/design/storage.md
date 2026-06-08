@@ -234,3 +234,13 @@ sits so the options stay open (CLAUDE.md §9).
   `page_read` counts a **logical** page access (the structural node count), not a physical disk
   fetch, so a future buffer pool / cache (§1, larger-than-RAM) stays invisible to the
   deterministic cost. Accrual rules: [cost.md](cost.md) §3 "`page_read`".
+- **Bounded scan / point lookup** — ✅ the store exposes an order-preserving **bounded range scan**
+  (`range_entries(lo, hi)` + a matching `overlap_node_count(lo, hi)` for the cost, mirrored across
+  cores). A single-table WHERE on the primary key (`pk = c`, ranges, `BETWEEN`, AND-combinations)
+  pushes down to a B-tree **seek/range** instead of a full scan: a bounded in-order traversal prunes
+  any subtree whose separator span cannot overlap the key range, so it faults **only** the leaves the
+  range spans, and `overlap_node_count` counts exactly the visited nodes from the resident interior
+  skeleton **without faulting a leaf** (keeping `page_read` a logical count). The unbounded range
+  reproduces the full scan exactly (`overlap_node_count == node_count`), so existing costs are
+  unchanged. JOIN base tables, correlated-subquery inner re-scans, and `IN (list)` are not bounded
+  yet (a follow-on). Accrual rules: [cost.md](cost.md) §3 "Bounded scan / point lookup".

@@ -194,6 +194,66 @@ pub struct PMap {
     len: usize,
 }
 
+/// A contiguous range of encoded keys — the form a primary-key predicate pushes down to a bounded
+/// B-tree scan (spec/design/cost.md §3 "bounded scan / point lookup", encoding.md). `lo`/`hi` are
+/// encoded key bytes; `None` is open on that side (−∞ / +∞), and the `_inc` flags say whether the
+/// endpoint key itself is included. Because the key encoding is order-preserving (`[u8]::cmp` = value
+/// order), a byte range is a value range. A bounded scan visits exactly the nodes whose key span
+/// intersects this bound, so its `page_read` cost is proportional to what it touches, not the whole
+/// tree — and the unbounded bound (−∞..+∞) degenerates to the full scan, so existing full-scan costs
+/// do not move (overlap_node_count then equals node_count).
+#[derive(Default)]
+pub(crate) struct KeyBound {
+    pub(crate) lo: Option<Vec<u8>>,
+    pub(crate) lo_inc: bool,
+    pub(crate) hi: Option<Vec<u8>>,
+    pub(crate) hi_inc: bool,
+}
+
+impl KeyBound {
+    /// The full-table bound (−∞..+∞): every node overlaps it, reproducing the full scan exactly.
+    pub(crate) fn unbounded() -> Self {
+        KeyBound::default()
+    }
+
+    /// Whether an encoded key lies within the bound.
+    fn contains(&self, key: &[u8]) -> bool {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        if let Some(lo) = &self.lo {
+            match key.cmp(lo.as_slice()) {
+                Less => return false,
+                Equal if !self.lo_inc => return false,
+                _ => {}
+            }
+        }
+        if let Some(hi) = &self.hi {
+            match key.cmp(hi.as_slice()) {
+                Greater => return false,
+                Equal if !self.hi_inc => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// Whether a child subtree spanning the OPEN separator interval `(a, c)` — `None` for the open
+    /// ends — can hold any key within the bound. The separators are entries in the PARENT (tested with
+    /// `contains`), never in the child, so the interval is open and strict comparisons are exact
+    /// regardless of endpoint inclusivity. `range_entries` (descends) and `overlap_node_count` (counts)
+    /// call this identically, so they visit the SAME node set — the §8 determinism the `page_read` cost
+    /// depends on — decided from resident separators WITHOUT faulting an OnDisk leaf.
+    fn child_overlaps(&self, a: Option<&[u8]>, c: Option<&[u8]>) -> bool {
+        use std::cmp::Ordering::{Greater, Less};
+        // Prune if the child is entirely at/below lo — its upper separator c is not strictly above lo
+        // (c == None is +∞, never below) — or entirely at/above hi — its lower separator a is not
+        // strictly below hi (a == None is −∞, never above). Descend only if neither holds.
+        let below_lo =
+            matches!((&self.lo, c), (Some(lo), Some(c)) if c.cmp(lo.as_slice()) != Greater);
+        let above_hi = matches!((&self.hi, a), (Some(hi), Some(a)) if a.cmp(hi.as_slice()) != Less);
+        !below_lo && !above_hi
+    }
+}
+
 impl PMap {
     pub fn new() -> Self {
         PMap { root: None, len: 0 }
@@ -346,6 +406,64 @@ impl PMap {
             collect(root, src, &mut out)?;
         }
         Ok(out)
+    }
+
+    /// `(key, row)` pairs whose key lies within the bound, in ascending key order — a bounded
+    /// in-order traversal that prunes a child subtree whose separator span cannot overlap the bound
+    /// ([`KeyBound::child_overlaps`]), so only overlapping leaves fault through `src`. The unbounded
+    /// bound walks the whole tree (identical to [`iter`]). Owned pairs, like `iter`, so a faulted leaf
+    /// can be evicted after the walk.
+    pub(crate) fn range_entries(
+        &self,
+        b: &KeyBound,
+        src: Option<&dyn LeafSource>,
+    ) -> Result<Vec<(Vec<u8>, Row)>> {
+        let mut out = Vec::new();
+        if let Some(root) = &self.root {
+            collect_range(root, b, None, None, src, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// The number of B-tree nodes a bounded scan over `b` visits — the `page_read` it charges
+    /// (cost.md §3). Mirrors `range_entries`' traversal exactly (same `child_overlaps` prune, root
+    /// always visited), counting an `OnDisk` leaf as one node WITHOUT faulting it (pager.md §5). The
+    /// unbounded bound returns `node_count()`, so a full scan's cost is unchanged.
+    pub(crate) fn overlap_node_count(&self, b: &KeyBound) -> usize {
+        fn count(
+            node: &Node,
+            b: &KeyBound,
+            node_lo: Option<&[u8]>,
+            node_hi: Option<&[u8]>,
+        ) -> usize {
+            if node.is_leaf() {
+                return 1;
+            }
+            let mut total = 1;
+            for i in 0..=node.keys.len() {
+                let a = if i > 0 {
+                    Some(node.keys[i - 1].as_slice())
+                } else {
+                    node_lo
+                };
+                let c = if i < node.keys.len() {
+                    Some(node.keys[i].as_slice())
+                } else {
+                    node_hi
+                };
+                if b.child_overlaps(a, c) {
+                    match &node.children[i] {
+                        Child::Resident(n) => total += count(n, b, a, c),
+                        Child::OnDisk(_) => total += 1,
+                    }
+                }
+            }
+            total
+        }
+        self.root
+            .as_deref()
+            .map(|r| count(r, b, None, None))
+            .unwrap_or(0)
     }
 }
 
@@ -669,6 +787,48 @@ fn collect(node: &Node, src: Option<&dyn LeafSource>, out: &mut Vec<(Vec<u8>, Ro
     Ok(())
 }
 
+/// The pruned `collect` for a bounded scan: descend a child only if its separator span (a, c) can
+/// overlap the bound, and emit a key only if it is in bound. `node_lo`/`node_hi` are the node's own
+/// bracketing separators (`None` at the root). Mirrors [`PMap::overlap_node_count`]'s traversal so the
+/// visited-node set — and the `page_read` cost — is identical.
+fn collect_range(
+    node: &Node,
+    b: &KeyBound,
+    node_lo: Option<&[u8]>,
+    node_hi: Option<&[u8]>,
+    src: Option<&dyn LeafSource>,
+    out: &mut Vec<(Vec<u8>, Row)>,
+) -> Result<()> {
+    if node.is_leaf() {
+        for i in 0..node.keys.len() {
+            if b.contains(&node.keys[i]) {
+                out.push((node.keys[i].clone(), node.vals[i].clone()));
+            }
+        }
+        return Ok(());
+    }
+    for i in 0..=node.keys.len() {
+        let a = if i > 0 {
+            Some(node.keys[i - 1].as_slice())
+        } else {
+            node_lo
+        };
+        let c = if i < node.keys.len() {
+            Some(node.keys[i].as_slice())
+        } else {
+            node_hi
+        };
+        if b.child_overlaps(a, c) {
+            let ch = child(node, i, src)?;
+            collect_range(&ch, b, a, c, src, out)?;
+        }
+        if i < node.keys.len() && b.contains(&node.keys[i]) {
+            out.push((node.keys[i].clone(), node.vals[i].clone()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,5 +1008,69 @@ mod tests {
             check_invariants(&pm);
         }
         assert!(pm.is_empty());
+    }
+
+    #[test]
+    fn bounded_range_and_overlap() {
+        // 200 entries at CAP 244 build a multi-leaf tree (the in-RAM analog of a paged store), so the
+        // bounded-scan primitive (spec/design/cost.md §3) can be checked where page_read drops below
+        // node_count — the property single-leaf conformance tables cannot show.
+        let mut pm = PMap::new();
+        for n in 0..200u64 {
+            pm.insert(key(n), row(n as i64), W, CAP, None).unwrap();
+        }
+        assert!(pm.node_count() > 1, "test needs a multi-leaf tree");
+
+        // A point bound visits strictly fewer nodes than the whole tree (the page_read win), and
+        // returns exactly the one matching entry.
+        let pb = KeyBound {
+            lo: Some(key(100)),
+            lo_inc: true,
+            hi: Some(key(100)),
+            hi_inc: true,
+        };
+        assert!(pm.overlap_node_count(&pb) < pm.node_count());
+        let got = pm.range_entries(&pb, None).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, key(100));
+
+        // An inclusive range spanning many leaves returns exactly those entries, in key order.
+        let decode = |k: &[u8]| u64::from_be_bytes(k.try_into().unwrap());
+        let rb = KeyBound {
+            lo: Some(key(50)),
+            lo_inc: true,
+            hi: Some(key(150)),
+            hi_inc: true,
+        };
+        let vals: Vec<u64> = pm
+            .range_entries(&rb, None)
+            .unwrap()
+            .iter()
+            .map(|(k, _)| decode(k))
+            .collect();
+        assert_eq!(vals, (50..=150).collect::<Vec<_>>());
+
+        // Exclusive endpoints drop both boundary keys (51..=149).
+        let ex = KeyBound {
+            lo: Some(key(50)),
+            lo_inc: false,
+            hi: Some(key(150)),
+            hi_inc: false,
+        };
+        assert_eq!(pm.range_entries(&ex, None).unwrap().len(), 99);
+
+        // Half-open (>= 195) reaches the end of the key space (195..=199).
+        let hi_open = KeyBound {
+            lo: Some(key(195)),
+            lo_inc: true,
+            hi: None,
+            hi_inc: false,
+        };
+        assert_eq!(pm.range_entries(&hi_open, None).unwrap().len(), 5);
+
+        // The unbounded bound reproduces the full scan exactly.
+        let unb = KeyBound::unbounded();
+        assert_eq!(pm.overlap_node_count(&unb), pm.node_count());
+        assert_eq!(pm.range_entries(&unb, None).unwrap().len(), 200);
     }
 }

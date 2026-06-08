@@ -30,7 +30,8 @@ import { Decimal, MAX_PRECISION, MAX_SCALE } from "./decimal.ts";
 import { encodeInt } from "./encoding.ts";
 import { type EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
-import { type Row, TableStore } from "./storage.ts";
+import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
+import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
   type ScalarType,
@@ -708,10 +709,13 @@ export class Database {
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.working().store(del.table);
     const keys: Uint8Array[] = [];
-    // A full scan walks the table's whole B-tree: page_read per node (block, before the rows),
-    // then storageRowRead per row (spec/design/cost.md §3 "page_read").
-    meter.charge(COSTS.pageRead * BigInt(store.nodeCount()));
-    for (const e of store.entriesInKeyOrder()) {
+    // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
+    // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
+    // page_read per visited node (block, before the rows), then storageRowRead per scanned row.
+    const { entries, overlap } = scanEntries(store, mutationPkBound(table, filter), bound);
+    if (entries === null) return { kind: "statement", cost: meter.accrued }; // empty bound
+    meter.charge(COSTS.pageRead * BigInt(overlap));
+    for (const e of entries) {
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
       meter.charge(COSTS.storageRowRead);
       if (filter === null || isTrue(evalExpr(filter, e.row, env, meter))) {
@@ -788,10 +792,13 @@ export class Database {
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.working().store(upd.table);
     const updates: { key: Uint8Array; row: Row }[] = [];
-    // A full scan walks the table's whole B-tree: page_read per node (block, before the rows),
-    // then storageRowRead per row (spec/design/cost.md §3 "page_read").
-    meter.charge(COSTS.pageRead * BigInt(store.nodeCount()));
-    for (const e of store.entriesInKeyOrder()) {
+    // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
+    // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
+    // page_read per visited node (block, before the rows), then storageRowRead per scanned row.
+    const { entries, overlap } = scanEntries(store, mutationPkBound(table, filter), bound);
+    if (entries === null) return { kind: "statement", cost: meter.accrued }; // empty bound
+    meter.charge(COSTS.pageRead * BigInt(overlap));
+    for (const e of entries) {
       meter.charge(COSTS.storageRowRead);
       if (filter !== null && !isTrue(evalExpr(filter, e.row, env, meter))) continue;
       const newRow = e.row.slice();
@@ -1063,6 +1070,18 @@ export class Database {
       return { kind: j.kind, on: resolveBooleanFilter(partial, j.on, ptypes) };
     });
 
+    // Primary-key predicate pushdown (single base table only): detect WHERE conjuncts that bound the
+    // storage key, so the scan seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
+    // scan"). Multi-table (join) and no-PK tables are excluded — a follow-on.
+    let pkBound: PkBound | null = null;
+    if (filter !== null && rels.length === 1) {
+      const t = rels[0]!.table;
+      const pkIdx = primaryKeyIndex(t);
+      if (pkIdx >= 0) {
+        pkBound = detectPkBound(filter, pkIdx, t.columns[pkIdx]!.type);
+      }
+    }
+
     // Assemble the owned plan (table NAMES + offsets/widths replace the scope's tables, so the
     // plan outlives the scope and a correlated subquery can re-execute it per row).
     const planRels: PlanRel[] = scope.rels.map((rel) => ({
@@ -1086,6 +1105,7 @@ export class Database {
       distinct: sel.distinct,
       limit: sel.limit,
       offset: sel.offset,
+      pkBound,
     };
   }
 
@@ -1101,17 +1121,31 @@ export class Database {
       runSubquery: (p, o) => this.execQueryPlan(p, o, params),
     };
 
-    // Materialize each base table once, in primary-key order. A full scan walks the table's whole
-    // B-tree, so it charges pageRead per node (block, before the rows) and storageRowRead per
-    // physical row (spec/design/cost.md §3 "page_read"/JOIN). The nested loop re-reads from these
-    // in-memory buffers, which are not stores and charge nothing.
+    // Materialize each base table once, in primary-key order, by draining a scanSource (the
+    // pageRead block + per-row storageRowRead accrue inside the generator — spec/design/cost.md §3
+    // "page_read"/JOIN). A primary-key bound (single base table only) seeks/ranges instead of walking
+    // the whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. The
+    // nested loop re-reads from these in-memory buffers, which are not stores and charge nothing.
     const meter = new Meter();
     const materialized: Row[][] = plan.rels.map((rel) => {
       const store = this.readSnap().store(rel.tableName);
-      meter.charge(COSTS.pageRead * BigInt(store.nodeCount()));
+      let rows: Row[];
+      let nodeCount: number;
+      if (plan.pkBound !== null) {
+        const b = buildKeyBound(plan.pkBound, params);
+        if (b === null) {
+          rows = [];
+          nodeCount = 0;
+        } else {
+          rows = store.rangeRows(b);
+          nodeCount = store.overlapNodeCount(b);
+        }
+      } else {
+        rows = store.iterInKeyOrder();
+        nodeCount = store.nodeCount();
+      }
       const tableRows: Row[] = [];
-      for (const row of store.iterInKeyOrder()) {
-        meter.charge(COSTS.storageRowRead);
+      for (const row of scanSource(rows, nodeCount, meter)) {
         tableRows.push(row);
       }
       return tableRows;
@@ -1384,6 +1418,236 @@ export class Database {
   }
 }
 
+// scanSource streams a base table's already-materialized rows as a pull-based generator — the
+// Volcano seam the streaming + point-lookup work (TODO Phase 6) builds on. The caller decides full
+// scan vs primary-key bound (passing the matching rows + the visited-node count); this generator just
+// charges the pageRead block (one per visited B-tree node — spec/design/cost.md §3 "page_read") once,
+// before the first row, then storageRowRead per row yielded: the same units in the same order as the
+// inline scan loop it replaced. The block fires before any row even for an empty scan (nodeCount 0 ⇒ a
+// no-op charge, driven by the consuming for-of's first next()), so the accrued total never moves. The
+// consumer drains it fully in this slice (no short-circuit), keeping the laziness unobservable and the
+// cost identical to Go/Rust.
+function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Row> {
+  meter.charge(COSTS.pageRead * BigInt(nodeCount));
+  for (const row of rows) {
+    meter.charge(COSTS.storageRowRead);
+    yield row;
+  }
+}
+
+// ---- Primary-key predicate pushdown (spec/design/cost.md §3 "bounded scan / point lookup") ----
+//
+// A single-table WHERE on the primary key bounds the storage-key range a scan must visit. Detection is
+// two-stage: detectPkBound at plan time (structural — which conjuncts are PK comparisons), buildKeyBound
+// at exec time (the const values, and any $N, are known only then). The bound is a SUPERSET of the
+// matching keys: the whole WHERE stays the residual filter (re-applied to each scanned row), so the
+// result is always correct — the bound only narrows which rows are scanned, and page_read/storageRowRead
+// drop to what it touches. The unbounded case keeps the full scan, so its cost never moves.
+
+// BoundTerm is one `pk <op> const-source` from a WHERE AND-chain, normalized so the PK is the LEFT side
+// (a `5 < pk` flips to `pk > 5`). src is the constant/parameter operand node.
+type BoundTerm = { op: BinaryOp; src: RExpr };
+
+// PkBound is the plan-time result of PK analysis: the PK's storage type + the bound terms. The concrete
+// key range is built per execution by buildKeyBound.
+type PkBound = { pkType: ScalarType; terms: BoundTerm[] };
+
+// BoundKey is the outcome of encoding a const-source into the PK key space: a usable key, a NULL const
+// (the comparison is 3VL-unknown ⇒ empty range), or an out-of-range integer (drop this half-bound).
+type BoundKey = { kind: "key"; key: Uint8Array } | { kind: "null" } | { kind: "outOfRange" };
+
+// detectPkBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction is
+// not a contiguous range) and collects every `pk <cmp> const-source` conjunct. null ⇒ full scan.
+// Conservative + sound: an unrecognized conjunct contributes no bound and stays in the residual filter.
+function detectPkBound(filter: RExpr, pkIdx: number, pkType: ScalarType): PkBound | null {
+  const terms: BoundTerm[] = [];
+  const walk = (e: RExpr): void => {
+    if (e.kind === "and") {
+      walk(e.lhs);
+      walk(e.rhs);
+      return;
+    }
+    const t = asBoundTerm(e, pkIdx, pkType);
+    if (t !== null) terms.push(t);
+  };
+  walk(filter);
+  return terms.length === 0 ? null : { pkType, terms };
+}
+
+// asBoundTerm recognizes a single PK comparison conjunct: a comparison (=,<,<=,>,>=) with the bare LOCAL
+// PK column ("column" at pkIdx — a correlated "outerColumn" is a different kind, so it never matches) on
+// one side and a const-source of the PK's own type on the other (a promoted comparison — e.g. intpk = 2.5
+// → a constDecimal — does not match, so it stays residual). The op is flipped when the PK is on the right.
+function asBoundTerm(e: RExpr, pkIdx: number, pkType: ScalarType): BoundTerm | null {
+  if (e.kind !== "compare") return null;
+  if (e.op !== "eq" && e.op !== "lt" && e.op !== "le" && e.op !== "gt" && e.op !== "ge") return null;
+  const isPk = (x: RExpr): boolean => x.kind === "column" && x.index === pkIdx;
+  if (isPk(e.lhs) && isConstSource(e.rhs, pkType)) return { op: e.op, src: e.rhs };
+  if (isPk(e.rhs) && isConstSource(e.lhs, pkType)) return { op: flipCmp(e.op), src: e.lhs };
+  return null;
+}
+
+// isConstSource reports whether e is constant for the whole scan AND of a type that encodes into the PK
+// key space: a same-family const literal, a NULL literal (⇒ a provably empty range), or a bind parameter.
+function isConstSource(e: RExpr, pkType: ScalarType): boolean {
+  switch (e.kind) {
+    case "param":
+    case "constNull":
+      return true;
+    case "constInt":
+      return isInteger(pkType);
+    case "constUuid":
+      return isUuid(pkType);
+    case "constTimestamp":
+      return isTimestamp(pkType);
+    case "constTimestamptz":
+      return isTimestamptz(pkType);
+    default:
+      return false;
+  }
+}
+
+// flipCmp swaps a comparison's sense (for `const <op> pk` ⇒ `pk <flipped> const`). eq is symmetric.
+function flipCmp(op: BinaryOp): BinaryOp {
+  switch (op) {
+    case "lt":
+      return "gt";
+    case "le":
+      return "ge";
+    case "gt":
+      return "lt";
+    case "ge":
+      return "le";
+    default:
+      return op;
+  }
+}
+
+// buildKeyBound turns the plan-time terms into a concrete key range at exec time: encode each
+// const-source and intersect the half-bounds. null ⇒ the range admits no key (a NULL const — 3VL — or
+// contradictory bounds), so the scan reads nothing. An out-of-range integer const drops only its own
+// half-bound (a wider, still sound, scan).
+function buildKeyBound(bp: PkBound, params: Value[]): KeyBound | null {
+  const b = unboundedBound();
+  for (const t of bp.terms) {
+    const r = encodeBoundKey(bp.pkType, t.src, params);
+    if (r.kind === "null") return null;
+    if (r.kind === "outOfRange") continue;
+    const key = r.key;
+    switch (t.op) {
+      case "eq":
+        intersectLo(b, key, true);
+        intersectHi(b, key, true);
+        break;
+      case "gt":
+        intersectLo(b, key, false);
+        break;
+      case "ge":
+        intersectLo(b, key, true);
+        break;
+      case "lt":
+        intersectHi(b, key, false);
+        break;
+      case "le":
+        intersectHi(b, key, true);
+        break;
+    }
+  }
+  return boundEmpty(b) ? null : b;
+}
+
+// encodeBoundKey encodes a const-source's value into the PK's storage key (the same codec INSERT uses —
+// encodeInt for integer/timestamp widths, the raw 16 bytes for uuid).
+function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[]): BoundKey {
+  switch (src.kind) {
+    case "constNull":
+      return { kind: "null" };
+    case "constInt":
+      return inRange(pkType, src.value) ? { kind: "key", key: encodeInt(pkType, src.value) } : { kind: "outOfRange" };
+    case "constUuid":
+      return { kind: "key", key: src.value.slice() };
+    case "constTimestamp":
+    case "constTimestamptz":
+      return { kind: "key", key: encodeInt(pkType, src.value) };
+    case "param": {
+      const v = params[src.index]!;
+      if (v.kind === "null") return { kind: "null" };
+      if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
+      if (v.kind === "int")
+        return inRange(pkType, v.int) ? { kind: "key", key: encodeInt(pkType, v.int) } : { kind: "outOfRange" };
+      if (v.kind === "timestamp" || v.kind === "timestamptz")
+        return { kind: "key", key: encodeInt(pkType, v.micros) };
+      return { kind: "outOfRange" };
+    }
+    default:
+      return { kind: "outOfRange" };
+  }
+}
+
+// intersectLo tightens b's lower bound to the more restrictive of (current, key); at an equal key an
+// exclusive bound (inc=false) wins.
+function intersectLo(b: KeyBound, key: Uint8Array, inc: boolean): void {
+  if (b.lo === null) {
+    b.lo = key;
+    b.loInc = inc;
+    return;
+  }
+  const c = compareBytes(key, b.lo);
+  if (c > 0 || (c === 0 && !inc)) {
+    b.lo = key;
+    b.loInc = inc;
+  }
+}
+
+// intersectHi tightens b's upper bound to the more restrictive of (current, key); at an equal key an
+// exclusive bound wins.
+function intersectHi(b: KeyBound, key: Uint8Array, inc: boolean): void {
+  if (b.hi === null) {
+    b.hi = key;
+    b.hiInc = inc;
+    return;
+  }
+  const c = compareBytes(key, b.hi);
+  if (c < 0 || (c === 0 && !inc)) {
+    b.hi = key;
+    b.hiInc = inc;
+  }
+}
+
+// boundEmpty reports whether the bound admits no key: lo above hi, or lo == hi with a non-inclusive
+// endpoint.
+function boundEmpty(b: KeyBound): boolean {
+  if (b.lo === null || b.hi === null) return false;
+  const c = compareBytes(b.lo, b.hi);
+  if (c > 0) return true;
+  if (c === 0) return !(b.loInc && b.hiInc);
+  return false;
+}
+
+// mutationPkBound detects a single-table UPDATE/DELETE's PK pushdown bound; null ⇒ full scan.
+function mutationPkBound(table: Table, filter: RExpr | null): PkBound | null {
+  if (filter === null) return null;
+  const pkIdx = primaryKeyIndex(table);
+  if (pkIdx < 0) return null;
+  return detectPkBound(filter, pkIdx, table.columns[pkIdx]!.type);
+}
+
+// scanEntries returns the (key,row) entries a mutation scans + the page_read node count: a primary-key
+// bound seeks/ranges, an empty bound yields entries=null (the caller charges nothing and mutates
+// nothing), and no bound is the full scan (cost.md §3 "bounded scan").
+function scanEntries(
+  store: TableStore,
+  pkBound: PkBound | null,
+  params: Value[],
+): { entries: Entry[] | null; overlap: number } {
+  if (pkBound !== null) {
+    const b = buildKeyBound(pkBound, params);
+    if (b === null) return { entries: null, overlap: 0 };
+    return { entries: store.rangeEntries(b), overlap: store.overlapNodeCount(b) };
+  }
+  return { entries: store.entriesInKeyOrder(), overlap: store.nodeCount() };
+}
+
 // ---- Subquery helpers (spec/design/grammar.md §26) ----------------------
 
 // queryPlanReferencesOuter reports whether a plan references any scope STRICTLY OUTSIDE itself —
@@ -1603,6 +1867,11 @@ type SelectPlan = {
   distinct: boolean;
   limit: bigint | null;
   offset: bigint | null;
+  // Primary-key predicate pushdown (single base table only): the WHERE conjuncts that bound the
+  // storage key, so the scan seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
+  // scan"). null ⇒ full scan. The residual filter stays the WHOLE `filter`, re-applied to each
+  // scanned row — the bound only narrows which rows are scanned.
+  pkBound: PkBound | null;
 };
 
 // SetOpPlan is a resolved set operation: both operands planned with the same parent scope, the

@@ -9,7 +9,7 @@
 # TABLE spelling, never the SELECT spelling); `expr AS alias` takes the alias as written;
 # `*` takes each column's canonical name; any other un-aliased expression takes `?column?`.
 # Aliases are output labels only — invisible to WHERE/ORDER BY resolution.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.column_alias, query.where_eq, query.order_by, expr.arithmetic, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.column_alias, query.where_eq, query.order_by, expr.arithmetic, types.int32, query.point_lookup, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
@@ -89,10 +89,11 @@ SELECT a AS b FROM t WHERE b = 10
 ----
 20
 
-# `# names:` and `# cost:` bind the same query independently. Cost: 2 scanned + 2 filter
-# (one `=` per scanned row) + 1 produced + 1 projection (`a + b` is one Add) = 6.
+# `# names:` and `# cost:` bind the same query independently. `id = 1` is a primary-key point
+# lookup (cost.md §3 "bounded scan") — it reads only the one matched row, not both: 1 page + 1
+# scanned + 1 filter (one `=`) + 1 produced + 1 projection (`a + b` is one Add) = 5.
 # names: total
-# cost: 7
+# cost: 5
 query I nosort
 SELECT a + b AS total FROM t WHERE id = 1
 ----

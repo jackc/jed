@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"sort"
@@ -746,13 +747,27 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	env := &evalEnv{exec: db, params: bound}
 	store := db.working().store(del.Table)
 	var keys [][]byte
-	// A full scan walks the table's whole B-tree: page_read per node (block, before the rows),
-	// then storage_row_read per row (spec/design/cost.md §3 "page_read").
-	meter.Charge(Costs.PageRead * int64(store.NodeCount()))
-	entries, err := store.EntriesInKeyOrder()
-	if err != nil {
-		return Outcome{}, err
+	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
+	// scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
+	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
+	var entries []Entry
+	var overlap int
+	if bp := pkBoundFor(table, filter); bp != nil {
+		kb, empty := db.buildKeyBound(bp, bound)
+		if empty {
+			return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
+		}
+		if entries, err = store.RangeEntries(kb); err != nil {
+			return Outcome{}, err
+		}
+		overlap = store.OverlapNodeCount(kb)
+	} else {
+		if entries, err = store.EntriesInKeyOrder(); err != nil {
+			return Outcome{}, err
+		}
+		overlap = store.NodeCount()
 	}
+	meter.Charge(Costs.PageRead * int64(overlap))
 	for _, e := range entries {
 		meter.Charge(Costs.StorageRowRead)
 		matched := true
@@ -868,13 +883,27 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		row Row
 	}
 	var updates []pending
-	// A full scan walks the table's whole B-tree: page_read per node (block, before the rows),
-	// then storage_row_read per row (spec/design/cost.md §3 "page_read").
-	meter.Charge(Costs.PageRead * int64(store.NodeCount()))
-	entries, err := store.EntriesInKeyOrder()
-	if err != nil {
-		return Outcome{}, err
+	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
+	// scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
+	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
+	var entries []Entry
+	var overlap int
+	if bp := pkBoundFor(table, filter); bp != nil {
+		kb, empty := db.buildKeyBound(bp, bound)
+		if empty {
+			return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
+		}
+		if entries, err = store.RangeEntries(kb); err != nil {
+			return Outcome{}, err
+		}
+		overlap = store.OverlapNodeCount(kb)
+	} else {
+		if entries, err = store.EntriesInKeyOrder(); err != nil {
+			return Outcome{}, err
+		}
+		overlap = store.NodeCount()
 	}
+	meter.Charge(Costs.PageRead * int64(overlap))
 	for _, e := range entries {
 		meter.Charge(Costs.StorageRowRead)
 		if filter != nil {
@@ -1391,6 +1420,17 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 			return nil, err
 		}
 	}
+	// Primary-key predicate pushdown (single base table only): detect WHERE conjuncts that bound the
+	// storage key, so the scan seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
+	// scan"). Multi-table (join) and no-PK tables are excluded — a follow-on (the bound machinery is
+	// the substrate they reuse).
+	var pkBound *pkBoundPlan
+	if filter != nil && len(rels) == 1 {
+		if t := rels[0].table; t.PrimaryKeyIndex() >= 0 {
+			pkIdx := t.PrimaryKeyIndex()
+			pkBound = detectPKBound(filter, pkIdx, t.Columns[pkIdx].Type)
+		}
+	}
 	// ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
 	// grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
 	// grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
@@ -1482,8 +1522,281 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
 		aggSpecs: aggSpecs, having: having, order: order, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset,
+		limit: sel.Limit, offset: sel.Offset, pkBound: pkBound,
 	}, nil
+}
+
+// rowSource is a pull-based row cursor (Volcano-style): each next() yields one row, or
+// (nil, false, nil) at end of stream. The evaluation environment and the cost meter are
+// threaded IN per call rather than stored as fields, so a source owns no borrow and the one
+// meter is charged down a single call path with no aliasing (the discipline that keeps the
+// Rust mirror free of lifetime entanglement — CLAUDE.md §2). This is the seam the streaming +
+// point-lookup work (TODO Phase 6) builds on; today only scanSource exists and feeds the
+// existing materialize-then-join pipeline unchanged, so results and cost are byte-identical.
+type rowSource interface {
+	next(env *evalEnv, m *Meter) (Row, bool, error)
+}
+
+// scanSource streams a base table's rows in primary-key order. It charges the page_read block
+// (one per B-tree node — spec/design/cost.md §3 "page_read") once, before the first row, then
+// storage_row_read per row yielded: the same units in the same order as the inline scan loop it
+// replaced. rows is the in-key-order materialization (eager today, via IterInKeyOrder; a lazy
+// leaf walk later) — the charge accounting is identical either way because cost is the logical
+// node/row count, not a physical leaf fetch (pager.md §5). The block fires on the first next()
+// even for an empty table (nodeCount 0 ⇒ a no-op charge), so the accrued total never moves.
+type scanSource struct {
+	rows         []Row
+	i            int
+	nodeCount    int
+	chargedBlock bool
+}
+
+func (s *scanSource) next(env *evalEnv, m *Meter) (Row, bool, error) {
+	if !s.chargedBlock {
+		m.Charge(Costs.PageRead * int64(s.nodeCount))
+		s.chargedBlock = true
+	}
+	if s.i >= len(s.rows) {
+		return nil, false, nil
+	}
+	m.Charge(Costs.StorageRowRead)
+	row := s.rows[s.i]
+	s.i++
+	return row, true, nil
+}
+
+// ---- Primary-key predicate pushdown (spec/design/cost.md §3 "bounded scan / point lookup") ----
+//
+// A single-table WHERE on the primary key bounds the storage-key range a scan must visit. Detection
+// is two-stage: detectPKBound runs at plan time (structural — which conjuncts are PK comparisons),
+// buildKeyBound at exec time (the const values, and any $N, are known only then). The bound is a
+// SUPERSET of the matching keys: the whole WHERE stays the residual filter (re-applied to each
+// scanned row), so the result is always correct — the bound only narrows which rows are scanned, and
+// the page_read/storage_row_read drop to what it touches. The unbounded case (nil pkBound) keeps the
+// full scan, so its cost never moves.
+
+// boundTerm is one resolved `pk <op> const-source` from a WHERE AND-chain, normalized so the PK is
+// the LEFT side (a `5 < pk` flips to `pk > 5`). src is the constant/parameter operand.
+type boundTerm struct {
+	op  BinaryOp
+	src *rExpr
+}
+
+// pkBoundPlan is the plan-time result of PK analysis: the PK column's storage type + the bound
+// terms. The concrete key range is built per execution by buildKeyBound.
+type pkBoundPlan struct {
+	pkType ScalarType
+	terms  []boundTerm
+}
+
+// pkBoundFor detects a single-table mutation's (UPDATE/DELETE) PK pushdown bound; nil ⇒ full scan.
+func pkBoundFor(table *Table, filter *rExpr) *pkBoundPlan {
+	if filter == nil {
+		return nil
+	}
+	pkIdx := table.PrimaryKeyIndex()
+	if pkIdx < 0 {
+		return nil
+	}
+	return detectPKBound(filter, pkIdx, table.Columns[pkIdx].Type)
+}
+
+// detectPKBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction
+// is not a contiguous range) and collects every `pk <cmp> const-source` conjunct. Returns nil when
+// none exist (⇒ full scan). Conservative + sound: an unrecognized conjunct contributes no bound and
+// stays in the residual filter.
+func detectPKBound(filter *rExpr, pkIdx int, pkType ScalarType) *pkBoundPlan {
+	var terms []boundTerm
+	var walk func(e *rExpr)
+	walk = func(e *rExpr) {
+		if e.kind == reAnd {
+			walk(e.lhs)
+			walk(e.rhs)
+			return
+		}
+		if t, ok := asBoundTerm(e, pkIdx, pkType); ok {
+			terms = append(terms, t)
+		}
+	}
+	walk(filter)
+	if len(terms) == 0 {
+		return nil
+	}
+	return &pkBoundPlan{pkType: pkType, terms: terms}
+}
+
+// asBoundTerm recognizes a single PK comparison conjunct: a comparison (=,<,<=,>,>=) with the bare
+// LOCAL PK column (reColumn at pkIdx — a correlated reOuterColumn is a different kind, so it never
+// matches) on one side and a const-source of the PK's own type on the other (a promoted comparison
+// — e.g. intpk = 2.5 → a reConstDecimal — does not match, so it stays residual). The op is flipped
+// when the PK is on the right.
+func asBoundTerm(e *rExpr, pkIdx int, pkType ScalarType) (boundTerm, bool) {
+	if e.kind != reCompare {
+		return boundTerm{}, false
+	}
+	switch e.op {
+	case OpEq, OpLt, OpLe, OpGt, OpGe:
+	default:
+		return boundTerm{}, false
+	}
+	isPK := func(x *rExpr) bool { return x.kind == reColumn && x.index == pkIdx }
+	switch {
+	case isPK(e.lhs) && isConstSource(e.rhs, pkType):
+		return boundTerm{op: e.op, src: e.rhs}, true
+	case isPK(e.rhs) && isConstSource(e.lhs, pkType):
+		return boundTerm{op: flipCompare(e.op), src: e.lhs}, true
+	}
+	return boundTerm{}, false
+}
+
+// isConstSource reports whether e is constant for the whole scan (no per-row input) AND of a type
+// that encodes into the PK key space: a same-family const literal, a NULL literal (⇒ a provably
+// empty range), or a bind parameter $N (its inferred type matched the PK via the comparison; a value
+// that does not fit is caught at buildKeyBound).
+func isConstSource(e *rExpr, pkType ScalarType) bool {
+	switch e.kind {
+	case reParam, reConstNull:
+		return true
+	case reConstInt:
+		return pkType.IsInteger()
+	case reConstUuid:
+		return pkType.IsUuid()
+	case reConstTimestamp:
+		return pkType.IsTimestamp()
+	case reConstTimestamptz:
+		return pkType.IsTimestamptz()
+	}
+	return false
+}
+
+// flipCompare swaps a comparison's sense (for `const <op> pk` ⇒ `pk <flipped> const`). Eq is
+// symmetric.
+func flipCompare(op BinaryOp) BinaryOp {
+	switch op {
+	case OpLt:
+		return OpGt
+	case OpLe:
+		return OpGe
+	case OpGt:
+		return OpLt
+	case OpGe:
+		return OpLe
+	default:
+		return op
+	}
+}
+
+// buildKeyBound turns the plan-time terms into a concrete key range at exec time: encode each
+// const-source in the PK key space and intersect the half-bounds. empty=true ⇒ the range admits no
+// key (a NULL const — 3VL — or contradictory bounds like pk>5 AND pk<5), so the scan reads nothing
+// and charges nothing. An out-of-range integer const drops only its own half-bound (a wider, still
+// sound, scan), never a wrong key.
+func (db *Database) buildKeyBound(bp *pkBoundPlan, params []Value) (keyBound, bool) {
+	b := unboundedBound()
+	for _, t := range bp.terms {
+		key, isNull, ok := encodeBoundKey(bp.pkType, t.src, params)
+		if isNull {
+			return keyBound{}, true
+		}
+		if !ok {
+			continue
+		}
+		switch t.op {
+		case OpEq:
+			b = intersectLo(b, key, true)
+			b = intersectHi(b, key, true)
+		case OpGt:
+			b = intersectLo(b, key, false)
+		case OpGe:
+			b = intersectLo(b, key, true)
+		case OpLt:
+			b = intersectHi(b, key, false)
+		case OpLe:
+			b = intersectHi(b, key, true)
+		}
+	}
+	if boundEmpty(b) {
+		return keyBound{}, true
+	}
+	return b, false
+}
+
+// encodeBoundKey encodes a const-source's value into the PK's storage key (the same codec INSERT
+// uses — EncodeInt for integer/timestamp widths, the raw 16 bytes for uuid). isNull ⇒ the value is
+// NULL; ok=false (not null) ⇒ an integer value outside the PK type's range (no key can equal it), so
+// the caller drops this bound.
+func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value) (key []byte, isNull bool, ok bool) {
+	switch src.kind {
+	case reConstNull:
+		return nil, true, false
+	case reConstInt:
+		if !pkType.InRange(src.cInt) {
+			return nil, false, false
+		}
+		return EncodeInt(pkType, src.cInt), false, true
+	case reConstUuid:
+		return src.cBytea, false, true
+	case reConstTimestamp, reConstTimestamptz:
+		return EncodeInt(pkType, src.cInt), false, true
+	case reParam:
+		v := params[src.index]
+		if v.IsNull() {
+			return nil, true, false
+		}
+		switch {
+		case pkType.IsUuid():
+			return []byte(v.Str), false, true
+		case pkType.IsInteger():
+			if !pkType.InRange(v.Int) {
+				return nil, false, false
+			}
+			return EncodeInt(pkType, v.Int), false, true
+		default: // timestamp / timestamptz
+			return EncodeInt(pkType, v.Int), false, true
+		}
+	}
+	return nil, false, false
+}
+
+// intersectLo tightens b's lower bound to the more restrictive of (current, key); at an equal key an
+// exclusive bound (inc=false) wins.
+func intersectLo(b keyBound, key []byte, inc bool) keyBound {
+	if b.lo == nil {
+		b.lo, b.loInc = key, inc
+		return b
+	}
+	if c := bytes.Compare(key, b.lo); c > 0 || (c == 0 && !inc) {
+		b.lo, b.loInc = key, inc
+	}
+	return b
+}
+
+// intersectHi tightens b's upper bound to the more restrictive of (current, key); at an equal key an
+// exclusive bound wins.
+func intersectHi(b keyBound, key []byte, inc bool) keyBound {
+	if b.hi == nil {
+		b.hi, b.hiInc = key, inc
+		return b
+	}
+	if c := bytes.Compare(key, b.hi); c < 0 || (c == 0 && !inc) {
+		b.hi, b.hiInc = key, inc
+	}
+	return b
+}
+
+// boundEmpty reports whether the bound admits no key: lo above hi, or lo == hi with a non-inclusive
+// endpoint.
+func boundEmpty(b keyBound) bool {
+	if b.lo == nil || b.hi == nil {
+		return false
+	}
+	switch bytes.Compare(b.lo, b.hi) {
+	case 1:
+		return true
+	case 0:
+		return !(b.loInc && b.hiInc)
+	}
+	return false
 }
 
 // execSelectPlan executes a resolved SELECT against an outer-row environment (outer = the
@@ -1494,22 +1807,45 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer}
 
-	// Materialize each base table once, in primary-key order. A full scan walks the table's whole
-	// B-tree, so it charges page_read per node (block, before the rows) and storage_row_read per
-	// physical row (spec/design/cost.md §3 "page_read"/JOIN). The nested loop re-reads from these
-	// in-memory buffers, which are not stores and charge nothing.
+	// Materialize each base table once, in primary-key order, by draining a scanSource (the
+	// page_read block + per-row storage_row_read accrue inside next() — spec/design/cost.md §3
+	// "page_read"/JOIN). The nested loop re-reads from these in-memory buffers, which are not
+	// stores and charge nothing.
 	meter := NewMeter()
 	materialized := make([][]Row, len(plan.rels))
 	for ri, rel := range plan.rels {
 		store := db.readSnap().store(rel.tableName)
-		meter.Charge(Costs.PageRead * int64(store.NodeCount()))
-		rows, err := store.IterInKeyOrder()
-		if err != nil {
-			return selectResult{}, err
+		// A primary-key bound (single base table only) seeks/ranges instead of walking the whole
+		// B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. Otherwise the
+		// full scan is unchanged (cost.md §3 "bounded scan").
+		var rows []Row
+		var nodeCount int
+		if plan.pkBound != nil {
+			b, empty := db.buildKeyBound(plan.pkBound, params)
+			if !empty {
+				var err error
+				if rows, err = store.RangeRows(b); err != nil {
+					return selectResult{}, err
+				}
+				nodeCount = store.OverlapNodeCount(b)
+			}
+		} else {
+			var err error
+			if rows, err = store.IterInKeyOrder(); err != nil {
+				return selectResult{}, err
+			}
+			nodeCount = store.NodeCount()
 		}
+		src := &scanSource{rows: rows, nodeCount: nodeCount}
 		var tableRows []Row
-		for _, row := range rows {
-			meter.Charge(Costs.StorageRowRead)
+		for {
+			row, ok, err := src.next(env, meter)
+			if err != nil {
+				return selectResult{}, err
+			}
+			if !ok {
+				break
+			}
 			tableRows = append(tableRows, row)
 		}
 		materialized[ri] = tableRows
@@ -2447,6 +2783,11 @@ type selectPlan struct {
 	distinct    bool
 	limit       *int64
 	offset      *int64
+	// pkBound is the primary-key predicate pushdown (single base table only): the WHERE conjuncts
+	// that bound the storage key, so the scan seeks/ranges instead of walking the whole B-tree
+	// (spec/design/cost.md §3 "bounded scan"). nil ⇒ full scan. The residual filter stays the WHOLE
+	// `filter`, re-applied to each scanned row — the bound only narrows which rows are scanned.
+	pkBound *pkBoundPlan
 }
 
 // setOpPlan is a resolved set operation: both operands planned with the same parent scope, the

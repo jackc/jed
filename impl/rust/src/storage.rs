@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::paging::SharedPaging;
-use crate::pmap::{LeafSource, Node, PMap};
+use crate::pmap::{KeyBound, LeafSource, Node, PMap};
 use crate::types::ScalarType;
 use crate::value::Value;
 
@@ -184,6 +184,33 @@ impl TableStore {
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows.iter(src_ref)
+    }
+
+    /// The rows whose primary key lies within the bound, in key order — a bounded B-tree scan that
+    /// faults only the leaves the bound spans (spec/design/cost.md §3 "bounded scan").
+    pub(crate) fn range_rows(&self, b: &KeyBound) -> Result<Vec<Row>> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        Ok(self
+            .rows
+            .range_entries(b, src_ref)?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect())
+    }
+
+    /// The `(encoded key, row)` pairs whose primary key lies within the bound, in key order (the
+    /// mutation paths need the keys to remove/replace).
+    pub(crate) fn range_entries(&self, b: &KeyBound) -> Result<Vec<(Vec<u8>, Row)>> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.rows.range_entries(b, src_ref)
+    }
+
+    /// The number of B-tree nodes a bounded scan over `b` visits — the `page_read` it charges
+    /// (cost.md §3). Equals `node_count` for the unbounded bound.
+    pub(crate) fn overlap_node_count(&self, b: &KeyBound) -> usize {
+        self.rows.overlap_node_count(b)
     }
 
     /// The root B-tree node of this table's store, for the page-backed serializer

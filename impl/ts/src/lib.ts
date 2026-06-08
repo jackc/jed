@@ -39,6 +39,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.select",
   "query.where_eq",
   "query.comparison_order",
+  "query.point_lookup",
   "query.is_null",
   "query.order_by",
   // Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

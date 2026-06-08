@@ -73,12 +73,58 @@ function payload(n: PNode): number {
   return total;
 }
 
-function compareBytes(a: Uint8Array, b: Uint8Array): number {
+export function compareBytes(a: Uint8Array, b: Uint8Array): number {
   const n = a.length < b.length ? a.length : b.length;
   for (let i = 0; i < n; i++) {
     if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
   }
   return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
+// KeyBound is a contiguous range of encoded keys — the form a primary-key predicate pushes down to a
+// bounded B-tree scan (spec/design/cost.md §3 "bounded scan / point lookup", encoding.md). lo/hi are
+// encoded key bytes; null is open on that side (−∞ / +∞), and the *Inc flags say whether the endpoint
+// key itself is included. Because the key encoding is order-preserving (compareBytes = value order), a
+// byte range is a value range. A bounded scan visits exactly the nodes whose key span intersects this
+// bound, so its page_read cost is proportional to what it touches, not the whole tree — and the
+// unbounded bound (−∞..+∞) degenerates to the full scan, so existing full-scan costs do not move.
+export type KeyBound = {
+  lo: Uint8Array | null;
+  loInc: boolean;
+  hi: Uint8Array | null;
+  hiInc: boolean;
+};
+
+// unboundedBound is the full-table bound (−∞..+∞): every node overlaps it, reproducing the full scan.
+export function unboundedBound(): KeyBound {
+  return { lo: null, loInc: false, hi: null, hiInc: false };
+}
+
+// boundContains: whether an encoded key lies within the bound.
+function boundContains(b: KeyBound, key: Uint8Array): boolean {
+  if (b.lo !== null) {
+    const c = compareBytes(key, b.lo);
+    if (c < 0 || (c === 0 && !b.loInc)) return false;
+  }
+  if (b.hi !== null) {
+    const c = compareBytes(key, b.hi);
+    if (c > 0 || (c === 0 && !b.hiInc)) return false;
+  }
+  return true;
+}
+
+// childOverlaps: whether a child subtree spanning the OPEN separator interval (a, c) — null for the
+// open ends — can hold any key within the bound. The separators are entries in the PARENT (tested with
+// boundContains), never in the child, so the interval is open and strict comparisons are exact
+// regardless of endpoint inclusivity. rangeEntries (descends) and overlapNodeCount (counts) call this
+// identically, so they visit the SAME node set — the §8 determinism page_read depends on — decided
+// from resident separators WITHOUT faulting an OnDisk leaf.
+function childOverlaps(b: KeyBound, a: Uint8Array | null, c: Uint8Array | null): boolean {
+  // Lower side: the child's upper separator c must be strictly above lo.
+  if (b.lo !== null && c !== null && compareBytes(c, b.lo) <= 0) return false;
+  // Upper side: the child's lower separator a must be strictly below hi.
+  if (b.hi !== null && a !== null && compareBytes(a, b.hi) >= 0) return false;
+  return true;
 }
 
 // search returns the index and whether key is present: found ⇒ keys[index] === key, else index is
@@ -224,6 +270,60 @@ export class PMap {
       return total;
     };
     return count(this.root);
+  }
+
+  // rangeEntries returns the (key, row) pairs whose key lies within the bound, in ascending key order
+  // — a bounded in-order traversal that prunes a child subtree whose separator span cannot overlap
+  // (childOverlaps), so only overlapping leaves fault through src. The unbounded bound walks the whole
+  // tree (identical to inorder). nodeLo/nodeHi are the node's bracketing separators (null at the root).
+  rangeEntries(b: KeyBound, src: LeafSource | null): { keys: Uint8Array[]; vals: Row[] } {
+    const keys: Uint8Array[] = [];
+    const vals: Row[] = [];
+    const walk = (n: PNode, nodeLo: Uint8Array | null, nodeHi: Uint8Array | null): void => {
+      if (isLeaf(n)) {
+        for (let i = 0; i < n.keys.length; i++) {
+          if (boundContains(b, n.keys[i])) {
+            keys.push(n.keys[i]);
+            vals.push(n.vals[i]);
+          }
+        }
+        return;
+      }
+      for (let i = 0; i <= n.keys.length; i++) {
+        const a = i > 0 ? n.keys[i - 1] : nodeLo;
+        const c = i < n.keys.length ? n.keys[i] : nodeHi;
+        if (childOverlaps(b, a, c)) {
+          walk(resolveChild(n.children[i], src), a, c);
+        }
+        if (i < n.keys.length && boundContains(b, n.keys[i])) {
+          keys.push(n.keys[i]);
+          vals.push(n.vals[i]);
+        }
+      }
+    };
+    if (this.root !== null) walk(this.root, null, null);
+    return { keys, vals };
+  }
+
+  // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
+  // charges (cost.md §3). Mirrors rangeEntries' traversal exactly (same childOverlaps prune, root
+  // always visited), counting an OnDisk leaf as one node WITHOUT faulting it (pager.md §5). The
+  // unbounded bound returns nodeCount(), so a full scan's cost is unchanged.
+  overlapNodeCount(b: KeyBound): number {
+    const count = (n: PNode, nodeLo: Uint8Array | null, nodeHi: Uint8Array | null): number => {
+      if (isLeaf(n)) return 1;
+      let total = 1;
+      for (let i = 0; i <= n.keys.length; i++) {
+        const a = i > 0 ? n.keys[i - 1] : nodeLo;
+        const c = i < n.keys.length ? n.keys[i] : nodeHi;
+        if (childOverlaps(b, a, c)) {
+          const ch = n.children[i];
+          total += ch.node !== null ? count(ch.node, a, c) : 1;
+        }
+      }
+      return total;
+    };
+    return this.root === null ? 0 : count(this.root, null, null);
   }
 }
 

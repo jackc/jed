@@ -1,0 +1,120 @@
+# Primary-key predicate pushdown — point lookup + range scan (spec/design/cost.md §3 "bounded
+# scan / point lookup"). A single-table WHERE on the primary key bounds the storage-key range the
+# scan visits, so it seeks/ranges the B-tree instead of walking the whole table. The whole WHERE
+# stays the residual filter (re-applied to each scanned row), so results are unchanged; only the
+# cost drops — page_read to the nodes on the access path, storage_row_read to the rows in range.
+# That drop is the CROSS-CORE contract pinned here with `# cost:` (cost.md §3; the same units in
+# Rust, Go, TS). All units weigh 1, so for every record:
+#   cost = page_read (visited B-tree nodes) + storage_row_read (rows in range) + filter
+#          operator_evals (per scanned row) + row_produced + projection operator_evals.
+# `t` is six rows in one leaf, so page_read is 1 for any non-empty bound and 0 for an empty one
+# (the multi-leaf case — where page_read drops below node_count — is pinned per-core, not here,
+# since forcing multiple leaves needs hundreds of rows). The win shows in storage_row_read: a
+# point lookup reads 1 row, not 6.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.point_lookup, expr.between, query.logical_connectives, query.order_by, expr.comparison_value, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)
+
+# Point lookup: id = 3 seeks the single leaf (page_read 1) and reads just the matching row, not
+# all six. 1 page + 1 scanned + 1 filter (`=` once) + 1 produced + 0 projection (`a` is a leaf) = 4.
+# A full scan of the same query would be 1 + 6 + 6 + 1 = 14.
+# cost: 4
+query I nosort
+SELECT a FROM t WHERE id = 3
+----
+30
+
+# Point lookup miss: id = 99 still visits the leaf to confirm absence (page_read 1) but the bound
+# admits no stored key, so no row is read or filtered. 1 page + 0 + 0 + 0 = 1.
+# cost: 1
+query I nosort
+SELECT a FROM t WHERE id = 99
+----
+
+# Range `id >= 4`: the bound [4, +∞) reads rows 4,5,6. 1 page + 3 scanned + 3 filter + 3 produced = 10.
+# cost: 10
+query I nosort
+SELECT id FROM t WHERE id >= 4 ORDER BY id
+----
+4
+5
+6
+
+# Range `id < 3`: the bound (−∞, 3) reads rows 1,2. 1 + 2 + 2 + 2 = 7.
+# cost: 7
+query I nosort
+SELECT id FROM t WHERE id < 3 ORDER BY id
+----
+1
+2
+
+# BETWEEN desugars to `id >= 2 AND id <= 4`, so the AND-chain yields the bound [2, 4] (rows 2,3,4)
+# AND the residual filter is the 3-node And(>=, <=) re-applied per scanned row. 1 page + 3 scanned
+# + 9 filter (3 nodes × 3 rows) + 3 produced = 16.
+# cost: 16
+query I nosort
+SELECT id FROM t WHERE id BETWEEN 2 AND 4 ORDER BY id
+----
+2
+3
+4
+
+# Two PK conjuncts intersect to one range: `id > 1 AND id < 5` → (1, 5), rows 2,3,4. Same shape as
+# BETWEEN: 1 + 3 + 9 + 3 = 16.
+# cost: 16
+query I nosort
+SELECT id FROM t WHERE id > 1 AND id < 5 ORDER BY id
+----
+2
+3
+4
+
+# Contradictory PK bounds `id > 4 AND id < 2` are provably empty: nothing is scanned, filtered, or
+# read — not even a page. cost 0.
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE id > 4 AND id < 2
+----
+
+# The PK may be on either side: `3 = id` flips to the bound [3, 3], same cost as `id = 3`.
+# cost: 4
+query I nosort
+SELECT a FROM t WHERE 3 = id
+----
+30
+
+# A predicate on a NON-key column does NOT push down — `a = 30` is a full scan (1 page + 6 scanned +
+# 6 filter + 1 produced = 14), the contrast that proves the pushdown is PK-only.
+# cost: 14
+query I nosort
+SELECT id FROM t WHERE a = 30
+----
+3
+
+# Mixed: `id = 3 AND a > 0` bounds the scan to [3, 3] (1 row), then the whole 3-node And is the
+# residual filter on that row. 1 page + 1 scanned + 3 filter + 1 produced = 6.
+# cost: 6
+query I nosort
+SELECT id FROM t WHERE id = 3 AND a > 0
+----
+3
+
+# UPDATE pushes the bound down too: `id = 5` scans 1 row (not 6). 1 page + 1 scanned + 1 filter
+# (`id = 5`) + 0 (the `0` RHS is a leaf) = 3. No rows produced (a mutation).
+# cost: 3
+statement ok
+UPDATE t SET a = 0 WHERE id = 5
+
+# An empty bound short-circuits a mutation too: `id > 5 AND id < 3` deletes nothing at cost 0.
+# cost: 0
+statement ok
+DELETE FROM t WHERE id > 5 AND id < 3
+
+# DELETE point lookup: `id = 6` scans 1 row. 1 page + 1 scanned + 1 filter = 3.
+# cost: 3
+statement ok
+DELETE FROM t WHERE id = 6

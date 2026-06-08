@@ -6,7 +6,7 @@
 # window charges storage_row_read + its filter ops but no row_produced/projection cost. The
 # count is a non-negative integer literal; a negative value is a deterministic parse-time data
 # error (2201W for LIMIT, 2201X for OFFSET) raised before any scan.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.limit, query.offset, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.limit, query.offset, types.int32, query.point_lookup, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, val int32)
@@ -89,10 +89,12 @@ SELECT id FROM t ORDER BY id LIMIT 100
 4
 5
 
-# LIMIT after a WHERE + ORDER BY: the filter runs on every scanned row (one `>=` compare each,
-# even the rows the LIMIT later drops). 5 scanned + 5 filter + 2 produced = 12.
+# LIMIT after a primary-key range WHERE + ORDER BY: `id >= 2` is a range scan (cost.md §3 "bounded
+# scan") that reads only rows 2..5 (4 rows), and the filter runs once per scanned row (even the
+# rows the LIMIT later drops — the LIMIT does not yet short-circuit the scan). 1 page + 4 scanned +
+# 4 filter + 2 produced = 11.
 # names: id
-# cost: 13
+# cost: 11
 query I nosort
 SELECT id FROM t WHERE id >= 2 ORDER BY id LIMIT 2
 ----

@@ -112,10 +112,11 @@ So the number of pages a scan touches is **deterministic and byte-identical acro
 exactly the property cost requires.
 
 - **A full table scan walks the whole tree**, so it charges `page_read` once per **node**
-  (interior *and* leaf) in that table's tree — its structural **node count**. The executor has
-  no index or point-lookup path yet: every `SELECT` / `DELETE` / `UPDATE` scan reads the entire
+  (interior *and* leaf) in that table's tree — its structural **node count**. A scan with no
+  usable primary-key bound (a predicate on a non-key column, an OR, or no WHERE) reads the entire
   store (the same loop that charges `storage_row_read` per row), so it touches every page. An
-  **empty table** (no root) has zero nodes and charges no `page_read`.
+  **empty table** (no root) has zero nodes and charges no `page_read`. A scan whose WHERE bounds
+  the primary key touches **fewer** pages — see "bounded scan / point lookup" below.
 - **`page_read` is charged as a block, before that table's `storage_row_read`s** — read the
   pages, then the rows within them. Charged at the **same three sites** as `storage_row_read`
   (the `SELECT`/JOIN materialization, the `DELETE` scan, the `UPDATE` phase-1 scan), once per
@@ -131,6 +132,44 @@ exactly the property cost requires.
   page access — **not** a physical disk fetch. A future buffer pool / demand-paging cache for
   larger-than-RAM files (CLAUDE.md §9) serves a page from memory or disk transparently; the
   cost is identical either way, so the deterministic cost stays cache-independent (§13).
+
+### Bounded scan / point lookup — the pages a primary-key predicate touches
+
+A **single-table** WHERE on the **primary key** does not need the whole tree. Because the key
+encoding is **order-preserving** ([encoding.md](encoding.md) — raw byte order *is* value order),
+a primary-key comparison maps to a contiguous range of storage keys, and the scan visits only the
+B-tree nodes that range can intersect. This is the engine's first index-style access path; it is a
+deliberate, cost-visible optimization, gated by the `query.point_lookup` capability.
+
+- **Which predicates bound.** Flatten the WHERE's top-level **AND-chain** (an `OR` is never
+  descended — a disjunction is not one contiguous range) and collect every conjunct of the form
+  `pk <cmp> const` (`=`, `<`, `<=`, `>`, `>=`; the primary key on either side; `BETWEEN` desugars
+  to `pk >= a AND pk <= b`, so it falls out for free). The `const` must be a literal or bind
+  parameter of the **primary key's own type** — a promoted comparison (e.g. `intpk = 2.5`) does
+  **not** bound. Every other conjunct stays in the **residual filter** (the whole WHERE, re-applied
+  to each scanned row), so the bound is always a *superset* of the matching rows and the result is
+  unchanged. Multi-table (JOIN) scans, correlated-subquery inner re-scans, and no-PK tables are
+  **not** bounded yet (a follow-on) — they keep the full-scan cost above.
+- **`page_read` = the nodes the bound's key range intersects.** A scan visits the root, then
+  descends only into a child subtree whose separator span can overlap the range — so a **point
+  lookup** (`pk = c`) charges the root→leaf path (the tree height), and a **range** charges the
+  path plus the contiguous run of leaves the range spans. The unbounded range (`−∞..+∞`, the full
+  scan) intersects every node, so it reduces to the node count above — **existing full-scan costs
+  do not move.** The overlap is computed from the resident interior separators **without faulting**
+  a leaf, so it stays a *logical* count (the buffer-pool-invisible property holds). It is
+  byte-identical across cores because the tree shape and the descent rule are both a §8 contract.
+- **`storage_row_read` = the rows in range.** Only the rows whose key lies within the bound are
+  read and charged (and then filtered) — a point lookup reads 0 or 1 row, not the whole table.
+  The residual filter's `operator_eval`s therefore accrue only over the in-range rows.
+- **A provably empty range charges nothing.** A `pk = NULL` (3VL-unknown) or contradictory bounds
+  (`pk > 5 AND pk < 5`) admit no key, so the scan reads no page and no row — `page_read` 0,
+  `storage_row_read` 0, and a mutation deletes/updates nothing. (A point-lookup *miss* on an
+  existing key range — `pk = 99` where 99 isn't stored — still visits the leaf it would live in,
+  so it charges that path's `page_read` but reads no row.)
+
+`spec/conformance/suites/query/point_lookup.test` pins these costs cross-core; the bounded forms in
+`expr/cost.test`, `query/distinct.test`, `query/limit_offset.test`, and `query/select_list.test`
+exercise them in context.
 
 ### `SELECT DISTINCT` — the projection-vs-produce asymmetry
 
