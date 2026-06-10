@@ -50,8 +50,9 @@ event  = "one B-tree node (page) touched while scanning a table store"
 # a BOUNDED scan (`query.point_lookup`): page_read charges only the nodes the key range
 # intersects (a point lookup ≈ the tree height), the unbounded range reproducing the full
 # scan exactly — so existing costs are unchanged (../design/cost.md §3 "Bounded scan"). The
-# same bound also applies to a correlated subquery's inner re-scan when its PK is compared to
-# an enclosing column (`query.correlated_pushdown`), resolved per outer row.
+# same bound also applies per JOIN base table (`query.join_pushdown`) and to a correlated
+# subquery's inner re-scan when its PK is compared to an enclosing column
+# (`query.correlated_pushdown`, resolved per outer row).
 
 [[unit]]
 id     = "row_produced"

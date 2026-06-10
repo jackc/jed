@@ -1088,17 +1088,19 @@ export class Database {
       return { kind: j.kind, on: resolveBooleanFilter(partial, j.on, ptypes) };
     });
 
-    // Primary-key predicate pushdown (single base table only): detect WHERE conjuncts that bound the
-    // storage key, so the scan seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
-    // scan"). Multi-table (join) and no-PK tables are excluded — a follow-on.
-    let pkBound: PkBound | null = null;
-    if (filter !== null && rels.length === 1) {
-      const t = rels[0]!.table;
-      const pkIdx = primaryKeyIndex(t);
-      if (pkIdx >= 0) {
-        pkBound = detectPkBound(filter, pkIdx, t.columns[pkIdx]!.type);
-      }
-    }
+    // Primary-key predicate pushdown, per base relation: detect WHERE conjuncts that bound that
+    // relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree (cost.md
+    // §3 "bounded scan"). The filter is resolved against the full FROM scope, so a relation's PK
+    // column is the GLOBAL index rel.offset+pkLocal; isConstSource only accepts a literal/param/outer
+    // const (never a sibling column), so a JOIN base table is bounded only by a CONSTANT predicate on
+    // its own PK — `b.pk = a.x` (index-nested-loop) stays a full scan, a follow-on. Sound for outer
+    // joins too: a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows, so
+    // bounding it cannot drop a surviving row. A no-PK relation gets null (full scan).
+    const relBounds: (PkBound | null)[] = rels.map((rel) => {
+      if (filter === null) return null;
+      const pkLocal = primaryKeyIndex(rel.table);
+      return pkLocal >= 0 ? detectPkBound(filter, rel.offset + pkLocal, rel.table.columns[pkLocal]!.type) : null;
+    });
 
     // Assemble the owned plan (table NAMES + offsets/widths replace the scope's tables, so the
     // plan outlives the scope and a correlated subquery can re-execute it per row).
@@ -1123,7 +1125,7 @@ export class Database {
       distinct: sel.distinct,
       limit: sel.limit,
       offset: sel.offset,
-      pkBound,
+      relBounds,
     };
   }
 
@@ -1142,12 +1144,13 @@ export class Database {
   private execStreamingLimit(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): SelectResult {
     const store = this.readSnap().store(plan.rels[0]!.tableName);
 
-    // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead block. A correlated
-    // bound resolves against env.outer (the enclosing rows).
+    // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead block. This path is
+    // single-table (gated below), so the only relation is relBounds[0]. A correlated bound resolves
+    // against env.outer (the enclosing rows).
     let bound: KeyBound = unboundedBound();
     let empty = false;
-    if (plan.pkBound !== null) {
-      const b = buildKeyBound(plan.pkBound, params, env.outer);
+    if (plan.relBounds[0] !== null) {
+      const b = buildKeyBound(plan.relBounds[0]!, params, env.outer);
       if (b === null) empty = true;
       else bound = b;
     }
@@ -1201,15 +1204,16 @@ export class Database {
 
     // Materialize each base table once, in primary-key order, by draining a scanSource (the
     // pageRead block + per-row storageRowRead accrue inside the generator — spec/design/cost.md §3
-    // "page_read"/JOIN). A primary-key bound (single base table only) seeks/ranges instead of walking
-    // the whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. The
-    // nested loop re-reads from these in-memory buffers, which are not stores and charge nothing.
-    const materialized: Row[][] = plan.rels.map((rel) => {
+    // "page_read"/JOIN). Each base table's own primary-key bound (if any) seeks/ranges instead of
+    // walking the whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing.
+    // The nested loop re-reads from these in-memory buffers, which are not stores and charge nothing.
+    const materialized: Row[][] = plan.rels.map((rel, ri) => {
       const store = this.readSnap().store(rel.tableName);
       let rows: Row[];
       let nodeCount: number;
-      if (plan.pkBound !== null) {
-        const b = buildKeyBound(plan.pkBound, params, outer);
+      const relBound = plan.relBounds[ri]!;
+      if (relBound !== null) {
+        const b = buildKeyBound(relBound, params, outer);
         if (b === null) {
           rows = [];
           nodeCount = 0;
@@ -1970,11 +1974,13 @@ type SelectPlan = {
   distinct: boolean;
   limit: bigint | null;
   offset: bigint | null;
-  // Primary-key predicate pushdown (single base table only): the WHERE conjuncts that bound the
-  // storage key, so the scan seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
-  // scan"). null ⇒ full scan. The residual filter stays the WHOLE `filter`, re-applied to each
-  // scanned row — the bound only narrows which rows are scanned.
-  pkBound: PkBound | null;
+  // Primary-key predicate pushdown, ONE entry per relation in rels: the WHERE conjuncts that bound
+  // that relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree
+  // (cost.md §3 "bounded scan"). null ⇒ a full scan of that relation. In a JOIN each base table is
+  // bounded independently by the WHERE predicates on its OWN primary key against a CONSTANT
+  // (literal/param/outer) — a cross-relation `b.pk = a.x` is the index-nested-loop case (a
+  // follow-on). The residual filter stays the WHOLE `filter`, re-applied after the join.
+  relBounds: (PkBound | null)[];
 };
 
 // SetOpPlan is a resolved set operation: both operands planned with the same parent scope, the

@@ -1419,17 +1419,25 @@ impl Database {
             Some(p) => Some(resolve_boolean_filter(&scope, p, ptypes)?),
             None => None,
         };
-        // Primary-key predicate pushdown (single base table only): detect WHERE conjuncts that bound
-        // the storage key, so the scan seeks/ranges instead of walking the whole B-tree (cost.md §3
-        // "bounded scan"). Multi-table (join) and no-PK tables are excluded — a follow-on (the bound
-        // machinery is the substrate they reuse).
-        let pk_bound = match (&filter, scope.rels.as_slice()) {
-            (Some(f), [rel]) => rel
-                .table
-                .primary_key_index()
-                .and_then(|pk_idx| detect_pk_bound(f, pk_idx, rel.table.columns[pk_idx].ty)),
-            _ => None,
-        };
+        // Primary-key predicate pushdown, per base relation: detect WHERE conjuncts that bound that
+        // relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree
+        // (cost.md §3 "bounded scan"). The filter is resolved against the full FROM scope, so a
+        // relation's PK column is the GLOBAL index `rel.offset + pk_local`; `const_source` only
+        // accepts a literal/param/outer const (never a sibling column), so a JOIN base table is
+        // bounded only by a CONSTANT predicate on its own PK — `b.pk = a.x` (the index-nested-loop
+        // case) stays a full scan, a follow-on. Sound for outer joins too: a non-NULL PK conjunct in
+        // WHERE eliminates that relation's NULL-extended rows, so bounding it cannot drop a surviving
+        // row. A no-PK relation gets `None` (full scan).
+        let rel_bounds: Vec<Option<PkBound>> = scope
+            .rels
+            .iter()
+            .map(|rel| match &filter {
+                Some(f) => rel.table.primary_key_index().and_then(|pk_local| {
+                    detect_pk_bound(f, rel.offset + pk_local, rel.table.columns[pk_local].ty)
+                }),
+                None => None,
+            })
+            .collect();
         // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
         // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
         // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain
@@ -1547,7 +1555,7 @@ impl Database {
             distinct: sel.distinct,
             limit: sel.limit,
             offset: sel.offset,
-            pk_bound,
+            rel_bounds,
         })
     }
 
@@ -1567,9 +1575,10 @@ impl Database {
     ) -> Result<SelectResult> {
         let store = self.store(&plan.rels[0].table_name);
 
-        // Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A
-        // correlated bound resolves against `env.outer` (the enclosing rows).
-        let (bound, empty) = match &plan.pk_bound {
+        // Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. This path
+        // is single-table (gated below), so the only relation is `rel_bounds[0]`. A correlated bound
+        // resolves against `env.outer` (the enclosing rows).
+        let (bound, empty) = match &plan.rel_bounds[0] {
             Some(bp) => match build_key_bound(bp, params, env.outer) {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
@@ -1657,12 +1666,12 @@ impl Database {
         // "page_read"/JOIN). The nested loop re-reads from these in-memory buffers, which are not
         // stores and charge nothing.
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
-        for rel in &plan.rels {
+        for (ri, rel) in plan.rels.iter().enumerate() {
             let store = self.store(&rel.table_name);
-            // A primary-key bound (single base table only) seeks/ranges instead of walking the whole
-            // B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. Otherwise
-            // the full scan is unchanged (cost.md §3 "bounded scan").
-            let (rows, node_count) = match &plan.pk_bound {
+            // Each base table's own primary-key bound (if any) seeks/ranges instead of walking the
+            // whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing.
+            // Otherwise the full scan is unchanged (cost.md §3 "bounded scan" / JOIN).
+            let (rows, node_count) = match &plan.rel_bounds[ri] {
                 Some(bp) => match build_key_bound(bp, params, outer) {
                     Some(b) => (store.range_rows(&b)?, store.overlap_node_count(&b) as i64),
                     None => (Vec::new(), 0),
@@ -2567,11 +2576,14 @@ struct SelectPlan {
     distinct: bool,
     limit: Option<i64>,
     offset: Option<i64>,
-    /// Primary-key predicate pushdown (single base table only): the WHERE conjuncts that bound the
-    /// storage key, so the scan seeks/ranges instead of walking the whole B-tree (cost.md §3
-    /// "bounded scan"). `None` ⇒ full scan. The residual filter stays the WHOLE `filter`, re-applied
-    /// to each scanned row — the bound only narrows which rows are scanned.
-    pk_bound: Option<PkBound>,
+    /// Primary-key predicate pushdown, **one entry per relation** in `rels`: the WHERE conjuncts
+    /// that bound that relation's storage key, so its scan seeks/ranges instead of walking the whole
+    /// B-tree (cost.md §3 "bounded scan"). `None` ⇒ a full scan of that relation. In a JOIN each base
+    /// table is bounded independently by the WHERE predicates on **its own** primary key against a
+    /// CONSTANT (literal/param/outer) — a cross-relation `b.pk = a.x` is the index-nested-loop case
+    /// (still a follow-on; `const_source` rejects a sibling column). The residual filter stays the
+    /// WHOLE `filter`, re-applied after the join — the bound only narrows which rows are scanned.
+    rel_bounds: Vec<Option<PkBound>>,
 }
 
 // ---- Primary-key predicate pushdown (spec/design/cost.md §3 "bounded scan / point lookup") ----

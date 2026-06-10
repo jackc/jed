@@ -37,6 +37,7 @@ var SupportedCapabilities = []string{
 	"query.point_lookup",
 	"query.limit_short_circuit",
 	"query.correlated_pushdown",
+	"query.join_pushdown",
 	"query.is_null",
 	"query.order_by",
 	// Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

@@ -1444,15 +1444,20 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 			return nil, err
 		}
 	}
-	// Primary-key predicate pushdown (single base table only): detect WHERE conjuncts that bound the
-	// storage key, so the scan seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
-	// scan"). Multi-table (join) and no-PK tables are excluded — a follow-on (the bound machinery is
-	// the substrate they reuse).
-	var pkBound *pkBoundPlan
-	if filter != nil && len(rels) == 1 {
-		if t := rels[0].table; t.PrimaryKeyIndex() >= 0 {
-			pkIdx := t.PrimaryKeyIndex()
-			pkBound = detectPKBound(filter, pkIdx, t.Columns[pkIdx].Type)
+	// Primary-key predicate pushdown, per base relation: detect WHERE conjuncts that bound that
+	// relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree (cost.md
+	// §3 "bounded scan"). The filter is resolved against the full FROM scope, so a relation's PK
+	// column is the GLOBAL index rel.offset+pkLocal; isConstSource only accepts a literal/param/outer
+	// const (never a sibling column), so a JOIN base table is bounded only by a CONSTANT predicate on
+	// its own PK — `b.pk = a.x` (index-nested-loop) stays a full scan, a follow-on. Sound for outer
+	// joins too: a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows, so
+	// bounding it cannot drop a surviving row. A no-PK relation gets nil (full scan).
+	relBounds := make([]*pkBoundPlan, len(rels))
+	if filter != nil {
+		for i, rel := range rels {
+			if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
+				relBounds[i] = detectPKBound(filter, rel.offset+pkLocal, rel.table.Columns[pkLocal].Type)
+			}
 		}
 	}
 	// ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
@@ -1546,7 +1551,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
 		aggSpecs: aggSpecs, having: having, order: order, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset, pkBound: pkBound,
+		limit: sel.Limit, offset: sel.Offset, relBounds: relBounds,
 	}, nil
 }
 
@@ -1863,11 +1868,12 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A correlated
 	// bound resolves against env.outer (the enclosing rows).
+	// This path is single-table (gated below), so the only relation is relBounds[0].
 	b := unboundedBound()
 	empty := false
 	overlap := store.NodeCount()
-	if plan.pkBound != nil {
-		if b, empty = db.buildKeyBound(plan.pkBound, params, env.outer); empty {
+	if plan.relBounds[0] != nil {
+		if b, empty = db.buildKeyBound(plan.relBounds[0], params, env.outer); empty {
 			overlap = 0
 		} else {
 			overlap = store.OverlapNodeCount(b)
@@ -1942,13 +1948,13 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	materialized := make([][]Row, len(plan.rels))
 	for ri, rel := range plan.rels {
 		store := db.readSnap().store(rel.tableName)
-		// A primary-key bound (single base table only) seeks/ranges instead of walking the whole
+		// Each base table's own primary-key bound (if any) seeks/ranges instead of walking the whole
 		// B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. Otherwise the
-		// full scan is unchanged (cost.md §3 "bounded scan").
+		// full scan is unchanged (cost.md §3 "bounded scan" / JOIN).
 		var rows []Row
 		var nodeCount int
-		if plan.pkBound != nil {
-			b, empty := db.buildKeyBound(plan.pkBound, params, outer)
+		if plan.relBounds[ri] != nil {
+			b, empty := db.buildKeyBound(plan.relBounds[ri], params, outer)
 			if !empty {
 				var err error
 				if rows, err = store.RangeRows(b); err != nil {
@@ -2922,11 +2928,14 @@ type selectPlan struct {
 	distinct    bool
 	limit       *int64
 	offset      *int64
-	// pkBound is the primary-key predicate pushdown (single base table only): the WHERE conjuncts
-	// that bound the storage key, so the scan seeks/ranges instead of walking the whole B-tree
-	// (spec/design/cost.md §3 "bounded scan"). nil ⇒ full scan. The residual filter stays the WHOLE
-	// `filter`, re-applied to each scanned row — the bound only narrows which rows are scanned.
-	pkBound *pkBoundPlan
+	// relBounds is the primary-key predicate pushdown, ONE entry per relation in rels: the WHERE
+	// conjuncts that bound that relation's storage key, so its scan seeks/ranges instead of walking
+	// the whole B-tree (spec/design/cost.md §3 "bounded scan"). nil ⇒ a full scan of that relation.
+	// In a JOIN each base table is bounded independently by the WHERE predicates on its OWN primary
+	// key against a CONSTANT (literal/param/outer) — a cross-relation `b.pk = a.x` is the
+	// index-nested-loop case (a follow-on). The residual filter stays the WHOLE `filter`, re-applied
+	// after the join — the bound only narrows which rows are scanned.
+	relBounds []*pkBoundPlan
 }
 
 // setOpPlan is a resolved set operation: both operands planned with the same parent scope, the

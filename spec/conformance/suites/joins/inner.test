@@ -72,19 +72,18 @@ SELECT a.id, b.id FROM a JOIN b ON a.k > 25 ORDER BY a.id, b.id
 3
 30
 
-# A join with no surviving pair yields the empty result. ON matches 3, WHERE drops all 3.
-# 8 materialize + 16 ON + 3 WHERE + 0 produced = 27.
-# cost: 29
+# A join with no surviving pair yields the empty result. ON matches 3, WHERE `a.id = 999` drops all 3.
+# (The WHERE bounds a's scan to its PRIMARY KEY — a point-lookup miss, so a materializes 0 rows — but
+# that is a cost-only optimization pinned in joins/pushdown.test; here only the rows are asserted.)
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 999
 ----
 
-# SELECT * expands across BOTH tables in FROM order, each in catalog order:
-# a(id, k) then b(id, k, label). Five output columns. ON matches 3 rows; WHERE `a.id = 1`
-# evaluates on each (3) and keeps one. 8 materialize + 16 ON + 3 WHERE + 1 produced = 28.
-# The star projection columns are all leaves (no operator_eval).
+# SELECT * expands across BOTH tables in FROM order, each in catalog order: a(id, k) then b(id, k,
+# label). Five output columns. ON matches 3 rows; WHERE `a.id = 1` evaluates on each and keeps one.
+# (The WHERE also bounds a's scan to its PRIMARY KEY — a cost-only optimization pinned in
+# joins/pushdown.test; here only the rows and the star column order/names are asserted.)
 # names: id, k, id, k, label
-# cost: 30
 query IIIIT nosort
 SELECT * FROM a JOIN b ON a.k = b.k WHERE a.id = 1
 ----

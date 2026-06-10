@@ -89,6 +89,10 @@ id = "query.correlated_pushdown"
 description = "Correlated primary-key pushdown — when a correlated subquery's inner query is a single table whose WHERE compares the inner primary key to an enclosing-query column (`inner.pk = outer.col`), the inner scan bounds to that outer row's value (a per-outer-row point lookup/range) instead of re-scanning the whole inner table for every outer row (spec/design/cost.md §3 \"bounded scan / correlated\"). The same point-lookup mechanism as query.point_lookup, with the bound source resolved per outer row; results are unchanged, only the inner re-scan cost drops. A cost-visible optimization: a core lacking it re-scans the whole inner table per outer row and computes the higher cost, so cost-asserting correlated-PK tests require it."
 
 [[capability]]
+id = "query.join_pushdown"
+description = "Join base-table primary-key pushdown — in a multi-table FROM, each base table is bounded independently by the WHERE predicates on its OWN primary key against a CONSTANT (`a JOIN b … WHERE a.pk = 5`), so that table materializes a seek/range instead of a full scan (spec/design/cost.md §3 \"bounded scan / JOIN\"). The same point-lookup mechanism as query.point_lookup applied per relation; a cross-relation `b.pk = a.x` (index-nested-loop) is NOT bounded (a follow-on). Sound for outer joins: a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows. A cost-visible optimization: a core lacking it full-scans every join base table and computes the higher cost, so cost-asserting join-PK tests require it."
+
+[[capability]]
 id = "query.is_null"
 description = "IS NULL / IS NOT NULL predicates"
 

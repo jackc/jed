@@ -152,8 +152,10 @@ deliberate, cost-visible optimization, gated by the `query.point_lookup` capabil
   is one of: a **literal**, a **bind parameter** `$N`, or (the correlated case below) a bare
   **enclosing-query column**. Every other conjunct stays in the **residual filter** (the whole
   WHERE, re-applied to each scanned row), so the bound is always a *superset* of the matching rows
-  and the result is unchanged. Multi-table (JOIN) scans and no-PK tables are **not** bounded yet (a
-  follow-on) — they keep the full-scan cost above.
+  and the result is unchanged. A no-PK relation is **not** bounded (it keeps the full-scan cost
+  above). In a **JOIN** each base table is bounded *independently* by the WHERE conjuncts on **its
+  own** primary key against such a const-source (`query.join_pushdown`, "/ JOIN" below); a
+  cross-relation `b.pk = a.x` is **not** bounded (a follow-on — see "/ JOIN").
 - **`page_read` = the nodes the bound's key range intersects.** A scan visits the root, then
   descends only into a child subtree whose separator span can overlap the range — so a **point
   lookup** (`pk = c`) charges the root→leaf path (the tree height), and a **range** charges the
@@ -174,6 +176,22 @@ deliberate, cost-visible optimization, gated by the `query.point_lookup` capabil
 `spec/conformance/suites/query/point_lookup.test` pins these costs cross-core; the bounded forms in
 `expr/cost.test`, `query/distinct.test`, `query/limit_offset.test`, and `query/select_list.test`
 exercise them in context.
+
+**Bounded scan / JOIN — each base table bounded by its own PK predicate.** In a multi-table FROM
+each base table is materialized independently (see "JOIN" below), so each is bounded **on its own**
+by the WHERE conjuncts on **its** primary key against a const-source — exactly the per-relation form
+of the rule above. `SELECT … FROM a JOIN b … WHERE a.pk = 5` materializes a's matching row (a seek)
+and full-scans b; `WHERE a.pk = 5 AND b.pk = 10` seeks both. A point-lookup **miss** on a join key
+(`a.pk = 999`) materializes **zero** rows for that table, so the nested loop has nothing to drive —
+the join collapses to the other tables' scan cost. The bound's source is still a constant
+(literal/param/outer); a **cross-relation** `b.pk = a.x` is **not** bounded — binding b's key to a's
+value per outer row is the index-nested-loop case, a follow-on (a sibling column is not a
+const-source). Bounds come only from the **WHERE**, never an `ON` (an ON failure NULL-extends rather
+than drops, so it is not a post-join filter). **Sound for outer joins:** a non-NULL PK conjunct in
+WHERE is unknown for a NULL-extended row, so it discards every NULL-extension of that relation — the
+LEFT/RIGHT/FULL join degenerates to INNER on the bounded side, and any surviving output row has that
+PK in range, so bounding the table cannot drop it. Gated by `query.join_pushdown`, pinned cross-core
+in `spec/conformance/suites/joins/pushdown.test`.
 
 **Bounded scan / correlated — the inner PK bound from an outer column.** A correlated subquery is
 re-executed once per outer row (see "Subqueries" below). When its inner query is a **single table**
@@ -265,7 +283,10 @@ cost is pinned here because, with no reference implementation, the count is a cr
   store and charges nothing. This keeps the existing rule verbatim ("once per row pulled from a
   store, in the executor loop not the storage iterator" — so the Rust lazy-iterator vs Go/TS
   materialized-slice split stays neutralized) and keeps single-table cost identical (one table →
-  its cardinality).
+  its cardinality). When a table is **bounded** by a WHERE predicate on its own primary key
+  (`query.join_pushdown`, "Bounded scan / JOIN" above), only its in-range rows are materialized, so
+  its `storage_row_read` (and `page_read`) is the bounded count, not the full cardinality — a miss
+  materializes zero. The bound never changes the result, only which rows are scanned.
 - **The `ON`-predicate `operator_eval` is charged per candidate combination** the join evaluates
   it against — for an `INNER JOIN`, once per (running-row × right-row) pair, the `ON` tree's
   interior nodes firing pre-order with **no short-circuit**, exactly like a WHERE. A `CROSS JOIN`
