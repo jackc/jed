@@ -1,0 +1,143 @@
+# Cost ceiling + deterministic abort (CLAUDE.md §13; spec/design/cost.md §6). A first-class use
+# case is safely evaluating untrusted, user-supplied queries: the engine meters execution cost
+# deterministically (spec/cost/schedule.toml) and aborts when a caller-set ceiling is reached. The
+# host sets `max_cost` on the handle (spec/design/api.md §8); the instant a statement's accrued cost
+# reaches it, execution aborts with `54P01` (cost_limit_exceeded).
+#
+# The abort point is part of the CROSS-CORE contract (no reference impl, §2): every core meters the
+# BYTE-IDENTICAL cost (the `# cost:` directive), so every core aborts on the SAME (query, db, ceiling).
+# This suite pins both directions with the `# max_cost: N` directive — a comment the stock runner
+# ignores (like `# cost:`) that runs the NEXT record under a ceiling of N. Under-ceiling records run
+# normally (and may assert their cost); over-ceiling records are `statement error 54P01`. The ceiling
+# is the first DISALLOWED value: accrued *reaching* it (≥) aborts, so a ceiling equal to a query's
+# true cost aborts and one above it succeeds. The abort is an ordinary error, so an aborted DELETE /
+# UPDATE rolls back its (autocommit) transaction and leaves the table untouched.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, expr.arithmetic, types.int32, query.point_lookup, resource.cost_metering, resource.cost_limit
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+
+# Baseline with NO ceiling: a full scan reads every row. 1 page + 5 scanned + 5 produced = 11.
+# This is the true cost the ceilings below are measured against.
+# cost: 11
+query I rowsort
+SELECT v FROM t
+----
+10
+20
+30
+40
+50
+
+# A ceiling comfortably above the true cost lets the query through, unchanged (same 11).
+# max_cost: 100
+# cost: 11
+query I rowsort
+SELECT v FROM t
+----
+10
+20
+30
+40
+50
+
+# A ceiling well below the true cost aborts the scan deterministically (54P01).
+# max_cost: 5
+statement error 54P01
+SELECT v FROM t
+
+# Exact boundary: the ceiling is the first DISALLOWED value, so a ceiling EQUAL to the true cost
+# (11) aborts — accrued reaches 11 and the next guard fires (CLAUDE.md §13 "the instant accrued
+# cost reaches it").
+# max_cost: 11
+statement error 54P01
+SELECT v FROM t
+
+# ...one above the true cost succeeds: the final charge lands at 11 < 12, and execution finishes.
+# max_cost: 12
+# cost: 11
+query I rowsort
+SELECT v FROM t
+----
+10
+20
+30
+40
+50
+
+# The bound is on ACTUAL accrued cost, not table size: a primary-key point lookup costs only
+# 1 page + 1 scanned + 1 filter (`id = 3`) + 1 produced = 4, so it runs under a ceiling of 8...
+# max_cost: 8
+# cost: 4
+query I rowsort
+SELECT v FROM t WHERE id = 3
+----
+30
+
+# ...while the full scan (11) aborts under that SAME ceiling of 8. The point-lookup pushdown is
+# what makes a low ceiling usable: legitimate keyed queries pass, runaway scans do not.
+# max_cost: 8
+statement error 54P01
+SELECT v FROM t
+
+# A primary-key range scan reads rows 2..5: 1 page + 4 scanned + 4 filter (`id >= 2`) + 4 produced
+# = 13. A ceiling equal to it aborts...
+# max_cost: 13
+statement error 54P01
+SELECT v FROM t WHERE id >= 2
+
+# ...and one above it succeeds, returning the in-range rows.
+# max_cost: 14
+# cost: 13
+query I rowsort
+SELECT v FROM t WHERE id >= 2
+----
+20
+30
+40
+50
+
+# A provably-empty primary-key bound (contradictory range) reads no page and no row, so it accrues
+# 0 and survives even a ceiling of 1 (the minimum that is not "unlimited").
+# max_cost: 1
+# cost: 0
+query I rowsort
+SELECT v FROM t WHERE id > 5 AND id < 5
+----
+
+# A DELETE scans + filters every row, so a low ceiling aborts it (1 page + 5 scanned + 5 filter
+# would be 11; the ceiling of 5 stops it first).
+# max_cost: 5
+statement error 54P01
+DELETE FROM t WHERE v > 0
+
+# The aborted DELETE rolled back (the abort is an ordinary error): the table is intact — still 5
+# rows, all unchanged.
+# cost: 11
+query I rowsort
+SELECT v FROM t
+----
+10
+20
+30
+40
+50
+
+# An UPDATE likewise aborts under a low ceiling — and rolls back, so no row's `v` is incremented.
+# max_cost: 5
+statement error 54P01
+UPDATE t SET v = v + 1 WHERE v > 0
+
+# Proof the UPDATE wrote nothing: the values are the originals, not v+1.
+# cost: 11
+query I rowsort
+SELECT v FROM t
+----
+10
+20
+30
+40
+50

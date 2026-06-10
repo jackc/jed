@@ -207,6 +207,12 @@ export class Database {
   // writes through it. null for an in-memory database (persistHook is then null too); set by file.ts
   // open/create, dropped by close. A type-only import keeps the executor free of a file-module dependency.
   paging: SharedPaging | null;
+  // maxCost is the caller-set execution-cost ceiling (CLAUDE.md §13; spec/design/api.md §8), or 0n
+  // (the default) for unlimited. A positive value bounds every statement run on this handle: each
+  // statement's Meter is built with this limit and aborts with 54P01 the instant accrued cost reaches
+  // it. A handle setting (not stored in the file), set by setMaxCost; the primary guard for safely
+  // evaluating untrusted, user-supplied queries.
+  maxCost: bigint;
 
   constructor() {
     this.committed = new Snapshot();
@@ -217,6 +223,16 @@ export class Database {
     this.freePages = [];
     this.persistHook = null;
     this.paging = null;
+    this.maxCost = 0n;
+  }
+
+  // setMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
+  // spec/design/api.md §8). A positive limit bounds every subsequent statement: it aborts with 54P01
+  // the instant accrued cost reaches limit (spec/design/cost.md §6). limit <= 0n (the default) is
+  // unlimited. The primary guard for safely evaluating untrusted, user-supplied queries; a handle
+  // setting, not stored in the file.
+  setMaxCost(limit: bigint): void {
+    this.maxCost = limit;
   }
 
   // readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
@@ -700,7 +716,7 @@ export class Database {
     // per-row outer environment below (it pushes the current row, so `target.col` reads it). The
     // uncorrelated execution reads the pre-DELETE snapshot (keys are collected before mutating).
     // Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
-    const meter = new Meter();
+    const meter = new Meter(this.maxCost);
     if (filter !== null) {
       const cost = { value: 0n };
       filter = this.foldUncorrelatedInRExpr(filter, bound, cost);
@@ -716,6 +732,7 @@ export class Database {
     if (entries === null) return { kind: "statement", cost: meter.accrued }; // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap));
     for (const e of entries) {
+      meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
       meter.charge(COSTS.storageRowRead);
       if (filter === null || isTrue(evalExpr(filter, e.row, env, meter))) {
@@ -784,7 +801,7 @@ export class Database {
     //
     // Phase 1: build + validate every matching row's new values; no writes yet. Each scanned row,
     // the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
-    const meter = new Meter();
+    const meter = new Meter(this.maxCost);
     const foldCost = { value: 0n };
     for (const p of plans) p.source = this.foldUncorrelatedInRExpr(p.source, bound, foldCost);
     if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, foldCost);
@@ -799,6 +816,7 @@ export class Database {
     if (entries === null) return { kind: "statement", cost: meter.accrued }; // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap));
     for (const e of entries) {
+      meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
       if (filter !== null && !isTrue(evalExpr(filter, e.row, env, meter))) continue;
       const newRow = e.row.slice();
@@ -1141,6 +1159,7 @@ export class Database {
     if (!empty && limit > 0n) {
       let passed = 0n;
       store.scanRange(bound, (_key, row) => {
+        meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
         meter.charge(COSTS.storageRowRead);
         if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
           return true;
@@ -1161,7 +1180,7 @@ export class Database {
       outer,
       runSubquery: (p, o) => this.execQueryPlan(p, o, params),
     };
-    const meter = new Meter();
+    const meter = new Meter(this.maxCost);
 
     // LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
     // operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the
@@ -1307,6 +1326,7 @@ export class Database {
         index.set("", 0);
       }
       for (const row of rows) {
+        meter.guard(); // enforce the cost ceiling per folded row (CLAUDE.md §13)
         const keys = plan.groupKeys.map((gk) => row[gk]!);
         const k = distinctRowKey(keys);
         let gi = index.get(k);
@@ -1343,6 +1363,7 @@ export class Database {
       // Window + project; only an emitted row charges rowProduced + its projection cost.
       const [start, end] = windowBounds(groupRows.length);
       out = groupRows.slice(start, end).map((srow) => {
+        meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
         meter.charge(COSTS.rowProduced);
         return plan.projections.map((p) => evalExpr(p, srow, env, meter));
       });
@@ -1364,6 +1385,7 @@ export class Database {
       // rowProduced (spec/design/cost.md §3).
       const [start, end] = windowBounds(distinctRows.length);
       out = distinctRows.slice(start, end).map((tuple) => {
+        meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
         meter.charge(COSTS.rowProduced);
         return tuple;
       });
@@ -1374,6 +1396,7 @@ export class Database {
       // (ORDER BY's sort comparisons are not metered — spec/design/cost.md §3.)
       const [start, end] = windowBounds(rows.length);
       out = rows.slice(start, end).map((row) => {
+        meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
         meter.charge(COSTS.rowProduced);
         return plan.projections.map((p) => evalExpr(p, row, env, meter));
       });
@@ -1487,6 +1510,10 @@ export class Database {
 function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Row> {
   meter.charge(COSTS.pageRead * BigInt(nodeCount));
   for (const row of rows) {
+    // Enforce the cost ceiling before pulling the next row (CLAUDE.md §13): a runaway scan (or a
+    // JOIN/correlated re-scan built on this source) stops deterministically once accrued cost
+    // reaches the limit. No-op when unlimited (spec/design/cost.md §6).
+    meter.guard();
     meter.charge(COSTS.storageRowRead);
     yield row;
   }
@@ -3539,6 +3566,10 @@ function inMembership(lv: Value, list: Value[], negated: boolean, m: Meter): Val
 }
 
 function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
+  // Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). evalExpr recurses once
+  // per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot; it
+  // is a no-op when no ceiling is set (spec/design/cost.md §6).
+  m.guard();
   switch (e.kind) {
     case "column":
       return row[e.index]!;

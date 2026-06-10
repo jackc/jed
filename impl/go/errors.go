@@ -81,6 +81,10 @@ const (
 	IndeterminateDatatype
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
+	// CostLimitExceeded is 54P01 — a query's accrued execution cost reached the caller-set
+	// max_cost ceiling and execution was aborted (CLAUDE.md §13; spec/design/cost.md §6).
+	// jed-specific (PostgreSQL has no execution-cost ceiling); class 54 program_limit_exceeded.
+	CostLimitExceeded
 	// IoError is 58030 — an I/O error from the host file layer (spec/design/api.md §2).
 	IoError
 	// UndefinedFile is 58P01 — open of a database path that does not exist.
@@ -154,6 +158,8 @@ func (s SqlState) Code() string {
 		return "42P18"
 	case FeatureNotSupported:
 		return "0A000"
+	case CostLimitExceeded:
+		return "54P01"
 	case IoError:
 		return "58030"
 	case UndefinedFile:

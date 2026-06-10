@@ -127,6 +127,9 @@ var SupportedCapabilities = []string{
 	// Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
 	// accrued cost via the `# cost:` directive (CLAUDE.md §13).
 	"resource.cost_metering",
+	// Cost ceiling — a caller-set `max_cost` aborts a query (54P01) the instant accrued cost
+	// reaches it; the `# max_cost:` directive runs a record under a ceiling (cost.md §6).
+	"resource.cost_limit",
 	// Phase 5 — explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes,
 	// failed-block poisoning (spec/design/transactions.md §4, grammar.md §27).
 	"txn.explicit",

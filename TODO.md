@@ -114,10 +114,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       ([spec/conformance/suites/expr/cost.test](spec/conformance/suites/expr/cost.test), gated by
       the `resource.cost_metering` capability) asserts the **byte-identical** accrued cost in
       Rust, Go, **and** TS. The accrual rules (interior nodes only, no short-circuit, pre-order)
-      and the deferred bits are in [spec/design/cost.md](spec/design/cost.md). **Still deferred:**
-      the caller-set **max-cost ceiling + deterministic abort** (and its error code) — designed so
-      `Meter.charge` is the single chokepoint where it slots in; a real `page_read` unit; and
-      per-operator `cost` weights. _(was: M seam / L full enforcement; §13)_ _(parallel)_
+      and the accrual rules are in [spec/design/cost.md](spec/design/cost.md). The caller-set
+      **max-cost ceiling + deterministic abort** (`54P01`) has since **landed** (Phase 7, all 3
+      cores) via `Meter::guard()` at the work loops; a real `page_read` unit landed (P6.3). **Still
+      deferred:** per-operator `cost` weights. _(§13)_ _(parallel)_
 
 ---
 
@@ -835,9 +835,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **Storage hosts** — Node `fs` host **built** (Phase 7, `impl/ts/src/file.ts`; Rust/Go use
       `std::fs`/`os` directly); build the **browser/OPFS** host (`FileSystemSyncAccessHandle`)
       and confirm native file-host parity (§9, storage.md §2). _(size: L; §9)_
-- [ ] **Cost ceiling (`max_cost`) + deterministic abort** — the metering seam exists (cost.md
-      §6, `Outcome` carries `cost`); the host API shape reserves an options object on
-      `prepare`/`execute` for it. Wire it + register a resource-limit SQLSTATE. _(size: M; §13)_
+- [x] **Cost ceiling (`max_cost`) + deterministic abort** — ✅ landed (all 3 cores). A handle
+      `max_cost` setting (`set_max_cost`/`SetMaxCost`/`setMaxCost`, `0` = unlimited) aborts a
+      statement with **`54P01`** (`cost_limit_exceeded`, class 54 program_limit_exceeded) the
+      instant accrued cost reaches it. Enforced by `Meter::guard()` at the unbounded-work points
+      (per scanned row, per produced row, per expression node, per aggregate fold) — `charge`
+      stays a pure accrual chokepoint so the `# cost:` contract is byte-unchanged; the abort is an
+      ordinary error (rolls back). Deterministic + cross-core identical; the `# max_cost:` corpus
+      directive + `resource.cost_limit` capability + `resource/cost_limit.test` pin it (cost.md
+      §6, api.md §8). _(§13)_
 - [ ] **(Open question, not scheduled)** low-level direct access API beneath SQL
       (`getValue("table", key)`) — keep the seam open, don't build yet (§9). _(size: —)_
 

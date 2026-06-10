@@ -208,6 +208,20 @@ name = "feature_not_supported"
 class = "feature not supported"
 template = "feature not supported: {detail}"
 
+# --- program limit exceeded (class 54) --------------------------------------
+# A caller-imposed limit was exceeded during execution. jed-specific: PostgreSQL has
+# no execution-cost ceiling, so this code (a `P` subclass, like 22P02/42P18/25P02) is
+# a documented divergence (CLAUDE.md §1/§13; spec/design/cost.md §6). The deterministic
+# cost meter (spec/cost/schedule.toml) accrues a query's cost; when it reaches the
+# handle's `max_cost` (spec/design/api.md §8) execution aborts here — the safety gate for
+# untrusted, user-supplied queries. Asserted by the conformance corpus (the resource.cost_limit
+# capability), since the abort point is part of the cross-core contract (no reference impl, §2).
+[[error]]
+code = "54P01"
+name = "cost_limit_exceeded"
+class = "program limit exceeded"
+template = "query exceeded the cost limit of {limit} (accrued {cost})"
+
 # --- system error / host filesystem (class 58) ------------------------------
 # Raised by the host API's file layer (spec/design/api.md), never by the SQL
 # executor: open/create/commit touch the filesystem. Per-impl surface — the

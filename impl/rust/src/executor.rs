@@ -179,6 +179,13 @@ pub struct Database {
     /// every commit writes through it. `None` for an in-memory database (`persist` is then a no-op);
     /// set by `open`/`create`, dropped by `close`.
     pub(crate) paging: Option<std::sync::Arc<crate::paging::SharedPaging>>,
+    /// The caller-set execution-cost ceiling (CLAUDE.md §13; spec/design/api.md §8), or `0`
+    /// (the default) for **unlimited**. A positive value bounds every statement run on this
+    /// handle: each statement's [`Meter`](crate::cost::Meter) is built with this limit and
+    /// aborts with `54P01` the instant accrued cost reaches it. A handle setting (not stored
+    /// in the file), set by [`set_max_cost`](Database::set_max_cost); the primary guard for
+    /// safely evaluating untrusted, user-supplied queries.
+    pub(crate) max_cost: i64,
 }
 
 /// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
@@ -217,6 +224,7 @@ impl Database {
             page_count: 0,
             free_pages: Vec::new(),
             paging: None,
+            max_cost: 0,
         }
     }
 
@@ -234,6 +242,7 @@ impl Database {
             page_count: 0,
             free_pages: Vec::new(),
             paging: None,
+            max_cost: 0,
         }
     }
 
@@ -293,6 +302,20 @@ impl Database {
     /// The page size this database serializes with (spec/design/api.md §2).
     pub fn page_size(&self) -> u32 {
         self.page_size
+    }
+
+    /// Set the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
+    /// spec/design/api.md §8). A positive `limit` bounds every subsequent statement: it
+    /// aborts with `54P01` the instant accrued cost reaches `limit` (spec/design/cost.md §6).
+    /// `limit <= 0` (the default) is **unlimited**. The primary guard for safely evaluating
+    /// untrusted, user-supplied queries; a handle setting, not stored in the file.
+    pub fn set_max_cost(&mut self, limit: i64) {
+        self.max_cost = limit;
+    }
+
+    /// The current execution-cost ceiling (`0` ⇒ unlimited). See [`set_max_cost`](Database::set_max_cost).
+    pub fn max_cost(&self) -> i64 {
+        self.max_cost
     }
 
     /// The backing file path, or `None` for an in-memory database.
@@ -862,7 +885,7 @@ impl Database {
         // spec/design/grammar.md §26, cost.md §3); a correlated one stays and re-runs per row via
         // the per-row outer environment below. The uncorrelated execution reads the pre-DELETE
         // snapshot (we collect keys before mutating), matching PostgreSQL.
-        let mut meter = Meter::new();
+        let mut meter = Meter::with_limit(self.max_cost);
         if let Some(f) = &mut filter {
             self.fold_uncorrelated_in_rexpr(f, &bound, &mut meter.accrued)?;
         }
@@ -905,6 +928,7 @@ impl Database {
         };
         meter.charge(COSTS.page_read * overlap);
         for (k, row) in entries {
+            meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
@@ -996,7 +1020,7 @@ impl Database {
         // cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and
         // re-runs per row via the outer environment. The uncorrelated execution reads the
         // pre-UPDATE snapshot (phase 1 only reads; phase 2 writes), matching PostgreSQL.
-        let mut meter = Meter::new();
+        let mut meter = Meter::with_limit(self.max_cost);
         for plan in &mut plans {
             self.fold_uncorrelated_in_rexpr(&mut plan.source, &bound, &mut meter.accrued)?;
         }
@@ -1041,6 +1065,7 @@ impl Database {
         };
         meter.charge(COSTS.page_read * overlap);
         for (key, row) in entries {
+            meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
             let matched = match &filter {
                 None => true,
@@ -1561,6 +1586,7 @@ impl Database {
         if !empty && limit > 0 {
             let mut passed: i64 = 0;
             store.scan_range(&bound, &mut |_key, row| {
+                meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
                 meter.charge(COSTS.storage_row_read);
                 let keep = match &plan.filter {
                     Some(f) => f.eval(row, env, meter)?.is_true(),
@@ -1606,7 +1632,7 @@ impl Database {
             params,
             outer,
         };
-        let mut meter = Meter::new();
+        let mut meter = Meter::with_limit(self.max_cost);
 
         // LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no
         // blocking operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project
@@ -1776,6 +1802,7 @@ impl Database {
                 index.insert(Vec::new(), 0);
             }
             for row in &rows {
+                meter.guard()?; // enforce the cost ceiling per folded row (CLAUDE.md §13)
                 let key: Vec<Value> = plan.group_keys.iter().map(|&gk| row[gk].clone()).collect();
                 let gi = match index.get(&key) {
                     Some(&i) => i,
@@ -1836,6 +1863,7 @@ impl Database {
             let (start, end) = window_bounds(group_rows.len());
             let mut out_rows = Vec::with_capacity(end - start);
             for srow in &group_rows[start..end] {
+                meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                 meter.charge(COSTS.row_produced);
                 let mut out = Vec::with_capacity(plan.projections.len());
                 for p in &plan.projections {
@@ -1865,6 +1893,7 @@ impl Database {
             let (start, end) = window_bounds(distinct_rows.len());
             let mut out_rows = Vec::with_capacity(end - start);
             for row in distinct_rows.drain(start..end) {
+                meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                 meter.charge(COSTS.row_produced);
                 out_rows.push(row);
             }
@@ -1878,6 +1907,7 @@ impl Database {
             let (start, end) = window_bounds(rows.len());
             let mut out_rows = Vec::with_capacity(end - start);
             for row in &rows[start..end] {
+                meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                 meter.charge(COSTS.row_produced);
                 let mut out = Vec::with_capacity(plan.projections.len());
                 for p in &plan.projections {
@@ -2797,6 +2827,10 @@ impl ScanSource {
     }
 
     fn next(&mut self, m: &mut Meter) -> Result<Option<Row>> {
+        // Enforce the cost ceiling before pulling the next row (CLAUDE.md §13): a runaway scan
+        // (or a JOIN/correlated re-scan built on this source) stops deterministically once
+        // accrued cost reaches the limit. No-op when unlimited (spec/design/cost.md §6).
+        m.guard()?;
         if !self.charged_block {
             m.charge(COSTS.page_read * self.node_count);
             self.charged_block = true;
@@ -4990,6 +5024,10 @@ impl RExpr {
     /// operands are always evaluated — there is no short-circuit, so the count never
     /// depends on operand values (spec/design/cost.md §3).
     fn eval(&self, row: &[Value], env: &EvalEnv, m: &mut Meter) -> Result<Value> {
+        // Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). `eval` recurses
+        // once per expression node, so guarding here bounds a pathological expression to ~O(1)
+        // overshoot; it is a no-op when no ceiling is set (spec/design/cost.md §6).
+        m.guard()?;
         match self {
             // The value is read out of a borrowed stored row, so it is cloned (Value is
             // Clone, not Copy, now that a text value owns a String).

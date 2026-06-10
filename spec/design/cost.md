@@ -8,11 +8,11 @@
 
 A first-class use case is **safely evaluating untrusted, user-supplied queries**
 (CLAUDE.md §13). That requires the engine to **deterministically meter the cost of
-executing a query** and, eventually, to **abort when a caller-supplied ceiling is
-exceeded**. This slice builds the **seam** — the cost counter threaded through the
-executor, expression evaluator, and storage reads — while the executor is still small.
-The ceiling + abort is deferred (§6); the seam is what is expensive to retrofit, so it
-goes in now.
+executing a query** and to **abort when a caller-supplied ceiling is reached**. Both halves
+have landed: the metering **seam** — the cost counter threaded through the executor,
+expression evaluator, and storage reads — and the **ceiling + deterministic abort** built on
+it (§6). A caller sets `max_cost` on the handle (spec/design/api.md §8); the instant a
+statement's accrued cost reaches it, execution aborts with `54P01` (`cost_limit_exceeded`).
 
 ## 1. Why cost is a shared contract, not an implementation detail
 
@@ -100,7 +100,7 @@ TS; any deviation diverges the count and fails the corpus.
   evaluated once per tested branch — the same per-branch model as `IN`'s LHS.)
 - **Pre-order, LHS-before-RHS.** A node charges itself, then evaluates its left operand,
   then its right. The order does not change the **total** (a sum is order-independent),
-  but it fixes the deterministic **abort point** for the deferred ceiling (§6) identically
+  but it fixes the deterministic **abort point** for the cost ceiling (§6) identically
   across cores.
 - **Helpers are not separately charged.** `eval_arith`/`evalArith`, and the `<=`/`>=`
   comparisons' internal `lt3 OR eq3` combinators, are covered by their owning node's
@@ -124,7 +124,7 @@ exactly the property cost requires.
   pages, then the rows within them. Charged at the **same three sites** as `storage_row_read`
   (the `SELECT`/JOIN materialization, the `DELETE` scan, the `UPDATE` phase-1 scan), once per
   table-scan *execution*. The total is order-independent, but fixing the block-before-rows order
-  pins the future abort point (§6) identically across cores.
+  pins the cost-ceiling abort point (§6) identically across cores.
 - **It composes exactly like `storage_row_read`.** A **JOIN** materializes each base table
   once, so it charges each table's node count once (Σ over the relations — a self-join counts
   the table twice, once per alias). A **set operation** charges each operand's scans
@@ -254,7 +254,7 @@ cost is pinned here because, with no reference implementation, the count is a cr
   |running| × |right| × (interior nodes in the `ON`), deterministic and fan-out-explicit. The
   iteration order — running/left side outer in PK order, right side inner in PK order, left-deep —
   is fixed so the per-combination evals accrue in the same sequence in every core (a §8 surface;
-  it fixes the future abort point even though only the total is asserted today).
+  it fixes the cost-ceiling abort point even though only the total is asserted today).
 - **WHERE `operator_eval`** is charged per **surviving combined row** (post-join), and
   **`row_produced`** per emitted output row (post-`LIMIT`/`OFFSET`) — both unchanged; the combined
   row is simply wider. Join materialization buffering, the nested-loop control flow, and row
@@ -403,20 +403,62 @@ Every accrual routes through a single `Meter::charge(units)` chokepoint per core
 `Meter` struct threaded by `&mut`/pointer/mutable-object through the executors and the
 recursive evaluator). The accrued total is exposed on `Outcome` (both the statement and
 query variants — a `DELETE` still accrues scan + filter cost). Centralizing accrual in
-`charge` is what makes the deferred enforcement a local change (§6).
+`charge`, with the ceiling check factored into `Meter::guard()`, is what kept enforcement a
+local change (§6).
 
-## 6. Deferred — enforcement
+## 6. Enforcement — the cost ceiling (landed)
 
-Not built in this slice; recorded here so the seam shape can be confirmed against it:
+The metering seam (§5) exists so that bounding an untrusted query is a small, local addition.
+It is now built:
 
-- **Caller-set ceiling + deterministic abort.** `Meter` gains a `limit`; `charge` becomes
-  the one place that compares `accrued` against it and aborts. Because every unit already
-  flows through `charge`, no executor call site is re-threaded — the abort is a ~3-line,
-  one-method change. The abort point is deterministic (same `(query, db, ceiling)` → same
-  abort) because accrual order is fixed (§3).
-- **Cost-ceiling error code.** A new `[[error]]` in [../errors/registry.toml](../errors/registry.toml)
-  — a resource/limit class (PostgreSQL uses SQLSTATE class `53` *insufficient_resources*;
-  `54` *program_limit_exceeded* is the other candidate). **Not authored now.**
+- **Caller-set ceiling.** The handle carries a `max_cost` setting (spec/design/api.md §8),
+  `0` (the default) ⇒ **unlimited**, a positive value ⇒ the ceiling. Each statement's `Meter`
+  is constructed with that limit. It is a handle setting, not stored in the file — the host
+  configures the budget for whatever handle serves untrusted queries.
+- **Deterministic abort via `guard()`.** `charge` stays a pure accrual chokepoint (so the
+  `# cost:` accrual contract is **byte-unchanged**); a separate `Meter::guard()` does the
+  comparison and **aborts when accrued cost has reached the ceiling** (`accrued >= limit`,
+  CLAUDE.md §13 — "the instant accrued cost reaches it"). The ceiling is therefore the first
+  *disallowed* value: a query whose true cost equals the ceiling aborts, one costing
+  `ceiling − 1` completes. `guard()` is consulted at the **unbounded-work points** — once per
+  scanned row (the SELECT/JOIN materialization, the DELETE and UPDATE scans, the streaming
+  LIMIT walk), once per produced row, once per expression node (the recursive evaluator's
+  entry), and once per aggregate fold row. These points are **mirrored identically across
+  Rust, Go, and TS**, and accrual order is fixed (§3), so the abort is deterministic and
+  **cross-core identical**: the same `(query, db, ceiling)` aborts (or completes) in every
+  core. A subquery executes through the same path with the same `max_cost`, so a runaway
+  correlated re-scan aborts within its own execution; the outer meter additionally accrues the
+  subquery's cost (`charge(r.cost)`), so the outer scan guard sees the running total. The
+  guard is a single comparison and a **no-op when unlimited**, so it is free on the hot path
+  by default.
+  - **Surfacing differs per core, the abort point does not.** Rust returns `Result` (the
+    guard is `m.guard()?`), Go returns `error` (`if err := m.Guard(); err != nil`), TS
+    **throws** the `EngineError` (which unwinds to the API boundary like every other SQL
+    error) — each its own idiom, all aborting at the same guarded point. The abort is an
+    **ordinary engine error**, so it flows through the existing rollback-on-error paths
+    untouched: an aborted autocommit DELETE/UPDATE discards its working set and leaves the
+    table unchanged, and inside an explicit block the abort poisons the block (§transactions).
+  - **Bounded overshoot, by design.** Because `guard()` is checked at the work-loop
+    boundaries rather than inside every `charge`, accrued cost can pass the ceiling by at most
+    the work of one unit between two guards — one row's filter/projection, one expression
+    subtree, or one folded row (the membership loop over an `IN`-subquery's result is bounded
+    by that result, which a guarded inner scan already capped). The overshoot is itself
+    deterministic and cross-core identical. Tightening `page_read`'s single up-front block
+    charge, and a single global running counter across subquery nesting, are possible later
+    refinements; neither changes the abort *decision* for a `(query, db, ceiling)`.
+- **Cost-ceiling error code — `54P01` `cost_limit_exceeded`.** Authored in
+  [../errors/registry.toml](../errors/registry.toml), class `54` *program_limit_exceeded* (a
+  caller-imposed limit was exceeded). jed-specific — PostgreSQL has no execution-cost ceiling,
+  so it is a documented divergence (CLAUDE.md §1/§13), the `P` subclass marking it as jed's,
+  like the existing `22P02`/`42P18`/`25P02`.
+- **Conformance.** The `# max_cost: N` directive (mirroring `# cost:`) runs the next record
+  under a ceiling of N; an over-ceiling record is `statement error 54P01`, an under-ceiling
+  record runs normally and may assert its `# cost:`.
+  [../conformance/suites/resource/cost_limit.test](../conformance/suites/resource/cost_limit.test)
+  pins both directions cross-core, gated by the `resource.cost_limit` capability.
+
+Other items recorded against the seam:
+
 - **A real `page_read` unit — ✅ landed (P6.3).** The store is now a page-backed B-tree
   ([storage.md](storage.md) §6), so a distinct `page_read` unit was **added** to the schedule
   (not a rename of `storage_row_read` — both fire on a scan) and is charged per node a scan

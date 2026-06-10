@@ -8,9 +8,11 @@
 # CLAUDE.md §8 divergence hotspot) — because there is no reference implementation
 # (§2), the cost is part of the shared contract and is asserted in the conformance
 # corpus (the `# cost:` directive — conformance.md). Enforcement (a caller-set ceiling
-# + a deterministic abort) is DEFERRED (TODO.md); this table only defines the unit
-# weights the seam accrues. Weights are uniform (all 1) for this slice — the point is
-# that the seam reads them from DATA, tunable later with no code change.
+# + a deterministic abort) has LANDED: a handle's `max_cost` aborts a statement with
+# `54P01` the instant accrued cost reaches it (spec/design/cost.md §6, api.md §8); this
+# table only defines the unit weights the seam accrues. Weights are uniform (all 1) for
+# this slice — the point is that the seam reads them from DATA, tunable later with no
+# code change.
 
 schema_version = 1
 

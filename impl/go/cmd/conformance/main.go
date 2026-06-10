@@ -130,6 +130,22 @@ func parseCostDirective(line string) (int64, bool) {
 	return n, true
 }
 
+// parseMaxCostDirective parses a `# max_cost: N` directive line. Returns the caller-set cost
+// ceiling to run the next record under and true, or (0, false) if not a max_cost directive.
+// Mirrors `# cost:`, but instead of asserting the accrued cost it bounds it: the record is
+// expected to abort with 54P01 once accrued cost reaches N (CLAUDE.md §13; cost.md §6).
+func parseMaxCostDirective(line string) (int64, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "max_cost:")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // assertCost checks the accrued execution cost matches a pending `# cost:` directive.
 func assertCost(expected *int64, actual int64, sql string) error {
 	if expected != nil && *expected != actual {
@@ -168,9 +184,11 @@ func runFile(text string) error {
 	db := jed.NewDatabase()
 	lines := strings.Split(text, "\n")
 	i := 0
-	// A `# cost: N` / `# names: ...` directive sets these; the next record consumes them.
+	// A `# cost: N` / `# names: ...` / `# max_cost: N` directive sets these; the next record
+	// consumes them.
 	var pendingCost *int64
 	var pendingNames []string
+	var pendingMaxCost *int64
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
@@ -181,6 +199,8 @@ func runFile(text string) error {
 			// `# cost:` / `# names:` bind to the next record; every other comment is ignored.
 			if n, ok := parseCostDirective(line); ok {
 				pendingCost = &n
+			} else if n, ok := parseMaxCostDirective(line); ok {
+				pendingMaxCost = &n
 			} else if names, ok := parseNamesDirective(line); ok {
 				pendingNames = names
 			}
@@ -192,6 +212,13 @@ func runFile(text string) error {
 		expectedNames := pendingNames
 		pendingCost = nil
 		pendingNames = nil
+		// Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
+		var maxCost int64
+		if pendingMaxCost != nil {
+			maxCost = *pendingMaxCost
+		}
+		db.SetMaxCost(maxCost)
+		pendingMaxCost = nil
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "statement":

@@ -258,6 +258,7 @@ only and the engine has no wire protocol).
 | rows iterate | `impl Iterator<Item = Vec<Value>>` | `for rows.Next() { rows.Row() }` | `for (const row of rows)` |
 | rows columns | `rows.column_names()` | `rows.ColumnNames()` | `rows.columnNames` |
 | rows cost | `rows.cost()` | `rows.Cost()` | `rows.cost` |
+| set cost ceiling (§8) | `db.set_max_cost(limit)` | `db.SetMaxCost(limit)` | `db.setMaxCost(limit)` |
 
 **Per-language divergences, deliberate and documented:**
 
@@ -282,11 +283,31 @@ their existing codes; the API adds the host-filesystem class-58 codes (`58P01`/`
 category (`22` data, `23` integrity, `25` transaction state, `42` syntax/access, `58` system,
 `XX` internal).
 
-## 8. Non-goals this slice
+## 8. Cost ceiling (`max_cost`)
 
-- **No cost ceiling.** Cost is metered ([cost.md](cost.md), `Outcome` carries it) but a
-  caller-supplied `max_cost` that aborts is deferred (cost.md §6). The shape is kept open: an
-  options object on `prepare`/`execute` can carry it later without changing the surface.
+A first-class use case is **safely evaluating untrusted, user-supplied queries** (CLAUDE.md
+§13). The handle carries a **`max_cost`** setting — `db.set_max_cost(limit)` /
+`db.SetMaxCost(limit)` / `db.setMaxCost(limit)` — that bounds the deterministic execution cost
+([cost.md](cost.md)) of every statement run on it:
+
+- `limit <= 0` (the **default**, `0`) ⇒ **unlimited** (the metered cost is still reported on
+  `Outcome`/`Rows`, nothing aborts).
+- `limit > 0` ⇒ the instant a statement's accrued cost **reaches** `limit`, execution aborts
+  with **`54P01`** (`cost_limit_exceeded`). The ceiling is the first *disallowed* value: a query
+  whose true cost equals `limit` aborts, one costing `limit − 1` completes.
+
+The abort is **deterministic and cross-core identical** — the same `(query, db, max_cost)`
+aborts (or completes) in Rust, Go, and TS alike (cost.md §6) — and it is an **ordinary engine
+error**, so it integrates with rollback-on-error: an aborted autocommit `DELETE`/`UPDATE` leaves
+the table untouched, and inside an explicit block it poisons the block (transactions.md §6).
+
+It is a **handle setting**, not stored in the file and not a per-statement argument: the host
+configures the budget once on whatever handle serves untrusted queries. A per-call override (an
+options object on `execute`/`prepare`) stays open for later without changing this surface. The
+`# max_cost: N` conformance directive (cost.md §6) exercises it cross-core.
+
+## 9. Non-goals this slice
+
 - **No streaming rows** — the cursor walks materialized rows (§4).
 - **Transactions are IN, not a non-goal.** The §3 staging buffer, autocommit, the `Transaction`
   surface (`begin`/`view`/`update`), the `synchronous` durability setting, and SQL

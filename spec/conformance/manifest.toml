@@ -316,6 +316,10 @@ description = "Integer division / modulo by zero is defined and traps SQLSTATE 2
 id = "resource.cost_metering"
 description = "Deterministic, cross-core-identical query cost accounting (CLAUDE.md §13)"
 
+[[capability]]
+id = "resource.cost_limit"
+description = "Caller-set execution-cost ceiling (`max_cost`) with a deterministic, cross-core-identical abort (54P01) the instant accrued cost reaches it (CLAUDE.md §13; spec/design/cost.md §6). The safety gate for untrusted, user-supplied queries; the `# max_cost: N` corpus directive runs the next record under a ceiling of N. Builds on resource.cost_metering."
+
 # Transaction control (Phase 5, spec/design/transactions.md §4). The SQL surface
 # BEGIN/COMMIT/ROLLBACK over the handle's single current transaction; tested by deterministic,
 # single-handle visibility sequences (the harness runs a whole .test file against one Database).

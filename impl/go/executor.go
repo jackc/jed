@@ -132,6 +132,12 @@ type Database struct {
 	// commit writes through it. nil for an in-memory database (persist is then a no-op); set by
 	// Open/Create, dropped by Close.
 	paging *sharedPaging
+	// maxCost is the caller-set execution-cost ceiling (CLAUDE.md §13; spec/design/api.md §8), or 0
+	// (the default) for unlimited. A positive value bounds every statement run on this handle: each
+	// statement's Meter is built with this limit and aborts with 54P01 the instant accrued cost
+	// reaches it. A handle setting (not stored in the file), set by SetMaxCost; the primary guard for
+	// safely evaluating untrusted, user-supplied queries.
+	maxCost int64
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
@@ -188,6 +194,16 @@ func (db *Database) PageSize() uint32 { return db.pageSize }
 
 // Path is the backing file path, or "" for an in-memory database.
 func (db *Database) Path() string { return db.path }
+
+// SetMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
+// spec/design/api.md §8). A positive limit bounds every subsequent statement: it aborts with
+// 54P01 the instant accrued cost reaches limit (spec/design/cost.md §6). limit <= 0 (the default)
+// is unlimited. The primary guard for safely evaluating untrusted, user-supplied queries; a handle
+// setting, not stored in the file.
+func (db *Database) SetMaxCost(limit int64) { db.maxCost = limit }
+
+// MaxCost is the current execution-cost ceiling (0 ⇒ unlimited). See SetMaxCost.
+func (db *Database) MaxCost() int64 { return db.maxCost }
 
 // Table looks up a table definition by name (case-insensitive) in the visible snapshot.
 func (db *Database) Table(name string) (*Table, bool) {
@@ -738,7 +754,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	// per-row outer environment below (it pushes the current row, so `target.col` reads it). The
 	// uncorrelated execution reads the pre-DELETE snapshot (keys are collected before mutating).
 	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
-	meter := NewMeter()
+	meter := NewMeterWithLimit(db.maxCost)
 	if filter != nil {
 		if err := db.foldUncorrelatedInRExpr(filter, bound, &meter.Accrued); err != nil {
 			return Outcome{}, err
@@ -769,6 +785,9 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	}
 	meter.Charge(Costs.PageRead * int64(overlap))
 	for _, e := range entries {
+		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+			return Outcome{}, err
+		}
 		meter.Charge(Costs.StorageRowRead)
 		matched := true
 		if filter != nil {
@@ -865,7 +884,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	//
 	// Phase 1: build + validate every matching row's new values; no writes yet. Each scanned row,
 	// the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
-	meter := NewMeter()
+	meter := NewMeterWithLimit(db.maxCost)
 	for i := range plans {
 		if err := db.foldUncorrelatedInRExpr(plans[i].source, bound, &meter.Accrued); err != nil {
 			return Outcome{}, err
@@ -905,6 +924,9 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	}
 	meter.Charge(Costs.PageRead * int64(overlap))
 	for _, e := range entries {
+		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+			return Outcome{}, err
+		}
 		meter.Charge(Costs.StorageRowRead)
 		if filter != nil {
 			v, err := filter.eval(e.Row, env, meter)
@@ -1552,6 +1574,12 @@ type scanSource struct {
 }
 
 func (s *scanSource) next(env *evalEnv, m *Meter) (Row, bool, error) {
+	// Enforce the cost ceiling before pulling the next row (CLAUDE.md §13): a runaway scan (or a
+	// JOIN/correlated re-scan built on this source) stops deterministically once accrued cost
+	// reaches the limit. No-op when unlimited (spec/design/cost.md §6).
+	if err := m.Guard(); err != nil {
+		return nil, false, err
+	}
 	if !s.chargedBlock {
 		m.Charge(Costs.PageRead * int64(s.nodeCount))
 		s.chargedBlock = true
@@ -1836,6 +1864,9 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 	if !empty && limit > 0 {
 		var passed int64
 		err := store.ScanRange(b, func(_ []byte, row Row) (bool, error) {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+				return false, err
+			}
 			meter.Charge(Costs.StorageRowRead)
 			if plan.filter != nil {
 				v, err := plan.filter.eval(row, env, meter)
@@ -1871,7 +1902,7 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 
 func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer}
-	meter := NewMeter()
+	meter := NewMeterWithLimit(db.maxCost)
 
 	// LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
 	// operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the
@@ -2077,6 +2108,9 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 			index[""] = 0
 		}
 		for _, row := range rows {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per folded row (CLAUDE.md §13)
+				return selectResult{}, err
+			}
 			keys := make([]Value, len(plan.groupKeys))
 			for i, gk := range plan.groupKeys {
 				keys[i] = row[gk]
@@ -2148,6 +2182,9 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		start, end := windowBounds(int64(len(groupRows)))
 		out = make([][]Value, 0, end-start)
 		for _, srow := range groupRows[start:end] {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+				return selectResult{}, err
+			}
 			meter.Charge(Costs.RowProduced)
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
@@ -2185,6 +2222,9 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		start, end := windowBounds(int64(len(distinctRows)))
 		out = make([][]Value, 0, end-start)
 		for _, row := range distinctRows[start:end] {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+				return selectResult{}, err
+			}
 			meter.Charge(Costs.RowProduced)
 			out = append(out, row)
 		}
@@ -2197,6 +2237,9 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		windowed := rows[start:end]
 		out = make([][]Value, 0, len(windowed))
 		for _, row := range windowed {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+				return selectResult{}, err
+			}
 			meter.Charge(Costs.RowProduced)
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
@@ -4399,6 +4442,12 @@ func typeError(msg string) error { return NewError(DatatypeMismatch, msg) }
 // are always evaluated — there is no short-circuit, so the count never depends on operand
 // values (spec/design/cost.md §3).
 func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
+	// Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). eval recurses once
+	// per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot;
+	// it is a no-op when no ceiling is set (spec/design/cost.md §6).
+	if err := m.Guard(); err != nil {
+		return Value{}, err
+	}
 	switch e.kind {
 	case reColumn:
 		return row[e.index], nil

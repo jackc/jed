@@ -127,6 +127,18 @@ fn parse_cost_directive(rest: &str) -> Option<i64> {
     rest.trim_start().strip_prefix("cost:")?.trim().parse().ok()
 }
 
+/// Parse a `# max_cost: N` directive body. Returns the caller-set cost ceiling to run the
+/// next record under, or None if this comment is not a max_cost directive. Mirrors `# cost:`,
+/// but instead of asserting the accrued cost it *bounds* it: the record is expected to abort
+/// with `54P01` once accrued cost reaches N (CLAUDE.md §13; spec/design/cost.md §6).
+fn parse_max_cost_directive(rest: &str) -> Option<i64> {
+    rest.trim_start()
+        .strip_prefix("max_cost:")?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Parse a `# names: a, b, ?column?` directive body. Returns the asserted output column
 /// names, or None if this comment is not a names directive (spec/design/conformance.md §1).
 fn parse_names_directive(rest: &str) -> Option<Vec<String>> {
@@ -168,9 +180,11 @@ fn assert_names(
 fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut db = Database::new();
     let mut lines = text.lines().peekable();
-    // A `# cost: N` / `# names: ...` directive sets these; the next record consumes them.
+    // A `# cost: N` / `# names: ...` / `# max_cost: N` directive sets these; the next record
+    // consumes them.
     let mut pending_cost: Option<i64> = None;
     let mut pending_names: Option<Vec<String>> = None;
+    let mut pending_max_cost: Option<i64> = None;
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -181,6 +195,8 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             // `# cost:` / `# names:` bind to the next record; every other comment is ignored.
             if let Some(n) = parse_cost_directive(rest) {
                 pending_cost = Some(n);
+            } else if let Some(n) = parse_max_cost_directive(rest) {
+                pending_max_cost = Some(n);
             } else if let Some(names) = parse_names_directive(rest) {
                 pending_names = Some(names);
             }
@@ -189,6 +205,8 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
         // This record consumes any pending assertions (so they never leak forward).
         let expected_cost = pending_cost.take();
         let expected_names = pending_names.take();
+        // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
+        db.set_max_cost(pending_max_cost.take().unwrap_or(0));
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();
         match kind {
@@ -277,6 +295,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
     let mut out: Vec<String> = text.lines().map(str::to_string).collect();
     let mut db = Database::new();
     let mut pending_cost_line: Option<usize> = None;
+    let mut pending_max_cost: Option<i64> = None;
     let mut changed = false;
     let mut i = 0;
     while i < out.len() {
@@ -288,12 +307,16 @@ fn rebaseline_file(text: &str) -> Option<String> {
         if let Some(rest) = trimmed.strip_prefix('#') {
             if parse_cost_directive(rest).is_some() {
                 pending_cost_line = Some(i);
+            } else if let Some(n) = parse_max_cost_directive(rest) {
+                pending_max_cost = Some(n);
             }
             i += 1;
             continue;
         }
         // A record: collect its SQL (advancing `i` past the whole record) and run it to
-        // accrue cost + advance DB state.
+        // accrue cost + advance DB state. Apply any per-record cost ceiling so an aborting
+        // record evolves the DB state identically to `run_file` (it writes nothing).
+        db.set_max_cost(pending_max_cost.take().unwrap_or(0));
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();
         let actual_cost: Option<i64> = match kind {

@@ -37,6 +37,7 @@ export type SqlState =
   | "undefined_function" // 42883 — an unknown function name in a call (aggregates.md §5)
   | "indeterminate_datatype" // 42P18 — a bind parameter $N whose type cannot be inferred (api.md §5)
   | "feature_not_supported" // 0A000
+  | "cost_limit_exceeded" // 54P01 — accrued cost reached the caller-set max_cost ceiling (cost.md §6)
   | "io_error" // 58030 — an I/O error from the host file layer (spec/design/api.md §2)
   | "undefined_file" // 58P01 — open of a database path that does not exist
   | "duplicate_file" // 58P02 — create of a database path that already exists
@@ -73,6 +74,7 @@ const CODES: Record<SqlState, string> = {
   undefined_function: "42883",
   indeterminate_datatype: "42P18",
   feature_not_supported: "0A000",
+  cost_limit_exceeded: "54P01",
   io_error: "58030",
   undefined_file: "58P01",
   duplicate_file: "58P02",

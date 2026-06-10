@@ -81,6 +81,10 @@ pub enum SqlState {
     IndeterminateDatatype,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
+    /// 54P01 — cost limit exceeded: a query's accrued execution cost reached the caller-set
+    /// `max_cost` ceiling and execution was aborted (CLAUDE.md §13; spec/design/cost.md §6).
+    /// jed-specific (PostgreSQL has no execution-cost ceiling); class 54 program_limit_exceeded.
+    CostLimitExceeded,
     /// 58030 — I/O error from the host file layer (read/write/fsync/rename;
     /// spec/design/api.md §2).
     IoError,
@@ -125,6 +129,7 @@ impl SqlState {
             SqlState::UndefinedFunction => "42883",
             SqlState::IndeterminateDatatype => "42P18",
             SqlState::FeatureNotSupported => "0A000",
+            SqlState::CostLimitExceeded => "54P01",
             SqlState::IoError => "58030",
             SqlState::UndefinedFile => "58P01",
             SqlState::DuplicateFile => "58P02",

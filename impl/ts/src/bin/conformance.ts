@@ -119,6 +119,21 @@ function parseCostDirective(line: string): bigint | null {
   }
 }
 
+// parseMaxCostDirective parses a `# max_cost: N` directive line. Returns the caller-set cost
+// ceiling to run the next record under, or null if not a max_cost directive. Mirrors `# cost:`,
+// but instead of asserting the accrued cost it bounds it: the record is expected to abort with
+// 54P01 once accrued cost reaches N (CLAUDE.md §13; spec/design/cost.md §6).
+function parseMaxCostDirective(line: string): bigint | null {
+  const m = line.match(/^#\s*max_cost:\s*(\S+)/);
+  if (!m) return null;
+  try {
+    const n = BigInt(m[1]!);
+    return n >= 0n ? n : null;
+  } catch {
+    return null;
+  }
+}
+
 // assertCost checks the accrued execution cost matches a pending `# cost:` directive.
 function assertCost(expected: bigint | null, actual: bigint, sql: string): void {
   if (expected !== null && expected !== actual) {
@@ -151,9 +166,11 @@ function runFile(text: string): void {
   const db = new Database();
   const lines = text.split("\n");
   const c: Cursor = { i: 0 };
-  // A `# cost: N` / `# names: ...` directive sets these; the next record consumes them.
+  // A `# cost: N` / `# names: ...` / `# max_cost: N` directive sets these; the next record
+  // consumes them.
   let pendingCost: bigint | null = null;
   let pendingNames: string[] | null = null;
+  let pendingMaxCost: bigint | null = null;
   while (c.i < lines.length) {
     const line = lines[c.i]!.trim();
     if (line === "") {
@@ -161,10 +178,13 @@ function runFile(text: string): void {
       continue;
     }
     if (line.startsWith("#")) {
-      // `# cost:` / `# names:` bind to the next record; every other comment is ignored.
+      // `# cost:` / `# max_cost:` / `# names:` bind to the next record; every other comment is ignored.
       const n = parseCostDirective(line);
+      const mc = parseMaxCostDirective(line);
       if (n !== null) {
         pendingCost = n;
+      } else if (mc !== null) {
+        pendingMaxCost = mc;
       } else {
         const names = parseNamesDirective(line);
         if (names !== null) pendingNames = names;
@@ -177,6 +197,9 @@ function runFile(text: string): void {
     const expectedNames = pendingNames;
     pendingCost = null;
     pendingNames = null;
+    // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
+    db.setMaxCost(pendingMaxCost ?? 0n);
+    pendingMaxCost = null;
     const fields = line.split(/\s+/);
     if (fields[0] === "statement") {
       // A `# names:` directive asserts result columns, which a statement lacks.
