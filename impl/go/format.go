@@ -20,7 +20,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion uint16 = 2               // on-disk format version (2 = page-backed CoW B-tree, P6.1)
+	formatVersion uint16 = 3               // on-disk format version (3 = + overflow pages, large-values.md §12)
 	pageHeader           = 12              // bytes of the catalog/B-tree page header
 	pageCatalog   byte   = 1               // page_type for a catalog page
 	pageLeaf      byte   = 2               // page_type for a B-tree leaf node

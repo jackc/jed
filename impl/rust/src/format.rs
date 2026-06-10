@@ -26,8 +26,8 @@ use crate::value::Value;
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 2 = page-backed copy-on-write B-tree (Phase 6, P6.1).
-const FORMAT_VERSION: u16 = 2;
+/// On-disk format version — 3 = + out-of-line overflow pages for large values (large-values.md §12).
+const FORMAT_VERSION: u16 = 3;
 /// Bytes of the page header on catalog / B-tree pages.
 const PAGE_HEADER: usize = 12;
 /// Smallest valid page size: the 36-byte meta header (plus the page header) must fit

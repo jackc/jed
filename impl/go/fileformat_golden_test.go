@@ -143,6 +143,20 @@ func byteaTableDB(t *testing.T) *Database {
 	return db
 }
 
+// overflowTableDB has large text + bytea values that spill OUT-OF-LINE to overflow pages
+// (spec/design/large-values.md §12): at page_size 256 a ~600/300-byte value exceeds RECORD_MAX
+// (116) so the record holds a pointer and the bytes live in a page_type-4 chain. Row 1 spills both
+// columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL. Must match the Ruby
+// reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
+func overflowTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)")
+	run(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s', '\\x%s')", strings.Repeat("x", 600), strings.Repeat("ab", 300)))
+	run(t, db, `INSERT INTO t VALUES (2, 'small', '\xcafe')`)
+	run(t, db, "INSERT INTO t VALUES (3, NULL, NULL)")
+	return db
+}
+
 // uuidTableDB has a uuid PRIMARY KEY (the first golden with a NON-integer stored key — the
 // load-bearing §8 cross-core key-path proof) plus a nullable uuid column. Exercises the value
 // codec's fixed-16-byte uuid branch (no length prefix), the uuid key encoding (bare 16 bytes),
@@ -208,6 +222,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		build func(*testing.T) *Database
 	}{
 		{"empty_db.jed", func(*testing.T) *Database { return WithPageSize(goldenPageSize) }},
+		{"overflow_table.jed", overflowTableDB},
 		{"one_table_empty.jed", oneTableEmptyDB},
 		{"pk_table.jed", pkTableDB},
 		{"text_table.jed", textTableDB},
@@ -241,6 +256,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		table string
 	}{
 		{"one_table_empty.jed", oneTableEmptyDB, "t"},
+		{"overflow_table.jed", overflowTableDB, "t"},
 		{"pk_table.jed", pkTableDB, "t"},
 		{"text_table.jed", textTableDB, "t"},
 		{"bool_table.jed", boolTableDB, "t"},

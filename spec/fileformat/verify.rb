@@ -14,13 +14,20 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 2 # format_version 2: page-backed copy-on-write B-tree (Phase 6, P6.1)
+VERSION = 3 # format_version 3: + out-of-line overflow pages for large values (large-values.md §12)
 PAGE_HEADER = 12
 ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
 TXID = 1
 PAGE_CATALOG = 1
 PAGE_LEAF = 2
 PAGE_INTERIOR = 3
+PAGE_OVERFLOW = 4 # an out-of-line value slab, chained by next_page (large-values.md §12)
+
+# Value-codec presence tag for a present EXTERNAL value: the body is a pointer (u32 first_page +
+# u32 payload_len) into an overflow chain (large-values.md §12). 0x00 present-inline / 0x01 NULL
+# unchanged; 0x03 / 0x04 reserved for compression. EXTERNAL_PTR_LEN is the pointer's in-record size.
+TAG_EXTERNAL = 0x02
+EXTERNAL_PTR_LEN = 1 + 4 + 4
 
 WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "timestamp" => 8, "timestamptz" => 8 }.freeze
 TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
@@ -171,8 +178,22 @@ TIMESTAMPTZ_TABLE = {
          [4, -9_223_372_036_854_775_808], [5, 9_223_372_036_854_775_807], [6, nil]]
 }.freeze
 
+# A table with large text + bytea values that must spill OUT-OF-LINE to overflow pages
+# (large-values.md §12). At page_size 256 the per-record cap is RECORD_MAX = (256-12-12)/2 = 116,
+# so a value of ~600/300 bytes exceeds it and is externalized: the record holds a fixed pointer
+# (tag 0x02 + u32 first_page + u32 len) and the bytes live in a chain of page_type-4 slabs (244
+# bytes each). Row 1's text (600 B → 3 slabs) and bytea (300 B → 2 slabs) both spill; row 2's
+# values stay inline; row 3 is NULL/NULL. Exercises multi-page chains, multi-column spill, and the
+# inline+external mix in one leaf. The PK stays int32.
+OVERFLOW_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("body", "text"), col("blob", "bytea")],
+  rows: [[1, "x" * 600, (["ab"].pack("H*") * 300)], [2, "small", ["cafe"].pack("H*")], [3, nil, nil]]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
+  { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
   { file: "one_table_empty.jed", page_size: 256,
     tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("v", "int16")], rows: [] }] },
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
@@ -329,10 +350,69 @@ def table_entries(table)
   pairs.sort_by { |key, _| key } # String#<=> is bytewise == memcmp order
 end
 
-def record_bytes(table, key, row)
+# --- out-of-line large values (large-values.md §12) -------------------------
+
+def spillable?(type) = %w[text bytea decimal].include?(type)
+def record_max(cap) = [(cap - 12) / 2, 0].max # RECORD_MAX = (C-12)/2 (format.md "Why the record cap")
+
+# A value's content payload P(v) — the bytes stored in the overflow chain when externalized: raw
+# UTF-8 / raw bytes for text/bytea, the decimal body for decimal (large-values.md §12).
+def value_payload(type, v)
+  case type
+  when "text", "bytea" then v.b
+  when "decimal" then encode_decimal(v) # the body (no presence tag)
+  else raise "only spillable values are externalized"
+  end
+end
+
+# Decide each column's disposition for a record: [is_external per column, on-disk record size].
+# Spill only when forced (record > RECORD_MAX); externalize the largest spillable values first,
+# ties by column index — deterministic, mirrors the cores' planDispositions (large-values.md §12).
+def plan_record(table, key, row, cap)
+  inline = table[:columns].each_with_index.map { |c, i| encode_value(c[:type], row[i]).bytesize }
+  ext = Array.new(table[:columns].size, false)
+  size = 2 + key.bytesize + inline.sum
+  max = record_max(cap)
+  return [ext, size] if size <= max
+
+  cand = (0...table[:columns].size).select { |i| spillable?(table[:columns][i][:type]) && inline[i] > EXTERNAL_PTR_LEN }
+  cand.sort_by! { |i| [-inline[i], i] } # largest first; ties by ascending index (stable, deterministic)
+  cand.each do |i|
+    break if size <= max
+
+    ext[i] = true
+    size = size - inline[i] + EXTERNAL_PTR_LEN
+  end
+  [ext, size]
+end
+
+# Write a payload across a chain of overflow pages (cap-byte slabs, in order), allocating each via
+# `alloc` and linking with next_page (0 terminates). Returns the first page index for the pointer.
+def write_overflow_chain(payload, cap, alloc, pages)
+  n = (payload.bytesize + cap - 1) / cap
+  indices = Array.new(n) { alloc.call }
+  n.times do |j|
+    slab = payload.byteslice(j * cap, cap)
+    nxt = j + 1 < n ? indices[j + 1] : 0
+    pages[indices[j]] = [PAGE_OVERFLOW, slab.bytesize, slab, nxt]
+  end
+  indices[0]
+end
+
+# Emit one record's on-disk bytes (key_len | key | values), spilling external columns to overflow
+# pages drawn via `alloc` (large-values.md §12). `rec` is a plan hash { key:, row:, table:, ext: }.
+def emit_record(rec, cap, alloc, pages)
   out = +"".b
-  out << u16(key.bytesize) << key
-  table[:columns].each_with_index { |c, i| out << encode_value(c[:type], row[i]) }
+  out << u16(rec[:key].bytesize) << rec[:key]
+  rec[:table][:columns].each_with_index do |c, i|
+    if rec[:ext][i]
+      payload = value_payload(c[:type], rec[:row][i])
+      first = write_overflow_chain(payload, cap, alloc, pages)
+      out << [TAG_EXTERNAL].pack("C") << u32(first) << u32(payload.bytesize)
+    else
+      out << encode_value(c[:type], rec[:row][i])
+    end
+  end
   out
 end
 
@@ -385,8 +465,11 @@ end
 
 def node_leaf?(node) = node[:children].empty?
 
+# `recs[i]` is the record PLAN for keys[i] — a hash { key:, row:, table:, ext:, size: } whose
+# `size` is the on-disk (post-spill) record size (large-values.md §12). The tree splits on `size`;
+# the actual pointer bytes (with allocated overflow pages) are emitted later by serialize_tree.
 def node_payload(node)
-  s = node[:recs].sum(&:bytesize)
+  s = node[:recs].sum { |r| r[:size] }
   s += 4 * node[:children].size unless node_leaf?(node) # (N+1) child pointers
   s
 end
@@ -400,7 +483,7 @@ def split_node(node, cap)
   n = node[:keys].size
   best = 1
   (1...n).each do |m|
-    lp = (interior ? 4 * (m + 1) : 0) + node[:recs][0, m].sum(&:bytesize)
+    lp = (interior ? 4 * (m + 1) : 0) + node[:recs][0, m].sum { |r| r[:size] }
     best = m if lp <= cap
   end
   m = [best, n - 2].min
@@ -438,9 +521,11 @@ end
 # Build a table's B-tree from its (key, record) pairs in key order. nil for an empty table.
 def build_tree(pairs, cap)
   root = nil
-  record_max = (cap - 12) / 2 # see format.md "Why the record cap" (reserves a 2-key interior's child ptrs)
+  max = record_max(cap)
   pairs.each do |key, rec|
-    raise "record of #{rec.bytesize}B exceeds RECORD_MAX #{record_max}" if rec.bytesize > record_max
+    # rec is a record plan; rec[:size] is the post-spill on-disk size. A record still over
+    # RECORD_MAX after externalizing every spillable value is genuinely unsupported (0A000).
+    raise "record of #{rec[:size]}B exceeds RECORD_MAX #{max} after spilling" if rec[:size] > max
 
     if root.nil?
       root = { keys: [key], recs: [rec], children: [] }
@@ -455,20 +540,28 @@ end
 # Post-order page allocation: children before their parent (so a parent's child pointers
 # reference already-allocated pages). Fills `pages[index] = [page_type, item_count, payload]`.
 # Returns [root_page (0 for an empty tree), next free index].
-def serialize_tree(root, next_index, pages)
+def serialize_tree(root, next_index, cap, pages)
   return [0, next_index] if root.nil?
 
   child_pages = root[:children].map do |c|
-    cp, next_index = serialize_tree(c, next_index, pages)
+    cp, next_index = serialize_tree(c, next_index, cap, pages)
     cp
   end
   index = next_index
   next_index += 1
+  # Emit records, spilling external values to overflow pages allocated AFTER this node's index
+  # (post-order traversal + column order → deterministic, golden-pinnable layout — large-values.md §12).
+  alloc = lambda do
+    i = next_index
+    next_index += 1
+    i
+  end
+  recs = root[:recs].map { |r| emit_record(r, cap, alloc, pages) }
   n = root[:keys].size
   pages[index] = if node_leaf?(root)
-                   [PAGE_LEAF, n, root[:recs].join.b]
+                   [PAGE_LEAF, n, recs.join.b, 0]
                  else
-                   [PAGE_INTERIOR, n, child_pages.map { |cp| u32(cp) }.join.b + root[:recs].join.b]
+                   [PAGE_INTERIOR, n, child_pages.map { |cp| u32(cp) }.join.b + recs.join.b, 0]
                  end
   [index, next_index]
 end
@@ -485,8 +578,11 @@ def build_image(tables, page_size)
   root_data = Array.new(sorted.size, 0)
   next_index = ROOT_PAGE
   sorted.each_with_index do |t, ti|
-    pairs = table_entries(t).map { |key, row| [key, record_bytes(t, key, row)] }
-    root_data[ti], next_index = serialize_tree(build_tree(pairs, cap), next_index, data_pages)
+    pairs = table_entries(t).map do |key, row|
+      ext, size = plan_record(t, key, row, cap)
+      [key, { key: key, row: row, table: t, ext: ext, size: size }]
+    end
+    root_data[ti], next_index = serialize_tree(build_tree(pairs, cap), next_index, cap, data_pages)
   end
 
   cat_root = next_index
@@ -497,7 +593,7 @@ def build_image(tables, page_size)
   write_meta(image, ps, 0, page_size, TXID, cat_root, page_count)
   write_meta(image, ps, 1, page_size, TXID, cat_root, page_count)
 
-  data_pages.each { |index, (type, count, payload)| write_page(image, ps, index, type, count, 0, payload) }
+  data_pages.each { |index, (type, count, payload, nxt)| write_page(image, ps, index, type, count, nxt || 0, payload) }
 
   cat_groups.each_with_index do |group, gi|
     index = cat_root + gi
@@ -593,9 +689,66 @@ end
 
 # Read one value via the value codec (inverse of encode_value): a presence tag, then — when
 # present — the type's body. 0x01 = NULL. Shared by row records and the catalog default.
-def decode_value(type, buf, pos)
+# Decode a decimal value's body (flags + u16 scale + u16 ndigits + base-10^4 groups). Shared by the
+# inline decimal branch and by external reconstruction (a spilled decimal's payload is this body).
+def decode_decimal_body(buf, pos)
+  fb, pos = take(buf, pos, 1)
+  scb, pos = take(buf, pos, 2)
+  ndb, pos = take(buf, pos, 2)
+  coeff = 0
+  ndb.unpack1("n").times do
+    gb, pos = take(buf, pos, 2)
+    coeff = coeff * 10_000 + gb.unpack1("n")
+  end
+  [render_decimal((fb.getbyte(0) & 1) != 0, scb.unpack1("n"), coeff), pos]
+end
+
+# Reconstruct a value from the P(v) content gathered from its overflow chain (large-values.md §12).
+def value_from_payload(type, payload)
+  case type
+  when "text" then payload.dup.force_encoding("UTF-8")
+  when "bytea" then payload.dup.force_encoding("ASCII-8BIT")
+  when "decimal" then decode_decimal_body(payload, 0).first
+  else raise "a non-spillable type was stored external"
+  end
+end
+
+# Gather `len` bytes of an external value's payload by following its overflow chain from `first`:
+# each page is page_type 4, carries item_count payload bytes, chained via next_page (0 terminates).
+def read_overflow_chain(first, len, fetch)
+  out = +"".b
+  p = first
+  while out.bytesize < len
+    raise "overflow chain ended before the value length" if p.zero?
+
+    pg = fetch.call(p)
+    raise "expected an overflow page" unless pg[:type] == PAGE_OVERFLOW
+
+    n = pg[:item_count]
+    raise "overflow page slab out of range" if n.zero? || n > pg[:payload].bytesize || out.bytesize + n > len
+
+    out << pg[:payload].byteslice(0, n)
+    p = pg[:next_page]
+  end
+  out
+end
+
+# Read one value via the value codec (inverse of encode_value/emit_record): a presence tag, then —
+# when present-inline — the type's body, or — when external (0x02) — a pointer whose payload is
+# gathered from the overflow chain via `fetch` and reconstructed by type (large-values.md §12).
+# `fetch` is nil only where no value can be external (a catalog default). 0x01 = NULL.
+def decode_value(type, buf, pos, fetch = nil)
   tag, pos = take(buf, pos, 1)
-  return [nil, pos] unless tag.getbyte(0).zero? # 0x01 = NULL
+  t = tag.getbyte(0)
+  return [nil, pos] if t == 0x01
+  if t == TAG_EXTERNAL
+    fpb, pos = take(buf, pos, 4)
+    lnb, pos = take(buf, pos, 4)
+    raise "external value with no overflow reader" if fetch.nil?
+
+    return [value_from_payload(type, read_overflow_chain(fpb.unpack1("N"), lnb.unpack1("N"), fetch)), pos]
+  end
+  raise "invalid value presence tag" unless t.zero?
 
   case type
   when "text"
@@ -606,15 +759,7 @@ def decode_value(type, buf, pos)
     bb, pos = take(buf, pos, 1)
     [bb.getbyte(0) == 1, pos]
   when "decimal"
-    fb, pos = take(buf, pos, 1)
-    scb, pos = take(buf, pos, 2)
-    ndb, pos = take(buf, pos, 2)
-    coeff = 0
-    ndb.unpack1("n").times do
-      gb, pos = take(buf, pos, 2)
-      coeff = coeff * 10_000 + gb.unpack1("n")
-    end
-    [render_decimal((fb.getbyte(0) & 1) != 0, scb.unpack1("n"), coeff), pos]
+    decode_decimal_body(buf, pos)
   when "bytea"
     len, pos = take(buf, pos, 2)
     bb, pos = take(buf, pos, len.unpack1("n"))
@@ -628,21 +773,23 @@ def decode_value(type, buf, pos)
   end
 end
 
-def decode_record(columns, buf, pos)
+def decode_record(columns, buf, pos, fetch)
   key_len, pos = take(buf, pos, 2)
   _key, pos = take(buf, pos, key_len.unpack1("n"))
   row = []
   columns.each do |c|
-    v, pos = decode_value(c[:type], buf, pos)
+    v, pos = decode_value(c[:type], buf, pos, fetch)
     row << v
   end
   [row, pos]
 end
 
 # In-order walk of a table's B-tree -> rows in ascending key order (format.md interior layout:
-# (N+1) child pointers, then N records). Independent of how the tree was built.
+# (N+1) child pointers, then N records). Independent of how the tree was built. An external value's
+# chain is followed through `fetch` (large-values.md §12).
 def read_tree_rows(image, ps, root_page, columns)
   rows = []
+  fetch = ->(p) { read_page(image, ps, p) }
   walk = lambda do |idx|
     return if idx.zero?
 
@@ -651,7 +798,7 @@ def read_tree_rows(image, ps, root_page, columns)
     when PAGE_LEAF
       pos = 0
       pg[:item_count].times do
-        row, pos = decode_record(columns, pg[:payload], pos)
+        row, pos = decode_record(columns, pg[:payload], pos, fetch)
         rows << row
       end
     when PAGE_INTERIOR
@@ -660,7 +807,7 @@ def read_tree_rows(image, ps, root_page, columns)
       pos = 4 * (n + 1)
       n.times do |i|
         walk.call(children[i])
-        row, pos = decode_record(columns, pg[:payload], pos)
+        row, pos = decode_record(columns, pg[:payload], pos, fetch)
         rows << row
       end
       walk.call(children[n])

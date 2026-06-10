@@ -137,6 +137,30 @@ fn bytea_table_db() -> Database {
     db
 }
 
+/// A table with large text + bytea values that spill OUT-OF-LINE to overflow pages
+/// (spec/design/large-values.md §12): at page_size 256 a ~600/300-byte value exceeds RECORD_MAX
+/// (116), so the record holds a pointer and the bytes live in a page_type-4 chain. Row 1 spills both
+/// columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL. Must match the Ruby
+/// reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
+fn overflow_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)",
+    );
+    run(
+        &mut db,
+        &format!(
+            "INSERT INTO t VALUES (1, '{}', '\\x{}')",
+            "x".repeat(600),
+            "ab".repeat(300)
+        ),
+    );
+    run(&mut db, "INSERT INTO t VALUES (2, 'small', '\\xcafe')");
+    run(&mut db, "INSERT INTO t VALUES (3, NULL, NULL)");
+    db
+}
+
 /// A table with a uuid PRIMARY KEY (the first golden with a NON-integer stored key — the
 /// load-bearing §8 cross-core key-path proof) plus a nullable uuid column. Exercises the value
 /// codec's fixed-16-byte uuid branch (no length prefix), the uuid key encoding (bare 16 bytes),
@@ -229,6 +253,7 @@ fn timestamptz_table_db() -> Database {
 fn write_matches_goldens() {
     let cases: &[(&str, Builder)] = &[
         ("empty_db.jed", Database::new),
+        ("overflow_table.jed", overflow_table_db),
         ("one_table_empty.jed", one_table_empty_db),
         ("pk_table.jed", pk_table_db),
         ("text_table.jed", text_table_db),
@@ -254,6 +279,7 @@ fn write_matches_goldens() {
 fn read_goldens_reproduces_rows() {
     let cases: &[(&str, Builder, &str)] = &[
         ("one_table_empty.jed", one_table_empty_db, "t"),
+        ("overflow_table.jed", overflow_table_db, "t"),
         ("pk_table.jed", pk_table_db, "t"),
         ("text_table.jed", text_table_db, "t"),
         ("bool_table.jed", bool_table_db, "t"),

@@ -43,7 +43,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 2; // on-disk format version (2 = page-backed CoW B-tree, P6.1)
+const FORMAT_VERSION = 3; // on-disk format version (3 = + overflow pages, large-values.md §12)
 const PAGE_HEADER = 12; // bytes of the catalog/B-tree page header
 const PAGE_CATALOG = 1; // page_type for a catalog page
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node

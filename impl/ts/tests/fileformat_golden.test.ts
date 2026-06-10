@@ -129,6 +129,20 @@ function byteaTableDB(): Database {
   return db;
 }
 
+// overflowTableDB has large text + bytea values that spill OUT-OF-LINE to overflow pages
+// (spec/design/large-values.md §12): at page_size 256 a ~600/300-byte value exceeds RECORD_MAX
+// (116), so the record holds a pointer and the bytes live in a page_type-4 chain. Row 1 spills both
+// columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL. Must match the Ruby
+// reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
+function overflowTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)");
+  run(db, `INSERT INTO t VALUES (1, '${"x".repeat(600)}', '\\x${"ab".repeat(300)}')`);
+  run(db, "INSERT INTO t VALUES (2, 'small', '\\xcafe')");
+  run(db, "INSERT INTO t VALUES (3, NULL, NULL)");
+  return db;
+}
+
 // uuidTableDB has a uuid PRIMARY KEY (the first golden with a NON-integer stored key — the
 // load-bearing §8 cross-core key-path proof) plus a nullable uuid column. Exercises the value
 // codec's fixed-16-byte uuid branch (no length prefix), the uuid key encoding (bare 16 bytes),
@@ -197,6 +211,7 @@ function timestamptzTableDB(): Database {
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
     { name: "empty_db.jed", build: () => goldenDb() },
+    { name: "overflow_table.jed", build: overflowTableDB },
     { name: "one_table_empty.jed", build: oneTableEmptyDB },
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
@@ -225,6 +240,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
 test("read goldens reproduces rows", () => {
   const cases: { name: string; build: () => Database; table: string }[] = [
     { name: "one_table_empty.jed", build: oneTableEmptyDB, table: "t" },
+    { name: "overflow_table.jed", build: overflowTableDB, table: "t" },
     { name: "pk_table.jed", build: pkTableDB, table: "t" },
     { name: "text_table.jed", build: textTableDB, table: "t" },
     { name: "bool_table.jed", build: boolTableDB, table: "t" },
