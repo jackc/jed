@@ -146,13 +146,14 @@ deliberate, cost-visible optimization, gated by the `query.point_lookup` capabil
 
 - **Which predicates bound.** Flatten the WHERE's top-level **AND-chain** (an `OR` is never
   descended — a disjunction is not one contiguous range) and collect every conjunct of the form
-  `pk <cmp> const` (`=`, `<`, `<=`, `>`, `>=`; the primary key on either side; `BETWEEN` desugars
-  to `pk >= a AND pk <= b`, so it falls out for free). The `const` must be a literal or bind
-  parameter of the **primary key's own type** — a promoted comparison (e.g. `intpk = 2.5`) does
-  **not** bound. Every other conjunct stays in the **residual filter** (the whole WHERE, re-applied
-  to each scanned row), so the bound is always a *superset* of the matching rows and the result is
-  unchanged. Multi-table (JOIN) scans, correlated-subquery inner re-scans, and no-PK tables are
-  **not** bounded yet (a follow-on) — they keep the full-scan cost above.
+  `pk <cmp> const-source` (`=`, `<`, `<=`, `>`, `>=`; the primary key on either side; `BETWEEN`
+  desugars to `pk >= a AND pk <= b`, so it falls out for free). The `const-source` must be of the
+  **primary key's own type** — a promoted comparison (e.g. `intpk = 2.5`) does **not** bound — and
+  is one of: a **literal**, a **bind parameter** `$N`, or (the correlated case below) a bare
+  **enclosing-query column**. Every other conjunct stays in the **residual filter** (the whole
+  WHERE, re-applied to each scanned row), so the bound is always a *superset* of the matching rows
+  and the result is unchanged. Multi-table (JOIN) scans and no-PK tables are **not** bounded yet (a
+  follow-on) — they keep the full-scan cost above.
 - **`page_read` = the nodes the bound's key range intersects.** A scan visits the root, then
   descends only into a child subtree whose separator span can overlap the range — so a **point
   lookup** (`pk = c`) charges the root→leaf path (the tree height), and a **range** charges the
@@ -173,6 +174,24 @@ deliberate, cost-visible optimization, gated by the `query.point_lookup` capabil
 `spec/conformance/suites/query/point_lookup.test` pins these costs cross-core; the bounded forms in
 `expr/cost.test`, `query/distinct.test`, `query/limit_offset.test`, and `query/select_list.test`
 exercise them in context.
+
+**Bounded scan / correlated — the inner PK bound from an outer column.** A correlated subquery is
+re-executed once per outer row (see "Subqueries" below). When its inner query is a **single table**
+whose WHERE compares the inner **primary key** to an **enclosing-query column** — `inner.pk = o.col`
+(or `<`, `<=`, `>`, `>=`) — the bound's `const-source` is that outer column, resolved to **the
+current outer row's value** each time the inner runs. So the inner **seeks** (a per-outer-row point
+lookup/range) instead of re-scanning the whole inner table for every outer row: across N outer rows
+the inner's `storage_row_read` drops from `N × |inner|` to `N ×` (rows in range, 0/1 for a point
+lookup), and `page_read` from `N × node_count` to `N ×` the access-path nodes. It is the **same
+bounded-scan mechanism** — the only addition is that the source is read from the outer row rather
+than a literal/param — so soundness is identical (the whole WHERE stays the residual filter) and the
+**rows are unchanged**; only the inner re-scan cost drops. The bound is still fully deterministic per
+`(query, db)`: the outer rows are deterministic, so each per-outer-row bound — and its cost — is too,
+and it is byte-identical across cores (the outer value, the key codec, and the overlap rule are all
+shared). A NULL outer value gives a 3VL-empty bound (the inner reads nothing). This is gated by the
+`query.correlated_pushdown` capability and pinned cross-core in
+`spec/conformance/suites/subquery/correlated_pushdown.test`. JOIN base tables and no-PK inners stay
+unbounded (the same follow-on as above).
 
 ### LIMIT short-circuit — stopping the scan when the window is filled
 
@@ -345,6 +364,12 @@ set-operation combine. How many times that operand cost lands depends on correla
   model). So for a correlated subquery `s` reached by outer rows `R`:
 
   > `cost(query with correlated s) = cost(query) + Σ_{r ∈ R} (operator_eval + cost(s | r))`
+
+  When the inner query is a single table whose WHERE bounds its **primary key** by an enclosing
+  column (`inner.pk = o.col`), each `cost(s | r)` is the **bounded** inner scan for that outer
+  row's value — a per-outer-row point lookup/range, not a full re-scan (see "Bounded scan /
+  correlated" above; `query.correlated_pushdown`). The Σ shrinks accordingly, but the formula is
+  unchanged — only each term is smaller.
 
 Both are fully deterministic and identical across cores: the same `(query, database)` always
 visits the same outer rows in the same order and runs the subquery the same number of times.

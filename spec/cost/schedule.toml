@@ -49,7 +49,9 @@ event  = "one B-tree node (page) touched while scanning a table store"
 # cost (§13, ../design/cost.md §3). A single-table primary-key predicate now pushes down to
 # a BOUNDED scan (`query.point_lookup`): page_read charges only the nodes the key range
 # intersects (a point lookup ≈ the tree height), the unbounded range reproducing the full
-# scan exactly — so existing costs are unchanged (../design/cost.md §3 "Bounded scan").
+# scan exactly — so existing costs are unchanged (../design/cost.md §3 "Bounded scan"). The
+# same bound also applies to a correlated subquery's inner re-scan when its PK is compared to
+# an enclosing column (`query.correlated_pushdown`), resolved per outer row.
 
 [[unit]]
 id     = "row_produced"

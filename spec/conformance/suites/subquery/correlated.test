@@ -71,10 +71,11 @@ SELECT t1.id, (SELECT sum(t2.v + t1.v) FROM t2) FROM t1 ORDER BY t1.id
 80
 
 # Correlated IN — t1.v in the t2 values selected for this t1 row. id=1: t2.id=1 -> {10}, 10 in -> yes.
-# id=2: t2.id=2 -> {30}, 20 in -> no. Cost: scan t1 (2). Per t1 row the IN node (1 operator_eval)
-# runs its subquery [scan t2 (2) + `t2.id=t1.id` per row (2) + 1 produced = 5] then tests membership
-# (1 operator_eval per result element, 1 here). So each row = 1+5+1 = 7. Plus 1 row_produced. 2+7+7+1 = 17.
-# cost: 20
+# id=2: t2.id=2 -> {30}, 20 in -> no. The inner correlation `t2.id = t1.id` is on t2's PRIMARY KEY, so
+# it pushes down to a per-outer-row point lookup (the inner seeks t2 instead of re-scanning it). That is
+# a cost-only optimization — the rows are identical with or without it — so the cost contract for this
+# shape is pinned separately in subquery/correlated_pushdown.test (which requires query.correlated_pushdown);
+# here only the rows are asserted, keeping this file runnable without that capability.
 query I rowsort
 SELECT t1.id FROM t1 WHERE t1.v IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id)
 ----

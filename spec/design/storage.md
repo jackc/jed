@@ -242,5 +242,8 @@ sits so the options stay open (CLAUDE.md §9).
   range spans, and `overlap_node_count` counts exactly the visited nodes from the resident interior
   skeleton **without faulting a leaf** (keeping `page_read` a logical count). The unbounded range
   reproduces the full scan exactly (`overlap_node_count == node_count`), so existing costs are
-  unchanged. JOIN base tables, correlated-subquery inner re-scans, and `IN (list)` are not bounded
-  yet (a follow-on). Accrual rules: [cost.md](cost.md) §3 "Bounded scan / point lookup".
+  unchanged. The same seek/range also bounds a **correlated subquery's inner re-scan** when its inner
+  PK is compared to an enclosing column (`inner.pk = o.col`) — the bound's source is the current outer
+  row's value, resolved per outer row, so the inner seeks instead of re-scanning the whole table each
+  time (`query.correlated_pushdown`). JOIN base tables and `IN (list)` are not bounded yet (a
+  follow-on). Accrual rules: [cost.md](cost.md) §3 "Bounded scan / point lookup" + "/ correlated".

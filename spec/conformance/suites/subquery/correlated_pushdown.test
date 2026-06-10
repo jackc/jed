@@ -1,0 +1,90 @@
+# Correlated primary-key pushdown (spec/design/cost.md §3 "bounded scan / correlated"; grammar.md
+# §26). A correlated subquery is re-executed once per outer row. When its inner query is a single
+# table whose WHERE compares the inner PRIMARY KEY to an enclosing-query column (`inner.pk = o.col`),
+# the inner scan bounds to THAT outer row's value — a per-outer-row point lookup/range — instead of
+# re-scanning the whole inner table for every outer row. It is the same bounded-scan mechanism as
+# query.point_lookup, only the bound's source is an outer column resolved per outer row, so the whole
+# WHERE stays the residual filter and the ROWS are identical with or without the pushdown; only the
+# inner re-scan COST drops. That drop is the cross-core contract pinned here with `# cost:` (cost.md
+# §3; the same units in Rust, Go, TS). All units weigh 1. `o` and `inr` are three/four rows in one
+# leaf each, so page_read is 1 for any non-empty inner bound and 0 for an empty one; the win shows in
+# storage_row_read — a point lookup reads 0/1 inner rows per outer row, not all of `inr`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.qualified_column, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.correlated_pushdown, types.int32, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE o (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE inr (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO o VALUES (1, 2), (2, 5), (3, 9), (4, NULL)
+
+statement ok
+INSERT INTO inr VALUES (2, 2), (4, 4), (5, 5)
+
+# Correlated EXISTS on the inner PK: `inr.id = o.k` bounds the inner to a point lookup per outer row.
+# Outer scan o: 1 page + 4 rows = 5. Per outer row: the EXISTS node (1 operator_eval) + its run.
+#   k=2 -> seek inr.id=2: 1 page + 1 row + 1 filter + 1 produced = 4; node 1+4 = 5
+#   k=5 -> seek inr.id=5: same = 4; node 5
+#   k=9 -> seek inr.id=9 (miss): 1 page + 0 + 0 + 0 = 1; node 1+1 = 2
+#   k=NULL -> 3VL-empty bound: the inner reads nothing (0 page, 0 row); node 1+0 = 1
+# Two outer rows survive -> 2 row_produced. Total 5 + 5+5+2+1 + 2 = 20. A full re-scan (next record)
+# is 41 — the pushdown is the difference.
+# cost: 20
+query I rowsort
+SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM inr WHERE inr.id = o.k)
+----
+1
+2
+
+# The SAME rows via a NON-key correlation `inr.v = o.k` do NOT push down — `v` is not the PK, so the
+# inner re-scans all of `inr` for every outer row. Outer scan o (5). Per outer row: EXISTS node (1) +
+# full inner scan [1 page + 3 rows + 3 filter + produced]. k=2 -> 1 match: 1+3+3+1 = 8, node 9; k=5 ->
+# 1 match: 8, node 9; k=9 -> 0: 7, node 8; k=NULL -> 0: 7, node 8. 2 survive -> 2. 5 + 9+9+8+8 + 2 = 41.
+# cost: 41
+query I rowsort
+SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM inr WHERE inr.v = o.k)
+----
+1
+2
+
+# Correlated SCALAR subquery on the inner PK — one bounded seek per outer row, every outer row emitted.
+# Outer scan o (5). Per outer row: the scalar node (1) + its run. k=2 -> seek id=2: 4, node 5; k=5 ->
+# 4, node 5; k=9 (miss) -> 1, node 2; k=NULL (empty) -> 0, node 1. All 4 outer rows are produced -> 4.
+# Total 5 + 5+5+2+1 + 4 = 22.
+# cost: 22
+query II nosort
+SELECT o.id, (SELECT inr.v FROM inr WHERE inr.id = o.k) FROM o ORDER BY o.id
+----
+1
+2
+2
+5
+3
+NULL
+4
+NULL
+
+# Correlated IN on the inner PK — the inner seeks `inr.id = o.k`, then membership tests o.k against the
+# (0/1-element) result. Outer scan o (5). Per outer row: IN node (1) + inner + 1 operator_eval per
+# result element. k=2 -> seek 4, list {2}, 1 in -> 6; k=5 -> 6; k=9 -> inner 1, empty list, 0 -> 2;
+# k=NULL -> inner 0, empty list, 0 -> 1. 2 survive -> 2. 5 + 6+6+2+1 + 2 = 22.
+# cost: 22
+query I rowsort
+SELECT o.id FROM o WHERE o.k IN (SELECT inr.v FROM inr WHERE inr.id = o.k)
+----
+1
+2
+
+# Correlated RANGE on the inner PK — `inr.id < o.k` bounds the inner to (−∞, o.k), pruning the scan to
+# the rows below the outer value (EXISTS itself still reads every match — it does not LIMIT 1). Outer
+# scan o (5). Per outer row: EXISTS node (1) + inner over (−∞,k). k=2 -> 0 rows below: 1 page, node 2;
+# k=5 -> rows 2,4: 1+2+2+2 = 7, node 8; k=9 -> rows 2,4,5: 1+3+3+3 = 10, node 11; k=NULL (empty) -> 0,
+# node 1. 2 survive (ids 2,3) -> 2. 5 + 2+8+11+1 + 2 = 29.
+# cost: 29
+query I rowsort
+SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM inr WHERE inr.id < o.k)
+----
+2
+3

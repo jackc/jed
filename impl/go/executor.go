@@ -769,7 +769,8 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	var entries []Entry
 	var overlap int
 	if bp := pkBoundFor(table, filter); bp != nil {
-		kb, empty := db.buildKeyBound(bp, bound)
+		// Top-level statement: no enclosing query, so the bound never has a correlated source.
+		kb, empty := db.buildKeyBound(bp, bound, nil)
 		if empty {
 			return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
 		}
@@ -908,7 +909,8 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	var entries []Entry
 	var overlap int
 	if bp := pkBoundFor(table, filter); bp != nil {
-		kb, empty := db.buildKeyBound(bp, bound)
+		// Top-level statement: no enclosing query, so the bound never has a correlated source.
+		kb, empty := db.buildKeyBound(bp, bound, nil)
 		if empty {
 			return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
 		}
@@ -1679,11 +1681,15 @@ func asBoundTerm(e *rExpr, pkIdx int, pkType ScalarType) (boundTerm, bool) {
 
 // isConstSource reports whether e is constant for the whole scan (no per-row input) AND of a type
 // that encodes into the PK key space: a same-family const literal, a NULL literal (⇒ a provably
-// empty range), or a bind parameter $N (its inferred type matched the PK via the comparison; a value
-// that does not fit is caught at buildKeyBound).
+// empty range), a bind parameter $N (its inferred type matched the PK via the comparison; a value
+// that does not fit is caught at buildKeyBound), or a bare correlated reOuterColumn — its value is a
+// runtime constant for a given outer row, so the inner subquery's PK is bounded by the current outer
+// row's column and seeks instead of re-scanning the whole inner table per outer row (cost.md §3
+// "bounded scan", grammar.md §26). A type-mismatched outer reference is wrapped in a cast by the
+// resolver (as for a const literal), so it never arrives here bare — the type check stays implicit.
 func isConstSource(e *rExpr, pkType ScalarType) bool {
 	switch e.kind {
-	case reParam, reConstNull:
+	case reParam, reConstNull, reOuterColumn:
 		return true
 	case reConstInt:
 		return pkType.IsInteger()
@@ -1719,10 +1725,12 @@ func flipCompare(op BinaryOp) BinaryOp {
 // key (a NULL const — 3VL — or contradictory bounds like pk>5 AND pk<5), so the scan reads nothing
 // and charges nothing. An out-of-range integer const drops only its own half-bound (a wider, still
 // sound, scan), never a wrong key.
-func (db *Database) buildKeyBound(bp *pkBoundPlan, params []Value) (keyBound, bool) {
+// outer carries the enclosing rows (innermost last) so a correlated reOuterColumn source resolves to
+// the current outer row's value; it is nil for a top-level statement.
+func (db *Database) buildKeyBound(bp *pkBoundPlan, params []Value, outer []Row) (keyBound, bool) {
 	b := unboundedBound()
 	for _, t := range bp.terms {
-		key, isNull, ok := encodeBoundKey(bp.pkType, t.src, params)
+		key, isNull, ok := encodeBoundKey(bp.pkType, t.src, params, outer)
 		if isNull {
 			return keyBound{}, true
 		}
@@ -1752,8 +1760,9 @@ func (db *Database) buildKeyBound(bp *pkBoundPlan, params []Value) (keyBound, bo
 // encodeBoundKey encodes a const-source's value into the PK's storage key (the same codec INSERT
 // uses — EncodeInt for integer/timestamp widths, the raw 16 bytes for uuid). isNull ⇒ the value is
 // NULL; ok=false (not null) ⇒ an integer value outside the PK type's range (no key can equal it), so
-// the caller drops this bound.
-func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value) (key []byte, isNull bool, ok bool) {
+// the caller drops this bound. reParam/reOuterColumn resolve to a runtime Value first (the param
+// table / the enclosing outer row) and then encode through the shared path.
+func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row) (key []byte, isNull bool, ok bool) {
 	switch src.kind {
 	case reConstNull:
 		return nil, true, false
@@ -1767,23 +1776,33 @@ func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value) (key []byte, 
 	case reConstTimestamp, reConstTimestamptz:
 		return EncodeInt(pkType, src.cInt), false, true
 	case reParam:
-		v := params[src.index]
-		if v.IsNull() {
-			return nil, true, false
-		}
-		switch {
-		case pkType.IsUuid():
-			return []byte(v.Str), false, true
-		case pkType.IsInteger():
-			if !pkType.InRange(v.Int) {
-				return nil, false, false
-			}
-			return EncodeInt(pkType, v.Int), false, true
-		default: // timestamp / timestamptz
-			return EncodeInt(pkType, v.Int), false, true
-		}
+		return encodeValueKey(pkType, params[src.index])
+	case reOuterColumn:
+		// A correlated reference: column index of the enclosing row level hops out — the same
+		// indexing the evaluator uses for reOuterColumn (innermost outer row is last).
+		return encodeValueKey(pkType, outer[len(outer)-src.level][src.index])
 	}
 	return nil, false, false
+}
+
+// encodeValueKey encodes a runtime Value (a bound param or a resolved outer column) into the PK's
+// storage key. isNull ⇒ the value is NULL (a 3VL-empty range); ok=false (not null) ⇒ an integer
+// outside the PK width, so the caller drops this half-bound (a wider, still sound, scan).
+func encodeValueKey(pkType ScalarType, v Value) (key []byte, isNull bool, ok bool) {
+	if v.IsNull() {
+		return nil, true, false
+	}
+	switch {
+	case pkType.IsUuid():
+		return []byte(v.Str), false, true
+	case pkType.IsInteger():
+		if !pkType.InRange(v.Int) {
+			return nil, false, false
+		}
+		return EncodeInt(pkType, v.Int), false, true
+	default: // timestamp / timestamptz
+		return EncodeInt(pkType, v.Int), false, true
+	}
 }
 
 // intersectLo tightens b's lower bound to the more restrictive of (current, key); at an equal key an
@@ -1842,12 +1861,13 @@ func boundEmpty(b keyBound) bool {
 func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
 	store := db.readSnap().store(plan.rels[0].tableName)
 
-	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block.
+	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A correlated
+	// bound resolves against env.outer (the enclosing rows).
 	b := unboundedBound()
 	empty := false
 	overlap := store.NodeCount()
 	if plan.pkBound != nil {
-		if b, empty = db.buildKeyBound(plan.pkBound, params); empty {
+		if b, empty = db.buildKeyBound(plan.pkBound, params, env.outer); empty {
 			overlap = 0
 		} else {
 			overlap = store.OverlapNodeCount(b)
@@ -1928,7 +1948,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		var rows []Row
 		var nodeCount int
 		if plan.pkBound != nil {
-			b, empty := db.buildKeyBound(plan.pkBound, params)
+			b, empty := db.buildKeyBound(plan.pkBound, params, outer)
 			if !empty {
 				var err error
 				if rows, err = store.RangeRows(b); err != nil {

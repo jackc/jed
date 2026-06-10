@@ -911,7 +911,8 @@ impl Database {
             _ => None,
         };
         let (entries, overlap) = match &pk_bound {
-            Some(bp) => match build_key_bound(bp, &bound) {
+            // Top-level statement: no enclosing query, so the bound never has a correlated source.
+            Some(bp) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
                     let store = self.store(&del.table);
                     (
@@ -1048,7 +1049,8 @@ impl Database {
             _ => None,
         };
         let (entries, overlap) = match &pk_bound {
-            Some(bp) => match build_key_bound(bp, &bound) {
+            // Top-level statement: no enclosing query, so the bound never has a correlated source.
+            Some(bp) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
                     let store = self.store(&upd.table);
                     (
@@ -1565,9 +1567,10 @@ impl Database {
     ) -> Result<SelectResult> {
         let store = self.store(&plan.rels[0].table_name);
 
-        // Resolve the scan bound (the PK pushdown, if any) and charge the page_read block.
+        // Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A
+        // correlated bound resolves against `env.outer` (the enclosing rows).
         let (bound, empty) = match &plan.pk_bound {
-            Some(bp) => match build_key_bound(bp, params) {
+            Some(bp) => match build_key_bound(bp, params, env.outer) {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
@@ -1660,7 +1663,7 @@ impl Database {
             // B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. Otherwise
             // the full scan is unchanged (cost.md §3 "bounded scan").
             let (rows, node_count) = match &plan.pk_bound {
-                Some(bp) => match build_key_bound(bp, params) {
+                Some(bp) => match build_key_bound(bp, params, outer) {
                     Some(b) => (store.range_rows(&b)?, store.overlap_node_count(&b) as i64),
                     None => (Vec::new(), 0),
                 },
@@ -2583,13 +2586,18 @@ struct SelectPlan {
 
 /// The constant data extracted from a bound term's const-source operand (avoids cloning the whole
 /// `RExpr` and keeps `PkBound` owned). `Timestamp` covers both timestamp and timestamptz (same
-/// encoding; the PK type disambiguates). `Param` resolves to a value at exec time.
+/// encoding; the PK type disambiguates). `Param` and `Outer` resolve to a value at exec time:
+/// `Param` from the bound parameters, `Outer` from an enclosing query's row (a correlated
+/// reference — the inner subquery's PK is bounded by the current outer row's column, so it seeks
+/// instead of re-scanning the whole inner table per outer row; spec/design/cost.md §3 "bounded
+/// scan", grammar.md §26).
 enum BoundSrc {
     Int(i64),
     Uuid([u8; 16]),
     Timestamp(i64),
     Null,
     Param(usize),
+    Outer { level: usize, index: usize },
 }
 
 /// One `pk <op> const-source` from a WHERE AND-chain, normalized so the PK is the LEFT side (a
@@ -2659,7 +2667,10 @@ fn collect_bound_terms(e: &RExpr, pk_idx: usize, pk_type: ScalarType, terms: &mu
 
 /// Recognize a const-source operand whose static type matches the PK's storage type (a promoted
 /// comparison — e.g. `intpk = 2.5` → a `ConstDecimal` — does not match, so it stays residual). A
-/// correlated `OuterColumn`, a column, arithmetic, etc. are not const-sources.
+/// bare correlated `OuterColumn` IS a const-source (its value is a runtime constant for a given
+/// outer row); a column of the same query, arithmetic, etc. are not. A type-mismatched outer
+/// reference is wrapped in a `Cast` by the resolver (as for the literal case above), so it never
+/// arrives here bare — the type check is implicit and the match stays sound.
 fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
     match e {
         RExpr::Param(i) => Some(BoundSrc::Param(*i)),
@@ -2668,6 +2679,10 @@ fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
         RExpr::ConstUuid(u) if pk_type.is_uuid() => Some(BoundSrc::Uuid(*u)),
         RExpr::ConstTimestamp(m) if pk_type.is_timestamp() => Some(BoundSrc::Timestamp(*m)),
         RExpr::ConstTimestamptz(m) if pk_type.is_timestamptz() => Some(BoundSrc::Timestamp(*m)),
+        RExpr::OuterColumn { level, index } => Some(BoundSrc::Outer {
+            level: *level,
+            index: *index,
+        }),
         _ => None,
     }
 }
@@ -2684,12 +2699,14 @@ fn flip_cmp(op: CmpOp) -> CmpOp {
 }
 
 /// Build the concrete key range at exec time: encode each const-source and intersect the half-bounds.
-/// `None` ⇒ the range admits no key (a NULL const — 3VL — or contradictory bounds), so the scan reads
-/// nothing. An out-of-range integer const drops only its own half-bound (a wider, still sound, scan).
-fn build_key_bound(bp: &PkBound, params: &[Value]) -> Option<KeyBound> {
+/// `outer` carries the enclosing rows (innermost last) so a correlated `Outer` source resolves to
+/// the current outer row's value; it is empty for a top-level statement. `None` ⇒ the range admits
+/// no key (a NULL const/value — 3VL — or contradictory bounds), so the scan reads nothing. An
+/// out-of-range integer const drops only its own half-bound (a wider, still sound, scan).
+fn build_key_bound(bp: &PkBound, params: &[Value], outer: &[&[Value]]) -> Option<KeyBound> {
     let mut b = KeyBound::unbounded();
     for t in &bp.terms {
-        let key = match encode_bound_key(bp.pk_type, &t.src, params) {
+        let key = match encode_bound_key(bp.pk_type, &t.src, params, outer) {
             BoundKey::Null => return None,
             BoundKey::OutOfRange => continue,
             BoundKey::Key(k) => k,
@@ -2709,8 +2726,14 @@ fn build_key_bound(bp: &PkBound, params: &[Value]) -> Option<KeyBound> {
 }
 
 /// Encode a const-source's value into the PK's storage key (the same codec INSERT uses — `encode_int`
-/// for integer/timestamp widths, the raw 16 bytes for uuid).
-fn encode_bound_key(pk_ty: ScalarType, src: &BoundSrc, params: &[Value]) -> BoundKey {
+/// for integer/timestamp widths, the raw 16 bytes for uuid). `Param`/`Outer` resolve to a runtime
+/// `Value` first (the param table / the enclosing outer row) and then encode through the shared path.
+fn encode_bound_key(
+    pk_ty: ScalarType,
+    src: &BoundSrc,
+    params: &[Value],
+    outer: &[&[Value]],
+) -> BoundKey {
     match src {
         BoundSrc::Null => BoundKey::Null,
         BoundSrc::Int(n) => {
@@ -2722,19 +2745,31 @@ fn encode_bound_key(pk_ty: ScalarType, src: &BoundSrc, params: &[Value]) -> Boun
         }
         BoundSrc::Uuid(u) => BoundKey::Key(u.to_vec()),
         BoundSrc::Timestamp(m) => BoundKey::Key(encode_int(pk_ty, *m)),
-        BoundSrc::Param(i) => match &params[*i] {
-            Value::Null => BoundKey::Null,
-            Value::Uuid(u) => BoundKey::Key(u.to_vec()),
-            Value::Int(n) => {
-                if pk_ty.in_range(*n) {
-                    BoundKey::Key(encode_int(pk_ty, *n))
-                } else {
-                    BoundKey::OutOfRange
-                }
+        BoundSrc::Param(i) => encode_value_key(pk_ty, &params[*i]),
+        // A correlated reference: column `index` of the enclosing row `level` hops out — the same
+        // indexing the evaluator uses for `RExpr::OuterColumn` (innermost outer row is last).
+        BoundSrc::Outer { level, index } => {
+            encode_value_key(pk_ty, &outer[outer.len() - level][*index])
+        }
+    }
+}
+
+/// Encode a runtime `Value` (a bound param or a resolved outer column) into the PK's storage key.
+/// A NULL value makes the comparison 3VL-unknown (an empty range); a value of a kind no key can
+/// hold (or an integer outside the PK width) drops its half-bound, widening — still sound.
+fn encode_value_key(pk_ty: ScalarType, v: &Value) -> BoundKey {
+    match v {
+        Value::Null => BoundKey::Null,
+        Value::Uuid(u) => BoundKey::Key(u.to_vec()),
+        Value::Int(n) => {
+            if pk_ty.in_range(*n) {
+                BoundKey::Key(encode_int(pk_ty, *n))
+            } else {
+                BoundKey::OutOfRange
             }
-            Value::Timestamp(m) | Value::Timestamptz(m) => BoundKey::Key(encode_int(pk_ty, *m)),
-            _ => BoundKey::OutOfRange,
-        },
+        }
+        Value::Timestamp(m) | Value::Timestamptz(m) => BoundKey::Key(encode_int(pk_ty, *m)),
+        _ => BoundKey::OutOfRange,
     }
 }
 

@@ -1142,11 +1142,12 @@ export class Database {
   private execStreamingLimit(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): SelectResult {
     const store = this.readSnap().store(plan.rels[0]!.tableName);
 
-    // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead block.
+    // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead block. A correlated
+    // bound resolves against env.outer (the enclosing rows).
     let bound: KeyBound = unboundedBound();
     let empty = false;
     if (plan.pkBound !== null) {
-      const b = buildKeyBound(plan.pkBound, params);
+      const b = buildKeyBound(plan.pkBound, params, env.outer);
       if (b === null) empty = true;
       else bound = b;
     }
@@ -1208,7 +1209,7 @@ export class Database {
       let rows: Row[];
       let nodeCount: number;
       if (plan.pkBound !== null) {
-        const b = buildKeyBound(plan.pkBound, params);
+        const b = buildKeyBound(plan.pkBound, params, outer);
         if (b === null) {
           rows = [];
           nodeCount = 0;
@@ -1572,11 +1573,16 @@ function asBoundTerm(e: RExpr, pkIdx: number, pkType: ScalarType): BoundTerm | n
 }
 
 // isConstSource reports whether e is constant for the whole scan AND of a type that encodes into the PK
-// key space: a same-family const literal, a NULL literal (⇒ a provably empty range), or a bind parameter.
+// key space: a same-family const literal, a NULL literal (⇒ a provably empty range), a bind parameter,
+// or a bare correlated "outerColumn" — its value is a runtime constant for a given outer row, so the
+// inner subquery's PK is bounded by the current outer row's column and seeks instead of re-scanning the
+// whole inner table per outer row (cost.md §3 "bounded scan", grammar.md §26). A type-mismatched outer
+// reference is wrapped in a cast by the resolver (as for a const literal), so it never arrives here bare.
 function isConstSource(e: RExpr, pkType: ScalarType): boolean {
   switch (e.kind) {
     case "param":
     case "constNull":
+    case "outerColumn":
       return true;
     case "constInt":
       return isInteger(pkType);
@@ -1611,10 +1617,12 @@ function flipCmp(op: BinaryOp): BinaryOp {
 // const-source and intersect the half-bounds. null ⇒ the range admits no key (a NULL const — 3VL — or
 // contradictory bounds), so the scan reads nothing. An out-of-range integer const drops only its own
 // half-bound (a wider, still sound, scan).
-function buildKeyBound(bp: PkBound, params: Value[]): KeyBound | null {
+// outer carries the enclosing rows (innermost last) so a correlated "outerColumn" source resolves to
+// the current outer row's value; it is empty for a top-level statement.
+function buildKeyBound(bp: PkBound, params: Value[], outer: Row[]): KeyBound | null {
   const b = unboundedBound();
   for (const t of bp.terms) {
-    const r = encodeBoundKey(bp.pkType, t.src, params);
+    const r = encodeBoundKey(bp.pkType, t.src, params, outer);
     if (r.kind === "null") return null;
     if (r.kind === "outOfRange") continue;
     const key = r.key;
@@ -1641,8 +1649,9 @@ function buildKeyBound(bp: PkBound, params: Value[]): KeyBound | null {
 }
 
 // encodeBoundKey encodes a const-source's value into the PK's storage key (the same codec INSERT uses —
-// encodeInt for integer/timestamp widths, the raw 16 bytes for uuid).
-function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[]): BoundKey {
+// encodeInt for integer/timestamp widths, the raw 16 bytes for uuid). param/outerColumn resolve to a
+// runtime Value first (the param table / the enclosing outer row) and then encode through the shared path.
+function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[], outer: Row[]): BoundKey {
   switch (src.kind) {
     case "constNull":
       return { kind: "null" };
@@ -1653,19 +1662,28 @@ function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[]): BoundK
     case "constTimestamp":
     case "constTimestamptz":
       return { kind: "key", key: encodeInt(pkType, src.value) };
-    case "param": {
-      const v = params[src.index]!;
-      if (v.kind === "null") return { kind: "null" };
-      if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
-      if (v.kind === "int")
-        return inRange(pkType, v.int) ? { kind: "key", key: encodeInt(pkType, v.int) } : { kind: "outOfRange" };
-      if (v.kind === "timestamp" || v.kind === "timestamptz")
-        return { kind: "key", key: encodeInt(pkType, v.micros) };
-      return { kind: "outOfRange" };
-    }
+    case "param":
+      return encodeValueKey(pkType, params[src.index]!);
+    case "outerColumn":
+      // A correlated reference: column index of the enclosing row level hops out — the same indexing
+      // the evaluator uses for "outerColumn" (innermost outer row is last).
+      return encodeValueKey(pkType, outer[outer.length - src.level]![src.index]!);
     default:
       return { kind: "outOfRange" };
   }
+}
+
+// encodeValueKey encodes a runtime Value (a bound param or a resolved outer column) into the PK's storage
+// key. A NULL value makes the comparison 3VL-unknown (an empty range); a value of a kind no key can hold
+// (or an integer outside the PK width) drops its half-bound, widening — still sound.
+function encodeValueKey(pkType: ScalarType, v: Value): BoundKey {
+  if (v.kind === "null") return { kind: "null" };
+  if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
+  if (v.kind === "int")
+    return inRange(pkType, v.int) ? { kind: "key", key: encodeInt(pkType, v.int) } : { kind: "outOfRange" };
+  if (v.kind === "timestamp" || v.kind === "timestamptz")
+    return { kind: "key", key: encodeInt(pkType, v.micros) };
+  return { kind: "outOfRange" };
 }
 
 // intersectLo tightens b's lower bound to the more restrictive of (current, key); at an equal key an
@@ -1725,7 +1743,8 @@ function scanEntries(
   params: Value[],
 ): { entries: Entry[] | null; overlap: number } {
   if (pkBound !== null) {
-    const b = buildKeyBound(pkBound, params);
+    // Top-level statement: no enclosing query, so the bound never has a correlated source.
+    const b = buildKeyBound(pkBound, params, []);
     if (b === null) return { entries: null, overlap: 0 };
     return { entries: store.rangeEntries(b), overlap: store.overlapNodeCount(b) };
   }
