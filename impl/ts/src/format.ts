@@ -48,7 +48,13 @@ const PAGE_HEADER = 12; // bytes of the catalog/B-tree page header
 const PAGE_CATALOG = 1; // page_type for a catalog page
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
 const PAGE_INTERIOR = 3; // page_type for a B-tree interior node
+const PAGE_OVERFLOW = 4; // page_type for an out-of-line value slab (large-values.md §12)
 const ROOT_PAGE = 2; // catalog root of a fresh empty db (relocatable thereafter)
+// tagExternal is the value-codec presence tag for a present external value: the body is a pointer
+// (u32 first_page + u32 payload_len) into an overflow chain, not the value (large-values.md §12).
+// 0x00 present-inline / 0x01 NULL unchanged; 0x03/0x04 reserved for compression (Slice B).
+const TAG_EXTERNAL = 0x02;
+const EXTERNAL_PTR_LEN = 1 + 4 + 4; // tag + first_page(u32) + payload_len(u32) in a record
 const MIN_PAGE_SIZE = PAGE_HEADER + 36; // smallest valid page size (page + 36-byte meta header; format.md)
 const MAX_PAGE_SIZE = 65536; // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
 
@@ -222,26 +228,139 @@ function concat(parts: Uint8Array[]): Uint8Array {
   return out;
 }
 
-// recordSize is the on-disk size of a record (key_len(u16) | key | each column value) — the weight
-// the page-backed B-tree splits on (format.md). It must equal encodeRecord(...).length, so in-memory
-// node boundaries match serialized page boundaries; computed from the value codec to stay in lockstep.
-export function recordSize(colTypes: ScalarType[], key: Uint8Array, row: Row): number {
-  let n = 2 + key.length;
-  for (let i = 0; i < colTypes.length; i++) {
-    n += encodeValue(colTypes[i]!, row[i]!).length;
-  }
-  return n;
+// isSpillable reports whether a value of this type can be stored out-of-line (a variable-length
+// type). Fixed-width types are tiny and always stay inline (spec/design/large-values.md §12).
+function isSpillable(ty: ScalarType): boolean {
+  return isText(ty) || isBytea(ty) || ty === "decimal";
 }
 
-// encodeRecord builds one record: key_len(u16) | key | payload(each column value).
-function encodeRecord(table: Table, key: Uint8Array, row: Row): Uint8Array {
+// recordMaxFor is the largest a single record may serialize to and still satisfy the B-tree split
+// contract — RECORD_MAX = (C-12)/2 where C = capacity is the page payload (format.md "Why the record
+// cap"). The spill planner reduces a record to ≤ this by externalizing values.
+function recordMaxFor(capacity: number): number {
+  return Math.max(0, Math.floor((capacity - PAGE_HEADER) / 2));
+}
+
+// planDispositions decides each column's on-disk disposition (Slice A: inline or external-plain) and
+// returns [isExternal per column, on-disk record size] — spec/design/large-values.md §3/§12. Spill
+// only when forced: if the all-inline record already fits RECORD_MAX nothing spills; else externalize
+// the largest spillable values (ties by column order) until it fits. Deterministic and cross-core
+// identical (a §8 contract); shared by the serializer and by recordSize (the B-tree split weight).
+function planDispositions(
+  colTypes: ScalarType[],
+  key: Uint8Array,
+  row: Row,
+  capacity: number,
+): [boolean[], number] {
+  const inline = colTypes.map((ty, i) => encodeValue(ty, row[i]!).length);
+  const external = new Array<boolean>(colTypes.length).fill(false);
+  let size = 2 + key.length + inline.reduce((a, b) => a + b, 0);
+  const max = recordMaxFor(capacity);
+  if (size <= max) return [external, size];
+  // Spillable, currently-inline columns whose externalization actually shrinks the record
+  // (inline > pointer), largest inline size first; ties by column order — a stable sort keeps it
+  // deterministic.
+  const cand: number[] = [];
+  for (let i = 0; i < colTypes.length; i++) {
+    if (isSpillable(colTypes[i]!) && inline[i]! > EXTERNAL_PTR_LEN) cand.push(i);
+  }
+  cand.sort((a, b) => inline[b]! - inline[a]!); // Array.prototype.sort is stable (ES2019+)
+  for (const i of cand) {
+    if (size <= max) break;
+    external[i] = true;
+    size = size - inline[i]! + EXTERNAL_PTR_LEN;
+  }
+  return [external, size];
+}
+
+// recordSize is the on-disk size of a record — the weight the page-backed B-tree splits on
+// (format.md). Accounts for out-of-line spill: an externalized value contributes its fixed pointer
+// size, not its full inline body (large-values.md §12). Must equal what the serializer produces, so
+// in-memory node boundaries match serialized page boundaries.
+export function recordSize(colTypes: ScalarType[], key: Uint8Array, row: Row, capacity: number): number {
+  return planDispositions(colTypes, key, row, capacity)[1];
+}
+
+// valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
+// externalized (large-values.md §12): raw UTF-8 for text, raw bytes for bytea, the decimal body
+// (encoding minus its presence tag) for decimal. Only spillable types reach here.
+function valuePayload(ty: ScalarType, v: Value): Uint8Array {
+  if (v.kind === "text") return UTF8.encode(v.text);
+  if (v.kind === "bytea") return v.bytes;
+  if (v.kind === "decimal") return encodeValue(ty, v).subarray(1); // strip the presence tag
+  throw engineError("data_corrupted", "only spillable values are externalized");
+}
+
+// valueFromPayload reconstructs a value from the P(v) content gathered from its overflow chain
+// (inverse of valuePayload) — large-values.md §12.
+function valueFromPayload(ty: ScalarType, payload: Uint8Array): Value {
+  if (isText(ty)) {
+    try {
+      return textValue(UTF8_DECODE.decode(payload));
+    } catch {
+      throw engineError("data_corrupted", "non-UTF-8 text value");
+    }
+  }
+  if (isBytea(ty)) return byteaValue(payload.slice());
+  if (ty === "decimal") return decodeDecimalBody(payload, { pos: 0 });
+  throw engineError("data_corrupted", "a non-spillable type was stored external");
+}
+
+// OverflowPageOut is one overflow page produced while serializing a record's external value.
+type OverflowPageOut = { index: number; itemCount: number; nextPage: number; payload: Uint8Array };
+
+// encodeRecord builds one record (key_len(u16) | key | payload), spilling over-large values out-of-
+// line per the disposition plan (large-values.md §12). For each externalized value, allocate overflow
+// page(s) via `take`, append them to `ovf`, and write a tag|first_page|len pointer instead of the
+// inline body. capacity is the page payload (the slab size + the spill-plan input). Shared by the
+// whole-image (serializeNode) and incremental (serializeDirty) writers, which differ only in `take`.
+function encodeRecord(
+  table: Table,
+  key: Uint8Array,
+  row: Row,
+  capacity: number,
+  take: () => number,
+  ovf: OverflowPageOut[],
+): Uint8Array {
+  const colTypes = table.columns.map((c) => c.type);
+  const [external] = planDispositions(colTypes, key, row, capacity);
   const w = new ByteWriter();
   w.u16(key.length);
   w.bytes(key);
   for (let i = 0; i < table.columns.length; i++) {
-    w.bytes(encodeValue(table.columns[i]!.type, row[i]!));
+    if (external[i]) {
+      const payload = valuePayload(table.columns[i]!.type, row[i]!);
+      const first = writeOverflowChain(payload, capacity, take, ovf);
+      w.u8(TAG_EXTERNAL);
+      w.u32(first);
+      w.u32(payload.length);
+    } else {
+      w.bytes(encodeValue(table.columns[i]!.type, row[i]!));
+    }
   }
   return w.toBytes();
+}
+
+// writeOverflowChain writes payload across a chain of overflow pages (capacity-byte slabs, in order),
+// allocating each page via `take` and linking it with nextPage (0 terminates). Returns the first page
+// index for the record's pointer. payload is always non-empty (only values larger than the pointer
+// spill — planDispositions).
+function writeOverflowChain(
+  payload: Uint8Array,
+  capacity: number,
+  take: () => number,
+  ovf: OverflowPageOut[],
+): number {
+  const n = Math.ceil(payload.length / capacity);
+  const indices: number[] = [];
+  for (let i = 0; i < n; i++) indices.push(take());
+  for (let j = 0; j < n; j++) {
+    const lo = j * capacity;
+    const hi = Math.min(lo + capacity, payload.length);
+    const nextPage = j + 1 < n ? indices[j + 1]! : 0;
+    ovf.push({ index: indices[j]!, itemCount: hi - lo, nextPage, payload: payload.subarray(lo, hi) });
+  }
+  return indices[0]!;
 }
 
 // tableEntryBytes builds one table's catalog entry (format.md).
@@ -351,9 +470,9 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   writeMeta(image, ps, 0, pageSize, txid, catRoot, pageCount);
   writeMeta(image, ps, 1, pageSize, txid, catRoot, pageCount);
 
-  // B-tree node pages.
+  // B-tree node + overflow pages.
   for (const bp of body) {
-    writePage(image, ps, bp.index, bp.pageType, bp.itemCount, 0, bp.payload);
+    writePage(image, ps, bp.index, bp.pageType, bp.itemCount, bp.nextPage, bp.payload);
   }
 
   // Catalog chain.
@@ -368,8 +487,9 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   return image;
 }
 
-// BodyPage is one serialized B-tree node awaiting write: its index, type, key count, payload.
-type BodyPage = { index: number; pageType: number; itemCount: number; payload: Uint8Array };
+// BodyPage is one serialized page awaiting write: its index, type, key count, chain link, payload.
+// nextPage is 0 for B-tree nodes and the chain link for overflow pages (large-values.md §12).
+type BodyPage = { index: number; pageType: number; itemCount: number; nextPage: number; payload: Uint8Array };
 
 // serializeNode serializes one node and its subtree post-order, appending each to `body`, and
 // returns this node's assigned page index and the next free index. A leaf's payload is its records;
@@ -402,14 +522,21 @@ function serializeNode(
     pageType = PAGE_INTERIOR;
     for (const cp of childPages) w.u32(cp);
   }
+  // Encode records, spilling over-large values to overflow pages allocated after this node's index
+  // (post-order traversal + column order → deterministic, golden-pinnable layout).
+  const ovf: OverflowPageOut[] = [];
+  const take = (): number => nextIndex++;
   for (let i = 0; i < n.keys.length; i++) {
-    w.bytes(encodeRecord(table, n.keys[i]!, n.vals[i]!));
+    w.bytes(encodeRecord(table, n.keys[i]!, n.vals[i]!, capacity, take, ovf));
   }
   const payload = w.toBytes();
   if (payload.length > capacity) {
     throw engineError("feature_not_supported", "a record larger than the per-row limit is not supported");
   }
-  body.push({ index, pageType, itemCount: n.keys.length, payload });
+  body.push({ index, pageType, itemCount: n.keys.length, nextPage: 0, payload });
+  for (const o of ovf) {
+    body.push({ index: o.index, pageType: PAGE_OVERFLOW, itemCount: o.itemCount, nextPage: o.nextPage, payload: o.payload });
+  }
   return { index, next: nextIndex };
 }
 
@@ -527,8 +654,12 @@ function serializeDirty(
     pageType = PAGE_INTERIOR;
     for (const cp of childPages) w.u32(cp);
   }
+  // Encode records, spilling over-large values to overflow pages drawn from the same allocator
+  // (free-list first, then high-water — large-values.md §12).
+  const ovf: OverflowPageOut[] = [];
+  const take = (): number => alloc.take();
   for (let i = 0; i < n.keys.length; i++) {
-    w.bytes(encodeRecord(table, n.keys[i]!, n.vals[i]!));
+    w.bytes(encodeRecord(table, n.keys[i]!, n.vals[i]!, capacity, take, ovf));
   }
   const payload = w.toBytes();
   if (payload.length > capacity) {
@@ -537,6 +668,9 @@ function serializeDirty(
   const index = alloc.take();
   n.page = index;
   pages.push({ index, bytes: makePage(ps, pageType, n.keys.length, 0, payload) });
+  for (const o of ovf) {
+    pages.push({ index: o.index, bytes: makePage(ps, PAGE_OVERFLOW, o.itemCount, o.nextPage, o.payload) });
+  }
   return index;
 }
 
@@ -574,8 +708,7 @@ export function loadDatabase(image: Uint8Array): Database {
       const hasPK = primaryKeyIndex(table) >= 0;
       snap.putTable(table, pageSize);
       if (root !== 0) {
-        const t = readTree(image, dv, pageSize, root, colTypes);
-        collectNodePages(t.node, reached);
+        const t = readTree(image, dv, pageSize, root, colTypes, reached);
         const store = snap.stores.get(table.name.toLowerCase())!;
         store.setTree(t.node, t.length);
         // No-PK keys are synthetic int64 rowids — advance the counter past the largest (the last
@@ -600,17 +733,35 @@ export function loadDatabase(image: Uint8Array): Database {
   return db;
 }
 
-// collectNodePages records the on-disk page index of node and every descendant (a loaded tree, all
-// pages set) into reached — the live set the free-list reconstruction subtracts from
-// [2, pageCount) (P6.2).
-function collectNodePages(n: PNode, reached: Set<number>): void {
-  reached.add(n.page);
-  // An OnDisk leaf contributes its page without being loaded — the free-list walk reuses the resident
-  // interior skeleton (pager.md §4); a resident child recurses.
-  for (const c of n.children) {
-    if (c.node !== null) collectNodePages(c.node, reached);
-    else reached.add(c.page);
+// anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
+function anySpillable(colTypes: ScalarType[]): boolean {
+  return colTypes.some(isSpillable);
+}
+
+// collectLeafOverflow walks a table's on-disk B-tree, reading each leaf and adding the overflow chain
+// pages its records reference to `reached` (large-values.md §12). Interior separators are skipped here
+// — readSkeletonNode already collected their chains. Used only for tables with spillable columns during
+// the paged-open free-list reconstruction; it reads (and transiently materializes) every leaf, the
+// deliberate cost of reconstruct-on-open reclamation for overflow.
+function collectLeafOverflow(paging: SharedPaging, pageIdx: number, colTypes: ScalarType[], reached: Set<number>): void {
+  const pg = parsePage(paging.readBlock(pageIdx));
+  if (pg.pageType === PAGE_LEAF) {
+    const fetch = (p: number): Uint8Array => paging.readBlock(p);
+    const cur = { pos: 0 };
+    for (let i = 0; i < pg.itemCount; i++) {
+      const { ovf } = decodeRecord(colTypes, pg.payload, cur, fetch);
+      for (const p of ovf) reached.add(p);
+    }
+    return;
   }
+  if (pg.pageType === PAGE_INTERIOR) {
+    const cur = { pos: 0 };
+    const cps: number[] = [];
+    for (let i = 0; i < pg.itemCount + 1; i++) cps.push(readU32(pg.payload, cur));
+    for (const cp of cps) collectLeafOverflow(paging, cp, colTypes, reached);
+    return;
+  }
+  throw engineError("data_corrupted", "expected a B-tree node page");
 }
 
 // loadDatabasePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
@@ -652,6 +803,12 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
       store.attachPaging(paging);
       if (root !== 0) {
         const t = readSkeleton(paging, root, colTypes, reached);
+        // The skeleton leaves leaves OnDisk (unread), so their records' overflow chains are invisible
+        // to the reachability walk above. For a table with spillable columns, read the leaves now to
+        // collect those live chains — else the free-list would reclaim still-referenced overflow pages
+        // (large-values.md §12; default open is this paged path). Dead chains still leak until the
+        // next open, matching the P6.2 orphan model.
+        if (anySpillable(colTypes)) collectLeafOverflow(paging, root, colTypes, reached);
         store.setTree(t.node, t.length);
         if (!hasPK && t.length > 0) {
           // No-PK rowid reconstruction faults the leaves to find the largest key; only for keyless
@@ -718,9 +875,12 @@ function readSkeletonNode(
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
     const weights: number[] = [];
+    const capacity = paging.pageSize() - PAGE_HEADER;
+    const fetch = (p: number): Uint8Array => paging.readBlock(p);
     for (let i = 0; i < n; i++) {
-      const { key, row } = decodeRecord(colTypes, pg.payload, cur);
-      weights.push(recordSize(colTypes, key, row));
+      const { key, row, ovf } = decodeRecord(colTypes, pg.payload, cur, fetch);
+      weights.push(recordSize(colTypes, key, row, capacity));
+      for (const p of ovf) reached.add(p);
       keys.push(key);
       vals.push(row);
     }
@@ -741,8 +901,12 @@ function readTree(
   ps: number,
   pageIdx: number,
   colTypes: ScalarType[],
+  reached: Set<number>,
 ): { node: PNode; length: number } {
+  reached.add(pageIdx);
+  const capacity = ps - PAGE_HEADER;
   const pg = readPage(image, dv, ps, pageIdx);
+  const fetch = (p: number): Uint8Array => pageBlock(image, ps, p);
   if (pg.pageType === PAGE_LEAF) {
     const n = pg.itemCount;
     const keys: Uint8Array[] = [];
@@ -750,8 +914,9 @@ function readTree(
     const weights: number[] = [];
     const cur = { pos: 0 };
     for (let i = 0; i < n; i++) {
-      const { key, row } = decodeRecord(colTypes, pg.payload, cur);
-      weights.push(recordSize(colTypes, key, row));
+      const { key, row, ovf } = decodeRecord(colTypes, pg.payload, cur, fetch);
+      weights.push(recordSize(colTypes, key, row, capacity));
+      for (const p of ovf) reached.add(p);
       keys.push(key);
       vals.push(row);
     }
@@ -764,7 +929,7 @@ function readTree(
     let total = 0;
     for (let i = 0; i < n + 1; i++) {
       const cp = readU32(pg.payload, cur);
-      const r = readTree(image, dv, ps, cp, colTypes);
+      const r = readTree(image, dv, ps, cp, colTypes, reached);
       // The in-memory load is fully resident (no pager to fault from); the demand-paged file load
       // (loadDatabasePaged) is a separate path that leaves leaf children OnDisk.
       children.push(residentRef(r.node));
@@ -774,8 +939,9 @@ function readTree(
     const vals: Row[] = [];
     const weights: number[] = [];
     for (let i = 0; i < n; i++) {
-      const { key, row } = decodeRecord(colTypes, pg.payload, cur);
-      weights.push(recordSize(colTypes, key, row));
+      const { key, row, ovf } = decodeRecord(colTypes, pg.payload, cur, fetch);
+      weights.push(recordSize(colTypes, key, row, capacity));
+      for (const p of ovf) reached.add(p);
       keys.push(key);
       vals.push(row);
     }
@@ -932,6 +1098,14 @@ function readPage(image: Uint8Array, dv: DataView, ps: number, index: number): P
   };
 }
 
+// pageBlock returns one page's full block, copied out of a whole image — the overflow-chain fetch for
+// the in-memory load path (readTree, large-values.md §12).
+function pageBlock(image: Uint8Array, ps: number, index: number): Uint8Array {
+  const off = index * ps;
+  if (off + ps > image.length) throw engineError("data_corrupted", "page index out of range");
+  return image.slice(off, off + ps);
+}
+
 // parsePage parses one standalone page block (header + payload). The single-block reader the
 // demand-paged loader and fault path use (a page read through the pager is exactly one block);
 // readPage slices it out of a whole image.
@@ -950,16 +1124,25 @@ function parsePage(block: Uint8Array): Page {
 // path (spec/design/pager.md §4; paging.ts faultLeaf). block is one page; page is its page id, stamped
 // on the node so a later incremental commit keeps it clean. Weights are recomputed from the value
 // codec (the exact size the writer used), so the loaded leaf is ready for further splits.
-export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ScalarType[]): PNode {
+// `fetch` reads an overflow page block by index (to materialize external values whose chains live
+// outside this leaf — large-values.md §12); the chain pages it visits are discarded here (the
+// free-list is reconstructed at open, not on a runtime fault).
+export function decodeLeafNode(
+  block: Uint8Array,
+  page: number,
+  colTypes: ScalarType[],
+  fetch: (page: number) => Uint8Array,
+): PNode {
   const pg = parsePage(block);
   if (pg.pageType !== PAGE_LEAF) throw engineError("data_corrupted", "demand-paged a non-leaf page");
+  const capacity = block.length - PAGE_HEADER;
   const keys: Uint8Array[] = [];
   const vals: Row[] = [];
   const weights: number[] = [];
   const cur = { pos: 0 };
   for (let i = 0; i < pg.itemCount; i++) {
-    const { key, row } = decodeRecord(colTypes, pg.payload, cur);
-    weights.push(recordSize(colTypes, key, row));
+    const { key, row } = decodeRecord(colTypes, pg.payload, cur, fetch);
+    weights.push(recordSize(colTypes, key, row, capacity));
     keys.push(key);
     vals.push(row);
   }
@@ -988,8 +1171,9 @@ function decodeTableEntry(buf: Uint8Array, cur: Cursor): { table: Table; root: n
       if (precision !== 0) decimal = { precision, scale };
     }
     // The default value follows the typmod, present iff flags bit2 (same value codec as rows).
-    // Absent → no bytes consumed (format.md).
-    const colDefault = (flags & 0b100) !== 0 ? readValue(ty, buf, cur) : null;
+    // Absent → no bytes consumed (format.md). A default is a small literal — never externalized —
+    // so no overflow reader is needed (a 0x02 tag here would be a corrupt catalog).
+    const colDefault = (flags & 0b100) !== 0 ? readValue(ty, buf, cur, null, []) : null;
     columns.push({
       name: cname,
       type: ty,
@@ -1003,60 +1187,121 @@ function decodeTableEntry(buf: Uint8Array, cur: Cursor): { table: Table; root: n
   return { table: { name, columns }, root };
 }
 
-function decodeRecord(colTypes: ScalarType[], buf: Uint8Array, cur: Cursor): { key: Uint8Array; row: Row } {
+// decodeRecord decodes one record {key, row} and the overflow chain pages any external value followed
+// (for the free-list reachability walk — large-values.md §12). `fetch` reads a page block by index,
+// used to follow overflow chains; null is only valid where no value can be external (a default).
+function decodeRecord(
+  colTypes: ScalarType[],
+  buf: Uint8Array,
+  cur: Cursor,
+  fetch: ((page: number) => Uint8Array) | null,
+): { key: Uint8Array; row: Row; ovf: number[] } {
   const keyLen = readU16(buf, cur);
   const key = take(buf, cur, keyLen).slice(); // copy out of the borrowed page slice
   const row: Row = new Array(colTypes.length);
+  const ovf: number[] = [];
   for (let i = 0; i < colTypes.length; i++) {
-    row[i] = readValue(colTypes[i]!, buf, cur);
+    row[i] = readValue(colTypes[i]!, buf, cur, fetch, ovf);
   }
-  return { key, row };
+  return { key, row, ovf };
 }
 
-// readValue reads one value via the value codec (inverse of encodeValue).
-function readValue(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
+// readValue reads one value via the value codec (inverse of encodeValue). The presence tag is read
+// first: 0x00 an inline body, 0x01 NULL, 0x02 an external pointer (u32 first_page + u32 len) whose
+// payload is gathered from the overflow chain via `fetch` and reconstructed by type (large-values.md
+// §12). Pages visited while following a chain are pushed to `ovfOut` for the free-list walk.
+function readValue(
+  ty: ScalarType,
+  buf: Uint8Array,
+  cur: Cursor,
+  fetch: ((page: number) => Uint8Array) | null,
+  ovfOut: number[],
+): Value {
   const tag = readU8(buf, cur);
-  if (tag === 0x00) {
-    if (isText(ty)) {
-      const n = readU16(buf, cur);
-      const bytes = take(buf, cur, n);
-      try {
-        return textValue(UTF8_DECODE.decode(bytes));
-      } catch {
-        throw engineError("data_corrupted", "non-UTF-8 text value");
-      }
-    }
-    if (isBool(ty)) {
-      const b = readU8(buf, cur);
-      if (b === 0x00) return boolValue(false);
-      if (b === 0x01) return boolValue(true);
-      throw engineError("data_corrupted", "invalid boolean value byte");
-    }
-    if (ty === "decimal") {
-      // flags (sign), u16 scale, u16 ndigits, then that many base-10^4 groups.
-      const flags = readU8(buf, cur);
-      const scale = readU16(buf, cur);
-      const ndigits = readU16(buf, cur);
-      const groups: number[] = new Array(ndigits);
-      for (let i = 0; i < ndigits; i++) groups[i] = readU16(buf, cur);
-      return decimalValue(Decimal.fromCodec((flags & 1) !== 0, scale, groups));
-    }
-    if (isBytea(ty)) {
-      const n = readU16(buf, cur);
-      // .slice() copies out of the page buffer so the value owns its bytes (no UTF-8 check).
-      return byteaValue(take(buf, cur, n).slice());
-    }
-    if (isUuid(ty)) {
-      // Fixed 16 raw bytes, no length prefix. Must branch before the integer path —
-      // decodeInt would sign-flip and widthBytes is 16 there too. .slice() copies out.
-      return uuidValue(take(buf, cur, 16).slice());
-    }
-    if (isTimestamp(ty)) return timestampValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
-    if (isTimestamptz(ty)) return timestamptzValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
-    return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
-  }
+  if (tag === 0x00) return readInlineBody(ty, buf, cur);
   if (tag === 0x01) return nullValue();
+  if (tag === TAG_EXTERNAL) {
+    const first = readU32(buf, cur);
+    const len = readU32(buf, cur);
+    if (fetch === null) throw engineError("data_corrupted", "external value with no overflow reader");
+    return valueFromPayload(ty, readOverflowChain(first, len, fetch, ovfOut));
+  }
   throw engineError("data_corrupted", "invalid value presence tag");
+}
+
+// readInlineBody reads the present-value body (after a 0x00 tag): a fixed-width integer, a u16 length
+// + UTF-8 bytes for text, a single bool-byte, the decimal body, etc. (format.md *Value codec*).
+function readInlineBody(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
+  if (isText(ty)) {
+    const n = readU16(buf, cur);
+    const bytes = take(buf, cur, n);
+    try {
+      return textValue(UTF8_DECODE.decode(bytes));
+    } catch {
+      throw engineError("data_corrupted", "non-UTF-8 text value");
+    }
+  }
+  if (isBool(ty)) {
+    const b = readU8(buf, cur);
+    if (b === 0x00) return boolValue(false);
+    if (b === 0x01) return boolValue(true);
+    throw engineError("data_corrupted", "invalid boolean value byte");
+  }
+  if (ty === "decimal") return decodeDecimalBody(buf, cur);
+  if (isBytea(ty)) {
+    const n = readU16(buf, cur);
+    // .slice() copies out of the page buffer so the value owns its bytes (no UTF-8 check).
+    return byteaValue(take(buf, cur, n).slice());
+  }
+  if (isUuid(ty)) {
+    // Fixed 16 raw bytes, no length prefix. Must branch before the integer path —
+    // decodeInt would sign-flip and widthBytes is 16 there too. .slice() copies out.
+    return uuidValue(take(buf, cur, 16).slice());
+  }
+  if (isTimestamp(ty)) return timestampValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
+  if (isTimestamptz(ty)) return timestamptzValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
+  return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
+}
+
+// decodeDecimalBody decodes a decimal value's body — flags (sign), u16 scale, u16 ndigits, then that
+// many base-10^4 groups (format.md). Shared by the inline path and by external reconstruction (a
+// spilled decimal's chain payload is exactly this body — large-values.md §12).
+function decodeDecimalBody(buf: Uint8Array, cur: Cursor): Value {
+  const flags = readU8(buf, cur);
+  const scale = readU16(buf, cur);
+  const ndigits = readU16(buf, cur);
+  const groups: number[] = new Array(ndigits);
+  for (let i = 0; i < ndigits; i++) groups[i] = readU16(buf, cur);
+  return decimalValue(Decimal.fromCodec((flags & 1) !== 0, scale, groups));
+}
+
+// readOverflowChain gathers `length` bytes of an external value's payload by following its overflow
+// chain from `first` (large-values.md §12): each page is page_type 4, carries itemCount payload bytes,
+// and chains via nextPage (0 terminates). Every visited page is pushed to `visited` (the free-list
+// reachability walk). `fetch` returns a page's full block by index.
+function readOverflowChain(
+  first: number,
+  length: number,
+  fetch: (page: number) => Uint8Array,
+  visited: number[],
+): Uint8Array {
+  const out = new Uint8Array(length);
+  let got = 0;
+  let p = first;
+  while (got < length) {
+    if (p === 0) throw engineError("data_corrupted", "overflow chain ended before the value length");
+    visited.push(p);
+    const pg = parsePage(fetch(p));
+    if (pg.pageType !== PAGE_OVERFLOW) throw engineError("data_corrupted", "expected an overflow page");
+    const n = pg.itemCount;
+    if (n === 0 || n > pg.payload.length || got + n > length) {
+      throw engineError("data_corrupted", "overflow page slab out of range");
+    }
+    out.set(pg.payload.subarray(0, n), got);
+    got += n;
+    p = pg.nextPage;
+  }
+  return out;
 }
 
 // --- bounds-checked big-endian readers over a payload cursor ---

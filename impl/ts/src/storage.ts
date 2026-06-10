@@ -90,9 +90,11 @@ export class TableStore {
     return this.paging === null ? null : new PagedSource(this.paging, this.colTypes);
   }
 
-  // weight is this row's on-disk record size — the weight the page-backed B-tree splits on.
+  // weight is this row's on-disk record size — the weight the page-backed B-tree splits on. Accounts
+  // for out-of-line spill at cap (an externalized value weighs its pointer, not its full body —
+  // large-values.md §12), so split points match the serialized pages.
   private weight(key: Uint8Array, row: Row): number {
-    return recordSize(this.colTypes, key, row);
+    return recordSize(this.colTypes, key, row, this.cap);
   }
 
   // insert adds a row under its encoded key. Returns false if the key already exists

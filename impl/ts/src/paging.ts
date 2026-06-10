@@ -48,7 +48,10 @@ export class SharedPaging {
   // evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global page id
   // with a caller-supplied decoder is consistent (pager.md §4).
   faultLeaf(page: number, colTypes: ScalarType[]): PNode {
-    return this.pool.getOrLoad(page, () => decodeLeafNode(this.pager.readBlock(page), page, colTypes));
+    // Materialize any external value by following its overflow chain through the pager (the leaf
+    // block holds only the pointer — spec/design/large-values.md §12).
+    const fetch = (p: number): Uint8Array => this.pager.readBlock(p);
+    return this.pool.getOrLoad(page, () => decodeLeafNode(this.pager.readBlock(page), page, colTypes, fetch));
   }
 
   // readBlock reads one page through the pager — the demand-paged loader reads the meta, catalog, and
