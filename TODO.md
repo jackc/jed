@@ -351,7 +351,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `decimal-order-preserving` key encoding is authored in `encoding.md §2.5` but unexercised
       — decimal PK is rejected `0A000`); scientific `e`-notation literals (`1.5e3`); negative /
       `s>p` scale typmods (PG 15+); `round(x,n)` and other decimal functions; raising the
-      1000-digit / scale-1000 cap once over-page values (overflow pages / TOAST) land (Phase 6).
+      1000-digit / scale-1000 cap once over-page values land (overflow pages / TOAST —
+      [spec/design/large-values.md](spec/design/large-values.md), Phase 6).
 - [x] **`timestamp` / `timestamptz`** — done & committed across Rust/Go/TS (`1ee7027`). The
       PostgreSQL **instant** model (not the SQL-standard offset-bearing one): `timestamp` is a
       zoneless wall clock, `timestamptz` a UTC instant whose input offset normalizes to UTC then
@@ -806,12 +807,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       exceeded (external merge sort, grace hash join), so a query over larger-than-RAM data
       never materializes its whole input/output in memory. Pull-based row iteration is the
       enabler. _(size: XL; deps: paged storage; §9/§13)_
-- [ ] **Compression of large values (LZ4).** Transparently compress large
-      `text`/`bytea`/`json` values at the storage layer — likely **LZ4** (fast, streaming,
-      cross-language). Pairs with the overflow-page path (a value larger than one page
-      currently trips the `0A000` oversized-item narrowing — types.md §11, format.md). The
-      compression library is a **third-party dependency → gated on CLAUDE.md §14** (human
-      confirmation; must preserve cross-core byte-identity). _(size: L; §9/§14)_
+- [ ] **Large values — overflow pages + compression (TOAST-equivalent).** Designed in
+      [spec/design/large-values.md](spec/design/large-values.md). Lift the `RECORD_MAX` / `u16`
+      oversized-item ceilings (`0A000`) by pushing large `text`/`bytea`/`json`/`decimal` values
+      **out-of-line onto an overflow-page chain**, optionally **compressed** first (a
+      deterministic hand-rolled **LZ4-block** codec). **Build order: overflow first (Slice A),
+      compression second (Slice B)** — both behind one `format_version` 3 design (reserve the
+      compressed form codes in A so B is additive). The compressor is hand-rolled per core (a
+      library fails §8 cross-core byte-identity — large-values.md §6), so the feature needs **no**
+      third-party dependency; any later proposal is gated on CLAUDE.md §14. Unblocks the `decimal`
+      1000-digit cap and the `json`/`array` headline types. _(size: L→XL; deps: B-tree pages
+      [P6.1] ✓; §9/§13/§14)_
 - [ ] **Crash-recovery hardening** — torn-meta fixtures exist; expand durability/recovery
       tests. WAL is deferred (COW + root-swap gives atomicity without one). _(size: M; §9)_
 

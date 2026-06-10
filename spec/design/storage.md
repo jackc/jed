@@ -219,12 +219,15 @@ sits so the options stay open (CLAUDE.md §9).
   needed. The crypto comes from a **vetted library, never hand-rolled** (CLAUDE.md §14). The
   present requirement is only that the format and seam not foreclose it — concretely, don't
   bake in assumptions that page bytes are plaintext-comparable on disk.
-- **Compression of large values** — kept open, not built (CLAUDE.md §9). Large
-  `text`/`bytea`/`json` values may be compressed (likely **LZ4**) before they reach a page,
-  pairing with the deferred overflow-page path — a value larger than one page currently
-  trips the `0A000` oversized-item narrowing ([types.md §11](types.md),
-  [../fileformat/format.md](../fileformat/format.md)). Any compression library is a
-  third-party dependency, added under CLAUDE.md §14.
+- **Overflow pages + compression of large values** — kept open, not built (CLAUDE.md §9);
+  **designed in [large-values.md](large-values.md)** (the TOAST-equivalent subsystem). A value
+  that pushes a record over `RECORD_MAX` currently trips the `0A000` oversized-item narrowing
+  ([types.md §11](types.md), [../fileformat/format.md](../fileformat/format.md)); the design
+  lifts it by pushing large `text`/`bytea`/`json` values **out-of-line onto an overflow-page
+  chain**, optionally **compressed** first (likely **LZ4**). Build order is **overflow first,
+  compression second**, behind one `format_version` 3 design. The compressor is **hand-rolled
+  per core** (a library cannot satisfy the cross-core byte-identity of §8 — large-values.md §6),
+  so the feature needs **no** third-party dependency; any later proposal is gated on CLAUDE.md §14.
 - **Cost unit for storage reads** — ✅ the store is now a page-backed B-tree, so the
   cost-accounting seam (CLAUDE.md §13, [cost.md](cost.md)) meters a scan with **two** coexisting
   units: `storage_row_read` (one row read from a store during a scan) **and** `page_read` (one

@@ -354,7 +354,7 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   hotspot), comparison + casts + storage + arithmetic. Deferred sub-features: decimal in a key
   (`0A000`; the order-preserving encoding is authored, [encoding.md](encoding.md) §2.5),
   scientific `e`-notation literals, negative/over-precision scale typmods, and raising the
-  1000-digit cap once over-page values land.
+  1000-digit cap once over-page values land ([large-values.md](large-values.md)).
 - **`bytea`** — ✅ landed as the fourth storable non-integer scalar — variable-width raw bytes,
   unsigned byte-order comparison (§13). Its deferred sub-features (the traditional escape input
   format, bytea⇄other casts, binary functions, and bytea in keys) are enumerated in §13.
@@ -432,7 +432,7 @@ files it.
 **Practical size note.** A text value is unbounded by type, but a single stored value (or row)
 larger than one page trips the existing whole-image `feature_not_supported` (`0A000`) narrowing
 (format.md "Oversized item") — with integers that was unreachable; with text it becomes a real,
-documented limit until overflow pages land.
+documented limit until overflow pages land ([large-values.md](large-values.md)).
 
 ## 12. The decimal type
 

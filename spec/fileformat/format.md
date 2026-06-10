@@ -44,8 +44,8 @@ item P6.3).
 **reconstructed on open** (see *Reclamation* below), so a file no longer grows without bound
 across its lifetime (P6.1 alone *leaked* every page an old root dropped). **Still deferred, not
 foreclosed** (later Phase-6 items): continuous *within-session* reclamation + on-disk free-list
-persistence (P6.2 follow-ons), demand paging / a buffer pool, overflow pages for over-large
-values, and compression.
+persistence (P6.2 follow-ons), demand paging / a buffer pool, and **overflow pages +
+compression** for over-large values (designed in [../design/large-values.md](../design/large-values.md)).
 
 ## Conventions
 
@@ -243,7 +243,8 @@ the quantity the split/merge rules below measure.
 **`RECORD_MAX`.** A single record's on-disk size must be ≤ `RECORD_MAX = (C-12)/2` (floor); a
 larger row is a write-side `feature_not_supported` (**`0A000`**). This is **tighter than v1's
 ≤ `C`** rule, and it is what makes every node split clean (see *Why the record cap* below); it
-is lifted later by overflow pages (Phase 6). At the 8192 default, `RECORD_MAX = 4084`; the
+is lifted later by overflow pages ([../design/large-values.md](../design/large-values.md), Phase 6).
+At the 8192 default, `RECORD_MAX = 4084`; the
 256-byte fixtures cap a record at 116 bytes (every fixture row is far smaller).
 
 ### Leaf node (`page_type = 2`)
