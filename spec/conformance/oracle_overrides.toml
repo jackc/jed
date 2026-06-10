@@ -1,0 +1,37 @@
+# Oracle-import override sidecar (CLAUDE.md §1/§7/§8; scripts/oracle_import.rb).
+#
+# PostgreSQL is jed's behavioral DEFAULT, not a compatibility target: jed deliberately diverges
+# where the strict type system (§4) or a documented narrowing demands it. This file is the
+# machine-checked ledger of those divergences. When `oracle_import.rb --check` finds jed's
+# committed expected output disagreeing with the live PG oracle, a matching entry here marks the
+# divergence INTENTIONAL — the importer keeps jed's answer and stays silent. A disagreement with
+# NO entry is a warning ("add an override"), so the ledger cannot silently fall out of date.
+#
+#   file    path suffix of the .test (e.g. "types/decimal.test")
+#   sql     the record's SQL, matched after whitespace-normalization
+#   reason  why jed departs from PostgreSQL here
+
+[[override]]
+file = "types/decimal.test"
+sql = "SELECT id FROM c WHERE d = '2.5'"
+reason = "jed: decimal vs text is not comparable (42804). PG implicitly coerces the text literal to numeric and returns a row. The strict type system (§4) rejects the cross-family comparison."
+
+[[override]]
+file = "types/decimal.test"
+sql = "INSERT INTO c VALUES (2, 1.5, 9.9)"
+reason = "jed: storing a decimal literal into an integer column is an explicit-CAST-only operation (42804), stricter than PG, which assignment-casts 1.5 -> 2 by rounding. (decimal.md)"
+
+[[override]]
+file = "types/decimal.test"
+sql = "CREATE TABLE bad3 (x numeric(5,7))"
+reason = "jed: scale > precision is an invalid typmod (22023). PG 18 accepts numeric(5,7) (it allows scale outside [0,precision]). Documented PG-version-sensitive divergence."
+
+[[override]]
+file = "types/decimal.test"
+sql = "CREATE TABLE bad4 (x int32(5))"
+reason = "jed: a type modifier on a non-decimal type is unsupported this slice (0A000). PG rejects `integer(5)` as a syntax error (42601) — both reject, different code/class."
+
+[[override]]
+file = "types/decimal.test"
+sql = "CREATE TABLE bad5 (k numeric PRIMARY KEY)"
+reason = "jed: a decimal PRIMARY KEY is rejected this slice (0A000), a documented narrowing (like text PK). PG allows a numeric primary key."

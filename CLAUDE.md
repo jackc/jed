@@ -391,7 +391,10 @@ The design is optimized for AI agents even more than for humans. In practice:
 - **The conformance corpus is the contract.** Implement a feature as "make these corpus
   entries pass." A feature = one SQL construct, parsed + planned + executed + tested, as
   a **vertical slice**. That is the unit of agent work and the unit of cross-language
-  porting.
+  porting. When a slice touches the PostgreSQL-comparable surface, oracle-check its rows
+  (`rake corpus:check`) and record any deliberate PG divergence in the override ledger; when it
+  adds a query optimization, add a metamorphic (NoREC) relation so the sweep keeps pace —
+  neither grows on its own (`spec/design/conformance.md` §5/§8).
 - **Determinism everywhere** — deterministic results (exact multiset, values, types, errors,
   cost), deterministic error messages, no wall-clock nondeterminism. **Row order is
   deterministic iff `ORDER BY` is present** (§8): without it the order is unspecified (the

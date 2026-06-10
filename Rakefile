@@ -200,6 +200,46 @@ task :codegen do
   abort "codegen failed for #{failures.join(', ')}" unless failures.empty?
 end
 
+# corpus — the Phase-8 testing tools (CLAUDE.md §7). These talk to the LIVE `db` PostgreSQL
+# service, never the source checkout, so they do NOT trip the §12 reference-provisioning gate.
+# psql-only (no `pg` gem): no §14 dependency decision.
+namespace :corpus do
+  desc "Check a .test's expected output against the live PostgreSQL oracle (no write)"
+  task :check, [:file] do |_, args|
+    file = args.fetch(:file) { abort "usage: rake 'corpus:check[path/to/file.test]'" }
+    sh RbConfig.ruby, "scripts/oracle_import.rb", "--check", file
+  end
+
+  desc "Fill a .test's expected output from the live PostgreSQL oracle (writes the file)"
+  task :import, [:file] do |_, args|
+    file = args.fetch(:file) { abort "usage: rake 'corpus:import[path/to/file.test]'" }
+    sh RbConfig.ruby, "scripts/oracle_import.rb", file
+  end
+
+  desc "Generate one metamorphic NoREC seed (SQLancer-style) and run it on Go + TS"
+  task :norec, [:seed] do |_, args|
+    sh RbConfig.ruby, "scripts/norec_gen.rb", *(args[:seed] ? [args[:seed]] : [])
+  end
+
+  # The CI-style metamorphic check: a fixed, reproducible sweep of seeds 1..N (deterministic, so
+  # the generated tests are the same every run) generated into suites/metamorphic, run ONCE per
+  # core, and removed. Exits non-zero if any (seed, core) disagrees — `sh` turns that into a task
+  # failure. Runs all THREE cores, so each seed is checked metamorphically (optimized vs full
+  # scan agree) AND differentially (the cores agree). Default N=20 (= 100 metamorphic pairs/core).
+  desc "CI sweep: N reproducible NoREC seeds (default 20) on all three cores; fails on any divergence"
+  task :norec_sweep, [:count] do |_, args|
+    sh RbConfig.ruby, "scripts/norec_gen.rb", "--sweep", (args[:count] || "20")
+  end
+end
+
+# ci — the aggregate gate. Chains the toolchain-light spec checks, the formatter gate, and the
+# metamorphic sweep, so one command reproduces what CI enforces. Each is `sh`/task-failure
+# propagating, so `rake ci` exits non-zero on the first failure.
+desc "CI gate: spec data checks + core formatting + the NoREC metamorphic sweep"
+task ci: %w[verify fmt] do
+  Rake::Task["corpus:norec_sweep"].invoke
+end
+
 namespace :references do
   desc "Clone/refresh reference mirrors on persist and check out worktrees into references/"
   task :setup do

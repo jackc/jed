@@ -167,14 +167,26 @@ Every corpus entry MUST obey:
 
 ## 5. Bootstrapping policy
 
-- The current corpus is **hand-authored.** Integer semantics are small and fully known, so
-  the expected output is written directly and reviewed as the contract.
-- **Differential bootstrapping** against PostgreSQL/SQLite oracles (CLAUDE.md §7) is
-  deferred and optional. When used, where our semantics intentionally diverge from the
-  oracle we override the expected output by hand and document why.
-- **Never auto-provision references or run heavy oracles** (CLAUDE.md §12). Provisioning
-  the reference checkouts or running a bulk oracle import is an explicit, user-initiated
-  step.
+- The corpus is **predominantly hand-authored.** Integer semantics are small and fully
+  known, so the expected output is written directly and reviewed as the contract.
+- **Oracle-import** against the live PostgreSQL service is **available** (`scripts/oracle_import.rb`;
+  `rake corpus:import[file]` fills a `.test`'s expected rows/error codes from PG, `rake
+  corpus:check[file]` re-derives and diffs without writing). It talks **only to the running
+  `db` service**, never the source checkout, so it does **not** trip the §12
+  reference-provisioning gate, and it is **psql-only** (no `pg` gem — no §14 dependency). It is
+  an authoring aid + a standing drift check, **not** a query generator (that is the metamorphic
+  generator, §8). It cannot derive `# cost:` (PG has no notion of jed's cost units), so cost
+  assertions stay hand-authored.
+- **Intentional divergences are a machine-checked ledger.** PostgreSQL is the *default*, not a
+  compatibility target (CLAUDE.md §1): where jed deliberately differs — the strict type system,
+  a documented narrowing — the divergence is recorded in
+  [oracle_overrides.toml](../conformance/oracle_overrides.toml) with a reason. `corpus:check`
+  stays silent on a divergence that has an entry and **warns ("add an override") on one that
+  does not**, so the ledger cannot fall out of date. When you add a `.test` on the
+  PG-comparable surface, run `corpus:check` on it and register any divergence in the sidecar.
+- **Never auto-provision references or run heavy oracles** (CLAUDE.md §12). The *source*
+  checkouts and any bulk import remain explicit, user-initiated steps; the live-`db` oracle
+  above is the always-available path that needs no provisioning.
 
 ## 6. Running the corpus
 
@@ -200,3 +212,42 @@ profile's capabilities passes. Harnesses arrive with the first vertical slice
   deferred (types.md §10).
 - **Render-tag breadth** — `I`, `B`, `T` (text), and `D` (decimal) are in use; `R` (binary
   float) stays reserved and unused until a float type exists, if ever (CLAUDE.md §8).
+
+## 8. Metamorphic generator (SQLancer-style) — and the obligation to grow it
+
+[scripts/norec_gen.rb](../../scripts/norec_gen.rb) generates self-checking **NoREC**
+(Non-optimizing Reference Engine Construction) tests: for a predicate it emits an *optimized*
+query and a *semantically-equivalent non-optimizable* rewrite that must return identical rows.
+jed's planner pushes a predicate to a B-tree seek/range only when the primary key appears as a
+**bare column** (`detect_pk_bound`), so `id = K` is pushed down while `id + 0 = K` (a
+`BinaryOp`) full-scans — two different code paths that must agree. Expected rows are known **by
+construction** from the generated data, so no oracle (PG or otherwise) is consulted. `rake
+corpus:norec_sweep` runs a fixed, reproducible sweep (seeds 1..N) on **all three cores**, so
+each test is checked **metamorphically** (the two paths agree) *and* **differentially** (the
+cores agree). It is in the `rake ci` gate.
+
+**Why this catches what the differential cores cannot.** Running every `.test` on Rust/Go/TS
+catches the cores *disagreeing*; it is blind to a bug **all three share**. A metamorphic
+relation is an independent oracle — it can fail even when all cores agree.
+
+**The growth obligation (this is load-bearing — do not let it ossify).** The sweep covers only
+the query shapes the generator **emits**. It does **not** discover new optimizations on its own,
+and **adding seeds does not add feature coverage** — a seed only varies the data; coverage grows
+only when a new metamorphic *relation* is added to the generator. So: **when you land a query
+optimization or a new evaluable query shape, add a NoREC relation for it** (an optimized form +
+a rewrite the planner cannot optimize), in the same change. A passing sweep that silently tests
+only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent caps").
+
+- **Covered today:** point-lookup (`pk = K`) and range (`pk BETWEEN a AND b`) pushdown on an
+  integer primary key.
+- **NOT yet covered (needs a new relation):** `LIMIT` short-circuit, join pushdown, correlated
+  pushdown, and any future index / DISTINCT / aggregate pushdown. Each is an existing or future
+  optimization the sweep currently does **not** exercise.
+
+**Reducing a discovered failure.** Generation is seeded, so a failure reproduces deterministically
+(CLAUDE.md §10); reduce it to a minimal `.test` and commit it to the corpus as a normal regression
+entry. The fuzzer is discovery; the committed `.test` is the durable artifact.
+
+Further SQLancer oracles — **TLP** (ternary-logic partitioning, well-suited to jed's 3-valued
+NULL + aggregates) and **PQS** (pivoted query synthesis, needs an in-harness expression
+evaluator) — and an automatic reducer remain open (TODO.md Phase 8).

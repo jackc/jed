@@ -854,14 +854,29 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > Cross-cutting; raises the honesty/coverage ceiling. Some pairs with earlier phases.
 
 - [ ] **Differential-testing harness** vs PostgreSQL/SQLite oracles to bootstrap corpus
-      cheaply (§7). Gated on **user-initiated** reference provisioning (§12) — never
-      auto-provision. Valuable as soon as `text`/`decimal` widen the surface. _(size: L; §7)_
-- [ ] **SQLancer-style metamorphic / generative testing** — finds logic bugs by
-      synthesizing queries with known-correct answers. Explicitly *later* (§7). _(size: L; §7)_
+      cheaply (§7). **PARTIAL** — the **live-`db` oracle-import** tool is built
+      (`scripts/oracle_import.rb`; `rake corpus:import/check`; override ledger
+      `spec/conformance/oracle_overrides.toml`; conformance.md §5) and needs no §12 provisioning.
+      *Remaining:* the **bulk** bootstrap from the *source* checkouts (gated on **user-initiated**
+      reference provisioning §12 — never auto-provision) and a SQLite oracle. _(size: M remaining; §7)_
+- [ ] **SQLancer-style metamorphic / generative testing** — finds logic bugs by synthesizing
+      queries with known-correct answers. **PARTIAL** — the **NoREC** slice is built
+      (`scripts/norec_gen.rb`; `rake corpus:norec_sweep`, in `rake ci`; conformance.md §8): a
+      pushdown predicate vs a non-optimizable rewrite must agree, run on all three cores. *Remaining:*
+      **TLP** (ternary-logic partitioning — suits the 3-valued NULL + aggregate surface), **PQS**
+      (pivoted query synthesis — needs an in-harness expression evaluator), an automatic **reducer**,
+      and **broader NoREC relations** (see the growth obligation below). _(size: L remaining; §7)_
 - [ ] **Result-type assertion directive** — assert a column's precise declared type
       (`int16` vs `int32`) beyond the `I`/`T`/`R` render tag (deferred, conformance.md §7).
       _(size: S; §7)_
-- [ ] **Corpus growth** — keep adding `.test` coverage as each feature lands (ongoing).
+- [ ] **Corpus growth** — keep adding `.test` coverage as each feature lands (ongoing). Two
+      **standing obligations** when a feature lands (conformance.md §5/§8): (a) on the
+      PG-comparable surface, run `rake corpus:check` on the new `.test` and register any
+      intentional divergence in the override ledger; (b) **when you add a query optimization or a
+      new evaluable query shape, add a NoREC relation for it** to `norec_gen.rb` — the sweep does
+      **not** discover new optimizations, and adding *seeds* does not add coverage. NoREC covers
+      point-lookup + range pushdown on an int PK today; `LIMIT` short-circuit, joins, and future
+      index/DISTINCT/aggregate pushdown are **not yet** covered.
 
 ---
 

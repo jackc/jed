@@ -12,8 +12,14 @@ corpus entries pass"; the corpus *is* the contract, not an afterthought.
   engines — our exact problem.
 - **Structured-error matching** — `statement error <sqlstate>` matches on the error's
   SQLSTATE code (from [../errors/registry.toml](../errors/registry.toml)), never on prose.
-- **Bootstrap via differential testing** — hand-authored for now; PostgreSQL/SQLite oracles
-  are a deferred, user-initiated option (never auto-run — CLAUDE.md §12).
+- **Bootstrap via differential testing** — predominantly hand-authored, with two Phase-8 tools
+  (see [../design/conformance.md](../design/conformance.md) §5/§8): **oracle-import**
+  (`rake corpus:import/check[file]`) fills/re-checks a `.test`'s expected output from the live
+  `db` PostgreSQL service — never the source checkout, so no §12 trip — and records intentional
+  jed-vs-PG divergences in [oracle_overrides.toml](oracle_overrides.toml); and the
+  **metamorphic generator** (`rake corpus:norec_sweep`) generates self-checking NoREC pushdown
+  tests run on all three cores. The *source* checkouts and bulk imports stay deferred and
+  user-initiated (never auto-run — CLAUDE.md §12).
 - **Three-axis taxonomy** — **suites** (this directory tree) organize tests by feature
   area; **capabilities** (dotted flags an impl declares + a test `# requires:`) gate which
   tests run; **profiles** (named capability bundles) are the conformance levels an impl
@@ -26,6 +32,9 @@ corpus entries pass"; the corpus *is* the contract, not an afterthought.
 |---|---|
 | [manifest.toml](manifest.toml) | Capability + profile definitions (data). |
 | [verify.rb](verify.rb) | Taxonomy checker (run via `rake verify`): validates manifest ↔ corpus coherence. |
+| [oracle_overrides.toml](oracle_overrides.toml) | Machine-checked ledger of intentional jed-vs-PostgreSQL divergences (consumed by `corpus:check`). |
+| [../../scripts/oracle_import.rb](../../scripts/oracle_import.rb) | Oracle-import harness — fills/checks expected output from the live `db` (`rake corpus:import/check`). |
+| [../../scripts/norec_gen.rb](../../scripts/norec_gen.rb) | Metamorphic NoREC generator + sweep (`rake corpus:norec[_sweep]`); writes a transient `suites/metamorphic/` tier it cleans up. |
 | [suites/query/](suites/query/) | CREATE/INSERT/SELECT/`WHERE pk =`/`ORDER BY`. |
 | [suites/null/](suites/null/) | NULL storage, `IS [NOT] NULL`, three-valued logic. |
 | [suites/types/](suites/types/) | Type behavior — integer overflow trap, literal typing. |
@@ -37,5 +46,8 @@ Each implementation under [../../impl/](../../impl/) ships a thin harness that r
 manifest, runs each `.test` whose `# requires:` capabilities it declares, and reports the
 profiles it meets. Harnesses arrive with the first vertical slice (CLAUDE.md §11 step 5).
 
-> Status: format + taxonomy + corpus authored (6 suites; `core`/`mutation`/`casts`/
-> `comparison`/`expression` profiles). All three cores pass the corpus.
+> Status: format + taxonomy + corpus authored (suites across query/null/types/cast/compare/
+> expr/ddl/dml/mutation/setops/transactions/resource/subquery). All three cores pass the
+> corpus. Phase-8 tooling landed: oracle-import (`corpus:check/import`) + override ledger, and
+> the metamorphic NoREC sweep (`corpus:norec_sweep`, in `rake ci`). See
+> [../design/conformance.md](../design/conformance.md) §5/§8.
