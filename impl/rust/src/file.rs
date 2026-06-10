@@ -481,4 +481,71 @@ mod tests {
         assert_eq!(err.state, SqlState::DataCorrupted);
         assert!(err.message.contains("page size"), "{}", err.message);
     }
+
+    /// Large values (spec/design/large-values.md §12) through the **default demand-paged** file path:
+    /// a value too big for a record spills to an overflow chain; the paged read faults the leaf and
+    /// follows the chain to materialize it exactly; and after a delete + reopen the dead chain's pages
+    /// are reclaimed, so re-inserting a large value reuses them rather than growing the file.
+    #[test]
+    fn external_value_through_paged_file_and_reclaims() {
+        let path = tmp("jed_large_values.jed");
+        let _ = std::fs::remove_file(&path);
+        let big = "Z".repeat(1500); // ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
+
+        {
+            let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)").unwrap();
+            execute(&mut db, &format!("INSERT INTO t VALUES (1, '{big}')")).unwrap();
+            execute(&mut db, "INSERT INTO t VALUES (2, 'small')").unwrap();
+            db.close().unwrap();
+        }
+
+        // Reopen demand-paged (the default `open`): the big value reconstructs exactly through the
+        // pager-backed chain read.
+        {
+            let db = Database::open(&path).unwrap();
+            let rows = db.rows_in_key_order("t").unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][1], Value::Text(big.clone()));
+            assert_eq!(rows[1][1], Value::Text("small".to_string()));
+            db.close().unwrap();
+        }
+
+        // Delete the big row; its overflow chain is orphaned (leaked this session).
+        {
+            let mut db = Database::open(&path).unwrap();
+            execute(&mut db, "DELETE FROM t WHERE id = 1").unwrap();
+            db.close().unwrap();
+        }
+
+        // Reopen: the free-list reconstruction collects only *live* chains, so the dead chain's pages
+        // are now free. Re-inserting a large value reuses them — the high-water grows by a handful of
+        // pages, not by a whole fresh chain (~7 pages).
+        let (before, after) = {
+            let mut db = Database::open(&path).unwrap();
+            let before = db.page_count;
+            execute(&mut db, &format!("INSERT INTO t VALUES (3, '{big}')")).unwrap();
+            let after = db.page_count;
+            db.close().unwrap();
+            (before, after)
+        };
+        assert!(
+            after <= before + 3,
+            "re-insert reused reclaimed overflow pages (page_count {before} → {after})"
+        );
+
+        // Final correctness through the paged path.
+        {
+            let db = Database::open(&path).unwrap();
+            let rows = db.rows_in_key_order("t").unwrap();
+            assert_eq!(rows.len(), 2);
+            let r3 = rows
+                .iter()
+                .find(|r| r[0] == Value::Int(3))
+                .expect("the re-inserted big row");
+            assert_eq!(r3[1], Value::Text(big));
+            db.close().unwrap();
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }

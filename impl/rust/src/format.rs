@@ -44,6 +44,18 @@ const PAGE_CATALOG: u8 = 1;
 const PAGE_LEAF: u8 = 2;
 /// `page_type` for a B-tree interior node.
 const PAGE_INTERIOR: u8 = 3;
+/// `page_type` for an overflow page — a slab of an out-of-line (external) value's payload, chained
+/// by `next_page` (spec/design/large-values.md §4/§12). Large values spill here so their record
+/// stays ≤ `RECORD_MAX`.
+const PAGE_OVERFLOW: u8 = 4;
+
+/// Value-codec presence tag for a present **external** value: the body is a fixed-size pointer
+/// (`u32 first_page` + `u32 payload_len`) into an overflow chain, not the value itself
+/// (spec/design/large-values.md §12). `0x00` present-inline / `0x01` NULL are unchanged; `0x03`
+/// (inline-compressed) and `0x04` (external-compressed) are reserved for Slice B.
+const TAG_EXTERNAL: u8 = 0x02;
+/// On-disk size of an external-value pointer in a record: `tag(1) + first_page(u32) + len(u32)`.
+const EXTERNAL_PTR_LEN: usize = 1 + 4 + 4;
 /// Catalog root page index of a *fresh empty* database (pages 0,1 are the meta slots). The catalog
 /// root is **relocatable** thereafter — a reader follows `meta.root_page`, never assumes `2`.
 const ROOT_PAGE: u32 = 2;
@@ -155,16 +167,95 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
     }
 }
 
-/// The on-disk size of a record (`key_len(u16) | key | each column value`) — the **weight** the
-/// page-backed B-tree splits on (spec/fileformat/format.md). It must equal the length
-/// `encode_record` produces, so the in-memory node boundaries match the serialized page boundaries;
-/// computed directly from the value codec to keep the two in lockstep.
-pub(crate) fn record_size(col_types: &[ScalarType], key: &[u8], row: &Row) -> usize {
-    let mut n = 2 + key.len();
-    for (ty, v) in col_types.iter().zip(row.iter()) {
-        n += encode_value(*ty, v).len();
+/// Whether a value of this type can spill out-of-line (a variable-length type). Fixed-width types
+/// (`int*`/`boolean`/`uuid`/`timestamp*`) are tiny and always stay inline
+/// (spec/design/large-values.md §12).
+fn is_spillable(ty: ScalarType) -> bool {
+    ty.is_text() || ty.is_bytea() || ty.is_decimal()
+}
+
+/// The largest a single record may serialize to and still satisfy the B-tree split contract —
+/// `RECORD_MAX = (C-12)/2` where `C = cap` is the page payload (spec/fileformat/format.md
+/// "Why the record cap"). The spill planner reduces a record to ≤ this by externalizing values.
+fn record_max(cap: usize) -> usize {
+    cap.saturating_sub(PAGE_HEADER) / 2
+}
+
+/// Decide each column's on-disk disposition for a record (Slice A: inline or external-plain) and
+/// return `(is_external per column, on-disk record size)` (spec/design/large-values.md §3/§12).
+/// **Spill only when forced:** if the all-inline record already fits `RECORD_MAX`, nothing spills.
+/// Otherwise externalize the largest spillable values (ties broken by column order) until the
+/// record fits — a deterministic, cross-core-identical rule (a §8 contract). The on-disk size is
+/// the **weight** the page-backed B-tree splits on, so this is shared by the serializer and by
+/// `record_size` (the weight): the in-memory node boundaries must match the serialized pages.
+fn plan_dispositions(
+    col_types: &[ScalarType],
+    key: &[u8],
+    row: &[Value],
+    cap: usize,
+) -> (Vec<bool>, usize) {
+    let inline: Vec<usize> = col_types
+        .iter()
+        .zip(row.iter())
+        .map(|(ty, v)| encode_value(*ty, v).len())
+        .collect();
+    let mut external = vec![false; row.len()];
+    let mut size = 2 + key.len() + inline.iter().sum::<usize>();
+    let max = record_max(cap);
+    if size <= max {
+        return (external, size);
     }
-    n
+    // Spillable, currently-inline columns whose externalization actually shrinks the record
+    // (`inline > pointer`), largest inline size first; ties by column order — deterministic.
+    let mut cand: Vec<usize> = (0..row.len())
+        .filter(|&i| is_spillable(col_types[i]) && inline[i] > EXTERNAL_PTR_LEN)
+        .collect();
+    cand.sort_by(|&a, &b| inline[b].cmp(&inline[a]).then(a.cmp(&b)));
+    for i in cand {
+        if size <= max {
+            break;
+        }
+        external[i] = true;
+        size = size - inline[i] + EXTERNAL_PTR_LEN;
+    }
+    (external, size)
+}
+
+/// The on-disk size of a record — the **weight** the page-backed B-tree splits on
+/// (spec/fileformat/format.md). Accounts for out-of-line spill: an externalized value contributes
+/// its fixed pointer size, not its full inline body (spec/design/large-values.md §12). Must equal
+/// the length the serializer produces, so in-memory node boundaries match the serialized pages.
+pub(crate) fn record_size(col_types: &[ScalarType], key: &[u8], row: &Row, cap: usize) -> usize {
+    plan_dispositions(col_types, key, row, cap).1
+}
+
+/// A value's **content payload** `P(v)` — the bytes stored in the overflow chain when the value is
+/// externalized (spec/design/large-values.md §12): raw UTF-8 for `text`, raw bytes for `bytea`, the
+/// decimal body (`flags | scale | ndigits | groups`) for `decimal`. Only spillable types reach here.
+fn value_payload(ty: ScalarType, v: &Value) -> Vec<u8> {
+    match v {
+        Value::Text(s) => s.as_bytes().to_vec(),
+        Value::Bytea(b) => b.clone(),
+        // The decimal inline body is the encoding minus its leading presence tag.
+        Value::Decimal(_) => encode_value(ty, v)[1..].to_vec(),
+        _ => unreachable!("only spillable values are externalized"),
+    }
+}
+
+/// Reconstruct a value from the `P(v)` content payload gathered from its overflow chain (inverse of
+/// [`value_payload`]) — spec/design/large-values.md §12.
+fn value_from_payload(ty: ScalarType, payload: &[u8]) -> Result<Value> {
+    if ty.is_text() {
+        let s = String::from_utf8(payload.to_vec()).map_err(|_| corrupt("non-UTF-8 text value"))?;
+        Ok(Value::Text(s))
+    } else if ty.is_bytea() {
+        Ok(Value::Bytea(payload.to_vec()))
+    } else if ty.is_decimal() {
+        let mut pos = 0usize;
+        decode_decimal_body(payload, &mut pos)
+    } else {
+        Err(corrupt("a non-spillable type was stored external"))
+    }
 }
 
 fn corrupt(msg: &str) -> EngineError {
@@ -199,9 +290,10 @@ impl Snapshot {
         tables.sort_by(|a, b| a.0.cmp(b.0));
 
         // Serialize each table's B-tree post-order, body pages allocated from page 2. Each entry
-        // is `(index, page_type, item_count, payload)`; children precede their parent so parent
-        // child-pointers reference already-allocated pages (format.md).
-        let mut body: Vec<(u32, u8, u32, Vec<u8>)> = Vec::new();
+        // is `(index, page_type, item_count, next_page, payload)`; children precede their parent so
+        // parent child-pointers reference already-allocated pages (format.md). `next_page` is `0`
+        // for B-tree nodes and the chain link for overflow pages (large-values.md §12).
+        let mut body: Vec<(u32, u8, u32, u32, Vec<u8>)> = Vec::new();
         let mut root_data_page = vec![0u32; tables.len()];
         let mut next_index = ROOT_PAGE;
         for (ti, (_, table, store)) in tables.iter().enumerate() {
@@ -226,9 +318,17 @@ impl Snapshot {
         write_meta(&mut image, ps, 0, page_size, txid, cat_root, page_count);
         write_meta(&mut image, ps, 1, page_size, txid, cat_root, page_count);
 
-        // B-tree node pages.
-        for (index, page_type, item_count, payload) in &body {
-            write_page(&mut image, ps, *index, *page_type, *item_count, 0, payload);
+        // B-tree node + overflow pages.
+        for (index, page_type, item_count, next_page, payload) in &body {
+            write_page(
+                &mut image,
+                ps,
+                *index,
+                *page_type,
+                *item_count,
+                *next_page,
+                payload,
+            );
         }
 
         // Catalog chain.
@@ -268,7 +368,7 @@ fn serialize_node(
     table: &Table,
     cap: usize,
     next_index: &mut u32,
-    body: &mut Vec<(u32, u8, u32, Vec<u8>)>,
+    body: &mut Vec<(u32, u8, u32, u32, Vec<u8>)>,
 ) -> Result<u32> {
     let mut child_pages = Vec::with_capacity(node.children.len());
     for child in &node.children {
@@ -297,8 +397,23 @@ fn serialize_node(
         }
         PAGE_INTERIOR
     };
+    // Encode records, spilling over-large values to overflow pages allocated after this node's
+    // index (post-order traversal + column order → deterministic, golden-pinnable layout).
+    let mut ovf = Vec::new();
+    let mut take = || {
+        let i = *next_index;
+        *next_index += 1;
+        i
+    };
     for i in 0..node.keys.len() {
-        payload.extend_from_slice(&encode_record(table, &node.keys[i], &node.vals[i]));
+        payload.extend_from_slice(&encode_record(
+            table,
+            &node.keys[i],
+            &node.vals[i],
+            cap,
+            &mut take,
+            &mut ovf,
+        ));
     }
     if payload.len() > cap {
         return Err(EngineError::new(
@@ -306,7 +421,10 @@ fn serialize_node(
             "a record larger than the per-row limit is not supported",
         ));
     }
-    body.push((index, page_type, n, payload));
+    body.push((index, page_type, n, 0, payload));
+    for o in ovf {
+        body.push((o.index, PAGE_OVERFLOW, o.item_count, o.next_page, o.payload));
+    }
     Ok(index)
 }
 
@@ -457,8 +575,22 @@ fn serialize_dirty(
         }
         PAGE_INTERIOR
     };
-    for i in 0..node.keys.len() {
-        payload.extend_from_slice(&encode_record(table, &node.keys[i], &node.vals[i]));
+    // Encode records, spilling over-large values to overflow pages drawn from the same allocator
+    // (free-list first, then high-water — large-values.md §12). Scoped so the `&mut alloc` borrow
+    // ends before this node's own page is allocated.
+    let mut ovf = Vec::new();
+    {
+        let mut take = || alloc.take();
+        for i in 0..node.keys.len() {
+            payload.extend_from_slice(&encode_record(
+                table,
+                &node.keys[i],
+                &node.vals[i],
+                cap,
+                &mut take,
+                &mut ovf,
+            ));
+        }
     }
     if payload.len() > cap {
         return Err(EngineError::new(
@@ -469,6 +601,12 @@ fn serialize_dirty(
     let index = alloc.take();
     node.page.store(index, Ordering::Release);
     pages.push((index, make_page(ps, page_type, n, 0, &payload)));
+    for o in ovf {
+        pages.push((
+            o.index,
+            make_page(ps, PAGE_OVERFLOW, o.item_count, o.next_page, &o.payload),
+        ));
+    }
     Ok(index)
 }
 
@@ -517,8 +655,8 @@ impl Database {
                 let has_pk = table.primary_key_index().is_some();
                 snap.put_table(table, page_size as u32);
                 if root_data_page != 0 {
-                    let (root, len) = read_tree(image, page_size, root_data_page, &col_types)?;
-                    collect_node_pages(&root, &mut reached);
+                    let (root, len) =
+                        read_tree(image, page_size, root_data_page, &col_types, &mut reached)?;
                     let store = snap.store_mut(&name);
                     store.set_tree(Some(root), len);
                     // No-PK keys are synthetic int64 rowids — advance the counter past the largest
@@ -606,6 +744,15 @@ impl Database {
                 if root_data_page != 0 {
                     let (root, len) =
                         read_skeleton(&paging, root_data_page, &col_types, &mut reached)?;
+                    // The skeleton leaves leaves `OnDisk` (unread), so their records' overflow
+                    // chains are invisible to the reachability walk above. For a table with
+                    // spillable columns, read the leaves now to collect those live chains — else
+                    // the free-list would reclaim still-referenced overflow pages
+                    // (spec/design/large-values.md §12; default `open` is this paged path). Dead
+                    // chains still leak until the next open, matching the P6.2 orphan model.
+                    if col_types.iter().copied().any(is_spillable) {
+                        collect_leaf_overflow(&paging, root_data_page, &col_types, &mut reached)?;
+                    }
                     let store = snap.store_mut(&name);
                     store.set_tree(Some(root), len);
                     if !has_pk {
@@ -630,6 +777,45 @@ impl Database {
         db.committed = snap;
         db.paging = Some(paging);
         Ok(db)
+    }
+}
+
+/// Walk a table's on-disk B-tree, reading each **leaf** and adding the overflow chain pages its
+/// records reference to `reached` (spec/design/large-values.md §12). Interior separators are
+/// skipped here — `read_skeleton_node` already collected their chains. Used only for tables with
+/// spillable columns during the paged-open free-list reconstruction; it reads (and transiently
+/// materializes) every leaf, the deliberate cost of reconstruct-on-open reclamation for overflow.
+fn collect_leaf_overflow(
+    paging: &SharedPaging,
+    page_idx: u32,
+    col_types: &[ScalarType],
+    reached: &mut HashSet<u32>,
+) -> Result<()> {
+    let block = paging.pager().read_block(page_idx)?;
+    let page = parse_page(&block)?;
+    match page.page_type {
+        PAGE_LEAF => {
+            let fetch = |p: u32| paging.pager().read_block(p);
+            let mut pos = 0usize;
+            for _ in 0..page.item_count {
+                let (_k, _r, ovf) = decode_record(col_types, page.payload, &mut pos, Some(&fetch))?;
+                reached.extend(ovf);
+            }
+            Ok(())
+        }
+        PAGE_INTERIOR => {
+            let n = page.item_count as usize;
+            let mut pos = 0usize;
+            let mut cps = Vec::with_capacity(n + 1);
+            for _ in 0..=n {
+                cps.push(read_u32(page.payload, &mut pos)?);
+            }
+            for cp in cps {
+                collect_leaf_overflow(paging, cp, col_types, reached)?;
+            }
+            Ok(())
+        }
+        _ => Err(corrupt("expected a B-tree node page")),
     }
 }
 
@@ -681,9 +867,13 @@ fn read_skeleton_node(
                 Vec::with_capacity(n),
                 Vec::with_capacity(n),
             );
+            let cap = block.len() - PAGE_HEADER;
+            let fetch = |p: u32| paging.pager().read_block(p);
             for _ in 0..n {
-                let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
-                weights.push(record_size(col_types, &key, &row) as u32);
+                let (key, row, ovf) =
+                    decode_record(col_types, page.payload, &mut pos, Some(&fetch))?;
+                weights.push(record_size(col_types, &key, &row, cap) as u32);
+                reached.extend(ovf);
                 keys.push(key);
                 vals.push(row);
             }
@@ -697,34 +887,23 @@ fn read_skeleton_node(
     }
 }
 
-/// Collect the on-disk page index of `node` and every descendant (a loaded tree, all pages set) into
-/// `reached` — the live set the free-list reconstruction subtracts from `[2, page_count)` (P6.2).
-fn collect_node_pages(node: &Arc<Node>, reached: &mut HashSet<u32>) {
-    reached.insert(node.page.load(Ordering::Acquire));
-    for child in &node.children {
-        match child {
-            // An `OnDisk` leaf contributes its page without being loaded — the free-list walk reuses
-            // the resident interior skeleton (pager.md §4); a `Resident` child recurses.
-            Child::Resident(n) => collect_node_pages(n, reached),
-            Child::OnDisk(p) => {
-                reached.insert(*p);
-            }
-        }
-    }
-}
-
 /// Read a table's on-disk B-tree (rooted at `page_idx`) into an in-memory tree, returning the root
 /// node and the total row count (spec/fileformat/format.md). An interior node's payload is its
 /// `N+1` child pointers then its `N` records; we recurse the pointers, then read the separators.
 /// Weights are recomputed from the value codec (the exact size the writer used), so the loaded tree
-/// is ready for further size-driven splits.
+/// is ready for further size-driven splits. Every node page and every overflow chain page reached
+/// (an external value's chain — large-values.md §12) is added to `reached` for the free-list walk.
 fn read_tree(
     image: &[u8],
     ps: usize,
     page_idx: u32,
     col_types: &[ScalarType],
+    reached: &mut HashSet<u32>,
 ) -> Result<(Arc<Node>, usize)> {
+    reached.insert(page_idx);
+    let cap = ps - PAGE_HEADER;
     let page = read_page(image, ps, page_idx)?;
+    let fetch = |p: u32| page_block(image, ps, p);
     match page.page_type {
         PAGE_LEAF => {
             let n = page.item_count as usize;
@@ -735,8 +914,10 @@ fn read_tree(
             );
             let mut pos = 0usize;
             for _ in 0..n {
-                let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
-                weights.push(record_size(col_types, &key, &row) as u32);
+                let (key, row, ovf) =
+                    decode_record(col_types, page.payload, &mut pos, Some(&fetch))?;
+                weights.push(record_size(col_types, &key, &row, cap) as u32);
+                reached.extend(ovf);
                 keys.push(key);
                 vals.push(row);
             }
@@ -749,7 +930,7 @@ fn read_tree(
             let mut total = 0usize;
             for _ in 0..=n {
                 let cp = read_u32(page.payload, &mut pos)?;
-                let (child, clen) = read_tree(image, ps, cp, col_types)?;
+                let (child, clen) = read_tree(image, ps, cp, col_types, reached)?;
                 // The in-memory load is fully resident (no pager to fault from); the demand-paged
                 // file load (B2) is a separate path that leaves leaf children `OnDisk`.
                 children.push(Child::Resident(child));
@@ -761,8 +942,10 @@ fn read_tree(
                 Vec::with_capacity(n),
             );
             for _ in 0..n {
-                let (key, row) = decode_record(col_types, page.payload, &mut pos)?;
-                weights.push(record_size(col_types, &key, &row) as u32);
+                let (key, row, ovf) =
+                    decode_record(col_types, page.payload, &mut pos, Some(&fetch))?;
+                weights.push(record_size(col_types, &key, &row, cap) as u32);
+                reached.extend(ovf);
                 keys.push(key);
                 vals.push(row);
             }
@@ -774,14 +957,73 @@ fn read_tree(
 }
 
 /// One record's bytes: `key_len(u16) | key | payload(each column value)`.
-fn encode_record(table: &Table, key: &[u8], row: &[Value]) -> Vec<u8> {
+/// One overflow page produced while serializing a record's external value (large-values.md §12).
+struct OverflowPageOut {
+    index: u32,
+    item_count: u32,
+    next_page: u32,
+    payload: Vec<u8>,
+}
+
+/// Encode a record (`key_len | key | each column value`), spilling over-large values out-of-line
+/// per the disposition plan (large-values.md §12). For each externalized value, allocate overflow
+/// page(s) via `take`, append them to `ovf`, and write a fixed `tag | first_page | len` pointer
+/// into the record instead of the inline body. `cap` is the page payload (the slab size + the
+/// spill-plan input). Shared by the whole-image (`serialize_node`) and incremental (`serialize_dirty`)
+/// writers, which differ only in how `take` allocates a page.
+fn encode_record(
+    table: &Table,
+    key: &[u8],
+    row: &[Value],
+    cap: usize,
+    take: &mut dyn FnMut() -> u32,
+    ovf: &mut Vec<OverflowPageOut>,
+) -> Vec<u8> {
+    let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
+    let (external, _) = plan_dispositions(&col_types, key, row, cap);
     let mut out = Vec::new();
     out.extend_from_slice(&(key.len() as u16).to_be_bytes());
     out.extend_from_slice(key);
-    for (col, val) in table.columns.iter().zip(row.iter()) {
-        out.extend_from_slice(&encode_value(col.ty, val));
+    for (i, (col, val)) in table.columns.iter().zip(row.iter()).enumerate() {
+        if external[i] {
+            let payload = value_payload(col.ty, val);
+            let first = write_overflow_chain(&payload, cap, take, ovf);
+            out.push(TAG_EXTERNAL);
+            out.extend_from_slice(&first.to_be_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        } else {
+            out.extend_from_slice(&encode_value(col.ty, val));
+        }
     }
     out
+}
+
+/// Write `payload` across a chain of overflow pages (`cap`-byte slabs, in order), allocating each
+/// page via `take` and linking it with `next_page` (`0` terminates). Returns the first page index
+/// for the record's pointer. `payload` is always non-empty (only values larger than the pointer
+/// spill — `plan_dispositions`).
+fn write_overflow_chain(
+    payload: &[u8],
+    cap: usize,
+    take: &mut dyn FnMut() -> u32,
+    ovf: &mut Vec<OverflowPageOut>,
+) -> u32 {
+    let n = payload.len().div_ceil(cap);
+    let indices: Vec<u32> = (0..n).map(|_| take()).collect();
+    for (j, slab) in payload.chunks(cap).enumerate() {
+        let next_page = if j + 1 < indices.len() {
+            indices[j + 1]
+        } else {
+            0
+        };
+        ovf.push(OverflowPageOut {
+            index: indices[j],
+            item_count: slab.len() as u32,
+            next_page,
+            payload: slab.to_vec(),
+        });
+    }
+    indices[0]
 }
 
 /// One table's catalog entry bytes (spec/fileformat/format.md).
@@ -995,15 +1237,34 @@ fn read_page(image: &[u8], ps: usize, index: u32) -> Result<Page<'_>> {
     parse_page(&image[off..off + ps])
 }
 
+/// One page's full block, copied out of a whole image — the overflow-chain `fetch` for the
+/// in-memory load path (`read_tree`, large-values.md §12).
+fn page_block(image: &[u8], ps: usize, index: u32) -> Result<Vec<u8>> {
+    let off = index as usize * ps;
+    if off + ps > image.len() {
+        return Err(corrupt("page index out of range"));
+    }
+    Ok(image[off..off + ps].to_vec())
+}
+
 /// Decode a single **leaf** page block into a resident node, for the demand-paging fault path
 /// (spec/design/pager.md §4; paging.rs `fault_leaf`). `block` is one page; `page` is its page id,
 /// stamped on the node so a later incremental commit keeps it clean. Weights are recomputed from the
 /// value codec (the exact size the writer used), so the loaded leaf is ready for further splits.
-pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ScalarType]) -> Result<Node> {
+/// `fetch` reads an overflow page block by index (to materialize external values whose chains live
+/// outside this leaf — large-values.md §12); the chain pages it visits are discarded here (the
+/// free-list is reconstructed at open, not on a runtime fault).
+pub(crate) fn decode_leaf_node(
+    block: &[u8],
+    page: u32,
+    col_types: &[ScalarType],
+    fetch: Option<&dyn Fn(u32) -> Result<Vec<u8>>>,
+) -> Result<Node> {
     let parsed = parse_page(block)?;
     if parsed.page_type != PAGE_LEAF {
         return Err(corrupt("demand-paged a non-leaf page"));
     }
+    let cap = block.len() - PAGE_HEADER;
     let n = parsed.item_count as usize;
     let (mut keys, mut vals, mut weights) = (
         Vec::with_capacity(n),
@@ -1012,8 +1273,8 @@ pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ScalarType]
     );
     let mut pos = 0usize;
     for _ in 0..n {
-        let (key, row) = decode_record(col_types, parsed.payload, &mut pos)?;
-        weights.push(record_size(col_types, &key, &row) as u32);
+        let (key, row, _ovf) = decode_record(col_types, parsed.payload, &mut pos, fetch)?;
+        weights.push(record_size(col_types, &key, &row, cap) as u32);
         keys.push(key);
         vals.push(row);
     }
@@ -1043,8 +1304,11 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32)> {
         };
         // The default value follows the typmod, present iff flags bit2 (same value codec as
         // rows). Absent → no bytes consumed (spec/fileformat/format.md).
+        // A default is a small evaluated literal — never externalized — so no overflow reader
+        // is needed (a `0x02` tag here would be a corrupt catalog).
         let default = if flags & 0b100 != 0 {
-            Some(read_value(ty, buf, pos)?)
+            let mut sink = Vec::new();
+            Some(read_value(ty, buf, pos, None, &mut sink)?)
         } else {
             None
         };
@@ -1061,70 +1325,137 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32)> {
     Ok((Table { name, columns }, root_data_page))
 }
 
-fn decode_record(col_types: &[ScalarType], buf: &[u8], pos: &mut usize) -> Result<(Vec<u8>, Row)> {
+/// Decode one record `(key, row)` and the **overflow chain pages** any external value followed
+/// (for the free-list reachability walk — spec/design/large-values.md §12). `fetch` reads a page
+/// block by index, used to follow overflow chains; `None` is only valid where no value can be
+/// external (e.g. a catalog default).
+fn decode_record(
+    col_types: &[ScalarType],
+    buf: &[u8],
+    pos: &mut usize,
+    fetch: Option<&dyn Fn(u32) -> Result<Vec<u8>>>,
+) -> Result<(Vec<u8>, Row, Vec<u32>)> {
     let key_len = read_u16(buf, pos)? as usize;
     let key = take(buf, pos, key_len)?.to_vec();
     let mut row = Vec::with_capacity(col_types.len());
+    let mut ovf = Vec::new();
     for &ty in col_types {
-        row.push(read_value(ty, buf, pos)?);
+        row.push(read_value(ty, buf, pos, fetch, &mut ovf)?);
     }
-    Ok((key, row))
+    Ok((key, row, ovf))
 }
 
-/// Read one value via the value codec (inverse of `encode_value`). The presence tag is
-/// read first; for a present value the body is the column type's: a fixed-width integer,
-/// a `u16` length + that many UTF-8 bytes for `text`, or a single `bool-byte` for `boolean`.
-fn read_value(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+/// Read one value via the value codec (inverse of `encode_value`). The presence tag is read first:
+/// `0x00` an inline body, `0x01` NULL, `0x02` an external pointer (`u32 first_page` + `u32 len`)
+/// whose payload is gathered from the overflow chain via `fetch` and reconstructed by type
+/// (spec/design/large-values.md §12). Pages visited while following a chain are pushed to `ovf_out`
+/// for the free-list reachability walk.
+fn read_value(
+    ty: ScalarType,
+    buf: &[u8],
+    pos: &mut usize,
+    fetch: Option<&dyn Fn(u32) -> Result<Vec<u8>>>,
+    ovf_out: &mut Vec<u32>,
+) -> Result<Value> {
     match read_u8(buf, pos)? {
-        0x00 => {
-            if ty.is_text() {
-                let len = read_u16(buf, pos)? as usize;
-                let bytes = take(buf, pos, len)?.to_vec();
-                let s = String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 text value"))?;
-                Ok(Value::Text(s))
-            } else if ty.is_bool() {
-                match read_u8(buf, pos)? {
-                    0x00 => Ok(Value::Bool(false)),
-                    0x01 => Ok(Value::Bool(true)),
-                    _ => Err(corrupt("invalid boolean value byte")),
-                }
-            } else if ty.is_decimal() {
-                // flags (sign), u16 scale, u16 ndigits, then that many base-10^4 groups.
-                let flags = read_u8(buf, pos)?;
-                let neg = flags & 1 != 0;
-                let scale = read_u16(buf, pos)? as u32;
-                let ndigits = read_u16(buf, pos)? as usize;
-                let mut groups = Vec::with_capacity(ndigits);
-                for _ in 0..ndigits {
-                    groups.push(read_u16(buf, pos)?);
-                }
-                Ok(Value::Decimal(Decimal::from_codec(neg, scale, &groups)))
-            } else if ty.is_bytea() {
-                let len = read_u16(buf, pos)? as usize;
-                let bytes = take(buf, pos, len)?.to_vec();
-                Ok(Value::Bytea(bytes))
-            } else if ty.is_uuid() {
-                // Fixed 16 raw bytes, no length prefix (must branch before the integer path —
-                // decode_int would sign-flip and width_bytes is 16 there too).
-                let b: [u8; 16] = take(buf, pos, 16)?
-                    .try_into()
-                    .map_err(|_| corrupt("invalid uuid length"))?;
-                Ok(Value::Uuid(b))
-            } else if ty.is_timestamp() {
-                let vb = take(buf, pos, ty.width_bytes())?;
-                Ok(Value::Timestamp(decode_int(ty, vb)))
-            } else if ty.is_timestamptz() {
-                let vb = take(buf, pos, ty.width_bytes())?;
-                Ok(Value::Timestamptz(decode_int(ty, vb)))
-            } else {
-                let w = ty.width_bytes();
-                let vb = take(buf, pos, w)?;
-                Ok(Value::Int(decode_int(ty, vb)))
-            }
-        }
+        0x00 => read_inline_body(ty, buf, pos),
         0x01 => Ok(Value::Null),
+        TAG_EXTERNAL => {
+            let first = read_u32(buf, pos)?;
+            let len = read_u32(buf, pos)? as usize;
+            let fetch = fetch.ok_or_else(|| corrupt("external value with no overflow reader"))?;
+            let payload = read_overflow_chain(first, len, fetch, ovf_out)?;
+            value_from_payload(ty, &payload)
+        }
         _ => Err(corrupt("invalid value presence tag")),
     }
+}
+
+/// The present-value body (after a `0x00` tag): a fixed-width integer, a `u16` length + UTF-8 bytes
+/// for `text`, a single `bool-byte`, the decimal body, etc. (spec/fileformat/format.md *Value codec*).
+fn read_inline_body(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+    if ty.is_text() {
+        let len = read_u16(buf, pos)? as usize;
+        let bytes = take(buf, pos, len)?.to_vec();
+        let s = String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 text value"))?;
+        Ok(Value::Text(s))
+    } else if ty.is_bool() {
+        match read_u8(buf, pos)? {
+            0x00 => Ok(Value::Bool(false)),
+            0x01 => Ok(Value::Bool(true)),
+            _ => Err(corrupt("invalid boolean value byte")),
+        }
+    } else if ty.is_decimal() {
+        decode_decimal_body(buf, pos)
+    } else if ty.is_bytea() {
+        let len = read_u16(buf, pos)? as usize;
+        let bytes = take(buf, pos, len)?.to_vec();
+        Ok(Value::Bytea(bytes))
+    } else if ty.is_uuid() {
+        // Fixed 16 raw bytes, no length prefix (must branch before the integer path —
+        // decode_int would sign-flip and width_bytes is 16 there too).
+        let b: [u8; 16] = take(buf, pos, 16)?
+            .try_into()
+            .map_err(|_| corrupt("invalid uuid length"))?;
+        Ok(Value::Uuid(b))
+    } else if ty.is_timestamp() {
+        let vb = take(buf, pos, ty.width_bytes())?;
+        Ok(Value::Timestamp(decode_int(ty, vb)))
+    } else if ty.is_timestamptz() {
+        let vb = take(buf, pos, ty.width_bytes())?;
+        Ok(Value::Timestamptz(decode_int(ty, vb)))
+    } else {
+        let w = ty.width_bytes();
+        let vb = take(buf, pos, w)?;
+        Ok(Value::Int(decode_int(ty, vb)))
+    }
+}
+
+/// Decode a decimal value's body — `flags` (sign), `u16` scale, `u16` ndigits, then that many
+/// base-10⁴ groups (spec/fileformat/format.md). Shared by the inline path and by external
+/// reconstruction (a spilled decimal's chain payload is exactly this body — large-values.md §12).
+fn decode_decimal_body(buf: &[u8], pos: &mut usize) -> Result<Value> {
+    let flags = read_u8(buf, pos)?;
+    let neg = flags & 1 != 0;
+    let scale = read_u16(buf, pos)? as u32;
+    let ndigits = read_u16(buf, pos)? as usize;
+    let mut groups = Vec::with_capacity(ndigits);
+    for _ in 0..ndigits {
+        groups.push(read_u16(buf, pos)?);
+    }
+    Ok(Value::Decimal(Decimal::from_codec(neg, scale, &groups)))
+}
+
+/// Gather `len` bytes of an external value's payload by following its overflow chain from
+/// `first` (spec/design/large-values.md §12): each page is `page_type 4`, carries `item_count`
+/// payload bytes, and chains via `next_page` (`0` terminates). Every visited page is pushed to
+/// `visited` (the free-list reachability walk). `fetch` returns a page's full block by index.
+fn read_overflow_chain(
+    first: u32,
+    len: usize,
+    fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
+    visited: &mut Vec<u32>,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(len);
+    let mut p = first;
+    while out.len() < len {
+        if p == 0 {
+            return Err(corrupt("overflow chain ended before the value length"));
+        }
+        visited.push(p);
+        let block = fetch(p)?;
+        let page = parse_page(&block)?;
+        if page.page_type != PAGE_OVERFLOW {
+            return Err(corrupt("expected an overflow page"));
+        }
+        let take = page.item_count as usize;
+        if take == 0 || take > page.payload.len() || out.len() + take > len {
+            return Err(corrupt("overflow page slab out of range"));
+        }
+        out.extend_from_slice(&page.payload[..take]);
+        p = page.next_page;
+    }
+    Ok(out)
 }
 
 // --- bounds-checked big-endian readers over a payload cursor ---
@@ -1251,5 +1582,81 @@ mod tests {
             Err(e) => assert_eq!(e.code(), "XX001"),
             Ok(_) => panic!("expected a data_corrupted error"),
         }
+    }
+
+    // --- large values / overflow pages (spec/design/large-values.md §12) ---
+
+    /// Count the body pages of a given `page_type` in an image (meta slots start with the magic, so
+    /// they never collide with a small `page_type` byte).
+    fn count_page_type(image: &[u8], ps: usize, ty: u8) -> usize {
+        (0..image.len() / ps)
+            .filter(|&i| image[i * ps] == ty)
+            .count()
+    }
+
+    /// A table with a large `text` value that must spill out-of-line at a small page size, plus a
+    /// small inline value. The big value (≈1000 UTF-8 bytes) far exceeds `RECORD_MAX` at `ps=256`
+    /// (`= (256-12-12)/2 = 116`) and `cap` (`= 244`), so it spans **several** overflow pages.
+    fn big_value_db() -> Database {
+        let mut db = Database::new();
+        let big = "abcΩ".repeat(250); // 5 bytes × 250 = 1250 UTF-8 bytes
+        for s in [
+            "CREATE TABLE t (id int32 PRIMARY KEY, body text)".to_string(),
+            format!("INSERT INTO t VALUES (1, '{big}')"),
+            "INSERT INTO t VALUES (2, 'tiny')".to_string(),
+        ] {
+            execute(&mut db, &s).expect("setup");
+        }
+        db
+    }
+
+    #[test]
+    fn external_value_spans_overflow_chain_and_round_trips() {
+        let db = big_value_db();
+        let ps = 256u32;
+        let image = db.to_image(ps, 1).unwrap();
+        // The 1250-byte value spilled across a multi-page chain (cap 244 ⇒ ≥ 6 pages).
+        assert!(
+            count_page_type(&image, ps as usize, PAGE_OVERFLOW) >= 2,
+            "a large value spans several overflow pages"
+        );
+        // It reconstructs exactly, and re-serialization is byte-identical (deterministic spill +
+        // chain allocation).
+        let loaded = Database::from_image(&image).unwrap();
+        assert_eq!(
+            loaded.rows_in_key_order("t"),
+            db.rows_in_key_order("t"),
+            "the external value survives the round trip"
+        );
+        assert_eq!(loaded.to_image(ps, 1).unwrap(), image);
+    }
+
+    #[test]
+    fn small_values_never_spill() {
+        // The all-integer sample table fits inline at the same small page size — "spill only when
+        // forced": no overflow page is written.
+        let image = sample_db().to_image(256, 1).unwrap();
+        assert_eq!(
+            count_page_type(&image, 256, PAGE_OVERFLOW),
+            0,
+            "inline-fitting values are never externalized"
+        );
+    }
+
+    #[test]
+    fn from_image_reclaims_only_dead_overflow_pages() {
+        // The live external value's chain pages must be in the reachable set, so they are NOT on the
+        // reconstructed free-list (else a later commit would reuse a still-referenced page).
+        let db = big_value_db();
+        let ps = 256u32;
+        let loaded = Database::from_image(&db.to_image(ps, 1).unwrap()).unwrap();
+        let ovf_pages =
+            count_page_type(&loaded.to_image(ps, 1).unwrap(), ps as usize, PAGE_OVERFLOW);
+        assert!(ovf_pages >= 2);
+        assert!(
+            loaded.free_pages.len() < ovf_pages,
+            "live overflow pages ({ovf_pages}) are reachable, not free ({} free)",
+            loaded.free_pages.len()
+        );
     }
 }

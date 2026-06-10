@@ -326,3 +326,67 @@ Everything an external/compressed value touches is a §8 byte/cost contract:
   is built now.
 - **Slotted pages / in-place value updates** (format.md *Within-page structure*) — orthogonal;
   this subsystem rewrites whole node pages like the rest of P6.1.
+
+---
+
+## 12. Slice A — resolved implementation decisions (overflow, no compression)
+
+These pin the open questions of §3/§7/§11 for the **first** slice (out-of-line storage only;
+compression is Slice B). They were chosen with the maintainer; the byte details land in
+[../fileformat/format.md](../fileformat/format.md) when goldens regenerate.
+
+- **Spill trigger = `RECORD_MAX`** (§3, "only when forced"). The target `T_target` is exactly
+  `RECORD_MAX = (C−12)/2` — the existing B-tree record cap. A record that fits inline stays fully
+  inline; a value spills **only** when the record would otherwise trip the `0A000` oversized-item
+  narrowing. This preserves the B-tree split/merge proof unchanged (every stored record is still
+  ≤ `RECORD_MAX`) and minimizes externalization for the common case. The PG-style lower target is
+  a later tunable. A record whose key + fixed-width values + one external pointer per spillable
+  value *still* exceeds `RECORD_MAX` (pathological: huge key / very many columns at a tiny page)
+  remains `0A000` — externalization cannot reduce it further.
+
+- **Disposition encoding = extend the presence tag** (refines §5; no separate form byte). The
+  value codec's present/NULL tag gains an external state: **`0x00`** present-inline-plain (today's
+  body, byte-unchanged), **`0x01`** NULL, **`0x02`** present-external-plain. **`0x03`** (inline-
+  compressed) and **`0x04`** (external-compressed) are **reserved** for Slice B — a `0x03`/`0x04`
+  (or any tag ≥ `0x05`) is `data_corrupted` until then. Because inline and NULL are unchanged,
+  **every existing value is byte-identical**; only spilled values use the new tag.
+
+- **External pointer = `tag(0x02) ++ u32 first_page ++ u32 payload_len`** (9 bytes). `payload_len`
+  is the length of the value's **content payload `P(v)`** held in the chain: the raw UTF-8 bytes
+  for `text`, the raw bytes for `bytea`, the decimal body (`flags ++ scale ++ ndigits ++ groups`)
+  for `decimal`. The `u32` length supersedes the inline `u16` (lifting the 64 KiB ceiling); the
+  inline `u16` is never the binding limit because `RECORD_MAX ≤ 32762 < 65535`, so a value spills
+  long before it would overflow `u16`. Only variable-length types (`text`/`bytea`/`decimal`) ever
+  spill; fixed-width types are always inline.
+
+- **Overflow page = `page_type 4`.** `P(v)` is split into `C`-byte slabs (`C = page_size − 12`),
+  one per page; each page's header carries `item_count` = bytes in this page and `next_page` =
+  the continuation (`0` terminates). The reader follows `next_page` from `first_page`, gathering
+  `payload_len` bytes, then reconstructs the value by column type. Allocation order is
+  deterministic (post-order tree walk; within a record, column order; the chain's slabs in order),
+  so the bytes stay cross-core identical and golden-pinnable. **`to_image` now carries a per-page
+  `next_page`** (it previously hard-coded `0`, valid only for leaf/interior nodes).
+
+- **Read = eager materialization** (resolves §7 for Slice A). An external value's chain is read
+  when its **leaf is decoded** (whole-image load or buffer-pool fault), reconstructing the full
+  in-memory `Value`; the in-memory model never holds a lazy reference, so the planner/executor are
+  untouched. Lazy (read-on-touch) materialization is a tracked follow-on.
+
+- **Reclamation = reconstruct-on-open, extended to read spillable leaves.** The **default `open`
+  is the lazy demand-paged path**, whose free-list reconstruction does *not* read leaf bodies — so
+  it cannot see the overflow pointers buried in records. Slice A extends the reachability walk to
+  **read the leaves of tables with spillable columns** and collect their live chains, so overflow
+  pages are marked reachable and never handed out as free. Dead chains (from an updated/deleted row
+  or a rewritten leaf) **leak until the next open**, exactly matching the P6.2 B-tree-orphan model.
+  On-disk free-list persistence (so open needn't read leaves — the larger-than-RAM end-state) and
+  continuous within-session reclamation remain the documented P6.2 follow-ons.
+
+- **Cost = `page_read` per chain page, charged at materialization** (§8.1). With eager
+  materialization that is when the leaf is decoded. Deterministic and cross-core identical.
+
+- **Format version.** Clean break to **`format_version 3`** (v2 not read), regenerating the 15
+  goldens (only the version field + CRC change for non-spilling fixtures) plus new external-value
+  goldens. The version bump, the `format.md` byte-pinning, the Ruby reference, and all three cores
+  move **together** — that lockstep step is what makes `rake verify` green again; during
+  development the mechanism is built under the v2 version field, since a core cannot bump the
+  version alone without regenerating the shared goldens.

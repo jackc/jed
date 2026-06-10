@@ -95,9 +95,11 @@ impl TableStore {
         self.paging = Some(paging);
     }
 
-    /// This row's on-disk record size — the weight the page-backed B-tree splits on.
+    /// This row's on-disk record size — the weight the page-backed B-tree splits on. Accounts for
+    /// out-of-line spill at `cap` (an externalized value weighs its pointer, not its full body —
+    /// spec/design/large-values.md §12), so split points match the serialized pages.
     fn weight(&self, key: &[u8], row: &Row) -> u32 {
-        crate::format::record_size(&self.col_types, key, row) as u32
+        crate::format::record_size(&self.col_types, key, row, self.cap) as u32
     }
 
     /// Insert a row under its encoded key. Returns `Ok(false)` if the key already exists
