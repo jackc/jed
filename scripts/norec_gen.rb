@@ -1,64 +1,82 @@
 # frozen_string_literal: true
 
 # scripts/norec_gen.rb — SQLancer-style metamorphic test generator (CLAUDE.md §7, TODO.md
-# Phase 8: "SQLancer-style metamorphic / generative testing"). This is the NoREC oracle
-# (Non-optimizing Reference Engine Construction) specialized to jed's query pushdown.
+# Phase 8: "SQLancer-style metamorphic / generative testing"). NoREC-style oracles
+# (Non-optimizing Reference Engine Construction) specialized to jed's query optimizations: a
+# form that triggers an optimization and a semantically-equivalent form that does NOT must agree.
+# Expected rows are known BY CONSTRUCTION from the generated data — no oracle (PG or otherwise)
+# is consulted. We run every generated test on all three cores, so each is checked
+# METAMORPHICALLY (the two forms agree) AND DIFFERENTIALLY (the cores agree) — the latter catches
+# core disagreement, the former catches a bug ALL cores share (which differential testing cannot).
 #
-# The relation: an OPTIMIZED query and a semantically-equivalent NON-optimizable rewrite must
-# return identical rows. jed's planner pushes a predicate to a B-tree seek/range ONLY when the
-# primary key appears as a BARE column (executor `detect_pk_bound`: it matches `RExpr::Column`,
-# nothing else). So `id = K` is pushed down (point-lookup seek) while `id + 0 = K` — an
-# arithmetic BinaryOp — is NOT, and full-scans. The two paths execute completely different code
-# yet must agree. A pushdown bug shows up as the optimized query disagreeing with the scan.
+# Relations (one scenario each — add a new scenario when you add a new optimization, §8):
+#   pushdown — `pk = K` / `pk BETWEEN a AND b` seek a B-tree node; `pk + 0 = K` is a `BinaryOp`,
+#              so `detect_pk_bound` (which matches only a bare `RExpr::Column`) does NOT push it
+#              and it full-scans. Both must return identical rows.
+#   limit    — LIMIT short-circuits the streaming scan at the window; OFFSET / the full query do
+#              not. Over a total order (`ORDER BY` the unique pk) the windows must reconstruct the
+#              whole — each window matches its by-construction slice.
+#   join     — a constant WHERE predicate on a base relation's bare pk bounds THAT relation's scan
+#              in a join (`detect_pk_bound` per relation); `pk + 0 = K` defeats it (full scan).
+#              Both must return identical rows — for INNER and for a preserved-side LEFT predicate.
 #
-# Why this is more than the differential cores (Rust/Go/TS run every test): those catch the
-# cores DISAGREEING, but are blind to a bug ALL of them share. This metamorphic relation is an
-# independent oracle — it can fail even when all three cores agree. And we still run it on every
-# core, so it is metamorphic AND differential at once (the discussion's two axes composed).
+# Determinism (CLAUDE.md §10): generation is SEEDED, so a discovered failure reduces to this exact
+# deterministic .test, which then joins the corpus. The fuzzer is dev-time discovery; the emitted
+# .test is the reproducible artifact.
 #
-# Determinism (CLAUDE.md §10): generation is SEEDED, so a discovered failure reduces to this
-# exact deterministic .test, which then joins the corpus. The fuzzer is dev-time discovery; the
-# emitted .test is the reproducible artifact. Expected rows are known BY CONSTRUCTION from the
-# generated data — no oracle (PG or otherwise) is consulted to produce them.
-#
-#   ruby scripts/norec_gen.rb [seed]        # generate, run on the cores, report, clean up
-#   ruby scripts/norec_gen.rb 7 --keep PATH # write the .test to PATH and leave it
+#   ruby scripts/norec_gen.rb [seed]            # one seed, all scenarios, run on Go + TS
+#   ruby scripts/norec_gen.rb --sweep 20        # seeds 1..20 × all scenarios, all three cores
+#   ruby scripts/norec_gen.rb 7 --keep          # generate seed 7 and LEAVE the files for inspection
 
 require "open3"
 require "fileutils"
 
-REQUIRES = %w[
-  ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select query.where_eq
-  query.comparison_order query.point_lookup query.order_by query.logical_connectives
-  expr.arithmetic expr.between expr.comparison_value types.int32
-].freeze
-
 # Each core ships a conformance binary that WALKS spec/conformance/suites and prints one
 # `PASS|FAIL|SKIP <relpath>` line per file (identical format across cores). So we generate every
-# seed's .test into the tree, then run each core ONCE — 3 harness runs total, not 3×N.
+# file into the tree, then run each core ONCE — 3 harness runs total, not 3×(files).
 CORES = {
   "rust" => { dir: %w[impl rust], cmd: %w[cargo run --quiet --bin conformance] },
   "go" => { dir: %w[impl go], cmd: %w[go run ./cmd/conformance] },
   "ts" => { dir: %w[impl ts], cmd: %w[npm run --silent conformance] },
 }.freeze
 
-PAIRS_PER_SEED = 5 # keep in sync with generate(): 2 present + 1 absent + 2 ranges
+# Per-scenario `# requires:` — the minimal capability set, so a still-incomplete core skips a
+# scenario it can't run rather than failing (conformance.md §3), and each scenario gates tightly.
+PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                  query.where_eq query.comparison_order query.point_lookup query.order_by
+                  query.logical_connectives expr.arithmetic expr.between expr.comparison_value
+                  types.int32].freeze
+LIMIT_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+               query.comparison_order query.order_by query.limit query.offset
+               query.limit_short_circuit types.int32].freeze
+JOIN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+              query.where_eq query.comparison_order query.order_by query.order_by_keys
+              query.qualified_column query.join_inner query.join_left query.join_pushdown
+              query.point_lookup expr.arithmetic expr.comparison_value types.int32].freeze
 
-# A metamorphic pair: the same predicate expressed pushdown-able and not. Both assert `exp`.
-def pair(out, title, opt_pred, scan_pred, exp)
-  out << "# #{title}"
-  [["pushdown (bare pk -> B-tree seek)", opt_pred],
-   ["full scan (id+0 defeats pushdown) — MUST match", scan_pred]].each do |note, pred|
-    out << "# #{note}"
-    out << "query II nosort"
-    out << "SELECT id, v FROM t WHERE #{pred} ORDER BY id"
-    out << "----"
-    out.concat(exp)
-    out << ""
-  end
+def header(seed, requires, desc)
+  ["# Metamorphic NoREC #{desc} — GENERATED by scripts/norec_gen.rb (seed #{seed}).",
+   "# An optimization-triggering query and a semantically-equivalent form that does not trigger it",
+   "# must return identical rows on every core. Expected rows known by construction; no oracle.",
+   "# requires: #{requires.join(', ')}",
+   ""]
 end
 
-def generate(seed)
+# Emit one `query` record. `exp` is the flat list of rendered value strings (row-major).
+def q(out, coltypes, sql, exp)
+  out << "query #{coltypes} nosort"
+  out << sql
+  out << "----"
+  out.concat(exp)
+  out << ""
+end
+
+def stmt(out, sql)
+  out << "statement ok" << sql << ""
+end
+
+# --- scenario: primary-key pushdown (point lookup + range) ------------------------------------
+def gen_pushdown(seed)
   rng = Random.new(seed)
   ids = (1..40).to_a.sample(12, random: rng).sort
   rows = ids.map { |id| [id, rng.rand(-100..100)] }
@@ -67,50 +85,129 @@ def generate(seed)
   present = ids.sample(2, random: rng)
   absent = ((1..40).to_a - ids).sample(random: rng)
   lo, hi = ids.sample(2, random: rng).sort
-  empty_lo = 41
-  empty_hi = 50
 
-  out = []
-  out << "# Metamorphic NoREC pushdown test — GENERATED by scripts/norec_gen.rb (seed #{seed})."
-  out << "# An optimized query and a non-optimizable rewrite must return identical rows, on every"
-  out << "# core. Expected rows are known by construction; no oracle is consulted. See the script."
-  out << "# requires: #{REQUIRES.join(', ')}"
-  out << ""
-  out << "statement ok"
-  out << "CREATE TABLE t (id int32 PRIMARY KEY, v int32)"
-  out << ""
-  out << "statement ok"
-  out << "INSERT INTO t VALUES #{rows.map { |id, v| "(#{id}, #{v})" }.join(', ')}"
-  out << ""
+  out = header(seed, PUSHDOWN_REQ, "primary-key pushdown (point lookup + range)")
+  stmt(out, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v| "(#{id}, #{v})" }.join(', ')}")
+
+  pair = lambda do |title, opt, scan, exp|
+    out << "# #{title}"
+    out << "# pushdown (bare pk -> B-tree seek)"
+    q(out, "II", "SELECT id, v FROM t WHERE #{opt} ORDER BY id", exp)
+    out << "# full scan (+0 defeats pushdown) — MUST match"
+    q(out, "II", "SELECT id, v FROM t WHERE #{scan} ORDER BY id", exp)
+  end
 
   present.each do |k|
-    pair(out, "point lookup id = #{k} (present)",
-         "id = #{k}", "id + 0 = #{k}", block.call(->(id, _v) { id == k }))
+    pair.call("point lookup id = #{k} (present)", "id = #{k}", "id + 0 = #{k}",
+              block.call(->(id, _v) { id == k }))
   end
-  pair(out, "point lookup id = #{absent} (absent -> empty)",
-       "id = #{absent}", "id + 0 = #{absent}", block.call(->(id, _v) { id == absent }))
-  pair(out, "range #{lo}..#{hi}",
-       "id BETWEEN #{lo} AND #{hi}", "id + 0 BETWEEN #{lo} AND #{hi}",
-       block.call(->(id, _v) { id >= lo && id <= hi }))
-  pair(out, "range #{empty_lo}..#{empty_hi} (empty)",
-       "id BETWEEN #{empty_lo} AND #{empty_hi}", "id + 0 BETWEEN #{empty_lo} AND #{empty_hi}",
-       block.call(->(id, _v) { id >= empty_lo && id <= empty_hi }))
+  pair.call("point lookup id = #{absent} (absent -> empty)", "id = #{absent}", "id + 0 = #{absent}",
+            block.call(->(id, _v) { id == absent }))
+  pair.call("range #{lo}..#{hi}", "id BETWEEN #{lo} AND #{hi}", "id + 0 BETWEEN #{lo} AND #{hi}",
+            block.call(->(id, _v) { id >= lo && id <= hi }))
+  pair.call("range 41..50 (empty)", "id BETWEEN 41 AND 50", "id + 0 BETWEEN 41 AND 50",
+            block.call(->(id, _v) { id >= 41 && id <= 50 }))
 
   out.join("\n") + "\n"
 end
 
-# Run one core's harness once; return {seed => "PASS"/"FAIL", ...} for our metamorphic files,
-# plus the FAIL detail line per failing seed (for reporting).
+# --- scenario: LIMIT short-circuit (windows reconstruct the ordered whole) ---------------------
+def gen_limit(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(10, random: rng).sort
+  rows = ids.map { |id| [id, rng.rand(-50..50)] }
+  flat = ->(rs) { rs.flat_map { |id, v| [id.to_s, v.to_s] } }
+  n = rows.size
+  a = rng.rand(2..n - 2)
+
+  out = header(seed, LIMIT_REQ, "LIMIT short-circuit (windows reconstruct the ordered whole)")
+  stmt(out, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v| "(#{id}, #{v})" }.join(', ')}")
+
+  # Each window of `ORDER BY id` (a total order) must match its by-construction slice: LIMIT a
+  # short-circuits the scan; OFFSET a / the full query scan further. Boundaries (0, n, >n) stress
+  # the short-circuit's stop condition. `LIMIT a` ++ `OFFSET a` reconstructs the full result.
+  windows = [
+    ["LIMIT #{a}", rows[0, a]],
+    ["LIMIT #{a} OFFSET #{a}", rows[a, a] || []],
+    ["OFFSET #{a}", rows[a..] || []],
+    ["LIMIT 0", []],
+    ["LIMIT #{n}", rows],
+    ["LIMIT #{n + 3}", rows],
+    ["OFFSET #{n}", []],
+    ["", rows],
+  ]
+  windows.each do |clause, exp|
+    out << "# ORDER BY id #{clause.empty? ? '(full reference)' : clause}"
+    q(out, "II", "SELECT id, v FROM t ORDER BY id #{clause}".strip, flat.call(exp))
+  end
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: JOIN base-table pk pushdown ----------------------------------------------------
+def gen_join(seed)
+  rng = Random.new(seed)
+  # a's key domain (1..6) is WIDER than b's (1..4), so some a-rows have NO match — that is what
+  # makes the LEFT-JOIN NULL-extension path reachable (and worth pushing a predicate through).
+  a = (1..20).to_a.sample(6, random: rng).sort.map { |id| [id, rng.rand(1..6)] }   # (id, join key)
+  b = (101..120).to_a.sample(6, random: rng).sort.map { |id| [id, rng.rand(1..4)] }
+
+  inner = a.flat_map { |aid, ak| b.select { |_, bk| bk == ak }.map { |bid, _| [aid, bid] } }
+  left = a.flat_map do |aid, ak|
+    m = b.select { |_, bk| bk == ak }
+    m.empty? ? [[aid, nil]] : m.map { |bid, _| [aid, bid] }
+  end
+  # ORDER BY a.id, b.id with NULLs LAST (the PostgreSQL model, CLAUDE.md §8).
+  ord = ->(rs) { rs.sort_by { |aid, bid| [aid, bid.nil? ? 1 : 0, bid || 0] } }
+  flat = ->(rs) { ord.call(rs).flat_map { |aid, bid| [aid.to_s, bid.nil? ? "NULL" : bid.to_s] } }
+
+  ka = inner.map(&:first).uniq.sample(random: rng) || a.first.first          # an a.id WITH matches
+  ka_null = (a.map(&:first) - inner.map(&:first)).sample(random: rng) || ka  # an a.id with NO match
+  jb = inner.map(&:last).uniq.sample(random: rng) || b.first.first
+
+  out = header(seed, JOIN_REQ, "JOIN base-table pk pushdown (bound a relation by its own WHERE)")
+  stmt(out, "CREATE TABLE a (id int32 PRIMARY KEY, k int32)")
+  stmt(out, "CREATE TABLE b (id int32 PRIMARY KEY, k int32)")
+  stmt(out, "INSERT INTO a VALUES #{a.map { |id, k| "(#{id}, #{k})" }.join(', ')}")
+  stmt(out, "INSERT INTO b VALUES #{b.map { |id, k| "(#{id}, #{k})" }.join(', ')}")
+
+  jpair = lambda do |title, join, opt, scan, exp|
+    out << "# #{title}"
+    out << "# pushdown (bare pk bounds this relation's scan)"
+    q(out, "II", "SELECT a.id, b.id FROM a #{join} b ON a.k = b.k WHERE #{opt} ORDER BY a.id, b.id", flat.call(exp))
+    out << "# full scan (+0 defeats pushdown) — MUST match"
+    q(out, "II", "SELECT a.id, b.id FROM a #{join} b ON a.k = b.k WHERE #{scan} ORDER BY a.id, b.id", flat.call(exp))
+  end
+
+  jpair.call("INNER, bound a by a.id = #{ka}", "JOIN", "a.id = #{ka}", "a.id + 0 = #{ka}",
+             inner.select { |aid, _| aid == ka })
+  jpair.call("LEFT, bound the preserved side by a.id = #{ka_null} (NULL-extension survives pushdown)",
+             "LEFT JOIN", "a.id = #{ka_null}", "a.id + 0 = #{ka_null}", left.select { |aid, _| aid == ka_null })
+  jpair.call("INNER, bound b by b.id = #{jb}", "JOIN", "b.id = #{jb}", "b.id + 0 = #{jb}",
+             inner.select { |_, bid| bid == jb })
+
+  out.join("\n") + "\n"
+end
+
+SCENARIOS = {
+  "pushdown" => method(:gen_pushdown),
+  "limit" => method(:gen_limit),
+  "join" => method(:gen_join),
+}.freeze
+
+# Run one core's harness once; return {basename => "PASS"/"FAIL"/"SKIP"} and the detail line per
+# non-pass file, for every metamorphic file in the tree.
 def run_core(repo, core)
   out, = Open3.capture2e(*core[:cmd], chdir: File.join(repo, *core[:dir]))
   status = {}
   detail = {}
   out.each_line do |l|
-    next unless (m = l.match(%r{^(PASS|FAIL|SKIP)\s+(metamorphic/_norec_seed(\d+)\.test)}))
+    next unless (m = l.match(%r{^(PASS|FAIL|SKIP)\s+metamorphic/(_norec_\w+\.test)}))
 
-    seed = m[3].to_i
-    status[seed] = m[1]
-    detail[seed] = l.strip if m[1] != "PASS"
+    status[m[2]] = m[1]
+    detail[m[2]] = l.strip if m[1] != "PASS"
   end
   [status, detail]
 end
@@ -121,48 +218,54 @@ keep = !args.delete("--keep").nil?
 sweep = (i = args.index("--sweep")) ? args[i + 1].to_i : nil
 seeds_arg = (i = args.index("--seeds")) ? args[i + 1].split(",").map(&:to_i) : nil
 cores_arg = (i = args.index("--cores")) ? args[i + 1].split(",") : nil
-bare = args.find { |a| a =~ /\A\d+\z/ }
+bare = args.find { |x| x =~ /\A\d+\z/ }
 
 seeds = seeds_arg || (sweep ? (1..sweep).to_a : [bare ? bare.to_i : 1])
-# A sweep is the full differential CI check (all three cores); a single seed defaults to the
-# fast dev pair (Go + TS) unless cores are named explicitly.
+# A sweep is the full differential CI check (all three cores); a single seed defaults to the fast
+# dev pair (Go + TS) unless cores are named explicitly.
 cores = cores_arg || ((sweep || seeds_arg) ? CORES.keys : %w[go ts])
 cores.each { |c| abort "unknown core #{c.inspect} (have: #{CORES.keys.join(', ')})" unless CORES[c] }
 
 repo = File.expand_path("..", __dir__)
 dir = File.join(repo, "spec/conformance/suites/metamorphic")
 
-# --- generate every seed, run each core once, report a matrix -------------------------------
+# --- generate every (scenario × seed), run each core once, report -----------------------------
 FileUtils.mkdir_p(dir)
-seeds.each { |s| File.write(File.join(dir, "_norec_seed#{s}.test"), generate(s)) }
-span = seeds.size == 1 ? "seed #{seeds.first}" : "#{seeds.size} seeds (#{seeds.first}..#{seeds.last})"
-puts "NoREC metamorphic sweep — #{span}, #{PAIRS_PER_SEED} pairs each, cores: #{cores.join(', ')}"
+specs = []
+seeds.each do |s|
+  SCENARIOS.each do |scn, gen|
+    text = gen.call(s)
+    base = "_norec_#{scn}_seed#{s}.test"
+    File.write(File.join(dir, base), text)
+    specs << { scn: scn, seed: s, base: base, rels: text.scan(/^query /).size }
+  end
+end
+total_rels = specs.sum { |sp| sp[:rels] }
+span = seeds.size == 1 ? "seed #{seeds.first}" : "seeds #{seeds.first}..#{seeds.last}"
+puts "NoREC metamorphic sweep — #{span} × {#{SCENARIOS.keys.join(', ')}} = #{specs.size} files " \
+     "(#{total_rels} relations), cores: #{cores.join(', ')}"
 
 failures = 0
 begin
   cores.each do |name|
     status, detail = run_core(repo, CORES[name])
-    missing = seeds.reject { |s| status.key?(s) }
-    failed = seeds.select { |s| status[s] == "FAIL" }
-    failures += failed.size + missing.size
-    pass = seeds.size - failed.size - missing.size
-    note = []
-    note << "FAILED: #{failed.join(', ')}" unless failed.empty?
-    note << "NOT RUN/SKIPPED: #{missing.join(', ')}" unless missing.empty?
-    printf("  %-4s %2d/%-2d PASS%s\n", name, pass, seeds.size, note.empty? ? "" : "  — #{note.join('; ')}")
-    failed.each { |s| puts "       #{detail[s]}" }
+    failed = specs.reject { |sp| status[sp[:base]] == "PASS" }
+    failures += failed.size
+    printf("  %-4s %3d/%-3d files PASS%s\n", name, specs.size - failed.size, specs.size,
+           failed.empty? ? "" : "  — FAILED: #{failed.map { |sp| "#{sp[:scn]}@#{sp[:seed]}" }.join(', ')}")
+    failed.each { |sp| puts "       #{detail[sp[:base]] || "#{sp[:base]} (not run / skipped)"}" }
   end
 ensure
   unless keep
-    seeds.each { |s| FileUtils.rm_f(File.join(dir, "_norec_seed#{s}.test")) }
+    specs.each { |sp| FileUtils.rm_f(File.join(dir, sp[:base])) }
     Dir.rmdir(dir) if Dir.exist?(dir) && Dir.empty?(dir)
   end
 end
 
-checks = seeds.size * cores.size
+checks = specs.size * cores.size
 if failures.zero?
-  puts "\nsweep PASS — #{checks} checks (#{seeds.size} seeds × #{cores.size} cores), " \
-       "#{seeds.size * PAIRS_PER_SEED} metamorphic pairs/core, all green."
+  puts "\nsweep PASS — #{checks} checks (#{specs.size} files × #{cores.size} cores), " \
+       "#{SCENARIOS.size} relations/seed, all green."
   exit 0
 else
   puts "\nsweep FAIL — #{failures}/#{checks} checks failed."

@@ -216,15 +216,16 @@ profile's capabilities passes. Harnesses arrive with the first vertical slice
 ## 8. Metamorphic generator (SQLancer-style) — and the obligation to grow it
 
 [scripts/norec_gen.rb](../../scripts/norec_gen.rb) generates self-checking **NoREC**
-(Non-optimizing Reference Engine Construction) tests: for a predicate it emits an *optimized*
-query and a *semantically-equivalent non-optimizable* rewrite that must return identical rows.
+(Non-optimizing Reference Engine Construction) tests: a query that triggers an optimization and a
+*semantically-equivalent* form that does **not** must return identical rows. The canonical case:
 jed's planner pushes a predicate to a B-tree seek/range only when the primary key appears as a
 **bare column** (`detect_pk_bound`), so `id = K` is pushed down while `id + 0 = K` (a
 `BinaryOp`) full-scans — two different code paths that must agree. Expected rows are known **by
-construction** from the generated data, so no oracle (PG or otherwise) is consulted. `rake
-corpus:norec_sweep` runs a fixed, reproducible sweep (seeds 1..N) on **all three cores**, so
-each test is checked **metamorphically** (the two paths agree) *and* **differentially** (the
-cores agree). It is in the `rake ci` gate.
+construction** from the generated data, so no oracle (PG or otherwise) is consulted. One
+**scenario per optimization** (see the covered list below); each seed emits one file per
+scenario. `rake corpus:norec_sweep` runs a fixed, reproducible sweep (seeds 1..N × scenarios) on
+**all three cores**, so each test is checked **metamorphically** (the two forms agree) *and*
+**differentially** (the cores agree). It is in the `rake ci` gate.
 
 **Why this catches what the differential cores cannot.** Running every `.test` on Rust/Go/TS
 catches the cores *disagreeing*; it is blind to a bug **all three share**. A metamorphic
@@ -238,11 +239,15 @@ optimization or a new evaluable query shape, add a NoREC relation for it** (an o
 a rewrite the planner cannot optimize), in the same change. A passing sweep that silently tests
 only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent caps").
 
-- **Covered today:** point-lookup (`pk = K`) and range (`pk BETWEEN a AND b`) pushdown on an
-  integer primary key.
-- **NOT yet covered (needs a new relation):** `LIMIT` short-circuit, join pushdown, correlated
-  pushdown, and any future index / DISTINCT / aggregate pushdown. Each is an existing or future
-  optimization the sweep currently does **not** exercise.
+- **Covered today** (one scenario each): **pushdown** — point-lookup (`pk = K`) and range
+  (`pk BETWEEN a AND b`) on an integer primary key; **limit** — `LIMIT` short-circuit, where the
+  windows of an `ORDER BY`-on-pk query (`LIMIT a`, `OFFSET a`, boundaries) must reconstruct the
+  ordered whole; **join** — JOIN base-table pk pushdown, a constant `pk = K` bounding one
+  relation's scan (INNER, plus a preserved-side LEFT predicate whose NULL-extension must survive
+  the pushdown), defeated by `pk + 0 = K`.
+- **NOT yet covered (needs a new relation):** correlated-subquery pk pushdown
+  (`query.correlated_pushdown`), and any future index / DISTINCT / aggregate pushdown. Each is an
+  existing or future optimization the sweep currently does **not** exercise.
 
 **Reducing a discovered failure.** Generation is seeded, so a failure reproduces deterministically
 (CLAUDE.md §10); reduce it to a minimal `.test` and commit it to the corpus as a normal regression

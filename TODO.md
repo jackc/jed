@@ -875,8 +875,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       intentional divergence in the override ledger; (b) **when you add a query optimization or a
       new evaluable query shape, add a NoREC relation for it** to `norec_gen.rb` — the sweep does
       **not** discover new optimizations, and adding *seeds* does not add coverage. NoREC covers
-      point-lookup + range pushdown on an int PK today; `LIMIT` short-circuit, joins, and future
-      index/DISTINCT/aggregate pushdown are **not yet** covered.
+      point-lookup + range pushdown, `LIMIT` short-circuit, and JOIN base-table pk pushdown today;
+      **correlated-subquery pushdown** and future index/DISTINCT/aggregate pushdown are **not yet**
+      covered.
 
 ---
 
