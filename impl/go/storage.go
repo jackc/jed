@@ -71,9 +71,11 @@ func (s *TableStore) leafSrc() leafSource {
 	return &pagedSource{paging: s.paging, colTypes: s.colTypes}
 }
 
-// weight is this row's on-disk record size — the weight the page-backed B-tree splits on.
+// weight is this row's on-disk record size — the weight the page-backed B-tree splits on. Accounts
+// for out-of-line spill at cap (an externalized value weighs its pointer, not its full body —
+// large-values.md §12), so split points match the serialized pages.
 func (s *TableStore) weight(key []byte, row Row) uint32 {
-	return uint32(recordSize(s.colTypes, key, row))
+	return uint32(recordSize(s.colTypes, key, row, s.cap))
 }
 
 // Insert adds a row under its encoded key. Returns (false, nil) if the key already exists

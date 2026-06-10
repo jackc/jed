@@ -62,7 +62,11 @@ func (s *sharedPaging) faultLeaf(page uint32, colTypes []ScalarType) (*pnode, er
 		if err != nil {
 			return nil, err
 		}
-		return decodeLeafNode(block, page, colTypes)
+		// Materialize any external value by following its overflow chain through the pager (the leaf
+		// block holds only the pointer — large-values.md §12). s.mu is already held, so the chain
+		// reads reuse it (a different page each time; no re-lock).
+		fetch := func(p uint32) ([]byte, error) { return s.pgr.readBlock(p) }
+		return decodeLeafNode(block, page, colTypes, fetch)
 	})
 }
 

@@ -25,9 +25,16 @@ const (
 	pageCatalog   byte   = 1               // page_type for a catalog page
 	pageLeaf      byte   = 2               // page_type for a B-tree leaf node
 	pageInterior  byte   = 3               // page_type for a B-tree interior node
+	pageOverflow  byte   = 4               // page_type for an out-of-line value slab (large-values.md §12)
 	rootPage      uint32 = 2               // catalog root of a fresh empty db (relocatable thereafter)
 	minPageSize          = pageHeader + 36 // smallest valid page size (page + 36-byte meta header; format.md)
 	maxPageSize          = 65536           // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
+
+	// tagExternal is the value-codec presence tag for a present external value: the body is a
+	// pointer (u32 first_page + u32 payload_len) into an overflow chain, not the value (large-values.md
+	// §12). 0x00 present-inline / 0x01 NULL unchanged; 0x03/0x04 reserved for compression (Slice B).
+	tagExternal    byte = 0x02
+	externalPtrLen      = 1 + 4 + 4 // tag + first_page(u32) + payload_len(u32) in a record
 )
 
 // typeCodeForScalar maps a scalar type to its stable on-disk code, independent of
@@ -224,9 +231,9 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	writeMeta(image, ps, 0, pageSize, txid, catRoot, pageCount)
 	writeMeta(image, ps, 1, pageSize, txid, catRoot, pageCount)
 
-	// B-tree node pages.
+	// B-tree node + overflow pages.
 	for _, bp := range body {
-		writePage(image, ps, int(bp.index), bp.pageType, bp.itemCount, 0, bp.payload)
+		writePage(image, ps, int(bp.index), bp.pageType, bp.itemCount, bp.nextPage, bp.payload)
 	}
 
 	// Catalog chain.
@@ -246,11 +253,13 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	return image, nil
 }
 
-// bodyPage is one serialized B-tree node awaiting write: its assigned index, type, key count, payload.
+// bodyPage is one serialized page awaiting write: its index, type, key count, chain link, payload.
+// nextPage is 0 for B-tree nodes and the chain link for overflow pages (large-values.md §12).
 type bodyPage struct {
 	index     uint32
 	pageType  byte
 	itemCount uint32
+	nextPage  uint32
 	payload   []byte
 }
 
@@ -286,13 +295,20 @@ func serializeNode(n *pnode, table *Table, capacity int, nextIndex uint32, body 
 			payload = appendU32(payload, cp)
 		}
 	}
+	// Encode records, spilling over-large values to overflow pages allocated after this node's index
+	// (post-order traversal + column order → deterministic, golden-pinnable layout).
+	var ovf []overflowPageOut
+	take := func() uint32 { p := nextIndex; nextIndex++; return p }
 	for i := range n.keys {
-		payload = append(payload, encodeRecord(table, n.keys[i], n.vals[i])...)
+		payload = append(payload, encodeRecord(table, n.keys[i], n.vals[i], capacity, take, &ovf)...)
 	}
 	if len(payload) > capacity {
 		return 0, 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
 	}
 	*body = append(*body, bodyPage{index: index, pageType: pageType, itemCount: uint32(len(n.keys)), payload: payload})
+	for _, o := range ovf {
+		*body = append(*body, bodyPage{index: o.index, pageType: pageOverflow, itemCount: o.itemCount, nextPage: o.nextPage, payload: o.payload})
+	}
 	return index, nextIndex, nil
 }
 
@@ -433,8 +449,11 @@ func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, 
 			payload = appendU32(payload, cp)
 		}
 	}
+	// Encode records, spilling over-large values to overflow pages drawn from the same allocator
+	// (free-list first, then high-water — large-values.md §12).
+	var ovf []overflowPageOut
 	for i := range n.keys {
-		payload = append(payload, encodeRecord(table, n.keys[i], n.vals[i])...)
+		payload = append(payload, encodeRecord(table, n.keys[i], n.vals[i], capacity, alloc.take, &ovf)...)
 	}
 	if len(payload) > capacity {
 		return 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
@@ -442,6 +461,9 @@ func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, 
 	index := alloc.take()
 	n.page = index
 	*pages = append(*pages, dirtyPage{index: index, bytes: makePage(ps, pageType, uint32(len(n.keys)), 0, payload)})
+	for _, o := range ovf {
+		*pages = append(*pages, dirtyPage{index: o.index, bytes: makePage(ps, pageOverflow, o.itemCount, o.nextPage, o.payload)})
+	}
 	return index, nil
 }
 
@@ -492,11 +514,10 @@ func LoadDatabase(image []byte) (*Database, error) {
 			hasPK := table.PrimaryKeyIndex() >= 0
 			snap.putTable(table, uint32(pageSize))
 			if tableRoot != 0 {
-				root, length, err := readTree(image, pageSize, tableRoot, colTypes)
+				root, length, err := readTree(image, pageSize, tableRoot, colTypes, reached)
 				if err != nil {
 					return nil, err
 				}
-				collectNodePages(root, reached)
 				store := snap.stores[strings.ToLower(name)]
 				store.setTree(root, length)
 				// No-PK keys are synthetic int64 rowids — advance the counter past the largest (the
@@ -525,22 +546,6 @@ func LoadDatabase(image []byte) (*Database, error) {
 	}
 	db.committed = snap
 	return db, nil
-}
-
-// collectNodePages records the on-disk page index of node and every descendant (a loaded tree, all
-// pages set) into reached — the live set the free-list reconstruction subtracts from
-// [2, pageCount) (P6.2).
-func collectNodePages(n *pnode, reached map[uint32]bool) {
-	reached[n.page] = true
-	for _, c := range n.children {
-		// An OnDisk leaf contributes its page without being loaded — the free-list walk reuses the
-		// resident interior skeleton (pager.md §4); a resident child recurses.
-		if c.node != nil {
-			collectNodePages(c.node, reached)
-		} else {
-			reached[c.page] = true
-		}
-	}
 }
 
 // LoadDatabasePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
@@ -616,6 +621,16 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 				if err != nil {
 					return nil, err
 				}
+				// The skeleton leaves leaves OnDisk (unread), so their records' overflow chains are
+				// invisible to the reachability walk above. For a table with spillable columns, read
+				// the leaves now to collect those live chains — else the free-list would reclaim still-
+				// referenced overflow pages (large-values.md §12; default open is this paged path).
+				// Dead chains still leak until the next open, matching the P6.2 orphan model.
+				if anySpillable(colTypes) {
+					if err := collectLeafOverflow(paging, tableRoot, colTypes, reached); err != nil {
+						return nil, err
+					}
+				}
 				store.setTree(root, length)
 				if !hasPK && length > 0 {
 					// No-PK rowid reconstruction faults the leaves to find the largest key; only for
@@ -642,6 +657,66 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 	db.committed = snap
 	db.paging = paging
 	return db, nil
+}
+
+// anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
+func anySpillable(colTypes []ScalarType) bool {
+	for _, ty := range colTypes {
+		if isSpillable(ty) {
+			return true
+		}
+	}
+	return false
+}
+
+// collectLeafOverflow walks a table's on-disk B-tree, reading each leaf and adding the overflow chain
+// pages its records reference to reached (large-values.md §12). Interior separators are skipped here —
+// readSkeletonNode already collected their chains. Used only for tables with spillable columns during
+// the paged-open free-list reconstruction; it reads (and transiently materializes) every leaf, the
+// deliberate cost of reconstruct-on-open reclamation for overflow.
+func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []ScalarType, reached map[uint32]bool) error {
+	block, err := paging.pgr.readBlock(pageIdx)
+	if err != nil {
+		return err
+	}
+	pg, err := parsePage(block)
+	if err != nil {
+		return err
+	}
+	switch pg.pageType {
+	case pageLeaf:
+		fetch := func(p uint32) ([]byte, error) { return paging.pgr.readBlock(p) }
+		pos := 0
+		for i := uint32(0); i < pg.itemCount; i++ {
+			_, _, ovf, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
+			if err != nil {
+				return err
+			}
+			for _, p := range ovf {
+				reached[p] = true
+			}
+		}
+		return nil
+	case pageInterior:
+		n := int(pg.itemCount)
+		pos := 0
+		cps := make([]uint32, 0, n+1)
+		for i := 0; i < n+1; i++ {
+			cp, err := readU32(pg.payload, &pos)
+			if err != nil {
+				return err
+			}
+			cps = append(cps, cp)
+		}
+		for _, cp := range cps {
+			if err := collectLeafOverflow(paging, cp, colTypes, reached); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return NewError(DataCorrupted, "expected a B-tree node page")
+	}
 }
 
 // readSkeleton reads a table's on-disk B-tree (rooted at rootPage) into a demand-paged skeleton:
@@ -698,12 +773,17 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ScalarTyp
 			total += clen
 		}
 		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
+		capacity := len(block) - pageHeader
+		fetch := func(p uint32) ([]byte, error) { return paging.pgr.readBlock(p) }
 		for i := 0; i < n; i++ {
-			key, row, err := decodeRecord(colTypes, pg.payload, &pos)
+			key, row, ovf, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
 			if err != nil {
 				return childRef{}, 0, err
 			}
-			weights = append(weights, uint32(recordSize(colTypes, key, row)))
+			weights = append(weights, uint32(recordSize(colTypes, key, row, capacity)))
+			for _, p := range ovf {
+				reached[p] = true
+			}
 			keys = append(keys, key)
 			vals = append(vals, row)
 		}
@@ -719,22 +799,28 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ScalarTyp
 // N+1 child pointers then its N records; we recurse the pointers, then read the separators. Weights
 // are recomputed from the value codec (the exact size the writer used), so the loaded tree is ready
 // for further size-driven splits.
-func readTree(image []byte, ps int, pageIdx uint32, colTypes []ScalarType) (*pnode, int, error) {
+func readTree(image []byte, ps int, pageIdx uint32, colTypes []ScalarType, reached map[uint32]bool) (*pnode, int, error) {
+	reached[pageIdx] = true
+	capacity := ps - pageHeader
 	pg, err := readPage(image, ps, pageIdx)
 	if err != nil {
 		return nil, 0, err
 	}
+	fetch := func(p uint32) ([]byte, error) { return pageBlock(image, ps, p) }
 	switch pg.pageType {
 	case pageLeaf:
 		n := int(pg.itemCount)
 		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
 		pos := 0
 		for i := 0; i < n; i++ {
-			key, row, err := decodeRecord(colTypes, pg.payload, &pos)
+			key, row, ovf, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
 			if err != nil {
 				return nil, 0, err
 			}
-			weights = append(weights, uint32(recordSize(colTypes, key, row)))
+			weights = append(weights, uint32(recordSize(colTypes, key, row, capacity)))
+			for _, p := range ovf {
+				reached[p] = true
+			}
 			keys = append(keys, key)
 			vals = append(vals, row)
 		}
@@ -749,7 +835,7 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ScalarType) (*pno
 			if err != nil {
 				return nil, 0, err
 			}
-			child, clen, err := readTree(image, ps, cp, colTypes)
+			child, clen, err := readTree(image, ps, cp, colTypes, reached)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -760,11 +846,14 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ScalarType) (*pno
 		}
 		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
 		for i := 0; i < n; i++ {
-			key, row, err := decodeRecord(colTypes, pg.payload, &pos)
+			key, row, ovf, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
 			if err != nil {
 				return nil, 0, err
 			}
-			weights = append(weights, uint32(recordSize(colTypes, key, row)))
+			weights = append(weights, uint32(recordSize(colTypes, key, row, capacity)))
+			for _, p := range ovf {
+				reached[p] = true
+			}
 			keys = append(keys, key)
 			vals = append(vals, row)
 		}
@@ -775,26 +864,157 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ScalarType) (*pno
 	}
 }
 
-// recordSize is the on-disk size of a record (key_len(u16) | key | each column value) — the weight
-// the page-backed B-tree splits on (format.md). It must equal len(encodeRecord ...), so in-memory
-// node boundaries match serialized page boundaries; computed from the value codec to stay in lockstep.
-func recordSize(colTypes []ScalarType, key []byte, row Row) int {
-	n := 2 + len(key)
-	for i, ty := range colTypes {
-		n += len(encodeValue(ty, row[i]))
-	}
-	return n
+// isSpillable reports whether a value of this type can be stored out-of-line (a variable-length
+// type). Fixed-width types are tiny and always stay inline (spec/design/large-values.md §12).
+func isSpillable(ty ScalarType) bool {
+	return ty.IsText() || ty.IsBytea() || ty.IsDecimal()
 }
 
-// encodeRecord builds one record: key_len(u16) | key | payload(each column value).
-func encodeRecord(table *Table, key []byte, row Row) []byte {
+// recordMaxFor is the largest a single record may serialize to and still satisfy the B-tree split
+// contract — RECORD_MAX = (C-12)/2 where C = capacity is the page payload (format.md "Why the
+// record cap"). The spill planner reduces a record to ≤ this by externalizing values.
+func recordMaxFor(capacity int) int {
+	m := (capacity - pageHeader) / 2
+	if m < 0 {
+		m = 0
+	}
+	return m
+}
+
+// planDispositions decides each column's on-disk disposition (Slice A: inline or external-plain) and
+// returns (isExternal per column, on-disk record size) — spec/design/large-values.md §3/§12. Spill
+// only when forced: if the all-inline record already fits RECORD_MAX nothing spills; else externalize
+// the largest spillable values (ties by column order) until it fits. Deterministic and cross-core
+// identical (a §8 contract); shared by the serializer and by recordSize (the B-tree split weight).
+func planDispositions(colTypes []ScalarType, key []byte, row Row, capacity int) ([]bool, int) {
+	inline := make([]int, len(colTypes))
+	size := 2 + len(key)
+	for i, ty := range colTypes {
+		inline[i] = len(encodeValue(ty, row[i]))
+		size += inline[i]
+	}
+	external := make([]bool, len(colTypes))
+	max := recordMaxFor(capacity)
+	if size <= max {
+		return external, size
+	}
+	// Spillable, currently-inline columns whose externalization actually shrinks the record
+	// (inline > pointer), largest inline size first; ties by column order — deterministic.
+	cand := make([]int, 0, len(colTypes))
+	for i, ty := range colTypes {
+		if isSpillable(ty) && inline[i] > externalPtrLen {
+			cand = append(cand, i)
+		}
+	}
+	sort.SliceStable(cand, func(a, b int) bool { return inline[cand[a]] > inline[cand[b]] })
+	for _, i := range cand {
+		if size <= max {
+			break
+		}
+		external[i] = true
+		size = size - inline[i] + externalPtrLen
+	}
+	return external, size
+}
+
+// recordSize is the on-disk size of a record — the weight the page-backed B-tree splits on
+// (format.md). Accounts for out-of-line spill: an externalized value contributes its fixed pointer
+// size, not its full inline body (large-values.md §12). Must equal what the serializer produces, so
+// in-memory node boundaries match serialized page boundaries.
+func recordSize(colTypes []ScalarType, key []byte, row Row, capacity int) int {
+	_, size := planDispositions(colTypes, key, row, capacity)
+	return size
+}
+
+// valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
+// externalized (large-values.md §12): raw UTF-8 for text / raw bytes for bytea (both in v.Str), the
+// decimal body (encoding minus its presence tag) for decimal. Only spillable types reach here.
+func valuePayload(ty ScalarType, v Value) []byte {
+	switch {
+	case ty.IsText(), ty.IsBytea():
+		return []byte(v.Str)
+	case ty.IsDecimal():
+		return encodeValue(ty, v)[1:] // strip the leading presence tag
+	default:
+		panic("only spillable values are externalized")
+	}
+}
+
+// valueFromPayload reconstructs a value from the P(v) content gathered from its overflow chain
+// (inverse of valuePayload) — large-values.md §12.
+func valueFromPayload(ty ScalarType, payload []byte) (Value, error) {
+	switch {
+	case ty.IsText():
+		return TextValue(string(payload)), nil
+	case ty.IsBytea():
+		return ByteaValue(payload), nil
+	case ty.IsDecimal():
+		pos := 0
+		return decodeDecimalBody(payload, &pos)
+	default:
+		return Value{}, NewError(DataCorrupted, "a non-spillable type was stored external")
+	}
+}
+
+// encodeRecord builds one record (key_len(u16) | key | payload), spilling over-large values out-of-
+// line per the disposition plan (large-values.md §12). For each externalized value, allocate overflow
+// page(s) via take, append them to *ovf, and write a tag|first_page|len pointer instead of the inline
+// body. capacity is the page payload (the slab size + the spill-plan input). Shared by the whole-image
+// (serializeNode) and incremental (serializeDirty) writers, which differ only in how take allocates.
+func encodeRecord(table *Table, key []byte, row Row, capacity int, take func() uint32, ovf *[]overflowPageOut) []byte {
+	colTypes := make([]ScalarType, len(table.Columns))
+	for i, c := range table.Columns {
+		colTypes[i] = c.Type
+	}
+	external, _ := planDispositions(colTypes, key, row, capacity)
 	out := make([]byte, 0, 2+len(key)+len(row)*2)
 	out = appendU16(out, uint16(len(key)))
 	out = append(out, key...)
 	for i, col := range table.Columns {
-		out = append(out, encodeValue(col.Type, row[i])...)
+		if external[i] {
+			payload := valuePayload(col.Type, row[i])
+			first := writeOverflowChain(payload, capacity, take, ovf)
+			out = append(out, tagExternal)
+			out = appendU32(out, first)
+			out = appendU32(out, uint32(len(payload)))
+		} else {
+			out = append(out, encodeValue(col.Type, row[i])...)
+		}
 	}
 	return out
+}
+
+// overflowPageOut is one overflow page produced while serializing a record's external value.
+type overflowPageOut struct {
+	index     uint32
+	itemCount uint32
+	nextPage  uint32
+	payload   []byte
+}
+
+// writeOverflowChain writes payload across a chain of overflow pages (capacity-byte slabs, in order),
+// allocating each page via take and linking it with nextPage (0 terminates). Returns the first page
+// index for the record's pointer. payload is always non-empty (only values larger than the pointer
+// spill — planDispositions).
+func writeOverflowChain(payload []byte, capacity int, take func() uint32, ovf *[]overflowPageOut) uint32 {
+	n := (len(payload) + capacity - 1) / capacity
+	indices := make([]uint32, n)
+	for i := range indices {
+		indices[i] = take()
+	}
+	for j := 0; j < n; j++ {
+		lo := j * capacity
+		hi := lo + capacity
+		if hi > len(payload) {
+			hi = len(payload)
+		}
+		var next uint32
+		if j+1 < n {
+			next = indices[j+1]
+		}
+		*ovf = append(*ovf, overflowPageOut{index: indices[j], itemCount: uint32(hi - lo), nextPage: next, payload: payload[lo:hi]})
+	}
+	return indices[0]
 }
 
 // tableEntryBytes builds one table's catalog entry (format.md).
@@ -1014,11 +1234,26 @@ func readPage(image []byte, ps int, index uint32) (page, error) {
 	return parsePage(image[off : off+ps])
 }
 
+// pageBlock returns one page's full block, copied out of a whole image — the overflow-chain fetch for
+// the in-memory load path (readTree, large-values.md §12).
+func pageBlock(image []byte, ps int, index uint32) ([]byte, error) {
+	off := int(index) * ps
+	if off+ps > len(image) {
+		return nil, NewError(DataCorrupted, "page index out of range")
+	}
+	out := make([]byte, ps)
+	copy(out, image[off:off+ps])
+	return out, nil
+}
+
 // decodeLeafNode decodes a single leaf page block into a resident node, for the demand-paging fault
 // path (spec/design/pager.md §4; paging.go faultLeaf). block is one page; page is its page id, stamped
 // on the node so a later incremental commit keeps it clean. Weights are recomputed from the value
 // codec (the exact size the writer used), so the loaded leaf is ready for further splits.
-func decodeLeafNode(block []byte, pageID uint32, colTypes []ScalarType) (*pnode, error) {
+// fetch reads an overflow page block by index (to materialize external values whose chains live
+// outside this leaf — large-values.md §12); the chain pages it visits are discarded here (the
+// free-list is reconstructed at open, not on a runtime fault).
+func decodeLeafNode(block []byte, pageID uint32, colTypes []ScalarType, fetch func(uint32) ([]byte, error)) (*pnode, error) {
 	pg, err := parsePage(block)
 	if err != nil {
 		return nil, err
@@ -1026,15 +1261,16 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []ScalarType) (*pnode,
 	if pg.pageType != pageLeaf {
 		return nil, NewError(DataCorrupted, "demand-paged a non-leaf page")
 	}
+	capacity := len(block) - pageHeader
 	n := int(pg.itemCount)
 	keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
 	pos := 0
 	for i := 0; i < n; i++ {
-		key, row, err := decodeRecord(colTypes, pg.payload, &pos)
+		key, row, _, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
 		if err != nil {
 			return nil, err
 		}
-		weights = append(weights, uint32(recordSize(colTypes, key, row)))
+		weights = append(weights, uint32(recordSize(colTypes, key, row, capacity)))
 		keys = append(keys, key)
 		vals = append(vals, row)
 	}
@@ -1087,7 +1323,10 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, error) {
 		// rows). Absent → no bytes consumed (spec/fileformat/format.md).
 		var defaultVal *Value
 		if flags&0b100 != 0 {
-			dv, err := readValue(ty, buf, pos)
+			// A default is a small evaluated literal — never externalized — so no overflow reader
+			// is needed (a 0x02 tag here would be a corrupt catalog).
+			var sink []uint32
+			dv, err := readValue(ty, buf, pos, nil, &sink)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -1109,127 +1348,193 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, error) {
 	return &Table{Name: name, Columns: columns}, root, nil
 }
 
-func decodeRecord(colTypes []ScalarType, buf []byte, pos *int) ([]byte, Row, error) {
+// decodeRecord decodes one record (key, row) and the overflow chain pages any external value
+// followed (for the free-list reachability walk — large-values.md §12). fetch reads a page block by
+// index, used to follow overflow chains; nil is only valid where no value can be external (a default).
+func decodeRecord(colTypes []ScalarType, buf []byte, pos *int, fetch func(uint32) ([]byte, error)) ([]byte, Row, []uint32, error) {
 	keyLen, err := readU16(buf, pos)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	keySlice, err := take(buf, pos, int(keyLen))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	key := make([]byte, len(keySlice))
 	copy(key, keySlice)
 	row := make(Row, len(colTypes))
+	var ovf []uint32
 	for i, ty := range colTypes {
-		v, err := readValue(ty, buf, pos)
+		v, err := readValue(ty, buf, pos, fetch, &ovf)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		row[i] = v
 	}
-	return key, row, nil
+	return key, row, ovf, nil
 }
 
-// readValue reads one value via the value codec (inverse of encodeValue).
-func readValue(ty ScalarType, buf []byte, pos *int) (Value, error) {
+// readValue reads one value via the value codec (inverse of encodeValue). The presence tag is read
+// first: 0x00 an inline body, 0x01 NULL, 0x02 an external pointer (u32 first_page + u32 len) whose
+// payload is gathered from the overflow chain via fetch and reconstructed by type (large-values.md
+// §12). Pages visited while following a chain are appended to *ovfOut for the free-list walk.
+func readValue(ty ScalarType, buf []byte, pos *int, fetch func(uint32) ([]byte, error), ovfOut *[]uint32) (Value, error) {
 	tag, err := readU8(buf, pos)
 	if err != nil {
 		return Value{}, err
 	}
 	switch tag {
 	case 0x00:
-		if ty.IsText() {
-			n, err := readU16(buf, pos)
-			if err != nil {
-				return Value{}, err
-			}
-			sb, err := take(buf, pos, int(n))
-			if err != nil {
-				return Value{}, err
-			}
-			return TextValue(string(sb)), nil
+		return readInlineBody(ty, buf, pos)
+	case 0x01:
+		return NullValue(), nil
+	case tagExternal:
+		first, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
 		}
-		if ty.IsBool() {
-			b, err := readU8(buf, pos)
-			if err != nil {
-				return Value{}, err
-			}
-			switch b {
-			case 0x00:
-				return BoolValue(false), nil
-			case 0x01:
-				return BoolValue(true), nil
-			default:
-				return Value{}, NewError(DataCorrupted, "invalid boolean value byte")
-			}
+		length, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
 		}
-		if ty.IsDecimal() {
-			// flags (sign), u16 scale, u16 ndigits, then that many base-10^4 groups.
-			flags, err := readU8(buf, pos)
-			if err != nil {
-				return Value{}, err
-			}
-			scale, err := readU16(buf, pos)
-			if err != nil {
-				return Value{}, err
-			}
-			ndigits, err := readU16(buf, pos)
-			if err != nil {
-				return Value{}, err
-			}
-			groups := make([]uint16, ndigits)
-			for i := range groups {
-				g, err := readU16(buf, pos)
-				if err != nil {
-					return Value{}, err
-				}
-				groups[i] = g
-			}
-			return DecimalValue(DecimalFromCodec(flags&1 != 0, uint32(scale), groups)), nil
+		if fetch == nil {
+			return Value{}, NewError(DataCorrupted, "external value with no overflow reader")
 		}
-		if ty.IsBytea() {
-			n, err := readU16(buf, pos)
-			if err != nil {
-				return Value{}, err
-			}
-			bb, err := take(buf, pos, int(n))
-			if err != nil {
-				return Value{}, err
-			}
-			// ByteaValue copies the bytes into a string, so the value owns its content.
-			return ByteaValue(bb), nil
+		payload, err := readOverflowChain(first, int(length), fetch, ovfOut)
+		if err != nil {
+			return Value{}, err
 		}
-		if ty.IsUuid() {
-			// Fixed 16 raw bytes, no length prefix. Must branch before the integer path —
-			// DecodeInt would sign-flip and WidthBytes is 16 there too.
-			ub, err := take(buf, pos, 16)
-			if err != nil {
-				return Value{}, err
-			}
-			return UuidValue(ub), nil
+		return valueFromPayload(ty, payload)
+	default:
+		return Value{}, NewError(DataCorrupted, "invalid value presence tag")
+	}
+}
+
+// readInlineBody reads the present-value body (after a 0x00 tag): a fixed-width integer, a u16 length
+// + UTF-8 bytes for text, a single bool-byte, the decimal body, etc. (format.md *Value codec*).
+func readInlineBody(ty ScalarType, buf []byte, pos *int) (Value, error) {
+	switch {
+	case ty.IsText():
+		n, err := readU16(buf, pos)
+		if err != nil {
+			return Value{}, err
 		}
-		if ty.IsTimestamp() || ty.IsTimestamptz() {
-			vb, err := take(buf, pos, ty.WidthBytes())
-			if err != nil {
-				return Value{}, err
-			}
-			m := DecodeInt(ty, vb)
-			if ty.IsTimestamp() {
-				return TimestampValue(m), nil
-			}
-			return TimestamptzValue(m), nil
+		sb, err := take(buf, pos, int(n))
+		if err != nil {
+			return Value{}, err
 		}
+		return TextValue(string(sb)), nil
+	case ty.IsBool():
+		b, err := readU8(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		switch b {
+		case 0x00:
+			return BoolValue(false), nil
+		case 0x01:
+			return BoolValue(true), nil
+		default:
+			return Value{}, NewError(DataCorrupted, "invalid boolean value byte")
+		}
+	case ty.IsDecimal():
+		return decodeDecimalBody(buf, pos)
+	case ty.IsBytea():
+		n, err := readU16(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		bb, err := take(buf, pos, int(n))
+		if err != nil {
+			return Value{}, err
+		}
+		// ByteaValue copies the bytes into a string, so the value owns its content.
+		return ByteaValue(bb), nil
+	case ty.IsUuid():
+		// Fixed 16 raw bytes, no length prefix. Must branch before the integer path —
+		// DecodeInt would sign-flip and WidthBytes is 16 there too.
+		ub, err := take(buf, pos, 16)
+		if err != nil {
+			return Value{}, err
+		}
+		return UuidValue(ub), nil
+	case ty.IsTimestamp() || ty.IsTimestamptz():
+		vb, err := take(buf, pos, ty.WidthBytes())
+		if err != nil {
+			return Value{}, err
+		}
+		m := DecodeInt(ty, vb)
+		if ty.IsTimestamp() {
+			return TimestampValue(m), nil
+		}
+		return TimestamptzValue(m), nil
+	default:
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {
 			return Value{}, err
 		}
 		return IntValue(DecodeInt(ty, vb)), nil
-	case 0x01:
-		return NullValue(), nil
-	default:
-		return Value{}, NewError(DataCorrupted, "invalid value presence tag")
 	}
+}
+
+// decodeDecimalBody decodes a decimal value's body — flags (sign), u16 scale, u16 ndigits, then that
+// many base-10^4 groups (format.md). Shared by the inline path and by external reconstruction (a
+// spilled decimal's chain payload is exactly this body — large-values.md §12).
+func decodeDecimalBody(buf []byte, pos *int) (Value, error) {
+	flags, err := readU8(buf, pos)
+	if err != nil {
+		return Value{}, err
+	}
+	scale, err := readU16(buf, pos)
+	if err != nil {
+		return Value{}, err
+	}
+	ndigits, err := readU16(buf, pos)
+	if err != nil {
+		return Value{}, err
+	}
+	groups := make([]uint16, ndigits)
+	for i := range groups {
+		g, err := readU16(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		groups[i] = g
+	}
+	return DecimalValue(DecimalFromCodec(flags&1 != 0, uint32(scale), groups)), nil
+}
+
+// readOverflowChain gathers length bytes of an external value's payload by following its overflow
+// chain from first (large-values.md §12): each page is page_type 4, carries itemCount payload bytes,
+// and chains via nextPage (0 terminates). Every visited page is appended to *visited (the free-list
+// reachability walk). fetch returns a page's full block by index.
+func readOverflowChain(first uint32, length int, fetch func(uint32) ([]byte, error), visited *[]uint32) ([]byte, error) {
+	out := make([]byte, 0, length)
+	p := first
+	for len(out) < length {
+		if p == 0 {
+			return nil, NewError(DataCorrupted, "overflow chain ended before the value length")
+		}
+		*visited = append(*visited, p)
+		block, err := fetch(p)
+		if err != nil {
+			return nil, err
+		}
+		pg, err := parsePage(block)
+		if err != nil {
+			return nil, err
+		}
+		if pg.pageType != pageOverflow {
+			return nil, NewError(DataCorrupted, "expected an overflow page")
+		}
+		n := int(pg.itemCount)
+		if n == 0 || n > len(pg.payload) || len(out)+n > length {
+			return nil, NewError(DataCorrupted, "overflow page slab out of range")
+		}
+		out = append(out, pg.payload[:n]...)
+		p = pg.nextPage
+	}
+	return out, nil
 }
 
 // --- bounds-checked big-endian readers over a payload cursor ---
