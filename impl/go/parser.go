@@ -67,13 +67,28 @@ func ParseSQL(sql string) (Statement, error) {
 
 func (p *Parser) parseStatement() (Statement, error) {
 	switch p.peekKeyword() {
+	// CREATE / DROP dispatch on the object keyword (TABLE vs INDEX — grammar.md §30).
 	case "create":
+		if p.peekKeywordAt(1) == "index" {
+			ci, err := p.parseCreateIndex()
+			if err != nil {
+				return Statement{}, err
+			}
+			return Statement{CreateIndex: ci}, nil
+		}
 		ct, err := p.parseCreateTable()
 		if err != nil {
 			return Statement{}, err
 		}
 		return Statement{CreateTable: ct}, nil
 	case "drop":
+		if p.peekKeywordAt(1) == "index" {
+			di, err := p.parseDropIndex()
+			if err != nil {
+				return Statement{}, err
+			}
+			return Statement{DropIndex: di}, nil
+		}
 		dt, err := p.parseDropTable()
 		if err != nil {
 			return Statement{}, err
@@ -416,6 +431,74 @@ func (p *Parser) parseDropTable() (*DropTable, error) {
 		return nil, err
 	}
 	return &DropTable{Name: name}, nil
+}
+
+// parseCreateIndex parses `CREATE INDEX [name] ON <table> ( col [, col]* )`
+// (spec/design/grammar.md §30). The optional name needs one disambiguation because no
+// word is reserved: the word after INDEX is the index name UNLESS it is `ON` followed by
+// a word and then `(` — that exact three-token shape can only be the unnamed form's
+// `ON table (`. Key columns are bare identifiers (no expression/ordered/partial keys this
+// slice — a `(`/`ASC`/`DESC` after a key is the natural 42601).
+func (p *Parser) parseCreateIndex() (*CreateIndex, error) {
+	if err := p.expectKeyword("create"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("index"); err != nil {
+		return nil, err
+	}
+	unnamed := p.peekKeyword() == "on" &&
+		p.peekKindAt(1) == TokWord && p.peekKindAt(2) == TokLParen
+	name := ""
+	if !unnamed {
+		n, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		name = n
+	}
+	if err := p.expectKeyword("on"); err != nil {
+		return nil, err
+	}
+	table, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect(TokLParen); err != nil {
+		return nil, err
+	}
+	var columns []string
+	for {
+		col, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		columns = append(columns, col)
+		tok := p.advance()
+		if tok.Kind == TokComma {
+			continue
+		}
+		if tok.Kind == TokRParen {
+			break
+		}
+		return nil, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
+	}
+	return &CreateIndex{Name: name, Table: table, Columns: columns}, nil
+}
+
+// parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing index
+// (42704) or a table's name (42809) is rejected at execution time, not here.
+func (p *Parser) parseDropIndex() (*DropIndex, error) {
+	if err := p.expectKeyword("drop"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("index"); err != nil {
+		return nil, err
+	}
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	return &DropIndex{Name: name}, nil
 }
 
 // parseInsert parses `INSERT INTO <table> [( <col> [, <col>]* )] VALUES <row> [, <row>]*`,

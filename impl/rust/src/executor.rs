@@ -5,11 +5,11 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    BinaryOp, CreateTable, Delete, DropTable, Expr, Insert, InsertSource, InsertValue, JoinKind,
-    Literal, OrderKey, QueryExpr, Select, SelectItems, SetOp, SetOpKind, Statement, TypeMod,
-    UnaryOp, Update,
+    BinaryOp, CreateIndex, CreateTable, Delete, DropIndex, DropTable, Expr, Insert, InsertSource,
+    InsertValue, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItems, SetOp, SetOpKind,
+    Statement, TypeMod, UnaryOp, Update,
 };
-use crate::catalog::{CheckConstraint, Column, Table};
+use crate::catalog::{CheckConstraint, Column, IndexDef, Table};
 use crate::cost::Meter;
 use crate::costs::COSTS;
 use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
@@ -83,6 +83,11 @@ pub struct Snapshot {
     pub(crate) txid: u64,
     tables: HashMap<String, Table>,
     stores: HashMap<String, TableStore>,
+    /// Each secondary index's B-tree (spec/design/indexes.md §3): a `TableStore` with ZERO
+    /// value columns (entry keys only — the on-disk empty-payload record), keyed by the
+    /// lowercased index name (index names live in the relation namespace, globally unique).
+    /// Which table owns an index is recorded in that table's `Table::indexes`.
+    index_stores: HashMap<String, TableStore>,
 }
 
 impl Snapshot {
@@ -131,10 +136,75 @@ impl Snapshot {
         self.tables.insert(key, table);
     }
 
-    /// Remove a table's definition and its store (DROP TABLE).
+    /// Remove a table's definition, its store, and its indexes' stores (DROP TABLE — the
+    /// indexes have no independent life, spec/design/indexes.md §2).
     fn remove_table(&mut self, key: &str) {
+        if let Some(t) = self.tables.get(key) {
+            for idx in &t.indexes {
+                self.index_stores.remove(&idx.name.to_ascii_lowercase());
+            }
+        }
         self.tables.remove(key);
         self.stores.remove(key);
+    }
+
+    /// The store of a secondary index (panics if absent — callers resolve the index first).
+    pub(crate) fn index_store(&self, name_key: &str) -> &TableStore {
+        self.index_stores
+            .get(name_key)
+            .expect("store exists for a resolved index")
+    }
+
+    /// The store of a secondary index, mutable (panics if absent).
+    pub(crate) fn index_store_mut(&mut self, name_key: &str) -> &mut TableStore {
+        self.index_stores
+            .get_mut(name_key)
+            .expect("store exists for a resolved index")
+    }
+
+    /// Register a new (empty) secondary index on `table_key`: insert its definition into the
+    /// table's `indexes` in ascending lowercased-name order (the catalog/planner order —
+    /// spec/design/indexes.md §6) and create its zero-column store.
+    pub(crate) fn put_index(&mut self, table_key: &str, def: IndexDef, page_size: u32) {
+        let name_key = def.name.to_ascii_lowercase();
+        let cap = page_size as usize - 12; // PAGE_HEADER
+        self.index_stores
+            .insert(name_key.clone(), TableStore::new(cap, Vec::new()));
+        let table = self.tables.get_mut(table_key).expect("table exists");
+        let pos = table
+            .indexes
+            .iter()
+            .position(|i| i.name.to_ascii_lowercase() > name_key)
+            .unwrap_or(table.indexes.len());
+        table.indexes.insert(pos, def);
+    }
+
+    /// Register a loaded index store under its (lowercased) name — the file loader's hook
+    /// (format.rs): the owning table's `indexes` list came from its catalog entry, so only
+    /// the store is registered here.
+    pub(crate) fn put_index_store(&mut self, name_key: String, store: TableStore) {
+        self.index_stores.insert(name_key, store);
+    }
+
+    /// Remove one secondary index (DROP INDEX): its definition from the owning table and
+    /// its store.
+    fn remove_index(&mut self, table_key: &str, name_key: &str) {
+        if let Some(t) = self.tables.get_mut(table_key) {
+            t.indexes
+                .retain(|i| i.name.to_ascii_lowercase() != name_key);
+        }
+        self.index_stores.remove(name_key);
+    }
+
+    /// Find the table owning the named index (case-insensitive): `(table_key, &IndexDef)`.
+    fn find_index(&self, name: &str) -> Option<(&str, &IndexDef)> {
+        let key = name.to_ascii_lowercase();
+        self.tables.iter().find_map(|(tk, t)| {
+            t.indexes
+                .iter()
+                .find(|i| i.name.to_ascii_lowercase() == key)
+                .map(|i| (tk.as_str(), i))
+        })
     }
 
     /// Every table with its store, as `(lowercased key, table, store)` tuples, for the on-disk
@@ -501,6 +571,14 @@ impl Database {
                 reject_params_for_ddl(params)?;
                 self.execute_drop_table(dt)
             }
+            Statement::CreateIndex(ci) => {
+                reject_params_for_ddl(params)?;
+                self.execute_create_index(ci)
+            }
+            Statement::DropIndex(di) => {
+                reject_params_for_ddl(params)?;
+                self.execute_drop_index(di)
+            }
             Statement::Insert(ins) => self.execute_insert(ins, params),
             Statement::Select(sel) => self.execute_select(sel, params),
             Statement::SetOp(so) => self.execute_set_op(so, params),
@@ -522,14 +600,19 @@ impl Database {
     /// left to right (unknown 42703, repeated 42701); then the jed narrowings — the
     /// declaration-order rule and the per-member key-type gate — trap 0A000.
     fn execute_create_table(&mut self, ct: CreateTable) -> Result<Outcome> {
-        if self.table(&ct.name).is_some() {
+        // The relation namespace is shared between tables and indexes (indexes.md §2), so a
+        // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
+        if self.relation_exists(&ct.name) {
             return Err(EngineError::new(
                 SqlState::DuplicateTable,
-                format!("table already exists: {}", ct.name),
+                format!("relation already exists: {}", ct.name),
             ));
         }
 
         let mut columns = Vec::with_capacity(ct.columns.len());
+        // The primary-key member ordinals in KEY order (constraints.md §3): the column-level
+        // form is the one-member case; the table-level list below records its own order.
+        let mut pk: Vec<usize> = Vec::new();
         let mut pk_seen = false;
         for def in &ct.columns {
             if columns
@@ -567,6 +650,7 @@ impl Database {
                     ));
                 }
                 pk_seen = true;
+                pk.push(columns.len()); // this column's ordinal (pushed below)
             }
             // Evaluate + type-coerce the DEFAULT literal once, here. A bad default fails at
             // CREATE TABLE: out of range 22003, cross-family 42804, decimal over-precision
@@ -595,8 +679,9 @@ impl Database {
         // Table-level `PRIMARY KEY (a, b, …)` constraints (constraints.md §3). Check order
         // mirrors PostgreSQL (oracle-probed): a second primary key is 42P16 before its
         // members resolve; members resolve left to right (42703 unknown, 42701 repeated).
-        // The jed narrowings follow: the list must name columns in declaration order, and
-        // every member must be of a key-encodable type (both 0A000, relaxable).
+        // The LIST order is the KEY order — it may differ from declaration order (the v5
+        // catalog persists the ordinal list; the old 0A000 narrowing is lifted). The
+        // per-member key-type gate (0A000) remains.
         for pk_list in &ct.table_pks {
             if pk_seen {
                 return Err(EngineError::new(
@@ -627,13 +712,6 @@ impl Database {
                 }
                 indices.push(idx);
             }
-            if !indices.windows(2).all(|w| w[0] < w[1]) {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "a primary key whose column order differs from the table's column order \
-                     is not supported yet",
-                ));
-            }
             for &i in &indices {
                 let ty = columns[i].ty;
                 if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
@@ -645,6 +723,7 @@ impl Database {
                 columns[i].primary_key = true;
                 columns[i].not_null = true; // PRIMARY KEY ⇒ NOT NULL, per member
             }
+            pk = indices;
         }
 
         // CHECK constraints (constraints.md §4). All validation runs first, in textual
@@ -655,7 +734,9 @@ impl Database {
         let mut table = Table {
             name: ct.name,
             columns,
+            pk,
             checks: Vec::new(),
+            indexes: Vec::new(),
         };
         for def in &ct.checks {
             // Structural rejections first (a single pre-walk — a documented micro-order
@@ -769,6 +850,14 @@ impl Database {
     /// no expression tree (the store is discarded wholesale), so it accrues zero cost.
     fn execute_drop_table(&mut self, dt: DropTable) -> Result<Outcome> {
         if self.table(&dt.name).is_none() {
+            // An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
+            // anything else is the missing-table 42P01 the DML paths raise.
+            if self.find_index(&dt.name).is_some() {
+                return Err(EngineError::new(
+                    SqlState::WrongObjectType,
+                    format!("{} is not a table", dt.name),
+                ));
+            }
             return Err(EngineError::new(
                 SqlState::UndefinedTable,
                 format!("table does not exist: {}", dt.name),
@@ -776,6 +865,133 @@ impl Database {
         }
         let key = dt.name.to_ascii_lowercase();
         self.working_mut().remove_table(&key);
+        Ok(Outcome::Statement { cost: 0 })
+    }
+
+    /// Analyze and run a CREATE INDEX (spec/design/indexes.md §2). Validation mirrors
+    /// PostgreSQL's order (oracle-probed): the table must exist (42P01); each key column, in
+    /// list order, must exist (42703) and be of a key-encodable type (0A000 — the same
+    /// narrowing as a PRIMARY KEY member); then an explicit name is checked against the
+    /// shared relation namespace (42P07), or an omitted name derives PG's choice — the
+    /// lowercased `<table>_<col>..._idx` with the smallest free suffix. The index is then
+    /// built by scanning the table once: `page_read` per node + `storage_row_read` per row
+    /// (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
+    fn execute_create_index(&mut self, ci: CreateIndex) -> Result<Outcome> {
+        let table = self.table(&ci.table).ok_or_else(|| {
+            EngineError::new(
+                SqlState::UndefinedTable,
+                format!("table does not exist: {}", ci.table),
+            )
+        })?;
+        let table_key = table.name.to_ascii_lowercase();
+        let columns = table.columns.clone();
+        let mut cols: Vec<usize> = Vec::with_capacity(ci.columns.len());
+        for name in &ci.columns {
+            let idx = table.column_index(name).ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedColumn,
+                    format!("column does not exist: {name}"),
+                )
+            })?;
+            let ty = columns[idx].ty;
+            if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "a {} index column is not supported yet",
+                        ty.canonical_name()
+                    ),
+                ));
+            }
+            // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
+            cols.push(idx);
+        }
+        let name = match &ci.name {
+            Some(n) => {
+                if self.relation_exists(n) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateTable,
+                        format!("relation already exists: {n}"),
+                    ));
+                }
+                n.clone()
+            }
+            None => {
+                // PG's ChooseIndexName (probed): lowercased table + every listed column name
+                // (list order, duplicates included) + "idx", then the smallest free suffix.
+                let mut base = table_key.clone();
+                for name in &ci.columns {
+                    base.push('_');
+                    base.push_str(&name.to_ascii_lowercase());
+                }
+                base.push_str("_idx");
+                let mut candidate = base.clone();
+                let mut suffix = 0u32;
+                while self.relation_exists(&candidate) {
+                    suffix += 1;
+                    candidate = format!("{base}{suffix}");
+                }
+                candidate
+            }
+        };
+
+        // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
+        // row, with the indexed columns as the touched set (fixed-width — the chain/decompress
+        // terms are structurally zero). An empty table charges 0. The entries are computed
+        // here, against the pre-index store; the writes below are unmetered.
+        let mut meter = Meter::with_limit(self.max_cost);
+        let mut mask = vec![false; columns.len()];
+        for &c in &cols {
+            mask[c] = true;
+        }
+        let def = IndexDef {
+            name,
+            columns: cols,
+        };
+        let store = self.store(&ci.table);
+        let (nodes, slabs) = store.scan_units(&mask)?;
+        meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
+        let mut entries: Vec<Vec<u8>> = Vec::with_capacity(store.len());
+        for (key, row) in store.iter_entries()? {
+            meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+            meter.charge(COSTS.storage_row_read);
+            entries.push(index_entry_key(&columns, &def, &key, &row));
+        }
+        meter.guard()?;
+
+        let name_key = def.name.to_ascii_lowercase();
+        let ps = self.page_size;
+        self.working_mut().put_index(&table_key, def, ps);
+        let istore = self.index_store_mut(&name_key);
+        for ek in entries {
+            assert!(
+                istore.insert(ek, Vec::new())?,
+                "index entry keys are unique (storage-key suffix)"
+            );
+        }
+        Ok(Outcome::Statement {
+            cost: meter.accrued,
+        })
+    }
+
+    /// Run a DROP INDEX (spec/design/indexes.md §2): a table's name is 42809, a missing one
+    /// 42704. A pure catalog edit — zero cost, like DROP TABLE.
+    fn execute_drop_index(&mut self, di: DropIndex) -> Result<Outcome> {
+        if self.table(&di.name).is_some() {
+            return Err(EngineError::new(
+                SqlState::WrongObjectType,
+                format!("{} is not an index", di.name),
+            ));
+        }
+        let Some((table_key, _)) = self.find_index(&di.name) else {
+            return Err(EngineError::new(
+                SqlState::UndefinedObject,
+                format!("index does not exist: {}", di.name),
+            ));
+        };
+        let table_key = table_key.to_string();
+        let name_key = di.name.to_ascii_lowercase();
+        self.working_mut().remove_index(&table_key, &name_key);
         Ok(Outcome::Statement { cost: 0 })
     }
 
@@ -992,11 +1208,12 @@ impl Database {
     ) -> Result<()> {
         let n = columns.len();
         // The canonical relation name for the 23514 message (the `table` argument is the
-        // name as the statement spelled it).
-        let relation = self
+        // name as the statement spelled it), and the index definitions phase 2 maintains
+        // (spec/design/indexes.md §4 — unmetered write work, like the row writes).
+        let (relation, indexes) = self
             .table(table)
-            .map(|t| t.name.clone())
-            .unwrap_or_else(|| table.to_string());
+            .map(|t| (t.name.clone(), t.indexes.clone()))
+            .unwrap_or_else(|| (table.to_string(), Vec::new()));
         let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(rows.len());
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
         let mut cunits: i64 = 0;
@@ -1105,14 +1322,30 @@ impl Database {
 
         // Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
         // rowid is allocated here, in row order, so a failed validation pass burns none
-        // (spec/fileformat/format.md, spec/design/grammar.md §12).
+        // (spec/fileformat/format.md, spec/design/grammar.md §12). Each stored row's
+        // secondary-index entries are computed against its final key (the rowid included)
+        // and written after the rows (indexes.md §4 — an index write cannot fail, so
+        // all-or-nothing is unchanged).
         let store = self.store_mut(table);
+        let mut index_inserts: Vec<Vec<Vec<u8>>> = vec![Vec::new(); indexes.len()];
         for (key, row) in prepared {
             let key = key.unwrap_or_else(|| encode_int(ScalarType::Int64, store.alloc_rowid()));
+            for (k, def) in indexes.iter().enumerate() {
+                index_inserts[k].push(index_entry_key(columns, def, &key, &row));
+            }
             assert!(
                 store.insert(key, row)?,
                 "pre-validated INSERT key must be unique"
             );
+        }
+        for (k, def) in indexes.iter().enumerate() {
+            let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+            for ek in index_inserts[k].drain(..) {
+                assert!(
+                    istore.insert(ek, Vec::new())?,
+                    "index entry keys are unique (storage-key suffix)"
+                );
+            }
         }
         Ok(())
     }
@@ -1129,9 +1362,17 @@ impl Database {
             )
         })?;
         // Capture the PK (index, type) now, by value, so the primary-key pushdown can be detected
-        // after the `table` borrow ends (the mutate path takes `&mut self`).
+        // after the `table` borrow ends (the mutate path takes `&mut self`). The index
+        // definitions (and the columns their entry keys read) feed phase 2's maintenance
+        // (indexes.md §4).
         let pk_info = table.primary_key_index().map(|i| (i, table.columns[i].ty));
         let ncols = table.columns.len();
+        let indexes = table.indexes.clone();
+        let tcolumns: Vec<Column> = if indexes.is_empty() {
+            Vec::new()
+        } else {
+            table.columns.clone()
+        };
         // DELETE is single-table; resolve its WHERE against a one-relation scope.
         let scope = Scope::single(self, table);
         let mut ptypes = ParamTypes::default();
@@ -1150,11 +1391,13 @@ impl Database {
             self.fold_uncorrelated_in_rexpr(f, &bound, &mut meter.accrued)?;
         }
 
-        // Collect matching keys before mutating (so the map is not modified mid-scan).
-        // A WHERE arithmetic can trap (22003/22012), so this is an explicit loop that
-        // propagates the error rather than a `.filter` closure. Each scanned row and each
-        // filter evaluation accrues cost (CLAUDE.md §13; spec/design/cost.md §3).
-        let mut keys: Vec<Vec<u8>> = Vec::new();
+        // Collect matching (key, row) pairs before mutating (so the map is not modified
+        // mid-scan; the rows feed phase 2's index-entry removal — indexed columns are
+        // fixed-width and always resident). A WHERE arithmetic can trap (22003/22012), so
+        // this is an explicit loop that propagates the error rather than a `.filter`
+        // closure. Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13;
+        // spec/design/cost.md §3).
+        let mut matched: Vec<(Vec<u8>, Row)> = Vec::new();
         // A correlated subquery in the WHERE re-runs per row: the eval environment pushes the
         // current row, so `target.col` (an `OuterColumn`) reads it. `outer` starts empty (DELETE
         // is the top-level statement — no enclosing query).
@@ -1201,18 +1444,26 @@ impl Database {
             // Materialize the filter's columns if the lazy load left them unfetched — exactly
             // the touched set the block above charged (large-values.md §14).
             store.resolve_columns(&mut row, &mask)?;
-            let matched = match &filter {
+            let keep = match &filter {
                 None => true,
                 Some(f) => f.eval(&row, &env, &mut meter)?.is_true(),
             };
-            if matched {
-                keys.push(k);
+            if keep {
+                matched.push((k, row));
             }
         }
 
+        // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
+        // unmetered write work; an index removal cannot fail).
         let store = self.store_mut(&del.table);
-        for k in &keys {
+        for (k, _) in &matched {
             store.remove(k)?;
+        }
+        for def in &indexes {
+            let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+            for (k, row) in &matched {
+                istore.remove(&index_entry_key(&tcolumns, def, k, row))?;
+            }
         }
         Ok(Outcome::Statement {
             cost: meter.accrued,
@@ -1245,6 +1496,14 @@ impl Database {
         // single-column keys only (`primary_key_index`); a composite-PK table full-scans.
         let pk_info = table.primary_key_index().map(|i| (i, table.columns[i].ty));
         let ncols = table.columns.len();
+        // The index definitions (and the columns their entry keys read) feed phase 2's
+        // maintenance (indexes.md §4): an entry moves only when its key actually changed.
+        let indexes = table.indexes.clone();
+        let tcolumns: Vec<Column> = if indexes.is_empty() {
+            Vec::new()
+        } else {
+            table.columns.clone()
+        };
         let mut ptypes = ParamTypes::default();
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
         for a in &upd.assignments {
@@ -1309,8 +1568,9 @@ impl Database {
 
         // Phase 1: build + validate every matching row's new values; no writes yet. Each
         // scanned row, the filter, and each assignment RHS accrue cost (the phase-2 writes
-        // do not — they evaluate nothing; spec/design/cost.md §3).
-        let mut updates: Vec<(Vec<u8>, Row)> = Vec::new();
+        // do not — they evaluate nothing; spec/design/cost.md §3). Each entry is
+        // (key, new row, OLD row) — the old row feeds the index maintenance.
+        let mut updates: Vec<(Vec<u8>, Row, Row)> = Vec::new();
         // A correlated subquery (in an RHS or the WHERE) re-runs per row: the eval environment
         // pushes the current (old) row, so `target.col` (an `OuterColumn`) reads it. `outer`
         // starts empty (UPDATE is the top-level statement — no enclosing query).
@@ -1390,7 +1650,7 @@ impl Database {
                     ));
                 }
             }
-            updates.push((key, new_row));
+            updates.push((key, new_row, row));
         }
 
         // Each rewritten row's disposition plan may attempt compression (a record over
@@ -1398,16 +1658,43 @@ impl Database {
         // ceiling BEFORE phase 2 writes anything, preserving all-or-nothing.
         let store = self.store(&upd.table);
         let mut cunits: i64 = 0;
-        for (key, row) in &updates {
+        for (key, row, _) in &updates {
             cunits += store.write_compress_units(key, row) as i64;
         }
         meter.charge(COSTS.value_compress * cunits);
         meter.guard()?;
 
-        // Phase 2: apply (keys unchanged — a PK column can't be assigned).
+        // Index maintenance (indexes.md §4): an entry moves only when its key CHANGED —
+        // equal old/new keys leave the index tree untouched (part of the contract: it keeps
+        // the copy-on-write dirty set, and so the commit's written pages, byte-identical
+        // across cores). The storage key cannot change (PK assignment is rejected), so the
+        // suffix is stable. Computed before the rewrite consumes the rows.
+        let mut index_moves: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); indexes.len()];
+        for (key, new_row, old_row) in &updates {
+            for (k, def) in indexes.iter().enumerate() {
+                let old_ek = index_entry_key(&tcolumns, def, key, old_row);
+                let new_ek = index_entry_key(&tcolumns, def, key, new_row);
+                if old_ek != new_ek {
+                    index_moves[k].push((old_ek, new_ek));
+                }
+            }
+        }
+
+        // Phase 2: apply (keys unchanged — a PK column can't be assigned), then move the
+        // changed index entries (unmetered write work; cannot fail).
         let store = self.store_mut(&upd.table);
-        for (key, row) in updates {
+        for (key, row, _) in updates {
             store.replace(&key, row)?;
+        }
+        for (k, def) in indexes.iter().enumerate() {
+            let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+            for (old_ek, new_ek) in index_moves[k].drain(..) {
+                istore.remove(&old_ek)?;
+                assert!(
+                    istore.insert(new_ek, Vec::new())?,
+                    "index entry keys are unique (storage-key suffix)"
+                );
+            }
         }
         Ok(Outcome::Statement {
             cost: meter.accrued,
@@ -1739,22 +2026,21 @@ impl Database {
             Some(p) => Some(resolve_boolean_filter(&scope, p, ptypes)?),
             None => None,
         };
-        // Primary-key predicate pushdown, per base relation: detect WHERE conjuncts that bound that
-        // relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree
-        // (cost.md §3 "bounded scan"). The filter is resolved against the full FROM scope, so a
-        // relation's PK column is the GLOBAL index `rel.offset + pk_local`; `const_source` only
+        // Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that
+        // relation's scan — a PK range, else a secondary-index equality — so it seeks/ranges
+        // instead of walking the whole B-tree (cost.md §3 "bounded scan" / "index-bounded
+        // scan"; indexes.md §5). The filter is resolved against the full FROM scope, so a
+        // relation's column is the GLOBAL index `rel.offset + local`; `const_source` only
         // accepts a literal/param/outer const (never a sibling column), so a JOIN base table is
-        // bounded only by a CONSTANT predicate on its own PK — `b.pk = a.x` (the index-nested-loop
-        // case) stays a full scan, a follow-on. Sound for outer joins too: a non-NULL PK conjunct in
-        // WHERE eliminates that relation's NULL-extended rows, so bounding it cannot drop a surviving
-        // row. A no-PK relation gets `None` (full scan).
-        let rel_bounds: Vec<Option<PkBound>> = scope
+        // bounded only by a CONSTANT predicate on its own columns — `b.pk = a.x` (the
+        // index-nested-loop case) stays a full scan, a follow-on. Sound for outer joins too: a
+        // non-NULL conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding
+        // it cannot drop a surviving row.
+        let rel_bounds: Vec<Option<ScanBound>> = scope
             .rels
             .iter()
             .map(|rel| match &filter {
-                Some(f) => rel.table.primary_key_index().and_then(|pk_local| {
-                    detect_pk_bound(f, rel.offset + pk_local, rel.table.columns[pk_local].ty)
-                }),
+                Some(f) => detect_scan_bound(f, rel),
                 None => None,
             })
             .collect();
@@ -1936,12 +2222,16 @@ impl Database {
 
         // Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. This path
         // is single-table (gated below), so the only relation is `rel_bounds[0]`. A correlated bound
-        // resolves against `env.outer` (the enclosing rows).
+        // resolves against `env.outer` (the enclosing rows). An INDEX bound never streams — the
+        // dispatch gate routes it to the eager path (cost.md §3 "LIMIT short-circuit").
         let (bound, empty) = match &plan.rel_bounds[0] {
-            Some(bp) => match build_key_bound(bp, params, env.outer) {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer) {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
+            Some(ScanBound::Index(_)) => {
+                unreachable!("the streaming path is gated to PK/full scans")
+            }
             None => (KeyBound::unbounded(), false),
         };
         let (overlap, slabs) = if empty {
@@ -2028,6 +2318,9 @@ impl Database {
             && !plan.is_agg
             && !plan.distinct
             && plan.order.is_empty()
+            // An index-bounded scan does not stream (cost.md §3 "index-bounded scan"): it
+            // reads the full admitted set via the eager path below.
+            && !matches!(plan.rel_bounds[0], Some(ScanBound::Index(_)))
         {
             return self.exec_streaming_limit(plan, &env, &mut meter, params);
         }
@@ -2039,17 +2332,21 @@ impl Database {
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
         for (ri, rel) in plan.rels.iter().enumerate() {
             let store = self.store(&rel.table_name);
-            // Each base table's own primary-key bound (if any) seeks/ranges instead of walking the
+            // Each base table's own scan bound (if any) seeks/ranges instead of walking the
             // whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing.
-            // Otherwise the full scan is unchanged (cost.md §3 "bounded scan" / JOIN).
+            // An index bound fetches via the index tree + per-row point lookups (cost.md §3
+            // "index-bounded scan"). Otherwise the full scan is unchanged.
             let (mut rows, (node_count, slabs)) = match &plan.rel_bounds[ri] {
-                Some(bp) => match build_key_bound(bp, params, outer) {
+                Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer) {
                     Some(b) => (
                         store.range_rows(&b)?,
                         store.overlap_scan_units(&b, &plan.rel_masks[ri])?,
                     ),
                     None => (Vec::new(), (0, 0)),
                 },
+                Some(ScanBound::Index(ib)) => {
+                    self.index_bound_rows(&rel.table_name, ib, params, outer, &plan.rel_masks[ri])?
+                }
                 None => (
                     store.iter_in_key_order()?,
                     store.scan_units(&plan.rel_masks[ri])?,
@@ -2504,6 +2801,104 @@ impl Database {
     /// a write runs within a transaction, so the working set is present).
     pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
         self.working_mut().store_mut(name)
+    }
+
+    /// Shared read access to a secondary index's store in the visible snapshot (the index is
+    /// known to exist). `name_key` is the lowercased index name.
+    fn index_store(&self, name_key: &str) -> &TableStore {
+        self.read_snap().index_store(name_key)
+    }
+
+    /// Mutable access to a secondary index's store in the working snapshot.
+    fn index_store_mut(&mut self, name_key: &str) -> &mut TableStore {
+        self.working_mut().index_store_mut(name_key)
+    }
+
+    /// Find the table owning the named index in the visible snapshot (case-insensitive).
+    fn find_index(&self, name: &str) -> Option<(&str, &IndexDef)> {
+        self.read_snap().find_index(name)
+    }
+
+    /// Whether `name` is taken in the shared relation namespace (a table OR an index —
+    /// spec/design/indexes.md §2), case-insensitively.
+    fn relation_exists(&self, name: &str) -> bool {
+        self.table(name).is_some() || self.find_index(name).is_some()
+    }
+
+    /// Execute an index equality bound (cost.md §3 "index-bounded scan"): fetch the rows the
+    /// equality admits, in index-entry order (= storage-key order among equal values), and
+    /// return them with the scan's up-front units `(pages, slabs)` — the index-tree nodes
+    /// overlapping the prefix range plus, per admitted entry, the table-tree nodes of that
+    /// row's point lookup and its touched-column decompress slabs. The caller feeds the rows
+    /// through the same ScanSource as any bounded scan (page_read block + per-row
+    /// storage_row_read). A provably empty bound (NULL / contradictory equalities /
+    /// out-of-range) returns nothing and charges nothing.
+    fn index_bound_rows(
+        &self,
+        table_name: &str,
+        ib: &IndexBound,
+        params: &[Value],
+        outer: &[&[Value]],
+        mask: &[bool],
+    ) -> Result<(Vec<Row>, (usize, usize))> {
+        // Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
+        // true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
+        // integer can equal no stored value — all provably empty.
+        let mut agreed: Option<Vec<u8>> = None;
+        for src in &ib.eqs {
+            let k = match encode_bound_key(ib.col_type, src, params, outer) {
+                BoundKey::Null | BoundKey::OutOfRange => return Ok((Vec::new(), (0, 0))),
+                BoundKey::Key(k) => k,
+            };
+            match &agreed {
+                None => agreed = Some(k),
+                Some(prev) if *prev == k => {}
+                Some(_) => return Ok((Vec::new(), (0, 0))),
+            }
+        }
+        // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
+        // is every entry extending the prefix: [prefix, byte-successor(prefix)).
+        let mut prefix = vec![0x00u8];
+        prefix.extend_from_slice(&agreed.expect("an index bound has at least one term"));
+        let bound = KeyBound {
+            lo: Some(prefix.clone()),
+            lo_inc: true,
+            hi: prefix_successor(&prefix),
+            hi_inc: false,
+        };
+        let istore = self.index_store(&ib.name_key);
+        let entries = istore.range_entries(&bound)?;
+        let mut pages = istore.overlap_node_count(&bound);
+        let store = self.store(table_name);
+        let mut slabs = 0usize;
+        let mut rows = Vec::with_capacity(entries.len());
+        for (ekey, _) in entries {
+            // Skip the remaining key components (each self-delimiting — indexes.md §5);
+            // the suffix after them is the row's storage key (indexes.md §3).
+            let mut at = prefix.len();
+            for &ty in &ib.tail_types {
+                at += match ekey.get(at) {
+                    Some(0x01) => 1,
+                    _ => 1 + ty.width_bytes(),
+                };
+            }
+            let row_key = &ekey[at..];
+            let point = KeyBound {
+                lo: Some(row_key.to_vec()),
+                lo_inc: true,
+                hi: Some(row_key.to_vec()),
+                hi_inc: true,
+            };
+            let (n, s) = store.overlap_scan_units(&point, mask)?;
+            pages += n;
+            slabs += s;
+            rows.push(
+                store
+                    .get(row_key)?
+                    .expect("an index entry references a stored row"),
+            );
+        }
+        Ok((rows, (pages, slabs)))
     }
 }
 
@@ -2962,14 +3357,15 @@ struct SelectPlan {
     distinct: bool,
     limit: Option<i64>,
     offset: Option<i64>,
-    /// Primary-key predicate pushdown, **one entry per relation** in `rels`: the WHERE conjuncts
-    /// that bound that relation's storage key, so its scan seeks/ranges instead of walking the whole
-    /// B-tree (cost.md §3 "bounded scan"). `None` ⇒ a full scan of that relation. In a JOIN each base
-    /// table is bounded independently by the WHERE predicates on **its own** primary key against a
-    /// CONSTANT (literal/param/outer) — a cross-relation `b.pk = a.x` is the index-nested-loop case
-    /// (still a follow-on; `const_source` rejects a sibling column). The residual filter stays the
-    /// WHOLE `filter`, re-applied after the join — the bound only narrows which rows are scanned.
-    rel_bounds: Vec<Option<PkBound>>,
+    /// Scan-bound pushdown, **one entry per relation** in `rels`: the WHERE conjuncts that
+    /// bound that relation's scan — a primary-key range, or (when no PK bound applies) a
+    /// secondary-index equality (cost.md §3 "bounded scan" / "index-bounded scan"). `None` ⇒
+    /// a full scan of that relation. In a JOIN each base table is bounded independently by
+    /// the WHERE predicates against a CONSTANT (literal/param/outer) — a cross-relation
+    /// `b.pk = a.x` is the index-nested-loop case (still a follow-on; `const_source` rejects
+    /// a sibling column). The residual filter stays the WHOLE `filter`, re-applied after the
+    /// join — the bound only narrows which rows are scanned.
+    rel_bounds: Vec<Option<ScanBound>>,
     /// The **touched set** per relation (cost.md §3 "The touched set"; large-values.md §14): which
     /// of its columns this query statically references. Drives the chain-`page_read` /
     /// `value_decompress` portion of the scan's up-front cost block — an untouched spilled or
@@ -3017,6 +3413,30 @@ struct PkBound {
     terms: Vec<BoundTerm>,
 }
 
+/// A per-relation scan bound (cost.md §3): a primary-key range, or a secondary-index
+/// equality (spec/design/indexes.md §5). The PK bound wins when both apply — it is the
+/// row's own key (no second tree, range-capable, strictly cheaper).
+enum ScanBound {
+    Pk(PkBound),
+    Index(IndexBound),
+}
+
+/// The plan-time result of index analysis (indexes.md §5): the chosen index (lowest
+/// lowercased name whose FIRST key column has an equality conjunct), that column's storage
+/// type, and every equality const-source on it. At exec time the sources must agree on one
+/// value (else the bound is provably empty) and the index is range-scanned over that
+/// value's presence-tagged prefix.
+struct IndexBound {
+    /// The index store's key — the lowercased index name.
+    name_key: String,
+    col_type: ScalarType,
+    eqs: Vec<BoundSrc>,
+    /// The REMAINING key components' types (`columns[1..]`): an admitted entry's row-key
+    /// suffix sits after every component slot, so the fetch skips these (each slot is
+    /// self-delimiting — a `0x01` NULL tag alone, or `0x00` + the type's fixed width).
+    tail_types: Vec<ScalarType>,
+}
+
 /// The outcome of encoding a const-source into the PK key space.
 enum BoundKey {
     /// A NULL const — the comparison is 3VL-unknown, so the range is provably empty.
@@ -3024,6 +3444,92 @@ enum BoundKey {
     /// An integer value outside the PK type's range — no key can equal it, so drop this half-bound.
     OutOfRange,
     Key(Vec<u8>),
+}
+
+/// Pick one relation's scan bound (cost.md §3; indexes.md §5): the single-column PK bound
+/// first (the row's own key — range-capable and strictly cheaper); else, among the
+/// relation's indexes (held in ascending lowercased-name order — the deterministic
+/// tie-break), the first whose FIRST key column has at least one equality conjunct against
+/// a type-matched const-source; else `None` (full scan).
+fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
+    if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
+        detect_pk_bound(
+            filter,
+            rel.offset + pk_local,
+            rel.table.columns[pk_local].ty,
+        )
+    }) {
+        return Some(ScanBound::Pk(b));
+    }
+    for idx in &rel.table.indexes {
+        let ci = idx.columns[0];
+        let ty = rel.table.columns[ci].ty;
+        let mut terms = Vec::new();
+        collect_bound_terms(filter, rel.offset + ci, ty, &mut terms);
+        let eqs: Vec<BoundSrc> = terms
+            .into_iter()
+            .filter(|t| matches!(t.op, CmpOp::Eq))
+            .map(|t| t.src)
+            .collect();
+        if !eqs.is_empty() {
+            return Some(ScanBound::Index(IndexBound {
+                name_key: idx.name.to_ascii_lowercase(),
+                col_type: ty,
+                eqs,
+                tail_types: idx.columns[1..]
+                    .iter()
+                    .map(|&c| rel.table.columns[c].ty)
+                    .collect(),
+            }));
+        }
+    }
+    None
+}
+
+/// A secondary-index entry key (spec/design/indexes.md §3): each indexed column as the
+/// encoding.md §2.2 nullable slot — `0x00` + the type's bare order-preserving key bytes when
+/// present, the lone `0x01` for NULL (always tagged, even for a NOT NULL column) — then the
+/// row's storage key as the suffix. Indexable types are fixed-width and never spill, so the
+/// values are always resident (never `Unfetched`).
+fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &ci in &def.columns {
+        match &row[ci] {
+            Value::Null => out.push(0x01),
+            v => {
+                out.push(0x00);
+                let ty = columns[ci].ty;
+                match v {
+                    Value::Int(n) => out.extend_from_slice(&encode_int(ty, *n)),
+                    Value::Uuid(u) => out.extend_from_slice(u),
+                    Value::Timestamp(m) | Value::Timestamptz(m) => {
+                        out.extend_from_slice(&encode_int(ty, *m))
+                    }
+                    _ => {
+                        unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
+                    }
+                }
+            }
+        }
+    }
+    out.extend_from_slice(storage_key);
+    out
+}
+
+/// The byte-successor of a prefix: the smallest byte string greater than every string that
+/// extends `p`. Increment the last non-0xFF byte and truncate after it; an all-0xFF prefix
+/// has no successor (`None` ⇒ unbounded high end).
+fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
+    let mut s = p.to_vec();
+    while let Some(last) = s.last_mut() {
+        if *last == 0xFF {
+            s.pop();
+        } else {
+            *last += 1;
+            return Some(s);
+        }
+    }
+    None
 }
 
 /// Flatten the WHERE's top-level AND-chain (an OR is never descended — a disjunction is not a
@@ -4347,6 +4853,8 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
         stmt,
         Statement::CreateTable(_)
             | Statement::DropTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
@@ -4359,6 +4867,8 @@ fn stmt_kind(stmt: &Statement) -> &'static str {
     match stmt {
         Statement::CreateTable(_) => "CREATE TABLE",
         Statement::DropTable(_) => "DROP TABLE",
+        Statement::CreateIndex(_) => "CREATE INDEX",
+        Statement::DropIndex(_) => "DROP INDEX",
         Statement::Insert(_) => "INSERT",
         Statement::Update(_) => "UPDATE",
         Statement::Delete(_) => "DELETE",

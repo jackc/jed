@@ -14,7 +14,9 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 4 # format_version 4: + catalog CHECK constraints (constraints.md §4.5)
+VERSION = 5 # format_version 5: secondary-index catalog reshape (indexes.md §6) — explicit
+# pk ordinal list (flags bit0 retired), per-table index list, index B-trees of
+# empty-payload records
 PAGE_HEADER = 12
 ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
 TXID = 1
@@ -67,10 +69,10 @@ def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, defaul
 end
 
 # A table with a COMPOSITE primary key (constraints.md §3): the stored key is the
-# concatenation of the members' encodings in declaration order (a 4-byte int32 then a
+# concatenation of the members' encodings in key order (a 4-byte int32 then a
 # 2-byte int16 — mixed widths, ../design/encoding.md §2.3), pinning the cross-core
-# composite key bytes. Both flag bits are set in the catalog (bit0 per member); no
-# format change. Rows include a negative first component (sign-flip ordering) and
+# composite key bytes; the catalog persists the v5 pk ordinal list [0, 1].
+# Rows include a negative first component (sign-flip ordering) and
 # first-component ties broken by the second. Listed in ascending tuple order — the
 # cores build this via `CREATE TABLE t (a int32, b int16, v int16, PRIMARY KEY (a, b))`
 # and insert in this order (the tree shape is order-sensitive).
@@ -286,6 +288,29 @@ COMPRESSED_TABLE = {
          [4, nil, nil]]
 }.freeze
 
+# A table with SECONDARY INDEXES (v5 — indexes.md): pins the catalog reshape and the index
+# trees. The PK list order (b, a) DIFFERS from declaration order (the lifted composite-PK
+# narrowing — pk ordinals [1, 0]); index `i_u` covers a NULLABLE uuid column holding a NULL
+# (the encoding.md §2.2 presence tag in stored index order — present values first, NULL
+# last), and `t_a_b_idx` is the auto-named two-column index. Index records have EMPTY
+# payloads (key only). Indexes listed in ascending lowercased-name order (the catalog
+# order). The cores build this via
+#   CREATE TABLE t (a int32, b int32, u uuid, PRIMARY KEY (b, a));
+#   CREATE INDEX i_u ON t (u);  CREATE INDEX ON t (a, b);
+# and insert rows in ascending storage-key order.
+INDEX_TABLE = {
+  name: "t",
+  columns: [col("a", "int32", pk: true), col("b", "int32", pk: true), col("u", "uuid")],
+  pk_order: [1, 0], # PRIMARY KEY (b, a)
+  indexes: [
+    { name: "i_u", cols: [2] },
+    { name: "t_a_b_idx", cols: [0, 1] }
+  ],
+  rows: [[1, 10, "550e8400-e29b-41d4-a716-446655440000"],
+         [2, 10, nil],
+         [3, 20, "00000000-0000-0000-0000-000000000000"]]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -306,6 +331,7 @@ FIXTURES = [
                rows: [[7, 70], [8, 80], [9, 90]] }] },
   { file: "composite_pk_table.jed", page_size: 256, tables: [COMPOSITE_PK_TABLE] },
   { file: "check_table.jed", page_size: 256, tables: [CHECK_TABLE] },
+  { file: "index_table.jed", page_size: 256, tables: [INDEX_TABLE] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
@@ -402,7 +428,14 @@ end
 
 # --- encoding (reference serializer) ----------------------------------------
 
-def table_entry_bytes(table, root_data_page)
+# The primary-key member ordinals in KEY order (v5): an explicit pk_order when the fixture
+# declares one (key order != declaration order), else the pk-flagged columns in declaration
+# order. [] = no PK (synthetic rowid keys).
+def pk_order(table)
+  table[:pk_order] || table[:columns].each_index.select { |i| table[:columns][i][:pk] }
+end
+
+def table_entry_bytes(table, root_data_page, index_roots)
   out = +"".b
   out << u16(table[:name].bytesize) << table[:name].b
   out << u16(table[:columns].size)
@@ -410,8 +443,9 @@ def table_entry_bytes(table, root_data_page)
     out << u16(c[:name].bytesize) << c[:name].b
     out << [TYPECODE.fetch(c[:type])].pack("C")
     has_default = c[:default] != :none
+    # bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is the
+    # single authority; the bit is reserved, written 0 (format.md).
     flags = 0
-    flags |= 0b01 if c[:pk]
     flags |= 0b10 if c[:not_null]
     flags |= 0b100 if has_default
     out << [flags].pack("C")
@@ -422,6 +456,10 @@ def table_entry_bytes(table, root_data_page)
     # value codec rows use — AFTER the typmod, presence-gated. A DEFAULT NULL is one 0x01.
     out << encode_value(c[:type], c[:default]) if has_default
   end
+  # The primary key (v5): count, then the member column ordinals in KEY order.
+  pk = pk_order(table)
+  out << u16(pk.size)
+  pk.each { |i| out << u16(i) }
   # CHECK constraints (v4): count, then (name, expression text) per check, in the catalog's
   # evaluation order — ascending byte order of the lowercased name (constraints.md §4.4/§4.5).
   checks = table[:checks] || []
@@ -430,16 +468,26 @@ def table_entry_bytes(table, root_data_page)
     out << u16(ck[:name].bytesize) << ck[:name].b
     out << u16(ck[:expr].bytesize) << ck[:expr].b
   end
+  # Secondary indexes (v5): count, then per index the name, key-column ordinals (index-key
+  # order), and the index tree's root page — in ascending lowercased-name order (indexes.md).
+  indexes = table[:indexes] || []
+  out << u16(indexes.size)
+  indexes.each_with_index do |ix, k|
+    out << u16(ix[:name].bytesize) << ix[:name].b
+    out << u16(ix[:cols].size)
+    ix[:cols].each { |i| out << u16(i) }
+    out << u32(index_roots[k])
+  end
   out << u32(root_data_page)
   out
 end
 
 # (key, row) pairs in stored (encoded-key) order. PK tables key on the PK member columns —
-# the key is the CONCATENATION of the members' encodings in declaration order (a composite
+# the key is the CONCATENATION of the members' encodings in KEY order (a composite
 # PRIMARY KEY, ../design/encoding.md §2.3; a single-column key is the one-member case).
 # A no-PK table keys on a synthetic int64 rowid = insertion index (executor.rs).
 def table_entries(table)
-  pk_idxs = table[:columns].each_index.select { |i| table[:columns][i][:pk] }
+  pk_idxs = pk_order(table)
   pairs = table[:rows].each_with_index.map do |row, i|
     key = if pk_idxs.empty?
             encode_int(8, i)
@@ -458,6 +506,34 @@ def table_entries(table)
     [key, row]
   end
   pairs.sort_by { |key, _| key } # String#<=> is bytewise == memcmp order
+end
+
+# A secondary-index entry key (indexes.md §3): each indexed column as the encoding.md §2.2
+# NULLABLE SLOT (0x00 + bare order-preserving bytes when present, the lone 0x01 for NULL —
+# always tagged, even for a NOT NULL column), then the row's storage key as the suffix.
+def index_entry_key(table, ix, storage_key, row)
+  out = +"".b
+  ix[:cols].each do |ci|
+    v = row[ci]
+    if v.nil?
+      out << "\x01".b
+    else
+      type = table[:columns][ci][:type]
+      out << "\x00".b
+      out << (type == "uuid" ? uuid_to_bytes(v) : encode_int(WIDTH.fetch(type), v))
+    end
+  end
+  out << storage_key
+  out
+end
+
+# An index's (entry_key, record-plan) pairs in entry-key order. An index record has an EMPTY
+# payload (key only — format.md "Index trees"), so its plan is trivially inline.
+def index_entries(table, ix)
+  table_entries(table).map do |storage_key, row|
+    key = index_entry_key(table, ix, storage_key, row)
+    [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: 2 + key.bytesize }]
+  end.sort_by { |key, _| key }
 end
 
 # --- out-of-line large values (large-values.md §12) -------------------------
@@ -728,6 +804,7 @@ def build_image(tables, page_size)
 
   data_pages = {} # index => [page_type, item_count, payload]
   root_data = Array.new(sorted.size, 0)
+  index_roots = Array.new(sorted.size) { [] }
   next_index = ROOT_PAGE
   sorted.each_with_index do |t, ti|
     pairs = table_entries(t).map do |key, row|
@@ -735,10 +812,16 @@ def build_image(tables, page_size)
       [key, { key: key, row: row, table: t, forms: forms, comps: comps, size: size }]
     end
     root_data[ti], next_index = serialize_tree(build_tree(pairs, cap), next_index, cap, data_pages)
+    # The table's index trees follow its data tree, in catalog (name) order (format.md
+    # "Allocation & incremental commit" / "From-scratch image").
+    (t[:indexes] || []).each do |ix|
+      r, next_index = serialize_tree(build_tree(index_entries(t, ix), cap), next_index, cap, data_pages)
+      index_roots[ti] << r
+    end
   end
 
   cat_root = next_index
-  cat_groups = pack(sorted.map.with_index { |t, ti| table_entry_bytes(t, root_data[ti]).bytesize }, cap)
+  cat_groups = pack(sorted.map.with_index { |t, ti| table_entry_bytes(t, root_data[ti], index_roots[ti]).bytesize }, cap)
   page_count = cat_root + cat_groups.size
 
   image = "\x00".b * (page_count * ps)
@@ -750,7 +833,7 @@ def build_image(tables, page_size)
   cat_groups.each_with_index do |group, gi|
     index = cat_root + gi
     nxt = gi + 1 < cat_groups.size ? index + 1 : 0
-    payload = group.map { |ti| table_entry_bytes(sorted[ti], root_data[ti]) }.join.b
+    payload = group.map { |ti| table_entry_bytes(sorted[ti], root_data[ti], index_roots[ti]) }.join.b
     write_page(image, ps, index, PAGE_CATALOG, group.size, nxt, payload)
   end
 
@@ -819,6 +902,8 @@ def decode_table_entry(buf, pos)
     tc, pos = take(buf, pos, 1)
     flags, pos = take(buf, pos, 1)
     f = flags.getbyte(0)
+    raise "reserved flag bit0 set (retired primary_key bit — v5)" if (f & 0b01) != 0
+
     type = CODETYPE.fetch(tc.getbyte(0))
     precision = nil
     scale = nil
@@ -832,9 +917,17 @@ def decode_table_entry(buf, pos)
     # The default value follows the typmod, present iff flags bit2 (same value codec as rows).
     default = :none
     default, pos = decode_value(type, buf, pos) if (f & 0b100) != 0
-    columns << { name: cname, type: type, pk: (f & 0b01) != 0, not_null: (f & 0b10) != 0,
+    columns << { name: cname, type: type, pk: false, not_null: (f & 0b10) != 0,
                  precision: precision, scale: scale, default: default }
   end
+  # The primary key (v5): member ordinals in KEY order; pk membership marks the columns.
+  pk = []
+  pkc, pos = take(buf, pos, 2)
+  pkc.unpack1("n").times do
+    ob, pos = take(buf, pos, 2)
+    pk << ob.unpack1("n")
+  end
+  pk.each { |i| columns[i][:pk] = true }
   # CHECK constraints (v4): (name, expression text) pairs in evaluation order.
   checks = []
   cc, pos = take(buf, pos, 2)
@@ -845,8 +938,24 @@ def decode_table_entry(buf, pos)
     expr, pos = take(buf, pos, el.unpack1("n"))
     checks << { name: cname, expr: expr }
   end
+  # Secondary indexes (v5): name + key-column ordinals + root page, in name order.
+  indexes = []
+  ic, pos = take(buf, pos, 2)
+  ic.unpack1("n").times do
+    nl, pos = take(buf, pos, 2)
+    iname, pos = take(buf, pos, nl.unpack1("n"))
+    kc, pos = take(buf, pos, 2)
+    cols = []
+    kc.unpack1("n").times do
+      ob, pos = take(buf, pos, 2)
+      cols << ob.unpack1("n")
+    end
+    rb, pos = take(buf, pos, 4)
+    indexes << { name: iname, cols: cols, root_page: rb.unpack1("N") }
+  end
   root, pos = take(buf, pos, 4)
-  [{ name: name, columns: columns, checks: checks, root_data_page: root.unpack1("N") }, pos]
+  [{ name: name, columns: columns, pk: pk, checks: checks, indexes: indexes,
+     root_data_page: root.unpack1("N") }, pos]
 end
 
 # Read one value via the value codec (inverse of encode_value): a presence tag, then — when
@@ -996,6 +1105,41 @@ def read_tree_rows(image, ps, root_page, columns)
   rows
 end
 
+# In-order walk of an INDEX B-tree -> entry keys in ascending order. An index record has an
+# empty payload, so only the key is read (format.md "Index trees").
+def read_tree_keys(image, ps, root_page)
+  keys = []
+  walk = lambda do |idx|
+    return if idx.zero?
+
+    pg = read_page(image, ps, idx)
+    read_rec = lambda do |pos|
+      klb, pos = take(pg[:payload], pos, 2)
+      key, pos = take(pg[:payload], pos, klb.unpack1("n"))
+      keys << key
+      pos
+    end
+    case pg[:type]
+    when PAGE_LEAF
+      pos = 0
+      pg[:item_count].times { pos = read_rec.call(pos) }
+    when PAGE_INTERIOR
+      n = pg[:item_count]
+      children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }
+      pos = 4 * (n + 1)
+      n.times do |i|
+        walk.call(children[i])
+        pos = read_rec.call(pos)
+      end
+      walk.call(children[n])
+    else
+      raise "expected a B-tree node page, got type #{pg[:type]}"
+    end
+  end
+  walk.call(root_page)
+  keys
+end
+
 def decode_image(image)
   ps = image.byteslice(8, 4).unpack1("N")
   meta = select_meta(image, ps)
@@ -1009,7 +1153,12 @@ def decode_image(image)
     pg[:item_count].times do
       entry, pos = decode_table_entry(pg[:payload], pos)
       rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns])
-      tables << { name: entry[:name], columns: entry[:columns], checks: entry[:checks], rows: rows }
+      indexes = entry[:indexes].map do |ix|
+        { name: ix[:name], cols: ix[:cols],
+          entries: read_tree_keys(image, ps, ix[:root_page]).map { |k| k.unpack1("H*") } }
+      end
+      tables << { name: entry[:name], columns: entry[:columns], pk: entry[:pk],
+                  checks: entry[:checks], indexes: indexes, rows: rows }
     end
     cat = pg[:next_page]
   end
@@ -1025,7 +1174,12 @@ def expected_tables(fx)
         { name: c[:name], type: c[:type], pk: c[:pk], not_null: c[:not_null],
           precision: c[:precision], scale: c[:scale], default: c[:default] }
       end,
+      pk: pk_order(t),
       checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr] } },
+      indexes: (t[:indexes] || []).map do |ix|
+        { name: ix[:name], cols: ix[:cols],
+          entries: index_entries(t, ix).map { |key, _| key.unpack1("H*") } }
+      end,
       rows: table_entries(t).map { |_key, row| row } }
   end
 end

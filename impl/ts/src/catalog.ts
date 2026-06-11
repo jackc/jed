@@ -26,11 +26,25 @@ export type Column = {
 export type Table = {
   name: string;
   columns: Column[];
+  // The primary-key member column ordinals in KEY order (which may differ from
+  // declaration order — constraints.md §3; the v5 catalog persists this list). Empty =
+  // no primary key (synthetic rowid keys). The per-column primaryKey flag is derived
+  // membership convenience; this list is the authority for order.
+  pk: number[];
   // The table's CHECK constraints in EVALUATION ORDER — ascending byte order of the
   // lowercased name (spec/design/constraints.md §4.4); the on-disk catalog stores them in
   // this same order. Empty for an unchecked table.
   checks: CheckConstraint[];
+  // The table's secondary indexes in ascending lowercased-name order (the catalog's
+  // on-disk order and the planner's tie-break order — spec/design/indexes.md).
+  indexes: IndexDef[];
 };
+
+// IndexDef is one secondary index of a table (spec/design/indexes.md): its
+// (relation-namespace) name and the indexed column ordinals in index-key order
+// (duplicates allowed — PG). The index's B-tree lives in the snapshot's index-store map,
+// keyed by the lowercased name.
+export type IndexDef = { name: string; columns: number[] };
 
 // CheckConstraint is one CHECK constraint: its (resolved, unique-per-table) name, its
 // persisted expression text — written back verbatim at every commit so the catalog bytes
@@ -47,17 +61,11 @@ export function columnIndex(t: Table, name: string): number {
   return -1;
 }
 
-// pkIndices returns the primary-key member columns' indices in KEY order. Key order is
-// the flagged columns in declaration order — CREATE TABLE requires the constraint's list
-// order to match (the documented 0A000 narrowing, spec/design/constraints.md §3), so the
-// flag bits alone reconstruct the key. Empty = the table has no primary key (synthetic
-// rowid keys).
+// pkIndices returns the primary-key member columns' indices in KEY order (the explicit
+// pk list — the v5 catalog persists key order independent of declaration order). Empty =
+// the table has no primary key (synthetic rowid keys).
 export function pkIndices(t: Table): number[] {
-  const idxs: number[] = [];
-  for (let i = 0; i < t.columns.length; i++) {
-    if (t.columns[i]!.primaryKey) idxs.push(i);
-  }
-  return idxs;
+  return t.pk;
 }
 
 // primaryKeyIndex returns the primary-key column's index iff the key is SINGLE-column,

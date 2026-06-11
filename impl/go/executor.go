@@ -52,11 +52,21 @@ type Snapshot struct {
 	txid   uint64
 	tables map[string]*Table
 	stores map[string]*TableStore
+	// indexStores holds each secondary index's B-tree (spec/design/indexes.md §3): a
+	// TableStore with ZERO value columns (entry keys only — the on-disk empty-payload
+	// record), keyed by the lowercased index name (index names live in the relation
+	// namespace, globally unique). Which table owns an index is recorded in that table's
+	// Indexes list.
+	indexStores map[string]*TableStore
 }
 
 // newSnapshot builds an empty snapshot.
 func newSnapshot() *Snapshot {
-	return &Snapshot{tables: make(map[string]*Table), stores: make(map[string]*TableStore)}
+	return &Snapshot{
+		tables:      make(map[string]*Table),
+		stores:      make(map[string]*TableStore),
+		indexStores: make(map[string]*TableStore),
+	}
 }
 
 // clone returns an independent copy: the catalog map is shallow (Table structs are never mutated
@@ -70,7 +80,11 @@ func (s *Snapshot) clone() *Snapshot {
 	for k, v := range s.stores {
 		stores[k] = v.clone()
 	}
-	return &Snapshot{txid: s.txid, tables: tables, stores: stores}
+	indexStores := make(map[string]*TableStore, len(s.indexStores))
+	for k, v := range s.indexStores {
+		indexStores[k] = v.clone()
+	}
+	return &Snapshot{txid: s.txid, tables: tables, stores: stores, indexStores: indexStores}
 }
 
 // table looks up a table definition by name (case-insensitive).
@@ -95,10 +109,79 @@ func (s *Snapshot) putTable(t *Table, pageSize uint32) {
 	s.tables[key] = t
 }
 
-// removeTable removes a table's definition and its store (DROP TABLE).
+// removeTable removes a table's definition, its store, and its indexes' stores (DROP
+// TABLE — the indexes have no independent life, spec/design/indexes.md §2).
 func (s *Snapshot) removeTable(key string) {
+	if t, ok := s.tables[key]; ok {
+		for _, idx := range t.Indexes {
+			delete(s.indexStores, strings.ToLower(idx.Name))
+		}
+	}
 	delete(s.tables, key)
 	delete(s.stores, key)
+}
+
+// indexStore returns a secondary index's store (the index is known to exist). nameKey is
+// the lowercased index name.
+func (s *Snapshot) indexStore(nameKey string) *TableStore { return s.indexStores[nameKey] }
+
+// putIndex registers a new (empty) secondary index on tableKey: insert its definition
+// into the table's Indexes in ascending lowercased-name order (the catalog/planner order —
+// spec/design/indexes.md §6) and create its zero-column store. The Table struct is
+// re-allocated (catalog Tables are never mutated in place — snapshots share them).
+func (s *Snapshot) putIndex(tableKey string, def IndexDef, pageSize uint32) {
+	nameKey := strings.ToLower(def.Name)
+	s.indexStores[nameKey] = NewTableStore(int(pageSize)-12, nil) // 12 = pageHeader
+	old := s.tables[tableKey]
+	t := *old
+	pos := len(old.Indexes)
+	for i, ix := range old.Indexes {
+		if strings.ToLower(ix.Name) > nameKey {
+			pos = i
+			break
+		}
+	}
+	t.Indexes = make([]IndexDef, 0, len(old.Indexes)+1)
+	t.Indexes = append(t.Indexes, old.Indexes[:pos]...)
+	t.Indexes = append(t.Indexes, def)
+	t.Indexes = append(t.Indexes, old.Indexes[pos:]...)
+	s.tables[tableKey] = &t
+}
+
+// putIndexStore registers a loaded index store under its (lowercased) name — the file
+// loader's hook (format.go): the owning table's Indexes list came from its catalog entry,
+// so only the store is registered here.
+func (s *Snapshot) putIndexStore(nameKey string, store *TableStore) {
+	s.indexStores[nameKey] = store
+}
+
+// removeIndex removes one secondary index (DROP INDEX): its definition from the owning
+// table and its store.
+func (s *Snapshot) removeIndex(tableKey, nameKey string) {
+	if old, ok := s.tables[tableKey]; ok {
+		t := *old
+		t.Indexes = nil
+		for _, ix := range old.Indexes {
+			if strings.ToLower(ix.Name) != nameKey {
+				t.Indexes = append(t.Indexes, ix)
+			}
+		}
+		s.tables[tableKey] = &t
+	}
+	delete(s.indexStores, nameKey)
+}
+
+// findIndex finds the table owning the named index (case-insensitive): (tableKey, def, true).
+func (s *Snapshot) findIndex(name string) (string, IndexDef, bool) {
+	key := strings.ToLower(name)
+	for tk, t := range s.tables {
+		for _, ix := range t.Indexes {
+			if strings.ToLower(ix.Name) == key {
+				return tk, ix, true
+			}
+		}
+	}
+	return "", IndexDef{}, false
 }
 
 // Database is the database handle: the last committed Snapshot plus, while a transaction is open,
@@ -346,6 +429,7 @@ func (db *Database) rollbackTx() (Outcome, error) {
 // Reads (SELECT, set operations) and transaction control run with no data mutation.
 func stmtIsWrite(stmt Statement) bool {
 	return stmt.CreateTable != nil || stmt.DropTable != nil ||
+		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
 		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil
 }
 
@@ -357,6 +441,10 @@ func stmtKind(stmt Statement) string {
 		return "CREATE TABLE"
 	case stmt.DropTable != nil:
 		return "DROP TABLE"
+	case stmt.CreateIndex != nil:
+		return "CREATE INDEX"
+	case stmt.DropIndex != nil:
+		return "DROP INDEX"
 	case stmt.Insert != nil:
 		return "INSERT"
 	case stmt.Update != nil:
@@ -382,6 +470,16 @@ func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error
 			return Outcome{}, err
 		}
 		return db.executeDropTable(stmt.DropTable)
+	case stmt.CreateIndex != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return Outcome{}, err
+		}
+		return db.executeCreateIndex(stmt.CreateIndex)
+	case stmt.DropIndex != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return Outcome{}, err
+		}
+		return db.executeDropIndex(stmt.DropIndex)
 	case stmt.Insert != nil:
 		return db.executeInsert(stmt.Insert, params)
 	case stmt.Select != nil:
@@ -415,11 +513,17 @@ func rejectParamsForDDL(params []Value) error {
 // left to right (unknown 42703, repeated 42701); then the jed narrowings — the
 // declaration-order rule and the per-member key-type gate — trap 0A000.
 func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
-	if _, ok := db.Table(ct.Name); ok {
-		return Outcome{}, NewError(DuplicateTable, "table already exists: "+ct.Name)
+	// The relation namespace is shared between tables and indexes (indexes.md §2), so a
+	// CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
+	if db.relationExists(ct.Name) {
+		return Outcome{}, NewError(DuplicateTable, "relation already exists: "+ct.Name)
 	}
 
 	columns := make([]Column, 0, len(ct.Columns))
+	// pk is the primary-key member ordinals in KEY order (constraints.md §3): the
+	// column-level form is the one-member case; the table-level list below records its
+	// own order.
+	var pk []int
 	pkSeen := false
 	for _, def := range ct.Columns {
 		for _, c := range columns {
@@ -447,6 +551,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 					"multiple primary keys for table "+ct.Name+" are not allowed")
 			}
 			pkSeen = true
+			pk = append(pk, len(columns)) // this column's ordinal (appended below)
 		}
 		// Evaluate + type-coerce the DEFAULT literal once, here. A bad default fails at CREATE
 		// TABLE: out of range 22003, cross-family 42804, decimal over-precision 22003. NOT NULL
@@ -473,8 +578,9 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// Table-level PRIMARY KEY (a, b, ...) constraints (constraints.md §3). Check order
 	// mirrors PostgreSQL (oracle-probed): a second primary key is 42P16 before its
 	// members resolve; members resolve left to right (42703 unknown, 42701 repeated).
-	// The jed narrowings follow: the list must name columns in declaration order, and
-	// every member must be of a key-encodable type (both 0A000, relaxable).
+	// The LIST order is the KEY order — it may differ from declaration order (the v5
+	// catalog persists the ordinal list; the old 0A000 narrowing is lifted). The
+	// per-member key-type gate (0A000) remains.
 	for _, pkList := range ct.TablePKs {
 		if pkSeen {
 			return Outcome{}, NewError(InvalidTableDefinition,
@@ -500,10 +606,6 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			}
 			indices = append(indices, idx)
 		}
-		if !slices.IsSorted(indices) {
-			return Outcome{}, NewError(FeatureNotSupported,
-				"a primary key whose column order differs from the table's column order is not supported yet")
-		}
 		for _, i := range indices {
 			ty := columns[i].Type
 			if !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
@@ -513,6 +615,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			columns[i].PrimaryKey = true
 			columns[i].NotNull = true // PRIMARY KEY ⇒ NOT NULL, per member
 		}
+		pk = indices
 	}
 
 	// CHECK constraints (constraints.md §4). All validation runs first, in textual
@@ -520,7 +623,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// oracle-probed); naming follows in a second pass, so a 42703 in a later check fires
 	// before a 42710 between earlier ones. Resolution needs a catalog *Table, so build it
 	// now (checks attach below, before putTable).
-	table := &Table{Name: ct.Name, Columns: columns}
+	table := &Table{Name: ct.Name, Columns: columns, PK: pk}
 	for i := range ct.Checks {
 		def := &ct.Checks[i]
 		// Structural rejections first (a single pre-walk — a documented micro-order
@@ -639,10 +742,169 @@ func evalChecks(checks []namedCheck, relation string, row Row, env *evalEnv, met
 // expression tree (the store is discarded wholesale), so it accrues zero cost.
 func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
 	if _, ok := db.Table(dt.Name); !ok {
+		// An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
+		// anything else is the missing-table 42P01 the DML paths raise.
+		if _, _, ok := db.findIndex(dt.Name); ok {
+			return Outcome{}, NewError(WrongObjectType, dt.Name+" is not a table")
+		}
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+dt.Name)
 	}
 	db.working().removeTable(strings.ToLower(dt.Name))
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// findIndex finds the table owning the named index in the visible snapshot
+// (case-insensitive).
+func (db *Database) findIndex(name string) (string, IndexDef, bool) {
+	return db.readSnap().findIndex(name)
+}
+
+// relationExists reports whether name is taken in the shared relation namespace (a table
+// OR an index — spec/design/indexes.md §2), case-insensitively.
+func (db *Database) relationExists(name string) bool {
+	if _, ok := db.Table(name); ok {
+		return true
+	}
+	_, _, ok := db.findIndex(name)
+	return ok
+}
+
+// executeCreateIndex analyzes and runs a CREATE INDEX (spec/design/indexes.md §2).
+// Validation mirrors PostgreSQL's order (oracle-probed): the table must exist (42P01);
+// each key column, in list order, must exist (42703) and be of a key-encodable type
+// (0A000 — the same narrowing as a PRIMARY KEY member); then an explicit name is checked
+// against the shared relation namespace (42P07), or an omitted name derives PG's choice —
+// the lowercased <table>_<col>..._idx with the smallest free suffix. The index is then
+// built by scanning the table once: page_read per node + storage_row_read per row (the
+// metered build scan — cost.md §3); maintenance thereafter is unmetered.
+func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
+	table, ok := db.Table(ci.Table)
+	if !ok {
+		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ci.Table)
+	}
+	tableKey := strings.ToLower(table.Name)
+	columns := table.Columns
+	cols := make([]int, 0, len(ci.Columns))
+	for _, name := range ci.Columns {
+		idx := table.ColumnIndex(name)
+		if idx < 0 {
+			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+name)
+		}
+		ty := columns[idx].Type
+		if !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+			return Outcome{}, NewError(FeatureNotSupported,
+				"a "+ty.CanonicalName()+" index column is not supported yet")
+		}
+		// A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
+		cols = append(cols, idx)
+	}
+	name := ci.Name
+	if name != "" {
+		if db.relationExists(name) {
+			return Outcome{}, NewError(DuplicateTable, "relation already exists: "+name)
+		}
+	} else {
+		// PG's ChooseIndexName (probed): lowercased table + every listed column name
+		// (list order, duplicates included) + "idx", then the smallest free suffix.
+		base := tableKey
+		for _, cn := range ci.Columns {
+			base += "_" + strings.ToLower(cn)
+		}
+		base += "_idx"
+		name = base
+		for suffix := 1; db.relationExists(name); suffix++ {
+			name = base + strconv.Itoa(suffix)
+		}
+	}
+
+	// The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
+	// row, with the indexed columns as the touched set (fixed-width — the chain/decompress
+	// terms are structurally zero). An empty table charges 0. The entries are computed
+	// here, against the pre-index store; the writes below are unmetered.
+	meter := NewMeterWithLimit(db.maxCost)
+	mask := make([]bool, len(columns))
+	for _, c := range cols {
+		mask[c] = true
+	}
+	def := IndexDef{Name: name, Columns: cols}
+	store := db.readSnap().store(ci.Table)
+	nodes, slabs, err := store.ScanUnits(mask)
+	if err != nil {
+		return Outcome{}, err
+	}
+	meter.Charge(Costs.PageRead*int64(nodes) + Costs.ValueDecompress*int64(slabs))
+	stored, err := store.EntriesInKeyOrder()
+	if err != nil {
+		return Outcome{}, err
+	}
+	entries := make([][]byte, 0, len(stored))
+	for _, e := range stored {
+		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row
+			return Outcome{}, err
+		}
+		meter.Charge(Costs.StorageRowRead)
+		entries = append(entries, indexEntryKey(columns, def, e.Key, e.Row))
+	}
+	if err := meter.Guard(); err != nil {
+		return Outcome{}, err
+	}
+
+	nameKey := strings.ToLower(def.Name)
+	db.working().putIndex(tableKey, def, db.pageSize)
+	istore := db.working().indexStore(nameKey)
+	for _, ek := range entries {
+		inserted, err := istore.Insert(ek, nil)
+		if err != nil {
+			return Outcome{}, err
+		}
+		if !inserted {
+			panic("index entry keys are unique (storage-key suffix)")
+		}
+	}
+	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
+}
+
+// executeDropIndex runs a DROP INDEX (spec/design/indexes.md §2): a table's name is
+// 42809, a missing one 42704. A pure catalog edit — zero cost, like DROP TABLE.
+func (db *Database) executeDropIndex(di *DropIndex) (Outcome, error) {
+	if _, ok := db.Table(di.Name); ok {
+		return Outcome{}, NewError(WrongObjectType, di.Name+" is not an index")
+	}
+	tableKey, _, ok := db.findIndex(di.Name)
+	if !ok {
+		return Outcome{}, NewError(UndefinedObject, "index does not exist: "+di.Name)
+	}
+	db.working().removeIndex(tableKey, strings.ToLower(di.Name))
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each
+// indexed column as the encoding.md §2.2 nullable slot — 0x00 + the type's bare
+// order-preserving key bytes when present, the lone 0x01 for NULL (always tagged, even
+// for a NOT NULL column) — then the row's storage key as the suffix. Indexable types are
+// fixed-width and never spill, so the values are always resident (never unfetched).
+func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) []byte {
+	var out []byte
+	for _, ci := range def.Columns {
+		v := row[ci]
+		switch v.Kind {
+		case ValNull:
+			out = append(out, 0x01)
+		case ValInt:
+			out = append(out, 0x00)
+			out = append(out, EncodeInt(columns[ci].Type, v.Int)...)
+		case ValUuid:
+			out = append(out, 0x00)
+			out = append(out, v.Str...)
+		case ValTimestamp, ValTimestamptz:
+			out = append(out, 0x00)
+			out = append(out, EncodeInt(columns[ci].Type, v.Int)...)
+		default:
+			panic("an index column is a key-encodable type (CREATE INDEX gate)")
+		}
+	}
+	out = append(out, storageKey...)
+	return out
 }
 
 // executeInsert analyzes and runs an INSERT whose rows come from a VALUES list or a SELECT
@@ -908,11 +1170,18 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 
 	// Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
 	// rowid is allocated here, in row order, so a failed validation pass burns none
-	// (spec/fileformat/format.md, spec/design/grammar.md §12).
+	// (spec/fileformat/format.md, spec/design/grammar.md §12). Each stored row's
+	// secondary-index entries are computed against its final key (the rowid included) and
+	// written after the rows (indexes.md §4 — an index write cannot fail, so
+	// all-or-nothing is unchanged).
+	indexInserts := make([][][]byte, len(table.Indexes))
 	for _, pr := range prepared {
 		key := pr.key
 		if key == nil {
 			key = EncodeInt(Int64, store.AllocRowid())
+		}
+		for k, def := range table.Indexes {
+			indexInserts[k] = append(indexInserts[k], indexEntryKey(table.Columns, def, key, pr.row))
 		}
 		ok, err := store.Insert(key, pr.row)
 		if err != nil {
@@ -920,6 +1189,18 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		}
 		if !ok {
 			panic("pre-validated INSERT key must be unique")
+		}
+	}
+	for k, def := range table.Indexes {
+		istore := db.working().indexStore(strings.ToLower(def.Name))
+		for _, ek := range indexInserts[k] {
+			inserted, err := istore.Insert(ek, nil)
+			if err != nil {
+				return err
+			}
+			if !inserted {
+				panic("index entry keys are unique (storage-key suffix)")
+			}
 		}
 	}
 	return nil
@@ -976,7 +1257,13 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	}
 	env := &evalEnv{exec: db, params: bound}
 	store := db.working().store(del.Table)
-	var keys [][]byte
+	// matched collects (key, row) pairs before mutating; the rows feed phase 2's
+	// index-entry removal (indexed columns are fixed-width and always resident).
+	type matchedRow struct {
+		key []byte
+		row Row
+	}
+	var matched []matchedRow
 	// DELETE's touched set (cost.md §3): only the filter's columns — dropping a row never reads
 	// its chains, so a bare DELETE charges no chain/decompress units at all.
 	mask := make([]bool, len(table.Columns))
@@ -1018,21 +1305,31 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		if err != nil {
 			return Outcome{}, err
 		}
-		matched := true
+		keep := true
 		if filter != nil {
 			v, err := filter.eval(row, env, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
-			matched = v.IsTrue()
+			keep = v.IsTrue()
 		}
-		if matched {
-			keys = append(keys, e.Key)
+		if keep {
+			matched = append(matched, matchedRow{key: e.Key, row: row})
 		}
 	}
-	for _, k := range keys {
-		if _, err := store.Remove(k); err != nil {
+	// Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
+	// unmetered write work; an index removal cannot fail).
+	for _, m := range matched {
+		if _, err := store.Remove(m.key); err != nil {
 			return Outcome{}, err
+		}
+	}
+	for _, def := range table.Indexes {
+		istore := db.working().indexStore(strings.ToLower(def.Name))
+		for _, m := range matched {
+			if _, err := istore.Remove(indexEntryKey(table.Columns, def, m.key, m.row)); err != nil {
+				return Outcome{}, err
+			}
 		}
 	}
 	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
@@ -1134,9 +1431,11 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	}
 	env := &evalEnv{exec: db, params: bound}
 	store := db.working().store(upd.Table)
+	// Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
 	type pending struct {
-		key []byte
-		row Row
+		key    []byte
+		row    Row
+		oldRow Row
 	}
 	var updates []pending
 	// UPDATE's touched set (cost.md §3): the filter's columns plus every assignment SOURCE's —
@@ -1220,7 +1519,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		if err := evalChecks(checks, table.Name, newRow, env, meter); err != nil {
 			return Outcome{}, err
 		}
-		updates = append(updates, pending{key: e.Key, row: newRow})
+		updates = append(updates, pending{key: e.Key, row: newRow, oldRow: row})
 	}
 
 	// Each rewritten row's disposition plan may attempt compression (a record over RECORD_MAX)
@@ -1235,10 +1534,43 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		return Outcome{}, err
 	}
 
-	// Phase 2: apply (keys unchanged — a PK column can't be assigned).
+	// Index maintenance (indexes.md §4): an entry moves only when its key CHANGED — equal
+	// old/new keys leave the index tree untouched (part of the contract: it keeps the
+	// copy-on-write dirty set, and so the commit's written pages, byte-identical across
+	// cores). The storage key cannot change (PK assignment is rejected), so the suffix is
+	// stable.
+	type indexMove struct{ oldKey, newKey []byte }
+	indexMoves := make([][]indexMove, len(table.Indexes))
+	for _, u := range updates {
+		for k, def := range table.Indexes {
+			oldEk := indexEntryKey(table.Columns, def, u.key, u.oldRow)
+			newEk := indexEntryKey(table.Columns, def, u.key, u.row)
+			if !bytes.Equal(oldEk, newEk) {
+				indexMoves[k] = append(indexMoves[k], indexMove{oldKey: oldEk, newKey: newEk})
+			}
+		}
+	}
+
+	// Phase 2: apply (keys unchanged — a PK column can't be assigned), then move the
+	// changed index entries (unmetered write work; cannot fail).
 	for _, u := range updates {
 		if err := store.Replace(u.key, u.row); err != nil {
 			return Outcome{}, err
+		}
+	}
+	for k, def := range table.Indexes {
+		istore := db.working().indexStore(strings.ToLower(def.Name))
+		for _, mv := range indexMoves[k] {
+			if _, err := istore.Remove(mv.oldKey); err != nil {
+				return Outcome{}, err
+			}
+			inserted, err := istore.Insert(mv.newKey, nil)
+			if err != nil {
+				return Outcome{}, err
+			}
+			if !inserted {
+				panic("index entry keys are unique (storage-key suffix)")
+			}
 		}
 	}
 	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
@@ -1731,20 +2063,19 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 			return nil, err
 		}
 	}
-	// Primary-key predicate pushdown, per base relation: detect WHERE conjuncts that bound that
-	// relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree (cost.md
-	// §3 "bounded scan"). The filter is resolved against the full FROM scope, so a relation's PK
-	// column is the GLOBAL index rel.offset+pkLocal; isConstSource only accepts a literal/param/outer
-	// const (never a sibling column), so a JOIN base table is bounded only by a CONSTANT predicate on
-	// its own PK — `b.pk = a.x` (index-nested-loop) stays a full scan, a follow-on. Sound for outer
-	// joins too: a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows, so
-	// bounding it cannot drop a surviving row. A no-PK relation gets nil (full scan).
-	relBounds := make([]*pkBoundPlan, len(rels))
+	// Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that relation's
+	// scan — a PK range, else a secondary-index equality — so it seeks/ranges instead of walking
+	// the whole B-tree (cost.md §3 "bounded scan" / "index-bounded scan"; indexes.md §5). The
+	// filter is resolved against the full FROM scope, so a relation's column is the GLOBAL index
+	// rel.offset+local; isConstSource only accepts a literal/param/outer const (never a sibling
+	// column), so a JOIN base table is bounded only by a CONSTANT predicate on its own columns —
+	// `b.pk = a.x` (index-nested-loop) stays a full scan, a follow-on. Sound for outer joins too:
+	// a non-NULL conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding it
+	// cannot drop a surviving row.
+	relBounds := make([]*scanBound, len(rels))
 	if filter != nil {
 		for i, rel := range rels {
-			if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
-				relBounds[i] = detectPKBound(filter, rel.offset+pkLocal, rel.table.Columns[pkLocal].Type)
-			}
+			relBounds[i] = detectScanBound(filter, rel)
 		}
 	}
 	// ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
@@ -1943,6 +2274,148 @@ type boundTerm struct {
 type pkBoundPlan struct {
 	pkType ScalarType
 	terms  []boundTerm
+}
+
+// scanBound is a per-relation scan bound (cost.md §3): a primary-key range, or a
+// secondary-index equality (spec/design/indexes.md §5) — exactly one of pk/index is set.
+// The PK bound wins when both apply (it is the row's own key — no second tree,
+// range-capable, strictly cheaper).
+type scanBound struct {
+	pk    *pkBoundPlan
+	index *indexBoundPlan
+}
+
+// indexBoundPlan is the plan-time result of index analysis (indexes.md §5): the chosen
+// index (lowest lowercased name whose FIRST key column has an equality conjunct), that
+// column's storage type, and every equality const-source on it. At exec time the sources
+// must agree on one value (else the bound is provably empty) and the index is
+// range-scanned over that value's presence-tagged prefix.
+type indexBoundPlan struct {
+	nameKey string // the index store's key — the lowercased index name
+	colType ScalarType
+	eqs     []*rExpr
+	// tailTypes is the REMAINING key components' types (columns[1:]): an admitted
+	// entry's row-key suffix sits after every component slot, so the fetch skips these
+	// (each slot is self-delimiting — a 0x01 NULL tag alone, or 0x00 + the type's fixed
+	// width).
+	tailTypes []ScalarType
+}
+
+// detectScanBound picks one relation's scan bound (cost.md §3; indexes.md §5): the
+// single-column PK bound first; else, among the relation's indexes (held in ascending
+// lowercased-name order — the deterministic tie-break), the first whose FIRST key column
+// has at least one equality conjunct against a type-matched const-source; else nil (full
+// scan).
+func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
+	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
+		if bp := detectPKBound(filter, rel.offset+pkLocal, rel.table.Columns[pkLocal].Type); bp != nil {
+			return &scanBound{pk: bp}
+		}
+	}
+	for _, idx := range rel.table.Indexes {
+		ci := idx.Columns[0]
+		ty := rel.table.Columns[ci].Type
+		var eqs []*rExpr
+		if bp := detectPKBound(filter, rel.offset+ci, ty); bp != nil {
+			for _, t := range bp.terms {
+				if t.op == OpEq {
+					eqs = append(eqs, t.src)
+				}
+			}
+		}
+		if len(eqs) > 0 {
+			tail := make([]ScalarType, 0, len(idx.Columns)-1)
+			for _, c := range idx.Columns[1:] {
+				tail = append(tail, rel.table.Columns[c].Type)
+			}
+			return &scanBound{index: &indexBoundPlan{
+				nameKey: strings.ToLower(idx.Name), colType: ty, eqs: eqs, tailTypes: tail,
+			}}
+		}
+	}
+	return nil
+}
+
+// indexBoundRows executes an index equality bound (cost.md §3 "index-bounded scan"):
+// fetch the rows the equality admits, in index-entry order (= storage-key order among
+// equal values), and return them with the scan's up-front units (pages, slabs) — the
+// index-tree nodes overlapping the prefix range plus, per admitted entry, the table-tree
+// nodes of that row's point lookup and its touched-column decompress slabs. The caller
+// feeds the rows through the same scanSource as any bounded scan (page_read block +
+// per-row storage_row_read). A provably empty bound (NULL / contradictory equalities /
+// out-of-range) returns nothing and charges nothing.
+func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params []Value, outer []Row, mask []bool) (rows []Row, pages, slabs int, err error) {
+	// Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
+	// true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
+	// integer can equal no stored value — all provably empty.
+	var agreed []byte
+	for _, src := range ib.eqs {
+		key, isNull, ok := encodeBoundKey(ib.colType, src, params, outer)
+		if isNull || !ok {
+			return nil, 0, 0, nil
+		}
+		if agreed == nil {
+			agreed = key
+		} else if !bytes.Equal(agreed, key) {
+			return nil, 0, 0, nil
+		}
+	}
+	// The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
+	// is every entry extending the prefix: [prefix, byte-successor(prefix)).
+	prefix := append([]byte{0x00}, agreed...)
+	b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
+	istore := db.readSnap().indexStore(ib.nameKey)
+	entries, err := istore.RangeEntries(b)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	pages = istore.OverlapNodeCount(b)
+	store := db.readSnap().store(tableName)
+	for _, e := range entries {
+		// Skip the remaining key components (each self-delimiting — indexes.md §5);
+		// the suffix after them is the row's storage key (indexes.md §3).
+		at := len(prefix)
+		for _, ty := range ib.tailTypes {
+			if at < len(e.Key) && e.Key[at] == 0x01 {
+				at++
+			} else {
+				at += 1 + ty.WidthBytes()
+			}
+		}
+		rowKey := e.Key[at:]
+		point := keyBound{lo: rowKey, loInc: true, hi: rowKey, hiInc: true}
+		n, sl, err := store.OverlapScanUnits(point, mask)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		pages += n
+		slabs += sl
+		row, ok, err := store.Get(rowKey)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		if !ok {
+			panic("an index entry references a stored row")
+		}
+		rows = append(rows, row)
+	}
+	return rows, pages, slabs, nil
+}
+
+// prefixSuccessor is the byte-successor of a prefix: the smallest byte string greater
+// than every string that extends p. Increment the last non-0xFF byte and truncate after
+// it; an all-0xFF prefix has no successor (nil ⇒ unbounded high end).
+func prefixSuccessor(p []byte) []byte {
+	s := append([]byte(nil), p...)
+	for len(s) > 0 {
+		if s[len(s)-1] == 0xFF {
+			s = s[:len(s)-1]
+		} else {
+			s[len(s)-1]++
+			return s
+		}
+	}
+	return nil
 }
 
 // pkBoundFor detects a single-table mutation's (UPDATE/DELETE) PK pushdown bound; nil ⇒ full scan.
@@ -2190,11 +2663,13 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A correlated
 	// bound resolves against env.outer (the enclosing rows).
 	// This path is single-table (gated below), so the only relation is relBounds[0].
+	// An INDEX bound never streams — the dispatch gate routes it to the eager path
+	// (cost.md §3 "LIMIT short-circuit").
 	b := unboundedBound()
 	empty := false
 	overlap, slabs := 0, 0
 	if plan.relBounds[0] != nil {
-		b, empty = db.buildKeyBound(plan.relBounds[0], params, env.outer)
+		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer)
 	}
 	if !empty {
 		var err error
@@ -2265,8 +2740,11 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// genuine early-out, not a post-hoc truncation. (ORDER BY/DISTINCT/aggregate must see every row, so
 	// they keep the eager path below.) page_read stays the full block (the bound's node count); only
 	// row reads short-circuit.
+	// An index-bounded scan does not stream (cost.md §3 "index-bounded scan"): it reads
+	// the full admitted set via the eager path below.
 	if plan.limit != nil && len(plan.rels) == 1 && len(plan.joins) == 0 &&
-		!plan.isAgg && !plan.distinct && len(plan.order) == 0 {
+		!plan.isAgg && !plan.distinct && len(plan.order) == 0 &&
+		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) {
 		return db.execStreamingLimit(plan, env, meter, params)
 	}
 
@@ -2277,13 +2755,19 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	materialized := make([][]Row, len(plan.rels))
 	for ri, rel := range plan.rels {
 		store := db.readSnap().store(rel.tableName)
-		// Each base table's own primary-key bound (if any) seeks/ranges instead of walking the whole
-		// B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. Otherwise the
-		// full scan is unchanged (cost.md §3 "bounded scan" / JOIN).
+		// Each base table's own scan bound (if any) seeks/ranges instead of walking the whole
+		// B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. An index
+		// bound fetches via the index tree + per-row point lookups (cost.md §3 "index-bounded
+		// scan"). Otherwise the full scan is unchanged.
 		var rows []Row
 		var nodeCount, slabs int
-		if plan.relBounds[ri] != nil {
-			b, empty := db.buildKeyBound(plan.relBounds[ri], params, outer)
+		if sb := plan.relBounds[ri]; sb != nil && sb.index != nil {
+			var err error
+			if rows, nodeCount, slabs, err = db.indexBoundRows(rel.tableName, sb.index, params, outer, plan.relMasks[ri]); err != nil {
+				return selectResult{}, err
+			}
+		} else if sb != nil {
+			b, empty := db.buildKeyBound(sb.pk, params, outer)
 			if !empty {
 				var err error
 				if rows, err = store.RangeRows(b); err != nil {
@@ -3349,14 +3833,14 @@ type selectPlan struct {
 	distinct    bool
 	limit       *int64
 	offset      *int64
-	// relBounds is the primary-key predicate pushdown, ONE entry per relation in rels: the WHERE
+	// relBounds is the scan-bound pushdown, ONE entry per relation in rels: the WHERE
 	// conjuncts that bound that relation's storage key, so its scan seeks/ranges instead of walking
 	// the whole B-tree (spec/design/cost.md §3 "bounded scan"). nil ⇒ a full scan of that relation.
 	// In a JOIN each base table is bounded independently by the WHERE predicates on its OWN primary
 	// key against a CONSTANT (literal/param/outer) — a cross-relation `b.pk = a.x` is the
 	// index-nested-loop case (a follow-on). The residual filter stays the WHOLE `filter`, re-applied
 	// after the join — the bound only narrows which rows are scanned.
-	relBounds []*pkBoundPlan
+	relBounds []*scanBound
 	// relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md
 	// §14): which of its columns this query statically references. Drives the chain-page_read /
 	// value_decompress portion of the scan's up-front cost block — an untouched spilled or

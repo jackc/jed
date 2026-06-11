@@ -103,6 +103,21 @@ func checkTableDB(t *testing.T) *Database {
 	return db
 }
 
+// indexTableDB has SECONDARY INDEXES (v5 — spec/design/indexes.md): the catalog reshape +
+// the index trees. The PK list order (b, a) differs from declaration order (the lifted
+// composite-PK narrowing); i_u covers a nullable uuid column holding a NULL (the
+// encoding.md §2.2 presence tag in stored index order — NULL last), and the unnamed index
+// auto-names to t_a_b_idx. Index records have empty payloads (key only).
+func indexTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (a int32, b int32, u uuid, PRIMARY KEY (b, a))")
+	run(t, db, "CREATE INDEX i_u ON t (u)")
+	run(t, db, "CREATE INDEX ON t (a, b)")
+	run(t, db, "INSERT INTO t VALUES (1, 10, '550e8400-e29b-41d4-a716-446655440000'), "+
+		"(2, 10, NULL), (3, 20, '00000000-0000-0000-0000-000000000000')")
+	return db
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 func nopkTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
@@ -324,6 +339,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"nopk_table.jed", nopkTableDB},
 		{"composite_pk_table.jed", compositePKTableDB},
 		{"check_table.jed", checkTableDB},
+		{"index_table.jed", indexTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -360,6 +376,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"composite_pk_table.jed", compositePKTableDB, "t"},
 		{"check_table.jed", checkTableDB, "t"},
+		{"index_table.jed", indexTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

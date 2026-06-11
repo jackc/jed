@@ -1,0 +1,160 @@
+# Secondary indexes — CREATE INDEX / DROP INDEX DDL (spec/design/indexes.md §1/§2,
+# grammar.md §30). PG-matched (oracle-probed): auto-naming (<table>_<cols>_idx + the
+# smallest free suffix), the shared table/index relation namespace (42P07 "relation"),
+# validation order table (42P01) → columns in list order (42703/0A000) → name collision
+# (42P07), and the DROP mismatches 42704 (missing) / 42809 (wrong object kind). Auto-named
+# indexes are observable through DROP INDEX and name collisions (jed has no pg_indexes).
+# DDL costs: CREATE INDEX charges its build scan (page_read per table node +
+# storage_row_read per row — cost.md §3); DROP INDEX charges 0. The trailing `on`-named
+# block exercises the grammar.md §30 lookahead (PG reserves ON, so those records carry
+# oracle overrides and sit LAST — a PG-failing `statement ok` would poison the oracle
+# replay prefix).
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.drop_table, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE t (a int32 PRIMARY KEY, b int32, s text)
+
+# an index on an empty table builds for free (no rows, no nodes)
+# cost: 0
+statement ok
+CREATE INDEX t_b_idx ON t (b)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x'), (2, 10, 'y'), (3, 20, 'z')
+
+# the build scan is metered: page_read(1 node) + 3 storage_row_read = 4
+# cost: 4
+statement ok
+CREATE INDEX explicit_b ON t (b)
+
+# the unnamed form derives PG's choice — t_a_b_idx — proven by the later collision
+statement ok
+CREATE INDEX ON t (a, b)
+
+# a duplicate column in the key list is allowed (PG allows it; auto-name t_b_b_idx)
+statement ok
+CREATE INDEX ON t (b, b)
+
+# --- validation order (oracle-probed: table -> columns -> name) ---------------
+
+# the table must exist — reported before the bad column
+statement error 42P01
+CREATE INDEX i ON nosuch (nope)
+
+# an unknown key column
+statement error 42703
+CREATE INDEX i ON t (nope)
+
+# the column check precedes the name-collision check (PG's order)
+statement error 42703
+CREATE INDEX explicit_b ON t (nope)
+
+# a text key column is the documented 0A000 narrowing (the same as a PRIMARY KEY member)
+statement error 0A000
+CREATE INDEX i ON t (s)
+
+# --- the shared relation namespace --------------------------------------------
+
+# a duplicate index name
+statement error 42P07
+CREATE INDEX explicit_b ON t (b)
+
+# an index may not take a table's name
+statement error 42P07
+CREATE INDEX t ON t (b)
+
+# a table may not take an index's name
+statement error 42P07
+CREATE TABLE explicit_b (x int32)
+
+# the auto-namer found t_a_b_idx taken? no — it chose it; an explicit clash proves the
+# derived name exists
+statement error 42P07
+CREATE INDEX t_a_b_idx ON t (b)
+
+# --- DROP INDEX ----------------------------------------------------------------
+
+statement error 42704
+DROP INDEX nosuch
+
+# DROP INDEX of a table is the wrong object kind
+statement error 42809
+DROP INDEX t
+
+# DROP TABLE of an index is the wrong object kind
+statement error 42809
+DROP TABLE explicit_b
+
+# cost: 0
+statement ok
+DROP INDEX explicit_b
+
+statement error 42704
+DROP INDEX explicit_b
+
+# after the drop the name is free again — for any relation kind
+statement ok
+CREATE TABLE explicit_b (x int32)
+
+statement ok
+DROP TABLE explicit_b
+
+# the auto-name suffix walk: t_b_idx is taken, so the next unnamed (b) index is t_b_idx1
+statement ok
+CREATE INDEX ON t (b)
+
+statement error 42P07
+CREATE INDEX t_b_idx1 ON t (b)
+
+# DROP TABLE drops its indexes with it and frees every name
+statement ok
+DROP TABLE t
+
+statement ok
+CREATE TABLE t_b_idx (x int32)
+
+statement ok
+DROP TABLE t_b_idx
+
+# --- indexes keep working as relations come and go ------------------------------
+
+statement ok
+CREATE TABLE r (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO r VALUES (1, 5), (2, 5), (3, 6)
+
+statement ok
+CREATE INDEX r_v ON r (v)
+
+# cost: 9
+query I nosort
+SELECT id FROM r WHERE v = 5 ORDER BY id
+----
+1
+2
+
+# jed keeps every word non-reserved (grammar.md §30): the unnamed form over a table named
+# `on`, and an index explicitly named `on`. PostgreSQL reserves ON, so it cannot parse
+# these — they sit LAST with oracle overrides (conformance.md §5).
+statement ok
+CREATE TABLE on (x int32)
+
+statement ok
+CREATE INDEX ON on (x)
+
+statement ok
+DROP INDEX on_x_idx
+
+statement ok
+DROP TABLE on
+
+statement ok
+CREATE TABLE q (x int32)
+
+statement ok
+CREATE INDEX on ON q (x)
+
+statement ok
+DROP INDEX on

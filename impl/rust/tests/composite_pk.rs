@@ -116,14 +116,30 @@ fn ddl_errors_match_postgres_and_narrowings() {
         ),
         "42P16"
     );
-    // Narrowing: the list must name columns in declaration order.
+    // The list order is the KEY order — it may differ from declaration order (the original
+    // 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
+    // keys by (b, a), so the stored scan order is b-major.
+    execute(
+        &mut db,
+        "CREATE TABLE t (a int32, b int32, PRIMARY KEY (b, a))",
+    )
+    .unwrap();
+    assert_eq!(db.table("t").unwrap().pk_indices(), vec![1, 0]);
+    execute(&mut db, "INSERT INTO t VALUES (1, 20), (2, 10), (3, 15)").unwrap();
+    let rows = db.rows_in_key_order("t").unwrap();
+    let bs: Vec<i64> = rows
+        .iter()
+        .map(|r| match r[1] {
+            Value::Int(n) => n,
+            _ => unreachable!(),
+        })
+        .collect();
     assert_eq!(
-        err_code(
-            &mut db,
-            "CREATE TABLE t (a int32, b int32, PRIMARY KEY (b, a))"
-        ),
-        "0A000"
+        bs,
+        vec![10, 15, 20],
+        "stored order is the (b, a) tuple order"
     );
+    execute(&mut db, "DROP TABLE t").unwrap();
     // Narrowing: every member must be key-encodable (text is not, types.md §11).
     assert_eq!(
         err_code(

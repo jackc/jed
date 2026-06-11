@@ -60,3 +60,43 @@ reason = "jed: the constraint keywords (check, constraint) are NOT reserved — 
 file = "ddl/check.test"
 sql = "INSERT INTO odd VALUES (1, 2)"
 reason = "jed: follows from the override above — the table `odd` (columns named check/constraint) exists in jed but its CREATE fails in PostgreSQL, so this INSERT cannot run on the oracle."
+
+[[override]]
+file = "ddl/create_index.test"
+sql = "CREATE INDEX i ON t (s)"
+reason = "jed: a text index key column is rejected this slice (0A000), the same documented narrowing as a text PRIMARY KEY (indexes.md §1). PG allows a text index."
+
+[[override]]
+file = "ddl/create_index.test"
+sql = "CREATE TABLE on (x int32)"
+reason = "jed keeps every word non-reserved (grammar.md §30): `on` is a legal table name. PG reserves ON (42601). The whole `on` block sits LAST in the file so the PG-failing ok does not poison the oracle replay prefix."
+
+[[override]]
+file = "ddl/create_index.test"
+sql = "CREATE INDEX ON on (x)"
+reason = "jed: the unnamed form over a table named `on` (the grammar.md §30 lookahead). PG reserves ON (42601); prefix-poisoned thereafter."
+
+[[override]]
+file = "ddl/create_index.test"
+sql = "DROP INDEX on_x_idx"
+reason = "Follows the PG-unparseable `on` block: the index only exists in jed (PG failed its CREATE), and the PG replay prefix is already poisoned (25P02)."
+
+[[override]]
+file = "ddl/create_index.test"
+sql = "DROP TABLE on"
+reason = "Follows the PG-unparseable `on` block (PG reserves ON; 25P02 in the poisoned replay prefix)."
+
+[[override]]
+file = "ddl/create_index.test"
+sql = "CREATE TABLE q (x int32)"
+reason = "Inside the PG-poisoned tail of the `on` block (25P02 in the replay prefix); plain SQL otherwise."
+
+[[override]]
+file = "ddl/create_index.test"
+sql = "CREATE INDEX on ON q (x)"
+reason = "jed: an index explicitly named `on` (the grammar.md §30 lookahead). PG reserves ON (42601)."
+
+[[override]]
+file = "ddl/create_index.test"
+sql = "DROP INDEX on"
+reason = "jed: dropping the index named `on`. PG reserves ON (42601)."

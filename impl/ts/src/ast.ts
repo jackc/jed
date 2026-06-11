@@ -181,6 +181,23 @@ export type CheckDef = { name: string | null; expr: Expr; text: string };
 // objects exist yet). See spec/design/grammar.md §13.
 export type DropTable = { kind: "dropTable"; name: string };
 
+// CreateIndex is a CREATE INDEX [name] ON <table> ( col [, col]* ) statement — a
+// non-unique secondary index (spec/design/indexes.md, grammar.md §30). name === null is
+// the unnamed form; the executor derives PostgreSQL's auto-name. Key columns are bare
+// names (no expression/ordered/partial keys this slice); a column may repeat (PG allows
+// it). Execution validates in PG's order: table 42P01, columns 42703/0A000, name
+// collision 42P07.
+export type CreateIndex = {
+  kind: "createIndex";
+  name: string | null;
+  table: string;
+  columns: string[];
+};
+
+// DropIndex is a DROP INDEX <name> statement — remove one secondary index
+// (spec/design/indexes.md §2). Missing → 42704; a table's name → 42809.
+export type DropIndex = { kind: "dropIndex"; name: string };
+
 // Insert is an INSERT ... [(col, ..)] whose rows come from EITHER a VALUES list (each value a
 // literal or the DEFAULT keyword) OR a SELECT (INSERT ... SELECT — spec/design/grammar.md §24).
 // An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
@@ -302,6 +319,8 @@ export type SetOp = {
 export type Statement =
   | CreateTable
   | DropTable
+  | CreateIndex
+  | DropIndex
   | Insert
   | Select
   | SetOp

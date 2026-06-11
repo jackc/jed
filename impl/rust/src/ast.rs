@@ -8,6 +8,8 @@ use crate::decimal::Decimal;
 pub enum Statement {
     CreateTable(CreateTable),
     DropTable(DropTable),
+    CreateIndex(CreateIndex),
+    DropIndex(DropIndex),
     Insert(Insert),
     Select(Select),
     /// A set operation (`UNION`/`INTERSECT`/`EXCEPT`) combining two query expressions
@@ -66,6 +68,25 @@ pub struct CheckDef {
 /// objects exist yet). See spec/design/grammar.md §13.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DropTable {
+    pub name: String,
+}
+
+/// `CREATE INDEX [name] ON <table> ( col [, col]* )` — a non-unique secondary index
+/// (spec/design/indexes.md, grammar.md §30). `name: None` is the unnamed form; the
+/// executor derives PostgreSQL's auto-name. Key columns are bare names (no expression /
+/// ordered / partial keys this slice); a column may repeat (PG allows it). Execution
+/// validates in PG's order: table 42P01, columns 42703/0A000, name collision 42P07.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CreateIndex {
+    pub name: Option<String>,
+    pub table: String,
+    pub columns: Vec<String>,
+}
+
+/// `DROP INDEX <name>` — remove one secondary index (spec/design/indexes.md §2).
+/// Missing → 42704; a table's name → 42809.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DropIndex {
     pub name: String,
 }
 

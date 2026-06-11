@@ -7,6 +7,8 @@ package jed
 type Statement struct {
 	CreateTable *CreateTable
 	DropTable   *DropTable
+	CreateIndex *CreateIndex
+	DropIndex   *DropIndex
 	Insert      *Insert
 	Select      *Select
 	// SetOp is a set operation (UNION/INTERSECT/EXCEPT) combining two query expressions
@@ -70,6 +72,24 @@ type CheckDef struct {
 // there is no IF EXISTS this slice. Single table only; no CASCADE/RESTRICT (no
 // dependent objects exist yet). See spec/design/grammar.md §13.
 type DropTable struct {
+	Name string
+}
+
+// CreateIndex is a CREATE INDEX [name] ON <table> ( col [, col]* ) statement — a
+// non-unique secondary index (spec/design/indexes.md, grammar.md §30). Name == "" is the
+// unnamed form; the executor derives PostgreSQL's auto-name. Key columns are bare names
+// (no expression/ordered/partial keys this slice); a column may repeat (PG allows it).
+// Execution validates in PG's order: table 42P01, columns 42703/0A000, name collision
+// 42P07.
+type CreateIndex struct {
+	Name    string
+	Table   string
+	Columns []string
+}
+
+// DropIndex is a DROP INDEX <name> statement — remove one secondary index
+// (spec/design/indexes.md §2). Missing → 42704; a table's name → 42809.
+type DropIndex struct {
 	Name string
 }
 

@@ -143,27 +143,24 @@ lexicographic logical order; the stored scan order is `ORDER BY a, b, …` for f
 Uniqueness is over the **whole tuple**: a duplicate `(a, b, …)` traps **`23505`** in
 INSERT's two-phase pass; two rows sharing a prefix are distinct rows.
 
-**Narrowing — key order must match declaration order.** This slice requires the constraint's
-column list to name its columns in the table's **declaration order** (`CREATE TABLE t (a …,
-b …, PRIMARY KEY (a, b))` is accepted; `PRIMARY KEY (b, a)` traps `0A000`). Why: the on-disk
-catalog records the key as the per-column `primary_key` flag bits
-([../fileformat/format.md](../fileformat/format.md)), which encode the member *set* but not
-an independent *order* — the key order is defined as the flagged columns in declaration
-order. Persisting an arbitrary order needs a catalog format change, deliberately deferred to
-the secondary-index slice (which must reshape the catalog anyway —
-[../../TODO.md](../../TODO.md) Phase 4); the narrowing is relaxable there. PostgreSQL
-accepts any order, so this is a documented temporary divergence.
+**Key order is the list order — any order.** `PRIMARY KEY (b, a)` keys the table by `b`
+then `a`, independent of declaration order (PostgreSQL's behavior). *History:* the original
+slice required list order to match declaration order (`0A000`) because the catalog persisted
+the key only as per-column flag bits — a member *set* with no independent order. The
+secondary-index catalog reshape (`format_version` 5 — [indexes.md §6](indexes.md),
+[../fileformat/format.md](../fileformat/format.md)) records the key as an explicit ordinal
+list in key order, which lifted the narrowing.
 
 **Planner.** The primary-key pushdown (cost.md §3) recognizes **single-column** keys only; a
 composite-PK table scans whole this slice (sound and deterministic — the bound is an
 optimization, never a semantic). Composite point-lookup/prefix pushdown is a follow-on
 optimization slice and carries the NoREC growth obligation with it (conformance.md §8).
 
-**Persistence.** No format change: the existing per-column flags `bit0` marks each member
-(format.md "reader trusts the bits"), and the key order is the declaration order by the
-narrowing above. Files written before this slice are unchanged; a composite-PK table is just
-a table with several `bit0` columns. The cross-core byte fixture is the
-`composite_pk_table.jed` golden.
+**Persistence.** Since `format_version` 5 the catalog records the primary key as an explicit
+**ordinal list in key order** (`pk_count` + column ordinals — format.md); the old per-column
+flag `bit0` is retired (reserved, written 0). The cross-core byte fixture is the
+`composite_pk_table.jed` golden; the out-of-declaration-order case is pinned by
+`index_table.jed`.
 
 ## 4. `CHECK`
 

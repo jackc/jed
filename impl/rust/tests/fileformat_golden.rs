@@ -96,6 +96,26 @@ fn check_table_db() -> Database {
     db
 }
 
+/// A table with SECONDARY INDEXES (v5 — spec/design/indexes.md): the catalog reshape +
+/// the index trees. The PK list order (b, a) differs from declaration order (the lifted
+/// composite-PK narrowing); `i_u` covers a nullable uuid column holding a NULL (the
+/// encoding.md §2.2 presence tag in stored index order — NULL last), and the unnamed
+/// index auto-names to `t_a_b_idx`. Index records have empty payloads (key only).
+fn index_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE t (a int32, b int32, u uuid, PRIMARY KEY (b, a))",
+    );
+    run(&mut db, "CREATE INDEX i_u ON t (u)");
+    run(&mut db, "CREATE INDEX ON t (a, b)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, 10, '550e8400-e29b-41d4-a716-446655440000'),          (2, 10, NULL), (3, 20, '00000000-0000-0000-0000-000000000000')",
+    );
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic int64 rowid key.
 fn nopk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
@@ -380,6 +400,7 @@ fn write_matches_goldens() {
         ("nopk_table.jed", nopk_table_db),
         ("composite_pk_table.jed", composite_pk_table_db),
         ("check_table.jed", check_table_db),
+        ("index_table.jed", index_table_db),
         ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
@@ -408,6 +429,7 @@ fn read_goldens_reproduces_rows() {
         ("nopk_table.jed", nopk_table_db, "r"),
         ("composite_pk_table.jed", composite_pk_table_db, "t"),
         ("check_table.jed", check_table_db, "t"),
+        ("index_table.jed", index_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),

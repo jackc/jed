@@ -88,6 +88,9 @@ const (
 	// DuplicateObject is 42710 — a constraint name already taken on this table
 	// (spec/design/constraints.md §4.3).
 	DuplicateObject
+	// WrongObjectType is 42809 — DROP TABLE of an index name, DROP INDEX of a table name
+	// (spec/design/indexes.md §2).
+	WrongObjectType
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
 	// CostLimitExceeded is 54P01 — a query's accrued execution cost reached the caller-set
@@ -171,6 +174,8 @@ func (s SqlState) Code() string {
 		return "42P02"
 	case DuplicateObject:
 		return "42710"
+	case WrongObjectType:
+		return "42809"
 	case FeatureNotSupported:
 		return "0A000"
 	case CostLimitExceeded:

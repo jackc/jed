@@ -30,7 +30,11 @@ description = "PRIMARY KEY column constraint (enables point lookup by key)"
 
 [[capability]]
 id = "ddl.composite_primary_key"
-description = "Table-level PRIMARY KEY (a, b, …) constraint — a composite key over one or more columns; key bytes are the members' concatenated encodings, uniqueness is over the whole tuple (23505), every member is implicitly NOT NULL; PG-matching DDL errors 42703/42701/42P16; the list order must match declaration order this slice (0A000, relaxable) (spec/design/constraints.md §3, grammar.md §28)"
+description = "Table-level PRIMARY KEY (a, b, …) constraint — a composite key over one or more columns in LIST order (any order — the order narrowing was lifted by the format-5 catalog reshape); key bytes are the members' concatenated encodings, uniqueness is over the whole tuple (23505), every member is implicitly NOT NULL; PG-matching DDL errors 42703/42701/42P16 (spec/design/constraints.md §3, grammar.md §28)"
+
+[[capability]]
+id = "ddl.secondary_index"
+description = "CREATE INDEX [name] ON t (cols) / DROP INDEX name — non-unique secondary indexes: PG auto-naming (t_col_idx + suffixes), relation namespace shared with tables (42P07), validation order 42P01/42703/0A000/42P07, DROP errors 42704/42809; maintained on every write; the planner bounds a SELECT base-relation scan by a first-column equality (spec/design/indexes.md, grammar.md §30)"
 
 [[capability]]
 id = "ddl.check"

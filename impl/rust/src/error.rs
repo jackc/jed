@@ -63,7 +63,8 @@ pub enum SqlState {
     InvalidColumnReference,
     /// 42804 — datatype mismatch (a value's type is wrong for its context).
     DatatypeMismatch,
-    /// 42P07 — duplicate table (CREATE TABLE of an existing name).
+    /// 42P07 — duplicate table/relation: CREATE TABLE or CREATE INDEX of a name already
+    /// taken in the shared relation namespace (spec/design/indexes.md §2).
     DuplicateTable,
     /// 42701 — duplicate column (two columns with the same name).
     DuplicateColumn,
@@ -88,6 +89,9 @@ pub enum SqlState {
     /// 42710 — duplicate object: a constraint name already taken on this table
     /// (spec/design/constraints.md §4.3).
     DuplicateObject,
+    /// 42809 — wrong object type: DROP TABLE of an index name, DROP INDEX of a table name
+    /// (spec/design/indexes.md §2).
+    WrongObjectType,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
     /// 54P01 — cost limit exceeded: a query's accrued execution cost reached the caller-set
@@ -140,6 +144,7 @@ impl SqlState {
             SqlState::IndeterminateDatatype => "42P18",
             SqlState::UndefinedParameter => "42P02",
             SqlState::DuplicateObject => "42710",
+            SqlState::WrongObjectType => "42809",
             SqlState::FeatureNotSupported => "0A000",
             SqlState::CostLimitExceeded => "54P01",
             SqlState::IoError => "58030",

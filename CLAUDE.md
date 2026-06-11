@@ -376,8 +376,12 @@ biases below are where an overriding reason *does* steer away from PG.
   byte-identical files, verified against shared golden fixtures (the §8 cross-core round-trip;
   the goldens pin the clean *from-scratch* image). The double-buffered meta page + root pointer
   are the hooks the incremental commit model (§3) uses. **Landed since:** demand paging / the
-  bounded buffer pool (P6.4), and **large values** (`format_version` 3 — out-of-line overflow
-  chains + transparent LZ4 compression, `spec/design/large-values.md`). **Still deferred**
+  bounded buffer pool (P6.4), **large values** (`format_version` 3 — out-of-line overflow
+  chains + transparent LZ4 compression, `spec/design/large-values.md`), **CHECK constraints**
+  (`format_version` 4 — the catalog check list, `spec/design/constraints.md` §4), and
+  **secondary indexes** (`format_version` 5 — the catalog reshape: an explicit primary-key
+  ordinal list in key order plus per-table index lists, each index an on-disk B-tree of
+  empty-payload records, `spec/design/indexes.md`). **Still deferred**
   (later Phase-6, none foreclosed): continuous within-session reclamation + on-disk free-list
   persistence (the P6.2 follow-ons). The from-scratch whole-image serializer survives as
   `create`'s initial write and the golden generator.

@@ -75,14 +75,24 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
     ["CREATE TABLE t (a int32, b int32, PRIMARY KEY (a), PRIMARY KEY (b))", "42P16"],
     // 42P16 fires BEFORE the second constraint's members resolve (PostgreSQL's order).
     ["CREATE TABLE t (a int32 PRIMARY KEY, PRIMARY KEY (nosuch))", "42P16"],
-    // Narrowing: the list must name columns in declaration order.
-    ["CREATE TABLE t (a int32, b int32, PRIMARY KEY (b, a))", "0A000"],
     // Narrowing: every member must be key-encodable (text is not, types.md §11).
     ["CREATE TABLE t (a int32, s text, PRIMARY KEY (a, s))", "0A000"],
   ];
   for (const [sql, want] of cases) {
     assert.equal(errCode(() => execute(new Database(), sql)), want, sql);
   }
+  // The list order is the KEY order — it may differ from declaration order (the original
+  // 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
+  // keys by (b, a), so the stored scan order is b-major.
+  {
+    const rev = new Database();
+    execute(rev, "CREATE TABLE rev (a int32, b int32, PRIMARY KEY (b, a))");
+    assert.deepEqual(pkIndices(rev.table("rev")!), [1, 0]);
+    execute(rev, "INSERT INTO rev VALUES (1, 20), (2, 10), (3, 15)");
+    const bs = rev.rowsInKeyOrder("rev").map((r) => (r[1]!.kind === "int" ? r[1]!.int : null));
+    assert.deepEqual(bs, [10n, 15n, 20n], "stored order is the (b, a) tuple order");
+  }
+
   // A single-column table constraint is the column-level form's equivalent.
   const db = new Database();
   execute(db, "CREATE TABLE ok (a int32, PRIMARY KEY (a))");

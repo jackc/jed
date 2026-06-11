@@ -5,9 +5,10 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, CheckDef, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert,
-    InsertSource, InsertValue, JoinClause, JoinKind, Literal, OrderKey, QueryExpr, Select,
-    SelectItem, SelectItems, SetOp, SetOpKind, Statement, TableRef, TypeMod, UnaryOp, Update,
+    Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, Delete, DropIndex,
+    DropTable, Expr, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OrderKey,
+    QueryExpr, Select, SelectItem, SelectItems, SetOp, SetOpKind, Statement, TableRef, TypeMod,
+    UnaryOp, Update,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -36,7 +37,14 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         // Dispatch on the leading keyword. Remaining productions land in Phases D–E.
         match self.peek_keyword().as_deref() {
+            // CREATE / DROP dispatch on the object keyword (TABLE vs INDEX — grammar.md §30).
+            Some("create") if self.peek_keyword_at(1).as_deref() == Some("index") => {
+                Ok(Statement::CreateIndex(self.parse_create_index()?))
+            }
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
+            Some("drop") if self.peek_keyword_at(1).as_deref() == Some("index") => {
+                Ok(Statement::DropIndex(self.parse_drop_index()?))
+            }
             Some("drop") => Ok(Statement::DropTable(self.parse_drop_table()?)),
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("select") => self.parse_query_expr(),
@@ -297,6 +305,51 @@ impl Parser {
         self.expect_keyword("table")?;
         let name = self.expect_identifier()?;
         Ok(DropTable { name })
+    }
+
+    /// `CREATE INDEX [name] ON <table> ( col [, col]* )` (spec/design/grammar.md §30). The
+    /// optional name needs one disambiguation because no word is reserved: the word after
+    /// INDEX is the index name UNLESS it is `ON` followed by a word and then `(` — that exact
+    /// three-token shape can only be the unnamed form's `ON table (`. Key columns are bare
+    /// identifiers (no expression / ordered / partial keys this slice — a `(`/`ASC`/`DESC`
+    /// after a key is the natural 42601).
+    fn parse_create_index(&mut self) -> Result<CreateIndex> {
+        self.expect_keyword("create")?;
+        self.expect_keyword("index")?;
+        let unnamed = self.peek_keyword().as_deref() == Some("on")
+            && matches!(self.peek_at(1), Token::Word(_))
+            && matches!(self.peek_at(2), Token::LParen);
+        let name = if unnamed {
+            None
+        } else {
+            Some(self.expect_identifier()?)
+        };
+        self.expect_keyword("on")?;
+        let table = self.expect_identifier()?;
+        self.expect(&Token::LParen)?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_identifier()?);
+            match self.advance() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
+            }
+        }
+        Ok(CreateIndex {
+            name,
+            table,
+            columns,
+        })
+    }
+
+    /// `DROP INDEX <name>` (spec/design/grammar.md §30). A missing index (42704) or a
+    /// table's name (42809) is rejected at execution time, not here.
+    fn parse_drop_index(&mut self) -> Result<DropIndex> {
+        self.expect_keyword("drop")?;
+        self.expect_keyword("index")?;
+        let name = self.expect_identifier()?;
+        Ok(DropIndex { name })
     }
 
     /// `INSERT INTO <table> [( <col> [, <col>]* )] ( VALUES <row> [, <row>]* | <select> )`. The

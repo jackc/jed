@@ -33,15 +33,32 @@ pub struct CheckConstraint {
     pub expr: Expr,
 }
 
+/// One secondary index of a table (spec/design/indexes.md): its (relation-namespace) name
+/// and the indexed column ordinals in index-key order (duplicates allowed — PG). The index's
+/// B-tree lives in the snapshot's index-store map, keyed by the lowercased name.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IndexDef {
+    pub name: String,
+    pub columns: Vec<usize>,
+}
+
 /// A table definition.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
+    /// The primary-key member column ordinals in **key order** (which may differ from
+    /// declaration order — constraints.md §3; the v5 catalog persists this list). Empty =
+    /// no primary key (synthetic rowid keys). The per-column `primary_key` flag is derived
+    /// membership convenience; this list is the authority for order.
+    pub pk: Vec<usize>,
     /// The table's CHECK constraints in **evaluation order** — ascending byte order of the
     /// lowercased name (spec/design/constraints.md §4.4); the on-disk catalog stores them in
     /// this same order. Empty for an unchecked table.
     pub checks: Vec<CheckConstraint>,
+    /// The table's secondary indexes in **ascending lowercased-name order** (the catalog's
+    /// on-disk order and the planner's tie-break order — spec/design/indexes.md §5/§6).
+    pub indexes: Vec<IndexDef>,
 }
 
 impl Table {
@@ -52,18 +69,11 @@ impl Table {
             .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
-    /// The primary-key member columns' indices in KEY order. Key order is the flagged
-    /// columns in declaration order — CREATE TABLE requires the constraint's list order to
-    /// match (the documented 0A000 narrowing, spec/design/constraints.md §3), so the flag
-    /// bits alone reconstruct the key. Empty = the table has no primary key (synthetic
-    /// rowid keys).
+    /// The primary-key member columns' indices in KEY order (the explicit `pk` list — the
+    /// v5 catalog persists key order independent of declaration order). Empty = the table
+    /// has no primary key (synthetic rowid keys).
     pub fn pk_indices(&self) -> Vec<usize> {
-        self.columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.primary_key)
-            .map(|(i, _)| i)
-            .collect()
+        self.pk.clone()
     }
 
     /// The primary-key column's index iff the key is SINGLE-column. The PK pushdown

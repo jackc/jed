@@ -38,6 +38,8 @@
 
 sql_statement  ::= create_table
                  | drop_table
+                 | create_index
+                 | drop_index
                  | insert
                  | query_expr
                  | update
@@ -62,12 +64,13 @@ create_table   ::= "CREATE" "TABLE" identifier
 table_element  ::= column_def | table_constraint
 
 /* "PRIMARY KEY (a, b, ...)" declares the table's key over one or more named columns; the
- * LIST order is the KEY order. Each named column must exist (42703) and appear once
- * (42701); a table has at most one primary key across both forms (42P16). Every member is
- * implicitly NOT NULL and must be of a key-encodable type (the column-level rule). The
- * key bytes are the concatenation of the members' encodings (../design/encoding.md §2.3).
- * Narrowing: the list order must match the table's column-declaration order this slice
- * (else 0A000 — ../design/constraints.md §3, relaxable).
+ * LIST order is the KEY order — it may differ from the column-declaration order (the
+ * original 0A000 narrowing was lifted by the secondary-index catalog reshape, which
+ * persists the key order explicitly — ../design/constraints.md §3). Each named column
+ * must exist (42703) and appear once (42701); a table has at most one primary key across
+ * both forms (42P16). Every member is implicitly NOT NULL and must be of a key-encodable
+ * type (the column-level rule). The key bytes are the concatenation of the members'
+ * encodings in LIST order (../design/encoding.md §2.3).
  *
  * "CHECK ( expr )" declares a row predicate over this table's columns, optionally named
  * via the "CONSTRAINT name" prefix (auto-named otherwise — ../design/constraints.md §4).
@@ -105,6 +108,26 @@ column_constraint ::= "PRIMARY" "KEY"
  * duplicate), and no "CASCADE" / "RESTRICT" (there are no dependent objects yet).
  * Each omission is relaxable later (../../TODO.md). */
 drop_table     ::= "DROP" "TABLE" identifier
+
+/* CREATE INDEX declares a (non-unique) secondary index over one or more named columns of
+ * one table (../design/indexes.md). The index name is optional: omitted, the engine
+ * derives PostgreSQL's choice — lowercased "<table>_<col>_..._idx" with the smallest free
+ * positive-integer suffix on collision. Because no word is reserved (§3), the optional
+ * name needs one disambiguation: the word after INDEX is the index name UNLESS it is
+ * "ON" followed by a word and then "(" — a fixed three-token lookahead, byte-identical
+ * across the parsers (../design/grammar.md §30). Each named column must exist (42703) and
+ * be of a key-encodable type (else 0A000); a column may be listed more than once
+ * (PostgreSQL allows it). Index names share the TABLE namespace (a duplicate in either is
+ * 42P07, "relation"). Narrowings this slice (each 0A000-free — simply not in the
+ * grammar): no UNIQUE, no expression/ordered/partial keys (a key is a bare column name),
+ * no IF NOT EXISTS, no USING.
+ *
+ * DROP INDEX removes one index by name: 42704 if it does not exist, 42809 if the name is
+ * a table ("is not an index"); symmetrically DROP TABLE of an index name is 42809 ("is
+ * not a table"). DROP TABLE drops the table's indexes with it. */
+create_index   ::= "CREATE" "INDEX" identifier? "ON" identifier
+                   "(" identifier ("," identifier)* ")"
+drop_index     ::= "DROP" "INDEX" identifier
 
 /* type_name is an identifier, optionally followed by a parenthesized type modifier
  * (precision, optional scale) — `decimal` is the FIRST parameterized type. The name is

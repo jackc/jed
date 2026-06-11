@@ -181,7 +181,9 @@ template = "table name {name} specified more than once"
 code = "42P07"
 name = "duplicate_table"
 class = "syntax error or access rule violation"
-template = "table already exists: {name}"
+# "relation": index names share the table namespace (spec/design/indexes.md §2), so the
+# code covers CREATE TABLE and CREATE INDEX collisions against either kind — PG's word.
+template = "relation already exists: {name}"
 
 [[error]]
 code = "42P16"
@@ -218,6 +220,14 @@ code = "42710"
 name = "duplicate_object"
 class = "syntax error or access rule violation"
 template = "check constraint {name} already exists"
+
+[[error]]
+code = "42809"
+name = "wrong_object_type"
+class = "syntax error or access rule violation"
+# kind is "a table" / "an index": DROP TABLE of an index name, DROP INDEX of a table
+# name (spec/design/indexes.md §2).
+template = "{name} is not {kind}"
 
 # --- feature not supported (class 0A) ---------------------------------------
 [[error]]

@@ -70,5 +70,8 @@ test("DROP TABLE syntax errors trap 42601", () => {
   const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)"]);
   assert.equal(errCode(() => execute(db, "DROP TABLE")), "42601"); // no table name
   assert.equal(errCode(() => execute(db, "DROP TABLE t extra")), "42601"); // trailing input
-  assert.equal(errCode(() => execute(db, "DROP INDEX x")), "42601"); // only DROP TABLE exists
+  // DROP INDEX is its own statement now (spec/design/indexes.md §2): a missing index is
+  // 42704, not a syntax error; DROP of any other object kind is still unparsed.
+  assert.equal(errCode(() => execute(db, "DROP INDEX x")), "42704");
+  assert.equal(errCode(() => execute(db, "DROP VIEW v")), "42601");
 });

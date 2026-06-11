@@ -11,7 +11,7 @@
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
 import type { Expr } from "./ast.ts";
-import { type CheckConstraint, type Column, type Table, pkIndices } from "./catalog.ts";
+import { type CheckConstraint, type Column, type IndexDef, type Table, pkIndices } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, encodeNullable } from "./encoding.ts";
@@ -21,7 +21,7 @@ import { lz4Compress, lz4Decompress } from "./lz4.ts";
 import { onDiskRef, residentRef } from "./pmap.ts";
 import type { Child, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
-import type { Row } from "./storage.ts";
+import { TableStore, type Row } from "./storage.ts";
 import {
   type DecimalTypmod,
   type ScalarType,
@@ -47,7 +47,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 4; // on-disk format version (4 = + catalog CHECK constraints, constraints.md §4.5)
+const FORMAT_VERSION = 5; // on-disk format version (5 = the secondary-index catalog reshape, indexes.md §6)
 const PAGE_HEADER = 12; // bytes of the catalog/B-tree page header
 const PAGE_CATALOG = 1; // page_type for a catalog page
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
@@ -528,8 +528,9 @@ function writeOverflowChain(
   return indices[0]!;
 }
 
-// tableEntryBytes builds one table's catalog entry (format.md).
-function tableEntryBytes(table: Table, rootDataPage: number): Uint8Array {
+// tableEntryBytes builds one table's catalog entry (format.md). indexRoots is each
+// index's tree root page, parallel to table.indexes.
+function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[]): Uint8Array {
   const w = new ByteWriter();
   const nameB = UTF8.encode(table.name);
   w.u16(nameB.length);
@@ -540,8 +541,9 @@ function tableEntryBytes(table: Table, rootDataPage: number): Uint8Array {
     w.u16(cn.length);
     w.bytes(cn);
     w.u8(typeCodeForScalar(col.type));
+    // bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is the
+    // single authority; the bit is reserved, written 0 (spec/fileformat/format.md).
     let flags = 0;
-    if (col.primaryKey) flags |= 0b01;
     if (col.notNull) flags |= 0b10;
     if (col.default !== null) flags |= 0b100;
     w.u8(flags);
@@ -558,6 +560,10 @@ function tableEntryBytes(table: Table, rootDataPage: number): Uint8Array {
       w.bytes(encodeValue(col.type, col.default));
     }
   }
+  // The primary key (v5): count, then the member column ordinals in KEY order
+  // (constraints.md §3 — the list persists an order independent of declaration order).
+  w.u16(table.pk.length);
+  for (const i of table.pk) w.u16(i);
   // CHECK constraints (v4): count, then (name, expression text) per check, in the
   // catalog's evaluation order — the text is written back VERBATIM, so the bytes are
   // stable across create → commit → load → commit (spec/fileformat/format.md
@@ -570,6 +576,19 @@ function tableEntryBytes(table: Table, rootDataPage: number): Uint8Array {
     const ce = UTF8.encode(check.exprText);
     w.u16(ce.length);
     w.bytes(ce);
+  }
+  // Secondary indexes (v5): count, then per index the name, key-column ordinals
+  // (index-key order, duplicates allowed), and its tree's root page — in the catalog's
+  // ascending lowercased-name order (spec/design/indexes.md §6).
+  w.u16(table.indexes.length);
+  for (let k = 0; k < table.indexes.length; k++) {
+    const idx = table.indexes[k]!;
+    const inm = UTF8.encode(idx.name);
+    w.u16(inm.length);
+    w.bytes(inm);
+    w.u16(idx.columns.length);
+    for (const c of idx.columns) w.u16(c);
+    w.u32(indexRoots[k]!);
   }
   w.u32(rootDataPage);
   return w.toBytes();
@@ -625,6 +644,9 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   // reference already-allocated pages (format.md).
   const body: BodyPage[] = [];
   const rootDataPage: number[] = new Array(keys.length).fill(0);
+  const indexRoots: number[][] = keys.map(() => []);
+  // Index trees have no value columns — encode against an empty pseudo-table.
+  const indexTable: Table = { name: "", columns: [], pk: [], checks: [], indexes: [] };
   let nextIndex = ROOT_PAGE;
   for (let ti = 0; ti < keys.length; ti++) {
     const root = snap.stores.get(keys[ti]!)!.treeRoot();
@@ -633,11 +655,25 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
       rootDataPage[ti] = r.index;
       nextIndex = r.next;
     }
+    // The table's index trees follow its data tree, in catalog (name) order
+    // (spec/fileformat/format.md "From-scratch image").
+    for (const idx of snap.tables.get(keys[ti]!)!.indexes) {
+      let ir = 0;
+      const iroot = snap.indexStore(idx.name.toLowerCase()).treeRoot();
+      if (iroot !== null) {
+        const r = serializeNode(iroot, indexTable, capacity, nextIndex, body);
+        ir = r.index;
+        nextIndex = r.next;
+      }
+      indexRoots[ti]!.push(ir);
+    }
   }
 
   // The catalog chain follows the data; its head is the relocatable root_page.
   const catRoot = nextIndex;
-  const entrySizes = keys.map((k) => tableEntryBytes(snap.tables.get(k)!, 0).length);
+  const entrySizes = keys.map((k) =>
+    tableEntryBytes(snap.tables.get(k)!, 0, snap.tables.get(k)!.indexes.map(() => 0)).length,
+  );
   const catGroups = pack(entrySizes, capacity);
   const pageCount = catRoot + catGroups.length;
 
@@ -658,7 +694,9 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
     const group = catGroups[gi]!;
     const index = catRoot + gi;
     const next = gi + 1 < catGroups.length ? index + 1 : 0;
-    const parts = group.map((ti) => tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!));
+    const parts = group.map((ti) =>
+      tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!, indexRoots[ti]!),
+    );
     writePage(image, ps, index, PAGE_CATALOG, group.length, next, concat(parts));
   }
 
@@ -780,24 +818,41 @@ export function incrementalImage(
 
   const pages: { index: number; bytes: Uint8Array }[] = [];
   const rootDataPage: number[] = new Array(keys.length).fill(0);
+  const indexRoots: number[][] = keys.map(() => []);
+  const indexTable: Table = { name: "", columns: [], pk: [], checks: [], indexes: [] };
   for (let ti = 0; ti < keys.length; ti++) {
     const root = snap.stores.get(keys[ti]!)!.treeRoot();
     if (root !== null) {
       rootDataPage[ti] = serializeDirty(root, snap.tables.get(keys[ti]!)!, capacity, ps, alloc, pages, paging);
+    }
+    // The table's index trees follow its data tree, in catalog (name) order — only their
+    // dirty nodes are written, like any tree (spec/fileformat/format.md "Allocation &
+    // incremental commit").
+    for (const idx of snap.tables.get(keys[ti]!)!.indexes) {
+      let ir = 0;
+      const iroot = snap.indexStore(idx.name.toLowerCase()).treeRoot();
+      if (iroot !== null) {
+        ir = serializeDirty(iroot, indexTable, capacity, ps, alloc, pages, paging);
+      }
+      indexRoots[ti]!.push(ir);
     }
   }
 
   // The catalog chain is rewritten to fresh pages every commit (table roots move). Allocate its page
   // indices up front — they may be reused free pages, hence not contiguous — so each page can point at
   // the next (`pack` always returns ≥ 1 group, so catPages is non-empty).
-  const entrySizes = keys.map((k) => tableEntryBytes(snap.tables.get(k)!, 0).length);
+  const entrySizes = keys.map((k) =>
+    tableEntryBytes(snap.tables.get(k)!, 0, snap.tables.get(k)!.indexes.map(() => 0)).length,
+  );
   const catGroups = pack(entrySizes, capacity);
   const catPages = catGroups.map(() => alloc.take());
   const catRoot = catPages[0]!;
   for (let gi = 0; gi < catGroups.length; gi++) {
     const group = catGroups[gi]!;
     const nextPage = gi + 1 < catGroups.length ? catPages[gi + 1]! : 0;
-    const parts = group.map((ti) => tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!));
+    const parts = group.map((ti) =>
+      tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!, indexRoots[ti]!),
+    );
     pages.push({ index: catPages[gi]!, bytes: makePage(ps, PAGE_CATALOG, group.length, nextPage, concat(parts)) });
   }
 
@@ -899,7 +954,7 @@ export function loadDatabase(image: Uint8Array): Database {
     }
     const cur = { pos: 0 };
     for (let i = 0; i < pg.itemCount; i++) {
-      const { table, root } = decodeTableEntry(pg.payload, cur);
+      const { table, root, indexRoots } = decodeTableEntry(pg.payload, cur);
       const colTypes = table.columns.map((c) => c.type);
       const hasPK = pkIndices(table).length > 0;
       snap.putTable(table, pageSize);
@@ -913,6 +968,16 @@ export function loadDatabase(image: Uint8Array): Database {
           const entries = store.entriesInKeyOrder();
           store.bumpRowidTo(decodeInt("int64", entries[entries.length - 1]!.key) + 1n);
         }
+      }
+      // The table's index trees (v5): zero-column stores of entry keys
+      // (spec/design/indexes.md §3), reachable pages included in the walk.
+      for (let k = 0; k < table.indexes.length; k++) {
+        const istore = new TableStore(pageSize - PAGE_HEADER, []);
+        if (indexRoots[k]! !== 0) {
+          const t = readTree(image, dv, pageSize, indexRoots[k]!, [], reached);
+          istore.setTree(t.node, t.length);
+        }
+        snap.putIndexStore(table.indexes[k]!.name.toLowerCase(), istore);
       }
     }
     catPage = pg.nextPage;
@@ -999,7 +1064,7 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
     if (pg.pageType !== PAGE_CATALOG) throw engineError("data_corrupted", "expected a catalog page");
     const cur = { pos: 0 };
     for (let i = 0; i < pg.itemCount; i++) {
-      const { table, root } = decodeTableEntry(pg.payload, cur);
+      const { table, root, indexRoots } = decodeTableEntry(pg.payload, cur);
       const colTypes = table.columns.map((c) => c.type);
       const hasPK = pkIndices(table).length > 0;
       snap.putTable(table, pageSize);
@@ -1020,6 +1085,18 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
           const entries = store.entriesInKeyOrder();
           store.bumpRowidTo(decodeInt("int64", entries[entries.length - 1]!.key) + 1n);
         }
+      }
+      // The table's index trees (v5): zero-column demand-paged stores of entry keys
+      // (spec/design/indexes.md §3); no spillable columns, so no overflow collection is
+      // ever needed.
+      for (let k = 0; k < table.indexes.length; k++) {
+        const istore = new TableStore(pageSize - PAGE_HEADER, []);
+        istore.attachPaging(paging);
+        if (indexRoots[k]! !== 0) {
+          const t = readSkeleton(paging, indexRoots[k]!, [], reached);
+          istore.setTree(t.node, t.length);
+        }
+        snap.putIndexStore(table.indexes[k]!.name.toLowerCase(), istore);
       }
     }
     catPage = pg.nextPage;
@@ -1350,7 +1427,13 @@ export function decodeLeafNode(block: Uint8Array, page: number, colTypes: Scalar
 
 type Cursor = { pos: number };
 
-function decodeTableEntry(buf: Uint8Array, cur: Cursor): { table: Table; root: number } {
+// decodeTableEntry decodes one catalog table entry: the Table (its pk list, checks, and
+// index definitions included), its root_data_page, and each index's root page (parallel
+// to table.indexes).
+function decodeTableEntry(
+  buf: Uint8Array,
+  cur: Cursor,
+): { table: Table; root: number; indexRoots: number[] } {
   const name = readString(buf, cur);
   const colCount = readU16(buf, cur);
   const columns: Column[] = [];
@@ -1362,6 +1445,11 @@ function decodeTableEntry(buf: Uint8Array, cur: Cursor): { table: Table; root: n
       throw engineError("data_corrupted", "unknown type code");
     }
     const flags = readU8(buf, cur);
+    // bit0 was the primary_key flag through v4; v5 retired it (the pk list below is the
+    // authority) and reserves it as must-be-zero.
+    if ((flags & 0b01) !== 0) {
+      throw engineError("data_corrupted", "reserved column flag bit0 set");
+    }
     // A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
     let decimal: DecimalTypmod | null = null;
     if (ty === "decimal") {
@@ -1377,10 +1465,22 @@ function decodeTableEntry(buf: Uint8Array, cur: Cursor): { table: Table; root: n
       name: cname,
       type: ty,
       decimal,
-      primaryKey: (flags & 0b01) !== 0,
+      primaryKey: false, // set from the pk list below
       notNull: (flags & 0b10) !== 0,
       default: colDefault,
     });
+  }
+  // The primary key (v5): member ordinals in KEY order. Each must name a real column,
+  // once; membership sets the per-column convenience flag.
+  const pkCount = readU16(buf, cur);
+  const pk: number[] = [];
+  for (let i = 0; i < pkCount; i++) {
+    const ord = readU16(buf, cur);
+    if (ord >= columns.length || pk.includes(ord)) {
+      throw engineError("data_corrupted", "invalid primary key ordinal");
+    }
+    columns[ord]!.primaryKey = true;
+    pk.push(ord);
   }
   // CHECK constraints (v4): the stored expression text re-parses with the ordinary
   // expression parser — it was written by the token renderer, so this cannot fail for a
@@ -1401,8 +1501,29 @@ function decodeTableEntry(buf: Uint8Array, cur: Cursor): { table: Table; root: n
     }
     checks.push({ name: checkName, exprText, expr });
   }
+  // Secondary indexes (v5): name + key-column ordinals + root page, in the catalog's
+  // (lowercased-name ascending) order — a reader trusts the order. Duplicate ordinals
+  // within one index are legal (indexes.md §1).
+  const indexCount = readU16(buf, cur);
+  const indexes: IndexDef[] = [];
+  const indexRoots: number[] = [];
+  for (let i = 0; i < indexCount; i++) {
+    const iname = readString(buf, cur);
+    const kc = readU16(buf, cur);
+    if (kc === 0) throw engineError("data_corrupted", "index with no key columns");
+    const cols: number[] = [];
+    for (let j = 0; j < kc; j++) {
+      const ord = readU16(buf, cur);
+      if (ord >= columns.length) {
+        throw engineError("data_corrupted", "invalid index column ordinal");
+      }
+      cols.push(ord);
+    }
+    indexRoots.push(readU32(buf, cur));
+    indexes.push({ name: iname, columns: cols });
+  }
   const root = readU32(buf, cur);
-  return { table: { name, columns, checks }, root };
+  return { table: { name, columns, pk, checks, indexes }, root, indexRoots };
 }
 
 // readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL

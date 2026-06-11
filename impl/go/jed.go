@@ -15,6 +15,9 @@ var SupportedCapabilities = []string{
 	"ddl.check",
 	// DROP TABLE — remove a table (definition + rows) from the catalog (grammar.md §13).
 	"ddl.drop_table",
+	// CREATE INDEX / DROP INDEX — non-unique secondary indexes, maintained on every write
+	// and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
+	"ddl.secondary_index",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
 	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

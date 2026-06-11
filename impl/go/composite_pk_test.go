@@ -104,8 +104,6 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 		{"CREATE TABLE t (a int32, b int32, PRIMARY KEY (a), PRIMARY KEY (b))", "42P16"},
 		// 42P16 fires BEFORE the second constraint's members resolve (PostgreSQL's order).
 		{"CREATE TABLE t (a int32 PRIMARY KEY, PRIMARY KEY (nosuch))", "42P16"},
-		// Narrowing: the list must name columns in declaration order.
-		{"CREATE TABLE t (a int32, b int32, PRIMARY KEY (b, a))", "0A000"},
 		// Narrowing: every member must be key-encodable (text is not, types.md §11).
 		{"CREATE TABLE t (a int32, s text, PRIMARY KEY (a, s))", "0A000"},
 	}
@@ -114,6 +112,26 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 			t.Fatalf("%q: got %s, want %s", c.sql, code, c.want)
 		}
 	}
+	// The list order is the KEY order — it may differ from declaration order (the original
+	// 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
+	// keys by (b, a), so the stored scan order is b-major.
+	if _, err := Execute(db, "CREATE TABLE rev (a int32, b int32, PRIMARY KEY (b, a))"); err != nil {
+		t.Fatalf("out-of-declaration-order PK: %v", err)
+	}
+	if revTab, _ := db.Table("rev"); !slices.Equal(revTab.PKIndices(), []int{1, 0}) {
+		t.Fatalf("PKIndices = %v, want [1 0]", func() []int { rt, _ := db.Table("rev"); return rt.PKIndices() }())
+	}
+	if _, err := Execute(db, "INSERT INTO rev VALUES (1, 20), (2, 10), (3, 15)"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	var bs []int64
+	for _, row := range db.RowsInKeyOrder("rev") {
+		bs = append(bs, row[1].Int)
+	}
+	if !slices.Equal(bs, []int64{10, 15, 20}) {
+		t.Fatalf("stored order = %v, want the (b, a) tuple order [10 15 20]", bs)
+	}
+
 	// A single-column table constraint is the column-level form's equivalent.
 	if _, err := Execute(db, "CREATE TABLE ok (a int32, PRIMARY KEY (a))"); err != nil {
 		t.Fatalf("single-column table constraint: %v", err)

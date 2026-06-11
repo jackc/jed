@@ -246,10 +246,13 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   relation's scan (INNER, plus a preserved-side LEFT predicate whose NULL-extension must survive
   the pushdown), defeated by `pk + 0 = K`; **correlated** — a correlated subquery whose inner pk
   equals an outer column (`inr.id = o.k`) bounds the inner re-scan to a per-outer-row seek
-  (through EXISTS / scalar / IN, including a NULL outer key), defeated by `inr.id + 0 = o.k`.
-- **NOT yet covered (needs a new relation):** any future index / DISTINCT / aggregate pushdown,
-  or other optimization added later. Each is a future optimization the sweep does **not** yet
-  exercise — add a scenario when it lands.
+  (through EXISTS / scalar / IN, including a NULL outer key), defeated by `inr.id + 0 = o.k`;
+  **index** — a secondary-index equality (`v = K` on an indexed column) fetches via the index
+  tree + per-row point lookups ([indexes.md §5](indexes.md)), defeated by `v + 0 = K`, checked
+  across UPDATE/DELETE maintenance and a NULL indexed value (3VL through the index).
+- **NOT yet covered (needs a new relation):** any future index *range* / multi-column-prefix
+  bound, DISTINCT / aggregate pushdown, or other optimization added later. Each is a future
+  optimization the sweep does **not** yet exercise — add a scenario when it lands.
 
 **Reducing a discovered failure.** Generation is seeded, so a failure reproduces deterministically
 (CLAUDE.md §10); reduce it to a minimal `.test` and commit it to the corpus as a normal regression

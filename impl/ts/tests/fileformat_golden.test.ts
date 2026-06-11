@@ -83,6 +83,21 @@ function checkTableDB(): Database {
   return db;
 }
 
+// indexTableDB has SECONDARY INDEXES (v5 — spec/design/indexes.md): the catalog reshape +
+// the index trees. The PK list order (b, a) differs from declaration order (the lifted
+// composite-PK narrowing); i_u covers a nullable uuid column holding a NULL (the
+// encoding.md §2.2 presence tag in stored index order — NULL last), and the unnamed index
+// auto-names to t_a_b_idx. Index records have empty payloads (key only).
+function indexTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (a int32, b int32, u uuid, PRIMARY KEY (b, a))");
+  run(db, "CREATE INDEX i_u ON t (u)");
+  run(db, "CREATE INDEX ON t (a, b)");
+  run(db, "INSERT INTO t VALUES (1, 10, '550e8400-e29b-41d4-a716-446655440000'), " +
+    "(2, 10, NULL), (3, 20, '00000000-0000-0000-0000-000000000000')");
+  return db;
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 function nopkTableDB(): Database {
   const db = goldenDb();
@@ -275,6 +290,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "nopk_table.jed", build: nopkTableDB },
     { name: "composite_pk_table.jed", build: compositePKTableDB },
     { name: "check_table.jed", build: checkTableDB },
+    { name: "index_table.jed", build: indexTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
   ];
   for (const c of cases) {
@@ -306,6 +322,7 @@ test("read goldens reproduces rows", () => {
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "composite_pk_table.jed", build: compositePKTableDB, table: "t" },
     { name: "check_table.jed", build: checkTableDB, table: "t" },
+    { name: "index_table.jed", build: indexTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },

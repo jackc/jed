@@ -185,6 +185,7 @@ fn error_codes_are_registered() {
         SqlState::CheckViolation,
         SqlState::UndefinedParameter,
         SqlState::DuplicateObject,
+        SqlState::WrongObjectType,
         SqlState::ActiveSqlTransaction,
         SqlState::ReadOnlySqlTransaction,
         SqlState::InFailedSqlTransaction,

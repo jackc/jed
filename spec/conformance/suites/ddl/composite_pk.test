@@ -1,10 +1,11 @@
 # Composite PRIMARY KEY — the table-level PRIMARY KEY (a, b, …) constraint. The key is the
-# members' concatenated encodings in declaration order; uniqueness is over the WHOLE tuple
-# (23505); every member is implicitly NOT NULL (23502); DDL errors match PostgreSQL
-# (42703/42701/42P16); the out-of-declaration-order list and a non-keyable member type are
-# documented 0A000 narrowings. spec/design/constraints.md §3, grammar.md §28.
+# members' concatenated encodings in LIST (key) order — which may differ from declaration
+# order since the v5 catalog reshape; uniqueness is over the WHOLE tuple (23505); every
+# member is implicitly NOT NULL (23502); DDL errors match PostgreSQL (42703/42701/42P16);
+# a non-keyable member type is a documented 0A000 narrowing.
+# spec/design/constraints.md §3, grammar.md §28.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.update, query.select, query.order_by, types.int16, types.int32, types.text
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.update, query.select, query.order_by, types.int16, types.int32, types.text, resource.cost_metering
 
 statement ok
 CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))
@@ -111,9 +112,28 @@ CREATE TABLE e3 (a int32 PRIMARY KEY, b int32, PRIMARY KEY (b))
 statement error 42P16
 CREATE TABLE e4 (a int32, b int32, PRIMARY KEY (a), PRIMARY KEY (b))
 
-# narrowing: the list must name columns in declaration order (PG accepts any order)
-statement error 0A000
+# the list order is the KEY order — it may differ from declaration order (the original
+# 0A000 narrowing was lifted by the secondary-index catalog reshape, constraints.md §3):
+# this table keys by (b, a); a duplicate (b, a) tuple still traps 23505.
+statement ok
 CREATE TABLE e5 (a int32, b int32, PRIMARY KEY (b, a))
+
+statement ok
+INSERT INTO e5 VALUES (1, 20), (2, 10), (3, 15)
+
+statement error 23505
+INSERT INTO e5 VALUES (1, 20)
+
+# cost: 7
+query II nosort
+SELECT a, b FROM e5 ORDER BY b
+----
+2
+10
+3
+15
+1
+20
 
 # narrowing: every member must be of a key-encodable type (text is not yet — types.md §11)
 statement error 0A000

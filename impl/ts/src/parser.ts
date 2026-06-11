@@ -109,9 +109,12 @@ class Parser {
 
   parseStatement(): Statement {
     switch (this.peekKeyword()) {
+      // CREATE / DROP dispatch on the object keyword (TABLE vs INDEX — grammar.md §30).
       case "create":
+        if (this.peekKeywordAt(1) === "index") return this.parseCreateIndex();
         return this.parseCreateTable();
       case "drop":
+        if (this.peekKeywordAt(1) === "index") return this.parseDropIndex();
         return this.parseDropTable();
       case "insert":
         return this.parseInsert();
@@ -343,6 +346,43 @@ class Parser {
     this.expectKeyword("table");
     const name = this.expectIdentifier();
     return { kind: "dropTable", name };
+  }
+
+  // parseCreateIndex parses `CREATE INDEX [name] ON <table> ( col [, col]* )`
+  // (spec/design/grammar.md §30). The optional name needs one disambiguation because no
+  // word is reserved: the word after INDEX is the index name UNLESS it is `ON` followed
+  // by a word and then `(` — that exact three-token shape can only be the unnamed form's
+  // `ON table (`. Key columns are bare identifiers (no expression/ordered/partial keys
+  // this slice — a `(`/`ASC`/`DESC` after a key is the natural 42601).
+  private parseCreateIndex(): Statement {
+    this.expectKeyword("create");
+    this.expectKeyword("index");
+    const unnamed =
+      this.peekKeyword() === "on" &&
+      this.peekKindAt(1) === "word" &&
+      this.peekKindAt(2) === "lparen";
+    const name = unnamed ? null : this.expectIdentifier();
+    this.expectKeyword("on");
+    const table = this.expectIdentifier();
+    this.expect("lparen");
+    const columns: string[] = [];
+    for (;;) {
+      columns.push(this.expectIdentifier());
+      const tok = this.advance();
+      if (tok.kind === "comma") continue;
+      if (tok.kind === "rparen") break;
+      throw engineError("syntax_error", `expected ',' or ')', found ${tok.kind}`);
+    }
+    return { kind: "createIndex", name, table, columns };
+  }
+
+  // parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing
+  // index (42704) or a table's name (42809) is rejected at execution time, not here.
+  private parseDropIndex(): Statement {
+    this.expectKeyword("drop");
+    this.expectKeyword("index");
+    const name = this.expectIdentifier();
+    return { kind: "dropIndex", name };
   }
 
   // parseInsert parses `INSERT INTO <table> [( <col> [, <col>]* )] ( VALUES <row> [, <row>]* |

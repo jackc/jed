@@ -1,7 +1,9 @@
 //! On-disk single-file format: serialize / load (spec/fileformat/format.md).
 //!
-//! `format_version` 4 — the page-backed copy-on-write B-tree (Phase 6, P6.1; v3 added large-value
-//! overflow/compression, v4 the catalog CHECK-constraint list): each table's rows are
+//! `format_version` 5 — the page-backed copy-on-write B-tree (Phase 6, P6.1; v3 added large-value
+//! overflow/compression, v4 the catalog CHECK-constraint list, v5 the secondary-index catalog
+//! reshape — explicit pk ordinal list, per-table index list, index B-trees of empty-payload
+//! records, spec/design/indexes.md §6): each table's rows are
 //! an on-disk B-tree (leaf + interior node pages), the catalog is a relocatable page chain, and
 //! `to_image` lays the whole tree out post-order (the from-scratch image the goldens pin; the
 //! incremental dirty-page commit reuses the same node codec — storage.md §4). The byte layout is the
@@ -13,7 +15,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::catalog::{CheckConstraint, Column, Table};
+use crate::catalog::{CheckConstraint, Column, IndexDef, Table};
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
@@ -21,14 +23,14 @@ use crate::executor::{Database, Snapshot};
 use crate::pager::Pager;
 use crate::paging::SharedPaging;
 use crate::pmap::{Child, Node};
-use crate::storage::Row;
+use crate::storage::{Row, TableStore};
 use crate::types::{DecimalTypmod, ScalarType};
 use crate::value::{Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
 /// On-disk format version — 3 = + out-of-line overflow pages for large values (large-values.md §12).
-const FORMAT_VERSION: u16 = 4;
+const FORMAT_VERSION: u16 = 5;
 /// Bytes of the page header on catalog / B-tree pages.
 const PAGE_HEADER: usize = 12;
 /// Smallest valid page size: the 36-byte meta header (plus the page header) must fit
@@ -487,10 +489,25 @@ impl Snapshot {
         // for B-tree nodes and the chain link for overflow pages (large-values.md §12).
         let mut body: Vec<(u32, u8, u32, u32, Vec<u8>)> = Vec::new();
         let mut root_data_page = vec![0u32; tables.len()];
+        let mut index_roots: Vec<Vec<u32>> = vec![Vec::new(); tables.len()];
+        // Index trees have no value columns — encode against an empty pseudo-table.
+        let index_table = index_pseudo_table();
         let mut next_index = ROOT_PAGE;
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
                 root_data_page[ti] = serialize_node(root, table, cap, &mut next_index, &mut body)?;
+            }
+            // The table's index trees follow its data tree, in catalog (name) order
+            // (spec/fileformat/format.md "From-scratch image").
+            for idx in &table.indexes {
+                let istore = self.index_store(&idx.name.to_ascii_lowercase());
+                let r = match istore.tree_root() {
+                    Some(root) => {
+                        serialize_node(root, &index_table, cap, &mut next_index, &mut body)?
+                    }
+                    None => 0,
+                };
+                index_roots[ti].push(r);
             }
         }
 
@@ -498,7 +515,8 @@ impl Snapshot {
         let cat_root = next_index;
         let entry_sizes: Vec<usize> = tables
             .iter()
-            .map(|(_, t, _)| table_entry_bytes(t, 0).len())
+            .enumerate()
+            .map(|(ti, (_, t, _))| table_entry_bytes(t, 0, &vec![0; index_roots[ti].len()]).len())
             .collect();
         let cat_groups = pack(&entry_sizes, cap)?;
         let page_count = cat_root + cat_groups.len() as u32;
@@ -533,7 +551,11 @@ impl Snapshot {
             };
             let mut payload = Vec::new();
             for &ti in group {
-                payload.extend_from_slice(&table_entry_bytes(tables[ti].1, root_data_page[ti]));
+                payload.extend_from_slice(&table_entry_bytes(
+                    tables[ti].1,
+                    root_data_page[ti],
+                    &index_roots[ti],
+                ));
             }
             write_page(
                 &mut image,
@@ -547,6 +569,18 @@ impl Snapshot {
         }
 
         Ok(image)
+    }
+}
+
+/// The zero-column pseudo-table an index tree's records encode against (an index record is
+/// the entry key alone — spec/fileformat/format.md "Index trees").
+fn index_pseudo_table() -> Table {
+    Table {
+        name: String::new(),
+        columns: Vec::new(),
+        pk: Vec::new(),
+        checks: Vec::new(),
+        indexes: Vec::new(),
     }
 }
 
@@ -713,10 +747,31 @@ impl Snapshot {
 
         let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut root_data_page = vec![0u32; tables.len()];
+        let mut index_roots: Vec<Vec<u32>> = vec![Vec::new(); tables.len()];
+        let index_table = index_pseudo_table();
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
                 root_data_page[ti] =
                     serialize_dirty(root, table, cap, ps, &mut alloc, &mut pages, paging)?;
+            }
+            // The table's index trees follow its data tree, in catalog (name) order — only
+            // their dirty nodes are written, like any tree (spec/fileformat/format.md
+            // "Allocation & incremental commit").
+            for idx in &table.indexes {
+                let istore = self.index_store(&idx.name.to_ascii_lowercase());
+                let r = match istore.tree_root() {
+                    Some(root) => serialize_dirty(
+                        root,
+                        &index_table,
+                        cap,
+                        ps,
+                        &mut alloc,
+                        &mut pages,
+                        paging,
+                    )?,
+                    None => 0,
+                };
+                index_roots[ti].push(r);
             }
         }
 
@@ -725,7 +780,8 @@ impl Snapshot {
         // page can point at the next (`pack` always returns ≥ 1 group, so `cat_pages` is non-empty).
         let entry_sizes: Vec<usize> = tables
             .iter()
-            .map(|(_, t, _)| table_entry_bytes(t, 0).len())
+            .enumerate()
+            .map(|(ti, (_, t, _))| table_entry_bytes(t, 0, &vec![0; index_roots[ti].len()]).len())
             .collect();
         let cat_groups = pack(&entry_sizes, cap)?;
         let cat_pages: Vec<u32> = (0..cat_groups.len()).map(|_| alloc.take()).collect();
@@ -738,7 +794,11 @@ impl Snapshot {
             };
             let mut payload = Vec::new();
             for &ti in group {
-                payload.extend_from_slice(&table_entry_bytes(tables[ti].1, root_data_page[ti]));
+                payload.extend_from_slice(&table_entry_bytes(
+                    tables[ti].1,
+                    root_data_page[ti],
+                    &index_roots[ti],
+                ));
             }
             pages.push((
                 cat_pages[gi],
@@ -874,10 +934,12 @@ impl Database {
             }
             let mut pos = 0usize;
             for _ in 0..page.item_count {
-                let (table, root_data_page) = decode_table_entry(page.payload, &mut pos)?;
+                let (table, root_data_page, index_roots) =
+                    decode_table_entry(page.payload, &mut pos)?;
                 let name = table.name.clone();
                 let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
                 let has_pk = !table.pk_indices().is_empty();
+                let indexes = table.indexes.clone();
                 snap.put_table(table, page_size as u32);
                 if root_data_page != 0 {
                     let (root, len) =
@@ -893,6 +955,17 @@ impl Database {
                             store.bump_rowid_to(decode_int(ScalarType::Int64, k) + 1);
                         }
                     }
+                }
+                // The table's index trees (v5): zero-column stores of entry keys
+                // (spec/design/indexes.md §3), reachable pages included in the walk.
+                for (idx, &iroot) in indexes.iter().zip(&index_roots) {
+                    let cap = page_size - PAGE_HEADER;
+                    let mut istore = TableStore::new(cap, Vec::new());
+                    if iroot != 0 {
+                        let (root, len) = read_tree(image, page_size, iroot, &[], &mut reached)?;
+                        istore.set_tree(Some(root), len);
+                    }
+                    snap.put_index_store(idx.name.to_ascii_lowercase(), istore);
                 }
             }
             cat_page = page.next_page;
@@ -960,10 +1033,12 @@ impl Database {
             }
             let mut pos = 0usize;
             for _ in 0..page.item_count {
-                let (table, root_data_page) = decode_table_entry(page.payload, &mut pos)?;
+                let (table, root_data_page, index_roots) =
+                    decode_table_entry(page.payload, &mut pos)?;
                 let name = table.name.clone();
                 let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
                 let has_pk = !table.pk_indices().is_empty();
+                let indexes = table.indexes.clone();
                 snap.put_table(table, page_size as u32);
                 snap.store_mut(&name).attach_paging(paging.clone());
                 if root_data_page != 0 {
@@ -988,6 +1063,19 @@ impl Database {
                             store.bump_rowid_to(decode_int(ScalarType::Int64, k) + 1);
                         }
                     }
+                }
+                // The table's index trees (v5): zero-column demand-paged stores of entry
+                // keys (spec/design/indexes.md §3); no spillable columns, so no overflow
+                // collection is ever needed.
+                for (idx, &iroot) in indexes.iter().zip(&index_roots) {
+                    let cap = page_size - PAGE_HEADER;
+                    let mut istore = TableStore::new(cap, Vec::new());
+                    istore.attach_paging(paging.clone());
+                    if iroot != 0 {
+                        let (root, len) = read_skeleton(&paging, iroot, &[], &mut reached)?;
+                        istore.set_tree(Some(root), len);
+                    }
+                    snap.put_index_store(idx.name.to_ascii_lowercase(), istore);
                 }
             }
             cat_page = page.next_page;
@@ -1270,7 +1358,7 @@ fn write_overflow_chain(
 }
 
 /// One table's catalog entry bytes (spec/fileformat/format.md).
-fn table_entry_bytes(table: &Table, root_data_page: u32) -> Vec<u8> {
+fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) -> Vec<u8> {
     let mut out = Vec::new();
     let name = table.name.as_bytes();
     out.extend_from_slice(&(name.len() as u16).to_be_bytes());
@@ -1281,10 +1369,9 @@ fn table_entry_bytes(table: &Table, root_data_page: u32) -> Vec<u8> {
         out.extend_from_slice(&(cn.len() as u16).to_be_bytes());
         out.extend_from_slice(cn);
         out.push(type_code_for_scalar(col.ty));
+        // bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is the
+        // single authority; the bit is reserved, written 0 (spec/fileformat/format.md).
         let mut flags = 0u8;
-        if col.primary_key {
-            flags |= 0b01;
-        }
         if col.not_null {
             flags |= 0b10;
         }
@@ -1310,6 +1397,12 @@ fn table_entry_bytes(table: &Table, root_data_page: u32) -> Vec<u8> {
             out.extend_from_slice(&encode_value(col.ty, d));
         }
     }
+    // The primary key (v5): count, then the member column ordinals in KEY order
+    // (constraints.md §3 — the list persists an order independent of declaration order).
+    out.extend_from_slice(&(table.pk.len() as u16).to_be_bytes());
+    for &i in &table.pk {
+        out.extend_from_slice(&(i as u16).to_be_bytes());
+    }
     // CHECK constraints (v4): count, then (name, expression text) per check, in the
     // catalog's evaluation order — the text is written back VERBATIM, so the bytes are
     // stable across create → commit → load → commit (spec/fileformat/format.md
@@ -1322,6 +1415,21 @@ fn table_entry_bytes(table: &Table, root_data_page: u32) -> Vec<u8> {
         let ce = check.expr_text.as_bytes();
         out.extend_from_slice(&(ce.len() as u16).to_be_bytes());
         out.extend_from_slice(ce);
+    }
+    // Secondary indexes (v5): count, then per index the name, key-column ordinals
+    // (index-key order, duplicates allowed), and its tree's root page — in the catalog's
+    // ascending lowercased-name order (spec/design/indexes.md §6).
+    debug_assert_eq!(table.indexes.len(), index_roots.len());
+    out.extend_from_slice(&(table.indexes.len() as u16).to_be_bytes());
+    for (idx, &root) in table.indexes.iter().zip(index_roots) {
+        let inm = idx.name.as_bytes();
+        out.extend_from_slice(&(inm.len() as u16).to_be_bytes());
+        out.extend_from_slice(inm);
+        out.extend_from_slice(&(idx.columns.len() as u16).to_be_bytes());
+        for &c in &idx.columns {
+            out.extend_from_slice(&(c as u16).to_be_bytes());
+        }
+        out.extend_from_slice(&root.to_be_bytes());
     }
     out.extend_from_slice(&root_data_page.to_be_bytes());
     out
@@ -1530,7 +1638,10 @@ pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ScalarType]
     Ok(Node::leaf_loaded(keys, vals, weights, page))
 }
 
-fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32)> {
+/// Decode one catalog table entry: the `Table` (its pk list, checks, and index definitions
+/// included), its `root_data_page`, and each index's root page (parallel to
+/// `Table::indexes`).
+fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u32>)> {
     let name = read_string(buf, pos)?;
     let col_count = read_u16(buf, pos)? as usize;
     let mut columns = Vec::with_capacity(col_count);
@@ -1539,6 +1650,11 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32)> {
         let tc = read_u8(buf, pos)?;
         let ty = scalar_for_type_code(tc).ok_or_else(|| corrupt("unknown type code"))?;
         let flags = read_u8(buf, pos)?;
+        // bit0 was the primary_key flag through v4; v5 retired it (the pk list below is the
+        // authority) and reserves it as must-be-zero.
+        if flags & 0b01 != 0 {
+            return Err(corrupt("reserved column flag bit0 set"));
+        }
         // A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
         let decimal = if ty.is_decimal() {
             let precision = read_u16(buf, pos)?;
@@ -1565,10 +1681,22 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32)> {
             name: cname,
             ty,
             decimal,
-            primary_key: flags & 0b01 != 0,
+            primary_key: false, // set from the pk list below
             not_null: flags & 0b10 != 0,
             default,
         });
+    }
+    // The primary key (v5): member ordinals in KEY order. Each must name a real column,
+    // once; membership sets the per-column convenience flag.
+    let pk_count = read_u16(buf, pos)? as usize;
+    let mut pk = Vec::with_capacity(pk_count);
+    for _ in 0..pk_count {
+        let ord = read_u16(buf, pos)? as usize;
+        if ord >= columns.len() || pk.contains(&ord) {
+            return Err(corrupt("invalid primary key ordinal"));
+        }
+        columns[ord].primary_key = true;
+        pk.push(ord);
     }
     // CHECK constraints (v4): the stored expression text re-parses with the ordinary
     // expression parser — it was written by the token renderer, so this cannot fail for a
@@ -1586,14 +1714,43 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32)> {
             expr,
         });
     }
+    // Secondary indexes (v5): name + key-column ordinals + root page, in the catalog's
+    // (lowercased-name ascending) order — a reader trusts the order. Duplicate ordinals
+    // within one index are legal (indexes.md §1).
+    let index_count = read_u16(buf, pos)? as usize;
+    let mut indexes = Vec::with_capacity(index_count);
+    let mut index_roots = Vec::with_capacity(index_count);
+    for _ in 0..index_count {
+        let iname = read_string(buf, pos)?;
+        let kc = read_u16(buf, pos)? as usize;
+        if kc == 0 {
+            return Err(corrupt("index with no key columns"));
+        }
+        let mut cols = Vec::with_capacity(kc);
+        for _ in 0..kc {
+            let ord = read_u16(buf, pos)? as usize;
+            if ord >= columns.len() {
+                return Err(corrupt("invalid index column ordinal"));
+            }
+            cols.push(ord);
+        }
+        index_roots.push(read_u32(buf, pos)?);
+        indexes.push(IndexDef {
+            name: iname,
+            columns: cols,
+        });
+    }
     let root_data_page = read_u32(buf, pos)?;
     Ok((
         Table {
             name,
             columns,
+            pk,
             checks,
+            indexes,
         },
         root_data_page,
+        index_roots,
     ))
 }
 

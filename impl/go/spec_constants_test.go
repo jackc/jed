@@ -193,7 +193,7 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 		DivisionByZero, InvalidParameterValue,
 		InvalidRowCountInLimitClause, InvalidRowCountInOffsetClause,
 		NotNullViolation, UniqueViolation, CheckViolation,
-		UndefinedParameter, DuplicateObject,
+		UndefinedParameter, DuplicateObject, WrongObjectType,
 		ActiveSqlTransaction, ReadOnlySqlTransaction, InFailedSqlTransaction,
 		SyntaxError, UndefinedTable, UndefinedColumn, UndefinedObject,
 		DatatypeMismatch, DuplicateTable, DuplicateColumn,

@@ -1,0 +1,207 @@
+# Secondary indexes — design
+
+> `CREATE INDEX` / `DROP INDEX`: non-unique secondary indexes as on-disk B-trees beside
+> each table's primary tree, maintained on every write and used by the planner to bound a
+> scan. This doc is the contract all three cores implement in lockstep (CLAUDE.md §2); the
+> grammar is in [../grammar/grammar.ebnf](../grammar/grammar.ebnf) +
+> [grammar.md §30](grammar.md), the byte layout in
+> [../fileformat/format.md](../fileformat/format.md) (`format_version` 5), the entry-key
+> encoding in [encoding.md](encoding.md), and the cost contract in [cost.md §3](cost.md).
+> PostgreSQL semantics were pinned against the live `postgres:18` oracle (CLAUDE.md §1).
+
+## 1. Surface
+
+```sql
+CREATE INDEX [name] ON table (col [, col ...])
+DROP INDEX name
+```
+
+- **Non-unique.** A `UNIQUE` index is a later slice (it is the enforcement mechanism for
+  the `UNIQUE` constraint — TODO.md). Duplicate indexed values are expected and handled
+  by the entry-key suffix (§3).
+- **Plain column keys only.** Each key is a bare column name. Expression keys
+  (`(a + 1)`), per-key `ASC`/`DESC`/`NULLS`, partial (`WHERE`) indexes, `USING`,
+  `IF NOT EXISTS`, and `CONCURRENTLY` are not in the grammar this slice (all are
+  PostgreSQL features; each is a relaxable narrowing).
+- **A column may be listed more than once** (`CREATE INDEX i ON t (a, a)`) — PostgreSQL
+  allows it (oracle-probed), and rejecting it would be a gratuitous divergence. (Contrast
+  the composite `PRIMARY KEY`, where PG itself rejects a duplicate member, 42701 —
+  [constraints.md §3](constraints.md).)
+- **Indexable types = key-encodable types**: the integer widths, `uuid`, `timestamp`,
+  `timestamptz` — exactly the types a `PRIMARY KEY` accepts today. A `text` / `decimal` /
+  `bytea` / `boolean` key column is rejected `0A000` (the same documented narrowing as
+  for PK, lifted per type when its order-preserving key encoding is exercised —
+  [encoding.md §2.4–§2.6](encoding.md)). **Unlike a PK member, an indexed column may be
+  nullable** — this is the first exercise of the encoding.md §2.2 presence tag (§3).
+- **Indexing the PK column is legal** (pointless but harmless, as in PG).
+
+## 2. DDL semantics (PG-matched, oracle-probed)
+
+**Namespace.** Index names live in the **relation namespace, shared with tables**
+(PostgreSQL's model): a `CREATE INDEX` whose name (explicit) collides with an existing
+table *or* index — case-insensitively, jed's identifier rule — is **42P07**
+`relation already exists: {name}`; symmetrically `CREATE TABLE` of an existing *index*
+name is the same 42P07. The 42P07 registry template is now the PG word "relation"
+(covering both kinds); previously "table", a message-text-only change (matching is on
+code — [../errors/registry.toml](../errors/registry.toml)).
+
+**Validation order at CREATE INDEX** (deterministic, probed):
+
+1. The table must exist — **42P01** (`CREATE INDEX i ON nosuch (nope)` reports the
+   table, not the column).
+2. Each key column, in **list order**: it must exist in the table — **42703** — and be of
+   an indexable type — **0A000**. (Column validation precedes the name-collision check:
+   PG reports 42703 for `CREATE INDEX dup_name ON t (nope)`.)
+3. The **explicit name**, if any, is checked against the relation namespace — **42P07**.
+4. An **omitted name** is derived (below) — derivation always finds a free name, so it
+   cannot collide.
+
+**Auto-naming** (PostgreSQL's `ChooseIndexName`, probed): the base is the **lowercased**
+`<table>_<col>_<col>..._idx` — every listed column name in list order (duplicates
+included), joined with `_`. If the base is taken (case-insensitive), try `<base>1`,
+`<base>2`, … and take the smallest free suffix: `t_a_idx`, `t_a_idx1`, `t_a_idx2`.
+An explicit name is stored **as written** (original case round-trips; comparisons are
+case-insensitive) — same rule as table and CHECK-constraint names.
+
+**DROP INDEX**: the name must exist — **42704** `index does not exist: {name}` — and must
+be an index, not a table — **42809** (`wrong_object_type`, new) `{name} is not an index`.
+Symmetrically, `DROP TABLE` of an index name is **42809** `{name} is not a table`.
+**`DROP TABLE` drops the table's indexes with it** (they live in its catalog entry and
+have no independent life). Cost of both DDL statements: **zero** for `DROP INDEX` (a pure
+catalog edit, like DROP TABLE); `CREATE INDEX` charges its build scan (§5).
+
+## 3. The index entry: key encoding, no payload
+
+An index is a B-tree of **entries** whose byte-ordered keys realize the index order; an
+entry carries **no payload** (its record is the key alone — format.md). The entry key is:
+
+```
+entry_key = nullable-slot(col_1) ‖ nullable-slot(col_2) ‖ … ‖ row_storage_key
+```
+
+- Each indexed column value is encoded as the **encoding.md §2.2 nullable slot**: a
+  1-byte presence tag (`0x00` present ‖ the type's order-preserving key bytes, `0x01`
+  NULL) — **always**, even for a NOT NULL column (one uniform rule; a column's
+  nullability never changes the byte layout). This is the first place §2.2 is exercised
+  in stored bytes: NULL sorts **after** every present value (ascending), the PostgreSQL
+  model.
+- The **row's storage key** (the encoded PK, or the synthetic-rowid key of a no-PK
+  table) is appended as the **suffix**. It makes every entry key unique (a non-unique
+  index needs no duplicate handling in the tree), defines a deterministic order among
+  equal indexed values (storage-key order), and *is* the row pointer: every prefix
+  component is self-delimiting (fixed-width behind the tag today; terminated/escaped for
+  the future variable-width types), so the suffix is recovered by walking the prefix —
+  no payload needed.
+
+Composition and `memcmp` order follow [encoding.md §2.3](encoding.md) unchanged.
+
+## 4. Maintenance (every write path, phase 2)
+
+Indexes are maintained **inside the same statement** that mutates the table, in the
+write phase of the existing two-phase / all-or-nothing model — validation (coercion, NOT
+NULL, CHECK, duplicate-key) never consults or touches an index, and an index write
+cannot fail, so atomicity is unchanged:
+
+- **INSERT** (both forms): after a row is stored, insert its entry into every index of
+  the table.
+- **DELETE**: after a row is removed, remove its entries.
+- **UPDATE**: for each rewritten row, compute the old and new entry keys; if they
+  **differ**, remove the old and insert the new — if they are **equal** (the update did
+  not touch this index's columns), leave the tree node untouched. The skip is part of
+  the contract, not an optimization detail: it keeps the copy-on-write dirty set — and
+  therefore the incremental commit's written pages — byte-identical across cores
+  (CLAUDE.md §8). The row's storage key cannot change (the PK-assignment narrowing,
+  CLAUDE.md §11 step 6), so the suffix is stable.
+- **CREATE INDEX on a non-empty table** builds the index by scanning the table once in
+  key order (cost: §5).
+
+Maintenance work is **unmetered** (like sort and the commit itself — cost.md §3 "What is
+NOT metered"); the *scan* side of CREATE INDEX is metered.
+
+Indexed column values are always resident when maintenance reads them: the indexable
+types are fixed-width and never spill or compress (large-values.md), so maintenance
+cannot fault an `Unfetched` reference.
+
+## 5. The planner: index-bounded scans (SELECT)
+
+The existing per-relation pushdown seam ([cost.md §3](cost.md) "bounded scan") gains a
+second bound kind. For each **base relation of a SELECT scan** (single-table, a JOIN
+base table, or a correlated subquery's inner table), the plan picks, in order:
+
+1. The **single-column PK bound**, if the WHERE AND-chain bounds the relation's PK
+   (unchanged — the PK is the row's own key; it needs no second tree, supports ranges,
+   and is strictly cheaper).
+2. Else, an **index equality bound**: among the relation's indexes whose **first key
+   column** has at least one equality conjunct `col = const-source` (literal, `$N`
+   param, or correlated outer column — the same `const-source` rule as the PK bound,
+   type-matched so a promoted comparison stays residual), the index with the **lowest
+   lowercased name** (a deterministic choice; cost-based selection is a later concern).
+3. Else, the full scan.
+
+**Execution** of an index equality bound: every equality conjunct's value is encoded; if
+any is NULL (3VL — `col = NULL` is never true) or the values disagree (contradictory
+`a = 1 AND a = 2`) or an integer is out of the column type's range, the scan is provably
+**empty** and reads nothing. Otherwise the index tree is range-scanned over the prefix
+`0x00 ‖ encode(value)` (every entry whose first slot equals the value — the upper bound
+is the prefix's byte-successor); in each admitted entry the **remaining key components
+are skipped** (each is self-delimiting: a `0x01` NULL tag alone, or `0x00` + the
+component type's fixed width), the suffix after them names the row's storage key, and
+the row is fetched from the table tree by **point lookup**, in index-entry order
+(= component order, then storage-key order, so downstream order-determinism — ORDER BY
+tie-breaking, DISTINCT first-occurrence — is unchanged). The WHERE stays the
+**residual filter**, re-applied to every fetched row: the bound only narrows which rows
+are scanned, so the result is always correct even where the bound is a superset.
+
+**Narrowings this slice** (documented, relaxable, each a follow-on optimization slice
+with its own NoREC obligation — conformance.md §8): only the **first** key column is
+bound (no multi-column prefix), **equality only** (no index range scans), `UPDATE` /
+`DELETE` scans keep their PK pushdown but do **not** use indexes, and the **LIMIT
+streaming short-circuit does not combine** with an index bound (an index-bounded scan
+with LIMIT takes the eager path — its cost reads the full admitted set).
+
+### Cost (the cross-core contract — cost.md §3)
+
+An index-bounded scan accrues, in place of the full-scan block:
+
+- `page_read` × the index-tree nodes overlapping the prefix range (the same
+  overlap-node rule as a PK bounded scan, applied to the index tree);
+- per admitted entry: `page_read` × the table-tree nodes overlapping the **point**
+  bound of that row's storage key (the root-to-row descent), plus that row's
+  touched-column `value_decompress` slabs (large-values.md §14);
+- `storage_row_read` per fetched row, and everything downstream (filter,
+  projection, `row_produced`) unchanged.
+
+An empty bound charges nothing. **CREATE INDEX** charges its build scan: `page_read` ×
+the table's node count + `storage_row_read` per row (its touched set — the indexed
+columns — is fixed-width, so the chain/decompress terms are structurally zero); an empty
+table charges 0. `DROP INDEX` charges 0.
+
+## 6. Persistence (`format_version` 5)
+
+The catalog reshape ([../fileformat/format.md](../fileformat/format.md)):
+
+- The table entry gains an explicit **primary-key ordinal list** (`pk_count` + column
+  ordinals in **key order**). This retires column-flag bit0 (now reserved, written 0)
+  and **lifts the composite-PK order narrowing**: `PRIMARY KEY (b, a)` is now legal —
+  list order is key order, persisted independently of declaration order
+  ([constraints.md §3](constraints.md)).
+- The table entry gains its **index list**: per index, the name (original case) +
+  column ordinals (key order, duplicates allowed) + the index tree's **root page**.
+  Indexes are stored and held in **ascending lowercased-name order** (the catalog's
+  deterministic order, like checks; also the §5 tie-break order).
+- Each index is an ordinary on-disk **B-tree of empty-payload records** — the same
+  leaf/interior pages, split/merge rules, copy-on-write incremental commit, free-list
+  reclamation, and demand-paged open as a table tree. A record is `key_len ‖ key` with
+  zero value columns.
+
+## 7. Divergences from PostgreSQL (documented per CLAUDE.md §1)
+
+- **No system catalog surface**: PG exposes indexes via `pg_indexes`; jed has no catalog
+  tables (auto-chosen names are observable via `DROP INDEX` / collision errors, and via
+  the host API's catalog in per-core tests).
+- PG's index machinery (btree opclasses, `USING`, collations, opfamilies) is owned
+  surface jed does not implement — we own our surface (CLAUDE.md §1).
+- Error **messages** differ in jed's house style (no identifier quoting); codes match.
+- PG reserves `ON`, so `CREATE INDEX on ON t (a)` is unparseable there; jed keeps every
+  word non-reserved via the grammar.md §30 lookahead (the standing no-reserved-words
+  stance, as for `check` / `constraint`).

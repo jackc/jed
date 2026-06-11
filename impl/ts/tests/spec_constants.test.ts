@@ -102,6 +102,7 @@ test("error codes are registered in spec/errors/registry.toml", () => {
     "check_violation",
     "undefined_parameter",
     "duplicate_object",
+    "wrong_object_type",
     "active_sql_transaction",
     "read_only_sql_transaction",
     "in_failed_sql_transaction",

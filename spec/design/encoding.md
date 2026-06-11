@@ -55,16 +55,29 @@ NULL** — so NULLs sort **last** in ascending order. See §4 for why that is th
 position. The tag is one byte, not a bit stolen from the value, so the value encoding in
 §2.1 is reused verbatim and stays width-clean.
 
+**Status — EXERCISED** (the secondary-index slice): every component of a **secondary-index
+entry key** is a nullable slot — uniformly, even for a NOT NULL column — because an indexed
+column, unlike a PK member, may hold NULL ([indexes.md §3](indexes.md)). The slot's sort
+order is what places NULL last in the stored index order. Before that slice the tag was
+authored but appeared only behind the value codec (§3), where its order is irrelevant.
+
 ### 2.3 Composition and descending
 
 - **Composite keys** are the **concatenation** of their components' encodings, left to
   right. Each component is either fixed-width (the integer types) or self-delimiting, so the
   concatenation stays order-preserving without separators. **Status — EXERCISED:** a
   composite `PRIMARY KEY` ([constraints.md §3](constraints.md)) stores exactly this
-  concatenation (every keyable component type is fixed-width today — integers, uuid,
-  timestamps — so the widths come from the schema and `memcmp` equals the tuple's
-  lexicographic order). The cross-core bytes are pinned by the `composite_pk_table.jed`
-  golden ([../fileformat/format.md](../fileformat/format.md)).
+  concatenation **in the constraint's list order** (which may differ from declaration order —
+  the catalog persists the key order explicitly since `format_version` 5); every keyable
+  component type is fixed-width today — integers, uuid, timestamps — so the widths come from
+  the schema and `memcmp` equals the tuple's lexicographic order. The cross-core bytes are
+  pinned by the `composite_pk_table.jed` golden
+  ([../fileformat/format.md](../fileformat/format.md)). A **secondary-index entry key**
+  ([indexes.md §3](indexes.md)) is the same composition with two twists: each indexed
+  component is wrapped in the §2.2 **nullable slot** (tag + bare encoding), and the row's
+  storage key is appended as the final component — the suffix that makes every entry unique
+  and recoverable (each prefix component is self-delimiting, so the suffix needs no length
+  field). Pinned by the `index_table.jed` golden.
 - **Descending order** is the **bitwise inversion (one's complement)** of a component,
   *tag byte included*. Inverting every byte reverses `memcmp` order exactly, so a descending
   component sorts as the mirror of its ascending form. Under inversion the nullable tag

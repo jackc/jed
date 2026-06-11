@@ -6,8 +6,10 @@
 
 import type {
   BinaryOp,
+  CreateIndex,
   CreateTable,
   Delete,
+  DropIndex,
   DropTable,
   Expr,
   Insert,
@@ -26,6 +28,7 @@ import type {
 import {
   type CheckConstraint,
   type Column,
+  type IndexDef,
   type Table,
   columnIndex,
   pkIndices,
@@ -54,6 +57,7 @@ import {
   isTimestamptz,
   rank,
   scalarTypeFromName,
+  widthBytes,
 } from "./types.ts";
 import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
 import {
@@ -121,21 +125,34 @@ export class Snapshot {
   txid: bigint;
   tables: Map<string, Table>;
   stores: Map<string, TableStore>;
+  // indexStores holds each secondary index's B-tree (spec/design/indexes.md §3): a
+  // TableStore with ZERO value columns (entry keys only — the on-disk empty-payload
+  // record), keyed by the lowercased index name (index names live in the relation
+  // namespace, globally unique). Which table owns an index is recorded in that table's
+  // indexes list.
+  indexStores: Map<string, TableStore>;
 
   constructor(
     txid: bigint = 0n,
     tables: Map<string, Table> = new Map(),
     stores: Map<string, TableStore> = new Map(),
+    indexStores: Map<string, TableStore> = new Map(),
   ) {
     this.txid = txid;
     this.tables = tables;
     this.stores = stores;
+    this.indexStores = indexStores;
   }
 
   // clone returns an independent copy: the catalog map is shallow (Table objects are never mutated
   // in place — only added/removed) and each store is an O(1) persistent-map clone (pmap.ts).
   clone(): Snapshot {
-    return new Snapshot(this.txid, new Map(this.tables), cloneStores(this.stores));
+    return new Snapshot(
+      this.txid,
+      new Map(this.tables),
+      cloneStores(this.stores),
+      cloneStores(this.indexStores),
+    );
   }
 
   // table looks up a table definition by name (case-insensitive).
@@ -158,10 +175,68 @@ export class Snapshot {
     this.tables.set(key, t);
   }
 
-  // removeTable removes a table's definition and its store (DROP TABLE).
+  // removeTable removes a table's definition, its store, and its indexes' stores (DROP
+  // TABLE — the indexes have no independent life, spec/design/indexes.md §2).
   removeTable(key: string): void {
+    const t = this.tables.get(key);
+    if (t) for (const idx of t.indexes) this.indexStores.delete(idx.name.toLowerCase());
     this.tables.delete(key);
     this.stores.delete(key);
+  }
+
+  // indexStore returns a secondary index's store (the index is known to exist). nameKey
+  // is the lowercased index name.
+  indexStore(nameKey: string): TableStore {
+    return this.indexStores.get(nameKey)!;
+  }
+
+  // putIndex registers a new (empty) secondary index on tableKey: insert its definition
+  // into the table's indexes in ascending lowercased-name order (the catalog/planner
+  // order — spec/design/indexes.md §6) and create its zero-column store. The Table object
+  // is re-allocated (catalog Tables are never mutated in place — snapshots share them).
+  putIndex(tableKey: string, def: IndexDef, pageSize: number): void {
+    const nameKey = def.name.toLowerCase();
+    this.indexStores.set(nameKey, new TableStore(pageSize - 12, [])); // 12 = PAGE_HEADER
+    const old = this.tables.get(tableKey)!;
+    let pos = old.indexes.length;
+    for (let i = 0; i < old.indexes.length; i++) {
+      if (old.indexes[i]!.name.toLowerCase() > nameKey) {
+        pos = i;
+        break;
+      }
+    }
+    const indexes = [...old.indexes.slice(0, pos), def, ...old.indexes.slice(pos)];
+    this.tables.set(tableKey, { ...old, indexes });
+  }
+
+  // putIndexStore registers a loaded index store under its (lowercased) name — the file
+  // loader's hook (format.ts): the owning table's indexes list came from its catalog
+  // entry, so only the store is registered here.
+  putIndexStore(nameKey: string, store: TableStore): void {
+    this.indexStores.set(nameKey, store);
+  }
+
+  // removeIndex removes one secondary index (DROP INDEX): its definition from the owning
+  // table and its store.
+  removeIndex(tableKey: string, nameKey: string): void {
+    const old = this.tables.get(tableKey);
+    if (old) {
+      const indexes = old.indexes.filter((ix) => ix.name.toLowerCase() !== nameKey);
+      this.tables.set(tableKey, { ...old, indexes });
+    }
+    this.indexStores.delete(nameKey);
+  }
+
+  // findIndex finds the table owning the named index (case-insensitive):
+  // [tableKey, def] or null.
+  findIndex(name: string): [string, IndexDef] | null {
+    const key = name.toLowerCase();
+    for (const [tk, t] of this.tables) {
+      for (const ix of t.indexes) {
+        if (ix.name.toLowerCase() === key) return [tk, ix];
+      }
+    }
+    return null;
   }
 
   // rowsInKeyOrder returns a table's rows in primary-key order, or [] if the table is absent.
@@ -415,6 +490,12 @@ export class Database {
       case "dropTable":
         rejectParamsForDDL(params);
         return this.executeDropTable(stmt);
+      case "createIndex":
+        rejectParamsForDDL(params);
+        return this.executeCreateIndex(stmt);
+      case "dropIndex":
+        rejectParamsForDDL(params);
+        return this.executeDropIndex(stmt);
       case "insert":
         return this.executeInsert(stmt, params);
       case "select":
@@ -446,11 +527,17 @@ export class Database {
   // resolve left to right (unknown 42703, repeated 42701); then the jed narrowings — the
   // declaration-order rule and the per-member key-type gate — trap 0A000.
   private executeCreateTable(ct: CreateTable): Outcome {
-    if (this.table(ct.name)) {
-      throw engineError("duplicate_table", "table already exists: " + ct.name);
+    // The relation namespace is shared between tables and indexes (indexes.md §2), so a
+    // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
+    if (this.relationExists(ct.name)) {
+      throw engineError("duplicate_table", "relation already exists: " + ct.name);
     }
 
     const columns: Column[] = [];
+    // pk is the primary-key member ordinals in KEY order (constraints.md §3): the
+    // column-level form is the one-member case; the table-level list below records its
+    // own order.
+    let pk: number[] = [];
     let pkSeen = false;
     for (const def of ct.columns) {
       for (const c of columns) {
@@ -480,6 +567,7 @@ export class Database {
           );
         }
         pkSeen = true;
+        pk.push(columns.length); // this column's ordinal (pushed below)
       }
       // Evaluate + type-coerce the DEFAULT literal once, here. A bad default fails at CREATE
       // TABLE: out of range 22003, cross-family 42804, decimal over-precision 22003. NOT NULL
@@ -502,8 +590,9 @@ export class Database {
     // Table-level PRIMARY KEY (a, b, ...) constraints (constraints.md §3). Check order
     // mirrors PostgreSQL (oracle-probed): a second primary key is 42P16 before its
     // members resolve; members resolve left to right (42703 unknown, 42701 repeated).
-    // The jed narrowings follow: the list must name columns in declaration order, and
-    // every member must be of a key-encodable type (both 0A000, relaxable).
+    // The LIST order is the KEY order — it may differ from declaration order (the v5
+    // catalog persists the ordinal list; the old 0A000 narrowing is lifted). The
+    // per-member key-type gate (0A000) remains.
     for (const pkList of ct.tablePks) {
       if (pkSeen) {
         throw engineError(
@@ -527,12 +616,6 @@ export class Database {
         }
         indices.push(idx);
       }
-      if (!indices.every((v, i) => i === 0 || indices[i - 1]! < v)) {
-        throw engineError(
-          "feature_not_supported",
-          "a primary key whose column order differs from the table's column order is not supported yet",
-        );
-      }
       for (const i of indices) {
         const ty = columns[i]!.type;
         if (!isInteger(ty) && !isUuid(ty) && !isTimestamp(ty) && !isTimestamptz(ty)) {
@@ -544,6 +627,7 @@ export class Database {
         columns[i]!.primaryKey = true;
         columns[i]!.notNull = true; // PRIMARY KEY ⇒ NOT NULL, per member
       }
+      pk = indices;
     }
 
     // CHECK constraints (constraints.md §4). All validation runs first, in textual
@@ -551,7 +635,7 @@ export class Database {
     // oracle-probed); naming follows in a second pass, so a 42703 in a later check fires
     // before a 42710 between earlier ones. Resolution needs a catalog Table, so build it
     // now (checks attach below, before putTable).
-    const table: Table = { name: ct.name, columns, checks: [] };
+    const table: Table = { name: ct.name, columns, pk, checks: [], indexes: [] };
     for (const def of ct.checks) {
       // Structural rejections first (a single pre-walk — a documented micro-order
       // divergence from PG, which interleaves them with name/type resolution): subquery
@@ -624,10 +708,173 @@ export class Database {
   // discarded wholesale), so it accrues zero cost.
   private executeDropTable(dt: DropTable): Outcome {
     if (!this.table(dt.name)) {
+      // An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
+      // anything else is the missing-table 42P01 the DML paths raise.
+      if (this.findIndex(dt.name)) {
+        throw engineError("wrong_object_type", dt.name + " is not a table");
+      }
       throw engineError("undefined_table", "table does not exist: " + dt.name);
     }
     this.working().removeTable(dt.name.toLowerCase());
     return { kind: "statement", cost: 0n };
+  }
+
+  // findIndex finds the table owning the named index in the visible snapshot
+  // (case-insensitive).
+  private findIndex(name: string): [string, IndexDef] | null {
+    return this.readSnap().findIndex(name);
+  }
+
+  // relationExists reports whether name is taken in the shared relation namespace (a
+  // table OR an index — spec/design/indexes.md §2), case-insensitively.
+  private relationExists(name: string): boolean {
+    return this.table(name) !== undefined || this.findIndex(name) !== null;
+  }
+
+  // executeCreateIndex analyzes and runs a CREATE INDEX (spec/design/indexes.md §2).
+  // Validation mirrors PostgreSQL's order (oracle-probed): the table must exist (42P01);
+  // each key column, in list order, must exist (42703) and be of a key-encodable type
+  // (0A000 — the same narrowing as a PRIMARY KEY member); then an explicit name is
+  // checked against the shared relation namespace (42P07), or an omitted name derives
+  // PG's choice — the lowercased <table>_<col>..._idx with the smallest free suffix. The
+  // index is then built by scanning the table once: page_read per node + storage_row_read
+  // per row (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
+  private executeCreateIndex(ci: CreateIndex): Outcome {
+    const table = this.table(ci.table);
+    if (!table) {
+      throw engineError("undefined_table", "table does not exist: " + ci.table);
+    }
+    const tableKey = table.name.toLowerCase();
+    const columns = table.columns;
+    const cols: number[] = [];
+    for (const name of ci.columns) {
+      const idx = columnIndex(table, name);
+      if (idx < 0) {
+        throw engineError("undefined_column", "column does not exist: " + name);
+      }
+      const ty = columns[idx]!.type;
+      if (!isInteger(ty) && !isUuid(ty) && !isTimestamp(ty) && !isTimestamptz(ty)) {
+        throw engineError(
+          "feature_not_supported",
+          "a " + canonicalName(ty) + " index column is not supported yet",
+        );
+      }
+      // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
+      cols.push(idx);
+    }
+    let name: string;
+    if (ci.name !== null) {
+      if (this.relationExists(ci.name)) {
+        throw engineError("duplicate_table", "relation already exists: " + ci.name);
+      }
+      name = ci.name;
+    } else {
+      // PG's ChooseIndexName (probed): lowercased table + every listed column name
+      // (list order, duplicates included) + "idx", then the smallest free suffix.
+      let base = tableKey;
+      for (const cn of ci.columns) base += "_" + cn.toLowerCase();
+      base += "_idx";
+      name = base;
+      for (let suffix = 1; this.relationExists(name); suffix++) name = base + suffix.toString();
+    }
+
+    // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
+    // row, with the indexed columns as the touched set (fixed-width — the chain/decompress
+    // terms are structurally zero). An empty table charges 0. The entries are computed
+    // here, against the pre-index store; the writes below are unmetered.
+    const meter = new Meter(this.maxCost);
+    const mask = columns.map(() => false);
+    for (const c of cols) mask[c] = true;
+    const def: IndexDef = { name, columns: cols };
+    const store = this.readSnap().store(ci.table);
+    const { pages: nodes, slabs } = store.scanUnits(mask);
+    meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
+    const entries: Uint8Array[] = [];
+    for (const e of store.entriesInKeyOrder()) {
+      meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+      meter.charge(COSTS.storageRowRead);
+      entries.push(indexEntryKey(columns, def, e.key, e.row));
+    }
+    meter.guard();
+
+    const nameKey = def.name.toLowerCase();
+    this.working().putIndex(tableKey, def, this.pageSize);
+    const istore = this.working().indexStore(nameKey);
+    for (const ek of entries) {
+      if (!istore.insert(ek, [])) {
+        throw new Error("index entry keys are unique (storage-key suffix)");
+      }
+    }
+    return { kind: "statement", cost: meter.accrued };
+  }
+
+  // executeDropIndex runs a DROP INDEX (spec/design/indexes.md §2): a table's name is
+  // 42809, a missing one 42704. A pure catalog edit — zero cost, like DROP TABLE.
+  private executeDropIndex(di: DropIndex): Outcome {
+    if (this.table(di.name)) {
+      throw engineError("wrong_object_type", di.name + " is not an index");
+    }
+    const found = this.findIndex(di.name);
+    if (!found) {
+      throw engineError("undefined_object", "index does not exist: " + di.name);
+    }
+    this.working().removeIndex(found[0], di.name.toLowerCase());
+    return { kind: "statement", cost: 0n };
+  }
+
+  // indexBoundRows executes an index equality bound (cost.md §3 "index-bounded scan"):
+  // fetch the rows the equality admits, in index-entry order (= storage-key order among
+  // equal values), and return them with the scan's up-front units (pages, slabs) — the
+  // index-tree nodes overlapping the prefix range plus, per admitted entry, the
+  // table-tree nodes of that row's point lookup and its touched-column decompress slabs.
+  // The caller feeds the rows through the same scanSource as any bounded scan (page_read
+  // block + per-row storage_row_read). A provably empty bound (NULL / contradictory
+  // equalities / out-of-range) returns nothing and charges nothing.
+  indexBoundRows(
+    tableName: string,
+    ib: IndexBound,
+    params: Value[],
+    outer: Row[],
+    mask: boolean[],
+  ): { rows: Row[]; pages: number; slabs: number } {
+    // Every equality const-source must encode to ONE agreed value: a NULL is 3VL-never-
+    // true, a disagreement (`a = 1 AND a = 2`) is a contradiction, and an out-of-range
+    // integer can equal no stored value — all provably empty.
+    let agreed: Uint8Array | null = null;
+    for (const src of ib.eqs) {
+      const bk = encodeBoundKey(ib.colType, src, params, outer);
+      if (bk.kind !== "key") return { rows: [], pages: 0, slabs: 0 };
+      if (agreed === null) agreed = bk.key;
+      else if (!bytesEq(agreed, bk.key)) return { rows: [], pages: 0, slabs: 0 };
+    }
+    // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
+    // is every entry extending the prefix: [prefix, byte-successor(prefix)).
+    const prefix = new Uint8Array(1 + agreed!.length);
+    prefix.set(agreed!, 1);
+    const b: KeyBound = { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
+    const istore = this.readSnap().indexStore(ib.nameKey);
+    const entries = istore.rangeEntries(b);
+    let pages = istore.overlapNodeCount(b);
+    const store = this.readSnap().store(tableName);
+    let slabs = 0;
+    const rows: Row[] = [];
+    for (const e of entries) {
+      // Skip the remaining key components (each self-delimiting — indexes.md §5); the
+      // suffix after them is the row's storage key (indexes.md §3).
+      let at = prefix.length;
+      for (const ty of ib.tailTypes) {
+        at += e.key[at] === 0x01 ? 1 : 1 + widthBytes(ty);
+      }
+      const rowKey = e.key.slice(at);
+      const point: KeyBound = { lo: rowKey, loInc: true, hi: rowKey, hiInc: true };
+      const u = store.overlapScanUnits(point, mask);
+      pages += u.pages;
+      slabs += u.slabs;
+      const row = store.get(rowKey);
+      if (row === undefined) throw new Error("an index entry references a stored row");
+      rows.push(row);
+    }
+    return { rows, pages, slabs };
   }
 
   // executeInsert runs an INSERT whose rows come from a VALUES list or a SELECT (grammar.md
@@ -867,11 +1114,26 @@ export class Database {
 
     // Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
     // rowid is allocated here, in row order, so a failed validation pass burns none
-    // (spec/fileformat/format.md, grammar.md §12).
+    // (spec/fileformat/format.md, grammar.md §12). Each stored row's secondary-index
+    // entries are computed against its final key (the rowid included) and written after
+    // the rows (indexes.md §4 — an index write cannot fail, so all-or-nothing is
+    // unchanged).
+    const indexInserts: Uint8Array[][] = table.indexes.map(() => []);
     for (const pr of prepared) {
       const key = pr.key ?? encodeInt("int64", store.allocRowid());
+      for (let k = 0; k < table.indexes.length; k++) {
+        indexInserts[k]!.push(indexEntryKey(table.columns, table.indexes[k]!, key, pr.row));
+      }
       if (!store.insert(key, pr.row)) {
         throw new Error("pre-validated INSERT key must be unique");
+      }
+    }
+    for (let k = 0; k < table.indexes.length; k++) {
+      const istore = this.working().indexStore(table.indexes[k]!.name.toLowerCase());
+      for (const ek of indexInserts[k]!) {
+        if (!istore.insert(ek, [])) {
+          throw new Error("index entry keys are unique (storage-key suffix)");
+        }
       }
     }
   }
@@ -903,7 +1165,9 @@ export class Database {
     }
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.working().store(del.table);
-    const keys: Uint8Array[] = [];
+    // matched collects (key, row) pairs before mutating; the rows feed phase 2's
+    // index-entry removal (indexed columns are fixed-width and always resident).
+    const matched: { key: Uint8Array; row: Row }[] = [];
     // DELETE's touched set (cost.md §3): only the filter's columns — dropping a row never reads
     // its chains, so a bare DELETE charges no chain/decompress units at all.
     const mask: boolean[] = new Array(table.columns.length).fill(false);
@@ -922,10 +1186,18 @@ export class Database {
       // touched set the block above charged (large-values.md §14).
       const row = store.resolveColumns(e.row, mask);
       if (filter === null || isTrue(evalExpr(filter, row, env, meter))) {
-        keys.push(e.key);
+        matched.push({ key: e.key, row });
       }
     }
-    for (const k of keys) store.remove(k);
+    // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
+    // unmetered write work; an index removal cannot fail).
+    for (const m of matched) store.remove(m.key);
+    for (const def of table.indexes) {
+      const istore = this.working().indexStore(def.name.toLowerCase());
+      for (const m of matched) {
+        istore.remove(indexEntryKey(table.columns, def, m.key, m.row));
+      }
+    }
     return { kind: "statement", cost: meter.accrued };
   }
 
@@ -999,7 +1271,8 @@ export class Database {
     meter.charge(foldCost.value);
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.working().store(upd.table);
-    const updates: { key: Uint8Array; row: Row }[] = [];
+    // Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
+    const updates: { key: Uint8Array; row: Row; oldRow: Row }[] = [];
     // UPDATE's touched set (cost.md §3): the filter's columns plus every assignment SOURCE's —
     // the rewrite re-stores an untouched spilled value without logically re-reading it
     // (large-values.md §14).
@@ -1033,7 +1306,7 @@ export class Database {
       // columns); TRUE and NULL pass, the first FALSE aborts the statement (phase 1 —
       // nothing has been written).
       evalChecks(checks, table.name, resident, env, meter);
-      updates.push({ key: e.key, row: resident });
+      updates.push({ key: e.key, row: resident, oldRow: row });
     }
 
     // Each rewritten row's disposition plan may attempt compression (a record over RECORD_MAX)
@@ -1044,8 +1317,33 @@ export class Database {
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
 
-    // Phase 2: apply (keys unchanged — a PK column can't be assigned).
+    // Index maintenance (indexes.md §4): an entry moves only when its key CHANGED — equal
+    // old/new keys leave the index tree untouched (part of the contract: it keeps the
+    // copy-on-write dirty set, and so the commit's written pages, byte-identical across
+    // cores). The storage key cannot change (PK assignment is rejected), so the suffix is
+    // stable.
+    const indexMoves: { oldKey: Uint8Array; newKey: Uint8Array }[][] = table.indexes.map(() => []);
+    for (const u of updates) {
+      for (let k = 0; k < table.indexes.length; k++) {
+        const def = table.indexes[k]!;
+        const oldEk = indexEntryKey(table.columns, def, u.key, u.oldRow);
+        const newEk = indexEntryKey(table.columns, def, u.key, u.row);
+        if (!bytesEq(oldEk, newEk)) indexMoves[k]!.push({ oldKey: oldEk, newKey: newEk });
+      }
+    }
+
+    // Phase 2: apply (keys unchanged — a PK column can't be assigned), then move the
+    // changed index entries (unmetered write work; cannot fail).
     for (const u of updates) store.replace(u.key, u.row);
+    for (let k = 0; k < table.indexes.length; k++) {
+      const istore = this.working().indexStore(table.indexes[k]!.name.toLowerCase());
+      for (const mv of indexMoves[k]!) {
+        istore.remove(mv.oldKey);
+        if (!istore.insert(mv.newKey, [])) {
+          throw new Error("index entry keys are unique (storage-key suffix)");
+        }
+      }
+    }
     return { kind: "statement", cost: meter.accrued };
   }
 
@@ -1314,11 +1612,9 @@ export class Database {
     // its own PK — `b.pk = a.x` (index-nested-loop) stays a full scan, a follow-on. Sound for outer
     // joins too: a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows, so
     // bounding it cannot drop a surviving row. A no-PK relation gets null (full scan).
-    const relBounds: (PkBound | null)[] = rels.map((rel) => {
-      if (filter === null) return null;
-      const pkLocal = primaryKeyIndex(rel.table);
-      return pkLocal >= 0 ? detectPkBound(filter, rel.offset + pkLocal, rel.table.columns[pkLocal]!.type) : null;
-    });
+    const relBounds: (ScanBound | null)[] = rels.map((rel) =>
+      filter === null ? null : detectScanBound(filter, rel),
+    );
 
     // Assemble the owned plan (table NAMES + offsets/widths replace the scope's tables, so the
     // plan outlives the scope and a correlated subquery can re-execute it per row).
@@ -1384,10 +1680,14 @@ export class Database {
     // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead block. This path is
     // single-table (gated below), so the only relation is relBounds[0]. A correlated bound resolves
     // against env.outer (the enclosing rows).
+    // An INDEX bound never streams — the dispatch gate routes it to the eager path
+    // (cost.md §3 "LIMIT short-circuit").
     let bound: KeyBound = unboundedBound();
     let empty = false;
-    if (plan.relBounds[0] !== null) {
-      const b = buildKeyBound(plan.relBounds[0]!, params, env.outer);
+    const sb = plan.relBounds[0]!;
+    if (sb !== null) {
+      if (sb.kind === "index") throw new Error("the streaming path is gated to PK/full scans");
+      const b = buildKeyBound(sb.pk, params, env.outer);
       if (b === null) empty = true;
       else bound = b;
     }
@@ -1437,7 +1737,10 @@ export class Database {
       plan.joins.length === 0 &&
       !plan.isAgg &&
       !plan.distinct &&
-      plan.order.length === 0
+      plan.order.length === 0 &&
+      // An index-bounded scan does not stream (cost.md §3 "index-bounded scan"): it
+      // reads the full admitted set via the eager path below.
+      plan.relBounds[0]?.kind !== "index"
     ) {
       return this.execStreamingLimit(plan, env, meter, params);
     }
@@ -1453,8 +1756,15 @@ export class Database {
       let nodeCount: number;
       let slabs = 0;
       const relBound = plan.relBounds[ri]!;
-      if (relBound !== null) {
-        const b = buildKeyBound(relBound, params, outer);
+      if (relBound !== null && relBound.kind === "index") {
+        // An index bound fetches via the index tree + per-row point lookups (cost.md §3
+        // "index-bounded scan").
+        const r = this.indexBoundRows(rel.tableName, relBound.index, params, outer, plan.relMasks[ri]!);
+        rows = r.rows;
+        nodeCount = r.pages;
+        slabs = r.slabs;
+      } else if (relBound !== null) {
+        const b = buildKeyBound(relBound.pk, params, outer);
         if (b === null) {
           rows = [];
           nodeCount = 0;
@@ -1786,6 +2096,97 @@ function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Ro
 // matching keys: the whole WHERE stays the residual filter (re-applied to each scanned row), so the
 // result is always correct — the bound only narrows which rows are scanned, and page_read/storageRowRead
 // drop to what it touches. The unbounded case keeps the full scan, so its cost never moves.
+
+// ScanBound is a per-relation scan bound (cost.md §3): a primary-key range, or a
+// secondary-index equality (spec/design/indexes.md §5). The PK bound wins when both apply
+// (it is the row's own key — no second tree, range-capable, strictly cheaper).
+type ScanBound = { kind: "pk"; pk: PkBound } | { kind: "index"; index: IndexBound };
+
+// IndexBound is the plan-time result of index analysis (indexes.md §5): the chosen index
+// (lowest lowercased name whose FIRST key column has an equality conjunct), that column's
+// storage type, and every equality const-source on it. At exec time the sources must
+// agree on one value (else the bound is provably empty) and the index is range-scanned
+// over that value's presence-tagged prefix.
+// tailTypes is the REMAINING key components' types (columns[1..]): an admitted entry's
+// row-key suffix sits after every component slot, so the fetch skips these (each slot is
+// self-delimiting — a 0x01 NULL tag alone, or 0x00 + the type's fixed width).
+type IndexBound = { nameKey: string; colType: ScalarType; eqs: RExpr[]; tailTypes: ScalarType[] };
+
+// detectScanBound picks one relation's scan bound (cost.md §3; indexes.md §5): the
+// single-column PK bound first; else, among the relation's indexes (held in ascending
+// lowercased-name order — the deterministic tie-break), the first whose FIRST key column
+// has at least one equality conjunct against a type-matched const-source; else null
+// (full scan).
+function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
+  const pkLocal = primaryKeyIndex(rel.table);
+  if (pkLocal >= 0) {
+    const bp = detectPkBound(filter, rel.offset + pkLocal, rel.table.columns[pkLocal]!.type);
+    if (bp !== null) return { kind: "pk", pk: bp };
+  }
+  for (const idx of rel.table.indexes) {
+    const ci = idx.columns[0]!;
+    const ty = rel.table.columns[ci]!.type;
+    const bp = detectPkBound(filter, rel.offset + ci, ty);
+    const eqs: RExpr[] = [];
+    if (bp !== null) {
+      for (const t of bp.terms) if (t.op === "eq") eqs.push(t.src);
+    }
+    if (eqs.length > 0) {
+      const tailTypes = idx.columns.slice(1).map((c) => rel.table.columns[c]!.type);
+      return { kind: "index", index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, tailTypes } };
+    }
+  }
+  return null;
+}
+
+// indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each
+// indexed column as the encoding.md §2.2 nullable slot — 0x00 + the type's bare
+// order-preserving key bytes when present, the lone 0x01 for NULL (always tagged, even
+// for a NOT NULL column) — then the row's storage key as the suffix. Indexable types are
+// fixed-width and never spill, so the values are always resident (never unfetched).
+function indexEntryKey(columns: Column[], def: IndexDef, storageKey: Uint8Array, row: Row): Uint8Array {
+  const parts: Uint8Array[] = [];
+  for (const ci of def.columns) {
+    const v = row[ci]!;
+    if (v.kind === "null") {
+      parts.push(Uint8Array.of(0x01));
+    } else if (v.kind === "int") {
+      parts.push(Uint8Array.of(0x00), encodeInt(columns[ci]!.type, v.int));
+    } else if (v.kind === "uuid") {
+      parts.push(Uint8Array.of(0x00), v.bytes);
+    } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
+      parts.push(Uint8Array.of(0x00), encodeInt(columns[ci]!.type, v.micros));
+    } else {
+      throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
+    }
+  }
+  parts.push(storageKey);
+  const total = parts.reduce((acc, b) => acc + b.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const b of parts) {
+    out.set(b, off);
+    off += b.length;
+  }
+  return out;
+}
+
+// bytesEq reports byte equality of two keys.
+function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
+  return compareBytes(a, b) === 0;
+}
+
+// prefixSuccessor is the byte-successor of a prefix: the smallest byte string greater
+// than every string that extends p. Increment the last non-0xFF byte and truncate after
+// it; an all-0xFF prefix has no successor (null ⇒ unbounded high end).
+function prefixSuccessor(p: Uint8Array): Uint8Array | null {
+  let end = p.length;
+  while (end > 0 && p[end - 1] === 0xff) end--;
+  if (end === 0) return null;
+  const s = p.slice(0, end);
+  s[end - 1]!++;
+  return s;
+}
 
 // BoundTerm is one `pk <op> const-source` from a WHERE AND-chain, normalized so the PK is the LEFT side
 // (a `5 < pk` flips to `pk > 5`). src is the constant/parameter operand node.
@@ -2304,7 +2705,7 @@ type SelectPlan = {
   // bounded independently by the WHERE predicates on its OWN primary key against a CONSTANT
   // (literal/param/outer) — a cross-relation `b.pk = a.x` is the index-nested-loop case (a
   // follow-on). The residual filter stays the WHOLE `filter`, re-applied after the join.
-  relBounds: (PkBound | null)[];
+  relBounds: (ScanBound | null)[];
   // relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md §14):
   // which of its columns this query statically references. Drives the chain-pageRead /
   // valueDecompress portion of the scan's up-front cost block — an untouched spilled or
@@ -3067,6 +3468,8 @@ export function stmtIsWrite(stmt: Statement): boolean {
   return (
     stmt.kind === "createTable" ||
     stmt.kind === "dropTable" ||
+    stmt.kind === "createIndex" ||
+    stmt.kind === "dropIndex" ||
     stmt.kind === "insert" ||
     stmt.kind === "update" ||
     stmt.kind === "delete"
@@ -3081,6 +3484,10 @@ function stmtKind(stmt: Statement): string {
       return "CREATE TABLE";
     case "dropTable":
       return "DROP TABLE";
+    case "createIndex":
+      return "CREATE INDEX";
+    case "dropIndex":
+      return "DROP INDEX";
     case "insert":
       return "INSERT";
     case "update":

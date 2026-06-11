@@ -294,6 +294,44 @@ deliberate, cost-visible optimization, gated by the `query.point_lookup` capabil
 `expr/cost.test`, `query/distinct.test`, `query/limit_offset.test`, and `query/select_list.test`
 exercise them in context.
 
+### Index-bounded scan — a secondary index narrows a base-relation scan
+
+A **secondary index** ([indexes.md](indexes.md)) gives a second bound kind at the same
+per-relation pushdown seam. For each base relation of a **SELECT** scan (single-table, a JOIN
+base table, or a correlated subquery's inner table), the plan picks the **single-column PK
+bound first** (it is the row's own key — no second tree, range-capable, strictly cheaper);
+else, among the relation's indexes whose **first key column** has at least one **equality**
+conjunct `col = const-source` in the WHERE AND-chain (the same const-source rule as above —
+literal / `$N` / correlated outer column, type-matched), the index with the **lowest
+lowercased name**; else the full scan. Gated by the `ddl.secondary_index` capability, pinned
+cross-core in `spec/conformance/suites/query/index_scan.test`.
+
+The index-bounded scan accrues, in place of the full-scan block:
+
+- **`page_read` × the index-tree nodes** overlapping the equality prefix range (the same
+  overlap rule as the PK bound, applied to the index tree — a logical count, never faulted).
+- **Per admitted entry, the row fetch**: `page_read` × the **table-tree** nodes overlapping
+  the *point* bound of that entry's row storage key (the root→row descent), plus that row's
+  touched-column `value_decompress` slabs — i.e. each row fetch costs exactly what a PK point
+  lookup of that row costs.
+- **`storage_row_read` per fetched row**, and the residual filter / projection /
+  `row_produced` unchanged. The WHERE stays the residual filter; the bound only narrows
+  which rows are fetched.
+- **A provably empty bound charges nothing**: an equality against NULL (3VL), contradictory
+  equalities (`a = 1 AND a = 2`), or an out-of-range integer admit no entry — no page, no row.
+
+Deterministic and byte-identical across cores: the index tree shape, the entry-key encoding,
+and the overlap rule are all §8 contracts. **Narrowings this slice** (indexes.md §5): first
+key column only, equality only, SELECT scans only (UPDATE/DELETE keep their PK pushdown), and
+**no LIMIT-streaming combination** — an index-bounded scan with a LIMIT takes the eager path
+(reads the full admitted set; the short-circuit below stays PK/full-scan-only).
+
+**DDL costs.** `CREATE INDEX` charges its build scan over the existing rows: `page_read` ×
+the **table's** full node count + `storage_row_read` per row (the build's touched set — the
+indexed columns — is fixed-width, so its chain/decompress terms are structurally zero); an
+empty table charges 0. `DROP INDEX` charges 0 (a pure catalog edit, like DROP TABLE). Index
+**maintenance** at INSERT/UPDATE/DELETE is unmetered ("What is NOT metered" below).
+
 **Bounded scan / JOIN — each base table bounded by its own PK predicate.** In a multi-table FROM
 each base table is materialized independently (see "JOIN" below), so each is bounded **on its own**
 by the WHERE conjuncts on **its** primary key against a const-source — exactly the per-relation form
@@ -355,7 +393,9 @@ capability.
   section. This is why every `LIMIT`-with-`ORDER BY` cost in `query/limit_offset.test` scans all
   rows, while the `LIMIT`-without-`ORDER BY` cases short-circuit.
 - **Composes with the PK bound.** A `WHERE pk <range> ... LIMIT n` first bounds the scan to the key
-  range (above), then short-circuits within it once `n` rows are produced.
+  range (above), then short-circuits within it once `n` rows are produced. (An **index** bound does
+  **not** stream — an index-bounded scan with a LIMIT takes the eager path; see the index-bounded
+  scan subsection above.)
 - **The rows are identical** to the eager path: the `offset..offset+limit` slice of the
   primary-key-ordered filtered rows. (The *result set* of a `LIMIT` with no `ORDER BY` is
   SQL-unspecified — CLAUDE.md §8 — but our cores agree, scanning in primary-key order.)
@@ -544,6 +584,11 @@ evaluation. It deliberately does **not** meter:
   `row_produced` only for the surviving distinct, windowed rows.
 - **Phase-2 row writes** in `UPDATE`/`DELETE` — the two-phase mutation's write pass does
   no eval and produces no row.
+- **Secondary-index maintenance** — computing and writing/removing index entries at
+  INSERT/UPDATE/DELETE is phase-2 write work (it evaluates nothing and cannot fail), so it
+  is unmetered like the row writes themselves. The *build* scan of `CREATE INDEX` over
+  existing rows **is** metered (the index-bounded-scan subsection above); `DROP INDEX`
+  charges 0.
 - **JOIN nested-loop control flow** — buffering each materialized table, iterating the
   Cartesian/left-deep combinations, and concatenating left+right rows are bookkeeping, not
   evaluation; only `storage_row_read` (per materialized row), the `ON`/WHERE/projection

@@ -23,10 +23,27 @@ type Column struct {
 type Table struct {
 	Name    string
 	Columns []Column
+	// PK is the primary-key member column ordinals in KEY order (which may differ from
+	// declaration order — constraints.md §3; the v5 catalog persists this list). Empty =
+	// no primary key (synthetic rowid keys). The per-column PrimaryKey flag is derived
+	// membership convenience; this list is the authority for order.
+	PK []int
 	// Checks is the table's CHECK constraints in EVALUATION ORDER — ascending byte order
 	// of the lowercased name (spec/design/constraints.md §4.4); the on-disk catalog stores
 	// them in this same order. Empty for an unchecked table.
 	Checks []CheckConstraint
+	// Indexes is the table's secondary indexes in ascending lowercased-name order (the
+	// catalog's on-disk order and the planner's tie-break order — spec/design/indexes.md).
+	Indexes []IndexDef
+}
+
+// IndexDef is one secondary index of a table (spec/design/indexes.md): its
+// (relation-namespace) name and the indexed column ordinals in index-key order
+// (duplicates allowed — PG). The index's B-tree lives in the snapshot's index-store map,
+// keyed by the lowercased name.
+type IndexDef struct {
+	Name    string
+	Columns []int
 }
 
 // CheckConstraint is one CHECK constraint: its (resolved, unique-per-table) name, its
@@ -49,19 +66,11 @@ func (t *Table) ColumnIndex(name string) int {
 	return -1
 }
 
-// PKIndices returns the primary-key member columns' indices in KEY order. Key order is
-// the flagged columns in declaration order — CREATE TABLE requires the constraint's list
-// order to match (the documented 0A000 narrowing, spec/design/constraints.md §3), so the
-// flag bits alone reconstruct the key. Empty = the table has no primary key (synthetic
-// rowid keys).
+// PKIndices returns the primary-key member columns' indices in KEY order (the explicit
+// PK list — the v5 catalog persists key order independent of declaration order). Empty =
+// the table has no primary key (synthetic rowid keys).
 func (t *Table) PKIndices() []int {
-	var idxs []int
-	for i, c := range t.Columns {
-		if c.PrimaryKey {
-			idxs = append(idxs, i)
-		}
-	}
-	return idxs
+	return t.PK
 }
 
 // PrimaryKeyIndex returns the primary-key column's index iff the key is SINGLE-column,

@@ -90,6 +90,8 @@ fn syntax_errors_are_reported() {
         run(&mut db, "DROP TABLE t extra").unwrap_err().code(),
         "42601"
     );
-    // DROP of anything other than a TABLE is not part of the surface yet.
-    assert_eq!(run(&mut db, "DROP INDEX x").unwrap_err().code(), "42601");
+    // DROP INDEX is its own statement now (spec/design/indexes.md §2): a missing index is
+    // 42704, not a syntax error; DROP of any other object kind is still unparsed.
+    assert_eq!(run(&mut db, "DROP INDEX x").unwrap_err().code(), "42704");
+    assert_eq!(run(&mut db, "DROP VIEW v").unwrap_err().code(), "42601");
 }

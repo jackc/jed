@@ -11,6 +11,7 @@ package jed
 import (
 	"bytes"
 	"encoding/binary"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -20,7 +21,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion uint16 = 4               // on-disk format version (4 = + catalog CHECK constraints, constraints.md §4.5)
+	formatVersion uint16 = 5               // on-disk format version (5 = the secondary-index catalog reshape, indexes.md §6)
 	pageHeader           = 12              // bytes of the catalog/B-tree page header
 	pageCatalog   byte   = 1               // page_type for a catalog page
 	pageLeaf      byte   = 2               // page_type for a B-tree leaf node
@@ -214,6 +215,9 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	// reference already-allocated pages (format.md).
 	var body []bodyPage
 	rootDataPage := make([]uint32, len(keys))
+	indexRoots := make([][]uint32, len(keys))
+	// Index trees have no value columns — encode against an empty pseudo-table.
+	indexTable := &Table{}
 	nextIndex := rootPage
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
@@ -224,13 +228,27 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 			rootDataPage[ti] = rp
 			nextIndex = np
 		}
+		// The table's index trees follow its data tree, in catalog (name) order
+		// (spec/fileformat/format.md "From-scratch image").
+		for _, idx := range s.tables[k].Indexes {
+			var r uint32
+			if root := s.indexStores[strings.ToLower(idx.Name)].treeRoot(); root != nil {
+				rp, np, err := serializeNode(root, indexTable, capacity, nextIndex, &body)
+				if err != nil {
+					return nil, err
+				}
+				r = rp
+				nextIndex = np
+			}
+			indexRoots[ti] = append(indexRoots[ti], r)
+		}
 	}
 
 	// The catalog chain follows the data; its head is the relocatable root_page.
 	catRoot := nextIndex
 	entrySizes := make([]int, len(keys))
 	for ti, k := range keys {
-		entrySizes[ti] = len(tableEntryBytes(s.tables[k], 0))
+		entrySizes[ti] = len(tableEntryBytes(s.tables[k], 0, make([]uint32, len(s.tables[k].Indexes))))
 	}
 	catGroups, err := pack(entrySizes, capacity)
 	if err != nil {
@@ -259,7 +277,7 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 		}
 		var payload []byte
 		for _, ti := range group {
-			payload = append(payload, tableEntryBytes(s.tables[keys[ti]], rootDataPage[ti])...)
+			payload = append(payload, tableEntryBytes(s.tables[keys[ti]], rootDataPage[ti], indexRoots[ti])...)
 		}
 		writePage(image, ps, int(index), pageCatalog, uint32(len(group)), next, payload)
 	}
@@ -389,6 +407,8 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 
 	var pages []dirtyPage
 	rootDataPage := make([]uint32, len(keys))
+	indexRoots := make([][]uint32, len(keys))
+	indexTable := &Table{}
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
 			rp, err := serializeDirty(root, s.tables[k], capacity, ps, alloc, &pages, paging)
@@ -397,6 +417,20 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 			}
 			rootDataPage[ti] = rp
 		}
+		// The table's index trees follow its data tree, in catalog (name) order — only
+		// their dirty nodes are written, like any tree (spec/fileformat/format.md
+		// "Allocation & incremental commit").
+		for _, idx := range s.tables[k].Indexes {
+			var r uint32
+			if root := s.indexStores[strings.ToLower(idx.Name)].treeRoot(); root != nil {
+				rp, err := serializeDirty(root, indexTable, capacity, ps, alloc, &pages, paging)
+				if err != nil {
+					return incrementalWrite{}, err
+				}
+				r = rp
+			}
+			indexRoots[ti] = append(indexRoots[ti], r)
+		}
 	}
 
 	// The catalog chain is rewritten to fresh pages every commit (table roots move). Allocate its
@@ -404,7 +438,7 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 	// point at the next (pack always returns ≥ 1 group, so catPages is non-empty).
 	entrySizes := make([]int, len(keys))
 	for ti, k := range keys {
-		entrySizes[ti] = len(tableEntryBytes(s.tables[k], 0))
+		entrySizes[ti] = len(tableEntryBytes(s.tables[k], 0, make([]uint32, len(s.tables[k].Indexes))))
 	}
 	catGroups, err := pack(entrySizes, capacity)
 	if err != nil {
@@ -422,7 +456,7 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 		}
 		var payload []byte
 		for _, ti := range group {
-			payload = append(payload, tableEntryBytes(s.tables[keys[ti]], rootDataPage[ti])...)
+			payload = append(payload, tableEntryBytes(s.tables[keys[ti]], rootDataPage[ti], indexRoots[ti])...)
 		}
 		pages = append(pages, dirtyPage{index: catPages[gi], bytes: makePage(ps, pageCatalog, uint32(len(group)), nextPage, payload)})
 	}
@@ -558,7 +592,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 		}
 		pos := 0
 		for i := uint32(0); i < pg.itemCount; i++ {
-			table, tableRoot, err := decodeTableEntry(pg.payload, &pos)
+			table, tableRoot, indexRoots, err := decodeTableEntry(pg.payload, &pos)
 			if err != nil {
 				return nil, err
 			}
@@ -586,6 +620,19 @@ func LoadDatabase(image []byte) (*Database, error) {
 					}
 					store.BumpRowidTo(DecodeInt(Int64, keys[len(keys)-1]) + 1)
 				}
+			}
+			// The table's index trees (v5): zero-column stores of entry keys
+			// (spec/design/indexes.md §3), reachable pages included in the walk.
+			for k, idx := range table.Indexes {
+				istore := NewTableStore(pageSize-pageHeader, nil)
+				if indexRoots[k] != 0 {
+					root, length, err := readTree(image, pageSize, indexRoots[k], nil, reached)
+					if err != nil {
+						return nil, err
+					}
+					istore.setTree(root, length)
+				}
+				snap.putIndexStore(strings.ToLower(idx.Name), istore)
 			}
 		}
 		catPage = pg.nextPage
@@ -659,7 +706,7 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 		}
 		pos := 0
 		for i := uint32(0); i < pg.itemCount; i++ {
-			table, tableRoot, err := decodeTableEntry(pg.payload, &pos)
+			table, tableRoot, indexRoots, err := decodeTableEntry(pg.payload, &pos)
 			if err != nil {
 				return nil, err
 			}
@@ -697,6 +744,21 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 					}
 					store.BumpRowidTo(DecodeInt(Int64, keys[len(keys)-1]) + 1)
 				}
+			}
+			// The table's index trees (v5): zero-column demand-paged stores of entry keys
+			// (spec/design/indexes.md §3); no spillable columns, so no overflow collection
+			// is ever needed.
+			for k, idx := range table.Indexes {
+				istore := NewTableStore(pageSize-pageHeader, nil)
+				istore.attachPaging(paging)
+				if indexRoots[k] != 0 {
+					root, length, err := readSkeleton(paging, indexRoots[k], nil, reached)
+					if err != nil {
+						return nil, err
+					}
+					istore.setTree(root, length)
+				}
+				snap.putIndexStore(strings.ToLower(idx.Name), istore)
 			}
 		}
 		catPage = pg.nextPage
@@ -1241,8 +1303,9 @@ func writeOverflowChain(payload []byte, capacity int, take func() uint32, ovf *[
 	return indices[0]
 }
 
-// tableEntryBytes builds one table's catalog entry (format.md).
-func tableEntryBytes(table *Table, rootDataPage uint32) []byte {
+// tableEntryBytes builds one table's catalog entry (format.md). indexRoots is each
+// index's tree root page, parallel to table.Indexes.
+func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []byte {
 	var out []byte
 	out = appendU16(out, uint16(len(table.Name)))
 	out = append(out, table.Name...)
@@ -1251,10 +1314,9 @@ func tableEntryBytes(table *Table, rootDataPage uint32) []byte {
 		out = appendU16(out, uint16(len(col.Name)))
 		out = append(out, col.Name...)
 		out = append(out, typeCodeForScalar(col.Type))
+		// bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is
+		// the single authority; the bit is reserved, written 0 (spec/fileformat/format.md).
 		var flags byte
-		if col.PrimaryKey {
-			flags |= 0b01
-		}
 		if col.NotNull {
 			flags |= 0b10
 		}
@@ -1280,6 +1342,12 @@ func tableEntryBytes(table *Table, rootDataPage uint32) []byte {
 			out = append(out, encodeValue(col.Type, *col.Default)...)
 		}
 	}
+	// The primary key (v5): count, then the member column ordinals in KEY order
+	// (constraints.md §3 — the list persists an order independent of declaration order).
+	out = appendU16(out, uint16(len(table.PK)))
+	for _, i := range table.PK {
+		out = appendU16(out, uint16(i))
+	}
 	// CHECK constraints (v4): count, then (name, expression text) per check, in the
 	// catalog's evaluation order — the text is written back VERBATIM, so the bytes are
 	// stable across create → commit → load → commit (spec/fileformat/format.md
@@ -1290,6 +1358,19 @@ func tableEntryBytes(table *Table, rootDataPage uint32) []byte {
 		out = append(out, check.Name...)
 		out = appendU16(out, uint16(len(check.ExprText)))
 		out = append(out, check.ExprText...)
+	}
+	// Secondary indexes (v5): count, then per index the name, key-column ordinals
+	// (index-key order, duplicates allowed), and its tree's root page — in the catalog's
+	// ascending lowercased-name order (spec/design/indexes.md §6).
+	out = appendU16(out, uint16(len(table.Indexes)))
+	for k, idx := range table.Indexes {
+		out = appendU16(out, uint16(len(idx.Name)))
+		out = append(out, idx.Name...)
+		out = appendU16(out, uint16(len(idx.Columns)))
+		for _, c := range idx.Columns {
+			out = appendU16(out, uint16(c))
+		}
+		out = appendU32(out, indexRoots[k])
 	}
 	out = appendU32(out, rootDataPage)
 	return out
@@ -1510,43 +1591,51 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []ScalarType) (*pnode,
 	return &pnode{keys: keys, vals: vals, weights: weights, page: pageID}, nil
 }
 
-func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, error) {
+// decodeTableEntry decodes one catalog table entry: the *Table (its pk list, checks, and
+// index definitions included), its root_data_page, and each index's root page (parallel
+// to Table.Indexes).
+func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 	name, err := readString(buf, pos)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	colCount, err := readU16(buf, pos)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	columns := make([]Column, 0, colCount)
 	for i := uint16(0); i < colCount; i++ {
 		cname, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 		tc, err := readU8(buf, pos)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 		ty, ok := scalarForTypeCode(tc)
 		if !ok {
-			return nil, 0, NewError(DataCorrupted, "unknown type code")
+			return nil, 0, nil, NewError(DataCorrupted, "unknown type code")
 		}
 		flags, err := readU8(buf, pos)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
+		}
+		// bit0 was the primary_key flag through v4; v5 retired it (the pk list below is
+		// the authority) and reserves it as must-be-zero.
+		if flags&0b01 != 0 {
+			return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit0 set")
 		}
 		// A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
 		var decimal *DecimalTypmod
 		if ty.IsDecimal() {
 			precision, err := readU16(buf, pos)
 			if err != nil {
-				return nil, 0, err
+				return nil, 0, nil, err
 			}
 			scale, err := readU16(buf, pos)
 			if err != nil {
-				return nil, 0, err
+				return nil, 0, nil, err
 			}
 			if precision != 0 {
 				decimal = &DecimalTypmod{Precision: precision, Scale: scale}
@@ -1561,48 +1650,106 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, error) {
 			var sink []uint32
 			dv, err := readValue(ty, buf, pos, nil, &sink)
 			if err != nil {
-				return nil, 0, err
+				return nil, 0, nil, err
 			}
 			defaultVal = &dv
 		}
 		columns = append(columns, Column{
-			Name:       cname,
-			Type:       ty,
-			Decimal:    decimal,
-			PrimaryKey: flags&0b01 != 0,
-			NotNull:    flags&0b10 != 0,
-			Default:    defaultVal,
+			Name:    cname,
+			Type:    ty,
+			Decimal: decimal,
+			// PrimaryKey is set from the pk list below.
+			NotNull: flags&0b10 != 0,
+			Default: defaultVal,
 		})
+	}
+	// The primary key (v5): member ordinals in KEY order. Each must name a real column,
+	// once; membership sets the per-column convenience flag.
+	pkCount, err := readU16(buf, pos)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	pk := make([]int, 0, pkCount)
+	for i := uint16(0); i < pkCount; i++ {
+		ord, err := readU16(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		o := int(ord)
+		if o >= len(columns) || slices.Contains(pk, o) {
+			return nil, 0, nil, NewError(DataCorrupted, "invalid primary key ordinal")
+		}
+		columns[o].PrimaryKey = true
+		pk = append(pk, o)
 	}
 	// CHECK constraints (v4): the stored expression text re-parses with the ordinary
 	// expression parser — it was written by the token renderer, so this cannot fail for a
 	// file the engine wrote; failure means the file lied (XX001, constraints.md §4.5).
 	checkCount, err := readU16(buf, pos)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	checks := make([]CheckConstraint, 0, checkCount)
 	for i := uint16(0); i < checkCount; i++ {
 		checkName, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 		exprText, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 		expr, err := ParseExpression(exprText)
 		if err != nil {
-			return nil, 0, NewError(DataCorrupted,
+			return nil, 0, nil, NewError(DataCorrupted,
 				"stored check constraint does not parse: "+err.Error())
 		}
 		checks = append(checks, CheckConstraint{Name: checkName, ExprText: exprText, Expr: expr})
 	}
+	// Secondary indexes (v5): name + key-column ordinals + root page, in the catalog's
+	// (lowercased-name ascending) order — a reader trusts the order. Duplicate ordinals
+	// within one index are legal (indexes.md §1).
+	indexCount, err := readU16(buf, pos)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	indexes := make([]IndexDef, 0, indexCount)
+	indexRoots := make([]uint32, 0, indexCount)
+	for i := uint16(0); i < indexCount; i++ {
+		iname, err := readString(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		kc, err := readU16(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if kc == 0 {
+			return nil, 0, nil, NewError(DataCorrupted, "index with no key columns")
+		}
+		cols := make([]int, 0, kc)
+		for j := uint16(0); j < kc; j++ {
+			ord, err := readU16(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			if int(ord) >= len(columns) {
+				return nil, 0, nil, NewError(DataCorrupted, "invalid index column ordinal")
+			}
+			cols = append(cols, int(ord))
+		}
+		iroot, err := readU32(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		indexes = append(indexes, IndexDef{Name: iname, Columns: cols})
+		indexRoots = append(indexRoots, iroot)
+	}
 	root, err := readU32(buf, pos)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
-	return &Table{Name: name, Columns: columns, Checks: checks}, root, nil
+	return &Table{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes}, root, indexRoots, nil
 }
 
 // readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL

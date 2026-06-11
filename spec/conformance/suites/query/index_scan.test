@@ -1,0 +1,176 @@
+# The index-bounded scan (spec/design/indexes.md §5, cost.md §3 "index-bounded scan"):
+# a SELECT base-relation scan with an equality on an index's FIRST key column fetches via
+# the index tree + per-row point lookups instead of the full scan. Cost is the cross-core
+# contract: page_read × (index nodes overlapping the prefix range + per admitted entry the
+# table-tree point-lookup nodes) + storage_row_read per fetched row, residual filter and
+# projection unchanged. A provably-empty bound (3VL NULL / contradictory equalities)
+# charges nothing. The WHERE stays the residual filter, so rows NEVER change — only cost
+# does. Maintenance (indexes.md §4) keeps the index exact across INSERT/UPDATE/DELETE.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.limit, query.point_lookup, query.join_inner, query.qualified_column, query.table_alias, query.subquery_scalar, query.subquery_correlated, query.correlated_pushdown, types.int32, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (5, 0, 5), (6, 1, 6), (7, 2, 7), (8, 3, 8), (9, 4, 9), (10, 0, 10), (11, 1, 11), (12, 2, 12), (13, 3, 13), (14, 4, 14), (15, 0, 15), (16, 1, 16), (17, 2, 17), (18, 3, 18), (19, 4, 19), (20, 0, 20)
+
+# the full scan baseline: page_read(1) + 20 rows + 20 filter evals + 4 produced = 45
+# cost: 45
+query I nosort
+SELECT id FROM t WHERE v = 3 ORDER BY id
+----
+3
+8
+13
+18
+
+# the build scan: page_read(1) + 20 storage_row_read = 21
+# cost: 21
+statement ok
+CREATE INDEX t_v_idx ON t (v)
+
+# the same query now index-bounds: index node(1) + 4 point lookups(4) + 4 rows
+# + 4 filter evals + 4 produced = 17 — identical rows, lower cost
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE v = 3 ORDER BY id
+----
+3
+8
+13
+18
+
+# an equality against NULL is 3VL-provably empty: no page, no row
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE v = NULL
+----
+
+# contradictory equalities are provably empty too
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE v = 1 AND v = 2
+----
+
+# a bind-parameter-shaped miss: an equality on a value no row holds still descends the
+# index (1 node) but admits nothing — page_read(1) only
+# cost: 1
+query I nosort
+SELECT id FROM t WHERE v = 99
+----
+
+# the single-column PK bound wins over the index when both apply:
+# page_read(1) + 1 row + 3 evals (=, =, AND) + 1 produced = 6
+# cost: 6
+query II nosort
+SELECT id, v FROM t WHERE id = 7 AND v = 2
+----
+7
+2
+
+# LIMIT does not stream over an index bound (the eager path reads the full admitted
+# set; only row_produced drops): 17 - 3 = 14
+# cost: 14
+query I nosort
+SELECT id FROM t WHERE v = 3 ORDER BY id LIMIT 1
+----
+3
+
+# --- maintenance keeps the index exact (indexes.md §4) --------------------------
+
+statement ok
+UPDATE t SET v = 9 WHERE id = 3
+
+# cost: 13
+query I nosort
+SELECT id FROM t WHERE v = 3 ORDER BY id
+----
+8
+13
+18
+
+# cost: 5
+query I nosort
+SELECT id FROM t WHERE v = 9
+----
+3
+
+statement ok
+UPDATE t SET v = NULL WHERE id = 8
+
+# a NULL entry is never matched by an equality
+# cost: 9
+query I nosort
+SELECT id FROM t WHERE v = 3 ORDER BY id
+----
+13
+18
+
+statement ok
+DELETE FROM t WHERE v = 3
+
+# cost: 1
+query I nosort
+SELECT id FROM t WHERE v = 3
+----
+
+# INSERT ... SELECT maintains too (the shared insert path)
+statement ok
+INSERT INTO t SELECT id + 100, 3, w FROM t WHERE v = 4
+
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE v = 3 ORDER BY id
+----
+104
+109
+114
+119
+
+# --- the index bound composes with JOIN and correlated subqueries ----------------
+
+statement ok
+CREATE TABLE side (k int32 PRIMARY KEY, tag int32)
+
+statement ok
+INSERT INTO side VALUES (1, 3), (2, 4)
+
+# a JOIN base relation index-bounds independently: t fetches via t_v_idx (4 entries),
+# side full-scans (1 node + 2 rows); ON evaluates per combination
+# cost: 28
+query II nosort
+SELECT s.k, x.id FROM side s JOIN t x ON s.k = 1 WHERE x.v = 3 ORDER BY x.id
+----
+1
+104
+1
+109
+1
+114
+1
+119
+
+# a correlated inner equality on the indexed column bounds the inner re-scan per outer
+# row: for each of side's 2 rows the inner seeks tag's matches through t_v_idx
+# cost: 43
+query II nosort
+SELECT s.k, (SELECT max(x.id) FROM t x WHERE x.v = s.tag) FROM side s ORDER BY s.k
+----
+1
+119
+2
+19
+
+# dropping the index restores the full-scan cost — the rows never move
+statement ok
+DROP INDEX t_v_idx
+
+# cost: 49
+query I nosort
+SELECT id FROM t WHERE v = 3 ORDER BY id
+----
+104
+109
+114
+119

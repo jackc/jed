@@ -1228,3 +1228,34 @@ ordinary `expr` production — `CHECK ()` is `42601`, and the parentheses are re
 the constraint must reject — and CREATE TABLE's execution validates: subquery `0A000`,
 aggregate `42803`, bind parameter `42P02`, unknown column `42703`, non-boolean `42804`,
 duplicate name `42710` (constraints.md §4.1–§4.3). The parser knows no catalog.
+
+## 30. `CREATE INDEX` / `DROP INDEX`
+
+Two new top-level statements ([indexes.md](indexes.md)):
+
+```
+create_index ::= "CREATE" "INDEX" identifier? "ON" identifier
+                 "(" identifier ("," identifier)* ")"
+drop_index   ::= "DROP" "INDEX" identifier
+```
+
+**Disambiguating the optional name.** No word is reserved (§3), so `ON` may itself name
+an index or table. The rule, byte-identical across the three parsers: after
+`CREATE INDEX`, the next word is the **index name UNLESS** it is `ON` followed by a word
+followed by `(` — that exact three-token shape can only be the unnamed form's
+`ON table (`. Both readings stay reachable: `CREATE INDEX ON t (a)` is unnamed (the
+lookahead sees `ON t (`), while `CREATE INDEX on ON t (a)` names the index `on` (the
+lookahead sees `ON ON t`, not `ON word (`), and `CREATE INDEX ON on (a)` is the unnamed
+form over a table named `on`. PostgreSQL reserves `ON` so the ambiguity cannot arise
+there; the lookahead is jed's standing no-reserved-words mechanism (the same move as
+`DISTINCT`'s and `CHECK`'s).
+
+**Key columns are bare identifiers.** A `(` in key position is a `42601` syntax error
+(no expression keys — a documented narrowing, indexes.md §1), as are `ASC` / `DESC` /
+`NULLS` after a key (they parse as an unexpected token; PostgreSQL accepts them).
+
+**Where the errors fire.** The parser knows no catalog; CREATE INDEX's execution
+validates in PostgreSQL's order — table `42P01`, then each key column in list order
+(`42703` unknown / `0A000` unindexable type), then the explicit name against the shared
+relation namespace (`42P07`) — and DROP INDEX raises `42704` (missing) / `42809` (names
+a table). Semantics: [indexes.md §2](indexes.md).

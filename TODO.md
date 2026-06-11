@@ -580,10 +580,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `PRIMARY KEY (a, b, …)` constraint (grammar.md §28, constraints.md §3): key bytes are
       the members' concatenated encodings (encoding.md §2.3, now exercised; pinned by the
       `composite_pk_table.jed` golden), uniqueness over the whole tuple (23505), every member
-      implicitly NOT NULL, PG-matching DDL errors (42703/42701/42P16). Two documented
-      narrowings, both relaxable: the list order must match declaration order (0A000 — the
-      catalog's flag-bit persistence carries no independent order; lift at the secondary-index
-      catalog reshape), and the PK pushdown stays single-column (a composite-PK table
+      implicitly NOT NULL, PG-matching DDL errors (42703/42701/42P16). The original
+      list-order-must-match-declaration-order narrowing was **lifted by the secondary-index
+      catalog reshape** (`format_version` 5 persists the key as an explicit ordinal list —
+      `PRIMARY KEY (b, a)` now keys by (b, a), pinned by `index_table.jed`). Remaining
+      narrowing, relaxable: the PK pushdown stays single-column (a composite-PK table
       full-scans; composite point-lookup/prefix pushdown is a follow-on optimization slice
       with its NoREC obligation).
 - [x] **`CHECK` constraints** — ✅ landed (all 3 cores): column-level and table-level
@@ -605,8 +606,31 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       non-reserved `check`/`constraint` column names).
 - [ ] **Constraints (remaining)** — `UNIQUE`, `FOREIGN KEY`. These are heavier.
       _(size: M→L each)_
-- [ ] **Secondary indexes** (`CREATE INDEX`) — also a planner + storage concern (index
-      pages, index maintenance on write). _(size: L; deps: storage maturation)_
+- [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — ✅ landed (all 3 cores):
+      non-unique secondary indexes (spec/design/indexes.md, grammar.md §30). Each index is
+      an on-disk **B-tree of empty-payload records** whose entry key is the indexed
+      columns' nullable slots (encoding.md §2.2, first exercised — NULL sorts last) + the
+      row's storage key as suffix; maintained at INSERT/UPDATE/DELETE inside the two-phase
+      pass (UPDATE moves an entry only when its key changed — a cross-core dirty-set
+      contract). PG semantics oracle-probed: auto-naming `<table>_<cols>_idx` + smallest
+      free suffix, the shared table/index relation namespace (42P07 "relation already
+      exists"), validation order table→columns→name, DROP errors 42704/**42809** (new
+      code), DROP TABLE drops its indexes; duplicate key columns allowed; the optional
+      index name parses via a three-token lookahead (no reserved words). The planner
+      **index-bounds** a SELECT base-relation scan on a first-column equality (cost.md §3
+      "index-bounded scan": index overlap nodes + per-entry point lookups; lowest
+      lowercased name breaks ties; PK bound wins; provably-empty bounds read nothing);
+      CREATE INDEX charges its build scan. Persisted under **`format_version` 5** (the
+      catalog reshape: explicit pk ordinal list — which also lifted the composite-PK order
+      narrowing — + per-table index lists; flags bit0 retired); 20 goldens incl.
+      `index_table.jed`, rust==go==ts==ruby. Capability `ddl.secondary_index`; corpus
+      `ddl/create_index.test` + `query/index_scan.test` (81/0/0 ×3, oracle-checked, 8
+      ledgered `on`-keyword overrides); NoREC scenario 5 (`index`). **Narrowings
+      (relaxable, each a follow-on with its NoREC obligation):** equality-only on the
+      FIRST key column (no index ranges / multi-column prefixes), SELECT scans only
+      (UPDATE/DELETE keep PK pushdown), no LIMIT-streaming combination, no UNIQUE (next),
+      indexable types = key-encodable types (no text/decimal/bytea/boolean keys), no
+      expression/ordered/partial keys, no IF NOT EXISTS. _(was: L)_
 - [ ] **`RETURNING`** clause; **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE)_
 - [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
       `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).

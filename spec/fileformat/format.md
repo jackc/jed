@@ -15,16 +15,27 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 4)
+## Version scope (`format_version` 5)
 
-The current on-disk version is **`format_version` 4** — it adds **`CHECK` constraints to the
-catalog table entry** (a per-table list of `(name, expression-text)` pairs after the column
-entries — *Catalog* below; [../design/constraints.md](../design/constraints.md) §4). Each
-version is a **clean break** — older versions are **not read** (we are pre-1.0 and owe no
-on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only**
-version 4. The change is catalog-only: a table with no checks gains exactly two zero bytes
-(`check_count = 0`), and every data page is byte-unchanged; the goldens regenerate
-accordingly.
+The current on-disk version is **`format_version` 5** — the **secondary-index catalog
+reshape** ([../design/indexes.md](../design/indexes.md)). Each version is a **clean break** —
+older versions are **not read** (we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md
+§1, "we own our surface"), so a reader accepts **only** version 5. Three changes:
+
+1. The catalog table entry records the **primary key as an explicit ordinal list in key
+   order** (`pk_count` + ordinals — *Catalog* below). Column-flag **bit0 is retired**
+   (reserved, written 0): the list is the single authority, and an order independent of
+   declaration order is now expressible — which lifted the composite-PK order narrowing
+   ([../design/constraints.md](../design/constraints.md) §3).
+2. The catalog table entry gains the table's **index list** (name + key-column ordinals +
+   root page, in ascending lowercased-name order).
+3. Each index is an on-disk **B-tree of empty-payload records** — the same node pages,
+   split/merge rules, and commit model as a table tree; only the record's value-column
+   count (zero) differs (*The per-table data B-tree* below).
+
+`format_version` 4 added **`CHECK` constraints to the catalog table entry** (a per-table
+list of `(name, expression-text)` pairs after the column entries — *Catalog* below;
+[../design/constraints.md](../design/constraints.md) §4); a catalog-only change.
 
 `format_version` 3 was the **page-backed copy-on-write B-tree** format (Phase 6) plus
 **out-of-line overflow pages** and **transparent LZ4 compression** for large values (the
@@ -113,7 +124,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`4`** |
+| 4  | 2 | `format_version` (u16) — current = **`5`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -142,7 +153,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 4`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 5`,
 reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
 slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
 
@@ -174,8 +185,8 @@ the chain. Catalog entries are packed greedily (a single table entry must fit on
 ≤ `C`, else `0A000`; the `RECORD_MAX = C/2` cap is a B-tree-record rule and does **not** apply
 to catalog entries, which never split).
 
-Each **table entry** (v4 adds the check-constraint list between the columns and
-`root_data_page`; everything else is unchanged from v1):
+Each **table entry** (v5 adds the primary-key ordinal list after the columns and the index
+list after the checks, and retires column-flag bit0):
 
 | field | encoding |
 |---|---|
@@ -186,21 +197,33 @@ Each **table entry** (v4 adds the check-constraint list between the columns and
 | &nbsp;&nbsp;`col_name_len` | u16 |
 | &nbsp;&nbsp;`col_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`type_code` | u8 (stable, see below) |
-| &nbsp;&nbsp;`flags` | u8 — bit0 `primary_key`, bit1 `not_null`, bit2 `has_default` (reader trusts the bits) |
+| &nbsp;&nbsp;`flags` | u8 — bit0 reserved 0 (**was** `primary_key` through v4 — the `pk` list below is the authority), bit1 `not_null`, bit2 `has_default` (reader trusts the bits) |
 | &nbsp;&nbsp;`precision` | u16 — **only present when `type_code == 6` (decimal)**; `0` = unconstrained |
 | &nbsp;&nbsp;`scale` | u16 — **only present when `type_code == 6` (decimal)** |
 | &nbsp;&nbsp;`default` | value-codec bytes — **only present when `flags` bit2 (`has_default`)**; written *after* the typmod |
-| `check_count` | u16 — the table's `CHECK` constraints (**new in v4**; `0` for an unchecked table) |
+| `pk_count` | u16 — primary-key member count (**new in v5**; `0` = no PK, synthetic rowid keys) |
+| `pk_ordinal` ×`pk_count` | u16 each — column ordinals (0-based declaration position) in **key order**; each must be `< col_count` and distinct (else `XX001`) |
+| `check_count` | u16 — the table's `CHECK` constraints (v4; `0` for an unchecked table) |
 | per check (×`check_count`): | |
 | &nbsp;&nbsp;`check_name_len` | u16 |
 | &nbsp;&nbsp;`check_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`check_expr_len` | u16 |
 | &nbsp;&nbsp;`check_expr` | UTF-8 — the expression text (*Check-expression text* below) |
+| `index_count` | u16 — the table's secondary indexes (**new in v5**; `0` for an unindexed table) |
+| per index (×`index_count`): | |
+| &nbsp;&nbsp;`index_name_len` | u16 |
+| &nbsp;&nbsp;`index_name` | UTF-8 (original case) |
+| &nbsp;&nbsp;`key_col_count` | u16 — ≥ 1; per index key column: |
+| &nbsp;&nbsp;`key_ordinal` ×`key_col_count` | u16 each — column ordinals in **index-key order**; each must be `< col_count` (duplicates allowed — indexes.md §1; else `XX001`) |
+| &nbsp;&nbsp;`index_root_page` | u32 — the root B-tree node of this index, or 0 if the table has no rows |
 | `root_data_page` | u32 — the **root B-tree node** of this table, or 0 if it has no rows |
 
 Columns are emitted in declaration order. Checks are emitted in their **evaluation order** —
 ascending byte order of the lowercased `check_name` ([../design/constraints.md
-§4.4](../design/constraints.md)); a reader trusts that order (it never re-sorts).
+§4.4](../design/constraints.md)); a reader trusts that order (it never re-sorts). Indexes
+are emitted in **ascending byte order of the lowercased `index_name`** (the catalog's
+in-memory order and the planner's tie-break order — [../design/indexes.md
+§5/§6](../design/indexes.md)); a reader trusts that order too.
 
 ### Check-expression text
 
@@ -226,14 +249,11 @@ Example: `CHECK (a>0 AND b IS NOT NULL)` persists as `a > 0 AND b IS NOT NULL`; 
 (price * qty <= 10000.00)` persists as `price * qty <= 10000.00`.
 
 **Composite primary key.** A composite `PRIMARY KEY` ([../design/constraints.md
-§3](../design/constraints.md)) is persisted as `bit0` set on **each** member column — there is
-no separate key-descriptor field. The **key order is the flagged columns in declaration
-order**; this is sufficient because CREATE TABLE requires the constraint's list order to match
-declaration order (the documented `0A000` narrowing, constraints.md §3). A stored record's
-`key` is the concatenation of the members' encodings ([../design/encoding.md
-§2.3](../design/encoding.md)). Persisting an *independent* key order is deferred to the
-catalog reshape the secondary-index slice needs. Files written before this slice are
-unaffected (they have at most one `bit0` column).
+§3](../design/constraints.md)) is persisted as the `pk_count`/`pk_ordinal` list in **key
+order** (v5 — through v4 it was `bit0` on each member column, which encoded the member *set*
+but no independent order; the list is what lifted the `0A000` list-order narrowing). A stored
+record's `key` is the concatenation of the members' encodings in that order
+([../design/encoding.md §2.3](../design/encoding.md)).
 
 ### Stable type codes
 
@@ -293,6 +313,12 @@ order, taking each value's width from its type (fixed for integers / 8-byte time
 1-byte boolean / 16-byte uuid; self-describing for text/bytea via their `u16` length and for
 decimal via `ndigits`). The **on-disk size of a record** — `2 + key_len + Σ value_size` — is
 the quantity the split/merge rules below measure.
+
+**Index trees (v5).** A secondary index ([../design/indexes.md](../design/indexes.md)) is a
+B-tree of exactly this shape, rooted at the catalog's `index_root_page`, whose records have
+**zero value columns**: a record is `key_len ‖ key` (the entry key — indexes.md §3) with an
+empty payload, `record size = 2 + key_len`. Every node, split/merge, allocation, commit, and
+reclamation rule below applies to an index tree unchanged.
 
 **`RECORD_MAX`.** A single record's **stored** on-disk size must be ≤ `RECORD_MAX = (C-12)/2`
 (floor); this is **tighter than v1's ≤ `C`** rule and is what makes every node split clean (see
@@ -510,7 +536,8 @@ only its **dirty** pages, then publishing the new root. The §2 atomicity rests 
    cross-core identical:
    - For each table in **lowercased-name order**, the dirty nodes of its B-tree in
      **post-order** (a node's children before the node — so a parent's child pointers
-     reference already-allocated pages), left to right.
+     reference already-allocated pages), left to right; **then each of its index trees**
+     (v5), in the catalog's index order (lowercased-name ascending), post-order each.
    - Then the **catalog chain** (always rewritten fresh: it carries the possibly-moved
      `root_data_page` of every table), as consecutive pages.
 3. **`sync()`** — every body page is durable.
@@ -534,8 +561,8 @@ commit. The free-list is **reconstructed on open, not persisted** (the TODO's
 free-list head that lets open skip the walk is a later *open-speed* optimization):
 
 - **On open**, the free-list is `[2, page_count)` **minus the pages reachable from the
-  committed root** (the catalog chain plus every table B-tree node — both already walked while
-  loading). Those reachable pages are the only live ones; everything else in the file is dead
+  committed root** (the catalog chain plus every table **and index** B-tree node — all
+  already walked while loading). Those reachable pages are the only live ones; everything else in the file is dead
   space left by earlier commits and is free.
 - **During a session**, the allocator (step 1) draws dirty/catalog pages from the free-list
   (lowest index first) before extending the file. A page leaves the list **only** by being
@@ -561,7 +588,8 @@ recompute) and on-disk free-list persistence are the documented follow-ons.
 **From-scratch image (`to_image`).** A clean, garbage-free image of a snapshot — used by
 `create`'s initial write and by the **golden tests / Ruby reference** — is the special case
 where *every* node is dirty: allocate and write the whole tree (post-order per table, in
-name order) starting at page 2, then the catalog chain, then both meta slots at `txid = 1`.
+name order; each table's tree then its index trees in catalog order) starting at page 2,
+then the catalog chain, then both meta slots at `txid = 1`.
 This is what the fixtures pin. (An incrementally-committed file additionally contains leaked
 pages from intermediate commits; its round-trip correctness is verified by per-core tests, not
 by a static golden, because it depends on the commit history.)
@@ -597,7 +625,8 @@ the interior-node format and the split contract.
 | `timestamp_table.jed` | a timestamp column — the 8-byte int64 branch; epoch, pre-1970, BC-era, `±infinity`, NULL |
 | `timestamptz_table.jed` | a timestamptz column — the same 8-byte branch under type code 10 |
 | `nopk_table.jed` | a no-PK table — the stored synthetic `int64` rowid key |
-| `composite_pk_table.jed` | a **composite PRIMARY KEY** (`int32` ‖ `int16`) — the concatenated key encoding (encoding.md §2.3) + multiple `bit0` flag columns; negative first component and tie-breaking second |
+| `composite_pk_table.jed` | a **composite PRIMARY KEY** (`int32` ‖ `int16`) — the concatenated key encoding (encoding.md §2.3) + the v5 `pk_ordinal` list; negative first component and tie-breaking second |
+| `index_table.jed` | **secondary indexes** (v5) — a table whose PK list order differs from declaration order (`PRIMARY KEY (b, a)` — the lifted narrowing), one single-column index over a **nullable** column holding a NULL (the encoding.md §2.2 presence tag in stored index order, NULL last) and one auto-named two-column index; empty-payload index records |
 | `check_table.jed` | **`CHECK` constraints** (v4) — the catalog check list: an auto-named single-column check, an explicitly-named multi-column check, and a check whose text exercises the token rendering (string + decimal literals, `<=`); stored in name order |
 | `tall_tree.jed` | enough small int rows to force a **two-level interior** (height-2 tree) — exercises interior-of-interior child pointers and post-order page allocation |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
