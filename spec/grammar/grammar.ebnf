@@ -51,12 +51,14 @@ sql_statement  ::= create_table
 create_table   ::= "CREATE" "TABLE" identifier
                    "(" table_element ("," table_element)* ")"
 
-/* A table element is a column definition or a table-level constraint. The only
- * table constraint is the composite-capable PRIMARY KEY list; it may appear anywhere
- * among the column definitions (PostgreSQL's shape). An element starting with the two
- * keywords "PRIMARY" "KEY" parses as the table constraint — the constraint keywords are
- * not reserved (§3), but a column named "primary" cannot have a type named "key" (no such
- * type exists), so the disambiguation loses nothing (../design/grammar.md §13). */
+/* A table element is a column definition or a table-level constraint: the
+ * composite-capable PRIMARY KEY list, or an (optionally named) CHECK constraint. Either
+ * may appear anywhere among the column definitions (PostgreSQL's shape). An element
+ * starting with the two keywords "PRIMARY" "KEY", with "CHECK" "(", or with "CONSTRAINT"
+ * parses as a table constraint — the constraint keywords are not reserved (§3), but a
+ * column named "primary" cannot have a type named "key" (no such type exists) and a
+ * column named "check"/"constraint" is followed by a type name, never "(" — so the
+ * disambiguation loses nothing (../design/grammar.md §13/§29). */
 table_element  ::= column_def | table_constraint
 
 /* "PRIMARY KEY (a, b, ...)" declares the table's key over one or more named columns; the
@@ -65,8 +67,19 @@ table_element  ::= column_def | table_constraint
  * implicitly NOT NULL and must be of a key-encodable type (the column-level rule). The
  * key bytes are the concatenation of the members' encodings (../design/encoding.md §2.3).
  * Narrowing: the list order must match the table's column-declaration order this slice
- * (else 0A000 — ../design/constraints.md §3, relaxable). */
+ * (else 0A000 — ../design/constraints.md §3, relaxable).
+ *
+ * "CHECK ( expr )" declares a row predicate over this table's columns, optionally named
+ * via the "CONSTRAINT name" prefix (auto-named otherwise — ../design/constraints.md §4).
+ * The expression is a general boolean expression (42804 otherwise) over the table's
+ * columns; a subquery (0A000), an aggregate (42803), and a bind parameter (42P02) are
+ * rejected at CREATE TABLE. The table-level and column-level CHECK forms are
+ * semantically IDENTICAL — a column-level CHECK may reference any column (PostgreSQL's
+ * model); the position only feeds the textual definition order. The "CONSTRAINT name"
+ * prefix is accepted only before CHECK this slice (a jed narrowing; PG allows it before
+ * any constraint). */
 table_constraint ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
+                 | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
 
 /* A column definition is a name, a type, and zero or more column constraints. The
  * constraints are order-free (the parsers accept them in any order, deduplicating —
@@ -74,13 +87,16 @@ table_constraint ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
  * column the table's single-column key and implies NOT NULL. "NOT NULL" forbids a NULL
  * value in the column: storing one — directly, or via an applied/omitted default — traps
  * 23502 (../design/constraints.md). "DEFAULT" gives the column the literal as its
- * default, evaluated + coerced once at CREATE TABLE (../design/constraints.md §2). The
- * constraint keywords are NOT reserved (§3). */
+ * default, evaluated + coerced once at CREATE TABLE (../design/constraints.md §2).
+ * "CHECK" declares a row predicate, identical in semantics to the table-level form
+ * (../design/constraints.md §4) — its position only feeds the textual definition order.
+ * The constraint keywords are NOT reserved (§3). */
 column_def     ::= identifier type_name column_constraint*
 
 column_constraint ::= "PRIMARY" "KEY"
                  | "NOT" "NULL"
                  | "DEFAULT" literal
+                 | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
 
 /* DROP TABLE removes a table — its definition and all its rows — from the
  * catalog. The surface is deliberately minimal (../design/grammar.md §13): ONE

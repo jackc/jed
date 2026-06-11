@@ -23,7 +23,14 @@ import type {
   TypeMod,
   Update,
 } from "./ast.ts";
-import { type Column, type Table, columnIndex, pkIndices, primaryKeyIndex } from "./catalog.ts";
+import {
+  type CheckConstraint,
+  type Column,
+  type Table,
+  columnIndex,
+  pkIndices,
+  primaryKeyIndex,
+} from "./catalog.ts";
 import { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import { Decimal, MAX_PRECISION, MAX_SCALE, workDiv, workLinear, workMod, workMul } from "./decimal.ts";
@@ -539,9 +546,75 @@ export class Database {
       }
     }
 
-    this.putTable({ name: ct.name, columns });
+    // CHECK constraints (constraints.md §4). All validation runs first, in textual
+    // definition order, AFTER the PRIMARY KEY constraints resolved (PG's order,
+    // oracle-probed); naming follows in a second pass, so a 42703 in a later check fires
+    // before a 42710 between earlier ones. Resolution needs a catalog Table, so build it
+    // now (checks attach below, before putTable).
+    const table: Table = { name: ct.name, columns, checks: [] };
+    for (const def of ct.checks) {
+      // Structural rejections first (a single pre-walk — a documented micro-order
+      // divergence from PG, which interleaves them with name/type resolution): subquery
+      // 0A000, aggregate 42803, bind parameter 42P02 (constraints.md §4.1).
+      rejectCheckStructure(def.expr);
+      const scope = Scope.single(this, table);
+      const { type } = resolve(scope, def.expr, null, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes());
+      if (type.kind !== "bool" && type.kind !== "null") {
+        throw typeError("argument of CHECK must be boolean");
+      }
+    }
+    // Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
+    // used as written; a derived name is built from the LOWERCASED table/column names —
+    // `<table>_<col>_check` when the expression references exactly one distinct column,
+    // else `<table>_check` — suffixed with the smallest positive integer that frees it. A
+    // collision (case-insensitive, PG folds) is 42710; derived names never yield to a
+    // later explicit one (oracle-probed).
+    const checks: CheckConstraint[] = [];
+    const nameTaken = (name: string): boolean =>
+      checks.some((c) => c.name.toLowerCase() === name.toLowerCase());
+    for (const def of ct.checks) {
+      let name: string;
+      if (def.name !== null) {
+        if (nameTaken(def.name)) {
+          throw engineError("duplicate_object", "check constraint " + def.name + " already exists");
+        }
+        name = def.name;
+      } else {
+        const cols = checkReferencedColumns(def.expr, columns);
+        const base =
+          cols.length === 1
+            ? table.name.toLowerCase() + "_" + columns[cols[0]!]!.name.toLowerCase() + "_check"
+            : table.name.toLowerCase() + "_check";
+        name = base;
+        for (let suffix = 1; nameTaken(name); suffix++) name = base + suffix.toString();
+      }
+      checks.push({ name, exprText: def.text, expr: def.expr });
+    }
+    // Evaluation (and on-disk) order: ascending byte order of the lowercased name
+    // (constraints.md §4.4 — PG evaluates checks sorted by name, oracle-probed).
+    checks.sort((a, b) => {
+      const an = a.name.toLowerCase();
+      const bn = b.name.toLowerCase();
+      return an < bn ? -1 : an > bn ? 1 : 0;
+    });
+    table.checks = checks;
+
+    this.putTable(table);
     // DDL touches no rows and evaluates no expressions: zero cost.
     return { kind: "statement", cost: 0n };
+  }
+
+  // resolveChecks resolves a table's CHECK constraints for a write statement: each stored
+  // expression against a one-relation scope, in the catalog's (evaluation/name) order.
+  // Cannot fail for a catalog produced by CREATE TABLE or a well-formed file (both
+  // validated); a hand-corrupted expression surfaces its natural resolve error.
+  private resolveChecks(table: Table): NamedCheck[] {
+    if (table.checks.length === 0) return [];
+    const scope = Scope.single(this, table);
+    return table.checks.map((c) => ({
+      name: c.name,
+      node: resolve(scope, c.expr, null, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes()).node,
+    }));
   }
 
   // executeDropTable removes the table's definition and its row store from the catalog
@@ -577,6 +650,9 @@ export class Database {
     // The key members in key order — one for a single-column PK, several for a composite
     // (constraints.md §3), empty for a no-PK (rowid) table.
     const pk = pkIndices(table);
+    // The CHECK constraints, resolved once per statement in evaluation (name) order;
+    // insertRows evaluates them per candidate row (constraints.md §4.4).
+    const checks = this.resolveChecks(table);
 
     // Resolve the optional column list once. provided[i] >= 0 means table column i takes that
     // value position in each row; -1 means column i is omitted (its default, else NULL). With no
@@ -642,7 +718,7 @@ export class Database {
       // one ceiling over the whole statement.
       const meter = new Meter(this.maxCost);
       meter.charge(q.cost);
-      this.insertRows(table, store, pk, provided, q.rows, meter);
+      this.insertRows(table, store, pk, checks, provided, q.rows, meter);
       return { kind: "statement", cost: meter.accrued };
     }
 
@@ -692,7 +768,7 @@ export class Database {
     // metered work is the disposition plan's compression attempts for over-RECORD_MAX rows
     // (value_compress, cost.md §3); a fully-inline row still costs zero.
     const meter = new Meter(this.maxCost);
-    this.insertRows(table, store, pk, provided, rows, meter);
+    this.insertRows(table, store, pk, checks, provided, rows, meter);
     return { kind: "statement", cost: meter.accrued };
   }
 
@@ -708,6 +784,7 @@ export class Database {
     table: Table,
     store: TableStore,
     pk: number[],
+    checks: NamedCheck[],
     provided: number[],
     rows: Value[][],
     meter: Meter,
@@ -723,6 +800,21 @@ export class Database {
         const p = provided[i]!;
         const candidate: Value = p >= 0 ? values[p]! : (col.default ?? nullValue());
         row[i] = storeValue(candidate, col.type, col.decimal, col.notNull, col.name);
+      }
+
+      // CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
+      // NULL (storeValue above), before the key/duplicate check (PG's per-row order,
+      // constraints.md §4.4). TRUE and NULL pass; the first FALSE aborts the whole
+      // statement (two-phase — nothing has been written). Evaluation is metered
+      // expression work (operator_eval), so guard the ceiling per checked row.
+      if (checks.length > 0) {
+        meter.guard();
+        const env: EvalEnv = {
+          params: [],
+          outer: [],
+          runSubquery: (p, o) => this.execQueryPlan(p, o, []),
+        };
+        evalChecks(checks, table.name, row, env, meter);
       }
 
       let key: Uint8Array | null = null;
@@ -887,6 +979,9 @@ export class Database {
     }
 
     let filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
+    // The CHECK constraints, resolved once per statement in evaluation (name) order;
+    // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
+    const checks = this.resolveChecks(table);
     // All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
     const bound = bindParams(params, ptypes.finalize());
 
@@ -931,7 +1026,14 @@ export class Database {
       // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
       // columns so its weight/disposition re-plan exactly as an eager writer's would —
       // unmetered, part of the rewrite like commit work (large-values.md §14).
-      updates.push({ key: e.key, row: store.resolveAll(newRow) });
+      const resident = store.resolveAll(newRow);
+      // CHECK constraints, in name order, on the post-assignment row — after the
+      // assignments coerced (22003/23502 in checkAssign above), on the fully-resident row
+      // (constraints.md §4.4). Every check evaluates (not only those mentioning assigned
+      // columns); TRUE and NULL pass, the first FALSE aborts the statement (phase 1 —
+      // nothing has been written).
+      evalChecks(checks, table.name, resident, env, meter);
+      updates.push({ key: e.key, row: resident });
     }
 
     // Each rewritten row's disposition plan may attempt compression (a record over RECORD_MAX)
@@ -2409,6 +2511,130 @@ function exprHasAggregate(e: Expr): boolean {
     default:
       return false;
   }
+}
+
+// NamedCheck is one statement-resolved CHECK constraint: its name (for the 23514 message)
+// and the resolved expression evaluated per candidate row.
+type NamedCheck = { name: string; node: RExpr };
+
+// evalChecks evaluates a row's CHECK constraints in name order (constraints.md §4.4):
+// TRUE and NULL pass; the first FALSE aborts with 23514 and PG's message. Shared by the
+// INSERT and UPDATE write paths.
+function evalChecks(checks: NamedCheck[], relation: string, row: Row, env: EvalEnv, meter: Meter): void {
+  for (const c of checks) {
+    const v = evalExpr(c.node, row, env, meter);
+    if (v.kind === "bool" && !v.value) {
+      throw engineError(
+        "check_violation",
+        "new row for relation " + relation + " violates check constraint " + c.name,
+      );
+    }
+  }
+}
+
+// rejectCheckStructure applies the structural CHECK-expression rejections
+// (spec/design/constraints.md §4.1) in a single depth-first pre-order walk before
+// resolution: a subquery is 0A000, an aggregate call 42803, a bind parameter 42P02 — PG's
+// codes and messages (oracle-probed; PG interleaves these with resolution in parse order,
+// a documented micro-order divergence).
+function rejectCheckStructure(e: Expr): void {
+  switch (e.kind) {
+    case "scalarSubquery":
+    case "exists":
+    case "inSubquery":
+      throw engineError("feature_not_supported", "cannot use subquery in check constraint");
+    case "param":
+      throw engineError("undefined_parameter", "there is no parameter $" + e.index.toString());
+    case "funcCall":
+      if (isAggregateName(e.name)) {
+        throw engineError("grouping_error", "aggregate functions are not allowed in check constraints");
+      }
+      for (const a of e.args) rejectCheckStructure(a);
+      return;
+    case "cast":
+      return rejectCheckStructure(e.inner);
+    case "unary":
+    case "isNull":
+      return rejectCheckStructure(e.operand);
+    case "binary":
+    case "isDistinct":
+    case "like":
+      rejectCheckStructure(e.lhs);
+      return rejectCheckStructure(e.rhs);
+    case "in":
+      rejectCheckStructure(e.lhs);
+      for (const elem of e.list) rejectCheckStructure(elem);
+      return;
+    case "between":
+      rejectCheckStructure(e.lhs);
+      rejectCheckStructure(e.lo);
+      return rejectCheckStructure(e.hi);
+    case "case":
+      if (e.operand !== null) rejectCheckStructure(e.operand);
+      for (const w of e.whens) {
+        rejectCheckStructure(w.cond);
+        rejectCheckStructure(w.result);
+      }
+      if (e.els !== null) rejectCheckStructure(e.els);
+      return;
+    default: // column, qualifiedColumn, literal
+      return;
+  }
+}
+
+// checkReferencedColumns returns the distinct columns a CHECK expression references, as
+// indices into columns — the input to PG's auto-naming rule (constraints.md §4.3: exactly
+// one distinct column → <table>_<col>_check). Resolution already validated every
+// reference, so an unknown name is simply skipped; a qualified reference counts its column
+// like a bare one (oracle-probed).
+function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
+  const out: number[] = [];
+  const note = (name: string): void => {
+    const lower = name.toLowerCase();
+    const i = columns.findIndex((c) => c.name.toLowerCase() === lower);
+    if (i >= 0 && !out.includes(i)) out.push(i);
+  };
+  const walk = (e: Expr): void => {
+    switch (e.kind) {
+      case "column":
+      case "qualifiedColumn":
+        note(e.name);
+        return;
+      case "cast":
+        return walk(e.inner);
+      case "unary":
+      case "isNull":
+        return walk(e.operand);
+      case "binary":
+      case "isDistinct":
+      case "like":
+        walk(e.lhs);
+        return walk(e.rhs);
+      case "in":
+        walk(e.lhs);
+        for (const elem of e.list) walk(elem);
+        return;
+      case "between":
+        walk(e.lhs);
+        walk(e.lo);
+        return walk(e.hi);
+      case "case":
+        if (e.operand !== null) walk(e.operand);
+        for (const w of e.whens) {
+          walk(w.cond);
+          walk(w.result);
+        }
+        if (e.els !== null) walk(e.els);
+        return;
+      case "funcCall":
+        for (const a of e.args) walk(a);
+        return;
+      default: // literal, param; subqueries unreachable in a validated check
+        return;
+    }
+  };
+  walk(e);
+  return out;
 }
 
 // resolveAggregate resolves an aggregate call into a synthetic-row reference, collecting its

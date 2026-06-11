@@ -5,9 +5,9 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert, InsertSource,
-    InsertValue, JoinClause, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItem,
-    SelectItems, SetOp, SetOpKind, Statement, TableRef, TypeMod, UnaryOp, Update,
+    Assignment, BinaryOp, CheckDef, ColumnDef, CreateTable, Delete, DropTable, Expr, Insert,
+    InsertSource, InsertValue, JoinClause, JoinKind, Literal, OrderKey, QueryExpr, Select,
+    SelectItem, SelectItems, SetOp, SetOpKind, Statement, TableRef, TypeMod, UnaryOp, Update,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -136,6 +136,7 @@ impl Parser {
 
         let mut columns = Vec::new();
         let mut table_pks = Vec::new();
+        let mut checks = Vec::new();
         loop {
             if self.peek_keyword().as_deref() == Some("primary")
                 && self.peek_keyword_at(1).as_deref() == Some("key")
@@ -143,8 +144,10 @@ impl Parser {
                 self.advance();
                 self.advance();
                 table_pks.push(self.parse_pk_column_list()?);
+            } else if self.at_check_constraint() {
+                checks.push(self.parse_check_constraint()?);
             } else {
-                columns.push(self.parse_column_def()?);
+                columns.push(self.parse_column_def(&mut checks)?);
             }
             match self.advance() {
                 Token::Comma => continue,
@@ -159,7 +162,39 @@ impl Parser {
             name,
             columns,
             table_pks,
+            checks,
         })
+    }
+
+    /// Whether the cursor sits on a `CHECK` constraint: the keyword `CHECK` followed by `(`,
+    /// or `CONSTRAINT <ident> CHECK (` (spec/design/grammar.md §29). The keywords stay
+    /// non-reserved — a column named `check`/`constraint` is followed by a type name (an
+    /// identifier, never `(`), so the lookahead loses nothing.
+    fn at_check_constraint(&self) -> bool {
+        (self.peek_keyword().as_deref() == Some("check")
+            && matches!(self.peek_at(1), Token::LParen))
+            || (self.peek_keyword().as_deref() == Some("constraint")
+                && self.peek_keyword_at(2).as_deref() == Some("check")
+                && matches!(self.peek_at(3), Token::LParen))
+    }
+
+    /// Parse one `[CONSTRAINT name] CHECK ( expr )` (the cursor is verified by
+    /// `at_check_constraint`). The token span between the parentheses is re-rendered as the
+    /// constraint's persisted text (spec/fileformat/format.md "Check-expression text").
+    fn parse_check_constraint(&mut self) -> Result<CheckDef> {
+        let name = if self.peek_keyword().as_deref() == Some("constraint") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+        self.expect_keyword("check")?;
+        self.expect(&Token::LParen)?;
+        let start = self.pos;
+        let expr = self.parse_expr()?;
+        let text = render_tokens(&self.tokens[start..self.pos]);
+        self.expect(&Token::RParen)?;
+        Ok(CheckDef { name, expr, text })
     }
 
     /// The parenthesized member list of a table-level `PRIMARY KEY` constraint:
@@ -178,17 +213,24 @@ impl Parser {
         Ok(cols)
     }
 
-    fn parse_column_def(&mut self) -> Result<ColumnDef> {
+    fn parse_column_def(&mut self, checks: &mut Vec<CheckDef>) -> Result<ColumnDef> {
         let name = self.expect_identifier()?;
         let type_name = self.expect_identifier()?;
         let type_mod = self.parse_type_mod()?;
-        // Zero or more order-free column constraints: `PRIMARY KEY`, `NOT NULL`, and
-        // `DEFAULT <literal>`. A boolean constraint may be repeated harmlessly; a repeated
-        // `DEFAULT` just keeps the last (the catalog stores one default).
+        // Zero or more order-free column constraints: `PRIMARY KEY`, `NOT NULL`,
+        // `DEFAULT <literal>`, and `[CONSTRAINT name] CHECK ( expr )`. A boolean constraint
+        // may be repeated harmlessly; a repeated `DEFAULT` just keeps the last (the catalog
+        // stores one default); each `CHECK` is a distinct constraint, collected into the
+        // statement-wide list in textual order (a column-level check is semantically
+        // identical to a table-level one — spec/design/constraints.md §4).
         let mut primary_key = false;
         let mut not_null = false;
         let mut default = None;
         loop {
+            if self.at_check_constraint() {
+                checks.push(self.parse_check_constraint()?);
+                continue;
+            }
             match self.peek_keyword().as_deref() {
                 Some("primary") => {
                     self.advance();
@@ -1294,6 +1336,12 @@ impl Parser {
         &self.tokens[self.pos]
     }
 
+    /// The token `offset` positions ahead of the cursor (`Eof` past the end). Used with
+    /// `peek_keyword_at` for the CHECK-constraint lookahead (spec/design/grammar.md §29).
+    pub fn peek_at(&self, offset: usize) -> &Token {
+        self.tokens.get(self.pos + offset).unwrap_or(&Token::Eof)
+    }
+
     /// The current token lowercased if it is a word, else None.
     pub fn peek_keyword(&self) -> Option<String> {
         match self.peek() {
@@ -1354,6 +1402,59 @@ impl Parser {
             Token::Eof => Ok(()),
             other => Err(syntax(format!("unexpected trailing input: {other:?}"))),
         }
+    }
+}
+
+/// Parse a bare expression — the catalog-load path for a persisted CHECK expression
+/// (spec/design/constraints.md §4.5). The text was written by `render_tokens`, so it
+/// re-lexes to a value-identical token sequence; the caller maps a failure to XX001
+/// (the file claimed to be well-formed).
+pub fn parse_expression(text: &str) -> Result<Expr> {
+    let tokens = lex(text)?;
+    let mut p = Parser::new(tokens);
+    let expr = p.parse_expr()?;
+    p.expect_eof()?;
+    Ok(expr)
+}
+
+/// Re-render a token slice as the persisted check-expression text: each token rendered by
+/// the closed table in spec/fileformat/format.md "Check-expression text", joined with
+/// single spaces. A byte contract — identical across every core (CLAUDE.md §8).
+pub fn render_tokens(tokens: &[Token]) -> String {
+    let parts: Vec<String> = tokens.iter().map(render_token).collect();
+    parts.join(" ")
+}
+
+fn render_token(t: &Token) -> String {
+    match t {
+        Token::Word(w) => w.clone(),
+        Token::Int(m) => m.to_string(),
+        // The digit string with `.` inserted `scale` digits from the right. The lexer
+        // guarantees scale <= coeff.len() (every fractional digit is in the coefficient),
+        // so the insertion point is in range; scale == len renders a leading-dot form
+        // (".5") and scale == 0 a trailing-dot form ("1."), both of which re-lex as the
+        // same decimal value (spec/fileformat/format.md "Check-expression text").
+        Token::Decimal(coeff, scale) => {
+            let split = coeff.len() - *scale as usize;
+            format!("{}.{}", &coeff[..split], &coeff[split..])
+        }
+        Token::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        Token::Param(n) => format!("${n}"),
+        Token::Comma => ",".into(),
+        Token::Dot => ".".into(),
+        Token::LParen => "(".into(),
+        Token::RParen => ")".into(),
+        Token::Star => "*".into(),
+        Token::Plus => "+".into(),
+        Token::Minus => "-".into(),
+        Token::Slash => "/".into(),
+        Token::Percent => "%".into(),
+        Token::Eq => "=".into(),
+        Token::Lt => "<".into(),
+        Token::Gt => ">".into(),
+        Token::Le => "<=".into(),
+        Token::Ge => ">=".into(),
+        Token::Eof => String::new(),
     }
 }
 

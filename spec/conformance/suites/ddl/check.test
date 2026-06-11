@@ -1,0 +1,204 @@
+# CHECK constraints — column-level and table-level [CONSTRAINT name] CHECK (expr): boolean
+# row predicates enforced per candidate row at INSERT/UPDATE (23514; TRUE and NULL pass),
+# evaluated in name order, inside the two-phase / all-or-nothing pass. PG-matched DDL
+# rejections: non-boolean 42804, subquery 0A000, aggregate 42803, bind parameter 42P02,
+# unknown column 42703, unknown qualifier 42P01, duplicate name 42710. Check evaluation is
+# metered expression work (operator_eval per interior node per row) — the documented
+# exception to "VALUES inserts cost zero". spec/design/constraints.md §4, grammar.md §29.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.update, query.select, query.order_by, query.aggregates, types.int32, types.text, types.boolean_storable, types.decimal, expr.case, expr.between, expr.like, expr.in_list, resource.cost_metering
+
+statement ok
+CREATE TABLE t (a int CHECK (a > 0), b int, CHECK (b > a))
+
+# a row that satisfies both checks stores; check evaluation is metered: 2 checks × 1
+# interior node (>) each × 1 row = 2
+# cost: 2
+statement ok
+INSERT INTO t VALUES (1, 5)
+
+# FALSE violates — the column-level check (auto-named t_a_check)
+statement error 23514
+INSERT INTO t VALUES (-1, 5)
+
+# FALSE violates — the table-level check (auto-named t_check)
+statement error 23514
+INSERT INTO t VALUES (5, 1)
+
+# NULL passes (UNKNOWN is not FALSE): both checks evaluate to UNKNOWN
+statement ok
+INSERT INTO t VALUES (NULL, NULL)
+
+# multi-row two-phase: the second row violates, so the WHOLE statement stores nothing
+statement error 23514
+INSERT INTO t VALUES (2, 9), (-2, 9)
+
+query I nosort
+SELECT count(*) FROM t
+----
+2
+
+# NOT NULL fires before CHECK on the same row (PG's per-row order)
+statement ok
+CREATE TABLE tn (a int NOT NULL CHECK (a > 0))
+
+statement error 23502
+INSERT INTO tn VALUES (NULL)
+
+# CHECK fires before the duplicate-key check (PG's per-row order)
+statement ok
+CREATE TABLE tu (k int PRIMARY KEY, v int CHECK (v > 0))
+
+statement ok
+INSERT INTO tu VALUES (1, 5)
+
+statement error 23514
+INSERT INTO tu VALUES (1, -1)
+
+# INSERT ... SELECT flows through the same per-row checks (two-phase: nothing stored)
+statement ok
+CREATE TABLE src (v int)
+
+statement ok
+INSERT INTO src VALUES (3), (-3)
+
+statement error 23514
+INSERT INTO tu (k, v) SELECT v, v FROM src
+
+# a check-violating DEFAULT is accepted at CREATE TABLE and traps only when applied
+statement ok
+CREATE TABLE t7 (a int DEFAULT -5 CHECK (a > 0), b int)
+
+statement error 23514
+INSERT INTO t7 VALUES (DEFAULT, 1)
+
+statement error 23514
+INSERT INTO t7 (b) VALUES (1)
+
+statement ok
+INSERT INTO t7 VALUES (2, 1)
+
+# UPDATE evaluates every check on each post-assignment row, two-phase: the second row's
+# new value violates, so NO row changes
+statement ok
+CREATE TABLE u (k int PRIMARY KEY, v int CHECK (v > 0))
+
+statement ok
+INSERT INTO u VALUES (1, 2), (2, 1)
+
+statement error 23514
+UPDATE u SET v = v - 1
+
+query II nosort
+SELECT k, v FROM u ORDER BY k
+----
+1
+2
+2
+1
+
+# a passing UPDATE applies; cost = page_read(1) + 2×storage_row_read + 2×(v + 1) +
+# 2×(v > 0 check) = 7
+# cost: 7
+statement ok
+UPDATE u SET v = v + 1
+
+# a runtime error inside a check propagates as itself
+statement ok
+CREATE TABLE dz (a int CHECK (10 / a > 0))
+
+statement error 22012
+INSERT INTO dz VALUES (0)
+
+# the full expression surface works inside a check: CASE/BETWEEN, a bare boolean column,
+# LIKE/IN over text, a named decimal-range constraint
+statement ok
+CREATE TABLE e (n int, flag boolean, note text, price numeric(8,2), CHECK (CASE WHEN n IS NULL THEN TRUE ELSE n BETWEEN 0 AND 100 END), CHECK (flag), CHECK (note LIKE 'ok%' OR note IN ('a', 'b')), CONSTRAINT price_pos CHECK (price >= 0.50))
+
+statement ok
+INSERT INTO e VALUES (50, TRUE, 'ok then', 1.00), (NULL, TRUE, 'a', 0.50)
+
+statement error 23514
+INSERT INTO e VALUES (101, TRUE, 'a', 1.00)
+
+statement error 23514
+INSERT INTO e VALUES (1, FALSE, 'a', 1.00)
+
+statement error 23514
+INSERT INTO e VALUES (1, TRUE, 'c', 1.00)
+
+statement error 23514
+INSERT INTO e VALUES (1, TRUE, 'a', 0.49)
+
+query ITD nosort
+SELECT n, note, price FROM e ORDER BY note
+----
+NULL
+a
+0.50
+50
+ok then
+1.00
+
+# a check may reference a column defined later in the statement, and may qualify a
+# reference by the table's own name
+statement ok
+CREATE TABLE fwd (CHECK (fwd.b > 0), b int)
+
+statement ok
+INSERT INTO fwd VALUES (1)
+
+statement error 23514
+INSERT INTO fwd VALUES (0)
+
+# --- DDL-time rejections (codes match PostgreSQL, oracle-checked) -------------
+
+# e1: the expression must be boolean
+statement error 42804
+CREATE TABLE e1 (a int CHECK (a + 1))
+
+# e2: a subquery is rejected (structurally — the inner table need not exist)
+statement error 0A000
+CREATE TABLE e2 (a int CHECK (a > (SELECT v FROM nowhere)))
+
+# e3: an aggregate is rejected
+statement error 42803
+CREATE TABLE e3 (a int CHECK (sum(a) > 0))
+
+# e4: a bind parameter is rejected
+statement error 42P02
+CREATE TABLE e4 (a int CHECK (a > $1))
+
+# e5: an unknown column
+statement error 42703
+CREATE TABLE e5 (a int CHECK (nope > 0))
+
+# e6: a qualifier other than the table's name
+statement error 42P01
+CREATE TABLE e6 (a int CHECK (other.a > 0))
+
+# e7: a duplicate explicit constraint name
+statement error 42710
+CREATE TABLE e7 (a int CONSTRAINT cc CHECK (a > 0) CONSTRAINT cc CHECK (a < 5))
+
+# e8: an explicit name colliding with an earlier auto-derived name (e8_a_check)
+statement error 42710
+CREATE TABLE e8 (a int CHECK (a > 0), CONSTRAINT e8_a_check CHECK (a < 5))
+
+# e9: PRIMARY KEY constraints resolve before any check expression (PG's order)
+statement error 42703
+CREATE TABLE e9 (a int CHECK (nope > 0), PRIMARY KEY (alsonope))
+
+# e10: an empty CHECK () is a syntax error
+statement error 42601
+CREATE TABLE e10 (a int, CHECK ())
+
+# columns may be NAMED check / constraint — jed keeps the constraint keywords non-reserved
+# (a documented divergence: they are reserved words in PostgreSQL, so these are ledgered
+# overrides — and they sit LAST because PG's failure would poison the oracle's replayed
+# statement prefix for everything after them)
+statement ok
+CREATE TABLE odd (check int, constraint int16)
+
+statement ok
+INSERT INTO odd VALUES (1, 2)

@@ -41,6 +41,23 @@ pub struct CreateTable {
     /// sees; CREATE TABLE's execution resolves them (42703/42701) and rejects more than one
     /// primary key across both forms (42P16) — spec/design/constraints.md §3.
     pub table_pks: Vec<Vec<String>>,
+    /// Every `[CONSTRAINT name] CHECK ( expr )` of the statement — column-level and
+    /// table-level forms are semantically identical, so both collect here, in **textual
+    /// definition order** (it drives validation and naming — spec/design/constraints.md §4).
+    /// CREATE TABLE's execution validates each (0A000/42803/42P02/42703/42804) and names
+    /// the unnamed ones (42710 on a collision).
+    pub checks: Vec<CheckDef>,
+}
+
+/// One parsed `CHECK` constraint (spec/design/grammar.md §29): the optional explicit
+/// `CONSTRAINT` name, the expression, and the expression's persisted text — the source
+/// token sequence between the parentheses re-rendered per the closed table in
+/// spec/fileformat/format.md "Check-expression text".
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CheckDef {
+    pub name: Option<String>,
+    pub expr: Expr,
+    pub text: String,
 }
 
 /// `DROP TABLE <name>`. Removes a table — its definition and all its rows — from the

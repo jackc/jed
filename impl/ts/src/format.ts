@@ -10,7 +10,9 @@
 // TextEncoder/TextDecoder (name_len is the UTF-8 byte length, not String#length);
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
-import { type Column, type Table, pkIndices } from "./catalog.ts";
+import type { Expr } from "./ast.ts";
+import { type CheckConstraint, type Column, type Table, pkIndices } from "./catalog.ts";
+import { parseExpression } from "./parser.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
@@ -45,7 +47,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 3; // on-disk format version (3 = + overflow pages, large-values.md §12)
+const FORMAT_VERSION = 4; // on-disk format version (4 = + catalog CHECK constraints, constraints.md §4.5)
 const PAGE_HEADER = 12; // bytes of the catalog/B-tree page header
 const PAGE_CATALOG = 1; // page_type for a catalog page
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
@@ -555,6 +557,19 @@ function tableEntryBytes(table: Table, rootDataPage: number): Uint8Array {
     if (col.default !== null) {
       w.bytes(encodeValue(col.type, col.default));
     }
+  }
+  // CHECK constraints (v4): count, then (name, expression text) per check, in the
+  // catalog's evaluation order — the text is written back VERBATIM, so the bytes are
+  // stable across create → commit → load → commit (spec/fileformat/format.md
+  // "Check-expression text").
+  w.u16(table.checks.length);
+  for (const check of table.checks) {
+    const cn = UTF8.encode(check.name);
+    w.u16(cn.length);
+    w.bytes(cn);
+    const ce = UTF8.encode(check.exprText);
+    w.u16(ce.length);
+    w.bytes(ce);
   }
   w.u32(rootDataPage);
   return w.toBytes();
@@ -1367,8 +1382,27 @@ function decodeTableEntry(buf: Uint8Array, cur: Cursor): { table: Table; root: n
       default: colDefault,
     });
   }
+  // CHECK constraints (v4): the stored expression text re-parses with the ordinary
+  // expression parser — it was written by the token renderer, so this cannot fail for a
+  // file the engine wrote; failure means the file lied (XX001, constraints.md §4.5).
+  const checkCount = readU16(buf, cur);
+  const checks: CheckConstraint[] = [];
+  for (let i = 0; i < checkCount; i++) {
+    const checkName = readString(buf, cur);
+    const exprText = readString(buf, cur);
+    let expr: Expr;
+    try {
+      expr = parseExpression(exprText);
+    } catch (e) {
+      throw engineError(
+        "data_corrupted",
+        "stored check constraint does not parse: " + (e instanceof Error ? e.message : String(e)),
+      );
+    }
+    checks.push({ name: checkName, exprText, expr });
+  }
   const root = readU32(buf, cur);
-  return { table: { name, columns }, root };
+  return { table: { name, columns, checks }, root };
 }
 
 // readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL

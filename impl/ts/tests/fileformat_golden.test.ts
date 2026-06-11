@@ -68,6 +68,21 @@ function compositePKTableDB(): Database {
   return db;
 }
 
+// checkTableDB has CHECK constraints (constraints.md §4) — exercises the v4 catalog check
+// list: an auto-named single-column check, an explicitly-named multi-column check, and a
+// check whose persisted text exercises the token rendering (string literal with a doubled
+// quote, decimal literals, >=/<=), stored in name order
+// (price_range < t_b_check < t_note_check).
+function checkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (a int PRIMARY KEY, b int CHECK (b > 0), price numeric(8,2), " +
+    "CONSTRAINT price_range CHECK (price >= 0.50 AND price <= 9999.99), note text, " +
+    "CHECK (note = 'ok' OR note = 'a''b'))");
+  run(db, "INSERT INTO t VALUES (1, 5, 1.00, 'ok'), (2, NULL, 9999.99, 'a''b'), " +
+    "(3, 100, 0.50, 'ok')");
+  return db;
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 function nopkTableDB(): Database {
   const db = goldenDb();
@@ -259,6 +274,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "timestamptz_table.jed", build: timestamptzTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
     { name: "composite_pk_table.jed", build: compositePKTableDB },
+    { name: "check_table.jed", build: checkTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
   ];
   for (const c of cases) {
@@ -289,6 +305,7 @@ test("read goldens reproduces rows", () => {
     { name: "timestamptz_table.jed", build: timestamptzTableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "composite_pk_table.jed", build: compositePKTableDB, table: "t" },
+    { name: "check_table.jed", build: checkTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },

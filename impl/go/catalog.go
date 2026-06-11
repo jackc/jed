@@ -23,6 +23,20 @@ type Column struct {
 type Table struct {
 	Name    string
 	Columns []Column
+	// Checks is the table's CHECK constraints in EVALUATION ORDER — ascending byte order
+	// of the lowercased name (spec/design/constraints.md §4.4); the on-disk catalog stores
+	// them in this same order. Empty for an unchecked table.
+	Checks []CheckConstraint
+}
+
+// CheckConstraint is one CHECK constraint: its (resolved, unique-per-table) name, its
+// persisted expression text — written back verbatim at every commit so the catalog bytes
+// are stable (spec/fileformat/format.md "Check-expression text") — and the parsed
+// expression the write paths resolve and evaluate per candidate row (constraints.md §4).
+type CheckConstraint struct {
+	Name     string
+	ExprText string
+	Expr     Expr
 }
 
 // ColumnIndex returns the index of the named column (case-insensitive), or -1.

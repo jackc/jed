@@ -36,6 +36,9 @@ pub enum SqlState {
     NotNullViolation,
     /// 23505 — unique (primary key) constraint violation.
     UniqueViolation,
+    /// 23514 — check constraint violation: a candidate row falsified a CHECK
+    /// expression at INSERT/UPDATE (spec/design/constraints.md §4).
+    CheckViolation,
     /// 25001 — a `BEGIN` issued while a transaction is already open (no nesting — there is no
     /// SAVEPOINT this slice; spec/design/transactions.md §4.2).
     ActiveSqlTransaction,
@@ -79,6 +82,12 @@ pub enum SqlState {
     /// 42P18 — indeterminate datatype: a bind parameter `$N` whose type cannot be inferred
     /// from context (spec/design/api.md §5).
     IndeterminateDatatype,
+    /// 42P02 — undefined parameter: a bind parameter `$N` where none can exist (a CHECK
+    /// expression; spec/design/constraints.md §4.1).
+    UndefinedParameter,
+    /// 42710 — duplicate object: a constraint name already taken on this table
+    /// (spec/design/constraints.md §4.3).
+    DuplicateObject,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
     /// 54P01 — cost limit exceeded: a query's accrued execution cost reached the caller-set
@@ -111,6 +120,7 @@ impl SqlState {
             SqlState::InvalidRowCountInOffsetClause => "2201X",
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
+            SqlState::CheckViolation => "23514",
             SqlState::ActiveSqlTransaction => "25001",
             SqlState::ReadOnlySqlTransaction => "25006",
             SqlState::InFailedSqlTransaction => "25P02",
@@ -128,6 +138,8 @@ impl SqlState {
             SqlState::GroupingError => "42803",
             SqlState::UndefinedFunction => "42883",
             SqlState::IndeterminateDatatype => "42P18",
+            SqlState::UndefinedParameter => "42P02",
+            SqlState::DuplicateObject => "42710",
             SqlState::FeatureNotSupported => "0A000",
             SqlState::CostLimitExceeded => "54P01",
             SqlState::IoError => "58030",

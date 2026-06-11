@@ -93,6 +93,12 @@ name = "unique_violation"
 class = "integrity constraint violation"
 template = "duplicate key value violates primary key uniqueness"
 
+[[error]]
+code = "23514"
+name = "check_violation"
+class = "integrity constraint violation"
+template = "new row for relation {table} violates check constraint {name}"
+
 # --- invalid transaction state (class 25) -----------------------------------
 # Raised by the transaction-control surface (spec/design/transactions.md §4/§6):
 # BEGIN/COMMIT/ROLLBACK, the read-only access mode, and the failed-transaction
@@ -200,6 +206,18 @@ code = "42P18"
 name = "indeterminate_datatype"
 class = "syntax error or access rule violation"
 template = "could not determine data type of parameter ${index}"
+
+[[error]]
+code = "42P02"
+name = "undefined_parameter"
+class = "syntax error or access rule violation"
+template = "there is no parameter ${index}"
+
+[[error]]
+code = "42710"
+name = "duplicate_object"
+class = "syntax error or access rule violation"
+template = "check constraint {name} already exists"
 
 # --- feature not supported (class 0A) ---------------------------------------
 [[error]]

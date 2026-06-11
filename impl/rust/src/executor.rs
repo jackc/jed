@@ -9,7 +9,7 @@ use crate::ast::{
     Literal, OrderKey, QueryExpr, Select, SelectItems, SetOp, SetOpKind, Statement, TypeMod,
     UnaryOp, Update,
 };
-use crate::catalog::{Column, Table};
+use crate::catalog::{CheckConstraint, Column, Table};
 use crate::cost::Meter;
 use crate::costs::COSTS;
 use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
@@ -647,12 +647,119 @@ impl Database {
             }
         }
 
-        self.put_table(Table {
+        // CHECK constraints (constraints.md §4). All validation runs first, in textual
+        // definition order, AFTER the PRIMARY KEY constraints resolved (PG's order,
+        // oracle-probed); naming follows in a second pass, so a 42703 in a later check
+        // fires before a 42710 between earlier ones. Resolution needs a catalog `Table`,
+        // so build it now (checks attach below, before `put_table`).
+        let mut table = Table {
             name: ct.name,
             columns,
-        });
+            checks: Vec::new(),
+        };
+        for def in &ct.checks {
+            // Structural rejections first (a single pre-walk — a documented micro-order
+            // divergence from PG, which interleaves them with name/type resolution):
+            // subquery 0A000, aggregate 42803, bind parameter 42P02 (constraints.md §4.1).
+            reject_check_structure(&def.expr)?;
+            let scope = Scope::single(self, &table);
+            let (_, ty) = resolve(
+                &scope,
+                &def.expr,
+                None,
+                &mut AggCtx::Forbidden,
+                &mut ParamTypes::default(),
+            )?;
+            match ty {
+                ResolvedType::Bool | ResolvedType::Null => {}
+                ResolvedType::Int(_)
+                | ResolvedType::Text
+                | ResolvedType::Decimal
+                | ResolvedType::Bytea
+                | ResolvedType::Uuid
+                | ResolvedType::Timestamp
+                | ResolvedType::Timestamptz => {
+                    return Err(type_error("argument of CHECK must be boolean"));
+                }
+            }
+        }
+        // Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
+        // used as written; a derived name is built from the LOWERCASED table/column names —
+        // `<table>_<col>_check` when the expression references exactly one distinct column,
+        // else `<table>_check` — suffixed with the smallest positive integer that frees it.
+        // A collision (case-insensitive, PG folds) is 42710; derived names never yield to a
+        // later explicit one (oracle-probed).
+        let mut checks: Vec<CheckConstraint> = Vec::with_capacity(ct.checks.len());
+        for def in &ct.checks {
+            let name = match &def.name {
+                Some(n) => {
+                    if checks.iter().any(|c| c.name.eq_ignore_ascii_case(n)) {
+                        return Err(EngineError::new(
+                            SqlState::DuplicateObject,
+                            format!("check constraint {n} already exists"),
+                        ));
+                    }
+                    n.clone()
+                }
+                None => {
+                    let cols = check_referenced_columns(&def.expr, &table.columns);
+                    let base = match cols.as_slice() {
+                        [i] => format!(
+                            "{}_{}_check",
+                            table.name.to_ascii_lowercase(),
+                            table.columns[*i].name.to_ascii_lowercase()
+                        ),
+                        _ => format!("{}_check", table.name.to_ascii_lowercase()),
+                    };
+                    let mut candidate = base.clone();
+                    let mut suffix = 0u32;
+                    while checks
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&candidate))
+                    {
+                        suffix += 1;
+                        candidate = format!("{base}{suffix}");
+                    }
+                    candidate
+                }
+            };
+            checks.push(CheckConstraint {
+                name,
+                expr_text: def.text.clone(),
+                expr: def.expr.clone(),
+            });
+        }
+        // Evaluation (and on-disk) order: ascending byte order of the lowercased name
+        // (constraints.md §4.4 — PG evaluates checks sorted by name, oracle-probed).
+        checks.sort_by_key(|c| c.name.to_ascii_lowercase());
+        table.checks = checks;
+
+        self.put_table(table);
         // DDL touches no rows and evaluates no expressions: zero cost.
         Ok(Outcome::Statement { cost: 0 })
+    }
+
+    /// Resolve a table's CHECK constraints for a write statement: each stored expression
+    /// against a one-relation scope, in the catalog's (evaluation/name) order. Cannot fail
+    /// for a catalog produced by CREATE TABLE or a well-formed file (both validated); a
+    /// hand-corrupted expression surfaces its natural resolve error.
+    fn resolve_checks(&self, table: &Table) -> Result<Vec<(String, RExpr)>> {
+        if table.checks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = Scope::single(self, table);
+        let mut out = Vec::with_capacity(table.checks.len());
+        for c in &table.checks {
+            let (node, _) = resolve(
+                &scope,
+                &c.expr,
+                None,
+                &mut AggCtx::Forbidden,
+                &mut ParamTypes::default(),
+            )?;
+            out.push((c.name.clone(), node));
+        }
+        Ok(out)
     }
 
     /// Run a DROP TABLE: remove the table's definition and its row store from the
@@ -709,6 +816,9 @@ impl Database {
             .into_iter()
             .map(|i| (i, tdef.columns[i].ty))
             .collect();
+        // The CHECK constraints, resolved once per statement in evaluation (name) order;
+        // `insert_rows` evaluates them per candidate row (constraints.md §4.4).
+        let checks = self.resolve_checks(tdef)?;
 
         // Resolve the optional column list once. `provided[i] = Some(p)` means table column i
         // takes value position `p` in each row; `None` means column i is omitted (its default,
@@ -798,7 +908,7 @@ impl Database {
                 // work is the disposition plan's compression attempts for over-RECORD_MAX rows
                 // (value_compress, cost.md §3); a fully-inline row still costs zero.
                 let mut meter = Meter::with_limit(self.max_cost);
-                self.insert_rows(&table, &columns, &pk, &provided, rows, &mut meter)?;
+                self.insert_rows(&table, &columns, &pk, &checks, &provided, rows, &mut meter)?;
                 Ok(Outcome::Statement {
                     cost: meter.accrued,
                 })
@@ -847,7 +957,9 @@ impl Database {
                 // SELECT's cost keeps one ceiling over the whole statement.
                 let mut meter = Meter::with_limit(self.max_cost);
                 meter.charge(q.cost);
-                self.insert_rows(&table, &columns, &pk, &provided, q.rows, &mut meter)?;
+                self.insert_rows(
+                    &table, &columns, &pk, &checks, &provided, q.rows, &mut meter,
+                )?;
                 Ok(Outcome::Statement {
                     cost: meter.accrued,
                 })
@@ -864,16 +976,27 @@ impl Database {
     /// written; only once every row validates are they all inserted (phase 2), allocating a
     /// fresh monotonic rowid in row order for a table with no primary key. All-or-nothing: a
     /// failure leaves the store untouched and burns no rowids.
+    ///
+    /// The argument list mirrors the statement-resolved inputs phase 1 validates against,
+    /// one-for-one with the Go/TS cores — grouping them would only add indirection.
+    #[allow(clippy::too_many_arguments)]
     fn insert_rows(
         &mut self,
         table: &str,
         columns: &[Column],
         pk: &[(usize, ScalarType)],
+        checks: &[(String, RExpr)],
         provided: &[Option<usize>],
         rows: Vec<Vec<Value>>,
         meter: &mut Meter,
     ) -> Result<()> {
         let n = columns.len();
+        // The canonical relation name for the 23514 message (the `table` argument is the
+        // name as the statement spelled it).
+        let relation = self
+            .table(table)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| table.to_string());
         let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(rows.len());
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
         let mut cunits: i64 = 0;
@@ -891,6 +1014,30 @@ impl Database {
                     col.not_null,
                     &col.name,
                 )?);
+            }
+
+            // CHECK constraints, in name order, on the fully-coerced candidate row — after
+            // NOT NULL (`store_value` above), before the key/duplicate check (PG's per-row
+            // order, constraints.md §4.4). TRUE and NULL pass; the first FALSE aborts the
+            // whole statement (two-phase — nothing has been written). Evaluation is metered
+            // expression work (operator_eval), so guard the ceiling per checked row.
+            if !checks.is_empty() {
+                meter.guard()?;
+                let env = EvalEnv {
+                    exec: self,
+                    params: &[],
+                    outer: &[],
+                };
+                for (name, rexpr) in checks {
+                    if matches!(rexpr.eval(&row, &env, meter)?, Value::Bool(false)) {
+                        return Err(EngineError::new(
+                            SqlState::CheckViolation,
+                            format!(
+                                "new row for relation {relation} violates check constraint {name}"
+                            ),
+                        ));
+                    }
+                }
             }
 
             let key = if pk.is_empty() {
@@ -1141,6 +1288,10 @@ impl Database {
             Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
             None => None,
         };
+        // The CHECK constraints, resolved once per statement in evaluation (name) order;
+        // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
+        let checks = self.resolve_checks(table)?;
+        let relation = table.name.clone();
         // All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
         let bound = bind_params(params, &ptypes.finalize()?)?;
 
@@ -1226,6 +1377,19 @@ impl Database {
             // columns so its weight/disposition re-plan exactly as an eager writer's would —
             // unmetered, part of the rewrite like commit work (large-values.md §14).
             store.resolve_all(&mut new_row)?;
+            // CHECK constraints, in name order, on the post-assignment row — after the
+            // assignments coerced (22003/23502 in `plan.check` above), on the fully-resident
+            // row (constraints.md §4.4). Every check evaluates (not only those mentioning
+            // assigned columns); TRUE and NULL pass, the first FALSE aborts the statement
+            // (phase 1 — nothing has been written).
+            for (name, rexpr) in &checks {
+                if matches!(rexpr.eval(&new_row, &env, &mut meter)?, Value::Bool(false)) {
+                    return Err(EngineError::new(
+                        SqlState::CheckViolation,
+                        format!("new row for relation {relation} violates check constraint {name}"),
+                    ));
+                }
+            }
             updates.push((key, new_row));
         }
 
@@ -3354,6 +3518,141 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         // an aggregate query (the outer reference, if any, is just a constant to the subquery).
         Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => false,
     }
+}
+
+/// The structural CHECK-expression rejections (spec/design/constraints.md §4.1), applied in
+/// a single depth-first pre-order walk before resolution: a subquery is 0A000, an aggregate
+/// call 42803, a bind parameter 42P02 — PG's codes and messages (oracle-probed; PG
+/// interleaves these with resolution in parse order, a documented micro-order divergence).
+fn reject_check_structure(e: &Expr) -> Result<()> {
+    match e {
+        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {
+            Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "cannot use subquery in check constraint",
+            ))
+        }
+        Expr::Param(n) => Err(EngineError::new(
+            SqlState::UndefinedParameter,
+            format!("there is no parameter ${n}"),
+        )),
+        Expr::FuncCall { name, args, .. } => {
+            if is_aggregate_name(name) {
+                return Err(EngineError::new(
+                    SqlState::GroupingError,
+                    "aggregate functions are not allowed in check constraints",
+                ));
+            }
+            args.iter().try_for_each(reject_check_structure)
+        }
+        Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::Literal(_) => Ok(()),
+        Expr::Cast { inner, .. } => reject_check_structure(inner),
+        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
+            reject_check_structure(operand)
+        }
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::Like { lhs, rhs, .. } => {
+            reject_check_structure(lhs)?;
+            reject_check_structure(rhs)
+        }
+        Expr::In { lhs, list, .. } => {
+            reject_check_structure(lhs)?;
+            list.iter().try_for_each(reject_check_structure)
+        }
+        Expr::Between { lhs, lo, hi, .. } => {
+            reject_check_structure(lhs)?;
+            reject_check_structure(lo)?;
+            reject_check_structure(hi)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            if let Some(op) = operand {
+                reject_check_structure(op)?;
+            }
+            for (c, r) in whens {
+                reject_check_structure(c)?;
+                reject_check_structure(r)?;
+            }
+            match els {
+                Some(e) => reject_check_structure(e),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+/// The distinct columns a CHECK expression references, as indices into `columns` — the input
+/// to PG's auto-naming rule (constraints.md §4.3: exactly one distinct column →
+/// `<table>_<col>_check`). Resolution already validated every reference, so an unknown name
+/// is simply skipped; a qualified reference counts its column like a bare one (oracle-probed).
+fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
+    fn walk(e: &Expr, columns: &[Column], out: &mut Vec<usize>) {
+        let mut note = |name: &str| {
+            if let Some(i) = columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+            {
+                if !out.contains(&i) {
+                    out.push(i);
+                }
+            }
+        };
+        match e {
+            Expr::Column(name) | Expr::QualifiedColumn { name, .. } => note(name),
+            Expr::Literal(_) | Expr::Param(_) => {}
+            Expr::Cast { inner, .. } => walk(inner, columns, out),
+            Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
+                walk(operand, columns, out)
+            }
+            Expr::Binary { lhs, rhs, .. }
+            | Expr::IsDistinctFrom { lhs, rhs, .. }
+            | Expr::Like { lhs, rhs, .. } => {
+                walk(lhs, columns, out);
+                walk(rhs, columns, out);
+            }
+            Expr::In { lhs, list, .. } => {
+                walk(lhs, columns, out);
+                for x in list {
+                    walk(x, columns, out);
+                }
+            }
+            Expr::Between { lhs, lo, hi, .. } => {
+                walk(lhs, columns, out);
+                walk(lo, columns, out);
+                walk(hi, columns, out);
+            }
+            Expr::Case {
+                operand,
+                whens,
+                els,
+            } => {
+                if let Some(op) = operand {
+                    walk(op, columns, out);
+                }
+                for (c, r) in whens {
+                    walk(c, columns, out);
+                    walk(r, columns, out);
+                }
+                if let Some(e) = els {
+                    walk(e, columns, out);
+                }
+            }
+            Expr::FuncCall { args, .. } => {
+                for a in args {
+                    walk(a, columns, out);
+                }
+            }
+            // Unreachable in a validated check (rejected by `reject_check_structure`).
+            Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(e, columns, &mut out);
+    out
 }
 
 /// The environment threaded into the per-row evaluator (spec/design/grammar.md §26): the

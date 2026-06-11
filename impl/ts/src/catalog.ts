@@ -1,6 +1,7 @@
 // Table metadata: column definitions and lookups. Data-shaped (a type + free
 // functions) to match the boring/explicit style (CLAUDE.md §10).
 
+import type { Expr } from "./ast.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
 import type { Value } from "./value.ts";
 
@@ -22,7 +23,20 @@ export type Column = {
 };
 
 // Table is a table definition.
-export type Table = { name: string; columns: Column[] };
+export type Table = {
+  name: string;
+  columns: Column[];
+  // The table's CHECK constraints in EVALUATION ORDER — ascending byte order of the
+  // lowercased name (spec/design/constraints.md §4.4); the on-disk catalog stores them in
+  // this same order. Empty for an unchecked table.
+  checks: CheckConstraint[];
+};
+
+// CheckConstraint is one CHECK constraint: its (resolved, unique-per-table) name, its
+// persisted expression text — written back verbatim at every commit so the catalog bytes
+// are stable (spec/fileformat/format.md "Check-expression text") — and the parsed
+// expression the write paths resolve and evaluate per candidate row (constraints.md §4).
+export type CheckConstraint = { name: string; exprText: string; expr: Expr };
 
 // columnIndex returns the index of the named column (case-insensitive), or -1.
 export function columnIndex(t: Table, name: string): number {

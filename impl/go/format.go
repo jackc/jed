@@ -20,7 +20,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion uint16 = 3               // on-disk format version (3 = + overflow pages, large-values.md §12)
+	formatVersion uint16 = 4               // on-disk format version (4 = + catalog CHECK constraints, constraints.md §4.5)
 	pageHeader           = 12              // bytes of the catalog/B-tree page header
 	pageCatalog   byte   = 1               // page_type for a catalog page
 	pageLeaf      byte   = 2               // page_type for a B-tree leaf node
@@ -1280,6 +1280,17 @@ func tableEntryBytes(table *Table, rootDataPage uint32) []byte {
 			out = append(out, encodeValue(col.Type, *col.Default)...)
 		}
 	}
+	// CHECK constraints (v4): count, then (name, expression text) per check, in the
+	// catalog's evaluation order — the text is written back VERBATIM, so the bytes are
+	// stable across create → commit → load → commit (spec/fileformat/format.md
+	// "Check-expression text").
+	out = appendU16(out, uint16(len(table.Checks)))
+	for _, check := range table.Checks {
+		out = appendU16(out, uint16(len(check.Name)))
+		out = append(out, check.Name...)
+		out = appendU16(out, uint16(len(check.ExprText)))
+		out = append(out, check.ExprText...)
+	}
 	out = appendU32(out, rootDataPage)
 	return out
 }
@@ -1563,11 +1574,35 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, error) {
 			Default:    defaultVal,
 		})
 	}
+	// CHECK constraints (v4): the stored expression text re-parses with the ordinary
+	// expression parser — it was written by the token renderer, so this cannot fail for a
+	// file the engine wrote; failure means the file lied (XX001, constraints.md §4.5).
+	checkCount, err := readU16(buf, pos)
+	if err != nil {
+		return nil, 0, err
+	}
+	checks := make([]CheckConstraint, 0, checkCount)
+	for i := uint16(0); i < checkCount; i++ {
+		checkName, err := readString(buf, pos)
+		if err != nil {
+			return nil, 0, err
+		}
+		exprText, err := readString(buf, pos)
+		if err != nil {
+			return nil, 0, err
+		}
+		expr, err := ParseExpression(exprText)
+		if err != nil {
+			return nil, 0, NewError(DataCorrupted,
+				"stored check constraint does not parse: "+err.Error())
+		}
+		checks = append(checks, CheckConstraint{Name: checkName, ExprText: exprText, Expr: expr})
+	}
 	root, err := readU32(buf, pos)
 	if err != nil {
 		return nil, 0, err
 	}
-	return &Table{Name: name, Columns: columns}, root, nil
+	return &Table{Name: name, Columns: columns, Checks: checks}, root, nil
 }
 
 // readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL

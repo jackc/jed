@@ -1202,3 +1202,29 @@ repeated member `42701`, more than one primary key across both forms `42P16`, a
 non-keyable member type or an out-of-declaration-order list `0A000` (constraints.md §3).
 Keeping resolution in the executor matches every other name-resolution error in the
 surface (the parser knows no catalog).
+
+## 29. `CHECK` constraints (`[CONSTRAINT name] CHECK ( expr )`)
+
+Both constraint positions gain the same form: a `column_constraint` and a `table_constraint`
+may each be `["CONSTRAINT" identifier] "CHECK" "(" expr ")"`. The two positions are
+semantically identical (either may reference any column of the table); semantics —
+validation, naming, name-order evaluation, `23514`, persistence — live in
+[constraints.md §4](constraints.md). This section is the parser surface.
+
+**Disambiguation.** `CHECK` and `CONSTRAINT` stay non-reserved (§3). A table element
+beginning with the keyword `CHECK` **followed by `(`** parses as an unnamed check
+constraint; one beginning with `CONSTRAINT` followed by an identifier and `CHECK` parses as
+a named one. Nothing is lost: a column named `check` is followed by a *type name* (an
+identifier, never `(`), and a column named `constraint` would need its second-next token to
+be a type, never the keyword `check` followed by `(` — no valid `column_def` collides. In
+column-constraint position the same lookahead applies after the column's type.
+
+**The expression is captured for persistence.** The parser records the token span between
+the constraint's parentheses; the persisted text is that token sequence re-rendered
+([format.md](../fileformat/format.md) "Check-expression text"). The parse itself is the
+ordinary `expr` production — `CHECK ()` is `42601`, and the parentheses are required.
+
+**Where the errors fire.** The parser accepts any well-formed expression — including ones
+the constraint must reject — and CREATE TABLE's execution validates: subquery `0A000`,
+aggregate `42803`, bind parameter `42P02`, unknown column `42703`, non-boolean `42804`,
+duplicate name `42710` (constraints.md §4.1–§4.3). The parser knows no catalog.

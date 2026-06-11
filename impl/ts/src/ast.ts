@@ -161,7 +161,19 @@ export type CreateTable = {
   name: string;
   columns: ColumnDef[];
   tablePks: string[][];
+  // Every `[CONSTRAINT name] CHECK ( expr )` of the statement — column-level and
+  // table-level forms are semantically identical, so both collect here, in TEXTUAL
+  // DEFINITION ORDER (it drives validation and naming — spec/design/constraints.md §4).
+  // CREATE TABLE's execution validates each (0A000/42803/42P02/42703/42804) and names the
+  // unnamed ones (42710 on a collision).
+  checks: CheckDef[];
 };
+
+// CheckDef is one parsed CHECK constraint (spec/design/grammar.md §29): the optional
+// explicit CONSTRAINT name (null = unnamed), the expression, and the expression's
+// persisted text — the source token sequence between the parentheses re-rendered per the
+// closed table in spec/fileformat/format.md "Check-expression text".
+export type CheckDef = { name: string | null; expr: Expr; text: string };
 
 // DropTable is a DROP TABLE statement. Removes a table — its definition and all its
 // rows — from the catalog. Dropping a table that does not exist is an error (42P01);

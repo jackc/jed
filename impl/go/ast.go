@@ -47,6 +47,22 @@ type CreateTable struct {
 	// every one it sees; CREATE TABLE's execution resolves them (42703/42701) and rejects
 	// more than one primary key across both forms (42P16) — spec/design/constraints.md §3.
 	TablePKs [][]string
+	// Checks is every `[CONSTRAINT name] CHECK ( expr )` of the statement — column-level
+	// and table-level forms are semantically identical, so both collect here, in TEXTUAL
+	// DEFINITION ORDER (it drives validation and naming — spec/design/constraints.md §4).
+	// CREATE TABLE's execution validates each (0A000/42803/42P02/42703/42804) and names the
+	// unnamed ones (42710 on a collision).
+	Checks []CheckDef
+}
+
+// CheckDef is one parsed CHECK constraint (spec/design/grammar.md §29): the optional
+// explicit CONSTRAINT name (empty = unnamed), the expression, and the expression's
+// persisted text — the source token sequence between the parentheses re-rendered per the
+// closed table in spec/fileformat/format.md "Check-expression text".
+type CheckDef struct {
+	Name string
+	Expr Expr
+	Text string
 }
 
 // DropTable is a DROP TABLE statement. Removes a table — its definition and all its

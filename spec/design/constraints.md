@@ -10,25 +10,29 @@
 > change the data/grammar and here in the same edit.
 
 A `column_def` is a name, a type, and zero or more **column constraints**; a `CREATE TABLE`
-element may also be the one **table constraint**, the composite-capable `PRIMARY KEY` list:
+element may also be a **table constraint** — the composite-capable `PRIMARY KEY` list, or an
+(optionally named) `CHECK`:
 
 ```
 table_element     ::= column_def | table_constraint
 table_constraint  ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
+                    | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
 column_def        ::= identifier type_name column_constraint*
 column_constraint ::= "PRIMARY" "KEY"
                     | "NOT" "NULL"
                     | "DEFAULT" literal
+                    | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
 ```
 
 Constraints are **order-free** and idempotent: the parsers accept the keywords in any order
 and a repeat is harmless (`x int NOT NULL PRIMARY KEY` ≡ `x int PRIMARY KEY NOT NULL` ≡
-`x int NOT NULL NOT NULL`). The constraint keywords are **not reserved** (grammar.md §3) — a
-column may be named `not`, `null`, `primary`, or `key`; the parser distinguishes them
+`x int NOT NULL NOT NULL`; repeated `CHECK`s all collect — each is a distinct constraint).
+The constraint keywords are **not reserved** (grammar.md §3) — a column may be named `not`,
+`null`, `primary`, `key`, `check`, or `constraint`; the parser distinguishes them
 positionally.
 
-This grows one constraint at a time (CLAUDE.md §11, [../../TODO.md](../../TODO.md)). `UNIQUE`,
-`CHECK`, and `FOREIGN KEY` stay deferred; the composite `PRIMARY KEY` landed (§3).
+This grows one constraint at a time (CLAUDE.md §11, [../../TODO.md](../../TODO.md)). `UNIQUE`
+and `FOREIGN KEY` stay deferred; the composite `PRIMARY KEY` landed (§3), `CHECK` landed (§4).
 
 ## 1. `NOT NULL`
 
@@ -160,3 +164,123 @@ optimization slice and carries the NoREC growth obligation with it (conformance.
 narrowing above. Files written before this slice are unchanged; a composite-PK table is just
 a table with several `bit0` columns. The cross-core byte fixture is the
 `composite_pk_table.jed` golden.
+
+## 4. `CHECK`
+
+A `CHECK` constraint is a **row predicate**: a boolean expression over the table's columns
+that every stored row must not falsify. It is enforced at the two write paths (INSERT and
+UPDATE) on each candidate row; a row for which the expression evaluates to **FALSE** traps
+**`23514`** (`check_violation`):
+
+```
+new row for relation <table> violates check constraint <name>
+```
+
+**TRUE and NULL both pass** (the SQL-standard rule PostgreSQL follows: only FALSE violates —
+so `CHECK (a > 0)` admits a NULL `a`; combine with `NOT NULL` to forbid it). Every behavior
+in this section is oracle-checked against PostgreSQL (CLAUDE.md §1).
+
+### 4.1 Surface
+
+Both positions, same constraint: a **column-level** `CHECK` (among a column's constraints)
+and a **table-level** `CHECK` (a table element) are semantically identical — either may
+reference **any** of the table's columns, including columns defined later in the statement
+(PostgreSQL's model). The position feeds only the constraint's *textual definition order*
+(naming, §4.3). An optional **`CONSTRAINT <name>`** prefix names the constraint; the prefix
+is accepted only immediately before `CHECK` this slice (PostgreSQL allows it before any
+constraint — a relaxable jed narrowing).
+
+The expression is a general scalar expression (the full `expr` grammar: arithmetic,
+comparisons, `AND`/`OR`/`NOT`, `IS NULL`, `IS DISTINCT FROM`, `IN`, `BETWEEN`, `LIKE`,
+`CASE`, `CAST`, scalar function calls), restricted at CREATE TABLE:
+
+- it must be **boolean-typed** (NULL counts as boolean) — else **`42804`**
+  (`argument of CHECK must be boolean`);
+- a **subquery** is rejected — **`0A000`** (`cannot use subquery in check constraint`);
+- an **aggregate** is rejected — **`42803`**
+  (`aggregate functions are not allowed in check constraints`);
+- a **bind parameter** `$N` is rejected — **`42P02`** (`there is no parameter $N`);
+- column references resolve against this table only: an unknown column is **`42703`**, a
+  qualifier other than the table's name is the resolver's usual **`42P01`**. A reference may
+  be table-qualified (`CHECK (t.a > 0)` inside `CREATE TABLE t`).
+
+All codes and messages match PostgreSQL (oracle-probed), with one documented divergence: jed
+checks the **structural** rejections (subquery / aggregate / parameter, a single
+depth-first pre-walk) before resolving names and types, while PostgreSQL interleaves them in
+parse order — so a statement containing *both* kinds of error in one expression may report a
+different (equally valid) error than PG. Recorded in the oracle-override ledger.
+
+### 4.2 Validation order at CREATE TABLE (deterministic, PG-matched)
+
+1. Columns are processed as before (duplicate name `42701`, type resolution, the PK gates,
+   `DEFAULT` coercion — §2). Both `CHECK` forms are *collected* in textual order, not yet
+   validated.
+2. The table-level `PRIMARY KEY` constraints resolve (§3) — PK errors fire before any check
+   expression is examined (PG's order: index constraints transform first).
+3. Each check **validates** in textual definition order: the §4.1 pre-walk, then name/type
+   resolution, then the boolean gate.
+4. Each check is **named** in textual definition order (§4.3); a name collision traps
+   **`42710`** (`check constraint <name> already exists`). All validation (step 3) precedes
+   all naming — a `42703` in a later check fires before a `42710` between earlier ones
+   (oracle-probed).
+
+**`DEFAULT` is not checked against `CHECK` at CREATE TABLE** (matching §2's `NOT NULL` rule
+and PostgreSQL): `a int DEFAULT -5 CHECK (a > 0)` is accepted; the `23514` fires only when
+the default is applied to an inserted row.
+
+### 4.3 Naming
+
+An explicit `CONSTRAINT <name>` is used as written (names follow the engine's identifier
+convention: original case round-trips, comparisons are case-insensitive). Otherwise the name
+is **derived, PostgreSQL's algorithm**: let the *referenced columns* be the distinct columns
+the expression mentions —
+
+- exactly one → `<table>_<column>_check`;
+- zero or several → `<table>_check`;
+- if that name is taken (by any earlier-named check, explicit or derived), append the
+  smallest positive integer that frees it (`<table>_<column>_check1`, `…2`, …).
+
+Derived names are built from the **lowercased** table/column names (what PostgreSQL's
+identifier folding produces). Naming is a single pass in textual definition order — an
+explicit name colliding with an *earlier* derived name is `42710` (derived names never
+yield; oracle-probed).
+
+### 4.4 Enforcement
+
+At INSERT (both sources, including `INSERT … SELECT`) and UPDATE, **per candidate row**,
+inside the existing two-phase / all-or-nothing pass (grammar.md §12): after the row's values
+are coerced (`22003`) and `NOT NULL` is applied (`23502` — NOT NULL fires before CHECK,
+PG's order), and **before** the storage key is built and checked (`23505` — CHECK fires
+before a duplicate key, PG's order), every check constraint is evaluated against the
+candidate row **in name order** (ascending byte order of the lowercased name — PostgreSQL
+evaluates checks sorted by name, oracle-probed; `aa` fires before `zz` regardless of
+definition order). The first FALSE aborts the statement with `23514`; nothing is written.
+
+- **UPDATE** evaluates **every** check on each post-assignment row (not only checks
+  mentioning assigned columns — same observable result as PG, and the deterministic-cost
+  contract needs the fixed rule). Rows the WHERE does not match evaluate nothing.
+- A runtime error inside a check expression propagates as itself (`22012` on a division by
+  zero, etc.) — same as any expression evaluation.
+- Checks reference at most the candidate row, so evaluation needs no storage reads; on
+  UPDATE the row is already fully resident at evaluation time (the §14 large-values
+  resolve-on-rewrite precedes it).
+
+**Cost.** A check evaluation is ordinary expression evaluation through the metered
+evaluator: `operator_eval` per interior node (and `decimal_work` where decimal arithmetic
+fires), per check, per candidate row ([cost.md](cost.md) §3). An `INSERT … VALUES` into a
+checked table therefore accrues nonzero cost — the documented exception to "VALUES inserts
+cost zero". The ceiling (`max_cost`) aborts mid-validation deterministically like any other
+expression work.
+
+### 4.5 Persistence
+
+A check constraint is stored in the table's catalog entry as its **name** plus its
+**expression text**, under `format_version` **4** ([../fileformat/format.md
+](../fileformat/format.md)): after the column entries, a `check_count` and per-check
+`(name, expr_text)` pairs, ordered by the **evaluation order** (lowercased-name byte order).
+The expression text is the **re-rendered source token sequence** (format.md defines the
+per-token rendering — a closed, recursion-free byte contract identical across cores); on
+load each core re-parses the stored text with its ordinary expression parser, and a commit
+writes the retained text back verbatim, so the catalog bytes are stable across
+create → commit → load → commit. Unparseable stored text in an otherwise-valid file is
+**`XX001`** (`data_corrupted`) at open.

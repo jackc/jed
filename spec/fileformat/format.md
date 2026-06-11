@@ -15,18 +15,22 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Phase-6 scope (`format_version` 3)
+## Version scope (`format_version` 4)
 
-This is the **page-backed copy-on-write B-tree** format (Phase 6). The current on-disk version is
-**`format_version` 3** — it adds **out-of-line overflow pages** and **transparent LZ4 compression**
-for large values (the *Large values* section below; [../design/large-values.md](../design/large-values.md))
-on top of the P6.1 page-backed B-tree. Each version is a **clean break** — older versions are **not
-read** (we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a
-reader accepts **only** version 3. Because inline-plain and NULL values are byte-unchanged (the
-large-value change extends the value-codec presence tag with new states — *Value codec*), a file
-with no spilled or compressed value differs from its v2 form only in the version field; the goldens
-regenerate accordingly. Compression (large-values.md Slice B) landed **additively within v3**: the
-`0x03`/`0x04` forms were reserved by the overflow slice, so no second version bump.
+The current on-disk version is **`format_version` 4** — it adds **`CHECK` constraints to the
+catalog table entry** (a per-table list of `(name, expression-text)` pairs after the column
+entries — *Catalog* below; [../design/constraints.md](../design/constraints.md) §4). Each
+version is a **clean break** — older versions are **not read** (we are pre-1.0 and owe no
+on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only**
+version 4. The change is catalog-only: a table with no checks gains exactly two zero bytes
+(`check_count = 0`), and every data page is byte-unchanged; the goldens regenerate
+accordingly.
+
+`format_version` 3 was the **page-backed copy-on-write B-tree** format (Phase 6) plus
+**out-of-line overflow pages** and **transparent LZ4 compression** for large values (the
+*Large values* section below; [../design/large-values.md](../design/large-values.md)).
+Compression (large-values.md Slice B) landed **additively within v3**: the `0x03`/`0x04`
+forms were reserved by the overflow slice, so no second version bump.
 
 The P6.1 page-backed B-tree (`format_version` 2) changed exactly two things from the step-5b
 whole-image format (`format_version` 1):
@@ -109,7 +113,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`2`** |
+| 4  | 2 | `format_version` (u16) — current = **`4`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -138,7 +142,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 2`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 4`,
 reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
 slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
 
@@ -170,7 +174,8 @@ the chain. Catalog entries are packed greedily (a single table entry must fit on
 ≤ `C`, else `0A000`; the `RECORD_MAX = C/2` cap is a B-tree-record rule and does **not** apply
 to catalog entries, which never split).
 
-Each **table entry** (unchanged from v1):
+Each **table entry** (v4 adds the check-constraint list between the columns and
+`root_data_page`; everything else is unchanged from v1):
 
 | field | encoding |
 |---|---|
@@ -185,9 +190,40 @@ Each **table entry** (unchanged from v1):
 | &nbsp;&nbsp;`precision` | u16 — **only present when `type_code == 6` (decimal)**; `0` = unconstrained |
 | &nbsp;&nbsp;`scale` | u16 — **only present when `type_code == 6` (decimal)** |
 | &nbsp;&nbsp;`default` | value-codec bytes — **only present when `flags` bit2 (`has_default`)**; written *after* the typmod |
+| `check_count` | u16 — the table's `CHECK` constraints (**new in v4**; `0` for an unchecked table) |
+| per check (×`check_count`): | |
+| &nbsp;&nbsp;`check_name_len` | u16 |
+| &nbsp;&nbsp;`check_name` | UTF-8 (original case) |
+| &nbsp;&nbsp;`check_expr_len` | u16 |
+| &nbsp;&nbsp;`check_expr` | UTF-8 — the expression text (*Check-expression text* below) |
 | `root_data_page` | u32 — the **root B-tree node** of this table, or 0 if it has no rows |
 
-Columns are emitted in declaration order.
+Columns are emitted in declaration order. Checks are emitted in their **evaluation order** —
+ascending byte order of the lowercased `check_name` ([../design/constraints.md
+§4.4](../design/constraints.md)); a reader trusts that order (it never re-sorts).
+
+### Check-expression text
+
+The persisted `check_expr` is the constraint's parsed **token sequence re-rendered** — the
+tokens between the `CHECK` parentheses, each rendered by the closed table below, joined with
+single spaces (`0x20`). It is a recursion-free byte contract: every core renders the same
+token stream to the same bytes, and a loader re-parses the text with its ordinary expression
+parser (re-lexing yields a value-identical token sequence by construction). A commit writes
+the retained text back **verbatim**, so the bytes are stable across create → commit → load →
+commit. Text that fails to lex/parse in an otherwise-valid file is `XX001` (`data_corrupted`)
+at open.
+
+| token | rendering |
+|---|---|
+| word (keyword / identifier) | as written (original case; comparisons are case-insensitive at parse) |
+| integer literal | the unsigned decimal digits of its magnitude, no sign, no leading zeros |
+| decimal literal `(coeff, scale)` | the digit string `coeff` with `.` inserted `scale` digits from the right — `("150", 2)` → `1.50`, `("5", 1)` → `.5`, `("1", 0)` → `1.` (always contains the `.`, so it re-lexes as a decimal) |
+| string literal | `'` + content with each `'` doubled + `'` |
+| bind parameter | `$N` (unreachable in a *stored* check — rejected at CREATE TABLE, 42P02) |
+| punctuation / operators | their fixed spelling: `,` `.` `(` `)` `*` `+` `-` `/` `%` `=` `<` `>` `<=` `>=` |
+
+Example: `CHECK (a>0 AND b IS NOT NULL)` persists as `a > 0 AND b IS NOT NULL`; `CHECK
+(price * qty <= 10000.00)` persists as `price * qty <= 10000.00`.
 
 **Composite primary key.** A composite `PRIMARY KEY` ([../design/constraints.md
 §3](../design/constraints.md)) is persisted as `bit0` set on **each** member column — there is
@@ -562,6 +598,7 @@ the interior-node format and the split contract.
 | `timestamptz_table.jed` | a timestamptz column — the same 8-byte branch under type code 10 |
 | `nopk_table.jed` | a no-PK table — the stored synthetic `int64` rowid key |
 | `composite_pk_table.jed` | a **composite PRIMARY KEY** (`int32` ‖ `int16`) — the concatenated key encoding (encoding.md §2.3) + multiple `bit0` flag columns; negative first component and tie-breaking second |
+| `check_table.jed` | **`CHECK` constraints** (v4) — the catalog check list: an auto-named single-column check, an explicitly-named multi-column check, and a check whose text exercises the token rendering (string + decimal literals, `<=`); stored in name order |
 | `tall_tree.jed` | enough small int rows to force a **two-level interior** (height-2 tree) — exercises interior-of-interior child pointers and post-order page allocation |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |

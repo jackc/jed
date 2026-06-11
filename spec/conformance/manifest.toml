@@ -33,6 +33,10 @@ id = "ddl.composite_primary_key"
 description = "Table-level PRIMARY KEY (a, b, …) constraint — a composite key over one or more columns; key bytes are the members' concatenated encodings, uniqueness is over the whole tuple (23505), every member is implicitly NOT NULL; PG-matching DDL errors 42703/42701/42P16; the list order must match declaration order this slice (0A000, relaxable) (spec/design/constraints.md §3, grammar.md §28)"
 
 [[capability]]
+id = "ddl.check"
+description = "CHECK constraints — column-level and table-level [CONSTRAINT name] CHECK (expr): boolean row predicates enforced per candidate row at INSERT/UPDATE (23514; TRUE/NULL pass), evaluated in name order; PG auto-naming (t_col_check / t_check + suffixes); DDL rejections 42804/0A000/42803/42P02/42703/42710; persisted as expression text in the v4 catalog (spec/design/constraints.md §4, grammar.md §29)"
+
+[[capability]]
 id = "ddl.drop_table"
 description = "DROP TABLE — remove a table (definition + rows) from the catalog; missing table is 42P01 (grammar.md §13)"
 

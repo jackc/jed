@@ -14,7 +14,7 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 3 # format_version 3: + out-of-line overflow pages for large values (large-values.md §12)
+VERSION = 4 # format_version 4: + catalog CHECK constraints (constraints.md §4.5)
 PAGE_HEADER = 12
 ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
 TXID = 1
@@ -79,6 +79,27 @@ COMPOSITE_PK_TABLE = {
   columns: [col("a", "int32", pk: true), col("b", "int16", pk: true), col("v", "int16")],
   rows: [[-2, 5, 10], [1, 1, 20], [1, 2, 30], [1, 3, 40],
          [2, 0, 50], [2, 1, 60], [3, 7, 70], [3, 9, 80]]
+}.freeze
+
+# A table with CHECK constraints (constraints.md §4): exercises the v4 catalog check list —
+# an auto-named single-column check, an explicitly-named multi-column check, and a check
+# whose text exercises the token rendering (a doubled-quote string literal, decimal
+# literals, >= / <=). Stored in evaluation (name) order: price_range < t_b_check <
+# t_note_check. The cores build this via
+#   CREATE TABLE t (a int PRIMARY KEY, b int CHECK (b > 0), price numeric(8,2),
+#     CONSTRAINT price_range CHECK (price >= 0.50 AND price <= 9999.99), note text,
+#     CHECK (note = 'ok' OR note = 'a''b'))
+# and insert rows in ascending key order.
+CHECK_TABLE = {
+  name: "t",
+  columns: [col("a", "int32", pk: true), col("b", "int32"),
+            col("price", "decimal", precision: 8, scale: 2), col("note", "text")],
+  checks: [
+    { name: "price_range", expr: "price >= 0.50 AND price <= 9999.99" },
+    { name: "t_b_check", expr: "b > 0" },
+    { name: "t_note_check", expr: "note = 'ok' OR note = 'a''b'" }
+  ],
+  rows: [[1, 5, "1.00", "ok"], [2, nil, "9999.99", "a'b"], [3, 100, "0.50", "ok"]]
 }.freeze
 
 PK_TABLE = {
@@ -284,6 +305,7 @@ FIXTURES = [
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
   { file: "composite_pk_table.jed", page_size: 256, tables: [COMPOSITE_PK_TABLE] },
+  { file: "check_table.jed", page_size: 256, tables: [CHECK_TABLE] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
@@ -399,6 +421,14 @@ def table_entry_bytes(table, root_data_page)
     # A column with a DEFAULT (flags bit2) appends its pre-evaluated default value via the same
     # value codec rows use — AFTER the typmod, presence-gated. A DEFAULT NULL is one 0x01.
     out << encode_value(c[:type], c[:default]) if has_default
+  end
+  # CHECK constraints (v4): count, then (name, expression text) per check, in the catalog's
+  # evaluation order — ascending byte order of the lowercased name (constraints.md §4.4/§4.5).
+  checks = table[:checks] || []
+  out << u16(checks.size)
+  checks.each do |ck|
+    out << u16(ck[:name].bytesize) << ck[:name].b
+    out << u16(ck[:expr].bytesize) << ck[:expr].b
   end
   out << u32(root_data_page)
   out
@@ -805,8 +835,18 @@ def decode_table_entry(buf, pos)
     columns << { name: cname, type: type, pk: (f & 0b01) != 0, not_null: (f & 0b10) != 0,
                  precision: precision, scale: scale, default: default }
   end
+  # CHECK constraints (v4): (name, expression text) pairs in evaluation order.
+  checks = []
+  cc, pos = take(buf, pos, 2)
+  cc.unpack1("n").times do
+    nl, pos = take(buf, pos, 2)
+    cname, pos = take(buf, pos, nl.unpack1("n"))
+    el, pos = take(buf, pos, 2)
+    expr, pos = take(buf, pos, el.unpack1("n"))
+    checks << { name: cname, expr: expr }
+  end
   root, pos = take(buf, pos, 4)
-  [{ name: name, columns: columns, root_data_page: root.unpack1("N") }, pos]
+  [{ name: name, columns: columns, checks: checks, root_data_page: root.unpack1("N") }, pos]
 end
 
 # Read one value via the value codec (inverse of encode_value): a presence tag, then — when
@@ -969,7 +1009,7 @@ def decode_image(image)
     pg[:item_count].times do
       entry, pos = decode_table_entry(pg[:payload], pos)
       rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns])
-      tables << { name: entry[:name], columns: entry[:columns], rows: rows }
+      tables << { name: entry[:name], columns: entry[:columns], checks: entry[:checks], rows: rows }
     end
     cat = pg[:next_page]
   end
@@ -985,6 +1025,7 @@ def expected_tables(fx)
         { name: c[:name], type: c[:type], pk: c[:pk], not_null: c[:not_null],
           precision: c[:precision], scale: c[:scale], default: c[:default] }
       end,
+      checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr] } },
       rows: table_entries(t).map { |_key, row| row } }
   end
 end

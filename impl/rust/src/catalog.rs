@@ -1,5 +1,6 @@
 //! The catalog: table and column definitions (CLAUDE.md §4 strict static types).
 
+use crate::ast::Expr;
 use crate::types::{DecimalTypmod, ScalarType};
 use crate::value::Value;
 
@@ -21,11 +22,26 @@ pub struct Column {
     pub default: Option<Value>,
 }
 
+/// One `CHECK` constraint: its (resolved, unique-per-table) name, its persisted expression
+/// text — written back verbatim at every commit so the catalog bytes are stable
+/// (spec/fileformat/format.md "Check-expression text") — and the parsed expression the
+/// write paths resolve and evaluate per candidate row (spec/design/constraints.md §4).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CheckConstraint {
+    pub name: String,
+    pub expr_text: String,
+    pub expr: Expr,
+}
+
 /// A table definition.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
+    /// The table's CHECK constraints in **evaluation order** — ascending byte order of the
+    /// lowercased name (spec/design/constraints.md §4.4); the on-disk catalog stores them in
+    /// this same order. Empty for an unchecked table.
+    pub checks: Vec<CheckConstraint>,
 }
 
 impl Table {

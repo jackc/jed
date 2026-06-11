@@ -515,9 +515,121 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 	}
 
-	db.putTable(&Table{Name: ct.Name, Columns: columns})
+	// CHECK constraints (constraints.md §4). All validation runs first, in textual
+	// definition order, AFTER the PRIMARY KEY constraints resolved (PG's order,
+	// oracle-probed); naming follows in a second pass, so a 42703 in a later check fires
+	// before a 42710 between earlier ones. Resolution needs a catalog *Table, so build it
+	// now (checks attach below, before putTable).
+	table := &Table{Name: ct.Name, Columns: columns}
+	for i := range ct.Checks {
+		def := &ct.Checks[i]
+		// Structural rejections first (a single pre-walk — a documented micro-order
+		// divergence from PG, which interleaves them with name/type resolution): subquery
+		// 0A000, aggregate 42803, bind parameter 42P02 (constraints.md §4.1).
+		if err := rejectCheckStructure(def.Expr); err != nil {
+			return Outcome{}, err
+		}
+		s := singleScope(db, table)
+		_, ty, err := resolve(s, def.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
+		if err != nil {
+			return Outcome{}, err
+		}
+		if ty.kind != rtBool && ty.kind != rtNull {
+			return Outcome{}, typeError("argument of CHECK must be boolean")
+		}
+	}
+	// Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
+	// used as written; a derived name is built from the LOWERCASED table/column names —
+	// `<table>_<col>_check` when the expression references exactly one distinct column,
+	// else `<table>_check` — suffixed with the smallest positive integer that frees it. A
+	// collision (case-insensitive, PG folds) is 42710; derived names never yield to a later
+	// explicit one (oracle-probed).
+	checks := make([]CheckConstraint, 0, len(ct.Checks))
+	nameTaken := func(name string) bool {
+		for _, c := range checks {
+			if strings.EqualFold(c.Name, name) {
+				return true
+			}
+		}
+		return false
+	}
+	for i := range ct.Checks {
+		def := &ct.Checks[i]
+		name := def.Name
+		if name != "" {
+			if nameTaken(name) {
+				return Outcome{}, NewError(DuplicateObject,
+					"check constraint "+name+" already exists")
+			}
+		} else {
+			cols := checkReferencedColumns(def.Expr, columns)
+			var base string
+			if len(cols) == 1 {
+				base = strings.ToLower(table.Name) + "_" + strings.ToLower(columns[cols[0]].Name) + "_check"
+			} else {
+				base = strings.ToLower(table.Name) + "_check"
+			}
+			name = base
+			for suffix := 1; nameTaken(name); suffix++ {
+				name = base + strconv.Itoa(suffix)
+			}
+		}
+		checks = append(checks, CheckConstraint{Name: name, ExprText: def.Text, Expr: def.Expr})
+	}
+	// Evaluation (and on-disk) order: ascending byte order of the lowercased name
+	// (constraints.md §4.4 — PG evaluates checks sorted by name, oracle-probed).
+	sort.SliceStable(checks, func(i, j int) bool {
+		return strings.ToLower(checks[i].Name) < strings.ToLower(checks[j].Name)
+	})
+	table.Checks = checks
+
+	db.putTable(table)
 	// DDL touches no rows and evaluates no expressions: zero cost.
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// resolveChecks resolves a table's CHECK constraints for a write statement: each stored
+// expression against a one-relation scope, in the catalog's (evaluation/name) order.
+// Cannot fail for a catalog produced by CREATE TABLE or a well-formed file (both
+// validated); a hand-corrupted expression surfaces its natural resolve error.
+func (db *Database) resolveChecks(table *Table) ([]namedCheck, error) {
+	if len(table.Checks) == 0 {
+		return nil, nil
+	}
+	s := singleScope(db, table)
+	out := make([]namedCheck, 0, len(table.Checks))
+	for i := range table.Checks {
+		node, _, err := resolve(s, table.Checks[i].Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, namedCheck{name: table.Checks[i].Name, node: node})
+	}
+	return out, nil
+}
+
+// namedCheck is one statement-resolved CHECK constraint: its name (for the 23514
+// message) and the resolved expression evaluated per candidate row.
+type namedCheck struct {
+	name string
+	node *rExpr
+}
+
+// evalChecks evaluates a row's CHECK constraints in name order (constraints.md §4.4):
+// TRUE and NULL pass; the first FALSE aborts with 23514 and PG's message. Shared by the
+// INSERT and UPDATE write paths.
+func evalChecks(checks []namedCheck, relation string, row Row, env *evalEnv, meter *Meter) error {
+	for _, c := range checks {
+		v, err := c.node.eval(row, env, meter)
+		if err != nil {
+			return err
+		}
+		if v.Kind == ValBool && !v.Bool {
+			return NewError(CheckViolation,
+				"new row for relation "+relation+" violates check constraint "+c.name)
+		}
+	}
+	return nil
 }
 
 // executeDropTable runs a DROP TABLE: remove the table's definition and its row store
@@ -553,6 +665,12 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	// The key members in key order — one for a single-column PK, several for a composite
 	// (constraints.md §3), empty for a no-PK (rowid) table.
 	pk := table.PKIndices()
+	// The CHECK constraints, resolved once per statement in evaluation (name) order;
+	// insertRows evaluates them per candidate row (constraints.md §4.4).
+	checks, err := db.resolveChecks(table)
+	if err != nil {
+		return Outcome{}, err
+	}
 
 	// Resolve the optional column list once. provided[i] >= 0 means table column i takes that
 	// value position in each row; -1 means column i is omitted (its default, else NULL). With no
@@ -625,7 +743,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		// one ceiling over the whole statement.
 		meter := NewMeterWithLimit(db.maxCost)
 		meter.Charge(q.cost)
-		if err := db.insertRows(table, store, pk, provided, q.rows, meter); err != nil {
+		if err := db.insertRows(table, store, pk, checks, provided, q.rows, meter); err != nil {
 			return Outcome{}, err
 		}
 		return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
@@ -691,7 +809,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	// metered work is the disposition plan's compression attempts for over-RECORD_MAX rows
 	// (value_compress, cost.md §3); a fully-inline row still costs zero.
 	meter := NewMeterWithLimit(db.maxCost)
-	if err := db.insertRows(table, store, pk, provided, rows, meter); err != nil {
+	if err := db.insertRows(table, store, pk, checks, provided, rows, meter); err != nil {
 		return Outcome{}, err
 	}
 	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
@@ -705,7 +823,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 // seenKeys AND against the store) BEFORE any row is written; only once every row validates are
 // they all inserted (phase 2), allocating a fresh monotonic rowid in row order for a no-PK table.
 // All-or-nothing: a failure leaves the store untouched and burns no rowids.
-func (db *Database) insertRows(table *Table, store *TableStore, pk []int, provided []int, rows [][]Value, meter *Meter) error {
+func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, provided []int, rows [][]Value, meter *Meter) error {
 	n := len(table.Columns)
 	type preparedRow struct {
 		key []byte // nil for a no-PK table (rowid allocated in phase 2)
@@ -728,6 +846,21 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, provid
 				return err
 			}
 			row[i] = v
+		}
+
+		// CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
+		// NULL (storeValue above), before the key/duplicate check (PG's per-row order,
+		// constraints.md §4.4). TRUE and NULL pass; the first FALSE aborts the whole
+		// statement (two-phase — nothing has been written). Evaluation is metered
+		// expression work (operator_eval), so guard the ceiling per checked row.
+		if len(checks) > 0 {
+			if err := meter.Guard(); err != nil {
+				return err
+			}
+			env := &evalEnv{exec: db}
+			if err := evalChecks(checks, table.Name, row, env, meter); err != nil {
+				return err
+			}
 		}
 
 		var key []byte
@@ -965,6 +1098,12 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		}
 		filter = f
 	}
+	// The CHECK constraints, resolved once per statement in evaluation (name) order;
+	// phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
+	checks, err := db.resolveChecks(table)
+	if err != nil {
+		return Outcome{}, err
+	}
 	// All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
 	ptys, err := ptypes.finalize()
 	if err != nil {
@@ -1071,6 +1210,14 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		// columns so its weight/disposition re-plan exactly as an eager writer's would —
 		// unmetered, part of the rewrite like commit work (large-values.md §14).
 		if newRow, err = store.resolveAll(newRow); err != nil {
+			return Outcome{}, err
+		}
+		// CHECK constraints, in name order, on the post-assignment row — after the
+		// assignments coerced (22003/23502 in p.check above), on the fully-resident row
+		// (constraints.md §4.4). Every check evaluates (not only those mentioning assigned
+		// columns); TRUE and NULL pass, the first FALSE aborts the statement (phase 1 —
+		// nothing has been written).
+		if err := evalChecks(checks, table.Name, newRow, env, meter); err != nil {
 			return Outcome{}, err
 		}
 		updates = append(updates, pending{key: e.Key, row: newRow})
@@ -3488,6 +3635,158 @@ func exprHasAggregate(e Expr) bool {
 	default:
 		return false
 	}
+}
+
+// rejectCheckStructure applies the structural CHECK-expression rejections
+// (spec/design/constraints.md §4.1) in a single depth-first pre-order walk before
+// resolution: a subquery is 0A000, an aggregate call 42803, a bind parameter 42P02 — PG's
+// codes and messages (oracle-probed; PG interleaves these with resolution in parse order,
+// a documented micro-order divergence).
+func rejectCheckStructure(e Expr) error {
+	switch e.Kind {
+	case ExprScalarSubquery, ExprExists, ExprInSubquery:
+		return NewError(FeatureNotSupported, "cannot use subquery in check constraint")
+	case ExprParam:
+		return NewError(UndefinedParameter,
+			"there is no parameter $"+strconv.FormatUint(e.Param, 10))
+	case ExprFuncCall:
+		if isAggregateName(e.FuncCall.Name) {
+			return NewError(GroupingError,
+				"aggregate functions are not allowed in check constraints")
+		}
+		for _, a := range e.FuncCall.Args {
+			if err := rejectCheckStructure(*a); err != nil {
+				return err
+			}
+		}
+		return nil
+	case ExprCast:
+		return rejectCheckStructure(e.Cast.Inner)
+	case ExprUnary:
+		return rejectCheckStructure(e.Unary.Operand)
+	case ExprIsNull:
+		return rejectCheckStructure(e.IsNullOf.Operand)
+	case ExprBinary:
+		if err := rejectCheckStructure(e.Binary.Lhs); err != nil {
+			return err
+		}
+		return rejectCheckStructure(e.Binary.Rhs)
+	case ExprIsDistinct:
+		if err := rejectCheckStructure(e.IsDistinct.Lhs); err != nil {
+			return err
+		}
+		return rejectCheckStructure(e.IsDistinct.Rhs)
+	case ExprLike:
+		if err := rejectCheckStructure(e.Like.Lhs); err != nil {
+			return err
+		}
+		return rejectCheckStructure(e.Like.Rhs)
+	case ExprIn:
+		if err := rejectCheckStructure(e.In.Lhs); err != nil {
+			return err
+		}
+		for _, elem := range e.In.List {
+			if err := rejectCheckStructure(elem); err != nil {
+				return err
+			}
+		}
+		return nil
+	case ExprBetween:
+		if err := rejectCheckStructure(e.Between.Lhs); err != nil {
+			return err
+		}
+		if err := rejectCheckStructure(e.Between.Lo); err != nil {
+			return err
+		}
+		return rejectCheckStructure(e.Between.Hi)
+	case ExprCase:
+		if e.Case.Operand != nil {
+			if err := rejectCheckStructure(*e.Case.Operand); err != nil {
+				return err
+			}
+		}
+		for _, w := range e.Case.Whens {
+			if err := rejectCheckStructure(w.Cond); err != nil {
+				return err
+			}
+			if err := rejectCheckStructure(w.Result); err != nil {
+				return err
+			}
+		}
+		if e.Case.Els != nil {
+			return rejectCheckStructure(*e.Case.Els)
+		}
+		return nil
+	default: // ExprColumn, ExprQualifiedColumn, ExprLiteral
+		return nil
+	}
+}
+
+// checkReferencedColumns returns the distinct columns a CHECK expression references, as
+// indices into columns — the input to PG's auto-naming rule (constraints.md §4.3: exactly
+// one distinct column → <table>_<col>_check). Resolution already validated every
+// reference, so an unknown name is simply skipped; a qualified reference counts its column
+// like a bare one (oracle-probed).
+func checkReferencedColumns(e Expr, columns []Column) []int {
+	var out []int
+	var walk func(e Expr)
+	note := func(name string) {
+		for i := range columns {
+			if strings.EqualFold(columns[i].Name, name) {
+				if !slices.Contains(out, i) {
+					out = append(out, i)
+				}
+				return
+			}
+		}
+	}
+	walk = func(e Expr) {
+		switch e.Kind {
+		case ExprColumn, ExprQualifiedColumn:
+			note(e.Column)
+		case ExprCast:
+			walk(e.Cast.Inner)
+		case ExprUnary:
+			walk(e.Unary.Operand)
+		case ExprIsNull:
+			walk(e.IsNullOf.Operand)
+		case ExprBinary:
+			walk(e.Binary.Lhs)
+			walk(e.Binary.Rhs)
+		case ExprIsDistinct:
+			walk(e.IsDistinct.Lhs)
+			walk(e.IsDistinct.Rhs)
+		case ExprLike:
+			walk(e.Like.Lhs)
+			walk(e.Like.Rhs)
+		case ExprIn:
+			walk(e.In.Lhs)
+			for _, elem := range e.In.List {
+				walk(elem)
+			}
+		case ExprBetween:
+			walk(e.Between.Lhs)
+			walk(e.Between.Lo)
+			walk(e.Between.Hi)
+		case ExprCase:
+			if e.Case.Operand != nil {
+				walk(*e.Case.Operand)
+			}
+			for _, w := range e.Case.Whens {
+				walk(w.Cond)
+				walk(w.Result)
+			}
+			if e.Case.Els != nil {
+				walk(*e.Case.Els)
+			}
+		case ExprFuncCall:
+			for _, a := range e.FuncCall.Args {
+				walk(*a)
+			}
+		}
+	}
+	walk(e)
+	return out
 }
 
 // resolveAggregate resolves an aggregate call into a synthetic-row reference, collecting its

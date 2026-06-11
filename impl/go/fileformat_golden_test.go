@@ -88,6 +88,21 @@ func compositePKTableDB(t *testing.T) *Database {
 	return db
 }
 
+// checkTableDB has CHECK constraints (constraints.md §4) — exercises the v4 catalog check
+// list: an auto-named single-column check, an explicitly-named multi-column check, and a
+// check whose persisted text exercises the token rendering (string literal with a doubled
+// quote, decimal literals, >=/<=), stored in name order
+// (price_range < t_b_check < t_note_check).
+func checkTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (a int PRIMARY KEY, b int CHECK (b > 0), price numeric(8,2), "+
+		"CONSTRAINT price_range CHECK (price >= 0.50 AND price <= 9999.99), note text, "+
+		"CHECK (note = 'ok' OR note = 'a''b'))")
+	run(t, db, "INSERT INTO t VALUES (1, 5, 1.00, 'ok'), (2, NULL, 9999.99, 'a''b'), "+
+		"(3, 100, 0.50, 'ok')")
+	return db
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 func nopkTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
@@ -308,6 +323,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"timestamptz_table.jed", timestamptzTableDB},
 		{"nopk_table.jed", nopkTableDB},
 		{"composite_pk_table.jed", compositePKTableDB},
+		{"check_table.jed", checkTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -343,6 +359,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"timestamptz_table.jed", timestamptzTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"composite_pk_table.jed", compositePKTableDB, "t"},
+		{"check_table.jed", checkTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

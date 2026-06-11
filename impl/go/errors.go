@@ -37,6 +37,9 @@ const (
 	NotNullViolation
 	// UniqueViolation is 23505 — unique (primary key) constraint violation.
 	UniqueViolation
+	// CheckViolation is 23514 — a candidate row falsified a CHECK expression at
+	// INSERT/UPDATE (spec/design/constraints.md §4).
+	CheckViolation
 	// ActiveSqlTransaction is 25001 — a BEGIN issued while a transaction is already open (no
 	// nesting — there is no SAVEPOINT this slice; spec/design/transactions.md §4.2).
 	ActiveSqlTransaction
@@ -79,6 +82,12 @@ const (
 	// IndeterminateDatatype is 42P18 — a bind parameter $N whose type cannot be inferred from
 	// context (spec/design/api.md §5).
 	IndeterminateDatatype
+	// UndefinedParameter is 42P02 — a bind parameter $N where none can exist (a CHECK
+	// expression; spec/design/constraints.md §4.1).
+	UndefinedParameter
+	// DuplicateObject is 42710 — a constraint name already taken on this table
+	// (spec/design/constraints.md §4.3).
+	DuplicateObject
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
 	// CostLimitExceeded is 54P01 — a query's accrued execution cost reached the caller-set
@@ -122,6 +131,8 @@ func (s SqlState) Code() string {
 		return "23502"
 	case UniqueViolation:
 		return "23505"
+	case CheckViolation:
+		return "23514"
 	case ActiveSqlTransaction:
 		return "25001"
 	case ReadOnlySqlTransaction:
@@ -156,6 +167,10 @@ func (s SqlState) Code() string {
 		return "42883"
 	case IndeterminateDatatype:
 		return "42P18"
+	case UndefinedParameter:
+		return "42P02"
+	case DuplicateObject:
+		return "42710"
 	case FeatureNotSupported:
 		return "0A000"
 	case CostLimitExceeded:

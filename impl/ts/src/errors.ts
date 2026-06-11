@@ -19,6 +19,7 @@ export type SqlState =
   | "invalid_row_count_in_offset_clause" // 2201X — a negative OFFSET count
   | "not_null_violation" // 23502
   | "unique_violation" // 23505 — primary-key uniqueness
+  | "check_violation" // 23514 — a candidate row falsified a CHECK expression (constraints.md §4)
   | "active_sql_transaction" // 25001 — a nested BEGIN (no SAVEPOINT this slice; transactions.md §4.2)
   | "read_only_sql_transaction" // 25006 — a write in a READ ONLY transaction (transactions.md §4.3)
   | "in_failed_sql_transaction" // 25P02 — a statement in a failed/aborted block (transactions.md §6)
@@ -36,6 +37,8 @@ export type SqlState =
   | "grouping_error" // 42803 — non-aggregated column not in GROUP BY, or aggregate in WHERE/ON/nested
   | "undefined_function" // 42883 — an unknown function name in a call (aggregates.md §5)
   | "indeterminate_datatype" // 42P18 — a bind parameter $N whose type cannot be inferred (api.md §5)
+  | "undefined_parameter" // 42P02 — a bind parameter $N where none can exist (a CHECK expression)
+  | "duplicate_object" // 42710 — a constraint name already taken on this table (constraints.md §4.3)
   | "feature_not_supported" // 0A000
   | "cost_limit_exceeded" // 54P01 — accrued cost reached the caller-set max_cost ceiling (cost.md §6)
   | "io_error" // 58030 — an I/O error from the host file layer (spec/design/api.md §2)
@@ -56,6 +59,7 @@ const CODES: Record<SqlState, string> = {
   invalid_row_count_in_offset_clause: "2201X",
   not_null_violation: "23502",
   unique_violation: "23505",
+  check_violation: "23514",
   active_sql_transaction: "25001",
   read_only_sql_transaction: "25006",
   in_failed_sql_transaction: "25P02",
@@ -73,6 +77,8 @@ const CODES: Record<SqlState, string> = {
   grouping_error: "42803",
   undefined_function: "42883",
   indeterminate_datatype: "42P18",
+  undefined_parameter: "42P02",
+  duplicate_object: "42710",
   feature_not_supported: "0A000",
   cost_limit_exceeded: "54P01",
   io_error: "58030",

@@ -1,6 +1,7 @@
 //! On-disk single-file format: serialize / load (spec/fileformat/format.md).
 //!
-//! `format_version` 2 — the page-backed copy-on-write B-tree (Phase 6, P6.1): each table's rows are
+//! `format_version` 4 — the page-backed copy-on-write B-tree (Phase 6, P6.1; v3 added large-value
+//! overflow/compression, v4 the catalog CHECK-constraint list): each table's rows are
 //! an on-disk B-tree (leaf + interior node pages), the catalog is a relocatable page chain, and
 //! `to_image` lays the whole tree out post-order (the from-scratch image the goldens pin; the
 //! incremental dirty-page commit reuses the same node codec — storage.md §4). The byte layout is the
@@ -12,7 +13,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::catalog::{Column, Table};
+use crate::catalog::{CheckConstraint, Column, Table};
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
@@ -27,7 +28,7 @@ use crate::value::{Unfetched, Value};
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
 /// On-disk format version — 3 = + out-of-line overflow pages for large values (large-values.md §12).
-const FORMAT_VERSION: u16 = 3;
+const FORMAT_VERSION: u16 = 4;
 /// Bytes of the page header on catalog / B-tree pages.
 const PAGE_HEADER: usize = 12;
 /// Smallest valid page size: the 36-byte meta header (plus the page header) must fit
@@ -1309,6 +1310,19 @@ fn table_entry_bytes(table: &Table, root_data_page: u32) -> Vec<u8> {
             out.extend_from_slice(&encode_value(col.ty, d));
         }
     }
+    // CHECK constraints (v4): count, then (name, expression text) per check, in the
+    // catalog's evaluation order — the text is written back VERBATIM, so the bytes are
+    // stable across create → commit → load → commit (spec/fileformat/format.md
+    // "Check-expression text").
+    out.extend_from_slice(&(table.checks.len() as u16).to_be_bytes());
+    for check in &table.checks {
+        let cn = check.name.as_bytes();
+        out.extend_from_slice(&(cn.len() as u16).to_be_bytes());
+        out.extend_from_slice(cn);
+        let ce = check.expr_text.as_bytes();
+        out.extend_from_slice(&(ce.len() as u16).to_be_bytes());
+        out.extend_from_slice(ce);
+    }
     out.extend_from_slice(&root_data_page.to_be_bytes());
     out
 }
@@ -1556,8 +1570,31 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32)> {
             default,
         });
     }
+    // CHECK constraints (v4): the stored expression text re-parses with the ordinary
+    // expression parser — it was written by the token renderer, so this cannot fail for a
+    // file the engine wrote; failure means the file lied (XX001, constraints.md §4.5).
+    let check_count = read_u16(buf, pos)? as usize;
+    let mut checks = Vec::with_capacity(check_count);
+    for _ in 0..check_count {
+        let check_name = read_string(buf, pos)?;
+        let expr_text = read_string(buf, pos)?;
+        let expr = crate::parser::parse_expression(&expr_text)
+            .map_err(|e| corrupt(&format!("stored check constraint does not parse: {e}")))?;
+        checks.push(CheckConstraint {
+            name: check_name,
+            expr_text,
+            expr,
+        });
+    }
     let root_data_page = read_u32(buf, pos)?;
-    Ok((Table { name, columns }, root_data_page))
+    Ok((
+        Table {
+            name,
+            columns,
+            checks,
+        },
+        root_data_page,
+    ))
 }
 
 /// Decode one record `(key, row)` and the **overflow chain pages** any external value followed

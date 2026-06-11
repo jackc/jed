@@ -586,7 +586,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       catalog reshape), and the PK pushdown stays single-column (a composite-PK table
       full-scans; composite point-lookup/prefix pushdown is a follow-on optimization slice
       with its NoREC obligation).
-- [ ] **Constraints (remaining)** — `UNIQUE`, `CHECK`, `FOREIGN KEY`. These are heavier.
+- [x] **`CHECK` constraints** — ✅ landed (all 3 cores): column-level and table-level
+      `[CONSTRAINT name] CHECK (expr)` (constraints.md §4, grammar.md §29). Boolean row
+      predicates enforced per candidate row at INSERT/UPDATE inside the two-phase pass
+      (23514; TRUE/NULL pass), evaluated in **name order** (PG, oracle-probed); PG's
+      auto-naming (`t_col_check` / `t_check` + smallest-free suffix, single pass in textual
+      order); DDL rejections 42804 / 0A000 subquery / 42803 aggregate / 42P02 param /
+      42703 / 42P01 / 42710, with PG's validation-then-naming order. Persisted under
+      **`format_version` 4** as `(name, expression-text)` pairs in the catalog table entry —
+      the text is the **re-rendered source token sequence** (format.md "Check-expression
+      text", a closed recursion-free byte contract), re-parsed at load (bad text → XX001)
+      and written back verbatim at commit. Check evaluation is metered (`operator_eval`
+      per interior node per row — the documented exception to "VALUES inserts cost zero"),
+      pinned cross-core by `# cost:` corpus assertions. One documented micro-divergence:
+      structural rejections pre-walk before name/type resolution (PG interleaves). New
+      golden `check_table.jed` (19 fixtures, rust==go==ts==ruby); capability `ddl.check`;
+      corpus `ddl/check.test` oracle-checked byte-identically (2 ledgered overrides: the
+      non-reserved `check`/`constraint` column names).
+- [ ] **Constraints (remaining)** — `UNIQUE`, `FOREIGN KEY`. These are heavier.
       _(size: M→L each)_
 - [ ] **Secondary indexes** (`CREATE INDEX`) — also a planner + storage concern (index
       pages, index maintenance on write). _(size: L; deps: storage maturation)_

@@ -3,6 +3,8 @@ package jed
 import (
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 )
 
 // foldInt converts a lexed unsigned magnitude (<= 2^63) and a sign into a signed
@@ -198,6 +200,7 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 
 	var columns []ColumnDef
 	var tablePKs [][]string
+	var checks []CheckDef
 	for {
 		if p.peekKeyword() == "primary" && p.peekKeywordAt(1) == "key" {
 			p.advance()
@@ -207,8 +210,14 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 				return nil, err
 			}
 			tablePKs = append(tablePKs, pkCols)
+		} else if p.atCheckConstraint() {
+			check, err := p.parseCheckConstraint()
+			if err != nil {
+				return nil, err
+			}
+			checks = append(checks, check)
 		} else {
-			col, err := p.parseColumnDef()
+			col, err := p.parseColumnDef(&checks)
 			if err != nil {
 				return nil, err
 			}
@@ -226,7 +235,50 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	if len(columns) == 0 {
 		return nil, NewError(SyntaxError, "a table must have at least one column")
 	}
-	return &CreateTable{Name: name, Columns: columns, TablePKs: tablePKs}, nil
+	return &CreateTable{Name: name, Columns: columns, TablePKs: tablePKs, Checks: checks}, nil
+}
+
+// atCheckConstraint reports whether the cursor sits on a CHECK constraint: the keyword
+// CHECK followed by "(", or CONSTRAINT <ident> CHECK "(" (spec/design/grammar.md §29). The
+// keywords stay non-reserved — a column named "check"/"constraint" is followed by a type
+// name (an identifier, never "("), so the lookahead loses nothing.
+func (p *Parser) atCheckConstraint() bool {
+	if p.peekKeyword() == "check" && p.peekKindAt(1) == TokLParen {
+		return true
+	}
+	return p.peekKeyword() == "constraint" &&
+		p.peekKeywordAt(2) == "check" && p.peekKindAt(3) == TokLParen
+}
+
+// parseCheckConstraint parses one `[CONSTRAINT name] CHECK ( expr )` (the cursor is
+// verified by atCheckConstraint). The token span between the parentheses is re-rendered as
+// the constraint's persisted text (spec/fileformat/format.md "Check-expression text").
+func (p *Parser) parseCheckConstraint() (CheckDef, error) {
+	name := ""
+	if p.peekKeyword() == "constraint" {
+		p.advance()
+		n, err := p.expectIdentifier()
+		if err != nil {
+			return CheckDef{}, err
+		}
+		name = n
+	}
+	if err := p.expectKeyword("check"); err != nil {
+		return CheckDef{}, err
+	}
+	if err := p.expect(TokLParen); err != nil {
+		return CheckDef{}, err
+	}
+	start := p.pos
+	expr, err := p.parseExpr()
+	if err != nil {
+		return CheckDef{}, err
+	}
+	text := renderTokens(p.tokens[start:p.pos])
+	if err := p.expect(TokRParen); err != nil {
+		return CheckDef{}, err
+	}
+	return CheckDef{Name: name, Expr: expr, Text: text}, nil
 }
 
 // parsePKColumnList parses the parenthesized member list of a table-level PRIMARY KEY
@@ -257,7 +309,7 @@ func (p *Parser) parsePKColumnList() ([]string, error) {
 	}
 }
 
-func (p *Parser) parseColumnDef() (ColumnDef, error) {
+func (p *Parser) parseColumnDef(checks *[]CheckDef) (ColumnDef, error) {
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return ColumnDef{}, err
@@ -270,12 +322,23 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	if err != nil {
 		return ColumnDef{}, err
 	}
-	// Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, and DEFAULT <literal>.
-	// A boolean constraint may be repeated harmlessly; a repeated DEFAULT keeps the last.
+	// Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, DEFAULT <literal>,
+	// and [CONSTRAINT name] CHECK ( expr ). A boolean constraint may be repeated harmlessly;
+	// a repeated DEFAULT keeps the last; each CHECK is a distinct constraint, collected into
+	// the statement-wide list in textual order (a column-level check is semantically
+	// identical to a table-level one — spec/design/constraints.md §4).
 	primaryKey := false
 	notNull := false
 	var def *Literal
 	for {
+		if p.atCheckConstraint() {
+			check, err := p.parseCheckConstraint()
+			if err != nil {
+				return ColumnDef{}, err
+			}
+			*checks = append(*checks, check)
+			continue
+		}
 		switch p.peekKeyword() {
 		case "primary":
 			p.advance()
@@ -1667,4 +1730,86 @@ func toLowerASCII(s string) string {
 		}
 	}
 	return string(b)
+}
+
+// ParseExpression parses a bare expression — the catalog-load path for a persisted CHECK
+// expression (spec/design/constraints.md §4.5). The text was written by renderTokens, so
+// it re-lexes to a value-identical token sequence; the caller maps a failure to XX001
+// (the file claimed to be well-formed).
+func ParseExpression(text string) (Expr, error) {
+	tokens, err := Lex(text)
+	if err != nil {
+		return Expr{}, err
+	}
+	p := &Parser{tokens: tokens}
+	expr, err := p.parseExpr()
+	if err != nil {
+		return Expr{}, err
+	}
+	if err := p.expectEof(); err != nil {
+		return Expr{}, err
+	}
+	return expr, nil
+}
+
+// renderTokens re-renders a token slice as the persisted check-expression text: each token
+// rendered by the closed table in spec/fileformat/format.md "Check-expression text", joined
+// with single spaces. A byte contract — identical across every core (CLAUDE.md §8).
+func renderTokens(tokens []Token) string {
+	parts := make([]string, len(tokens))
+	for i, t := range tokens {
+		parts[i] = renderToken(t)
+	}
+	return strings.Join(parts, " ")
+}
+
+func renderToken(t Token) string {
+	switch t.Kind {
+	case TokWord:
+		return t.Word
+	case TokInt:
+		return strconv.FormatUint(t.Int, 10)
+	case TokDecimal:
+		// The digit string with '.' inserted `scale` digits from the right. The lexer
+		// guarantees scale <= len(coeff) (every fractional digit is in the coefficient), so
+		// the insertion point is in range; scale == len renders a leading-dot form (".5")
+		// and scale == 0 a trailing-dot form ("1."), both of which re-lex as the same
+		// decimal value (spec/fileformat/format.md "Check-expression text").
+		split := len(t.Word) - int(t.Int)
+		return t.Word[:split] + "." + t.Word[split:]
+	case TokStr:
+		return "'" + strings.ReplaceAll(t.Word, "'", "''") + "'"
+	case TokParam:
+		return "$" + strconv.FormatUint(t.Int, 10)
+	case TokComma:
+		return ","
+	case TokDot:
+		return "."
+	case TokLParen:
+		return "("
+	case TokRParen:
+		return ")"
+	case TokStar:
+		return "*"
+	case TokPlus:
+		return "+"
+	case TokMinus:
+		return "-"
+	case TokSlash:
+		return "/"
+	case TokPercent:
+		return "%"
+	case TokEq:
+		return "="
+	case TokLt:
+		return "<"
+	case TokGt:
+		return ">"
+	case TokLe:
+		return "<="
+	case TokGe:
+		return ">="
+	default: // TokEof — never inside the parentheses
+		return ""
+	}
 }

@@ -5,6 +5,7 @@
 import type {
   Assignment,
   BinaryOp,
+  CheckDef,
   ColumnDef,
   Delete,
   Expr,
@@ -205,13 +206,16 @@ class Parser {
 
     const columns: ColumnDef[] = [];
     const tablePks: string[][] = [];
+    const checks: CheckDef[] = [];
     for (;;) {
       if (this.peekKeyword() === "primary" && this.peekKeywordAt(1) === "key") {
         this.advance();
         this.advance();
         tablePks.push(this.parsePkColumnList());
+      } else if (this.atCheckConstraint()) {
+        checks.push(this.parseCheckConstraint());
       } else {
-        columns.push(this.parseColumnDef());
+        columns.push(this.parseColumnDef(checks));
       }
       const k = this.advance().kind;
       if (k === "comma") continue;
@@ -221,7 +225,38 @@ class Parser {
     if (columns.length === 0) {
       throw engineError("syntax_error", "a table must have at least one column");
     }
-    return { kind: "createTable", name, columns, tablePks };
+    return { kind: "createTable", name, columns, tablePks, checks };
+  }
+
+  // atCheckConstraint reports whether the cursor sits on a CHECK constraint: the keyword
+  // CHECK followed by "(", or CONSTRAINT <ident> CHECK "(" (spec/design/grammar.md §29).
+  // The keywords stay non-reserved — a column named "check"/"constraint" is followed by a
+  // type name (an identifier, never "("), so the lookahead loses nothing.
+  private atCheckConstraint(): boolean {
+    if (this.peekKeyword() === "check" && this.peekKindAt(1) === "lparen") return true;
+    return (
+      this.peekKeyword() === "constraint" &&
+      this.peekKeywordAt(2) === "check" &&
+      this.peekKindAt(3) === "lparen"
+    );
+  }
+
+  // parseCheckConstraint parses one `[CONSTRAINT name] CHECK ( expr )` (the cursor is
+  // verified by atCheckConstraint). The token span between the parentheses is re-rendered
+  // as the constraint's persisted text (spec/fileformat/format.md "Check-expression text").
+  private parseCheckConstraint(): CheckDef {
+    let name: string | null = null;
+    if (this.peekKeyword() === "constraint") {
+      this.advance();
+      name = this.expectIdentifier();
+    }
+    this.expectKeyword("check");
+    this.expect("lparen");
+    const start = this.pos;
+    const expr = this.parseExpr();
+    const text = renderTokens(this.tokens.slice(start, this.pos));
+    this.expect("rparen");
+    return { name, expr, text };
   }
 
   // parsePkColumnList parses the parenthesized member list of a table-level PRIMARY KEY
@@ -241,16 +276,23 @@ class Parser {
     }
   }
 
-  private parseColumnDef(): ColumnDef {
+  private parseColumnDef(checks: CheckDef[]): ColumnDef {
     const name = this.expectIdentifier();
     const typeName = this.expectIdentifier();
     const typeMod = this.parseTypeMod();
-    // Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, and DEFAULT <literal>.
-    // A boolean constraint may be repeated harmlessly; a repeated DEFAULT keeps the last.
+    // Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, DEFAULT <literal>,
+    // and [CONSTRAINT name] CHECK ( expr ). A boolean constraint may be repeated harmlessly;
+    // a repeated DEFAULT keeps the last; each CHECK is a distinct constraint, collected into
+    // the statement-wide list in textual order (a column-level check is semantically
+    // identical to a table-level one — spec/design/constraints.md §4).
     let primaryKey = false;
     let notNull = false;
     let def: Literal | null = null;
     for (;;) {
+      if (this.atCheckConstraint()) {
+        checks.push(this.parseCheckConstraint());
+        continue;
+      }
       const kw = this.peekKeyword();
       if (kw === "primary") {
         this.advance();
@@ -1144,6 +1186,13 @@ class Parser {
     return t !== undefined && t.kind === "word" ? lower(t.word!) : "";
   }
 
+  // peekKindAt returns the token kind `offset` tokens ahead of the cursor ("eof" past the
+  // end). Used with peekKeywordAt for the CHECK-constraint lookahead (grammar.md §29).
+  private peekKindAt(offset: number): TokenKind {
+    const t = this.tokens[this.pos + offset];
+    return t !== undefined ? t.kind : "eof";
+  }
+
   private advance(): Token {
     const t = this.tokens[this.pos]!;
     if (this.pos + 1 < this.tokens.length) this.pos++;
@@ -1174,5 +1223,75 @@ class Parser {
     if (this.peek().kind !== "eof") {
       throw engineError("syntax_error", "unexpected trailing input");
     }
+  }
+}
+
+// parseExpression parses a bare expression — the catalog-load path for a persisted CHECK
+// expression (spec/design/constraints.md §4.5). The text was written by renderTokens, so
+// it re-lexes to a value-identical token sequence; the caller maps a failure to XX001
+// (the file claimed to be well-formed).
+export function parseExpression(text: string): Expr {
+  const p = new Parser(lex(text));
+  const expr = p.parseExpr();
+  p.expectEof();
+  return expr;
+}
+
+// renderTokens re-renders a token slice as the persisted check-expression text: each token
+// rendered by the closed table in spec/fileformat/format.md "Check-expression text",
+// joined with single spaces. A byte contract — identical across every core (CLAUDE.md §8).
+export function renderTokens(tokens: Token[]): string {
+  return tokens.map(renderToken).join(" ");
+}
+
+function renderToken(t: Token): string {
+  switch (t.kind) {
+    case "word":
+      return t.word!;
+    case "int":
+      return t.int!.toString();
+    case "decimal": {
+      // The digit string with "." inserted `scale` digits from the right. The lexer
+      // guarantees scale <= coeff.length (every fractional digit is in the coefficient),
+      // so the insertion point is in range; scale == length renders a leading-dot form
+      // (".5") and scale == 0 a trailing-dot form ("1."), both of which re-lex as the same
+      // decimal value (spec/fileformat/format.md "Check-expression text").
+      const split = t.decDigits!.length - t.decScale!;
+      return t.decDigits!.slice(0, split) + "." + t.decDigits!.slice(split);
+    }
+    case "str":
+      return "'" + t.str!.replaceAll("'", "''") + "'";
+    case "param":
+      return "$" + t.paramIndex!.toString();
+    case "comma":
+      return ",";
+    case "dot":
+      return ".";
+    case "lparen":
+      return "(";
+    case "rparen":
+      return ")";
+    case "star":
+      return "*";
+    case "plus":
+      return "+";
+    case "minus":
+      return "-";
+    case "slash":
+      return "/";
+    case "percent":
+      return "%";
+    case "eq":
+      return "=";
+    case "lt":
+      return "<";
+    case "gt":
+      return ">";
+    case "le":
+      return "<=";
+    case "ge":
+      return ">=";
+    default: // "eof" — never inside the parentheses
+      return "";
   }
 }

@@ -58,6 +58,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "ddl.primary_key",
     // Table-level PRIMARY KEY (a, b, ...) — composite keys (constraints.md §3).
     "ddl.composite_primary_key",
+    // CHECK constraints — row predicates enforced at INSERT/UPDATE, 23514 (constraints.md §4).
+    "ddl.check",
     // DROP TABLE — remove a table (definition + rows) from the catalog (grammar.md §13).
     "ddl.drop_table",
     // NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
