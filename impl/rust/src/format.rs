@@ -191,6 +191,16 @@ pub(crate) fn any_spillable(col_types: &[ScalarType]) -> bool {
     col_types.iter().any(|&ty| is_spillable(ty))
 }
 
+/// Like [`any_spillable`], but only over the columns a query's touched set selects — the gate for
+/// the masked scan-units walk (cost.md §3 "The touched set"): if no *touched* column can spill,
+/// the whole walk yields zero and is skipped.
+pub(crate) fn any_spillable_masked(col_types: &[ScalarType], mask: &[bool]) -> bool {
+    col_types
+        .iter()
+        .zip(mask.iter())
+        .any(|(&ty, &m)| m && is_spillable(ty))
+}
+
 /// The largest a single record may serialize to and still satisfy the B-tree split contract —
 /// `RECORD_MAX = (C-12)/2` where `C = cap` is the page payload (spec/fileformat/format.md
 /// "Why the record cap"). The spill planner reduces a record to ≤ this by externalizing values.
@@ -321,10 +331,11 @@ pub(crate) fn record_size(col_types: &[ScalarType], key: &[u8], row: &Row, cap: 
 }
 
 /// The per-record units a scan's up-front cost block charges for this record beyond the B-tree
-/// nodes (cost.md §3; spec/design/large-values.md §8/§12/§13): `pages` = one `page_read` per
-/// overflow chain page (the chain carries the payload for external-plain, the COMPRESSED block
-/// for external-compressed), `decompress` = `ceil(raw_len / cap)` `value_decompress` slabs per
-/// compressed stored value (inline- or external-). Zero/zero for a fully-inline-plain record.
+/// nodes (cost.md §3; spec/design/large-values.md §8/§12/§14): for every column in the query's
+/// **touched set** (`mask`), `pages` = one `page_read` per overflow chain page (the chain carries
+/// the payload for external-plain, the COMPRESSED block for external-compressed) and
+/// `decompress` = `ceil(raw_len / cap)` `value_decompress` slabs per compressed stored value
+/// (inline- or external-). Zero/zero for a fully-inline-plain record or an untouched column.
 pub(crate) struct ScanUnits {
     pub pages: usize,
     pub decompress: usize,
@@ -335,6 +346,7 @@ pub(crate) fn record_scan_units(
     key: &[u8],
     row: &Row,
     cap: usize,
+    mask: &[bool],
 ) -> ScanUnits {
     let plan = plan_dispositions(col_types, key, row, cap);
     let mut units = ScanUnits {
@@ -342,6 +354,9 @@ pub(crate) fn record_scan_units(
         decompress: 0,
     };
     for (i, d) in plan.disp.iter().enumerate() {
+        if !mask[i] {
+            continue; // an untouched column's chain/slabs are never read (cost.md §3)
+        }
         match d {
             Disp::Inline => {}
             Disp::External => {

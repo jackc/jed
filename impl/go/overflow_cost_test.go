@@ -81,12 +81,47 @@ func TestOverflowCostLimitDoesNotLowerTheBlock(t *testing.T) {
 	}
 }
 
-func TestOverflowCostMutationScansChargeChainPages(t *testing.T) {
+func TestOverflowCostMutationScansChargeOnlyTouchedChains(t *testing.T) {
+	// A DELETE whose filter READS the spilled column pays its chain (the touched set —
+	// cost.md §3); a bare DELETE reads no column, so dropping the rows charges nothing extra.
 	db := overflowTables(t)
-	spill := mustCost(t, db, "DELETE FROM spill")
-	control := mustCost(t, db, "DELETE FROM control")
-	if spill != control+textChainPages {
-		t.Fatalf("DELETE: spill cost %d, want control %d + %d", spill, control, textChainPages)
+	spillTouch := mustCost(t, db, "DELETE FROM spill WHERE body = 'nope'")
+	controlTouch := mustCost(t, db, "DELETE FROM control WHERE body = 'nope'")
+	if spillTouch != controlTouch+textChainPages {
+		t.Fatalf("touching DELETE: spill %d, want control %d + %d", spillTouch, controlTouch, textChainPages)
+	}
+	spillBare := mustCost(t, db, "DELETE FROM spill")
+	controlBare := mustCost(t, db, "DELETE FROM control")
+	if spillBare != controlBare {
+		t.Fatalf("bare DELETE: spill %d, want control %d", spillBare, controlBare)
+	}
+}
+
+func TestOverflowCostUntouchedColumnsChargeNothing(t *testing.T) {
+	// The touched set (cost.md §3 "The touched set"): a query that never references the spilled
+	// column pays neither its chain pages nor anything else for it — the large-values.md §7
+	// headline case — while one that does still pays.
+	db := overflowTables(t)
+	// Projection-only touch ...
+	if s, c := mustCost(t, db, "SELECT id FROM spill"), mustCost(t, db, "SELECT id FROM control"); s != c {
+		t.Fatalf("SELECT id: spill %d, want control %d", s, c)
+	}
+	// ... an aggregate touches only its argument (count(*) touches nothing) ...
+	if s, c := mustCost(t, db, "SELECT count(*) FROM spill"), mustCost(t, db, "SELECT count(*) FROM control"); s != c {
+		t.Fatalf("count(*): spill %d, want control %d", s, c)
+	}
+	// ... a WHERE reference is a touch even when only `id` is projected ...
+	s := mustCost(t, db, "SELECT id FROM spill WHERE body = 'nope'")
+	c := mustCost(t, db, "SELECT id FROM control WHERE body = 'nope'")
+	if s != c+textChainPages {
+		t.Fatalf("WHERE body: spill %d, want control %d + %d", s, c, textChainPages)
+	}
+	// ... and an UPDATE that ASSIGNS the spilled column without reading it (a constant
+	// source) skips its chain too — only assignment sources touch, not targets.
+	su := mustCost(t, db, "UPDATE spill SET body = 'tiny2' WHERE id = 2")
+	cu := mustCost(t, db, "UPDATE control SET body = 'tiny2' WHERE id = 2")
+	if su != cu {
+		t.Fatalf("UPDATE const: spill %d, want control %d", su, cu)
 	}
 }
 

@@ -167,20 +167,21 @@ func (s *TableStore) RangeEntries(b keyBound) ([]Entry, error) {
 func (s *TableStore) OverlapNodeCount(b keyBound) int { return s.rows.overlapNodeCount(b) }
 
 // ScanUnits is the up-front cost block a FULL scan of this store charges, as
-// (page_read, value_decompress) units: every B-tree node plus one page_read per overflow chain
-// page, and ceil(raw/C) value_decompress slabs per compressed stored value (cost.md §3;
-// spec/design/large-values.md §8/§12/§13). Equals (NodeCount, 0) when no record spills or
-// compresses — and the row walk is skipped entirely when no column type can spill, so fixed-width
-// tables pay nothing extra.
-func (s *TableStore) ScanUnits() (pages, slabs int, err error) {
+// (page_read, value_decompress) units: every B-tree node plus — for the query's TOUCHED columns
+// (mask, cost.md §3 "The touched set") — one page_read per overflow chain page and ceil(raw/C)
+// value_decompress slabs per compressed stored value (spec/design/large-values.md §8/§12/§14).
+// Equals (NodeCount, 0) when no touched record spills or compresses — and the row walk is
+// skipped entirely when no touched column type can spill, so fixed-width tables and untouching
+// queries pay nothing extra.
+func (s *TableStore) ScanUnits(mask []bool) (pages, slabs int, err error) {
 	pages = s.NodeCount()
-	if anySpillable(s.colTypes) {
+	if anySpillableMasked(s.colTypes, mask) {
 		entries, err := s.EntriesInKeyOrder()
 		if err != nil {
 			return 0, 0, err
 		}
 		for _, e := range entries {
-			p, d := recordScanUnits(s.colTypes, e.Key, e.Row, s.cap)
+			p, d := recordScanUnits(s.colTypes, e.Key, e.Row, s.cap, mask)
 			pages += p
 			slabs += d
 		}
@@ -193,15 +194,15 @@ func (s *TableStore) ScanUnits() (pages, slabs int, err error) {
 // pages and decompress slabs of the records the bound admits (cost.md §3;
 // spec/design/large-values.md §8/§12/§13). An empty bound or a point-lookup miss admits no record
 // and adds nothing beyond the path nodes.
-func (s *TableStore) OverlapScanUnits(b keyBound) (pages, slabs int, err error) {
+func (s *TableStore) OverlapScanUnits(b keyBound, mask []bool) (pages, slabs int, err error) {
 	pages = s.OverlapNodeCount(b)
-	if anySpillable(s.colTypes) {
+	if anySpillableMasked(s.colTypes, mask) {
 		entries, err := s.RangeEntries(b)
 		if err != nil {
 			return 0, 0, err
 		}
 		for _, e := range entries {
-			p, d := recordScanUnits(s.colTypes, e.Key, e.Row, s.cap)
+			p, d := recordScanUnits(s.colTypes, e.Key, e.Row, s.cap, mask)
 			pages += p
 			slabs += d
 		}

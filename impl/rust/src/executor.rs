@@ -898,6 +898,7 @@ impl Database {
         // Capture the PK (index, type) now, by value, so the primary-key pushdown can be detected
         // after the `table` borrow ends (the mutate path takes `&mut self`).
         let pk_info = table.primary_key_index().map(|i| (i, table.columns[i].ty));
+        let ncols = table.columns.len();
         // DELETE is single-table; resolve its WHERE against a one-relation scope.
         let scope = Scope::single(self, table);
         let mut ptypes = ParamTypes::default();
@@ -936,18 +937,27 @@ impl Database {
             (Some(f), Some((pk_idx, pk_ty))) => detect_pk_bound(f, pk_idx, pk_ty),
             _ => None,
         };
+        // DELETE's touched set (cost.md §3): only the filter's columns — dropping a row never
+        // reads its chains, so a bare DELETE charges no chain/decompress units at all.
+        let mut mask = vec![false; ncols];
+        if let Some(f) = &filter {
+            collect_touched(f, 0, &mut mask);
+        }
         let (entries, (overlap, slabs)) = match &pk_bound {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
             Some(bp) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
                     let store = self.store(&del.table);
-                    (store.range_entries(&b)?, store.overlap_scan_units(&b)?)
+                    (
+                        store.range_entries(&b)?,
+                        store.overlap_scan_units(&b, &mask)?,
+                    )
                 }
                 None => (Vec::new(), (0, 0)),
             },
             None => {
                 let store = self.store(&del.table);
-                (store.iter_entries()?, store.scan_units()?)
+                (store.iter_entries()?, store.scan_units(&mask)?)
             }
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
@@ -994,6 +1004,7 @@ impl Database {
         // Capture the PK (index, type) by value for the primary-key pushdown (detected after the
         // `table` borrow ends, since the mutate path takes `&mut self`).
         let pk_info = pk_idx.map(|i| (i, table.columns[i].ty));
+        let ncols = table.columns.len();
         let mut ptypes = ParamTypes::default();
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
         for a in &upd.assignments {
@@ -1071,18 +1082,31 @@ impl Database {
             (Some(f), Some((pk_i, pk_ty))) => detect_pk_bound(f, pk_i, pk_ty),
             _ => None,
         };
+        // UPDATE's touched set (cost.md §3): the filter's columns plus every assignment
+        // SOURCE's — the rewrite re-stores an untouched spilled value without logically
+        // re-reading it (large-values.md §14).
+        let mut mask = vec![false; ncols];
+        if let Some(f) = &filter {
+            collect_touched(f, 0, &mut mask);
+        }
+        for plan in &plans {
+            collect_touched(&plan.source, 0, &mut mask);
+        }
         let (entries, (overlap, slabs)) = match &pk_bound {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
             Some(bp) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
                     let store = self.store(&upd.table);
-                    (store.range_entries(&b)?, store.overlap_scan_units(&b)?)
+                    (
+                        store.range_entries(&b)?,
+                        store.overlap_scan_units(&b, &mask)?,
+                    )
                 }
                 None => (Vec::new(), (0, 0)),
             },
             None => {
                 let store = self.store(&upd.table);
-                (store.iter_entries()?, store.scan_units()?)
+                (store.iter_entries()?, store.scan_units(&mask)?)
             }
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
@@ -1571,6 +1595,44 @@ impl Database {
                 col_count: r.table.columns.len(),
             })
             .collect();
+        // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14):
+        // the columns this query statically references, collected depth-aware so a correlated
+        // subquery's outer reference back into this scope counts. An aggregate query's
+        // projections / HAVING / ORDER BY index the synthetic group row, whose inputs are
+        // exactly the group keys + aggregate arguments collected here; a plain query's
+        // projections and ORDER BY keys index the combined row directly.
+        let total_cols: usize = rels.iter().map(|r| r.col_count).sum();
+        let mut touched = vec![false; total_cols];
+        if let Some(f) = &filter {
+            collect_touched(f, 0, &mut touched);
+        }
+        for j in &joins {
+            if let Some(on) = &j.on {
+                collect_touched(on, 0, &mut touched);
+            }
+        }
+        if is_agg {
+            for &k in &group_keys {
+                touched[k] = true;
+            }
+            for s in &agg_specs {
+                if let Some(op) = &s.operand {
+                    collect_touched(op, 0, &mut touched);
+                }
+            }
+        } else {
+            for p in &projections {
+                collect_touched(p, 0, &mut touched);
+            }
+            for &(slot, _, _) in &order {
+                touched[slot] = true;
+            }
+        }
+        let rel_masks: Vec<Vec<bool>> = rels
+            .iter()
+            .map(|r| touched[r.offset..r.offset + r.col_count].to_vec())
+            .collect();
+
         Ok(SelectPlan {
             rels,
             joins,
@@ -1587,6 +1649,7 @@ impl Database {
             limit: sel.limit,
             offset: sel.offset,
             rel_bounds,
+            rel_masks,
         })
     }
 
@@ -1619,7 +1682,7 @@ impl Database {
         let (overlap, slabs) = if empty {
             (0, 0)
         } else {
-            store.overlap_scan_units(&bound)?
+            store.overlap_scan_units(&bound, &plan.rel_masks[0])?
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
 
@@ -1704,10 +1767,16 @@ impl Database {
             // Otherwise the full scan is unchanged (cost.md §3 "bounded scan" / JOIN).
             let (rows, (node_count, slabs)) = match &plan.rel_bounds[ri] {
                 Some(bp) => match build_key_bound(bp, params, outer) {
-                    Some(b) => (store.range_rows(&b)?, store.overlap_scan_units(&b)?),
+                    Some(b) => (
+                        store.range_rows(&b)?,
+                        store.overlap_scan_units(&b, &plan.rel_masks[ri])?,
+                    ),
                     None => (Vec::new(), (0, 0)),
                 },
-                None => (store.iter_in_key_order()?, store.scan_units()?),
+                None => (
+                    store.iter_in_key_order()?,
+                    store.scan_units(&plan.rel_masks[ri])?,
+                ),
             };
             // The decompress slabs join the same up-front block as the page_read the
             // ScanSource charges on its first next() (cost.md §3 "the compression units").
@@ -2618,6 +2687,11 @@ struct SelectPlan {
     /// (still a follow-on; `const_source` rejects a sibling column). The residual filter stays the
     /// WHOLE `filter`, re-applied after the join — the bound only narrows which rows are scanned.
     rel_bounds: Vec<Option<PkBound>>,
+    /// The **touched set** per relation (cost.md §3 "The touched set"; large-values.md §14): which
+    /// of its columns this query statically references. Drives the chain-`page_read` /
+    /// `value_decompress` portion of the scan's up-front cost block — an untouched spilled or
+    /// compressed column charges nothing, however many records the bound admits.
+    rel_masks: Vec<Vec<bool>>,
 }
 
 // ---- Primary-key predicate pushdown (spec/design/cost.md §3 "bounded scan / point lookup") ----
@@ -3259,6 +3333,105 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
         | RExpr::ConstNull => false,
+    }
+}
+
+/// Collect the combined-row columns an expression **statically references** — the touched set
+/// (cost.md §3 "The touched set"; large-values.md §14). Depth bookkeeping mirrors
+/// `rexpr_references_outer`: walking the target plan's own clauses is depth 0 (a `Column`
+/// touches); inside a nested subquery a `Column` indexes the subquery's own row (ignored) and an
+/// `OuterColumn { level == depth }` is a correlated reference back into the target scope
+/// (touches). Purely syntactic — a never-taken CASE branch still touches — so the set is
+/// deterministic and cross-core identical (a §8 contract).
+fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
+    match e {
+        RExpr::Column(i) => {
+            if depth == 0 {
+                touched[*i] = true;
+            }
+        }
+        RExpr::OuterColumn { level, index } => {
+            if *level == depth && depth > 0 {
+                touched[*index] = true;
+            }
+        }
+        RExpr::Subquery { plan, lhs, .. } => {
+            if let Some(l) = lhs {
+                collect_touched(l, depth, touched);
+            }
+            collect_touched_plan(plan, depth + 1, touched);
+        }
+        RExpr::InValues { lhs, .. } => collect_touched(lhs, depth, touched),
+        RExpr::Cast { inner, .. } => collect_touched(inner, depth, touched),
+        RExpr::Neg { operand, .. } => collect_touched(operand, depth, touched),
+        RExpr::Not(x) => collect_touched(x, depth, touched),
+        RExpr::Arith { lhs, rhs, .. }
+        | RExpr::Compare { lhs, rhs, .. }
+        | RExpr::Distinct { lhs, rhs, .. }
+        | RExpr::Like { lhs, rhs, .. } => {
+            collect_touched(lhs, depth, touched);
+            collect_touched(rhs, depth, touched);
+        }
+        RExpr::And(l, r) | RExpr::Or(l, r) => {
+            collect_touched(l, depth, touched);
+            collect_touched(r, depth, touched);
+        }
+        RExpr::IsNull { operand, .. } => collect_touched(operand, depth, touched),
+        RExpr::Case { arms, els, .. } => {
+            for (c, r) in arms {
+                collect_touched(c, depth, touched);
+                collect_touched(r, depth, touched);
+            }
+            collect_touched(els, depth, touched);
+        }
+        RExpr::ScalarFunc { args, .. } => {
+            for a in args {
+                collect_touched(a, depth, touched);
+            }
+        }
+        RExpr::Param(_)
+        | RExpr::ConstInt(_)
+        | RExpr::ConstBool(_)
+        | RExpr::ConstText(_)
+        | RExpr::ConstDecimal(_)
+        | RExpr::ConstBytea(_)
+        | RExpr::ConstUuid(_)
+        | RExpr::ConstTimestamp(_)
+        | RExpr::ConstTimestamptz(_)
+        | RExpr::ConstNull => {}
+    }
+}
+
+/// Walk a nested plan's expression surfaces for outer references back into the target scope —
+/// the same five surfaces `select_plan_references_outer` checks (slot lists like group keys /
+/// ORDER BY index the nested plan's own rows and can never reach outward).
+fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut [bool]) {
+    match plan {
+        QueryPlan::Select(sp) => {
+            for j in &sp.joins {
+                if let Some(on) = &j.on {
+                    collect_touched(on, depth, touched);
+                }
+            }
+            if let Some(f) = &sp.filter {
+                collect_touched(f, depth, touched);
+            }
+            if let Some(h) = &sp.having {
+                collect_touched(h, depth, touched);
+            }
+            for s in &sp.agg_specs {
+                if let Some(op) = &s.operand {
+                    collect_touched(op, depth, touched);
+                }
+            }
+            for p in &sp.projections {
+                collect_touched(p, depth, touched);
+            }
+        }
+        QueryPlan::SetOp(s) => {
+            collect_touched_plan(&s.lhs, depth, touched);
+            collect_touched_plan(&s.rhs, depth, touched);
+        }
     }
 }
 

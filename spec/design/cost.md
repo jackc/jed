@@ -136,20 +136,47 @@ exactly the property cost requires.
   page access — **not** a physical disk fetch. A future buffer pool / demand-paging cache for
   larger-than-RAM files (CLAUDE.md §9) serves a page from memory or disk transparently; the
   cost is identical either way, so the deterministic cost stays cache-independent (§13).
-- **Overflow chains count too** ([large-values.md](large-values.md) §8.1/§12). A record whose
-  values spilled out-of-line stores them on a chain of overflow pages (`page_type 4`), and
-  materializing the record reads that chain — so the scan's `page_read` block also counts **one
-  per overflow chain page of every record the scan's bound admits** (the full table when
-  unbounded; the in-range records for a bounded scan, so a point lookup pays only *its* record's
-  chain and a miss pays none). The chain page count is `ceil(stored / C)` per externalized
-  value, where `stored` is the bytes the chain actually carries — the content payload for an
-  external-plain value, the **compressed** block for an external-compressed one (large-values.md
-  §13) — a function of the §8-contracted disposition rule and chain layout, so it is
-  byte-identical across cores; a fully-inline table charges exactly the structural node count as
-  before (existing costs do not move). Like the rest of the block it is charged **up front** and
-  does **not** short-circuit under `LIMIT` (see "LIMIT short-circuit" below); it stays *logical*
-  (whether eager materialization actually read the chain, or a future lazy read skipped it, the
-  charge is the same — large-values.md §7 is a tracked follow-on that would revisit this).
+- **Overflow chains count too — for the columns the query references**
+  ([large-values.md](large-values.md) §8.1/§12/§14). A record whose values spilled out-of-line
+  stores them on a chain of overflow pages (`page_type 4`), and materializing such a value reads
+  its chain — so the scan's `page_read` block also counts **one per overflow chain page of every
+  record the scan's bound admits, for every spilled column in the query's *touched set*** (the
+  full table when unbounded; the in-range records for a bounded scan, so a point lookup pays only
+  *its* record's chains and a miss pays none — and a query that never references the spilled
+  column pays nothing for it, however many records it admits). The touched set is **static**
+  (below), so the charge stays an up-front block that does **not** short-circuit under `LIMIT`
+  (see "LIMIT short-circuit"; tightening to the rows actually emitted is a possible later
+  refinement, exactly like the leaves-actually-faulted note there). The chain page count is
+  `ceil(stored / C)` per externalized value, where `stored` is the bytes the chain actually
+  carries — the content payload for an external-plain value, the **compressed** block for an
+  external-compressed one (large-values.md §13) — a function of the §8-contracted disposition
+  rule and chain layout, so it is byte-identical across cores; a fully-inline table charges
+  exactly the structural node count as before (existing costs do not move). The charge stays
+  *logical* (§13): it models the lazy read-on-touch executor (large-values.md §7/§14) whether or
+  not the engine physically reads eagerly today, the same way `page_read` predates the buffer
+  pool.
+
+### The touched set — which columns a scan "reads"
+
+The **touched set** of a relation is the set of its columns the query **statically references**,
+collected at plan time from the resolved expression trees (a §8 contract — every core collects
+identically): the WHERE filter, every JOIN `ON`, and — for a non-aggregate query — the
+projections and `ORDER BY` keys, or — for an aggregate query — the `GROUP BY` keys and every
+aggregate's argument (an aggregate query's projections / `HAVING` / `ORDER BY` reference the
+synthetic group row, whose inputs those keys and arguments already are). A **correlated
+subquery's outer reference** into the relation counts (collected depth-aware through nested
+plans). The set is per `(query, relation)` and purely syntactic: a column referenced only in a
+never-taken `CASE` branch is still touched. Consequences worth naming:
+
+- `SELECT small_col FROM t WHERE pk = $1` touches neither a spilled `body` column's chain nor a
+  compressed value's slabs — the large-values headline case (large-values.md §7).
+- `SELECT count(*) FROM t` and `EXISTS (SELECT 1 FROM t …)` touch **no** columns of `t`: they
+  charge the structural node block and row reads only.
+- **`DELETE`** touches only its filter's columns — dropping a row never reads its chains.
+- **`UPDATE`** touches its filter's columns plus every assignment **source**'s columns. The
+  rewrite itself does not *read* an untouched stored value (under the §14 model an unchanged
+  spilled value's bytes move without decompression); the write side stays metered by
+  `value_compress` per stored row version, unchanged.
 
 ### `value_compress` / `value_decompress` — the compression units
 
@@ -161,11 +188,10 @@ computable from the stored lengths alone, so the charge never requires re-runnin
 
 - **`value_decompress`** joins the scan's **up-front block** next to the chain `page_read`s: for
   every record the scan's bound admits, each **compressed** stored value (inline-compressed `0x03`
-  or external-compressed `0x04`) charges `ceil(raw_len / C)`. The same composition rules apply
-  verbatim — per JOIN base table, per correlated re-scan, no `LIMIT` short-circuit, nothing for a
-  missed bound, and a table with no compressed value charges nothing. (This is the
-  eager-materialization reading; large-values.md §7's lazy read is the tracked follow-on that
-  would refine it to per-touched-value.)
+  or external-compressed `0x04`) **in a touched column** (the touched set above) charges
+  `ceil(raw_len / C)`. The same composition rules apply verbatim — per JOIN base table, per
+  correlated re-scan, no `LIMIT` short-circuit, nothing for a missed bound, nothing for an
+  untouched column, and a table with no compressed value charges nothing.
 - **`value_compress`** is the write side: an `INSERT`/`UPDATE` whose record exceeds `RECORD_MAX`
   runs the disposition decision's compress pass, and **every attempt** (adopted or rejected by
   *store-smaller* — the encoder ran either way) charges `ceil(raw_len / C)`. Charged once per

@@ -251,7 +251,11 @@ column reads **no** overflow pages. Because the executor is identical across cor
 is materialized is itself deterministic — so this optimization does not threaten cross-core cost
 identity (§8). The alternative (eagerly materialize every value on record read) is simpler but
 pays the chain read even when unused; lazy is the recommended default and what the cost rules of
-§8 assume.
+§8 assume. **Status (§14): split into two phases.** Phase 1 — the *cost contract* — is **built**:
+the touched-column rule of §14 charges chains/slabs only for columns the query statically
+references, modeling this lazy executor logically (the same way `page_read` predated the buffer
+pool). Phase 2 — the *physical* read-on-touch storage — remains the tracked follow-on, with its
+design pinned in §14 so it lands behind the contract with zero cost churn.
 
 ---
 
@@ -261,11 +265,13 @@ Three accrual rules, all **logical** and deterministic (so a future buffer pool 
 cost.md §3, pager.md §5):
 
 1. **Overflow-chain reads → `page_read`.** Materializing an external value charges one
-   `page_read` per overflow page in its chain (the §4 logical count), accrued **when the value is
-   materialized** (§7) — so an unread external value costs nothing, deterministically. This slots
-   into the existing `page_read` unit (P6.3) with no new unit. (Slice A materializes **eagerly**,
-   so the as-built rule folds the chain pages into the scan's up-front `page_read` block — §12,
-   cost.md §3; the unread-value-costs-nothing refinement arrives with §7's lazy read.)
+   `page_read` per overflow page in its chain (the §4 logical count), accrued for the values the
+   query **touches** (§7) — so an unread external value costs nothing, deterministically. This
+   slots into the existing `page_read` unit (P6.3) with no new unit. **As built (§14):** the
+   touched set is *static* (the columns the query references, per relation), and the charge stays
+   folded into the scan's up-front block for the records the bound admits — an untouched *column*
+   charges nothing; an admitted-but-never-emitted *row* of a touched column still charges (the
+   block does not short-circuit under `LIMIT`, cost.md §3).
 2. **Decompression → a new `value_decompress` unit.** Decompressing a value is real CPU work an
    untrusted query can drive (§13); it must be metered or the cost ceiling cannot bound it. Charge
    per unit of work on materialization. **Granularity — resolved (§13): one unit per `C`-byte slab
@@ -393,12 +399,12 @@ compression is Slice B). They were chosen with the maintainer; the byte details 
 
 - **Cost = `page_read` per chain page, folded into the scan's up-front block** (§8.1, as built).
   A scan's `page_read` block counts the B-tree nodes its bound intersects **plus one per overflow
-  chain page of every record the bound admits** — so a full scan pays every chain, a point lookup
-  pays only the admitted record's chain, and a miss or empty bound pays none. Like the rest of the
-  block it is charged up front and does **not** short-circuit under `LIMIT` (cost.md §3). This is
-  the eager-materialization reading of §8.1's "charged when materialized": with §7's lazy read a
-  tracked follow-on, the per-*touched-value* refinement is revisited there. Deterministic and
-  cross-core identical (the chain page count is `ceil(payload/C)` under the §3 disposition rule).
+  chain page of every record the bound admits, for every touched column** (refined by §14 from
+  Slice A's all-columns rule) — so a full scan pays every referenced chain, a point lookup pays
+  only the admitted record's, a query that never references the spilled column pays none, and a
+  miss or empty bound pays none. Like the rest of the block it is charged up front and does
+  **not** short-circuit under `LIMIT` (cost.md §3). Deterministic and cross-core identical (the
+  chain page count is `ceil(stored/C)` under the §3 disposition rule).
 
 - **Format version.** Clean break to **`format_version 3`** (v2 not read), regenerating the 15
   goldens (only the version field + CRC change for non-spilling fixtures) plus new external-value
@@ -458,3 +464,57 @@ within `format_version` 3** (the `0x03`/`0x04` tags Slice A reserved), so no ver
 - **What did NOT change:** the spill trigger (`RECORD_MAX`, §12), the chain layout (§4/§12), the
   reclamation model (a `0x04` chain is collected by the same reachability walk), the eager read
   path, and every inline-plain/NULL byte. Fixed-width types still never compress or spill.
+
+---
+
+## 14. Lazy follow-on — phase 1 resolved (the touched-column cost contract), phase 2 pinned
+
+The §7/§8.1 follow-on splits in two, sequenced like P6.3's `page_read` before the P6.4 buffer
+pool: **pin the logical cost contract first**, then land the physical optimization behind it with
+zero cost churn.
+
+### Phase 1 — BUILT: the touched-column cost rule
+
+A scan's up-front block charges chain `page_read`s and `value_decompress` slabs only for the
+**touched set** — the columns of the relation the query **statically references**, collected at
+plan time from the resolved expression trees (precise clause list in [cost.md](cost.md) §3 "The
+touched set"; correlated outer references collected depth-aware through nested plans). Decisions:
+
+- **Static, not dynamic.** Per `(query, relation)`, independent of which rows are emitted: a
+  column referenced only in a never-taken `CASE` branch is touched; an admitted-but-`LIMIT`-skipped
+  row of a touched column still charges. Static keeps the charge an up-front block (one accrual
+  model for everything in it), is trivially deterministic and cross-core identical, and
+  **over-approximates** the §7 lazy executor's physical work — the safe direction for a §13
+  ceiling. The dynamic per-emitted-row refinement is the same possible-later-tightening cost.md
+  already records for `page_read` leaves.
+- **Mutations.** `DELETE` touches only its filter's columns (dropping a row never reads chains);
+  `UPDATE` touches its filter's plus every assignment *source*'s columns — the rewrite re-stores
+  an untouched spilled value without logically re-reading it (phase 2 makes that physical).
+  `value_compress` is unchanged: per stored row version at the write site (§13).
+- **Aggregates.** An aggregate query touches its `GROUP BY` keys and aggregate arguments — so
+  `count(*)` / `EXISTS(SELECT 1 …)` over a spilled table touch nothing and charge only nodes +
+  row reads.
+- **Implementation seam:** the disposition-plan walk (`scan_units` / `overlap_scan_units`) takes
+  a per-relation **column mask** computed once at plan time; nothing else moves.
+
+### Phase 2 — TRACKED: physical read-on-touch storage (design pinned, not built)
+
+The engine still materializes eagerly. The pinned design for the physical half, so it cannot
+drift from the phase-1 contract:
+
+- A loaded record's spilled/compressed value becomes an **unfetched reference** (first page /
+  stored+raw lengths / form) instead of a resident `Value`; the **scan layer resolves the touched
+  columns** through the pager as it copies rows out for the executor, leaving untouched columns
+  unfetched — the evaluator never sees a reference, so the expression layer is untouched and the
+  resolution points are exactly the static touched set the cost already models.
+- An unfetched value that *escapes* (a bug) must fail loudly (a poisoned variant), never read as
+  NULL.
+- A dirty leaf's re-encode resolves what it must through the pager at commit (unmetered, like all
+  commit work). Whether an **unchanged** spilled value's chain can be *shared* by the rewritten
+  record (pointer copy, no chain rewrite — safe under reconstruct-on-open reachability, which
+  unions over live records) is phase 2's one open byte-layout decision: it changes incremental
+  allocation order, so it must land in all cores + the per-core incremental tests together.
+- The open-time reachability walk follows chains via **headers only** (`next_page` hops — no
+  decompression), which it can do today.
+- Wins: a `SELECT small_col` over a table of huge values stops reading (and holding) them; the
+  resident set of a file-backed store stops scaling with unreferenced large values.

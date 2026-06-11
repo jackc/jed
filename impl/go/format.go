@@ -669,6 +669,18 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 	return db, nil
 }
 
+// anySpillableMasked is anySpillable restricted to the columns a query's touched set selects —
+// the gate for the masked scan-units walk (cost.md §3 "The touched set"): if no TOUCHED column
+// can spill, the whole walk yields zero and is skipped.
+func anySpillableMasked(colTypes []ScalarType, mask []bool) bool {
+	for i, ty := range colTypes {
+		if mask[i] && isSpillable(ty) {
+			return true
+		}
+	}
+	return false
+}
+
 // anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
 func anySpillable(colTypes []ScalarType) bool {
 	for _, ty := range colTypes {
@@ -1005,13 +1017,17 @@ func recordSize(colTypes []ScalarType, key []byte, row Row, capacity int) int {
 }
 
 // recordScanUnits returns the per-record units a scan's up-front cost block charges beyond the
-// B-tree nodes (cost.md §3; large-values.md §8/§12/§13): pages = one page_read per overflow chain
-// page (the chain carries the payload for external-plain, the COMPRESSED block for
-// external-compressed); decompress = ceil(raw/capacity) value_decompress slabs per compressed
-// stored value (inline- or external-). Zero/zero for a fully-inline-plain record.
-func recordScanUnits(colTypes []ScalarType, key []byte, row Row, capacity int) (pages, decompress int) {
+// B-tree nodes (cost.md §3; large-values.md §8/§12/§14): for every column in the query's TOUCHED
+// SET (mask), pages = one page_read per overflow chain page (the chain carries the payload for
+// external-plain, the COMPRESSED block for external-compressed) and decompress = ceil(raw/capacity)
+// value_decompress slabs per compressed stored value (inline- or external-). Zero/zero for a
+// fully-inline-plain record or an untouched column.
+func recordScanUnits(colTypes []ScalarType, key []byte, row Row, capacity int, mask []bool) (pages, decompress int) {
 	plan := planDispositions(colTypes, key, row, capacity)
 	for i, d := range plan.disp {
+		if !mask[i] {
+			continue // an untouched column's chain/slabs are never read (cost.md §3)
+		}
 		switch d {
 		case dispExternal:
 			n := len(valuePayload(colTypes[i], row[i]))

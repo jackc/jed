@@ -15,7 +15,7 @@ import type { ScalarType } from "./types.ts";
 import { PMap, pmapFromLoaded } from "./pmap.ts";
 import type { KeyBound, LeafSource, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
-import { anySpillable, recordCompressUnits, recordScanUnits, recordSize } from "./format.ts";
+import { anySpillable, anySpillableMasked, recordCompressUnits, recordScanUnits, recordSize } from "./format.ts";
 
 // Row is a stored row: one value per column, in column order.
 export type Row = Value[];
@@ -179,17 +179,18 @@ export class TableStore {
   }
 
   // scanUnits is the up-front cost block a FULL scan of this store charges, as
-  // (page_read, value_decompress) units: every B-tree node plus one page_read per overflow chain
-  // page, and ceil(raw/C) value_decompress slabs per compressed stored value (cost.md §3;
-  // spec/design/large-values.md §8/§12/§13). Equals (nodeCount, 0) when no record spills or
-  // compresses — and the row walk is skipped entirely when no column type can spill, so
-  // fixed-width tables pay nothing extra.
-  scanUnits(): { pages: number; slabs: number } {
+  // (page_read, value_decompress) units: every B-tree node plus — for the query's TOUCHED
+  // columns (mask, cost.md §3 "The touched set") — one page_read per overflow chain page and
+  // ceil(raw/C) value_decompress slabs per compressed stored value (spec/design/large-values.md
+  // §8/§12/§14). Equals (nodeCount, 0) when no touched record spills or compresses — and the row
+  // walk is skipped entirely when no touched column type can spill, so fixed-width tables and
+  // untouching queries pay nothing extra.
+  scanUnits(mask: boolean[]): { pages: number; slabs: number } {
     let pages = this.nodeCount();
     let slabs = 0;
-    if (anySpillable(this.colTypes)) {
+    if (anySpillableMasked(this.colTypes, mask)) {
       for (const e of this.entriesInKeyOrder()) {
-        const u = recordScanUnits(this.colTypes, e.key, e.row, this.cap);
+        const u = recordScanUnits(this.colTypes, e.key, e.row, this.cap, mask);
         pages += u.pages;
         slabs += u.decompress;
       }
@@ -202,12 +203,12 @@ export class TableStore {
   // pages and decompress slabs of the records the bound admits (cost.md §3;
   // spec/design/large-values.md §8/§12/§13). An empty bound or a point-lookup miss admits no record
   // and adds nothing beyond the path nodes.
-  overlapScanUnits(b: KeyBound): { pages: number; slabs: number } {
+  overlapScanUnits(b: KeyBound, mask: boolean[]): { pages: number; slabs: number } {
     let pages = this.overlapNodeCount(b);
     let slabs = 0;
-    if (anySpillable(this.colTypes)) {
+    if (anySpillableMasked(this.colTypes, mask)) {
       for (const e of this.rangeEntries(b)) {
-        const u = recordScanUnits(this.colTypes, e.key, e.row, this.cap);
+        const u = recordScanUnits(this.colTypes, e.key, e.row, this.cap, mask);
         pages += u.pages;
         slabs += u.decompress;
       }

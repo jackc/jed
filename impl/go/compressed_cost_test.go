@@ -130,3 +130,35 @@ func TestCompressedCostDecimalPayloadsCompressToo(t *testing.T) {
 		t.Fatalf("decimal scan: comp %d, control %d (want +2 decompress slabs)", comp, control)
 	}
 }
+
+func TestCompressedCostUntouchedColumnsChargeNoSlabs(t *testing.T) {
+	// The touched set (cost.md §3 "The touched set"): a query that never references the
+	// compressed column pays no decompress slabs; an aggregate's ARGUMENT is a touch.
+	db := compressedTables(t)
+	if a, b := mustCost(t, db, "SELECT id FROM comp"), mustCost(t, db, "SELECT id FROM control"); a != b {
+		t.Fatalf("SELECT id: comp %d, want control %d", a, b)
+	}
+	if a, b := mustCost(t, db, "SELECT count(*) FROM comp"), mustCost(t, db, "SELECT count(*) FROM control"); a != b {
+		t.Fatalf("count(*): comp %d, want control %d", a, b)
+	}
+	a := mustCost(t, db, "SELECT min(body) FROM comp")
+	b := mustCost(t, db, "SELECT min(body) FROM control")
+	if a != b+slabs600 {
+		t.Fatalf("min(body): comp %d, want control %d + %d", a, b, slabs600)
+	}
+}
+
+func TestCompressedCostCorrelatedOuterReferenceIsATouch(t *testing.T) {
+	// A nested subquery's outer reference back into the scanned relation counts as a touch
+	// (collected depth-aware — cost.md §3). `probe` holds the one value that matches both
+	// tables' row 2, so the two queries emit identical row counts and differ only in the
+	// outer table's storage — isolating the slabs600 the outer reference charges.
+	db := compressedTables(t)
+	mustExec(t, db, "CREATE TABLE probe (id int32 PRIMARY KEY, body text)")
+	mustExec(t, db, "INSERT INTO probe VALUES (1, 'small')")
+	a := mustCost(t, db, "SELECT id FROM comp WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = comp.body)")
+	b := mustCost(t, db, "SELECT id FROM control WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = control.body)")
+	if a != b+slabs600 {
+		t.Fatalf("correlated touch: comp %d, want control %d + %d", a, b, slabs600)
+	}
+}

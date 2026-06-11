@@ -77,11 +77,38 @@ test("LIMIT does not lower the block", () => {
   assert.strictEqual(spill, control + TEXT_CHAIN_PAGES);
 });
 
-test("mutation scans charge the chain pages", () => {
+test("mutation scans charge only touched chains", () => {
+  // A DELETE whose filter READS the spilled column pays its chain (the touched set —
+  // cost.md §3); a bare DELETE reads no column, so dropping the rows charges nothing extra.
   const db = overflowTables();
-  const spill = cost(db, "DELETE FROM spill");
-  const control = cost(db, "DELETE FROM control");
-  assert.strictEqual(spill, control + TEXT_CHAIN_PAGES);
+  const spillTouch = cost(db, "DELETE FROM spill WHERE body = 'nope'");
+  const controlTouch = cost(db, "DELETE FROM control WHERE body = 'nope'");
+  assert.strictEqual(spillTouch, controlTouch + TEXT_CHAIN_PAGES);
+  const spillBare = cost(db, "DELETE FROM spill");
+  const controlBare = cost(db, "DELETE FROM control");
+  assert.strictEqual(spillBare, controlBare);
+});
+
+test("untouched columns charge nothing", () => {
+  // The touched set (cost.md §3 "The touched set"): a query that never references the spilled
+  // column pays neither its chain pages nor anything else for it — the large-values.md §7
+  // headline case — while one that does still pays.
+  const db = overflowTables();
+  // Projection-only touch ...
+  assert.strictEqual(cost(db, "SELECT id FROM spill"), cost(db, "SELECT id FROM control"));
+  // ... an aggregate touches only its argument (count(*) touches nothing) ...
+  assert.strictEqual(cost(db, "SELECT count(*) FROM spill"), cost(db, "SELECT count(*) FROM control"));
+  // ... a WHERE reference is a touch even when only `id` is projected ...
+  assert.strictEqual(
+    cost(db, "SELECT id FROM spill WHERE body = 'nope'"),
+    cost(db, "SELECT id FROM control WHERE body = 'nope'") + TEXT_CHAIN_PAGES,
+  );
+  // ... and an UPDATE that ASSIGNS the spilled column without reading it (a constant
+  // source) skips its chain too — only assignment sources touch, not targets.
+  assert.strictEqual(
+    cost(db, "UPDATE spill SET body = 'tiny2' WHERE id = 2"),
+    cost(db, "UPDATE control SET body = 'tiny2' WHERE id = 2"),
+  );
 });
 
 test("multiple chains in one record sum", () => {

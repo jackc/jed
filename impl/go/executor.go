@@ -785,6 +785,10 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	env := &evalEnv{exec: db, params: bound}
 	store := db.working().store(del.Table)
 	var keys [][]byte
+	// DELETE's touched set (cost.md §3): only the filter's columns — dropping a row never reads
+	// its chains, so a bare DELETE charges no chain/decompress units at all.
+	mask := make([]bool, len(table.Columns))
+	collectTouched(filter, 0, mask)
 	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
 	// scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
@@ -799,14 +803,14 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		if entries, err = store.RangeEntries(kb); err != nil {
 			return Outcome{}, err
 		}
-		if overlap, slabs, err = store.OverlapScanUnits(kb); err != nil {
+		if overlap, slabs, err = store.OverlapScanUnits(kb, mask); err != nil {
 			return Outcome{}, err
 		}
 	} else {
 		if entries, err = store.EntriesInKeyOrder(); err != nil {
 			return Outcome{}, err
 		}
-		if overlap, slabs, err = store.ScanUnits(); err != nil {
+		if overlap, slabs, err = store.ScanUnits(mask); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -929,6 +933,14 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		row Row
 	}
 	var updates []pending
+	// UPDATE's touched set (cost.md §3): the filter's columns plus every assignment SOURCE's —
+	// the rewrite re-stores an untouched spilled value without logically re-reading it
+	// (large-values.md §14).
+	mask := make([]bool, len(table.Columns))
+	collectTouched(filter, 0, mask)
+	for i := range plans {
+		collectTouched(plans[i].source, 0, mask)
+	}
 	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
 	// scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
@@ -943,14 +955,14 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		if entries, err = store.RangeEntries(kb); err != nil {
 			return Outcome{}, err
 		}
-		if overlap, slabs, err = store.OverlapScanUnits(kb); err != nil {
+		if overlap, slabs, err = store.OverlapScanUnits(kb, mask); err != nil {
 			return Outcome{}, err
 		}
 	} else {
 		if entries, err = store.EntriesInKeyOrder(); err != nil {
 			return Outcome{}, err
 		}
-		if overlap, slabs, err = store.ScanUnits(); err != nil {
+		if overlap, slabs, err = store.ScanUnits(mask); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -1589,11 +1601,45 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 	for i, rel := range s.rels {
 		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns)}
 	}
+	// The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
+	// columns this query statically references, collected depth-aware so a correlated
+	// subquery's outer reference back into this scope counts. An aggregate query's projections
+	// / HAVING / ORDER BY index the synthetic group row, whose inputs are exactly the group
+	// keys + aggregate arguments collected here; a plain query's projections and ORDER BY keys
+	// index the combined row directly.
+	totalCols := 0
+	for _, rel := range planRels {
+		totalCols += rel.colCount
+	}
+	touched := make([]bool, totalCols)
+	collectTouched(filter, 0, touched)
+	for k := range joins {
+		collectTouched(joins[k].on, 0, touched)
+	}
+	if isAgg {
+		for _, gk := range groupKeys {
+			touched[gk] = true
+		}
+		for i := range aggSpecs {
+			collectTouched(aggSpecs[i].operand, 0, touched)
+		}
+	} else {
+		for _, p := range projections {
+			collectTouched(p, 0, touched)
+		}
+		for _, o := range order {
+			touched[o.idx] = true
+		}
+	}
+	relMasks := make([][]bool, len(planRels))
+	for i, rel := range planRels {
+		relMasks[i] = touched[rel.offset : rel.offset+rel.colCount]
+	}
 	return &selectPlan{
 		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
 		aggSpecs: aggSpecs, having: having, order: order, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset, relBounds: relBounds,
+		limit: sel.Limit, offset: sel.Offset, relBounds: relBounds, relMasks: relMasks,
 	}, nil
 }
 
@@ -1919,7 +1965,7 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 	}
 	if !empty {
 		var err error
-		if overlap, slabs, err = store.OverlapScanUnits(b); err != nil {
+		if overlap, slabs, err = store.OverlapScanUnits(b, plan.relMasks[0]); err != nil {
 			return selectResult{}, err
 		}
 	}
@@ -2004,7 +2050,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 				if rows, err = store.RangeRows(b); err != nil {
 					return selectResult{}, err
 				}
-				if nodeCount, slabs, err = store.OverlapScanUnits(b); err != nil {
+				if nodeCount, slabs, err = store.OverlapScanUnits(b, plan.relMasks[ri]); err != nil {
 					return selectResult{}, err
 				}
 			}
@@ -2013,7 +2059,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 			if rows, err = store.IterInKeyOrder(); err != nil {
 				return selectResult{}, err
 			}
-			if nodeCount, slabs, err = store.ScanUnits(); err != nil {
+			if nodeCount, slabs, err = store.ScanUnits(plan.relMasks[ri]); err != nil {
 				return selectResult{}, err
 			}
 		}
@@ -2545,6 +2591,76 @@ func rexprReferencesOuter(e *rExpr, depth int) bool {
 	return false
 }
 
+// collectTouched marks the combined-row columns an expression STATICALLY references — the
+// touched set (cost.md §3 "The touched set"; large-values.md §14). Depth bookkeeping mirrors
+// rexprReferencesOuter: walking the target plan's own clauses is depth 0 (a column touches);
+// inside a nested subquery a column indexes the subquery's own row (ignored) and an outer
+// column with level == depth is a correlated reference back into the target scope (touches).
+// Purely syntactic — a never-taken CASE branch still touches — so the set is deterministic and
+// cross-core identical (a §8 contract).
+func collectTouched(e *rExpr, depth int, touched []bool) {
+	if e == nil {
+		return
+	}
+	switch e.kind {
+	case reColumn:
+		if depth == 0 {
+			touched[e.index] = true
+		}
+		return
+	case reOuterColumn:
+		if e.level == depth && depth > 0 {
+			touched[e.index] = true
+		}
+		return
+	case reSubquery:
+		collectTouched(e.lhs, depth, touched)
+		collectTouchedPlan(e.subPlan, depth+1, touched)
+		return
+	case reInValues:
+		collectTouched(e.lhs, depth, touched)
+		return
+	}
+	collectTouched(e.operand, depth, touched)
+	collectTouched(e.lhs, depth, touched)
+	collectTouched(e.rhs, depth, touched)
+	for _, arm := range e.caseArms {
+		collectTouched(arm.cond, depth, touched)
+		collectTouched(arm.result, depth, touched)
+	}
+	collectTouched(e.caseEls, depth, touched)
+	for _, a := range e.sargs {
+		collectTouched(a, depth, touched)
+	}
+}
+
+// collectTouchedPlan walks a nested plan's expression surfaces for outer references back into
+// the target scope — the same five surfaces selectPlanReferencesOuter checks (slot lists like
+// group keys / ORDER BY index the nested plan's own rows and can never reach outward).
+func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
+	if plan == nil {
+		return
+	}
+	if plan.sel != nil {
+		sp := plan.sel
+		for k := range sp.joins {
+			collectTouched(sp.joins[k].on, depth, touched)
+		}
+		collectTouched(sp.filter, depth, touched)
+		collectTouched(sp.having, depth, touched)
+		for i := range sp.aggSpecs {
+			collectTouched(sp.aggSpecs[i].operand, depth, touched)
+		}
+		for _, p := range sp.projections {
+			collectTouched(p, depth, touched)
+		}
+	}
+	if plan.setop != nil {
+		collectTouchedPlan(&plan.setop.lhs, depth, touched)
+		collectTouchedPlan(&plan.setop.rhs, depth, touched)
+	}
+}
+
 // inMembership is three-valued `lhs IN (list)` membership (spec/design/grammar.md §26), charging
 // one operator_eval per element compared. An EMPTY list is `negated` (x IN () = FALSE, x NOT IN ()
 // = TRUE) independent of lv. Otherwise: a positive match -> TRUE; else a NULL element (or NULL lv)
@@ -2987,6 +3103,11 @@ type selectPlan struct {
 	// index-nested-loop case (a follow-on). The residual filter stays the WHOLE `filter`, re-applied
 	// after the join — the bound only narrows which rows are scanned.
 	relBounds []*pkBoundPlan
+	// relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md
+	// §14): which of its columns this query statically references. Drives the chain-page_read /
+	// value_decompress portion of the scan's up-front cost block — an untouched spilled or
+	// compressed column charges nothing, however many records the bound admits.
+	relMasks [][]bool
 }
 
 // setOpPlan is a resolved set operation: both operands planned with the same parent scope, the

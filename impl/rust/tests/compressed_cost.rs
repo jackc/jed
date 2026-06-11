@@ -180,3 +180,43 @@ fn decimal_payloads_compress_too() {
     let control = cost(&mut db, "SELECT * FROM control");
     assert_eq!(comp, control + 2, "the decompress slabs are metered");
 }
+
+#[test]
+fn untouched_compressed_columns_charge_no_slabs() {
+    // The touched set (cost.md §3 "The touched set"): a query that never references the
+    // compressed column pays no decompress slabs; an aggregate's ARGUMENT is a touch.
+    let mut db = two_tables();
+    let comp_id = cost(&mut db, "SELECT id FROM comp");
+    let control_id = cost(&mut db, "SELECT id FROM control");
+    assert_eq!(comp_id, control_id);
+    let comp_cnt = cost(&mut db, "SELECT count(*) FROM comp");
+    let control_cnt = cost(&mut db, "SELECT count(*) FROM control");
+    assert_eq!(comp_cnt, control_cnt);
+    let comp_min = cost(&mut db, "SELECT min(body) FROM comp");
+    let control_min = cost(&mut db, "SELECT min(body) FROM control");
+    assert_eq!(comp_min, control_min + SLABS_600);
+}
+
+#[test]
+fn correlated_outer_reference_is_a_touch() {
+    // A nested subquery's outer reference back into the scanned relation counts as a touch
+    // (collected depth-aware — cost.md §3). `probe` holds the one value that matches both
+    // tables' row 2, so the two queries emit identical row counts and differ only in the
+    // outer table's storage — isolating the SLABS_600 the outer reference charges.
+    let mut db = two_tables();
+    execute(
+        &mut db,
+        "CREATE TABLE probe (id int32 PRIMARY KEY, body text)",
+    )
+    .unwrap();
+    execute(&mut db, "INSERT INTO probe VALUES (1, 'small')").unwrap();
+    let comp_q = cost(
+        &mut db,
+        "SELECT id FROM comp WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = comp.body)",
+    );
+    let control_q = cost(
+        &mut db,
+        "SELECT id FROM control WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = control.body)",
+    );
+    assert_eq!(comp_q, control_q + SLABS_600);
+}

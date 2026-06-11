@@ -349,20 +349,23 @@ export function recordSize(colTypes: ScalarType[], key: Uint8Array, row: Row, ca
 }
 
 // recordScanUnits returns the per-record units a scan's up-front cost block charges beyond the
-// B-tree nodes (cost.md §3; large-values.md §8/§12/§13): pages = one page_read per overflow
-// chain page (the chain carries the payload for external-plain, the COMPRESSED block for
-// external-compressed); decompress = ceil(raw/capacity) value_decompress slabs per compressed
-// stored value (inline- or external-). Zero/zero for a fully-inline-plain record.
+// B-tree nodes (cost.md §3; large-values.md §8/§12/§14): for every column in the query's TOUCHED
+// SET (mask), pages = one page_read per overflow chain page (the chain carries the payload for
+// external-plain, the COMPRESSED block for external-compressed) and decompress =
+// ceil(raw/capacity) value_decompress slabs per compressed stored value (inline- or external-).
+// Zero/zero for a fully-inline-plain record or an untouched column.
 export function recordScanUnits(
   colTypes: ScalarType[],
   key: Uint8Array,
   row: Row,
   capacity: number,
+  mask: boolean[],
 ): { pages: number; decompress: number } {
   const plan = planDispositions(colTypes, key, row, capacity);
   let pages = 0;
   let decompress = 0;
   for (let i = 0; i < plan.disp.length; i++) {
+    if (!mask[i]) continue; // an untouched column's chain/slabs are never read (cost.md §3)
     switch (plan.disp[i]) {
       case "external":
         pages += Math.ceil(valuePayload(colTypes[i]!, row[i]!).length / capacity);
@@ -868,6 +871,13 @@ export function loadDatabase(image: Uint8Array): Database {
 }
 
 // anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
+// anySpillableMasked is anySpillable restricted to the columns a query's touched set selects —
+// the gate for the masked scan-units walk (cost.md §3 "The touched set"): if no TOUCHED column
+// can spill, the whole walk yields zero and is skipped.
+export function anySpillableMasked(colTypes: ScalarType[], mask: boolean[]): boolean {
+  return colTypes.some((ty, i) => mask[i]! && isSpillable(ty));
+}
+
 export function anySpillable(colTypes: ScalarType[]): boolean {
   return colTypes.some(isSpillable);
 }

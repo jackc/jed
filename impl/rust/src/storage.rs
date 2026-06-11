@@ -216,17 +216,18 @@ impl TableStore {
     }
 
     /// The up-front cost block a **full scan** of this store charges, as
-    /// `(page_read, value_decompress)` units: every B-tree node plus one `page_read` per overflow
-    /// chain page, and `ceil(raw/C)` `value_decompress` slabs per compressed stored value
-    /// (cost.md §3; spec/design/large-values.md §8/§12/§13). Equals `(node_count, 0)` when no
-    /// record spills or compresses — and the row walk is skipped entirely when no column type can
-    /// spill, so fixed-width tables pay nothing extra.
-    pub fn scan_units(&self) -> Result<(usize, usize)> {
+    /// `(page_read, value_decompress)` units: every B-tree node plus — for the query's **touched
+    /// columns** (`mask`, cost.md §3 "The touched set") — one `page_read` per overflow chain page
+    /// and `ceil(raw/C)` `value_decompress` slabs per compressed stored value
+    /// (spec/design/large-values.md §8/§12/§14). Equals `(node_count, 0)` when no touched record
+    /// spills or compresses — and the row walk is skipped entirely when no touched column type
+    /// can spill, so fixed-width tables and untouching queries pay nothing extra.
+    pub fn scan_units(&self, mask: &[bool]) -> Result<(usize, usize)> {
         let mut pages = self.node_count();
         let mut slabs = 0usize;
-        if crate::format::any_spillable(&self.col_types) {
+        if crate::format::any_spillable_masked(&self.col_types, mask) {
             for (k, row) in self.iter_entries()? {
-                let u = crate::format::record_scan_units(&self.col_types, &k, &row, self.cap);
+                let u = crate::format::record_scan_units(&self.col_types, &k, &row, self.cap, mask);
                 pages += u.pages;
                 slabs += u.decompress;
             }
@@ -239,12 +240,12 @@ impl TableStore {
     /// chain pages and decompress slabs of the records the bound admits (cost.md §3;
     /// spec/design/large-values.md §8/§12/§13). An empty bound or a point-lookup miss admits no
     /// record and adds nothing beyond the path nodes.
-    pub(crate) fn overlap_scan_units(&self, b: &KeyBound) -> Result<(usize, usize)> {
+    pub(crate) fn overlap_scan_units(&self, b: &KeyBound, mask: &[bool]) -> Result<(usize, usize)> {
         let mut pages = self.overlap_node_count(b);
         let mut slabs = 0usize;
-        if crate::format::any_spillable(&self.col_types) {
+        if crate::format::any_spillable_masked(&self.col_types, mask) {
             for (k, row) in self.range_entries(b)? {
-                let u = crate::format::record_scan_units(&self.col_types, &k, &row, self.cap);
+                let u = crate::format::record_scan_units(&self.col_types, &k, &row, self.cap, mask);
                 pages += u.pages;
                 slabs += u.decompress;
             }

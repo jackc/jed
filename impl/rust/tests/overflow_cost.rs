@@ -139,11 +139,41 @@ fn limit_does_not_lower_the_block() {
 }
 
 #[test]
-fn mutation_scans_charge_chain_pages() {
+fn mutation_scans_charge_only_touched_chains() {
+    // A DELETE whose filter READS the spilled column pays its chain (the touched set —
+    // cost.md §3); a bare DELETE reads no column, so dropping the rows charges nothing extra.
     let mut db = two_tables();
-    let spill = cost(&mut db, "DELETE FROM spill");
-    let control = cost(&mut db, "DELETE FROM control");
-    assert_eq!(spill, control + TEXT_CHAIN_PAGES);
+    let spill_touch = cost(&mut db, "DELETE FROM spill WHERE body = 'nope'");
+    let control_touch = cost(&mut db, "DELETE FROM control WHERE body = 'nope'");
+    assert_eq!(spill_touch, control_touch + TEXT_CHAIN_PAGES);
+    let spill_bare = cost(&mut db, "DELETE FROM spill");
+    let control_bare = cost(&mut db, "DELETE FROM control");
+    assert_eq!(spill_bare, control_bare);
+}
+
+#[test]
+fn untouched_columns_charge_nothing() {
+    // The touched set (cost.md §3 "The touched set"): a query that never references the spilled
+    // column pays neither its chain pages nor anything else for it — the large-values.md §7
+    // headline case — while one that does still pays.
+    let mut db = two_tables();
+    // Projection-only touch ...
+    let spill = cost(&mut db, "SELECT id FROM spill");
+    let control = cost(&mut db, "SELECT id FROM control");
+    assert_eq!(spill, control);
+    // ... an aggregate touches only its argument (count(*) touches nothing) ...
+    let spill_cnt = cost(&mut db, "SELECT count(*) FROM spill");
+    let control_cnt = cost(&mut db, "SELECT count(*) FROM control");
+    assert_eq!(spill_cnt, control_cnt);
+    // ... a WHERE reference is a touch even when only `id` is projected ...
+    let spill_w = cost(&mut db, "SELECT id FROM spill WHERE body = 'nope'");
+    let control_w = cost(&mut db, "SELECT id FROM control WHERE body = 'nope'");
+    assert_eq!(spill_w, control_w + TEXT_CHAIN_PAGES);
+    // ... and an UPDATE that ASSIGNS the spilled column without reading it (a constant
+    // source) skips its chain too — only assignment sources touch, not targets.
+    let spill_u = cost(&mut db, "UPDATE spill SET body = 'tiny2' WHERE id = 2");
+    let control_u = cost(&mut db, "UPDATE control SET body = 'tiny2' WHERE id = 2");
+    assert_eq!(spill_u, control_u);
 }
 
 #[test]

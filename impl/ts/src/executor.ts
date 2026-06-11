@@ -742,10 +742,14 @@ export class Database {
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.working().store(del.table);
     const keys: Uint8Array[] = [];
+    // DELETE's touched set (cost.md §3): only the filter's columns — dropping a row never reads
+    // its chains, so a bare DELETE charges no chain/decompress units at all.
+    const mask: boolean[] = new Array(table.columns.length).fill(false);
+    if (filter !== null) collectTouched(filter, 0, mask);
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
     // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
     // page_read per visited node (block, before the rows), then storageRowRead per scanned row.
-    const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound);
+    const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound, mask);
     if (entries === null) return { kind: "statement", cost: meter.accrued }; // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
@@ -826,10 +830,16 @@ export class Database {
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.working().store(upd.table);
     const updates: { key: Uint8Array; row: Row }[] = [];
+    // UPDATE's touched set (cost.md §3): the filter's columns plus every assignment SOURCE's —
+    // the rewrite re-stores an untouched spilled value without logically re-reading it
+    // (large-values.md §14).
+    const mask: boolean[] = new Array(table.columns.length).fill(false);
+    if (filter !== null) collectTouched(filter, 0, mask);
+    for (const p of plans) collectTouched(p.source, 0, mask);
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
     // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
     // page_read per visited node (block, before the rows), then storageRowRead per scanned row.
-    const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound);
+    const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound, mask);
     if (entries === null) return { kind: "statement", cost: meter.accrued }; // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
@@ -1134,6 +1144,24 @@ export class Database {
       offset: rel.offset,
       colCount: rel.table.columns.length,
     }));
+    // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
+    // columns this query statically references, collected depth-aware so a correlated
+    // subquery's outer reference back into this scope counts. An aggregate query's projections
+    // / HAVING / ORDER BY index the synthetic group row, whose inputs are exactly the group
+    // keys + aggregate arguments collected here; a plain query's projections and ORDER BY keys
+    // index the combined row directly.
+    const totalCols = planRels.reduce((a, r) => a + r.colCount, 0);
+    const touched: boolean[] = new Array(totalCols).fill(false);
+    if (filter !== null) collectTouched(filter, 0, touched);
+    for (const j of joins) if (j.on !== null) collectTouched(j.on, 0, touched);
+    if (isAgg) {
+      for (const gk of groupKeys) touched[gk] = true;
+      for (const s of aggSpecs) if (s.operand !== null) collectTouched(s.operand, 0, touched);
+    } else {
+      for (const p of projections) collectTouched(p, 0, touched);
+      for (const o of order) touched[o.idx] = true;
+    }
+    const relMasks = planRels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
     return {
       kind: "select",
       rels: planRels,
@@ -1151,6 +1179,7 @@ export class Database {
       limit: sel.limit,
       offset: sel.offset,
       relBounds,
+      relMasks,
     };
   }
 
@@ -1179,7 +1208,7 @@ export class Database {
       if (b === null) empty = true;
       else bound = b;
     }
-    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound);
+    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
     meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
 
     const limit = plan.limit!;
@@ -1245,13 +1274,13 @@ export class Database {
           nodeCount = 0;
         } else {
           rows = store.rangeRows(b);
-          const u = store.overlapScanUnits(b);
+          const u = store.overlapScanUnits(b, plan.relMasks[ri]!);
           nodeCount = u.pages;
           slabs = u.slabs;
         }
       } else {
         rows = store.iterInKeyOrder();
-        const u = store.scanUnits();
+        const u = store.scanUnits(plan.relMasks[ri]!);
         nodeCount = u.pages;
         slabs = u.slabs;
       }
@@ -1778,15 +1807,16 @@ function scanEntries(
   store: TableStore,
   pkBound: PkBound | null,
   params: Value[],
+  mask: boolean[],
 ): { entries: Entry[] | null; overlap: number; slabs: number } {
   if (pkBound !== null) {
     // Top-level statement: no enclosing query, so the bound never has a correlated source.
     const b = buildKeyBound(pkBound, params, []);
     if (b === null) return { entries: null, overlap: 0, slabs: 0 };
-    const u = store.overlapScanUnits(b);
+    const u = store.overlapScanUnits(b, mask);
     return { entries: store.rangeEntries(b), overlap: u.pages, slabs: u.slabs };
   }
-  const u = store.scanUnits();
+  const u = store.scanUnits(mask);
   return { entries: store.entriesInKeyOrder(), overlap: u.pages, slabs: u.slabs };
 }
 
@@ -1842,6 +1872,73 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     default:
       return false; // leaves: column, param, const*
+  }
+}
+
+// collectTouched marks the combined-row columns an expression STATICALLY references — the
+// touched set (cost.md §3 "The touched set"; large-values.md §14). Depth bookkeeping mirrors
+// rexprReferencesOuter: walking the target plan's own clauses is depth 0 (a column touches);
+// inside a nested subquery a column indexes the subquery's own row (ignored) and an outer
+// column with level === depth is a correlated reference back into the target scope (touches).
+// Purely syntactic — a never-taken CASE branch still touches — so the set is deterministic and
+// cross-core identical (a §8 contract).
+function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
+  switch (e.kind) {
+    case "column":
+      if (depth === 0) touched[e.index] = true;
+      return;
+    case "outerColumn":
+      if (e.level === depth && depth > 0) touched[e.index] = true;
+      return;
+    case "subquery":
+      if (e.lhs !== null) collectTouched(e.lhs, depth, touched);
+      collectTouchedPlan(e.plan, depth + 1, touched);
+      return;
+    case "inValues":
+      collectTouched(e.lhs, depth, touched);
+      return;
+    case "cast":
+    case "neg":
+    case "not":
+    case "isNull":
+      collectTouched(e.operand, depth, touched);
+      return;
+    case "arith":
+    case "compare":
+    case "and":
+    case "or":
+    case "distinct":
+    case "like":
+      collectTouched(e.lhs, depth, touched);
+      collectTouched(e.rhs, depth, touched);
+      return;
+    case "case":
+      for (const arm of e.arms) {
+        collectTouched(arm.cond, depth, touched);
+        collectTouched(arm.result, depth, touched);
+      }
+      collectTouched(e.els, depth, touched);
+      return;
+    case "scalarFunc":
+      for (const a of e.args) collectTouched(a, depth, touched);
+      return;
+    default: // leaves: param, const*
+  }
+}
+
+// collectTouchedPlan walks a nested plan's expression surfaces for outer references back into
+// the target scope — the same five surfaces selectPlanReferencesOuter checks (slot lists like
+// group keys / ORDER BY index the nested plan's own rows and can never reach outward).
+function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]): void {
+  if (plan.kind === "select") {
+    for (const j of plan.joins) if (j.on !== null) collectTouched(j.on, depth, touched);
+    if (plan.filter !== null) collectTouched(plan.filter, depth, touched);
+    if (plan.having !== null) collectTouched(plan.having, depth, touched);
+    for (const s of plan.aggSpecs) if (s.operand !== null) collectTouched(s.operand, depth, touched);
+    for (const p of plan.projections) collectTouched(p, depth, touched);
+  } else {
+    collectTouchedPlan(plan.lhs, depth, touched);
+    collectTouchedPlan(plan.rhs, depth, touched);
   }
 }
 
@@ -2016,6 +2113,11 @@ type SelectPlan = {
   // (literal/param/outer) — a cross-relation `b.pk = a.x` is the index-nested-loop case (a
   // follow-on). The residual filter stays the WHOLE `filter`, re-applied after the join.
   relBounds: (PkBound | null)[];
+  // relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md §14):
+  // which of its columns this query statically references. Drives the chain-pageRead /
+  // valueDecompress portion of the scan's up-front cost block — an untouched spilled or
+  // compressed column charges nothing, however many records the bound admits.
+  relMasks: boolean[][];
 };
 
 // SetOpPlan is a resolved set operation: both operands planned with the same parent scope, the

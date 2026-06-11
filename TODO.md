@@ -832,9 +832,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
             dependency (a library fails §8 cross-core byte-identity — large-values.md §6); any
             later proposal stays gated on CLAUDE.md §14.
 
-      Unblocks the `decimal` 1000-digit cap and the `json`/`array` headline types. Remaining
-      follow-ons ride §7/§8.1: lazy (read-on-touch) materialization + the per-touched-value
-      cost refinement. _(was size: L→XL; deps: B-tree pages [P6.1] ✓; §9/§13/§14)_
+      Unblocks the `decimal` 1000-digit cap and the `json`/`array` headline types.
+      **Follow-on phase 1 ✅ landed — the touched-column cost contract** (large-values.md §14;
+      cost.md §3 "The touched set"): a scan's chain-`page_read` / `value_decompress` block now
+      charges only the columns the query statically references (collected depth-aware at plan
+      time, incl. correlated outer refs), so `SELECT small_col` / `count(*)` / bare `DELETE`
+      over a spilled table charge nothing for the large values. Remaining follow-on (phase 2,
+      design pinned in §14): **physical lazy read-on-touch storage** — unfetched references in
+      loaded records, scan-layer resolution by the same masks, header-only chain reachability at
+      open; lands behind the contract with zero cost churn. _(was size: L→XL; deps: B-tree pages
+      [P6.1] ✓; §9/§13/§14)_
 - [ ] **Crash-recovery hardening** — torn-meta fixtures exist; expand durability/recovery
       tests. WAL is deferred (COW + root-swap gives atomicity without one). _(size: M; §9)_
 

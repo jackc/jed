@@ -105,3 +105,25 @@ test("decimal payloads compress too", () => {
   execute(db, "INSERT INTO control VALUES (1, 7)");
   assert.equal(cost(db, "SELECT * FROM t"), cost(db, "SELECT * FROM control") + 2n, "the decompress slabs are metered");
 });
+
+test("untouched compressed columns charge no slabs", () => {
+  // The touched set (cost.md §3 "The touched set"): a query that never references the
+  // compressed column pays no decompress slabs; an aggregate's ARGUMENT is a touch.
+  const db = twoTables();
+  assert.equal(cost(db, "SELECT id FROM comp"), cost(db, "SELECT id FROM control"));
+  assert.equal(cost(db, "SELECT count(*) FROM comp"), cost(db, "SELECT count(*) FROM control"));
+  assert.equal(cost(db, "SELECT min(body) FROM comp"), cost(db, "SELECT min(body) FROM control") + SLABS_600);
+});
+
+test("a correlated outer reference is a touch", () => {
+  // A nested subquery's outer reference back into the scanned relation counts as a touch
+  // (collected depth-aware — cost.md §3). `probe` holds the one value that matches both
+  // tables' row 2, so the two queries emit identical row counts and differ only in the
+  // outer table's storage — isolating the SLABS_600 the outer reference charges.
+  const db = twoTables();
+  execute(db, "CREATE TABLE probe (id int32 PRIMARY KEY, body text)");
+  execute(db, "INSERT INTO probe VALUES (1, 'small')");
+  const comp = cost(db, "SELECT id FROM comp WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = comp.body)");
+  const control = cost(db, "SELECT id FROM control WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = control.body)");
+  assert.equal(comp, control + SLABS_600);
+});
