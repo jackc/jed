@@ -65,6 +65,29 @@ func oneTableEmptyDB(t *testing.T) *Database {
 	return db
 }
 
+// compositePKTableDB has a COMPOSITE primary key (constraints.md §3) — the stored key is
+// the concatenation of the members' encodings (4-byte int32 then 2-byte int16,
+// encoding.md §2.3). Rows insert in ascending tuple order (the tree shape is
+// order-sensitive), with a negative first component and first-component ties broken by
+// the second.
+func compositePKTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (a int32, b int16, v int16, PRIMARY KEY (a, b))")
+	for _, abv := range [][3]int64{
+		{-2, 5, 10},
+		{1, 1, 20},
+		{1, 2, 30},
+		{1, 3, 40},
+		{2, 0, 50},
+		{2, 1, 60},
+		{3, 7, 70},
+		{3, 9, 80},
+	} {
+		run(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d, %d)", abv[0], abv[1], abv[2]))
+	}
+	return db
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 func nopkTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
@@ -284,6 +307,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"timestamp_table.jed", timestampTableDB},
 		{"timestamptz_table.jed", timestamptzTableDB},
 		{"nopk_table.jed", nopkTableDB},
+		{"composite_pk_table.jed", compositePKTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -318,6 +342,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"timestamp_table.jed", timestampTableDB, "t"},
 		{"timestamptz_table.jed", timestamptzTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
+		{"composite_pk_table.jed", compositePKTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

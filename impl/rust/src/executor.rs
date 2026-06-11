@@ -514,8 +514,13 @@ impl Database {
     }
 
     /// Analyze and run a CREATE TABLE: resolve each column's type name, enforce a
-    /// single primary key (which is implicitly NOT NULL), reject duplicate table
-    /// and column names, then register the table.
+    /// single primary key across both forms (column-level and the table-level
+    /// `PRIMARY KEY (a, b, …)` constraint — which is implicitly NOT NULL per member),
+    /// reject duplicate table and column names, then register the table.
+    /// Constraint checks mirror PostgreSQL's order (oracle-probed, constraints.md §3):
+    /// a second primary key traps 42P16 before its members resolve; members resolve
+    /// left to right (unknown 42703, repeated 42701); then the jed narrowings — the
+    /// declaration-order rule and the per-member key-type gate — trap 0A000.
     fn execute_create_table(&mut self, ct: CreateTable) -> Result<Outcome> {
         if self.table(&ct.name).is_some() {
             return Err(EngineError::new(
@@ -555,7 +560,10 @@ impl Database {
                 if pk_seen {
                     return Err(EngineError::new(
                         SqlState::InvalidTableDefinition,
-                        "a table may have at most one primary key",
+                        format!(
+                            "multiple primary keys for table {} are not allowed",
+                            ct.name
+                        ),
                     ));
                 }
                 pk_seen = true;
@@ -582,6 +590,61 @@ impl Database {
                 not_null: def.primary_key || def.not_null, // PRIMARY KEY ⇒ NOT NULL
                 default,
             });
+        }
+
+        // Table-level `PRIMARY KEY (a, b, …)` constraints (constraints.md §3). Check order
+        // mirrors PostgreSQL (oracle-probed): a second primary key is 42P16 before its
+        // members resolve; members resolve left to right (42703 unknown, 42701 repeated).
+        // The jed narrowings follow: the list must name columns in declaration order, and
+        // every member must be of a key-encodable type (both 0A000, relaxable).
+        for pk_list in &ct.table_pks {
+            if pk_seen {
+                return Err(EngineError::new(
+                    SqlState::InvalidTableDefinition,
+                    format!(
+                        "multiple primary keys for table {} are not allowed",
+                        ct.name
+                    ),
+                ));
+            }
+            pk_seen = true;
+            let mut indices: Vec<usize> = Vec::with_capacity(pk_list.len());
+            for name in pk_list {
+                let idx = columns
+                    .iter()
+                    .position(|c: &Column| c.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            SqlState::UndefinedColumn,
+                            format!("column {name} named in key does not exist"),
+                        )
+                    })?;
+                if indices.contains(&idx) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateColumn,
+                        format!("column {name} appears twice in primary key constraint"),
+                    ));
+                }
+                indices.push(idx);
+            }
+            if !indices.windows(2).all(|w| w[0] < w[1]) {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a primary key whose column order differs from the table's column order \
+                     is not supported yet",
+                ));
+            }
+            for &i in &indices {
+                let ty = columns[i].ty;
+                if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!("a {} primary key is not supported yet", ty.canonical_name()),
+                    ));
+                }
+                columns[i].primary_key = true;
+                columns[i].not_null = true; // PRIMARY KEY ⇒ NOT NULL, per member
+            }
         }
 
         self.put_table(Table {
@@ -639,7 +702,13 @@ impl Database {
         // borrow so phase 1 can read the store (dup-key check) and phase 2 can mutate it.
         let table_name = tdef.name.clone();
         let columns: Vec<Column> = tdef.columns.clone();
-        let pk = tdef.primary_key_index().map(|i| (i, tdef.columns[i].ty));
+        // The key members in key order — one for a single-column PK, several for a
+        // composite (constraints.md §3), empty for a no-PK (rowid) table.
+        let pk: Vec<(usize, ScalarType)> = tdef
+            .pk_indices()
+            .into_iter()
+            .map(|i| (i, tdef.columns[i].ty))
+            .collect();
 
         // Resolve the optional column list once. `provided[i] = Some(p)` means table column i
         // takes value position `p` in each row; `None` means column i is omitted (its default,
@@ -729,7 +798,7 @@ impl Database {
                 // work is the disposition plan's compression attempts for over-RECORD_MAX rows
                 // (value_compress, cost.md §3); a fully-inline row still costs zero.
                 let mut meter = Meter::with_limit(self.max_cost);
-                self.insert_rows(&table, &columns, pk, &provided, rows, &mut meter)?;
+                self.insert_rows(&table, &columns, &pk, &provided, rows, &mut meter)?;
                 Ok(Outcome::Statement {
                     cost: meter.accrued,
                 })
@@ -778,7 +847,7 @@ impl Database {
                 // SELECT's cost keeps one ceiling over the whole statement.
                 let mut meter = Meter::with_limit(self.max_cost);
                 meter.charge(q.cost);
-                self.insert_rows(&table, &columns, pk, &provided, q.rows, &mut meter)?;
+                self.insert_rows(&table, &columns, &pk, &provided, q.rows, &mut meter)?;
                 Ok(Outcome::Statement {
                     cost: meter.accrued,
                 })
@@ -799,7 +868,7 @@ impl Database {
         &mut self,
         table: &str,
         columns: &[Column],
-        pk: Option<(usize, ScalarType)>,
+        pk: &[(usize, ScalarType)],
         provided: &[Option<usize>],
         rows: Vec<Vec<Value>>,
         meter: &mut Meter,
@@ -824,16 +893,25 @@ impl Database {
                 )?);
             }
 
-            let key = match pk {
-                Some((i, pk_ty)) => {
-                    let k = match &row[i] {
-                        Value::Int(nn) => encode_int(pk_ty, *nn),
+            let key = if pk.is_empty() {
+                None
+            } else {
+                // The composite key is the concatenation of the members' bare encodings in
+                // key order (encoding.md §2.3) — every keyable type is fixed-width, so the
+                // concatenation is self-delimiting and memcmp equals the tuple's order. A
+                // single-column key is the one-member case of the same rule.
+                let mut k = Vec::new();
+                for &(i, pk_ty) in pk {
+                    match &row[i] {
+                        Value::Int(nn) => k.extend_from_slice(&encode_int(pk_ty, *nn)),
                         // uuid is the first non-integer key: its key is the bare 16 bytes
                         // (uuid-raw16, encoding.md §2.7) — a PK is NOT NULL, so no presence tag.
-                        Value::Uuid(u) => u.to_vec(),
+                        Value::Uuid(u) => k.extend_from_slice(u),
                         // A timestamp / timestamptz PRIMARY KEY is supported: its key bytes are
                         // the int64 instant codec (spec/design/timestamp.md §6).
-                        Value::Timestamp(m) | Value::Timestamptz(m) => encode_int(pk_ty, *m),
+                        Value::Timestamp(m) | Value::Timestamptz(m) => {
+                            k.extend_from_slice(&encode_int(pk_ty, *m))
+                        }
                         // Unreachable: a PK column is NOT NULL, enforced above.
                         Value::Null => unreachable!("primary key column is NOT NULL"),
                         // Unreachable: a boolean PRIMARY KEY is rejected at CREATE TABLE (0A000).
@@ -852,17 +930,16 @@ impl Database {
                         Value::Unfetched(_) => {
                             panic!("BUG: unfetched large value escaped the storage layer")
                         }
-                    };
-                    if seen_keys.contains(&k) || self.store(table).get(&k)?.is_some() {
-                        return Err(EngineError::new(
-                            SqlState::UniqueViolation,
-                            "duplicate key value violates primary key uniqueness",
-                        ));
                     }
-                    seen_keys.insert(k.clone());
-                    Some(k)
                 }
-                None => None,
+                if seen_keys.contains(&k) || self.store(table).get(&k)?.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::UniqueViolation,
+                        "duplicate key value violates primary key uniqueness",
+                    ));
+                }
+                seen_keys.insert(k.clone());
+                Some(k)
             };
             // Meter the row's disposition-plan compression attempts (value_compress, cost.md
             // §3). For a no-PK table the synthetic rowid is allocated in phase 2; only the key
@@ -1012,17 +1089,20 @@ impl Database {
         // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
         let scope = Scope::single(self, table);
 
-        // Resolve assignments up front (fail fast, deterministic).
-        let pk_idx = table.primary_key_index();
+        // Resolve assignments up front (fail fast, deterministic). The 0A000 guard covers
+        // EVERY key member — for a composite PRIMARY KEY, assigning any member would change
+        // the storage key (constraints.md §3).
+        let pk_members = table.pk_indices();
         // Capture the PK (index, type) by value for the primary-key pushdown (detected after the
-        // `table` borrow ends, since the mutate path takes `&mut self`).
-        let pk_info = pk_idx.map(|i| (i, table.columns[i].ty));
+        // `table` borrow ends, since the mutate path takes `&mut self`). Pushdown recognizes
+        // single-column keys only (`primary_key_index`); a composite-PK table full-scans.
+        let pk_info = table.primary_key_index().map(|i| (i, table.columns[i].ty));
         let ncols = table.columns.len();
         let mut ptypes = ParamTypes::default();
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
         for a in &upd.assignments {
             let idx = col_idx(table, &a.column)?;
-            if Some(idx) == pk_idx {
+            if pk_members.contains(&idx) {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "updating a primary key column is not supported",

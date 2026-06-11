@@ -151,11 +151,16 @@ export type ColumnDef = {
 // evaluated against the pre-update row (so `SET a = b, b = a` swaps).
 export type Assignment = { column: string; value: Expr };
 
-// CreateTable is a CREATE TABLE statement.
+// CreateTable is a CREATE TABLE statement. tablePks is the table-level
+// `PRIMARY KEY (a, b, ...)` constraints, each a list of member column names in key order
+// (spec/design/grammar.md §28). The parser collects every one it sees; CREATE TABLE's
+// execution resolves them (42703/42701) and rejects more than one primary key across both
+// forms (42P16) — spec/design/constraints.md §3.
 export type CreateTable = {
   kind: "createTable";
   name: string;
   columns: ColumnDef[];
+  tablePks: string[][];
 };
 
 // DropTable is a DROP TABLE statement. Removes a table — its definition and all its

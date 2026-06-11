@@ -35,13 +35,29 @@ func (t *Table) ColumnIndex(name string) int {
 	return -1
 }
 
-// PrimaryKeyIndex returns the primary-key column's index, or -1. Step-1 supports at
-// most a single-column primary key.
-func (t *Table) PrimaryKeyIndex() int {
+// PKIndices returns the primary-key member columns' indices in KEY order. Key order is
+// the flagged columns in declaration order — CREATE TABLE requires the constraint's list
+// order to match (the documented 0A000 narrowing, spec/design/constraints.md §3), so the
+// flag bits alone reconstruct the key. Empty = the table has no primary key (synthetic
+// rowid keys).
+func (t *Table) PKIndices() []int {
+	var idxs []int
 	for i, c := range t.Columns {
 		if c.PrimaryKey {
-			return i
+			idxs = append(idxs, i)
 		}
+	}
+	return idxs
+}
+
+// PrimaryKeyIndex returns the primary-key column's index iff the key is SINGLE-column,
+// else -1. The PK pushdown (point lookup / range bound) recognizes single-column keys
+// only — a composite-PK table full-scans this slice (spec/design/constraints.md §3) — so
+// every pushdown site routes through this accessor and stays sound by construction.
+func (t *Table) PrimaryKeyIndex() int {
+	idxs := t.PKIndices()
+	if len(idxs) == 1 {
+		return idxs[0]
 	}
 	return -1
 }

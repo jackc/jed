@@ -576,8 +576,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       at CREATE TABLE; applied for an omitted column or the `DEFAULT` keyword; persisted via flags
       bit2 + the value codec. Landed with the **`INSERT` column list** + the `DEFAULT` value
       keyword (grammar.md §16, constraints.md §2). A general-expression default stays deferred.
-- [ ] **Constraints (remaining)** — `UNIQUE`, `CHECK`, **composite `PRIMARY KEY`** (key encoding
-      already composes — types.md §7), `FOREIGN KEY`. These are heavier. _(size: M→L each)_
+- [x] **Composite `PRIMARY KEY`** ✅ **landed** (all 3 cores) — the table-level
+      `PRIMARY KEY (a, b, …)` constraint (grammar.md §28, constraints.md §3): key bytes are
+      the members' concatenated encodings (encoding.md §2.3, now exercised; pinned by the
+      `composite_pk_table.jed` golden), uniqueness over the whole tuple (23505), every member
+      implicitly NOT NULL, PG-matching DDL errors (42703/42701/42P16). Two documented
+      narrowings, both relaxable: the list order must match declaration order (0A000 — the
+      catalog's flag-bit persistence carries no independent order; lift at the secondary-index
+      catalog reshape), and the PK pushdown stays single-column (a composite-PK table
+      full-scans; composite point-lookup/prefix pushdown is a follow-on optimization slice
+      with its NoREC obligation).
+- [ ] **Constraints (remaining)** — `UNIQUE`, `CHECK`, `FOREIGN KEY`. These are heavier.
+      _(size: M→L each)_
 - [ ] **Secondary indexes** (`CREATE INDEX`) — also a planner + storage concern (index
       pages, index maintenance on write). _(size: L; deps: storage maturation)_
 - [ ] **`RETURNING`** clause; **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE)_

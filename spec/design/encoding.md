@@ -59,7 +59,12 @@ position. The tag is one byte, not a bit stolen from the value, so the value enc
 
 - **Composite keys** are the **concatenation** of their components' encodings, left to
   right. Each component is either fixed-width (the integer types) or self-delimiting, so the
-  concatenation stays order-preserving without separators.
+  concatenation stays order-preserving without separators. **Status — EXERCISED:** a
+  composite `PRIMARY KEY` ([constraints.md §3](constraints.md)) stores exactly this
+  concatenation (every keyable component type is fixed-width today — integers, uuid,
+  timestamps — so the widths come from the schema and `memcmp` equals the tuple's
+  lexicographic order). The cross-core bytes are pinned by the `composite_pk_table.jed`
+  golden ([../fileformat/format.md](../fileformat/format.md)).
 - **Descending order** is the **bitwise inversion (one's complement)** of a component,
   *tag byte included*. Inverting every byte reverses `memcmp` order exactly, so a descending
   component sorts as the mirror of its ascending form. Under inversion the nullable tag
@@ -237,9 +242,11 @@ text is not yet allowed in a key. `bytea` (§2.6) is the same: raw-byte *values*
 compact value codec, the order-preserving *key* rule authored but unexercised. `uuid` (§2.7) is
 the **exception and the first non-integer key actually exercised**: a uuid `PRIMARY KEY` stores
 the bare 16 bytes as its key (so the BTree/sorted store iterates uuid PKs in correct logical
-order with no comparator), proving the executor key path generalizes beyond integers. The
-remaining non-integer scalars (`decimal`, …) and composite keys will add their own §2 rules and
-fixtures when those features land; nullable *secondary indexes* — the first place §2.2's sort
+order with no comparator), proving the executor key path generalizes beyond integers.
+**Composite keys are exercised too**: a composite `PRIMARY KEY` ([constraints.md §3](constraints.md))
+concatenates its fixed-width components per §2.3, pinned by the `composite_pk_table.jed`
+golden. The remaining non-integer scalars (`decimal`, …) will add their own §2 key paths when
+their in-key narrowings lift; nullable *secondary indexes* — the first place §2.2's sort
 order becomes load-bearing rather than spec-only — follow then too.
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)

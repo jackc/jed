@@ -174,9 +174,13 @@ func (p *Parser) consumeTransactionOrWork() {
 	}
 }
 
-// parseCreateTable parses `CREATE TABLE <name> ( <coldef> [, <coldef>]* )`, where
-// each <coldef> is `<name> <typename> [PRIMARY KEY]`. Type names are kept as written
-// and resolved during execution (the catalog owns the type lattice).
+// parseCreateTable parses `CREATE TABLE <name> ( <element> [, <element>]* )`, where
+// each <element> is a column definition or the table-level `PRIMARY KEY ( <col> [,
+// <col>]* )` constraint (spec/design/grammar.md §28). An element starting with the two
+// keywords PRIMARY KEY is the table constraint — nothing is lost, since a column named
+// "primary" would need a type named "key", which does not exist. Type names are kept as
+// written and resolved during execution (the catalog owns the type lattice); the
+// constraint's member names are likewise resolved there (42703/42701/42P16).
 func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	if err := p.expectKeyword("create"); err != nil {
 		return nil, err
@@ -193,12 +197,23 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	}
 
 	var columns []ColumnDef
+	var tablePKs [][]string
 	for {
-		col, err := p.parseColumnDef()
-		if err != nil {
-			return nil, err
+		if p.peekKeyword() == "primary" && p.peekKeywordAt(1) == "key" {
+			p.advance()
+			p.advance()
+			pkCols, err := p.parsePKColumnList()
+			if err != nil {
+				return nil, err
+			}
+			tablePKs = append(tablePKs, pkCols)
+		} else {
+			col, err := p.parseColumnDef()
+			if err != nil {
+				return nil, err
+			}
+			columns = append(columns, col)
 		}
-		columns = append(columns, col)
 		switch p.advance().Kind {
 		case TokComma:
 			continue
@@ -211,7 +226,35 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	if len(columns) == 0 {
 		return nil, NewError(SyntaxError, "a table must have at least one column")
 	}
-	return &CreateTable{Name: name, Columns: columns}, nil
+	return &CreateTable{Name: name, Columns: columns, TablePKs: tablePKs}, nil
+}
+
+// parsePKColumnList parses the parenthesized member list of a table-level PRIMARY KEY
+// constraint: `( <col> [, <col>]* )`. Must be non-empty — `PRIMARY KEY ()` is 42601 (the
+// first expectIdentifier rejects `)`).
+func (p *Parser) parsePKColumnList() ([]string, error) {
+	if err := p.expect(TokLParen); err != nil {
+		return nil, err
+	}
+	first, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	cols := []string{first}
+	for {
+		switch p.advance().Kind {
+		case TokComma:
+			col, err := p.expectIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			cols = append(cols, col)
+		case TokRParen:
+			return cols, nil
+		default:
+			return nil, NewError(SyntaxError, "expected ',' or ')'")
+		}
+	}
 }
 
 func (p *Parser) parseColumnDef() (ColumnDef, error) {

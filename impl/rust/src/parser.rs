@@ -121,9 +121,13 @@ impl Parser {
         }
     }
 
-    /// `CREATE TABLE <name> ( <coldef> [, <coldef>]* )`, where each `<coldef>` is
-    /// `<name> <typename> [PRIMARY KEY]`. Type names are kept as written and
-    /// resolved during execution (the catalog owns the type lattice).
+    /// `CREATE TABLE <name> ( <element> [, <element>]* )`, where each `<element>` is a
+    /// column definition or the table-level `PRIMARY KEY ( <col> [, <col>]* )` constraint
+    /// (spec/design/grammar.md §28). An element starting with the two keywords `PRIMARY KEY`
+    /// is the table constraint — nothing is lost, since a column named `primary` would need
+    /// a type named `key`, which does not exist. Type names are kept as written and
+    /// resolved during execution (the catalog owns the type lattice); the constraint's
+    /// member names are likewise resolved there (42703/42701/42P16).
     fn parse_create_table(&mut self) -> Result<CreateTable> {
         self.expect_keyword("create")?;
         self.expect_keyword("table")?;
@@ -131,8 +135,17 @@ impl Parser {
         self.expect(&Token::LParen)?;
 
         let mut columns = Vec::new();
+        let mut table_pks = Vec::new();
         loop {
-            columns.push(self.parse_column_def()?);
+            if self.peek_keyword().as_deref() == Some("primary")
+                && self.peek_keyword_at(1).as_deref() == Some("key")
+            {
+                self.advance();
+                self.advance();
+                table_pks.push(self.parse_pk_column_list()?);
+            } else {
+                columns.push(self.parse_column_def()?);
+            }
             match self.advance() {
                 Token::Comma => continue,
                 Token::RParen => break,
@@ -142,7 +155,27 @@ impl Parser {
         if columns.is_empty() {
             return Err(syntax("a table must have at least one column"));
         }
-        Ok(CreateTable { name, columns })
+        Ok(CreateTable {
+            name,
+            columns,
+            table_pks,
+        })
+    }
+
+    /// The parenthesized member list of a table-level `PRIMARY KEY` constraint:
+    /// `( <col> [, <col>]* )`. Must be non-empty — `PRIMARY KEY ()` is 42601 (the first
+    /// `expect_identifier` rejects `)`).
+    fn parse_pk_column_list(&mut self) -> Result<Vec<String>> {
+        self.expect(&Token::LParen)?;
+        let mut cols = vec![self.expect_identifier()?];
+        loop {
+            match self.advance() {
+                Token::Comma => cols.push(self.expect_identifier()?),
+                Token::RParen => break,
+                other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
+            }
+        }
+        Ok(cols)
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef> {

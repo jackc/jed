@@ -1,0 +1,120 @@
+# Composite PRIMARY KEY — the table-level PRIMARY KEY (a, b, …) constraint. The key is the
+# members' concatenated encodings in declaration order; uniqueness is over the WHOLE tuple
+# (23505); every member is implicitly NOT NULL (23502); DDL errors match PostgreSQL
+# (42703/42701/42P16); the out-of-declaration-order list and a non-keyable member type are
+# documented 0A000 narrowings. spec/design/constraints.md §3, grammar.md §28.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.update, query.select, query.order_by, types.int16, types.int32, types.text
+
+statement ok
+CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))
+
+# rows arrive out of tuple order; a negative first component exercises the sign-flip
+statement ok
+INSERT INTO t VALUES (2, 1, 50), (1, 2, 30), (1, 1, 20)
+
+statement ok
+INSERT INTO t VALUES (-1, 9, 10)
+
+# a shared first component is a distinct row — the whole tuple is the key
+statement ok
+INSERT INTO t VALUES (2, 0, 40)
+
+# a duplicate tuple traps 23505
+statement error 23505
+INSERT INTO t VALUES (1, 2, 99)
+
+# an in-batch duplicate too (two-phase / all-or-nothing: nothing stored)
+statement error 23505
+INSERT INTO t VALUES (5, 5, 1), (5, 5, 2)
+
+# ORDER BY over both members is fully deterministic (and mirrors the stored key order)
+query III nosort
+SELECT a, b, v FROM t ORDER BY a, b
+----
+-1
+9
+10
+1
+1
+20
+1
+2
+30
+2
+0
+40
+2
+1
+50
+
+# NULL into a member traps 23502 (PRIMARY KEY ⇒ NOT NULL, per member)
+statement error 23502
+INSERT INTO t VALUES (4, NULL, 1)
+
+# an omitted member (no default) traps 23502 the same way
+statement error 23502
+INSERT INTO t (a, v) VALUES (4, 1)
+
+# assigning any key member is the documented 0A000 narrowing (the storage key never
+# changes — constraints.md §3); PG allows PK updates, a recorded divergence
+statement error 0A000
+UPDATE t SET b = 9 WHERE a = 1
+
+# non-member columns update fine
+statement ok
+UPDATE t SET v = 99 WHERE a = 1 AND b = 1
+
+query III nosort
+SELECT a, b, v FROM t ORDER BY a, b
+----
+-1
+9
+10
+1
+1
+99
+1
+2
+30
+2
+0
+40
+2
+1
+50
+
+# a single-column table constraint is the column-level form's equivalent
+statement ok
+CREATE TABLE s (k int32, PRIMARY KEY (k))
+
+statement ok
+INSERT INTO s VALUES (1)
+
+statement error 23505
+INSERT INTO s VALUES (1)
+
+# --- DDL errors (codes match PostgreSQL, oracle-checked) ---
+
+# an unknown member column
+statement error 42703
+CREATE TABLE e1 (a int32, PRIMARY KEY (a, nosuch))
+
+# a repeated member column
+statement error 42701
+CREATE TABLE e2 (a int32, b int32, PRIMARY KEY (a, a))
+
+# at most one primary key across both forms
+statement error 42P16
+CREATE TABLE e3 (a int32 PRIMARY KEY, b int32, PRIMARY KEY (b))
+
+statement error 42P16
+CREATE TABLE e4 (a int32, b int32, PRIMARY KEY (a), PRIMARY KEY (b))
+
+# narrowing: the list must name columns in declaration order (PG accepts any order)
+statement error 0A000
+CREATE TABLE e5 (a int32, b int32, PRIMARY KEY (b, a))
+
+# narrowing: every member must be of a key-encodable type (text is not yet — types.md §11)
+statement error 0A000
+CREATE TABLE e6 (a int32, s text, PRIMARY KEY (a, s))

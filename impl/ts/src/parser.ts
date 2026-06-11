@@ -190,9 +190,13 @@ class Parser {
     if (kw === "transaction" || kw === "work") this.advance();
   }
 
-  // parseCreateTable parses `CREATE TABLE <name> ( <coldef> [, <coldef>]* )`, where
-  // each <coldef> is `<name> <typename> [PRIMARY KEY]`. Type names are kept as written
-  // and resolved during execution.
+  // parseCreateTable parses `CREATE TABLE <name> ( <element> [, <element>]* )`, where
+  // each <element> is a column definition or the table-level `PRIMARY KEY ( <col> [,
+  // <col>]* )` constraint (spec/design/grammar.md §28). An element starting with the two
+  // keywords PRIMARY KEY is the table constraint — nothing is lost, since a column named
+  // "primary" would need a type named "key", which does not exist. Type names are kept as
+  // written and resolved during execution; the constraint's member names are likewise
+  // resolved there (42703/42701/42P16).
   private parseCreateTable(): Statement {
     this.expectKeyword("create");
     this.expectKeyword("table");
@@ -200,8 +204,15 @@ class Parser {
     this.expect("lparen");
 
     const columns: ColumnDef[] = [];
+    const tablePks: string[][] = [];
     for (;;) {
-      columns.push(this.parseColumnDef());
+      if (this.peekKeyword() === "primary" && this.peekKeywordAt(1) === "key") {
+        this.advance();
+        this.advance();
+        tablePks.push(this.parsePkColumnList());
+      } else {
+        columns.push(this.parseColumnDef());
+      }
       const k = this.advance().kind;
       if (k === "comma") continue;
       if (k === "rparen") break;
@@ -210,7 +221,24 @@ class Parser {
     if (columns.length === 0) {
       throw engineError("syntax_error", "a table must have at least one column");
     }
-    return { kind: "createTable", name, columns };
+    return { kind: "createTable", name, columns, tablePks };
+  }
+
+  // parsePkColumnList parses the parenthesized member list of a table-level PRIMARY KEY
+  // constraint: `( <col> [, <col>]* )`. Must be non-empty — `PRIMARY KEY ()` is 42601 (the
+  // first expectIdentifier rejects `)`).
+  private parsePkColumnList(): string[] {
+    this.expect("lparen");
+    const cols = [this.expectIdentifier()];
+    for (;;) {
+      const k = this.advance().kind;
+      if (k === "comma") {
+        cols.push(this.expectIdentifier());
+        continue;
+      }
+      if (k === "rparen") return cols;
+      throw engineError("syntax_error", "expected ',' or ')'");
+    }
   }
 
   private parseColumnDef(): ColumnDef {

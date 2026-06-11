@@ -49,18 +49,38 @@ sql_statement  ::= create_table
 /* --- DDL ----------------------------------------------------------------- */
 
 create_table   ::= "CREATE" "TABLE" identifier
-                   "(" column_def ("," column_def)* ")"
+                   "(" table_element ("," table_element)* ")"
+
+/* A table element is a column definition or a table-level constraint. The only
+ * table constraint is the composite-capable PRIMARY KEY list; it may appear anywhere
+ * among the column definitions (PostgreSQL's shape). An element starting with the two
+ * keywords "PRIMARY" "KEY" parses as the table constraint — the constraint keywords are
+ * not reserved (§3), but a column named "primary" cannot have a type named "key" (no such
+ * type exists), so the disambiguation loses nothing (../design/grammar.md §13). */
+table_element  ::= column_def | table_constraint
+
+/* "PRIMARY KEY (a, b, ...)" declares the table's key over one or more named columns; the
+ * LIST order is the KEY order. Each named column must exist (42703) and appear once
+ * (42701); a table has at most one primary key across both forms (42P16). Every member is
+ * implicitly NOT NULL and must be of a key-encodable type (the column-level rule). The
+ * key bytes are the concatenation of the members' encodings (../design/encoding.md §2.3).
+ * Narrowing: the list order must match the table's column-declaration order this slice
+ * (else 0A000 — ../design/constraints.md §3, relaxable). */
+table_constraint ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
 
 /* A column definition is a name, a type, and zero or more column constraints. The
  * constraints are order-free (the parsers accept them in any order, deduplicating —
  * "x int NOT NULL PRIMARY KEY" = "x int PRIMARY KEY NOT NULL"). "PRIMARY KEY" makes the
  * column the table's single-column key and implies NOT NULL. "NOT NULL" forbids a NULL
  * value in the column: storing one — directly, or via an applied/omitted default — traps
- * 23502 (../design/constraints.md). The constraint keywords are NOT reserved (§3). */
+ * 23502 (../design/constraints.md). "DEFAULT" gives the column the literal as its
+ * default, evaluated + coerced once at CREATE TABLE (../design/constraints.md §2). The
+ * constraint keywords are NOT reserved (§3). */
 column_def     ::= identifier type_name column_constraint*
 
 column_constraint ::= "PRIMARY" "KEY"
                  | "NOT" "NULL"
+                 | "DEFAULT" literal
 
 /* DROP TABLE removes a table — its definition and all its rows — from the
  * catalog. The surface is deliberately minimal (../design/grammar.md §13): ONE

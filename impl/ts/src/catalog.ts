@@ -33,11 +33,24 @@ export function columnIndex(t: Table, name: string): number {
   return -1;
 }
 
-// primaryKeyIndex returns the primary-key column's index, or -1. Step-1 supports at
-// most a single-column primary key.
-export function primaryKeyIndex(t: Table): number {
+// pkIndices returns the primary-key member columns' indices in KEY order. Key order is
+// the flagged columns in declaration order — CREATE TABLE requires the constraint's list
+// order to match (the documented 0A000 narrowing, spec/design/constraints.md §3), so the
+// flag bits alone reconstruct the key. Empty = the table has no primary key (synthetic
+// rowid keys).
+export function pkIndices(t: Table): number[] {
+  const idxs: number[] = [];
   for (let i = 0; i < t.columns.length; i++) {
-    if (t.columns[i]!.primaryKey) return i;
+    if (t.columns[i]!.primaryKey) idxs.push(i);
   }
-  return -1;
+  return idxs;
+}
+
+// primaryKeyIndex returns the primary-key column's index iff the key is SINGLE-column,
+// else -1. The PK pushdown (point lookup / range bound) recognizes single-column keys
+// only — a composite-PK table full-scans this slice (spec/design/constraints.md §3) — so
+// every pushdown site routes through this accessor and stays sound by construction.
+export function primaryKeyIndex(t: Table): number {
+  const idxs = pkIndices(t);
+  return idxs.length === 1 ? idxs[0]! : -1;
 }

@@ -42,6 +42,11 @@ type Rollback struct{}
 type CreateTable struct {
 	Name    string
 	Columns []ColumnDef
+	// TablePKs is the table-level `PRIMARY KEY (a, b, …)` constraints, each a list of
+	// member column names in key order (spec/design/grammar.md §28). The parser collects
+	// every one it sees; CREATE TABLE's execution resolves them (42703/42701) and rejects
+	// more than one primary key across both forms (42P16) — spec/design/constraints.md §3.
+	TablePKs [][]string
 }
 
 // DropTable is a DROP TABLE statement. Removes a table — its definition and all its

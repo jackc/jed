@@ -1180,3 +1180,25 @@ The asymmetry is the rule "error where the action is undefined, succeed where it
 `SET TRANSACTION ISOLATION LEVEL` (snapshot isolation is the single level); the
 `[NOT] DEFERRABLE` and `ISOLATION LEVEL` modifiers on `BEGIN`; `synchronous=off` batching. Only
 the access-mode modifier (`READ ONLY` / `READ WRITE`) is accepted on the opener.
+
+## 28. Table-level `PRIMARY KEY` (the composite-key constraint)
+
+A `CREATE TABLE` element is now a `table_element` — a `column_def` **or** the one table
+constraint, `PRIMARY KEY ( ident [, ident]* )`, which may appear anywhere among the column
+definitions (PostgreSQL's shape). Semantics — member resolution, the implied `NOT NULL`,
+the concatenated key bytes, uniqueness over the tuple, and the key-order narrowing — live in
+[constraints.md §3](constraints.md); this section is the parser surface.
+
+**Disambiguation.** The constraint keywords stay non-reserved (§3): an element beginning with
+the two keywords `PRIMARY` `KEY` parses as the table constraint, anything else as a
+`column_def`. Nothing is lost — a column named `primary` would need a *type* named `key`,
+which does not exist (42704 at resolve), so no valid column definition starts that way. The
+member list must be non-empty and parenthesized; `PRIMARY KEY ()` is a `42601` syntax error
+(the first `expect_identifier` rejects `)`).
+
+**Where the errors fire.** The parser accepts any well-formed list — including several
+table constraints — and CREATE TABLE's execution resolves it: unknown member `42703`,
+repeated member `42701`, more than one primary key across both forms `42P16`, a
+non-keyable member type or an out-of-declaration-order list `0A000` (constraints.md §3).
+Keeping resolution in the executor matches every other name-resolution error in the
+surface (the parser knows no catalog).

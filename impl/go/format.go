@@ -567,7 +567,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 				colTypes[j] = c.Type
 			}
 			name := table.Name
-			hasPK := table.PrimaryKeyIndex() >= 0
+			hasPK := len(table.PKIndices()) > 0
 			snap.putTable(table, uint32(pageSize))
 			if tableRoot != 0 {
 				root, length, err := readTree(image, pageSize, tableRoot, colTypes, reached)
@@ -668,7 +668,7 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 				colTypes[j] = c.Type
 			}
 			name := strings.ToLower(table.Name)
-			hasPK := table.PrimaryKeyIndex() >= 0
+			hasPK := len(table.PKIndices()) > 0
 			snap.putTable(table, uint32(pageSize))
 			store := snap.stores[name]
 			store.attachPaging(paging)

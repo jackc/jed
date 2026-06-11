@@ -10,7 +10,7 @@
 // TextEncoder/TextDecoder (name_len is the UTF-8 byte length, not String#length);
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
-import { type Column, type Table, primaryKeyIndex } from "./catalog.ts";
+import { type Column, type Table, pkIndices } from "./catalog.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
@@ -886,7 +886,7 @@ export function loadDatabase(image: Uint8Array): Database {
     for (let i = 0; i < pg.itemCount; i++) {
       const { table, root } = decodeTableEntry(pg.payload, cur);
       const colTypes = table.columns.map((c) => c.type);
-      const hasPK = primaryKeyIndex(table) >= 0;
+      const hasPK = pkIndices(table).length > 0;
       snap.putTable(table, pageSize);
       if (root !== 0) {
         const t = readTree(image, dv, pageSize, root, colTypes, reached);
@@ -986,7 +986,7 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
     for (let i = 0; i < pg.itemCount; i++) {
       const { table, root } = decodeTableEntry(pg.payload, cur);
       const colTypes = table.columns.map((c) => c.type);
-      const hasPK = primaryKeyIndex(table) >= 0;
+      const hasPK = pkIndices(table).length > 0;
       snap.putTable(table, pageSize);
       const store = snap.stores.get(table.name.toLowerCase())!;
       store.attachPaging(paging);

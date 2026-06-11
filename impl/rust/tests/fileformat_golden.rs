@@ -50,6 +50,31 @@ fn one_table_empty_db() -> Database {
     db
 }
 
+/// A table with a COMPOSITE primary key (constraints.md §3) — the stored key is the
+/// concatenation of the members' encodings (4-byte int32 ‖ 2-byte int16, encoding.md §2.3).
+/// Rows insert in ascending tuple order (the tree shape is order-sensitive), with a negative
+/// first component and first-component ties broken by the second.
+fn composite_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE t (a int32, b int16, v int16, PRIMARY KEY (a, b))",
+    );
+    for (a, b, v) in [
+        (-2, 5, 10),
+        (1, 1, 20),
+        (1, 2, 30),
+        (1, 3, 40),
+        (2, 0, 50),
+        (2, 1, 60),
+        (3, 7, 70),
+        (3, 9, 80),
+    ] {
+        run(&mut db, &format!("INSERT INTO t VALUES ({a}, {b}, {v})"));
+    }
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic int64 rowid key.
 fn nopk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
@@ -332,6 +357,7 @@ fn write_matches_goldens() {
         ("timestamp_table.jed", timestamp_table_db),
         ("timestamptz_table.jed", timestamptz_table_db),
         ("nopk_table.jed", nopk_table_db),
+        ("composite_pk_table.jed", composite_pk_table_db),
         ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
@@ -358,6 +384,7 @@ fn read_goldens_reproduces_rows() {
         ("timestamp_table.jed", timestamp_table_db, "t"),
         ("timestamptz_table.jed", timestamptz_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
+        ("composite_pk_table.jed", composite_pk_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),

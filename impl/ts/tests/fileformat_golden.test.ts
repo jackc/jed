@@ -51,6 +51,23 @@ function oneTableEmptyDB(): Database {
   return db;
 }
 
+// compositePKTableDB has a COMPOSITE primary key (constraints.md §3) — the stored key is
+// the concatenation of the members' encodings (4-byte int32 then 2-byte int16,
+// encoding.md §2.3). Rows insert in ascending tuple order (the tree shape is
+// order-sensitive), with a negative first component and first-component ties broken by
+// the second.
+function compositePKTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (a int32, b int16, v int16, PRIMARY KEY (a, b))");
+  for (const [a, b, v] of [
+    [-2, 5, 10], [1, 1, 20], [1, 2, 30], [1, 3, 40],
+    [2, 0, 50], [2, 1, 60], [3, 7, 70], [3, 9, 80],
+  ]) {
+    run(db, `INSERT INTO t VALUES (${a}, ${b}, ${v})`);
+  }
+  return db;
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 function nopkTableDB(): Database {
   const db = goldenDb();
@@ -241,6 +258,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "timestamp_table.jed", build: timestampTableDB },
     { name: "timestamptz_table.jed", build: timestamptzTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
+    { name: "composite_pk_table.jed", build: compositePKTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
   ];
   for (const c of cases) {
@@ -270,6 +288,7 @@ test("read goldens reproduces rows", () => {
     { name: "timestamp_table.jed", build: timestampTableDB, table: "t" },
     { name: "timestamptz_table.jed", build: timestamptzTableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
+    { name: "composite_pk_table.jed", build: compositePKTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },

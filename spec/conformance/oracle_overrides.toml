@@ -35,3 +35,18 @@ reason = "jed: a type modifier on a non-decimal type is unsupported this slice (
 file = "types/decimal.test"
 sql = "CREATE TABLE bad5 (k numeric PRIMARY KEY)"
 reason = "jed: a decimal PRIMARY KEY is rejected this slice (0A000), a documented narrowing (like text PK). PG allows a numeric primary key."
+
+[[override]]
+file = "ddl/composite_pk.test"
+sql = "UPDATE t SET b = 9 WHERE a = 1"
+reason = "jed: assigning any primary-key member is the documented 0A000 narrowing (the storage key never changes — constraints.md §3, CLAUDE.md §11 step 6). PG allows PK updates (and here would instead trap 23505 on the resulting duplicate tuple)."
+
+[[override]]
+file = "ddl/composite_pk.test"
+sql = "CREATE TABLE e5 (a int32, b int32, PRIMARY KEY (b, a))"
+reason = "jed: a PRIMARY KEY list whose order differs from the table's column-declaration order is rejected 0A000 this slice — the catalog persists the key as per-column flag bits with no independent order; relaxable at the secondary-index catalog reshape (constraints.md §3). PG accepts any order."
+
+[[override]]
+file = "ddl/composite_pk.test"
+sql = "CREATE TABLE e6 (a int32, s text, PRIMARY KEY (a, s))"
+reason = "jed: a text primary-key member is the same documented 0A000 narrowing as a single-column text PRIMARY KEY (types.md §11 — the text key encoding is authored but unexercised). PG allows text key columns."

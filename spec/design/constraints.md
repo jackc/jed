@@ -9,9 +9,12 @@
 > three cores must reproduce identically (CLAUDE.md §2, §8). When a decision here changes,
 > change the data/grammar and here in the same edit.
 
-A `column_def` is a name, a type, and zero or more **column constraints**:
+A `column_def` is a name, a type, and zero or more **column constraints**; a `CREATE TABLE`
+element may also be the one **table constraint**, the composite-capable `PRIMARY KEY` list:
 
 ```
+table_element     ::= column_def | table_constraint
+table_constraint  ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
 column_def        ::= identifier type_name column_constraint*
 column_constraint ::= "PRIMARY" "KEY"
                     | "NOT" "NULL"
@@ -25,7 +28,7 @@ column may be named `not`, `null`, `primary`, or `key`; the parser distinguishes
 positionally.
 
 This grows one constraint at a time (CLAUDE.md §11, [../../TODO.md](../../TODO.md)). `UNIQUE`,
-`CHECK`, `FOREIGN KEY`, and a composite `PRIMARY KEY` stay deferred.
+`CHECK`, and `FOREIGN KEY` stay deferred; the composite `PRIMARY KEY` landed (§3).
 
 ## 1. `NOT NULL`
 
@@ -105,3 +108,55 @@ plus, when set, the coerced value via the row value codec, written after the dec
 **Cost.** A default is a pre-evaluated constant, so applying one evaluates no expression tree —
 an `INSERT` with defaults accrues the same zero cost as one with literal values (grammar.md §12,
 CLAUDE.md §13).
+
+## 3. Composite `PRIMARY KEY` (the table constraint)
+
+`PRIMARY KEY (a, b, …)` declares the table's key over **one or more** named columns. It is
+the engine's first **table-level** constraint and may appear anywhere among the column
+definitions, interleaved like any other element (PostgreSQL's shape). The single-column
+forms are equivalent: `PRIMARY KEY (a)` ≡ a column-level `a … PRIMARY KEY`.
+
+**Resolution (at CREATE TABLE, deterministic order):** each named column must exist —
+**`42703`** (`column <name> named in key does not exist`) — and may appear only once —
+**`42701`** (`column <name> appears twice in primary key constraint`). A table has **at most
+one** primary key across *both* forms: a second table constraint, or a table constraint plus
+any column-level `PRIMARY KEY`, traps **`42P16`** (`multiple primary keys for table <name>
+are not allowed`). All three codes and messages match PostgreSQL (CLAUDE.md §1,
+oracle-checked).
+
+**Every member is a key column.** Each member is implicitly `NOT NULL` (§1) and must be of a
+key-encodable type — the same per-column rule as the column-level form: the integer types,
+`uuid`, `timestamp`, `timestamptz`; a `text`/`decimal`/`bytea`/`boolean` member is the same
+documented `0A000` narrowing ([types.md](types.md) §9/§11/§12/§13). The UPDATE narrowing
+extends naturally: assigning **any** member column traps `0A000` (grammar.md §14 — the
+storage key never changes).
+
+**The key bytes are the concatenation** of the members' bare encodings, in **key order**
+([encoding.md](encoding.md) §2.3 — now exercised). Every keyable type is fixed-width, so the
+concatenation is self-delimiting and `memcmp` over the composite key equals the tuple's
+lexicographic logical order; the stored scan order is `ORDER BY a, b, …` for free, and the
+`ORDER BY` full-tie break "by primary key" (grammar.md §10) is the composite tuple.
+Uniqueness is over the **whole tuple**: a duplicate `(a, b, …)` traps **`23505`** in
+INSERT's two-phase pass; two rows sharing a prefix are distinct rows.
+
+**Narrowing — key order must match declaration order.** This slice requires the constraint's
+column list to name its columns in the table's **declaration order** (`CREATE TABLE t (a …,
+b …, PRIMARY KEY (a, b))` is accepted; `PRIMARY KEY (b, a)` traps `0A000`). Why: the on-disk
+catalog records the key as the per-column `primary_key` flag bits
+([../fileformat/format.md](../fileformat/format.md)), which encode the member *set* but not
+an independent *order* — the key order is defined as the flagged columns in declaration
+order. Persisting an arbitrary order needs a catalog format change, deliberately deferred to
+the secondary-index slice (which must reshape the catalog anyway —
+[../../TODO.md](../../TODO.md) Phase 4); the narrowing is relaxable there. PostgreSQL
+accepts any order, so this is a documented temporary divergence.
+
+**Planner.** The primary-key pushdown (cost.md §3) recognizes **single-column** keys only; a
+composite-PK table scans whole this slice (sound and deterministic — the bound is an
+optimization, never a semantic). Composite point-lookup/prefix pushdown is a follow-on
+optimization slice and carries the NoREC growth obligation with it (conformance.md §8).
+
+**Persistence.** No format change: the existing per-column flags `bit0` marks each member
+(format.md "reader trusts the bits"), and the key order is the declaration order by the
+narrowing above. Files written before this slice are unchanged; a composite-PK table is just
+a table with several `bit0` columns. The cross-core byte fixture is the
+`composite_pk_table.jed` golden.

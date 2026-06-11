@@ -36,9 +36,28 @@ impl Table {
             .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
-    /// The primary-key column's index, if the table has one. Step-1 supports at
-    /// most a single-column primary key.
+    /// The primary-key member columns' indices in KEY order. Key order is the flagged
+    /// columns in declaration order — CREATE TABLE requires the constraint's list order to
+    /// match (the documented 0A000 narrowing, spec/design/constraints.md §3), so the flag
+    /// bits alone reconstruct the key. Empty = the table has no primary key (synthetic
+    /// rowid keys).
+    pub fn pk_indices(&self) -> Vec<usize> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.primary_key)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The primary-key column's index iff the key is SINGLE-column. The PK pushdown
+    /// (point lookup / range bound) recognizes single-column keys only — a composite-PK
+    /// table full-scans this slice (spec/design/constraints.md §3) — so every pushdown
+    /// site routes through this accessor and stays sound by construction.
     pub fn primary_key_index(&self) -> Option<usize> {
-        self.columns.iter().position(|c| c.primary_key)
+        match self.pk_indices().as_slice() {
+            [i] => Some(*i),
+            _ => None,
+        }
     }
 }

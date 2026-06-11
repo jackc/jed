@@ -23,7 +23,7 @@ import type {
   TypeMod,
   Update,
 } from "./ast.ts";
-import { type Column, type Table, columnIndex, primaryKeyIndex } from "./catalog.ts";
+import { type Column, type Table, columnIndex, pkIndices, primaryKeyIndex } from "./catalog.ts";
 import { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import { Decimal, MAX_PRECISION, MAX_SCALE, workDiv, workLinear, workMod, workMul } from "./decimal.ts";
@@ -432,7 +432,12 @@ export class Database {
   }
 
   // executeCreateTable resolves each column's type name, enforces a single primary key
-  // (implicitly NOT NULL), rejects duplicate table and column names, then registers it.
+  // across both forms (column-level and the table-level PRIMARY KEY (a, b, ...) constraint —
+  // which is implicitly NOT NULL per member), rejects duplicate table and column names, then
+  // registers it. Constraint checks mirror PostgreSQL's order (oracle-probed,
+  // constraints.md §3): a second primary key traps 42P16 before its members resolve; members
+  // resolve left to right (unknown 42703, repeated 42701); then the jed narrowings — the
+  // declaration-order rule and the per-member key-type gate — trap 0A000.
   private executeCreateTable(ct: CreateTable): Outcome {
     if (this.table(ct.name)) {
       throw engineError("duplicate_table", "table already exists: " + ct.name);
@@ -464,7 +469,7 @@ export class Database {
         if (pkSeen) {
           throw engineError(
             "invalid_table_definition",
-            "a table may have at most one primary key",
+            "multiple primary keys for table " + ct.name + " are not allowed",
           );
         }
         pkSeen = true;
@@ -485,6 +490,53 @@ export class Database {
         notNull: def.primaryKey || def.notNull, // PRIMARY KEY ⇒ NOT NULL
         default: def_default,
       });
+    }
+
+    // Table-level PRIMARY KEY (a, b, ...) constraints (constraints.md §3). Check order
+    // mirrors PostgreSQL (oracle-probed): a second primary key is 42P16 before its
+    // members resolve; members resolve left to right (42703 unknown, 42701 repeated).
+    // The jed narrowings follow: the list must name columns in declaration order, and
+    // every member must be of a key-encodable type (both 0A000, relaxable).
+    for (const pkList of ct.tablePks) {
+      if (pkSeen) {
+        throw engineError(
+          "invalid_table_definition",
+          "multiple primary keys for table " + ct.name + " are not allowed",
+        );
+      }
+      pkSeen = true;
+      const indices: number[] = [];
+      for (const name of pkList) {
+        const lower = name.toLowerCase();
+        const idx = columns.findIndex((c) => c.name.toLowerCase() === lower);
+        if (idx < 0) {
+          throw engineError("undefined_column", "column " + name + " named in key does not exist");
+        }
+        if (indices.includes(idx)) {
+          throw engineError(
+            "duplicate_column",
+            "column " + name + " appears twice in primary key constraint",
+          );
+        }
+        indices.push(idx);
+      }
+      if (!indices.every((v, i) => i === 0 || indices[i - 1]! < v)) {
+        throw engineError(
+          "feature_not_supported",
+          "a primary key whose column order differs from the table's column order is not supported yet",
+        );
+      }
+      for (const i of indices) {
+        const ty = columns[i]!.type;
+        if (!isInteger(ty) && !isUuid(ty) && !isTimestamp(ty) && !isTimestamptz(ty)) {
+          throw engineError(
+            "feature_not_supported",
+            "a " + canonicalName(ty) + " primary key is not supported yet",
+          );
+        }
+        columns[i]!.primaryKey = true;
+        columns[i]!.notNull = true; // PRIMARY KEY ⇒ NOT NULL, per member
+      }
     }
 
     this.putTable({ name: ct.name, columns });
@@ -522,7 +574,9 @@ export class Database {
       throw engineError("undefined_table", "table does not exist: " + ins.table);
     }
     const store = this.working().store(ins.table);
-    const pk = primaryKeyIndex(table);
+    // The key members in key order — one for a single-column PK, several for a composite
+    // (constraints.md §3), empty for a no-PK (rowid) table.
+    const pk = pkIndices(table);
 
     // Resolve the optional column list once. provided[i] >= 0 means table column i takes that
     // value position in each row; -1 means column i is omitted (its default, else NULL). With no
@@ -653,7 +707,7 @@ export class Database {
   private insertRows(
     table: Table,
     store: TableStore,
-    pk: number,
+    pk: number[],
     provided: number[],
     rows: Value[][],
     meter: Meter,
@@ -672,19 +726,33 @@ export class Database {
       }
 
       let key: Uint8Array | null = null;
-      if (pk >= 0) {
-        const pkv = row[pk]!; // non-null: a PK column is NOT NULL and was checked above
-        if (pkv.kind === "uuid") {
-          // uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16,
-          // encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
-          key = pkv.bytes.slice();
-        } else if (pkv.kind === "int") {
-          key = encodeInt(table.columns[pk]!.type, pkv.int);
-        } else if (pkv.kind === "timestamp" || pkv.kind === "timestamptz") {
-          // A timestamp / timestamptz PK encodes its int64 instant (spec/design/timestamp.md §6).
-          key = encodeInt(table.columns[pk]!.type, pkv.micros);
-        } else {
-          throw engineError("data_corrupted", "a primary key must be an integer, uuid, or timestamp value");
+      if (pk.length > 0) {
+        // The composite key is the concatenation of the members' bare encodings in key
+        // order (encoding.md §2.3) — every keyable type is fixed-width, so the
+        // concatenation is self-delimiting and byte comparison equals the tuple's order. A
+        // single-column key is the one-member case of the same rule.
+        const parts: Uint8Array[] = [];
+        for (const i of pk) {
+          const pkv = row[i]!; // non-null: a PK member is NOT NULL and was checked above
+          if (pkv.kind === "uuid") {
+            // uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16,
+            // encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
+            parts.push(pkv.bytes.slice());
+          } else if (pkv.kind === "int") {
+            parts.push(encodeInt(table.columns[i]!.type, pkv.int));
+          } else if (pkv.kind === "timestamp" || pkv.kind === "timestamptz") {
+            // A timestamp / timestamptz PK encodes its int64 instant (spec/design/timestamp.md §6).
+            parts.push(encodeInt(table.columns[i]!.type, pkv.micros));
+          } else {
+            throw engineError("data_corrupted", "a primary key must be an integer, uuid, or timestamp value");
+          }
+        }
+        const total = parts.reduce((acc, b) => acc + b.length, 0);
+        key = new Uint8Array(total);
+        let off = 0;
+        for (const b of parts) {
+          key.set(b, off);
+          off += b.length;
         }
         const seen = key.join(",");
         if (seenKeys.has(seen) || store.get(key) !== undefined) {
@@ -786,14 +854,16 @@ export class Database {
     const ptypes = new ParamTypes();
 
     // Resolve assignments up front (fail fast, deterministic).
-    const pkIdx = primaryKeyIndex(table);
+    // The 0A000 guard covers EVERY key member — for a composite PRIMARY KEY, assigning
+    // any member would change the storage key (constraints.md §3).
+    const pkMembers = pkIndices(table);
     const plans: AssignPlan[] = [];
     for (const a of upd.assignments) {
       const idx = columnIndex(table, a.column);
       if (idx < 0) {
         throw engineError("undefined_column", "column does not exist: " + a.column);
       }
-      if (idx === pkIdx) {
+      if (pkMembers.includes(idx)) {
         throw engineError(
           "feature_not_supported",
           "updating a primary key column is not supported",

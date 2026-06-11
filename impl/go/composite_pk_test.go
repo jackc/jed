@@ -1,0 +1,221 @@
+package jed
+
+// Composite PRIMARY KEY — the table-level `PRIMARY KEY (a, b, …)` constraint
+// (spec/design/constraints.md §3, grammar.md §28). Covers what the corpus suite
+// (ddl/composite_pk.test) cannot: catalog flag introspection, the stored key order
+// (the concatenated encoding of encoding.md §2.3), and the on-disk round-trip (a
+// composite-PK table reloads as a KEYED table, not a rowid table). Mirrors
+// impl/rust/tests/composite_pk.rs and impl/ts/tests/composite_pk.test.ts.
+
+import (
+	"slices"
+	"testing"
+)
+
+func compositeErrCode(t *testing.T, db *Database, sql string) string {
+	t.Helper()
+	_, err := Execute(db, sql)
+	if err == nil {
+		t.Fatalf("expected an error from %q", sql)
+	}
+	return err.(*EngineError).Code()
+}
+
+// The constraint flags every member primary_key + NOT NULL, and the stored order is the
+// tuple's lexicographic order (the concatenated key — first component, then the second
+// breaking its ties), independent of insertion order.
+func TestCompositeKeyOrdersByTuple(t *testing.T) {
+	db := dbWith(t, "CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))")
+	tab, _ := db.Table("t")
+	if got := tab.PKIndices(); !slices.Equal(got, []int{0, 1}) {
+		t.Fatalf("PKIndices = %v, want [0 1]", got)
+	}
+	if !tab.Columns[0].PrimaryKey || !tab.Columns[0].NotNull ||
+		!tab.Columns[1].PrimaryKey || !tab.Columns[1].NotNull {
+		t.Fatal("both members must be primary_key + NOT NULL")
+	}
+	if tab.Columns[2].PrimaryKey {
+		t.Fatal("non-member column must not be flagged")
+	}
+	// Single-column pushdown accessor must NOT see a composite key.
+	if got := tab.PrimaryKeyIndex(); got != -1 {
+		t.Fatalf("PrimaryKeyIndex = %d, want -1 for a composite key", got)
+	}
+
+	// Insert out of tuple order; include a negative first component (sign-flip) and ties
+	// on the first component broken by the second.
+	for _, stmt := range []string{
+		"INSERT INTO t VALUES (2, 1, 50)",
+		"INSERT INTO t VALUES (1, 2, 30)",
+		"INSERT INTO t VALUES (-1, 9, 10)",
+		"INSERT INTO t VALUES (1, 1, 20)",
+		"INSERT INTO t VALUES (2, 0, 40)",
+	} {
+		if _, err := Execute(db, stmt); err != nil {
+			t.Fatalf("%q: %v", stmt, err)
+		}
+	}
+	want := [][2]int64{{-1, 9}, {1, 1}, {1, 2}, {2, 0}, {2, 1}}
+	rows := db.RowsInKeyOrder("t")
+	if len(rows) != len(want) {
+		t.Fatalf("got %d rows, want %d", len(rows), len(want))
+	}
+	for i, r := range rows {
+		if r[0].Int != want[i][0] || r[1].Int != want[i][1] {
+			t.Fatalf("row %d = (%d,%d), want (%d,%d)", i, r[0].Int, r[1].Int, want[i][0], want[i][1])
+		}
+	}
+}
+
+// Uniqueness is over the WHOLE tuple: a shared prefix is fine, a duplicate tuple traps
+// 23505 — both against the store and within one INSERT's batch (two-phase, nothing stored).
+func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
+	db := dbWith(
+		t,
+		"CREATE TABLE t (a int32, b int32, PRIMARY KEY (a, b))",
+		"INSERT INTO t VALUES (1, 1)",
+	)
+	if _, err := Execute(db, "INSERT INTO t VALUES (1, 2)"); err != nil {
+		t.Fatalf("shared prefix must be a distinct row: %v", err)
+	}
+	if code := compositeErrCode(t, db, "INSERT INTO t VALUES (1, 1)"); code != "23505" {
+		t.Fatalf("duplicate tuple: got %s, want 23505", code)
+	}
+	if code := compositeErrCode(t, db, "INSERT INTO t VALUES (5, 5), (5, 5)"); code != "23505" {
+		t.Fatalf("in-batch duplicate: got %s, want 23505", code)
+	}
+	// The failed batch stored nothing (all-or-nothing).
+	if n := len(db.RowsInKeyOrder("t")); n != 2 {
+		t.Fatalf("got %d rows, want 2", n)
+	}
+}
+
+// DDL errors mirror PostgreSQL (oracle-probed): unknown member 42703, repeated member
+// 42701, more than one primary key across both forms 42P16 — plus the jed narrowings
+// (0A000): out-of-declaration-order list, non-keyable member type.
+func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
+	db := NewDatabase()
+	cases := []struct {
+		sql, want string
+	}{
+		{"CREATE TABLE t (a int32, PRIMARY KEY (a, nosuch))", "42703"},
+		{"CREATE TABLE t (a int32, b int32, PRIMARY KEY (a, a))", "42701"},
+		{"CREATE TABLE t (a int32 PRIMARY KEY, b int32, PRIMARY KEY (b))", "42P16"},
+		{"CREATE TABLE t (a int32, b int32, PRIMARY KEY (a), PRIMARY KEY (b))", "42P16"},
+		// 42P16 fires BEFORE the second constraint's members resolve (PostgreSQL's order).
+		{"CREATE TABLE t (a int32 PRIMARY KEY, PRIMARY KEY (nosuch))", "42P16"},
+		// Narrowing: the list must name columns in declaration order.
+		{"CREATE TABLE t (a int32, b int32, PRIMARY KEY (b, a))", "0A000"},
+		// Narrowing: every member must be key-encodable (text is not, types.md §11).
+		{"CREATE TABLE t (a int32, s text, PRIMARY KEY (a, s))", "0A000"},
+	}
+	for _, c := range cases {
+		if code := compositeErrCode(t, db, c.sql); code != c.want {
+			t.Fatalf("%q: got %s, want %s", c.sql, code, c.want)
+		}
+	}
+	// A single-column table constraint is the column-level form's equivalent.
+	if _, err := Execute(db, "CREATE TABLE ok (a int32, PRIMARY KEY (a))"); err != nil {
+		t.Fatalf("single-column table constraint: %v", err)
+	}
+	tab, _ := db.Table("ok")
+	if tab.PrimaryKeyIndex() != 0 || !tab.Columns[0].NotNull {
+		t.Fatal("single-member constraint must behave as the column-level form")
+	}
+}
+
+// Every member is a key column: NULL into any member traps 23502, and UPDATE may assign
+// no member (0A000 — the storage key never changes), while non-member columns update fine.
+func TestCompositeMembersNotNullAndUpdateGuarded(t *testing.T) {
+	db := dbWith(
+		t,
+		"CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))",
+		"INSERT INTO t VALUES (1, 1, 10)",
+	)
+	if code := compositeErrCode(t, db, "INSERT INTO t VALUES (1, NULL, 5)"); code != "23502" {
+		t.Fatalf("NULL member: got %s, want 23502", code)
+	}
+	if code := compositeErrCode(t, db, "INSERT INTO t (a, v) VALUES (2, 5)"); code != "23502" {
+		t.Fatalf("omitted member: got %s, want 23502", code)
+	}
+	if code := compositeErrCode(t, db, "UPDATE t SET a = 9"); code != "0A000" {
+		t.Fatalf("assign first member: got %s, want 0A000", code)
+	}
+	if code := compositeErrCode(t, db, "UPDATE t SET b = 9"); code != "0A000" {
+		t.Fatalf("assign second member: got %s, want 0A000", code)
+	}
+	if _, err := Execute(db, "UPDATE t SET v = 11"); err != nil {
+		t.Fatalf("non-member update: %v", err)
+	}
+}
+
+// Mixed fixed-width components (uuid first, int32 second) concatenate per encoding.md
+// §2.3 and iterate in tuple order — uuid bytes compare first, the int breaks ties.
+func TestCompositeMixedUuidIntComponentsOrder(t *testing.T) {
+	db := dbWith(t, "CREATE TABLE t (u uuid, n int32, PRIMARY KEY (u, n))")
+	for _, stmt := range []string{
+		"INSERT INTO t VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', -5)",
+		"INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', 7)",
+		"INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', -2)",
+	} {
+		if _, err := Execute(db, stmt); err != nil {
+			t.Fatalf("%q: %v", stmt, err)
+		}
+	}
+	rows := db.RowsInKeyOrder("t")
+	want := []int64{-2, 7, -5}
+	for i, r := range rows {
+		if r[1].Int != want[i] {
+			t.Fatalf("row %d second component = %d, want %d", i, r[1].Int, want[i])
+		}
+	}
+}
+
+// The on-disk round-trip: a composite-PK table reloads as a KEYED table (both flag bits
+// survive in the catalog), key order is preserved, and a duplicate tuple still traps
+// 23505 after the reload. Guards the format.go hasPK seam — a composite-PK table must
+// not be mistaken for a rowid table on load.
+func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
+	db := dbWith(
+		t,
+		"CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))",
+		"INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
+	)
+	image, err := db.ToImage(256, 1)
+	if err != nil {
+		t.Fatalf("ToImage: %v", err)
+	}
+	loaded, err := LoadDatabase(image)
+	if err != nil {
+		t.Fatalf("LoadDatabase: %v", err)
+	}
+
+	tab, _ := loaded.Table("t")
+	if got := tab.PKIndices(); !slices.Equal(got, []int{0, 1}) {
+		t.Fatalf("PKIndices after reload = %v, want [0 1]", got)
+	}
+	if !tab.Columns[0].NotNull || !tab.Columns[1].NotNull {
+		t.Fatal("members must reload NOT NULL")
+	}
+
+	want := [][2]int64{{1, 1}, {1, 2}, {2, 1}}
+	rows := loaded.RowsInKeyOrder("t")
+	if len(rows) != len(want) {
+		t.Fatalf("got %d rows, want %d", len(rows), len(want))
+	}
+	for i, r := range rows {
+		if r[0].Int != want[i][0] || r[1].Int != want[i][1] {
+			t.Fatalf("row %d = (%d,%d), want (%d,%d)", i, r[0].Int, r[1].Int, want[i][0], want[i][1])
+		}
+	}
+
+	if code := compositeErrCode(t, loaded, "INSERT INTO t VALUES (1, 2, 99)"); code != "23505" {
+		t.Fatalf("duplicate after reload: got %s, want 23505", code)
+	}
+	if _, err := Execute(loaded, "INSERT INTO t VALUES (2, 2, 50)"); err != nil {
+		t.Fatalf("fresh insert after reload: %v", err)
+	}
+	if n := len(loaded.RowsInKeyOrder("t")); n != 4 {
+		t.Fatalf("got %d rows, want 4", n)
+	}
+}

@@ -189,6 +189,16 @@ Each **table entry** (unchanged from v1):
 
 Columns are emitted in declaration order.
 
+**Composite primary key.** A composite `PRIMARY KEY` ([../design/constraints.md
+§3](../design/constraints.md)) is persisted as `bit0` set on **each** member column — there is
+no separate key-descriptor field. The **key order is the flagged columns in declaration
+order**; this is sufficient because CREATE TABLE requires the constraint's list order to match
+declaration order (the documented `0A000` narrowing, constraints.md §3). A stored record's
+`key` is the concatenation of the members' encodings ([../design/encoding.md
+§2.3](../design/encoding.md)). Persisting an *independent* key order is deferred to the
+catalog reshape the secondary-index slice needs. Files written before this slice are
+unaffected (they have at most one `bit0` column).
+
 ### Stable type codes
 
 Independent of any in-memory enum discriminant (which may be reordered):
@@ -551,6 +561,7 @@ the interior-node format and the split contract.
 | `timestamp_table.jed` | a timestamp column — the 8-byte int64 branch; epoch, pre-1970, BC-era, `±infinity`, NULL |
 | `timestamptz_table.jed` | a timestamptz column — the same 8-byte branch under type code 10 |
 | `nopk_table.jed` | a no-PK table — the stored synthetic `int64` rowid key |
+| `composite_pk_table.jed` | a **composite PRIMARY KEY** (`int32` ‖ `int16`) — the concatenated key encoding (encoding.md §2.3) + multiple `bit0` flag columns; negative first component and tie-breaking second |
 | `tall_tree.jed` | enough small int rows to force a **two-level interior** (height-2 tree) — exercises interior-of-interior child pointers and post-order page allocation |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |

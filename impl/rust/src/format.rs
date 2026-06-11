@@ -876,7 +876,7 @@ impl Database {
                 let (table, root_data_page) = decode_table_entry(page.payload, &mut pos)?;
                 let name = table.name.clone();
                 let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
-                let has_pk = table.primary_key_index().is_some();
+                let has_pk = !table.pk_indices().is_empty();
                 snap.put_table(table, page_size as u32);
                 if root_data_page != 0 {
                     let (root, len) =
@@ -962,7 +962,7 @@ impl Database {
                 let (table, root_data_page) = decode_table_entry(page.payload, &mut pos)?;
                 let name = table.name.clone();
                 let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
-                let has_pk = table.primary_key_index().is_some();
+                let has_pk = !table.pk_indices().is_empty();
                 snap.put_table(table, page_size as u32);
                 snap.store_mut(&name).attach_paging(paging.clone());
                 if root_data_page != 0 {

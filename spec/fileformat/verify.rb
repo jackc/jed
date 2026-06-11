@@ -66,6 +66,21 @@ def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, defaul
     precision: precision, scale: scale, default: default }
 end
 
+# A table with a COMPOSITE primary key (constraints.md §3): the stored key is the
+# concatenation of the members' encodings in declaration order (a 4-byte int32 then a
+# 2-byte int16 — mixed widths, ../design/encoding.md §2.3), pinning the cross-core
+# composite key bytes. Both flag bits are set in the catalog (bit0 per member); no
+# format change. Rows include a negative first component (sign-flip ordering) and
+# first-component ties broken by the second. Listed in ascending tuple order — the
+# cores build this via `CREATE TABLE t (a int32, b int16, v int16, PRIMARY KEY (a, b))`
+# and insert in this order (the tree shape is order-sensitive).
+COMPOSITE_PK_TABLE = {
+  name: "t",
+  columns: [col("a", "int32", pk: true), col("b", "int16", pk: true), col("v", "int16")],
+  rows: [[-2, 5, 10], [1, 1, 20], [1, 2, 30], [1, 3, 40],
+         [2, 0, 50], [2, 1, 60], [3, 7, 70], [3, 9, 80]]
+}.freeze
+
 PK_TABLE = {
   name: "t",
   columns: [col("id", "int32", pk: true), col("v", "int16")],
@@ -268,6 +283,7 @@ FIXTURES = [
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
+  { file: "composite_pk_table.jed", page_size: 256, tables: [COMPOSITE_PK_TABLE] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
@@ -388,22 +404,26 @@ def table_entry_bytes(table, root_data_page)
   out
 end
 
-# (key, row) pairs in stored (encoded-key) order. PK tables key on the PK column;
-# a no-PK table keys on a synthetic int64 rowid = insertion index (executor.rs).
+# (key, row) pairs in stored (encoded-key) order. PK tables key on the PK member columns —
+# the key is the CONCATENATION of the members' encodings in declaration order (a composite
+# PRIMARY KEY, ../design/encoding.md §2.3; a single-column key is the one-member case).
+# A no-PK table keys on a synthetic int64 rowid = insertion index (executor.rs).
 def table_entries(table)
-  pk_idx = table[:columns].index { |c| c[:pk] }
+  pk_idxs = table[:columns].each_index.select { |i| table[:columns][i][:pk] }
   pairs = table[:rows].each_with_index.map do |row, i|
-    key = if pk_idx
-            pk_type = table[:columns][pk_idx][:type]
-            # uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16),
-            # not the sign-flipped int encoding. A PK is NOT NULL, so no presence tag.
-            if pk_type == "uuid"
-              uuid_to_bytes(row[pk_idx])
-            else
-              encode_int(WIDTH.fetch(pk_type), row[pk_idx])
-            end
-          else
+    key = if pk_idxs.empty?
             encode_int(8, i)
+          else
+            pk_idxs.map do |pi|
+              pk_type = table[:columns][pi][:type]
+              # uuid is the bare 16 bytes (uuid-raw16), not the sign-flipped int encoding;
+              # a PK member is NOT NULL, so no presence tag either way.
+              if pk_type == "uuid"
+                uuid_to_bytes(row[pi])
+              else
+                encode_int(WIDTH.fetch(pk_type), row[pi])
+              end
+            end.join.b
           end
     [key, row]
   end

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -406,8 +407,13 @@ func rejectParamsForDDL(params []Value) error {
 }
 
 // executeCreateTable analyzes and runs a CREATE TABLE: resolve each column's type
-// name, enforce a single primary key (which is implicitly NOT NULL), reject
-// duplicate table and column names, then register the table.
+// name, enforce a single primary key across both forms (column-level and the
+// table-level PRIMARY KEY (a, b, ...) constraint — which is implicitly NOT NULL per
+// member), reject duplicate table and column names, then register the table.
+// Constraint checks mirror PostgreSQL's order (oracle-probed, constraints.md §3):
+// a second primary key traps 42P16 before its members resolve; members resolve
+// left to right (unknown 42703, repeated 42701); then the jed narrowings — the
+// declaration-order rule and the per-member key-type gate — trap 0A000.
 func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	if _, ok := db.Table(ct.Name); ok {
 		return Outcome{}, NewError(DuplicateTable, "table already exists: "+ct.Name)
@@ -438,7 +444,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			}
 			if pkSeen {
 				return Outcome{}, NewError(InvalidTableDefinition,
-					"a table may have at most one primary key")
+					"multiple primary keys for table "+ct.Name+" are not allowed")
 			}
 			pkSeen = true
 		}
@@ -462,6 +468,51 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			NotNull:    def.PrimaryKey || def.NotNull, // PRIMARY KEY ⇒ NOT NULL
 			Default:    defaultVal,
 		})
+	}
+
+	// Table-level PRIMARY KEY (a, b, ...) constraints (constraints.md §3). Check order
+	// mirrors PostgreSQL (oracle-probed): a second primary key is 42P16 before its
+	// members resolve; members resolve left to right (42703 unknown, 42701 repeated).
+	// The jed narrowings follow: the list must name columns in declaration order, and
+	// every member must be of a key-encodable type (both 0A000, relaxable).
+	for _, pkList := range ct.TablePKs {
+		if pkSeen {
+			return Outcome{}, NewError(InvalidTableDefinition,
+				"multiple primary keys for table "+ct.Name+" are not allowed")
+		}
+		pkSeen = true
+		indices := make([]int, 0, len(pkList))
+		for _, name := range pkList {
+			idx := -1
+			for i := range columns {
+				if strings.EqualFold(columns[i].Name, name) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return Outcome{}, NewError(UndefinedColumn,
+					"column "+name+" named in key does not exist")
+			}
+			if slices.Contains(indices, idx) {
+				return Outcome{}, NewError(DuplicateColumn,
+					"column "+name+" appears twice in primary key constraint")
+			}
+			indices = append(indices, idx)
+		}
+		if !slices.IsSorted(indices) {
+			return Outcome{}, NewError(FeatureNotSupported,
+				"a primary key whose column order differs from the table's column order is not supported yet")
+		}
+		for _, i := range indices {
+			ty := columns[i].Type
+			if !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a "+ty.CanonicalName()+" primary key is not supported yet")
+			}
+			columns[i].PrimaryKey = true
+			columns[i].NotNull = true // PRIMARY KEY ⇒ NOT NULL, per member
+		}
 	}
 
 	db.putTable(&Table{Name: ct.Name, Columns: columns})
@@ -499,7 +550,9 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ins.Table)
 	}
 	store := db.working().store(ins.Table)
-	pk := table.PrimaryKeyIndex()
+	// The key members in key order — one for a single-column PK, several for a composite
+	// (constraints.md §3), empty for a no-PK (rowid) table.
+	pk := table.PKIndices()
 
 	// Resolve the optional column list once. provided[i] >= 0 means table column i takes that
 	// value position in each row; -1 means column i is omitted (its default, else NULL). With no
@@ -652,7 +705,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 // seenKeys AND against the store) BEFORE any row is written; only once every row validates are
 // they all inserted (phase 2), allocating a fresh monotonic rowid in row order for a no-PK table.
 // All-or-nothing: a failure leaves the store untouched and burns no rowids.
-func (db *Database) insertRows(table *Table, store *TableStore, pk int, provided []int, rows [][]Value, meter *Meter) error {
+func (db *Database) insertRows(table *Table, store *TableStore, pk []int, provided []int, rows [][]Value, meter *Meter) error {
 	n := len(table.Columns)
 	type preparedRow struct {
 		key []byte // nil for a no-PK table (rowid allocated in phase 2)
@@ -678,13 +731,19 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk int, provided
 		}
 
 		var key []byte
-		if pk >= 0 {
-			if table.Columns[pk].Type.IsUuid() {
-				// uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16,
-				// encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
-				key = []byte(row[pk].Str)
-			} else {
-				key = EncodeInt(table.Columns[pk].Type, row[pk].Int)
+		if len(pk) > 0 {
+			// The composite key is the concatenation of the members' bare encodings in key
+			// order (encoding.md §2.3) — every keyable type is fixed-width, so the
+			// concatenation is self-delimiting and bytes.Compare equals the tuple's order. A
+			// single-column key is the one-member case of the same rule.
+			for _, i := range pk {
+				if table.Columns[i].Type.IsUuid() {
+					// uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16,
+					// encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
+					key = append(key, row[i].Str...)
+				} else {
+					key = append(key, EncodeInt(table.Columns[i].Type, row[i].Int)...)
+				}
 			}
 			if _, dup := seenKeys[string(key)]; dup {
 				return NewError(UniqueViolation,
@@ -862,15 +921,17 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	s := singleScope(db, table)
 	ptypes := &paramTypes{}
 
-	// Resolve assignments up front (fail fast, deterministic).
-	pkIdx := table.PrimaryKeyIndex()
+	// Resolve assignments up front (fail fast, deterministic). The 0A000 guard covers
+	// EVERY key member — for a composite PRIMARY KEY, assigning any member would change
+	// the storage key (constraints.md §3).
+	pkMembers := table.PKIndices()
 	plans := make([]assignPlan, 0, len(upd.Assignments))
 	for _, a := range upd.Assignments {
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
 			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+a.Column)
 		}
-		if idx == pkIdx {
+		if slices.Contains(pkMembers, idx) {
 			return Outcome{}, NewError(FeatureNotSupported,
 				"updating a primary key column is not supported")
 		}
