@@ -135,6 +135,18 @@ exactly the property cost requires.
   page access — **not** a physical disk fetch. A future buffer pool / demand-paging cache for
   larger-than-RAM files (CLAUDE.md §9) serves a page from memory or disk transparently; the
   cost is identical either way, so the deterministic cost stays cache-independent (§13).
+- **Overflow chains count too** ([large-values.md](large-values.md) §8.1/§12). A record whose
+  values spilled out-of-line stores them on a chain of overflow pages (`page_type 4`), and
+  materializing the record reads that chain — so the scan's `page_read` block also counts **one
+  per overflow chain page of every record the scan's bound admits** (the full table when
+  unbounded; the in-range records for a bounded scan, so a point lookup pays only *its* record's
+  chain and a miss pays none). The chain page count is `ceil(payload / C)` per externalized
+  value — a function of the §8-contracted disposition rule and chain layout, so it is
+  byte-identical across cores; a fully-inline table charges exactly the structural node count as
+  before (existing costs do not move). Like the rest of the block it is charged **up front** and
+  does **not** short-circuit under `LIMIT` (see "LIMIT short-circuit" below); it stays *logical*
+  (whether eager materialization actually read the chain, or a future lazy read skipped it, the
+  charge is the same — large-values.md §7 is a tracked follow-on that would revisit this).
 
 ### Bounded scan / point lookup — the pages a primary-key predicate touches
 
@@ -226,11 +238,12 @@ capability.
   whole table. `SELECT v FROM u LIMIT 2` over a 5-row table reads 2 rows, not 5. This is the
   deliberate cost change; it is genuine (the scan really stops — leaves past the stop point are never
   faulted), not a post-hoc truncation, so the cost honestly bounds the work (CLAUDE.md §13).
-- **`page_read` does NOT short-circuit** — it stays the full block (the scan bound's node count,
-  charged up front), so a `LIMIT` does not lower it. Keeping `page_read` the structural node count
-  preserves its "logical, buffer-pool-invisible" definition and one accrual model across all scans;
-  the row reads are where the early-out shows. (Tightening `page_read` to the leaves actually faulted
-  is a possible later refinement; it would only matter for a very large multi-leaf table.)
+- **`page_read` does NOT short-circuit** — it stays the full block (the scan bound's node count
+  plus the bound's overflow chain pages, charged up front), so a `LIMIT` does not lower it. Keeping
+  `page_read` the structural count preserves its "logical, buffer-pool-invisible" definition and one
+  accrual model across all scans; the row reads are where the early-out shows. (Tightening
+  `page_read` to the leaves actually faulted is a possible later refinement; it would only matter
+  for a very large multi-leaf table.)
 - **An `ORDER BY` (or any blocking operator) keeps the full scan.** Those must materialize every row
   before windowing, so they charge `storage_row_read` for all of them — the rule at the top of this
   section. This is why every `LIMIT`-with-`ORDER BY` cost in `query/limit_offset.test` scans all

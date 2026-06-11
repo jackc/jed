@@ -926,6 +926,23 @@ func recordSize(colTypes []ScalarType, key []byte, row Row, capacity int) int {
 	return size
 }
 
+// overflowPageCount is the number of overflow pages this record's externalized values occupy — the
+// extra page_reads a scan that materializes the record charges (spec/design/large-values.md
+// §8.1/§12; cost.md §3). Zero for a fully-inline record. Each external value's content payload P(v)
+// fills capacity-byte slabs, one page per slab — the same chain layout the serializer writes, so
+// the count is the chain's true page count and identical across cores.
+func overflowPageCount(colTypes []ScalarType, key []byte, row Row, capacity int) int {
+	external, _ := planDispositions(colTypes, key, row, capacity)
+	pages := 0
+	for i, ext := range external {
+		if ext {
+			n := len(valuePayload(colTypes[i], row[i]))
+			pages += (n + capacity - 1) / capacity
+		}
+	}
+	return pages
+}
+
 // valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
 // externalized (large-values.md §12): raw UTF-8 for text / raw bytes for bytea (both in v.Str), the
 // decimal body (encoding minus its presence tag) for decimal. Only spillable types reach here.

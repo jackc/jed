@@ -215,6 +215,35 @@ impl TableStore {
         self.rows.overlap_node_count(b)
     }
 
+    /// The `page_read` block a **full scan** of this store charges: every B-tree node plus one per
+    /// overflow chain page of every stored record (cost.md §3 "page_read";
+    /// spec/design/large-values.md §8.1/§12). Equals `node_count` when no record spills — and the
+    /// row walk is skipped entirely when no column type can spill, so fixed-width tables pay
+    /// nothing extra.
+    pub fn scan_page_count(&self) -> Result<usize> {
+        let mut pages = self.node_count();
+        if crate::format::any_spillable(&self.col_types) {
+            for (k, row) in self.iter_entries()? {
+                pages += crate::format::overflow_page_count(&self.col_types, &k, &row, self.cap);
+            }
+        }
+        Ok(pages)
+    }
+
+    /// The `page_read` block a **bounded scan** over `b` charges: the nodes the bound's key range
+    /// intersects plus the overflow chain pages of the records the bound admits (cost.md §3;
+    /// spec/design/large-values.md §8.1/§12). An empty bound or a point-lookup miss admits no
+    /// record and adds nothing beyond the path nodes.
+    pub(crate) fn overlap_scan_page_count(&self, b: &KeyBound) -> Result<usize> {
+        let mut pages = self.overlap_node_count(b);
+        if crate::format::any_spillable(&self.col_types) {
+            for (k, row) in self.range_entries(b)? {
+                pages += crate::format::overflow_page_count(&self.col_types, &k, &row, self.cap);
+            }
+        }
+        Ok(pages)
+    }
+
     /// Stream the rows whose primary key lies within `b` to `visit`, in key order, stopping (without
     /// faulting further leaves) the moment `visit` returns `Ok(false)` — the genuine LIMIT
     /// short-circuit (spec/design/cost.md §3 "LIMIT short-circuit").

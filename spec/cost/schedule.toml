@@ -52,7 +52,10 @@ event  = "one B-tree node (page) touched while scanning a table store"
 # scan exactly — so existing costs are unchanged (../design/cost.md §3 "Bounded scan"). The
 # same bound also applies per JOIN base table (`query.join_pushdown`) and to a correlated
 # subquery's inner re-scan when its PK is compared to an enclosing column
-# (`query.correlated_pushdown`, resolved per outer row).
+# (`query.correlated_pushdown`, resolved per outer row). The block also counts one per
+# OVERFLOW chain page (page_type 4) of every record the bound admits — an externalized
+# value's chain is part of what the scan reads (../design/large-values.md §8.1/§12;
+# ../design/cost.md §3); a fully-inline table charges exactly the node count as before.
 
 [[unit]]
 id     = "row_produced"

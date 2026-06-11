@@ -917,14 +917,14 @@ impl Database {
                     let store = self.store(&del.table);
                     (
                         store.range_entries(&b)?,
-                        store.overlap_node_count(&b) as i64,
+                        store.overlap_scan_page_count(&b)? as i64,
                     )
                 }
                 None => (Vec::new(), 0),
             },
             None => {
                 let store = self.store(&del.table);
-                (store.iter_entries()?, store.node_count() as i64)
+                (store.iter_entries()?, store.scan_page_count()? as i64)
             }
         };
         meter.charge(COSTS.page_read * overlap);
@@ -1055,14 +1055,14 @@ impl Database {
                     let store = self.store(&upd.table);
                     (
                         store.range_entries(&b)?,
-                        store.overlap_node_count(&b) as i64,
+                        store.overlap_scan_page_count(&b)? as i64,
                     )
                 }
                 None => (Vec::new(), 0),
             },
             None => {
                 let store = self.store(&upd.table);
-                (store.iter_entries()?, store.node_count() as i64)
+                (store.iter_entries()?, store.scan_page_count()? as i64)
             }
         };
         meter.charge(COSTS.page_read * overlap);
@@ -1588,7 +1588,7 @@ impl Database {
         let overlap = if empty {
             0
         } else {
-            store.overlap_node_count(&bound) as i64
+            store.overlap_scan_page_count(&bound)? as i64
         };
         meter.charge(COSTS.page_read * overlap);
 
@@ -1673,10 +1673,13 @@ impl Database {
             // Otherwise the full scan is unchanged (cost.md §3 "bounded scan" / JOIN).
             let (rows, node_count) = match &plan.rel_bounds[ri] {
                 Some(bp) => match build_key_bound(bp, params, outer) {
-                    Some(b) => (store.range_rows(&b)?, store.overlap_node_count(&b) as i64),
+                    Some(b) => (
+                        store.range_rows(&b)?,
+                        store.overlap_scan_page_count(&b)? as i64,
+                    ),
                     None => (Vec::new(), 0),
                 },
-                None => (store.iter_in_key_order()?, store.node_count() as i64),
+                None => (store.iter_in_key_order()?, store.scan_page_count()? as i64),
             };
             let mut src = ScanSource::new(rows, node_count);
             let mut table_rows: Vec<Row> = Vec::new();

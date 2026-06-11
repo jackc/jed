@@ -174,6 +174,12 @@ fn is_spillable(ty: ScalarType) -> bool {
     ty.is_text() || ty.is_bytea() || ty.is_decimal()
 }
 
+/// Whether any column of this row shape can ever spill — the cheap gate that keeps the
+/// overflow-page cost walk (`overflow_page_count`) off tables that cannot have chains.
+pub(crate) fn any_spillable(col_types: &[ScalarType]) -> bool {
+    col_types.iter().any(|&ty| is_spillable(ty))
+}
+
 /// The largest a single record may serialize to and still satisfy the B-tree split contract —
 /// `RECORD_MAX = (C-12)/2` where `C = cap` is the page payload (spec/fileformat/format.md
 /// "Why the record cap"). The spill planner reduces a record to ≤ this by externalizing values.
@@ -227,6 +233,27 @@ fn plan_dispositions(
 /// the length the serializer produces, so in-memory node boundaries match the serialized pages.
 pub(crate) fn record_size(col_types: &[ScalarType], key: &[u8], row: &Row, cap: usize) -> usize {
     plan_dispositions(col_types, key, row, cap).1
+}
+
+/// The number of overflow pages this record's externalized values occupy — the extra `page_read`s
+/// a scan that materializes the record charges (spec/design/large-values.md §8.1/§12; cost.md §3).
+/// Zero for a fully-inline record. Each external value's content payload `P(v)` fills `cap`-byte
+/// slabs, one page per slab — the same chain layout the serializer writes, so the count is the
+/// chain's true page count and identical across cores.
+pub(crate) fn overflow_page_count(
+    col_types: &[ScalarType],
+    key: &[u8],
+    row: &Row,
+    cap: usize,
+) -> usize {
+    let (external, _) = plan_dispositions(col_types, key, row, cap);
+    let mut pages = 0;
+    for (i, ext) in external.iter().enumerate() {
+        if *ext {
+            pages += value_payload(col_types[i], &row[i]).len().div_ceil(cap);
+        }
+    }
+    pages
 }
 
 /// A value's **content payload** `P(v)` — the bytes stored in the overflow chain when the value is
@@ -750,7 +777,7 @@ impl Database {
                     // the free-list would reclaim still-referenced overflow pages
                     // (spec/design/large-values.md §12; default `open` is this paged path). Dead
                     // chains still leak until the next open, matching the P6.2 orphan model.
-                    if col_types.iter().copied().any(is_spillable) {
+                    if any_spillable(&col_types) {
                         collect_leaf_overflow(&paging, root_data_page, &col_types, &mut reached)?;
                     }
                     let store = snap.store_mut(&name);

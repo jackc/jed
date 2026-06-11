@@ -15,7 +15,7 @@ import type { ScalarType } from "./types.ts";
 import { PMap, pmapFromLoaded } from "./pmap.ts";
 import type { KeyBound, LeafSource, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
-import { recordSize } from "./format.ts";
+import { anySpillable, overflowPageCount, recordSize } from "./format.ts";
 
 // Row is a stored row: one value per column, in column order.
 export type Row = Value[];
@@ -176,6 +176,34 @@ export class TableStore {
   // charges (cost.md §3). Equals nodeCount for the unbounded bound.
   overlapNodeCount(b: KeyBound): number {
     return this.rows.overlapNodeCount(b);
+  }
+
+  // scanPageCount is the page_read block a FULL scan of this store charges: every B-tree node plus
+  // one per overflow chain page of every stored record (cost.md §3 "page_read";
+  // spec/design/large-values.md §8.1/§12). Equals nodeCount when no record spills — and the row walk
+  // is skipped entirely when no column type can spill, so fixed-width tables pay nothing extra.
+  scanPageCount(): number {
+    let pages = this.nodeCount();
+    if (anySpillable(this.colTypes)) {
+      for (const e of this.entriesInKeyOrder()) {
+        pages += overflowPageCount(this.colTypes, e.key, e.row, this.cap);
+      }
+    }
+    return pages;
+  }
+
+  // overlapScanPageCount is the page_read block a BOUNDED scan over b charges: the nodes the bound's
+  // key range intersects plus the overflow chain pages of the records the bound admits (cost.md §3;
+  // spec/design/large-values.md §8.1/§12). An empty bound or a point-lookup miss admits no record and
+  // adds nothing beyond the path nodes.
+  overlapScanPageCount(b: KeyBound): number {
+    let pages = this.overlapNodeCount(b);
+    if (anySpillable(this.colTypes)) {
+      for (const e of this.rangeEntries(b)) {
+        pages += overflowPageCount(this.colTypes, e.key, e.row, this.cap);
+      }
+    }
+    return pages;
   }
 
   // scanRange streams the rows whose primary key lies within b to visit, in key order, stopping

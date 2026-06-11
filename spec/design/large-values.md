@@ -256,7 +256,9 @@ cost.md §3, pager.md §5):
 1. **Overflow-chain reads → `page_read`.** Materializing an external value charges one
    `page_read` per overflow page in its chain (the §4 logical count), accrued **when the value is
    materialized** (§7) — so an unread external value costs nothing, deterministically. This slots
-   into the existing `page_read` unit (P6.3) with no new unit.
+   into the existing `page_read` unit (P6.3) with no new unit. (Slice A materializes **eagerly**,
+   so the as-built rule folds the chain pages into the scan's up-front `page_read` block — §12,
+   cost.md §3; the unread-value-costs-nothing refinement arrives with §7's lazy read.)
 2. **Decompression → a new `value_decompress` unit.** Decompressing a value is real CPU work an
    untrusted query can drive (§13); it must be metered or the cost ceiling cannot bound it. Charge
    per unit of work on materialization. **Granularity is open** (per decompressed byte vs. per
@@ -381,8 +383,14 @@ compression is Slice B). They were chosen with the maintainer; the byte details 
   On-disk free-list persistence (so open needn't read leaves — the larger-than-RAM end-state) and
   continuous within-session reclamation remain the documented P6.2 follow-ons.
 
-- **Cost = `page_read` per chain page, charged at materialization** (§8.1). With eager
-  materialization that is when the leaf is decoded. Deterministic and cross-core identical.
+- **Cost = `page_read` per chain page, folded into the scan's up-front block** (§8.1, as built).
+  A scan's `page_read` block counts the B-tree nodes its bound intersects **plus one per overflow
+  chain page of every record the bound admits** — so a full scan pays every chain, a point lookup
+  pays only the admitted record's chain, and a miss or empty bound pays none. Like the rest of the
+  block it is charged up front and does **not** short-circuit under `LIMIT` (cost.md §3). This is
+  the eager-materialization reading of §8.1's "charged when materialized": with §7's lazy read a
+  tracked follow-on, the per-*touched-value* refinement is revisited there. Deterministic and
+  cross-core identical (the chain page count is `ceil(payload/C)` under the §3 disposition rule).
 
 - **Format version.** Clean break to **`format_version 3`** (v2 not read), regenerating the 15
   goldens (only the version field + CRC change for non-spilling fixtures) plus new external-value

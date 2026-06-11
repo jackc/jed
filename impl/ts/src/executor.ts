@@ -1154,7 +1154,7 @@ export class Database {
       if (b === null) empty = true;
       else bound = b;
     }
-    const overlap = empty ? 0 : store.overlapNodeCount(bound);
+    const overlap = empty ? 0 : store.overlapScanPageCount(bound);
     meter.charge(COSTS.pageRead * BigInt(overlap));
 
     const limit = plan.limit!;
@@ -1219,11 +1219,11 @@ export class Database {
           nodeCount = 0;
         } else {
           rows = store.rangeRows(b);
-          nodeCount = store.overlapNodeCount(b);
+          nodeCount = store.overlapScanPageCount(b);
         }
       } else {
         rows = store.iterInKeyOrder();
-        nodeCount = store.nodeCount();
+        nodeCount = store.scanPageCount();
       }
       const tableRows: Row[] = [];
       for (const row of scanSource(rows, nodeCount, meter)) {
@@ -1750,9 +1750,9 @@ function scanEntries(
     // Top-level statement: no enclosing query, so the bound never has a correlated source.
     const b = buildKeyBound(pkBound, params, []);
     if (b === null) return { entries: null, overlap: 0 };
-    return { entries: store.rangeEntries(b), overlap: store.overlapNodeCount(b) };
+    return { entries: store.rangeEntries(b), overlap: store.overlapScanPageCount(b) };
   }
-  return { entries: store.entriesInKeyOrder(), overlap: store.nodeCount() };
+  return { entries: store.entriesInKeyOrder(), overlap: store.scanPageCount() };
 }
 
 // ---- Subquery helpers (spec/design/grammar.md §26) ----------------------

@@ -777,12 +777,16 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		if entries, err = store.RangeEntries(kb); err != nil {
 			return Outcome{}, err
 		}
-		overlap = store.OverlapNodeCount(kb)
+		if overlap, err = store.OverlapScanPageCount(kb); err != nil {
+			return Outcome{}, err
+		}
 	} else {
 		if entries, err = store.EntriesInKeyOrder(); err != nil {
 			return Outcome{}, err
 		}
-		overlap = store.NodeCount()
+		if overlap, err = store.ScanPageCount(); err != nil {
+			return Outcome{}, err
+		}
 	}
 	meter.Charge(Costs.PageRead * int64(overlap))
 	for _, e := range entries {
@@ -917,12 +921,16 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		if entries, err = store.RangeEntries(kb); err != nil {
 			return Outcome{}, err
 		}
-		overlap = store.OverlapNodeCount(kb)
+		if overlap, err = store.OverlapScanPageCount(kb); err != nil {
+			return Outcome{}, err
+		}
 	} else {
 		if entries, err = store.EntriesInKeyOrder(); err != nil {
 			return Outcome{}, err
 		}
-		overlap = store.NodeCount()
+		if overlap, err = store.ScanPageCount(); err != nil {
+			return Outcome{}, err
+		}
 	}
 	meter.Charge(Costs.PageRead * int64(overlap))
 	for _, e := range entries {
@@ -1871,12 +1879,14 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 	// This path is single-table (gated below), so the only relation is relBounds[0].
 	b := unboundedBound()
 	empty := false
-	overlap := store.NodeCount()
+	overlap := 0
 	if plan.relBounds[0] != nil {
-		if b, empty = db.buildKeyBound(plan.relBounds[0], params, env.outer); empty {
-			overlap = 0
-		} else {
-			overlap = store.OverlapNodeCount(b)
+		b, empty = db.buildKeyBound(plan.relBounds[0], params, env.outer)
+	}
+	if !empty {
+		var err error
+		if overlap, err = store.OverlapScanPageCount(b); err != nil {
+			return selectResult{}, err
 		}
 	}
 	meter.Charge(Costs.PageRead * int64(overlap))
@@ -1960,14 +1970,18 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 				if rows, err = store.RangeRows(b); err != nil {
 					return selectResult{}, err
 				}
-				nodeCount = store.OverlapNodeCount(b)
+				if nodeCount, err = store.OverlapScanPageCount(b); err != nil {
+					return selectResult{}, err
+				}
 			}
 		} else {
 			var err error
 			if rows, err = store.IterInKeyOrder(); err != nil {
 				return selectResult{}, err
 			}
-			nodeCount = store.NodeCount()
+			if nodeCount, err = store.ScanPageCount(); err != nil {
+				return selectResult{}, err
+			}
 		}
 		src := &scanSource{rows: rows, nodeCount: nodeCount}
 		var tableRows []Row

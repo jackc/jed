@@ -166,6 +166,42 @@ func (s *TableStore) RangeEntries(b keyBound) ([]Entry, error) {
 // charges (spec/design/cost.md §3). Equals NodeCount for the unbounded bound.
 func (s *TableStore) OverlapNodeCount(b keyBound) int { return s.rows.overlapNodeCount(b) }
 
+// ScanPageCount is the page_read block a FULL scan of this store charges: every B-tree node plus
+// one per overflow chain page of every stored record (cost.md §3 "page_read";
+// spec/design/large-values.md §8.1/§12). Equals NodeCount when no record spills — and the row walk
+// is skipped entirely when no column type can spill, so fixed-width tables pay nothing extra.
+func (s *TableStore) ScanPageCount() (int, error) {
+	pages := s.NodeCount()
+	if anySpillable(s.colTypes) {
+		entries, err := s.EntriesInKeyOrder()
+		if err != nil {
+			return 0, err
+		}
+		for _, e := range entries {
+			pages += overflowPageCount(s.colTypes, e.Key, e.Row, s.cap)
+		}
+	}
+	return pages, nil
+}
+
+// OverlapScanPageCount is the page_read block a BOUNDED scan over b charges: the nodes the bound's
+// key range intersects plus the overflow chain pages of the records the bound admits (cost.md §3;
+// spec/design/large-values.md §8.1/§12). An empty bound or a point-lookup miss admits no record and
+// adds nothing beyond the path nodes.
+func (s *TableStore) OverlapScanPageCount(b keyBound) (int, error) {
+	pages := s.OverlapNodeCount(b)
+	if anySpillable(s.colTypes) {
+		entries, err := s.RangeEntries(b)
+		if err != nil {
+			return 0, err
+		}
+		for _, e := range entries {
+			pages += overflowPageCount(s.colTypes, e.Key, e.Row, s.cap)
+		}
+	}
+	return pages, nil
+}
+
 // ScanRange streams the rows whose primary key lies within the bound to visit, in key order, stopping
 // (without faulting further leaves) the moment visit returns a false `continue` — the genuine LIMIT
 // short-circuit (spec/design/cost.md §3 "LIMIT short-circuit").

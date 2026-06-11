@@ -281,6 +281,27 @@ export function recordSize(colTypes: ScalarType[], key: Uint8Array, row: Row, ca
   return planDispositions(colTypes, key, row, capacity)[1];
 }
 
+// overflowPageCount is the number of overflow pages this record's externalized values occupy — the
+// extra page_reads a scan that materializes the record charges (spec/design/large-values.md
+// §8.1/§12; cost.md §3). Zero for a fully-inline record. Each external value's content payload P(v)
+// fills capacity-byte slabs, one page per slab — the same chain layout the serializer writes, so
+// the count is the chain's true page count and identical across cores.
+export function overflowPageCount(
+  colTypes: ScalarType[],
+  key: Uint8Array,
+  row: Row,
+  capacity: number,
+): number {
+  const [external] = planDispositions(colTypes, key, row, capacity);
+  let pages = 0;
+  for (let i = 0; i < external.length; i++) {
+    if (external[i]) {
+      pages += Math.ceil(valuePayload(colTypes[i]!, row[i]!).length / capacity);
+    }
+  }
+  return pages;
+}
+
 // valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
 // externalized (large-values.md §12): raw UTF-8 for text, raw bytes for bytea, the decimal body
 // (encoding minus its presence tag) for decimal. Only spillable types reach here.
@@ -734,7 +755,7 @@ export function loadDatabase(image: Uint8Array): Database {
 }
 
 // anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
-function anySpillable(colTypes: ScalarType[]): boolean {
+export function anySpillable(colTypes: ScalarType[]): boolean {
   return colTypes.some(isSpillable);
 }
 
