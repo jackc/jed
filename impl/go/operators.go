@@ -946,7 +946,7 @@ var Operators = []OperatorDesc{
 		Result:        "decimal",
 		Null:          "propagates",
 		Precedence:    0,
-		Errors:        []string{},
+		Errors:        []string{"22003"},
 	},
 	{
 		Name:          "round",
@@ -958,7 +958,7 @@ var Operators = []OperatorDesc{
 		Result:        "decimal",
 		Null:          "propagates",
 		Precedence:    0,
-		Errors:        []string{},
+		Errors:        []string{"22003"},
 	},
 	{
 		Name:          "round",

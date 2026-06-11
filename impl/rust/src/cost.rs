@@ -10,7 +10,8 @@
 //! Every unit routes through the single [`Meter::charge`] chokepoint; the caller-set
 //! ceiling + deterministic abort (spec/design/cost.md §6) is enforced by [`Meter::guard`],
 //! consulted at the unbounded-work points (per scanned row, per produced row, per
-//! expression node, per aggregate fold) so a runaway query stops deterministically.
+//! expression node, per aggregate fold, and immediately after each size-scaled
+//! `decimal_work` charge — cost.md §3) so a runaway query stops deterministically.
 
 use crate::error::{EngineError, Result, SqlState};
 

@@ -14,7 +14,7 @@ import {
   scalarTypeFromName,
   widthBytes,
 } from "../src/types.ts";
-import { MAX_PRECISION, MAX_SCALE } from "../src/decimal.ts";
+import { MAX_INT_DIGITS, MAX_PRECISION, MAX_SCALE } from "../src/decimal.ts";
 import { AGGREGATES, OPERATORS } from "../src/operators.ts";
 import { COSTS } from "../src/costs.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
@@ -71,6 +71,7 @@ test("scalar types match spec/types/scalars.toml", () => {
   }
   assert.equal(decimal!.big("max_precision"), BigInt(MAX_PRECISION), "max_precision matches module");
   assert.equal(decimal!.big("max_scale"), BigInt(MAX_SCALE), "max_scale matches module");
+  assert.equal(decimal!.big("max_int_digits"), BigInt(MAX_INT_DIGITS), "max_int_digits matches module");
 
   // uuid: storable, the uuid family, fixed-width (the first non-integer with a width_bytes).
   // Its on-disk width (16) is a cross-core contract, so cross-check it against the spec.
@@ -196,6 +197,8 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.valueCompress;
       case "value_decompress":
         return COSTS.valueDecompress;
+      case "decimal_work":
+        return COSTS.decimalWork;
       case "row_produced":
         return COSTS.rowProduced;
       case "operator_eval":

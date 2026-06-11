@@ -12,7 +12,7 @@ use crate::ast::{
 use crate::catalog::{Column, Table};
 use crate::cost::Meter;
 use crate::costs::COSTS;
-use crate::decimal::{Decimal, MAX_PRECISION, MAX_SCALE};
+use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
 use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
 use crate::pmap::KeyBound;
@@ -1976,7 +1976,7 @@ impl Database {
                         Some(op) => op.eval(row, &env, &mut meter)?,
                         None => Value::Null, // COUNT(*) ignores the value
                     };
-                    groups[gi].1[si].fold(v)?;
+                    groups[gi].1[si].fold(v, &mut meter)?;
                 }
             }
             // Build one synthetic row per group: [group_key_values..., aggregate_results...].
@@ -3141,7 +3141,10 @@ impl Acc {
 
     /// Fold one input value into the accumulator. NULL arguments are skipped (COUNT(*) ignores
     /// the value and always counts). Traps 22003 on SUM/AVG overflow at the result bound.
-    fn fold(&mut self, value: Value) -> Result<()> {
+    /// A decimal SUM/AVG fold charges size-scaled `decimal_work` against the running
+    /// accumulator (the `+` formula — spec/design/cost.md §3 "decimal_work"); MIN/MAX folds
+    /// are direct Value compares like the sort's and stay unmetered.
+    fn fold(&mut self, value: Value, m: &mut Meter) -> Result<()> {
         match self {
             Acc::CountStar(n) => *n += 1,
             Acc::Count(n) => {
@@ -3159,13 +3162,19 @@ impl Acc {
             }
             Acc::SumDecimal { sum, seen } => {
                 if !matches!(value, Value::Null) {
-                    *sum = sum.add(&to_decimal(value))?;
+                    let d = to_decimal(value);
+                    m.charge(COSTS.decimal_work * ((decimal::work_linear(sum, &d) - 1) as i64));
+                    m.guard()?;
+                    *sum = sum.add(&d)?;
                     *seen = true;
                 }
             }
             Acc::Avg { sum, count } => {
                 if !matches!(value, Value::Null) {
-                    *sum = sum.add(&to_decimal(value))?;
+                    let d = to_decimal(value);
+                    m.charge(COSTS.decimal_work * ((decimal::work_linear(sum, &d) - 1) as i64));
+                    m.guard()?;
+                    *sum = sum.add(&d)?;
                     *count += 1;
                 }
             }
@@ -3481,14 +3490,18 @@ fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut [bool]) {
 /// `x NOT IN ()` = TRUE) independent of `lv`. Otherwise: a positive match → TRUE; else a NULL
 /// element (or NULL `lv`) → NULL (unknown); else FALSE. `NOT IN` is the Kleene negation. Shared
 /// by the folded `InValues` node and the correlated `Subquery { In }` eval.
-fn in_membership(lv: &Value, list: &[Value], negated: bool, m: &mut Meter) -> Value {
+fn in_membership(lv: &Value, list: &[Value], negated: bool, m: &mut Meter) -> Result<Value> {
     if list.is_empty() {
-        return Value::Bool(negated);
+        return Ok(Value::Bool(negated));
     }
     let mut any_match = false;
     let mut any_null = false;
     for v in list {
         m.charge(COSTS.operator_eval);
+        // Each element comparison over a decimal pair charges its size-scaled decimal_work
+        // (cost.md §3 "decimal_work"), like a Compare node.
+        m.charge(COSTS.decimal_work * ((decimal_cmp_work(lv, v) - 1) as i64));
+        m.guard()?;
         match lv.eq3(v) {
             ThreeValued::True => any_match = true,
             ThreeValued::Unknown => any_null = true,
@@ -3502,7 +3515,7 @@ fn in_membership(lv: &Value, list: &[Value], negated: bool, m: &mut Meter) -> Va
     } else {
         Value::Bool(false)
     };
-    if negated { not3(&in_val) } else { in_val }
+    Ok(if negated { not3(&in_val) } else { in_val })
 }
 
 /// Build a binary-operator `Expr` node (used by the IN/BETWEEN desugar in `resolve`).
@@ -5442,8 +5455,14 @@ impl RExpr {
                 }
                 if result.is_decimal() {
                     // Decimal arithmetic: widen any integer operand to decimal, then apply the
-                    // op with PG's scale rules (spec/design/decimal.md §4).
-                    eval_decimal_arith(*op, to_decimal(a), to_decimal(b))
+                    // op with PG's scale rules (spec/design/decimal.md §4). The size-scaled
+                    // decimal_work is charged BEFORE the operation runs, so a cost ceiling
+                    // aborts ahead of the limb work (spec/design/cost.md §3 "decimal_work").
+                    let (da, db) = (to_decimal(a), to_decimal(b));
+                    let w = decimal_arith_work(*op, &da, &db);
+                    m.charge(COSTS.decimal_work * ((w - 1) as i64));
+                    m.guard()?;
+                    eval_decimal_arith(*op, da, db)
                 } else {
                     match (a, b) {
                         (Value::Int(x), Value::Int(y)) => eval_arith(*op, x, y, *result),
@@ -5455,6 +5474,10 @@ impl RExpr {
                 m.charge(COSTS.operator_eval);
                 let a = lhs.eval(row, env, m)?;
                 let b = rhs.eval(row, env, m)?;
+                // A decimal(-promotable) pair charges size-scaled decimal_work — once per
+                // node, even where `<=`/`>=` decompose internally (cost.md §3 "decimal_work").
+                m.charge(COSTS.decimal_work * ((decimal_cmp_work(&a, &b) - 1) as i64));
+                m.guard()?;
                 let tv = match op {
                     CmpOp::Eq => a.eq3(&b),
                     CmpOp::Lt => a.lt3(&b),
@@ -5486,6 +5509,10 @@ impl RExpr {
                 m.charge(COSTS.operator_eval);
                 let lv = lhs.eval(row, env, m)?;
                 let rv = rhs.eval(row, env, m)?;
+                // IS [NOT] DISTINCT FROM is a comparison: a decimal pair charges its
+                // size-scaled decimal_work like Compare (cost.md §3 "decimal_work").
+                m.charge(COSTS.decimal_work * ((decimal_cmp_work(&lv, &rv) - 1) as i64));
+                m.guard()?;
                 let same = lv.not_distinct_from(&rv);
                 // `negated` carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks
                 // "are they the same?" → `same`; IS DISTINCT FROM asks the opposite. Either
@@ -5568,7 +5595,7 @@ impl RExpr {
                             Some(Value::Int(k)) => *k,
                             Some(_) => unreachable!("resolver restricts round's count to integer"),
                         };
-                        Ok(Value::Decimal(d.round_places(places)))
+                        Ok(Value::Decimal(d.round_places(places)?))
                     }
                 }
             }
@@ -5615,7 +5642,7 @@ impl RExpr {
                             .into_iter()
                             .map(|mut row| row.swap_remove(0))
                             .collect();
-                        Ok(in_membership(&lv, &list, *negated, m))
+                        in_membership(&lv, &list, *negated, m)
                     }
                 }
             }
@@ -5623,7 +5650,7 @@ impl RExpr {
             RExpr::InValues { lhs, list, negated } => {
                 m.charge(COSTS.operator_eval);
                 let lv = lhs.eval(row, env, m)?;
-                Ok(in_membership(&lv, list, *negated, m))
+                in_membership(&lv, list, *negated, m)
             }
         }
     }
@@ -5732,6 +5759,29 @@ fn to_decimal(v: Value) -> Decimal {
         Value::Decimal(d) => d,
         Value::Int(n) => Decimal::from_i64(n),
         _ => unreachable!("resolver guarantees a numeric operand here"),
+    }
+}
+
+/// The `decimal_work` W of an arithmetic node — which group-count formula applies per op
+/// (spec/design/cost.md §3 "decimal_work"). The evaluator charges W − 1 before the op runs.
+fn decimal_arith_work(op: ArithOp, a: &Decimal, b: &Decimal) -> u64 {
+    match op {
+        ArithOp::Add | ArithOp::Sub => decimal::work_linear(a, b),
+        ArithOp::Mul => decimal::work_mul(a, b),
+        ArithOp::Div => decimal::work_div(a, b),
+        ArithOp::Mod => decimal::work_mod(a, b),
+    }
+}
+
+/// The `decimal_work` W of a comparison over a decimal(-promotable) pair — the aligned
+/// linear formula after `int → decimal` promotion; 1 (no charge) for any other pair,
+/// including a NULL side, where no decimal compare runs (cost.md §3 "decimal_work").
+fn decimal_cmp_work(a: &Value, b: &Value) -> u64 {
+    match (a, b) {
+        (Value::Decimal(x), Value::Decimal(y)) => decimal::work_linear(x, y),
+        (Value::Decimal(x), Value::Int(y)) => decimal::work_linear(x, &Decimal::from_i64(*y)),
+        (Value::Int(x), Value::Decimal(y)) => decimal::work_linear(&Decimal::from_i64(*x), y),
+        _ => 1,
     }
 }
 

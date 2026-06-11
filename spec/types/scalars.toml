@@ -43,10 +43,16 @@ schema_version = 1
 #               §2.7). All sort byte-for-byte identically to logical order. width_bytes is
 #               omitted for the variable-width types (text, bytea, decimal) but PRESENT for
 #               uuid (fixed 16 bytes — uuid is the first non-integer type usable as a key).
-# max_precision for decimal only: the maximum total significant digits a value may carry
-#               (precision p of numeric(p,s)). 1000, PG's declarable max. An unconstrained
-#               `numeric` (no typmod) is capped here too (../design/decimal.md §2).
-# max_scale     for decimal only: the maximum digits after the point (scale s). 1000.
+# max_precision for decimal only: the maximum DECLARABLE precision p of numeric(p,s) —
+#               1000, PG's NUMERIC_MAX_PRECISION — and (as in PG) the display-scale clamp
+#               on a division result (../design/decimal.md §4). NOT a cap on what an
+#               unconstrained value may carry; that is the pair below.
+# max_int_digits for decimal only: the maximum integer-part digits ANY value may carry —
+#               131072, PG's (NUMERIC_WEIGHT_MAX + 1) * DEC_DIGITS. Exceeding traps 22003
+#               (../design/decimal.md §2).
+# max_scale     for decimal only: the maximum digits after the point ANY value may carry —
+#               16383, PG's NUMERIC_DSCALE_MAX. Exceeding traps 22003 on input; a
+#               multiplication result instead ROUNDS to this scale (../design/decimal.md §2).
 # rank          position in the integer promotion tower; the common type of two
 #               integers is the one with the higher rank (see compare.toml). Omitted
 #               for non-integer types (boolean and text do not promote).
@@ -154,8 +160,11 @@ collation = "C"
 # (decimal-order-preserving) is authored (encoding.md §2.5) but UNEXERCISED this slice —
 # a decimal PRIMARY KEY is rejected 0A000 (the text-PK narrowing). No bits/min/max/rank
 # (decimal forms no integer-style promotion tower); no collation; no width_bytes
-# (variable-width). max_precision/max_scale bound an unconstrained value too
-# (../design/decimal.md §2); relax when over-page values land (TODO.md Phase 6).
+# (variable-width). An UNCONSTRAINED value is bounded by PG's numeric-format caps
+# (max_int_digits / max_scale — ../design/decimal.md §2); these were lifted from the
+# original 1000/1000 cap when over-page values landed (large-values.md), with the
+# size-scaled `decimal_work` cost unit bounding the arithmetic an untrusted query can
+# drive (../cost/schedule.toml, ../design/cost.md §3).
 [[type]]
 id = "decimal"
 aliases = ["numeric", "dec"]
@@ -165,7 +174,8 @@ overflow = "trap"
 overflow_error = "22003"
 encoding = { method = "decimal-order-preserving" }
 max_precision = 1000
-max_scale = 1000
+max_int_digits = 131072
+max_scale = 16383
 
 # --- bytea: a variable-width binary string (raw bytes) -----------------------
 # STORABLE this slice: `CREATE TABLE t(b bytea)` works, values are stored on disk

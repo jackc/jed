@@ -351,10 +351,13 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   functions / `||` / `LIKE`, text in keys, and locale/ICU multi-collation) are enumerated in §11.
 - **`decimal`** — ✅ landed (§12, [decimal.md](decimal.md)): exact base-10 numeric, the first
   parameterized type (`numeric(p,s)`), rounding half-away (settling the §8 decimal-rounding
-  hotspot), comparison + casts + storage + arithmetic. Deferred sub-features: decimal in a key
+  hotspot), comparison + casts + storage + arithmetic. The original 1000-digit absolute cap
+  has been **lifted to PostgreSQL's numeric-format limits** (131072 integer / 16383 fractional
+  digits — [decimal.md](decimal.md) §2) now that over-page values land via
+  [large-values.md](large-values.md), with the size-scaled `decimal_work` cost unit bounding
+  big-value arithmetic ([cost.md](cost.md) §3). Deferred sub-features: decimal in a key
   (`0A000`; the order-preserving encoding is authored, [encoding.md](encoding.md) §2.5),
-  scientific `e`-notation literals, negative/over-precision scale typmods, and raising the
-  1000-digit cap once over-page values land ([large-values.md](large-values.md)).
+  scientific `e`-notation literals, and negative/over-precision scale typmods.
 - **`bytea`** — ✅ landed as the fourth storable non-integer scalar — variable-width raw bytes,
   unsigned byte-order comparison (§13). Its deferred sub-features (the traditional escape input
   format, bytea⇄other casts, binary functions, and bytea in keys) are enumerated in §13.

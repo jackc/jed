@@ -10,6 +10,7 @@
 // Every unit routes through the single charge() chokepoint; the caller-set ceiling +
 // deterministic abort (spec/design/cost.md §6) is enforced by guard(), consulted at the
 // unbounded-work points (per scanned row, per produced row, per expression node, per
+// size-scaled decimal_work charge (immediately after it — cost.md §3), and per
 // aggregate fold) so a runaway query stops deterministically.
 
 import { engineError } from "./errors.ts";

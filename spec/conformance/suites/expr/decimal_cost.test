@@ -1,0 +1,77 @@
+# Size-scaled decimal arithmetic cost — the `decimal_work` unit (spec/cost/schedule.toml;
+# spec/design/cost.md §3 "decimal_work"). A decimal arithmetic or comparison evaluation
+# charges decimal_work × (W − 1) on top of its flat operator_eval, where W is the operation's
+# work in base-10^4 digit groups (q(n) = max(1, ceil(n/4)) over LOGICAL significant-digit
+# counts, never a core's internal limb count): add/sub/compare align scales first and take
+# the larger operand's groups; mul multiplies the two group counts; div multiplies numerator
+# groups (dividend digits + the rescale shift E) by divisor groups; SUM/AVG folds charge the
+# add formula against the running accumulator. Operands of <= 4 aligned digits have W = 1 and
+# charge NOTHING — costs predating this unit are unchanged. Charged BEFORE the work runs, so
+# a cost ceiling (cost.md §6) aborts ahead of the expensive operation. Cost is a CROSS-CORE
+# contract: the single `# cost: N` asserted here holds for Rust, Go, and TS alike.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.aggregates, types.int32, types.decimal, expr.decimal_arithmetic, resource.cost_metering
+
+statement ok
+CREATE TABLE d (id int32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO d VALUES (1, 1.5)
+
+# Small operands charge NOTHING new: v + 1 aligns to (2, 2) digits = 1 group each, W = 1.
+# Point lookup: 1 page + 1 scanned + 1 filter (=) + 1 produced + 1 Add = 5 — exactly the
+# cost this query had before decimal_work existed.
+# cost: 5
+query D nosort
+SELECT v + 1 FROM d WHERE id = 1
+----
+2.5
+
+# add: aligned to scale 3, the constant is 8 digits = 2 groups, W = 2 -> +1 decimal_work.
+# 1 page + 1 scanned + 1 filter + 1 produced + 1 Add + 1 = 6.
+# cost: 6
+query D nosort
+SELECT v + 12345.678 FROM d WHERE id = 1
+----
+12347.178
+
+# mul: group counts MULTIPLY — 1.5 is 1 group, 123456789.123456789 is 18 digits = 5 groups,
+# W = 5 -> +4. 1 + 1 + 1 + 1 + 1 + 4 = 9.
+# cost: 9
+query D nosort
+SELECT v * 123456789.123456789 FROM d WHERE id = 1
+----
+185185183.6851851835
+
+# div: 1.5 / 3 has rscale 20 (select_div_scale), so the working numerator is 2 digits +
+# E (= 20 + 0 - 1 = 19) = 21 digits = 6 groups; the divisor is 1 group; W = 6 -> +5.
+# 1 + 1 + 1 + 1 + 1 + 5 = 10.
+# cost: 10
+query D nosort
+SELECT v / 3 FROM d WHERE id = 1
+----
+0.50000000000000000000
+
+# compare: a decimal WHERE charges the aligned linear formula — v < 12345.6789 aligns to
+# scale 4: (5, 9) digits = (2, 3) groups, W = 3 -> +2. Full scan of the one row:
+# 1 page + 1 scanned + (1 Lt + 2) filter + 1 produced = 6.
+# cost: 6
+query I nosort
+SELECT id FROM d WHERE v < 12345.6789
+----
+1
+
+statement ok
+CREATE TABLE s (id int32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO s VALUES (1, 12345.678), (2, 0.001)
+
+# SUM folds charge the add formula against the RUNNING accumulator: fold 1 (0 + 12345.678,
+# aligned (3, 8) digits -> W 2 -> +1), fold 2 (12345.678 + 0.001, aligned (8, 1) -> W 2 -> +1).
+# 1 page + 2 scanned + 2 accumulate + 2 decimal_work + 1 produced = 8.
+# cost: 8
+query D nosort
+SELECT SUM(v) FROM s
+----
+12345.679

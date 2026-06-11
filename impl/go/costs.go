@@ -13,6 +13,7 @@ type CostSchedule struct {
 	PageRead            int64
 	ValueCompress       int64
 	ValueDecompress     int64
+	DecimalWork         int64
 	RowProduced         int64
 	OperatorEval        int64
 	AggregateAccumulate int64
@@ -24,6 +25,7 @@ var Costs = CostSchedule{
 	PageRead:            1,
 	ValueCompress:       1,
 	ValueDecompress:     1,
+	DecimalWork:         1,
 	RowProduced:         1,
 	OperatorEval:        1,
 	AggregateAccumulate: 1,

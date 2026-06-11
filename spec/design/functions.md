@@ -268,7 +268,11 @@ rounds to **`n` fractional places** (PG parity includes a negative `n`, rounding
 of the point: `round(150, -2) → 200`). Two **integer overloads**, `round(integer)` and
 `round(integer, integer)`, return `numeric` so that PostgreSQL's `round(5) → 5` works
 without an implicit coercion pass — they are authored as concrete catalog rows. All of
-`round`'s forms `propagate` NULL (any NULL argument → NULL), as does `abs`.
+`round`'s forms `propagate` NULL (any NULL argument → NULL), as does `abs`. The **decimal**
+overloads carry `errors = ["22003"]`: a round-up carry can push a value at the integer-digit
+format cap over it ([decimal.md](decimal.md) §2/§4 — exactly PG); the integer overloads
+cannot (an int64 is at most 19 digits). `round`'s scale argument clamps to `max_scale`
+(16383) like PG `numeric_round`.
 
 **Cost.** A scalar-function call charges one `operator_eval` ([cost.md](cost.md)) — the same
 uniform per-evaluation weight every operator charges — with its arguments charging their own

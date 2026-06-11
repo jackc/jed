@@ -26,7 +26,7 @@ import type {
 import { type Column, type Table, columnIndex, primaryKeyIndex } from "./catalog.ts";
 import { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
-import { Decimal, MAX_PRECISION, MAX_SCALE } from "./decimal.ts";
+import { Decimal, MAX_PRECISION, MAX_SCALE, workDiv, workLinear, workMod, workMul } from "./decimal.ts";
 import { encodeInt } from "./encoding.ts";
 import { type EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
@@ -1426,7 +1426,7 @@ export class Database {
         plan.aggSpecs.forEach((spec, i) => {
           meter.charge(COSTS.aggregateAccumulate);
           const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
-          foldAcc(accs[i]!, v);
+          foldAcc(accs[i]!, v, meter);
         });
       }
       // Build one synthetic row per group: [group_key_values..., aggregate_results...].
@@ -2218,7 +2218,10 @@ function newAcc(plan: AggPlan): Acc {
 
 // foldAcc folds one input value into the accumulator. NULL arguments are skipped (COUNT(*)
 // ignores the value and always counts). Traps 22003 on SUM overflow at the result bound.
-function foldAcc(a: Acc, v: Value): void {
+// A decimal SUM/AVG fold charges size-scaled decimal_work against the running accumulator
+// (the `+` formula — spec/design/cost.md §3 "decimal_work"); MIN/MAX folds are direct Value
+// compares like the sort's and stay unmetered.
+function foldAcc(a: Acc, v: Value, m: Meter): void {
   switch (a.plan) {
     case "countStar":
       a.count += 1n;
@@ -2236,13 +2239,19 @@ function foldAcc(a: Acc, v: Value): void {
       break;
     case "sumDecimal":
       if (v.kind !== "null") {
-        a.sumDec = a.sumDec.add(toDecimal(v));
+        const inc = toDecimal(v);
+        m.charge(COSTS.decimalWork * BigInt(workLinear(a.sumDec, inc) - 1));
+        m.guard();
+        a.sumDec = a.sumDec.add(inc);
         a.seen = true;
       }
       break;
     case "avg":
       if (v.kind !== "null") {
-        a.sumDec = a.sumDec.add(toDecimal(v));
+        const inc = toDecimal(v);
+        m.charge(COSTS.decimalWork * BigInt(workLinear(a.sumDec, inc) - 1));
+        m.guard();
+        a.sumDec = a.sumDec.add(inc);
         a.count += 1n;
       }
       break;
@@ -3735,6 +3744,10 @@ function inMembership(lv: Value, list: Value[], negated: boolean, m: Meter): Val
   let anyNull = false;
   for (const v of list) {
     m.charge(COSTS.operatorEval);
+    // Each element comparison over a decimal pair charges its size-scaled decimal_work
+    // (spec/design/cost.md §3 "decimal_work"), like a compare node.
+    m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(lv, v) - 1));
+    m.guard();
     const t = eq3(lv, v);
     if (t === "true") anyMatch = true;
     else if (t === "unknown") anyNull = true;
@@ -3809,8 +3822,14 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (a.kind === "null" || b.kind === "null") return nullValue();
       if (isDecimal(e.result)) {
         // Decimal arithmetic: widen any integer operand to decimal, then apply the op with
-        // PG's scale rules (spec/design/decimal.md §4).
-        return decimalValue(evalDecimalArith(e.op, toDecimal(a), toDecimal(b)));
+        // PG's scale rules (spec/design/decimal.md §4). The size-scaled decimal_work is
+        // charged BEFORE the operation runs, so a cost ceiling aborts ahead of the limb
+        // work (spec/design/cost.md §3 "decimal_work").
+        const da = toDecimal(a);
+        const db = toDecimal(b);
+        m.charge(COSTS.decimalWork * BigInt(decimalArithWork(e.op, da, db) - 1));
+        m.guard();
+        return decimalValue(evalDecimalArith(e.op, da, db));
       }
       if (a.kind !== "int" || b.kind !== "int") throw typeError("internal: non-integer arithmetic");
       return evalArith(e.op, a.int, b.int, e.result);
@@ -3819,6 +3838,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const a = evalExpr(e.lhs, row, env, m);
       const b = evalExpr(e.rhs, row, env, m);
+      // A decimal(-promotable) pair charges size-scaled decimal_work — once per node, even
+      // where <=/>= decompose internally (spec/design/cost.md §3 "decimal_work").
+      m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(a, b) - 1));
+      m.guard();
       switch (e.op) {
         case "eq":
           return from3(eq3(a, b));
@@ -3851,7 +3874,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
     }
     case "distinct": {
       m.charge(COSTS.operatorEval);
-      const same = notDistinctFrom(evalExpr(e.lhs, row, env, m), evalExpr(e.rhs, row, env, m));
+      const dl = evalExpr(e.lhs, row, env, m);
+      const dr = evalExpr(e.rhs, row, env, m);
+      // IS [NOT] DISTINCT FROM is a comparison: a decimal pair charges its size-scaled
+      // decimal_work like "compare" (spec/design/cost.md §3 "decimal_work").
+      m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(dl, dr) - 1));
+      m.guard();
+      const same = notDistinctFrom(dl, dr);
       // negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
       // the same?"; IS DISTINCT FROM asks the opposite. Always a definite boolean — never
       // unknown (the null_safe discipline, functions.md §3).
@@ -4055,6 +4084,33 @@ function toDecimal(v: Value): Decimal {
   if (v.kind === "decimal") return v.dec;
   if (v.kind === "int") return Decimal.fromBigInt(v.int);
   throw typeError("internal: non-numeric decimal operand");
+}
+
+// decimalArithWork is the decimal_work W of an arithmetic node — which group-count formula
+// applies per op (spec/design/cost.md §3 "decimal_work"). The evaluator charges W − 1 before
+// the op runs.
+function decimalArithWork(op: BinaryOp, a: Decimal, b: Decimal): number {
+  switch (op) {
+    case "add":
+    case "sub":
+      return workLinear(a, b);
+    case "mul":
+      return workMul(a, b);
+    case "div":
+      return workDiv(a, b);
+    default: // "mod"
+      return workMod(a, b);
+  }
+}
+
+// decimalCmpWork is the decimal_work W of a comparison over a decimal(-promotable) pair — the
+// aligned linear formula after int→decimal promotion; 1 (no charge) for any other pair,
+// including a NULL side, where no decimal compare runs (spec/design/cost.md §3 "decimal_work").
+function decimalCmpWork(a: Value, b: Value): number {
+  if (a.kind === "decimal" && b.kind === "decimal") return workLinear(a.dec, b.dec);
+  if (a.kind === "decimal" && b.kind === "int") return workLinear(a.dec, Decimal.fromBigInt(b.int));
+  if (a.kind === "int" && b.kind === "decimal") return workLinear(Decimal.fromBigInt(a.int), b.dec);
+  return 1;
 }
 
 // evalDecimalArith evaluates decimal arithmetic with PG's result-scale rules

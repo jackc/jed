@@ -83,6 +83,20 @@ event  = "one C-byte slab of decompressed payload reconstructed by the LZ4 decod
 # computable from the stored raw_len alone — logical and cross-core identical.
 
 [[unit]]
+id     = "decimal_work"
+weight = 1
+event  = "one base-10^4 digit group of decimal arithmetic work beyond an operation's first"
+# Landed with the decimal cap lift (../design/decimal.md §2/§6, ../design/cost.md §3
+# "decimal_work"). A decimal arithmetic or comparison evaluation fires this unit W - 1 times,
+# where W is the operation's work in base-10^4 digit groups (the on-disk digit unit, so the
+# count is independent of each core's internal limb base): add/sub/compare/mod scale with the
+# larger aligned operand, mul/div with the PRODUCT of their operands' group counts — the
+# schoolbook-quadratic work an untrusted query can drive now that values reach PG's format
+# caps (131072 integer + 16383 fractional digits, CLAUDE.md §13). Charged BEFORE the
+# operation runs, so a cost ceiling aborts ahead of the work. Operands of <= 4 aligned digits
+# have W = 1 and charge nothing — small-decimal costs are unchanged.
+
+[[unit]]
 id     = "row_produced"
 weight = 1
 event  = "one row emitted into a query result set"

@@ -2294,7 +2294,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 						return selectResult{}, verr
 					}
 				}
-				if ferr := groups[gi].accs[i].fold(v); ferr != nil {
+				if ferr := groups[gi].accs[i].fold(v, meter); ferr != nil {
 					return selectResult{}, ferr
 				}
 			}
@@ -2706,14 +2706,20 @@ func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
 // = TRUE) independent of lv. Otherwise: a positive match -> TRUE; else a NULL element (or NULL lv)
 // -> NULL; else FALSE. NOT IN is the Kleene negation. Shared by reInValues and the correlated
 // reSubquery/sqIn eval.
-func inMembership(lv Value, list []Value, negated bool, m *Meter) Value {
+func inMembership(lv Value, list []Value, negated bool, m *Meter) (Value, error) {
 	if len(list) == 0 {
-		return BoolValue(negated)
+		return BoolValue(negated), nil
 	}
 	anyMatch := false
 	anyNull := false
 	for _, v := range list {
 		m.Charge(Costs.OperatorEval)
+		// Each element comparison over a decimal pair charges its size-scaled decimal_work
+		// (spec/design/cost.md §3 "decimal_work"), like a compare node.
+		m.Charge(Costs.DecimalWork * (decimalCmpWork(lv, v) - 1))
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
 		switch lv.Eq3(v) {
 		case True:
 			anyMatch = true
@@ -2731,9 +2737,9 @@ func inMembership(lv Value, list []Value, negated bool, m *Meter) Value {
 		inVal = BoolValue(false)
 	}
 	if negated {
-		return boolNot(inVal)
+		return boolNot(inVal), nil
 	}
-	return inVal
+	return inVal, nil
 }
 
 // valueToRExpr builds the constant rExpr for a folded subquery value (§26). The static type is
@@ -3249,7 +3255,10 @@ func newAcc(plan aggPlan) *acc {
 
 // fold folds one input value into the accumulator. NULL arguments are skipped (COUNT(*)
 // ignores the value and always counts). Traps 22003 on SUM/AVG overflow at the result bound.
-func (a *acc) fold(v Value) error {
+// A decimal SUM/AVG fold charges size-scaled decimal_work against the running accumulator
+// (the `+` formula — spec/design/cost.md §3 "decimal_work"); MIN/MAX folds are direct Value
+// compares like the sort's and stay unmetered.
+func (a *acc) fold(v Value, m *Meter) error {
 	switch a.plan {
 	case planCountStar:
 		a.count++
@@ -3268,7 +3277,12 @@ func (a *acc) fold(v Value) error {
 		}
 	case planSumDecimal:
 		if !v.IsNull() {
-			d, err := a.sumDec.Add(toDecimal(v))
+			in := toDecimal(v)
+			m.Charge(Costs.DecimalWork * (WorkLinear(a.sumDec, in) - 1))
+			if err := m.Guard(); err != nil {
+				return err
+			}
+			d, err := a.sumDec.Add(in)
 			if err != nil {
 				return err
 			}
@@ -3277,7 +3291,12 @@ func (a *acc) fold(v Value) error {
 		}
 	case planAvg:
 		if !v.IsNull() {
-			d, err := a.sumDec.Add(toDecimal(v))
+			in := toDecimal(v)
+			m.Charge(Costs.DecimalWork * (WorkLinear(a.sumDec, in) - 1))
+			if err := m.Guard(); err != nil {
+				return err
+			}
+			d, err := a.sumDec.Add(in)
 			if err != nil {
 				return err
 			}
@@ -4772,8 +4791,15 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		if e.result.IsDecimal() {
 			// Decimal arithmetic: widen any integer operand to decimal, then apply the op with
-			// PG's scale rules (spec/design/decimal.md §4).
-			return evalDecimalArith(e.op, toDecimal(a), toDecimal(b))
+			// PG's scale rules (spec/design/decimal.md §4). The size-scaled decimal_work is
+			// charged BEFORE the operation runs, so a cost ceiling aborts ahead of the limb
+			// work (spec/design/cost.md §3 "decimal_work").
+			da, db := toDecimal(a), toDecimal(b)
+			m.Charge(Costs.DecimalWork * (decimalArithWork(e.op, da, db) - 1))
+			if err := m.Guard(); err != nil {
+				return Value{}, err
+			}
+			return evalDecimalArith(e.op, da, db)
 		}
 		return evalArith(e.op, a.Int, b.Int, e.result)
 	case reCompare:
@@ -4784,6 +4810,12 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		b, err := e.rhs.eval(row, env, m)
 		if err != nil {
+			return Value{}, err
+		}
+		// A decimal(-promotable) pair charges size-scaled decimal_work — once per node, even
+		// where <=/>= decompose internally (spec/design/cost.md §3 "decimal_work").
+		m.Charge(Costs.DecimalWork * (decimalCmpWork(a, b) - 1))
+		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
 		switch e.op {
@@ -4917,7 +4949,11 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			if len(vals) > 1 {
 				places = vals[1].Int
 			}
-			return DecimalValue(d.RoundPlaces(places)), nil
+			r, err := d.RoundPlaces(places)
+			if err != nil {
+				return Value{}, err
+			}
+			return DecimalValue(r), nil
 		}
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
@@ -4953,7 +4989,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			for i, rr := range r.rows {
 				list[i] = rr[0]
 			}
-			return inMembership(lv, list, e.negated, m), nil
+			return inMembership(lv, list, e.negated, m)
 		}
 	case reInValues:
 		// A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.
@@ -4962,7 +4998,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return inMembership(lv, e.list, e.negated, m), nil
+		return inMembership(lv, e.list, e.negated, m)
 	default: // reDistinct
 		m.Charge(Costs.OperatorEval)
 		a, err := e.lhs.eval(row, env, m)
@@ -4971,6 +5007,12 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		b, err := e.rhs.eval(row, env, m)
 		if err != nil {
+			return Value{}, err
+		}
+		// IS [NOT] DISTINCT FROM is a comparison: a decimal pair charges its size-scaled
+		// decimal_work like reCompare (spec/design/cost.md §3 "decimal_work").
+		m.Charge(Costs.DecimalWork * (decimalCmpWork(a, b) - 1))
+		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
 		// negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
@@ -5119,6 +5161,38 @@ func toDecimal(v Value) Decimal {
 		return *v.Dec
 	}
 	return DecimalFromInt64(v.Int)
+}
+
+// decimalArithWork is the decimal_work W of an arithmetic node — which group-count formula
+// applies per op (spec/design/cost.md §3 "decimal_work"). The evaluator charges W − 1 before
+// the op runs.
+func decimalArithWork(op BinaryOp, a, b Decimal) int64 {
+	switch op {
+	case OpAdd, OpSub:
+		return WorkLinear(a, b)
+	case OpMul:
+		return WorkMul(a, b)
+	case OpDiv:
+		return WorkDiv(a, b)
+	default: // OpMod
+		return WorkMod(a, b)
+	}
+}
+
+// decimalCmpWork is the decimal_work W of a comparison over a decimal(-promotable) pair — the
+// aligned linear formula after int→decimal promotion; 1 (no charge) for any other pair,
+// including a NULL side, where no decimal compare runs (spec/design/cost.md §3 "decimal_work").
+func decimalCmpWork(a, b Value) int64 {
+	switch {
+	case a.Kind == ValDecimal && b.Kind == ValDecimal:
+		return WorkLinear(*a.Dec, *b.Dec)
+	case a.Kind == ValDecimal && b.Kind == ValInt:
+		return WorkLinear(*a.Dec, DecimalFromInt64(b.Int))
+	case a.Kind == ValInt && b.Kind == ValDecimal:
+		return WorkLinear(DecimalFromInt64(a.Int), *b.Dec)
+	default:
+		return 1
+	}
 }
 
 // evalDecimalArith evaluates decimal arithmetic with PG's result-scale rules

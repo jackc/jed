@@ -141,6 +141,9 @@ func TestScalarTypesMatchSpec(t *testing.T) {
 	if got, want := decimal.int("max_scale"), int64(MaxScale); got != want {
 		t.Errorf("max_scale: spec %d, module %d", got, want)
 	}
+	if got, want := decimal.int("max_int_digits"), int64(MaxIntDigits); got != want {
+		t.Errorf("max_int_digits: spec %d, module %d", got, want)
+	}
 
 	// uuid: storable, the uuid family, fixed-width (the first non-integer with a width_bytes).
 	// Its on-disk width (16) is a cross-core contract, so cross-check it against the spec.
@@ -329,6 +332,8 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.ValueCompress
 		case "value_decompress":
 			return Costs.ValueDecompress
+		case "decimal_work":
+			return Costs.DecimalWork
 		case "row_produced":
 			return Costs.RowProduced
 		case "operator_eval":

@@ -13,10 +13,16 @@ import { engineError, type EngineError } from "./errors.ts";
 
 const BASE = 10000; // 10^4: a limb holds 4 digits; products fit JS safe integers
 const BASE_DIGITS = 4;
-// Max total significant digits (precision) — spec/types/scalars.toml max_precision.
+// Max DECLARABLE precision of numeric(p,s), and the division display-scale clamp —
+// spec/types/scalars.toml max_precision (PG NUMERIC_MAX_PRECISION, which is also its
+// NUMERIC_MAX_DISPLAY_SCALE). NOT a cap on what an unconstrained value may carry.
 export const MAX_PRECISION = 1000;
-// Max digits after the point (scale) — spec/types/scalars.toml max_scale.
-export const MAX_SCALE = 1000;
+// Max integer-part digits ANY value may carry — spec/types/scalars.toml max_int_digits
+// (PG (NUMERIC_WEIGHT_MAX + 1) * DEC_DIGITS; spec/design/decimal.md §2).
+export const MAX_INT_DIGITS = 131072;
+// Max digits after the point ANY value may carry — spec/types/scalars.toml max_scale
+// (PG NUMERIC_DSCALE_MAX; spec/design/decimal.md §2).
+export const MAX_SCALE = 16383;
 
 function overflow(): EngineError {
   return engineError("numeric_value_out_of_range", "value out of range for type decimal");
@@ -81,9 +87,13 @@ export class Decimal {
     return magDigitCount(this.limbs);
   }
 
-  // checkCap traps 22003 if this (unconstrained) value exceeds the precision/scale caps.
+  // checkCap traps 22003 if this (unconstrained) value exceeds the numeric-format caps
+  // (spec/design/decimal.md §2): more than MAX_INT_DIGITS integer-part digits or a scale
+  // over MAX_SCALE — PG's make_result / numeric_in checks.
   checkCap(): Decimal {
-    if (this.precision() > MAX_PRECISION || this.scale > MAX_SCALE) throw overflow();
+    const p = this.precision();
+    const intDigits = p > this.scale ? p - this.scale : 0;
+    if (intDigits > MAX_INT_DIGITS || this.scale > MAX_SCALE) throw overflow();
     return this;
   }
 
@@ -149,9 +159,14 @@ export class Decimal {
     return this.add(o.negate());
   }
 
-  // mul is exact multiplication, result scale s1+s2; traps 22003 at the cap.
+  // mul is exact multiplication, result scale s1+s2; traps 22003 at the integer-digit cap.
+  // A product scale over MAX_SCALE ROUNDS to it instead of trapping (PG numeric_mul rounds
+  // the exact product — spec/design/decimal.md §2).
   mul(o: Decimal): Decimal {
-    return Decimal.fromParts(this.neg !== o.neg, this.scale + o.scale, magMul(this.limbs, o.limbs)).checkCap();
+    const scale = this.scale + o.scale;
+    let exact = Decimal.fromParts(this.neg !== o.neg, scale, magMul(this.limbs, o.limbs));
+    if (scale > MAX_SCALE) exact = exact.roundToScale(MAX_SCALE);
+    return exact.checkCap();
   }
 
   // div is this / o with PG's select_div_scale result scale, rounded half away from zero
@@ -200,12 +215,13 @@ export class Decimal {
   }
 
   // roundPlaces is PG round(numeric, n) (spec/design/functions.md §9): round half away from zero
-  // to n fractional places. n >= 0 rounds to scale n (delegating to roundToScale, capped at
-  // MAX_SCALE); n < 0 rounds to the LEFT of the point — result scale 0, value a multiple of
-  // 10^-n (round(150, -2) = 200). roundPlaces(0) is round(x).
+  // to n fractional places. n >= 0 rounds to scale n (delegating to roundToScale, with n clamped
+  // at MAX_SCALE like PG numeric_round); n < 0 rounds to the LEFT of the point — result scale 0,
+  // value a multiple of 10^-n (round(150, -2) = 200). roundPlaces(0) is round(x). Traps 22003
+  // when the round-up carry pushes a value at the integer-digit cap over it (decimal.md §4).
   roundPlaces(n: number): Decimal {
     if (n >= 0) {
-      return this.roundToScale(Math.min(n, MAX_SCALE));
+      return this.roundToScale(Math.min(n, MAX_SCALE)).checkCap();
     }
     // Drop this.scale + k digits of the magnitude (rounding half away), then re-append the k
     // integer zeros. k is capped at the digit count + 1: beyond that every value rounds to 0
@@ -215,7 +231,7 @@ export class Decimal {
     const [q, r] = magDivMod(this.limbs, pow);
     let quo = q;
     if (magCmp(magAdd(r, r), pow) >= 0) quo = magAdd(quo, [1]);
-    return Decimal.fromParts(this.neg, 0, magMulPow10(quo, k));
+    return Decimal.fromParts(this.neg, 0, magMulPow10(quo, k)).checkCap();
   }
 
   // coerceToTypmod coerces into numeric(precision, scale): round to scale (half away), then
@@ -264,7 +280,9 @@ function selectDivScale(a: Decimal, b: Decimal): number {
   if (f1 <= f2) qweight--;
   let rscale = 16 - 4 * qweight;
   rscale = Math.max(rscale, a.scale, b.scale, 0);
-  rscale = Math.min(rscale, MAX_SCALE);
+  // PG's display-scale clamp: NUMERIC_MAX_DISPLAY_SCALE = NUMERIC_MAX_PRECISION (1000),
+  // deliberately NOT the MAX_SCALE value cap (spec/design/decimal.md §4).
+  rscale = Math.min(rscale, MAX_PRECISION);
   return rscale;
 }
 
@@ -282,6 +300,55 @@ function nbase4WeightLead(d: Decimal): [number, number] {
     f = f * 10 + (i < s.length ? s.charCodeAt(i) - 48 : 0);
   }
   return [w, f];
+}
+
+// ============================================================================
+// decimal_work group counts (spec/design/cost.md §3 "decimal_work") — an operation's work W
+// in base-10⁴ digit groups, computed from LOGICAL significant-digit counts, never from this
+// core's internal limb count (the cross-core contract, decimal.md §7 #11; this core's limbs
+// happen to be base-10⁴ too, but the contract is the logical digit count). All return
+// W >= 1; the evaluator charges decimal_work × (W − 1) as a bigint.
+// ============================================================================
+
+// max(1, ceil(n/4)) — the base-10⁴ group count of an n-digit coefficient.
+function decGroups(n: number): number {
+  return Math.max(1, Math.ceil(n / 4));
+}
+
+// Both operands' digit counts after aligning to the common scale max(s1, s2) (the digit count
+// once the lower-scale coefficient is multiplied up — exactly the add/sub/cmp work).
+function alignedDigits(a: Decimal, b: Decimal): [number, number] {
+  const s = Math.max(a.scale, b.scale);
+  return [a.precision() + (s - a.scale), b.precision() + (s - b.scale)];
+}
+
+// W for add/sub/compare: the larger aligned operand.
+export function workLinear(a: Decimal, b: Decimal): number {
+  const [a1, a2] = alignedDigits(a, b);
+  return Math.max(decGroups(a1), decGroups(a2));
+}
+
+// W for mul: the product of the (unaligned) operand group counts — schoolbook-quadratic.
+export function workMul(a: Decimal, b: Decimal): number {
+  return decGroups(a.precision()) * decGroups(b.precision());
+}
+
+// W for div: numerator groups (dividend digits + the rescale shift E) × divisor groups,
+// E = rscale + s2 − s1 with the same selectDivScale as the result. A zero divisor returns 1 —
+// the operation traps 22012 before any work (cost.md §3).
+export function workDiv(a: Decimal, b: Decimal): number {
+  if (b.isZero()) return 1;
+  const rscale = selectDivScale(a, b);
+  const e = rscale + b.scale - a.scale; // >= 0 since rscale >= s1
+  return decGroups(a.precision() + e) * decGroups(b.precision());
+}
+
+// W for mod: the aligned divmod — the product of the aligned group counts. A zero divisor
+// returns 1.
+export function workMod(a: Decimal, b: Decimal): number {
+  if (b.isZero()) return 1;
+  const [a1, a2] = alignedDigits(a, b);
+  return decGroups(a1) * decGroups(a2);
 }
 
 // ============================================================================

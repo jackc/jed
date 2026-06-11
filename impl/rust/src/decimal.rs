@@ -14,10 +14,16 @@ use crate::error::{EngineError, Result, SqlState};
 const BASE: u64 = 1_000_000_000;
 /// Decimal digits per limb.
 const BASE_DIGITS: u32 = 9;
-/// Max total significant digits (precision) — spec/types/scalars.toml `max_precision`.
+/// Max DECLARABLE precision of `numeric(p,s)`, and the division display-scale clamp —
+/// spec/types/scalars.toml `max_precision` (PG `NUMERIC_MAX_PRECISION`, which is also its
+/// `NUMERIC_MAX_DISPLAY_SCALE`). NOT a cap on what an unconstrained value may carry.
 pub const MAX_PRECISION: u32 = 1000;
-/// Max digits after the point (scale) — spec/types/scalars.toml `max_scale`.
-pub const MAX_SCALE: u32 = 1000;
+/// Max integer-part digits ANY value may carry — spec/types/scalars.toml `max_int_digits`
+/// (PG `(NUMERIC_WEIGHT_MAX + 1) * DEC_DIGITS`; spec/design/decimal.md §2).
+pub const MAX_INT_DIGITS: u32 = 131072;
+/// Max digits after the point ANY value may carry — spec/types/scalars.toml `max_scale`
+/// (PG `NUMERIC_DSCALE_MAX`; spec/design/decimal.md §2).
+pub const MAX_SCALE: u32 = 16383;
 
 /// An exact base-10 decimal. `neg` is the sign (always `false` for zero — no negative zero);
 /// `scale` is the display scale; `limbs` is the coefficient magnitude (base 10^9, LSB-first,
@@ -89,9 +95,11 @@ impl Decimal {
         mag_digit_count(&self.limbs)
     }
 
-    /// Trap 22003 if this (unconstrained) value exceeds the precision/scale caps.
+    /// Trap 22003 if this (unconstrained) value exceeds the numeric-format caps
+    /// (spec/design/decimal.md §2): more than `MAX_INT_DIGITS` integer-part digits or a
+    /// scale over `MAX_SCALE` — PG's `make_result` / `numeric_in` checks.
     pub fn check_cap(self) -> Result<Decimal> {
-        if self.precision() > MAX_PRECISION || self.scale > MAX_SCALE {
+        if self.precision().saturating_sub(self.scale) > MAX_INT_DIGITS || self.scale > MAX_SCALE {
             return Err(overflow());
         }
         Ok(self)
@@ -186,11 +194,19 @@ impl Decimal {
         self.add(&other.neg())
     }
 
-    /// `self * other`, exact, result scale `s1 + s2`; traps 22003 at the cap.
+    /// `self * other`, exact, result scale `s1 + s2`; traps 22003 at the integer-digit cap.
+    /// A product scale over `MAX_SCALE` ROUNDS to it instead of trapping (PG `numeric_mul`
+    /// rounds the exact product — spec/design/decimal.md §2).
     pub fn mul(&self, other: &Decimal) -> Result<Decimal> {
         let scale = self.scale + other.scale;
         let neg = self.neg ^ other.neg;
-        Decimal::from_parts(neg, scale, mag_mul(&self.limbs, &other.limbs)).check_cap()
+        let exact = Decimal::from_parts(neg, scale, mag_mul(&self.limbs, &other.limbs));
+        let r = if scale > MAX_SCALE {
+            exact.round_to_scale(MAX_SCALE)
+        } else {
+            exact
+        };
+        r.check_cap()
     }
 
     /// `self / other` with PostgreSQL's `select_div_scale` result scale, rounded half away
@@ -255,17 +271,21 @@ impl Decimal {
     }
 
     /// PG `round(numeric, n)` (spec/design/functions.md §9): round half away from zero to `n`
-    /// fractional places. `n >= 0` rounds to scale `n` (delegating to `round_to_scale`, capped
-    /// at `MAX_SCALE`); `n < 0` rounds to the LEFT of the point — result scale 0, value a
-    /// multiple of `10^-n` (`round(150, -2) = 200`). `round(x)` is `round_places(0)`.
-    pub fn round_places(&self, n: i64) -> Decimal {
+    /// fractional places. `n >= 0` rounds to scale `n` (delegating to `round_to_scale`, with
+    /// `n` clamped at `MAX_SCALE` like PG `numeric_round`); `n < 0` rounds to the LEFT of the
+    /// point — result scale 0, value a multiple of `10^-n` (`round(150, -2) = 200`).
+    /// `round(x)` is `round_places(0)`. Traps 22003 when the round-up carry pushes a value at
+    /// the integer-digit cap over it (spec/design/decimal.md §4).
+    pub fn round_places(&self, n: i64) -> Result<Decimal> {
         if n >= 0 {
-            return self.round_to_scale((n as u32).min(MAX_SCALE));
+            return self
+                .round_to_scale(n.min(MAX_SCALE as i64) as u32)
+                .check_cap();
         }
         // Drop `self.scale + k` digits of the magnitude (rounding half away), then re-append
         // the k integer zeros. `k` is capped at the digit count + 1: beyond that every value
         // rounds to 0 (or a single carried `1`), so the clamp changes no result but bounds work.
-        let k = ((-n) as u32).min(self.precision() + 1);
+        let k = n.unsigned_abs().min((self.precision() + 1) as u64) as u32;
         let drop = self.scale + k;
         let pow = mag_pow10(drop);
         let (mut q, r) = mag_divmod(&self.limbs, &pow);
@@ -273,7 +293,7 @@ impl Decimal {
             q = mag_add(&q, &[1]);
         }
         let scaled = mag_mul_pow10(&q, k);
-        Decimal::from_parts(self.neg, 0, scaled)
+        Decimal::from_parts(self.neg, 0, scaled).check_cap()
     }
 
     /// Coerce into `numeric(precision, scale)`: round to `scale` (half away), then trap 22003
@@ -342,7 +362,9 @@ fn select_div_scale(a: &Decimal, b: &Decimal) -> u32 {
     }
     let mut rscale = 16 - 4 * qweight;
     rscale = rscale.max(a.scale as i64).max(b.scale as i64).max(0);
-    rscale = rscale.min(MAX_SCALE as i64);
+    // PG's display-scale clamp: NUMERIC_MAX_DISPLAY_SCALE = NUMERIC_MAX_PRECISION (1000),
+    // deliberately NOT the MAX_SCALE value cap (spec/design/decimal.md §4).
+    rscale = rscale.min(MAX_PRECISION as i64);
     rscale as u32
 }
 
@@ -368,6 +390,57 @@ fn nbase4_weight_lead(d: &Decimal) -> (i64, i64) {
         f = f * 10 + digit;
     }
     (w, f)
+}
+
+// ============================================================================
+// `decimal_work` group counts (spec/design/cost.md §3 "decimal_work") — an operation's
+// work W in base-10⁴ digit groups, computed from LOGICAL significant-digit counts, never
+// from this core's internal limb count (the cross-core contract, decimal.md §7 #11).
+// All return W >= 1; the evaluator charges `decimal_work` × (W − 1).
+// ============================================================================
+
+/// `max(1, ceil(n/4))` — the base-10⁴ group count of an `n`-digit coefficient.
+fn groups(n: u32) -> u64 {
+    (n as u64).div_ceil(4).max(1)
+}
+
+/// Both operands' digit counts after aligning to the common scale `max(s1, s2)` (the digit
+/// count once the lower-scale coefficient is multiplied up — exactly the add/sub/cmp work).
+fn aligned_digits(a: &Decimal, b: &Decimal) -> (u32, u32) {
+    let s = a.scale.max(b.scale);
+    (a.precision() + (s - a.scale), b.precision() + (s - b.scale))
+}
+
+/// W for add/sub/compare: the larger aligned operand.
+pub fn work_linear(a: &Decimal, b: &Decimal) -> u64 {
+    let (a1, a2) = aligned_digits(a, b);
+    groups(a1).max(groups(a2))
+}
+
+/// W for mul: the product of the (unaligned) operand group counts — schoolbook-quadratic.
+pub fn work_mul(a: &Decimal, b: &Decimal) -> u64 {
+    groups(a.precision()) * groups(b.precision())
+}
+
+/// W for div: numerator groups (dividend digits + the rescale shift `E`) × divisor groups,
+/// `E = rscale + s2 − s1` with the same `select_div_scale` as the result. A zero divisor
+/// returns 1 — the operation traps 22012 before any work (cost.md §3).
+pub fn work_div(a: &Decimal, b: &Decimal) -> u64 {
+    if b.is_zero() {
+        return 1;
+    }
+    let rscale = select_div_scale(a, b);
+    let e = rscale as i64 + b.scale as i64 - a.scale as i64; // >= 0 since rscale >= s1
+    groups(a.precision() + e as u32) * groups(b.precision())
+}
+
+/// W for mod: the aligned divmod — the product of the aligned group counts. Zero divisor → 1.
+pub fn work_mod(a: &Decimal, b: &Decimal) -> u64 {
+    if b.is_zero() {
+        return 1;
+    }
+    let (a1, a2) = aligned_digits(a, b);
+    groups(a1) * groups(a2)
 }
 
 // ============================================================================
@@ -799,6 +872,7 @@ mod tests {
     fn caps_match_spec() {
         // Cross-checked against spec/types/scalars.toml in the types cross-check test.
         assert_eq!(MAX_PRECISION, 1000);
-        assert_eq!(MAX_SCALE, 1000);
+        assert_eq!(MAX_SCALE, 16383);
+        assert_eq!(MAX_INT_DIGITS, 131072);
     }
 }

@@ -350,9 +350,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       **Deferred follow-ups:** decimal in a `PRIMARY KEY`/index (the order-preserving
       `decimal-order-preserving` key encoding is authored in `encoding.md §2.5` but unexercised
       — decimal PK is rejected `0A000`); scientific `e`-notation literals (`1.5e3`); negative /
-      `s>p` scale typmods (PG 15+); `round(x,n)` and other decimal functions; raising the
-      1000-digit / scale-1000 cap once over-page values land (overflow pages / TOAST —
-      [spec/design/large-values.md](spec/design/large-values.md), Phase 6).
+      `s>p` scale typmods (PG 15+); `round(x,n)` and other decimal functions. ~~Raising the
+      1000-digit / scale-1000 cap once over-page values land~~ — ✅ **done**: the cap is now
+      PostgreSQL's numeric format limit (131072 integer / 16383 fractional digits,
+      [spec/design/decimal.md](spec/design/decimal.md) §2), with multiplication rounding at
+      `max_scale` like PG and the new size-scaled `decimal_work` cost unit metering big-value
+      arithmetic ([spec/design/cost.md](spec/design/cost.md) §3 — CLAUDE.md §13).
 - [x] **`timestamp` / `timestamptz`** — done & committed across Rust/Go/TS (`1ee7027`). The
       PostgreSQL **instant** model (not the SQL-standard offset-bearing one): `timestamp` is a
       zoneless wall clock, `timestamptz` a UTC instant whose input offset normalizes to UTC then
@@ -832,7 +835,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
             dependency (a library fails §8 cross-core byte-identity — large-values.md §6); any
             later proposal stays gated on CLAUDE.md §14.
 
-      Unblocks the `decimal` 1000-digit cap and the `json`/`array` headline types.
+      Unblocked the `decimal` 1000-digit cap (✅ since lifted to PG's format limits — the
+      decimal entry above) and the `json`/`array` headline types.
       **Follow-on phase 1 ✅ landed — the touched-column cost contract** (large-values.md §14;
       cost.md §3 "The touched set"): a scan's chain-`page_read` / `value_decompress` block now
       charges only the columns the query statically references (collected depth-aware at plan

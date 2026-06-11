@@ -244,13 +244,34 @@ fn cross_family_and_assignment_type_errors() {
 
 #[test]
 fn unconstrained_cap_overflow_traps_22003() {
+    // The format caps are PG's (spec/design/decimal.md §2): 131072 integer digits and
+    // scale 16383. The ORIGINAL 1000/1000 cap is lifted — values past it now store fine.
     let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY, v numeric)"]);
-    // a literal with scale > 1000 overflows the cap.
-    let lit = format!("0.{}", "0".repeat(1001));
+    let over_old_cap = format!("0.{}1", "0".repeat(1001)); // scale 1002: legal now
+    execute(
+        &mut db,
+        &format!("INSERT INTO t VALUES (1, {over_old_cap})"),
+    )
+    .unwrap();
+    assert_eq!(one(&mut db, "SELECT v FROM t WHERE id = 1"), over_old_cap);
+
+    // scale > 16383 traps 22003 at resolve (PG numeric_in).
+    let over_scale = format!("0.{}1", "0".repeat(16383));
     assert_eq!(
-        err_code(&mut db, &format!("INSERT INTO t VALUES (1, {lit})")),
+        err_code(&mut db, &format!("INSERT INTO t VALUES (2, {over_scale})")),
         "22003"
     );
+    // integer digits > 131072 trap 22003 at resolve. (Dotted: a dot-less literal is an
+    // INTEGER literal, 42601 past i64 — types.md §6; the decimal path needs the `.`.)
+    let over_int = format!("1{}.0", "0".repeat(131072));
+    assert_eq!(
+        err_code(&mut db, &format!("INSERT INTO t VALUES (2, {over_int})")),
+        "22003"
+    );
+    // exactly AT both caps is legal, stores (spilling to overflow chains), and round-trips.
+    let at_caps = format!("1{}.{}1", "0".repeat(131071), "0".repeat(16382));
+    execute(&mut db, &format!("INSERT INTO t VALUES (3, {at_caps})")).unwrap();
+    assert_eq!(one(&mut db, "SELECT v FROM t WHERE id = 3"), at_caps);
 }
 
 #[test]
@@ -298,4 +319,44 @@ fn distinct_collapses_equal_values_across_scale() {
         rendered(&mut db, "SELECT DISTINCT v FROM t ORDER BY v"),
         [["1.5"], ["2.0"]]
     );
+}
+
+#[test]
+fn mul_result_scale_rounds_at_max_scale() {
+    // PG numeric_mul: an exact product whose scale exceeds max_scale (16383) ROUNDS to it,
+    // half away from zero, instead of trapping (spec/design/decimal.md §2). Mirrors
+    // impl/go/decimal_test.go and impl/ts/tests/decimal.test.ts.
+    let mut db = db_with(&[
+        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "INSERT INTO t VALUES (1)",
+    ]);
+    let tiny1 = format!("0.{}1", "0".repeat(8191)); // 1e-8192 (scale 8192)
+    let tiny5 = format!("0.{}5", "0".repeat(8191)); // 5e-8192
+    // 1e-8192 * 1e-8192 = 1e-16384: the dropped digit is 1 -> rounds DOWN to 0 at scale 16383.
+    assert_eq!(
+        one(&mut db, &format!("SELECT {tiny1} * {tiny1} = 0 FROM t")),
+        "true"
+    );
+    // 5e-8192 * 1e-8192 = 5e-16384: the dropped digit is 5 -> rounds UP to 1e-16383, nonzero.
+    assert_eq!(
+        one(&mut db, &format!("SELECT {tiny5} * {tiny1} = 0 FROM t")),
+        "false"
+    );
+}
+
+#[test]
+fn cost_ceiling_aborts_ahead_of_a_big_multiply() {
+    // decimal_work is charged and GUARDED before the limb work runs (spec/design/cost.md §3/§6),
+    // so a ceiling aborts a pathological multiply up front (CLAUDE.md §13). ~20000 digits is
+    // ~5000 groups; the mul W is ~25,000,000 — far over the tiny ceiling.
+    let mut db = db_with(&[
+        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "INSERT INTO t VALUES (1)",
+    ]);
+    let big = format!("{}.5", "9".repeat(20000));
+    db.set_max_cost(1000);
+    match execute(&mut db, &format!("SELECT {big} * {big} FROM t")) {
+        Err(e) => assert_eq!(e.code(), "54P01", "want the cost-limit abort"),
+        Ok(_) => panic!("expected the cost ceiling to abort the multiply"),
+    }
 }

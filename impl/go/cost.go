@@ -14,6 +14,7 @@ import "fmt"
 // Every unit routes through the single Charge chokepoint; the caller-set ceiling +
 // deterministic abort (spec/design/cost.md §6) is enforced by Guard, consulted at the
 // unbounded-work points (per scanned row, per produced row, per expression node, per
+// size-scaled decimal_work charge (immediately after it — cost.md §3), and per
 // aggregate fold) so a runaway query stops deterministically.
 
 // Meter accrues deterministic execution cost and enforces an optional ceiling (CLAUDE.md

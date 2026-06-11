@@ -45,8 +45,9 @@ The core seam units, all weight `1`:
 (`page_read` was **added** in P6.3 when the store became a page-backed B-tree — §3
 "`page_read`" — *alongside* `storage_row_read`, not a rename; the later
 `aggregate_accumulate` unit, [../cost/schedule.toml](../cost/schedule.toml), is metered in
-the aggregates path, and the `value_compress`/`value_decompress` units — §3 "the compression
-units" — in the large-value codec paths.) The weights are uniform on purpose — phase 1 proves the seam reads
+the aggregates path, the `value_compress`/`value_decompress` units — §3 "the compression
+units" — in the large-value codec paths, and the `decimal_work` unit — §3 "`decimal_work`"
+— in the decimal arithmetic/comparison evaluations.) The weights are uniform on purpose — phase 1 proves the seam reads
 cost from **data**; tuning the numbers later is a data-only change touching no executor code.
 
 ## 3. Accrual rules (the cross-core determinism contract)
@@ -78,7 +79,8 @@ TS; any deviation diverges the count and fails the corpus.
   `not`, `arith`, `compare`, `and`, `or`, `is_null`, `distinct`. **Leaf nodes — `column`
   and the constants (`int`/`bool`/`null`) — charge nothing.** Charging leaves would make
   cost track how many literals the parser happened to fold, an accidental property; cost
-  must track genuine evaluation work.
+  must track genuine evaluation work. A **decimal** arithmetic/comparison node additionally
+  charges size-scaled `decimal_work` — the dedicated subsection below.
 - **No short-circuit.** Both operands of every binary node (`and`, `or`, `compare`,
   `arith`, `distinct`) are **always** evaluated before the node charges its own
   `operator_eval`. This is already true — the Kleene helpers (`and3`/`or3`/`boolAnd`)
@@ -197,6 +199,59 @@ computable from the stored lengths alone, so the charge never requires re-runnin
   *store-smaller* — the encoder ran either way) charges `ceil(raw_len / C)`. Charged once per
   stored row version at the statement's write site, never for the B-tree's internal re-encodes.
   A record that fits inline-plain attempts nothing, so existing costs do not move.
+
+### `decimal_work` — size-scaled decimal arithmetic
+
+A decimal value can now reach PostgreSQL's format caps — 131072 integer + 16383 fractional
+digits ([decimal.md](decimal.md) §2) — so a single multiplication can be ~10⁹ limb operations.
+A flat `operator_eval` would let an untrusted query buy that CPU for one unit (§1, CLAUDE.md
+§13), so decimal arithmetic and comparison evaluations charge an **additional**
+`decimal_work × (W − 1)`, where **W is the operation's work in base-10⁴ digit groups** — the
+on-disk digit unit ([format.md](../fileformat/format.md)), deliberately **not** a core's
+internal limb base (Rust/Go use base-10⁹, TS base-10⁴; the group count is computed from the
+logical digit counts, identical everywhere).
+
+Definitions, with each operand taken **after** `int → decimal` promotion: `d` = significant
+digits of the coefficient (`0` for zero), `s` = display scale, and `q(n) = max(1, ceil(n/4))`.
+For the scale-aligning operations let `s* = max(s1, s2)` and `aᵢ = dᵢ + (s* − sᵢ)` (the digit
+count after the lower-scale coefficient is multiplied up). Then:
+
+| operation | W |
+|---|---|
+| compare (`=` `<>` `<` `<=` `>` `>=`, `IS [NOT] DISTINCT FROM`, one `IN`-list element) | `max(q(a1), q(a2))` |
+| `+` `−` | `max(q(a1), q(a2))` |
+| `*` | `q(d1) · q(d2)` |
+| `/` | `q(d1 + E) · q(d2)` with `E = rscale + s2 − s1` (`rscale` per `select_div_scale`, decimal.md §4) |
+| `%` | `q(a1) · q(a2)` |
+| `SUM`/`AVG` fold | the `+` formula, accumulator vs. input |
+
+The rules:
+
+- **Charged before the work runs, and immediately guarded.** The W − 1 units accrue *before*
+  the limb loop executes, and the charge is **immediately followed by a §6 ceiling guard** —
+  a new enforcement point alongside the per-node/per-row/per-fold guards — so a ceiling
+  aborts ahead of the expensive operation, not after it. The abort point stays deterministic
+  (the charge+guard is a single block at the owning node, after the node's `operator_eval`
+  and its operand evaluations, mirrored identically across cores).
+- **W − 1, not W.** The first group rides the operation's flat `operator_eval`. Operands of
+  ≤ 4 aligned digits — every int-promoted small constant, money, ordinary literals — have
+  W = 1 and charge **nothing**, so costs predating this unit are unchanged.
+- **A NULL operand charges nothing** (the operation short-circuits to NULL before any limb
+  work — same as its result rule). A **zero divisor/modulus charges nothing** and traps
+  `22012` (the trap precedes the work). A zero **dividend** still charges by the formula
+  (uniform, no special case; `d = 0` keeps it small).
+- **Comparison nodes charge once**, even where a core's `<=`/`>=` decomposes into
+  `lt3 OR eq3` internally (the "helpers are not separately charged" rule above).
+- **Aggregate folds**: each `SUM`/`AVG` accumulate over decimals charges the `+` formula
+  against the running accumulator (deterministic — rows fold in scan order, which is key
+  order). `MIN`/`MAX` folds are direct `Value` compares like the sort's, and stay unmetered
+  (the boundary below).
+- **Linear single-pass work stays flat**: unary `−` / `abs`, casts and `round`/typmod
+  rescale, literal parse, rendering, and the key-canonicalization in GROUP BY/DISTINCT are
+  all O(digits) one-pass over a value the scan already paid for (`page_read` chains +
+  `value_decompress`), with no quadratic blow-up — they keep their single flat charge (or
+  none, where they were already unmetered). The quadratic operations are the attack
+  surface; they are what scales.
 
 ### Bounded scan / point lookup — the pages a primary-key predicate touches
 
@@ -474,10 +529,11 @@ evaluation. It deliberately does **not** meter:
 - **Parse / plan / resolve** — these are per-statement (and the literal range-checks,
   type resolution, etc. happen once), not per-row execution.
 - **`ORDER BY` sort-internal comparisons** — the sort compares `Value`s directly, not
-  through the expression evaluator, so they are outside the `operator_eval` unit. This holds
-  for a **multi-key** sort too (each key's comparison is the same direct `Value` compare),
-  so adding keys or `NULLS FIRST|LAST` placement changes no cost. (A dedicated
-  sort-comparison unit could be added later if wanted; it is not in this slice.)
+  through the expression evaluator, so they are outside the `operator_eval` unit (and the
+  `decimal_work` unit — `MIN`/`MAX` folds are the same direct compare and share this
+  boundary). This holds for a **multi-key** sort too (each key's comparison is the same
+  direct `Value` compare), so adding keys or `NULLS FIRST|LAST` placement changes no cost.
+  (A dedicated sort-comparison unit could be added later if wanted; it is not in this slice.)
 - **`LIMIT` / `OFFSET` slicing** — selecting the output window is an index slice over the
   already-sorted rows, not evaluation work; like the sort it is unmetered. Its only cost
   effect is *fewer* `row_produced`/projection charges (the excluded rows are never
@@ -533,7 +589,9 @@ It is now built:
   `ceiling − 1` completes. `guard()` is consulted at the **unbounded-work points** — once per
   scanned row (the SELECT/JOIN materialization, the DELETE and UPDATE scans, the streaming
   LIMIT walk), once per produced row, once per expression node (the recursive evaluator's
-  entry), and once per aggregate fold row. These points are **mirrored identically across
+  entry), once per aggregate fold row, and **immediately after each size-scaled
+  `decimal_work` charge** (§3 — so the ceiling aborts *before* the big-decimal limb work
+  runs, not at the next node). These points are **mirrored identically across
   Rust, Go, and TS**, and accrual order is fixed (§3), so the abort is deterministic and
   **cross-core identical**: the same `(query, db, ceiling)` aborts (or completes) in every
   core. A subquery executes through the same path with the same `max_cost`, so a runaway

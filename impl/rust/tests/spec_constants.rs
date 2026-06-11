@@ -139,6 +139,11 @@ fn scalar_types_match_spec() {
         jed::decimal::MAX_SCALE,
         "max_scale matches the decimal module"
     );
+    assert_eq!(
+        decimal["max_int_digits"].as_integer().unwrap() as u32,
+        jed::decimal::MAX_INT_DIGITS,
+        "max_int_digits matches the decimal module"
+    );
 
     // uuid: storable, the uuid family, fixed-width (the first non-integer with a width_bytes).
     // Its on-disk width (16) is a cross-core contract, so cross-check it against the spec.
@@ -350,6 +355,7 @@ fn cost_schedule_matches_spec() {
             "page_read" => COSTS.page_read,
             "value_compress" => COSTS.value_compress,
             "value_decompress" => COSTS.value_decompress,
+            "decimal_work" => COSTS.decimal_work,
             "row_produced" => COSTS.row_produced,
             "operator_eval" => COSTS.operator_eval,
             "aggregate_accumulate" => COSTS.aggregate_accumulate,

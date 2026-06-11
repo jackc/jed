@@ -919,7 +919,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     result: "decimal",
     null: "propagates",
     precedence: 0,
-    errors: [],
+    errors: ["22003"],
   },
   {
     name: "round",
@@ -930,7 +930,7 @@ export const OPERATORS: readonly OperatorDesc[] = [
     result: "decimal",
     null: "propagates",
     precedence: 0,
-    errors: [],
+    errors: ["22003"],
   },
   {
     name: "round",

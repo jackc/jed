@@ -17,10 +17,16 @@ import (
 const (
 	decBase       = uint64(1_000_000_000) // 10^9: a uint32 limb holds 9 digits
 	decBaseDigits = 9
-	// MaxPrecision is the max total significant digits — spec/types/scalars.toml max_precision.
+	// MaxPrecision is the max DECLARABLE precision of numeric(p,s), and the division
+	// display-scale clamp — spec/types/scalars.toml max_precision (PG NUMERIC_MAX_PRECISION,
+	// which is also its NUMERIC_MAX_DISPLAY_SCALE). NOT a cap on what a value may carry.
 	MaxPrecision = 1000
-	// MaxScale is the max digits after the point — spec/types/scalars.toml max_scale.
-	MaxScale = 1000
+	// MaxIntDigits is the max integer-part digits ANY value may carry — spec/types/
+	// scalars.toml max_int_digits (PG (NUMERIC_WEIGHT_MAX+1)*DEC_DIGITS; decimal.md §2).
+	MaxIntDigits = 131072
+	// MaxScale is the max digits after the point ANY value may carry — spec/types/
+	// scalars.toml max_scale (PG NUMERIC_DSCALE_MAX; decimal.md §2).
+	MaxScale = 16383
 )
 
 // Decimal is an exact base-10 decimal. Neg is the sign (always false for zero — no negative
@@ -76,9 +82,15 @@ func (d Decimal) IsZero() bool { return len(d.Limbs) == 0 }
 // Precision is the number of significant digits in the coefficient (0 for zero).
 func (d Decimal) Precision() uint32 { return magDigitCount(d.Limbs) }
 
-// CheckCap traps 22003 if this (unconstrained) value exceeds the precision/scale caps.
+// CheckCap traps 22003 if this (unconstrained) value exceeds the numeric-format caps
+// (spec/design/decimal.md §2): more than MaxIntDigits integer-part digits or a scale over
+// MaxScale — PG's make_result / numeric_in checks.
 func (d Decimal) CheckCap() (Decimal, error) {
-	if d.Precision() > MaxPrecision || d.Scale > MaxScale {
+	intDigits := uint32(0)
+	if p := d.Precision(); p > d.Scale {
+		intDigits = p - d.Scale
+	}
+	if intDigits > MaxIntDigits || d.Scale > MaxScale {
 		return Decimal{}, decimalOverflow()
 	}
 	return d, nil
@@ -187,9 +199,16 @@ func (d Decimal) Add(o Decimal) (Decimal, error) {
 // Sub is d - o (= d + (-o)).
 func (d Decimal) Sub(o Decimal) (Decimal, error) { return d.Add(o.Negate()) }
 
-// Mul is exact multiplication, result scale s1+s2; traps 22003 at the cap.
+// Mul is exact multiplication, result scale s1+s2; traps 22003 at the integer-digit cap.
+// A product scale over MaxScale ROUNDS to it instead of trapping (PG numeric_mul rounds the
+// exact product — spec/design/decimal.md §2).
 func (d Decimal) Mul(o Decimal) (Decimal, error) {
-	return newDecimal(d.Neg != o.Neg, d.Scale+o.Scale, magMul(d.Limbs, o.Limbs)).CheckCap()
+	scale := d.Scale + o.Scale
+	exact := newDecimal(d.Neg != o.Neg, scale, magMul(d.Limbs, o.Limbs))
+	if scale > MaxScale {
+		exact = exact.RoundToScale(MaxScale)
+	}
+	return exact.CheckCap()
 }
 
 // Div is d / o with PG's select_div_scale result scale, rounded half away from zero
@@ -249,30 +268,32 @@ func (d Decimal) Abs() Decimal {
 }
 
 // RoundPlaces is PG round(numeric, n) (spec/design/functions.md §9): round half away from zero
-// to n fractional places. n >= 0 rounds to scale n (delegating to RoundToScale, capped at
-// MaxScale); n < 0 rounds to the LEFT of the point — result scale 0, value a multiple of 10^-n
-// (round(150, -2) = 200). RoundPlaces(0) is round(x).
-func (d Decimal) RoundPlaces(n int64) Decimal {
+// to n fractional places. n >= 0 rounds to scale n (delegating to RoundToScale, with n clamped
+// at MaxScale like PG numeric_round); n < 0 rounds to the LEFT of the point — result scale 0,
+// value a multiple of 10^-n (round(150, -2) = 200). RoundPlaces(0) is round(x). Traps 22003
+// when the round-up carry pushes a value at the integer-digit cap over it (decimal.md §4).
+func (d Decimal) RoundPlaces(n int64) (Decimal, error) {
 	if n >= 0 {
-		target := uint32(n)
-		if n > int64(MaxScale) {
-			target = MaxScale
+		target := uint32(MaxScale)
+		if n < int64(MaxScale) {
+			target = uint32(n)
 		}
-		return d.RoundToScale(target)
+		return d.RoundToScale(target).CheckCap()
 	}
 	// Drop d.Scale + k digits of the magnitude (rounding half away), then re-append the k
 	// integer zeros. k is capped at the digit count + 1: beyond that every value rounds to 0
 	// (or a single carried 1), so the clamp changes no result but bounds the work.
-	k := uint32(-n)
-	if cap := d.Precision() + 1; k > cap {
-		k = cap
+	mag := uint64(-n) // two's-complement: the correct magnitude even for MinInt64
+	k := d.Precision() + 1
+	if mag < uint64(k) {
+		k = uint32(mag)
 	}
 	pow := magPow10(d.Scale + k)
 	q, r := magDivMod(d.Limbs, pow)
 	if magCmp(magAdd(r, r), pow) >= 0 {
 		q = magAdd(q, []uint32{1})
 	}
-	return newDecimal(d.Neg, 0, magMulPow10(q, k))
+	return newDecimal(d.Neg, 0, magMulPow10(q, k)).CheckCap()
 }
 
 // CoerceToTypmod coerces into numeric(precision, scale): round to scale (half away), then trap
@@ -355,8 +376,10 @@ func selectDivScale(a, b Decimal) uint32 {
 	if rscale < 0 {
 		rscale = 0
 	}
-	if rscale > MaxScale {
-		rscale = MaxScale
+	// PG's display-scale clamp: NUMERIC_MAX_DISPLAY_SCALE = NUMERIC_MAX_PRECISION (1000),
+	// deliberately NOT the MaxScale value cap (spec/design/decimal.md §4).
+	if rscale > MaxPrecision {
+		rscale = MaxPrecision
 	}
 	return uint32(rscale)
 }
@@ -389,6 +412,71 @@ func floorDiv4(e int64) int64 {
 		return e / 4
 	}
 	return -((-e + 3) / 4)
+}
+
+// ============================================================================
+// decimal_work group counts (spec/design/cost.md §3 "decimal_work") — an operation's work W
+// in base-10^4 digit groups, computed from LOGICAL significant-digit counts, never from this
+// core's internal limb count (the cross-core contract, decimal.md §7 #11). All return W >= 1;
+// the evaluator charges decimal_work × (W − 1).
+// ============================================================================
+
+// decGroups is max(1, ceil(n/4)) — the base-10^4 group count of an n-digit coefficient.
+func decGroups(n uint32) int64 {
+	g := (int64(n) + 3) / 4
+	if g < 1 {
+		g = 1
+	}
+	return g
+}
+
+// alignedDigits is both operands' digit counts after aligning to the common scale
+// max(s1, s2) (the digit count once the lower-scale coefficient is multiplied up — exactly
+// the add/sub/cmp work).
+func alignedDigits(a, b Decimal) (uint32, uint32) {
+	s := a.Scale
+	if b.Scale > s {
+		s = b.Scale
+	}
+	return a.Precision() + (s - a.Scale), b.Precision() + (s - b.Scale)
+}
+
+// WorkLinear is W for add/sub/compare: the larger aligned operand.
+func WorkLinear(a, b Decimal) int64 {
+	a1, a2 := alignedDigits(a, b)
+	g1, g2 := decGroups(a1), decGroups(a2)
+	if g1 > g2 {
+		return g1
+	}
+	return g2
+}
+
+// WorkMul is W for mul: the product of the (unaligned) operand group counts —
+// schoolbook-quadratic.
+func WorkMul(a, b Decimal) int64 {
+	return decGroups(a.Precision()) * decGroups(b.Precision())
+}
+
+// WorkDiv is W for div: numerator groups (dividend digits + the rescale shift E) × divisor
+// groups, E = rscale + s2 − s1 with the same selectDivScale as the result. A zero divisor
+// returns 1 — the operation traps 22012 before any work (cost.md §3).
+func WorkDiv(a, b Decimal) int64 {
+	if b.IsZero() {
+		return 1
+	}
+	rscale := selectDivScale(a, b)
+	e := int64(rscale) + int64(b.Scale) - int64(a.Scale) // >= 0 since rscale >= s1
+	return decGroups(a.Precision()+uint32(e)) * decGroups(b.Precision())
+}
+
+// WorkMod is W for mod: the aligned divmod — the product of the aligned group counts. A zero
+// divisor returns 1.
+func WorkMod(a, b Decimal) int64 {
+	if b.IsZero() {
+		return 1
+	}
+	a1, a2 := alignedDigits(a, b)
+	return decGroups(a1) * decGroups(a2)
 }
 
 // ============================================================================

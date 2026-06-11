@@ -944,7 +944,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         result: "decimal",
         null: "propagates",
         precedence: 0,
-        errors: &[],
+        errors: &["22003"],
     },
     OperatorDesc {
         name: "round",
@@ -956,7 +956,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         result: "decimal",
         null: "propagates",
         precedence: 0,
-        errors: &[],
+        errors: &["22003"],
     },
     OperatorDesc {
         name: "round",

@@ -1101,6 +1101,8 @@ result         = "promoted"
 null           = "propagates"
 errors         = []
 
+# round's carry can push a value at the integer-digit cap over it (decimal.md §2/§4) —
+# 22003, exactly PG. The integer overloads below cannot (an int64 is at most 19 digits).
 [[operator]]
 name           = "round"
 kind           = "function"
@@ -1109,7 +1111,7 @@ arg_families   = ["decimal"]
 arg_resolution = "none"
 result         = "decimal"
 null           = "propagates"
-errors         = []
+errors         = ["22003"]
 
 [[operator]]
 name           = "round"
@@ -1119,7 +1121,7 @@ arg_families   = ["decimal", "integer"]
 arg_resolution = "none"
 result         = "decimal"
 null           = "propagates"
-errors         = []
+errors         = ["22003"]
 
 [[operator]]
 name           = "round"

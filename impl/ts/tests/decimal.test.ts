@@ -199,3 +199,47 @@ test("DISTINCT collapses equal decimal values across scale", () => {
   ]);
   assert.deepStrictEqual(query(db, "SELECT DISTINCT v FROM t ORDER BY v"), [["1.5"], ["2.0"]]);
 });
+
+// The PG numeric-format caps (spec/design/decimal.md §2): the original 1000/1000 absolute cap
+// is lifted; the bounds are 131072 integer digits and scale 16383, 22003 past either; a value
+// AT both caps stores (spilling to overflow chains) and round-trips. Mirrors
+// impl/rust/tests/decimal.rs and impl/go/decimal_test.go.
+test("decimal format caps are PG's numeric limits", () => {
+  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY, v numeric)"]);
+  const overOld = "0." + "0".repeat(1001) + "1"; // scale 1002: legal now
+  execD(db, `INSERT INTO t VALUES (1, ${overOld})`);
+  assert.equal(one(db, "SELECT v FROM t WHERE id = 1"), overOld);
+  // scale > 16383 traps 22003 at resolve (PG numeric_in).
+  const overScale = "0." + "0".repeat(16383) + "1";
+  assert.equal(errCode(() => void execD(db, `INSERT INTO t VALUES (2, ${overScale})`)), "22003");
+  // integer digits > 131072 trap 22003 at resolve. (Dotted: a dot-less literal is an INTEGER
+  // literal, 42601 past i64 — types.md §6; the decimal path needs the `.`.)
+  const overInt = "1" + "0".repeat(131072) + ".0";
+  assert.equal(errCode(() => void execD(db, `INSERT INTO t VALUES (2, ${overInt})`)), "22003");
+  // exactly AT both caps is legal, stores, and round-trips.
+  const atCaps = "1" + "0".repeat(131071) + "." + "0".repeat(16382) + "1";
+  execD(db, `INSERT INTO t VALUES (3, ${atCaps})`);
+  assert.equal(one(db, "SELECT v FROM t WHERE id = 3"), atCaps);
+});
+
+// PG numeric_mul's rounding: an exact product whose scale exceeds max_scale (16383) ROUNDS to
+// it, half away from zero, instead of trapping (spec/design/decimal.md §2).
+test("decimal mul rounds its result scale at max_scale", () => {
+  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)", "INSERT INTO t VALUES (1)"]);
+  const tiny1 = "0." + "0".repeat(8191) + "1"; // 1e-8192 (scale 8192)
+  const tiny5 = "0." + "0".repeat(8191) + "5"; // 5e-8192
+  // 1e-8192 * 1e-8192 = 1e-16384: the dropped digit is 1 -> rounds DOWN to 0 at scale 16383.
+  assert.equal(one(db, `SELECT ${tiny1} * ${tiny1} = 0 FROM t`), "true");
+  // 5e-8192 * 1e-8192 = 5e-16384: the dropped digit is 5 -> rounds UP to 1e-16383, nonzero.
+  assert.equal(one(db, `SELECT ${tiny5} * ${tiny1} = 0 FROM t`), "false");
+});
+
+// decimal_work is charged and GUARDED before the limb work runs (spec/design/cost.md §3/§6),
+// so a ceiling aborts a pathological multiply up front (CLAUDE.md §13). ~20000 digits is
+// ~5000 groups; the mul W is ~25,000,000 — far over the tiny ceiling.
+test("decimal cost ceiling aborts ahead of a big multiply", () => {
+  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)", "INSERT INTO t VALUES (1)"]);
+  const big = "9".repeat(20000) + ".5";
+  db.setMaxCost(1000n);
+  assert.equal(errCode(() => void execD(db, `SELECT ${big} * ${big} FROM t`)), "54P01");
+});

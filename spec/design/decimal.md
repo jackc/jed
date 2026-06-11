@@ -61,7 +61,7 @@ power-of-ten split, authored once with fixtures.
 Three forms, matching PostgreSQL:
 
 - **`numeric`** (no typmod) — *unconstrained*: a value carries whatever precision/scale an
-  operation produces, bounded only by the absolute cap below. Required: division and decimal
+  operation produces, bounded only by the format caps below. Required: division and decimal
   literals naturally produce unconstrained values.
 - **`numeric(p)`** ≡ `numeric(p, 0)`.
 - **`numeric(p, s)`** — `p` = total significant digits (**precision**), `s` = digits after the
@@ -77,14 +77,25 @@ digit count `≤ p − s`; if not, trap **`22003`** ("numeric field overflow"). 
 display scale becomes exactly `s` — trailing zeros are materialized, so `1.5::numeric(10,2)`
 is `1.50`.
 
-**Absolute cap (the one deliberate divergence from PG).** An unconstrained value is capped at
-`max_precision = 1000` significant digits and `max_scale = 1000`; exceeding it traps `22003`.
-PG's limit is far higher (131072 integer + 16383 fraction digits). jed caps lower **because a
-single value must fit one page** — the same whole-image "oversized item" `0A000` narrowing that
-bounds over-page text ([format.md](../fileformat/format.md)). 1000/1000 covers every monetary
-and scientific use and equals the *declarable* maximum, so there is one number to remember.
-**Relax this** toward PG's limit once an over-page-value mechanism (overflow pages / TOAST-style
-out-of-line storage) lands (CLAUDE.md §9, TODO.md Phase 6); note it here at the cap.
+**Value-format caps — PostgreSQL's numeric format limits.** An unconstrained value is bounded
+by the same two limits PG's storage format imposes (`numeric.c`): at most
+**`max_int_digits = 131072` integer-part digits** (PG: `(NUMERIC_WEIGHT_MAX + 1) · DEC_DIGITS`,
+the int16 base-10⁴ weight) and at most **`max_scale = 16383` fractional digits** (PG:
+`NUMERIC_DSCALE_MAX`, the 14-bit dscale). Both live in
+[scalars.toml](../types/scalars.toml). Exceeding either traps **`22003`** — at literal/input
+resolve (PG `numeric_in`) and at every operation result (PG `make_result`) — with **one**
+exception, faithful to PG `numeric_mul`: a multiplication whose exact product has more than
+`max_scale` fractional digits **rounds** the product to scale 16383 (half away, §3) instead of
+trapping, then applies the integer-digit check (oracle-confirmed: `1e-10000 * 1e-10000 = 0` at
+dscale 16383). A value at both caps is ~147 455 digits ≈ 74 KB encoded — far over a page;
+storable because large values spill to overflow chains and compress transparently
+([large-values.md](large-values.md)), the mechanism the **original 1000/1000 cap was waiting
+on** (this cap was lifted to PG's limits when that landed). One PG divergence remains at the
+edge: PG's `SUM` accumulator may hold intermediates beyond the storable range and only checks
+the final result, while jed folds `SUM`/`AVG` through ordinary `add` and traps `22003` at the
+first intermediate over the cap. Declarability is unchanged: `numeric(p,s)` still requires
+`p ≤ max_precision = 1000` (also PG's rule), so a *constrained* column never approaches the
+format caps — only unconstrained `numeric` values can.
 
 **Finite only — no NaN, no ±Infinity** (a deliberate, documented PG divergence). PG `numeric`
 has `'NaN'` and `±'Infinity'`; jed's does not. There is **no source** for a non-finite value:
@@ -127,7 +138,7 @@ so every case below is decimal ⊕ decimal. `neg`-result = `neg1 XOR neg2` unles
 | op | result scale | rule |
 |---|---|---|
 | `+` `−` | **`max(s1, s2)`** | align both to `s = max(s1,s2)` (multiply the lower-scale coefficient up — exact), add/subtract magnitudes by sign. `1.50 + 1.5 = 3.00`; `1.234 − 1.2 = 0.034`. |
-| `*` | **`s1 + s2`** | `coeff = C1·C2`, exact, no rounding. `1.50 * 1.5 = 2.250`; `2.0 * 3.000 = 6.0000`. |
+| `*` | **`s1 + s2`** | `coeff = C1·C2`, exact, no rounding — unless `s1 + s2 > max_scale` (16383), where the exact product **rounds** to scale 16383 (§2, PG `numeric_mul`). `1.50 * 1.5 = 2.250`; `2.0 * 3.000 = 6.0000`. |
 | `/` | **`select_div_scale`** (below) | long-divide to that scale, **rounded half away** (§3). `1/3 = 0.33333333333333333333`; `10.0/4.0 = 2.5000000000000000`. |
 | `%` | **`max(s1, s2)`** | truncated-division remainder; sign of the **dividend**. `5.5 % 2 = 1.5`; `−5.5 % 2 = −1.5`. |
 | unary `−` | scale unchanged | flip `neg` (forced false if zero). Never overflows. |
@@ -144,8 +155,14 @@ qweight = w1 − w2
 if f1 ≤ f2:  qweight −= 1                  // quotient < 1 (or unsure) ⇒ one more weight
 rscale = 16 − 4·qweight                     // 16 = NUMERIC_MIN_SIG_DIGITS, 4 = DEC_DIGITS
 rscale = max(rscale, s1, s2, 0)
-rscale = min(rscale, max_scale)             // 1000
+rscale = min(rscale, max_precision)         // 1000 — PG NUMERIC_MAX_DISPLAY_SCALE (= NUMERIC_MAX_PRECISION)
 ```
+
+The final clamp is PG's **display-scale** limit (1000 = `max_precision`), deliberately *not*
+the §2 `max_scale` value cap (16383): division never produces more than 1000 fractional
+digits, even from max-scale operands (oracle-confirmed: `1e-16383 / 1` is `0` at scale 1000 —
+the `max(…, s1, s2)` step is applied *before* the clamp). PG's `round(x, n)` likewise clamps
+its scale argument, but at `max_scale` = 16383 (`numeric_round`); jed matches.
 
 The `4·` granularity and the `f1 ≤ f2` adjustment are PG's (`numeric.c select_div_scale`); they
 make `1/3 → rscale 20` (f1=1 ≤ f2=3 ⇒ qweight −1 ⇒ 16+4) and `10.0/4.0 → rscale 16`
@@ -158,10 +175,12 @@ since `rscale ≥ s1`), form `N = |C1| · 10^E`; then `q = N div |C2|`, `r = N m
 Division/modulo by zero traps **`22012`** (the integer trap, reused).
 
 **Overflow.** A constrained result (a `numeric(p,s)` column/CAST target) traps `22003` by the
-§2 store check. An unconstrained result traps `22003` only at the absolute cap (§2). So `+ − *
-/` carry `errors = [22003]` and `div`/`mod` also `22012`; unary `neg` cannot overflow
-(`errors = []`). The trap boundary is the *result*, mirroring the integer rule
-([functions.md](functions.md) §7).
+§2 store check. An unconstrained result traps `22003` only at the §2 format caps — too many
+integer digits for any operation; too large a scale for input (multiplication instead rounds,
+§2). So `+ − * /` carry `errors = [22003]` and `div`/`mod` also `22012`; unary `neg` cannot
+overflow (`errors = []`). `round(x, n)`'s carry can push a value at the integer-digit cap over
+it (`round` of a 131072-nines integer), trapping `22003` like PG. The trap boundary is the
+*result*, mirroring the integer rule ([functions.md](functions.md) §7).
 
 ## 5. Comparison and ordering
 
@@ -182,8 +201,9 @@ comparison with NULL treated as a comparable value (always definite).
 - **Literals** ([grammar.md](grammar.md) §14): a `.`-bearing numeric literal is an *untyped
   decimal constant* with its written scale, adapting to context like an integer literal
   ([types.md](types.md) §6). Into a `numeric(p,s)` target it rounds to `s` + precision-checks;
-  with no decimal context it keeps its scale; a coefficient over `max_precision` digits or
-  scale over `max_scale` traps `22003` at resolve.
+  with no decimal context it keeps its scale; a literal over the §2 format caps (integer part
+  over `max_int_digits` digits, or scale over `max_scale`) traps `22003` at resolve (PG
+  `numeric_in`).
 - **Casts** ([casts.toml](../types/casts.toml)): `int → decimal` **implicit** (lossless, scale
   0); `decimal → int` **explicit** only (round to scale 0 half-away, then range-check, `22003`)
   — **stricter than PG**, which assignment-casts numeric→int; jed forbids the silent narrowing.
@@ -197,9 +217,14 @@ comparison with NULL treated as a comparable value (always definite).
   **unexercised** this slice — a decimal `PRIMARY KEY`/index key is rejected `0A000` (the
   text-PK precedent). The on-disk **value** codec (type code 5,
   [format.md](../fileformat/format.md)) is what lands now.
-- **Cost** ([cost.md](cost.md)): a decimal compare/arith node charges **one** uniform
-  `operator_eval`, independent of coefficient length — like integer/text, so the `# cost:`
-  contract is unchanged.
+- **Cost** ([cost.md](cost.md) §3 "`decimal_work`"): a decimal compare/arith node charges its
+  uniform `operator_eval` **plus `decimal_work` × (W − 1)**, W being the operation's work in
+  base-10⁴ digit groups (add/sub/compare/mod scale with the larger aligned operand; mul/div
+  with the *product* of the operands' group counts). Small values (≤ 4 aligned digits) have
+  W = 1 and charge nothing extra — pre-existing `# cost:` assertions are unchanged — while
+  the quadratic big-value operations the §2 caps now allow accrue cost proportional to their
+  real limb work, charged *before* the work runs so a cost ceiling (cost.md §6) aborts ahead
+  of it (CLAUDE.md §13).
 
 ## 7. Determinism traps (the cross-core checklist)
 
@@ -222,3 +247,7 @@ comparison with NULL treated as a comparable value (always definite).
    order-independent for the result scale.
 10. **`%` sign & truncation** — remainder takes the dividend's sign with a toward-zero
     quotient, matching the integer `%` convention (one mental model).
+11. **`decimal_work` group counts** — W is computed from the *logical* significant-digit
+    counts in base-10⁴ groups ([cost.md](cost.md) §3), never from a core's internal limb
+    count (Rust/Go hold base-10⁹ limbs, TS base-10⁴ — limb counts differ, group counts do
+    not); division's W uses the same `select_div_scale` as its result.

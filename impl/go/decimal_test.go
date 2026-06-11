@@ -367,3 +367,66 @@ func TestDecimalDistinctCollapsesEqualValues(t *testing.T) {
 		t.Errorf("DISTINCT v = %v, want [1.5 2.0]", got)
 	}
 }
+
+// TestDecimalFormatCaps pins the PG numeric-format caps (spec/design/decimal.md §2): the
+// original 1000/1000 absolute cap is lifted; the bounds are 131072 integer digits and scale
+// 16383, 22003 past either; a value AT both caps stores (spilling to overflow chains) and
+// round-trips. Mirrors impl/rust/tests/decimal.rs and impl/ts/tests/decimal.test.ts.
+func TestDecimalFormatCaps(t *testing.T) {
+	db := decDB(t, "CREATE TABLE t (id int32 PRIMARY KEY, v numeric)")
+	overOld := "0." + strings.Repeat("0", 1001) + "1" // scale 1002: legal now
+	decExec(t, db, "INSERT INTO t VALUES (1, "+overOld+")")
+	if got := decOne(t, db, "SELECT v FROM t WHERE id = 1"); got != overOld {
+		t.Errorf("over-old-cap value did not round-trip")
+	}
+	// scale > 16383 traps 22003 at resolve (PG numeric_in).
+	overScale := "0." + strings.Repeat("0", 16383) + "1"
+	if c := decErr(t, db, "INSERT INTO t VALUES (2, "+overScale+")"); c != "22003" {
+		t.Errorf("over-scale literal = %s, want 22003", c)
+	}
+	// integer digits > 131072 trap 22003 at resolve. (Dotted: a dot-less literal is an
+	// INTEGER literal, 42601 past i64 — types.md §6; the decimal path needs the `.`.)
+	overInt := "1" + strings.Repeat("0", 131072) + ".0"
+	if c := decErr(t, db, "INSERT INTO t VALUES (2, "+overInt+")"); c != "22003" {
+		t.Errorf("over-int-digits literal = %s, want 22003", c)
+	}
+	// exactly AT both caps is legal, stores, and round-trips.
+	atCaps := "1" + strings.Repeat("0", 131071) + "." + strings.Repeat("0", 16382) + "1"
+	decExec(t, db, "INSERT INTO t VALUES (3, "+atCaps+")")
+	if got := decOne(t, db, "SELECT v FROM t WHERE id = 3"); got != atCaps {
+		t.Errorf("at-caps value did not round-trip")
+	}
+}
+
+// TestDecimalMulRoundsAtMaxScale pins PG numeric_mul's rounding: an exact product whose scale
+// exceeds max_scale (16383) ROUNDS to it, half away from zero, instead of trapping
+// (spec/design/decimal.md §2).
+func TestDecimalMulRoundsAtMaxScale(t *testing.T) {
+	db := decDB(t, "CREATE TABLE t (id int32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
+	tiny1 := "0." + strings.Repeat("0", 8191) + "1" // 1e-8192 (scale 8192)
+	tiny5 := "0." + strings.Repeat("0", 8191) + "5" // 5e-8192
+	// 1e-8192 * 1e-8192 = 1e-16384: the dropped digit is 1 -> rounds DOWN to 0 at scale 16383.
+	if got := decOne(t, db, "SELECT "+tiny1+" * "+tiny1+" = 0 FROM t"); got != "true" {
+		t.Errorf("1e-16384 should round to zero, got %s", got)
+	}
+	// 5e-8192 * 1e-8192 = 5e-16384: the dropped digit is 5 -> rounds UP to 1e-16383, nonzero.
+	if got := decOne(t, db, "SELECT "+tiny5+" * "+tiny1+" = 0 FROM t"); got != "false" {
+		t.Errorf("5e-16384 should round up to 1e-16383, got %s", got)
+	}
+}
+
+// TestDecimalCostCeilingAbortsAheadOfBigMultiply: decimal_work is charged and GUARDED before
+// the limb work runs (spec/design/cost.md §3/§6), so a ceiling aborts a pathological multiply
+// up front (CLAUDE.md §13). ~20000 digits is ~5000 groups; the mul W is ~25,000,000.
+func TestDecimalCostCeilingAbortsAheadOfBigMultiply(t *testing.T) {
+	db := decDB(t, "CREATE TABLE t (id int32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
+	big := strings.Repeat("9", 20000) + ".5"
+	db.SetMaxCost(1000)
+	_, err := Execute(db, "SELECT "+big+" * "+big+" FROM t")
+	if err == nil {
+		t.Fatal("expected the cost ceiling to abort the multiply")
+	}
+	if ee, ok := err.(*EngineError); !ok || ee.Code() != "54P01" {
+		t.Fatalf("want 54P01, got %v", err)
+	}
+}

@@ -12,6 +12,7 @@ export interface CostSchedule {
   pageRead: bigint;
   valueCompress: bigint;
   valueDecompress: bigint;
+  decimalWork: bigint;
   rowProduced: bigint;
   operatorEval: bigint;
   aggregateAccumulate: bigint;
@@ -23,6 +24,7 @@ export const COSTS: CostSchedule = {
   pageRead: 1n,
   valueCompress: 1n,
   valueDecompress: 1n,
+  decimalWork: 1n,
   rowProduced: 1n,
   operatorEval: 1n,
   aggregateAccumulate: 1n,
