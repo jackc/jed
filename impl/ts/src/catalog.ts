@@ -43,8 +43,10 @@ export type Table = {
 // IndexDef is one secondary index of a table (spec/design/indexes.md): its
 // (relation-namespace) name and the indexed column ordinals in index-key order
 // (duplicates allowed — PG). The index's B-tree lives in the snapshot's index-store map,
-// keyed by the lowercased name.
-export type IndexDef = { name: string; columns: number[] };
+// keyed by the lowercased name. A unique index enforces uniqueness over its key tuple
+// (NULLS DISTINCT — spec/design/indexes.md §8); it is what backs a UNIQUE constraint
+// (spec/design/constraints.md §5).
+export type IndexDef = { name: string; columns: number[]; unique: boolean };
 
 // CheckConstraint is one CHECK constraint: its (resolved, unique-per-table) name, its
 // persisted expression text — written back verbatim at every commit so the catalog bytes

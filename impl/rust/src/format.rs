@@ -30,7 +30,7 @@ use crate::value::{Unfetched, Value};
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
 /// On-disk format version — 3 = + out-of-line overflow pages for large values (large-values.md §12).
-const FORMAT_VERSION: u16 = 5;
+const FORMAT_VERSION: u16 = 6;
 /// Bytes of the page header on catalog / B-tree pages.
 const PAGE_HEADER: usize = 12;
 /// Smallest valid page size: the 36-byte meta header (plus the page header) must fit
@@ -1417,8 +1417,9 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
         out.extend_from_slice(ce);
     }
     // Secondary indexes (v5): count, then per index the name, key-column ordinals
-    // (index-key order, duplicates allowed), and its tree's root page — in the catalog's
-    // ascending lowercased-name order (spec/design/indexes.md §6).
+    // (index-key order, duplicates allowed), the v6 flags byte (bit0 unique —
+    // spec/design/indexes.md §8), and its tree's root page — in the catalog's ascending
+    // lowercased-name order (spec/design/indexes.md §6).
     debug_assert_eq!(table.indexes.len(), index_roots.len());
     out.extend_from_slice(&(table.indexes.len() as u16).to_be_bytes());
     for (idx, &root) in table.indexes.iter().zip(index_roots) {
@@ -1429,6 +1430,7 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
         for &c in &idx.columns {
             out.extend_from_slice(&(c as u16).to_be_bytes());
         }
+        out.push(if idx.unique { 1 } else { 0 });
         out.extend_from_slice(&root.to_be_bytes());
     }
     out.extend_from_slice(&root_data_page.to_be_bytes());
@@ -1714,9 +1716,10 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             expr,
         });
     }
-    // Secondary indexes (v5): name + key-column ordinals + root page, in the catalog's
-    // (lowercased-name ascending) order — a reader trusts the order. Duplicate ordinals
-    // within one index are legal (indexes.md §1).
+    // Secondary indexes (v5): name + key-column ordinals + the v6 flags byte (bit0
+    // unique; the rest reserved-zero) + root page, in the catalog's (lowercased-name
+    // ascending) order — a reader trusts the order. Duplicate ordinals within one index
+    // are legal (indexes.md §1).
     let index_count = read_u16(buf, pos)? as usize;
     let mut indexes = Vec::with_capacity(index_count);
     let mut index_roots = Vec::with_capacity(index_count);
@@ -1734,10 +1737,15 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             }
             cols.push(ord);
         }
+        let iflags = read_u8(buf, pos)?;
+        if iflags & !0b01 != 0 {
+            return Err(corrupt("reserved index flag set"));
+        }
         index_roots.push(read_u32(buf, pos)?);
         indexes.push(IndexDef {
             name: iname,
             columns: cols,
+            unique: iflags & 0b01 != 0,
         });
     }
     let root_data_page = read_u32(buf, pos)?;

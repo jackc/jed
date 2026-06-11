@@ -1234,10 +1234,16 @@ duplicate name `42710` (constraints.md §4.1–§4.3). The parser knows no catal
 Two new top-level statements ([indexes.md](indexes.md)):
 
 ```
-create_index ::= "CREATE" "INDEX" identifier? "ON" identifier
+create_index ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" identifier
                  "(" identifier ("," identifier)* ")"
 drop_index   ::= "DROP" "INDEX" identifier
 ```
+
+**`UNIQUE` needs no lookahead of its own**: after `CREATE`, the next word being `UNIQUE`
+can only be this form (`CREATE TABLE`/`CREATE INDEX` are the only `CREATE` statements, and
+a table cannot be named by position two). `UNIQUE` stays non-reserved everywhere else. The
+flag's semantics — the build-time duplicate check (`23505`) and write-time enforcement —
+live in [indexes.md §8](indexes.md).
 
 **Disambiguating the optional name.** No word is reserved (§3), so `ON` may itself name
 an index or table. The rule, byte-identical across the three parsers: after
@@ -1259,3 +1265,26 @@ validates in PostgreSQL's order — table `42P01`, then each key column in list 
 (`42703` unknown / `0A000` unindexable type), then the explicit name against the shared
 relation namespace (`42P07`) — and DROP INDEX raises `42704` (missing) / `42809` (names
 a table). Semantics: [indexes.md §2](indexes.md).
+
+## 31. `UNIQUE` constraints (`[CONSTRAINT name] UNIQUE [( cols )]`)
+
+Both constraint positions gain the `UNIQUE` form ([constraints.md §5](constraints.md)): a
+`column_constraint` may be `["CONSTRAINT" identifier] "UNIQUE"` (the one-member form over
+its own column), and a `table_constraint` may be
+`["CONSTRAINT" identifier] "UNIQUE" "(" identifier ("," identifier)* ")"` (the member list
+reuses the `PRIMARY KEY` list shape — bare column names, non-empty).
+
+**Disambiguation.** `UNIQUE` stays non-reserved (§3). A table element beginning with the
+keyword `UNIQUE` **followed by `(`** parses as an unnamed unique constraint — a column
+named `unique` is followed by a *type name* (an identifier, never `(`), so nothing is
+lost. One beginning with `CONSTRAINT` dispatches on the keyword after the name: `CHECK`
+(§29) or `UNIQUE`; at table level the named unique requires the `(` list, at column level
+the bare keyword ends the form. In column-constraint position `UNIQUE` is one keyword in
+the order-free constraint loop, like `NOT NULL` (a repeat is harmless — the identical
+constraint folds, constraints.md §5).
+
+**Where the errors fire.** The parser knows no catalog; CREATE TABLE's execution resolves
+members (`42703`/`42701`/`0A000`) and names the backing index (`42P07`/`42710`)
+(constraints.md §5). PostgreSQL *reserves* `UNIQUE`, so a column named `unique` is
+jed-only surface (the standing no-reserved-words stance; such corpus records carry oracle
+overrides like `on`'s — conformance.md §5).

@@ -167,6 +167,11 @@ export type CreateTable = {
   // CREATE TABLE's execution validates each (0A000/42803/42P02/42703/42804) and names the
   // unnamed ones (42710 on a collision).
   checks: CheckDef[];
+  // Every `[CONSTRAINT name] UNIQUE [(cols)]` of the statement — the column-level form
+  // collects as a one-member list — in TEXTUAL DEFINITION ORDER (it drives member
+  // resolution, the dedup/PK fold, and naming — spec/design/constraints.md §5). Each
+  // survivor becomes a unique secondary index (spec/design/indexes.md §8).
+  uniques: UniqueDef[];
 };
 
 // CheckDef is one parsed CHECK constraint (spec/design/grammar.md §29): the optional
@@ -175,23 +180,31 @@ export type CreateTable = {
 // closed table in spec/fileformat/format.md "Check-expression text".
 export type CheckDef = { name: string | null; expr: Expr; text: string };
 
+// UniqueDef is one parsed UNIQUE constraint (spec/design/grammar.md §31): the optional
+// explicit CONSTRAINT name (null = unnamed; it names the backing index) and the member
+// column names in list order. Execution resolves the members (42703/42701/0A000) and
+// names the index (42P07/42710) — spec/design/constraints.md §5.
+export type UniqueDef = { name: string | null; columns: string[] };
+
 // DropTable is a DROP TABLE statement. Removes a table — its definition and all its
 // rows — from the catalog. Dropping a table that does not exist is an error (42P01);
 // there is no IF EXISTS this slice. Single table only; no CASCADE/RESTRICT (no dependent
 // objects exist yet). See spec/design/grammar.md §13.
 export type DropTable = { kind: "dropTable"; name: string };
 
-// CreateIndex is a CREATE INDEX [name] ON <table> ( col [, col]* ) statement — a
-// non-unique secondary index (spec/design/indexes.md, grammar.md §30). name === null is
-// the unnamed form; the executor derives PostgreSQL's auto-name. Key columns are bare
-// names (no expression/ordered/partial keys this slice); a column may repeat (PG allows
-// it). Execution validates in PG's order: table 42P01, columns 42703/0A000, name
-// collision 42P07.
+// CreateIndex is a CREATE [UNIQUE] INDEX [name] ON <table> ( col [, col]* ) statement —
+// a secondary index (spec/design/indexes.md, grammar.md §30). name === null is the
+// unnamed form; the executor derives PostgreSQL's auto-name. Key columns are bare names
+// (no expression/ordered/partial keys this slice); a column may repeat (PG allows it).
+// Execution validates in PG's order: table 42P01, columns 42703/0A000, name collision
+// 42P07. A unique index additionally verifies the existing rows at build (23505) and
+// enforces uniqueness thereafter (spec/design/indexes.md §8).
 export type CreateIndex = {
   kind: "createIndex";
   name: string | null;
   table: string;
   columns: string[];
+  unique: boolean;
 };
 
 // DropIndex is a DROP INDEX <name> statement — remove one secondary index

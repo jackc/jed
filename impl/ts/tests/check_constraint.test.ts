@@ -82,7 +82,7 @@ test("DDL errors match PostgreSQL", () => {
     execute(db, "CREATE TABLE x (a int CONSTRAINT cc CHECK (a > 0) CONSTRAINT cc CHECK (a < 5))"),
   );
   assert.equal(e.code, "42710");
-  assert.equal(e.message, "check constraint cc already exists");
+  assert.equal(e.message, "constraint cc for relation x already exists");
   // An explicit name colliding with an EARLIER auto name (derived names never yield).
   assert.equal(
     errCode(() =>

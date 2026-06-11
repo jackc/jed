@@ -55,6 +55,21 @@ type CreateTable struct {
 	// CREATE TABLE's execution validates each (0A000/42803/42P02/42703/42804) and names the
 	// unnamed ones (42710 on a collision).
 	Checks []CheckDef
+	// Uniques is every `[CONSTRAINT name] UNIQUE [(cols)]` of the statement — the
+	// column-level form collects as a one-member list — in TEXTUAL DEFINITION ORDER (it
+	// drives member resolution, the dedup/PK fold, and naming —
+	// spec/design/constraints.md §5). Each survivor becomes a unique secondary index
+	// (spec/design/indexes.md §8).
+	Uniques []UniqueDef
+}
+
+// UniqueDef is one parsed UNIQUE constraint (spec/design/grammar.md §31): the optional
+// explicit CONSTRAINT name (empty = unnamed; it names the backing index) and the member
+// column names in list order. Execution resolves the members (42703/42701/0A000) and
+// names the index (42P07/42710) — spec/design/constraints.md §5.
+type UniqueDef struct {
+	Name    string
+	Columns []string
 }
 
 // CheckDef is one parsed CHECK constraint (spec/design/grammar.md §29): the optional
@@ -75,16 +90,18 @@ type DropTable struct {
 	Name string
 }
 
-// CreateIndex is a CREATE INDEX [name] ON <table> ( col [, col]* ) statement — a
-// non-unique secondary index (spec/design/indexes.md, grammar.md §30). Name == "" is the
-// unnamed form; the executor derives PostgreSQL's auto-name. Key columns are bare names
-// (no expression/ordered/partial keys this slice); a column may repeat (PG allows it).
+// CreateIndex is a CREATE [UNIQUE] INDEX [name] ON <table> ( col [, col]* ) statement —
+// a secondary index (spec/design/indexes.md, grammar.md §30). Name == "" is the unnamed
+// form; the executor derives PostgreSQL's auto-name. Key columns are bare names (no
+// expression/ordered/partial keys this slice); a column may repeat (PG allows it).
 // Execution validates in PG's order: table 42P01, columns 42703/0A000, name collision
-// 42P07.
+// 42P07. A Unique index additionally verifies the existing rows at build (23505) and
+// enforces uniqueness thereafter (spec/design/indexes.md §8).
 type CreateIndex struct {
 	Name    string
 	Table   string
 	Columns []string
+	Unique  bool
 }
 
 // DropIndex is a DROP INDEX <name> statement — remove one secondary index

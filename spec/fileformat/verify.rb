@@ -14,9 +14,9 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 5 # format_version 5: secondary-index catalog reshape (indexes.md §6) — explicit
-# pk ordinal list (flags bit0 retired), per-table index list, index B-trees of
-# empty-payload records
+VERSION = 6 # format_version 6: the per-index flags byte (bit0 unique — indexes.md §8),
+# atop the v5 secondary-index catalog reshape (explicit pk ordinal list with column-flag
+# bit0 retired, per-table index list, index B-trees of empty-payload records)
 PAGE_HEADER = 12
 ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
 TXID = 1
@@ -311,6 +311,27 @@ INDEX_TABLE = {
          [3, 20, "00000000-0000-0000-0000-000000000000"]]
 }.freeze
 
+# A table with UNIQUE indexes (v6 — indexes.md §8, constraints.md §5): pins the per-index
+# flags byte. `t_v_key` is the UNIQUE constraint's auto-named index over a NULLABLE column
+# holding two NULLs (NULLS DISTINCT — both entries stored, side by side after the present
+# value); `wv` is a named two-column UNIQUE constraint; `uq` is a CREATE UNIQUE INDEX; `nu`
+# is a plain index over the same column as `t_v_key` (flags 0 beside flags 1). The cores
+# build this via
+#   CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32,
+#                   UNIQUE (v), CONSTRAINT wv UNIQUE (w, v));
+#   CREATE INDEX nu ON t (v);  CREATE UNIQUE INDEX uq ON t (w);
+UNIQUE_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("v", "int32"), col("w", "int32")],
+  indexes: [
+    { name: "nu", cols: [1] },
+    { name: "t_v_key", cols: [1], unique: true },
+    { name: "uq", cols: [2], unique: true },
+    { name: "wv", cols: [2, 1], unique: true }
+  ],
+  rows: [[1, 10, 100], [2, nil, 200], [3, nil, 300]]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -332,6 +353,7 @@ FIXTURES = [
   { file: "composite_pk_table.jed", page_size: 256, tables: [COMPOSITE_PK_TABLE] },
   { file: "check_table.jed", page_size: 256, tables: [CHECK_TABLE] },
   { file: "index_table.jed", page_size: 256, tables: [INDEX_TABLE] },
+  { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
@@ -469,13 +491,15 @@ def table_entry_bytes(table, root_data_page, index_roots)
     out << u16(ck[:expr].bytesize) << ck[:expr].b
   end
   # Secondary indexes (v5): count, then per index the name, key-column ordinals (index-key
-  # order), and the index tree's root page — in ascending lowercased-name order (indexes.md).
+  # order), the v6 flags byte (bit0 unique — indexes.md §8), and the index tree's root
+  # page — in ascending lowercased-name order (indexes.md).
   indexes = table[:indexes] || []
   out << u16(indexes.size)
   indexes.each_with_index do |ix, k|
     out << u16(ix[:name].bytesize) << ix[:name].b
     out << u16(ix[:cols].size)
     ix[:cols].each { |i| out << u16(i) }
+    out << [ix[:unique] ? 1 : 0].pack("C")
     out << u32(index_roots[k])
   end
   out << u32(root_data_page)
@@ -938,7 +962,8 @@ def decode_table_entry(buf, pos)
     expr, pos = take(buf, pos, el.unpack1("n"))
     checks << { name: cname, expr: expr }
   end
-  # Secondary indexes (v5): name + key-column ordinals + root page, in name order.
+  # Secondary indexes (v5): name + key-column ordinals + the v6 flags byte (bit0 unique)
+  # + root page, in name order.
   indexes = []
   ic, pos = take(buf, pos, 2)
   ic.unpack1("n").times do
@@ -950,8 +975,11 @@ def decode_table_entry(buf, pos)
       ob, pos = take(buf, pos, 2)
       cols << ob.unpack1("n")
     end
+    fb, pos = take(buf, pos, 1)
+    raise "reserved index flag set (only bit0 unique is defined — v6)" if (fb.getbyte(0) & ~0b01) != 0
+
     rb, pos = take(buf, pos, 4)
-    indexes << { name: iname, cols: cols, root_page: rb.unpack1("N") }
+    indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0, root_page: rb.unpack1("N") }
   end
   root, pos = take(buf, pos, 4)
   [{ name: name, columns: columns, pk: pk, checks: checks, indexes: indexes,

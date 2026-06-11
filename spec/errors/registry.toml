@@ -91,7 +91,11 @@ template = "null value in column {name} violates not-null constraint"
 code = "23505"
 name = "unique_violation"
 class = "integrity constraint violation"
-template = "duplicate key value violates primary key uniqueness"
+# {name} is the violated constraint: a unique index's name (which IS the UNIQUE
+# constraint's name — spec/design/indexes.md §8), or the derived "<table>_pkey" for the
+# primary key (PostgreSQL's auto-name; jed does not persist or reserve it —
+# spec/design/constraints.md §5).
+template = "duplicate key value violates unique constraint: {name}"
 
 [[error]]
 code = "23514"
@@ -219,7 +223,9 @@ template = "there is no parameter ${index}"
 code = "42710"
 name = "duplicate_object"
 class = "syntax error or access rule violation"
-template = "check constraint {name} already exists"
+# PG's general wording: the per-table CONSTRAINT namespace is shared by CHECK and UNIQUE
+# constraints (spec/design/constraints.md §4.3/§5), so the template names both.
+template = "constraint {name} for relation {table} already exists"
 
 [[error]]
 code = "42809"

@@ -28,14 +28,17 @@ format** that realizes it.
 | [fixtures/](fixtures/) | Byte-exact golden `.jed` files at `page_size = 256` (reviewable hex). Each core reads them and writes bytes equal to them. |
 | [verify.rb](verify.rb) | Independent Ruby reference that (re)generates and validates the goldens + LZ4 vectors — a *fourth* implementation, so the goldens are not self-certified by the cores. `--generate` rewrites them; bare run verifies. Test-time only; run via `rake verify`. |
 
-## Scope (`format_version` 3, Phase 6)
+## Scope (`format_version` 6, Phase 6+)
 
 The format is the **page-backed copy-on-write B-tree** with **incremental commit** (only
 dirty pages are written; the new root is published via the alternate meta slot),
 **reconstruct-on-open page reclamation**, and **large values** — out-of-line overflow chains
 plus transparent LZ4 compression ([../design/large-values.md](../design/large-values.md)).
-Still deferred: continuous within-session reclamation + on-disk free-list persistence
-(format.md *Reclamation*).
+On top of that base: **`CHECK` constraints** in the catalog entry (v4), the
+**secondary-index catalog reshape** — the explicit pk ordinal list + per-table index lists
+and index B-trees (v5, [../design/indexes.md](../design/indexes.md)) — and the per-index
+**`unique` flags byte** (v6, indexes.md §8). Still deferred: continuous within-session
+reclamation + on-disk free-list persistence (format.md *Reclamation*).
 
 > Status: all three cores (Rust, Go, TS) **and** the Ruby reference read every golden and
 > write byte-identical output (the CLAUDE.md §8 cross-core round-trip), and every core's

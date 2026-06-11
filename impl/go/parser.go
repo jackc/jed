@@ -67,9 +67,11 @@ func ParseSQL(sql string) (Statement, error) {
 
 func (p *Parser) parseStatement() (Statement, error) {
 	switch p.peekKeyword() {
-	// CREATE / DROP dispatch on the object keyword (TABLE vs INDEX — grammar.md §30).
+	// CREATE / DROP dispatch on the object keyword (TABLE vs [UNIQUE] INDEX — grammar.md
+	// §30; UNIQUE needs no lookahead of its own — after CREATE the next word being UNIQUE
+	// can only be CREATE UNIQUE INDEX).
 	case "create":
-		if p.peekKeywordAt(1) == "index" {
+		if p.peekKeywordAt(1) == "index" || p.peekKeywordAt(1) == "unique" {
 			ci, err := p.parseCreateIndex()
 			if err != nil {
 				return Statement{}, err
@@ -216,6 +218,7 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	var columns []ColumnDef
 	var tablePKs [][]string
 	var checks []CheckDef
+	var uniques []UniqueDef
 	for {
 		if p.peekKeyword() == "primary" && p.peekKeywordAt(1) == "key" {
 			p.advance()
@@ -231,8 +234,14 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 				return nil, err
 			}
 			checks = append(checks, check)
+		} else if p.atUniqueTableConstraint() {
+			u, err := p.parseUniqueTableConstraint()
+			if err != nil {
+				return nil, err
+			}
+			uniques = append(uniques, u)
 		} else {
-			col, err := p.parseColumnDef(&checks)
+			col, err := p.parseColumnDef(&checks, &uniques)
 			if err != nil {
 				return nil, err
 			}
@@ -250,7 +259,7 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	if len(columns) == 0 {
 		return nil, NewError(SyntaxError, "a table must have at least one column")
 	}
-	return &CreateTable{Name: name, Columns: columns, TablePKs: tablePKs, Checks: checks}, nil
+	return &CreateTable{Name: name, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques}, nil
 }
 
 // atCheckConstraint reports whether the cursor sits on a CHECK constraint: the keyword
@@ -296,6 +305,40 @@ func (p *Parser) parseCheckConstraint() (CheckDef, error) {
 	return CheckDef{Name: name, Expr: expr, Text: text}, nil
 }
 
+// atUniqueTableConstraint reports whether the cursor sits on a table-level UNIQUE
+// constraint: the keyword UNIQUE followed by "(", or CONSTRAINT <ident> UNIQUE
+// (spec/design/grammar.md §31). The keywords stay non-reserved — a column named "unique"
+// is followed by a type name (an identifier, never "("), so the lookahead loses nothing.
+func (p *Parser) atUniqueTableConstraint() bool {
+	if p.peekKeyword() == "unique" && p.peekKindAt(1) == TokLParen {
+		return true
+	}
+	return p.peekKeyword() == "constraint" && p.peekKeywordAt(2) == "unique"
+}
+
+// parseUniqueTableConstraint parses one table-level `[CONSTRAINT name] UNIQUE ( col [,
+// col]* )` (the cursor is verified by atUniqueTableConstraint). The member list reuses
+// the PRIMARY KEY list shape (spec/design/grammar.md §31).
+func (p *Parser) parseUniqueTableConstraint() (UniqueDef, error) {
+	name := ""
+	if p.peekKeyword() == "constraint" {
+		p.advance()
+		n, err := p.expectIdentifier()
+		if err != nil {
+			return UniqueDef{}, err
+		}
+		name = n
+	}
+	if err := p.expectKeyword("unique"); err != nil {
+		return UniqueDef{}, err
+	}
+	columns, err := p.parsePKColumnList()
+	if err != nil {
+		return UniqueDef{}, err
+	}
+	return UniqueDef{Name: name, Columns: columns}, nil
+}
+
 // parsePKColumnList parses the parenthesized member list of a table-level PRIMARY KEY
 // constraint: `( <col> [, <col>]* )`. Must be non-empty — `PRIMARY KEY ()` is 42601 (the
 // first expectIdentifier rejects `)`).
@@ -324,7 +367,7 @@ func (p *Parser) parsePKColumnList() ([]string, error) {
 	}
 }
 
-func (p *Parser) parseColumnDef(checks *[]CheckDef) (ColumnDef, error) {
+func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef) (ColumnDef, error) {
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return ColumnDef{}, err
@@ -338,10 +381,12 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef) (ColumnDef, error) {
 		return ColumnDef{}, err
 	}
 	// Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, DEFAULT <literal>,
-	// and [CONSTRAINT name] CHECK ( expr ). A boolean constraint may be repeated harmlessly;
-	// a repeated DEFAULT keeps the last; each CHECK is a distinct constraint, collected into
-	// the statement-wide list in textual order (a column-level check is semantically
-	// identical to a table-level one — spec/design/constraints.md §4).
+	// [CONSTRAINT name] CHECK ( expr ), and [CONSTRAINT name] UNIQUE. A boolean constraint
+	// may be repeated harmlessly; a repeated DEFAULT keeps the last; each CHECK is a
+	// distinct constraint, collected into the statement-wide list in textual order (a
+	// column-level check is semantically identical to a table-level one —
+	// spec/design/constraints.md §4). A column-level UNIQUE collects the same way as the
+	// one-member form (a repeat folds at execution — spec/design/constraints.md §5).
 	primaryKey := false
 	notNull := false
 	var def *Literal
@@ -352,6 +397,20 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef) (ColumnDef, error) {
 				return ColumnDef{}, err
 			}
 			*checks = append(*checks, check)
+			continue
+		}
+		// CONSTRAINT <name> UNIQUE in column position (the named one-member form;
+		// CONSTRAINT <name> CHECK ( was caught above).
+		if p.peekKeyword() == "constraint" && p.peekKeywordAt(2) == "unique" {
+			p.advance()
+			cname, err := p.expectIdentifier()
+			if err != nil {
+				return ColumnDef{}, err
+			}
+			if err := p.expectKeyword("unique"); err != nil {
+				return ColumnDef{}, err
+			}
+			*uniques = append(*uniques, UniqueDef{Name: cname, Columns: []string{name}})
 			continue
 		}
 		switch p.peekKeyword() {
@@ -374,6 +433,9 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef) (ColumnDef, error) {
 				return ColumnDef{}, err
 			}
 			def = &lit
+		case "unique":
+			p.advance()
+			*uniques = append(*uniques, UniqueDef{Columns: []string{name}})
 		default:
 			return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def}, nil
 		}
@@ -443,6 +505,10 @@ func (p *Parser) parseCreateIndex() (*CreateIndex, error) {
 	if err := p.expectKeyword("create"); err != nil {
 		return nil, err
 	}
+	unique := p.peekKeyword() == "unique"
+	if unique {
+		p.advance()
+	}
 	if err := p.expectKeyword("index"); err != nil {
 		return nil, err
 	}
@@ -482,7 +548,7 @@ func (p *Parser) parseCreateIndex() (*CreateIndex, error) {
 		}
 		return nil, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
 	}
-	return &CreateIndex{Name: name, Table: table, Columns: columns}, nil
+	return &CreateIndex{Name: name, Table: table, Columns: columns, Unique: unique}, nil
 }
 
 // parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing index

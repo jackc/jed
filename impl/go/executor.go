@@ -618,6 +618,48 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		pk = indices
 	}
 
+	// UNIQUE constraints (constraints.md §5.1): resolve members in textual definition
+	// order, AFTER the PRIMARY KEY constraints and BEFORE any CHECK validates (PG's
+	// order, oracle-probed — transformIndexConstraint runs first). Each member must exist
+	// (42703, PG's "named in key" wording), appear once (42701), and be of a key-encodable
+	// type (0A000 — the same narrowing as a PK member / index key column; unlike a PK
+	// member it stays nullable). Folding + naming happen LAST (after check naming),
+	// mirroring PG's index_create-at-execution timing.
+	type resolvedUnique struct {
+		name string
+		cols []int
+	}
+	runiques := make([]resolvedUnique, 0, len(ct.Uniques))
+	for _, u := range ct.Uniques {
+		indices := make([]int, 0, len(u.Columns))
+		for _, cname := range u.Columns {
+			idx := -1
+			for i := range columns {
+				if strings.EqualFold(columns[i].Name, cname) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return Outcome{}, NewError(UndefinedColumn,
+					"column "+cname+" named in key does not exist")
+			}
+			if slices.Contains(indices, idx) {
+				return Outcome{}, NewError(DuplicateColumn,
+					"column "+cname+" appears twice in unique constraint")
+			}
+			indices = append(indices, idx)
+		}
+		for _, i := range indices {
+			ty := columns[i].Type
+			if !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
+			}
+		}
+		runiques = append(runiques, resolvedUnique{name: u.Name, cols: indices})
+	}
+
 	// CHECK constraints (constraints.md §4). All validation runs first, in textual
 	// definition order, AFTER the PRIMARY KEY constraints resolved (PG's order,
 	// oracle-probed); naming follows in a second pass, so a 42703 in a later check fires
@@ -662,7 +704,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		if name != "" {
 			if nameTaken(name) {
 				return Outcome{}, NewError(DuplicateObject,
-					"check constraint "+name+" already exists")
+					"constraint "+name+" for relation "+table.Name+" already exists")
 			}
 		} else {
 			cols := checkReferencedColumns(def.Expr, columns)
@@ -686,7 +728,91 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	})
 	table.Checks = checks
 
+	// UNIQUE fold + naming (constraints.md §5.2/§5.3, PG-probed). Fold first: a
+	// constraint whose member list equals the primary key's (same order) creates nothing;
+	// identical lists fold into the first occurrence, the surviving name being the first
+	// explicitly-named one's. Then each survivor names its backing index in textual order:
+	// an explicit name checks the relation namespace (42P07 — existing relations, the
+	// table being created, and the statement's earlier indexes) before the table's
+	// constraint names (42710); a derived `<table>_<cols>_key` suffix-walks past BOTH
+	// namespaces.
+	var survivors []resolvedUnique
+	for _, ru := range runiques {
+		if slices.Equal(ru.cols, table.PK) {
+			continue
+		}
+		folded := false
+		for i := range survivors {
+			if slices.Equal(survivors[i].cols, ru.cols) {
+				if survivors[i].name == "" {
+					survivors[i].name = ru.name
+				}
+				folded = true
+				break
+			}
+		}
+		if !folded {
+			survivors = append(survivors, ru)
+		}
+	}
+	relationTaken := func(n string) bool {
+		if db.relationExists(n) || strings.EqualFold(table.Name, n) {
+			return true
+		}
+		for _, ix := range table.Indexes {
+			if strings.EqualFold(ix.Name, n) {
+				return true
+			}
+		}
+		return false
+	}
+	checkNameTaken := func(n string) bool {
+		for _, c := range table.Checks {
+			if strings.EqualFold(c.Name, n) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, ru := range survivors {
+		name := ru.name
+		if name != "" {
+			if relationTaken(name) {
+				return Outcome{}, NewError(DuplicateTable, "relation already exists: "+name)
+			}
+			if checkNameTaken(name) {
+				return Outcome{}, NewError(DuplicateObject,
+					"constraint "+name+" for relation "+table.Name+" already exists")
+			}
+		} else {
+			base := strings.ToLower(table.Name)
+			for _, i := range ru.cols {
+				base += "_" + strings.ToLower(table.Columns[i].Name)
+			}
+			base += "_key"
+			name = base
+			for suffix := 1; relationTaken(name) || checkNameTaken(name); suffix++ {
+				name = base + strconv.Itoa(suffix)
+			}
+		}
+		// Insert in catalog (ascending lowercased-name) order — indexes.md §6.
+		def := IndexDef{Name: name, Columns: ru.cols, Unique: true}
+		nameKey := strings.ToLower(name)
+		pos := len(table.Indexes)
+		for i, ix := range table.Indexes {
+			if strings.ToLower(ix.Name) > nameKey {
+				pos = i
+				break
+			}
+		}
+		table.Indexes = slices.Insert(table.Indexes, pos, def)
+	}
+
 	db.putTable(table)
+	// The table is brand new (no rows), so each backing index store starts empty.
+	for _, ix := range table.Indexes {
+		db.working().putIndexStore(strings.ToLower(ix.Name), NewTableStore(int(db.pageSize)-12, nil)) // 12 = pageHeader
+	}
 	// DDL touches no rows and evaluates no expressions: zero cost.
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
@@ -826,7 +952,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	for _, c := range cols {
 		mask[c] = true
 	}
-	def := IndexDef{Name: name, Columns: cols}
+	def := IndexDef{Name: name, Columns: cols, Unique: ci.Unique}
 	store := db.readSnap().store(ci.Table)
 	nodes, slabs, err := store.ScanUnits(mask)
 	if err != nil {
@@ -838,11 +964,24 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		return Outcome{}, err
 	}
 	entries := make([][]byte, 0, len(stored))
+	// A UNIQUE build verifies the existing rows before the index is registered
+	// (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
+	// prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
+	seenPrefixes := make(map[string]bool)
 	for _, e := range stored {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row
 			return Outcome{}, err
 		}
 		meter.Charge(Costs.StorageRowRead)
+		if def.Unique {
+			if prefix, ok := indexPrefixKey(columns, def, e.Row); ok {
+				if seenPrefixes[string(prefix)] {
+					return Outcome{}, NewError(UniqueViolation,
+						"duplicate key value violates unique constraint: "+def.Name)
+				}
+				seenPrefixes[string(prefix)] = true
+			}
+		}
 		entries = append(entries, indexEntryKey(columns, def, e.Key, e.Row))
 	}
 	if err := meter.Guard(); err != nil {
@@ -905,6 +1044,40 @@ func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) [
 	}
 	out = append(out, storageKey...)
 	return out
+}
+
+// indexPrefixKey builds a row's UNIQUENESS PROBE KEY for one unique index
+// (spec/design/indexes.md §8): the §3 entry key's slot prefix — without the storage-key
+// suffix — or ok=false when any component is NULL (NULLS DISTINCT: such a tuple never
+// conflicts). Two rows conflict iff they yield the same prefix.
+func indexPrefixKey(columns []Column, def IndexDef, row Row) ([]byte, bool) {
+	var out []byte
+	for _, ci := range def.Columns {
+		v := row[ci]
+		switch v.Kind {
+		case ValNull:
+			return nil, false
+		case ValInt:
+			out = append(out, 0x00)
+			out = append(out, EncodeInt(columns[ci].Type, v.Int)...)
+		case ValUuid:
+			out = append(out, 0x00)
+			out = append(out, v.Str...)
+		case ValTimestamp, ValTimestamptz:
+			out = append(out, 0x00)
+			out = append(out, EncodeInt(columns[ci].Type, v.Int)...)
+		default:
+			panic("an index column is a key-encodable type (CREATE INDEX gate)")
+		}
+	}
+	return out, true
+}
+
+// uniqueProbeBound is the half-open byte range [prefix, byte-successor(prefix)) — every
+// index entry whose slot prefix equals prefix (the suffix makes tree keys unique, so
+// equal prefixes sit adjacent). The uniqueness probes range over it (indexes.md §8).
+func uniqueProbeBound(prefix []byte) keyBound {
+	return keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
 }
 
 // executeInsert analyzes and runs an INSERT whose rows come from a VALUES list or a SELECT
@@ -1093,6 +1266,18 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 	}
 	prepared := make([]preparedRow, 0, len(rows))
 	seenKeys := make(map[string]struct{})
+	// Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
+	// claimed — an in-batch duplicate traps 23505 like a stored one (indexes.md §8).
+	var uniqDefs []IndexDef
+	for _, def := range table.Indexes {
+		if def.Unique {
+			uniqDefs = append(uniqDefs, def)
+		}
+	}
+	seenPrefixes := make([]map[string]struct{}, len(uniqDefs))
+	for i := range seenPrefixes {
+		seenPrefixes[i] = make(map[string]struct{})
+	}
 	var cunits int64
 	for _, values := range rows {
 		row := make(Row, n)
@@ -1140,17 +1325,40 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 					key = append(key, EncodeInt(table.Columns[i].Type, row[i].Int)...)
 				}
 			}
+			// The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
+			// `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
 			if _, dup := seenKeys[string(key)]; dup {
 				return NewError(UniqueViolation,
-					"duplicate key value violates primary key uniqueness")
+					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
 			if _, exists, err := store.Get(key); err != nil {
 				return err
 			} else if exists {
 				return NewError(UniqueViolation,
-					"duplicate key value violates primary key uniqueness")
+					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
 			seenKeys[string(key)] = struct{}{}
+		}
+		// UNIQUE-index probes (indexes.md §8), AFTER the primary-key duplicate check (PG
+		// reports the PK first when both are violated — probed): per unique index in
+		// catalog (name) order, a fully-non-NULL key tuple (its slot prefix) must match no
+		// existing entry and no earlier row of this batch. Unmetered validation, like the
+		// PK duplicate check (cost.md §3).
+		for u, def := range uniqDefs {
+			prefix, ok := indexPrefixKey(table.Columns, def, row)
+			if !ok {
+				continue
+			}
+			istore := db.readSnap().indexStore(strings.ToLower(def.Name))
+			stored, err := istore.RangeEntries(uniqueProbeBound(prefix))
+			if err != nil {
+				return err
+			}
+			if _, dup := seenPrefixes[u][string(prefix)]; dup || len(stored) > 0 {
+				return NewError(UniqueViolation,
+					"duplicate key value violates unique constraint: "+def.Name)
+			}
+			seenPrefixes[u][string(prefix)] = struct{}{}
 		}
 		// Meter the row's disposition-plan compression attempts (value_compress, cost.md §3).
 		// For a no-PK table the synthetic rowid is allocated in phase 2; only the key LENGTH
@@ -1520,6 +1728,53 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 		updates = append(updates, pending{key: e.Key, row: newRow, oldRow: row})
+	}
+
+	// UNIQUE validation against the statement's END STATE (indexes.md §8 — a documented
+	// PG divergence: PG checks per-row in heap order, so a transient collision like
+	// `SET v = v + 1` fails there and succeeds here). Per unique index in catalog (name)
+	// order, over the rewritten rows in scan (storage-key) order: the new prefixes must
+	// not collide with each other (in-batch), nor with an existing entry whose suffix is
+	// NOT a rewritten row's key (a rewritten row's old entry is being replaced, so it
+	// cannot conflict). Unmetered validation, phase 1.
+	if len(updates) > 0 {
+		rewritten := make(map[string]struct{}, len(updates))
+		for _, u := range updates {
+			rewritten[string(u.key)] = struct{}{}
+		}
+		for _, def := range table.Indexes {
+			if !def.Unique {
+				continue
+			}
+			istore := db.readSnap().indexStore(strings.ToLower(def.Name))
+			batch := make(map[string]struct{})
+			for _, u := range updates {
+				prefix, ok := indexPrefixKey(table.Columns, def, u.row)
+				if !ok {
+					continue
+				}
+				conflict := false
+				if _, dup := batch[string(prefix)]; dup {
+					conflict = true
+				} else {
+					entries, err := istore.RangeEntries(uniqueProbeBound(prefix))
+					if err != nil {
+						return Outcome{}, err
+					}
+					for _, e := range entries {
+						if _, own := rewritten[string(e.Key[len(prefix):])]; !own {
+							conflict = true
+							break
+						}
+					}
+				}
+				if conflict {
+					return Outcome{}, NewError(UniqueViolation,
+						"duplicate key value violates unique constraint: "+def.Name)
+				}
+				batch[string(prefix)] = struct{}{}
+			}
+		}
 	}
 
 	// Each rewritten row's disposition plan may attempt compression (a record over RECORD_MAX)

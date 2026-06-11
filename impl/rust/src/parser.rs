@@ -8,7 +8,7 @@ use crate::ast::{
     Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, Delete, DropIndex,
     DropTable, Expr, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OrderKey,
     QueryExpr, Select, SelectItem, SelectItems, SetOp, SetOpKind, Statement, TableRef, TypeMod,
-    UnaryOp, Update,
+    UnaryOp, UniqueDef, Update,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -37,8 +37,13 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         // Dispatch on the leading keyword. Remaining productions land in Phases D–E.
         match self.peek_keyword().as_deref() {
-            // CREATE / DROP dispatch on the object keyword (TABLE vs INDEX — grammar.md §30).
-            Some("create") if self.peek_keyword_at(1).as_deref() == Some("index") => {
+            // CREATE / DROP dispatch on the object keyword (TABLE vs [UNIQUE] INDEX —
+            // grammar.md §30; UNIQUE needs no lookahead of its own — after CREATE the next
+            // word being UNIQUE can only be CREATE UNIQUE INDEX).
+            Some("create")
+                if self.peek_keyword_at(1).as_deref() == Some("index")
+                    || self.peek_keyword_at(1).as_deref() == Some("unique") =>
+            {
                 Ok(Statement::CreateIndex(self.parse_create_index()?))
             }
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
@@ -145,6 +150,7 @@ impl Parser {
         let mut columns = Vec::new();
         let mut table_pks = Vec::new();
         let mut checks = Vec::new();
+        let mut uniques = Vec::new();
         loop {
             if self.peek_keyword().as_deref() == Some("primary")
                 && self.peek_keyword_at(1).as_deref() == Some("key")
@@ -154,8 +160,10 @@ impl Parser {
                 table_pks.push(self.parse_pk_column_list()?);
             } else if self.at_check_constraint() {
                 checks.push(self.parse_check_constraint()?);
+            } else if self.at_unique_table_constraint() {
+                uniques.push(self.parse_unique_table_constraint()?);
             } else {
-                columns.push(self.parse_column_def(&mut checks)?);
+                columns.push(self.parse_column_def(&mut checks, &mut uniques)?);
             }
             match self.advance() {
                 Token::Comma => continue,
@@ -171,6 +179,7 @@ impl Parser {
             columns,
             table_pks,
             checks,
+            uniques,
         })
     }
 
@@ -205,6 +214,32 @@ impl Parser {
         Ok(CheckDef { name, expr, text })
     }
 
+    /// Whether the cursor sits on a table-level `UNIQUE` constraint: the keyword `UNIQUE`
+    /// followed by `(`, or `CONSTRAINT <ident> UNIQUE` (spec/design/grammar.md §31). The
+    /// keywords stay non-reserved — a column named `unique` is followed by a type name (an
+    /// identifier, never `(`), so the lookahead loses nothing.
+    fn at_unique_table_constraint(&self) -> bool {
+        (self.peek_keyword().as_deref() == Some("unique")
+            && matches!(self.peek_at(1), Token::LParen))
+            || (self.peek_keyword().as_deref() == Some("constraint")
+                && self.peek_keyword_at(2).as_deref() == Some("unique"))
+    }
+
+    /// Parse one table-level `[CONSTRAINT name] UNIQUE ( col [, col]* )` (the cursor is
+    /// verified by `at_unique_table_constraint`). The member list reuses the PRIMARY KEY
+    /// list shape (spec/design/grammar.md §31).
+    fn parse_unique_table_constraint(&mut self) -> Result<UniqueDef> {
+        let name = if self.peek_keyword().as_deref() == Some("constraint") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+        self.expect_keyword("unique")?;
+        let columns = self.parse_pk_column_list()?;
+        Ok(UniqueDef { name, columns })
+    }
+
     /// The parenthesized member list of a table-level `PRIMARY KEY` constraint:
     /// `( <col> [, <col>]* )`. Must be non-empty — `PRIMARY KEY ()` is 42601 (the first
     /// `expect_identifier` rejects `)`).
@@ -221,22 +256,43 @@ impl Parser {
         Ok(cols)
     }
 
-    fn parse_column_def(&mut self, checks: &mut Vec<CheckDef>) -> Result<ColumnDef> {
+    fn parse_column_def(
+        &mut self,
+        checks: &mut Vec<CheckDef>,
+        uniques: &mut Vec<UniqueDef>,
+    ) -> Result<ColumnDef> {
         let name = self.expect_identifier()?;
         let type_name = self.expect_identifier()?;
         let type_mod = self.parse_type_mod()?;
         // Zero or more order-free column constraints: `PRIMARY KEY`, `NOT NULL`,
-        // `DEFAULT <literal>`, and `[CONSTRAINT name] CHECK ( expr )`. A boolean constraint
-        // may be repeated harmlessly; a repeated `DEFAULT` just keeps the last (the catalog
-        // stores one default); each `CHECK` is a distinct constraint, collected into the
-        // statement-wide list in textual order (a column-level check is semantically
-        // identical to a table-level one — spec/design/constraints.md §4).
+        // `DEFAULT <literal>`, `[CONSTRAINT name] CHECK ( expr )`, and
+        // `[CONSTRAINT name] UNIQUE`. A boolean constraint may be repeated harmlessly; a
+        // repeated `DEFAULT` just keeps the last (the catalog stores one default); each
+        // `CHECK` is a distinct constraint, collected into the statement-wide list in
+        // textual order (a column-level check is semantically identical to a table-level
+        // one — spec/design/constraints.md §4). A column-level `UNIQUE` collects the same
+        // way as the one-member form (a repeat folds at execution —
+        // spec/design/constraints.md §5).
         let mut primary_key = false;
         let mut not_null = false;
         let mut default = None;
         loop {
             if self.at_check_constraint() {
                 checks.push(self.parse_check_constraint()?);
+                continue;
+            }
+            // `CONSTRAINT <name> UNIQUE` in column position (the named one-member form;
+            // `CONSTRAINT <name> CHECK (` was caught above).
+            if self.peek_keyword().as_deref() == Some("constraint")
+                && self.peek_keyword_at(2).as_deref() == Some("unique")
+            {
+                self.advance();
+                let cname = self.expect_identifier()?;
+                self.expect_keyword("unique")?;
+                uniques.push(UniqueDef {
+                    name: Some(cname),
+                    columns: vec![name.clone()],
+                });
                 continue;
             }
             match self.peek_keyword().as_deref() {
@@ -253,6 +309,13 @@ impl Parser {
                 Some("default") => {
                     self.advance();
                     default = Some(self.parse_literal()?);
+                }
+                Some("unique") => {
+                    self.advance();
+                    uniques.push(UniqueDef {
+                        name: None,
+                        columns: vec![name.clone()],
+                    });
                 }
                 _ => break,
             }
@@ -307,14 +370,18 @@ impl Parser {
         Ok(DropTable { name })
     }
 
-    /// `CREATE INDEX [name] ON <table> ( col [, col]* )` (spec/design/grammar.md §30). The
-    /// optional name needs one disambiguation because no word is reserved: the word after
-    /// INDEX is the index name UNLESS it is `ON` followed by a word and then `(` — that exact
-    /// three-token shape can only be the unnamed form's `ON table (`. Key columns are bare
-    /// identifiers (no expression / ordered / partial keys this slice — a `(`/`ASC`/`DESC`
-    /// after a key is the natural 42601).
+    /// `CREATE [UNIQUE] INDEX [name] ON <table> ( col [, col]* )` (spec/design/grammar.md
+    /// §30). The optional name needs one disambiguation because no word is reserved: the
+    /// word after INDEX is the index name UNLESS it is `ON` followed by a word and then `(`
+    /// — that exact three-token shape can only be the unnamed form's `ON table (`. Key
+    /// columns are bare identifiers (no expression / ordered / partial keys this slice — a
+    /// `(`/`ASC`/`DESC` after a key is the natural 42601).
     fn parse_create_index(&mut self) -> Result<CreateIndex> {
         self.expect_keyword("create")?;
+        let unique = self.peek_keyword().as_deref() == Some("unique");
+        if unique {
+            self.advance();
+        }
         self.expect_keyword("index")?;
         let unnamed = self.peek_keyword().as_deref() == Some("on")
             && matches!(self.peek_at(1), Token::Word(_))
@@ -340,6 +407,7 @@ impl Parser {
             name,
             table,
             columns,
+            unique,
         })
     }
 

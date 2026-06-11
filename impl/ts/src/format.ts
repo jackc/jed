@@ -47,7 +47,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 5; // on-disk format version (5 = the secondary-index catalog reshape, indexes.md §6)
+const FORMAT_VERSION = 6; // on-disk format version (6 = the per-index unique flags byte, indexes.md §8)
 const PAGE_HEADER = 12; // bytes of the catalog/B-tree page header
 const PAGE_CATALOG = 1; // page_type for a catalog page
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
@@ -578,8 +578,9 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
     w.bytes(ce);
   }
   // Secondary indexes (v5): count, then per index the name, key-column ordinals
-  // (index-key order, duplicates allowed), and its tree's root page — in the catalog's
-  // ascending lowercased-name order (spec/design/indexes.md §6).
+  // (index-key order, duplicates allowed), the v6 flags byte (bit0 unique —
+  // spec/design/indexes.md §8), and its tree's root page — in the catalog's ascending
+  // lowercased-name order (spec/design/indexes.md §6).
   w.u16(table.indexes.length);
   for (let k = 0; k < table.indexes.length; k++) {
     const idx = table.indexes[k]!;
@@ -588,6 +589,7 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
     w.bytes(inm);
     w.u16(idx.columns.length);
     for (const c of idx.columns) w.u16(c);
+    w.u8(idx.unique ? 1 : 0);
     w.u32(indexRoots[k]!);
   }
   w.u32(rootDataPage);
@@ -1501,9 +1503,10 @@ function decodeTableEntry(
     }
     checks.push({ name: checkName, exprText, expr });
   }
-  // Secondary indexes (v5): name + key-column ordinals + root page, in the catalog's
-  // (lowercased-name ascending) order — a reader trusts the order. Duplicate ordinals
-  // within one index are legal (indexes.md §1).
+  // Secondary indexes (v5): name + key-column ordinals + the v6 flags byte (bit0
+  // unique; the rest reserved-zero) + root page, in the catalog's (lowercased-name
+  // ascending) order — a reader trusts the order. Duplicate ordinals within one index
+  // are legal (indexes.md §1).
   const indexCount = readU16(buf, cur);
   const indexes: IndexDef[] = [];
   const indexRoots: number[] = [];
@@ -1519,8 +1522,12 @@ function decodeTableEntry(
       }
       cols.push(ord);
     }
+    const iflags = readU8(buf, cur);
+    if ((iflags & ~0b01) !== 0) {
+      throw engineError("data_corrupted", "reserved index flag set");
+    }
     indexRoots.push(readU32(buf, cur));
-    indexes.push({ name: iname, columns: cols });
+    indexes.push({ name: iname, columns: cols, unique: (iflags & 0b01) !== 0 });
   }
   const root = readU32(buf, cur);
   return { table: { name, columns, pk, checks, indexes }, root, indexRoots };

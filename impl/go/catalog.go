@@ -40,10 +40,13 @@ type Table struct {
 // IndexDef is one secondary index of a table (spec/design/indexes.md): its
 // (relation-namespace) name and the indexed column ordinals in index-key order
 // (duplicates allowed — PG). The index's B-tree lives in the snapshot's index-store map,
-// keyed by the lowercased name.
+// keyed by the lowercased name. A Unique index enforces uniqueness over its key tuple
+// (NULLS DISTINCT — spec/design/indexes.md §8); it is what backs a UNIQUE constraint
+// (spec/design/constraints.md §5).
 type IndexDef struct {
 	Name    string
 	Columns []int
+	Unique  bool
 }
 
 // CheckConstraint is one CHECK constraint: its (resolved, unique-per-table) name, its

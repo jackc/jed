@@ -115,7 +115,7 @@ fn ddl_errors_match_postgres() {
         "CREATE TABLE x (a int CONSTRAINT cc CHECK (a > 0) CONSTRAINT cc CHECK (a < 5))",
     );
     assert_eq!(code, "42710");
-    assert_eq!(msg, "check constraint cc already exists");
+    assert_eq!(msg, "constraint cc for relation x already exists");
     // An explicit name colliding with an EARLIER auto name (derived names never yield).
     assert_eq!(
         err(

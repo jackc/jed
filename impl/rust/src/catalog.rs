@@ -35,11 +35,15 @@ pub struct CheckConstraint {
 
 /// One secondary index of a table (spec/design/indexes.md): its (relation-namespace) name
 /// and the indexed column ordinals in index-key order (duplicates allowed — PG). The index's
-/// B-tree lives in the snapshot's index-store map, keyed by the lowercased name.
+/// B-tree lives in the snapshot's index-store map, keyed by the lowercased name. A
+/// `unique` index enforces uniqueness over its key tuple (NULLS DISTINCT —
+/// spec/design/indexes.md §8); it is what backs a `UNIQUE` constraint
+/// (spec/design/constraints.md §5).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IndexDef {
     pub name: String,
     pub columns: Vec<usize>,
+    pub unique: bool,
 }
 
 /// A table definition.

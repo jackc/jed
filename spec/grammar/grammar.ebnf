@@ -54,13 +54,14 @@ create_table   ::= "CREATE" "TABLE" identifier
                    "(" table_element ("," table_element)* ")"
 
 /* A table element is a column definition or a table-level constraint: the
- * composite-capable PRIMARY KEY list, or an (optionally named) CHECK constraint. Either
- * may appear anywhere among the column definitions (PostgreSQL's shape). An element
- * starting with the two keywords "PRIMARY" "KEY", with "CHECK" "(", or with "CONSTRAINT"
- * parses as a table constraint — the constraint keywords are not reserved (§3), but a
- * column named "primary" cannot have a type named "key" (no such type exists) and a
- * column named "check"/"constraint" is followed by a type name, never "(" — so the
- * disambiguation loses nothing (../design/grammar.md §13/§29). */
+ * composite-capable PRIMARY KEY list, an (optionally named) CHECK constraint, or an
+ * (optionally named) UNIQUE column list. Any may appear anywhere among the column
+ * definitions (PostgreSQL's shape). An element starting with the two keywords
+ * "PRIMARY" "KEY", with "CHECK" "(", with "UNIQUE" "(", or with "CONSTRAINT" parses as a
+ * table constraint — the constraint keywords are not reserved (§3), but a column named
+ * "primary" cannot have a type named "key" (no such type exists) and a column named
+ * "check"/"constraint"/"unique" is followed by a type name, never "(" — so the
+ * disambiguation loses nothing (../design/grammar.md §13/§29/§31). */
 table_element  ::= column_def | table_constraint
 
 /* "PRIMARY KEY (a, b, ...)" declares the table's key over one or more named columns; the
@@ -79,10 +80,21 @@ table_element  ::= column_def | table_constraint
  * rejected at CREATE TABLE. The table-level and column-level CHECK forms are
  * semantically IDENTICAL — a column-level CHECK may reference any column (PostgreSQL's
  * model); the position only feeds the textual definition order. The "CONSTRAINT name"
- * prefix is accepted only before CHECK this slice (a jed narrowing; PG allows it before
- * any constraint). */
+ * prefix is accepted before CHECK and UNIQUE this slice (a jed narrowing; PG allows it
+ * before any constraint).
+ *
+ * "UNIQUE (a, b, ...)" declares a uniqueness constraint over one or more named columns,
+ * realized as a UNIQUE secondary index (../design/constraints.md §5, indexes.md §8). Each
+ * named column must exist (42703, "named in key") and appear once (42701); each must be of
+ * a key-encodable type (0A000). An identical column LIST (same columns, same order) as the
+ * primary key, or as an earlier UNIQUE constraint, is folded away (PostgreSQL); the
+ * backing index is auto-named lowercased "<table>_<cols>_key" with the smallest free
+ * suffix, or takes the explicit CONSTRAINT name (collisions: 42P07 against the relation
+ * namespace, 42710 against the table's constraint names). The column-level "UNIQUE" is the
+ * one-member form. */
 table_constraint ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
                  | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
+                 | ["CONSTRAINT" identifier] "UNIQUE" "(" identifier ("," identifier)* ")"
 
 /* A column definition is a name, a type, and zero or more column constraints. The
  * constraints are order-free (the parsers accept them in any order, deduplicating —
@@ -100,6 +112,7 @@ column_constraint ::= "PRIMARY" "KEY"
                  | "NOT" "NULL"
                  | "DEFAULT" literal
                  | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
+                 | ["CONSTRAINT" identifier] "UNIQUE"
 
 /* DROP TABLE removes a table — its definition and all its rows — from the
  * catalog. The surface is deliberately minimal (../design/grammar.md §13): ONE
@@ -109,23 +122,29 @@ column_constraint ::= "PRIMARY" "KEY"
  * Each omission is relaxable later (../../TODO.md). */
 drop_table     ::= "DROP" "TABLE" identifier
 
-/* CREATE INDEX declares a (non-unique) secondary index over one or more named columns of
- * one table (../design/indexes.md). The index name is optional: omitted, the engine
+/* CREATE INDEX declares a secondary index over one or more named columns of one table
+ * (../design/indexes.md). "CREATE UNIQUE INDEX" makes it a UNIQUE index: building it over
+ * existing duplicate values is 23505, and thereafter it enforces uniqueness at every write
+ * (NULLS DISTINCT — indexes.md §8). The index name is optional: omitted, the engine
  * derives PostgreSQL's choice — lowercased "<table>_<col>_..._idx" with the smallest free
- * positive-integer suffix on collision. Because no word is reserved (§3), the optional
- * name needs one disambiguation: the word after INDEX is the index name UNLESS it is
- * "ON" followed by a word and then "(" — a fixed three-token lookahead, byte-identical
- * across the parsers (../design/grammar.md §30). Each named column must exist (42703) and
- * be of a key-encodable type (else 0A000); a column may be listed more than once
- * (PostgreSQL allows it). Index names share the TABLE namespace (a duplicate in either is
- * 42P07, "relation"). Narrowings this slice (each 0A000-free — simply not in the
- * grammar): no UNIQUE, no expression/ordered/partial keys (a key is a bare column name),
- * no IF NOT EXISTS, no USING.
+ * positive-integer suffix on collision (the "_idx" suffix even for a unique index;
+ * "_key" is the UNIQUE-constraint spelling — table_constraint above). Because no word is
+ * reserved (§3), the optional name needs one disambiguation: the word after INDEX is the
+ * index name UNLESS it is "ON" followed by a word and then "(" — a fixed three-token
+ * lookahead, byte-identical across the parsers (../design/grammar.md §30). Each named
+ * column must exist (42703) and be of a key-encodable type (else 0A000); a column may be
+ * listed more than once (PostgreSQL allows it). Index names share the TABLE namespace (a
+ * duplicate in either is 42P07, "relation"). Narrowings this slice (each 0A000-free —
+ * simply not in the grammar): no expression/ordered/partial keys (a key is a bare column
+ * name), no IF NOT EXISTS, no USING, no NULLS NOT DISTINCT.
  *
  * DROP INDEX removes one index by name: 42704 if it does not exist, 42809 if the name is
  * a table ("is not an index"); symmetrically DROP TABLE of an index name is 42809 ("is
- * not a table"). DROP TABLE drops the table's indexes with it. */
-create_index   ::= "CREATE" "INDEX" identifier? "ON" identifier
+ * not a table"). DROP TABLE drops the table's indexes with it. DROP INDEX of a
+ * constraint-backed unique index drops the UNIQUE constraint with it (a documented PG
+ * divergence — jed has no ALTER TABLE ... DROP CONSTRAINT, so the index name is the
+ * constraint's only handle; indexes.md §8). */
+create_index   ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" identifier
                    "(" identifier ("," identifier)* ")"
 drop_index     ::= "DROP" "INDEX" identifier
 

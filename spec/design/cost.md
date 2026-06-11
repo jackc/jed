@@ -329,8 +329,10 @@ key column only, equality only, SELECT scans only (UPDATE/DELETE keep their PK p
 **DDL costs.** `CREATE INDEX` charges its build scan over the existing rows: `page_read` ×
 the **table's** full node count + `storage_row_read` per row (the build's touched set — the
 indexed columns — is fixed-width, so its chain/decompress terms are structurally zero); an
-empty table charges 0. `DROP INDEX` charges 0 (a pure catalog edit, like DROP TABLE). Index
-**maintenance** at INSERT/UPDATE/DELETE is unmetered ("What is NOT metered" below).
+empty table charges 0. `CREATE UNIQUE INDEX` charges **exactly the same** — its duplicate
+verification (indexes.md §8) is unmetered validation, like the uniqueness probes below.
+`DROP INDEX` charges 0 (a pure catalog edit, like DROP TABLE). Index **maintenance** at
+INSERT/UPDATE/DELETE is unmetered ("What is NOT metered" below).
 
 **Bounded scan / JOIN — each base table bounded by its own PK predicate.** In a multi-table FROM
 each base table is materialized independently (see "JOIN" below), so each is bounded **on its own**
@@ -589,6 +591,10 @@ evaluation. It deliberately does **not** meter:
   is unmetered like the row writes themselves. The *build* scan of `CREATE INDEX` over
   existing rows **is** metered (the index-bounded-scan subsection above); `DROP INDEX`
   charges 0.
+- **Uniqueness validation** — the primary-key duplicate check and the unique-index probes
+  (indexes.md §8) at INSERT/UPDATE, and `CREATE UNIQUE INDEX`'s build verification, are
+  constraint validation like NOT NULL (a branch, not expression evaluation): unmetered. An
+  INSERT into a uniquely-indexed table costs the same as into a plainly-indexed one.
 - **JOIN nested-loop control flow** — buffering each materialized table, iterating the
   Cartesian/left-deep combinations, and concatenating left+right rows are bookkeeping, not
   evaluation; only `storage_row_read` (per materialized row), the `ON`/WHERE/projection

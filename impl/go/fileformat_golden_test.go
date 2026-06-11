@@ -118,6 +118,20 @@ func indexTableDB(t *testing.T) *Database {
 	return db
 }
 
+// uniqueTableDB has UNIQUE indexes (v6 — the per-index flags byte, indexes.md §8):
+// t_v_key (a UNIQUE constraint's auto-name) over a nullable column holding two NULLs
+// (NULLS DISTINCT — both stored), the named two-column constraint wv, a CREATE UNIQUE
+// INDEX uq, and the plain index nu (flags 0 beside flags 1).
+func uniqueTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32, "+
+		"UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))")
+	run(t, db, "CREATE INDEX nu ON t (v)")
+	run(t, db, "CREATE UNIQUE INDEX uq ON t (w)")
+	run(t, db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 200), (3, NULL, 300)")
+	return db
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 func nopkTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
@@ -340,6 +354,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"composite_pk_table.jed", compositePKTableDB},
 		{"check_table.jed", checkTableDB},
 		{"index_table.jed", indexTableDB},
+		{"unique_table.jed", uniqueTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -377,6 +392,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"composite_pk_table.jed", compositePKTableDB, "t"},
 		{"check_table.jed", checkTableDB, "t"},
 		{"index_table.jed", indexTableDB, "t"},
+		{"unique_table.jed", uniqueTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

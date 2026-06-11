@@ -21,7 +21,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion uint16 = 5               // on-disk format version (5 = the secondary-index catalog reshape, indexes.md §6)
+	formatVersion uint16 = 6               // on-disk format version (6 = the per-index unique flags byte, indexes.md §8)
 	pageHeader           = 12              // bytes of the catalog/B-tree page header
 	pageCatalog   byte   = 1               // page_type for a catalog page
 	pageLeaf      byte   = 2               // page_type for a B-tree leaf node
@@ -1360,8 +1360,9 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 		out = append(out, check.ExprText...)
 	}
 	// Secondary indexes (v5): count, then per index the name, key-column ordinals
-	// (index-key order, duplicates allowed), and its tree's root page — in the catalog's
-	// ascending lowercased-name order (spec/design/indexes.md §6).
+	// (index-key order, duplicates allowed), the v6 flags byte (bit0 unique —
+	// spec/design/indexes.md §8), and its tree's root page — in the catalog's ascending
+	// lowercased-name order (spec/design/indexes.md §6).
 	out = appendU16(out, uint16(len(table.Indexes)))
 	for k, idx := range table.Indexes {
 		out = appendU16(out, uint16(len(idx.Name)))
@@ -1369,6 +1370,11 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 		out = appendU16(out, uint16(len(idx.Columns)))
 		for _, c := range idx.Columns {
 			out = appendU16(out, uint16(c))
+		}
+		if idx.Unique {
+			out = append(out, 1)
+		} else {
+			out = append(out, 0)
 		}
 		out = appendU32(out, indexRoots[k])
 	}
@@ -1706,9 +1712,10 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		}
 		checks = append(checks, CheckConstraint{Name: checkName, ExprText: exprText, Expr: expr})
 	}
-	// Secondary indexes (v5): name + key-column ordinals + root page, in the catalog's
-	// (lowercased-name ascending) order — a reader trusts the order. Duplicate ordinals
-	// within one index are legal (indexes.md §1).
+	// Secondary indexes (v5): name + key-column ordinals + the v6 flags byte (bit0
+	// unique; the rest reserved-zero) + root page, in the catalog's (lowercased-name
+	// ascending) order — a reader trusts the order. Duplicate ordinals within one index
+	// are legal (indexes.md §1).
 	indexCount, err := readU16(buf, pos)
 	if err != nil {
 		return nil, 0, nil, err
@@ -1738,11 +1745,18 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			}
 			cols = append(cols, int(ord))
 		}
+		iflags, err := readU8(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if iflags&^uint8(0b01) != 0 {
+			return nil, 0, nil, NewError(DataCorrupted, "reserved index flag set")
+		}
 		iroot, err := readU32(buf, pos)
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		indexes = append(indexes, IndexDef{Name: iname, Columns: cols})
+		indexes = append(indexes, IndexDef{Name: iname, Columns: cols, Unique: iflags&0b01 != 0})
 		indexRoots = append(indexRoots, iroot)
 	}
 	root, err := readU32(buf, pos)

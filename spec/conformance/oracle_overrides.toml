@@ -43,11 +43,6 @@ reason = "jed: assigning any primary-key member is the documented 0A000 narrowin
 
 [[override]]
 file = "ddl/composite_pk.test"
-sql = "CREATE TABLE e5 (a int32, b int32, PRIMARY KEY (b, a))"
-reason = "jed: a PRIMARY KEY list whose order differs from the table's column-declaration order is rejected 0A000 this slice — the catalog persists the key as per-column flag bits with no independent order; relaxable at the secondary-index catalog reshape (constraints.md §3). PG accepts any order."
-
-[[override]]
-file = "ddl/composite_pk.test"
 sql = "CREATE TABLE e6 (a int32, s text, PRIMARY KEY (a, s))"
 reason = "jed: a text primary-key member is the same documented 0A000 narrowing as a single-column text PRIMARY KEY (types.md §11 — the text key encoding is authored but unexercised). PG allows text key columns."
 
@@ -100,3 +95,33 @@ reason = "jed: an index explicitly named `on` (the grammar.md §30 lookahead). P
 file = "ddl/create_index.test"
 sql = "DROP INDEX on"
 reason = "jed: dropping the index named `on`. PG reserves ON (42601)."
+
+[[override]]
+file = "ddl/unique.test"
+sql = "CREATE TABLE e6 (a int32, s text UNIQUE)"
+reason = "jed: a text UNIQUE member is rejected this slice (0A000), the same documented narrowing as a text PRIMARY KEY / index key column (constraints.md §5.1, indexes.md §1). PG allows text unique columns."
+
+[[override]]
+file = "ddl/unique.test"
+sql = "UPDATE m SET vv = vv + 1 WHERE id < 3"
+reason = "jed: UPDATE validates uniqueness against the statement's END STATE (the two-phase / all-or-nothing model — indexes.md §8); the transient 1,2 -> 2,3 shift is unique when done. PG checks per-row in heap order and fails the intermediate collision (23505)."
+
+[[override]]
+file = "ddl/unique.test"
+sql = "SELECT vv FROM m ORDER BY id"
+reason = "Follows the end-state UPDATE divergence: PG's failed UPDATE left m at its prior values, so the oracle's rows differ from jed's (which applied the shift, then the swap)."
+
+[[override]]
+file = "ddl/unique.test"
+sql = "UPDATE m SET vv = 5 - vv WHERE id < 3"
+reason = "jed: the end-state value swap succeeds (indexes.md §8); PG fails it per-row in heap order (23505) — and here runs against the state its earlier failed UPDATE preserved."
+
+[[override]]
+file = "ddl/unique.test"
+sql = "DROP INDEX m_vv_key"
+reason = "jed: DROP INDEX of a constraint-backed unique index is allowed and drops the UNIQUE constraint with it — jed has no ALTER TABLE ... DROP CONSTRAINT, so the index name is the constraint's only handle (indexes.md §7). PG refuses (2BP01, dependent_objects_still_exist)."
+
+[[override]]
+file = "ddl/unique.test"
+sql = "INSERT INTO m VALUES (4, 30)"
+reason = "Follows the constraint-drop divergence: jed dropped m's UNIQUE so the duplicate 30 inserts; in PG the constraint survived its refused DROP INDEX (and vv still holds 30 from the earlier failed UPDATEs), so the oracle traps 23505."

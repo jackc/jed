@@ -17,11 +17,13 @@ element may also be a **table constraint** — the composite-capable `PRIMARY KE
 table_element     ::= column_def | table_constraint
 table_constraint  ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
                     | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
+                    | ["CONSTRAINT" identifier] "UNIQUE" "(" identifier ("," identifier)* ")"
 column_def        ::= identifier type_name column_constraint*
 column_constraint ::= "PRIMARY" "KEY"
                     | "NOT" "NULL"
                     | "DEFAULT" literal
                     | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
+                    | ["CONSTRAINT" identifier] "UNIQUE"
 ```
 
 Constraints are **order-free** and idempotent: the parsers accept the keywords in any order
@@ -31,8 +33,9 @@ The constraint keywords are **not reserved** (grammar.md §3) — a column may b
 `null`, `primary`, `key`, `check`, or `constraint`; the parser distinguishes them
 positionally.
 
-This grows one constraint at a time (CLAUDE.md §11, [../../TODO.md](../../TODO.md)). `UNIQUE`
-and `FOREIGN KEY` stay deferred; the composite `PRIMARY KEY` landed (§3), `CHECK` landed (§4).
+This grows one constraint at a time (CLAUDE.md §11, [../../TODO.md](../../TODO.md)).
+`FOREIGN KEY` stays deferred; the composite `PRIMARY KEY` landed (§3), `CHECK` landed (§4),
+`UNIQUE` landed (§5 — backed by a unique secondary index, [indexes.md §8](indexes.md)).
 
 ## 1. `NOT NULL`
 
@@ -217,9 +220,10 @@ different (equally valid) error than PG. Recorded in the oracle-override ledger.
 3. Each check **validates** in textual definition order: the §4.1 pre-walk, then name/type
    resolution, then the boolean gate.
 4. Each check is **named** in textual definition order (§4.3); a name collision traps
-   **`42710`** (`check constraint <name> already exists`). All validation (step 3) precedes
-   all naming — a `42703` in a later check fires before a `42710` between earlier ones
-   (oracle-probed).
+   **`42710`** (`constraint <name> for relation <table> already exists` — the template
+   generalized to PG's wording when `UNIQUE` joined the per-table constraint namespace,
+   §5). All validation (step 3) precedes all naming — a `42703` in a later check fires
+   before a `42710` between earlier ones (oracle-probed).
 
 **`DEFAULT` is not checked against `CHECK` at CREATE TABLE** (matching §2's `NOT NULL` rule
 and PostgreSQL): `a int DEFAULT -5 CHECK (a > 0)` is accepted; the `23514` fires only when
@@ -281,3 +285,92 @@ load each core re-parses the stored text with its ordinary expression parser, an
 writes the retained text back verbatim, so the catalog bytes are stable across
 create → commit → load → commit. Unparseable stored text in an otherwise-valid file is
 **`XX001`** (`data_corrupted`) at open.
+
+## 5. `UNIQUE`
+
+A `UNIQUE` constraint forbids two rows from sharing a value tuple over its member columns.
+**A UNIQUE constraint IS a unique secondary index** — jed materializes the constraint as
+nothing but an [indexes.md](indexes.md) index with the `unique` flag, named per PG's
+constraint convention. There is no separate constraint object: the index's name is the
+constraint's name (it is what the `23505` message reports), and the enforcement semantics
+live with the index ([indexes.md §8](indexes.md) — *NULLS DISTINCT*, the write-time checks,
+`CREATE UNIQUE INDEX`). This section is the CREATE TABLE surface. Everything here is
+oracle-probed against PostgreSQL 18 except the documented divergences.
+
+### 5.1 Surface and resolution
+
+Both positions, same constraint: a **column-level** `[CONSTRAINT name] UNIQUE` is the
+one-member form over its own column; a **table-level**
+`[CONSTRAINT name] UNIQUE (a, b, …)` lists one or more members
+([grammar.md §31](grammar.md)). Constraints are collected in **textual definition order**
+(a column-level one at its column's position), like checks.
+
+**Resolution** (per constraint, in textual order, after the table-level `PRIMARY KEY`
+constraints and **before** any `CHECK` validates — PG's order, probed): each member must
+exist — **`42703`** (`column <name> named in key does not exist`, the PK wording) — appear
+once — **`42701`** (`column <name> appears twice in unique constraint`) — and be of a
+key-encodable type — **`0A000`** (the same documented narrowing as a PK member / index key
+column; *unlike* a PK member, a UNIQUE member stays **nullable**).
+
+### 5.2 Dedup and the PK fold (PG-matched, probed)
+
+A uniqueness requirement already guaranteed elsewhere is **folded away**, matching
+PostgreSQL:
+
+- a UNIQUE constraint whose member list is **identical to the primary key's** (same
+  columns, same order) creates nothing — the PK already enforces it (`a int PRIMARY KEY
+  UNIQUE` and `PRIMARY KEY (a, b) … UNIQUE (a, b)` each yield one index-free PK); a
+  *differing order* (`UNIQUE (b, a)` against `PRIMARY KEY (a, b)`) is a distinct
+  constraint and stays;
+- two UNIQUE constraints with **identical member lists** fold into one. The surviving
+  name is the **first explicitly-named** one's, if any (`a int UNIQUE, CONSTRAINT named
+  UNIQUE (a)` keeps `named` — probed); with no explicit name the one auto-name derives.
+  Identical lists with two *different* explicit names also fold (PG keeps the first —
+  `CONSTRAINT x UNIQUE (a), CONSTRAINT y UNIQUE (a)` keeps `x`).
+
+A repeated bare `UNIQUE` on one column is the trivial case of the same fold.
+
+### 5.3 Naming the backing index
+
+After the folds, each surviving constraint names its index, in textual order:
+
+- an **explicit** `CONSTRAINT <name>` is used as written; it is checked against the
+  **relation namespace** first — tables (including the one being created) and indexes,
+  `42P07` — then against the table's **constraint names** (its checks) — `42710`
+  (`constraint <name> for relation <table> already exists`). Relation before constraint
+  is PG's probed order;
+- an **omitted** name derives PostgreSQL's choice: the lowercased
+  `<table>_<col>_<col>…_key` (members in list order), suffix-walked past **both**
+  namespaces (a check named `t_a_key` pushes the derived name to `t_a_key1` — probed).
+
+The `_key` suffix (vs `CREATE INDEX`'s `_idx`) is the only naming difference from a plain
+index; the walk rule is otherwise [indexes.md §2](indexes.md)'s.
+
+### 5.4 Enforcement and the violation message
+
+Enforcement is the unique index's ([indexes.md §8](indexes.md)): at INSERT and UPDATE,
+inside the two-phase / all-or-nothing pass, **after** the primary-key duplicate check. A
+violation traps **`23505`** (`unique_violation`):
+
+```
+duplicate key value violates unique constraint: <name>
+```
+
+`<name>` is the violated unique index's name. The **primary key's own** `23505` reports
+the derived `<table>_pkey` (lowercased — PostgreSQL's auto-name for the PK index). jed
+does **not** persist or reserve that name: `CREATE INDEX t_pkey ON t (a)` is legal in jed
+where PG would collide — a documented divergence (the PK has no index object here).
+
+When one row violates several uniqueness constraints, the reported one is: the **primary
+key first**, then the unique indexes in the catalog's **ascending lowercased-name order**
+(jed's standing deterministic order — checks fire in name order the same way, §4.4).
+PostgreSQL reports in index *creation* order, which jed does not persist — a documented
+divergence (the code is identical; only the choice of reported name differs).
+
+### 5.5 Persistence
+
+Nothing constraint-specific is persisted: the backing index is stored like any other, with
+its **`unique` flag** in the per-index catalog flags byte (`format_version` **6** —
+[../fileformat/format.md](../fileformat/format.md), [indexes.md §6](indexes.md)). A
+reloaded database enforces exactly as the creating session did. The byte fixture is the
+`unique_table.jed` golden.

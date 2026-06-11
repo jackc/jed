@@ -116,6 +116,25 @@ fn index_table_db() -> Database {
     db
 }
 
+/// A table with UNIQUE indexes (v6 — the per-index flags byte, indexes.md §8): `t_v_key`
+/// (a UNIQUE constraint's auto-name) over a nullable column holding two NULLs (NULLS
+/// DISTINCT — both stored), the named two-column constraint `wv`, a CREATE UNIQUE INDEX
+/// `uq`, and the plain index `nu` (flags 0 beside flags 1).
+fn unique_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32, UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))",
+    );
+    run(&mut db, "CREATE INDEX nu ON t (v)");
+    run(&mut db, "CREATE UNIQUE INDEX uq ON t (w)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 200), (3, NULL, 300)",
+    );
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic int64 rowid key.
 fn nopk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
@@ -401,6 +420,7 @@ fn write_matches_goldens() {
         ("composite_pk_table.jed", composite_pk_table_db),
         ("check_table.jed", check_table_db),
         ("index_table.jed", index_table_db),
+        ("unique_table.jed", unique_table_db),
         ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
@@ -430,6 +450,7 @@ fn read_goldens_reproduces_rows() {
         ("composite_pk_table.jed", composite_pk_table_db, "t"),
         ("check_table.jed", check_table_db, "t"),
         ("index_table.jed", index_table_db, "t"),
+        ("unique_table.jed", unique_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),

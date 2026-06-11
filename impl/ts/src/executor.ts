@@ -630,6 +630,42 @@ export class Database {
       pk = indices;
     }
 
+    // UNIQUE constraints (constraints.md §5.1): resolve members in textual definition
+    // order, AFTER the PRIMARY KEY constraints and BEFORE any CHECK validates (PG's
+    // order, oracle-probed — transformIndexConstraint runs first). Each member must
+    // exist (42703, PG's "named in key" wording), appear once (42701), and be of a
+    // key-encodable type (0A000 — the same narrowing as a PK member / index key column;
+    // unlike a PK member it stays nullable). Folding + naming happen LAST (after check
+    // naming), mirroring PG's index_create-at-execution timing.
+    const runiques: { name: string | null; cols: number[] }[] = [];
+    for (const u of ct.uniques) {
+      const indices: number[] = [];
+      for (const cname of u.columns) {
+        const lower = cname.toLowerCase();
+        const idx = columns.findIndex((c) => c.name.toLowerCase() === lower);
+        if (idx < 0) {
+          throw engineError("undefined_column", "column " + cname + " named in key does not exist");
+        }
+        if (indices.includes(idx)) {
+          throw engineError(
+            "duplicate_column",
+            "column " + cname + " appears twice in unique constraint",
+          );
+        }
+        indices.push(idx);
+      }
+      for (const i of indices) {
+        const ty = columns[i]!.type;
+        if (!isInteger(ty) && !isUuid(ty) && !isTimestamp(ty) && !isTimestamptz(ty)) {
+          throw engineError(
+            "feature_not_supported",
+            "a " + canonicalName(ty) + " unique constraint member is not supported yet",
+          );
+        }
+      }
+      runiques.push({ name: u.name, cols: indices });
+    }
+
     // CHECK constraints (constraints.md §4). All validation runs first, in textual
     // definition order, AFTER the PRIMARY KEY constraints resolved (PG's order,
     // oracle-probed); naming follows in a second pass, so a 42703 in a later check fires
@@ -660,7 +696,10 @@ export class Database {
       let name: string;
       if (def.name !== null) {
         if (nameTaken(def.name)) {
-          throw engineError("duplicate_object", "check constraint " + def.name + " already exists");
+          throw engineError(
+            "duplicate_object",
+            "constraint " + def.name + " for relation " + table.name + " already exists",
+          );
         }
         name = def.name;
       } else {
@@ -683,7 +722,69 @@ export class Database {
     });
     table.checks = checks;
 
+    // UNIQUE fold + naming (constraints.md §5.2/§5.3, PG-probed). Fold first: a
+    // constraint whose member list equals the primary key's (same order) creates
+    // nothing; identical lists fold into the first occurrence, the surviving name being
+    // the first explicitly-named one's. Then each survivor names its backing index in
+    // textual order: an explicit name checks the relation namespace (42P07 — existing
+    // relations, the table being created, and the statement's earlier indexes) before
+    // the table's constraint names (42710); a derived `<table>_<cols>_key` suffix-walks
+    // past BOTH namespaces.
+    const sameCols = (a: number[], b: number[]): boolean =>
+      a.length === b.length && a.every((v, i) => v === b[i]);
+    const survivors: { name: string | null; cols: number[] }[] = [];
+    for (const ru of runiques) {
+      if (sameCols(ru.cols, table.pk)) continue;
+      const existing = survivors.find((sv) => sameCols(sv.cols, ru.cols));
+      if (existing) {
+        if (existing.name === null) existing.name = ru.name;
+        continue;
+      }
+      survivors.push(ru);
+    }
+    const relationTaken = (n: string): boolean =>
+      this.relationExists(n) ||
+      table.name.toLowerCase() === n.toLowerCase() ||
+      table.indexes.some((ix) => ix.name.toLowerCase() === n.toLowerCase());
+    const checkNameTaken = (n: string): boolean =>
+      table.checks.some((c) => c.name.toLowerCase() === n.toLowerCase());
+    for (const ru of survivors) {
+      let name: string;
+      if (ru.name !== null) {
+        if (relationTaken(ru.name)) {
+          throw engineError("duplicate_table", "relation already exists: " + ru.name);
+        }
+        if (checkNameTaken(ru.name)) {
+          throw engineError(
+            "duplicate_object",
+            "constraint " + ru.name + " for relation " + table.name + " already exists",
+          );
+        }
+        name = ru.name;
+      } else {
+        let base = table.name.toLowerCase();
+        for (const i of ru.cols) base += "_" + columns[i]!.name.toLowerCase();
+        base += "_key";
+        name = base;
+        for (let suffix = 1; relationTaken(name) || checkNameTaken(name); suffix++) {
+          name = base + suffix.toString();
+        }
+      }
+      // Insert in catalog (ascending lowercased-name) order — indexes.md §6.
+      const nameKey = name.toLowerCase();
+      let pos = table.indexes.findIndex((ix) => ix.name.toLowerCase() > nameKey);
+      if (pos < 0) pos = table.indexes.length;
+      table.indexes.splice(pos, 0, { name, columns: ru.cols, unique: true });
+    }
+
     this.putTable(table);
+    // The table is brand new (no rows), so each backing index store starts empty.
+    for (const ix of table.indexes) {
+      this.working().putIndexStore(
+        ix.name.toLowerCase(),
+        new TableStore(this.pageSize - 12, []), // 12 = PAGE_HEADER
+      );
+    }
     // DDL touches no rows and evaluates no expressions: zero cost.
     return { kind: "statement", cost: 0n };
   }
@@ -785,14 +886,31 @@ export class Database {
     const meter = new Meter(this.maxCost);
     const mask = columns.map(() => false);
     for (const c of cols) mask[c] = true;
-    const def: IndexDef = { name, columns: cols };
+    const def: IndexDef = { name, columns: cols, unique: ci.unique };
     const store = this.readSnap().store(ci.table);
     const { pages: nodes, slabs } = store.scanUnits(mask);
     meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
     const entries: Uint8Array[] = [];
+    // A UNIQUE build verifies the existing rows before the index is registered
+    // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
+    // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
+    const seenPrefixes = new Set<string>();
     for (const e of store.entriesInKeyOrder()) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
+      if (def.unique) {
+        const prefix = indexPrefixKey(columns, def, e.row);
+        if (prefix !== null) {
+          const k = prefix.join(",");
+          if (seenPrefixes.has(k)) {
+            throw engineError(
+              "unique_violation",
+              "duplicate key value violates unique constraint: " + def.name,
+            );
+          }
+          seenPrefixes.add(k);
+        }
+      }
       entries.push(indexEntryKey(columns, def, e.key, e.row));
     }
     meter.guard();
@@ -1039,6 +1157,10 @@ export class Database {
     const n = table.columns.length;
     const prepared: { key: Uint8Array | null; row: Row }[] = [];
     const seenKeys = new Set<string>();
+    // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
+    // claimed — an in-batch duplicate traps 23505 like a stored one (indexes.md §8).
+    const uniqDefs = table.indexes.filter((d) => d.unique);
+    const seenPrefixes = uniqDefs.map(() => new Set<string>());
     let cunits = 0n;
     for (const values of rows) {
       const row: Row = new Array(n);
@@ -1093,14 +1215,38 @@ export class Database {
           key.set(b, off);
           off += b.length;
         }
+        // The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
+        // `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
         const seen = key.join(",");
         if (seenKeys.has(seen) || store.get(key) !== undefined) {
           throw engineError(
             "unique_violation",
-            "duplicate key value violates primary key uniqueness",
+            "duplicate key value violates unique constraint: " +
+              table.name.toLowerCase() +
+              "_pkey",
           );
         }
         seenKeys.add(seen);
+      }
+      // UNIQUE-index probes (indexes.md §8), AFTER the primary-key duplicate check (PG
+      // reports the PK first when both are violated — probed): per unique index in
+      // catalog (name) order, a fully-non-NULL key tuple (its slot prefix) must match no
+      // existing entry and no earlier row of this batch. Unmetered validation, like the
+      // PK duplicate check (cost.md §3).
+      for (let u = 0; u < uniqDefs.length; u++) {
+        const def = uniqDefs[u]!;
+        const prefix = indexPrefixKey(table.columns, def, row);
+        if (prefix === null) continue;
+        const istore = this.readSnap().indexStore(def.name.toLowerCase());
+        const stored = istore.rangeEntries(uniqueProbeBound(prefix));
+        const k = prefix.join(",");
+        if (stored.length > 0 || seenPrefixes[u]!.has(k)) {
+          throw engineError(
+            "unique_violation",
+            "duplicate key value violates unique constraint: " + def.name,
+          );
+        }
+        seenPrefixes[u]!.add(k);
       }
       // Meter the row's disposition-plan compression attempts (value_compress, cost.md §3).
       // For a no-PK table the synthetic rowid is allocated in phase 2; only the key LENGTH
@@ -1307,6 +1453,39 @@ export class Database {
       // nothing has been written).
       evalChecks(checks, table.name, resident, env, meter);
       updates.push({ key: e.key, row: resident, oldRow: row });
+    }
+
+    // UNIQUE validation against the statement's END STATE (indexes.md §8 — a documented
+    // PG divergence: PG checks per-row in heap order, so a transient collision like
+    // `SET v = v + 1` fails there and succeeds here). Per unique index in catalog (name)
+    // order, over the rewritten rows in scan (storage-key) order: the new prefixes must
+    // not collide with each other (in-batch), nor with an existing entry whose suffix is
+    // NOT a rewritten row's key (a rewritten row's old entry is being replaced, so it
+    // cannot conflict). Unmetered validation, phase 1.
+    if (updates.length > 0 && table.indexes.some((d) => d.unique)) {
+      const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
+      for (const def of table.indexes) {
+        if (!def.unique) continue;
+        const istore = this.readSnap().indexStore(def.name.toLowerCase());
+        const batch = new Set<string>();
+        for (const u of updates) {
+          const prefix = indexPrefixKey(table.columns, def, u.row);
+          if (prefix === null) continue;
+          const k = prefix.join(",");
+          const conflict =
+            batch.has(k) ||
+            istore
+              .rangeEntries(uniqueProbeBound(prefix))
+              .some((e) => !rewritten.has(e.key.slice(prefix.length).join(",")));
+          if (conflict) {
+            throw engineError(
+              "unique_violation",
+              "duplicate key value violates unique constraint: " + def.name,
+            );
+          }
+          batch.add(k);
+        }
+      }
     }
 
     // Each rewritten row's disposition plan may attempt compression (a record over RECORD_MAX)
@@ -2169,6 +2348,43 @@ function indexEntryKey(columns: Column[], def: IndexDef, storageKey: Uint8Array,
     off += b.length;
   }
   return out;
+}
+
+// indexPrefixKey builds a row's UNIQUENESS PROBE KEY for one unique index
+// (spec/design/indexes.md §8): the §3 entry key's slot prefix — without the storage-key
+// suffix — or null when any component is NULL (NULLS DISTINCT: such a tuple never
+// conflicts). Two rows conflict iff they yield the same non-null prefix.
+function indexPrefixKey(columns: Column[], def: IndexDef, row: Row): Uint8Array | null {
+  const parts: Uint8Array[] = [];
+  for (const ci of def.columns) {
+    const v = row[ci]!;
+    if (v.kind === "null") {
+      return null;
+    } else if (v.kind === "int") {
+      parts.push(Uint8Array.of(0x00), encodeInt(columns[ci]!.type, v.int));
+    } else if (v.kind === "uuid") {
+      parts.push(Uint8Array.of(0x00), v.bytes);
+    } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
+      parts.push(Uint8Array.of(0x00), encodeInt(columns[ci]!.type, v.micros));
+    } else {
+      throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
+    }
+  }
+  const total = parts.reduce((acc, b) => acc + b.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const b of parts) {
+    out.set(b, off);
+    off += b.length;
+  }
+  return out;
+}
+
+// uniqueProbeBound is the half-open byte range [prefix, byte-successor(prefix)) — every
+// index entry whose slot prefix equals prefix (the suffix makes tree keys unique, so
+// equal prefixes sit adjacent). The uniqueness probes range over it (indexes.md §8).
+function uniqueProbeBound(prefix: Uint8Array): KeyBound {
+  return { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
 }
 
 // bytesEq reports byte equality of two keys.

@@ -114,7 +114,7 @@ func TestCheckDDLErrorsMatchPostgres(t *testing.T) {
 	// Duplicate explicit name.
 	code, msg = checkErr(t, db,
 		"CREATE TABLE x (a int CONSTRAINT cc CHECK (a > 0) CONSTRAINT cc CHECK (a < 5))")
-	if code != "42710" || msg != "check constraint cc already exists" {
+	if code != "42710" || msg != "constraint cc for relation x already exists" {
 		t.Fatalf("dup name = %s %q", code, msg)
 	}
 	// An explicit name colliding with an EARLIER auto name (derived names never yield).

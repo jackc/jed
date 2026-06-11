@@ -6,6 +6,7 @@ import type {
   Assignment,
   BinaryOp,
   CheckDef,
+  UniqueDef,
   ColumnDef,
   Delete,
   Expr,
@@ -109,9 +110,13 @@ class Parser {
 
   parseStatement(): Statement {
     switch (this.peekKeyword()) {
-      // CREATE / DROP dispatch on the object keyword (TABLE vs INDEX — grammar.md §30).
+      // CREATE / DROP dispatch on the object keyword (TABLE vs [UNIQUE] INDEX — grammar.md
+      // §30; UNIQUE needs no lookahead of its own — after CREATE the next word being
+      // UNIQUE can only be CREATE UNIQUE INDEX).
       case "create":
-        if (this.peekKeywordAt(1) === "index") return this.parseCreateIndex();
+        if (this.peekKeywordAt(1) === "index" || this.peekKeywordAt(1) === "unique") {
+          return this.parseCreateIndex();
+        }
         return this.parseCreateTable();
       case "drop":
         if (this.peekKeywordAt(1) === "index") return this.parseDropIndex();
@@ -210,6 +215,7 @@ class Parser {
     const columns: ColumnDef[] = [];
     const tablePks: string[][] = [];
     const checks: CheckDef[] = [];
+    const uniques: UniqueDef[] = [];
     for (;;) {
       if (this.peekKeyword() === "primary" && this.peekKeywordAt(1) === "key") {
         this.advance();
@@ -217,8 +223,10 @@ class Parser {
         tablePks.push(this.parsePkColumnList());
       } else if (this.atCheckConstraint()) {
         checks.push(this.parseCheckConstraint());
+      } else if (this.atUniqueTableConstraint()) {
+        uniques.push(this.parseUniqueTableConstraint());
       } else {
-        columns.push(this.parseColumnDef(checks));
+        columns.push(this.parseColumnDef(checks, uniques));
       }
       const k = this.advance().kind;
       if (k === "comma") continue;
@@ -228,7 +236,30 @@ class Parser {
     if (columns.length === 0) {
       throw engineError("syntax_error", "a table must have at least one column");
     }
-    return { kind: "createTable", name, columns, tablePks, checks };
+    return { kind: "createTable", name, columns, tablePks, checks, uniques };
+  }
+
+  // atUniqueTableConstraint reports whether the cursor sits on a table-level UNIQUE
+  // constraint: the keyword UNIQUE followed by "(", or CONSTRAINT <ident> UNIQUE
+  // (spec/design/grammar.md §31). The keywords stay non-reserved — a column named
+  // "unique" is followed by a type name (an identifier, never "("), so the lookahead
+  // loses nothing.
+  private atUniqueTableConstraint(): boolean {
+    if (this.peekKeyword() === "unique" && this.peekKindAt(1) === "lparen") return true;
+    return this.peekKeyword() === "constraint" && this.peekKeywordAt(2) === "unique";
+  }
+
+  // parseUniqueTableConstraint parses one table-level `[CONSTRAINT name] UNIQUE ( col [,
+  // col]* )` (the cursor is verified by atUniqueTableConstraint). The member list reuses
+  // the PRIMARY KEY list shape (spec/design/grammar.md §31).
+  private parseUniqueTableConstraint(): UniqueDef {
+    let name: string | null = null;
+    if (this.peekKeyword() === "constraint") {
+      this.advance();
+      name = this.expectIdentifier();
+    }
+    this.expectKeyword("unique");
+    return { name, columns: this.parsePkColumnList() };
   }
 
   // atCheckConstraint reports whether the cursor sits on a CHECK constraint: the keyword
@@ -279,21 +310,32 @@ class Parser {
     }
   }
 
-  private parseColumnDef(checks: CheckDef[]): ColumnDef {
+  private parseColumnDef(checks: CheckDef[], uniques: UniqueDef[]): ColumnDef {
     const name = this.expectIdentifier();
     const typeName = this.expectIdentifier();
     const typeMod = this.parseTypeMod();
     // Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, DEFAULT <literal>,
-    // and [CONSTRAINT name] CHECK ( expr ). A boolean constraint may be repeated harmlessly;
-    // a repeated DEFAULT keeps the last; each CHECK is a distinct constraint, collected into
-    // the statement-wide list in textual order (a column-level check is semantically
-    // identical to a table-level one — spec/design/constraints.md §4).
+    // [CONSTRAINT name] CHECK ( expr ), and [CONSTRAINT name] UNIQUE. A boolean constraint
+    // may be repeated harmlessly; a repeated DEFAULT keeps the last; each CHECK is a
+    // distinct constraint, collected into the statement-wide list in textual order (a
+    // column-level check is semantically identical to a table-level one —
+    // spec/design/constraints.md §4). A column-level UNIQUE collects the same way as the
+    // one-member form (a repeat folds at execution — spec/design/constraints.md §5).
     let primaryKey = false;
     let notNull = false;
     let def: Literal | null = null;
     for (;;) {
       if (this.atCheckConstraint()) {
         checks.push(this.parseCheckConstraint());
+        continue;
+      }
+      // CONSTRAINT <name> UNIQUE in column position (the named one-member form;
+      // CONSTRAINT <name> CHECK ( was caught above).
+      if (this.peekKeyword() === "constraint" && this.peekKeywordAt(2) === "unique") {
+        this.advance();
+        const cname = this.expectIdentifier();
+        this.expectKeyword("unique");
+        uniques.push({ name: cname, columns: [name] });
         continue;
       }
       const kw = this.peekKeyword();
@@ -308,6 +350,9 @@ class Parser {
       } else if (kw === "default") {
         this.advance();
         def = this.parseLiteral();
+      } else if (kw === "unique") {
+        this.advance();
+        uniques.push({ name: null, columns: [name] });
       } else {
         break;
       }
@@ -356,6 +401,8 @@ class Parser {
   // this slice — a `(`/`ASC`/`DESC` after a key is the natural 42601).
   private parseCreateIndex(): Statement {
     this.expectKeyword("create");
+    const unique = this.peekKeyword() === "unique";
+    if (unique) this.advance();
     this.expectKeyword("index");
     const unnamed =
       this.peekKeyword() === "on" &&
@@ -373,7 +420,7 @@ class Parser {
       if (tok.kind === "rparen") break;
       throw engineError("syntax_error", `expected ',' or ')', found ${tok.kind}`);
     }
-    return { kind: "createIndex", name, table, columns };
+    return { kind: "createIndex", name, table, columns, unique };
   }
 
   // parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing

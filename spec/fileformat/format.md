@@ -15,12 +15,18 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 5)
+## Version scope (`format_version` 6)
 
-The current on-disk version is **`format_version` 5** — the **secondary-index catalog
-reshape** ([../design/indexes.md](../design/indexes.md)). Each version is a **clean break** —
-older versions are **not read** (we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md
-§1, "we own our surface"), so a reader accepts **only** version 5. Three changes:
+The current on-disk version is **`format_version` 6** — the per-index **flags byte**
+carrying the `unique` bit ([../design/indexes.md §8](../design/indexes.md),
+[../design/constraints.md §5](../design/constraints.md)). Each version is a **clean
+break** — older versions are **not read** (we are pre-1.0 and owe no on-disk
+compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only** version
+6. One change: each catalog index entry gains an `index_flags` u8 between its key
+ordinals and its root page — bit0 `unique`, the rest reserved (written 0, read-validated).
+
+`format_version` 5 was the **secondary-index catalog reshape**
+([../design/indexes.md](../design/indexes.md)). Three changes:
 
 1. The catalog table entry records the **primary key as an explicit ordinal list in key
    order** (`pk_count` + ordinals — *Catalog* below). Column-flag **bit0 is retired**
@@ -124,7 +130,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`5`** |
+| 4  | 2 | `format_version` (u16) — current = **`6`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -153,7 +159,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 5`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 6`,
 reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
 slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
 
@@ -215,6 +221,7 @@ list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`index_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`key_col_count` | u16 — ≥ 1; per index key column: |
 | &nbsp;&nbsp;`key_ordinal` ×`key_col_count` | u16 each — column ordinals in **index-key order**; each must be `< col_count` (duplicates allowed — indexes.md §1; else `XX001`) |
+| &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); bits 1–7 reserved, written 0 (a set reserved bit is `XX001`) |
 | &nbsp;&nbsp;`index_root_page` | u32 — the root B-tree node of this index, or 0 if the table has no rows |
 | `root_data_page` | u32 — the **root B-tree node** of this table, or 0 if it has no rows |
 
@@ -627,6 +634,7 @@ the interior-node format and the split contract.
 | `nopk_table.jed` | a no-PK table — the stored synthetic `int64` rowid key |
 | `composite_pk_table.jed` | a **composite PRIMARY KEY** (`int32` ‖ `int16`) — the concatenated key encoding (encoding.md §2.3) + the v5 `pk_ordinal` list; negative first component and tie-breaking second |
 | `index_table.jed` | **secondary indexes** (v5) — a table whose PK list order differs from declaration order (`PRIMARY KEY (b, a)` — the lifted narrowing), one single-column index over a **nullable** column holding a NULL (the encoding.md §2.2 presence tag in stored index order, NULL last) and one auto-named two-column index; empty-payload index records |
+| `unique_table.jed` | **unique indexes** (v6) — the per-index `index_flags` byte: a `UNIQUE` constraint's auto-named `t_v_key` (over a nullable column holding two NULLs — *NULLS DISTINCT* stored side by side), a named two-column constraint, a `CREATE UNIQUE INDEX`, and one plain index (`index_flags` 0) in the same catalog |
 | `check_table.jed` | **`CHECK` constraints** (v4) — the catalog check list: an auto-named single-column check, an explicitly-named multi-column check, and a check whose text exercises the token rendering (string + decimal literals, `<=`); stored in name order |
 | `tall_tree.jed` | enough small int rows to force a **two-level interior** (height-2 tree) — exercises interior-of-interior child pointers and post-order page allocation |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |

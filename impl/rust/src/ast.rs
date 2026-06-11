@@ -49,6 +49,21 @@ pub struct CreateTable {
     /// CREATE TABLE's execution validates each (0A000/42803/42P02/42703/42804) and names
     /// the unnamed ones (42710 on a collision).
     pub checks: Vec<CheckDef>,
+    /// Every `[CONSTRAINT name] UNIQUE [(cols)]` of the statement — the column-level form
+    /// collects as a one-member list — in **textual definition order** (it drives member
+    /// resolution, the dedup/PK fold, and naming — spec/design/constraints.md §5). Each
+    /// survivor becomes a unique secondary index (spec/design/indexes.md §8).
+    pub uniques: Vec<UniqueDef>,
+}
+
+/// One parsed `UNIQUE` constraint (spec/design/grammar.md §31): the optional explicit
+/// `CONSTRAINT` name (it names the backing index) and the member column names in list
+/// order. Execution resolves the members (42703/42701/0A000) and names the index
+/// (42P07/42710) — spec/design/constraints.md §5.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct UniqueDef {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
 }
 
 /// One parsed `CHECK` constraint (spec/design/grammar.md §29): the optional explicit
@@ -71,16 +86,19 @@ pub struct DropTable {
     pub name: String,
 }
 
-/// `CREATE INDEX [name] ON <table> ( col [, col]* )` — a non-unique secondary index
+/// `CREATE [UNIQUE] INDEX [name] ON <table> ( col [, col]* )` — a secondary index
 /// (spec/design/indexes.md, grammar.md §30). `name: None` is the unnamed form; the
 /// executor derives PostgreSQL's auto-name. Key columns are bare names (no expression /
 /// ordered / partial keys this slice); a column may repeat (PG allows it). Execution
-/// validates in PG's order: table 42P01, columns 42703/0A000, name collision 42P07.
+/// validates in PG's order: table 42P01, columns 42703/0A000, name collision 42P07. A
+/// `unique` index additionally verifies the existing rows at build (23505) and enforces
+/// uniqueness thereafter (spec/design/indexes.md §8).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CreateIndex {
     pub name: Option<String>,
     pub table: String,
     pub columns: Vec<String>,
+    pub unique: bool,
 }
 
 /// `DROP INDEX <name>` — remove one secondary index (spec/design/indexes.md §2).

@@ -37,6 +37,10 @@ id = "ddl.secondary_index"
 description = "CREATE INDEX [name] ON t (cols) / DROP INDEX name — non-unique secondary indexes: PG auto-naming (t_col_idx + suffixes), relation namespace shared with tables (42P07), validation order 42P01/42703/0A000/42P07, DROP errors 42704/42809; maintained on every write; the planner bounds a SELECT base-relation scan by a first-column equality (spec/design/indexes.md, grammar.md §30)"
 
 [[capability]]
+id = "ddl.unique"
+description = "UNIQUE constraints + unique indexes — column-level and table-level [CONSTRAINT name] UNIQUE (cols) and CREATE UNIQUE INDEX, all backed by a unique secondary index: PG auto-naming (t_col_key + suffixes; an explicit CONSTRAINT name names the index), identical-list dedup/PK fold, NULLS DISTINCT enforcement at INSERT/UPDATE (23505 names the constraint; UPDATE validates the end state — a documented PG divergence), build-over-duplicates 23505; the v6 catalog persists a per-index unique flag (spec/design/constraints.md §5, indexes.md §8)"
+
+[[capability]]
 id = "ddl.check"
 description = "CHECK constraints — column-level and table-level [CONSTRAINT name] CHECK (expr): boolean row predicates enforced per candidate row at INSERT/UPDATE (23514; TRUE/NULL pass), evaluated in name order; PG auto-naming (t_col_check / t_check + suffixes); DDL rejections 42804/0A000/42803/42P02/42703/42710; persisted as expression text in the v4 catalog (spec/design/constraints.md §4, grammar.md §29)"
 

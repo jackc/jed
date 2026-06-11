@@ -98,6 +98,20 @@ function indexTableDB(): Database {
   return db;
 }
 
+// uniqueTableDB has UNIQUE indexes (v6 — the per-index flags byte, indexes.md §8):
+// t_v_key (a UNIQUE constraint's auto-name) over a nullable column holding two NULLs
+// (NULLS DISTINCT — both stored), the named two-column constraint wv, a CREATE UNIQUE
+// INDEX uq, and the plain index nu (flags 0 beside flags 1).
+function uniqueTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32, " +
+    "UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))");
+  run(db, "CREATE INDEX nu ON t (v)");
+  run(db, "CREATE UNIQUE INDEX uq ON t (w)");
+  run(db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 200), (3, NULL, 300)");
+  return db;
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 function nopkTableDB(): Database {
   const db = goldenDb();
@@ -291,6 +305,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "composite_pk_table.jed", build: compositePKTableDB },
     { name: "check_table.jed", build: checkTableDB },
     { name: "index_table.jed", build: indexTableDB },
+    { name: "unique_table.jed", build: uniqueTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
   ];
   for (const c of cases) {
@@ -323,6 +338,7 @@ test("read goldens reproduces rows", () => {
     { name: "composite_pk_table.jed", build: compositePKTableDB, table: "t" },
     { name: "check_table.jed", build: checkTableDB, table: "t" },
     { name: "index_table.jed", build: indexTableDB, table: "t" },
+    { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },

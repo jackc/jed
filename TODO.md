@@ -604,8 +604,31 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       golden `check_table.jed` (19 fixtures, rust==go==ts==ruby); capability `ddl.check`;
       corpus `ddl/check.test` oracle-checked byte-identically (2 ledgered overrides: the
       non-reserved `check`/`constraint` column names).
-- [ ] **Constraints (remaining)** — `UNIQUE`, `FOREIGN KEY`. These are heavier.
-      _(size: M→L each)_
+- [x] **`UNIQUE` constraints + unique indexes** — ✅ landed (all 3 cores): column-level
+      `[CONSTRAINT name] UNIQUE`, table-level `[CONSTRAINT name] UNIQUE (a, b, …)`, and
+      `CREATE UNIQUE INDEX` (spec/design/constraints.md §5, indexes.md §8, grammar.md
+      §30/§31). A UNIQUE constraint **is** a unique secondary index — no separate
+      constraint object; the index name is the constraint's name and what the 23505
+      message reports (the registry template gained `{name}`; the PK reports the derived
+      `<table>_pkey`, never persisted/reserved). PG semantics oracle-probed: auto-name
+      `<table>_<cols>_key` + smallest free suffix, suffix-walked past the relation
+      namespace AND the table's check names; identical-list dedup (first explicit name
+      wins) and the PK fold; collisions 42P07 (relation) before 42710 (constraint — the
+      template generalized to PG's "constraint X for relation Y already exists");
+      member errors 42703/42701/0A000 before any CHECK validates. Enforcement is *NULLS
+      DISTINCT*: INSERT probes per row after the PK duplicate check (in-batch included);
+      `CREATE UNIQUE INDEX` verifies existing rows at build (23505, registers nothing);
+      uniqueness validation is unmetered (cost.md §3). `format_version` **6**: a
+      per-index flags byte (bit0 unique), 21 goldens incl. `unique_table.jed`,
+      rust==go==ts==ruby. Capability `ddl.unique`; corpus `ddl/unique.test`
+      (oracle-checked, 6 ledgered divergences); 10 mirrored tests ×3. **Documented PG
+      divergences**: UPDATE validates uniqueness against the statement's **end state**
+      (PG fails transient per-row collisions like `SET v = v + 1` in heap order — the
+      two-phase model is the overriding reason); `DROP INDEX` of a constraint-backed
+      index drops the constraint (no `ALTER TABLE … DROP CONSTRAINT` exists, so the
+      index name is the only handle; PG refuses 2BP01); multi-violation reports use
+      catalog (name) order, not PG's creation order. Unlocks `ON CONFLICT`. _(was: M)_
+- [ ] **Constraints (remaining)** — `FOREIGN KEY`. Heavier. _(size: L)_
 - [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — ✅ landed (all 3 cores):
       non-unique secondary indexes (spec/design/indexes.md, grammar.md §30). Each index is
       an on-disk **B-tree of empty-payload records** whose entry key is the indexed
@@ -631,7 +654,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       (UPDATE/DELETE keep PK pushdown), no LIMIT-streaming combination, no UNIQUE (next),
       indexable types = key-encodable types (no text/decimal/bytea/boolean keys), no
       expression/ordered/partial keys, no IF NOT EXISTS. _(was: L)_
-- [ ] **`RETURNING`** clause; **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE)_
+- [ ] **`RETURNING`** clause; **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE ✅ —
+      unblocked)_
 - [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
       `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).
       _(size: M; deps: transactions for clean re-keying)_

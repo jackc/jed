@@ -726,6 +726,49 @@ impl Database {
             pk = indices;
         }
 
+        // UNIQUE constraints (constraints.md §5.1): resolve members in textual definition
+        // order, AFTER the PRIMARY KEY constraints and BEFORE any CHECK validates (PG's
+        // order, oracle-probed — transformIndexConstraint runs first). Each member must
+        // exist (42703, PG's "named in key" wording), appear once (42701), and be of a
+        // key-encodable type (0A000 — the same narrowing as a PK member / index key column;
+        // unlike a PK member it stays nullable). Folding + naming happen LAST (after check
+        // naming), mirroring PG's index_create-at-execution timing.
+        let mut runiques: Vec<(Option<String>, Vec<usize>)> = Vec::with_capacity(ct.uniques.len());
+        for u in &ct.uniques {
+            let mut indices: Vec<usize> = Vec::with_capacity(u.columns.len());
+            for cname in &u.columns {
+                let idx = columns
+                    .iter()
+                    .position(|c: &Column| c.name.eq_ignore_ascii_case(cname))
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            SqlState::UndefinedColumn,
+                            format!("column {cname} named in key does not exist"),
+                        )
+                    })?;
+                if indices.contains(&idx) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateColumn,
+                        format!("column {cname} appears twice in unique constraint"),
+                    ));
+                }
+                indices.push(idx);
+            }
+            for &i in &indices {
+                let ty = columns[i].ty;
+                if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "a {} unique constraint member is not supported yet",
+                            ty.canonical_name()
+                        ),
+                    ));
+                }
+            }
+            runiques.push((u.name.clone(), indices));
+        }
+
         // CHECK constraints (constraints.md §4). All validation runs first, in textual
         // definition order, AFTER the PRIMARY KEY constraints resolved (PG's order,
         // oracle-probed); naming follows in a second pass, so a 42703 in a later check
@@ -777,7 +820,7 @@ impl Database {
                     if checks.iter().any(|c| c.name.eq_ignore_ascii_case(n)) {
                         return Err(EngineError::new(
                             SqlState::DuplicateObject,
-                            format!("check constraint {n} already exists"),
+                            format!("constraint {n} for relation {} already exists", table.name),
                         ));
                     }
                     n.clone()
@@ -815,7 +858,99 @@ impl Database {
         checks.sort_by_key(|c| c.name.to_ascii_lowercase());
         table.checks = checks;
 
+        // UNIQUE fold + naming (constraints.md §5.2/§5.3, PG-probed). Fold first: a
+        // constraint whose member list equals the primary key's (same order) creates
+        // nothing; identical lists fold into the first occurrence, the surviving name being
+        // the first explicitly-named one's. Then each survivor names its backing index in
+        // textual order: an explicit name checks the relation namespace (42P07 — existing
+        // relations, the table being created, and the statement's earlier indexes) before
+        // the table's constraint names (42710); a derived `<table>_<cols>_key` suffix-walks
+        // past BOTH namespaces.
+        let mut survivors: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+        for (uname, cols) in runiques {
+            if cols == table.pk {
+                continue;
+            }
+            if let Some(existing) = survivors.iter_mut().find(|(_, c)| *c == cols) {
+                if existing.0.is_none() {
+                    existing.0 = uname;
+                }
+                continue;
+            }
+            survivors.push((uname, cols));
+        }
+        for (uname, cols) in survivors {
+            let taken = |exec: &Self, t: &Table, n: &str| {
+                exec.relation_exists(n)
+                    || t.name.eq_ignore_ascii_case(n)
+                    || t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n))
+            };
+            let name = match uname {
+                Some(n) => {
+                    if taken(self, &table, &n) {
+                        return Err(EngineError::new(
+                            SqlState::DuplicateTable,
+                            format!("relation already exists: {n}"),
+                        ));
+                    }
+                    if table.checks.iter().any(|c| c.name.eq_ignore_ascii_case(&n)) {
+                        return Err(EngineError::new(
+                            SqlState::DuplicateObject,
+                            format!("constraint {n} for relation {} already exists", table.name),
+                        ));
+                    }
+                    n
+                }
+                None => {
+                    let mut base = table.name.to_ascii_lowercase();
+                    for &i in &cols {
+                        base.push('_');
+                        base.push_str(&table.columns[i].name.to_ascii_lowercase());
+                    }
+                    base.push_str("_key");
+                    let mut candidate = base.clone();
+                    let mut suffix = 0u32;
+                    while taken(self, &table, &candidate)
+                        || table
+                            .checks
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&candidate))
+                    {
+                        suffix += 1;
+                        candidate = format!("{base}{suffix}");
+                    }
+                    candidate
+                }
+            };
+            // Insert in catalog (ascending lowercased-name) order — indexes.md §6.
+            let name_key = name.to_ascii_lowercase();
+            let pos = table
+                .indexes
+                .iter()
+                .position(|i| i.name.to_ascii_lowercase() > name_key)
+                .unwrap_or(table.indexes.len());
+            table.indexes.insert(
+                pos,
+                IndexDef {
+                    name,
+                    columns: cols,
+                    unique: true,
+                },
+            );
+        }
+
+        let index_keys: Vec<String> = table
+            .indexes
+            .iter()
+            .map(|i| i.name.to_ascii_lowercase())
+            .collect();
         self.put_table(table);
+        // The table is brand new (no rows), so each backing index store starts empty.
+        let cap = self.page_size as usize - 12; // PAGE_HEADER
+        for k in index_keys {
+            self.working_mut()
+                .put_index_store(k, TableStore::new(cap, Vec::new()));
+        }
         // DDL touches no rows and evaluates no expressions: zero cost.
         Ok(Outcome::Statement { cost: 0 })
     }
@@ -947,14 +1082,31 @@ impl Database {
         let def = IndexDef {
             name,
             columns: cols,
+            unique: ci.unique,
         };
         let store = self.store(&ci.table);
         let (nodes, slabs) = store.scan_units(&mask)?;
         meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
         let mut entries: Vec<Vec<u8>> = Vec::with_capacity(store.len());
+        // A UNIQUE build verifies the existing rows before the index is registered
+        // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
+        // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
+        let mut seen_prefixes: HashSet<Vec<u8>> = HashSet::new();
         for (key, row) in store.iter_entries()? {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
+            if def.unique
+                && let Some(prefix) = index_prefix_key(&columns, &def, &row)
+                && !seen_prefixes.insert(prefix)
+            {
+                return Err(EngineError::new(
+                    SqlState::UniqueViolation,
+                    format!(
+                        "duplicate key value violates unique constraint: {}",
+                        def.name
+                    ),
+                ));
+            }
             entries.push(index_entry_key(&columns, &def, &key, &row));
         }
         meter.guard()?;
@@ -1216,6 +1368,10 @@ impl Database {
             .unwrap_or_else(|| (table.to_string(), Vec::new()));
         let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(rows.len());
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+        // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
+        // claimed — an in-batch duplicate traps 23505 like a stored one (indexes.md §8).
+        let uniq_defs: Vec<&IndexDef> = indexes.iter().filter(|d| d.unique).collect();
+        let mut seen_prefixes: Vec<HashSet<Vec<u8>>> = vec![HashSet::new(); uniq_defs.len()];
         let mut cunits: i64 = 0;
         for values in &rows {
             let mut row = Vec::with_capacity(n);
@@ -1297,14 +1453,43 @@ impl Database {
                     }
                 }
                 if seen_keys.contains(&k) || self.store(table).get(&k)?.is_some() {
+                    // The PK's 23505 reports PostgreSQL's derived auto-name for the PK
+                    // index, `<table>_pkey` — jed persists/reserves no such relation
+                    // (constraints.md §5.4).
                     return Err(EngineError::new(
                         SqlState::UniqueViolation,
-                        "duplicate key value violates primary key uniqueness",
+                        format!(
+                            "duplicate key value violates unique constraint: {}_pkey",
+                            relation.to_ascii_lowercase()
+                        ),
                     ));
                 }
                 seen_keys.insert(k.clone());
                 Some(k)
             };
+            // UNIQUE-index probes (indexes.md §8), AFTER the primary-key duplicate check
+            // (PG reports the PK first when both are violated — probed): per unique index
+            // in catalog (name) order, a fully-non-NULL key tuple (its slot prefix) must
+            // match no existing entry and no earlier row of this batch. Unmetered
+            // validation, like the PK duplicate check (cost.md §3).
+            for (u, def) in uniq_defs.iter().enumerate() {
+                let Some(prefix) = index_prefix_key(columns, def, &row) else {
+                    continue;
+                };
+                let istore = self.index_store(&def.name.to_ascii_lowercase());
+                let stored = !istore
+                    .range_entries(&unique_probe_bound(&prefix))?
+                    .is_empty();
+                if stored || !seen_prefixes[u].insert(prefix) {
+                    return Err(EngineError::new(
+                        SqlState::UniqueViolation,
+                        format!(
+                            "duplicate key value violates unique constraint: {}",
+                            def.name
+                        ),
+                    ));
+                }
+            }
             // Meter the row's disposition-plan compression attempts (value_compress, cost.md
             // §3). For a no-PK table the synthetic rowid is allocated in phase 2; only the key
             // LENGTH feeds the plan, so an 8-byte placeholder stands in deterministically.
@@ -1651,6 +1836,40 @@ impl Database {
                 }
             }
             updates.push((key, new_row, row));
+        }
+
+        // UNIQUE validation against the statement's END STATE (indexes.md §8 — a
+        // documented PG divergence: PG checks per-row in heap order, so a transient
+        // collision like `SET v = v + 1` fails there and succeeds here). Per unique index
+        // in catalog (name) order, over the rewritten rows in scan (storage-key) order:
+        // the new prefixes must not collide with each other (in-batch), nor with an
+        // existing entry whose suffix is NOT a rewritten row's key (a rewritten row's old
+        // entry is being replaced, so it cannot conflict). Unmetered validation, phase 1.
+        if indexes.iter().any(|d| d.unique) && !updates.is_empty() {
+            let rewritten: HashSet<&[u8]> = updates.iter().map(|(k, _, _)| k.as_slice()).collect();
+            for def in indexes.iter().filter(|d| d.unique) {
+                let istore = self.index_store(&def.name.to_ascii_lowercase());
+                let mut batch: HashSet<Vec<u8>> = HashSet::new();
+                for (_, new_row, _) in &updates {
+                    let Some(prefix) = index_prefix_key(&tcolumns, def, new_row) else {
+                        continue;
+                    };
+                    let conflict = !batch.insert(prefix.clone())
+                        || istore
+                            .range_entries(&unique_probe_bound(&prefix))?
+                            .iter()
+                            .any(|(ekey, _)| !rewritten.contains(&ekey[prefix.len()..]));
+                    if conflict {
+                        return Err(EngineError::new(
+                            SqlState::UniqueViolation,
+                            format!(
+                                "duplicate key value violates unique constraint: {}",
+                                def.name
+                            ),
+                        ));
+                    }
+                }
+            }
         }
 
         // Each rewritten row's disposition plan may attempt compression (a record over
@@ -3514,6 +3733,46 @@ fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: 
     }
     out.extend_from_slice(storage_key);
     out
+}
+
+/// A row's UNIQUENESS PROBE KEY for one unique index (spec/design/indexes.md §8): the §3
+/// entry key's slot prefix — without the storage-key suffix — or `None` when any component
+/// is NULL (*NULLS DISTINCT*: such a tuple never conflicts). Two rows conflict iff they
+/// yield the same `Some` prefix.
+fn index_prefix_key(columns: &[Column], def: &IndexDef, row: &Row) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for &ci in &def.columns {
+        match &row[ci] {
+            Value::Null => return None,
+            v => {
+                out.push(0x00);
+                let ty = columns[ci].ty;
+                match v {
+                    Value::Int(n) => out.extend_from_slice(&encode_int(ty, *n)),
+                    Value::Uuid(u) => out.extend_from_slice(u),
+                    Value::Timestamp(m) | Value::Timestamptz(m) => {
+                        out.extend_from_slice(&encode_int(ty, *m))
+                    }
+                    _ => {
+                        unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The half-open byte range `[prefix, byte-successor(prefix))` — every index entry whose
+/// slot prefix equals `prefix` (the suffix makes tree keys unique, so equal prefixes sit
+/// adjacent). The uniqueness probes range over it (spec/design/indexes.md §8).
+fn unique_probe_bound(prefix: &[u8]) -> KeyBound {
+    KeyBound {
+        lo: Some(prefix.to_vec()),
+        lo_inc: true,
+        hi: prefix_successor(prefix),
+        hi_inc: false,
+    }
 }
 
 /// The byte-successor of a prefix: the smallest byte string greater than every string that

@@ -1,24 +1,26 @@
 # Secondary indexes — design
 
-> `CREATE INDEX` / `DROP INDEX`: non-unique secondary indexes as on-disk B-trees beside
+> `CREATE [UNIQUE] INDEX` / `DROP INDEX`: secondary indexes as on-disk B-trees beside
 > each table's primary tree, maintained on every write and used by the planner to bound a
-> scan. This doc is the contract all three cores implement in lockstep (CLAUDE.md §2); the
-> grammar is in [../grammar/grammar.ebnf](../grammar/grammar.ebnf) +
-> [grammar.md §30](grammar.md), the byte layout in
-> [../fileformat/format.md](../fileformat/format.md) (`format_version` 5), the entry-key
+> scan; a **unique** index additionally enforces uniqueness (§8) and is what backs the
+> `UNIQUE` constraint ([constraints.md §5](constraints.md)). This doc is the contract all
+> three cores implement in lockstep (CLAUDE.md §2); the grammar is in
+> [../grammar/grammar.ebnf](../grammar/grammar.ebnf) +
+> [grammar.md §30/§31](grammar.md), the byte layout in
+> [../fileformat/format.md](../fileformat/format.md) (`format_version` 6), the entry-key
 > encoding in [encoding.md](encoding.md), and the cost contract in [cost.md §3](cost.md).
 > PostgreSQL semantics were pinned against the live `postgres:18` oracle (CLAUDE.md §1).
 
 ## 1. Surface
 
 ```sql
-CREATE INDEX [name] ON table (col [, col ...])
+CREATE [UNIQUE] INDEX [name] ON table (col [, col ...])
 DROP INDEX name
 ```
 
-- **Non-unique.** A `UNIQUE` index is a later slice (it is the enforcement mechanism for
-  the `UNIQUE` constraint — TODO.md). Duplicate indexed values are expected and handled
-  by the entry-key suffix (§3).
+- **Non-unique by default.** Duplicate indexed values are expected and handled by the
+  entry-key suffix (§3). The `UNIQUE` flag adds the §8 enforcement — the tree, the entry
+  keys, the maintenance, and the planner treatment are otherwise identical.
 - **Plain column keys only.** Each key is a bare column name. Expression keys
   (`(a + 1)`), per-key `ASC`/`DESC`/`NULLS`, partial (`WHERE`) indexes, `USING`,
   `IF NOT EXISTS`, and `CONCURRENTLY` are not in the grammar this slice (all are
@@ -63,11 +65,18 @@ included), joined with `_`. If the base is taken (case-insensitive), try `<base>
 An explicit name is stored **as written** (original case round-trips; comparisons are
 case-insensitive) — same rule as table and CHECK-constraint names.
 
+**`CREATE UNIQUE INDEX`** validates identically; its auto-name keeps the `_idx` suffix
+(the `_key` spelling belongs to the `UNIQUE` *constraint* — constraints.md §5.3). Before
+registration the build additionally **verifies the existing rows are unique** under §8's
+rule (any duplicate non-NULL tuple → **23505**, and the index is not created).
+
 **DROP INDEX**: the name must exist — **42704** `index does not exist: {name}` — and must
 be an index, not a table — **42809** (`wrong_object_type`, new) `{name} is not an index`.
 Symmetrically, `DROP TABLE` of an index name is **42809** `{name} is not a table`.
 **`DROP TABLE` drops the table's indexes with it** (they live in its catalog entry and
-have no independent life). Cost of both DDL statements: **zero** for `DROP INDEX` (a pure
+have no independent life). A **unique** index drops like any other — including one that
+backs a `UNIQUE` constraint, which drops the constraint with it (a documented PG
+divergence, §7). Cost of both DDL statements: **zero** for `DROP INDEX` (a pure
 catalog edit, like DROP TABLE); `CREATE INDEX` charges its build scan (§5).
 
 ## 3. The index entry: key encoding, no payload
@@ -99,8 +108,8 @@ Composition and `memcmp` order follow [encoding.md §2.3](encoding.md) unchanged
 
 Indexes are maintained **inside the same statement** that mutates the table, in the
 write phase of the existing two-phase / all-or-nothing model — validation (coercion, NOT
-NULL, CHECK, duplicate-key) never consults or touches an index, and an index write
-cannot fail, so atomicity is unchanged:
+NULL, CHECK, duplicate-key) only *reads* an index (the §8 uniqueness probes), never
+writes one, and an index write cannot fail, so atomicity is unchanged:
 
 - **INSERT** (both forms): after a row is stored, insert its entry into every index of
   the table.
@@ -176,9 +185,10 @@ the table's node count + `storage_row_read` per row (its touched set — the ind
 columns — is fixed-width, so the chain/decompress terms are structurally zero); an empty
 table charges 0. `DROP INDEX` charges 0.
 
-## 6. Persistence (`format_version` 5)
+## 6. Persistence (`format_version` 6)
 
-The catalog reshape ([../fileformat/format.md](../fileformat/format.md)):
+The catalog reshape (v5) + the unique flag (v6)
+([../fileformat/format.md](../fileformat/format.md)):
 
 - The table entry gains an explicit **primary-key ordinal list** (`pk_count` + column
   ordinals in **key order**). This retires column-flag bit0 (now reserved, written 0)
@@ -186,9 +196,11 @@ The catalog reshape ([../fileformat/format.md](../fileformat/format.md)):
   list order is key order, persisted independently of declaration order
   ([constraints.md §3](constraints.md)).
 - The table entry gains its **index list**: per index, the name (original case) +
-  column ordinals (key order, duplicates allowed) + the index tree's **root page**.
-  Indexes are stored and held in **ascending lowercased-name order** (the catalog's
-  deterministic order, like checks; also the §5 tie-break order).
+  column ordinals (key order, duplicates allowed) + a **flags byte** (`bit0 unique` —
+  added in v6; the remaining bits are reserved, written 0 and read-validated) + the
+  index tree's **root page**. Indexes are stored and held in **ascending
+  lowercased-name order** (the catalog's deterministic order, like checks; also the §5
+  tie-break order and the §8 violation-report order).
 - Each index is an ordinary on-disk **B-tree of empty-payload records** — the same
   leaf/interior pages, split/merge rules, copy-on-write incremental commit, free-list
   reclamation, and demand-paged open as a table tree. A record is `key_len ‖ key` with
@@ -202,6 +214,59 @@ The catalog reshape ([../fileformat/format.md](../fileformat/format.md)):
 - PG's index machinery (btree opclasses, `USING`, collations, opfamilies) is owned
   surface jed does not implement — we own our surface (CLAUDE.md §1).
 - Error **messages** differ in jed's house style (no identifier quoting); codes match.
-- PG reserves `ON`, so `CREATE INDEX on ON t (a)` is unparseable there; jed keeps every
-  word non-reserved via the grammar.md §30 lookahead (the standing no-reserved-words
-  stance, as for `check` / `constraint`).
+- PG reserves `ON` (and `UNIQUE`), so `CREATE INDEX on ON t (a)` is unparseable there;
+  jed keeps every word non-reserved via the grammar.md §30 lookahead (the standing
+  no-reserved-words stance, as for `check` / `constraint`).
+- **`DROP INDEX` of a constraint-backed unique index is allowed** and drops the `UNIQUE`
+  constraint with it. PG refuses (`2BP01`, "drop constraint instead"); the overriding
+  reason is structural — jed has no `ALTER TABLE … DROP CONSTRAINT`, so the index name
+  is the constraint's *only* handle, and refusing would make a UNIQUE constraint
+  permanent short of dropping the table.
+- **UPDATE uniqueness is validated against the statement's end state**, not per-row in
+  heap order — PG fails `UPDATE t SET v = v + 1` on a unique `v` where jed succeeds (§8;
+  the overriding reason is the two-phase / all-or-nothing model, CLAUDE.md §11 step 6).
+- When one row violates **several** unique indexes, jed reports the lowest lowercased
+  name; PG reports creation order, which jed does not persist (constraints.md §5.4).
+
+## 8. UNIQUE indexes (the enforcement)
+
+A **unique** index (`unique = true` in the catalog — set by `CREATE UNIQUE INDEX` or by a
+`UNIQUE` constraint, constraints.md §5) forbids two rows from sharing its **key-column
+value tuple**. Everything else about it — entry keys (§3), maintenance (§4), planner
+treatment (§5), persistence (§6) — is exactly a plain index's. Enforcement:
+
+- **The rule (*NULLS DISTINCT* — PostgreSQL's default).** Two rows conflict iff their
+  indexed tuples are equal **and every component is non-NULL**. A tuple with *any* NULL
+  component never conflicts with anything (any number of `(NULL)`s, or `(1, NULL)`s,
+  coexist — probed). Mechanically: a row's **uniqueness probe key** is its §3 entry key
+  *prefix* (the nullable slots, without the storage-key suffix); a prefix containing a
+  NULL tag is exempt, and a conflict is "another row's entry begins with the same
+  prefix" (a range probe `[prefix, byte-successor(prefix))` over the index tree — the
+  suffix makes tree keys unique, so equal prefixes sit adjacent).
+- **INSERT** (both sources): in phase 1, per candidate row, **after** the primary-key
+  duplicate check (PG reports the PK first when both are violated — probed), each
+  *unique* index of the table is probed in catalog (name) order: a non-exempt prefix
+  that matches an existing entry, **or one seen earlier in the same statement's batch**,
+  traps `23505` naming that index (constraints.md §5.4). Nothing has been written
+  (two-phase, all-or-nothing). NOT NULL (23502) and CHECK (23514) fire earlier, per the
+  existing per-row order (constraints.md §4.4).
+- **UPDATE**: phase 1 collects every matching row's rewritten values, then validates
+  uniqueness **against the end state**, per unique index in catalog order: the new
+  prefixes are checked against each other (an in-batch duplicate traps 23505) and
+  against the index's existing entries **excluding the rewritten rows' own** (an entry
+  whose storage-key suffix belongs to a row being rewritten is being replaced, so it
+  does not conflict). So `UPDATE t SET v = v + 1` and a two-row value *swap* both
+  succeed — the end state is unique — where PostgreSQL's per-row check fails on the
+  transient collision (§7; PG's report depends on heap order, which jed has no analogue
+  of). A genuine conflict with an untouched row traps 23505 as usual. The storage key
+  cannot change (the PK-assignment narrowing), so suffixes are stable.
+- **DELETE** cannot violate uniqueness; no probe.
+- **`CREATE UNIQUE INDEX` on a non-empty table** verifies the §1 build's computed
+  entries pairwise (the same exempt-NULL prefix rule) before the index is registered; a
+  duplicate traps `23505` and creates nothing.
+
+**Cost.** Uniqueness probes are **unmetered** validation work, like the primary-key
+duplicate check and the index maintenance itself ([cost.md §3](cost.md) "What is NOT
+metered") — an INSERT into a uniquely-indexed table accrues the same cost as into a
+plainly-indexed one. The `CREATE UNIQUE INDEX` build charges exactly the plain build's
+scan (§5); its verification adds nothing.
