@@ -10,10 +10,14 @@
 > here changes, update [CLAUDE.md](../../CLAUDE.md) §9, [storage.md §6](storage.md),
 > [../fileformat/format.md](../fileformat/format.md), and [types.md](types.md) in the same edit.
 
-**Status: design-only — NOT built.** Phase 6, deferred (storage.md §6, TODO.md). No code, no
-data tables, no fixtures yet. Per CLAUDE.md §14 a third-party dependency is **never** added on
-an agent's initiative — and as §6 below shows this feature needs **none**, which is part of the
-point. Nothing here is a commitment to build now; it is the spec of record for when it is.
+**Status: Slice A (overflow / out-of-line storage) BUILT — Slice B (compression) design-only.**
+Slice A landed in all three cores + the Ruby reference as `format_version` 3 (the bytes in
+[../fileformat/format.md](../fileformat/format.md) "Large values", goldens incl.
+`overflow_table.jed`; the resolved decisions in §12 below; the `page_read` accrual in
+[cost.md](cost.md) §3). Compression (§6, forms `0x03`/`0x04` — reserved in v3, additive when
+built) remains deferred (TODO.md). Per CLAUDE.md §14 a third-party dependency is **never** added
+on an agent's initiative — and as §6 below shows this feature needs **none**, which is part of
+the point.
 
 ---
 

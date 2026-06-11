@@ -813,11 +813,23 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       **out-of-line onto an overflow-page chain**, optionally **compressed** first (a
       deterministic hand-rolled **LZ4-block** codec). **Build order: overflow first (Slice A),
       compression second (Slice B)** — both behind one `format_version` 3 design (reserve the
-      compressed form codes in A so B is additive). The compressor is hand-rolled per core (a
-      library fails §8 cross-core byte-identity — large-values.md §6), so the feature needs **no**
-      third-party dependency; any later proposal is gated on CLAUDE.md §14. Unblocks the `decimal`
-      1000-digit cap and the `json`/`array` headline types. _(size: L→XL; deps: B-tree pages
-      [P6.1] ✓; §9/§13/§14)_
+      compressed form codes in A so B is additive).
+      - [x] **Slice A — overflow / out-of-line storage** ✅ **landed** (all 3 cores + Ruby ref):
+            `format_version` 3 (extended presence tag `0x02` external-plain, 9-byte pointer,
+            `page_type 4` chains, spill-only-when-forced planner — large-values.md §12),
+            byte-exact goldens incl. `overflow_table.jed`, reconstruct-on-open reclamation of
+            live chains, and the `page_read` cost accrual (chain pages folded into the scan's
+            up-front block — cost.md §3). Lazy (read-on-touch) materialization and the
+            per-touched-value cost refinement are tracked follow-ons (§7/§8.1).
+      - [ ] **Slice B — transparent compression**: the deterministic LZ4-block codec + input→bytes
+            fixtures, forms `0x03`/`0x04` (additive within v3), the compress decision +
+            store-smaller rule, and the `value_decompress` cost unit. The compressor is
+            hand-rolled per core (a library fails §8 cross-core byte-identity — large-values.md
+            §6), so it needs **no** third-party dependency; any later proposal is gated on
+            CLAUDE.md §14.
+
+      Unblocks the `decimal` 1000-digit cap and the `json`/`array` headline types. _(size: L→XL;
+      deps: B-tree pages [P6.1] ✓; §9/§13/§14)_
 - [ ] **Crash-recovery hardening** — torn-meta fixtures exist; expand durability/recovery
       tests. WAL is deferred (COW + root-swap gives atomicity without one). _(size: M; §9)_
 
