@@ -158,9 +158,11 @@ export class Snapshot {
   }
 
   // rowsInKeyOrder returns a table's rows in primary-key order, or [] if the table is absent.
+  // Every value is fully materialized — the helper's callers compare whole rows, so no
+  // unfetched reference may escape (large-values.md §14).
   rowsInKeyOrder(name: string): Row[] {
     const store = this.stores.get(name.toLowerCase());
-    return store ? store.iterInKeyOrder() : [];
+    return store ? store.iterInKeyOrder().map((r) => store.resolveAll(r)) : [];
   }
 }
 
@@ -756,7 +758,10 @@ export class Database {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
       meter.charge(COSTS.storageRowRead);
-      if (filter === null || isTrue(evalExpr(filter, e.row, env, meter))) {
+      // Materialize the filter's columns if the lazy load left them unfetched — exactly the
+      // touched set the block above charged (large-values.md §14).
+      const row = store.resolveColumns(e.row, mask);
+      if (filter === null || isTrue(evalExpr(filter, row, env, meter))) {
         keys.push(e.key);
       }
     }
@@ -845,12 +850,18 @@ export class Database {
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
-      if (filter !== null && !isTrue(evalExpr(filter, e.row, env, meter))) continue;
-      const newRow = e.row.slice();
+      // Materialize the filter's + assignment sources' columns if the lazy load left them
+      // unfetched — exactly the touched set the block above charged (large-values.md §14).
+      const row = store.resolveColumns(e.row, mask);
+      if (filter !== null && !isTrue(evalExpr(filter, row, env, meter))) continue;
+      const newRow = row.slice();
       for (const p of plans) {
-        newRow[p.idx] = checkAssign(p, evalExpr(p.source, e.row, env, meter));
+        newRow[p.idx] = checkAssign(p, evalExpr(p.source, row, env, meter));
       }
-      updates.push({ key: e.key, row: newRow });
+      // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
+      // columns so its weight/disposition re-plan exactly as an eager writer's would —
+      // unmetered, part of the rewrite like commit work (large-values.md §14).
+      updates.push({ key: e.key, row: store.resolveAll(newRow) });
     }
 
     // Each rewritten row's disposition plan may attempt compression (a record over RECORD_MAX)
@@ -1216,9 +1227,12 @@ export class Database {
     const out: Value[][] = [];
     if (!empty && limit > 0n) {
       let passed = 0n;
-      store.scanRange(bound, (_key, row) => {
+      store.scanRange(bound, (_key, rawRow) => {
         meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
         meter.charge(COSTS.storageRowRead);
+        // Materialize the touched columns if the lazy load left them unfetched
+        // (large-values.md §14) — a fresh copy only when needed (resolveColumns).
+        const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
         if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
           return true;
         }
@@ -1283,6 +1297,12 @@ export class Database {
         const u = store.scanUnits(plan.relMasks[ri]!);
         nodeCount = u.pages;
         slabs = u.slabs;
+      }
+      // Materialize this relation's touched columns where the lazy load left unfetched
+      // references (large-values.md §14) — exactly the static set the cost block charges, so
+      // the physical chain reads/decompressions match the metered units.
+      for (let i = 0; i < rows.length; i++) {
+        rows[i] = store.resolveColumns(rows[i]!, plan.relMasks[ri]!);
       }
       // The decompress slabs join the same up-front block as the page_read the scanSource
       // charges on its first next() (cost.md §3 "the compression units").

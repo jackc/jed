@@ -115,7 +115,7 @@ function persistImpl(db: Database, snap: Snapshot): void {
   // An in-memory database has no paging context — a no-op success (committed swaps in commitTx after
   // this). JS is single-threaded, so the read (fault) and this commit-write path never overlap.
   if (db.paging === null) return;
-  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages);
+  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging);
   for (const pg of write.pages) {
     db.paging.writeBlock(pg.index, pg.bytes);
   }

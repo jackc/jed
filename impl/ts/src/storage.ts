@@ -15,7 +15,7 @@ import type { ScalarType } from "./types.ts";
 import { PMap, pmapFromLoaded } from "./pmap.ts";
 import type { KeyBound, LeafSource, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
-import { anySpillable, anySpillableMasked, recordCompressUnits, recordScanUnits, recordSize } from "./format.ts";
+import { resolveUnfetched, anySpillable, anySpillableMasked, recordCompressUnits, recordScanUnits, recordSize } from "./format.ts";
 
 // Row is a stored row: one value per column, in column order.
 export type Row = Value[];
@@ -223,6 +223,31 @@ export class TableStore {
   writeCompressUnits(key: Uint8Array, row: Row): number {
     if (!anySpillable(this.colTypes)) return 0;
     return recordCompressUnits(this.colTypes, key, row, this.cap);
+  }
+
+  // resolveColumns returns `row` with the unfetched values in the columns `mask` selects
+  // materialized through this store's pager (spec/design/large-values.md §14). The scan layer
+  // calls this per admitted row with the query's touched-set mask — the same static set the cost
+  // block charges (cost.md §3), so the physical chain reads / decompressions are exactly what
+  // the page_read/value_decompress units metered. When nothing needs resolution the row is
+  // returned as-is; otherwise a fresh copy is built — stored rows are shared with the tree and
+  // must never be mutated in place. Repeated scans therefore re-read (and are re-charged)
+  // consistently.
+  resolveColumns(row: Row, mask: boolean[]): Row {
+    if (!row.some((v, i) => mask[i] && v.kind === "unfetched")) return row;
+    const paging = this.paging;
+    if (paging === null) throw new Error("an unfetched value implies a paged store");
+    const fetch = (p: number): Uint8Array => paging.readBlock(p);
+    return row.map((v, i) =>
+      mask[i] && v.kind === "unfetched" ? resolveUnfetched(this.colTypes[i]!, v.ref, fetch) : v,
+    );
+  }
+
+  // resolveAll materializes EVERY unfetched value in `row` (all columns). The mutation path uses
+  // this on a row it is about to re-store (UPDATE), so the stored row is fully resident and its
+  // weight/disposition re-plan exactly like an eager writer's (large-values.md §14).
+  resolveAll(row: Row): Row {
+    return this.resolveColumns(row, this.colTypes.map(() => true));
   }
 
   // scanRange streams the rows whose primary key lies within b to visit, in key order, stopping

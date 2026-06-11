@@ -50,8 +50,10 @@ export class SharedPaging {
   faultLeaf(page: number, colTypes: ScalarType[]): PNode {
     // Materialize any external value by following its overflow chain through the pager (the leaf
     // block holds only the pointer — spec/design/large-values.md §12).
-    const fetch = (p: number): Uint8Array => this.pager.readBlock(p);
-    return this.pool.getOrLoad(page, () => decodeLeafNode(this.pager.readBlock(page), page, colTypes, fetch));
+    // Lazy decode (spec/design/large-values.md §14): an external/compressed value stays an
+    // unfetched reference — no chain read, no decompression. The scan layer resolves the
+    // columns a query touches through readBlock below.
+    return this.pool.getOrLoad(page, () => decodeLeafNode(this.pager.readBlock(page), page, colTypes));
   }
 
   // readBlock reads one page through the pager — the demand-paged loader reads the meta, catalog, and

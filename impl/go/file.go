@@ -149,7 +149,7 @@ func (db *Database) persist(snap *Snapshot) error {
 	if db.paging == nil {
 		return nil
 	}
-	write, err := snap.incrementalImage(db.pageSize, db.pageCount, db.freePages)
+	write, err := snap.incrementalImage(db.pageSize, db.pageCount, db.freePages, db.paging)
 	if err != nil {
 		return err
 	}

@@ -264,6 +264,45 @@ impl TableStore {
         crate::format::record_compress_units(&self.col_types, key, row, self.cap)
     }
 
+    /// Whether `row` holds an unfetched large-value reference in any column `mask` selects —
+    /// the cheap gate before [`resolve_columns`](TableStore::resolve_columns) clones/faults.
+    pub(crate) fn needs_resolution(row: &Row, mask: &[bool]) -> bool {
+        row.iter()
+            .zip(mask.iter())
+            .any(|(v, &m)| m && matches!(v, Value::Unfetched(_)))
+    }
+
+    /// Materialize the unfetched values in the columns `mask` selects, in place, through this
+    /// store's pager (spec/design/large-values.md §14). The scan layer calls this per admitted
+    /// row with the query's touched-set mask — the same static set the cost block charges
+    /// (cost.md §3), so the physical chain reads / decompressions are exactly what the
+    /// `page_read`/`value_decompress` units metered. Resolution mutates only the scan's owned
+    /// copy, never the shared tree, so repeated scans re-read (and are re-charged) consistently.
+    pub(crate) fn resolve_columns(&self, row: &mut Row, mask: &[bool]) -> Result<()> {
+        for (i, v) in row.iter_mut().enumerate() {
+            if !mask[i] {
+                continue;
+            }
+            if let Value::Unfetched(u) = v {
+                let paging = self
+                    .paging
+                    .as_ref()
+                    .expect("an unfetched value implies a paged store");
+                let fetch = |p: u32| paging.pager().read_block(p);
+                *v = crate::format::resolve_unfetched(self.col_types[i], u, &fetch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialize **every** unfetched value in `row` (all columns). The mutation path uses this
+    /// on a row it is about to re-store (UPDATE), so the stored row is fully resident and its
+    /// weight/disposition re-plan exactly like an eager writer's (large-values.md §14).
+    pub(crate) fn resolve_all(&self, row: &mut Row) -> Result<()> {
+        let all = vec![true; self.col_types.len()];
+        self.resolve_columns(row, &all)
+    }
+
     /// Stream the rows whose primary key lies within `b` to `visit`, in key order, stopping (without
     /// faulting further leaves) the moment `visit` returns `Ok(false)` — the genuine LIMIT
     /// short-circuit (spec/design/cost.md §3 "LIMIT short-circuit").

@@ -221,6 +221,53 @@ func (s *TableStore) WriteCompressUnits(key []byte, row Row) int {
 	return recordCompressUnits(s.colTypes, key, row, s.cap)
 }
 
+// resolveColumns returns row with the unfetched values in the columns mask selects
+// materialized through this store's pager (spec/design/large-values.md §14). The scan layer
+// calls this per admitted row with the query's touched-set mask — the same static set the cost
+// block charges (cost.md §3), so the physical chain reads / decompressions are exactly what the
+// page_read/value_decompress units metered. When nothing needs resolution the row is returned
+// as-is; otherwise a fresh copy is built — stored rows are shared with the tree and must never
+// be mutated in place. Repeated scans therefore re-read (and are re-charged) consistently.
+func (s *TableStore) resolveColumns(row Row, mask []bool) (Row, error) {
+	needs := false
+	for i, v := range row {
+		if mask[i] && v.Kind == ValUnfetched {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return row, nil
+	}
+	if s.paging == nil {
+		panic("an unfetched value implies a paged store")
+	}
+	fetch := func(p uint32) ([]byte, error) { return s.paging.readBlock(p) }
+	out := make(Row, len(row))
+	copy(out, row)
+	for i := range out {
+		if mask[i] && out[i].Kind == ValUnfetched {
+			v, err := resolveUnfetched(s.colTypes[i], out[i].Unf, fetch)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = v
+		}
+	}
+	return out, nil
+}
+
+// resolveAll materializes EVERY unfetched value in row (all columns). The mutation path uses
+// this on a row it is about to re-store (UPDATE), so the stored row is fully resident and its
+// weight/disposition re-plan exactly like an eager writer's (large-values.md §14).
+func (s *TableStore) resolveAll(row Row) (Row, error) {
+	mask := make([]bool, len(s.colTypes))
+	for i := range mask {
+		mask[i] = true
+	}
+	return s.resolveColumns(row, mask)
+}
+
 // ScanRange streams the rows whose primary key lies within the bound to visit, in key order, stopping
 // (without faulting further leaves) the moment visit returns a false `continue` — the genuine LIMIT
 // short-circuit (spec/design/cost.md §3 "LIMIT short-circuit").

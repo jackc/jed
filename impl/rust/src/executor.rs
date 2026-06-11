@@ -107,12 +107,16 @@ impl Snapshot {
 
     /// All rows of a table in primary-key (encoded byte) order, or None if the table is absent. A
     /// test/debug convenience (the SELECT path scans through `iter_in_key_order` directly, propagating
-    /// I/O errors). The inner fault-`Result` is unwrapped here — these callers are in-memory, where a
-    /// scan never faults.
+    /// I/O errors); every value is fully materialized — the helper's callers compare whole rows, so
+    /// no unfetched reference may escape (large-values.md §14). The fault-`Result` is unwrapped here.
     fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
-        self.stores
-            .get(&name.to_ascii_lowercase())
-            .map(|s| s.iter_in_key_order().expect("in-memory read cannot fault"))
+        self.stores.get(&name.to_ascii_lowercase()).map(|s| {
+            let mut rows = s.iter_in_key_order().expect("test-helper read failed");
+            for row in &mut rows {
+                s.resolve_all(row).expect("test-helper resolve failed");
+            }
+            rows
+        })
     }
 
     /// Register a new table and its (empty) store. Lower-cased name is the key. The store carries
@@ -843,6 +847,11 @@ impl Database {
                                 "a text/decimal/bytea primary key is rejected at CREATE TABLE"
                             )
                         }
+                        // Poisoned (large-values.md §14): INSERT values are evaluated
+                        // expressions, never lazily-loaded storage rows.
+                        Value::Unfetched(_) => {
+                            panic!("BUG: unfetched large value escaped the storage layer")
+                        }
                     };
                     if seen_keys.contains(&k) || self.store(table).get(&k)?.is_some() {
                         return Err(EngineError::new(
@@ -961,9 +970,13 @@ impl Database {
             }
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
-        for (k, row) in entries {
+        let store = self.store(&del.table);
+        for (k, mut row) in entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
+            // Materialize the filter's columns if the lazy load left them unfetched — exactly
+            // the touched set the block above charged (large-values.md §14).
+            store.resolve_columns(&mut row, &mask)?;
             let matched = match &filter {
                 None => true,
                 Some(f) => f.eval(&row, &env, &mut meter)?.is_true(),
@@ -1110,9 +1123,13 @@ impl Database {
             }
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
-        for (key, row) in entries {
+        let store = self.store(&upd.table);
+        for (key, mut row) in entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
+            // Materialize the filter's + assignment sources' columns if the lazy load left them
+            // unfetched — exactly the touched set the block above charged (large-values.md §14).
+            store.resolve_columns(&mut row, &mask)?;
             let matched = match &filter {
                 None => true,
                 Some(f) => f.eval(&row, &env, &mut meter)?.is_true(),
@@ -1125,6 +1142,10 @@ impl Database {
                 let raw = plan.source.eval(&row, &env, &mut meter)?;
                 new_row[plan.idx] = plan.check(raw)?;
             }
+            // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
+            // columns so its weight/disposition re-plan exactly as an eager writer's would —
+            // unmetered, part of the rewrite like commit work (large-values.md §14).
+            store.resolve_all(&mut new_row)?;
             updates.push((key, new_row));
         }
 
@@ -1694,6 +1715,18 @@ impl Database {
             store.scan_range(&bound, &mut |_key, row| {
                 meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
                 meter.charge(COSTS.storage_row_read);
+                // Materialize the touched columns if the lazy load left them unfetched
+                // (large-values.md §14); the resolved copy is made only when needed, so the
+                // streaming path stays allocation-free for fully-resident rows.
+                let resolved;
+                let row = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
+                    let mut r = row.clone();
+                    store.resolve_columns(&mut r, &plan.rel_masks[0])?;
+                    resolved = r;
+                    &resolved
+                } else {
+                    row
+                };
                 let keep = match &plan.filter {
                     Some(f) => f.eval(row, env, meter)?.is_true(),
                     None => true,
@@ -1765,7 +1798,7 @@ impl Database {
             // Each base table's own primary-key bound (if any) seeks/ranges instead of walking the
             // whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing.
             // Otherwise the full scan is unchanged (cost.md §3 "bounded scan" / JOIN).
-            let (rows, (node_count, slabs)) = match &plan.rel_bounds[ri] {
+            let (mut rows, (node_count, slabs)) = match &plan.rel_bounds[ri] {
                 Some(bp) => match build_key_bound(bp, params, outer) {
                     Some(b) => (
                         store.range_rows(&b)?,
@@ -1778,6 +1811,12 @@ impl Database {
                     store.scan_units(&plan.rel_masks[ri])?,
                 ),
             };
+            // Materialize this relation's touched columns where the lazy load left unfetched
+            // references (large-values.md §14) — exactly the static set the cost block charges,
+            // so the physical chain reads/decompressions match the metered units.
+            for row in &mut rows {
+                store.resolve_columns(row, &plan.rel_masks[ri])?;
+            }
             // The decompress slabs join the same up-front block as the page_read the
             // ScanSource charges on its first next() (cost.md §3 "the compression units").
             meter.charge(COSTS.value_decompress * slabs as i64);
@@ -3252,6 +3291,8 @@ fn value_to_rexpr(v: &Value) -> RExpr {
         Value::Uuid(u) => RExpr::ConstUuid(*u),
         Value::Timestamp(m) => RExpr::ConstTimestamp(*m),
         Value::Timestamptz(m) => RExpr::ConstTimestamptz(*m),
+        // Poisoned (large-values.md §14): a folded subquery's projections are resolved values.
+        Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
 }
 
@@ -5244,6 +5285,8 @@ fn store_value(
                 )))
             }
         }
+        // Poisoned (large-values.md §14): a stored value is an evaluated expression result.
+        Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
 }
 
@@ -5346,6 +5389,9 @@ impl RExpr {
                     Value::Timestamp(_) | Value::Timestamptz(_) => {
                         unreachable!("resolver rejects a timestamp cast operand")
                     }
+                    Value::Unfetched(_) => {
+                        panic!("BUG: unfetched large value escaped the storage layer")
+                    }
                 }
             }
             RExpr::Neg { operand, result } => {
@@ -5371,6 +5417,9 @@ impl RExpr {
                     Value::Uuid(_) => unreachable!("resolver rejects a uuid unary minus"),
                     Value::Timestamp(_) | Value::Timestamptz(_) => {
                         unreachable!("resolver rejects a timestamp unary minus")
+                    }
+                    Value::Unfetched(_) => {
+                        panic!("BUG: unfetched large value escaped the storage layer")
                     }
                 }
             }
@@ -5767,5 +5816,8 @@ fn family_rank(v: &Value) -> u8 {
         Value::Uuid(_) => 6,
         Value::Timestamp(_) => 6,
         Value::Timestamptz(_) => 7,
+        // Poisoned (large-values.md §14): ORDER BY slots are in the touched set, so a sort
+        // key is always resolved before it reaches the comparator.
+        Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
 }

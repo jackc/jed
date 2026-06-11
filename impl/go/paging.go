@@ -62,12 +62,20 @@ func (s *sharedPaging) faultLeaf(page uint32, colTypes []ScalarType) (*pnode, er
 		if err != nil {
 			return nil, err
 		}
-		// Materialize any external value by following its overflow chain through the pager (the leaf
-		// block holds only the pointer — large-values.md §12). s.mu is already held, so the chain
-		// reads reuse it (a different page each time; no re-lock).
-		fetch := func(p uint32) ([]byte, error) { return s.pgr.readBlock(p) }
-		return decodeLeafNode(block, page, colTypes, fetch)
+		// Lazy decode (spec/design/large-values.md §14): an external/compressed value stays an
+		// unfetched reference — no chain read, no decompression. The scan layer resolves the
+		// columns a query touches through readBlock below.
+		return decodeLeafNode(block, page, colTypes)
 	})
+}
+
+// readBlock reads one page through the shared pager under the paging lock — the overflow-chain
+// read path the scan layer's read-on-touch resolution uses (large-values.md §14); concurrent
+// readers may resolve while another faults a leaf, so the same mutex serializes both.
+func (s *sharedPaging) readBlock(page uint32) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pgr.readBlock(page)
 }
 
 // withPager runs fn with the pager locked — the commit write path (file.go persist pwrites dirty

@@ -820,9 +820,15 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 		meter.Charge(Costs.StorageRowRead)
+		// Materialize the filter's columns if the lazy load left them unfetched — exactly the
+		// touched set the block above charged (large-values.md §14).
+		row, err := store.resolveColumns(e.Row, mask)
+		if err != nil {
+			return Outcome{}, err
+		}
 		matched := true
 		if filter != nil {
-			v, err := filter.eval(e.Row, env, meter)
+			v, err := filter.eval(row, env, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -972,8 +978,14 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 		meter.Charge(Costs.StorageRowRead)
+		// Materialize the filter's + assignment sources' columns if the lazy load left them
+		// unfetched — exactly the touched set the block above charged (large-values.md §14).
+		row, err := store.resolveColumns(e.Row, mask)
+		if err != nil {
+			return Outcome{}, err
+		}
 		if filter != nil {
-			v, err := filter.eval(e.Row, env, meter)
+			v, err := filter.eval(row, env, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -981,10 +993,10 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 				continue
 			}
 		}
-		newRow := make(Row, len(e.Row))
-		copy(newRow, e.Row)
+		newRow := make(Row, len(row))
+		copy(newRow, row)
 		for _, p := range plans {
-			raw, err := p.source.eval(e.Row, env, meter)
+			raw, err := p.source.eval(row, env, meter)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -993,6 +1005,12 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 				return Outcome{}, err
 			}
 			newRow[p.idx] = checked
+		}
+		// The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
+		// columns so its weight/disposition re-plan exactly as an eager writer's would —
+		// unmetered, part of the rewrite like commit work (large-values.md §14).
+		if newRow, err = store.resolveAll(newRow); err != nil {
+			return Outcome{}, err
 		}
 		updates = append(updates, pending{key: e.Key, row: newRow})
 	}
@@ -1030,6 +1048,13 @@ func (db *Database) RowsInKeyOrder(name string) []Row {
 	rows, err := store.IterInKeyOrder()
 	if err != nil {
 		panic(err)
+	}
+	// Fully materialize every value — the helper's callers compare whole rows, so no
+	// unfetched reference may escape (large-values.md §14).
+	for i := range rows {
+		if rows[i], err = store.resolveAll(rows[i]); err != nil {
+			panic(err)
+		}
 	}
 	return rows
 }
@@ -1984,6 +2009,12 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 				return false, err
 			}
 			meter.Charge(Costs.StorageRowRead)
+			// Materialize the touched columns if the lazy load left them unfetched
+			// (large-values.md §14) — a fresh copy only when needed (resolveColumns).
+			row, err := store.resolveColumns(row, plan.relMasks[0])
+			if err != nil {
+				return false, err
+			}
 			if plan.filter != nil {
 				v, err := plan.filter.eval(row, env, meter)
 				if err != nil {
@@ -2060,6 +2091,15 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 				return selectResult{}, err
 			}
 			if nodeCount, slabs, err = store.ScanUnits(plan.relMasks[ri]); err != nil {
+				return selectResult{}, err
+			}
+		}
+		// Materialize this relation's touched columns where the lazy load left unfetched
+		// references (large-values.md §14) — exactly the static set the cost block charges,
+		// so the physical chain reads/decompressions match the metered units.
+		for i := range rows {
+			var err error
+			if rows[i], err = store.resolveColumns(rows[i], plan.relMasks[ri]); err != nil {
 				return selectResult{}, err
 			}
 		}

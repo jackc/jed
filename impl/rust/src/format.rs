@@ -22,7 +22,7 @@ use crate::paging::SharedPaging;
 use crate::pmap::{Child, Node};
 use crate::storage::Row;
 use crate::types::{DecimalTypmod, ScalarType};
-use crate::value::Value;
+use crate::value::{Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
@@ -175,6 +175,9 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
             }
             out
         }
+        // An unfetched reference is resolved before any encode/plan (the scan layer for reads,
+        // the mutation path for stores, `resolve_for_encode` at commit — large-values.md §14).
+        Value::Unfetched(_) => panic!("BUG: encoding an unfetched large value"),
     }
 }
 
@@ -348,11 +351,42 @@ pub(crate) fn record_scan_units(
     cap: usize,
     mask: &[bool],
 ) -> ScanUnits {
-    let plan = plan_dispositions(col_types, key, row, cap);
     let mut units = ScanUnits {
         pages: 0,
         decompress: 0,
     };
+    // A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
+    // §14): read the units straight off them — no disposition re-plan, which would need the
+    // unfetched bytes. The numbers equal the resident plan below by construction (the
+    // references ARE that plan's stored output), so a paged and an in-memory database charge
+    // identically (cost.md §3, logical cost).
+    if row.iter().any(|v| matches!(v, Value::Unfetched(_))) {
+        for (i, v) in row.iter().enumerate() {
+            if !mask[i] {
+                continue;
+            }
+            if let Value::Unfetched(u) = v {
+                match u {
+                    Unfetched::External { len, .. } => {
+                        units.pages += (*len as usize).div_ceil(cap);
+                    }
+                    Unfetched::InlineComp { raw_len, .. } => {
+                        units.decompress += (*raw_len as usize).div_ceil(cap);
+                    }
+                    Unfetched::ExternalComp {
+                        stored_len,
+                        raw_len,
+                        ..
+                    } => {
+                        units.pages += (*stored_len as usize).div_ceil(cap);
+                        units.decompress += (*raw_len as usize).div_ceil(cap);
+                    }
+                }
+            }
+        }
+        return units;
+    }
+    let plan = plan_dispositions(col_types, key, row, cap);
     for (i, d) in plan.disp.iter().enumerate() {
         if !mask[i] {
             continue; // an untouched column's chain/slabs are never read (cost.md §3)
@@ -585,6 +619,30 @@ fn serialize_node(
     Ok(index)
 }
 
+/// Materialize any unfetched values in `row` for re-encoding at commit
+/// (spec/design/large-values.md §14): a dirty leaf may carry rows the lazy load left as
+/// references; the serializer needs their bytes to re-plan and rewrite the record. Unmetered,
+/// like all commit work. Returns `None` when nothing is unfetched (the common case — no clone).
+fn resolve_for_encode(
+    row: &Row,
+    table: &Table,
+    paging: Option<&SharedPaging>,
+) -> Result<Option<Row>> {
+    if !row.iter().any(|v| matches!(v, Value::Unfetched(_))) {
+        return Ok(None);
+    }
+    let paging = paging.ok_or_else(|| corrupt("unfetched large value with no pager at commit"))?;
+    let fetch = |p: u32| paging.pager().read_block(p);
+    let mut out = row.clone();
+    for (i, v) in out.iter_mut().enumerate() {
+        if let Value::Unfetched(u) = v {
+            let resolved = resolve_unfetched(table.columns[i].ty, u, &fetch)?;
+            *v = resolved;
+        }
+    }
+    Ok(Some(out))
+}
+
 /// The pages an incremental commit must write durably, plus the new catalog root and high-water for
 /// the meta slot (spec/fileformat/format.md, P6.1 part B). Each `pages` entry is a full `page_size`
 /// image keyed by its page index; `file.rs` pwrites them, then publishes `root_page`/`page_count` in
@@ -637,6 +695,7 @@ impl Snapshot {
         page_size: u32,
         start_page: u32,
         free: &[u32],
+        paging: Option<&SharedPaging>,
     ) -> Result<IncrementalWrite> {
         let ps = page_size as usize;
         let cap = ps - PAGE_HEADER;
@@ -655,7 +714,8 @@ impl Snapshot {
         let mut root_data_page = vec![0u32; tables.len()];
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
-                root_data_page[ti] = serialize_dirty(root, table, cap, ps, &mut alloc, &mut pages)?;
+                root_data_page[ti] =
+                    serialize_dirty(root, table, cap, ps, &mut alloc, &mut pages, paging)?;
             }
         }
 
@@ -707,6 +767,7 @@ fn serialize_dirty(
     ps: usize,
     alloc: &mut PageAlloc,
     pages: &mut Vec<(u32, Vec<u8>)>,
+    paging: Option<&SharedPaging>,
 ) -> Result<u32> {
     let existing = node.page.load(Ordering::Acquire);
     if existing != 0 {
@@ -717,7 +778,7 @@ fn serialize_dirty(
         // A `Resident` child recurses (dirty descendants get pages); an `OnDisk` child is a clean
         // leaf already durable at its page — keep it, write nothing (the incremental-commit win).
         let cp = match child {
-            Child::Resident(n) => serialize_dirty(n, table, cap, ps, alloc, pages)?,
+            Child::Resident(n) => serialize_dirty(n, table, cap, ps, alloc, pages, paging)?,
             Child::OnDisk(p) => *p,
         };
         child_pages.push(cp);
@@ -733,16 +794,22 @@ fn serialize_dirty(
         PAGE_INTERIOR
     };
     // Encode records, spilling over-large values to overflow pages drawn from the same allocator
-    // (free-list first, then high-water — large-values.md §12). Scoped so the `&mut alloc` borrow
+    // (free-list first, then high-water — large-values.md §12). A dirty node may carry rows the
+    // lazy load left unfetched (a sibling row's mutation dirtied them): resolve those through the
+    // pager first — unmetered commit work, large-values.md §14 — so the re-encode re-plans the
+    // resident row exactly as an eager writer would (chains are rewritten fresh; sharing an
+    // unchanged chain is the deferred byte-layout follow-on). Scoped so the `&mut alloc` borrow
     // ends before this node's own page is allocated.
     let mut ovf = Vec::new();
     {
         let mut take = || alloc.take();
         for i in 0..node.keys.len() {
+            let resolved = resolve_for_encode(&node.vals[i], table, paging)?;
+            let row = resolved.as_ref().unwrap_or(&node.vals[i]);
             payload.extend_from_slice(&encode_record(
                 table,
                 &node.keys[i],
-                &node.vals[i],
+                row,
                 cap,
                 &mut take,
                 &mut ovf,
@@ -940,8 +1007,9 @@ impl Database {
 /// Walk a table's on-disk B-tree, reading each **leaf** and adding the overflow chain pages its
 /// records reference to `reached` (spec/design/large-values.md §12). Interior separators are
 /// skipped here — `read_skeleton_node` already collected their chains. Used only for tables with
-/// spillable columns during the paged-open free-list reconstruction; it reads (and transiently
-/// materializes) every leaf, the deliberate cost of reconstruct-on-open reclamation for overflow.
+/// spillable columns during the paged-open free-list reconstruction; it decodes each leaf lazily
+/// and follows its chains **by headers only** (`chain_pages` — large-values.md §14), so opening a
+/// file never materializes or decompresses a large value.
 fn collect_leaf_overflow(
     paging: &SharedPaging,
     page_idx: u32,
@@ -955,8 +1023,8 @@ fn collect_leaf_overflow(
             let fetch = |p: u32| paging.pager().read_block(p);
             let mut pos = 0usize;
             for _ in 0..page.item_count {
-                let (_k, _r, ovf) = decode_record(col_types, page.payload, &mut pos, Some(&fetch))?;
-                reached.extend(ovf);
+                let (_k, row, _w) = decode_record_lazy(col_types, page.payload, &mut pos)?;
+                mark_chains(&row, &fetch, reached)?;
             }
             Ok(())
         }
@@ -1024,13 +1092,13 @@ fn read_skeleton_node(
                 Vec::with_capacity(n),
                 Vec::with_capacity(n),
             );
-            let cap = block.len() - PAGE_HEADER;
+            // Separators decode lazily like leaves (large-values.md §14): an external value
+            // stays an unfetched reference; its chain is marked reachable by headers only.
             let fetch = |p: u32| paging.pager().read_block(p);
             for _ in 0..n {
-                let (key, row, ovf) =
-                    decode_record(col_types, page.payload, &mut pos, Some(&fetch))?;
-                weights.push(record_size(col_types, &key, &row, cap) as u32);
-                reached.extend(ovf);
+                let (key, row, w) = decode_record_lazy(col_types, page.payload, &mut pos)?;
+                weights.push(w as u32);
+                mark_chains(&row, &fetch, reached)?;
                 keys.push(key);
                 vals.push(row);
             }
@@ -1423,22 +1491,15 @@ fn page_block(image: &[u8], ps: usize, index: u32) -> Result<Vec<u8>> {
 
 /// Decode a single **leaf** page block into a resident node, for the demand-paging fault path
 /// (spec/design/pager.md §4; paging.rs `fault_leaf`). `block` is one page; `page` is its page id,
-/// stamped on the node so a later incremental commit keeps it clean. Weights are recomputed from the
-/// value codec (the exact size the writer used), so the loaded leaf is ready for further splits.
-/// `fetch` reads an overflow page block by index (to materialize external values whose chains live
-/// outside this leaf — large-values.md §12); the chain pages it visits are discarded here (the
-/// free-list is reconstructed at open, not on a runtime fault).
-pub(crate) fn decode_leaf_node(
-    block: &[u8],
-    page: u32,
-    col_types: &[ScalarType],
-    fetch: Option<&dyn Fn(u32) -> Result<Vec<u8>>>,
-) -> Result<Node> {
+/// stamped on the node so a later incremental commit keeps it clean. Decoding is **lazy**
+/// (large-values.md §14): an external/compressed value becomes an [`Unfetched`] reference — no
+/// chain read, no decompression — resolved later only for the columns a query touches. Each
+/// weight is the bytes the record occupies on the page (exactly the writer's `record_size`).
+pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ScalarType]) -> Result<Node> {
     let parsed = parse_page(block)?;
     if parsed.page_type != PAGE_LEAF {
         return Err(corrupt("demand-paged a non-leaf page"));
     }
-    let cap = block.len() - PAGE_HEADER;
     let n = parsed.item_count as usize;
     let (mut keys, mut vals, mut weights) = (
         Vec::with_capacity(n),
@@ -1447,8 +1508,8 @@ pub(crate) fn decode_leaf_node(
     );
     let mut pos = 0usize;
     for _ in 0..n {
-        let (key, row, _ovf) = decode_record(col_types, parsed.payload, &mut pos, fetch)?;
-        weights.push(record_size(col_types, &key, &row, cap) as u32);
+        let (key, row, w) = decode_record_lazy(col_types, parsed.payload, &mut pos)?;
+        weights.push(w as u32);
         keys.push(key);
         vals.push(row);
     }
@@ -1646,6 +1707,145 @@ fn read_overflow_chain(
         p = page.next_page;
     }
     Ok(out)
+}
+
+/// Read one value **lazily** (spec/design/large-values.md §14): inline-plain and NULL decode as
+/// today, but an external/compressed form becomes an [`Unfetched`] reference holding exactly the
+/// record's pointer fields — no chain read, no decompression. The scan layer resolves the
+/// references for the columns a query touches ([`resolve_unfetched`]); the commit path resolves
+/// the rest when a dirty leaf re-encodes (`resolve_for_encode`).
+fn read_value_lazy(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+    match read_u8(buf, pos)? {
+        0x00 => read_inline_body(ty, buf, pos),
+        0x01 => Ok(Value::Null),
+        TAG_EXTERNAL => {
+            let first_page = read_u32(buf, pos)?;
+            let len = read_u32(buf, pos)?;
+            Ok(Value::Unfetched(Unfetched::External { first_page, len }))
+        }
+        TAG_INLINE_COMP => {
+            let raw_len = read_u32(buf, pos)?;
+            let comp_len = read_u16(buf, pos)? as usize;
+            let comp = take(buf, pos, comp_len)?.to_vec();
+            Ok(Value::Unfetched(Unfetched::InlineComp { comp, raw_len }))
+        }
+        TAG_EXTERNAL_COMP => {
+            let first_page = read_u32(buf, pos)?;
+            let stored_len = read_u32(buf, pos)?;
+            let raw_len = read_u32(buf, pos)?;
+            Ok(Value::Unfetched(Unfetched::ExternalComp {
+                first_page,
+                stored_len,
+                raw_len,
+            }))
+        }
+        _ => Err(corrupt("invalid value presence tag")),
+    }
+}
+
+/// Decode one record lazily (`read_value_lazy` per column) and return `(key, row, weight)`,
+/// where the weight is the bytes the record occupies on the page — exactly the
+/// [`record_size`] the writer split on, read off the cursor instead of re-planned (a re-plan
+/// would need the unfetched bytes).
+fn decode_record_lazy(
+    col_types: &[ScalarType],
+    buf: &[u8],
+    pos: &mut usize,
+) -> Result<(Vec<u8>, Row, usize)> {
+    let start = *pos;
+    let key_len = read_u16(buf, pos)? as usize;
+    let key = take(buf, pos, key_len)?.to_vec();
+    let mut row = Vec::with_capacity(col_types.len());
+    for &ty in col_types {
+        row.push(read_value_lazy(ty, buf, pos)?);
+    }
+    Ok((key, row, *pos - start))
+}
+
+/// Materialize an unfetched reference into its plain [`Value`] (spec/design/large-values.md
+/// §14): gather the overflow chain through `fetch` for an external form, decompress a
+/// compressed one, and reconstruct by column type. Decompression errors are `data_corrupted`,
+/// surfaced only when the value is actually touched.
+pub(crate) fn resolve_unfetched(
+    ty: ScalarType,
+    u: &Unfetched,
+    fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
+) -> Result<Value> {
+    let mut sink = Vec::new();
+    match u {
+        Unfetched::External { first_page, len } => {
+            let payload = read_overflow_chain(*first_page, *len as usize, fetch, &mut sink)?;
+            value_from_payload(ty, &payload)
+        }
+        Unfetched::InlineComp { comp, raw_len } => {
+            let payload = crate::lz4::decompress(comp, *raw_len as usize)?;
+            value_from_payload(ty, &payload)
+        }
+        Unfetched::ExternalComp {
+            first_page,
+            stored_len,
+            raw_len,
+        } => {
+            let comp = read_overflow_chain(*first_page, *stored_len as usize, fetch, &mut sink)?;
+            let payload = crate::lz4::decompress(&comp, *raw_len as usize)?;
+            value_from_payload(ty, &payload)
+        }
+    }
+}
+
+/// The page indices of the overflow chain carrying `len` payload bytes from `first`, following
+/// `next_page` hops and reading **headers only** — no payload assembly, no decompression
+/// (spec/design/large-values.md §14). The open-time reachability walk marks live chains with
+/// this, so opening a file never materializes its large values.
+fn chain_pages(first: u32, len: usize, fetch: &dyn Fn(u32) -> Result<Vec<u8>>) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    let mut gathered = 0usize;
+    let mut p = first;
+    while gathered < len {
+        if p == 0 {
+            return Err(corrupt("overflow chain ended before the value length"));
+        }
+        out.push(p);
+        let block = fetch(p)?;
+        let page = parse_page(&block)?;
+        if page.page_type != PAGE_OVERFLOW {
+            return Err(corrupt("expected an overflow page"));
+        }
+        let take = page.item_count as usize;
+        if take == 0 || take > page.payload.len() || gathered + take > len {
+            return Err(corrupt("overflow page slab out of range"));
+        }
+        gathered += take;
+        p = page.next_page;
+    }
+    Ok(out)
+}
+
+/// Add the overflow chain pages a lazily-decoded row references to `reached` (the free-list
+/// reachability walk), via the header-only [`chain_pages`] hop.
+fn mark_chains(
+    row: &Row,
+    fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
+    reached: &mut HashSet<u32>,
+) -> Result<()> {
+    for v in row {
+        if let Value::Unfetched(u) = v {
+            match u {
+                Unfetched::External { first_page, len } => {
+                    reached.extend(chain_pages(*first_page, *len as usize, fetch)?);
+                }
+                Unfetched::ExternalComp {
+                    first_page,
+                    stored_len,
+                    ..
+                } => {
+                    reached.extend(chain_pages(*first_page, *stored_len as usize, fetch)?);
+                }
+                Unfetched::InlineComp { .. } => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 // --- bounds-checked big-endian readers over a payload cursor ---

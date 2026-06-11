@@ -32,6 +32,7 @@ import {
   widthBytes,
 } from "./types.ts";
 import {
+  type Unfetched,
   type Value,
   boolValue,
   byteaValue,
@@ -151,6 +152,11 @@ export function crc32Ieee(data: Uint8Array): number {
 // true (types.md §9).
 function encodeValue(ty: ScalarType, v: Value): Uint8Array {
   if (v.kind === "null") return encodeNullable(ty, null);
+  if (v.kind === "unfetched") {
+    // An unfetched reference is resolved before any encode/plan (the scan layer for reads,
+    // the mutation path for stores, resolveForEncode at commit — large-values.md §14).
+    throw new Error("BUG: encoding an unfetched large value");
+  }
   if (v.kind === "text") {
     const bytes = UTF8.encode(v.text);
     const out = new Uint8Array(3 + bytes.length);
@@ -361,9 +367,29 @@ export function recordScanUnits(
   capacity: number,
   mask: boolean[],
 ): { pages: number; decompress: number } {
-  const plan = planDispositions(colTypes, key, row, capacity);
   let pages = 0;
   let decompress = 0;
+  // A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
+  // §14): read the units straight off them — no disposition re-plan, which would need the
+  // unfetched bytes. The numbers equal the resident plan below by construction (the
+  // references ARE that plan's stored output), so a paged and an in-memory database charge
+  // identically (cost.md §3, logical cost).
+  if (row.some((v) => v.kind === "unfetched")) {
+    for (let i = 0; i < row.length; i++) {
+      const v = row[i]!;
+      if (!mask[i] || v.kind !== "unfetched") continue;
+      if (v.ref.form === TAG_EXTERNAL) {
+        pages += Math.ceil(v.ref.storedLen / capacity);
+      } else if (v.ref.form === TAG_INLINE_COMP) {
+        decompress += Math.ceil(v.ref.rawLen / capacity);
+      } else {
+        pages += Math.ceil(v.ref.storedLen / capacity);
+        decompress += Math.ceil(v.ref.rawLen / capacity);
+      }
+    }
+    return { pages, decompress };
+  }
+  const plan = planDispositions(colTypes, key, row, capacity);
   for (let i = 0; i < plan.disp.length; i++) {
     if (!mask[i]) continue; // an untouched column's chain/slabs are never read (cost.md §3)
     switch (plan.disp[i]) {
@@ -727,6 +753,7 @@ export function incrementalImage(
   pageSize: number,
   startPage: number,
   free: number[],
+  paging: SharedPaging | null,
 ): IncrementalWrite {
   const ps = pageSize;
   const capacity = ps - PAGE_HEADER;
@@ -741,7 +768,7 @@ export function incrementalImage(
   for (let ti = 0; ti < keys.length; ti++) {
     const root = snap.stores.get(keys[ti]!)!.treeRoot();
     if (root !== null) {
-      rootDataPage[ti] = serializeDirty(root, snap.tables.get(keys[ti]!)!, capacity, ps, alloc, pages);
+      rootDataPage[ti] = serializeDirty(root, snap.tables.get(keys[ti]!)!, capacity, ps, alloc, pages, paging);
     }
   }
 
@@ -762,6 +789,18 @@ export function incrementalImage(
   return { pages, rootPage: catRoot, pageCount: alloc.next, freeRemaining: alloc.remaining() };
 }
 
+// resolveForEncode materializes any unfetched values in `row` for re-encoding at commit
+// (spec/design/large-values.md §14): a dirty leaf may carry rows the lazy load left as
+// references; the serializer needs their bytes to re-plan and rewrite the record. Unmetered,
+// like all commit work. Returns the row unchanged when nothing is unfetched (the common case);
+// resolution builds a fresh copy, never mutating the shared tree's row.
+function resolveForEncode(row: Row, table: Table, paging: SharedPaging | null): Row {
+  if (!row.some((v) => v.kind === "unfetched")) return row;
+  if (paging === null) throw engineError("data_corrupted", "unfetched large value with no pager at commit");
+  const fetch = (p: number): Uint8Array => paging.readBlock(p);
+  return row.map((v, i) => (v.kind === "unfetched" ? resolveUnfetched(table.columns[i]!.type, v.ref, fetch) : v));
+}
+
 // serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
 // each as a full pageSize page to `pages`, and returns this node's page index. A clean node (already
 // persisted, page !== 0) short-circuits: its whole subtree is on disk unchanged (copy-on-write only
@@ -775,6 +814,7 @@ function serializeDirty(
   ps: number,
   alloc: PageAlloc,
   pages: { index: number; bytes: Uint8Array }[],
+  paging: SharedPaging | null,
 ): number {
   if (n.page !== 0) {
     return n.page;
@@ -783,7 +823,7 @@ function serializeDirty(
   for (const c of n.children) {
     // A resident child recurses (dirty descendants get pages); an OnDisk child is a clean leaf already
     // durable at its page — keep it, write nothing (the incremental-commit win).
-    childPages.push(c.node === null ? c.page : serializeDirty(c.node, table, capacity, ps, alloc, pages));
+    childPages.push(c.node === null ? c.page : serializeDirty(c.node, table, capacity, ps, alloc, pages, paging));
   }
   const w = new ByteWriter();
   let pageType = PAGE_LEAF;
@@ -792,11 +832,15 @@ function serializeDirty(
     for (const cp of childPages) w.u32(cp);
   }
   // Encode records, spilling over-large values to overflow pages drawn from the same allocator
-  // (free-list first, then high-water — large-values.md §12).
+  // (free-list first, then high-water — large-values.md §12). A dirty node may carry rows the
+  // lazy load left unfetched (a sibling row's mutation dirtied them): resolve those through the
+  // pager first — unmetered commit work, large-values.md §14 — so the re-encode re-plans the
+  // resident row exactly as an eager writer would (chains are rewritten fresh; sharing an
+  // unchanged chain is the deferred byte-layout follow-on).
   const ovf: OverflowPageOut[] = [];
   const take = (): number => alloc.take();
   for (let i = 0; i < n.keys.length; i++) {
-    w.bytes(encodeRecord(table, n.keys[i]!, n.vals[i]!, capacity, take, ovf));
+    w.bytes(encodeRecord(table, n.keys[i]!, resolveForEncode(n.vals[i]!, table, paging), capacity, take, ovf));
   }
   const payload = w.toBytes();
   if (payload.length > capacity) {
@@ -885,16 +929,17 @@ export function anySpillable(colTypes: ScalarType[]): boolean {
 // collectLeafOverflow walks a table's on-disk B-tree, reading each leaf and adding the overflow chain
 // pages its records reference to `reached` (large-values.md §12). Interior separators are skipped here
 // — readSkeletonNode already collected their chains. Used only for tables with spillable columns during
-// the paged-open free-list reconstruction; it reads (and transiently materializes) every leaf, the
-// deliberate cost of reconstruct-on-open reclamation for overflow.
+// the paged-open free-list reconstruction; it decodes each leaf lazily and follows its chains by
+// HEADERS only (chainPages — large-values.md §14), so opening a file never materializes or
+// decompresses a large value.
 function collectLeafOverflow(paging: SharedPaging, pageIdx: number, colTypes: ScalarType[], reached: Set<number>): void {
   const pg = parsePage(paging.readBlock(pageIdx));
   if (pg.pageType === PAGE_LEAF) {
     const fetch = (p: number): Uint8Array => paging.readBlock(p);
     const cur = { pos: 0 };
     for (let i = 0; i < pg.itemCount; i++) {
-      const { ovf } = decodeRecord(colTypes, pg.payload, cur, fetch);
-      for (const p of ovf) reached.add(p);
+      const { row } = decodeRecordLazy(colTypes, pg.payload, cur);
+      markChains(row, fetch, reached);
     }
     return;
   }
@@ -1019,12 +1064,13 @@ function readSkeletonNode(
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
     const weights: number[] = [];
-    const capacity = paging.pageSize() - PAGE_HEADER;
+    // Separators decode lazily like leaves (large-values.md §14): an external value stays an
+    // unfetched reference; its chain is marked reachable by headers only.
     const fetch = (p: number): Uint8Array => paging.readBlock(p);
     for (let i = 0; i < n; i++) {
-      const { key, row, ovf } = decodeRecord(colTypes, pg.payload, cur, fetch);
-      weights.push(recordSize(colTypes, key, row, capacity));
-      for (const p of ovf) reached.add(p);
+      const { key, row, weight } = decodeRecordLazy(colTypes, pg.payload, cur);
+      weights.push(weight);
+      markChains(row, fetch, reached);
       keys.push(key);
       vals.push(row);
     }
@@ -1267,26 +1313,20 @@ function parsePage(block: Uint8Array): Page {
 // decodeLeafNode decodes a single leaf page block into a resident node, for the demand-paging fault
 // path (spec/design/pager.md §4; paging.ts faultLeaf). block is one page; page is its page id, stamped
 // on the node so a later incremental commit keeps it clean. Weights are recomputed from the value
-// codec (the exact size the writer used), so the loaded leaf is ready for further splits.
-// `fetch` reads an overflow page block by index (to materialize external values whose chains live
-// outside this leaf — large-values.md §12); the chain pages it visits are discarded here (the
-// free-list is reconstructed at open, not on a runtime fault).
-export function decodeLeafNode(
-  block: Uint8Array,
-  page: number,
-  colTypes: ScalarType[],
-  fetch: (page: number) => Uint8Array,
-): PNode {
+// codec... decoding is LAZY (large-values.md §14): an external/compressed value becomes an
+// unfetched reference — no chain read, no decompression — resolved later only for the columns a
+// query touches. Each weight is the bytes the record occupies on the page (exactly the writer's
+// recordSize).
+export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ScalarType[]): PNode {
   const pg = parsePage(block);
   if (pg.pageType !== PAGE_LEAF) throw engineError("data_corrupted", "demand-paged a non-leaf page");
-  const capacity = block.length - PAGE_HEADER;
   const keys: Uint8Array[] = [];
   const vals: Row[] = [];
   const weights: number[] = [];
   const cur = { pos: 0 };
   for (let i = 0; i < pg.itemCount; i++) {
-    const { key, row } = decodeRecord(colTypes, pg.payload, cur, fetch);
-    weights.push(recordSize(colTypes, key, row, capacity));
+    const { key, row, weight } = decodeRecordLazy(colTypes, pg.payload, cur);
+    weights.push(weight);
     keys.push(key);
     vals.push(row);
   }
@@ -1329,6 +1369,105 @@ function decodeTableEntry(buf: Uint8Array, cur: Cursor): { table: Table; root: n
   }
   const root = readU32(buf, cur);
   return { table: { name, columns }, root };
+}
+
+// readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL
+// decode as today, but an external/compressed form becomes an unfetched reference holding exactly
+// the record's pointer fields — no chain read, no decompression. The scan layer resolves the
+// references for the columns a query touches (resolveUnfetched); the commit path resolves the
+// rest when a dirty leaf re-encodes (resolveForEncode).
+function readValueLazy(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
+  const tag = readU8(buf, cur);
+  if (tag === 0x00) return readInlineBody(ty, buf, cur);
+  if (tag === 0x01) return nullValue();
+  if (tag === TAG_EXTERNAL) {
+    const first = readU32(buf, cur);
+    const len = readU32(buf, cur);
+    return { kind: "unfetched", ref: { form: TAG_EXTERNAL, firstPage: first, storedLen: len, rawLen: 0, comp: undefined } };
+  }
+  if (tag === TAG_INLINE_COMP) {
+    const rawLen = readU32(buf, cur);
+    const compLen = readU16(buf, cur);
+    const comp = take(buf, cur, compLen).slice(); // copy out of the borrowed page slice
+    return { kind: "unfetched", ref: { form: TAG_INLINE_COMP, firstPage: 0, storedLen: 0, rawLen, comp } };
+  }
+  if (tag === TAG_EXTERNAL_COMP) {
+    const first = readU32(buf, cur);
+    const stored = readU32(buf, cur);
+    const rawLen = readU32(buf, cur);
+    return { kind: "unfetched", ref: { form: TAG_EXTERNAL_COMP, firstPage: first, storedLen: stored, rawLen, comp: undefined } };
+  }
+  throw engineError("data_corrupted", "invalid value presence tag");
+}
+
+// decodeRecordLazy decodes one record (readValueLazy per column) and returns {key, row, weight},
+// where the weight is the bytes the record occupies on the page — exactly the recordSize the
+// writer split on, read off the cursor instead of re-planned (a re-plan would need the unfetched
+// bytes).
+function decodeRecordLazy(
+  colTypes: ScalarType[],
+  buf: Uint8Array,
+  cur: Cursor,
+): { key: Uint8Array; row: Row; weight: number } {
+  const start = cur.pos;
+  const keyLen = readU16(buf, cur);
+  const key = take(buf, cur, keyLen).slice(); // copy out of the borrowed page slice
+  const row: Row = new Array(colTypes.length);
+  for (let i = 0; i < colTypes.length; i++) {
+    row[i] = readValueLazy(colTypes[i]!, buf, cur);
+  }
+  return { key, row, weight: cur.pos - start };
+}
+
+// resolveUnfetched materializes an unfetched reference into its plain Value
+// (spec/design/large-values.md §14): gather the overflow chain through `fetch` for an external
+// form, decompress a compressed one, and reconstruct by column type. Decompression errors are
+// data_corrupted, surfaced only when the value is actually touched.
+export function resolveUnfetched(ty: ScalarType, ref: Unfetched, fetch: (page: number) => Uint8Array): Value {
+  const sink: number[] = [];
+  if (ref.form === TAG_EXTERNAL) {
+    return valueFromPayload(ty, readOverflowChain(ref.firstPage, ref.storedLen, fetch, sink));
+  }
+  if (ref.form === TAG_INLINE_COMP) {
+    return valueFromPayload(ty, lz4Decompress(ref.comp!, ref.rawLen));
+  }
+  if (ref.form === TAG_EXTERNAL_COMP) {
+    const comp = readOverflowChain(ref.firstPage, ref.storedLen, fetch, sink);
+    return valueFromPayload(ty, lz4Decompress(comp, ref.rawLen));
+  }
+  throw engineError("data_corrupted", "invalid unfetched value form");
+}
+
+// chainPages returns the page indices of the overflow chain carrying `length` payload bytes from
+// `first`, following next_page hops and reading HEADERS only — no payload assembly, no
+// decompression (spec/design/large-values.md §14). The open-time reachability walk marks live
+// chains with this, so opening a file never materializes its large values.
+function chainPages(first: number, length: number, fetch: (page: number) => Uint8Array): number[] {
+  const out: number[] = [];
+  let gathered = 0;
+  let p = first;
+  while (gathered < length) {
+    if (p === 0) throw engineError("data_corrupted", "overflow chain ended before the value length");
+    out.push(p);
+    const pg = parsePage(fetch(p));
+    if (pg.pageType !== PAGE_OVERFLOW) throw engineError("data_corrupted", "expected an overflow page");
+    const n = pg.itemCount;
+    if (n === 0 || n > pg.payload.length || gathered + n > length) {
+      throw engineError("data_corrupted", "overflow page slab out of range");
+    }
+    gathered += n;
+    p = pg.nextPage;
+  }
+  return out;
+}
+
+// markChains adds the overflow chain pages a lazily-decoded row references to `reached` (the
+// free-list reachability walk), via the header-only chainPages hop.
+function markChains(row: Row, fetch: (page: number) => Uint8Array, reached: Set<number>): void {
+  for (const v of row) {
+    if (v.kind !== "unfetched" || v.ref.form === TAG_INLINE_COMP) continue;
+    for (const p of chainPages(v.ref.firstPage, v.ref.storedLen, fetch)) reached.add(p);
+  }
 }
 
 // decodeRecord decodes one record {key, row} and the overflow chain pages any external value followed

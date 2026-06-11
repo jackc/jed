@@ -163,7 +163,12 @@ impl Database {
             return Ok(());
         }
         let free = self.free_pages.clone();
-        let write = snap.incremental_image(self.page_size, self.page_count, &free)?;
+        let write = snap.incremental_image(
+            self.page_size,
+            self.page_count,
+            &free,
+            self.paging.as_deref(),
+        )?;
         let meta =
             crate::format::meta_page(self.page_size, snap.txid, write.root_page, write.page_count);
         {

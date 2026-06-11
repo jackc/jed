@@ -131,6 +131,10 @@ func encodeValue(ty ScalarType, v Value) []byte {
 	switch v.Kind {
 	case ValNull:
 		return EncodeNullable(ty, nil)
+	case ValUnfetched:
+		// An unfetched reference is resolved before any encode/plan (the scan layer for reads,
+		// the mutation path for stores, resolveForEncode at commit — large-values.md §14).
+		panic("BUG: encoding an unfetched large value")
 	case ValText, ValBytea:
 		// text (UTF-8) and bytea (raw bytes) share the compact length-prefixed body; both
 		// hold their bytes in Str, so the on-disk form is identical.
@@ -370,7 +374,7 @@ func (a *pageAlloc) take() uint32 {
 // catalog chain is always rewritten (it carries each table's possibly-moved root). The dirty nodes'
 // set-once page ids are assigned here. The page size was validated at file creation, so no size check
 // is repeated.
-func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32) (incrementalWrite, error) {
+func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, paging *sharedPaging) (incrementalWrite, error) {
 	ps := int(pageSize)
 	capacity := ps - pageHeader
 
@@ -387,7 +391,7 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32) (
 	rootDataPage := make([]uint32, len(keys))
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, err := serializeDirty(root, s.tables[k], capacity, ps, alloc, &pages)
+			rp, err := serializeDirty(root, s.tables[k], capacity, ps, alloc, &pages, paging)
 			if err != nil {
 				return incrementalWrite{}, err
 			}
@@ -426,6 +430,40 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32) (
 	return incrementalWrite{pages: pages, rootPage: catRoot, pageCount: alloc.next, freeRemaining: alloc.free[alloc.cursor:]}, nil
 }
 
+// resolveForEncode materializes any unfetched values in row for re-encoding at commit
+// (spec/design/large-values.md §14): a dirty leaf may carry rows the lazy load left as
+// references; the serializer needs their bytes to re-plan and rewrite the record. Unmetered,
+// like all commit work. Returns the row unchanged when nothing is unfetched (the common case);
+// resolution builds a fresh copy, never mutating the shared tree's row.
+func resolveForEncode(row Row, table *Table, paging *sharedPaging) (Row, error) {
+	needs := false
+	for _, v := range row {
+		if v.Kind == ValUnfetched {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return row, nil
+	}
+	if paging == nil {
+		return nil, NewError(DataCorrupted, "unfetched large value with no pager at commit")
+	}
+	fetch := func(p uint32) ([]byte, error) { return paging.readBlock(p) }
+	out := make(Row, len(row))
+	copy(out, row)
+	for i := range out {
+		if out[i].Kind == ValUnfetched {
+			v, err := resolveUnfetched(table.Columns[i].Type, out[i].Unf, fetch)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = v
+		}
+	}
+	return out, nil
+}
+
 // serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
 // each as a full pageSize page to *pages, and returns this node's page index. A clean node (already
 // persisted, page != 0) short-circuits: its whole subtree is on disk unchanged (copy-on-write only
@@ -433,7 +471,7 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32) (
 // set-once page id is stored here — safe, as the working tree is owned by the single writer at commit.
 // Page indices come from the allocator (free-list first, then the high-water). Mirrors serializeNode
 // for the byte layout.
-func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, pages *[]dirtyPage) (uint32, error) {
+func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, pages *[]dirtyPage, paging *sharedPaging) (uint32, error) {
 	if n.page != 0 {
 		return n.page, nil
 	}
@@ -445,7 +483,7 @@ func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, 
 			childPages[i] = c.page
 			continue
 		}
-		cp, err := serializeDirty(c.node, table, capacity, ps, alloc, pages)
+		cp, err := serializeDirty(c.node, table, capacity, ps, alloc, pages, paging)
 		if err != nil {
 			return 0, err
 		}
@@ -460,10 +498,18 @@ func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, 
 		}
 	}
 	// Encode records, spilling over-large values to overflow pages drawn from the same allocator
-	// (free-list first, then high-water — large-values.md §12).
+	// (free-list first, then high-water — large-values.md §12). A dirty node may carry rows the
+	// lazy load left unfetched (a sibling row's mutation dirtied them): resolve those through the
+	// pager first — unmetered commit work, large-values.md §14 — so the re-encode re-plans the
+	// resident row exactly as an eager writer would (chains are rewritten fresh; sharing an
+	// unchanged chain is the deferred byte-layout follow-on).
 	var ovf []overflowPageOut
 	for i := range n.keys {
-		payload = append(payload, encodeRecord(table, n.keys[i], n.vals[i], capacity, alloc.take, &ovf)...)
+		row, err := resolveForEncode(n.vals[i], table, paging)
+		if err != nil {
+			return 0, err
+		}
+		payload = append(payload, encodeRecord(table, n.keys[i], row, capacity, alloc.take, &ovf)...)
 	}
 	if len(payload) > capacity {
 		return 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
@@ -694,8 +740,9 @@ func anySpillable(colTypes []ScalarType) bool {
 // collectLeafOverflow walks a table's on-disk B-tree, reading each leaf and adding the overflow chain
 // pages its records reference to reached (large-values.md §12). Interior separators are skipped here —
 // readSkeletonNode already collected their chains. Used only for tables with spillable columns during
-// the paged-open free-list reconstruction; it reads (and transiently materializes) every leaf, the
-// deliberate cost of reconstruct-on-open reclamation for overflow.
+// the paged-open free-list reconstruction; it decodes each leaf lazily and follows its chains by
+// HEADERS only (chainPages — large-values.md §14), so opening a file never materializes or
+// decompresses a large value.
 func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []ScalarType, reached map[uint32]bool) error {
 	block, err := paging.pgr.readBlock(pageIdx)
 	if err != nil {
@@ -710,12 +757,12 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []Scalar
 		fetch := func(p uint32) ([]byte, error) { return paging.pgr.readBlock(p) }
 		pos := 0
 		for i := uint32(0); i < pg.itemCount; i++ {
-			_, _, ovf, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
+			_, row, _, err := decodeRecordLazy(colTypes, pg.payload, &pos)
 			if err != nil {
 				return err
 			}
-			for _, p := range ovf {
-				reached[p] = true
+			if err := markChains(row, fetch, reached); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -795,16 +842,17 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ScalarTyp
 			total += clen
 		}
 		keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
-		capacity := len(block) - pageHeader
+		// Separators decode lazily like leaves (large-values.md §14): an external value stays an
+		// unfetched reference; its chain is marked reachable by headers only.
 		fetch := func(p uint32) ([]byte, error) { return paging.pgr.readBlock(p) }
 		for i := 0; i < n; i++ {
-			key, row, ovf, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
+			key, row, w, err := decodeRecordLazy(colTypes, pg.payload, &pos)
 			if err != nil {
 				return childRef{}, 0, err
 			}
-			weights = append(weights, uint32(recordSize(colTypes, key, row, capacity)))
-			for _, p := range ovf {
-				reached[p] = true
+			weights = append(weights, uint32(w))
+			if err := markChains(row, fetch, reached); err != nil {
+				return childRef{}, 0, err
 			}
 			keys = append(keys, key)
 			vals = append(vals, row)
@@ -1023,6 +1071,35 @@ func recordSize(colTypes []ScalarType, key []byte, row Row, capacity int) int {
 // value_decompress slabs per compressed stored value (inline- or external-). Zero/zero for a
 // fully-inline-plain record or an untouched column.
 func recordScanUnits(colTypes []ScalarType, key []byte, row Row, capacity int, mask []bool) (pages, decompress int) {
+	// A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
+	// §14): read the units straight off them — no disposition re-plan, which would need the
+	// unfetched bytes. The numbers equal the resident plan below by construction (the
+	// references ARE that plan's stored output), so a paged and an in-memory database charge
+	// identically (cost.md §3, logical cost).
+	lazy := false
+	for _, v := range row {
+		if v.Kind == ValUnfetched {
+			lazy = true
+			break
+		}
+	}
+	if lazy {
+		for i, v := range row {
+			if !mask[i] || v.Kind != ValUnfetched {
+				continue
+			}
+			switch v.Unf.Form {
+			case tagExternal:
+				pages += (int(v.Unf.StoredLen) + capacity - 1) / capacity
+			case tagInlineComp:
+				decompress += (int(v.Unf.RawLen) + capacity - 1) / capacity
+			case tagExternalComp:
+				pages += (int(v.Unf.StoredLen) + capacity - 1) / capacity
+				decompress += (int(v.Unf.RawLen) + capacity - 1) / capacity
+			}
+		}
+		return pages, decompress
+	}
 	plan := planDispositions(colTypes, key, row, capacity)
 	for i, d := range plan.disp {
 		if !mask[i] {
@@ -1072,6 +1149,9 @@ func valuePayload(ty ScalarType, v Value) []byte {
 func valueFromPayload(ty ScalarType, payload []byte) (Value, error) {
 	switch {
 	case ty.IsText():
+		if !utf8.Valid(payload) {
+			return Value{}, NewError(DataCorrupted, "non-UTF-8 text value")
+		}
 		return TextValue(string(payload)), nil
 	case ty.IsBytea():
 		return ByteaValue(payload), nil
@@ -1392,12 +1472,11 @@ func pageBlock(image []byte, ps int, index uint32) ([]byte, error) {
 
 // decodeLeafNode decodes a single leaf page block into a resident node, for the demand-paging fault
 // path (spec/design/pager.md §4; paging.go faultLeaf). block is one page; page is its page id, stamped
-// on the node so a later incremental commit keeps it clean. Weights are recomputed from the value
-// codec (the exact size the writer used), so the loaded leaf is ready for further splits.
-// fetch reads an overflow page block by index (to materialize external values whose chains live
-// outside this leaf — large-values.md §12); the chain pages it visits are discarded here (the
-// free-list is reconstructed at open, not on a runtime fault).
-func decodeLeafNode(block []byte, pageID uint32, colTypes []ScalarType, fetch func(uint32) ([]byte, error)) (*pnode, error) {
+// on the node so a later incremental commit keeps it clean. Decoding is LAZY (large-values.md §14):
+// an external/compressed value becomes an Unfetched reference — no chain read, no decompression —
+// resolved later only for the columns a query touches. Each weight is the bytes the record occupies
+// on the page (exactly the writer's recordSize).
+func decodeLeafNode(block []byte, pageID uint32, colTypes []ScalarType) (*pnode, error) {
 	pg, err := parsePage(block)
 	if err != nil {
 		return nil, err
@@ -1405,16 +1484,15 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []ScalarType, fetch fu
 	if pg.pageType != pageLeaf {
 		return nil, NewError(DataCorrupted, "demand-paged a non-leaf page")
 	}
-	capacity := len(block) - pageHeader
 	n := int(pg.itemCount)
 	keys, vals, weights := make([][]byte, 0, n), make([]Row, 0, n), make([]uint32, 0, n)
 	pos := 0
 	for i := 0; i < n; i++ {
-		key, row, _, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
+		key, row, w, err := decodeRecordLazy(colTypes, pg.payload, &pos)
 		if err != nil {
 			return nil, err
 		}
-		weights = append(weights, uint32(recordSize(colTypes, key, row, capacity)))
+		weights = append(weights, uint32(w))
 		keys = append(keys, key)
 		vals = append(vals, row)
 	}
@@ -1490,6 +1568,182 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, error) {
 		return nil, 0, err
 	}
 	return &Table{Name: name, Columns: columns}, root, nil
+}
+
+// readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL
+// decode as today, but an external/compressed form becomes an Unfetched reference holding exactly
+// the record's pointer fields — no chain read, no decompression. The scan layer resolves the
+// references for the columns a query touches (resolveUnfetched); the commit path resolves the
+// rest when a dirty leaf re-encodes (resolveForEncode).
+func readValueLazy(ty ScalarType, buf []byte, pos *int) (Value, error) {
+	tag, err := readU8(buf, pos)
+	if err != nil {
+		return Value{}, err
+	}
+	switch tag {
+	case 0x00:
+		return readInlineBody(ty, buf, pos)
+	case 0x01:
+		return NullValue(), nil
+	case tagExternal:
+		first, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		length, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagExternal, FirstPage: first, StoredLen: length}}, nil
+	case tagInlineComp:
+		rawLen, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		compLen, err := readU16(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		compSlice, err := take(buf, pos, int(compLen))
+		if err != nil {
+			return Value{}, err
+		}
+		comp := make([]byte, len(compSlice))
+		copy(comp, compSlice)
+		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagInlineComp, RawLen: rawLen, Comp: comp}}, nil
+	case tagExternalComp:
+		first, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		stored, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		rawLen, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: rawLen}}, nil
+	default:
+		return Value{}, NewError(DataCorrupted, "invalid value presence tag")
+	}
+}
+
+// decodeRecordLazy decodes one record (readValueLazy per column) and returns (key, row, weight),
+// where the weight is the bytes the record occupies on the page — exactly the recordSize the
+// writer split on, read off the cursor instead of re-planned (a re-plan would need the unfetched
+// bytes).
+func decodeRecordLazy(colTypes []ScalarType, buf []byte, pos *int) ([]byte, Row, int, error) {
+	start := *pos
+	keyLen, err := readU16(buf, pos)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	keySlice, err := take(buf, pos, int(keyLen))
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	key := make([]byte, len(keySlice))
+	copy(key, keySlice)
+	row := make(Row, len(colTypes))
+	for i, ty := range colTypes {
+		v, err := readValueLazy(ty, buf, pos)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		row[i] = v
+	}
+	return key, row, *pos - start, nil
+}
+
+// resolveUnfetched materializes an unfetched reference into its plain Value
+// (spec/design/large-values.md §14): gather the overflow chain through fetch for an external
+// form, decompress a compressed one, and reconstruct by column type. Decompression errors are
+// data_corrupted, surfaced only when the value is actually touched.
+func resolveUnfetched(ty ScalarType, u *Unfetched, fetch func(uint32) ([]byte, error)) (Value, error) {
+	var sink []uint32
+	switch u.Form {
+	case tagExternal:
+		payload, err := readOverflowChain(u.FirstPage, int(u.StoredLen), fetch, &sink)
+		if err != nil {
+			return Value{}, err
+		}
+		return valueFromPayload(ty, payload)
+	case tagInlineComp:
+		payload, err := lz4Decompress(u.Comp, int(u.RawLen))
+		if err != nil {
+			return Value{}, err
+		}
+		return valueFromPayload(ty, payload)
+	case tagExternalComp:
+		comp, err := readOverflowChain(u.FirstPage, int(u.StoredLen), fetch, &sink)
+		if err != nil {
+			return Value{}, err
+		}
+		payload, err := lz4Decompress(comp, int(u.RawLen))
+		if err != nil {
+			return Value{}, err
+		}
+		return valueFromPayload(ty, payload)
+	default:
+		return Value{}, NewError(DataCorrupted, "invalid unfetched value form")
+	}
+}
+
+// chainPages returns the page indices of the overflow chain carrying length payload bytes from
+// first, following next_page hops and reading HEADERS only — no payload assembly, no
+// decompression (spec/design/large-values.md §14). The open-time reachability walk marks live
+// chains with this, so opening a file never materializes its large values.
+func chainPages(first uint32, length int, fetch func(uint32) ([]byte, error)) ([]uint32, error) {
+	var out []uint32
+	gathered := 0
+	p := first
+	for gathered < length {
+		if p == 0 {
+			return nil, NewError(DataCorrupted, "overflow chain ended before the value length")
+		}
+		out = append(out, p)
+		block, err := fetch(p)
+		if err != nil {
+			return nil, err
+		}
+		pg, err := parsePage(block)
+		if err != nil {
+			return nil, err
+		}
+		if pg.pageType != pageOverflow {
+			return nil, NewError(DataCorrupted, "expected an overflow page")
+		}
+		n := int(pg.itemCount)
+		if n == 0 || n > len(pg.payload) || gathered+n > length {
+			return nil, NewError(DataCorrupted, "overflow page slab out of range")
+		}
+		gathered += n
+		p = pg.nextPage
+	}
+	return out, nil
+}
+
+// markChains adds the overflow chain pages a lazily-decoded row references to reached (the
+// free-list reachability walk), via the header-only chainPages hop.
+func markChains(row Row, fetch func(uint32) ([]byte, error), reached map[uint32]bool) error {
+	for _, v := range row {
+		if v.Kind != ValUnfetched {
+			continue
+		}
+		switch v.Unf.Form {
+		case tagExternal, tagExternalComp:
+			pages, err := chainPages(v.Unf.FirstPage, int(v.Unf.StoredLen), fetch)
+			if err != nil {
+				return err
+			}
+			for _, p := range pages {
+				reached[p] = true
+			}
+		}
+	}
+	return nil
 }
 
 // decodeRecord decodes one record (key, row) and the overflow chain pages any external value
@@ -1609,6 +1863,9 @@ func readInlineBody(ty ScalarType, buf []byte, pos *int) (Value, error) {
 		sb, err := take(buf, pos, int(n))
 		if err != nil {
 			return Value{}, err
+		}
+		if !utf8.Valid(sb) {
+			return Value{}, NewError(DataCorrupted, "non-UTF-8 text value")
 		}
 		return TextValue(string(sb)), nil
 	case ty.IsBool():

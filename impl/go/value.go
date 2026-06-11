@@ -31,7 +31,29 @@ const (
 	ValTimestamp
 	// ValTimestamptz is a UTC-instant timestamptz; Int holds the int64 microsecond instant.
 	ValTimestamptz
+	// ValUnfetched is an unfetched large-value reference (spec/design/large-values.md §14): a
+	// stored external/compressed value loaded as its on-disk pointer instead of being
+	// materialized; Unf holds the pointer fields. Internal to the storage/scan layers — the scan
+	// layer resolves every column a query touches before the evaluator sees the row, so this kind
+	// must never reach a comparison, render, or encode. It is POISONED: those paths panic loudly
+	// (an engine bug), never read it as NULL.
+	ValUnfetched
 )
+
+// Unfetched is the on-disk form of a lazily-loaded large value (spec/design/large-values.md §14;
+// spec/fileformat/format.md "Large values") — exactly the record's pointer fields, so the scan
+// layer can resolve it through the pager (and the cost walk can count its chain pages /
+// decompress slabs) without reading the value. Form is the presence tag (tagExternal /
+// tagInlineComp / tagExternalComp); FirstPage/StoredLen describe the chain for the external
+// forms (the payload for plain, the LZ4 block for compressed); RawLen is the decompressed
+// length for the compressed forms; Comp holds the resident LZ4 block for inline-compressed.
+type Unfetched struct {
+	Form      byte
+	FirstPage uint32
+	StoredLen uint32
+	RawLen    uint32
+	Comp      []byte
+}
 
 // Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers
 // fit in int64 regardless of their declared column type (the type governs range checks and
@@ -52,6 +74,9 @@ type Value struct {
 	// through Eq3 / CmpValue / the DISTINCT value-canonical key — never `==` on two decimal
 	// Values (that compares pointers). See spec/design/decimal.md §5.
 	Dec *Decimal
+	// Unf holds the unfetched large-value reference when Kind == ValUnfetched (a pointer for
+	// the same comparability reason as Dec — the LZ4 block is a slice).
+	Unf *Unfetched
 }
 
 // IntValue builds a non-null integer value.
@@ -231,6 +256,8 @@ func (v Value) Render() string {
 		return RenderTimestamp(v.Int)
 	case ValTimestamptz:
 		return RenderTimestamptz(v.Int)
+	case ValUnfetched:
+		panic("BUG: unfetched large value escaped the storage layer")
 	default:
 		return strconv.FormatInt(v.Int, 10)
 	}
@@ -276,6 +303,11 @@ func numericCmp(a, b Value) (int, bool) {
 // booleans compare by value (false < true). A mixed cross-family pair never reaches here
 // — the resolver rejects it (42804).
 func (v Value) Eq3(o Value) ThreeValued {
+	// Poisoned (large-values.md §14): an unfetched value must never be compared — falling
+	// through to UNKNOWN would silently read it as NULL.
+	if v.Kind == ValUnfetched || o.Kind == ValUnfetched {
+		panic("BUG: unfetched large value escaped the storage layer")
+	}
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
 	}
@@ -307,6 +339,11 @@ func (v Value) Eq3(o Value) ThreeValued {
 // Lt3 is the three-valued ordering predicate v < o (numerics by value with int↔decimal
 // promotion; text by C collation = byte order; boolean by value, false < true).
 func (v Value) Lt3(o Value) ThreeValued {
+	// Poisoned (large-values.md §14): an unfetched value must never be compared — falling
+	// through to UNKNOWN would silently read it as NULL.
+	if v.Kind == ValUnfetched || o.Kind == ValUnfetched {
+		panic("BUG: unfetched large value escaped the storage layer")
+	}
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
 	}
@@ -337,6 +374,11 @@ func (v Value) Lt3(o Value) ThreeValued {
 // Gt3 is the three-valued ordering predicate v > o (numerics by value with int↔decimal
 // promotion; text by C collation = byte order; boolean by value, false < true).
 func (v Value) Gt3(o Value) ThreeValued {
+	// Poisoned (large-values.md §14): an unfetched value must never be compared — falling
+	// through to UNKNOWN would silently read it as NULL.
+	if v.Kind == ValUnfetched || o.Kind == ValUnfetched {
+		panic("BUG: unfetched large value escaped the storage layer")
+	}
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return Unknown
 	}

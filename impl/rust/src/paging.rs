@@ -64,16 +64,10 @@ impl SharedPaging {
                 .lock()
                 .expect("pager mutex poisoned")
                 .read_block(page)?;
-            // Materialize any external value by following its overflow chain through the pager
-            // (the leaf block holds only the pointer — spec/design/large-values.md §12). The pager
-            // lock above is released before this runs, so the chain reads re-lock per page.
-            let fetch = |p: u32| {
-                self.pager
-                    .lock()
-                    .expect("pager mutex poisoned")
-                    .read_block(p)
-            };
-            crate::format::decode_leaf_node(&block, page, col_types, Some(&fetch))
+            // Lazy decode (spec/design/large-values.md §14): an external/compressed value stays
+            // an unfetched reference — no chain read, no decompression. The scan layer resolves
+            // the columns a query touches through this same pager.
+            crate::format::decode_leaf_node(&block, page, col_types)
         })
     }
 

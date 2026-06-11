@@ -33,7 +33,30 @@ export type Value =
   // A fixed 16-byte UUID (RFC 4122); compares by UNSIGNED byte order over the 16 bytes (§14).
   // Holds a 16-byte Uint8Array — a distinct kind from bytea (renders 8-4-4-4-12, its own
   // comparison family), so a uuid never equals a bytea even with identical bytes.
-  | { kind: "uuid"; bytes: Uint8Array };
+  | { kind: "uuid"; bytes: Uint8Array }
+  // An UNFETCHED large-value reference (spec/design/large-values.md §14): a stored
+  // external/compressed value loaded as its on-disk pointer instead of being materialized.
+  // Internal to the storage/scan layers — the scan layer resolves every column a query
+  // touches before the evaluator sees the row, so this kind must never reach a comparison,
+  // render, or encode. It is POISONED: those paths throw loudly (an engine bug), never read
+  // it as NULL.
+  | { kind: "unfetched"; ref: Unfetched };
+
+// The on-disk form of a lazily-loaded large value (spec/design/large-values.md §14;
+// spec/fileformat/format.md "Large values") — exactly the record's pointer fields, so the scan
+// layer can resolve it through the pager (and the cost walk can count its chain pages /
+// decompress slabs) without reading the value. `form` is the presence tag (0x02 external-plain
+// / 0x03 inline-compressed / 0x04 external-compressed); firstPage/storedLen describe the chain
+// for the external forms (the payload for plain, the LZ4 block for compressed); rawLen is the
+// decompressed length for the compressed forms; comp holds the resident LZ4 block for
+// inline-compressed.
+export type Unfetched = {
+  form: number;
+  firstPage: number;
+  storedLen: number;
+  rawLen: number;
+  comp: Uint8Array | undefined;
+};
 
 // intValue builds a non-null integer value.
 export function intValue(n: bigint): Value {
@@ -254,6 +277,8 @@ export function render(v: Value): string {
       return renderTimestamp(v.micros);
     case "timestamptz":
       return renderTimestamptz(v.micros);
+    case "unfetched":
+      throw new Error("BUG: unfetched large value escaped the storage layer");
     default:
       return v.int.toString();
   }
@@ -266,6 +291,11 @@ export function render(v: Value): string {
 // (false < true). A mixed cross-family pair never reaches here (the resolver rejects it,
 // 42804); any other variant pair is a NULL.
 export function eq3(a: Value, b: Value): ThreeValued {
+  // Poisoned (large-values.md §14): an unfetched value must never be compared — falling
+  // through to UNKNOWN would silently read it as NULL.
+  if (a.kind === "unfetched" || b.kind === "unfetched") {
+    throw new Error("BUG: unfetched large value escaped the storage layer");
+  }
   if (a.kind === "null" || b.kind === "null") return "unknown";
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c === 0);
@@ -282,6 +312,11 @@ export function eq3(a: Value, b: Value): ThreeValued {
 // lt3 is the three-valued ordering predicate a < b (numerics by value with int↔decimal
 // promotion; text by C collation = UTF-8 byte order; boolean by value, false < true).
 export function lt3(a: Value, b: Value): ThreeValued {
+  // Poisoned (large-values.md §14): an unfetched value must never be compared — falling
+  // through to UNKNOWN would silently read it as NULL.
+  if (a.kind === "unfetched" || b.kind === "unfetched") {
+    throw new Error("BUG: unfetched large value escaped the storage layer");
+  }
   if (a.kind === "null" || b.kind === "null") return "unknown";
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c < 0);
@@ -297,6 +332,11 @@ export function lt3(a: Value, b: Value): ThreeValued {
 // gt3 is the three-valued ordering predicate a > b (numerics by value with int↔decimal
 // promotion; text by C collation = UTF-8 byte order; boolean by value, false < true).
 export function gt3(a: Value, b: Value): ThreeValued {
+  // Poisoned (large-values.md §14): an unfetched value must never be compared — falling
+  // through to UNKNOWN would silently read it as NULL.
+  if (a.kind === "unfetched" || b.kind === "unfetched") {
+    throw new Error("BUG: unfetched large value escaped the storage layer");
+  }
   if (a.kind === "null" || b.kind === "null") return "unknown";
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c > 0);

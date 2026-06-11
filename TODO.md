@@ -837,11 +837,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       cost.md §3 "The touched set"): a scan's chain-`page_read` / `value_decompress` block now
       charges only the columns the query statically references (collected depth-aware at plan
       time, incl. correlated outer refs), so `SELECT small_col` / `count(*)` / bare `DELETE`
-      over a spilled table charge nothing for the large values. Remaining follow-on (phase 2,
-      design pinned in §14): **physical lazy read-on-touch storage** — unfetched references in
-      loaded records, scan-layer resolution by the same masks, header-only chain reachability at
-      open; lands behind the contract with zero cost churn. _(was size: L→XL; deps: B-tree pages
-      [P6.1] ✓; §9/§13/§14)_
+      over a spilled table charge nothing for the large values.
+      **Follow-on phase 2 ✅ landed — physical lazy read-on-touch storage** (large-values.md §14,
+      all 3 cores): lazily-decoded records hold poisoned **unfetched references**; the scan layer
+      resolves exactly the touched-set masks through the pager; open's reachability walk follows
+      chains by **headers only**; mutated rows resolve on rewrite and dirty leaves resolve at
+      commit. Zero cost churn, zero byte churn (corpus, cost tests, goldens, incremental tests
+      all unchanged); pinned per-core by the `lazy_large_values` corruption + mode-cost-identity
+      tests. Remaining (small, deferred): **chain sharing on rewrite** — let a rewritten record
+      keep an unchanged value's existing chain (pointer copy, no chain rewrite + no commit-time
+      re-read); a byte-layout change (incremental allocation order), so it lands in all cores +
+      incremental tests together (§14). _(was size: L→XL; deps: B-tree pages [P6.1] ✓;
+      §9/§13/§14)_
 - [ ] **Crash-recovery hardening** — torn-meta fixtures exist; expand durability/recovery
       tests. WAL is deferred (COW + root-swap gives atomicity without one). _(size: M; §9)_
 

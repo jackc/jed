@@ -18,9 +18,11 @@ cores + the Ruby reference as `format_version` 3 (the bytes in
 hand-rolled deterministic LZ4-block codec ([../fileformat/lz4.md](../fileformat/lz4.md) + the
 `lz4_vectors.toml` byte vectors), the `0x03`/`0x04` compressed forms, the compress-before-
 externalize disposition pass, the `compressed_table.jed` golden, and the
-`value_compress`/`value_decompress` cost units; the resolved decisions are in §13 below. Per
-CLAUDE.md §14 a third-party dependency is **never** added on an agent's initiative — and as §6
-below shows this feature needs **none**: both slices shipped dependency-free.
+`value_compress`/`value_decompress` cost units; the resolved decisions are in §13 below. The
+**lazy follow-on is also built, in both phases** (§14): the touched-column cost contract, then the
+physical read-on-touch storage behind it. Per CLAUDE.md §14 a third-party dependency is **never**
+added on an agent's initiative — and as §6 below shows this feature needs **none**: every slice
+shipped dependency-free.
 
 ---
 
@@ -251,11 +253,12 @@ column reads **no** overflow pages. Because the executor is identical across cor
 is materialized is itself deterministic — so this optimization does not threaten cross-core cost
 identity (§8). The alternative (eagerly materialize every value on record read) is simpler but
 pays the chain read even when unused; lazy is the recommended default and what the cost rules of
-§8 assume. **Status (§14): split into two phases.** Phase 1 — the *cost contract* — is **built**:
+§8 assume. **Status (§14): BUILT, in two phases.** Phase 1 — the *cost contract* — landed first:
 the touched-column rule of §14 charges chains/slabs only for columns the query statically
-references, modeling this lazy executor logically (the same way `page_read` predated the buffer
-pool). Phase 2 — the *physical* read-on-touch storage — remains the tracked follow-on, with its
-design pinned in §14 so it lands behind the contract with zero cost churn.
+references (the same way `page_read` predated the buffer pool). Phase 2 — the *physical*
+read-on-touch storage — then landed behind that contract with **zero cost churn and zero byte
+churn**: a lazily-loaded record holds unfetched references, and the scan layer resolves exactly
+the touched columns through the pager (§14).
 
 ---
 
@@ -383,10 +386,10 @@ compression is Slice B). They were chosen with the maintainer; the byte details 
   so the bytes stay cross-core identical and golden-pinnable. **`to_image` now carries a per-page
   `next_page`** (it previously hard-coded `0`, valid only for leaf/interior nodes).
 
-- **Read = eager materialization** (resolves §7 for Slice A). An external value's chain is read
-  when its **leaf is decoded** (whole-image load or buffer-pool fault), reconstructing the full
-  in-memory `Value`; the in-memory model never holds a lazy reference, so the planner/executor are
-  untouched. Lazy (read-on-touch) materialization is a tracked follow-on.
+- **Read = eager materialization** (resolved §7 for Slice A; **superseded by §14 phase 2** for
+  the demand-paged path). As built today, the whole-image load (`from_image`, which has no pager
+  to resolve through later) still materializes eagerly; the demand-paged path — the default
+  `open` — decodes lazily and resolves on touch (§14).
 
 - **Reclamation = reconstruct-on-open, extended to read spillable leaves.** The **default `open`
   is the lazy demand-paged path**, whose free-list reconstruction does *not* read leaf bodies — so
@@ -457,9 +460,10 @@ within `format_version` 3** (the `0x03`/`0x04` tags Slice A reserved), so no ver
   charged once per stored row version at the statement's write site (`INSERT` / `UPDATE`), never
   for the B-tree's internal re-encodes. Both stay logical and cross-core identical.
 
-- **Read = eager, like §12.** A compressed value is decompressed when its leaf is decoded; the
-  in-memory model holds only plain values, so the planner/executor see nothing. Decompression
-  errors are `data_corrupted`, deterministic and structured (lz4.md §3).
+- **Read = eager, like §12** (as Slice B shipped; **superseded by §14 phase 2** for the
+  demand-paged path, where decompression now happens on touch). Decompression errors are
+  `data_corrupted`, deterministic and structured (lz4.md §3) — under §14 they surface only when
+  the value is touched.
 
 - **What did NOT change:** the spill trigger (`RECORD_MAX`, §12), the chain layout (§4/§12), the
   reclamation model (a `0x04` chain is collected by the same reachability walk), the eager read
@@ -497,24 +501,46 @@ touched set"; correlated outer references collected depth-aware through nested p
 - **Implementation seam:** the disposition-plan walk (`scan_units` / `overlap_scan_units`) takes
   a per-relation **column mask** computed once at plan time; nothing else moves.
 
-### Phase 2 — TRACKED: physical read-on-touch storage (design pinned, not built)
+### Phase 2 — BUILT: physical read-on-touch storage
 
-The engine still materializes eagerly. The pinned design for the physical half, so it cannot
-drift from the phase-1 contract:
+The demand-paged path no longer materializes eagerly. As built (all three cores, mirrored
+`lazy_large_values` tests; **zero cost churn, zero byte churn** — the corpus, the per-core cost
+tests, the goldens, and the incremental tests are all unchanged):
 
-- A loaded record's spilled/compressed value becomes an **unfetched reference** (first page /
-  stored+raw lengths / form) instead of a resident `Value`; the **scan layer resolves the touched
-  columns** through the pager as it copies rows out for the executor, leaving untouched columns
-  unfetched — the evaluator never sees a reference, so the expression layer is untouched and the
-  resolution points are exactly the static touched set the cost already models.
-- An unfetched value that *escapes* (a bug) must fail loudly (a poisoned variant), never read as
-  NULL.
-- A dirty leaf's re-encode resolves what it must through the pager at commit (unmetered, like all
-  commit work). Whether an **unchanged** spilled value's chain can be *shared* by the rewritten
-  record (pointer copy, no chain rewrite — safe under reconstruct-on-open reachability, which
-  unions over live records) is phase 2's one open byte-layout decision: it changes incremental
-  allocation order, so it must land in all cores + the per-core incremental tests together.
+- A lazily-decoded record's spilled/compressed value is an **unfetched reference** — exactly the
+  record's pointer fields (form / first page / stored+raw lengths; the resident LZ4 block for
+  inline-compressed) — instead of a resident `Value`. The leaf fault path, the skeleton load's
+  interior separators, and the open-time reachability walk all decode lazily; the whole-image
+  load (`from_image`) stays eager (it has no pager to resolve through later). A lazy record's
+  B-tree **weight** is the bytes it occupies on the page (read off the decode cursor — equal to
+  the writer's `record_size` by determinism), and the scan-units cost walk reads its units
+  **directly off the references**, which equal the resident disposition plan's numbers by
+  construction — so a paged and an in-memory database charge identical costs (the mode-identity
+  the per-core `paged_and_resident_costs_match` tests pin).
+- The **scan layer resolves the touched columns** through the pager per admitted row — at all
+  four read sites (materialize, streaming-LIMIT, DELETE, UPDATE), using the same per-relation
+  masks the cost block charges — so the physical chain reads / decompressions are exactly the
+  metered set. Resolution works on the scan's copy, never the shared tree (snapshots stay
+  immutable; repeated scans re-read and are re-charged consistently). The evaluator never sees a
+  reference.
+- An unfetched value that *escapes* (a bug) **fails loudly** — the variant is poisoned: render,
+  comparison, and encode panic/throw rather than read it as NULL.
+- A **mutated row is re-stored fully resident**: UPDATE resolves the rewritten row's remaining
+  references as part of the rewrite (unmetered write work), so its weight and disposition re-plan
+  exactly as an eager writer's would. A **dirty leaf's other rows** resolve through the pager at
+  commit (unmetered, like all commit work), re-encoding byte-identically to the eager
+  implementation — chains are rewritten fresh. Whether an **unchanged** spilled value's chain can
+  instead be *shared* by the rewritten record (pointer copy, no chain rewrite — safe under
+  reconstruct-on-open reachability, which unions over live records) remains the **one deferred
+  byte-layout follow-on**: it changes incremental allocation order, so it must land in all cores
+  + the per-core incremental tests together, and it is what would also drop the commit-time
+  re-read.
 - The open-time reachability walk follows chains via **headers only** (`next_page` hops — no
-  decompression), which it can do today.
-- Wins: a `SELECT small_col` over a table of huge values stops reading (and holding) them; the
-  resident set of a file-backed store stops scaling with unreferenced large values.
+  payload assembly, no decompression, no UTF-8 validation), so `open` never materializes a large
+  value. The per-core tests pin this physically: with every chain *payload* corrupted on disk,
+  open and untouching queries succeed, and touching the spilled column is the moment `XX001`
+  surfaces. (Alignment fix that fell out: the Go core now validates text UTF-8 on decode like
+  Rust/TS, so a corrupt chain is `XX001` in every core.)
+- Wins, now real: a `SELECT small_col` over a table of huge values reads no chains and decompresses
+  nothing; `open` is cheaper on spillable tables; the resident set of a file-backed store stops
+  scaling with unreferenced large values (a faulted leaf holds pointers, not megabytes).

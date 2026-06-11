@@ -43,6 +43,32 @@ pub enum Value {
     /// A UTC-instant `timestamptz` — int64 microseconds since the Unix epoch. Distinct from
     /// `Timestamp` (it renders with a +00 suffix and never compares cross-family).
     Timestamptz(i64),
+    /// An **unfetched** large-value reference (spec/design/large-values.md §14): a stored
+    /// external/compressed value loaded as its on-disk pointer instead of being materialized.
+    /// Internal to the storage/scan layers — the scan layer resolves every column a query
+    /// touches before the evaluator sees the row, so this variant must never reach a
+    /// comparison, render, or encode. It is **poisoned**: those paths panic loudly (an engine
+    /// bug), never read it as NULL.
+    Unfetched(Unfetched),
+}
+
+/// The on-disk form an unfetched large value was stored in (spec/design/large-values.md §14;
+/// spec/fileformat/format.md "Large values") — exactly the record's pointer fields, so the
+/// scan layer can resolve it through the pager (and the cost walk can count its chain pages /
+/// decompress slabs) without reading the value.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Unfetched {
+    /// `0x02` external-plain: the chain carries `len` payload bytes from `first_page`.
+    External { first_page: u32, len: u32 },
+    /// `0x03` inline-compressed: the LZ4 block is resident (it lives in the record), but
+    /// decompression is deferred until the column is touched.
+    InlineComp { comp: Vec<u8>, raw_len: u32 },
+    /// `0x04` external-compressed: the chain carries the `stored_len`-byte LZ4 block.
+    ExternalComp {
+        first_page: u32,
+        stored_len: u32,
+        raw_len: u32,
+    },
 }
 
 /// Compare two numeric values by value, promoting an integer operand to decimal when its
@@ -109,6 +135,7 @@ impl Value {
             // `YYYY-MM-DD HH:MM:SS[.ffffff]`, timestamptz with a `+00` suffix, ±infinity bare.
             Value::Timestamp(m) => timestamp::render_timestamp(*m),
             Value::Timestamptz(m) => timestamp::render_timestamptz(*m),
+            Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
         }
     }
 
@@ -137,6 +164,11 @@ impl Value {
             // Timestamps compare by the int64 instant; infinity is just an extreme value.
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a == b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a == b),
+            // Poisoned (large-values.md §14): an unfetched value must never be compared —
+            // falling through to UNKNOWN here would silently read it as NULL.
+            (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
+                panic!("BUG: unfetched large value escaped the storage layer")
+            }
             _ => ThreeValued::Unknown,
         }
     }
@@ -154,6 +186,9 @@ impl Value {
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a < b),
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a < b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a < b),
+            (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
+                panic!("BUG: unfetched large value escaped the storage layer")
+            }
             _ => ThreeValued::Unknown,
         }
     }
@@ -171,6 +206,9 @@ impl Value {
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a > b),
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a > b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a > b),
+            (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
+                panic!("BUG: unfetched large value escaped the storage layer")
+            }
             _ => ThreeValued::Unknown,
         }
     }
