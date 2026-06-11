@@ -11,6 +11,8 @@ package jed
 type CostSchedule struct {
 	StorageRowRead      int64
 	PageRead            int64
+	ValueCompress       int64
+	ValueDecompress     int64
 	RowProduced         int64
 	OperatorEval        int64
 	AggregateAccumulate int64
@@ -20,6 +22,8 @@ type CostSchedule struct {
 var Costs = CostSchedule{
 	StorageRowRead:      1,
 	PageRead:            1,
+	ValueCompress:       1,
+	ValueDecompress:     1,
 	RowProduced:         1,
 	OperatorEval:        1,
 	AggregateAccumulate: 1,

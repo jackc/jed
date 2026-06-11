@@ -15,6 +15,7 @@ import { Decimal } from "./decimal.ts";
 import { decodeInt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database, Snapshot } from "./executor.ts";
+import { lz4Compress, lz4Decompress } from "./lz4.ts";
 import { onDiskRef, residentRef } from "./pmap.ts";
 import type { Child, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
@@ -50,11 +51,20 @@ const PAGE_LEAF = 2; // page_type for a B-tree leaf node
 const PAGE_INTERIOR = 3; // page_type for a B-tree interior node
 const PAGE_OVERFLOW = 4; // page_type for an out-of-line value slab (large-values.md §12)
 const ROOT_PAGE = 2; // catalog root of a fresh empty db (relocatable thereafter)
-// tagExternal is the value-codec presence tag for a present external value: the body is a pointer
-// (u32 first_page + u32 payload_len) into an overflow chain, not the value (large-values.md §12).
-// 0x00 present-inline / 0x01 NULL unchanged; 0x03/0x04 reserved for compression (Slice B).
+// Value-codec presence tags beyond 0x00 present-inline-plain / 0x01 NULL (large-values.md
+// §12/§13; format.md "Large values"): 0x02 external-plain (u32 first_page + u32 payload_len),
+// 0x03 inline-compressed (u32 raw_len + u16 comp_len + LZ4 block — lz4.md), 0x04
+// external-compressed (u32 first_page + u32 stored_len + u32 raw_len; the chain carries the
+// COMPRESSED block). The *_LEN constants are each form's full in-record size (tag included).
 const TAG_EXTERNAL = 0x02;
+const TAG_INLINE_COMP = 0x03;
+const TAG_EXTERNAL_COMP = 0x04;
 const EXTERNAL_PTR_LEN = 1 + 4 + 4; // tag + first_page(u32) + payload_len(u32) in a record
+const INLINE_COMP_OVERHEAD = 1 + 4 + 2; // tag + raw_len(u32) + comp_len(u16)
+const EXTERNAL_COMP_PTR_LEN = 1 + 4 + 4 + 4; // tag + first_page + stored_len + raw_len
+// Content payloads below this many bytes are never fed to the LZ4 encoder (header overhead
+// dominates; PostgreSQL pglz's default min_input_size — large-values.md §13).
+const S_COMPRESS = 32;
 const MIN_PAGE_SIZE = PAGE_HEADER + 36; // smallest valid page size (page + 36-byte meta header; format.md)
 const MAX_PAGE_SIZE = 65536; // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
 
@@ -241,65 +251,145 @@ function recordMaxFor(capacity: number): number {
   return Math.max(0, Math.floor((capacity - PAGE_HEADER) / 2));
 }
 
-// planDispositions decides each column's on-disk disposition (Slice A: inline or external-plain) and
-// returns [isExternal per column, on-disk record size] — spec/design/large-values.md §3/§12. Spill
-// only when forced: if the all-inline record already fits RECORD_MAX nothing spills; else externalize
-// the largest spillable values (ties by column order) until it fits. Deterministic and cross-core
-// identical (a §8 contract); shared by the serializer and by recordSize (the B-tree split weight).
-function planDispositions(
+// A value's planned on-disk disposition (large-values.md §2/§12/§13).
+type ValueDisp = "inline" | "inlineComp" | "external" | "externalComp";
+
+// A record's resolved disposition plan: per-column form, the LZ4 block a compressed form
+// carries (so the serializer never re-compresses), the on-disk record size (the B-tree split
+// weight), and the value_compress slabs the plan's pass-1 attempts cost (cost.md §3).
+type RecordPlan = {
+  disp: ValueDisp[];
+  comp: (Uint8Array | null)[];
+  size: number;
+  compressUnits: number;
+};
+
+// planDispositions decides each column's on-disk disposition (large-values.md §3/§12/§13;
+// format.md "Large values"). Spill only when forced: if the all-inline-plain record already fits
+// RECORD_MAX, nothing is compressed or spilled. Otherwise two passes, each visiting largest
+// encoded size first, ties by ascending column index — deterministic, a §8 contract:
+// (1) compress eligible values (payload ≥ S_COMPRESS), adopting iff the encoded compressed form
+// is strictly smaller (store-smaller); (2) externalize values whose current encoded size still
+// beats their pointer, moving the bytes pass 1 chose (compressed → a 0x04 chain of the
+// compressed block) until the record fits. Shared by the serializer and recordSize (the B-tree
+// split weight): in-memory node boundaries must match the serialized pages.
+function planDispositions(colTypes: ScalarType[], key: Uint8Array, row: Row, capacity: number): RecordPlan {
+  const inline = colTypes.map((ty, i) => encodeValue(ty, row[i]!).length);
+  const plan: RecordPlan = {
+    disp: new Array<ValueDisp>(colTypes.length).fill("inline"),
+    comp: new Array<Uint8Array | null>(colTypes.length).fill(null),
+    size: 0,
+    compressUnits: 0,
+  };
+  const cur = inline.slice();
+  let size = 2 + key.length + inline.reduce((a, b) => a + b, 0);
+  const max = recordMaxFor(capacity);
+  if (size <= max) {
+    plan.size = size;
+    return plan;
+  }
+  // Pass 1 — compress (lz4.md): spillable, non-NULL, payload ≥ S_COMPRESS; largest inline-plain
+  // encoded size first, ties by ascending index (Array.prototype.sort is stable, ES2019+).
+  // Every attempt is metered (ceil(raw/capacity) value_compress slabs) whether or not
+  // store-smaller adopts it.
+  let cand: number[] = [];
+  for (let i = 0; i < colTypes.length; i++) {
+    if (
+      isSpillable(colTypes[i]!) &&
+      row[i]!.kind !== "null" &&
+      valuePayload(colTypes[i]!, row[i]!).length >= S_COMPRESS
+    ) {
+      cand.push(i);
+    }
+  }
+  cand.sort((a, b) => inline[b]! - inline[a]!);
+  for (const i of cand) {
+    if (size <= max) break;
+    const payload = valuePayload(colTypes[i]!, row[i]!);
+    plan.compressUnits += Math.ceil(payload.length / capacity);
+    const comp = lz4Compress(payload);
+    if (INLINE_COMP_OVERHEAD + comp.length < inline[i]!) {
+      size = size - cur[i]! + INLINE_COMP_OVERHEAD + comp.length;
+      cur[i] = INLINE_COMP_OVERHEAD + comp.length;
+      plan.disp[i] = "inlineComp";
+      plan.comp[i] = comp;
+    }
+  }
+  if (size <= max) {
+    plan.size = size;
+    return plan;
+  }
+  // Pass 2 — externalize: anything whose current encoded size beats its pointer, largest
+  // current size first, ties by ascending index. (A NULL is 1 byte and never qualifies.)
+  cand = [];
+  for (let i = 0; i < colTypes.length; i++) {
+    const ptr = plan.disp[i] === "inlineComp" ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN;
+    if (isSpillable(colTypes[i]!) && cur[i]! > ptr) cand.push(i);
+  }
+  cand.sort((a, b) => cur[b]! - cur[a]!);
+  for (const i of cand) {
+    if (size <= max) break;
+    const compressed = plan.disp[i] === "inlineComp";
+    const ptr = compressed ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN;
+    plan.disp[i] = compressed ? "externalComp" : "external";
+    size = size - cur[i]! + ptr;
+    cur[i] = ptr;
+  }
+  plan.size = size;
+  return plan;
+}
+
+// recordSize is the on-disk size of a record — the weight the page-backed B-tree splits on
+// (format.md). Accounts for compression and out-of-line spill: a compressed value contributes
+// its compressed inline form, an externalized one its fixed pointer size (large-values.md
+// §12/§13). Must equal what the serializer produces, so in-memory node boundaries match
+// serialized page boundaries.
+export function recordSize(colTypes: ScalarType[], key: Uint8Array, row: Row, capacity: number): number {
+  return planDispositions(colTypes, key, row, capacity).size;
+}
+
+// recordScanUnits returns the per-record units a scan's up-front cost block charges beyond the
+// B-tree nodes (cost.md §3; large-values.md §8/§12/§13): pages = one page_read per overflow
+// chain page (the chain carries the payload for external-plain, the COMPRESSED block for
+// external-compressed); decompress = ceil(raw/capacity) value_decompress slabs per compressed
+// stored value (inline- or external-). Zero/zero for a fully-inline-plain record.
+export function recordScanUnits(
   colTypes: ScalarType[],
   key: Uint8Array,
   row: Row,
   capacity: number,
-): [boolean[], number] {
-  const inline = colTypes.map((ty, i) => encodeValue(ty, row[i]!).length);
-  const external = new Array<boolean>(colTypes.length).fill(false);
-  let size = 2 + key.length + inline.reduce((a, b) => a + b, 0);
-  const max = recordMaxFor(capacity);
-  if (size <= max) return [external, size];
-  // Spillable, currently-inline columns whose externalization actually shrinks the record
-  // (inline > pointer), largest inline size first; ties by column order — a stable sort keeps it
-  // deterministic.
-  const cand: number[] = [];
-  for (let i = 0; i < colTypes.length; i++) {
-    if (isSpillable(colTypes[i]!) && inline[i]! > EXTERNAL_PTR_LEN) cand.push(i);
+): { pages: number; decompress: number } {
+  const plan = planDispositions(colTypes, key, row, capacity);
+  let pages = 0;
+  let decompress = 0;
+  for (let i = 0; i < plan.disp.length; i++) {
+    switch (plan.disp[i]) {
+      case "external":
+        pages += Math.ceil(valuePayload(colTypes[i]!, row[i]!).length / capacity);
+        break;
+      case "inlineComp":
+        decompress += Math.ceil(valuePayload(colTypes[i]!, row[i]!).length / capacity);
+        break;
+      case "externalComp":
+        pages += Math.ceil(plan.comp[i]!.length / capacity);
+        decompress += Math.ceil(valuePayload(colTypes[i]!, row[i]!).length / capacity);
+        break;
+    }
   }
-  cand.sort((a, b) => inline[b]! - inline[a]!); // Array.prototype.sort is stable (ES2019+)
-  for (const i of cand) {
-    if (size <= max) break;
-    external[i] = true;
-    size = size - inline[i]! + EXTERNAL_PTR_LEN;
-  }
-  return [external, size];
+  return { pages, decompress };
 }
 
-// recordSize is the on-disk size of a record — the weight the page-backed B-tree splits on
-// (format.md). Accounts for out-of-line spill: an externalized value contributes its fixed pointer
-// size, not its full inline body (large-values.md §12). Must equal what the serializer produces, so
-// in-memory node boundaries match serialized page boundaries.
-export function recordSize(colTypes: ScalarType[], key: Uint8Array, row: Row, capacity: number): number {
-  return planDispositions(colTypes, key, row, capacity)[1];
-}
-
-// overflowPageCount is the number of overflow pages this record's externalized values occupy — the
-// extra page_reads a scan that materializes the record charges (spec/design/large-values.md
-// §8.1/§12; cost.md §3). Zero for a fully-inline record. Each external value's content payload P(v)
-// fills capacity-byte slabs, one page per slab — the same chain layout the serializer writes, so
-// the count is the chain's true page count and identical across cores.
-export function overflowPageCount(
+// recordCompressUnits returns the value_compress slabs storing this record costs — one
+// ceil(raw/capacity) block per pass-1 compression attempt, adopted or not (cost.md §3;
+// large-values.md §13). Charged once per stored row version at the statement's write site,
+// never for B-tree re-encodes.
+export function recordCompressUnits(
   colTypes: ScalarType[],
   key: Uint8Array,
   row: Row,
   capacity: number,
 ): number {
-  const [external] = planDispositions(colTypes, key, row, capacity);
-  let pages = 0;
-  for (let i = 0; i < external.length; i++) {
-    if (external[i]) {
-      pages += Math.ceil(valuePayload(colTypes[i]!, row[i]!).length / capacity);
-    }
-  }
-  return pages;
+  return planDispositions(colTypes, key, row, capacity).compressUnits;
 }
 
 // valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
@@ -344,19 +434,42 @@ function encodeRecord(
   ovf: OverflowPageOut[],
 ): Uint8Array {
   const colTypes = table.columns.map((c) => c.type);
-  const [external] = planDispositions(colTypes, key, row, capacity);
+  const plan = planDispositions(colTypes, key, row, capacity);
   const w = new ByteWriter();
   w.u16(key.length);
   w.bytes(key);
   for (let i = 0; i < table.columns.length; i++) {
-    if (external[i]) {
-      const payload = valuePayload(table.columns[i]!.type, row[i]!);
-      const first = writeOverflowChain(payload, capacity, take, ovf);
-      w.u8(TAG_EXTERNAL);
-      w.u32(first);
-      w.u32(payload.length);
-    } else {
-      w.bytes(encodeValue(table.columns[i]!.type, row[i]!));
+    switch (plan.disp[i]) {
+      case "external": {
+        const payload = valuePayload(table.columns[i]!.type, row[i]!);
+        const first = writeOverflowChain(payload, capacity, take, ovf);
+        w.u8(TAG_EXTERNAL);
+        w.u32(first);
+        w.u32(payload.length);
+        break;
+      }
+      case "inlineComp": {
+        const rawLen = valuePayload(table.columns[i]!.type, row[i]!).length;
+        const comp = plan.comp[i]!;
+        w.u8(TAG_INLINE_COMP);
+        w.u32(rawLen);
+        w.u16(comp.length);
+        w.bytes(comp);
+        break;
+      }
+      case "externalComp": {
+        // The chain carries the COMPRESSED block (its page count follows comp size).
+        const rawLen = valuePayload(table.columns[i]!.type, row[i]!).length;
+        const comp = plan.comp[i]!;
+        const first = writeOverflowChain(comp, capacity, take, ovf);
+        w.u8(TAG_EXTERNAL_COMP);
+        w.u32(first);
+        w.u32(comp.length);
+        w.u32(rawLen);
+        break;
+      }
+      default:
+        w.bytes(encodeValue(table.columns[i]!.type, row[i]!));
     }
   }
   return w.toBytes();
@@ -1246,6 +1359,20 @@ function readValue(
     const len = readU32(buf, cur);
     if (fetch === null) throw engineError("data_corrupted", "external value with no overflow reader");
     return valueFromPayload(ty, readOverflowChain(first, len, fetch, ovfOut));
+  }
+  if (tag === TAG_INLINE_COMP) {
+    const rawLen = readU32(buf, cur);
+    const compLen = readU16(buf, cur);
+    const comp = take(buf, cur, compLen);
+    return valueFromPayload(ty, lz4Decompress(comp, rawLen));
+  }
+  if (tag === TAG_EXTERNAL_COMP) {
+    const first = readU32(buf, cur);
+    const stored = readU32(buf, cur);
+    const rawLen = readU32(buf, cur);
+    if (fetch === null) throw engineError("data_corrupted", "external value with no overflow reader");
+    const comp = readOverflowChain(first, stored, fetch, ovfOut);
+    return valueFromPayload(ty, lz4Decompress(comp, rawLen));
   }
   throw engineError("data_corrupted", "invalid value presence tag");
 }

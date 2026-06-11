@@ -720,10 +720,15 @@ impl Database {
                     }
                     rows.push(rv);
                 }
-                self.insert_rows(&table, &columns, pk, &provided, rows)?;
                 // INSERT ... VALUES reads no rows and evaluates no expression tree — its values
-                // are literals and pre-evaluated constant defaults (leaves): zero cost.
-                Ok(Outcome::Statement { cost: 0 })
+                // are literals and pre-evaluated constant defaults (leaves). The only metered
+                // work is the disposition plan's compression attempts for over-RECORD_MAX rows
+                // (value_compress, cost.md §3); a fully-inline row still costs zero.
+                let mut meter = Meter::with_limit(self.max_cost);
+                self.insert_rows(&table, &columns, pk, &provided, rows, &mut meter)?;
+                Ok(Outcome::Statement {
+                    cost: meter.accrued,
+                })
             }
             InsertSource::Select(sel) => {
                 // Run the source query first; it returns OWNED rows, so the `&mut self` borrow
@@ -763,9 +768,16 @@ impl Database {
                     }
                 }
 
-                self.insert_rows(&table, &columns, pk, &provided, q.rows)?;
-                // Cost = the embedded SELECT's accrued cost (§24); storing rows is unmetered.
-                Ok(Outcome::Statement { cost: q.cost })
+                // Cost = the embedded SELECT's accrued cost (§24) plus the disposition plan's
+                // compression attempts for over-RECORD_MAX rows (value_compress, cost.md §3);
+                // storing the rows themselves stays unmetered. Seeding the meter with the
+                // SELECT's cost keeps one ceiling over the whole statement.
+                let mut meter = Meter::with_limit(self.max_cost);
+                meter.charge(q.cost);
+                self.insert_rows(&table, &columns, pk, &provided, q.rows, &mut meter)?;
+                Ok(Outcome::Statement {
+                    cost: meter.accrued,
+                })
             }
         }
     }
@@ -786,10 +798,12 @@ impl Database {
         pk: Option<(usize, ScalarType)>,
         provided: &[Option<usize>],
         rows: Vec<Vec<Value>>,
+        meter: &mut Meter,
     ) -> Result<()> {
         let n = columns.len();
         let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(rows.len());
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut cunits: i64 = 0;
         for values in &rows {
             let mut row = Vec::with_capacity(n);
             for (i, col) in columns.iter().enumerate() {
@@ -841,8 +855,20 @@ impl Database {
                 }
                 None => None,
             };
+            // Meter the row's disposition-plan compression attempts (value_compress, cost.md
+            // §3). For a no-PK table the synthetic rowid is allocated in phase 2; only the key
+            // LENGTH feeds the plan, so an 8-byte placeholder stands in deterministically.
+            {
+                let store = self.store(table);
+                let placeholder = [0u8; 8];
+                let kb: &[u8] = key.as_deref().unwrap_or(&placeholder);
+                cunits += store.write_compress_units(kb, &row) as i64;
+            }
             prepared.push((key, row));
         }
+        // Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
+        meter.charge(COSTS.value_compress * cunits);
+        meter.guard()?;
 
         // Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
         // rowid is allocated here, in row order, so a failed validation pass burns none
@@ -910,24 +936,21 @@ impl Database {
             (Some(f), Some((pk_idx, pk_ty))) => detect_pk_bound(f, pk_idx, pk_ty),
             _ => None,
         };
-        let (entries, overlap) = match &pk_bound {
+        let (entries, (overlap, slabs)) = match &pk_bound {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
             Some(bp) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
                     let store = self.store(&del.table);
-                    (
-                        store.range_entries(&b)?,
-                        store.overlap_scan_page_count(&b)? as i64,
-                    )
+                    (store.range_entries(&b)?, store.overlap_scan_units(&b)?)
                 }
-                None => (Vec::new(), 0),
+                None => (Vec::new(), (0, 0)),
             },
             None => {
                 let store = self.store(&del.table);
-                (store.iter_entries()?, store.scan_page_count()? as i64)
+                (store.iter_entries()?, store.scan_units()?)
             }
         };
-        meter.charge(COSTS.page_read * overlap);
+        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
         for (k, row) in entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
@@ -1048,24 +1071,21 @@ impl Database {
             (Some(f), Some((pk_i, pk_ty))) => detect_pk_bound(f, pk_i, pk_ty),
             _ => None,
         };
-        let (entries, overlap) = match &pk_bound {
+        let (entries, (overlap, slabs)) = match &pk_bound {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
             Some(bp) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
                     let store = self.store(&upd.table);
-                    (
-                        store.range_entries(&b)?,
-                        store.overlap_scan_page_count(&b)? as i64,
-                    )
+                    (store.range_entries(&b)?, store.overlap_scan_units(&b)?)
                 }
-                None => (Vec::new(), 0),
+                None => (Vec::new(), (0, 0)),
             },
             None => {
                 let store = self.store(&upd.table);
-                (store.iter_entries()?, store.scan_page_count()? as i64)
+                (store.iter_entries()?, store.scan_units()?)
             }
         };
-        meter.charge(COSTS.page_read * overlap);
+        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
         for (key, row) in entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
@@ -1083,6 +1103,17 @@ impl Database {
             }
             updates.push((key, new_row));
         }
+
+        // Each rewritten row's disposition plan may attempt compression (a record over
+        // RECORD_MAX) — meter the attempts (value_compress, cost.md §3) and enforce the
+        // ceiling BEFORE phase 2 writes anything, preserving all-or-nothing.
+        let store = self.store(&upd.table);
+        let mut cunits: i64 = 0;
+        for (key, row) in &updates {
+            cunits += store.write_compress_units(key, row) as i64;
+        }
+        meter.charge(COSTS.value_compress * cunits);
+        meter.guard()?;
 
         // Phase 2: apply (keys unchanged — a PK column can't be assigned).
         let store = self.store_mut(&upd.table);
@@ -1585,12 +1616,12 @@ impl Database {
             },
             None => (KeyBound::unbounded(), false),
         };
-        let overlap = if empty {
-            0
+        let (overlap, slabs) = if empty {
+            (0, 0)
         } else {
-            store.overlap_scan_page_count(&bound)? as i64
+            store.overlap_scan_units(&bound)?
         };
-        meter.charge(COSTS.page_read * overlap);
+        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
 
         let limit = plan.limit.expect("streaming path is gated on a LIMIT");
         let offset = plan.offset.unwrap_or(0);
@@ -1671,17 +1702,17 @@ impl Database {
             // Each base table's own primary-key bound (if any) seeks/ranges instead of walking the
             // whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing.
             // Otherwise the full scan is unchanged (cost.md §3 "bounded scan" / JOIN).
-            let (rows, node_count) = match &plan.rel_bounds[ri] {
+            let (rows, (node_count, slabs)) = match &plan.rel_bounds[ri] {
                 Some(bp) => match build_key_bound(bp, params, outer) {
-                    Some(b) => (
-                        store.range_rows(&b)?,
-                        store.overlap_scan_page_count(&b)? as i64,
-                    ),
-                    None => (Vec::new(), 0),
+                    Some(b) => (store.range_rows(&b)?, store.overlap_scan_units(&b)?),
+                    None => (Vec::new(), (0, 0)),
                 },
-                None => (store.iter_in_key_order()?, store.scan_page_count()? as i64),
+                None => (store.iter_in_key_order()?, store.scan_units()?),
             };
-            let mut src = ScanSource::new(rows, node_count);
+            // The decompress slabs join the same up-front block as the page_read the
+            // ScanSource charges on its first next() (cost.md §3 "the compression units").
+            meter.charge(COSTS.value_decompress * slabs as i64);
+            let mut src = ScanSource::new(rows, node_count as i64);
             let mut table_rows: Vec<Row> = Vec::new();
             while let Some(row) = src.next(&mut meter)? {
                 table_rows.push(row);

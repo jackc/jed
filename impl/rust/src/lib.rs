@@ -19,6 +19,7 @@ pub mod executor;
 pub mod file;
 pub mod format;
 pub mod lexer;
+pub mod lz4;
 pub mod operators;
 pub mod pager;
 pub mod paging;

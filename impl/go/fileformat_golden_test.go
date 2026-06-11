@@ -143,17 +143,66 @@ func byteaTableDB(t *testing.T) *Database {
 	return db
 }
 
-// overflowTableDB has large text + bytea values that spill OUT-OF-LINE to overflow pages
-// (spec/design/large-values.md §12): at page_size 256 a ~600/300-byte value exceeds RECORD_MAX
-// (116) so the record holds a pointer and the bytes live in a page_type-4 chain. Row 1 spills both
-// columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL. Must match the Ruby
-// reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
+// Incompressible filler (spec/fileformat/format.md "Fixtures"): xorshift32(seed "JEDB") mapped
+// to a 64-char alphabet (text) or raw bytes (bytea hex literals). High-entropy, so the LZ4
+// encoder never wins store-smaller and the value deterministically stays PLAIN. Mirrors
+// verify.rb's filler_text/filler_bytes; each call restarts at the seed.
+const fillerAlpha64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+func fillerStep(x uint32) uint32 {
+	x ^= x << 13
+	x ^= x >> 17
+	return x ^ (x << 5)
+}
+
+func fillerText(n int) string {
+	x := uint32(0x4A454442)
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		x = fillerStep(x)
+		b.WriteByte(fillerAlpha64[x%64])
+	}
+	return b.String()
+}
+
+func fillerBytesHex(n int) string {
+	x := uint32(0x4A454442)
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		x = fillerStep(x)
+		fmt.Fprintf(&b, "%02x", x%256)
+	}
+	return b.String()
+}
+
+// overflowTableDB has large INCOMPRESSIBLE text + bytea values that spill OUT-OF-LINE PLAIN to
+// overflow pages (spec/design/large-values.md §12): at page_size 256 a ~600/300-byte value
+// exceeds RECORD_MAX (116); compression is attempted first (Slice B) but rejected by
+// store-smaller, so the record holds a 0x02 pointer and the raw bytes live in a page_type-4
+// chain. Row 1 spills both columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL.
+// Must match the Ruby reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
 func overflowTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
 	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)")
-	run(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s', '\\x%s')", strings.Repeat("x", 600), strings.Repeat("ab", 300)))
+	run(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s', '\\x%s')", fillerText(600), fillerBytesHex(300)))
 	run(t, db, `INSERT INTO t VALUES (2, 'small', '\xcafe')`)
 	run(t, db, "INSERT INTO t VALUES (3, NULL, NULL)")
+	return db
+}
+
+// compressedTableDB has large COMPRESSIBLE values exercising Slice B's forms (large-values.md
+// §13, format.md "Large values", lz4.md): row 1's "x"-run text and 0xAB-run bytea both become
+// 0x03 inline-compressed; row 2's half-filler/half-run text compresses to ~200 B — smaller than
+// plain but still over RECORD_MAX → 0x04 external-compressed (a chain carrying the COMPRESSED
+// block); row 3 stays inline-plain; row 4 is NULL/NULL. Must match the Ruby reference's
+// COMPRESSED_TABLE (spec/fileformat/verify.rb).
+func compressedTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)")
+	run(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s', '\\x%s')", strings.Repeat("x", 600), strings.Repeat("ab", 200)))
+	run(t, db, fmt.Sprintf("INSERT INTO t VALUES (2, '%s%s', NULL)", fillerText(200), strings.Repeat("y", 200)))
+	run(t, db, `INSERT INTO t VALUES (3, 'tiny', '\xcafe')`)
+	run(t, db, "INSERT INTO t VALUES (4, NULL, NULL)")
 	return db
 }
 
@@ -223,6 +272,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 	}{
 		{"empty_db.jed", func(*testing.T) *Database { return WithPageSize(goldenPageSize) }},
 		{"overflow_table.jed", overflowTableDB},
+		{"compressed_table.jed", compressedTableDB},
 		{"one_table_empty.jed", oneTableEmptyDB},
 		{"pk_table.jed", pkTableDB},
 		{"text_table.jed", textTableDB},
@@ -257,6 +307,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 	}{
 		{"one_table_empty.jed", oneTableEmptyDB, "t"},
 		{"overflow_table.jed", overflowTableDB, "t"},
+		{"compressed_table.jed", compressedTableDB, "t"},
 		{"pk_table.jed", pkTableDB, "t"},
 		{"text_table.jed", textTableDB, "t"},
 		{"bool_table.jed", boolTableDB, "t"},

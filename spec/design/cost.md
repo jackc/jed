@@ -45,7 +45,8 @@ The core seam units, all weight `1`:
 (`page_read` was **added** in P6.3 when the store became a page-backed B-tree — §3
 "`page_read`" — *alongside* `storage_row_read`, not a rename; the later
 `aggregate_accumulate` unit, [../cost/schedule.toml](../cost/schedule.toml), is metered in
-the aggregates path.) The weights are uniform on purpose — phase 1 proves the seam reads
+the aggregates path, and the `value_compress`/`value_decompress` units — §3 "the compression
+units" — in the large-value codec paths.) The weights are uniform on purpose — phase 1 proves the seam reads
 cost from **data**; tuning the numbers later is a data-only change touching no executor code.
 
 ## 3. Accrual rules (the cross-core determinism contract)
@@ -140,13 +141,36 @@ exactly the property cost requires.
   materializing the record reads that chain — so the scan's `page_read` block also counts **one
   per overflow chain page of every record the scan's bound admits** (the full table when
   unbounded; the in-range records for a bounded scan, so a point lookup pays only *its* record's
-  chain and a miss pays none). The chain page count is `ceil(payload / C)` per externalized
-  value — a function of the §8-contracted disposition rule and chain layout, so it is
+  chain and a miss pays none). The chain page count is `ceil(stored / C)` per externalized
+  value, where `stored` is the bytes the chain actually carries — the content payload for an
+  external-plain value, the **compressed** block for an external-compressed one (large-values.md
+  §13) — a function of the §8-contracted disposition rule and chain layout, so it is
   byte-identical across cores; a fully-inline table charges exactly the structural node count as
   before (existing costs do not move). Like the rest of the block it is charged **up front** and
   does **not** short-circuit under `LIMIT` (see "LIMIT short-circuit" below); it stays *logical*
   (whether eager materialization actually read the chain, or a future lazy read skipped it, the
   charge is the same — large-values.md §7 is a tracked follow-on that would revisit this).
+
+### `value_compress` / `value_decompress` — the compression units
+
+Transparent LZ4 compression (large-values.md Slice B, [../fileformat/lz4.md](../fileformat/lz4.md))
+is real CPU work in both directions, metered by two units so the §6 ceiling can bound it. Both are
+quantized in **`C`-byte slabs of the *decompressed* (raw) payload** — `ceil(raw_len / C)` with
+`C = page_size − 12`, the same slab size the overflow chains use — proportional to the work yet
+computable from the stored lengths alone, so the charge never requires re-running the codec.
+
+- **`value_decompress`** joins the scan's **up-front block** next to the chain `page_read`s: for
+  every record the scan's bound admits, each **compressed** stored value (inline-compressed `0x03`
+  or external-compressed `0x04`) charges `ceil(raw_len / C)`. The same composition rules apply
+  verbatim — per JOIN base table, per correlated re-scan, no `LIMIT` short-circuit, nothing for a
+  missed bound, and a table with no compressed value charges nothing. (This is the
+  eager-materialization reading; large-values.md §7's lazy read is the tracked follow-on that
+  would refine it to per-touched-value.)
+- **`value_compress`** is the write side: an `INSERT`/`UPDATE` whose record exceeds `RECORD_MAX`
+  runs the disposition decision's compress pass, and **every attempt** (adopted or rejected by
+  *store-smaller* — the encoder ran either way) charges `ceil(raw_len / C)`. Charged once per
+  stored row version at the statement's write site, never for the B-tree's internal re-encodes.
+  A record that fits inline-plain attempts nothing, so existing costs do not move.
 
 ### Bounded scan / point lookup — the pages a primary-key predicate touches
 
@@ -239,7 +263,8 @@ capability.
   deliberate cost change; it is genuine (the scan really stops — leaves past the stop point are never
   faulted), not a post-hoc truncation, so the cost honestly bounds the work (CLAUDE.md §13).
 - **`page_read` does NOT short-circuit** — it stays the full block (the scan bound's node count
-  plus the bound's overflow chain pages, charged up front), so a `LIMIT` does not lower it. Keeping
+  plus the bound's overflow chain pages and `value_decompress` slabs, charged up front), so a
+  `LIMIT` does not lower it. Keeping
   `page_read` the structural count preserves its "logical, buffer-pool-invisible" definition and one
   accrual model across all scans; the row reads are where the early-out shows. (Tightening
   `page_read` to the leaves actually faulted is a possible later refinement; it would only matter

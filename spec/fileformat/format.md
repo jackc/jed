@@ -18,13 +18,15 @@ other's output. A fourth independent encoder/decoder (the Ruby reference in
 ## Phase-6 scope (`format_version` 3)
 
 This is the **page-backed copy-on-write B-tree** format (Phase 6). The current on-disk version is
-**`format_version` 3** — it adds **out-of-line overflow pages for large values** (the *Large values*
-section below; [../design/large-values.md](../design/large-values.md)) on top of the P6.1
-page-backed B-tree. Each version is a **clean break** — older versions are **not read** (we are
-pre-1.0 and owe no on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts
-**only** version 3. Because inline and NULL values are byte-unchanged (the overflow change extends
-the value-codec presence tag with a new state — *Value codec*), a file with no spilled value differs
-from its v2 form only in the version field; the goldens regenerate accordingly.
+**`format_version` 3** — it adds **out-of-line overflow pages** and **transparent LZ4 compression**
+for large values (the *Large values* section below; [../design/large-values.md](../design/large-values.md))
+on top of the P6.1 page-backed B-tree. Each version is a **clean break** — older versions are **not
+read** (we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a
+reader accepts **only** version 3. Because inline-plain and NULL values are byte-unchanged (the
+large-value change extends the value-codec presence tag with new states — *Value codec*), a file
+with no spilled or compressed value differs from its v2 form only in the version field; the goldens
+regenerate accordingly. Compression (large-values.md Slice B) landed **additively within v3**: the
+`0x03`/`0x04` forms were reserved by the overflow slice, so no second version bump.
 
 The P6.1 page-backed B-tree (`format_version` 2) changed exactly two things from the step-5b
 whole-image format (`format_version` 1):
@@ -42,18 +44,16 @@ whole-image format (`format_version` 1):
 
 Through v2 the stable type codes, the catalog table-entry encoding, the CRC, and the
 order-preserving keys stayed byte-identical to v1, and the **value codec** did too. **v3 extends the
-value codec** — and only it — with the external-value state (a new presence-tag value + a per-row
-overflow chain; *Value codec* / *Large values* below); every **inline** and **NULL** value is still
-byte-unchanged, and the type codes / catalog / CRC / keys are untouched.
+value codec** — and only it — with the external and compressed value states (three new presence-tag
+values + a per-row overflow chain; *Value codec* / *Large values* below); every **inline-plain** and
+**NULL** value is still byte-unchanged, and the type codes / catalog / CRC / keys are untouched.
 
 **Reclamation (P6.2)** — the allocator reuses dead pages from a free-list **reconstructed on open**
 (see *Reclamation* below), so a file no longer grows without bound across its lifetime. The
 reachability walk also collects each live record's **overflow chain** (v3), so spilled-value pages
 are never handed out as free; a dead chain (from an updated/deleted row) leaks until the next open,
 matching the B-tree-orphan model. **Still deferred, not foreclosed**: continuous *within-session*
-reclamation + on-disk free-list persistence (P6.2 follow-ons), demand paging / a buffer pool, and
-**transparent compression** of large values (the Slice B half of
-[../design/large-values.md](../design/large-values.md); v3 ships the out-of-line half).
+reclamation + on-disk free-list persistence (the P6.2 follow-ons).
 
 ## Conventions
 
@@ -251,11 +251,12 @@ the quantity the split/merge rules below measure.
 **`RECORD_MAX`.** A single record's **stored** on-disk size must be ≤ `RECORD_MAX = (C-12)/2`
 (floor); this is **tighter than v1's ≤ `C`** rule and is what makes every node split clean (see
 *Why the record cap* below). Since **v3**, a record over the cap is **not** rejected — its large
-values **spill out-of-line** (the *Large values* section), so the *stored* record (with pointers)
-falls back under `RECORD_MAX`. Only a record that can't be reduced below the cap even after
-externalizing every spillable value remains a write-side `feature_not_supported` (**`0A000`**). At
-the 8192 default, `RECORD_MAX = 4084`; the 256-byte fixtures cap a stored record at 116 bytes, which
-is what makes `overflow_table.jed`'s ~600/300-byte values spill.
+values are **compressed** and/or **spill out-of-line** (the *Large values* section), so the
+*stored* record (with pointers) falls back under `RECORD_MAX`. Only a record that can't be reduced
+below the cap even after compressing and externalizing every spillable value remains a write-side
+`feature_not_supported` (**`0A000`**). At the 8192 default, `RECORD_MAX = 4084`; the 256-byte
+fixtures cap a stored record at 116 bytes, which is what makes `overflow_table.jed`'s ~600/300-byte
+values spill.
 
 ### Leaf node (`page_type = 2`)
 
@@ -343,11 +344,11 @@ limit.
 ### Value codec
 
 A row value is encoded behind a named `encode_value`/`decode_value` seam, by column type. All
-forms begin with a 1-byte **presence tag**: `0x00` **present-inline**, `0x01` **NULL** (the tag
-alone), `0x02` **present-external** (the body is an overflow pointer — *Large values* below).
-`0x03`/`0x04` are **reserved** for compression (large-values.md Slice B); any other tag is
-`data_corrupted`. `0x00` and `0x01` are **unchanged from v1**. The present-**inline** body depends
-on the type:
+forms begin with a 1-byte **presence tag**: `0x00` **present-inline-plain**, `0x01` **NULL** (the
+tag alone), `0x02` **present-external-plain** (the body is an overflow pointer), `0x03`
+**present-inline-compressed**, `0x04` **present-external-compressed** (the `0x02`–`0x04` bodies
+are in *Large values* below). Any other tag is `data_corrupted`. `0x00` and `0x01` are **unchanged
+from v1**. The present-**inline-plain** body depends on the type:
 
 - **Integers** (`int16`/`int32`/`int64`) — the **same order-preserving bytes as keys**
   ([encoding.md §2.1](../design/encoding.md)): fixed-width big-endian, sign-bit flipped.
@@ -381,40 +382,68 @@ over the table's persisted keys (0 for an empty table), exact because a no-PK ke
 `int64` rowid and the rowids issued are `0, 1, 2, …`. Walking the B-tree in key order yields
 the rowids in ascending order; the largest is the rightmost leaf's last key.
 
-### Large values (overflow pages, v3)
+### Large values (overflow pages + compression, v3)
 
-When a record would exceed `RECORD_MAX`, the engine stores its largest variable-length values
-**out-of-line** so the record falls back under the cap (the design rationale and decisions are in
-[../design/large-values.md](../design/large-values.md) §12). The mechanism:
+When a record would exceed `RECORD_MAX`, the engine **compresses** its largest variable-length
+values and, where that is not enough, stores them **out-of-line**, so the record falls back under
+the cap (the design rationale and decisions are in
+[../design/large-values.md](../design/large-values.md) §12/§13). The mechanism:
 
-- **Disposition decision (deterministic, a §8 contract).** Compute the all-inline record size; if
-  it is ≤ `RECORD_MAX`, every value stays inline. Otherwise externalize the **largest spillable
-  values first** (`text`/`bytea`/`decimal` whose inline size exceeds the pointer size), **ties
-  broken by ascending column index**, until the record fits. Fixed-width types never spill. The
-  same rule computes the B-tree split weight (`record_size`) and drives the serializer, so in-memory
-  split points match on-disk pages.
+- **Disposition decision (deterministic, a §8 contract).** Compute the all-inline-plain record
+  size `R = 2 + key_len + Σ value_size`; if `R ≤ RECORD_MAX`, every value stays inline-plain —
+  a record that fits is **never** compressed or spilled. Otherwise run two passes over the
+  spillable values (`text`/`bytea`/`decimal`; fixed-width types never compress or spill), each
+  pass visiting **largest encoded size first, ties broken by ascending column index**:
 
-- **External pointer (in the record).** An externalized value's body is the presence tag `0x02`
-  then **`u32 first_page`** + **`u32 payload_len`** — a fixed **9-byte** in-record footprint
+  1. **Compress pass.** Candidates: spillable values whose content payload is
+     ≥ **`S_COMPRESS = 32`** bytes, ordered by their **inline-plain** encoded size. For each, in
+     order, while `R > RECORD_MAX`: run the pinned LZ4 encoder ([lz4.md](lz4.md)) over the
+     payload; adopt the compressed form **iff its encoded inline size (`7 + comp_len`) is
+     strictly smaller than the inline-plain encoded size** (the *store-smaller* rule —
+     a non-shrinking value stays plain, so a reader never pays for a useless decompression).
+  2. **Externalize pass.** Candidates: spillable values whose **current** encoded size exceeds
+     their external-pointer size (9 bytes plain / 13 bytes compressed), ordered by current
+     encoded size. For each, in order, while `R > RECORD_MAX`: move the value's stored bytes
+     (compressed if pass 1 adopted compression, else plain) into an overflow chain, leaving the
+     fixed pointer in the record.
+
+  The same rule computes the B-tree split weight (`record_size`) and drives the serializer, so
+  in-memory split points match on-disk pages, and the per-value compression **attempts** of pass 1
+  are what the `value_compress` cost unit meters ([../design/cost.md](../design/cost.md) §3).
+
+- **External-plain pointer (`0x02`).** An externalized plain value's body is the presence tag
+  `0x02` then **`u32 first_page`** + **`u32 payload_len`** — a fixed **9-byte** in-record footprint
   regardless of the value's size. `payload_len` is the length of the value's **content payload**:
   the raw UTF-8 bytes (`text`), the raw bytes (`bytea`), or the decimal body
   (`flags|scale|ndigits|groups`, `decimal`). The `u32` length supersedes the inline `u16` cap.
 
-- **Overflow page (`page_type = 4`).** The content payload is split into **`C`-byte slabs**
-  (`C = page_size − 12`), one per page, written in order. Each overflow page's header carries
-  `item_count` = the bytes on **this** page and `next_page` = the continuation (`0` terminates).
-  The reader follows `next_page` from `first_page`, gathering `payload_len` bytes, then reconstructs
-  the value by column type. Overflow pages are ordinary pages for allocation, copy-on-write commit,
-  and reclamation (the free-list); the reachability walk collects a live record's chain so its pages
-  are never reused while referenced.
+- **Inline-compressed (`0x03`).** The tag, then **`u32 raw_len`** (the content payload's
+  decompressed length) + **`u16 comp_len`** + that many bytes of the [lz4.md](lz4.md) block —
+  `7 + comp_len` bytes in the record. `comp_len` fits `u16` because an inline form only survives
+  the disposition decision inside a record ≤ `RECORD_MAX ≤ 32762`. The reader decompresses to
+  `raw_len` bytes and reconstructs the value by column type (exactly the external content payload).
+
+- **External-compressed (`0x04`).** The tag, then **`u32 first_page`** + **`u32 stored_len`** +
+  **`u32 raw_len`** — a fixed **13-byte** footprint. The overflow chain carries `stored_len` bytes
+  of the **compressed** block (the chain page count follows the compressed size); the reader
+  gathers them, decompresses to `raw_len`, and reconstructs by type.
+
+- **Overflow page (`page_type = 4`).** The chain's stored bytes — the content payload (`0x02`) or
+  the compressed block (`0x04`) — are split into **`C`-byte slabs** (`C = page_size − 12`), one per
+  page, written in order. Each overflow page's header carries `item_count` = the bytes on **this**
+  page and `next_page` = the continuation (`0` terminates). The reader follows `next_page` from
+  `first_page`, gathering `payload_len`/`stored_len` bytes, then reconstructs the value by column
+  type (decompressing first for `0x04`). Overflow pages are ordinary pages for allocation,
+  copy-on-write commit, and reclamation (the free-list); the reachability walk collects a live
+  record's chain so its pages are never reused while referenced.
 
 - **Allocation order (golden-pinned).** In a from-scratch image a node's own page is allocated
   first, then — while encoding its records in key order — each external value's chain is allocated
   in **column order**, contiguously. This fixes the byte layout the goldens pin (`overflow_table.jed`).
 
-A record that still exceeds `RECORD_MAX` after externalizing **every** spillable value (pathological:
-a huge key, or very many columns at a tiny page) remains a write-side `feature_not_supported`
-(`0A000`).
+A record that still exceeds `RECORD_MAX` after compressing and externalizing **every** spillable
+value (pathological: a huge key, or very many columns at a tiny page) remains a write-side
+`feature_not_supported` (`0A000`).
 
 ## Allocation & incremental commit
 
@@ -509,7 +538,8 @@ the interior-node format and the split contract.
 | fixture | exercises |
 |---|---|
 | `empty_db.jed` | zero tables; catalog `item_count = 0`; `root_page = 2` |
-| `overflow_table.jed` | large `text` + `bytea` values that **spill out-of-line** (v3) — `page_type 4` overflow chains (3-page + 2-page), the `0x02` external pointer, and an inline+external+NULL mix in one leaf ([../design/large-values.md](../design/large-values.md) §12) |
+| `overflow_table.jed` | large **incompressible** `text` + `bytea` values that **spill out-of-line plain** (v3) — `page_type 4` overflow chains (3-page + 2-page), the `0x02` external pointer (compression attempted, rejected by *store-smaller*), and an inline+external+NULL mix in one leaf ([../design/large-values.md](../design/large-values.md) §12) |
+| `compressed_table.jed` | large **compressible** values (v3, Slice B) — a `0x03` inline-compressed text (a long run that compresses back under `RECORD_MAX`), a `0x04` external-compressed text (compressed block still over the cap → a chain holding **compressed** bytes), an inline-compressed bytea, and an inline-plain + NULL mix ([../design/large-values.md](../design/large-values.md) §13, [lz4.md](lz4.md)) |
 | `one_table_empty.jed` | one table, zero rows (`root_data_page = 0`) |
 | `pk_table.jed` | an int PK table whose rows force a **3-node tree** (interior root + two leaves) at page 256 — the load-bearing interior-node + split proof; includes a NULL value in a row |
 | `text_table.jed` | a text column — the value codec's text branch; empty string, embedded quote, multi-byte + astral chars, a NULL (single leaf) |
@@ -524,6 +554,14 @@ the interior-node format and the split contract.
 | `tall_tree.jed` | enough small int rows to force a **two-level interior** (height-2 tree) — exercises interior-of-interior child pointers and post-order page allocation |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |
+
+**Incompressible filler (`filler64`).** Fixtures (and mirrored core tests) that need a value the
+LZ4 encoder cannot shrink generate it with a pinned PRNG, identical in all four implementations:
+**xorshift32 with seed `0x4A454442`** (`"JEDB"`), each step `x ^= x << 13; x ^= x >> 17;
+x ^= x << 5` (all modulo 2³²), emitting per step the character `ALPHA64[x mod 64]` where
+`ALPHA64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"` (for `text`) or the
+byte `x mod 256` (for `bytea`). High-entropy output has no 4-byte repeats for the encoder to match,
+so compression never wins *store-smaller* and the value stays plain — deterministically.
 
 The "highest `txid` wins" selection (vs. the torn-write fallback), the **slot alternation**
 across consecutive commits, and the **incremental dirty-page-only write** are covered by

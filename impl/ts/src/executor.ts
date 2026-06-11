@@ -580,9 +580,14 @@ export class Database {
           );
         }
       }
-      this.insertRows(table, store, pk, provided, q.rows);
-      // Cost = the embedded SELECT's accrued cost (§24); storing rows is unmetered.
-      return { kind: "statement", cost: q.cost };
+      // Cost = the embedded SELECT's accrued cost (§24) plus the disposition plan's
+      // compression attempts for over-RECORD_MAX rows (value_compress, cost.md §3); storing
+      // the rows themselves stays unmetered. Seeding the meter with the SELECT's cost keeps
+      // one ceiling over the whole statement.
+      const meter = new Meter(this.maxCost);
+      meter.charge(q.cost);
+      this.insertRows(table, store, pk, provided, q.rows, meter);
+      return { kind: "statement", cost: meter.accrued };
     }
 
     // VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
@@ -626,10 +631,13 @@ export class Database {
       }
       rows.push(rv);
     }
-    this.insertRows(table, store, pk, provided, rows);
     // INSERT ... VALUES reads no rows and evaluates no expression tree — its values are literals
-    // and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves: zero cost.
-    return { kind: "statement", cost: 0n };
+    // and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves. The only
+    // metered work is the disposition plan's compression attempts for over-RECORD_MAX rows
+    // (value_compress, cost.md §3); a fully-inline row still costs zero.
+    const meter = new Meter(this.maxCost);
+    this.insertRows(table, store, pk, provided, rows, meter);
+    return { kind: "statement", cost: meter.accrued };
   }
 
   // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -646,10 +654,12 @@ export class Database {
     pk: number,
     provided: number[],
     rows: Value[][],
+    meter: Meter,
   ): void {
     const n = table.columns.length;
     const prepared: { key: Uint8Array | null; row: Row }[] = [];
     const seenKeys = new Set<string>();
+    let cunits = 0n;
     for (const values of rows) {
       const row: Row = new Array(n);
       for (let i = 0; i < n; i++) {
@@ -683,8 +693,15 @@ export class Database {
         }
         seenKeys.add(seen);
       }
+      // Meter the row's disposition-plan compression attempts (value_compress, cost.md §3).
+      // For a no-PK table the synthetic rowid is allocated in phase 2; only the key LENGTH
+      // feeds the plan, so an 8-byte placeholder stands in deterministically.
+      cunits += BigInt(store.writeCompressUnits(key ?? new Uint8Array(8), row));
       prepared.push({ key, row });
     }
+    // Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
+    meter.charge(COSTS.valueCompress * cunits);
+    meter.guard();
 
     // Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
     // rowid is allocated here, in row order, so a failed validation pass burns none
@@ -728,9 +745,9 @@ export class Database {
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
     // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
     // page_read per visited node (block, before the rows), then storageRowRead per scanned row.
-    const { entries, overlap } = scanEntries(store, mutationPkBound(table, filter), bound);
+    const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound);
     if (entries === null) return { kind: "statement", cost: meter.accrued }; // empty bound
-    meter.charge(COSTS.pageRead * BigInt(overlap));
+    meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
@@ -812,9 +829,9 @@ export class Database {
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
     // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
     // page_read per visited node (block, before the rows), then storageRowRead per scanned row.
-    const { entries, overlap } = scanEntries(store, mutationPkBound(table, filter), bound);
+    const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound);
     if (entries === null) return { kind: "statement", cost: meter.accrued }; // empty bound
-    meter.charge(COSTS.pageRead * BigInt(overlap));
+    meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
@@ -825,6 +842,14 @@ export class Database {
       }
       updates.push({ key: e.key, row: newRow });
     }
+
+    // Each rewritten row's disposition plan may attempt compression (a record over RECORD_MAX)
+    // — meter the attempts (value_compress, cost.md §3) and enforce the ceiling BEFORE phase 2
+    // writes anything, preserving all-or-nothing.
+    let cunits = 0n;
+    for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.key, u.row));
+    meter.charge(COSTS.valueCompress * cunits);
+    meter.guard();
 
     // Phase 2: apply (keys unchanged — a PK column can't be assigned).
     for (const u of updates) store.replace(u.key, u.row);
@@ -1154,8 +1179,8 @@ export class Database {
       if (b === null) empty = true;
       else bound = b;
     }
-    const overlap = empty ? 0 : store.overlapScanPageCount(bound);
-    meter.charge(COSTS.pageRead * BigInt(overlap));
+    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound);
+    meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
 
     const limit = plan.limit!;
     const offset = plan.offset ?? 0n;
@@ -1211,6 +1236,7 @@ export class Database {
       const store = this.readSnap().store(rel.tableName);
       let rows: Row[];
       let nodeCount: number;
+      let slabs = 0;
       const relBound = plan.relBounds[ri]!;
       if (relBound !== null) {
         const b = buildKeyBound(relBound, params, outer);
@@ -1219,12 +1245,19 @@ export class Database {
           nodeCount = 0;
         } else {
           rows = store.rangeRows(b);
-          nodeCount = store.overlapScanPageCount(b);
+          const u = store.overlapScanUnits(b);
+          nodeCount = u.pages;
+          slabs = u.slabs;
         }
       } else {
         rows = store.iterInKeyOrder();
-        nodeCount = store.scanPageCount();
+        const u = store.scanUnits();
+        nodeCount = u.pages;
+        slabs = u.slabs;
       }
+      // The decompress slabs join the same up-front block as the page_read the scanSource
+      // charges on its first next() (cost.md §3 "the compression units").
+      meter.charge(COSTS.valueDecompress * BigInt(slabs));
       const tableRows: Row[] = [];
       for (const row of scanSource(rows, nodeCount, meter)) {
         tableRows.push(row);
@@ -1745,14 +1778,16 @@ function scanEntries(
   store: TableStore,
   pkBound: PkBound | null,
   params: Value[],
-): { entries: Entry[] | null; overlap: number } {
+): { entries: Entry[] | null; overlap: number; slabs: number } {
   if (pkBound !== null) {
     // Top-level statement: no enclosing query, so the bound never has a correlated source.
     const b = buildKeyBound(pkBound, params, []);
-    if (b === null) return { entries: null, overlap: 0 };
-    return { entries: store.rangeEntries(b), overlap: store.overlapScanPageCount(b) };
+    if (b === null) return { entries: null, overlap: 0, slabs: 0 };
+    const u = store.overlapScanUnits(b);
+    return { entries: store.rangeEntries(b), overlap: u.pages, slabs: u.slabs };
   }
-  return { entries: store.entriesInKeyOrder(), overlap: store.scanPageCount() };
+  const u = store.scanUnits();
+  return { entries: store.entriesInKeyOrder(), overlap: u.pages, slabs: u.slabs };
 }
 
 // ---- Subquery helpers (spec/design/grammar.md §26) ----------------------

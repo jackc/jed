@@ -15,7 +15,7 @@ import type { ScalarType } from "./types.ts";
 import { PMap, pmapFromLoaded } from "./pmap.ts";
 import type { KeyBound, LeafSource, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
-import { anySpillable, overflowPageCount, recordSize } from "./format.ts";
+import { anySpillable, recordCompressUnits, recordScanUnits, recordSize } from "./format.ts";
 
 // Row is a stored row: one value per column, in column order.
 export type Row = Value[];
@@ -178,32 +178,50 @@ export class TableStore {
     return this.rows.overlapNodeCount(b);
   }
 
-  // scanPageCount is the page_read block a FULL scan of this store charges: every B-tree node plus
-  // one per overflow chain page of every stored record (cost.md §3 "page_read";
-  // spec/design/large-values.md §8.1/§12). Equals nodeCount when no record spills — and the row walk
-  // is skipped entirely when no column type can spill, so fixed-width tables pay nothing extra.
-  scanPageCount(): number {
+  // scanUnits is the up-front cost block a FULL scan of this store charges, as
+  // (page_read, value_decompress) units: every B-tree node plus one page_read per overflow chain
+  // page, and ceil(raw/C) value_decompress slabs per compressed stored value (cost.md §3;
+  // spec/design/large-values.md §8/§12/§13). Equals (nodeCount, 0) when no record spills or
+  // compresses — and the row walk is skipped entirely when no column type can spill, so
+  // fixed-width tables pay nothing extra.
+  scanUnits(): { pages: number; slabs: number } {
     let pages = this.nodeCount();
+    let slabs = 0;
     if (anySpillable(this.colTypes)) {
       for (const e of this.entriesInKeyOrder()) {
-        pages += overflowPageCount(this.colTypes, e.key, e.row, this.cap);
+        const u = recordScanUnits(this.colTypes, e.key, e.row, this.cap);
+        pages += u.pages;
+        slabs += u.decompress;
       }
     }
-    return pages;
+    return { pages, slabs };
   }
 
-  // overlapScanPageCount is the page_read block a BOUNDED scan over b charges: the nodes the bound's
-  // key range intersects plus the overflow chain pages of the records the bound admits (cost.md §3;
-  // spec/design/large-values.md §8.1/§12). An empty bound or a point-lookup miss admits no record and
-  // adds nothing beyond the path nodes.
-  overlapScanPageCount(b: KeyBound): number {
+  // overlapScanUnits is the up-front cost block a BOUNDED scan over b charges, as
+  // (page_read, value_decompress) units: the nodes the bound's key range intersects plus the chain
+  // pages and decompress slabs of the records the bound admits (cost.md §3;
+  // spec/design/large-values.md §8/§12/§13). An empty bound or a point-lookup miss admits no record
+  // and adds nothing beyond the path nodes.
+  overlapScanUnits(b: KeyBound): { pages: number; slabs: number } {
     let pages = this.overlapNodeCount(b);
+    let slabs = 0;
     if (anySpillable(this.colTypes)) {
       for (const e of this.rangeEntries(b)) {
-        pages += overflowPageCount(this.colTypes, e.key, e.row, this.cap);
+        const u = recordScanUnits(this.colTypes, e.key, e.row, this.cap);
+        pages += u.pages;
+        slabs += u.decompress;
       }
     }
-    return pages;
+    return { pages, slabs };
+  }
+
+  // writeCompressUnits is the value_compress slabs storing this record costs — one ceil(raw/C)
+  // block per disposition-plan compression attempt (cost.md §3; large-values.md §13). Charged by
+  // the executor once per stored row version at the INSERT/UPDATE write site. Zero whenever the
+  // record fits inline-plain (no attempt runs), so existing costs do not move.
+  writeCompressUnits(key: Uint8Array, row: Row): number {
+    if (!anySpillable(this.colTypes)) return 0;
+    return recordCompressUnits(this.colTypes, key, row, this.cap);
   }
 
   // scanRange streams the rows whose primary key lies within b to visit, in key order, stopping

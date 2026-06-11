@@ -566,11 +566,16 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 				}
 			}
 		}
-		if err := db.insertRows(table, store, pk, provided, q.rows); err != nil {
+		// Cost = the embedded SELECT's accrued cost (§24) plus the disposition plan's
+		// compression attempts for over-RECORD_MAX rows (value_compress, cost.md §3); storing
+		// the rows themselves stays unmetered. Seeding the meter with the SELECT's cost keeps
+		// one ceiling over the whole statement.
+		meter := NewMeterWithLimit(db.maxCost)
+		meter.Charge(q.cost)
+		if err := db.insertRows(table, store, pk, provided, q.rows, meter); err != nil {
 			return Outcome{}, err
 		}
-		// Cost = the embedded SELECT's accrued cost (§24); storing rows is unmetered.
-		return Outcome{Kind: OutcomeStatement, Cost: q.cost}, nil
+		return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
 	}
 
 	// VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
@@ -628,12 +633,15 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		}
 		rows = append(rows, rv)
 	}
-	if err := db.insertRows(table, store, pk, provided, rows); err != nil {
+	// INSERT ... VALUES reads no rows and evaluates no expression tree — its values are literals
+	// and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves. The only
+	// metered work is the disposition plan's compression attempts for over-RECORD_MAX rows
+	// (value_compress, cost.md §3); a fully-inline row still costs zero.
+	meter := NewMeterWithLimit(db.maxCost)
+	if err := db.insertRows(table, store, pk, provided, rows, meter); err != nil {
 		return Outcome{}, err
 	}
-	// INSERT ... VALUES reads no rows and evaluates no expression tree — its values are literals
-	// and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves: zero cost.
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
 }
 
 // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -644,7 +652,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 // seenKeys AND against the store) BEFORE any row is written; only once every row validates are
 // they all inserted (phase 2), allocating a fresh monotonic rowid in row order for a no-PK table.
 // All-or-nothing: a failure leaves the store untouched and burns no rowids.
-func (db *Database) insertRows(table *Table, store *TableStore, pk int, provided []int, rows [][]Value) error {
+func (db *Database) insertRows(table *Table, store *TableStore, pk int, provided []int, rows [][]Value, meter *Meter) error {
 	n := len(table.Columns)
 	type preparedRow struct {
 		key []byte // nil for a no-PK table (rowid allocated in phase 2)
@@ -652,6 +660,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk int, provided
 	}
 	prepared := make([]preparedRow, 0, len(rows))
 	seenKeys := make(map[string]struct{})
+	var cunits int64
 	for _, values := range rows {
 		row := make(Row, n)
 		for i, col := range table.Columns {
@@ -689,7 +698,20 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk int, provided
 			}
 			seenKeys[string(key)] = struct{}{}
 		}
+		// Meter the row's disposition-plan compression attempts (value_compress, cost.md §3).
+		// For a no-PK table the synthetic rowid is allocated in phase 2; only the key LENGTH
+		// feeds the plan, so an 8-byte placeholder stands in deterministically.
+		kb := key
+		if kb == nil {
+			kb = make([]byte, 8)
+		}
+		cunits += int64(store.WriteCompressUnits(kb, row))
 		prepared = append(prepared, preparedRow{key: key, row: row})
+	}
+	// Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
+	meter.Charge(Costs.ValueCompress * cunits)
+	if err := meter.Guard(); err != nil {
+		return err
 	}
 
 	// Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
@@ -767,7 +789,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	// scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
 	var entries []Entry
-	var overlap int
+	var overlap, slabs int
 	if bp := pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
 		kb, empty := db.buildKeyBound(bp, bound, nil)
@@ -777,18 +799,18 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		if entries, err = store.RangeEntries(kb); err != nil {
 			return Outcome{}, err
 		}
-		if overlap, err = store.OverlapScanPageCount(kb); err != nil {
+		if overlap, slabs, err = store.OverlapScanUnits(kb); err != nil {
 			return Outcome{}, err
 		}
 	} else {
 		if entries, err = store.EntriesInKeyOrder(); err != nil {
 			return Outcome{}, err
 		}
-		if overlap, err = store.ScanPageCount(); err != nil {
+		if overlap, slabs, err = store.ScanUnits(); err != nil {
 			return Outcome{}, err
 		}
 	}
-	meter.Charge(Costs.PageRead * int64(overlap))
+	meter.Charge(Costs.PageRead*int64(overlap) + Costs.ValueDecompress*int64(slabs))
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 			return Outcome{}, err
@@ -911,7 +933,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	// scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
 	var entries []Entry
-	var overlap int
+	var overlap, slabs int
 	if bp := pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
 		kb, empty := db.buildKeyBound(bp, bound, nil)
@@ -921,18 +943,18 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		if entries, err = store.RangeEntries(kb); err != nil {
 			return Outcome{}, err
 		}
-		if overlap, err = store.OverlapScanPageCount(kb); err != nil {
+		if overlap, slabs, err = store.OverlapScanUnits(kb); err != nil {
 			return Outcome{}, err
 		}
 	} else {
 		if entries, err = store.EntriesInKeyOrder(); err != nil {
 			return Outcome{}, err
 		}
-		if overlap, err = store.ScanPageCount(); err != nil {
+		if overlap, slabs, err = store.ScanUnits(); err != nil {
 			return Outcome{}, err
 		}
 	}
-	meter.Charge(Costs.PageRead * int64(overlap))
+	meter.Charge(Costs.PageRead*int64(overlap) + Costs.ValueDecompress*int64(slabs))
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 			return Outcome{}, err
@@ -961,6 +983,18 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			newRow[p.idx] = checked
 		}
 		updates = append(updates, pending{key: e.Key, row: newRow})
+	}
+
+	// Each rewritten row's disposition plan may attempt compression (a record over RECORD_MAX)
+	// — meter the attempts (value_compress, cost.md §3) and enforce the ceiling BEFORE phase 2
+	// writes anything, preserving all-or-nothing.
+	var cunits int64
+	for _, u := range updates {
+		cunits += int64(store.WriteCompressUnits(u.key, u.row))
+	}
+	meter.Charge(Costs.ValueCompress * cunits)
+	if err := meter.Guard(); err != nil {
+		return Outcome{}, err
 	}
 
 	// Phase 2: apply (keys unchanged — a PK column can't be assigned).
@@ -1879,17 +1913,17 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 	// This path is single-table (gated below), so the only relation is relBounds[0].
 	b := unboundedBound()
 	empty := false
-	overlap := 0
+	overlap, slabs := 0, 0
 	if plan.relBounds[0] != nil {
 		b, empty = db.buildKeyBound(plan.relBounds[0], params, env.outer)
 	}
 	if !empty {
 		var err error
-		if overlap, err = store.OverlapScanPageCount(b); err != nil {
+		if overlap, slabs, err = store.OverlapScanUnits(b); err != nil {
 			return selectResult{}, err
 		}
 	}
-	meter.Charge(Costs.PageRead * int64(overlap))
+	meter.Charge(Costs.PageRead*int64(overlap) + Costs.ValueDecompress*int64(slabs))
 
 	limit := *plan.limit
 	var offset int64
@@ -1962,7 +1996,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		// B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. Otherwise the
 		// full scan is unchanged (cost.md §3 "bounded scan" / JOIN).
 		var rows []Row
-		var nodeCount int
+		var nodeCount, slabs int
 		if plan.relBounds[ri] != nil {
 			b, empty := db.buildKeyBound(plan.relBounds[ri], params, outer)
 			if !empty {
@@ -1970,7 +2004,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 				if rows, err = store.RangeRows(b); err != nil {
 					return selectResult{}, err
 				}
-				if nodeCount, err = store.OverlapScanPageCount(b); err != nil {
+				if nodeCount, slabs, err = store.OverlapScanUnits(b); err != nil {
 					return selectResult{}, err
 				}
 			}
@@ -1979,10 +2013,13 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 			if rows, err = store.IterInKeyOrder(); err != nil {
 				return selectResult{}, err
 			}
-			if nodeCount, err = store.ScanPageCount(); err != nil {
+			if nodeCount, slabs, err = store.ScanUnits(); err != nil {
 				return selectResult{}, err
 			}
 		}
+		// The decompress slabs join the same up-front block as the page_read the scanSource
+		// charges on its first next() (cost.md §3 "the compression units").
+		meter.Charge(Costs.ValueDecompress * int64(slabs))
 		src := &scanSource{rows: rows, nodeCount: nodeCount}
 		var tableRows []Row
 		for {

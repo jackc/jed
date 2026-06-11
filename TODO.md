@@ -807,7 +807,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       exceeded (external merge sort, grace hash join), so a query over larger-than-RAM data
       never materializes its whole input/output in memory. Pull-based row iteration is the
       enabler. _(size: XL; deps: paged storage; §9/§13)_
-- [ ] **Large values — overflow pages + compression (TOAST-equivalent).** Designed in
+- [x] **Large values — overflow pages + compression (TOAST-equivalent)** ✅ **landed
+      (both slices)**. Designed in
       [spec/design/large-values.md](spec/design/large-values.md). Lift the `RECORD_MAX` / `u16`
       oversized-item ceilings (`0A000`) by pushing large `text`/`bytea`/`json`/`decimal` values
       **out-of-line onto an overflow-page chain**, optionally **compressed** first (a
@@ -821,15 +822,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
             live chains, and the `page_read` cost accrual (chain pages folded into the scan's
             up-front block — cost.md §3). Lazy (read-on-touch) materialization and the
             per-touched-value cost refinement are tracked follow-ons (§7/§8.1).
-      - [ ] **Slice B — transparent compression**: the deterministic LZ4-block codec + input→bytes
-            fixtures, forms `0x03`/`0x04` (additive within v3), the compress decision +
-            store-smaller rule, and the `value_decompress` cost unit. The compressor is
-            hand-rolled per core (a library fails §8 cross-core byte-identity — large-values.md
-            §6), so it needs **no** third-party dependency; any later proposal is gated on
-            CLAUDE.md §14.
+      - [x] **Slice B — transparent compression** ✅ **landed** (all 3 cores + Ruby ref): the
+            deterministic hand-rolled LZ4-block codec ([spec/fileformat/lz4.md](spec/fileformat/lz4.md)
+            + the `lz4_vectors.toml` input→bytes fixtures), forms `0x03` inline-compressed /
+            `0x04` external-compressed (additive within v3 — no version bump), the
+            compress-before-externalize disposition pass + store-smaller rule + `S_COMPRESS`
+            (large-values.md §13), the `compressed_table.jed` golden, and the
+            `value_compress`/`value_decompress` cost units (cost.md §3). No third-party
+            dependency (a library fails §8 cross-core byte-identity — large-values.md §6); any
+            later proposal stays gated on CLAUDE.md §14.
 
-      Unblocks the `decimal` 1000-digit cap and the `json`/`array` headline types. _(size: L→XL;
-      deps: B-tree pages [P6.1] ✓; §9/§13/§14)_
+      Unblocks the `decimal` 1000-digit cap and the `json`/`array` headline types. Remaining
+      follow-ons ride §7/§8.1: lazy (read-on-touch) materialization + the per-touched-value
+      cost refinement. _(was size: L→XL; deps: B-tree pages [P6.1] ✓; §9/§13/§14)_
 - [ ] **Crash-recovery hardening** — torn-meta fixtures exist; expand durability/recovery
       tests. WAL is deferred (COW + root-swap gives atomicity without one). _(size: M; §9)_
 

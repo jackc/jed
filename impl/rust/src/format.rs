@@ -49,13 +49,24 @@ const PAGE_INTERIOR: u8 = 3;
 /// stays ≤ `RECORD_MAX`.
 const PAGE_OVERFLOW: u8 = 4;
 
-/// Value-codec presence tag for a present **external** value: the body is a fixed-size pointer
-/// (`u32 first_page` + `u32 payload_len`) into an overflow chain, not the value itself
-/// (spec/design/large-values.md §12). `0x00` present-inline / `0x01` NULL are unchanged; `0x03`
-/// (inline-compressed) and `0x04` (external-compressed) are reserved for Slice B.
+/// Value-codec presence tags beyond `0x00` present-inline-plain / `0x01` NULL
+/// (spec/design/large-values.md §12/§13; spec/fileformat/format.md "Large values"):
+/// `0x02` external-plain — the body is a fixed pointer (`u32 first_page` + `u32 payload_len`)
+/// into an overflow chain; `0x03` inline-compressed — `u32 raw_len` + `u16 comp_len` + the
+/// LZ4 block (lz4.md); `0x04` external-compressed — `u32 first_page` + `u32 stored_len` +
+/// `u32 raw_len`, the chain carrying the COMPRESSED block.
 const TAG_EXTERNAL: u8 = 0x02;
-/// On-disk size of an external-value pointer in a record: `tag(1) + first_page(u32) + len(u32)`.
+const TAG_INLINE_COMP: u8 = 0x03;
+const TAG_EXTERNAL_COMP: u8 = 0x04;
+/// On-disk size of an external-plain pointer in a record: `tag(1) + first_page(u32) + len(u32)`.
 const EXTERNAL_PTR_LEN: usize = 1 + 4 + 4;
+/// In-record overhead of the inline-compressed form: `tag(1) + raw_len(u32) + comp_len(u16)`.
+const INLINE_COMP_OVERHEAD: usize = 1 + 4 + 2;
+/// On-disk size of an external-compressed pointer: `tag + first_page + stored_len + raw_len`.
+const EXTERNAL_COMP_PTR_LEN: usize = 1 + 4 + 4 + 4;
+/// Content payloads below this many bytes are never fed to the LZ4 encoder (header overhead
+/// dominates; PostgreSQL pglz's default min_input_size — large-values.md §13).
+const S_COMPRESS: usize = 32;
 /// Catalog root page index of a *fresh empty* database (pages 0,1 are the meta slots). The catalog
 /// root is **relocatable** thereafter — a reader follows `meta.root_page`, never assumes `2`.
 const ROOT_PAGE: u32 = 2;
@@ -187,73 +198,177 @@ fn record_max(cap: usize) -> usize {
     cap.saturating_sub(PAGE_HEADER) / 2
 }
 
-/// Decide each column's on-disk disposition for a record (Slice A: inline or external-plain) and
-/// return `(is_external per column, on-disk record size)` (spec/design/large-values.md §3/§12).
-/// **Spill only when forced:** if the all-inline record already fits `RECORD_MAX`, nothing spills.
-/// Otherwise externalize the largest spillable values (ties broken by column order) until the
-/// record fits — a deterministic, cross-core-identical rule (a §8 contract). The on-disk size is
-/// the **weight** the page-backed B-tree splits on, so this is shared by the serializer and by
-/// `record_size` (the weight): the in-memory node boundaries must match the serialized pages.
+/// A value's planned on-disk disposition (spec/design/large-values.md §2/§12/§13). The compressed
+/// variants carry the LZ4 block the plan produced, so the serializer never re-compresses.
+enum Disp {
+    Inline,
+    InlineComp(Vec<u8>),
+    External,
+    ExternalComp(Vec<u8>),
+}
+
+/// A record's resolved disposition plan: per-column form, the on-disk record size (the B-tree
+/// split weight), and the `value_compress` slabs the plan's pass-1 attempts cost (cost.md §3).
+struct RecordPlan {
+    disp: Vec<Disp>,
+    size: usize,
+    compress_units: usize,
+}
+
+/// Decide each column's on-disk disposition for a record (spec/design/large-values.md §3/§12/§13;
+/// spec/fileformat/format.md "Large values"). **Spill only when forced:** if the all-inline-plain
+/// record already fits `RECORD_MAX`, nothing is compressed or spilled. Otherwise two passes, each
+/// visiting largest encoded size first, ties by ascending column index — deterministic, a §8
+/// contract: (1) **compress** eligible values (payload ≥ `S_COMPRESS`), adopting iff the encoded
+/// compressed form is strictly smaller (store-smaller); (2) **externalize** values whose current
+/// encoded size still beats their pointer, moving the bytes pass 1 chose (compressed → a `0x04`
+/// chain of the compressed block) until the record fits. The size is the **weight** the
+/// page-backed B-tree splits on, shared by the serializer and `record_size`: in-memory node
+/// boundaries must match the serialized pages.
 fn plan_dispositions(
     col_types: &[ScalarType],
     key: &[u8],
     row: &[Value],
     cap: usize,
-) -> (Vec<bool>, usize) {
+) -> RecordPlan {
     let inline: Vec<usize> = col_types
         .iter()
         .zip(row.iter())
         .map(|(ty, v)| encode_value(*ty, v).len())
         .collect();
-    let mut external = vec![false; row.len()];
+    let mut disp: Vec<Disp> = (0..row.len()).map(|_| Disp::Inline).collect();
+    let mut cur = inline.clone();
     let mut size = 2 + key.len() + inline.iter().sum::<usize>();
     let max = record_max(cap);
+    let mut compress_units = 0usize;
     if size <= max {
-        return (external, size);
+        return RecordPlan {
+            disp,
+            size,
+            compress_units,
+        };
     }
-    // Spillable, currently-inline columns whose externalization actually shrinks the record
-    // (`inline > pointer`), largest inline size first; ties by column order — deterministic.
+    // Pass 1 — compress (lz4.md): spillable, non-NULL, payload ≥ S_COMPRESS; largest
+    // inline-plain encoded size first, ties by ascending index. Every attempt is metered
+    // (ceil(raw/cap) value_compress slabs) whether or not store-smaller adopts it.
     let mut cand: Vec<usize> = (0..row.len())
-        .filter(|&i| is_spillable(col_types[i]) && inline[i] > EXTERNAL_PTR_LEN)
+        .filter(|&i| {
+            is_spillable(col_types[i])
+                && !matches!(row[i], Value::Null)
+                && value_payload(col_types[i], &row[i]).len() >= S_COMPRESS
+        })
         .collect();
     cand.sort_by(|&a, &b| inline[b].cmp(&inline[a]).then(a.cmp(&b)));
     for i in cand {
         if size <= max {
             break;
         }
-        external[i] = true;
-        size = size - inline[i] + EXTERNAL_PTR_LEN;
+        let payload = value_payload(col_types[i], &row[i]);
+        compress_units += payload.len().div_ceil(cap);
+        let comp = crate::lz4::compress(&payload);
+        if INLINE_COMP_OVERHEAD + comp.len() < inline[i] {
+            size = size - cur[i] + INLINE_COMP_OVERHEAD + comp.len();
+            cur[i] = INLINE_COMP_OVERHEAD + comp.len();
+            disp[i] = Disp::InlineComp(comp);
+        }
     }
-    (external, size)
+    if size <= max {
+        return RecordPlan {
+            disp,
+            size,
+            compress_units,
+        };
+    }
+    // Pass 2 — externalize: anything whose current encoded size beats its pointer, largest
+    // current size first, ties by ascending index. (A NULL is 1 byte and never qualifies.)
+    let mut cand: Vec<usize> = (0..row.len())
+        .filter(|&i| {
+            is_spillable(col_types[i])
+                && cur[i]
+                    > match disp[i] {
+                        Disp::InlineComp(_) => EXTERNAL_COMP_PTR_LEN,
+                        _ => EXTERNAL_PTR_LEN,
+                    }
+        })
+        .collect();
+    cand.sort_by(|&a, &b| cur[b].cmp(&cur[a]).then(a.cmp(&b)));
+    for i in cand {
+        if size <= max {
+            break;
+        }
+        let (ptr, next) = match std::mem::replace(&mut disp[i], Disp::Inline) {
+            Disp::InlineComp(c) => (EXTERNAL_COMP_PTR_LEN, Disp::ExternalComp(c)),
+            _ => (EXTERNAL_PTR_LEN, Disp::External),
+        };
+        disp[i] = next;
+        size = size - cur[i] + ptr;
+        cur[i] = ptr;
+    }
+    RecordPlan {
+        disp,
+        size,
+        compress_units,
+    }
 }
 
 /// The on-disk size of a record — the **weight** the page-backed B-tree splits on
-/// (spec/fileformat/format.md). Accounts for out-of-line spill: an externalized value contributes
-/// its fixed pointer size, not its full inline body (spec/design/large-values.md §12). Must equal
-/// the length the serializer produces, so in-memory node boundaries match the serialized pages.
+/// (spec/fileformat/format.md). Accounts for compression and out-of-line spill: a compressed
+/// value contributes its compressed inline form, an externalized one its fixed pointer size
+/// (spec/design/large-values.md §12/§13). Must equal the length the serializer produces, so
+/// in-memory node boundaries match the serialized pages.
 pub(crate) fn record_size(col_types: &[ScalarType], key: &[u8], row: &Row, cap: usize) -> usize {
-    plan_dispositions(col_types, key, row, cap).1
+    plan_dispositions(col_types, key, row, cap).size
 }
 
-/// The number of overflow pages this record's externalized values occupy — the extra `page_read`s
-/// a scan that materializes the record charges (spec/design/large-values.md §8.1/§12; cost.md §3).
-/// Zero for a fully-inline record. Each external value's content payload `P(v)` fills `cap`-byte
-/// slabs, one page per slab — the same chain layout the serializer writes, so the count is the
-/// chain's true page count and identical across cores.
-pub(crate) fn overflow_page_count(
+/// The per-record units a scan's up-front cost block charges for this record beyond the B-tree
+/// nodes (cost.md §3; spec/design/large-values.md §8/§12/§13): `pages` = one `page_read` per
+/// overflow chain page (the chain carries the payload for external-plain, the COMPRESSED block
+/// for external-compressed), `decompress` = `ceil(raw_len / cap)` `value_decompress` slabs per
+/// compressed stored value (inline- or external-). Zero/zero for a fully-inline-plain record.
+pub(crate) struct ScanUnits {
+    pub pages: usize,
+    pub decompress: usize,
+}
+
+pub(crate) fn record_scan_units(
+    col_types: &[ScalarType],
+    key: &[u8],
+    row: &Row,
+    cap: usize,
+) -> ScanUnits {
+    let plan = plan_dispositions(col_types, key, row, cap);
+    let mut units = ScanUnits {
+        pages: 0,
+        decompress: 0,
+    };
+    for (i, d) in plan.disp.iter().enumerate() {
+        match d {
+            Disp::Inline => {}
+            Disp::External => {
+                units.pages += value_payload(col_types[i], &row[i]).len().div_ceil(cap);
+            }
+            Disp::InlineComp(_) => {
+                units.decompress += value_payload(col_types[i], &row[i]).len().div_ceil(cap);
+            }
+            Disp::ExternalComp(c) => {
+                units.pages += c.len().div_ceil(cap);
+                units.decompress += value_payload(col_types[i], &row[i]).len().div_ceil(cap);
+            }
+        }
+    }
+    units
+}
+
+/// The `value_compress` slabs storing this record costs — one `ceil(raw_len / cap)` block per
+/// pass-1 compression attempt, adopted or not (cost.md §3; large-values.md §13). Charged once
+/// per stored row version at the statement's write site, never for B-tree re-encodes.
+pub(crate) fn record_compress_units(
     col_types: &[ScalarType],
     key: &[u8],
     row: &Row,
     cap: usize,
 ) -> usize {
-    let (external, _) = plan_dispositions(col_types, key, row, cap);
-    let mut pages = 0;
-    for (i, ext) in external.iter().enumerate() {
-        if *ext {
-            pages += value_payload(col_types[i], &row[i]).len().div_ceil(cap);
-        }
-    }
-    pages
+    plan_dispositions(col_types, key, row, cap).compress_units
 }
 
 /// A value's **content payload** `P(v)` — the bytes stored in the overflow chain when the value is
@@ -1007,19 +1122,36 @@ fn encode_record(
     ovf: &mut Vec<OverflowPageOut>,
 ) -> Vec<u8> {
     let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
-    let (external, _) = plan_dispositions(&col_types, key, row, cap);
+    let plan = plan_dispositions(&col_types, key, row, cap);
     let mut out = Vec::new();
     out.extend_from_slice(&(key.len() as u16).to_be_bytes());
     out.extend_from_slice(key);
     for (i, (col, val)) in table.columns.iter().zip(row.iter()).enumerate() {
-        if external[i] {
-            let payload = value_payload(col.ty, val);
-            let first = write_overflow_chain(&payload, cap, take, ovf);
-            out.push(TAG_EXTERNAL);
-            out.extend_from_slice(&first.to_be_bytes());
-            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        } else {
-            out.extend_from_slice(&encode_value(col.ty, val));
+        match &plan.disp[i] {
+            Disp::Inline => out.extend_from_slice(&encode_value(col.ty, val)),
+            Disp::External => {
+                let payload = value_payload(col.ty, val);
+                let first = write_overflow_chain(&payload, cap, take, ovf);
+                out.push(TAG_EXTERNAL);
+                out.extend_from_slice(&first.to_be_bytes());
+                out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            }
+            Disp::InlineComp(comp) => {
+                let raw_len = value_payload(col.ty, val).len();
+                out.push(TAG_INLINE_COMP);
+                out.extend_from_slice(&(raw_len as u32).to_be_bytes());
+                out.extend_from_slice(&(comp.len() as u16).to_be_bytes());
+                out.extend_from_slice(comp);
+            }
+            Disp::ExternalComp(comp) => {
+                // The chain carries the COMPRESSED block (its page count follows comp size).
+                let raw_len = value_payload(col.ty, val).len();
+                let first = write_overflow_chain(comp, cap, take, ovf);
+                out.push(TAG_EXTERNAL_COMP);
+                out.extend_from_slice(&first.to_be_bytes());
+                out.extend_from_slice(&(comp.len() as u32).to_be_bytes());
+                out.extend_from_slice(&(raw_len as u32).to_be_bytes());
+            }
         }
     }
     out
@@ -1394,6 +1526,22 @@ fn read_value(
             let payload = read_overflow_chain(first, len, fetch, ovf_out)?;
             value_from_payload(ty, &payload)
         }
+        TAG_INLINE_COMP => {
+            let raw_len = read_u32(buf, pos)? as usize;
+            let comp_len = read_u16(buf, pos)? as usize;
+            let comp = take(buf, pos, comp_len)?;
+            let payload = crate::lz4::decompress(comp, raw_len)?;
+            value_from_payload(ty, &payload)
+        }
+        TAG_EXTERNAL_COMP => {
+            let first = read_u32(buf, pos)?;
+            let stored = read_u32(buf, pos)? as usize;
+            let raw_len = read_u32(buf, pos)? as usize;
+            let fetch = fetch.ok_or_else(|| corrupt("external value with no overflow reader"))?;
+            let comp = read_overflow_chain(first, stored, fetch, ovf_out)?;
+            let payload = crate::lz4::decompress(&comp, raw_len)?;
+            value_from_payload(ty, &payload)
+        }
         _ => Err(corrupt("invalid value presence tag")),
     }
 }
@@ -1621,12 +1769,30 @@ mod tests {
             .count()
     }
 
-    /// A table with a large `text` value that must spill out-of-line at a small page size, plus a
-    /// small inline value. The big value (≈1000 UTF-8 bytes) far exceeds `RECORD_MAX` at `ps=256`
-    /// (`= (256-12-12)/2 = 116`) and `cap` (`= 244`), so it spans **several** overflow pages.
+    /// Incompressible filler (spec/fileformat/format.md "Fixtures"): xorshift32("JEDB") over a
+    /// 64-char alphabet, so Slice B's compress pass never wins store-smaller and the value
+    /// deterministically stays PLAIN (this test exercises the out-of-line chain, which a
+    /// compressible run would dodge by compressing inline).
+    fn filler_text(n: usize) -> String {
+        const ALPHA64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut x: u32 = 0x4A45_4442;
+        let mut out = String::with_capacity(n);
+        for _ in 0..n {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            out.push(ALPHA64[(x % 64) as usize] as char);
+        }
+        out
+    }
+
+    /// A table with a large incompressible `text` value that must spill out-of-line at a small
+    /// page size, plus a small inline value. The big value (1250 bytes) far exceeds `RECORD_MAX`
+    /// at `ps=256` (`= (256-12-12)/2 = 116`) and `cap` (`= 244`), so it spans **several**
+    /// overflow pages.
     fn big_value_db() -> Database {
         let mut db = Database::new();
-        let big = "abcΩ".repeat(250); // 5 bytes × 250 = 1250 UTF-8 bytes
+        let big = filler_text(1250);
         for s in [
             "CREATE TABLE t (id int32 PRIMARY KEY, body text)".to_string(),
             format!("INSERT INTO t VALUES (1, '{big}')"),

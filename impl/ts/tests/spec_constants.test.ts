@@ -192,6 +192,10 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.storageRowRead;
       case "page_read":
         return COSTS.pageRead;
+      case "value_compress":
+        return COSTS.valueCompress;
+      case "value_decompress":
+        return COSTS.valueDecompress;
       case "row_produced":
         return COSTS.rowProduced;
       case "operator_eval":

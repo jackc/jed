@@ -490,7 +490,22 @@ mod tests {
     fn external_value_through_paged_file_and_reclaims() {
         let path = tmp("jed_large_values.jed");
         let _ = std::fs::remove_file(&path);
-        let big = "Z".repeat(1500); // ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
+        // Incompressible filler (xorshift32 "JEDB" over a 64-char alphabet — format.md
+        // "Fixtures"): ≫ RECORD_MAX at ps 256 AND immune to Slice B's compress pass, so the
+        // value genuinely spills to a multi-page overflow chain.
+        let big: String = {
+            const ALPHA64: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut x: u32 = 0x4A45_4442;
+            (0..1500)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    ALPHA64[(x % 64) as usize] as char
+                })
+                .collect()
+        };
 
         {
             let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();

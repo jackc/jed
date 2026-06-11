@@ -23,11 +23,20 @@ PAGE_LEAF = 2
 PAGE_INTERIOR = 3
 PAGE_OVERFLOW = 4 # an out-of-line value slab, chained by next_page (large-values.md §12)
 
-# Value-codec presence tag for a present EXTERNAL value: the body is a pointer (u32 first_page +
-# u32 payload_len) into an overflow chain (large-values.md §12). 0x00 present-inline / 0x01 NULL
-# unchanged; 0x03 / 0x04 reserved for compression. EXTERNAL_PTR_LEN is the pointer's in-record size.
+# Value-codec presence tags beyond 0x00 present-inline-plain / 0x01 NULL (large-values.md §12/§13;
+# format.md "Large values"): 0x02 external-plain (u32 first_page + u32 payload_len), 0x03
+# inline-compressed (u32 raw_len + u16 comp_len + LZ4 block), 0x04 external-compressed
+# (u32 first_page + u32 stored_len + u32 raw_len; the chain carries the COMPRESSED block).
+# The *_LEN constants are each form's full in-record size (tag included).
 TAG_EXTERNAL = 0x02
+TAG_INLINE_COMP = 0x03
+TAG_EXTERNAL_COMP = 0x04
 EXTERNAL_PTR_LEN = 1 + 4 + 4
+INLINE_COMP_OVERHEAD = 1 + 4 + 2 # + comp_len bytes
+EXTERNAL_COMP_PTR_LEN = 1 + 4 + 4 + 4
+S_COMPRESS = 32 # payloads below this are never fed to the encoder (large-values.md §13)
+
+require_relative "lz4"
 
 WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "timestamp" => 8, "timestamptz" => 8 }.freeze
 TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
@@ -178,22 +187,73 @@ TIMESTAMPTZ_TABLE = {
          [4, -9_223_372_036_854_775_808], [5, 9_223_372_036_854_775_807], [6, nil]]
 }.freeze
 
-# A table with large text + bytea values that must spill OUT-OF-LINE to overflow pages
-# (large-values.md §12). At page_size 256 the per-record cap is RECORD_MAX = (256-12-12)/2 = 116,
-# so a value of ~600/300 bytes exceeds it and is externalized: the record holds a fixed pointer
-# (tag 0x02 + u32 first_page + u32 len) and the bytes live in a chain of page_type-4 slabs (244
-# bytes each). Row 1's text (600 B → 3 slabs) and bytea (300 B → 2 slabs) both spill; row 2's
-# values stay inline; row 3 is NULL/NULL. Exercises multi-page chains, multi-column spill, and the
-# inline+external mix in one leaf. The PK stays int32.
+# Incompressible filler (format.md "Fixtures"): xorshift32(seed "JEDB") mapped to a 64-char
+# alphabet (text) or raw bytes (bytea). High-entropy output has no 4-byte repeats, so the LZ4
+# encoder never wins store-smaller and the value deterministically stays PLAIN. Mirrored in the
+# cores' golden/cost tests. Each call restarts at the seed (one fixed stream per length).
+ALPHA64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+FILLER_SEED = 0x4A454442
+
+def filler_step(x)
+  x ^= (x << 13) & 0xFFFFFFFF
+  x ^= x >> 17
+  (x ^ ((x << 5) & 0xFFFFFFFF)) & 0xFFFFFFFF
+end
+
+def filler_text(n)
+  x = FILLER_SEED
+  out = +""
+  n.times do
+    x = filler_step(x)
+    out << ALPHA64[x % 64]
+  end
+  out
+end
+
+def filler_bytes(n)
+  x = FILLER_SEED
+  out = +"".b
+  n.times do
+    x = filler_step(x)
+    out << (x % 256).chr
+  end
+  out
+end
+
+# A table with large INCOMPRESSIBLE text + bytea values that must spill OUT-OF-LINE PLAIN to
+# overflow pages (large-values.md §12). At page_size 256 the per-record cap is
+# RECORD_MAX = (256-12-12)/2 = 116, so a value of ~600/300 bytes exceeds it: compression is
+# attempted first (Slice B) but rejected by store-smaller (the filler is high-entropy), so the
+# record holds a fixed 0x02 pointer (u32 first_page + u32 len) and the raw bytes live in a chain
+# of page_type-4 slabs (244 bytes each). Row 1's text (600 B → 3 slabs) and bytea (300 B → 2
+# slabs) both spill; row 2's values stay inline; row 3 is NULL/NULL. Exercises multi-page chains,
+# multi-column spill, and the inline+external mix in one leaf. The PK stays int32.
 OVERFLOW_TABLE = {
   name: "t",
   columns: [col("id", "int32", pk: true), col("body", "text"), col("blob", "bytea")],
-  rows: [[1, "x" * 600, (["ab"].pack("H*") * 300)], [2, "small", ["cafe"].pack("H*")], [3, nil, nil]]
+  rows: [[1, filler_text(600), filler_bytes(300)], [2, "small", ["cafe"].pack("H*")], [3, nil, nil]]
+}.freeze
+
+# A table with large COMPRESSIBLE values exercising Slice B's forms (large-values.md §13,
+# format.md "Large values", lz4.md). At page_size 256 (RECORD_MAX 116, C = 244):
+# row 1's 600-char "x" run compresses to a few bytes → 0x03 inline-compressed text — and its
+# 200-byte 0xAB bytea run → 0x03 inline-compressed bytea (two compressed values, one record);
+# row 2's 400-char half-filler/half-run text compresses to ~200 B — smaller than plain but still
+# over RECORD_MAX → 0x04 external-compressed (a chain carrying the COMPRESSED block);
+# row 3 stays fully inline-plain; row 4 is NULL/NULL. PK int32.
+COMPRESSED_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("body", "text"), col("blob", "bytea")],
+  rows: [[1, "x" * 600, (["ab"].pack("H*") * 200)],
+         [2, filler_text(200) + ("y" * 200), nil],
+         [3, "tiny", ["cafe"].pack("H*")],
+         [4, nil, nil]]
 }.freeze
 
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
+  { file: "compressed_table.jed", page_size: 256, tables: [COMPRESSED_TABLE] },
   { file: "one_table_empty.jed", page_size: 256,
     tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("v", "int16")], rows: [] }] },
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
@@ -365,25 +425,56 @@ def value_payload(type, v)
   end
 end
 
-# Decide each column's disposition for a record: [is_external per column, on-disk record size].
-# Spill only when forced (record > RECORD_MAX); externalize the largest spillable values first,
-# ties by column index — deterministic, mirrors the cores' planDispositions (large-values.md §12).
+# Decide each column's disposition for a record: [forms, comps, on-disk record size], where
+# forms[i] is :inline / :inline_comp / :external / :external_comp and comps[i] holds the LZ4
+# block for a compressed form. Spill only when forced (record > RECORD_MAX); then COMPRESS the
+# largest eligible values first (store-smaller rule), then EXTERNALIZE the largest remaining —
+# both passes ties-by-column-index. Deterministic, mirrors the cores' plan_dispositions
+# (large-values.md §12/§13; format.md "Large values").
 def plan_record(table, key, row, cap)
-  inline = table[:columns].each_with_index.map { |c, i| encode_value(c[:type], row[i]).bytesize }
-  ext = Array.new(table[:columns].size, false)
+  cols = table[:columns]
+  inline = cols.each_with_index.map { |c, i| encode_value(c[:type], row[i]).bytesize }
+  forms = Array.new(cols.size, :inline)
+  comps = Array.new(cols.size)
+  cur = inline.dup
   size = 2 + key.bytesize + inline.sum
   max = record_max(cap)
-  return [ext, size] if size <= max
+  return [forms, comps, size] if size <= max
 
-  cand = (0...table[:columns].size).select { |i| spillable?(table[:columns][i][:type]) && inline[i] > EXTERNAL_PTR_LEN }
-  cand.sort_by! { |i| [-inline[i], i] } # largest first; ties by ascending index (stable, deterministic)
+  # Pass 1 — compress (lz4.md): payload >= S_COMPRESS, largest inline-plain encoded size first,
+  # ties by ascending index; adopt iff the encoded compressed form is strictly smaller.
+  cand = (0...cols.size).select do |i|
+    spillable?(cols[i][:type]) && !row[i].nil? && value_payload(cols[i][:type], row[i]).bytesize >= S_COMPRESS
+  end
+  cand.sort_by! { |i| [-inline[i], i] }
   cand.each do |i|
     break if size <= max
 
-    ext[i] = true
-    size = size - inline[i] + EXTERNAL_PTR_LEN
+    comp = LZ4.compress(value_payload(cols[i][:type], row[i]))
+    next unless INLINE_COMP_OVERHEAD + comp.bytesize < inline[i]
+
+    forms[i] = :inline_comp
+    comps[i] = comp
+    size += INLINE_COMP_OVERHEAD + comp.bytesize - cur[i]
+    cur[i] = INLINE_COMP_OVERHEAD + comp.bytesize
   end
-  [ext, size]
+  return [forms, comps, size] if size <= max
+
+  # Pass 2 — externalize: anything whose current encoded size beats its pointer, largest first.
+  cand = (0...cols.size).select do |i|
+    spillable?(cols[i][:type]) &&
+      cur[i] > (forms[i] == :inline_comp ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN)
+  end
+  cand.sort_by! { |i| [-cur[i], i] }
+  cand.each do |i|
+    break if size <= max
+
+    ptr = forms[i] == :inline_comp ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN
+    forms[i] = forms[i] == :inline_comp ? :external_comp : :external
+    size += ptr - cur[i]
+    cur[i] = ptr
+  end
+  [forms, comps, size]
 end
 
 # Write a payload across a chain of overflow pages (cap-byte slabs, in order), allocating each via
@@ -400,15 +491,26 @@ def write_overflow_chain(payload, cap, alloc, pages)
 end
 
 # Emit one record's on-disk bytes (key_len | key | values), spilling external columns to overflow
-# pages drawn via `alloc` (large-values.md §12). `rec` is a plan hash { key:, row:, table:, ext: }.
+# pages drawn via `alloc` (large-values.md §12/§13). `rec` is a plan hash
+# { key:, row:, table:, forms:, comps: } from plan_record.
 def emit_record(rec, cap, alloc, pages)
   out = +"".b
   out << u16(rec[:key].bytesize) << rec[:key]
   rec[:table][:columns].each_with_index do |c, i|
-    if rec[:ext][i]
+    case rec[:forms][i]
+    when :external
       payload = value_payload(c[:type], rec[:row][i])
       first = write_overflow_chain(payload, cap, alloc, pages)
       out << [TAG_EXTERNAL].pack("C") << u32(first) << u32(payload.bytesize)
+    when :inline_comp
+      payload = value_payload(c[:type], rec[:row][i])
+      comp = rec[:comps][i]
+      out << [TAG_INLINE_COMP].pack("C") << u32(payload.bytesize) << u16(comp.bytesize) << comp
+    when :external_comp
+      payload = value_payload(c[:type], rec[:row][i])
+      comp = rec[:comps][i]
+      first = write_overflow_chain(comp, cap, alloc, pages) # the chain carries the COMPRESSED block
+      out << [TAG_EXTERNAL_COMP].pack("C") << u32(first) << u32(comp.bytesize) << u32(payload.bytesize)
     else
       out << encode_value(c[:type], rec[:row][i])
     end
@@ -579,8 +681,8 @@ def build_image(tables, page_size)
   next_index = ROOT_PAGE
   sorted.each_with_index do |t, ti|
     pairs = table_entries(t).map do |key, row|
-      ext, size = plan_record(t, key, row, cap)
-      [key, { key: key, row: row, table: t, ext: ext, size: size }]
+      forms, comps, size = plan_record(t, key, row, cap)
+      [key, { key: key, row: row, table: t, forms: forms, comps: comps, size: size }]
     end
     root_data[ti], next_index = serialize_tree(build_tree(pairs, cap), next_index, cap, data_pages)
   end
@@ -748,6 +850,21 @@ def decode_value(type, buf, pos, fetch = nil)
 
     return [value_from_payload(type, read_overflow_chain(fpb.unpack1("N"), lnb.unpack1("N"), fetch)), pos]
   end
+  if t == TAG_INLINE_COMP
+    rlb, pos = take(buf, pos, 4)
+    clb, pos = take(buf, pos, 2)
+    comp, pos = take(buf, pos, clb.unpack1("n"))
+    return [value_from_payload(type, LZ4.decompress(comp, rlb.unpack1("N"))), pos]
+  end
+  if t == TAG_EXTERNAL_COMP
+    fpb, pos = take(buf, pos, 4)
+    slb, pos = take(buf, pos, 4)
+    rlb, pos = take(buf, pos, 4)
+    raise "external value with no overflow reader" if fetch.nil?
+
+    comp = read_overflow_chain(fpb.unpack1("N"), slb.unpack1("N"), fetch)
+    return [value_from_payload(type, LZ4.decompress(comp, rlb.unpack1("N"))), pos]
+  end
   raise "invalid value presence tag" unless t.zero?
 
   case type
@@ -852,6 +969,55 @@ def expected_tables(fx)
   end
 end
 
+# --- LZ4 byte vectors (lz4.md §4) --------------------------------------------
+#
+# Pins `input -> exact compressed bytes` for the lz4.md §2 encoder. Generated into
+# lz4_vectors.toml; every core's codec test must reproduce each `compressed` byte-for-byte
+# and decode it back to `input`. Inputs chosen to cover each encoder/format branch.
+LZ4_VECTORS = [
+  { name: "empty", input: "".b },                                  # -> the lone 0x00 token
+  { name: "one_byte", input: "a".b },
+  { name: "twelve_below_mflimit", input: "abcdefghijkl".b },       # 12 B: literals only
+  { name: "thirteen_run", input: ("a" * 13).b },                   # smallest matchable input
+  { name: "run_32", input: ("a" * 32).b },                         # overlapping match (offset 1)
+  { name: "pattern_abc", input: ("abc" * 40).b },                  # multi-byte period
+  { name: "long_literals_then_run", input: (filler_text(40) + ("z" * 60)).b }, # lit-extension + match
+  { name: "long_run_extension", input: ("y" * 1000).b },           # match-length 255-extensions
+  { name: "incompressible_64", input: filler_bytes(64) },          # high entropy: expands
+  { name: "mixed_text", input: ("the quick brown fox jumps over the lazy dog " * 6).b },
+  { name: "trailing_tail", input: (("b" * 20) + "QRSTUVWX").b }    # run ending inside the 12-byte tail
+].freeze
+
+def lz4_vectors_path = File.join(__dir__, "lz4_vectors.toml")
+
+def lz4_vectors_toml
+  out = +"# LZ4 block codec byte vectors — GENERATED by `ruby spec/fileformat/verify.rb --generate`\n"
+  out << "# (the reference encoder in lz4.rb; the algorithm is pinned in lz4.md §2). Each core's\n"
+  out << "# codec must reproduce `compressed_hex` from `input_hex` byte-for-byte, and decode it\n"
+  out << "# back. Do not edit by hand.\n\nschema_version = 1\n"
+  LZ4_VECTORS.each do |v|
+    comp = LZ4.compress(v[:input])
+    out << "\n[[vector]]\n"
+    out << "name = \"#{v[:name]}\"\n"
+    out << "input_hex = \"#{v[:input].unpack1('H*')}\"\n"
+    out << "compressed_hex = \"#{comp.unpack1('H*')}\"\n"
+  end
+  out
+end
+
+def verify_lz4_vectors
+  fail!("lz4_vectors.toml: missing (run `ruby spec/fileformat/verify.rb --generate`)") unless File.exist?(lz4_vectors_path)
+  unless File.read(lz4_vectors_path) == lz4_vectors_toml
+    fail!("lz4_vectors.toml: differs from the reference encoder (regenerate or fix the codec)")
+  end
+
+  LZ4_VECTORS.each do |v|
+    comp = LZ4.compress(v[:input])
+    round = LZ4.decompress(comp, v[:input].bytesize)
+    fail!("lz4 vector #{v[:name]}: decompress(compress(x)) != x") unless round == v[:input]
+  end
+end
+
 # --- driver -----------------------------------------------------------------
 
 def fail!(msg)
@@ -868,6 +1034,8 @@ def generate
     File.binwrite(File.join(dir, fx[:file]), fixture_image(fx))
     puts "wrote #{fx[:file]} (#{fixture_image(fx).bytesize} bytes)"
   end
+  File.write(lz4_vectors_path, lz4_vectors_toml)
+  puts "wrote lz4_vectors.toml (#{LZ4_VECTORS.size} vectors)"
   puts "Generated #{FIXTURES.size} fixtures in #{dir}"
 end
 
@@ -893,7 +1061,9 @@ def verify
     end
   end
 
-  puts "OK: #{FIXTURES.size} file-format fixtures verified (byte-exact + independent decode)"
+  verify_lz4_vectors
+  puts "OK: #{FIXTURES.size} file-format fixtures verified (byte-exact + independent decode); " \
+       "#{LZ4_VECTORS.size} LZ4 vectors verified"
 end
 
 if ARGV.include?("--generate")

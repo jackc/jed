@@ -3,21 +3,24 @@
 > The reasoning behind how the engine stores a value too large to keep inline in a B-tree
 > record: pushing it **out-of-line** onto a chain of overflow pages, and (optionally)
 > **compressing** it first. This is jed's equivalent of PostgreSQL **TOAST** — one subsystem
-> with two tools for the same job. This is a **design** doc for a **deferred** feature: it
-> fixes the *model* and the cross-core contracts so the eventual implementation has a spec to
-> conform to; the *bytes* land in [../fileformat/format.md](../fileformat/format.md) and the
-> cost units in [../cost/schedule.toml](../cost/schedule.toml) when it is built. When a decision
+> with two tools for the same job. This doc fixes the *model* and the cross-core contracts the
+> implementation conforms to; the *bytes* live in [../fileformat/format.md](../fileformat/format.md)
+> / [../fileformat/lz4.md](../fileformat/lz4.md) and the
+> cost units in [../cost/schedule.toml](../cost/schedule.toml). When a decision
 > here changes, update [CLAUDE.md](../../CLAUDE.md) §9, [storage.md §6](storage.md),
 > [../fileformat/format.md](../fileformat/format.md), and [types.md](types.md) in the same edit.
 
-**Status: Slice A (overflow / out-of-line storage) BUILT — Slice B (compression) design-only.**
-Slice A landed in all three cores + the Ruby reference as `format_version` 3 (the bytes in
+**Status: BUILT — both slices.** Slice A (overflow / out-of-line storage) landed in all three
+cores + the Ruby reference as `format_version` 3 (the bytes in
 [../fileformat/format.md](../fileformat/format.md) "Large values", goldens incl.
 `overflow_table.jed`; the resolved decisions in §12 below; the `page_read` accrual in
-[cost.md](cost.md) §3). Compression (§6, forms `0x03`/`0x04` — reserved in v3, additive when
-built) remains deferred (TODO.md). Per CLAUDE.md §14 a third-party dependency is **never** added
-on an agent's initiative — and as §6 below shows this feature needs **none**, which is part of
-the point.
+[cost.md](cost.md) §3). Slice B (transparent compression) landed **additively within v3**: the
+hand-rolled deterministic LZ4-block codec ([../fileformat/lz4.md](../fileformat/lz4.md) + the
+`lz4_vectors.toml` byte vectors), the `0x03`/`0x04` compressed forms, the compress-before-
+externalize disposition pass, the `compressed_table.jed` golden, and the
+`value_compress`/`value_decompress` cost units; the resolved decisions are in §13 below. Per
+CLAUDE.md §14 a third-party dependency is **never** added on an agent's initiative — and as §6
+below shows this feature needs **none**: both slices shipped dependency-free.
 
 ---
 
@@ -265,10 +268,11 @@ cost.md §3, pager.md §5):
    cost.md §3; the unread-value-costs-nothing refinement arrives with §7's lazy read.)
 2. **Decompression → a new `value_decompress` unit.** Decompressing a value is real CPU work an
    untrusted query can drive (§13); it must be metered or the cost ceiling cannot bound it. Charge
-   per unit of work on materialization. **Granularity is open** (per decompressed byte vs. per
-   input page) — pick the one that is cheap to compute identically in every core and fix it in
-   `schedule.toml`. Write-side **compression** cost is the single writer's own and lower-stakes,
-   but is metered the same way for symmetry and determinism.
+   per unit of work on materialization. **Granularity — resolved (§13): one unit per `C`-byte slab
+   of decompressed payload, `ceil(raw_len / C)`** — proportional to the work, page-coherent, and
+   computable from the stored `raw_len` alone. Write-side **compression** cost is the single
+   writer's own and lower-stakes, but is metered the same way for symmetry and determinism (the
+   `value_compress` unit, charged per pass-1 attempt — §13).
 3. **Compressed size feeds cost.** The number of overflow pages a value occupies depends on its
    **compressed** size, so the compressor's output size flows straight into `page_read`. This is a
    **second, independent reason** (besides the byte-exact goldens of §6) the compressor must be
@@ -319,10 +323,10 @@ Everything an external/compressed value touches is a §8 byte/cost contract:
 
 ## 11. Open questions / non-foreclosure
 
-- **Spill target vs. per-value threshold** (§3) — row-target (PG-faithful) is the recommended
-  default; the per-value-threshold simplification is the documented fallback. **Open.**
-- **`value_decompress` granularity** (§8.2) — per-byte vs. per-page. **Open**; pick for cheap
-  cross-core identity.
+- **Spill target vs. per-value threshold** (§3) — resolved for now by §12: the target is exactly
+  `RECORD_MAX` ("only when forced"); the PG-style lower `T_target` stays a later tunable.
+- **`value_decompress` granularity** (§8.2) — **resolved (§13)**: per `C`-byte slab of
+  decompressed payload, `ceil(raw_len / C)`.
 - **Algorithm beyond LZ4** — LZ4-block is the recommendation (simple, IP-clear, no entropy stage).
   zstd is explicitly **out** for the hand-roll (entropy coding makes byte-exact reproduction
   across four cores impractical). Not foreclosed if a future need justifies the cost, under §14.
@@ -402,3 +406,55 @@ compression is Slice B). They were chosen with the maintainer; the byte details 
   move **together** — that lockstep step is what makes `rake verify` green again; during
   development the mechanism is built under the v2 version field, since a core cannot bump the
   version alone without regenerating the shared goldens.
+
+---
+
+## 13. Slice B — resolved implementation decisions (compression)
+
+These pin the open questions of §3/§6/§8 for the **second** slice. The codec bytes are in
+[../fileformat/lz4.md](../fileformat/lz4.md), the record forms in
+[../fileformat/format.md](../fileformat/format.md) *Large values*; everything here is **additive
+within `format_version` 3** (the `0x03`/`0x04` tags Slice A reserved), so no version bump.
+
+- **The codec = the pinned LZ4-block encoder of [lz4.md](../fileformat/lz4.md).** Hand-rolled in
+  all four implementations (the §6.2 analysis stands: a library is inadmissible under CLAUDE.md
+  §14 because encoders diverge). Greedy match search, step 1, a 4096-entry single-candidate hash
+  table, no backward extension — every free parameter fixed as a spec constant, output pinned by
+  the `lz4_vectors.toml` byte vectors and the `compressed_table.jed` golden.
+
+- **`S_COMPRESS = 32` bytes.** A content payload below 32 bytes is never fed to the encoder
+  (header overhead dominates; this is PostgreSQL `pglz`'s default `min_input_size`, §1).
+
+- **Store-smaller = compare encoded footprints.** A compressed form is adopted **iff its encoded
+  inline size (`7 + comp_len`) is strictly smaller than the value's inline-plain encoded size**.
+  No ratio heuristics; the per-value tag records the outcome so a reader never guesses.
+
+- **Disposition = two passes, compress before externalize** (refines §3 with the §12 trigger
+  unchanged): a record over `RECORD_MAX` first compresses its largest eligible values
+  (inline-plain encoded size order, ties by ascending column index) until it fits, then — only if
+  still over — externalizes the largest remaining (current encoded size order, same tiebreak). An
+  externalized value keeps the bytes pass 1 chose: compressed → a `0x04` chain of the
+  **compressed** block, plain → the `0x02` chain of §12. A record that fits inline-plain is never
+  touched, so Slice A's "spill only when forced" survives verbatim.
+
+- **Forms** (format.md): `0x03` = `tag ++ u32 raw_len ++ u16 comp_len ++ block` (7 + `comp_len`
+  in-record); `0x04` = `tag ++ u32 first_page ++ u32 stored_len ++ u32 raw_len` (13 bytes, chain
+  carries `stored_len` compressed bytes). The chain page count — and so the `page_read` accrual of
+  §8.1/§12 — follows the **compressed** size, `ceil(stored_len / C)` (§8.3).
+
+- **Cost units** (cost.md §3, `spec/cost/schedule.toml`): **`value_decompress`** fires
+  `ceil(raw_len / C)` times per compressed value (inline- or external-) **a scan's bound admits**,
+  folded into the same up-front block as the chain `page_read`s (§12's eager-materialization
+  reading; the per-touched-value refinement still rides the §7 lazy-read follow-on). It does not
+  short-circuit under `LIMIT`, and a bound that misses charges nothing. **`value_compress`** fires
+  `ceil(raw_len / C)` times per **pass-1 attempt** (adopted or not — the work is done either way),
+  charged once per stored row version at the statement's write site (`INSERT` / `UPDATE`), never
+  for the B-tree's internal re-encodes. Both stay logical and cross-core identical.
+
+- **Read = eager, like §12.** A compressed value is decompressed when its leaf is decoded; the
+  in-memory model holds only plain values, so the planner/executor see nothing. Decompression
+  errors are `data_corrupted`, deterministic and structured (lz4.md §3).
+
+- **What did NOT change:** the spill trigger (`RECORD_MAX`, §12), the chain layout (§4/§12), the
+  reclamation model (a `0x04` chain is collected by the same reachability walk), the eager read
+  path, and every inline-plain/NULL byte. Fixed-width types still never compress or spill.

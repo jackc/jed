@@ -215,33 +215,52 @@ impl TableStore {
         self.rows.overlap_node_count(b)
     }
 
-    /// The `page_read` block a **full scan** of this store charges: every B-tree node plus one per
-    /// overflow chain page of every stored record (cost.md §3 "page_read";
-    /// spec/design/large-values.md §8.1/§12). Equals `node_count` when no record spills — and the
-    /// row walk is skipped entirely when no column type can spill, so fixed-width tables pay
-    /// nothing extra.
-    pub fn scan_page_count(&self) -> Result<usize> {
+    /// The up-front cost block a **full scan** of this store charges, as
+    /// `(page_read, value_decompress)` units: every B-tree node plus one `page_read` per overflow
+    /// chain page, and `ceil(raw/C)` `value_decompress` slabs per compressed stored value
+    /// (cost.md §3; spec/design/large-values.md §8/§12/§13). Equals `(node_count, 0)` when no
+    /// record spills or compresses — and the row walk is skipped entirely when no column type can
+    /// spill, so fixed-width tables pay nothing extra.
+    pub fn scan_units(&self) -> Result<(usize, usize)> {
         let mut pages = self.node_count();
+        let mut slabs = 0usize;
         if crate::format::any_spillable(&self.col_types) {
             for (k, row) in self.iter_entries()? {
-                pages += crate::format::overflow_page_count(&self.col_types, &k, &row, self.cap);
+                let u = crate::format::record_scan_units(&self.col_types, &k, &row, self.cap);
+                pages += u.pages;
+                slabs += u.decompress;
             }
         }
-        Ok(pages)
+        Ok((pages, slabs))
     }
 
-    /// The `page_read` block a **bounded scan** over `b` charges: the nodes the bound's key range
-    /// intersects plus the overflow chain pages of the records the bound admits (cost.md §3;
-    /// spec/design/large-values.md §8.1/§12). An empty bound or a point-lookup miss admits no
+    /// The up-front cost block a **bounded scan** over `b` charges, as
+    /// `(page_read, value_decompress)` units: the nodes the bound's key range intersects plus the
+    /// chain pages and decompress slabs of the records the bound admits (cost.md §3;
+    /// spec/design/large-values.md §8/§12/§13). An empty bound or a point-lookup miss admits no
     /// record and adds nothing beyond the path nodes.
-    pub(crate) fn overlap_scan_page_count(&self, b: &KeyBound) -> Result<usize> {
+    pub(crate) fn overlap_scan_units(&self, b: &KeyBound) -> Result<(usize, usize)> {
         let mut pages = self.overlap_node_count(b);
+        let mut slabs = 0usize;
         if crate::format::any_spillable(&self.col_types) {
             for (k, row) in self.range_entries(b)? {
-                pages += crate::format::overflow_page_count(&self.col_types, &k, &row, self.cap);
+                let u = crate::format::record_scan_units(&self.col_types, &k, &row, self.cap);
+                pages += u.pages;
+                slabs += u.decompress;
             }
         }
-        Ok(pages)
+        Ok((pages, slabs))
+    }
+
+    /// The `value_compress` slabs storing this record costs — one `ceil(raw/C)` block per
+    /// disposition-plan compression attempt (cost.md §3; large-values.md §13). Charged by the
+    /// executor once per stored row version at the INSERT/UPDATE write site. Zero whenever the
+    /// record fits inline-plain (no attempt runs), so existing costs do not move.
+    pub(crate) fn write_compress_units(&self, key: &[u8], row: &Row) -> usize {
+        if !crate::format::any_spillable(&self.col_types) {
+            return 0;
+        }
+        crate::format::record_compress_units(&self.col_types, key, row, self.cap)
     }
 
     /// Stream the rows whose primary key lies within `b` to `visit`, in key order, stopping (without

@@ -10,12 +10,14 @@ package jed
 // (tests/overflow_cost.test.ts).
 
 import (
-	"strings"
 	"testing"
 )
 
 // page_size 256 ⇒ cap = 244, RECORD_MAX = 116. A 600-byte text payload spills into
-// ceil(600/244) = 3 overflow pages; a 300-byte bytea into ceil(300/244) = 2.
+// ceil(600/244) = 3 overflow pages; a 300-byte bytea into ceil(300/244) = 2. Payloads are
+// incompressible filler (fillerText/fillerBytesHex — fileformat_golden_test.go) so Slice B's
+// compress pass rejects them (store-smaller) and they genuinely spill plain — compression's own
+// costs are pinned in compressed_cost_test.go.
 const (
 	overflowPageSize   = 256
 	textChainPages     = 3
@@ -28,7 +30,7 @@ const (
 func overflowTables(t *testing.T) *Database {
 	t.Helper()
 	db := WithPageSize(overflowPageSize)
-	big := strings.Repeat("x", overflowBodyLength)
+	big := fillerText(overflowBodyLength)
 	mustExec(t, db, "CREATE TABLE spill (id int32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO spill VALUES (1, '"+big+"'), (2, 'small')")
 	mustExec(t, db, "CREATE TABLE control (id int32 PRIMARY KEY, body text)")
@@ -67,7 +69,7 @@ func TestOverflowCostLimitDoesNotLowerTheBlock(t *testing.T) {
 	// block (which never short-circuits — cost.md §3 "LIMIT short-circuit") still counts the
 	// bound's chain pages.
 	db := WithPageSize(overflowPageSize)
-	big := strings.Repeat("x", overflowBodyLength)
+	big := fillerText(overflowBodyLength)
 	mustExec(t, db, "CREATE TABLE spill (id int32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO spill VALUES (1, 'small'), (2, '"+big+"')")
 	mustExec(t, db, "CREATE TABLE control (id int32 PRIMARY KEY, body text)")
@@ -91,8 +93,8 @@ func TestOverflowCostMutationScansChargeChainPages(t *testing.T) {
 func TestOverflowCostMultipleChainsSum(t *testing.T) {
 	// One record with two externalized values charges the sum of both chains: 3 + 2 = 5.
 	db := WithPageSize(overflowPageSize)
-	bigText := strings.Repeat("x", overflowBodyLength)
-	bigHex := strings.Repeat("ab", 300)
+	bigText := fillerText(overflowBodyLength)
+	bigHex := fillerBytesHex(300)
 	mustExec(t, db, "CREATE TABLE spill (id int32 PRIMARY KEY, body text, blob bytea)")
 	mustExec(t, db, "INSERT INTO spill VALUES (1, '"+bigText+"', '\\x"+bigHex+"')")
 	mustExec(t, db, "CREATE TABLE control (id int32 PRIMARY KEY, body text, blob bytea)")

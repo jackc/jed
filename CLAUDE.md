@@ -355,12 +355,16 @@ biases below are where an overriding reason *does* steer away from PG.
   present requirement is that nothing foreclose it (don't assume page bytes are
   plaintext-comparable on disk). When it lands, the crypto comes from a **vetted library,
   never a hand-rolled algorithm** — the dependency policy (§14).
-- **Leave the door open for compression of large values.** Large values (long `text`,
-  `bytea`, future `json`) may be **compressed** transparently at the storage layer —
-  **LZ4** is the likely choice (fast, streaming, well-supported across languages). Like
-  encryption, a forward-compatible option, not a current feature; it pairs with the
-  deferred overflow-page path for over-large values (storage.md). Any compression library
-  is added under §14.
+- **Compression of large values — ✅ built (large-values Slice B).** Large values (long
+  `text`, `bytea`, big `decimal`, future `json`) are **compressed** transparently at the
+  storage layer with a **hand-rolled, byte-pinned LZ4-block codec**
+  (`spec/fileformat/lz4.md` + `lz4_vectors.toml`): a record over `RECORD_MAX` compresses its
+  largest values first and externalizes only what still doesn't fit
+  (`spec/design/large-values.md` §13). Deliberately **no compression library** — LZ4
+  *encoders* are not standardized, so a per-core library would break the §8 byte-identity
+  the goldens and the deterministic cost depend on (the §14 analysis, recorded in
+  large-values.md §6); the work is metered by the `value_compress`/`value_decompress` cost
+  units (§13).
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored in `spec/fileformat/format.md` and is now the
   **page-backed copy-on-write B-tree** (`format_version` 2, Phase 6): each table's rows are an
@@ -371,10 +375,12 @@ biases below are where an overriding reason *does* steer away from PG.
   grows without bound. All three cores (Rust, Go, TS) **and** the Ruby reference read/write
   byte-identical files, verified against shared golden fixtures (the §8 cross-core round-trip;
   the goldens pin the clean *from-scratch* image). The double-buffered meta page + root pointer
-  are the hooks the incremental commit model (§3) uses. **Still deferred** (later Phase-6, none
-  foreclosed): continuous within-session reclamation + on-disk free-list persistence (P6.2
-  follow-ons), demand paging / a buffer pool, overflow pages, and compression. The from-scratch
-  whole-image serializer survives as `create`'s initial write and the golden generator.
+  are the hooks the incremental commit model (§3) uses. **Landed since:** demand paging / the
+  bounded buffer pool (P6.4), and **large values** (`format_version` 3 — out-of-line overflow
+  chains + transparent LZ4 compression, `spec/design/large-values.md`). **Still deferred**
+  (later Phase-6, none foreclosed): continuous within-session reclamation + on-disk free-list
+  persistence (the P6.2 follow-ons). The from-scratch whole-image serializer survives as
+  `create`'s initial write and the golden generator.
 - **Host file API (Phase 7).** The embedding surface (`spec/design/api.md`) `open`s/`create`s
   a database file and `commit`s the whole image **durably** via temp-file + fsync + atomic
   rename + dir fsync (whole-image rewrite ⇒ rename gives all-or-nothing for free). `commit` is

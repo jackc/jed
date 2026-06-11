@@ -10,10 +10,44 @@
 use jed::{Database, Outcome, execute};
 
 // page_size 256 ⇒ cap = 244, RECORD_MAX = 116. A 600-byte text payload spills into
-// ceil(600/244) = 3 overflow pages; a 300-byte bytea into ceil(300/244) = 2.
+// ceil(600/244) = 3 overflow pages; a 300-byte bytea into ceil(300/244) = 2. Payloads are
+// incompressible filler so Slice B's compress pass rejects them (store-smaller) and they
+// genuinely spill plain — compression's own costs are pinned in compressed_cost.rs.
 const PAGE_SIZE: u32 = 256;
 const TEXT_CHAIN_PAGES: i64 = 3;
 const BYTEA_CHAIN_PAGES: i64 = 2;
+
+/// Incompressible filler (spec/fileformat/format.md "Fixtures"): xorshift32("JEDB") mapped to a
+/// 64-char alphabet (text) or hex bytes (bytea literals). High-entropy, so Slice B's compress
+/// pass never wins store-smaller and the value genuinely spills PLAIN — keeping these tests
+/// about overflow chains. Mirrors verify.rb's filler_text/filler_bytes.
+const ALPHA64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn filler_step(mut x: u32) -> u32 {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^ (x << 5)
+}
+
+fn filler_text(n: usize) -> String {
+    let mut x: u32 = 0x4A45_4442;
+    (0..n)
+        .map(|_| {
+            x = filler_step(x);
+            ALPHA64[(x % 64) as usize] as char
+        })
+        .collect()
+}
+
+fn filler_bytes_hex(n: usize) -> String {
+    let mut x: u32 = 0x4A45_4442;
+    let mut out = String::with_capacity(n * 2);
+    for _ in 0..n {
+        x = filler_step(x);
+        out.push_str(&format!("{:02x}", x % 256));
+    }
+    out
+}
 
 fn cost(db: &mut Database, sql: &str) -> i64 {
     match execute(db, sql).unwrap() {
@@ -26,7 +60,7 @@ fn cost(db: &mut Database, sql: &str) -> i64 {
 /// `control` keeps every value inline. Row 2 is inline in both.
 fn two_tables() -> Database {
     let mut db = Database::with_page_size(PAGE_SIZE);
-    let big = "x".repeat(600);
+    let big = filler_text(600);
     execute(
         &mut db,
         "CREATE TABLE spill (id int32 PRIMARY KEY, body text)",
@@ -78,7 +112,7 @@ fn limit_does_not_lower_the_block() {
     // block (which never short-circuits — cost.md §3 "LIMIT short-circuit") still counts the
     // bound's chain pages.
     let mut db = Database::with_page_size(PAGE_SIZE);
-    let big = "x".repeat(600);
+    let big = filler_text(600);
     execute(
         &mut db,
         "CREATE TABLE spill (id int32 PRIMARY KEY, body text)",
@@ -116,8 +150,8 @@ fn mutation_scans_charge_chain_pages() {
 fn multiple_chains_sum() {
     // One record with two externalized values charges the sum of both chains: 3 + 2 = 5.
     let mut db = Database::with_page_size(PAGE_SIZE);
-    let big_text = "x".repeat(600);
-    let big_hex = "ab".repeat(300);
+    let big_text = filler_text(600);
+    let big_hex = filler_bytes_hex(300);
     execute(
         &mut db,
         "CREATE TABLE spill (id int32 PRIMARY KEY, body text, blob bytea)",

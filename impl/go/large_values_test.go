@@ -10,7 +10,6 @@ package jed
 import (
 	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -31,7 +30,7 @@ func countPageType(image []byte, ps int, ty byte) int {
 func bigValueDB(t *testing.T) (*Database, string) {
 	t.Helper()
 	db := NewDatabase()
-	big := strings.Repeat("abcΩ", 250) // 5 bytes × 250 = 1250 UTF-8 bytes
+	big := fillerText(1250) // incompressible, so Slice B keeps it external-plain
 	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)")
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s')", big))
 	mustExec(t, db, "INSERT INTO t VALUES (2, 'tiny')")
@@ -101,7 +100,7 @@ func TestLoadReclaimsOnlyDeadOverflowPages(t *testing.T) {
 
 func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "large_values.jed")
-	big := strings.Repeat("Z", 1500) // ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
+	big := fillerText(1500) // incompressible ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
 
 	db, err := Create(path, DatabaseOptions{PageSize: 256})
 	if err != nil {

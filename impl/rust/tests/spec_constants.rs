@@ -348,6 +348,8 @@ fn cost_schedule_matches_spec() {
         match id {
             "storage_row_read" => COSTS.storage_row_read,
             "page_read" => COSTS.page_read,
+            "value_compress" => COSTS.value_compress,
+            "value_decompress" => COSTS.value_decompress,
             "row_produced" => COSTS.row_produced,
             "operator_eval" => COSTS.operator_eval,
             "aggregate_accumulate" => COSTS.aggregate_accumulate,

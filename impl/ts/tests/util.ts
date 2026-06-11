@@ -49,3 +49,35 @@ export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   }
   return true;
 }
+
+// Incompressible filler (spec/fileformat/format.md "Fixtures"): xorshift32(seed "JEDB") mapped
+// to a 64-char alphabet (text) or raw bytes (bytea hex literals). High-entropy, so the LZ4
+// encoder never wins store-smaller and the value deterministically stays PLAIN. Mirrors
+// verify.rb's filler_text/filler_bytes; each call restarts at the seed.
+const FILLER_ALPHA64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function fillerStep(x: number): number {
+  x = (x ^ (x << 13)) >>> 0;
+  x = (x ^ (x >>> 17)) >>> 0;
+  return (x ^ (x << 5)) >>> 0;
+}
+
+export function fillerText(n: number): string {
+  let x = 0x4a454442;
+  let out = "";
+  for (let i = 0; i < n; i++) {
+    x = fillerStep(x);
+    out += FILLER_ALPHA64[x % 64]!;
+  }
+  return out;
+}
+
+export function fillerBytesHex(n: number): string {
+  let x = 0x4a454442;
+  let out = "";
+  for (let i = 0; i < n; i++) {
+    x = fillerStep(x);
+    out += (x % 256).toString(16).padStart(2, "0");
+  }
+  return out;
+}

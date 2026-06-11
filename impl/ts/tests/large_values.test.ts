@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { close, create, Database, execute, loadDatabase, open, toImage } from "../src/lib.ts";
+import { fillerText } from "./util.ts";
 
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)
 
@@ -35,7 +36,7 @@ function textOf(v: { kind: string; text?: string } | undefined): string | null {
 }
 
 // A ~1250-byte text value forces a multi-page overflow chain at page 256 (RECORD_MAX = 116, cap = 244).
-const BIG = "abcΩ".repeat(250); // 5 bytes × 250 = 1250 UTF-8 bytes
+const BIG = fillerText(1250); // incompressible, so Slice B keeps it external-plain
 
 function bigValueDB(): Database {
   const db = new Database();
@@ -80,7 +81,7 @@ test("load reclaims only dead overflow pages", () => {
 test("external value through the default demand-paged file path, with reclamation", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-lv-"));
   const path = join(dir, "large_values.jed");
-  const big = "Z".repeat(1500); // ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
+  const big = fillerText(1500); // incompressible ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
   try {
     let db = create(path, { pageSize: 256 });
     execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)");

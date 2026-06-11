@@ -166,40 +166,58 @@ func (s *TableStore) RangeEntries(b keyBound) ([]Entry, error) {
 // charges (spec/design/cost.md §3). Equals NodeCount for the unbounded bound.
 func (s *TableStore) OverlapNodeCount(b keyBound) int { return s.rows.overlapNodeCount(b) }
 
-// ScanPageCount is the page_read block a FULL scan of this store charges: every B-tree node plus
-// one per overflow chain page of every stored record (cost.md §3 "page_read";
-// spec/design/large-values.md §8.1/§12). Equals NodeCount when no record spills — and the row walk
-// is skipped entirely when no column type can spill, so fixed-width tables pay nothing extra.
-func (s *TableStore) ScanPageCount() (int, error) {
-	pages := s.NodeCount()
+// ScanUnits is the up-front cost block a FULL scan of this store charges, as
+// (page_read, value_decompress) units: every B-tree node plus one page_read per overflow chain
+// page, and ceil(raw/C) value_decompress slabs per compressed stored value (cost.md §3;
+// spec/design/large-values.md §8/§12/§13). Equals (NodeCount, 0) when no record spills or
+// compresses — and the row walk is skipped entirely when no column type can spill, so fixed-width
+// tables pay nothing extra.
+func (s *TableStore) ScanUnits() (pages, slabs int, err error) {
+	pages = s.NodeCount()
 	if anySpillable(s.colTypes) {
 		entries, err := s.EntriesInKeyOrder()
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		for _, e := range entries {
-			pages += overflowPageCount(s.colTypes, e.Key, e.Row, s.cap)
+			p, d := recordScanUnits(s.colTypes, e.Key, e.Row, s.cap)
+			pages += p
+			slabs += d
 		}
 	}
-	return pages, nil
+	return pages, slabs, nil
 }
 
-// OverlapScanPageCount is the page_read block a BOUNDED scan over b charges: the nodes the bound's
-// key range intersects plus the overflow chain pages of the records the bound admits (cost.md §3;
-// spec/design/large-values.md §8.1/§12). An empty bound or a point-lookup miss admits no record and
-// adds nothing beyond the path nodes.
-func (s *TableStore) OverlapScanPageCount(b keyBound) (int, error) {
-	pages := s.OverlapNodeCount(b)
+// OverlapScanUnits is the up-front cost block a BOUNDED scan over b charges, as
+// (page_read, value_decompress) units: the nodes the bound's key range intersects plus the chain
+// pages and decompress slabs of the records the bound admits (cost.md §3;
+// spec/design/large-values.md §8/§12/§13). An empty bound or a point-lookup miss admits no record
+// and adds nothing beyond the path nodes.
+func (s *TableStore) OverlapScanUnits(b keyBound) (pages, slabs int, err error) {
+	pages = s.OverlapNodeCount(b)
 	if anySpillable(s.colTypes) {
 		entries, err := s.RangeEntries(b)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		for _, e := range entries {
-			pages += overflowPageCount(s.colTypes, e.Key, e.Row, s.cap)
+			p, d := recordScanUnits(s.colTypes, e.Key, e.Row, s.cap)
+			pages += p
+			slabs += d
 		}
 	}
-	return pages, nil
+	return pages, slabs, nil
+}
+
+// WriteCompressUnits is the value_compress slabs storing this record costs — one ceil(raw/C)
+// block per disposition-plan compression attempt (cost.md §3; large-values.md §13). Charged by
+// the executor once per stored row version at the INSERT/UPDATE write site. Zero whenever the
+// record fits inline-plain (no attempt runs), so existing costs do not move.
+func (s *TableStore) WriteCompressUnits(key []byte, row Row) int {
+	if !anySpillable(s.colTypes) {
+		return 0
+	}
+	return recordCompressUnits(s.colTypes, key, row, s.cap)
 }
 
 // ScanRange streams the rows whose primary key lies within the bound to visit, in key order, stopping

@@ -30,11 +30,21 @@ const (
 	minPageSize          = pageHeader + 36 // smallest valid page size (page + 36-byte meta header; format.md)
 	maxPageSize          = 65536           // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
 
-	// tagExternal is the value-codec presence tag for a present external value: the body is a
-	// pointer (u32 first_page + u32 payload_len) into an overflow chain, not the value (large-values.md
-	// §12). 0x00 present-inline / 0x01 NULL unchanged; 0x03/0x04 reserved for compression (Slice B).
-	tagExternal    byte = 0x02
-	externalPtrLen      = 1 + 4 + 4 // tag + first_page(u32) + payload_len(u32) in a record
+	// Value-codec presence tags beyond 0x00 present-inline-plain / 0x01 NULL (large-values.md
+	// §12/§13; format.md "Large values"): 0x02 external-plain (u32 first_page + u32 payload_len),
+	// 0x03 inline-compressed (u32 raw_len + u16 comp_len + LZ4 block — lz4.md), 0x04
+	// external-compressed (u32 first_page + u32 stored_len + u32 raw_len; the chain carries the
+	// COMPRESSED block). The *Len constants are each form's full in-record size (tag included).
+	tagExternal     byte = 0x02
+	tagInlineComp   byte = 0x03
+	tagExternalComp byte = 0x04
+	externalPtrLen       = 1 + 4 + 4 // tag + first_page(u32) + payload_len(u32) in a record
+	// inlineCompOverhead is the inline-compressed form's overhead: tag + raw_len(u32) + comp_len(u16).
+	inlineCompOverhead = 1 + 4 + 2
+	externalCompPtrLen = 1 + 4 + 4 + 4 // tag + first_page + stored_len + raw_len
+	// sCompress: content payloads below this many bytes are never fed to the LZ4 encoder (header
+	// overhead dominates; PostgreSQL pglz's default min_input_size — large-values.md §13).
+	sCompress = 32
 )
 
 // typeCodeForScalar maps a scalar type to its stable on-disk code, independent of
@@ -881,28 +891,58 @@ func recordMaxFor(capacity int) int {
 	return m
 }
 
-// planDispositions decides each column's on-disk disposition (Slice A: inline or external-plain) and
-// returns (isExternal per column, on-disk record size) — spec/design/large-values.md §3/§12. Spill
-// only when forced: if the all-inline record already fits RECORD_MAX nothing spills; else externalize
-// the largest spillable values (ties by column order) until it fits. Deterministic and cross-core
-// identical (a §8 contract); shared by the serializer and by recordSize (the B-tree split weight).
-func planDispositions(colTypes []ScalarType, key []byte, row Row, capacity int) ([]bool, int) {
+// valueDisp is a value's planned on-disk disposition (large-values.md §2/§12/§13).
+type valueDisp uint8
+
+const (
+	dispInline valueDisp = iota
+	dispInlineComp
+	dispExternal
+	dispExternalComp
+)
+
+// recordPlan is a record's resolved disposition plan: per-column form, the LZ4 block a
+// compressed form carries (so the serializer never re-compresses), the on-disk record size
+// (the B-tree split weight), and the value_compress slabs the plan's pass-1 attempts cost.
+type recordPlan struct {
+	disp          []valueDisp
+	comp          [][]byte
+	size          int
+	compressUnits int
+}
+
+// planDispositions decides each column's on-disk disposition (large-values.md §3/§12/§13;
+// format.md "Large values"). Spill only when forced: if the all-inline-plain record already fits
+// RECORD_MAX, nothing is compressed or spilled. Otherwise two passes, each visiting largest
+// encoded size first, ties by ascending column index — deterministic, a §8 contract:
+// (1) compress eligible values (payload ≥ sCompress), adopting iff the encoded compressed form is
+// strictly smaller (store-smaller); (2) externalize values whose current encoded size still beats
+// their pointer, moving the bytes pass 1 chose (compressed → a 0x04 chain of the compressed
+// block) until the record fits. Shared by the serializer and recordSize (the B-tree split
+// weight): in-memory node boundaries must match the serialized pages.
+func planDispositions(colTypes []ScalarType, key []byte, row Row, capacity int) recordPlan {
 	inline := make([]int, len(colTypes))
 	size := 2 + len(key)
 	for i, ty := range colTypes {
 		inline[i] = len(encodeValue(ty, row[i]))
 		size += inline[i]
 	}
-	external := make([]bool, len(colTypes))
+	plan := recordPlan{
+		disp: make([]valueDisp, len(colTypes)),
+		comp: make([][]byte, len(colTypes)),
+	}
+	cur := append([]int(nil), inline...)
 	max := recordMaxFor(capacity)
 	if size <= max {
-		return external, size
+		plan.size = size
+		return plan
 	}
-	// Spillable, currently-inline columns whose externalization actually shrinks the record
-	// (inline > pointer), largest inline size first; ties by column order — deterministic.
+	// Pass 1 — compress (lz4.md): spillable, non-NULL, payload ≥ sCompress; largest inline-plain
+	// encoded size first, ties by ascending index. Every attempt is metered (ceil(raw/capacity)
+	// value_compress slabs) whether or not store-smaller adopts it.
 	cand := make([]int, 0, len(colTypes))
 	for i, ty := range colTypes {
-		if isSpillable(ty) && inline[i] > externalPtrLen {
+		if isSpillable(ty) && !row[i].IsNull() && len(valuePayload(ty, row[i])) >= sCompress {
 			cand = append(cand, i)
 		}
 	}
@@ -911,36 +951,90 @@ func planDispositions(colTypes []ScalarType, key []byte, row Row, capacity int) 
 		if size <= max {
 			break
 		}
-		external[i] = true
-		size = size - inline[i] + externalPtrLen
+		payload := valuePayload(colTypes[i], row[i])
+		plan.compressUnits += (len(payload) + capacity - 1) / capacity
+		comp := lz4Compress(payload)
+		if inlineCompOverhead+len(comp) < inline[i] {
+			size = size - cur[i] + inlineCompOverhead + len(comp)
+			cur[i] = inlineCompOverhead + len(comp)
+			plan.disp[i] = dispInlineComp
+			plan.comp[i] = comp
+		}
 	}
-	return external, size
+	if size <= max {
+		plan.size = size
+		return plan
+	}
+	// Pass 2 — externalize: anything whose current encoded size beats its pointer, largest
+	// current size first, ties by ascending index. (A NULL is 1 byte and never qualifies.)
+	cand = cand[:0]
+	for i, ty := range colTypes {
+		ptr := externalPtrLen
+		if plan.disp[i] == dispInlineComp {
+			ptr = externalCompPtrLen
+		}
+		if isSpillable(ty) && cur[i] > ptr {
+			cand = append(cand, i)
+		}
+	}
+	sort.SliceStable(cand, func(a, b int) bool { return cur[cand[a]] > cur[cand[b]] })
+	for _, i := range cand {
+		if size <= max {
+			break
+		}
+		ptr := externalPtrLen
+		next := dispExternal
+		if plan.disp[i] == dispInlineComp {
+			ptr = externalCompPtrLen
+			next = dispExternalComp
+		}
+		plan.disp[i] = next
+		size = size - cur[i] + ptr
+		cur[i] = ptr
+	}
+	plan.size = size
+	return plan
 }
 
 // recordSize is the on-disk size of a record — the weight the page-backed B-tree splits on
-// (format.md). Accounts for out-of-line spill: an externalized value contributes its fixed pointer
-// size, not its full inline body (large-values.md §12). Must equal what the serializer produces, so
-// in-memory node boundaries match serialized page boundaries.
+// (format.md). Accounts for compression and out-of-line spill: a compressed value contributes its
+// compressed inline form, an externalized one its fixed pointer size (large-values.md §12/§13).
+// Must equal what the serializer produces, so in-memory node boundaries match serialized pages.
 func recordSize(colTypes []ScalarType, key []byte, row Row, capacity int) int {
-	_, size := planDispositions(colTypes, key, row, capacity)
-	return size
+	return planDispositions(colTypes, key, row, capacity).size
 }
 
-// overflowPageCount is the number of overflow pages this record's externalized values occupy — the
-// extra page_reads a scan that materializes the record charges (spec/design/large-values.md
-// §8.1/§12; cost.md §3). Zero for a fully-inline record. Each external value's content payload P(v)
-// fills capacity-byte slabs, one page per slab — the same chain layout the serializer writes, so
-// the count is the chain's true page count and identical across cores.
-func overflowPageCount(colTypes []ScalarType, key []byte, row Row, capacity int) int {
-	external, _ := planDispositions(colTypes, key, row, capacity)
-	pages := 0
-	for i, ext := range external {
-		if ext {
+// recordScanUnits returns the per-record units a scan's up-front cost block charges beyond the
+// B-tree nodes (cost.md §3; large-values.md §8/§12/§13): pages = one page_read per overflow chain
+// page (the chain carries the payload for external-plain, the COMPRESSED block for
+// external-compressed); decompress = ceil(raw/capacity) value_decompress slabs per compressed
+// stored value (inline- or external-). Zero/zero for a fully-inline-plain record.
+func recordScanUnits(colTypes []ScalarType, key []byte, row Row, capacity int) (pages, decompress int) {
+	plan := planDispositions(colTypes, key, row, capacity)
+	for i, d := range plan.disp {
+		switch d {
+		case dispExternal:
 			n := len(valuePayload(colTypes[i], row[i]))
 			pages += (n + capacity - 1) / capacity
+		case dispInlineComp:
+			n := len(valuePayload(colTypes[i], row[i]))
+			decompress += (n + capacity - 1) / capacity
+		case dispExternalComp:
+			pages += (len(plan.comp[i]) + capacity - 1) / capacity
+			n := len(valuePayload(colTypes[i], row[i]))
+			decompress += (n + capacity - 1) / capacity
+		case dispInline:
 		}
 	}
-	return pages
+	return pages, decompress
+}
+
+// recordCompressUnits returns the value_compress slabs storing this record costs — one
+// ceil(raw/capacity) block per pass-1 compression attempt, adopted or not (cost.md §3;
+// large-values.md §13). Charged once per stored row version at the statement's write site,
+// never for B-tree re-encodes.
+func recordCompressUnits(colTypes []ScalarType, key []byte, row Row, capacity int) int {
+	return planDispositions(colTypes, key, row, capacity).compressUnits
 }
 
 // valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
@@ -983,18 +1077,35 @@ func encodeRecord(table *Table, key []byte, row Row, capacity int, take func() u
 	for i, c := range table.Columns {
 		colTypes[i] = c.Type
 	}
-	external, _ := planDispositions(colTypes, key, row, capacity)
+	plan := planDispositions(colTypes, key, row, capacity)
 	out := make([]byte, 0, 2+len(key)+len(row)*2)
 	out = appendU16(out, uint16(len(key)))
 	out = append(out, key...)
 	for i, col := range table.Columns {
-		if external[i] {
+		switch plan.disp[i] {
+		case dispExternal:
 			payload := valuePayload(col.Type, row[i])
 			first := writeOverflowChain(payload, capacity, take, ovf)
 			out = append(out, tagExternal)
 			out = appendU32(out, first)
 			out = appendU32(out, uint32(len(payload)))
-		} else {
+		case dispInlineComp:
+			rawLen := len(valuePayload(col.Type, row[i]))
+			comp := plan.comp[i]
+			out = append(out, tagInlineComp)
+			out = appendU32(out, uint32(rawLen))
+			out = appendU16(out, uint16(len(comp)))
+			out = append(out, comp...)
+		case dispExternalComp:
+			// The chain carries the COMPRESSED block (its page count follows comp size).
+			rawLen := len(valuePayload(col.Type, row[i]))
+			comp := plan.comp[i]
+			first := writeOverflowChain(comp, capacity, take, ovf)
+			out = append(out, tagExternalComp)
+			out = appendU32(out, first)
+			out = appendU32(out, uint32(len(comp)))
+			out = appendU32(out, uint32(rawLen))
+		default:
 			out = append(out, encodeValue(col.Type, row[i])...)
 		}
 	}
@@ -1418,6 +1529,49 @@ func readValue(ty ScalarType, buf []byte, pos *int, fetch func(uint32) ([]byte, 
 			return Value{}, NewError(DataCorrupted, "external value with no overflow reader")
 		}
 		payload, err := readOverflowChain(first, int(length), fetch, ovfOut)
+		if err != nil {
+			return Value{}, err
+		}
+		return valueFromPayload(ty, payload)
+	case tagInlineComp:
+		rawLen, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		compLen, err := readU16(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		comp, err := take(buf, pos, int(compLen))
+		if err != nil {
+			return Value{}, err
+		}
+		payload, err := lz4Decompress(comp, int(rawLen))
+		if err != nil {
+			return Value{}, err
+		}
+		return valueFromPayload(ty, payload)
+	case tagExternalComp:
+		first, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		stored, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		rawLen, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		if fetch == nil {
+			return Value{}, NewError(DataCorrupted, "external value with no overflow reader")
+		}
+		comp, err := readOverflowChain(first, int(stored), fetch, ovfOut)
+		if err != nil {
+			return Value{}, err
+		}
+		payload, err := lz4Decompress(comp, int(rawLen))
 		if err != nil {
 			return Value{}, err
 		}

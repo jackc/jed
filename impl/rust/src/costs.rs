@@ -9,6 +9,8 @@
 pub struct CostSchedule {
     pub storage_row_read: i64,
     pub page_read: i64,
+    pub value_compress: i64,
+    pub value_decompress: i64,
     pub row_produced: i64,
     pub operator_eval: i64,
     pub aggregate_accumulate: i64,
@@ -18,6 +20,8 @@ pub struct CostSchedule {
 pub const COSTS: CostSchedule = CostSchedule {
     storage_row_read: 1,
     page_read: 1,
+    value_compress: 1,
+    value_decompress: 1,
     row_produced: 1,
     operator_eval: 1,
     aggregate_accumulate: 1,

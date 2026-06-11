@@ -58,6 +58,29 @@ event  = "one B-tree node (page) touched while scanning a table store"
 # ../design/cost.md §3); a fully-inline table charges exactly the node count as before.
 
 [[unit]]
+id     = "value_compress"
+weight = 1
+event  = "one C-byte slab of raw payload fed through the LZ4 encoder at a statement's write site"
+# Landed with large-values Slice B (../design/large-values.md §13, ../design/cost.md §3). An
+# over-`RECORD_MAX` record's disposition decision attempts to compress its largest values
+# (../fileformat/format.md "Large values"); each ATTEMPT — adopted or not, the CPU is spent either
+# way — fires this unit ceil(raw_len / C) times (C = page_size − 12, the same slab the chains use).
+# Charged once per stored row version at the INSERT/UPDATE write site, never for the B-tree's
+# internal re-encodes. A record that fits inline-plain attempts nothing and charges nothing.
+
+[[unit]]
+id     = "value_decompress"
+weight = 1
+event  = "one C-byte slab of decompressed payload reconstructed by the LZ4 decoder during a scan"
+# Landed with large-values Slice B (../design/large-values.md §8.2/§13, ../design/cost.md §3).
+# Fires ceil(raw_len / C) times per COMPRESSED stored value (inline- or external-compressed) of
+# every record a scan's bound admits — folded into the same up-front block as `page_read` (eager
+# materialization; the per-touched-value refinement rides the lazy-read follow-on). Does not
+# short-circuit under LIMIT; a bound that misses charges nothing; fully-inline-plain tables are
+# unchanged. Proportional to the real decompression work an untrusted query can drive (§13), yet
+# computable from the stored raw_len alone — logical and cross-core identical.
+
+[[unit]]
 id     = "row_produced"
 weight = 1
 event  = "one row emitted into a query result set"

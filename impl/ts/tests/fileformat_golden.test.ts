@@ -11,7 +11,7 @@ import { test } from "node:test";
 import { Database, execute } from "../src/lib.ts";
 import { crc32Ieee, loadDatabase, toImage } from "../src/format.ts";
 import { specPath } from "./tomlmini.ts";
-import { bytesEqual } from "./util.ts";
+import { bytesEqual, fillerBytesHex, fillerText } from "./util.ts";
 
 const GOLDEN_PAGE_SIZE = 256;
 
@@ -129,17 +129,34 @@ function byteaTableDB(): Database {
   return db;
 }
 
-// overflowTableDB has large text + bytea values that spill OUT-OF-LINE to overflow pages
-// (spec/design/large-values.md §12): at page_size 256 a ~600/300-byte value exceeds RECORD_MAX
-// (116), so the record holds a pointer and the bytes live in a page_type-4 chain. Row 1 spills both
-// columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL. Must match the Ruby
-// reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
+// overflowTableDB has large INCOMPRESSIBLE text + bytea values that spill OUT-OF-LINE PLAIN to
+// overflow pages (spec/design/large-values.md §12): at page_size 256 a ~600/300-byte value
+// exceeds RECORD_MAX (116); compression is attempted first (Slice B) but rejected by
+// store-smaller, so the record holds a 0x02 pointer and the raw bytes live in a page_type-4
+// chain. Row 1 spills both columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL.
+// Must match the Ruby reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
 function overflowTableDB(): Database {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)");
-  run(db, `INSERT INTO t VALUES (1, '${"x".repeat(600)}', '\\x${"ab".repeat(300)}')`);
+  run(db, `INSERT INTO t VALUES (1, '${fillerText(600)}', '\\x${fillerBytesHex(300)}')`);
   run(db, "INSERT INTO t VALUES (2, 'small', '\\xcafe')");
   run(db, "INSERT INTO t VALUES (3, NULL, NULL)");
+  return db;
+}
+
+// compressedTableDB has large COMPRESSIBLE values exercising Slice B's forms (large-values.md
+// §13, format.md "Large values", lz4.md): row 1's "x"-run text and 0xAB-run bytea both become
+// 0x03 inline-compressed; row 2's half-filler/half-run text compresses to ~200 B — smaller than
+// plain but still over RECORD_MAX → 0x04 external-compressed (a chain carrying the COMPRESSED
+// block); row 3 stays inline-plain; row 4 is NULL/NULL. Must match the Ruby reference's
+// COMPRESSED_TABLE (spec/fileformat/verify.rb).
+function compressedTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)");
+  run(db, `INSERT INTO t VALUES (1, '${"x".repeat(600)}', '\\x${"ab".repeat(200)}')`);
+  run(db, `INSERT INTO t VALUES (2, '${fillerText(200)}${"y".repeat(200)}', NULL)`);
+  run(db, "INSERT INTO t VALUES (3, 'tiny', '\\xcafe')");
+  run(db, "INSERT INTO t VALUES (4, NULL, NULL)");
   return db;
 }
 
@@ -212,6 +229,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
     { name: "empty_db.jed", build: () => goldenDb() },
     { name: "overflow_table.jed", build: overflowTableDB },
+    { name: "compressed_table.jed", build: compressedTableDB },
     { name: "one_table_empty.jed", build: oneTableEmptyDB },
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
@@ -241,6 +259,7 @@ test("read goldens reproduces rows", () => {
   const cases: { name: string; build: () => Database; table: string }[] = [
     { name: "one_table_empty.jed", build: oneTableEmptyDB, table: "t" },
     { name: "overflow_table.jed", build: overflowTableDB, table: "t" },
+    { name: "compressed_table.jed", build: compressedTableDB, table: "t" },
     { name: "pk_table.jed", build: pkTableDB, table: "t" },
     { name: "text_table.jed", build: textTableDB, table: "t" },
     { name: "bool_table.jed", build: boolTableDB, table: "t" },

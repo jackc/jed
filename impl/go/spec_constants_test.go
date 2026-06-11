@@ -325,6 +325,10 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.StorageRowRead
 		case "page_read":
 			return Costs.PageRead
+		case "value_compress":
+			return Costs.ValueCompress
+		case "value_decompress":
+			return Costs.ValueDecompress
 		case "row_produced":
 			return Costs.RowProduced
 		case "operator_eval":
