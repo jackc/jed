@@ -227,6 +227,9 @@ export type Insert = {
   source:
     | { kind: "values"; rows: InsertValue[][] }
     | { kind: "select"; select: Select };
+  // The optional terminal RETURNING clause (spec/design/grammar.md §32): project each stored
+  // row, turning the statement into a query result. Null = no clause.
+  returning: SelectItems | null;
 };
 
 // InsertValue is one value slot in an INSERT VALUES row: a literal, or the DEFAULT keyword —
@@ -290,11 +293,21 @@ export type Update = {
   table: string;
   assignments: Assignment[];
   filter: Expr | null;
+  // The optional terminal RETURNING clause (spec/design/grammar.md §32): project each matched
+  // row's NEW (post-assignment) values. Null = no clause.
+  returning: SelectItems | null;
 };
 
 // Delete is `DELETE FROM <table> [WHERE ...]`. No WHERE deletes every row; the WHERE
 // expression must resolve to boolean.
-export type Delete = { kind: "delete"; table: string; filter: Expr | null };
+// `returning` is the optional terminal RETURNING clause (spec/design/grammar.md §32):
+// project each deleted row's OLD values. Null = no clause.
+export type Delete = {
+  kind: "delete";
+  table: string;
+  filter: Expr | null;
+  returning: SelectItems | null;
+};
 
 // Begin/Commit/Rollback are the explicit transaction-control statements (grammar.md §27,
 // transactions.md §4.2). Begin's `writable` is the access mode: true is READ WRITE (the default),

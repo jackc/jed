@@ -654,8 +654,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       (UPDATE/DELETE keep PK pushdown), no LIMIT-streaming combination, no UNIQUE (next),
       indexable types = key-encodable types (no text/decimal/bytea/boolean keys), no
       expression/ordered/partial keys, no IF NOT EXISTS. _(was: L)_
-- [ ] **`RETURNING`** clause; **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE ✅ —
-      unblocked)_
+- [x] **`RETURNING`** clause — ✅ landed (all three cores). `INSERT`/`UPDATE`/`DELETE` take
+      a terminal `RETURNING <select_items>` and become a query result projecting each
+      affected row: INSERT the stored row, UPDATE the new row, DELETE the old row
+      (grammar.md §32). Items resolve against the target table only (subqueries allowed,
+      correlated included — they observe the **pre-statement snapshot**, probed; aggregates
+      42803); zero affected rows is an empty query result; row order unspecified (rowsort).
+      Projections evaluate after all validation, **before any write** (a 54P01 abort stays
+      all-or-nothing). Cost: per returned row `row_produced` + the items' metered
+      evaluation; the items' column reads join an UPDATE/DELETE's **touched set** (UPDATE
+      minus assigned columns — cost.md §3 "RETURNING"). `returning` joined the table_ref
+      implicit-alias stop set (§15); no format change, no new error codes. Capability
+      `dml.returning`; corpus `dml/returning.test` (83/0/0 ×3, oracle-checked — the
+      importer now replays row-returning DML query records into the prefix); 3 ledgered
+      divergences (no `OLD`/`NEW` qualifiers — PG 18 has them, relaxable; `AS returning`
+      parses). _(was: half of M)_
+- [ ] **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE ✅, RETURNING ✅ — unblocked)_
 - [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
       `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).
       _(size: M; deps: transactions for clean re-keying)_

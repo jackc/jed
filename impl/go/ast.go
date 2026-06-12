@@ -153,6 +153,9 @@ type Insert struct {
 	// Rows is set.
 	Rows   [][]InsertValue
 	Select *Select
+	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
+	// project each stored row, turning the statement into a query result. Nil = no clause.
+	Returning *SelectItems
 }
 
 // InsertValue is one value slot in an INSERT VALUES row: a literal, a bind parameter ($N,
@@ -175,6 +178,9 @@ type Update struct {
 	Table       string
 	Assignments []Assignment
 	Filter      *Expr
+	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
+	// project each matched row's NEW (post-assignment) values. Nil = no clause.
+	Returning *SelectItems
 }
 
 // Assignment is one `SET <Column> = <Value>` clause; Value is a general expression.
@@ -188,6 +194,9 @@ type Assignment struct {
 type Delete struct {
 	Table  string
 	Filter *Expr
+	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
+	// project each deleted row's OLD values. Nil = no clause.
+	Returning *SelectItems
 }
 
 // TableRef is a table reference in a FROM clause: a table name with an optional alias

@@ -26,7 +26,9 @@ mapping table in §6.
   prepare time; the same statement runs many times with different bound values.
 - **`Outcome`** — the result of running a statement: either a bare statement result carrying
   the accrued `cost`, or a query result carrying column names, rows, and `cost`. Unchanged
-  from the pre-API engine.
+  from the pre-API engine. Which variant a statement yields follows from its SQL: a `SELECT`
+  (or set operation) is a query result, and so is a DML statement with a `RETURNING` clause
+  ([grammar.md](grammar.md) §32); everything else is a bare statement result.
 - **`Rows`** — a cursor over a query result, yielding one row at a time, plus the column
   names and the accrued cost.
 - **`EngineError` / `SqlState`** — the structured error surface (errors are data, not prose

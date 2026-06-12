@@ -466,10 +466,12 @@ impl Parser {
             }
             InsertSource::Values(rows)
         };
+        let returning = self.parse_returning()?;
         Ok(Insert {
             table,
             columns,
             source,
+            returning,
         })
     }
 
@@ -996,10 +998,12 @@ impl Parser {
         }
 
         let filter = self.parse_optional_where()?;
+        let returning = self.parse_returning()?;
         Ok(Update {
             table,
             assignments,
             filter,
+            returning,
         })
     }
 
@@ -1009,7 +1013,26 @@ impl Parser {
         self.expect_keyword("from")?;
         let table = self.expect_identifier()?;
         let filter = self.parse_optional_where()?;
-        Ok(Delete { table, filter })
+        let returning = self.parse_returning()?;
+        Ok(Delete {
+            table,
+            filter,
+            returning,
+        })
+    }
+
+    /// Parse an optional terminal `RETURNING <select_items>` clause (shared by
+    /// INSERT/UPDATE/DELETE — spec/design/grammar.md §32). `RETURNING` is not reserved (§3):
+    /// it is a clause only in this trailing position (and it joins the table_ref
+    /// implicit-alias stop set, so an `INSERT ... SELECT` source never swallows it — §15).
+    /// The item list is the ordinary select-items production (`*` or expressions with
+    /// optional `AS` labels); an empty list fails in `parse_expr` (42601).
+    fn parse_returning(&mut self) -> Result<Option<SelectItems>> {
+        if self.peek_keyword().as_deref() != Some("returning") {
+            return Ok(None);
+        }
+        self.advance(); // RETURNING
+        Ok(Some(self.parse_select_items()?))
     }
 
     /// Parse an optional trailing `WHERE <expr>` (shared by SELECT/UPDATE/DELETE). The
@@ -1612,6 +1635,10 @@ fn is_table_ref_stop_keyword(kw: &str) -> bool {
             | "union"
             | "intersect"
             | "except"
+            // RETURNING ends an INSERT ... SELECT source — it must not be swallowed as the
+            // source's implicit table alias (`... SELECT v FROM t RETURNING v` is the INSERT's
+            // clause). §32; PostgreSQL fully reserves the word.
+            | "returning"
     )
 }
 

@@ -563,6 +563,33 @@ per **scanned** row that reaches its node, adding `operator_eval + cost(s | r)` 
 identical to the `SELECT` case, since both mutations drive the same per-row evaluator. The
 phase-2 writes evaluate nothing and stay unmetered (below).
 
+### `RETURNING` — DML that produces rows
+
+A DML statement's `RETURNING` clause ([grammar.md](grammar.md) §32) is metered as a
+**`SELECT` projection over the affected rows**, with no new cost unit:
+
+- **Per returned row**: one `row_produced` plus the item expressions' metered evaluation
+  (`operator_eval` per interior node; `decimal_work` composes) — exactly the charge a
+  `SELECT` makes when it emits a row. `RETURNING *` and bare column references are leaves
+  (`row_produced` only). The statement's existing charges (scan block, per-row
+  `storage_row_read`, filter/assignment/check evaluation, `value_compress`) are unchanged,
+  and a statement that affects zero rows charges nothing for its `RETURNING`.
+- **The touched set** (the subsection above) **grows by the items' column references** for
+  the statements that read stored rows: a `DELETE`'s touched set becomes
+  `WHERE ∪ RETURNING`, and an `UPDATE`'s becomes
+  `WHERE ∪ assignment sources ∪ (RETURNING ∖ assigned columns)` — an **assigned** column's
+  returned value is the freshly computed one, not a storage read, so it charges nothing
+  extra. An `INSERT`'s `RETURNING` reads no stored row at all (the values are the
+  statement's own candidates), so it never adds scan units; an `INSERT ... SELECT`'s
+  source charges through its own query path as before.
+- **Subqueries in the list** follow the subsection above: uncorrelated folds once (cost
+  added once, evaluated against the pre-statement snapshot — grammar.md §32), correlated
+  re-runs per **returned** row (`operator_eval + cost(s | r)` each).
+- **Ordering / the ceiling**: projections evaluate after the statement's validation
+  completes and **before any write**, charging per returned row in scan order with the
+  per-row ceiling guard — so a `54P01` abort mid-`RETURNING` has written nothing
+  (all-or-nothing is preserved; §6).
+
 ### What is NOT metered (defined boundary)
 
 Metering covers **execution** — per-row scans, per-row produced, per-row expression

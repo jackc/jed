@@ -1164,6 +1164,7 @@ impl Database {
             table,
             columns: col_list,
             source,
+            returning,
         } = ins;
 
         let tdef = self.table(&table).ok_or_else(|| {
@@ -1224,24 +1225,9 @@ impl Database {
             InsertSource::Values(rows_in) => {
                 // A `$N` in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
                 // types across every row (a `$N` reused under two columns unifies; api.md §5),
-                // then bind the supplied values up front so a bad bind fails before any store.
+                // checking each row's arity (42601) as it is visited, then bind the supplied
+                // values up front so a bad bind fails before any store.
                 let mut ptypes = ParamTypes::default();
-                for values in &rows_in {
-                    for (i, col) in columns.iter().enumerate() {
-                        if let Some(p) = provided[i] {
-                            if let Some(InsertValue::Param(nn)) = values.get(p) {
-                                ptypes.note((*nn as usize) - 1, Some(col.ty))?;
-                            }
-                        }
-                    }
-                }
-                let bound = bind_params(params, &ptypes.finalize()?)?;
-
-                // Materialize each row into its value-position-indexed candidates (length
-                // `arity`), checking arity (42601) and resolving each slot: a literal, a bound
-                // `$N`, or a `DEFAULT` keyword → that column's default else NULL. The shared
-                // `insert_rows` then builds the declaration-order row and validates it.
-                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rows_in.len());
                 for values in &rows_in {
                     if values.len() != arity {
                         return Err(EngineError::new(
@@ -1259,6 +1245,29 @@ impl Database {
                             ),
                         ));
                     }
+                    for (i, col) in columns.iter().enumerate() {
+                        if let Some(p) = provided[i] {
+                            if let Some(InsertValue::Param(nn)) = values.get(p) {
+                                ptypes.note((*nn as usize) - 1, Some(col.ty))?;
+                            }
+                        }
+                    }
+                }
+                // Resolve the RETURNING projection after the source (PostgreSQL's analysis
+                // order) and before binding/execution — a 42703 here beats a would-be 23505
+                // (grammar.md §32).
+                let ret = match &returning {
+                    Some(items) => Some(self.resolve_returning(&table, items, &mut ptypes)?),
+                    None => None,
+                };
+                let bound = bind_params(params, &ptypes.finalize()?)?;
+
+                // Materialize each row into its value-position-indexed candidates (length
+                // `arity`, checked above), resolving each slot: a literal, a bound `$N`, or a
+                // `DEFAULT` keyword → that column's default else NULL. The shared `insert_rows`
+                // then builds the declaration-order row and validates it.
+                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rows_in.len());
+                for values in &rows_in {
                     let mut rv = vec![Value::Null; arity];
                     for (i, col) in columns.iter().enumerate() {
                         if let Some(p) = provided[i] {
@@ -1272,20 +1281,64 @@ impl Database {
                     rows.push(rv);
                 }
                 // INSERT ... VALUES reads no rows and evaluates no expression tree — its values
-                // are literals and pre-evaluated constant defaults (leaves). The only metered
-                // work is the disposition plan's compression attempts for over-RECORD_MAX rows
-                // (value_compress, cost.md §3); a fully-inline row still costs zero.
+                // are literals and pre-evaluated constant defaults (leaves). The metered work is
+                // the disposition plan's compression attempts for over-RECORD_MAX rows
+                // (value_compress, cost.md §3) and the RETURNING projection (row_produced +
+                // item evaluation per stored row); a plain fully-inline insert still costs zero.
                 let mut meter = Meter::with_limit(self.max_cost);
-                self.insert_rows(&table, &columns, &pk, &checks, &provided, rows, &mut meter)?;
-                Ok(Outcome::Statement {
-                    cost: meter.accrued,
+                let mut ret_nodes = ret;
+                if let Some((nodes, _)) = &mut ret_nodes {
+                    // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3),
+                    // reading the pre-statement snapshot (grammar.md §32).
+                    for node in nodes {
+                        self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
+                    }
+                }
+                let returned = self.insert_rows(
+                    &table,
+                    &columns,
+                    &pk,
+                    &checks,
+                    &provided,
+                    rows,
+                    ret_nodes.as_ref().map(|(nodes, _)| nodes.as_slice()),
+                    &bound,
+                    &mut meter,
+                )?;
+                Ok(match (ret_nodes, returned) {
+                    (Some((_, names)), Some(rows)) => Outcome::Query {
+                        column_names: names,
+                        rows,
+                        cost: meter.accrued,
+                    },
+                    _ => Outcome::Statement {
+                        cost: meter.accrued,
+                    },
                 })
             }
             InsertSource::Select(sel) => {
-                // Run the source query first; it returns OWNED rows, so the `&mut self` borrow
-                // ends here and phase 2 may mutate the store (a self-insert reads the pre-insert
-                // snapshot — §24). Params bind through the SELECT's own resolver.
-                let q = self.run_select(*sel, params)?;
+                // Plan the source query, then resolve the RETURNING projection (PostgreSQL's
+                // analysis order — both precede any execution), threading ONE ParamTypes so a
+                // `$N` shared by the source and the RETURNING list unifies statement-wide
+                // (api.md §5). The source returns OWNED rows, so the `&mut self` borrow ends
+                // before phase 2 mutates the store (a self-insert reads the pre-insert
+                // snapshot — §24).
+                let mut ptypes = ParamTypes::default();
+                let mut plan = self.plan_query(&QueryExpr::Select(sel), None, &mut ptypes)?;
+                let ret = match &returning {
+                    Some(items) => Some(self.resolve_returning(&table, items, &mut ptypes)?),
+                    None => None,
+                };
+                let bound = bind_params(params, &ptypes.finalize()?)?;
+                let mut meter = Meter::with_limit(self.max_cost);
+                self.fold_uncorrelated_in_plan(&mut plan, &bound, &mut meter.accrued)?;
+                let mut ret_nodes = ret;
+                if let Some((nodes, _)) = &mut ret_nodes {
+                    for node in nodes {
+                        self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
+                    }
+                }
+                let q = self.exec_query_plan(&plan, &[], &bound)?;
 
                 // Arity: the SELECT's output column count must match the target — checked before
                 // any row is produced, so it fires even when the source returns zero rows.
@@ -1320,16 +1373,30 @@ impl Database {
                 }
 
                 // Cost = the embedded SELECT's accrued cost (§24) plus the disposition plan's
-                // compression attempts for over-RECORD_MAX rows (value_compress, cost.md §3);
-                // storing the rows themselves stays unmetered. Seeding the meter with the
-                // SELECT's cost keeps one ceiling over the whole statement.
-                let mut meter = Meter::with_limit(self.max_cost);
+                // compression attempts for over-RECORD_MAX rows (value_compress, cost.md §3)
+                // plus the RETURNING projection; storing the rows themselves stays unmetered.
+                // One meter keeps one ceiling over the whole statement.
                 meter.charge(q.cost);
-                self.insert_rows(
-                    &table, &columns, &pk, &checks, &provided, q.rows, &mut meter,
+                let returned = self.insert_rows(
+                    &table,
+                    &columns,
+                    &pk,
+                    &checks,
+                    &provided,
+                    q.rows,
+                    ret_nodes.as_ref().map(|(nodes, _)| nodes.as_slice()),
+                    &bound,
+                    &mut meter,
                 )?;
-                Ok(Outcome::Statement {
-                    cost: meter.accrued,
+                Ok(match (ret_nodes, returned) {
+                    (Some((_, names)), Some(rows)) => Outcome::Query {
+                        column_names: names,
+                        rows,
+                        cost: meter.accrued,
+                    },
+                    _ => Outcome::Statement {
+                        cost: meter.accrued,
+                    },
                 })
             }
         }
@@ -1347,6 +1414,11 @@ impl Database {
     ///
     /// The argument list mirrors the statement-resolved inputs phase 1 validates against,
     /// one-for-one with the Go/TS cores — grouping them would only add indirection.
+    ///
+    /// `returning` is the resolved RETURNING projection (grammar.md §32), evaluated over the
+    /// validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
+    /// observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; `params`
+    /// feeds its `$N`s. Returns the projected output rows, `None` without a clause.
     #[allow(clippy::too_many_arguments)]
     fn insert_rows(
         &mut self,
@@ -1356,8 +1428,10 @@ impl Database {
         checks: &[(String, RExpr)],
         provided: &[Option<usize>],
         rows: Vec<Vec<Value>>,
+        returning: Option<&[RExpr]>,
+        params: &[Value],
         meter: &mut Meter,
-    ) -> Result<()> {
+    ) -> Result<Option<Vec<Vec<Value>>>> {
         let n = columns.len();
         // The canonical relation name for the 23514 message (the `table` argument is the
         // name as the statement spelled it), and the index definitions phase 2 maintains
@@ -1505,6 +1579,17 @@ impl Database {
         meter.charge(COSTS.value_compress * cunits);
         meter.guard()?;
 
+        // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the validated
+        // rows — every check has passed, nothing is written yet, so subqueries in the list
+        // read the pre-statement snapshot and a 54P01 here leaves the store untouched.
+        let returned = match returning {
+            Some(nodes) => {
+                let prows: Vec<&Row> = prepared.iter().map(|(_, r)| r).collect();
+                Some(self.project_returning(nodes, &prows, params, meter)?)
+            }
+            None => None,
+        };
+
         // Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
         // rowid is allocated here, in row order, so a failed validation pass burns none
         // (spec/fileformat/format.md, spec/design/grammar.md §12). Each stored row's
@@ -1532,7 +1617,55 @@ impl Database {
                 );
             }
         }
-        Ok(())
+        Ok(returned)
+    }
+
+    /// Resolve a RETURNING item list against the target table's one-relation scope
+    /// (grammar.md §32): aggregates are 42803 (`Forbidden`), subqueries resolve (and may
+    /// correlate against the returned row), output names follow §8. Returns the projection
+    /// nodes and names; the item types have no consumer. The INSERT path uses this (its
+    /// target borrow ends early); UPDATE/DELETE resolve inline against their live scope.
+    fn resolve_returning(
+        &self,
+        table: &str,
+        items: &SelectItems,
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Vec<RExpr>, Vec<String>)> {
+        let tdef = self.table(table).expect("INSERT target resolved above");
+        let scope = Scope::single(self, tdef);
+        let (nodes, names, _types) =
+            resolve_projections(&scope, items, &mut AggCtx::Forbidden, ptypes)?;
+        Ok((nodes, names))
+    }
+
+    /// Evaluate a resolved RETURNING projection over the affected rows (grammar.md §32,
+    /// cost.md §3): per returned row, guard the ceiling, charge one `row_produced`, then
+    /// evaluate each item — metered expression work, exactly a SELECT's projection (a
+    /// correlated subquery re-runs here, its outer reference reading the row being
+    /// returned). Callers run this after all validation and BEFORE any write.
+    fn project_returning(
+        &self,
+        nodes: &[RExpr],
+        rows: &[&Row],
+        params: &[Value],
+        meter: &mut Meter,
+    ) -> Result<Vec<Vec<Value>>> {
+        let env = EvalEnv {
+            exec: self,
+            params,
+            outer: &[],
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for &row in rows {
+            meter.guard()?;
+            meter.charge(COSTS.row_produced);
+            let mut vals = Vec::with_capacity(nodes.len());
+            for node in nodes {
+                vals.push(node.eval(row, &env, meter)?);
+            }
+            out.push(vals);
+        }
+        Ok(out)
     }
 
     /// Analyze and run a DELETE: resolve the table and optional predicate, collect
@@ -1558,22 +1691,38 @@ impl Database {
         } else {
             table.columns.clone()
         };
-        // DELETE is single-table; resolve its WHERE against a one-relation scope.
+        // DELETE is single-table; resolve its WHERE against a one-relation scope. The
+        // RETURNING projection resolves after it (PostgreSQL's analysis order), against the
+        // same scope (grammar.md §32).
         let scope = Scope::single(self, table);
         let mut ptypes = ParamTypes::default();
         let mut filter = match &del.filter {
             Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
             None => None,
         };
+        let mut ret = match &del.returning {
+            Some(items) => {
+                let (nodes, names, _types) =
+                    resolve_projections(&scope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
+                Some((nodes, names))
+            }
+            None => None,
+        };
         let bound = bind_params(params, &ptypes.finalize()?)?;
 
-        // Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
-        // spec/design/grammar.md §26, cost.md §3); a correlated one stays and re-runs per row via
-        // the per-row outer environment below. The uncorrelated execution reads the pre-DELETE
-        // snapshot (we collect keys before mutating), matching PostgreSQL.
+        // Fold globally-uncorrelated subqueries (in the WHERE or the RETURNING list) once
+        // (their cost is added a single time — spec/design/grammar.md §26, cost.md §3); a
+        // correlated one stays and re-runs per row via the per-row outer environment below.
+        // The uncorrelated execution reads the pre-DELETE snapshot (we collect keys before
+        // mutating), matching PostgreSQL.
         let mut meter = Meter::with_limit(self.max_cost);
         if let Some(f) = &mut filter {
             self.fold_uncorrelated_in_rexpr(f, &bound, &mut meter.accrued)?;
+        }
+        if let Some((nodes, _)) = &mut ret {
+            for node in nodes {
+                self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
+            }
         }
 
         // Collect matching (key, row) pairs before mutating (so the map is not modified
@@ -1598,11 +1747,17 @@ impl Database {
             (Some(f), Some((pk_idx, pk_ty))) => detect_pk_bound(f, pk_idx, pk_ty),
             _ => None,
         };
-        // DELETE's touched set (cost.md §3): only the filter's columns — dropping a row never
-        // reads its chains, so a bare DELETE charges no chain/decompress units at all.
+        // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items' —
+        // a returned column's old value is a logical read of the dropped row. A bare DELETE
+        // still charges no chain/decompress units at all.
         let mut mask = vec![false; ncols];
         if let Some(f) = &filter {
             collect_touched(f, 0, &mut mask);
+        }
+        if let Some((nodes, _)) = &ret {
+            for node in nodes {
+                collect_touched(node, 0, &mut mask);
+            }
         }
         let (entries, (overlap, slabs)) = match &pk_bound {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
@@ -1638,6 +1793,17 @@ impl Database {
             }
         }
 
+        // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched
+        // rows' OLD values before anything is removed — subqueries in the list read the
+        // pre-statement snapshot, and a 54P01 here deletes nothing (all-or-nothing).
+        let returned = match &ret {
+            Some((nodes, _)) => {
+                let prows: Vec<&Row> = matched.iter().map(|(_, r)| r).collect();
+                Some(self.project_returning(nodes, &prows, &bound, &mut meter)?)
+            }
+            None => None,
+        };
+
         // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
         // unmetered write work; an index removal cannot fail).
         let store = self.store_mut(&del.table);
@@ -1650,8 +1816,15 @@ impl Database {
                 istore.remove(&index_entry_key(&tcolumns, def, k, row))?;
             }
         }
-        Ok(Outcome::Statement {
-            cost: meter.accrued,
+        Ok(match (ret, returned) {
+            (Some((_, names)), Some(rows)) => Outcome::Query {
+                column_names: names,
+                rows,
+                cost: meter.accrued,
+            },
+            _ => Outcome::Statement {
+                cost: meter.accrued,
+            },
         })
     }
 
@@ -1732,11 +1905,22 @@ impl Database {
             Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
             None => None,
         };
+        // The RETURNING projection resolves last (PostgreSQL's analysis order), against the
+        // same one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
+        let mut ret = match &upd.returning {
+            Some(items) => {
+                let (nodes, names, _types) =
+                    resolve_projections(&scope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
+                Some((nodes, names))
+            }
+            None => None,
+        };
         // The CHECK constraints, resolved once per statement in evaluation (name) order;
         // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
         let checks = self.resolve_checks(table)?;
         let relation = table.name.clone();
-        // All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
+        // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind
+        // before any scan.
         let bound = bind_params(params, &ptypes.finalize()?)?;
 
         // Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
@@ -1749,6 +1933,11 @@ impl Database {
         }
         if let Some(f) = &mut filter {
             self.fold_uncorrelated_in_rexpr(f, &bound, &mut meter.accrued)?;
+        }
+        if let Some((nodes, _)) = &mut ret {
+            for node in nodes {
+                self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
+            }
         }
 
         // Phase 1: build + validate every matching row's new values; no writes yet. Each
@@ -1771,15 +1960,27 @@ impl Database {
             (Some(f), Some((pk_i, pk_ty))) => detect_pk_bound(f, pk_i, pk_ty),
             _ => None,
         };
-        // UPDATE's touched set (cost.md §3): the filter's columns plus every assignment
-        // SOURCE's — the rewrite re-stores an untouched spilled value without logically
-        // re-reading it (large-values.md §14).
+        // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's,
+        // and the RETURNING items' MINUS the assigned columns — an assigned column's returned
+        // value is the freshly computed one, not a storage read. The rewrite re-stores an
+        // untouched spilled value without logically re-reading it (large-values.md §14).
         let mut mask = vec![false; ncols];
         if let Some(f) = &filter {
             collect_touched(f, 0, &mut mask);
         }
         for plan in &plans {
             collect_touched(&plan.source, 0, &mut mask);
+        }
+        if let Some((nodes, _)) = &ret {
+            let mut ret_mask = vec![false; ncols];
+            for node in nodes {
+                collect_touched(node, 0, &mut ret_mask);
+            }
+            for (i, touched) in ret_mask.iter().enumerate() {
+                if *touched && !plans.iter().any(|p| p.idx == i) {
+                    mask[i] = true;
+                }
+            }
         }
         let (entries, (overlap, slabs)) = match &pk_bound {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
@@ -1883,6 +2084,18 @@ impl Database {
         meter.charge(COSTS.value_compress * cunits);
         meter.guard()?;
 
+        // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched
+        // rows' NEW (post-assignment, fully resident) values — all validation has passed,
+        // nothing is written yet, so subqueries in the list read the pre-statement snapshot
+        // and a 54P01 here writes nothing (all-or-nothing).
+        let returned = match &ret {
+            Some((nodes, _)) => {
+                let prows: Vec<&Row> = updates.iter().map(|(_, new_row, _)| new_row).collect();
+                Some(self.project_returning(nodes, &prows, &bound, &mut meter)?)
+            }
+            None => None,
+        };
+
         // Index maintenance (indexes.md §4): an entry moves only when its key CHANGED —
         // equal old/new keys leave the index tree untouched (part of the contract: it keeps
         // the copy-on-write dirty set, and so the commit's written pages, byte-identical
@@ -1915,8 +2128,15 @@ impl Database {
                 );
             }
         }
-        Ok(Outcome::Statement {
-            cost: meter.accrued,
+        Ok(match (ret, returned) {
+            (Some((_, names)), Some(rows)) => Outcome::Query {
+                column_names: names,
+                rows,
+                cost: meter.accrued,
+            },
+            _ => Outcome::Statement {
+                cost: meter.accrued,
+            },
         })
     }
 

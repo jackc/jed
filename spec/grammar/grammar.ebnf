@@ -187,6 +187,7 @@ type_name      ::= identifier ("(" integer ("," integer)? ")")?
  * (it is a keyword only in a VALUES slot). */
 insert         ::= "INSERT" "INTO" identifier ("(" identifier ("," identifier)* ")")?
                    ( "VALUES" row ("," row)* | select )
+                   returning_clause?
 
 row            ::= "(" insert_value ("," insert_value)* ")"
 
@@ -195,10 +196,22 @@ insert_value   ::= "DEFAULT" | parameter | literal
 update         ::= "UPDATE" identifier "SET"
                    assignment ("," assignment)*
                    where_clause?
+                   returning_clause?
 
 assignment     ::= identifier "=" expr
 
-delete         ::= "DELETE" "FROM" identifier where_clause?
+delete         ::= "DELETE" "FROM" identifier where_clause? returning_clause?
+
+/* The terminal clause of the three DML statements (../design/grammar.md §32): the statement
+ * becomes a query result projecting each affected row — INSERT the stored row, UPDATE the new
+ * row, DELETE the old row. The item list is the ordinary select_items production (general
+ * expressions, "AS" output labels, the standalone "*" glob), resolved against the target table
+ * only; subqueries are allowed (they observe the pre-statement snapshot), aggregates are 42803.
+ * "RETURNING" is NOT reserved (§3): it is recognized positionally as the trailing clause, and it
+ * joins the table_ref implicit-alias stop-keyword set so an INSERT ... SELECT source never
+ * swallows it as an alias (../design/grammar.md §15). Row order is unspecified (no ORDER BY
+ * exists here — one after the clause is 42601). */
+returning_clause ::= "RETURNING" select_items
 
 /* --- transaction control (../design/transactions.md §4, ../design/grammar.md §27) --------- */
 

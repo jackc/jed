@@ -83,6 +83,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Step 6 — row mutation: UPDATE (in-place) + DELETE.
     "dml.update",
     "dml.delete",
+    // The RETURNING clause on INSERT/UPDATE/DELETE — the statement becomes a query result
+    // projecting each affected row (grammar.md §32, cost.md §3).
+    "dml.returning",
     // Phase D/E — SELECT, WHERE (=, ordering), ORDER BY, IS [NOT] NULL, 3VL, casts,
     // cross-type comparison via the promotion tower, and all three integer types.
     "query.select",

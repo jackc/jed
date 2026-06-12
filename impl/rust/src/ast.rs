@@ -149,6 +149,9 @@ pub struct Insert {
     pub columns: Option<Vec<String>>,
     /// Where the rows come from: a `VALUES` list or a `SELECT`.
     pub source: InsertSource,
+    /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
+    /// stored row, turning the statement into a query result. `None` = no clause.
+    pub returning: Option<SelectItems>,
 }
 
 /// The source of an INSERT's rows (spec/design/grammar.md §24): a literal `VALUES` list, or a
@@ -185,6 +188,9 @@ pub struct Update {
     pub table: String,
     pub assignments: Vec<Assignment>,
     pub filter: Option<Expr>,
+    /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
+    /// matched row's NEW (post-assignment) values.
+    pub returning: Option<SelectItems>,
 }
 
 /// One `SET <column> = <expr>` clause.
@@ -200,6 +206,9 @@ pub struct Assignment {
 pub struct Delete {
     pub table: String,
     pub filter: Option<Expr>,
+    /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
+    /// deleted row's OLD values.
+    pub returning: Option<SelectItems>,
 }
 
 /// A table reference in a FROM clause: a table name with an optional alias (`orders o`

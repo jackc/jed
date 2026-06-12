@@ -81,6 +81,10 @@ id = "dml.delete"
 description = "DELETE FROM ... [WHERE]"
 
 [[capability]]
+id = "dml.returning"
+description = "The RETURNING clause on INSERT/UPDATE/DELETE — the statement becomes a query result projecting each affected row (INSERT the stored row, UPDATE the new row, DELETE the old row); items resolve against the target table only (subqueries allowed and observe the pre-statement snapshot; aggregates 42803); zero affected rows is an empty result; row order unspecified (grammar.md §32, cost.md §3)"
+
+[[capability]]
 id = "query.select"
 description = "SELECT of columns from a single table"
 

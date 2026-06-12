@@ -513,8 +513,11 @@ use, and the lookahead must be **byte-identical** across cores (a CLAUDE.md §8 
   `JOIN` keyword (a two-token lookahead), or a bare `JOIN` immediately following the `table_ref`.
   Any other word ends the `FROM` clause (it must be `WHERE`/`ORDER`/`LIMIT`/`OFFSET` or EOF).
 - A `table_ref`'s **implicit** alias is taken only when, after the table name, the next token is
-  a word that is **not** a clause/join keyword (`as`/`where`/`order`/`limit`/`offset`/`on`/`join`/
-  `inner`/`cross`/`left`/`right`/`full`/`outer`); an explicit `AS` takes the next identifier
+  a word that is **not** in the clause/join stop-keyword set: `as`, the trailing-clause keywords
+  (`where`/`group`/`having`/`order`/`limit`/`offset`), the join machinery (`on`/`join`/`inner`/
+  `cross`/`left`/`right`/`full`/`outer`), the set operators (`union`/`intersect`/`except` — §25),
+  and `returning` (the DML trailing clause — §32, so an `INSERT ... SELECT ... RETURNING` never
+  swallows the clause as the source's alias). An explicit `AS` takes the next identifier
   unconditionally. So `FROM t WHERE ...` (no alias) and `FROM t x JOIN ...` (alias `x`) both parse.
   This is the same precedent as the select-item `AS` and the `SELECT DISTINCT` two-token lookahead.
 
@@ -1288,3 +1291,67 @@ members (`42703`/`42701`/`0A000`) and names the backing index (`42P07`/`42710`)
 (constraints.md §5). PostgreSQL *reserves* `UNIQUE`, so a column named `unique` is
 jed-only surface (the standing no-reserved-words stance; such corpus records carry oracle
 overrides like `on`'s — conformance.md §5).
+
+## 32. `RETURNING` — DML that produces rows
+
+`INSERT`, `UPDATE`, and `DELETE` take an optional **terminal** `RETURNING` clause —
+`returning_clause ::= "RETURNING" select_items` — turning the statement into one that
+produces a **query result** (column names + rows, the same `Outcome` shape a `SELECT`
+returns; [api.md](api.md) §3). The item list is the ordinary `select_items` production:
+general expressions with optional `AS` output labels, or the standalone `*` glob expanding
+to every column in declaration order. Output names follow §8 unchanged. All semantics
+below are PostgreSQL's, probed against the live oracle (CLAUDE.md §1).
+
+**Which row each statement returns.**
+
+- **`INSERT`** returns each **stored row** — after the column list / `DEFAULT` fill-in and
+  after type coercion, i.e. exactly the values written. Both sources (`VALUES` and
+  `SELECT`) take the clause; in `INSERT ... SELECT ... RETURNING` the clause belongs to
+  the INSERT (it projects the *inserted* rows, after the source's own optional
+  `ORDER BY`/`LIMIT` ran).
+- **`UPDATE`** returns each matched row's **new** (post-assignment) values.
+- **`DELETE`** returns each deleted row's **old** values.
+
+A statement that affects **zero rows** succeeds with an **empty result** (not an error).
+Without `RETURNING` the statement produces no result set, exactly as before.
+
+**Resolution — a one-relation scope over the target table.** Items resolve against the
+target table only (bare or table-qualified references): an unknown column is `42703`, an
+unknown qualifier is `42P01` (*"missing FROM-clause entry for table rel"* — §15), and
+resolution precedes execution, so a `42703` beats a would-be `23505` (probed). An
+aggregate call is **`42803`** (*aggregate functions are not allowed in RETURNING* — jed
+reports its standing generic message under the same code). Subqueries are **allowed**,
+correlated ones included — an outer reference reads the row being returned (the new row
+under UPDATE, the old row under DELETE, the candidate row under INSERT). `$N` binds as
+anywhere else (api.md §5); a parameter typed by nothing is `42P18`.
+
+**The pre-statement snapshot.** A subquery in the list observes the database **as of the
+start of the statement** — `INSERT INTO t ... RETURNING (SELECT count(*) FROM t)` counts
+**0** over an empty table, an UPDATE's subquery sees pre-update values, a DELETE's sees
+the rows still present (all probed). Operationally: projections evaluate after the
+statement's validation completes and **before any write** (the two-phase model's phase
+boundary, [constraints.md](constraints.md) §4.4), which also keeps a ceiling abort
+(`54P01`) all-or-nothing — a statement aborted mid-RETURNING has written nothing.
+
+**Row order is unspecified** (CLAUDE.md §8): `RETURNING` takes no `ORDER BY` (one after
+the clause is `42601`, as in PostgreSQL), so the corpus compares its results `rowsort`.
+PostgreSQL happens to emit processing order; jed pins only the multiset.
+
+**Keyword + disambiguation.** `RETURNING` stays non-reserved (§3) and is recognized
+positionally as the trailing clause of the three DML statements. The single collision —
+an `INSERT ... SELECT` source whose final `table_ref` could swallow `returning` as an
+implicit alias — is settled by the §15 stop-keyword set, which `returning` joins: a bare
+word `returning` after a `table_ref` is never an implicit alias (PostgreSQL fully
+reserves `RETURNING` and rejects even `AS returning`; jed's explicit-`AS` form stays
+legal — the standing no-reserved-words divergence, oracle-overridden like `on`'s).
+`RETURNING` with an empty list is `42601` (the item parser requires an expression).
+
+**Deliberate divergence — no `OLD`/`NEW` rows.** PostgreSQL 18 lets a `RETURNING` list
+qualify items with `old.`/`new.` (and alias them via `WITH (OLD AS o, NEW AS n)`). jed
+does not implement the feature: `old`/`new` are ordinary identifiers, so `RETURNING
+old.v` resolves like any unknown qualifier (`42P01` unless the target table is named
+`old`). Recorded in the override ledger; relaxable later ([../../TODO.md](../../TODO.md)).
+
+**Cost.** Each returned row charges `row_produced` plus its items' metered evaluation,
+and the items' column references join an UPDATE/DELETE's touched set —
+[cost.md](cost.md) §3 "`RETURNING`".

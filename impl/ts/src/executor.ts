@@ -1051,10 +1051,25 @@ export class Database {
     }
 
     if (ins.source.kind === "select") {
-      // SELECT source (§24). Run the source query first; it returns OWNED rows, so a self-insert
-      // (INSERT INTO t SELECT ... FROM t) reads the pre-insert snapshot, then writes. Params bind
-      // through the SELECT's own resolver.
-      const q = this.runSelect(ins.source.select, params);
+      // SELECT source (§24). Plan the source query, then resolve the RETURNING projection
+      // (PostgreSQL's analysis order — both precede any execution), threading ONE ParamTypes
+      // so a $N shared by the source and the RETURNING list unifies statement-wide (api.md
+      // §5). The source returns OWNED rows, so a self-insert (INSERT INTO t SELECT ... FROM
+      // t) reads the pre-insert snapshot, then writes.
+      const ptypes = new ParamTypes();
+      const plan = this.planQuery(ins.source.select, null, ptypes);
+      const ret = ins.returning !== null ? this.resolveReturning(table, ins.returning, ptypes) : null;
+      const bound = bindParams(params, ptypes.finalize());
+      const meter = new Meter(this.maxCost);
+      const foldCost = { value: 0n };
+      this.foldUncorrelatedInPlan(plan, bound, foldCost);
+      // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
+      // pre-statement snapshot (grammar.md §32).
+      if (ret !== null) {
+        ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, foldCost));
+      }
+      meter.charge(foldCost.value);
+      const q = this.execQueryPlan(plan, [], bound);
       // Arity: the SELECT's output column count must match the target — checked before any row is
       // produced, so it fires even when the source returns zero rows.
       if (q.columnNames.length !== arity) {
@@ -1078,13 +1093,12 @@ export class Database {
         }
       }
       // Cost = the embedded SELECT's accrued cost (§24) plus the disposition plan's
-      // compression attempts for over-RECORD_MAX rows (value_compress, cost.md §3); storing
-      // the rows themselves stays unmetered. Seeding the meter with the SELECT's cost keeps
+      // compression attempts for over-RECORD_MAX rows (value_compress, cost.md §3) plus the
+      // RETURNING projection; storing the rows themselves stays unmetered. One meter keeps
       // one ceiling over the whole statement.
-      const meter = new Meter(this.maxCost);
       meter.charge(q.cost);
-      this.insertRows(table, store, pk, checks, provided, q.rows, meter);
-      return { kind: "statement", cost: meter.accrued };
+      const returned = this.insertRows(table, store, pk, checks, provided, q.rows, ret?.nodes ?? null, bound, meter);
+      return dmlOutcome(ret?.names ?? null, returned, meter.accrued);
     }
 
     // VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
@@ -1093,6 +1107,13 @@ export class Database {
     const rowsIn = ins.source.rows;
     const ptypes = new ParamTypes();
     for (const values of rowsIn) {
+      if (values.length !== arity) {
+        const which = ins.columns !== null ? "target columns are" : "columns are";
+        throw engineError(
+          "syntax_error",
+          `INSERT row has ${values.length} values but ${arity} ${which} expected for table ${table.name}`,
+        );
+      }
       for (let i = 0; i < n; i++) {
         const p = provided[i]!;
         if (p >= 0 && p < values.length) {
@@ -1101,20 +1122,16 @@ export class Database {
         }
       }
     }
+    // Resolve the RETURNING projection after the source (PostgreSQL's analysis order) and
+    // before binding/execution — a 42703 here beats a would-be 23505 (grammar.md §32).
+    const ret = ins.returning !== null ? this.resolveReturning(table, ins.returning, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize());
 
-    // Materialize each row into its value-position-indexed candidates (length arity), checking
-    // arity (42601) and resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that
+    // Materialize each row into its value-position-indexed candidates (length arity, checked
+    // above), resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that
     // column's default else NULL. The shared insertRows then builds the declaration-order row.
     const rows: Value[][] = [];
     for (const values of rowsIn) {
-      if (values.length !== arity) {
-        const which = ins.columns !== null ? "target columns are" : "columns are";
-        throw engineError(
-          "syntax_error",
-          `INSERT row has ${values.length} values but ${arity} ${which} expected for table ${table.name}`,
-        );
-      }
       const rv: Value[] = new Array(arity);
       for (let i = 0; i < n; i++) {
         const col = table.columns[i]!;
@@ -1129,12 +1146,20 @@ export class Database {
       rows.push(rv);
     }
     // INSERT ... VALUES reads no rows and evaluates no expression tree — its values are literals
-    // and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves. The only
-    // metered work is the disposition plan's compression attempts for over-RECORD_MAX rows
-    // (value_compress, cost.md §3); a fully-inline row still costs zero.
+    // and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves. The metered
+    // work is the disposition plan's compression attempts for over-RECORD_MAX rows
+    // (value_compress, cost.md §3) and the RETURNING projection (row_produced + item
+    // evaluation per stored row); a plain fully-inline insert still costs zero.
     const meter = new Meter(this.maxCost);
-    this.insertRows(table, store, pk, checks, provided, rows, meter);
-    return { kind: "statement", cost: meter.accrued };
+    // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
+    // pre-statement snapshot (grammar.md §32).
+    if (ret !== null) {
+      const foldCost = { value: 0n };
+      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, foldCost));
+      meter.charge(foldCost.value);
+    }
+    const returned = this.insertRows(table, store, pk, checks, provided, rows, ret?.nodes ?? null, bound, meter);
+    return dmlOutcome(ret?.names ?? null, returned, meter.accrued);
   }
 
   // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -1145,6 +1170,10 @@ export class Database {
   // seenKeys AND against the store) BEFORE any row is written; only once every row validates are
   // they all inserted (phase 2), allocating a fresh monotonic rowid in row order for a no-PK
   // table. All-or-nothing: a failure leaves the store untouched and burns no rowids.
+  // `returning` is the resolved RETURNING projection (grammar.md §32), evaluated over the
+  // validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
+  // observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; `params`
+  // feeds its $Ns. Returns the projected output rows, null without a clause.
   private insertRows(
     table: Table,
     store: TableStore,
@@ -1152,8 +1181,10 @@ export class Database {
     checks: NamedCheck[],
     provided: number[],
     rows: Value[][],
+    returning: RExpr[] | null,
+    params: Value[],
     meter: Meter,
-  ): void {
+  ): Value[][] | null {
     const n = table.columns.length;
     const prepared: { key: Uint8Array | null; row: Row }[] = [];
     const seenKeys = new Set<string>();
@@ -1258,6 +1289,14 @@ export class Database {
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
 
+    // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the validated
+    // rows — every check has passed, nothing is written yet, so subqueries in the list read
+    // the pre-statement snapshot and a 54P01 here leaves the store untouched.
+    const returned =
+      returning !== null
+        ? this.projectReturning(returning, prepared.map((pr) => pr.row), params, meter)
+        : null;
+
     // Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
     // rowid is allocated here, in row order, so a failed validation pass burns none
     // (spec/fileformat/format.md, grammar.md §12). Each stored row's secondary-index
@@ -1282,6 +1321,42 @@ export class Database {
         }
       }
     }
+    return returned;
+  }
+
+  // resolveReturning resolves a RETURNING item list against the target table's one-relation
+  // scope (grammar.md §32): aggregates are 42803 (the non-collecting AggCtx), subqueries
+  // resolve (and may correlate against the returned row), output names follow §8. Returns the
+  // projection nodes and names; the item types have no consumer.
+  private resolveReturning(
+    table: Table,
+    items: SelectItems,
+    ptypes: ParamTypes,
+  ): { nodes: RExpr[]; names: string[] } {
+    const scope = Scope.single(this, table);
+    const { nodes, names } = resolveProjections(
+      scope,
+      items,
+      { collecting: false, groupKeys: [], specs: [] },
+      ptypes,
+    );
+    return { nodes, names };
+  }
+
+  // projectReturning evaluates a resolved RETURNING projection over the affected rows
+  // (grammar.md §32, cost.md §3): per returned row, guard the ceiling, charge one
+  // row_produced, then evaluate each item — metered expression work, exactly a SELECT's
+  // projection (a correlated subquery re-runs here, its outer reference reading the row being
+  // returned). Callers run this after all validation and BEFORE any write.
+  private projectReturning(nodes: RExpr[], rows: Row[], params: Value[], meter: Meter): Value[][] {
+    const env: EvalEnv = { params, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, params) };
+    const out: Value[][] = [];
+    for (const row of rows) {
+      meter.guard();
+      meter.charge(COSTS.rowProduced);
+      out.push(nodes.map((node) => evalExpr(node, row, env, meter)));
+    }
+    return out;
   }
 
   // executeDelete resolves the table and optional predicate, collects the keys of
@@ -1292,10 +1367,13 @@ export class Database {
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + del.table);
     }
-    // DELETE is single-table; resolve its WHERE against a one-relation scope.
+    // DELETE is single-table; resolve its WHERE against a one-relation scope. The RETURNING
+    // projection resolves after it (PostgreSQL's analysis order), against the same scope
+    // (grammar.md §32).
     const scope = Scope.single(this, table);
     const ptypes = new ParamTypes();
     let filter = del.filter ? resolveBooleanFilter(scope, del.filter, ptypes) : null;
+    const ret = del.returning !== null ? this.resolveReturning(table, del.returning, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize());
 
     // Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
@@ -1309,20 +1387,31 @@ export class Database {
       filter = this.foldUncorrelatedInRExpr(filter, bound, cost);
       meter.charge(cost.value);
     }
+    // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
+    // pre-statement snapshot (grammar.md §32).
+    if (ret !== null) {
+      const cost = { value: 0n };
+      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, cost));
+      meter.charge(cost.value);
+    }
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.working().store(del.table);
     // matched collects (key, row) pairs before mutating; the rows feed phase 2's
     // index-entry removal (indexed columns are fixed-width and always resident).
     const matched: { key: Uint8Array; row: Row }[] = [];
-    // DELETE's touched set (cost.md §3): only the filter's columns — dropping a row never reads
-    // its chains, so a bare DELETE charges no chain/decompress units at all.
+    // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items' — a
+    // returned column's old value is a logical read of the dropped row. A bare DELETE still
+    // charges no chain/decompress units at all.
     const mask: boolean[] = new Array(table.columns.length).fill(false);
     if (filter !== null) collectTouched(filter, 0, mask);
+    if (ret !== null) for (const node of ret.nodes) collectTouched(node, 0, mask);
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
-    // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
-    // page_read per visited node (block, before the rows), then storageRowRead per scanned row.
+    // scan"); an empty bound deletes nothing — with RETURNING that is still a query result
+    // (empty rows), never a bare statement (grammar.md §32). The whole WHERE stays the
+    // residual filter below. page_read per visited node (block, before the rows), then
+    // storageRowRead per scanned row.
     const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound, mask);
-    if (entries === null) return { kind: "statement", cost: meter.accrued }; // empty bound
+    if (entries === null) return dmlOutcome(ret?.names ?? null, null, meter.accrued); // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -1335,6 +1424,13 @@ export class Database {
         matched.push({ key: e.key, row });
       }
     }
+    // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched rows'
+    // OLD values before anything is removed — subqueries in the list read the pre-statement
+    // snapshot, and a 54P01 here deletes nothing (all-or-nothing).
+    const returned =
+      ret !== null
+        ? this.projectReturning(ret.nodes, matched.map((m) => m.row), bound, meter)
+        : null;
     // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
     // unmetered write work; an index removal cannot fail).
     for (const m of matched) store.remove(m.key);
@@ -1344,7 +1440,7 @@ export class Database {
         istore.remove(indexEntryKey(table.columns, def, m.key, m.row));
       }
     }
-    return { kind: "statement", cost: meter.accrued };
+    return dmlOutcome(ret?.names ?? null, returned, meter.accrued);
   }
 
   // executeUpdate is two-phase / all-or-nothing: phase 1 builds and type-checks every
@@ -1397,10 +1493,14 @@ export class Database {
     }
 
     let filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
+    // The RETURNING projection resolves last (PostgreSQL's analysis order), against the same
+    // one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
+    const ret = upd.returning !== null ? this.resolveReturning(table, upd.returning, ptypes) : null;
     // The CHECK constraints, resolved once per statement in evaluation (name) order;
     // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
     const checks = this.resolveChecks(table);
-    // All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
+    // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind before
+    // any scan.
     const bound = bindParams(params, ptypes.finalize());
 
     // Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
@@ -1414,22 +1514,35 @@ export class Database {
     const foldCost = { value: 0n };
     for (const p of plans) p.source = this.foldUncorrelatedInRExpr(p.source, bound, foldCost);
     if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, foldCost);
+    if (ret !== null) {
+      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, foldCost));
+    }
     meter.charge(foldCost.value);
     const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
     const store = this.working().store(upd.table);
     // Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
     const updates: { key: Uint8Array; row: Row; oldRow: Row }[] = [];
-    // UPDATE's touched set (cost.md §3): the filter's columns plus every assignment SOURCE's —
-    // the rewrite re-stores an untouched spilled value without logically re-reading it
-    // (large-values.md §14).
+    // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's, and
+    // the RETURNING items' MINUS the assigned columns — an assigned column's returned value is
+    // the freshly computed one, not a storage read. The rewrite re-stores an untouched spilled
+    // value without logically re-reading it (large-values.md §14).
     const mask: boolean[] = new Array(table.columns.length).fill(false);
     if (filter !== null) collectTouched(filter, 0, mask);
     for (const p of plans) collectTouched(p.source, 0, mask);
+    if (ret !== null) {
+      const retMask: boolean[] = new Array(table.columns.length).fill(false);
+      for (const node of ret.nodes) collectTouched(node, 0, retMask);
+      for (let i = 0; i < retMask.length; i++) {
+        if (retMask[i] && !plans.some((p) => p.idx === i)) mask[i] = true;
+      }
+    }
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
-    // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
-    // page_read per visited node (block, before the rows), then storageRowRead per scanned row.
+    // scan"); an empty bound updates nothing — with RETURNING that is still a query result
+    // (empty rows), never a bare statement (grammar.md §32). The whole WHERE stays the
+    // residual filter below. page_read per visited node (block, before the rows), then
+    // storageRowRead per scanned row.
     const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound, mask);
-    if (entries === null) return { kind: "statement", cost: meter.accrued }; // empty bound
+    if (entries === null) return dmlOutcome(ret?.names ?? null, null, meter.accrued); // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -1496,6 +1609,15 @@ export class Database {
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
 
+    // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched rows'
+    // NEW (post-assignment, fully resident) values — all validation has passed, nothing is
+    // written yet, so subqueries in the list read the pre-statement snapshot and a 54P01 here
+    // writes nothing (all-or-nothing).
+    const returned =
+      ret !== null
+        ? this.projectReturning(ret.nodes, updates.map((u) => u.row), bound, meter)
+        : null;
+
     // Index maintenance (indexes.md §4): an entry moves only when its key CHANGED — equal
     // old/new keys leave the index tree untouched (part of the contract: it keeps the
     // copy-on-write dirty set, and so the commit's written pages, byte-identical across
@@ -1523,7 +1645,7 @@ export class Database {
         }
       }
     }
-    return { kind: "statement", cost: meter.accrued };
+    return dmlOutcome(ret?.names ?? null, returned, meter.accrued);
   }
 
   // executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query
@@ -3722,6 +3844,16 @@ function cloneStores(stores: Map<string, TableStore>): Map<string, TableStore> {
   const out = new Map<string, TableStore>();
   for (const [k, s] of stores) out.set(k, s.clone());
   return out;
+}
+
+// dmlOutcome wraps a DML statement's completion: a query result projecting the returned rows
+// when a RETURNING clause was resolved (retNames non-null — grammar.md §32; zero affected
+// rows is an EMPTY query result, never a bare statement), else a bare statement result.
+function dmlOutcome(retNames: string[] | null, returned: Value[][] | null, cost: bigint): Outcome {
+  if (retNames !== null) {
+    return { kind: "query", columnNames: retNames, rows: returned ?? [], cost };
+  }
+  return { kind: "statement", cost };
 }
 
 // resolveProjections resolves SELECT items into evaluable projections (any result type is

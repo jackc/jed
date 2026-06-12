@@ -1,0 +1,179 @@
+# The RETURNING clause (grammar.md §32, cost.md §3). INSERT/UPDATE/DELETE take a terminal
+# `RETURNING <select_items>`, turning the statement into a query result projecting each
+# affected row: INSERT the STORED row (post-default, post-coercion), UPDATE the NEW
+# (post-assignment) row, DELETE the deleted OLD row. Items resolve against the target table
+# only (42703/42P01; aggregates 42803); subqueries are allowed and observe the PRE-statement
+# snapshot; zero affected rows is an empty query result. Row order is unspecified (rowsort —
+# no ORDER BY exists here). Cost: per returned row, row_produced + the items' metered
+# evaluation; the items' column reads join an UPDATE/DELETE's touched set. The PG-divergent
+# block sits LAST with ledger overrides (conformance.md §5): jed has no OLD/NEW row
+# qualifiers (PG 18 does), and `AS returning` parses (jed reserves no words; PG rejects).
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.update, dml.delete, dml.returning, query.select, query.select_star, query.column_alias, query.where_eq, query.comparison_order, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.table_alias, query.qualified_column, expr.arithmetic, null.three_valued, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, v int32 DEFAULT 7, w int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)
+
+# --- INSERT ... VALUES RETURNING -------------------------------------------------------
+
+# Each stored row projects back; cost = 2 x (row_produced + one operator_eval). A plain
+# VALUES insert still costs zero — the projection is the only metered work here.
+# cost: 4
+query II rowsort
+INSERT INTO t VALUES (4, 40, 400), (5, 50, 500) RETURNING id, v + 1
+----
+4
+41
+5
+51
+
+# `*` expands every column in declaration order; the DEFAULT fills in (v = 7) and the
+# omitted column is NULL. Bare columns are leaves: one row_produced only.
+# cost: 1
+query III nosort
+INSERT INTO t (id) VALUES (6) RETURNING *
+----
+6
+7
+NULL
+
+# Output names follow §8: the AS label, the fixed ?column? for an expression, the
+# catalog's canonical name for a bare column.
+# names: id, dbl, ?column?
+# cost: 3
+query III nosort
+INSERT INTO t VALUES (7, 1, 2) RETURNING id, v * 2 AS dbl, w - 2
+----
+7
+2
+0
+
+# --- UPDATE / DELETE RETURNING ----------------------------------------------------------
+
+# UPDATE returns the NEW (post-assignment) values. Under the PK point bound:
+# page_read(1) + storage_row_read(1) + filter(1) + assignment v+1 (1) + row_produced(1).
+# cost: 5
+query II nosort
+UPDATE t SET v = v + 1 WHERE id = 1 RETURNING id, v
+----
+1
+11
+
+# Zero affected rows: still a query result — empty, names intact (never a bare statement).
+# names: id
+query I rowsort
+UPDATE t SET v = 0 WHERE id = 999 RETURNING id
+----
+
+# DELETE returns the deleted row's OLD values.
+# cost: 4
+query II nosort
+DELETE FROM t WHERE id = 7 RETURNING id, v
+----
+7
+1
+
+# --- INSERT ... SELECT ... RETURNING ----------------------------------------------------
+
+statement ok
+CREATE TABLE src (a int32)
+
+statement ok
+INSERT INTO src VALUES (100), (101)
+
+# The clause belongs to the INSERT: it projects the INSERTED rows (defaults filled), after
+# the source ran. Cost = the source (page 1 + 2 rows + 2 produced) + 2 returned rows.
+# cost: 7
+query II rowsort
+INSERT INTO t (id) SELECT a FROM src RETURNING id, v
+----
+100
+7
+101
+7
+
+# A bare trailing `returning` after the source is the CLAUSE, never an implicit alias
+# (the §15 stop set) — with no item list it is a syntax error, as in PostgreSQL.
+statement error 42601
+INSERT INTO t (id) SELECT a FROM src returning
+
+# --- subqueries observe the pre-statement snapshot (probed against PG 18) ---------------
+
+# Uncorrelated: folds once, reading the snapshot BEFORE the statement's writes — the
+# count excludes the two rows being inserted (8 rows live here).
+# cost: 20
+query II rowsort
+INSERT INTO t VALUES (8, 0, 0), (9, 0, 0) RETURNING id, (SELECT count(*) FROM t)
+----
+8
+8
+9
+8
+
+# An UPDATE's subquery sees the pre-update values: ids 8 and 9 still sum to 0.
+# cost: 16
+query I nosort
+UPDATE t SET v = 99 WHERE id = 8 RETURNING (SELECT sum(v) FROM t WHERE id > 7 AND id < 100)
+----
+0
+
+# A DELETE's subquery sees the row still present: ids 8, 9, 100, 101 all count.
+# cost: 18
+query I nosort
+DELETE FROM t WHERE id = 9 RETURNING (SELECT count(*) FROM t WHERE id >= 8)
+----
+4
+
+# Correlated: the outer reference reads the row being returned (the deleted row itself —
+# its own w is 0); the inner re-scan is PK-bounded per returned row.
+# cost: 9
+query I nosort
+DELETE FROM t WHERE id = 8 RETURNING (SELECT s.w FROM t AS s WHERE s.id = t.id)
+----
+0
+
+# --- errors (PG codes, probed) ----------------------------------------------------------
+
+# Resolution precedes execution: the unknown column beats the would-be 23505 duplicate.
+statement error 42703
+INSERT INTO t VALUES (1, 0, 0) RETURNING nosuch
+
+statement error 42803
+INSERT INTO t VALUES (90, 0, 0) RETURNING sum(v)
+
+statement error 42P01
+UPDATE t SET v = 1 WHERE id = 1 RETURNING other.v
+
+statement error 42601
+DELETE FROM t RETURNING
+
+statement error 42601
+DELETE FROM t WHERE id = 1 RETURNING id ORDER BY id
+
+statement error 42601
+SELECT v FROM t returning
+
+# --- documented PG divergences (oracle-overridden; conformance.md §5) -------------------
+# These sit LAST: the records where jed and PostgreSQL part ways are chosen to leave the
+# oracle's table state unchanged (a zero-net-change UPDATE, a zero-row DELETE) so the
+# replay prefix stays in sync, with the jed-only INSERT at the very end.
+
+# PG 18 returns OLD/NEW row versions via the old./new. qualifiers; jed does not implement
+# them (grammar.md §32) — old/new are ordinary unknown qualifiers.
+statement error 42P01
+UPDATE t SET v = v WHERE id = 1 RETURNING old.v, new.v
+
+statement error 42P01
+DELETE FROM t WHERE id < 0 RETURNING old.id
+
+# jed reserves no words (§3): an explicit `AS returning` source alias parses, with the
+# clause after it. PostgreSQL fully reserves RETURNING and rejects this (42601).
+# cost: 9
+query I rowsort
+INSERT INTO t (id) SELECT a + 100 FROM src AS returning RETURNING id
+----
+200
+201

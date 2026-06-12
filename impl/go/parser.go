@@ -613,7 +613,11 @@ func (p *Parser) parseInsert() (*Insert, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Insert{Table: table, Columns: columns, Select: sel}, nil
+		returning, err := p.parseReturning()
+		if err != nil {
+			return nil, err
+		}
+		return &Insert{Table: table, Columns: columns, Select: sel, Returning: returning}, nil
 	}
 
 	if err := p.expectKeyword("values"); err != nil {
@@ -633,7 +637,11 @@ func (p *Parser) parseInsert() (*Insert, error) {
 		}
 		break
 	}
-	return &Insert{Table: table, Columns: columns, Rows: rows}, nil
+	returning, err := p.parseReturning()
+	if err != nil {
+		return nil, err
+	}
+	return &Insert{Table: table, Columns: columns, Rows: rows, Returning: returning}, nil
 }
 
 // parseInsertRow parses one parenthesized `( <value> [, <value>]* )` row of an INSERT.
@@ -1034,7 +1042,11 @@ func isTableRefStopKeyword(kw string) bool {
 		"join", "inner", "cross", "left", "right", "full", "outer", "on", "as",
 		// set operators end a SELECT core — they must not be swallowed as an implicit table
 		// alias (`FROM a UNION ...` is a UNION, not a table `a` aliased `union`). §25.
-		"union", "intersect", "except":
+		"union", "intersect", "except",
+		// RETURNING ends an INSERT ... SELECT source — it must not be swallowed as the
+		// source's implicit table alias (`... SELECT v FROM t RETURNING v` is the INSERT's
+		// clause). §32; PostgreSQL fully reserves the word.
+		"returning":
 		return true
 	default:
 		return false
@@ -1244,7 +1256,11 @@ func (p *Parser) parseUpdate() (*Update, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Update{Table: table, Assignments: assignments, Filter: filter}, nil
+	returning, err := p.parseReturning()
+	if err != nil {
+		return nil, err
+	}
+	return &Update{Table: table, Assignments: assignments, Filter: filter, Returning: returning}, nil
 }
 
 // parseDelete parses `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes all rows.
@@ -1263,7 +1279,11 @@ func (p *Parser) parseDelete() (*Delete, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Delete{Table: table, Filter: filter}, nil
+	returning, err := p.parseReturning()
+	if err != nil {
+		return nil, err
+	}
+	return &Delete{Table: table, Filter: filter, Returning: returning}, nil
 }
 
 // parseOptionalWhere parses an optional trailing `WHERE <expr>` (shared by
@@ -1279,6 +1299,24 @@ func (p *Parser) parseOptionalWhere() (*Expr, error) {
 		return nil, err
 	}
 	return &e, nil
+}
+
+// parseReturning parses an optional terminal `RETURNING <select_items>` clause (shared by
+// INSERT/UPDATE/DELETE — spec/design/grammar.md §32). RETURNING is not reserved (§3): it is a
+// clause only in this trailing position (and it joins the table_ref implicit-alias stop set,
+// so an `INSERT ... SELECT` source never swallows it — §15). The item list is the ordinary
+// select-items production (`*` or expressions with optional AS labels); an empty list fails
+// in parseExpr (42601).
+func (p *Parser) parseReturning() (*SelectItems, error) {
+	if p.peekKeyword() != "returning" {
+		return nil, nil
+	}
+	p.advance() // RETURNING
+	items, err := p.parseSelectItems()
+	if err != nil {
+		return nil, err
+	}
+	return &items, nil
 }
 
 func (p *Parser) parseSelectItems() (SelectItems, error) {

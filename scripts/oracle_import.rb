@@ -100,6 +100,12 @@ class OracleImport
         else
           out.concat(regenerate_query(sql.join, coltypes, sortmode))
         end
+        # A row-returning DML query record (INSERT/UPDATE/DELETE ... RETURNING —
+        # grammar.md §32) mutates state like a `statement ok`, so its effects must reach
+        # later records' replay prefix; SELECTs stay un-replayed (side-effect-free).
+        # Appended unconditionally, like `statement ok`: an overridden PG-failing DML
+        # query record must sit LAST in its file (conformance.md §5).
+        @applied << rewrite(sql.join) if sql.join =~ /\A\s*(insert|update|delete)\b/i
       else
         out << line # comment / blank / directive — pass through verbatim
         i += 1

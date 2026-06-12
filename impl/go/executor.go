@@ -1139,10 +1139,43 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	}
 
 	if ins.Select != nil {
-		// SELECT source (§24). Run the source query first; it returns OWNED rows, so a
-		// self-insert (INSERT INTO t SELECT ... FROM t) reads the pre-insert snapshot, then
-		// writes. Params bind through the SELECT's own resolver.
-		q, err := db.runSelect(ins.Select, params)
+		// SELECT source (§24). Plan the source query, then resolve the RETURNING projection
+		// (PostgreSQL's analysis order — both precede any execution), threading ONE paramTypes
+		// so a $N shared by the source and the RETURNING list unifies statement-wide (api.md
+		// §5). The source returns OWNED rows, so a self-insert (INSERT INTO t SELECT ... FROM
+		// t) reads the pre-insert snapshot, then writes.
+		ptypes := &paramTypes{}
+		plan, err := db.planQuery(QueryExpr{Select: ins.Select}, nil, ptypes)
+		if err != nil {
+			return Outcome{}, err
+		}
+		var retNodes []*rExpr
+		var retNames []string
+		if ins.Returning != nil {
+			if retNodes, retNames, err = db.resolveReturning(table, *ins.Returning, ptypes); err != nil {
+				return Outcome{}, err
+			}
+		}
+		ptys, err := ptypes.finalize()
+		if err != nil {
+			return Outcome{}, err
+		}
+		bound, err := bindParams(params, ptys)
+		if err != nil {
+			return Outcome{}, err
+		}
+		meter := NewMeterWithLimit(db.maxCost)
+		if err := db.foldUncorrelatedInPlan(&plan, bound, &meter.Accrued); err != nil {
+			return Outcome{}, err
+		}
+		// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
+		// pre-statement snapshot (grammar.md §32).
+		for _, node := range retNodes {
+			if err := db.foldUncorrelatedInRExpr(node, bound, &meter.Accrued); err != nil {
+				return Outcome{}, err
+			}
+		}
+		q, err := db.execQueryPlan(&plan, nil, bound)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -1173,46 +1206,21 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 			}
 		}
 		// Cost = the embedded SELECT's accrued cost (§24) plus the disposition plan's
-		// compression attempts for over-RECORD_MAX rows (value_compress, cost.md §3); storing
-		// the rows themselves stays unmetered. Seeding the meter with the SELECT's cost keeps
+		// compression attempts for over-RECORD_MAX rows (value_compress, cost.md §3) plus the
+		// RETURNING projection; storing the rows themselves stays unmetered. One meter keeps
 		// one ceiling over the whole statement.
-		meter := NewMeterWithLimit(db.maxCost)
 		meter.Charge(q.cost)
-		if err := db.insertRows(table, store, pk, checks, provided, q.rows, meter); err != nil {
+		returned, err := db.insertRows(table, store, pk, checks, provided, q.rows, retNodes, bound, meter)
+		if err != nil {
 			return Outcome{}, err
 		}
-		return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
+		return dmlOutcome(retNames, returned, meter.Accrued), nil
 	}
 
 	// VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
 	// types across every row (a $N reused under two columns unifies; spec/design/api.md §5), then
 	// bind the supplied values up front so a bad bind fails before any row is stored.
 	ptypes := &paramTypes{}
-	for _, values := range ins.Rows {
-		for i, col := range table.Columns {
-			if p := provided[i]; p >= 0 && p < len(values) {
-				if iv := values[p]; iv.IsParam {
-					ct := col.Type
-					if err := ptypes.note(int(iv.Param)-1, &ct); err != nil {
-						return Outcome{}, err
-					}
-				}
-			}
-		}
-	}
-	ptys, err := ptypes.finalize()
-	if err != nil {
-		return Outcome{}, err
-	}
-	bound, err := bindParams(params, ptys)
-	if err != nil {
-		return Outcome{}, err
-	}
-
-	// Materialize each row into its value-position-indexed candidates (length arity), checking
-	// arity (42601) and resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that
-	// column's default else NULL. The shared insertRows then builds the declaration-order row.
-	rows := make([][]Value, 0, len(ins.Rows))
 	for _, values := range ins.Rows {
 		if len(values) != arity {
 			expected := "columns are"
@@ -1224,6 +1232,41 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 				len(values), arity, expected, table.Name,
 			))
 		}
+		for i, col := range table.Columns {
+			if p := provided[i]; p >= 0 && p < len(values) {
+				if iv := values[p]; iv.IsParam {
+					ct := col.Type
+					if err := ptypes.note(int(iv.Param)-1, &ct); err != nil {
+						return Outcome{}, err
+					}
+				}
+			}
+		}
+	}
+	// Resolve the RETURNING projection after the source (PostgreSQL's analysis order) and
+	// before binding/execution — a 42703 here beats a would-be 23505 (grammar.md §32).
+	var retNodes []*rExpr
+	var retNames []string
+	if ins.Returning != nil {
+		var rerr error
+		if retNodes, retNames, rerr = db.resolveReturning(table, *ins.Returning, ptypes); rerr != nil {
+			return Outcome{}, rerr
+		}
+	}
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return Outcome{}, err
+	}
+	bound, err := bindParams(params, ptys)
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	// Materialize each row into its value-position-indexed candidates (length arity, checked
+	// above) resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that
+	// column's default else NULL. The shared insertRows then builds the declaration-order row.
+	rows := make([][]Value, 0, len(ins.Rows))
+	for _, values := range ins.Rows {
 		rv := make([]Value, arity)
 		for i, col := range table.Columns {
 			if p := provided[i]; p >= 0 {
@@ -1240,14 +1283,23 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		rows = append(rows, rv)
 	}
 	// INSERT ... VALUES reads no rows and evaluates no expression tree — its values are literals
-	// and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves. The only
-	// metered work is the disposition plan's compression attempts for over-RECORD_MAX rows
-	// (value_compress, cost.md §3); a fully-inline row still costs zero.
+	// and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves. The metered
+	// work is the disposition plan's compression attempts for over-RECORD_MAX rows
+	// (value_compress, cost.md §3) and the RETURNING projection (row_produced + item
+	// evaluation per stored row); a plain fully-inline insert still costs zero.
 	meter := NewMeterWithLimit(db.maxCost)
-	if err := db.insertRows(table, store, pk, checks, provided, rows, meter); err != nil {
+	// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
+	// pre-statement snapshot (grammar.md §32).
+	for _, node := range retNodes {
+		if err := db.foldUncorrelatedInRExpr(node, bound, &meter.Accrued); err != nil {
+			return Outcome{}, err
+		}
+	}
+	returned, err := db.insertRows(table, store, pk, checks, provided, rows, retNodes, bound, meter)
+	if err != nil {
 		return Outcome{}, err
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
+	return dmlOutcome(retNames, returned, meter.Accrued), nil
 }
 
 // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -1258,7 +1310,12 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 // seenKeys AND against the store) BEFORE any row is written; only once every row validates are
 // they all inserted (phase 2), allocating a fresh monotonic rowid in row order for a no-PK table.
 // All-or-nothing: a failure leaves the store untouched and burns no rowids.
-func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, provided []int, rows [][]Value, meter *Meter) error {
+//
+// returning is the resolved RETURNING projection (grammar.md §32), evaluated over the
+// validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
+// observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; params feeds
+// its $Ns. Returns the projected output rows, nil without a clause.
+func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, provided []int, rows [][]Value, returning []*rExpr, params []Value, meter *Meter) ([][]Value, error) {
 	n := len(table.Columns)
 	type preparedRow struct {
 		key []byte // nil for a no-PK table (rowid allocated in phase 2)
@@ -1290,7 +1347,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			}
 			v, err := storeValue(candidate, col.Type, col.Decimal, col.NotNull, col.Name)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			row[i] = v
 		}
@@ -1302,11 +1359,11 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		// expression work (operator_eval), so guard the ceiling per checked row.
 		if len(checks) > 0 {
 			if err := meter.Guard(); err != nil {
-				return err
+				return nil, err
 			}
 			env := &evalEnv{exec: db}
 			if err := evalChecks(checks, table.Name, row, env, meter); err != nil {
-				return err
+				return nil, err
 			}
 		}
 
@@ -1328,13 +1385,13 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			// The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
 			// `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
 			if _, dup := seenKeys[string(key)]; dup {
-				return NewError(UniqueViolation,
+				return nil, NewError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
 			if _, exists, err := store.Get(key); err != nil {
-				return err
+				return nil, err
 			} else if exists {
-				return NewError(UniqueViolation,
+				return nil, NewError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
 			seenKeys[string(key)] = struct{}{}
@@ -1352,10 +1409,10 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			istore := db.readSnap().indexStore(strings.ToLower(def.Name))
 			stored, err := istore.RangeEntries(uniqueProbeBound(prefix))
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if _, dup := seenPrefixes[u][string(prefix)]; dup || len(stored) > 0 {
-				return NewError(UniqueViolation,
+				return nil, NewError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+def.Name)
 			}
 			seenPrefixes[u][string(prefix)] = struct{}{}
@@ -1373,7 +1430,22 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 	// Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
 	meter.Charge(Costs.ValueCompress * cunits)
 	if err := meter.Guard(); err != nil {
-		return err
+		return nil, err
+	}
+
+	// The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the validated
+	// rows — every check has passed, nothing is written yet, so subqueries in the list read
+	// the pre-statement snapshot and a 54P01 here leaves the store untouched.
+	var returned [][]Value
+	if returning != nil {
+		prows := make([]Row, len(prepared))
+		for i := range prepared {
+			prows[i] = prepared[i].row
+		}
+		var err error
+		if returned, err = db.projectReturning(returning, prows, params, meter); err != nil {
+			return nil, err
+		}
 	}
 
 	// Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
@@ -1393,7 +1465,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		}
 		ok, err := store.Insert(key, pr.row)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !ok {
 			panic("pre-validated INSERT key must be unique")
@@ -1404,14 +1476,14 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		for _, ek := range indexInserts[k] {
 			inserted, err := istore.Insert(ek, nil)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if !inserted {
 				panic("index entry keys are unique (storage-key suffix)")
 			}
 		}
 	}
-	return nil
+	return returned, nil
 }
 
 // defaultOrNull is the column's stored default value, or a NULL value when it has none —
@@ -1423,6 +1495,58 @@ func defaultOrNull(col Column) Value {
 	return NullValue()
 }
 
+// resolveReturning resolves a RETURNING item list against the target table's one-relation
+// scope (grammar.md §32): aggregates are 42803 (the non-collecting aggCtx), subqueries
+// resolve (and may correlate against the returned row), output names follow §8. Returns the
+// projection nodes and names; the item types have no consumer.
+func (db *Database) resolveReturning(table *Table, items SelectItems, ptypes *paramTypes) ([]*rExpr, []string, error) {
+	s := singleScope(db, table)
+	nodes, names, _, err := resolveProjections(s, items, &aggCtx{collecting: false}, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nodes, names, nil
+}
+
+// projectReturning evaluates a resolved RETURNING projection over the affected rows
+// (grammar.md §32, cost.md §3): per returned row, guard the ceiling, charge one
+// row_produced, then evaluate each item — metered expression work, exactly a SELECT's
+// projection (a correlated subquery re-runs here, its outer reference reading the row being
+// returned). Callers run this after all validation and BEFORE any write.
+func (db *Database) projectReturning(nodes []*rExpr, rows []Row, params []Value, meter *Meter) ([][]Value, error) {
+	env := &evalEnv{exec: db, params: params}
+	out := make([][]Value, 0, len(rows))
+	for _, row := range rows {
+		if err := meter.Guard(); err != nil {
+			return nil, err
+		}
+		meter.Charge(Costs.RowProduced)
+		vals := make([]Value, 0, len(nodes))
+		for _, node := range nodes {
+			v, err := node.eval(row, env, meter)
+			if err != nil {
+				return nil, err
+			}
+			vals = append(vals, v)
+		}
+		out = append(out, vals)
+	}
+	return out, nil
+}
+
+// dmlOutcome wraps a DML statement's completion: a query result projecting the returned rows
+// when a RETURNING clause was resolved (retNames non-nil — grammar.md §32; zero affected
+// rows is an EMPTY query result, never a bare statement), else a bare statement result.
+func dmlOutcome(retNames []string, returned [][]Value, cost int64) Outcome {
+	if retNames != nil {
+		if returned == nil {
+			returned = [][]Value{}
+		}
+		return Outcome{Kind: OutcomeQuery, ColumnNames: retNames, Rows: returned, Cost: cost}
+	}
+	return Outcome{Kind: OutcomeStatement, Cost: cost}
+}
+
 // executeDelete analyzes and runs a DELETE: resolve the table and optional predicate,
 // collect the keys of matching rows (only a TRUE predicate matches — Kleene), then
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
@@ -1432,7 +1556,9 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
 	}
-	// DELETE is single-table; resolve its WHERE against a one-relation scope.
+	// DELETE is single-table; resolve its WHERE against a one-relation scope. The RETURNING
+	// projection resolves after it (PostgreSQL's analysis order), against the same scope
+	// (grammar.md §32).
 	s := singleScope(db, table)
 	ptypes := &paramTypes{}
 	var filter *rExpr
@@ -1442,6 +1568,14 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 		filter = f
+	}
+	var retNodes []*rExpr
+	var retNames []string
+	if del.Returning != nil {
+		var rerr error
+		if retNodes, retNames, rerr = db.resolveReturning(table, *del.Returning, ptypes); rerr != nil {
+			return Outcome{}, rerr
+		}
 	}
 	ptys, err := ptypes.finalize()
 	if err != nil {
@@ -1463,6 +1597,13 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 	}
+	// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
+	// pre-statement snapshot (grammar.md §32).
+	for _, node := range retNodes {
+		if err := db.foldUncorrelatedInRExpr(node, bound, &meter.Accrued); err != nil {
+			return Outcome{}, err
+		}
+	}
 	env := &evalEnv{exec: db, params: bound}
 	store := db.working().store(del.Table)
 	// matched collects (key, row) pairs before mutating; the rows feed phase 2's
@@ -1472,10 +1613,14 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		row Row
 	}
 	var matched []matchedRow
-	// DELETE's touched set (cost.md §3): only the filter's columns — dropping a row never reads
-	// its chains, so a bare DELETE charges no chain/decompress units at all.
+	// DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items' — a
+	// returned column's old value is a logical read of the dropped row. A bare DELETE still
+	// charges no chain/decompress units at all.
 	mask := make([]bool, len(table.Columns))
 	collectTouched(filter, 0, mask)
+	for _, node := range retNodes {
+		collectTouched(node, 0, mask)
+	}
 	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
 	// scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
@@ -1485,7 +1630,9 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
 		kb, empty := db.buildKeyBound(bp, bound, nil)
 		if empty {
-			return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
+			// A provably-empty bound affects zero rows — with RETURNING that is still a
+			// query result (empty rows), never a bare statement (grammar.md §32).
+			return dmlOutcome(retNames, nil, meter.Accrued), nil
 		}
 		if entries, err = store.RangeEntries(kb); err != nil {
 			return Outcome{}, err
@@ -1525,6 +1672,19 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 			matched = append(matched, matchedRow{key: e.Key, row: row})
 		}
 	}
+	// The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched rows'
+	// OLD values before anything is removed — subqueries in the list read the pre-statement
+	// snapshot, and a 54P01 here deletes nothing (all-or-nothing).
+	var returned [][]Value
+	if retNodes != nil {
+		prows := make([]Row, len(matched))
+		for i := range matched {
+			prows[i] = matched[i].row
+		}
+		if returned, err = db.projectReturning(retNodes, prows, bound, meter); err != nil {
+			return Outcome{}, err
+		}
+	}
 	// Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
 	// unmetered write work; an index removal cannot fail).
 	for _, m := range matched {
@@ -1540,7 +1700,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 			}
 		}
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
+	return dmlOutcome(retNames, returned, meter.Accrued), nil
 }
 
 // executeUpdate analyzes and runs an UPDATE. Two-phase / all-or-nothing: phase 1
@@ -1603,13 +1763,24 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		}
 		filter = f
 	}
+	// The RETURNING projection resolves last (PostgreSQL's analysis order), against the same
+	// one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
+	var retNodes []*rExpr
+	var retNames []string
+	if upd.Returning != nil {
+		var rerr error
+		if retNodes, retNames, rerr = db.resolveReturning(table, *upd.Returning, ptypes); rerr != nil {
+			return Outcome{}, rerr
+		}
+	}
 	// The CHECK constraints, resolved once per statement in evaluation (name) order;
 	// phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
 	checks, err := db.resolveChecks(table)
 	if err != nil {
 		return Outcome{}, err
 	}
-	// All assignment RHSs + the WHERE are resolved: finalize + bind before any scan.
+	// All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind before
+	// any scan.
 	ptys, err := ptypes.finalize()
 	if err != nil {
 		return Outcome{}, err
@@ -1637,6 +1808,11 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 	}
+	for _, node := range retNodes {
+		if err := db.foldUncorrelatedInRExpr(node, bound, &meter.Accrued); err != nil {
+			return Outcome{}, err
+		}
+	}
 	env := &evalEnv{exec: db, params: bound}
 	store := db.working().store(upd.Table)
 	// Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
@@ -1646,13 +1822,25 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		oldRow Row
 	}
 	var updates []pending
-	// UPDATE's touched set (cost.md §3): the filter's columns plus every assignment SOURCE's —
-	// the rewrite re-stores an untouched spilled value without logically re-reading it
-	// (large-values.md §14).
+	// UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's, and
+	// the RETURNING items' MINUS the assigned columns — an assigned column's returned value is
+	// the freshly computed one, not a storage read. The rewrite re-stores an untouched spilled
+	// value without logically re-reading it (large-values.md §14).
 	mask := make([]bool, len(table.Columns))
 	collectTouched(filter, 0, mask)
 	for i := range plans {
 		collectTouched(plans[i].source, 0, mask)
+	}
+	if retNodes != nil {
+		retMask := make([]bool, len(table.Columns))
+		for _, node := range retNodes {
+			collectTouched(node, 0, retMask)
+		}
+		for i, touched := range retMask {
+			if touched && !slices.ContainsFunc(plans, func(p assignPlan) bool { return p.idx == i }) {
+				mask[i] = true
+			}
+		}
 	}
 	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
 	// scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
@@ -1663,7 +1851,9 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
 		kb, empty := db.buildKeyBound(bp, bound, nil)
 		if empty {
-			return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
+			// A provably-empty bound affects zero rows — with RETURNING that is still a
+			// query result (empty rows), never a bare statement (grammar.md §32).
+			return dmlOutcome(retNames, nil, meter.Accrued), nil
 		}
 		if entries, err = store.RangeEntries(kb); err != nil {
 			return Outcome{}, err
@@ -1789,6 +1979,21 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		return Outcome{}, err
 	}
 
+	// The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched rows'
+	// NEW (post-assignment, fully resident) values — all validation has passed, nothing is
+	// written yet, so subqueries in the list read the pre-statement snapshot and a 54P01 here
+	// writes nothing (all-or-nothing).
+	var returned [][]Value
+	if retNodes != nil {
+		prows := make([]Row, len(updates))
+		for i := range updates {
+			prows[i] = updates[i].row
+		}
+		if returned, err = db.projectReturning(retNodes, prows, bound, meter); err != nil {
+			return Outcome{}, err
+		}
+	}
+
 	// Index maintenance (indexes.md §4): an entry moves only when its key CHANGED — equal
 	// old/new keys leave the index tree untouched (part of the contract: it keeps the
 	// copy-on-write dirty set, and so the commit's written pages, byte-identical across
@@ -1828,7 +2033,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			}
 		}
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
+	return dmlOutcome(retNames, returned, meter.Accrued), nil
 }
 
 // RowsInKeyOrder returns a table's rows in primary-key (encoded byte) order in the visible snapshot,

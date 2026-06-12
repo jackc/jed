@@ -41,6 +41,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Row mutation: UPDATE (in-place) + DELETE.
   "dml.update",
   "dml.delete",
+  // The RETURNING clause on INSERT/UPDATE/DELETE — the statement becomes a query result
+  // projecting each affected row (grammar.md §32, cost.md §3).
+  "dml.returning",
   // SELECT, WHERE (=, ordering), ORDER BY, IS [NOT] NULL, 3VL, casts, cross-type
   // comparison via the promotion tower, and all three integer types.
   "query.select",

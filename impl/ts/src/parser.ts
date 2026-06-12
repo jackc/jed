@@ -65,6 +65,10 @@ function isTableRefStopKeyword(kw: string): boolean {
     case "union":
     case "intersect":
     case "except":
+    // RETURNING ends an INSERT ... SELECT source — it must not be swallowed as the source's
+    // implicit table alias (`... SELECT v FROM t RETURNING v` is the INSERT's clause). §32;
+    // PostgreSQL fully reserves the word.
+    case "returning":
       return true;
     default:
       return false;
@@ -463,7 +467,8 @@ class Parser {
     // `SELECT` are disjoint leading keywords, so a peek decides without lookahead.
     if (this.peekKeyword() === "select") {
       const select = this.parseSelect();
-      return { kind: "insert", table, columns, source: { kind: "select", select } };
+      const returning = this.parseReturning();
+      return { kind: "insert", table, columns, source: { kind: "select", select }, returning };
     }
 
     this.expectKeyword("values");
@@ -477,7 +482,8 @@ class Parser {
       }
       break;
     }
-    return { kind: "insert", table, columns, source: { kind: "values", rows } };
+    const returning = this.parseReturning();
+    return { kind: "insert", table, columns, source: { kind: "values", rows }, returning };
   }
 
   // parseInsertRow parses one parenthesized `( <value> [, <value>]* )` row.
@@ -896,7 +902,8 @@ class Parser {
     }
 
     const filter = this.parseOptionalWhere();
-    return { kind: "update", table, assignments, filter };
+    const returning = this.parseReturning();
+    return { kind: "update", table, assignments, filter, returning };
   }
 
   // parseDelete parses `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes all rows.
@@ -905,7 +912,8 @@ class Parser {
     this.expectKeyword("from");
     const table = this.expectIdentifier();
     const filter = this.parseOptionalWhere();
-    return { kind: "delete", table, filter };
+    const returning = this.parseReturning();
+    return { kind: "delete", table, filter, returning };
   }
 
   // parseOptionalWhere parses an optional trailing `WHERE <expr>` (shared by
@@ -915,6 +923,18 @@ class Parser {
     if (this.peekKeyword() !== "where") return null;
     this.advance();
     return this.parseExpr();
+  }
+
+  // parseReturning parses an optional terminal `RETURNING <select_items>` clause (shared by
+  // INSERT/UPDATE/DELETE — spec/design/grammar.md §32). RETURNING is not reserved (§3): it is
+  // a clause only in this trailing position (and it joins the table_ref implicit-alias stop
+  // set, so an `INSERT ... SELECT` source never swallows it — §15). The item list is the
+  // ordinary select-items production (`*` or expressions with optional AS labels); an empty
+  // list fails in parseExpr (42601).
+  private parseReturning(): SelectItems | null {
+    if (this.peekKeyword() !== "returning") return null;
+    this.advance(); // RETURNING
+    return this.parseSelectItems();
   }
 
   private parseSelectItems(): SelectItems {

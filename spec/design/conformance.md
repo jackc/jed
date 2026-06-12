@@ -176,7 +176,12 @@ Every corpus entry MUST obey:
   reference-provisioning gate, and it is **psql-only** (no `pg` gem — no §14 dependency). It is
   an authoring aid + a standing drift check, **not** a query generator (that is the metamorphic
   generator, §8). It cannot derive `# cost:` (PG has no notion of jed's cost units), so cost
-  assertions stay hand-authored.
+  assertions stay hand-authored. Each record replays the file's prior **state-changing**
+  records as its prefix: every `statement ok`, plus every **row-returning DML** `query`
+  record (`INSERT`/`UPDATE`/`DELETE ... RETURNING` — grammar.md §32; a `SELECT` query
+  record is side-effect-free and is not replayed). So a record that *fails* on PG while jed
+  runs it (a documented divergence) must sit **LAST** in its file, or it poisons the replay
+  prefix of everything after it.
 - **Intentional divergences are a machine-checked ledger.** PostgreSQL is the *default*, not a
   compatibility target (CLAUDE.md §1): where jed deliberately differs — the strict type system,
   a documented narrowing — the divergence is recorded in
