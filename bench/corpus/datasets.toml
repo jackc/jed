@@ -1,0 +1,88 @@
+# Benchmark dataset spec — consumed by bench-setup (generation) and every harness
+# (fingerprint check). spec/design/benchmarks.md §4/§5. The sha256 of THIS FILE's bytes is
+# the staleness fingerprint: any edit (including generator_version) invalidates the
+# generated databases and harnesses refuse to run until `rake bench:setup` regenerates.
+
+schema_version = 1
+
+# Bump whenever bench-setup's generation BEHAVIOR changes (row order, PRNG use, DDL
+# derivation) even if the shapes below do not.
+generator_version = 1
+
+[[dataset]]
+name = "small"
+
+[[dataset.table]]
+name = "orders"
+rows = 10000
+seed = 101
+
+[[dataset.table.column]]
+name = "id"
+type = "int64"
+gen = "serial"
+primary_key = true
+
+[[dataset.table.column]]
+name = "customer_id"
+type = "int32"
+gen = "int_uniform"
+min = 1
+max = 1000
+
+[[dataset.table.column]]
+name = "amount"
+type = "int32"
+gen = "int_uniform"
+min = 0
+max = 99999
+
+[[dataset.table.column]]
+name = "note"
+type = "text"
+gen = "text"
+min_len = 8
+max_len = 32
+
+[[dataset.table.index]]
+name = "orders_customer_idx"
+columns = ["customer_id"]
+
+[[dataset]]
+name = "large"
+
+[[dataset.table]]
+name = "orders"
+rows = 1000000
+seed = 201
+
+[[dataset.table.column]]
+name = "id"
+type = "int64"
+gen = "serial"
+primary_key = true
+
+[[dataset.table.column]]
+name = "customer_id"
+type = "int32"
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[dataset.table.column]]
+name = "amount"
+type = "int32"
+gen = "int_uniform"
+min = 0
+max = 99999
+
+[[dataset.table.column]]
+name = "note"
+type = "text"
+gen = "text"
+min_len = 8
+max_len = 32
+
+[[dataset.table.index]]
+name = "orders_customer_idx"
+columns = ["customer_id"]

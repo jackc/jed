@@ -1031,6 +1031,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       point-lookup + range pushdown, `LIMIT` short-circuit, JOIN base-table pk pushdown, and
       correlated-subquery pushdown today; future index/DISTINCT/aggregate pushdown (and any later
       optimization) are **not yet** covered.
+- [ ] **Benchmark backfill** — grow `bench/corpus` beyond the v1 set
+      (spec/design/benchmarks.md §11; built: cross-core + cross-engine wall-clock harness,
+      `rake bench:setup/run/report`, six benchmarks over 10k/1M-row datasets): a join benchmark
+      (needs a second dataset table → `generator_version` bump), GROUP BY aggregate,
+      UPDATE/DELETE throughput, miss-heavy point lookups, text/large-value-heavy rows (the
+      overflow + LZ4 path), `SharedDb` concurrent-reader throughput (once file-backed),
+      cold-open time, durable-commit batch-size sweep. **Standing obligation** (CLAUDE.md §10):
+      a perf-relevant feature lands with a benchmark; a perf-sensitive change runs the affected
+      benchmarks before/after and reports both numbers. _(size: M, ongoing; §10)_
 
 ---
 

@@ -1,0 +1,28 @@
+# Benchmark harness package (spec/design/benchmarks.md §7) — a SEPARATE package from the
+# engine core: impl/rust/Cargo.toml stays dependency-free. The drivers below are
+# harness-only deps (CLAUDE.md §14): postgres + rusqlite are the comparison engines,
+# toml parses the shared corpus, sha2 computes the dataset fingerprint (already in the
+# tree transitively via postgres's SCRAM auth).
+[package]
+name = "jed-bench"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+jed = { path = "../../impl/rust" }
+postgres = "0.19"
+rusqlite = { version = "0.38", features = ["bundled"] }
+toml = "0.9"
+sha2 = "0.10"
+
+[[bin]]
+name = "bench-jed"
+path = "src/bin/bench_jed.rs"
+
+[[bin]]
+name = "bench-pg"
+path = "src/bin/bench_pg.rs"
+
+[[bin]]
+name = "bench-sqlite"
+path = "src/bin/bench_sqlite.rs"

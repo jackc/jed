@@ -1,0 +1,112 @@
+# Benchmark definitions — one entry per benchmark, shared by every harness binary.
+# spec/design/benchmarks.md §3. SQL uses $N placeholders (SQLite harnesses rewrite to ?N);
+# multi-row queries MUST carry a total-order ORDER BY (explicit id tie-break) so the
+# cross-engine answer checksum is deterministic.
+
+schema_version = 1
+
+[[bench]]
+name = "point_lookup_pk"
+description = "PK point lookup on 1M rows; a B-tree seek in every engine"
+dataset = "large"
+kind = "query"
+sql = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
+warmup = 2000
+iterations = 50000
+seed = 4201
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench]]
+name = "secondary_lookup"
+description = "Secondary-index equality lookup on 1M rows (~10 rows per customer)"
+dataset = "large"
+kind = "query"
+sql = "SELECT id, amount FROM orders WHERE customer_id = $1 ORDER BY id"
+warmup = 2000
+iterations = 20000
+seed = 4202
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench]]
+name = "full_scan_agg"
+description = "Full-table aggregate over 1M rows (count + sum)"
+dataset = "large"
+kind = "query"
+sql = "SELECT count(*), sum(amount) FROM orders"
+warmup = 3
+iterations = 20
+seed = 4203
+expect_rows_per_iter = 1
+
+[[bench]]
+name = "order_by_limit"
+description = "Top-100 by non-indexed column over 1M rows (full sort or top-k)"
+dataset = "large"
+kind = "query"
+sql = "SELECT id, amount FROM orders ORDER BY amount DESC, id ASC LIMIT 100"
+warmup = 2
+iterations = 10
+seed = 4204
+expect_rows_per_iter = 100
+
+[[bench]]
+name = "insert_rollback"
+description = "Insert throughput: 1000 bound inserts per transaction, rolled back"
+dataset = "small"
+kind = "write_rollback"
+sql = "INSERT INTO orders (id, customer_id, amount, note) VALUES ($1, $2, $3, $4)"
+warmup = 3
+iterations = 30
+seed = 4205
+batch = 1000
+
+[[bench.param]]
+gen = "serial"
+start = 20000001
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 99999
+
+[[bench.param]]
+gen = "text"
+min_len = 8
+max_len = 32
+
+[[bench]]
+name = "insert_commit_durable"
+description = "Durable single-row commits: one INSERT per commit, full fsync path"
+dataset = "scratch"
+kind = "write_durable"
+sql = "INSERT INTO scratch (id, v) VALUES ($1, $2)"
+warmup = 10
+iterations = 300
+seed = 4206
+setup_sql = ["CREATE TABLE scratch (id bigint PRIMARY KEY, v integer)"]
+
+[bench.setup_sql_override]
+sqlite = ["CREATE TABLE scratch (id INTEGER PRIMARY KEY, v INTEGER)"]
+
+[[bench.param]]
+gen = "serial"
+start = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 99999

@@ -414,6 +414,14 @@ The design is optimized for AI agents even more than for humans. In practice:
   harness compares `rowsort`), so a query need not be force-ordered just to be testable — but
   everything *else* stays bit-reproducible, which is what the agent loop and cross-impl sync
   depend on.
+- **Benchmarks are wall-clock, never conformance.** `bench/` (`rake bench:setup/run/report`,
+  [spec/design/benchmarks.md](spec/design/benchmarks.md)) compares the three cores against
+  PostgreSQL and SQLite. Deliberately **outside `rake ci`** and the conformance contract
+  (wall-clock is nondeterministic) — but answers are still checked: every result carries a
+  cross-engine checksum and the report fails on any disagreement. When a perf-relevant
+  feature lands, **add a benchmark** for it (the same growth obligation as NoREC relations);
+  before/after a perf-sensitive change, **run the affected benchmarks** and report both
+  numbers in the change description.
 - **Structured errors**, not free text — so failures are machine-legible and
   `statement error` matching is stable.
 - **Boring, explicit code over clever abstraction.** In Rust, resist deep generics and
@@ -585,6 +593,12 @@ reinventing it N times.
 3. **Cryptography.** We do **not** roll our own crypto. Encryption/hashing primitives (the
    §9 encryption-at-rest door) come from a vetted, well-reviewed library, never a
    hand-written algorithm.
+
+The `bench/` harness modules (`bench/go`, `bench/rust`, `bench/ts`) are **not engine
+cores**: each is a separate module whose dependencies (PG/SQLite drivers, TOML parsers —
+[spec/design/benchmarks.md](spec/design/benchmarks.md) §7) never touch a core's manifest.
+The pure-Go no-cgo rule binds the Go *core*; the `bench-sqlite-cgo` baseline uses cgo
+inside the bench module only. New bench dependencies still require explicit confirmation.
 
 **Always get explicit human confirmation before adding any dependency.** A dependency is a
 standing maintenance and supply-chain commitment across every core; it is **never** added on

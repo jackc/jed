@@ -255,6 +255,57 @@ namespace :cli do
   end
 end
 
+# bench — the wall-clock benchmark subsystem (spec/design/benchmarks.md). Deliberately NOT part
+# of `rake ci`: timings are environment-relative and nondeterministic. Answers are still checked —
+# every result carries a cross-engine checksum and bench:report fails on any disagreement.
+namespace :bench do
+  BENCH_GO_BINS = %w[bench-jed bench-pg bench-sqlite bench-sqlite-cgo].freeze
+  BENCH_RUST_BINS = %w[bench-jed bench-pg bench-sqlite].freeze
+  BENCH_TS_BINS = %w[bench-jed bench-pg bench-sqlite].freeze
+
+  desc "Build all benchmark binaries (Go + Rust release; TS installs deps if absent)"
+  task :build do
+    # Every Go binary except the cgo SQLite baseline builds with CGO_ENABLED=0, proving the
+    # cgo surface stays confined to bench-sqlite-cgo (benchmarks.md §7).
+    pure = (%w[bench-setup] + BENCH_GO_BINS - %w[bench-sqlite-cgo]).map { |b| "./cmd/#{b}" }
+    sh({ "CGO_ENABLED" => "0" }, "go", "build", "-o", "bin/", *pure, chdir: "bench/go")
+    sh({ "CGO_ENABLED" => "1" }, "go", "build", "-o", "bin/", "./cmd/bench-sqlite-cgo", chdir: "bench/go")
+    sh "cargo", "build", "--release", "--quiet", "--manifest-path", "bench/rust/Cargo.toml"
+    sh "npm", "ci", "--silent", "--prefix", "bench/ts" unless File.directory?("bench/ts/node_modules")
+  end
+
+  desc "Generate/refresh the benchmark databases (fingerprint-gated; [force] to override)"
+  task :setup, [:force] do |_, args|
+    sh({ "CGO_ENABLED" => "0" }, "go", "build", "-o", "bin/", "./cmd/bench-setup", chdir: "bench/go")
+    cmd = %w[bench/go/bin/bench-setup bench/corpus bench/data]
+    cmd << "--force" if args[:force]
+    sh(*cmd)
+  end
+
+  desc "Run every benchmark binary sequentially; results to bench/results/<stamp>/ + report"
+  task :run, [:filter] => :build do |_, args|
+    stamp = Time.now.utc.strftime("%Y%m%d-%H%M%S")
+    dir = File.join("bench/results", stamp)
+    FileUtils.mkdir_p(dir)
+    filter = args[:filter] ? [args[:filter]] : []
+    BENCH_GO_BINS.each do |bin|
+      sh "bench/go/bin/#{bin}", "bench/corpus", "bench/data", File.join(dir, "go-#{bin}.jsonl"), *filter
+    end
+    BENCH_RUST_BINS.each do |bin|
+      sh "bench/rust/target/release/#{bin}", "bench/corpus", "bench/data", File.join(dir, "rust-#{bin}.jsonl"), *filter
+    end
+    BENCH_TS_BINS.each do |bin|
+      sh "node", "bench/ts/src/#{bin}.ts", "bench/corpus", "bench/data", File.join(dir, "ts-#{bin}.jsonl"), *filter
+    end
+    Rake::Task["bench:report"].invoke(dir)
+  end
+
+  desc "Aggregate a results dir into a comparison table (default: newest)"
+  task :report, [:dir] do |_, args|
+    sh RbConfig.ruby, "scripts/bench_report.rb", *(args[:dir] ? [args[:dir]] : [])
+  end
+end
+
 # ci — the aggregate gate. Chains the toolchain-light spec checks, the formatter gate, the
 # CLI's tests, and the metamorphic sweep, so one command reproduces what CI enforces. Each
 # is `sh`/task-failure propagating, so `rake ci` exits non-zero on the first failure.
