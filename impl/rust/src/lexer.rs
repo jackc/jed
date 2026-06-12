@@ -40,12 +40,45 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             b'-' => {
-                tokens.push(Token::Minus);
-                i += 1;
+                // `--` starts a line comment running to the end of the line; comments are
+                // whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
+                // string, even abutting a token (`1--2` is `1` — PG behavior).
+                if bytes.get(i + 1) == Some(&b'-') {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                        i += 1;
+                    }
+                } else {
+                    tokens.push(Token::Minus);
+                    i += 1;
+                }
             }
             b'/' => {
-                tokens.push(Token::Slash);
-                i += 1;
+                // `/*` starts a block comment; blocks NEST (PG / the SQL standard), so a depth
+                // counter tracks open/close pairs. End of input at depth >= 1 is 42601
+                // (grammar.md §33). A `*/` with no opener is NOT comment syntax — it lexes as
+                // `*` `/` and fails at parse.
+                if bytes.get(i + 1) == Some(&b'*') {
+                    i += 2;
+                    let mut depth = 1;
+                    while depth > 0 {
+                        if i + 1 >= bytes.len() {
+                            return Err(syntax("unterminated /* comment".to_string()));
+                        }
+                        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            i += 2;
+                        } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                } else {
+                    tokens.push(Token::Slash);
+                    i += 1;
+                }
             }
             b'%' => {
                 tokens.push(Token::Percent);

@@ -44,11 +44,44 @@ export function lex(sql: string): Token[] {
       tokens.push({ kind: "plus" });
       i++;
     } else if (c === "-") {
-      tokens.push({ kind: "minus" });
-      i++;
+      // `--` starts a line comment running to the end of the line; comments are
+      // whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
+      // string, even abutting a token (`1--2` is `1` — PG behavior).
+      if (i + 1 < n && sql[i + 1] === "-") {
+        i += 2;
+        while (i < n && sql[i] !== "\n" && sql[i] !== "\r") {
+          i++;
+        }
+      } else {
+        tokens.push({ kind: "minus" });
+        i++;
+      }
     } else if (c === "/") {
-      tokens.push({ kind: "slash" });
-      i++;
+      // `/*` starts a block comment; blocks NEST (PG / the SQL standard), so a depth
+      // counter tracks open/close pairs. End of input at depth >= 1 is 42601
+      // (grammar.md §33). A `*/` with no opener is NOT comment syntax — it lexes as
+      // `*` `/` and fails at parse.
+      if (i + 1 < n && sql[i + 1] === "*") {
+        i += 2;
+        let depth = 1;
+        while (depth > 0) {
+          if (i + 1 >= n) {
+            throw engineError("syntax_error", "unterminated /* comment");
+          }
+          if (sql[i] === "/" && sql[i + 1] === "*") {
+            depth++;
+            i += 2;
+          } else if (sql[i] === "*" && sql[i + 1] === "/") {
+            depth--;
+            i += 2;
+          } else {
+            i++;
+          }
+        }
+      } else {
+        tokens.push({ kind: "slash" });
+        i++;
+      }
     } else if (c === "%") {
       tokens.push({ kind: "percent" });
       i++;

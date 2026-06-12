@@ -130,3 +130,13 @@ reason = "Follows the constraint-drop divergence: jed dropped m's UNIQUE so the 
 file = "dml/returning.test"
 sql = "INSERT INTO t (id) SELECT a + 100 FROM src AS returning RETURNING id"
 reason = "jed keeps every word non-reserved (grammar.md §3): an explicit `AS returning` source alias parses, with the RETURNING clause after it. PostgreSQL fully reserves RETURNING and rejects this (42601). Sits LAST in the file — the rows insert only in jed."
+
+[[override]]
+file = "query/comments.test"
+sql = "-- nothing but a comment"
+reason = "jed: comment-only input is 'no statement' (42601) — exactly one statement is parsed per input (grammar.md §1/§33). PG answers an empty query with an empty-query response, not an error."
+
+[[override]]
+file = "query/comments.test"
+sql = "SELECT v */ 1 FROM t"
+reason = "jed: a stray `*/` lexes as the two operator tokens `*` `/` and fails at parse (42601). PG's lexer builds multi-character operator names, so `*/` becomes an undefined operator (42883). Both reject; the code differs because jed has no multi-char operator lexing (grammar.md §33)."

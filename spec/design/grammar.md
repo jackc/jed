@@ -1382,3 +1382,33 @@ every other statement's scope. Cost: the qualifiers are leaves like any column, 
 **Cost.** Each returned row charges `row_produced` plus its items' metered evaluation,
 and the items' column references join an UPDATE/DELETE's touched set —
 [cost.md](cost.md) §3 "`RETURNING`".
+
+## 33. Comments are whitespace
+
+The lexer treats SQL comments as whitespace, exactly as PostgreSQL does. Two forms
+([grammar.ebnf](../grammar/grammar.ebnf) conventions block):
+
+- **Line comments.** Two hyphens (`--`) start a comment running to the end of the line
+  (the next LF or CR, or end of input). The two hyphens **always** start a comment
+  outside a string literal, even when abutting a token: `1--2` lexes as the single
+  integer `1` (PostgreSQL behavior). `1- -2` (with the operators separated) remains
+  `1 - (-2)`.
+- **Block comments.** A slash-star opens a block comment and a star-slash closes it;
+  blocks **nest**, per PostgreSQL and the SQL standard, so the lexer tracks a depth
+  counter and the comment ends only when the depth returns to zero. A block comment is
+  not scanned for string quotes (an apostrophe inside one is ordinary comment text).
+  An **unterminated** block comment — end of input at depth ≥ 1 — is a `42601` syntax
+  error (`unterminated /* comment`).
+
+Comment openers inside a `'...'` string literal are ordinary text (`'--x /*y*/'` is just
+characters). A stray star-slash with **no** opener is *not* comment syntax — it lexes as
+the two operator tokens `*` `/` and fails at parse (`42601`), matching the spirit of
+PostgreSQL's rejection.
+
+Because a comment is whitespace, it is also a **token separator**: `SELECT/*c*/v` lexes
+as `SELECT v`. Comments carry no semantic content anywhere in the engine — they do not
+survive into the AST, and constructs that persist re-rendered statement text (the CHECK
+catalog, §29) never see them (rendering works from tokens).
+
+An input that is *only* comments (or empty after comment stripping) is still "no
+statement" and parses as `42601` — the one-statement-per-input rule (§1) is unchanged.

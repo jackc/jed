@@ -39,11 +39,45 @@ func Lex(sql string) ([]Token, error) {
 			tokens = append(tokens, Token{Kind: TokPlus})
 			i++
 		case c == '-':
-			tokens = append(tokens, Token{Kind: TokMinus})
-			i++
+			// `--` starts a line comment running to the end of the line; comments are
+			// whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
+			// string, even abutting a token (`1--2` is `1` — PG behavior).
+			if i+1 < len(b) && b[i+1] == '-' {
+				i += 2
+				for i < len(b) && b[i] != '\n' && b[i] != '\r' {
+					i++
+				}
+			} else {
+				tokens = append(tokens, Token{Kind: TokMinus})
+				i++
+			}
 		case c == '/':
-			tokens = append(tokens, Token{Kind: TokSlash})
-			i++
+			// `/*` starts a block comment; blocks NEST (PG / the SQL standard), so a depth
+			// counter tracks open/close pairs. End of input at depth >= 1 is 42601
+			// (grammar.md §33). A `*/` with no opener is NOT comment syntax — it lexes as
+			// `*` `/` and fails at parse.
+			if i+1 < len(b) && b[i+1] == '*' {
+				i += 2
+				depth := 1
+				for depth > 0 {
+					if i+1 >= len(b) {
+						return nil, NewError(SyntaxError, "unterminated /* comment")
+					}
+					switch {
+					case b[i] == '/' && b[i+1] == '*':
+						depth++
+						i += 2
+					case b[i] == '*' && b[i+1] == '/':
+						depth--
+						i += 2
+					default:
+						i++
+					}
+				}
+			} else {
+				tokens = append(tokens, Token{Kind: TokSlash})
+				i++
+			}
 		case c == '%':
 			tokens = append(tokens, Token{Kind: TokPercent})
 			i++

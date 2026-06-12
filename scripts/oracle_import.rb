@@ -150,7 +150,12 @@ class OracleImport
     out, err, = Open3.capture3(*args, stdin_data: script)
     s = out.lines.index { |l| l.chomp == "@@@S" }
     e = out.lines.index { |l| l.chomp == "@@@E" }
-    raise "psql sentinels missing for #{@path}:\n#{out}#{err}" unless s && e
+    # A missing @@@S means psql / the connection itself failed. A missing @@@E with @@@S
+    # present is the BODY's doing — an unterminated string or `/*` comment swallows the
+    # trailing `\echo` (psql accumulates it as literal text and flushes the open buffer at
+    # EOF, so PG still reports the body's error on stderr — grammar.md §33). Return the
+    # truncated window; the error-probing caller only needs stderr.
+    raise "psql sentinels missing for #{@path}:\n#{out}#{err}" unless s
 
     [out.lines[(s + 1)...e], err]
   end

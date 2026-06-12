@@ -1,0 +1,86 @@
+# SQL comments are lexer whitespace (spec/design/grammar.md §33; grammar.ebnf conventions):
+# `--` starts a line comment running to the end of the line and ALWAYS starts one outside a
+# string literal, even abutting a token (`v--1` is `v`, NOT `v - (-1)` — PG behavior);
+# `/* */` block comments NEST per PG / the SQL standard; comment openers inside a '...'
+# string are ordinary text; an unterminated block comment is 42601. Comments are token
+# separators and never survive into the AST.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.point_lookup, expr.arithmetic, expr.unary_minus, types.int32, types.text
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, v int32, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, '--x /*y*/')
+
+# A trailing line comment runs to the end of the line; the statement continues below it.
+query I nosort
+SELECT v -- trailing comment
+FROM t WHERE id = 1
+----
+10
+
+# A leading comment line is whitespace before the statement.
+query I nosort
+-- leading comment
+SELECT v FROM t WHERE id = 1
+----
+10
+
+# Two hyphens start a comment even abutting a token: `v--1` is `v` then a comment (PG).
+query I nosort
+SELECT v--1
+FROM t WHERE id = 1
+----
+10
+
+# With the operators separated, `v - -1` is double negation, not a comment.
+query I nosort
+SELECT v - -1 FROM t WHERE id = 1
+----
+11
+
+# A block comment is a token separator: `SELECT/*c*/v` lexes as `SELECT v`.
+query I nosort
+SELECT/*c*/v/*c*/FROM t WHERE id = 1
+----
+10
+
+# Block comments NEST: the comment ends only when the depth returns to zero.
+query I nosort
+SELECT /* outer /* inner */ still comment */ v FROM t WHERE id = 1
+----
+10
+
+# A quote inside a block comment is ordinary comment text, never a string opener.
+query I nosort
+SELECT /* it's fine */ v FROM t WHERE id = 1
+----
+10
+
+# Comment openers inside a string literal are ordinary characters.
+query T nosort
+SELECT s FROM t WHERE id = 1
+----
+--x /*y*/
+
+# An unterminated block comment is a syntax error.
+statement error 42601
+SELECT v FROM t WHERE id = 1 /* unterminated
+
+# Still open at depth 1: the inner block closed, the outer never did.
+statement error 42601
+SELECT v FROM t WHERE id = 1 /* outer /* inner */ still open
+
+# The close cannot overlap the open: `/*/` opens a comment and leaves it unterminated.
+statement error 42601
+SELECT v FROM t WHERE id = 1 /*/
+
+# A stray `*/` with no opener is NOT comment syntax — it lexes as `*` `/` and fails at parse.
+statement error 42601
+SELECT v */ 1 FROM t
+
+# Comment-only input is "no statement": the one-statement-per-input rule (grammar.md §1)
+# is unchanged. Deliberate PG divergence (ledgered): PG answers an empty query with an
+# empty-query response, not an error.
+statement error 42601
+-- nothing but a comment

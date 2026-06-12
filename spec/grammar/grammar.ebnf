@@ -28,7 +28,13 @@
  *   - Keyword terminals match case-insensitively (SELECT = select = SeLeCt).
  *     Punctuation terminals match literally.
  *   - Whitespace (space, tab, CR, LF) separates tokens and is otherwise
- *     insignificant. There is NO comment syntax in the SQL input itself.
+ *     insignificant. SQL comments are whitespace (../design/grammar.md §33):
+ *     two hyphens start a line comment running to the end of the line, and a
+ *     slash-star ... star-slash block comment NESTS (PostgreSQL / the SQL
+ *     standard). Two hyphens ALWAYS start a comment outside a string literal,
+ *     even abutting a token (`1--2` lexes as `1`). Comment openers inside a
+ *     string literal are ordinary text. An unterminated block comment is a
+ *     42601 syntax error.
  *   - Exactly one statement is parsed per input; there is no statement
  *     terminator (no ';').
  * ===========================================================================
