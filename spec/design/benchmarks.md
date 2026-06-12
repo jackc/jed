@@ -319,16 +319,45 @@ model but not jed's or SQLite's.
 ```
 rake bench:setup        # build + run bench-setup (fingerprint-gated; [force] to override)
 rake bench:run          # build all binaries, run them sequentially, results to
-                        #   bench/results/<UTC-stamp>/, then report
+                        #   bench/results/<UTC-stamp>/, then report + HTML
 rake "bench:run[point_lookup]"   # substring filter, passed through to every binary
 rake bench:report       # re-aggregate the newest (or a given) results dir
+rake bench:html         # static HTML report for the newest (or a given) run dir,
+                        #   diffed against the previous run by default
+rake bench:markdown     # the same report as Markdown, to stdout + <dir>/report.md
+rake "bench:diff[a,b]"  # machine-readable JSONL diff of two runs (default: newest
+                        #   vs previous)
 ```
 
-`scripts/bench_report.rb` groups results by `(bench, dataset)` and prints a fixed-width
-matrix of `ns_per_op` (humanized ns/µs/ms) with one column per `engine/lang/variant`;
-`-v` adds min/p50. It **exits 1** if any two results in the run disagree on `checksum`
-(wrong answer somewhere — treat it like a failing conformance test) or on `fingerprint`
-(mixed-vintage data).
+Three reporters share one loader/verifier (`scripts/bench_results.rb`); each **exits 1**
+if any two results in a run disagree on `checksum` (wrong answer somewhere — treat it
+like a failing conformance test) or on `fingerprint` (mixed-vintage data):
+
+- `scripts/bench_report.rb` — the terminal matrix: groups results by `(bench, dataset)`
+  and prints fixed-width `ns_per_op` (humanized ns/µs/ms) with one column per
+  `engine/lang/variant`; `-v` adds min/p50.
+- `scripts/bench_html.rb [run] [baseline] [--no-baseline]` — writes a self-contained
+  `<run_dir>/report.html` (stdlib ERB, inline CSS, zero JS): per-benchmark bar charts
+  sorted fastest-first, multipliers vs the fastest, min/p50 tooltips, and — against the
+  baseline run (default: the one before it) — per-pair Δ% colored with a 5% noise floor.
+  On verification failure the page is still written, failures in a red banner. A
+  baseline with a *different* fingerprint is a warning in the page (the runs measured
+  different data), not a failure.
+- `scripts/bench_markdown.rb [run] [baseline] [--no-baseline]` — the same report (the
+  two renderers share `BenchResults.report_model`, so they cannot drift) as Markdown:
+  printed to stdout for reading at the terminal and written to `<run_dir>/report.md`
+  for the VS Code markdown preview. GFM tables with block-character bars; cells are
+  space-padded so the raw text aligns at the terminal. Same defaults, failure handling,
+  and fingerprint warning as the HTML report.
+- `scripts/bench_diff.rb [run] [baseline] [--json] [--fail-over=PCT]` — the machine
+  surface (built for tooling and AI agents; this is the one-command form of the
+  CLAUDE.md §10 before/after obligation). Emits JSONL: one object per joined
+  `(bench, dataset, engine, lang, variant)` with `before_ns_per_op`/`after_ns_per_op`/
+  `delta_pct`/`checksum_match`, with `before_only`/`after_only` flags making
+  partial/filtered runs explicit, plus a trailing `{"summary":…}` line (fingerprints,
+  improved/regressed/noise counts at the same 5% floor). `--json` emits one pretty
+  document instead; `--fail-over=PCT` exits 2 if any matched pair regressed by more
+  than PCT% — an operator-side regression gate, never part of `rake ci`.
 
 `rake ci` does **not** run benchmarks, and never will (§1).
 

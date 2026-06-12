@@ -6,8 +6,11 @@ and SQLite on a shared, language-neutral benchmark corpus. **Canonical design:
 
 ```
 rake bench:setup     # generate benchmark databases (once; fingerprint-gated)
-rake bench:run       # run every harness binary, then print the comparison table
+rake bench:run       # run every harness binary, then print the comparison table + HTML
 rake bench:report    # re-print the newest results
+rake bench:html      # static HTML report (bars, multipliers, Δ vs the previous run)
+rake bench:markdown  # the same report as Markdown (terminal / VS Code preview)
+rake bench:diff      # machine-readable JSONL diff of two runs (newest vs previous)
 ```
 
 - `corpus/` — the shared benchmark + dataset definitions (TOML).

@@ -298,11 +298,27 @@ namespace :bench do
       sh "node", "bench/ts/src/#{bin}.ts", "bench/corpus", "bench/data", File.join(dir, "ts-#{bin}.jsonl"), *filter
     end
     Rake::Task["bench:report"].invoke(dir)
+    Rake::Task["bench:html"].invoke(dir)
   end
 
   desc "Aggregate a results dir into a comparison table (default: newest)"
   task :report, [:dir] do |_, args|
     sh RbConfig.ruby, "scripts/bench_report.rb", *(args[:dir] ? [args[:dir]] : [])
+  end
+
+  desc "Static HTML report for a results dir (default: newest, diffed against the previous run)"
+  task :html, [:dir, :baseline] do |_, args|
+    sh RbConfig.ruby, "scripts/bench_html.rb", *[args[:dir], args[:baseline]].compact
+  end
+
+  desc "Markdown report to stdout + <dir>/report.md (default: newest, diffed against the previous run)"
+  task :markdown, [:dir, :baseline] do |_, args|
+    sh RbConfig.ruby, "scripts/bench_markdown.rb", *[args[:dir], args[:baseline]].compact
+  end
+
+  desc "Machine-readable JSONL diff of two runs (default: newest vs previous)"
+  task :diff, [:dir, :baseline] do |_, args|
+    sh RbConfig.ruby, "scripts/bench_diff.rb", *[args[:dir], args[:baseline]].compact
   end
 end
 

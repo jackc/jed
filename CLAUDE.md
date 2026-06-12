@@ -421,7 +421,8 @@ The design is optimized for AI agents even more than for humans. In practice:
   cross-engine checksum and the report fails on any disagreement. When a perf-relevant
   feature lands, **add a benchmark** for it (the same growth obligation as NoREC relations);
   before/after a perf-sensitive change, **run the affected benchmarks** and report both
-  numbers in the change description.
+  numbers in the change description (`rake bench:diff` emits the before/after comparison
+  as JSONL; `rake bench:html` / `bench:markdown` render a run — with deltas — for humans).
 - **Structured errors**, not free text — so failures are machine-legible and
   `statement error` matching is stable.
 - **Boring, explicit code over clever abstraction.** In Rust, resist deep generics and
