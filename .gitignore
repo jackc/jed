@@ -6,6 +6,7 @@
 
 # Rust build artifacts (Cargo.lock IS committed — jed is an app, not a library).
 /impl/rust/target/
+/cli/target/
 
 # Go build artifacts. NOTE: do not ignore "*.test" — the conformance corpus files
 # use that extension (spec/conformance/suites/**/*.test).

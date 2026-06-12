@@ -151,6 +151,7 @@ end
 # `npm run typecheck` in impl/ts), so it is intentionally out of scope. Kept SEPARATE from
 # `verify`, which is deliberately toolchain-light (spec data only, no cargo/go needed).
 RUST_MANIFEST = File.join(__dir__, "impl/rust/Cargo.toml")
+CLI_MANIFEST  = File.join(__dir__, "cli/Cargo.toml")
 GO_DIR        = File.join(__dir__, "impl/go")
 
 # The Go files gofumpt would rewrite. `gofumpt -l` exits 0 even when files differ, so the
@@ -167,6 +168,11 @@ namespace :fmt do
       failures << "rust"
     end
 
+    puts "cli:  cargo fmt --check"
+    unless system("cargo", "fmt", "--check", "--manifest-path", CLI_MANIFEST)
+      failures << "cli"
+    end
+
     puts "go:   gofumpt -l impl/go"
     unformatted = gofumpt_unformatted
     unless unformatted.empty?
@@ -181,6 +187,7 @@ namespace :fmt do
   desc "Rewrite Rust + Go sources in place with the pinned formatters"
   task :fix do
     sh "cargo", "fmt", "--manifest-path", RUST_MANIFEST
+    sh "cargo", "fmt", "--manifest-path", CLI_MANIFEST
     sh "gofumpt", "-w", GO_DIR
   end
 end
@@ -232,11 +239,27 @@ namespace :corpus do
   end
 end
 
-# ci — the aggregate gate. Chains the toolchain-light spec checks, the formatter gate, and the
-# metamorphic sweep, so one command reproduces what CI enforces. Each is `sh`/task-failure
-# propagating, so `rake ci` exits non-zero on the first failure.
-desc "CI gate: spec data checks + core formatting + the NoREC metamorphic sweep"
-task ci: %w[verify fmt] do
+# cli — the `jed` terminal client (spec/design/cli.md), a HOST PROGRAM at /cli: a
+# standalone crate so its TUI dependencies never enter the zero-dep engine cores. Its
+# tests run in `rake ci` (its only gate); the engine cores' unit suites run per-core as
+# usual, outside Rake.
+namespace :cli do
+  desc "Build the jed CLI (release) to cli/target/release/jed"
+  task :build do
+    sh "cargo", "build", "--release", "--manifest-path", CLI_MANIFEST
+  end
+
+  desc "Run the jed CLI's unit + end-to-end golden tests"
+  task :test do
+    sh "cargo", "test", "--manifest-path", CLI_MANIFEST
+  end
+end
+
+# ci — the aggregate gate. Chains the toolchain-light spec checks, the formatter gate, the
+# CLI's tests, and the metamorphic sweep, so one command reproduces what CI enforces. Each
+# is `sh`/task-failure propagating, so `rake ci` exits non-zero on the first failure.
+desc "CI gate: spec data checks + core formatting + CLI tests + the NoREC metamorphic sweep"
+task ci: %w[verify fmt cli:test] do
   Rake::Task["corpus:norec_sweep"].invoke
 end
 

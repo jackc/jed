@@ -1,0 +1,5 @@
+[
+{"id":1,"name":"a,b","score":"1.50"},
+{"id":2,"name":"say \"hi\"","score":null},
+{"id":3,"name":null,"score":"12.00"}
+]

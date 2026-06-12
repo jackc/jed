@@ -1,0 +1,200 @@
+//! End-to-end golden tests for script mode (spec/design/cli.md §7). Deterministic by
+//! construction: the engine is deterministic, cost footers are exact, wall-clock never
+//! prints, there is no banner on piped stdin, and every golden query uses ORDER BY
+//! (unordered row order is spec-unspecified). Cargo builds the binary for integration
+//! tests and exposes it as CARGO_BIN_EXE_jed.
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+struct Run {
+    stdout: String,
+    stderr: String,
+    code: i32,
+}
+
+fn run(args: &[&str], stdin_text: &str) -> Run {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jed"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn jed");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin_text.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait jed");
+    Run {
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
+        code: out.status.code().unwrap(),
+    }
+}
+
+fn testdata(name: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/testdata")
+        .join(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn tmp(name: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!("jed_e2e_{}_{name}", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+#[test]
+fn basic_aligned_session_matches_golden() {
+    let r = run(&[], &testdata("basic.sql"));
+    assert_eq!(r.stderr, "", "stderr should be empty");
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, testdata("basic.golden"));
+}
+
+#[test]
+fn csv_format_matches_golden() {
+    let r = run(&["--format", "csv"], &testdata("formats.sql"));
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(r.stdout, testdata("formats_csv.golden"));
+}
+
+#[test]
+fn json_format_quiet_matches_golden() {
+    // -q drops the OK lines, leaving pure data (the json golden was made with -q).
+    let r = run(&["--format", "json", "-q"], &testdata("formats.sql"));
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(r.stdout, testdata("formats_json.golden"));
+}
+
+#[test]
+fn script_stops_at_the_first_error_with_exit_2() {
+    let r = run(&[], &testdata("errors.sql"));
+    assert_eq!(r.code, 2);
+    assert_eq!(r.stdout, "OK (cost 0)\nOK (cost 0)\n");
+    assert_eq!(
+        r.stderr,
+        "<stdin>:3: ERROR 23505: duplicate key value violates unique constraint: t_pkey\n"
+    );
+}
+
+#[test]
+fn continue_on_error_runs_the_rest_but_still_exits_2() {
+    let r = run(&["--continue-on-error"], &testdata("errors.sql"));
+    assert_eq!(r.code, 2);
+    assert!(r.stdout.contains("(1 row, cost 3)"), "stdout: {}", r.stdout);
+}
+
+#[test]
+fn framing_errors_reject_the_whole_input() {
+    let r = run(&[], "SELECT 'unterminated");
+    assert_eq!(r.code, 2);
+    assert_eq!(
+        r.stderr,
+        "<stdin>:1: ERROR 42601: unterminated string literal\n"
+    );
+    assert_eq!(r.stdout, "");
+}
+
+#[test]
+fn cost_ceiling_aborts_with_54p01_and_a_hint() {
+    let r = run(
+        &[
+            "--max-cost",
+            "2",
+            "-c",
+            "CREATE TABLE t (a int32 PRIMARY KEY)",
+        ],
+        "",
+    );
+    // DDL costs 0 — it survives; a scan does not.
+    assert_eq!(r.code, 0);
+    let db = tmp("ceiling.jed");
+    let db_str = db.to_str().unwrap();
+    let r = run(
+        &[
+            "--create",
+            db_str,
+            "-c",
+            "CREATE TABLE t (a int32 PRIMARY KEY); INSERT INTO t VALUES (1)",
+        ],
+        "",
+    );
+    assert_eq!(r.code, 0);
+    // A 1-row scan accrues page_read + row reads — past a ceiling of 2.
+    let r = run(&[db_str, "--max-cost", "2", "-c", "SELECT a FROM t"], "");
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("ERROR 54P01:"), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("hint: raise the ceiling with --max-cost"),
+        "stderr: {}",
+        r.stderr
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn create_then_reopen_round_trips() {
+    let db = tmp("roundtrip.jed");
+    let db_str = db.to_str().unwrap();
+    let r = run(
+        &[
+            "--create",
+            db_str,
+            "-c",
+            "CREATE TABLE t (a int32 PRIMARY KEY); INSERT INTO t VALUES (7)",
+        ],
+        "",
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    let r = run(&[db_str, "-q", "-c", "SELECT a FROM t"], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(r.stdout, " a\n---\n 7\n(1 row, cost 3)\n");
+    // Creating over an existing file is 58P02, exit 1 (strict create — cli.md §3).
+    let r = run(&["--create", db_str, "-c", "SELECT a FROM t"], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("ERROR 58P02:"), "stderr: {}", r.stderr);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn missing_file_exits_1_with_a_create_hint() {
+    let r = run(&["/nonexistent/nope.jed", "-c", "SELECT 1"], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("ERROR 58P01:"), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("hint: pass --create"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn usage_errors_exit_1() {
+    let r = run(&["--nope"], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("unknown flag"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn sources_run_in_command_line_order() {
+    let r = run(
+        &[
+            "-c",
+            "CREATE TABLE t (a int32 PRIMARY KEY)",
+            "-c",
+            "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+            "-q",
+            "-c",
+            "SELECT a FROM t ORDER BY a",
+        ],
+        "",
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(r.stdout, " a\n---\n 1\n 2\n(2 rows, cost 5)\n");
+}

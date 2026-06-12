@@ -1,0 +1,22 @@
+# The jed CLI — a HOST PROGRAM, not a core (CLAUDE.md §2; spec/design/cli.md).
+# Standalone crate, deliberately NOT in a workspace with impl/rust: the engine crate
+# stays hermetic and zero-dependency. The TUI dependencies below are the §14 record —
+# proposed in planning and explicitly approved by the maintainer 2026-06-12 — and are
+# confined to this crate (cli.md §2).
+
+[package]
+name = "jed-cli"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The jed terminal client: a full-screen TUI + plain script mode (spec/design/cli.md)."
+
+[[bin]]
+name = "jed"
+path = "src/main.rs"
+
+[dependencies]
+jed = { path = "../impl/rust" }
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"

@@ -981,6 +981,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       ordinary error (rolls back). Deterministic + cross-core identical; the `# max_cost:` corpus
       directive + `resource.cost_limit` capability + `resource/cost_limit.test` pin it (cost.md
       §6, api.md §8). _(§13)_
+- [x] **The `jed` CLI** — ✅ **landed** (`/cli`; [spec/design/cli.md](spec/design/cli.md)):
+      a full-screen TUI client (Rust + ratatui/crossterm/tui-textarea — the §14-approved
+      dependency record in cli.md §2; editor + results grid + schema sidebar + status bar
+      with tx/failed state + history + help) and a plain script mode (`-c`/`-f`/piped
+      stdin; aligned/csv/json; stop-on-error default; exit codes 0/1/2; cost footers). A
+      **host program**, not a core: links `impl/rust` via the public API, conforms to
+      nothing, votes on nothing; the engine cores stay zero-dep. Pre-work landed with it:
+      SQL comments as lexer whitespace (grammar.md §33) and `table_names()` (api.md §6).
+      Build/test: `rake cli:build` / `rake cli:test` (in `rake ci`). _(was: size L; §1)_
+- [ ] **Affected-row counts in `Outcome`** — DML without RETURNING reports how many rows it
+      touched (PG's `UPDATE 3` command tags), an additive `Outcome` field in all 3 cores +
+      api.md; the CLI's `OK` footer then becomes `OK, 3 rows (cost C)` (cli.md §5). The
+      `# cost:` corpus contract is untouched. _(size: M; follow-on to the CLI)_
+- [ ] **CLI follow-ons** (cli.md §8, after v1): editor autocomplete from the catalog, SQL
+      syntax highlighting, CSV import/export, `.dump`-style SQL export, read-only open mode
+      (wants engine support), pager/`-o` redirection. _(size: M each; not scheduled)_
 - [ ] **(Open question, not scheduled)** low-level direct access API beneath SQL
       (`getValue("table", key)`) — keep the seam open, don't build yet (§9). _(size: —)_
 

@@ -1,0 +1,18 @@
+OK (cost 0)
+OK (cost 0)
+ id | name  | score
+----+-------+-------
+  1 | alice |  9.50
+  2 | bob   |  NULL
+(2 rows, cost 5)
+BEGIN
+OK (cost 3)
+ id | score
+----+-------
+  1 | 10.00
+(1 row, cost 4)
+ROLLBACK
+ n
+---
+ 2
+(1 row, cost 6)
