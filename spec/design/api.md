@@ -261,6 +261,8 @@ only and the engine has no wire protocol).
 | rows columns | `rows.column_names()` | `rows.ColumnNames()` | `rows.columnNames` |
 | rows cost | `rows.cost()` | `rows.Cost()` | `rows.cost` |
 | set cost ceiling (§8) | `db.set_max_cost(limit)` | `db.SetMaxCost(limit)` | `db.setMaxCost(limit)` |
+| table lookup (catalog) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*Table, bool)` | `db.table(name): Table \| undefined` |
+| table names (catalog) | `db.table_names() -> Vec<String>` | `db.TableNames() []string` | `db.tableNames(): string[]` |
 
 **Per-language divergences, deliberate and documented:**
 
@@ -273,6 +275,15 @@ only and the engine has no wire protocol).
   otherwise collide with the AST `Statement` the executor consumes).
 - Method names avoid collisions with the kept free functions: Go `ExecuteSQL` (vs package
   `Execute`), TS `executeSql` (vs exported `execute`).
+
+**Catalog reads** (the last two rows) are the host's introspection surface until an SQL-level
+one exists (an `information_schema`-like layer is a possible later feature): both read the
+**currently-visible snapshot** (an open transaction's working set, else the committed state).
+`table` returns the full definition — columns (name, type, typmod, NOT NULL, PK membership,
+default), the primary key's ordinals in key order, CHECK constraints, and secondary indexes.
+`table_names` returns every table's **canonical** (CREATE TABLE-spelled) name, sorted
+ascending by **lowercased** name — the catalog's standing order, so no hash-map iteration
+order leaks (CLAUDE.md §8). Secondary indexes are relations but not tables; they are excluded.
 
 ## 7. Errors
 

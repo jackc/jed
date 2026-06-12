@@ -354,6 +354,15 @@ export class Database {
     return this.readSnap().table(name);
   }
 
+  // tableNames is the canonical name of every table in the visible snapshot, sorted ascending
+  // by lowercased name (the catalog's standing order — no map-iteration order may leak,
+  // CLAUDE.md §8; keys are ASCII, so code-unit sort == byte sort). Secondary indexes are not
+  // tables and are excluded (api.md §6).
+  tableNames(): string[] {
+    const snap = this.readSnap();
+    return [...snap.tables.keys()].sort().map((k) => snap.tables.get(k)!.name);
+  }
+
   // putTable registers a new table and its empty store in the working snapshot (DDL is
   // transactional — transactions.md §4.5).
   putTable(t: Table): void {

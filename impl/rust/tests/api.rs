@@ -195,3 +195,25 @@ fn incremental_commit_round_trips_to_canonical_image() {
         "the incremental file must decode to the identical canonical image"
     );
 }
+
+#[test]
+fn table_names_lists_tables_sorted_excluding_indexes() {
+    // The catalog-read surface (api.md §6): canonical names, sorted ascending by
+    // lowercased name; secondary indexes are relations but not tables.
+    let mut db = Database::new();
+    assert_eq!(db.table_names(), Vec::<String>::new());
+    execute(&mut db, "CREATE TABLE Zed (id int32 PRIMARY KEY, v int32)").unwrap();
+    execute(&mut db, "CREATE TABLE apple (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "CREATE INDEX zed_v_idx ON Zed (v)").unwrap();
+    // Sorted by LOWERCASED name (apple < zed), returning the canonical spelling (`Zed`).
+    assert_eq!(
+        db.table_names(),
+        vec!["apple".to_string(), "Zed".to_string()]
+    );
+    // The visible snapshot includes an open transaction's working set.
+    execute(&mut db, "BEGIN").unwrap();
+    execute(&mut db, "CREATE TABLE mid (id int32 PRIMARY KEY)").unwrap();
+    assert_eq!(db.table_names(), vec!["apple", "mid", "Zed"]);
+    execute(&mut db, "ROLLBACK").unwrap();
+    assert_eq!(db.table_names(), vec!["apple", "Zed"]);
+}

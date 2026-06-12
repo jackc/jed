@@ -186,3 +186,21 @@ test("commit on in-memory db is a no-op success", () => {
   assert.equal(db.txid, 0n);
   assert.equal(db.path, null);
 });
+
+test("tableNames lists tables sorted by lowercased name, excluding indexes", () => {
+  // The catalog-read surface (api.md §6): canonical names, sorted ascending by
+  // lowercased name; secondary indexes are relations but not tables.
+  const db = new Database();
+  assert.deepStrictEqual(db.tableNames(), []);
+  execute(db, "CREATE TABLE Zed (id int32 PRIMARY KEY, v int32)");
+  execute(db, "CREATE TABLE apple (id int32 PRIMARY KEY)");
+  execute(db, "CREATE INDEX zed_v_idx ON Zed (v)");
+  // Sorted by LOWERCASED name (apple < zed), returning the canonical spelling (`Zed`).
+  assert.deepStrictEqual(db.tableNames(), ["apple", "Zed"]);
+  // The visible snapshot includes an open transaction's working set.
+  execute(db, "BEGIN");
+  execute(db, "CREATE TABLE mid (id int32 PRIMARY KEY)");
+  assert.deepStrictEqual(db.tableNames(), ["apple", "mid", "Zed"]);
+  execute(db, "ROLLBACK");
+  assert.deepStrictEqual(db.tableNames(), ["apple", "Zed"]);
+});

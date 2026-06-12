@@ -403,6 +403,23 @@ impl Database {
         self.read_snap().table(name)
     }
 
+    /// The canonical name of every table in the currently-visible snapshot, sorted ascending
+    /// by lowercased name (the catalog's standing order — no map-iteration order may leak,
+    /// CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6).
+    pub fn table_names(&self) -> Vec<String> {
+        let snap = self.read_snap();
+        let mut named: Vec<(&str, &str)> = snap
+            .tables
+            .iter()
+            .map(|(key, t)| (key.as_str(), t.name.as_str()))
+            .collect();
+        named.sort_by(|a, b| a.0.cmp(b.0));
+        named
+            .into_iter()
+            .map(|(_, name)| name.to_string())
+            .collect()
+    }
+
     /// All rows of a table in primary-key (encoded byte) order, or None if the table does not exist.
     /// Reads the visible snapshot. A test/debug convenience — the SELECT path scans through
     /// `iter_in_key_order` directly (propagating fault errors); this unwraps that `Result` for the

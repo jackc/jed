@@ -6,6 +6,7 @@ package jed
 
 import (
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -189,5 +190,32 @@ func mustExec(t *testing.T, db *Database, sql string) {
 	t.Helper()
 	if _, err := Execute(db, sql); err != nil {
 		t.Fatalf("%q: %v", sql, err)
+	}
+}
+
+func TestTableNamesListsTablesSortedExcludingIndexes(t *testing.T) {
+	// The catalog-read surface (api.md §6): canonical names, sorted ascending by
+	// lowercased name; secondary indexes are relations but not tables.
+	db := NewDatabase()
+	if got := db.TableNames(); len(got) != 0 {
+		t.Fatalf("empty catalog: got %v", got)
+	}
+	mustCreate(t, db, "CREATE TABLE Zed (id int32 PRIMARY KEY, v int32)")
+	mustCreate(t, db, "CREATE TABLE apple (id int32 PRIMARY KEY)")
+	mustCreate(t, db, "CREATE INDEX zed_v_idx ON Zed (v)")
+	// Sorted by LOWERCASED name (apple < zed), returning the canonical spelling (`Zed`).
+	want := []string{"apple", "Zed"}
+	if got := db.TableNames(); !slices.Equal(got, want) {
+		t.Fatalf("TableNames() = %v, want %v", got, want)
+	}
+	// The visible snapshot includes an open transaction's working set.
+	mustCreate(t, db, "BEGIN")
+	mustCreate(t, db, "CREATE TABLE mid (id int32 PRIMARY KEY)")
+	if got := db.TableNames(); !slices.Equal(got, []string{"apple", "mid", "Zed"}) {
+		t.Fatalf("in-tx TableNames() = %v", got)
+	}
+	mustCreate(t, db, "ROLLBACK")
+	if got := db.TableNames(); !slices.Equal(got, want) {
+		t.Fatalf("post-rollback TableNames() = %v, want %v", got, want)
 	}
 }
