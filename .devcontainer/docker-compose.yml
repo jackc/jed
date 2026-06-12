@@ -7,10 +7,18 @@ services:
       - ..:/workspaces/jed:cached
       - devstate-local:/persist/local
       - devstate-shared:/persist/shared
+      # Shared Unix-domain-socket directory: the db service writes its socket
+      # here and the app connects over it (faster than the localhost TCP path,
+      # used for benchmarking jed against the PostgreSQL oracle).
+      - pg-sockets:/var/run/postgresql
     command: sleep infinity
     environment:
-      # PostgreSQL connection settings for testing
-      PGHOST: localhost
+      # PostgreSQL connection settings for testing. PGHOST is the shared socket
+      # directory (a leading '/' makes libpq use the Unix socket), so oracle
+      # queries skip the TCP stack entirely. The default initdb pg_hba.conf gives
+      # `local all all trust`, so any user connects without a password over the
+      # socket — pick the connecting user freely via PGUSER.
+      PGHOST: /var/run/postgresql
       PGUSER: postgres
       PGDATABASE: postgres
 
@@ -19,6 +27,9 @@ services:
     restart: unless-stopped
     volumes:
       - postgresql:/var/lib/postgresql
+      - pg-sockets:/var/run/postgresql
+    # Pin the socket directory to the shared volume so the app can reach it.
+    command: postgres -c unix_socket_directories=/var/run/postgresql
     network_mode: service:app
     environment:
       POSTGRES_USER: postgres
@@ -27,6 +38,8 @@ services:
 
 volumes:
   postgresql:
+  # Shared between app and db so the Unix-domain socket is reachable cross-container.
+  pg-sockets:
   # per-container persistence (unique per devcontainer instance via project-name prefix)
   devstate-local:
   # shared across all containers for this project

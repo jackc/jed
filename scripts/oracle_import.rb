@@ -27,7 +27,10 @@ rescue LoadError
 end
 
 class OracleImport
-  PSQL = %w[psql -h localhost -U postgres -q -A -t -X -v ON_ERROR_STOP=0].freeze
+  # No -h here: honor the PGHOST env (the devcontainer points it at the shared Unix
+  # socket directory, which is faster than the localhost TCP path). Socket connections
+  # authenticate via the default `local all all trust` rule, so no password is needed.
+  PSQL = %w[psql -U postgres -q -A -t -X -v ON_ERROR_STOP=0].freeze
   OVERRIDES = File.expand_path("../spec/conformance/oracle_overrides.toml", __dir__)
 
   # jed canonical type names -> the PG / SQL-standard spelling PG parses. A skeleton authored
