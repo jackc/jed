@@ -128,15 +128,5 @@ reason = "Follows the constraint-drop divergence: jed dropped m's UNIQUE so the 
 
 [[override]]
 file = "dml/returning.test"
-sql = "UPDATE t SET v = v WHERE id = 1 RETURNING old.v, new.v"
-reason = "jed: no OLD/NEW row qualifiers in RETURNING (grammar.md §32) — old/new are ordinary unknown qualifiers (42P01). PostgreSQL 18 supports them and returns the row. The UPDATE is zero-net-change (v = v), so the oracle's state stays in sync despite succeeding."
-
-[[override]]
-file = "dml/returning.test"
-sql = "DELETE FROM t WHERE id < 0 RETURNING old.id"
-reason = "jed: the same missing-OLD/NEW divergence (grammar.md §32) — 42P01. PG 18 succeeds with an empty result (the WHERE matches nothing, so no oracle state change)."
-
-[[override]]
-file = "dml/returning.test"
 sql = "INSERT INTO t (id) SELECT a + 100 FROM src AS returning RETURNING id"
 reason = "jed keeps every word non-reserved (grammar.md §3): an explicit `AS returning` source alias parses, with the RETURNING clause after it. PostgreSQL fully reserves RETURNING and rejects this (42601). Sits LAST in the file — the rows insert only in jed."

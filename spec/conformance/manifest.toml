@@ -85,6 +85,10 @@ id = "dml.returning"
 description = "The RETURNING clause on INSERT/UPDATE/DELETE — the statement becomes a query result projecting each affected row (INSERT the stored row, UPDATE the new row, DELETE the old row); items resolve against the target table only (subqueries allowed and observe the pre-statement snapshot; aggregates 42803); zero affected rows is an empty result; row order unspecified (grammar.md §32, cost.md §3)"
 
 [[capability]]
+id = "dml.returning_old_new"
+description = "The old./new. row-version qualifiers in a RETURNING list (PG 18 semantics, grammar.md §32): old.col = the pre-statement value, new.col = the post-statement value, the absent side the all-NULL row (INSERT's old, DELETE's new); valid only in RETURNING (elsewhere 42P01), shadowed by a target table actually named old/new, usable inside item subqueries; the WITH (OLD AS o, NEW AS n) aliasing form stays deferred"
+
+[[capability]]
 id = "query.select"
 description = "SELECT of columns from a single table"
 

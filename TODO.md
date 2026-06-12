@@ -666,9 +666,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       minus assigned columns — cost.md §3 "RETURNING"). `returning` joined the table_ref
       implicit-alias stop set (§15); no format change, no new error codes. Capability
       `dml.returning`; corpus `dml/returning.test` (83/0/0 ×3, oracle-checked — the
-      importer now replays row-returning DML query records into the prefix); 3 ledgered
-      divergences (no `OLD`/`NEW` qualifiers — PG 18 has them, relaxable; `AS returning`
-      parses). _(was: half of M)_
+      importer now replays row-returning DML query records into the prefix); 1 ledgered
+      divergence (`AS returning` parses; jed reserves no words). The **`old.`/`new.`
+      row-version qualifiers** (PG 18) ✅ landed as a follow-on (capability
+      `dml.returning_old_new`): qualifier-only pseudo-relations over the `[base | other]`
+      projection row (old = pre-statement, new = post-statement, the absent side the
+      all-NULL row; INSERT/UPDATE base = new, DELETE base = old), valid only in RETURNING,
+      shadowed by a target table actually named old/new, usable inside item subqueries;
+      touched set: old side always a storage read, new side ∖ assigned. Still deferred:
+      the `WITH (OLD AS o, NEW AS n)` aliasing form, `old.*`/`new.*` (the standing
+      no-qualified-star narrowing). _(was: half of M)_
 - [ ] **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE ✅, RETURNING ✅ — unblocked)_
 - [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
       `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).

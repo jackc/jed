@@ -1152,7 +1152,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		var retNodes []*rExpr
 		var retNames []string
 		if ins.Returning != nil {
-			if retNodes, retNames, err = db.resolveReturning(table, *ins.Returning, ptypes); err != nil {
+			if retNodes, retNames, err = db.resolveReturning(table, *ins.Returning, false, ptypes); err != nil {
 				return Outcome{}, err
 			}
 		}
@@ -1249,7 +1249,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	var retNames []string
 	if ins.Returning != nil {
 		var rerr error
-		if retNodes, retNames, rerr = db.resolveReturning(table, *ins.Returning, ptypes); rerr != nil {
+		if retNodes, retNames, rerr = db.resolveReturning(table, *ins.Returning, false, ptypes); rerr != nil {
 			return Outcome{}, rerr
 		}
 	}
@@ -1443,7 +1443,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			prows[i] = prepared[i].row
 		}
 		var err error
-		if returned, err = db.projectReturning(returning, prows, params, meter); err != nil {
+		if returned, err = db.projectReturning(returning, prows, nil, params, meter); err != nil {
 			return nil, err
 		}
 	}
@@ -1499,8 +1499,11 @@ func defaultOrNull(col Column) Value {
 // scope (grammar.md §32): aggregates are 42803 (the non-collecting aggCtx), subqueries
 // resolve (and may correlate against the returned row), output names follow §8. Returns the
 // projection nodes and names; the item types have no consumer.
-func (db *Database) resolveReturning(table *Table, items SelectItems, ptypes *paramTypes) ([]*rExpr, []string, error) {
-	s := singleScope(db, table)
+// The scope is the RETURNING scope (returningScope — the table at offset 0 plus the
+// old/new qualifier-only pseudo-relations over the [base | other] projection row, with
+// baseIsOld true for DELETE).
+func (db *Database) resolveReturning(table *Table, items SelectItems, baseIsOld bool, ptypes *paramTypes) ([]*rExpr, []string, error) {
+	s := returningScope(db, table, baseIsOld)
 	nodes, names, _, err := resolveProjections(s, items, &aggCtx{collecting: false}, ptypes)
 	if err != nil {
 		return nil, nil, err
@@ -1513,17 +1516,29 @@ func (db *Database) resolveReturning(table *Table, items SelectItems, ptypes *pa
 // row_produced, then evaluate each item — metered expression work, exactly a SELECT's
 // projection (a correlated subquery re-runs here, its outer reference reading the row being
 // returned). Callers run this after all validation and BEFORE any write.
-func (db *Database) projectReturning(nodes []*rExpr, rows []Row, params []Value, meter *Meter) ([][]Value, error) {
+// The evaluation row is the concatenation [base | other] the RETURNING scope resolved
+// against: others[i] is the row's opposite version (UPDATE's old rows), nil the all-NULL
+// row (INSERT's old side, DELETE's new side).
+func (db *Database) projectReturning(nodes []*rExpr, rows []Row, others []Row, params []Value, meter *Meter) ([][]Value, error) {
 	env := &evalEnv{exec: db, params: params}
 	out := make([][]Value, 0, len(rows))
-	for _, row := range rows {
+	for i, row := range rows {
 		if err := meter.Guard(); err != nil {
 			return nil, err
 		}
 		meter.Charge(Costs.RowProduced)
+		combined := make(Row, 0, 2*len(row))
+		combined = append(combined, row...)
+		if others != nil {
+			combined = append(combined, others[i]...)
+		} else {
+			for range row {
+				combined = append(combined, NullValue())
+			}
+		}
 		vals := make([]Value, 0, len(nodes))
 		for _, node := range nodes {
-			v, err := node.eval(row, env, meter)
+			v, err := node.eval(combined, env, meter)
 			if err != nil {
 				return nil, err
 			}
@@ -1573,7 +1588,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	var retNames []string
 	if del.Returning != nil {
 		var rerr error
-		if retNodes, retNames, rerr = db.resolveReturning(table, *del.Returning, ptypes); rerr != nil {
+		if retNodes, retNames, rerr = db.resolveReturning(table, *del.Returning, true, ptypes); rerr != nil {
 			return Outcome{}, rerr
 		}
 	}
@@ -1613,13 +1628,21 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		row Row
 	}
 	var matched []matchedRow
-	// DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items' — a
-	// returned column's old value is a logical read of the dropped row. A bare DELETE still
-	// charges no chain/decompress units at all.
+	// DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items'
+	// OLD-side references — a returned old value is a logical read of the dropped row,
+	// while a new.col is the constant NULL row and reads nothing. The RETURNING mask spans
+	// the [base | other] projection row (2 x ncols); only the base (old) half maps back to
+	// storage. A bare DELETE still charges no chain/decompress units at all.
 	mask := make([]bool, len(table.Columns))
 	collectTouched(filter, 0, mask)
-	for _, node := range retNodes {
-		collectTouched(node, 0, mask)
+	if retNodes != nil {
+		retMask := make([]bool, 2*len(table.Columns))
+		for _, node := range retNodes {
+			collectTouched(node, 0, retMask)
+		}
+		for i := range mask {
+			mask[i] = mask[i] || retMask[i]
+		}
 	}
 	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
 	// scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
@@ -1681,7 +1704,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		for i := range matched {
 			prows[i] = matched[i].row
 		}
-		if returned, err = db.projectReturning(retNodes, prows, bound, meter); err != nil {
+		if returned, err = db.projectReturning(retNodes, prows, nil, bound, meter); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -1769,7 +1792,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	var retNames []string
 	if upd.Returning != nil {
 		var rerr error
-		if retNodes, retNames, rerr = db.resolveReturning(table, *upd.Returning, ptypes); rerr != nil {
+		if retNodes, retNames, rerr = db.resolveReturning(table, *upd.Returning, false, ptypes); rerr != nil {
 			return Outcome{}, rerr
 		}
 	}
@@ -1831,14 +1854,22 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	for i := range plans {
 		collectTouched(plans[i].source, 0, mask)
 	}
+	// The RETURNING mask spans the [base | other] projection row (new at 0, old at ncols):
+	// the NEW side joins minus the assigned columns (an assigned column's returned value is
+	// the freshly computed one, not a storage read); the OLD side joins unconditionally
+	// (old.col is always a storage read, assigned or not).
 	if retNodes != nil {
-		retMask := make([]bool, len(table.Columns))
+		ncols := len(table.Columns)
+		retMask := make([]bool, 2*ncols)
 		for _, node := range retNodes {
 			collectTouched(node, 0, retMask)
 		}
-		for i, touched := range retMask {
-			if touched && !slices.ContainsFunc(plans, func(p assignPlan) bool { return p.idx == i }) {
-				mask[i] = true
+		for i := range mask {
+			if retMask[i] && !slices.ContainsFunc(plans, func(p assignPlan) bool { return p.idx == i }) {
+				mask[i] = true // new side
+			}
+			if retMask[ncols+i] {
+				mask[i] = true // old side — always a storage read
 			}
 		}
 	}
@@ -1986,10 +2017,12 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	var returned [][]Value
 	if retNodes != nil {
 		prows := make([]Row, len(updates))
+		olds := make([]Row, len(updates))
 		for i := range updates {
 			prows[i] = updates[i].row
+			olds[i] = updates[i].oldRow
 		}
-		if returned, err = db.projectReturning(retNodes, prows, bound, meter); err != nil {
+		if returned, err = db.projectReturning(retNodes, prows, olds, bound, meter); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -4930,11 +4963,15 @@ func collectColumn(s *scope, ag *aggCtx, idx int, name string) (*rExpr, resolved
 // ============================================================================
 
 // scopeRel is one relation in a FROM scope: its label (alias, else table name, lower-cased
-// for case-insensitive matching), the table, and the flat offset of its first column.
+// for case-insensitive matching), the table, and the flat offset of its first column. A
+// qualifierOnly relation is visible ONLY to qualified references — the RETURNING old/new
+// row-version pseudo-relations (grammar.md §32): bare-column resolution skips it (no new
+// ambiguity), every other statement never builds one.
 type scopeRel struct {
-	label  string
-	table  *Table
-	offset int
+	label         string
+	table         *Table
+	offset        int
+	qualifierOnly bool
 }
 
 // resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
@@ -4967,6 +5004,34 @@ func singleScope(catalog *Database, t *Table) *scope {
 	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}, catalog: catalog, allowSubquery: true}
 }
 
+// returningScope is the scope a RETURNING list resolves against (grammar.md §32): the target
+// table at offset 0 (bare and table-qualified references read the BASE row), plus the old/new
+// row-version pseudo-relations as QUALIFIER-ONLY rels over the concatenated projection row
+// [base | other]. baseIsOld says which version the base row is: false for INSERT/UPDATE
+// (base = the new row, `old` reads the other half), true for DELETE (base = the old row,
+// `new` reads the other half) — the absent version is the all-NULL row the caller appends.
+// A target table literally named old/new SHADOWS that qualifier (the pseudo-relation is
+// suppressed; PostgreSQL's probed rule — its WITH (OLD AS o, ...) aliasing escape stays
+// deferred).
+func returningScope(catalog *Database, t *Table, baseIsOld bool) *scope {
+	n := len(t.Columns)
+	label := strings.ToLower(t.Name)
+	oldOffset, newOffset := n, 0
+	if baseIsOld {
+		oldOffset, newOffset = 0, n
+	}
+	rels := []scopeRel{{label: label, table: t, offset: 0}}
+	for _, pseudo := range []struct {
+		label  string
+		offset int
+	}{{"old", oldOffset}, {"new", newOffset}} {
+		if label != pseudo.label {
+			rels = append(rels, scopeRel{label: pseudo.label, table: t, offset: pseudo.offset, qualifierOnly: true})
+		}
+	}
+	return &scope{rels: rels, catalog: catalog, allowSubquery: true}
+}
+
 // outerOf lifts a parent-scope resolution into the child's frame: one more hop outward.
 func outerOf(r resolved) resolved {
 	return resolved{level: r.level + 1, index: r.index}
@@ -4976,9 +5041,14 @@ func outerOf(r resolved) resolved {
 // chain. Within one scope: two+ relations have it → 42702 ambiguous; exactly one → local; none
 // → fall through to the parent. A name found only in an ancestor is an outer reference (nearest
 // scope wins — an inner match shadows an outer one). 42703 only if no scope in the chain has it.
+// A qualifier-only rel (the RETURNING old/new pseudo-relations) is invisible here — no new
+// ambiguity (grammar.md §32).
 func (s *scope) resolveBare(name string) (resolved, error) {
 	found := -1
 	for _, r := range s.rels {
+		if r.qualifierOnly {
+			continue
+		}
 		if local := r.table.ColumnIndex(name); local >= 0 {
 			if found >= 0 {
 				return resolved{}, ambiguousColumn(name)
@@ -5176,7 +5246,12 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 		var ps []*rExpr
 		var names []string
 		var types []resolvedType
+		// The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
+		// relations' columns exactly as before (grammar.md §32).
 		for _, r := range s.rels {
+			if r.qualifierOnly {
+				continue
+			}
 			for i := range r.table.Columns {
 				ps = append(ps, &rExpr{kind: reColumn, index: r.offset + i})
 				names = append(names, r.table.Columns[i].Name)

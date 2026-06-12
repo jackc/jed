@@ -44,6 +44,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The RETURNING clause on INSERT/UPDATE/DELETE — the statement becomes a query result
   // projecting each affected row (grammar.md §32, cost.md §3).
   "dml.returning",
+  // The old./new. row-version qualifiers in a RETURNING list (PG 18 semantics): old.col =
+  // the pre-statement value, new.col = the post-statement value, the absent side the
+  // all-NULL row (grammar.md §32).
+  "dml.returning_old_new",
   // SELECT, WHERE (=, ordering), ORDER BY, IS [NOT] NULL, 3VL, casts, cross-type
   // comparison via the promotion tower, and all three integer types.
   "query.select",

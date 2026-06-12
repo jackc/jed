@@ -104,11 +104,13 @@ test("RETURNING error codes", () => {
     // Aggregates are forbidden in RETURNING (PG 42803).
     ["INSERT INTO t VALUES (90, 0, 0) RETURNING sum(v)", "42803"],
     ["UPDATE t SET v = 1 RETURNING count(*)", "42803"],
-    // An unknown qualifier is 42P01 — including PG 18's old/new, which jed does not
-    // implement (the documented §32 divergence).
+    // An unknown qualifier is 42P01.
     ["INSERT INTO t VALUES (91, 0, 0) RETURNING other.v", "42P01"],
-    ["UPDATE t SET v = v + 1 RETURNING old.v", "42P01"],
-    ["DELETE FROM t RETURNING new.id", "42P01"],
+    // old/new are RETURNING-only (grammar.md §32): elsewhere they are ordinary unknown
+    // qualifiers (42P01, as in PG); an unknown column under them is 42703.
+    ["UPDATE t SET v = old.v + 1 WHERE id = 1", "42P01"],
+    ["DELETE FROM t WHERE new.v = 1", "42P01"],
+    ["UPDATE t SET v = 1 RETURNING old.nosuch", "42703"],
     // An empty item list, and any trailing clause after RETURNING, are 42601.
     ["DELETE FROM t RETURNING", "42601"],
     ["DELETE FROM t WHERE id = 1 RETURNING id ORDER BY id", "42601"],
@@ -247,4 +249,106 @@ test("RETURNING in transactions", () => {
   execute(db, "BEGIN READ ONLY");
   assert.equal(errCode(() => execute(db, "DELETE FROM t WHERE id = 1 RETURNING id")), "25006");
   execute(db, "ROLLBACK");
+});
+
+test("old/new qualifiers per statement", () => {
+  const db = setup();
+  // INSERT: old is the all-NULL row (the key included); new = bare = the stored row.
+  assert.deepStrictEqual(
+    rows(db, "INSERT INTO t VALUES (40, 4, 44) RETURNING old.v, new.v, v, old.id"),
+    [["NULL", "4", "4", "NULL"]],
+  );
+  // UPDATE: old = pre-assignment, new = bare = post; expressions span both versions;
+  // case-insensitive like any identifier.
+  assert.deepStrictEqual(
+    rows(db, "UPDATE t SET v = v + 5 WHERE id = 1 RETURNING OLD.v, New.v, v, new.v - old.v"),
+    [["10", "15", "15", "5"]],
+  );
+  // An unassigned column's two versions agree.
+  assert.deepStrictEqual(rows(db, "UPDATE t SET v = 0 WHERE id = 2 RETURNING old.w, new.w"), [
+    ["200", "200"],
+  ]);
+  // DELETE: old = bare = the deleted row; new is the all-NULL row.
+  assert.deepStrictEqual(rows(db, "DELETE FROM t WHERE id = 3 RETURNING old.v, new.v, v"), [
+    ["30", "NULL", "30"],
+  ]);
+  // INSERT ... SELECT takes the same mapping.
+  execute(db, "CREATE TABLE src2 (a int32)");
+  execute(db, "INSERT INTO src2 VALUES (60)");
+  assert.deepStrictEqual(rows(db, "INSERT INTO t (id) SELECT a FROM src2 RETURNING old.v, new.v"), [
+    ["NULL", "7"],
+  ]);
+});
+
+test("old/new naming and star", () => {
+  const db = setup();
+  // §8: the qualifier never leaks into the output name (old.v is named v, like PG).
+  const o = execute(db, "UPDATE t SET v = 1 WHERE id = 1 RETURNING old.v, new.w");
+  assert.equal(o.kind, "query");
+  if (o.kind !== "query") throw new Error("unreachable");
+  assert.deepStrictEqual(o.columnNames, ["v", "w"]);
+  // The pseudo-relations are qualifier-only: `*` still expands exactly the table's columns.
+  const o2 = execute(db, "INSERT INTO t (id) VALUES (41) RETURNING *");
+  assert.equal(o2.kind, "query");
+  if (o2.kind !== "query") throw new Error("unreachable");
+  assert.deepStrictEqual(o2.columnNames, ["id", "v", "w"]);
+});
+
+test("old/new shadowed by a table actually named old/new", () => {
+  // A target table literally named old (or new) keeps the ordinary table-qualified
+  // meaning — the row-version pseudo-relation is suppressed (PG-probed).
+  const db = dbWith(["CREATE TABLE old (x int32)"]);
+  assert.deepStrictEqual(rows(db, "INSERT INTO old VALUES (1) RETURNING old.x"), [["1"]]);
+  assert.deepStrictEqual(rows(db, "UPDATE old SET x = x + 1 RETURNING old.x"), [["2"]]);
+  // The other qualifier still works alongside the shadowed one.
+  assert.deepStrictEqual(rows(db, "UPDATE old SET x = x + 1 RETURNING new.x"), [["3"]]);
+  assert.deepStrictEqual(rows(db, "DELETE FROM old RETURNING old.x"), [["3"]]);
+  execute(db, "CREATE TABLE new (x int32)");
+  assert.deepStrictEqual(rows(db, "INSERT INTO new VALUES (9) RETURNING new.x"), [["9"]]);
+  assert.deepStrictEqual(rows(db, "DELETE FROM new RETURNING new.x"), [["9"]]);
+});
+
+test("old/new in RETURNING subqueries", () => {
+  const db = setup();
+  execute(db, "CREATE TABLE s2 (a int32, b int32)");
+  execute(db, "INSERT INTO s2 VALUES (1, 500)");
+  // old/new resolve inside item subqueries like any outer reference (probed; jed has no
+  // FROM-less SELECT, so the single-row s2 anchors the scalar subqueries).
+  assert.deepStrictEqual(
+    rows(
+      db,
+      "UPDATE t SET v = v * 2 WHERE id = 2 RETURNING (SELECT old.v + 0 FROM s2), (SELECT old.v + s2.b FROM s2)",
+    ),
+    [["20", "520"]],
+  );
+  assert.deepStrictEqual(
+    rows(
+      db,
+      "DELETE FROM t WHERE id = 1 RETURNING (SELECT new.v FROM s2), (SELECT count(*) FROM s2 WHERE s2.a = old.id)",
+    ),
+    [["NULL", "1"]],
+  );
+});
+
+test("old/new touched-set sides", () => {
+  // The touched-set sides (cost.md §3): old.col is ALWAYS a storage read — even when the
+  // column is assigned; a DELETE's new.col is the constant NULL row and reads nothing.
+  // Compressed 100k text at page_size 8192 = 13 slabs.
+  const big = `INSERT INTO big VALUES (1, 0, '${"x".repeat(100_000)}')`;
+  const fresh = () =>
+    dbWith(["CREATE TABLE big (id int32 PRIMARY KEY, w int32, t text)", big]);
+  // RETURNING the ASSIGNED column's old version forces the decompress the new version
+  // avoided (4 there): 3-unit bounded scan + 13 value_decompress + row_produced (the
+  // shrunken rewrite attempts no compression).
+  assert.equal(cost(fresh(), "UPDATE big SET t = 'short' WHERE id = 1 RETURNING old.t"), 17n);
+  // An unassigned column's old side costs the same as its new side (both storage reads):
+  // 3 + 13 decompress + 13 rewrite-compress + 1 row_produced.
+  assert.equal(cost(fresh(), "UPDATE big SET w = 1 WHERE id = 1 RETURNING old.t"), 30n);
+  // DELETE RETURNING new.t reads nothing (NULL side): the 4-unit shape, value NULL.
+  const db = fresh();
+  const o = execute(db, "DELETE FROM big WHERE id = 1 RETURNING new.t");
+  assert.equal(o.kind, "query");
+  if (o.kind !== "query") throw new Error("unreachable");
+  assert.deepStrictEqual(o.rows.map((r) => r.map(render)), [["NULL"]]);
+  assert.equal(o.cost, 4n);
 });

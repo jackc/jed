@@ -575,13 +575,17 @@ A DML statement's `RETURNING` clause ([grammar.md](grammar.md) §32) is metered 
   `storage_row_read`, filter/assignment/check evaluation, `value_compress`) are unchanged,
   and a statement that affects zero rows charges nothing for its `RETURNING`.
 - **The touched set** (the subsection above) **grows by the items' column references** for
-  the statements that read stored rows: a `DELETE`'s touched set becomes
-  `WHERE ∪ RETURNING`, and an `UPDATE`'s becomes
-  `WHERE ∪ assignment sources ∪ (RETURNING ∖ assigned columns)` — an **assigned** column's
-  returned value is the freshly computed one, not a storage read, so it charges nothing
-  extra. An `INSERT`'s `RETURNING` reads no stored row at all (the values are the
-  statement's own candidates), so it never adds scan units; an `INSERT ... SELECT`'s
-  source charges through its own query path as before.
+  the statements that read stored rows, and the `old.`/`new.` qualifiers (grammar.md §32)
+  distinguish the sides:
+  - a `DELETE`'s touched set becomes `WHERE ∪ RETURNING(old side)` — bare and `old.`
+    references read the dropped row; a `new.col` is the constant NULL row and reads
+    **nothing**;
+  - an `UPDATE`'s becomes `WHERE ∪ assignment sources ∪ (new side ∖ assigned columns)
+    ∪ old side` — an **assigned** column's new value is the freshly computed one (not a
+    storage read), but its `old.col` is **always** a storage read, assigned or not;
+  - an `INSERT`'s `RETURNING` reads no stored row at all (the new side is the statement's
+    own candidates, the old side the constant NULL row), so it never adds scan units; an
+    `INSERT ... SELECT`'s source charges through its own query path as before.
 - **Subqueries in the list** follow the subsection above: uncorrelated folds once (cost
   added once, evaluated against the pre-statement snapshot — grammar.md §32), correlated
   re-runs per **returned** row (`operator_eval + cost(s | r)` each).

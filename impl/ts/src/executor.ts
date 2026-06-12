@@ -1058,7 +1058,7 @@ export class Database {
       // t) reads the pre-insert snapshot, then writes.
       const ptypes = new ParamTypes();
       const plan = this.planQuery(ins.source.select, null, ptypes);
-      const ret = ins.returning !== null ? this.resolveReturning(table, ins.returning, ptypes) : null;
+      const ret = ins.returning !== null ? this.resolveReturning(table, ins.returning, false, ptypes) : null;
       const bound = bindParams(params, ptypes.finalize());
       const meter = new Meter(this.maxCost);
       const foldCost = { value: 0n };
@@ -1124,7 +1124,7 @@ export class Database {
     }
     // Resolve the RETURNING projection after the source (PostgreSQL's analysis order) and
     // before binding/execution — a 42703 here beats a would-be 23505 (grammar.md §32).
-    const ret = ins.returning !== null ? this.resolveReturning(table, ins.returning, ptypes) : null;
+    const ret = ins.returning !== null ? this.resolveReturning(table, ins.returning, false, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize());
 
     // Materialize each row into its value-position-indexed candidates (length arity, checked
@@ -1294,7 +1294,7 @@ export class Database {
     // the pre-statement snapshot and a 54P01 here leaves the store untouched.
     const returned =
       returning !== null
-        ? this.projectReturning(returning, prepared.map((pr) => pr.row), params, meter)
+        ? this.projectReturning(returning, prepared.map((pr) => pr.row), null, params, meter)
         : null;
 
     // Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
@@ -1328,12 +1328,16 @@ export class Database {
   // scope (grammar.md §32): aggregates are 42803 (the non-collecting AggCtx), subqueries
   // resolve (and may correlate against the returned row), output names follow §8. Returns the
   // projection nodes and names; the item types have no consumer.
+  // The scope is the RETURNING scope (Scope.returning — the table at offset 0 plus the
+  // old/new qualifier-only pseudo-relations over the [base | other] projection row, with
+  // baseIsOld true for DELETE).
   private resolveReturning(
     table: Table,
     items: SelectItems,
+    baseIsOld: boolean,
     ptypes: ParamTypes,
   ): { nodes: RExpr[]; names: string[] } {
-    const scope = Scope.single(this, table);
+    const scope = Scope.returning(this, table, baseIsOld);
     const { nodes, names } = resolveProjections(
       scope,
       items,
@@ -1348,14 +1352,24 @@ export class Database {
   // row_produced, then evaluate each item — metered expression work, exactly a SELECT's
   // projection (a correlated subquery re-runs here, its outer reference reading the row being
   // returned). Callers run this after all validation and BEFORE any write.
-  private projectReturning(nodes: RExpr[], rows: Row[], params: Value[], meter: Meter): Value[][] {
+  // The evaluation row is the concatenation [base | other] the RETURNING scope resolved
+  // against: others[i] is the row's opposite version (UPDATE's old rows), null the all-NULL
+  // row (INSERT's old side, DELETE's new side).
+  private projectReturning(
+    nodes: RExpr[],
+    rows: Row[],
+    others: Row[] | null,
+    params: Value[],
+    meter: Meter,
+  ): Value[][] {
     const env: EvalEnv = { params, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, params) };
     const out: Value[][] = [];
-    for (const row of rows) {
+    rows.forEach((row, i) => {
       meter.guard();
       meter.charge(COSTS.rowProduced);
-      out.push(nodes.map((node) => evalExpr(node, row, env, meter)));
-    }
+      const combined = row.concat(others !== null ? others[i]! : row.map(() => nullValue()));
+      out.push(nodes.map((node) => evalExpr(node, combined, env, meter)));
+    });
     return out;
   }
 
@@ -1373,7 +1387,7 @@ export class Database {
     const scope = Scope.single(this, table);
     const ptypes = new ParamTypes();
     let filter = del.filter ? resolveBooleanFilter(scope, del.filter, ptypes) : null;
-    const ret = del.returning !== null ? this.resolveReturning(table, del.returning, ptypes) : null;
+    const ret = del.returning !== null ? this.resolveReturning(table, del.returning, true, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize());
 
     // Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
@@ -1399,12 +1413,20 @@ export class Database {
     // matched collects (key, row) pairs before mutating; the rows feed phase 2's
     // index-entry removal (indexed columns are fixed-width and always resident).
     const matched: { key: Uint8Array; row: Row }[] = [];
-    // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items' — a
-    // returned column's old value is a logical read of the dropped row. A bare DELETE still
-    // charges no chain/decompress units at all.
+    // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items'
+    // OLD-side references — a returned old value is a logical read of the dropped row,
+    // while a new.col is the constant NULL row and reads nothing. The RETURNING mask spans
+    // the [base | other] projection row (2 x ncols); only the base (old) half maps back to
+    // storage. A bare DELETE still charges no chain/decompress units at all.
     const mask: boolean[] = new Array(table.columns.length).fill(false);
     if (filter !== null) collectTouched(filter, 0, mask);
-    if (ret !== null) for (const node of ret.nodes) collectTouched(node, 0, mask);
+    if (ret !== null) {
+      const retMask: boolean[] = new Array(2 * table.columns.length).fill(false);
+      for (const node of ret.nodes) collectTouched(node, 0, retMask);
+      for (let i = 0; i < mask.length; i++) {
+        if (retMask[i]) mask[i] = true;
+      }
+    }
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
     // scan"); an empty bound deletes nothing — with RETURNING that is still a query result
     // (empty rows), never a bare statement (grammar.md §32). The whole WHERE stays the
@@ -1429,7 +1451,7 @@ export class Database {
     // snapshot, and a 54P01 here deletes nothing (all-or-nothing).
     const returned =
       ret !== null
-        ? this.projectReturning(ret.nodes, matched.map((m) => m.row), bound, meter)
+        ? this.projectReturning(ret.nodes, matched.map((m) => m.row), null, bound, meter)
         : null;
     // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
     // unmetered write work; an index removal cannot fail).
@@ -1495,7 +1517,7 @@ export class Database {
     let filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
     // The RETURNING projection resolves last (PostgreSQL's analysis order), against the same
     // one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
-    const ret = upd.returning !== null ? this.resolveReturning(table, upd.returning, ptypes) : null;
+    const ret = upd.returning !== null ? this.resolveReturning(table, upd.returning, false, ptypes) : null;
     // The CHECK constraints, resolved once per statement in evaluation (name) order;
     // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
     const checks = this.resolveChecks(table);
@@ -1529,11 +1551,17 @@ export class Database {
     const mask: boolean[] = new Array(table.columns.length).fill(false);
     if (filter !== null) collectTouched(filter, 0, mask);
     for (const p of plans) collectTouched(p.source, 0, mask);
+    // The RETURNING mask spans the [base | other] projection row (new at 0, old at ncols):
+    // the NEW side joins minus the assigned columns (an assigned column's returned value is
+    // the freshly computed one, not a storage read); the OLD side joins unconditionally
+    // (old.col is always a storage read, assigned or not).
     if (ret !== null) {
-      const retMask: boolean[] = new Array(table.columns.length).fill(false);
+      const ncols = table.columns.length;
+      const retMask: boolean[] = new Array(2 * ncols).fill(false);
       for (const node of ret.nodes) collectTouched(node, 0, retMask);
-      for (let i = 0; i < retMask.length; i++) {
-        if (retMask[i] && !plans.some((p) => p.idx === i)) mask[i] = true;
+      for (let i = 0; i < ncols; i++) {
+        if (retMask[i] && !plans.some((p) => p.idx === i)) mask[i] = true; // new side
+        if (retMask[ncols + i]) mask[i] = true; // old side — always a storage read
       }
     }
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
@@ -1615,7 +1643,7 @@ export class Database {
     // writes nothing (all-or-nothing).
     const returned =
       ret !== null
-        ? this.projectReturning(ret.nodes, updates.map((u) => u.row), bound, meter)
+        ? this.projectReturning(ret.nodes, updates.map((u) => u.row), updates.map((u) => u.oldRow), bound, meter)
         : null;
 
     // Index maintenance (indexes.md §4): an entry moves only when its key CHANGED — equal
@@ -3556,8 +3584,11 @@ function groupingErrorColumn(name: string): EngineError {
 // ============================================================================
 
 // ScopeRel is one relation in a FROM scope: its label (alias, else table name, lower-cased
-// for case-insensitive matching), the table, and the flat offset of its first column.
-type ScopeRel = { label: string; table: Table; offset: number };
+// for case-insensitive matching), the table, and the flat offset of its first column. A
+// qualifierOnly relation is visible ONLY to qualified references — the RETURNING old/new
+// row-version pseudo-relations (grammar.md §32): bare-column resolution skips it (no new
+// ambiguity), every other statement never builds one.
+type ScopeRel = { label: string; table: Table; offset: number; qualifierOnly?: boolean };
 
 // Resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
 // §26): level === 0 is a LOCAL column of this query (a flat index into the joined row); level >= 1
@@ -3594,13 +3625,42 @@ class Scope {
     return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }], catalog, null, true);
   }
 
+  // returning is the scope a RETURNING list resolves against (grammar.md §32): the target
+  // table at offset 0 (bare and table-qualified references read the BASE row), plus the
+  // old/new row-version pseudo-relations as QUALIFIER-ONLY rels over the concatenated
+  // projection row [base | other]. baseIsOld says which version the base row is: false for
+  // INSERT/UPDATE (base = the new row, `old` reads the other half), true for DELETE (base =
+  // the old row, `new` reads the other half) — the absent version is the all-NULL row the
+  // caller appends. A target table literally named old/new SHADOWS that qualifier (the
+  // pseudo-relation is suppressed; PostgreSQL's probed rule — its WITH (OLD AS o, ...)
+  // aliasing escape stays deferred).
+  static returning(catalog: Database, t: Table, baseIsOld: boolean): Scope {
+    const n = t.columns.length;
+    const label = t.name.toLowerCase();
+    const oldOffset = baseIsOld ? 0 : n;
+    const newOffset = baseIsOld ? n : 0;
+    const rels: ScopeRel[] = [{ label, table: t, offset: 0 }];
+    for (const pseudo of [
+      { label: "old", offset: oldOffset },
+      { label: "new", offset: newOffset },
+    ]) {
+      if (label !== pseudo.label) {
+        rels.push({ label: pseudo.label, table: t, offset: pseudo.offset, qualifierOnly: true });
+      }
+    }
+    return new Scope(rels, catalog, null, true);
+  }
+
   // resolveBare resolves a bare column name against THIS scope, then OUTWARD through the parent
   // chain. Within one scope: two+ relations have it → 42702 ambiguous; exactly one → local; none
   // → fall through to the parent. A name found only in an ancestor is an outer reference (nearest
   // scope wins). 42703 only if no scope in the chain has it.
+  // A qualifier-only rel (the RETURNING old/new pseudo-relations) is invisible here — no
+  // new ambiguity (grammar.md §32).
   resolveBare(name: string): Resolved {
     let found = -1;
     for (const r of this.rels) {
+      if (r.qualifierOnly) continue;
       const local = columnIndex(r.table, name);
       if (local >= 0) {
         if (found >= 0) throw ambiguousColumn(name);
@@ -3870,7 +3930,10 @@ function resolveProjections(
     const nodes: RExpr[] = [];
     const names: string[] = [];
     const types: ResolvedType[] = [];
+    // The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
+    // relations' columns exactly as before (grammar.md §32).
     for (const r of scope.rels) {
+      if (r.qualifierOnly) continue;
       r.table.columns.forEach((c, i) => {
         nodes.push({ kind: "column", index: r.offset + i });
         names.push(c.name);

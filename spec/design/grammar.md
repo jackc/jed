@@ -1346,11 +1346,38 @@ reserves `RETURNING` and rejects even `AS returning`; jed's explicit-`AS` form s
 legal — the standing no-reserved-words divergence, oracle-overridden like `on`'s).
 `RETURNING` with an empty list is `42601` (the item parser requires an expression).
 
-**Deliberate divergence — no `OLD`/`NEW` rows.** PostgreSQL 18 lets a `RETURNING` list
-qualify items with `old.`/`new.` (and alias them via `WITH (OLD AS o, NEW AS n)`). jed
-does not implement the feature: `old`/`new` are ordinary identifiers, so `RETURNING
-old.v` resolves like any unknown qualifier (`42P01` unless the target table is named
-`old`). Recorded in the override ledger; relaxable later ([../../TODO.md](../../TODO.md)).
+**The `old.`/`new.` row-version qualifiers** (PostgreSQL 18 semantics, probed). Inside a
+`RETURNING` list — and only there — the qualifiers `old` and `new` name the affected row's
+two versions: `old.col` is the pre-statement value, `new.col` the post-statement value.
+The side a statement does not produce is the **all-NULL row**: an `INSERT`'s `old.col` is
+NULL (every column, the key included), a `DELETE`'s `new.col` is NULL. Bare and
+table-qualified references keep their §32 meaning unchanged (the new row under
+INSERT/UPDATE, the old row under DELETE) — so `new.v - old.v` is an UPDATE's delta, and
+for an unassigned column `old.v = new.v`. The qualifiers work anywhere in an item
+expression, **including inside subqueries** (they resolve like any outer reference —
+probed: `RETURNING (SELECT old.v + s.a FROM s ...)`). Resolution rules:
+
+- **Only in `RETURNING`.** In any other clause (`SET`, `WHERE`, a `SELECT`), `old`/`new`
+  are ordinary identifiers — an unknown qualifier is the usual `42P01`
+  (*missing FROM-clause entry*), exactly PostgreSQL's behavior (probed).
+- **The table name shadows the qualifier** (probed): if the target table is itself named
+  `old` (or `new`), that qualifier keeps its ordinary table-qualified meaning — the
+  row-version pseudo-relation is suppressed. PostgreSQL recovers the hidden version via
+  `RETURNING WITH (OLD AS o, NEW AS n)` aliasing; jed defers that form (a deliberate,
+  relaxable narrowing — the unaliased qualifiers are the whole feature surface this
+  slice; [../../TODO.md](../../TODO.md)).
+- An unknown column under a qualifier is `42703`; **bare** `old`/`new` are ordinary column
+  references (a column may be named either — they resolve normally, never to a row
+  version); `old.*`/`new.*` follow the standing no-qualified-star narrowing (§15).
+- **Output names** follow §8 unchanged: `RETURNING old.v` names the column `v` (the
+  qualifier never leaks — matches PostgreSQL).
+
+Operationally the projection row is the **concatenation** `[base | other]` of the two
+versions (base = what bare references read; other = the opposite version, the all-NULL
+row when the statement has no such version), and `old`/`new` are **qualifier-only**
+pseudo-relations over it — invisible to bare-column resolution (no new ambiguity) and to
+every other statement's scope. Cost: the qualifiers are leaves like any column, and the
+**touched set** distinguishes the sides — [cost.md](cost.md) §3 "`RETURNING`".
 
 **Cost.** Each returned row charges `row_produced` plus its items' metered evaluation,
 and the items' column references join an UPDATE/DELETE's touched set —

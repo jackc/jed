@@ -1257,7 +1257,9 @@ impl Database {
                 // order) and before binding/execution — a 42703 here beats a would-be 23505
                 // (grammar.md §32).
                 let ret = match &returning {
-                    Some(items) => Some(self.resolve_returning(&table, items, &mut ptypes)?),
+                    Some(items) => {
+                        Some(self.resolve_returning(&table, items, false, &mut ptypes)?)
+                    }
                     None => None,
                 };
                 let bound = bind_params(params, &ptypes.finalize()?)?;
@@ -1326,7 +1328,9 @@ impl Database {
                 let mut ptypes = ParamTypes::default();
                 let mut plan = self.plan_query(&QueryExpr::Select(sel), None, &mut ptypes)?;
                 let ret = match &returning {
-                    Some(items) => Some(self.resolve_returning(&table, items, &mut ptypes)?),
+                    Some(items) => {
+                        Some(self.resolve_returning(&table, items, false, &mut ptypes)?)
+                    }
                     None => None,
                 };
                 let bound = bind_params(params, &ptypes.finalize()?)?;
@@ -1585,7 +1589,7 @@ impl Database {
         let returned = match returning {
             Some(nodes) => {
                 let prows: Vec<&Row> = prepared.iter().map(|(_, r)| r).collect();
-                Some(self.project_returning(nodes, &prows, params, meter)?)
+                Some(self.project_returning(nodes, &prows, None, params, meter)?)
             }
             None => None,
         };
@@ -1620,19 +1624,22 @@ impl Database {
         Ok(returned)
     }
 
-    /// Resolve a RETURNING item list against the target table's one-relation scope
-    /// (grammar.md §32): aggregates are 42803 (`Forbidden`), subqueries resolve (and may
-    /// correlate against the returned row), output names follow §8. Returns the projection
-    /// nodes and names; the item types have no consumer. The INSERT path uses this (its
-    /// target borrow ends early); UPDATE/DELETE resolve inline against their live scope.
+    /// Resolve a RETURNING item list against the target table's RETURNING scope
+    /// (grammar.md §32; `Scope::returning` — the table at offset 0 plus the `old`/`new`
+    /// qualifier-only pseudo-relations over the `[base | other]` projection row, with
+    /// `base_is_old` true for DELETE): aggregates are 42803 (`Forbidden`), subqueries
+    /// resolve (and may correlate against either row version), output names follow §8.
+    /// Returns the projection nodes and names; the item types have no consumer. The INSERT
+    /// path uses this (its target borrow ends early); UPDATE/DELETE resolve inline.
     fn resolve_returning(
         &self,
         table: &str,
         items: &SelectItems,
+        base_is_old: bool,
         ptypes: &mut ParamTypes,
     ) -> Result<(Vec<RExpr>, Vec<String>)> {
         let tdef = self.table(table).expect("INSERT target resolved above");
-        let scope = Scope::single(self, tdef);
+        let scope = Scope::returning(self, tdef, base_is_old);
         let (nodes, names, _types) =
             resolve_projections(&scope, items, &mut AggCtx::Forbidden, ptypes)?;
         Ok((nodes, names))
@@ -1642,11 +1649,15 @@ impl Database {
     /// cost.md §3): per returned row, guard the ceiling, charge one `row_produced`, then
     /// evaluate each item — metered expression work, exactly a SELECT's projection (a
     /// correlated subquery re-runs here, its outer reference reading the row being
-    /// returned). Callers run this after all validation and BEFORE any write.
+    /// returned). The evaluation row is the concatenation `[base | other]` the RETURNING
+    /// scope resolved against: `others[i]` is the row's opposite version (UPDATE's old
+    /// rows), `None` the all-NULL row (INSERT's old side, DELETE's new side). Callers run
+    /// this after all validation and BEFORE any write.
     fn project_returning(
         &self,
         nodes: &[RExpr],
         rows: &[&Row],
+        others: Option<&[&Row]>,
         params: &[Value],
         meter: &mut Meter,
     ) -> Result<Vec<Vec<Value>>> {
@@ -1656,12 +1667,17 @@ impl Database {
             outer: &[],
         };
         let mut out = Vec::with_capacity(rows.len());
-        for &row in rows {
+        for (i, &row) in rows.iter().enumerate() {
             meter.guard()?;
             meter.charge(COSTS.row_produced);
+            let mut combined = row.clone();
+            match others {
+                Some(olds) => combined.extend_from_slice(olds[i]),
+                None => combined.resize(2 * row.len(), Value::Null),
+            }
             let mut vals = Vec::with_capacity(nodes.len());
             for node in nodes {
-                vals.push(node.eval(row, &env, meter)?);
+                vals.push(node.eval(&combined, &env, meter)?);
             }
             out.push(vals);
         }
@@ -1700,10 +1716,13 @@ impl Database {
             Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
             None => None,
         };
+        // RETURNING resolves against its own scope: DELETE's base row IS the old row
+        // (bare = `old.` = the deleted values; `new.` is the all-NULL side — grammar.md §32).
         let mut ret = match &del.returning {
             Some(items) => {
+                let rscope = Scope::returning(self, table, true);
                 let (nodes, names, _types) =
-                    resolve_projections(&scope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
+                    resolve_projections(&rscope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
                 Some((nodes, names))
             }
             None => None,
@@ -1747,16 +1766,22 @@ impl Database {
             (Some(f), Some((pk_idx, pk_ty))) => detect_pk_bound(f, pk_idx, pk_ty),
             _ => None,
         };
-        // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items' —
-        // a returned column's old value is a logical read of the dropped row. A bare DELETE
-        // still charges no chain/decompress units at all.
+        // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items'
+        // OLD-side references — a returned old value is a logical read of the dropped row,
+        // while a `new.col` is the constant NULL row and reads nothing. The RETURNING mask
+        // spans the [base | other] projection row (2 x ncols); only the base (old) half maps
+        // back to storage. A bare DELETE still charges no chain/decompress units at all.
         let mut mask = vec![false; ncols];
         if let Some(f) = &filter {
             collect_touched(f, 0, &mut mask);
         }
         if let Some((nodes, _)) = &ret {
+            let mut ret_mask = vec![false; 2 * ncols];
             for node in nodes {
-                collect_touched(node, 0, &mut mask);
+                collect_touched(node, 0, &mut ret_mask);
+            }
+            for (i, m) in mask.iter_mut().enumerate() {
+                *m |= ret_mask[i];
             }
         }
         let (entries, (overlap, slabs)) = match &pk_bound {
@@ -1799,7 +1824,7 @@ impl Database {
         let returned = match &ret {
             Some((nodes, _)) => {
                 let prows: Vec<&Row> = matched.iter().map(|(_, r)| r).collect();
-                Some(self.project_returning(nodes, &prows, &bound, &mut meter)?)
+                Some(self.project_returning(nodes, &prows, None, &bound, &mut meter)?)
             }
             None => None,
         };
@@ -1905,12 +1930,14 @@ impl Database {
             Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
             None => None,
         };
-        // The RETURNING projection resolves last (PostgreSQL's analysis order), against the
-        // same one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
+        // The RETURNING projection resolves last (PostgreSQL's analysis order), against its
+        // own scope: UPDATE's base row is the NEW row (bare = `new.` = post-assignment), and
+        // `old.` reads the pre-update half of [base | other] (grammar.md §32).
         let mut ret = match &upd.returning {
             Some(items) => {
+                let rscope = Scope::returning(self, table, false);
                 let (nodes, names, _types) =
-                    resolve_projections(&scope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
+                    resolve_projections(&rscope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
                 Some((nodes, names))
             }
             None => None,
@@ -1961,9 +1988,12 @@ impl Database {
             _ => None,
         };
         // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's,
-        // and the RETURNING items' MINUS the assigned columns — an assigned column's returned
-        // value is the freshly computed one, not a storage read. The rewrite re-stores an
-        // untouched spilled value without logically re-reading it (large-values.md §14).
+        // and the RETURNING items' — the NEW side minus the assigned columns (an assigned
+        // column's returned value is the freshly computed one, not a storage read), plus the
+        // OLD side unconditionally (`old.col` is always a storage read, assigned or not; the
+        // RETURNING mask spans the [base | other] projection row, new at 0, old at ncols).
+        // The rewrite re-stores an untouched spilled value without logically re-reading it
+        // (large-values.md §14).
         let mut mask = vec![false; ncols];
         if let Some(f) = &filter {
             collect_touched(f, 0, &mut mask);
@@ -1972,14 +2002,13 @@ impl Database {
             collect_touched(&plan.source, 0, &mut mask);
         }
         if let Some((nodes, _)) = &ret {
-            let mut ret_mask = vec![false; ncols];
+            let mut ret_mask = vec![false; 2 * ncols];
             for node in nodes {
                 collect_touched(node, 0, &mut ret_mask);
             }
-            for (i, touched) in ret_mask.iter().enumerate() {
-                if *touched && !plans.iter().any(|p| p.idx == i) {
-                    mask[i] = true;
-                }
+            for (i, m) in mask.iter_mut().enumerate() {
+                *m |= ret_mask[i] && !plans.iter().any(|p| p.idx == i); // new side
+                *m |= ret_mask[ncols + i]; // old side — always a storage read
             }
         }
         let (entries, (overlap, slabs)) = match &pk_bound {
@@ -2091,7 +2120,8 @@ impl Database {
         let returned = match &ret {
             Some((nodes, _)) => {
                 let prows: Vec<&Row> = updates.iter().map(|(_, new_row, _)| new_row).collect();
-                Some(self.project_returning(nodes, &prows, &bound, &mut meter)?)
+                let olds: Vec<&Row> = updates.iter().map(|(_, _, old_row)| old_row).collect();
+                Some(self.project_returning(nodes, &prows, Some(&olds), &bound, &mut meter)?)
             }
             None => None,
         };
@@ -2384,6 +2414,7 @@ impl Database {
                 label,
                 table,
                 offset,
+                qualifier_only: false,
             });
             offset += table.columns.len();
         }
@@ -3359,12 +3390,15 @@ impl Database {
 
 /// One relation in a FROM scope: its label (alias, else table name — lower-cased for
 /// case-insensitive matching), the table, and the flat offset of its first column in the
-/// joined row.
+/// joined row. A `qualifier_only` relation is visible ONLY to qualified references — the
+/// RETURNING `old`/`new` row-version pseudo-relations (grammar.md §32): bare-column
+/// resolution skips it (no new ambiguity), every other statement never builds one.
 #[derive(Clone)]
 struct ScopeRel<'a> {
     label: String,
     table: &'a Table,
     offset: usize,
+    qualifier_only: bool,
 }
 
 /// How a column reference resolved against the scope CHAIN (spec/design/grammar.md §26).
@@ -3402,7 +3436,45 @@ impl<'a> Scope<'a> {
                 label: table.name.to_ascii_lowercase(),
                 table,
                 offset: 0,
+                qualifier_only: false,
             }],
+            parent: None,
+            catalog,
+            allow_subquery: true,
+        }
+    }
+
+    /// The scope a RETURNING list resolves against (grammar.md §32): the target table at
+    /// offset 0 (bare and table-qualified references read the BASE row), plus the `old`/`new`
+    /// row-version pseudo-relations as QUALIFIER-ONLY rels over the concatenated projection
+    /// row `[base | other]`. `base_is_old` says which version the base row is: false for
+    /// INSERT/UPDATE (base = the new row, `old` reads the other half), true for DELETE
+    /// (base = the old row, `new` reads the other half) — the absent version is the all-NULL
+    /// row the caller appends. A target table literally named `old`/`new` SHADOWS that
+    /// qualifier (the pseudo-relation is suppressed; PostgreSQL's probed rule — its
+    /// `WITH (OLD AS o, ...)` aliasing escape stays deferred).
+    fn returning(catalog: &'a Database, table: &'a Table, base_is_old: bool) -> Scope<'a> {
+        let n = table.columns.len();
+        let label = table.name.to_ascii_lowercase();
+        let (old_offset, new_offset) = if base_is_old { (0, n) } else { (n, 0) };
+        let mut rels = vec![ScopeRel {
+            label: label.clone(),
+            table,
+            offset: 0,
+            qualifier_only: false,
+        }];
+        for (pseudo, offset) in [("old", old_offset), ("new", new_offset)] {
+            if label != pseudo {
+                rels.push(ScopeRel {
+                    label: pseudo.to_string(),
+                    table,
+                    offset,
+                    qualifier_only: true,
+                });
+            }
+        }
+        Scope {
+            rels,
             parent: None,
             catalog,
             allow_subquery: true,
@@ -3413,10 +3485,14 @@ impl<'a> Scope<'a> {
     /// Within one scope: two+ relations have it → 42702 ambiguous; exactly one → `Local`; none
     /// → fall through to the parent. A name found only in an ancestor is an `Outer` reference
     /// (nearest scope wins — an inner match shadows an outer one, matching PostgreSQL). 42703
-    /// only if no scope in the chain has it.
+    /// only if no scope in the chain has it. A qualifier-only rel (the RETURNING `old`/`new`
+    /// pseudo-relations) is invisible here — no new ambiguity (grammar.md §32).
     fn resolve_bare(&self, name: &str) -> Result<Resolved> {
         let mut found: Option<usize> = None;
         for r in &self.rels {
+            if r.qualifier_only {
+                continue;
+            }
             if let Some(local) = r.table.column_index(name) {
                 if found.is_some() {
                     return Err(ambiguous_column(name));
@@ -5149,7 +5225,9 @@ fn resolve_projections(
             let mut nodes = Vec::new();
             let mut names = Vec::new();
             let mut types = Vec::new();
-            for rel in &scope.rels {
+            // The RETURNING `old`/`new` pseudo-relations are qualifier-only: `*` expands the
+            // real relations' columns exactly as before (grammar.md §32).
+            for rel in scope.rels.iter().filter(|r| !r.qualifier_only) {
                 for (i, c) in rel.table.columns.iter().enumerate() {
                     nodes.push(RExpr::Column(rel.offset + i));
                     names.push(c.name.clone());

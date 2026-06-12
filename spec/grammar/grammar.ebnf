@@ -207,6 +207,10 @@ delete         ::= "DELETE" "FROM" identifier where_clause? returning_clause?
  * row, DELETE the old row. The item list is the ordinary select_items production (general
  * expressions, "AS" output labels, the standalone "*" glob), resolved against the target table
  * only; subqueries are allowed (they observe the pre-statement snapshot), aggregates are 42803.
+ * The qualifiers "old" and "new" name the row's two versions (old.col = pre-statement, new.col
+ * = post-statement; the absent side is the all-NULL row) — no new production: they are ordinary
+ * qualified column references resolved as qualifier-only pseudo-relations, valid only here, and
+ * shadowed by a target table actually named old/new (../design/grammar.md §32; PG 18 semantics).
  * "RETURNING" is NOT reserved (§3): it is recognized positionally as the trailing clause, and it
  * joins the table_ref implicit-alias stop-keyword set so an INSERT ... SELECT source never
  * swallows it as an alias (../design/grammar.md §15). Row order is unspecified (no ORDER BY
