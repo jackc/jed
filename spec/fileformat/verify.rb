@@ -727,17 +727,26 @@ def node_payload(node)
 end
 
 # Split an overflowing node 2-way, promoting one separator: [:split, left, sep_key, sep_rec,
-# right]. Split point m = min(largest m in [1,N-1] with leftpayload(m) <= C, N-2).
-def split_node(node, cap)
-  return [:whole, node] if node_payload(node) <= cap
+# right]. Split point (format.md "Split point"): right_edge (the just-inserted record / promoted
+# separator is the node's last) takes the append rule m = min(m_append, N-2) with m_append =
+# largest m in [1,N-1] with leftpayload(m) <= C; anywhere else splits balanced,
+# m = min(m_balanced, m_append, N-2) with m_balanced = smallest m with 2*leftpayload(m) >= payload.
+# This builder only inserts in ascending key order (build_tree), so right_edge is always true
+# here — the balanced arm is implemented so the reference states the whole contract.
+def split_node(node, cap, right_edge)
+  payload = node_payload(node)
+  return [:whole, node] if payload <= cap
 
   interior = !node_leaf?(node)
   n = node[:keys].size
   best = 1
+  balanced = 0
   (1...n).each do |m|
     lp = (interior ? 4 * (m + 1) : 0) + node[:recs][0, m].sum { |r| r[:size] }
     best = m if lp <= cap
+    balanced = m if balanced.zero? && 2 * lp >= payload
   end
+  best = balanced if !right_edge && balanced.positive? && balanced < best
   m = [best, n - 2].min
   left = { keys: node[:keys][0, m], recs: node[:recs][0, m],
            children: interior ? node[:children][0, m + 1] : [] }
@@ -753,7 +762,8 @@ def tree_insert(node, key, rec, cap)
 
   if node_leaf?(node)
     return split_node({ keys: node[:keys].dup.insert(i, key),
-                        recs: node[:recs].dup.insert(i, rec), children: [] }, cap)
+                        recs: node[:recs].dup.insert(i, rec), children: [] }, cap,
+                      i == node[:keys].size)
   end
   res = tree_insert(node[:children][i], key, rec, cap)
   if res[0] == :split
@@ -762,7 +772,7 @@ def tree_insert(node, key, rec, cap)
     children[i] = left
     children.insert(i + 1, right)
     split_node({ keys: node[:keys].dup.insert(i, sk), recs: node[:recs].dup.insert(i, sr),
-                 children: children }, cap)
+                 children: children }, cap, i == node[:keys].size)
   else
     children = node[:children].dup
     children[i] = res[1]

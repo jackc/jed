@@ -1132,6 +1132,11 @@ impl Database {
         let ps = self.page_size;
         self.working_mut().put_index(&table_key, def, ps);
         let istore = self.index_store_mut(&name_key);
+        // Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
+        // so the built tree packs ~full instead of splintering under the storage-key order the
+        // scan produced (random in entry-key space). Part of the byte contract — the sort fixes
+        // the built tree's shape across cores.
+        entries.sort_unstable();
         for ek in entries {
             assert!(
                 istore.insert(ek, Vec::new())?,

@@ -485,8 +485,15 @@ impl PMap {
 }
 
 /// Build a node from its parts; if its payload overflows `cap`, split it 2-way and promote one
-/// median. The split point `m = min(largest m in [1,N-1] with leftpayload(m) ≤ cap, N-2)` always
-/// yields two non-empty, fitting halves under the `RECORD_MAX = (cap-12)/2` cap (format.md "Why the
+/// median (format.md "Split point"). `right_edge` says the just-edited record (the
+/// inserted/replaced one, or the separator a child split promoted) is the node's LAST: then the
+/// split is the append rule `m = min(m_append, N-2)` with `m_append` = largest m in [1,N-1] with
+/// leftpayload(m) ≤ cap — sequential ascending loads pack left nodes ~full. Anywhere else (and the
+/// delete path's merge-overflow, which has no edited position) splits BALANCED:
+/// `m = min(m_balanced, m_append, N-2)` with `m_balanced` = smallest m with
+/// 2·leftpayload(m) ≥ payload — without it, largest-left degenerates to [N-2 | 1] splinters and
+/// random-order inserts converge on a few-percent fill (benchmarks.md finding). Either `m` yields
+/// two non-empty, fitting halves under the `RECORD_MAX = (cap-12)/2` cap (format.md "Why the
 /// record cap"). `children` empty ⇒ leaf.
 fn build(
     keys: Vec<Vec<u8>>,
@@ -494,6 +501,7 @@ fn build(
     weights: Vec<u32>,
     children: Vec<Child>,
     cap: usize,
+    right_edge: bool,
 ) -> Ins {
     let interior = !children.is_empty();
     let payload: usize = weights.iter().map(|&w| w as usize).sum::<usize>()
@@ -508,8 +516,10 @@ fn build(
     }
 
     let n = keys.len();
-    // largest m in [1, n-1] with leftpayload(m) ≤ cap
+    // m_append = largest m in [1, n-1] with leftpayload(m) ≤ cap;
+    // m_balanced = smallest m in [1, n-1] with 2·leftpayload(m) ≥ payload.
     let mut best = 1usize;
+    let mut balanced = 0usize;
     let mut prefix = 0usize;
     for m in 1..n {
         prefix += weights[m - 1] as usize;
@@ -517,6 +527,12 @@ fn build(
         if lp <= cap {
             best = m;
         }
+        if balanced == 0 && 2 * lp >= payload {
+            balanced = m;
+        }
+    }
+    if !right_edge && balanced != 0 && balanced < best {
+        best = balanced;
     }
     let m = best.min(n - 2).max(1);
 
@@ -570,6 +586,7 @@ fn node_insert(
                 weights,
                 node.children.clone(),
                 cap,
+                i == node.keys.len() - 1,
             ))
         }
         Err(i) => {
@@ -580,7 +597,14 @@ fn node_insert(
                 keys.insert(i, key);
                 vals.insert(i, val);
                 weights.insert(i, weight);
-                Ok(build(keys, vals, weights, Vec::new(), cap))
+                Ok(build(
+                    keys,
+                    vals,
+                    weights,
+                    Vec::new(),
+                    cap,
+                    i == node.keys.len(),
+                ))
             } else {
                 // Fault the target child (a `Resident` interior, or an `OnDisk` leaf brought in for
                 // mutation — it becomes a dirty resident node on the rebuilt path).
@@ -613,7 +637,14 @@ fn node_insert(
                         weights.insert(i, mw);
                         children[i] = Child::Resident(left);
                         children.insert(i + 1, Child::Resident(right));
-                        Ok(build(keys, vals, weights, children, cap))
+                        Ok(build(
+                            keys,
+                            vals,
+                            weights,
+                            children,
+                            cap,
+                            i == node.keys.len(),
+                        ))
                     }
                 }
             }
@@ -757,7 +788,8 @@ fn merge_at(
     let mut weights = node.weights.clone();
     let mut children = node.children.clone();
 
-    match build(mkeys, mvals, mweights, mchildren, cap) {
+    // Merge-overflow: balanced split (format.md — no edited position exists here).
+    match build(mkeys, mvals, mweights, mchildren, cap, false) {
         Ins::Whole(merged) => {
             keys.remove(j);
             vals.remove(j);

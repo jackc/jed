@@ -382,12 +382,35 @@ to the parent (which may then overflow and split, etc.; a root split grows the h
 
 ```
 leftpayload(m) = (interior ? 4·(m + 1) : 0) + Σ_{i < m} record_size(i)
+m_append       = the largest  m in [1, N-1] with leftpayload(m) ≤ C
+m_balanced     = the smallest m in [1, N-1] with 2·leftpayload(m) ≥ payload
 ```
 
-Choose `m = min( the largest m in [1, N-1] with leftpayload(m) ≤ C , N - 2 )`. Promote
-`r[m]`; the **left** node gets `r[0 … m)` (and `c[0 … m]`), the **right** node gets
-`r[m+1 … N)` (and `c[m+1 … N]`). The `RECORD_MAX = C/2` cap guarantees this `m` always yields
-two **non-empty** nodes that each **fit** (proof under *Why C/2*).
+The split point depends on **where the just-edited record sits** — the record whose
+insert/replace triggered this rebuild (for an interior node: the separator the child split
+just promoted into it):
+
+- **Right-edge (append) split** — the edited record is the node's **last** (`index N-1`):
+  `m = min(m_append, N-2)`. Sequential ascending loads land here every time and keep
+  packing left nodes ~full.
+- **Balanced split** — anywhere else: `m = min(m_balanced, m_append, N-2)` (the `m_append`
+  term keeps the left half fitting `C` even with near-`RECORD_MAX` records).
+- The delete path's **merge-overflow** split (below) always uses the **balanced** rule —
+  no edited position exists there.
+
+In both cases `m` is clamped to at least `1`. Promote `r[m]`; the **left** node gets
+`r[0 … m)` (and `c[0 … m]`), the **right** node gets `r[m+1 … N)` (and `c[m+1 … N]`). The
+`RECORD_MAX = C/2` cap guarantees either `m` yields two **non-empty** nodes that each
+**fit** (proof under *Why C/2*; for the balanced case additionally:
+`leftpayload(m) ≤ leftpayload(m_append) ≤ C` by the `min`, and the right half is
+`≤ payload − leftpayload(m_balanced) ≤ payload/2 ≤ C` under the same `payload ≤ 2C` bound).
+
+> Why two rules: largest-left-fit alone is optimal for ascending appends but degenerates to
+> a `[N-2 | 1]` splinter for **any other** insert position — under random-order inserts
+> (secondary-index maintenance, a future random pk source) leaves converge on a few-percent
+> fill (the 2026-06 benchmark finding, [../design/benchmarks.md](../design/benchmarks.md)).
+> The position hint keeps the ascending fast path byte-for-byte unchanged while random
+> inserts settle at the classic ~66-70% B-tree fill.
 
 **Delete.** Descend to the key (replacing an interior separator by its **in-order
 predecessor** — the rightmost record of the left subtree — and deleting that from the left
@@ -413,8 +436,8 @@ fit — the same `≤ 2C ⇒ one split suffices` bound the insert path relies on
 **Why the record cap.** Capping a record at `RECORD_MAX = (C-12)/2` makes a two-record node —
 leaf or interior — never exceed `C` (a leaf's two records are `≤ C-12 ≤ C`; an interior's two
 records plus three child pointers are `≤ (C-12) + 12 = C`), so a node overflows only at
-`N ≥ 3`, and the split point `m = min( largest m with leftpayload(m) ≤ C , N-2 )` always lands
-in `[1, N-2]` with both halves non-empty and ≤ `C`. Without the cap, a node could overflow on
+`N ≥ 3`, and the split point (either rule above — both are bounded by `min(m_append, N-2)`)
+always lands in `[1, N-2]` with both halves non-empty and ≤ `C`. Without the cap, a node could overflow on
 its **last**, oversized record, forcing an empty sibling (a degenerate node) or a multi-way
 spill — both of which complicate the byte contract across four implementations. The cap buys an
 all-2-way, no-empty-node scheme at the cost of a tighter (and later-liftable) oversized-row

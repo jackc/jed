@@ -366,7 +366,24 @@ type InsOut =
 // one median. The split point m = min(largest m in [1,N-1] with leftpayload(m) ≤ cap, N-2) always
 // yields two non-empty, fitting halves under RECORD_MAX = (cap-12)/2 (format.md). The < 3 guard is
 // defensive against an oversized record — the oversize surfaces as 0A000 at serialize (format.ts).
-function build(keys: Uint8Array[], vals: Row[], weights: number[], children: Child[], cap: number): InsOut {
+// build constructs a node from the parts; if its payload overflows cap it splits 2-way and promotes
+// one median (format.md "Split point"). rightEdge says the just-edited record (the inserted/replaced
+// one, or the separator a child split promoted) is the node's LAST: then the split is the append
+// rule m = min(m_append, N-2) with m_append = largest m in [1,N-1] with leftpayload(m) <= cap —
+// sequential ascending loads pack left nodes ~full. Anywhere else (and the delete path's
+// merge-overflow, which has no edited position) splits BALANCED: m = min(m_balanced, m_append, N-2)
+// with m_balanced = smallest m with 2*leftpayload(m) >= payload — without it, largest-left
+// degenerates to [N-2 | 1] splinters and random-order inserts converge on a few-percent fill
+// (benchmarks.md finding). Either m yields two non-empty, fitting halves under the
+// RECORD_MAX = (cap-12)/2 cap (format.md).
+function build(
+  keys: Uint8Array[],
+  vals: Row[],
+  weights: number[],
+  children: Child[],
+  cap: number,
+  rightEdge: boolean,
+): InsOut {
   const interior = children.length > 0;
   let total = 0;
   for (const w of weights) total += w;
@@ -377,12 +394,15 @@ function build(keys: Uint8Array[], vals: Row[], weights: number[], children: Chi
 
   const n = keys.length;
   let best = 1;
+  let balanced = 0;
   let prefix = 0;
   for (let m = 1; m < n; m++) {
     prefix += weights[m - 1];
     const lp = (interior ? 4 * (m + 1) : 0) + prefix;
     if (lp <= cap) best = m;
+    if (balanced === 0 && 2 * lp >= total) balanced = m;
   }
+  if (!rightEdge && balanced !== 0 && balanced < best) best = balanced;
   let m = Math.min(best, n - 2);
   if (m < 1) m = 1;
 
@@ -428,10 +448,17 @@ function nodeInsert(
     ctx.replaced = true;
     vals[index] = val;
     weights[index] = weight;
-    return build(n.keys.slice(), vals, weights, n.children.slice(), cap);
+    return build(n.keys.slice(), vals, weights, n.children.slice(), cap, index === n.keys.length - 1);
   }
   if (isLeaf(n)) {
-    return build(insertAt(n.keys, index, key), insertAt(n.vals, index, val), insertAt(n.weights, index, weight), [], cap);
+    return build(
+      insertAt(n.keys, index, key),
+      insertAt(n.vals, index, val),
+      insertAt(n.weights, index, weight),
+      [],
+      cap,
+      index === n.keys.length,
+    );
   }
   // Fault the target child (a resident interior, or an OnDisk leaf brought in for mutation — it
   // becomes a dirty resident node on the rebuilt path).
@@ -447,7 +474,7 @@ function nodeInsert(
   let children = n.children.slice();
   children[index] = residentRef(sub.left);
   children = insertAt(children, index + 1, residentRef(sub.right));
-  return build(keys, vals, weights, children, cap);
+  return build(keys, vals, weights, children, cap, index === n.keys.length);
 }
 
 // maxKV is the rightmost (largest) entry of a subtree — its in-order predecessor. Faults the rightmost
@@ -532,7 +559,8 @@ function mergeAt(n: PNode, j: number, src: LeafSource | null, cap: number): PNod
   const weights = n.weights.slice();
   const children = n.children.slice();
 
-  const out = build(mkeys, mvals, mweights, mchildren, cap);
+  // Merge-overflow: balanced split (format.md — no edited position exists here).
+  const out = build(mkeys, mvals, mweights, mchildren, cap, false);
   if (out.whole !== null) {
     keys.splice(j, 1);
     vals.splice(j, 1);

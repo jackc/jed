@@ -1008,6 +1008,11 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	nameKey := strings.ToLower(def.Name)
 	db.working().putIndex(tableKey, def, db.pageSize)
 	istore := db.working().indexStore(nameKey)
+	// Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
+	// so the built tree packs ~full instead of splintering under the storage-key order the
+	// scan produced (random in entry-key space). Part of the byte contract — the sort fixes
+	// the built tree's shape across cores.
+	slices.SortFunc(entries, bytes.Compare)
 	for _, ek := range entries {
 		inserted, err := istore.Insert(ek, nil)
 		if err != nil {

@@ -927,6 +927,11 @@ export class Database {
     const nameKey = def.name.toLowerCase();
     this.working().putIndex(tableKey, def, this.pageSize);
     const istore = this.working().indexStore(nameKey);
+    // Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
+    // so the built tree packs ~full instead of splintering under the storage-key order the
+    // scan produced (random in entry-key space). Part of the byte contract — the sort fixes
+    // the built tree's shape across cores.
+    entries.sort(compareBytes);
     for (const ek of entries) {
       if (!istore.insert(ek, [])) {
         throw new Error("index entry keys are unique (storage-key suffix)");

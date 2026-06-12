@@ -6,8 +6,9 @@
 schema_version = 1
 
 # Bump whenever bench-setup's generation BEHAVIOR changes (row order, PRNG use, DDL
-# derivation) even if the shapes below do not.
-generator_version = 1
+# derivation — or an engine change that reshapes the produced files, like the format.md
+# split-rule fix) even if the shapes below do not.
+generator_version = 2
 
 [[dataset]]
 name = "small"

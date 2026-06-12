@@ -478,11 +478,17 @@ type insOut struct {
 }
 
 // build constructs a node from the parts; if its payload overflows cap it splits 2-way and promotes
-// one median. The split point m = min(largest m in [1,N-1] with leftpayload(m) ≤ cap, N-2) always
-// yields two non-empty, fitting halves under the RECORD_MAX = (cap-12)/2 cap (format.md). The < 3
+// one median (format.md "Split point"). rightEdge says the just-edited record (the inserted/replaced
+// one, or the separator a child split promoted) is the node's LAST: then the split is the append rule
+// m = min(m_append, N-2) with m_append = largest m in [1,N-1] with leftpayload(m) ≤ cap — sequential
+// ascending loads pack left nodes ~full. Anywhere else (and the delete path's merge-overflow, which
+// has no edited position) splits BALANCED: m = min(m_balanced, m_append, N-2) with m_balanced =
+// smallest m with 2·leftpayload(m) ≥ payload — without it, largest-left degenerates to [N-2 | 1]
+// splinters and random-order inserts converge on a few-percent fill (benchmarks.md finding). Either
+// m yields two non-empty, fitting halves under the RECORD_MAX = (cap-12)/2 cap (format.md). The < 3
 // guard is defensive against an oversized record — it leaves the node whole, and the oversize is
 // surfaced as 0A000 when the node is serialized (format.go).
-func build(keys [][]byte, vals []Row, weights []uint32, children []childRef, cap int) insOut {
+func build(keys [][]byte, vals []Row, weights []uint32, children []childRef, cap int, rightEdge bool) insOut {
 	interior := len(children) > 0
 	payload := 0
 	for _, w := range weights {
@@ -498,6 +504,7 @@ func build(keys [][]byte, vals []Row, weights []uint32, children []childRef, cap
 	n := len(keys)
 	best := 1
 	prefix := 0
+	balanced := 0
 	for m := 1; m < n; m++ {
 		prefix += int(weights[m-1])
 		lp := prefix
@@ -507,8 +514,14 @@ func build(keys [][]byte, vals []Row, weights []uint32, children []childRef, cap
 		if lp <= cap {
 			best = m
 		}
+		if balanced == 0 && 2*lp >= payload {
+			balanced = m
+		}
 	}
 	m := best
+	if !rightEdge && balanced != 0 && balanced < m {
+		m = balanced
+	}
 	if n-2 < m {
 		m = n - 2
 	}
@@ -546,10 +559,10 @@ func nodeInsert(n *pnode, key []byte, val Row, weight uint32, old *Row, replaced
 		*replaced = true
 		vals[i] = val
 		weights[i] = weight
-		return build(cloneKeys(n.keys), vals, weights, cloneChildren(n.children), cap), nil
+		return build(cloneKeys(n.keys), vals, weights, cloneChildren(n.children), cap, i == len(n.keys)-1), nil
 	}
 	if n.isLeaf() {
-		return build(insertKeyAt(n.keys, i, key), insertValAt(n.vals, i, val), insertWeightAt(n.weights, i, weight), nil, cap), nil
+		return build(insertKeyAt(n.keys, i, key), insertValAt(n.vals, i, val), insertWeightAt(n.weights, i, weight), nil, cap, i == len(n.keys)), nil
 	}
 	// Fault the target child (a resident interior, or an OnDisk leaf brought in for mutation — it
 	// becomes a dirty resident node on the rebuilt path).
@@ -572,7 +585,7 @@ func nodeInsert(n *pnode, key []byte, val Row, weight uint32, old *Row, replaced
 	children := cloneChildren(n.children)
 	children[i] = residentRef(sub.left)
 	children = insertChildAt(children, i+1, residentRef(sub.right))
-	return build(keys, vals, weights, children, cap), nil
+	return build(keys, vals, weights, children, cap, i == len(n.keys)), nil
 }
 
 // maxKV is the rightmost (largest) entry of a subtree — its in-order predecessor. Faults the rightmost
@@ -709,7 +722,7 @@ func mergeAt(n *pnode, j int, src leafSource, cap int) (*pnode, error) {
 	weights := cloneWeights(n.weights)
 	children := cloneChildren(n.children)
 
-	out := build(mkeys, mvals, mweights, mchildren, cap)
+	out := build(mkeys, mvals, mweights, mchildren, cap, false) // merge-overflow: balanced (format.md)
 	if out.whole != nil {
 		keys = removeKeyAt(keys, j)
 		vals, _ = removeValAt(vals, j)
