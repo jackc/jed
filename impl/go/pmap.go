@@ -354,10 +354,21 @@ func (b keyBound) entryWindow(n *pnode) (int, int) {
 // is in bound while both its adjacent children are pruned, so the entry window can start one slot
 // before the child window — emitted before the descent loop.
 func (m *PMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []Row, error) {
+	keys, vals, _, err := m.rangeEntriesCounted(b, src)
+	return keys, vals, err
+}
+
+// rangeEntriesCounted is rangeEntries plus the number of B-tree nodes the bounded traversal
+// visits — the page_read count overlapNodeCount would return, observed during the ONE windowed
+// walk instead of a second counting descent (the visited sets are identical by construction:
+// both window with childWindow).
+func (m *PMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []Row, int, error) {
 	var keys [][]byte
 	var vals []Row
+	nodes := 0
 	var walk func(n *pnode) error
 	walk = func(n *pnode) error {
+		nodes++
 		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
 			for i := ef; i < el; i++ {
@@ -388,10 +399,10 @@ func (m *PMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []Row, error)
 	}
 	if m.root != nil {
 		if err := walk(m.root); err != nil {
-			return nil, nil, err
+			return nil, nil, 0, err
 		}
 	}
-	return keys, vals, nil
+	return keys, vals, nodes, nil
 }
 
 // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it

@@ -897,14 +897,14 @@ export class Database {
     for (const c of cols) mask[c] = true;
     const def: IndexDef = { name, columns: cols, unique: ci.unique };
     const store = this.readSnap().store(ci.table);
-    const { pages: nodes, slabs } = store.scanUnits(mask);
+    const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
     meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
     const entries: Uint8Array[] = [];
     // A UNIQUE build verifies the existing rows before the index is registered
     // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
     // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
     const seenPrefixes = new Set<string>();
-    for (const e of store.entriesInKeyOrder()) {
+    for (const e of stored) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
       if (def.unique) {
@@ -985,12 +985,14 @@ export class Database {
     prefix.set(agreed!, 1);
     const b: KeyBound = { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
     const istore = this.readSnap().indexStore(ib.nameKey);
-    const entries = istore.rangeEntries(b);
-    let pages = istore.overlapNodeCount(b);
+    // The index store has no payload columns, so its mask is empty and its fused scan
+    // contributes only the index-tree page_read count (no spill/compress units).
+    const iscan = istore.rangeScanWithUnits(b, []);
+    let pages = iscan.pages;
     const store = this.readSnap().store(tableName);
     let slabs = 0;
     const rows: Row[] = [];
-    for (const e of entries) {
+    for (const e of iscan.entries) {
       // Skip the remaining key components (each self-delimiting — indexes.md §5); the
       // suffix after them is the row's storage key (indexes.md §3).
       let at = prefix.length;
@@ -998,13 +1000,11 @@ export class Database {
         at += e.key[at] === 0x01 ? 1 : 1 + widthBytes(ty);
       }
       const rowKey = e.key.slice(at);
-      const point: KeyBound = { lo: rowKey, loInc: true, hi: rowKey, hiInc: true };
-      const u = store.overlapScanUnits(point, mask);
+      const u = store.getWithUnits(rowKey, mask);
       pages += u.pages;
       slabs += u.slabs;
-      const row = store.get(rowKey);
-      if (row === undefined) throw new Error("an index entry references a stored row");
-      rows.push(row);
+      if (u.row === undefined) throw new Error("an index entry references a stored row");
+      rows.push(u.row);
     }
     return { rows, pages, slabs };
   }
@@ -2115,14 +2115,14 @@ export class Database {
           rows = [];
           nodeCount = 0;
         } else {
-          rows = store.rangeRows(b);
-          const u = store.overlapScanUnits(b, plan.relMasks[ri]!);
+          const u = store.rangeScanWithUnits(b, plan.relMasks[ri]!);
+          rows = u.entries.map((e) => e.row);
           nodeCount = u.pages;
           slabs = u.slabs;
         }
       } else {
-        rows = store.iterInKeyOrder();
-        const u = store.scanUnits(plan.relMasks[ri]!);
+        const u = store.scanWithUnits(plan.relMasks[ri]!);
+        rows = u.entries.map((e) => e.row);
         nodeCount = u.pages;
         slabs = u.slabs;
       }
@@ -2791,11 +2791,11 @@ function scanEntries(
     // Top-level statement: no enclosing query, so the bound never has a correlated source.
     const b = buildKeyBound(pkBound, params, []);
     if (b === null) return { entries: null, overlap: 0, slabs: 0 };
-    const u = store.overlapScanUnits(b, mask);
-    return { entries: store.rangeEntries(b), overlap: u.pages, slabs: u.slabs };
+    const u = store.rangeScanWithUnits(b, mask);
+    return { entries: u.entries, overlap: u.pages, slabs: u.slabs };
   }
-  const u = store.scanUnits(mask);
-  return { entries: store.entriesInKeyOrder(), overlap: u.pages, slabs: u.slabs };
+  const u = store.scanWithUnits(mask);
+  return { entries: u.entries, overlap: u.pages, slabs: u.slabs };
 }
 
 // ---- Subquery helpers (spec/design/grammar.md §26) ----------------------

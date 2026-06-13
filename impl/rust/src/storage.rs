@@ -188,19 +188,6 @@ impl TableStore {
         self.rows.iter(src_ref)
     }
 
-    /// The rows whose primary key lies within the bound, in key order — a bounded B-tree scan that
-    /// faults only the leaves the bound spans (spec/design/cost.md §3 "bounded scan").
-    pub(crate) fn range_rows(&self, b: &KeyBound) -> Result<Vec<Row>> {
-        let src = make_src(&self.paging, &self.col_types);
-        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-        Ok(self
-            .rows
-            .range_entries(b, src_ref)?
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect())
-    }
-
     /// The `(encoded key, row)` pairs whose primary key lies within the bound, in key order (the
     /// mutation paths need the keys to remove/replace).
     pub(crate) fn range_entries(&self, b: &KeyBound) -> Result<Vec<(Vec<u8>, Row)>> {
@@ -251,6 +238,60 @@ impl TableStore {
             }
         }
         Ok((pages, slabs))
+    }
+
+    /// Fused single-descent bounded scan: the admitted `(key, row)` entries PLUS the
+    /// `(page_read, value_decompress)` cost block the bound charges — exactly
+    /// [`range_entries`](TableStore::range_entries) + [`overlap_scan_units`](TableStore::overlap_scan_units),
+    /// computed in ONE B-tree traversal instead of three (the windowed walk visits precisely the
+    /// nodes `overlap_node_count` counts, and the per-admitted-record spill/compress units are
+    /// computed inline from the entries it collects). Byte-identical cost and rows by construction.
+    pub(crate) fn range_scan_with_units(
+        &self,
+        b: &KeyBound,
+        mask: &[bool],
+    ) -> Result<(Vec<(Vec<u8>, Row)>, usize, usize)> {
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        let (entries, mut pages) = self.rows.range_entries_counted(b, src_ref)?;
+        let mut slabs = 0usize;
+        if crate::format::any_spillable_masked(&self.col_types, mask) {
+            for (k, row) in &entries {
+                let u = crate::format::record_scan_units(&self.col_types, k, row, self.cap, mask);
+                pages += u.pages;
+                slabs += u.decompress;
+            }
+        }
+        Ok((entries, pages, slabs))
+    }
+
+    /// Fused single-descent full scan: every `(key, row)` entry PLUS the full-scan cost block —
+    /// [`iter_entries`](TableStore::iter_entries) + [`scan_units`](TableStore::scan_units) in one
+    /// traversal (the unbounded bound visits every node, so the count equals `node_count`).
+    pub(crate) fn scan_with_units(
+        &self,
+        mask: &[bool],
+    ) -> Result<(Vec<(Vec<u8>, Row)>, usize, usize)> {
+        self.range_scan_with_units(&KeyBound::unbounded(), mask)
+    }
+
+    /// Fused single-descent point lookup: the row at `key` (if any) PLUS the
+    /// `(page_read, value_decompress)` block its point bound charges — the index fetch path's
+    /// [`get`](TableStore::get) + [`overlap_scan_units`](TableStore::overlap_scan_units) in one
+    /// descent.
+    pub(crate) fn get_with_units(
+        &self,
+        key: &[u8],
+        mask: &[bool],
+    ) -> Result<(Option<Row>, usize, usize)> {
+        let point = KeyBound {
+            lo: Some(key.to_vec()),
+            lo_inc: true,
+            hi: Some(key.to_vec()),
+            hi_inc: true,
+        };
+        let (entries, pages, slabs) = self.range_scan_with_units(&point, mask)?;
+        Ok((entries.into_iter().next().map(|(_, v)| v), pages, slabs))
     }
 
     /// The `value_compress` slabs storing this record costs — one `ceil(raw/C)` block per

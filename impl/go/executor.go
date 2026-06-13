@@ -971,15 +971,11 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	}
 	def := IndexDef{Name: name, Columns: cols, Unique: ci.Unique}
 	store := db.readSnap().store(ci.Table)
-	nodes, slabs, err := store.ScanUnits(mask)
+	stored, nodes, slabs, err := store.ScanWithUnits(mask)
 	if err != nil {
 		return Outcome{}, err
 	}
 	meter.Charge(Costs.PageRead*int64(nodes) + Costs.ValueDecompress*int64(slabs))
-	stored, err := store.EntriesInKeyOrder()
-	if err != nil {
-		return Outcome{}, err
-	}
 	entries := make([][]byte, 0, len(stored))
 	// A UNIQUE build verifies the existing rows before the index is registered
 	// (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
@@ -1679,17 +1675,11 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 			// query result (empty rows), never a bare statement (grammar.md §32).
 			return dmlOutcome(retNames, nil, meter.Accrued), nil
 		}
-		if entries, err = store.RangeEntries(kb); err != nil {
-			return Outcome{}, err
-		}
-		if overlap, slabs, err = store.OverlapScanUnits(kb, mask); err != nil {
+		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
 			return Outcome{}, err
 		}
 	} else {
-		if entries, err = store.EntriesInKeyOrder(); err != nil {
-			return Outcome{}, err
-		}
-		if overlap, slabs, err = store.ScanUnits(mask); err != nil {
+		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -1908,17 +1898,11 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			// query result (empty rows), never a bare statement (grammar.md §32).
 			return dmlOutcome(retNames, nil, meter.Accrued), nil
 		}
-		if entries, err = store.RangeEntries(kb); err != nil {
-			return Outcome{}, err
-		}
-		if overlap, slabs, err = store.OverlapScanUnits(kb, mask); err != nil {
+		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
 			return Outcome{}, err
 		}
 	} else {
-		if entries, err = store.EntriesInKeyOrder(); err != nil {
-			return Outcome{}, err
-		}
-		if overlap, slabs, err = store.ScanUnits(mask); err != nil {
+		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -2885,11 +2869,12 @@ func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params 
 	prefix := append([]byte{0x00}, agreed...)
 	b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
 	istore := db.readSnap().indexStore(ib.nameKey)
-	entries, err := istore.RangeEntries(b)
+	// The index store has no payload columns, so its mask is empty and its fused scan
+	// contributes only the index-tree page_read count (no spill/compress units).
+	entries, pages, _, err := istore.RangeScanWithUnits(b, nil)
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	pages = istore.OverlapNodeCount(b)
 	store := db.readSnap().store(tableName)
 	for _, e := range entries {
 		// Skip the remaining key components (each self-delimiting — indexes.md §5);
@@ -2903,17 +2888,12 @@ func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params 
 			}
 		}
 		rowKey := e.Key[at:]
-		point := keyBound{lo: rowKey, loInc: true, hi: rowKey, hiInc: true}
-		n, sl, err := store.OverlapScanUnits(point, mask)
+		row, ok, n, sl, err := store.GetWithUnits(rowKey, mask)
 		if err != nil {
 			return nil, 0, 0, err
 		}
 		pages += n
 		slabs += sl
-		row, ok, err := store.Get(rowKey)
-		if err != nil {
-			return nil, 0, 0, err
-		}
 		if !ok {
 			panic("an index entry references a stored row")
 		}
@@ -3289,22 +3269,26 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		} else if sb != nil {
 			b, empty := db.buildKeyBound(sb.pk, params, outer)
 			if !empty {
-				var err error
-				if rows, err = store.RangeRows(b); err != nil {
+				entries, pages, sl, err := store.RangeScanWithUnits(b, plan.relMasks[ri])
+				if err != nil {
 					return selectResult{}, err
 				}
-				if nodeCount, slabs, err = store.OverlapScanUnits(b, plan.relMasks[ri]); err != nil {
-					return selectResult{}, err
+				rows = make([]Row, len(entries))
+				for i := range entries {
+					rows[i] = entries[i].Row
 				}
+				nodeCount, slabs = pages, sl
 			}
 		} else {
-			var err error
-			if rows, err = store.IterInKeyOrder(); err != nil {
+			entries, pages, sl, err := store.ScanWithUnits(plan.relMasks[ri])
+			if err != nil {
 				return selectResult{}, err
 			}
-			if nodeCount, slabs, err = store.ScanUnits(plan.relMasks[ri]); err != nil {
-				return selectResult{}, err
+			rows = make([]Row, len(entries))
+			for i := range entries {
+				rows[i] = entries[i].Row
 			}
+			nodeCount, slabs = pages, sl
 		}
 		// Materialize this relation's touched columns where the lazy load left unfetched
 		// references (large-values.md §14) — exactly the static set the cost block charges,

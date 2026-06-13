@@ -12,7 +12,7 @@
 
 import type { Value } from "./value.ts";
 import type { ScalarType } from "./types.ts";
-import { PMap, pmapFromLoaded } from "./pmap.ts";
+import { PMap, pmapFromLoaded, unboundedBound } from "./pmap.ts";
 import type { KeyBound, LeafSource, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
 import { resolveUnfetched, anySpillable, anySpillableMasked, recordCompressUnits, recordScanUnits, recordSize } from "./format.ts";
@@ -214,6 +214,48 @@ export class TableStore {
       }
     }
     return { pages, slabs };
+  }
+
+  // rangeScanWithUnits is the fused single-descent bounded scan: the admitted (key, row) entries
+  // PLUS the (page_read, value_decompress) cost block the bound charges — exactly rangeEntries +
+  // overlapScanUnits, computed in ONE B-tree traversal instead of three (the windowed walk visits
+  // precisely the nodes overlapNodeCount counts, and the per-admitted-record spill/compress units
+  // are computed inline from the entries it collects). Byte-identical cost and rows by construction.
+  rangeScanWithUnits(
+    b: KeyBound,
+    mask: boolean[],
+  ): { entries: Entry[]; pages: number; slabs: number } {
+    const { keys, vals, nodes } = this.rows.rangeEntriesCounted(b, this.leafSrc());
+    const entries = keys.map((k, i) => ({ key: k, row: vals[i] }));
+    let pages = nodes;
+    let slabs = 0;
+    if (anySpillableMasked(this.colTypes, mask)) {
+      for (const e of entries) {
+        const u = recordScanUnits(this.colTypes, e.key, e.row, this.cap, mask);
+        pages += u.pages;
+        slabs += u.decompress;
+      }
+    }
+    return { entries, pages, slabs };
+  }
+
+  // scanWithUnits is the fused single-descent full scan: every (key, row) entry PLUS the full-scan
+  // cost block — entriesInKeyOrder + scanUnits in one traversal (the unbounded bound visits every
+  // node, so the count equals nodeCount).
+  scanWithUnits(mask: boolean[]): { entries: Entry[]; pages: number; slabs: number } {
+    return this.rangeScanWithUnits(unboundedBound(), mask);
+  }
+
+  // getWithUnits is the fused single-descent point lookup: the row at key (if any) PLUS the
+  // (page_read, value_decompress) block its point bound charges — the index fetch path's get +
+  // overlapScanUnits in one descent.
+  getWithUnits(
+    key: Uint8Array,
+    mask: boolean[],
+  ): { row: Row | undefined; pages: number; slabs: number } {
+    const point: KeyBound = { lo: key, loInc: true, hi: key, hiInc: true };
+    const { entries, pages, slabs } = this.rangeScanWithUnits(point, mask);
+    return { row: entries.length > 0 ? entries[0].row : undefined, pages, slabs };
   }
 
   // writeCompressUnits is the value_compress slabs storing this record costs — one ceil(raw/C)

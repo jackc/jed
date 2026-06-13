@@ -210,6 +210,53 @@ func (s *TableStore) OverlapScanUnits(b keyBound, mask []bool) (pages, slabs int
 	return pages, slabs, nil
 }
 
+// RangeScanWithUnits is the fused single-descent bounded scan: the admitted (key, row) entries
+// PLUS the (page_read, value_decompress) cost block the bound charges — exactly RangeEntries +
+// OverlapScanUnits, computed in ONE B-tree traversal instead of three (the windowed walk visits
+// precisely the nodes overlapNodeCount counts, and the per-admitted-record spill/compress units
+// are computed inline from the entries it collects). Byte-identical cost and rows by construction.
+func (s *TableStore) RangeScanWithUnits(b keyBound, mask []bool) ([]Entry, int, int, error) {
+	keys, vals, pages, err := s.rows.rangeEntriesCounted(b, s.leafSrc())
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	out := make([]Entry, len(keys))
+	for i := range keys {
+		out[i] = Entry{Key: keys[i], Row: vals[i]}
+	}
+	slabs := 0
+	if anySpillableMasked(s.colTypes, mask) {
+		for _, e := range out {
+			p, d := recordScanUnits(s.colTypes, e.Key, e.Row, s.cap, mask)
+			pages += p
+			slabs += d
+		}
+	}
+	return out, pages, slabs, nil
+}
+
+// ScanWithUnits is the fused single-descent full scan: every (key, row) entry PLUS the full-scan
+// cost block — EntriesInKeyOrder + ScanUnits in one traversal (the unbounded bound visits every
+// node, so the count equals NodeCount).
+func (s *TableStore) ScanWithUnits(mask []bool) ([]Entry, int, int, error) {
+	return s.RangeScanWithUnits(unboundedBound(), mask)
+}
+
+// GetWithUnits is the fused single-descent point lookup: the row at key (if any) PLUS the
+// (page_read, value_decompress) block its point bound charges — the index fetch path's Get +
+// OverlapScanUnits in one descent.
+func (s *TableStore) GetWithUnits(key []byte, mask []bool) (Row, bool, int, int, error) {
+	point := keyBound{lo: key, loInc: true, hi: key, hiInc: true}
+	entries, pages, slabs, err := s.RangeScanWithUnits(point, mask)
+	if err != nil {
+		return nil, false, 0, 0, err
+	}
+	if len(entries) == 0 {
+		return nil, false, pages, slabs, nil
+	}
+	return entries[0].Row, true, pages, slabs, nil
+}
+
 // WriteCompressUnits is the value_compress slabs storing this record costs — one ceil(raw/C)
 // block per disposition-plan compression attempt (cost.md §3; large-values.md §13). Charged by
 // the executor once per stored row version at the INSERT/UPDATE write site. Zero whenever the

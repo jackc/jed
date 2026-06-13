@@ -1102,14 +1102,14 @@ impl Database {
             unique: ci.unique,
         };
         let store = self.store(&ci.table);
-        let (nodes, slabs) = store.scan_units(&mask)?;
+        let (table_entries, nodes, slabs) = store.scan_with_units(&mask)?;
         meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
         let mut entries: Vec<Vec<u8>> = Vec::with_capacity(store.len());
         // A UNIQUE build verifies the existing rows before the index is registered
         // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
         // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
         let mut seen_prefixes: HashSet<Vec<u8>> = HashSet::new();
-        for (key, row) in store.iter_entries()? {
+        for (key, row) in table_entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
             if def.unique
@@ -1810,17 +1810,15 @@ impl Database {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
             Some(bp) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
-                    let store = self.store(&del.table);
-                    (
-                        store.range_entries(&b)?,
-                        store.overlap_scan_units(&b, &mask)?,
-                    )
+                    let (entries, pages, slabs) =
+                        self.store(&del.table).range_scan_with_units(&b, &mask)?;
+                    (entries, (pages, slabs))
                 }
                 None => (Vec::new(), (0, 0)),
             },
             None => {
-                let store = self.store(&del.table);
-                (store.iter_entries()?, store.scan_units(&mask)?)
+                let (entries, pages, slabs) = self.store(&del.table).scan_with_units(&mask)?;
+                (entries, (pages, slabs))
             }
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
@@ -2037,17 +2035,15 @@ impl Database {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
             Some(bp) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
-                    let store = self.store(&upd.table);
-                    (
-                        store.range_entries(&b)?,
-                        store.overlap_scan_units(&b, &mask)?,
-                    )
+                    let (entries, pages, slabs) =
+                        self.store(&upd.table).range_scan_with_units(&b, &mask)?;
+                    (entries, (pages, slabs))
                 }
                 None => (Vec::new(), (0, 0)),
             },
             None => {
-                let store = self.store(&upd.table);
-                (store.iter_entries()?, store.scan_units(&mask)?)
+                let (entries, pages, slabs) = self.store(&upd.table).scan_with_units(&mask)?;
+                (entries, (pages, slabs))
             }
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
@@ -2832,19 +2828,22 @@ impl Database {
             // "index-bounded scan"). Otherwise the full scan is unchanged.
             let (mut rows, (node_count, slabs)) = match &plan.rel_bounds[ri] {
                 Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer) {
-                    Some(b) => (
-                        store.range_rows(&b)?,
-                        store.overlap_scan_units(&b, &plan.rel_masks[ri])?,
-                    ),
+                    Some(b) => {
+                        let (entries, pages, slabs) =
+                            store.range_scan_with_units(&b, &plan.rel_masks[ri])?;
+                        let rows = entries.into_iter().map(|(_, v)| v).collect();
+                        (rows, (pages, slabs))
+                    }
                     None => (Vec::new(), (0, 0)),
                 },
                 Some(ScanBound::Index(ib)) => {
                     self.index_bound_rows(&rel.table_name, ib, params, outer, &plan.rel_masks[ri])?
                 }
-                None => (
-                    store.iter_in_key_order()?,
-                    store.scan_units(&plan.rel_masks[ri])?,
-                ),
+                None => {
+                    let (entries, pages, slabs) = store.scan_with_units(&plan.rel_masks[ri])?;
+                    let rows = entries.into_iter().map(|(_, v)| v).collect();
+                    (rows, (pages, slabs))
+                }
             };
             // Materialize this relation's touched columns where the lazy load left unfetched
             // references (large-values.md §14) — exactly the static set the cost block charges,
@@ -3367,8 +3366,9 @@ impl Database {
             hi_inc: false,
         };
         let istore = self.index_store(&ib.name_key);
-        let entries = istore.range_entries(&bound)?;
-        let mut pages = istore.overlap_node_count(&bound);
+        // The index store has no payload columns, so its mask is empty and its fused scan
+        // contributes only the index-tree page_read count (no spill/compress units).
+        let (entries, mut pages, _) = istore.range_scan_with_units(&bound, &[])?;
         let store = self.store(table_name);
         let mut slabs = 0usize;
         let mut rows = Vec::with_capacity(entries.len());
@@ -3383,20 +3383,10 @@ impl Database {
                 };
             }
             let row_key = &ekey[at..];
-            let point = KeyBound {
-                lo: Some(row_key.to_vec()),
-                lo_inc: true,
-                hi: Some(row_key.to_vec()),
-                hi_inc: true,
-            };
-            let (n, s) = store.overlap_scan_units(&point, mask)?;
+            let (row, n, s) = store.get_with_units(row_key, mask)?;
             pages += n;
             slabs += s;
-            rows.push(
-                store
-                    .get(row_key)?
-                    .expect("an index entry references a stored row"),
-            );
+            rows.push(row.expect("an index entry references a stored row"));
         }
         Ok((rows, (pages, slabs)))
     }

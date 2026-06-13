@@ -423,11 +423,24 @@ impl PMap {
         b: &KeyBound,
         src: Option<&dyn LeafSource>,
     ) -> Result<Vec<(Vec<u8>, Row)>> {
+        Ok(self.range_entries_counted(b, src)?.0)
+    }
+
+    /// [`range_entries`](PMap::range_entries) plus the number of B-tree nodes the bounded traversal
+    /// visits — the `page_read` count [`overlap_node_count`](PMap::overlap_node_count) would return,
+    /// observed during the ONE windowed walk instead of a second counting descent (the visited sets
+    /// are identical by construction: both window with [`KeyBound::child_window`]).
+    pub(crate) fn range_entries_counted(
+        &self,
+        b: &KeyBound,
+        src: Option<&dyn LeafSource>,
+    ) -> Result<(Vec<(Vec<u8>, Row)>, usize)> {
         let mut out = Vec::new();
+        let mut nodes = 0usize;
         if let Some(root) = &self.root {
-            collect_range(root, b, src, &mut out)?;
+            collect_range(root, b, src, &mut out, &mut nodes)?;
         }
-        Ok(out)
+        Ok((out, nodes))
     }
 
     /// The number of B-tree nodes a bounded scan over `b` visits — the `page_read` it charges
@@ -828,13 +841,16 @@ fn collect(node: &Node, src: Option<&dyn LeafSource>, out: &mut Vec<(Vec<u8>, Ro
 /// [`PMap::overlap_node_count`]'s traversal so the visited-node set — and the `page_read` cost — is
 /// identical. One asymmetric edge: a separator entry equal to an INCLUSIVE `lo` is in bound while
 /// both its adjacent children are pruned, so the entry window can start one slot before the child
-/// window — emitted before the descent loop.
+/// window — emitted before the descent loop. `nodes` counts every node the walk enters — the same
+/// total [`PMap::overlap_node_count`] computes, observed for free during the collecting descent.
 fn collect_range(
     node: &Node,
     b: &KeyBound,
     src: Option<&dyn LeafSource>,
     out: &mut Vec<(Vec<u8>, Row)>,
+    nodes: &mut usize,
 ) -> Result<()> {
+    *nodes += 1;
     let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
         for i in ef..el {
@@ -848,7 +864,7 @@ fn collect_range(
     }
     for i in cf..=cl {
         let ch = child(node, i, src)?;
-        collect_range(&ch, b, src, out)?;
+        collect_range(&ch, b, src, out, nodes)?;
         if i >= ef && i < el {
             out.push((node.keys[i].clone(), node.vals[i].clone()));
         }

@@ -306,9 +306,23 @@ export class PMap {
   // is in bound while both its adjacent children are pruned, so the entry window can start one slot
   // before the child window — emitted before the descent loop.
   rangeEntries(b: KeyBound, src: LeafSource | null): { keys: Uint8Array[]; vals: Row[] } {
+    const { keys, vals } = this.rangeEntriesCounted(b, src);
+    return { keys, vals };
+  }
+
+  // rangeEntriesCounted is rangeEntries plus the number of B-tree nodes the bounded traversal
+  // visits — the page_read count overlapNodeCount would return, observed during the ONE windowed
+  // walk instead of a second counting descent (the visited sets are identical by construction:
+  // both window with childWindow).
+  rangeEntriesCounted(
+    b: KeyBound,
+    src: LeafSource | null,
+  ): { keys: Uint8Array[]; vals: Row[]; nodes: number } {
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
+    let nodes = 0;
     const walk = (n: PNode): void => {
+      nodes++;
       const [ef, el] = entryWindow(b, n);
       if (isLeaf(n)) {
         for (let i = ef; i < el; i++) {
@@ -331,7 +345,7 @@ export class PMap {
       }
     };
     if (this.root !== null) walk(this.root);
-    return { keys, vals };
+    return { keys, vals, nodes };
   }
 
   // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
