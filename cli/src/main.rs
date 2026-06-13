@@ -3,6 +3,7 @@
 //! it links the Rust core through the public embedding API and adds no engine behavior.
 
 mod args;
+mod csv;
 mod render;
 mod script;
 mod session;
@@ -142,32 +143,45 @@ fn open_database(a: &args::Args) -> Result<(Database, String), u8> {
     }
 }
 
-/// Resolve the ordered `-c`/`-f` sources to (display name, SQL text); with none given
-/// (and stdin already known not to be a TTY), the single source is stdin.
-fn collect_sources(sources: &[Source]) -> Result<Vec<(String, String)>, String> {
-    if sources.is_empty() {
+/// Resolve the ordered `-c`/`-f`/`--import-csv` sources to script inputs (their file
+/// contents read up front, so a missing file is a startup error); with none given (and
+/// stdin already known not to be a TTY), the single source is stdin.
+fn collect_sources(sources: &[Source]) -> Result<Vec<script::Input>, String> {
+    let stdin_text = || -> Result<String, String> {
         let mut text = String::new();
         std::io::stdin()
             .read_to_string(&mut text)
             .map_err(|e| format!("reading stdin: {e}"))?;
-        return Ok(vec![("<stdin>".to_string(), text)]);
+        Ok(text)
+    };
+    if sources.is_empty() {
+        return Ok(vec![script::Input::Sql {
+            name: "<stdin>".to_string(),
+            text: stdin_text()?,
+        }]);
     }
     sources
         .iter()
         .map(|s| match s {
-            Source::Command(sql) => Ok(("<command>".to_string(), sql.clone())),
-            Source::File(path) if path.as_os_str() == "-" => {
-                let mut text = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut text)
-                    .map_err(|e| format!("reading stdin: {e}"))?;
-                Ok(("<stdin>".to_string(), text))
-            }
-            Source::File(path) => {
-                let text = std::fs::read_to_string(path)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-                Ok((path.display().to_string(), text))
-            }
+            Source::Command(sql) => Ok(script::Input::Sql {
+                name: "<command>".to_string(),
+                text: sql.clone(),
+            }),
+            Source::File(path) if path.as_os_str() == "-" => Ok(script::Input::Sql {
+                name: "<stdin>".to_string(),
+                text: stdin_text()?,
+            }),
+            Source::File(path) => Ok(script::Input::Sql {
+                name: path.display().to_string(),
+                text: std::fs::read_to_string(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+            }),
+            Source::ImportCsv { table, path } => Ok(script::Input::ImportCsv {
+                name: path.display().to_string(),
+                table: table.clone(),
+                text: std::fs::read_to_string(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+            }),
         })
         .collect()
 }

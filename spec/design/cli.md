@@ -56,6 +56,7 @@ jed [OPTIONS] [DBFILE]
   --page-size N           with --create only: the page size locked into the file
   -c SQL                  execute the statements, then exit (repeatable) — script mode
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin) — script mode
+  --import-csv TABLE=FILE import an RFC 4180 CSV into TABLE (repeatable) — script mode
   --format FORMAT         script-mode output format:
                           aligned (default) | box | markdown | csv | json
   -o FILE                 script mode: write results to FILE instead of stdout
@@ -82,6 +83,20 @@ path.
 
 **Exit codes.** `0` success · `1` startup/usage error (bad flags; `58P01`/`58P02`/
 `XX001`/`58030` on open/create) · `2` a SQL statement failed in script mode.
+
+**`--import-csv TABLE=FILE` imports a CSV** — the read half of the CSV story (`--format
+csv` + `-o` is the export half). It parses the RFC 4180 dialect the exporter writes
+(header row required; quoted fields, `""` escaping, CRLF or LF; quoted fields may span
+lines), maps the header's names case-insensitively to TABLE's columns (columns the CSV
+omits take their DEFAULT/NULL), and synthesizes **one multi-row `INSERT`** — so an import
+is **atomic** (the engine's per-statement all-or-nothing: one bad row imports nothing) and
+reports through the ordinary `OK, N rows (cost C)` footer. Values are built as typed SQL
+literals from each column's declared type — numerics and booleans are validated with their
+row/column position (booleans also accept PG `COPY`'s `t`/`f`), everything else passes
+through the engine's own coercion (`22P02` etc.). A bare empty field imports as **NULL**,
+a quoted `""` as the empty string (the PG `COPY ... CSV` convention — the inverse of the
+§5 export policy). Imports are sources like `-c`/`-f` and run in command-line order, so
+`-c 'CREATE TABLE ...' --import-csv t=data.csv` works in one invocation.
 
 **`-o FILE` redirects script-mode results** (OK lines, tables — everything that would hit
 stdout) to FILE; errors stay on stderr, so a failing script still reports on the terminal.
@@ -190,8 +205,8 @@ live in shared modules exercised by the script-mode tests).
 
 ## 8. Future (not v1)
 
-Editor autocomplete from the catalog · SQL syntax highlighting · CSV import / export ·
-`.dump`-style SQL export.
+Editor autocomplete from the catalog · SQL syntax highlighting · `.dump`-style SQL export.
 (Landed since v1: affected-row counts in `Outcome` — the `OK, N rows` footer of §5 —
-`--readonly` (§3), the `box`/`markdown` formats (§5), and `-o` output redirection (§3) —
-a built-in pager is deliberately out; the TUI grid pages interactively, scripts pipe.)
+`--readonly` (§3), the `box`/`markdown` formats (§5), `-o` output redirection (§3) —
+a built-in pager is deliberately out; the TUI grid pages interactively, scripts pipe —
+and CSV import/export: `--import-csv` in, `--format csv` + `-o` out (§3).)

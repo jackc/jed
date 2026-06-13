@@ -12,6 +12,8 @@ pub enum Source {
     Command(String),
     /// `-f FILE` (`-` = stdin)
     File(PathBuf),
+    /// `--import-csv TABLE=FILE`
+    ImportCsv { table: String, path: PathBuf },
 }
 
 #[derive(Debug)]
@@ -40,6 +42,8 @@ usage: jed [OPTIONS] [DBFILE]
   --page-size N           with --create: the page size locked into the file
   -c SQL                  execute the statements, then exit (repeatable)
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin)
+  --import-csv TABLE=FILE import an RFC 4180 CSV (header row required) into TABLE as one
+                          atomic INSERT (repeatable; runs in command-line order with -c/-f)
   --format FORMAT         script-mode output: aligned (default) | box | markdown | csv | json
   -o FILE                 script mode: write results to FILE instead of stdout ('-' = stdout);
                           errors still go to stderr
@@ -84,6 +88,19 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "-f" | "--file" => args
                 .sources
                 .push(Source::File(PathBuf::from(value_for("-f")?))),
+            "--import-csv" => {
+                let v = value_for("--import-csv")?;
+                let Some((table, file)) = v.split_once('=') else {
+                    return Err(format!("bad --import-csv: {v} (expected TABLE=FILE)"));
+                };
+                if table.is_empty() || file.is_empty() {
+                    return Err(format!("bad --import-csv: {v} (expected TABLE=FILE)"));
+                }
+                args.sources.push(Source::ImportCsv {
+                    table: table.to_string(),
+                    path: PathBuf::from(file),
+                });
+            }
             "--format" => {
                 let v = value_for("--format")?;
                 args.format = Format::parse(&v).ok_or_else(|| {
@@ -174,6 +191,21 @@ mod tests {
         assert!(p(&["-c"]).is_err()); // missing value
         assert!(p(&["--readonly"]).is_err()); // needs a DBFILE
         assert!(p(&["--readonly", "--create", "a.jed"]).is_err()); // mutually exclusive
+    }
+
+    #[test]
+    fn import_csv_takes_table_equals_file() {
+        let a = p(&["--import-csv", "t=data.csv"]).unwrap();
+        assert_eq!(
+            a.sources,
+            vec![Source::ImportCsv {
+                table: "t".to_string(),
+                path: PathBuf::from("data.csv"),
+            }]
+        );
+        assert!(p(&["--import-csv", "no-equals"]).is_err());
+        assert!(p(&["--import-csv", "=file"]).is_err());
+        assert!(p(&["--import-csv", "t="]).is_err());
     }
 
     #[test]

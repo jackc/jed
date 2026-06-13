@@ -5,6 +5,7 @@
 
 use std::io::Write;
 
+use crate::csv;
 use crate::render::{self, Format};
 use crate::session::{ExecOutput, Session};
 use crate::splitter;
@@ -15,26 +16,64 @@ pub struct Options {
     pub quiet: bool,
 }
 
-/// Run named SQL sources in order. Returns the process exit code: 0 = success,
-/// 2 = at least one statement (or the input's framing) failed.
+/// One resolved script-mode input, in command-line order (cli.md §3).
+pub enum Input {
+    /// SQL statements from `-c`, `-f`, or stdin: (display name, SQL text).
+    Sql { name: String, text: String },
+    /// `--import-csv TABLE=FILE`, already read: (display name, table, CSV text).
+    ImportCsv {
+        name: String,
+        table: String,
+        text: String,
+    },
+}
+
+/// Run the inputs in order. Returns the process exit code: 0 = success, 2 = at least one
+/// statement (or the input's framing) failed.
 pub fn run(
     session: &mut Session,
-    sources: &[(String, String)], // (display name, SQL text)
+    inputs: &[Input],
     opts: &Options,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
     let mut failed = false;
-    for (name, text) in sources {
-        let stmts = match splitter::split(text) {
-            Ok(stmts) => stmts,
-            Err(e) => {
-                let _ = writeln!(err, "{name}:{}: ERROR 42601: {}", e.line, e.message);
-                return 2; // a malformed input never half-runs, even under --continue-on-error
+    for input in inputs {
+        let (name, stmts) = match input {
+            Input::Sql { name, text } => match splitter::split(text) {
+                Ok(stmts) => (name, stmts.into_iter().map(|s| (s.line, s.sql)).collect()),
+                Err(e) => {
+                    let _ = writeln!(err, "{name}:{}: ERROR 42601: {}", e.line, e.message);
+                    return 2; // a malformed input never half-runs, even under --continue-on-error
+                }
+            },
+            Input::ImportCsv { name, table, text } => {
+                match import_statement(session, table, text) {
+                    // A header-only file imports nothing — report it like a 0-row DML.
+                    Ok(None) => {
+                        if !opts.quiet {
+                            let _ = writeln!(
+                                out,
+                                "{}",
+                                crate::session::statement_line("OK", 0, Some(0))
+                            );
+                        }
+                        continue;
+                    }
+                    Ok(Some(sql)) => (name, vec![(1usize, sql)]),
+                    Err(message) => {
+                        let _ = writeln!(err, "{name}: {message}");
+                        if !opts.continue_on_error {
+                            return 2;
+                        }
+                        failed = true;
+                        continue;
+                    }
+                }
             }
         };
-        for stmt in stmts {
-            match session.run(&stmt.sql) {
+        for (line, sql) in stmts {
+            match session.run(&sql) {
                 Ok(ExecOutput::Statement { tag, cost, rows }) => {
                     if !opts.quiet {
                         // Transaction-control tags print bare; everything else carries
@@ -52,13 +91,7 @@ pub fn run(
                     let _ = render::write_query(out, opts.format, &columns, &rows, cost);
                 }
                 Err(e) => {
-                    let _ = writeln!(
-                        err,
-                        "{name}:{}: ERROR {}: {}",
-                        stmt.line,
-                        e.code(),
-                        e.message
-                    );
+                    let _ = writeln!(err, "{name}:{line}: ERROR {}: {}", e.code(), e.message);
                     if let Some(hint) = hint_for(e.code()) {
                         let _ = writeln!(err, "hint: {hint}");
                     }
@@ -71,6 +104,17 @@ pub fn run(
         }
     }
     if failed { 2 } else { 0 }
+}
+
+/// Resolve one `--import-csv` input to its synthesized INSERT (cli.md §3): parse the CSV,
+/// look the table up in the session's visible catalog, and build the atomic statement.
+fn import_statement(session: &Session, table: &str, text: &str) -> Result<Option<String>, String> {
+    let records = csv::parse(text)?;
+    let def = session
+        .db
+        .table(table)
+        .ok_or_else(|| format!("table does not exist: {table}"))?;
+    csv::import_statement(def, &records)
 }
 
 /// CLI-generated hints for the errors a CLI user can act on (cli.md §5).
