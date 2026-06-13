@@ -741,12 +741,25 @@ class Parser {
     return { from, joins };
   }
 
-  // parseTableRef parses `table_ref ::= identifier ("AS"? identifier)?` — a table name with an
-  // optional alias. An explicit AS takes the next identifier unconditionally; an implicit alias
-  // is taken only when the next token is a word that is NOT a clause/join keyword (so `FROM t
-  // WHERE` and `FROM t JOIN ...` keep no alias). The stop-keyword set is a §8 cross-core surface.
+  // parseTableRef parses `table_ref ::= (identifier | table_function) ("AS"? identifier)?` where
+  // `table_function ::= identifier "(" expr ("," expr)* ")"` — a base table name OR a
+  // set-returning function call (generate_series(1, 5)) used as a row source, each with an
+  // optional alias (grammar.md §15/§35). A `(` immediately after the leading identifier marks
+  // the function form; the resolver owns arity/type errors. The alias logic is identical for
+  // both forms. The stop-keyword set is a §8 cross-core surface.
   private parseTableRef(): TableRef {
     const name = this.expectIdentifier();
+    // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
+    let args: Expr[] | null = null;
+    if (this.peek().kind === "lparen") {
+      this.advance();
+      args = [this.parseExpr()];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        args.push(this.parseExpr());
+      }
+      this.expect("rparen");
+    }
     let alias: string | null = null;
     if (this.peekKeyword() === "as") {
       this.advance();
@@ -758,7 +771,15 @@ class Parser {
         this.advance();
       }
     }
-    return { name, alias };
+    // The column-alias-list form `... AS g(n)` is a deferred narrowing (grammar.md §35): a `(`
+    // after the alias is unambiguous (a base table never has one there) and rejected.
+    if (alias !== null && this.peek().kind === "lparen") {
+      throw engineError(
+        "feature_not_supported",
+        "column alias list on a table function is not supported yet",
+      );
+    }
+    return { name, alias, args };
   }
 
   // parseJoinClause parses one join_clause if a join keyword begins here (returns null to end

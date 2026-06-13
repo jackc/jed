@@ -15,6 +15,7 @@ pub struct CostSchedule {
     pub row_produced: i64,
     pub operator_eval: i64,
     pub aggregate_accumulate: i64,
+    pub generated_row: i64,
 }
 
 /// The canonical cost schedule — weights accrued per unit during query execution.
@@ -27,4 +28,5 @@ pub const COSTS: CostSchedule = CostSchedule {
     row_produced: 1,
     operator_eval: 1,
     aggregate_accumulate: 1,
+    generated_row: 1,
 };

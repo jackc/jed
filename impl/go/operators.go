@@ -1075,3 +1075,46 @@ var Aggregates = []AggregateDesc{
 		Errors:      []string{},
 	},
 }
+
+// SetReturningDesc is one set-returning function's metadata, mirroring a [[set_returning]]
+// entry in catalog.toml. An SRF expands its args into a row SET (not a scalar/aggregate
+// value); Result is a reserved set id (set_of_promoted), Column is the fixed output column
+// name, and Null = "empty_on_null" (any NULL arg -> zero rows). The uniqueness key is
+// (Name, Arity). See spec/design/functions.md §10.
+type SetReturningDesc struct {
+	Name          string
+	Surface       string
+	Arity         int
+	ArgFamilies   []string
+	ArgResolution string
+	Result        string
+	Column        string
+	Null          string
+	Errors        []string
+}
+
+// SetReturning lists every set-returning function in the catalog, in catalog order.
+var SetReturning = []SetReturningDesc{
+	{
+		Name:          "generate_series",
+		Surface:       "generate_series",
+		Arity:         2,
+		ArgFamilies:   []string{"integer", "integer"},
+		ArgResolution: "promote",
+		Result:        "set_of_promoted",
+		Column:        "generate_series",
+		Null:          "empty_on_null",
+		Errors:        []string{},
+	},
+	{
+		Name:          "generate_series",
+		Surface:       "generate_series",
+		Arity:         3,
+		ArgFamilies:   []string{"integer", "integer", "integer"},
+		ArgResolution: "promote",
+		Result:        "set_of_promoted",
+		Column:        "generate_series",
+		Null:          "empty_on_null",
+		Errors:        []string{"22023"},
+	},
+}

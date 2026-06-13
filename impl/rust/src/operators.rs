@@ -1073,3 +1073,46 @@ pub const AGGREGATES: &[AggregateDesc] = &[
         errors: &[],
     },
 ];
+
+/// One set-returning function's metadata, mirroring a `[[set_returning]]` entry in
+/// catalog.toml. An SRF expands its args into a row SET (not a scalar/aggregate value);
+/// `result` is a reserved set id (set_of_promoted), `column` is the fixed output column
+/// name, and `null` = "empty_on_null" (any NULL arg → zero rows). The uniqueness key is
+/// (name, arity). See spec/design/functions.md §10.
+pub struct SetReturningDesc {
+    pub name: &'static str,
+    pub surface: &'static str,
+    pub arity: u8,
+    pub arg_families: &'static [&'static str],
+    pub arg_resolution: &'static str,
+    pub result: &'static str,
+    pub column: &'static str,
+    pub null: &'static str,
+    pub errors: &'static [&'static str],
+}
+
+/// Every set-returning function in the catalog, in catalog order.
+pub const SET_RETURNING: &[SetReturningDesc] = &[
+    SetReturningDesc {
+        name: "generate_series",
+        surface: "generate_series",
+        arity: 2,
+        arg_families: &["integer", "integer"],
+        arg_resolution: "promote",
+        result: "set_of_promoted",
+        column: "generate_series",
+        null: "empty_on_null",
+        errors: &[],
+    },
+    SetReturningDesc {
+        name: "generate_series",
+        surface: "generate_series",
+        arity: 3,
+        arg_families: &["integer", "integer", "integer"],
+        arg_resolution: "promote",
+        result: "set_of_promoted",
+        column: "generate_series",
+        null: "empty_on_null",
+        errors: &["22023"],
+    },
+];

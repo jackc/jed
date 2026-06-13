@@ -314,14 +314,20 @@ group_by       ::= "GROUP" "BY" column_ref ("," column_ref)*
 
 /* The FROM clause is a left-deep chain: a first table_ref followed by zero or more
  * join_clauses. With no join_clause it is the single-table SELECT the rest of the
- * engine already supported (../design/grammar.md §5/§15). A table_ref is a table name
- * with an optional alias — "AS" optional ("orders o" = "orders AS o"). The alias (or,
- * with none, the table name) is the relation's LABEL, used to qualify columns (t.col);
- * two relations with the same label (a self-join with no aliases, "t JOIN t") is a
- * 42712 duplicate_alias. */
+ * engine already supported (../design/grammar.md §5/§15). A table_ref is a base table
+ * name OR a set-returning function call (table_function — generate_series(1,5), the
+ * computed row source of ../design/grammar.md §35), each with an optional alias — "AS"
+ * optional ("orders o" = "orders AS o"). The alias (or, with none, the table name /
+ * function name) is the relation's LABEL, used to qualify columns (t.col); two relations
+ * with the same label (a self-join with no aliases, "t JOIN t") is a 42712 duplicate_alias.
+ * A "(" immediately after the leading identifier marks the function form (a one-token
+ * lookahead — a §8 determinism surface); the column-alias-list form "AS g(cols)" is a
+ * deferred 0A000 narrowing. */
 from_clause    ::= table_ref join_clause*
 
-table_ref      ::= identifier ("AS"? identifier)?
+table_ref      ::= (table_function | identifier) ("AS"? identifier)?
+
+table_function ::= identifier "(" expr ("," expr)* ")"
 
 /* A join_clause is INNER JOIN ... ON <expr> (the "INNER" keyword is optional — a bare
  * "JOIN" is INNER) or CROSS JOIN (a Cartesian product, no "ON"). The "ON" predicate is a

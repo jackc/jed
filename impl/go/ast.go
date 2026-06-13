@@ -205,9 +205,15 @@ type Delete struct {
 // (`orders o` or `orders AS o`). The alias, or the table name when there is none, is the
 // relation's LABEL — it qualifies columns (o.col) and must be distinct within one query (a
 // self-join needs aliases; a duplicate label is 42712). See spec/design/grammar.md §15.
+//
+// When IsFunc is true the reference is instead a set-returning FUNCTION call used as a row
+// source (generate_series(1, 5)): Name is the function name and Args its argument expressions
+// (the label is then the alias, or the function name when there is none — grammar.md §35).
 type TableRef struct {
-	Name  string
-	Alias *string
+	Name   string
+	Alias  *string
+	IsFunc bool
+	Args   []*Expr
 }
 
 // JoinKind is the kind of a join. Inner and Cross execute this slice; the Left/Right/Full

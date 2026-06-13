@@ -1255,3 +1255,63 @@ arg_families = ["any"]
 result       = "same_as_input"
 null         = "aggregate"
 errors       = []
+
+# === set-returning functions =================================================
+# A set-returning function (SRF) EXPANDS its arguments into a ROW SET — it fits neither the
+# operator mold (one value from infix operands) nor the aggregate mold (one value from a group):
+# it produces zero or more rows. So, like aggregates, SRFs live in their OWN array with kind =
+# "set_returning" and their own field set (verify.rb validates them on a separate branch;
+# gen_catalog.rb emits a separate SET_RETURNING descriptor table cross-checked per core). The
+# first SRF is `generate_series`, valid ONLY as a FROM-clause row source this slice (not in the
+# SELECT list; no LATERAL; no column-alias list) — semantics, the synthetic-relation model, and
+# the cost rule live in ../design/functions.md §10 and ../design/grammar.md §35. The resolve
+# DISPATCH is hand-written per core (like the aggregate/scalar dispatch); this row is the shared
+# registry data (CLAUDE.md §5).
+#
+# field doc (set_returning) ---------------------------------------------------
+# name          internal identity + AST/resolver selector. Overloaded across ARITY (the 2-arg
+#               and 3-arg generate_series share the name), so the uniqueness key is (name,
+#               arity), not (name, arg_families) — both forms take the same family per position.
+# kind          always "set_returning".
+# surface       SQL spelling, lowercase canonical (resolved case-insensitively — SRF names are
+#               not reserved, grammar.md §3).
+# arity         operand count (generate_series: 2 = start/stop, 3 = start/stop/step).
+# arg_families  required family of each operand, by position, referencing a `family` in
+#               ../types/scalars.toml. generate_series takes "integer" per position this slice.
+# arg_resolution "promote" = widen all operands via the promotion tower to a common type (the
+#               result column type); "none" = no reconcile. generate_series uses "promote".
+# result        a reserved set-returning result id (NOT a plain scalar — an SRF returns a row
+#               SET): "set_of_promoted" = a row set of ONE column whose type is the promoted
+#               integer type of the args (the SRF analogue of the aggregates' sum_widen).
+# column        the fixed output column NAME of the produced relation (PG names it after the
+#               function: generate_series). Authored data, not computed.
+# null          "empty_on_null" = any NULL argument yields ZERO rows (PG generate_series), as
+#               opposed to a scalar function's "propagates".
+# errors        SQLSTATE codes the SRF may raise; generate_series carries 22023 (step size of
+#               zero — ../errors/registry.toml). NULL→empty and i64-overflow→clean-stop are NOT
+#               errors.
+# -----------------------------------------------------------------------------
+
+[[set_returning]]
+name           = "generate_series"
+kind           = "set_returning"
+surface        = "generate_series"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "set_of_promoted"
+column         = "generate_series"
+null           = "empty_on_null"
+errors         = []
+
+[[set_returning]]
+name           = "generate_series"
+kind           = "set_returning"
+surface        = "generate_series"
+arity          = 3
+arg_families   = ["integer", "integer", "integer"]
+arg_resolution = "promote"
+result         = "set_of_promoted"
+column         = "generate_series"
+null           = "empty_on_null"
+errors         = ["22023"]

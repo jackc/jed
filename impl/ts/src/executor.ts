@@ -1888,19 +1888,34 @@ export class Database {
     // through to `parent` (the correlated-subquery rule) or 42703 at top level
     // (spec/design/grammar.md §34). The scope links to `parent` (correlation) + the catalog
     // (so a subquery resolves its own FROM); allowSubquery is true.
+    // A FROM item is either a base table or a set-returning function (generate_series —
+    // grammar.md §35). An SRF has no catalog table, so its relation borrows a SYNTHETIC
+    // one-column table; its args resolve against an EMPTY-local-rels scope whose parent is the
+    // enclosing query (non-LATERAL: a $N/outer reference works, a sibling FROM table does not).
     const tableRefs = sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
     const rels: ScopeRel[] = [];
+    const srfPlans: (SrfPlan | undefined)[] = []; // aligned with rels; undefined = a base table
     const seenLabels = new Set<string>();
     let offset = 0;
     for (const tref of tableRefs) {
-      const t = this.table(tref.name);
-      if (!t) throw engineError("undefined_table", "table does not exist: " + tref.name);
+      let t: Table;
+      let srf: SrfPlan | undefined;
+      if (tref.args !== null) {
+        const r = this.resolveSRF(tref.name, tref.args, tref.alias, parent, ptypes);
+        t = r.table;
+        srf = r.srf;
+      } else {
+        const tbl = this.table(tref.name);
+        if (!tbl) throw engineError("undefined_table", "table does not exist: " + tref.name);
+        t = tbl;
+      }
       const label = (tref.alias ?? t.name).toLowerCase();
       if (seenLabels.has(label)) {
         throw engineError("duplicate_alias", "table name " + label + " specified more than once");
       }
       seenLabels.add(label);
       rels.push({ label, table: t, offset });
+      srfPlans.push(srf);
       offset += t.columns.length;
     }
     const scope = new Scope(rels, this, parent, true);
@@ -2014,16 +2029,19 @@ export class Database {
     // its own PK — `b.pk = a.x` (index-nested-loop) stays a full scan, a follow-on. Sound for outer
     // joins too: a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows, so
     // bounding it cannot drop a surviving row. A no-PK relation gets null (full scan).
-    const relBounds: (ScanBound | null)[] = rels.map((rel) =>
-      filter === null ? null : detectScanBound(filter, rel),
+    // A set-returning relation is a computed row source with no PK/index — it never bounds
+    // (functions.md §10), so skip detection for it.
+    const relBounds: (ScanBound | null)[] = rels.map((rel, i) =>
+      filter === null || srfPlans[i] !== undefined ? null : detectScanBound(filter, rel),
     );
 
     // Assemble the owned plan (table NAMES + offsets/widths replace the scope's tables, so the
     // plan outlives the scope and a correlated subquery can re-execute it per row).
-    const planRels: PlanRel[] = scope.rels.map((rel) => ({
+    const planRels: PlanRel[] = scope.rels.map((rel, i) => ({
       tableName: rel.table.name,
       offset: rel.offset,
       colCount: rel.table.columns.length,
+      srf: srfPlans[i],
     }));
     // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
     // columns this query statically references, collected depth-aware so a correlated
@@ -2062,6 +2080,88 @@ export class Database {
       relBounds,
       relMasks,
     };
+  }
+
+  // resolveSRF resolves a FROM-clause set-returning function call (generate_series(...)) into a
+  // SYNTHETIC one-column relation plus its resolved argument expressions (spec/design/functions.md
+  // §10). Only generate_series exists this slice (any other name → 42883), with 2 or 3 integer
+  // args (a wrong arity/type → 42883). Non-LATERAL: the args resolve against an EMPTY-local-rels
+  // scope whose parent is the enclosing query, so $N and correlated outer columns resolve while a
+  // sibling FROM table does not (42703/42P01). The produced column is typed at the PROMOTED
+  // integer type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows
+  // PostgreSQL's single-column function-alias rule: the table alias when one is given
+  // (generate_series(1,5) AS g ⇒ column g), else the function name generate_series.
+  private resolveSRF(name: string, args: Expr[], alias: string | null, parent: Scope | null, ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
+    if (name.toLowerCase() !== "generate_series") {
+      throw engineError("undefined_function", "function does not exist: " + name);
+    }
+    if (args.length !== 2 && args.length !== 3) throw noFuncOverload("generate_series");
+    const argScope = new Scope([], this, parent, true);
+    const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const rargs: RExpr[] = [];
+    let result: ScalarType | null = null;
+    for (const a of args) {
+      const { node, type } = resolve(argScope, a, "int64", forbidden, ptypes);
+      if (type.kind === "int") {
+        if (result === null || rank(type.ty) > rank(result)) result = type.ty;
+      } else if (type.kind === "null") {
+        // An untyped NULL/param adapts and contributes no width.
+      } else {
+        throw noFuncOverload("generate_series");
+      }
+      rargs.push(node);
+    }
+    const colType: ScalarType = result ?? "int64";
+    // PG's single-column function-alias rule: the column takes the table alias when one is given,
+    // else the function name. The table's name stays the function name (the un-aliased label
+    // fallback).
+    const colName = alias ?? "generate_series";
+    const table: Table = {
+      name: "generate_series",
+      columns: [{ name: colName, type: colType, decimal: null, primaryKey: false, notNull: false, default: null }],
+      pk: [],
+      checks: [],
+      indexes: [],
+    };
+    return { table, srf: { args: rargs } };
+  }
+
+  // generateSeriesRows generates the rows of a generate_series(start, stop[, step]) FROM-clause
+  // source (spec/design/functions.md §10), as one-column rows. The args evaluate ONCE against the
+  // outer environment with no local row (non-LATERAL). PostgreSQL semantics: any NULL arg → zero
+  // rows; a step of zero → 22023; start > stop with a positive step (or the reverse) → zero rows;
+  // an i64 overflow while stepping STOPS the series cleanly (no trap). Each generated element
+  // charges one generatedRow AT THE SOURCE, guarded so a maxCost ceiling aborts a runaway series
+  // (54P01) mid-generation. Note (cross-core parity): TS values are bigint, which does NOT overflow
+  // at 64 bits — so the i64 boundary must be detected EXPLICITLY here, or TS would emit rows Rust/Go
+  // never reach.
+  private generateSeriesRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
+    const evalInt = (e: RExpr): bigint | null => {
+      const v = evalExpr(e, [], env, meter);
+      if (v.kind === "int") return v.int;
+      if (v.kind === "null") return null;
+      throw new Error("the resolver restricts generate_series args to integers");
+    };
+    const start = evalInt(srf.args[0]!);
+    const stop = evalInt(srf.args[1]!);
+    const step = srf.args.length === 3 ? evalInt(srf.args[2]!) : 1n;
+    // Any NULL argument yields zero rows (PG).
+    if (start === null || stop === null || step === null) return [];
+    if (step === 0n) throw engineError("invalid_parameter_value", "step size cannot be equal to zero");
+    const out: Row[] = [];
+    let cur = start;
+    for (;;) {
+      const inRange = step > 0n ? cur <= stop : cur >= stop;
+      if (!inRange) break;
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      out.push([intValue(cur)]);
+      // i64 overflow while stepping ends the series cleanly, matching PostgreSQL (and Rust/Go).
+      const next = cur + step;
+      if (next > 9223372036854775807n || next < -9223372036854775808n) break;
+      cur = next;
+    }
+    return out;
   }
 
   // execSelectPlan executes a resolved SELECT against an outer-row environment (outer = the
@@ -2225,7 +2325,10 @@ export class Database {
       plan.order.length === 0 &&
       // An index-bounded scan does not stream (cost.md §3 "index-bounded scan"): it
       // reads the full admitted set via the eager path below.
-      plan.relBounds[0]?.kind !== "index"
+      plan.relBounds[0]?.kind !== "index" &&
+      // A set-returning relation is generated, not scanned — it takes the eager path
+      // (functions.md §10); the streaming reader assumes a table store.
+      plan.rels[0]!.srf === undefined
     ) {
       return this.execStreamingLimit(plan, env, meter, params);
     }
@@ -2242,7 +2345,9 @@ export class Database {
       plan.joins.length === 0 &&
       !plan.isAgg &&
       !plan.distinct &&
-      plan.relBounds[0]?.kind !== "index"
+      plan.relBounds[0]?.kind !== "index" &&
+      // A set-returning relation takes the eager path (functions.md §10).
+      plan.rels[0]!.srf === undefined
     ) {
       return this.execStreamingSort(plan, env, meter, params);
     }
@@ -2253,6 +2358,11 @@ export class Database {
     // walking the whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing.
     // The nested loop re-reads from these in-memory buffers, which are not stores and charge nothing.
     const materialized: Row[][] = plan.rels.map((rel, ri) => {
+      // A set-returning relation is generated, not scanned (functions.md §10): produce its rows
+      // (charging generated_row per element) and feed them into the same join pipeline.
+      if (rel.srf !== undefined) {
+        return this.generateSeriesRows(rel.srf, env, meter);
+      }
       const store = this.readSnap().store(rel.tableName);
       let rows: Row[];
       let nodeCount: number;
@@ -2506,6 +2616,13 @@ export class Database {
       if (s.operand !== null) s.operand = this.foldUncorrelatedInRExpr(s.operand, bound, cost);
     }
     sp.projections = sp.projections.map((p) => this.foldUncorrelatedInRExpr(p, bound, cost));
+    // A set-returning relation's arguments may themselves contain an (uncorrelated) subquery to
+    // fold once before the generator runs (functions.md §10).
+    for (const rel of sp.rels) {
+      if (rel.srf !== undefined) {
+        rel.srf.args = rel.srf.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, cost));
+      }
+    }
   }
 
   // foldUncorrelatedInRExpr folds this node if it is an uncorrelated "subquery", else recurses into
@@ -2970,6 +3087,13 @@ function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
   if (plan.having !== null && rexprReferencesOuter(plan.having, depth)) return true;
   for (const s of plan.aggSpecs) if (s.operand !== null && rexprReferencesOuter(s.operand, depth)) return true;
   for (const p of plan.projections) if (rexprReferencesOuter(p, depth)) return true;
+  // A set-returning relation's arguments may carry a correlated reference (non-LATERAL: an SRF
+  // arg sees params/outer — functions.md §10), making the enclosing subquery correlated.
+  for (const rel of plan.rels) {
+    if (rel.srf !== undefined) {
+      for (const a of rel.srf.args) if (rexprReferencesOuter(a, depth)) return true;
+    }
+  }
   return false;
 }
 
@@ -3221,8 +3345,17 @@ type SubqueryKind = "scalar" | "exists" | "in";
 // ============================================================================
 
 // PlanRel is one relation in a SELECT plan: the table name (looked up in the store at exec), the
-// flat offset of its first column, and its column count (for NULL-padding).
-type PlanRel = { tableName: string; offset: number; colCount: number };
+// flat offset of its first column, and its column count (for NULL-padding). When `srf` is set the
+// relation is a COMPUTED set-returning function (generate_series) rather than a base table:
+// tableName is then the function name (never looked up in the store) and the executor generates
+// the rows instead of scanning (spec/design/functions.md §10).
+type PlanRel = { tableName: string; offset: number; colCount: number; srf?: SrfPlan };
+
+// SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10). The
+// first SRF is generate_series, so args is [start, stop] or [start, stop, step] — non-LATERAL, so
+// each arg evaluates against the params/outer environment with no local row. The produced
+// column's promoted integer type lives on the synthetic relation (built in resolveSRF).
+type SrfPlan = { args: RExpr[] };
 
 // PlanJoin is one join in a SELECT plan: its kind and resolved ON predicate (null for CROSS). The
 // right relation is rels[k+1].

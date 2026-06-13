@@ -29,6 +29,12 @@
 #      or a reserved aggregate result (sum_widen | same_as_input); null is "aggregate";
 #      (name, arg_families) is unique. Aggregates are NOT operators (no symbol/precedence/
 #      arg_resolution/arity), so they skip the operator-only checks above (functions.md).
+#  12. each [[set_returning]] (kind = "set_returning") has its own field set (name/kind/
+#      surface/arity/arg_families/arg_resolution/result/column/null/errors); arity ==
+#      arg_families length; result is a scalar id or a reserved set id (set_of_promoted);
+#      null is "empty_on_null"; column is a non-empty string. "promote" requires each
+#      operand family to have a promotion rule (NOT a comparable pair — an SRF widens its
+#      own args among themselves, it never compares two families). (name, arity) is unique.
 #
 # Exit 0 = catalog is internally coherent and cross-references resolve; nonzero =
 # the offending problem.
@@ -53,6 +59,14 @@ RESERVED_AGG_RESULTS = %w[sum_widen same_as_input].to_set
 AGG_ARGS             = %w[star expr].to_set
 AGG_NULL_BEHAVIORS   = %w[aggregate].to_set
 AGG_REQUIRED_FIELDS  = %w[name kind surface arg result null errors].freeze
+
+# Set-returning functions (kind = "set_returning") use a distinct field set and validation
+# branch — they expand args into a row set, fitting neither operator nor aggregate (functions.md
+# §10). `result` accepts a scalar id or the reserved set id; `null` is the single "empty_on_null"
+# discipline; the uniqueness key is (name, arity).
+RESERVED_SRF_RESULTS = %w[set_of_promoted].to_set
+SRF_NULL_BEHAVIORS   = %w[empty_on_null].to_set
+SRF_REQUIRED_FIELDS  = %w[name kind surface arity arg_families arg_resolution result column null errors].freeze
 
 def fail!(msg)
   warn "FAIL: #{msg}"
@@ -203,7 +217,58 @@ def main
     fail!("duplicate aggregate (name, arg_families): #{dup_aggs.map { |n, a| "#{n}#{a.inspect}" }.join(', ')}")
   end
 
-  puts "OK: #{operators.length} operators, #{aggregates.length} aggregates — catalog coherent"
+  # (12) set-returning functions (kind = "set_returning") — a separate array + field set.
+  # SRFs are neither operators nor aggregates, so they skip the operator/aggregate checks above.
+  set_returning = catalog["set_returning"] || []
+  srf_sigs = [] # [name, arity] — unique per overload (the 2-arg and 3-arg forms share a name)
+  set_returning.each do |sf|
+    id = sf["name"] || "(unnamed)"
+
+    SRF_REQUIRED_FIELDS.each do |f|
+      fail!("set_returning #{id}: missing field `#{f}`") unless sf.key?(f)
+    end
+    fail!("set_returning #{id}: kind must be \"set_returning\"") unless sf["kind"] == "set_returning"
+    fail!("set_returning #{id}: surface must be a non-empty string") unless sf["surface"].is_a?(String) && !sf["surface"].empty?
+    fail!("set_returning #{id}: column must be a non-empty string") unless sf["column"].is_a?(String) && !sf["column"].empty?
+
+    args = sf["arg_families"]
+    fail!("set_returning #{id}: arg_families must be an array") unless args.is_a?(Array)
+    fail!("set_returning #{id}: arity #{sf['arity']} != arg_families length #{args.length}") unless sf["arity"] == args.length
+    args.each do |fam|
+      next if fam == "any"
+      fail!("set_returning #{id}: arg family #{fam.inspect} is not a family in scalars.toml") unless families.include?(fam)
+    end
+
+    res = sf["arg_resolution"]
+    fail!("set_returning #{id}: arg_resolution #{res.inspect} not in (#{RESOLUTIONS.to_a.join('|')})") unless RESOLUTIONS.include?(res)
+    # "promote" widens an SRF's OWN args among themselves (never compares two families), so —
+    # unlike a binary operator — it requires each family to have a promotion rule, not a
+    # comparable pair. This is the one deliberate divergence from the operator promote check.
+    if res == "promote"
+      args.uniq.each do |fam|
+        fail!("set_returning #{id}: no promotion rule for family #{fam.inspect} in compare.toml") unless promotion_families.include?(fam)
+      end
+    end
+
+    result = sf["result"]
+    unless scalar_ids.include?(result) || RESERVED_SRF_RESULTS.include?(result)
+      fail!("set_returning #{id}: result #{result.inspect} is neither a scalar id nor a reserved set result (#{RESERVED_SRF_RESULTS.to_a.join('|')})")
+    end
+
+    fail!("set_returning #{id}: null #{sf['null'].inspect} must be \"empty_on_null\"") unless SRF_NULL_BEHAVIORS.include?(sf["null"])
+
+    (sf["errors"] || []).each do |code|
+      fail!("set_returning #{id}: error code #{code.inspect} is not in registry.toml") unless error_codes.include?(code)
+    end
+
+    srf_sigs << [sf["name"], sf["arity"]]
+  end
+  dup_srfs = srf_sigs.tally.select { |_, n| n > 1 }.keys
+  unless dup_srfs.empty?
+    fail!("duplicate set_returning (name, arity): #{dup_srfs.map { |n, a| "#{n}/arity-#{a}" }.join(', ')}")
+  end
+
+  puts "OK: #{operators.length} operators, #{aggregates.length} aggregates, #{set_returning.length} set-returning — catalog coherent"
 end
 
 main

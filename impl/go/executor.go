@@ -2551,13 +2551,29 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 	for _, j := range sel.Joins {
 		tableRefs = append(tableRefs, j.Table)
 	}
+	// A FROM item is either a base table or a set-returning function (generate_series —
+	// grammar.md §35). An SRF has no catalog table, so its relation borrows a SYNTHETIC
+	// one-column table; its args resolve against an EMPTY-local-rels scope whose parent is the
+	// enclosing query (non-LATERAL: a $N/outer reference works, a sibling FROM table does not).
 	var rels []scopeRel
+	srfPlans := make([]*srfPlan, len(tableRefs)) // aligned with rels; nil = a base table
 	seenLabels := make(map[string]bool)
 	offset := 0
-	for _, tref := range tableRefs {
-		t, ok := db.Table(tref.Name)
-		if !ok {
-			return nil, NewError(UndefinedTable, "table does not exist: "+tref.Name)
+	for i, tref := range tableRefs {
+		var t *Table
+		if tref.IsFunc {
+			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, parent, ptypes)
+			if serr != nil {
+				return nil, serr
+			}
+			t = tbl
+			srfPlans[i] = sp
+		} else {
+			tbl, ok := db.Table(tref.Name)
+			if !ok {
+				return nil, NewError(UndefinedTable, "table does not exist: "+tref.Name)
+			}
+			t = tbl
 		}
 		label := strings.ToLower(t.Name)
 		if tref.Alias != nil {
@@ -2648,6 +2664,11 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 	relBounds := make([]*scanBound, len(rels))
 	if filter != nil {
 		for i, rel := range rels {
+			// A set-returning relation is a computed row source with no PK/index — it never
+			// bounds (functions.md §10), so skip detection for it.
+			if srfPlans[i] != nil {
+				continue
+			}
 			relBounds[i] = detectScanBound(filter, rel)
 		}
 	}
@@ -2736,7 +2757,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 	// plan outlives the scope and a correlated subquery can re-execute it per row).
 	planRels := make([]planRel, len(s.rels))
 	for i, rel := range s.rels {
-		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns)}
+		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i]}
 	}
 	// The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
 	// columns this query statically references, collected depth-aware so a correlated
@@ -2778,6 +2799,134 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
 		limit: sel.Limit, offset: sel.Offset, relBounds: relBounds, relMasks: relMasks,
 	}, nil
+}
+
+// resolveSRF resolves a FROM-clause set-returning function call (generate_series(...)) into a
+// SYNTHETIC one-column relation plus its resolved argument expressions (spec/design/functions.md
+// §10). Only generate_series exists this slice (any other name → 42883), with 2 or 3 integer
+// args (a wrong arity/type → 42883). Non-LATERAL: the args resolve against an EMPTY-local-rels
+// scope whose parent is the enclosing query, so $N and correlated outer columns resolve while a
+// sibling FROM table does not (42703/42P01). The produced column is typed at the PROMOTED integer
+// type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows PostgreSQL's
+// single-column function-alias rule: the table alias when one is given (generate_series(1,5) AS g
+// ⇒ column g), else the function name generate_series.
+func (db *Database) resolveSRF(name string, args []*Expr, alias *string, parent *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+	if !strings.EqualFold(name, "generate_series") {
+		return nil, nil, NewError(UndefinedFunction, "function does not exist: "+name)
+	}
+	if len(args) != 2 && len(args) != 3 {
+		return nil, nil, noFuncOverload("generate_series")
+	}
+	int64Ctx := Int64
+	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true}
+	forbidden := &aggCtx{}
+	rargs := make([]*rExpr, 0, len(args))
+	var result ScalarType
+	haveResult := false
+	for _, a := range args {
+		r, t, err := resolve(argScope, *a, &int64Ctx, forbidden, ptypes)
+		if err != nil {
+			return nil, nil, err
+		}
+		switch t.kind {
+		case rtInt:
+			if !haveResult || t.intTy.Rank() > result.Rank() {
+				result = t.intTy
+				haveResult = true
+			}
+		case rtNull:
+			// An untyped NULL/param adapts and contributes no width.
+		default:
+			return nil, nil, noFuncOverload("generate_series")
+		}
+		rargs = append(rargs, r)
+	}
+	if !haveResult {
+		result = Int64
+	}
+	// PG's single-column function-alias rule: the column takes the table alias when one is given,
+	// else the function name. The table's Name stays the function name (the un-aliased label
+	// fallback).
+	colName := "generate_series"
+	if alias != nil {
+		colName = *alias
+	}
+	t := &Table{
+		Name:    "generate_series",
+		Columns: []Column{{Name: colName, Type: result}},
+	}
+	return t, &srfPlan{args: rargs}, nil
+}
+
+// generateSeriesRows generates the rows of a generate_series(start, stop[, step]) FROM-clause
+// source (spec/design/functions.md §10), as one-column rows. The args evaluate ONCE against the
+// outer environment with no local row (non-LATERAL). PostgreSQL semantics: any NULL arg → zero
+// rows; a step of zero → 22023; start > stop with a positive step (or the reverse) → zero rows;
+// an i64 overflow while stepping STOPS the series cleanly (no trap). Each generated element
+// charges one generated_row AT THE SOURCE, guarded so a max_cost ceiling aborts a runaway series
+// (54P01) mid-generation before the whole thing materializes (CLAUDE.md §13).
+func (db *Database) generateSeriesRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+	evalInt := func(e *rExpr) (int64, bool, error) {
+		v, err := e.eval(nil, env, m)
+		if err != nil {
+			return 0, false, err
+		}
+		switch v.Kind {
+		case ValInt:
+			return v.Int, true, nil
+		case ValNull:
+			return 0, false, nil
+		default:
+			panic("the resolver restricts generate_series args to integers")
+		}
+	}
+	start, okStart, err := evalInt(sp.args[0])
+	if err != nil {
+		return nil, err
+	}
+	stop, okStop, err := evalInt(sp.args[1])
+	if err != nil {
+		return nil, err
+	}
+	step, okStep := int64(1), true
+	if len(sp.args) == 3 {
+		step, okStep, err = evalInt(sp.args[2])
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Any NULL argument yields zero rows (PG).
+	if !okStart || !okStop || !okStep {
+		return nil, nil
+	}
+	if step == 0 {
+		return nil, NewError(InvalidParameterValue, "step size cannot be equal to zero")
+	}
+	var out []Row
+	cur := start
+	for {
+		inRange := false
+		if step > 0 {
+			inRange = cur <= stop
+		} else {
+			inRange = cur >= stop
+		}
+		if !inRange {
+			break
+		}
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(Costs.GeneratedRow)
+		out = append(out, Row{IntValue(cur)})
+		// i64 overflow while stepping ends the series cleanly, matching PostgreSQL.
+		next := cur + step
+		if (step > 0 && next < cur) || (step < 0 && next > cur) {
+			break
+		}
+		cur = next
+	}
+	return out, nil
 }
 
 // rowSource is a pull-based row cursor (Volcano-style): each next() yields one row, or
@@ -3433,9 +3582,12 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// row reads short-circuit.
 	// An index-bounded scan does not stream (cost.md §3 "index-bounded scan"): it reads
 	// the full admitted set via the eager path below.
+	// A set-returning relation is generated, not scanned — it takes the eager path
+	// (functions.md §10); the streaming reader assumes a table store.
 	if plan.limit != nil && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.distinct && len(plan.order) == 0 &&
-		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) {
+		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) &&
+		plan.rels[0].srf == nil {
 		return db.execStreamingLimit(plan, env, meter, params)
 	}
 
@@ -3447,7 +3599,8 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// (the sort is unmetered — cost.md §3; spill.md §6).
 	if len(plan.order) > 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.distinct &&
-		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) {
+		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) &&
+		plan.rels[0].srf == nil {
 		return db.execStreamingSort(plan, env, meter, params)
 	}
 
@@ -3457,6 +3610,16 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// stores and charge nothing.
 	materialized := make([][]Row, len(plan.rels))
 	for ri, rel := range plan.rels {
+		// A set-returning relation is generated, not scanned (functions.md §10): produce its rows
+		// (charging generated_row per element) and feed them into the same join pipeline.
+		if rel.srf != nil {
+			tableRows, err := db.generateSeriesRows(rel.srf, env, meter)
+			if err != nil {
+				return selectResult{}, err
+			}
+			materialized[ri] = tableRows
+			continue
+		}
 		store := db.readSnap().store(rel.tableName)
 		// Each base table's own scan bound (if any) seeks/ranges instead of walking the whole
 		// B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. An index
@@ -3875,6 +4038,17 @@ func (db *Database) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, cost
 			return err
 		}
 	}
+	// A set-returning relation's arguments may themselves contain an (uncorrelated) subquery to
+	// fold once before the generator runs (functions.md §10).
+	for i := range sp.rels {
+		if sp.rels[i].srf != nil {
+			for _, a := range sp.rels[i].srf.args {
+				if err := db.foldUncorrelatedInRExpr(a, bound, cost); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -3992,6 +4166,17 @@ func selectPlanReferencesOuter(sp *selectPlan, depth int) bool {
 	for _, p := range sp.projections {
 		if rexprReferencesOuter(p, depth) {
 			return true
+		}
+	}
+	// A set-returning relation's arguments may carry a correlated reference (non-LATERAL: an SRF
+	// arg sees params/outer — functions.md §10), making the enclosing subquery correlated.
+	for i := range sp.rels {
+		if sp.rels[i].srf != nil {
+			for _, a := range sp.rels[i].srf.args {
+				if rexprReferencesOuter(a, depth) {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -4535,6 +4720,18 @@ type planRel struct {
 	tableName string
 	offset    int
 	colCount  int
+	// srf is non-nil when this relation is a COMPUTED set-returning function (generate_series)
+	// rather than a base table: tableName is then the function name (never looked up in the
+	// store) and the executor generates the rows instead of scanning (functions.md §10).
+	srf *srfPlan
+}
+
+// srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10). The
+// first SRF is generate_series, so args is [start, stop] or [start, stop, step] — non-LATERAL,
+// so each arg evaluates against the params/outer environment with no local row. The produced
+// column's promoted integer type lives on the synthetic relation (built in resolveSRF).
+type srfPlan struct {
+	args []*rExpr
 }
 
 // planJoin is one join in a SELECT plan: its kind and resolved ON predicate (nil for CROSS). The

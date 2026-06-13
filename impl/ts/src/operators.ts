@@ -1045,3 +1045,46 @@ export const AGGREGATES: readonly AggregateDesc[] = [
     errors: [],
   },
 ];
+
+// One set-returning function's metadata, mirroring a [[set_returning]] entry in
+// catalog.toml. An SRF expands its args into a row SET (not a scalar/aggregate value);
+// `result` is a reserved set id (set_of_promoted), `column` is the fixed output column
+// name, and `null` = "empty_on_null" (any NULL arg → zero rows). The uniqueness key is
+// (name, arity). See spec/design/functions.md §10.
+export interface SetReturningDesc {
+  name: string;
+  surface: string;
+  arity: number;
+  argFamilies: readonly string[];
+  argResolution: string;
+  result: string;
+  column: string;
+  null: string;
+  errors: readonly string[];
+}
+
+// Every set-returning function in the catalog, in catalog order.
+export const SET_RETURNING: readonly SetReturningDesc[] = [
+  {
+    name: "generate_series",
+    surface: "generate_series",
+    arity: 2,
+    argFamilies: ["integer", "integer"],
+    argResolution: "promote",
+    result: "set_of_promoted",
+    column: "generate_series",
+    null: "empty_on_null",
+    errors: [],
+  },
+  {
+    name: "generate_series",
+    surface: "generate_series",
+    arity: 3,
+    argFamilies: ["integer", "integer", "integer"],
+    argResolution: "promote",
+    result: "set_of_promoted",
+    column: "generate_series",
+    null: "empty_on_null",
+    errors: ["22023"],
+  },
+];

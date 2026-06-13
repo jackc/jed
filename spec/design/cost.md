@@ -495,6 +495,35 @@ a literal projection is a leaf), `SELECT 1 + 2` costs **2**, `SELECT 1 WHERE fal
 (1 `aggregate_accumulate` + 1 `row_produced`). As a set-operation operand, a subquery, or an
 `INSERT … SELECT` source it composes by the rules below with no special case.
 
+### `generated_row` — a set-returning function's computed rows
+
+A set-returning function in the `FROM` clause (`generate_series` — [functions.md](functions.md)
+§10, [grammar.md](grammar.md) §35) is a **computed** row source, not a scanned table: it touches
+no page and reads no stored row, so it charges **no** `page_read` and **no** `storage_row_read`.
+Instead each element the generator emits charges one **`generated_row`**, accrued **at the source**
+(before the row enters the join/WHERE pipeline) with a `guard()` first — so a runaway
+`generate_series(1, 10^18)` aborts deterministically with `54P01` once accrued cost reaches the
+ceiling, **mid-generation**, never materializing the whole series (CLAUDE.md §13). The arguments
+are evaluated once up front, each charging its own `operator_eval`.
+
+`generated_row` meters **generation**; `row_produced` meters **emission** into the final result.
+They are deliberately distinct and **diverge under `WHERE` / `LIMIT`**: a generated row that a
+`WHERE` filters out, or that an enclosing join/limit never emits, still charged `generated_row`
+but charges no `row_produced`. Worked examples (all asserted in the corpus):
+
+- `SELECT * FROM generate_series(1, 5)` — 5 `generated_row` + 5 `row_produced` = **10**.
+- `SELECT * FROM generate_series(1, 5) WHERE generate_series > 2` — 5 `generated_row` + 5
+  `operator_eval` (the `>` per generated row) + 3 `row_produced` = **13**.
+- `SELECT * FROM generate_series(1, 5) ORDER BY generate_series DESC LIMIT 2` — 5 `generated_row`
+  + 2 `row_produced` = **7** (the SRF takes the eager path; the sort/limit are unmetered).
+- `SELECT * FROM t CROSS JOIN generate_series(1, 3)` over a 3-row `t` — `t`'s scan block
+  (`page_read` + 3 `storage_row_read`) **+ 3 `generated_row`** (the series is materialized once,
+  like any join operand) + 9 `row_produced` for the product.
+
+A correlated SRF argument (`generate_series(1, o.n)` inside a subquery) re-evaluates its arguments
+and re-generates per outer row, exactly like a correlated subquery's inner re-scan (the Subqueries
+subsection) — so the generated rows accrue per outer row.
+
 ### Set operations — `lhs + rhs`, the combine unmetered
 
 A set operation ([grammar.md](grammar.md) §25) — `UNION`/`INTERSECT`/`EXCEPT`, each with an

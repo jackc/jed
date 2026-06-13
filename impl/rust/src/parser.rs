@@ -784,13 +784,31 @@ impl Parser {
         Ok((from, joins))
     }
 
-    /// `table_ref ::= identifier ("AS"? identifier)?` — a table name with an optional alias.
-    /// An explicit `AS` takes the next identifier unconditionally; an implicit alias is taken
-    /// only when the next token is a word that is NOT a clause/join keyword (so `FROM t WHERE`
-    /// and `FROM t JOIN ...` keep no alias). The stop-keyword set is a §8 cross-core surface
-    /// (grammar.md §15).
+    /// `table_ref ::= (identifier | table_function) ("AS"? identifier)?` where
+    /// `table_function ::= identifier "(" expr ("," expr)* ")"` — a base table name OR a
+    /// set-returning function call (`generate_series(1, 5)`) used as a row source, each with an
+    /// optional alias (grammar.md §15/§35). A `(` immediately after the leading identifier marks
+    /// the function form; its argument list is parsed here, the resolver owns arity/type errors.
+    /// The alias logic is identical for both forms: an explicit `AS` takes the next identifier
+    /// unconditionally; an implicit alias is taken only when the next token is a word that is NOT
+    /// a clause/join keyword (so `FROM t WHERE` and `FROM t JOIN ...` keep no alias). The
+    /// stop-keyword set is a §8 cross-core surface.
     fn parse_table_ref(&mut self) -> Result<TableRef> {
         let name = self.expect_identifier()?;
+        // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT` — those
+        // are aggregate/star forms, not an SRF argument list).
+        let args = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let mut a = vec![self.parse_expr()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                a.push(self.parse_expr()?);
+            }
+            self.expect(&Token::RParen)?;
+            Some(a)
+        } else {
+            None
+        };
         let alias = if self.peek_keyword().as_deref() == Some("as") {
             self.advance();
             Some(self.expect_identifier()?)
@@ -804,7 +822,15 @@ impl Parser {
                 _ => None,
             }
         };
-        Ok(TableRef { name, alias })
+        // The column-alias-list form `... AS g(n)` is a deferred narrowing (grammar.md §35): a
+        // `(` after the alias is unambiguous (a base table never has one there) and rejected.
+        if alias.is_some() && matches!(self.peek(), Token::LParen) {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "column alias list on a table function is not supported yet",
+            ));
+        }
+        Ok(TableRef { name, alias, args })
     }
 
     /// Parse one `join_clause` if a join keyword begins here, else `None` (ending the FROM

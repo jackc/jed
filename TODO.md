@@ -596,16 +596,25 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       a termination story — the `54P01` cost ceiling does real work there) and **data-modifying
       CTEs** (`WITH x AS (INSERT … RETURNING …)`). _(size: L; +L for RECURSIVE; deps: derived
       tables)_
-- [ ] **Set-returning functions** — `generate_series(start, stop [, step])` as the engine's
-      first **table function**: a function call in FROM position producing a rowset (the first
-      FROM item that is neither a base table nor a derived table). Integer (`int64`) variants
-      first; the timestamp variant waits on `interval` (a Phase 3 deferred follow-up). Authored
-      as a new `kind = "table_function"` in [catalog.toml](spec/functions/catalog.toml); output
-      is fully deterministic (`step` 0 traps like PG `22023`; cost: a defined per-emitted-row
-      charge, cost.md §3 — the `54P01` ceiling bounds a huge series). Start
-      **FROM-position-only**: an SRF in the select list (PG's lock-step / least-common-multiple
-      expansion rules) is rejected `0A000`, a documented narrowing. `unnest(array)` joins once
-      arrays land. _(size: M; deps: derived-table FROM machinery)_
+- [x] **Set-returning functions** ✅ **landed** (all 3 cores) — `generate_series(start, stop
+      [, step])` as the engine's first **set-returning function**: a function call in FROM
+      position producing a rowset (the first FROM item that is neither a base table nor a derived
+      table — grammar.md §35, functions.md §10). Integer (`int16`/`int32`/`int64`) variants; the
+      timestamp variant waits on `interval`, the decimal variant deferred. Authored as a new
+      `kind = "set_returning"` array in [catalog.toml](spec/functions/catalog.toml) (NOT
+      `table_function` — the kind names what it DOES, expand to a row set; reserved result
+      `set_of_promoted`, `null = "empty_on_null"`, gen_catalog.rb emits a SET_RETURNING table +
+      verify.rb branch + per-core drift test). Resolves to a **synthetic one-column relation**
+      (column typed at the promoted integer type; named per PG's single-column function-alias
+      rule — `AS g` ⇒ column `g`); a NEW **`generated_row`** cost unit charges per emitted element
+      (cost.md §3 — the `54P01` ceiling bounds a huge series), distinct from `row_produced`,
+      charging no scan units. PG semantics oracle-verified: NULL arg → 0 rows, `step` 0 → `22023`,
+      i64 overflow → clean stop. Capability `query.set_returning`. **FROM-position-only**: an SRF
+      in the select list is `42883` (it is not a scalar function), and `LATERAL` + the
+      column-alias-list `AS g(c)` are `0A000`/deferred — all documented narrowings. Args are
+      non-LATERAL (a `$N`/correlated outer column works, a sibling FROM table is `42703`/`42P01`).
+      No on-disk/format change, no NoREC scenario (a row source, not an optimization).
+      `unnest(array)` joins once arrays land. _(landed; deps: none)_
 - [x] **`NOT NULL`** — explicit column constraint; storing NULL (direct, omitted, or applied
       default) traps `23502`. PRIMARY KEY still implies it (spec/design/constraints.md §1).
 - [x] **`DEFAULT`** (literal) — `DEFAULT <literal>` column constraint, evaluated + coerced once

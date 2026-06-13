@@ -117,6 +117,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.distinct",
     // FROM-less SELECT: one virtual zero-column row, no scan cost (grammar.md §34).
     "query.select_no_from",
+    // Set-returning functions in FROM: generate_series, a computed row source (functions.md §10).
+    "query.set_returning",
     // Phase 4 — multi-table FROM: INNER/CROSS/OUTER JOIN, table aliases, qualified columns
     // (grammar.md §15).
     "query.join_inner",

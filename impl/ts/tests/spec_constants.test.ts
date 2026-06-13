@@ -15,7 +15,7 @@ import {
   widthBytes,
 } from "../src/types.ts";
 import { MAX_INT_DIGITS, MAX_PRECISION, MAX_SCALE } from "../src/decimal.ts";
-import { AGGREGATES, OPERATORS } from "../src/operators.ts";
+import { AGGREGATES, OPERATORS, SET_RETURNING } from "../src/operators.ts";
 import { COSTS } from "../src/costs.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
 
@@ -184,6 +184,29 @@ test("aggregates match spec/functions/catalog.toml", () => {
   }
 });
 
+test("set-returning functions match spec/functions/catalog.toml", () => {
+  // The generated set-returning descriptor table must match the canonical catalog's
+  // [[set_returning]] rows field-for-field (codegen middle path, CLAUDE.md §5). SRFs are
+  // overloaded across ARITY (one row per (name, arity)) — functions.md §10.
+  const rows = readTomlTables(specPath("functions/catalog.toml"), "set_returning");
+  assert.equal(rows.length, SET_RETURNING.length, "set_returning count");
+  for (const row of rows) {
+    const name = row.str("name");
+    const arity = Number(row.big("arity"));
+    const desc = SET_RETURNING.find((d) => d.name === name && d.arity === arity);
+    assert.notEqual(desc, undefined, `generated table missing set_returning ${name}/arity-${arity}`);
+    const d = desc!;
+    assert.equal(row.str("kind"), "set_returning", `${name}: kind`);
+    assert.equal(d.surface, row.str("surface"), `${name}: surface`);
+    assert.deepEqual([...d.argFamilies], row.strs("arg_families"), `${name}: arg_families`);
+    assert.equal(d.argResolution, row.str("arg_resolution"), `${name}: arg_resolution`);
+    assert.equal(d.result, row.str("result"), `${name}: result`);
+    assert.equal(d.column, row.str("column"), `${name}: column`);
+    assert.equal(d.null, row.str("null"), `${name}: null`);
+    assert.deepEqual([...d.errors], row.strs("errors"), `${name}: errors`);
+  }
+});
+
 test("cost schedule matches spec/cost/schedule.toml", () => {
   // The generated cost schedule (codegen middle path, CLAUDE.md §5/§13) must match the
   // canonical schedule.toml weight-for-weight. Cost is a cross-core contract (§8): every
@@ -209,6 +232,8 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.operatorEval;
       case "aggregate_accumulate":
         return COSTS.aggregateAccumulate;
+      case "generated_row":
+        return COSTS.generatedRow;
       default:
         throw new Error(`cost unit ${id} has no COSTS field — update this cross-check`);
     }

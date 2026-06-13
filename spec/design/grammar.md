@@ -1468,3 +1468,41 @@ keywords (§3) and the ≥ 1 select-item rule, not separate decisions:
 
 None of these forms appear in the conformance corpus (they would pin oracle overrides
 for zero value); the corpus tests the PG-agreeing surface.
+
+## 35. Set-returning functions in `FROM` (`generate_series`)
+
+A `table_ref` may be a **set-returning function (SRF)** call instead of a base table name
+([grammar.ebnf](../grammar/grammar.ebnf) `table_function`): `SELECT * FROM
+generate_series(1, 5)`. An SRF is a **computed row source** — it *expands* its arguments
+into a row set rather than scanning stored rows — and is the engine's first; the semantics,
+the synthetic-relation model, and the cost rule live in [functions.md](functions.md) §10,
+and `generate_series` is registered as shared catalog data
+([catalog.toml](../functions/catalog.toml) `[[set_returning]]`).
+
+**Syntax.** `table_function ::= identifier "(" expr ("," expr)* ")"` — a `(` immediately
+after the leading identifier in `table_ref` position marks the function form (a **one-token
+lookahead**, a §8 cross-core determinism surface; a bare table name has no `(` there). The
+arguments are general expressions parsed exactly like a `function_call`'s, minus the `*` /
+`DISTINCT` forms (those are the aggregate/star spellings, not an SRF argument list). The
+optional alias is parsed identically to a base table's.
+
+**Labeling and the single-column-alias rule.** The relation's **label** is the alias, or the
+function name when there is none. The produced relation has **one column**; its **name**
+follows PostgreSQL's single-column function-alias rule: the alias when one is given
+(`generate_series(1, 5) AS g` ⇒ column `g`, so `g.g` resolves and `g.generate_series` is
+`42703`), else the function name (`generate_series(1, 5)` ⇒ column `generate_series`, so
+`generate_series.generate_series` resolves). Oracle-verified against PostgreSQL.
+
+**Composition.** An SRF relation is a first-class FROM item: it joins/cross-joins other
+relations (`t CROSS JOIN generate_series(1, 3)` is the product), and `WHERE` / `ORDER BY` /
+`LIMIT` / subqueries compose over it. Its arguments are **non-LATERAL**: they resolve against
+an empty-local scope linked outward, so a `$N` parameter or a **correlated outer-query
+column** is a legal argument (`(SELECT count(*) FROM generate_series(1, o.n)) FROM t o`), but
+a **sibling FROM table** is not (`42703`/`42P01`).
+
+**Deferred narrowings** (each a `0A000` or the relevant error, relaxable later): the
+**SELECT-list** SRF position (`SELECT generate_series(1, 5)` — `generate_series` is not a
+scalar function, `42883`), **`LATERAL`**, the **column-alias-list** form `AS g(c1, …)`
+(`0A000` — a `(` after the alias), and non-integer variants (numeric/timestamp). The integer
+forms and their PostgreSQL edge cases (NULL arg → zero rows, step zero → `22023`, overflow →
+clean stop) are spec'd in [functions.md](functions.md) §10.

@@ -7,7 +7,7 @@
 use crate::ast::{
     BinaryOp, CreateIndex, CreateTable, Delete, DropIndex, DropTable, Expr, Insert, InsertSource,
     InsertValue, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItems, SetOp, SetOpKind,
-    Statement, TypeMod, UnaryOp, Update,
+    Statement, TableRef, TypeMod, UnaryOp, Update,
 };
 use crate::catalog::{CheckConstraint, Column, IndexDef, Table};
 use crate::cost::Meter;
@@ -2541,16 +2541,48 @@ impl Database {
         // (spec/design/grammar.md §34). The scope links to `parent` (for correlation) and the
         // catalog (so a subquery can resolve its own FROM); `allow_subquery` is true (subqueries
         // are legal in a SELECT — UPDATE/DELETE pass a `Scope::single` with it false).
-        let mut rels: Vec<ScopeRel> = Vec::with_capacity(1 + sel.joins.len());
+        // A FROM item is either a base table or a set-returning function (generate_series —
+        // grammar.md §35). An SRF has no catalog table, so its relation borrows a SYNTHETIC
+        // one-column `Table` that must outlive the scope: build all synthetic tables (and resolve
+        // the SRF args, which determine each one's column type) in a FIRST pass into a local
+        // `Vec<Box<Table>>`, then take `&*` references into them when building `rels` (a borrow
+        // into the Vec cannot coexist with a push, hence two passes). The args resolve against an
+        // EMPTY-local-rels scope whose `parent` is the enclosing query (non-LATERAL: a $N/outer
+        // reference works, a sibling FROM table does not — functions.md §10).
+        let from_items: Vec<&TableRef> = sel
+            .from
+            .iter()
+            .chain(sel.joins.iter().map(|j| &j.table))
+            .collect();
+        let mut synthetic: Vec<Box<Table>> = Vec::new();
+        // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, result))` = an SRF.
+        let mut srf_meta: Vec<Option<(usize, Vec<RExpr>, ScalarType)>> =
+            Vec::with_capacity(from_items.len());
+        for tref in &from_items {
+            match &tref.args {
+                None => srf_meta.push(None),
+                Some(args) => {
+                    let (table, rargs, result) =
+                        self.resolve_srf(&tref.name, args, tref.alias.as_deref(), parent, ptypes)?;
+                    synthetic.push(table);
+                    srf_meta.push(Some((synthetic.len() - 1, rargs, result)));
+                }
+            }
+        }
+
+        let mut rels: Vec<ScopeRel> = Vec::with_capacity(from_items.len());
         let mut seen_labels: HashSet<String> = HashSet::new();
         let mut offset = 0usize;
-        for tref in sel.from.iter().chain(sel.joins.iter().map(|j| &j.table)) {
-            let table = self.table(&tref.name).ok_or_else(|| {
-                EngineError::new(
-                    SqlState::UndefinedTable,
-                    format!("table does not exist: {}", tref.name),
-                )
-            })?;
+        for (tref, meta) in from_items.iter().zip(srf_meta.iter()) {
+            let table: &Table = match meta {
+                None => self.table(&tref.name).ok_or_else(|| {
+                    EngineError::new(
+                        SqlState::UndefinedTable,
+                        format!("table does not exist: {}", tref.name),
+                    )
+                })?,
+                Some((si, _, _)) => &synthetic[*si],
+            };
             let label = tref
                 .alias
                 .clone()
@@ -2658,12 +2690,16 @@ impl Database {
         // index-nested-loop case) stays a full scan, a follow-on. Sound for outer joins too: a
         // non-NULL conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding
         // it cannot drop a surviving row.
+        // A set-returning relation is a computed row source with no PK/index — it never bounds
+        // (functions.md §10), so skip detection for it (the synthetic table would return None
+        // anyway, but gate it explicitly).
         let rel_bounds: Vec<Option<ScanBound>> = scope
             .rels
             .iter()
-            .map(|rel| match &filter {
-                Some(f) => detect_scan_bound(f, rel),
-                None => None,
+            .enumerate()
+            .map(|(i, rel)| match (&filter, &srf_meta[i]) {
+                (Some(f), None) => detect_scan_bound(f, rel),
+                _ => None,
             })
             .collect();
         // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
@@ -2759,13 +2795,19 @@ impl Database {
 
         // Assemble the owned plan (table NAMES + offsets/widths replace the scope's `&Table`s,
         // so the plan outlives the scope and a correlated subquery can re-execute it per row).
+        let mut srf_plans: Vec<Option<SrfPlan>> = srf_meta
+            .into_iter()
+            .map(|m| m.map(|(_, args, _result)| SrfPlan { args }))
+            .collect();
         let rels: Vec<PlanRel> = scope
             .rels
             .iter()
-            .map(|r| PlanRel {
+            .enumerate()
+            .map(|(i, r)| PlanRel {
                 table_name: r.table.name.clone(),
                 offset: r.offset,
                 col_count: r.table.columns.len(),
+                srf: srf_plans[i].take(),
             })
             .collect();
         // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14):
@@ -2824,6 +2866,144 @@ impl Database {
             rel_bounds,
             rel_masks,
         })
+    }
+
+    /// Resolve a FROM-clause set-returning function call (`generate_series(...)`) into a
+    /// **synthetic one-column relation** plus its resolved argument expressions and produced
+    /// column type (spec/design/functions.md §10). Only `generate_series` exists this slice
+    /// (any other name → `42883`), with 2 or 3 integer args (a wrong arity/type → `42883`).
+    /// Non-LATERAL: the args resolve against an EMPTY-local-rels scope whose `parent` is the
+    /// enclosing query, so `$N` and correlated outer columns resolve while a sibling FROM table
+    /// does not (42703/42P01). The produced column is typed at the PROMOTED integer type of the
+    /// args (PG); a NULL-typed arg contributes no width (the call yields zero rows at exec). Its
+    /// NAME follows PostgreSQL's single-column function-alias rule: the table alias when one is
+    /// given (`generate_series(1,5) AS g` ⇒ column `g`), else the function name `generate_series`.
+    /// Returns `(synthetic table, resolved args, result type)`.
+    fn resolve_srf(
+        &self,
+        name: &str,
+        args: &[Expr],
+        alias: Option<&str>,
+        parent: Option<&Scope>,
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Box<Table>, Vec<RExpr>, ScalarType)> {
+        if !name.eq_ignore_ascii_case("generate_series") {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                format!("function does not exist: {name}"),
+            ));
+        }
+        if args.len() != 2 && args.len() != 3 {
+            return Err(no_func_overload("generate_series"));
+        }
+        // The args see only params/outer — never sibling FROM tables (non-LATERAL).
+        let arg_scope = Scope {
+            rels: Vec::new(),
+            parent,
+            catalog: self,
+            allow_subquery: true,
+        };
+        let mut rargs = Vec::with_capacity(args.len());
+        // The produced column's type is the promoted width of the integer args; a NULL-typed arg
+        // (a bare/typed NULL or untyped $N) adapts and contributes none. All-NULL defaults int64.
+        let mut result: Option<ScalarType> = None;
+        for a in args {
+            let (r, t) = resolve(
+                &arg_scope,
+                a,
+                Some(ScalarType::Int64),
+                &mut AggCtx::Forbidden,
+                ptypes,
+            )?;
+            match t {
+                ResolvedType::Int(st) => {
+                    result = Some(match result {
+                        Some(prev) if prev.rank() >= st.rank() => prev,
+                        _ => st,
+                    });
+                }
+                ResolvedType::Null => {}
+                _ => return Err(no_func_overload("generate_series")),
+            }
+            rargs.push(r);
+        }
+        let result = result.unwrap_or(ScalarType::Int64);
+        // PG's single-column function-alias rule: the column takes the table alias when one is
+        // given, else the function name. The table's `name` stays the function name (the
+        // un-aliased label fallback).
+        let col_name = alias.unwrap_or("generate_series").to_string();
+        let table = Box::new(Table {
+            name: "generate_series".to_string(),
+            columns: vec![Column {
+                name: col_name,
+                ty: result,
+                decimal: None,
+                primary_key: false,
+                not_null: false,
+                default: None,
+            }],
+            pk: Vec::new(),
+            checks: Vec::new(),
+            indexes: Vec::new(),
+        });
+        Ok((table, rargs, result))
+    }
+
+    /// Generate the rows of a `generate_series(start, stop[, step])` FROM-clause source
+    /// (spec/design/functions.md §10), as a `Vec` of one-column rows. The args evaluate ONCE
+    /// against the outer environment with an empty local row (non-LATERAL — they reference only
+    /// params/outer). PostgreSQL semantics: any NULL arg → zero rows; a step of zero → `22023`;
+    /// `start > stop` with a positive step (or the reverse) → zero rows; an i64 overflow while
+    /// stepping STOPS the series cleanly (no trap). Each generated element charges one
+    /// `generated_row` AT THE SOURCE, guarded so a `max_cost` ceiling aborts a runaway series
+    /// (54P01) mid-generation before the whole thing materializes (CLAUDE.md §13).
+    fn generate_series_rows(
+        &self,
+        srf: &SrfPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+    ) -> Result<Vec<Row>> {
+        let eval_int = |e: &RExpr, m: &mut Meter| -> Result<Option<i64>> {
+            match e.eval(&[], env, m)? {
+                Value::Int(n) => Ok(Some(n)),
+                Value::Null => Ok(None),
+                _ => unreachable!("the resolver restricts generate_series args to integers"),
+            }
+        };
+        let start = eval_int(&srf.args[0], meter)?;
+        let stop = eval_int(&srf.args[1], meter)?;
+        let step = match srf.args.get(2) {
+            None => Some(1),
+            Some(e) => eval_int(e, meter)?,
+        };
+        // Any NULL argument yields zero rows (PG).
+        let (start, stop, step) = match (start, stop, step) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => return Ok(Vec::new()),
+        };
+        if step == 0 {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                "step size cannot be equal to zero",
+            ));
+        }
+        let mut out: Vec<Row> = Vec::new();
+        let mut cur = start;
+        loop {
+            let in_range = if step > 0 { cur <= stop } else { cur >= stop };
+            if !in_range {
+                break;
+            }
+            meter.guard()?;
+            meter.charge(COSTS.generated_row);
+            out.push(vec![Value::Int(cur)]);
+            // i64 overflow while stepping ends the series cleanly, matching PostgreSQL.
+            match cur.checked_add(step) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     /// The LIMIT short-circuit path (spec/design/cost.md §3): a single-table, no-blocking-operator
@@ -3061,6 +3241,9 @@ impl Database {
             // An index-bounded scan does not stream (cost.md §3 "index-bounded scan"): it
             // reads the full admitted set via the eager path below.
             && !matches!(plan.rel_bounds[0], Some(ScanBound::Index(_)))
+            // A set-returning relation is generated, not scanned — it takes the eager path
+            // (functions.md §10); the streaming reader assumes a table store.
+            && plan.rels[0].srf.is_none()
         {
             return self.exec_streaming_limit(plan, &env, &mut meter, params);
         }
@@ -3077,6 +3260,8 @@ impl Database {
             && !plan.is_agg
             && !plan.distinct
             && !matches!(plan.rel_bounds[0], Some(ScanBound::Index(_)))
+            // A set-returning relation takes the eager path (functions.md §10).
+            && plan.rels[0].srf.is_none()
         {
             return self.exec_streaming_sort(plan, &env, &mut meter, params);
         }
@@ -3087,6 +3272,13 @@ impl Database {
         // stores and charge nothing.
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
         for (ri, rel) in plan.rels.iter().enumerate() {
+            // A set-returning relation is generated, not scanned (functions.md §10): produce its
+            // rows (charging generated_row per element) and feed them into the same join pipeline.
+            if let Some(srf) = &rel.srf {
+                let table_rows = self.generate_series_rows(srf, &env, &mut meter)?;
+                materialized.push(table_rows);
+                continue;
+            }
             let store = self.store(&rel.table_name);
             // Each base table's own scan bound (if any) seeks/ranges instead of walking the
             // whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing.
@@ -3439,6 +3631,15 @@ impl Database {
         }
         for p in &mut sp.projections {
             self.fold_uncorrelated_in_rexpr(p, bound, cost)?;
+        }
+        // A set-returning relation's arguments may themselves contain an (uncorrelated) subquery
+        // to fold once before the generator runs (functions.md §10).
+        for r in &mut sp.rels {
+            if let Some(srf) = &mut r.srf {
+                for a in &mut srf.args {
+                    self.fold_uncorrelated_in_rexpr(a, bound, cost)?;
+                }
+            }
         }
         Ok(())
     }
@@ -4133,11 +4334,24 @@ impl QueryPlan {
 }
 
 /// One relation in a SELECT plan: the table name (looked up in the store at exec), the flat
-/// offset of its first column in the joined row, and its column count (for NULL-padding).
+/// offset of its first column in the joined row, and its column count (for NULL-padding). When
+/// `srf` is `Some`, the relation is a COMPUTED set-returning function (generate_series) rather
+/// than a base table: `table_name` is then the function name (never looked up in the store) and
+/// the executor generates the rows instead of scanning (spec/design/functions.md §10).
 struct PlanRel {
     table_name: String,
     offset: usize,
     col_count: usize,
+    srf: Option<SrfPlan>,
+}
+
+/// A resolved set-returning-function row source (spec/design/functions.md §10). The first SRF is
+/// `generate_series`, so the single shape is `args = [start, stop]` or `[start, stop, step]` —
+/// non-LATERAL, so each arg evaluates against the params/outer environment with no local row.
+/// The produced column's promoted integer type lives on the synthetic relation (built in
+/// `resolve_srf`), so the plan needs only the resolved arg expressions here.
+struct SrfPlan {
+    args: Vec<RExpr>,
 }
 
 /// One join in a SELECT plan: its kind and resolved ON predicate (`None` for CROSS). The right
@@ -5074,6 +5288,14 @@ fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> bool {
             .projections
             .iter()
             .any(|p| rexpr_references_outer(p, depth))
+        // A set-returning relation's arguments may carry a correlated reference (non-LATERAL: an
+        // SRF arg sees params/outer — functions.md §10), which makes the enclosing subquery
+        // correlated, so it must NOT be folded once.
+        || sp.rels.iter().any(|r| {
+            r.srf
+                .as_ref()
+                .is_some_and(|srf| srf.args.iter().any(|a| rexpr_references_outer(a, depth)))
+        })
 }
 
 fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {

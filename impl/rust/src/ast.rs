@@ -217,10 +217,16 @@ pub struct Delete {
 /// or `orders AS o`). The alias, or the table name when there is none, is the relation's
 /// **label** — it qualifies columns (`o.col`) and must be distinct within one query
 /// (a self-join needs aliases; a duplicate label is `42712`). See spec/design/grammar.md §15.
+///
+/// When `args` is `Some`, the reference is instead a **set-returning function** call used as a
+/// row source (`generate_series(1, 5)`): `name` is the function name and `args` its argument
+/// expressions. The label is then the alias, or the function name when there is none
+/// (spec/design/grammar.md §35). `None` = an ordinary base table.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+    pub args: Option<Vec<Expr>>,
 }
 
 /// The kind of a join. `Inner` and `Cross` execute this slice; the `Left`/`Right`/`Full`

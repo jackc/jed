@@ -278,3 +278,64 @@ cannot (an int64 is at most 19 digits). `round`'s scale argument clamps to `max_
 uniform per-evaluation weight every operator charges — with its arguments charging their own
 costs recursively. The cost is deterministic and cross-core-identical (CLAUDE.md §13), and
 is asserted in the conformance corpus alongside the rows.
+
+## 10. Set-returning functions (`generate_series`) — the fourth function mold
+
+A **set-returning function (SRF)** is the fourth function shape, distinct from the three
+above:
+
+- an **operator** maps infix operands to one value;
+- a **scalar function** (§9) maps named arguments to one value **per row**;
+- an **aggregate** ([aggregates.md](aggregates.md)) folds a **set** of rows into one value;
+- an **SRF** *expands* its arguments into a **row set** — zero or more rows per call.
+
+Because it produces rows, an SRF fits neither the operator/scalar result mold nor the
+aggregate fold. It lives in its own catalog array
+([catalog.toml](../functions/catalog.toml) `[[set_returning]]`, `kind = "set_returning"`)
+with its own field set — `arity`, `arg_families`, `arg_resolution`, a reserved `result`
+(`set_of_promoted` = "a row set of one column at the promoted integer type of the args"), a
+fixed output `column` name, and `null = "empty_on_null"`. Like the aggregate dispatch, the
+resolve path is hand-written per core; the catalog row is the shared registry data
+(CLAUDE.md §5). The codegen emits a `SET_RETURNING` descriptor table per core (a §8 drift
+test cross-checks it), and `verify.rb` validates the array on its own branch (`promote`
+there requires each operand family to have a promotion rule — an SRF widens its *own* args
+among themselves, it never compares two families, the one divergence from the operator
+`promote` check).
+
+**`generate_series` (FROM-clause only, integer only).** The first SRF is a row source in the
+`FROM` clause ([grammar.md](grammar.md) §35): `generate_series(start, stop)` and
+`generate_series(start, stop, step)` over the integer family. It resolves to a **synthetic
+one-column relation** — a `Table` built at plan time with a single column whose type is the
+**promoted integer type** of the arguments (`generate_series(int16, int32)` ⇒ `int32`;
+integer literals default to `int64`). The relation threads through the planner and the
+nested-loop join unchanged; the executor, instead of scanning a store, **generates** the
+rows in the materialization step. The synthetic table is the only new structure: a §8
+borrow-checker note for Rust — it is owned in a `Vec<Box<Table>>` local to the planner so a
+`ScopeRel`'s `&Table` reference stays valid (Go/TS are GC-managed).
+
+**PostgreSQL semantics** (oracle-verified): the series runs from `start` toward `stop`
+inclusive, stepping by `step` (default `1`); **any NULL argument yields zero rows**;
+`start` past `stop` for the step's direction yields zero rows; a **step of zero** is
+`22023` (`invalid_parameter_value`, *"step size cannot be equal to zero"*); and an **i64
+overflow** while stepping **stops the series cleanly** (no trap — the last representable
+element is emitted, then the loop ends). The output column name follows PG's single-column
+function-alias rule (§35). The arguments are **non-LATERAL**: they evaluate once against the
+params/outer environment with no local row, so a `$N` or a correlated outer column is a
+legal argument but a sibling FROM table is not. Deferred: the SELECT-list SRF position,
+`LATERAL`, the column-alias-list form, and non-integer variants (§35).
+
+**Cost.** Each generated element charges one **`generated_row`** ([cost.md](cost.md) §3),
+guarded so a `max_cost` ceiling aborts a runaway `generate_series(1, 10^18)` with `54P01`
+**mid-generation**, before the whole series materializes (CLAUDE.md §13). An SRF touches no
+store, so it charges **no** `page_read` / `storage_row_read`. `generated_row` is distinct
+from `row_produced` (the result-emission unit): a generated row filtered by a `WHERE` or
+dropped by a join still charges `generated_row` but not `row_produced`, so the two diverge
+under `WHERE`/`LIMIT`. The arguments charge their own `operator_eval`s once, up front.
+
+**Growth obligation discharged (no NoREC relation).** `generate_series` is a new **row
+source**, not an optimization — there is no optimized-vs-unoptimized rewrite pair to
+disagree, so the NoREC sweep ([conformance.md](conformance.md) §8) gains no scenario. The
+differential cores plus the new conformance file (exact rows, oracle-verified against
+PostgreSQL, plus the exact cross-core `# cost:`) are the coverage. Should the planner later
+gain an SRF-specific optimization (e.g. a streaming `LIMIT` short-circuit over a generated
+series), *that* would owe a NoREC relation.

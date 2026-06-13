@@ -4,7 +4,7 @@
 
 use jed::costs::COSTS;
 use jed::error::SqlState;
-use jed::operators::{AGGREGATES, OPERATORS};
+use jed::operators::{AGGREGATES, OPERATORS, SET_RETURNING};
 use jed::types::ScalarType;
 use std::path::Path;
 
@@ -344,6 +344,71 @@ fn aggregates_match_spec() {
 }
 
 #[test]
+fn set_returning_match_spec() {
+    // The generated set-returning descriptor table must match the canonical catalog's
+    // [[set_returning]] rows field-for-field (the codegen middle path, CLAUDE.md §5). SRFs are
+    // overloaded across ARITY (one row per (name, arity)) — functions.md §10.
+    let v: toml::Value = toml::from_str(&spec("functions/catalog.toml")).unwrap();
+    let srfs = v["set_returning"]
+        .as_array()
+        .expect("[[set_returning]] array");
+    assert_eq!(srfs.len(), SET_RETURNING.len(), "set_returning count");
+
+    for row in srfs {
+        let name = row["name"].as_str().unwrap();
+        let arity = row["arity"].as_integer().unwrap() as u8;
+        let desc = SET_RETURNING
+            .iter()
+            .find(|d| d.name == name && d.arity == arity)
+            .unwrap_or_else(|| {
+                panic!("generated table missing set_returning {name}/arity-{arity}")
+            });
+
+        assert_eq!(
+            row["kind"].as_str().unwrap(),
+            "set_returning",
+            "{name} kind"
+        );
+        assert_eq!(
+            desc.surface,
+            row["surface"].as_str().unwrap(),
+            "{name} surface"
+        );
+        let fams: Vec<&str> = row["arg_families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(desc.arg_families, fams.as_slice(), "{name} arg_families");
+        assert_eq!(
+            desc.arg_resolution,
+            row["arg_resolution"].as_str().unwrap(),
+            "{name} arg_resolution"
+        );
+        assert_eq!(
+            desc.result,
+            row["result"].as_str().unwrap(),
+            "{name} result"
+        );
+        assert_eq!(
+            desc.column,
+            row["column"].as_str().unwrap(),
+            "{name} column"
+        );
+        assert_eq!(desc.null, row["null"].as_str().unwrap(), "{name} null");
+
+        let errs: Vec<&str> = row["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(desc.errors, errs.as_slice(), "{name} errors");
+    }
+}
+
+#[test]
 fn cost_schedule_matches_spec() {
     // The generated cost schedule (codegen middle path, CLAUDE.md §5/§13) must match the
     // canonical schedule.toml weight-for-weight. This also compiles the generated table
@@ -363,6 +428,7 @@ fn cost_schedule_matches_spec() {
             "row_produced" => COSTS.row_produced,
             "operator_eval" => COSTS.operator_eval,
             "aggregate_accumulate" => COSTS.aggregate_accumulate,
+            "generated_row" => COSTS.generated_row,
             other => panic!("cost unit {other} has no COSTS field — update this cross-check"),
         }
     };

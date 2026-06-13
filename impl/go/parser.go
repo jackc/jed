@@ -951,14 +951,38 @@ func (p *Parser) parseFromClause() (TableRef, []JoinClause, error) {
 	return from, joins, nil
 }
 
-// parseTableRef parses `table_ref ::= identifier ("AS"? identifier)?` — a table name with an
-// optional alias. An explicit AS takes the next identifier unconditionally; an implicit alias
-// is taken only when the next token is a word that is NOT a clause/join keyword (so `FROM t
-// WHERE` and `FROM t JOIN ...` keep no alias). The stop-keyword set is a §8 cross-core surface.
+// parseTableRef parses `table_ref ::= (identifier | table_function) ("AS"? identifier)?` where
+// `table_function ::= identifier "(" expr ("," expr)* ")"` — a base table name OR a
+// set-returning function call (generate_series(1, 5)) used as a row source, each with an
+// optional alias (grammar.md §15/§35). A `(` immediately after the leading identifier marks the
+// function form; the resolver owns arity/type errors. The alias logic is identical for both: an
+// explicit AS takes the next identifier unconditionally; an implicit alias is taken only when the
+// next token is a word that is NOT a clause/join keyword. The stop-keyword set is a §8 surface.
 func (p *Parser) parseTableRef() (TableRef, error) {
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return TableRef{}, err
+	}
+	// A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
+	var args []*Expr
+	isFunc := false
+	if p.peek().Kind == TokLParen {
+		isFunc = true
+		p.advance()
+		for {
+			arg, err := p.parseExpr()
+			if err != nil {
+				return TableRef{}, err
+			}
+			args = append(args, &arg)
+			if p.peek().Kind != TokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return TableRef{}, err
+		}
 	}
 	var alias *string
 	if p.peekKeyword() == "as" {
@@ -973,7 +997,13 @@ func (p *Parser) parseTableRef() (TableRef, error) {
 		p.advance()
 		alias = &a
 	}
-	return TableRef{Name: name, Alias: alias}, nil
+	// The column-alias-list form `... AS g(n)` is a deferred narrowing (grammar.md §35): a `(`
+	// after the alias is unambiguous (a base table never has one there) and rejected.
+	if alias != nil && p.peek().Kind == TokLParen {
+		return TableRef{}, NewError(FeatureNotSupported,
+			"column alias list on a table function is not supported yet")
+	}
+	return TableRef{Name: name, Alias: alias, IsFunc: isFunc, Args: args}, nil
 }
 
 // parseJoinClause parses one join_clause if a join keyword begins here (returns ok=false to end

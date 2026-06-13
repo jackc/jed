@@ -119,3 +119,20 @@ event  = "one aggregate accumulator update — one (input row x aggregate) folde
 # evaluated through the normal evaluator (charging its own operator_eval); each emitted
 # group row charges row_produced; the bucketing and the finalize step (e.g. AVG's division)
 # are UNMETERED, like the ORDER BY sort and the DISTINCT dedup (../design/cost.md §3).
+
+[[unit]]
+id     = "generated_row"
+weight = 1
+event  = "one row produced by a set-returning function (e.g. generate_series) in the FROM clause"
+# Landed with generate_series — the first set-returning function (../design/functions.md §10,
+# ../design/cost.md §3 "generated_row"). An SRF in the FROM clause is a COMPUTED row source, not
+# a table store: it touches no page and reads no stored row, so it charges neither page_read nor
+# storage_row_read. Instead this unit fires once per element the generator emits, charged AT THE
+# SOURCE before the row flows into the join/WHERE pipeline — so it meters the GENERATION work an
+# untrusted query can drive (a runaway generate_series(1, 10^18)) and a max_cost ceiling aborts
+# it (54P01) mid-generation, deterministically, before the whole series materializes (§13). It is
+# DISTINCT from row_produced (one per row EMITTED into the final result): a generated row filtered
+# out by WHERE, or never reached under a join that produces nothing, still charges generated_row
+# but not row_produced — and the two diverge under WHERE/LIMIT. The arguments are evaluated once
+# up front (each charging its own operator_eval). Charged at the identical per-row point in every
+# core, so the accrued cost and the abort point are cross-core identical (CLAUDE.md §8/§13).

@@ -245,7 +245,12 @@ export type InsertValue =
 // (`orders o` or `orders AS o`). The alias, or the table name when there is none, is the
 // relation's LABEL — it qualifies columns (o.col) and must be distinct within one query (a
 // self-join needs aliases; a duplicate label is 42712). See spec/design/grammar.md §15.
-export type TableRef = { name: string; alias: string | null };
+//
+// When `args` is non-null the reference is instead a set-returning FUNCTION call used as a row
+// source (generate_series(1, 5)): `name` is the function name and `args` its argument
+// expressions (the label is then the alias, or the function name when there is none —
+// grammar.md §35). `null` = an ordinary base table.
+export type TableRef = { name: string; alias: string | null; args: Expr[] | null };
 
 // JoinKind is the kind of a join. "inner"/"cross" execute this slice; the "left"/"right"/"full"
 // outer kinds parse and are carried in the AST but executing one is a documented 0A000

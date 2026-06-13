@@ -316,6 +316,56 @@ func TestAggregatesMatchSpec(t *testing.T) {
 	}
 }
 
+func TestSetReturningMatchSpec(t *testing.T) {
+	// The generated set-returning descriptor table must match the canonical catalog's
+	// [[set_returning]] rows field-for-field (codegen middle path, CLAUDE.md §5). SRFs are
+	// overloaded across ARITY (one row per (name, arity)) — functions.md §10.
+	rows := readTomlTables(t, specPath(t, "functions/catalog.toml"), "set_returning")
+	if len(rows) != len(SetReturning) {
+		t.Fatalf("set_returning count: spec %d, generated %d", len(rows), len(SetReturning))
+	}
+	find := func(name string, arity int64) (SetReturningDesc, bool) {
+		for _, d := range SetReturning {
+			if d.Name == name && int64(d.Arity) == arity {
+				return d, true
+			}
+		}
+		return SetReturningDesc{}, false
+	}
+	for _, row := range rows {
+		name := row.str("name")
+		arity := row.int("arity")
+		desc, ok := find(name, arity)
+		if !ok {
+			t.Fatalf("generated table missing set_returning %q/arity-%d", name, arity)
+		}
+		if row.str("kind") != "set_returning" {
+			t.Errorf("%s: kind got %q want set_returning", name, row.str("kind"))
+		}
+		if desc.Surface != row.str("surface") {
+			t.Errorf("%s: surface mismatch", name)
+		}
+		if strings.Join(desc.ArgFamilies, ",") != strings.Join(row.strs("arg_families"), ",") {
+			t.Errorf("%s: arg_families mismatch", name)
+		}
+		if desc.ArgResolution != row.str("arg_resolution") {
+			t.Errorf("%s: arg_resolution mismatch", name)
+		}
+		if desc.Result != row.str("result") {
+			t.Errorf("%s: result mismatch", name)
+		}
+		if desc.Column != row.str("column") {
+			t.Errorf("%s: column mismatch", name)
+		}
+		if desc.Null != row.str("null") {
+			t.Errorf("%s: null mismatch", name)
+		}
+		if strings.Join(desc.Errors, ",") != strings.Join(row.strs("errors"), ",") {
+			t.Errorf("%s: errors mismatch", name)
+		}
+	}
+}
+
 func TestCostScheduleMatchesSpec(t *testing.T) {
 	// The generated cost schedule (codegen middle path, CLAUDE.md §5/§13) must match the
 	// canonical schedule.toml weight-for-weight. Cost is a cross-core contract (§8):
@@ -341,6 +391,8 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.OperatorEval
 		case "aggregate_accumulate":
 			return Costs.AggregateAccumulate
+		case "generated_row":
+			return Costs.GeneratedRow
 		default:
 			t.Fatalf("cost unit %q has no Costs field — update this cross-check", id)
 			return 0

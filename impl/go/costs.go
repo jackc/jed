@@ -17,6 +17,7 @@ type CostSchedule struct {
 	RowProduced         int64
 	OperatorEval        int64
 	AggregateAccumulate int64
+	GeneratedRow        int64
 }
 
 // Costs is the canonical cost schedule — weights accrued per unit during query execution.
@@ -29,4 +30,5 @@ var Costs = CostSchedule{
 	RowProduced:         1,
 	OperatorEval:        1,
 	AggregateAccumulate: 1,
+	GeneratedRow:        1,
 }

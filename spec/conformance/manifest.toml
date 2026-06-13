@@ -157,6 +157,10 @@ id = "query.select_no_from"
 description = "FROM-less SELECT — the select list evaluates over ONE virtual zero-column row with no table access (PostgreSQL semantics, spec/design/grammar.md §34): WHERE/LIMIT/OFFSET/DISTINCT/HAVING/aggregates compose (SELECT 1 WHERE false → zero rows; SELECT count(*) → 1 via the single-group rule), and it is a full citizen of set operations, subqueries (a correlated zero-relation scope resolves purely outward), and INSERT ... SELECT. SELECT * with no FROM is 42601 (PG's exact message), a bare column the ordinary 42703. Cost charges no scan units — just the items' metered evaluation plus row_produced (spec/design/cost.md §3)"
 
 [[capability]]
+id = "query.set_returning"
+description = "Set-returning functions in the FROM clause — generate_series(start, stop[, step]) over the integer family, the engine's first SRF, a COMPUTED row source rather than a scanned table (spec/design/functions.md §10, grammar.md §35). The produced relation has one column named generate_series, typed at the promoted integer type of the args; it joins/cross-joins with other FROM relations and composes with WHERE/ORDER BY/LIMIT/subqueries. PostgreSQL semantics: any NULL arg → zero rows; start > stop with a positive step → zero rows; a step of zero → 22023; an i64 overflow while stepping stops the series cleanly. Non-LATERAL (args see $N/outer, not sibling FROM tables); the SELECT-list SRF position, LATERAL, and the column-alias-list form (AS g(n)) are deferred narrowings (0A000). Each generated element charges one generated_row (spec/design/cost.md §3), so a max_cost ceiling bounds a runaway series (54P01)"
+
+[[capability]]
 id = "query.join_inner"
 description = "INNER JOIN ... ON <expr> — combine rows from two tables on a boolean predicate (left-deep nested loop, 3-valued ON). A bare JOIN is INNER; an INNER JOIN with no ON is 42601 (spec/design/grammar.md §15)"
 
