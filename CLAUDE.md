@@ -238,11 +238,17 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   hashing for large result sets). It was invented by SQLite precisely to run identical
   conformance tests across multiple independent engines — our exact problem. CockroachDB,
   DuckDB, and RisingWave use it for the same reason.
-- **Bootstrap the corpus via differential testing.** PostgreSQL and SQLite source and
-  test suites are fair game as **oracles**: run a supported-subset query against real
-  PG/SQLite, capture output, emit a corpus entry. Generates a large, *correct* corpus
-  cheaply. Where our semantics intentionally diverge, override the expected output by
-  hand and document why.
+- **Bootstrap the corpus via differential testing against PostgreSQL.** The real PG
+  service is the **result oracle** (§1): run a supported-subset query against it, capture
+  output, emit a corpus entry. Generates a large, *correct* corpus cheaply. Where our
+  semantics intentionally diverge from PG, override the expected output by hand and document
+  why. **SQLite is deliberately *not* a result oracle** — it diverges from PG on exactly the
+  surface that is jed's product (dynamic type affinity vs. strict static types, no exact
+  `decimal`, silent integer→float promotion, NULL/3VL edges), so its answers would manufacture
+  false divergences on the surface we care most about. SQLite's role here is the
+  deployment-model north star (§1) and the origin of the sqllogictest format (above), not a
+  semantic authority; the one oracle-adjacent use is mining its sqllogictest *test corpus for
+  query shapes* (the answers still come from PG).
 - **Layer metamorphic / generative testing later.** SQLancer is the canonical prior art
   (finds logic bugs by synthesizing queries whose correct answer is known by
   construction). Well-suited to an agent-driven loop.

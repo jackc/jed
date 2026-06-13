@@ -1099,12 +1099,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 > Cross-cutting; raises the honesty/coverage ceiling. Some pairs with earlier phases.
 
-- [ ] **Differential-testing harness** vs PostgreSQL/SQLite oracles to bootstrap corpus
+- [ ] **Differential-testing harness** vs the PostgreSQL oracle to bootstrap corpus
       cheaply (§7). **PARTIAL** — the **live-`db` oracle-import** tool is built
       (`scripts/oracle_import.rb`; `rake corpus:import/check`; override ledger
       `spec/conformance/oracle_overrides.toml`; conformance.md §5) and needs no §12 provisioning.
-      *Remaining:* the **bulk** bootstrap from the *source* checkouts (gated on **user-initiated**
-      reference provisioning §12 — never auto-provision) and a SQLite oracle. _(size: M remaining; §7)_
+      *Remaining:* the **bulk** bootstrap from PG's *source* test suite (gated on **user-initiated**
+      reference provisioning §12 — never auto-provision). **SQLite is deliberately not an oracle**
+      (CLAUDE.md §7 — it diverges from PG on jed's product surface: strict types, exact `decimal`,
+      integer overflow); mining its sqllogictest corpus for *query shapes* (answers from PG) is the
+      only oracle-adjacent use. _(size: M remaining; §7)_
 - [ ] **SQLancer-style metamorphic / generative testing** — finds logic bugs by synthesizing
       queries with known-correct answers. **PARTIAL** — the **NoREC** slice is built
       (`scripts/norec_gen.rb`; `rake corpus:norec_sweep`, in `rake ci`; conformance.md §8): a
