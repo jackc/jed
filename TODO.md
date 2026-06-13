@@ -1191,6 +1191,27 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **Design the host-function API vectorized/batched** up front — the single decision
       that keeps wrapping viable for any of the above (amortizes the per-row FFI upcall).
       _(size: M; §2, cross-cutting)_
+- [ ] **Host-defined functions must contribute to the cost system** — a hard requirement on
+      the host-function API above, not an optional extra. A host function is otherwise
+      **opaque to the meter** (its code does not route through `Meter::charge`), which breaks
+      two contracts at once: the untrusted-query bound (§13 — an unmetered call can burn
+      unbounded CPU past `max_cost`) and the **cross-core cost identity** (§8 — a wrapped core
+      and a native core must compute the *same* cost for the same call). So the registration
+      API **must** carry a cost-contribution contract. Design space (decide when the feature
+      is scheduled; recorded in cost.md §6):
+        - **Declared static weight** — a per-function cost in its registration (generalizing
+          the reserved `cost` field in `functions/catalog.toml`, functions.md §8): simplest,
+          charged once per call like `operator_eval`.
+        - **Declared cost-as-a-function-of-arguments** — the host supplies a *pure,
+          deterministic* cost over the argument values/sizes (the `decimal_work` /
+          `value_compress` model — cost scales with input), charged **up front and guarded
+          before** the call runs.
+        - **A metering callback** — the host receives a narrow `charge(n)` handle into the
+          `Meter` and charges deterministically as it works, enabling a **chunk-boundary
+          mid-call abort** (the per-chunk model). Must be deterministic and cross-core
+          identical — **no wall-clock**, no allocation/iteration-order dependence (§10).
+      A host that declines all three can be admitted only on a handle with `max_cost = 0`
+      (unlimited) — i.e. **not** the untrusted-query surface (§13). _(size: M; §2/§13)_
 
 ---
 

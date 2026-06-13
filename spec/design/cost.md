@@ -737,3 +737,19 @@ Other items recorded against the seam:
   `cost` field in [../functions/catalog.toml](../functions/catalog.toml) stays reserved
   ([functions.md](functions.md) §8). Authoring it later (evaluator preferring the
   operator's `cost`, falling back to `operator_eval`) is purely additive.
+- **Host-defined functions must contribute cost (open requirement).** When host-defined
+  functions land (CLAUDE.md §2; TODO.md Phase 7/9), they are **opaque to the meter** by
+  default — host code does not route through `charge` — which would break both the
+  untrusted-query bound (§6/§13: an unmetered call burns unbounded CPU past `max_cost`) and
+  the **cross-core cost identity** §8 demands (a wrapped core and a native core must compute
+  the *same* cost for the same call). The host-function registration API must therefore carry
+  a cost contract, one of: (a) a **declared static weight** (charged once per call, like
+  `operator_eval` — generalizing the reserved `cost` field, [functions.md](functions.md) §8);
+  (b) a **declared deterministic cost function of the argument values/sizes**, charged up
+  front and guarded *before* the call (the `decimal_work` / `value_compress` model above); or
+  (c) a **deterministic metering callback** — a narrow `charge(n)` handle into the `Meter`
+  that the host calls as it works, enabling a chunk-boundary **mid-call abort** (the per-chunk
+  model). Whichever is chosen, it must be deterministic and cross-core identical — **no
+  wall-clock**, no allocation/iteration-order basis (§10, [storage.md](storage.md)). A host
+  function supplying none of these is admissible only on a handle with `max_cost = 0`
+  (unlimited), never the untrusted-query surface. Tracked in TODO.md (Phase 7/9).
