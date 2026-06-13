@@ -251,3 +251,39 @@ fn markdown_format_quiet_matches_golden() {
     assert_eq!((r.code, r.stderr.as_str()), (0, ""));
     assert_eq!(r.stdout, testdata("formats_markdown.golden"));
 }
+
+#[test]
+fn output_redirection_writes_results_to_the_file() {
+    let out_path = tmp("out.txt");
+    let out_str = out_path.to_str().unwrap();
+    let r = run(
+        &[
+            "-o",
+            out_str,
+            "-c",
+            "CREATE TABLE t (a int32 PRIMARY KEY); INSERT INTO t VALUES (7); SELECT a FROM t",
+        ],
+        "",
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(r.stdout, "", "stdout must be empty under -o");
+    let written = std::fs::read_to_string(&out_path).unwrap();
+    assert_eq!(
+        written,
+        "OK (cost 0)\nOK, 1 row (cost 0)\n a\n---\n 7\n(1 row, cost 3)\n"
+    );
+    let _ = std::fs::remove_file(&out_path);
+
+    // `-o -` keeps stdout; errors stay on stderr either way.
+    let r = run(&["-o", "-", "-q", "-c", "SELECT 1"], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(
+        r.stdout,
+        " ?column?\n----------\n        1\n(1 row, cost 1)\n"
+    );
+
+    // An unwritable destination is a startup error, exit 1.
+    let r = run(&["-o", "/nonexistent/dir/out.txt", "-c", "SELECT 1"], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("/nonexistent/dir/out.txt"));
+}

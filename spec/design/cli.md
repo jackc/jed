@@ -58,6 +58,8 @@ jed [OPTIONS] [DBFILE]
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin) — script mode
   --format FORMAT         script-mode output format:
                           aligned (default) | box | markdown | csv | json
+  -o FILE                 script mode: write results to FILE instead of stdout
+                          ('-' = stdout); errors still go to stderr
   --max-cost N            cost ceiling: statements abort with 54P01 at cost N (api.md §8)
   --continue-on-error     script mode: keep going after a SQL error (default: stop)
   -q, --quiet             script mode: suppress OK lines (results and errors still print)
@@ -80,6 +82,12 @@ path.
 
 **Exit codes.** `0` success · `1` startup/usage error (bad flags; `58P01`/`58P02`/
 `XX001`/`58030` on open/create) · `2` a SQL statement failed in script mode.
+
+**`-o FILE` redirects script-mode results** (OK lines, tables — everything that would hit
+stdout) to FILE; errors stay on stderr, so a failing script still reports on the terminal.
+`-o -` keeps stdout, letting scripts parameterize the destination uniformly. `-o` is
+script-mode only (a usage error in TUI mode). There is deliberately **no built-in pager**:
+the TUI grid is the interactive pager, and script output composes with `less` by pipe.
 
 **Stop-on-error is the script-mode default** (psql's `ON_ERROR_STOP`-off default is a
 classic half-applied-migration footgun). It is safe by construction: under autocommit a
@@ -183,6 +191,7 @@ live in shared modules exercised by the script-mode tests).
 ## 8. Future (not v1)
 
 Editor autocomplete from the catalog · SQL syntax highlighting · CSV import / export ·
-`.dump`-style SQL export · pager/`-o` output redirection.
+`.dump`-style SQL export.
 (Landed since v1: affected-row counts in `Outcome` — the `OK, N rows` footer of §5 —
-`--readonly` (§3), and the `box`/`markdown` formats (§5).)
+`--readonly` (§3), the `box`/`markdown` formats (§5), and `-o` output redirection (§3) —
+a built-in pager is deliberately out; the TUI grid pages interactively, scripts pipe.)

@@ -9,7 +9,7 @@ mod session;
 mod splitter;
 mod tui;
 
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use jed::{Database, DatabaseOptions, OpenOptions};
@@ -52,6 +52,10 @@ fn run() -> u8 {
     // Mode select (cli.md §3): -c/-f present, or stdin not a TTY → script mode.
     let interactive = parsed.sources.is_empty() && std::io::stdin().is_terminal();
     if interactive {
+        if parsed.output.is_some() {
+            eprintln!("jed: -o applies to script mode only (pass -c/-f or pipe stdin)");
+            return 1;
+        }
         match tui::run(session) {
             Ok(()) => 0,
             Err(e) => {
@@ -72,13 +76,30 @@ fn run() -> u8 {
             continue_on_error: parsed.continue_on_error,
             quiet: parsed.quiet,
         };
-        script::run(
+        // -o redirects results to a file (cli.md §3); errors stay on stderr. `-` keeps
+        // stdout, so scripts can parameterize the destination uniformly.
+        let mut out: Box<dyn Write> = match &parsed.output {
+            Some(path) if path.as_os_str() != "-" => match std::fs::File::create(path) {
+                Ok(f) => Box::new(std::io::BufWriter::new(f)),
+                Err(e) => {
+                    eprintln!("jed: {}: {e}", path.display());
+                    return 1;
+                }
+            },
+            _ => Box::new(std::io::stdout()),
+        };
+        let code = script::run(
             &mut session,
             &sources,
             &opts,
-            &mut std::io::stdout(),
+            &mut out,
             &mut std::io::stderr(),
-        ) as u8
+        );
+        if let Err(e) = out.flush() {
+            eprintln!("jed: writing output: {e}");
+            return 1;
+        }
+        code as u8
     }
 }
 

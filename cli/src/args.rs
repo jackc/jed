@@ -22,6 +22,8 @@ pub struct Args {
     pub page_size: Option<u32>,
     pub sources: Vec<Source>,
     pub format: Format,
+    /// `-o FILE`: script-mode results go to FILE instead of stdout (`-` = stdout).
+    pub output: Option<PathBuf>,
     pub max_cost: Option<i64>,
     pub continue_on_error: bool,
     pub quiet: bool,
@@ -39,6 +41,8 @@ usage: jed [OPTIONS] [DBFILE]
   -c SQL                  execute the statements, then exit (repeatable)
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin)
   --format FORMAT         script-mode output: aligned (default) | box | markdown | csv | json
+  -o FILE                 script mode: write results to FILE instead of stdout ('-' = stdout);
+                          errors still go to stderr
   --max-cost N            cost ceiling: statements abort with 54P01 at cost N
   --continue-on-error     script mode: keep going after a SQL error
   -q, --quiet             script mode: suppress OK lines
@@ -57,6 +61,7 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
         page_size: None,
         sources: Vec::new(),
         format: Format::Aligned,
+        output: None,
         max_cost: None,
         continue_on_error: false,
         quiet: false,
@@ -85,6 +90,7 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     format!("bad --format: {v} (aligned | box | markdown | csv | json)")
                 })?;
             }
+            "-o" | "--output" => args.output = Some(PathBuf::from(value_for("-o")?)),
             "--max-cost" => {
                 let v = value_for("--max-cost")?;
                 args.max_cost = Some(v.parse().map_err(|_| format!("bad --max-cost: {v}"))?);
