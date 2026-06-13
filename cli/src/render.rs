@@ -10,6 +10,8 @@ use jed::Value;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Aligned,
+    Box,
+    Markdown,
     Csv,
     Json,
 }
@@ -18,6 +20,8 @@ impl Format {
     pub fn parse(name: &str) -> Option<Format> {
         match name {
             "aligned" => Some(Format::Aligned),
+            "box" => Some(Format::Box),
+            "markdown" => Some(Format::Markdown),
             "csv" => Some(Format::Csv),
             "json" => Some(Format::Json),
             _ => None,
@@ -25,8 +29,8 @@ impl Format {
     }
 }
 
-/// Write one query result. The aligned footer `(N rows, cost C)` prints only for
-/// `aligned` — csv/json are pure data, always (cli.md §5).
+/// Write one query result. The footer `(N rows, cost C)` prints only for the human
+/// formats (`aligned`, `box`) — markdown/csv/json are pure data, always (cli.md §5).
 pub fn write_query(
     out: &mut dyn Write,
     format: Format,
@@ -36,6 +40,8 @@ pub fn write_query(
 ) -> io::Result<()> {
     match format {
         Format::Aligned => write_aligned(out, columns, rows, cost),
+        Format::Box => write_box(out, columns, rows, cost),
+        Format::Markdown => write_markdown(out, columns, rows),
         Format::Csv => write_csv(out, columns, rows),
         Format::Json => write_json(out, columns, rows),
     }
@@ -100,6 +106,102 @@ fn write_aligned(
     }
     let noun = if rows.len() == 1 { "row" } else { "rows" };
     writeln!(out, "({} {noun}, cost {cost})", rows.len())
+}
+
+/// Unicode box-drawing table (cli.md §5): the aligned layout framed with `┌─┬─┐` /
+/// `├─┼─┤` / `└─┴─┘` rules, same alignment policy and footer as `aligned`.
+fn write_box(
+    out: &mut dyn Write,
+    columns: &[String],
+    rows: &[Vec<Value>],
+    cost: i64,
+) -> io::Result<()> {
+    let grid = rendered_grid(columns, rows);
+    let numeric = numeric_columns(columns, rows);
+    let widths: Vec<usize> = (0..columns.len())
+        .map(|c| grid.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
+        .collect();
+
+    let rule = |out: &mut dyn Write, left: &str, mid: &str, right: &str| -> io::Result<()> {
+        let bars: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+        writeln!(out, "{left}{}{right}", bars.join(mid))
+    };
+    let write_row = |out: &mut dyn Write, cells: &[String]| -> io::Result<()> {
+        let mut parts = Vec::with_capacity(cells.len());
+        for (c, cell) in cells.iter().enumerate() {
+            let pad = widths[c] - cell.chars().count();
+            let padded = if numeric[c] {
+                format!("{}{}", " ".repeat(pad), cell)
+            } else {
+                format!("{}{}", cell, " ".repeat(pad))
+            };
+            parts.push(padded);
+        }
+        writeln!(out, "│ {} │", parts.join(" │ "))
+    };
+
+    rule(out, "┌", "┬", "┐")?;
+    write_row(out, &grid[0])?;
+    rule(out, "├", "┼", "┤")?;
+    for row in &grid[1..] {
+        write_row(out, row)?;
+    }
+    rule(out, "└", "┴", "┘")?;
+    let noun = if rows.len() == 1 { "row" } else { "rows" };
+    writeln!(out, "({} {noun}, cost {cost})", rows.len())
+}
+
+/// GitHub-flavored markdown table (cli.md §5): pure data, no footer. Pipes are escaped
+/// and embedded newlines become `<br>` so a cell cannot break the table; the alignment
+/// row carries `---:` for numeric columns.
+fn write_markdown(out: &mut dyn Write, columns: &[String], rows: &[Vec<Value>]) -> io::Result<()> {
+    let escape = |s: &str| {
+        s.replace('|', "\\|")
+            .replace("\r\n", "<br>")
+            .replace(['\n', '\r'], "<br>")
+    };
+    let mut grid = rendered_grid(columns, rows);
+    for row in &mut grid {
+        for cell in row.iter_mut() {
+            *cell = escape(cell);
+        }
+    }
+    let numeric = numeric_columns(columns, rows);
+    let widths: Vec<usize> = (0..columns.len())
+        .map(|c| grid.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
+        .collect();
+
+    let write_row = |out: &mut dyn Write, cells: &[String]| -> io::Result<()> {
+        let mut parts = Vec::with_capacity(cells.len());
+        for (c, cell) in cells.iter().enumerate() {
+            let pad = widths[c] - cell.chars().count();
+            let padded = if numeric[c] {
+                format!("{}{}", " ".repeat(pad), cell)
+            } else {
+                format!("{}{}", cell, " ".repeat(pad))
+            };
+            parts.push(padded);
+        }
+        writeln!(out, "| {} |", parts.join(" | "))
+    };
+
+    write_row(out, &grid[0])?;
+    let seps: Vec<String> = widths
+        .iter()
+        .zip(&numeric)
+        .map(|(w, n)| {
+            if *n {
+                format!("{}:", "-".repeat(w + 1))
+            } else {
+                "-".repeat(w + 2)
+            }
+        })
+        .collect();
+    writeln!(out, "|{}|", seps.join("|"))?;
+    for row in &grid[1..] {
+        write_row(out, row)?;
+    }
+    Ok(())
 }
 
 fn write_csv(out: &mut dyn Write, columns: &[String], rows: &[Vec<Value>]) -> io::Result<()> {
@@ -231,6 +333,37 @@ mod tests {
         let columns = cols(&["v"]);
         let rows = vec![vec![Value::Int(7)]];
         assert!(render_to_string(Format::Aligned, &columns, &rows).ends_with("(1 row, cost 11)\n"));
+    }
+
+    #[test]
+    fn box_frames_the_aligned_layout() {
+        let (columns, rows) = sample();
+        assert_eq!(
+            render_to_string(Format::Box, &columns, &rows),
+            "┌────┬───────┬───────┐\n\
+             │ id │ name  │ score │\n\
+             ├────┼───────┼───────┤\n\
+             │  1 │ alice │  9.50 │\n\
+             │  2 │ bob   │  NULL │\n\
+             └────┴───────┴───────┘\n\
+             (2 rows, cost 11)\n"
+        );
+    }
+
+    #[test]
+    fn markdown_aligns_escapes_and_skips_the_footer() {
+        let columns = cols(&["id", "note"]);
+        let rows = vec![
+            vec![Value::Int(1), Value::Text("a|b".to_string())],
+            vec![Value::Int(2), Value::Text("two\nlines".to_string())],
+        ];
+        assert_eq!(
+            render_to_string(Format::Markdown, &columns, &rows),
+            "| id | note         |\n\
+             |---:|--------------|\n\
+             |  1 | a\\|b         |\n\
+             |  2 | two<br>lines |\n"
+        );
     }
 
     #[test]

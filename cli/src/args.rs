@@ -38,7 +38,7 @@ usage: jed [OPTIONS] [DBFILE]
   --page-size N           with --create: the page size locked into the file
   -c SQL                  execute the statements, then exit (repeatable)
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin)
-  --format FORMAT         script-mode output: aligned (default) | csv | json
+  --format FORMAT         script-mode output: aligned (default) | box | markdown | csv | json
   --max-cost N            cost ceiling: statements abort with 54P01 at cost N
   --continue-on-error     script mode: keep going after a SQL error
   -q, --quiet             script mode: suppress OK lines
@@ -81,8 +81,9 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
                 .push(Source::File(PathBuf::from(value_for("-f")?))),
             "--format" => {
                 let v = value_for("--format")?;
-                args.format = Format::parse(&v)
-                    .ok_or_else(|| format!("bad --format: {v} (aligned | csv | json)"))?;
+                args.format = Format::parse(&v).ok_or_else(|| {
+                    format!("bad --format: {v} (aligned | box | markdown | csv | json)")
+                })?;
             }
             "--max-cost" => {
                 let v = value_for("--max-cost")?;

@@ -56,7 +56,8 @@ jed [OPTIONS] [DBFILE]
   --page-size N           with --create only: the page size locked into the file
   -c SQL                  execute the statements, then exit (repeatable) — script mode
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin) — script mode
-  --format aligned|csv|json   script-mode output format (default aligned)
+  --format FORMAT         script-mode output format:
+                          aligned (default) | box | markdown | csv | json
   --max-cost N            cost ceiling: statements abort with 54P01 at cost N (api.md §8)
   --continue-on-error     script mode: keep going after a SQL error (default: stop)
   -q, --quiet             script mode: suppress OK lines (results and errors still print)
@@ -120,6 +121,12 @@ the conformance corpus' rendering, in every format.
   tag. **Cost is shown by default**: it is deterministic, reproducible, and a headline
   feature (§13) — wall-clock time is not printed at all in script mode (nondeterministic
   output breaks golden tests and diffs).
+- **`box`**: the `aligned` layout framed in Unicode box-drawing rules (`┌─┬─┐` / `├─┼─┤` /
+  `└─┴─┘`), same alignment policy, NULL rendering, and footers — a second human format.
+- **`markdown`**: a GitHub-flavored table, padded like `aligned`, with `---:` alignment
+  hints on numeric columns. Pipes are escaped (`\|`) and embedded newlines become `<br>`
+  so a cell cannot break the table. Pure data — no footers (it is meant to be pasted into
+  a document).
 - **`csv`**: RFC 4180 — header row, `,` separator, `"` quoting/escaping; **NULL → empty
   field** (the PG `COPY ... CSV` convention; the NULL-vs-empty-text ambiguity is accepted,
   v1). No footers, ever.
@@ -176,6 +183,6 @@ live in shared modules exercised by the script-mode tests).
 ## 8. Future (not v1)
 
 Editor autocomplete from the catalog · SQL syntax highlighting · CSV import / export ·
-`.dump`-style SQL export · pager/`-o` output redirection · `box`/markdown formats.
-(Landed since v1: affected-row counts in `Outcome` — the `OK, N rows` footer of §5 — and
-`--readonly`, §3.)
+`.dump`-style SQL export · pager/`-o` output redirection.
+(Landed since v1: affected-row counts in `Outcome` — the `OK, N rows` footer of §5 —
+`--readonly` (§3), and the `box`/`markdown` formats (§5).)

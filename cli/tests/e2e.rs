@@ -237,3 +237,17 @@ fn readonly_serves_reads_and_rejects_writes() {
     assert_eq!(r.code, 1);
     let _ = std::fs::remove_file(&db);
 }
+
+#[test]
+fn box_format_quiet_matches_golden() {
+    let r = run(&["--format", "box", "-q"], &testdata("formats.sql"));
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(r.stdout, testdata("formats_box.golden"));
+}
+
+#[test]
+fn markdown_format_quiet_matches_golden() {
+    let r = run(&["--format", "markdown", "-q"], &testdata("formats.sql"));
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(r.stdout, testdata("formats_markdown.golden"));
+}
