@@ -57,11 +57,25 @@ import {
   isUuid,
   isTimestamp,
   isTimestamptz,
+  isInterval,
   rank,
   scalarTypeFromName,
   widthBytes,
 } from "./types.ts";
 import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
+import {
+  type Interval,
+  intervalAdd,
+  intervalCmp,
+  intervalNeg,
+  intervalSpan,
+  intervalSub,
+  mulByFraction,
+  parseFactorDecimal,
+  parseInterval,
+  tsDiff,
+  tsShift,
+} from "./interval.ts";
 import {
   type Value,
   boolAnd,
@@ -88,6 +102,7 @@ import {
   uuidValue,
   timestampValue,
   timestamptzValue,
+  intervalValue,
 } from "./value.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
@@ -3220,6 +3235,8 @@ function valueToRExpr(v: Value): RExpr {
       return { kind: "constTimestamp", value: v.micros };
     case "timestamptz":
       return { kind: "constTimestamptz", value: v.micros };
+    case "interval":
+      return { kind: "constInterval", value: v.iv };
     default:
       return { kind: "constNull" };
   }
@@ -3264,6 +3281,11 @@ function distinctRowKey(row: Value[]): string {
           // The int64 UTC-instant micros under a distinct 'z' tag: offsets are normalized to UTC
           // at parse, so +00 and +05-of-the-same-instant bucket together.
           return "z" + v.micros.toString();
+        case "interval":
+          // The canonical 128-bit span as a decimal string under a distinct 'v' tag, so
+          // span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/
+          // GROUP BY bucket while each value renders its own fields (spec/design/interval.md §2).
+          return "v" + intervalSpan(v.iv).toString();
       }
     })
     .join("|");
@@ -3289,6 +3311,7 @@ type ResolvedType =
   | { kind: "uuid" } // the uuid family (fixed 16 bytes); does not promote. The first non-integer key.
   | { kind: "timestamp" } // zoneless instant; does not compare/cast to timestamptz
   | { kind: "timestamptz" } // UTC instant; does not compare/cast to timestamp
+  | { kind: "interval" } // a span; compares only with itself, by the canonical span
   | { kind: "null" };
 
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
@@ -3307,6 +3330,7 @@ type RExpr =
   | { kind: "constUuid"; value: Uint8Array }
   | { kind: "constTimestamp"; value: bigint }
   | { kind: "constTimestamptz"; value: bigint }
+  | { kind: "constInterval"; value: Interval }
   | { kind: "constNull" }
   | { kind: "cast"; target: ScalarType; typmod: DecimalTypmod | null; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
@@ -4051,6 +4075,7 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
   if (isUuid(ty)) return { kind: "uuid" };
   if (isTimestamp(ty)) return { kind: "timestamp" };
   if (isTimestamptz(ty)) return { kind: "timestamptz" };
+  if (isInterval(ty)) return { kind: "interval" };
   return { kind: "int", ty };
 }
 
@@ -4076,7 +4101,14 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
     case "bool":
       return isBool(colTy);
     case "text":
-      return isText(colTy) || isUuid(colTy) || isBytea(colTy) || isTimestamp(colTy) || isTimestamptz(colTy);
+      return (
+        isText(colTy) ||
+        isUuid(colTy) ||
+        isBytea(colTy) ||
+        isTimestamp(colTy) ||
+        isTimestamptz(colTy) ||
+        isInterval(colTy)
+      );
     case "bytea":
       return isBytea(colTy);
     case "uuid":
@@ -4085,6 +4117,8 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
       return isTimestamp(colTy);
     case "timestamptz":
       return isTimestamptz(colTy);
+    case "interval":
+      return isInterval(colTy);
   }
 }
 
@@ -4115,6 +4149,8 @@ function rtName(t: ResolvedType): string {
       return "timestamp";
     case "timestamptz":
       return "timestamptz";
+    case "interval":
+      return "interval";
     case "null":
       return "unknown";
   }
@@ -4376,6 +4412,10 @@ function resolve(
     }
     case "funcCall":
       return resolveFuncCall(scope, e, ag, params);
+    case "intervalLiteral":
+      // INTERVAL '...' — a keyword-introduced interval literal (spec/design/interval.md §3).
+      // Parsed at resolve (22007 malformed / 22008 field overflow), independent of context.
+      return { node: { kind: "constInterval", value: parseInterval(e.text) }, type: { kind: "interval" } };
     case "literal":
       switch (e.literal.kind) {
         case "null":
@@ -4411,6 +4451,14 @@ function resolve(
             return {
               node: { kind: "constTimestamptz", value: parseTimestamptz(e.literal.text) },
               type: { kind: "timestamptz" },
+            };
+          }
+          if (ctx !== null && isInterval(ctx)) {
+            // A string adapts to an INTERVAL context (parse the "unit + time" subset,
+            // 22007/22008 — spec/design/interval.md), like timestamp adaptation.
+            return {
+              node: { kind: "constInterval", value: parseInterval(e.literal.text) },
+              type: { kind: "interval" },
             };
           }
           return { node: { kind: "constText", value: e.literal.text }, type: { kind: "text" } };
@@ -4492,6 +4540,10 @@ function resolve(
       if (isTimestamp(target) || isTimestamptz(target)) {
         throw engineError("feature_not_supported", "casting to a timestamp type is not supported yet");
       }
+      // interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000.
+      if (isInterval(target)) {
+        throw engineError("feature_not_supported", "casting to an interval type is not supported yet");
+      }
       const inner = resolve(scope, e.inner, null, ag, params);
       if (inner.type.kind === "bool") {
         throw typeError("cannot cast boolean to " + canonicalName(target));
@@ -4512,6 +4564,10 @@ function resolve(
       if (inner.type.kind === "timestamp" || inner.type.kind === "timestamptz") {
         throw engineError("feature_not_supported", "casting from a timestamp type is not supported yet");
       }
+      // Casting FROM an interval is likewise deferred (0A000).
+      if (inner.type.kind === "interval") {
+        throw engineError("feature_not_supported", "casting from an interval type is not supported yet");
+      }
       // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
       // decimal→decimal (re-scale), and NULL are all castable.
       const resultType: ResolvedType = isDecimal(target) ? { kind: "decimal" } : { kind: "int", ty: target };
@@ -4522,6 +4578,10 @@ function resolve(
         const { node, type } = resolve(scope, e.operand, ctx, ag, params);
         if (type.kind === "decimal") {
           return { node: { kind: "neg", result: "decimal", operand: node }, type: { kind: "decimal" } };
+        }
+        if (type.kind === "interval") {
+          // -interval (spec/design/interval.md §5).
+          return { node: { kind: "neg", result: "interval", operand: node }, type: { kind: "interval" } };
         }
         let result: ScalarType;
         if (type.kind === "int") result = type.ty;
@@ -4659,6 +4719,20 @@ function resolveBinary(
       // integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
       // widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
       const p = resolveOperandPair(scope, lhs, rhs, ag, params);
+      // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5). Checked
+      // before the ±-only temporal rule below.
+      const scaled = intervalScaleResult(op, p.lt.kind, p.rt.kind);
+      if (scaled !== undefined) {
+        return { node: { kind: "arith", op, result: scaled, lhs: p.rl, rhs: p.rr }, type: resolvedTypeOf(scaled) };
+      }
+      // Temporal arithmetic (spec/design/interval.md §5): interval ± interval, timestamp[tz] ±
+      // interval, interval + timestamp[tz], and timestamp[tz] − timestamp[tz] → interval. The
+      // eval dispatches on the value kinds; here we settle the result type. A temporal operand in
+      // any other combination is a 42804.
+      const temporal = temporalArithResult(op, p.lt.kind, p.rt.kind);
+      if (temporal !== undefined) {
+        return { node: { kind: "arith", op, result: temporal, lhs: p.rl, rhs: p.rr }, type: resolvedTypeOf(temporal) };
+      }
       requireNumericOperand(p.lt);
       requireNumericOperand(p.rt);
       if (p.lt.kind === "decimal" || p.rt.kind === "decimal") {
@@ -4764,6 +4838,12 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   if ((tsL || tsR) && lt.kind !== rt.kind && lt.kind !== "null" && rt.kind !== "null") {
     throw typeError("cannot compare a timestamp value with a value of a different type");
   }
+  // interval compares only with itself (or NULL); interval vs any other family is a 42804.
+  const ivL = lt.kind === "interval";
+  const ivR = rt.kind === "interval";
+  if (ivL !== ivR && lt.kind !== "null" && rt.kind !== "null") {
+    throw typeError("cannot compare an interval value with a value of a different type");
+  }
 }
 
 // isAdaptableOperand reports whether e is an adaptable operand — one that takes its type from its
@@ -4788,6 +4868,7 @@ function ctxOf(t: ResolvedType): ScalarType | null {
   if (t.kind === "decimal") return "decimal";
   if (t.kind === "timestamp") return "timestamp";
   if (t.kind === "timestamptz") return "timestamptz";
+  if (t.kind === "interval") return "interval";
   return null;
 }
 
@@ -4839,10 +4920,52 @@ function requireNumericOperand(t: ResolvedType): void {
     t.kind === "bytea" ||
     t.kind === "uuid" ||
     t.kind === "timestamp" ||
-    t.kind === "timestamptz"
+    t.kind === "timestamptz" ||
+    t.kind === "interval"
   ) {
     throw typeError("arithmetic operators require numeric operands");
   }
+}
+
+// temporalArithResult gives the result type of a temporal +/- (spec/design/interval.md §5), or
+// undefined when neither operand is temporal (then arithmetic falls through to the numeric path).
+// A temporal operand in an unsupported combination throws 42804. A NULL operand adopts the other
+// side's temporal type (so `timestamp ± NULL` types as timestamp and evaluates to NULL).
+type RtKind = ResolvedType["kind"];
+
+// intervalScaleResult gives the result type of an interval ×÷ number (spec/design/interval.md §5):
+// interval * number, number * interval (commute), interval / number → interval. undefined when no
+// interval is involved (or the op is not * / /). number / interval and interval × interval return
+// undefined and fall to the ±-only temporal rule (which reports the 42804).
+function intervalScaleResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {
+  const lIv = lt === "interval";
+  const rIv = rt === "interval";
+  if (!lIv && !rIv) return undefined;
+  const numeric = (k: RtKind) => k === "int" || k === "decimal" || k === "null";
+  if (op === "mul" && ((lIv && numeric(rt)) || (rIv && numeric(lt)))) return "interval";
+  if (op === "div" && lIv && numeric(rt)) return "interval";
+  return undefined;
+}
+
+// factorToFraction returns a numeric factor value as an exact fraction [num, den] with den > 0.
+function factorToFraction(v: Value): [bigint, bigint] {
+  if (v.kind === "int") return [v.int, 1n];
+  if (v.kind === "decimal") return parseFactorDecimal(v.dec.render());
+  throw typeError("internal: non-numeric interval-scale factor");
+}
+
+function temporalArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {
+  const temporal = (k: RtKind) => k === "interval" || k === "timestamp" || k === "timestamptz";
+  if (!temporal(lt) && !temporal(rt)) return undefined;
+  const l = lt === "null" ? rt : lt;
+  const r = rt === "null" ? lt : rt;
+  if ((op === "add" || op === "sub") && l === "interval" && r === "interval") return "interval";
+  if (op === "add" && ((l === "timestamp" && r === "interval") || (l === "interval" && r === "timestamp"))) return "timestamp";
+  if (op === "sub" && l === "timestamp" && r === "interval") return "timestamp";
+  if (op === "add" && ((l === "timestamptz" && r === "interval") || (l === "interval" && r === "timestamptz"))) return "timestamptz";
+  if (op === "sub" && l === "timestamptz" && r === "interval") return "timestamptz";
+  if (op === "sub" && ((l === "timestamp" && r === "timestamp") || (l === "timestamptz" && r === "timestamptz"))) return "interval";
+  throw typeError("unsupported operand types for temporal arithmetic");
 }
 
 function requireBool(t: ResolvedType, msg: string): void {
@@ -4853,7 +4976,8 @@ function requireBool(t: ResolvedType, msg: string): void {
     t.kind === "bytea" ||
     t.kind === "uuid" ||
     t.kind === "timestamp" ||
-    t.kind === "timestamptz"
+    t.kind === "timestamptz" ||
+    t.kind === "interval"
   ) {
     throw typeError(msg);
   }
@@ -5055,6 +5179,7 @@ function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): voi
   else if (isUuid(colTy)) ok = t.kind === "uuid" || t.kind === "null";
   else if (isTimestamp(colTy)) ok = t.kind === "timestamp" || t.kind === "null";
   else if (isTimestamptz(colTy)) ok = t.kind === "timestamptz" || t.kind === "null";
+  else if (isInterval(colTy)) ok = t.kind === "interval" || t.kind === "null";
   else ok = t.kind === "text" || t.kind === "null";
   if (!ok) {
     throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
@@ -5125,6 +5250,8 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
       // ... or to a timestamp column (spec/design/timestamp.md); bad input traps 22007/22008.
       if (isTimestamp(colTy)) return timestampValue(parseTimestamp(v.text));
       if (isTimestamptz(colTy)) return timestamptzValue(parseTimestamptz(v.text));
+      // ... or to an interval column (spec/design/interval.md); bad input traps 22007/22008.
+      if (isInterval(colTy)) return intervalValue(parseInterval(v.text));
       throw typeError("cannot store a text value in " + canonicalName(colTy) + " column " + colName);
     case "bytea":
       if (isBytea(colTy)) return v;
@@ -5138,6 +5265,9 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
     case "timestamptz":
       if (isTimestamptz(colTy)) return v;
       throw typeError("cannot store a timestamptz value in " + canonicalName(colTy) + " column " + colName);
+    case "interval":
+      if (isInterval(colTy)) return v;
+      throw typeError("cannot store an interval value in " + canonicalName(colTy) + " column " + colName);
     default: // bool
       if (isBool(colTy)) return v;
       throw typeError("cannot store a boolean value in " + canonicalName(colTy) + " column " + colName);
@@ -5243,6 +5373,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return timestampValue(e.value);
     case "constTimestamptz":
       return timestamptzValue(e.value);
+    case "constInterval":
+      return intervalValue(e.value);
     case "constNull":
       return nullValue();
     case "cast": {
@@ -5255,6 +5387,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
+      if (isInterval(e.result)) {
+        if (v.kind !== "interval") throw typeError("internal: non-interval unary minus");
+        return intervalValue(intervalNeg(v.iv));
+      }
       if (isDecimal(e.result)) {
         return decimalValue((v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec).negate());
       }
@@ -5272,6 +5408,46 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const a = evalExpr(e.lhs, row, env, m);
       const b = evalExpr(e.rhs, row, env, m);
       if (a.kind === "null" || b.kind === "null") return nullValue();
+      if (isInterval(e.result) && (e.op === "mul" || e.op === "div")) {
+        // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5). Mul
+        // commutes; Div is interval / number. A zero divisor traps 22012.
+        const ivVal = a.kind === "interval" ? a : (b as { iv: Interval });
+        const numVal = a.kind === "interval" ? b : a;
+        let [fnum, fden] = factorToFraction(numVal);
+        if (e.op === "div") {
+          if (fnum === 0n) throw engineError("division_by_zero", "division by zero");
+          // interval / number = interval * (den/num); keep fden > 0.
+          [fnum, fden] = fnum < 0n ? [-fden, -fnum] : [fden, fnum];
+        }
+        return intervalValue(mulByFraction(ivVal.iv, fnum, fden));
+      }
+      if (isInterval(e.result)) {
+        // interval ± interval → interval; timestamp[tz] − timestamp[tz] → interval (§5).
+        if (a.kind === "interval" && b.kind === "interval") {
+          return intervalValue(e.op === "add" ? intervalAdd(a.iv, b.iv) : intervalSub(a.iv, b.iv));
+        }
+        if (
+          (a.kind === "timestamp" && b.kind === "timestamp") ||
+          (a.kind === "timestamptz" && b.kind === "timestamptz")
+        ) {
+          return intervalValue(tsDiff(a.micros, b.micros));
+        }
+        throw typeError("internal: bad temporal-difference operands");
+      }
+      if (isTimestamp(e.result) || isTimestamptz(e.result)) {
+        // timestamp[tz] ± interval → timestamp[tz] (calendar month-add; interval + ts commutes).
+        let instant: bigint;
+        let iv: Interval;
+        if (a.kind === "interval") {
+          iv = a.iv;
+          instant = (b as { micros: bigint }).micros;
+        } else {
+          instant = (a as { micros: bigint }).micros;
+          iv = (b as { iv: Interval }).iv;
+        }
+        const r = tsShift(instant, iv, e.op === "sub");
+        return isTimestamptz(e.result) ? timestamptzValue(r) : timestampValue(r);
+      }
       if (isDecimal(e.result)) {
         // Decimal arithmetic: widen any integer operand to decimal, then apply the op with
         // PG's scale rules (spec/design/decimal.md §4). The size-scaled decimal_work is
@@ -5625,6 +5801,8 @@ function valueCmp(a: Value, b: Value): number {
   if (a.kind === "timestamptz" && b.kind === "timestamptz") {
     return a.micros < b.micros ? -1 : a.micros > b.micros ? 1 : 0;
   }
+  // Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
+  if (a.kind === "interval" && b.kind === "interval") return intervalCmp(a.iv, b.iv);
   // Cross-family arms exist only for totality — ORDER BY is over a single typed column, so a
   // mixed pair is unreachable. A fixed family order keeps the comparator total.
   const fr = familyRank(a) - familyRank(b);
@@ -5653,8 +5831,10 @@ function familyRank(v: Value): number {
       return 7;
     case "timestamptz":
       return 8;
-    default:
+    case "interval":
       return 9;
+    default:
+      return 10;
   }
 }
 

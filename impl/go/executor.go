@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"math/big"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -4351,6 +4352,8 @@ func valueToRExpr(v Value) *rExpr {
 		return &rExpr{kind: reConstTimestamp, cInt: v.Int}
 	case ValTimestamptz:
 		return &rExpr{kind: reConstTimestamptz, cInt: v.Int}
+	case ValInterval:
+		return &rExpr{kind: reConstInterval, cIv: v.Iv}
 	default: // ValNull
 		return &rExpr{kind: reConstNull}
 	}
@@ -4416,6 +4419,12 @@ func distinctRowKey(row []Value) string {
 			// already normalized to UTC at parse, so +00 and +05-of-the-same-instant bucket together.
 			b.WriteByte('z')
 			b.WriteString(strconv.FormatInt(v.Int, 10))
+		case ValInterval:
+			// The canonical 128-bit span as a decimal string, under a distinct 'v' tag, so
+			// span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/
+			// GROUP BY bucket while each value still renders its own fields (spec/design/interval.md §2).
+			b.WriteByte('v')
+			b.WriteString(v.Iv.Span().String())
 		}
 	}
 	return b.String()
@@ -4442,6 +4451,7 @@ const (
 	rtUuid        // uuid (one family, fixed 16 bytes); does not promote. First non-integer key.
 	rtTimestamp   // timestamp (zoneless instant); does not compare/cast to timestamptz
 	rtTimestamptz // timestamptz (UTC instant); does not compare/cast to timestamp
+	rtInterval    // interval (a span); compares only with itself, by the canonical span
 )
 
 type resolvedType struct {
@@ -4475,6 +4485,8 @@ func resolvedOfColumn(ty ScalarType) resolvedType {
 		return resolvedType{kind: rtTimestamp}
 	case ty.IsTimestamptz():
 		return resolvedType{kind: rtTimestamptz}
+	case ty.IsInterval():
+		return resolvedType{kind: rtInterval}
 	default: // uuid
 		return resolvedType{kind: rtUuid}
 	}
@@ -4503,7 +4515,7 @@ func assignableTo(t resolvedType, colTy ScalarType) bool {
 		return colTy.IsBool()
 	case rtText:
 		return colTy.IsText() || colTy.IsUuid() || colTy.IsBytea() ||
-			colTy.IsTimestamp() || colTy.IsTimestamptz()
+			colTy.IsTimestamp() || colTy.IsTimestamptz() || colTy.IsInterval()
 	case rtBytea:
 		return colTy.IsBytea()
 	case rtUuid:
@@ -4512,6 +4524,8 @@ func assignableTo(t resolvedType, colTy ScalarType) bool {
 		return colTy.IsTimestamp()
 	case rtTimestamptz:
 		return colTy.IsTimestamptz()
+	case rtInterval:
+		return colTy.IsInterval()
 	default:
 		return false
 	}
@@ -4548,6 +4562,8 @@ func rtName(t resolvedType) string {
 		return "timestamp"
 	case rtTimestamptz:
 		return "timestamptz"
+	case rtInterval:
+		return "interval"
 	default:
 		return "unknown"
 	}
@@ -4584,6 +4600,9 @@ func ctxOf(t resolvedType) *ScalarType {
 	case rtTimestamptz:
 		ty := Timestamptz
 		return &ty
+	case rtInterval:
+		ty := IntervalType
+		return &ty
 	default:
 		return nil
 	}
@@ -4606,6 +4625,7 @@ const (
 	reConstUuid
 	reConstTimestamp
 	reConstTimestamptz
+	reConstInterval
 	reConstNull
 	reCast
 	reNeg
@@ -4661,6 +4681,7 @@ type rExpr struct {
 	cText   string         // reConstText
 	cDec    Decimal        // reConstDecimal
 	cBytea  []byte         // reConstBytea
+	cIv     Interval       // reConstInterval
 	op      BinaryOp       // reArith, reCompare
 	result  ScalarType     // reCast target; reNeg / reArith result type
 	typmod  *DecimalTypmod // reCast: a decimal target's numeric(p,s) typmod
@@ -5671,6 +5692,8 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 		return resolvedType{kind: rtTimestamp}
 	case ty.IsTimestamptz():
 		return resolvedType{kind: rtTimestamptz}
+	case ty.IsInterval():
+		return resolvedType{kind: rtInterval}
 	default:
 		return resolvedType{kind: rtInt, intTy: ty}
 	}
@@ -5869,6 +5892,14 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 					return nil, resolvedType{}, err
 				}
 				return &rExpr{kind: reConstTimestamptz, cInt: m}, resolvedType{kind: rtTimestamptz}, nil
+			case ctx != nil && ctx.IsInterval():
+				// A string adapts to an INTERVAL context (parse the "unit + time" subset,
+				// 22007/22008 — spec/design/interval.md), like timestamp adaptation.
+				iv, err := ParseInterval(e.Literal.Str)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return &rExpr{kind: reConstInterval, cIv: iv}, resolvedType{kind: rtInterval}, nil
 			}
 			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
 		case LiteralDecimal:
@@ -5894,6 +5925,14 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return &rExpr{kind: reConstInt, cInt: e.Literal.Int},
 				resolvedType{kind: rtInt, intTy: ty}, nil
 		}
+	case ExprIntervalLiteral:
+		// INTERVAL '...' — a keyword-introduced interval literal (spec/design/interval.md §3).
+		// Parsed at resolve (22007 malformed / 22008 field overflow), independent of context.
+		iv, err := ParseInterval(e.IntervalText)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstInterval, cIv: iv}, resolvedType{kind: rtInterval}, nil
 	case ExprScalarSubquery:
 		// A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so
 		// its column-count / type errors fire even over an empty outer. planSubquery rejects a
@@ -5964,6 +6003,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if target.IsTimestamp() || target.IsTimestamptz() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to a timestamp type is not supported yet")
 		}
+		// interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000.
+		if target.IsInterval() {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to an interval type is not supported yet")
+		}
 		inner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -5986,6 +6029,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// Casting FROM a timestamp is likewise deferred (0A000).
 		if ity.kind == rtTimestamp || ity.kind == rtTimestamptz {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from a timestamp type is not supported yet")
+		}
+		// Casting FROM an interval is likewise deferred (0A000).
+		if ity.kind == rtInterval {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from an interval type is not supported yet")
 		}
 		// int→int (range check), int→decimal (widen), decimal→int (explicit, round),
 		// decimal→decimal (re-scale), and NULL are all castable.
@@ -6010,7 +6057,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			case rtNull:
 				return &rExpr{kind: reNeg, operand: rop, result: Int64}, // -NULL = NULL
 					resolvedType{kind: rtInt, intTy: Int64}, nil
-			default: // rtBool, rtText
+			case rtInterval:
+				return &rExpr{kind: reNeg, operand: rop, result: IntervalType}, // -interval (interval.md §5)
+					resolvedType{kind: rtInterval}, nil
+			default: // rtBool, rtText, ...
 				return nil, resolvedType{}, typeError("unary minus requires a numeric operand")
 			}
 		}
@@ -6172,6 +6222,21 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		// interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5). Checked
+		// before the ±-only temporal rule below.
+		if st, isScale := intervalScaleResult(b.Op, lt.kind, rt.kind); isScale {
+			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: st}, resolvedTypeOf(st), nil
+		}
+		// Temporal arithmetic (spec/design/interval.md §5): interval ± interval, timestamp[tz] ±
+		// interval, interval + timestamp[tz], and timestamp[tz] − timestamp[tz] → interval. The
+		// eval dispatches on the value kinds; here we settle the result type. A temporal operand
+		// in any other combination is a 42804.
+		if st, isTemporal, terr := temporalArithResult(b.Op, lt.kind, rt.kind); isTemporal {
+			if terr != nil {
+				return nil, resolvedType{}, terr
+			}
+			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: st}, resolvedTypeOf(st), nil
+		}
 		if err := requireNumericOperand(lt); err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -6268,10 +6333,77 @@ func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes)
 // or NULL); a boolean or text operand is a 42804 type error.
 func requireNumericOperand(t resolvedType) error {
 	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea || t.kind == rtUuid ||
-		t.kind == rtTimestamp || t.kind == rtTimestamptz {
+		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval {
 		return typeError("arithmetic operators require numeric operands")
 	}
 	return nil
+}
+
+// intervalScaleResult gives the result type of an interval ×÷ number (spec/design/interval.md §5):
+// interval * number, number * interval (commute), interval / number → interval. isScale is false
+// when no interval is involved (or the op is not * / /). number / interval and interval × interval
+// return false and fall to the ±-only temporal rule (which reports the 42804).
+func intervalScaleResult(op BinaryOp, lt, rt rtKind) (st ScalarType, isScale bool) {
+	lIv, rIv := lt == rtInterval, rt == rtInterval
+	if !lIv && !rIv {
+		return 0, false
+	}
+	numeric := func(k rtKind) bool { return k == rtInt || k == rtDecimal || k == rtNull }
+	switch op {
+	case OpMul:
+		if (lIv && numeric(rt)) || (rIv && numeric(lt)) {
+			return IntervalType, true
+		}
+	case OpDiv:
+		if lIv && numeric(rt) {
+			return IntervalType, true
+		}
+	}
+	return 0, false
+}
+
+// factorToFraction returns a numeric factor value as an exact fraction (num, den) with den > 0.
+func factorToFraction(v Value) (*big.Int, *big.Int, error) {
+	if v.Kind == ValInt {
+		return big.NewInt(v.Int), big.NewInt(1), nil
+	}
+	return ParseFactorDecimal(v.Dec.Render())
+}
+
+// temporalArithResult gives the result type of a temporal +/- (spec/design/interval.md §5).
+// isTemporal is false when neither operand is temporal (then arithmetic falls through to the
+// numeric path); true with a non-nil error is a temporal operand in an unsupported combination
+// (42804). A NULL operand adopts the other side's temporal type (so `timestamp ± NULL` types as
+// timestamp and evaluates to NULL).
+func temporalArithResult(op BinaryOp, lt, rt rtKind) (st ScalarType, isTemporal bool, err error) {
+	temporal := func(k rtKind) bool { return k == rtInterval || k == rtTimestamp || k == rtTimestamptz }
+	if !temporal(lt) && !temporal(rt) {
+		return 0, false, nil
+	}
+	l, r := lt, rt
+	if l == rtNull {
+		l = rt
+	}
+	if r == rtNull {
+		r = lt
+	}
+	switch {
+	case (op == OpAdd || op == OpSub) && l == rtInterval && r == rtInterval:
+		return IntervalType, true, nil
+	case op == OpAdd && l == rtTimestamp && r == rtInterval,
+		op == OpAdd && l == rtInterval && r == rtTimestamp,
+		op == OpSub && l == rtTimestamp && r == rtInterval:
+		return Timestamp, true, nil
+	case op == OpAdd && l == rtTimestamptz && r == rtInterval,
+		op == OpAdd && l == rtInterval && r == rtTimestamptz,
+		op == OpSub && l == rtTimestamptz && r == rtInterval:
+		return Timestamptz, true, nil
+	case op == OpSub && l == rtTimestamp && r == rtTimestamp,
+		op == OpSub && l == rtTimestamptz && r == rtTimestamptz:
+		return IntervalType, true, nil
+	default:
+		return 0, true, typeError("unsupported operand types for temporal arithmetic")
+	}
 }
 
 // classifyComparable requires that a comparison operand pair is comparable
@@ -6307,6 +6439,11 @@ func classifyComparable(lt, rt resolvedType) error {
 	tsR := rt.kind == rtTimestamp || rt.kind == rtTimestamptz
 	if (tsL || tsR) && lt.kind != rt.kind && lt.kind != rtNull && rt.kind != rtNull {
 		return typeError("cannot compare a timestamp value with a value of a different type")
+	}
+	// interval compares only with itself (or NULL); interval vs any other family is a 42804.
+	ivL, ivR := lt.kind == rtInterval, rt.kind == rtInterval
+	if ivL != ivR && lt.kind != rtNull && rt.kind != rtNull {
+		return typeError("cannot compare an interval value with a value of a different type")
 	}
 	return nil
 }
@@ -6366,7 +6503,7 @@ func promote(a, b resolvedType) ScalarType {
 
 func requireBool(t resolvedType, msg string) error {
 	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal || t.kind == rtBytea || t.kind == rtUuid ||
-		t.kind == rtTimestamp || t.kind == rtTimestamptz {
+		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval {
 		return typeError(msg)
 	}
 	return nil
@@ -6464,6 +6601,8 @@ func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
 		ok = t.kind == rtTimestamp || t.kind == rtNull
 	case colTy.IsTimestamptz():
 		ok = t.kind == rtTimestamptz || t.kind == rtNull
+	case colTy.IsInterval():
+		ok = t.kind == rtInterval || t.kind == rtNull
 	default: // text
 		ok = t.kind == rtText || t.kind == rtNull
 	}
@@ -6565,6 +6704,8 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		return TimestampValue(e.cInt), nil
 	case reConstTimestamptz:
 		return TimestamptzValue(e.cInt), nil
+	case reConstInterval:
+		return IntervalValue(e.cIv), nil
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
@@ -6585,6 +6726,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		if v.Kind == ValNull {
 			return NullValue(), nil
+		}
+		if e.result.IsInterval() {
+			r, err := v.Iv.Neg()
+			if err != nil {
+				return Value{}, err
+			}
+			return IntervalValue(r), nil
 		}
 		if e.result.IsDecimal() {
 			if v.Kind == ValInt {
@@ -6619,6 +6767,75 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		if a.Kind == ValNull || b.Kind == ValNull {
 			return NullValue(), nil
+		}
+		if e.result.IsInterval() && (e.op == OpMul || e.op == OpDiv) {
+			// interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5).
+			// Mul commutes; Div is interval / number. A zero divisor traps 22012.
+			iv, num := a, b
+			if a.Kind != ValInterval {
+				iv, num = b, a
+			}
+			fnum, fden, ferr := factorToFraction(num)
+			if ferr != nil {
+				return Value{}, ferr
+			}
+			if e.op == OpDiv {
+				if fnum.Sign() == 0 {
+					return Value{}, NewError(DivisionByZero, "division by zero")
+				}
+				// interval / number = interval * (den/num); keep fden > 0.
+				if fnum.Sign() < 0 {
+					fnum, fden = new(big.Int).Neg(fden), new(big.Int).Neg(fnum)
+				} else {
+					fnum, fden = fden, fnum
+				}
+			}
+			r, rerr := MulByFraction(iv.Iv, fnum, fden)
+			if rerr != nil {
+				return Value{}, rerr
+			}
+			return IntervalValue(r), nil
+		}
+		if e.result.IsInterval() {
+			// interval ± interval → interval; timestamp[tz] − timestamp[tz] → interval
+			// (spec/design/interval.md §5). Dispatch on the operand kinds.
+			if a.Kind == ValInterval && b.Kind == ValInterval {
+				var r Interval
+				if e.op == OpAdd {
+					r, err = a.Iv.Add(b.Iv)
+				} else {
+					r, err = a.Iv.Sub(b.Iv)
+				}
+				if err != nil {
+					return Value{}, err
+				}
+				return IntervalValue(r), nil
+			}
+			// timestamp[tz] − timestamp[tz] (both Int-carried instants).
+			r, err := TsDiff(a.Int, b.Int)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntervalValue(r), nil
+		}
+		if e.result.IsTimestamp() || e.result.IsTimestamptz() {
+			// timestamp[tz] ± interval → timestamp[tz] (calendar month-add with clamping;
+			// interval + timestamp commutes). Find the timestamp instant and the interval.
+			var instant int64
+			var iv Interval
+			if a.Kind == ValInterval {
+				instant, iv = b.Int, a.Iv
+			} else {
+				instant, iv = a.Int, b.Iv
+			}
+			r, terr := TsShift(instant, iv, e.op == OpSub)
+			if terr != nil {
+				return Value{}, terr
+			}
+			if e.result.IsTimestamptz() {
+				return TimestamptzValue(r), nil
+			}
+			return TimestampValue(r), nil
 		}
 		if e.result.IsDecimal() {
 			// Decimal arithmetic: widen any integer operand to decimal, then apply the op with
@@ -7117,6 +7334,9 @@ func valueCmp(a, b Value) int {
 		return cmpInt64(a.Int, b.Int)
 	case a.Kind == ValTimestamptz && b.Kind == ValTimestamptz:
 		return cmpInt64(a.Int, b.Int)
+	case a.Kind == ValInterval && b.Kind == ValInterval:
+		// Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
+		return a.Iv.SpanCmp(b.Iv)
 	default:
 		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
 		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -7167,8 +7387,10 @@ func familyRank(v Value) int {
 		return 7
 	case ValTimestamptz:
 		return 8
-	default:
+	case ValInterval:
 		return 9
+	default:
+		return 10
 	}
 }
 
@@ -7267,6 +7489,15 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			}
 			return TimestamptzValue(m), nil
 		}
+		if colTy.IsInterval() {
+			// A string literal adapts to an interval column (spec/design/interval.md);
+			// malformed input traps 22007, an out-of-range field 22008.
+			iv, err := ParseInterval(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntervalValue(iv), nil
+		}
 		return Value{}, typeError("cannot store a text value in " + colTy.CanonicalName() + " column " + colName)
 	case ValBytea:
 		if colTy.IsBytea() {
@@ -7288,6 +7519,11 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			return v, nil
 		}
 		return Value{}, typeError("cannot store a timestamptz value in " + colTy.CanonicalName() + " column " + colName)
+	case ValInterval:
+		if colTy.IsInterval() {
+			return v, nil
+		}
+		return Value{}, typeError("cannot store an interval value in " + colTy.CanonicalName() + " column " + colName)
 	default: // ValBool
 		if colTy.IsBool() {
 			return BoolValue(v.Bool), nil

@@ -36,7 +36,7 @@ function isLeap(y: bigint): boolean {
   return y % 4n === 0n && (y % 100n !== 0n || y % 400n === 0n);
 }
 
-function daysInMonth(y: bigint, month: bigint): bigint {
+export function daysInMonth(y: bigint, month: bigint): bigint {
   switch (month) {
     case 1n:
     case 3n:
@@ -60,7 +60,7 @@ function daysInMonth(y: bigint, month: bigint): bigint {
 
 // daysFromCivil returns days since 1970-01-01 for the civil date (y, m, d) (Hinnant). `y` is
 // the astronomical year; `/` truncates, paired with the y-399 adjustment (= floor for y<0).
-function daysFromCivil(y: bigint, m: bigint, d: bigint): bigint {
+export function daysFromCivil(y: bigint, m: bigint, d: bigint): bigint {
   if (m <= 2n) y -= 1n;
   const era = (y >= 0n ? y : y - 399n) / 400n;
   const yoe = y - era * 400n;
@@ -85,7 +85,7 @@ function civilFromDays(z: bigint): [bigint, bigint, bigint] {
 
 // civilFromMicros decomposes an instant into civil fields using FLOOR division (so pre-1970 /
 // BC instants decompose correctly; us is always 0..999_999).
-function civilFromMicros(
+export function civilFromMicros(
   t: bigint,
 ): [bigint, bigint, bigint, bigint, bigint, bigint, bigint] {
   const us = floorMod(t, MICROS_PER_SEC);

@@ -1,0 +1,78 @@
+# interval ×÷ number (spec/design/interval.md §5): interval × integer/decimal, integer/decimal ×
+# interval (commute), interval ÷ integer/decimal → interval. Each field is scaled by the factor
+# with the fractional part cascading months→days→micros (1 month = 30 days, 1 day = 24 h),
+# computed EXACTLY (a documented PG divergence only on sub-unit ties), µs rounded half away from
+# zero. Overflow traps 22008; a zero divisor traps 22012.
+# requires: query.select, query.select_no_from, types.int32, types.interval, expr.interval_scale
+
+# integer factor: simple field scaling
+query T nosort
+SELECT INTERVAL '2 hours' * 3
+----
+06:00:00
+
+# commute: number × interval
+query T nosort
+SELECT 2 * INTERVAL '30 minutes'
+----
+01:00:00
+
+# division cascade: 1 month / 2 = 15 days (1 mon = 30 days)
+query T nosort
+SELECT INTERVAL '1 mon' / 2
+----
+15 days
+
+# division with a non-integral day result: 10 days / 4 = 2.5 days = 2 days 12 h
+query T nosort
+SELECT INTERVAL '10 days' / 4
+----
+2 days 12:00:00
+
+# year / 3 = 4 months
+query T nosort
+SELECT INTERVAL '1 year' / 3
+----
+4 mons
+
+# decimal factor (fractional): 1 day × 1.5 = 1 day 12 h
+query T nosort
+SELECT INTERVAL '1 day' * 1.5
+----
+1 day 12:00:00
+
+# decimal factor on a multi-field value: 100 days × 0.5 = 50 days
+query T nosort
+SELECT INTERVAL '100 days' * 0.5
+----
+50 days
+
+# fractional month cascade: 1 mon × 1.5 = 1 mon 15 days
+query T nosort
+SELECT INTERVAL '1 mon' * 1.5
+----
+1 mon 15 days
+
+# negative factor flips the sign
+query T nosort
+SELECT INTERVAL '1 day 2 hours' * -2
+----
+-2 days -04:00:00
+
+# a NULL factor propagates
+query T nosort
+SELECT INTERVAL '1 day' * NULL
+----
+NULL
+
+# a zero divisor traps 22012
+statement error 22012
+SELECT INTERVAL '1 hour' / 0
+
+# dividing a number BY an interval is a 42804 (no such operator)
+statement error 42804
+SELECT 1 / INTERVAL '1 day'
+
+# multiplying two intervals is a 42804
+statement error 42804
+SELECT INTERVAL '1 day' * INTERVAL '2 days'

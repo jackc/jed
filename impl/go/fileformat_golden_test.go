@@ -331,6 +331,21 @@ func timestamptzTableDB(t *testing.T) *Database {
 	return db
 }
 
+// intervalTableDB exercises the value codec's fixed 16-byte interval branch (type code 11):
+// a positive multi-field value, a negative value, the zero interval, a months-only '1 mon'
+// vs a span-equal-but-byte-distinct '30 days', and a NULL. The bare-string literals adapt.
+func intervalTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, d interval)")
+	run(t, db, "INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05')")
+	run(t, db, "INSERT INTO t VALUES (2, '-1 day')")
+	run(t, db, "INSERT INTO t VALUES (3, '0 seconds')")
+	run(t, db, "INSERT INTO t VALUES (4, '1 mon')")
+	run(t, db, "INSERT INTO t VALUES (5, '30 days')")
+	run(t, db, "INSERT INTO t VALUES (6, NULL)")
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -350,6 +365,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"default_table.jed", defaultTableDB},
 		{"timestamp_table.jed", timestampTableDB},
 		{"timestamptz_table.jed", timestamptzTableDB},
+		{"interval_table.jed", intervalTableDB},
 		{"nopk_table.jed", nopkTableDB},
 		{"composite_pk_table.jed", compositePKTableDB},
 		{"check_table.jed", checkTableDB},
@@ -388,6 +404,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"default_table.jed", defaultTableDB, "t"},
 		{"timestamp_table.jed", timestampTableDB, "t"},
 		{"timestamptz_table.jed", timestamptzTableDB, "t"},
+		{"interval_table.jed", intervalTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"composite_pk_table.jed", compositePKTableDB, "t"},
 		{"check_table.jed", checkTableDB, "t"},
@@ -537,8 +554,8 @@ func TestTypeCodesRoundTrip(t *testing.T) {
 	if _, ok := scalarForTypeCode(0); ok {
 		t.Errorf("type code 0 (reserved) should be unknown")
 	}
-	if _, ok := scalarForTypeCode(11); ok {
-		t.Errorf("type code 11 should be unknown")
+	if _, ok := scalarForTypeCode(12); ok {
+		t.Errorf("type code 12 should be unknown")
 	}
 }
 

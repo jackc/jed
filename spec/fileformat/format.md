@@ -315,6 +315,7 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 8 | `uuid` |
 | 9 | `timestamp` |
 | 10 | `timestamptz` |
+| 11 | `interval` |
 
 A column's collation is **not** stored: there is one collation (`C`) for all text this slice
 ([../design/types.md](../design/types.md) §11). A per-column collation field is a forward
@@ -514,6 +515,12 @@ from v1**. The present-**inline-plain** body depends on the type:
   **same 8-byte order-preserving integer body as `int64`** (the two type codes 9/10 differ in
   semantics, not bytes); the `±infinity` sentinels are the extreme `int64` values.
 
+- **`interval`** — a **fixed 16-byte** body: **`i32` months**, **`i32` days**, **`i64` micros**,
+  each **big-endian two's-complement** (plain — **no** sign-flip; this is a value codec, not an
+  order-preserving key, and interval is not a key this slice — [../design/interval.md](../design/interval.md)).
+  No length prefix; the three fields are independent (PG's representation), and comparison goes
+  through the canonical 128-bit span at runtime, never these bytes.
+
 **Rowid reconstruction (no-PK tables).** The synthetic rowid is allocated from a **monotonic
 counter** that is never reused. It is **not stored** — on load it is set to `max(rowid) + 1`
 over the table's persisted keys (0 for an empty table), exact because a no-PK key is a bare
@@ -696,6 +703,7 @@ the interior-node format and the split contract.
 | `default_table.jed` | columns with `DEFAULT` — the `has_default` flag + default value codec written after the typmod |
 | `timestamp_table.jed` | a timestamp column — the 8-byte int64 branch; epoch, pre-1970, BC-era, `±infinity`, NULL |
 | `timestamptz_table.jed` | a timestamptz column — the same 8-byte branch under type code 10 |
+| `interval_table.jed` | an interval column — the fixed 16-byte branch (i32 months ‖ i32 days ‖ i64 micros, big-endian); a positive multi-field value, a negative value, the zero interval, a months-only/`'1 mon'` value (vs a `'30 days'` value that is span-equal but byte-distinct), and a NULL (single leaf) |
 | `nopk_table.jed` | a no-PK table — the stored synthetic `int64` rowid key |
 | `composite_pk_table.jed` | a **composite PRIMARY KEY** (`int32` ‖ `int16`) — the concatenated key encoding (encoding.md §2.3) + the v5 `pk_ordinal` list; negative first component and tie-breaking second |
 | `index_table.jed` | **secondary indexes** (v5) — a table whose PK list order differs from declaration order (`PRIMARY KEY (b, a)` — the lifted narrowing), one single-column index over a **nullable** column holding a NULL (the encoding.md §2.2 presence tag in stored index order, NULL last) and one auto-named two-column index; empty-payload index records |

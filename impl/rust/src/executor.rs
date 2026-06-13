@@ -15,6 +15,7 @@ use crate::costs::COSTS;
 use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
 use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
+use crate::interval::{Interval, parse_interval};
 use crate::pmap::KeyBound;
 use crate::storage::{Row, TableStore};
 use crate::timestamp::{parse_timestamp, parse_timestamptz};
@@ -928,7 +929,8 @@ impl Database {
                 | ResolvedType::Bytea
                 | ResolvedType::Uuid
                 | ResolvedType::Timestamp
-                | ResolvedType::Timestamptz => {
+                | ResolvedType::Timestamptz
+                | ResolvedType::Interval => {
                     return Err(type_error("argument of CHECK must be boolean"));
                 }
             }
@@ -1663,11 +1665,14 @@ impl Database {
                         Value::Bool(_) => {
                             unreachable!("a boolean primary key is rejected at CREATE TABLE")
                         }
-                        // Unreachable: a text/decimal/bytea PRIMARY KEY is rejected at CREATE
-                        // TABLE (0A000) — those non-integer PKs are caught by the CREATE gate.
-                        Value::Text(_) | Value::Decimal(_) | Value::Bytea(_) => {
+                        // Unreachable: a text/decimal/bytea/interval PRIMARY KEY is rejected at
+                        // CREATE TABLE (0A000) — those non-integer PKs are caught by the gate.
+                        Value::Text(_)
+                        | Value::Decimal(_)
+                        | Value::Bytea(_)
+                        | Value::Interval(_) => {
                             unreachable!(
-                                "a text/decimal/bytea primary key is rejected at CREATE TABLE"
+                                "a text/decimal/bytea/interval primary key is rejected at CREATE TABLE"
                             )
                         }
                         // Poisoned (large-values.md §14): INSERT values are evaluated
@@ -3753,6 +3758,7 @@ impl Database {
             | RExpr::ConstUuid(_)
             | RExpr::ConstTimestamp(_)
             | RExpr::ConstTimestamptz(_)
+            | RExpr::ConstInterval(_)
             | RExpr::ConstNull => Ok(()),
         }
     }
@@ -4084,6 +4090,8 @@ enum ResolvedType {
     Timestamp,
     /// The `timestamptz` family (UTC instant). Does not compare/cast to `Timestamp`.
     Timestamptz,
+    /// The `interval` family (a span). Compares only with itself (by the canonical span).
+    Interval,
     Null,
 }
 
@@ -4100,6 +4108,7 @@ impl ResolvedType {
             ScalarType::Uuid => ResolvedType::Uuid,
             ScalarType::Timestamp => ResolvedType::Timestamp,
             ScalarType::Timestamptz => ResolvedType::Timestamptz,
+            ScalarType::Interval => ResolvedType::Interval,
         }
     }
 
@@ -4114,6 +4123,7 @@ impl ResolvedType {
             ResolvedType::Uuid => "uuid",
             ResolvedType::Timestamp => "timestamp",
             ResolvedType::Timestamptz => "timestamptz",
+            ResolvedType::Interval => "interval",
             ResolvedType::Null => "unknown",
         }
     }
@@ -4123,7 +4133,7 @@ impl ResolvedType {
     /// before any row is produced (so it fires even over an empty source). It is the
     /// family-level subset of `store_value` and MUST agree with it: an integer assigns to an
     /// integer or decimal column (int→decimal widens), a decimal only to a decimal column
-    /// (decimal→int is explicit-CAST only), text to text/uuid/bytea/timestamp/timestamptz (the
+    /// (decimal→int is explicit-CAST only), text to text/uuid/bytea/timestamp/timestamptz/interval (the
     /// documented text adaptation — the per-row store then parses, trapping 22P02/22007 on
     /// malformed input), boolean→boolean, uuid→uuid, bytea→bytea, a timestamp only to a timestamp
     /// column and a timestamptz only to a timestamptz column (the two never cross — they do not
@@ -4141,11 +4151,13 @@ impl ResolvedType {
                     || col_ty.is_bytea()
                     || col_ty.is_timestamp()
                     || col_ty.is_timestamptz()
+                    || col_ty.is_interval()
             }
             ResolvedType::Bytea => col_ty.is_bytea(),
             ResolvedType::Uuid => col_ty.is_uuid(),
             ResolvedType::Timestamp => col_ty.is_timestamp(),
             ResolvedType::Timestamptz => col_ty.is_timestamptz(),
+            ResolvedType::Interval => col_ty.is_interval(),
         }
     }
 }
@@ -4198,6 +4210,8 @@ enum RExpr {
     /// A parsed `timestamp` / `timestamptz` literal: the int64 microsecond instant.
     ConstTimestamp(i64),
     ConstTimestamptz(i64),
+    /// A parsed `interval` literal: the three-field span (spec/design/interval.md).
+    ConstInterval(Interval),
     ConstNull,
     /// A bind parameter, by 0-based index into the bound-values slice passed to `eval`. Its
     /// static type was inferred from context at resolve (spec/design/api.md §5); the value
@@ -5057,7 +5071,11 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::FuncCall { name, args, .. } => {
             is_aggregate_name(name) || args.iter().any(expr_has_aggregate)
         }
-        Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::Literal(_) | Expr::Param(_) => false,
+        Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::Param(_) => false,
         Expr::Cast { inner, .. } => expr_has_aggregate(inner),
         Expr::Unary { operand, .. } => expr_has_aggregate(operand),
         Expr::IsNull { operand, .. } => expr_has_aggregate(operand),
@@ -5113,7 +5131,10 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
             }
             args.iter().try_for_each(reject_check_structure)
         }
-        Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::Literal(_) => Ok(()),
+        Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::IntervalLiteral(_) => Ok(()),
         Expr::Cast { inner, .. } => reject_check_structure(inner),
         Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
             reject_check_structure(operand)
@@ -5171,7 +5192,7 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
         };
         match e {
             Expr::Column(name) | Expr::QualifiedColumn { name, .. } => note(name),
-            Expr::Literal(_) | Expr::Param(_) => {}
+            Expr::Literal(_) | Expr::IntervalLiteral(_) | Expr::Param(_) => {}
             Expr::Cast { inner, .. } => walk(inner, columns, out),
             Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
                 walk(operand, columns, out)
@@ -5247,6 +5268,7 @@ fn value_to_rexpr(v: &Value) -> RExpr {
         Value::Uuid(u) => RExpr::ConstUuid(*u),
         Value::Timestamp(m) => RExpr::ConstTimestamp(*m),
         Value::Timestamptz(m) => RExpr::ConstTimestamptz(*m),
+        Value::Interval(iv) => RExpr::ConstInterval(*iv),
         // Poisoned (large-values.md §14): a folded subquery's projections are resolved values.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
@@ -5337,6 +5359,7 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::ConstUuid(_)
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
+        | RExpr::ConstInterval(_)
         | RExpr::ConstNull => false,
     }
 }
@@ -5403,6 +5426,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::ConstUuid(_)
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
+        | RExpr::ConstInterval(_)
         | RExpr::ConstNull => {}
     }
 }
@@ -5817,7 +5841,8 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> R
         | ResolvedType::Bytea
         | ResolvedType::Uuid
         | ResolvedType::Timestamp
-        | ResolvedType::Timestamptz => Err(type_error("argument of WHERE must be boolean")),
+        | ResolvedType::Timestamptz
+        | ResolvedType::Interval => Err(type_error("argument of WHERE must be boolean")),
     }
 }
 
@@ -5976,6 +6001,8 @@ fn resolved_type_of(ty: ScalarType) -> ResolvedType {
         ResolvedType::Timestamp
     } else if ty.is_timestamptz() {
         ResolvedType::Timestamptz
+    } else if ty.is_interval() {
+        ResolvedType::Interval
     } else {
         ResolvedType::Int(ty)
     }
@@ -6098,6 +6125,12 @@ fn resolve(
                     RExpr::ConstTimestamptz(parse_timestamptz(s)?),
                     ResolvedType::Timestamptz,
                 )),
+                // A string adapts to an INTERVAL context (parse the "unit + time" subset,
+                // 22007/22008 — spec/design/interval.md), exactly like timestamp adaptation.
+                Some(t) if t.is_interval() => Ok((
+                    RExpr::ConstInterval(parse_interval(s)?),
+                    ResolvedType::Interval,
+                )),
                 _ => Ok((RExpr::ConstText(s.clone()), ResolvedType::Text)),
             }
         }
@@ -6108,6 +6141,12 @@ fn resolve(
             let d = d.clone().check_cap()?;
             Ok((RExpr::ConstDecimal(d), ResolvedType::Decimal))
         }
+        // `INTERVAL '...'` — a keyword-introduced interval literal (spec/design/interval.md §3).
+        // Parsed at resolve (22007 malformed / 22008 field overflow), independent of any context.
+        Expr::IntervalLiteral(s) => Ok((
+            RExpr::ConstInterval(parse_interval(s)?),
+            ResolvedType::Interval,
+        )),
         // A subquery in expression position (spec/design/grammar.md §26): PLANNED ONCE against the
         // scope chain here, so its column-count / type errors fire even over an empty outer.
         // `plan_subquery` rejects a non-SELECT context and a `$N` inside (both 0A000). The fold
@@ -6218,6 +6257,15 @@ fn resolve(
                     "casting to a timestamp type is not supported yet",
                 ));
             }
+            // interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000
+            // (a string lands in an interval column by literal adaptation / the INTERVAL '...'
+            // keyword literal, not a CAST).
+            if target.is_interval() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "casting to an interval type is not supported yet",
+                ));
+            }
             // The inner value is range-checked / coerced against `target` at eval, so it
             // resolves with no literal context here.
             let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
@@ -6259,6 +6307,13 @@ fn resolve(
                         "casting from a timestamp type is not supported yet",
                     ));
                 }
+                // Casting FROM an interval is likewise deferred (0A000).
+                ResolvedType::Interval => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting from an interval type is not supported yet",
+                    ));
+                }
             }
             let result_ty = if target.is_decimal() {
                 ResolvedType::Decimal
@@ -6283,6 +6338,7 @@ fn resolve(
                 ResolvedType::Int(t) => t,
                 ResolvedType::Decimal => ScalarType::Decimal,
                 ResolvedType::Null => ScalarType::Int64, // -NULL = NULL
+                ResolvedType::Interval => ScalarType::Interval, // -interval (interval.md §5)
                 ResolvedType::Bool
                 | ResolvedType::Text
                 | ResolvedType::Bytea
@@ -6294,6 +6350,8 @@ fn resolve(
             };
             let rty = if result.is_decimal() {
                 ResolvedType::Decimal
+            } else if result.is_interval() {
+                ResolvedType::Interval
             } else {
                 ResolvedType::Int(result)
             };
@@ -6476,6 +6534,47 @@ fn resolve_binary(
             // arithmetic (the integer operand widens at eval); a text/boolean operand is a
             // 42804 (spec/design/decimal.md §4).
             let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
+            // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5).
+            // interval * number, number * interval (commute), interval / number. Checked before
+            // the ±-only temporal rule below.
+            if let Some(res) = interval_scale_result(op, lt, rt) {
+                let result = res?;
+                let aop = if matches!(op, BinaryOp::Mul) {
+                    ArithOp::Mul
+                } else {
+                    ArithOp::Div
+                };
+                return Ok((
+                    RExpr::Arith {
+                        op: aop,
+                        lhs: Box::new(rl),
+                        rhs: Box::new(rr),
+                        result,
+                    },
+                    resolved_type_of(result),
+                ));
+            }
+            // Temporal arithmetic (spec/design/interval.md §5): interval ± interval, timestamp[tz]
+            // ± interval, interval + timestamp[tz], and timestamp[tz] − timestamp[tz] → interval.
+            // The eval dispatches on the value kinds; here we settle the result type. A temporal
+            // operand in any other combination is a 42804.
+            if let Some(res) = temporal_arith_result(op, lt, rt) {
+                let result = res?;
+                let aop = if matches!(op, BinaryOp::Add) {
+                    ArithOp::Add
+                } else {
+                    ArithOp::Sub
+                };
+                return Ok((
+                    RExpr::Arith {
+                        op: aop,
+                        lhs: Box::new(rl),
+                        rhs: Box::new(rr),
+                        result,
+                    },
+                    resolved_type_of(result),
+                ));
+            }
             require_numeric_operand(lt)?;
             require_numeric_operand(rt)?;
             let aop = match op {
@@ -6606,11 +6705,87 @@ fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
         // A datetime sibling offers its type so a string literal parses as that datetime.
         ResolvedType::Timestamp => Some(ScalarType::Timestamp),
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
+        // An interval sibling offers its type so a string literal parses as an interval.
+        ResolvedType::Interval => Some(ScalarType::Interval),
     }
 }
 
 /// Require that an arithmetic operand is numeric (integer or decimal, or NULL); a boolean,
 /// text, or bytea operand is a 42804 type error.
+/// The result type of a temporal `+`/`-` (spec/design/interval.md §5), or `None` when neither
+/// operand is temporal (interval / timestamp / timestamptz) — then arithmetic falls through to
+/// the numeric path. `Some(Err)` is a temporal operand in an unsupported combination (42804). A
+/// NULL operand adopts the other side's temporal type (so `timestamp ± NULL` types as timestamp
+/// and evaluates to NULL).
+fn temporal_arith_result(
+    op: BinaryOp,
+    lt: ResolvedType,
+    rt: ResolvedType,
+) -> Option<Result<ScalarType>> {
+    use ResolvedType as R;
+    let temporal = |t: R| matches!(t, R::Interval | R::Timestamp | R::Timestamptz);
+    if !temporal(lt) && !temporal(rt) {
+        return None;
+    }
+    let l = if matches!(lt, R::Null) { rt } else { lt };
+    let r = if matches!(rt, R::Null) { lt } else { rt };
+    use BinaryOp::{Add, Sub};
+    let st = match (op, l, r) {
+        (Add | Sub, R::Interval, R::Interval) => ScalarType::Interval,
+        (Add, R::Timestamp, R::Interval)
+        | (Add, R::Interval, R::Timestamp)
+        | (Sub, R::Timestamp, R::Interval) => ScalarType::Timestamp,
+        (Add, R::Timestamptz, R::Interval)
+        | (Add, R::Interval, R::Timestamptz)
+        | (Sub, R::Timestamptz, R::Interval) => ScalarType::Timestamptz,
+        (Sub, R::Timestamp, R::Timestamp) | (Sub, R::Timestamptz, R::Timestamptz) => {
+            ScalarType::Interval
+        }
+        _ => {
+            return Some(Err(type_error(
+                "unsupported operand types for temporal arithmetic",
+            )));
+        }
+    };
+    Some(Ok(st))
+}
+
+/// The result type of an interval `×÷` number (spec/design/interval.md §5): `interval * number`,
+/// `number * interval` (commute), `interval / number` → interval. `None` when no interval is
+/// involved (or the op is not `*`/`/`). A NULL operand counts as a numeric partner (propagates).
+/// `number / interval` and `interval × interval` return `None` here and fall to the ±-only
+/// temporal rule, which reports the 42804.
+fn interval_scale_result(
+    op: BinaryOp,
+    lt: ResolvedType,
+    rt: ResolvedType,
+) -> Option<Result<ScalarType>> {
+    use ResolvedType as R;
+    let l_iv = matches!(lt, R::Interval);
+    let r_iv = matches!(rt, R::Interval);
+    if !l_iv && !r_iv {
+        return None;
+    }
+    let numeric = |t: R| matches!(t, R::Int(_) | R::Decimal | R::Null);
+    match op {
+        BinaryOp::Mul if (l_iv && numeric(rt)) || (r_iv && numeric(lt)) => {
+            Some(Ok(ScalarType::Interval))
+        }
+        BinaryOp::Div if l_iv && numeric(rt) => Some(Ok(ScalarType::Interval)),
+        _ => None,
+    }
+}
+
+/// A numeric factor value as an exact fraction `(num, den)` (`den > 0`): an integer is `(n, 1)`;
+/// a decimal is parsed from its canonical string (interval.rs). Used by the interval `×÷` cascade.
+fn factor_to_fraction(v: &Value) -> Result<(i128, i128)> {
+    match v {
+        Value::Int(n) => Ok((*n as i128, 1)),
+        Value::Decimal(d) => crate::interval::parse_factor_decimal(&d.render()),
+        _ => unreachable!("resolver guarantees a numeric interval-scale factor"),
+    }
+}
+
 fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
     match ty {
         ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null => Ok(()),
@@ -6619,7 +6794,8 @@ fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
         | ResolvedType::Bytea
         | ResolvedType::Uuid
         | ResolvedType::Timestamp
-        | ResolvedType::Timestamptz => {
+        | ResolvedType::Timestamptz
+        | ResolvedType::Interval => {
             Err(type_error("arithmetic operators require numeric operands"))
         }
     }
@@ -6631,8 +6807,17 @@ fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
 /// boolean/non-boolean, bytea/non-bytea, …) is a 42804 type error — comparison is overloaded
 /// across these families but never compares across them.
 fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
-    use ResolvedType::{Bool, Bytea, Decimal, Int, Null, Text, Timestamp, Timestamptz, Uuid};
+    use ResolvedType::{
+        Bool, Bytea, Decimal, Int, Interval, Null, Text, Timestamp, Timestamptz, Uuid,
+    };
     match (lt, rt) {
+        // interval compares only within its own family (or with a bare NULL), by the canonical
+        // span (spec/design/interval.md §2). interval vs any other family is a 42804.
+        (Interval, Interval) => Ok(()),
+        (Interval, Null) | (Null, Interval) => Ok(()),
+        (Interval, _) | (_, Interval) => Err(type_error(
+            "cannot compare an interval value with a value of a different type",
+        )),
         // timestamp / timestamptz compare only within their own family (or with a bare NULL).
         // A mixed timestamp × timestamptz pair — or a datetime vs any other family — would need
         // a zone, so it is a 42804 type error (spec/design/timestamp.md §5).
@@ -6949,7 +7134,8 @@ fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
         | ResolvedType::Bytea
         | ResolvedType::Uuid
         | ResolvedType::Timestamp
-        | ResolvedType::Timestamptz => Err(type_error(msg)),
+        | ResolvedType::Timestamptz
+        | ResolvedType::Interval => Err(type_error(msg)),
     }
 }
 
@@ -6977,6 +7163,8 @@ fn require_assignable(ty: ResolvedType, col_ty: ScalarType, col: &str) -> Result
         matches!(ty, ResolvedType::Timestamp | ResolvedType::Null)
     } else if col_ty.is_timestamptz() {
         matches!(ty, ResolvedType::Timestamptz | ResolvedType::Null)
+    } else if col_ty.is_interval() {
+        matches!(ty, ResolvedType::Interval | ResolvedType::Null)
     } else {
         // text column
         matches!(ty, ResolvedType::Text | ResolvedType::Null)
@@ -7211,6 +7399,10 @@ fn store_value(
                 Ok(Value::Timestamp(parse_timestamp(&s)?))
             } else if col_ty.is_timestamptz() {
                 Ok(Value::Timestamptz(parse_timestamptz(&s)?))
+            } else if col_ty.is_interval() {
+                // A string literal adapts to an interval column (spec/design/interval.md);
+                // malformed input traps 22007, an out-of-range field 22008.
+                Ok(Value::Interval(parse_interval(&s)?))
             } else {
                 Err(type_error(format!(
                     "cannot store a text value in {} column {col_name}",
@@ -7254,6 +7446,16 @@ fn store_value(
             } else {
                 Err(type_error(format!(
                     "cannot store a timestamptz value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+        Value::Interval(iv) => {
+            if col_ty.is_interval() {
+                Ok(Value::Interval(iv))
+            } else {
+                Err(type_error(format!(
+                    "cannot store an interval value in {} column {col_name}",
                     col_ty.canonical_name()
                 )))
             }
@@ -7328,6 +7530,7 @@ impl RExpr {
             RExpr::ConstUuid(u) => Ok(Value::Uuid(*u)),
             RExpr::ConstTimestamp(m) => Ok(Value::Timestamp(*m)),
             RExpr::ConstTimestamptz(m) => Ok(Value::Timestamptz(*m)),
+            RExpr::ConstInterval(iv) => Ok(Value::Interval(*iv)),
             RExpr::ConstNull => Ok(Value::Null),
             RExpr::Cast {
                 inner,
@@ -7372,6 +7575,7 @@ impl RExpr {
                     Value::Timestamp(_) | Value::Timestamptz(_) => {
                         unreachable!("resolver rejects a timestamp cast operand")
                     }
+                    Value::Interval(_) => unreachable!("resolver rejects an interval cast operand"),
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
@@ -7401,6 +7605,7 @@ impl RExpr {
                     Value::Timestamp(_) | Value::Timestamptz(_) => {
                         unreachable!("resolver rejects a timestamp unary minus")
                     }
+                    Value::Interval(iv) => Ok(Value::Interval(iv.neg()?)),
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
@@ -7423,7 +7628,66 @@ impl RExpr {
                 if matches!(a, Value::Null) || matches!(b, Value::Null) {
                     return Ok(Value::Null);
                 }
-                if result.is_decimal() {
+                if result.is_interval() && matches!(op, ArithOp::Mul | ArithOp::Div) {
+                    // interval ×÷ number → interval (the exact cascade; spec/design/interval.md
+                    // §5). Mul commutes; Div is interval / number (the resolver guarantees the
+                    // interval is the left operand). A zero divisor traps 22012.
+                    let (iv, num) = match (a, b) {
+                        (Value::Interval(iv), n) | (n, Value::Interval(iv)) => (iv, n),
+                        _ => unreachable!("resolver guarantees an interval ×÷ number pair"),
+                    };
+                    let (fnum, fden) = factor_to_fraction(&num)?;
+                    let (fnum, fden) = if matches!(op, ArithOp::Mul) {
+                        (fnum, fden)
+                    } else if fnum == 0 {
+                        return Err(EngineError::new(
+                            SqlState::DivisionByZero,
+                            "division by zero",
+                        ));
+                    } else if fnum < 0 {
+                        (-fden, -fnum) // interval / number = interval * (den/num); keep fden > 0
+                    } else {
+                        (fden, fnum)
+                    };
+                    Ok(Value::Interval(crate::interval::mul_by_fraction(
+                        &iv, fnum, fden,
+                    )?))
+                } else if result.is_interval() {
+                    // interval ± interval → interval; timestamp[tz] − timestamp[tz] → interval
+                    // (spec/design/interval.md §5). Dispatch on the operand kinds.
+                    match (a, b) {
+                        (Value::Interval(x), Value::Interval(y)) => {
+                            let r = match op {
+                                ArithOp::Add => x.add(&y)?,
+                                ArithOp::Sub => x.sub(&y)?,
+                                _ => unreachable!("resolver allows only interval ±"),
+                            };
+                            Ok(Value::Interval(r))
+                        }
+                        (Value::Timestamp(x), Value::Timestamp(y))
+                        | (Value::Timestamptz(x), Value::Timestamptz(y)) => {
+                            Ok(Value::Interval(crate::interval::ts_diff(x, y)?))
+                        }
+                        _ => unreachable!("resolver guarantees a temporal-difference pair here"),
+                    }
+                } else if result.is_timestamp() || result.is_timestamptz() {
+                    // timestamp[tz] ± interval → timestamp[tz] (calendar month-add with clamping;
+                    // spec/design/interval.md §5). interval + timestamp commutes.
+                    let subtract = matches!(op, ArithOp::Sub);
+                    let (t, iv, is_tz) = match (a, b) {
+                        (Value::Timestamp(t), Value::Interval(iv)) => (t, iv, false),
+                        (Value::Interval(iv), Value::Timestamp(t)) => (t, iv, false),
+                        (Value::Timestamptz(t), Value::Interval(iv)) => (t, iv, true),
+                        (Value::Interval(iv), Value::Timestamptz(t)) => (t, iv, true),
+                        _ => unreachable!("resolver guarantees a timestamp ± interval pair here"),
+                    };
+                    let r = crate::interval::ts_shift(t, &iv, subtract)?;
+                    Ok(if is_tz {
+                        Value::Timestamptz(r)
+                    } else {
+                        Value::Timestamp(r)
+                    })
+                } else if result.is_decimal() {
                     // Decimal arithmetic: widen any integer operand to decimal, then apply the
                     // op with PG's scale rules (spec/design/decimal.md §4). The size-scaled
                     // decimal_work is charged BEFORE the operation runs, so a cost ceiling
@@ -7821,6 +8085,8 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         // Timestamps order by the int64 instant (-infinity < finite < infinity).
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
+        // Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
+        (Value::Interval(x), Value::Interval(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
         // Cross-family arms exist only for totality — ORDER BY is over a single typed column,
         // so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -7841,6 +8107,7 @@ fn family_rank(v: &Value) -> u8 {
         Value::Uuid(_) => 6,
         Value::Timestamp(_) => 6,
         Value::Timestamptz(_) => 7,
+        Value::Interval(_) => 8,
         // Poisoned (large-values.md §14): ORDER BY slots are in the touched set, so a sort
         // key is always resolved before it reaches the comparator.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),

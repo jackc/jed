@@ -399,6 +399,22 @@ fn timestamptz_table_db() -> Database {
     db
 }
 
+/// A table with an interval column (type code 11) — the fixed 16-byte value-codec branch
+/// (i32 months ‖ i32 days ‖ i64 micros). A positive multi-field value, a negative value, the
+/// zero interval, a months-only `'1 mon'` vs a span-equal-but-byte-distinct `'30 days'`, and a
+/// NULL. The bare-string literals adapt to the interval column. PK stays int32.
+fn interval_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, d interval)");
+    run(&mut db, "INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05')");
+    run(&mut db, "INSERT INTO t VALUES (2, '-1 day')");
+    run(&mut db, "INSERT INTO t VALUES (3, '0 seconds')");
+    run(&mut db, "INSERT INTO t VALUES (4, '1 mon')");
+    run(&mut db, "INSERT INTO t VALUES (5, '30 days')");
+    run(&mut db, "INSERT INTO t VALUES (6, NULL)");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -416,6 +432,7 @@ fn write_matches_goldens() {
         ("default_table.jed", default_table_db),
         ("timestamp_table.jed", timestamp_table_db),
         ("timestamptz_table.jed", timestamptz_table_db),
+        ("interval_table.jed", interval_table_db),
         ("nopk_table.jed", nopk_table_db),
         ("composite_pk_table.jed", composite_pk_table_db),
         ("check_table.jed", check_table_db),
@@ -446,6 +463,7 @@ fn read_goldens_reproduces_rows() {
         ("default_table.jed", default_table_db, "t"),
         ("timestamp_table.jed", timestamp_table_db, "t"),
         ("timestamptz_table.jed", timestamptz_table_db, "t"),
+        ("interval_table.jed", interval_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
         ("composite_pk_table.jed", composite_pk_table_db, "t"),
         ("check_table.jed", check_table_db, "t"),

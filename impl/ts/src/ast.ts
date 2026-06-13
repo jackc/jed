@@ -56,6 +56,10 @@ export type Expr =
   // ambiguous (spec/design/grammar.md §15). Bare "column" stays the unqualified form.
   | { kind: "qualifiedColumn"; qualifier: string; name: string }
   | { kind: "literal"; literal: Literal }
+  // A keyword-introduced INTERVAL '...' literal (spec/design/interval.md §3). Unlike a bare
+  // string adapting by context, the INTERVAL keyword names the type, so it produces an interval
+  // in any expression position. The string is parsed at resolve.
+  | { kind: "intervalLiteral"; text: string }
   // A bind parameter $N (1-based index). Like an adaptable literal it takes its type from
   // context at resolve; the host binds a value at execute (spec/design/api.md §5).
   | { kind: "param"; index: number }

@@ -41,7 +41,7 @@ require_relative "lz4"
 
 WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "timestamp" => 8, "timestamptz" => 8 }.freeze
 TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
-             "bytea" => 7, "uuid" => 8, "timestamp" => 9, "timestamptz" => 10 }.freeze
+             "bytea" => 7, "uuid" => 8, "timestamp" => 9, "timestamptz" => 10, "interval" => 11 }.freeze
 CODETYPE = TYPECODE.invert.freeze
 
 # uuid-raw16 (encoding.md §2.7): the 16 raw bytes of the canonical 8-4-4-4-12 form. Used both
@@ -224,6 +224,18 @@ TIMESTAMPTZ_TABLE = {
          [4, -9_223_372_036_854_775_808], [5, 9_223_372_036_854_775_807], [6, nil]]
 }.freeze
 
+# A table with an interval column (type code 11): the fixed 16-byte branch (i32 months ‖ i32 days
+# ‖ i64 micros, big-endian, no sign-flip). Covers a positive multi-field value
+# ('1 mon 2 days 03:04:05'), a negative value ('-1 day'), the zero interval, a months-only value
+# ('1 mon') vs a '30 days' value that is SPAN-EQUAL but byte-distinct, and a NULL. Each interval
+# value is the [months, days, micros] triple the cores compute from the literal. PK is int32.
+INTERVAL_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("d", "interval")],
+  rows: [[1, [1, 2, 11_045_000_000]], [2, [0, -1, 0]], [3, [0, 0, 0]],
+         [4, [1, 0, 0]], [5, [0, 30, 0]], [6, nil]]
+}.freeze
+
 # Incompressible filler (format.md "Fixtures"): xorshift32(seed "JEDB") mapped to a 64-char
 # alphabet (text) or raw bytes (bytea). High-entropy output has no 4-byte repeats, so the LZ4
 # encoder never wins store-smaller and the value deterministically stays PLAIN. Mirrored in the
@@ -346,6 +358,7 @@ FIXTURES = [
   { file: "default_table.jed",   page_size: 256, tables: [DEFAULT_TABLE] },
   { file: "timestamp_table.jed",   page_size: 256, tables: [TIMESTAMP_TABLE] },
   { file: "timestamptz_table.jed", page_size: 256, tables: [TIMESTAMPTZ_TABLE] },
+  { file: "interval_table.jed",    page_size: 256, tables: [INTERVAL_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
@@ -414,6 +427,11 @@ def encode_value(type, v)
     "\x00".b + encode_decimal(v)
   when "uuid"
     "\x00".b + uuid_to_bytes(v) # fixed 16 bytes, NO length prefix
+  when "interval"
+    # fixed 16 bytes: i32 months, i32 days, i64 micros — big-endian two's-complement, no
+    # sign-flip (a value codec, not a key). v is [months, days, micros].
+    m, d, us = v
+    "\x00".b + [m].pack("l>") + [d].pack("l>") + [us].pack("q>")
   else
     "\x00".b + encode_int(WIDTH.fetch(type), v)
   end
@@ -1101,6 +1119,11 @@ def decode_value(type, buf, pos, fetch = nil)
   when "uuid"
     ub, pos = take(buf, pos, 16) # fixed 16 bytes, no length prefix
     [uuid_from_bytes(ub), pos]
+  when "interval"
+    mb, pos = take(buf, pos, 4)
+    db, pos = take(buf, pos, 4)
+    ub, pos = take(buf, pos, 8)
+    [[mb.unpack1("l>"), db.unpack1("l>"), ub.unpack1("q>")], pos]
   else
     vb, pos = take(buf, pos, WIDTH.fetch(type))
     [decode_int(WIDTH.fetch(type), vb), pos]

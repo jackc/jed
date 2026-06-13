@@ -31,6 +31,9 @@ const (
 	ValTimestamp
 	// ValTimestamptz is a UTC-instant timestamptz; Int holds the int64 microsecond instant.
 	ValTimestamptz
+	// ValInterval is a span — Iv holds the three fields (months/days/micros). Comparison/dedup
+	// go through the canonical 128-bit span, NOT field equality (spec/design/interval.md).
+	ValInterval
 	// ValUnfetched is an unfetched large-value reference (spec/design/large-values.md §14): a
 	// stored external/compressed value loaded as its on-disk pointer instead of being
 	// materialized; Unf holds the pointer fields. Internal to the storage/scan layers — the scan
@@ -77,6 +80,11 @@ type Value struct {
 	// Unf holds the unfetched large-value reference when Kind == ValUnfetched (a pointer for
 	// the same comparability reason as Dec — the LZ4 block is a slice).
 	Unf *Unfetched
+	// Iv holds the interval value when Kind == ValInterval. Stored inline (Interval is a small
+	// all-value struct, so Value stays ==-comparable). Field equality distinguishes '1 mon' from
+	// '30 days'; their VALUE equality (span-canonical) goes through Eq3 / the DISTINCT key, never
+	// `==` — exactly like decimal (spec/design/interval.md §2).
+	Iv Interval
 }
 
 // IntValue builds a non-null integer value.
@@ -106,6 +114,9 @@ func TimestampValue(m int64) Value { return Value{Kind: ValTimestamp, Int: m} }
 
 // TimestamptzValue builds a non-null timestamptz from its int64 microsecond instant.
 func TimestamptzValue(m int64) Value { return Value{Kind: ValTimestamptz, Int: m} }
+
+// IntervalValue builds a non-null interval value.
+func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, Iv: iv} }
 
 // ParseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
 // a `\x` prefix followed by an even count of hexadecimal digits (case-insensitive), each
@@ -256,6 +267,8 @@ func (v Value) Render() string {
 		return RenderTimestamp(v.Int)
 	case ValTimestamptz:
 		return RenderTimestamptz(v.Int)
+	case ValInterval:
+		return RenderInterval(v.Iv)
 	case ValUnfetched:
 		panic("BUG: unfetched large value escaped the storage layer")
 	default:
@@ -333,6 +346,10 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
 		return bool3(v.Int == o.Int)
 	}
+	// Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
+	if v.Kind == ValInterval && o.Kind == ValInterval {
+		return bool3(v.Iv.SpanCmp(o.Iv) == 0)
+	}
 	return Unknown
 }
 
@@ -368,6 +385,9 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
 		return bool3(v.Int < o.Int)
 	}
+	if v.Kind == ValInterval && o.Kind == ValInterval {
+		return bool3(v.Iv.SpanCmp(o.Iv) < 0)
+	}
 	return Unknown
 }
 
@@ -402,6 +422,9 @@ func (v Value) Gt3(o Value) ThreeValued {
 	}
 	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
 		return bool3(v.Int > o.Int)
+	}
+	if v.Kind == ValInterval && o.Kind == ValInterval {
+		return bool3(v.Iv.SpanCmp(o.Iv) > 0)
 	}
 	return Unknown
 }

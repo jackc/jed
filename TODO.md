@@ -392,11 +392,42 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       epoch values + renders match). **Two documented divergences (by design):** sub-µs rounding is
       **half-away** (jed's one rounding mode, no float in the value path) vs PG's half-even; a `:60`
       seconds field is **rejected** (strict) vs PG's roll-to-next-minute. _(was: L; §4;
-      spec/design/timestamp.md, encoding/timestamps.toml)_ **Deferred follow-ups:** an `interval`
-      type + timestamp arithmetic; date/time functions (`now()`/`current_timestamp`, `EXTRACT`,
-      `date_trunc`, `age`); separate `date` / `time` types; named-zone `AT TIME ZONE` (needs the
-      host-supplied tz database); timestamp⇄text/date casts; sub-second precision typmods
-      (`timestamp(p)`).
+      spec/design/timestamp.md, encoding/timestamps.toml)_ **Deferred follow-ups:** ~~an `interval`
+      type + timestamp arithmetic~~ ✅ **done** (below); date/time functions
+      (`now()`/`current_timestamp`, `EXTRACT`, `date_trunc`, `age`); separate `date` / `time` types;
+      named-zone `AT TIME ZONE` (needs the host-supplied tz database); timestamp⇄text/date casts;
+      sub-second precision typmods (`timestamp(p)`); a context-free `TIMESTAMP '...'` keyword/cast
+      literal (until then a timestamp literal needs a column context — interval arithmetic with a
+      timestamp uses stored columns).
+- [x] **`interval`** — done & committed across Rust/Go/TS (+ Ruby reference). A span held as
+      PostgreSQL's **three independent fields** — `months` (i32), `days` (i32), `micros` (i64) —
+      so `+ 1 month` is calendar-aware (Jan 31 + 1 month → Feb 28/29, day clamped) and distinct
+      from `+ 30 days`. On-disk type code **11** (fixed 16-byte body: i32 months ‖ i32 days ‖ i64
+      micros, big-endian, no sign-flip — not a key this slice). Comparison/ordering/dedup collapse
+      the fields via the canonical **128-bit span** (1 month = 30 days, 1 day = 24 h — so
+      `'1 mon'` = `'30 days'` = `'720:00:00'`), while each value still renders its own fields
+      (first-seen survives a dedup, reusing the decimal value-canonical machinery). Input is the
+      **"unit + time" subset** (units + abbreviations, per-field signs, trailing `ago`, the exact
+      fractional-unit cascade, bare `HH:MM:SS`) via a single-quoted literal **or** the `INTERVAL
+      '...'` keyword literal; rendered in PG `IntervalStyle = postgres`. **Full arithmetic**: the
+      engine's first cross-type result rules and its **first timestamp arithmetic** — interval ±
+      interval, unary minus, interval ×÷ number (the EXACT field-scaling cascade, no float — a
+      documented PG divergence only on sub-unit ties), timestamp[tz] ± interval (calendar month-add
+      with clamping), interval + timestamp[tz], and timestamp[tz] − timestamp[tz] → interval
+      (justified). All oracle-verified against PG 18. Authored spec-first:
+      [spec/design/interval.md](spec/design/interval.md), the type/compare/cast/catalog/encoding
+      data, capabilities `types.interval` / `expr.interval_arithmetic` / `expr.interval_scale` /
+      `expr.timestamp_arithmetic`, pinned by `spec/conformance/suites/types/interval.test` +
+      `suites/expr/{interval_arithmetic,interval_scale,timestamp_arithmetic}.test` (97/0/0
+      byte-identical in Rust, Go, TS) and the byte-exact golden `interval_table.jed`
+      (rust==go==ts==ruby). **Documented divergences** (oracle ledger): an interval has no
+      infinity (so subtracting infinite timestamps traps 22008 where PG 15+ returns an infinite
+      interval); ambiguous bare `m` is rejected (22007); the exact `×÷` cascade differs from PG's
+      `double` only on sub-unit ties; an interval ± non-interval / two-interval `×` is 42804 where
+      PG says 42883. **Deferred follow-ups:** an interval `PRIMARY KEY`/index (0A000 — no
+      order-preserving key encoding exercised); CAST to/from interval; ISO-8601 `P…` and SQL-standard
+      combined input forms; field qualifiers (`YEAR TO MONTH`) and the `interval(p)` precision
+      typmod; `justify_*`/`EXTRACT`/`age` functions. _(was: XL; §4; on-disk type code 11, next free 12)_
 - [x] **`bytea`** — done & committed across Rust/Go/TS. A variable-width binary string (raw
       bytes), compared by **unsigned byte order** (PostgreSQL's bytea comparison). Storage +
       `\x`-hex literals + comparison/ordering (`= < > <= >=`, `IS [NOT] DISTINCT FROM`); on-disk

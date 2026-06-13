@@ -863,6 +863,97 @@ null           = "null_safe"
 precedence     = 35
 errors         = []
 
+# --- comparison operators (interval) -----------------------------------------
+# The interval-family OVERLOAD of the comparisons (`=` < > <= >=, IS [NOT] DISTINCT FROM)
+# applied to interval×interval. arg_resolution = "none" — one interval type, no promotion
+# (compare.toml). Operands compare by the canonical 128-bit SPAN (1 month = 30 days, 1 day =
+# 24 h — spec/design/interval.md §2), so '1 mon' = '30 days'. interval vs any other family is
+# NOT comparable (compare.toml lists only interval×interval), a 42804 type error. Same
+# precedence (35) and NULL discipline as the other comparisons. No failure is possible, so
+# errors = [].
+
+[[operator]]
+name           = "eq"
+symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["interval", "interval"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "lt"
+symbol         = "<"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["interval", "interval"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "gt"
+symbol         = ">"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["interval", "interval"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "le"
+symbol         = "<="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["interval", "interval"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ge"
+symbol         = ">="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["interval", "interval"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["interval", "interval"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_not_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["interval", "interval"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
 # --- null tests --------------------------------------------------------------
 # Unary null-detection over any nullable value of any type. Unlike comparisons
 # these never propagate: the result is ALWAYS a definite boolean, never unknown —
@@ -1061,6 +1152,235 @@ result         = "promoted"
 null           = "propagates"
 precedence     = 60
 errors         = []
+
+# --- arithmetic operators (interval) -----------------------------------------
+# interval ± interval → interval (field-wise; PG keeps the months/days/micros fields
+# independent — no justification) and unary minus (negate all fields). result = "interval"
+# (a concrete scalar id, not "promoted" — the family does not promote, compare.toml). A NULL
+# operand propagates. An i32 month/day or i64 micros overflow traps 22008
+# (spec/design/interval.md §5). interval ×÷ number and timestamp ± interval are separate
+# operator slices (different arg_families). arg_resolution = "none" (one interval type).
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["interval", "interval"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["interval", "interval"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "neg"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 1
+arg_families   = ["interval"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 60
+errors         = ["22008"]
+
+# --- arithmetic operators (timestamp / timestamptz × interval) ---------------
+# The engine's FIRST timestamp arithmetic (spec/design/interval.md §5). timestamp[tz] ± interval
+# adds months first WITH DAY-OF-MONTH CLAMPING (Jan 31 + 1 month -> Feb 28/29), then days (24 h
+# each — jed has no zones), then micros; ±infinity stays ±infinity; overflow / a sentinel result
+# traps 22008. interval + timestamp[tz] commutes. timestamp[tz] − timestamp[tz] -> interval,
+# justified into days + time (months = 0); an ±infinity operand traps 22008. arg_resolution =
+# "none" (the two operands are genuinely different types, not reconciled to one). result is the
+# concrete type. These are NOT a key/index concern (interval is not a key this slice).
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["timestamp", "interval"]
+arg_resolution = "none"
+result         = "timestamp"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["interval", "timestamp"]
+arg_resolution = "none"
+result         = "timestamp"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["timestamp", "interval"]
+arg_resolution = "none"
+result         = "timestamp"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["timestamptz", "interval"]
+arg_resolution = "none"
+result         = "timestamptz"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["interval", "timestamptz"]
+arg_resolution = "none"
+result         = "timestamptz"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["timestamptz", "interval"]
+arg_resolution = "none"
+result         = "timestamptz"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 40
+errors         = ["22008"]
+
+# --- arithmetic operators (interval ×÷ number) -------------------------------
+# interval × integer/decimal → interval, integer/decimal × interval (commute), interval ÷
+# integer/decimal → interval (spec/design/interval.md §5). Each field is scaled by the factor
+# with the fractional part cascading months→days→micros (1 month = 30 days, 1 day = 24 h),
+# computed EXACTLY (no float — a documented PG divergence only on sub-unit ties), µs rounded half
+# away from zero. result = "interval"; arg_resolution = "none" (the interval and the numeric
+# factor are not reconciled to one type). Overflow traps 22008; a zero divisor traps 22012.
+
+[[operator]]
+name           = "mul"
+symbol         = "*"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["interval", "integer"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 50
+errors         = ["22008"]
+
+[[operator]]
+name           = "mul"
+symbol         = "*"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["integer", "interval"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 50
+errors         = ["22008"]
+
+[[operator]]
+name           = "mul"
+symbol         = "*"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["interval", "decimal"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 50
+errors         = ["22008"]
+
+[[operator]]
+name           = "mul"
+symbol         = "*"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["decimal", "interval"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 50
+errors         = ["22008"]
+
+[[operator]]
+name           = "div"
+symbol         = "/"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["interval", "integer"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 50
+errors         = ["22008", "22012"]
+
+[[operator]]
+name           = "div"
+symbol         = "/"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["interval", "decimal"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+precedence     = 50
+errors         = ["22008", "22012"]
 
 # === scalar functions ========================================================
 # Named scalar functions (kind = "function", functions.md §9). They take scalar argument(s)

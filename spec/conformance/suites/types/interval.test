@@ -1,0 +1,145 @@
+# interval scalar type (spec/design/interval.md): a span of time held as three independent
+# fields (months/days/micros). Storage, the "unit + time" input subset (single-quoted string
+# adapting to an interval column, OR the INTERVAL '...' keyword literal in expression position),
+# PG `IntervalStyle = postgres` rendering, and comparison/ordering/dedup by the canonical 128-bit
+# SPAN (1 month = 30 days, 1 day = 24 h — so '1 mon' = '30 days' = '720:00:00'). NULL, the
+# fractional-unit cascade, parse-error codes (22007 malformed / 22008 field overflow), and the
+# interval-PRIMARY-KEY rejection (0A000 — not a key this slice). No field qualifiers, no
+# precision typmod, no CAST.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.is_null, query.order_by, query.distinct, query.group_by, query.aggregates, types.int32, types.interval
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, d interval)
+
+statement ok
+INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05'), (2, '-1 day'), (3, '30 days'), (4, '1 mon'), (5, NULL), (6, '1.5 days')
+
+# rendering (PG postgres style): a multi-field value, year/mon from the months field
+query T nosort
+SELECT d FROM t WHERE id = 1
+----
+1 mon 2 days 03:04:05
+
+# the fractional-unit cascade: 1.5 days -> 1 day 12:00:00 (0.5 day = 12 h, exact)
+query T nosort
+SELECT d FROM t WHERE id = 6
+----
+1 day 12:00:00
+
+# a negative field renders with its sign and the plural unit
+query T nosort
+SELECT d FROM t WHERE id = 2
+----
+-1 days
+
+# the INTERVAL '...' keyword literal works in expression position (no column context needed)
+query T nosort
+SELECT INTERVAL '2 hours 30 minutes'
+----
+02:30:00
+
+# year/mon split + bare time, signs across fields
+query T nosort
+SELECT INTERVAL '1 year 2 mons 3 days 4:5:6'
+----
+1 year 2 mons 3 days 04:05:06
+
+# the zero interval renders as a bare 00:00:00
+query T nosort
+SELECT INTERVAL '0 seconds'
+----
+00:00:00
+
+# span equality: '1 mon' (id 4) and '30 days' (id 3) compare EQUAL (1 month = 30 days)
+query I nosort
+SELECT id FROM t WHERE d = INTERVAL '30 days' ORDER BY id
+----
+3
+4
+
+# a bare string adapts to interval in a comparison context too
+query I nosort
+SELECT id FROM t WHERE d = '1 mon' ORDER BY id
+----
+3
+4
+
+# ordering is by the canonical span; ties broken by the PK
+query I nosort
+SELECT id FROM t WHERE d IS NOT NULL ORDER BY d, id
+----
+2
+6
+3
+4
+1
+
+# DISTINCT collapses the span-equal '1 mon'/'30 days' to ONE row; the first-seen representation
+# (PK scan order -> id 3 = '30 days') survives, then ORDER BY orders by span
+query T nosort
+SELECT DISTINCT d FROM t WHERE d IS NOT NULL ORDER BY d
+----
+-1 days
+1 day 12:00:00
+30 days
+1 mon 2 days 03:04:05
+
+# GROUP BY buckets by span: the '1 mon'/'30 days' rows form one group of 2
+# names: d, count
+query TI nosort
+SELECT d, COUNT(*) FROM t WHERE d IS NOT NULL GROUP BY d ORDER BY d
+----
+-1 days
+1
+1 day 12:00:00
+1
+30 days
+2
+1 mon 2 days 03:04:05
+1
+
+# IS NULL / IS NOT NULL
+query I nosort
+SELECT id FROM t WHERE d IS NULL
+----
+5
+
+# NULL sorts last ascending (PG model)
+query I nosort
+SELECT id FROM t ORDER BY d, id
+----
+2
+6
+3
+4
+1
+5
+
+# trailing `ago` negates the whole interval
+query T nosort
+SELECT INTERVAL '1 day 2 hours ago'
+----
+-1 days -02:00:00
+
+# a bare number defaults to seconds (PG)
+query T nosort
+SELECT INTERVAL '90'
+----
+00:01:30
+
+# --- parse errors (PG agrees: bad interval input fails) ---
+
+statement error 22007
+SELECT INTERVAL '1 fortnight'
+
+statement error 22007
+SELECT INTERVAL 'not an interval'
+
+# a bare ambiguous `m` is not accepted (months vs minutes)
+statement error 22007
+SELECT INTERVAL '1 m'
+
+# --- interval as a key is rejected (0A000); deliberate divergence from PG (kept LAST) ---
+
+statement error 0A000
+CREATE TABLE bad (d interval PRIMARY KEY)

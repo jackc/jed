@@ -26,7 +26,7 @@ fn is_leap(y: i64) -> bool {
 }
 
 /// Days in `month` (1..=12) of astronomical year `y`.
-fn days_in_month(y: i64, month: u32) -> u32 {
+pub(crate) fn days_in_month(y: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -43,7 +43,7 @@ fn days_in_month(y: i64, month: u32) -> u32 {
 
 /// Days since 1970-01-01 for the civil date `(y, m, d)` (Hinnant). `y` is the astronomical
 /// year; `/` is truncating, paired with the `y-399` adjustment (= floor for negative `y`).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = y - if m <= 2 { 1 } else { 0 };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400; // [0, 399]
@@ -68,7 +68,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Decompose an instant (µs since epoch) into civil fields, using **floor** division so
 /// pre-1970 / BC instants decompose correctly (`us` is always 0..=999_999).
-fn civil_from_micros(t: i64) -> (i64, u32, u32, u32, u32, u32, u32) {
+pub(crate) fn civil_from_micros(t: i64) -> (i64, u32, u32, u32, u32, u32, u32) {
     let us = t.rem_euclid(MICROS_PER_SEC);
     let secs = t.div_euclid(MICROS_PER_SEC);
     let sod = secs.rem_euclid(SECS_PER_DAY);

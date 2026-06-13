@@ -352,6 +352,10 @@ pub enum Expr {
         name: String,
     },
     Literal(Literal),
+    /// A keyword-introduced `INTERVAL '...'` literal (spec/design/interval.md §3). Unlike a bare
+    /// string adapting by context, the INTERVAL keyword names the type, so it produces an interval
+    /// in any expression position (e.g. `SELECT INTERVAL '1 day'`). The string is parsed at resolve.
+    IntervalLiteral(String),
     /// A bind parameter `$N` (1-based index). Like an integer/string literal it is an
     /// *adaptable* operand: its type is inferred from context at resolve (sibling operand,
     /// target column, or CAST target), and the host binds a value at execute time

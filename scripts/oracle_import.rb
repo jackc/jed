@@ -44,6 +44,7 @@ class OracleImport
     "boolean" => "B", "numeric" => "D",
     "text" => "T", "character varying" => "T", "uuid" => "T", "bytea" => "T",
     "timestamp without time zone" => "T", "timestamp with time zone" => "T",
+    "interval" => "T",
   }.freeze
 
   def initialize(path)

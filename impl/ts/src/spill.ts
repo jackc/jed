@@ -412,6 +412,13 @@ function writeValue(w: ByteWriter, v: Value): void {
       w.u8(8);
       w.u64(v.micros);
       break;
+    case "interval":
+      // Interval — tag 12 (tags 9/10/11 are the Unfetched forms below); months, days, micros.
+      w.u8(12);
+      w.u32(v.iv.months);
+      w.u32(v.iv.days);
+      w.u64(v.iv.micros);
+      break;
     case "unfetched":
       // An untouched large-value reference rides along to the output unread (spill.md §4); spill it
       // opaquely so it round-trips, never resolving it.
@@ -491,6 +498,12 @@ function readValue(r: FileSource): Value {
         kind: "unfetched",
         ref: { form: 0x04, firstPage: readU32(r), storedLen: readU32(r), rawLen: readU32(r), comp: undefined },
       };
+    case 12: {
+      const months = readU32(r) | 0; // signed int32
+      const days = readU32(r) | 0;
+      const micros = BigInt.asIntN(64, r.u64()); // signed int64
+      return { kind: "interval", iv: { months, days, micros } };
+    }
     default:
       throw new Error("bad spill value tag");
   }

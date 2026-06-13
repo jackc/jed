@@ -20,6 +20,7 @@ use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{Database, Snapshot};
+use crate::interval::Interval;
 use crate::pager::Pager;
 use crate::paging::SharedPaging;
 use crate::pmap::{Child, Node};
@@ -94,6 +95,7 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Uuid => 8,
         ScalarType::Timestamp => 9,
         ScalarType::Timestamptz => 10,
+        ScalarType::Interval => 11,
     }
 }
 
@@ -110,6 +112,7 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         8 => Some(ScalarType::Uuid),
         9 => Some(ScalarType::Timestamp),
         10 => Some(ScalarType::Timestamptz),
+        11 => Some(ScalarType::Interval),
         _ => None,
     }
 }
@@ -184,6 +187,17 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
             let mut out = Vec::with_capacity(1 + 16);
             out.push(0x00); // present
             out.extend_from_slice(u);
+            out
+        }
+        // Interval: a fixed 16-byte body — i32 months, i32 days, i64 micros, all big-endian
+        // two's-complement (NO sign-flip; this is a value codec, not an order-preserving key)
+        // — spec/fileformat/format.md.
+        Value::Interval(iv) => {
+            let mut out = Vec::with_capacity(1 + 16);
+            out.push(0x00); // present
+            out.extend_from_slice(&iv.months.to_be_bytes());
+            out.extend_from_slice(&iv.days.to_be_bytes());
+            out.extend_from_slice(&iv.micros.to_be_bytes());
             out
         }
         Value::Bool(b) => vec![0x00, u8::from(*b)], // present tag + bool-byte (0x00 false, 0x01 true)
@@ -1889,6 +1903,28 @@ fn read_inline_body(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value
     } else if ty.is_timestamptz() {
         let vb = take(buf, pos, ty.width_bytes())?;
         Ok(Value::Timestamptz(decode_int(ty, vb)))
+    } else if ty.is_interval() {
+        // Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
+        let months = i32::from_be_bytes(
+            take(buf, pos, 4)?
+                .try_into()
+                .map_err(|_| corrupt("invalid interval months"))?,
+        );
+        let days = i32::from_be_bytes(
+            take(buf, pos, 4)?
+                .try_into()
+                .map_err(|_| corrupt("invalid interval days"))?,
+        );
+        let micros = i64::from_be_bytes(
+            take(buf, pos, 8)?
+                .try_into()
+                .map_err(|_| corrupt("invalid interval micros"))?,
+        );
+        Ok(Value::Interval(Interval {
+            months,
+            days,
+            micros,
+        }))
     } else {
         let w = ty.width_bytes();
         let vb = take(buf, pos, w)?;
@@ -2141,7 +2177,7 @@ mod tests {
             assert_eq!(scalar_for_type_code(type_code_for_scalar(ty)), Some(ty));
         }
         assert_eq!(scalar_for_type_code(0), None);
-        assert_eq!(scalar_for_type_code(11), None);
+        assert_eq!(scalar_for_type_code(12), None);
     }
 
     fn sample_db() -> Database {

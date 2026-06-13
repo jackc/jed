@@ -30,6 +30,7 @@ import {
   isText,
   isTimestamp,
   isTimestamptz,
+  isInterval,
   isUuid,
   widthBytes,
 } from "./types.ts";
@@ -40,6 +41,7 @@ import {
   byteaValue,
   decimalValue,
   intValue,
+  intervalValue,
   nullValue,
   textValue,
   timestampValue,
@@ -99,6 +101,8 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 9;
     case "timestamptz":
       return 10;
+    case "interval":
+      return 11;
   }
 }
 
@@ -125,6 +129,8 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "timestamp";
     case 10:
       return "timestamptz";
+    case 11:
+      return "interval";
     default:
       return undefined;
   }
@@ -226,6 +232,17 @@ function encodeValue(ty: ScalarType, v: Value): Uint8Array {
     // Timestamps store their int64 microsecond instant via the same fixed-width codec as
     // int64 (spec/design/timestamp.md §6).
     return encodeNullable(ty, v.micros);
+  }
+  if (v.kind === "interval") {
+    // Fixed 16-byte body: i32 months, i32 days, i64 micros — big-endian two's-complement, no
+    // sign-flip (a value codec, not an order-preserving key) — spec/fileformat/format.md.
+    const out = new Uint8Array(1 + 16);
+    out[0] = 0x00; // present
+    const dv = new DataView(out.buffer);
+    dv.setInt32(1, v.iv.months, false);
+    dv.setInt32(5, v.iv.days, false);
+    dv.setBigInt64(9, v.iv.micros, false);
+    return out;
   }
   if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");
   return encodeNullable(ty, v.int);
@@ -1746,6 +1763,16 @@ function readInlineBody(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
   }
   if (isTimestamp(ty)) return timestampValue(readIntBody(ty, buf, cur));
   if (isTimestamptz(ty)) return timestamptzValue(readIntBody(ty, buf, cur));
+  if (isInterval(ty)) {
+    // Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
+    const b = take(buf, cur, 16);
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    return intervalValue({
+      months: dv.getInt32(0, false),
+      days: dv.getInt32(4, false),
+      micros: dv.getBigInt64(8, false),
+    });
+  }
   return intValue(readIntBody(ty, buf, cur));
 }
 

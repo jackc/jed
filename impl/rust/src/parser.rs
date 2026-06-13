@@ -1368,6 +1368,18 @@ impl Parser {
                 type_mod,
             });
         }
+        // `INTERVAL '...'` — a keyword-introduced interval literal (grammar.md §36). Recognized
+        // only when a string literal follows, so `interval` stays usable as a column / function
+        // name (a column named `interval` outside this construct still parses).
+        if self.peek_keyword().as_deref() == Some("interval")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Str(_)))
+        {
+            self.advance(); // INTERVAL
+            if let Token::Str(s) = self.advance() {
+                return Ok(Expr::IntervalLiteral(s));
+            }
+            unreachable!("peeked a string literal after INTERVAL");
+        }
         if self.peek_keyword().as_deref() == Some("case") {
             self.advance();
             // Simple form has an operand between CASE and the first WHEN; the searched form

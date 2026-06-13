@@ -37,6 +37,41 @@ sql = "CREATE TABLE bad5 (k numeric PRIMARY KEY)"
 reason = "jed: a decimal PRIMARY KEY is rejected this slice (0A000), a documented narrowing (like text PK). PG allows a numeric primary key."
 
 [[override]]
+file = "expr/timestamp_arithmetic.test"
+sql = "SELECT ts - ts2 FROM t WHERE id = 3"
+reason = "jed: subtracting infinite timestamps (infinity − (−infinity)) traps 22008 — jed's interval type has NO infinity (like decimal; spec/design/interval.md §1). PG 15+ returns an infinite interval. A documented semantic divergence (jed has no interval infinity to return)."
+
+[[override]]
+file = "expr/timestamp_arithmetic.test"
+sql = "SELECT ts - ts2 - 1 FROM t WHERE id = 1"
+reason = "jed: an interval ± non-interval operand is a 42804 datatype mismatch (interval.md §5); PG reports 42883 (no `interval − integer` operator). Both reject; a documented error-class divergence."
+
+[[override]]
+file = "expr/interval_scale.test"
+sql = "SELECT 1 / INTERVAL '1 day'"
+reason = "jed: dividing a number by an interval is a 42804 datatype mismatch (interval.md §5); PG reports 42883 (no `integer / interval` operator). Both reject; a documented error-class divergence."
+
+[[override]]
+file = "expr/interval_scale.test"
+sql = "SELECT INTERVAL '1 day' * INTERVAL '2 days'"
+reason = "jed: multiplying two intervals is a 42804 datatype mismatch (interval.md §5); PG reports 42883 (no `interval * interval` operator). Both reject; a documented error-class divergence."
+
+[[override]]
+file = "expr/interval_arithmetic.test"
+sql = "SELECT INTERVAL '1 day' + 1"
+reason = "jed: an interval ± non-interval operand is a 42804 datatype mismatch (the hand-written interval-arithmetic rule — interval.md §5). PG instead reports 42883 (no `interval + integer` operator). Both reject; jed names it a type mismatch, a documented error-class divergence."
+
+[[override]]
+file = "types/interval.test"
+sql = "SELECT INTERVAL '1 m'"
+reason = "jed: a bare `m` unit is ambiguous (months vs minutes) and rejected (22007 — spec/design/interval.md §3). PG resolves `m` contextually (here to minutes, `00:01:00`); jed declines the ambiguity, a documented divergence on its own surface."
+
+[[override]]
+file = "types/interval.test"
+sql = "CREATE TABLE bad (d interval PRIMARY KEY)"
+reason = "jed: an interval PRIMARY KEY is rejected this slice (0A000), a documented narrowing (like decimal/text PK — interval has no exercised order-preserving key encoding yet, interval.md §6). PG allows an interval primary key."
+
+[[override]]
 file = "ddl/composite_pk.test"
 sql = "UPDATE t SET b = 9 WHERE a = 1"
 reason = "jed: assigning any primary-key member is the documented 0A000 narrowing (the storage key never changes — constraints.md §3, CLAUDE.md §11 step 6). PG allows PK updates (and here would instead trap 23505 on the resulting duplicate tuple)."

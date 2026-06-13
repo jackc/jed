@@ -34,6 +34,10 @@ pub enum ScalarType {
     Timestamp,
     /// UTC instant, int64 microseconds since the Unix epoch (spec/design/timestamp.md).
     Timestamptz,
+    /// A span of time — three independent fields (months/days/micros), compared by the canonical
+    /// 128-bit span (spec/design/interval.md). Not a key this slice; not fixed-width through the
+    /// integer codec.
+    Interval,
 }
 
 impl ScalarType {
@@ -50,6 +54,7 @@ impl ScalarType {
             ScalarType::Uuid => "uuid",
             ScalarType::Timestamp => "timestamp",
             ScalarType::Timestamptz => "timestamptz",
+            ScalarType::Interval => "interval",
         }
     }
 
@@ -70,6 +75,7 @@ impl ScalarType {
             "uuid" => Some(ScalarType::Uuid),
             "timestamp" | "timestamp without time zone" => Some(ScalarType::Timestamp),
             "timestamptz" | "timestamp with time zone" => Some(ScalarType::Timestamptz),
+            "interval" => Some(ScalarType::Interval),
             _ => None,
         }
     }
@@ -109,6 +115,11 @@ impl ScalarType {
         matches!(self, ScalarType::Timestamptz)
     }
 
+    /// Whether this is the `interval` (span) type.
+    pub fn is_interval(self) -> bool {
+        matches!(self, ScalarType::Interval)
+    }
+
     /// Whether this is one of the fixed-width signed integer types.
     pub fn is_integer(self) -> bool {
         matches!(
@@ -128,9 +139,13 @@ impl ScalarType {
             ScalarType::Int32 => 4,
             ScalarType::Int64 | ScalarType::Timestamp | ScalarType::Timestamptz => 8,
             ScalarType::Uuid => 16,
-            ScalarType::Text | ScalarType::Bool | ScalarType::Decimal | ScalarType::Bytea => {
+            ScalarType::Text
+            | ScalarType::Bool
+            | ScalarType::Decimal
+            | ScalarType::Bytea
+            | ScalarType::Interval => {
                 unreachable!(
-                    "text/boolean/decimal/bytea are not fixed-width; width_bytes covers integers + uuid + timestamps"
+                    "text/boolean/decimal/bytea/interval are not serialized through the fixed-width integer codec; width_bytes covers integers + uuid + timestamps"
                 )
             }
         }
@@ -148,8 +163,11 @@ impl ScalarType {
             | ScalarType::Bytea
             | ScalarType::Uuid
             | ScalarType::Timestamp
-            | ScalarType::Timestamptz => {
-                unreachable!("text/boolean/decimal/bytea/uuid/timestamp have no integer range")
+            | ScalarType::Timestamptz
+            | ScalarType::Interval => {
+                unreachable!(
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval have no integer range"
+                )
             }
         }
     }
@@ -166,8 +184,11 @@ impl ScalarType {
             | ScalarType::Bytea
             | ScalarType::Uuid
             | ScalarType::Timestamp
-            | ScalarType::Timestamptz => {
-                unreachable!("text/boolean/decimal/bytea/uuid/timestamp have no integer range")
+            | ScalarType::Timestamptz
+            | ScalarType::Interval => {
+                unreachable!(
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval have no integer range"
+                )
             }
         }
     }
@@ -185,9 +206,10 @@ impl ScalarType {
             | ScalarType::Bytea
             | ScalarType::Uuid
             | ScalarType::Timestamp
-            | ScalarType::Timestamptz => {
+            | ScalarType::Timestamptz
+            | ScalarType::Interval => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/uuid/timestamp have no integer promotion rank"
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval have no integer promotion rank"
                 )
             }
         }
@@ -199,7 +221,7 @@ impl ScalarType {
     }
 
     /// All types, for exhaustive iteration in tests.
-    pub fn all() -> [ScalarType; 10] {
+    pub fn all() -> [ScalarType; 11] {
         [
             ScalarType::Int16,
             ScalarType::Int32,
@@ -211,6 +233,7 @@ impl ScalarType {
             ScalarType::Uuid,
             ScalarType::Timestamp,
             ScalarType::Timestamptz,
+            ScalarType::Interval,
         ]
     }
 }

@@ -10,6 +10,7 @@
 //! fixed `[u8; 16]` (stack, `Copy`-able, but `Value` stays `Clone` for the heap variants).
 
 use crate::decimal::Decimal;
+use crate::interval::{self, Interval};
 use crate::timestamp;
 
 /// A runtime value: SQL NULL, an integer, a boolean, a text string, a decimal, or a byte string.
@@ -43,6 +44,10 @@ pub enum Value {
     /// A UTC-instant `timestamptz` — int64 microseconds since the Unix epoch. Distinct from
     /// `Timestamp` (it renders with a +00 suffix and never compares cross-family).
     Timestamptz(i64),
+    /// An `interval` span — months/days/micros (spec/design/interval.md). Its `PartialEq`/`Eq`/
+    /// `Hash` are **span-canonical** (`'1 mon' == '30 days'`), so DISTINCT/GROUP BY compare by the
+    /// 128-bit span while `render` still preserves each value's field representation.
+    Interval(Interval),
     /// An **unfetched** large-value reference (spec/design/large-values.md §14): a stored
     /// external/compressed value loaded as its on-disk pointer instead of being materialized.
     /// Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -135,6 +140,8 @@ impl Value {
             // `YYYY-MM-DD HH:MM:SS[.ffffff]`, timestamptz with a `+00` suffix, ±infinity bare.
             Value::Timestamp(m) => timestamp::render_timestamp(*m),
             Value::Timestamptz(m) => timestamp::render_timestamptz(*m),
+            // Interval renders via the shared formatter (PG `IntervalStyle = postgres`).
+            Value::Interval(iv) => interval::render_interval(iv),
             Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
         }
     }
@@ -164,6 +171,8 @@ impl Value {
             // Timestamps compare by the int64 instant; infinity is just an extreme value.
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a == b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a == b),
+            // Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
+            (Value::Interval(a), Value::Interval(b)) => bool3(a == b),
             // Poisoned (large-values.md §14): an unfetched value must never be compared —
             // falling through to UNKNOWN here would silently read it as NULL.
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
@@ -186,6 +195,7 @@ impl Value {
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a < b),
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a < b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a < b),
+            (Value::Interval(a), Value::Interval(b)) => bool3(a < b),
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
                 panic!("BUG: unfetched large value escaped the storage layer")
             }
@@ -206,6 +216,7 @@ impl Value {
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a > b),
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a > b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a > b),
+            (Value::Interval(a), Value::Interval(b)) => bool3(a > b),
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
                 panic!("BUG: unfetched large value escaped the storage layer")
             }

@@ -1,0 +1,91 @@
+# timestamp arithmetic — the engine's first (spec/design/interval.md §5). timestamp[tz] ± interval
+# adds months first WITH DAY-OF-MONTH CLAMPING (Jan 31 + 1 month -> Feb 28/29), then days (24 h
+# each — jed has no zones), then micros; ±infinity stays ±infinity. interval + timestamp[tz]
+# commutes. timestamp[tz] − timestamp[tz] -> interval, justified into days + time (months = 0); an
+# infinite operand traps 22008. jed has no context-free timestamp literal (the timestamp slice
+# deferred it), so the timestamp operands come from stored columns.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, types.int32, types.timestamp, types.timestamptz, types.interval, expr.timestamp_arithmetic
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, ts timestamp, ts2 timestamp, tz timestamptz, tz2 timestamptz)
+
+statement ok
+INSERT INTO t VALUES
+  (1, '2024-01-31 00:00:00', '2024-01-01 00:00:00', '2024-01-31 12:00:00+00', '2024-01-30 12:00:00+00'),
+  (2, '2024-01-02 18:00:00', '2024-01-01 12:00:00', '2024-06-15 08:30:00+00', '2024-06-15 08:30:00+00'),
+  (3, 'infinity', '-infinity', 'infinity', '-infinity'),
+  (4, NULL, NULL, NULL, NULL)
+
+# timestamp + interval: month-add clamps Jan 31 -> Feb 29 (2024 is a leap year)
+query T nosort
+SELECT ts + INTERVAL '1 month' FROM t WHERE id = 1
+----
+2024-02-29 00:00:00
+
+# timestamp - timestamp -> interval (exactly 30 days)
+query T nosort
+SELECT ts - ts2 FROM t WHERE id = 1
+----
+30 days
+
+# timestamp - timestamp justified into days + time (30 h = 1 day 6 h)
+query T nosort
+SELECT ts - ts2 FROM t WHERE id = 2
+----
+1 day 06:00:00
+
+# timestamp - interval
+query T nosort
+SELECT ts - INTERVAL '6 hours' FROM t WHERE id = 2
+----
+2024-01-02 12:00:00
+
+# interval + timestamp commutes
+query T nosort
+SELECT INTERVAL '1 day' + ts FROM t WHERE id = 2
+----
+2024-01-03 18:00:00
+
+# multi-field add: 1 year 1 mon 2 days keeps the time-of-day
+query T nosort
+SELECT ts + INTERVAL '1 year 1 mon 2 days' FROM t WHERE id = 2
+----
+2025-02-04 18:00:00
+
+# timestamptz + interval (renders with +00; jed stores the UTC instant)
+query T nosort
+SELECT tz + INTERVAL '1 day' FROM t WHERE id = 1
+----
+2024-02-01 12:00:00+00
+
+# timestamptz - timestamptz -> interval
+query T nosort
+SELECT tz - tz2 FROM t WHERE id = 1
+----
+1 day
+
+# timestamptz - interval
+query T nosort
+SELECT tz - INTERVAL '2 hours' FROM t WHERE id = 2
+----
+2024-06-15 06:30:00+00
+
+# adding any finite interval to +infinity stays +infinity
+query T nosort
+SELECT ts + INTERVAL '1 day' FROM t WHERE id = 3
+----
+infinity
+
+# a NULL timestamp propagates
+query T nosort
+SELECT ts + INTERVAL '1 day' FROM t WHERE id = 4
+----
+NULL
+
+# subtracting infinite timestamps traps 22008 (cannot subtract infinite timestamps)
+statement error 22008
+SELECT ts - ts2 FROM t WHERE id = 3
+
+# a timestamp ± a non-interval is a 42804
+statement error 42804
+SELECT ts - ts2 - 1 FROM t WHERE id = 1

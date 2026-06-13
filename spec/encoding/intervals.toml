@@ -1,0 +1,103 @@
+# interval parse / render vectors — CANONICAL DATA (CLAUDE.md §8).
+#
+# The cross-core determinism anchor for the interval parser and renderer
+# (../design/interval.md §3/§4). Each core's unit test reproduces these byte-for-byte. Parsing
+# yields the three fields (months, days, micros); rendering takes the three fields to text.
+#
+# These pin jed's behavior (the "unit + time" input subset, the exact fractional-unit cascade,
+# half-away µs rounding, and the PG `IntervalStyle = postgres` render). The conformance suite
+# (../conformance/suites/types/interval.test) separately oracle-checks the rendered SQL against
+# the live PostgreSQL db where the two do not deliberately diverge.
+
+# --- parse: input string -> (months, days, micros) ---------------------------
+[[parse]]
+cases = [
+  # plain units
+  { input = "1 day",            months = 0,   days = 1,  micros = 0 },
+  { input = "2 days",           months = 0,   days = 2,  micros = 0 },
+  { input = "1 year",           months = 12,  days = 0,  micros = 0 },
+  { input = "1 year 2 months",  months = 14,  days = 0,  micros = 0 },
+  { input = "1 mon",            months = 1,   days = 0,  micros = 0 },
+  { input = "30 days",          months = 0,   days = 30, micros = 0 },
+  { input = "3 weeks",          months = 0,   days = 21, micros = 0 },
+  { input = "1 week 1 day",     months = 0,   days = 8,  micros = 0 },
+  { input = "1 decade",         months = 120, days = 0,  micros = 0 },
+  { input = "1 century",        months = 1200, days = 0, micros = 0 },
+  { input = "1 millennium",     months = 12000, days = 0, micros = 0 },
+  # time forms
+  { input = "1 day 02:30:00",   months = 0, days = 1, micros = 9000000000 },
+  { input = "04:05:06",         months = 0, days = 0, micros = 14706000000 },
+  { input = "1:2:3",            months = 0, days = 0, micros = 3723000000 },
+  { input = "02:30",            months = 0, days = 0, micros = 9000000000 },
+  { input = "100 hours",        months = 0, days = 0, micros = 360000000000 },
+  { input = "1 hour 30 minutes", months = 0, days = 0, micros = 5400000000 },
+  { input = "1 second",         months = 0, days = 0, micros = 1000000 },
+  { input = "1.5 seconds",      months = 0, days = 0, micros = 1500000 },
+  { input = "0.5 seconds",      months = 0, days = 0, micros = 500000 },
+  { input = "1 millisecond",    months = 0, days = 0, micros = 1000 },
+  { input = "1 microsecond",    months = 0, days = 0, micros = 1 },
+  # bare number defaults to seconds (PG)
+  { input = "5",                months = 0, days = 0, micros = 5000000 },
+  { input = "1.5",              months = 0, days = 0, micros = 1500000 },
+  # fractional-unit cascade (exact, 1 month = 30 days, 1 day = 24 h)
+  { input = "1.5 days",         months = 0, days = 1,  micros = 43200000000 },
+  { input = "1.5 months",       months = 1, days = 15, micros = 0 },
+  { input = "1.5 years",        months = 18, days = 0, micros = 0 },
+  { input = "1.15 months",      months = 1, days = 4,  micros = 43200000000 },
+  # half-away µs rounding (a jed divergence from PG half-even on the exact tie)
+  { input = "0.0000005 seconds", months = 0, days = 0, micros = 1 },
+  # signs, ago, @
+  { input = "-1 day",           months = 0,   days = -1, micros = 0 },
+  { input = "1 day -02:00",     months = 0,   days = 1,  micros = -7200000000 },
+  { input = "-00:00:01",        months = 0,   days = 0,  micros = -1000000 },
+  { input = "-1 year 2 mons",   months = -10, days = 0,  micros = 0 },
+  { input = "2 mons -1 day",    months = 2,   days = -1, micros = 0 },
+  { input = "1 day ago",        months = 0,   days = -1, micros = 0 },
+  { input = "1 year 1 day 01:00:00 ago", months = -12, days = -1, micros = -3600000000 },
+  { input = "@ 1 day",          months = 0, days = 1, micros = 0 },
+  # zero
+  { input = "00:00:00",         months = 0, days = 0, micros = 0 },
+  { input = "0 seconds",        months = 0, days = 0, micros = 0 },
+]
+
+# --- parse_error: input string -> SQLSTATE -----------------------------------
+[[parse_error]]
+cases = [
+  { input = "",            error = "22007" },  # empty
+  { input = "1 fortnight", error = "22007" },  # unknown unit
+  { input = "1 day foo",   error = "22007" },  # trailing junk
+  { input = "abc",         error = "22007" },  # not a number
+  { input = "1 m",         error = "22007" },  # ambiguous bare `m` is not accepted
+]
+
+# --- render: (months, days, micros) -> text (PG IntervalStyle = postgres) ----
+[[render]]
+cases = [
+  { months = 0,   days = 1,  micros = 0,           text = "1 day" },
+  { months = 0,   days = 2,  micros = 0,           text = "2 days" },
+  { months = 12,  days = 0,  micros = 0,           text = "1 year" },
+  { months = 14,  days = 0,  micros = 0,           text = "1 year 2 mons" },
+  { months = 1,   days = 0,  micros = 0,           text = "1 mon" },
+  { months = 0,   days = 30, micros = 0,           text = "30 days" },
+  { months = 0,   days = 1,  micros = 9000000000,  text = "1 day 02:30:00" },
+  { months = 0,   days = 0,  micros = 14706000000, text = "04:05:06" },
+  { months = 0,   days = 0,  micros = 360000000000, text = "100:00:00" },
+  { months = 0,   days = 1,  micros = 43200000000, text = "1 day 12:00:00" },
+  { months = 1,   days = 15, micros = 0,           text = "1 mon 15 days" },
+  { months = 18,  days = 0,  micros = 0,           text = "1 year 6 mons" },
+  { months = 1,   days = 4,  micros = 43200000000, text = "1 mon 4 days 12:00:00" },
+  { months = 0,   days = -1, micros = 0,           text = "-1 days" },
+  { months = 0,   days = 1,  micros = -7200000000, text = "1 day -02:00:00" },
+  { months = -10, days = 0,  micros = 0,           text = "-10 mons" },
+  { months = 0,   days = 0,  micros = 1000000,     text = "00:00:01" },
+  { months = 0,   days = 0,  micros = 1500000,     text = "00:00:01.5" },
+  { months = 0,   days = 0,  micros = 500000,      text = "00:00:00.5" },
+  { months = 0,   days = 0,  micros = 1000,        text = "00:00:00.001" },
+  { months = 0,   days = 0,  micros = 1,           text = "00:00:00.000001" },
+  { months = 0,   days = 0,  micros = 0,           text = "00:00:00" },
+  { months = -12, days = -1, micros = -3600000000, text = "-1 years -1 days -01:00:00" },
+  { months = 2,   days = -1, micros = 0,           text = "2 mons -1 days" },
+  { months = 0,   days = 8,  micros = 0,           text = "8 days" },
+  { months = 0,   days = 0,  micros = 5400000000,  text = "01:30:00" },
+  { months = 0,   days = 0,  micros = -1000000,    text = "-00:00:01" },
+]

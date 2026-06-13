@@ -273,6 +273,22 @@ id = "types.timestamptz"
 description = "timestamptz / timestamp with time zone scalar type (UTC instant, int64 microseconds): storage, literals with offset→UTC normalization (offset then discarded), comparison/ordering, infinity, and timestamptz PRIMARY KEY. No named zones (spec/design/timestamp.md)"
 
 [[capability]]
+id = "types.interval"
+description = "interval scalar type (a span — months/days/micros): storage, the 'unit + time' input subset (units with abbreviations, per-field signs, trailing 'ago', the fractional-unit cascade, bare HH:MM:SS) via a single-quoted literal or the INTERVAL '...' keyword, PG 'postgres' render, and comparison/ordering/dedup by the canonical 128-bit span (1 month = 30 days, 1 day = 24 h — so '1 mon' = '30 days'). Non-key column only — an interval PRIMARY KEY/index is rejected 0A000; CAST and field qualifiers/precision are deferred (spec/design/interval.md)"
+
+[[capability]]
+id = "expr.interval_arithmetic"
+description = "interval arithmetic (spec/design/interval.md §5): interval ± interval → interval (field-wise, no justification) and unary minus; a NULL operand propagates; an i32 month/day or i64 micros overflow traps 22008. interval ×÷ number and timestamp ± interval are separate capabilities (later slices)"
+
+[[capability]]
+id = "expr.interval_scale"
+description = "interval ×÷ number (spec/design/interval.md §5): interval × integer/decimal, integer/decimal × interval (commute), interval ÷ integer/decimal → interval, each field scaled with the fractional part cascading months→days→micros — computed EXACTLY (no float; a documented PG divergence on sub-unit ties), µs half-away. Overflow → 22008, zero divisor → 22012"
+
+[[capability]]
+id = "expr.timestamp_arithmetic"
+description = "timestamp arithmetic (the engine's first; spec/design/interval.md §5): timestamp[tz] ± interval → timestamp[tz] (months added first with day-of-month clamping, then days as 24 h, then micros; ±infinity stays ±infinity; overflow → 22008), interval + timestamp[tz] commutes, and timestamp[tz] − timestamp[tz] → interval justified into days + time (months = 0; an infinite operand → 22008)"
+
+[[capability]]
 id = "null.three_valued"
 description = "Three-valued NULL logic in comparisons (CLAUDE.md §4)"
 

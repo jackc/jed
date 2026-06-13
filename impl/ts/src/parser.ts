@@ -1193,6 +1193,13 @@ class Parser {
       this.expect("rparen");
       return { kind: "exists", query };
     }
+    // `INTERVAL '...'` — a keyword-introduced interval literal (grammar.md §36). Recognized only
+    // when a string literal follows, so `interval` stays usable as a column / function name.
+    if (this.peekKeyword() === "interval" && this.tokens[this.pos + 1]?.kind === "str") {
+      this.advance(); // INTERVAL
+      const t = this.advance();
+      return { kind: "intervalLiteral", text: t.str! };
+    }
     if (this.peekKeyword() === "cast") {
       this.advance();
       this.expect("lparen");

@@ -37,6 +37,11 @@ const (
 	Timestamp
 	// Timestamptz is the UTC instant, int64 microseconds since the Unix epoch.
 	Timestamptz
+	// IntervalType is a span of time — three independent fields (months/days/micros), compared
+	// by the canonical 128-bit span (spec/design/interval.md). Not a key this slice; not
+	// serialized through the fixed-width integer codec. (Named IntervalType, not Interval,
+	// because Interval is the value struct.)
+	IntervalType
 )
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. Precision >= 1;
@@ -70,6 +75,8 @@ func (t ScalarType) CanonicalName() string {
 		return "timestamp"
 	case Timestamptz:
 		return "timestamptz"
+	case IntervalType:
+		return "interval"
 	default:
 		return "?"
 	}
@@ -101,6 +108,8 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return Timestamp, true
 	case "timestamptz", "timestamp with time zone":
 		return Timestamptz, true
+	case "interval":
+		return IntervalType, true
 	default:
 		return 0, false
 	}
@@ -126,6 +135,9 @@ func (t ScalarType) IsTimestamp() bool { return t == Timestamp }
 
 // IsTimestamptz reports whether this is the UTC-instant timestamptz type.
 func (t ScalarType) IsTimestamptz() bool { return t == Timestamptz }
+
+// IsInterval reports whether this is the interval (span) type.
+func (t ScalarType) IsInterval() bool { return t == IntervalType }
 
 // IsInteger reports whether this is one of the fixed-width signed integer types.
 func (t ScalarType) IsInteger() bool { return t == Int16 || t == Int32 || t == Int64 }
@@ -201,5 +213,5 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz}
+	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType}
 }

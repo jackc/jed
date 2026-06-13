@@ -9,6 +9,7 @@
 // three-valued domain, ordered false < true.
 
 import { Decimal } from "./decimal.ts";
+import { type Interval, intervalCmp, renderInterval } from "./interval.ts";
 import { renderTimestamp, renderTimestamptz } from "./timestamp.ts";
 
 export type Value =
@@ -20,6 +21,10 @@ export type Value =
   // -infinity/+infinity). They compare by the instant and never cross-family (timestamp.ts).
   | { kind: "timestamp"; micros: bigint }
   | { kind: "timestamptz"; micros: bigint }
+  // An interval span — months/days/micros (spec/design/interval.md). Comparison/dedup go through
+  // the canonical 128-bit span (intervalSpan), NOT field equality, so '1 mon' == '30 days' while
+  // render preserves each value's fields. micros is a bigint (int64 exactness).
+  | { kind: "interval"; iv: Interval }
   // The first stored non-integer value; compares by the C collation (UTF-8 byte /
   // code-point order — spec/design/types.md §11). NOT compared with JS `<`/localeCompare,
   // which use UTF-16 code-unit order and disagree above U+FFFF (see compareTextC below).
@@ -101,6 +106,11 @@ export function timestampValue(m: bigint): Value {
 // timestamptzValue builds a non-null timestamptz from its int64 microsecond instant.
 export function timestamptzValue(m: bigint): Value {
   return { kind: "timestamptz", micros: m };
+}
+
+// intervalValue builds a non-null interval value.
+export function intervalValue(iv: Interval): Value {
+  return { kind: "interval", iv };
 }
 
 // compareBytea compares two byte strings by UNSIGNED byte order (Uint8Array elements are
@@ -277,6 +287,8 @@ export function render(v: Value): string {
       return renderTimestamp(v.micros);
     case "timestamptz":
       return renderTimestamptz(v.micros);
+    case "interval":
+      return renderInterval(v.iv);
     case "unfetched":
       throw new Error("BUG: unfetched large value escaped the storage layer");
     default:
@@ -306,6 +318,8 @@ export function eq3(a: Value, b: Value): ThreeValued {
   // Timestamps compare by the int64 instant (infinity is just an extreme value).
   if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros === b.micros);
   if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros === b.micros);
+  // Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
+  if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) === 0);
   return "unknown";
 }
 
@@ -326,6 +340,7 @@ export function lt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "bool" && b.kind === "bool") return bool3(!a.value && b.value);
   if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros < b.micros);
   if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros < b.micros);
+  if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) < 0);
   return "unknown";
 }
 
@@ -346,6 +361,7 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value && !b.value);
   if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros > b.micros);
   if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros > b.micros);
+  if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) > 0);
   return "unknown";
 }
 

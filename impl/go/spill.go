@@ -379,6 +379,12 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 	case ValTimestamptz:
 		_ = w.WriteByte(8)
 		spillWriteU64(w, uint64(v.Int))
+	case ValInterval:
+		// Interval — tag 12 (tags 9/10/11 are the Unfetched forms below); months, days, micros.
+		_ = w.WriteByte(12)
+		spillWriteU32(w, uint32(v.Iv.Months))
+		spillWriteU32(w, uint32(v.Iv.Days))
+		spillWriteU64(w, uint64(v.Iv.Micros))
 	case ValUnfetched:
 		// An untouched large-value reference rides along to the output unread (spill.md §4); spill
 		// it opaquely so it round-trips, never resolving it.
@@ -524,6 +530,17 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		}
 		raw, err := spillReadU32(r)
 		return Value{Kind: ValUnfetched, Unf: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: raw}}, err
+	case 12:
+		months, err := spillReadU32(r)
+		if err != nil {
+			return Value{}, err
+		}
+		days, err := spillReadU32(r)
+		if err != nil {
+			return Value{}, err
+		}
+		micros, err := spillReadU64(r)
+		return IntervalValue(Interval{Months: int32(months), Days: int32(days), Micros: int64(micros)}), err
 	default:
 		return Value{}, io.ErrUnexpectedEOF
 	}

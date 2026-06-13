@@ -73,6 +73,8 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 9
 	case Timestamptz:
 		return 10
+	case IntervalType:
+		return 11
 	default:
 		return 0
 	}
@@ -101,6 +103,8 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return Timestamp, true
 	case 10:
 		return Timestamptz, true
+	case 11:
+		return IntervalType, true
 	default:
 		return 0, false
 	}
@@ -186,6 +190,17 @@ func encodeValue(ty ScalarType, v Value) []byte {
 		for _, g := range groups {
 			out = appendU16(out, g)
 		}
+		return out
+	case ValInterval:
+		// Fixed 16-byte body: i32 months, i32 days, i64 micros — big-endian two's-complement,
+		// no sign-flip (a value codec, not an order-preserving key) — spec/fileformat/format.md.
+		out := make([]byte, 0, 1+16)
+		out = append(out, 0x00) // present
+		out = appendU32(out, uint32(v.Iv.Months))
+		out = appendU32(out, uint32(v.Iv.Days))
+		m := uint64(v.Iv.Micros)
+		out = append(out, byte(m>>56), byte(m>>48), byte(m>>40), byte(m>>32),
+			byte(m>>24), byte(m>>16), byte(m>>8), byte(m))
 		return out
 	default:
 		n := v.Int
@@ -2130,6 +2145,25 @@ func readInlineBody(ty ScalarType, buf []byte, pos *int) (Value, error) {
 			return TimestampValue(m), nil
 		}
 		return TimestamptzValue(m), nil
+	case ty.IsInterval():
+		// Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
+		mb, err := take(buf, pos, 4)
+		if err != nil {
+			return Value{}, err
+		}
+		db, err := take(buf, pos, 4)
+		if err != nil {
+			return Value{}, err
+		}
+		ub, err := take(buf, pos, 8)
+		if err != nil {
+			return Value{}, err
+		}
+		months := int32(uint32(mb[0])<<24 | uint32(mb[1])<<16 | uint32(mb[2])<<8 | uint32(mb[3]))
+		days := int32(uint32(db[0])<<24 | uint32(db[1])<<16 | uint32(db[2])<<8 | uint32(db[3]))
+		micros := int64(uint64(ub[0])<<56 | uint64(ub[1])<<48 | uint64(ub[2])<<40 | uint64(ub[3])<<32 |
+			uint64(ub[4])<<24 | uint64(ub[5])<<16 | uint64(ub[6])<<8 | uint64(ub[7]))
+		return IntervalValue(Interval{Months: months, Days: days, Micros: micros}), nil
 	default:
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {

@@ -260,3 +260,32 @@ aliases = ["timestamp with time zone"]
 family = "timestamptz"
 storable = true
 encoding = { method = "int-be-signflip", width_bytes = 8 }
+
+# --- interval: a span of time (../design/interval.md) ------------------------
+# PostgreSQL's three INDEPENDENT fields — months (int32), days (int32), micros (int64) —
+# kept separate so `+ 1 month` is calendar-aware (Jan 31 + 1 month -> Feb 28/29, day clamped)
+# and genuinely distinct from `+ 30 days`. STORABLE this slice (on-disk type code 11 —
+# ../fileformat/format.md), with a FIXED 16-byte value body (i32 months + i32 days + i64
+# micros, big-endian two's-complement; NO sign-flip — a value codec, not a key). Comparison,
+# ordering, and dedup (DISTINCT/GROUP BY/set-ops) collapse the three fields via the canonical
+# 128-bit SPAN (1 month = 30 days, 1 day = 24 h): span = (months*30 + days)*86_400_000_000 +
+# micros, compared as a signed 128-bit integer (PG `interval_cmp_value`). So `'1 mon'` ==
+# `'30 days'` == `'720:00:00'`, while each value still RENDERS its own fields. A value is written
+# as a single-quoted string in an interval context (literal adaptation, like timestamp) OR with
+# the `INTERVAL '...'` keyword literal (context-free): the "unit + time" input subset (units with
+# abbreviations, per-field signs, trailing `ago`, the fractional-unit cascade `1.5 days` ->
+# `1 day 12:00:00`, and a bare `HH:MM:SS[.ffffff]`). Malformed input traps 22007; an out-of-range
+# field 22008. ISO-8601 `P…`, the SQL-standard combined forms (`1-2`/`3 4:05:06`), field
+# qualifiers (`YEAR TO MONTH`), the `interval(p)` precision typmod, and CAST to/from interval are
+# all DEFERRED. NOT a key this slice — its order-preserving key encoding is not authored, so an
+# interval PRIMARY KEY / index is rejected 0A000 (like decimal/text/bytea). No bits/min/max/
+# overflow/rank (not the integer family); no collation; no width_bytes (the fixed body is
+# multi-field, not a single int through the integer codec). `interval * / number` arithmetic
+# computes the fractional cascade EXACTLY (no float — CLAUDE.md §8), a documented PG divergence
+# on sub-unit ties (../design/interval.md §5).
+[[type]]
+id = "interval"
+aliases = []
+family = "interval"
+storable = true
+encoding = { method = "interval-fixed16" }

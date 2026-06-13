@@ -214,6 +214,40 @@ export function readTimestampCases(path: string): TsCase[] {
   return out;
 }
 
+// readIntervalCases reads spec/encoding/intervals.toml — like readTimestampCases but the
+// sections carry no `type =` field (one type), so a `{ ... }` line is collected as soon as a
+// section is active. Each case's fields are the raw key=value pairs.
+export interface IvCase {
+  section: "parse" | "parse_error" | "render";
+  fields: Record<string, string>;
+}
+
+export function readIntervalCases(path: string): IvCase[] {
+  const data = readFileSync(path, "utf8");
+  const out: IvCase[] = [];
+  let section: IvCase["section"] | "" = "";
+  for (const raw of data.split("\n")) {
+    const line = raw.trim();
+    if (line === "[[parse]]") section = "parse";
+    else if (line === "[[parse_error]]") section = "parse_error";
+    else if (line === "[[render]]") section = "render";
+    else if (line.startsWith("{") && section !== "") {
+      let inner = line;
+      const o = inner.indexOf("{");
+      if (o >= 0) inner = inner.slice(o + 1);
+      const cl = inner.indexOf("}");
+      if (cl >= 0) inner = inner.slice(0, cl);
+      const fields: Record<string, string> = {};
+      for (const part of inner.split(",")) {
+        const idx = part.indexOf("=");
+        if (idx >= 0) fields[part.slice(0, idx).trim()] = unquote(part.slice(idx + 1).trim());
+      }
+      out.push({ section, fields });
+    }
+  }
+  return out;
+}
+
 function parseEncCaseLine(line: string, kind: EncCase["kind"] | "", typ: string): EncCase | null {
   if (kind === "" || typ === "") return null;
   let inner = line;

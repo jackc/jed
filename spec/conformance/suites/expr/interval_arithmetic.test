@@ -1,0 +1,95 @@
+# interval arithmetic (spec/design/interval.md §5): interval ± interval → interval (field-wise,
+# PG keeps months/days/micros independent — no justification) and unary minus. A NULL operand
+# propagates; an i32 month/day or i64 micros overflow traps 22008. interval ×÷ number and
+# timestamp ± interval are later slices (this suite is the ± / unary-minus part).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.int32, types.interval, expr.interval_arithmetic
+
+# --- literal arithmetic (the INTERVAL keyword form) ---
+
+# field-wise add: 1 day + 2 hours keeps the day and time fields separate
+query T nosort
+SELECT INTERVAL '1 day' + INTERVAL '2 hours'
+----
+1 day 02:00:00
+
+# field-wise subtract within the month/day fields
+query T nosort
+SELECT INTERVAL '1 mon 5 days' - INTERVAL '3 days'
+----
+1 mon 2 days
+
+# unary minus negates every field
+query T nosort
+SELECT -INTERVAL '1 day 2 hours'
+----
+-1 days -02:00:00
+
+# mixed-sign result: 1 day + (-2 days) = -1 day
+query T nosort
+SELECT INTERVAL '1 day' + INTERVAL '-2 days'
+----
+-1 days
+
+# the time field can go negative on its own
+query T nosort
+SELECT INTERVAL '1 hour' - INTERVAL '90 minutes'
+----
+-00:30:00
+
+# add across all three fields
+query T nosort
+SELECT INTERVAL '1 year 2 mons' + INTERVAL '10 days 03:00:00'
+----
+1 year 2 mons 10 days 03:00:00
+
+# a NULL operand propagates (result is NULL)
+query T nosort
+SELECT INTERVAL '1 day' + NULL
+----
+NULL
+
+# --- arithmetic over stored interval columns ---
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a interval, b interval)
+
+statement ok
+INSERT INTO t VALUES (1, '1 mon', '10 days'), (2, '2 hours', '30 minutes'), (3, '1 day', NULL)
+
+query T nosort
+SELECT a + b FROM t WHERE id = 1
+----
+1 mon 10 days
+
+query T nosort
+SELECT a - b FROM t WHERE id = 2
+----
+01:30:00
+
+# NULL operand from a column propagates
+query T nosort
+SELECT a + b FROM t WHERE id = 3
+----
+NULL
+
+# the sum is span-equal to '40 days' (1 mon = 30 days, + 10 days)
+query I nosort
+SELECT id FROM t WHERE a + b = INTERVAL '40 days'
+----
+1
+
+# negation in a predicate
+query I nosort
+SELECT id FROM t WHERE -a = INTERVAL '-1 mon'
+----
+1
+
+# --- overflow traps 22008 (i32 day field) ---
+
+statement error 22008
+SELECT INTERVAL '2000000000 days' + INTERVAL '2000000000 days'
+
+# --- a non-interval ± interval pair is a 42804 ---
+
+statement error 42804
+SELECT INTERVAL '1 day' + 1

@@ -1715,6 +1715,13 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		}
 		return Expr{Kind: ExprCast, Cast: &CastExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod}}, nil
 	}
+	// `INTERVAL '...'` — a keyword-introduced interval literal (grammar.md §36). Recognized only
+	// when a string literal follows, so `interval` stays usable as a column / function name.
+	if p.peekKeyword() == "interval" && p.peekKindAt(1) == TokStr {
+		p.advance() // INTERVAL
+		t := p.advance()
+		return Expr{Kind: ExprIntervalLiteral, IntervalText: t.Word}, nil
+	}
 	if p.peekKeyword() == "case" {
 		p.advance()
 		// Simple form has an operand between CASE and the first WHEN; the searched form starts

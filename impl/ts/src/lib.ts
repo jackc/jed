@@ -133,6 +133,16 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // timestamp PRIMARY KEY (key encoding = int64). spec/design/timestamp.md.
   "types.timestamp",
   "types.timestamptz",
+  // interval scalar type (a span — months/days/micros): the "unit + time" input subset, PG
+  // render, and comparison/ordering/dedup by the canonical 128-bit span. Non-key column only.
+  // spec/design/interval.md.
+  "types.interval",
+  // interval ± interval → interval and unary minus (interval.md §5).
+  "expr.interval_arithmetic",
+  // interval ×÷ number → interval (the exact field-scaling cascade — interval.md §5).
+  "expr.interval_scale",
+  // timestamp[tz] ± interval and timestamp[tz] − timestamp[tz] → interval (interval.md §5).
+  "expr.timestamp_arithmetic",
   // General expression substrate — integer arithmetic, the boolean type, and the
   // AND/OR/NOT Kleene connectives (the `expression` profile).
   "types.boolean",

@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::key_cmp;
+use crate::interval::Interval;
 use crate::storage::Row;
 use crate::value::{Unfetched, Value};
 
@@ -381,6 +382,13 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             w.write_all(&[8])?;
             w.write_all(&m.to_le_bytes())
         }
+        // Interval — tag 12 (tags 9/10/11 are the Unfetched forms below); months, days, micros.
+        Value::Interval(iv) => {
+            w.write_all(&[12])?;
+            w.write_all(&iv.months.to_le_bytes())?;
+            w.write_all(&iv.days.to_le_bytes())?;
+            w.write_all(&iv.micros.to_le_bytes())
+        }
         // An untouched large-value reference rides along to the output unread (spill.md §4); spill
         // it opaquely (the pointer/inline block) so it round-trips, never resolving it.
         Value::Unfetched(Unfetched::External { first_page, len }) => {
@@ -486,6 +494,17 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             stored_len: read_u32(r)?,
             raw_len: read_u32(r)?,
         }),
+        12 => {
+            let mut mb = [0u8; 4];
+            r.read_exact(&mut mb)?;
+            let mut db = [0u8; 4];
+            r.read_exact(&mut db)?;
+            Value::Interval(Interval {
+                months: i32::from_le_bytes(mb),
+                days: i32::from_le_bytes(db),
+                micros: read_i64(r)?,
+            })
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

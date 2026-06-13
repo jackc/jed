@@ -285,6 +285,21 @@ function timestamptzTableDB(): Database {
   return db;
 }
 
+// intervalTableDB exercises the value codec's fixed 16-byte interval branch (type code 11): a
+// positive multi-field value, a negative value, the zero interval, a months-only '1 mon' vs a
+// span-equal-but-byte-distinct '30 days', and a NULL. The bare-string literals adapt.
+function intervalTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, d interval)");
+  run(db, "INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05')");
+  run(db, "INSERT INTO t VALUES (2, '-1 day')");
+  run(db, "INSERT INTO t VALUES (3, '0 seconds')");
+  run(db, "INSERT INTO t VALUES (4, '1 mon')");
+  run(db, "INSERT INTO t VALUES (5, '30 days')");
+  run(db, "INSERT INTO t VALUES (6, NULL)");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -301,6 +316,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "default_table.jed", build: defaultTableDB },
     { name: "timestamp_table.jed", build: timestampTableDB },
     { name: "timestamptz_table.jed", build: timestamptzTableDB },
+    { name: "interval_table.jed", build: intervalTableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
     { name: "composite_pk_table.jed", build: compositePKTableDB },
     { name: "check_table.jed", build: checkTableDB },
@@ -334,6 +350,7 @@ test("read goldens reproduces rows", () => {
     { name: "default_table.jed", build: defaultTableDB, table: "t" },
     { name: "timestamp_table.jed", build: timestampTableDB, table: "t" },
     { name: "timestamptz_table.jed", build: timestamptzTableDB, table: "t" },
+    { name: "interval_table.jed", build: intervalTableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "composite_pk_table.jed", build: compositePKTableDB, table: "t" },
     { name: "check_table.jed", build: checkTableDB, table: "t" },
