@@ -45,6 +45,10 @@ pub struct App {
     pub help_open: bool,
     pub show_schema: bool,
     pub completion: Option<Completion>,
+    /// The editor viewport's (row, col) scroll offsets — view-side bookkeeping kept here
+    /// so draw.rs can keep the cursor visible (the editor is custom-rendered for syntax
+    /// highlighting, so tui-textarea's internal scrolling is unused).
+    pub editor_scroll: (usize, usize),
     pub quit: bool,
 }
 
@@ -67,6 +71,7 @@ impl App {
             help_open: false,
             show_schema: true,
             completion: None,
+            editor_scroll: (0, 0),
             quit: false,
         }
     }

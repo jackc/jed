@@ -6,6 +6,7 @@ mod app;
 mod complete;
 mod draw;
 mod grid;
+mod highlight;
 mod history;
 mod schema;
 

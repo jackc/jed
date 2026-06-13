@@ -191,7 +191,12 @@ tui-textarea) · **results grid** (bottom right) · **status bar** (bottom) · a
   the grammar's keywords/type/function names (case-styled after the typed prefix): one
   match completes inline, several open a popup at the cursor (`↑`/`↓` select,
   `Enter`/`Tab` accept, `Esc` closes, any other key closes and types). At a non-word
-  position `Tab` stays an ordinary tab.
+  position `Tab` stays an ordinary tab. The buffer is **syntax-highlighted** by a small
+  line-spanning tokenizer mirroring the engine's lexical rules (grammar.md §33 — strings
+  and nested block comments carry across lines): keywords cyan, strings green, numbers
+  magenta, comments dim. The editor view is rendered from the highlighter's spans
+  (tui-textarea offers no per-token styling; it still owns all editing state), with the
+  real terminal cursor when focused.
 - **Results grid**: scrollable on both axes when focused (arrows / PgUp / PgDn / Home /
   End); header row pinned; cells via `Value::render()`, NULL dimmed. Footer:
   `N rows · cost C` (wall time may appear here, clearly cosmetic — it never appears in
@@ -222,10 +227,9 @@ live in shared modules exercised by the script-mode tests).
 
 ## 8. Future (not v1)
 
-SQL syntax highlighting.
-(Landed since v1: affected-row counts in `Outcome` — the `OK, N rows` footer of §5 —
-editor autocomplete from the catalog (§6) —
-`--readonly` (§3), the `box`/`markdown` formats (§5), `-o` output redirection (§3) —
-a built-in pager is deliberately out; the TUI grid pages interactively, scripts pipe —
-CSV import/export: `--import-csv` in, `--format csv` + `-o` out (§3) — and the
-`--dump` SQL export (§3).)
+The original post-v1 list has fully landed: affected-row counts in `Outcome` (the
+`OK, N rows` footer of §5) · editor autocomplete from the catalog (§6) · SQL syntax
+highlighting (§6) · CSV import/export (`--import-csv` in, `--format csv` + `-o` out — §3)
+· the `--dump` SQL export (§3) · `--readonly` (§3) · the `box`/`markdown` formats (§5) ·
+`-o` output redirection (§3 — a built-in pager is deliberately out: the TUI grid pages
+interactively, scripts pipe). Nothing further is currently scheduled.

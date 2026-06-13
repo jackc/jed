@@ -7,7 +7,8 @@ use jed::Database;
 
 /// The grammar's word list (keywords, canonical type names, aggregate functions) —
 /// completed in the case style of the typed prefix (all-uppercase prefix → uppercase).
-const WORDS: &[&str] = &[
+/// Shared with the editor's syntax highlighter (highlight.rs).
+pub(crate) const WORDS: &[&str] = &[
     "all",
     "and",
     "as",

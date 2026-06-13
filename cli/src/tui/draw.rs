@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table};
 
 use super::app::{App, Focus};
+use super::highlight;
 use crate::session::TxState;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -99,14 +100,68 @@ fn draw_schema(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(body, inner);
 }
 
+/// The editor is rendered from its lines directly — through the syntax highlighter
+/// (cli.md §6) — rather than as the tui-textarea widget (which offers no per-token
+/// styling). tui-textarea still owns all editing state; this view adds the highlight
+/// styles, its own cursor-following scroll, and the real terminal cursor when focused.
 fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Editor;
-    app.editor.set_block(
-        Block::bordered()
-            .title(" Query — Ctrl+Enter / F5 runs ")
-            .border_style(border_style(focused)),
+    let block = Block::bordered()
+        .title(" Query — Ctrl+Enter / F5 runs ")
+        .border_style(border_style(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Keep the cursor inside the viewport (view-side bookkeeping, like the grid).
+    let (row, col) = app.editor.cursor();
+    let (mut row_off, mut col_off) = app.editor_scroll;
+    let (w, h) = (inner.width as usize, inner.height as usize);
+    row_off = row_off.min(row);
+    if row >= row_off + h {
+        row_off = row + 1 - h;
+    }
+    col_off = col_off.min(col);
+    if col >= col_off + w {
+        col_off = col + 1 - w;
+    }
+    app.editor_scroll = (row_off, col_off);
+
+    let lines: Vec<Line> = highlight::highlight(app.editor.lines())
+        .into_iter()
+        .map(|spans| {
+            Line::from(
+                spans
+                    .into_iter()
+                    .map(|s| Span::styled(s.text, class_style(s.class)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).scroll((row_off as u16, col_off as u16)),
+        inner,
     );
-    frame.render_widget(&app.editor, area);
+    if focused {
+        frame.set_cursor_position((
+            inner.x + (col - col_off) as u16,
+            inner.y + (row - row_off) as u16,
+        ));
+    }
+}
+
+/// The highlight palette (cli.md §6): keywords cyan, strings green, numbers magenta,
+/// comments dim — everything else default.
+fn class_style(class: highlight::Class) -> Style {
+    match class {
+        highlight::Class::Keyword => Style::default().fg(Color::Cyan),
+        highlight::Class::Str => Style::default().fg(Color::Green),
+        highlight::Class::Number => Style::default().fg(Color::Magenta),
+        highlight::Class::Comment => Style::default().fg(Color::DarkGray),
+        highlight::Class::Plain => Style::default(),
+    }
 }
 
 /// The autocomplete popup (cli.md §6), anchored just below the editor's cursor (clamped
@@ -118,13 +173,18 @@ fn draw_completion(frame: &mut Frame, app: &App, editor_area: Rect) {
     }
     let inner = Block::bordered().inner(editor_area);
     let (row, col) = app.editor.cursor();
+    let (row_off, col_off) = app.editor_scroll;
+    let (vrow, vcol) = (
+        row.saturating_sub(row_off) as u16,
+        col.saturating_sub(col_off) as u16,
+    );
     let width = (c.items.iter().map(|i| i.len()).max().unwrap_or(0) as u16 + 2).clamp(8, 32);
     let height = (c.items.len() as u16).min(8);
     let frame_area = frame.area();
-    let x = (inner.x + col as u16).min(frame_area.width.saturating_sub(width));
-    let mut y = inner.y + row as u16 + 1; // below the cursor line...
+    let x = (inner.x + vcol).min(frame_area.width.saturating_sub(width));
+    let mut y = inner.y + vrow + 1; // below the cursor line...
     if y + height > frame_area.height {
-        y = (inner.y + row as u16).saturating_sub(height); // ...or above when out of room
+        y = (inner.y + vrow).saturating_sub(height); // ...or above when out of room
     }
     let area = Rect::new(x, y, width, height.max(1));
 
