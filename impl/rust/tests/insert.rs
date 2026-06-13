@@ -101,7 +101,10 @@ fn int32_and_int64_overflow_boundaries() {
     // int32 max fits.
     assert_eq!(
         execute(&mut db, "INSERT INTO t VALUES (2, 2147483647)").unwrap(),
-        Outcome::Statement { cost: 0 }
+        Outcome::Statement {
+            cost: 0,
+            rows_affected: Some(1)
+        }
     );
 }
 
@@ -278,7 +281,10 @@ fn insert_select_cost_is_the_embedded_select_cost() {
     // storing the rows is unmetered.
     assert_eq!(
         execute(&mut db, "INSERT INTO dst SELECT id, a, b FROM src").unwrap(),
-        Outcome::Statement { cost: 7 }
+        Outcome::Statement {
+            cost: 7,
+            rows_affected: Some(3)
+        }
     );
 }
 

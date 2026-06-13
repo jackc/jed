@@ -16,7 +16,13 @@ fn drop_removes_table_and_rows() {
     assert!(db.table("t").is_some());
 
     let out = run(&mut db, "DROP TABLE t").unwrap();
-    assert_eq!(out, Outcome::Statement { cost: 0 });
+    assert_eq!(
+        out,
+        Outcome::Statement {
+            cost: 0,
+            rows_affected: None
+        }
+    );
     assert!(db.table("t").is_none(), "catalog entry gone");
     assert!(db.rows_in_key_order("t").is_none(), "row store gone");
 }

@@ -34,7 +34,7 @@ fn tables(n: i64) -> Database {
 fn cost(db: &mut Database, sql: &str) -> i64 {
     match execute(db, sql).unwrap() {
         Outcome::Query { cost, .. } => cost,
-        Outcome::Statement { cost } => cost,
+        Outcome::Statement { cost, .. } => cost,
     }
 }
 

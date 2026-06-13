@@ -76,7 +76,7 @@ fn json_format_quiet_matches_golden() {
 fn script_stops_at_the_first_error_with_exit_2() {
     let r = run(&[], &testdata("errors.sql"));
     assert_eq!(r.code, 2);
-    assert_eq!(r.stdout, "OK (cost 0)\nOK (cost 0)\n");
+    assert_eq!(r.stdout, "OK (cost 0)\nOK, 1 row (cost 0)\n");
     assert_eq!(
         r.stderr,
         "<stdin>:3: ERROR 23505: duplicate key value violates unique constraint: t_pkey\n"

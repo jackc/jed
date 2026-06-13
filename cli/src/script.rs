@@ -35,15 +35,13 @@ pub fn run(
         };
         for stmt in stmts {
             match session.run(&stmt.sql) {
-                Ok(ExecOutput::Statement { tag, cost }) => {
+                Ok(ExecOutput::Statement { tag, cost, rows }) => {
                     if !opts.quiet {
                         // Transaction-control tags print bare; everything else carries
-                        // the deterministic cost (cli.md §5).
-                        let _ = if tag == "OK" {
-                            writeln!(out, "OK (cost {cost})")
-                        } else {
-                            writeln!(out, "{tag}")
-                        };
+                        // the affected-row count (DML) and the deterministic cost
+                        // (cli.md §5).
+                        let _ =
+                            writeln!(out, "{}", crate::session::statement_line(tag, cost, rows));
                     }
                 }
                 Ok(ExecOutput::Query {

@@ -22,7 +22,7 @@ fn run(db: &mut Database, sql: &str) -> Outcome {
 
 fn cost(db: &mut Database, sql: &str) -> i64 {
     match run(db, sql) {
-        Outcome::Statement { cost } => cost,
+        Outcome::Statement { cost, .. } => cost,
         Outcome::Query { cost, .. } => cost,
     }
 }

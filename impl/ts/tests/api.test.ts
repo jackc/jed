@@ -204,3 +204,31 @@ test("tableNames lists tables sorted by lowercased name, excluding indexes", () 
   execute(db, "ROLLBACK");
   assert.deepStrictEqual(db.tableNames(), ["apple", "Zed"]);
 });
+
+test("rowsAffected reports DML counts", () => {
+  // The affected-row count (api.md §4): INSERT/UPDATE/DELETE without RETURNING report
+  // how many rows they touched (PostgreSQL's command-tag count); a DML statement that
+  // matched nothing reports 0; DDL and transaction control report null; DML with
+  // RETURNING is a query outcome (its row count is the result's length).
+  const db = new Database();
+  const affected = (sql: string): number | null => {
+    const out = execute(db, sql);
+    assert.equal(out.kind, "statement", sql);
+    return out.kind === "statement" ? out.rowsAffected : null;
+  };
+
+  assert.equal(affected("CREATE TABLE t (id int32 PRIMARY KEY, v int32)"), null);
+  assert.equal(affected("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)"), 3);
+  assert.equal(affected("UPDATE t SET v = v + 1 WHERE id <= 2"), 2);
+  assert.equal(affected("DELETE FROM t WHERE id = 3"), 1);
+  assert.equal(affected("DELETE FROM t WHERE id = 99"), 0);
+  assert.equal(affected("BEGIN"), null);
+  assert.equal(affected("COMMIT"), null);
+
+  // INSERT ... SELECT counts the inserted rows; DML with RETURNING is a Query.
+  execute(db, "CREATE TABLE dst (id int32 PRIMARY KEY)");
+  assert.equal(affected("INSERT INTO dst SELECT id FROM t"), 2);
+  const out = execute(db, "DELETE FROM dst RETURNING id");
+  assert.equal(out.kind, "query");
+  if (out.kind === "query") assert.equal(out.rows.length, 2);
+});

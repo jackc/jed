@@ -13,7 +13,7 @@ test("drop removes the table and its rows", () => {
     "INSERT INTO t VALUES (1, 10), (2, 20)",
   ]);
   const out = execute(db, "DROP TABLE t");
-  assert.deepStrictEqual(out, { kind: "statement", cost: 0n });
+  assert.deepStrictEqual(out, { kind: "statement", cost: 0n, rowsAffected: null });
   assert.equal(db.table("t"), undefined);
   assert.deepStrictEqual(db.rowsInKeyOrder("t"), []);
 });

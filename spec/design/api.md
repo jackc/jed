@@ -25,10 +25,10 @@ mapping table in §6.
 - **`PreparedStatement`** — a parsed, reusable statement. Parameter count/types are fixed at
   prepare time; the same statement runs many times with different bound values.
 - **`Outcome`** — the result of running a statement: either a bare statement result carrying
-  the accrued `cost`, or a query result carrying column names, rows, and `cost`. Unchanged
-  from the pre-API engine. Which variant a statement yields follows from its SQL: a `SELECT`
-  (or set operation) is a query result, and so is a DML statement with a `RETURNING` clause
-  ([grammar.md](grammar.md) §32); everything else is a bare statement result.
+  the accrued `cost` (plus, for DML, the affected-row count — §4), or a query result carrying
+  column names, rows, and `cost`. Which variant a statement yields follows from its SQL: a
+  `SELECT` (or set operation) is a query result, and so is a DML statement with a `RETURNING`
+  clause ([grammar.md](grammar.md) §32); everything else is a bare statement result.
 - **`Rows`** — a cursor over a query result, yielding one row at a time, plus the column
   names and the accrued cost.
 - **`EngineError` / `SqlState`** — the structured error surface (errors are data, not prose
@@ -214,8 +214,13 @@ then column metadata) is exactly what a future streaming/pull executor satisfies
 streaming can land later without changing any caller. True streaming and spill-to-disk
 operators are a separate deferred change (CLAUDE.md §9, Phase 6).
 
-`Outcome` is unchanged: a statement result carries `cost`; a query result carries
-`column_names`, the materialized `rows`, and `cost`.
+A statement result carries `cost` and the **affected-row count**: an INSERT, UPDATE, or
+DELETE without RETURNING reports how many rows it touched — PostgreSQL's command-tag count
+(`UPDATE 3`). A DML statement that matched nothing reports **0**; DDL and transaction
+control report **no count** (Rust `Option<i64>` `None` / Go `HasRowsAffected == false` /
+TS `null`) — mirroring PG, whose DDL tags carry no row count. DML *with* RETURNING is a
+query result; its count is the result's row length. A query result carries `column_names`,
+the materialized `rows`, and `cost`.
 
 ## 5. Parameters (`$N`)
 
@@ -261,6 +266,7 @@ only and the engine has no wire protocol).
 | rows iterate | `impl Iterator<Item = Vec<Value>>` | `for rows.Next() { rows.Row() }` | `for (const row of rows)` |
 | rows columns | `rows.column_names()` | `rows.ColumnNames()` | `rows.columnNames` |
 | rows cost | `rows.cost()` | `rows.Cost()` | `rows.cost` |
+| rows affected (§4) | `Outcome::Statement { rows_affected: Option<i64>, .. }` | `outcome.RowsAffected, outcome.HasRowsAffected` | `outcome.rowsAffected: number \| null` |
 | set cost ceiling (§8) | `db.set_max_cost(limit)` | `db.SetMaxCost(limit)` | `db.setMaxCost(limit)` |
 | table lookup (catalog) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*Table, bool)` | `db.table(name): Table \| undefined` |
 | table names (catalog) | `db.table_names() -> Vec<String>` | `db.TableNames() []string` | `db.tableNames(): string[]` |

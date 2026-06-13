@@ -198,13 +198,8 @@ impl App {
         for stmt in stmts {
             self.history.add(&stmt.sql);
             match self.session.run(&stmt.sql) {
-                Ok(ExecOutput::Statement { tag, cost }) => {
-                    let text = if tag == "OK" {
-                        format!("OK (cost {cost})")
-                    } else {
-                        tag.to_string()
-                    };
-                    self.set_message(text, false);
+                Ok(ExecOutput::Statement { tag, cost, rows }) => {
+                    self.set_message(crate::session::statement_line(tag, cost, rows), false);
                 }
                 Ok(ExecOutput::Query {
                     columns,

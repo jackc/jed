@@ -109,11 +109,11 @@ the conformance corpus' rendering, in every format.
   int/decimal columns right-aligned, everything else left-aligned; **NULL renders as
   `NULL`** (the engine's canonical rendering — a deliberate divergence from psql's blank
   cell, which is ambiguous against the empty string). Footers: query → `(N rows, cost C)`;
-  non-query statement → `OK (cost C)`; `BEGIN`/`COMMIT`/`ROLLBACK` → the bare tag.
-  **Cost is shown by default**: it is deterministic, reproducible, and a headline feature
-  (§13) — wall-clock time is not printed at all in script mode (nondeterministic output
-  breaks golden tests and diffs). The engine exposes no affected-row count yet; `OK` gains
-  one (`OK, 3 rows`) when `Outcome` does (TODO.md Phase 7).
+  DML without RETURNING → `OK, N rows (cost C)` (the engine's affected-row count, api.md
+  §4); other non-query statements → `OK (cost C)`; `BEGIN`/`COMMIT`/`ROLLBACK` → the bare
+  tag. **Cost is shown by default**: it is deterministic, reproducible, and a headline
+  feature (§13) — wall-clock time is not printed at all in script mode (nondeterministic
+  output breaks golden tests and diffs).
 - **`csv`**: RFC 4180 — header row, `,` separator, `"` quoting/escaping; **NULL → empty
   field** (the PG `COPY ... CSV` convention; the NULL-vs-empty-text ambiguity is accepted,
   v1). No footers, ever.
@@ -169,7 +169,7 @@ live in shared modules exercised by the script-mode tests).
 
 ## 8. Future (not v1)
 
-Affected-row counts in `Outcome` → real `UPDATE 3` tags · editor autocomplete from the
-catalog · SQL syntax highlighting · CSV import / export · `.dump`-style SQL export ·
-read-only open mode (wants engine support) · pager/`-o` output redirection ·
-`box`/markdown formats.
+Editor autocomplete from the catalog · SQL syntax highlighting · CSV import / export ·
+`.dump`-style SQL export · read-only open mode (wants engine support) · pager/`-o` output
+redirection · `box`/markdown formats. (Affected-row counts in `Outcome` landed — the
+`OK, N rows` footer of §5.)

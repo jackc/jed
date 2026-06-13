@@ -28,7 +28,14 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
     /// A statement that produces no result set (CREATE, INSERT, UPDATE, DELETE).
-    Statement { cost: i64 },
+    Statement {
+        cost: i64,
+        /// How many rows a DML statement (INSERT/UPDATE/DELETE without RETURNING) touched
+        /// — PostgreSQL's command-tag count (spec/design/api.md §4). `Some(0)` for a DML
+        /// statement that matched nothing; `None` for DDL and transaction control, which
+        /// have no row count.
+        rows_affected: Option<i64>,
+    },
     /// A query result: output column names plus rows in result order. The column count
     /// is `column_names.len()` (spec/design/grammar.md §8).
     Query {
@@ -42,7 +49,7 @@ impl Outcome {
     /// The accrued execution cost (CLAUDE.md §13), available on either variant.
     pub fn cost(&self) -> i64 {
         match self {
-            Outcome::Statement { cost } => *cost,
+            Outcome::Statement { cost, .. } => *cost,
             Outcome::Query { cost, .. } => *cost,
         }
     }
@@ -537,7 +544,10 @@ impl Database {
             failed: false,
             working: self.committed.clone(),
         });
-        Ok(Outcome::Statement { cost: 0 })
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
     }
 
     /// Commit the current transaction (spec/design/transactions.md §4.2). With no open block it is
@@ -549,11 +559,19 @@ impl Database {
     /// propagates (the commit failed; the working set is discarded). Returns to autocommit.
     pub(crate) fn commit_tx(&mut self) -> Result<Outcome> {
         let tx = match self.tx.take() {
-            None => return Ok(Outcome::Statement { cost: 0 }),
+            None => {
+                return Ok(Outcome::Statement {
+                    cost: 0,
+                    rows_affected: None,
+                });
+            }
             Some(tx) => tx,
         };
         if tx.failed || !tx.writable {
-            return Ok(Outcome::Statement { cost: 0 });
+            return Ok(Outcome::Statement {
+                cost: 0,
+                rows_affected: None,
+            });
         }
         let mut working = tx.working;
         // The txid is the durable commit counter (spec/design/api.md §2): it advances only on a
@@ -564,7 +582,10 @@ impl Database {
         }
         self.persist(&working)?; // no-op for an in-memory database
         self.committed = working;
-        Ok(Outcome::Statement { cost: 0 })
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
     }
 
     /// Roll back the current transaction (spec/design/transactions.md §4.2). With no open block it
@@ -573,7 +594,10 @@ impl Database {
     /// `committed` was never mutated, so there is nothing to restore. Returns to autocommit.
     pub(crate) fn rollback_tx(&mut self) -> Result<Outcome> {
         self.tx = None;
-        Ok(Outcome::Statement { cost: 0 })
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
     }
 
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
@@ -969,7 +993,10 @@ impl Database {
                 .put_index_store(k, TableStore::new(cap, Vec::new()));
         }
         // DDL touches no rows and evaluates no expressions: zero cost.
-        Ok(Outcome::Statement { cost: 0 })
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
     }
 
     /// Resolve a table's CHECK constraints for a write statement: each stored expression
@@ -1017,7 +1044,10 @@ impl Database {
         }
         let key = dt.name.to_ascii_lowercase();
         self.working_mut().remove_table(&key);
-        Ok(Outcome::Statement { cost: 0 })
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
     }
 
     /// Analyze and run a CREATE INDEX (spec/design/indexes.md §2). Validation mirrors
@@ -1145,6 +1175,7 @@ impl Database {
         }
         Ok(Outcome::Statement {
             cost: meter.accrued,
+            rows_affected: None,
         })
     }
 
@@ -1166,7 +1197,10 @@ impl Database {
         let table_key = table_key.to_string();
         let name_key = di.name.to_ascii_lowercase();
         self.working_mut().remove_index(&table_key, &name_key);
-        Ok(Outcome::Statement { cost: 0 })
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
     }
 
     /// Analyze and run an INSERT whose rows come from a `VALUES` list or a `SELECT`
@@ -1318,6 +1352,7 @@ impl Database {
                         self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
                     }
                 }
+                let inserted = rows.len() as i64;
                 let returned = self.insert_rows(
                     &table,
                     &columns,
@@ -1337,6 +1372,7 @@ impl Database {
                     },
                     _ => Outcome::Statement {
                         cost: meter.accrued,
+                        rows_affected: Some(inserted),
                     },
                 })
             }
@@ -1403,6 +1439,7 @@ impl Database {
                 // plus the RETURNING projection; storing the rows themselves stays unmetered.
                 // One meter keeps one ceiling over the whole statement.
                 meter.charge(q.cost);
+                let inserted = q.rows.len() as i64;
                 let returned = self.insert_rows(
                     &table,
                     &columns,
@@ -1422,6 +1459,7 @@ impl Database {
                     },
                     _ => Outcome::Statement {
                         cost: meter.accrued,
+                        rows_affected: Some(inserted),
                     },
                 })
             }
@@ -1869,6 +1907,7 @@ impl Database {
             },
             _ => Outcome::Statement {
                 cost: meter.accrued,
+                rows_affected: Some(matched.len() as i64),
             },
         })
     }
@@ -2162,6 +2201,7 @@ impl Database {
 
         // Phase 2: apply (keys unchanged — a PK column can't be assigned), then move the
         // changed index entries (unmetered write work; cannot fail).
+        let updated = updates.len() as i64;
         let store = self.store_mut(&upd.table);
         for (key, row, _) in updates {
             store.replace(&key, row)?;
@@ -2184,6 +2224,7 @@ impl Database {
             },
             _ => Outcome::Statement {
                 cost: meter.accrued,
+                rows_affected: Some(updated),
             },
         })
     }

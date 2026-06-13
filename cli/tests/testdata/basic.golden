@@ -1,12 +1,12 @@
 OK (cost 0)
-OK (cost 0)
+OK, 2 rows (cost 0)
  id | name  | score
 ----+-------+-------
   1 | alice |  9.50
   2 | bob   |  NULL
 (2 rows, cost 5)
 BEGIN
-OK (cost 3)
+OK, 1 row (cost 3)
  id | score
 ----+-------
   1 | 10.00

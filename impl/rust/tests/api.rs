@@ -197,6 +197,43 @@ fn incremental_commit_round_trips_to_canonical_image() {
 }
 
 #[test]
+fn rows_affected_reports_dml_counts() {
+    // The affected-row count (api.md §4): INSERT/UPDATE/DELETE without RETURNING report
+    // how many rows they touched (PostgreSQL's command-tag count); a DML statement that
+    // matched nothing reports Some(0); DDL and transaction control report None; DML with
+    // RETURNING is a query outcome (its row count is the result's length).
+    let mut db = Database::new();
+    let affected = |out: Outcome| match out {
+        Outcome::Statement { rows_affected, .. } => rows_affected,
+        Outcome::Query { .. } => panic!("expected a statement outcome"),
+    };
+
+    let ddl = execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)").unwrap();
+    assert_eq!(affected(ddl), None);
+    let ins = execute(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+    assert_eq!(affected(ins), Some(3));
+    let upd = execute(&mut db, "UPDATE t SET v = v + 1 WHERE id <= 2").unwrap();
+    assert_eq!(affected(upd), Some(2));
+    let del = execute(&mut db, "DELETE FROM t WHERE id = 3").unwrap();
+    assert_eq!(affected(del), Some(1));
+    let none = execute(&mut db, "DELETE FROM t WHERE id = 99").unwrap();
+    assert_eq!(affected(none), Some(0));
+    let begin = execute(&mut db, "BEGIN").unwrap();
+    assert_eq!(affected(begin), None);
+    let commit = execute(&mut db, "COMMIT").unwrap();
+    assert_eq!(affected(commit), None);
+
+    // INSERT ... SELECT counts the inserted rows; DML with RETURNING is a Query.
+    execute(&mut db, "CREATE TABLE dst (id int32 PRIMARY KEY)").unwrap();
+    let ins_sel = execute(&mut db, "INSERT INTO dst SELECT id FROM t").unwrap();
+    assert_eq!(affected(ins_sel), Some(2));
+    match execute(&mut db, "DELETE FROM dst RETURNING id").unwrap() {
+        Outcome::Query { rows, .. } => assert_eq!(rows.len(), 2),
+        _ => panic!("RETURNING must yield a query outcome"),
+    }
+}
+
+#[test]
 fn table_names_lists_tables_sorted_excluding_indexes() {
     // The catalog-read surface (api.md §6): canonical names, sorted ascending by
     // lowercased name; secondary indexes are relations but not tables.

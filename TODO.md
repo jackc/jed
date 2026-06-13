@@ -1059,10 +1059,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       nothing, votes on nothing; the engine cores stay zero-dep. Pre-work landed with it:
       SQL comments as lexer whitespace (grammar.md §33) and `table_names()` (api.md §6).
       Build/test: `rake cli:build` / `rake cli:test` (in `rake ci`). _(was: size L; §1)_
-- [ ] **Affected-row counts in `Outcome`** — DML without RETURNING reports how many rows it
-      touched (PG's `UPDATE 3` command tags), an additive `Outcome` field in all 3 cores +
-      api.md; the CLI's `OK` footer then becomes `OK, 3 rows (cost C)` (cli.md §5). The
-      `# cost:` corpus contract is untouched. _(size: M; follow-on to the CLI)_
+- [x] **Affected-row counts in `Outcome`** — ✅ **landed**: DML without RETURNING reports how
+      many rows it touched (PG's `UPDATE 3` command tags), an additive `Outcome` field in all
+      3 cores (Rust `rows_affected: Option<i64>` / Go `RowsAffected`+`HasRowsAffected` / TS
+      `rowsAffected: number | null`) + api.md §4; the CLI's `OK` footer is now
+      `OK, 3 rows (cost C)` (cli.md §5). The `# cost:` corpus contract is untouched.
 - [ ] **CLI follow-ons** (cli.md §8, after v1): editor autocomplete from the catalog, SQL
       syntax highlighting, CSV import/export, `.dump`-style SQL export, read-only open mode
       (wants engine support), pager/`-o` redirection. _(size: M each; not scheduled)_

@@ -92,8 +92,11 @@ import {
 // UPDATE, DELETE) or a query result set. cost is the deterministic execution cost accrued
 // while running it (CLAUDE.md §13) — a DML statement accrues its scan + filter cost even
 // though it returns no rows. It is a bigint for int64 parity across cores (§8).
+// rowsAffected is how many rows a DML statement (INSERT/UPDATE/DELETE without RETURNING)
+// touched — PostgreSQL's command-tag count (spec/design/api.md §4); 0 for a DML statement
+// that matched nothing, null for DDL and transaction control, which have no row count.
 export type Outcome =
-  | { kind: "statement"; cost: bigint }
+  | { kind: "statement"; cost: bigint; rowsAffected: number | null }
   | { kind: "query"; columnNames: string[]; rows: Value[][]; cost: bigint };
 
 // SelectResult is the full result of running a SELECT (runSelect): the output column names and
@@ -457,7 +460,7 @@ export class Database {
       throw engineError("active_sql_transaction", "there is already a transaction in progress");
     }
     this.tx = { writable, failed: false, working: this.committed.clone() };
-    return { kind: "statement", cost: 0n };
+    return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
   // commitTx commits the current transaction (spec/design/transactions.md §4.2). With no open block
@@ -468,16 +471,16 @@ export class Database {
   // failure leaves committed untouched and rethrows. Returns to autocommit.
   commitTx(): Outcome {
     const tx = this.tx;
-    if (tx === null) return { kind: "statement", cost: 0n };
+    if (tx === null) return { kind: "statement", cost: 0n, rowsAffected: null };
     this.tx = null;
-    if (tx.failed || !tx.writable) return { kind: "statement", cost: 0n };
+    if (tx.failed || !tx.writable) return { kind: "statement", cost: 0n, rowsAffected: null };
     const working = tx.working;
     if (this.path !== null) working.txid = this.committed.txid + 1n;
     // persistHook (if any) throws on an I/O failure before committed is swapped, so committed is
     // left untouched (the commit failed; the working snapshot is discarded).
     if (this.persistHook !== null) this.persistHook(this, working);
     this.committed = working;
-    return { kind: "statement", cost: 0n };
+    return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
   // rollbackTx rolls back the current transaction (spec/design/transactions.md §4.2). With no open
@@ -486,7 +489,7 @@ export class Database {
   // committed was never mutated, so there is nothing to restore. Returns to autocommit.
   rollbackTx(): Outcome {
     this.tx = null;
-    return { kind: "statement", cost: 0n };
+    return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
   // dispatchStmt routes one parsed statement to its executor. The autocommit transaction
@@ -795,7 +798,7 @@ export class Database {
       );
     }
     // DDL touches no rows and evaluates no expressions: zero cost.
-    return { kind: "statement", cost: 0n };
+    return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
   // resolveChecks resolves a table's CHECK constraints for a write statement: each stored
@@ -826,7 +829,7 @@ export class Database {
       throw engineError("undefined_table", "table does not exist: " + dt.name);
     }
     this.working().removeTable(dt.name.toLowerCase());
-    return { kind: "statement", cost: 0n };
+    return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
   // findIndex finds the table owning the named index in the visible snapshot
@@ -937,7 +940,7 @@ export class Database {
         throw new Error("index entry keys are unique (storage-key suffix)");
       }
     }
-    return { kind: "statement", cost: meter.accrued };
+    return { kind: "statement", cost: meter.accrued, rowsAffected: null };
   }
 
   // executeDropIndex runs a DROP INDEX (spec/design/indexes.md §2): a table's name is
@@ -951,7 +954,7 @@ export class Database {
       throw engineError("undefined_object", "index does not exist: " + di.name);
     }
     this.working().removeIndex(found[0], di.name.toLowerCase());
-    return { kind: "statement", cost: 0n };
+    return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
   // indexBoundRows executes an index equality bound (cost.md §3 "index-bounded scan"):
@@ -1112,7 +1115,7 @@ export class Database {
       // one ceiling over the whole statement.
       meter.charge(q.cost);
       const returned = this.insertRows(table, store, pk, checks, provided, q.rows, ret?.nodes ?? null, bound, meter);
-      return dmlOutcome(ret?.names ?? null, returned, meter.accrued);
+      return dmlOutcome(ret?.names ?? null, returned, q.rows.length, meter.accrued);
     }
 
     // VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
@@ -1173,7 +1176,7 @@ export class Database {
       meter.charge(foldCost.value);
     }
     const returned = this.insertRows(table, store, pk, checks, provided, rows, ret?.nodes ?? null, bound, meter);
-    return dmlOutcome(ret?.names ?? null, returned, meter.accrued);
+    return dmlOutcome(ret?.names ?? null, returned, rows.length, meter.accrued);
   }
 
   // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -1447,7 +1450,7 @@ export class Database {
     // residual filter below. page_read per visited node (block, before the rows), then
     // storageRowRead per scanned row.
     const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound, mask);
-    if (entries === null) return dmlOutcome(ret?.names ?? null, null, meter.accrued); // empty bound
+    if (entries === null) return dmlOutcome(ret?.names ?? null, null, 0, meter.accrued); // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -1476,7 +1479,7 @@ export class Database {
         istore.remove(indexEntryKey(table.columns, def, m.key, m.row));
       }
     }
-    return dmlOutcome(ret?.names ?? null, returned, meter.accrued);
+    return dmlOutcome(ret?.names ?? null, returned, matched.length, meter.accrued);
   }
 
   // executeUpdate is two-phase / all-or-nothing: phase 1 builds and type-checks every
@@ -1584,7 +1587,7 @@ export class Database {
     // residual filter below. page_read per visited node (block, before the rows), then
     // storageRowRead per scanned row.
     const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound, mask);
-    if (entries === null) return dmlOutcome(ret?.names ?? null, null, meter.accrued); // empty bound
+    if (entries === null) return dmlOutcome(ret?.names ?? null, null, 0, meter.accrued); // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -1687,7 +1690,7 @@ export class Database {
         }
       }
     }
-    return dmlOutcome(ret?.names ?? null, returned, meter.accrued);
+    return dmlOutcome(ret?.names ?? null, returned, updates.length, meter.accrued);
   }
 
   // executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query
@@ -3927,12 +3930,18 @@ function cloneStores(stores: Map<string, TableStore>): Map<string, TableStore> {
 
 // dmlOutcome wraps a DML statement's completion: a query result projecting the returned rows
 // when a RETURNING clause was resolved (retNames non-null — grammar.md §32; zero affected
-// rows is an EMPTY query result, never a bare statement), else a bare statement result.
-function dmlOutcome(retNames: string[] | null, returned: Value[][] | null, cost: bigint): Outcome {
+// rows is an EMPTY query result, never a bare statement), else a bare statement result
+// carrying the affected-row count (spec/design/api.md §4).
+function dmlOutcome(
+  retNames: string[] | null,
+  returned: Value[][] | null,
+  affected: number,
+  cost: bigint,
+): Outcome {
   if (retNames !== null) {
     return { kind: "query", columnNames: retNames, rows: returned ?? [], cost };
   }
-  return { kind: "statement", cost };
+  return { kind: "statement", cost, rowsAffected: affected };
 }
 
 // resolveProjections resolves SELECT items into evaluable projections (any result type is

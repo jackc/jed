@@ -35,6 +35,12 @@ type Outcome struct {
 	ColumnNames []string
 	Rows        [][]Value
 	Cost        int64
+	// RowsAffected is how many rows a DML statement (INSERT/UPDATE/DELETE without
+	// RETURNING) touched — PostgreSQL's command-tag count (spec/design/api.md §4).
+	// HasRowsAffected distinguishes a DML statement that matched nothing (0, true)
+	// from DDL and transaction control, which have no row count (0, false).
+	RowsAffected    int64
+	HasRowsAffected bool
 }
 
 // DefaultPageSize is the default serialization page size (8 KiB — spec/design/storage.md §3),
@@ -1232,7 +1238,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		if err != nil {
 			return Outcome{}, err
 		}
-		return dmlOutcome(retNames, returned, meter.Accrued), nil
+		return dmlOutcome(retNames, returned, int64(len(q.rows)), meter.Accrued), nil
 	}
 
 	// VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
@@ -1317,7 +1323,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	if err != nil {
 		return Outcome{}, err
 	}
-	return dmlOutcome(retNames, returned, meter.Accrued), nil
+	return dmlOutcome(retNames, returned, int64(len(rows)), meter.Accrued), nil
 }
 
 // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -1569,15 +1575,16 @@ func (db *Database) projectReturning(nodes []*rExpr, rows []Row, others []Row, p
 
 // dmlOutcome wraps a DML statement's completion: a query result projecting the returned rows
 // when a RETURNING clause was resolved (retNames non-nil — grammar.md §32; zero affected
-// rows is an EMPTY query result, never a bare statement), else a bare statement result.
-func dmlOutcome(retNames []string, returned [][]Value, cost int64) Outcome {
+// rows is an EMPTY query result, never a bare statement), else a bare statement result
+// carrying the affected-row count (spec/design/api.md §4).
+func dmlOutcome(retNames []string, returned [][]Value, affected int64, cost int64) Outcome {
 	if retNames != nil {
 		if returned == nil {
 			returned = [][]Value{}
 		}
 		return Outcome{Kind: OutcomeQuery, ColumnNames: retNames, Rows: returned, Cost: cost}
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: cost}
+	return Outcome{Kind: OutcomeStatement, Cost: cost, RowsAffected: affected, HasRowsAffected: true}
 }
 
 // executeDelete analyzes and runs a DELETE: resolve the table and optional predicate,
@@ -1673,7 +1680,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		if empty {
 			// A provably-empty bound affects zero rows — with RETURNING that is still a
 			// query result (empty rows), never a bare statement (grammar.md §32).
-			return dmlOutcome(retNames, nil, meter.Accrued), nil
+			return dmlOutcome(retNames, nil, 0, meter.Accrued), nil
 		}
 		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
 			return Outcome{}, err
@@ -1735,7 +1742,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 			}
 		}
 	}
-	return dmlOutcome(retNames, returned, meter.Accrued), nil
+	return dmlOutcome(retNames, returned, int64(len(matched)), meter.Accrued), nil
 }
 
 // executeUpdate analyzes and runs an UPDATE. Two-phase / all-or-nothing: phase 1
@@ -1896,7 +1903,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		if empty {
 			// A provably-empty bound affects zero rows — with RETURNING that is still a
 			// query result (empty rows), never a bare statement (grammar.md §32).
-			return dmlOutcome(retNames, nil, meter.Accrued), nil
+			return dmlOutcome(retNames, nil, 0, meter.Accrued), nil
 		}
 		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
 			return Outcome{}, err
@@ -2072,7 +2079,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			}
 		}
 	}
-	return dmlOutcome(retNames, returned, meter.Accrued), nil
+	return dmlOutcome(retNames, returned, int64(len(updates)), meter.Accrued), nil
 }
 
 // RowsInKeyOrder returns a table's rows in primary-key (encoded byte) order in the visible snapshot,

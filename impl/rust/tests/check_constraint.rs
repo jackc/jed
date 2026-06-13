@@ -276,19 +276,19 @@ fn check_evaluation_is_metered() {
     let mut db = db_with(&["CREATE TABLE c (a int CHECK (a > 0))"]);
     // One interior node (>) × one row.
     match execute(&mut db, "INSERT INTO c VALUES (1)").unwrap() {
-        Outcome::Statement { cost } => assert_eq!(cost, 1),
+        Outcome::Statement { cost, .. } => assert_eq!(cost, 1),
         other => panic!("expected a statement outcome, got {other:?}"),
     }
     // Two rows × one node.
     match execute(&mut db, "INSERT INTO c VALUES (2), (3)").unwrap() {
-        Outcome::Statement { cost } => assert_eq!(cost, 2),
+        Outcome::Statement { cost, .. } => assert_eq!(cost, 2),
         other => panic!("expected a statement outcome, got {other:?}"),
     }
     // UPDATE: full scan of 3 rows. Baseline without the check would be page_read(1) +
     // 3×storage_row_read + 3×(a + 1 eval) = 7; the check adds one more eval per updated
     // row → 10.
     match execute(&mut db, "UPDATE c SET a = a + 1").unwrap() {
-        Outcome::Statement { cost } => assert_eq!(cost, 10),
+        Outcome::Statement { cost, .. } => assert_eq!(cost, 10),
         other => panic!("expected a statement outcome, got {other:?}"),
     }
     // The ceiling aborts mid-validation deterministically.

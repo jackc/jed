@@ -1,5 +1,5 @@
 OK (cost 0)
-OK (cost 0)
+OK, 3 rows (cost 0)
 id,name,score
 1,"a,b",1.50
 2,"say ""hi""",

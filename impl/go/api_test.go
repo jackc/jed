@@ -219,3 +219,57 @@ func TestTableNamesListsTablesSortedExcludingIndexes(t *testing.T) {
 		t.Fatalf("post-rollback TableNames() = %v, want %v", got, want)
 	}
 }
+
+func TestRowsAffectedReportsDMLCounts(t *testing.T) {
+	// The affected-row count (api.md §4): INSERT/UPDATE/DELETE without RETURNING report
+	// how many rows they touched (PostgreSQL's command-tag count); a DML statement that
+	// matched nothing reports (0, true); DDL and transaction control report (0, false);
+	// DML with RETURNING is a query outcome (its row count is the result's length).
+	db := NewDatabase()
+	affected := func(sql string) (int64, bool) {
+		t.Helper()
+		out, err := Execute(db, sql)
+		if err != nil {
+			t.Fatalf("%q: %v", sql, err)
+		}
+		if out.Kind != OutcomeStatement {
+			t.Fatalf("%q: expected a statement outcome", sql)
+		}
+		return out.RowsAffected, out.HasRowsAffected
+	}
+
+	if n, ok := affected("CREATE TABLE t (id int32 PRIMARY KEY, v int32)"); ok || n != 0 {
+		t.Fatalf("DDL: got (%d, %v) want (0, false)", n, ok)
+	}
+	if n, ok := affected("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)"); !ok || n != 3 {
+		t.Fatalf("INSERT: got (%d, %v) want (3, true)", n, ok)
+	}
+	if n, ok := affected("UPDATE t SET v = v + 1 WHERE id <= 2"); !ok || n != 2 {
+		t.Fatalf("UPDATE: got (%d, %v) want (2, true)", n, ok)
+	}
+	if n, ok := affected("DELETE FROM t WHERE id = 3"); !ok || n != 1 {
+		t.Fatalf("DELETE: got (%d, %v) want (1, true)", n, ok)
+	}
+	if n, ok := affected("DELETE FROM t WHERE id = 99"); !ok || n != 0 {
+		t.Fatalf("zero-match DELETE: got (%d, %v) want (0, true)", n, ok)
+	}
+	if n, ok := affected("BEGIN"); ok || n != 0 {
+		t.Fatalf("BEGIN: got (%d, %v) want (0, false)", n, ok)
+	}
+	if n, ok := affected("COMMIT"); ok || n != 0 {
+		t.Fatalf("COMMIT: got (%d, %v) want (0, false)", n, ok)
+	}
+
+	// INSERT ... SELECT counts the inserted rows; DML with RETURNING is a Query.
+	mustExec(t, db, "CREATE TABLE dst (id int32 PRIMARY KEY)")
+	if n, ok := affected("INSERT INTO dst SELECT id FROM t"); !ok || n != 2 {
+		t.Fatalf("INSERT ... SELECT: got (%d, %v) want (2, true)", n, ok)
+	}
+	out, err := Execute(db, "DELETE FROM dst RETURNING id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Kind != OutcomeQuery || len(out.Rows) != 2 {
+		t.Fatalf("RETURNING must yield a query outcome with 2 rows, got kind=%v rows=%d", out.Kind, len(out.Rows))
+	}
+}
