@@ -5075,6 +5075,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
         | Expr::IntervalLiteral(_)
+        | Expr::TimestampLiteral { .. }
         | Expr::Param(_) => false,
         Expr::Cast { inner, .. } => expr_has_aggregate(inner),
         Expr::Unary { operand, .. } => expr_has_aggregate(operand),
@@ -5134,7 +5135,8 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
         Expr::Column(_)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
-        | Expr::IntervalLiteral(_) => Ok(()),
+        | Expr::IntervalLiteral(_)
+        | Expr::TimestampLiteral { .. } => Ok(()),
         Expr::Cast { inner, .. } => reject_check_structure(inner),
         Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
             reject_check_structure(operand)
@@ -5192,7 +5194,10 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
         };
         match e {
             Expr::Column(name) | Expr::QualifiedColumn { name, .. } => note(name),
-            Expr::Literal(_) | Expr::IntervalLiteral(_) | Expr::Param(_) => {}
+            Expr::Literal(_)
+            | Expr::IntervalLiteral(_)
+            | Expr::TimestampLiteral { .. }
+            | Expr::Param(_) => {}
             Expr::Cast { inner, .. } => walk(inner, columns, out),
             Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
                 walk(operand, columns, out)
@@ -6147,6 +6152,23 @@ fn resolve(
             RExpr::ConstInterval(parse_interval(s)?),
             ResolvedType::Interval,
         )),
+        // `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` — keyword-introduced datetime literals
+        // (spec/design/timestamp.md §6, grammar.md §36). The keyword names the type, so the literal
+        // carries it in any expression position. Parsed at resolve by the same code as the
+        // bare-string adaptation (22007 malformed / 22008 field-or-range overflow), context-free.
+        Expr::TimestampLiteral { value, with_tz } => {
+            if *with_tz {
+                Ok((
+                    RExpr::ConstTimestamptz(parse_timestamptz(value)?),
+                    ResolvedType::Timestamptz,
+                ))
+            } else {
+                Ok((
+                    RExpr::ConstTimestamp(parse_timestamp(value)?),
+                    ResolvedType::Timestamp,
+                ))
+            }
+        }
         // A subquery in expression position (spec/design/grammar.md §26): PLANNED ONCE against the
         // scope chain here, so its column-count / type errors fire even over an empty outer.
         // `plan_subquery` rejects a non-SELECT context and a `$N` inside (both 0A000). The fold

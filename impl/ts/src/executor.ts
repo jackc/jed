@@ -4416,6 +4416,14 @@ function resolve(
       // INTERVAL '...' — a keyword-introduced interval literal (spec/design/interval.md §3).
       // Parsed at resolve (22007 malformed / 22008 field overflow), independent of context.
       return { node: { kind: "constInterval", value: parseInterval(e.text) }, type: { kind: "interval" } };
+    case "timestampLiteral":
+      // TIMESTAMP '...' / TIMESTAMPTZ '...' — keyword-introduced datetime literals
+      // (spec/design/timestamp.md §6, grammar.md §36). The keyword names the type, so the literal
+      // carries it in any expression position. Parsed at resolve by the same code as the
+      // bare-string adaptation (22007 / 22008), context-free.
+      return e.withTz
+        ? { node: { kind: "constTimestamptz", value: parseTimestamptz(e.text) }, type: { kind: "timestamptz" } }
+        : { node: { kind: "constTimestamp", value: parseTimestamp(e.text) }, type: { kind: "timestamp" } };
     case "literal":
       switch (e.literal.kind) {
         case "null":

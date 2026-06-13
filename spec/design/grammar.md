@@ -1506,3 +1506,50 @@ scalar function, `42883`), **`LATERAL`**, the **column-alias-list** form `AS g(c
 (`0A000` — a `(` after the alias), and non-integer variants (numeric/timestamp). The integer
 forms and their PostgreSQL edge cases (NULL arg → zero rows, step zero → `22023`, overflow →
 clean stop) are spec'd in [functions.md](functions.md) §10.
+
+## 36. Keyword-introduced typed literals (`INTERVAL` / `TIMESTAMP` / `TIMESTAMPTZ` `'…'`)
+
+A `primary` may be a **keyword-introduced typed literal** — a type-naming keyword immediately
+followed by a single-quoted string ([grammar.ebnf](../grammar/grammar.ebnf) `typed_literal`):
+
+```
+typed_literal ::= ( "INTERVAL" | "TIMESTAMP" | "TIMESTAMPTZ" ) string
+```
+
+The keyword **names the type**, so the literal carries that type in **any** expression position
+— independent of any surrounding context. This is the *context-free* counterpart to a bare
+single-quoted string adapting to a datetime/interval column (§5; [timestamp.md](timestamp.md) §3/§6,
+[interval.md](interval.md) §3): `SELECT TIMESTAMP '2024-01-01 12:00:00'` and `SELECT INTERVAL
+'1 day'` resolve with no column or sibling to take their type from, and `TIMESTAMP '2024-01-31'
++ INTERVAL '1 month'` is timestamp arithmetic spelled entirely with literals. The string is the
+same text the bare-string adaptation accepts, parsed by the **same** code at resolve time — so a
+malformed literal traps `22007` and a field/range overflow `22008` (interval: `22008`), *before*
+any scan ([timestamp.md](timestamp.md) §7, [interval.md](interval.md) §3).
+
+- **`TIMESTAMP '…'`** is `timestamp` (zoneless); **`TIMESTAMPTZ '…'`** is `timestamptz` (an
+  offset in the string normalizes to UTC). They are distinct families that never reconcile
+  ([timestamp.md](timestamp.md) §1).
+- **`INTERVAL '…'`** is `interval`, parsed by the "unit + time" subset ([interval.md](interval.md) §3).
+
+**Disambiguation — the keywords stay non-reserved (§3).** `INTERVAL` / `TIMESTAMP` /
+`TIMESTAMPTZ` introduce a literal **only** when the *next* token is a string; otherwise the word
+is an ordinary identifier, so a column named `timestamp` (or `interval`) still parses
+(`SELECT timestamp FROM t`, `SELECT interval + 1 FROM t`). This is the one-token lookahead used
+for `CAST` / `EXISTS` / function names — a §8 cross-core determinism surface, byte-identical
+across the three hand-written parsers.
+
+**Documented divergences from PostgreSQL** (we own our surface, CLAUDE.md §1):
+
+- jed uses the **canonical single-word** type names. PG also accepts the multi-word
+  `TIMESTAMP WITH TIME ZONE '…'` / `TIMESTAMP WITHOUT TIME ZONE '…'` spellings; jed does not (it
+  accepts no multi-word type name anywhere — a column is `timestamptz`, not `timestamp with time
+  zone`), so those forms are not typed literals here. Spell `timestamptz` with the one-word
+  keyword.
+- The **precision typmod** form `TIMESTAMP(p) '…'` / `INTERVAL '…' (p)` is **not** accepted as a
+  literal — `timestamp(p)` precision is deferred everywhere ([timestamp.md](timestamp.md) §6;
+  accepted-but-ignored on a column, absent on a literal). Always full microsecond precision.
+- **ISO-8601 / SQL-standard combined interval forms** inside `INTERVAL '…'` remain deferred
+  ([interval.md](interval.md) §3) — a parse-subset gap, not a literal-syntax one.
+
+`DATE '…'` / `TIME '…'` are absent because those types are not in the scalar set; a CAST-style
+typed literal for the other scalars (`DECIMAL '…'`, etc.) is not part of this surface.

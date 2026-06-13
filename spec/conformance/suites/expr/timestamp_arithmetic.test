@@ -2,8 +2,8 @@
 # adds months first WITH DAY-OF-MONTH CLAMPING (Jan 31 + 1 month -> Feb 28/29), then days (24 h
 # each — jed has no zones), then micros; ±infinity stays ±infinity. interval + timestamp[tz]
 # commutes. timestamp[tz] − timestamp[tz] -> interval, justified into days + time (months = 0); an
-# infinite operand traps 22008. jed has no context-free timestamp literal (the timestamp slice
-# deferred it), so the timestamp operands come from stored columns.
+# infinite operand traps 22008. The timestamp operands here come from stored columns; the
+# context-free TIMESTAMP '...' literal (grammar.md §36) is exercised by expr/timestamp_literal.test.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, types.int32, types.timestamp, types.timestamptz, types.interval, expr.timestamp_arithmetic
 
 statement ok

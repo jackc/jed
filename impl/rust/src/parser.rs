@@ -1380,6 +1380,22 @@ impl Parser {
             }
             unreachable!("peeked a string literal after INTERVAL");
         }
+        // `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` — keyword-introduced datetime literals
+        // (grammar.md §36), the context-free counterpart to a bare string adapting to a datetime
+        // column. Recognized only when a string literal follows, so `timestamp` / `timestamptz`
+        // stay usable as column / function names (same one-token lookahead as the INTERVAL form).
+        if matches!(
+            self.peek_keyword().as_deref(),
+            Some("timestamp") | Some("timestamptz")
+        ) && matches!(self.tokens.get(self.pos + 1), Some(Token::Str(_)))
+        {
+            let with_tz = self.peek_keyword().as_deref() == Some("timestamptz");
+            self.advance(); // TIMESTAMP / TIMESTAMPTZ
+            if let Token::Str(s) = self.advance() {
+                return Ok(Expr::TimestampLiteral { value: s, with_tz });
+            }
+            unreachable!("peeked a string literal after TIMESTAMP/TIMESTAMPTZ");
+        }
         if self.peek_keyword().as_deref() == Some("case") {
             self.advance();
             // Simple form has an operand between CASE and the first WHEN; the searched form

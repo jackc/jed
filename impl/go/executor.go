@@ -5933,6 +5933,23 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstInterval, cIv: iv}, resolvedType{kind: rtInterval}, nil
+	case ExprTimestampLiteral:
+		// TIMESTAMP '...' / TIMESTAMPTZ '...' — keyword-introduced datetime literals
+		// (spec/design/timestamp.md §6, grammar.md §36). The keyword names the type, so the literal
+		// carries it in any expression position. Parsed at resolve by the same code as the
+		// bare-string adaptation (22007 / 22008), context-free.
+		if e.TimestampWithTZ {
+			m, err := ParseTimestamptz(e.TimestampText)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			return &rExpr{kind: reConstTimestamptz, cInt: m}, resolvedType{kind: rtTimestamptz}, nil
+		}
+		m, err := ParseTimestamp(e.TimestampText)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstTimestamp, cInt: m}, resolvedType{kind: rtTimestamp}, nil
 	case ExprScalarSubquery:
 		// A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so
 		// its column-count / type errors fire even over an empty outer. planSubquery rejects a

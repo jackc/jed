@@ -1,0 +1,120 @@
+# Context-free TIMESTAMP '...' / TIMESTAMPTZ '...' typed literals (spec/design/grammar.md §36,
+# timestamp.md §6). The keyword names the type, so the literal carries timestamp / timestamptz in
+# ANY expression position with no column or sibling to adapt from — unlike a bare single-quoted
+# string, which stays text without a datetime context. The string is parsed by the SAME code as
+# the bare-string adaptation, so the field rules and the 22007 (malformed) / 22008 (field-or-range
+# overflow) codes are identical, at resolve time before any scan. TIMESTAMP is zoneless (an offset
+# in the string is accepted and ignored); TIMESTAMPTZ normalizes the offset to UTC then renders
+# +00. The keywords stay non-reserved: a column named `timestamp` / `interval` still resolves.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, types.int32, types.timestamp, types.timestamptz, types.interval, expr.timestamp_arithmetic
+
+# context-free: a TIMESTAMP literal in the select list, no column to adapt from
+query T nosort
+SELECT TIMESTAMP '2024-01-31 12:00:00'
+----
+2024-01-31 12:00:00
+
+# a date-only literal defaults the time to 00:00:00
+query T nosort
+SELECT TIMESTAMP '2024-06-15'
+----
+2024-06-15 00:00:00
+
+# TIMESTAMP is zoneless: an offset in the string is accepted and IGNORED (the wall clock stands)
+query T nosort
+SELECT TIMESTAMP '2024-06-15 08:30:00+05'
+----
+2024-06-15 08:30:00
+
+# fractional seconds survive (trailing zeros trimmed)
+query T nosort
+SELECT TIMESTAMP '2024-01-01 00:00:00.25'
+----
+2024-01-01 00:00:00.25
+
+# a BC-era literal: displayed year via astro = 1 - displayed, rendered back with the BC suffix
+query T nosort
+SELECT TIMESTAMP '0001-01-01 00:00:00 BC'
+----
+0001-01-01 00:00:00 BC
+
+# the infinity sentinel as a context-free literal
+query T nosort
+SELECT TIMESTAMP 'infinity'
+----
+infinity
+
+# TIMESTAMPTZ normalizes the offset to UTC (utc = wallclock - offset) and renders +00
+query T nosort
+SELECT TIMESTAMPTZ '2024-06-15 08:30:00+05'
+----
+2024-06-15 03:30:00+00
+
+# TIMESTAMPTZ with Z == +00
+query T nosort
+SELECT TIMESTAMPTZ '2024-06-15 03:30:00Z'
+----
+2024-06-15 03:30:00+00
+
+# the RHS bare string adapts to the LHS literal's timestamp context (the comparison drives it)
+query B nosort
+SELECT TIMESTAMP '2024-01-31 12:00:00' = '2024-01-31 12:00:00'
+----
+true
+
+# ordering literals: the earlier instant is less
+query B nosort
+SELECT TIMESTAMP '2024-01-01 00:00:00' < TIMESTAMP '2024-12-31 23:59:59'
+----
+true
+
+# literal-driven timestamp arithmetic (previously impossible without a stored column):
+# month-add clamps Jan 31 -> Feb 29 (2024 is a leap year)
+query T nosort
+SELECT TIMESTAMP '2024-01-31' + INTERVAL '1 month'
+----
+2024-02-29 00:00:00
+
+# timestamp - timestamp -> interval, both operands literals
+query T nosort
+SELECT TIMESTAMP '2024-02-01' - TIMESTAMP '2024-01-01'
+----
+31 days
+
+# timestamptz literal arithmetic stays on the UTC instant
+query T nosort
+SELECT TIMESTAMPTZ '2024-06-15 08:30:00+00' - INTERVAL '2 hours'
+----
+2024-06-15 06:30:00+00
+
+# disambiguation: TIMESTAMP / INTERVAL stay non-reserved — a column may be named `timestamp`
+statement ok
+CREATE TABLE kw (timestamp int32 PRIMARY KEY, interval int32)
+
+statement ok
+INSERT INTO kw VALUES (7, 9), (3, 4)
+
+# a bare `timestamp` / `interval` (no following string) is a column reference, not a literal
+query II nosort
+SELECT timestamp, interval FROM kw ORDER BY timestamp
+----
+3
+4
+7
+9
+
+# a malformed literal traps 22007 at resolve, before any scan
+statement error 22007
+SELECT TIMESTAMP 'not a timestamp'
+
+# an out-of-range field traps 22008 (month 13)
+statement error 22008
+SELECT TIMESTAMP '2024-13-01 00:00:00'
+
+# a malformed TIMESTAMPTZ literal likewise traps 22007
+statement error 22007
+SELECT TIMESTAMPTZ 'garbage'
+
+# the two datetime families do not reconcile: timestamp = timestamptz is 42804
+statement error 42804
+SELECT TIMESTAMP '2024-01-01 00:00:00' = TIMESTAMPTZ '2024-01-01 00:00:00+00'

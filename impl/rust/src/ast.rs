@@ -356,6 +356,15 @@ pub enum Expr {
     /// string adapting by context, the INTERVAL keyword names the type, so it produces an interval
     /// in any expression position (e.g. `SELECT INTERVAL '1 day'`). The string is parsed at resolve.
     IntervalLiteral(String),
+    /// A keyword-introduced `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` literal (the context-free
+    /// counterpart to a bare string adapting to a datetime column — spec/design/timestamp.md §6,
+    /// grammar.md §36). The keyword names the type, so it produces a timestamp[tz] in any
+    /// expression position (e.g. `SELECT TIMESTAMP '2024-01-01'`); `with_tz` selects timestamptz.
+    /// The string is parsed at resolve (22007 malformed / 22008 field-or-range overflow).
+    TimestampLiteral {
+        value: String,
+        with_tz: bool,
+    },
     /// A bind parameter `$N` (1-based index). Like an integer/string literal it is an
     /// *adaptable* operand: its type is inferred from context at resolve (sibling operand,
     /// target column, or CAST target), and the host binds a value at execute time

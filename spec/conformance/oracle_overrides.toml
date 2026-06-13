@@ -202,6 +202,11 @@ sql = "SELECT id FROM m WHERE a = b"
 reason = "jed: timestamp and timestamptz are distinct comparison families — `timestamp = timestamptz` is not comparable (42804, the strict type system §4). PostgreSQL implicitly coerces timestamp to timestamptz (at the session zone) and returns a result."
 
 [[override]]
+file = "expr/timestamp_literal.test"
+sql = "SELECT TIMESTAMP '2024-01-01 00:00:00' = TIMESTAMPTZ '2024-01-01 00:00:00+00'"
+reason = "jed: timestamp and timestamptz are distinct comparison families — `timestamp = timestamptz` is not comparable (42804, the strict type system §4), here spelled with the context-free typed literals (grammar.md §36). PostgreSQL implicitly coerces timestamp to timestamptz (at the session zone) and returns a result. Same divergence as the types/timestamp.test `a = b` case."
+
+[[override]]
 file = "types/timestamptz.test"
 sql = "INSERT INTO t VALUES (10, '2024-01-01 12:00:00+99')"
 reason = "jed: a +99 zone offset is out of range, reported as 22008. PostgreSQL reports the same rejection under 22009 (invalid_time_zone_displacement_value). Both reject; the SQLSTATE subcode differs."

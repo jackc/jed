@@ -396,9 +396,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       type + timestamp arithmetic~~ ✅ **done** (below); date/time functions
       (`now()`/`current_timestamp`, `EXTRACT`, `date_trunc`, `age`); separate `date` / `time` types;
       named-zone `AT TIME ZONE` (needs the host-supplied tz database); timestamp⇄text/date casts;
-      sub-second precision typmods (`timestamp(p)`); a context-free `TIMESTAMP '...'` keyword/cast
-      literal (until then a timestamp literal needs a column context — interval arithmetic with a
-      timestamp uses stored columns).
+      sub-second precision typmods (`timestamp(p)`); ~~a context-free `TIMESTAMP '...'` keyword
+      literal~~ ✅ **done** — the keyword-introduced `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` typed
+      literal (grammar.md §36, the `INTERVAL '...'` pattern) carries the type in any expression
+      position, so timestamp arithmetic is now spellable entirely with literals
+      (`TIMESTAMP '2024-01-31' + INTERVAL '1 month'`); pure parser + resolver (no new storage /
+      catalog / capability — under `types.timestamp` / `types.timestamptz`), pinned by
+      `spec/conformance/suites/expr/timestamp_literal.test` (98/0/0 byte-identical Rust/Go/TS,
+      oracle-clean vs PG 18 with the one `timestamp = timestamptz → 42804` family-mismatch
+      divergence already on the ledger). jed uses the **one-word** keywords only — PG's multi-word
+      `TIMESTAMP WITH TIME ZONE '...'` and the `TIMESTAMP(p) '...'` precision typmod stay deferred.
 - [x] **`interval`** — done & committed across Rust/Go/TS (+ Ruby reference). A span held as
       PostgreSQL's **three independent fields** — `months` (i32), `days` (i32), `micros` (i64) —
       so `+ 1 month` is calendar-aware (Jan 31 + 1 month → Feb 28/29, day clamped) and distinct

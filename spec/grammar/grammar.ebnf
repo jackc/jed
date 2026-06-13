@@ -477,12 +477,25 @@ primary        ::= number
                  | "TRUE" | "FALSE"
                  | "NULL"
                  | parameter
+                 | typed_literal
                  | "CAST" "(" expr "AS" type_name ")"
                  | case_expr
                  | function_call
                  | "EXISTS" "(" query_expr ")"
                  | "(" ( query_expr | expr ) ")"
                  | column_ref
+
+/* A keyword-introduced typed literal (../design/grammar.md §36): a type-naming keyword
+ * IMMEDIATELY followed by a single-quoted string, naming the literal's type so it is
+ * CONTEXT-FREE (carries that type in any expression position) — the counterpart to a bare
+ * string adapting to a datetime/interval column (../design/timestamp.md §3, ../design/interval.md
+ * §3). The string is parsed at resolve by the same code as the adaptation (22007 malformed /
+ * 22008 field-or-range overflow), before any scan. The keywords stay non-reserved (§3): the form
+ * is recognized ONLY when the next token is a string — a ONE-token lookahead, a §8 determinism
+ * surface — so "timestamp"/"interval" remain usable as column / function names otherwise. jed
+ * uses the canonical one-word type names: PG's multi-word "TIMESTAMP WITH TIME ZONE '…'" and the
+ * "TIMESTAMP(p) '…'" precision typmod are NOT accepted (documented divergences, §36). */
+typed_literal  ::= ( "INTERVAL" | "TIMESTAMP" | "TIMESTAMPTZ" ) string
 
 /* A bind parameter — "$" followed by a 1-based decimal index ($1, $2, …). NOT part of
  * the conformance corpus (which is literal-only, ../design/conformance.md §1.2): a

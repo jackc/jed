@@ -1722,6 +1722,15 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		t := p.advance()
 		return Expr{Kind: ExprIntervalLiteral, IntervalText: t.Word}, nil
 	}
+	// `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` — keyword-introduced datetime literals (grammar.md
+	// §36), the context-free counterpart to a bare string adapting to a datetime column. Recognized
+	// only when a string literal follows, so `timestamp` / `timestamptz` stay usable as names.
+	if (p.peekKeyword() == "timestamp" || p.peekKeyword() == "timestamptz") && p.peekKindAt(1) == TokStr {
+		withTZ := p.peekKeyword() == "timestamptz"
+		p.advance() // TIMESTAMP / TIMESTAMPTZ
+		t := p.advance()
+		return Expr{Kind: ExprTimestampLiteral, TimestampText: t.Word, TimestampWithTZ: withTZ}, nil
+	}
 	if p.peekKeyword() == "case" {
 		p.advance()
 		// Simple form has an operand between CASE and the first WHEN; the searched form starts

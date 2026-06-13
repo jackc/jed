@@ -225,6 +225,16 @@ comparable value (always definite).
 - **Literals.** A single-quoted string adapts in a timestamp context (§3) — not a distinct
   token, and not a CAST. With no timestamp context (e.g. `'a' = 'b'` with no datetime column),
   a string literal stays text and compares as text, exactly like `bytea` today.
+- **Keyword-introduced typed literal** (`TIMESTAMP '…'` / `TIMESTAMPTZ '…'`, [grammar.md](grammar.md)
+  §36): the **context-free** counterpart — the keyword names the type, so the literal carries
+  `timestamp` / `timestamptz` in *any* expression position with no column or sibling to adapt
+  from (`SELECT TIMESTAMP '2024-01-01 12:00:00'`, and timestamp arithmetic spelled entirely with
+  literals, `TIMESTAMP '2024-01-31' + INTERVAL '1 month'`). It is a small **parser** addition (a
+  one-token lookahead on a following string, like the `INTERVAL` literal — [interval.md](interval.md)
+  §3); the string is parsed by the **same** `parse_timestamp` / `parse_timestamptz` as §3, so the
+  `22007` / `22008` codes and every field rule are identical. jed uses the canonical one-word
+  keywords only: PG's multi-word `TIMESTAMP WITH TIME ZONE '…'` and the `TIMESTAMP(p) '…'`
+  precision typmod are **not** accepted (documented §36 divergences).
 - **Casts** ([casts.toml](../types/casts.toml)): **deferred**. `CAST(x AS timestamp)`,
   text↔timestamp, and the zone-requiring timestamp↔timestamptz conversion are all later work;
   the latter needs a zone and so never reconciles the two families here.
@@ -232,7 +242,7 @@ comparable value (always definite).
   reuse the fixed-width `int-be-signflip` integer key encoding **verbatim** — and unlike
   text/bytea/decimal it is **exercised** this slice, so a timestamp / timestamptz `PRIMARY KEY`
   is **supported** (the bytes already sort in instant order, infinities included).
-- **On-disk value codec** (type codes **8** / **9**, [format.md](../fileformat/format.md)): the
+- **On-disk value codec** (type codes **9** / **10**, [format.md](../fileformat/format.md)): the
   same 8-byte integer body behind the presence tag.
 - **Cost** ([cost.md](cost.md)): a datetime compare node charges **one** uniform
   `operator_eval`, like integer/text — the `# cost:` contract is unchanged.
@@ -256,7 +266,7 @@ comparable value (always definite).
    only exactly `24:00:00` normalizes. All trap `22008`; malformed syntax `22007`.
 8. **Render trim** — fractional digits appended only when nonzero, trailing zeros trimmed;
    identical zero-padding of every field across cores.
-9. **Two types, one representation** — distinct `Value` variants and type codes (8 vs 9); never
+9. **Two types, one representation** — distinct `Value` variants and type codes (9 vs 10); never
    collapse to the integer variant (results render via `Value::render()`, which needs the type).
    `timestamp × timestamptz` is `42804`.
 10. **Resolve-time parse** — a bad literal in `WHERE` traps before any scan, deterministically,

@@ -1200,6 +1200,18 @@ class Parser {
       const t = this.advance();
       return { kind: "intervalLiteral", text: t.str! };
     }
+    // `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` — keyword-introduced datetime literals (grammar.md
+    // §36), the context-free counterpart to a bare string adapting to a datetime column. Recognized
+    // only when a string literal follows, so `timestamp` / `timestamptz` stay usable as names.
+    if (
+      (this.peekKeyword() === "timestamp" || this.peekKeyword() === "timestamptz") &&
+      this.tokens[this.pos + 1]?.kind === "str"
+    ) {
+      const withTz = this.peekKeyword() === "timestamptz";
+      this.advance(); // TIMESTAMP / TIMESTAMPTZ
+      const t = this.advance();
+      return { kind: "timestampLiteral", text: t.str!, withTz };
+    }
     if (this.peekKeyword() === "cast") {
       this.advance();
       this.expect("lparen");
