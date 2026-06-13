@@ -14,10 +14,9 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 6 # format_version 6: the per-index flags byte (bit0 unique — indexes.md §8),
-# atop the v5 secondary-index catalog reshape (explicit pk ordinal list with column-flag
-# bit0 retired, per-table index list, index B-trees of empty-payload records)
-PAGE_HEADER = 12
+VERSION = 7 # format_version 7: a per-page CRC-32 on every body page (the header grows 12→16
+# bytes — format.md *Version scope*), atop v6's per-index unique flags byte (indexes.md §8)
+PAGE_HEADER = 16 # v7: the 12-byte v6 header (page_type/item_count/next_page) + a 4-byte per-page crc32 at offset 12
 ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
 TXID = 1
 PAGE_CATALOG = 1
@@ -107,7 +106,7 @@ CHECK_TABLE = {
 PK_TABLE = {
   name: "t",
   columns: [col("id", "int32", pk: true), col("v", "int16")],
-  # 20 rows: each record is 14 bytes, so a 256-byte page (cap 244) overflows at 18 rows and
+  # 20 rows: each record is 14 bytes, so a 256-byte page (cap 240, v7) overflows at 18 rows and
   # the tree becomes interior-root + two leaves (the load-bearing interior-node + split proof).
   # id 3 has a NULL value. Inserted in ascending key order (the tree shape is order-sensitive).
   rows: (1..20).map { |i| [i, i == 3 ? nil : i * 10] }
@@ -260,10 +259,10 @@ end
 
 # A table with large INCOMPRESSIBLE text + bytea values that must spill OUT-OF-LINE PLAIN to
 # overflow pages (large-values.md §12). At page_size 256 the per-record cap is
-# RECORD_MAX = (256-12-12)/2 = 116, so a value of ~600/300 bytes exceeds it: compression is
+# RECORD_MAX = (256-16-12)/2 = 114 (v7), so a value of ~600/300 bytes exceeds it: compression is
 # attempted first (Slice B) but rejected by store-smaller (the filler is high-entropy), so the
 # record holds a fixed 0x02 pointer (u32 first_page + u32 len) and the raw bytes live in a chain
-# of page_type-4 slabs (244 bytes each). Row 1's text (600 B → 3 slabs) and bytea (300 B → 2
+# of page_type-4 slabs (240 bytes each). Row 1's text (600 B → 3 slabs) and bytea (300 B → 2
 # slabs) both spill; row 2's values stay inline; row 3 is NULL/NULL. Exercises multi-page chains,
 # multi-column spill, and the inline+external mix in one leaf. The PK stays int32.
 OVERFLOW_TABLE = {
@@ -273,7 +272,7 @@ OVERFLOW_TABLE = {
 }.freeze
 
 # A table with large COMPRESSIBLE values exercising Slice B's forms (large-values.md §13,
-# format.md "Large values", lz4.md). At page_size 256 (RECORD_MAX 116, C = 244):
+# format.md "Large values", lz4.md). At page_size 256 (RECORD_MAX 114, C = 240, v7):
 # row 1's 600-char "x" run compresses to a few bytes → 0x03 inline-compressed text — and its
 # 200-byte 0xAB bytea run → 0x03 inline-compressed bytea (two compressed values, one record);
 # row 2's 400-char half-filler/half-run text compresses to ~200 B — smaller than plain but still
@@ -377,6 +376,13 @@ def crc32(data)
     end
   end
   crc ^ 0xFFFFFFFF
+end
+
+# The per-page checksum (v7, format.md *Page header*): CRC-32/IEEE over a body page's bytes
+# EXCLUDING its own 4-byte crc32 field at [12,16) — i.e. [0,12) then [16,ps). crc32 is linear over
+# the byte stream, so checksumming the concatenation matches the cores' streaming page_crc exactly.
+def page_crc(page)
+  crc32(page.byteslice(0, 12) + page.byteslice(PAGE_HEADER, page.bytesize - PAGE_HEADER))
 end
 
 # int-be-signflip: add bias 2^(bits-1), emit unsigned big-endian (encoding.md).
@@ -704,6 +710,8 @@ def write_page(image, ps, index, type, item_count, next_page, payload)
   image[off + 4, 4] = u32(item_count)
   image[off + 8, 4] = u32(next_page)
   image[off + PAGE_HEADER, payload.bytesize] = payload unless payload.empty?
+  # The per-page checksum (v7) is computed last, over every byte but its own field at [12,16).
+  image[off + 12, 4] = u32(page_crc(image.byteslice(off, ps)))
 end
 
 # --- size-driven B-tree (format.md "The per-table data B-tree") -------------
@@ -921,6 +929,8 @@ def read_page(image, ps, index)
   raise "page index out of range" if off + ps > image.bytesize
 
   p = image.byteslice(off, ps)
+  # Verify the per-page checksum (v7) before trusting any header field (format.md *Page header*).
+  raise "page checksum mismatch (corrupted page)" unless page_crc(p) == p.byteslice(12, 4).unpack1("N")
   { type: p.getbyte(0), item_count: p.byteslice(4, 4).unpack1("N"),
     next_page: p.byteslice(8, 4).unpack1("N"), payload: p.byteslice(PAGE_HEADER, ps - PAGE_HEADER) }
 end

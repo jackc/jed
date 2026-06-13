@@ -223,6 +223,19 @@ sits so the options stay open (CLAUDE.md §9).
   require one for atomicity). The atomicity is **verified at the actual commit points** by the
   **fault-injection seam** (§7): a per-core, test-only one-shot crash/tear armed on the pager,
   with a cross-core recovery matrix asserting that a crash anywhere recovers to a valid snapshot.
+- **At-rest corruption detection** — distinct from crash recovery (which protects the *commit*
+  boundary), this protects a *quiescent* page against bit-rot. Through `format_version` 6 only
+  the two meta slots were checksummed; a flipped bit in any catalog page, B-tree node, or
+  overflow page went undetected and silently produced wrong rows or a panic. **`format_version`
+  7 adds a per-page CRC-32/IEEE to every body page** (the page header grows 12→16 bytes —
+  [../fileformat/format.md](../fileformat/format.md) *Page header*), verified the instant a page
+  is parsed: a mismatch is `data_corrupted` (`XX001`). Because every read funnels through that
+  parse — the demand-paged leaf fault and the open-time free-list reachability walk included —
+  corruption of a catalog/interior/overflow page is caught at **open** and a leaf the moment it
+  faults. It is **not** end-to-end integrity (a malicious rewriter can recompute the CRC; that is
+  the encryption-at-rest / authenticated-page door below, not this), and it is **not** metered
+  (physical I/O, invisible to `page_read` cost). A dedicated per-core corruption test
+  complements the fault-injection matrix.
 - **Alternative physical layouts & direct-access API** — kept open (§5), not scheduled.
 - **Encryption at rest (file-level)** — kept open, not built (CLAUDE.md §9). The block seam
   (§2) is the natural insertion point: an encrypting host — or a thin layer just above it —

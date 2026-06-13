@@ -47,8 +47,9 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 6; // on-disk format version (6 = the per-index unique flags byte, indexes.md §8)
-const PAGE_HEADER = 12; // bytes of the catalog/B-tree page header
+const FORMAT_VERSION = 7; // on-disk format version (7 = a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
+const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
+const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
 const PAGE_INTERIOR = 3; // page_type for a B-tree interior node
@@ -129,11 +130,11 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
   }
 }
 
-// crc32Ieee is CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the
-// standard zlib CRC32, hand-rolled so no dependency is needed. Pinned by the vector
-// crc32("123456789") === 0xCBF43926. `>>> 0` keeps the result an unsigned 32-bit value.
-export function crc32Ieee(data: Uint8Array): number {
-  let crc = 0xffffffff;
+// crc32Update folds data into a running CRC-32/IEEE register (reflected, poly 0xEDB88320)
+// WITHOUT the final XOR, so it composes: crc32Update(crc32Update(0xFFFFFFFF, a), b) over a split
+// buffer equals folding a‖b. Both crc32Ieee and the split pageCrc build on it. `>>> 0` keeps the
+// running value an unsigned 32-bit number (feeding it back through `^` is bit-identical anyway).
+function crc32Update(crc: number, data: Uint8Array): number {
   for (const b of data) {
     crc ^= b;
     for (let i = 0; i < 8; i++) {
@@ -141,7 +142,23 @@ export function crc32Ieee(data: Uint8Array): number {
       crc = (crc >>> 1) ^ (0xedb88320 & mask);
     }
   }
-  return (crc ^ 0xffffffff) >>> 0;
+  return crc >>> 0;
+}
+
+// crc32Ieee is CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the
+// standard zlib CRC32, hand-rolled so no dependency is needed. Pinned by the vector
+// crc32("123456789") === 0xCBF43926.
+export function crc32Ieee(data: Uint8Array): number {
+  return (crc32Update(0xffffffff, data) ^ 0xffffffff) >>> 0;
+}
+
+// pageCrc is the per-page checksum (v7, format.md *Page header*): CRC-32/IEEE over a body page's
+// bytes EXCLUDING its own 4-byte crc32 field at [12,16) — i.e. [0,12) then [16,pageSize), covering
+// the header, payload, and zero-fill tail. makePage writes it; parsePage/readPage re-verify it
+// (mismatch → XX001). page is one full page (pageSize bytes).
+function pageCrc(page: Uint8Array): number {
+  const c = crc32Update(0xffffffff, page.subarray(0, 12));
+  return (crc32Update(c, page.subarray(PAGE_HEADER)) ^ 0xffffffff) >>> 0;
 }
 
 // encodeValue is the value codec (format.md): a 1-byte presence tag (0x01 = NULL), then the
@@ -256,7 +273,7 @@ function isSpillable(ty: ScalarType): boolean {
 // contract — RECORD_MAX = (C-12)/2 where C = capacity is the page payload (format.md "Why the record
 // cap"). The spill planner reduces a record to ≤ this by externalizing values.
 function recordMaxFor(capacity: number): number {
-  return Math.max(0, Math.floor((capacity - PAGE_HEADER) / 2));
+  return Math.max(0, Math.floor((capacity - INTERIOR_RESERVE) / 2));
 }
 
 // A value's planned on-disk disposition (large-values.md §2/§12/§13).
@@ -1271,6 +1288,8 @@ function makePage(
   dv.setUint32(4, itemCount, false);
   dv.setUint32(8, nextPage, false);
   p.set(payload, PAGE_HEADER);
+  // The per-page checksum (v7) is computed last, over every byte but its own field at [12,16).
+  dv.setUint32(12, pageCrc(p), false);
   return p;
 }
 
@@ -1374,6 +1393,10 @@ function readPage(image: Uint8Array, dv: DataView, ps: number, index: number): P
   if (off + ps > image.length) {
     throw engineError("data_corrupted", "page index out of range");
   }
+  // Verify the per-page checksum (v7) before trusting any header field (format.md *Page header*).
+  if (pageCrc(image.subarray(off, off + ps)) !== dv.getUint32(off + 12, false)) {
+    throw engineError("data_corrupted", "page checksum mismatch (corrupted page)");
+  }
   return {
     pageType: image[off]!,
     itemCount: dv.getUint32(off + 4, false),
@@ -1396,6 +1419,10 @@ function pageBlock(image: Uint8Array, ps: number, index: number): Uint8Array {
 function parsePage(block: Uint8Array): Page {
   if (block.length < PAGE_HEADER) throw engineError("data_corrupted", "page shorter than its header");
   const dv = new DataView(block.buffer, block.byteOffset, block.byteLength);
+  // Verify the per-page checksum (v7) before trusting any header field (format.md *Page header*).
+  if (pageCrc(block) !== dv.getUint32(12, false)) {
+    throw engineError("data_corrupted", "page checksum mismatch (corrupted page)");
+  }
   return {
     pageType: block[0]!,
     itemCount: dv.getUint32(4, false),

@@ -19,7 +19,7 @@ import { errCode, fillerText } from "./util.ts";
 const PAGE_SIZE = 256;
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)
 
-// One row per stored form at ps=256 (RECORD_MAX 116, cap 244): id 1 external-plain
+// One row per stored form at ps=256 (RECORD_MAX 114, cap 240, v7): id 1 external-plain
 // (incompressible 600-char filler → a 3-page chain), id 2 external-compressed (half filler /
 // half run → the ~212-byte block spills to a 1-page chain), id 3 inline-compressed (a
 // 600-char run), id 4 plain inline.
@@ -31,16 +31,36 @@ function seed(db: Database): void {
   execute(db, `INSERT INTO t VALUES (1, '${plain}'), (2, '${extc}'), (3, '${inlc}'), (4, 'tiny')`);
 }
 
-// Overwrite every overflow page's payload with 0xFF, keeping the 12-byte header (page_type /
-// item_count / next_page) intact — so the header-only chain walk still works but any read of
-// the chain's bytes yields garbage (non-UTF-8 for a plain text payload, a malformed block for
-// a compressed one).
+// The v7 per-page checksum (format.md *Page header*) — replicated here (like fillerText) so the
+// corruption below can stay checksum-valid: CRC-32/IEEE over the page minus its own 4-byte field
+// at [12,16).
+function pageCrc(page: Uint8Array): number {
+  let crc = 0xffffffff;
+  const feed = (b: number): void => {
+    crc ^= b;
+    for (let i = 0; i < 8; i++) {
+      const mask = -(crc & 1);
+      crc = (crc >>> 1) ^ (0xedb88320 & mask);
+    }
+  };
+  for (let i = 0; i < 12; i++) feed(page[i]!);
+  for (let i = 16; i < page.length; i++) feed(page[i]!);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+// Overwrite every overflow page's payload (offset 16+, v7) with 0xFF, keeping the 16-byte header
+// (page_type / item_count / next_page) intact — so the header-only chain walk still works — then
+// recompute the v7 per-page CRC so the page stays checksum-valid. This isolates the decode-time
+// failure (non-UTF-8 / malformed LZ4 block) from the per-page checksum: a checksum-inconsistent
+// corruption is instead caught at open (the dedicated test in checksum.test.ts).
 function corruptOverflowPayloads(path: string): void {
   const bytes = readFileSync(path);
   let corrupted = 0;
   for (let i = 2; (i + 1) * PAGE_SIZE <= bytes.length; i++) {
     if (bytes[i * PAGE_SIZE] === PAGE_OVERFLOW) {
-      bytes.fill(0xff, i * PAGE_SIZE + 12, (i + 1) * PAGE_SIZE);
+      bytes.fill(0xff, i * PAGE_SIZE + 16, (i + 1) * PAGE_SIZE);
+      const page = bytes.subarray(i * PAGE_SIZE, (i + 1) * PAGE_SIZE);
+      new DataView(page.buffer, page.byteOffset, page.byteLength).setUint32(12, pageCrc(page), false);
       corrupted++;
     }
   }

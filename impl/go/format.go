@@ -21,15 +21,16 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion uint16 = 6               // on-disk format version (6 = the per-index unique flags byte, indexes.md §8)
-	pageHeader           = 12              // bytes of the catalog/B-tree page header
-	pageCatalog   byte   = 1               // page_type for a catalog page
-	pageLeaf      byte   = 2               // page_type for a B-tree leaf node
-	pageInterior  byte   = 3               // page_type for a B-tree interior node
-	pageOverflow  byte   = 4               // page_type for an out-of-line value slab (large-values.md §12)
-	rootPage      uint32 = 2               // catalog root of a fresh empty db (relocatable thereafter)
-	minPageSize          = pageHeader + 36 // smallest valid page size (page + 36-byte meta header; format.md)
-	maxPageSize          = 65536           // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
+	formatVersion   uint16 = 7               // on-disk format version (7 = a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
+	pageHeader             = 16              // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
+	interiorReserve        = 12              // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
+	pageCatalog     byte   = 1               // page_type for a catalog page
+	pageLeaf        byte   = 2               // page_type for a B-tree leaf node
+	pageInterior    byte   = 3               // page_type for a B-tree interior node
+	pageOverflow    byte   = 4               // page_type for an out-of-line value slab (large-values.md §12)
+	rootPage        uint32 = 2               // catalog root of a fresh empty db (relocatable thereafter)
+	minPageSize            = pageHeader + 36 // smallest valid page size (page + 36-byte meta header; format.md)
+	maxPageSize            = 65536           // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
 
 	// Value-codec presence tags beyond 0x00 present-inline-plain / 0x01 NULL (large-values.md
 	// §12/§13; format.md "Large values"): 0x02 external-plain (u32 first_page + u32 payload_len),
@@ -105,11 +106,10 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 	}
 }
 
-// crc32IEEE is CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the
-// standard zlib CRC32, hand-rolled so no dependency is needed. Pinned by the vector
-// crc32("123456789") == 0xCBF43926.
-func crc32IEEE(data []byte) uint32 {
-	crc := uint32(0xFFFFFFFF)
+// crc32Update folds data into a running CRC-32/IEEE register (reflected, poly 0xEDB88320)
+// WITHOUT the final XOR, so it composes: crc32Update(crc32Update(0xFFFFFFFF, a), b) over a
+// split buffer equals folding a‖b. Both crc32IEEE and the split pageCRC build on it.
+func crc32Update(crc uint32, data []byte) uint32 {
 	for _, b := range data {
 		crc ^= uint32(b)
 		for i := 0; i < 8; i++ {
@@ -117,7 +117,22 @@ func crc32IEEE(data []byte) uint32 {
 			crc = (crc >> 1) ^ (0xEDB88320 & mask)
 		}
 	}
-	return ^crc
+	return crc
+}
+
+// crc32IEEE is CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the
+// standard zlib CRC32, hand-rolled so no dependency is needed. Pinned by the vector
+// crc32("123456789") == 0xCBF43926.
+func crc32IEEE(data []byte) uint32 {
+	return ^crc32Update(0xFFFFFFFF, data)
+}
+
+// pageCRC is the per-page checksum (v7, format.md *Page header*): CRC-32/IEEE over a body page's
+// bytes EXCLUDING its own 4-byte crc32 field at [12,16) — i.e. [0,12) then [16,pageSize), covering
+// the header, payload, and zero-fill tail. makePage writes it; parsePage re-verifies it (mismatch →
+// XX001). page is one full page (pageSize bytes).
+func pageCRC(page []byte) uint32 {
+	return ^crc32Update(crc32Update(0xFFFFFFFF, page[0:12]), page[pageHeader:])
 }
 
 // encodeValue is the value codec (format.md): a 1-byte presence tag (0x01 = NULL), then
@@ -1006,7 +1021,7 @@ func isSpillable(ty ScalarType) bool {
 // contract — RECORD_MAX = (C-12)/2 where C = capacity is the page payload (format.md "Why the
 // record cap"). The spill planner reduces a record to ≤ this by externalizing values.
 func recordMaxFor(capacity int) int {
-	m := (capacity - pageHeader) / 2
+	m := (capacity - interiorReserve) / 2
 	if m < 0 {
 		m = 0
 	}
@@ -1430,6 +1445,8 @@ func makePage(ps int, pageType byte, itemCount, nextPage uint32, payload []byte)
 	binary.BigEndian.PutUint32(p[4:], itemCount)
 	binary.BigEndian.PutUint32(p[8:], nextPage)
 	copy(p[pageHeader:], payload)
+	// The per-page checksum (v7) is computed last, over every byte but its own field at [12,16).
+	binary.BigEndian.PutUint32(p[12:], pageCRC(p))
 	return p
 }
 
@@ -1539,6 +1556,11 @@ type page struct {
 func parsePage(block []byte) (page, error) {
 	if len(block) < pageHeader {
 		return page{}, NewError(DataCorrupted, "page shorter than its header")
+	}
+	// Verify the per-page checksum (v7) before trusting any header field — a mismatch is silent
+	// at-rest corruption (format.md *Page header*; storage.md §6).
+	if pageCRC(block) != binary.BigEndian.Uint32(block[12:16]) {
+		return page{}, NewError(DataCorrupted, "page checksum mismatch (corrupted page)")
 	}
 	return page{
 		pageType:  block[0],

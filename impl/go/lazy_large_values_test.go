@@ -11,6 +11,7 @@ package jed
 // impl/ts/tests/lazy_large_values.test.ts. Uses fillerText from fileformat_golden_test.go.
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,10 +34,11 @@ func lazySeed(t *testing.T, db *Database) {
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s'), (2, '%s'), (3, '%s'), (4, 'tiny')", plain, extc, inlc))
 }
 
-// corruptOverflowPayloads overwrites every overflow page's payload with 0xFF, keeping the
-// 12-byte header (page_type / item_count / next_page) intact — so the header-only chain walk
-// still works but any read of the chain's bytes yields garbage (non-UTF-8 for a plain text
-// payload, a malformed block for a compressed one).
+// corruptOverflowPayloads overwrites every overflow page's payload (offset 16+, v7) with 0xFF,
+// keeping the 16-byte header (page_type / item_count / next_page) intact — so the header-only chain
+// walk still works — then recomputes the v7 per-page CRC so the page stays checksum-valid. This
+// isolates the decode-time failure (non-UTF-8 / malformed LZ4 block) from the per-page checksum: a
+// checksum-inconsistent corruption is instead caught at open (crash_recovery_test.go's checksum case).
 func corruptOverflowPayloads(t *testing.T, path string) {
 	t.Helper()
 	bytes, err := os.ReadFile(path)
@@ -46,9 +48,11 @@ func corruptOverflowPayloads(t *testing.T, path string) {
 	corrupted := 0
 	for i := 2; (i+1)*lazyPageSize <= len(bytes); i++ {
 		if bytes[i*lazyPageSize] == pageOverflow {
-			for j := i*lazyPageSize + 12; j < (i+1)*lazyPageSize; j++ {
+			for j := i*lazyPageSize + pageHeader; j < (i+1)*lazyPageSize; j++ {
 				bytes[j] = 0xFF
 			}
+			page := bytes[i*lazyPageSize : (i+1)*lazyPageSize]
+			binary.BigEndian.PutUint32(page[12:16], pageCRC(page))
 			corrupted++
 		}
 	}

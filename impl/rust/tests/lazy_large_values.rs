@@ -61,10 +61,27 @@ fn seed(db: &mut Database) {
     .unwrap();
 }
 
-/// Overwrite every overflow page's **payload** with 0xFF, keeping the 12-byte header
-/// (page_type / item_count / next_page) intact — so the header-only chain walk still works
-/// but any read of the chain's bytes yields garbage (non-UTF-8 for a plain text payload, a
-/// malformed block for a compressed one).
+/// The v7 per-page checksum (spec/fileformat/format.md *Page header*) — replicated here (like
+/// `filler_text`) so the corruption below can stay checksum-**valid**: CRC-32/IEEE over the page
+/// minus its own 4-byte field at `[12, 16)`.
+fn page_crc(page: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in page[0..12].iter().chain(&page[16..]) {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Overwrite every overflow page's **payload** (offset 16+, v7) with 0xFF, keeping the 16-byte
+/// header (page_type / item_count / next_page) intact — so the header-only chain walk still works
+/// — then **recompute the v7 per-page CRC** so the page stays checksum-valid. This isolates the
+/// decode-time failure (non-UTF-8 for a plain text payload, a malformed LZ4 block for a compressed
+/// one) from the per-page checksum: a checksum-*inconsistent* corruption is instead caught at open
+/// (the dedicated test in checksum.rs). Any read of the chain's bytes still yields garbage.
 fn corrupt_overflow_payloads(path: &std::path::Path) {
     let mut bytes = std::fs::read(path).unwrap();
     let ps = PAGE_SIZE as usize;
@@ -72,9 +89,11 @@ fn corrupt_overflow_payloads(path: &std::path::Path) {
     let mut corrupted = 0;
     for i in 2..pages {
         if bytes[i * ps] == 4 {
-            for b in &mut bytes[i * ps + 12..(i + 1) * ps] {
+            for b in &mut bytes[i * ps + 16..(i + 1) * ps] {
                 *b = 0xFF;
             }
+            let crc = page_crc(&bytes[i * ps..(i + 1) * ps]);
+            bytes[i * ps + 12..i * ps + 16].copy_from_slice(&crc.to_be_bytes());
             corrupted += 1;
         }
     }

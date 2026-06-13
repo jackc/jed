@@ -390,10 +390,14 @@ biases below are where an overriding reason *does* steer away from PG.
   (`format_version` 4 — the catalog check list, `spec/design/constraints.md` §4),
   **secondary indexes** (`format_version` 5 — the catalog reshape: an explicit primary-key
   ordinal list in key order plus per-table index lists, each index an on-disk B-tree of
-  empty-payload records, `spec/design/indexes.md`), and **UNIQUE constraints**
+  empty-payload records, `spec/design/indexes.md`), **UNIQUE constraints**
   (`format_version` 6 — a per-index flags byte carrying the `unique` bit; a UNIQUE
   constraint IS its backing unique index, `spec/design/constraints.md` §5 /
-  `spec/design/indexes.md` §8). **Still deferred**
+  `spec/design/indexes.md` §8), and **per-page checksums** (`format_version` 7 — the page
+  header grows 12→16 bytes for a CRC-32/IEEE on **every** body page, so silent at-rest
+  corruption of a catalog/node/overflow page is detected as `XX001` on read rather than
+  served as wrong rows; through v6 only the meta slots were checksummed —
+  `spec/fileformat/format.md` *Page header*, `spec/design/storage.md` §6). **Still deferred**
   (later Phase-6, none foreclosed): continuous within-session reclamation + on-disk free-list
   persistence (the P6.2 follow-ons). The from-scratch whole-image serializer survives as
   `create`'s initial write and the golden generator.

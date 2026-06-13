@@ -122,10 +122,11 @@ files diverge.
 An externalized value's bytes live in a **chain of overflow pages**, a new page kind alongside
 the leaf/interior nodes:
 
-- **New `page_type = 4` (overflow).** It reuses the existing 12-byte page header
-  ([format.md](../fileformat/format.md) *Page header*): `next_page` chains to the continuation
-  page (`0` terminates); a length field records how many payload bytes this page carries (a tail
-  page is partially filled). The remaining `C − 12` bytes hold a slab of the value.
+- **New `page_type = 4` (overflow).** It reuses the standard 16-byte page header (v7 —
+  [format.md](../fileformat/format.md) *Page header*, including the per-page `crc32`):
+  `next_page` chains to the continuation page (`0` terminates); a length field records how many
+  payload bytes this page carries (a tail page is partially filled). The remaining `C` bytes (=
+  `page_size − 16`) hold a slab of the value, and the page's CRC protects the slab like any other.
 - **The chain is filled deterministically:** the value's bytes (compressed or raw) are split
   into `C − 12`-byte slabs in order, one per page, the last partial. No per-core freedom in how
   bytes are partitioned — the layout is a §8 byte contract like everything else on disk.

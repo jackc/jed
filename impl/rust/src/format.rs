@@ -1,9 +1,9 @@
 //! On-disk single-file format: serialize / load (spec/fileformat/format.md).
 //!
-//! `format_version` 5 — the page-backed copy-on-write B-tree (Phase 6, P6.1; v3 added large-value
+//! `format_version` 7 — the page-backed copy-on-write B-tree (Phase 6, P6.1; v3 added large-value
 //! overflow/compression, v4 the catalog CHECK-constraint list, v5 the secondary-index catalog
-//! reshape — explicit pk ordinal list, per-table index list, index B-trees of empty-payload
-//! records, spec/design/indexes.md §6): each table's rows are
+//! reshape, v6 the per-index unique flags byte, v7 a per-page CRC-32 on every body page — the
+//! header grows 12→16 bytes, spec/fileformat/format.md *Version scope*): each table's rows are
 //! an on-disk B-tree (leaf + interior node pages), the catalog is a relocatable page chain, and
 //! `to_image` lays the whole tree out post-order (the from-scratch image the goldens pin; the
 //! incremental dirty-page commit reuses the same node codec — storage.md §4). The byte layout is the
@@ -29,10 +29,16 @@ use crate::value::{Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 3 = + out-of-line overflow pages for large values (large-values.md §12).
-const FORMAT_VERSION: u16 = 6;
-/// Bytes of the page header on catalog / B-tree pages.
-const PAGE_HEADER: usize = 12;
+/// On-disk format version — 7 = a per-page CRC-32 on every body page (the header grows 12→16
+/// bytes; spec/fileformat/format.md *Version scope*). v6 added the per-index unique flags byte.
+const FORMAT_VERSION: u16 = 7;
+/// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
+/// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
+const PAGE_HEADER: usize = 16;
+/// Bytes reserved inside `RECORD_MAX` for a two-key interior node's three child pointers (`4·3`)
+/// — **independent of `PAGE_HEADER`** (spec/fileformat/format.md "Why the record cap"). Both were
+/// 12 through v6; v7 widened the header to 16 but this reserve stays 12.
+const INTERIOR_RESERVE: usize = 12;
 /// Smallest valid page size: the 36-byte meta header (plus the page header) must fit
 /// (spec/fileformat/format.md *Page model*). Below it a file cannot hold its own meta.
 const MIN_PAGE_SIZE: usize = PAGE_HEADER + 36;
@@ -108,11 +114,10 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
     }
 }
 
-/// CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the standard
-/// zlib CRC32, hand-rolled so no runtime dependency is needed. Pinned by the vector
-/// `crc32("123456789") == 0xCBF43926`.
-fn crc32_ieee(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
+/// Fold `data` into a running CRC-32/IEEE register (reflected, poly 0xEDB88320), **without** the
+/// final XOR — so it composes: `crc32_update(crc32_update(0xFFFF_FFFF, a), b)` over a split buffer
+/// equals folding `a ‖ b`. Both `crc32_ieee` and the split [`page_crc`] build on it.
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
         for _ in 0..8 {
@@ -120,7 +125,25 @@ fn crc32_ieee(data: &[u8]) -> u32 {
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
         }
     }
-    !crc
+    crc
+}
+
+/// CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the standard
+/// zlib CRC32, hand-rolled so no runtime dependency is needed. Pinned by the vector
+/// `crc32("123456789") == 0xCBF43926`.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    !crc32_update(0xFFFF_FFFF, data)
+}
+
+/// The per-page checksum (v7, spec/fileformat/format.md *Page header*): CRC-32/IEEE over a body
+/// page's bytes **excluding its own 4-byte `crc32` field** at `[12, 16)` — i.e. `[0, 12)` then
+/// `[16, page_size)`, covering the header, payload, and zero-fill tail. `make_page` writes it;
+/// `parse_page` re-verifies it (mismatch → `XX001`). `page` is one full page (`page_size` bytes).
+fn page_crc(page: &[u8]) -> u32 {
+    !crc32_update(
+        crc32_update(0xFFFF_FFFF, &page[0..12]),
+        &page[PAGE_HEADER..],
+    )
 }
 
 /// The value codec (spec/fileformat/format.md): a 1-byte presence tag (`0x01` = NULL),
@@ -211,7 +234,7 @@ pub(crate) fn any_spillable_masked(col_types: &[ScalarType], mask: &[bool]) -> b
 /// `RECORD_MAX = (C-12)/2` where `C = cap` is the page payload (spec/fileformat/format.md
 /// "Why the record cap"). The spill planner reduces a record to ≤ this by externalizing values.
 fn record_max(cap: usize) -> usize {
-    cap.saturating_sub(PAGE_HEADER) / 2
+    cap.saturating_sub(INTERIOR_RESERVE) / 2
 }
 
 /// A value's planned on-disk disposition (spec/design/large-values.md §2/§12/§13). The compressed
@@ -1487,6 +1510,9 @@ fn make_page(ps: usize, page_type: u8, item_count: u32, next_page: u32, payload:
     p[4..8].copy_from_slice(&item_count.to_be_bytes());
     p[8..12].copy_from_slice(&next_page.to_be_bytes());
     p[PAGE_HEADER..PAGE_HEADER + payload.len()].copy_from_slice(payload);
+    // The per-page checksum (v7) is computed last, over every byte but its own field at [12,16).
+    let crc = page_crc(&p);
+    p[12..16].copy_from_slice(&crc.to_be_bytes());
     p
 }
 
@@ -1586,6 +1612,12 @@ struct Page<'a> {
 fn parse_page(block: &[u8]) -> Result<Page<'_>> {
     if block.len() < PAGE_HEADER {
         return Err(corrupt("page shorter than its header"));
+    }
+    // Verify the per-page checksum (v7) before trusting any header field — a mismatch is silent
+    // at-rest corruption (spec/fileformat/format.md *Page header*; storage.md §6).
+    let stored = u32::from_be_bytes([block[12], block[13], block[14], block[15]]);
+    if page_crc(block) != stored {
+        return Err(corrupt("page checksum mismatch (corrupted page)"));
     }
     Ok(Page {
         page_type: block[0],

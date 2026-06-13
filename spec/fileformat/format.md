@@ -15,15 +15,35 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 6)
+## Version scope (`format_version` 7)
 
-The current on-disk version is **`format_version` 6** — the per-index **flags byte**
-carrying the `unique` bit ([../design/indexes.md §8](../design/indexes.md),
-[../design/constraints.md §5](../design/constraints.md)). Each version is a **clean
+The current on-disk version is **`format_version` 7** — a **per-page checksum on every
+body page** (catalog / B-tree node / overflow), the on-disk-integrity layer that lets the
+loader **detect silent corruption** of a live page rather than returning wrong results or
+panicking ([../design/storage.md §6](../design/storage.md)). Each version is a **clean
 break** — older versions are **not read** (we are pre-1.0 and owe no on-disk
 compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only** version
-6. One change: each catalog index entry gains an `index_flags` u8 between its key
-ordinals and its root page — bit0 `unique`, the rest reserved (written 0, read-validated).
+7. Two coupled changes:
+
+1. The **page header grows from 12 to 16 bytes** — a `crc32` (u32) is appended after
+   `next_page` (*Page header* below). Through v6 only the meta slots were checksummed; a
+   bit flip in any other page went undetected. Now **every** body page carries a
+   CRC-32/IEEE over its own bytes, verified the instant the page is parsed (`XX001` on
+   mismatch) — including the open-time reachability walk, so corruption of a catalog page,
+   an interior node, or an overflow chain is caught at **open**, and a leaf the moment it
+   faults in.
+2. Because the header is 4 bytes wider, the page payload `C = page_size − 16` shrinks by 4
+   and the byte layout of every multi-record page shifts (`RECORD_MAX` falls from 116 to
+   114 at the 256-byte fixture size). The **`− 12` inside `RECORD_MAX`** is *unchanged* — it
+   reserves three interior child pointers (`4·3`), which is independent of the header width
+   (it merely coincided with the old 12-byte header). The meta page (its own 36-byte layout
+   and CRC over `[0, 32)`) is **untouched** except for the `format_version` value.
+
+`format_version` 6 was the per-index **flags byte** carrying the `unique` bit
+([../design/indexes.md §8](../design/indexes.md),
+[../design/constraints.md §5](../design/constraints.md)): each catalog index entry gained
+an `index_flags` u8 between its key ordinals and its root page — bit0 `unique`, the rest
+reserved (written 0, read-validated).
 
 `format_version` 5 was the **secondary-index catalog reshape**
 ([../design/indexes.md](../design/indexes.md)). Three changes:
@@ -95,7 +115,7 @@ reclamation + on-disk free-list persistence (the P6.2 follow-ons).
 
 The file is a flat array of fixed-size **pages**; the page size is a format parameter
 recorded in the meta page (**default 8192**; the golden fixtures use **256** so the hex stays
-reviewable). It must lie in **`[48, 65536]`**: the minimum is `PAGE_HEADER + 36` (below it the
+reviewable). It must lie in **`[52, 65536]`**: the minimum is `PAGE_HEADER + 36` (below it the
 36-byte meta header does not fit), the maximum is `MAX_PAGE_SIZE = 65536` (64 KiB). A core
 **rejects** a page size outside this range — `0A000` when serializing (`create`), `XX001` when
 reading a file's meta (`open`). The maximum bounds the largest single page allocation: without
@@ -106,14 +126,17 @@ is zero-filled to exactly `page_size`. Two page-payload capacities derive from t
 recur throughout:
 
 ```
-C          = page_size - 12       # PAGE_HEADER; the bytes a page body may hold
+C          = page_size - 16       # PAGE_HEADER (v7); the bytes a page body may hold
 RECORD_MAX = (C - 12) / 2 (floor) # the largest a single B-tree record may serialize to
 ```
 
-The `- 12` inside `RECORD_MAX` reserves room for a **two-key interior** node's three child
-pointers (`4·3`): it makes `2·RECORD_MAX + 12 ≤ C`, so a two-record node — leaf *or* interior —
-**never** overflows. Overflow therefore happens only at `N ≥ 3` keys, which is what lets every
-split be a clean 2-way with two non-empty halves (see *Why the record cap* below).
+The `- 16` in `C` is the **v7 page header** (12-byte v6 header + a 4-byte per-page `crc32`).
+The `- 12` inside `RECORD_MAX` is a **separate** quantity — room for a **two-key interior**
+node's three child pointers (`4·3`) — and is unchanged across versions (through v6 it
+coincided with the header width; v7 widened the header but not this reserve). It makes
+`2·RECORD_MAX + 12 ≤ C`, so a two-record node — leaf *or* interior — **never** overflows.
+Overflow therefore happens only at `N ≥ 3` keys, which is what lets every split be a clean
+2-way with two non-empty halves (see *Why the record cap* below).
 
 | page index | role |
 |---|---|
@@ -163,17 +186,30 @@ then overwrites slot 0).
 reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
 slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
 
-## Page header (catalog and B-tree pages, 12 bytes)
+## Page header (catalog and B-tree pages, 16 bytes — v7)
 
 | offset | size | field |
 |---|---|---|
-| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior** |
+| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow |
 | 1 | 1 | reserved (0) |
 | 2 | 2 | reserved (0) |
 | 4 | 4 | `item_count` (u32) — entries (catalog) / keys `N` (B-tree node) on this page |
-| 8 | 4 | `next_page` (u32) — **catalog only**: next page of the chain, or 0. B-tree nodes write `0` here (a node is reached by a child pointer, not a chain). |
+| 8 | 4 | `next_page` (u32) — **catalog / overflow only**: next page of the chain, or 0. B-tree nodes write `0` here (a node is reached by a child pointer, not a chain). |
+| 12 | 4 | `crc32` (u32) — **new in v7**: CRC-32/IEEE over the page bytes *excluding this field* — i.e. `[0, 12)` then `[16, page_size)`, covering the header, the payload, and the zero-fill tail |
 
-The payload follows immediately and is zero-filled to `page_size`.
+The payload follows at offset **16** and is zero-filled to `page_size`.
+
+**Per-page checksum (v7).** Every body page (catalog `1`, leaf `2`, interior `3`, overflow
+`4`) carries a `crc32` over all its own bytes except the 4-byte field itself. It uses the
+**same CRC-32/IEEE** routine and polynomial as the meta slot (below). A reader computes the
+checksum the instant it parses a page and rejects a mismatch as `data_corrupted` (`XX001`).
+Because *every* page read funnels through one parse — including the demand-paged leaf fault
+and the open-time free-list reachability walk (which follows catalog and overflow chains by
+header) — a single-bit flip in any live page is **detected**, not silently served. The
+checksum is part of physical page I/O and is **not** a metered cost unit (it is invisible to
+the deterministic `page_read` cost, like the buffer pool — [../design/cost.md](../design/cost.md),
+CLAUDE.md §13). The zero-fill tail is covered too: a committed page's tail is always zero, so
+the CRC is a deterministic function of the page's logical content (a §8 byte contract).
 
 ## Catalog (relocatable page chain rooted at `root_page`)
 
@@ -333,8 +369,8 @@ reclamation rule below applies to an index tree unchanged.
 values are **compressed** and/or **spill out-of-line** (the *Large values* section), so the
 *stored* record (with pointers) falls back under `RECORD_MAX`. Only a record that can't be reduced
 below the cap even after compressing and externalizing every spillable value remains a write-side
-`feature_not_supported` (**`0A000`**). At the 8192 default, `RECORD_MAX = 4084`; the 256-byte
-fixtures cap a stored record at 116 bytes, which is what makes `overflow_table.jed`'s ~600/300-byte
+`feature_not_supported` (**`0A000`**). At the 8192 default, `RECORD_MAX = 4082` (v7); the 256-byte
+fixtures cap a stored record at 114 bytes, which is what makes `overflow_table.jed`'s ~600/300-byte
 values spill.
 
 ### Leaf node (`page_type = 2`)
@@ -577,9 +613,12 @@ only its **dirty** pages, then publishing the new root. The §2 atomicity rests 
 
 A crash between steps 3 and 5 leaves the prior meta valid (its body pages are intact — copy-on-
 write never overwrote them), so the database opens at the prior snapshot; the freshly written
-body pages are simply unreferenced. A torn meta write at step 4 is caught by the checksum and
+body pages are simply unreferenced. A torn meta write at step 4 is caught by the meta checksum and
 falls back to the other slot. Either way the file is never corrupt — it is always a valid
-snapshot, the new one or the immediately prior one (storage.md §4, transactions.md §9). This is
+snapshot, the new one or the immediately prior one (storage.md §4, transactions.md §9). **Bit-rot
+of an at-rest body page** — distinct from a crash — is caught separately by the **per-page
+checksum** (v7, *Page header* above): the page's CRC fails to verify the instant it is parsed, so
+a damaged catalog/node/overflow page surfaces as `XX001` rather than wrong rows. This is
 **verified at each of steps 1–5** by the fault-injection seam (storage.md §7): a test-only one-shot
 crash/tear armed on the pager, exercising mid-body, between-syncs, and torn-meta-write points with a
 cross-core recovery matrix.
