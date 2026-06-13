@@ -186,7 +186,12 @@ tui-textarea) · **results grid** (bottom right) · **status bar** (bottom) · a
   Ctrl+Enter) runs the buffer through the splitter; statements execute sequentially,
   stopping at the first error. The message line carries the last statement's tag
   (`OK (cost C)` / `N rows (cost C)`) or the error that stopped the batch; the grid
-  shows the **last** query result.
+  shows the **last** query result. **`Tab` autocompletes** the word at the cursor from
+  the live catalog (table names, column names — completed in canonical spelling) plus
+  the grammar's keywords/type/function names (case-styled after the typed prefix): one
+  match completes inline, several open a popup at the cursor (`↑`/`↓` select,
+  `Enter`/`Tab` accept, `Esc` closes, any other key closes and types). At a non-word
+  position `Tab` stays an ordinary tab.
 - **Results grid**: scrollable on both axes when focused (arrows / PgUp / PgDn / Home /
   End); header row pinned; cells via `Value::render()`, NULL dimmed. Footer:
   `N rows · cost C` (wall time may appear here, clearly cosmetic — it never appears in
@@ -217,8 +222,9 @@ live in shared modules exercised by the script-mode tests).
 
 ## 8. Future (not v1)
 
-Editor autocomplete from the catalog · SQL syntax highlighting.
+SQL syntax highlighting.
 (Landed since v1: affected-row counts in `Outcome` — the `OK, N rows` footer of §5 —
+editor autocomplete from the catalog (§6) —
 `--readonly` (§3), the `box`/`markdown` formats (§5), `-o` output redirection (§3) —
 a built-in pager is deliberately out; the TUI grid pages interactively, scripts pipe —
 CSV import/export: `--import-csv` in, `--format csv` + `-o` out (§3) — and the

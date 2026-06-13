@@ -3,6 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tui_textarea::TextArea;
 
+use super::complete;
 use super::grid::Grid;
 use super::history::History;
 use super::schema::SchemaPane;
@@ -22,6 +23,15 @@ pub struct Message {
     pub is_error: bool,
 }
 
+/// The open autocomplete popup (cli.md §6): the filtered candidates, the highlighted one,
+/// and how many characters of the word were already typed (replaced on accept, so a
+/// candidate completes in its canonical spelling).
+pub struct Completion {
+    pub items: Vec<String>,
+    pub sel: usize,
+    pub prefix_chars: usize,
+}
+
 pub struct App {
     pub session: Session,
     pub editor: TextArea<'static>,
@@ -34,6 +44,7 @@ pub struct App {
     pub history_sel: usize,
     pub help_open: bool,
     pub show_schema: bool,
+    pub completion: Option<Completion>,
     pub quit: bool,
 }
 
@@ -55,6 +66,7 @@ impl App {
             history_sel: 0,
             help_open: false,
             show_schema: true,
+            completion: None,
             quit: false,
         }
     }
@@ -114,12 +126,42 @@ impl App {
         }
 
         match self.focus {
-            Focus::Editor => match key.code {
-                KeyCode::Esc => self.focus = Focus::Results,
-                _ => {
-                    self.editor.input(key);
+            Focus::Editor => {
+                // The completion popup (cli.md §6) swallows its navigation keys; any
+                // other key closes it and is processed normally below.
+                if self.completion.is_some() {
+                    match key.code {
+                        KeyCode::Up => {
+                            let c = self.completion.as_mut().expect("popup open");
+                            c.sel = c.sel.saturating_sub(1);
+                            return;
+                        }
+                        KeyCode::Down => {
+                            let c = self.completion.as_mut().expect("popup open");
+                            if c.sel + 1 < c.items.len() {
+                                c.sel += 1;
+                            }
+                            return;
+                        }
+                        KeyCode::Enter | KeyCode::Tab => {
+                            self.accept_completion();
+                            return;
+                        }
+                        KeyCode::Esc => {
+                            self.completion = None;
+                            return;
+                        }
+                        _ => self.completion = None,
+                    }
                 }
-            },
+                match key.code {
+                    KeyCode::Esc => self.focus = Focus::Results,
+                    KeyCode::Tab if !ctrl => self.trigger_completion(key),
+                    _ => {
+                        self.editor.input(key);
+                    }
+                }
+            }
             Focus::Results => match key.code {
                 KeyCode::Tab => {
                     self.focus = if self.show_schema {
@@ -177,10 +219,50 @@ impl App {
         }
     }
 
+    /// Tab in the editor (cli.md §6): at a partial word, complete it from the catalog +
+    /// grammar words — directly when one candidate matches, via the popup when several
+    /// do. At a non-word position the key stays an ordinary Tab.
+    fn trigger_completion(&mut self, key: KeyEvent) {
+        let (row, col) = self.editor.cursor();
+        let (_, prefix) = complete::current_word(&self.editor.lines()[row], col);
+        let items = complete::candidates(&self.session.db, &prefix);
+        match items.len() {
+            0 => {
+                self.editor.input(key);
+            }
+            1 => self.replace_word(prefix.chars().count(), &items[0].clone()),
+            _ => {
+                self.completion = Some(Completion {
+                    items,
+                    sel: 0,
+                    prefix_chars: prefix.chars().count(),
+                });
+            }
+        }
+    }
+
+    /// Accept the highlighted candidate: replace the typed prefix with the candidate's
+    /// canonical spelling (so `use<Tab>` becomes `Users`, not `users`).
+    fn accept_completion(&mut self) {
+        let Some(c) = self.completion.take() else {
+            return;
+        };
+        let candidate = c.items[c.sel].clone();
+        self.replace_word(c.prefix_chars, &candidate);
+    }
+
+    fn replace_word(&mut self, prefix_chars: usize, candidate: &str) {
+        for _ in 0..prefix_chars {
+            self.editor.delete_char();
+        }
+        self.editor.insert_str(candidate);
+    }
+
     /// Run the editor buffer: split, execute sequentially, stop at the first error
     /// (cli.md §6). The grid shows the LAST query result; the message line carries the
     /// final statement tag or the error.
     fn run_buffer(&mut self) {
+        self.completion = None;
         let text = self.editor.lines().join("\n");
         let stmts = match splitter::split(&text) {
             Ok(stmts) => stmts,
@@ -227,5 +309,90 @@ impl App {
 
     fn set_message(&mut self, text: String, is_error: bool) {
         self.message = Some(Message { text, is_error });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jed::{Database, execute};
+
+    fn app() -> App {
+        let mut db = Database::new();
+        execute(
+            &mut db,
+            "CREATE TABLE Users (id int32 PRIMARY KEY, score int32)",
+        )
+        .unwrap();
+        execute(&mut db, "CREATE TABLE selections (sel int32 PRIMARY KEY)").unwrap();
+        App::new(Session::new(db, "memory".to_string()))
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for ch in s.chars() {
+            press(app, KeyCode::Char(ch));
+        }
+    }
+
+    fn editor_text(app: &App) -> String {
+        app.editor.lines().join("\n")
+    }
+
+    #[test]
+    fn tab_completes_a_unique_word_in_canonical_spelling() {
+        let mut a = app();
+        type_str(&mut a, "SELECT * FROM use");
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(editor_text(&a), "SELECT * FROM Users");
+        assert!(a.completion.is_none());
+    }
+
+    #[test]
+    fn tab_opens_a_popup_for_multiple_candidates() {
+        let mut a = app();
+        type_str(&mut a, "sel");
+        press(&mut a, KeyCode::Tab);
+        let c = a.completion.as_ref().expect("popup open");
+        assert_eq!(c.items, vec!["selections", "select"]);
+        // Down selects the keyword; Enter accepts it, replacing the typed prefix.
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(editor_text(&a), "select");
+        assert!(a.completion.is_none());
+    }
+
+    #[test]
+    fn esc_closes_the_popup_and_typing_falls_through() {
+        let mut a = app();
+        type_str(&mut a, "sel");
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.completion.is_none());
+        assert_eq!(editor_text(&a), "sel"); // Esc closed the popup, not the editor focus
+        assert_eq!(a.focus as usize, Focus::Editor as usize);
+
+        // A non-navigation key closes the popup and is processed as input.
+        press(&mut a, KeyCode::Tab);
+        assert!(a.completion.is_some());
+        press(&mut a, KeyCode::Char('x'));
+        assert!(a.completion.is_none());
+        assert_eq!(editor_text(&a), "selx");
+    }
+
+    #[test]
+    fn tab_at_a_non_word_position_stays_a_tab() {
+        let mut a = app();
+        type_str(&mut a, "SELECT ");
+        press(&mut a, KeyCode::Tab);
+        assert!(a.completion.is_none());
+        assert!(
+            editor_text(&a).len() > "SELECT ".len(),
+            "Tab should insert whitespace: {:?}",
+            editor_text(&a)
+        );
     }
 }

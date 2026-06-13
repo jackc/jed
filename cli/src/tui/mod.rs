@@ -3,6 +3,7 @@
 //! layer holds no execution logic — script mode and the TUI share `Session`.
 
 mod app;
+mod complete;
 mod draw;
 mod grid;
 mod history;

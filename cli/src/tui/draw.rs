@@ -35,6 +35,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_message(frame, app, message_area);
     draw_grid(frame, app, grid_area);
     draw_status(frame, app, status);
+    draw_completion(frame, app, editor_area);
 
     if app.help_open {
         draw_help(frame);
@@ -106,6 +107,44 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
             .border_style(border_style(focused)),
     );
     frame.render_widget(&app.editor, area);
+}
+
+/// The autocomplete popup (cli.md §6), anchored just below the editor's cursor (clamped
+/// to the frame). Selection inverted; Tab/Enter accepts, Esc closes (app.rs).
+fn draw_completion(frame: &mut Frame, app: &App, editor_area: Rect) {
+    let Some(c) = &app.completion else { return };
+    if app.focus != Focus::Editor || c.items.is_empty() {
+        return;
+    }
+    let inner = Block::bordered().inner(editor_area);
+    let (row, col) = app.editor.cursor();
+    let width = (c.items.iter().map(|i| i.len()).max().unwrap_or(0) as u16 + 2).clamp(8, 32);
+    let height = (c.items.len() as u16).min(8);
+    let frame_area = frame.area();
+    let x = (inner.x + col as u16).min(frame_area.width.saturating_sub(width));
+    let mut y = inner.y + row as u16 + 1; // below the cursor line...
+    if y + height > frame_area.height {
+        y = (inner.y + row as u16).saturating_sub(height); // ...or above when out of room
+    }
+    let area = Rect::new(x, y, width, height.max(1));
+
+    frame.render_widget(Clear, area);
+    let lines: Vec<Line> = c
+        .items
+        .iter()
+        .enumerate()
+        .skip(c.sel.saturating_sub(height as usize - 1)) // keep the selection visible
+        .take(height as usize)
+        .map(|(i, item)| {
+            let style = if i == c.sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().bg(Color::DarkGray)
+            };
+            Line::styled(format!(" {item:w$}", w = width as usize - 2), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_message(frame: &mut Frame, app: &App, area: Rect) {
@@ -217,6 +256,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
 const HELP: &[&str] = &[
     "Ctrl+Enter / F5   run the editor buffer (statements end with ;)",
+    "Tab (editor)      autocomplete the word at the cursor (catalog + keywords)",
     "Esc               leave the editor (then Tab cycles panes)",
     "Tab / Shift+Tab   cycle focus: results → schema → editor",
     "Ctrl+R            statement history (Enter loads into the editor)",
