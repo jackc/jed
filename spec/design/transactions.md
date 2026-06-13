@@ -150,8 +150,9 @@ own implicit single-statement transaction:
 ### 4.2 Explicit transaction blocks
 
 `BEGIN [TRANSACTION] [READ ONLY | READ WRITE]` (also `START TRANSACTION …`; default access
-mode **READ WRITE**) opens an explicit block; subsequent statements run within it until it
-ends:
+mode **READ WRITE** — on a **read-only handle** the default flips to READ ONLY and an explicit
+READ WRITE is `25006`, PostgreSQL hot-standby behavior, api.md §2.1) opens an explicit block;
+subsequent statements run within it until it ends:
 
 - **`COMMIT`** (`COMMIT [TRANSACTION|WORK]`, `END`) publishes + makes durable (§9) and returns
   to autocommit. Committing a **failed** block (§6) performs a `ROLLBACK` instead (PostgreSQL).

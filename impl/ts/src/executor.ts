@@ -300,6 +300,12 @@ export class Database {
   // it. A handle setting (not stored in the file), set by setMaxCost; the primary guard for safely
   // evaluating untrusted, user-supplied queries.
   maxCost: bigint;
+  // readOnly marks a handle opened read-only (spec/design/api.md §2.1, OpenOptions.readOnly). A
+  // read-only handle behaves like PostgreSQL hot standby: every transaction defaults to READ ONLY,
+  // an explicit READ WRITE request and any write statement are 25006, and the file is opened
+  // without write access, so it is never written. Always false for an in-memory or
+  // normally-opened database.
+  readOnly: boolean;
 
   constructor() {
     this.committed = new Snapshot();
@@ -311,6 +317,7 @@ export class Database {
     this.persistHook = null;
     this.paging = null;
     this.maxCost = 0n;
+    this.readOnly = false;
   }
 
   // setMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
@@ -438,6 +445,15 @@ export class Database {
     if (!stmtIsWrite(stmt)) {
       return this.dispatchStmt(stmt, params);
     }
+    // On a read-only handle the implicit transaction is READ ONLY (PostgreSQL hot-standby
+    // behavior — api.md §2.1), so an autocommit write fails exactly like a write inside a
+    // READ ONLY block.
+    if (this.readOnly) {
+      throw engineError(
+        "read_only_sql_transaction",
+        "cannot execute " + stmtKind(stmt) + " in a read-only transaction",
+      );
+    }
     this.tx = { writable: true, failed: false, working: this.committed.clone() };
     let outcome: Outcome;
     try {
@@ -451,15 +467,28 @@ export class Database {
   }
 
   // beginTx opens an explicit transaction (spec/design/transactions.md §4.2). A nested BEGIN (a
-  // block is already open) is 25001. The committed snapshot is captured as the transaction's
-  // working snapshot — a writable tx mutates it in place; a read-only tx reads it unchanged
-  // (read-your-snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.ts) and the catalog is
-  // shallow. committed is untouched until commit.
-  beginTx(writable: boolean): Outcome {
+  // block is already open) is 25001. writable is the *requested* access mode: null (unspecified)
+  // defaults to READ WRITE on a normal handle and READ ONLY on a read-only handle (PostgreSQL
+  // hot-standby behavior — api.md §2.1); requesting READ WRITE on a read-only handle is 25006.
+  // The committed snapshot is captured as the transaction's working snapshot — a writable tx
+  // mutates it in place; a read-only tx reads it unchanged (read-your-snapshot, §4.3). Cheap: the
+  // persistent stores clone O(1) (pmap.ts) and the catalog is shallow. committed is untouched
+  // until commit.
+  beginTx(writable: boolean | null): Outcome {
     if (this.tx !== null) {
       throw engineError("active_sql_transaction", "there is already a transaction in progress");
     }
-    this.tx = { writable, failed: false, working: this.committed.clone() };
+    if (writable === true && this.readOnly) {
+      throw engineError(
+        "read_only_sql_transaction",
+        "cannot set transaction read-write mode on a read-only database",
+      );
+    }
+    this.tx = {
+      writable: writable ?? !this.readOnly,
+      failed: false,
+      working: this.committed.clone(),
+    };
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 

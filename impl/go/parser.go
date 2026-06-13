@@ -144,29 +144,31 @@ func (p *Parser) parseBegin() (Statement, error) {
 			p.advance()
 		}
 	}
-	writable, err := p.parseAccessMode()
+	writable, modeSet, err := p.parseAccessMode()
 	if err != nil {
 		return Statement{}, err
 	}
-	return Statement{Begin: &Begin{Writable: writable}}, nil
+	return Statement{Begin: &Begin{Writable: writable, ModeSet: modeSet}}, nil
 }
 
-// parseAccessMode parses the optional access mode after a transaction opener: `READ ONLY` → false,
-// `READ WRITE` → true, absent → true (READ WRITE is the default — transactions.md §4.3).
-func (p *Parser) parseAccessMode() (bool, error) {
+// parseAccessMode parses the optional access mode after a transaction opener: `READ ONLY` →
+// (false, true), `READ WRITE` → (true, true), absent → (false, false) (unspecified — the
+// executor applies the handle's default: READ WRITE, or READ ONLY on a read-only handle;
+// transactions.md §4.3, api.md §2.1).
+func (p *Parser) parseAccessMode() (writable, modeSet bool, err error) {
 	if p.peekKeyword() != "read" {
-		return true, nil
+		return false, false, nil
 	}
 	p.advance() // READ
 	switch p.peekKeyword() {
 	case "only":
 		p.advance()
-		return false, nil
+		return false, true, nil
 	case "write":
 		p.advance()
-		return true, nil
+		return true, true, nil
 	default:
-		return false, NewError(SyntaxError, fmt.Sprintf("expected ONLY or WRITE after READ, found '%s'", p.peekKeyword()))
+		return false, false, NewError(SyntaxError, fmt.Sprintf("expected ONLY or WRITE after READ, found '%s'", p.peekKeyword()))
 	}
 }
 

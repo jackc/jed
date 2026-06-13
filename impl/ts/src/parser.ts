@@ -164,9 +164,10 @@ class Parser {
   }
 
   // parseAccessMode parses the optional access mode after a transaction opener: `READ ONLY` →
-  // false, `READ WRITE` → true, absent → true (READ WRITE is the default — transactions.md §4.3).
-  private parseAccessMode(): boolean {
-    if (this.peekKeyword() !== "read") return true;
+  // false, `READ WRITE` → true, absent → null (unspecified — the executor applies the handle's
+  // default: READ WRITE, or READ ONLY on a read-only handle; transactions.md §4.3, api.md §2.1).
+  private parseAccessMode(): boolean | null {
+    if (this.peekKeyword() !== "read") return null;
     this.advance(); // READ
     switch (this.peekKeyword()) {
       case "only":

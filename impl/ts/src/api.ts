@@ -125,8 +125,9 @@ export class Transaction {
 }
 
 // begin opens an explicit transaction (spec/design/api.md §2.2). writable false is READ ONLY (a
-// write inside → 25006); true is READ WRITE. A nested begin (a transaction is already open) is
-// 25001. Prefer view/update, which cannot forget to end the transaction.
+// write inside → 25006); true is READ WRITE — 25006 on a read-only handle (§2.1). A nested begin
+// (a transaction is already open) is 25001. Prefer view/update, which cannot forget to end the
+// transaction.
 export function begin(db: Database, writable: boolean): Transaction {
   db.beginTx(writable);
   return new Transaction(db);

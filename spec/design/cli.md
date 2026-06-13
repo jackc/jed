@@ -51,6 +51,8 @@ jed [OPTIONS] [DBFILE]
 
   (no DBFILE)             transient in-memory database
   --create                create DBFILE instead of opening it (58P02 if it exists)
+  --readonly              open DBFILE read-only (api.md §2.1): writes fail with 25006,
+                          the file is never touched
   --page-size N           with --create only: the page size locked into the file
   -c SQL                  execute the statements, then exit (repeatable) — script mode
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin) — script mode
@@ -70,6 +72,10 @@ open-or-create: a typo'd path must not durably create an empty database (the eng
 the initial image at `create` — api.md §2), and implicit creation is the same footgun
 sqlite3 is known for. No DBFILE means a **transient in-memory** database (the sqlite3 /
 DuckDB convention; ideal for trying SQL), stated by the TUI status bar / script-mode banner.
+`--readonly` opens the file via the engine's read-only mode (api.md §2.1 — every transaction
+defaults to READ ONLY, writes are `25006`, the file is opened without write access); it
+requires a DBFILE and excludes `--create`. The TUI status bar appends `(read-only)` to the
+path.
 
 **Exit codes.** `0` success · `1` startup/usage error (bad flags; `58P01`/`58P02`/
 `XX001`/`58030` on open/create) · `2` a SQL statement failed in script mode.
@@ -170,6 +176,6 @@ live in shared modules exercised by the script-mode tests).
 ## 8. Future (not v1)
 
 Editor autocomplete from the catalog · SQL syntax highlighting · CSV import / export ·
-`.dump`-style SQL export · read-only open mode (wants engine support) · pager/`-o` output
-redirection · `box`/markdown formats. (Affected-row counts in `Outcome` landed — the
-`OK, N rows` footer of §5.)
+`.dump`-style SQL export · pager/`-o` output redirection · `box`/markdown formats.
+(Landed since v1: affected-row counts in `Outcome` — the `OK, N rows` footer of §5 — and
+`--readonly`, §3.)

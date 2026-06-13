@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, Outcome, execute};
+use jed::{Database, DatabaseOptions, OpenOptions, Outcome, execute};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -194,6 +194,82 @@ fn incremental_commit_round_trips_to_canonical_image() {
         canonical,
         "the incremental file must decode to the identical canonical image"
     );
+}
+
+#[test]
+fn open_read_only_blocks_writes_and_never_touches_the_file() {
+    // Read-only open (api.md §2.1): the handle behaves like PostgreSQL hot standby — every
+    // transaction defaults to READ ONLY, an explicit READ WRITE request and any write are
+    // 25006, and the file bytes are never touched.
+    let path = tmp("readonly.jed");
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
+    db.close().unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            read_only: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(db.read_only());
+
+    // Reads work — bare and inside an explicit block (plain BEGIN defaults to READ ONLY here).
+    match execute(&mut db, "SELECT id FROM t").unwrap() {
+        Outcome::Query { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+        _ => panic!("expected a query"),
+    }
+    execute(&mut db, "BEGIN").unwrap();
+    execute(&mut db, "SELECT id FROM t").unwrap();
+    execute(&mut db, "COMMIT").unwrap();
+
+    // Autocommit writes are 25006 (the implicit transaction is read-only)...
+    assert_eq!(
+        execute(&mut db, "INSERT INTO t VALUES (2)")
+            .unwrap_err()
+            .code(),
+        "25006"
+    );
+    // ...as are writes inside a block (which then poisons, like any in-block error)...
+    execute(&mut db, "BEGIN").unwrap();
+    assert_eq!(
+        execute(&mut db, "DELETE FROM t").unwrap_err().code(),
+        "25006"
+    );
+    assert_eq!(
+        execute(&mut db, "SELECT id FROM t").unwrap_err().code(),
+        "25P02"
+    );
+    execute(&mut db, "ROLLBACK").unwrap();
+    // ...and an explicit READ WRITE request, via SQL or the host API.
+    assert_eq!(
+        execute(&mut db, "BEGIN READ WRITE").unwrap_err().code(),
+        "25006"
+    );
+    assert_eq!(db.begin(true).err().unwrap().code(), "25006");
+    db.view(|tx| tx.query("SELECT id FROM t", &[]).map(|_| ()))
+        .unwrap();
+    assert_eq!(
+        db.update(|tx| tx.execute("DELETE FROM t", &[]).map(|_| ()))
+            .err()
+            .unwrap()
+            .code(),
+        "25006"
+    );
+    db.close().unwrap();
+
+    // The file is byte-identical after the whole read-only session.
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // A normal reopen is writable again.
+    let mut db = Database::open(&path).unwrap();
+    assert!(!db.read_only());
+    execute(&mut db, "INSERT INTO t VALUES (2)").unwrap();
 }
 
 #[test]

@@ -267,6 +267,13 @@ pub struct Database {
     /// in the file), set by [`set_max_cost`](Database::set_max_cost); the primary guard for
     /// safely evaluating untrusted, user-supplied queries.
     pub(crate) max_cost: i64,
+    /// Whether this handle was opened **read-only** (spec/design/api.md §2.1,
+    /// [`crate::file::OpenOptions::read_only`]). A read-only handle behaves like PostgreSQL
+    /// hot standby: every transaction defaults to READ ONLY, an explicit `BEGIN READ WRITE`
+    /// (or `begin(true)`) is `25006`, and an autocommit write is `25006` — so no commit ever
+    /// publishes and the file is never written (it is opened without write access). Always
+    /// `false` for an in-memory or normally-opened database.
+    pub(crate) read_only: bool,
 }
 
 /// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
@@ -306,6 +313,7 @@ impl Database {
             free_pages: Vec::new(),
             paging: None,
             max_cost: 0,
+            read_only: false,
         }
     }
 
@@ -324,6 +332,7 @@ impl Database {
             free_pages: Vec::new(),
             paging: None,
             max_cost: 0,
+            read_only: false,
         }
     }
 
@@ -392,6 +401,12 @@ impl Database {
     /// untrusted, user-supplied queries; a handle setting, not stored in the file.
     pub fn set_max_cost(&mut self, limit: i64) {
         self.max_cost = limit;
+    }
+
+    /// Whether this handle was opened read-only (spec/design/api.md §2.1): every transaction
+    /// defaults to READ ONLY, writes are `25006`, and the file is never written.
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// The current execution-cost ceiling (`0` ⇒ unlimited). See [`set_max_cost`](Database::set_max_cost).
@@ -513,6 +528,18 @@ impl Database {
         if !stmt_is_write(&stmt) {
             return self.dispatch_stmt(stmt, params);
         }
+        // On a read-only handle the implicit transaction is READ ONLY (PostgreSQL hot-standby
+        // behavior — api.md §2.1), so an autocommit write fails exactly like a write inside a
+        // READ ONLY block.
+        if self.read_only {
+            return Err(EngineError::new(
+                SqlState::ReadOnlySqlTransaction,
+                format!(
+                    "cannot execute {} in a read-only transaction",
+                    stmt_kind(&stmt)
+                ),
+            ));
+        }
         self.tx = Some(ActiveTx {
             writable: true,
             failed: false,
@@ -528,19 +555,28 @@ impl Database {
     }
 
     /// Open an explicit transaction block (spec/design/transactions.md §4.2). A nested `BEGIN` (a
-    /// block is already open) is 25001. The committed snapshot is captured as the transaction's
+    /// block is already open) is 25001. `writable` is the *requested* access mode: `None`
+    /// (unspecified) defaults to READ WRITE on a normal handle and READ ONLY on a read-only
+    /// handle (PostgreSQL hot-standby behavior — api.md §2.1); requesting READ WRITE on a
+    /// read-only handle is 25006. The committed snapshot is captured as the transaction's
     /// working snapshot — a writable tx mutates it in place; a read-only tx reads it unchanged
     /// (read-your-snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.rs) and the
     /// catalog is a shallow copy. `committed` is untouched until commit.
-    pub(crate) fn begin_tx(&mut self, writable: bool) -> Result<Outcome> {
+    pub(crate) fn begin_tx(&mut self, writable: Option<bool>) -> Result<Outcome> {
         if self.tx.is_some() {
             return Err(EngineError::new(
                 SqlState::ActiveSqlTransaction,
                 "there is already a transaction in progress",
             ));
         }
+        if writable == Some(true) && self.read_only {
+            return Err(EngineError::new(
+                SqlState::ReadOnlySqlTransaction,
+                "cannot set transaction read-write mode on a read-only database",
+            ));
+        }
         self.tx = Some(ActiveTx {
-            writable,
+            writable: writable.unwrap_or(!self.read_only),
             failed: false,
             working: self.committed.clone(),
         });

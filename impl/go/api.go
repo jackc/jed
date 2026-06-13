@@ -48,7 +48,7 @@ func (tx *Transaction) Rollback() error {
 // write inside → 25006); true is READ WRITE. A nested Begin (a transaction is already open) is
 // 25001. Prefer View/Update, which cannot forget to end the transaction.
 func (db *Database) Begin(writable bool) (*Transaction, error) {
-	if _, err := db.beginTx(writable); err != nil {
+	if _, err := db.beginTx(writable, true); err != nil {
 		return nil, err
 	}
 	return &Transaction{db: db}, nil

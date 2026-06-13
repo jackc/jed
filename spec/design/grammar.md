@@ -1148,7 +1148,8 @@ explicit block; the statements that follow run within it until `COMMIT` / `END` 
   write statement (`INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`) inside it is **`25006`**
   (read_only_sql_transaction). The mode is **fixed when the block opens** (it governs the write
   lock — transactions.md §4.3/§10), declared here and inferred from the statement kind under
-  autocommit.
+  autocommit. On a **read-only handle** (api.md §2.1) an unspecified mode defaults to READ ONLY
+  instead, and an explicit `READ WRITE` is `25006` (PostgreSQL hot-standby behavior).
 - **`COMMIT` / `END`** publishes the block's changes atomically (the snapshot swap) and makes
   them durable per the `synchronous` setting (transactions.md §9), returning to autocommit.
   Committing a **failed** block (below) performs a `ROLLBACK` instead (PostgreSQL).

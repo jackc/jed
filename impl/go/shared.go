@@ -108,7 +108,7 @@ func (s *SharedDB) Write() *WriteHandle {
 	base := s.core.committed.Load()
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
 	db := &Database{committed: base, pageSize: DefaultPageSize}
-	_, _ = db.beginTx(true)
+	_, _ = db.beginTx(true, true)
 	return &WriteHandle{core: s.core, db: db, baseVersion: base.txid}
 }
 

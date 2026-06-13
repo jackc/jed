@@ -1065,8 +1065,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `rowsAffected: number | null`) + api.md §4; the CLI's `OK` footer is now
       `OK, 3 rows (cost C)` (cli.md §5). The `# cost:` corpus contract is untouched.
 - [ ] **CLI follow-ons** (cli.md §8, after v1): editor autocomplete from the catalog, SQL
-      syntax highlighting, CSV import/export, `.dump`-style SQL export, read-only open mode
-      (wants engine support), pager/`-o` redirection. _(size: M each; not scheduled)_
+      syntax highlighting, CSV import/export, `.dump`-style SQL export, pager/`-o`
+      redirection. **Landed:** read-only open mode (`--readonly` + the engine's
+      `OpenOptions` read-only flag in all 3 cores, api.md §2.1). _(size: M each; not
+      scheduled)_
 - [ ] **(Open question, not scheduled)** low-level direct access API beneath SQL
       (`getValue("table", key)`) — keep the seam open, don't build yet (§9). _(size: —)_
 

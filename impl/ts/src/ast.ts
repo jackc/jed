@@ -313,10 +313,11 @@ export type Delete = {
 };
 
 // Begin/Commit/Rollback are the explicit transaction-control statements (grammar.md §27,
-// transactions.md §4.2). Begin's `writable` is the access mode: true is READ WRITE (the default),
-// false READ ONLY (a write inside → 25006). A nested BEGIN is 25001; a COMMIT/ROLLBACK with no
-// open block is a no-op success.
-export type Begin = { kind: "begin"; writable: boolean };
+// transactions.md §4.2). Begin's `writable` is the *requested* access mode: true READ WRITE,
+// false READ ONLY (a write inside → 25006), null unspecified — which defaults to READ WRITE on
+// a normal handle and READ ONLY on a read-only handle (api.md §2.1). A nested BEGIN is 25001; a
+// COMMIT/ROLLBACK with no open block is a no-op success.
+export type Begin = { kind: "begin"; writable: boolean | null };
 export type Commit = { kind: "commit" };
 export type Rollback = { kind: "rollback" };
 

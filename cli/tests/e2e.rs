@@ -198,3 +198,42 @@ fn sources_run_in_command_line_order() {
     assert_eq!((r.code, r.stderr.as_str()), (0, ""));
     assert_eq!(r.stdout, " a\n---\n 1\n 2\n(2 rows, cost 5)\n");
 }
+
+#[test]
+fn readonly_serves_reads_and_rejects_writes() {
+    let db = tmp("readonly.jed");
+    let db_str = db.to_str().unwrap();
+    let r = run(
+        &[
+            "--create",
+            db_str,
+            "-c",
+            "CREATE TABLE t (a int32 PRIMARY KEY); INSERT INTO t VALUES (1)",
+        ],
+        "",
+    );
+    assert_eq!(r.code, 0);
+
+    let r = run(&["--readonly", db_str, "-c", "SELECT a FROM t"], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert!(r.stdout.contains("(1 row, cost"), "stdout: {}", r.stdout);
+
+    let r = run(
+        &["--readonly", db_str, "-c", "INSERT INTO t VALUES (2)"],
+        "",
+    );
+    assert_eq!(r.code, 2);
+    assert!(
+        r.stderr
+            .contains("ERROR 25006: cannot execute INSERT in a read-only transaction"),
+        "stderr: {}",
+        r.stderr
+    );
+
+    // --readonly is strict about its shape.
+    let r = run(&["--readonly"], "");
+    assert_eq!(r.code, 1);
+    let r = run(&["--readonly", "--create", db_str], "");
+    assert_eq!(r.code, 1);
+    let _ = std::fs::remove_file(&db);
+}

@@ -228,6 +228,12 @@ type Database struct {
 	// reaches it. A handle setting (not stored in the file), set by SetMaxCost; the primary guard for
 	// safely evaluating untrusted, user-supplied queries.
 	maxCost int64
+	// readOnly marks a handle opened read-only (spec/design/api.md §2.1, OpenOptions.ReadOnly).
+	// A read-only handle behaves like PostgreSQL hot standby: every transaction defaults to READ
+	// ONLY, an explicit READ WRITE request and any write statement are 25006, and the file is
+	// opened without write access, so it is never written. Always false for an in-memory or
+	// normally-opened database.
+	readOnly bool
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
@@ -295,6 +301,10 @@ func (db *Database) SetMaxCost(limit int64) { db.maxCost = limit }
 // MaxCost is the current execution-cost ceiling (0 ⇒ unlimited). See SetMaxCost.
 func (db *Database) MaxCost() int64 { return db.maxCost }
 
+// ReadOnly reports whether this handle was opened read-only (spec/design/api.md §2.1): every
+// transaction defaults to READ ONLY, writes are 25006, and the file is never written.
+func (db *Database) ReadOnly() bool { return db.readOnly }
+
 // Table looks up a table definition by name (case-insensitive) in the visible snapshot.
 func (db *Database) Table(name string) (*Table, bool) {
 	return db.readSnap().table(name)
@@ -351,7 +361,7 @@ func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
 func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, error) {
 	switch {
 	case stmt.Begin != nil:
-		return db.beginTx(stmt.Begin.Writable)
+		return db.beginTx(stmt.Begin.Writable, stmt.Begin.ModeSet)
 	case stmt.Commit != nil:
 		return db.commitTx()
 	case stmt.Rollback != nil:
@@ -387,6 +397,13 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 	if !stmtIsWrite(stmt) {
 		return db.dispatchStmt(stmt, params)
 	}
+	// On a read-only handle the implicit transaction is READ ONLY (PostgreSQL hot-standby
+	// behavior — api.md §2.1), so an autocommit write fails exactly like a write inside a
+	// READ ONLY block.
+	if db.readOnly {
+		return Outcome{}, NewError(ReadOnlySqlTransaction,
+			"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
+	}
 	db.tx = &activeTx{writable: true, working: db.committed.clone()}
 	outcome, err := db.dispatchStmt(stmt, params)
 	if err != nil {
@@ -400,13 +417,23 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 }
 
 // beginTx opens an explicit transaction (spec/design/transactions.md §4.2). A nested BEGIN (a block
-// is already open) is 25001. The committed snapshot is captured as the transaction's working
+// is already open) is 25001. writable/modeSet carry the *requested* access mode: with modeSet
+// false the mode was unspecified and defaults to READ WRITE on a normal handle, READ ONLY on a
+// read-only handle (PostgreSQL hot-standby behavior — api.md §2.1); requesting READ WRITE on a
+// read-only handle is 25006. The committed snapshot is captured as the transaction's working
 // snapshot — a writable tx mutates it in place; a read-only tx reads it unchanged (read-your-
 // snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.go) and the catalog is shallow.
 // committed is untouched until commit.
-func (db *Database) beginTx(writable bool) (Outcome, error) {
+func (db *Database) beginTx(writable, modeSet bool) (Outcome, error) {
 	if db.tx != nil {
 		return Outcome{}, NewError(ActiveSqlTransaction, "there is already a transaction in progress")
+	}
+	if modeSet && writable && db.readOnly {
+		return Outcome{}, NewError(ReadOnlySqlTransaction,
+			"cannot set transaction read-write mode on a read-only database")
+	}
+	if !modeSet {
+		writable = !db.readOnly
 	}
 	db.tx = &activeTx{writable: writable, working: db.committed.clone()}
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil

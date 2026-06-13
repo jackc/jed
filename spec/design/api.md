@@ -55,7 +55,7 @@ Two file constructors, deliberately split (open ≠ create):
   or hostile file cannot force a multi-gigabyte allocation before its contents are even checked. If the
   path is **absent**, it is `58P01 undefined_file` — `open` never creates. A malformed file is `XX001
   data_corrupted`; an underlying read failure is `58030 io_error`. `opts` is optional open-time
-  settings; today the only field is the **memory budget** below.
+  settings: the **memory budget** and the **read-only flag** below.
 
 **Memory budget — a handle setting (P6.4c, [pager.md](pager.md) §3).** `open`'s `opts.cache_bytes`
 sets the **buffer-pool budget in bytes**: the approximate maximum memory the demand-paging leaf cache
@@ -79,6 +79,20 @@ pages are currently resident — `≤ cache_leaves` by construction. An in-memor
 budget (it is fully resident, nothing to page). Same shape across cores (Rust `OpenOptions {
 cache_bytes }` / Go `OpenOptions { CacheBytes }` / TS `{ cacheBytes }`); the bare `open(path)` form uses
 the default.
+
+**Read-only open — a handle setting.** `open`'s `opts.read_only` (Rust `OpenOptions {
+read_only }` / Go `OpenOptions { ReadOnly }` / TS `{ readOnly }`; default off) opens the file
+**read-only**. The handle then behaves like **PostgreSQL hot standby** (the §1 PG-default
+applied to a read-only database): every transaction defaults to **READ ONLY** — a plain
+`BEGIN` (or `begin(false)`/`view`) works and reads normally — while an explicit READ WRITE
+request (`BEGIN READ WRITE`, `begin(true)`, `update`) is **`25006`** ("cannot set transaction
+read-write mode on a read-only database"), and an autocommit write statement is **`25006`**
+with PG's hot-standby message ("cannot execute INSERT in a read-only transaction" — the
+implicit transaction *is* read-only). Because no write transaction can open, no commit ever
+publishes; the file is additionally opened **without write access**, so the OS enforces what
+the guards promise (a read-only handle works on a read-only filesystem). The handle exposes
+`read_only()` / `ReadOnly()` / `.readOnly`. Like the memory budget it is a handle setting, not
+stored in the file — another handle may have the same file open writable.
 
 In-memory databases use the **existing constructors** (`Database::new()` / `NewDatabase()` /
 `new Database()`) — no backing file, default settings, kept verbatim for back-compat (the

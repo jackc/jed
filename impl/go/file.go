@@ -70,6 +70,11 @@ type OpenOptions struct {
 	// larger than RAM be served (pager.md §1); it never changes what a query observes (§3/§5). 0 →
 	// DefaultCacheBytes (256 MiB).
 	CacheBytes int
+	// ReadOnly opens the file read-only (api.md §2.1). The handle then behaves like PostgreSQL
+	// hot standby: every transaction defaults to READ ONLY, an explicit READ WRITE request and
+	// any write statement are 25006, and the file is opened without write access, so it is never
+	// written (works on a read-only filesystem).
+	ReadOnly bool
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool
@@ -92,7 +97,13 @@ func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
 	if cacheBytes <= 0 {
 		cacheBytes = DefaultCacheBytes
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	// A read-only open never writes the file, so it is not opened for writing at all — the OS
+	// enforces what the executor's 25006 guards promise (api.md §2.1).
+	flag := os.O_RDWR
+	if opts.ReadOnly {
+		flag = os.O_RDONLY
+	}
+	f, err := os.OpenFile(path, flag, 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, NewError(UndefinedFile, "database file does not exist: "+path)
@@ -113,6 +124,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
 		return nil, err
 	}
 	db.path = path
+	db.readOnly = opts.ReadOnly
 	return db, nil
 }
 

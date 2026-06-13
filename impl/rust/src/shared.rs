@@ -184,7 +184,7 @@ impl SharedDb {
         let base = self.0.pin();
         let base_version = base.txid;
         let mut db = Database::from_snapshot((*base).clone());
-        db.begin_tx(true)
+        db.begin_tx(Some(true))
             .expect("a fresh handle has no open transaction");
         WriteHandle {
             shared: self.0.clone(),

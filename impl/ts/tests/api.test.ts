@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  begin,
   close,
   commit,
   create,
@@ -19,6 +20,8 @@ import {
   prepare,
   query,
   rollback,
+  update,
+  view,
 } from "../src/lib.ts";
 import type { Value } from "../src/lib.ts";
 
@@ -231,4 +234,66 @@ test("rowsAffected reports DML counts", () => {
   const out = execute(db, "DELETE FROM dst RETURNING id");
   assert.equal(out.kind, "query");
   if (out.kind === "query") assert.equal(out.rows.length, 2);
+});
+
+test("open read-only blocks writes and never touches the file", () => {
+  // Read-only open (api.md §2.1): the handle behaves like PostgreSQL hot standby — every
+  // transaction defaults to READ ONLY, an explicit READ WRITE request and any write are
+  // 25006, and the file bytes are never touched.
+  const dir = tmpDir();
+  try {
+    const path = join(dir, "readonly.jed");
+    let db = create(path);
+    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+    execute(db, "INSERT INTO t VALUES (1)");
+    close(db);
+    const before = readFileSync(path);
+
+    db = open(path, { readOnly: true });
+    assert.equal(db.readOnly, true);
+    const wantCode = (fn: () => void, code: string) => {
+      try {
+        fn();
+      } catch (e) {
+        if (e instanceof EngineError) {
+          assert.equal(e.code(), code);
+          return;
+        }
+        throw e;
+      }
+      assert.fail(`expected ${code}`);
+    };
+
+    // Reads work — bare and inside an explicit block (plain BEGIN defaults to READ ONLY here).
+    const out = execute(db, "SELECT id FROM t");
+    assert.equal(out.kind === "query" && out.rows.length, 1);
+    execute(db, "BEGIN");
+    execute(db, "SELECT id FROM t");
+    execute(db, "COMMIT");
+
+    // Autocommit writes are 25006 (the implicit transaction is read-only)...
+    wantCode(() => execute(db, "INSERT INTO t VALUES (2)"), "25006");
+    // ...as are writes inside a block (which then poisons, like any in-block error)...
+    execute(db, "BEGIN");
+    wantCode(() => execute(db, "DELETE FROM t"), "25006");
+    wantCode(() => execute(db, "SELECT id FROM t"), "25P02");
+    execute(db, "ROLLBACK");
+    // ...and an explicit READ WRITE request, via SQL or the host API.
+    wantCode(() => execute(db, "BEGIN READ WRITE"), "25006");
+    wantCode(() => begin(db, true), "25006");
+    view(db, (tx) => tx.query("SELECT id FROM t"));
+    wantCode(() => update(db, (tx) => tx.execute("DELETE FROM t")), "25006");
+    close(db);
+
+    // The file is byte-identical after the whole read-only session.
+    assert.deepStrictEqual(readFileSync(path), before);
+
+    // A normal reopen is writable again.
+    db = open(path);
+    assert.equal(db.readOnly, false);
+    execute(db, "INSERT INTO t VALUES (2)");
+    close(db);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

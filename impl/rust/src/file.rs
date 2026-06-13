@@ -41,12 +41,18 @@ pub struct OpenOptions {
     /// bound that lets a database far larger than RAM be served (pager.md §1); it never changes what a
     /// query observes (§3/§5). Default [`DEFAULT_CACHE_BYTES`](crate::paging) (256 MiB).
     pub cache_bytes: usize,
+    /// Open the file **read-only** (api.md §2.1). The handle then behaves like PostgreSQL hot
+    /// standby: every transaction defaults to READ ONLY, an explicit READ WRITE request and any
+    /// write statement are `25006`, and the file is opened without write access, so it is never
+    /// written (works on a read-only filesystem). Default `false`.
+    pub read_only: bool,
 }
 
 impl Default for OpenOptions {
     fn default() -> Self {
         OpenOptions {
             cache_bytes: DEFAULT_CACHE_BYTES,
+            read_only: false,
         }
     }
 }
@@ -103,7 +109,13 @@ impl Database {
     /// (§3). Later commits write through the same pager kept open for the handle's life.
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
         let path = path.as_ref();
-        let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+        // A read-only open never writes the file, so it is not opened for writing at all —
+        // the OS enforces what the executor's 25006 guards promise (api.md §2.1).
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(!opts.read_only)
+            .open(path)
+        {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(EngineError::new(
@@ -120,6 +132,7 @@ impl Database {
         let capacity = cache_leaves(opts.cache_bytes, pager.page_size());
         let mut db = Database::open_paged(pager, capacity)?;
         db.path = Some(path.to_path_buf());
+        db.read_only = opts.read_only;
         Ok(db)
     }
 
@@ -289,6 +302,7 @@ mod tests {
             &path,
             OpenOptions {
                 cache_bytes: CAP * 256,
+                ..OpenOptions::default()
             },
         )
         .unwrap();
@@ -321,6 +335,7 @@ mod tests {
                 &path,
                 OpenOptions {
                     cache_bytes: CAP * 256,
+                    ..OpenOptions::default()
                 },
             )
             .unwrap();
@@ -337,6 +352,7 @@ mod tests {
             &path,
             OpenOptions {
                 cache_bytes: CAP * 256,
+                ..OpenOptions::default()
             },
         )
         .unwrap();
@@ -381,6 +397,7 @@ mod tests {
             &path,
             OpenOptions {
                 cache_bytes: CAP * 256,
+                ..OpenOptions::default()
             },
         )
         .unwrap();
@@ -435,7 +452,14 @@ mod tests {
 
         // A 1-byte budget is far below the 256-byte page size: it must clamp to one resident leaf,
         // not zero (zero would be unable to walk a root→leaf path).
-        let db = Database::open_with_options(&path, OpenOptions { cache_bytes: 1 }).unwrap();
+        let db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                cache_bytes: 1,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
         let rows = db.rows_in_key_order("t").unwrap();
         assert_eq!(rows.len(), n as usize);
         for (i, row) in rows.iter().enumerate() {

@@ -12,7 +12,7 @@ mod tui;
 use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
-use jed::{Database, DatabaseOptions};
+use jed::{Database, DatabaseOptions, OpenOptions};
 
 use args::Source;
 use session::Session;
@@ -91,11 +91,26 @@ fn open_database(a: &args::Args) -> Result<(Database, String), u8> {
             page_size: a.page_size.unwrap_or(jed::DEFAULT_PAGE_SIZE),
         };
         Database::create(path, opts)
+    } else if a.readonly {
+        Database::open_with_options(
+            path,
+            OpenOptions {
+                read_only: true,
+                ..OpenOptions::default()
+            },
+        )
     } else {
         Database::open(path)
     };
     match result {
-        Ok(db) => Ok((db, path.display().to_string())),
+        Ok(db) => {
+            let source = if a.readonly {
+                format!("{} (read-only)", path.display())
+            } else {
+                path.display().to_string()
+            };
+            Ok((db, source))
+        }
         Err(e) => {
             eprintln!("ERROR {}: {}", e.code(), e.message);
             if e.code() == "58P01" {

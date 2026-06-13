@@ -25,11 +25,13 @@ type Statement struct {
 }
 
 // Begin is a BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE] / START TRANSACTION [...] statement
-// — open an explicit transaction block (spec/design/grammar.md §27). Writable is the access mode:
-// true is READ WRITE (the default), false READ ONLY (a write inside → 25006). A nested BEGIN is
-// 25001 (transactions.md §4.2).
+// — open an explicit transaction block (spec/design/grammar.md §27). Writable is the *requested*
+// access mode when ModeSet (true READ WRITE, false READ ONLY — a write inside → 25006). With
+// ModeSet false the mode was unspecified and defaults to the handle's — READ WRITE normally,
+// READ ONLY on a read-only handle (api.md §2.1). A nested BEGIN is 25001 (transactions.md §4.2).
 type Begin struct {
 	Writable bool
+	ModeSet  bool
 }
 
 // Commit is a COMMIT [TRANSACTION|WORK] / END [...] statement — publish the open block durably and

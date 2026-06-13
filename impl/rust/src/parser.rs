@@ -88,21 +88,23 @@ impl Parser {
         })
     }
 
-    /// The optional access mode after a transaction opener: `READ ONLY` → false, `READ WRITE` →
-    /// true, absent → true (READ WRITE is the default — spec/design/transactions.md §4.3).
-    fn parse_access_mode(&mut self) -> Result<bool> {
+    /// The optional access mode after a transaction opener: `READ ONLY` → `Some(false)`,
+    /// `READ WRITE` → `Some(true)`, absent → `None` (unspecified — the executor applies the
+    /// handle's default: READ WRITE, or READ ONLY on a read-only handle; transactions.md §4.3,
+    /// api.md §2.1).
+    fn parse_access_mode(&mut self) -> Result<Option<bool>> {
         if self.peek_keyword().as_deref() != Some("read") {
-            return Ok(true);
+            return Ok(None);
         }
         self.advance(); // READ
         match self.peek_keyword().as_deref() {
             Some("only") => {
                 self.advance();
-                Ok(false)
+                Ok(Some(false))
             }
             Some("write") => {
                 self.advance();
-                Ok(true)
+                Ok(Some(true))
             }
             other => Err(syntax(format!(
                 "expected ONLY or WRITE after READ, found {other:?}"

@@ -20,11 +20,13 @@ pub enum Statement {
     Update(Update),
     Delete(Delete),
     /// `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` / `START TRANSACTION [...]` — open an
-    /// explicit transaction block (spec/design/grammar.md §27). `writable` is the access mode:
-    /// `true` is READ WRITE (the default), `false` READ ONLY (a write inside → 25006). A nested
-    /// `BEGIN` is 25001 (transactions.md §4.2).
+    /// explicit transaction block (spec/design/grammar.md §27). `writable` is the *requested*
+    /// access mode: `Some(true)` READ WRITE, `Some(false)` READ ONLY, `None` unspecified —
+    /// which defaults to READ WRITE on a normal handle and READ ONLY on a read-only handle
+    /// (api.md §2.1; a write inside a READ ONLY block → 25006). A nested `BEGIN` is 25001
+    /// (transactions.md §4.2).
     Begin {
-        writable: bool,
+        writable: Option<bool>,
     },
     /// `COMMIT [TRANSACTION|WORK]` / `END [...]` — publish the open block durably and return to
     /// autocommit; a `COMMIT` with no open block is a no-op success (transactions.md §4.2).

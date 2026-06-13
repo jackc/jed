@@ -5,6 +5,9 @@ package jed
 // under t.TempDir(), never the repo tree.
 
 import (
+	"bytes"
+	"errors"
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -272,4 +275,92 @@ func TestRowsAffectedReportsDMLCounts(t *testing.T) {
 	if out.Kind != OutcomeQuery || len(out.Rows) != 2 {
 		t.Fatalf("RETURNING must yield a query outcome with 2 rows, got kind=%v rows=%d", out.Kind, len(out.Rows))
 	}
+}
+
+func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
+	// Read-only open (api.md §2.1): the handle behaves like PostgreSQL hot standby — every
+	// transaction defaults to READ ONLY, an explicit READ WRITE request and any write are
+	// 25006, and the file bytes are never touched.
+	path := filepath.Join(t.TempDir(), "readonly.jed")
+	db, err := Create(path, DefaultDatabaseOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	mustExec(t, db, "INSERT INTO t VALUES (1)")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = OpenWithOptions(path, OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !db.ReadOnly() {
+		t.Fatal("handle must report read-only")
+	}
+	wantCode := func(sql, code string) {
+		t.Helper()
+		_, err := Execute(db, sql)
+		var ee *EngineError
+		if !errors.As(err, &ee) || ee.Code() != code {
+			t.Fatalf("%q: got %v, want %s", sql, err, code)
+		}
+	}
+
+	// Reads work — bare and inside an explicit block (plain BEGIN defaults to READ ONLY here).
+	out, err := Execute(db, "SELECT id FROM t")
+	if err != nil || len(out.Rows) != 1 {
+		t.Fatalf("read on a read-only handle: %v", err)
+	}
+	mustExec(t, db, "BEGIN")
+	mustExec(t, db, "SELECT id FROM t")
+	mustExec(t, db, "COMMIT")
+
+	// Autocommit writes are 25006 (the implicit transaction is read-only)...
+	wantCode("INSERT INTO t VALUES (2)", "25006")
+	// ...as are writes inside a block (which then poisons, like any in-block error)...
+	mustExec(t, db, "BEGIN")
+	wantCode("DELETE FROM t", "25006")
+	wantCode("SELECT id FROM t", "25P02")
+	mustExec(t, db, "ROLLBACK")
+	// ...and an explicit READ WRITE request, via SQL or the host API.
+	wantCode("BEGIN READ WRITE", "25006")
+	var ee *EngineError
+	if _, err := db.Begin(true); !errors.As(err, &ee) || ee.Code() != "25006" {
+		t.Fatalf("Begin(true) on a read-only handle: %v", err)
+	}
+	if err := db.View(func(tx *Transaction) error { _, err := tx.Query("SELECT id FROM t", nil); return err }); err != nil {
+		t.Fatalf("View on a read-only handle: %v", err)
+	}
+	err = db.Update(func(tx *Transaction) error { _, err := tx.Execute("DELETE FROM t", nil); return err })
+	if !errors.As(err, &ee) || ee.Code() != "25006" {
+		t.Fatalf("Update on a read-only handle: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The file is byte-identical after the whole read-only session.
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("a read-only session must not change the file")
+	}
+
+	// A normal reopen is writable again.
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.ReadOnly() {
+		t.Fatal("a normal open must not be read-only")
+	}
+	mustExec(t, db, "INSERT INTO t VALUES (2)")
 }

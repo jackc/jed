@@ -63,7 +63,10 @@ function writeFullImage(db: Database): void {
 // the engine converts it to a leaf-page capacity by the file's page size as max(1, cacheBytes /
 // pageSize) (cacheLeaves). The bound that lets a database far larger than RAM be served (pager.md §1);
 // it never changes what a query observes (§3/§5). Default DEFAULT_CACHE_BYTES (256 MiB).
-export type OpenOptions = { cacheBytes?: number };
+// readOnly opens the file read-only (api.md §2.1): the handle then behaves like PostgreSQL hot
+// standby — every transaction defaults to READ ONLY, an explicit READ WRITE request and any write
+// statement are 25006, and the file is opened without write access, so it is never written.
+export type OpenOptions = { cacheBytes?: number; readOnly?: boolean };
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,
 // opts.cacheBytes). Loads its committed state, adopting its page size / txid. The path must exist —
@@ -79,9 +82,12 @@ export function open(path: string, opts: OpenOptions = {}): Database {
     throw engineError("undefined_file", "database file does not exist: " + path);
   }
   const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
+  const readOnly = opts.readOnly ?? false;
   let fd: number;
   try {
-    fd = openSync(path, "r+");
+    // A read-only open never writes the file, so it is not opened for writing at all — the OS
+    // enforces what the executor's 25006 guards promise (api.md §2.1).
+    fd = openSync(path, readOnly ? "r" : "r+");
   } catch (e) {
     throw ioError(e);
   }
@@ -93,6 +99,7 @@ export function open(path: string, opts: OpenOptions = {}): Database {
     const db = loadDatabasePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
+    db.readOnly = readOnly;
     return db;
   } catch (e) {
     closeSync(fd); // a malformed file / read failure must not leak the fd

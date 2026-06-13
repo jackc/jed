@@ -18,6 +18,7 @@ pub enum Source {
 pub struct Args {
     pub db_path: Option<PathBuf>,
     pub create: bool,
+    pub readonly: bool,
     pub page_size: Option<u32>,
     pub sources: Vec<Source>,
     pub format: Format,
@@ -33,6 +34,7 @@ usage: jed [OPTIONS] [DBFILE]
 
   (no DBFILE)             transient in-memory database
   --create                create DBFILE instead of opening it
+  --readonly              open DBFILE read-only: writes fail with 25006, the file is never touched
   --page-size N           with --create: the page size locked into the file
   -c SQL                  execute the statements, then exit (repeatable)
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin)
@@ -51,6 +53,7 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut args = Args {
         db_path: None,
         create: false,
+        readonly: false,
         page_size: None,
         sources: Vec::new(),
         format: Format::Aligned,
@@ -67,6 +70,7 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
         };
         match arg.as_str() {
             "--create" => args.create = true,
+            "--readonly" => args.readonly = true,
             "--page-size" => {
                 let v = value_for("--page-size")?;
                 args.page_size = Some(v.parse().map_err(|_| format!("bad --page-size: {v}"))?);
@@ -102,6 +106,12 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if args.create && args.db_path.is_none() {
         return Err("--create requires a DBFILE".to_string());
+    }
+    if args.readonly && args.db_path.is_none() {
+        return Err("--readonly requires a DBFILE".to_string());
+    }
+    if args.readonly && args.create {
+        return Err("--readonly cannot be combined with --create".to_string());
     }
     Ok(args)
 }
@@ -155,6 +165,15 @@ mod tests {
         assert!(p(&["--create"]).is_err()); // needs a DBFILE
         assert!(p(&["--format", "xml"]).is_err());
         assert!(p(&["-c"]).is_err()); // missing value
+        assert!(p(&["--readonly"]).is_err()); // needs a DBFILE
+        assert!(p(&["--readonly", "--create", "a.jed"]).is_err()); // mutually exclusive
+    }
+
+    #[test]
+    fn readonly_opens_a_dbfile() {
+        let a = p(&["--readonly", "a.jed"]).unwrap();
+        assert!(a.readonly);
+        assert_eq!(a.db_path, Some(PathBuf::from("a.jed")));
     }
 
     #[test]
