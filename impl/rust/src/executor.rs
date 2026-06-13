@@ -36,10 +36,15 @@ pub enum Outcome {
         /// have no row count.
         rows_affected: Option<i64>,
     },
-    /// A query result: output column names plus rows in result order. The column count
-    /// is `column_names.len()` (spec/design/grammar.md §8).
+    /// A query result: output column names, the canonical name of each column's resolved type
+    /// (`int16`/`int32`/`int64`/`text`/`boolean`/`decimal`/…; `unknown` for an untyped NULL),
+    /// and rows in result order. The column count is `column_names.len()`
+    /// (spec/design/grammar.md §8); `column_types` is parallel to it. The type is the resolved
+    /// *scalar* type — for `decimal` it is the unconstrained `decimal`, not the `numeric(p,s)`
+    /// typmod (which the resolved expression type does not carry; spec/design/conformance.md §7).
     Query {
         column_names: Vec<String>,
+        column_types: Vec<String>,
         rows: Vec<Vec<Value>>,
         cost: i64,
     },
@@ -58,6 +63,16 @@ impl Outcome {
     pub fn column_names(&self) -> &[String] {
         match self {
             Outcome::Query { column_names, .. } => column_names,
+            Outcome::Statement { .. } => &[],
+        }
+    }
+
+    /// The canonical type name of each output column of a query result (parallel to
+    /// `column_names`; empty for a non-query statement) — `int16`/`text`/`decimal`/…, or
+    /// `unknown` for an untyped NULL column (spec/design/conformance.md §7).
+    pub fn column_types(&self) -> &[String] {
+        match self {
+            Outcome::Query { column_types, .. } => column_types,
             Outcome::Statement { .. } => &[],
         }
     }
@@ -1415,7 +1430,7 @@ impl Database {
                 // item evaluation per stored row); a plain fully-inline insert still costs zero.
                 let mut meter = Meter::with_limit(self.max_cost);
                 let mut ret_nodes = ret;
-                if let Some((nodes, _)) = &mut ret_nodes {
+                if let Some((nodes, _, _)) = &mut ret_nodes {
                     // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3),
                     // reading the pre-statement snapshot (grammar.md §32).
                     for node in nodes {
@@ -1430,13 +1445,14 @@ impl Database {
                     &checks,
                     &provided,
                     rows,
-                    ret_nodes.as_ref().map(|(nodes, _)| nodes.as_slice()),
+                    ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice()),
                     &bound,
                     &mut meter,
                 )?;
                 Ok(match (ret_nodes, returned) {
-                    (Some((_, names)), Some(rows)) => Outcome::Query {
+                    (Some((_, names, types)), Some(rows)) => Outcome::Query {
                         column_names: names,
+                        column_types: types,
                         rows,
                         cost: meter.accrued,
                     },
@@ -1465,7 +1481,7 @@ impl Database {
                 let mut meter = Meter::with_limit(self.max_cost);
                 self.fold_uncorrelated_in_plan(&mut plan, &bound, &mut meter.accrued)?;
                 let mut ret_nodes = ret;
-                if let Some((nodes, _)) = &mut ret_nodes {
+                if let Some((nodes, _, _)) = &mut ret_nodes {
                     for node in nodes {
                         self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
                     }
@@ -1517,13 +1533,14 @@ impl Database {
                     &checks,
                     &provided,
                     q.rows,
-                    ret_nodes.as_ref().map(|(nodes, _)| nodes.as_slice()),
+                    ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice()),
                     &bound,
                     &mut meter,
                 )?;
                 Ok(match (ret_nodes, returned) {
-                    (Some((_, names)), Some(rows)) => Outcome::Query {
+                    (Some((_, names, types)), Some(rows)) => Outcome::Query {
                         column_names: names,
+                        column_types: types,
                         rows,
                         cost: meter.accrued,
                     },
@@ -1767,12 +1784,12 @@ impl Database {
         items: &SelectItems,
         base_is_old: bool,
         ptypes: &mut ParamTypes,
-    ) -> Result<(Vec<RExpr>, Vec<String>)> {
+    ) -> Result<(Vec<RExpr>, Vec<String>, Vec<String>)> {
         let tdef = self.table(table).expect("INSERT target resolved above");
         let scope = Scope::returning(self, tdef, base_is_old);
-        let (nodes, names, _types) =
+        let (nodes, names, types) =
             resolve_projections(&scope, items, &mut AggCtx::Forbidden, ptypes)?;
-        Ok((nodes, names))
+        Ok((nodes, names, type_names(&types)))
     }
 
     /// Evaluate a resolved RETURNING projection over the affected rows (grammar.md §32,
@@ -1851,9 +1868,9 @@ impl Database {
         let mut ret = match &del.returning {
             Some(items) => {
                 let rscope = Scope::returning(self, table, true);
-                let (nodes, names, _types) =
+                let (nodes, names, types) =
                     resolve_projections(&rscope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
-                Some((nodes, names))
+                Some((nodes, names, type_names(&types)))
             }
             None => None,
         };
@@ -1868,7 +1885,7 @@ impl Database {
         if let Some(f) = &mut filter {
             self.fold_uncorrelated_in_rexpr(f, &bound, &mut meter.accrued)?;
         }
-        if let Some((nodes, _)) = &mut ret {
+        if let Some((nodes, _, _)) = &mut ret {
             for node in nodes {
                 self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
             }
@@ -1905,7 +1922,7 @@ impl Database {
         if let Some(f) = &filter {
             collect_touched(f, 0, &mut mask);
         }
-        if let Some((nodes, _)) = &ret {
+        if let Some((nodes, _, _)) = &ret {
             let mut ret_mask = vec![false; 2 * ncols];
             for node in nodes {
                 collect_touched(node, 0, &mut ret_mask);
@@ -1950,7 +1967,7 @@ impl Database {
         // rows' OLD values before anything is removed — subqueries in the list read the
         // pre-statement snapshot, and a 54P01 here deletes nothing (all-or-nothing).
         let returned = match &ret {
-            Some((nodes, _)) => {
+            Some((nodes, _, _)) => {
                 let prows: Vec<&Row> = matched.iter().map(|(_, r)| r).collect();
                 Some(self.project_returning(nodes, &prows, None, &bound, &mut meter)?)
             }
@@ -1970,8 +1987,9 @@ impl Database {
             }
         }
         Ok(match (ret, returned) {
-            (Some((_, names)), Some(rows)) => Outcome::Query {
+            (Some((_, names, types)), Some(rows)) => Outcome::Query {
                 column_names: names,
+                column_types: types,
                 rows,
                 cost: meter.accrued,
             },
@@ -2065,9 +2083,9 @@ impl Database {
         let mut ret = match &upd.returning {
             Some(items) => {
                 let rscope = Scope::returning(self, table, false);
-                let (nodes, names, _types) =
+                let (nodes, names, types) =
                     resolve_projections(&rscope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
-                Some((nodes, names))
+                Some((nodes, names, type_names(&types)))
             }
             None => None,
         };
@@ -2090,7 +2108,7 @@ impl Database {
         if let Some(f) = &mut filter {
             self.fold_uncorrelated_in_rexpr(f, &bound, &mut meter.accrued)?;
         }
-        if let Some((nodes, _)) = &mut ret {
+        if let Some((nodes, _, _)) = &mut ret {
             for node in nodes {
                 self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
             }
@@ -2130,7 +2148,7 @@ impl Database {
         for plan in &plans {
             collect_touched(&plan.source, 0, &mut mask);
         }
-        if let Some((nodes, _)) = &ret {
+        if let Some((nodes, _, _)) = &ret {
             let mut ret_mask = vec![false; 2 * ncols];
             for node in nodes {
                 collect_touched(node, 0, &mut ret_mask);
@@ -2245,7 +2263,7 @@ impl Database {
         // nothing is written yet, so subqueries in the list read the pre-statement snapshot
         // and a 54P01 here writes nothing (all-or-nothing).
         let returned = match &ret {
-            Some((nodes, _)) => {
+            Some((nodes, _, _)) => {
                 let prows: Vec<&Row> = updates.iter().map(|(_, new_row, _)| new_row).collect();
                 let olds: Vec<&Row> = updates.iter().map(|(_, _, old_row)| old_row).collect();
                 Some(self.project_returning(nodes, &prows, Some(&olds), &bound, &mut meter)?)
@@ -2287,8 +2305,9 @@ impl Database {
             }
         }
         Ok(match (ret, returned) {
-            (Some((_, names)), Some(rows)) => Outcome::Query {
+            (Some((_, names, types)), Some(rows)) => Outcome::Query {
                 column_names: names,
+                column_types: types,
                 rows,
                 cost: meter.accrued,
             },
@@ -2305,6 +2324,7 @@ impl Database {
         let r = self.run_select(sel, params)?;
         Ok(Outcome::Query {
             column_names: r.column_names,
+            column_types: type_names(&r.column_types),
             rows: r.rows,
             cost: r.cost,
         })
@@ -2318,6 +2338,7 @@ impl Database {
         let r = self.run_set_op(so, params)?;
         Ok(Outcome::Query {
             column_names: r.column_names,
+            column_types: type_names(&r.column_types),
             rows: r.rows,
             cost: r.cost,
         })
@@ -3926,6 +3947,13 @@ impl ResolvedType {
             ResolvedType::Timestamptz => col_ty.is_timestamptz(),
         }
     }
+}
+
+/// Render a projection's resolved types as their canonical names for the public `Outcome::Query`
+/// — the `# types:` directive's assertion surface (spec/design/conformance.md §7). Same names as
+/// the `42804` message (`type_name`): the exact integer width, the unconstrained `decimal`.
+fn type_names(types: &[ResolvedType]) -> Vec<String> {
+    types.iter().map(|t| t.type_name().to_string()).collect()
 }
 
 #[derive(Clone, Copy)]

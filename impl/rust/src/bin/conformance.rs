@@ -151,6 +151,20 @@ fn parse_names_directive(rest: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Parse a `# types: int16, text, decimal` directive body. Returns the asserted output column
+/// types — each the canonical name of a result column's resolved type (the integer WIDTH, the
+/// unconstrained `decimal`, `unknown` for an untyped NULL), beyond the `I`/`T`/`D` rendering tag
+/// (spec/design/conformance.md §1/§7). None if this comment is not a types directive.
+fn parse_types_directive(rest: &str) -> Option<Vec<String>> {
+    let list = rest.trim_start().strip_prefix("types:")?;
+    Some(
+        list.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
+}
+
 /// Assert the accrued execution cost matches a pending `# cost:` directive (if any).
 fn assert_cost(expected: Option<i64>, actual: i64, sql: &str) -> std::result::Result<(), String> {
     match expected {
@@ -175,15 +189,30 @@ fn assert_names(
     }
 }
 
+/// Assert the query's output column types match a pending `# types:` directive (if any).
+fn assert_types(
+    expected: Option<&[String]>,
+    actual: &[String],
+    sql: &str,
+) -> std::result::Result<(), String> {
+    match expected {
+        Some(e) if e != actual => Err(format!(
+            "column-type mismatch\n  SQL: {sql}\n  expected: {e:?}\n  actual:   {actual:?}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Run all records in one .test file against a fresh database. Returns the first
 /// mismatch as an error string.
 fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut db = Database::new();
     let mut lines = text.lines().peekable();
-    // A `# cost: N` / `# names: ...` / `# max_cost: N` directive sets these; the next record
-    // consumes them.
+    // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
+    // next record consumes them.
     let mut pending_cost: Option<i64> = None;
     let mut pending_names: Option<Vec<String>> = None;
+    let mut pending_types: Option<Vec<String>> = None;
     let mut pending_max_cost: Option<i64> = None;
 
     while let Some(line) = lines.next() {
@@ -192,28 +221,35 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('#') {
-            // `# cost:` / `# names:` bind to the next record; every other comment is ignored.
+            // `# cost:` / `# names:` / `# types:` bind to the next record; every other comment
+            // is ignored.
             if let Some(n) = parse_cost_directive(rest) {
                 pending_cost = Some(n);
             } else if let Some(n) = parse_max_cost_directive(rest) {
                 pending_max_cost = Some(n);
             } else if let Some(names) = parse_names_directive(rest) {
                 pending_names = Some(names);
+            } else if let Some(types) = parse_types_directive(rest) {
+                pending_types = Some(types);
             }
             continue;
         }
         // This record consumes any pending assertions (so they never leak forward).
         let expected_cost = pending_cost.take();
         let expected_names = pending_names.take();
+        let expected_types = pending_types.take();
         // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
         db.set_max_cost(pending_max_cost.take().unwrap_or(0));
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();
         match kind {
             "statement" => {
-                // A `# names:` directive asserts result columns, which a statement lacks.
+                // `# names:` / `# types:` assert result columns, which a statement lacks.
                 if expected_names.is_some() {
                     return Err("# names: directive precedes a non-query statement".to_string());
+                }
+                if expected_types.is_some() {
+                    return Err("# types: directive precedes a non-query statement".to_string());
                 }
                 let expect = parts.next().unwrap_or("");
                 let sql = take_sql(&mut lines);
@@ -277,6 +313,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 }
                 assert_cost(expected_cost, outcome.cost(), &sql)?;
                 assert_names(expected_names.as_deref(), outcome.column_names(), &sql)?;
+                assert_types(expected_types.as_deref(), outcome.column_types(), &sql)?;
             }
             other => return Err(format!("unknown record kind '{other}'")),
         }

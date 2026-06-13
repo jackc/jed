@@ -1,0 +1,68 @@
+# Result-type assertions (spec/design/conformance.md §1/§7). The `# types:` directive binds to the
+# next `query` record and asserts each output column's PRECISE resolved type — the canonical type
+# name, in order. This is the assertion the `I`/`B`/`T`/`D` rendering tag deliberately is NOT: the
+# tag says how a value PRINTS, so the three integer widths int16/int32/int64 all render as `I` and
+# are indistinguishable by value alone. `# types:` pins the width (and the family), so a cross-core
+# divergence in the integer promotion tower / cast target / comparison result type fails here even
+# though the printed rows agree. Like `# names:`/`# cost:`, it is a comment the stock runner
+# ignores; it precedes a `query` (never a `statement`, which has no result columns). The asserted
+# type is the resolved SCALAR type — for decimal the unconstrained `decimal`, NOT the numeric(p,s)
+# typmod (the resolved expression type does not carry it; §7 records that as deferred).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, types.int16, types.int32, types.int64, types.text, types.decimal, types.boolean_storable, types.boolean, expr.arithmetic, expr.decimal_arithmetic, cast.explicit, compare.promotion, query.comparison_order, expr.comparison_value
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, a int16, b int32, c int64, d numeric(10,2), s text, f boolean)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 1000, 100000, 3.50, 'hi', true)
+
+# Bare columns carry their declared type exactly — the three integer widths are distinct even
+# though all three print as `I`, and text/decimal/boolean keep their families. `# names:` composes.
+# names: a, b, c, s, d, f
+# types: int16, int32, int64, text, decimal, boolean
+query IIITDB nosort
+SELECT a, b, c, s, d, f FROM t
+----
+10
+1000
+100000
+hi
+3.50
+true
+
+# Integer arithmetic promotes to the wider operand (the promotion tower int16<int32<int64): same
+# width stays, a mixed pair takes the wider — the result TYPE differs across the three even though
+# the sums all print as plain integers.
+# types: int16, int32, int64
+query III nosort
+SELECT a + a, a + b, b + c FROM t
+----
+20
+1010
+101000
+
+# An explicit CAST resolves to its target width regardless of the source width.
+# types: int16, int64
+query II nosort
+SELECT CAST(b AS int16), CAST(a AS int64) FROM t
+----
+1000
+10
+
+# A comparison is a boolean value (expr.comparison_value), whatever the operand types.
+# types: boolean, boolean
+query BB nosort
+SELECT a < b, c = c FROM t
+----
+true
+true
+
+# Decimal arithmetic stays decimal, and an integer operand promotes to decimal (so int + decimal
+# is a decimal result, not an integer). The value's display scale follows the per-operator rule
+# (add → max scale), but the asserted TYPE is the unconstrained `decimal` either way.
+# types: decimal, decimal
+query DD nosort
+SELECT d + d, b + d FROM t
+----
+7.00
+1003.50

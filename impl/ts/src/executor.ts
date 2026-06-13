@@ -97,9 +97,13 @@ import {
 // rowsAffected is how many rows a DML statement (INSERT/UPDATE/DELETE without RETURNING)
 // touched — PostgreSQL's command-tag count (spec/design/api.md §4); 0 for a DML statement
 // that matched nothing, null for DDL and transaction control, which have no row count.
+// columnTypes is the canonical name of each output column's resolved type (parallel to
+// columnNames) — int16/int32/int64/text/boolean/decimal/…, or "unknown" for an untyped NULL
+// column. The resolved SCALAR type — for decimal the unconstrained "decimal", not the
+// numeric(p,s) typmod (spec/design/conformance.md §7).
 export type Outcome =
   | { kind: "statement"; cost: bigint; rowsAffected: number | null }
-  | { kind: "query"; columnNames: string[]; rows: Value[][]; cost: bigint };
+  | { kind: "query"; columnNames: string[]; columnTypes: string[]; rows: Value[][]; cost: bigint };
 
 // SelectResult is the full result of running a SELECT (runSelect): the output column names and
 // their resolved types, the rows in result order, and the accrued cost. Internal — executeSelect
@@ -1164,7 +1168,7 @@ export class Database {
       // one ceiling over the whole statement.
       meter.charge(q.cost);
       const returned = this.insertRows(table, store, pk, checks, provided, q.rows, ret?.nodes ?? null, bound, meter);
-      return dmlOutcome(ret?.names ?? null, returned, q.rows.length, meter.accrued);
+      return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, q.rows.length, meter.accrued);
     }
 
     // VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
@@ -1225,7 +1229,7 @@ export class Database {
       meter.charge(foldCost.value);
     }
     const returned = this.insertRows(table, store, pk, checks, provided, rows, ret?.nodes ?? null, bound, meter);
-    return dmlOutcome(ret?.names ?? null, returned, rows.length, meter.accrued);
+    return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, rows.length, meter.accrued);
   }
 
   // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -1393,7 +1397,7 @@ export class Database {
   // resolveReturning resolves a RETURNING item list against the target table's one-relation
   // scope (grammar.md §32): aggregates are 42803 (the non-collecting AggCtx), subqueries
   // resolve (and may correlate against the returned row), output names follow §8. Returns the
-  // projection nodes and names; the item types have no consumer.
+  // projection nodes, names, and the canonical type names (Outcome columnTypes — conformance.md §7).
   // The scope is the RETURNING scope (Scope.returning — the table at offset 0 plus the
   // old/new qualifier-only pseudo-relations over the [base | other] projection row, with
   // baseIsOld true for DELETE).
@@ -1402,15 +1406,15 @@ export class Database {
     items: SelectItems,
     baseIsOld: boolean,
     ptypes: ParamTypes,
-  ): { nodes: RExpr[]; names: string[] } {
+  ): { nodes: RExpr[]; names: string[]; types: string[] } {
     const scope = Scope.returning(this, table, baseIsOld);
-    const { nodes, names } = resolveProjections(
+    const { nodes, names, types } = resolveProjections(
       scope,
       items,
       { collecting: false, groupKeys: [], specs: [] },
       ptypes,
     );
-    return { nodes, names };
+    return { nodes, names, types: typeNames(types) };
   }
 
   // projectReturning evaluates a resolved RETURNING projection over the affected rows
@@ -1499,7 +1503,7 @@ export class Database {
     // residual filter below. page_read per visited node (block, before the rows), then
     // storageRowRead per scanned row.
     const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound, mask);
-    if (entries === null) return dmlOutcome(ret?.names ?? null, null, 0, meter.accrued); // empty bound
+    if (entries === null) return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -1528,7 +1532,7 @@ export class Database {
         istore.remove(indexEntryKey(table.columns, def, m.key, m.row));
       }
     }
-    return dmlOutcome(ret?.names ?? null, returned, matched.length, meter.accrued);
+    return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, matched.length, meter.accrued);
   }
 
   // executeUpdate is two-phase / all-or-nothing: phase 1 builds and type-checks every
@@ -1636,7 +1640,7 @@ export class Database {
     // residual filter below. page_read per visited node (block, before the rows), then
     // storageRowRead per scanned row.
     const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound, mask);
-    if (entries === null) return dmlOutcome(ret?.names ?? null, null, 0, meter.accrued); // empty bound
+    if (entries === null) return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -1739,21 +1743,21 @@ export class Database {
         }
       }
     }
-    return dmlOutcome(ret?.names ?? null, returned, updates.length, meter.accrued);
+    return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, updates.length, meter.accrued);
   }
 
   // executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query
   // Outcome (the projection types are internal — only INSERT ... SELECT consumes them).
   private executeSelect(sel: Select, params: Value[]): Outcome {
     const r = this.runSelect(sel, params);
-    return { kind: "query", columnNames: r.columnNames, rows: r.rows, cost: r.cost };
+    return { kind: "query", columnNames: r.columnNames, columnTypes: typeNames(r.columnTypes), rows: r.rows, cost: r.cost };
   }
 
   // executeSetOp runs a set operation as a top-level statement: runSetOp, then wrap as a query
   // Outcome. Cost is lhs.cost + rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
   private executeSetOp(so: SetOp, params: Value[]): Outcome {
     const r = this.runSetOp(so, params);
-    return { kind: "query", columnNames: r.columnNames, rows: r.rows, cost: r.cost };
+    return { kind: "query", columnNames: r.columnNames, columnTypes: typeNames(r.columnTypes), rows: r.rows, cost: r.cost };
   }
 
   // runQueryExpr runs a query expression to a SelectResult — a lone SELECT via runSelect, or a set
@@ -3943,6 +3947,14 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
 }
 
 // rtName is `t`'s type name, for a 42804 assignability message (the integer width is exact).
+// typeNames renders a projection's resolved types as their canonical names for the public
+// Outcome columnTypes — the `# types:` directive's assertion surface (spec/design/conformance.md
+// §7). Same names as the 42804 message (rtName): the exact integer width, the unconstrained
+// "decimal".
+function typeNames(ts: ResolvedType[]): string[] {
+  return ts.map(rtName);
+}
+
 function rtName(t: ResolvedType): string {
   switch (t.kind) {
     case "int":
@@ -4083,12 +4095,13 @@ function cloneStores(stores: Map<string, TableStore>): Map<string, TableStore> {
 // carrying the affected-row count (spec/design/api.md §4).
 function dmlOutcome(
   retNames: string[] | null,
+  retTypes: string[] | null,
   returned: Value[][] | null,
   affected: number,
   cost: bigint,
 ): Outcome {
   if (retNames !== null) {
-    return { kind: "query", columnNames: retNames, rows: returned ?? [], cost };
+    return { kind: "query", columnNames: retNames, columnTypes: retTypes ?? [], rows: returned ?? [], cost };
   }
   return { kind: "statement", cost, rowsAffected: affected };
 }

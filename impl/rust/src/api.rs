@@ -46,6 +46,7 @@ impl Rows {
                 column_names,
                 rows,
                 cost,
+                ..
             } => Ok(Rows {
                 column_names,
                 iter: rows.into_iter(),

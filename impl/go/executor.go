@@ -34,6 +34,11 @@ type Outcome struct {
 	// ColumnNames are the output column names of a query result (nil for a non-query
 	// statement); the column count is len(ColumnNames) (spec/design/grammar.md §8).
 	ColumnNames []string
+	// ColumnTypes is the canonical name of each output column's resolved type (parallel to
+	// ColumnNames; nil for a non-query statement) — int16/int32/int64/text/boolean/decimal/…,
+	// or "unknown" for an untyped NULL column. It is the resolved SCALAR type — for decimal the
+	// unconstrained "decimal", not the numeric(p,s) typmod (spec/design/conformance.md §7).
+	ColumnTypes []string
 	Rows        [][]Value
 	Cost        int64
 	// RowsAffected is how many rows a DML statement (INSERT/UPDATE/DELETE without
@@ -1228,8 +1233,9 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		}
 		var retNodes []*rExpr
 		var retNames []string
+		var retTypes []string
 		if ins.Returning != nil {
-			if retNodes, retNames, err = db.resolveReturning(table, *ins.Returning, false, ptypes); err != nil {
+			if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ptypes); err != nil {
 				return Outcome{}, err
 			}
 		}
@@ -1291,7 +1297,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		if err != nil {
 			return Outcome{}, err
 		}
-		return dmlOutcome(retNames, returned, int64(len(q.rows)), meter.Accrued), nil
+		return dmlOutcome(retNames, retTypes, returned, int64(len(q.rows)), meter.Accrued), nil
 	}
 
 	// VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
@@ -1324,9 +1330,10 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	// before binding/execution — a 42703 here beats a would-be 23505 (grammar.md §32).
 	var retNodes []*rExpr
 	var retNames []string
+	var retTypes []string
 	if ins.Returning != nil {
 		var rerr error
-		if retNodes, retNames, rerr = db.resolveReturning(table, *ins.Returning, false, ptypes); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *ins.Returning, false, ptypes); rerr != nil {
 			return Outcome{}, rerr
 		}
 	}
@@ -1376,7 +1383,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	if err != nil {
 		return Outcome{}, err
 	}
-	return dmlOutcome(retNames, returned, int64(len(rows)), meter.Accrued), nil
+	return dmlOutcome(retNames, retTypes, returned, int64(len(rows)), meter.Accrued), nil
 }
 
 // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -1579,13 +1586,13 @@ func defaultOrNull(col Column) Value {
 // The scope is the RETURNING scope (returningScope — the table at offset 0 plus the
 // old/new qualifier-only pseudo-relations over the [base | other] projection row, with
 // baseIsOld true for DELETE).
-func (db *Database) resolveReturning(table *Table, items SelectItems, baseIsOld bool, ptypes *paramTypes) ([]*rExpr, []string, error) {
+func (db *Database) resolveReturning(table *Table, items SelectItems, baseIsOld bool, ptypes *paramTypes) ([]*rExpr, []string, []string, error) {
 	s := returningScope(db, table, baseIsOld)
-	nodes, names, _, err := resolveProjections(s, items, &aggCtx{collecting: false}, ptypes)
+	nodes, names, types, err := resolveProjections(s, items, &aggCtx{collecting: false}, ptypes)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return nodes, names, nil
+	return nodes, names, typeNames(types), nil
 }
 
 // projectReturning evaluates a resolved RETURNING projection over the affected rows
@@ -1630,12 +1637,12 @@ func (db *Database) projectReturning(nodes []*rExpr, rows []Row, others []Row, p
 // when a RETURNING clause was resolved (retNames non-nil — grammar.md §32; zero affected
 // rows is an EMPTY query result, never a bare statement), else a bare statement result
 // carrying the affected-row count (spec/design/api.md §4).
-func dmlOutcome(retNames []string, returned [][]Value, affected int64, cost int64) Outcome {
+func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affected int64, cost int64) Outcome {
 	if retNames != nil {
 		if returned == nil {
 			returned = [][]Value{}
 		}
-		return Outcome{Kind: OutcomeQuery, ColumnNames: retNames, Rows: returned, Cost: cost}
+		return Outcome{Kind: OutcomeQuery, ColumnNames: retNames, ColumnTypes: retTypes, Rows: returned, Cost: cost}
 	}
 	return Outcome{Kind: OutcomeStatement, Cost: cost, RowsAffected: affected, HasRowsAffected: true}
 }
@@ -1664,9 +1671,10 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	}
 	var retNodes []*rExpr
 	var retNames []string
+	var retTypes []string
 	if del.Returning != nil {
 		var rerr error
-		if retNodes, retNames, rerr = db.resolveReturning(table, *del.Returning, true, ptypes); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *del.Returning, true, ptypes); rerr != nil {
 			return Outcome{}, rerr
 		}
 	}
@@ -1733,7 +1741,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		if empty {
 			// A provably-empty bound affects zero rows — with RETURNING that is still a
 			// query result (empty rows), never a bare statement (grammar.md §32).
-			return dmlOutcome(retNames, nil, 0, meter.Accrued), nil
+			return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
 		}
 		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
 			return Outcome{}, err
@@ -1795,7 +1803,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 			}
 		}
 	}
-	return dmlOutcome(retNames, returned, int64(len(matched)), meter.Accrued), nil
+	return dmlOutcome(retNames, retTypes, returned, int64(len(matched)), meter.Accrued), nil
 }
 
 // executeUpdate analyzes and runs an UPDATE. Two-phase / all-or-nothing: phase 1
@@ -1862,9 +1870,10 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	// one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
 	var retNodes []*rExpr
 	var retNames []string
+	var retTypes []string
 	if upd.Returning != nil {
 		var rerr error
-		if retNodes, retNames, rerr = db.resolveReturning(table, *upd.Returning, false, ptypes); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *upd.Returning, false, ptypes); rerr != nil {
 			return Outcome{}, rerr
 		}
 	}
@@ -1956,7 +1965,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		if empty {
 			// A provably-empty bound affects zero rows — with RETURNING that is still a
 			// query result (empty rows), never a bare statement (grammar.md §32).
-			return dmlOutcome(retNames, nil, 0, meter.Accrued), nil
+			return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
 		}
 		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
 			return Outcome{}, err
@@ -2132,7 +2141,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			}
 		}
 	}
-	return dmlOutcome(retNames, returned, int64(len(updates)), meter.Accrued), nil
+	return dmlOutcome(retNames, retTypes, returned, int64(len(updates)), meter.Accrued), nil
 }
 
 // RowsInKeyOrder returns a table's rows in primary-key (encoded byte) order in the visible snapshot,
@@ -2176,7 +2185,7 @@ func (db *Database) executeSelect(sel *Select, params []Value) (Outcome, error) 
 	if err != nil {
 		return Outcome{}, err
 	}
-	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, Rows: r.rows, Cost: r.cost}, nil
+	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
 }
 
 // executeSetOp runs a set operation as a top-level statement: runSetOp, then wrap as a query
@@ -2186,7 +2195,7 @@ func (db *Database) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
-	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, Rows: r.rows, Cost: r.cost}, nil
+	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
 }
 
 // runQueryExpr runs a query expression to a selectResult — a lone SELECT via runSelect, or a set
@@ -4313,6 +4322,18 @@ func assignableTo(t resolvedType, colTy ScalarType) bool {
 }
 
 // rtName is t's type name, for a 42804 assignability message (the integer width is exact).
+// typeNames renders a projection's resolved types as their canonical names for the public
+// Outcome.ColumnTypes — the `# types:` directive's assertion surface (spec/design/conformance.md
+// §7). Same names as the 42804 message (rtName): the exact integer width, the unconstrained
+// "decimal".
+func typeNames(ts []resolvedType) []string {
+	out := make([]string, len(ts))
+	for i, t := range ts {
+		out[i] = rtName(t)
+	}
+	return out
+}
+
 func rtName(t resolvedType) string {
 	switch t.kind {
 	case rtInt:

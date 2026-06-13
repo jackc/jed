@@ -161,15 +161,38 @@ function assertNames(expected: string[] | null, actual: string[], sql: string): 
   }
 }
 
+// parseTypesDirective parses a `# types: int16, text, decimal` directive line. Returns the
+// asserted output column types — each the canonical name of a result column's resolved type (the
+// integer WIDTH, the unconstrained `decimal`, `unknown` for an untyped NULL), beyond the
+// `I`/`T`/`D` rendering tag (conformance.md §1/§7); null if not a types directive.
+function parseTypesDirective(line: string): string[] | null {
+  const m = line.match(/^#\s*types:\s*(.+)$/);
+  if (!m) return null;
+  return m[1]!
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+}
+
+// assertTypes checks the query's output column types match a pending `# types:` directive.
+function assertTypes(expected: string[] | null, actual: string[], sql: string): void {
+  if (expected !== null && !arrEq(expected, actual)) {
+    throw new Error(
+      `column-type mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(expected)}\n  actual:   ${JSON.stringify(actual)}`,
+    );
+  }
+}
+
 // runFile runs all records in one .test file against a fresh database.
 function runFile(text: string): void {
   const db = new Database();
   const lines = text.split("\n");
   const c: Cursor = { i: 0 };
-  // A `# cost: N` / `# names: ...` / `# max_cost: N` directive sets these; the next record
-  // consumes them.
+  // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
+  // next record consumes them.
   let pendingCost: bigint | null = null;
   let pendingNames: string[] | null = null;
+  let pendingTypes: string[] | null = null;
   let pendingMaxCost: bigint | null = null;
   while (c.i < lines.length) {
     const line = lines[c.i]!.trim();
@@ -178,7 +201,8 @@ function runFile(text: string): void {
       continue;
     }
     if (line.startsWith("#")) {
-      // `# cost:` / `# max_cost:` / `# names:` bind to the next record; every other comment is ignored.
+      // `# cost:` / `# max_cost:` / `# names:` / `# types:` bind to the next record; every other
+      // comment is ignored.
       const n = parseCostDirective(line);
       const mc = parseMaxCostDirective(line);
       if (n !== null) {
@@ -187,7 +211,12 @@ function runFile(text: string): void {
         pendingMaxCost = mc;
       } else {
         const names = parseNamesDirective(line);
-        if (names !== null) pendingNames = names;
+        if (names !== null) {
+          pendingNames = names;
+        } else {
+          const types = parseTypesDirective(line);
+          if (types !== null) pendingTypes = types;
+        }
       }
       c.i++;
       continue;
@@ -195,16 +224,21 @@ function runFile(text: string): void {
     // This record consumes any pending assertions (so they never leak forward).
     const expectedCost = pendingCost;
     const expectedNames = pendingNames;
+    const expectedTypes = pendingTypes;
     pendingCost = null;
     pendingNames = null;
+    pendingTypes = null;
     // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
     db.setMaxCost(pendingMaxCost ?? 0n);
     pendingMaxCost = null;
     const fields = line.split(/\s+/);
     if (fields[0] === "statement") {
-      // A `# names:` directive asserts result columns, which a statement lacks.
+      // `# names:` / `# types:` assert result columns, which a statement lacks.
       if (expectedNames !== null) {
         throw new Error("# names: directive precedes a non-query statement");
+      }
+      if (expectedTypes !== null) {
+        throw new Error("# types: directive precedes a non-query statement");
       }
       const expect = fields[1] ?? "";
       c.i++;
@@ -259,6 +293,7 @@ function runFile(text: string): void {
       }
       assertCost(expectedCost, outcome.cost, sql);
       assertNames(expectedNames, outcome.kind === "query" ? outcome.columnNames : [], sql);
+      assertTypes(expectedTypes, outcome.kind === "query" ? outcome.columnTypes : [], sql);
     } else {
       throw new Error(`unknown record kind "${fields[0]}"`);
     }

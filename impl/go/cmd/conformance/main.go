@@ -179,15 +179,42 @@ func assertNames(expected []string, actual []string, sql string) error {
 	return nil
 }
 
+// parseTypesDirective parses a `# types: int16, text, decimal` directive line. Returns the
+// asserted output column types — each the canonical name of a result column's resolved type (the
+// integer WIDTH, the unconstrained `decimal`, `unknown` for an untyped NULL), beyond the
+// `I`/`T`/`D` rendering tag (spec/design/conformance.md §1/§7). (nil, false) if not a types directive.
+func parseTypesDirective(line string) ([]string, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "types:")
+	if !ok {
+		return nil, false
+	}
+	var types []string
+	for _, part := range strings.Split(rest, ",") {
+		if s := strings.TrimSpace(part); s != "" {
+			types = append(types, s)
+		}
+	}
+	return types, true
+}
+
+// assertTypes checks the query's output column types match a pending `# types:` directive.
+func assertTypes(expected []string, actual []string, sql string) error {
+	if expected != nil && !equal(expected, actual) {
+		return fmt.Errorf("column-type mismatch\n  SQL: %s\n  expected: %v\n  actual:   %v", sql, expected, actual)
+	}
+	return nil
+}
+
 // runFile runs all records in one .test file against a fresh database.
 func runFile(text string) error {
 	db := jed.NewDatabase()
 	lines := strings.Split(text, "\n")
 	i := 0
-	// A `# cost: N` / `# names: ...` / `# max_cost: N` directive sets these; the next record
-	// consumes them.
+	// A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
+	// next record consumes them.
 	var pendingCost *int64
 	var pendingNames []string
+	var pendingTypes []string
 	var pendingMaxCost *int64
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
@@ -196,13 +223,16 @@ func runFile(text string) error {
 			continue
 		}
 		if strings.HasPrefix(line, "#") {
-			// `# cost:` / `# names:` bind to the next record; every other comment is ignored.
+			// `# cost:` / `# names:` / `# types:` bind to the next record; every other comment
+			// is ignored.
 			if n, ok := parseCostDirective(line); ok {
 				pendingCost = &n
 			} else if n, ok := parseMaxCostDirective(line); ok {
 				pendingMaxCost = &n
 			} else if names, ok := parseNamesDirective(line); ok {
 				pendingNames = names
+			} else if types, ok := parseTypesDirective(line); ok {
+				pendingTypes = types
 			}
 			i++
 			continue
@@ -210,8 +240,10 @@ func runFile(text string) error {
 		// This record consumes any pending assertions (so they never leak forward).
 		expectedCost := pendingCost
 		expectedNames := pendingNames
+		expectedTypes := pendingTypes
 		pendingCost = nil
 		pendingNames = nil
+		pendingTypes = nil
 		// Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
 		var maxCost int64
 		if pendingMaxCost != nil {
@@ -222,9 +254,12 @@ func runFile(text string) error {
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "statement":
-			// A `# names:` directive asserts result columns, which a statement lacks.
+			// `# names:` / `# types:` assert result columns, which a statement lacks.
 			if expectedNames != nil {
 				return fmt.Errorf("# names: directive precedes a non-query statement")
+			}
+			if expectedTypes != nil {
+				return fmt.Errorf("# types: directive precedes a non-query statement")
 			}
 			expect := ""
 			if len(fields) > 1 {
@@ -289,6 +324,9 @@ func runFile(text string) error {
 			}
 			if nerr := assertNames(expectedNames, outcome.ColumnNames, sql); nerr != nil {
 				return nerr
+			}
+			if terr := assertTypes(expectedTypes, outcome.ColumnTypes, sql); terr != nil {
+				return terr
 			}
 		default:
 			return fmt.Errorf("unknown record kind %q", fields[0])

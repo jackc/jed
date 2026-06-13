@@ -87,6 +87,7 @@ impl Session {
                 column_names,
                 rows,
                 cost,
+                ..
             }) => Ok(ExecOutput::Query {
                 columns: column_names,
                 rows,
