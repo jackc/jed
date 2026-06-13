@@ -39,7 +39,7 @@ pub struct OpenOptions {
     /// silently scale with the file's page size; the engine converts it to a leaf-page capacity by the
     /// file's page size as `max(1, cache_bytes / page_size)` ([`cache_leaves`](crate::paging)). The
     /// bound that lets a database far larger than RAM be served (pager.md §1); it never changes what a
-    /// query observes (§3/§5). Default [`DEFAULT_CACHE_BYTES`](crate::paging) (8 MiB).
+    /// query observes (§3/§5). Default [`DEFAULT_CACHE_BYTES`](crate::paging) (256 MiB).
     pub cache_bytes: usize,
 }
 
@@ -85,7 +85,7 @@ impl Database {
     }
 
     /// Open an **existing** file-backed database at `path` with default open settings — the buffer-pool
-    /// budget defaults to [`DEFAULT_CACHE_BYTES`](crate::paging) (8 MiB). See
+    /// budget defaults to [`DEFAULT_CACHE_BYTES`](crate::paging) (256 MiB). See
     /// [`open_with_options`](Database::open_with_options) to set the budget.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Database> {
         Database::open_with_options(path, OpenOptions::default())

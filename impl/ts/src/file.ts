@@ -62,7 +62,7 @@ function writeFullImage(db: Database): void {
 // P6.4b/c). Bytes, not a page count, so the budget does not silently scale with the file's page size;
 // the engine converts it to a leaf-page capacity by the file's page size as max(1, cacheBytes /
 // pageSize) (cacheLeaves). The bound that lets a database far larger than RAM be served (pager.md §1);
-// it never changes what a query observes (§3/§5). Default DEFAULT_CACHE_BYTES (8 MiB).
+// it never changes what a query observes (§3/§5). Default DEFAULT_CACHE_BYTES (256 MiB).
 export type OpenOptions = { cacheBytes?: number };
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,

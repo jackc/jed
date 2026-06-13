@@ -69,8 +69,9 @@ page still keeps **one** leaf resident, the minimum to walk a root→leaf path. 
 on-disk page bytes* — a proxy for resident memory, since a cached leaf is held *decoded*, whose heap
 size depends on row content; it bounds the leaf count deterministically, not bytes exactly.) It is a
 **handle** setting, **not** stored in the file (unlike `page_size`): a different host may reopen the
-same file with a different budget. Default **8 MiB** (`DEFAULT_CACHE_BYTES` — exactly the historical
-1024-leaf default at the 8192 default page size). The budget bounds only the **leaf cache** — the
+same file with a different budget. Default **256 MiB** (`DEFAULT_CACHE_BYTES` — sized so the dominant
+RAM-sized-database case stays fully cache-resident, pager.md §3). The budget bounds only the **leaf
+cache** — the
 interior B-tree skeleton is always resident (pager.md §1/§4) — and it **never changes what a query
 observes** (results and cost are invariant to it, pager.md §3/§5), so it is purely a memory/throughput
 knob. A read-only gauge, **`resident_leaves`** (`0` for an in-memory database), reports how many leaf

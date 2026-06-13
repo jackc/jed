@@ -96,7 +96,11 @@ A fixed-capacity cache mapping `page_id → decoded page`, with:
   Bytes, not a page count, so the caller's budget does not silently scale with the file's `page_size`
   (a page count would mean a 256× different footprint across page sizes); the `max(1, …)` floor keeps
   one leaf resident even when `cache_bytes < page_size`. Default sized so a RAM-sized working set stays
-  fully cache-resident (§1) — `DEFAULT_CACHE_BYTES = 8 MiB`. The budget is a *handle* setting, not an
+  fully cache-resident (§1) — `DEFAULT_CACHE_BYTES = 256 MiB`. (Originally 8 MiB — the historical
+  1024-leaf count at the 8192 page size — which contradicted this sizing rule: a typical RAM-sized
+  database thrashed the pool under the default, paying a fault + leaf decode on most point lookups.
+  256 MiB keeps the dominant RAM-sized case fully resident; a host that wants the old bound passes
+  `cache_bytes` explicitly.) The budget is a *handle* setting, not an
   on-disk parameter.
 - **Eviction — CLOCK (second-chance).** A simple per-core CLOCK over the resident pages: a
   reference bit set on access, a hand that sweeps and evicts the first unreferenced, unpinned,
@@ -212,7 +216,7 @@ change lands alone, on a frozen seam:
   corpus-neutral change, so each core can land green independently — like P5.1).
 - **P6.4c — budget config + hardening. ✅ landed.** The handle-level memory budget is now a public
   **open-time** setting (`open(path, opts)` with `opts.cache_bytes` — the buffer-pool budget in
-  **bytes**, default `DEFAULT_CACHE_BYTES = 8 MiB`, converted to a leaf-page capacity by the file's
+  **bytes**, default `DEFAULT_CACHE_BYTES = 256 MiB`, converted to a leaf-page capacity by the file's
   page size as `max(1, cache_bytes / page_size)`; a **handle** setting, never stored in the file —
   api.md §2.1), with a read-only **`resident_leaves`** gauge (`0` for in-memory). The internal
   `open_with_capacity` seam was promoted to this public API. **Bytes, not a page count**, so the

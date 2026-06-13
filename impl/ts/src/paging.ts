@@ -18,11 +18,12 @@ import { BufferPool } from "./bufferpool.ts";
 import { decodeLeafNode } from "./format.ts";
 import { Pager } from "./pager.ts";
 
-// DEFAULT_CACHE_BYTES is the default memory budget for the resident leaf cache, in bytes (8 MiB) — the
-// OpenOptions.cachePages default (spec/design/pager.md §3, api.md §2.1). Exactly the historical
-// 1024-leaf default at the 8192 default page size; stated in bytes so the budget does not silently
-// scale with a file's page size. Converted to a leaf-page capacity by cacheLeaves.
-export const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
+// DEFAULT_CACHE_BYTES is the default memory budget for the resident leaf cache, in bytes (256 MiB) — the
+// OpenOptions.cacheBytes default (spec/design/pager.md §3, api.md §2.1). Sized so the dominant case —
+// a RAM-sized database (CLAUDE.md §9) — stays fully cache-resident under the default; stated in bytes
+// so the budget does not silently scale with a file's page size. Converted to a leaf-page capacity by
+// cacheLeaves.
+export const DEFAULT_CACHE_BYTES = 256 * 1024 * 1024;
 
 // cacheLeaves converts a byte budget to a resident-leaf-page capacity for a file of pageSize bytes:
 // max(1, floor(cacheBytes / pageSize)) (pager.md §3). The max(1, …) floor keeps one leaf resident even

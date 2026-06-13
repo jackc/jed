@@ -68,12 +68,12 @@ type OpenOptions struct {
 	// silently scale with the file's page size; the engine converts it to a leaf-page capacity by the
 	// file's page size as max(1, CacheBytes / pageSize) (cacheLeaves). The bound that lets a database far
 	// larger than RAM be served (pager.md §1); it never changes what a query observes (§3/§5). 0 →
-	// DefaultCacheBytes (8 MiB).
+	// DefaultCacheBytes (256 MiB).
 	CacheBytes int
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool
-// budget defaults to DefaultCacheBytes (8 MiB). See OpenWithOptions to set the budget. The path must
+// budget defaults to DefaultCacheBytes (256 MiB). See OpenWithOptions to set the budget. The path must
 // exist — 58P01 otherwise; a malformed file is XX001, a read failure 58030 (api.md §2.1).
 func Open(path string) (*Database, error) {
 	return OpenWithOptions(path, OpenOptions{})

@@ -16,11 +16,12 @@ package jed
 
 import "sync"
 
-// DefaultCacheBytes is the default memory budget for the resident leaf cache, in bytes (8 MiB) — the
-// OpenOptions.CacheBytes default (spec/design/pager.md §3, api.md §2.1). Exactly the historical
-// 1024-leaf default at the 8192 default page size; stated in bytes so the budget does not silently
-// scale with a file's page size. Converted to a leaf-page capacity by cacheLeaves.
-const DefaultCacheBytes = 8 * 1024 * 1024
+// DefaultCacheBytes is the default memory budget for the resident leaf cache, in bytes (256 MiB) — the
+// OpenOptions.CacheBytes default (spec/design/pager.md §3, api.md §2.1). Sized so the dominant case —
+// a RAM-sized database (CLAUDE.md §9) — stays fully cache-resident under the default; stated in bytes
+// so the budget does not silently scale with a file's page size. Converted to a leaf-page capacity by
+// cacheLeaves.
+const DefaultCacheBytes = 256 * 1024 * 1024
 
 // cacheLeaves converts a byte budget to a resident-leaf-page capacity for a file of pageSize bytes:
 // max(1, cacheBytes / pageSize) (pager.md §3). The max(1, …) floor keeps one leaf resident even when
