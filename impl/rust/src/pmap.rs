@@ -216,41 +216,46 @@ impl KeyBound {
         KeyBound::default()
     }
 
-    /// Whether an encoded key lies within the bound.
-    fn contains(&self, key: &[u8]) -> bool {
-        use std::cmp::Ordering::{Equal, Greater, Less};
-        if let Some(lo) = &self.lo {
-            match key.cmp(lo.as_slice()) {
-                Less => return false,
-                Equal if !self.lo_inc => return false,
-                _ => {}
-            }
-        }
-        if let Some(hi) = &self.hi {
-            match key.cmp(hi.as_slice()) {
-                Greater => return false,
-                Equal if !self.hi_inc => return false,
-                _ => {}
-            }
-        }
-        true
+    /// The contiguous window `[first ..= last]` of `node`'s child indices whose separator span can
+    /// overlap the bound — child `i` spans the OPEN interval `(keys[i-1], keys[i])`, so it is pruned
+    /// iff `keys[i] ≤ lo` (entirely at/below lo) or `keys[i-1] ≥ hi` (entirely at/above hi). The keys
+    /// are sorted, so the surviving children are contiguous and both edges binary-search:
+    /// `first` = the first child not below lo, `last` = the last child not above hi. The strict
+    /// comparisons are exact regardless of endpoint inclusivity — the separators are entries in this
+    /// node (covered by [`entry_window`]), never in a child. The node's own outer brackets need no
+    /// test: the parent descended here only because this subtree overlaps. `range_entries` (descends)
+    /// and `overlap_node_count` (counts) window identically, so they visit the SAME node set — the §8
+    /// determinism the `page_read` cost depends on — decided from resident separators WITHOUT
+    /// faulting an OnDisk leaf. A bound admitting only a separator entry in this node yields
+    /// `first > last` (every child pruned): an empty child window, still a valid entry window.
+    fn child_window(&self, node: &Node) -> (usize, usize) {
+        let first = match &self.lo {
+            None => 0,
+            Some(lo) => node.keys.partition_point(|k| k.as_slice() <= lo.as_slice()),
+        };
+        let last = match &self.hi {
+            None => node.keys.len(),
+            Some(hi) => node.keys.partition_point(|k| k.as_slice() < hi.as_slice()),
+        };
+        (first, last)
     }
 
-    /// Whether a child subtree spanning the OPEN separator interval `(a, c)` — `None` for the open
-    /// ends — can hold any key within the bound. The separators are entries in the PARENT (tested with
-    /// `contains`), never in the child, so the interval is open and strict comparisons are exact
-    /// regardless of endpoint inclusivity. `range_entries` (descends) and `overlap_node_count` (counts)
-    /// call this identically, so they visit the SAME node set — the §8 determinism the `page_read` cost
-    /// depends on — decided from resident separators WITHOUT faulting an OnDisk leaf.
-    fn child_overlaps(&self, a: Option<&[u8]>, c: Option<&[u8]>) -> bool {
-        use std::cmp::Ordering::{Greater, Less};
-        // Prune if the child is entirely at/below lo — its upper separator c is not strictly above lo
-        // (c == None is +∞, never below) — or entirely at/above hi — its lower separator a is not
-        // strictly below hi (a == None is −∞, never above). Descend only if neither holds.
-        let below_lo =
-            matches!((&self.lo, c), (Some(lo), Some(c)) if c.cmp(lo.as_slice()) != Greater);
-        let above_hi = matches!((&self.hi, a), (Some(hi), Some(a)) if a.cmp(hi.as_slice()) != Less);
-        !below_lo && !above_hi
+    /// The contiguous half-open window `[first .. last)` of `node`'s own entry indices whose keys lie
+    /// within the bound — the binary-searched equivalent of testing `contains` per key, honoring the
+    /// endpoint inclusivity flags. On a leaf this is the admitted row range; on an interior node it is
+    /// the admitted separator entries (a B-tree stores records in interior nodes too).
+    fn entry_window(&self, node: &Node) -> (usize, usize) {
+        let first = match &self.lo {
+            None => 0,
+            Some(lo) if self.lo_inc => node.keys.partition_point(|k| k.as_slice() < lo.as_slice()),
+            Some(lo) => node.keys.partition_point(|k| k.as_slice() <= lo.as_slice()),
+        };
+        let last = match &self.hi {
+            None => node.keys.len(),
+            Some(hi) if self.hi_inc => node.keys.partition_point(|k| k.as_slice() <= hi.as_slice()),
+            Some(hi) => node.keys.partition_point(|k| k.as_slice() < hi.as_slice()),
+        };
+        (first, last.max(first))
     }
 }
 
@@ -410,7 +415,7 @@ impl PMap {
 
     /// `(key, row)` pairs whose key lies within the bound, in ascending key order — a bounded
     /// in-order traversal that prunes a child subtree whose separator span cannot overlap the bound
-    /// ([`KeyBound::child_overlaps`]), so only overlapping leaves fault through `src`. The unbounded
+    /// ([`KeyBound::child_window`]), so only overlapping leaves fault through `src`. The unbounded
     /// bound walks the whole tree (identical to [`iter`]). Owned pairs, like `iter`, so a faulted leaf
     /// can be evicted after the walk.
     pub(crate) fn range_entries(
@@ -420,50 +425,31 @@ impl PMap {
     ) -> Result<Vec<(Vec<u8>, Row)>> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
-            collect_range(root, b, None, None, src, &mut out)?;
+            collect_range(root, b, src, &mut out)?;
         }
         Ok(out)
     }
 
     /// The number of B-tree nodes a bounded scan over `b` visits — the `page_read` it charges
-    /// (cost.md §3). Mirrors `range_entries`' traversal exactly (same `child_overlaps` prune, root
+    /// (cost.md §3). Mirrors `range_entries`' traversal exactly (same `child_window` prune, root
     /// always visited), counting an `OnDisk` leaf as one node WITHOUT faulting it (pager.md §5). The
     /// unbounded bound returns `node_count()`, so a full scan's cost is unchanged.
     pub(crate) fn overlap_node_count(&self, b: &KeyBound) -> usize {
-        fn count(
-            node: &Node,
-            b: &KeyBound,
-            node_lo: Option<&[u8]>,
-            node_hi: Option<&[u8]>,
-        ) -> usize {
+        fn count(node: &Node, b: &KeyBound) -> usize {
             if node.is_leaf() {
                 return 1;
             }
             let mut total = 1;
-            for i in 0..=node.keys.len() {
-                let a = if i > 0 {
-                    Some(node.keys[i - 1].as_slice())
-                } else {
-                    node_lo
-                };
-                let c = if i < node.keys.len() {
-                    Some(node.keys[i].as_slice())
-                } else {
-                    node_hi
-                };
-                if b.child_overlaps(a, c) {
-                    match &node.children[i] {
-                        Child::Resident(n) => total += count(n, b, a, c),
-                        Child::OnDisk(_) => total += 1,
-                    }
+            let (first, last) = b.child_window(node);
+            for i in first..=last {
+                match &node.children[i] {
+                    Child::Resident(n) => total += count(n, b),
+                    Child::OnDisk(_) => total += 1,
                 }
             }
             total
         }
-        self.root
-            .as_deref()
-            .map(|r| count(r, b, None, None))
-            .unwrap_or(0)
+        self.root.as_deref().map(|r| count(r, b)).unwrap_or(0)
     }
 
     /// Visit the `(key, row)` pairs within the bound, in ascending key order, calling `visit` per
@@ -478,7 +464,7 @@ impl PMap {
         visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
     ) -> Result<()> {
         if let Some(root) = &self.root {
-            walk_range_visit(root, b, None, None, src, visit)?;
+            walk_range_visit(root, b, src, visit)?;
         }
         Ok(())
     }
@@ -836,42 +822,34 @@ fn collect(node: &Node, src: Option<&dyn LeafSource>, out: &mut Vec<(Vec<u8>, Ro
     Ok(())
 }
 
-/// The pruned `collect` for a bounded scan: descend a child only if its separator span (a, c) can
-/// overlap the bound, and emit a key only if it is in bound. `node_lo`/`node_hi` are the node's own
-/// bracketing separators (`None` at the root). Mirrors [`PMap::overlap_node_count`]'s traversal so the
-/// visited-node set — and the `page_read` cost — is identical.
+/// The pruned `collect` for a bounded scan: binary-search the child window (the children whose
+/// separator span can overlap the bound — [`KeyBound::child_window`]) and the in-bound entry window
+/// ([`KeyBound::entry_window`]), then walk only those, in order. Mirrors
+/// [`PMap::overlap_node_count`]'s traversal so the visited-node set — and the `page_read` cost — is
+/// identical. One asymmetric edge: a separator entry equal to an INCLUSIVE `lo` is in bound while
+/// both its adjacent children are pruned, so the entry window can start one slot before the child
+/// window — emitted before the descent loop.
 fn collect_range(
     node: &Node,
     b: &KeyBound,
-    node_lo: Option<&[u8]>,
-    node_hi: Option<&[u8]>,
     src: Option<&dyn LeafSource>,
     out: &mut Vec<(Vec<u8>, Row)>,
 ) -> Result<()> {
+    let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
-        for i in 0..node.keys.len() {
-            if b.contains(&node.keys[i]) {
-                out.push((node.keys[i].clone(), node.vals[i].clone()));
-            }
+        for i in ef..el {
+            out.push((node.keys[i].clone(), node.vals[i].clone()));
         }
         return Ok(());
     }
-    for i in 0..=node.keys.len() {
-        let a = if i > 0 {
-            Some(node.keys[i - 1].as_slice())
-        } else {
-            node_lo
-        };
-        let c = if i < node.keys.len() {
-            Some(node.keys[i].as_slice())
-        } else {
-            node_hi
-        };
-        if b.child_overlaps(a, c) {
-            let ch = child(node, i, src)?;
-            collect_range(&ch, b, a, c, src, out)?;
-        }
-        if i < node.keys.len() && b.contains(&node.keys[i]) {
+    let (cf, cl) = b.child_window(node);
+    if ef < cf {
+        out.push((node.keys[ef].clone(), node.vals[ef].clone()));
+    }
+    for i in cf..=cl {
+        let ch = child(node, i, src)?;
+        collect_range(&ch, b, src, out)?;
+        if i >= ef && i < el {
             out.push((node.keys[i].clone(), node.vals[i].clone()));
         }
     }
@@ -880,42 +858,32 @@ fn collect_range(
 
 /// The early-stoppable, streaming `collect_range`: calls `visit` per in-bound row instead of pushing
 /// to a `Vec`, and stops the whole traversal (returning `Ok(false)`) when `visit` does — without
-/// faulting any leaf past the stop point. Mirrors `collect_range`'s prune.
+/// faulting any leaf past the stop point. Mirrors `collect_range`'s windowed walk.
 fn walk_range_visit(
     node: &Node,
     b: &KeyBound,
-    node_lo: Option<&[u8]>,
-    node_hi: Option<&[u8]>,
     src: Option<&dyn LeafSource>,
     visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
 ) -> Result<bool> {
+    let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
-        for i in 0..node.keys.len() {
-            if b.contains(&node.keys[i]) && !visit(&node.keys[i], &node.vals[i])? {
+        for i in ef..el {
+            if !visit(&node.keys[i], &node.vals[i])? {
                 return Ok(false);
             }
         }
         return Ok(true);
     }
-    for i in 0..=node.keys.len() {
-        let a = if i > 0 {
-            Some(node.keys[i - 1].as_slice())
-        } else {
-            node_lo
-        };
-        let c = if i < node.keys.len() {
-            Some(node.keys[i].as_slice())
-        } else {
-            node_hi
-        };
-        if b.child_overlaps(a, c) {
-            let ch = child(node, i, src)?;
-            if !walk_range_visit(&ch, b, a, c, src, visit)? {
-                return Ok(false);
-            }
+    let (cf, cl) = b.child_window(node);
+    if ef < cf && !visit(&node.keys[ef], &node.vals[ef])? {
+        return Ok(false);
+    }
+    for i in cf..=cl {
+        let ch = child(node, i, src)?;
+        if !walk_range_visit(&ch, b, src, visit)? {
+            return Ok(false);
         }
-        if i < node.keys.len() && b.contains(&node.keys[i]) && !visit(&node.keys[i], &node.vals[i])?
-        {
+        if i >= ef && i < el && !visit(&node.keys[i], &node.vals[i])? {
             return Ok(false);
         }
     }

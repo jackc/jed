@@ -17,7 +17,10 @@ package jed
 // a set-once on-disk page id (0 = dirty) for the incremental commit (P6.1 part B). Delete rebalances
 // by merge-then-maybe-split (no borrow — merge subsumes it; format.md "Delete").
 
-import "bytes"
+import (
+	"bytes"
+	"sort"
+)
 
 // pnode is one B-tree node. children is empty for a leaf; otherwise len(children) == len(keys)+1.
 // len(keys) == len(vals) == len(weights) always. weights[i] is entry i's on-disk record size, used
@@ -288,80 +291,95 @@ type keyBound struct {
 // full scan exactly.
 func unboundedBound() keyBound { return keyBound{} }
 
-// contains reports whether an encoded key lies within the bound.
-func (b keyBound) contains(key []byte) bool {
+// childWindow is the contiguous window [first, last] of n's child indices whose separator span can
+// overlap the bound — child i spans the OPEN interval (keys[i-1], keys[i]), so it is pruned iff
+// keys[i] ≤ lo (entirely at/below lo) or keys[i-1] ≥ hi (entirely at/above hi). The keys are sorted,
+// so the surviving children are contiguous and both edges binary-search: first = the first child not
+// below lo, last = the last child not above hi. The strict comparisons are exact regardless of
+// endpoint inclusivity — the separators are entries in this node (covered by entryWindow), never in
+// a child. The node's own outer brackets need no test: the parent descended here only because this
+// subtree overlaps. rangeEntries (which descends) and overlapNodeCount (which counts) window
+// identically, so they visit the SAME node set — the §8 cross-core determinism the page_read cost
+// depends on — decided from the resident interior separators WITHOUT faulting an OnDisk leaf. A
+// bound admitting only a separator entry in this node yields first > last (every child pruned): an
+// empty child window, still a valid entry window.
+func (b keyBound) childWindow(n *pnode) (int, int) {
+	first := 0
 	if b.lo != nil {
-		if c := bytes.Compare(key, b.lo); c < 0 || (c == 0 && !b.loInc) {
-			return false
-		}
+		first = sort.Search(len(n.keys), func(i int) bool { return bytes.Compare(n.keys[i], b.lo) > 0 })
 	}
+	last := len(n.keys)
 	if b.hi != nil {
-		if c := bytes.Compare(key, b.hi); c > 0 || (c == 0 && !b.hiInc) {
-			return false
-		}
+		last = sort.Search(len(n.keys), func(i int) bool { return bytes.Compare(n.keys[i], b.hi) >= 0 })
 	}
-	return true
+	return first, last
 }
 
-// childOverlaps reports whether a child subtree spanning the OPEN separator interval (a, c) — a/c
-// nil for the open ends (−∞ / +∞) — can hold any key within the bound. The separator keys are
-// entries in the parent (tested with contains), never in the child, so the interval is open and
-// strict comparisons are exact regardless of the bound's endpoint inclusivity. rangeEntries (which
-// descends) and overlapNodeCount (which counts) call this identically, so they visit the SAME node
-// set — the §8 cross-core determinism the page_read cost depends on — and it is decided from the
-// resident interior separators WITHOUT faulting an OnDisk leaf.
-func (b keyBound) childOverlaps(a, c []byte) bool {
-	// Lower side: the child's upper separator c must be strictly above lo (only then can a key < c
-	// reach lo). c == nil is +∞ (always above).
-	if b.lo != nil && c != nil && bytes.Compare(c, b.lo) <= 0 {
-		return false
+// entryWindow is the contiguous half-open window [first, last) of n's own entry indices whose keys
+// lie within the bound — the binary-searched equivalent of testing containment per key, honoring the
+// endpoint inclusivity flags. On a leaf this is the admitted row range; on an interior node it is
+// the admitted separator entries (a B-tree stores records in interior nodes too).
+func (b keyBound) entryWindow(n *pnode) (int, int) {
+	first := 0
+	if b.lo != nil {
+		first = sort.Search(len(n.keys), func(i int) bool {
+			c := bytes.Compare(n.keys[i], b.lo)
+			if b.loInc {
+				return c >= 0
+			}
+			return c > 0
+		})
 	}
-	// Upper side: the child's lower separator a must be strictly below hi (only then can a key > a
-	// reach hi). a == nil is −∞ (always below).
-	if b.hi != nil && a != nil && bytes.Compare(a, b.hi) >= 0 {
-		return false
+	last := len(n.keys)
+	if b.hi != nil {
+		last = sort.Search(len(n.keys), func(i int) bool {
+			c := bytes.Compare(n.keys[i], b.hi)
+			if b.hiInc {
+				return c > 0
+			}
+			return c >= 0
+		})
 	}
-	return true
+	if last < first {
+		last = first
+	}
+	return first, last
 }
 
 // rangeEntries returns the (key, row) pairs whose key lies within the bound, in ascending key
-// order — a bounded in-order traversal that prunes a child subtree whose separator span cannot
-// overlap the bound (childOverlaps), so only overlapping leaves fault through src. The unbounded
-// bound walks the whole tree (identical to inorder). Each node's bracketing separators (nodeLo,
-// nodeHi; nil at the root) drive the prune.
+// order — a bounded in-order traversal that binary-searches each node's child window (the children
+// whose separator span can overlap the bound — childWindow) and in-bound entry window (entryWindow),
+// then walks only those, so only overlapping leaves fault through src. The unbounded bound walks the
+// whole tree (identical to inorder). One asymmetric edge: a separator entry equal to an INCLUSIVE lo
+// is in bound while both its adjacent children are pruned, so the entry window can start one slot
+// before the child window — emitted before the descent loop.
 func (m *PMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []Row, error) {
 	var keys [][]byte
 	var vals []Row
-	var walk func(n *pnode, nodeLo, nodeHi []byte) error
-	walk = func(n *pnode, nodeLo, nodeHi []byte) error {
+	var walk func(n *pnode) error
+	walk = func(n *pnode) error {
+		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
-			for i, k := range n.keys {
-				if b.contains(k) {
-					keys = append(keys, k)
-					vals = append(vals, n.vals[i])
-				}
+			for i := ef; i < el; i++ {
+				keys = append(keys, n.keys[i])
+				vals = append(vals, n.vals[i])
 			}
 			return nil
 		}
-		for i := 0; i <= len(n.keys); i++ {
-			a := nodeLo
-			if i > 0 {
-				a = n.keys[i-1]
+		cf, cl := b.childWindow(n)
+		if ef < cf {
+			keys = append(keys, n.keys[ef])
+			vals = append(vals, n.vals[ef])
+		}
+		for i := cf; i <= cl; i++ {
+			child, err := resolveChild(n.children[i], src)
+			if err != nil {
+				return err
 			}
-			c := nodeHi
-			if i < len(n.keys) {
-				c = n.keys[i]
+			if err := walk(child); err != nil {
+				return err
 			}
-			if b.childOverlaps(a, c) {
-				child, err := resolveChild(n.children[i], src)
-				if err != nil {
-					return err
-				}
-				if err := walk(child, a, c); err != nil {
-					return err
-				}
-			}
-			if i < len(n.keys) && b.contains(n.keys[i]) {
+			if i >= ef && i < el {
 				keys = append(keys, n.keys[i])
 				vals = append(vals, n.vals[i])
 			}
@@ -369,7 +387,7 @@ func (m *PMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []Row, error)
 		return nil
 	}
 	if m.root != nil {
-		if err := walk(m.root, nil, nil); err != nil {
+		if err := walk(m.root); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -377,32 +395,23 @@ func (m *PMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []Row, error)
 }
 
 // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
-// charges (spec/design/cost.md §3). It mirrors rangeEntries' traversal exactly (same childOverlaps
+// charges (spec/design/cost.md §3). It mirrors rangeEntries' traversal exactly (same childWindow
 // prune, root always visited), counting an OnDisk leaf as one node WITHOUT faulting it (the
 // resident-skeleton dividend, pager.md §5). The unbounded bound returns nodeCount() (every node
 // overlaps), so a full scan's cost is unchanged.
 func (m *PMap) overlapNodeCount(b keyBound) int {
-	var count func(n *pnode, nodeLo, nodeHi []byte) int
-	count = func(n *pnode, nodeLo, nodeHi []byte) int {
+	var count func(n *pnode) int
+	count = func(n *pnode) int {
 		if n.isLeaf() {
 			return 1
 		}
 		total := 1
-		for i := 0; i <= len(n.keys); i++ {
-			a := nodeLo
-			if i > 0 {
-				a = n.keys[i-1]
-			}
-			c := nodeHi
-			if i < len(n.keys) {
-				c = n.keys[i]
-			}
-			if b.childOverlaps(a, c) {
-				if ch := n.children[i]; ch.node != nil {
-					total += count(ch.node, a, c)
-				} else {
-					total++
-				}
+		cf, cl := b.childWindow(n)
+		for i := cf; i <= cl; i++ {
+			if ch := n.children[i]; ch.node != nil {
+				total += count(ch.node)
+			} else {
+				total++
 			}
 		}
 		return total
@@ -410,7 +419,7 @@ func (m *PMap) overlapNodeCount(b keyBound) int {
 	if m.root == nil {
 		return 0
 	}
-	return count(m.root, nil, nil)
+	return count(m.root)
 }
 
 // scanRange visits the (key, row) pairs within the bound, in ascending key order, calling visit per
@@ -420,38 +429,34 @@ func (m *PMap) overlapNodeCount(b keyBound) int {
 // "LIMIT short-circuit"). Like rangeEntries it prunes non-overlapping subtrees; unlike it, it streams
 // (one row at a time, no Vec) so a bounded result holds ~one leaf resident.
 func (m *PMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row Row) (bool, error)) error {
-	var walk func(n *pnode, nodeLo, nodeHi []byte) (bool, error)
-	walk = func(n *pnode, nodeLo, nodeHi []byte) (bool, error) {
+	var walk func(n *pnode) (bool, error)
+	walk = func(n *pnode) (bool, error) {
+		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
-			for i, k := range n.keys {
-				if b.contains(k) {
-					cont, err := visit(k, n.vals[i])
-					if err != nil || !cont {
-						return cont, err
-					}
+			for i := ef; i < el; i++ {
+				cont, err := visit(n.keys[i], n.vals[i])
+				if err != nil || !cont {
+					return cont, err
 				}
 			}
 			return true, nil
 		}
-		for i := 0; i <= len(n.keys); i++ {
-			a := nodeLo
-			if i > 0 {
-				a = n.keys[i-1]
+		cf, cl := b.childWindow(n)
+		if ef < cf {
+			cont, err := visit(n.keys[ef], n.vals[ef])
+			if err != nil || !cont {
+				return cont, err
 			}
-			c := nodeHi
-			if i < len(n.keys) {
-				c = n.keys[i]
+		}
+		for i := cf; i <= cl; i++ {
+			child, err := resolveChild(n.children[i], src)
+			if err != nil {
+				return false, err
 			}
-			if b.childOverlaps(a, c) {
-				child, err := resolveChild(n.children[i], src)
-				if err != nil {
-					return false, err
-				}
-				if cont, err := walk(child, a, c); err != nil || !cont {
-					return cont, err
-				}
+			if cont, err := walk(child); err != nil || !cont {
+				return cont, err
 			}
-			if i < len(n.keys) && b.contains(n.keys[i]) {
+			if i >= ef && i < el {
 				cont, err := visit(n.keys[i], n.vals[i])
 				if err != nil || !cont {
 					return cont, err
@@ -463,7 +468,7 @@ func (m *PMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row 
 	if m.root == nil {
 		return nil
 	}
-	_, err := walk(m.root, nil, nil)
+	_, err := walk(m.root)
 	return err
 }
 

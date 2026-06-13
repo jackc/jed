@@ -100,31 +100,57 @@ export function unboundedBound(): KeyBound {
   return { lo: null, loInc: false, hi: null, hiInc: false };
 }
 
-// boundContains: whether an encoded key lies within the bound.
-function boundContains(b: KeyBound, key: Uint8Array): boolean {
-  if (b.lo !== null) {
-    const c = compareBytes(key, b.lo);
-    if (c < 0 || (c === 0 && !b.loInc)) return false;
+// partitionPoint: the first index in n.keys where pred is false — pred must be true for a prefix of
+// the (sorted) keys and false after, the binary-search backbone of the window helpers below.
+function partitionPoint(keys: Uint8Array[], pred: (k: Uint8Array) => boolean): number {
+  let lo = 0;
+  let hi = keys.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (pred(keys[mid])) lo = mid + 1;
+    else hi = mid;
   }
-  if (b.hi !== null) {
-    const c = compareBytes(key, b.hi);
-    if (c > 0 || (c === 0 && !b.hiInc)) return false;
-  }
-  return true;
+  return lo;
 }
 
-// childOverlaps: whether a child subtree spanning the OPEN separator interval (a, c) — null for the
-// open ends — can hold any key within the bound. The separators are entries in the PARENT (tested with
-// boundContains), never in the child, so the interval is open and strict comparisons are exact
-// regardless of endpoint inclusivity. rangeEntries (descends) and overlapNodeCount (counts) call this
-// identically, so they visit the SAME node set — the §8 determinism page_read depends on — decided
-// from resident separators WITHOUT faulting an OnDisk leaf.
-function childOverlaps(b: KeyBound, a: Uint8Array | null, c: Uint8Array | null): boolean {
-  // Lower side: the child's upper separator c must be strictly above lo.
-  if (b.lo !== null && c !== null && compareBytes(c, b.lo) <= 0) return false;
-  // Upper side: the child's lower separator a must be strictly below hi.
-  if (b.hi !== null && a !== null && compareBytes(a, b.hi) >= 0) return false;
-  return true;
+// childWindow: the contiguous window [first, last] of n's child indices whose separator span can
+// overlap the bound — child i spans the OPEN interval (keys[i-1], keys[i]), so it is pruned iff
+// keys[i] ≤ lo (entirely at/below lo) or keys[i-1] ≥ hi (entirely at/above hi). The keys are sorted,
+// so the surviving children are contiguous and both edges binary-search: first = the first child not
+// below lo, last = the last child not above hi. The strict comparisons are exact regardless of
+// endpoint inclusivity — the separators are entries in this node (covered by entryWindow), never in a
+// child. The node's own outer brackets need no test: the parent descended here only because this
+// subtree overlaps. rangeEntries (descends) and overlapNodeCount (counts) window identically, so they
+// visit the SAME node set — the §8 determinism page_read depends on — decided from resident
+// separators WITHOUT faulting an OnDisk leaf. A bound admitting only a separator entry in this node
+// yields first > last (every child pruned): an empty child window, still a valid entry window.
+function childWindow(b: KeyBound, n: PNode): [number, number] {
+  const first = b.lo === null ? 0 : partitionPoint(n.keys, (k) => compareBytes(k, b.lo!) <= 0);
+  const last = b.hi === null ? n.keys.length : partitionPoint(n.keys, (k) => compareBytes(k, b.hi!) < 0);
+  return [first, last];
+}
+
+// entryWindow: the contiguous half-open window [first, last) of n's own entry indices whose keys lie
+// within the bound — the binary-searched equivalent of testing containment per key, honoring the
+// endpoint inclusivity flags. On a leaf this is the admitted row range; on an interior node it is the
+// admitted separator entries (a B-tree stores records in interior nodes too).
+function entryWindow(b: KeyBound, n: PNode): [number, number] {
+  const first =
+    b.lo === null
+      ? 0
+      : partitionPoint(n.keys, (k) => {
+          const c = compareBytes(k, b.lo!);
+          return b.loInc ? c < 0 : c <= 0;
+        });
+  let last =
+    b.hi === null
+      ? n.keys.length
+      : partitionPoint(n.keys, (k) => {
+          const c = compareBytes(k, b.hi!);
+          return b.hiInc ? c <= 0 : c < 0;
+        });
+  if (last < first) last = first;
+  return [first, last];
 }
 
 // search returns the index and whether key is present: found ⇒ keys[index] === key, else index is
@@ -273,81 +299,83 @@ export class PMap {
   }
 
   // rangeEntries returns the (key, row) pairs whose key lies within the bound, in ascending key order
-  // — a bounded in-order traversal that prunes a child subtree whose separator span cannot overlap
-  // (childOverlaps), so only overlapping leaves fault through src. The unbounded bound walks the whole
-  // tree (identical to inorder). nodeLo/nodeHi are the node's bracketing separators (null at the root).
+  // — a bounded in-order traversal that binary-searches each node's child window (the children whose
+  // separator span can overlap the bound — childWindow) and in-bound entry window (entryWindow), then
+  // walks only those, so only overlapping leaves fault through src. The unbounded bound walks the
+  // whole tree (identical to inorder). One asymmetric edge: a separator entry equal to an INCLUSIVE lo
+  // is in bound while both its adjacent children are pruned, so the entry window can start one slot
+  // before the child window — emitted before the descent loop.
   rangeEntries(b: KeyBound, src: LeafSource | null): { keys: Uint8Array[]; vals: Row[] } {
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
-    const walk = (n: PNode, nodeLo: Uint8Array | null, nodeHi: Uint8Array | null): void => {
+    const walk = (n: PNode): void => {
+      const [ef, el] = entryWindow(b, n);
       if (isLeaf(n)) {
-        for (let i = 0; i < n.keys.length; i++) {
-          if (boundContains(b, n.keys[i])) {
-            keys.push(n.keys[i]);
-            vals.push(n.vals[i]);
-          }
+        for (let i = ef; i < el; i++) {
+          keys.push(n.keys[i]);
+          vals.push(n.vals[i]);
         }
         return;
       }
-      for (let i = 0; i <= n.keys.length; i++) {
-        const a = i > 0 ? n.keys[i - 1] : nodeLo;
-        const c = i < n.keys.length ? n.keys[i] : nodeHi;
-        if (childOverlaps(b, a, c)) {
-          walk(resolveChild(n.children[i], src), a, c);
-        }
-        if (i < n.keys.length && boundContains(b, n.keys[i])) {
+      const [cf, cl] = childWindow(b, n);
+      if (ef < cf) {
+        keys.push(n.keys[ef]);
+        vals.push(n.vals[ef]);
+      }
+      for (let i = cf; i <= cl; i++) {
+        walk(resolveChild(n.children[i], src));
+        if (i >= ef && i < el) {
           keys.push(n.keys[i]);
           vals.push(n.vals[i]);
         }
       }
     };
-    if (this.root !== null) walk(this.root, null, null);
+    if (this.root !== null) walk(this.root);
     return { keys, vals };
   }
 
   // overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
-  // charges (cost.md §3). Mirrors rangeEntries' traversal exactly (same childOverlaps prune, root
+  // charges (cost.md §3). Mirrors rangeEntries' traversal exactly (same childWindow prune, root
   // always visited), counting an OnDisk leaf as one node WITHOUT faulting it (pager.md §5). The
   // unbounded bound returns nodeCount(), so a full scan's cost is unchanged.
   overlapNodeCount(b: KeyBound): number {
-    const count = (n: PNode, nodeLo: Uint8Array | null, nodeHi: Uint8Array | null): number => {
+    const count = (n: PNode): number => {
       if (isLeaf(n)) return 1;
       let total = 1;
-      for (let i = 0; i <= n.keys.length; i++) {
-        const a = i > 0 ? n.keys[i - 1] : nodeLo;
-        const c = i < n.keys.length ? n.keys[i] : nodeHi;
-        if (childOverlaps(b, a, c)) {
-          const ch = n.children[i];
-          total += ch.node !== null ? count(ch.node, a, c) : 1;
-        }
+      const [cf, cl] = childWindow(b, n);
+      for (let i = cf; i <= cl; i++) {
+        const ch = n.children[i];
+        total += ch.node !== null ? count(ch.node) : 1;
       }
       return total;
     };
-    return this.root === null ? 0 : count(this.root, null, null);
+    return this.root === null ? 0 : count(this.root);
   }
 
   // scanRange visits the (key, row) pairs within the bound, in ascending key order, calling visit per
   // in-bound row. visit returns false to STOP the traversal — and because a leaf is faulted only when
   // descended into, leaves past the stop point are never faulted (the genuine LIMIT short-circuit —
   // spec/design/cost.md §3 "LIMIT short-circuit"). Streams one row at a time (no array), so a bounded
-  // result holds ~one leaf resident. An eval error propagates as a thrown exception.
+  // result holds ~one leaf resident. An eval error propagates as a thrown exception. Windowed like
+  // rangeEntries, including the separator-equal-to-an-inclusive-lo edge emitted before the descent.
   scanRange(b: KeyBound, src: LeafSource | null, visit: (key: Uint8Array, row: Row) => boolean): void {
-    const walk = (n: PNode, nodeLo: Uint8Array | null, nodeHi: Uint8Array | null): boolean => {
+    const walk = (n: PNode): boolean => {
+      const [ef, el] = entryWindow(b, n);
       if (isLeaf(n)) {
-        for (let i = 0; i < n.keys.length; i++) {
-          if (boundContains(b, n.keys[i]) && !visit(n.keys[i], n.vals[i])) return false;
+        for (let i = ef; i < el; i++) {
+          if (!visit(n.keys[i], n.vals[i])) return false;
         }
         return true;
       }
-      for (let i = 0; i <= n.keys.length; i++) {
-        const a = i > 0 ? n.keys[i - 1] : nodeLo;
-        const c = i < n.keys.length ? n.keys[i] : nodeHi;
-        if (childOverlaps(b, a, c) && !walk(resolveChild(n.children[i], src), a, c)) return false;
-        if (i < n.keys.length && boundContains(b, n.keys[i]) && !visit(n.keys[i], n.vals[i])) return false;
+      const [cf, cl] = childWindow(b, n);
+      if (ef < cf && !visit(n.keys[ef], n.vals[ef])) return false;
+      for (let i = cf; i <= cl; i++) {
+        if (!walk(resolveChild(n.children[i], src))) return false;
+        if (i >= ef && i < el && !visit(n.keys[i], n.vals[i])) return false;
       }
       return true;
     };
-    if (this.root !== null) walk(this.root, null, null);
+    if (this.root !== null) walk(this.root);
   }
 }
 
