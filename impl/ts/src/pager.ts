@@ -10,7 +10,7 @@
 
 import { closeSync, fdatasyncSync, fstatSync, fsyncSync, readSync, writeSync } from "node:fs";
 
-import { engineError } from "./errors.ts";
+import { type EngineError, engineError } from "./errors.ts";
 
 // PREALLOC_CHUNK_BYTES is the file-growth step — ~1 MiB worth of pages preallocated at once. Growing
 // the file in chunks of real, durably-allocated zero blocks is what lets a steady-state commit write
@@ -26,6 +26,32 @@ function preallocChunkPages(pageSize: number): number {
   return Math.max(1, Math.floor(PREALLOC_CHUNK_BYTES / Math.max(1, pageSize)));
 }
 
+// FaultPoint selects a point in the commit write sequence at which the fault-injection seam
+// (spec/design/storage.md §7) simulates a crash. Pages 0/1 are always the meta slots and every
+// body/catalog page is ≥ 2 (format.md), so "meta_write" is identified by the page index, never by
+// counting body pages. Testing only.
+export type FaultPoint = "body_write" | "meta_write" | "sync";
+
+// CommitFault is a one-shot crash/tear the pager simulates at a chosen commit point (storage.md §7).
+// Testing only. Not a §8 byte contract: like the buffer pool (pager.md §3), the seam is per-core
+// internal machinery; the cross-core contract is the recovery outcome.
+export interface CommitFault {
+  point: FaultPoint;
+  // For body_write/sync: the 1-based ordinal (nth body-page write / nth sync since arming). Ignored
+  // for meta_write.
+  n?: number;
+  // For a write point: the count of leading page bytes to write before failing (a torn page); omitted
+  // or negative means write nothing (a clean crash before the page lands). Ignored for sync.
+  tearBytes?: number;
+}
+
+// injectedCrash is the error an armed fault throws to abort persistImpl mid-commit — a simulated
+// crash, reported as an ordinary I/O failure so the commit path rolls back exactly as a real write
+// error would (spec/design/storage.md §7). Testing only.
+function injectedCrash(): EngineError {
+  return engineError("io_error", "injected commit crash (fault injection)");
+}
+
 // A file-backed block device: fixed-size pages addressed by index, over an open fd kept for the
 // handle's life. One page at a time (storage.md §2); the demand-paging buffer pool (P6.4b) faults
 // pages in through readBlock.
@@ -38,11 +64,50 @@ export class Pager {
   // logical pageCount the meta records: the slack pages in [pageCount, allocatedPages) are
   // unreferenced trailing zeros (no byte-contract impact — past the high-water).
   private allocatedPages: number;
+  // fault is the armed one-shot commit fault — the fault-injection seam (spec/design/storage.md §7),
+  // null unless a test armed one with armFault. Production never arms one, so the checks in
+  // writeBlock/sync are a single null branch. bodyWrites/syncs count body-page writes (index ≥ 2) and
+  // sync() calls since arming, driving "body_write" / "sync".
+  private fault: CommitFault | null = null;
+  private bodyWrites = 0;
+  private syncs = 0;
 
   private constructor(fd: number, pageSize: number, allocatedPages: number) {
     this.fd = fd;
     this.pageSize = pageSize;
     this.allocatedPages = allocatedPages;
+  }
+
+  // armFault arms a one-shot commit fault (the fault-injection seam, spec/design/storage.md §7) and
+  // resets the since-arm counters, so the next commit's body-write / meta-write / sync sequence
+  // triggers it. The fault auto-disarms when it fires. Testing only.
+  armFault(fault: CommitFault): void {
+    this.fault = fault;
+    this.bodyWrites = 0;
+    this.syncs = 0;
+  }
+
+  // faultOnWrite is the fault-injection seam's write hook (storage.md §7): null-fault → no-op. If an
+  // armed fault targets this write it optionally performs a torn partial write, then disarms and
+  // throws an injected-crash error so persistImpl aborts mid-commit.
+  private faultOnWrite(index: number, bytes: Uint8Array): void {
+    const f = this.fault;
+    if (f === null) return;
+    let hit = false;
+    if (f.point === "meta_write") {
+      hit = index < 2;
+    } else if (f.point === "body_write" && index >= 2) {
+      this.bodyWrites++;
+      hit = this.bodyWrites === f.n;
+    }
+    if (!hit) return;
+    this.fault = null; // one-shot
+    const tear = f.tearBytes ?? -1;
+    if (tear >= 0) {
+      const k = Math.min(tear, bytes.length);
+      writeSync(this.fd, bytes.subarray(0, k), 0, k, index * this.pageSize);
+    }
+    throw injectedCrash();
   }
 
   // fromFd adopts an already-open (r+) fd as the backing, reading the page size from its meta header
@@ -74,6 +139,7 @@ export class Pager {
   // reserves the high-water first, so the target is already-allocated space (a reused free page, or a
   // preallocated slot past the old high-water). bytes is one page wide.
   writeBlock(index: number, bytes: Uint8Array): void {
+    this.faultOnWrite(index, bytes);
     writeSync(this.fd, bytes, 0, bytes.length, index * this.pageSize);
   }
 
@@ -101,6 +167,13 @@ export class Pager {
   // persistImpl). fdatasync (not fsync) so an overwrite into the preallocated region (reserve) flushes
   // only the data, never a file-size/inode-timestamp metadata journal (spec/design/pager.md §7).
   sync(): void {
+    if (this.fault !== null && this.fault.point === "sync") {
+      this.syncs++;
+      if (this.syncs === this.fault.n) {
+        this.fault = null; // one-shot
+        throw injectedCrash();
+      }
+    }
     fdatasyncSync(this.fd);
   }
 

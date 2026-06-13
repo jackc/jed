@@ -16,7 +16,7 @@ import type { ScalarType } from "./types.ts";
 import type { PNode } from "./pmap.ts";
 import { BufferPool } from "./bufferpool.ts";
 import { decodeLeafNode } from "./format.ts";
-import { Pager } from "./pager.ts";
+import { type CommitFault, Pager } from "./pager.ts";
 
 // DEFAULT_CACHE_BYTES is the default memory budget for the resident leaf cache, in bytes (256 MiB) — the
 // OpenOptions.cacheBytes default (spec/design/pager.md §3, api.md §2.1). Sized so the dominant case —
@@ -75,6 +75,12 @@ export class SharedPaging {
 
   sync(): void {
     this.pager.sync();
+  }
+
+  // armFault arms a one-shot commit fault on the backing pager — the fault-injection seam
+  // (spec/design/storage.md §7), used by the crash-recovery tests. Testing only.
+  armFault(fault: CommitFault): void {
+    this.pager.armFault(fault);
   }
 
   close(): void {

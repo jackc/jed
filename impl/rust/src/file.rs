@@ -211,6 +211,16 @@ impl Database {
         Ok(())
     }
 
+    /// Arm a one-shot commit fault on the backing pager — the **fault-injection seam**
+    /// (spec/design/storage.md §7), used by the crash-recovery tests to simulate a crash at a chosen
+    /// point in `persist`. **Testing only**; a no-op for an in-memory database (no pager).
+    #[cfg(test)]
+    pub(crate) fn arm_commit_fault(&self, fault: crate::pager::Fault) {
+        if let Some(paging) = &self.paging {
+            paging.pager().arm_fault(fault);
+        }
+    }
+
     /// Commit the current transaction (spec/design/api.md §2.2, transactions.md §4.2). Publishes
     /// the open explicit block durably (per `synchronous`); a `commit` with no open block is a
     /// **lenient no-op success** (under autocommit each statement already committed). Drives the

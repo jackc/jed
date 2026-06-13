@@ -220,7 +220,9 @@ sits so the options stay open (CLAUDE.md §9).
   a later refinement; P6.1 rewrites a whole node page when it changes.
 - **Crash-recovery story** — the meta double-buffer (§4) gives atomic commit; whether a
   separate WAL is ever added is deferred (the copy-on-write + root-swap model does not
-  require one for atomicity).
+  require one for atomicity). The atomicity is **verified at the actual commit points** by the
+  **fault-injection seam** (§7): a per-core, test-only one-shot crash/tear armed on the pager,
+  with a cross-core recovery matrix asserting that a crash anywhere recovers to a valid snapshot.
 - **Alternative physical layouts & direct-access API** — kept open (§5), not scheduled.
 - **Encryption at rest (file-level)** — kept open, not built (CLAUDE.md §9). The block seam
   (§2) is the natural insertion point: an encrypting host — or a thin layer just above it —
@@ -262,3 +264,58 @@ sits so the options stay open (CLAUDE.md §9).
   materializes a seek/range per table instead of a full scan. A cross-relation `b.pk = a.x`
   (index-nested-loop) and `IN (list)` are not bounded yet (a follow-on). Accrual rules:
   [cost.md](cost.md) §3 "Bounded scan / point lookup" + "/ JOIN" + "/ correlated".
+
+## 7. Fault injection & crash-recovery testing
+
+The crash-safety claims of §4 — **body pages + `sync()`, *then* the alternate meta slot + `sync()`**,
+backed by the **two checksummed meta slots** ([../fileformat/format.md](../fileformat/format.md)) — are
+the load-bearing reliability property: a crash at *any* point in a commit must leave the file readable
+as a **valid snapshot**, never corrupt. A golden fixture with a hand-corrupted checksum
+(`torn_meta_slot{0,1}.jed`) tests the *post-hoc* fallback, but it cannot exercise the **actual commit
+points** — mid-body, between the body and meta syncs, mid-meta-write. The **fault-injection seam** does.
+
+**The seam.** The pager (§2) carries an optional **one-shot fault**, armed only by tests, that simulates
+a crash at a chosen point in the commit write sequence (`persist`):
+
+- **`BodyWrite(n)`** — fail on the *n*-th write to a **body** page (a clean crash mid-body, before the
+  body `sync()`).
+- **`MetaWrite`** — let the body write + `sync()` complete, then fail on the **meta-slot** write (a crash
+  *between* the body sync and the meta sync — the critical window §4 protects).
+- **`Sync(n)`** — fail on the *n*-th `sync()` since arming (`1` = body barrier, `2` = meta barrier).
+
+Pages **0 and 1 are always the meta slots** and every body/catalog page is **≥ 2**
+([../fileformat/format.md](../fileformat/format.md)), so `MetaWrite` is identified by the page **index**
+(`< 2`), never by counting body pages — stable regardless of how many pages a commit dirties. A write
+fault may additionally **tear** the page: write `k` leading bytes before failing, simulating a partial
+(torn) page write — the case the meta checksum exists to catch.
+
+**Not a §8 byte contract.** Like the buffer pool (pager.md §3) and the `fdatasync` flavor (pager.md §7),
+the seam is **per-core internal machinery, realized idiomatically** — the Rust core gates it behind
+`#[cfg(test)]` (zero production footprint); Go/TS carry an inert `None`/`nil` field checked on the write
+path. What is a **cross-core contract is the recovery *outcome***, asserted identically in all three
+cores' per-core tests (not the corpus — a crash mid-commit is not SQL-level deterministic, like P5.3
+concurrency and `$N`).
+
+**The recovery matrix (the invariant: recover to a valid snapshot — prior *or* new — never corruption).**
+
+| Injected crash point | Durable result | Reopen yields |
+|---|---|---|
+| `BodyWrite(1)` (mid-body, unsynced) | new body pages partial/unreferenced; prior meta intact | **prior** snapshot, fully readable |
+| `BodyWrite(1)` torn (partial page) | a torn body page, unreferenced by the prior meta | **prior** snapshot (the torn page is never read) |
+| `Sync(1)` (before body durable) | body written-through but unsynced; meta not written | **prior** snapshot |
+| `MetaWrite` (body durable, meta not written) | new body durable but unreferenced; prior meta intact | **prior** snapshot |
+| `MetaWrite` torn (partial meta page) | the published slot's checksum fails | **prior** snapshot (checksum → fall back to the other slot) |
+| `Sync(2)` (meta written, unsynced) | the new meta is written-through | a **valid** snapshot (atomicity holds either way; see below) |
+| no fault (baseline) | full commit | **new** snapshot |
+
+After any recovery-to-prior, a follow-on test **continues committing** (insert/delete churn) to confirm
+the **free-list reconstruction** (§6, reconstruct-on-open) is correct after a crash — reuse stays
+torn-write-safe and the file does not corrupt or grow unbounded.
+
+**Write-through fidelity caveat.** The seam writes through to the real file (it does not model "unsynced
+bytes are lost on power loss"). For every point *before* the meta is written this is exactly faithful —
+the prior meta references only prior pages, so unreferenced new bytes are inert. At the **`Sync(2)`**
+boundary (meta written, not yet synced) a real power loss could lose the meta (→ prior) or keep it
+(→ new); write-through deterministically yields **new**. Both are *valid* — that boundary tests
+**atomicity** (never a half-published state), and the loss-direction is already covered by the
+`MetaWrite` / `Sync(1)` rows, so the matrix is complete without modeling unsynced-data loss.

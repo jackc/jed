@@ -41,6 +41,54 @@ pub(crate) struct Pager {
     /// allocated_pages)` are unreferenced trailing zeros (no byte-contract impact — past the
     /// high-water).
     allocated_pages: u32,
+    /// The armed one-shot commit fault — the **fault-injection seam** (spec/design/storage.md §7),
+    /// `#[cfg(test)]` so it is **entirely absent from a production build** (zero footprint). `None`
+    /// unless a test armed one with [`arm_fault`](Pager::arm_fault).
+    #[cfg(test)]
+    fault: Option<Fault>,
+    /// Writes to **body** pages (index ≥ 2) seen since the fault was armed — drives `BodyWrite(n)`.
+    #[cfg(test)]
+    body_writes: u32,
+    /// `sync()` calls seen since the fault was armed — drives `Sync(n)`.
+    #[cfg(test)]
+    syncs: u32,
+}
+
+/// A point in the commit write sequence at which the [fault-injection seam](Pager::arm_fault) can
+/// simulate a crash (spec/design/storage.md §7). Pages 0/1 are always the meta slots and every
+/// body/catalog page is ≥ 2 (format.md), so `MetaWrite` is identified by the page **index**, never by
+/// counting body pages. Testing only.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FaultPoint {
+    /// The `n`-th write to a **body** page (index ≥ 2), 1-based, counted since the fault was armed —
+    /// a clean crash mid-body, before the body `sync()`.
+    BodyWrite(u32),
+    /// The write to a **meta** slot (index < 2) — the publish, after the body is written and synced
+    /// (the critical between-syncs window §4 protects).
+    MetaWrite,
+    /// The `n`-th `sync()` since the fault was armed (`1` = body barrier, `2` = meta barrier).
+    Sync(u32),
+}
+
+/// A one-shot crash/tear the pager simulates at a chosen commit point — the **fault-injection seam**
+/// (spec/design/storage.md §7). **Testing only** (`#[cfg(test)]`). Not a §8 byte contract: like the
+/// buffer pool (pager.md §3), each core realizes it idiomatically; the cross-core contract is the
+/// *recovery outcome*, not the mechanism.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fault {
+    point: FaultPoint,
+    /// For a write point: write this many **leading** bytes of the page before failing (a torn page);
+    /// `None` = write nothing (a clean crash before the page lands). Ignored for `Sync`.
+    tear_bytes: Option<usize>,
+}
+
+#[cfg(test)]
+impl Fault {
+    pub(crate) fn new(point: FaultPoint, tear_bytes: Option<usize>) -> Fault {
+        Fault { point, tear_bytes }
+    }
 }
 
 impl Pager {
@@ -68,7 +116,23 @@ impl Pager {
             file,
             page_size,
             allocated_pages,
+            #[cfg(test)]
+            fault: None,
+            #[cfg(test)]
+            body_writes: 0,
+            #[cfg(test)]
+            syncs: 0,
         })
+    }
+
+    /// Arm a one-shot commit fault (the **fault-injection seam**, spec/design/storage.md §7) and
+    /// reset the since-arm counters, so the next commit's body-write / meta-write / `sync()` sequence
+    /// triggers it. The fault auto-disarms when it fires. **Testing only.**
+    #[cfg(test)]
+    pub(crate) fn arm_fault(&mut self, fault: Fault) {
+        self.fault = Some(fault);
+        self.body_writes = 0;
+        self.syncs = 0;
     }
 
     /// The page size fixed into this file's meta header (format.md) — the block width the demand-
@@ -91,10 +155,52 @@ impl Pager {
     /// [`reserve`](Pager::reserve)s the high-water first, so the target is already-allocated space
     /// (a reused free page, or a preallocated slot past the old high-water). `bytes` is one page wide.
     pub(crate) fn write_block(&mut self, index: u32, bytes: &[u8]) -> Result<()> {
+        self.fault_on_write(index, bytes)?;
         self.file
             .seek(SeekFrom::Start(index as u64 * self.page_size as u64))
             .map_err(io_error)?;
         self.file.write_all(bytes).map_err(io_error)
+    }
+
+    /// The fault-injection seam's write hook (spec/design/storage.md §7). In a non-test build this is
+    /// a no-op (`Ok(())`), so `write_block` carries **zero** fault-injection footprint in production.
+    /// Under test, if an armed [`Fault`] targets this write it optionally performs a **torn** partial
+    /// write, then disarms and returns an injected-crash error so `persist` aborts mid-commit.
+    #[cfg(not(test))]
+    #[inline]
+    fn fault_on_write(&mut self, _index: u32, _bytes: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fault_on_write(&mut self, index: u32, bytes: &[u8]) -> Result<()> {
+        let Some(fault) = self.fault else {
+            return Ok(());
+        };
+        let hit = match fault.point {
+            FaultPoint::MetaWrite => index < 2,
+            FaultPoint::BodyWrite(n) => {
+                if index >= 2 {
+                    self.body_writes += 1;
+                    self.body_writes == n
+                } else {
+                    false
+                }
+            }
+            FaultPoint::Sync(_) => false,
+        };
+        if !hit {
+            return Ok(());
+        }
+        self.fault = None; // one-shot
+        if let Some(k) = fault.tear_bytes {
+            let k = k.min(bytes.len());
+            self.file
+                .seek(SeekFrom::Start(index as u64 * self.page_size as u64))
+                .map_err(io_error)?;
+            self.file.write_all(&bytes[..k]).map_err(io_error)?;
+        }
+        Err(injected_crash())
     }
 
     /// Ensure the file has at least `min_pages` physically-allocated pages, growing it in fixed
@@ -129,8 +235,34 @@ impl Pager {
     /// meta — to honour the body-before-meta write-ordering rule (format.md, file.rs `persist`).
     /// `fdatasync`, not `fsync`, so an overwrite into the preallocated region ([`Pager::reserve`])
     /// flushes only the data, never a file-size/inode-timestamp metadata journal (spec/design/pager.md §7).
-    pub(crate) fn sync(&self) -> Result<()> {
+    pub(crate) fn sync(&mut self) -> Result<()> {
+        self.fault_on_sync()?;
         self.file.sync_data().map_err(io_error)
+    }
+
+    /// The fault-injection seam's `sync()` hook (spec/design/storage.md §7) — a no-op in a non-test
+    /// build. Under test, fails the `n`-th `sync()` since arming **before flushing** (the data is
+    /// already written-through; only the durability barrier is skipped), then disarms.
+    #[cfg(not(test))]
+    #[inline]
+    fn fault_on_sync(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fault_on_sync(&mut self) -> Result<()> {
+        if let Some(Fault {
+            point: FaultPoint::Sync(n),
+            ..
+        }) = self.fault
+        {
+            self.syncs += 1;
+            if self.syncs == n {
+                self.fault = None; // one-shot
+                return Err(injected_crash());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -140,4 +272,11 @@ fn io_error(e: std::io::Error) -> EngineError {
 
 fn corrupt(msg: &str) -> EngineError {
     EngineError::new(SqlState::DataCorrupted, msg)
+}
+
+/// The error an armed [`Fault`] returns to abort `persist` mid-commit — a simulated crash, reported as
+/// an ordinary I/O failure so the commit path rolls back exactly as a real write error would.
+#[cfg(test)]
+fn injected_crash() -> EngineError {
+    EngineError::new(SqlState::IoError, "injected commit crash (fault injection)")
 }

@@ -1043,8 +1043,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       re-read); a byte-layout change (incremental allocation order), so it lands in all cores +
       incremental tests together (§14). _(was size: L→XL; deps: B-tree pages [P6.1] ✓;
       §9/§13/§14)_
-- [ ] **Crash-recovery hardening** — torn-meta fixtures exist; expand durability/recovery
-      tests. WAL is deferred (COW + root-swap gives atomicity without one). _(size: M; §9)_
+- [x] **Crash-recovery hardening** — ✅ **landed (all 3 cores).** The §4 commit atomicity is now
+      verified at the **actual commit points** by a **fault-injection seam** on the pager
+      ([storage.md §7](spec/design/storage.md)): a test-only one-shot crash/tear armed at
+      `BodyWrite(n)` / `MetaWrite` (identified by page index < 2 — meta slots are always pages 0/1) /
+      `Sync(n)`, optionally writing only `k` leading bytes (a torn page). A cross-core recovery matrix
+      (`recovery.rs`, `crash_recovery_test.go`, `crash_recovery.test.ts`, 7 tests each, identical
+      outcomes) asserts the invariant: a crash **anywhere** — mid-body, before the body sync, between
+      the two syncs, mid-meta-write (torn), before the meta sync — recovers to a **valid snapshot**
+      (the prior one, or the new one at the last barrier), never corrupt, and the free-list
+      reconstruction (P6.2) stays correct after recovery. Per-core, not corpus (a crash mid-commit is
+      not SQL-level deterministic, like P5.3 concurrency / `$N`); the seam is per-core internal
+      machinery (Rust `#[cfg(test)]`, zero production footprint; Go/TS an inert nil-checked field), not
+      a §8 byte contract. The static `torn_meta_slot{0,1}.jed` goldens (a post-hoc byte corruption)
+      remain as the at-rest fallback check. **WAL stays deferred** (COW + root-swap gives atomicity
+      without one). _(was: M; §9)_
 
 ---
 

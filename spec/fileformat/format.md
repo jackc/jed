@@ -579,7 +579,10 @@ A crash between steps 3 and 5 leaves the prior meta valid (its body pages are in
 write never overwrote them), so the database opens at the prior snapshot; the freshly written
 body pages are simply unreferenced. A torn meta write at step 4 is caught by the checksum and
 falls back to the other slot. Either way the file is never corrupt — it is always a valid
-snapshot, the new one or the immediately prior one (storage.md §4, transactions.md §9).
+snapshot, the new one or the immediately prior one (storage.md §4, transactions.md §9). This is
+**verified at each of steps 1–5** by the fault-injection seam (storage.md §7): a test-only one-shot
+crash/tear armed on the pager, exercising mid-body, between-syncs, and torn-meta-write points with a
+cross-core recovery matrix.
 
 ### Reclamation (the free-list, P6.2)
 

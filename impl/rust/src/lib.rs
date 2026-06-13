@@ -25,6 +25,8 @@ pub mod pager;
 pub mod paging;
 pub mod parser;
 pub mod pmap;
+#[cfg(test)]
+mod recovery;
 pub mod shared;
 pub mod spill;
 pub mod storage;

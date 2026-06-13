@@ -49,6 +49,47 @@ type pager struct {
 	// logical pageCount the meta records: the slack pages in [pageCount, allocatedPages) are
 	// unreferenced trailing zeros (no byte-contract impact — past the high-water).
 	allocatedPages uint32
+	// fault is the armed one-shot commit fault — the fault-injection seam (spec/design/storage.md §7),
+	// nil unless a test armed one with armFault. Production never arms one, so the checks in
+	// writeBlock/sync are a single nil branch. Not a §8 byte contract: like the buffer pool (pager.md
+	// §3), the seam is per-core internal machinery; the cross-core contract is the recovery outcome.
+	fault *commitFault
+	// bodyWrites/syncs count body-page writes (index ≥ 2) and sync() calls since the fault was armed,
+	// driving faultBodyWrite / faultSync respectively.
+	bodyWrites uint32
+	syncs      uint32
+}
+
+// faultPoint selects a point in the commit write sequence at which the fault-injection seam
+// (spec/design/storage.md §7) simulates a crash. Pages 0/1 are always the meta slots and every
+// body/catalog page is ≥ 2 (format.md), so faultMetaWrite is identified by the page index, never by
+// counting body pages. Testing only.
+type faultPoint int
+
+const (
+	faultBodyWrite faultPoint = iota // the nth write to a body page (index ≥ 2), before the body sync
+	faultMetaWrite                   // the meta-slot write (index < 2): the publish, after the body is synced
+	faultSync                        // the nth sync() since arming (1 = body barrier, 2 = meta barrier)
+)
+
+// commitFault is a one-shot crash/tear the pager simulates at a chosen commit point (storage.md §7).
+// Testing only.
+type commitFault struct {
+	point faultPoint
+	n     uint32 // for faultBodyWrite/faultSync: the 1-based ordinal; ignored for faultMetaWrite
+	// tearBytes, for a write point, is the count of leading page bytes to write before failing (a torn
+	// page); a negative value means write nothing (a clean crash before the page lands). Ignored for
+	// faultSync.
+	tearBytes int
+}
+
+// armFault arms a one-shot commit fault (the fault-injection seam, spec/design/storage.md §7) and
+// resets the since-arm counters, so the next commit's body-write / meta-write / sync sequence triggers
+// it. The fault auto-disarms when it fires. Testing only.
+func (p *pager) armFault(f commitFault) {
+	p.fault = &f
+	p.bodyWrites = 0
+	p.syncs = 0
 }
 
 // pagerFromFile adopts an already-open (read+write) file as the backing, reading the page size from
@@ -92,10 +133,47 @@ func (p *pager) readBlock(index uint32) ([]byte, error) {
 // the high-water first, so the target is already-allocated space (a reused free page, or a
 // preallocated slot past the old high-water). bytes is one page wide.
 func (p *pager) writeBlock(index uint32, bytes []byte) error {
+	if err := p.faultOnWrite(index, bytes); err != nil {
+		return err
+	}
 	if _, err := p.f.WriteAt(bytes, int64(index)*int64(p.pageSize)); err != nil {
 		return ioError(err)
 	}
 	return nil
+}
+
+// faultOnWrite is the fault-injection seam's write hook (spec/design/storage.md §7): nil-fault → no-op
+// (zero production cost). If an armed fault targets this write it optionally performs a torn partial
+// write, then disarms and returns an injected-crash error so persist aborts mid-commit.
+func (p *pager) faultOnWrite(index uint32, bytes []byte) error {
+	if p.fault == nil {
+		return nil
+	}
+	f := p.fault
+	hit := false
+	switch f.point {
+	case faultMetaWrite:
+		hit = index < 2
+	case faultBodyWrite:
+		if index >= 2 {
+			p.bodyWrites++
+			hit = p.bodyWrites == f.n
+		}
+	}
+	if !hit {
+		return nil
+	}
+	p.fault = nil // one-shot
+	if f.tearBytes >= 0 {
+		k := f.tearBytes
+		if k > len(bytes) {
+			k = len(bytes)
+		}
+		if _, err := p.f.WriteAt(bytes[:k], int64(index)*int64(p.pageSize)); err != nil {
+			return ioError(err)
+		}
+	}
+	return injectedCrash()
 }
 
 // reserve ensures the file has at least minPages physically-allocated pages, growing it in fixed
@@ -131,10 +209,24 @@ func (p *pager) reserve(minPages uint32) error {
 // is platform-specific, so it lives in pager_datasync_*.go (Linux uses syscall.Fdatasync, pure Go,
 // no cgo — CLAUDE.md §2; other platforms fall back to a full Sync).
 func (p *pager) sync() error {
+	if p.fault != nil && p.fault.point == faultSync {
+		p.syncs++
+		if p.syncs == p.fault.n {
+			p.fault = nil // one-shot
+			return injectedCrash()
+		}
+	}
 	if err := datasync(p.f); err != nil {
 		return ioError(err)
 	}
 	return nil
+}
+
+// injectedCrash is the error an armed fault returns to abort persist mid-commit — a simulated crash,
+// reported as an ordinary I/O failure so the commit path rolls back exactly as a real write error
+// would (spec/design/storage.md §7). Testing only.
+func injectedCrash() error {
+	return NewError(IoError, "injected commit crash (fault injection)")
 }
 
 // close closes the open file (Database.Close).
