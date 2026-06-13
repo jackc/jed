@@ -352,18 +352,15 @@ pub enum Expr {
         name: String,
     },
     Literal(Literal),
-    /// A keyword-introduced `INTERVAL '...'` literal (spec/design/interval.md §3). Unlike a bare
-    /// string adapting by context, the INTERVAL keyword names the type, so it produces an interval
-    /// in any expression position (e.g. `SELECT INTERVAL '1 day'`). The string is parsed at resolve.
-    IntervalLiteral(String),
-    /// A keyword-introduced `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` literal (the context-free
-    /// counterpart to a bare string adapting to a datetime column — spec/design/timestamp.md §6,
-    /// grammar.md §36). The keyword names the type, so it produces a timestamp[tz] in any
-    /// expression position (e.g. `SELECT TIMESTAMP '2024-01-01'`); `with_tz` selects timestamptz.
-    /// The string is parsed at resolve (22007 malformed / 22008 field-or-range overflow).
-    TimestampLiteral {
-        value: String,
-        with_tz: bool,
+    /// A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
+    /// `type 'string'` form, equal to `CAST('string' AS type)` over a string-literal operand.
+    /// `type_name` names the target scalar (resolved by `ScalarType::from_name`; unknown → 42704)
+    /// and `text` is the literal's string. The keyword names the type, so the literal carries it in
+    /// any expression position (`SELECT INTERVAL '1 day'`, `SELECT INTEGER '42'`); the string is
+    /// coerced to the type at resolve — 22P02 malformed / 22003 out of range / the type's parse code.
+    TypedLiteral {
+        type_name: String,
+        text: String,
     },
     /// A bind parameter `$N` (1-based index). Like an integer/string literal it is an
     /// *adaptable* operand: its type is inferred from context at resolve (sibling operand,

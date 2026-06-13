@@ -1193,24 +1193,23 @@ class Parser {
       this.expect("rparen");
       return { kind: "exists", query };
     }
-    // `INTERVAL '...'` — a keyword-introduced interval literal (grammar.md §36). Recognized only
-    // when a string literal follows, so `interval` stays usable as a column / function name.
-    if (this.peekKeyword() === "interval" && this.tokens[this.pos + 1]?.kind === "str") {
-      this.advance(); // INTERVAL
-      const t = this.advance();
-      return { kind: "intervalLiteral", text: t.str! };
-    }
-    // `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` — keyword-introduced datetime literals (grammar.md
-    // §36), the context-free counterpart to a bare string adapting to a datetime column. Recognized
-    // only when a string literal follows, so `timestamp` / `timestamptz` stay usable as names.
+    // A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`, equal to
+    // CAST('string' AS type) over a string-literal operand: ANY type-naming word immediately followed
+    // by a string (`INTERVAL '1 day'`, `TIMESTAMP '...'`, `INTEGER '42'`, `BYTEA '\xDE'`, …).
+    // Recognized only when the next token is a string — a one-token lookahead — so the word stays
+    // usable as a column / function name otherwise. true/false/null are excluded (their own value
+    // literals). The type name is resolved (and the string coerced to it) at resolve; unknown → 42704.
+    const tlKw = this.peekKeyword();
     if (
-      (this.peekKeyword() === "timestamp" || this.peekKeyword() === "timestamptz") &&
+      tlKw !== "" &&
+      tlKw !== "null" &&
+      tlKw !== "true" &&
+      tlKw !== "false" &&
       this.tokens[this.pos + 1]?.kind === "str"
     ) {
-      const withTz = this.peekKeyword() === "timestamptz";
-      this.advance(); // TIMESTAMP / TIMESTAMPTZ
+      const nameTok = this.advance(); // the named type (original case; scalarFromName lowercases)
       const t = this.advance();
-      return { kind: "timestampLiteral", text: t.str!, withTz };
+      return { kind: "typedLiteral", typeName: nameTok.word!, text: t.str! };
     }
     if (this.peekKeyword() === "cast") {
       this.advance();

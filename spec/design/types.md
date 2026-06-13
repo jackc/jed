@@ -165,10 +165,21 @@ listed).
   **implicit** — inserted automatically wherever a wider integer is wanted.
 - **Narrowing** (`int64→int32`, `int64→int16`, `int32→int16`) is lossy in general, so it
   requires an **explicit** `CAST(...)` and **traps** (`22003`) when the value does not fit.
-- **Text casts** are **not in the matrix**, so by the strict rule they are forbidden this
-  slice: `text ↔ int` in either direction is rejected (`CAST('1' AS int)`, `CAST(1 AS text)`).
-  The `text → text` identity is implicit, like any identity cast. Text↔other conversions arrive
-  with the string-function slice (§11).
+- **Text casts** split by operand. A **string LITERAL** coerces to a named type — the
+  `type 'string'` typed literal and `CAST(<string literal> AS T)` ([grammar.md](grammar.md) §36) —
+  for every scalar `T`, folded at resolve (`INTEGER '42'`, `NUMERIC '1.5'`, `BOOLEAN 'true'`,
+  `CAST('42' AS int)`). The coercion is the type's own parse (the §3 datetime parse, the §13/§14
+  bytea/uuid input, a decimal/integer/boolean parse matching jed's literal grammar), trapping
+  `22P02` (malformed) / `22003` (out of range) / `42704` (unknown type name). A **runtime** text→`T`
+  cast on a *non-literal* text expression (`CAST(text_col AS int)`) stays **deferred** (`0A000`) —
+  the general string-function slice (§11). `CAST(1 AS text)` (casting *to* text) is likewise
+  deferred. The `text → text` identity is implicit, like any identity cast.
+- **Strictness is preserved.** The string→number/bool coercion fires only when the type is
+  **named** (a literal or CAST). A **bare** string in a numeric context does **not** silently
+  become a number: `WHERE int_col = '42'` is `42804` (§4), and a bare string adapts *only* to the
+  string-native types (bytea/uuid/timestamp/timestamptz/interval, where the string is the only
+  literal form) — never to int/decimal/boolean. So `type 'string'` admits the *explicit* spelling
+  of a text→scalar cast without weakening the implicit rules.
 
 Cast modes are `implicit` / `assignment` / `explicit`. `assignment` (allowed on
 INSERT/UPDATE into a column but not in general expressions) is part of the vocabulary for

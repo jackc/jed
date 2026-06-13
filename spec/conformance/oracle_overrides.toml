@@ -11,6 +11,29 @@
 #   sql     the record's SQL, matched after whitespace-normalization
 #   reason  why jed departs from PostgreSQL here
 
+# --- typed string literals: jed coerces integer/decimal by its OWN literal grammar (grammar.md
+# §36), not PG's permissive input functions, so a `type 'string'` is byte-identical to writing the
+# value as a native jed literal. The four forms PG accepts and jed rejects (22P02):
+[[override]]
+file = "expr/typed_literal.test"
+sql = "SELECT integer '0x10'"
+reason = "jed: a `type 'string'` integer is coerced by jed's own integer-literal grammar — decimal digits only (22P02). PostgreSQL (16+) accepts hex/octal/binary input and returns 16. jed has no hex integer literal anywhere, so admitting it only in the string form would diverge from its native literals (grammar.md §36)."
+
+[[override]]
+file = "expr/typed_literal.test"
+sql = "SELECT integer '1_000'"
+reason = "jed: a `type 'string'` integer is coerced by jed's own integer-literal grammar — no digit underscores (22P02). PostgreSQL (16+) accepts `1_000` and returns 1000. jed has no underscore-grouped integer literal anywhere (grammar.md §36)."
+
+[[override]]
+file = "expr/typed_literal.test"
+sql = "SELECT numeric '1.5e3'"
+reason = "jed: a `type 'string'` decimal is coerced by jed's own decimal-literal grammar — no scientific notation (22P02). PostgreSQL accepts `1.5e3` and returns 1500. jed has no e-notation decimal literal anywhere (a deferred literal form, TODO.md); grammar.md §36."
+
+[[override]]
+file = "expr/typed_literal.test"
+sql = "SELECT numeric 'NaN'"
+reason = "jed: jed's decimal is ALWAYS finite (decimal.md §2 — no NaN/±Infinity), so `numeric 'NaN'` traps 22P02. PostgreSQL's numeric has a NaN value and accepts it. A standing, documented decimal divergence (grammar.md §36, decimal.md §2)."
+
 [[override]]
 file = "types/decimal.test"
 sql = "SELECT id FROM c WHERE d = '2.5'"

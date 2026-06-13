@@ -1,0 +1,211 @@
+# Typed string literals — PostgreSQL's `type 'string'` form and `CAST(<string literal> AS type)`
+# (spec/design/grammar.md §36, types.md §5). The string is coerced to the NAMED type at resolve,
+# context-free, for EVERY scalar: the string-native types parse by their own input (bytea/uuid/
+# timestamp/interval), `text` is identity, and integer/decimal/boolean are the text→T cast admitted
+# only for a literal operand. Unknown type name → 42704, malformed → 22P02, out of range → 22003.
+# A runtime text→T cast on a non-literal text expression stays deferred (0A000); a bare string still
+# does not silently coerce to a number/bool. For integer/decimal jed uses its OWN literal grammar:
+# hex/underscore/scientific/NaN trap 22P02 where PG accepts them (documented §36 divergences).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.int16, types.int32, types.int64, types.decimal, types.boolean, types.text, types.bytea, types.uuid, expr.arithmetic, cast.explicit, cast.string_literal
+
+# --- integer typed literals ------------------------------------------------------------
+# context-free: `integer '42'` carries int32 with no column to adapt from
+query I nosort
+SELECT integer '42'
+----
+42
+
+# surrounding whitespace is trimmed; a leading sign is accepted
+query I nosort
+SELECT int '  +7 '
+----
+7
+
+# the alias `bigint` reaches int64; the max int64 fits exactly
+query I nosort
+SELECT bigint '9223372036854775807'
+----
+9223372036854775807
+
+# `smallint` is int16; -32768 is its min
+query I nosort
+SELECT smallint '-32768'
+----
+-32768
+
+# a typed-literal integer compares to a bare integer literal (both int32)
+query B nosort
+SELECT integer '42' = 42
+----
+true
+
+# and takes part in arithmetic
+query I nosort
+SELECT integer '40' + 2
+----
+42
+
+# --- decimal typed literals ------------------------------------------------------------
+# the trailing zero in the string is preserved as scale (1.50, not 1.5)
+query D nosort
+SELECT numeric '1.50'
+----
+1.50
+
+# a leading-dot decimal with a sign renders with the leading zero
+query D nosort
+SELECT numeric '-.5'
+----
+-0.5
+
+# `decimal` is the same type as `numeric`
+query D nosort
+SELECT decimal '42'
+----
+42
+
+# --- boolean typed literals (PG boolin: prefixes + the on/off/yes/no/1/0 spellings) ----
+query B nosort
+SELECT boolean 'true'
+----
+true
+
+query B nosort
+SELECT boolean 'tr'
+----
+true
+
+query B nosort
+SELECT boolean 'yes'
+----
+true
+
+query B nosort
+SELECT bool 'on'
+----
+true
+
+query B nosort
+SELECT boolean '1'
+----
+true
+
+query B nosort
+SELECT boolean 'false'
+----
+false
+
+query B nosort
+SELECT boolean 'fa'
+----
+false
+
+query B nosort
+SELECT boolean 'off'
+----
+false
+
+query B nosort
+SELECT boolean '0'
+----
+false
+
+# --- text identity, and the string-native types now reachable by keyword --------------
+query T nosort
+SELECT text 'hi'
+----
+hi
+
+# `bytea '\x..'` — the keyword form (previously only context adaptation parsed bytea)
+query T nosort
+SELECT bytea '\xDEADBEEF'
+----
+\xdeadbeef
+
+query T nosort
+SELECT uuid '00000000-0000-0000-0000-000000000001'
+----
+00000000-0000-0000-0000-000000000001
+
+# --- CAST(<string literal> AS type) folds through the same coercion -------------------
+query I nosort
+SELECT CAST('42' AS integer)
+----
+42
+
+query B nosort
+SELECT CAST('true' AS boolean)
+----
+true
+
+# a CAST typmod re-scales the coerced decimal (1.5 → scale 2)
+query D nosort
+SELECT CAST('1.5' AS numeric(10,2))
+----
+1.50
+
+# casting a string literal TO text is the identity (the keyword/CAST names text)
+query T nosort
+SELECT CAST('hi' AS text)
+----
+hi
+
+# --- disambiguation: the type-name words stay non-reserved ----------------------------
+statement ok
+CREATE TABLE kw (integer int32 PRIMARY KEY, numeric int32, boolean int32)
+
+statement ok
+INSERT INTO kw VALUES (3, 4, 5), (7, 8, 9)
+
+# bare `integer` / `numeric` / `boolean` (no following string) are column references
+query III nosort
+SELECT integer, numeric, boolean FROM kw ORDER BY integer
+----
+3
+4
+5
+7
+8
+9
+
+# --- errors: malformed (22P02), out of range (22003), unknown type (42704) ------------
+statement error 22P02
+SELECT integer 'abc'
+
+statement error 22P02
+SELECT integer '4.0'
+
+statement error 22003
+SELECT smallint '99999'
+
+statement error 22P02
+SELECT numeric 'abc'
+
+statement error 22P02
+SELECT boolean 'maybe'
+
+statement error 22P02
+SELECT boolean '2'
+
+statement error 42704
+SELECT nosuchtype '42'
+
+statement error 22P02
+SELECT CAST('abc' AS integer)
+
+# --- documented divergences from PostgreSQL (jed uses its own literal grammar) ---------
+# hex integer input: PG accepts `integer '0x10'` → 16; jed traps 22P02 (decimal digits only)
+statement error 22P02
+SELECT integer '0x10'
+
+# digit underscores: PG accepts `integer '1_000'` → 1000; jed traps 22P02
+statement error 22P02
+SELECT integer '1_000'
+
+# scientific notation: PG accepts `numeric '1.5e3'` → 1500; jed traps 22P02
+statement error 22P02
+SELECT numeric '1.5e3'
+
+# NaN: PG accepts `numeric 'NaN'`; jed's decimal is always finite, so 22P02
+statement error 22P02
+SELECT numeric 'NaN'

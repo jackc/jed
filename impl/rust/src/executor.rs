@@ -5074,8 +5074,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::Column(_)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
-        | Expr::IntervalLiteral(_)
-        | Expr::TimestampLiteral { .. }
+        | Expr::TypedLiteral { .. }
         | Expr::Param(_) => false,
         Expr::Cast { inner, .. } => expr_has_aggregate(inner),
         Expr::Unary { operand, .. } => expr_has_aggregate(operand),
@@ -5135,8 +5134,7 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
         Expr::Column(_)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
-        | Expr::IntervalLiteral(_)
-        | Expr::TimestampLiteral { .. } => Ok(()),
+        | Expr::TypedLiteral { .. } => Ok(()),
         Expr::Cast { inner, .. } => reject_check_structure(inner),
         Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
             reject_check_structure(operand)
@@ -5194,10 +5192,7 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
         };
         match e {
             Expr::Column(name) | Expr::QualifiedColumn { name, .. } => note(name),
-            Expr::Literal(_)
-            | Expr::IntervalLiteral(_)
-            | Expr::TimestampLiteral { .. }
-            | Expr::Param(_) => {}
+            Expr::Literal(_) | Expr::TypedLiteral { .. } | Expr::Param(_) => {}
             Expr::Cast { inner, .. } => walk(inner, columns, out),
             Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
                 walk(operand, columns, out)
@@ -6146,28 +6141,13 @@ fn resolve(
             let d = d.clone().check_cap()?;
             Ok((RExpr::ConstDecimal(d), ResolvedType::Decimal))
         }
-        // `INTERVAL '...'` — a keyword-introduced interval literal (spec/design/interval.md §3).
-        // Parsed at resolve (22007 malformed / 22008 field overflow), independent of any context.
-        Expr::IntervalLiteral(s) => Ok((
-            RExpr::ConstInterval(parse_interval(s)?),
-            ResolvedType::Interval,
-        )),
-        // `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` — keyword-introduced datetime literals
-        // (spec/design/timestamp.md §6, grammar.md §36). The keyword names the type, so the literal
-        // carries it in any expression position. Parsed at resolve by the same code as the
-        // bare-string adaptation (22007 malformed / 22008 field-or-range overflow), context-free.
-        Expr::TimestampLiteral { value, with_tz } => {
-            if *with_tz {
-                Ok((
-                    RExpr::ConstTimestamptz(parse_timestamptz(value)?),
-                    ResolvedType::Timestamptz,
-                ))
-            } else {
-                Ok((
-                    RExpr::ConstTimestamp(parse_timestamp(value)?),
-                    ResolvedType::Timestamp,
-                ))
-            }
+        // A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
+        // `type 'string'`, equal to `CAST('string' AS type)` over a string-literal operand. Resolve
+        // the type by name (unknown → 42704) and coerce the string to it at resolve, independent of
+        // any context. No typmod rides on the literal (the parser's one-token lookahead admits none).
+        Expr::TypedLiteral { type_name, text } => {
+            let (target, _) = resolve_type_and_typmod(type_name, &None)?;
+            coerce_string_literal(text, target, None)
         }
         // A subquery in expression position (spec/design/grammar.md §26): PLANNED ONCE against the
         // scope chain here, so its column-count / type errors fire even over an empty outer.
@@ -6240,6 +6220,13 @@ fn resolve(
             type_mod,
         } => {
             let (target, typmod) = resolve_type_and_typmod(type_name, type_mod)?;
+            // A string LITERAL operand is coerced to the target at resolve — `CAST('42' AS int)`,
+            // the same primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5).
+            // This is the ONLY text→T cast admitted ahead of the general cast slice; a non-literal
+            // text operand still falls through to the deferred 0A000 below.
+            if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
+                return coerce_string_literal(s, target, typmod);
+            }
             // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
             // casting TO text is a 0A000 this slice.
             if target.is_text() {
@@ -7327,6 +7314,141 @@ fn decode_uuid_literal(s: &str) -> Result<[u8; 16]> {
             format!("invalid input syntax for type uuid: {detail}"),
         )
     })
+}
+
+/// Coerce a string literal's content to the named scalar `target` at resolve time — the shared
+/// engine of the `type 'string'` typed literal and `CAST(<string literal> AS target)` (PG's
+/// text→T cast over a literal operand; spec/design/grammar.md §36, types.md §5). Every scalar is
+/// reachable: the string-native types parse by their own input (datetime / interval / bytea /
+/// uuid), `text` is identity, and the native-syntax types (int / decimal / boolean) are the cast
+/// from text admitted only for a literal operand. Errors: `22P02` malformed / `22003` out of
+/// range / the type's own parse code. `typmod` (decimal only) re-scales the result.
+fn coerce_string_literal(
+    s: &str,
+    target: ScalarType,
+    typmod: Option<DecimalTypmod>,
+) -> Result<(RExpr, ResolvedType)> {
+    Ok(match target {
+        ScalarType::Bytea => (
+            RExpr::ConstBytea(decode_bytea_literal(s)?),
+            ResolvedType::Bytea,
+        ),
+        ScalarType::Uuid => (
+            RExpr::ConstUuid(decode_uuid_literal(s)?),
+            ResolvedType::Uuid,
+        ),
+        ScalarType::Timestamp => (
+            RExpr::ConstTimestamp(parse_timestamp(s)?),
+            ResolvedType::Timestamp,
+        ),
+        ScalarType::Timestamptz => (
+            RExpr::ConstTimestamptz(parse_timestamptz(s)?),
+            ResolvedType::Timestamptz,
+        ),
+        ScalarType::Interval => (
+            RExpr::ConstInterval(parse_interval(s)?),
+            ResolvedType::Interval,
+        ),
+        // `text 'x'` is identity — the string IS the value.
+        ScalarType::Text => (RExpr::ConstText(s.to_string()), ResolvedType::Text),
+        ScalarType::Bool => (RExpr::ConstBool(parse_bool_literal(s)?), ResolvedType::Bool),
+        ScalarType::Decimal => {
+            let d = parse_decimal_literal(s)?;
+            let d = match typmod {
+                Some(tm) => d.coerce_to_typmod(tm.precision as u32, tm.scale as u32)?,
+                None => d.check_cap()?,
+            };
+            (RExpr::ConstDecimal(d), ResolvedType::Decimal)
+        }
+        ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64 => (
+            RExpr::ConstInt(parse_int_literal(s, target)?),
+            ResolvedType::Int(target),
+        ),
+    })
+}
+
+/// Parse a string literal's content as a signed integer of type `ty` — the text→integer coercion
+/// for `INTEGER '42'` / `CAST('42' AS int)` (grammar.md §36). Matches jed's OWN integer-literal
+/// grammar: surrounding ASCII whitespace trimmed, an optional leading `+`/`-`, then one or more
+/// ASCII decimal digits. NO hex/octal/binary or digit underscores (those trap `22P02`, a documented
+/// PG divergence). A value outside `ty`'s range traps `22003`; anything else `22P02`.
+fn parse_int_literal(s: &str, ty: ScalarType) -> Result<i64> {
+    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    let invalid = || {
+        EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            format!(
+                "invalid input syntax for type {}: \"{s}\"",
+                ty.canonical_name()
+            ),
+        )
+    };
+    let (neg, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    // All-digit but too large for i128 is an out-of-range value (22003), not malformed (22P02).
+    let mag: i128 = digits.parse().map_err(|_| overflow(ty))?;
+    let val = if neg { -mag } else { mag };
+    if val < ty.min() as i128 || val > ty.max() as i128 {
+        return Err(overflow(ty));
+    }
+    Ok(val as i64)
+}
+
+/// Parse a string literal's content as a decimal — the text→decimal coercion for `NUMERIC '1.5'`
+/// / `CAST('1.5' AS numeric)` (grammar.md §36). Matches jed's OWN decimal-literal grammar: trimmed
+/// ASCII whitespace, optional sign, ASCII digits with at most one `.` and a digit on at least one
+/// side — built into the SAME `(neg, digits, scale)` the lexer feeds `from_digits_scale`, so a
+/// `NUMERIC 'x'` is byte-identical to writing `x`. NO scientific notation / `NaN` / `Infinity`
+/// (those trap `22P02` — jed's decimal is always finite; documented PG divergences). The caller
+/// applies the typmod / cap-check.
+fn parse_decimal_literal(s: &str) -> Result<Decimal> {
+    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    let invalid = || {
+        EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            format!("invalid input syntax for type numeric: \"{s}\""),
+        )
+    };
+    let (neg, rest) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let mut parts = rest.splitn(2, '.');
+    let int_part = parts.next().unwrap_or("");
+    let frac = parts.next().unwrap_or("");
+    // A second `.` lands in `frac` (splitn(2) does not split it); reject it.
+    if frac.contains('.')
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+        || (int_part.is_empty() && frac.is_empty())
+    {
+        return Err(invalid());
+    }
+    let digits = format!("{int_part}{frac}");
+    Ok(Decimal::from_digits_scale(neg, &digits, frac.len() as u32))
+}
+
+/// Parse a string literal's content as a boolean — the text→boolean coercion for `BOOLEAN 'true'`
+/// / `CAST('t' AS boolean)` (grammar.md §36). Matches PostgreSQL's `boolin`: trimmed ASCII
+/// whitespace, case-insensitive; `t`/`tr`/`tru`/`true`, `y`/`ye`/`yes`, `on`, `1` → true and
+/// `f`/`fa`/`fal`/`fals`/`false`, `n`/`no`, `off`, `0` → false; anything else `22P02`.
+fn parse_bool_literal(s: &str) -> Result<bool> {
+    let t = s
+        .trim_matches(|c: char| c.is_ascii_whitespace())
+        .to_ascii_lowercase();
+    match t.as_str() {
+        "t" | "tr" | "tru" | "true" | "y" | "ye" | "yes" | "on" | "1" => Ok(true),
+        "f" | "fa" | "fal" | "fals" | "false" | "n" | "no" | "off" | "0" => Ok(false),
+        _ => Err(EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            format!("invalid input syntax for type boolean: \"{s}\""),
+        )),
+    }
 }
 
 /// A resolved UPDATE assignment: which column to write, the target type/nullability so

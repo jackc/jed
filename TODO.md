@@ -329,9 +329,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] **boolean in a key / `PRIMARY KEY`** — rejected `0A000` this slice; the order-preserving
         `bool-byte` key rule is authored (`scalars.toml`) but unexercised. Lifting it adds the
         executor key path + `bool-byte` key-encoding byte-vectors. _(size: S)_
-  - [ ] **boolean⇄integer casts** — `CAST(x AS boolean)` / `CAST(bool AS int)` rejected
+  - [ ] **boolean⇄integer casts** — `CAST(int_expr AS boolean)` / `CAST(bool AS int)` rejected
         (`0A000` / `42804`); not in the cast matrix. PostgreSQL's are asymmetric (bool→int yes,
-        int→bool no), so authored in a dedicated cast slice, not here. _(size: S; §5)_
+        int→bool no), so authored in a dedicated cast slice, not here. (Note: `CAST('true' AS
+        boolean)` over a string *literal* DOES work — the `cast.string_literal` coercion above; this
+        item is the bool⇄int value cast.) _(size: S; §5)_
 - [x] **`text` + ONE defined collation** — done & committed across Rust/Go/TS. Collation is
       PostgreSQL `C` (UTF-8 byte / code-point order; `scalars.toml` records the type with
       `collation = "C"`). Storage + single-quoted literals (`''` escaping) + comparison/ordering
@@ -343,7 +345,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       JS `<`) and pinned by an astral-char conformance case. _(was: L; §4/§8; spec/design/types.md §11)_
       **Deferred follow-ups:** text in a `PRIMARY KEY` / index (the order-preserving
       terminator+escape key encoding is authored in `encoding.md §2.4` but unexercised — text PK
-      is rejected `0A000`); `varchar(n)` length limits (`22001`); text⇄other casts; string
+      is rejected `0A000`); `varchar(n)` length limits (`22001`); **runtime** text⇄other casts (the
+      text-*literal*→T coercion landed — see the typed-literal entry; the non-literal `CAST(text_col
+      AS int)` stays deferred); string
       functions (`||`, `length`, `lower`/`upper`, `substring`) + `LIKE`; multi-collation / ICU
       (a per-column catalog collation field + `COLLATE`).
 - [x] **Exact `decimal`** — *the* headline type. Done across Rust/Go/TS: an exact base-10
@@ -397,15 +401,31 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       (`now()`/`current_timestamp`, `EXTRACT`, `date_trunc`, `age`); separate `date` / `time` types;
       named-zone `AT TIME ZONE` (needs the host-supplied tz database); timestamp⇄text/date casts;
       sub-second precision typmods (`timestamp(p)`); ~~a context-free `TIMESTAMP '...'` keyword
-      literal~~ ✅ **done** — the keyword-introduced `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` typed
-      literal (grammar.md §36, the `INTERVAL '...'` pattern) carries the type in any expression
-      position, so timestamp arithmetic is now spellable entirely with literals
-      (`TIMESTAMP '2024-01-31' + INTERVAL '1 month'`); pure parser + resolver (no new storage /
-      catalog / capability — under `types.timestamp` / `types.timestamptz`), pinned by
-      `spec/conformance/suites/expr/timestamp_literal.test` (98/0/0 byte-identical Rust/Go/TS,
-      oracle-clean vs PG 18 with the one `timestamp = timestamptz → 42804` family-mismatch
-      divergence already on the ledger). jed uses the **one-word** keywords only — PG's multi-word
-      `TIMESTAMP WITH TIME ZONE '...'` and the `TIMESTAMP(p) '...'` precision typmod stay deferred.
+      literal~~ ✅ **done** — first as the dedicated `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` keyword
+      literal, then **generalized** to the `type 'string'` typed literal (see the typed-literal
+      entry below); pinned by `spec/conformance/suites/expr/timestamp_literal.test`.
+- [x] **Typed string literals + string-literal casts** (`type 'string'`) — done & committed across
+      Rust/Go/TS. PostgreSQL's `type 'string'` form, which is exactly `CAST('string' AS type)` over a
+      string-literal operand ([spec/design/grammar.md](spec/design/grammar.md) §36,
+      [types.md](spec/design/types.md) §5). **Generalized** the dedicated `INTERVAL '...'` /
+      `TIMESTAMP '...'` keyword branches into ONE parser production — any type-naming word
+      immediately followed by a string (one-token lookahead; `true`/`false`/`null` excluded) — so
+      the parser stops hardcoding type names and the set becomes a type-system fact (data-over-code,
+      §5). Resolution unifies through one `coerce_string_literal(s, T)`: the string-native types
+      parse by their own input (and **`bytea '\x..'` / `uuid '...'` gain the keyword form**, a gap
+      the per-keyword approach had left), `text 'x'` is identity, and **integer / decimal / boolean
+      are the text→T cast** — admitted only for a **literal** operand (`INTEGER '42'`, `NUMERIC '1.5'`,
+      `BOOLEAN 'true'`, and `CAST('42' AS integer)` / `CAST('1.5' AS numeric(10,2))`). Unknown type
+      name → `42704`, malformed → `22P02`, out of range → `22003`. **Strictness preserved**: a
+      *runtime* text→T cast on a non-literal text expression stays deferred (`0A000`), and a *bare*
+      string never silently becomes a number/bool (`int_col = '42'` is still `42804`) — only the
+      *named, literal* spelling coerces. New capability `cast.string_literal`; pinned by
+      `spec/conformance/suites/expr/typed_literal.test` (99/0/0 byte-identical Rust/Go/TS).
+      **Documented divergences** (oracle ledger): for `integer`/`decimal`, jed coerces by its OWN
+      literal grammar, so PG's `integer '0x10'` (hex), `'1_000'` (underscores), `numeric '1.5e3'`
+      (scientific), and `numeric 'NaN'` all trap `22P02`. **Deferred follow-up:** the **runtime**
+      text→`T` cast on a non-literal text expression (`CAST(text_col AS int)` — the general
+      string-function / cast slice). _(size: M; §5; no on-disk change)_
 - [x] **`interval`** — done & committed across Rust/Go/TS (+ Ruby reference). A span held as
       PostgreSQL's **three independent fields** — `months` (i32), `days` (i32), `micros` (i64) —
       so `+ 1 month` is calendar-aware (Jan 31 + 1 month → Feb 28/29, day clamped) and distinct

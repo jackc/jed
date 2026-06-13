@@ -107,6 +107,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "null.three_valued",
   "compare.promotion",
   "cast.explicit",
+  // Typed string literals — `type 'string'` and CAST(<string literal> AS type) coerce the
+  // literal to the named type at resolve (spec/design/grammar.md §36, types.md §5).
+  "cast.string_literal",
   "types.int16",
   "types.int32",
   "types.int64",

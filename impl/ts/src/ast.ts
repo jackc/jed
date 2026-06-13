@@ -56,15 +56,12 @@ export type Expr =
   // ambiguous (spec/design/grammar.md §15). Bare "column" stays the unqualified form.
   | { kind: "qualifiedColumn"; qualifier: string; name: string }
   | { kind: "literal"; literal: Literal }
-  // A keyword-introduced INTERVAL '...' literal (spec/design/interval.md §3). Unlike a bare
-  // string adapting by context, the INTERVAL keyword names the type, so it produces an interval
-  // in any expression position. The string is parsed at resolve.
-  | { kind: "intervalLiteral"; text: string }
-  // A keyword-introduced TIMESTAMP '...' / TIMESTAMPTZ '...' literal (spec/design/timestamp.md §6,
-  // grammar.md §36) — the context-free counterpart to a bare string adapting to a datetime column.
-  // The keyword names the type, so it produces a timestamp[tz] in any expression position; withTz
-  // selects timestamptz. The string is parsed at resolve (22007 malformed / 22008 overflow).
-  | { kind: "timestampLiteral"; text: string; withTz: boolean }
+  // A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's `type 'string'`,
+  // equal to CAST('string' AS type) over a string-literal operand. typeName names the target scalar
+  // (resolved by scalarFromName; unknown → 42704) and text is the literal's string; the string is
+  // coerced to the type at resolve. The keyword names the type, so the literal carries it in any
+  // expression position (`INTERVAL '1 day'`, `INTEGER '42'`).
+  | { kind: "typedLiteral"; typeName: string; text: string }
   // A bind parameter $N (1-based index). Like an adaptable literal it takes its type from
   // context at resolve; the host binds a value at execute (spec/design/api.md §5).
   | { kind: "param"; index: number }

@@ -338,15 +338,12 @@ const (
 	ExprQualifiedColumn
 	// ExprLiteral is a literal value.
 	ExprLiteral
-	// ExprIntervalLiteral is a keyword-introduced INTERVAL '...' literal (IntervalText holds the
-	// string). Unlike a bare string adapting by context, the INTERVAL keyword names the type, so
-	// it produces an interval in any expression position (spec/design/interval.md §3).
-	ExprIntervalLiteral
-	// ExprTimestampLiteral is a keyword-introduced TIMESTAMP '...' / TIMESTAMPTZ '...' literal
-	// (TimestampText holds the string, TimestampWithTZ picks timestamptz). The keyword names the
-	// type, so it produces a timestamp[tz] in any expression position — the context-free counterpart
-	// to a bare string adapting to a datetime column (spec/design/timestamp.md §6, grammar.md §36).
-	ExprTimestampLiteral
+	// ExprTypedLiteral is a typed string literal `type '...'` — PostgreSQL's `type 'string'`,
+	// equal to CAST('string' AS type) over a string-literal operand (spec/design/grammar.md §36).
+	// TypeLitName names the target scalar (resolved by from_name; unknown → 42704), TypeLitText is
+	// the literal's string; the string is coerced to the type at resolve. The keyword names the
+	// type, so the literal carries it in any expression position (`INTERVAL '1 day'`, `INTEGER '42'`).
+	ExprTypedLiteral
 	// ExprParam is a bind parameter $N (Param holds the 1-based index). Like an adaptable
 	// literal it takes its type from context at resolve; the host binds a value at execute
 	// (spec/design/api.md §5).
@@ -431,26 +428,25 @@ const (
 // Kind selects which fields are meaningful. A comparison/logical/null-test node is
 // boolean-valued; arithmetic and columns/integer-literals are integer-valued.
 type Expr struct {
-	Kind            ExprKind
-	Column          string     // ExprColumn, ExprQualifiedColumn (the column name)
-	Qualifier       string     // ExprQualifiedColumn (the relation label)
-	Param           uint64     // ExprParam (the 1-based bind-parameter index)
-	Literal         *Literal   // ExprLiteral
-	IntervalText    string     // ExprIntervalLiteral (the INTERVAL '...' string)
-	TimestampText   string     // ExprTimestampLiteral (the TIMESTAMP / TIMESTAMPTZ '...' string)
-	TimestampWithTZ bool       // ExprTimestampLiteral (true ⇒ TIMESTAMPTZ, false ⇒ TIMESTAMP)
-	Cast            *CastExpr  // ExprCast
-	Unary           *UnaryExpr // ExprUnary
-	Binary          *BinaryExpr
-	IsNullOf        *IsNullExpr     // ExprIsNull
-	IsDistinct      *IsDistinctExpr // ExprIsDistinct
-	FuncCall        *FuncCallExpr   // ExprFuncCall
-	In              *InExpr         // ExprIn
-	Between         *BetweenExpr    // ExprBetween
-	Like            *LikeExpr       // ExprLike
-	Case            *CaseExpr       // ExprCase
-	Subquery        *QueryExpr      // ExprScalarSubquery, ExprExists (the inner query)
-	InSubquery      *InSubqueryExpr // ExprInSubquery
+	Kind        ExprKind
+	Column      string     // ExprColumn, ExprQualifiedColumn (the column name)
+	Qualifier   string     // ExprQualifiedColumn (the relation label)
+	Param       uint64     // ExprParam (the 1-based bind-parameter index)
+	Literal     *Literal   // ExprLiteral
+	TypeLitName string     // ExprTypedLiteral (the named type, e.g. "integer", "interval")
+	TypeLitText string     // ExprTypedLiteral (the literal's string, coerced to the type at resolve)
+	Cast        *CastExpr  // ExprCast
+	Unary       *UnaryExpr // ExprUnary
+	Binary      *BinaryExpr
+	IsNullOf    *IsNullExpr     // ExprIsNull
+	IsDistinct  *IsDistinctExpr // ExprIsDistinct
+	FuncCall    *FuncCallExpr   // ExprFuncCall
+	In          *InExpr         // ExprIn
+	Between     *BetweenExpr    // ExprBetween
+	Like        *LikeExpr       // ExprLike
+	Case        *CaseExpr       // ExprCase
+	Subquery    *QueryExpr      // ExprScalarSubquery, ExprExists (the inner query)
+	InSubquery  *InSubqueryExpr // ExprInSubquery
 }
 
 // InSubqueryExpr is `Lhs [NOT] IN ( Query )` (spec/design/grammar.md §26) — membership of Lhs in

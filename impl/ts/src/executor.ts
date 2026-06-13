@@ -4412,18 +4412,14 @@ function resolve(
     }
     case "funcCall":
       return resolveFuncCall(scope, e, ag, params);
-    case "intervalLiteral":
-      // INTERVAL '...' — a keyword-introduced interval literal (spec/design/interval.md §3).
-      // Parsed at resolve (22007 malformed / 22008 field overflow), independent of context.
-      return { node: { kind: "constInterval", value: parseInterval(e.text) }, type: { kind: "interval" } };
-    case "timestampLiteral":
-      // TIMESTAMP '...' / TIMESTAMPTZ '...' — keyword-introduced datetime literals
-      // (spec/design/timestamp.md §6, grammar.md §36). The keyword names the type, so the literal
-      // carries it in any expression position. Parsed at resolve by the same code as the
-      // bare-string adaptation (22007 / 22008), context-free.
-      return e.withTz
-        ? { node: { kind: "constTimestamptz", value: parseTimestamptz(e.text) }, type: { kind: "timestamptz" } }
-        : { node: { kind: "constTimestamp", value: parseTimestamp(e.text) }, type: { kind: "timestamp" } };
+    case "typedLiteral": {
+      // A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
+      // `type 'string'`, equal to CAST('string' AS type) over a string-literal operand. Resolve the
+      // type by name (unknown → 42704) and coerce the string to it at resolve, context-free. No
+      // typmod rides on the literal (the parser's one-token lookahead admits none).
+      const [target] = resolveTypeAndTypmod(e.typeName, null);
+      return coerceStringLiteral(e.text, target, null);
+    }
     case "literal":
       switch (e.literal.kind) {
         case "null":
@@ -4525,6 +4521,13 @@ function resolve(
     }
     case "cast": {
       const [target, typmod] = resolveTypeAndTypmod(e.typeName, e.typeMod);
+      // A string LITERAL operand is coerced to the target at resolve — CAST('42' AS int), the same
+      // primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5). The ONLY
+      // text→T cast admitted ahead of the general cast slice; a non-literal text operand still
+      // falls through to the deferred 0A000 below.
+      if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
+        return coerceStringLiteral(e.inner.literal.text, target, typmod);
+      }
       // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
       // casting TO text is a 0A000 this slice.
       if (isText(target)) {
@@ -4906,6 +4909,138 @@ function decodeUuidLiteral(str: string): Uint8Array {
     throw engineError("invalid_text_representation", "invalid input syntax for type uuid: " + r.error);
   }
   return r.bytes;
+}
+
+// LIT_WS is the ASCII whitespace set trimmed by the int/decimal/bool string coercions — EXACTLY
+// Rust's is_ascii_whitespace (space, tab, LF, FF, CR; NO vertical tab), so the three cores trim
+// byte-identically (a §8 determinism surface — JS's Unicode-aware String.trim would diverge).
+const LIT_WS = /^[ \t\n\f\r]+|[ \t\n\f\r]+$/g;
+const trimLit = (s: string): string => s.replace(LIT_WS, "");
+const allAsciiDigits = (s: string): boolean => /^[0-9]+$/.test(s);
+
+// coerceStringLiteral coerces a string literal's content to the named scalar target at resolve —
+// the shared engine of the `type 'string'` typed literal and CAST(<string literal> AS target)
+// (spec/design/grammar.md §36, types.md §5). Every scalar is reachable: the string-native types
+// parse by their own input, text is identity, and int/decimal/boolean are the cast from text
+// admitted only for a literal operand. 22P02 malformed / 22003 out of range / the type's parse
+// code. typmod (decimal only) re-scales the result.
+function coerceStringLiteral(
+  s: string,
+  target: ScalarType,
+  typmod: DecimalTypmod | null,
+): { node: RExpr; type: ResolvedType } {
+  switch (target) {
+    case "bytea":
+      return { node: { kind: "constBytea", value: decodeByteaLiteral(s) }, type: { kind: "bytea" } };
+    case "uuid":
+      return { node: { kind: "constUuid", value: decodeUuidLiteral(s) }, type: { kind: "uuid" } };
+    case "timestamp":
+      return { node: { kind: "constTimestamp", value: parseTimestamp(s) }, type: { kind: "timestamp" } };
+    case "timestamptz":
+      return { node: { kind: "constTimestamptz", value: parseTimestamptz(s) }, type: { kind: "timestamptz" } };
+    case "interval":
+      return { node: { kind: "constInterval", value: parseInterval(s) }, type: { kind: "interval" } };
+    case "text":
+      // text 'x' is identity — the string IS the value.
+      return { node: { kind: "constText", value: s }, type: { kind: "text" } };
+    case "boolean":
+      return { node: { kind: "constBool", value: parseBoolLiteral(s) }, type: { kind: "bool" } };
+    case "decimal": {
+      let d = parseDecimalLiteral(s);
+      d = typmod !== null ? d.coerceToTypmod(typmod.precision, typmod.scale) : d.checkCap();
+      return { node: { kind: "constDecimal", value: d }, type: { kind: "decimal" } };
+    }
+    default: {
+      // int16 / int32 / int64
+      const n = parseIntLiteral(s, target);
+      return { node: { kind: "constInt", value: n }, type: { kind: "int", ty: target } };
+    }
+  }
+}
+
+// parseIntLiteral parses a string literal's content as a signed integer of type ty — the
+// text→integer coercion for INTEGER '42' / CAST('42' AS int) (grammar.md §36). jed's OWN
+// integer-literal grammar: trimmed ASCII whitespace, optional +/-, then ASCII decimal digits
+// (NO hex/octal/binary or underscores — 22P02, a documented PG divergence). Out of range → 22003.
+function parseIntLiteral(s: string, ty: ScalarType): bigint {
+  const invalid = (): Error =>
+    engineError("invalid_text_representation", `invalid input syntax for type ${canonicalName(ty)}: "${s}"`);
+  let t = trimLit(s);
+  let neg = false;
+  if (t.startsWith("-")) {
+    neg = true;
+    t = t.slice(1);
+  } else if (t.startsWith("+")) {
+    t = t.slice(1);
+  }
+  if (t === "" || !allAsciiDigits(t)) throw invalid();
+  // BigInt holds an arbitrary-length digit run; range is checked below (out of range → 22003).
+  const v = neg ? -BigInt(t) : BigInt(t);
+  if (!inRange(ty, v)) throw overflow(ty);
+  return v;
+}
+
+// parseDecimalLiteral parses a string literal's content as a decimal — the text→decimal coercion
+// for NUMERIC '1.5' / CAST('1.5' AS numeric) (grammar.md §36). jed's OWN decimal-literal grammar:
+// trimmed ASCII whitespace, optional sign, ASCII digits with at most one '.' and a digit on at
+// least one side — built into the SAME (neg, digits, scale) the lexer feeds Decimal.fromDigitsScale,
+// so NUMERIC 'x' is byte-identical to writing x. NO scientific / NaN / Infinity (22P02). Caller
+// applies typmod / cap-check.
+function parseDecimalLiteral(s: string): Decimal {
+  const invalid = (): Error =>
+    engineError("invalid_text_representation", `invalid input syntax for type numeric: "${s}"`);
+  let t = trimLit(s);
+  let neg = false;
+  if (t.startsWith("-")) {
+    neg = true;
+    t = t.slice(1);
+  } else if (t.startsWith("+")) {
+    t = t.slice(1);
+  }
+  const dot = t.indexOf(".");
+  const intPart = dot < 0 ? t : t.slice(0, dot);
+  const frac = dot < 0 ? "" : t.slice(dot + 1);
+  // A second '.' lands in frac (indexOf found the first); reject it.
+  if (
+    frac.includes(".") ||
+    !(intPart === "" || allAsciiDigits(intPart)) ||
+    !(frac === "" || allAsciiDigits(frac)) ||
+    (intPart === "" && frac === "")
+  ) {
+    throw invalid();
+  }
+  return Decimal.fromDigitsScale(neg, intPart + frac, frac.length);
+}
+
+// parseBoolLiteral parses a string literal's content as a boolean — the text→boolean coercion for
+// BOOLEAN 'true' / CAST('t' AS boolean) (grammar.md §36). Matches PostgreSQL's boolin: trimmed
+// ASCII whitespace, case-insensitive; t/tr/tru/true, y/ye/yes, on, 1 → true and f/fa/fal/fals/
+// false, n/no, off, 0 → false; anything else 22P02.
+function parseBoolLiteral(s: string): boolean {
+  switch (trimLit(s).toLowerCase()) {
+    case "t":
+    case "tr":
+    case "tru":
+    case "true":
+    case "y":
+    case "ye":
+    case "yes":
+    case "on":
+    case "1":
+      return true;
+    case "f":
+    case "fa":
+    case "fal":
+    case "fals":
+    case "false":
+    case "n":
+    case "no":
+    case "off":
+    case "0":
+      return false;
+    default:
+      throw engineError("invalid_text_representation", `invalid input syntax for type boolean: "${s}"`);
+  }
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the

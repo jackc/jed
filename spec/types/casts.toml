@@ -35,6 +35,18 @@
 # `CAST(x AS interval)` and casting FROM an interval are DEFERRED to a later cast slice (0A000 /
 # 42804), exactly like timestamp (../design/interval.md §6).
 #
+# STRING-LITERAL coercion is the one (text -> T) cast admitted ahead of the general cast slice,
+# and it is NOT a (from, to) pair in this matrix because its source is a string LITERAL, not the
+# `text` TYPE. PostgreSQL's `type 'string'` form and `CAST(<string literal> AS T)` coerce the
+# literal's string to the NAMED type T at resolve time, for EVERY scalar T — the type's own parse
+# (int16/int32/int64, decimal, boolean, text-identity, plus the string-native bytea/uuid/timestamp/
+# timestamptz/interval). Folded at resolve: 42704 unknown type, 22P02 malformed, 22003 out of range
+# (../design/grammar.md §36, ../design/types.md §5). This does NOT relax the matrix below: a RUNTIME
+# text->T cast on a non-literal text expression (`CAST(text_col AS int)`) stays DEFERRED (0A000), and
+# a BARE string never silently becomes a number/bool (`int_col = '42'` is 42804). Only the explicit,
+# named, literal spelling is admitted. For integer/decimal the coercion follows jed's OWN literal
+# grammar (no hex/underscore/scientific/NaN — documented §36 divergences from PG).
+#
 # mode:
 #   implicit    inserted automatically anywhere a value of `to` is wanted (safe, lossless)
 #   assignment  inserted on INSERT/UPDATE into a column of `to` (safe, lossless)

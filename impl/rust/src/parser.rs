@@ -1368,33 +1368,23 @@ impl Parser {
                 type_mod,
             });
         }
-        // `INTERVAL '...'` — a keyword-introduced interval literal (grammar.md §36). Recognized
-        // only when a string literal follows, so `interval` stays usable as a column / function
-        // name (a column named `interval` outside this construct still parses).
-        if self.peek_keyword().as_deref() == Some("interval")
+        // A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`,
+        // equal to `CAST('string' AS type)` over a string-literal operand: ANY type-naming word
+        // immediately followed by a string (`INTERVAL '1 day'`, `TIMESTAMP '...'`, `INTEGER '42'`,
+        // `NUMERIC '1.5'`, `BOOLEAN 'true'`, `BYTEA '\xDE'`, …). Recognized only when the next token
+        // is a string — a one-token lookahead — so the word stays usable as a column / function
+        // name otherwise (`SELECT interval FROM t`). `true`/`false`/`null` are excluded: they are
+        // their own value literals (handled below), not type names. The type name is resolved (and
+        // the string coerced to it) at resolve time; an unknown type is 42704 there.
+        if let Token::Word(w) = self.peek()
             && matches!(self.tokens.get(self.pos + 1), Some(Token::Str(_)))
+            && !matches!(w.to_ascii_lowercase().as_str(), "null" | "true" | "false")
         {
-            self.advance(); // INTERVAL
-            if let Token::Str(s) = self.advance() {
-                return Ok(Expr::IntervalLiteral(s));
+            let type_name = self.expect_identifier()?;
+            if let Token::Str(text) = self.advance() {
+                return Ok(Expr::TypedLiteral { type_name, text });
             }
-            unreachable!("peeked a string literal after INTERVAL");
-        }
-        // `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` — keyword-introduced datetime literals
-        // (grammar.md §36), the context-free counterpart to a bare string adapting to a datetime
-        // column. Recognized only when a string literal follows, so `timestamp` / `timestamptz`
-        // stay usable as column / function names (same one-token lookahead as the INTERVAL form).
-        if matches!(
-            self.peek_keyword().as_deref(),
-            Some("timestamp") | Some("timestamptz")
-        ) && matches!(self.tokens.get(self.pos + 1), Some(Token::Str(_)))
-        {
-            let with_tz = self.peek_keyword().as_deref() == Some("timestamptz");
-            self.advance(); // TIMESTAMP / TIMESTAMPTZ
-            if let Token::Str(s) = self.advance() {
-                return Ok(Expr::TimestampLiteral { value: s, with_tz });
-            }
-            unreachable!("peeked a string literal after TIMESTAMP/TIMESTAMPTZ");
+            unreachable!("peeked a string literal after the type name");
         }
         if self.peek_keyword().as_deref() == Some("case") {
             self.advance();

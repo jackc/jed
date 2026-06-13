@@ -5925,31 +5925,16 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return &rExpr{kind: reConstInt, cInt: e.Literal.Int},
 				resolvedType{kind: rtInt, intTy: ty}, nil
 		}
-	case ExprIntervalLiteral:
-		// INTERVAL '...' — a keyword-introduced interval literal (spec/design/interval.md §3).
-		// Parsed at resolve (22007 malformed / 22008 field overflow), independent of context.
-		iv, err := ParseInterval(e.IntervalText)
+	case ExprTypedLiteral:
+		// A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
+		// `type 'string'`, equal to CAST('string' AS type) over a string-literal operand. Resolve
+		// the type by name (unknown → 42704) and coerce the string to it at resolve, context-free.
+		// No typmod rides on the literal (the parser's one-token lookahead admits none).
+		target, _, err := resolveTypeAndTypmod(e.TypeLitName, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		return &rExpr{kind: reConstInterval, cIv: iv}, resolvedType{kind: rtInterval}, nil
-	case ExprTimestampLiteral:
-		// TIMESTAMP '...' / TIMESTAMPTZ '...' — keyword-introduced datetime literals
-		// (spec/design/timestamp.md §6, grammar.md §36). The keyword names the type, so the literal
-		// carries it in any expression position. Parsed at resolve by the same code as the
-		// bare-string adaptation (22007 / 22008), context-free.
-		if e.TimestampWithTZ {
-			m, err := ParseTimestamptz(e.TimestampText)
-			if err != nil {
-				return nil, resolvedType{}, err
-			}
-			return &rExpr{kind: reConstTimestamptz, cInt: m}, resolvedType{kind: rtTimestamptz}, nil
-		}
-		m, err := ParseTimestamp(e.TimestampText)
-		if err != nil {
-			return nil, resolvedType{}, err
-		}
-		return &rExpr{kind: reConstTimestamp, cInt: m}, resolvedType{kind: rtTimestamp}, nil
+		return coerceStringLiteral(e.TypeLitText, target, nil)
 	case ExprScalarSubquery:
 		// A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so
 		// its column-count / type errors fire even over an empty outer. planSubquery rejects a
@@ -5996,6 +5981,13 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		target, typmod, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod)
 		if err != nil {
 			return nil, resolvedType{}, err
+		}
+		// A string LITERAL operand is coerced to the target at resolve — CAST('42' AS int), the
+		// same primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5). The
+		// ONLY text→T cast admitted ahead of the general cast slice; a non-literal text operand
+		// still falls through to the deferred 0A000 below.
+		if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralText {
+			return coerceStringLiteral(in.Literal.Str, target, typmod)
 		}
 		// Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
 		// casting TO text is a 0A000 this slice.
@@ -6496,6 +6488,174 @@ func decodeUUIDLiteral(s string) ([]byte, error) {
 		return nil, NewError(InvalidTextRepresentation, "invalid input syntax for type uuid: "+reason)
 	}
 	return b, nil
+}
+
+// litWhitespace is the ASCII whitespace set trimmed by the int/decimal/bool string coercions —
+// EXACTLY Rust's is_ascii_whitespace (space, tab, LF, FF, CR; NO vertical tab), so the three cores
+// trim byte-identically (a §8 determinism surface — a Unicode-aware trim would diverge).
+const litWhitespace = " \t\n\f\r"
+
+// coerceStringLiteral coerces a string literal's content to the named scalar target at resolve —
+// the shared engine of the `type 'string'` typed literal and CAST(<string literal> AS target)
+// (spec/design/grammar.md §36, types.md §5). Every scalar is reachable: the string-native types
+// parse by their own input, text is identity, and int/decimal/boolean are the cast from text
+// admitted only for a literal operand. 22P02 malformed / 22003 out of range / the type's parse
+// code. typmod (decimal only) re-scales the result.
+func coerceStringLiteral(s string, target ScalarType, typmod *DecimalTypmod) (*rExpr, resolvedType, error) {
+	switch target {
+	case Bytea:
+		b, err := decodeByteaLiteral(s)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstBytea, cBytea: b}, resolvedType{kind: rtBytea}, nil
+	case Uuid:
+		b, err := decodeUUIDLiteral(s)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstUuid, cBytea: b}, resolvedType{kind: rtUuid}, nil
+	case Timestamp:
+		m, err := ParseTimestamp(s)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstTimestamp, cInt: m}, resolvedType{kind: rtTimestamp}, nil
+	case Timestamptz:
+		m, err := ParseTimestamptz(s)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstTimestamptz, cInt: m}, resolvedType{kind: rtTimestamptz}, nil
+	case IntervalType:
+		iv, err := ParseInterval(s)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstInterval, cIv: iv}, resolvedType{kind: rtInterval}, nil
+	case Text:
+		// text 'x' is identity — the string IS the value.
+		return &rExpr{kind: reConstText, cText: s}, resolvedType{kind: rtText}, nil
+	case Bool:
+		v, err := parseBoolLiteral(s)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstBool, cBool: v}, resolvedType{kind: rtBool}, nil
+	case DecimalType:
+		d, err := parseDecimalLiteral(s)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if typmod != nil {
+			d, err = d.CoerceToTypmod(uint32(typmod.Precision), uint32(typmod.Scale))
+		} else {
+			d, err = d.CheckCap()
+		}
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstDecimal, cDec: d}, resolvedType{kind: rtDecimal}, nil
+	default: // Int16 / Int32 / Int64
+		n, err := parseIntLiteral(s, target)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstInt, cInt: n}, resolvedType{kind: rtInt, intTy: target}, nil
+	}
+}
+
+// parseIntLiteral parses a string literal's content as a signed integer of type ty — the
+// text→integer coercion for INTEGER '42' / CAST('42' AS int) (grammar.md §36). jed's OWN
+// integer-literal grammar: trimmed ASCII whitespace, optional +/-, then ASCII decimal digits
+// (NO hex/octal/binary or underscores — 22P02, a documented PG divergence). Out of range → 22003.
+func parseIntLiteral(s string, ty ScalarType) (int64, error) {
+	t := strings.Trim(s, litWhitespace)
+	invalid := func() error {
+		return NewError(InvalidTextRepresentation,
+			"invalid input syntax for type "+ty.CanonicalName()+": \""+s+"\"")
+	}
+	neg := false
+	if rest, ok := strings.CutPrefix(t, "-"); ok {
+		neg, t = true, rest
+	} else if rest, ok := strings.CutPrefix(t, "+"); ok {
+		t = rest
+	}
+	if t == "" || !allASCIIDigits(t) {
+		return 0, invalid()
+	}
+	// big.Int parses an arbitrary-length digit run; an out-of-range value is 22003, not 22P02.
+	mag, ok := new(big.Int).SetString(t, 10)
+	if !ok {
+		return 0, invalid()
+	}
+	if neg {
+		mag.Neg(mag)
+	}
+	if !mag.IsInt64() {
+		return 0, overflowErr(ty)
+	}
+	v := mag.Int64()
+	if !ty.InRange(v) {
+		return 0, overflowErr(ty)
+	}
+	return v, nil
+}
+
+// parseDecimalLiteral parses a string literal's content as a decimal — the text→decimal coercion
+// for NUMERIC '1.5' / CAST('1.5' AS numeric) (grammar.md §36). jed's OWN decimal-literal grammar:
+// trimmed ASCII whitespace, optional sign, ASCII digits with at most one '.' and a digit on at
+// least one side — built into the SAME (neg, digits, scale) the lexer feeds DecimalFromDigitsScale,
+// so NUMERIC 'x' is byte-identical to writing x. NO scientific / NaN / Infinity (22P02). Caller
+// applies typmod / cap-check.
+func parseDecimalLiteral(s string) (Decimal, error) {
+	t := strings.Trim(s, litWhitespace)
+	invalid := func() (Decimal, error) {
+		return Decimal{}, NewError(InvalidTextRepresentation,
+			"invalid input syntax for type numeric: \""+s+"\"")
+	}
+	neg := false
+	if rest, ok := strings.CutPrefix(t, "-"); ok {
+		neg, t = true, rest
+	} else if rest, ok := strings.CutPrefix(t, "+"); ok {
+		t = rest
+	}
+	intPart, frac, hasDot := strings.Cut(t, ".")
+	// A second '.' lands in frac (Cut splits on the first); reject it.
+	if (hasDot && strings.Contains(frac, ".")) ||
+		!allASCIIDigits(intPart) || !allASCIIDigits(frac) ||
+		(intPart == "" && frac == "") {
+		return invalid()
+	}
+	return DecimalFromDigitsScale(neg, intPart+frac, uint32(len(frac))), nil
+}
+
+// parseBoolLiteral parses a string literal's content as a boolean — the text→boolean coercion for
+// BOOLEAN 'true' / CAST('t' AS boolean) (grammar.md §36). Matches PostgreSQL's boolin: trimmed
+// ASCII whitespace, case-insensitive; t/tr/tru/true, y/ye/yes, on, 1 → true and f/fa/fal/fals/
+// false, n/no, off, 0 → false; anything else 22P02.
+func parseBoolLiteral(s string) (bool, error) {
+	switch toLowerASCII(strings.Trim(s, litWhitespace)) {
+	case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
+		return true, nil
+	case "f", "fa", "fal", "fals", "false", "n", "no", "off", "0":
+		return false, nil
+	default:
+		return false, NewError(InvalidTextRepresentation,
+			"invalid input syntax for type boolean: \""+s+"\"")
+	}
+}
+
+// allASCIIDigits reports whether every byte of s is an ASCII digit (empty → true, so callers
+// guard emptiness separately). Used by the int/decimal string coercions — ASCII '0'..'9' only,
+// never Unicode digits (a §8 determinism surface).
+func allASCIIDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the

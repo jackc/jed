@@ -1507,49 +1507,68 @@ scalar function, `42883`), **`LATERAL`**, the **column-alias-list** form `AS g(c
 forms and their PostgreSQL edge cases (NULL arg → zero rows, step zero → `22023`, overflow →
 clean stop) are spec'd in [functions.md](functions.md) §10.
 
-## 36. Keyword-introduced typed literals (`INTERVAL` / `TIMESTAMP` / `TIMESTAMPTZ` `'…'`)
+## 36. Typed string literals (`type '…'`) and string-literal casts
 
-A `primary` may be a **keyword-introduced typed literal** — a type-naming keyword immediately
-followed by a single-quoted string ([grammar.ebnf](../grammar/grammar.ebnf) `typed_literal`):
+A `primary` may be a **typed string literal** — *any* type name immediately followed by a
+single-quoted string ([grammar.ebnf](../grammar/grammar.ebnf) `typed_literal`):
 
 ```
-typed_literal ::= ( "INTERVAL" | "TIMESTAMP" | "TIMESTAMPTZ" ) string
+typed_literal ::= identifier string
 ```
 
-The keyword **names the type**, so the literal carries that type in **any** expression position
-— independent of any surrounding context. This is the *context-free* counterpart to a bare
-single-quoted string adapting to a datetime/interval column (§5; [timestamp.md](timestamp.md) §3/§6,
-[interval.md](interval.md) §3): `SELECT TIMESTAMP '2024-01-01 12:00:00'` and `SELECT INTERVAL
-'1 day'` resolve with no column or sibling to take their type from, and `TIMESTAMP '2024-01-31'
-+ INTERVAL '1 month'` is timestamp arithmetic spelled entirely with literals. The string is the
-same text the bare-string adaptation accepts, parsed by the **same** code at resolve time — so a
-malformed literal traps `22007` and a field/range overflow `22008` (interval: `22008`), *before*
-any scan ([timestamp.md](timestamp.md) §7, [interval.md](interval.md) §3).
+This is PostgreSQL's `type 'string'` form, which is exactly `CAST('string' AS type)` restricted
+to a string-literal operand ([types.md](types.md) §5). The type name **names the type**, so the
+literal carries it in **any** expression position — independent of surrounding context:
+`SELECT TIMESTAMP '2024-01-01 12:00:00'`, `SELECT INTEGER '42'`, `SELECT NUMERIC '1.5'`,
+`SELECT BOOLEAN 'true'`, `SELECT BYTEA '\xDE'`, `SELECT UUID '…'`, `SELECT TEXT 'hi'`, and
+`TIMESTAMP '2024-01-31' + INTERVAL '1 month'` (arithmetic spelled entirely with literals). The
+string is **coerced to the named type at resolve time**, before any scan — so an unknown type
+name is `42704` (undefined_object), and a malformed/out-of-range string traps the type's parse
+code (below).
 
-- **`TIMESTAMP '…'`** is `timestamp` (zoneless); **`TIMESTAMPTZ '…'`** is `timestamptz` (an
-  offset in the string normalizes to UTC). They are distinct families that never reconcile
-  ([timestamp.md](timestamp.md) §1).
-- **`INTERVAL '…'`** is `interval`, parsed by the "unit + time" subset ([interval.md](interval.md) §3).
+**One coercion, three syntaxes.** The literal's string is run through the **same** resolve-time
+coercion as `CAST('string' AS type)` and as a bare string adapting to a column — `type 'x'` is
+just "coerce the string `x` to that type, with the type named explicitly." The per-type rules:
 
-**Disambiguation — the keywords stay non-reserved (§3).** `INTERVAL` / `TIMESTAMP` /
-`TIMESTAMPTZ` introduce a literal **only** when the *next* token is a string; otherwise the word
-is an ordinary identifier, so a column named `timestamp` (or `interval`) still parses
-(`SELECT timestamp FROM t`, `SELECT interval + 1 FROM t`). This is the one-token lookahead used
-for `CAST` / `EXISTS` / function names — a §8 cross-core determinism surface, byte-identical
-across the three hand-written parsers.
+| target | rule | error codes |
+|---|---|---|
+| `timestamp` / `timestamptz` | the §3 datetime parse ([timestamp.md](timestamp.md)); tz normalizes the offset to UTC | `22007` / `22008` |
+| `interval` | the "unit + time" subset ([interval.md](interval.md) §3) | `22007` / `22008` |
+| `bytea` | `\x`-hex input ([types.md](types.md) §13) | `22P02` |
+| `uuid` | PG-flexible uuid input ([types.md](types.md) §14) | `22P02` |
+| `text` | identity (the string itself) | — |
+| `int16` / `int32` / `int64` | optional sign + decimal digits, surrounding whitespace trimmed | `22P02` malformed / `22003` out of range |
+| `decimal` / `numeric` | jed's decimal-literal grammar (sign, digits, one `.`), whitespace trimmed; capped | `22P02` malformed / `22003` over cap |
+| `boolean` | PG's `boolin`: `t`/`tr`/`tru`/`true`, `f`/`fa`/`fal`/`fals`/`false`, `y`/`ye`/`yes`, `n`/`no`, `on`/`off`, `1`, `0` (case-insensitive, trimmed) | `22P02` malformed |
+
+The native-syntax types (`integer`/`decimal`/`boolean`) are where `type 'string'` is a genuine
+**cast from text** — coercing a *string* to a number/bool. jed allows it **only when the operand
+is a string literal** (the `type 'string'` form and `CAST(<string literal> AS T)`), folded at
+resolve. A **runtime** text→`T` cast on a non-literal text expression (`CAST(text_col AS int)`)
+stays deferred (`0A000`, [types.md](types.md) §5). And a **bare** string still does **not**
+silently become a number/bool in a numeric context (`WHERE int_col = '42'` is `42804`, the strict
+rule — [types.md](types.md) §4): the type must be *named* for the string→number coercion to
+happen. So strictness is preserved; only the *explicit* spelling is admitted.
+
+**Disambiguation — the type names stay non-reserved (§3).** A word introduces a typed literal
+**only** when the *next* token is a string; otherwise it is an ordinary identifier, so a column
+named `timestamp` / `interval` / `integer` still parses (`SELECT timestamp FROM t`,
+`SELECT interval + 1 FROM t`). This is the one-token lookahead used for `CAST` / `EXISTS` /
+function names — a §8 cross-core determinism surface, byte-identical across the three hand-written
+parsers. (`true` / `false` / `null` are excluded from the type-name position — they are their own
+value literals, so `true 'x'` is not `CAST('x' AS true)`.)
 
 **Documented divergences from PostgreSQL** (we own our surface, CLAUDE.md §1):
 
-- jed uses the **canonical single-word** type names. PG also accepts the multi-word
-  `TIMESTAMP WITH TIME ZONE '…'` / `TIMESTAMP WITHOUT TIME ZONE '…'` spellings; jed does not (it
-  accepts no multi-word type name anywhere — a column is `timestamptz`, not `timestamp with time
-  zone`), so those forms are not typed literals here. Spell `timestamptz` with the one-word
-  keyword.
-- The **precision typmod** form `TIMESTAMP(p) '…'` / `INTERVAL '…' (p)` is **not** accepted as a
-  literal — `timestamp(p)` precision is deferred everywhere ([timestamp.md](timestamp.md) §6;
-  accepted-but-ignored on a column, absent on a literal). Always full microsecond precision.
+- For `integer`/`decimal`, jed coerces by its **own literal grammar**, not PG's input-function
+  extras: **hex/octal/binary** (`integer '0x10'`), **digit underscores** (`integer '1_000'`),
+  **scientific notation** (`numeric '1.5e3'`), and **`NaN` / `±Infinity`** (`numeric 'NaN'` — jed's
+  decimal is always finite, [decimal.md](decimal.md) §2) all trap `22P02` where PG accepts them.
+  This keeps `type 'string'` coercion identical to writing the value as a native jed literal.
+- jed uses the **canonical single-word** type names: PG's multi-word `TIMESTAMP WITH TIME ZONE
+  '…'` and the **precision typmod** form `TIMESTAMP(p) '…'` / `NUMERIC(p,s) '…'` are not typed
+  literals here (a `(` after the name breaks the lookahead; typmod rides only on `CAST`).
 - **ISO-8601 / SQL-standard combined interval forms** inside `INTERVAL '…'` remain deferred
   ([interval.md](interval.md) §3) — a parse-subset gap, not a literal-syntax one.
 
-`DATE '…'` / `TIME '…'` are absent because those types are not in the scalar set; a CAST-style
-typed literal for the other scalars (`DECIMAL '…'`, etc.) is not part of this surface.
+`DATE '…'` / `TIME '…'` are absent only because those types are not in the scalar set.

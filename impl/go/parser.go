@@ -1715,21 +1715,16 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		}
 		return Expr{Kind: ExprCast, Cast: &CastExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod}}, nil
 	}
-	// `INTERVAL '...'` — a keyword-introduced interval literal (grammar.md §36). Recognized only
-	// when a string literal follows, so `interval` stays usable as a column / function name.
-	if p.peekKeyword() == "interval" && p.peekKindAt(1) == TokStr {
-		p.advance() // INTERVAL
+	// A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`, equal to
+	// CAST('string' AS type) over a string-literal operand: ANY type-naming word immediately followed
+	// by a string (`INTERVAL '1 day'`, `TIMESTAMP '...'`, `INTEGER '42'`, `BYTEA '\xDE'`, …).
+	// Recognized only when the next token is a string — a one-token lookahead — so the word stays
+	// usable as a column / function name otherwise. true/false/null are excluded (their own value
+	// literals). The type name is resolved (and the string coerced to it) at resolve; unknown → 42704.
+	if kw := p.peekKeyword(); kw != "" && kw != "null" && kw != "true" && kw != "false" && p.peekKindAt(1) == TokStr {
+		name := p.advance().Word // the named type (original case; ScalarFromName lowercases)
 		t := p.advance()
-		return Expr{Kind: ExprIntervalLiteral, IntervalText: t.Word}, nil
-	}
-	// `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` — keyword-introduced datetime literals (grammar.md
-	// §36), the context-free counterpart to a bare string adapting to a datetime column. Recognized
-	// only when a string literal follows, so `timestamp` / `timestamptz` stay usable as names.
-	if (p.peekKeyword() == "timestamp" || p.peekKeyword() == "timestamptz") && p.peekKindAt(1) == TokStr {
-		withTZ := p.peekKeyword() == "timestamptz"
-		p.advance() // TIMESTAMP / TIMESTAMPTZ
-		t := p.advance()
-		return Expr{Kind: ExprTimestampLiteral, TimestampText: t.Word, TimestampWithTZ: withTZ}, nil
+		return Expr{Kind: ExprTypedLiteral, TypeLitName: name, TypeLitText: t.Word}, nil
 	}
 	if p.peekKeyword() == "case" {
 		p.advance()

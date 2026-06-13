@@ -485,17 +485,21 @@ primary        ::= number
                  | "(" ( query_expr | expr ) ")"
                  | column_ref
 
-/* A keyword-introduced typed literal (../design/grammar.md §36): a type-naming keyword
- * IMMEDIATELY followed by a single-quoted string, naming the literal's type so it is
- * CONTEXT-FREE (carries that type in any expression position) — the counterpart to a bare
- * string adapting to a datetime/interval column (../design/timestamp.md §3, ../design/interval.md
- * §3). The string is parsed at resolve by the same code as the adaptation (22007 malformed /
- * 22008 field-or-range overflow), before any scan. The keywords stay non-reserved (§3): the form
- * is recognized ONLY when the next token is a string — a ONE-token lookahead, a §8 determinism
- * surface — so "timestamp"/"interval" remain usable as column / function names otherwise. jed
- * uses the canonical one-word type names: PG's multi-word "TIMESTAMP WITH TIME ZONE '…'" and the
- * "TIMESTAMP(p) '…'" precision typmod are NOT accepted (documented divergences, §36). */
-typed_literal  ::= ( "INTERVAL" | "TIMESTAMP" | "TIMESTAMPTZ" ) string
+/* A typed string literal (../design/grammar.md §36): ANY type name IMMEDIATELY followed by a
+ * single-quoted string, naming the literal's type so it is CONTEXT-FREE (carries that type in
+ * any expression position) — e.g. `INTERVAL '1 day'`, `TIMESTAMP '2024-01-01'`, `INTEGER '42'`,
+ * `NUMERIC '1.5'`, `BOOLEAN 'true'`, `BYTEA '\xDE'`, `UUID '…'`, `TEXT 'hi'`. This is PostgreSQL's
+ * `type 'string'` form, equal to `CAST('string' AS type)` restricted to a string-literal operand
+ * (../design/types.md §5). The string is coerced to the type at resolve time (22P02 malformed /
+ * 22003 out of range / the type's own parse codes; 42704 if the type name is unknown), before any
+ * scan. The leading word stays non-reserved (§3): the form is recognized ONLY when the next token
+ * is a string — a ONE-token lookahead, a §8 determinism surface — so "timestamp"/"interval"/etc.
+ * remain usable as column / function names otherwise. The type name is a bare identifier (NO
+ * typmod here: a "(" after the name breaks the lookahead, so `NUMERIC(10,2) '…'` is not a typed
+ * literal — typmod rides only on CAST). For the native-syntax types (integer/decimal/boolean) the
+ * coercion matches jed's OWN literal grammar, not PG's extras (no hex/underscore/scientific/NaN —
+ * documented §36 divergences). */
+typed_literal  ::= identifier string
 
 /* A bind parameter — "$" followed by a 1-based decimal index ($1, $2, …). NOT part of
  * the conformance corpus (which is literal-only, ../design/conformance.md §1.2): a
