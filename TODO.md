@@ -942,6 +942,31 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       exceeded (external merge sort, grace hash join), so a query over larger-than-RAM data
       never materializes its whole input/output in memory. Pull-based row iteration is the
       enabler. _(size: XL; deps: paged storage; §9/§13)_
+- [ ] **Bench-driven perf follow-ons** — the `perf-point-lookup` branch (2026-06-13) took
+      `point_lookup_pk` past same-language PG clients in all 3 cores (rust 5.4µs / go 6.6µs /
+      ts 17.3µs vs PG 10.2/12.6/18.4) via the 256 MiB pool default, binary-searched descent
+      windows, fused single-descent scans, and TS codec hot paths; `secondary_lookup` fell
+      ~93% to PG parity. The measured gaps that remain, with their diagnoses:
+      - **Rust CoW insert deep-clone** — `node_insert` rebuilds a path node with `Vec::clone`,
+        deep-copying every key (`Vec<Vec<u8>>`) and row in the node, where Go's `[][]byte`
+        copy is pointer-shallow — why `insert_rollback` is rust 21.6ms vs go 10.3ms (PG-rust
+        12.0ms). Fix: share entry storage (`Arc<[u8]>` keys / `Arc`-shared rows) so a path
+        rebuild is O(n) refcount bumps. Rust-only, no byte or cost change; touches
+        pmap/format/storage. _(size: M)_
+      - **ORDER BY + LIMIT top-k** — `order_by_limit` is 0.76–1.6s vs PG ~20ms: the executor
+        full-sorts all 1M rows before slicing. A bounded top-k selection (heap of
+        LIMIT+OFFSET, index-stable tie-break so it reproduces the stable sort + slice
+        exactly) cuts the sort to ~scan cost. Sort and window are unmetered (cost.md §3), so
+        rows and cost are unchanged. _(size: M; ×3 cores)_
+      - **Full-scan materialization** — `full_scan_agg` is 143–281ms vs PG ~13ms: the eager
+        path clones every row (text values included) into a materialized buffer before
+        aggregating. Streaming aggregation over the scan visitor is the contained first step;
+        the full fix is the "Streaming + spill-to-disk operators" item above. _(size: M–L)_
+      - **Durable-commit fsync grouping** — `insert_commit_durable` is ~7–9.5ms vs PG ~1.5ms:
+        every commit pays two fsyncs (body, then meta slot — the P6.1 crash contract) where
+        PG groups WAL flushes. Already beats SQLite (~13ms). Closing on PG means
+        batched/group commit under the relaxed `synchronous` setting (transactions.md §9) —
+        only fsync *timing* may move, never the commit-visibility boundary. _(size: M)_
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** ✅ **landed
       (both slices)**. Designed in
       [spec/design/large-values.md](spec/design/large-values.md). Lift the `RECORD_MAX` / `u16`
