@@ -32,7 +32,8 @@ everywhere" real rather than retrofitted (CLAUDE.md §9).
   (resident set = a cache of pages with eviction), incremental COW commit (dirty pages only;
   large write sets stage to disk pages, not all RAM — §4), B-tree interior pages (replace the
   flat record chain — §6), and streaming + **spill-to-disk** blocking operators (sort / hash
-  join / aggregate / DISTINCT under a memory budget). **Binding rule for present work:** no
+  join / aggregate / DISTINCT under a memory budget — the `ORDER BY` external merge sort has
+  landed, [spill.md](spill.md); the others are follow-ons). **Binding rule for present work:** no
   code above the storage seam may assume full residency — no "load = whole file into one
   buffer," no operator that requires its whole input/output in RAM. The whole-image
   load/commit and flat record chain (§6) are deliberately-narrowed current forms, not the

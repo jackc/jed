@@ -26,6 +26,7 @@ pub mod paging;
 pub mod parser;
 pub mod pmap;
 pub mod shared;
+pub mod spill;
 pub mod storage;
 pub mod timestamp;
 pub mod token;
@@ -39,6 +40,7 @@ pub use executor::{DEFAULT_PAGE_SIZE, Database, Outcome, Snapshot};
 pub use file::{DatabaseOptions, OpenOptions};
 pub use parser::Parser;
 pub use shared::{ReadHandle, SharedDb, WriteHandle};
+pub use spill::DEFAULT_WORK_MEM;
 pub use value::Value;
 
 /// The capabilities this implementation currently supports (spec/conformance:

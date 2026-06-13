@@ -75,6 +75,11 @@ type OpenOptions struct {
 	// any write statement are 25006, and the file is opened without write access, so it is never
 	// written (works on a read-only filesystem).
 	ReadOnly bool
+	// WorkMem is the work-memory budget in bytes for a blocking operator before it spills to disk
+	// (spec/design/spill.md §3, api.md §2.1): the ORDER BY external merge sort holds at most roughly
+	// this many bytes of rows resident, then spills sorted runs. Like CacheBytes it is a handle
+	// setting that never changes what a query observes (spill.md §6). 0 → DefaultWorkMem (256 MiB).
+	WorkMem int
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool
@@ -125,6 +130,9 @@ func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
 	}
 	db.path = path
 	db.readOnly = opts.ReadOnly
+	if opts.WorkMem != 0 {
+		db.workMem = opts.WorkMem
+	}
 	return db, nil
 }
 

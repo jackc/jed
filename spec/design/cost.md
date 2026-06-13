@@ -618,7 +618,11 @@ evaluation. It deliberately does **not** meter:
   through the expression evaluator, so they are outside the `operator_eval` unit (and the
   `decimal_work` unit — `MIN`/`MAX` folds are the same direct compare and share this
   boundary). This holds for a **multi-key** sort too (each key's comparison is the same
-  direct `Value` compare), so adding keys or `NULLS FIRST|LAST` placement changes no cost.
+  direct `Value` compare), so adding keys or `NULLS FIRST|LAST` placement changes no cost. It
+  also holds when the sort **spills to disk** under `work_mem` ([spill.md](spill.md)): the
+  external merge sort's run-spill / k-way-merge comparisons and its temp-file I/O are
+  sort-internal, so a larger-than-RAM `ORDER BY` charges exactly what the in-memory sort did —
+  cost is invariant to whether and how often it spilled (spill.md §6).
   (A dedicated sort-comparison unit could be added later if wanted; it is not in this slice.)
 - **`LIMIT` / `OFFSET` slicing** — selecting the output window is an index slice over the
   already-sorted rows, not evaluation work; like the sort it is unmetered. Its only cost

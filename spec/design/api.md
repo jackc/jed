@@ -94,6 +94,20 @@ the guards promise (a read-only handle works on a read-only filesystem). The han
 `read_only()` / `ReadOnly()` / `.readOnly`. Like the memory budget it is a handle setting, not
 stored in the file — another handle may have the same file open writable.
 
+**Work-memory budget — a handle setting ([spill.md](spill.md) §3).** `open`'s `opts.work_mem`
+(Rust `OpenOptions { work_mem }` / Go `OpenOptions { WorkMem }` / TS `{ workMem }`; default
+**`DEFAULT_WORK_MEM = 256 MiB`**) bounds the memory a single **blocking operator** — currently the
+`ORDER BY` external merge sort (spill.md §4) — may hold resident before it **spills to disk**, so a
+query over larger-than-RAM data never materializes its whole input in the executor's heap
+(CLAUDE.md §9). It is PostgreSQL's `work_mem`, stated in the same unit (**bytes**), and like
+`cache_bytes` / `max_cost` it is a **handle** setting (not stored in the file) that **never changes
+what a query observes** — results and cost are invariant to it (spill.md §6), it only changes *when*
+an operator spills. `db.set_work_mem(bytes)` / `SetWorkMem` / `setWorkMem` sets it on an open handle
+(mirroring `set_max_cost`); `0` means **unlimited** (never spill). An **in-memory** database ignores
+it — it has nowhere to spill, so a blocking operator stays fully resident regardless (spill.md §2,
+mirroring the buffer pool's in-memory residency). Same shape across cores; the bare `open(path)`
+form uses the default.
+
 In-memory databases use the **existing constructors** (`Database::new()` / `NewDatabase()` /
 `new Database()`) — no backing file, default settings, kept verbatim for back-compat (the
 conformance harnesses and unit suites use them). An in-memory database never touches the
@@ -226,7 +240,9 @@ assumption (the [storage.md](storage.md) §1 binding rule): today the executor *
 all rows before the cursor walks them, but the caller-visible contract (yield row, then row,
 then column metadata) is exactly what a future streaming/pull executor satisfies — so
 streaming can land later without changing any caller. True streaming and spill-to-disk
-operators are a separate deferred change (CLAUDE.md §9, Phase 6).
+operators are landing operator-by-operator ([spill.md](spill.md)): the `ORDER BY` external
+merge sort + its streaming single-table feed have landed; the spilling hash aggregate /
+`DISTINCT` / hash JOIN are deferred follow-ons (CLAUDE.md §9, Phase 6).
 
 A statement result carries `cost` and the **affected-row count**: an INSERT, UPDATE, or
 DELETE without RETURNING reports how many rows it touched — PostgreSQL's command-tag count
@@ -342,7 +358,10 @@ options object on `execute`/`prepare`) stays open for later without changing thi
 
 ## 9. Non-goals this slice
 
-- **No streaming rows** — the cursor walks materialized rows (§4).
+- **No streaming rows at the cursor** — the cursor still walks materialized rows (§4). (The
+  *operators* are being bounded internally — the `ORDER BY` external merge sort spills to disk
+  under `work_mem` ([spill.md](spill.md)) — but the `Rows` cursor itself is fed a materialized
+  result; a fully pull-based cursor is the further step.)
 - **Transactions are IN, not a non-goal.** The §3 staging buffer, autocommit, the `Transaction`
   surface (`begin`/`view`/`update`), the `synchronous` durability setting, and SQL
   `BEGIN`/`COMMIT`/`ROLLBACK` are **specified** in [transactions.md](transactions.md) and land in

@@ -46,6 +46,12 @@ pub struct OpenOptions {
     /// write statement are `25006`, and the file is opened without write access, so it is never
     /// written (works on a read-only filesystem). Default `false`.
     pub read_only: bool,
+    /// The work-memory budget **in bytes** for a blocking operator before it spills to disk
+    /// (spec/design/spill.md §3, api.md §2.1): the `ORDER BY` external merge sort holds at most
+    /// roughly this many bytes of rows resident, then spills sorted runs. `0` ⇒ unlimited (never
+    /// spill). Like `cache_bytes` it is a handle setting that never changes what a query observes
+    /// (spill.md §6). Default [`DEFAULT_WORK_MEM`](crate::spill::DEFAULT_WORK_MEM) (256 MiB).
+    pub work_mem: usize,
 }
 
 impl Default for OpenOptions {
@@ -53,6 +59,7 @@ impl Default for OpenOptions {
         OpenOptions {
             cache_bytes: DEFAULT_CACHE_BYTES,
             read_only: false,
+            work_mem: crate::spill::DEFAULT_WORK_MEM,
         }
     }
 }
@@ -133,6 +140,7 @@ impl Database {
         let mut db = Database::open_paged(pager, capacity)?;
         db.path = Some(path.to_path_buf());
         db.read_only = opts.read_only;
+        db.work_mem = opts.work_mem;
         Ok(db)
     }
 

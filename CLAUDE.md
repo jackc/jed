@@ -332,7 +332,10 @@ biases below are where an overriding reason *does* steer away from PG.
   pool** (the resident set becomes a cache of pages with eviction, not the whole file — **design
   landed**, [spec/design/pager.md](spec/design/pager.md), a *universal* pool reached
   seam-foundation-first; P6.4) and **streaming + spill-to-disk operators** (sort / hash join /
-  aggregate / DISTINCT bounded by a memory budget, spilling when exceeded). The binding constraint on
+  aggregate / DISTINCT bounded by a memory budget, spilling when exceeded — the **`ORDER BY`
+  external merge sort + its streaming single-table feed have landed**, [spec/design/spill.md](spec/design/spill.md),
+  bounded by the `work_mem` handle setting; the spilling hash aggregate / `DISTINCT` / hash JOIN
+  are follow-ons). The binding constraint on
   present work: **no code above the storage seam may harden a full-residency assumption** — no
   "load = read the whole file into one buffer," no operator that *requires* its entire input
   or output to fit in RAM. Today's whole-image load/commit and flat record chain are

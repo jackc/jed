@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -234,6 +235,13 @@ type Database struct {
 	// opened without write access, so it is never written. Always false for an in-memory or
 	// normally-opened database.
 	readOnly bool
+	// workMem is the work-memory budget in bytes (spec/design/spill.md §2, api.md §2.1): the memory
+	// a single blocking operator (currently the ORDER BY external merge sort) may hold resident
+	// before it spills sorted runs to disk. A handle setting (not stored in the file), set by
+	// SetWorkMem; 0 means unlimited (never spill). It never changes what a query observes (results +
+	// cost are invariant — spill.md §6), only when an operator spills; an in-memory database ignores
+	// it (no file to spill to). Default DefaultWorkMem.
+	workMem int
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
@@ -249,7 +257,7 @@ type activeTx struct {
 
 // NewDatabase builds an empty in-memory database.
 func NewDatabase() *Database {
-	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize}
+	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize, workMem: DefaultWorkMem}
 }
 
 // WithPageSize returns an in-memory handle that serializes at pageSize. The page-backed B-tree's
@@ -257,7 +265,7 @@ func NewDatabase() *Database {
 // the size it will serialize to — this builds fixtures / tests a non-default page size; a normal
 // in-memory database uses NewDatabase (the default page size).
 func WithPageSize(pageSize uint32) *Database {
-	return &Database{committed: newSnapshot(), pageSize: pageSize}
+	return &Database{committed: newSnapshot(), pageSize: pageSize, workMem: DefaultWorkMem}
 }
 
 // readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
@@ -300,6 +308,17 @@ func (db *Database) SetMaxCost(limit int64) { db.maxCost = limit }
 
 // MaxCost is the current execution-cost ceiling (0 ⇒ unlimited). See SetMaxCost.
 func (db *Database) MaxCost() int64 { return db.maxCost }
+
+// SetWorkMem sets the work-memory budget (in bytes) for blocking operators run on this handle
+// (spec/design/spill.md §3, api.md §2.1): the ORDER BY external merge sort holds at most roughly
+// this many bytes of rows resident before it spills sorted runs to disk. 0 is unlimited (never
+// spill). It never changes what a query observes (results + cost are invariant — spill.md §6), only
+// when an operator spills; an in-memory database ignores it. A handle setting, not stored in the
+// file (mirrors SetMaxCost).
+func (db *Database) SetWorkMem(bytes int) { db.workMem = bytes }
+
+// WorkMem is the current work-memory budget in bytes (0 ⇒ unlimited). See SetWorkMem.
+func (db *Database) WorkMem() int { return db.workMem }
 
 // ReadOnly reports whether this handle was opened read-only (spec/design/api.md §2.1): every
 // transaction defaults to READ ONLY, writes are 25006, and the file is never written.
@@ -3264,6 +3283,128 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
 }
 
+// execStreamingSort is the streaming external sort for a single-table ORDER BY (spec/design/spill.md
+// §4/§5). It streams scan→filter→sorter, so the input is never materialized in the executor heap;
+// the sorter spills sorted runs to disk under workMem (file-backed databases) and k-way-merges them
+// at finish, then the window/projection loop pulls the sorted rows one at a time. Results + cost are
+// byte-identical to the eager sort: the same page_read block, storage_row_read per scanned row,
+// filter operator_eval, and row_produced per windowed row accrue — only the sort, which is unmetered
+// (cost.md §3), now spills. Gated (by the caller) to a single table, no join, non-aggregate,
+// non-DISTINCT, with an ORDER BY and no index bound.
+func (db *Database) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
+	store := db.readSnap().store(plan.rels[0].tableName)
+
+	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read + value_decompress
+	// block up front — identical to the eager scan (cost.md §3). An INDEX bound never reaches here.
+	b := unboundedBound()
+	empty := false
+	overlap, slabs := 0, 0
+	if plan.relBounds[0] != nil {
+		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer)
+	}
+	if !empty {
+		var err error
+		if overlap, slabs, err = store.OverlapScanUnits(b, plan.relMasks[0]); err != nil {
+			return selectResult{}, err
+		}
+	}
+	meter.Charge(Costs.PageRead*int64(overlap) + Costs.ValueDecompress*int64(slabs))
+
+	// Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits:
+	// every in-range row is read (charging storage_row_read), its touched columns resolved
+	// (large-values.md §14), the WHERE applied (charging operator_eval), and a survivor pushed into
+	// the sorter, which spills when it exceeds the budget.
+	s := db.newSorterFor(plan.order)
+	if !empty {
+		err := store.ScanRange(b, func(_ []byte, row Row) (bool, error) {
+			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+				return false, err
+			}
+			meter.Charge(Costs.StorageRowRead)
+			row, err := store.resolveColumns(row, plan.relMasks[0])
+			if err != nil {
+				return false, err
+			}
+			keep := true
+			if plan.filter != nil {
+				v, err := plan.filter.eval(row, env, meter)
+				if err != nil {
+					return false, err
+				}
+				keep = v.IsTrue()
+			}
+			if keep {
+				if err := s.push(row); err != nil {
+					return false, err
+				}
+			}
+			return true, nil // never stop early — the sort must see every row
+		})
+		if err != nil {
+			return selectResult{}, err
+		}
+	}
+
+	// LIMIT / OFFSET window over the sort's total row count (known without materializing the
+	// output). Clamp in the int64 domain before indexing (CLAUDE.md §8).
+	total := int64(s.total)
+	var start int64
+	if plan.offset != nil && *plan.offset < total {
+		start = *plan.offset
+	} else if plan.offset != nil {
+		start = total
+	}
+	end := total
+	if plan.limit != nil && *plan.limit < total-start {
+		end = start + *plan.limit
+	}
+	sorted, err := s.finish()
+	if err != nil {
+		return selectResult{}, err
+	}
+	defer sorted.close() // a LIMIT may stop the merge early — release any undrained run files
+	for i := int64(0); i < start; i++ {
+		if _, _, err := sorted.next(); err != nil { // skip the OFFSET rows (unwindowed)
+			return selectResult{}, err
+		}
+	}
+	out := make([][]Value, 0, end-start)
+	for i := start; i < end; i++ {
+		row, ok, err := sorted.next()
+		if err != nil {
+			return selectResult{}, err
+		}
+		if !ok {
+			break
+		}
+		if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+			return selectResult{}, err
+		}
+		meter.Charge(Costs.RowProduced)
+		projected := make([]Value, len(plan.projections))
+		for j, p := range plan.projections {
+			v, err := p.eval(row, env, meter)
+			if err != nil {
+				return selectResult{}, err
+			}
+			projected[j] = v
+		}
+		out = append(out, projected)
+	}
+	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
+}
+
+// newSorterFor builds a sorter for order, bounded by this handle's workMem. Spilling is enabled only
+// for a file-backed database (an in-memory one has nowhere to spill — spill.md §2); spill runs live
+// next to the database file (same filesystem, guaranteed writable).
+func (db *Database) newSorterFor(order []orderSlot) *sorter {
+	spillDir := ""
+	if db.paging != nil {
+		spillDir = filepath.Dir(db.path)
+	}
+	return newSorter(order, db.workMem, spillDir)
+}
+
 func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer}
 	meter := NewMeterWithLimit(db.maxCost)
@@ -3280,6 +3421,18 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		!plan.isAgg && !plan.distinct && len(plan.order) == 0 &&
 		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) {
 		return db.execStreamingLimit(plan, env, meter, params)
+	}
+
+	// Streaming external sort (spec/design/spill.md §5): a single-table, no-join, non-aggregate,
+	// non-DISTINCT query with an ORDER BY streams scan→filter→sorter, so the input is never
+	// materialized in the executor heap and the sort spills sorted runs to disk under workMem
+	// (file-backed databases). DISTINCT/aggregate/join take the eager path below, and an index bound
+	// does not stream (like the LIMIT short-circuit). Results + cost are identical to the eager sort
+	// (the sort is unmetered — cost.md §3; spill.md §6).
+	if len(plan.order) > 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
+		!plan.isAgg && !plan.distinct &&
+		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) {
+		return db.execStreamingSort(plan, env, meter, params)
 	}
 
 	// Materialize each base table once, in primary-key order, by draining a scanSource (the

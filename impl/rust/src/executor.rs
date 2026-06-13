@@ -274,6 +274,14 @@ pub struct Database {
     /// publishes and the file is never written (it is opened without write access). Always
     /// `false` for an in-memory or normally-opened database.
     pub(crate) read_only: bool,
+    /// The work-memory budget in **bytes** (spec/design/spill.md §2, api.md §2.1): the memory a
+    /// single blocking operator (currently the `ORDER BY` external merge sort) may hold resident
+    /// before it spills sorted runs to disk. A handle setting (not stored in the file), set by
+    /// [`set_work_mem`](Database::set_work_mem); `0` ⇒ **unlimited** (never spill). It never changes
+    /// what a query observes (results + cost are invariant, spill.md §6) — only when an operator
+    /// spills. An **in-memory** database ignores it (no backing file to spill to — it stays fully
+    /// resident, like the buffer pool). Default [`DEFAULT_WORK_MEM`](crate::spill::DEFAULT_WORK_MEM).
+    pub(crate) work_mem: usize,
 }
 
 /// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
@@ -314,6 +322,7 @@ impl Database {
             paging: None,
             max_cost: 0,
             read_only: false,
+            work_mem: crate::spill::DEFAULT_WORK_MEM,
         }
     }
 
@@ -333,6 +342,7 @@ impl Database {
             paging: None,
             max_cost: 0,
             read_only: false,
+            work_mem: crate::spill::DEFAULT_WORK_MEM,
         }
     }
 
@@ -412,6 +422,21 @@ impl Database {
     /// The current execution-cost ceiling (`0` ⇒ unlimited). See [`set_max_cost`](Database::set_max_cost).
     pub fn max_cost(&self) -> i64 {
         self.max_cost
+    }
+
+    /// Set the work-memory budget (in **bytes**) for blocking operators run on this handle
+    /// (spec/design/spill.md §3, api.md §2.1): the `ORDER BY` external merge sort holds at most
+    /// roughly this many bytes of rows resident before it spills sorted runs to disk. `0` is
+    /// **unlimited** (never spill). It never changes what a query observes (results + cost are
+    /// invariant — spill.md §6), only when an operator spills; an in-memory database ignores it (no
+    /// file to spill to). A handle setting, not stored in the file (mirrors `set_max_cost`).
+    pub fn set_work_mem(&mut self, bytes: usize) {
+        self.work_mem = bytes;
+    }
+
+    /// The current work-memory budget in bytes (`0` ⇒ unlimited). See [`set_work_mem`](Database::set_work_mem).
+    pub fn work_mem(&self) -> usize {
+        self.work_mem
     }
 
     /// The backing file path, or `None` for an in-memory database.
@@ -2856,6 +2881,124 @@ impl Database {
         })
     }
 
+    /// Streaming external sort for a single-table `ORDER BY` (spec/design/spill.md §4/§5). Streams
+    /// scan→filter→[`Sorter`], so the input is never materialized in the executor heap; the sorter
+    /// spills sorted runs to disk under `work_mem` (file-backed databases) and k-way-merges them at
+    /// `finish`, then the window/projection loop pulls the sorted rows one at a time. Results + cost
+    /// are byte-identical to the eager sort: the same `page_read` block, `storage_row_read` per
+    /// scanned row, filter `operator_eval`, and `row_produced` per windowed row accrue — only the
+    /// sort, which is unmetered (cost.md §3), now spills. Gated (by the caller) to a single table, no
+    /// join, non-aggregate, non-DISTINCT, with an `ORDER BY` and no index bound.
+    fn exec_streaming_sort(
+        &self,
+        plan: &SelectPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+        params: &[Value],
+    ) -> Result<SelectResult> {
+        let store = self.store(&plan.rels[0].table_name);
+
+        // Resolve the scan bound (the PK pushdown, if any) and charge the page_read +
+        // value_decompress block up front — identical to the eager scan (cost.md §3). An INDEX
+        // bound never reaches here (the dispatch gate routes it to the eager path).
+        let (bound, empty) = match &plan.rel_bounds[0] {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer) {
+                Some(b) => (b, false),
+                None => (KeyBound::unbounded(), true),
+            },
+            Some(ScanBound::Index(_)) => {
+                unreachable!("the streaming sort path is gated to PK/full scans")
+            }
+            None => (KeyBound::unbounded(), false),
+        };
+        let (overlap, slabs) = if empty {
+            (0, 0)
+        } else {
+            store.overlap_scan_units(&bound, &plan.rel_masks[0])?
+        };
+        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+
+        // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits:
+        // every in-range row is read (charging storage_row_read), its touched columns resolved
+        // (large-values.md §14), the WHERE applied (charging operator_eval), and a survivor pushed
+        // into the sorter, which spills when it exceeds the budget. Only surviving rows are cloned.
+        let mut sorter = self.new_sorter(&plan.order);
+        if !empty {
+            store.scan_range(&bound, &mut |_key, row| {
+                meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+                meter.charge(COSTS.storage_row_read);
+                let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
+                    let mut r = row.clone();
+                    store.resolve_columns(&mut r, &plan.rel_masks[0])?;
+                    Some(r)
+                } else {
+                    None
+                };
+                let row_ref = resolved.as_ref().unwrap_or(row);
+                let keep = match &plan.filter {
+                    Some(f) => f.eval(row_ref, env, meter)?.is_true(),
+                    None => true,
+                };
+                if keep {
+                    sorter.push(resolved.unwrap_or_else(|| row.clone()))?;
+                }
+                Ok(true) // never stop early — the sort must see every row
+            })?;
+        }
+
+        // LIMIT / OFFSET window over the sort's total row count (known without materializing the
+        // output). Clamp in the i64 domain before indexing (CLAUDE.md §8).
+        let total = sorter.total() as i64;
+        let start = plan.offset.unwrap_or(0).min(total);
+        let end = match plan.limit {
+            Some(lim) if lim < total - start => start + lim,
+            _ => total,
+        };
+        let mut sorted = sorter.finish()?;
+        for _ in 0..start {
+            sorted.next()?; // skip the OFFSET rows (unwindowed — no row_produced)
+        }
+        let mut out: Vec<Vec<Value>> = Vec::with_capacity((end - start) as usize);
+        for _ in start..end {
+            let row = sorted
+                .next()?
+                .expect("the sorter yields exactly `total` rows");
+            meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+            meter.charge(COSTS.row_produced);
+            let mut projected = Vec::with_capacity(plan.projections.len());
+            for p in &plan.projections {
+                projected.push(p.eval(&row, env, meter)?);
+            }
+            out.push(projected);
+        }
+        Ok(SelectResult {
+            column_names: plan.column_names.clone(),
+            column_types: plan.column_types.clone(),
+            rows: out,
+            cost: meter.accrued,
+        })
+    }
+
+    /// Build an [`Sorter`](crate::spill::Sorter) for `order`, bounded by this handle's `work_mem`.
+    /// Spilling is enabled only for a **file-backed** database (an in-memory one has nowhere to
+    /// spill — spill.md §2); spill runs live next to the database file (same filesystem, guaranteed
+    /// writable), falling back to the system temp dir.
+    fn new_sorter(&self, order: &[(usize, bool, bool)]) -> crate::spill::Sorter {
+        let spill_dir = if self.paging.is_some() {
+            let dir = self
+                .path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(std::env::temp_dir);
+            Some(dir)
+        } else {
+            None
+        };
+        crate::spill::Sorter::new(order.to_vec(), self.work_mem, spill_dir)
+    }
+
     /// Execute a resolved SELECT against an outer-row environment (`outer` = the enclosing
     /// rows, innermost last; empty at top level) and the bound parameters. The execute half of
     /// the old `run_select`: materialize, nested-loop join, WHERE, then aggregate / DISTINCT /
@@ -2890,6 +3033,22 @@ impl Database {
             && !matches!(plan.rel_bounds[0], Some(ScanBound::Index(_)))
         {
             return self.exec_streaming_limit(plan, &env, &mut meter, params);
+        }
+
+        // Streaming external sort (spec/design/spill.md §5): a single-table, no-join,
+        // non-aggregate, non-DISTINCT query with an ORDER BY streams scan→filter→Sorter, so the
+        // input is never materialized in the executor heap and the sort spills sorted runs to disk
+        // under work_mem (file-backed databases). DISTINCT/aggregate/join take the eager path below,
+        // and an index bound does not stream (like the LIMIT short-circuit). Results + cost are
+        // identical to the eager sort (the sort is unmetered — cost.md §3; spill.md §6).
+        if !plan.order.is_empty()
+            && plan.rels.len() == 1
+            && plan.joins.is_empty()
+            && !plan.is_agg
+            && !plan.distinct
+            && !matches!(plan.rel_bounds[0], Some(ScanBound::Index(_)))
+        {
+            return self.exec_streaming_sort(plan, &env, &mut meter, params);
         }
 
         // Materialize each base table once, in primary-key order, by draining a ScanSource (the
@@ -7355,7 +7514,12 @@ fn eval_decimal_arith(op: ArithOp, a: Decimal, b: Decimal) -> Result<Value> {
 /// `NULLS FIRST|LAST` overrides the direction default (spec/design/grammar.md §10). The
 /// physical key order ratifies NULL as the largest value (the PostgreSQL model), which
 /// surfaces as the parse-time default `nulls_first = descending` (ASC → last, DESC → first).
-fn key_cmp(a: &Value, b: &Value, descending: bool, nulls_first: bool) -> std::cmp::Ordering {
+pub(crate) fn key_cmp(
+    a: &Value,
+    b: &Value,
+    descending: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,

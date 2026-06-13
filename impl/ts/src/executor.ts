@@ -41,6 +41,8 @@ import { encodeInt } from "./encoding.ts";
 import { type EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
 import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
+import { dirname } from "node:path";
+import { DEFAULT_WORK_MEM, type RowCompare, Sorter } from "./spill.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -306,6 +308,13 @@ export class Database {
   // without write access, so it is never written. Always false for an in-memory or
   // normally-opened database.
   readOnly: boolean;
+  // workMem is the work-memory budget in bytes (spec/design/spill.md §2, api.md §2.1): the memory a
+  // single blocking operator (currently the ORDER BY external merge sort) may hold resident before it
+  // spills sorted runs to disk. A handle setting (not stored in the file), set by setWorkMem; 0 means
+  // unlimited (never spill). It never changes what a query observes (results + cost are invariant —
+  // spill.md §6), only when an operator spills; an in-memory database ignores it. Default
+  // DEFAULT_WORK_MEM.
+  workMem: number;
 
   constructor() {
     this.committed = new Snapshot();
@@ -318,6 +327,7 @@ export class Database {
     this.paging = null;
     this.maxCost = 0n;
     this.readOnly = false;
+    this.workMem = DEFAULT_WORK_MEM;
   }
 
   // setMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
@@ -327,6 +337,16 @@ export class Database {
   // setting, not stored in the file.
   setMaxCost(limit: bigint): void {
     this.maxCost = limit;
+  }
+
+  // setWorkMem sets the work-memory budget (in bytes) for blocking operators run on this handle
+  // (spec/design/spill.md §3, api.md §2.1): the ORDER BY external merge sort holds at most roughly
+  // this many bytes of rows resident before it spills sorted runs to disk. 0 is unlimited (never
+  // spill). It never changes what a query observes (results + cost are invariant — spill.md §6),
+  // only when an operator spills; an in-memory database ignores it. A handle setting, not stored in
+  // the file (mirrors setMaxCost).
+  setWorkMem(bytes: number): void {
+    this.workMem = bytes;
   }
 
   // readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
@@ -2096,6 +2116,89 @@ export class Database {
     return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.accrued };
   }
 
+  // execStreamingSort is the streaming external sort for a single-table ORDER BY (spec/design/spill.md
+  // §4/§5). It streams scan→filter→sorter, so the input is never materialized in the executor heap;
+  // the sorter spills sorted runs to disk under workMem (file-backed databases) and k-way-merges them
+  // at finish, then the window/projection loop pulls the sorted rows one at a time. Results + cost are
+  // byte-identical to the eager sort: the same pageRead block, storageRowRead per scanned row, filter
+  // operator_eval, and rowProduced per windowed row accrue — only the sort, which is unmetered
+  // (cost.md §3), now spills. Gated (by the caller) to a single table, no join, non-aggregate,
+  // non-DISTINCT, with an ORDER BY and no index bound.
+  private execStreamingSort(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): SelectResult {
+    const store = this.readSnap().store(plan.rels[0]!.tableName);
+
+    // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead + valueDecompress block
+    // up front — identical to the eager scan (cost.md §3). An INDEX bound never reaches here.
+    let bound: KeyBound = unboundedBound();
+    let empty = false;
+    const sb = plan.relBounds[0]!;
+    if (sb !== null) {
+      if (sb.kind === "index") throw new Error("the streaming sort path is gated to PK/full scans");
+      const b = buildKeyBound(sb.pk, params, env.outer);
+      if (b === null) empty = true;
+      else bound = b;
+    }
+    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
+    meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
+
+    // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits: every
+    // in-range row is read (charging storageRowRead), its touched columns resolved (large-values.md
+    // §14), the WHERE applied (charging operator_eval), and a survivor pushed into the sorter, which
+    // spills when it exceeds the budget.
+    const sorter = this.newSorterFor(plan.order);
+    if (!empty) {
+      store.scanRange(bound, (_key, rawRow) => {
+        meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+        meter.charge(COSTS.storageRowRead);
+        const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
+        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
+          return true;
+        }
+        sorter.push(row);
+        return true; // never stop early — the sort must see every row
+      });
+    }
+
+    // LIMIT / OFFSET window over the sort's total row count (known without materializing the output).
+    // Clamp in the bigint domain before indexing (CLAUDE.md §8).
+    const total = BigInt(sorter.total);
+    const offset = plan.offset ?? 0n;
+    const start = offset < total ? offset : total;
+    let end = total;
+    if (plan.limit !== null && plan.limit < total - start) end = start + plan.limit;
+
+    const sorted = sorter.finish();
+    try {
+      for (let i = 0n; i < start; i++) sorted.next(); // skip the OFFSET rows (unwindowed)
+      const out: Value[][] = [];
+      for (let i = start; i < end; i++) {
+        const row = sorted.next();
+        if (row === null) break;
+        meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+        meter.charge(COSTS.rowProduced);
+        out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+      }
+      return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.accrued };
+    } finally {
+      sorted.close(); // a LIMIT may stop the merge early — release any undrained run files
+    }
+  }
+
+  // newSorterFor builds a Sorter for order, bounded by this handle's workMem. Spilling is enabled only
+  // for a file-backed database (an in-memory one has nowhere to spill — spill.md §2); spill runs live
+  // next to the database file (same filesystem, guaranteed writable).
+  private newSorterFor(order: OrderSlot[]): Sorter {
+    const compare: RowCompare = (a, b) => {
+      for (const k of order) {
+        const c = keyCmp(a[k.idx]!, b[k.idx]!, k.descending, k.nullsFirst);
+        if (c !== 0) return c;
+      }
+      return 0;
+    };
+    const spillDir = this.paging !== null && this.path !== null ? dirname(this.path) : null;
+    return new Sorter(compare, this.workMem, spillDir);
+  }
+
   private execSelectPlan(plan: SelectPlan, outer: Row[], params: Value[]): SelectResult {
     const env: EvalEnv = {
       params,
@@ -2121,6 +2224,23 @@ export class Database {
       plan.relBounds[0]?.kind !== "index"
     ) {
       return this.execStreamingLimit(plan, env, meter, params);
+    }
+
+    // Streaming external sort (spec/design/spill.md §5): a single-table, no-join, non-aggregate,
+    // non-DISTINCT query with an ORDER BY streams scan→filter→sorter, so the input is never
+    // materialized in the executor heap and the sort spills sorted runs to disk under workMem
+    // (file-backed databases). DISTINCT/aggregate/join take the eager path below, and an index bound
+    // does not stream (like the LIMIT short-circuit). Results + cost are identical to the eager sort
+    // (the sort is unmetered — cost.md §3; spill.md §6).
+    if (
+      plan.order.length > 0 &&
+      plan.rels.length === 1 &&
+      plan.joins.length === 0 &&
+      !plan.isAgg &&
+      !plan.distinct &&
+      plan.relBounds[0]?.kind !== "index"
+    ) {
+      return this.execStreamingSort(plan, env, meter, params);
     }
 
     // Materialize each base table once, in primary-key order, by draining a scanSource (the

@@ -66,7 +66,11 @@ function writeFullImage(db: Database): void {
 // readOnly opens the file read-only (api.md §2.1): the handle then behaves like PostgreSQL hot
 // standby — every transaction defaults to READ ONLY, an explicit READ WRITE request and any write
 // statement are 25006, and the file is opened without write access, so it is never written.
-export type OpenOptions = { cacheBytes?: number; readOnly?: boolean };
+// workMem is the work-memory budget in bytes for a blocking operator before it spills to disk
+// (spec/design/spill.md §3, api.md §2.1): the ORDER BY external merge sort holds at most roughly this
+// many bytes of rows resident, then spills sorted runs. Like cacheBytes it is a handle setting that
+// never changes what a query observes (spill.md §6). Default DEFAULT_WORK_MEM (256 MiB).
+export type OpenOptions = { cacheBytes?: number; readOnly?: boolean; workMem?: number };
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,
 // opts.cacheBytes). Loads its committed state, adopting its page size / txid. The path must exist —
@@ -100,6 +104,7 @@ export function open(path: string, opts: OpenOptions = {}): Database {
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;
+    if (opts.workMem !== undefined) db.workMem = opts.workMem;
     return db;
   } catch (e) {
     closeSync(fd); // a malformed file / read failure must not leak the fd

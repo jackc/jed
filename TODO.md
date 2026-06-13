@@ -941,7 +941,27 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `JOIN`, `GROUP BY`/aggregate, `DISTINCT`) by a memory budget and **spill to disk** when
       exceeded (external merge sort, grace hash join), so a query over larger-than-RAM data
       never materializes its whole input/output in memory. Pull-based row iteration is the
-      enabler. _(size: XL; deps: paged storage; §9/§13)_
+      enabler. Designed in [spec/design/spill.md](spec/design/spill.md). _(size: XL; deps: paged
+      storage; §9/§13)_
+  - [x] **External merge sort for `ORDER BY`** ✅ **landed** (all 3 cores). A `Sorter` replaces the
+        in-memory `sort_by`/`SliceStable` at the plain (non-aggregate, non-`DISTINCT`) `ORDER BY`
+        site: it accumulates rows up to the **`work_mem`** budget (api.md §2.1 — a handle setting in
+        bytes, default `DEFAULT_WORK_MEM = 256 MiB`, `set_work_mem` to override, in-memory databases
+        never spill), then **stable-sorts + spills sorted runs** to per-core temp files and **k-way
+        merges** them — reproducing the in-memory stable sort byte-for-byte (tie-break by (run,
+        position) = input order). For a **single table, no join** `ORDER BY` the executor **fuses
+        scan→filter→Sorter** so the input is never materialized (the larger-than-RAM `ORDER BY`); a
+        join/multi-table `ORDER BY` drains the existing pipeline into the same `Sorter`. **Result- and
+        cost-invariant** (the sort is unmetered — cost.md §3; not a §8 byte contract — like the buffer
+        pool, so each core is idiomatic, no golden/format/cost change), verified by per-core spill
+        tests (a file-backed DB + a tiny `work_mem` returns identical rows + cost to the in-memory
+        path). The spill files are stdlib temp-file I/O only (no dependency, memory-safe — §14/§13).
+        _(size: L)_
+  - [ ] **Spilling hash aggregate / `DISTINCT` / hash JOIN** — the remaining blocking operators
+        (spill.md §7). Each needs a *different* algorithm: a partitioned (grace) hash that preserves
+        first-occurrence order for aggregate/DISTINCT, and — for hash JOIN — a hash-join operator
+        first (jed joins are nested-loop today), then grace-hash spill to bound the build side (the
+        item that bounds a *join's* input materialization). _(size: L–XL each)_
 - [ ] **Bench-driven perf follow-ons** — the `perf-point-lookup` branch (2026-06-13) took
       `point_lookup_pk` past same-language PG clients in all 3 cores (rust 5.4µs / go 6.6µs /
       ts 17.3µs vs PG 10.2/12.6/18.4) via the 256 MiB pool default, binary-searched descent
