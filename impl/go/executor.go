@@ -4220,6 +4220,17 @@ func distinctRowKey(row []Value) string {
 			b.WriteString(strconv.Itoa(len(v.Str)))
 			b.WriteByte(':')
 			b.WriteString(v.Str)
+		case ValTimestamp:
+			// The int64 microsecond instant (held in Int), under a distinct 's' tag. Two literals
+			// for the same instant (e.g. 12:00:00 and 12:00:00.0) share the int, so they bucket
+			// together; the infinity sentinels are ordinary int values with their own buckets.
+			b.WriteByte('s')
+			b.WriteString(strconv.FormatInt(v.Int, 10))
+		case ValTimestamptz:
+			// The int64 UTC-instant micros (held in Int), under a distinct 'z' tag: offsets are
+			// already normalized to UTC at parse, so +00 and +05-of-the-same-instant bucket together.
+			b.WriteByte('z')
+			b.WriteString(strconv.FormatInt(v.Int, 10))
 		}
 	}
 	return b.String()

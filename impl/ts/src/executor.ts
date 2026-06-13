@@ -3131,6 +3131,15 @@ function distinctRowKey(row: Value[]): string {
           // A distinct 'u' tag over the canonical form, so a uuid never collides with a
           // bytea/text of the same bytes.
           return "u" + renderUuid(v.bytes);
+        case "timestamp":
+          // The int64 microsecond instant under a distinct 's' tag: two literals for the same
+          // instant (12:00:00 and 12:00:00.0) share micros and bucket together; the infinity
+          // sentinels are ordinary int values with their own buckets.
+          return "s" + v.micros.toString();
+        case "timestamptz":
+          // The int64 UTC-instant micros under a distinct 'z' tag: offsets are normalized to UTC
+          // at parse, so +00 and +05-of-the-same-instant bucket together.
+          return "z" + v.micros.toString();
       }
     })
     .join("|");
