@@ -270,8 +270,16 @@ intersect_expr ::= select_core ("INTERSECT" ("ALL" | "DISTINCT")? select_core)*
 
 /* A SELECT core is one SELECT WITHOUT a trailing ORDER BY / LIMIT / OFFSET — the operand form of
  * a set operation. A lone query_expr (no set operator) folds the trailing clauses back onto this
- * core, recovering the single-table / joined SELECT unchanged. */
-select_core    ::= "SELECT" "DISTINCT"? select_items "FROM" from_clause
+ * core, recovering the single-table / joined SELECT unchanged.
+ *   The FROM clause is OPTIONAL (../design/grammar.md §34): with no FROM the select list
+ * evaluates over ONE virtual zero-column row (PostgreSQL semantics) — no table is read, so no
+ * scan cost accrues (../design/cost.md §3). WHERE / GROUP BY / HAVING (and a lone query's
+ * ORDER BY / LIMIT / OFFSET) still compose; "SELECT *" with no FROM is 42601. Because keywords
+ * are not reserved (§3), a word after the select items that is not "FROM" is NOT a FROM clause:
+ * "SELECT distinct" at end of input is a column reference (the DISTINCT lookahead is unchanged)
+ * and "SELECT from" reads "from" as a column — both resolve to 42703, a documented divergence
+ * from PG's empty-target-list form (../design/grammar.md §34). */
+select_core    ::= "SELECT" "DISTINCT"? select_items ("FROM" from_clause)?
                    where_clause?
                    group_by?
                    having_clause?

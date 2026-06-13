@@ -680,9 +680,11 @@ impl Parser {
         Ok(sel)
     }
 
-    /// `select_core ::= "SELECT" "DISTINCT"? select_items "FROM" from_clause where? group_by?
-    /// having?` — a `SELECT` WITHOUT a trailing `ORDER BY`/`LIMIT`/`OFFSET` (the operand form of a
-    /// set operation). The returned `Select` has empty `order_by` and no `limit`/`offset`.
+    /// `select_core ::= "SELECT" "DISTINCT"? select_items ("FROM" from_clause)? where?
+    /// group_by? having?` — a `SELECT` WITHOUT a trailing `ORDER BY`/`LIMIT`/`OFFSET` (the
+    /// operand form of a set operation). The returned `Select` has empty `order_by` and no
+    /// `limit`/`offset`. The FROM clause is optional: with no `from` keyword the SELECT is
+    /// FROM-less — one virtual zero-column row (spec/design/grammar.md §34).
     fn parse_select_core(&mut self) -> Result<Select> {
         self.expect_keyword("select")?;
 
@@ -701,8 +703,13 @@ impl Parser {
         };
 
         let items = self.parse_select_items()?;
-        self.expect_keyword("from")?;
-        let (from, joins) = self.parse_from_clause()?;
+        let (from, joins) = if self.peek_keyword().as_deref() == Some("from") {
+            self.advance(); // FROM
+            let (f, j) = self.parse_from_clause()?;
+            (Some(f), j)
+        } else {
+            (None, Vec::new())
+        };
 
         let filter = self.parse_optional_where()?;
 

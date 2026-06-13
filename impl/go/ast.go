@@ -242,8 +242,11 @@ type Select struct {
 	// applied after ORDER BY and before LIMIT/OFFSET (spec/design/grammar.md §11).
 	Distinct bool
 	Items    SelectItems
-	From     TableRef
-	// Joins holds the left-deep JOINs after From (nil/empty = a single-table SELECT).
+	// From is the first table reference of the FROM clause, or nil for a FROM-less SELECT —
+	// the select list evaluates over one virtual zero-column row (spec/design/grammar.md §34).
+	From *TableRef
+	// Joins holds the left-deep JOINs after From (nil/empty = a single-table SELECT; always
+	// empty when From is nil — joins exist only inside a FROM clause).
 	Joins  []JoinClause
 	Filter *Expr
 	// GroupBy holds the GROUP BY keys — bare or qualified table columns (never expressions /

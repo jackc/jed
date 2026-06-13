@@ -870,6 +870,8 @@ func (p *Parser) parseSelect() (*Select, error) {
 
 // parseSelectCore parses a SELECT without a trailing ORDER BY/LIMIT/OFFSET — the operand form of a
 // set operation (spec/design/grammar.md §25). The returned Select has no OrderBy/Limit/Offset set.
+// The FROM clause is optional: with no `from` keyword the SELECT is FROM-less — one virtual
+// zero-column row (spec/design/grammar.md §34).
 func (p *Parser) parseSelectCore() (*Select, error) {
 	if err := p.expectKeyword("select"); err != nil {
 		return nil, err
@@ -894,12 +896,15 @@ func (p *Parser) parseSelectCore() (*Select, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := p.expectKeyword("from"); err != nil {
-		return nil, err
-	}
-	from, joins, err := p.parseFromClause()
-	if err != nil {
-		return nil, err
+	var from *TableRef
+	var joins []JoinClause
+	if p.peekKeyword() == "from" {
+		p.advance() // FROM
+		f, j, err := p.parseFromClause()
+		if err != nil {
+			return nil, err
+		}
+		from, joins = &f, j
 	}
 
 	sel := &Select{Distinct: distinct, Items: items, From: from, Joins: joins}

@@ -2486,10 +2486,15 @@ func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
 func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (*selectPlan, error) {
 	// Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
 	// relation's flat column offset in FROM order, and reject a duplicate label — a self-join
-	// without distinct aliases is 42712 (spec/design/grammar.md §15). The scope links to `parent`
-	// (correlation) + the catalog (so a subquery resolves its own FROM); allowSubquery is true.
+	// without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less SELECT
+	// (sel.From == nil) builds an EMPTY scope: nothing local resolves, so bare columns fall
+	// through to `parent` (the correlated-subquery rule) or 42703 at top level
+	// (spec/design/grammar.md §34). The scope links to `parent` (correlation) + the catalog
+	// (so a subquery resolves its own FROM); allowSubquery is true.
 	tableRefs := make([]TableRef, 0, 1+len(sel.Joins))
-	tableRefs = append(tableRefs, sel.From)
+	if sel.From != nil {
+		tableRefs = append(tableRefs, *sel.From)
+	}
 	for _, j := range sel.Joins {
 		tableRefs = append(tableRefs, j.Table)
 	}
@@ -3337,7 +3342,12 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// no ON (no operator_eval — spec/design/cost.md §3). Output order is deterministic: running
 	// order (outer) then right key order (inner), each unmatched left row after its (empty)
 	// match run, all unmatched right rows last in right key order (CLAUDE.md §10).
-	running := materialized[0]
+	// A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
+	// instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
+	running := []Row{{}}
+	if len(plan.rels) > 0 {
+		running = materialized[0]
+	}
 	for k := range plan.joins {
 		rightRows := materialized[k+1]
 		on := plan.joins[k].on
@@ -5265,6 +5275,19 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 // each relation's columns in catalog order (§15).
 func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, []resolvedType, error) {
 	if items.All {
+		// `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
+		// (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
+		// pseudo-relations, and that scope always also carries the real relation.
+		expandable := false
+		for _, r := range s.rels {
+			if !r.qualifierOnly {
+				expandable = true
+				break
+			}
+		}
+		if !expandable {
+			return nil, nil, nil, NewError(SyntaxError, "SELECT * with no tables specified is not valid")
+		}
 		var ps []*rExpr
 		var names []string
 		var types []resolvedType

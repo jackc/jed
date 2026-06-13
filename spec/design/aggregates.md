@@ -99,6 +99,10 @@ grouping-error rule (§10): with no `GROUP BY`, the set of legal "grouping keys"
 (`SELECT 1, COUNT(*) FROM t`), and aggregates may be combined with constants and operators
 (`SELECT SUM(x) + 1, COUNT(*) * 2 FROM t`).
 
+This rule also covers the **FROM-less** aggregate ([grammar.md](grammar.md) §34): the input
+is the one virtual row, so `SELECT COUNT(*)` is `1`; with a false `WHERE` the single group
+still emits (`COUNT` → `0`, the others → `NULL`), exactly the empty-table case above.
+
 ## 5. Function-call syntax (see [grammar.md](grammar.md) §17 for the full rule)
 
 `function_call ::= identifier "(" ( "*" | expr ) ")"`. Only the five aggregate names

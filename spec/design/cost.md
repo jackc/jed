@@ -482,6 +482,19 @@ ON a.k = b.k` where 1 `a`-row matches 1 `b`-row and the other 2 `a`-rows match n
 emitted rows → **(1 + 3) + (1 + 2) + 6 + 3 = 16** (the INNER form of the same query is
 `… + 1 = 14`; the +2 is the two preserved-left rows).
 
+### FROM-less `SELECT` — the virtual row charges no scan units
+
+A `SELECT` with no `FROM` clause ([grammar.md](grammar.md) §34) evaluates its select list over
+**one virtual zero-column row**. There is no relation, so **no scan units accrue** — zero
+`page_read`, zero `storage_row_read`, zero `value_decompress`. The virtual row then flows
+through the ordinary clause rules above: the `WHERE` predicate charges its `operator_eval`s,
+aggregation charges `aggregate_accumulate` per (input row × aggregate) over the single row, and
+each emitted row charges `row_produced`. So `SELECT 1` costs exactly **1** (one `row_produced`;
+a literal projection is a leaf), `SELECT 1 + 2` costs **2**, `SELECT 1 WHERE false` costs **0**
+(a constant filter is a leaf and no row is produced), and `SELECT count(*)` costs **2**
+(1 `aggregate_accumulate` + 1 `row_produced`). As a set-operation operand, a subquery, or an
+`INSERT … SELECT` source it composes by the rules below with no special case.
+
 ### Set operations — `lhs + rhs`, the combine unmetered
 
 A set operation ([grammar.md](grammar.md) §25) — `UNION`/`INTERSECT`/`EXCEPT`, each with an

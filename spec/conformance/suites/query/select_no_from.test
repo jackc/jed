@@ -1,0 +1,229 @@
+# FROM-less SELECT (spec/design/grammar.md §34): the FROM clause is optional — with no FROM
+# the select list evaluates over ONE virtual zero-column row, PostgreSQL semantics. No table
+# is read, so no scan units accrue (zero page_read / storage_row_read — cost.md §3): the only
+# charges are the items' metered evaluation plus row_produced per emitted row. Every clause
+# composes over the virtual row: WHERE filters it (SELECT 1 WHERE false → zero rows),
+# aggregates fold it through the single-group rule (SELECT count(*) → 1; a false WHERE still
+# emits the group — aggregates.md §4), HAVING filters that single group, and DISTINCT /
+# ORDER BY / LIMIT / OFFSET apply to the 0-or-1-row result. A FROM-less SELECT is a full
+# citizen of set operations, subqueries (correlated included — a zero-relation scope resolves
+# purely outward), and INSERT ... SELECT.
+#
+# Errors: `SELECT *` with no FROM is 42601 with PostgreSQL's exact message; a bare column —
+# and any GROUP BY / ORDER BY key, which are table columns only (§5/§10) — is the ordinary
+# 42703; an aggregate in WHERE stays 42803. PG-divergent forms that fall out of non-reserved
+# keywords (`SELECT`, `SELECT from`, `SELECT distinct` — §34) are deliberately NOT tested
+# here: the corpus pins the PG-agreeing surface.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.aggregates, query.having, query.distinct, query.limit, query.offset, query.order_by, query.column_alias, query.union, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.table_alias, query.qualified_column, query.point_lookup, expr.arithmetic, expr.comparison_value, types.int32, types.boolean, resource.cost_metering
+
+# --- the virtual row ------------------------------------------------------------------
+# A literal projection is a leaf (no operator_eval): the whole query costs the single
+# row_produced. Exactly one row, no table touched.
+# names: ?column?
+# cost: 1
+query I nosort
+SELECT 1
+----
+1
+
+# An expression charges its interior nodes: 1 operator_eval (the `+`) + 1 row_produced.
+# names: ?column?
+# cost: 2
+query I nosort
+SELECT 1 + 2
+----
+3
+
+# Multiple items, AS naming; an unaliased expression is ?column? (grammar.md §8).
+# names: ?column?, b
+# cost: 2
+query II nosort
+SELECT 1, 2 + 3 AS b
+----
+1
+5
+
+# --- WHERE filters the virtual row ----------------------------------------------------
+# The constant filter is a leaf (no operator_eval) and no row survives: cost 0.
+# cost: 0
+query I nosort
+SELECT 1 WHERE false
+----
+
+# A TRUE filter keeps the row: the `=` (1) + the produced row (1).
+# cost: 2
+query I nosort
+SELECT 1 WHERE 1 = 1
+----
+1
+
+# --- aggregates over the single group (aggregates.md §4) ------------------------------
+# The virtual row is the one input row: count(*) = 1. 1 aggregate_accumulate + 1 row_produced.
+# names: count
+# cost: 2
+query I nosort
+SELECT count(*)
+----
+1
+
+# A false WHERE empties the input but the whole-table group still emits: count 0.
+# Nothing accumulates; only the group row is produced.
+# names: count
+# cost: 1
+query I nosort
+SELECT count(*) WHERE false
+----
+0
+
+# A value aggregate over the virtual row returns its argument. (sum(1) is deliberately not
+# pinned here: jed types the literal int64 so sum widens to decimal, while PG types it int4
+# and derives bigint — the documented literal-default divergence; the widening itself is
+# pinned over columns in aggregates/sum.test.)
+# names: max
+# cost: 2
+query I nosort
+SELECT max(5)
+----
+5
+
+# HAVING filters the single group away (it makes the query aggregate even with no
+# aggregate in the select list — grammar.md §19).
+# cost: 0
+query I nosort
+SELECT 1 HAVING false
+----
+
+# --- DISTINCT and the window ----------------------------------------------------------
+# DISTINCT over one row: dedup is unmetered; the literal projection is a leaf.
+# cost: 1
+query I nosort
+SELECT DISTINCT 1
+----
+1
+
+# LIMIT 0 / OFFSET 1 empty the one-row result before projection: cost 0.
+# cost: 0
+query I nosort
+SELECT 1 LIMIT 0
+----
+
+# cost: 0
+query I nosort
+SELECT 1 OFFSET 1
+----
+
+# --- set operations (grammar.md §25) --------------------------------------------------
+# Each operand costs its own 1; the combine is unmetered. No ORDER BY → rowsort.
+# cost: 2
+query I rowsort
+SELECT 1 UNION SELECT 2
+----
+1
+2
+
+# Bare UNION deduplicates the two identical one-row operands.
+# cost: 2
+query I nosort
+SELECT 1 UNION SELECT 1
+----
+1
+
+# A set operation's trailing ORDER BY resolves by OUTPUT name (§25), so it works over
+# FROM-less operands even though a lone FROM-less SELECT admits no ORDER BY column.
+# names: x
+# cost: 2
+query I nosort
+SELECT 2 AS x UNION SELECT 1 ORDER BY x
+----
+1
+2
+
+# --- subqueries (grammar.md §26) ------------------------------------------------------
+# An uncorrelated FROM-less subquery folds once (initplan): inner row_produced + outer
+# row_produced.
+# names: ?column?
+# cost: 2
+query I nosort
+SELECT (SELECT 1)
+----
+1
+
+# names: ?column?
+# cost: 2
+query B nosort
+SELECT EXISTS (SELECT 1)
+----
+true
+
+# The inner WHERE false produces nothing: EXISTS is false, inner cost 0.
+# cost: 1
+query B nosort
+SELECT EXISTS (SELECT 1 WHERE false)
+----
+false
+
+# Inner cost (1) + the IN membership's operator_evals (2) + the produced row (1).
+# cost: 4
+query B nosort
+SELECT 1 IN (SELECT 1)
+----
+true
+
+# --- composing with real tables -------------------------------------------------------
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1), (2)
+
+# A FROM-less subquery inside an ordinary table query.
+# names: id
+# cost: 7
+query I nosort
+SELECT id FROM t WHERE id > (SELECT 1) ORDER BY id
+----
+2
+
+# A CORRELATED FROM-less subquery: the zero-relation scope resolves o.id purely outward,
+# re-executed per outer row. 1 page_read + 2 storage_row_read + per outer row (×2): the
+# subquery node's operator_eval + the inner row_produced; + 2 outer row_produced = 9.
+# names: ?column?
+# cost: 9
+query I nosort
+SELECT (SELECT o.id) FROM t o ORDER BY id
+----
+1
+2
+
+# INSERT ... SELECT with a FROM-less source costs exactly the embedded SELECT's cost
+# (the §24 rule: storing is unmetered).
+# cost: 1
+statement ok
+INSERT INTO t SELECT 3
+
+# names: id
+# cost: 4
+query I nosort
+SELECT id FROM t WHERE id = 3
+----
+3
+
+# --- errors ---------------------------------------------------------------------------
+# `*` with no tables: PostgreSQL's exact error.
+statement error 42601
+SELECT *
+
+# A bare column has nothing to bind to.
+statement error 42703
+SELECT nope
+
+# GROUP BY / ORDER BY keys are table columns only (§5/§10) — always 42703 here.
+statement error 42703
+SELECT 1 GROUP BY nope
+
+statement error 42703
+SELECT 1 ORDER BY nope
+
+# An aggregate is still illegal in WHERE (42803), FROM or not.
+statement error 42803
+SELECT 1 WHERE count(*) > 0

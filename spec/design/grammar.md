@@ -1412,3 +1412,58 @@ catalog, §29) never see them (rendering works from tokens).
 
 An input that is *only* comments (or empty after comment stripping) is still "no
 statement" and parses as `42601` — the one-statement-per-input rule (§1) is unchanged.
+
+## 34. FROM-less `SELECT` (the virtual row)
+
+The `FROM` clause is **optional** ([grammar.ebnf](../grammar/grammar.ebnf)
+`select_core`). A `SELECT` with no `FROM` evaluates its select list over **one virtual
+zero-column row**, exactly PostgreSQL's model: `SELECT 1` returns one row, no table is
+touched, and no scan cost accrues — the only charges are the items' metered evaluation
+plus `row_produced` per emitted row ([cost.md](cost.md) §3). `SELECT 1` costs exactly 1.
+
+Every clause composes over the virtual row with its ordinary semantics:
+
+- **`WHERE`** filters it: `SELECT 1 WHERE false` returns zero rows (cost 0 — the
+  constant filter is a leaf, and no row is produced).
+- **Aggregates** fold it through the single-group rule ([aggregates.md](aggregates.md)
+  §4): `SELECT count(*)` is `1`; with a false `WHERE` the group still emits
+  (`count` → `0`, other aggregates → `NULL`). `HAVING` filters that single group
+  (`SELECT 1 HAVING false` → zero rows).
+- **`DISTINCT`**, and a lone query's **`ORDER BY` / `LIMIT` / `OFFSET`**, apply to the
+  0-or-1-row result unchanged.
+- It is a **full citizen of composition**: a set-operation operand
+  (`SELECT 1 UNION SELECT 2`), a subquery in any position — including a **correlated**
+  one whose zero-relation scope resolves purely outward (`SELECT (SELECT o.id) FROM t o`)
+  — and an `INSERT ... SELECT` source (`INSERT INTO t SELECT 1`).
+
+**Errors.** With zero relations in scope there is nothing for a star or a column to
+bind to:
+
+- `SELECT *` (no FROM) — `42601`, message `SELECT * with no tables specified is not
+  valid` (PostgreSQL's exact message; raised at projection resolution, so the RETURNING
+  `old`/`new` qualifier-only scope of §32 is unaffected).
+- A bare or qualified column reference — the existing `42703` (top level) or an outer
+  resolution in a subquery (§26). `GROUP BY` / `ORDER BY` keys are table columns only
+  (§5/§10), so on a lone FROM-less SELECT they are always `42703`; a set operation's
+  trailing `ORDER BY` still resolves by **output name** (§25), so
+  `SELECT 2 AS x UNION SELECT 1 ORDER BY x` is legal.
+- A parameter typed by nothing (`SELECT $1`) is `42P18`, the ordinary rule (§5).
+
+**Documented divergences from PostgreSQL** — consequences of jed's non-reserved
+keywords (§3) and the ≥ 1 select-item rule, not separate decisions:
+
+- **`SELECT` with an empty target list** (legal in PG, returning zero-column rows)
+  stays `42601`: a zero-column result is unrepresentable in jed's result surface and
+  conformance format, and buys nothing ("we own our surface", CLAUDE.md §1).
+- **`SELECT from`** reads `from` as a column reference → `42703` (PG parses an empty
+  target list). `SELECT from t` is a leftover-token `42601`.
+- **`SELECT distinct`** at end of input — the §11 two-token DISTINCT lookahead is
+  unchanged, so the word is a column reference → `42703`. Likewise
+  `SELECT distinct WHERE ...` keeps treating `distinct` as the modifier and fails as a
+  leftover-token `42601` where PG would run it.
+- **`SELECT 1 x`** (implicit item alias) remains `42601` — aliasing requires explicit
+  `AS` (§5); only the message changes (leftover tokens rather than a failed `FROM`
+  expectation).
+
+None of these forms appear in the conformance corpus (they would pin oracle overrides
+for zero value); the corpus tests the PG-agreeing surface.

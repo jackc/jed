@@ -250,9 +250,11 @@ pub struct Select {
     pub distinct: bool,
     /// Projected expressions, or `*` for all (`SelectItems::All`).
     pub items: SelectItems,
-    /// The first table reference of the FROM clause.
-    pub from: TableRef,
-    /// Zero or more left-deep JOINs after `from` (empty = a single-table SELECT).
+    /// The first table reference of the FROM clause, or `None` for a FROM-less SELECT —
+    /// the select list evaluates over one virtual zero-column row (spec/design/grammar.md §34).
+    pub from: Option<TableRef>,
+    /// Zero or more left-deep JOINs after `from` (empty = a single-table SELECT; always
+    /// empty when `from` is `None` — joins exist only inside a FROM clause).
     /// spec/design/grammar.md §15.
     pub joins: Vec<JoinClause>,
     /// The WHERE expression (must resolve to boolean), if any.

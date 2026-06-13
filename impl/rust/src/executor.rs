@@ -2407,14 +2407,16 @@ impl Database {
     ) -> Result<SelectPlan> {
         // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
         // relation's flat column offset in FROM order, and reject a duplicate label — a
-        // self-join without distinct aliases is 42712 (spec/design/grammar.md §15). The scope
-        // links to `parent` (for correlation) and the catalog (so a subquery can resolve its own
-        // FROM); `allow_subquery` is true (subqueries are legal in a SELECT — UPDATE/DELETE pass
-        // a `Scope::single` with it false).
+        // self-join without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less
+        // SELECT (`sel.from` = None) builds an EMPTY scope: nothing local resolves, so bare
+        // columns fall through to `parent` (the correlated-subquery rule) or 42703 at top level
+        // (spec/design/grammar.md §34). The scope links to `parent` (for correlation) and the
+        // catalog (so a subquery can resolve its own FROM); `allow_subquery` is true (subqueries
+        // are legal in a SELECT — UPDATE/DELETE pass a `Scope::single` with it false).
         let mut rels: Vec<ScopeRel> = Vec::with_capacity(1 + sel.joins.len());
         let mut seen_labels: HashSet<String> = HashSet::new();
         let mut offset = 0usize;
-        for tref in std::iter::once(&sel.from).chain(sel.joins.iter().map(|j| &j.table)) {
+        for tref in sel.from.iter().chain(sel.joins.iter().map(|j| &j.table)) {
             let table = self.table(&tref.name).ok_or_else(|| {
                 EngineError::new(
                     SqlState::UndefinedTable,
@@ -2871,7 +2873,13 @@ impl Database {
         // Output order is deterministic: running order (outer) then right key order (inner),
         // each unmatched left row after its (empty) match run, all unmatched right rows last in
         // right key order — so a join is deterministic even with no ORDER BY (CLAUDE.md §10).
-        let mut running: Vec<Row> = std::mem::take(&mut materialized[0]);
+        // A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
+        // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
+        let mut running: Vec<Row> = if plan.rels.is_empty() {
+            vec![Vec::new()]
+        } else {
+            std::mem::take(&mut materialized[0])
+        };
         for (k, pj) in plan.joins.iter().enumerate() {
             let right_rows = &materialized[k + 1];
             let on = &pj.on;
@@ -5244,6 +5252,15 @@ fn resolve_projections(
 ) -> Result<(Vec<RExpr>, Vec<String>, Vec<ResolvedType>)> {
     match items {
         SelectItems::All => {
+            // `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
+            // (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
+            // pseudo-relations, and that scope always also carries the real relation.
+            if scope.rels.iter().all(|r| r.qualifier_only) {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    "SELECT * with no tables specified is not valid",
+                ));
+            }
             let mut nodes = Vec::new();
             let mut names = Vec::new();
             let mut types = Vec::new();

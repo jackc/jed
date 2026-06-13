@@ -153,6 +153,10 @@ id = "query.distinct"
 description = "SELECT DISTINCT: deduplicate projected output rows (NULL-safe), with the PostgreSQL ORDER-BY-in-select-list restriction"
 
 [[capability]]
+id = "query.select_no_from"
+description = "FROM-less SELECT — the select list evaluates over ONE virtual zero-column row with no table access (PostgreSQL semantics, spec/design/grammar.md §34): WHERE/LIMIT/OFFSET/DISTINCT/HAVING/aggregates compose (SELECT 1 WHERE false → zero rows; SELECT count(*) → 1 via the single-group rule), and it is a full citizen of set operations, subqueries (a correlated zero-relation scope resolves purely outward), and INSERT ... SELECT. SELECT * with no FROM is 42601 (PG's exact message), a bare column the ordinary 42703. Cost charges no scan units — just the items' metered evaluation plus row_produced (spec/design/cost.md §3)"
+
+[[capability]]
 id = "query.join_inner"
 description = "INNER JOIN ... ON <expr> — combine rows from two tables on a boolean predicate (left-deep nested loop, 3-valued ON). A bare JOIN is INNER; an INNER JOIN with no ON is 42601 (spec/design/grammar.md §15)"
 

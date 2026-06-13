@@ -646,7 +646,8 @@ class Parser {
 
   // parseSelectCore parses a SELECT without a trailing ORDER BY/LIMIT/OFFSET — the operand form of
   // a set operation (spec/design/grammar.md §25). The returned Select has empty orderBy and null
-  // limit/offset.
+  // limit/offset. The FROM clause is optional: with no `from` keyword the SELECT is FROM-less —
+  // one virtual zero-column row (spec/design/grammar.md §34).
   private parseSelectCore(): Select {
     this.expectKeyword("select");
 
@@ -666,8 +667,12 @@ class Parser {
     }
 
     const items = this.parseSelectItems();
-    this.expectKeyword("from");
-    const { from, joins } = this.parseFromClause();
+    let from: TableRef | null = null;
+    let joins: JoinClause[] = [];
+    if (this.peekKeyword() === "from") {
+      this.advance(); // FROM
+      ({ from, joins } = this.parseFromClause());
+    }
 
     const filter = this.parseOptionalWhere();
 

@@ -64,6 +64,8 @@ var SupportedCapabilities = []string{
 	"query.offset",
 	// SELECT DISTINCT: deduplicate projected output rows, NULL-safe (grammar.md §11).
 	"query.distinct",
+	// FROM-less SELECT: one virtual zero-column row, no scan cost (grammar.md §34).
+	"query.select_no_from",
 	// Phase 4 — multi-table FROM: INNER/CROSS/OUTER JOIN, table aliases, qualified columns
 	// (grammar.md §15).
 	"query.join_inner",

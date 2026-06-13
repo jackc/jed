@@ -185,6 +185,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       [manifest.toml](spec/conformance/manifest.toml), all three cores in lockstep, pinned by
       [spec/conformance/suites/query/distinct.test](spec/conformance/suites/query/distinct.test).
       _(size: S–M)_
+- [x] **FROM-less `SELECT`** — `SELECT 1` works. Done: the `FROM` clause is **optional**
+      ([grammar.ebnf](spec/grammar/grammar.ebnf) `select_core`); with no FROM the select list
+      evaluates over **one virtual zero-column row** (PostgreSQL semantics,
+      [grammar.md §34](spec/design/grammar.md)). WHERE / DISTINCT / HAVING / aggregates /
+      ORDER BY / LIMIT / OFFSET compose (`SELECT 1 WHERE false` → zero rows; `SELECT count(*)`
+      → `1` via the aggregates.md §4 single-group rule), and it is a full citizen of set
+      operations, subqueries (correlated included — a zero-relation scope resolves purely
+      outward), and `INSERT … SELECT`. `SELECT *` with no FROM is `42601` (PG's exact message);
+      no scan cost accrues — `SELECT 1` costs exactly 1 `row_produced`
+      ([cost.md §3](spec/design/cost.md)). Documented divergences (non-reserved keywords + the
+      ≥1-item rule, §34): PG's empty target list (`SELECT`, `SELECT from`) stays an error.
+      Capability `query.select_no_from` in [manifest.toml](spec/conformance/manifest.toml), all
+      three cores in lockstep, pinned by
+      [spec/conformance/suites/query/select_no_from.test](spec/conformance/suites/query/select_no_from.test).
+      _(size: S)_
 - [x] **Predicate forms** — `IN (list)`, `BETWEEN`, `LIKE`, `CASE`. Done in **four vertical
       slices** (all three cores in lockstep), all edge cases verified against the live `postgres:18`
       oracle. (1) **`IN (list)` / `NOT IN`** and (2) **`BETWEEN` / `NOT BETWEEN`** are non-associative
@@ -570,6 +585,27 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       (relaxable later): no parenthesized operands `(SELECT …) UNION …`, no ORDER BY/LIMIT inside an
       operand (→ `42601`), no ORDER BY ordinals, and no set operation in an `INSERT … SELECT` source.
       _(was: M)_
+- [ ] **Common table expressions (`WITH`)** — `WITH name [(cols)] AS (SELECT …) [, …] SELECT …`:
+      named subqueries visible as relations in the statement's FROM (and to later CTEs in the
+      same WITH list). A CTE is essentially a **named derived table**, so it builds on the
+      derived-tables seam (`FROM (SELECT …) AS t`, the subqueries follow-on above): the scope
+      machinery must serve relations that aren't catalog tables. Decide the evaluation rule as a
+      deterministic cost contract (PG ≥12 inlines a single-reference CTE and materializes a
+      multi-reference / `MATERIALIZED` one — jed needs one defined rule, recorded in cost.md §3).
+      Follow-on slices, not this item: **`WITH RECURSIVE`** (the iterate-to-fixpoint executor +
+      a termination story — the `54P01` cost ceiling does real work there) and **data-modifying
+      CTEs** (`WITH x AS (INSERT … RETURNING …)`). _(size: L; +L for RECURSIVE; deps: derived
+      tables)_
+- [ ] **Set-returning functions** — `generate_series(start, stop [, step])` as the engine's
+      first **table function**: a function call in FROM position producing a rowset (the first
+      FROM item that is neither a base table nor a derived table). Integer (`int64`) variants
+      first; the timestamp variant waits on `interval` (a Phase 3 deferred follow-up). Authored
+      as a new `kind = "table_function"` in [catalog.toml](spec/functions/catalog.toml); output
+      is fully deterministic (`step` 0 traps like PG `22023`; cost: a defined per-emitted-row
+      charge, cost.md §3 — the `54P01` ceiling bounds a huge series). Start
+      **FROM-position-only**: an SRF in the select list (PG's lock-step / least-common-multiple
+      expansion rules) is rejected `0A000`, a documented narrowing. `unnest(array)` joins once
+      arrays land. _(size: M; deps: derived-table FROM machinery)_
 - [x] **`NOT NULL`** — explicit column constraint; storing NULL (direct, omitted, or applied
       default) traps `23502`. PRIMARY KEY still implies it (spec/design/constraints.md §1).
 - [x] **`DEFAULT`** (literal) — `DEFAULT <literal>` column constraint, evaluated + coerced once

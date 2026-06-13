@@ -267,8 +267,11 @@ export type Select = {
   // ORDER BY and before LIMIT/OFFSET (spec/design/grammar.md §11).
   distinct: boolean;
   items: SelectItems;
-  from: TableRef;
-  // The left-deep JOINs after `from` (empty = a single-table SELECT). grammar.md §15.
+  // The first table reference of the FROM clause, or null for a FROM-less SELECT — the
+  // select list evaluates over one virtual zero-column row (spec/design/grammar.md §34).
+  from: TableRef | null;
+  // The left-deep JOINs after `from` (empty = a single-table SELECT; always empty when
+  // `from` is null — joins exist only inside a FROM clause). grammar.md §15.
   joins: JoinClause[];
   filter: Expr | null;
   // GROUP BY keys — bare or qualified table columns (never expressions/aliases/ordinals);

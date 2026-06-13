@@ -1827,9 +1827,12 @@ export class Database {
   private planSelect(sel: Select, parent: Scope | null, ptypes: ParamTypes): SelectPlan {
     // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
     // relation's flat column offset in FROM order, and reject a duplicate label — a self-join
-    // without distinct aliases is 42712 (spec/design/grammar.md §15). The scope links to `parent`
-    // (correlation) + the catalog (so a subquery resolves its own FROM); allowSubquery is true.
-    const tableRefs = [sel.from, ...sel.joins.map((j) => j.table)];
+    // without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less SELECT
+    // (sel.from === null) builds an EMPTY scope: nothing local resolves, so bare columns fall
+    // through to `parent` (the correlated-subquery rule) or 42703 at top level
+    // (spec/design/grammar.md §34). The scope links to `parent` (correlation) + the catalog
+    // (so a subquery resolves its own FROM); allowSubquery is true.
+    const tableRefs = sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
     const rels: ScopeRel[] = [];
     const seenLabels = new Set<string>();
     let offset = 0;
@@ -2149,7 +2152,9 @@ export class Database {
     // order (outer) then right key order (inner), each unmatched left row after its (empty)
     // match run, all unmatched right rows last in right key order (CLAUDE.md §10).
     const nullRow = (n: number): Row => Array.from({ length: n }, () => nullValue());
-    let running: Row[] = materialized[0]!;
+    // A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
+    // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
+    let running: Row[] = plan.rels.length === 0 ? [[]] : materialized[0]!;
     for (let k = 0; k < plan.joins.length; k++) {
       const rightRows = materialized[k + 1]!;
       const on = plan.joins[k]!.on;
@@ -3941,6 +3946,12 @@ function resolveProjections(
   params: ParamTypes,
 ): { nodes: RExpr[]; names: string[]; types: ResolvedType[] } {
   if (items.kind === "all") {
+    // `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
+    // (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
+    // pseudo-relations, and that scope always also carries the real relation.
+    if (scope.rels.every((r) => r.qualifierOnly)) {
+      throw engineError("syntax_error", "SELECT * with no tables specified is not valid");
+    }
     const nodes: RExpr[] = [];
     const names: string[] = [];
     const types: ResolvedType[] = [];
