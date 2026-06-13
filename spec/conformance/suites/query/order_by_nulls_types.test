@@ -1,0 +1,191 @@
+# ORDER BY NULL position (NULLS FIRST / LAST, ASC / DESC) over NON-INTEGER types — the sort
+# machinery's NULL placement and per-type ordering (grammar.md §17, query.order_by_keys) exercised
+# for text, boolean, bytea, uuid, timestamp, and timestamptz. The dedicated order_by.test pins
+# this only for int32. PostgreSQL's defaults are NULLS LAST for ASC and NULLS FIRST for DESC; an
+# explicit NULLS FIRST|LAST overrides that independently of direction. NULL is the largest value
+# under jed's ordering (CLAUDE.md §8), which is exactly why the default ASC puts it last.
+#
+# These are `nosort` (the ORDER BY *is* the assertion). text uses lowercase distinct-first-letter
+# values whose order is identical under jed's collation C and PG's locale collation, so the text
+# cases stay oracle-clean (the collation itself is pinned in types/text.test); the other types are
+# collation-independent.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, types.int32, types.text, types.boolean_storable, types.bytea, types.uuid, types.timestamp, types.timestamptz
+
+# --- timestamp: the full default + explicit matrix on one representative type ----------------
+statement ok
+CREATE TABLE ts (id int32 PRIMARY KEY, k timestamp)
+
+statement ok
+INSERT INTO ts VALUES (1, '2024-01-01 12:00:00'), (2, '1999-06-15 08:30:00'), (3, NULL), (4, '2024-12-31 23:59:59')
+
+# DEFAULT ASC → ascending instants, NULL LAST.
+# names: k
+query T nosort
+SELECT k FROM ts ORDER BY k
+----
+1999-06-15 08:30:00
+2024-01-01 12:00:00
+2024-12-31 23:59:59
+NULL
+
+# DEFAULT DESC → descending instants, NULL FIRST.
+# names: k
+query T nosort
+SELECT k FROM ts ORDER BY k DESC
+----
+NULL
+2024-12-31 23:59:59
+2024-01-01 12:00:00
+1999-06-15 08:30:00
+
+# explicit ASC NULLS FIRST → NULL first, then ascending.
+# names: k
+query T nosort
+SELECT k FROM ts ORDER BY k ASC NULLS FIRST
+----
+NULL
+1999-06-15 08:30:00
+2024-01-01 12:00:00
+2024-12-31 23:59:59
+
+# explicit DESC NULLS LAST → descending, then NULL.
+# names: k
+query T nosort
+SELECT k FROM ts ORDER BY k DESC NULLS LAST
+----
+2024-12-31 23:59:59
+2024-01-01 12:00:00
+1999-06-15 08:30:00
+NULL
+
+# --- text (collation-agreeing lowercase values): NULL position under each clause -------------
+statement ok
+CREATE TABLE tt (id int32 PRIMARY KEY, k text)
+
+statement ok
+INSERT INTO tt VALUES (1, 'banana'), (2, 'apple'), (3, NULL), (4, 'cherry')
+
+# names: k
+query T nosort
+SELECT k FROM tt ORDER BY k NULLS FIRST
+----
+NULL
+apple
+banana
+cherry
+
+# names: k
+query T nosort
+SELECT k FROM tt ORDER BY k DESC NULLS LAST
+----
+cherry
+banana
+apple
+NULL
+
+# --- boolean: false < true, NULL placed by the clause ----------------------------------------
+statement ok
+CREATE TABLE tb (id int32 PRIMARY KEY, k boolean)
+
+statement ok
+INSERT INTO tb VALUES (1, true), (2, false), (3, NULL)
+
+# names: k
+query B nosort
+SELECT k FROM tb ORDER BY k NULLS FIRST
+----
+NULL
+false
+true
+
+# names: k
+query B nosort
+SELECT k FROM tb ORDER BY k DESC NULLS LAST
+----
+true
+false
+NULL
+
+# --- bytea: unsigned byte order, NULL placed by the clause -----------------------------------
+statement ok
+CREATE TABLE tby (id int32 PRIMARY KEY, k bytea)
+
+statement ok
+INSERT INTO tby VALUES (1, '\x02'), (2, '\x01'), (3, NULL), (4, '\xff')
+
+# names: k
+query T nosort
+SELECT k FROM tby ORDER BY k NULLS FIRST
+----
+NULL
+\x01
+\x02
+\xff
+
+# names: k
+query T nosort
+SELECT k FROM tby ORDER BY k DESC NULLS LAST
+----
+\xff
+\x02
+\x01
+NULL
+
+# --- uuid: unsigned 16-byte order, NULL placed by the clause ---------------------------------
+statement ok
+CREATE TABLE tu (id int32 PRIMARY KEY, k uuid)
+
+statement ok
+INSERT INTO tu VALUES
+  (1, 'f47ac10b-58cc-4372-a567-0e02b2c3d479'),
+  (2, '00000000-0000-0000-0000-000000000000'),
+  (3, NULL),
+  (4, '550e8400-e29b-41d4-a716-446655440000')
+
+# names: k
+query T nosort
+SELECT k FROM tu ORDER BY k NULLS FIRST
+----
+NULL
+00000000-0000-0000-0000-000000000000
+550e8400-e29b-41d4-a716-446655440000
+f47ac10b-58cc-4372-a567-0e02b2c3d479
+
+# names: k
+query T nosort
+SELECT k FROM tu ORDER BY k DESC NULLS LAST
+----
+f47ac10b-58cc-4372-a567-0e02b2c3d479
+550e8400-e29b-41d4-a716-446655440000
+00000000-0000-0000-0000-000000000000
+NULL
+
+# --- timestamptz: instant order after offset normalization, NULL placed by the clause --------
+statement ok
+CREATE TABLE tz (id int32 PRIMARY KEY, k timestamptz)
+
+statement ok
+INSERT INTO tz VALUES
+  (1, '2024-01-01 12:00:00+00'),
+  (2, '2024-01-01 12:00:00+05'),
+  (3, NULL),
+  (4, '2024-01-01 12:00:00-08')
+
+# +05 = 07:00 UTC (earliest), +00 = 12:00, -08 = 20:00 (latest).
+# names: k
+query T nosort
+SELECT k FROM tz ORDER BY k NULLS FIRST
+----
+NULL
+2024-01-01 07:00:00+00
+2024-01-01 12:00:00+00
+2024-01-01 20:00:00+00
+
+# names: k
+query T nosort
+SELECT k FROM tz ORDER BY k DESC NULLS LAST
+----
+2024-01-01 20:00:00+00
+2024-01-01 12:00:00+00
+2024-01-01 07:00:00+00
+NULL

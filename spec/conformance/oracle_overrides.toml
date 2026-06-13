@@ -140,3 +140,33 @@ reason = "jed: comment-only input is 'no statement' (42601) — exactly one stat
 file = "query/comments.test"
 sql = "SELECT v */ 1 FROM t"
 reason = "jed: a stray `*/` lexes as the two operator tokens `*` `/` and fails at parse (42601). PG's lexer builds multi-character operator names, so `*/` becomes an undefined operator (42883). Both reject; the code differs because jed has no multi-char operator lexing (grammar.md §33)."
+
+[[override]]
+file = "aggregates/min_max_types.test"
+sql = "SELECT MIN(v), MAX(v) FROM mu"
+reason = "jed: MIN/MAX over uuid is a jed extension — jed defines a total unsigned-byte order on uuid (types.md §14), so MIN/MAX work like any ordered type. PostgreSQL ships no min/max aggregate for uuid, so the query cannot run on the oracle; the committed rows (nil = MIN, all-FF = MAX) are guaranteed by the three-core agreement. Same situation as MIN/MAX(boolean)."
+
+[[override]]
+file = "aggregates/min_max.test"
+sql = "SELECT MIN(f), MAX(f) FROM tb"
+reason = "jed: MIN/MAX over boolean is a jed extension (false < true; types.md §9). PostgreSQL ships no min/max aggregate for boolean (it has bool_and/bool_or), so the query cannot run on the oracle; the committed rows are guaranteed by the three-core agreement. Same situation as MIN/MAX(uuid)."
+
+[[override]]
+file = "types/timestamp.test"
+sql = "INSERT INTO t VALUES (10, 'now')"
+reason = "jed: only literal timestamps are accepted — the special value 'now' is rejected (22007, timestamp.md). PostgreSQL resolves 'now' to the current transaction time and accepts the insert (a wall-clock, nondeterministic value jed forbids by design, CLAUDE.md §10)."
+
+[[override]]
+file = "types/timestamp.test"
+sql = "INSERT INTO t VALUES (13, '2024-01-01 12:00:60')"
+reason = "jed: a seconds field of 60 is out of range (22008). PostgreSQL accepts it and carries it over to 12:01:00. jed does not perform field carry-over on out-of-range time components (timestamp.md)."
+
+[[override]]
+file = "types/timestamp.test"
+sql = "SELECT id FROM m WHERE a = b"
+reason = "jed: timestamp and timestamptz are distinct comparison families — `timestamp = timestamptz` is not comparable (42804, the strict type system §4). PostgreSQL implicitly coerces timestamp to timestamptz (at the session zone) and returns a result."
+
+[[override]]
+file = "types/timestamptz.test"
+sql = "INSERT INTO t VALUES (10, '2024-01-01 12:00:00+99')"
+reason = "jed: a +99 zone offset is out of range, reported as 22008. PostgreSQL reports the same rejection under 22009 (invalid_time_zone_displacement_value). Both reject; the SQLSTATE subcode differs."

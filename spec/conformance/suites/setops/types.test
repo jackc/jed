@@ -1,0 +1,168 @@
+# Set operations (UNION / INTERSECT / EXCEPT, each with ALL) over NON-INTEGER element types — the
+# dedup, multiplicity, and NULL-safe matching rules (grammar.md §25) exercised for text, bytea,
+# uuid, timestamp, and timestamptz. The dedicated setops/*.test cover only integer + decimal
+# operands; this file pushes the value-canonical equality the set ops rely on through each type
+# (the §8 hotspot). NULL is matched NULL-safely: two NULLs dedup to one under UNION and match under
+# INTERSECT, but cancel under EXCEPT. The canonical-form cases are the point — two input spellings
+# of the SAME value (uuid case/braces, bytea hex case, timestamptz offset) must dedup to ONE row,
+# proving the set op compares the stored value, not the input text. Rows are asserted with
+# `rowsort` (order is not part of a set op's contract).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.intersect, query.except, types.int32, types.text, types.bytea, types.uuid, types.timestamp, types.timestamptz
+
+# --- text: dedup / multiplicity / NULL-safe matching across all four operators ---------------
+statement ok
+CREATE TABLE ta (id int32 PRIMARY KEY, k text)
+
+statement ok
+INSERT INTO ta VALUES (1, 'apple'), (2, 'banana'), (3, NULL)
+
+statement ok
+CREATE TABLE tb (id int32 PRIMARY KEY, k text)
+
+statement ok
+INSERT INTO tb VALUES (1, 'banana'), (2, 'cherry'), (3, NULL)
+
+# UNION (distinct): {apple, banana, cherry, NULL} — banana dedups, the two NULLs dedup to one.
+# names: k
+query T rowsort
+SELECT k FROM ta UNION SELECT k FROM tb
+----
+NULL
+apple
+banana
+cherry
+
+# UNION ALL: every row from both, no dedup — banana×2 and NULL×2 survive (6 rows).
+# names: k
+query T rowsort
+SELECT k FROM ta UNION ALL SELECT k FROM tb
+----
+NULL
+NULL
+apple
+banana
+banana
+cherry
+
+# INTERSECT: rows in BOTH — banana, and NULL (NULL-safe: NULL matches NULL).
+# names: k
+query T rowsort
+SELECT k FROM ta INTERSECT SELECT k FROM tb
+----
+NULL
+banana
+
+# EXCEPT: ta minus tb — apple only (banana and the NULL are both removed by tb's matching rows).
+# names: k
+query T rowsort
+SELECT k FROM ta EXCEPT SELECT k FROM tb
+----
+apple
+
+# --- uuid: input spellings normalize, so the operands share a value the set op must match ------
+statement ok
+CREATE TABLE ua (id int32 PRIMARY KEY, k uuid)
+
+statement ok
+INSERT INTO ua VALUES (1, '550e8400-e29b-41d4-a716-446655440000'), (2, 'f47ac10b-58cc-4372-a567-0e02b2c3d479')
+
+statement ok
+CREATE TABLE ub (id int32 PRIMARY KEY, k uuid)
+
+statement ok
+INSERT INTO ub VALUES (1, '550E8400-E29B-41D4-A716-446655440000'), (2, '00000000-0000-0000-0000-000000000000')
+
+# UNION: 550e8400… appears as upper in ub and lower in ua — ONE row (normalized equal); plus the
+# two distinct others → 3 rows.
+# names: k
+query T rowsort
+SELECT k FROM ua UNION SELECT k FROM ub
+----
+00000000-0000-0000-0000-000000000000
+550e8400-e29b-41d4-a716-446655440000
+f47ac10b-58cc-4372-a567-0e02b2c3d479
+
+# INTERSECT: only 550e8400… is shared (across the spelling difference) → 1 row.
+# names: k
+query T rowsort
+SELECT k FROM ua INTERSECT SELECT k FROM ub
+----
+550e8400-e29b-41d4-a716-446655440000
+
+# --- bytea: hex INPUT case normalizes, so \xDE and \xde are the same element ------------------
+statement ok
+CREATE TABLE ba (id int32 PRIMARY KEY, k bytea)
+
+statement ok
+INSERT INTO ba VALUES (1, '\xDE'), (2, '\x01')
+
+statement ok
+CREATE TABLE bb (id int32 PRIMARY KEY, k bytea)
+
+statement ok
+INSERT INTO bb VALUES (1, '\xde'), (2, '\x02')
+
+# INTERSECT: \xDE (ba) and \xde (bb) are the same bytes → 1 row.
+# names: k
+query T rowsort
+SELECT k FROM ba INTERSECT SELECT k FROM bb
+----
+\xde
+
+# --- timestamptz: offsets normalize, so the same instant written two ways is one element ------
+statement ok
+CREATE TABLE za (id int32 PRIMARY KEY, k timestamptz)
+
+statement ok
+INSERT INTO za VALUES (1, '2024-01-01 12:00:00+00'), (2, '2024-06-01 00:00:00+00')
+
+statement ok
+CREATE TABLE zb (id int32 PRIMARY KEY, k timestamptz)
+
+statement ok
+INSERT INTO zb VALUES (1, '2024-01-01 17:00:00+05'), (2, '2024-12-25 00:00:00+00')
+
+# UNION: za's 12:00+00 and zb's 17:00+05 denote the same UTC instant → ONE row; plus two distinct
+# others → 3 rows.
+# names: k
+query T rowsort
+SELECT k FROM za UNION SELECT k FROM zb
+----
+2024-01-01 12:00:00+00
+2024-06-01 00:00:00+00
+2024-12-25 00:00:00+00
+
+# INTERSECT: only that shared instant matches → 1 row.
+# names: k
+query T rowsort
+SELECT k FROM za INTERSECT SELECT k FROM zb
+----
+2024-01-01 12:00:00+00
+
+# --- timestamp: INTERSECT ALL keeps min-multiplicity; EXCEPT ALL keeps the surplus -----------
+statement ok
+CREATE TABLE sa (id int32 PRIMARY KEY, k timestamp)
+
+statement ok
+INSERT INTO sa VALUES (1, '2024-01-01 00:00:00'), (2, '2024-01-01 00:00:00'), (3, '2024-02-02 00:00:00')
+
+statement ok
+CREATE TABLE sb (id int32 PRIMARY KEY, k timestamp)
+
+statement ok
+INSERT INTO sb VALUES (1, '2024-01-01 00:00:00'), (2, '2024-03-03 00:00:00')
+
+# INTERSECT ALL: 2024-01-01 appears twice in sa, once in sb → min(2,1) = ONE row.
+# names: k
+query T rowsort
+SELECT k FROM sa INTERSECT ALL SELECT k FROM sb
+----
+2024-01-01 00:00:00
+
+# EXCEPT ALL: sa minus sb keeping surplus — one 2024-01-01 cancels (2-1=1 left) plus 2024-02-02.
+# names: k
+query T rowsort
+SELECT k FROM sa EXCEPT ALL SELECT k FROM sb
+----
+2024-01-01 00:00:00
+2024-02-02 00:00:00

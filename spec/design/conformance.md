@@ -205,6 +205,14 @@ Every corpus entry MUST obey:
   stays silent on a divergence that has an entry and **warns ("add an override") on one that
   does not**, so the ledger cannot fall out of date. When you add a `.test` on the
   PG-comparable surface, run `corpus:check` on it and register any divergence in the sidecar.
+- **Coltype + type coverage.** The importer derives each result column's render tag from PG's
+  `\gdesc` and covers every shipped scalar — integers (`I`), `boolean` (`B`), `numeric` (`D`),
+  and `text` / `bytea` / `uuid` / **`timestamp` / `timestamptz`** (`T`). The session zone is pinned
+  to **UTC** for each replay so `timestamptz` renders `+00`, matching jed's instant model
+  (timestamp.md); zoneless `timestamp` is zone-independent. A query PG cannot even *describe* — a
+  **jed extension PostgreSQL has no overload for**, e.g. `MIN`/`MAX` over `uuid` or `boolean` (jed
+  defines those orderings; PG ships no such aggregate) — is left at its committed rows with a
+  warning, and is recorded in the ledger like any other divergence rather than crashing the import.
 - **Never auto-provision references or run heavy oracles** (CLAUDE.md §12). The *source*
   checkouts and any bulk import remain explicit, user-initiated steps; the live-`db` oracle
   above is the always-available path that needs no provisioning.

@@ -1,0 +1,147 @@
+# MIN / MAX over NON-INTEGER value types — the aggregate that returns the input type and selects
+# by that type's ORDERING (aggregates.md), exercised for decimal, bytea, uuid, timestamp, and
+# timestamptz. The dedicated min_max.test covers only int32 / text / boolean; this file pushes
+# MIN/MAX through each type's comparison rule, the §8 ordering hotspot: decimal numeric order,
+# bytea/uuid UNSIGNED byte order (incl. the bytea shorter-is-less prefix rule), the timestamp
+# instant order with its infinity / -infinity sentinels (largest / smallest), and timestamptz
+# offset normalization. MIN/MAX skip NULL; over no non-NULL rows the result is NULL. Single-row
+# results, so `nosort`. The "earliest / latest" timestamp query is the canonical real-world shape
+# that this matrix was missing entirely.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.aggregates, types.int32, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz
+
+# --- decimal: numeric (value-canonical) order, negatives, mixed scale; NULL skipped ----------
+statement ok
+CREATE TABLE md (id int32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO md VALUES (1, 1.5), (2, 2.50), (3, -3), (4, NULL), (5, 0.125)
+
+# MIN = -3, MAX = 2.50 (numeric order, not lexical); NULL ignored.
+# names: min, max
+query DD nosort
+SELECT MIN(v), MAX(v) FROM md
+----
+-3
+2.50
+
+# --- bytea: UNSIGNED byte order with the shorter-is-less prefix rule (encoding.md §2.6) -------
+statement ok
+CREATE TABLE mby (id int32 PRIMARY KEY, v bytea)
+
+statement ok
+INSERT INTO mby VALUES (1, '\x00'), (2, '\xff'), (3, '\x0102'), (4, '\xff00'), (5, NULL)
+
+# MIN = \x00 (leading 0x00 byte is smallest). MAX = \xff00: vs \xff they share the first byte
+# 0xff, then \xff ends first, so \xff < \xff00 — the prefix rule picks the LONGER one as MAX.
+# names: min, max
+query TT nosort
+SELECT MIN(v), MAX(v) FROM mby
+----
+\x00
+\xff00
+
+# --- uuid: UNSIGNED order over the 16 bytes (memcmp); nil is smallest, all-FF is largest ------
+# NOTE: MIN/MAX(uuid) is a jed EXTENSION — PostgreSQL ships no min/max aggregate over uuid (it has
+# no ordering-based aggregate for the type), so this query cannot be oracle-checked and is recorded
+# in oracle_overrides.toml; the rows below are hand-authored from jed's defined uuid ordering and
+# guaranteed by the three-core agreement. (Same situation as MIN/MAX(boolean) in min_max.test.)
+statement ok
+CREATE TABLE mu (id int32 PRIMARY KEY, v uuid)
+
+statement ok
+INSERT INTO mu VALUES
+  (1, '550e8400-e29b-41d4-a716-446655440000'),
+  (2, 'ffffffff-ffff-ffff-ffff-ffffffffffff'),
+  (3, '00000000-0000-0000-0000-000000000000'),
+  (4, 'f47ac10b-58cc-4372-a567-0e02b2c3d479'),
+  (5, NULL)
+
+# MIN = the nil UUID, MAX = the all-FF UUID.
+# names: min, max
+query TT nosort
+SELECT MIN(v), MAX(v) FROM mu
+----
+00000000-0000-0000-0000-000000000000
+ffffffff-ffff-ffff-ffff-ffffffffffff
+
+# --- timestamp: instant order, with the infinity / -infinity sentinels at the extremes -------
+statement ok
+CREATE TABLE mts (id int32 PRIMARY KEY, v timestamp)
+
+statement ok
+INSERT INTO mts VALUES
+  (1, '2024-01-01 12:00:00'),
+  (2, '1999-12-31 23:59:59'),
+  (3, 'infinity'),
+  (4, '-infinity'),
+  (5, NULL)
+
+# -infinity is the smallest value, infinity the largest — they win MIN/MAX over every finite ts.
+# names: min, max
+query TT nosort
+SELECT MIN(v), MAX(v) FROM mts
+----
+-infinity
+infinity
+
+# the FINITE earliest / latest (no sentinels): the canonical "oldest and newest row" query.
+statement ok
+CREATE TABLE mtf (id int32 PRIMARY KEY, v timestamp)
+
+statement ok
+INSERT INTO mtf VALUES
+  (1, '2024-06-15 08:30:00'),
+  (2, '2024-01-01 12:00:00'),
+  (3, '2024-12-31 23:59:59.5'),
+  (4, NULL)
+
+# names: min, max
+query TT nosort
+SELECT MIN(v), MAX(v) FROM mtf
+----
+2024-01-01 12:00:00
+2024-12-31 23:59:59.5
+
+# --- timestamptz: offsets normalize to UTC, then ordered by instant --------------------------
+statement ok
+CREATE TABLE mtz (id int32 PRIMARY KEY, v timestamptz)
+
+statement ok
+INSERT INTO mtz VALUES
+  (1, '2024-01-01 12:00:00+00'),
+  (2, '2024-01-01 12:00:00+05'),
+  (3, '2024-01-01 12:00:00-08'),
+  (4, NULL)
+
+# +05 (07:00 UTC) is the earliest instant, -08 (20:00 UTC) the latest.
+# names: min, max
+query TT nosort
+SELECT MIN(v), MAX(v) FROM mtz
+----
+2024-01-01 07:00:00+00
+2024-01-01 20:00:00+00
+
+# --- MIN/MAX over no non-NULL rows is NULL (not an error) — shown for timestamp ---------------
+statement ok
+CREATE TABLE mnull (id int32 PRIMARY KEY, v timestamp)
+
+statement ok
+INSERT INTO mnull VALUES (1, NULL), (2, NULL)
+
+# names: min, max
+query TT nosort
+SELECT MIN(v), MAX(v) FROM mnull
+----
+NULL
+NULL
+
+# MIN = MAX over a single non-NULL value, ignoring the NULLs around it.
+statement ok
+INSERT INTO mnull VALUES (3, '2024-03-03 03:03:03')
+
+# names: min, max
+query TT nosort
+SELECT MIN(v), MAX(v) FROM mnull
+----
+2024-03-03 03:03:03
+2024-03-03 03:03:03

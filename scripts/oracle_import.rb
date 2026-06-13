@@ -43,6 +43,7 @@ class OracleImport
     "smallint" => "I", "integer" => "I", "bigint" => "I",
     "boolean" => "B", "numeric" => "D",
     "text" => "T", "character varying" => "T", "uuid" => "T", "bytea" => "T",
+    "timestamp without time zone" => "T", "timestamp with time zone" => "T",
   }.freeze
 
   def initialize(path)
@@ -98,7 +99,7 @@ class OracleImport
         if overridden?(sql.join)
           out.concat(old)
         else
-          out.concat(regenerate_query(sql.join, coltypes, sortmode))
+          out.concat(regenerate_query(sql.join, coltypes, sortmode, old))
         end
         # A row-returning DML query record (INSERT/UPDATE/DELETE ... RETURNING —
         # grammar.md §32) mutates state like a `statement ok`, so its effects must reach
@@ -145,6 +146,10 @@ class OracleImport
     args = PSQL.dup
     args += ["-F", fieldsep] if fieldsep
     script = +"BEGIN;\n"
+    # Pin the session zone so timestamptz renders as UTC (+00), matching jed's instant model
+    # (timestamp.md): jed always emits UTC, PG emits in the session TimeZone. SET LOCAL is scoped
+    # to this rolled-back transaction. Zoneless `timestamp` output is tz-independent already.
+    script << "SET LOCAL TimeZone='UTC';\n"
     @applied.each { |s| script << s.rstrip << ";\n" unless s.strip.empty? }
     script << "\\echo @@@S\n" << body << "\n\\echo @@@E\n" << "ROLLBACK;\n"
     out, err, = Open3.capture3(*args, stdin_data: script)
@@ -187,13 +192,22 @@ class OracleImport
     end
   end
 
-  def regenerate_query(sql, declared_coltypes, sortmode)
+  def regenerate_query(sql, declared_coltypes, sortmode, old)
     pg_sql = rewrite(sql).rstrip.chomp(";")
 
     # Type pass: `\gdesc` describes result columns without executing (default `|` fieldsep).
     # \gdesc reports the type WITH its typmod (`numeric(10,2)`); the tag is by base type.
     desc, = run("#{pg_sql} \\gdesc")
     types = desc.map { |l| n, t = l.chomp.split("|", 2); [n, t.sub(/\(.*\)\z/, "")] }
+    # An empty description means PG could not even plan the query — almost always a jed extension
+    # PG has no overload for (e.g. MIN/MAX over uuid or boolean: jed defines the ordering, PG ships
+    # no such aggregate). Keep the committed rows and flag it, rather than crashing on ncol == 0.
+    if types.empty?
+      @warnings << "PG could not describe `#{sql.strip}` (no result columns — likely a jed " \
+                   "extension PG lacks). Keeping the committed rows; add an oracle_overrides " \
+                   "entry to document the divergence."
+      return old
+    end
     tags = types.map { |(_name, t)| TAG[t] || raise("no coltype tag for PG type #{t.inspect}") }
     is_bool = types.map { |(_name, t)| t == "boolean" }
     derived = tags.join
@@ -231,6 +245,10 @@ class OracleImport
 
   def value_script(pg_sql)
     script = +"BEGIN;\n"
+    # Pin the session zone so timestamptz renders as UTC (+00), matching jed's instant model
+    # (timestamp.md): jed always emits UTC, PG emits in the session TimeZone. SET LOCAL is scoped
+    # to this rolled-back transaction. Zoneless `timestamp` output is tz-independent already.
+    script << "SET LOCAL TimeZone='UTC';\n"
     @applied.each { |s| script << s.rstrip << ";\n" unless s.strip.empty? }
     script << "\\echo @@@S\n" << pg_sql << ";\n" << "\\echo @@@E\n" << "ROLLBACK;\n"
     script

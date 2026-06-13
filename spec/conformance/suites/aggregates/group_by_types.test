@@ -1,0 +1,160 @@
+# GROUP BY over NON-INTEGER key types — the bucketing / NULL-as-its-own-group / value-canonical
+# grouping rules (aggregates.md §5-6) exercised for text, boolean, bytea, uuid, timestamp, and
+# timestamptz. The dedicated group_by.test covers only int32 + decimal keys; this file pushes the
+# grouping machinery through each type's EQUALITY + value-canonicalization, the §8 divergence
+# hotspot. The canonical-form cases are the point: two input spellings of the SAME value
+# (uuid case/braces, bytea hex case, timestamp sub-second zero, timestamptz offset) must land in
+# ONE group — proving grouping compares the stored value, not the input text. NULL is always its
+# own single group. Rows are asserted with `rowsort` (the harness's collation-independent byte
+# sort) so the assertion does not depend on jed's collation-C ORDER BY vs PG's locale collation.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.aggregates, query.group_by, types.int32, types.text, types.boolean_storable, types.bytea, types.uuid, types.timestamp, types.timestamptz
+
+# --- text keys: distinct values bucket separately; NULL is its own group --------------------
+statement ok
+CREATE TABLE gt (id int32 PRIMARY KEY, k text)
+
+statement ok
+INSERT INTO gt VALUES (1, 'apple'), (2, 'apple'), (3, 'banana'), (4, NULL), (5, 'cherry'), (6, NULL)
+
+# apple:2, banana:1, cherry:1, NULL:2 — NULL groups with NULL (one group), value match is exact.
+# names: k, count
+query TI rowsort
+SELECT k, COUNT(*) FROM gt GROUP BY k
+----
+NULL
+2
+apple
+2
+banana
+1
+cherry
+1
+
+# text equality is case-sensitive (collation C — types.md §11): 'x' and 'X' are DISTINCT groups,
+# so two singleton groups (counts 1, 1), not one group of 2. Asserted as the multiset of counts.
+statement ok
+CREATE TABLE gtc (id int32 PRIMARY KEY, k text)
+
+statement ok
+INSERT INTO gtc VALUES (1, 'x'), (2, 'X'), (3, 'x')
+
+# names: count
+query I rowsort
+SELECT COUNT(*) FROM gtc GROUP BY k
+----
+1
+2
+
+# --- boolean keys: true / false / NULL are three groups -------------------------------------
+statement ok
+CREATE TABLE gb (id int32 PRIMARY KEY, k boolean)
+
+statement ok
+INSERT INTO gb VALUES (1, true), (2, false), (3, true), (4, NULL), (5, true)
+
+# names: k, count
+query BI rowsort
+SELECT k, COUNT(*) FROM gb GROUP BY k
+----
+NULL
+1
+false
+1
+true
+3
+
+# --- bytea keys: hex INPUT case is normalized, so \xAB and \xab are the SAME value ----------
+statement ok
+CREATE TABLE gby (id int32 PRIMARY KEY, k bytea)
+
+statement ok
+INSERT INTO gby VALUES (1, '\xab'), (2, '\xAB'), (3, '\xcd'), (4, NULL), (5, '\x')
+
+# \xab + \xAB collapse to ONE group (count 2); \xcd singleton; empty-bytea \x singleton; NULL group.
+# names: k, count
+query TI rowsort
+SELECT k, COUNT(*) FROM gby GROUP BY k
+----
+NULL
+1
+\x
+1
+\xab
+2
+\xcd
+1
+
+# --- uuid keys: input spelling (case / braces / hyphenation) normalizes before grouping ------
+statement ok
+CREATE TABLE gu (id int32 PRIMARY KEY, k uuid)
+
+statement ok
+INSERT INTO gu VALUES
+  (1, '550e8400-e29b-41d4-a716-446655440000'),
+  (2, '550E8400-E29B-41D4-A716-446655440000'),
+  (3, '{550e8400e29b41d4a716446655440000}'),
+  (4, 'f47ac10b-58cc-4372-a567-0e02b2c3d479'),
+  (5, NULL)
+
+# the three spellings of 550e8400… are ONE group (count 3); f47ac10b… singleton; NULL group.
+# names: k, count
+query TI rowsort
+SELECT k, COUNT(*) FROM gu GROUP BY k
+----
+550e8400-e29b-41d4-a716-446655440000
+3
+NULL
+1
+f47ac10b-58cc-4372-a567-0e02b2c3d479
+1
+
+# --- timestamp keys: the same instant written two ways (sub-second zero) is ONE group --------
+statement ok
+CREATE TABLE gts (id int32 PRIMARY KEY, k timestamp)
+
+statement ok
+INSERT INTO gts VALUES
+  (1, '2024-01-01 12:00:00'),
+  (2, '2024-01-01 12:00:00.0'),
+  (3, '2024-06-15 08:30:00'),
+  (4, NULL),
+  (5, 'infinity')
+
+# 12:00:00 and 12:00:00.0 are the same instant → one group (count 2); 08:30 singleton; the
+# infinity sentinel is an ordinary groupable value (singleton); NULL its own group.
+# names: k, count
+query TI rowsort
+SELECT k, COUNT(*) FROM gts GROUP BY k
+----
+2024-01-01 12:00:00
+2
+2024-06-15 08:30:00
+1
+NULL
+1
+infinity
+1
+
+# --- timestamptz keys: offsets normalize to the same UTC instant → ONE group ----------------
+statement ok
+CREATE TABLE gtz (id int32 PRIMARY KEY, k timestamptz)
+
+statement ok
+INSERT INTO gtz VALUES
+  (1, '2024-01-01 12:00:00+00'),
+  (2, '2024-01-01 17:00:00+05'),
+  (3, '2024-01-01 12:00:00-08'),
+  (4, NULL)
+
+# +00 and +05 (17:00) denote the same UTC instant 12:00:00+00 → one group (count 2); the -08
+# row is a different instant (singleton); NULL its own group.
+# names: k, count
+query TI rowsort
+SELECT k, COUNT(*) FROM gtz GROUP BY k
+----
+2024-01-01 12:00:00+00
+2
+2024-01-01 20:00:00+00
+1
+NULL
+1
