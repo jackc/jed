@@ -5,37 +5,63 @@
 // spec/encoding/integers.toml in tests — this is what guarantees the Rust, Go, and TS
 // cores iterate keys identically.
 //
-// All arithmetic is `bigint`: int64 keys exceed JS's safe-integer range, and a single
-// bigint path is exact at every width.
+// Values are `bigint` (int64 keys exceed JS's safe-integer range); the byte marshalling
+// itself runs width-specialized in the number domain where exact (≤ 32-bit halves), since
+// per-byte bigint arithmetic allocates and these codecs sit on the hot path.
 
 import { type ScalarType, widthBytes } from "./types.ts";
 
 // encodeInt encodes a non-null integer value of the given type to its order-preserving
-// key bytes. value is assumed in range for t (callers range-check).
+// key bytes — value + 2^(bits-1), emitted as `width` unsigned big-endian bytes. value is
+// assumed in range for t (callers range-check). Width-specialized: the 8-byte path writes
+// the biased value as two number-domain 32-bit halves, the narrow path stays in the number
+// domain entirely — per-byte bigint arithmetic is allocation-heavy in V8 and this sits on
+// the key-encode/leaf-decode hot path.
 export function encodeInt(t: ScalarType, value: bigint): Uint8Array {
   const width = widthBytes(t);
-  const bits = BigInt(width * 8);
-  const bias = 1n << (bits - 1n);
-  const mask = (1n << bits) - 1n;
-  // value + 2^(bits-1), kept to `width` bytes. For an in-range value the sum is in
-  // [0, 2^bits), so the mask is a no-op; it documents the fixed width.
-  const u = (value + bias) & mask;
   const out = new Uint8Array(width);
-  for (let i = 0; i < width; i++) {
-    out[width - 1 - i] = Number((u >> (8n * BigInt(i))) & 0xffn);
+  if (width === 8) {
+    const u = BigInt.asUintN(64, value + 9223372036854775808n);
+    let hi = Number(u >> 32n);
+    let lo = Number(u & 0xffffffffn);
+    for (let i = 3; i >= 0; i--) {
+      out[i] = hi & 0xff;
+      hi >>>= 8;
+      out[i + 4] = lo & 0xff;
+      lo >>>= 8;
+    }
+    return out;
+  }
+  // width ≤ 4: the biased value is in [0, 2^32), exact in a JS number.
+  let u = Number(value) + 2 ** (width * 8 - 1);
+  for (let i = width - 1; i >= 0; i--) {
+    out[i] = u & 0xff;
+    u = Math.floor(u / 256);
   }
   return out;
 }
 
 // decodeInt is the inverse of encodeInt. b.length must equal the type's width.
 export function decodeInt(t: ScalarType, b: Uint8Array): bigint {
+  return decodeIntAt(t, b, 0);
+}
+
+// decodeIntAt decodes an encoded integer in place at offset `off` — no subarray view, so the
+// record decoder reads values straight off the page buffer (the leaf-fault hot path). Width-
+// specialized like encodeInt.
+export function decodeIntAt(t: ScalarType, b: Uint8Array, off: number): bigint {
   const width = widthBytes(t);
-  const bias = 1n << (BigInt(width * 8) - 1n);
-  let u = 0n;
-  for (const x of b) {
-    u = (u << 8n) | BigInt(x);
+  if (width === 8) {
+    const hi = ((b[off]! << 24) | (b[off + 1]! << 16) | (b[off + 2]! << 8) | b[off + 3]!) >>> 0;
+    const lo =
+      ((b[off + 4]! << 24) | (b[off + 5]! << 16) | (b[off + 6]! << 8) | b[off + 7]!) >>> 0;
+    return ((BigInt(hi) << 32n) | BigInt(lo)) - 9223372036854775808n;
   }
-  return u - bias;
+  let u = 0;
+  for (let i = 0; i < width; i++) {
+    u = u * 256 + b[off + i]!;
+  }
+  return BigInt(u - 2 ** (width * 8 - 1));
 }
 
 // encodeNullable encodes a nullable key slot: a 1-byte presence tag (0x00 present, 0x01

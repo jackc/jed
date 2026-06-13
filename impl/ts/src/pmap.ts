@@ -100,14 +100,26 @@ export function unboundedBound(): KeyBound {
   return { lo: null, loInc: false, hi: null, hiInc: false };
 }
 
-// partitionPoint: the first index in n.keys where pred is false — pred must be true for a prefix of
-// the (sorted) keys and false after, the binary-search backbone of the window helpers below.
-function partitionPoint(keys: Uint8Array[], pred: (k: Uint8Array) => boolean): number {
+// lowerBoundGT / lowerBoundGE: the first index whose key is > / ≥ `key` — the binary-search
+// backbone of the window helpers below. Written as two direct loops (no predicate closure): the
+// windows run per node on every descent, and a per-call closure allocation is measurable there.
+function lowerBoundGT(keys: Uint8Array[], key: Uint8Array): number {
   let lo = 0;
   let hi = keys.length;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
-    if (pred(keys[mid])) lo = mid + 1;
+    if (compareBytes(keys[mid]!, key) <= 0) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function lowerBoundGE(keys: Uint8Array[], key: Uint8Array): number {
+  let lo = 0;
+  let hi = keys.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (compareBytes(keys[mid]!, key) < 0) lo = mid + 1;
     else hi = mid;
   }
   return lo;
@@ -125,8 +137,8 @@ function partitionPoint(keys: Uint8Array[], pred: (k: Uint8Array) => boolean): n
 // separators WITHOUT faulting an OnDisk leaf. A bound admitting only a separator entry in this node
 // yields first > last (every child pruned): an empty child window, still a valid entry window.
 function childWindow(b: KeyBound, n: PNode): [number, number] {
-  const first = b.lo === null ? 0 : partitionPoint(n.keys, (k) => compareBytes(k, b.lo!) <= 0);
-  const last = b.hi === null ? n.keys.length : partitionPoint(n.keys, (k) => compareBytes(k, b.hi!) < 0);
+  const first = b.lo === null ? 0 : lowerBoundGT(n.keys, b.lo);
+  const last = b.hi === null ? n.keys.length : lowerBoundGE(n.keys, b.hi);
   return [first, last];
 }
 
@@ -136,19 +148,9 @@ function childWindow(b: KeyBound, n: PNode): [number, number] {
 // admitted separator entries (a B-tree stores records in interior nodes too).
 function entryWindow(b: KeyBound, n: PNode): [number, number] {
   const first =
-    b.lo === null
-      ? 0
-      : partitionPoint(n.keys, (k) => {
-          const c = compareBytes(k, b.lo!);
-          return b.loInc ? c < 0 : c <= 0;
-        });
+    b.lo === null ? 0 : b.loInc ? lowerBoundGE(n.keys, b.lo) : lowerBoundGT(n.keys, b.lo);
   let last =
-    b.hi === null
-      ? n.keys.length
-      : partitionPoint(n.keys, (k) => {
-          const c = compareBytes(k, b.hi!);
-          return b.hiInc ? c <= 0 : c < 0;
-        });
+    b.hi === null ? n.keys.length : b.hiInc ? lowerBoundGT(n.keys, b.hi) : lowerBoundGE(n.keys, b.hi);
   if (last < first) last = first;
   return [first, last];
 }

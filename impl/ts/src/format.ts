@@ -14,7 +14,7 @@ import type { Expr } from "./ast.ts";
 import { type CheckConstraint, type Column, type IndexDef, type Table, pkIndices } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
 import { Decimal } from "./decimal.ts";
-import { decodeInt, encodeNullable } from "./encoding.ts";
+import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { Database, Snapshot } from "./executor.ts";
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
@@ -1717,9 +1717,21 @@ function readInlineBody(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
     // decodeInt would sign-flip and widthBytes is 16 there too. .slice() copies out.
     return uuidValue(take(buf, cur, 16).slice());
   }
-  if (isTimestamp(ty)) return timestampValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
-  if (isTimestamptz(ty)) return timestamptzValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
-  return intValue(decodeInt(ty, take(buf, cur, widthBytes(ty))));
+  if (isTimestamp(ty)) return timestampValue(readIntBody(ty, buf, cur));
+  if (isTimestamptz(ty)) return timestamptzValue(readIntBody(ty, buf, cur));
+  return intValue(readIntBody(ty, buf, cur));
+}
+
+// readIntBody decodes a fixed-width integer body in place (decodeIntAt — no subarray view per
+// value; the leaf-fault hot path).
+function readIntBody(ty: ScalarType, buf: Uint8Array, cur: Cursor): bigint {
+  const w = widthBytes(ty);
+  if (cur.pos + w > buf.length) {
+    throw engineError("data_corrupted", "unexpected end of page data");
+  }
+  const v = decodeIntAt(ty, buf, cur.pos);
+  cur.pos += w;
+  return v;
 }
 
 // decodeDecimalBody decodes a decimal value's body — flags (sign), u16 scale, u16 ndigits, then that
@@ -1774,18 +1786,33 @@ function take(buf: Uint8Array, cur: Cursor, n: number): Uint8Array {
   return s;
 }
 
+// The scalar readers index the buffer directly — no subarray view per read. A leaf decode
+// runs these hundreds of times per page, so per-read view allocations dominate fault cost.
+
 function readU8(buf: Uint8Array, cur: Cursor): number {
-  return take(buf, cur, 1)[0]!;
+  if (cur.pos + 1 > buf.length) {
+    throw engineError("data_corrupted", "unexpected end of page data");
+  }
+  return buf[cur.pos++]!;
 }
 
 function readU16(buf: Uint8Array, cur: Cursor): number {
-  const s = take(buf, cur, 2);
-  return (s[0]! << 8) | s[1]!;
+  if (cur.pos + 2 > buf.length) {
+    throw engineError("data_corrupted", "unexpected end of page data");
+  }
+  const v = (buf[cur.pos]! << 8) | buf[cur.pos + 1]!;
+  cur.pos += 2;
+  return v;
 }
 
 function readU32(buf: Uint8Array, cur: Cursor): number {
-  const s = take(buf, cur, 4);
-  return ((s[0]! << 24) | (s[1]! << 16) | (s[2]! << 8) | s[3]!) >>> 0;
+  if (cur.pos + 4 > buf.length) {
+    throw engineError("data_corrupted", "unexpected end of page data");
+  }
+  const p = cur.pos;
+  const v = ((buf[p]! << 24) | (buf[p + 1]! << 16) | (buf[p + 2]! << 8) | buf[p + 3]!) >>> 0;
+  cur.pos += 4;
+  return v;
 }
 
 function readString(buf: Uint8Array, cur: Cursor): string {
