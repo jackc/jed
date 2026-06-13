@@ -4,6 +4,7 @@
 
 mod args;
 mod csv;
+mod dump;
 mod render;
 mod script;
 mod session;
@@ -49,6 +50,25 @@ fn run() -> u8 {
         db.set_max_cost(limit);
     }
     let mut session = Session::new(db, source);
+
+    // --dump (cli.md §3): write the database as SQL to stdout / -o, then exit.
+    if parsed.dump {
+        let mut out: Box<dyn Write> = match &parsed.output {
+            Some(path) if path.as_os_str() != "-" => match std::fs::File::create(path) {
+                Ok(f) => Box::new(std::io::BufWriter::new(f)),
+                Err(e) => {
+                    eprintln!("jed: {}: {e}", path.display());
+                    return 1;
+                }
+            },
+            _ => Box::new(std::io::stdout()),
+        };
+        if let Err(e) = dump::dump(&mut session.db, &mut out).and_then(|()| out.flush()) {
+            eprintln!("jed: writing dump: {e}");
+            return 1;
+        }
+        return 0;
+    }
 
     // Mode select (cli.md §3): -c/-f present, or stdin not a TTY → script mode.
     let interactive = parsed.sources.is_empty() && std::io::stdin().is_terminal();

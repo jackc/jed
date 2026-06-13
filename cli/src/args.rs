@@ -21,6 +21,7 @@ pub struct Args {
     pub db_path: Option<PathBuf>,
     pub create: bool,
     pub readonly: bool,
+    pub dump: bool,
     pub page_size: Option<u32>,
     pub sources: Vec<Source>,
     pub format: Format,
@@ -44,6 +45,8 @@ usage: jed [OPTIONS] [DBFILE]
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin)
   --import-csv TABLE=FILE import an RFC 4180 CSV (header row required) into TABLE as one
                           atomic INSERT (repeatable; runs in command-line order with -c/-f)
+  --dump                  write the database as SQL (schema + rows + indexes), then exit;
+                          composes with --readonly and -o
   --format FORMAT         script-mode output: aligned (default) | box | markdown | csv | json
   -o FILE                 script mode: write results to FILE instead of stdout ('-' = stdout);
                           errors still go to stderr
@@ -62,6 +65,7 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
         db_path: None,
         create: false,
         readonly: false,
+        dump: false,
         page_size: None,
         sources: Vec::new(),
         format: Format::Aligned,
@@ -80,6 +84,7 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
         match arg.as_str() {
             "--create" => args.create = true,
             "--readonly" => args.readonly = true,
+            "--dump" => args.dump = true,
             "--page-size" => {
                 let v = value_for("--page-size")?;
                 args.page_size = Some(v.parse().map_err(|_| format!("bad --page-size: {v}"))?);
@@ -136,6 +141,12 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if args.readonly && args.create {
         return Err("--readonly cannot be combined with --create".to_string());
+    }
+    if args.dump && args.db_path.is_none() {
+        return Err("--dump requires a DBFILE".to_string());
+    }
+    if args.dump && !args.sources.is_empty() {
+        return Err("--dump cannot be combined with -c/-f/--import-csv".to_string());
     }
     Ok(args)
 }

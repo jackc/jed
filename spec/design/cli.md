@@ -57,6 +57,7 @@ jed [OPTIONS] [DBFILE]
   -c SQL                  execute the statements, then exit (repeatable) — script mode
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin) — script mode
   --import-csv TABLE=FILE import an RFC 4180 CSV into TABLE (repeatable) — script mode
+  --dump                  write the database as SQL (schema + rows + indexes), then exit
   --format FORMAT         script-mode output format:
                           aligned (default) | box | markdown | csv | json
   -o FILE                 script mode: write results to FILE instead of stdout
@@ -97,6 +98,17 @@ through the engine's own coercion (`22P02` etc.). A bare empty field imports as 
 a quoted `""` as the empty string (the PG `COPY ... CSV` convention — the inverse of the
 §5 export policy). Imports are sources like `-c`/`-f` and run in command-line order, so
 `-c 'CREATE TABLE ...' --import-csv t=data.csv` works in one invocation.
+
+**`--dump` writes the database as SQL** (the sqlite3 `.dump` role): per table — in the
+catalog's standing order — a `CREATE TABLE` (columns with typmods, NOT NULL, DEFAULT;
+table-level `PRIMARY KEY` in key order; named `CHECK`s from their persisted text), one
+`INSERT` per row in primary-key order (a no-PK table dumps in storage order, which replays
+into the same rowids), then `CREATE [UNIQUE] INDEX` statements (after the rows, so a
+replay builds each index once — a UNIQUE *constraint* dumps as its backing unique index,
+which recreates the same state). The script is wrapped in one `BEGIN`/`COMMIT` so a
+file-backed replay commits durably once. Round-trip contract: dump → replay into a fresh
+database → dump is **byte-identical**. `--dump` requires a DBFILE, excludes `-c`/`-f`/
+`--import-csv`, and composes with `--readonly` (the natural pairing) and `-o`.
 
 **`-o FILE` redirects script-mode results** (OK lines, tables — everything that would hit
 stdout) to FILE; errors stay on stderr, so a failing script still reports on the terminal.
@@ -205,8 +217,9 @@ live in shared modules exercised by the script-mode tests).
 
 ## 8. Future (not v1)
 
-Editor autocomplete from the catalog · SQL syntax highlighting · `.dump`-style SQL export.
+Editor autocomplete from the catalog · SQL syntax highlighting.
 (Landed since v1: affected-row counts in `Outcome` — the `OK, N rows` footer of §5 —
 `--readonly` (§3), the `box`/`markdown` formats (§5), `-o` output redirection (§3) —
 a built-in pager is deliberately out; the TUI grid pages interactively, scripts pipe —
-and CSV import/export: `--import-csv` in, `--format csv` + `-o` out (§3).)
+CSV import/export: `--import-csv` in, `--format csv` + `-o` out (§3) — and the
+`--dump` SQL export (§3).)

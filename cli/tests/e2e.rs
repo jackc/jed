@@ -418,3 +418,53 @@ fn csv_export_then_import_round_trips() {
     let _ = std::fs::remove_file(&db);
     let _ = std::fs::remove_file(&exported);
 }
+
+#[test]
+fn dump_replays_into_an_identical_database() {
+    let db = tmp("dump_src.jed");
+    let db_str = db.to_str().unwrap();
+    let r = run(
+        &[
+            "--create",
+            db_str,
+            "-c",
+            "CREATE TABLE t (id int32 PRIMARY KEY, name text, score numeric(5,2) DEFAULT 1.00); \
+             INSERT INTO t (id, name) VALUES (2, 'it''s b'), (1, NULL); \
+             CREATE TABLE u (a int64, b int32 UNIQUE); INSERT INTO u VALUES (5, 6)",
+        ],
+        "",
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+
+    // Dump composes with --readonly (the natural pairing) and -o.
+    let dump_path = tmp("dump.sql");
+    let dump_str = dump_path.to_str().unwrap();
+    let r = run(&["--readonly", db_str, "--dump", "-o", dump_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    let first = std::fs::read_to_string(&dump_path).unwrap();
+    assert!(first.starts_with("BEGIN;\n"), "dump: {first}");
+    assert!(first.contains("PRIMARY KEY (id)"), "dump: {first}");
+    assert!(
+        first.contains("CREATE UNIQUE INDEX u_b_key ON u (b);"),
+        "dump: {first}"
+    );
+
+    // Replay into a fresh database; its dump is byte-identical.
+    let replayed = tmp("dump_replay.jed");
+    let replayed_str = replayed.to_str().unwrap();
+    let r = run(&["--create", replayed_str, "-q", "-f", dump_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    let r = run(&[replayed_str, "--dump"], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(r.stdout, first);
+
+    // --dump is exclusive of SQL sources and needs a DBFILE.
+    let r = run(&[db_str, "--dump", "-c", "SELECT 1"], "");
+    assert_eq!(r.code, 1);
+    let r = run(&["--dump"], "");
+    assert_eq!(r.code, 1);
+
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&dump_path);
+    let _ = std::fs::remove_file(&replayed);
+}
