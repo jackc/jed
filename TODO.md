@@ -962,11 +962,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         path clones every row (text values included) into a materialized buffer before
         aggregating. Streaming aggregation over the scan visitor is the contained first step;
         the full fix is the "Streaming + spill-to-disk operators" item above. _(size: M–L)_
-      - **Durable-commit fsync grouping** — `insert_commit_durable` is ~7–9.5ms vs PG ~1.5ms:
-        every commit pays two fsyncs (body, then meta slot — the P6.1 crash contract) where
-        PG groups WAL flushes. Already beats SQLite (~13ms). Closing on PG means
-        batched/group commit under the relaxed `synchronous` setting (transactions.md §9) —
-        only fsync *timing* may move, never the commit-visibility boundary. _(size: M)_
+      - **Durable-commit sync cost** — `insert_commit_durable` is ~7–9.5ms vs PG ~1.5ms.
+        Measured diagnosis (2026-06-13, this host): a write+`fdatasync` into a **growing**
+        file costs ~4.3ms (the size change drags ext4 metadata journaling into the flush),
+        while the same write into a **preallocated** region costs ~1.4ms — and PG's 1.5ms
+        commit is exactly one metadata-free fdatasync into its preallocated 16MB WAL segment
+        (verified honest: `fsync=on`, `synchronous_commit=on`). jed pays a growing-file
+        body fsync (~4.3ms, appends at the page high-water) + the meta-slot fsync; SQLite's
+        ~13ms is the DELETE-journal multi-sync. So the cheap, big win is **preallocating
+        file growth in chunks** so the body fsync is metadata-free (≈4.3→1.4ms, total
+        ≈ 2.8ms) — a block-seam/allocator change, no byte-contract impact since trailing
+        zero pages are past the committed page_count. Batched/group commit under the
+        relaxed `synchronous` setting (transactions.md §9) remains the further step — only
+        fsync *timing* may move, never the commit-visibility boundary. _(size: M)_
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** ✅ **landed
       (both slices)**. Designed in
       [spec/design/large-values.md](spec/design/large-values.md). Lift the `RECORD_MAX` / `u16`
