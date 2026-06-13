@@ -19,10 +19,12 @@ import (
 
 const reclaimPS = int64(256)
 
-// reclaimPageCount equals the file length in pages (format invariant pageCount = fileSize/pageSize),
-// so it directly reports whether a commit extended the file or reused a free page.
-func reclaimPageCount(t *testing.T, path string) int64 {
-	return fileSize(t, path) / reclaimPS
+// reclaimPageCount is the committed logical page high-water (db.PageCount) — the count the meta
+// records, which directly reports whether a commit extended the high-water or reused a free page. We
+// track this, not the file length: the file is preallocated in chunks ahead of the high-water
+// (spec/design/pager.md §7), so its physical size no longer equals pageCount*pageSize.
+func reclaimPageCount(db *Database) int64 {
+	return int64(db.PageCount())
 }
 
 // padOf returns the pad text of the row with id, and whether it exists.
@@ -53,11 +55,13 @@ func TestReopenReclaimsDeadPagesSoALaterChurnReuses(t *testing.T) {
 	pad := strings.Repeat("y", 40)
 
 	// Churn within this session: each UPDATE commit copies the root→leaf path + rewrites the catalog
-	// to fresh pages and leaks the old ones (P6.2 does not reclaim mid-session), so the file grows.
+	// to fresh pages and leaks the old ones (P6.2 does not reclaim mid-session), so the logical
+	// high-water grows. (We track the committed pageCount, not the file length — the file is
+	// preallocated in chunks ahead of it, spec/design/pager.md §7.)
 	for k := 0; k < 60; k++ {
 		mustExec(t, db, fmt.Sprintf("UPDATE t SET pad = 'a%d-%s' WHERE id = 15", k, pad))
 	}
-	sizeAfterChurn1 := reclaimPageCount(t, path)
+	pcAfterChurn1 := reclaimPageCount(db)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -67,24 +71,23 @@ func TestReopenReclaimsDeadPagesSoALaterChurnReuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pcReopen := reclaimPageCount(t, path)
-	if pcReopen != sizeAfterChurn1 {
-		t.Fatalf("reopen changed the file: %d vs %d", pcReopen, sizeAfterChurn1)
+	if pc := reclaimPageCount(db); pc != pcAfterChurn1 {
+		t.Fatalf("reopen changed the high-water: %d vs %d", pc, pcAfterChurn1)
 	}
 
-	// The very first post-reopen commit reuses a free page rather than extending the file.
+	// The very first post-reopen commit reuses a free page rather than extending the high-water.
 	mustExec(t, db, fmt.Sprintf("UPDATE t SET pad = 'b0-%s' WHERE id = 15", pad))
-	if got := reclaimPageCount(t, path); got != pcReopen {
-		t.Fatalf("first commit after reopen grew the file (no reuse): %d vs %d", got, pcReopen)
+	if got := reclaimPageCount(db); got != pcAfterChurn1 {
+		t.Fatalf("first commit after reopen grew the high-water (no reuse): %d vs %d", got, pcAfterChurn1)
 	}
 
 	// A whole second churn — shorter than the first, so the reclaimed pool covers it — does not grow
-	// the file: the page count after equals the count after the first churn.
+	// the high-water: the page count after equals the count after the first churn.
 	for k := 1; k < 40; k++ {
 		mustExec(t, db, fmt.Sprintf("UPDATE t SET pad = 'b%d-%s' WHERE id = 15", k, pad))
 	}
-	if got := reclaimPageCount(t, path); got != sizeAfterChurn1 {
-		t.Fatalf("second churn grew the file despite reuse: %d vs %d", got, sizeAfterChurn1)
+	if got := reclaimPageCount(db); got != pcAfterChurn1 {
+		t.Fatalf("second churn grew the high-water despite reuse: %d vs %d", got, pcAfterChurn1)
 	}
 
 	// And the data is exactly right (reuse never clobbered a live page).

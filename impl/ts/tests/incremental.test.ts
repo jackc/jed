@@ -54,10 +54,13 @@ test("a single-row commit appends only the dirty path", () => {
     assert.ok(wholePages >= 10, `the tree should span several pages (got ${wholePages})`);
 
     // One more row: the incremental commit appends only the rebuilt root→leaf path + catalog —
-    // far fewer pages than the whole tree, and bounded by tree height, not table size.
-    const before = statSync(path).size;
+    // far fewer pages than the whole tree, and bounded by tree height, not table size. We track the
+    // committed pageCount delta, not the file length — the file is preallocated in chunks ahead of
+    // the high-water (spec/design/pager.md §7), so its physical size jumps by a chunk, not the
+    // dirty-page count.
+    const before = db.pageCount;
     execute(db, `INSERT INTO t VALUES (31, 'row-31-${pad}')`);
-    const appended = Math.floor((statSync(path).size - before) / ps);
+    const appended = db.pageCount - before;
     assert.ok(appended >= 2, `the commit must append its dirty path + catalog (got ${appended})`);
     assert.ok(
       appended < wholePages,
@@ -153,6 +156,62 @@ test("a torn latest commit falls back to the prior snapshot", () => {
     const db2 = open(path);
     assert.equal(db2.txid, 3n, "fell back to the prior committed snapshot");
     assert.deepEqual(ids(db2), [1n], "only the prior snapshot's row survives the torn write");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a commit preallocates file growth in chunks and reuses the slack", () => {
+  // Chunked file preallocation (spec/design/pager.md §7, TODO.md durable-commit win): a commit that
+  // grows past the allocation high-water extends the file by whole 1 MiB chunks of real zero blocks,
+  // so the physical file is a multiple of the chunk and runs ahead of the committed pageCount. The
+  // slack is unreferenced (the committed image round-trips exactly), and a later commit that fits
+  // within it does not grow the file at all (the steady-state metadata-free path). The logical
+  // pageCount is the real high-water — independent of the physical size.
+  const CHUNK = 1024 * 1024; // PREALLOC_CHUNK_BYTES (pager.ts)
+  const dir = tmpDir();
+  try {
+    const path = join(dir, "prealloc_chunks.jed");
+    // A from-scratch image is just the empty catalog — far below one chunk — so the file starts
+    // un-aligned (create writes exactly pageCount pages, no preallocation).
+    const db = create(path); // default 8 KiB page size
+    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)");
+
+    // One commit big enough to push the tree past a chunk: ~400 rows of a ~3.5 KiB pad ≈ 1.4 MiB of
+    // tree, > the 128-page (1 MiB) chunk at the default 8 KiB page size.
+    const pad = "p".repeat(3500);
+    execute(db, "BEGIN");
+    for (let i = 0; i < 400; i++) {
+      execute(db, `INSERT INTO t VALUES (${i}, '${pad}')`);
+    }
+    execute(db, "COMMIT");
+
+    const logical = db.pageCount * db.pageSize;
+    const physical = statSync(path).size;
+    assert.ok(db.pageCount > 128, `the batch should span more than one chunk's worth of pages (got ${db.pageCount})`);
+    assert.equal(physical % CHUNK, 0, `physical file should grow in whole chunks (got ${physical})`);
+    assert.ok(
+      physical >= logical && physical >= CHUNK,
+      `preallocation should run ahead of the ${logical}-byte committed image (physical ${physical})`,
+    );
+    close(db);
+
+    // The committed image round-trips exactly through the preallocated file (trailing slack is inert
+    // zeros past the high-water).
+    const db2 = open(path);
+    const physicalBefore = statSync(path).size;
+    assert.equal(ids(db2).length, 400, "all 400 rows survive the reopen");
+
+    // A small commit fits within the preallocated slack, so the physical file does not grow at all —
+    // the steady-state metadata-free commit path.
+    execute(db2, `INSERT INTO t VALUES (1000, '${pad}')`);
+    assert.equal(statSync(path).size, physicalBefore, "a commit within the slack reuses it without growing the file");
+    close(db2);
+
+    // And the extra row is durable.
+    const db3 = open(path);
+    assert.equal(ids(db3).length, 401, "the in-slack commit persisted");
+    close(db3);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

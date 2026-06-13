@@ -8,9 +8,23 @@
 // The bounded buffer pool + lazy node loading that make the resident set bounded (P6.4b) read through
 // this same readBlock.
 
-import { closeSync, fsyncSync, readSync, writeSync } from "node:fs";
+import { closeSync, fdatasyncSync, fstatSync, fsyncSync, readSync, writeSync } from "node:fs";
 
 import { engineError } from "./errors.ts";
+
+// PREALLOC_CHUNK_BYTES is the file-growth step — ~1 MiB worth of pages preallocated at once. Growing
+// the file in chunks of real, durably-allocated zero blocks is what lets a steady-state commit write
+// its body into already-allocated space, so the per-commit fdatasync (Pager.sync) carries no ext4
+// metadata-journaling for a file-size change — the durable-commit win (spec/design/pager.md §7,
+// TODO.md). The chunk's one-time allocating fsync (Pager.reserve) amortizes across the chunk's commits.
+const PREALLOC_CHUNK_BYTES = 1024 * 1024;
+
+// preallocChunkPages is the preallocation chunk in pages for a file of pageSize bytes: max(1,
+// 1 MiB / pageSize). Page sizes are powers of two ≤ 64 KiB, so this divides 1 MiB evenly — the
+// physical file therefore grows in exact 1 MiB steps regardless of page size.
+function preallocChunkPages(pageSize: number): number {
+  return Math.max(1, Math.floor(PREALLOC_CHUNK_BYTES / Math.max(1, pageSize)));
+}
 
 // A file-backed block device: fixed-size pages addressed by index, over an open fd kept for the
 // handle's life. One page at a time (storage.md §2); the demand-paging buffer pool (P6.4b) faults
@@ -18,10 +32,17 @@ import { engineError } from "./errors.ts";
 export class Pager {
   private fd: number;
   pageSize: number;
+  // allocatedPages is the number of pages physically allocated on disk — the file length in pages,
+  // which the chunked preallocation (reserve) runs ahead of the committed high-water. A commit whose
+  // pages all fall below this never grows the file (storage.md §9). Distinct from the committed
+  // logical pageCount the meta records: the slack pages in [pageCount, allocatedPages) are
+  // unreferenced trailing zeros (no byte-contract impact — past the high-water).
+  private allocatedPages: number;
 
-  private constructor(fd: number, pageSize: number) {
+  private constructor(fd: number, pageSize: number, allocatedPages: number) {
     this.fd = fd;
     this.pageSize = pageSize;
+    this.allocatedPages = allocatedPages;
   }
 
   // fromFd adopts an already-open (r+) fd as the backing, reading the page size from its meta header
@@ -36,7 +57,10 @@ export class Pager {
     if (pageSize === 0) {
       throw engineError("data_corrupted", "zero page size in meta header");
     }
-    return new Pager(fd, pageSize);
+    // The allocation high-water is the current file length in pages — already past the committed
+    // pageCount if a prior session preallocated slack (reused for free on this session's growth).
+    const allocatedPages = Math.floor(fstatSync(fd).size / pageSize);
+    return new Pager(fd, pageSize, allocatedPages);
   }
 
   // readBlock reads one page (block index) — random access, the demand-paging read path (P6.4b).
@@ -46,16 +70,38 @@ export class Pager {
     return buf;
   }
 
-  // writeBlock writes one page (bytes) at block index. Extends the file when index is the high-water,
-  // overwrites in place when reusing a free page (P6.2). bytes is one page wide.
+  // writeBlock writes one page (bytes) at block index. Overwrites in place — persistImpl always
+  // reserves the high-water first, so the target is already-allocated space (a reused free page, or a
+  // preallocated slot past the old high-water). bytes is one page wide.
   writeBlock(index: number, bytes: Uint8Array): void {
     writeSync(this.fd, bytes, 0, bytes.length, index * this.pageSize);
   }
 
-  // sync is the durability barrier (fsync). Called twice per commit — body pages, then the meta — to
-  // honour the body-before-meta write-ordering rule (format.md, file.ts persistImpl).
+  // reserve ensures the file has at least minPages physically-allocated pages, growing it in fixed
+  // chunks (preallocChunkPages) of real, durably-allocated zero blocks when short. persistImpl calls
+  // it before each commit's body write with the new committed high-water, so that write — and almost
+  // every commit's — lands entirely in already-allocated space and its fdatasync (Pager.sync) pays no
+  // metadata journaling (spec/design/pager.md §7). The growth itself is a full fsync: the block
+  // allocation + the new file size must be durable before commits rely on writing into the region
+  // (else the body fdatasync would have to flush that metadata, defeating the point). Crash-safe: the
+  // preallocated pages are unreferenced zeros past the committed pageCount, so a crash before the next
+  // commit publishes simply ignores them.
+  reserve(minPages: number): void {
+    if (minPages <= this.allocatedPages) return;
+    const chunk = preallocChunkPages(this.pageSize);
+    const target = Math.ceil(minPages / chunk) * chunk;
+    const zeros = new Uint8Array((target - this.allocatedPages) * this.pageSize);
+    writeSync(this.fd, zeros, 0, zeros.length, this.allocatedPages * this.pageSize);
+    fsyncSync(this.fd); // the allocation must be durable before in-region commits
+    this.allocatedPages = target;
+  }
+
+  // sync is the metadata-free durability barrier (fdatasync). Called twice per commit — body pages,
+  // then the meta — to honour the body-before-meta write-ordering rule (format.md, file.ts
+  // persistImpl). fdatasync (not fsync) so an overwrite into the preallocated region (reserve) flushes
+  // only the data, never a file-size/inode-timestamp metadata journal (spec/design/pager.md §7).
   sync(): void {
-    fsyncSync(this.fd);
+    fdatasyncSync(this.fd);
   }
 
   // close closes the open fd (close()).

@@ -177,6 +177,12 @@ func (db *Database) persist(snap *Snapshot) error {
 	// Write the dirty pages + meta through the shared pager (under the pool lock, so a concurrent
 	// fault cannot race): body pages, Sync, then the alternate meta slot, Sync.
 	if err := db.paging.withPager(func(p *pager) error {
+		// Preallocate the file ahead of the high-water in chunks, so this commit's body write — and
+		// most later commits' — lands in already-allocated space and the body fdatasync below carries
+		// no file-growth metadata journaling (spec/design/pager.md §7).
+		if err := p.reserve(write.pageCount); err != nil {
+			return err
+		}
 		for _, pg := range write.pages {
 			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
 				return err

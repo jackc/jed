@@ -136,6 +136,14 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 > whole-file swap, which only worked because the whole file was rewritten). Atomicity comes
 > from the meta-slot alternation + the checksum + the write ordering, exactly as this section
 > describes. `commit` is **explicit** and `close` does not auto-flush (api.md §2).
+>
+> **Durable-commit preallocation ([pager.md](pager.md) §7).** That per-commit `fsync` was made
+> ~3× cheaper without changing the model: the block seam **preallocates file growth in 1 MiB
+> chunks** (real, durably-allocated zero blocks ahead of the committed `page_count` — SSD-target
+> page-aligned writes, CLAUDE.md §9) and the body+meta barrier uses **`fdatasync`**, so a
+> steady-state commit overwrites already-allocated space and pays no ext4 file-growth metadata
+> journaling. Byte- and cost-neutral (the slack is unreferenced trailing zeros the loader ignores;
+> `create`'s from-scratch image is **not** preallocated, so the goldens stay byte-exact).
 
 **The root swap, in two backings (transactions.md).** The §3 staging buffer + atomic publish
 this section describes is realized in [transactions.md](transactions.md): the writer's

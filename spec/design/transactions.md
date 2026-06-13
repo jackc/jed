@@ -330,6 +330,14 @@ image ([../fileformat/format.md](../fileformat/format.md), *Allocation & increme
 The `synchronous` setting is orthogonal to both. (This refines CLAUDE.md §9's "writes … land
 durably on the SSD at commit": durably at commit under `synchronous=on`, batched under `off`.)
 
+**The `synchronous=on` fsync was then made cheap** without moving the commit boundary
+([pager.md](pager.md) §7): the storage seam **preallocates file growth in 1 MiB chunks** (real,
+durably-allocated zero blocks ahead of the committed `page_count`) and the per-commit body+meta
+barrier uses **`fdatasync`**, so a steady-state commit overwrites already-allocated space with no
+ext4 file-growth metadata journaling — `insert_commit_durable` fell ~9 ms → ~2.8 ms p50 across all
+three cores. This changes only fsync *timing/flavor*, never the commit-visibility boundary, and is
+byte- and cost-neutral (the slack is trailing zeros past the high-water).
+
 ## 10. Concurrency mechanism & the testing split
 
 - **Single writer, lock-free readers.** A read transaction takes **no** lock and never blocks —

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -61,10 +62,13 @@ func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
 	}
 
 	// One more row: the incremental commit appends only the rebuilt root→leaf path + catalog —
-	// far fewer pages than the whole tree, and bounded by tree height, not table size.
-	before := fileSize(t, path)
+	// far fewer pages than the whole tree, and bounded by tree height, not table size. We track the
+	// committed pageCount delta, not the file length — the file is preallocated in chunks ahead of
+	// the high-water (spec/design/pager.md §7), so its physical size jumps by a chunk, not the
+	// dirty-page count.
+	before := int64(db.PageCount())
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (31, 'row-31-%s')", pad))
-	appended := (fileSize(t, path) - before) / ps
+	appended := int64(db.PageCount()) - before
 	if appended < 2 {
 		t.Fatalf("the commit must append its dirty path + catalog, got %d", appended)
 	}
@@ -205,6 +209,79 @@ func TestTornLatestCommitFallsBackToPriorSnapshot(t *testing.T) {
 	got := selectIDs(t, db)
 	if len(got) != 1 || got[0] != 1 {
 		t.Fatalf("only the prior snapshot's row should survive the torn write, got %v", got)
+	}
+}
+
+// TestCommitPreallocatesFileGrowthInChunks mirrors the Rust/TS preallocation tests (spec/design/pager.md
+// §7, TODO.md durable-commit win): a commit that grows past the allocation high-water extends the file
+// by whole 1 MiB chunks of real zero blocks, so the physical file is a multiple of the chunk and runs
+// ahead of the committed pageCount. The slack is unreferenced (the committed image round-trips
+// exactly), and a later commit that fits within it does not grow the file at all (the steady-state
+// metadata-free path). The logical pageCount is the real high-water — independent of the physical size.
+func TestCommitPreallocatesFileGrowthInChunks(t *testing.T) {
+	const chunk = int64(1024 * 1024) // preallocChunkBytes (pager.go)
+	path := filepath.Join(t.TempDir(), "prealloc_chunks.jed")
+
+	// A from-scratch image is just the empty catalog — far below one chunk — so the file starts
+	// un-aligned (Create writes exactly pageCount pages, no preallocation).
+	db, err := Create(path, DefaultDatabaseOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)")
+
+	// One commit big enough to push the tree past a chunk: ~400 rows of a ~3.5 KiB pad ≈ 1.4 MiB of
+	// tree, > the 128-page (1 MiB) chunk at the default 8 KiB page size.
+	pad := strings.Repeat("p", 3500)
+	mustExec(t, db, "BEGIN")
+	for i := 0; i < 400; i++ {
+		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, '%s')", i, pad))
+	}
+	mustExec(t, db, "COMMIT")
+
+	logical := int64(db.PageCount()) * int64(db.PageSize())
+	physical := fileSize(t, path)
+	if db.PageCount() <= 128 {
+		t.Fatalf("the batch should span more than one chunk's worth of pages, got %d", db.PageCount())
+	}
+	if physical%chunk != 0 {
+		t.Fatalf("physical file should grow in whole chunks, got %d (chunk %d)", physical, chunk)
+	}
+	if physical < logical || physical < chunk {
+		t.Fatalf("preallocation should run ahead of the %d-byte committed image, got physical %d", logical, physical)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The committed image round-trips exactly through the preallocated file (trailing slack is inert
+	// zeros past the high-water).
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physicalBefore := fileSize(t, path)
+	if got := len(selectIDs(t, db)); got != 400 {
+		t.Fatalf("expected 400 rows after reopen, got %d", got)
+	}
+
+	// A small commit fits within the preallocated slack, so the physical file does not grow at all —
+	// the steady-state metadata-free commit path.
+	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (1000, '%s')", pad))
+	if got := fileSize(t, path); got != physicalBefore {
+		t.Fatalf("a commit within the preallocated slack should reuse it without growing the file: %d vs %d", got, physicalBefore)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// And the extra row is durable.
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(selectIDs(t, db)); got != 401 {
+		t.Fatalf("expected 401 rows after the in-slack commit, got %d", got)
 	}
 }
 

@@ -982,19 +982,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         path clones every row (text values included) into a materialized buffer before
         aggregating. Streaming aggregation over the scan visitor is the contained first step;
         the full fix is the "Streaming + spill-to-disk operators" item above. _(size: M–L)_
-      - **Durable-commit sync cost** — `insert_commit_durable` is ~7–9.5ms vs PG ~1.5ms.
-        Measured diagnosis (2026-06-13, this host): a write+`fdatasync` into a **growing**
-        file costs ~4.3ms (the size change drags ext4 metadata journaling into the flush),
-        while the same write into a **preallocated** region costs ~1.4ms — and PG's 1.5ms
-        commit is exactly one metadata-free fdatasync into its preallocated 16MB WAL segment
-        (verified honest: `fsync=on`, `synchronous_commit=on`). jed pays a growing-file
-        body fsync (~4.3ms, appends at the page high-water) + the meta-slot fsync; SQLite's
-        ~13ms is the DELETE-journal multi-sync. So the cheap, big win is **preallocating
-        file growth in chunks** so the body fsync is metadata-free (≈4.3→1.4ms, total
-        ≈ 2.8ms) — a block-seam/allocator change, no byte-contract impact since trailing
-        zero pages are past the committed page_count. Batched/group commit under the
-        relaxed `synchronous` setting (transactions.md §9) remains the further step — only
-        fsync *timing* may move, never the commit-visibility boundary. _(size: M)_
+      - [x] **Durable-commit sync cost** — ✅ **landed (all 3 cores), spec/design/pager.md §7.**
+        Was `insert_commit_durable` ~7–9.5ms vs PG ~1.5ms. Measured diagnosis (2026-06-13, this
+        host): a write+`fdatasync` into a **growing** file costs ~4.3ms (the size change drags ext4
+        metadata journaling into the flush), while the same write into a **preallocated** region
+        costs ~1.4ms — and PG's 1.5ms commit is exactly one metadata-free fdatasync into its
+        preallocated 16MB WAL segment. jed paid a growing-file body fsync (~4.3ms) + the meta-slot
+        fsync (~9ms total). **Fix (both halves load-bearing — a microbench showed neither alone
+        wins):** the pager **preallocates file growth in 1 MiB chunks** of real durably-allocated
+        zero blocks ahead of the committed `page_count` (one amortized full `fsync` per chunk), and
+        the per-commit body+meta barrier switched `fsync`→**`fdatasync`**, so steady-state commits
+        overwrite already-allocated space metadata-free (two `fdatasync`s ≈ 2.8ms). **Measured:
+        ~9.0ms → ~2.5–3.1ms p50 (~2.7–2.9×), rust/go/ts, identical cross-core checksums.** No
+        byte-contract impact (trailing zero slack past the high-water; `create`/goldens
+        un-preallocated, byte-exact), cost-neutral (logical `page_read`), crash-safe (slack
+        unreferenced by any committed meta). Go fdatasync = `syscall.Fdatasync` behind a `linux`
+        build tag (pure Go, no cgo) + full-`Sync` fallback elsewhere. Batched/group commit under the
+        relaxed `synchronous` setting (transactions.md §9) remains the further, orthogonal step —
+        only fsync *timing* may move, never the commit-visibility boundary. _(size: M)_
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** ✅ **landed
       (both slices)**. Designed in
       [spec/design/large-values.md](spec/design/large-values.md). Lift the `RECORD_MAX` / `u16`

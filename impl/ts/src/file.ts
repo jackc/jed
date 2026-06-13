@@ -128,6 +128,10 @@ function persistImpl(db: Database, snap: Snapshot): void {
   // this). JS is single-threaded, so the read (fault) and this commit-write path never overlap.
   if (db.paging === null) return;
   const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging);
+  // Preallocate the file ahead of the high-water in chunks, so this commit's body write — and most
+  // later commits' — lands in already-allocated space and the body fdatasync below carries no
+  // file-growth metadata journaling (spec/design/pager.md §7).
+  db.paging.reserve(write.pageCount);
   for (const pg of write.pages) {
     db.paging.writeBlock(pg.index, pg.bytes);
   }

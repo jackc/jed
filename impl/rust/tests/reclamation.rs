@@ -32,13 +32,6 @@ fn slot_txid(bytes: &[u8], slot: usize) -> u64 {
     be64(bytes, slot * ps + 12)
 }
 
-/// `page_count` equals the file length in pages (format invariant `page_count = file_size /
-/// page_size`), so the file size directly reports whether a commit extended the file or reused a
-/// free page.
-fn page_count(path: &PathBuf) -> u64 {
-    std::fs::metadata(path).unwrap().len() / PS
-}
-
 fn ids(db: &mut Database) -> Vec<i64> {
     match execute(db, "SELECT id FROM t").unwrap() {
         Outcome::Query { rows, .. } => rows
@@ -92,7 +85,9 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
 
     // Churn within this session: each UPDATE commit copies the root→leaf path + rewrites the
     // catalog to fresh pages and *leaks* the old ones (P6.2 does not reclaim mid-session), so the
-    // file grows monotonically across the 60 updates.
+    // logical high-water grows monotonically across the 60 updates. (We track the committed
+    // `page_count`, not the file length — the file is preallocated in chunks ahead of it,
+    // spec/design/pager.md §7.)
     for k in 0..60 {
         execute(
             &mut db,
@@ -100,31 +95,31 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
         )
         .unwrap();
     }
-    let size_after_churn1 = page_count(&path);
+    let pc_after_churn1 = db.page_count();
     db.close().unwrap();
 
     // Reopen: the free-list is reconstructed from the ~60 churn iterations' dead pages.
     let mut db = Database::open(&path).unwrap();
-    let pc_reopen = page_count(&path);
     assert_eq!(
-        pc_reopen, size_after_churn1,
-        "reopen does not change the file"
+        db.page_count(),
+        pc_after_churn1,
+        "reopen does not change the high-water"
     );
 
-    // The very first post-reopen commit reuses a free page rather than extending the file.
+    // The very first post-reopen commit reuses a free page rather than extending the high-water.
     execute(
         &mut db,
         &format!("UPDATE t SET pad = 'b0-{pad}' WHERE id = 15"),
     )
     .unwrap();
     assert_eq!(
-        page_count(&path),
-        pc_reopen,
+        db.page_count(),
+        pc_after_churn1,
         "the first commit after reopen reuses a dead page (no growth)"
     );
 
     // A whole second churn — shorter than the first, so the reclaimed pool covers it — extends the
-    // file not at all: the page count after equals the count after the first churn.
+    // high-water not at all: the page count after equals the count after the first churn.
     for k in 1..40 {
         execute(
             &mut db,
@@ -133,9 +128,9 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
         .unwrap();
     }
     assert_eq!(
-        page_count(&path),
-        size_after_churn1,
-        "reusing reclaimed pages, the second churn does not grow the file"
+        db.page_count(),
+        pc_after_churn1,
+        "reusing reclaimed pages, the second churn does not grow the high-water"
     );
 
     // And the data is exactly right (reuse never clobbered a live page).

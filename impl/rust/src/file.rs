@@ -195,6 +195,10 @@ impl Database {
         {
             let paging = self.paging.as_ref().expect("paging present");
             let mut pager = paging.pager();
+            // Preallocate the file ahead of the high-water in chunks, so this commit's body write —
+            // and most later commits' — lands in already-allocated space and the body `fdatasync`
+            // below carries no file-growth metadata journaling (spec/design/pager.md §7).
+            pager.reserve(write.page_count)?;
             for (index, bytes) in &write.pages {
                 pager.write_block(*index, bytes)?;
             }
@@ -598,6 +602,71 @@ mod tests {
             assert_eq!(r3[1], Value::Text(big));
             db.close().unwrap();
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Chunked file preallocation (spec/design/pager.md §7, TODO.md durable-commit win): a commit that
+    /// grows past the allocation high-water extends the file by whole 1 MiB chunks of real zero blocks,
+    /// so the physical file is a multiple of the chunk and runs **ahead** of the committed
+    /// `page_count`. The slack is unreferenced (the committed image round-trips exactly), and a later
+    /// commit that fits within it does **not** grow the file at all (the steady-state metadata-free
+    /// path). The logical `page_count` is the real high-water — independent of the physical size.
+    #[test]
+    fn commit_preallocates_file_growth_in_chunks_and_reuses_slack() {
+        const CHUNK: u64 = 1024 * 1024; // PREALLOC_CHUNK_BYTES (pager.rs)
+        let path = tmp("jed_prealloc_chunks.jed");
+        let _ = std::fs::remove_file(&path);
+
+        // A from-scratch image is just the empty catalog — far below one chunk — so the file starts
+        // un-aligned (create writes exactly page_count pages, no preallocation).
+        let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+        execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)").unwrap();
+
+        // One commit big enough to push the tree past a chunk: ~400 rows of a ~3.5 KiB pad ≈ 1.4 MiB
+        // of tree, > the 128-page (1 MiB) chunk at the default 8 KiB page size.
+        let pad = "p".repeat(3500);
+        execute(&mut db, "BEGIN").unwrap();
+        for i in 0..400 {
+            execute(&mut db, &format!("INSERT INTO t VALUES ({i}, '{pad}')")).unwrap();
+        }
+        execute(&mut db, "COMMIT").unwrap();
+
+        let logical = db.page_count() as u64 * db.page_size() as u64;
+        let physical = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            db.page_count() > 128,
+            "the batch should span more than one chunk's worth of pages (got {})",
+            db.page_count()
+        );
+        assert_eq!(physical % CHUNK, 0, "physical file grows in whole chunks");
+        assert!(
+            physical >= logical && physical >= CHUNK,
+            "preallocation runs ahead of the {logical}-byte committed image (physical {physical})"
+        );
+        db.close().unwrap();
+
+        // The committed image round-trips exactly through the preallocated file (trailing slack is
+        // inert zeros past the high-water).
+        let mut db = Database::open(&path).unwrap();
+        let physical_before = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(db.rows_in_key_order("t").unwrap().len(), 400);
+
+        // A small commit fits within the preallocated slack, so the physical file does not grow at
+        // all — the steady-state metadata-free commit path.
+        execute(&mut db, &format!("INSERT INTO t VALUES (1000, '{pad}')")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            physical_before,
+            "a commit within the preallocated slack reuses it without growing the file"
+        );
+        db.close().unwrap();
+
+        // And the extra row is durable.
+        let db = Database::open(&path).unwrap();
+        let rows = db.rows_in_key_order("t").unwrap();
+        assert_eq!(rows.len(), 401);
+        assert!(rows.iter().any(|r| r[0] == Value::Int(1000)));
+        db.close().unwrap();
         let _ = std::fs::remove_file(&path);
     }
 }

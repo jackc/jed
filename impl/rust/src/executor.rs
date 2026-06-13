@@ -404,6 +404,15 @@ impl Database {
         self.page_size
     }
 
+    /// The committed **logical** page high-water — the number of pages the on-disk image references
+    /// (the count the meta records, format.md). This is the size an incremental commit extends at
+    /// (spec/fileformat/format.md *Reclamation*); it is **not** the physical file length, which the
+    /// chunked preallocation ([`crate::pager`], spec/design/pager.md §7) runs ahead of with trailing
+    /// zero slack. `0` for a fresh in-memory database.
+    pub fn page_count(&self) -> u32 {
+        self.page_count
+    }
+
     /// Set the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
     /// spec/design/api.md §8). A positive `limit` bounds every subsequent statement: it
     /// aborts with `54P01` the instant accrued cost reaches `limit` (spec/design/cost.md §6).

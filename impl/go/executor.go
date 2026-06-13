@@ -296,6 +296,13 @@ func (db *Database) OldestLiveTxid() uint64 { return db.committed.txid }
 // PageSize is the page size this database serializes with (spec/design/api.md §2).
 func (db *Database) PageSize() uint32 { return db.pageSize }
 
+// PageCount is the committed logical page high-water — the number of pages the on-disk image
+// references (the count the meta records, format.md), the size an incremental commit extends at
+// (spec/fileformat/format.md *Reclamation*). It is not the physical file length, which the chunked
+// preallocation (pager.go, spec/design/pager.md §7) runs ahead of with trailing zero slack. 0 for a
+// fresh in-memory database.
+func (db *Database) PageCount() uint32 { return db.pageCount }
+
 // Path is the backing file path, or "" for an in-memory database.
 func (db *Database) Path() string { return db.path }
 

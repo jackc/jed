@@ -63,7 +63,12 @@ export class SharedPaging {
     return this.pager.readBlock(index);
   }
 
-  // writeBlock / sync / close drive the commit write path (file.ts persistImpl) and handle release.
+  // reserve / writeBlock / sync / close drive the commit write path (file.ts persistImpl) and handle
+  // release. reserve preallocates file growth in chunks ahead of the high-water (spec/design/pager.md §7).
+  reserve(minPages: number): void {
+    this.pager.reserve(minPages);
+  }
+
   writeBlock(index: number, bytes: Uint8Array): void {
     this.pager.writeBlock(index, bytes);
   }

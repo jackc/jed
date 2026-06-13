@@ -8,7 +8,7 @@
 // dead, so overwriting it never damaged the fallback).
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -27,10 +27,12 @@ function slotTxid(b: Uint8Array, slot: number): bigint {
   return dv.getBigUint64(slot * ps + 12, false);
 }
 
-// pageCount equals the file length in pages (format invariant pageCount = fileSize/pageSize), so it
-// directly reports whether a commit extended the file or reused a free page.
-function pageCount(path: string): number {
-  return Math.floor(statSync(path).size / PS);
+// pageCountOf is the committed logical page high-water (db.pageCount) — the count the meta records,
+// which directly reports whether a commit extended the high-water or reused a free page. We track
+// this, not the file length: the file is preallocated in chunks ahead of the high-water
+// (spec/design/pager.md §7), so its physical size no longer equals pageCount*pageSize.
+function pageCountOf(db: Database): number {
+  return db.pageCount;
 }
 
 function ids(db: Database): bigint[] {
@@ -75,28 +77,29 @@ test("reopening reclaims dead pages so a later churn reuses them", () => {
     const pad = "y".repeat(40);
 
     // Churn within this session: each UPDATE commit copies the root→leaf path + rewrites the catalog
-    // to fresh pages and leaks the old ones (P6.2 does not reclaim mid-session), so the file grows.
+    // to fresh pages and leaks the old ones (P6.2 does not reclaim mid-session), so the logical
+    // high-water grows. (We track the committed pageCount, not the file length — the file is
+    // preallocated in chunks ahead of it, spec/design/pager.md §7.)
     for (let k = 0; k < 60; k++) {
       execute(db, `UPDATE t SET pad = 'a${k}-${pad}' WHERE id = 15`);
     }
-    const sizeAfterChurn1 = pageCount(path);
+    const pcAfterChurn1 = pageCountOf(db);
     close(db);
 
     // Reopen: the free-list is reconstructed from the ~60 churn iterations' dead pages.
     const db2 = open(path);
-    const pcReopen = pageCount(path);
-    assert.equal(pcReopen, sizeAfterChurn1, "reopen does not change the file");
+    assert.equal(pageCountOf(db2), pcAfterChurn1, "reopen does not change the high-water");
 
-    // The very first post-reopen commit reuses a free page rather than extending the file.
+    // The very first post-reopen commit reuses a free page rather than extending the high-water.
     execute(db2, `UPDATE t SET pad = 'b0-${pad}' WHERE id = 15`);
-    assert.equal(pageCount(path), pcReopen, "the first commit after reopen reuses a dead page");
+    assert.equal(pageCountOf(db2), pcAfterChurn1, "the first commit after reopen reuses a dead page");
 
     // A whole second churn — shorter than the first, so the reclaimed pool covers it — does not grow
-    // the file: the page count after equals the count after the first churn.
+    // the high-water: the page count after equals the count after the first churn.
     for (let k = 1; k < 40; k++) {
       execute(db2, `UPDATE t SET pad = 'b${k}-${pad}' WHERE id = 15`);
     }
-    assert.equal(pageCount(path), sizeAfterChurn1, "reusing reclaimed pages, the churn does not grow the file");
+    assert.equal(pageCountOf(db2), pcAfterChurn1, "reusing reclaimed pages, the churn does not grow the high-water");
 
     // And the data is exactly right (reuse never clobbered a live page).
     assert.equal(padOf(db2, 15), `b39-${pad}`);

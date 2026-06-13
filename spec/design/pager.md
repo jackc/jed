@@ -239,7 +239,60 @@ Deferred and explicitly **out of this item** (separate TODO entries, none forecl
 budget — a *query-operator* memory bound, distinct from this *storage* page cache) and a
 **point-lookup / index** path (would change which pages a query touches, hence cost).
 
-## 7. Determinism & cross-core notes
+## 7. Durable-commit preallocation (the metadata-free body sync)
+
+The `synchronous=on` commit chokepoint (transactions.md §9) is two `fsync`s — body pages, then
+the alternate meta slot. Measured on ext4 (the dev/CI host, 2026-06-13), each of those was
+**~4.3 ms** when the commit **grew the file**: appending pages past the high-water drags ext4's
+**metadata journaling** (the inode size + extent/block-allocation change) into the flush. With the
+free-list draining only on reopen (P6.2), a long write session appends fresh pages on essentially
+every commit — so a single-row durable commit cost **~9 ms** (two growing-file syncs), well behind
+PostgreSQL's ~1.5 ms (one metadata-free `fdatasync` into its preallocated WAL segment).
+
+The fix has **two** load-bearing halves — a microbenchmark on the same host showed preallocation
+*alone* barely helped (`fsync` still journals the inode timestamp), and `fdatasync` *alone* on a
+growing file still pays the size-metadata journal; only **both together** win:
+
+- **Preallocate file growth in chunks.** The pager tracks an `allocated_pages` high-water (the
+  physical file length in pages) distinct from the committed logical `page_count`. Before a
+  commit's body write, `reserve(new_page_count)` grows the file — when short — by whole
+  **1 MiB chunks** (`max(1, 1 MiB / page_size)` pages, mirroring `cache_leaves`) of **real,
+  durably-allocated zero blocks** (a write of zeros, not a sparse `ftruncate` — a hole would
+  re-allocate on first write and re-journal). That growth is made durable with **one full
+  `fsync`**, *amortized* across the chunk's worth of commits. Almost every commit then writes its
+  body entirely into **already-allocated** space.
+- **`fdatasync`, not `fsync`, for the per-commit barrier.** An overwrite into the preallocated
+  region changes no file metadata (size fixed, blocks already allocated), and `fdatasync` skips
+  the inode-timestamp flush `fsync` forces — so the body and meta syncs become **metadata-free**.
+
+Steady state is therefore **two metadata-free `fdatasync`s ≈ 2.8 ms** per commit. **Measured
+result (all three cores):** the `insert_commit_durable` benchmark fell from **~9.0 ms → ~2.5–3.1 ms**
+p50 (~2.7–2.9×), at PostgreSQL's order of magnitude (jed pays two syncs to PG's one).
+
+**What this does *not* touch:**
+
+- **The byte contract (§8 / CLAUDE.md §8).** The committed image — pages `[0, page_count)` — is
+  byte-identical; the preallocated tail is **unreferenced trailing zeros past the high-water**.
+  `create`'s from-scratch `to_image` write and the golden fixtures are **not** preallocated, so the
+  goldens stay byte-exact and the cross-core round-trip is unchanged. The loader reads `page_count`
+  and reconstructs the free-list from the **meta**, never the physical file length, so slack pages
+  are never mistaken for free pages.
+- **Cost (§5 / CLAUDE.md §13).** `page_read` is a **logical** count; the physical file size and the
+  preallocation are invisible to it.
+- **Crash safety (storage.md §4).** The preallocated zeros are referenced by no committed meta, and
+  the chunk's allocating `fsync` lands *before* any commit relies on the region — so a crash at any
+  point falls back to a valid prior snapshot exactly as before.
+- **The commit-visibility boundary (transactions.md §9).** Only fsync *timing/flavor* changed, never
+  *when* a commit becomes visible. The future `synchronous=off` batching is an orthogonal,
+  still-deferred step on top of this.
+
+**Per-core realization (not a byte contract — like the pool, §3).** `fdatasync` is the metadata-free
+barrier in each core, chosen idiomatically: Rust `File::sync_data()`, TS Node `fs.fdatasyncSync`, Go
+`syscall.Fdatasync` (pure Go, no cgo — CLAUDE.md §2) behind a `linux` build tag with a full-`Sync`
+fallback for platforms lacking it (still correct, just without the optimization). The preallocation
+chunk size and `reserve` logic are identical across cores.
+
+## 8. Determinism & cross-core notes
 
 - **Results + cost are the only contract**, and both are invariant to the pool (§3, §5). The
   pager, the pool, and CLOCK are internal performance machinery, **not** a byte contract — each

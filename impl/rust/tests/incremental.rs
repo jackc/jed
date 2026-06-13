@@ -68,14 +68,17 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
     );
 
     // One more row: the incremental commit appends only the rebuilt root→leaf path + catalog —
-    // far fewer pages than the whole tree, and bounded by tree height, not table size.
-    let size_before = std::fs::metadata(&path).unwrap().len();
+    // far fewer pages than the whole tree, and bounded by tree height, not table size. We track the
+    // committed `page_count` delta, not the file length — the file is preallocated in chunks ahead
+    // of the high-water (spec/design/pager.md §7), so its physical size jumps by a chunk, not by the
+    // dirty-page count.
+    let pc_before = db.page_count();
     execute(
         &mut db,
         &format!("INSERT INTO t VALUES (31, 'row-31-{pad}')"),
     )
     .unwrap();
-    let appended = (std::fs::metadata(&path).unwrap().len() - size_before) / ps;
+    let appended = (db.page_count() - pc_before) as u64;
     assert!(
         appended >= 2,
         "the commit must append its dirty path + catalog (got {appended})"
