@@ -237,6 +237,18 @@ namespace :corpus do
   task :norec_sweep, [:count] do |_, args|
     sh RbConfig.ruby, "scripts/norec_gen.rb", "--sweep", (args[:count] || "20")
   end
+
+  desc "Reduce a failing .test to a minimal one (ddmin; [core] rust|go|ts, default rust)"
+  task :reduce, [:file, :core] do |_, args|
+    file = args.fetch(:file) { abort "usage: rake 'corpus:reduce[path/to/failing.test,rust]'" }
+    extra = args[:core] ? ["--core", args[:core]] : []
+    sh RbConfig.ruby, "scripts/reduce.rb", file, *extra
+  end
+
+  desc "Self-test the reducer on a fixed synthetic failure (rust-only, oracle-free)"
+  task :reduce_selftest do
+    sh RbConfig.ruby, "scripts/reduce_selftest.rb"
+  end
 end
 
 # cli — the `jed` terminal client (spec/design/cli.md), a HOST PROGRAM at /cli: a
@@ -325,9 +337,10 @@ end
 # ci — the aggregate gate. Chains the toolchain-light spec checks, the formatter gate, the
 # CLI's tests, and the metamorphic sweep, so one command reproduces what CI enforces. Each
 # is `sh`/task-failure propagating, so `rake ci` exits non-zero on the first failure.
-desc "CI gate: spec data checks + core formatting + CLI tests + the NoREC metamorphic sweep"
+desc "CI gate: spec data checks + core formatting + CLI tests + the NoREC/TLP sweep + reducer self-test"
 task ci: %w[verify fmt cli:test] do
   Rake::Task["corpus:norec_sweep"].invoke
+  Rake::Task["corpus:reduce_selftest"].invoke
 end
 
 namespace :references do

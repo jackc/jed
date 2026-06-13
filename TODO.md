@@ -1127,15 +1127,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       integer overflow); mining its sqllogictest corpus for *query shapes* (answers from PG) is the
       only oracle-adjacent use. _(size: M remaining; §7)_
 - [ ] **SQLancer-style metamorphic / generative testing** — finds logic bugs by synthesizing
-      queries with known-correct answers. **PARTIAL** — the **NoREC** slice is built
-      (`scripts/norec_gen.rb`; `rake corpus:norec_sweep`, in `rake ci`; conformance.md §8): a
-      pushdown predicate vs a non-optimizable rewrite must agree, run on all three cores. *Remaining:*
-      **TLP** (ternary-logic partitioning — suits the 3-valued NULL + aggregate surface), **PQS**
-      (pivoted query synthesis — needs an in-harness expression evaluator), an automatic **reducer**,
-      and **broader NoREC relations** (see the growth obligation below). _(size: L remaining; §7)_
-- [ ] **Result-type assertion directive** — assert a column's precise declared type
-      (`int16` vs `int32`) beyond the `I`/`T`/`R` render tag (deferred, conformance.md §7).
-      _(size: S; §7)_
+      queries with known-correct answers. **PARTIAL** — built so far (`scripts/norec_gen.rb`;
+      `rake corpus:norec_sweep`, in `rake ci`; conformance.md §8): the **NoREC** slice (a pushdown
+      predicate vs a non-optimizable rewrite must agree — scenarios pushdown / limit / join /
+      correlated / index), the **TLP** slice (ternary-logic partitioning — `WHERE p` / `WHERE NOT p` /
+      `WHERE (p) IS NULL` reconstruct the whole + `COUNT` aggregate partitioning; an independent
+      oracle for the 3-valued NULL logic), and an automatic **reducer** (`scripts/reduce.rb`,
+      `rake corpus:reduce`; ddmin over records preserving the byte-identical failure signature;
+      self-tested in `rake ci`). *Remaining:* **PQS** (pivoted query synthesis — needs an in-harness
+      expression evaluator), `SUM`/`MIN`/`MAX`/`AVG` + `GROUP BY` TLP (blocked on
+      `COALESCE`/`LEAST`/`GREATEST`), and **broader NoREC relations** (see the growth obligation
+      below). _(size: M remaining; §7)_
+- [x] **Result-type assertion directive** — ✅ landed (`dd2d2ef`): the `# types:` directive asserts
+      each result column's precise resolved type (`int16` vs `int32`, the family) beyond the
+      `I`/`T`/`D` render tag, via each core's `Outcome::Query` column-types accessor; coverage in
+      `suites/types/result_types.test`. The finer `numeric(p,s)` typmod granularity stays deferred
+      (conformance.md §7). _(size: S; §7)_
 - [ ] **Corpus growth** — keep adding `.test` coverage as each feature lands (ongoing). Two
       **standing obligations** when a feature lands (conformance.md §5/§8): (a) on the
       PG-comparable surface, run `rake corpus:check` on the new `.test` and register any

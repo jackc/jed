@@ -243,17 +243,30 @@ profile's capabilities passes. Harnesses arrive with the first vertical slice
 
 ## 8. Metamorphic generator (SQLancer-style) — and the obligation to grow it
 
-[scripts/norec_gen.rb](../../scripts/norec_gen.rb) generates self-checking **NoREC**
-(Non-optimizing Reference Engine Construction) tests: a query that triggers an optimization and a
-*semantically-equivalent* form that does **not** must return identical rows. The canonical case:
-jed's planner pushes a predicate to a B-tree seek/range only when the primary key appears as a
-**bare column** (`detect_pk_bound`), so `id = K` is pushed down while `id + 0 = K` (a
-`BinaryOp`) full-scans — two different code paths that must agree. Expected rows are known **by
-construction** from the generated data, so no oracle (PG or otherwise) is consulted. One
-**scenario per optimization** (see the covered list below); each seed emits one file per
-scenario. `rake corpus:norec_sweep` runs a fixed, reproducible sweep (seeds 1..N × scenarios) on
-**all three cores**, so each test is checked **metamorphically** (the two forms agree) *and*
-**differentially** (the cores agree). It is in the `rake ci` gate.
+[scripts/norec_gen.rb](../../scripts/norec_gen.rb) generates self-checking metamorphic tests.
+Expected rows are known **by construction** from the generated data, so no oracle (PG or otherwise)
+is consulted. Each seed emits one file per scenario; `rake corpus:norec_sweep` runs a fixed,
+reproducible sweep (seeds 1..N × scenarios) on **all three cores**, so each test is checked
+**metamorphically** (the equivalent forms agree) *and* **differentially** (the cores agree). It is
+in the `rake ci` gate. Two families of relation are generated:
+
+- **NoREC** (Non-optimizing Reference Engine Construction): a query that triggers an optimization
+  and a *semantically-equivalent* form that does **not** must return identical rows. The canonical
+  case: jed's planner pushes a predicate to a B-tree seek/range only when the primary key appears as
+  a **bare column** (`detect_pk_bound`), so `id = K` is pushed down while `id + 0 = K` (a `BinaryOp`)
+  full-scans — two different code paths that must agree. One **scenario per optimization** (the
+  covered list below).
+- **TLP** (Ternary-Logic Partitioning): for **any** predicate `p`, three-valued logic places every
+  row in exactly one of `WHERE p` (TRUE), `WHERE NOT p` (FALSE), or `WHERE (p) IS NULL` (UNKNOWN), so
+  the three partitions `UNION ALL` must reconstruct the unpartitioned table (and `COUNT` over the
+  whole equals the partition counts summed). Unlike NoREC this is **not** an optimized-vs-unoptimized
+  pair — it is an independent oracle for the 3-valued NULL logic itself (comparison-with-NULL, the
+  Kleene `AND`/`OR`/`NOT` connectives, `IS NULL` — the §8 divergence hotspot), well-suited to jed's
+  NULL surface. The generator computes the partition by construction with the same Kleene rules jed
+  must implement; a bug shows up as a partition that fails to reconstruct the whole. The `tlp`
+  scenario covers comparison / equality / Kleene-`AND` / Kleene-`OR` / arithmetic-NULL predicates and
+  the `COUNT(*)` / `COUNT(expr)` aggregate forms; `SUM`/`MIN`/`MAX`/`AVG` aggregate-TLP is **deferred**
+  (combining per-partition results needs a `COALESCE`/`LEAST`/`GREATEST` jed does not have yet).
 
 **Why this catches what the differential cores cannot.** Running every `.test` on Rust/Go/TS
 catches the cores *disagreeing*; it is blind to a bug **all three share**. A metamorphic
@@ -277,15 +290,30 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   (through EXISTS / scalar / IN, including a NULL outer key), defeated by `inr.id + 0 = o.k`;
   **index** — a secondary-index equality (`v = K` on an indexed column) fetches via the index
   tree + per-row point lookups ([indexes.md §5](indexes.md)), defeated by `v + 0 = K`, checked
-  across UPDATE/DELETE maintenance and a NULL indexed value (3VL through the index).
+  across UPDATE/DELETE maintenance and a NULL indexed value (3VL through the index); **tlp** —
+  ternary-logic partitioning (above), an independent oracle for 3-valued NULL logic rather than an
+  optimization pair.
 - **NOT yet covered (needs a new relation):** any future index *range* / multi-column-prefix
-  bound, DISTINCT / aggregate pushdown, or other optimization added later. Each is a future
-  optimization the sweep does **not** yet exercise — add a scenario when it lands.
+  bound, DISTINCT / aggregate pushdown, or other optimization added later; on the TLP side,
+  `SUM`/`MIN`/`MAX`/`AVG` aggregate partitioning (blocked on `COALESCE`/`LEAST`/`GREATEST`) and a
+  `GROUP BY`-level TLP. Each is a future relation the sweep does **not** yet exercise — add a
+  scenario when it lands.
 
 **Reducing a discovered failure.** Generation is seeded, so a failure reproduces deterministically
-(CLAUDE.md §10); reduce it to a minimal `.test` and commit it to the corpus as a normal regression
-entry. The fuzzer is discovery; the committed `.test` is the durable artifact.
+(CLAUDE.md §10), but a failing file is large and noisy. [scripts/reduce.rb](../../scripts/reduce.rb)
+(`rake corpus:reduce[file,core]`) shrinks it automatically: **delta-debugging (ddmin) over the
+file's records** — the blank-line-separated `statement`/`query` blocks; the `# requires:` header is
+fixed — accepting a smaller record set iff the chosen core's harness still reports the
+**byte-identical failure signature** (the `FAIL …` message + SQL + expected/actual). That strict
+oracle is what makes record removal safe despite hard-coded expected rows: dropping the CREATE makes
+the failing query *error* (different message → rejected), dropping the INSERT changes its `actual:`
+(different signature → rejected), so prerequisites and any state-changing record the failure depends
+on are retained automatically while unrelated records are stripped. The result is the minimal
+{CREATE, INSERT, …, failing query}, ready to commit as a regression `.test` (the fuzzer discovers;
+the reducer distills; the committed `.test` is the durable artifact). It reduces at record
+granularity only — shrinking the data or the failing SQL would change the expected/actual and thus
+the signature, so finer trimming is left to the author. A fixed synthetic case guards the reducer in
+`rake ci` (`rake corpus:reduce_selftest`).
 
-Further SQLancer oracles — **TLP** (ternary-logic partitioning, well-suited to jed's 3-valued
-NULL + aggregates) and **PQS** (pivoted query synthesis, needs an in-harness expression
-evaluator) — and an automatic reducer remain open (TODO.md Phase 8).
+Further SQLancer oracles remain open (TODO.md Phase 8): **PQS** (pivoted query synthesis — needs an
+in-harness expression evaluator) and broader NoREC/TLP relations as new optimizations land.
