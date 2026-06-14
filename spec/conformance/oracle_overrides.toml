@@ -233,3 +233,22 @@ reason = "jed: timestamp and timestamptz are distinct comparison families — `t
 file = "types/timestamptz.test"
 sql = "INSERT INTO t VALUES (10, '2024-01-01 12:00:00+99')"
 reason = "jed: a +99 zone offset is out of range, reported as 22008. PostgreSQL reports the same rejection under 22009 (invalid_time_zone_displacement_value). Both reject; the SQLSTATE subcode differs."
+
+# --- float64 / float32 (spec/design/float.md). jed's float behavior tracks PG's float8/float4 on
+# nearly everything (the total order — NaN largest, NaN = NaN, -0 = +0; div-by-zero 22012; finite
+# overflow 22003; NaN→int 22003), so most float.test records regenerate byte-identically from the
+# oracle and need NO entry. These three are the deliberate divergences:
+[[override]]
+file = "types/float.test"
+sql = "SELECT CAST(float64 '2.5' AS int32)"
+reason = "jed: float→int rounds HALF AWAY FROM ZERO (2.5 → 3) — jed's single engine-wide rounding mode, no float in the value path (float.md §5, decimal.md §3). PostgreSQL's float8→int4 cast applies rint() (round half to EVEN), so 2.5 → 2. A documented divergence on the cast's rounding mode (same half-away vs half-even split as the decimal casts)."
+
+[[override]]
+file = "types/float.test"
+sql = "SELECT id FROM t WHERE id = d"
+reason = "jed: int64 vs float64 is not comparable (42804) — the strict type system requires an explicit cast across the int/float families (no implicit int→float promotion; float.md §2/§11). PostgreSQL implicitly coerces the bigint to double precision and compares, returning an (empty) result with no error."
+
+[[override]]
+file = "types/float.test"
+sql = "CREATE TABLE bad (k float64 PRIMARY KEY)"
+reason = "jed: a float PRIMARY KEY is rejected this slice (0A000), the documented narrowing every non-integer type takes — the float-order-preserving key encoding is authored but unexercised (float.md §10, encoding.md §2.8). PostgreSQL allows a double precision primary key."

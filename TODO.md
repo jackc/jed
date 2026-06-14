@@ -521,8 +521,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       vs `NULL` array, equality/ordering, and an order-preserving key encoding for
       arrays-in-keys. Match PostgreSQL array semantics by default (§1). Large surface;
       sequence after the core scalar set settles. _(size: XL; §4/§8)_
-- [~] **`float32` + `float64` (IEEE 754 binary float).** ✅ **Decided, spec'd, all three cores +
-      conformance + byte-exact goldens landed; only oracle overrides remain.**
+- [x] **`float32` + `float64` (IEEE 754 binary float).** ✅ **DONE — spec'd, all three cores +
+      conformance + byte-exact goldens + oracle overrides landed.**
       The float policy is **settled**: floats exist as a two-width PROMOTION TOWER — `float64`
       (aliases `double precision`/`float` — bare `float` is 64-bit in PG) and `float32` (alias
       `real`), with `float32`→`float64` lossless-implicit widening (like int16→int64) and cross-family
@@ -548,11 +548,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       This surfaced + closed a latent storage divergence: a NaN's payload bits are core-specific
       (Go `math.NaN()` = `…001`, hardware `Inf−Inf` = `0xFFF8…`), so the value codec now
       **canonicalizes NaN to one quiet pattern on store** (float.md §10 / format.md), keeping a stored
-      NaN cross-core byte-identical; `-0`/±Inf/finite stay verbatim. **Remaining (S):** oracle-import
-      overrides ([oracle_overrides.toml](spec/conformance/oracle_overrides.toml)) for the documented
-      float-vs-PG divergences (float→int half-away vs PG half-even; exact float→decimal vs PG shortest;
-      finite overflow/`÷0` traps vs PG ±Inf; strict cross-family `42804`). Scope ratified by the user:
-      "everything" incl. casts + exact SUM/AVG + transcendentals. _(was: S decision / now XL build; §8)_
+      NaN cross-core byte-identical; `-0`/±Inf/finite stay verbatim. **Oracle overrides DONE**
+      ([oracle_overrides.toml](spec/conformance/oracle_overrides.toml)) — every float.test record's PG
+      behavior verified against REL_18_STABLE source; jed tracks PG on nearly everything (the total
+      order — NaN largest, NaN=NaN, -0=+0; `÷0` 22012; finite overflow 22003; NaN→int 22003 all
+      AGREE, no entry), so only **three** deliberate divergences are ledgered: float→int half-away
+      vs PG's `rint` half-even; strict cross-family `42804` (`int = float`, no implicit promotion);
+      float PRIMARY KEY `0A000`. The oracle importer (`scripts/oracle_import.rb`) was taught the float
+      types (`TYPE_REWRITE` float64→double precision / float32→real; `TAG` → `R`). Scope ratified by
+      the user: "everything" incl. casts + exact SUM/AVG + transcendentals. _(S decision → XL build; §8)_
 
 ---
 
