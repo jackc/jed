@@ -501,10 +501,16 @@ type IsDistinctExpr struct {
 // and abs take one, round one or two. DISTINCT inside the parens is rejected at parse (42601).
 // An aggregate in WHERE/ON or nested in another aggregate is 42803 (spec/design/aggregates.md);
 // a scalar function is legal anywhere an expression is.
+//
+// ArgNames carries PostgreSQL named notation (name => value, grammar.md §17): nil ⇒ every
+// argument positional (the common case); otherwise it is parallel to Args, with a non-nil
+// *string for a named slot and nil for a positional one. The parser rejects a positional arg
+// after a named one.
 type FuncCallExpr struct {
-	Name string
-	Args []*Expr
-	Star bool
+	Name     string
+	Args     []*Expr
+	ArgNames []*string
+	Star     bool
 }
 
 // InExpr is `Lhs IN (List)` / `Lhs NOT IN (List)` — membership over a non-empty value list

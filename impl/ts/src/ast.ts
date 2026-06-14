@@ -101,8 +101,11 @@ export type Expr =
   // is the COUNT(*) row-count form (then `args` is empty); otherwise `args` is the comma-separated
   // argument list — aggregates and abs take one, round one or two. DISTINCT inside the parens is
   // rejected at parse (42601). An aggregate in WHERE/ON or nested in another aggregate is 42803
-  // (spec/design/aggregates.md); a scalar function is legal anywhere an expression is.
-  | { kind: "funcCall"; name: string; args: Expr[]; star: boolean }
+  // (spec/design/aggregates.md); a scalar function is legal anywhere an expression is. `argNames`
+  // carries PostgreSQL named notation (name => value, grammar.md §17): empty ⇒ every argument
+  // positional (the common case); otherwise it is parallel to `args`, with a string for a named
+  // slot and null for a positional one. The parser rejects a positional arg after a named one.
+  | { kind: "funcCall"; name: string; args: Expr[]; argNames: (string | null)[]; star: boolean }
   // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26). resolve
   // plans it once against the scope chain; an uncorrelated one is then folded to a constant, a
   // correlated one is re-executed per outer row. A `$N` inside is a 0A000.

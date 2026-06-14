@@ -15,7 +15,8 @@ use crate::costs::COSTS;
 use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
 use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
-use crate::interval::{Interval, parse_interval};
+use crate::interval::{self, Interval, parse_interval};
+use crate::operators::{OPERATORS, OperatorDesc};
 use crate::pmap::KeyBound;
 use crate::storage::{Row, TableStore};
 use crate::timestamp::{parse_timestamp, parse_timestamptz};
@@ -4222,6 +4223,9 @@ enum ScalarFunc {
     Sin,
     Cos,
     Tan,
+    /// make_interval — builds an interval from its (named/defaulted) integer components plus the
+    /// float64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
+    MakeInterval,
 }
 
 /// A resolved expression: a tree over fixed column indices, ready to evaluate against
@@ -5806,29 +5810,207 @@ fn no_func_overload(func: &str) -> EngineError {
 }
 
 /// Resolve a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar function
-/// (abs/round, spec/design/functions.md §9), or 42883 (undefined_function) for any other name.
-/// Aggregates and scalar functions share the call syntax (grammar.md §17); they are
-/// distinguished here, at resolve.
+/// (abs/round/…, spec/design/functions.md §9), the named/defaulted `make_interval` (§11), or
+/// 42883 (undefined_function) for any other name. Aggregates and scalar functions share the call
+/// syntax (grammar.md §17); they are distinguished here, at resolve. Named notation (`name =>
+/// value`) is valid only for a function that declares parameter names (make_interval); on every
+/// other function it is rejected 42883 (PG's "function ... has no parameter named X").
 fn resolve_func_call(
     scope: &Scope,
     name: &str,
     args: &[Expr],
+    arg_names: Option<&[Option<String>]>,
     star: bool,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     let lname = name.to_ascii_lowercase();
     match lname.as_str() {
+        "make_interval" => resolve_make_interval(scope, args, arg_names, star, agg, params),
         "count" | "sum" | "min" | "max" | "avg" => {
+            reject_named(&lname, arg_names)?;
             resolve_aggregate(scope, &lname, args, star, agg, params)
         }
         "abs" | "round" | "ceil" | "floor" | "trunc" | "sqrt" | "exp" | "ln" | "log10" | "pow"
-        | "sin" | "cos" | "tan" => resolve_scalar_func(scope, &lname, args, star, agg, params),
+        | "sin" | "cos" | "tan" => {
+            reject_named(&lname, arg_names)?;
+            resolve_scalar_func(scope, &lname, args, star, agg, params)
+        }
         _ => Err(EngineError::new(
             SqlState::UndefinedFunction,
             format!("function does not exist: {name}"),
         )),
     }
+}
+
+/// Named notation is only valid for a function that declares parameter names. Reject it on any
+/// other function — PG's "function ... has no parameter named X" (42883).
+fn reject_named(name: &str, arg_names: Option<&[Option<String>]>) -> Result<()> {
+    if let Some(names) = arg_names {
+        if let Some(Some(pn)) = names.iter().find(|n| n.is_some()) {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                format!("function {name} has no parameter named \"{pn}\""),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The lone scalar-function catalog row of this `name` (e.g. make_interval). Reads the
+/// named/default/family metadata for named-notation resolution (functions.md §11) from the
+/// generated catalog table (CLAUDE.md §5) rather than re-hardcoding it.
+fn scalar_func_desc(name: &str) -> Option<&'static OperatorDesc> {
+    OPERATORS
+        .iter()
+        .find(|o| o.kind == "function" && o.name == name)
+}
+
+/// The type context offered to an untyped literal in a function-argument slot of `family`, so it
+/// adapts (functions.md §11): an integer slot offers int64, a float slot offers float64 (so a
+/// bare `0`/`1.5` becomes float64 for `secs`). Other families offer no hint (the literal keeps
+/// its default family, and the slot type-check catches a mismatch).
+fn family_hint(family: &str) -> Option<ScalarType> {
+    match family {
+        "integer" => Some(ScalarType::Int64),
+        "float" => Some(ScalarType::Float64),
+        _ => None,
+    }
+}
+
+/// Materialize a catalog DEFAULT (an integer-literal string, verify.rb-checked) as an `Expr` so
+/// an omitted trailing argument resolves through the normal literal path — adapting to its slot's
+/// family (e.g. "0" → float64 for `secs`). functions.md §11.
+fn default_expr(lit: &str) -> Expr {
+    let n: i64 = lit
+        .parse()
+        .expect("catalog arg_defaults are integer literals (verify.rb)");
+    Expr::Literal(Literal::Int(n))
+}
+
+/// Map a call's positional + named arguments onto a function's positional parameter slots,
+/// filling omitted trailing slots from `desc.arg_defaults` (PostgreSQL named notation + DEFAULTs,
+/// functions.md §11). Returns the positional `Expr` vector of length `desc.arity`. Errors: 42601 a
+/// positional arg after a named one (also caught at parse) or a duplicated name; 42883 an unknown
+/// parameter name, too many arguments, or a missing non-defaulted slot (no matching overload).
+fn normalize_named_args(
+    desc: &OperatorDesc,
+    args: &[Expr],
+    arg_names: Option<&[Option<String>]>,
+) -> Result<Vec<Expr>> {
+    let arity = desc.arity as usize;
+    let mut slots: Vec<Option<Expr>> = vec![None; arity];
+    let mut seen_named = false;
+    for (i, a) in args.iter().enumerate() {
+        match arg_names.and_then(|ns| ns[i].as_ref()) {
+            None => {
+                if seen_named {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        "positional argument cannot follow named argument",
+                    ));
+                }
+                if i >= arity {
+                    return Err(no_func_overload(desc.name)); // too many positional arguments
+                }
+                slots[i] = Some(a.clone());
+            }
+            Some(pn) => {
+                seen_named = true;
+                let idx = desc
+                    .arg_names
+                    .iter()
+                    .position(|p| p.eq_ignore_ascii_case(pn))
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            SqlState::UndefinedFunction,
+                            format!("function {} has no parameter named \"{pn}\"", desc.name),
+                        )
+                    })?;
+                if slots[idx].is_some() {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        format!("argument name \"{pn}\" used more than once"),
+                    ));
+                }
+                slots[idx] = Some(a.clone());
+            }
+        }
+    }
+    let first_defaulted = arity - desc.arg_defaults.len();
+    let mut out = Vec::with_capacity(arity);
+    for (i, slot) in slots.into_iter().enumerate() {
+        match slot {
+            Some(e) => out.push(e),
+            None if i >= first_defaulted => {
+                out.push(default_expr(desc.arg_defaults[i - first_defaulted]))
+            }
+            None => return Err(no_func_overload(desc.name)), // missing required argument
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve `make_interval(years, months, weeks, days, hours, mins, secs)` — the engine's first
+/// named + defaulted function (functions.md §11). Normalize named/positional args + defaults onto
+/// the seven slots, resolve each with its declared family as the type hint (so a bare numeric
+/// literal adapts to the `float64` `secs` slot), and emit a `MakeInterval` node. The arguments
+/// keep their families (no promotion); a wrong family in a slot is 42883.
+fn resolve_make_interval(
+    scope: &Scope,
+    args: &[Expr],
+    arg_names: Option<&[Option<String>]>,
+    star: bool,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if star {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "* is only valid as the argument of COUNT",
+        ));
+    }
+    let desc = scalar_func_desc("make_interval").expect("make_interval is in the catalog");
+    let positional = normalize_named_args(desc, args, arg_names)?;
+    let mut rargs = Vec::with_capacity(positional.len());
+    for (i, e) in positional.iter().enumerate() {
+        let fam = desc.arg_families[i];
+        let (r, t) = resolve(scope, e, family_hint(fam), agg, params)?;
+        // Type-check the resolved arg against its declared family. A NULL adapts (NULL
+        // propagates). A float32 `secs` is read at its own width and widened losslessly to f64
+        // at eval (no Cast node — so the cost matches the float64 case and the Go/TS cores).
+        let ok = matches!(t, ResolvedType::Null)
+            || (fam == "integer" && matches!(t, ResolvedType::Int(_)))
+            || (fam == "float" && matches!(t, ResolvedType::Float(_)));
+        if !ok {
+            return Err(no_func_overload("make_interval"));
+        }
+        rargs.push(r);
+    }
+    Ok((
+        RExpr::ScalarFunc {
+            func: ScalarFunc::MakeInterval,
+            args: rargs,
+            result: ScalarType::Interval,
+        },
+        ResolvedType::Interval,
+    ))
+}
+
+/// Convert `make_interval`'s `secs` (double precision) to a microsecond count: one correctly-
+/// rounded multiply, rounded half-away-from-zero to i64 (the engine's one mode — interval.md /
+/// float.md §6). A non-finite or out-of-i64-range product traps 22008 (interval out of range),
+/// matching PG. The result stays in-contract (the multiply + round are deterministic).
+fn f64_to_micros(secs: f64) -> Result<i64> {
+    let p = (secs * 1_000_000.0_f64).round(); // round-half-away-from-zero (f64::round)
+    // 2^63 = 9_223_372_036_854_775_808.0 is the first f64 strictly above i64::MAX.
+    if !p.is_finite() || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&p) {
+        return Err(EngineError::new(
+            SqlState::DatetimeFieldOverflow,
+            "interval out of range",
+        ));
+    }
+    Ok(p as i64)
 }
 
 /// Resolve a scalar-function call (abs/round) into a per-row `ScalarFunc` node. Unlike an
@@ -6270,8 +6452,14 @@ fn resolve(
             };
             Ok((RExpr::Param(idx0), rty))
         }
-        Expr::FuncCall { name, args, star } => {
-            resolve_func_call(scope, name, args, *star, agg, params)
+        Expr::FuncCall {
+            name,
+            args,
+            arg_names,
+            star,
+        } => {
+            let names = arg_names.as_deref().map(Vec::as_slice);
+            resolve_func_call(scope, name, args, names, *star, agg, params)
         }
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
@@ -8508,6 +8696,36 @@ impl RExpr {
                         };
                         eval_float_func(*func, x, vals.get(1))
                     }
+                    // make_interval — six integer components plus the float64 `secs`. years/
+                    // months → months field (×12), weeks/days → days field (×7), hours/mins/secs
+                    // → micros; an i32/i64 field overflow traps 22008 (functions.md §11). The one
+                    // float step (secs → micros) is correctly-rounded + deterministic, so the
+                    // resulting interval is in-contract (not an `R`-exempt float).
+                    ScalarFunc::MakeInterval => {
+                        let geti = |k: usize| match &vals[k] {
+                            Value::Int(n) => *n,
+                            _ => unreachable!(
+                                "resolver restricts make_interval's components to integers"
+                            ),
+                        };
+                        let secs = match &vals[6] {
+                            Value::Float64(f) => *f,
+                            // float32 widens losslessly to f64 (every binary32 is an exact binary64).
+                            Value::Float32(f) => *f as f64,
+                            _ => unreachable!("resolver restricts make_interval's secs to a float"),
+                        };
+                        let sec_micros = f64_to_micros(secs)?;
+                        let iv = interval::make_interval(
+                            geti(0),
+                            geti(1),
+                            geti(2),
+                            geti(3),
+                            geti(4),
+                            geti(5),
+                            sec_micros,
+                        )?;
+                        Ok(Value::Interval(iv))
+                    }
                 }
             }
             // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
@@ -8979,8 +9197,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         ScalarFunc::Sin => x.sin(),
         ScalarFunc::Cos => x.cos(),
         ScalarFunc::Tan => x.tan(),
-        ScalarFunc::Abs | ScalarFunc::Round => {
-            unreachable!("abs/round are handled before eval_float_func")
+        ScalarFunc::Abs | ScalarFunc::Round | ScalarFunc::MakeInterval => {
+            unreachable!("abs/round/make_interval are handled before eval_float_func")
         }
     };
     Ok(Value::Float64(r))

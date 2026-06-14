@@ -18,9 +18,14 @@ pub struct OperatorDesc {
     pub null: &'static str,
     pub precedence: u8,
     pub errors: &'static [&'static str],
+    /// Parameter names for PostgreSQL named notation (functions.md §11); empty = none.
+    pub arg_names: &'static [&'static str],
+    /// Integer-literal DEFAULTs for the trailing parameters; empty = none.
+    pub arg_defaults: &'static [&'static str],
 }
 
 /// Every operator in the catalog, in catalog order.
+#[rustfmt::skip]
 pub const OPERATORS: &[OperatorDesc] = &[
     OperatorDesc {
         name: "or",
@@ -33,6 +38,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "kleene",
         precedence: 10,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "and",
@@ -45,6 +52,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "kleene",
         precedence: 20,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "not",
@@ -57,6 +66,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 30,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "eq",
@@ -69,6 +80,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "lt",
@@ -81,6 +94,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "gt",
@@ -93,6 +108,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "le",
@@ -105,6 +122,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ge",
@@ -117,6 +136,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -129,6 +150,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -141,6 +164,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "eq",
@@ -153,6 +178,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "lt",
@@ -165,6 +192,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "gt",
@@ -177,6 +206,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "le",
@@ -189,6 +220,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ge",
@@ -201,6 +234,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -213,6 +248,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -225,6 +262,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "like",
@@ -237,6 +276,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &["22025"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "eq",
@@ -249,6 +290,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "lt",
@@ -261,6 +304,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "gt",
@@ -273,6 +318,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "le",
@@ -285,6 +332,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ge",
@@ -297,6 +346,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -309,6 +360,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -321,6 +374,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "eq",
@@ -333,6 +388,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "lt",
@@ -345,6 +402,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "gt",
@@ -357,6 +416,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "le",
@@ -369,6 +430,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ge",
@@ -381,6 +444,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -393,6 +458,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -405,6 +472,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "eq",
@@ -417,6 +486,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "lt",
@@ -429,6 +500,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "gt",
@@ -441,6 +514,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "le",
@@ -453,6 +528,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ge",
@@ -465,6 +542,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -477,6 +556,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -489,6 +570,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "eq",
@@ -501,6 +584,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "lt",
@@ -513,6 +598,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "gt",
@@ -525,6 +612,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "le",
@@ -537,6 +626,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ge",
@@ -549,6 +640,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -561,6 +654,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -573,6 +668,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "eq",
@@ -585,6 +682,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "lt",
@@ -597,6 +696,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "gt",
@@ -609,6 +710,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "le",
@@ -621,6 +724,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ge",
@@ -633,6 +738,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -645,6 +752,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -657,6 +766,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "eq",
@@ -669,6 +780,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "lt",
@@ -681,6 +794,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "gt",
@@ -693,6 +808,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "le",
@@ -705,6 +822,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ge",
@@ -717,6 +836,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -729,6 +850,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -741,6 +864,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "eq",
@@ -753,6 +878,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "lt",
@@ -765,6 +892,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "gt",
@@ -777,6 +906,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "le",
@@ -789,6 +920,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ge",
@@ -801,6 +934,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -813,6 +948,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -825,6 +962,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "eq",
@@ -837,6 +976,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "lt",
@@ -849,6 +990,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "gt",
@@ -861,6 +1004,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "le",
@@ -873,6 +1018,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ge",
@@ -885,6 +1032,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -897,6 +1046,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -909,6 +1060,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "null_safe",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_null",
@@ -921,6 +1074,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "detects",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "is_not_null",
@@ -933,6 +1088,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "detects",
         precedence: 35,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "add",
@@ -945,6 +1102,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "sub",
@@ -957,6 +1116,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "mul",
@@ -969,6 +1130,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "div",
@@ -981,6 +1144,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22003", "22012"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "mod",
@@ -993,6 +1158,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22003", "22012"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "neg",
@@ -1005,6 +1172,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 60,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "add",
@@ -1017,6 +1186,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "sub",
@@ -1029,6 +1200,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "mul",
@@ -1041,6 +1214,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "div",
@@ -1053,6 +1228,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22003", "22012"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "mod",
@@ -1065,6 +1242,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22012"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "neg",
@@ -1077,6 +1256,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 60,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "add",
@@ -1089,6 +1270,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "sub",
@@ -1101,6 +1284,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "neg",
@@ -1113,6 +1298,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 60,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "add",
@@ -1125,6 +1312,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "add",
@@ -1137,6 +1326,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "sub",
@@ -1149,6 +1340,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "add",
@@ -1161,6 +1354,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "add",
@@ -1173,6 +1368,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "sub",
@@ -1185,6 +1382,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "sub",
@@ -1197,6 +1396,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "sub",
@@ -1209,6 +1410,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "mul",
@@ -1221,6 +1424,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "mul",
@@ -1233,6 +1438,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "mul",
@@ -1245,6 +1452,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "mul",
@@ -1257,6 +1466,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "div",
@@ -1269,6 +1480,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22008", "22012"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "div",
@@ -1281,6 +1494,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22008", "22012"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "add",
@@ -1293,6 +1508,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "sub",
@@ -1305,6 +1522,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 40,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "mul",
@@ -1317,6 +1536,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "div",
@@ -1329,6 +1550,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22003", "22012"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "mod",
@@ -1341,6 +1564,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 50,
         errors: &["22012"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "neg",
@@ -1353,6 +1578,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 60,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "abs",
@@ -1365,6 +1592,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "abs",
@@ -1377,6 +1606,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "round",
@@ -1389,6 +1620,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "round",
@@ -1401,6 +1634,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "round",
@@ -1413,6 +1648,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "round",
@@ -1425,6 +1662,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "abs",
@@ -1437,6 +1676,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ceil",
@@ -1449,6 +1690,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "floor",
@@ -1461,6 +1704,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "trunc",
@@ -1473,6 +1718,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "round",
@@ -1485,6 +1732,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "round",
@@ -1497,6 +1746,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "sqrt",
@@ -1509,6 +1760,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "exp",
@@ -1521,6 +1774,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "ln",
@@ -1533,6 +1788,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "log10",
@@ -1545,6 +1802,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "pow",
@@ -1557,6 +1816,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &["22003"],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "sin",
@@ -1569,6 +1830,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "cos",
@@ -1581,6 +1844,8 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
     },
     OperatorDesc {
         name: "tan",
@@ -1593,6 +1858,22 @@ pub const OPERATORS: &[OperatorDesc] = &[
         null: "propagates",
         precedence: 0,
         errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
+    },
+    OperatorDesc {
+        name: "make_interval",
+        symbol: None,
+        kind: "function",
+        arity: 7,
+        arg_families: &["integer", "integer", "integer", "integer", "integer", "integer", "float"],
+        arg_resolution: "none",
+        result: "interval",
+        null: "propagates",
+        precedence: 0,
+        errors: &["22008"],
+        arg_names: &["years", "months", "weeks", "days", "hours", "mins", "secs"],
+        arg_defaults: &["0", "0", "0", "0", "0", "0", "0"],
     },
 ];
 
@@ -1611,6 +1892,7 @@ pub struct AggregateDesc {
 }
 
 /// Every aggregate in the catalog, in catalog order.
+#[rustfmt::skip]
 pub const AGGREGATES: &[AggregateDesc] = &[
     AggregateDesc {
         name: "count_star",
@@ -1722,6 +2004,7 @@ pub struct SetReturningDesc {
 }
 
 /// Every set-returning function in the catalog, in catalog order.
+#[rustfmt::skip]
 pub const SET_RETURNING: &[SetReturningDesc] = &[
     SetReturningDesc {
         name: "generate_series",

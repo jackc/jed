@@ -555,7 +555,13 @@ case_expr      ::= "CASE" expr? ( "WHEN" expr "THEN" expr )+ ( "ELSE" expr )? "E
  * form) is distinct from the SELECT-list "*" glob. This lookahead is a CLAUDE.md §8
  * determinism surface — byte-identical across the three hand-written parsers
  * (../design/grammar.md §17). */
-function_call  ::= identifier "(" ( "*" | expr ( "," expr )* ) ")"
+/* An argument is positional (`expr`) or NAMED (`name => expr`, PostgreSQL named notation —
+ * the only spelling; legacy ":=" is rejected, ../design/grammar.md §17). A positional argument
+ * may NOT follow a named one (parser-enforced, 42601). The argument list may be EMPTY (a
+ * function whose parameters all DEFAULT — e.g. make_interval()). Named notation is valid only
+ * for a function that declares parameter names (make_interval); elsewhere it is 42883. */
+function_call  ::= identifier "(" ( "*" | function_arg ( "," function_arg )* )? ")"
+function_arg   ::= ( identifier "=>" )? expr
 
 /* A column reference is a bare column ("col") or a qualified column ("rel.col") where
  * `rel` is a relation's LABEL in the FROM clause (its alias, else its table name). A bare

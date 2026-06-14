@@ -95,8 +95,15 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 }
             }
             b'=' => {
-                tokens.push(Token::Eq);
-                i += 1;
+                // `=>` is the named-argument arrow (grammar.md §17), scanned greedily as one
+                // token; a bare `=` is the equality operator.
+                if bytes.get(i + 1) == Some(&b'>') {
+                    tokens.push(Token::FatArrow);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Eq);
+                    i += 1;
+                }
             }
             b'<' => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {

@@ -73,12 +73,14 @@ import {
   intervalNeg,
   intervalSpan,
   intervalSub,
+  makeInterval,
   mulByFraction,
   parseFactorDecimal,
   parseInterval,
   tsDiff,
   tsShift,
 } from "./interval.ts";
+import { OPERATORS, type OperatorDesc } from "./operators.ts";
 import {
   type Value,
   boolAnd,
@@ -3414,7 +3416,10 @@ type ScalarFuncName =
   | "pow"
   | "sin"
   | "cos"
-  | "tan";
+  | "tan"
+  // make_interval — builds an interval from its (named/defaulted) integer components plus the
+  // float64 secs (spec/design/functions.md §11). The one scalar function returning interval.
+  | "make_interval";
 
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
@@ -4000,20 +4005,26 @@ function noFuncOverload(fn: string): EngineError {
 }
 
 // resolveFuncCall resolves a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar
-// function (abs/round, spec/design/functions.md §9), or 42883 for any other name. Aggregates and
-// scalar functions share the call syntax (grammar.md §17); they are distinguished here.
+// function (abs/round/…, spec/design/functions.md §9), the named/defaulted make_interval (§11), or
+// 42883 for any other name. Aggregates and scalar functions share the call syntax (grammar.md §17);
+// they are distinguished here. Named notation (name => value) is valid only for a function that
+// declares parameter names (make_interval); on every other function it is 42883.
 function resolveFuncCall(
   scope: Scope,
-  e: { name: string; args: Expr[]; star: boolean },
+  e: { name: string; args: Expr[]; argNames: (string | null)[]; star: boolean },
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  switch (e.name.toLowerCase()) {
+  const lname = e.name.toLowerCase();
+  switch (lname) {
+    case "make_interval":
+      return resolveMakeInterval(scope, e, ag, params);
     case "count":
     case "sum":
     case "min":
     case "max":
     case "avg":
+      rejectNamed(lname, e.argNames);
       return resolveAggregate(scope, e, ag, params);
     case "abs":
     case "round":
@@ -4028,10 +4039,134 @@ function resolveFuncCall(
     case "sin":
     case "cos":
     case "tan":
+      rejectNamed(lname, e.argNames);
       return resolveScalarFunc(scope, e, ag, params);
     default:
       throw engineError("undefined_function", "function does not exist: " + e.name);
   }
+}
+
+// rejectNamed throws 42883 if any argument is named — named notation is valid only for a function
+// that declares parameter names (PG's "function ... has no parameter named X").
+function rejectNamed(name: string, argNames: (string | null)[]): void {
+  for (const n of argNames) {
+    if (n !== null) {
+      throw engineError("undefined_function", 'function ' + name + ' has no parameter named "' + n + '"');
+    }
+  }
+}
+
+// scalarFuncDesc returns the lone scalar-function catalog row of this name (e.g. make_interval),
+// reading named/default/family metadata for named-notation resolution (functions.md §11) from the
+// generated catalog table (CLAUDE.md §5) rather than re-hardcoding it.
+function scalarFuncDesc(name: string): OperatorDesc | undefined {
+  return OPERATORS.find((o) => o.kind === "function" && o.name === name);
+}
+
+// familyHint is the type context offered to an untyped literal in a function-argument slot of the
+// given family, so it adapts (functions.md §11): an integer slot offers int64, a float slot offers
+// float64 (so a bare 0/1.5 becomes float64 for secs). Other families offer no hint (null).
+function familyHint(family: string): ScalarType | null {
+  if (family === "integer") return "int64";
+  if (family === "float") return "float64";
+  return null;
+}
+
+// defaultExpr materializes a catalog DEFAULT (an integer-literal string, verify.rb-checked) as an
+// Expr so an omitted trailing argument resolves through the normal literal path — adapting to its
+// slot's family (e.g. "0" → float64 for secs). functions.md §11.
+function defaultExpr(lit: string): Expr {
+  return { kind: "literal", literal: { kind: "int", int: BigInt(lit) } };
+}
+
+// normalizeNamedArgs maps a call's positional + named arguments onto a function's positional
+// parameter slots, filling omitted trailing slots from desc.argDefaults (PostgreSQL named notation
+// + DEFAULTs, functions.md §11). Returns the positional Expr array of length desc.arity. Errors:
+// 42601 a positional arg after a named one (also caught at parse) or a duplicated name; 42883 an
+// unknown parameter name, too many arguments, or a missing non-defaulted slot (no overload).
+function normalizeNamedArgs(desc: OperatorDesc, args: Expr[], argNames: (string | null)[]): Expr[] {
+  const arity = desc.arity;
+  const slots: (Expr | null)[] = new Array(arity).fill(null);
+  const namesEmpty = argNames.length === 0;
+  let seenNamed = false;
+  for (let i = 0; i < args.length; i++) {
+    const nm = namesEmpty ? null : argNames[i];
+    if (nm === null || nm === undefined) {
+      if (seenNamed) {
+        throw engineError("syntax_error", "positional argument cannot follow named argument");
+      }
+      if (i >= arity) throw noFuncOverload(desc.name); // too many positional arguments
+      slots[i] = args[i]!;
+      continue;
+    }
+    seenNamed = true;
+    const idx = desc.argNames.findIndex((p) => p.toLowerCase() === nm.toLowerCase());
+    if (idx < 0) {
+      throw engineError("undefined_function", 'function ' + desc.name + ' has no parameter named "' + nm + '"');
+    }
+    if (slots[idx] !== null) {
+      throw engineError("syntax_error", 'argument name "' + nm + '" used more than once');
+    }
+    slots[idx] = args[i]!;
+  }
+  const firstDefaulted = arity - desc.argDefaults.length;
+  const out: Expr[] = [];
+  for (let i = 0; i < arity; i++) {
+    const slot = slots[i];
+    if (slot !== null) {
+      out.push(slot);
+    } else if (i >= firstDefaulted) {
+      out.push(defaultExpr(desc.argDefaults[i - firstDefaulted]!));
+    } else {
+      throw noFuncOverload(desc.name); // missing required argument
+    }
+  }
+  return out;
+}
+
+// resolveMakeInterval resolves make_interval(years, months, weeks, days, hours, mins, secs) — the
+// engine's first named + defaulted function (functions.md §11). Normalize named/positional args +
+// defaults onto the seven slots, resolve each with its declared family as the type hint (so a bare
+// numeric literal adapts to the float64 secs slot), and emit a make_interval node. The arguments
+// keep their families (no promotion); a wrong family in a slot is 42883.
+function resolveMakeInterval(
+  scope: Scope,
+  e: { name: string; args: Expr[]; argNames: (string | null)[]; star: boolean },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  const desc = scalarFuncDesc("make_interval");
+  if (desc === undefined) throw new Error("make_interval is in the catalog");
+  const positional = normalizeNamedArgs(desc, e.args, e.argNames);
+  const rargs: RExpr[] = [];
+  for (let i = 0; i < positional.length; i++) {
+    const fam = desc.argFamilies[i]!;
+    const r = resolve(scope, positional[i]!, familyHint(fam), ag, params);
+    // Type-check against the declared family. A NULL adapts (NULL propagates); a float32 secs is
+    // read at eval and widened losslessly to f64 (no cast node — cost matches the cores).
+    const ok =
+      r.type.kind === "null" ||
+      (fam === "integer" && r.type.kind === "int") ||
+      (fam === "float" && r.type.kind === "float");
+    if (!ok) throw noFuncOverload("make_interval");
+    rargs.push(r.node);
+  }
+  return scalarFuncNode("make_interval", rargs, "interval", undefined);
+}
+
+// f64ToMicros converts make_interval's secs (double precision) to a microsecond count: one
+// correctly-rounded multiply, rounded half-away-from-zero to a bigint (the engine's one mode —
+// float.md §6, via floatToIntHalfAway). A non-finite or out-of-i64-range product traps 22008
+// (interval out of range), matching PG and the other cores.
+function f64ToMicros(secs: number): bigint {
+  const p = secs * 1_000_000;
+  if (!Number.isFinite(p)) throw engineError("datetime_field_overflow", "interval out of range");
+  const r = floatToIntHalfAway(p); // bigint, half-away-from-zero
+  if (r < -9223372036854775808n || r > 9223372036854775807n) {
+    throw engineError("datetime_field_overflow", "interval out of range");
+  }
+  return r;
 }
 
 // resolveScalarFunc resolves a scalar-function call (abs/round) into a per-row scalarFunc node.
@@ -6134,6 +6269,18 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const v = evalExpr(a, row, env, m);
         if (v.kind === "null") return nullValue(); // NULL propagates
         vals.push(v);
+      }
+      if (e.func === "make_interval") {
+        // make_interval — six integer components plus the float64 secs. years/months → months
+        // field (×12), weeks/days → days field (×7), hours/mins/secs → micros; an i32/i64 field
+        // overflow traps 22008 (functions.md §11). The one float step (secs → micros) is
+        // correctly-rounded + deterministic, so the interval is in-contract. A float32 secs reads
+        // as its exact f64 value (.value holds the binary64 of either width).
+        const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
+        const secMicros = f64ToMicros((vals[6] as { value: number }).value);
+        return intervalValue(
+          makeInterval(geti(0), geti(1), geti(2), geti(3), geti(4), geti(5), secMicros),
+        );
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

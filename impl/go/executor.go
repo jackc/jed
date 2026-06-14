@@ -4738,6 +4738,9 @@ const (
 	sfSin
 	sfCos
 	sfTan
+	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
+	// float64 secs (spec/design/functions.md §11). The one scalar function returning interval.
+	sfMakeInterval
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -5449,18 +5452,185 @@ func noFuncOverload(fn string) error {
 }
 
 // resolveFuncCall resolves a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar
-// function (abs/round, spec/design/functions.md §9), or 42883 for any other name. Aggregates
-// and scalar functions share the call syntax (grammar.md §17); they are distinguished here.
+// function (abs/round/…, spec/design/functions.md §9), the named/defaulted make_interval (§11),
+// or 42883 for any other name. Aggregates and scalar functions share the call syntax (grammar.md
+// §17); they are distinguished here. Named notation (name => value) is valid only for a function
+// that declares parameter names (make_interval); on every other function it is 42883.
 func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	switch toLowerASCII(fc.Name) {
+	case "make_interval":
+		return resolveMakeInterval(s, fc, ag, params)
 	case "count", "sum", "min", "max", "avg":
+		if err := rejectNamed(toLowerASCII(fc.Name), fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
 		return resolveAggregate(s, fc, ag, params)
 	case "abs", "round", "ceil", "floor", "trunc", "sqrt",
 		"exp", "ln", "log10", "pow", "sin", "cos", "tan":
+		if err := rejectNamed(toLowerASCII(fc.Name), fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
 		return resolveScalarFunc(s, fc, ag, params)
 	default:
 		return nil, resolvedType{}, NewError(UndefinedFunction, "function does not exist: "+fc.Name)
 	}
+}
+
+// rejectNamed errors 42883 if any argument is named — named notation is valid only for a function
+// that declares parameter names (PG's "function ... has no parameter named X").
+func rejectNamed(name string, argNames []*string) error {
+	for _, n := range argNames {
+		if n != nil {
+			return NewError(UndefinedFunction, "function "+name+" has no parameter named \""+*n+"\"")
+		}
+	}
+	return nil
+}
+
+// scalarFuncDesc returns the lone scalar-function catalog row of this name (e.g. make_interval),
+// reading named/default/family metadata for named-notation resolution (functions.md §11) from the
+// generated catalog table (CLAUDE.md §5) rather than re-hardcoding it.
+func scalarFuncDesc(name string) *OperatorDesc {
+	for i := range Operators {
+		if Operators[i].Kind == "function" && Operators[i].Name == name {
+			return &Operators[i]
+		}
+	}
+	return nil
+}
+
+// familyHint is the type context offered to an untyped literal in a function-argument slot of the
+// given family, so it adapts (functions.md §11): an integer slot offers int64, a float slot offers
+// float64 (so a bare 0/1.5 becomes float64 for secs). Other families offer no hint (nil).
+func familyHint(family string) *ScalarType {
+	switch family {
+	case "integer":
+		t := Int64
+		return &t
+	case "float":
+		t := Float64
+		return &t
+	default:
+		return nil
+	}
+}
+
+// defaultExpr materializes a catalog DEFAULT (an integer-literal string, verify.rb-checked) as an
+// Expr so an omitted trailing argument resolves through the normal literal path — adapting to its
+// slot's family (e.g. "0" → float64 for secs). functions.md §11.
+func defaultExpr(lit string) Expr {
+	n, err := strconv.ParseInt(lit, 10, 64)
+	if err != nil {
+		panic("catalog arg_defaults are integer literals (verify.rb): " + lit)
+	}
+	return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralInt, Int: n}}
+}
+
+// normalizeNamedArgs maps a call's positional + named arguments onto a function's positional
+// parameter slots, filling omitted trailing slots from desc.ArgDefaults (PostgreSQL named notation
+// + DEFAULTs, functions.md §11). Returns the positional Expr slice of length desc.Arity. Errors:
+// 42601 a positional arg after a named one (also caught at parse) or a duplicated name; 42883 an
+// unknown parameter name, too many arguments, or a missing non-defaulted slot (no overload).
+func normalizeNamedArgs(desc *OperatorDesc, args []*Expr, argNames []*string) ([]*Expr, error) {
+	arity := desc.Arity
+	slots := make([]*Expr, arity)
+	seenNamed := false
+	for i, a := range args {
+		var nm *string
+		if argNames != nil {
+			nm = argNames[i]
+		}
+		if nm == nil {
+			if seenNamed {
+				return nil, NewError(SyntaxError, "positional argument cannot follow named argument")
+			}
+			if i >= arity {
+				return nil, noFuncOverload(desc.Name) // too many positional arguments
+			}
+			slots[i] = a
+			continue
+		}
+		seenNamed = true
+		idx := -1
+		for j, pn := range desc.ArgNames {
+			if toLowerASCII(pn) == toLowerASCII(*nm) {
+				idx = j
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, NewError(UndefinedFunction, "function "+desc.Name+" has no parameter named \""+*nm+"\"")
+		}
+		if slots[idx] != nil {
+			return nil, NewError(SyntaxError, "argument name \""+*nm+"\" used more than once")
+		}
+		slots[idx] = a
+	}
+	firstDefaulted := arity - len(desc.ArgDefaults)
+	out := make([]*Expr, 0, arity)
+	for i := 0; i < arity; i++ {
+		switch {
+		case slots[i] != nil:
+			out = append(out, slots[i])
+		case i >= firstDefaulted:
+			e := defaultExpr(desc.ArgDefaults[i-firstDefaulted])
+			out = append(out, &e)
+		default:
+			return nil, noFuncOverload(desc.Name) // missing required argument
+		}
+	}
+	return out, nil
+}
+
+// resolveMakeInterval resolves make_interval(years, months, weeks, days, hours, mins, secs) — the
+// engine's first named + defaulted function (functions.md §11). Normalize named/positional args +
+// defaults onto the seven slots, resolve each with its declared family as the type hint (so a bare
+// numeric literal adapts to the float64 secs slot), and emit a sfMakeInterval node. The arguments
+// keep their families (no promotion); a wrong family in a slot is 42883.
+func resolveMakeInterval(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if fc.Star {
+		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+	}
+	desc := scalarFuncDesc("make_interval")
+	if desc == nil {
+		panic("make_interval is in the catalog")
+	}
+	positional, err := normalizeNamedArgs(desc, fc.Args, fc.ArgNames)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	rargs := make([]*rExpr, 0, len(positional))
+	for i, e := range positional {
+		fam := desc.ArgFamilies[i]
+		r, t, err := resolve(s, *e, familyHint(fam), ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		// Type-check against the declared family. A NULL adapts (NULL propagates); a float32 secs
+		// is read at eval and widened losslessly to f64 (no Cast node — cost matches the cores).
+		ok := t.kind == rtNull ||
+			(fam == "integer" && t.kind == rtInt) ||
+			(fam == "float" && isFloatKind(t.kind))
+		if !ok {
+			return nil, resolvedType{}, noFuncOverload("make_interval")
+		}
+		rargs = append(rargs, r)
+	}
+	return &rExpr{kind: reScalarFunc, sfunc: sfMakeInterval, sargs: rargs, result: IntervalType},
+		resolvedTypeOf(IntervalType), nil
+}
+
+// f64ToMicros converts make_interval's secs (double precision) to a microsecond count: one
+// correctly-rounded multiply, rounded half-away-from-zero to int64 (the engine's one mode —
+// interval.md / float.md §6). A non-finite or out-of-int64-range product traps 22008 (interval
+// out of range), matching PG. The result stays in-contract (multiply + round are deterministic).
+func f64ToMicros(secs float64) (int64, error) {
+	p := math.Round(secs * 1_000_000.0) // round-half-away-from-zero (math.Round)
+	// 2^63 = 9_223_372_036_854_775_808.0 is the first float64 strictly above math.MaxInt64.
+	if math.IsNaN(p) || math.IsInf(p, 0) || p < -9_223_372_036_854_775_808.0 || p >= 9_223_372_036_854_775_808.0 {
+		return 0, NewError(DatetimeFieldOverflow, "interval out of range")
+	}
+	return int64(p), nil
 }
 
 // resolveScalarFunc resolves a scalar-function call (abs/round) into a per-row reScalarFunc
@@ -7563,6 +7733,20 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return DecimalValue(r), nil
+		case sfMakeInterval:
+			// make_interval — six integer components plus the float64 secs. years/months →
+			// months field (×12), weeks/days → days field (×7), hours/mins/secs → micros; an
+			// i32/i64 field overflow traps 22008 (functions.md §11). The one float step (secs →
+			// micros) is correctly-rounded + deterministic, so the interval is in-contract.
+			secMicros, err := f64ToMicros(vals[6].asF64())
+			if err != nil {
+				return Value{}, err
+			}
+			iv, err := MakeInterval(vals[0].Int, vals[1].Int, vals[2].Int, vals[3].Int, vals[4].Int, vals[5].Int, secMicros)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntervalValue(iv), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; float64 for the rest, per the catalog).

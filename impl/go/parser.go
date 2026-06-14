@@ -1850,10 +1850,14 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	}
 }
 
-// parseFunctionCall parses `function_call ::= identifier "(" ( "*" | expr ("," expr)* ) ")"` —
-// the shared aggregate/scalar call syntax (grammar.md §17). COUNT(*) is the star form; every
-// other call takes a comma-separated argument list (resolution checks the per-function arity).
-// DISTINCT inside the parens is deferred (rejected 42601).
+// parseFunctionCall parses
+// `function_call ::= identifier "(" ( "*" | function_arg ("," function_arg)* )? ")"` and
+// `function_arg ::= ( identifier "=>" )? expr` — the shared aggregate/scalar call syntax
+// (grammar.md §17). COUNT(*) is the star form; the argument list may be empty (a function whose
+// parameters all DEFAULT, e.g. make_interval()); otherwise it is a comma-separated list of
+// positional and/or NAMED (name => value) arguments. A positional argument may not follow a named
+// one (42601). ArgNames stays nil when every argument is positional. DISTINCT inside the parens is
+// deferred (rejected 42601). Resolution checks per-function arity and fills defaults.
 func (p *Parser) parseFunctionCall() (Expr, error) {
 	name, err := p.expectIdentifier()
 	if err != nil {
@@ -1867,20 +1871,47 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 		return Expr{}, NewError(SyntaxError, "DISTINCT inside an aggregate is not supported yet")
 	}
 	fc := &FuncCallExpr{Name: name}
-	if p.peek().Kind == TokStar {
+	anyNamed := false
+	switch {
+	case p.peek().Kind == TokStar:
 		p.advance()
 		fc.Star = true
-	} else {
+	case p.peek().Kind == TokRParen:
+		// Empty argument list (make_interval()) — leave Args/ArgNames empty.
+	default:
+		var names []*string
 		for {
+			// A named argument is `identifier "=>" expr` (grammar.md §17); a two-token lookahead
+			// (word then "=>") distinguishes it from a bare expr that starts with an identifier.
+			var argName *string
+			if p.peek().Kind == TokWord && p.peekKindAt(1) == TokFatArrow {
+				nm, err := p.expectIdentifier()
+				if err != nil {
+					return Expr{}, err
+				}
+				if err := p.expect(TokFatArrow); err != nil {
+					return Expr{}, err
+				}
+				anyNamed = true
+				argName = &nm
+			} else if anyNamed {
+				// A positional argument may not follow a named one (PostgreSQL, 42601).
+				return Expr{}, NewError(SyntaxError, "positional argument cannot follow named argument")
+			}
 			arg, err := p.parseExpr()
 			if err != nil {
 				return Expr{}, err
 			}
 			fc.Args = append(fc.Args, &arg)
+			names = append(names, argName)
 			if p.peek().Kind != TokComma {
 				break
 			}
 			p.advance()
+		}
+		// Keep ArgNames nil unless a name appeared (the all-positional sentinel — §8).
+		if anyNamed {
+			fc.ArgNames = names
 		}
 	}
 	if err := p.expect(TokRParen); err != nil {
@@ -2072,6 +2103,8 @@ func renderToken(t Token) string {
 		return "<="
 	case TokGe:
 		return ">="
+	case TokFatArrow:
+		return "=>"
 	default: // TokEof — never inside the parentheses
 		return ""
 	}

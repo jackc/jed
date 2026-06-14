@@ -11,6 +11,13 @@
 #   sql     the record's SQL, matched after whitespace-normalization
 #   reason  why jed departs from PostgreSQL here
 
+# --- make_interval named notation: jed accepts only the `=>` spelling. PostgreSQL also accepts
+# the legacy `:=`, so this call SUCCEEDS in PG (returns 00:00:01) but jed rejects it 42601.
+[[override]]
+file = "expr/make_interval.test"
+sql = "SELECT make_interval(secs := 1)"
+reason = "jed: named notation uses only `=>` (grammar.md §17). jed has no `:` token, and `=>` alone is the modern, unambiguous PostgreSQL spelling, so `:=` is a 42601 syntax error. PostgreSQL accepts the legacy `:=` alias and returns 00:00:01. A deliberate, documented surface narrowing (a spelling, not a behavior — functions.md §11)."
+
 # --- typed string literals: jed coerces integer/decimal by its OWN literal grammar (grammar.md
 # §36), not PG's permissive input functions, so a `type 'string'` is byte-identical to writing the
 # value as a native jed literal. The four forms PG accepts and jed rejects (22P02):

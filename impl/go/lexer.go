@@ -91,8 +91,15 @@ func Lex(sql string) ([]Token, error) {
 				return nil, NewError(SyntaxError, "unexpected character ':'")
 			}
 		case c == '=':
-			tokens = append(tokens, Token{Kind: TokEq})
-			i++
+			// `=>` is the named-argument arrow (grammar.md §17), scanned greedily as one token;
+			// a bare `=` is the equality operator.
+			if i+1 < len(b) && b[i+1] == '>' {
+				tokens = append(tokens, Token{Kind: TokFatArrow})
+				i += 2
+			} else {
+				tokens = append(tokens, Token{Kind: TokEq})
+				i++
+			}
 		case c == '<':
 			if i+1 < len(b) && b[i+1] == '=' {
 				tokens = append(tokens, Token{Kind: TokLe})

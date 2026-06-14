@@ -153,6 +153,9 @@ test("operators match spec/functions/catalog.toml", () => {
     assert.equal(d.precedence, row.has("precedence") ? row.num("precedence") : 0, `${name}: precedence`);
     assert.deepEqual([...d.argFamilies], row.strs("arg_families"), `${name}: argFamilies`);
     assert.deepEqual([...d.errors], row.strs("errors"), `${name}: errors`);
+    // Optional named/default-argument metadata (functions.md §11); absent ⇒ empty array.
+    assert.deepEqual([...d.argNames], row.strs("arg_names"), `${name}: argNames`);
+    assert.deepEqual([...d.argDefaults], row.strs("arg_defaults"), `${name}: argDefaults`);
     if (row.has("symbol")) {
       assert.equal(d.symbol, row.str("symbol"), `${name}: symbol`);
     } else {

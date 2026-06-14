@@ -291,6 +291,24 @@ fn operators_match_spec() {
             .collect();
         assert_eq!(desc.errors, errs.as_slice(), "{name} errors");
 
+        // Optional named/default-argument metadata (functions.md §11); absent ⇒ empty slice.
+        let str_array = |key: &str| -> Vec<String> {
+            row.get(key)
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            desc.arg_names,
+            str_array("arg_names").as_slice(),
+            "{name} arg_names"
+        );
+        assert_eq!(
+            desc.arg_defaults,
+            str_array("arg_defaults").as_slice(),
+            "{name} arg_defaults"
+        );
+
         match row.get("symbol").and_then(|s| s.as_str()) {
             Some(sym) => assert_eq!(desc.symbol, Some(sym), "{name} symbol"),
             None => assert_eq!(desc.symbol, None, "{name} symbol absent"),

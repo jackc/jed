@@ -378,6 +378,10 @@ id = "func.round"
 description = "round(x[, n]) scalar function — numeric/integer → numeric, half-away-from-zero to scale 0 or n places; integer overloads return numeric (PG round(5)); NULL propagates (spec/design/functions.md §9)"
 
 [[capability]]
+id = "func.named_arguments"
+description = "PostgreSQL named-argument notation f(name => value) + DEFAULT parameter values, exercised by make_interval(years,months,weeks,days,hours,mins,secs) — every parameter named and defaulting to 0. Positional, named, and mixed (positional-then-named) calls; a positional arg after a named one is 42601, an unknown name or a named arg on a nameless function is 42883; field overflow is 22008. The legacy ':=' spelling is rejected (42601 — a deliberate surface narrowing; PG accepts it). spec/design/functions.md §11"
+
+[[capability]]
 id = "error.division_by_zero"
 description = "Integer division / modulo by zero is defined and traps SQLSTATE 22012"
 

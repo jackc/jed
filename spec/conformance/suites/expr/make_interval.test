@@ -1,0 +1,113 @@
+# make_interval — the engine's first NAMED + DEFAULTED function (spec/design/functions.md §11).
+# make_interval(years, months, weeks, days, hours, mins, secs) builds an interval; every
+# parameter is named and DEFAULTs to 0, so it is callable positionally, by named notation
+# (name => value), or mixed (positional then named), with any subset supplied. years/months
+# fold into the months field (×12), weeks/days into the days field (×7), hours/mins/secs into
+# the microsecond field; `secs` is `double precision` (float64), folded EXACTLY into micros, so
+# the result is in-contract (a normal `T` interval render, not an `R`-exempt float). NULL in any
+# argument propagates. Errors: an unknown parameter name, a named arg on a function with no
+# parameter names, or too many arguments is 42883; a positional arg after a named one or a
+# duplicated name is 42601; a field overflow is 22008. The legacy `:=` spelling is rejected
+# (42601) — a deliberate surface narrowing (PostgreSQL accepts it; ../../oracle_overrides.toml).
+# Each call charges one operator_eval + one row_produced (the literal/default args are leaves),
+# so every single-row form costs 2 — identical for a named call and its positional twin (§13).
+# PostgreSQL-oracle-verified (postgres:18).
+# requires: query.select, query.select_no_from, types.int32, types.int64, types.interval, types.float64, func.named_arguments, resource.cost_metering
+
+# --- named notation, a subset of parameters ---------------------------------------------
+# cost: 2
+query T nosort
+SELECT make_interval(days => 3, hours => 2)
+----
+3 days 02:00:00
+
+# cost: 2
+query T nosort
+SELECT make_interval(years => 1, mins => 30)
+----
+1 year 00:30:00
+
+# --- a bare numeric literal adapts to the float64 `secs` slot (decimal and integer forms) ---
+# cost: 2
+query T nosort
+SELECT make_interval(secs => 1.5)
+----
+00:00:01.5
+
+# cost: 2
+query T nosort
+SELECT make_interval(secs => 2)
+----
+00:00:02
+
+# cost: 2
+query T nosort
+SELECT make_interval(secs => 0.123456)
+----
+00:00:00.123456
+
+# --- positional, and mixed positional-then-named ----------------------------------------
+# make_interval(1, 2, 3): years=1, months=2, weeks=3 → 14 months + 21 days.
+# cost: 2
+query T nosort
+SELECT make_interval(1, 2, 3)
+----
+1 year 2 mons 21 days
+
+# years=1 positional, weeks=2 named → 12 months + 14 days.
+# cost: 2
+query T nosort
+SELECT make_interval(1, weeks => 2)
+----
+1 year 14 days
+
+# --- the all-defaults call (empty argument list) ----------------------------------------
+# cost: 2
+query T nosort
+SELECT make_interval()
+----
+00:00:00
+
+# --- a named call and its positional twin resolve identically AND cost the same ----------
+# make_interval(0, 0, 0, 3, 2) is the positional twin of make_interval(days => 3, hours => 2).
+# cost: 2
+query T nosort
+SELECT make_interval(0, 0, 0, 3, 2)
+----
+3 days 02:00:00
+
+# --- NULL in any argument propagates ----------------------------------------------------
+# cost: 2
+query T nosort
+SELECT make_interval(days => NULL)
+----
+NULL
+
+# --- errors: unknown name, named-on-nameless, too many args (42883) ----------------------
+statement error 42883
+SELECT make_interval(bogus => 1)
+
+statement error 42883
+SELECT abs(x => 5)
+
+statement error 42883
+SELECT make_interval(7, 8, 9, 10, 11, 12, 13, 14)
+
+# a decimal literal does not adapt to an integer slot (years is integer) → no overload, 42883
+statement error 42883
+SELECT make_interval(years => 1.5)
+
+# --- errors: positional-after-named, duplicate name (42601) ------------------------------
+statement error 42601
+SELECT make_interval(days => 1, 2)
+
+statement error 42601
+SELECT make_interval(days => 1, days => 2)
+
+# --- a field overflow traps 22008 (interval out of range): years=2e9 → 24e9 months > i32 ---
+statement error 22008
+SELECT make_interval(years => 2000000000)
+
+# --- the legacy `:=` spelling is rejected (42601) — a deliberate divergence; PG accepts it ---
+statement error 42601
+SELECT make_interval(secs := 1)

@@ -18,6 +18,10 @@ export interface OperatorDesc {
   null: string;
   precedence: number;
   errors: readonly string[];
+  // Parameter names for PostgreSQL named notation (functions.md §11); empty = none.
+  argNames: readonly string[];
+  // Integer-literal DEFAULTs for the trailing parameters; empty = none.
+  argDefaults: readonly string[];
 }
 
 // Every operator in the catalog, in catalog order.
@@ -32,6 +36,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "kleene",
     precedence: 10,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "and",
@@ -43,6 +49,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "kleene",
     precedence: 20,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "not",
@@ -54,6 +62,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 30,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "eq",
@@ -66,6 +76,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "lt",
@@ -78,6 +90,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "gt",
@@ -90,6 +104,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "le",
@@ -102,6 +118,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ge",
@@ -114,6 +132,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_distinct_from",
@@ -125,6 +145,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_distinct_from",
@@ -136,6 +158,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "eq",
@@ -148,6 +172,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "lt",
@@ -160,6 +186,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "gt",
@@ -172,6 +200,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "le",
@@ -184,6 +214,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ge",
@@ -196,6 +228,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_distinct_from",
@@ -207,6 +241,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_distinct_from",
@@ -218,6 +254,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "like",
@@ -229,6 +267,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: ["22025"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "eq",
@@ -241,6 +281,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "lt",
@@ -253,6 +295,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "gt",
@@ -265,6 +309,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "le",
@@ -277,6 +323,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ge",
@@ -289,6 +337,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_distinct_from",
@@ -300,6 +350,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_distinct_from",
@@ -311,6 +363,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "eq",
@@ -323,6 +377,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "lt",
@@ -335,6 +391,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "gt",
@@ -347,6 +405,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "le",
@@ -359,6 +419,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ge",
@@ -371,6 +433,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_distinct_from",
@@ -382,6 +446,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_distinct_from",
@@ -393,6 +459,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "eq",
@@ -405,6 +473,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "lt",
@@ -417,6 +487,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "gt",
@@ -429,6 +501,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "le",
@@ -441,6 +515,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ge",
@@ -453,6 +529,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_distinct_from",
@@ -464,6 +542,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_distinct_from",
@@ -475,6 +555,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "eq",
@@ -487,6 +569,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "lt",
@@ -499,6 +583,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "gt",
@@ -511,6 +597,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "le",
@@ -523,6 +611,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ge",
@@ -535,6 +625,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_distinct_from",
@@ -546,6 +638,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_distinct_from",
@@ -557,6 +651,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "eq",
@@ -569,6 +665,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "lt",
@@ -581,6 +679,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "gt",
@@ -593,6 +693,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "le",
@@ -605,6 +707,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ge",
@@ -617,6 +721,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_distinct_from",
@@ -628,6 +734,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_distinct_from",
@@ -639,6 +747,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "eq",
@@ -651,6 +761,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "lt",
@@ -663,6 +775,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "gt",
@@ -675,6 +789,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "le",
@@ -687,6 +803,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ge",
@@ -699,6 +817,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_distinct_from",
@@ -710,6 +830,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_distinct_from",
@@ -721,6 +843,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "eq",
@@ -733,6 +857,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "lt",
@@ -745,6 +871,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "gt",
@@ -757,6 +885,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "le",
@@ -769,6 +899,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ge",
@@ -781,6 +913,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_distinct_from",
@@ -792,6 +926,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_distinct_from",
@@ -803,6 +939,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "eq",
@@ -815,6 +953,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "lt",
@@ -827,6 +967,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "gt",
@@ -839,6 +981,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "le",
@@ -851,6 +995,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ge",
@@ -863,6 +1009,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_distinct_from",
@@ -874,6 +1022,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_distinct_from",
@@ -885,6 +1035,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "null_safe",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_null",
@@ -896,6 +1048,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "detects",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "is_not_null",
@@ -907,6 +1061,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "detects",
     precedence: 35,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "add",
@@ -919,6 +1075,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "sub",
@@ -931,6 +1089,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "mul",
@@ -943,6 +1103,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "div",
@@ -955,6 +1117,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22003", "22012"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "mod",
@@ -967,6 +1131,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22003", "22012"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "neg",
@@ -979,6 +1145,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 60,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "add",
@@ -991,6 +1159,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "sub",
@@ -1003,6 +1173,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "mul",
@@ -1015,6 +1187,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "div",
@@ -1027,6 +1201,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22003", "22012"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "mod",
@@ -1039,6 +1215,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22012"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "neg",
@@ -1051,6 +1229,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 60,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "add",
@@ -1063,6 +1243,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "sub",
@@ -1075,6 +1257,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "neg",
@@ -1087,6 +1271,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 60,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "add",
@@ -1099,6 +1285,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "add",
@@ -1111,6 +1299,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "sub",
@@ -1123,6 +1313,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "add",
@@ -1135,6 +1327,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "add",
@@ -1147,6 +1341,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "sub",
@@ -1159,6 +1355,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "sub",
@@ -1171,6 +1369,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "sub",
@@ -1183,6 +1383,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "mul",
@@ -1195,6 +1397,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "mul",
@@ -1207,6 +1411,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "mul",
@@ -1219,6 +1425,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "mul",
@@ -1231,6 +1439,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22008"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "div",
@@ -1243,6 +1453,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22008", "22012"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "div",
@@ -1255,6 +1467,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22008", "22012"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "add",
@@ -1267,6 +1481,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "sub",
@@ -1279,6 +1495,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 40,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "mul",
@@ -1291,6 +1509,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "div",
@@ -1303,6 +1523,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22003", "22012"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "mod",
@@ -1315,6 +1537,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 50,
     errors: ["22012"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "neg",
@@ -1327,6 +1551,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 60,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "abs",
@@ -1338,6 +1564,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "abs",
@@ -1349,6 +1577,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "round",
@@ -1360,6 +1590,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "round",
@@ -1371,6 +1603,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "round",
@@ -1382,6 +1616,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "round",
@@ -1393,6 +1629,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "abs",
@@ -1404,6 +1642,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ceil",
@@ -1415,6 +1655,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "floor",
@@ -1426,6 +1668,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "trunc",
@@ -1437,6 +1681,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "round",
@@ -1448,6 +1694,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "round",
@@ -1459,6 +1707,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "sqrt",
@@ -1470,6 +1720,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "exp",
@@ -1481,6 +1733,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "ln",
@@ -1492,6 +1746,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "log10",
@@ -1503,6 +1759,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "pow",
@@ -1514,6 +1772,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: ["22003"],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "sin",
@@ -1525,6 +1785,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "cos",
@@ -1536,6 +1798,8 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
   },
   {
     name: "tan",
@@ -1547,6 +1811,21 @@ export const OPERATORS: readonly OperatorDesc[] = [
     null: "propagates",
     precedence: 0,
     errors: [],
+    argNames: [],
+    argDefaults: [],
+  },
+  {
+    name: "make_interval",
+    kind: "function",
+    arity: 7,
+    argFamilies: ["integer", "integer", "integer", "integer", "integer", "integer", "float"],
+    argResolution: "none",
+    result: "interval",
+    null: "propagates",
+    precedence: 0,
+    errors: ["22008"],
+    argNames: ["years", "months", "weeks", "days", "hours", "mins", "secs"],
+    argDefaults: ["0", "0", "0", "0", "0", "0", "0"],
   },
 ];
 

@@ -339,3 +339,79 @@ differential cores plus the new conformance file (exact rows, oracle-verified ag
 PostgreSQL, plus the exact cross-core `# cost:`) are the coverage. Should the planner later
 gain an SRF-specific optimization (e.g. a streaming `LIMIT` short-circuit over a generated
 series), *that* would owe a NoREC relation.
+
+## 11. Named + optional (DEFAULT) arguments — `make_interval`
+
+PostgreSQL lets a call use **named notation** (`f(b => 2, a => 1)`) and lets a function
+declare **DEFAULT** values so trailing arguments may be omitted. jed had neither at the call
+site (it already expresses "optional" the way PG implements most built-ins — by **overloading
+on arity**, e.g. `round/1` + `round/2`, `generate_series/2` + `generate_series/3` — which is
+separate catalog rows, not a default). Named notation and DEFAULTs landed together, driven by
+the first function that needs both: **`make_interval`**.
+
+**The driver — `make_interval(years, months, weeks, days, hours, mins, secs)`.** A scalar
+function (one row, `kind = "function"`) whose every parameter is **named** and **DEFAULTs to
+0**, returning `interval`. It is the natural first consumer because it is unusable without the
+two features: `make_interval(days => 3)` needs named notation to name `days` and DEFAULTs to
+omit the other six. PG's `make_interval` is also genuinely named (`pg_proc.proargnames` is
+set) and defaulted, so the slice is **oracle-checkable from day one** (postgres:18) rather than
+a jed-only divergence — the reason it was chosen over naming an existing built-in like `round`,
+whose PG parameters are nameless (naming them would have been a documented §1/§7 divergence).
+
+**`secs` is `float64` (`double precision`), its true PG type** — available since the float
+slice ([float.md](float.md)). `years…mins` are the `integer` family; `secs` is `float`. The
+value folds into the interval **exactly**: `years/months → months` field (×12), `weeks/days →
+days` field (×7), `hours/mins/secs → micros`, grouped `(((hours*60)+mins)*60)*10⁶ +
+round(secs*10⁶)` as PG does. The one float step — `secs*10⁶` then a half-away-from-zero round
+to an integer — is a single correctly-rounded multiply plus a deterministic round, so the
+result is **in-contract** (byte-identical cross-core, compared exactly — *not* an `R`-exempt
+float render; the float appears only as an input deterministically folded into an exact
+interval). The float→int micro-rounding is jed's one engine-wide mode (half away from zero,
+[float.md](float.md) §6) where PG uses `rint` (half-to-even); they can differ only at an exact
+half-microsecond tie, which realistic `secs` never hit (the corpus uses exactly-representable
+values, so it stays oracle-positive). An `i32` month/day or `i64` micros overflow traps
+**`22008`** (`datetime_field_overflow`, *"interval out of range"*), exactly PG — the constructor
+uses the same checked arithmetic in every core (Rust `checked_*`, Go `mulAdd`/`mul64`, TS
+bigint with per-step i64 checks).
+
+**The data — `arg_names` + `arg_defaults` (catalog).** Two **optional** fields were added to
+the scalar-function (`[[operator]]`) mold ([../functions/catalog.toml](../functions/catalog.toml)):
+
+- `arg_names` — one parameter name per position (length == arity). **Absent ⇒ the function has
+  no parameter names ⇒ named notation on it is `42883`** (PG's behavior for `abs`/`round`/the
+  aggregates, which simply omit the field — so every pre-existing row is unchanged and
+  positional-only).
+- `arg_defaults` — integer-literal default strings for the **trailing** parameters (length ≤
+  arity; a default may occupy only a trailing slot, like PG). An omitted trailing argument is
+  filled with its default at resolve, and the default literal **adapts to its slot's family**
+  (so `make_interval`'s `"0"` becomes `float64 0.0` for `secs`, `int64 0` elsewhere).
+
+Both are codegen'd into the per-core descriptor table (`OperatorDesc`) as data (CLAUDE.md §5) —
+the resolver **reads** the names/defaults rather than re-hardcoding them. `verify.rb` checks the
+shapes (length, no duplicate names, trailing-only defaults, integer-literal defaults) and a
+**cross-overload consistency** rule: a parameter name maps to one position across all overloads
+of a function, so named→slot resolution is well-defined independent of which arity overload
+matches (`make_interval` is single-signature, so this is trivially satisfied today; the rule
+guards future named overloads).
+
+**Resolution — normalize-then-dispatch.** A shared per-core `normalize_named_args` step runs
+*before* the ordinary family dispatch. Given the call's positional + named arguments and the
+catalog row, it builds the positional argument vector of length `arity`: positional args fill
+their index in order; each named arg is placed at its `arg_names` index (unknown name `42883`,
+duplicate / collision `42601`); every still-empty trailing slot is filled from `arg_defaults`,
+and a still-empty *non*-defaulted slot means no overload matches (`42883`). Each resolved
+argument is then resolved **with its declared family as the expected-type hint** — this is what
+lets a bare numeric literal adapt to the `float64` `secs` slot (reusing the existing float
+literal-adaptation path; float is otherwise a strict island), so `make_interval(secs => 1.5)`
+and `make_interval(secs => 2)` work like PG instead of erroring as a family mismatch. Fully
+positional calls take a fast path identical to before (no names, no behavior change). The
+feature is **resolution-only**: the executor, the type system, and the **cost** are untouched —
+a named call charges exactly what its positional twin does (one `operator_eval` + the
+arguments' own costs), asserted in the corpus (`# cost:`).
+
+**Deferred (sequenced follow-ons).** General DEFAULT values for *arbitrary* (non-integer)
+literals and user-defined functions are not built (jed has no UDFs; built-ins use overloads or
+`make_interval`-style 0-defaults). The sibling constructors `make_timestamp` /
+`make_timestamptz` reuse this exact mold (their `sec` is also `float64`). **`VARIADIC` is
+blocked** on the composite `array` type ([CLAUDE.md](../../CLAUDE.md) §4), which is deferred —
+it has no value codec yet — so it waits until `array` lands ([../../TODO.md](../../TODO.md)).

@@ -442,9 +442,15 @@ pub enum Expr {
     /// list — aggregates and `abs` take one, `round` one or two. DISTINCT inside the parens is
     /// rejected at parse (42601). An aggregate in WHERE/ON or nested in another aggregate is
     /// 42803 (spec/design/aggregates.md); a scalar function is legal anywhere an expression is.
+    /// `arg_names` carries PostgreSQL named notation (`name => value`, grammar.md §17): `None`
+    /// ⇒ every argument positional (the common case — no allocation, and the hot `Expr` enum
+    /// stays small); `Some(boxed)` is a per-argument name vector parallel to `args` (`Some(name)`
+    /// for a named slot, `None` for a positional one). Boxed so a plain call does not grow `Expr`.
+    /// The parser enforces that no positional arg follows a named one.
     FuncCall {
         name: String,
         args: Vec<Expr>,
+        arg_names: Option<Box<Vec<Option<String>>>>,
         star: bool,
     },
     /// A scalar subquery `( query_expr )` in expression position (grammar.md §26). `resolve`

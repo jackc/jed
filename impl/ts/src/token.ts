@@ -22,6 +22,8 @@ export type TokenKind =
   | "ge" // >=
   | "doubleColon" // :: — the PostgreSQL typecast operator (expr::type = CAST(expr AS type)); two
   //                colons scanned greedily, a lone ":" is a 42601 error (spec/design/grammar.md §37)
+  | "fatArrow" // => — the named-argument arrow (name => value, PostgreSQL named notation); two
+  //              chars scanned greedily after "=", the legacy ":=" is not jed's surface (grammar.md §17)
   | "param" // a bind parameter $N — `paramIndex` holds the 1-based index (spec/design/api.md §5)
   | "eof"; // end of input
 

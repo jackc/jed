@@ -1311,10 +1311,14 @@ class Parser {
     throw engineError("syntax_error", "expected an expression");
   }
 
-  // parseFunctionCall parses `function_call ::= identifier "(" ( "*" | expr ("," expr)* ) ")"` —
-  // the shared aggregate/scalar call syntax (grammar.md §17). COUNT(*) is the star form; every
-  // other call takes a comma-separated argument list (resolution checks the per-function arity).
-  // DISTINCT inside the parens is deferred (rejected 42601).
+  // parseFunctionCall parses
+  // `function_call ::= identifier "(" ( "*" | function_arg ("," function_arg)* )? ")"` and
+  // `function_arg ::= ( identifier "=>" )? expr` — the shared aggregate/scalar call syntax
+  // (grammar.md §17). COUNT(*) is the star form; the argument list may be empty (a function whose
+  // parameters all DEFAULT, e.g. make_interval()); otherwise it is a comma-separated list of
+  // positional and/or NAMED (name => value) arguments. A positional argument may not follow a
+  // named one (42601). argNames stays empty when every argument is positional. DISTINCT inside the
+  // parens is deferred (rejected 42601). Resolution checks per-function arity and fills defaults.
   private parseFunctionCall(): Expr {
     const name = this.expectIdentifier();
     this.expect("lparen");
@@ -1323,19 +1327,36 @@ class Parser {
       throw engineError("syntax_error", "DISTINCT inside an aggregate is not supported yet");
     }
     const args: Expr[] = [];
+    const names: (string | null)[] = [];
     let star = false;
+    let anyNamed = false;
     if (this.peek().kind === "star") {
       this.advance();
       star = true;
-    } else {
-      args.push(this.parseExpr());
-      while (this.peek().kind === "comma") {
-        this.advance();
+    } else if (this.peek().kind !== "rparen") {
+      // Empty parens (make_interval()) fall through with empty args.
+      for (;;) {
+        // A named argument is `identifier "=>" expr` (grammar.md §17); a two-token lookahead
+        // (word then "=>") distinguishes it from a bare expr that starts with an identifier.
+        let argName: string | null = null;
+        if (this.peek().kind === "word" && this.peekKindAt(1) === "fatArrow") {
+          argName = this.expectIdentifier();
+          this.expect("fatArrow");
+          anyNamed = true;
+        } else if (anyNamed) {
+          // A positional argument may not follow a named one (PostgreSQL, 42601).
+          throw engineError("syntax_error", "positional argument cannot follow named argument");
+        }
         args.push(this.parseExpr());
+        names.push(argName);
+        if (this.peek().kind !== "comma") break;
+        this.advance();
       }
     }
     this.expect("rparen");
-    return { kind: "funcCall", name, args, star };
+    // Keep argNames empty unless a name appeared (the all-positional sentinel — §8).
+    const argNames = anyNamed ? names : [];
+    return { kind: "funcCall", name, args, argNames, star };
   }
 
   // --- cursor helpers ---

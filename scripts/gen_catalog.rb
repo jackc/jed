@@ -75,6 +75,8 @@ def rust_entry(op)
     "        null: #{rust_str(op['null'])},",
     "        precedence: #{op['precedence'] || 0},",
     "        errors: #{rust_slice(op['errors'])},",
+    "        arg_names: #{rust_slice(op['arg_names'] || [])},",
+    "        arg_defaults: #{rust_slice(op['arg_defaults'] || [])},",
     "    },",
   ].join("\n")
 end
@@ -131,9 +133,14 @@ def rust_file(ops, aggs, srfs)
         pub null: &'static str,
         pub precedence: u8,
         pub errors: &'static [&'static str],
+        /// Parameter names for PostgreSQL named notation (functions.md §11); empty = none.
+        pub arg_names: &'static [&'static str],
+        /// Integer-literal DEFAULTs for the trailing parameters; empty = none.
+        pub arg_defaults: &'static [&'static str],
     }
 
     /// Every operator in the catalog, in catalog order.
+    #[rustfmt::skip]
     pub const OPERATORS: &[OperatorDesc] = &[
     #{ops.map { |op| rust_entry(op) }.join("\n")}
     ];
@@ -153,6 +160,7 @@ def rust_file(ops, aggs, srfs)
     }
 
     /// Every aggregate in the catalog, in catalog order.
+    #[rustfmt::skip]
     pub const AGGREGATES: &[AggregateDesc] = &[
     #{aggs.map { |ag| rust_agg_entry(ag) }.join("\n")}
     ];
@@ -175,6 +183,7 @@ def rust_file(ops, aggs, srfs)
     }
 
     /// Every set-returning function in the catalog, in catalog order.
+    #[rustfmt::skip]
     pub const SET_RETURNING: &[SetReturningDesc] = &[
     #{srfs.map { |sf| rust_srf_entry(sf) }.join("\n")}
     ];
@@ -198,6 +207,8 @@ def go_entry(op)
     ["Null",          go_str(op["null"])],
     ["Precedence",    (op["precedence"] || 0).to_s],
     ["Errors",        go_slice(op["errors"])],
+    ["ArgNames",      go_slice(op["arg_names"] || [])],
+    ["ArgDefaults",   go_slice(op["arg_defaults"] || [])],
   ]
   w = fields.map { |k, _| k.length }.max
   lines = fields.map { |k, v| "\t\t#{k}:#{' ' * (w - k.length + 1)}#{v}," }
@@ -260,6 +271,10 @@ def go_file(ops, aggs, srfs)
     \tNull          string
     \tPrecedence    int
     \tErrors        []string
+    \t// ArgNames holds the parameter names for PostgreSQL named notation (functions.md §11);
+    \t// empty = none. ArgDefaults holds integer-literal DEFAULTs for the trailing parameters.
+    \tArgNames    []string
+    \tArgDefaults []string
     }
 
     // Operators lists every operator in the catalog, in catalog order.
@@ -327,6 +342,8 @@ def ts_entry(op)
   lines << "    null: #{ts_str(op['null'])},"
   lines << "    precedence: #{op['precedence'] || 0},"
   lines << "    errors: #{ts_arr(op['errors'])},"
+  lines << "    argNames: #{ts_arr(op['arg_names'] || [])},"
+  lines << "    argDefaults: #{ts_arr(op['arg_defaults'] || [])},"
   lines << "  },"
   lines.join("\n")
 end
@@ -381,6 +398,10 @@ def ts_file(ops, aggs, srfs)
       null: string;
       precedence: number;
       errors: readonly string[];
+      // Parameter names for PostgreSQL named notation (functions.md §11); empty = none.
+      argNames: readonly string[];
+      // Integer-literal DEFAULTs for the trailing parameters; empty = none.
+      argDefaults: readonly string[];
     }
 
     // Every operator in the catalog, in catalog order.

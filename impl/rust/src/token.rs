@@ -42,6 +42,10 @@ pub enum Token {
     /// The `::` PostgreSQL typecast operator (`expr::type` = `CAST(expr AS type)`). Two colons,
     /// scanned greedily; a lone `:` is a 42601 syntax error. See spec/design/grammar.md §37.
     DoubleColon,
+    /// The `=>` named-argument arrow (`name => value`, PostgreSQL named notation). Two chars,
+    /// scanned greedily after `=`; the legacy `:=` spelling is not part of jed's surface. See
+    /// spec/design/grammar.md §17.
+    FatArrow,
     /// End of input.
     Eof,
 }

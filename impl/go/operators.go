@@ -20,6 +20,10 @@ type OperatorDesc struct {
 	Null          string
 	Precedence    int
 	Errors        []string
+	// ArgNames holds the parameter names for PostgreSQL named notation (functions.md §11);
+	// empty = none. ArgDefaults holds integer-literal DEFAULTs for the trailing parameters.
+	ArgNames    []string
+	ArgDefaults []string
 }
 
 // Operators lists every operator in the catalog, in catalog order.
@@ -35,6 +39,8 @@ var Operators = []OperatorDesc{
 		Null:          "kleene",
 		Precedence:    10,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "and",
@@ -47,6 +53,8 @@ var Operators = []OperatorDesc{
 		Null:          "kleene",
 		Precedence:    20,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "not",
@@ -59,6 +67,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    30,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "eq",
@@ -71,6 +81,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "lt",
@@ -83,6 +95,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "gt",
@@ -95,6 +109,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "le",
@@ -107,6 +123,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ge",
@@ -119,6 +137,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_distinct_from",
@@ -131,6 +151,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -143,6 +165,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "eq",
@@ -155,6 +179,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "lt",
@@ -167,6 +193,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "gt",
@@ -179,6 +207,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "le",
@@ -191,6 +221,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ge",
@@ -203,6 +235,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_distinct_from",
@@ -215,6 +249,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -227,6 +263,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "like",
@@ -239,6 +277,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{"22025"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "eq",
@@ -251,6 +291,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "lt",
@@ -263,6 +305,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "gt",
@@ -275,6 +319,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "le",
@@ -287,6 +333,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ge",
@@ -299,6 +347,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_distinct_from",
@@ -311,6 +361,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -323,6 +375,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "eq",
@@ -335,6 +389,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "lt",
@@ -347,6 +403,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "gt",
@@ -359,6 +417,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "le",
@@ -371,6 +431,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ge",
@@ -383,6 +445,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_distinct_from",
@@ -395,6 +459,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -407,6 +473,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "eq",
@@ -419,6 +487,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "lt",
@@ -431,6 +501,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "gt",
@@ -443,6 +515,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "le",
@@ -455,6 +529,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ge",
@@ -467,6 +543,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_distinct_from",
@@ -479,6 +557,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -491,6 +571,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "eq",
@@ -503,6 +585,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "lt",
@@ -515,6 +599,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "gt",
@@ -527,6 +613,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "le",
@@ -539,6 +627,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ge",
@@ -551,6 +641,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_distinct_from",
@@ -563,6 +655,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -575,6 +669,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "eq",
@@ -587,6 +683,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "lt",
@@ -599,6 +697,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "gt",
@@ -611,6 +711,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "le",
@@ -623,6 +725,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ge",
@@ -635,6 +739,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_distinct_from",
@@ -647,6 +753,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -659,6 +767,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "eq",
@@ -671,6 +781,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "lt",
@@ -683,6 +795,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "gt",
@@ -695,6 +809,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "le",
@@ -707,6 +823,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ge",
@@ -719,6 +837,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_distinct_from",
@@ -731,6 +851,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -743,6 +865,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "eq",
@@ -755,6 +879,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "lt",
@@ -767,6 +893,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "gt",
@@ -779,6 +907,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "le",
@@ -791,6 +921,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ge",
@@ -803,6 +935,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_distinct_from",
@@ -815,6 +949,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -827,6 +963,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "eq",
@@ -839,6 +977,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "lt",
@@ -851,6 +991,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "gt",
@@ -863,6 +1005,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "le",
@@ -875,6 +1019,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ge",
@@ -887,6 +1033,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_distinct_from",
@@ -899,6 +1047,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -911,6 +1061,8 @@ var Operators = []OperatorDesc{
 		Null:          "null_safe",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_null",
@@ -923,6 +1075,8 @@ var Operators = []OperatorDesc{
 		Null:          "detects",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "is_not_null",
@@ -935,6 +1089,8 @@ var Operators = []OperatorDesc{
 		Null:          "detects",
 		Precedence:    35,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "add",
@@ -947,6 +1103,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "sub",
@@ -959,6 +1117,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "mul",
@@ -971,6 +1131,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "div",
@@ -983,6 +1145,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22003", "22012"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "mod",
@@ -995,6 +1159,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22003", "22012"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "neg",
@@ -1007,6 +1173,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    60,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "add",
@@ -1019,6 +1187,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "sub",
@@ -1031,6 +1201,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "mul",
@@ -1043,6 +1215,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "div",
@@ -1055,6 +1229,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22003", "22012"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "mod",
@@ -1067,6 +1243,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22012"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "neg",
@@ -1079,6 +1257,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    60,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "add",
@@ -1091,6 +1271,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "sub",
@@ -1103,6 +1285,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "neg",
@@ -1115,6 +1299,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    60,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "add",
@@ -1127,6 +1313,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "add",
@@ -1139,6 +1327,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "sub",
@@ -1151,6 +1341,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "add",
@@ -1163,6 +1355,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "add",
@@ -1175,6 +1369,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "sub",
@@ -1187,6 +1383,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "sub",
@@ -1199,6 +1397,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "sub",
@@ -1211,6 +1411,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "mul",
@@ -1223,6 +1425,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "mul",
@@ -1235,6 +1439,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "mul",
@@ -1247,6 +1453,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "mul",
@@ -1259,6 +1467,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22008"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "div",
@@ -1271,6 +1481,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22008", "22012"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "div",
@@ -1283,6 +1495,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22008", "22012"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "add",
@@ -1295,6 +1509,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "sub",
@@ -1307,6 +1523,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    40,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "mul",
@@ -1319,6 +1537,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "div",
@@ -1331,6 +1551,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22003", "22012"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "mod",
@@ -1343,6 +1565,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    50,
 		Errors:        []string{"22012"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "neg",
@@ -1355,6 +1579,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    60,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "abs",
@@ -1367,6 +1593,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "abs",
@@ -1379,6 +1607,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "round",
@@ -1391,6 +1621,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "round",
@@ -1403,6 +1635,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "round",
@@ -1415,6 +1649,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "round",
@@ -1427,6 +1663,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "abs",
@@ -1439,6 +1677,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ceil",
@@ -1451,6 +1691,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "floor",
@@ -1463,6 +1705,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "trunc",
@@ -1475,6 +1719,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "round",
@@ -1487,6 +1733,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "round",
@@ -1499,6 +1747,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "sqrt",
@@ -1511,6 +1761,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "exp",
@@ -1523,6 +1775,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "ln",
@@ -1535,6 +1789,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "log10",
@@ -1547,6 +1803,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "pow",
@@ -1559,6 +1817,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{"22003"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "sin",
@@ -1571,6 +1831,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "cos",
@@ -1583,6 +1845,8 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
 	},
 	{
 		Name:          "tan",
@@ -1595,6 +1859,22 @@ var Operators = []OperatorDesc{
 		Null:          "propagates",
 		Precedence:    0,
 		Errors:        []string{},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
+	},
+	{
+		Name:          "make_interval",
+		Symbol:        "",
+		Kind:          "function",
+		Arity:         7,
+		ArgFamilies:   []string{"integer", "integer", "integer", "integer", "integer", "integer", "float"},
+		ArgResolution: "none",
+		Result:        "interval",
+		Null:          "propagates",
+		Precedence:    0,
+		Errors:        []string{"22008"},
+		ArgNames:      []string{"years", "months", "weeks", "days", "hours", "mins", "secs"},
+		ArgDefaults:   []string{"0", "0", "0", "0", "0", "0", "0"},
 	},
 }
 

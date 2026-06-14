@@ -1514,11 +1514,15 @@ impl Parser {
         }
     }
 
-    /// `function_call ::= identifier "(" ( "*" | expr ("," expr)* ) ")"` — the shared
-    /// aggregate/scalar call syntax (grammar.md §17). `COUNT(*)` is the `star` form; every
-    /// other call takes a comma-separated argument list (resolution checks the per-function
-    /// arity). DISTINCT inside the parens is deferred (rejected 42601). The function name is
-    /// resolved (case-insensitively) against the catalog later.
+    /// `function_call ::= identifier "(" ( "*" | function_arg ("," function_arg)* )? ")"` and
+    /// `function_arg ::= ( identifier "=>" )? expr` — the shared aggregate/scalar call syntax
+    /// (grammar.md §17). `COUNT(*)` is the `star` form; the argument list may be empty (a
+    /// function whose parameters all DEFAULT, e.g. `make_interval()`); otherwise it is a
+    /// comma-separated list of positional and/or NAMED (`name => value`) arguments. A positional
+    /// argument may not follow a named one (42601). `arg_names` stays empty when every argument
+    /// is positional (byte-identical to a pre-named call); resolution checks per-function arity,
+    /// rejects named notation on a function with no parameter names, and fills defaults. The
+    /// function name is resolved (case-insensitively) against the catalog later.
     fn parse_function_call(&mut self) -> Result<Expr> {
         let name = self.expect_identifier()?;
         self.expect(&Token::LParen)?;
@@ -1526,19 +1530,56 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("distinct") {
             return Err(syntax("DISTINCT inside an aggregate is not supported yet"));
         }
-        let (args, star) = if matches!(self.peek(), Token::Star) {
+        let mut args = Vec::new();
+        let mut arg_names: Vec<Option<String>> = Vec::new();
+        let mut any_named = false;
+        let star = if matches!(self.peek(), Token::Star) {
             self.advance();
-            (Vec::new(), true)
+            true
+        } else if matches!(self.peek(), Token::RParen) {
+            // Empty argument list (make_interval()) — leave args/arg_names empty.
+            false
         } else {
-            let mut args = vec![self.parse_expr()?];
-            while matches!(self.peek(), Token::Comma) {
-                self.advance();
+            loop {
+                // A named argument is `identifier "=>" expr` (grammar.md §17); a two-token
+                // lookahead (Word then `=>`) distinguishes it from a bare expr that starts with
+                // an identifier (a column reference).
+                let argname = if matches!(self.peek(), Token::Word(_))
+                    && matches!(self.peek_at(1), Token::FatArrow)
+                {
+                    let nm = self.expect_identifier()?;
+                    self.expect(&Token::FatArrow)?;
+                    any_named = true;
+                    Some(nm)
+                } else if any_named {
+                    // A positional argument may not follow a named one (PostgreSQL, 42601).
+                    return Err(syntax("positional argument cannot follow named argument"));
+                } else {
+                    None
+                };
                 args.push(self.parse_expr()?);
+                arg_names.push(argname);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
             }
-            (args, false)
+            false
         };
         self.expect(&Token::RParen)?;
-        Ok(Expr::FuncCall { name, args, star })
+        // None unless a name appeared (the all-positional sentinel — §8 — keeping `Expr` small).
+        let arg_names = if any_named {
+            Some(Box::new(arg_names))
+        } else {
+            None
+        };
+        Ok(Expr::FuncCall {
+            name,
+            args,
+            arg_names,
+            star,
+        })
     }
 
     /// `column_ref ::= identifier ("." identifier)?` — a bare column name, or a qualified
@@ -1681,6 +1722,7 @@ fn render_token(t: &Token) -> String {
         Token::Le => "<=".into(),
         Token::Ge => ">=".into(),
         Token::DoubleColon => "::".into(),
+        Token::FatArrow => "=>".into(),
         Token::Eof => String::new(),
     }
 }

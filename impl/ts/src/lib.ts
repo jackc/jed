@@ -104,6 +104,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // spec/design/functions.md §9.
   "func.abs",
   "func.round",
+  // Named-argument notation + DEFAULT parameter values, via make_interval — functions.md §11.
+  "func.named_arguments",
   "null.three_valued",
   "compare.promotion",
   "cast.explicit",

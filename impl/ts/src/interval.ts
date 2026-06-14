@@ -73,6 +73,32 @@ export function intervalSub(a: Interval, b: Interval): Interval {
   };
 }
 
+// makeInterval builds an interval from PostgreSQL make_interval's components (functions.md §11).
+// years/months fold into the months field (×12), weeks/days into the days field (×7), and
+// hours/mins plus the caller's pre-converted secMicros into the micros field — grouped
+// (((hours*60)+mins)*60)*1e6 + secMicros like PG, checking i64 at each step like the other cores.
+// All math here is exact bigint integer (the one float step, secs → secMicros, lives in the
+// executor). Any i32 month/day or i64 micros overflow traps 22008.
+export function makeInterval(
+  years: bigint,
+  months: bigint,
+  weeks: bigint,
+  days: bigint,
+  hours: bigint,
+  mins: bigint,
+  secMicros: bigint,
+): Interval {
+  const monthsTotal = years * MONTHS_PER_YEAR + months;
+  const daysTotal = weeks * 7n + days;
+  const hm = checkedI64(hours * 60n + mins); // total minutes
+  const sec = checkedI64(hm * 60n); // total seconds
+  const micros = checkedI64(checkedI64(sec * MICROS_PER_SEC) + secMicros);
+  if (monthsTotal < I32_MIN || monthsTotal > I32_MAX || daysTotal < I32_MIN || daysTotal > I32_MAX) {
+    throw intervalFieldOverflow("interval out of range");
+  }
+  return { months: Number(monthsTotal), days: Number(daysTotal), micros };
+}
+
 // intervalNeg negates all three fields. i32::MIN / i64::MIN would overflow → 22008.
 export function intervalNeg(a: Interval): Interval {
   return {

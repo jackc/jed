@@ -589,8 +589,9 @@ column list and `DEFAULT` keyword apply unchanged when the source is a `SELECT` 
 ## 17. Function-call syntax, aggregate and scalar functions
 
 The `primary` rule gains a `function_call` production — `function_call ::= identifier "("
-( "*" | expr ( "," expr )* ) ")"` — the engine's call syntax, shared by aggregate and
-scalar functions. The *semantics* (what each aggregate computes, the SUM/AVG widening, the
+( "*" | function_arg ( "," function_arg )* )? ")"` with `function_arg ::= ( identifier "=>"
+)? expr` — the engine's call syntax, shared by aggregate and scalar functions, now including
+PostgreSQL **named notation** and an **empty** argument list (see "Named notation" below). The *semantics* (what each aggregate computes, the SUM/AVG widening, the
 NULL / empty-set rules, the grouping rules) live in [aggregates.md](aggregates.md), and the
 scalar-function semantics in [functions.md](functions.md) §9; this section is the **syntax**
 and the disambiguation, the established grammar.md/semantics split (§15 does the same for
@@ -637,6 +638,29 @@ per input row: an aggregate in a `WHERE` clause, a `JOIN ON`, or a `GROUP BY` ke
 aggregate **nested** in another aggregate, are all **`42803`** (`grouping_error`). Filtering
 on an aggregate is `HAVING`'s job (a later slice). The output name of an un-aliased aggregate
 is its lowercased function name (§8).
+
+**Named notation + DEFAULT arguments (PostgreSQL named args).** A `function_arg` may be
+written `name => expr` (named notation), and the whole argument list may be **empty** — both
+landed with `make_interval`, the engine's first named + defaulted function
+([functions.md](functions.md) §11). Three rules, parser-enforced and **byte-identical across
+the three cores** (another §8 determinism surface, like the one-token call lookahead above):
+
+1. **Two-token lookahead.** A named argument is distinguished from a bare `expr` that happens
+   to start with an identifier by peeking **two** tokens: a `word` immediately followed by the
+   `=>` arrow is `name => …`; anything else is positional. The `=>` arrow is a single lexer
+   token (greedy after `=`, like `::` / `<=`). The legacy `:=` spelling PostgreSQL also accepts
+   is **not** part of jed's surface — jed has no `:` token, and `=>` alone is the modern,
+   unambiguous form — so `f(a := 1)` is a `42601` syntax error (a deliberate, documented
+   narrowing; the conformance override ledger records it).
+2. **No positional after named.** Once a named argument appears, a later positional one is
+   `42601` (`positional argument cannot follow named argument`) — PostgreSQL's rule.
+3. **Resolve-time mapping.** Whether named notation is *allowed*, how names map to parameter
+   slots, how omitted trailing arguments are filled from DEFAULTs, and the errors for an
+   unknown name (`42883`), a name on a function with no parameter names (`42883`), or a
+   duplicate name (`42601`) are **resolve-time** concerns driven by the catalog's
+   `arg_names` / `arg_defaults` data — see [functions.md](functions.md) §11. The grammar only
+   carries the per-argument optional name to resolve; an all-positional call carries none (so
+   it is byte-identical to a pre-named-notation parse).
 
 ## 18. `GROUP BY`
 

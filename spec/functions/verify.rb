@@ -35,6 +35,11 @@
 #      null is "empty_on_null"; column is a non-empty string. "promote" requires each
 #      operand family to have a promotion rule (NOT a comparable pair — an SRF widens its
 #      own args among themselves, it never compares two families). (name, arity) is unique.
+#  13. OPTIONAL named/default args (scalar functions — functions.md §11): if present,
+#      arg_names is a string array of length == arity with no duplicates; arg_defaults is a
+#      string array of integer literals, length ≤ arity, filling only TRAILING slots. Across
+#      a function's overloads a parameter name maps to one position (so named→slot resolution
+#      is overload-independent).
 #
 # Exit 0 = catalog is internally coherent and cross-references resolve; nonzero =
 # the offending problem.
@@ -94,6 +99,7 @@ def main
 
   name_sigs = []   # [name, arg_families] — unique per overload
   symbol_sigs = [] # [symbol, kind, arity, arg_families] — unique per overload
+  param_pos = {}   # [name, param_name] => position — cross-overload name→slot consistency
 
   operators.each do |op|
     id = op["name"] || "(unnamed)"
@@ -154,6 +160,33 @@ def main
     # (7) declared errors exist in the registry
     (op["errors"] || []).each do |code|
       fail!("operator #{id}: error code #{code.inspect} is not in registry.toml") unless error_codes.include?(code)
+    end
+
+    # (13) optional named/default arguments (scalar functions — functions.md §11).
+    if op.key?("arg_names")
+      names = op["arg_names"]
+      fail!("operator #{id}: arg_names must be an array") unless names.is_a?(Array)
+      fail!("operator #{id}: arg_names length #{names.length} != arity #{op['arity']}") unless names.length == op["arity"]
+      names.each do |nm|
+        fail!("operator #{id}: arg_names entry #{nm.inspect} must be a non-empty string") unless nm.is_a?(String) && !nm.empty?
+      end
+      fail!("operator #{id}: duplicate parameter name in arg_names #{names.inspect}") unless names.uniq.length == names.length
+      # cross-overload consistency: a parameter name maps to one position for this function.
+      names.each_with_index do |pn, i|
+        key = [op["name"], pn]
+        if param_pos.key?(key) && param_pos[key] != i
+          fail!("operator #{id}: parameter #{pn.inspect} maps to position #{param_pos[key]} and #{i} across overloads of #{op['name']}")
+        end
+        param_pos[key] = i
+      end
+    end
+    if op.key?("arg_defaults")
+      defs = op["arg_defaults"]
+      fail!("operator #{id}: arg_defaults must be an array") unless defs.is_a?(Array)
+      fail!("operator #{id}: arg_defaults length #{defs.length} > arity #{op['arity']}") if defs.length > op["arity"]
+      defs.each do |d|
+        fail!("operator #{id}: arg_defaults entry #{d.inspect} must be an integer-literal string") unless d.is_a?(String) && d.match?(/\A-?\d+\z/)
+      end
     end
 
     # (9) collect for uniqueness — keyed by operand-family signature, so an operator

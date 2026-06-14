@@ -297,6 +297,44 @@ fn field_overflow(detail: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::DatetimeFieldOverflow, detail.into())
 }
 
+/// Build an interval from PostgreSQL `make_interval`'s components (spec/design/functions.md §11).
+/// `years`/`months` fold into the months field (×12), `weeks`/`days` into the days field (×7),
+/// and `hours`/`mins` plus the caller's pre-converted `sec_micros` into the micros field —
+/// grouped `(((hours*60)+mins)*60)*1e6 + sec_micros` like PG. All math here is EXACT integer
+/// (the one float step, `secs` → `sec_micros`, lives in the executor so this module stays
+/// float-free — see the module note). Any i32 month/day or i64 micros overflow traps 22008.
+pub fn make_interval(
+    years: i64,
+    months: i64,
+    weeks: i64,
+    days: i64,
+    hours: i64,
+    mins: i64,
+    sec_micros: i64,
+) -> Result<Interval> {
+    let oor = || field_overflow("interval out of range");
+    let months_total = years
+        .checked_mul(MONTHS_PER_YEAR)
+        .and_then(|y| y.checked_add(months))
+        .ok_or_else(oor)?;
+    let days_total = weeks
+        .checked_mul(7)
+        .and_then(|w| w.checked_add(days))
+        .ok_or_else(oor)?;
+    let micros = hours
+        .checked_mul(60)
+        .and_then(|h| h.checked_add(mins)) // total minutes
+        .and_then(|m| m.checked_mul(60)) // total seconds
+        .and_then(|s| s.checked_mul(MICROS_PER_SEC))
+        .and_then(|t| t.checked_add(sec_micros))
+        .ok_or_else(oor)?;
+    Ok(Interval {
+        months: i32::try_from(months_total).map_err(|_| oor())?,
+        days: i32::try_from(days_total).map_err(|_| oor())?,
+        micros,
+    })
+}
+
 /// An ASCII-whitespace byte — the fixed set separating/trimming interval tokens (not
 /// locale/Unicode-dependent, identical across cores).
 fn is_ws(b: u8) -> bool {

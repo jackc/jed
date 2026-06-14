@@ -82,6 +82,26 @@ func (iv Interval) Sub(o Interval) (Interval, error) {
 	return Interval{Months: months, Days: days, Micros: micros}, nil
 }
 
+// MakeInterval builds an interval from PostgreSQL make_interval's components (functions.md §11).
+// years/months fold into the months field (×12), weeks/days into the days field (×7), and
+// hours/mins plus the caller's pre-converted secMicros into the micros field — grouped
+// (((hours*60)+mins)*60)*1e6 + secMicros like PG. All math here is exact integer (the one float
+// step, secs → secMicros, lives in the executor so this stays float-free). Any i32 month/day or
+// i64 micros overflow traps 22008.
+func MakeInterval(years, months, weeks, days, hours, mins, secMicros int64) (Interval, error) {
+	monthsTotal, ok1 := mulAdd(years, monthsPerYear, months)
+	daysTotal, ok2 := mulAdd(weeks, 7, days)
+	hm, ok3 := mulAdd(hours, 60, mins) // total minutes
+	sec, ok4 := mul64(hm, 60)          // total seconds
+	micros, ok5 := mulAdd(sec, microsPerSec, secMicros)
+	if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 ||
+		monthsTotal < -2147483648 || monthsTotal > 2147483647 ||
+		daysTotal < -2147483648 || daysTotal > 2147483647 {
+		return Interval{}, intervalFieldOverflow("interval out of range")
+	}
+	return Interval{Months: int32(monthsTotal), Days: int32(daysTotal), Micros: micros}, nil
+}
+
 // Neg negates all three fields. i32::MIN / i64::MIN would overflow → 22008.
 func (iv Interval) Neg() (Interval, error) {
 	if iv.Months == -2147483648 || iv.Days == -2147483648 || iv.Micros == -9223372036854775808 {

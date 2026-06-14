@@ -263,6 +263,13 @@ func TestOperatorsMatchSpec(t *testing.T) {
 		if strings.Join(desc.Errors, ",") != strings.Join(row.strs("errors"), ",") {
 			t.Errorf("%s: errors mismatch", name)
 		}
+		// Optional named/default-argument metadata (functions.md §11); absent ⇒ empty slice.
+		if strings.Join(desc.ArgNames, ",") != strings.Join(row.strs("arg_names"), ",") {
+			t.Errorf("%s: arg_names mismatch", name)
+		}
+		if strings.Join(desc.ArgDefaults, ",") != strings.Join(row.strs("arg_defaults"), ",") {
+			t.Errorf("%s: arg_defaults mismatch", name)
+		}
 		if row.has("symbol") {
 			if desc.Symbol != row.str("symbol") {
 				t.Errorf("%s: symbol got %q want %q", name, desc.Symbol, row.str("symbol"))

@@ -261,6 +261,26 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       [suites/expr/scalar_functions.test](spec/conformance/suites/expr/scalar_functions.test).
       No new type / on-disk-format change. Follow-ons: `ceil`/`floor`/`mod`/`sign`, text
       `length`/`lower`/`upper`, a general implicit argument-coercion pass. _(size: M; deps: expression evaluator, decimal)_
+- [x] **Named + optional (DEFAULT) function arguments** — PostgreSQL named notation
+      (`f(name => value)`) + DEFAULT parameter values, driven by **`make_interval`**, the
+      engine's first named + defaulted function ([functions.md](spec/design/functions.md) §11).
+      Done across Rust/Go/TS (conformance byte-identical, PG-oracle-verified, incl. cross-core
+      `# cost:`). New `=>` lexer token; the `function_call` grammar gains `function_arg ::= (
+      identifier "=>" )? expr` + an empty arg list ([grammar.md](spec/design/grammar.md) §17);
+      the `FuncCall`/`FuncCallExpr` AST gains an optional per-arg name (boxed/optional so the hot
+      `Expr` enum doesn't grow). Two **optional** catalog fields `arg_names` / `arg_defaults`
+      (codegen'd into the descriptor; `verify.rb` checks shape + cross-overload name→slot
+      consistency) drive a resolve-time **normalize-then-dispatch**: positional/named args +
+      DEFAULTs map onto the parameter slots, each resolved with its declared family as the
+      type-hint so a bare numeric literal adapts to `make_interval`'s `float64` `secs`. Errors:
+      unknown name / named-on-nameless / too many args → `42883`; positional-after-named /
+      duplicate name → `42601`; the legacy `:=` spelling → `42601` (a deliberate narrowing — PG
+      accepts it; override-ledgered); interval field overflow → `22008`. Resolution-only — the
+      executor, type system, and cost are untouched. Capability `func.named_arguments`;
+      conformance [suites/expr/make_interval.test](spec/conformance/suites/expr/make_interval.test).
+      No on-disk-format change. **Follow-ons:** `make_timestamp`/`make_timestamptz` (same mold,
+      `sec` also `float64`); general non-integer/UDF defaults; **`VARIADIC`** — *blocked on the
+      `array` type* (CLAUDE.md §4, deferred — no value codec yet). _(size: M; deps: scalar functions, interval, float)_
 - [x] **Multi-row `INSERT`** (`VALUES (..),(..)`). Done: `INSERT INTO t VALUES (..),(..)`
       accepts one or more parenthesized rows, **two-phase / all-or-nothing** like `UPDATE`
       (CLAUDE.md §11 step 6) — every row is fully validated (arity → `42601`, type/range →

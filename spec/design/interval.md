@@ -178,6 +178,17 @@ exact integer/decimal math** (no float in the value path — CLAUDE.md §8), rou
 half away from zero. The two agree on all "nice" factors and differ only on sub-unit ties (the same
 class as the half-away-vs-half-even timestamp-fraction divergence). Recorded in the override ledger.
 
+**Construction — `make_interval(years, months, weeks, days, hours, mins, secs)`.** The interval
+*constructor* is jed's first **named + defaulted** function (every parameter named, DEFAULT 0;
+[functions.md](functions.md) §11). `years/months` fold into the `months` field (×12), `weeks/days`
+into `days` (×7), `hours/mins/secs` into `micros`. The integer-field math stays exact (this module's
+`make_interval` helper, checked `i32`/`i64` → `22008`); the **one** float step — PG's `secs`
+(`double precision`) `× 10⁶`, rounded half away from zero to a µs integer — lives in the *executor*
+so the interval module stays float-free, and because it is a single correctly-rounded multiply the
+resulting interval is **in-contract** (byte-identical cross-core, not an `R`-exempt float). It shares
+the `× / number` half-away-vs-half-even sub-µs tie divergence above (avoided in the corpus by using
+exactly-representable `secs`).
+
 ## 6. Literals, casts, keys, cost
 
 - **Literals.** A single-quoted string adapts in an interval context (§3); the `INTERVAL '…'`

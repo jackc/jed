@@ -95,8 +95,15 @@ export function lex(sql: string): Token[] {
         throw engineError("syntax_error", "unexpected character ':'");
       }
     } else if (c === "=") {
-      tokens.push({ kind: "eq" });
-      i++;
+      // `=>` is the named-argument arrow (grammar.md §17), scanned greedily as one token;
+      // a bare `=` is the equality operator.
+      if (i + 1 < n && sql[i + 1] === ">") {
+        tokens.push({ kind: "fatArrow" });
+        i += 2;
+      } else {
+        tokens.push({ kind: "eq" });
+        i++;
+      }
     } else if (c === "<") {
       if (i + 1 < n && sql[i + 1] === "=") {
         tokens.push({ kind: "le" });
