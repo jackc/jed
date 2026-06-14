@@ -70,6 +70,16 @@ strategy = "none"
 family = "interval"
 strategy = "none"
 
+# float (float32, float64) forms a PROMOTION TOWER like the integers (strategy = "max-rank"):
+# when two floats of different width meet, both widen to the higher-rank type (float32 -> float64,
+# lossless) before comparison/arithmetic — exactly the integer rule, and matching PG (real promotes
+# to double). There is deliberately NO CROSS-family float reconciliation: int/decimal × float is a
+# 42804 type error (no comparable rule below) — float is a strict island requiring an explicit cast,
+# UNLIKE PG which promotes the other operand to float (a documented divergence — ../design/float.md §6).
+[[promotion]]
+family = "float"
+strategy = "max-rank"
+
 # --- comparability -----------------------------------------------------------
 # Which (family, family) pairs may be compared at all. Anything not listed is a
 # type error. Step 1 has exactly one family, so there is one rule. Cross-family
@@ -161,6 +171,17 @@ left_family = "interval"
 right_family = "interval"
 via = "none"
 
+# float × float (either width). via = "promote": a mixed-width pair widens to the higher rank
+# (float32 -> float64) via the tower, then compares. Operands compare by the TOTAL order (below):
+# -0 = +0, NaN = NaN, NaN is the largest value (PG float btree order — NOT raw IEEE, where NaN is
+# unordered). So `NaN = NaN` is TRUE and two NaNs dedup. float vs ANY other family (incl. integer
+# and decimal) is NOT listed, so it is a 42804 type error — float is a strict island, requiring an
+# explicit cast (../design/float.md §3, §6).
+[[comparable]]
+left_family = "float"
+right_family = "float"
+via = "promote"
+
 # --- value ordering ----------------------------------------------------------
 # The total order over non-NULL integers used by ORDER BY and by index/key
 # iteration. Plain signed numeric order; matches the order-preserving key
@@ -207,6 +228,15 @@ timestamptz = "numeric-ascending"
 # authored this slice (interval is not yet a key), so there is no "stored byte order == logical
 # order" claim to make for it — ordering is the in-memory span comparison only.
 interval = "span-ascending"
+# float64 orders by the PG float8 TOTAL order (not raw IEEE): -Infinity < every finite value <
+# +Infinity < NaN, with -0 = +0 and NaN = NaN (NaN is the single largest value, above +Infinity).
+# This makes ORDER BY / DISTINCT / GROUP BY / MIN / MAX total and deterministic over a type that
+# is otherwise only partially ordered by IEEE. The order-preserving key encoding (scalars.toml
+# "float-order-preserving", ../design/encoding.md §2.8) reproduces THIS order in raw bytes
+# (canonicalize -0 and NaN, then the sign-flip bit transform) — authored but UNEXERCISED this
+# slice (float64 is not yet a key). Note the contrast with timestamp (no NaN, so totally ordered
+# for free) and decimal (excludes NaN/∞ entirely); float carries them as real, ordered values.
+float = "float-total-order"
 
 # NULL's position in the physical total order of encoded keys (index/key
 # iteration), RATIFIED with the key-encoding spec (CLAUDE.md §11 step 4) and

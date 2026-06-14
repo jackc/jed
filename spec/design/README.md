@@ -20,6 +20,10 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   per-core cross-check.
 - [conformance.md](conformance.md) — the conformance corpus: sqllogictest-style format,
   structured-error matching, the tier + capability-flag system, and determinism rules.
+- [determinism.md](determinism.md) — the determinism contract decomposed into four
+  guarantees, the taxonomy of sanctioned relaxations (underspecified order, boundary inputs,
+  approximate/float, identity, plan/parallelism), the clock/entropy seams, the
+  no-contamination invariant, and the exception ledger (CLAUDE.md §2/§8/§10/§13).
 - [encoding.md](encoding.md) — order-preserving key encoding: the `int-be-signflip` rule,
   the nullable presence tag (NULLs-last, the PostgreSQL model), composition, and descending
   order.

@@ -1,0 +1,51 @@
+# Determinism-exception ledger (CLAUDE.md §2/§8/§10/§13; ../design/determinism.md).
+#
+# Determinism is DEFAULT-DENY (determinism.md §1): an engine behavior that relaxes any of the
+# four determinism guarantees — G1 reproducibility, G2 cross-core identity, G3 cross-platform
+# identity, G4 contract granularity — is a BUG unless it has an entry HERE. This is the cross-core
+# analogue of oracle_overrides.toml (which ledgers deliberate PostgreSQL divergences); this file
+# ledgers deliberate DETERMINISM divergences. Each entry names the surface, which guarantee it
+# drops, the BOUNDED blast radius (determinism.md §4 — non-contamination), and how the corpus
+# still tests it. An exempted behavior with no entry is a failure.
+#
+#   id            stable kebab-case slug
+#   surface       the function / type / behavior the exception covers
+#   class         U | B | A | I | P  (determinism.md §2 taxonomy by source)
+#   drops         which guarantees are surrendered (subset of G1/G2/G3/G4); the rest are kept
+#   blast_radius  how far the non-determinism reaches, and what bounds it (determinism.md §4)
+#   test          how the corpus still catches real bugs in it
+#   status        ratified | proposed | unratified
+#   reason        why the non-determinism is intrinsic (not an accidental artifact)
+
+# --- float64: transcendental function values ---------------------------------
+[[exception]]
+id           = "float-transcendental"
+surface      = "exp, ln, log10, pow, sin, cos, tan over float32/float64 (../design/float.md §8)"
+class        = "A"
+drops        = ["G2", "G3"]
+blast_radius = "the function's result column; promotes to the row multiset / other columns ONLY via a float-gated WHERE / ORDER BY...LIMIT / narrowing CAST (the float64-control-flow entry below). A float64 query that does not call a transcendental stays bit-identical cross-core."
+test         = "the `R` render tag's tolerant compare (parse to f64, equal within ULP/relative tolerance; NaN==NaN, ±Inf exact, -0==+0 — conformance.md §1); PG-oracle-only, with any larger PG divergence recorded in oracle_overrides.toml. # cost:/# names:/# types: stay exact (structural)."
+status       = "ratified"
+reason       = "IEEE 754 does NOT mandate correctly-rounded transcendentals (the table-maker's dilemma), so every libm differs by an ULP across Rust/Go/TS and PG. Not injectable away; bit-pinned reimplementations would cost decimal-limb-level effort on an approximate type (the over-investment determinism.md §6 declines). The arithmetic kernel (+ - * / sqrt) IS correctly-rounded and stays in-contract (float.md §5)."
+
+# --- float64: text rendering layout ------------------------------------------
+[[exception]]
+id           = "float-render-layout"
+surface      = "float32/float64 value -> text (each core's native shortest-round-trip formatter)"
+class        = "A"
+drops        = ["G2", "G3"]
+blast_radius = "the rendered STRING layout only (exponent threshold/spelling). The shortest-round-trip DIGITS are mathematically unique, so the cores agree on value; only layout may differ, and the `R` tag compares by parsed value, so layout never affects a test result. No promotion path (rendering is terminal)."
+test         = "the `R` render tag's tolerant compare (conformance.md §1) — parsed to f64, so layout is irrelevant. jed does NOT hand-roll a shared formatter (the exemption's payoff)."
+status       = "ratified"
+reason       = "Each language's shortest-round-trip formatter chooses different presentation (Rust {} vs Go FormatFloat(-1) vs JS toString) even when the digits agree. Pinning one shared formatter is decimal-limb-level effort for zero observable benefit given the `R` tolerant compare."
+
+# --- float64: control-flow promotion of an exempted value --------------------
+[[exception]]
+id           = "float-control-flow"
+surface      = "a query whose ROW MULTISET depends on an exempted float value (a transcendental result near a WHERE / ORDER BY...LIMIT boundary, or feeding a narrowing CAST)"
+class        = "A"
+drops        = ["G2", "G3"]
+blast_radius = "the affected query's row multiset (and thereby its non-float columns and cost). BOUNDED by keeping float64 OUT of keys/indexes (rejected 0A000 — encoding.md §2.8): an exempted value can at worst reorder/refilter a QUERY result, never corrupt STORED order. A query not gated on an exempted value is unaffected."
+test         = "such corpus entries are PG-oracle-only and authored to avoid knife-edge boundaries where possible; the documented residue is recorded here. The in-contract float surface (kernel/exact-sum/total-order) does NOT trigger this — only the transcendental-gated case does."
+status       = "ratified"
+reason       = "Non-determinism is infectious through boolean/control-flow boundaries (determinism.md §4): a <=1-ULP transcendental difference near a comparison boundary can flip a row's inclusion. Intrinsic to admitting transcendentals at all; bounded, not eliminable, so ledgered rather than pretended away."

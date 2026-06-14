@@ -242,6 +242,32 @@ is NOT NULL, so no presence tag). A stored uuid *value* reuses the same 16 bytes
 value-codec presence tag ([../fileformat/format.md](../fileformat/format.md)); for uuid the key
 and value bodies coincide (both the raw 16 bytes), the simplest case of the §3 key/value seam.
 
+### 2.8 Float64 — `float-order-preserving` (authored; unexercised this slice)
+
+`float64` is fixed-width (8 bytes) but, unlike the integers, its IEEE 754 bit pattern does **not**
+sort by `memcmp` in numeric order: negatives have the sign bit set (so they would sort *above*
+positives), and within negatives larger magnitudes sort later (backwards). The standard transform
+maps the type's **total order** ([compare.toml](../types/compare.toml) `float = "float-total-order"`;
+[../design/float.md](float.md) §3) onto unsigned byte order:
+
+1. **Canonicalize** first, so equal values encode identically: `-0.0 → +0.0`, and every NaN → one
+   canonical NaN bit pattern (`NaN = NaN` and `-0 = +0` in the total order — §3).
+2. Take the 64 IEEE bits as a big-endian `u64`; **if the sign bit is set (negative) flip all 64
+   bits, else flip just the sign bit.** Negatives then sort below positives and in correct
+   (magnitude-reversed) order; the canonical NaN, having the largest payload above `+Infinity`,
+   lands last — matching `−Inf < finite < +Inf < NaN`.
+
+This composes with the §2.2 nullable presence tag (`0x00` present ‖ the 8 bytes, or `0x01` NULL)
+and the §2.3 descending inversion unchanged.
+
+**Status — authored, not yet exercised.** A `float64 PRIMARY KEY`/index is rejected `0A000` this
+slice — the text/decimal/bytea/interval precedent, reinforced by the **contamination** rule
+([determinism.md](determinism.md) §4): keeping an exempted-value type out of *keys* bounds float
+non-determinism to *query-time* order, never *stored* order. Stored float *values* use the simpler
+fixed 8-byte value codec ([../fileformat/format.md](../fileformat/format.md), type code 12), which
+preserves the bits verbatim (no canonicalization) because a stored value never needs to sort.
+Lifting the narrowing adds the `(value → bytes)` fixtures and the executor key path then.
+
 ## 3. Where this is used today
 
 The bare integer rule is exercised by every stored key. The on-disk **value codec**

@@ -146,3 +146,145 @@ overflow_error = "22003"
 # one type; p/s are parameters): the executor rounds x to scale s half-away and traps 22003
 # if the integer-part digits exceed p-s (../design/decimal.md §2). It is the assignment/
 # explicit coercion the casts vocabulary reserves, applied within the decimal type.
+
+# --- float64 casts: ALL explicit (every one is lossy or representation-changing) -------
+# float64 is a strict family: NO implicit coercion crosses into or out of it (UNLIKE PG, which
+# promotes int/decimal -> float8 implicitly). int->float and decimal->float are lossy (int64 >
+# 2^53 and most decimals are not exactly representable in binary64), so they are EXPLICIT, not
+# implicit like int->decimal. Conversion is to the nearest binary64, round-ties-to-even (the
+# IEEE conversion). A finite value whose magnitude overflows binary64 traps 22003 rather than
+# yielding ±Infinity (the §3 finite-overflow rule — NaN/∞ are input-only). ../design/float.md §6.
+[[cast]]
+from = "int16"
+to = "float64"
+mode = "explicit"
+
+[[cast]]
+from = "int32"
+to = "float64"
+mode = "explicit"
+
+[[cast]]
+from = "int64"
+to = "float64"
+mode = "explicit"
+
+[[cast]]
+from = "decimal"
+to = "float64"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+# float64 -> integer: round HALF AWAY FROM ZERO to an integer (jed's one engine rounding mode —
+# ../design/decimal.md §3; a DOCUMENTED divergence from PG, which rounds half-to-even via rint),
+# then range-check (22003). NaN / ±Infinity -> 22003 (no integer representation).
+[[cast]]
+from = "float64"
+to = "int16"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "float64"
+to = "int32"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "float64"
+to = "int64"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+# float64 -> decimal: the exact decimal of the binary64 value, then the target typmod's scale
+# coercion (../design/decimal.md §3). NaN / ±Infinity -> 22003 (decimal is always finite).
+[[cast]]
+from = "float64"
+to = "decimal"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+# text <-> float64: the `float '...'` typed literal / CAST(<string literal> AS float64) is the
+# text-LITERAL -> float64 coercion (the string-literal cast above, ../design/grammar.md §36 — and
+# float64's string parse DOES accept e-notation and Infinity/NaN, unlike a bare decimal literal).
+# A RUNTIME CAST(text_col AS float64) and CAST(float_expr AS text) stay DEFERRED (0A000), the
+# general runtime-text-cast slice — so they are NOT (from,to) pairs here, exactly like decimal.
+
+# --- within the float family: float32 <-> float64 (the tower) -------------------------
+# float32 -> float64 is LOSSLESS (every binary32 is an exact binary64), so it is IMPLICIT — the
+# float analogue of int16 -> int64, and what lets a mixed-width float pair promote (compare.toml
+# `max-rank`). float64 -> float32 is lossy (round-ties-to-even to binary32) and EXPLICIT; a finite
+# value beyond the binary32 range traps 22003 (the §3 finite-overflow rule — not ±Inf). NaN/±Inf
+# convert across widths unchanged.
+[[cast]]
+from = "float32"
+to = "float64"
+mode = "implicit"
+
+[[cast]]
+from = "float64"
+to = "float32"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+# --- float32 cross-family casts: ALL explicit (mirror the float64 rows above) ----------
+# Same strict rules as float64: int/decimal -> float32 explicit (lossy; nearest binary32,
+# round-ties-to-even; finite overflow traps 22003); float32 -> integer explicit (round half-away,
+# range-check 22003; NaN/±Inf -> 22003); float32 -> decimal explicit (exact decimal of the
+# binary32, then typmod scale; NaN/±Inf -> 22003). text <-> float32 via the `real '...'` typed
+# literal only; runtime text casts deferred (0A000) — not (from,to) pairs, like float64.
+[[cast]]
+from = "int16"
+to = "float32"
+mode = "explicit"
+
+[[cast]]
+from = "int32"
+to = "float32"
+mode = "explicit"
+
+[[cast]]
+from = "int64"
+to = "float32"
+mode = "explicit"
+
+[[cast]]
+from = "decimal"
+to = "float32"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "float32"
+to = "int16"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "float32"
+to = "int32"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "float32"
+to = "int64"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"
+
+[[cast]]
+from = "float32"
+to = "decimal"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22003"

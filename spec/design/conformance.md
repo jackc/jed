@@ -27,9 +27,15 @@ problem (CLAUDE.md §7). We use the standard record types:
 Conventions, fixed here so every implementation renders identically:
 
 - **coltypes** — one letter per result column: `I` integer, `B` boolean, `T` text, `D`
-  decimal, `R` real. The corpus uses `I`, `B`, `T`, and `D` (integers, boolean, text, and the
-  exact decimal — all storable, CLAUDE.md §4); `R` (binary float) is reserved and may never be
-  used until a float type exists (§4). The letter is a **rendering** tag (how a value
+  decimal, `R` real. The corpus uses `I`, `B`, `T`, `D`, and now **`R`** (`float64` — the
+  first binary float, CLAUDE.md §4). Unlike the others, an `R` column is compared **by value at
+  a tolerance, not by string**: both sides are parsed to f64 and considered equal iff bit-equal
+  or within a small ULP/relative tolerance, with `NaN == NaN`, `±Inf` exact, and `-0 == +0`
+  ([float.md](float.md) §9, [determinism.md](determinism.md) §6). This single rule absorbs the
+  cross-core rendering-layout difference and the exempted transcendental last-ULP divergence
+  (`float64` is the first type exempted from cross-core byte-identity for *computed/rendered
+  values*; its *storage*, *ordering*, *kernel*, *exact-sum aggregates*, and *cost* stay exact).
+  The letter is a **rendering** tag (how a value
   is printed), *not* a type assertion — asserting the precise resolved type (`int16` vs
   `int32`) is the separate **`# types:`** directive (below; the decimal `numeric(p,s)` typmod
   granularity stays deferred, §7). Types that render as a printable-ASCII string reuse the `T`
@@ -172,12 +178,17 @@ Every corpus entry MUST obey:
   (CLAUDE.md §8).
 - **One canonical name, one code.** Types print under their canonical id; each error
   condition has exactly one SQLSTATE.
-- **No nondeterminism.** No wall-clock, no random, no hashmap-order leakage.
-- **No floats.** The scalar set is integers, text, boolean, and the exact `decimal` — **no
-  binary float** (`R`), so the float-formatting divergence (CLAUDE.md §8) cannot arise.
-  `decimal` renders deterministically as a canonical base-10 string preserving its display
-  scale (`1.50` prints `1.50`; [decimal.md](decimal.md) §6), so it is a `D`-tag value, never an
-  `R`-tag one.
+- **No *unledgered* nondeterminism.** Determinism is **default-deny** ([determinism.md](determinism.md)
+  §1): no wall-clock, no random, no hashmap-order leakage — *unless* the behavior is an entry in
+  the determinism-exception ledger ([../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml))
+  with a stated blast radius and test mechanism. The only relaxation exercised today is `float64`
+  (below); everything else stays fully deterministic and cross-core byte-identical.
+- **Floats are the one ledgered exception.** `float64` ([float.md](float.md)) is exempt from
+  cross-core byte-identity for *computed/rendered values only* — compared via the `R` tag's
+  tolerant rule (§1). Its *storage* bytes, *total order*, *arithmetic kernel*, *exact-sum
+  `SUM`/`AVG`*, and *cost/names/types* remain exact and cross-core (so a float query still carries
+  `# cost:`). `decimal` stays the exact path (`1.50` prints `1.50`, a `D`-tag value); a value is
+  an `R`-tag value only when it is genuinely `float64`.
 - **Canonical boolean spelling.** A boolean prints as exactly `true`/`false` (NULL as
   `NULL`); no core may emit `t`/`f`, `0`/`1`, or host-cased variants.
 
@@ -246,8 +257,8 @@ profile's capabilities passes. Harnesses arrive with the first vertical slice
   general expression substrate. Rendered under the `B` tag (§1); the `expression` profile (§3)
   gates them; coverage in `suites/expr/`. Boolean as a *storable column type* remains
   deferred (types.md §10).
-- **Render-tag breadth** — `I`, `B`, `T` (text), and `D` (decimal) are in use; `R` (binary
-  float) stays reserved and unused until a float type exists, if ever (CLAUDE.md §8).
+- **Render-tag breadth** — `I`, `B`, `T` (text), `D` (decimal), and now `R` (`float64` — binary
+  float, compared at tolerance §1) are all in use (CLAUDE.md §8).
 
 ## 8. Metamorphic generator (SQLancer-style) — and the obligation to grow it
 

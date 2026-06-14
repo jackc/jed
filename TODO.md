@@ -521,8 +521,28 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       vs `NULL` array, equality/ordering, and an order-preserving key encoding for
       arrays-in-keys. Match PostgreSQL array semantics by default (§1). Large surface;
       sequence after the core scalar set settles. _(size: XL; §4/§8)_
-- [ ] **Float policy decision.** §8 deliberately keeps `f64` out of compare/text-output
-      paths. Decide if floats ever exist, and if so how rendered. _(size: S decision / L if built; §8)_
+- [~] **`float32` + `float64` (IEEE 754 binary float).** ✅ **Decided & spec'd; cores in progress.**
+      The float policy is **settled**: floats exist as a two-width PROMOTION TOWER — `float64`
+      (aliases `double precision`/`float` — bare `float` is 64-bit in PG) and `float32` (alias
+      `real`), with `float32`→`float64` lossless-implicit widening (like int16→int64) and cross-family
+      int/decimal↔float explicit-only. They are the **first types exempted from cross-core
+      byte-identity** — but NARROWLY (storage, the total
+      order, the `+ − * / sqrt` kernel, the exact-sum `SUM`/`AVG`, `MIN`/`MAX`/`COUNT`, and cost
+      stay fully deterministic and cross-core; only transcendental *values* and text-rendering
+      *layout* are exempt, absorbed by the new `R` render tag's tolerant compare). This required
+      establishing the **determinism framework first** ([spec/design/determinism.md](spec/design/determinism.md)
+      — the four-guarantee model + the exception ledger
+      [spec/conformance/determinism_exceptions.toml](spec/conformance/determinism_exceptions.toml)).
+      **Spec layer DONE** (`rake verify` green): [spec/design/float.md](spec/design/float.md);
+      type/compare/cast/catalog data (on-disk type code **12**); `R` tag + default-deny determinism
+      rules in [conformance.md](spec/design/conformance.md); `float-order-preserving` key rule
+      authored/unexercised (float PK rejected `0A000` — [encoding.md](spec/design/encoding.md) §2.8).
+      **Remaining (XL):** the four cores (Rust/Go/TS hand-written + Ruby reference) — value repr,
+      literals, total-order compare, the trapping arithmetic kernel, casts, the **order-independent
+      exact accumulator** for `SUM`/`AVG`, the exact + transcendental functions, native rendering;
+      the **`R`-tag tolerant comparison** in each harness; the byte-exact golden `float64_table.jed`;
+      the conformance corpus + oracle overrides. Scope ratified by the user: "everything" incl.
+      casts + exact SUM/AVG + transcendentals. _(was: S decision / now XL build; §8)_
 
 ---
 

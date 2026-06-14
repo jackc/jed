@@ -289,3 +289,52 @@ aliases = []
 family = "interval"
 storable = true
 encoding = { method = "interval-fixed16" }
+
+# --- float64: IEEE 754 double precision (../design/float.md) ------------------
+# The engine's APPROXIMATE numeric and the FIRST type deliberately EXEMPTED from
+# cross-core byte-identity (CLAUDE.md §2/§8; ../design/determinism.md §6, class A).
+# The exemption is NARROW: storage, the total order, the +-*/ /sqrt arithmetic kernel,
+# the exact-sum SUM/AVG, MIN/MAX/COUNT, and cost are all kept fully deterministic and
+# cross-core; only TRANSCENDENTAL function values and text-rendering LAYOUT are exempt
+# (absorbed by the conformance `R` tag's tolerant compare). STORABLE this slice with the
+# on-disk value codec (type code 12 — ../fileformat/format.md): the 8 IEEE bytes, big-
+# endian, behind the presence tag (fixed-width, no length prefix, like uuid/timestamp).
+# Two widths forming a PROMOTION TOWER like the integers (float32 rank 1 < float64 rank 2):
+#   float64  canonical; aliases `double precision` and `float` (in PG a bare `float` with NO
+#            precision IS double precision / 64-bit — NOT 32-bit; the C/Java intuition is wrong).
+#   float32  canonical; alias `real` (PG's 32-bit single-precision type, `float4`).
+# PG's `float8`/`float4` and the `float(p)` precision typmod are NOT accepted (we own our surface,
+# like int2/4/8). WIDENING float32 -> float64 is LOSSLESS (every binary32 is an exact binary64), so
+# it is IMPLICIT, exactly like int16 -> int64 (casts.toml); float64 -> float32 is lossy -> explicit.
+# Cross-family int/decimal <-> float stays EXPLICIT either way (float is a strict island — the only
+# implicit edge is within-family widening). Mixed-width float arithmetic/comparison promotes to the
+# higher rank (compare.toml `max-rank`), matching PG (real promotes to double).
+# TOTAL ORDER (PG float8 btree): -0 = +0, NaN = NaN, NaN is the LARGEST value (above
+# +Infinity) — see compare.toml `ordering` and ../design/float.md §3. NaN/±Infinity are
+# FIRST-CLASS values (unlike decimal, which excludes them): they enter only via literals/
+# casts/stored values and propagate; FINITE arithmetic that would produce them TRAPS
+# instead (overflow 22003, x/0 22012), the PG trap model. The order-preserving KEY
+# encoding (float-order-preserving — ../design/encoding.md §2.8) is AUTHORED but
+# UNEXERCISED: a float64 PRIMARY KEY is rejected 0A000 (the text/decimal/bytea/interval
+# precedent, reinforced by the determinism.md §4 contamination rule — float stays out of
+# stored order). No bits/min/max/rank (not the integer family); no collation. overflow =
+# "trap" (finite-overflow 22003, the §3 rule). width_bytes present (fixed 8).
+[[type]]
+id = "float32"
+aliases = ["real"]
+family = "float"
+storable = true
+overflow = "trap"
+overflow_error = "22003"
+encoding = { method = "float-order-preserving", width_bytes = 4 }
+rank = 1
+
+[[type]]
+id = "float64"
+aliases = ["double precision", "float"]
+family = "float"
+storable = true
+overflow = "trap"
+overflow_error = "22003"
+encoding = { method = "float-order-preserving", width_bytes = 8 }
+rank = 2

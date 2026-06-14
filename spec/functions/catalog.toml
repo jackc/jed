@@ -954,6 +954,97 @@ null           = "null_safe"
 precedence     = 35
 errors         = []
 
+# --- comparison operators (float64) ------------------------------------------
+# The float-family OVERLOAD of the comparisons (`=` < > <= >=, IS [NOT] DISTINCT FROM) over
+# float64 × float64. arg_resolution = "none" — one float type, no promotion (compare.toml).
+# Operands compare by the TOTAL order (compare.toml `float = "float-total-order"`): -0 = +0,
+# NaN = NaN, NaN largest — NOT raw IEEE (where NaN is unordered). So `NaN = NaN` is TRUE.
+# float64 vs ANY other family (incl. integer/decimal) is NOT comparable (compare.toml lists only
+# float × float) → 42804: float is strict, requiring an explicit cast (../design/float.md §3/§6).
+# Same precedence (35) and NULL discipline as the other comparisons; no failure, errors = [].
+
+[[operator]]
+name           = "eq"
+symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "lt"
+symbol         = "<"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "gt"
+symbol         = ">"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "le"
+symbol         = "<="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ge"
+symbol         = ">="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "is_not_distinct_from"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "null_safe"
+precedence     = 35
+errors         = []
+
 # --- null tests --------------------------------------------------------------
 # Unary null-detection over any nullable value of any type. Unlike comparisons
 # these never propagate: the result is ALWAYS a definite boolean, never unknown —
@@ -1382,6 +1473,88 @@ null           = "propagates"
 precedence     = 50
 errors         = ["22008", "22012"]
 
+# --- arithmetic operators (float64) ------------------------------------------
+# The float-family OVERLOAD of the arithmetic operators. float64 ⊕ float64 → float64 for
+# + - * / % and unary -, each the IEEE 754 CORRECTLY-ROUNDED operation (round-ties-to-even),
+# evaluated ONE OP PER NODE in the tree-walking evaluator (so no FMA fusion — a G3 hazard in Go;
+# ../design/float.md §5). result = "promoted" (the common operand type = float64). NO cross-family
+# promotion: int/decimal × float64 is 42804 (compare.toml has no float promotion). The PG TRAP
+# model: a FINITE result that overflows binary64 traps 22003; x/0 traps 22012 — finite arithmetic
+# never PRODUCES Inf/NaN (they are input-only and propagate by IEEE once present, §3). unary neg
+# only flips the sign bit (no overflow), but a NaN/Inf operand passes through, so errors = [].
+
+[[operator]]
+name           = "add"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "promoted"
+null           = "propagates"
+precedence     = 40
+errors         = ["22003"]
+
+[[operator]]
+name           = "sub"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "promoted"
+null           = "propagates"
+precedence     = 40
+errors         = ["22003"]
+
+[[operator]]
+name           = "mul"
+symbol         = "*"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "promoted"
+null           = "propagates"
+precedence     = 50
+errors         = ["22003"]
+
+[[operator]]
+name           = "div"
+symbol         = "/"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "promoted"
+null           = "propagates"
+precedence     = 50
+errors         = ["22003", "22012"]
+
+[[operator]]
+name           = "mod"
+symbol         = "%"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "promoted"
+null           = "propagates"
+precedence     = 50
+errors         = ["22012"]
+
+[[operator]]
+name           = "neg"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+precedence     = 60
+errors         = []
+
 # === scalar functions ========================================================
 # Named scalar functions (kind = "function", functions.md §9). They take scalar argument(s)
 # and return a scalar, fitting the operator result/NULL mold, so they REUSE the [[operator]]
@@ -1460,6 +1633,164 @@ arity          = 2
 arg_families   = ["integer", "integer"]
 arg_resolution = "none"
 result         = "decimal"
+null           = "propagates"
+errors         = []
+
+# --- scalar functions (float64) ----------------------------------------------
+# Two classes (../design/float.md §8), distinguished only by the determinism contract, not by
+# any catalog field — the split is enforced at the conformance layer (the `R` tag's tolerant
+# compare + the determinism_exceptions.toml ledger), so these are ordinary function rows:
+#
+#   EXACT / correctly-rounded — IN-CONTRACT (bit-identical cross-core, exact `R` assertions):
+#     abs, ceil, floor, trunc, round (half-away, 1- and 2-arg), and sqrt (IEEE-mandated
+#     correctly-rounded). result "promoted" for abs (operand-typed, like int/decimal abs);
+#     "float64" for the others (always float64). No overflow is possible except sqrt of a
+#     negative, a DOMAIN error -> 22003 (NaN stays input-only, §3).
+#
+#   TRANSCENDENTAL — EXEMPTED (libm differs by an ULP per core; ledgered class A): exp, ln,
+#     log10, pow, sin, cos, tan. result "float64". exp/ln/log10/pow carry 22003 (overflow /
+#     domain, e.g. ln(0), ln(-1), exp(710)); sin/cos/tan cannot trap (a NaN/Inf operand
+#     propagates). These are PG-oracle-only in the corpus and compared at `R` tolerance.
+# Further functions (sign, asin/acos/atan/atan2, cbrt, log(b,x), the `^` power operator) are
+# easy additive follow-ons (../design/float.md §8).
+
+[[operator]]
+name           = "abs"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "promoted"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "ceil"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "floor"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "trunc"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "round"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "round"
+kind           = "function"
+arity          = 2
+arg_families   = ["float", "integer"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "sqrt"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = ["22003"]
+
+[[operator]]
+name           = "exp"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = ["22003"]
+
+[[operator]]
+name           = "ln"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = ["22003"]
+
+[[operator]]
+name           = "log10"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = ["22003"]
+
+[[operator]]
+name           = "pow"
+kind           = "function"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "float64"
+null           = "propagates"
+errors         = ["22003"]
+
+[[operator]]
+name           = "sin"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "cos"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "tan"
+kind           = "function"
+arity          = 1
+arg_families   = ["float"]
+arg_resolution = "none"
+result         = "float64"
 null           = "propagates"
 errors         = []
 
@@ -1553,6 +1884,36 @@ surface      = "AVG"
 arg          = "expr"
 arg_families = ["decimal"]
 result       = "decimal"
+null         = "aggregate"
+errors       = ["22003"]
+
+# SUM/AVG over the float family -> SAME width as input (same_as_input: SUM(float32) -> float32,
+# SUM(float64) -> float64; NOT sum_widen — a float sum stays the same width, matching PG sum(real)
+# -> real). Computed via the ORDER-INDEPENDENT CANONICAL-ORDER FOLD (../design/float.md §7):
+# canonicalize -0, resolve NaN/±Inf first, sort the finite inputs by the §3 total order, then fold
+# left with width-correct IEEE addition — so the result is identical across cores AND across any
+# serial/parallel plan, IN-CONTRACT, a documented divergence from PG's order-dependent float sum
+# (within R-tag tolerance). NaN/±Infinity resolve before the fold (any NaN -> NaN; mixed ±Inf -> NaN;
+# else the present infinity); a running total overflowing to ±Inf traps 22003 (PG yields ±Inf —
+# divergence, §7). AVG = SUM / count, one final rounding at the input width (a minor divergence from
+# PG, which widens AVG(real) -> double). MIN/MAX/COUNT over float are the "any" rows (total order §3).
+[[aggregate]]
+name         = "sum"
+kind         = "aggregate"
+surface      = "SUM"
+arg          = "expr"
+arg_families = ["float"]
+result       = "same_as_input"
+null         = "aggregate"
+errors       = ["22003"]
+
+[[aggregate]]
+name         = "avg"
+kind         = "aggregate"
+surface      = "AVG"
+arg          = "expr"
+arg_families = ["float"]
+result       = "same_as_input"
 null         = "aggregate"
 errors       = ["22003"]
 

@@ -316,6 +316,16 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 9 | `timestamp` |
 | 10 | `timestamptz` |
 | 11 | `interval` |
+| 12 | `float64` |
+| 13 | `float32` |
+
+A **`float64`** value (`type_code == 12`) is the **8 IEEE 754 bytes, big-endian**, and a
+**`float32`** value (`type_code == 13`) is the **4 IEEE 754 bytes, big-endian** — both behind the
+presence tag, fixed-width, no length prefix, the `int64`/`uuid`/`timestamp` shape. The stored bits
+are preserved verbatim (a stored `-0.0` keeps its sign bit; the `-0 = +0` and NaN canonicalization
+is a comparison/key concern, not a storage one — [../design/float.md](../design/float.md) §3/§10).
+The on-disk bytes are byte-identical across cores (the float types are exempt from cross-core
+identity only for *computed/rendered values*, not for *storage* — determinism.md §6).
 
 A column's collation is **not** stored: there is one collation (`C`) for all text this slice
 ([../design/types.md](../design/types.md) §11). A per-column collation field is a forward
