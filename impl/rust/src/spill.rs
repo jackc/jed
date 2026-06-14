@@ -351,6 +351,16 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             w.write_all(&n.to_le_bytes())
         }
         Value::Bool(b) => w.write_all(&[2, u8::from(*b)]),
+        // Floats — internal spill tags 13/14 (this is the merge-sort scratch format, not the
+        // cross-core on-disk format, so the tag space is local). Store the IEEE bits verbatim.
+        Value::Float64(f) => {
+            w.write_all(&[13])?;
+            w.write_all(&f.to_bits().to_le_bytes())
+        }
+        Value::Float32(f) => {
+            w.write_all(&[14])?;
+            w.write_all(&f.to_bits().to_le_bytes())
+        }
         Value::Text(s) => {
             w.write_all(&[3])?;
             write_bytes(w, s.as_bytes())
@@ -504,6 +514,12 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
                 days: i32::from_le_bytes(db),
                 micros: read_i64(r)?,
             })
+        }
+        13 => Value::Float64(f64::from_bits(read_u64(r)?)),
+        14 => {
+            let mut b = [0u8; 4];
+            r.read_exact(&mut b)?;
+            Value::Float32(f32::from_bits(u32::from_le_bytes(b)))
         }
         _ => {
             return Err(io::Error::new(

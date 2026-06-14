@@ -2,6 +2,7 @@ package jed
 
 import (
 	"encoding/hex"
+	"math"
 	"strconv"
 )
 
@@ -34,6 +35,14 @@ const (
 	// ValInterval is a span — Iv holds the three fields (months/days/micros). Comparison/dedup
 	// go through the canonical 128-bit span, NOT field equality (spec/design/interval.md).
 	ValInterval
+	// ValFloat32 is an IEEE 754 binary32 (the float32 / real type, spec/design/float.md). Int
+	// holds math.Float32bits(value) zero-extended to int64 — the bits are stored VERBATIM (a
+	// stored -0.0 keeps its sign bit); the total order / dedup / keys canonicalize -0→+0 and
+	// collapse NaN patterns at COMPARISON time, not in storage (float.md §3).
+	ValFloat32
+	// ValFloat64 is an IEEE 754 binary64 (the float64 / double-precision type). Int holds
+	// math.Float64bits(value); same verbatim-storage / canonical-comparison rule as float32.
+	ValFloat64
 	// ValUnfetched is an unfetched large-value reference (spec/design/large-values.md §14): a
 	// stored external/compressed value loaded as its on-disk pointer instead of being
 	// materialized; Unf holds the pointer fields. Internal to the storage/scan layers — the scan
@@ -117,6 +126,37 @@ func TimestamptzValue(m int64) Value { return Value{Kind: ValTimestamptz, Int: m
 
 // IntervalValue builds a non-null interval value.
 func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, Iv: iv} }
+
+// Float32Value builds a non-null float32 value from a Go float32 — the bits are stored verbatim
+// in Int (math.Float32bits, zero-extended), so -0.0 / NaN / ±Inf keep their original pattern
+// (spec/design/float.md §3/§10). The total order / keys canonicalize at comparison time, not here.
+func Float32Value(f float32) Value {
+	return Value{Kind: ValFloat32, Int: int64(math.Float32bits(f))}
+}
+
+// Float64Value builds a non-null float64 value from a Go float64 — the bits are stored verbatim
+// in Int (math.Float64bits), preserving -0.0 / NaN / ±Inf bit patterns (spec/design/float.md §3/§10).
+func Float64Value(f float64) Value {
+	return Value{Kind: ValFloat64, Int: int64(math.Float64bits(f))}
+}
+
+// F32 returns the Go float32 of a ValFloat32 value (the inverse of Float32Value).
+func (v Value) F32() float32 { return math.Float32frombits(uint32(v.Int)) }
+
+// F64 returns the Go float64 of a ValFloat64 value (the inverse of Float64Value).
+func (v Value) F64() float64 { return math.Float64frombits(uint64(v.Int)) }
+
+// asF64 returns a float value (either width) as a float64 — float32 widens losslessly (the
+// implicit-cast / total-order path; spec/design/float.md §2). Caller guarantees a float kind.
+func (v Value) asF64() float64 {
+	if v.Kind == ValFloat32 {
+		return float64(v.F32())
+	}
+	return v.F64()
+}
+
+// IsFloat reports whether the value is one of the two float widths.
+func (v Value) IsFloat() bool { return v.Kind == ValFloat32 || v.Kind == ValFloat64 }
 
 // ParseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
 // a `\x` prefix followed by an even count of hexadecimal digits (case-insensitive), each
@@ -269,6 +309,10 @@ func (v Value) Render() string {
 		return RenderTimestamptz(v.Int)
 	case ValInterval:
 		return RenderInterval(v.Iv)
+	case ValFloat32:
+		return renderFloat32(v.F32())
+	case ValFloat64:
+		return renderFloat64(v.F64())
 	case ValUnfetched:
 		panic("BUG: unfetched large value escaped the storage layer")
 	default:
@@ -327,6 +371,11 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if c, ok := numericCmp(v, o); ok {
 		return bool3(c == 0)
 	}
+	if v.IsFloat() && o.IsFloat() {
+		// The PG float8 TOTAL order (NOT raw IEEE): -0 = +0, NaN = NaN, NaN largest. So
+		// NaN = NaN is TRUE (spec/design/float.md §3). Mixed widths promote to float64.
+		return bool3(floatTotalCmp(v.asF64(), o.asF64()) == 0)
+	}
 	if v.Kind == ValText && o.Kind == ValText {
 		return bool3(v.Str == o.Str)
 	}
@@ -367,6 +416,9 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if c, ok := numericCmp(v, o); ok {
 		return bool3(c < 0)
 	}
+	if v.IsFloat() && o.IsFloat() {
+		return bool3(floatTotalCmp(v.asF64(), o.asF64()) < 0)
+	}
 	if v.Kind == ValText && o.Kind == ValText {
 		return bool3(v.Str < o.Str)
 	}
@@ -404,6 +456,9 @@ func (v Value) Gt3(o Value) ThreeValued {
 	}
 	if c, ok := numericCmp(v, o); ok {
 		return bool3(c > 0)
+	}
+	if v.IsFloat() && o.IsFloat() {
+		return bool3(floatTotalCmp(v.asF64(), o.asF64()) > 0)
 	}
 	if v.Kind == ValText && o.Kind == ValText {
 		return bool3(v.Str > o.Str)

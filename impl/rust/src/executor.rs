@@ -785,7 +785,7 @@ impl Database {
             // NOT NULL column is accepted and traps 23502 only when applied (constraints.md §2).
             let default = match &def.default {
                 Some(lit) => Some(store_value(
-                    literal_to_value(lit),
+                    literal_to_value_for(lit, ty)?,
                     ty,
                     decimal,
                     false,
@@ -930,7 +930,8 @@ impl Database {
                 | ResolvedType::Uuid
                 | ResolvedType::Timestamp
                 | ResolvedType::Timestamptz
-                | ResolvedType::Interval => {
+                | ResolvedType::Interval
+                | ResolvedType::Float(_) => {
                     return Err(type_error("argument of CHECK must be boolean"));
                 }
             }
@@ -1417,7 +1418,7 @@ impl Database {
                     for (i, col) in columns.iter().enumerate() {
                         if let Some(p) = provided[i] {
                             rv[p] = match &values[p] {
-                                InsertValue::Lit(lit) => literal_to_value(lit),
+                                InsertValue::Lit(lit) => literal_to_value_for(lit, col.ty)?,
                                 InsertValue::Param(nn) => bound[(*nn as usize) - 1].clone(),
                                 InsertValue::Default => col.default.clone().unwrap_or(Value::Null),
                             };
@@ -1665,14 +1666,16 @@ impl Database {
                         Value::Bool(_) => {
                             unreachable!("a boolean primary key is rejected at CREATE TABLE")
                         }
-                        // Unreachable: a text/decimal/bytea/interval PRIMARY KEY is rejected at
-                        // CREATE TABLE (0A000) — those non-integer PKs are caught by the gate.
+                        // Unreachable: a text/decimal/bytea/interval/float PRIMARY KEY is rejected
+                        // at CREATE TABLE (0A000) — those non-integer PKs are caught by the gate.
                         Value::Text(_)
                         | Value::Decimal(_)
                         | Value::Bytea(_)
-                        | Value::Interval(_) => {
+                        | Value::Interval(_)
+                        | Value::Float32(_)
+                        | Value::Float64(_) => {
                             unreachable!(
-                                "a text/decimal/bytea/interval primary key is rejected at CREATE TABLE"
+                                "a text/decimal/bytea/interval/float primary key is rejected at CREATE TABLE"
                             )
                         }
                         // Poisoned (large-values.md §14): INSERT values are evaluated
@@ -3754,6 +3757,8 @@ impl Database {
             | RExpr::ConstBool(_)
             | RExpr::ConstText(_)
             | RExpr::ConstDecimal(_)
+            | RExpr::ConstFloat32(_)
+            | RExpr::ConstFloat64(_)
             | RExpr::ConstBytea(_)
             | RExpr::ConstUuid(_)
             | RExpr::ConstTimestamp(_)
@@ -4092,6 +4097,10 @@ enum ResolvedType {
     Timestamptz,
     /// The `interval` family (a span). Compares only with itself (by the canonical span).
     Interval,
+    /// The float family, carrying its width (spec/design/float.md §2). The two widths form a
+    /// promotion tower: `float32 → float64` is the one implicit float cast; mixed-width arithmetic
+    /// and comparison promote to `float64` first. A strict island — no implicit int/decimal ↔ float.
+    Float(ScalarType),
     Null,
 }
 
@@ -4109,6 +4118,7 @@ impl ResolvedType {
             ScalarType::Timestamp => ResolvedType::Timestamp,
             ScalarType::Timestamptz => ResolvedType::Timestamptz,
             ScalarType::Interval => ResolvedType::Interval,
+            ScalarType::Float32 | ScalarType::Float64 => ResolvedType::Float(ty),
         }
     }
 
@@ -4124,6 +4134,7 @@ impl ResolvedType {
             ResolvedType::Timestamp => "timestamp",
             ResolvedType::Timestamptz => "timestamptz",
             ResolvedType::Interval => "interval",
+            ResolvedType::Float(st) => st.canonical_name(),
             ResolvedType::Null => "unknown",
         }
     }
@@ -4158,6 +4169,10 @@ impl ResolvedType {
             ResolvedType::Timestamp => col_ty.is_timestamp(),
             ResolvedType::Timestamptz => col_ty.is_timestamptz(),
             ResolvedType::Interval => col_ty.is_interval(),
+            // A float assigns to a float column of equal-or-wider width: float32 → float32/float64
+            // (the implicit widening cast), float64 → float64 only (float64 → float32 is explicit).
+            // store_value enforces the same rule per row (spec/types/casts.toml).
+            ResolvedType::Float(st) => col_ty.is_float() && st.rank() <= col_ty.rank(),
         }
     }
 }
@@ -4194,6 +4209,19 @@ enum CmpOp {
 enum ScalarFunc {
     Abs,
     Round,
+    // Float functions (spec/design/float.md §8). EXACT / correctly-rounded (in-contract):
+    Ceil,
+    Floor,
+    Trunc,
+    Sqrt,
+    // TRANSCENDENTAL (exempted — native libm, may differ by an ULP cross-core):
+    Exp,
+    Ln,
+    Log10,
+    Pow,
+    Sin,
+    Cos,
+    Tan,
 }
 
 /// A resolved expression: a tree over fixed column indices, ready to evaluate against
@@ -4205,6 +4233,10 @@ enum RExpr {
     ConstBool(bool),
     ConstText(String),
     ConstDecimal(Decimal),
+    /// A `float32` / `float64` constant (a typed float literal, an adapted decimal/int literal
+    /// in a float context, or a folded subquery value — spec/design/float.md §4).
+    ConstFloat32(f32),
+    ConstFloat64(f64),
     ConstBytea(Vec<u8>),
     ConstUuid([u8; 16]),
     /// A parsed `timestamp` / `timestamptz` literal: the int64 microsecond instant.
@@ -4916,6 +4948,11 @@ enum AggPlan {
     SumDecimal,
     /// AVG — accumulate a decimal sum + i64 count; result sum/count (decimal), NULL if count 0.
     Avg,
+    /// SUM(float32|float64) — the ORDER-INDEPENDENT CANONICAL-ORDER FOLD (spec/design/float.md §7).
+    /// Carries the width so the result/fold round at the input width. Buffers the finite inputs.
+    SumFloat(ScalarType),
+    /// AVG(float32|float64) — SUM (canonical fold) / count, one final rounding at the input width.
+    AvgFloat(ScalarType),
     Min,
     Max,
 }
@@ -4931,10 +4968,34 @@ struct AggSpec {
 enum Acc {
     CountStar(i64),
     Count(i64),
-    SumInt { sum: i64, seen: bool },
-    SumDecimal { sum: Decimal, seen: bool },
-    Avg { sum: Decimal, count: i64 },
-    MinMax { cur: Option<Value>, is_min: bool },
+    SumInt {
+        sum: i64,
+        seen: bool,
+    },
+    SumDecimal {
+        sum: Decimal,
+        seen: bool,
+    },
+    Avg {
+        sum: Decimal,
+        count: i64,
+    },
+    /// Float SUM/AVG: buffer the canonical inputs (the §7 fold needs ALL values to sort), tracking
+    /// NaN / ±Inf presence so the special-value resolution is order-independent. `is_avg` selects
+    /// the final SUM vs SUM/count; `width` rounds at the input width. `count` is the non-NULL count.
+    FloatFold {
+        width: ScalarType,
+        is_avg: bool,
+        finite: Vec<f64>,
+        count: i64,
+        any_nan: bool,
+        pos_inf: bool,
+        neg_inf: bool,
+    },
+    MinMax {
+        cur: Option<Value>,
+        is_min: bool,
+    },
 }
 
 impl Acc {
@@ -4953,6 +5014,24 @@ impl Acc {
             AggPlan::Avg => Acc::Avg {
                 sum: Decimal::from_i64(0),
                 count: 0,
+            },
+            AggPlan::SumFloat(w) => Acc::FloatFold {
+                width: w,
+                is_avg: false,
+                finite: Vec::new(),
+                count: 0,
+                any_nan: false,
+                pos_inf: false,
+                neg_inf: false,
+            },
+            AggPlan::AvgFloat(w) => Acc::FloatFold {
+                width: w,
+                is_avg: true,
+                finite: Vec::new(),
+                count: 0,
+                any_nan: false,
+                pos_inf: false,
+                neg_inf: false,
             },
             AggPlan::Min => Acc::MinMax {
                 cur: None,
@@ -5004,6 +5083,36 @@ impl Acc {
                     *count += 1;
                 }
             }
+            Acc::FloatFold {
+                finite,
+                count,
+                any_nan,
+                pos_inf,
+                neg_inf,
+                ..
+            } => {
+                // Classify each non-NULL input order-independently (the §7 special-value pass).
+                // Convert a float32 to its exact f64 for buffering; the fold re-rounds per step.
+                let f = match value {
+                    Value::Null => return Ok(()),
+                    Value::Float32(f) => f as f64,
+                    Value::Float64(f) => f,
+                    _ => unreachable!("resolver restricts float SUM/AVG to a float operand"),
+                };
+                *count += 1;
+                if f.is_nan() {
+                    *any_nan = true;
+                } else if f.is_infinite() {
+                    if f > 0.0 {
+                        *pos_inf = true;
+                    } else {
+                        *neg_inf = true;
+                    }
+                } else {
+                    // Canonicalize -0 → +0 before buffering (so the sort/fold are deterministic).
+                    finite.push(if f == 0.0 { 0.0 } else { f });
+                }
+            }
             Acc::MinMax { cur, is_min } => {
                 if !matches!(value, Value::Null) {
                     let next = match cur.take() {
@@ -5051,6 +5160,15 @@ impl Acc {
                     Value::Decimal(sum.div(&Decimal::from_i64(count))?)
                 }
             }
+            Acc::FloatFold {
+                width,
+                is_avg,
+                finite,
+                count,
+                any_nan,
+                pos_inf,
+                neg_inf,
+            } => finalize_float_fold(width, is_avg, finite, count, any_nan, pos_inf, neg_inf)?,
             Acc::MinMax { cur, .. } => cur.unwrap_or(Value::Null),
         })
     }
@@ -5264,6 +5382,8 @@ fn value_to_rexpr(v: &Value) -> RExpr {
         Value::Bool(b) => RExpr::ConstBool(*b),
         Value::Text(s) => RExpr::ConstText(s.clone()),
         Value::Decimal(d) => RExpr::ConstDecimal(d.clone()),
+        Value::Float32(f) => RExpr::ConstFloat32(*f),
+        Value::Float64(f) => RExpr::ConstFloat64(*f),
         Value::Bytea(b) => RExpr::ConstBytea(b.clone()),
         Value::Uuid(u) => RExpr::ConstUuid(*u),
         Value::Timestamp(m) => RExpr::ConstTimestamp(*m),
@@ -5355,6 +5475,8 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::ConstBool(_)
         | RExpr::ConstText(_)
         | RExpr::ConstDecimal(_)
+        | RExpr::ConstFloat32(_)
+        | RExpr::ConstFloat64(_)
         | RExpr::ConstBytea(_)
         | RExpr::ConstUuid(_)
         | RExpr::ConstTimestamp(_)
@@ -5422,6 +5544,8 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::ConstBool(_)
         | RExpr::ConstText(_)
         | RExpr::ConstDecimal(_)
+        | RExpr::ConstFloat32(_)
+        | RExpr::ConstFloat64(_)
         | RExpr::ConstBytea(_)
         | RExpr::ConstUuid(_)
         | RExpr::ConstTimestamp(_)
@@ -5576,6 +5700,10 @@ fn resolve_aggregate(
                     ResolvedType::Int(ScalarType::Int64),
                 ),
                 ResolvedType::Decimal => (AggPlan::SumDecimal, Some(r), ResolvedType::Decimal),
+                // SUM(float) → SAME width (the canonical-order fold — spec/design/float.md §7).
+                ResolvedType::Float(ft) => {
+                    (AggPlan::SumFloat(ft), Some(r), ResolvedType::Float(ft))
+                }
                 _ => return Err(no_agg_overload("sum")),
             }
         }
@@ -5584,6 +5712,10 @@ fn resolve_aggregate(
             match t {
                 ResolvedType::Int(_) | ResolvedType::Decimal => {
                     (AggPlan::Avg, Some(r), ResolvedType::Decimal)
+                }
+                // AVG(float) → SAME width (= SUM/count, rounded once — spec/design/float.md §7).
+                ResolvedType::Float(ft) => {
+                    (AggPlan::AvgFloat(ft), Some(r), ResolvedType::Float(ft))
                 }
                 _ => return Err(no_agg_overload("avg")),
             }
@@ -5681,7 +5813,8 @@ fn resolve_func_call(
         "count" | "sum" | "min" | "max" | "avg" => {
             resolve_aggregate(scope, &lname, args, star, agg, params)
         }
-        "abs" | "round" => resolve_scalar_func(scope, &lname, args, star, agg, params),
+        "abs" | "round" | "ceil" | "floor" | "trunc" | "sqrt" | "exp" | "ln" | "log10" | "pow"
+        | "sin" | "cos" | "tan" => resolve_scalar_func(scope, &lname, args, star, agg, params),
         _ => Err(EngineError::new(
             SqlState::UndefinedFunction,
             format!("function does not exist: {name}"),
@@ -5714,21 +5847,62 @@ fn resolve_scalar_func(
         rargs.push(r);
         tys.push(t);
     }
+    use ResolvedType::{Decimal as RDec, Float, Int};
     let result = match (name, tys.as_slice()) {
-        // abs: result is the operand's own type (range-checked at its boundary for integers).
-        ("abs", [ResolvedType::Int(it)]) => *it,
-        ("abs", [ResolvedType::Decimal]) => ScalarType::Decimal,
-        // round: always decimal; integer overloads return numeric (PG round(5)).
-        ("round", [ResolvedType::Decimal])
-        | ("round", [ResolvedType::Decimal, ResolvedType::Int(_)])
-        | ("round", [ResolvedType::Int(_)])
-        | ("round", [ResolvedType::Int(_), ResolvedType::Int(_)]) => ScalarType::Decimal,
+        // abs: result is the operand's own type (range-checked at its boundary for integers; the
+        // operand's float width for floats — spec/design/float.md §8, the only `promoted` float fn).
+        ("abs", [Int(it)]) => *it,
+        ("abs", [RDec]) => ScalarType::Decimal,
+        ("abs", [Float(ft)]) => *ft,
+        // round: decimal/integer overloads return numeric (PG round(5)); the FLOAT overloads
+        // (1- and 2-arg) return float64 (catalog `result = "float64"`).
+        ("round", [RDec])
+        | ("round", [RDec, Int(_)])
+        | ("round", [Int(_)])
+        | ("round", [Int(_), Int(_)]) => ScalarType::Decimal,
+        ("round", [Float(_)]) | ("round", [Float(_), Int(_)]) => ScalarType::Float64,
+        // The other float functions always return float64 (catalog `result = "float64"`), over a
+        // single float arg — exact (ceil/floor/trunc/sqrt) and transcendental (exp/ln/log10/sin/
+        // cos/tan). `pow` takes two floats (mixed widths promote to float64).
+        ("ceil", [Float(_)])
+        | ("floor", [Float(_)])
+        | ("trunc", [Float(_)])
+        | ("sqrt", [Float(_)])
+        | ("exp", [Float(_)])
+        | ("ln", [Float(_)])
+        | ("log10", [Float(_)])
+        | ("sin", [Float(_)])
+        | ("cos", [Float(_)])
+        | ("tan", [Float(_)])
+        | ("pow", [Float(_), Float(_)]) => ScalarType::Float64,
         _ => return Err(no_func_overload(name)),
     };
     let func = match name {
         "abs" => ScalarFunc::Abs,
-        _ => ScalarFunc::Round,
+        "round" => ScalarFunc::Round,
+        "ceil" => ScalarFunc::Ceil,
+        "floor" => ScalarFunc::Floor,
+        "trunc" => ScalarFunc::Trunc,
+        "sqrt" => ScalarFunc::Sqrt,
+        "exp" => ScalarFunc::Exp,
+        "ln" => ScalarFunc::Ln,
+        "log10" => ScalarFunc::Log10,
+        "pow" => ScalarFunc::Pow,
+        "sin" => ScalarFunc::Sin,
+        "cos" => ScalarFunc::Cos,
+        "tan" => ScalarFunc::Tan,
+        _ => unreachable!("scalar-func dispatch admits only the names above"),
     };
+    // Promote float arguments to float64 when the function computes at float64 (every float
+    // overload except `abs(float32)`, which keeps its width). The eval then sees one width.
+    let widen_args = !matches!(func, ScalarFunc::Abs);
+    if widen_args && result == ScalarType::Float64 {
+        rargs = rargs
+            .into_iter()
+            .zip(tys.iter())
+            .map(|(r, t)| widen_float_to_f64(r, *t))
+            .collect();
+    }
     Ok((
         RExpr::ScalarFunc {
             func,
@@ -5842,7 +6016,8 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> R
         | ResolvedType::Uuid
         | ResolvedType::Timestamp
         | ResolvedType::Timestamptz
-        | ResolvedType::Interval => Err(type_error("argument of WHERE must be boolean")),
+        | ResolvedType::Interval
+        | ResolvedType::Float(_) => Err(type_error("argument of WHERE must be boolean")),
     }
 }
 
@@ -6003,6 +6178,8 @@ fn resolved_type_of(ty: ScalarType) -> ResolvedType {
         ResolvedType::Timestamptz
     } else if ty.is_interval() {
         ResolvedType::Interval
+    } else if ty.is_float() {
+        ResolvedType::Float(ty)
     } else {
         ResolvedType::Int(ty)
     }
@@ -6090,10 +6267,14 @@ fn resolve(
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
         Expr::Literal(Literal::Int(n)) => {
-            // An integer literal adapts only to an *integer* context; a non-integer context
-            // (a text/decimal column or assignment target) does not apply — it defaults to
-            // int64, and the surrounding check then reports the family mismatch (42804) or
-            // widens it (int→decimal), never panics on a non-integer range.
+            // An integer literal ADAPTS to a float context — decimal/int literal → float at the
+            // context width (nearest, round-ties-to-even — spec/design/float.md §4). This is
+            // literal adaptation, not an implicit cross-family cast (a *value* never silently
+            // becomes a float). Otherwise it adapts only to an integer context, defaulting to
+            // int64; a non-numeric context defers the family-mismatch check to the surroundings.
+            if let Some(t) = ctx.filter(|t| t.is_float()) {
+                return Ok((int_to_const_float(*n, t), ResolvedType::Float(t)));
+            }
             let ty = match ctx {
                 Some(t) if t.is_integer() => t,
                 _ => ScalarType::Int64,
@@ -6135,9 +6316,18 @@ fn resolve(
             }
         }
         Expr::Literal(Literal::Decimal(d)) => {
-            // A decimal literal is always decimal; it does not adapt to context (like text).
-            // Cap-check it here (an over-long coefficient/scale traps 22003 at resolve —
+            // A decimal literal ADAPTS to a float context — decimal → float at the context width
+            // (nearest binary value, round-ties-to-even — spec/design/float.md §4). Otherwise it
+            // stays decimal (it does not adapt to other contexts, like text). Cap-check the
+            // decimal value here (an over-long coefficient/scale traps 22003 at resolve —
             // spec/design/decimal.md §6).
+            if let Some(t) = ctx.filter(|t| t.is_float()) {
+                return Ok(match decimal_to_float(d, t)? {
+                    Value::Float32(f) => (RExpr::ConstFloat32(f), ResolvedType::Float(t)),
+                    Value::Float64(f) => (RExpr::ConstFloat64(f), ResolvedType::Float(t)),
+                    _ => unreachable!("decimal_to_float returns a float value"),
+                });
+            }
             let d = d.clone().check_cap()?;
             Ok((RExpr::ConstDecimal(d), ResolvedType::Decimal))
         }
@@ -6288,8 +6478,13 @@ fn resolve(
             let (rinner, ity) = resolve(scope, inner, inner_ctx, agg, params)?;
             match ity {
                 // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
-                // decimal→decimal (re-scale), and NULL are all castable.
-                ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null => {}
+                // decimal→decimal (re-scale), and NULL are all castable. Floats add int↔float,
+                // decimal↔float, and float↔float (spec/design/float.md §6 — all explicit; the
+                // eval does the rounding/range-check), so a Float inner is castable too.
+                ResolvedType::Int(_)
+                | ResolvedType::Decimal
+                | ResolvedType::Float(_)
+                | ResolvedType::Null => {}
                 ResolvedType::Bool => {
                     return Err(type_error(format!(
                         "cannot cast boolean to {}",
@@ -6334,6 +6529,8 @@ fn resolve(
             }
             let result_ty = if target.is_decimal() {
                 ResolvedType::Decimal
+            } else if target.is_float() {
+                ResolvedType::Float(target)
             } else {
                 ResolvedType::Int(target)
             };
@@ -6354,6 +6551,9 @@ fn resolve(
             let result = match ty {
                 ResolvedType::Int(t) => t,
                 ResolvedType::Decimal => ScalarType::Decimal,
+                // -float flips the sign bit (no overflow; a NaN/Inf operand passes through —
+                // spec/design/float.md §5). The result keeps the operand's width.
+                ResolvedType::Float(t) => t,
                 ResolvedType::Null => ScalarType::Int64, // -NULL = NULL
                 ResolvedType::Interval => ScalarType::Interval, // -interval (interval.md §5)
                 ResolvedType::Bool
@@ -6369,6 +6569,8 @@ fn resolve(
                 ResolvedType::Decimal
             } else if result.is_interval() {
                 ResolvedType::Interval
+            } else if result.is_float() {
+                ResolvedType::Float(result)
             } else {
                 ResolvedType::Int(result)
             };
@@ -6592,6 +6794,38 @@ fn resolve_binary(
                     resolved_type_of(result),
                 ));
             }
+            // Float arithmetic (spec/design/float.md §5): float ⊕ float → float, mixed widths
+            // PROMOTE to float64 first (the implicit float32 → float64 cast). A float paired with
+            // any non-float family is a 42804 (the strict island), reported by require_numeric
+            // below since one side is Float. A pure float pair (or float × NULL) is handled here.
+            if matches!(lt, ResolvedType::Float(_)) || matches!(rt, ResolvedType::Float(_)) {
+                match promote_float_arith(rl, lt, rr, rt) {
+                    Some((rl, rr, result)) => {
+                        let aop = match op {
+                            BinaryOp::Add => ArithOp::Add,
+                            BinaryOp::Sub => ArithOp::Sub,
+                            BinaryOp::Mul => ArithOp::Mul,
+                            BinaryOp::Div => ArithOp::Div,
+                            BinaryOp::Mod => ArithOp::Mod,
+                            _ => unreachable!(),
+                        };
+                        return Ok((
+                            RExpr::Arith {
+                                op: aop,
+                                lhs: Box::new(rl),
+                                rhs: Box::new(rr),
+                                result,
+                            },
+                            ResolvedType::Float(result),
+                        ));
+                    }
+                    // A float paired with a non-float, non-NULL family — the strict island
+                    // (int/decimal × float is 42804, spec/design/float.md §6).
+                    None => {
+                        return Err(type_error("arithmetic operators require numeric operands"));
+                    }
+                }
+            }
             require_numeric_operand(lt)?;
             require_numeric_operand(rt)?;
             let aop = match op {
@@ -6625,6 +6859,14 @@ fn resolve_binary(
             // The runtime comparison (eq3/lt3/gt3) dispatches on the value variants.
             let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
             classify_comparable(lt, rt)?;
+            // A mixed-width float comparison promotes the float32 side to float64 first (the
+            // implicit cast — spec/design/float.md §2/§3), so the runtime compare sees one width.
+            let (rl, rr) =
+                if matches!(lt, ResolvedType::Float(_)) && matches!(rt, ResolvedType::Float(_)) {
+                    (widen_float_to_f64(rl, lt), widen_float_to_f64(rr, rt))
+                } else {
+                    (rl, rr)
+                };
             let cop = match op {
                 BinaryOp::Eq => CmpOp::Eq,
                 BinaryOp::Lt => CmpOp::Lt,
@@ -6701,7 +6943,10 @@ fn resolve_operand_pair(
 fn is_adaptable_operand(e: &Expr) -> bool {
     matches!(
         e,
-        Expr::Literal(Literal::Int(_)) | Expr::Literal(Literal::Text(_)) | Expr::Param(_)
+        Expr::Literal(Literal::Int(_))
+            | Expr::Literal(Literal::Decimal(_))
+            | Expr::Literal(Literal::Text(_))
+            | Expr::Param(_)
     )
 }
 
@@ -6724,6 +6969,11 @@ fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
         // An interval sibling offers its type so a string literal parses as an interval.
         ResolvedType::Interval => Some(ScalarType::Interval),
+        // A float sibling offers its width so an integer/decimal literal ADAPTS to a float
+        // context (decimal/int → float at the sibling's width — spec/design/float.md §4). A bare
+        // string literal does NOT adapt to a float sibling (its Literal::Text arm keeps it text),
+        // so widening the mapping is safe.
+        ResolvedType::Float(st) => Some(st),
     }
 }
 
@@ -6806,13 +7056,16 @@ fn factor_to_fraction(v: &Value) -> Result<(i128, i128)> {
 fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
     match ty {
         ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null => Ok(()),
+        // Float reaches here only as the NON-float side of a mixed pair (a pure float × float pair
+        // is routed before this) — int/decimal × float is a 42804, the strict island (float.md §6).
         ResolvedType::Bool
         | ResolvedType::Text
         | ResolvedType::Bytea
         | ResolvedType::Uuid
         | ResolvedType::Timestamp
         | ResolvedType::Timestamptz
-        | ResolvedType::Interval => {
+        | ResolvedType::Interval
+        | ResolvedType::Float(_) => {
             Err(type_error("arithmetic operators require numeric operands"))
         }
     }
@@ -6825,9 +7078,18 @@ fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
 /// across these families but never compares across them.
 fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
     use ResolvedType::{
-        Bool, Bytea, Decimal, Int, Interval, Null, Text, Timestamp, Timestamptz, Uuid,
+        Bool, Bytea, Decimal, Float, Int, Interval, Null, Text, Timestamp, Timestamptz, Uuid,
     };
     match (lt, rt) {
+        // Float is a STRICT ISLAND (spec/design/float.md §3/§6): comparable only float × float
+        // (either width — a mixed-width pair promotes to float64 first, compare.toml `max-rank`)
+        // or with a bare NULL. Float vs ANY other family (int/decimal included) is 42804 — jed
+        // requires an explicit cast, a documented divergence from PG which promotes to float8.
+        (Float(_), Float(_)) => Ok(()),
+        (Float(_), Null) | (Null, Float(_)) => Ok(()),
+        (Float(_), _) | (_, Float(_)) => Err(type_error(
+            "cannot compare a float value with a value of a different type",
+        )),
         // interval compares only within its own family (or with a bare NULL), by the canonical
         // span (spec/design/interval.md §2). interval vs any other family is a 42804.
         (Interval, Interval) => Ok(()),
@@ -6893,6 +7155,52 @@ fn int_type(ty: ResolvedType) -> Option<ScalarType> {
         ResolvedType::Int(t) => Some(t),
         _ => None,
     }
+}
+
+/// Wrap a `float32`-typed operand in an implicit `CAST(... AS float64)` so a mixed-width float
+/// pair (compare or arith) computes at one width (spec/design/float.md §2/§5). A float64 or
+/// non-float operand is returned unchanged; the caller decides when widening is needed.
+fn widen_float_to_f64(node: RExpr, ty: ResolvedType) -> RExpr {
+    if matches!(ty, ResolvedType::Float(ScalarType::Float32)) {
+        RExpr::Cast {
+            inner: Box::new(node),
+            target: ScalarType::Float64,
+            typmod: None,
+        }
+    } else {
+        node
+    }
+}
+
+/// Resolve a float arithmetic pair to `(lhs, rhs, result_width)` with mixed widths promoted to
+/// float64 (spec/design/float.md §5). Returns `None` when the pair is NOT a pure float pair (one
+/// side is a non-float, non-NULL family) — the caller then raises the strict-island 42804. A
+/// `float × NULL` pair adopts the float side's width (the NULL propagates at eval).
+fn promote_float_arith(
+    rl: RExpr,
+    lt: ResolvedType,
+    rr: RExpr,
+    rt: ResolvedType,
+) -> Option<(RExpr, RExpr, ScalarType)> {
+    use ResolvedType::{Float, Null};
+    let width = match (lt, rt) {
+        (Float(a), Float(b)) => {
+            if a.rank() >= b.rank() {
+                a
+            } else {
+                b
+            }
+        }
+        (Float(a), Null) | (Null, Float(a)) => a,
+        _ => return None,
+    };
+    // Promote a float32 operand to the common width when the result is float64.
+    let (rl, rr) = if width == ScalarType::Float64 {
+        (widen_float_to_f64(rl, lt), widen_float_to_f64(rr, rt))
+    } else {
+        (rl, rr)
+    };
+    Some((rl, rr, width))
 }
 
 /// The promotion-tower result type of two arithmetic operands: the higher-ranked
@@ -7152,7 +7460,8 @@ fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
         | ResolvedType::Uuid
         | ResolvedType::Timestamp
         | ResolvedType::Timestamptz
-        | ResolvedType::Interval => Err(type_error(msg)),
+        | ResolvedType::Interval
+        | ResolvedType::Float(_) => Err(type_error(msg)),
     }
 }
 
@@ -7182,6 +7491,11 @@ fn require_assignable(ty: ResolvedType, col_ty: ScalarType, col: &str) -> Result
         matches!(ty, ResolvedType::Timestamptz | ResolvedType::Null)
     } else if col_ty.is_interval() {
         matches!(ty, ResolvedType::Interval | ResolvedType::Null)
+    } else if col_ty.is_float() {
+        // A float value assigns to an equal-or-wider float column: float32 → float32/float64
+        // (implicit widening), float64 → float64 only (float64 → float32 is explicit-CAST only).
+        matches!(ty, ResolvedType::Float(st) if st.rank() <= col_ty.rank())
+            || matches!(ty, ResolvedType::Null)
     } else {
         // text column
         matches!(ty, ResolvedType::Text | ResolvedType::Null)
@@ -7372,7 +7686,99 @@ fn coerce_string_literal(
             RExpr::ConstInt(parse_int_literal(s, target)?),
             ResolvedType::Int(target),
         ),
+        // `float '…'` / `real '…'` / CAST('…' AS float64) — parse via the float input function
+        // (sign, digits, `.`, e-notation, Infinity/inf/NaN; spec/design/float.md §4). Malformed →
+        // 22P02, out of range → 22003.
+        ScalarType::Float64 => (
+            RExpr::ConstFloat64(parse_f64_literal(s)?),
+            ResolvedType::Float(ScalarType::Float64),
+        ),
+        ScalarType::Float32 => (
+            RExpr::ConstFloat32(parse_f32_literal(s)?),
+            ResolvedType::Float(ScalarType::Float32),
+        ),
     })
+}
+
+/// Parse a string literal's content as a `float64` — the text→float coercion for `float '1.5e10'`
+/// / `CAST('Infinity' AS float64)` (spec/design/float.md §4). Accepts an optional leading sign,
+/// decimal digits with an optional point and `e`-notation, and the case-insensitive special words
+/// `Infinity`/`+Infinity`/`-Infinity`/`inf`/`+inf`/`-inf`/`NaN` (PG `float8in` spellings).
+/// Surrounding ASCII whitespace is trimmed. Malformed input traps `22P02`; a value outside the
+/// binary64 range traps `22003`.
+fn parse_f64_literal(s: &str) -> Result<f64> {
+    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    let invalid = || {
+        EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            format!("invalid input syntax for type float64: \"{s}\""),
+        )
+    };
+    if let Some(v) = parse_float_special_f64(t) {
+        return Ok(v);
+    }
+    // Rust's `f64::from_str` accepts the same finite grammar PG does (sign/digits/point/e-notation),
+    // but also `inf`/`nan` spellings — already handled above, so reject any non-finite result that
+    // sneaks through (defensive) and any parse failure.
+    let v: f64 = t.parse().map_err(|_| invalid())?;
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        // A finite-looking literal that overflows binary64 parses to ±Inf — that is 22003, not a
+        // first-class infinity (only the special words above produce ±Inf).
+        Err(overflow(ScalarType::Float64))
+    }
+}
+
+/// As [`parse_f64_literal`], for `float32` (binary32). A finite value beyond the binary32 range
+/// traps `22003`.
+fn parse_f32_literal(s: &str) -> Result<f32> {
+    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    let invalid = || {
+        EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            format!("invalid input syntax for type float32: \"{s}\""),
+        )
+    };
+    if let Some(v) = parse_float_special_f32(t) {
+        return Ok(v);
+    }
+    let v: f32 = t.parse().map_err(|_| invalid())?;
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Err(overflow(ScalarType::Float32))
+    }
+}
+
+/// Recognize PG's special float spellings (case-insensitive): `infinity`/`inf` (± optional sign),
+/// `nan`. Returns the value, or `None` if `t` is not one of them (a finite literal). Shared shape
+/// for both widths.
+fn parse_float_special_f64(t: &str) -> Option<f64> {
+    let lower = t.to_ascii_lowercase();
+    let (sign, body) = match lower.strip_prefix('-') {
+        Some(r) => (-1.0, r),
+        None => (1.0, lower.strip_prefix('+').unwrap_or(&lower)),
+    };
+    match body {
+        "infinity" | "inf" => Some(sign * f64::INFINITY),
+        "nan" => Some(f64::NAN),
+        _ => None,
+    }
+}
+
+/// As [`parse_float_special_f64`], at binary32.
+fn parse_float_special_f32(t: &str) -> Option<f32> {
+    let lower = t.to_ascii_lowercase();
+    let (sign, body) = match lower.strip_prefix('-') {
+        Some(r) => (-1.0, r),
+        None => (1.0, lower.strip_prefix('+').unwrap_or(&lower)),
+    };
+    match body {
+        "infinity" | "inf" => Some(sign * f32::INFINITY),
+        "nan" => Some(f32::NAN),
+        _ => None,
+    }
 }
 
 /// Parse a string literal's content as a signed integer of type `ty` — the text→integer coercion
@@ -7622,6 +8028,32 @@ fn store_value(
                 )))
             }
         }
+        // A float32 stores into a float32 column verbatim, or WIDENS losslessly into a float64
+        // column (the implicit float32 → float64 cast, spec/types/casts.toml). Other targets 42804.
+        Value::Float32(f) => {
+            if col_ty.is_float32() {
+                Ok(Value::Float32(f))
+            } else if col_ty.is_float64() {
+                Ok(Value::Float64(f as f64))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a float32 value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+        // A float64 stores into a float64 column verbatim. float64 → float32 is an EXPLICIT cast
+        // (lossy), so it never reaches store_value as an implicit assignment — any other target 42804.
+        Value::Float64(f) => {
+            if col_ty.is_float64() {
+                Ok(Value::Float64(f))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a float64 value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
         // Poisoned (large-values.md §14): a stored value is an evaluated expression result.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
@@ -7646,6 +8078,22 @@ fn literal_to_value(lit: &Literal) -> Value {
         Literal::Text(s) => Value::Text(s.clone()),
         Literal::Decimal(d) => Value::Decimal(d.clone()),
     }
+}
+
+/// Wrap a literal as a runtime value for a given target column type — like [`literal_to_value`],
+/// but an integer or decimal literal ADAPTS to a float column (decimal/int → float at the column's
+/// width, nearest, round-ties-to-even — spec/design/float.md §4), so `INSERT INTO t(f) VALUES (1.5)`
+/// and a `DEFAULT 1.5` on a float column land as floats. An out-of-range magnitude traps 22003 at
+/// resolve. Every other literal/target pair falls through unchanged (store_value then type-checks).
+fn literal_to_value_for(lit: &Literal, col_ty: ScalarType) -> Result<Value> {
+    if col_ty.is_float() {
+        match lit {
+            Literal::Int(n) => return Ok(int_to_float(*n, col_ty)),
+            Literal::Decimal(d) => return decimal_to_float(d, col_ty),
+            _ => {}
+        }
+    }
+    Ok(literal_to_value(lit))
 }
 
 impl RExpr {
@@ -7678,6 +8126,8 @@ impl RExpr {
             RExpr::ConstBool(b) => Ok(Value::Bool(*b)),
             RExpr::ConstText(s) => Ok(Value::Text(s.clone())),
             RExpr::ConstDecimal(d) => Ok(Value::Decimal(d.clone())),
+            RExpr::ConstFloat32(f) => Ok(Value::Float32(*f)),
+            RExpr::ConstFloat64(f) => Ok(Value::Float64(*f)),
             RExpr::ConstBytea(b) => Ok(Value::Bytea(b.clone())),
             RExpr::ConstUuid(u) => Ok(Value::Uuid(*u)),
             RExpr::ConstTimestamp(m) => Ok(Value::Timestamp(*m)),
@@ -7699,6 +8149,10 @@ impl RExpr {
                                 Decimal::from_i64(n),
                                 *typmod,
                             )?))
+                        } else if target.is_float() {
+                            // int → float (explicit; nearest, round-ties-to-even — Rust `as`).
+                            // Never overflows: i64::MAX < f32::MAX, so the result is always finite.
+                            Ok(int_to_float(n, *target))
                         } else if target.in_range(n) {
                             Ok(Value::Int(n))
                         } else {
@@ -7709,6 +8163,10 @@ impl RExpr {
                         if target.is_decimal() {
                             // decimal → decimal: re-scale to the target typmod.
                             Ok(Value::Decimal(coerce_decimal(d, *typmod)?))
+                        } else if target.is_float() {
+                            // decimal → float (explicit; nearest binary value). A magnitude that
+                            // overflows the float range → 22003 (not ±Inf — the §3 finite rule).
+                            decimal_to_float(&d, *target)
                         } else {
                             // decimal → int (explicit): round half-away to scale 0, then
                             // range-check the target integer type (22003).
@@ -7720,6 +8178,9 @@ impl RExpr {
                             }
                         }
                     }
+                    // float → int / decimal / float (all explicit — spec/design/float.md §6).
+                    Value::Float32(f) => cast_from_float(f as f64, *target, *typmod),
+                    Value::Float64(f) => cast_from_float(f, *target, *typmod),
                     Value::Bool(_) => unreachable!("resolver rejects a boolean cast operand"),
                     Value::Text(_) => unreachable!("resolver rejects a text cast operand"),
                     Value::Bytea(_) => unreachable!("resolver rejects a bytea cast operand"),
@@ -7750,6 +8211,10 @@ impl RExpr {
                         }
                     }
                     Value::Decimal(d) => Ok(Value::Decimal(d.neg())),
+                    // Unary minus flips the float sign bit (no overflow; a NaN/Inf operand passes
+                    // through — spec/design/float.md §5). Width preserved by the resolver's result.
+                    Value::Float32(f) => Ok(Value::Float32(-f)),
+                    Value::Float64(f) => Ok(Value::Float64(-f)),
                     Value::Bool(_) => unreachable!("resolver rejects a boolean unary minus"),
                     Value::Text(_) => unreachable!("resolver rejects a text unary minus"),
                     Value::Bytea(_) => unreachable!("resolver rejects a bytea unary minus"),
@@ -7849,6 +8314,17 @@ impl RExpr {
                     m.charge(COSTS.decimal_work * ((w - 1) as i64));
                     m.guard()?;
                     eval_decimal_arith(*op, da, db)
+                } else if result.is_float() {
+                    // Float arithmetic (spec/design/float.md §5): the IEEE correctly-rounded op at
+                    // the result width, ONE op per node (no FMA fusion — the tree-walk guarantees
+                    // it). The resolver promoted a mixed-width pair to float64, so both operands
+                    // are already the result width. A finite overflow to ±Inf traps 22003, x/0
+                    // traps 22012; an Inf/NaN operand propagates by IEEE.
+                    match (a, b) {
+                        (Value::Float32(x), Value::Float32(y)) => eval_float32_arith(*op, x, y),
+                        (Value::Float64(x), Value::Float64(y)) => eval_float64_arith(*op, x, y),
+                        _ => unreachable!("resolver promotes float arithmetic to one width"),
+                    }
                 } else {
                     match (a, b) {
                         (Value::Int(x), Value::Int(y)) => eval_arith(*op, x, y, *result),
@@ -7966,14 +8442,32 @@ impl RExpr {
                             }
                         }
                         Value::Decimal(d) => Ok(Value::Decimal(d.abs())),
-                        _ => unreachable!("resolver restricts abs to integer/decimal operands"),
+                        // abs over a float keeps the operand width (NaN passes through; |±Inf| = Inf).
+                        Value::Float32(f) => Ok(Value::Float32(f.abs())),
+                        Value::Float64(f) => Ok(Value::Float64(f.abs())),
+                        _ => unreachable!("resolver restricts abs to numeric operands"),
                     },
+                    // round over a float (1- or 2-arg) → float64 (half-away — the engine's mode;
+                    // a NaN/Inf operand passes through). Distinguished from decimal round by the
+                    // operand variant.
+                    ScalarFunc::Round if matches!(&vals[0], Value::Float64(_)) => {
+                        let f = match &vals[0] {
+                            Value::Float64(f) => *f,
+                            _ => unreachable!(),
+                        };
+                        let places = match vals.get(1) {
+                            None => 0,
+                            Some(Value::Int(k)) => *k,
+                            Some(_) => unreachable!("resolver restricts round's count to integer"),
+                        };
+                        Ok(Value::Float64(round_f64_places(f, places)))
+                    }
                     ScalarFunc::Round => {
                         let d = match &vals[0] {
                             Value::Int(n) => Decimal::from_i64(*n),
                             Value::Decimal(d) => d.clone(),
                             _ => {
-                                unreachable!("resolver restricts round to integer/decimal operands")
+                                unreachable!("resolver restricts round to numeric operands")
                             }
                         };
                         let places = match vals.get(1) {
@@ -7982,6 +8476,28 @@ impl RExpr {
                             Some(_) => unreachable!("resolver restricts round's count to integer"),
                         };
                         Ok(Value::Decimal(d.round_places(places)?))
+                    }
+                    // The other float functions all take a single float64 arg (the resolver widened
+                    // it) and return float64 (spec/design/float.md §8). EXACT (in-contract):
+                    // ceil/floor/trunc/sqrt. sqrt of a negative is a DOMAIN error → 22003 (NaN stays
+                    // input-only). TRANSCENDENTAL (exempted — native libm): exp/ln/log10/pow/sin/
+                    // cos/tan; ln(0)/ln(neg) → 22003, exp/pow overflow → 22003.
+                    ScalarFunc::Ceil
+                    | ScalarFunc::Floor
+                    | ScalarFunc::Trunc
+                    | ScalarFunc::Sqrt
+                    | ScalarFunc::Exp
+                    | ScalarFunc::Ln
+                    | ScalarFunc::Log10
+                    | ScalarFunc::Pow
+                    | ScalarFunc::Sin
+                    | ScalarFunc::Cos
+                    | ScalarFunc::Tan => {
+                        let x = match &vals[0] {
+                            Value::Float64(f) => *f,
+                            _ => unreachable!("resolver widens a float function arg to float64"),
+                        };
+                        eval_float_func(*func, x, vals.get(1))
                     }
                 }
             }
@@ -8139,6 +8655,328 @@ fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> 
     }
 }
 
+/// Evaluate `float64 ⊕ float64` for one node (spec/design/float.md §5): the IEEE correctly-rounded
+/// op (round-ties-to-even — Rust's default). The PG TRAP model: a FINITE pair whose result
+/// overflows to ±Inf traps 22003 (finite arithmetic never PRODUCES non-finite values); `x / 0`
+/// (or `x % 0`) traps 22012. An operand already Inf/NaN PROPAGATES by IEEE (no trap).
+fn eval_float64_arith(op: ArithOp, x: f64, y: f64) -> Result<Value> {
+    // Division/modulus by zero traps 22012, BUT only when the dividend is finite — `Inf / 0`
+    // would be a propagating non-finite operand in PG terms; here the divisor is finite zero so
+    // it is a genuine division by zero regardless of the dividend's finiteness (matches PG).
+    if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0.0 {
+        return Err(EngineError::new(
+            SqlState::DivisionByZero,
+            "division by zero",
+        ));
+    }
+    let r = match op {
+        ArithOp::Add => x + y,
+        ArithOp::Sub => x - y,
+        ArithOp::Mul => x * y,
+        ArithOp::Div => x / y,
+        ArithOp::Mod => x % y, // IEEE fmod (Rust `%` on f64 is fmod)
+    };
+    // Finite-overflow trap (§3): a result that became ±Inf from two FINITE operands overflowed.
+    if r.is_infinite() && x.is_finite() && y.is_finite() {
+        return Err(overflow(ScalarType::Float64));
+    }
+    Ok(Value::Float64(r))
+}
+
+/// As [`eval_float64_arith`], at binary32 (`float32`). Each op rounds to binary32 (native `f32`
+/// arithmetic), so a finite overflow to ±Inf at the float32 range traps 22003.
+fn eval_float32_arith(op: ArithOp, x: f32, y: f32) -> Result<Value> {
+    if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0.0 {
+        return Err(EngineError::new(
+            SqlState::DivisionByZero,
+            "division by zero",
+        ));
+    }
+    let r = match op {
+        ArithOp::Add => x + y,
+        ArithOp::Sub => x - y,
+        ArithOp::Mul => x * y,
+        ArithOp::Div => x / y,
+        ArithOp::Mod => x % y,
+    };
+    if r.is_infinite() && x.is_finite() && y.is_finite() {
+        return Err(overflow(ScalarType::Float32));
+    }
+    Ok(Value::Float32(r))
+}
+
+/// Cast an integer to a float of `target` width (spec/design/float.md §6): nearest, round-ties-to-
+/// even (Rust `as`), never overflows (i64::MAX < f32::MAX). `target` is a float type.
+fn int_to_float(n: i64, target: ScalarType) -> Value {
+    if target.is_float32() {
+        Value::Float32(n as f32)
+    } else {
+        Value::Float64(n as f64)
+    }
+}
+
+/// An integer literal adapted to a float context as a constant `RExpr` (spec/design/float.md §4),
+/// at the context width.
+fn int_to_const_float(n: i64, target: ScalarType) -> RExpr {
+    if target.is_float32() {
+        RExpr::ConstFloat32(n as f32)
+    } else {
+        RExpr::ConstFloat64(n as f64)
+    }
+}
+
+/// Cast a decimal to a float of `target` width (spec/design/float.md §6): the nearest binary value
+/// to the decimal's exact value. A magnitude that overflows the float range traps 22003 (not ±Inf
+/// — the §3 finite rule; decimal is always finite, so the result can only be finite or trap).
+fn decimal_to_float(d: &Decimal, target: ScalarType) -> Result<Value> {
+    // The decimal's canonical string parses to the nearest binary value (Rust's float parser is
+    // correctly rounded). A huge decimal parses to ±Inf, which is the overflow case.
+    let s = d.render();
+    if target.is_float32() {
+        let f: f32 = s.parse().map_err(|_| overflow(ScalarType::Float32))?;
+        if f.is_finite() {
+            Ok(Value::Float32(f))
+        } else {
+            Err(overflow(ScalarType::Float32))
+        }
+    } else {
+        let f: f64 = s.parse().map_err(|_| overflow(ScalarType::Float64))?;
+        if f.is_finite() {
+            Ok(Value::Float64(f))
+        } else {
+            Err(overflow(ScalarType::Float64))
+        }
+    }
+}
+
+/// Cast a float value (already widened to f64) to a non-float `target` — int / decimal — or to a
+/// narrower float width (spec/design/float.md §6). NaN/±Inf → 22003 for every non-float target
+/// (and for float64 → float32 overflow). Float → int rounds HALF AWAY FROM ZERO (jed's one mode)
+/// then range-checks. Float → decimal is the exact decimal of the binary value, then the typmod.
+fn cast_from_float(f: f64, target: ScalarType, typmod: Option<DecimalTypmod>) -> Result<Value> {
+    if target.is_float64() {
+        // float → float64: widening (lossless from f32, identity from f64).
+        return Ok(Value::Float64(f));
+    }
+    if target.is_float32() {
+        // float64 → float32: nearest (round-ties-to-even). A finite value beyond the binary32
+        // range traps 22003 (not ±Inf); NaN/±Inf convert across widths unchanged (propagate).
+        let n = f as f32;
+        if n.is_infinite() && f.is_finite() {
+            return Err(overflow(ScalarType::Float32));
+        }
+        return Ok(Value::Float32(n));
+    }
+    // Non-float targets reject NaN/±Inf (they have no finite representation).
+    if !f.is_finite() {
+        return Err(overflow(target));
+    }
+    if target.is_decimal() {
+        // float → decimal: the EXACT decimal of the binary value (spec/design/float.md §6), then
+        // the typmod's scale coercion. `f` is finite (checked above); a float32 reaches here
+        // already losslessly widened to f64, so the exact decimal IS the binary32 value's.
+        let d = Decimal::from_float64(f);
+        return Ok(Value::Decimal(coerce_decimal(d, typmod)?));
+    }
+    // float → int: round HALF AWAY FROM ZERO, then range-check the target integer (22003).
+    let rounded = f.round(); // Rust `f64::round` is round-half-away-from-zero
+    if rounded < i64::MIN as f64 || rounded > i64::MAX as f64 {
+        return Err(overflow(target));
+    }
+    let v = rounded as i64;
+    if target.in_range(v) {
+        Ok(Value::Int(v))
+    } else {
+        Err(overflow(target))
+    }
+}
+
+/// Finalize a float SUM/AVG as the order-independent CANONICAL-ORDER FOLD (spec/design/float.md §7),
+/// bit-identical across cores and across any serial/parallel plan. The steps, in order:
+/// 1. Special values FIRST (order-independent): empty/all-NULL group → NULL (an aggregate over no
+///    rows); any NaN → NaN; both +Inf and -Inf → NaN; else +Inf → +Inf; else -Inf → -Inf; else
+///    all-finite → step 2.
+/// 2. Sort the (already `-0`-canonicalized) finite inputs by the §3 total order — distinct values
+///    have distinct keys, so the sort is total/deterministic.
+/// 3. Fold left with width-correct IEEE add (a running total overflowing to ±Inf → 22003).
+///
+/// AVG = SUM / count, ONE final rounding at the input width.
+#[allow(clippy::too_many_arguments)]
+fn finalize_float_fold(
+    width: ScalarType,
+    is_avg: bool,
+    mut finite: Vec<f64>,
+    count: i64,
+    any_nan: bool,
+    pos_inf: bool,
+    neg_inf: bool,
+) -> Result<Value> {
+    let is_f32 = width.is_float32();
+    let wrap = |f: f64| -> Value {
+        if is_f32 {
+            Value::Float32(f as f32)
+        } else {
+            Value::Float64(f)
+        }
+    };
+    // Step 1 — empty group → NULL (no non-NULL inputs).
+    if count == 0 {
+        return Ok(Value::Null);
+    }
+    // Step 1 — special values, resolved before any finite sum (order-independent).
+    if any_nan {
+        return Ok(wrap(f64::NAN));
+    }
+    if pos_inf && neg_inf {
+        return Ok(wrap(f64::NAN));
+    }
+    if pos_inf {
+        return Ok(wrap(f64::INFINITY));
+    }
+    if neg_inf {
+        return Ok(wrap(f64::NEG_INFINITY));
+    }
+    // Step 2 — sort the finite inputs by the total order (all finite, so a plain partial_cmp is
+    // total here; -0 already canonicalized to +0 at fold time).
+    finite.sort_by(|a, b| crate::value::total_cmp_f64(*a, *b));
+    // Step 3 — fold left at the input width (round each add to the width). A running total that
+    // overflows to ±Inf from finite operands traps 22003 (the §3 finite-overflow rule).
+    let sum = if is_f32 {
+        let mut acc: f32 = 0.0;
+        for &v in &finite {
+            acc += v as f32;
+            if acc.is_infinite() {
+                return Err(overflow(ScalarType::Float32));
+            }
+        }
+        acc as f64
+    } else {
+        let mut acc: f64 = 0.0;
+        for &v in &finite {
+            acc += v;
+            if acc.is_infinite() {
+                return Err(overflow(ScalarType::Float64));
+            }
+        }
+        acc
+    };
+    if !is_avg {
+        return Ok(wrap(sum));
+    }
+    // AVG = SUM / count, one rounding at the input width.
+    if is_f32 {
+        let avg = (sum as f32) / (count as f32);
+        Ok(Value::Float32(avg))
+    } else {
+        Ok(Value::Float64(sum / count as f64))
+    }
+}
+
+/// `round(float64, places)` — round half away from zero to `places` decimal digits (the engine's
+/// one mode — spec/design/float.md §8). A NaN/±Inf operand passes through. `places` may be
+/// negative (round to the left of the point). Done by scaling by 10^places, `round()` (half-away),
+/// then unscaling — the approximate float path (binary, so itself inexact, which the `R` tag
+/// absorbs).
+fn round_f64_places(f: f64, places: i64) -> f64 {
+    if !f.is_finite() {
+        return f;
+    }
+    if places == 0 {
+        return f.round();
+    }
+    let scale = 10f64.powi(places as i32);
+    if !scale.is_finite() || scale == 0.0 {
+        // Extreme `places` — clamp to the operand (no observable rounding at that magnitude).
+        return f;
+    }
+    (f * scale).round() / scale
+}
+
+/// Evaluate a float scalar function over a finite/non-finite f64 (spec/design/float.md §8). The
+/// EXACT set (ceil/floor/trunc/sqrt) is correctly-rounded (in-contract); the TRANSCENDENTAL set
+/// (exp/ln/log10/pow/sin/cos/tan) calls Rust's libm (exempted, may differ by an ULP cross-core).
+/// Domain/overflow errors trap 22003, keeping NaN/Inf input-only (a NaN/Inf *operand* propagates).
+fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Value> {
+    let r = match func {
+        ScalarFunc::Ceil => x.ceil(),
+        ScalarFunc::Floor => x.floor(),
+        ScalarFunc::Trunc => x.trunc(),
+        ScalarFunc::Sqrt => {
+            // sqrt of a NEGATIVE finite value is a domain error → 22003 (NaN stays input-only).
+            // A NaN/±Inf operand propagates (sqrt(Inf) = Inf, sqrt(NaN) = NaN).
+            if x.is_finite() && x < 0.0 {
+                return Err(EngineError::new(
+                    SqlState::NumericValueOutOfRange,
+                    "cannot take square root of a negative number",
+                ));
+            }
+            x.sqrt()
+        }
+        ScalarFunc::Exp => {
+            let v = x.exp();
+            // exp overflow (e.g. exp(710)) → ±Inf from a finite operand traps 22003.
+            if v.is_infinite() && x.is_finite() {
+                return Err(overflow(ScalarType::Float64));
+            }
+            v
+        }
+        ScalarFunc::Ln => {
+            // ln(0) → 22003; ln(neg) → 22003 (domain). NaN/Inf operands propagate.
+            if x.is_finite() {
+                if x == 0.0 {
+                    return Err(EngineError::new(
+                        SqlState::NumericValueOutOfRange,
+                        "cannot take logarithm of zero",
+                    ));
+                }
+                if x < 0.0 {
+                    return Err(EngineError::new(
+                        SqlState::NumericValueOutOfRange,
+                        "cannot take logarithm of a negative number",
+                    ));
+                }
+            }
+            x.ln()
+        }
+        ScalarFunc::Log10 => {
+            if x.is_finite() {
+                if x == 0.0 {
+                    return Err(EngineError::new(
+                        SqlState::NumericValueOutOfRange,
+                        "cannot take logarithm of zero",
+                    ));
+                }
+                if x < 0.0 {
+                    return Err(EngineError::new(
+                        SqlState::NumericValueOutOfRange,
+                        "cannot take logarithm of a negative number",
+                    ));
+                }
+            }
+            x.log10()
+        }
+        ScalarFunc::Pow => {
+            let y = match arg2 {
+                Some(Value::Float64(y)) => *y,
+                _ => unreachable!("pow's second arg is a widened float64"),
+            };
+            let v = x.powf(y);
+            // pow overflow from finite operands → 22003.
+            if v.is_infinite() && x.is_finite() && y.is_finite() {
+                return Err(overflow(ScalarType::Float64));
+            }
+            v
+        }
+        ScalarFunc::Sin => x.sin(),
+        ScalarFunc::Cos => x.cos(),
+        ScalarFunc::Tan => x.tan(),
+        ScalarFunc::Abs | ScalarFunc::Round => {
+            unreachable!("abs/round are handled before eval_float_func")
+        }
+    };
+    Ok(Value::Float64(r))
+}
+
 /// Widen a numeric value to `Decimal` (an integer operand of decimal arithmetic).
 fn to_decimal(v: Value) -> Decimal {
     match v {
@@ -8232,6 +9070,9 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Decimal(x), Value::Decimal(y)) => x.cmp_value(y),
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        // Floats order by the PG total order (NaN largest, -0 = +0; spec/design/float.md §3).
+        (Value::Float32(x), Value::Float32(y)) => crate::value::total_cmp_f32(*x, *y),
+        (Value::Float64(x), Value::Float64(y)) => crate::value::total_cmp_f64(*x, *y),
         (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         // Timestamps order by the int64 instant (-infinity < finite < infinity).
@@ -8260,6 +9101,8 @@ fn family_rank(v: &Value) -> u8 {
         Value::Timestamp(_) => 6,
         Value::Timestamptz(_) => 7,
         Value::Interval(_) => 8,
+        Value::Float32(_) => 9,
+        Value::Float64(_) => 10,
         // Poisoned (large-values.md §14): ORDER BY slots are in the touched set, so a sort
         // key is always resolved before it reaches the comparator.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),

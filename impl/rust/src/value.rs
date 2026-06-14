@@ -22,11 +22,19 @@ use crate::timestamp;
 /// booleans compare by value, false < true. `Text` is a stored non-integer value; it
 /// compares by the `C` collation (UTF-8 byte / code-point order — types.md §11). `Bytea`
 /// is a raw byte string; it compares by unsigned byte order (types.md §13).
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Debug)]
 pub enum Value {
     Null,
     Int(i64),
     Bool(bool),
+    /// IEEE 754 binary32 (`float32`/`real` — spec/design/float.md). Held as the native `f32`;
+    /// the stored bits round-trip verbatim (a stored `-0.0` keeps its sign), but equality,
+    /// ordering, and `DISTINCT`/`GROUP BY` use the PG TOTAL order (`-0 = +0`, `NaN = NaN`, NaN
+    /// the largest value — §3), implemented in the manual `PartialEq`/`Eq`/`Hash` below.
+    Float32(f32),
+    /// IEEE 754 binary64 (`float64`/`double precision` — spec/design/float.md). Same total-order
+    /// semantics as `Float32`, at binary64 width.
+    Float64(f64),
     Text(String),
     /// An exact base-10 decimal (spec/design/decimal.md). Its `PartialEq`/`Eq`/`Hash` are
     /// **value-canonical** (`1.5 == 1.50`), so DISTINCT/GROUP BY over decimals compare by
@@ -74,6 +82,119 @@ pub enum Unfetched {
         stored_len: u32,
         raw_len: u32,
     },
+}
+
+/// A `float64`'s canonical bits for the TOTAL order (spec/design/float.md §3): collapse `-0.0`
+/// to `+0.0` and every NaN bit pattern to one canonical quiet NaN, leaving every other value's
+/// bits unchanged. Equality, hashing, dedup, and key encoding all act on this canonical form, so
+/// `-0 = +0` and `NaN = NaN` while a stored value's *original* bits are preserved by the codec.
+pub(crate) fn canon_f64_bits(x: f64) -> u64 {
+    if x.is_nan() {
+        // One canonical NaN pattern (the standard quiet NaN) for all NaNs.
+        0x7ff8_0000_0000_0000
+    } else if x == 0.0 {
+        // Covers both -0.0 and +0.0 (they are `==`), mapping both to +0.0's bits.
+        0u64
+    } else {
+        x.to_bits()
+    }
+}
+
+/// As [`canon_f64_bits`], for `float32` (binary32): one canonical quiet NaN, `-0 → +0`.
+pub(crate) fn canon_f32_bits(x: f32) -> u32 {
+    if x.is_nan() {
+        0x7fc0_0000
+    } else if x == 0.0 {
+        0u32
+    } else {
+        x.to_bits()
+    }
+}
+
+/// The PG `float8` TOTAL order over `f64` (spec/design/float.md §3): `-Infinity < every finite
+/// value < +Infinity < NaN`, with `-0 = +0` and all NaNs one equivalence class. NOT raw IEEE
+/// (where NaN is unordered) and NOT Rust's `f64::total_cmp` (which orders `-NaN` below `-Inf`
+/// and splits `±0`). Used by every comparison/order/dedup path so a float sorts identically in
+/// every core.
+pub(crate) fn total_cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (an, bn) = (a.is_nan(), b.is_nan());
+    match (an, bn) {
+        (true, true) => Ordering::Equal,    // all NaNs equal
+        (true, false) => Ordering::Greater, // NaN is the largest value
+        (false, true) => Ordering::Less,
+        // Both non-NaN: IEEE compare gives a total order over finite/±Inf, and `-0 == +0`
+        // already holds, so `partial_cmp` is `Some` here.
+        (false, false) => a
+            .partial_cmp(&b)
+            .expect("non-NaN floats are totally ordered"),
+    }
+}
+
+/// As [`total_cmp_f64`], for `float32` (binary32) — the same PG total order at single precision.
+pub(crate) fn total_cmp_f32(a: f32, b: f32) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (an, bn) = (a.is_nan(), b.is_nan());
+    match (an, bn) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a
+            .partial_cmp(&b)
+            .expect("non-NaN floats are totally ordered"),
+    }
+}
+
+// `Value` cannot derive PartialEq/Eq/Hash because the float variants hold f32/f64, which are
+// neither Eq nor Hash (IEEE NaN ≠ NaN, ±0 split). The manual impls below give the float variants
+// the PG TOTAL-order semantics (-0 = +0, NaN = NaN) so DISTINCT/GROUP BY (which key on
+// `Vec<Value>` hash sets/maps — executor.rs) collapse them correctly, while every other variant
+// keeps its previous derived behavior (value-canonical for Decimal/Interval).
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Float32(a), Value::Float32(b)) => canon_f32_bits(*a) == canon_f32_bits(*b),
+            (Value::Float64(a), Value::Float64(b)) => canon_f64_bits(*a) == canon_f64_bits(*b),
+            (Value::Text(a), Value::Text(b)) => a == b,
+            (Value::Decimal(a), Value::Decimal(b)) => a == b,
+            (Value::Bytea(a), Value::Bytea(b)) => a == b,
+            (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (Value::Timestamptz(a), Value::Timestamptz(b)) => a == b,
+            (Value::Interval(a), Value::Interval(b)) => a == b,
+            (Value::Unfetched(a), Value::Unfetched(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Discriminant-tag the variant so two different-variant values never collide spuriously,
+        // then hash the canonical payload. Floats hash their canonical bits, so `-0`/`+0` and all
+        // NaNs land in one bucket — consistent with `PartialEq` (the Hash/Eq contract).
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Null => {}
+            Value::Int(n) => n.hash(state),
+            Value::Bool(b) => b.hash(state),
+            Value::Float32(f) => canon_f32_bits(*f).hash(state),
+            Value::Float64(f) => canon_f64_bits(*f).hash(state),
+            Value::Text(s) => s.hash(state),
+            Value::Decimal(d) => d.hash(state),
+            Value::Bytea(b) => b.hash(state),
+            Value::Uuid(u) => u.hash(state),
+            Value::Timestamp(m) => m.hash(state),
+            Value::Timestamptz(m) => m.hash(state),
+            Value::Interval(iv) => iv.hash(state),
+            Value::Unfetched(u) => u.hash(state),
+        }
+    }
 }
 
 /// Compare two numeric values by value, promoting an integer operand to decimal when its
@@ -128,6 +249,13 @@ impl Value {
             Value::Int(n) => n.to_string(),
             Value::Bool(true) => "true".to_string(),
             Value::Bool(false) => "false".to_string(),
+            // Floats render with the native SHORTEST round-trip formatter (spec/design/float.md §9):
+            // Rust's `{}` (= `to_string()`) is shortest-round-trip. Special values render PG-style
+            // (`Infinity` / `-Infinity` / `NaN`), and `-0` renders `-0` (Rust's default already
+            // prints `-0`). Layout may differ across cores; the conformance `R` tag compares by
+            // value within a tolerance (float.md §9), so this divergence is absorbed.
+            Value::Float32(f) => render_f32(*f),
+            Value::Float64(f) => render_f64(*f),
             Value::Text(s) => s.clone(),
             // Decimal renders as its canonical base-10 string, preserving display scale
             // (the `D` tag — spec/design/decimal.md §6).
@@ -166,6 +294,15 @@ impl Value {
         match (self, other) {
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() == b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a == b),
+            // Floats compare by the PG TOTAL order (spec/design/float.md §3): `-0 = +0` and
+            // `NaN = NaN` (so `NaN = NaN` is TRUE in jed). Same-width only — the resolver
+            // promotes a mixed-width pair to float64 (an implicit cast) before eval.
+            (Value::Float32(a), Value::Float32(b)) => {
+                bool3(total_cmp_f32(*a, *b) == std::cmp::Ordering::Equal)
+            }
+            (Value::Float64(a), Value::Float64(b)) => {
+                bool3(total_cmp_f64(*a, *b) == std::cmp::Ordering::Equal)
+            }
             (Value::Bytea(a), Value::Bytea(b)) => bool3(a == b),
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a == b),
             // Timestamps compare by the int64 instant; infinity is just an extreme value.
@@ -191,6 +328,12 @@ impl Value {
         match (self, other) {
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() < b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a < b),
+            (Value::Float32(a), Value::Float32(b)) => {
+                bool3(total_cmp_f32(*a, *b) == std::cmp::Ordering::Less)
+            }
+            (Value::Float64(a), Value::Float64(b)) => {
+                bool3(total_cmp_f64(*a, *b) == std::cmp::Ordering::Less)
+            }
             (Value::Bytea(a), Value::Bytea(b)) => bool3(a < b),
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a < b),
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a < b),
@@ -212,6 +355,12 @@ impl Value {
         match (self, other) {
             (Value::Text(a), Value::Text(b)) => bool3(a.as_bytes() > b.as_bytes()),
             (Value::Bool(a), Value::Bool(b)) => bool3(a > b),
+            (Value::Float32(a), Value::Float32(b)) => {
+                bool3(total_cmp_f32(*a, *b) == std::cmp::Ordering::Greater)
+            }
+            (Value::Float64(a), Value::Float64(b)) => {
+                bool3(total_cmp_f64(*a, *b) == std::cmp::Ordering::Greater)
+            }
             (Value::Bytea(a), Value::Bytea(b)) => bool3(a > b),
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a > b),
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a > b),
@@ -245,6 +394,40 @@ fn bool3(b: bool) -> ThreeValued {
         ThreeValued::True
     } else {
         ThreeValued::False
+    }
+}
+
+/// Render a `float64` as its native shortest-round-trip decimal, with PG-style special-value
+/// spellings (spec/design/float.md §9). Rust's `{}` is already shortest-round-trip and prints
+/// `-0` for negative zero, but spells infinity `inf`/`-inf` and NaN `NaN`; PG (and the corpus)
+/// want `Infinity` / `-Infinity` / `NaN`, so those three are spelled here. The layout of finite
+/// values is core-specific and absorbed by the `R` tag's tolerant compare (§9).
+fn render_f64(f: f64) -> String {
+    if f.is_nan() {
+        "NaN".to_string()
+    } else if f.is_infinite() {
+        if f < 0.0 {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        }
+    } else {
+        f.to_string()
+    }
+}
+
+/// As [`render_f64`], for `float32` — `f32::to_string()` is the binary32 shortest round trip.
+fn render_f32(f: f32) -> String {
+    if f.is_nan() {
+        "NaN".to_string()
+    } else if f.is_infinite() {
+        if f < 0.0 {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        }
+    } else {
+        f.to_string()
     }
 }
 

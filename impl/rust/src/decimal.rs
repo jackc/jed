@@ -78,6 +78,49 @@ impl Decimal {
         Decimal::from_parts(neg, scale, mag_from_decimal_str(digits))
     }
 
+    /// The EXACT base-10 decimal equal to a finite binary64 (spec/design/float.md §6, the
+    /// `float → decimal` cast). A binary64 is `M · 2^E` for an integer significand `M` and
+    /// exponent `E`: for `E ≥ 0` the value is the integer `M · 2^E` (scale 0); for `E < 0` it
+    /// is `M · 5^(-E)` with scale `-E` (since `2^E = 5^(-E) / 10^(-E)`), an exact terminating
+    /// decimal. Computed with the module's own hand-rolled limb arithmetic (`mag_mul_small`
+    /// by 2 or 5) — NO float formatting, NO bignum crate — so it is identical bit-for-bit
+    /// across cores (the value matches Go's `exactDecimalFromFloat64`). The caller checks
+    /// finiteness (NaN/±Inf → 22003) and applies the target typmod's scale coercion.
+    pub fn from_float64(f: f64) -> Decimal {
+        if f == 0.0 {
+            return Decimal::zero(0); // +0 and -0 both → exact 0
+        }
+        let bits = f.to_bits();
+        let neg = (bits >> 63) != 0;
+        let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+        let mut mant = bits & ((1u64 << 52) - 1);
+        let exp: i64 = if raw_exp == 0 {
+            // Subnormal: no implicit leading 1; the true exponent is fixed at -1074.
+            -1074
+        } else {
+            mant |= 1u64 << 52; // restore the implicit leading 1
+            raw_exp - 1075 // unbias 1023 + shift out the 52 mantissa bits
+        };
+        let mut mag = mag_from_u64(mant);
+        if exp >= 0 {
+            // value = M · 2^exp (an integer, scale 0). Multiply the magnitude by 2 `exp` times.
+            for _ in 0..exp {
+                mag = mag_mul_small(&mag, 2);
+            }
+            return Decimal::from_parts(neg, 0, mag);
+        }
+        // value = M · 5^|exp| with scale |exp| (since 2^exp = 5^|exp| / 10^|exp|).
+        let k = (-exp) as u32;
+        for _ in 0..k {
+            mag = mag_mul_small(&mag, 5);
+        }
+        // Normalize to the minimal display scale (trim trailing fractional zeros): the value is
+        // unchanged but the rendered form matches PG's float8->numeric (0.5, not 0.500…0). This
+        // is exact — only zero digits are removed — via the canonical form.
+        let (cneg, cdigits, cscale) = Decimal::from_parts(neg, k, mag).canonical();
+        Decimal::from_parts(cneg, cscale, cdigits)
+    }
+
     pub fn is_zero(&self) -> bool {
         self.limbs.is_empty()
     }
@@ -831,6 +874,47 @@ mod tests {
             None,
             "out of i64 range"
         );
+    }
+
+    #[test]
+    fn float64_to_decimal_is_exact() {
+        // Exactly-representable binaries expand to their exact (short) decimal.
+        assert_eq!(Decimal::from_float64(0.5).render(), "0.5");
+        assert_eq!(Decimal::from_float64(2.5).render(), "2.5");
+        assert_eq!(Decimal::from_float64(0.0).render(), "0");
+        assert_eq!(Decimal::from_float64(-0.0).render(), "0");
+        assert_eq!(Decimal::from_float64(1.0).render(), "1");
+        // 1e20 is an exact integer in binary64 (its exponent is positive) — scale 0.
+        assert_eq!(
+            Decimal::from_float64(1e20).render(),
+            "100000000000000000000"
+        );
+
+        // 0.1 is NOT exactly representable: the exact value of the nearest binary64 is the long
+        // expansion below — the unique cross-core answer (matches Go's exactDecimalFromFloat64).
+        let tenth = Decimal::from_float64(0.1);
+        assert_eq!(
+            tenth.render(),
+            "0.1000000000000000055511151231257827021181583404541015625"
+        );
+        // The full exact value has scale 55; the typmod(60,55) coercion is loss-free here.
+        assert_eq!(tenth.scale(), 55);
+        assert_eq!(
+            tenth.coerce_to_typmod(60, 55).unwrap().render(),
+            "0.1000000000000000055511151231257827021181583404541015625"
+        );
+
+        // A negative non-representable value expands exactly too (the binary64 nearest -0.2).
+        assert_eq!(
+            Decimal::from_float64(-0.2).render(),
+            "-0.200000000000000011102230246251565404236316680908203125"
+        );
+
+        // Round-trip: the exact decimal must re-parse (via render) to the SAME binary64.
+        for f in [0.1f64, 1.0 / 3.0, 123456.789, -2.25, 1e-10, 0.2] {
+            let back: f64 = Decimal::from_float64(f).render().parse().unwrap();
+            assert_eq!(back, f, "exact decimal of {f} must reparse to itself");
+        }
     }
 
     #[test]

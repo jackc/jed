@@ -106,6 +106,55 @@ function arrEq(a: string[], b: string[]): boolean {
   return true;
 }
 
+// parseFloatCell parses an expected/actual float render cell to a JS number for the R-tag compare.
+// Recognizes the PG/jed spellings the R column may carry: NaN, ±Infinity (and -0). Returns NaN for
+// an unparseable cell (then both-NaN below would wrongly match — but a real float column never
+// renders junk, so this is fine; the tolerant compare is only reached for an R-tagged column).
+function parseFloatCell(s: string): number {
+  if (s === "Infinity" || s === "+Infinity") return Infinity;
+  if (s === "-Infinity") return -Infinity;
+  return Number(s);
+}
+
+// floatCellsEqual is the R (real) render-tag's tolerant comparison (spec/design/float.md §9,
+// conformance.md §1): parse both cells to f64 and consider them equal iff both NaN, OR bit-equal /
+// Object.is (covers ±Inf and -0===+0 via the a===b arm), OR — for two finite values — within a
+// small relative tolerance. Layout differences and a transcendental's last-ULP divergence never
+// fail. This is the ONE tag compared by value, not by string.
+function floatCellsEqual(expected: string, actual: string): boolean {
+  const a = parseFloatCell(expected);
+  const b = parseFloatCell(actual);
+  const an = Number.isNaN(a);
+  const bn = Number.isNaN(b);
+  if (an || bn) return an && bn; // both NaN → equal; exactly one NaN → not
+  if (a === b || Object.is(a, b)) return true; // ±Inf exact; -0 === +0 treated equal here
+  if (Number.isFinite(a) && Number.isFinite(b)) {
+    return Math.abs(a - b) <= 1e-9 * Math.max(Math.abs(a), Math.abs(b), 1);
+  }
+  return false;
+}
+
+// cellsEqual compares one result cell against its expected value, selecting the comparator by the
+// column's coltype tag: an `R` (real/float) column compares by PARSED VALUE within a tolerance
+// (floatCellsEqual); every other tag compares by exact string (the bit-exact, in-contract surface).
+function cellsEqual(coltype: string, expected: string, actual: string): boolean {
+  return coltype === "R" ? floatCellsEqual(expected, actual) : expected === actual;
+}
+
+// rowsEqual compares the actual vs expected flat cell arrays column-aware: a flat index's column is
+// (index mod cols), whose coltype tag picks the comparator. Used after applySort has aligned both
+// arrays (the R tag's tolerance only ever loosens equality, so sorting by string then comparing
+// tolerantly is sound for the float renders the corpus produces).
+function rowsEqual(coltypes: string, cols: number, actual: string[], expected: string[]): boolean {
+  if (actual.length !== expected.length) return false;
+  for (let i = 0; i < actual.length; i++) {
+    const col = cols > 0 ? i % cols : 0;
+    const tag = col < coltypes.length ? coltypes[col]! : "";
+    if (!cellsEqual(tag, expected[i]!, actual[i]!)) return false;
+  }
+  return true;
+}
+
 // parseCostDirective parses a `# cost: N` directive line (CLAUDE.md §13). Returns the
 // asserted cost, or null if the comment is not a cost directive.
 function parseCostDirective(line: string): bigint | null {
@@ -286,7 +335,11 @@ function runFile(text: string): void {
       const cols = coltypes.length === 0 ? 1 : coltypes.length;
       const actual = renderOutcome(outcome, cols, sortmode);
       const exp = applySort(expected, cols, sortmode);
-      if (!arrEq(actual, exp)) {
+      // Compare column-aware: an `R` (float) column compares by parsed value within a tolerance
+      // (the R-tag exemption — float.md §9); every other tag is exact string. arrEq is the
+      // exact-only fast path for the no-R-column case.
+      const ok = coltypes.includes("R") ? rowsEqual(coltypes, cols, actual, exp) : arrEq(actual, exp);
+      if (!ok) {
         throw new Error(
           `query result mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(exp)}\n  actual:   ${JSON.stringify(actual)}`,
         );

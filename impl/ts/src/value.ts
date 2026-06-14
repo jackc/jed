@@ -32,6 +32,15 @@ export type Value =
   // An exact base-10 decimal (spec/design/decimal.md). Value-equality is scale-insensitive
   // (1.5 == 1.50) and goes through eq3/cmpValue / the DISTINCT value-canonical key.
   | { kind: "decimal"; dec: Decimal }
+  // An IEEE 754 binary float (spec/design/float.md). `value` is a plain JS number — which IS
+  // binary64, so a float64's number is exact; a float32's number is ALWAYS the `Math.fround`'d
+  // value (true binary32), maintained by every constructor/op/cast/literal. NaN/±Infinity are
+  // first-class. Comparison/dedup/keys use the TOTAL order (floatTotalCmp): -0 == +0, NaN == NaN,
+  // NaN largest — NOT JS `<`/`===` (which give NaN!==NaN and -0===+0 wrong for ordering). Storage
+  // preserves the bits verbatim (a stored -0.0 keeps its sign); canonicalization is a compare/key
+  // concern only.
+  | { kind: "float32"; value: number }
+  | { kind: "float64"; value: number }
   // A raw byte string (the bytea column type); compares by UNSIGNED byte order (§13). It
   // holds a Uint8Array — already raw bytes, so unlike text there is NO UTF-16 trap here.
   | { kind: "bytea"; bytes: Uint8Array }
@@ -86,6 +95,43 @@ export function textValue(s: string): Value {
 // decimalValue builds a non-null decimal value.
 export function decimalValue(d: Decimal): Value {
   return { kind: "decimal", dec: d };
+}
+
+// float64Value builds a non-null float64 value (the number IS already binary64; verbatim bits).
+export function float64Value(n: number): Value {
+  return { kind: "float64", value: n };
+}
+
+// float32Value builds a non-null float32 value, rounding to binary32 via Math.fround so the
+// stored number is exactly the value the float32 width represents (spec/design/float.md §2).
+// Every caller building a float32 — literal, cast, arithmetic result, decode — goes through here
+// (or Math.fround directly) so a binary64-precision number can never leak into a float32 value.
+export function float32Value(n: number): Value {
+  return { kind: "float32", value: Math.fround(n) };
+}
+
+// canonFloat maps -0 → +0 for comparison / dedup / key encoding (NOT for storage, which keeps the
+// sign bit). NaN is left as-is; floatTotalCmp collapses all NaNs to one equivalence class. This is
+// the §3 negative-zero canonicalization: -0 and +0 must dedup to one bucket and key identically.
+export function canonFloat(n: number): number {
+  return Object.is(n, -0) ? 0 : n;
+}
+
+// floatTotalCmp is the float TOTAL order (PostgreSQL's float8 btree order — spec/design/float.md
+// §3), NOT raw IEEE: -Infinity < (finite) < +Infinity < NaN, with -0 == +0 and NaN == NaN (all
+// NaNs one equivalence class). Returns <0, 0, >0. Raw JS `<`/`===` are wrong here (NaN!==NaN, NaN
+// comparisons are all false), so the order is built explicitly. This drives =/</>/<=/>=, ORDER BY,
+// MIN/MAX, DISTINCT/GROUP BY, and SUM/AVG's canonical sort for BOTH float widths.
+export function floatTotalCmp(a: number, b: number): number {
+  const an = Number.isNaN(a);
+  const bn = Number.isNaN(b);
+  // NaN is the single largest value (above +Infinity); two NaNs are equal.
+  if (an || bn) return an && bn ? 0 : an ? 1 : -1;
+  // Finite/Infinite: canonicalize -0 → +0 so -0 == +0, then compare numerically. JS `<`/`>` are
+  // correct for the finite + ±Infinity range once NaN and -0 are handled.
+  const ca = canonFloat(a);
+  const cb = canonFloat(b);
+  return ca < cb ? -1 : ca > cb ? 1 : 0;
 }
 
 // byteaValue builds a non-null bytea value from raw bytes.
@@ -278,6 +324,15 @@ export function render(v: Value): string {
       // Decimal renders as its canonical base-10 string, preserving display scale
       // (the D tag — spec/design/decimal.md §6).
       return v.dec.render();
+    case "float32":
+    case "float64":
+      // Native shortest-round-trip (JS Number#toString), the R tag (spec/design/float.md §9).
+      // float32's value is already Math.fround'd (binary32), so its toString is the shortest
+      // form of the binary32 value. Specials render PG-style. NOTE the JS quirk: (-0).toString()
+      // is "0" (and (+0).toString() is "0"), so -0 is special-cased to "-0"; Infinity.toString()
+      // is already "Infinity"/"−" handled, and NaN.toString() is "NaN". Layout (exponent
+      // threshold) may differ cross-core — absorbed by the R tag's parse-to-value compare.
+      return renderFloat(v.value);
     case "bytea":
       return renderByteaHex(v.bytes);
     case "uuid":
@@ -296,6 +351,17 @@ export function render(v: Value): string {
   }
 }
 
+// renderFloat formats a float value's JS number to its conformance text (spec/design/float.md §9):
+// the native shortest-round-trip (Number#toString) for finite values, PG-style spellings for the
+// specials. The R tag compares by parsed value, so the only requirement here is that the digits be
+// shortest-round-trip (mathematically unique cross-core) and the specials match PG's words. The two
+// JS quirks handled: (-0).toString() is "0" (force "-0"), and NaN/Infinity already toString to
+// "NaN"/"Infinity"/"-Infinity".
+export function renderFloat(n: number): string {
+  if (Object.is(n, -0)) return "-0";
+  return n.toString();
+}
+
 // eq3 is three-valued equality. NULL compared with anything (including NULL) is
 // UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Integers compare by
 // value (all integer types promote losslessly into the common bigint); text by the C
@@ -311,6 +377,11 @@ export function eq3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c === 0);
+  // Floats compare by the TOTAL order (NaN == NaN TRUE, -0 == +0). A mixed-width float pair never
+  // reaches here — the resolver promotes both to float64 first. float is a strict island, so a
+  // float never compares with int/decimal (resolver rejects 42804).
+  if (a.kind === "float32" && b.kind === "float32") return bool3(floatTotalCmp(a.value, b.value) === 0);
+  if (a.kind === "float64" && b.kind === "float64") return bool3(floatTotalCmp(a.value, b.value) === 0);
   if (a.kind === "text" && b.kind === "text") return bool3(a.text === b.text);
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) === 0);
   if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) === 0);
@@ -334,6 +405,8 @@ export function lt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c < 0);
+  if (a.kind === "float32" && b.kind === "float32") return bool3(floatTotalCmp(a.value, b.value) < 0);
+  if (a.kind === "float64" && b.kind === "float64") return bool3(floatTotalCmp(a.value, b.value) < 0);
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) < 0);
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) < 0);
   if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) < 0);
@@ -355,6 +428,8 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c > 0);
+  if (a.kind === "float32" && b.kind === "float32") return bool3(floatTotalCmp(a.value, b.value) > 0);
+  if (a.kind === "float64" && b.kind === "float64") return bool3(floatTotalCmp(a.value, b.value) > 0);
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) > 0);
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) > 0);
   if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) > 0);

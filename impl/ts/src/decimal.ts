@@ -78,6 +78,33 @@ export class Decimal {
     return Decimal.fromParts(neg, scale, magFromDecimalStr(digits));
   }
 
+  // exactFromFloat64 builds the EXACT base-10 decimal equal to a finite IEEE binary64
+  // (spec/design/float.md §6; the cross-core float→decimal contract). A binary64 is
+  // mantissa·2^exp; for exp ≥ 0 the value is mantissa·2^exp (an integer, scale 0); for exp < 0
+  // it is mantissa·5^|exp| · 10^(-|exp|) (since 2^-k = 5^k·10^-k), an exact terminating decimal
+  // of scale |exp|. Computed with the limb machinery (magMulSmall by 2 or 5) so it is
+  // byte-identical across cores — NOT via Number#toString's shortest round-trip form. Matches Go
+  // `exactDecimalFromFloat64`. The caller must reject NaN/±Infinity (→ 22003) before calling.
+  static exactFromFloat64(f: number): Decimal {
+    if (f === 0) return Decimal.zero(0); // +0 and -0 both → exact 0
+    const buf = new DataView(new ArrayBuffer(8));
+    buf.setFloat64(0, f, false); // big-endian (layout is irrelevant — we read the same bits back)
+    const bits = buf.getBigUint64(0, false);
+    return exactFromBits(bits, 11, 52, 1075, -1074);
+  }
+
+  // exactFromFloat32 is exactFromFloat64 on the IEEE binary32 significand/exponent (24-bit
+  // mantissa: 23 stored + the implicit leading 1; 8-bit exponent, bias 127). The exact value of a
+  // binary32 is identical whether the source is read as 32-bit or widened to 64-bit, so the cast
+  // operates on the binary32 bit pattern directly (spec/design/float.md §6).
+  static exactFromFloat32(f: number): Decimal {
+    if (f === 0) return Decimal.zero(0);
+    const buf = new DataView(new ArrayBuffer(4));
+    buf.setFloat32(0, f, false);
+    const bits = BigInt(buf.getUint32(0, false));
+    return exactFromBits(bits, 8, 23, 150, -149);
+  }
+
   isZero(): boolean {
     return this.limbs.length === 0;
   }
@@ -354,6 +381,64 @@ export function workMod(a: Decimal, b: Decimal): number {
 // ============================================================================
 // Magnitude helpers — base 10^4, LSB-first, normalized (no high zero limbs).
 // ============================================================================
+
+// exactFromBits builds the exact decimal of a finite IEEE float from its raw bit pattern, shared
+// by exactFromFloat64/32. `expBits`/`mantBits` are the field widths; `normBias` is the exponent
+// adjustment for a normal value (bias + mantBits) and `subExp` the true exponent of a subnormal
+// (1 − bias − mantBits). The implicit leading 1 is added for normals only (subnormals omit it).
+// value = mant·2^exp: for exp ≥ 0 it is the integer mant·2^exp (scale 0); for exp < 0 it is
+// mant·5^|exp| at scale |exp| (since 2^exp = 5^|exp|/10^|exp|), then trailing-zero-trimmed to the
+// minimal display scale so the form matches PG's float→numeric (0.5, not 0.500…0). Mirrors Go
+// `exactDecimalFromFloat64`.
+function exactFromBits(
+  bits: bigint,
+  expBits: number,
+  mantBits: number,
+  normBias: number,
+  subExp: number,
+): Decimal {
+  const neg = bits >> BigInt(expBits + mantBits) !== 0n;
+  const expMask = (1n << BigInt(expBits)) - 1n;
+  const mantMask = (1n << BigInt(mantBits)) - 1n;
+  let biasedExp = Number((bits >> BigInt(mantBits)) & expMask);
+  let mant = bits & mantMask;
+  let exp: number;
+  if (biasedExp === 0) {
+    exp = subExp; // subnormal: no implicit leading 1
+  } else {
+    mant |= 1n << BigInt(mantBits); // implicit leading 1
+    exp = biasedExp - normBias;
+  }
+  let mag = magFromBigUint(mant);
+  if (exp >= 0) {
+    for (let i = 0; i < exp; i++) mag = magMulSmall(mag, 2); // value = mant·2^exp, integer
+    return Decimal.fromParts(neg, 0, mag);
+  }
+  const k = -exp;
+  for (let i = 0; i < k; i++) mag = magMulSmall(mag, 5); // value = mant·5^k at scale k
+  const d = Decimal.fromParts(neg, k, mag);
+  // Trim trailing fractional zeros to the minimal display scale (value unchanged — only zero
+  // digits removed), matching PG's float→numeric canonical form.
+  const cs = d.canonicalString(); // "+digits e scale" (trailing fractional zeros stripped)
+  const ePos = cs.indexOf("e");
+  const csNeg = cs[0] === "-";
+  const digits = cs.slice(1, ePos);
+  const scale = Number(cs.slice(ePos + 1));
+  return Decimal.fromDigitsScale(csNeg, digits, scale);
+}
+
+// magFromBigUint converts a non-negative bigint into LSB-first base-10^4 limbs (the IEEE
+// significand → magnitude step). bigint is permitted here only for the bit extraction; the value
+// math below stays on the limb path.
+function magFromBigUint(v: bigint): number[] {
+  const out: number[] = [];
+  const base = BigInt(BASE);
+  while (v !== 0n) {
+    out.push(Number(v % base));
+    v /= base;
+  }
+  return out;
+}
 
 function magTrim(limbs: number[]): number[] {
   let n = limbs.length;

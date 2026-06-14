@@ -75,6 +75,10 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 10
 	case IntervalType:
 		return 11
+	case Float64:
+		return 12
+	case Float32:
+		return 13
 	default:
 		return 0
 	}
@@ -105,6 +109,10 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return Timestamptz, true
 	case 11:
 		return IntervalType, true
+	case 12:
+		return Float64, true
+	case 13:
+		return Float32, true
 	default:
 		return 0, false
 	}
@@ -202,6 +210,20 @@ func encodeValue(ty ScalarType, v Value) []byte {
 		out = append(out, byte(m>>56), byte(m>>48), byte(m>>40), byte(m>>32),
 			byte(m>>24), byte(m>>16), byte(m>>8), byte(m))
 		return out
+	case ValFloat64:
+		// Fixed 8-byte body, NO length prefix: math.Float64bits big-endian, preserving the bits
+		// VERBATIM (a stored -0.0 keeps its sign bit) — spec/design/float.md §10, format.md code 12.
+		bits := uint64(v.Int)
+		out := make([]byte, 0, 1+8)
+		out = append(out, 0x00) // present
+		return append(out, byte(bits>>56), byte(bits>>48), byte(bits>>40), byte(bits>>32),
+			byte(bits>>24), byte(bits>>16), byte(bits>>8), byte(bits))
+	case ValFloat32:
+		// Fixed 4-byte body, NO length prefix: math.Float32bits big-endian (format.md code 13).
+		bits := uint32(v.Int)
+		out := make([]byte, 0, 1+4)
+		out = append(out, 0x00) // present
+		return appendU32(out, bits)
 	default:
 		n := v.Int
 		return EncodeNullable(ty, &n)
@@ -2145,6 +2167,23 @@ func readInlineBody(ty ScalarType, buf []byte, pos *int) (Value, error) {
 			return TimestampValue(m), nil
 		}
 		return TimestamptzValue(m), nil
+	case ty.IsFloat64():
+		// Fixed 8 raw IEEE bytes big-endian, no length prefix. Branch before the integer path —
+		// DecodeInt would sign-flip. Bits are reconstructed verbatim (spec/design/float.md §10).
+		vb, err := take(buf, pos, 8)
+		if err != nil {
+			return Value{}, err
+		}
+		bits := uint64(vb[0])<<56 | uint64(vb[1])<<48 | uint64(vb[2])<<40 | uint64(vb[3])<<32 |
+			uint64(vb[4])<<24 | uint64(vb[5])<<16 | uint64(vb[6])<<8 | uint64(vb[7])
+		return Value{Kind: ValFloat64, Int: int64(bits)}, nil
+	case ty.IsFloat32():
+		vb, err := take(buf, pos, 4)
+		if err != nil {
+			return Value{}, err
+		}
+		bits := uint32(vb[0])<<24 | uint32(vb[1])<<16 | uint32(vb[2])<<8 | uint32(vb[3])
+		return Value{Kind: ValFloat32, Int: int64(bits)}, nil
 	case ty.IsInterval():
 		// Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
 		mb, err := take(buf, pos, 4)

@@ -554,8 +554,8 @@ func TestTypeCodesRoundTrip(t *testing.T) {
 	if _, ok := scalarForTypeCode(0); ok {
 		t.Errorf("type code 0 (reserved) should be unknown")
 	}
-	if _, ok := scalarForTypeCode(12); ok {
-		t.Errorf("type code 12 should be unknown")
+	if _, ok := scalarForTypeCode(14); ok {
+		t.Errorf("type code 14 should be unknown")
 	}
 }
 

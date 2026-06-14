@@ -42,6 +42,13 @@ const (
 	// serialized through the fixed-width integer codec. (Named IntervalType, not Interval,
 	// because Interval is the value struct.)
 	IntervalType
+	// Float32 is IEEE 754 binary32 / real (spec/design/float.md): the lower rung of the float
+	// promotion tower (rank 1, 4 bytes). Approximate, admits NaN/±Infinity, compared by the PG
+	// total order (NOT raw IEEE). Storable; never a key (float PRIMARY KEY → 0A000).
+	Float32
+	// Float64 is IEEE 754 binary64 / double precision / float (rank 2, 8 bytes). Same family as
+	// float32; a mixed-width float op promotes to float64 (the only implicit float edge).
+	Float64
 )
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. Precision >= 1;
@@ -77,6 +84,10 @@ func (t ScalarType) CanonicalName() string {
 		return "timestamptz"
 	case IntervalType:
 		return "interval"
+	case Float32:
+		return "float32"
+	case Float64:
+		return "float64"
 	default:
 		return "?"
 	}
@@ -110,6 +121,16 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return Timestamptz, true
 	case "interval":
 		return IntervalType, true
+	case "float32", "real":
+		// float32 / real (binary32). PG's `float4` byte-count spelling is NOT accepted (we own
+		// our surface — spec/design/float.md §2), like int2/4/8.
+		return Float32, true
+	case "float64", "double precision", "float":
+		// float64 / double precision / float. A bare `float` (no precision) is double precision
+		// in PG — NOT 32-bit. `float8` and the `float(p)` typmod are NOT accepted (float.md §2).
+		// "double precision" is a two-word alias; this slice's parser only emits single-word type
+		// names, so it is reachable only via a future multi-word parse (a documented narrowing).
+		return Float64, true
 	default:
 		return 0, false
 	}
@@ -139,14 +160,24 @@ func (t ScalarType) IsTimestamptz() bool { return t == Timestamptz }
 // IsInterval reports whether this is the interval (span) type.
 func (t ScalarType) IsInterval() bool { return t == IntervalType }
 
+// IsFloat32 reports whether this is the binary32 float type (real).
+func (t ScalarType) IsFloat32() bool { return t == Float32 }
+
+// IsFloat64 reports whether this is the binary64 float type (double precision).
+func (t ScalarType) IsFloat64() bool { return t == Float64 }
+
+// IsFloat reports whether this is one of the two binary float types (the float family).
+func (t ScalarType) IsFloat() bool { return t == Float32 || t == Float64 }
+
 // IsInteger reports whether this is one of the fixed-width signed integer types.
 func (t ScalarType) IsInteger() bool { return t == Int16 || t == Int32 || t == Int64 }
 
-// WidthBytes is the fixed storage width in bytes (the key-encoding / value-codec width for
-// the fixed-width types: the three integers and uuid). text/decimal/bytea are variable-width
-// (return 0) — they carry their own length (spec/fileformat/format.md) and never use this.
-// uuid (16) is the first non-integer fixed-width type; callers branch on IsUuid before the
-// integer decode path, since decode_int would sign-flip its bytes.
+// WidthBytes is the fixed storage width in bytes (the value-codec width for the fixed-width
+// types: the three integers, uuid, and the two floats). text/decimal/bytea/interval are
+// variable-width or struct-bodied (return 0) — they carry their own length / fixed body
+// (spec/fileformat/format.md) and never use this. uuid (16) and the floats (4/8) are non-integer
+// fixed-width types; callers branch on IsUuid / IsFloat before the integer decode path, since
+// DecodeInt would sign-flip their bytes (floats store raw IEEE big-endian, no sign flip).
 func (t ScalarType) WidthBytes() int {
 	switch t {
 	case Int16:
@@ -159,6 +190,10 @@ func (t ScalarType) WidthBytes() int {
 		return 8
 	case Uuid:
 		return 16
+	case Float32:
+		return 4
+	case Float64:
+		return 8
 	default:
 		return 0
 	}
@@ -192,12 +227,14 @@ func (t ScalarType) Max() int64 {
 	}
 }
 
-// Rank is the promotion-tower rank: int16 < int32 < int64 (spec/types/compare.toml).
+// Rank is the promotion-tower rank within a family: int16 < int32 < int64, and (a SEPARATE
+// tower) float32 < float64 (spec/types/compare.toml). Ranks are only compared within one family
+// (the integer promote path and the float promote path never mix — float is a strict island).
 func (t ScalarType) Rank() int {
 	switch t {
-	case Int16:
+	case Int16, Float32:
 		return 1
-	case Int32:
+	case Int32, Float64:
 		return 2
 	case Int64:
 		return 3
@@ -213,5 +250,5 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType}
+	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType, Float32, Float64}
 }

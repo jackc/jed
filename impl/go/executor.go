@@ -4425,9 +4425,26 @@ func distinctRowKey(row []Value) string {
 			// GROUP BY bucket while each value still renders its own fields (spec/design/interval.md §2).
 			b.WriteByte('v')
 			b.WriteString(v.Iv.Span().String())
+		case ValFloat32, ValFloat64:
+			// Float DISTINCT / GROUP BY uses the §3 total order's equivalence classes: -0 → +0 and
+			// ALL NaNs collapse to one bucket (spec/design/float.md §3). Key on the CANONICAL form —
+			// a canonical NaN pattern, and +0 for ±0 — so -0/+0 and any two NaNs share a bucket. A
+			// distinct 'f' tag (a column is one float width, so the width need not enter the key).
+			b.WriteByte('f')
+			b.WriteString(floatCanonicalKey(v.asF64()))
 		}
 	}
 	return b.String()
+}
+
+// floatCanonicalKey is a collision-free string of a float's total-order equivalence class
+// (spec/design/float.md §3): every NaN → "nan", -0 → +0, otherwise the shortest round-trip
+// decimal. So -0/+0 and any two NaNs key identically (they dedup to one DISTINCT/GROUP BY bucket).
+func floatCanonicalKey(f float64) string {
+	if math.IsNaN(f) {
+		return "nan"
+	}
+	return renderFloat64(canonicalizeFloat64(f))
 }
 
 // ============================================================================
@@ -4452,7 +4469,21 @@ const (
 	rtTimestamp   // timestamp (zoneless instant); does not compare/cast to timestamptz
 	rtTimestamptz // timestamptz (UTC instant); does not compare/cast to timestamp
 	rtInterval    // interval (a span); compares only with itself, by the canonical span
+	rtFloat32     // float32 / real (binary32); promotes to float64; a strict island vs int/decimal
+	rtFloat64     // float64 / double precision (binary64)
 )
+
+// isFloatKind reports whether a resolvedType is one of the two float kinds.
+func isFloatKind(k rtKind) bool { return k == rtFloat32 || k == rtFloat64 }
+
+// promoteFloat is the float promotion tower (compare.toml max-rank): a mixed-width pair widens to
+// float64; same-width stays. Caller guarantees both kinds are float.
+func promoteFloat(a, b rtKind) ScalarType {
+	if a == rtFloat64 || b == rtFloat64 {
+		return Float64
+	}
+	return Float32
+}
 
 type resolvedType struct {
 	kind  rtKind
@@ -4487,6 +4518,10 @@ func resolvedOfColumn(ty ScalarType) resolvedType {
 		return resolvedType{kind: rtTimestamptz}
 	case ty.IsInterval():
 		return resolvedType{kind: rtInterval}
+	case ty.IsFloat32():
+		return resolvedType{kind: rtFloat32}
+	case ty.IsFloat64():
+		return resolvedType{kind: rtFloat64}
 	default: // uuid
 		return resolvedType{kind: rtUuid}
 	}
@@ -4526,6 +4561,12 @@ func assignableTo(t resolvedType, colTy ScalarType) bool {
 		return colTy.IsTimestamptz()
 	case rtInterval:
 		return colTy.IsInterval()
+	case rtFloat32:
+		// float32 assigns to a float32 OR a float64 column (the implicit, lossless widen — §2).
+		return colTy.IsFloat32() || colTy.IsFloat64()
+	case rtFloat64:
+		// float64 assigns only to a float64 column (float64→float32 is explicit-CAST only).
+		return colTy.IsFloat64()
 	default:
 		return false
 	}
@@ -4564,6 +4605,10 @@ func rtName(t resolvedType) string {
 		return "timestamptz"
 	case rtInterval:
 		return "interval"
+	case rtFloat32:
+		return "float32"
+	case rtFloat64:
+		return "float64"
 	default:
 		return "unknown"
 	}
@@ -4603,6 +4648,12 @@ func ctxOf(t resolvedType) *ScalarType {
 	case rtInterval:
 		ty := IntervalType
 		return &ty
+	case rtFloat32:
+		ty := Float32
+		return &ty
+	case rtFloat64:
+		ty := Float64
+		return &ty
 	default:
 		return nil
 	}
@@ -4626,6 +4677,8 @@ const (
 	reConstTimestamp
 	reConstTimestamptz
 	reConstInterval
+	reConstFloat32
+	reConstFloat64
 	reConstNull
 	reCast
 	reNeg
@@ -4668,6 +4721,23 @@ type scalarFunc int
 const (
 	sfAbs scalarFunc = iota
 	sfRound
+	// Float scalar functions (spec/design/float.md §8). The exact / correctly-rounded set
+	// (in-contract): sfFloatAbs, sfCeil, sfFloor, sfTrunc, sfFloatRound (1- and 2-arg), sfSqrt.
+	// The transcendental set (exempted, native libm): sfExp, sfLn, sfLog10, sfPow, sfSin, sfCos,
+	// sfTan. The width of the call is recorded in `result` (Float32/Float64).
+	sfFloatAbs
+	sfCeil
+	sfFloor
+	sfTrunc
+	sfFloatRound
+	sfSqrt
+	sfExp
+	sfLn
+	sfLog10
+	sfPow
+	sfSin
+	sfCos
+	sfTan
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -4682,6 +4752,7 @@ type rExpr struct {
 	cDec    Decimal        // reConstDecimal
 	cBytea  []byte         // reConstBytea
 	cIv     Interval       // reConstInterval
+	cFloat  float64        // reConstFloat32 / reConstFloat64 (a float32 const is held as the f64 of its value)
 	op      BinaryOp       // reArith, reCompare
 	result  ScalarType     // reCast target; reNeg / reArith result type
 	typmod  *DecimalTypmod // reCast: a decimal target's numeric(p,s) typmod
@@ -4868,6 +4939,10 @@ const (
 	planSumInt                    // SUM(int16|int32) — accumulate i64, result int64 (trap at int64)
 	planSumDecimal                // SUM(int64|decimal) — accumulate decimal, result decimal
 	planAvg                       // AVG — decimal sum + i64 count; result sum/count (NULL if 0)
+	planSumFloat32                // SUM(float32) — canonical-order fold, result float32 (float.md §7)
+	planSumFloat64                // SUM(float64) — canonical-order fold, result float64
+	planAvgFloat32                // AVG(float32) — fold sum / count, result float32
+	planAvgFloat64                // AVG(float64) — fold sum / count, result float64
 	planMin
 	planMax
 )
@@ -4881,19 +4956,26 @@ type aggSpec struct {
 
 // acc is a running aggregate accumulator (one per aggSpec), folded per input row then finalized.
 type acc struct {
-	plan   aggPlan
-	count  int64
-	sumInt int64
-	sumDec Decimal
-	seen   bool
-	cur    Value
-	hasCur bool
+	plan     aggPlan
+	count    int64
+	sumInt   int64
+	sumDec   Decimal
+	seen     bool
+	cur      Value
+	hasCur   bool
+	floatSum *floatSumAcc // non-nil for the float SUM/AVG plans (the canonical-order fold — float.md §7)
 }
 
 func newAcc(plan aggPlan) *acc {
 	a := &acc{plan: plan}
 	if plan == planSumDecimal || plan == planAvg {
 		a.sumDec = DecimalFromInt64(0)
+	}
+	switch plan {
+	case planSumFloat32, planAvgFloat32:
+		a.floatSum = newFloatSumAcc(true)
+	case planSumFloat64, planAvgFloat64:
+		a.floatSum = newFloatSumAcc(false)
 	}
 	return a
 }
@@ -4948,6 +5030,13 @@ func (a *acc) fold(v Value, m *Meter) error {
 			a.sumDec = d
 			a.count++
 		}
+	case planSumFloat32, planSumFloat64, planAvgFloat32, planAvgFloat64:
+		// Float SUM/AVG collect into the canonical-order fold accumulator; NULLs are skipped. The
+		// fold itself happens at finalize (order-independent — spec/design/float.md §7). The
+		// per-row aggregate_accumulate is charged by the caller, so this stays O(1)/row.
+		if !v.IsNull() {
+			a.floatSum.add(v)
+		}
 	case planMin, planMax:
 		if !v.IsNull() {
 			if !a.hasCur {
@@ -4989,6 +5078,30 @@ func (a *acc) finalize() (Value, error) {
 			return NullValue(), err
 		}
 		return DecimalValue(d), nil
+	case planSumFloat32:
+		f, ok, err := a.floatSum.sumF32()
+		if err != nil || !ok {
+			return NullValue(), err
+		}
+		return Float32Value(f), nil
+	case planSumFloat64:
+		f, ok, err := a.floatSum.sumF64()
+		if err != nil || !ok {
+			return NullValue(), err
+		}
+		return Float64Value(f), nil
+	case planAvgFloat32:
+		f, ok, err := a.floatSum.avgF32()
+		if err != nil || !ok {
+			return NullValue(), err
+		}
+		return Float32Value(f), nil
+	case planAvgFloat64:
+		f, ok, err := a.floatSum.avgF64()
+		if err != nil || !ok {
+			return NullValue(), err
+		}
+		return Float64Value(f), nil
 	default: // planMin, planMax
 		if a.hasCur {
 			return a.cur, nil
@@ -5277,13 +5390,24 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 				plan, operand, result = planSumInt, r, resolvedType{kind: rtInt, intTy: Int64}
 			case t.kind == rtDecimal:
 				plan, operand, result = planSumDecimal, r, resolvedType{kind: rtDecimal}
+			case t.kind == rtFloat32:
+				// SUM over float stays the input width (same_as_input — spec/design/float.md §7).
+				plan, operand, result = planSumFloat32, r, resolvedType{kind: rtFloat32}
+			case t.kind == rtFloat64:
+				plan, operand, result = planSumFloat64, r, resolvedType{kind: rtFloat64}
 			default:
 				return nil, resolvedType{}, noAggOverload("sum")
 			}
 		case "avg":
-			if t.kind == rtInt || t.kind == rtDecimal {
+			switch {
+			case t.kind == rtInt || t.kind == rtDecimal:
 				plan, operand, result = planAvg, r, resolvedType{kind: rtDecimal}
-			} else {
+			case t.kind == rtFloat32:
+				// AVG over float stays float (NOT widened to double like PG — float.md §7).
+				plan, operand, result = planAvgFloat32, r, resolvedType{kind: rtFloat32}
+			case t.kind == rtFloat64:
+				plan, operand, result = planAvgFloat64, r, resolvedType{kind: rtFloat64}
+			default:
 				return nil, resolvedType{}, noAggOverload("avg")
 			}
 		case "min":
@@ -5326,7 +5450,8 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 	switch toLowerASCII(fc.Name) {
 	case "count", "sum", "min", "max", "avg":
 		return resolveAggregate(s, fc, ag, params)
-	case "abs", "round":
+	case "abs", "round", "ceil", "floor", "trunc", "sqrt",
+		"exp", "ln", "log10", "pow", "sin", "cos", "tan":
 		return resolveScalarFunc(s, fc, ag, params)
 	default:
 		return nil, resolvedType{}, NewError(UndefinedFunction, "function does not exist: "+fc.Name)
@@ -5356,20 +5481,72 @@ func resolveScalarFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		fn     scalarFunc
 		result ScalarType
 	)
+	floatOne := len(tys) == 1 && isFloatKind(tys[0].kind)
 	switch {
-	// abs: result is the operand's own type (range-checked at its boundary for integers).
+	// abs: result is the operand's own type (range-checked at its boundary for integers; the
+	// float overload — sfFloatAbs — returns the arg width per the catalog's "promoted").
 	case name == "abs" && len(tys) == 1 && tys[0].kind == rtInt:
 		fn, result = sfAbs, tys[0].intTy
 	case name == "abs" && len(tys) == 1 && tys[0].kind == rtDecimal:
 		fn, result = sfAbs, DecimalType
-	// round: always decimal; integer overloads return numeric (PG round(5)).
+	case name == "abs" && floatOne:
+		fn, result = sfFloatAbs, floatScalar(tys[0].kind)
+	// round: numeric overloads return decimal (PG round(5)); the float overload (1- or 2-arg)
+	// returns float64 per the catalog (../functions/catalog.toml).
 	case name == "round" && roundArgsOK(tys):
 		fn, result = sfRound, DecimalType
+	case name == "round" && floatRoundArgsOK(tys):
+		fn, result = sfFloatRound, Float64
+	// ceil/floor/trunc/sqrt over a float — exact (sqrt correctly-rounded); result float64 (catalog).
+	case name == "ceil" && floatOne:
+		fn, result = sfCeil, Float64
+	case name == "floor" && floatOne:
+		fn, result = sfFloor, Float64
+	case name == "trunc" && floatOne:
+		fn, result = sfTrunc, Float64
+	case name == "sqrt" && floatOne:
+		fn, result = sfSqrt, Float64
+	// transcendental (exempted, native libm): result float64 (catalog). pow is 2-arg, both float.
+	case name == "exp" && floatOne:
+		fn, result = sfExp, Float64
+	case name == "ln" && floatOne:
+		fn, result = sfLn, Float64
+	case name == "log10" && floatOne:
+		fn, result = sfLog10, Float64
+	case name == "pow" && len(tys) == 2 && isFloatKind(tys[0].kind) && isFloatKind(tys[1].kind):
+		fn, result = sfPow, Float64
+	case name == "sin" && floatOne:
+		fn, result = sfSin, Float64
+	case name == "cos" && floatOne:
+		fn, result = sfCos, Float64
+	case name == "tan" && floatOne:
+		fn, result = sfTan, Float64
 	default:
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
 	rt := resolvedTypeOf(result)
 	return &rExpr{kind: reScalarFunc, sfunc: fn, sargs: rargs, result: result}, rt, nil
+}
+
+// floatScalar maps a float rtKind to its ScalarType.
+func floatScalar(k rtKind) ScalarType {
+	if k == rtFloat32 {
+		return Float32
+	}
+	return Float64
+}
+
+// floatRoundArgsOK reports whether the args match the float round overload: a float value and an
+// optional integer place count (spec/functions/catalog.toml round(float[, integer])).
+func floatRoundArgsOK(tys []resolvedType) bool {
+	switch len(tys) {
+	case 1:
+		return isFloatKind(tys[0].kind)
+	case 2:
+		return isFloatKind(tys[0].kind) && tys[1].kind == rtInt
+	default:
+		return false
+	}
 }
 
 // roundArgsOK reports whether the argument types match a round overload: a numeric value
@@ -5694,6 +5871,10 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 		return resolvedType{kind: rtTimestamptz}
 	case ty.IsInterval():
 		return resolvedType{kind: rtInterval}
+	case ty.IsFloat32():
+		return resolvedType{kind: rtFloat32}
+	case ty.IsFloat64():
+		return resolvedType{kind: rtFloat64}
 	default:
 		return resolvedType{kind: rtInt, intTy: ty}
 	}
@@ -5903,18 +6084,30 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			}
 			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
 		case LiteralDecimal:
-			// A decimal literal is always decimal; it does not adapt to context (like text).
-			// Cap-check it here (an over-long coefficient/scale traps 22003 at resolve).
+			// A decimal literal is decimal by default, but ADAPTS to a FLOAT context: in a
+			// float64/float32 column/operand context it coerces decimal→float at resolve (the
+			// nearest binary value, round-ties-to-even — spec/design/float.md §4). Any other
+			// context keeps it decimal (cap-checked, 22003 on an over-long coefficient/scale).
+			if ctx != nil && ctx.IsFloat() {
+				return floatConstFromDecimal(e.Literal.Dec, *ctx)
+			}
 			d, err := e.Literal.Dec.CheckCap()
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
 			return &rExpr{kind: reConstDecimal, cDec: d}, resolvedType{kind: rtDecimal}, nil
 		default: // LiteralInt
-			// An integer literal adapts only to an integer context; a non-integer context
-			// (a text/decimal column or assignment target) does not apply — it defaults to
-			// int64, and the surrounding check then reports the family mismatch (42804) or
-			// widens it (int→decimal), never a wrong range check on a non-integer type.
+			// An integer literal adapts to an integer context, OR to a FLOAT context (int→float
+			// at resolve — float.md §4). A non-integer/non-float context defaults to int64, and
+			// the surrounding check then reports the mismatch (42804) / widens it (int→decimal).
+			if ctx != nil && ctx.IsFloat() {
+				if ctx.IsFloat32() {
+					return &rExpr{kind: reConstFloat32, cFloat: float64(intToFloat32(e.Literal.Int))},
+						resolvedType{kind: rtFloat32}, nil
+				}
+				return &rExpr{kind: reConstFloat64, cFloat: intToFloat64(e.Literal.Int)},
+					resolvedType{kind: rtFloat64}, nil
+			}
 			ty := Int64
 			if ctx != nil && ctx.IsInteger() {
 				ty = *ctx
@@ -6055,10 +6248,11 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		// int→int (range check), int→decimal (widen), decimal→int (explicit, round),
 		// decimal→decimal (re-scale), and NULL are all castable.
-		resultRt := resolvedType{kind: rtInt, intTy: target}
-		if target.IsDecimal() {
-			resultRt = resolvedType{kind: rtDecimal}
-		}
+		// resolvedTypeOf maps the target to the right kind (incl. rtFloat32/rtFloat64). A float
+		// source reaching here is int/decimal/float (others were deferred above); every cross-family
+		// float cast is explicit (spec/design/float.md Â§6) â the only implicit float edge,
+		// float32->float64, is the tower, never a CAST.
+		resultRt := resolvedTypeOf(target)
 		return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod}, resultRt, nil
 	case ExprUnary:
 		if e.Unary.Op == OpNeg {
@@ -6079,6 +6273,12 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			case rtInterval:
 				return &rExpr{kind: reNeg, operand: rop, result: IntervalType}, // -interval (interval.md §5)
 					resolvedType{kind: rtInterval}, nil
+			case rtFloat32:
+				return &rExpr{kind: reNeg, operand: rop, result: Float32}, // -float32 (IEEE sign flip)
+					resolvedType{kind: rtFloat32}, nil
+			case rtFloat64:
+				return &rExpr{kind: reNeg, operand: rop, result: Float64},
+					resolvedType{kind: rtFloat64}, nil
 			default: // rtBool, rtText, ...
 				return nil, resolvedType{}, typeError("unary minus requires a numeric operand")
 			}
@@ -6256,6 +6456,25 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 			}
 			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: st}, resolvedTypeOf(st), nil
 		}
+		// Float arithmetic (spec/design/float.md §5): float ⊕ float → float, mixed widths promote
+		// to float64. Float is a STRICT island — float ⊕ int/decimal is a 42804 (no cross-family
+		// promotion, UNLIKE PG; only literals adapt to a float context — §6). A bare NULL operand
+		// adopts the other side's float type so `f + NULL` types as that float and evaluates NULL.
+		lFloat, rFloat := isFloatKind(lt.kind), isFloatKind(rt.kind)
+		if lFloat || rFloat {
+			l, r := lt.kind, rt.kind
+			if l == rtNull {
+				l = rt.kind
+			}
+			if r == rtNull {
+				r = lt.kind
+			}
+			if !isFloatKind(l) || !isFloatKind(r) {
+				return nil, resolvedType{}, typeError("arithmetic operators require operands of the same family")
+			}
+			st := promoteFloat(l, r)
+			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: st}, resolvedTypeOf(st), nil
+		}
 		if err := requireNumericOperand(lt); err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -6352,7 +6571,10 @@ func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes)
 // or NULL); a boolean or text operand is a 42804 type error.
 func requireNumericOperand(t resolvedType) error {
 	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea || t.kind == rtUuid ||
-		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval {
+		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval ||
+		isFloatKind(t.kind) {
+		// float is handled by the dedicated float branch in resolveBinary BEFORE this is reached;
+		// reject here too so any other caller treats it as a non-(int/decimal) operand.
 		return typeError("arithmetic operators require numeric operands")
 	}
 	return nil
@@ -6464,6 +6686,13 @@ func classifyComparable(lt, rt resolvedType) error {
 	if ivL != ivR && lt.kind != rtNull && rt.kind != rtNull {
 		return typeError("cannot compare an interval value with a value of a different type")
 	}
+	// float compares only with float (either width promotes — §2) or NULL; float vs any other
+	// family (incl. integer/decimal) is a 42804 — float is a strict island requiring an explicit
+	// cast (spec/design/float.md §3/§6, a documented PG divergence).
+	flL, flR := isFloatKind(lt.kind), isFloatKind(rt.kind)
+	if flL != flR && lt.kind != rtNull && rt.kind != rtNull {
+		return typeError("cannot compare a float value with a value of a different type")
+	}
 	return nil
 }
 
@@ -6504,6 +6733,25 @@ func decodeUUIDLiteral(s string) ([]byte, error) {
 // EXACTLY Rust's is_ascii_whitespace (space, tab, LF, FF, CR; NO vertical tab), so the three cores
 // trim byte-identically (a §8 determinism surface — a Unicode-aware trim would diverge).
 const litWhitespace = " \t\n\f\r"
+
+// floatConstFromDecimal builds a float constant from a decimal literal adapting to a float context
+// (spec/design/float.md §4): the nearest binary value at the context width, round-ties-to-even. A
+// magnitude beyond the width's range traps 22003 at resolve (the §3 finite-overflow rule). The
+// decimal is NOT cap-checked first — it is converted directly (a huge literal traps via overflow).
+func floatConstFromDecimal(d Decimal, ctx ScalarType) (*rExpr, resolvedType, error) {
+	if ctx.IsFloat32() {
+		f, err := decimalToFloat32(d)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstFloat32, cFloat: float64(f)}, resolvedType{kind: rtFloat32}, nil
+	}
+	f, err := decimalToFloat64(d)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	return &rExpr{kind: reConstFloat64, cFloat: f}, resolvedType{kind: rtFloat64}, nil
+}
 
 // coerceStringLiteral coerces a string literal's content to the named scalar target at resolve —
 // the shared engine of the `type 'string'` typed literal and CAST(<string literal> AS target)
@@ -6566,6 +6814,18 @@ func coerceStringLiteral(s string, target ScalarType, typmod *DecimalTypmod) (*r
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstDecimal, cDec: d}, resolvedType{kind: rtDecimal}, nil
+	case Float64:
+		f, err := parseFloatLiteral(s, Float64)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstFloat64, cFloat: f}, resolvedType{kind: rtFloat64}, nil
+	case Float32:
+		f, err := parseFloatLiteral(s, Float32)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstFloat32, cFloat: f}, resolvedType{kind: rtFloat32}, nil
 	default: // Int16 / Int32 / Int64
 		n, err := parseIntLiteral(s, target)
 		if err != nil {
@@ -6610,6 +6870,98 @@ func parseIntLiteral(s string, ty ScalarType) (int64, error) {
 		return 0, overflowErr(ty)
 	}
 	return v, nil
+}
+
+// parseFloatLiteral parses a string literal's content as a float of width ty — the text→float
+// coercion for float '1.5e10' / CAST('Infinity' AS float64) (spec/design/float.md §4, the float8in
+// spellings). Accepts: trimmed ASCII whitespace, then either a finite numeric (optional sign,
+// decimal digits with an optional point and optional e-notation) OR a case-insensitive special
+// word — `Infinity`/`+Infinity`/`-Infinity`/`inf`/`+inf`/`-inf`/`NaN`. Malformed → 22P02; a finite
+// value outside the width's range → 22003. Returns the value as a float64 (a float32 result is the
+// f64 of the binary32 value). NO hex floats / underscores (a documented PG-input narrowing,
+// cross-core determinism — like the int/decimal literals).
+func parseFloatLiteral(s string, ty ScalarType) (float64, error) {
+	t := strings.Trim(s, litWhitespace)
+	tn := ty.CanonicalName()
+	invalid := func() error {
+		return NewError(InvalidTextRepresentation,
+			"invalid input syntax for type "+tn+": \""+s+"\"")
+	}
+	// Special words (case-insensitive), with an optional leading sign on the infinities.
+	lower := toLowerASCII(t)
+	sign := 1.0
+	body := lower
+	if rest, ok := strings.CutPrefix(lower, "-"); ok {
+		sign, body = -1.0, rest
+	} else if rest, ok := strings.CutPrefix(lower, "+"); ok {
+		body = rest
+	}
+	switch body {
+	case "infinity", "inf":
+		return math.Inf(int(sign)), nil
+	case "nan":
+		// NaN carries no sign in jed's total order; a leading sign is accepted and ignored (PG).
+		return math.NaN(), nil
+	}
+	// Finite numeric: validate the grammar by hand (reject Go's hex-float / underscore / "inf"
+	// shapes already handled above), then parse with strconv (correctly rounded at the width).
+	if !validFloatNumeric(t) {
+		return 0, invalid()
+	}
+	bits := 64
+	if ty.IsFloat32() {
+		bits = 32
+	}
+	f, err := strconv.ParseFloat(t, bits)
+	if err != nil {
+		// strconv only errors here on RANGE for a syntactically-valid number (validFloatNumeric
+		// already gated syntax) → a finite value beyond the width's range traps 22003 (§4).
+		return 0, overflowErr(ty)
+	}
+	if math.IsInf(f, 0) {
+		// A finite numeric that rounded to ±Inf is out of range (22003), not a literal Infinity.
+		return 0, overflowErr(ty)
+	}
+	if bits == 32 {
+		return float64(float32(f)), nil
+	}
+	return f, nil
+}
+
+// validFloatNumeric reports whether t is a well-formed FINITE float numeric: an optional sign,
+// then digits with an optional single '.' (a digit on at least one side) and an optional
+// e-notation exponent (e/E, optional sign, ≥1 digit). No special words, no hex, no underscores.
+func validFloatNumeric(t string) bool {
+	if t == "" {
+		return false
+	}
+	if t[0] == '+' || t[0] == '-' {
+		t = t[1:]
+	}
+	mantissa, expPart, hasExp := t, "", false
+	if i := strings.IndexAny(t, "eE"); i >= 0 {
+		mantissa, expPart, hasExp = t[:i], t[i+1:], true
+	}
+	intPart, fracPart, hasDot := strings.Cut(mantissa, ".")
+	if hasDot && strings.Contains(fracPart, ".") {
+		return false
+	}
+	if !allASCIIDigits(intPart) || !allASCIIDigits(fracPart) {
+		return false
+	}
+	if intPart == "" && fracPart == "" {
+		return false // a lone "." or "" mantissa
+	}
+	if hasExp {
+		e := expPart
+		if len(e) > 0 && (e[0] == '+' || e[0] == '-') {
+			e = e[1:]
+		}
+		if e == "" || !allASCIIDigits(e) {
+			return false
+		}
+	}
+	return true
 }
 
 // parseDecimalLiteral parses a string literal's content as a decimal — the text→decimal coercion
@@ -6893,6 +7245,10 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		return TimestamptzValue(e.cInt), nil
 	case reConstInterval:
 		return IntervalValue(e.cIv), nil
+	case reConstFloat32:
+		return Float32Value(float32(e.cFloat)), nil
+	case reConstFloat64:
+		return Float64Value(e.cFloat), nil
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
@@ -6920,6 +7276,10 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return IntervalValue(r), nil
+		}
+		if e.result.IsFloat() {
+			// Unary minus is a pure IEEE sign flip — never traps (-NaN = NaN, -(-0) = +0). §5.
+			return evalFloatNeg(v), nil
 		}
 		if e.result.IsDecimal() {
 			if v.Kind == ValInt {
@@ -7023,6 +7383,12 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return TimestamptzValue(r), nil
 			}
 			return TimestampValue(r), nil
+		}
+		if e.result.IsFloat() {
+			// Float arithmetic (spec/design/float.md §5): correctly-rounded IEEE, one op per node
+			// (no FMA — the tree-walk). float32⊕float32→float32; any float64 operand → float64.
+			// /0 → 22012; finite overflow to ±Inf → 22003; Inf/NaN propagate.
+			return evalFloatArith(e.op, a, b, e.result.IsFloat32())
 		}
 		if e.result.IsDecimal() {
 			// Decimal arithmetic: widen any integer operand to decimal, then apply the op with
@@ -7173,7 +7539,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return IntValue(n), nil
 			}
 			return DecimalValue(vals[0].Dec.Abs()), nil
-		default: // sfRound
+		case sfRound:
 			var d Decimal
 			if vals[0].Kind == ValInt {
 				d = DecimalFromInt64(vals[0].Int)
@@ -7189,6 +7555,10 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return DecimalValue(r), nil
+		default:
+			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
+			// (Float32 only for abs; float64 for the rest, per the catalog).
+			return evalFloatFunc(e.sfunc, vals, e.result)
 		}
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
@@ -7363,6 +7733,13 @@ func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
 func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) {
 	if v.Kind == ValInt {
+		// int -> float (explicit, lossy; nearest binary, ties-to-even; never traps — float.md §6).
+		if target.IsFloat32() {
+			return Float32Value(intToFloat32(v.Int)), nil
+		}
+		if target.IsFloat64() {
+			return Float64Value(intToFloat64(v.Int)), nil
+		}
 		if target.IsDecimal() {
 			d, err := coerceDecimal(DecimalFromInt64(v.Int), typmod)
 			if err != nil {
@@ -7375,7 +7752,46 @@ func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) 
 		}
 		return IntValue(v.Int), nil
 	}
+	if v.IsFloat() {
+		f := v.asF64()
+		switch {
+		case target.IsFloat64():
+			// float32 -> float64 (lossless widen) or float64 -> float64 (identity).
+			return Float64Value(f), nil
+		case target.IsFloat32():
+			// float64 -> float32 (lossy, ties-to-even; finite overflow -> 22003) or f32 -> f32.
+			r, err := float64ToFloat32(f)
+			if err != nil {
+				return Value{}, err
+			}
+			return Float32Value(r), nil
+		case target.IsDecimal():
+			// float -> decimal: exact decimal of the value, then typmod scale (NaN/±Inf -> 22003).
+			return floatToDecimal(f, typmod)
+		default: // an integer target: round half-away, range-check (NaN/±Inf -> 22003).
+			n, err := floatToInt(f, target)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntValue(n), nil
+		}
+	}
 	// v.Kind == ValDecimal
+	if target.IsFloat32() {
+		// decimal -> float32 (explicit, lossy; finite overflow -> 22003).
+		r, err := decimalToFloat32(*v.Dec)
+		if err != nil {
+			return Value{}, err
+		}
+		return Float32Value(r), nil
+	}
+	if target.IsFloat64() {
+		r, err := decimalToFloat64(*v.Dec)
+		if err != nil {
+			return Value{}, err
+		}
+		return Float64Value(r), nil
+	}
 	if target.IsDecimal() {
 		d, err := coerceDecimal(*v.Dec, typmod)
 		if err != nil {
@@ -7524,6 +7940,10 @@ func valueCmp(a, b Value) int {
 	case a.Kind == ValInterval && b.Kind == ValInterval:
 		// Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
 		return a.Iv.SpanCmp(b.Iv)
+	case a.IsFloat() && b.IsFloat():
+		// The PG float8 TOTAL order: -0 = +0, NaN = NaN, NaN largest (spec/design/float.md §3).
+		// Mixed widths widen to float64 (lossless). Drives ORDER BY / MIN / MAX / DISTINCT / GROUP BY.
+		return floatTotalCmp(a.asF64(), b.asF64())
 	default:
 		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
 		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -7576,8 +7996,12 @@ func familyRank(v Value) int {
 		return 8
 	case ValInterval:
 		return 9
-	default:
+	case ValFloat32:
 		return 10
+	case ValFloat64:
+		return 11
+	default:
+		return 12
 	}
 }
 
@@ -7628,6 +8052,15 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			}
 			return DecimalValue(d), nil
 		}
+		if colTy.IsFloat() {
+			// An integer LITERAL adapts to a float column (spec/design/float.md §4) — INSERT VALUES
+			// / DEFAULT reach here with a literal int; an INSERT...SELECT integer VALUE is gated out
+			// upstream by assignableTo (42804), so this only ever adapts a literal.
+			if colTy.IsFloat32() {
+				return Float32Value(intToFloat32(v.Int)), nil
+			}
+			return Float64Value(intToFloat64(v.Int)), nil
+		}
 		return Value{}, typeError("cannot store an integer value in " + colTy.CanonicalName() + " column " + colName)
 	case ValDecimal:
 		if colTy.IsDecimal() {
@@ -7636,6 +8069,23 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 				return Value{}, err
 			}
 			return DecimalValue(d), nil
+		}
+		if colTy.IsFloat() {
+			// A decimal LITERAL adapts to a float column (decimal→float at the width, ties-to-even —
+			// float.md §4); a value beyond the width's range traps 22003. Same literal-only rule as
+			// the integer case (INSERT...SELECT decimal values are gated by assignableTo).
+			if colTy.IsFloat32() {
+				f, err := decimalToFloat32(*v.Dec)
+				if err != nil {
+					return Value{}, err
+				}
+				return Float32Value(f), nil
+			}
+			f, err := decimalToFloat64(*v.Dec)
+			if err != nil {
+				return Value{}, err
+			}
+			return Float64Value(f), nil
 		}
 		return Value{}, typeError("cannot store a decimal value in " + colTy.CanonicalName() + " column " + colName)
 	case ValText:
@@ -7676,6 +8126,20 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			}
 			return TimestamptzValue(m), nil
 		}
+		if colTy.IsFloat() {
+			// A string literal adapts to a float column via float's input parse (the float8in
+			// spellings — sign/digits/e-notation/Infinity/NaN; spec/design/float.md §4). Malformed
+			// input traps 22P02, out of range 22003. So `INSERT ... VALUES ('NaN')` works (a bare
+			// decimal literal cannot spell NaN/Infinity).
+			f, err := parseFloatLiteral(v.Str, colTy)
+			if err != nil {
+				return Value{}, err
+			}
+			if colTy.IsFloat32() {
+				return Float32Value(float32(f)), nil
+			}
+			return Float64Value(f), nil
+		}
 		if colTy.IsInterval() {
 			// A string literal adapts to an interval column (spec/design/interval.md);
 			// malformed input traps 22007, an out-of-range field 22008.
@@ -7711,6 +8175,20 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			return v, nil
 		}
 		return Value{}, typeError("cannot store an interval value in " + colTy.CanonicalName() + " column " + colName)
+	case ValFloat32:
+		if colTy.IsFloat32() {
+			return v, nil
+		}
+		if colTy.IsFloat64() {
+			// float32 → float64 column is the implicit, lossless widen (§2).
+			return Float64Value(float64(v.F32())), nil
+		}
+		return Value{}, typeError("cannot store a float32 value in " + colTy.CanonicalName() + " column " + colName)
+	case ValFloat64:
+		if colTy.IsFloat64() {
+			return v, nil
+		}
+		return Value{}, typeError("cannot store a float64 value in " + colTy.CanonicalName() + " column " + colName)
 	default: // ValBool
 		if colTy.IsBool() {
 			return BoolValue(v.Bool), nil

@@ -190,6 +190,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // PG render, and comparison/ordering/dedup by the canonical 128-bit span. Non-key column
     // only (interval PK → 0A000). spec/design/interval.md.
     "types.interval",
+    // float64/float32 (IEEE binary): storage, total order, kernel, casts, canonical-fold
+    // SUM/AVG; exempt from cross-core identity for computed/rendered values (R tag). float.md.
+    "types.float64",
+    "types.float32",
     // interval ± interval → interval and unary minus (interval.md §5).
     "expr.interval_arithmetic",
     // interval ×÷ number → interval (the exact field-scaling cascade — interval.md §5).

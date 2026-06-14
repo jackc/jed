@@ -40,6 +40,8 @@ import {
   boolValue,
   byteaValue,
   decimalValue,
+  float32Value,
+  float64Value,
   intValue,
   intervalValue,
   nullValue,
@@ -103,6 +105,10 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 10;
     case "interval":
       return 11;
+    case "float64":
+      return 12;
+    case "float32":
+      return 13;
   }
 }
 
@@ -131,6 +137,10 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "timestamptz";
     case 11:
       return "interval";
+    case 12:
+      return "float64";
+    case 13:
+      return "float32";
     default:
       return undefined;
   }
@@ -242,6 +252,23 @@ function encodeValue(ty: ScalarType, v: Value): Uint8Array {
     dv.setInt32(1, v.iv.months, false);
     dv.setInt32(5, v.iv.days, false);
     dv.setBigInt64(9, v.iv.micros, false);
+    return out;
+  }
+  if (v.kind === "float64") {
+    // 8 IEEE bytes, big-endian, no length prefix (fixed-width like uuid/timestamp). The bits are
+    // stored VERBATIM (a stored -0.0 keeps its sign bit; NaN keeps its pattern) — canonicalization
+    // is a compare/key concern, not a storage one (spec/fileformat/format.md, float.md §10).
+    const out = new Uint8Array(1 + 8);
+    out[0] = 0x00; // present
+    new DataView(out.buffer).setFloat64(1, v.value, false); // big-endian
+    return out;
+  }
+  if (v.kind === "float32") {
+    // 4 IEEE bytes, big-endian. v.value is already Math.fround'd (binary32), so setFloat32 stores
+    // it without further rounding loss.
+    const out = new Uint8Array(1 + 4);
+    out[0] = 0x00; // present
+    new DataView(out.buffer).setFloat32(1, v.value, false); // big-endian
     return out;
   }
   if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");
@@ -1760,6 +1787,18 @@ function readInlineBody(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
     // Fixed 16 raw bytes, no length prefix. Must branch before the integer path —
     // decodeInt would sign-flip and widthBytes is 16 there too. .slice() copies out.
     return uuidValue(take(buf, cur, 16).slice());
+  }
+  if (ty === "float64") {
+    // 8 IEEE bytes, big-endian; bits preserved verbatim (a stored -0/NaN round-trips). DataView
+    // needs the byteOffset within the page buffer (take() does not copy).
+    const b = take(buf, cur, 8);
+    return float64Value(new DataView(b.buffer, b.byteOffset, b.byteLength).getFloat64(0, false));
+  }
+  if (ty === "float32") {
+    // 4 IEEE bytes, big-endian; getFloat32 yields the exact binary32 value as a JS number, so
+    // float32Value's Math.fround is a no-op (the bits already are binary32).
+    const b = take(buf, cur, 4);
+    return float32Value(new DataView(b.buffer, b.byteOffset, b.byteLength).getFloat32(0, false));
   }
   if (isTimestamp(ty)) return timestampValue(readIntBody(ty, buf, cur));
   if (isTimestamptz(ty)) return timestamptzValue(readIntBody(ty, buf, cur));

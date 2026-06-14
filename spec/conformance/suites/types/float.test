@@ -1,0 +1,148 @@
+# float64 / float32 — IEEE 754 binary floating point (spec/design/float.md). The FIRST types
+# deliberately EXEMPTED from cross-core byte-identity for COMPUTED/RENDERED values: float result
+# columns use the `R` render tag, compared by PARSED VALUE at tolerance (conformance.md §1), so a
+# core's native render layout and a transcendental's last ULP don't fail a test. The IN-CONTRACT
+# surface stays exact & cross-core: storage, the TOTAL ORDER (-0=+0, NaN=NaN, NaN is the LARGEST
+# value), the trapping +-*/ kernel, casts (float->decimal yields an exact `D` value), and the
+# order-independent canonical-fold SUM/AVG. The two widths form a promotion tower (float32 widens
+# to float64, lossless). Non-key column only (a float PRIMARY KEY -> 0A000). float vs int/decimal
+# is 42804 (strict — an explicit cast is required). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.aggregates, cast.explicit, types.int32, types.int64, types.decimal, types.float32, types.float64
+
+# --- storage: both widths, NULL, and the special values (NaN / ±Infinity / -0) round-trip ---
+statement ok
+CREATE TABLE t (id int64 PRIMARY KEY, d float64, r float32)
+
+# finite values: a bare decimal literal adapts to the float column's width (literal adaptation)
+statement ok
+INSERT INTO t VALUES
+  (1, 1.5, 2.5),
+  (2, -0.5, 100.25),
+  (5, 0.0, 0.0)
+
+# Infinity / NaN have no bare-literal form, so they enter via a typed literal in INSERT ... SELECT
+# (a multi-row VALUES slot takes only bare literals this slice). Row 4 also stores a NULL float32.
+statement ok
+INSERT INTO t SELECT 3, float64 'Infinity', float32 '-Infinity'
+
+statement ok
+INSERT INTO t SELECT 4, float64 'NaN', NULL
+
+# float columns render under the `R` tag (parsed-value compare). NULL renders NULL.
+query IRR nosort
+SELECT id, d, r FROM t ORDER BY id
+----
+1
+1.5
+2.5
+2
+-0.5
+100.25
+3
+Infinity
+-Infinity
+4
+NaN
+NULL
+5
+0
+0
+
+# --- the TOTAL ORDER (not raw IEEE): -0.5 < 0 < 1.5 < +Infinity < NaN (NaN is the largest) ---
+query I nosort
+SELECT id FROM t ORDER BY d
+----
+2
+5
+1
+3
+4
+
+# NaN = NaN is TRUE under the total order (PG float btree order), unlike raw IEEE
+query B nosort
+SELECT float64 'NaN' = float64 'NaN'
+----
+true
+
+# -0 = +0 is TRUE
+query B nosort
+SELECT float64 '-0' = float64 '0'
+----
+true
+
+# --- the arithmetic kernel: correctly-rounded; mixed widths promote to float64 ---
+query R nosort
+SELECT float64 '1.5' + float64 '2.5'
+----
+4
+
+# float32 (r=2.5) + float64 (d=1.5) promotes to float64 -> 4
+query R nosort
+SELECT r + d FROM t WHERE id = 1
+----
+4
+
+# an Infinity operand propagates (it is already non-finite — no trap)
+query R nosort
+SELECT float64 'Infinity' + float64 '1'
+----
+Infinity
+
+# division by zero TRAPS (finite math never yields ±Inf) ...
+statement error 22012
+SELECT float64 '1' / float64 '0'
+
+# ... and finite overflow TRAPS rather than producing +Infinity
+statement error 22003
+SELECT float64 '1e308' * float64 '10'
+
+# --- casts: all explicit; float->int rounds HALF AWAY FROM ZERO; float->decimal is EXACT ---
+query I nosort
+SELECT CAST(float64 '2.5' AS int32)
+----
+3
+
+query R nosort
+SELECT CAST(2 AS float64)
+----
+2
+
+# float->decimal is in-contract: the EXACT decimal value, then the typmod scale (a `D` value)
+query D nosort
+SELECT CAST(float64 '0.5' AS numeric(10,2))
+----
+0.50
+
+# NaN / ±Infinity cannot become an integer
+statement error 22003
+SELECT CAST(float64 'NaN' AS int32)
+
+# --- strict family: a float column vs an int column is a type error (no implicit coercion) ---
+statement error 42804
+SELECT id FROM t WHERE id = d
+
+# --- aggregates: canonical-fold SUM/AVG (order-independent), MIN/MAX over the total order ---
+# SUM over a group containing NaN is NaN (special values resolved before the fold)
+query R nosort
+SELECT sum(d) FROM t
+----
+NaN
+
+# a finite group: SUM = 1.5 + (-0.5) = 1.0, AVG = 1.0 / 2 = 0.5
+query RR nosort
+SELECT sum(d), avg(d) FROM t WHERE id < 3
+----
+1
+0.5
+
+# MIN is the smallest finite (-0.5); MAX is NaN (the largest value)
+query RR nosort
+SELECT min(d), max(d) FROM t
+----
+-0.5
+NaN
+
+# --- a float64 / float32 PRIMARY KEY is rejected this slice (the float-order-preserving key
+# encoding is authored but unexercised — encoding.md §2.8) ---
+statement error 0A000
+CREATE TABLE bad (k float64 PRIMARY KEY)

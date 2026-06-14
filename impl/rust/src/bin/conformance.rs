@@ -306,7 +306,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 let cols = coltypes.len().max(1);
                 let actual = render_outcome(&outcome, cols, sortmode);
                 let expected = apply_sort(expected, cols, sortmode);
-                if actual != expected {
+                if !results_match(&expected, &actual, coltypes, cols, sortmode) {
                     return Err(format!(
                         "query result mismatch\n  SQL: {sql}\n  expected: {expected:?}\n  actual:   {actual:?}"
                     ));
@@ -457,6 +457,79 @@ fn render_outcome(outcome: &Outcome, cols: usize, sortmode: &str) -> Vec<String>
 
 fn render_value(v: &Value) -> String {
     v.render()
+}
+
+/// Compare an expected vs actual flat row-major result list, applying the per-column conformance
+/// render tag (spec/design/conformance.md §1). For most coltype letters the compare is EXACT
+/// string equality, but the **`R` (real / float)** tag compares BY VALUE within a tolerance
+/// (spec/design/float.md §9): each core's native shortest-round-trip layout may differ and a
+/// transcendental may differ by an ULP, so a column tagged `R` parses both sides to f64 and
+/// considers them equal iff both NaN, or `==` (covers ±Inf and -0==+0), or both finite within a
+/// small relative tolerance. Column association comes from the row-major position (`i % cols`),
+/// valid for `nosort`/`rowsort`; `valuesort` loses it, so there we fall back to exact compare
+/// (float columns use nosort/rowsort).
+fn results_match(
+    expected: &[String],
+    actual: &[String],
+    coltypes: &str,
+    cols: usize,
+    sortmode: &str,
+) -> bool {
+    if expected.len() != actual.len() {
+        return false;
+    }
+    let letters: Vec<char> = coltypes.chars().collect();
+    let per_column_ok = sortmode != "valuesort" && !letters.is_empty();
+    for (i, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {
+        let is_real = per_column_ok && letters.get(i % cols) == Some(&'R');
+        let ok = if is_real {
+            real_values_equal(e, a)
+        } else {
+            e == a
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// The `R`-tag tolerant float compare (spec/design/float.md §9): parse both strings to f64, then
+/// equal iff (a) both NaN, (b) exactly one NaN → not equal, (c) `a == b` (covers ±Inf and -0==+0),
+/// (d) both finite and `|a-b| <= 1e-9 * max(|a|,|b|,1.0)`, else not equal. A side that does not
+/// parse as a float falls back to exact string compare (e.g. `NULL`).
+fn real_values_equal(e: &str, a: &str) -> bool {
+    let (pe, pa) = (parse_render_float(e), parse_render_float(a));
+    match (pe, pa) {
+        (Some(x), Some(y)) => {
+            let (xn, yn) = (x.is_nan(), y.is_nan());
+            if xn || yn {
+                return xn && yn;
+            }
+            if x == y {
+                return true; // ±Inf exact, -0 == +0
+            }
+            if x.is_finite() && y.is_finite() {
+                let tol = 1e-9 * x.abs().max(y.abs()).max(1.0);
+                (x - y).abs() <= tol
+            } else {
+                false
+            }
+        }
+        // A non-float rendering (e.g. `NULL`) — exact string compare.
+        _ => e == a,
+    }
+}
+
+/// Parse a rendered float string (incl. the PG spellings `Infinity`/`-Infinity`/`NaN`) to f64,
+/// or `None` if it is not a float rendering.
+fn parse_render_float(s: &str) -> Option<f64> {
+    match s {
+        "Infinity" => Some(f64::INFINITY),
+        "-Infinity" => Some(f64::NEG_INFINITY),
+        "NaN" => Some(f64::NAN),
+        _ => s.parse::<f64>().ok(),
+    }
 }
 
 /// Apply a sqllogictest sort mode to a flat row-major value list.

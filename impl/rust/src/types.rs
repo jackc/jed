@@ -38,6 +38,13 @@ pub enum ScalarType {
     /// 128-bit span (spec/design/interval.md). Not a key this slice; not fixed-width through the
     /// integer codec.
     Interval,
+    /// IEEE 754 binary32 (single precision), `real` (spec/design/float.md). Rank 1 of the float
+    /// promotion tower; stored as 4 big-endian IEEE bytes (type code 13). Not a key this slice.
+    Float32,
+    /// IEEE 754 binary64 (double precision), `double precision` / `float` (spec/design/float.md).
+    /// Rank 2 of the float promotion tower; stored as 8 big-endian IEEE bytes (type code 12).
+    /// Not a key this slice.
+    Float64,
 }
 
 impl ScalarType {
@@ -55,6 +62,8 @@ impl ScalarType {
             ScalarType::Timestamp => "timestamp",
             ScalarType::Timestamptz => "timestamptz",
             ScalarType::Interval => "interval",
+            ScalarType::Float32 => "float32",
+            ScalarType::Float64 => "float64",
         }
     }
 
@@ -76,6 +85,11 @@ impl ScalarType {
             "timestamp" | "timestamp without time zone" => Some(ScalarType::Timestamp),
             "timestamptz" | "timestamp with time zone" => Some(ScalarType::Timestamptz),
             "interval" => Some(ScalarType::Interval),
+            // Float promotion tower (spec/design/float.md §2). Canonical ids state width in bits;
+            // SQL-standard names are aliases. PG's `float8`/`float4` byte-count spellings and the
+            // `float(p)` precision typmod are NOT accepted (we own our surface — CLAUDE.md §1).
+            "float32" | "real" => Some(ScalarType::Float32),
+            "float64" | "double precision" | "float" => Some(ScalarType::Float64),
             _ => None,
         }
     }
@@ -120,6 +134,22 @@ impl ScalarType {
         matches!(self, ScalarType::Interval)
     }
 
+    /// Whether this is the `float32` (binary32) type.
+    pub fn is_float32(self) -> bool {
+        matches!(self, ScalarType::Float32)
+    }
+
+    /// Whether this is the `float64` (binary64) type.
+    pub fn is_float64(self) -> bool {
+        matches!(self, ScalarType::Float64)
+    }
+
+    /// Whether this is one of the two float (binary) types — the float family
+    /// (spec/design/float.md §2).
+    pub fn is_float(self) -> bool {
+        matches!(self, ScalarType::Float32 | ScalarType::Float64)
+    }
+
     /// Whether this is one of the fixed-width signed integer types.
     pub fn is_integer(self) -> bool {
         matches!(
@@ -139,13 +169,17 @@ impl ScalarType {
             ScalarType::Int32 => 4,
             ScalarType::Int64 | ScalarType::Timestamp | ScalarType::Timestamptz => 8,
             ScalarType::Uuid => 16,
+            // The float types are fixed-width (binary32 = 4 bytes, binary64 = 8) — the value
+            // codec writes the IEEE bytes big-endian, no length prefix (spec/fileformat/format.md).
+            ScalarType::Float32 => 4,
+            ScalarType::Float64 => 8,
             ScalarType::Text
             | ScalarType::Bool
             | ScalarType::Decimal
             | ScalarType::Bytea
             | ScalarType::Interval => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/interval are not serialized through the fixed-width integer codec; width_bytes covers integers + uuid + timestamps"
+                    "text/boolean/decimal/bytea/interval are not serialized through the fixed-width integer codec; width_bytes covers integers + uuid + timestamps + floats"
                 )
             }
         }
@@ -164,9 +198,11 @@ impl ScalarType {
             | ScalarType::Uuid
             | ScalarType::Timestamp
             | ScalarType::Timestamptz
-            | ScalarType::Interval => {
+            | ScalarType::Interval
+            | ScalarType::Float32
+            | ScalarType::Float64 => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/uuid/timestamp/interval have no integer range"
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval/float have no integer range"
                 )
             }
         }
@@ -185,21 +221,29 @@ impl ScalarType {
             | ScalarType::Uuid
             | ScalarType::Timestamp
             | ScalarType::Timestamptz
-            | ScalarType::Interval => {
+            | ScalarType::Interval
+            | ScalarType::Float32
+            | ScalarType::Float64 => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/uuid/timestamp/interval have no integer range"
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval/float have no integer range"
                 )
             }
         }
     }
 
-    /// Promotion-tower rank: int16 < int32 < int64 (spec/types/compare.toml).
-    /// Integer-only — text, boolean, and decimal do not form an integer promotion tower.
+    /// Promotion-tower rank within a family (spec/types/compare.toml, spec/design/float.md §2):
+    /// the integer tower int16(1) < int32(2) < int64(3), and the *separate* float tower
+    /// float32(1) < float64(2). The two towers never mix — `promote` only ever compares ranks
+    /// among types of one family — so the float values reuse the small-integer slots safely.
+    /// Non-tower types (text/boolean/decimal/bytea/uuid/timestamp/interval) have no rank.
     pub fn rank(self) -> u8 {
         match self {
             ScalarType::Int16 => 1,
             ScalarType::Int32 => 2,
             ScalarType::Int64 => 3,
+            // The float tower (independent of the integer tower above).
+            ScalarType::Float32 => 1,
+            ScalarType::Float64 => 2,
             ScalarType::Text
             | ScalarType::Bool
             | ScalarType::Decimal
@@ -209,7 +253,7 @@ impl ScalarType {
             | ScalarType::Timestamptz
             | ScalarType::Interval => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/uuid/timestamp/interval have no integer promotion rank"
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval have no promotion rank"
                 )
             }
         }
@@ -221,7 +265,7 @@ impl ScalarType {
     }
 
     /// All types, for exhaustive iteration in tests.
-    pub fn all() -> [ScalarType; 11] {
+    pub fn all() -> [ScalarType; 13] {
         [
             ScalarType::Int16,
             ScalarType::Int32,
@@ -234,6 +278,8 @@ impl ScalarType {
             ScalarType::Timestamp,
             ScalarType::Timestamptz,
             ScalarType::Interval,
+            ScalarType::Float32,
+            ScalarType::Float64,
         ]
     }
 }

@@ -13,7 +13,7 @@ import { closeSync, openSync, readSync, unlinkSync, writeFileSync } from "node:f
 import { join } from "node:path";
 import { Decimal } from "./decimal.ts";
 import type { Row } from "./storage.ts";
-import { type Value } from "./value.ts";
+import { type Value, float32Value, float64Value } from "./value.ts";
 
 // DEFAULT_WORK_MEM is the default work-memory budget, in bytes (256 MiB) — the OpenOptions.workMem
 // default (spec/design/spill.md §2, api.md §2.1). Matches the buffer-pool default so a RAM-sized
@@ -346,6 +346,16 @@ class ByteWriter {
       x >>= 8n;
     }
   }
+  float64(n: number): void {
+    const dv = new DataView(new ArrayBuffer(8));
+    dv.setFloat64(0, n, true); // little-endian, matching this format's u32/u64
+    this.raw(new Uint8Array(dv.buffer));
+  }
+  float32(n: number): void {
+    const dv = new DataView(new ArrayBuffer(4));
+    dv.setFloat32(0, n, true);
+    this.raw(new Uint8Array(dv.buffer));
+  }
   bytesField(b: Uint8Array): void {
     this.u32(b.length);
     this.ensure(b.length);
@@ -411,6 +421,16 @@ function writeValue(w: ByteWriter, v: Value): void {
     case "timestamptz":
       w.u8(8);
       w.u64(v.micros);
+      break;
+    case "float64":
+      // The 8 IEEE bytes (DataView, the spill format is per-core internal — bits round-trip incl
+      // -0/NaN/±Inf so an ORDER BY over / carrying a float column spills correctly).
+      w.u8(13);
+      w.float64(v.value);
+      break;
+    case "float32":
+      w.u8(14);
+      w.float32(v.value);
       break;
     case "interval":
       // Interval — tag 12 (tags 9/10/11 are the Unfetched forms below); months, days, micros.
@@ -503,6 +523,14 @@ function readValue(r: FileSource): Value {
       const days = readU32(r) | 0;
       const micros = BigInt.asIntN(64, r.u64()); // signed int64
       return { kind: "interval", iv: { months, days, micros } };
+    }
+    case 13: {
+      const b = r.bytes(8);
+      return float64Value(new DataView(b.buffer, b.byteOffset, b.byteLength).getFloat64(0, true));
+    }
+    case 14: {
+      const b = r.bytes(4);
+      return float32Value(new DataView(b.buffer, b.byteOffset, b.byteLength).getFloat32(0, true));
     }
     default:
       throw new Error("bad spill value tag");

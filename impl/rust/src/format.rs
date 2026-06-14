@@ -96,6 +96,8 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Timestamp => 9,
         ScalarType::Timestamptz => 10,
         ScalarType::Interval => 11,
+        ScalarType::Float64 => 12,
+        ScalarType::Float32 => 13,
     }
 }
 
@@ -113,6 +115,8 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         9 => Some(ScalarType::Timestamp),
         10 => Some(ScalarType::Timestamptz),
         11 => Some(ScalarType::Interval),
+        12 => Some(ScalarType::Float64),
+        13 => Some(ScalarType::Float32),
         _ => None,
     }
 }
@@ -201,6 +205,22 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
             out
         }
         Value::Bool(b) => vec![0x00, u8::from(*b)], // present tag + bool-byte (0x00 false, 0x01 true)
+        // Float value codec (spec/fileformat/format.md, spec/design/float.md §10): present tag,
+        // then the IEEE bytes big-endian (float64 = 8, float32 = 4), no length prefix. The stored
+        // bits are preserved VERBATIM (a stored -0.0 keeps its sign bit; canonicalization is a
+        // comparison/key concern only).
+        Value::Float64(f) => {
+            let mut out = Vec::with_capacity(1 + 8);
+            out.push(0x00); // present
+            out.extend_from_slice(&f.to_bits().to_be_bytes());
+            out
+        }
+        Value::Float32(f) => {
+            let mut out = Vec::with_capacity(1 + 4);
+            out.push(0x00); // present
+            out.extend_from_slice(&f.to_bits().to_be_bytes());
+            out
+        }
         // Decimal value codec (spec/fileformat/format.md): tag, flags (sign), u16 scale,
         // u16 ndigits, then that many big-endian base-10^4 coefficient groups (MS-first).
         Value::Decimal(d) => {
@@ -1897,6 +1917,20 @@ fn read_inline_body(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value
             .try_into()
             .map_err(|_| corrupt("invalid uuid length"))?;
         Ok(Value::Uuid(b))
+    } else if ty.is_float64() {
+        // 8 IEEE bytes, big-endian; the stored bits are preserved verbatim (spec/design/float.md
+        // §10). Must branch before the integer path (width_bytes is 8 there too).
+        let b: [u8; 8] = take(buf, pos, 8)?
+            .try_into()
+            .map_err(|_| corrupt("invalid float64 length"))?;
+        Ok(Value::Float64(f64::from_bits(u64::from_be_bytes(b))))
+    } else if ty.is_float32() {
+        // 4 IEEE bytes, big-endian. Must branch before the integer path (width_bytes is 4, which
+        // would otherwise match int32 and sign-flip).
+        let b: [u8; 4] = take(buf, pos, 4)?
+            .try_into()
+            .map_err(|_| corrupt("invalid float32 length"))?;
+        Ok(Value::Float32(f32::from_bits(u32::from_be_bytes(b))))
     } else if ty.is_timestamp() {
         let vb = take(buf, pos, ty.width_bytes())?;
         Ok(Value::Timestamp(decode_int(ty, vb)))
@@ -2164,7 +2198,7 @@ fn read_string(buf: &[u8], pos: &mut usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execute;
+    use crate::{Outcome, execute};
 
     #[test]
     fn crc32_known_vector() {
@@ -2177,7 +2211,118 @@ mod tests {
             assert_eq!(scalar_for_type_code(type_code_for_scalar(ty)), Some(ty));
         }
         assert_eq!(scalar_for_type_code(0), None);
-        assert_eq!(scalar_for_type_code(12), None);
+        // 12 = float64, 13 = float32 (spec/fileformat/format.md); 14 is the next unassigned code.
+        assert_eq!(scalar_for_type_code(12), Some(ScalarType::Float64));
+        assert_eq!(scalar_for_type_code(13), Some(ScalarType::Float32));
+        assert_eq!(scalar_for_type_code(14), None);
+    }
+
+    /// The float value codec preserves the IEEE BITS verbatim — including the sign bit of `-0.0`,
+    /// every NaN bit pattern, and ±Inf — for both widths (spec/design/float.md §10). Storage is a
+    /// bit round-trip, NOT canonicalized (that is a comparison/key concern). Big-endian, fixed-width.
+    #[test]
+    fn float_value_codec_round_trips_bits() {
+        let mut sink = Vec::new();
+        // float64 cases, compared by RAW BITS so -0 vs +0 and NaN payloads are distinguished.
+        let f64s = [
+            0.0f64,
+            -0.0f64,
+            1.5,
+            -2.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001), // a NaN with a payload
+            f64::MIN_POSITIVE,
+            std::f64::consts::PI,
+        ];
+        for &x in &f64s {
+            let enc = encode_value(ScalarType::Float64, &Value::Float64(x));
+            // present tag + 8 IEEE bytes, big-endian, no length prefix.
+            assert_eq!(
+                enc.len(),
+                1 + 8,
+                "float64 body is 8 bytes behind the presence tag"
+            );
+            assert_eq!(enc[0], 0x00, "present tag");
+            assert_eq!(
+                &enc[1..],
+                &x.to_bits().to_be_bytes(),
+                "big-endian IEEE bytes"
+            );
+            let mut pos = 0usize;
+            let got = read_value(ScalarType::Float64, &enc, &mut pos, None, &mut sink).unwrap();
+            match got {
+                Value::Float64(y) => assert_eq!(y.to_bits(), x.to_bits(), "bits round-trip"),
+                other => panic!("expected Float64, got {other:?}"),
+            }
+        }
+        // float32 cases (4-byte body).
+        let f32s = [
+            0.0f32,
+            -0.0f32,
+            1.5,
+            -2.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0x7fc0_0001),
+        ];
+        for &x in &f32s {
+            let enc = encode_value(ScalarType::Float32, &Value::Float32(x));
+            assert_eq!(
+                enc.len(),
+                1 + 4,
+                "float32 body is 4 bytes behind the presence tag"
+            );
+            assert_eq!(&enc[1..], &x.to_bits().to_be_bytes());
+            let mut pos = 0usize;
+            let got = read_value(ScalarType::Float32, &enc, &mut pos, None, &mut sink).unwrap();
+            match got {
+                Value::Float32(y) => assert_eq!(y.to_bits(), x.to_bits()),
+                other => panic!("expected Float32, got {other:?}"),
+            }
+        }
+        // NULL round-trips for both float widths (presence tag only).
+        for ty in [ScalarType::Float32, ScalarType::Float64] {
+            let enc = encode_value(ty, &Value::Null);
+            let mut pos = 0usize;
+            assert!(matches!(
+                read_value(ty, &enc, &mut pos, None, &mut sink).unwrap(),
+                Value::Null
+            ));
+        }
+    }
+
+    /// A float column written and re-read through the whole on-disk image (the cross-core
+    /// round-trip path) preserves both finite and special values.
+    #[test]
+    fn float_table_in_memory_round_trip() {
+        let mut db = Database::new();
+        for s in [
+            "CREATE TABLE t (id int32 PRIMARY KEY, f float64, g float32)",
+            "INSERT INTO t VALUES (1, 1.5, 2.5)",
+            "INSERT INTO t VALUES (2, 0.0, 0.0)",
+            "INSERT INTO t VALUES (3, 0.0, 0.0)",
+            // INSERT VALUES takes only plain literals; the specials enter via an UPDATE whose RHS
+            // is a typed-literal expression (the resolver path that admits `float '…'`).
+            "UPDATE t SET f = float 'Infinity', g = real '-Infinity' WHERE id = 2",
+            "UPDATE t SET f = float 'NaN' WHERE id = 3",
+        ] {
+            execute(&mut db, s).expect("setup");
+        }
+        let image = db.to_image(8192, 1).unwrap();
+        let mut db2 = Database::from_image(&image).expect("re-open");
+        let out = execute(&mut db2, "SELECT id, f, g FROM t ORDER BY id").expect("query");
+        let rows = match out {
+            Outcome::Query { rows, .. } => rows,
+            _ => panic!("expected query"),
+        };
+        assert_eq!(rows.len(), 3);
+        // id=2 carries ±Infinity, id=3 carries NaN — they survive the image round trip.
+        assert_eq!(rows[1][1].render(), "Infinity");
+        assert_eq!(rows[1][2].render(), "-Infinity");
+        assert_eq!(rows[2][1].render(), "NaN");
     }
 
     fn sample_db() -> Database {

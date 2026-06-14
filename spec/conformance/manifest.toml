@@ -277,6 +277,14 @@ id = "types.interval"
 description = "interval scalar type (a span — months/days/micros): storage, the 'unit + time' input subset (units with abbreviations, per-field signs, trailing 'ago', the fractional-unit cascade, bare HH:MM:SS) via a single-quoted literal or the INTERVAL '...' keyword, PG 'postgres' render, and comparison/ordering/dedup by the canonical 128-bit span (1 month = 30 days, 1 day = 24 h — so '1 mon' = '30 days'). Non-key column only — an interval PRIMARY KEY/index is rejected 0A000; CAST and field qualifiers/precision are deferred (spec/design/interval.md)"
 
 [[capability]]
+id = "types.float64"
+description = "float64 / double precision scalar type (IEEE 754 binary64): storage, literals (incl Infinity/-Infinity/NaN, e-notation), the float total order (-0=+0, NaN=NaN, NaN largest), the trapping +-*/ /sqrt arithmetic kernel, casts, the order-independent canonical-fold SUM/AVG, and MIN/MAX/COUNT. The FIRST type exempted from cross-core byte-identity for COMPUTED/RENDERED values (compared via the R tag at tolerance — conformance.md §1, float.md, determinism.md §6); storage/ordering/kernel/exact-sum/cost stay in-contract. Non-key column only — a float64 PRIMARY KEY is rejected 0A000. Cross-family int/decimal<->float is explicit-only (else 42804)"
+
+[[capability]]
+id = "types.float32"
+description = "float32 / real scalar type (IEEE 754 binary32): the same surface as float64 at single precision; forms a promotion tower with float64 (float32->float64 lossless-implicit). Exempt from cross-core byte-identity for computed/rendered values (R tag); storage (4 bytes, on-disk code 13) / total order / kernel / exact-sum SUM/AVG / cost in-contract. Non-key column only (0A000). spec/design/float.md"
+
+[[capability]]
 id = "expr.interval_arithmetic"
 description = "interval arithmetic (spec/design/interval.md §5): interval ± interval → interval (field-wise, no justification) and unary minus; a NULL operand propagates; an i32 month/day or i64 micros overflow traps 22008. interval ×÷ number and timestamp ± interval are separate capabilities (later slices)"
 

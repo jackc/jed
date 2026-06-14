@@ -12,6 +12,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -316,7 +317,7 @@ func runFile(text string) error {
 			}
 			actual := renderOutcome(outcome, cols, sortmode)
 			expected = applySort(expected, cols, sortmode)
-			if !equal(actual, expected) {
+			if !equalColtyped(actual, expected, coltypes, cols) {
 				return fmt.Errorf("query result mismatch\n  SQL: %s\n  expected: %v\n  actual:   %v", sql, expected, actual)
 			}
 			if cerr := assertCost(expectedCost, outcome.Cost, sql); cerr != nil {
@@ -414,4 +415,71 @@ func equal(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// equalColtyped compares a query's flat rendered cells against the expected cells, honouring the
+// `R` (real/float) render tag: an R-tagged column is compared BY VALUE (parse both to f64, equal
+// within a small relative tolerance; NaN==NaN, ±Inf exact, -0==+0 — spec/design/float.md §9,
+// conformance.md §1), every other coltype by exact string. cols is the column count (so flat
+// index i maps to column i%cols → coltypes[i%cols]). With rowsort the cells stay column-aligned
+// (cells move as whole rows); with valuesort alignment is lost, so R falls back to string compare
+// (float suites use nosort/rowsort). An empty coltypes (cols defaulted to 1) is exact string.
+func equalColtyped(a, b []string, coltypes string, cols int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] == b[i] {
+			continue
+		}
+		// Determine this cell's coltype char (if any); only `R` gets the tolerant compare.
+		var ct byte
+		if cols > 0 && len(coltypes) == cols {
+			ct = coltypes[i%cols]
+		}
+		if ct == 'R' && floatCellsEqual(a[i], b[i]) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// floatCellsEqual compares two rendered float cells by VALUE: parse both to f64; both NaN → equal;
+// exactly one NaN → not; a == b (covers ±Inf exact and -0 == +0) → equal; both finite → equal iff
+// |a−b| ≤ 1e-9·max(|a|,|b|,1); otherwise not. A non-parseable cell falls back to (already-failed)
+// string compare → not equal (spec/design/float.md §9, the `R` tag's tolerant rule).
+func floatCellsEqual(as, bs string) bool {
+	a, aerr := parseFloatCell(as)
+	b, berr := parseFloatCell(bs)
+	if aerr != nil || berr != nil {
+		return false
+	}
+	aNaN, bNaN := math.IsNaN(a), math.IsNaN(b)
+	if aNaN || bNaN {
+		return aNaN && bNaN
+	}
+	if a == b { // exact (covers ±Inf and -0 == +0)
+		return true
+	}
+	if math.IsInf(a, 0) || math.IsInf(b, 0) {
+		return false // a non-equal infinity is a real mismatch
+	}
+	tol := 1e-9 * math.Max(math.Max(math.Abs(a), math.Abs(b)), 1.0)
+	return math.Abs(a-b) <= tol
+}
+
+// parseFloatCell parses a rendered float cell, accepting the spec's PG spellings (Infinity /
+// -Infinity / NaN, case-insensitive) alongside ordinary numerics, so the `R` compare reads jed's
+// own render output as well as PG's.
+func parseFloatCell(s string) (float64, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "infinity", "+infinity", "inf", "+inf":
+		return math.Inf(1), nil
+	case "-infinity", "-inf":
+		return math.Inf(-1), nil
+	case "nan":
+		return math.NaN(), nil
+	}
+	return strconv.ParseFloat(strings.TrimSpace(s), 64)
 }
