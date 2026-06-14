@@ -25,6 +25,16 @@ import (
 // with -0 = +0 and NaN = NaN (all NaN bit patterns are ONE equivalence class). So NaN is the
 // single largest value and `NaN = NaN` is TRUE. A documented divergence from raw IEEE.
 
+// canonicalNaN64Bits is the single quiet-NaN bit pattern jed materializes for a float64 NaN
+// (spec/design/float.md §3/§10). Go's math.NaN() is 0x7FF8000000000001 — its low payload bit
+// differs from the canonical 0x7FF8000000000000 the Rust/TS cores produce, so a NaN LITERAL uses
+// THIS pattern to stay cross-core byte-identical in memory (and the storage codec re-canonicalizes
+// any other NaN, e.g. hardware Inf-Inf, on the way to disk). float32's canonical NaN is 0x7FC00000.
+const canonicalNaN64Bits uint64 = 0x7FF8000000000000
+
+// canonicalNaN64 is the float64 NaN jed materializes (see canonicalNaN64Bits).
+func canonicalNaN64() float64 { return math.Float64frombits(canonicalNaN64Bits) }
+
 // floatTotalRank maps a float64 to a totally-ordered class rank: every NaN → the largest class,
 // everything else compares numerically with -0 folded to +0. Used only as a tie-break gate.
 //

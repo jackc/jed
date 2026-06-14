@@ -521,7 +521,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       vs `NULL` array, equality/ordering, and an order-preserving key encoding for
       arrays-in-keys. Match PostgreSQL array semantics by default (§1). Large surface;
       sequence after the core scalar set settles. _(size: XL; §4/§8)_
-- [~] **`float32` + `float64` (IEEE 754 binary float).** ✅ **Decided & spec'd; cores in progress.**
+- [~] **`float32` + `float64` (IEEE 754 binary float).** ✅ **Decided, spec'd, all three cores +
+      conformance + byte-exact goldens landed; only oracle overrides remain.**
       The float policy is **settled**: floats exist as a two-width PROMOTION TOWER — `float64`
       (aliases `double precision`/`float` — bare `float` is 64-bit in PG) and `float32` (alias
       `real`), with `float32`→`float64` lossless-implicit widening (like int16→int64) and cross-family
@@ -537,12 +538,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       type/compare/cast/catalog data (on-disk type code **12**); `R` tag + default-deny determinism
       rules in [conformance.md](spec/design/conformance.md); `float-order-preserving` key rule
       authored/unexercised (float PK rejected `0A000` — [encoding.md](spec/design/encoding.md) §2.8).
-      **Remaining (XL):** the four cores (Rust/Go/TS hand-written + Ruby reference) — value repr,
-      literals, total-order compare, the trapping arithmetic kernel, casts, the **order-independent
-      exact accumulator** for `SUM`/`AVG`, the exact + transcendental functions, native rendering;
-      the **`R`-tag tolerant comparison** in each harness; the byte-exact golden `float64_table.jed`;
-      the conformance corpus + oracle overrides. Scope ratified by the user: "everything" incl.
-      casts + exact SUM/AVG + transcendentals. _(was: S decision / now XL build; §8)_
+      **Cores DONE** (Rust/Go/TS hand-written + Ruby reference): value repr, literals, total-order
+      compare, the trapping arithmetic kernel, casts, the **order-independent canonical-order fold**
+      for `SUM`/`AVG`, the exact + transcendental functions, native rendering; the **`R`-tag tolerant
+      comparison** in each harness; the conformance corpus
+      ([float.test](spec/conformance/suites/types/float.test), 100/100 cross-core). **Byte-exact
+      goldens DONE** — `float64_table.jed` + `float32_table.jed`, `rust == go == ts == ruby` (the §8
+      cross-core round-trip), pinned by the Ruby reference codec ([verify.rb](spec/fileformat/verify.rb)).
+      This surfaced + closed a latent storage divergence: a NaN's payload bits are core-specific
+      (Go `math.NaN()` = `…001`, hardware `Inf−Inf` = `0xFFF8…`), so the value codec now
+      **canonicalizes NaN to one quiet pattern on store** (float.md §10 / format.md), keeping a stored
+      NaN cross-core byte-identical; `-0`/±Inf/finite stay verbatim. **Remaining (S):** oracle-import
+      overrides ([oracle_overrides.toml](spec/conformance/oracle_overrides.toml)) for the documented
+      float-vs-PG divergences (float→int half-away vs PG half-even; exact float→decimal vs PG shortest;
+      finite overflow/`÷0` traps vs PG ±Inf; strict cross-family `42804`). Scope ratified by the user:
+      "everything" incl. casts + exact SUM/AVG + transcendentals. _(was: S decision / now XL build; §8)_
 
 ---
 

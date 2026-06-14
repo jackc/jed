@@ -63,8 +63,10 @@ test("floatTotalCmp is the PG total order: -Inf < finite < +Inf < NaN, -0==+0, N
 
 // --- value codec round-trip (incl -0 / NaN / ±Inf), via DataView -------------
 // encodeValue/readInlineBody are not exported; this mirrors their codec (DataView, big-endian, no
-// length prefix) so a stored value's bits are verified to round-trip verbatim. The bit-level check
-// is what the cross-core golden also asserts (float.md §10).
+// length prefix). Every value round-trips verbatim EXCEPT NaN, which the codec canonicalizes to the
+// single quiet pattern (float.md §10); V8 already materializes a canonical NaN, so a round-tripped
+// NaN is simply asserted to still be a NaN. The bit-level check is what the cross-core golden
+// also asserts.
 
 function roundTripF64(n: number): number {
   const dv = new DataView(new ArrayBuffer(8));
@@ -77,16 +79,16 @@ function roundTripF32(n: number): number {
   return dv.getFloat32(0, false);
 }
 
-test("float64 codec round-trips every special verbatim (bits preserved)", () => {
+test("float64 codec round-trips finite/±Inf verbatim, NaN as a NaN", () => {
   for (const n of [0, 1.5, -1.5, 1e308, 5e-324, Infinity, -Infinity]) {
     assert.ok(Object.is(roundTripF64(n), n), `round-trip ${n}`);
   }
-  // -0 keeps its sign bit on disk (canonicalization is a compare/key concern, not storage).
+  // -0 keeps its sign bit on disk (the -0→+0 collapse is a compare/key concern, not storage).
   assert.ok(Object.is(roundTripF64(-0), -0), "round-trip -0 keeps the sign bit");
-  assert.ok(Number.isNaN(roundTripF64(NaN)), "round-trip NaN");
+  assert.ok(Number.isNaN(roundTripF64(NaN)), "round-trip NaN (canonicalized to one quiet pattern)");
 });
 
-test("float32 codec round-trips binary32 values verbatim (incl -0/NaN/±Inf)", () => {
+test("float32 codec round-trips binary32 finite/±Inf verbatim, NaN as a NaN", () => {
   for (const n of [0, 1.5, -1.5, Math.fround(0.1), 3.4e38, Infinity, -Infinity]) {
     const v = Math.fround(n);
     assert.ok(Object.is(roundTripF32(v), v), `round-trip ${v}`);

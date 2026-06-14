@@ -11,6 +11,7 @@ package jed
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -211,16 +212,27 @@ func encodeValue(ty ScalarType, v Value) []byte {
 			byte(m>>24), byte(m>>16), byte(m>>8), byte(m))
 		return out
 	case ValFloat64:
-		// Fixed 8-byte body, NO length prefix: math.Float64bits big-endian, preserving the bits
-		// VERBATIM (a stored -0.0 keeps its sign bit) — spec/design/float.md §10, format.md code 12.
+		// Fixed 8-byte body, NO length prefix: the IEEE bits big-endian (format.md code 12). VERBATIM
+		// for every value EXCEPT NaN: a -0.0 keeps its sign bit and ±Inf/finite keep theirs, but a
+		// NaN is canonicalized to the single quiet pattern 0x7FF8000000000000. A NaN's payload is
+		// core-specific (math.NaN() is …001, hardware Inf-Inf is the negative 0xFFF8…), so the codec
+		// re-canonicalizes it to keep a stored NaN cross-core byte-identical (spec/design/float.md §10,
+		// determinism.md §4). The -0→+0 collapse is a comparison/key concern only, NOT applied here.
 		bits := uint64(v.Int)
+		if math.IsNaN(math.Float64frombits(bits)) {
+			bits = 0x7FF8000000000000
+		}
 		out := make([]byte, 0, 1+8)
 		out = append(out, 0x00) // present
 		return append(out, byte(bits>>56), byte(bits>>48), byte(bits>>40), byte(bits>>32),
 			byte(bits>>24), byte(bits>>16), byte(bits>>8), byte(bits))
 	case ValFloat32:
-		// Fixed 4-byte body, NO length prefix: math.Float32bits big-endian (format.md code 13).
+		// Fixed 4-byte body, NO length prefix: the IEEE bits big-endian (format.md code 13). VERBATIM
+		// except a NaN is canonicalized to the single quiet pattern 0x7FC00000 (see ValFloat64).
 		bits := uint32(v.Int)
+		if math.IsNaN(float64(math.Float32frombits(bits))) {
+			bits = 0x7FC00000
+		}
 		out := make([]byte, 0, 1+4)
 		out = append(out, 0x00) // present
 		return appendU32(out, bits)

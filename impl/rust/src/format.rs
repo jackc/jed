@@ -207,18 +207,32 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
         Value::Bool(b) => vec![0x00, u8::from(*b)], // present tag + bool-byte (0x00 false, 0x01 true)
         // Float value codec (spec/fileformat/format.md, spec/design/float.md §10): present tag,
         // then the IEEE bytes big-endian (float64 = 8, float32 = 4), no length prefix. The stored
-        // bits are preserved VERBATIM (a stored -0.0 keeps its sign bit; canonicalization is a
-        // comparison/key concern only).
+        // bits are VERBATIM for every value EXCEPT NaN: a -0.0 keeps its sign bit and ±Inf/finite
+        // keep theirs, but a NaN is canonicalized to the single quiet pattern (0x7FF8…000 /
+        // 0x7FC00000). A NaN's payload is core-specific (hardware Inf-Inf is the negative 0xFFF8…),
+        // so the codec re-canonicalizes it to keep a stored NaN cross-core byte-identical and stop
+        // an exempt/computed NaN contaminating in-contract storage (determinism.md §4). The -0→+0
+        // collapse is a comparison/key concern (§3), NOT applied here.
         Value::Float64(f) => {
+            let bits = if f.is_nan() {
+                0x7ff8_0000_0000_0000_u64
+            } else {
+                f.to_bits()
+            };
             let mut out = Vec::with_capacity(1 + 8);
             out.push(0x00); // present
-            out.extend_from_slice(&f.to_bits().to_be_bytes());
+            out.extend_from_slice(&bits.to_be_bytes());
             out
         }
         Value::Float32(f) => {
+            let bits = if f.is_nan() {
+                0x7fc0_0000_u32
+            } else {
+                f.to_bits()
+            };
             let mut out = Vec::with_capacity(1 + 4);
             out.push(0x00); // present
-            out.extend_from_slice(&f.to_bits().to_be_bytes());
+            out.extend_from_slice(&bits.to_be_bytes());
             out
         }
         // Decimal value codec (spec/fileformat/format.md): tag, flags (sign), u16 scale,
@@ -2217,9 +2231,11 @@ mod tests {
         assert_eq!(scalar_for_type_code(14), None);
     }
 
-    /// The float value codec preserves the IEEE BITS verbatim — including the sign bit of `-0.0`,
-    /// every NaN bit pattern, and ±Inf — for both widths (spec/design/float.md §10). Storage is a
-    /// bit round-trip, NOT canonicalized (that is a comparison/key concern). Big-endian, fixed-width.
+    /// The float value codec preserves the IEEE BITS verbatim for every value EXCEPT NaN — the sign
+    /// bit of `-0.0`, ±Inf, and finite values all round-trip bit-for-bit — while a NaN is
+    /// canonicalized to the single quiet pattern (`0x7FF8…000` / `0x7FC00000`) so a stored NaN is
+    /// cross-core byte-identical (spec/design/float.md §10). Big-endian, fixed-width. The `-0 → +0`
+    /// collapse is a comparison/key concern and is NOT applied by the codec.
     #[test]
     fn float_value_codec_round_trips_bits() {
         let mut sink = Vec::new();
@@ -2238,7 +2254,13 @@ mod tests {
         ];
         for &x in &f64s {
             let enc = encode_value(ScalarType::Float64, &Value::Float64(x));
-            // present tag + 8 IEEE bytes, big-endian, no length prefix.
+            // present tag + 8 IEEE bytes, big-endian, no length prefix. A NaN canonicalizes to the
+            // single quiet pattern; every other value is verbatim.
+            let want_bits = if x.is_nan() {
+                0x7ff8_0000_0000_0000_u64
+            } else {
+                x.to_bits()
+            };
             assert_eq!(
                 enc.len(),
                 1 + 8,
@@ -2247,13 +2269,13 @@ mod tests {
             assert_eq!(enc[0], 0x00, "present tag");
             assert_eq!(
                 &enc[1..],
-                &x.to_bits().to_be_bytes(),
-                "big-endian IEEE bytes"
+                &want_bits.to_be_bytes(),
+                "big-endian IEEE bytes (NaN canonicalized)"
             );
             let mut pos = 0usize;
             let got = read_value(ScalarType::Float64, &enc, &mut pos, None, &mut sink).unwrap();
             match got {
-                Value::Float64(y) => assert_eq!(y.to_bits(), x.to_bits(), "bits round-trip"),
+                Value::Float64(y) => assert_eq!(y.to_bits(), want_bits, "bits round-trip"),
                 other => panic!("expected Float64, got {other:?}"),
             }
         }
@@ -2270,16 +2292,21 @@ mod tests {
         ];
         for &x in &f32s {
             let enc = encode_value(ScalarType::Float32, &Value::Float32(x));
+            let want_bits = if x.is_nan() {
+                0x7fc0_0000_u32
+            } else {
+                x.to_bits()
+            };
             assert_eq!(
                 enc.len(),
                 1 + 4,
                 "float32 body is 4 bytes behind the presence tag"
             );
-            assert_eq!(&enc[1..], &x.to_bits().to_be_bytes());
+            assert_eq!(&enc[1..], &want_bits.to_be_bytes());
             let mut pos = 0usize;
             let got = read_value(ScalarType::Float32, &enc, &mut pos, None, &mut sink).unwrap();
             match got {
-                Value::Float32(y) => assert_eq!(y.to_bits(), x.to_bits()),
+                Value::Float32(y) => assert_eq!(y.to_bits(), want_bits),
                 other => panic!("expected Float32, got {other:?}"),
             }
         }

@@ -41,7 +41,8 @@ require_relative "lz4"
 
 WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "timestamp" => 8, "timestamptz" => 8 }.freeze
 TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
-             "bytea" => 7, "uuid" => 8, "timestamp" => 9, "timestamptz" => 10, "interval" => 11 }.freeze
+             "bytea" => 7, "uuid" => 8, "timestamp" => 9, "timestamptz" => 10, "interval" => 11,
+             "float64" => 12, "float32" => 13 }.freeze
 CODETYPE = TYPECODE.invert.freeze
 
 # uuid-raw16 (encoding.md §2.7): the 16 raw bytes of the canonical 8-4-4-4-12 form. Used both
@@ -236,6 +237,30 @@ INTERVAL_TABLE = {
          [4, [1, 0, 0]], [5, [0, 30, 0]], [6, nil]]
 }.freeze
 
+# A table with a float64 column (type code 12): exercises the value codec's 8-byte IEEE branch.
+# Covers a positive fraction, a negative value, +0 and -0 (the sign bit is preserved on disk —
+# distinct bytes 0x0000…/0x8000…), +Infinity, -Infinity, a canonicalized NaN (stored as the single
+# quiet pattern 0x7FF8…000 regardless of source — float.md §10), a NULL, and Float::MAX (a full
+# mantissa, bits 0x7FEFFFFFFFFFFFFF). The PK is an int32 (float is not allowed in a key this slice
+# — a float PRIMARY KEY traps 0A000). Values are the exact f64 the cores compute from the literals.
+FLOAT64_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("d", "float64")],
+  rows: [[1, 1.5], [2, -2.5], [3, 0.0], [4, -0.0], [5, Float::INFINITY],
+         [6, -Float::INFINITY], [7, Float::NAN], [8, nil], [9, Float::MAX]]
+}.freeze
+
+# A table with a float32 column (type code 13): the 4-byte IEEE branch. Same special-value coverage
+# as FLOAT64_TABLE (+0/-0 distinct on disk, ±Infinity, a canonicalized NaN → 0x7FC00000, NULL) plus
+# 100.25 (exactly representable in binary32, bits 0x42C88000). Values are exactly representable in
+# binary32 so the f64 fixture value equals the f32-widened decode. PK is int32 (no float key).
+FLOAT32_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("r", "float32")],
+  rows: [[1, 1.5], [2, -2.5], [3, 0.0], [4, -0.0], [5, Float::INFINITY],
+         [6, -Float::INFINITY], [7, Float::NAN], [8, nil], [9, 100.25]]
+}.freeze
+
 # Incompressible filler (format.md "Fixtures"): xorshift32(seed "JEDB") mapped to a 64-char
 # alphabet (text) or raw bytes (bytea). High-entropy output has no 4-byte repeats, so the LZ4
 # encoder never wins store-smaller and the value deterministically stays PLAIN. Mirrored in the
@@ -359,6 +384,8 @@ FIXTURES = [
   { file: "timestamp_table.jed",   page_size: 256, tables: [TIMESTAMP_TABLE] },
   { file: "timestamptz_table.jed", page_size: 256, tables: [TIMESTAMPTZ_TABLE] },
   { file: "interval_table.jed",    page_size: 256, tables: [INTERVAL_TABLE] },
+  { file: "float64_table.jed",     page_size: 256, tables: [FLOAT64_TABLE] },
+  { file: "float32_table.jed",     page_size: 256, tables: [FLOAT32_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
@@ -432,9 +459,31 @@ def encode_value(type, v)
     # sign-flip (a value codec, not a key). v is [months, days, micros].
     m, d, us = v
     "\x00".b + [m].pack("l>") + [d].pack("l>") + [us].pack("q>")
+  when "float64"
+    "\x00".b + encode_float64(v)
+  when "float32"
+    "\x00".b + encode_float32(v)
   else
     "\x00".b + encode_int(WIDTH.fetch(type), v)
   end
+end
+
+# Float value codec body (format.md code 12/13; spec/design/float.md §10): the IEEE bytes,
+# big-endian, fixed width, no length prefix. Stored VERBATIM for every value except NaN — a -0.0
+# keeps its sign bit (pack preserves it) and ±Inf/finite keep theirs — but a NaN is canonicalized
+# to the single quiet pattern (0x7FF8…000 / 0x7FC00000), since a NaN's payload is core-specific and
+# a stored NaN must be cross-core byte-identical. The -0→+0 collapse is a comparison/key concern,
+# NOT applied here.
+def encode_float64(f)
+  return [0x7FF8000000000000].pack("Q>") if f.nan?
+
+  [f].pack("G") # IEEE 754 double, big-endian
+end
+
+def encode_float32(f)
+  return [0x7FC00000].pack("N") if f.nan?
+
+  [f].pack("g") # IEEE 754 single, big-endian
 end
 
 # Parse a decimal STRING ("[-]int[.frac]") into (neg, scale, coefficient). The coefficient is a
@@ -1124,6 +1173,12 @@ def decode_value(type, buf, pos, fetch = nil)
     db, pos = take(buf, pos, 4)
     ub, pos = take(buf, pos, 8)
     [[mb.unpack1("l>"), db.unpack1("l>"), ub.unpack1("q>")], pos]
+  when "float64"
+    vb, pos = take(buf, pos, 8)
+    [vb.unpack1("G"), pos] # a canonical-NaN body unpacks to a Float NaN; content_equal? handles ==
+  when "float32"
+    vb, pos = take(buf, pos, 4)
+    [vb.unpack1("g"), pos]
   else
     vb, pos = take(buf, pos, WIDTH.fetch(type))
     [decode_int(WIDTH.fetch(type), vb), pos]
@@ -1311,6 +1366,28 @@ def fail!(msg)
   exit 1
 end
 
+# Deep equality for comparing a decoded fixture's logical content against the expected content.
+# Identical to Ruby's `==` EXCEPT it treats two NaNs as equal: a stored NaN decodes to a Float NaN
+# (Ruby's NaN == NaN is false), so the float fixtures would otherwise read as a false mismatch even
+# though the BYTE check already pinned the on-disk bytes. -0.0 falls through to `==` (the byte check
+# distinguishes -0 from +0). Floats are the only values Ruby's structural `==` gets wrong here.
+def content_equal?(a, b)
+  case a
+  when Float
+    return false unless b.is_a?(Float)
+    return true if a.nan? && b.nan?
+    return false if a.nan? || b.nan?
+
+    a == b
+  when Array
+    b.is_a?(Array) && a.length == b.length && a.each_index.all? { |i| content_equal?(a[i], b[i]) }
+  when Hash
+    b.is_a?(Hash) && a.length == b.length && a.all? { |k, v| b.key?(k) && content_equal?(v, b[k]) }
+  else
+    a == b
+  end
+end
+
 def fixtures_dir = File.join(__dir__, "fixtures")
 
 def generate
@@ -1343,7 +1420,9 @@ def verify
     want = expected_tables(fx)
     fail!("#{fx[:file]}: decoded #{decoded.size} tables, expected #{want.size}") unless decoded.size == want.size
     decoded.each_with_index do |t, i|
-      fail!("#{fx[:file]}: table #{i} mismatch\n  got:  #{t.inspect}\n  want: #{want[i].inspect}") unless t == want[i]
+      unless content_equal?(t, want[i])
+        fail!("#{fx[:file]}: table #{i} mismatch\n  got:  #{t.inspect}\n  want: #{want[i].inspect}")
+      end
     end
   end
 

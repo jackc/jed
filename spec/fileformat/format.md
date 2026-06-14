@@ -322,10 +322,14 @@ Independent of any in-memory enum discriminant (which may be reordered):
 A **`float64`** value (`type_code == 12`) is the **8 IEEE 754 bytes, big-endian**, and a
 **`float32`** value (`type_code == 13`) is the **4 IEEE 754 bytes, big-endian** — both behind the
 presence tag, fixed-width, no length prefix, the `int64`/`uuid`/`timestamp` shape. The stored bits
-are preserved verbatim (a stored `-0.0` keeps its sign bit; the `-0 = +0` and NaN canonicalization
-is a comparison/key concern, not a storage one — [../design/float.md](../design/float.md) §3/§10).
-The on-disk bytes are byte-identical across cores (the float types are exempt from cross-core
-identity only for *computed/rendered values*, not for *storage* — determinism.md §6).
+are preserved verbatim for every value **except `NaN`**: a stored `-0.0` keeps its sign bit and
+`±Infinity`/finite values keep theirs, but a `NaN` is **canonicalized to the single quiet pattern**
+`0x7FF8000000000000` (`float64`) / `0x7FC00000` (`float32`) on write. A NaN's payload bits are
+core-specific (Go's `math.NaN()` is `0x7FF8…001`, hardware `Inf − Inf` is the negative `0xFFF8…`),
+so this NaN-only step is what keeps a stored NaN byte-identical across cores; everything else is
+verbatim (the `-0 = +0` collapse is a comparison/key concern only — [../design/float.md](../design/float.md)
+§3/§10). The on-disk bytes are byte-identical across cores (the float types are exempt from
+cross-core identity only for *computed/rendered values*, not for *storage* — determinism.md §6).
 
 A column's collation is **not** stored: there is one collation (`C`) for all text this slice
 ([../design/types.md](../design/types.md) §11). A per-column collation field is a forward

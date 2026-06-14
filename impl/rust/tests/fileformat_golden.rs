@@ -415,6 +415,48 @@ fn interval_table_db() -> Database {
     db
 }
 
+/// A table with a float64 column (type code 12) — the 8-byte IEEE value-codec branch. A positive
+/// fraction, a negative value, +0 and -0 (the sign bit is preserved on disk — distinct bytes), both
+/// infinities, a canonicalized NaN (stored as the single quiet pattern `0x7FF8…000`), a NULL, and
+/// `f64::MAX` (a full mantissa). Finite values enter via bare numeric literals (decimal adaptation);
+/// the specials enter via typed literals in `INSERT ... SELECT` (a VALUES slot takes only bare
+/// literals this slice — float.md). PK stays int32 (float PK → 0A000).
+fn float64_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, d float64)");
+    run(&mut db, "INSERT INTO t VALUES (1, 1.5)");
+    run(&mut db, "INSERT INTO t VALUES (2, -2.5)");
+    run(&mut db, "INSERT INTO t VALUES (3, 0.0)");
+    run(&mut db, "INSERT INTO t SELECT 4, float64 '-0'");
+    run(&mut db, "INSERT INTO t SELECT 5, float64 'Infinity'");
+    run(&mut db, "INSERT INTO t SELECT 6, float64 '-Infinity'");
+    run(&mut db, "INSERT INTO t SELECT 7, float64 'NaN'");
+    run(&mut db, "INSERT INTO t VALUES (8, NULL)");
+    run(
+        &mut db,
+        "INSERT INTO t SELECT 9, float64 '1.7976931348623157e308'",
+    );
+    db
+}
+
+/// A table with a float32 column (type code 13) — the 4-byte IEEE branch. The same special-value
+/// coverage as `float64_table_db` (canonicalized NaN → `0x7FC00000`) plus 100.25 (exactly
+/// representable in binary32). PK stays int32.
+fn float32_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, r float32)");
+    run(&mut db, "INSERT INTO t VALUES (1, 1.5)");
+    run(&mut db, "INSERT INTO t VALUES (2, -2.5)");
+    run(&mut db, "INSERT INTO t VALUES (3, 0.0)");
+    run(&mut db, "INSERT INTO t SELECT 4, float32 '-0'");
+    run(&mut db, "INSERT INTO t SELECT 5, float32 'Infinity'");
+    run(&mut db, "INSERT INTO t SELECT 6, float32 '-Infinity'");
+    run(&mut db, "INSERT INTO t SELECT 7, float32 'NaN'");
+    run(&mut db, "INSERT INTO t VALUES (8, NULL)");
+    run(&mut db, "INSERT INTO t VALUES (9, 100.25)");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -433,6 +475,8 @@ fn write_matches_goldens() {
         ("timestamp_table.jed", timestamp_table_db),
         ("timestamptz_table.jed", timestamptz_table_db),
         ("interval_table.jed", interval_table_db),
+        ("float64_table.jed", float64_table_db),
+        ("float32_table.jed", float32_table_db),
         ("nopk_table.jed", nopk_table_db),
         ("composite_pk_table.jed", composite_pk_table_db),
         ("check_table.jed", check_table_db),
@@ -464,6 +508,8 @@ fn read_goldens_reproduces_rows() {
         ("timestamp_table.jed", timestamp_table_db, "t"),
         ("timestamptz_table.jed", timestamptz_table_db, "t"),
         ("interval_table.jed", interval_table_db, "t"),
+        ("float64_table.jed", float64_table_db, "t"),
+        ("float32_table.jed", float32_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
         ("composite_pk_table.jed", composite_pk_table_db, "t"),
         ("check_table.jed", check_table_db, "t"),

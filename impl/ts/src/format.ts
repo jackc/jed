@@ -255,20 +255,28 @@ function encodeValue(ty: ScalarType, v: Value): Uint8Array {
     return out;
   }
   if (v.kind === "float64") {
-    // 8 IEEE bytes, big-endian, no length prefix (fixed-width like uuid/timestamp). The bits are
-    // stored VERBATIM (a stored -0.0 keeps its sign bit; NaN keeps its pattern) — canonicalization
-    // is a compare/key concern, not a storage one (spec/fileformat/format.md, float.md §10).
+    // 8 IEEE bytes, big-endian, no length prefix (fixed-width like uuid/timestamp). Stored VERBATIM
+    // for every value EXCEPT NaN: a -0.0 keeps its sign bit and ±Inf/finite keep theirs, but a NaN
+    // is canonicalized to the single quiet pattern 0x7FF8000000000000. A NaN's payload is
+    // core-specific (Go's math.NaN() is …001, hardware Inf-Inf is the negative 0xFFF8…), so the
+    // codec pins it cross-core (spec/design/float.md §10, determinism.md §4); the -0→+0 collapse is
+    // a compare/key concern only, NOT applied here. (V8 already materializes a canonical NaN, so the
+    // branch is belt-and-suspenders parity with the Rust/Go codecs.)
     const out = new Uint8Array(1 + 8);
     out[0] = 0x00; // present
-    new DataView(out.buffer).setFloat64(1, v.value, false); // big-endian
+    const dv = new DataView(out.buffer);
+    if (Number.isNaN(v.value)) dv.setBigUint64(1, 0x7ff8000000000000n, false);
+    else dv.setFloat64(1, v.value, false); // big-endian
     return out;
   }
   if (v.kind === "float32") {
-    // 4 IEEE bytes, big-endian. v.value is already Math.fround'd (binary32), so setFloat32 stores
-    // it without further rounding loss.
+    // 4 IEEE bytes, big-endian. v.value is already Math.fround'd (binary32), so setFloat32 stores it
+    // without further rounding loss. NaN is canonicalized to 0x7FC00000 (see float64 above).
     const out = new Uint8Array(1 + 4);
     out[0] = 0x00; // present
-    new DataView(out.buffer).setFloat32(1, v.value, false); // big-endian
+    const dv = new DataView(out.buffer);
+    if (Number.isNaN(v.value)) dv.setUint32(1, 0x7fc00000, false);
+    else dv.setFloat32(1, v.value, false); // big-endian
     return out;
   }
   if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");

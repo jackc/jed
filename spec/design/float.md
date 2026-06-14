@@ -301,10 +301,19 @@ compare; the tolerance exists for the exempted surface and the oracle. `# cost:`
   `math.Float64bits`, TS `DataView.setFloat64(_, false)`, Rust `f64::to_bits().to_be_bytes()`;
   `float32`: Go `math.Float32bits`, TS `setFloat32(_, false)`, Rust `f32::to_bits().to_be_bytes()`)
   behind the shared presence tag (NULL = tag only). Fixed-width, so no length prefix — like
-  `uuid`/`timestamp`. The stored bits are preserved verbatim (a stored `-0.0` keeps its sign bit);
-  canonicalization is a *comparison/key* concern (§3), not a *storage* one. Byte-exact goldens
-  `float32_table.jed` / `float64_table.jed` (`rust == go == ts == ruby`), the cross-core round-trip
-  every type ships.
+  `uuid`/`timestamp`. The stored bits are preserved **verbatim for every value except `NaN`**: a
+  stored `-0.0` keeps its sign bit, and `±Infinity`/finite values keep theirs, but a `NaN` is
+  **canonicalized to the single quiet pattern** `0x7FF8000000000000` (`float64`) / `0x7FC00000`
+  (`float32`) on the way to disk. This NaN-only step is the one storage divergence from verbatim,
+  and the determinism contract forces it: a NaN's *payload* bits are **core-specific** (Go's
+  `math.NaN()` is `0x7FF8…001`, Go/Rust hardware `Inf − Inf` is the negative `0xFFF8…`, JS
+  materializes `0x7FF8…000`), so storing them verbatim would make the cores' files disagree. A
+  stored value is **in-contract** (§8), so an exempt/computed NaN's bits must not contaminate it
+  ([determinism.md](determinism.md) §4 no-contamination) — the codec is the boundary that
+  re-canonicalizes them. (This is a *NaN-only* normalization; unlike the comparison/key form §3 it
+  does **not** collapse `-0 → +0`, since both zeros are already cross-core identical.) Byte-exact
+  goldens `float32_table.jed` / `float64_table.jed` (`rust == go == ts == ruby`), the cross-core
+  round-trip every type ships.
 - **Key encoding** — `float-order-preserving` ([encoding.md](encoding.md) §2.8, to author):
   canonicalize `-0 → +0` and all NaNs to one pattern, take the IEEE bits as a big-endian u64,
   and **if the sign bit is set (negative) flip all 64 bits, else flip just the sign bit** — the

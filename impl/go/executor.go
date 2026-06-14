@@ -6901,7 +6901,10 @@ func parseFloatLiteral(s string, ty ScalarType) (float64, error) {
 		return math.Inf(int(sign)), nil
 	case "nan":
 		// NaN carries no sign in jed's total order; a leading sign is accepted and ignored (PG).
-		return math.NaN(), nil
+		// Use jed's canonical NaN pattern (NOT math.NaN(), whose low payload bit 0x…001 differs from
+		// the Rust/TS cores) so a literal NaN is cross-core byte-identical in memory and on disk
+		// (spec/design/float.md §3/§10).
+		return canonicalNaN64(), nil
 	}
 	// Finite numeric: validate the grammar by hand (reject Go's hex-float / underscore / "inf"
 	// shapes already handled above), then parse with strconv (correctly rounded at the width).

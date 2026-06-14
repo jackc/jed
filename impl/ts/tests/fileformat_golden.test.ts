@@ -300,6 +300,45 @@ function intervalTableDB(): Database {
   return db;
 }
 
+// float64TableDB exercises the value codec's 8-byte IEEE branch (type code 12): a positive
+// fraction, a negative value, +0 and -0 (the sign bit is preserved on disk — distinct bytes), both
+// infinities, a canonicalized NaN (stored as the single quiet pattern 0x7FF8…000), a NULL, and
+// Float64 max (a full mantissa). Finite values enter via bare numeric literals (decimal adaptation);
+// the specials enter via typed literals in INSERT ... SELECT (a VALUES slot takes only bare literals
+// this slice — float.md). PK is int32 (no float key this slice — float PK → 0A000).
+function float64TableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, d float64)");
+  run(db, "INSERT INTO t VALUES (1, 1.5)");
+  run(db, "INSERT INTO t VALUES (2, -2.5)");
+  run(db, "INSERT INTO t VALUES (3, 0.0)");
+  run(db, "INSERT INTO t SELECT 4, float64 '-0'");
+  run(db, "INSERT INTO t SELECT 5, float64 'Infinity'");
+  run(db, "INSERT INTO t SELECT 6, float64 '-Infinity'");
+  run(db, "INSERT INTO t SELECT 7, float64 'NaN'");
+  run(db, "INSERT INTO t VALUES (8, NULL)");
+  run(db, "INSERT INTO t SELECT 9, float64 '1.7976931348623157e308'");
+  return db;
+}
+
+// float32TableDB exercises the value codec's 4-byte IEEE branch (type code 13): the same
+// special-value coverage as float64TableDB (canonicalized NaN → 0x7FC00000) plus 100.25 (exactly
+// representable in binary32). PK is int32 (no float key this slice).
+function float32TableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, r float32)");
+  run(db, "INSERT INTO t VALUES (1, 1.5)");
+  run(db, "INSERT INTO t VALUES (2, -2.5)");
+  run(db, "INSERT INTO t VALUES (3, 0.0)");
+  run(db, "INSERT INTO t SELECT 4, float32 '-0'");
+  run(db, "INSERT INTO t SELECT 5, float32 'Infinity'");
+  run(db, "INSERT INTO t SELECT 6, float32 '-Infinity'");
+  run(db, "INSERT INTO t SELECT 7, float32 'NaN'");
+  run(db, "INSERT INTO t VALUES (8, NULL)");
+  run(db, "INSERT INTO t VALUES (9, 100.25)");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -317,6 +356,8 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "timestamp_table.jed", build: timestampTableDB },
     { name: "timestamptz_table.jed", build: timestamptzTableDB },
     { name: "interval_table.jed", build: intervalTableDB },
+    { name: "float64_table.jed", build: float64TableDB },
+    { name: "float32_table.jed", build: float32TableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
     { name: "composite_pk_table.jed", build: compositePKTableDB },
     { name: "check_table.jed", build: checkTableDB },
@@ -351,6 +392,8 @@ test("read goldens reproduces rows", () => {
     { name: "timestamp_table.jed", build: timestampTableDB, table: "t" },
     { name: "timestamptz_table.jed", build: timestamptzTableDB, table: "t" },
     { name: "interval_table.jed", build: intervalTableDB, table: "t" },
+    { name: "float64_table.jed", build: float64TableDB, table: "t" },
+    { name: "float32_table.jed", build: float32TableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },
     { name: "composite_pk_table.jed", build: compositePKTableDB, table: "t" },
     { name: "check_table.jed", build: checkTableDB, table: "t" },

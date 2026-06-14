@@ -29,10 +29,15 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 		if got.Kind != ValFloat64 {
 			t.Fatalf("float64 %v: kind %v", f, got.Kind)
 		}
-		// Compare by BITS — storage preserves the original pattern verbatim (incl -0's sign bit
-		// and the NaN payload). Float64Value stashes bits in Int, so == on Int is a bit compare.
-		if uint64(got.Int) != math.Float64bits(f) {
-			t.Errorf("float64 %v: bits %#016x != %#016x", f, uint64(got.Int), math.Float64bits(f))
+		// Compare by BITS. Storage preserves the original pattern verbatim (incl -0's sign bit) EXCEPT
+		// for NaN, which canonicalizes to the single quiet pattern 0x7FF8…000 (float.md §10).
+		// Float64Value stashes bits in Int, so == on Int is a bit compare.
+		want := math.Float64bits(f)
+		if math.IsNaN(f) {
+			want = 0x7FF8000000000000
+		}
+		if uint64(got.Int) != want {
+			t.Errorf("float64 %v: bits %#016x != %#016x", f, uint64(got.Int), want)
 		}
 	}
 	cases32 := []float32{
@@ -47,15 +52,20 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("float32 decode %v: %v", f, err)
 		}
-		if got.Kind != ValFloat32 || uint32(got.Int) != math.Float32bits(f) {
-			t.Errorf("float32 %v: bits %#08x != %#08x", f, uint32(got.Int), math.Float32bits(f))
+		want := math.Float32bits(f)
+		if math.IsNaN(float64(f)) {
+			want = 0x7FC00000 // NaN canonicalizes on store (float.md §10)
+		}
+		if got.Kind != ValFloat32 || uint32(got.Int) != want {
+			t.Errorf("float32 %v: bits %#08x != %#08x", f, uint32(got.Int), want)
 		}
 	}
 }
 
 func TestFloatImageRoundTrip(t *testing.T) {
 	// The on-disk single-file image (the §8 cross-core round-trip contract) preserves float bits
-	// verbatim — incl NaN / -0 / ±Inf — across a serialize + reload.
+	// verbatim — incl -0 / ±Inf — across a serialize + reload (a NaN canonicalizes to one quiet
+	// pattern but stays a NaN; float.md §10).
 	db := dbWith(t,
 		"CREATE TABLE f (id int32 PRIMARY KEY, a float32, b float64)",
 		"INSERT INTO f VALUES (1, '1.5', 'NaN')",
