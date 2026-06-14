@@ -1622,8 +1622,11 @@ func (p *Parser) parseUnary() (Expr, error) {
 	if p.peek().Kind == TokMinus {
 		p.advance()
 		// Fold unary-minus-of-an-integer-literal into one negative literal, so int64's
-		// minimum is representable and the literal range-checks against context.
-		if p.peek().Kind == TokInt {
+		// minimum is representable and the literal range-checks against context. SUPPRESSED
+		// when a `::` immediately follows: `::` binds tighter than unary minus (PostgreSQL),
+		// so `-N::T` is `-(N::T)` — the cast applies to the unsigned magnitude first
+		// (grammar.md §37). A one-token lookahead on the token AFTER the literal.
+		if p.peek().Kind == TokInt && p.peekKindAt(1) != TokDoubleColon {
 			v, ok := foldInt(p.advance().Int, true)
 			if !ok {
 				return Expr{}, NewError(NumericValueOutOfRange,
@@ -1632,8 +1635,8 @@ func (p *Parser) parseUnary() (Expr, error) {
 			return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralInt, Int: v}}, nil
 		}
 		// Fold unary-minus of a decimal literal into one negative decimal literal (decimal
-		// negation never overflows).
-		if p.peek().Kind == TokDecimal {
+		// negation never overflows). Same `::` suppression.
+		if p.peek().Kind == TokDecimal && p.peekKindAt(1) != TokDoubleColon {
 			t := p.advance()
 			return Expr{Kind: ExprLiteral, Literal: &Literal{
 				Kind: LiteralDecimal, Dec: DecimalFromDigitsScale(true, t.Word, uint32(t.Int)),
@@ -1645,7 +1648,32 @@ func (p *Parser) parseUnary() (Expr, error) {
 		}
 		return Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNeg, Operand: operand}}, nil
 	}
-	return p.parsePrimary()
+	return p.parsePostfix()
+}
+
+// parsePostfix parses a primary optionally followed by one or more `::type` PostgreSQL typecasts
+// (grammar.md §37). `expr :: type` desugars to CAST(expr AS type) here at parse time — one
+// resolver / evaluator / cost path for both spellings — and casts chain left-associatively
+// (`x::int8::int2` = `(x::int8)::int2`). A typmod rides on the type name exactly as in CAST
+// (`x::numeric(10,2)`). `::` binds tighter than unary minus (handled by parseUnary above).
+func (p *Parser) parsePostfix() (Expr, error) {
+	expr, err := p.parsePrimary()
+	if err != nil {
+		return Expr{}, err
+	}
+	for p.peek().Kind == TokDoubleColon {
+		p.advance()
+		typeName, err := p.expectIdentifier()
+		if err != nil {
+			return Expr{}, err
+		}
+		typeMod, err := p.parseTypeMod()
+		if err != nil {
+			return Expr{}, err
+		}
+		expr = Expr{Kind: ExprCast, Cast: &CastExpr{Inner: expr, TypeName: typeName, TypeMod: typeMod}}
+	}
+	return expr, nil
 }
 
 // parsePrimary parses a parenthesized expression, CAST(...), a literal (integer,

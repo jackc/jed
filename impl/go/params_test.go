@@ -193,6 +193,55 @@ func TestDDLWithParamsTraps42601(t *testing.T) {
 	}
 }
 
+func TestParamTypedByCastOperator(t *testing.T) {
+	// `$1::int` declares `$1` as int — PostgreSQL types a parameter by its cast target
+	// (api.md §5, grammar.md §37). No surrounding context is needed, so this is NOT 42P18.
+	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	rows := queryRows(t, db, "SELECT $1::int", IntValue(42))
+	if len(rows) != 1 || rows[0][0].Int != 42 {
+		t.Fatalf("got %v want [[42]]", rows)
+	}
+	// The CAST(... AS ...) spelling infers the parameter's type identically.
+	rows = queryRows(t, db, "SELECT CAST($1 AS int)", IntValue(7))
+	if len(rows) != 1 || rows[0][0].Int != 7 {
+		t.Fatalf("got %v want [[7]]", rows)
+	}
+}
+
+func TestParamCastOperatorNarrowsAndTraps22003(t *testing.T) {
+	// `$1::smallint` declares `$1` as int16; a bound value out of int16 range traps 22003 at
+	// bind, before any scan.
+	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	if c := paramErrCode(t, db, "SELECT $1::smallint", IntValue(100000)); c != "22003" {
+		t.Fatalf("code = %s want 22003", c)
+	}
+}
+
+func TestParamCastToDeferredTargetIs0A000(t *testing.T) {
+	// Casting a parameter to a deferred target (text) is 0A000, like any non-string-literal
+	// cast to text.
+	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	if c := paramErrCode(t, db, "SELECT $1::text", IntValue(1)); c != "0A000" {
+		t.Fatalf("code = %s want 0A000", c)
+	}
+}
+
+func TestCastOperatorInheritsDeferralsAndRejectsLoneColon(t *testing.T) {
+	// `::` desugars to CAST, so casting a non-string-literal value to text/boolean is the same
+	// deferred 0A000 narrowing the CAST spelling carries.
+	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	if c := paramErrCode(t, db, "SELECT 5::text"); c != "0A000" {
+		t.Fatalf("5::text code = %s want 0A000", c)
+	}
+	if c := paramErrCode(t, db, "SELECT 5::boolean"); c != "0A000" {
+		t.Fatalf("5::boolean code = %s want 0A000", c)
+	}
+	// A lone `:` is not part of jed's surface — a 42601 syntax error from the lexer.
+	if c := paramErrCode(t, db, "SELECT 1 : 2"); c != "42601" {
+		t.Fatalf("lone colon code = %s want 42601", c)
+	}
+}
+
 func TestLexerRejectsBadParamTokens(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY)")
 	for _, sql := range []string{

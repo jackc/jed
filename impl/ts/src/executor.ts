@@ -4555,7 +4555,13 @@ function resolve(
       if (isInterval(target)) {
         throw engineError("feature_not_supported", "casting to an interval type is not supported yet");
       }
-      const inner = resolve(scope, e.inner, null, ag, params);
+      // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
+      // `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
+      // (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
+      // context (its value is range-checked / coerced against target at eval), so changing the
+      // context only for a parameter leaves all existing CAST behavior untouched.
+      const innerCtx = e.inner.kind === "param" ? target : null;
+      const inner = resolve(scope, e.inner, innerCtx, ag, params);
       if (inner.type.kind === "bool") {
         throw typeError("cannot cast boolean to " + canonicalName(target));
       }

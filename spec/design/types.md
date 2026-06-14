@@ -186,6 +186,13 @@ INSERT/UPDATE into a column but not in general expressions) is part of the vocab
 future types; for the integer set, widenings are fully implicit so no edge needs the
 weaker `assignment` mode yet.
 
+**Two spellings, one cast.** An explicit cast is written either `CAST(expr AS type)` or, with
+PostgreSQL's postfix operator, `expr :: type` ([grammar.md](grammar.md) §37). The two are
+identical — the parsers desugar `::` to the same `CAST` node — so the matrix above, the
+string-literal coercion, the deferred narrowings, and every resolve code apply unchanged to both.
+`::` binds tighter than unary minus (so `-5 :: int` is `-(5 :: int)`), and a bind-parameter operand
+takes the cast target as its type (`$1 :: int` types `$1` as int — [api.md](api.md) §5).
+
 ## 6. Integer-literal typing
 
 A bare integer literal (`1000`, `-32768`) is an **untyped integer constant** — in the

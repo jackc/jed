@@ -81,6 +81,15 @@ func Lex(sql string) ([]Token, error) {
 		case c == '%':
 			tokens = append(tokens, Token{Kind: TokPercent})
 			i++
+		case c == ':':
+			// `::` is the PostgreSQL typecast operator (grammar.md §37), scanned greedily as one
+			// token. A lone `:` is not part of jed's surface — a 42601 syntax error.
+			if i+1 < len(b) && b[i+1] == ':' {
+				tokens = append(tokens, Token{Kind: TokDoubleColon})
+				i += 2
+			} else {
+				return nil, NewError(SyntaxError, "unexpected character ':'")
+			}
 		case c == '=':
 			tokens = append(tokens, Token{Kind: TokEq})
 			i++

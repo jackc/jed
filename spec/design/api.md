@@ -262,7 +262,10 @@ primary expression is accepted and as an `INSERT` value slot.
 **Typing is by context, statically, before execution.** The engine has a strict static type
 system (CLAUDE.md §4); a parameter has no intrinsic type, so it adopts one from its context
 — the other operand of a comparison/arithmetic, the target column of an `INSERT`/`UPDATE
-SET`, or a `CAST` target. A parameter with **no derivable type** (e.g. a bare `SELECT $1`,
+SET`, or a `CAST` target. The cast-target case covers **both** spellings — `CAST($1 AS int)`
+and the postfix `$1 :: int` ([grammar.md](grammar.md) §37) — so `$1 :: int` types `$1` as int
+and `$1 :: numeric(10,2)` types it decimal and re-scales the bound value to `(10,2)`. A parameter
+with **no derivable type** (e.g. a bare `SELECT $1`,
 or a gap in `$1..$N`) is `42P18 indeterminate_datatype`. Conflicting inferences for the same
 index (`int16` here, `text` there) are `42804 datatype_mismatch`. Two adaptable operands
 with no anchoring type (`$1 = $2`, `$1 = 5`) default the parameter to `int64`, matching the

@@ -47,6 +47,9 @@ const (
 	TokLe
 	// TokGe is ">=".
 	TokGe
+	// TokDoubleColon is the "::" PostgreSQL typecast operator (expr::type = CAST(expr AS type)).
+	// Two colons, scanned greedily; a lone ":" is a 42601 syntax error (spec/design/grammar.md §37).
+	TokDoubleColon
 	// TokParam is a bind parameter $N — Int holds the 1-based index. The lexer rejects $0, a
 	// leading zero ($01), and $ with no following digit (42601). Bound by the host API, not the
 	// corpus (spec/design/api.md, grammar.md §5).

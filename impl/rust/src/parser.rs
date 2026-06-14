@@ -1302,15 +1302,23 @@ impl Parser {
             // Fold unary-minus-of-an-integer-literal into one negative literal: this
             // makes int64::MIN representable (`-(2^63)`) and lets the negative value
             // range-check against its context like any literal (spec/design/types.md §6).
-            if let Token::Int(m) = self.peek() {
+            // SUPPRESSED when a `::` immediately follows the literal: `::` binds tighter than
+            // unary minus (PostgreSQL), so `-N::T` is `-(N::T)` — the cast applies to the
+            // unsigned magnitude first (grammar.md §37). A one-token lookahead on the token
+            // AFTER the literal, a §8 cross-core determinism surface.
+            if let Token::Int(m) = self.peek()
+                && self.tokens.get(self.pos + 1) != Some(&Token::DoubleColon)
+            {
                 let m = *m;
                 self.advance();
                 let folded = -(m as i128); // m <= 2^63 ⇒ folded ∈ [-2^63, 0] ⊆ i64
                 return Ok(Expr::Literal(Literal::Int(folded as i64)));
             }
             // Fold unary-minus of a decimal literal into one negative decimal literal (like
-            // the integer fold). Decimal negation never overflows.
-            if matches!(self.peek(), Token::Decimal(..)) {
+            // the integer fold). Decimal negation never overflows. Same `::` suppression.
+            if matches!(self.peek(), Token::Decimal(..))
+                && self.tokens.get(self.pos + 1) != Some(&Token::DoubleColon)
+            {
                 if let Token::Decimal(digits, scale) = self.advance() {
                     return Ok(Expr::Literal(Literal::Decimal(Decimal::from_digits_scale(
                         true, &digits, scale,
@@ -1323,7 +1331,28 @@ impl Parser {
                 operand: Box::new(operand),
             });
         }
-        self.parse_primary()
+        self.parse_postfix()
+    }
+
+    /// A primary optionally followed by one or more `::type` PostgreSQL typecasts
+    /// (grammar.md §37). `expr :: type` desugars to `CAST(expr AS type)` here at parse time —
+    /// one resolver / evaluator / cost path for both spellings — and casts chain
+    /// left-associatively (`x::int8::int2` = `(x::int8)::int2`). A typmod rides on the type
+    /// name exactly as in `CAST` (`x::numeric(10,2)`). `::` binds tighter than unary minus
+    /// (handled by `parse_unary` above).
+    fn parse_postfix(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_primary()?;
+        while matches!(self.peek(), Token::DoubleColon) {
+            self.advance();
+            let type_name = self.expect_identifier()?;
+            let type_mod = self.parse_type_mod()?;
+            expr = Expr::Cast {
+                inner: Box::new(expr),
+                type_name,
+                type_mod,
+            };
+        }
+        Ok(expr)
     }
 
     /// A primary: a parenthesized expression, `CAST(...)`, a literal (integer,
@@ -1651,6 +1680,7 @@ fn render_token(t: &Token) -> String {
         Token::Gt => ">".into(),
         Token::Le => "<=".into(),
         Token::Ge => ">=".into(),
+        Token::DoubleColon => "::".into(),
         Token::Eof => String::new(),
     }
 }

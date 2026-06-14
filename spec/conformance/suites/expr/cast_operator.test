@@ -1,0 +1,142 @@
+# The PostgreSQL `::` cast operator — `expr :: type` is exactly `CAST(expr AS type)`
+# (spec/design/grammar.md §37, types.md §5). The parsers desugar `::` to the existing CAST node,
+# so it inherits the whole cast machinery: the cast matrix (../../../types/casts.toml), the
+# string-literal coercion (`'42'::int` = `integer '42'`), the decimal→int round-half-away, the
+# typmod re-scale (`::numeric(10,2)`), and the resolve codes (22003 / 22P02). Casts CHAIN
+# left-associatively (`x::bigint::smallint`), and `::` binds TIGHTER than unary minus
+# (`-32768::smallint` traps before the negation; `(-32768)::smallint` is the in-range value) and
+# tighter than arithmetic (`1 + 2::bigint`). Type names here are spelled with the SQL-standard
+# aliases (smallint/int/integer/bigint/numeric/text) so the oracle and jed agree.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.order_by_keys, types.int16, types.int32, types.int64, types.decimal, types.text, expr.arithmetic, expr.unary_minus, expr.parens, expr.precedence, cast.explicit, cast.string_literal, cast.operator, error.overflow_trap
+
+# --- string-literal casts: `'42'::int` is `CAST('42' AS int)` is `integer '42'` -----------
+query I nosort
+SELECT '42'::int
+----
+42
+
+# a cast-coerced literal is an ordinary int32, comparable to a bare integer literal
+query B nosort
+SELECT '42'::integer = 42
+----
+true
+
+# casting a string LITERAL to text is the identity (the string itself)
+query T nosort
+SELECT '5'::text
+----
+5
+
+# --- numeric casts: decimal -> int rounds half AWAY from zero (decimal.md §3) --------------
+query I nosort
+SELECT 1.5::int
+----
+2
+
+query I nosort
+SELECT 2.5::int
+----
+3
+
+# `-2.5::int` is `-(2.5::int)` = -(3) — :: binds tighter than unary minus
+query I nosort
+SELECT -2.5::int
+----
+-3
+
+# integer widening (int32 -> int64) is lossless
+query I nosort
+SELECT 1000::bigint
+----
+1000
+
+# --- chaining is left-associative: (42::bigint)::smallint -----------------------------------
+query I nosort
+SELECT 42::bigint::smallint
+----
+42
+
+# --- typmod rides on the type name, exactly as in CAST --------------------------------------
+# a trailing zero is materialized to the target scale (1.50, not 1.5)
+query D nosort
+SELECT 1.5::numeric(10,2)
+----
+1.50
+
+# a string literal coerced straight into a typmod'd decimal
+query D nosort
+SELECT '3'::numeric(6,2)
+----
+3.00
+
+# --- precedence: `::` binds tighter than unary minus ----------------------------------------
+# `(-32768)::smallint` parenthesizes the negation first — the in-range int16 minimum
+query I nosort
+SELECT (-32768)::smallint
+----
+-32768
+
+# --- precedence: `::` binds tighter than the arithmetic operators ---------------------------
+# `1 + 2::bigint` is `1 + (2::bigint)` = 3
+query I nosort
+SELECT 1 + 2::bigint
+----
+3
+
+# `2::bigint * 3` is `(2::bigint) * 3` = 6
+query I nosort
+SELECT 2::bigint * 3
+----
+6
+
+# --- NULL casts to a typed NULL -------------------------------------------------------------
+query I nosort
+SELECT NULL::int
+----
+NULL
+
+# --- column casts: a non-literal operand casts at eval --------------------------------------
+statement ok
+CREATE TABLE t (id int PRIMARY KEY, a int, d numeric(10,2))
+
+statement ok
+INSERT INTO t VALUES (1, 5, 2.75), (2, 40, -1.25)
+
+# widen an int32 column to int64, and round a decimal column to int (half-away: 2.75 -> 3,
+# -1.25 -> -1) — ordered by the key for determinism
+query II nosort
+SELECT a::bigint, d::int FROM t ORDER BY id
+----
+5
+3
+40
+-1
+
+# a column cast composes with arithmetic and the result re-narrows fine
+query I nosort
+SELECT a::smallint + 1 FROM t ORDER BY id
+----
+6
+41
+
+# --- errors: narrowing that does not fit traps 22003 (same as CAST) -------------------------
+# `-32768::smallint` is `-(32768::smallint)`: the inner 32768 overflows int16 BEFORE the
+# negation, so it traps — unlike the parenthesized `(-32768)::smallint` above
+statement error 22003
+SELECT -32768::smallint
+
+# a bare value out of the target range traps
+statement error 22003
+SELECT 300000::smallint
+
+# the trap fires at the INNER narrow of a chain
+statement error 22003
+SELECT 100000::bigint::smallint
+
+# casting a string literal that is not a valid integer is 22P02
+statement error 22P02
+SELECT 'abc'::int
+
+# an unknown type name is 42704 (resolved at execution, not by the grammar)
+statement error 42704
+SELECT 1::nosuchtype

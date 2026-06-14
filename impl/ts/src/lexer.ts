@@ -85,6 +85,15 @@ export function lex(sql: string): Token[] {
     } else if (c === "%") {
       tokens.push({ kind: "percent" });
       i++;
+    } else if (c === ":") {
+      // `::` is the PostgreSQL typecast operator (grammar.md §37), scanned greedily as one
+      // token. A lone `:` is not part of jed's surface — a 42601 syntax error.
+      if (i + 1 < n && sql[i + 1] === ":") {
+        tokens.push({ kind: "doubleColon" });
+        i += 2;
+      } else {
+        throw engineError("syntax_error", "unexpected character ':'");
+      }
     } else if (c === "=") {
       tokens.push({ kind: "eq" });
       i++;

@@ -6016,7 +6016,17 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if target.IsInterval() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to an interval type is not supported yet")
 		}
-		inner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+		// A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
+		// `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
+		// (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
+		// context (its value is range-checked / coerced against target at eval), so changing the
+		// context only for a parameter leaves all existing CAST behavior untouched.
+		var innerCtx *ScalarType
+		if e.Cast.Inner.Kind == ExprParam {
+			t := target
+			innerCtx = &t
+		}
+		inner, ity, err := resolve(s, e.Cast.Inner, innerCtx, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}

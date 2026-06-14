@@ -1572,3 +1572,62 @@ value literals, so `true 'x'` is not `CAST('x' AS true)`.)
   ([interval.md](interval.md) §3) — a parse-subset gap, not a literal-syntax one.
 
 `DATE '…'` / `TIME '…'` are absent only because those types are not in the scalar set.
+
+## 37. The `::` cast operator (`expr :: type`)
+
+`expr :: type_name` is PostgreSQL's postfix typecast operator, and it is **exactly**
+`CAST(expr AS type_name)` ([grammar.ebnf](../grammar/grammar.ebnf) `postfix`,
+[types.md](types.md) §5). It is pure surface sugar: the parsers **desugar `::` to the existing
+`Cast` AST node at parse time**, so there is one resolver path, one evaluator path, one cost, and
+one cross-core contract for both spellings. Everything the cast machinery already does carries
+over unchanged:
+
+- the **cast matrix** ([../types/casts.toml](../types/casts.toml)) — `'42' :: int` (string-literal
+  coercion, the same primitive as the `integer '42'` typed literal of §36), `x :: int8` (widen),
+  `x :: int2` (narrow, traps `22003`), `d :: int` (decimal→int, round half-away), `n :: numeric(10,2)`
+  (re-scale to the typmod);
+- the **deferred narrowings** — casting **to or from** `text` / `boolean` / `bytea` / `uuid` /
+  `timestamp` / `timestamptz` / `interval` is `0A000` (except a *string-literal* operand, which
+  coerces). `5 :: text` is `0A000`, identical to `CAST(5 AS text)`; `'5' :: text` is the string
+  identity `'5'`;
+- the resolve codes `42704` (unknown type) / `22003` (out of range) / `22P02` (malformed string) /
+  `22023` (bad typmod), and a **typmod on the type name** (`x :: numeric(10,2)`), exactly as CAST.
+
+**Chaining is left-associative.** `x :: int8 :: int2` is `(x :: int8) :: int2` — the parser loops,
+wrapping each `Cast` around the previous. So `42 :: int8 :: int2` is `42` widened to int64 then
+narrowed to int16 (= 42), and `9999999999 :: int8 :: int2` traps `22003` at the **inner** narrow's
+eval.
+
+**Precedence — `::` binds tighter than unary minus** (PostgreSQL's operator table: `::` sits just
+below the `.` qualifier, above unary `+`/`-`). So:
+
+```
+-5 :: int        ==  -(5 :: int)        -- NOT (-5) :: int
+-32768 :: int16  ->  22003              -- inner 32768 overflows int16, THEN negate
+(-32768) :: int16 ->  -32768            -- parenthesized: the in-range value
+1 + 2 :: int8    ==  1 + (2 :: int8)    -- tighter than additive, too
+```
+
+This matters because of §4's **leading-`-`-of-a-literal fold** (which makes `int64`'s minimum
+representable as `-9223372036854775808`). That fold is **suppressed when a `::` immediately follows
+the numeric literal**, so `-N :: T` parses as `-(N :: T)` (the cast applies to the unsigned
+magnitude first), matching PG. A bare `-N` with no trailing `::` still folds as before — no
+regression. The suppression is a one-token lookahead on the token *after* the literal, a §8
+cross-core determinism surface, byte-identical across the three hand-written parsers.
+
+**Bind parameters — `$1 :: int` types the parameter.** A bind-parameter operand of a cast takes
+the cast **target** as its inferred type ([api.md](../design/api.md) §5): `$1 :: int` declares `$1`
+as `int`, `$1 :: numeric(10,2)` declares it `decimal` and re-scales the bound value to `(10,2)`.
+This is the same parameter-typing rule the `CAST($1 AS int)` spelling already documents; both now
+infer the type rather than reporting `42P18`. (A *bare* `SELECT $1` with no cast and no other
+context is still `42P18` indeterminate.) Casting a parameter to a deferred target (`$1 :: text`) is
+`0A000`, like any non-literal cast to text.
+
+**Lexing.** `::` is two colons scanned greedily as one token; a **lone** `:` is a `42601` syntax
+error (jed has no `:name` host parameters, array slices, or `psql` meta-syntax — nothing else uses
+a colon). See [grammar.ebnf](../grammar/grammar.ebnf) `double_colon`.
+
+**Divergence note.** Because casting to non-string-literal text/boolean/etc. is still the deferred
+`0A000` narrowing (§36, [types.md](types.md) §5), `5 :: text`, `x :: boolean`, etc. are `0A000`
+where PostgreSQL succeeds — the *same* documented divergence the `CAST(... AS ...)` spelling
+already carries, not a new one. `::` adds no behavior of its own; it only adds the spelling.

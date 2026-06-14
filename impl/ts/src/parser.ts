@@ -1148,20 +1148,39 @@ class Parser {
     if (this.peek().kind === "minus") {
       this.advance();
       // Fold unary-minus-of-an-integer-literal into one negative literal, so int64's
-      // minimum is representable and the literal range-checks against context.
-      if (this.peek().kind === "int") {
+      // minimum is representable and the literal range-checks against context. SUPPRESSED
+      // when a `::` immediately follows: `::` binds tighter than unary minus (PostgreSQL),
+      // so `-N::T` is `-(N::T)` — the cast applies to the unsigned magnitude first
+      // (grammar.md §37). A one-token lookahead on the token AFTER the literal.
+      if (this.peek().kind === "int" && this.tokens[this.pos + 1]?.kind !== "doubleColon") {
         const v = foldInt(this.advance().int!, true);
         return { kind: "literal", literal: { kind: "int", int: v } };
       }
       // Fold unary-minus of a decimal literal into one negative decimal literal (decimal
-      // negation never overflows).
-      if (this.peek().kind === "decimal") {
+      // negation never overflows). Same `::` suppression.
+      if (this.peek().kind === "decimal" && this.tokens[this.pos + 1]?.kind !== "doubleColon") {
         const t = this.advance();
         return { kind: "literal", literal: { kind: "decimal", dec: Decimal.fromDigitsScale(true, t.decDigits!, t.decScale!) } };
       }
       return { kind: "unary", op: "neg", operand: this.parseUnary() };
     }
-    return this.parsePrimary();
+    return this.parsePostfix();
+  }
+
+  // parsePostfix parses a primary optionally followed by one or more `::type` PostgreSQL typecasts
+  // (grammar.md §37). `expr :: type` desugars to CAST(expr AS type) here at parse time — one
+  // resolver / evaluator / cost path for both spellings — and casts chain left-associatively
+  // (`x::int8::int2` = `(x::int8)::int2`). A typmod rides on the type name exactly as in CAST
+  // (`x::numeric(10,2)`). `::` binds tighter than unary minus (handled by parseUnary above).
+  private parsePostfix(): Expr {
+    let expr = this.parsePrimary();
+    while (this.peek().kind === "doubleColon") {
+      this.advance();
+      const typeName = this.expectIdentifier();
+      const typeMod = this.parseTypeMod();
+      expr = { kind: "cast", inner: expr, typeName, typeMod };
+    }
+    return expr;
   }
 
   // parsePrimary parses a parenthesized expression, CAST(...), a literal (integer,

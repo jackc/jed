@@ -237,6 +237,51 @@ fn ddl_with_params_traps_42601() {
 }
 
 #[test]
+fn param_typed_by_cast_operator() {
+    // `$1::int` declares `$1` as int — PostgreSQL types a parameter by its cast target
+    // (api.md §5, grammar.md §37). No surrounding context is needed, so this is NOT 42P18.
+    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let got = rows(&mut db, "SELECT $1::int", &[Value::Int(42)]);
+    assert_eq!(got, vec![vec![Value::Int(42)]]);
+    // The `CAST(... AS ...)` spelling infers the parameter's type identically.
+    let got = rows(&mut db, "SELECT CAST($1 AS int)", &[Value::Int(7)]);
+    assert_eq!(got, vec![vec![Value::Int(7)]]);
+}
+
+#[test]
+fn param_cast_operator_narrows_and_traps_22003() {
+    // `$1::smallint` declares `$1` as int16; a bound value out of int16 range traps 22003 at
+    // bind, before any scan (the same two-phase binding as a column-typed parameter).
+    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    assert_eq!(
+        err_code(&mut db, "SELECT $1::smallint", &[Value::Int(100000)]),
+        "22003"
+    );
+}
+
+#[test]
+fn param_cast_to_deferred_target_is_0a000() {
+    // Casting a parameter to a deferred target (text) is 0A000, like any non-string-literal
+    // cast to text — the `::` operator adds no behavior of its own beyond the spelling.
+    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    assert_eq!(
+        err_code(&mut db, "SELECT $1::text", &[Value::Int(1)]),
+        "0A000"
+    );
+}
+
+#[test]
+fn cast_operator_inherits_deferred_narrowings_and_rejects_lone_colon() {
+    // `::` desugars to CAST, so casting a non-string-literal value to text/boolean is the same
+    // deferred 0A000 narrowing the CAST spelling carries (a documented PG divergence).
+    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    assert_eq!(err_code(&mut db, "SELECT 5::text", &[]), "0A000");
+    assert_eq!(err_code(&mut db, "SELECT 5::boolean", &[]), "0A000");
+    // A lone `:` is not part of jed's surface — a 42601 syntax error from the lexer.
+    assert_eq!(err_code(&mut db, "SELECT 1 : 2", &[]), "42601");
+}
+
+#[test]
 fn lexer_rejects_bad_param_tokens() {
     let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
     for sql in [

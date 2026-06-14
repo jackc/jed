@@ -6275,9 +6275,17 @@ fn resolve(
                     "casting to an interval type is not supported yet",
                 ));
             }
-            // The inner value is range-checked / coerced against `target` at eval, so it
-            // resolves with no literal context here.
-            let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+            // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int`
+            // (and `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
+            // (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
+            // context — its value is range-checked / coerced against `target` at eval — so changing
+            // the context only for a parameter leaves all existing CAST behavior untouched.
+            let inner_ctx = if matches!(inner.as_ref(), Expr::Param(_)) {
+                Some(target)
+            } else {
+                None
+            };
+            let (rinner, ity) = resolve(scope, inner, inner_ctx, agg, params)?;
             match ity {
                 // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
                 // decimal→decimal (re-scale), and NULL are all castable.

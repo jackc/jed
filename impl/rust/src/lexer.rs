@@ -84,6 +84,16 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::Percent);
                 i += 1;
             }
+            b':' => {
+                // `::` is the PostgreSQL typecast operator (grammar.md §37), scanned greedily as
+                // one token. A lone `:` is not part of jed's surface — a 42601 syntax error.
+                if bytes.get(i + 1) == Some(&b':') {
+                    tokens.push(Token::DoubleColon);
+                    i += 2;
+                } else {
+                    return Err(syntax("unexpected character ':'".to_string()));
+                }
+            }
             b'=' => {
                 tokens.push(Token::Eq);
                 i += 1;

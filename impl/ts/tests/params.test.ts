@@ -130,6 +130,37 @@ test("DDL with params traps 42601", () => {
   assert.equal(paramErrCode(db, "CREATE TABLE t (id int32 PRIMARY KEY)", [intValue(1n)]), "42601");
 });
 
+test("param typed by the :: cast operator", () => {
+  // `$1::int` declares `$1` as int — PostgreSQL types a parameter by its cast target
+  // (api.md §5, grammar.md §37). No surrounding context is needed, so this is NOT 42P18.
+  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+  assert.deepStrictEqual(ints(rows(db, "SELECT $1::int", [intValue(42n)])), [42n]);
+  // The CAST(... AS ...) spelling infers the parameter's type identically.
+  assert.deepStrictEqual(ints(rows(db, "SELECT CAST($1 AS int)", [intValue(7n)])), [7n]);
+});
+
+test("param :: cast narrows and traps 22003", () => {
+  // `$1::smallint` declares `$1` as int16; a bound value out of int16 range traps 22003 at bind.
+  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+  assert.equal(paramErrCode(db, "SELECT $1::smallint", [intValue(100000n)]), "22003");
+});
+
+test("param cast to a deferred target is 0A000", () => {
+  // Casting a parameter to a deferred target (text) is 0A000, like any non-string-literal cast.
+  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+  assert.equal(paramErrCode(db, "SELECT $1::text", [intValue(1n)]), "0A000");
+});
+
+test(":: inherits deferred narrowings and rejects a lone colon", () => {
+  // `::` desugars to CAST, so casting a non-string-literal value to text/boolean is the same
+  // deferred 0A000 narrowing the CAST spelling carries.
+  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+  assert.equal(paramErrCode(db, "SELECT 5::text", []), "0A000");
+  assert.equal(paramErrCode(db, "SELECT 5::boolean", []), "0A000");
+  // A lone `:` is not part of jed's surface — a 42601 syntax error from the lexer.
+  assert.equal(paramErrCode(db, "SELECT 1 : 2", []), "42601");
+});
+
 test("lexer rejects bad param tokens", () => {
   const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)"]);
   for (const sql of [

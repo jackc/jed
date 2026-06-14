@@ -426,6 +426,27 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       (scientific), and `numeric 'NaN'` all trap `22P02`. **Deferred follow-up:** the **runtime**
       text→`T` cast on a non-literal text expression (`CAST(text_col AS int)` — the general
       string-function / cast slice). _(size: M; §5; no on-disk change)_
+- [x] **`::` cast operator** (`expr :: type`) — done & committed across Rust/Go/TS. PostgreSQL's
+      postfix typecast, which is **exactly** `CAST(expr AS type)`
+      ([spec/design/grammar.md](spec/design/grammar.md) §37, [types.md](spec/design/types.md) §5):
+      the three parsers **desugar `::` to the existing `Cast` AST node at parse time**, so there is
+      one resolver / evaluator / cost / cross-core contract for both spellings and it inherits the
+      whole cast machinery — the cast matrix, the `coerce_string_literal` string-literal coercion
+      (`'42'::int` = `integer '42'`), the decimal→int round-half-away, the typmod re-scale
+      (`::numeric(10,2)`), the deferred to/from text/boolean/bytea/uuid/timestamp/interval narrowings
+      (`5::text` → `0A000`, the same documented PG divergence the CAST spelling carries), and the
+      `42704`/`22003`/`22P02` codes. New `DoubleColon` token (a lone `:` is `42601` — jed has no
+      `:name` host params / array slices / `psql` meta-syntax). A new `parse_postfix` level chains
+      casts **left-associatively** (`x::bigint::smallint`). **Precedence:** `::` binds **tighter than
+      unary minus** (PostgreSQL) — `-32768::smallint` traps `22003` (the inner `32768` overflows int16
+      before the negation), `(-32768)::smallint` is the in-range value — implemented by **suppressing
+      the leading-`-`-of-a-numeric-literal fold (§4) when a `::` immediately follows** (a one-token
+      lookahead, a §8 determinism surface). A **bind-parameter operand takes the cast target as its
+      type** (`$1::int` types `$1` int, `$1::numeric(10,2)` types it decimal + re-scales — the
+      cast-target inference of [api.md](spec/design/api.md) §5; `CAST($1 AS int)` now infers
+      identically rather than `42P18`). New capability `cast.operator`; pinned by
+      `spec/conformance/suites/expr/cast_operator.test` (oracle-checked, byte-identical Rust/Go/TS) +
+      per-core `$1::…` param tests. _(size: M; §5; no on-disk change)_
 - [x] **`interval`** — done & committed across Rust/Go/TS (+ Ruby reference). A span held as
       PostgreSQL's **three independent fields** — `months` (i32), `days` (i32), `micros` (i64) —
       so `+ 1 month` is calendar-aware (Jan 31 + 1 month → Feb 28/29, day clamped) and distinct

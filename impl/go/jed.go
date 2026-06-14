@@ -105,6 +105,9 @@ var SupportedCapabilities = []string{
 	// Typed string literals — `type 'string'` and CAST(<string literal> AS type) coerce the
 	// literal to the named type at resolve (spec/design/grammar.md §36, types.md §5).
 	"cast.string_literal",
+	// The postfix `::` cast operator — `expr :: type` desugars to CAST(expr AS type), sharing
+	// its whole machinery; binds tighter than unary minus (spec/design/grammar.md §37).
+	"cast.operator",
 	"types.int16",
 	"types.int32",
 	"types.int64",

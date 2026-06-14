@@ -417,7 +417,7 @@ where_clause   ::= "WHERE" expr
  * ../functions/catalog.toml (the `precedence` field) — the hand-written parsers
  * and that table must agree (see ../design/functions.md). Levels:
  *   OR  <  AND  <  NOT  <  comparison/IS NULL  <  additive  <  multiplicative
- *       <  unary minus  <  primary
+ *       <  unary minus  <  postfix `::` cast  <  primary
  */
 expr           ::= or_expr
 
@@ -465,7 +465,23 @@ additive       ::= multiplicative ( ("+" | "-") multiplicative )*
 multiplicative ::= unary ( ("*" | "/" | "%") unary )*
 
 unary          ::= "-" unary
-                 | primary
+                 | postfix
+
+/* The PostgreSQL `::` typecast operator — `expr :: type_name` is exactly
+ * `CAST(expr AS type_name)` (../design/grammar.md §37, types.md §5), reusing the whole cast
+ * machinery: the same cast matrix (../types/casts.toml), the same string-literal coercion for a
+ * string-literal operand (`'42' :: int` = `CAST('42' AS int)` = `integer '42'`), the same deferred
+ * narrowings (casting to/from text/boolean/bytea/uuid/timestamp/interval is 0A000), and the same
+ * `42704`/`22003`/`22P02` resolve codes. Casts CHAIN left-associatively — `x :: int8 :: int2` is
+ * `(x :: int8) :: int2` — and a typmod rides on the type name exactly as in CAST (`x :: numeric(10,2)`).
+ *   PRECEDENCE: `::` binds TIGHTER than unary minus (PostgreSQL), so `-5 :: int` is `-(5 :: int)`,
+ * NOT `(-5) :: int`. This is observable at the type bound: `-32768 :: int16` traps `22003` (the inner
+ * `32768` overflows int16 before the negation), while `(-32768) :: int16` is the in-range value. The
+ * leading-`-`-of-a-numeric-literal fold (../design/grammar.md §4) is therefore suppressed when a `::`
+ * immediately follows the literal, so the cast applies to the unsigned magnitude first.
+ *   A bind parameter operand takes the cast TARGET as its inferred type — `$1 :: int` declares `$1`
+ * as int (../design/api.md §5), the parameter-typing case the `CAST(... AS ...)` spelling shares. */
+postfix        ::= primary ("::" type_name)*
 
 /* A "(" begins either a parenthesized expression "(" expr ")" or a SCALAR SUBQUERY
  * "(" query_expr ")" (../design/grammar.md §26) — disambiguated by a leading "SELECT" after the
@@ -600,6 +616,12 @@ decimal        ::= digit+ "." digit*
  * `<word> <decimal>` and rejected at parse (42601); no qualified form needs it. A bare "."
  * with no digit after and no identifier before/after is still a 42601. */
 dot            ::= "."
+
+/* The `::` PostgreSQL typecast operator token — exactly two colons, scanned greedily. A LONE
+ * `:` is not part of jed's surface (no host-parameter `:name`, no array slice, no `psql`
+ * meta-syntax), so a single colon is a 42601 syntax error, reported by the lexer. Consumed only
+ * by `postfix` above. */
+double_colon   ::= ":" ":"
 
 /* A single-quoted string literal (the `text` type). An embedded single quote is written
  * by doubling it (`''`) — standard_conforming_strings; there are NO backslash escapes. The

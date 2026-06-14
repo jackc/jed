@@ -39,6 +39,9 @@ pub enum Token {
     Gt,
     Le,
     Ge,
+    /// The `::` PostgreSQL typecast operator (`expr::type` = `CAST(expr AS type)`). Two colons,
+    /// scanned greedily; a lone `:` is a 42601 syntax error. See spec/design/grammar.md §37.
+    DoubleColon,
     /// End of input.
     Eof,
 }
