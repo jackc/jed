@@ -90,10 +90,17 @@ trapping, then applies the integer-digit check (oracle-confirmed: `1e-10000 * 1e
 dscale 16383). A value at both caps is ~147 455 digits ≈ 74 KB encoded — far over a page;
 storable because large values spill to overflow chains and compress transparently
 ([large-values.md](large-values.md)), the mechanism the **original 1000/1000 cap was waiting
-on** (this cap was lifted to PG's limits when that landed). One PG divergence remains at the
-edge: PG's `SUM` accumulator may hold intermediates beyond the storable range and only checks
-the final result, while jed folds `SUM`/`AVG` through ordinary `add` and traps `22003` at the
-first intermediate over the cap. Declarability is unchanged: `numeric(p,s)` still requires
+on** (this cap was lifted to PG's limits when that landed). The `SUM`/`AVG` accumulator
+**checks the cap only on the *final* result, never an intermediate** — faithful to PG, whose
+accumulator holds intermediates beyond the storable range and checks once at `make_result`. So
+a fold whose running sum transiently exceeds the cap but lands back in range succeeds (and
+`AVG`, whose final divide brings the value back, never traps on an over-cap intermediate sum);
+only a final result over the cap traps `22003`. This is the **`add_uncapped` accumulator path**
+([determinism.md](determinism.md) §7): folding through ordinary cap-checking `add` instead would
+trap at *whichever* intermediate first crossed the cap, making the trap depend on summation
+order — an order-dependent error this avoids (the in-fold `decimal_work` cost still meters each
+add, charged before it, so a cost ceiling aborts an unbounded accumulation — §6, cost.md §6).
+Declarability is unchanged: `numeric(p,s)` still requires
 `p ≤ max_precision = 1000` (also PG's rule), so a *constrained* column never approaches the
 format caps — only unconstrained `numeric` values can.
 

@@ -164,21 +164,25 @@ export class Decimal {
     return Decimal.fromParts(!this.neg, this.scale, this.limbs);
   }
 
-  // add is exact addition, result scale max(s1,s2); traps 22003 at the cap.
-  add(o: Decimal): Decimal {
+  // addUncapped is exact addition, result scale max(s1,s2), WITHOUT the §2 format-cap check —
+  // the running form for the SUM/AVG accumulator, which (like PG) checks the cap only on the
+  // FINAL result, not each intermediate (spec/design/decimal.md §2, determinism.md §7). That
+  // makes the trap order-independent: whether a fold overflows no longer depends on the order
+  // rows are summed. Standalone arithmetic uses add (capped).
+  addUncapped(o: Decimal): Decimal {
     const s = Math.max(this.scale, o.scale);
     const a = magMulPow10(this.limbs, s - this.scale);
     const b = magMulPow10(o.limbs, s - o.scale);
-    let r: Decimal;
-    if (this.neg === o.neg) {
-      r = Decimal.fromParts(this.neg, s, magAdd(a, b));
-    } else {
-      const c = magCmp(a, b);
-      if (c === 0) r = Decimal.zero(s);
-      else if (c > 0) r = Decimal.fromParts(this.neg, s, magSub(a, b));
-      else r = Decimal.fromParts(o.neg, s, magSub(b, a));
-    }
-    return r.checkCap();
+    if (this.neg === o.neg) return Decimal.fromParts(this.neg, s, magAdd(a, b));
+    const c = magCmp(a, b);
+    if (c === 0) return Decimal.zero(s);
+    if (c > 0) return Decimal.fromParts(this.neg, s, magSub(a, b));
+    return Decimal.fromParts(o.neg, s, magSub(b, a));
+  }
+
+  // add is exact addition, result scale max(s1,s2); traps 22003 at the cap.
+  add(o: Decimal): Decimal {
+    return this.addUncapped(o).checkCap();
   }
 
   // sub is this - o (= this + (-o)).

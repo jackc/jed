@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Decimal } from "../src/decimal.ts";
+import { Decimal, MAX_INT_DIGITS } from "../src/decimal.ts";
 import { loadDatabase, toImage } from "../src/format.ts";
 import { Database, execute } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
@@ -220,6 +220,35 @@ test("decimal format caps are PG's numeric limits", () => {
   const atCaps = "1" + "0".repeat(131071) + "." + "0".repeat(16382) + "1";
   execD(db, `INSERT INTO t VALUES (3, ${atCaps})`);
   assert.equal(one(db, "SELECT v FROM t WHERE id = 3"), atCaps);
+});
+
+// The SUM/AVG accumulator's addUncapped path (spec/design/decimal.md §2, determinism.md §7): the
+// running sum may cross the §2 format cap mid-fold without trapping; only the FINAL result is
+// cap-checked — the order-independent-trap fix. Too large to reach through SQL literals (a
+// 131072-digit value is ~74 KB), so pinned here. a is exactly at the cap (131072 nines); a + a is
+// one digit over it.
+test("decimal SUM accumulator checks only the final cap", () => {
+  const a = Decimal.fromDigitsScale(false, "9".repeat(MAX_INT_DIGITS), 0);
+  a.checkCap(); // exactly at the cap — does not throw
+  // Capped add (standalone arithmetic) still traps at the cap — unchanged contract.
+  assert.equal(
+    errCode(() => {
+      a.add(a);
+    }),
+    "22003",
+  );
+  // Uncapped fold may exceed the cap intermediately and NOT trap...
+  const over = a.addUncapped(a); // 2·a, one digit over the cap
+  // ...then come back in range, so the FINAL check passes and the value is exact.
+  const back = over.addUncapped(a.negate()).checkCap();
+  assert.equal(back.cmpValue(a), 0);
+  // A final result genuinely over the cap still traps 22003 (PG's make_result).
+  assert.equal(
+    errCode(() => {
+      over.checkCap();
+    }),
+    "22003",
+  );
 });
 
 // PG numeric_mul's rounding: an exact product whose scale exceeds max_scale (16383) ROUNDS to

@@ -215,12 +215,16 @@ impl Decimal {
         Decimal::from_parts(!self.neg, self.scale, self.limbs.clone())
     }
 
-    /// `self + other`, exact, result scale `max(s1,s2)`; traps 22003 at the cap.
-    pub fn add(&self, other: &Decimal) -> Result<Decimal> {
+    /// `self + other`, exact, result scale `max(s1,s2)`, **without** the §2 format-cap check —
+    /// the running form for the SUM/AVG accumulator, which (like PG) checks the cap only on the
+    /// FINAL result, not each intermediate (spec/design/decimal.md §2, determinism.md §7). That
+    /// makes the trap order-independent: whether a fold overflows no longer depends on the order
+    /// rows are summed. Standalone arithmetic uses `add` (capped).
+    pub fn add_uncapped(&self, other: &Decimal) -> Decimal {
         let s = self.scale.max(other.scale);
         let a = mag_mul_pow10(&self.limbs, s - self.scale);
         let b = mag_mul_pow10(&other.limbs, s - other.scale);
-        let r = if self.neg == other.neg {
+        if self.neg == other.neg {
             Decimal::from_parts(self.neg, s, mag_add(&a, &b))
         } else {
             match mag_cmp(&a, &b) {
@@ -228,8 +232,12 @@ impl Decimal {
                 std::cmp::Ordering::Greater => Decimal::from_parts(self.neg, s, mag_sub(&a, &b)),
                 std::cmp::Ordering::Less => Decimal::from_parts(other.neg, s, mag_sub(&b, &a)),
             }
-        };
-        r.check_cap()
+        }
+    }
+
+    /// `self + other`, exact, result scale `max(s1,s2)`; traps 22003 at the cap.
+    pub fn add(&self, other: &Decimal) -> Result<Decimal> {
+        self.add_uncapped(other).check_cap()
     }
 
     /// `self - other` (= `self + (-other)`).
@@ -958,5 +966,31 @@ mod tests {
         assert_eq!(MAX_PRECISION, 1000);
         assert_eq!(MAX_SCALE, 16383);
         assert_eq!(MAX_INT_DIGITS, 131072);
+    }
+
+    // The SUM/AVG accumulator's `add_uncapped` path (spec/design/decimal.md §2, determinism.md
+    // §7): the running sum may cross the §2 format cap mid-fold without trapping; only the FINAL
+    // result is cap-checked. This is the order-independent-trap fix — too large to reach through
+    // SQL literals (a 131072-digit value is ~74 KB), so it is pinned here. `a` is exactly at the
+    // cap (131072 nines); `a + a` is one digit over it.
+    #[test]
+    fn sum_accumulator_checks_only_the_final_cap() {
+        let a = Decimal::from_digits_scale(false, &"9".repeat(MAX_INT_DIGITS as usize), 0);
+        assert!(a.clone().check_cap().is_ok()); // exactly at the cap
+
+        // Capped `add` (standalone arithmetic) still traps at the cap — unchanged contract.
+        assert_eq!(a.add(&a).unwrap_err().code(), "22003");
+
+        // Uncapped fold may exceed the cap intermediately and NOT trap...
+        let over = a.add_uncapped(&a); // 2·a, one digit over the cap
+        // ...then come back in range, so the FINAL check passes and the value is exact.
+        let back = over.add_uncapped(&a.neg());
+        assert_eq!(
+            back.clone().check_cap().unwrap().cmp_value(&a),
+            std::cmp::Ordering::Equal
+        );
+
+        // A final result genuinely over the cap still traps 22003 (PG's make_result).
+        assert_eq!(over.check_cap().unwrap_err().code(), "22003");
     }
 }

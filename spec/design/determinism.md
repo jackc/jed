@@ -232,7 +232,7 @@ operation rather than discovering sensitivity at runtime:
 |---|---|---|
 | `COUNT`, `MIN`, `MAX`, `bool_and`/`bool_or` | no (commutative+associative+idempotent) | parallel-safe, no work |
 | `SUM`/`AVG` over **int** | no (widens to int64/decimal; intermediates don't overflow) | parallel-safe |
-| `SUM`/`AVG` over **decimal** | *error edge only* | values associative, but jed currently traps on the **first over-cap intermediate** ([decimal.md](decimal.md) §2) → order-dependent trap. **Fix:** overflow-check the **final** result only (matches PG) → order-independent |
+| `SUM`/`AVG` over **decimal** | no (**resolved**) | values associative; the fold checks the cap only on the **final** result (the `add_uncapped` accumulator path — [decimal.md](decimal.md) §2), matching PG → order-independent. (Previously trapped on the first over-cap intermediate, an order-dependent trap; that edge is closed.) |
 | `SUM`/`AVG` over **float** | yes (value) | **A**: exact accumulator → order-independent (§6) |
 | `string_agg`, `array_agg`, `json_agg` | yes (inherently) | **B/C** below — concatenation order *is* the meaning |
 

@@ -3598,7 +3598,10 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
         const inc = toDecimal(v);
         m.charge(COSTS.decimalWork * BigInt(workLinear(a.sumDec, inc) - 1));
         m.guard();
-        a.sumDec = a.sumDec.add(inc);
+        // Uncapped: the running sum may exceed the §2 format cap mid-fold; only the FINAL
+        // result is cap-checked (in finalizeAcc), matching PG and making the trap
+        // order-independent (spec/design/decimal.md §2, determinism.md §7).
+        a.sumDec = a.sumDec.addUncapped(inc);
         a.seen = true;
       }
       break;
@@ -3607,7 +3610,9 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
         const inc = toDecimal(v);
         m.charge(COSTS.decimalWork * BigInt(workLinear(a.sumDec, inc) - 1));
         m.guard();
-        a.sumDec = a.sumDec.add(inc);
+        // Uncapped (as sumDecimal): the average's final divide brings the value back in range,
+        // so AVG never traps on an over-cap intermediate sum the way PG does not.
+        a.sumDec = a.sumDec.addUncapped(inc);
         a.count += 1n;
       }
       break;
@@ -3646,8 +3651,12 @@ function finalizeAcc(a: Acc): Value {
     case "sumInt":
       return a.seen ? intValue(a.sumInt) : nullValue();
     case "sumDecimal":
-      return a.seen ? decimalValue(a.sumDec) : nullValue();
+      // checkCap is the only cap check for the fold: the FINAL sum traps 22003 if over the §2
+      // cap (PG's make_result), but no intermediate does (decimal.md §2).
+      return a.seen ? decimalValue(a.sumDec.checkCap()) : nullValue();
     case "avg":
+      // div cap-checks its (in-range) result; the over-cap-capable running sum is never surfaced
+      // directly, so AVG matches PG even when SUM would overflow.
       return a.count === 0n ? nullValue() : decimalValue(a.sumDec.div(Decimal.fromBigInt(a.count)));
     case "sumFloat": {
       if (!a.seen) return nullValue(); // empty / all-NULL group → NULL

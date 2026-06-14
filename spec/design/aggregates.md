@@ -66,10 +66,11 @@ Result types are a **function of the operand type**, the reason aggregates need 
   trap, mirroring the arithmetic rule ([functions.md](functions.md) §7).
 - **`SUM(int64)` → `decimal`.** Summing 64-bit values overflows `int64` readily, so PG
   widens to `numeric`; jed matches. The running sum accumulates in the exact `decimal`
-  domain (each `int64` widened to `decimal` scale 0); it traps `22003` only at the decimal
-  cap (`max_precision` digits — [decimal.md](decimal.md) §2).
+  domain (each `int64` widened to `decimal` scale 0); it traps `22003` only when the **final**
+  result exceeds the decimal cap — never an intermediate ([decimal.md](decimal.md) §2).
 - **`SUM(decimal)` → `decimal`**, scale carried exactly (no rounding); traps `22003` at the
-  cap.
+  cap of the **final** result only (the order-independent `add_uncapped` fold —
+  [decimal.md](decimal.md) §2, [determinism.md](determinism.md) §7), never an intermediate sum.
 - **`AVG(any numeric)` → `decimal`**, computed as **`sum::decimal / count::decimal`** — the
   running sum is **always** accumulated in `decimal` (even for integer input), then divided
   by the integer count widened to `decimal`. The quotient's scale follows the exact decimal

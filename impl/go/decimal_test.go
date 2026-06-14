@@ -398,6 +398,36 @@ func TestDecimalFormatCaps(t *testing.T) {
 	}
 }
 
+// TestSumAccumulatorChecksOnlyFinalCap pins the SUM/AVG accumulator's AddUncapped path
+// (spec/design/decimal.md §2, determinism.md §7): the running sum may cross the §2 format cap
+// mid-fold without trapping; only the FINAL result is cap-checked — the order-independent-trap
+// fix. Too large to reach through SQL literals (a 131072-digit value is ~74 KB), so pinned here.
+// a is exactly at the cap (131072 nines); a + a is one digit over it.
+func TestSumAccumulatorChecksOnlyFinalCap(t *testing.T) {
+	a := DecimalFromDigitsScale(false, strings.Repeat("9", MaxIntDigits), 0)
+	if _, err := a.CheckCap(); err != nil {
+		t.Fatalf("a should be exactly at the cap, got %v", err)
+	}
+	// Capped Add (standalone arithmetic) still traps at the cap — unchanged contract.
+	if _, err := a.Add(a); err == nil || err.(*EngineError).Code() != "22003" {
+		t.Fatalf("a + a (capped) = %v, want 22003", err)
+	}
+	// Uncapped fold may exceed the cap intermediately and NOT trap...
+	over := a.AddUncapped(a) // 2·a, one digit over the cap
+	// ...then come back in range, so the FINAL check passes and the value is exact.
+	back, err := over.AddUncapped(a.Negate()).CheckCap()
+	if err != nil {
+		t.Fatalf("sum back in range should pass the final cap, got %v", err)
+	}
+	if back.CmpValue(a) != 0 {
+		t.Errorf("folded value = %s, want a", back.Render())
+	}
+	// A final result genuinely over the cap still traps 22003 (PG's make_result).
+	if _, err := over.CheckCap(); err == nil || err.(*EngineError).Code() != "22003" {
+		t.Fatalf("over-cap final = %v, want 22003", err)
+	}
+}
+
 // TestDecimalMulRoundsAtMaxScale pins PG numeric_mul's rounding: an exact product whose scale
 // exceeds max_scale (16383) ROUNDS to it, half away from zero, instead of trapping
 // (spec/design/decimal.md §2).

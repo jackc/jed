@@ -5009,11 +5009,10 @@ func (a *acc) fold(v Value, m *Meter) error {
 			if err := m.Guard(); err != nil {
 				return err
 			}
-			d, err := a.sumDec.Add(in)
-			if err != nil {
-				return err
-			}
-			a.sumDec = d
+			// Uncapped: the running sum may exceed the §2 format cap mid-fold; only the FINAL
+			// result is cap-checked (in finalize), matching PG and making the trap
+			// order-independent (spec/design/decimal.md §2, determinism.md §7).
+			a.sumDec = a.sumDec.AddUncapped(in)
 			a.seen = true
 		}
 	case planAvg:
@@ -5023,11 +5022,9 @@ func (a *acc) fold(v Value, m *Meter) error {
 			if err := m.Guard(); err != nil {
 				return err
 			}
-			d, err := a.sumDec.Add(in)
-			if err != nil {
-				return err
-			}
-			a.sumDec = d
+			// Uncapped (as planSumDecimal): the average's final divide brings the value back in
+			// range, so AVG never traps on an over-cap intermediate sum the way PG does not.
+			a.sumDec = a.sumDec.AddUncapped(in)
 			a.count++
 		}
 	case planSumFloat32, planSumFloat64, planAvgFloat32, planAvgFloat64:
@@ -5066,13 +5063,21 @@ func (a *acc) finalize() (Value, error) {
 		return NullValue(), nil
 	case planSumDecimal:
 		if a.seen {
-			return DecimalValue(a.sumDec), nil
+			// The only cap check for the fold: the FINAL sum traps 22003 if over the §2 cap
+			// (PG's make_result), but no intermediate does (decimal.md §2).
+			d, err := a.sumDec.CheckCap()
+			if err != nil {
+				return NullValue(), err
+			}
+			return DecimalValue(d), nil
 		}
 		return NullValue(), nil
 	case planAvg:
 		if a.count == 0 {
 			return NullValue(), nil
 		}
+		// Div cap-checks its (in-range) result; the over-cap-capable running sum is never
+		// surfaced directly, so AVG matches PG even when SUM would overflow.
 		d, err := a.sumDec.Div(DecimalFromInt64(a.count))
 		if err != nil {
 			return NullValue(), err

@@ -5070,7 +5070,10 @@ impl Acc {
                     let d = to_decimal(value);
                     m.charge(COSTS.decimal_work * ((decimal::work_linear(sum, &d) - 1) as i64));
                     m.guard()?;
-                    *sum = sum.add(&d)?;
+                    // Uncapped: the running sum may exceed the §2 format cap mid-fold; only the
+                    // FINAL result is cap-checked (in `finalize`), matching PG and making the trap
+                    // order-independent (spec/design/decimal.md §2, determinism.md §7).
+                    *sum = sum.add_uncapped(&d);
                     *seen = true;
                 }
             }
@@ -5079,7 +5082,9 @@ impl Acc {
                     let d = to_decimal(value);
                     m.charge(COSTS.decimal_work * ((decimal::work_linear(sum, &d) - 1) as i64));
                     m.guard()?;
-                    *sum = sum.add(&d)?;
+                    // Uncapped (as SumDecimal): the average's final divide brings the value back in
+                    // range, so AVG never traps on an over-cap intermediate sum the way PG does not.
+                    *sum = sum.add_uncapped(&d);
                     *count += 1;
                 }
             }
@@ -5148,7 +5153,9 @@ impl Acc {
             }
             Acc::SumDecimal { sum, seen } => {
                 if seen {
-                    Value::Decimal(sum)
+                    // The only cap check for the fold: the FINAL sum traps 22003 if over the §2
+                    // cap (PG's make_result), but no intermediate does (decimal.md §2).
+                    Value::Decimal(sum.check_cap()?)
                 } else {
                     Value::Null
                 }
@@ -5157,6 +5164,8 @@ impl Acc {
                 if count == 0 {
                     Value::Null
                 } else {
+                    // `div` cap-checks its (in-range) result; the over-cap-capable running `sum` is
+                    // never surfaced directly, so AVG matches PG even when SUM would overflow.
                     Value::Decimal(sum.div(&Decimal::from_i64(count))?)
                 }
             }

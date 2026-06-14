@@ -172,28 +172,34 @@ func (d Decimal) Negate() Decimal {
 	return newDecimal(!d.Neg, d.Scale, d.Limbs)
 }
 
-// Add is exact addition, result scale max(s1,s2); traps 22003 at the cap.
-func (d Decimal) Add(o Decimal) (Decimal, error) {
+// AddUncapped is exact addition, result scale max(s1,s2), WITHOUT the §2 format-cap check —
+// the running form for the SUM/AVG accumulator, which (like PG) checks the cap only on the
+// FINAL result, not each intermediate (spec/design/decimal.md §2, determinism.md §7). That
+// makes the trap order-independent: whether a fold overflows no longer depends on the order
+// rows are summed. Standalone arithmetic uses Add (capped).
+func (d Decimal) AddUncapped(o Decimal) Decimal {
 	s := d.Scale
 	if o.Scale > s {
 		s = o.Scale
 	}
 	a := magMulPow10(d.Limbs, s-d.Scale)
 	b := magMulPow10(o.Limbs, s-o.Scale)
-	var r Decimal
 	if d.Neg == o.Neg {
-		r = newDecimal(d.Neg, s, magAdd(a, b))
-	} else {
-		switch magCmp(a, b) {
-		case 0:
-			r = DecimalZero(s)
-		case 1:
-			r = newDecimal(d.Neg, s, magSub(a, b))
-		default:
-			r = newDecimal(o.Neg, s, magSub(b, a))
-		}
+		return newDecimal(d.Neg, s, magAdd(a, b))
 	}
-	return r.CheckCap()
+	switch magCmp(a, b) {
+	case 0:
+		return DecimalZero(s)
+	case 1:
+		return newDecimal(d.Neg, s, magSub(a, b))
+	default:
+		return newDecimal(o.Neg, s, magSub(b, a))
+	}
+}
+
+// Add is exact addition, result scale max(s1,s2); traps 22003 at the cap.
+func (d Decimal) Add(o Decimal) (Decimal, error) {
+	return d.AddUncapped(o).CheckCap()
 }
 
 // Sub is d - o (= d + (-o)).
