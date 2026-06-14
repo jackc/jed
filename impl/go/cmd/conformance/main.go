@@ -147,6 +147,34 @@ func parseMaxCostDirective(line string) (int64, bool) {
 	return n, true
 }
 
+// parseSeedDirective parses a `# seed: N` directive line (spec/design/entropy.md §6): the fixed
+// PRNG seed (uint64) to run the next record under, making the uuid generators cross-core identical.
+func parseSeedDirective(line string) (uint64, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "seed:")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(rest), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// parseClockDirective parses a `# clock: N` directive line (entropy.md §6): the fixed statement
+// clock (int64 micros since the Unix epoch) to run the next record under, fixing uuidv7's instant.
+func parseClockDirective(line string) (int64, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "clock:")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // assertCost checks the accrued execution cost matches a pending `# cost:` directive.
 func assertCost(expected *int64, actual int64, sql string) error {
 	if expected != nil && *expected != actual {
@@ -217,6 +245,8 @@ func runFile(text string) error {
 	var pendingNames []string
 	var pendingTypes []string
 	var pendingMaxCost *int64
+	var pendingSeed *uint64
+	var pendingClock *int64
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
@@ -230,6 +260,10 @@ func runFile(text string) error {
 				pendingCost = &n
 			} else if n, ok := parseMaxCostDirective(line); ok {
 				pendingMaxCost = &n
+			} else if s, ok := parseSeedDirective(line); ok {
+				pendingSeed = &s
+			} else if c, ok := parseClockDirective(line); ok {
+				pendingClock = &c
 			} else if names, ok := parseNamesDirective(line); ok {
 				pendingNames = names
 			} else if types, ok := parseTypesDirective(line); ok {
@@ -252,6 +286,20 @@ func runFile(text string) error {
 		}
 		db.SetMaxCost(maxCost)
 		pendingMaxCost = nil
+		// Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md
+		// §6); absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
+		if pendingSeed != nil {
+			db.SetRandomSource(jed.SeededRandomSource(*pendingSeed))
+		} else {
+			db.ClearRandomSource()
+		}
+		pendingSeed = nil
+		if pendingClock != nil {
+			db.SetClockSource(jed.FixedClock(*pendingClock))
+		} else {
+			db.ClearClockSource()
+		}
+		pendingClock = nil
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "statement":

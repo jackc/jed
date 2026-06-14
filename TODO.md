@@ -536,8 +536,26 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `spec/conformance/suites/types/uuid.test` (51/0/0 byte-identical in Rust, Go, TS, with
       `# cost:` asserted) and the byte-exact golden `uuid_table.jed`. _(was: M; §4/§8;
       spec/design/types.md §14, encoding.md §2.7)_ **Deferred follow-ups:** uuid⇄other casts
-      (`text ⇄ uuid`, `bytea ⇄ uuid` — rejected `0A000`/`42804`, a later cast slice); uuid
-      functions (`gen_random_uuid()`, `uuid_generate_v*`).
+      (`text ⇄ uuid`, `bytea ⇄ uuid` — rejected `0A000`/`42804`, a later cast slice).
+- [x] **uuid extractor functions** — `uuid_extract_version(uuid) → int16` and
+      `uuid_extract_timestamp(uuid) → timestamptz`, the PURE inspectors (immutable), done across
+      Rust/Go/TS and oracle-verified (PG 18). Both gate on the RFC 4122 variant (NULL off-variant);
+      the timestamp covers v1/v7 only (v6 NULL, matching PG 18). Landed the catalog `volatility`
+      field (schema_version 2, default immutable — advisory until a folding pass consumes it).
+      `spec/design/functions.md §12`, capability `func.uuid_extract`,
+      `spec/conformance/suites/expr/uuid_functions.test`. _(was part of the uuid follow-ups)_
+- [x] **uuid generator functions** — `uuidv4()` and `uuidv7([shift interval])` (volatile), done
+      across Rust/Go/TS, byte-identical cross-core. Landed the host-injected **entropy + clock
+      seam** (`spec/design/entropy.md`, ratifying determinism.md §5 class B): a spec'd byte-exact
+      PRNG (splitmix64) + a statement clock reached from EvalEnv; the `# seed:`/`# clock:` corpus
+      directives inject a fixed seed + clock for exact cross-core assertions, production reads OS
+      entropy (Rust `getrandom` — the one core dep, §14; Go/TS stdlib) + wall clock. uuidv7 folds
+      a per-statement monotonic counter into rand_a (sortable), traps `22008` on an out-of-48-bit
+      ms, and takes an optional interval shift. Pinned by `spec/conformance/suites/expr/uuid_generate.test`
+      (exact UUIDs across all cores), the determinism ledger (`uuidv4-entropy`/`uuidv7-clock-entropy`),
+      and the independent Ruby fixtures (`spec/encoding/prng.toml` + `prng_verify.rb`). Capability
+      `func.uuid_generate`. **Groundwork** for `now()`/`current_timestamp` and a future `random()` /
+      `gen_random_uuid()` / `uuid_generate_v*` (trivial reuses of this seam). _(was: L; §8/§13)_
 - [ ] **`json` / `jsonb`** — optional headline feature (§1). Large surface. _(size: XL; §4)_
 - [ ] **Composite `array` type** — a **container** over the scalar set: a new type *axis*,
       not another scalar (CLAUDE.md §4). Array literals, element-type rules, `NULL` element

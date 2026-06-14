@@ -382,6 +382,14 @@ id = "func.named_arguments"
 description = "PostgreSQL named-argument notation f(name => value) + DEFAULT parameter values, exercised by make_interval(years,months,weeks,days,hours,mins,secs) — every parameter named and defaulting to 0. Positional, named, and mixed (positional-then-named) calls; a positional arg after a named one is 42601, an unknown name or a named arg on a nameless function is 42883; field overflow is 22008. The legacy ':=' spelling is rejected (42601 — a deliberate surface narrowing; PG accepts it). spec/design/functions.md §11"
 
 [[capability]]
+id = "func.uuid_extract"
+description = "PURE uuid inspectors (spec/design/functions.md §12), oracle-checked against PostgreSQL 18 — uuid_extract_version(uuid) → int16 (the version nibble) and uuid_extract_timestamp(uuid) → timestamptz (the embedded instant). Both gate on the RFC 4122 variant ((byte8 & 0xC0)==0x80) and return NULL off-variant (Microsoft GUIDs, the nil uuid); uuid_extract_timestamp returns the instant for VERSION 1 and 7 only (v7 = 48-bit ms; v1 = 60-bit Gregorian 100ns minus the 1582→1970 offset, truncated to micros) and NULL for every other version (v6 included, matching PG 18). NULL input propagates"
+
+[[capability]]
+id = "func.uuid_generate"
+description = "VOLATILE uuid generators on the host-injected entropy+clock seam (spec/design/entropy.md) — uuidv4() (random) and uuidv7([shift interval]) (48-bit ms timestamp + a per-statement monotonic counter in rand_a + random rand_b; an out-of-48-bit/pre-epoch ms traps 22008; the optional interval shifts the embedded instant via calendar-aware timestamptz arithmetic). A spec'd byte-exact PRNG (splitmix64) makes the seeded path cross-core identical; the `# seed:` and `# clock:` corpus directives inject a fixed seed + statement clock so the output is exact and deterministic (production reads OS entropy + the wall clock). NOT oracle-imported (PG's entropy differs); cost is one operator_eval per call, independent of the random values. Builds on types.uuid"
+
+[[capability]]
 id = "error.division_by_zero"
 description = "Integer division / modulo by zero is defined and traps SQLSTATE 22012"
 
@@ -482,6 +490,8 @@ includes = "decimal"
 capabilities = [
   "func.abs",
   "func.round",
+  "func.uuid_extract",
+  "func.uuid_generate",
 ]
 
 [[profile]]

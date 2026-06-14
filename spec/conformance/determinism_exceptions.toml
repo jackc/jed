@@ -39,6 +39,28 @@ test         = "the `R` render tag's tolerant compare (conformance.md §1) — p
 status       = "ratified"
 reason       = "Each language's shortest-round-trip formatter chooses different presentation (Rust {} vs Go FormatFloat(-1) vs JS toString) even when the digits agree. Pinning one shared formatter is decimal-limb-level effort for zero observable benefit given the `R` tolerant compare."
 
+# --- uuidv4: random generation on the entropy seam ---------------------------
+[[exception]]
+id           = "uuidv4-entropy"
+surface      = "uuidv4() (../design/entropy.md §3) — a random version-4 UUID"
+class        = "B"
+drops        = []
+blast_radius = "the uuid result column; promotes to the row multiset / other columns ONLY if that uuid flows through a WHERE / ORDER BY...LIMIT / a key (uuid CAN be a primary key — that is the host's choice). On the INJECTED path (a `# seed:` directive injects the provided deterministic source) NOTHING is dropped: the spec'd splitmix64 source (entropy.md §2) makes the value byte-identical across Rust/Go/TS. In PRODUCTION the 16 bytes are drawn directly from the OS CSPRNG per call, so the value is non-deterministic AND unpredictable (not reconstructable from one sample) — only the random bytes vary; the bit layout (version/variant) stays in-contract."
+test         = "injected-source-exact: the `# seed:` corpus directive injects the provided seeded source, so the value is asserted byte-for-byte across all cores (suites/expr/uuid_generate.test); the source + v4 bytes are independently re-derived by Ruby (spec/encoding/prng.toml + prng_verify.rb — the third voice). # cost: is exact and source-independent."
+status       = "ratified"
+reason       = "Randomness is intrinsic to uuidv4. Pushed to a host seam (determinism.md §5): with the provided deterministic source injected the engine is a deterministic function of it, so the only irreducible production non-determinism is the raw per-value OS-CSPRNG read — G1+G2 hold on the injected/test path."
+
+# --- uuidv7: clock + entropy seam --------------------------------------------
+[[exception]]
+id           = "uuidv7-clock-entropy"
+surface      = "uuidv7([shift interval]) (../design/entropy.md §3) — a time-ordered version-7 UUID"
+class        = "B"
+drops        = []
+blast_radius = "the uuid result column (as for uuidv4). On the INJECTED path (`# seed:` injects the provided deterministic source, `# clock:` a fixed clock) NOTHING is dropped: the 48-bit ms comes from the injected clock, rand_a is a deterministic per-statement monotonic counter, rand_b is the spec'd source — all byte-identical across cores. In PRODUCTION rand_b is drawn directly from the OS CSPRNG per call (unpredictable) and the clock is the wall clock — those two raw reads are the only non-determinism. The within-statement-millisecond monotonic counter is itself fully deterministic (NOT an exception — and not oracle-comparable to PG's own counter, since neither byte-matches PG's entropy; the generators are not oracle-imported)."
+test         = "injected-source+clock-exact: the `# seed:` / `# clock:` directives inject both, so the value (and its monotonic ordering) is asserted byte-for-byte across all cores (suites/expr/uuid_generate.test); the v7 bytes are independently re-derived by Ruby (prng_verify.rb). An out-of-48-bit/pre-epoch injected clock traps 22008 identically (deterministic). # cost: is exact and source/clock-independent."
+status       = "ratified"
+reason       = "Wall-clock + randomness are intrinsic to uuidv7. Both are pushed to host seams (determinism.md §5): with a deterministic source + fixed clock injected the engine is a deterministic function of them, so the only irreducible production non-determinism is the raw per-value entropy + clock reads — G1+G2 hold on the injected/test path."
+
 # --- float64: control-flow promotion of an exempted value --------------------
 [[exception]]
 id           = "float-control-flow"

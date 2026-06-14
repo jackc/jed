@@ -22,6 +22,9 @@ pub struct OperatorDesc {
     pub arg_names: &'static [&'static str],
     /// Integer-literal DEFAULTs for the trailing parameters; empty = none.
     pub arg_defaults: &'static [&'static str],
+    /// Value-stability class (functions.md §12): "immutable" | "stable" | "volatile".
+    /// Default "immutable"; marks a call non-foldable (advisory today).
+    pub volatility: &'static str,
 }
 
 /// Every operator in the catalog, in catalog order.
@@ -40,6 +43,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "and",
@@ -54,6 +58,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "not",
@@ -68,6 +73,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "eq",
@@ -82,6 +88,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "lt",
@@ -96,6 +103,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "gt",
@@ -110,6 +118,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "le",
@@ -124,6 +133,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ge",
@@ -138,6 +148,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -152,6 +163,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -166,6 +178,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "eq",
@@ -180,6 +193,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "lt",
@@ -194,6 +208,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "gt",
@@ -208,6 +223,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "le",
@@ -222,6 +238,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ge",
@@ -236,6 +253,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -250,6 +268,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -264,6 +283,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "like",
@@ -278,6 +298,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22025"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "eq",
@@ -292,6 +313,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "lt",
@@ -306,6 +328,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "gt",
@@ -320,6 +343,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "le",
@@ -334,6 +358,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ge",
@@ -348,6 +373,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -362,6 +388,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -376,6 +403,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "eq",
@@ -390,6 +418,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "lt",
@@ -404,6 +433,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "gt",
@@ -418,6 +448,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "le",
@@ -432,6 +463,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ge",
@@ -446,6 +478,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -460,6 +493,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -474,6 +508,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "eq",
@@ -488,6 +523,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "lt",
@@ -502,6 +538,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "gt",
@@ -516,6 +553,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "le",
@@ -530,6 +568,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ge",
@@ -544,6 +583,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -558,6 +598,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -572,6 +613,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "eq",
@@ -586,6 +628,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "lt",
@@ -600,6 +643,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "gt",
@@ -614,6 +658,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "le",
@@ -628,6 +673,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ge",
@@ -642,6 +688,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -656,6 +703,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -670,6 +718,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "eq",
@@ -684,6 +733,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "lt",
@@ -698,6 +748,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "gt",
@@ -712,6 +763,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "le",
@@ -726,6 +778,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ge",
@@ -740,6 +793,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -754,6 +808,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -768,6 +823,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "eq",
@@ -782,6 +838,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "lt",
@@ -796,6 +853,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "gt",
@@ -810,6 +868,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "le",
@@ -824,6 +883,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ge",
@@ -838,6 +898,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -852,6 +913,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -866,6 +928,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "eq",
@@ -880,6 +943,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "lt",
@@ -894,6 +958,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "gt",
@@ -908,6 +973,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "le",
@@ -922,6 +988,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ge",
@@ -936,6 +1003,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -950,6 +1018,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -964,6 +1033,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "eq",
@@ -978,6 +1048,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "lt",
@@ -992,6 +1063,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "gt",
@@ -1006,6 +1078,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "le",
@@ -1020,6 +1093,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ge",
@@ -1034,6 +1108,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_distinct_from",
@@ -1048,6 +1123,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_distinct_from",
@@ -1062,6 +1138,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_null",
@@ -1076,6 +1153,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "is_not_null",
@@ -1090,6 +1168,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "add",
@@ -1104,6 +1183,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "sub",
@@ -1118,6 +1198,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "mul",
@@ -1132,6 +1213,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "div",
@@ -1146,6 +1228,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003", "22012"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "mod",
@@ -1160,6 +1243,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003", "22012"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "neg",
@@ -1174,6 +1258,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "add",
@@ -1188,6 +1273,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "sub",
@@ -1202,6 +1288,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "mul",
@@ -1216,6 +1303,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "div",
@@ -1230,6 +1318,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003", "22012"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "mod",
@@ -1244,6 +1333,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22012"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "neg",
@@ -1258,6 +1348,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "add",
@@ -1272,6 +1363,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "sub",
@@ -1286,6 +1378,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "neg",
@@ -1300,6 +1393,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "add",
@@ -1314,6 +1408,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "add",
@@ -1328,6 +1423,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "sub",
@@ -1342,6 +1438,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "add",
@@ -1356,6 +1453,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "add",
@@ -1370,6 +1468,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "sub",
@@ -1384,6 +1483,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "sub",
@@ -1398,6 +1498,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "sub",
@@ -1412,6 +1513,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "mul",
@@ -1426,6 +1528,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "mul",
@@ -1440,6 +1543,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "mul",
@@ -1454,6 +1558,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "mul",
@@ -1468,6 +1573,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "div",
@@ -1482,6 +1588,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008", "22012"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "div",
@@ -1496,6 +1603,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008", "22012"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "add",
@@ -1510,6 +1618,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "sub",
@@ -1524,6 +1633,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "mul",
@@ -1538,6 +1648,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "div",
@@ -1552,6 +1663,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003", "22012"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "mod",
@@ -1566,6 +1678,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22012"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "neg",
@@ -1580,6 +1693,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "abs",
@@ -1594,6 +1708,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "abs",
@@ -1608,6 +1723,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "round",
@@ -1622,6 +1738,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "round",
@@ -1636,6 +1753,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "round",
@@ -1650,6 +1768,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "round",
@@ -1664,6 +1783,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "abs",
@@ -1678,6 +1798,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ceil",
@@ -1692,6 +1813,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "floor",
@@ -1706,6 +1828,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "trunc",
@@ -1720,6 +1843,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "round",
@@ -1734,6 +1858,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "round",
@@ -1748,6 +1873,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "sqrt",
@@ -1762,6 +1888,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "exp",
@@ -1776,6 +1903,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "ln",
@@ -1790,6 +1918,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "log10",
@@ -1804,6 +1933,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "pow",
@@ -1818,6 +1948,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22003"],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "sin",
@@ -1832,6 +1963,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "cos",
@@ -1846,6 +1978,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "tan",
@@ -1860,6 +1993,7 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &[],
         arg_names: &[],
         arg_defaults: &[],
+        volatility: "immutable",
     },
     OperatorDesc {
         name: "make_interval",
@@ -1874,6 +2008,82 @@ pub const OPERATORS: &[OperatorDesc] = &[
         errors: &["22008"],
         arg_names: &["years", "months", "weeks", "days", "hours", "mins", "secs"],
         arg_defaults: &["0", "0", "0", "0", "0", "0", "0"],
+        volatility: "immutable",
+    },
+    OperatorDesc {
+        name: "uuid_extract_version",
+        symbol: None,
+        kind: "function",
+        arity: 1,
+        arg_families: &["uuid"],
+        arg_resolution: "none",
+        result: "int16",
+        null: "propagates",
+        precedence: 0,
+        errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
+        volatility: "immutable",
+    },
+    OperatorDesc {
+        name: "uuid_extract_timestamp",
+        symbol: None,
+        kind: "function",
+        arity: 1,
+        arg_families: &["uuid"],
+        arg_resolution: "none",
+        result: "timestamptz",
+        null: "propagates",
+        precedence: 0,
+        errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
+        volatility: "immutable",
+    },
+    OperatorDesc {
+        name: "uuidv4",
+        symbol: None,
+        kind: "function",
+        arity: 0,
+        arg_families: &[],
+        arg_resolution: "none",
+        result: "uuid",
+        null: "propagates",
+        precedence: 0,
+        errors: &[],
+        arg_names: &[],
+        arg_defaults: &[],
+        volatility: "volatile",
+    },
+    OperatorDesc {
+        name: "uuidv7",
+        symbol: None,
+        kind: "function",
+        arity: 0,
+        arg_families: &[],
+        arg_resolution: "none",
+        result: "uuid",
+        null: "propagates",
+        precedence: 0,
+        errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
+        volatility: "volatile",
+    },
+    OperatorDesc {
+        name: "uuidv7",
+        symbol: None,
+        kind: "function",
+        arity: 1,
+        arg_families: &["interval"],
+        arg_resolution: "none",
+        result: "uuid",
+        null: "propagates",
+        precedence: 0,
+        errors: &["22008"],
+        arg_names: &[],
+        arg_defaults: &[],
+        volatility: "volatile",
     },
 ];
 

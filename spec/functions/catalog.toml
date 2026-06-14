@@ -10,7 +10,7 @@
 # codes in ../errors/registry.toml. Comparison/promotion and the three-valued NULL
 # logic are NOT re-encoded here (see functions.md).
 
-schema_version = 1
+schema_version = 2
 
 # field doc -------------------------------------------------------------------
 # name            internal identity; the codegen handle and AST node name (eq/lt/
@@ -67,6 +67,13 @@ schema_version = 1
 #                 trailing slot — no required parameter follows a defaulted one, like PG). An
 #                 omitted trailing argument is filled with its default at resolve; the default
 #                 literal ADAPTS to the slot's family (e.g. "0" → float64 for `secs`).
+# volatility      OPTIONAL value-stability class (PostgreSQL's, ../design/functions.md §12),
+#                 absent ⇒ "immutable". "immutable" = same args → same result always (every
+#                 operator + the pure scalar functions); "stable" = fixed within a statement,
+#                 varies across statements (a future now()/the clock seam); "volatile" = may
+#                 differ on every call (uuidv4/uuidv7 — the entropy+clock seam, ../design/
+#                 entropy.md). Marks a call non-foldable for a future constant-folding/CSE pass;
+#                 ADVISORY today (no such pass exists yet — the reserved-`cost`-field posture).
 # -----------------------------------------------------------------------------
 
 # --- logical connectives -----------------------------------------------------
@@ -1828,6 +1835,88 @@ arg_resolution = "none"
 result         = "interval"
 null           = "propagates"
 errors         = ["22008"]
+
+# --- uuid functions (extractors) ---------------------------------------------
+# PURE inspectors of a uuid's bits (../design/functions.md §12), oracle-checked against
+# PostgreSQL 18. Both gate on the RFC 4122 variant ((b[8] & 0xC0) == 0x80) and return NULL on
+# a non-RFC variant (Microsoft GUIDs, the nil uuid). volatility = "immutable" (deterministic
+# functions of their input). The generators uuidv4()/uuidv7() (volatile, the entropy+clock
+# seam) land in a later slice.
+#
+# uuid_extract_version: the version nibble (high nibble of byte 6), 0..15, as int16; NULL when
+# the variant is not RFC 4122.
+# uuid_extract_timestamp: the embedded instant as timestamptz, for VERSION 1 and 7 ONLY
+# (matching PG 18 — v6 returns NULL there); NULL for every other version and for a non-RFC
+# variant. v7 = the 48-bit big-endian Unix-millisecond field (×1000 → micros); v1 = the 60-bit
+# Gregorian 100-ns count minus the 1582→1970 epoch offset, truncated to micros.
+[[operator]]
+name           = "uuid_extract_version"
+kind           = "function"
+arity          = 1
+arg_families   = ["uuid"]
+arg_resolution = "none"
+result         = "int16"
+null           = "propagates"
+errors         = []
+volatility     = "immutable"
+
+[[operator]]
+name           = "uuid_extract_timestamp"
+kind           = "function"
+arity          = 1
+arg_families   = ["uuid"]
+arg_resolution = "none"
+result         = "timestamptz"
+null           = "propagates"
+errors         = []
+volatility     = "immutable"
+
+# --- uuid functions (generators) ---------------------------------------------
+# VOLATILE generators (spec/design/entropy.md) on the host-injected entropy+clock seam: tests
+# inject a fixed seed+clock (the `# seed:`/`# clock:` directives) for exact cross-core output;
+# production reads OS entropy + the wall clock. A spec'd byte-exact PRNG (splitmix64) keeps the
+# seeded path identical across cores. NOT oracle-imported (PG's entropy differs); expected
+# values are hand-authored from the PRNG fixtures (spec/encoding/prng.toml). volatility =
+# "volatile" marks them non-foldable for a future optimizer.
+#
+# uuidv4: 16 random bytes (two PRNG draws), version 4 + RFC variant.
+# uuidv7: 48-bit ms (the statement clock) + a per-statement monotonic counter in rand_a
+# (sortable within a millisecond) + 62 random bits; version 7 + RFC variant. An out-of-48-bit /
+# pre-epoch ms traps 22008. The optional `interval` shifts the embedded instant (PG-faithful,
+# via the calendar-aware timestamptz+interval arithmetic) — a PG-style arity overload (uuidv7/0,
+# uuidv7/1), not a default.
+[[operator]]
+name           = "uuidv4"
+kind           = "function"
+arity          = 0
+arg_families   = []
+arg_resolution = "none"
+result         = "uuid"
+null           = "propagates"
+errors         = []
+volatility     = "volatile"
+
+[[operator]]
+name           = "uuidv7"
+kind           = "function"
+arity          = 0
+arg_families   = []
+arg_resolution = "none"
+result         = "uuid"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "volatile"
+
+[[operator]]
+name           = "uuidv7"
+kind           = "function"
+arity          = 1
+arg_families   = ["interval"]
+arg_resolution = "none"
+result         = "uuid"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "volatile"
 
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a

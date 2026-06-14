@@ -76,6 +76,8 @@ import {
   widthBytes,
 } from "./types.ts";
 import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
+import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
+import { type ClockFunc, type RandomFill, Seam, StmtRng } from "./seam.ts";
 import {
   type Interval,
   intervalAdd,
@@ -354,6 +356,12 @@ export class Database {
   // spill.md §6), only when an operator spills; an in-memory database ignores it. Default
   // DEFAULT_WORK_MEM.
   workMem: number;
+  // seam: the entropy + clock seam for the uuid generators (spec/design/entropy.md): two
+  // host-injectable functions (a random source + a clock), each unset ⇒ the platform primitive (OS
+  // CSPRNG per value / wall clock). Set via setRandomSource / setClockSource; tests inject the
+  // provided seededRandomSource + fixedClock (the # seed: / # clock: directives) for exact
+  // cross-core output. A handle setting, not stored in the file.
+  seam: Seam;
 
   constructor() {
     this.committed = new Snapshot();
@@ -367,6 +375,7 @@ export class Database {
     this.maxCost = 0n;
     this.readOnly = false;
     this.workMem = DEFAULT_WORK_MEM;
+    this.seam = new Seam();
   }
 
   // setMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
@@ -376,6 +385,28 @@ export class Database {
   // setting, not stored in the file.
   setMaxCost(limit: bigint): void {
     this.maxCost = limit;
+  }
+
+  // setRandomSource injects a random source for the uuid generators (spec/design/entropy.md §6) —
+  // the deterministic / reproducible path. Pass seededRandomSource for a byte-identical cross-core
+  // stream (the conformance # seed: directive). clearRandomSource returns to the OS CSPRNG, drawn
+  // per value (production — unpredictable output).
+  setRandomSource(f: RandomFill): void {
+    this.seam.randomFill = f;
+  }
+
+  clearRandomSource(): void {
+    this.seam.randomFill = undefined;
+  }
+
+  // setClockSource injects a clock source for uuidv7 (entropy.md §6) — e.g. fixedClock (the # clock:
+  // directive). clearClockSource returns to the wall clock.
+  setClockSource(f: ClockFunc): void {
+    this.seam.clock = f;
+  }
+
+  clearClockSource(): void {
+    this.seam.clock = undefined;
   }
 
   // setWorkMem sets the work-memory budget (in bytes) for blocking operators run on this handle
@@ -1318,6 +1349,8 @@ export class Database {
           params: [],
           outer: [],
           runSubquery: (p, o) => this.execQueryPlan(p, o, []),
+          seam: this.seam,
+          rng: new StmtRng(),
         };
         evalChecks(checks, table.name, row, env, meter);
       }
@@ -1467,7 +1500,7 @@ export class Database {
     params: Value[],
     meter: Meter,
   ): Value[][] {
-    const env: EvalEnv = { params, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, params) };
+    const env: EvalEnv = { params, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, params), seam: this.seam, rng: new StmtRng() };
     const out: Value[][] = [];
     rows.forEach((row, i) => {
       meter.guard();
@@ -1513,7 +1546,7 @@ export class Database {
       ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, cost));
       meter.charge(cost.value);
     }
-    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
+    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound), seam: this.seam, rng: new StmtRng() };
     const store = this.working().store(del.table);
     // matched collects (key, row) pairs before mutating; the rows feed phase 2's
     // index-entry removal (indexed columns are fixed-width and always resident).
@@ -1645,7 +1678,7 @@ export class Database {
       ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, foldCost));
     }
     meter.charge(foldCost.value);
-    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound) };
+    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound), seam: this.seam, rng: new StmtRng() };
     const store = this.working().store(upd.table);
     // Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
     const updates: { key: Uint8Array; row: Row; oldRow: Row }[] = [];
@@ -2343,6 +2376,8 @@ export class Database {
       params,
       outer,
       runSubquery: (p, o) => this.execQueryPlan(p, o, params),
+      seam: this.seam,
+      rng: new StmtRng(),
     };
     const meter = new Meter(this.maxCost);
 
@@ -3429,7 +3464,16 @@ type ScalarFuncName =
   | "tan"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
   // float64 secs (spec/design/functions.md §11). The one scalar function returning interval.
-  | "make_interval";
+  | "make_interval"
+  // uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
+  // uuid_extract_version → int16 (NULL off-RFC-variant); uuid_extract_timestamp → timestamptz
+  // (the embedded instant for v1/v7, else NULL).
+  | "uuid_extract_version"
+  | "uuid_extract_timestamp"
+  // uuid generators (spec/design/entropy.md §3): volatile. uuidv4 → random; uuidv7 → ms timestamp
+  // + monotonic counter + random, with an optional interval shift.
+  | "uuidv4"
+  | "uuidv7";
 
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
@@ -3517,6 +3561,11 @@ type EvalEnv = {
   params: Value[];
   outer: Row[];
   runSubquery(plan: QueryPlan, outer: Row[]): SelectResult;
+  // The entropy+clock seam (spec/design/entropy.md §5): `seam` is the handle's injected random/clock
+  // functions (a reference to the Database's Seam — handle-scoped); `rng` is the per-statement
+  // uuidv7 counter + once-resolved clock. Only the volatile uuid generators touch either.
+  seam: Seam;
+  rng: StmtRng;
 };
 
 // ============================================================================
@@ -4049,6 +4098,10 @@ function resolveFuncCall(
     case "sin":
     case "cos":
     case "tan":
+    case "uuid_extract_version":
+    case "uuid_extract_timestamp":
+    case "uuidv4":
+    case "uuidv7":
       rejectNamed(lname, e.argNames);
       return resolveScalarFunc(scope, e, ag, params);
     default:
@@ -4244,6 +4297,21 @@ function resolveScalarFunc(
     const a0 = widenFloatTo(rargs[0]!, tys[0].ty, w);
     const a1 = widenFloatTo(rargs[1]!, tys[1].ty, w);
     return scalarFuncNode("pow", [a0, a1], "float64", w);
+  }
+
+  // uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
+  if (name === "uuid_extract_version" && tys.length === 1 && tys[0].kind === "uuid") {
+    return scalarFuncNode("uuid_extract_version", rargs, "int16", undefined);
+  }
+  if (name === "uuid_extract_timestamp" && tys.length === 1 && tys[0].kind === "uuid") {
+    return scalarFuncNode("uuid_extract_timestamp", rargs, "timestamptz", undefined);
+  }
+  // uuid generators (spec/design/entropy.md §3): volatile; uuidv7 takes an optional interval shift.
+  if (name === "uuidv4" && tys.length === 0) {
+    return scalarFuncNode("uuidv4", rargs, "uuid", undefined);
+  }
+  if (name === "uuidv7" && (tys.length === 0 || (tys.length === 1 && tys[0].kind === "interval"))) {
+    return scalarFuncNode("uuidv7", rargs, "uuid", undefined);
   }
 
   throw noFuncOverload(name);
@@ -6323,6 +6391,29 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         return intervalValue(
           makeInterval(geti(0), geti(1), geti(2), geti(3), geti(4), geti(5), secMicros),
         );
+      }
+      // uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a non-RFC
+      // variant (and, for the timestamp, any version other than 1/7). The NULL-input case is
+      // already handled above.
+      if (e.func === "uuid_extract_version") {
+        const ver = uuidExtractVersion((vals[0] as { bytes: Uint8Array }).bytes);
+        return ver === null ? nullValue() : intValue(ver);
+      }
+      if (e.func === "uuid_extract_timestamp") {
+        const mc = uuidExtractTimestampMicros((vals[0] as { bytes: Uint8Array }).bytes);
+        return mc === null ? nullValue() : timestamptzValue(mc);
+      }
+      // uuid generators (spec/design/entropy.md §3): draw from the per-statement seam (env.rng),
+      // advancing the PRNG/counter. The NULL-arg case is handled above.
+      if (e.func === "uuidv4") {
+        return uuidValue(env.rng.uuidV4(env.seam));
+      }
+      if (e.func === "uuidv7") {
+        const clock = env.rng.statementClockMicros(env.seam);
+        // The optional interval arg shifts the embedded instant via the existing calendar-aware
+        // timestamptz arithmetic (entropy.md §4).
+        const shifted = vals.length === 1 ? tsShift(clock, (vals[0] as { iv: Interval }).iv, false) : clock;
+        return uuidValue(env.rng.uuidV7(env.seam, shifted));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

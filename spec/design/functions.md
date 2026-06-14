@@ -415,3 +415,50 @@ literals and user-defined functions are not built (jed has no UDFs; built-ins us
 `make_timestamptz` reuse this exact mold (their `sec` is also `float64`). **`VARIADIC` is
 blocked** on the composite `array` type ([CLAUDE.md](../../CLAUDE.md) §4), which is deferred —
 it has no value codec yet — so it waits until `array` lands ([../../TODO.md](../../TODO.md)).
+
+## 12. UUID functions — extractors now, generators on the entropy+clock seam
+
+PostgreSQL's UUID functions split cleanly along jed's determinism contract
+([determinism.md](determinism.md) §1), and that split is the build order:
+
+- **Pure extractors (landed):** `uuid_extract_version(uuid) → int16` and
+  `uuid_extract_timestamp(uuid) → timestamptz` are deterministic functions of their input
+  bits — immutable, fully in-contract, oracle-checked against PostgreSQL 18. They reuse the §9
+  scalar-function mold (`[[operator]]`, `kind = "function"`), one row each.
+- **Generators (the seam slice):** `uuidv4()` (random) and `uuidv7([shift interval])`
+  (wall-clock + random) are **volatile** — they read entropy and the clock, the class-**B**
+  case (determinism.md §5). They land on a host-injected **random + clock seam** — two functions
+  the host supplies ([entropy.md](entropy.md)) — so they stay *deterministic given the seam
+  functions*: tests inject the engine's provided deterministic source + a fixed clock for exact
+  cross-core assertions; production's default draws from the OS CSPRNG **per value** (unpredictable)
+  + the wall clock.
+
+**The extractors' semantics** (byte 0 is the most-significant of the 16 raw bytes):
+
+- Both **gate on the RFC 4122 variant** — the value is RFC 4122 iff `(byte8 & 0xC0) == 0x80`.
+  A non-RFC variant (Microsoft GUIDs `11`, the legacy NCS variant `0`, the all-zero nil UUID)
+  makes **both** functions return NULL. NULL input propagates (the `null = "propagates"` rule).
+- `uuid_extract_version` returns the version nibble — the high nibble of byte 6, `0..15` — as
+  `int16`, for an RFC value.
+- `uuid_extract_timestamp` returns the embedded instant as `timestamptz`, for **version 1 and
+  7 only**, NULL for every other version. This matches PG 18, which extracts from v1/v7 only —
+  **v6 returns NULL there**, a deliberate match to the pinned oracle, not a divergence (a later
+  PG may extend the set; jed tracks `REL_18`). v7 reads the first 6 bytes as a 48-bit big-endian
+  Unix-millisecond count (`micros = ms * 1000`). v1 reassembles the 60-bit Gregorian 100-ns
+  count from time_low/time_mid/time_hi (the version nibble masked off), subtracts the 1582→1970
+  epoch offset (`122192928000000000` 100-ns ticks), and **truncates** to microseconds (`/10`,
+  toward zero — PG drops the sub-microsecond remainder).
+
+The bit work lives in a small per-core `uuid` module (`uuid.rs`/`uuid.go`/`uuid.ts`), kept
+separate from value.rs's text rendering/parsing; the resolver/eval wire it like any scalar
+function. Cost is the uniform one `operator_eval` per call.
+
+**The `volatility` field** (catalog schema_version 2). The catalog grows an optional
+`volatility` column — PostgreSQL's class, `immutable | stable | volatile`, absent ⇒
+`immutable`. Every existing operator/function is `immutable` (and stays so by default, no
+re-authoring); the generators will be `volatile`; a future `now()`/the clock seam is `stable`.
+It marks a call non-foldable for a future constant-folding/CSE pass. It is **advisory today** —
+no such pass exists yet — exactly the posture §8 takes with the reserved `cost` field: the spec
+states the truth at the point the function is added, and the optimizer slice that needs the
+data finds it already there. `verify.rb` validates the value set; `gen_catalog.rb` emits it
+(default `immutable`) into the descriptor table each core reads.

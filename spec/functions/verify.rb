@@ -6,7 +6,7 @@
 # (CLAUDE.md §5); run via `rake verify`. This is a COHERENCE checker — it does NOT
 # re-implement three-valued logic. Checks, with no engine required:
 #
-#   1. schema_version == 1
+#   1. schema_version == 2
 #   2. each operator has the fields required for its kind; arity == arg_families
 #      length; null_test => arity 1; comparison => arity 2
 #   3. every arg_families entry is "any" or a real `family` in scalars.toml
@@ -40,6 +40,8 @@
 #      string array of integer literals, length ≤ arity, filling only TRAILING slots. Across
 #      a function's overloads a parameter name maps to one position (so named→slot resolution
 #      is overload-independent).
+#  14. OPTIONAL volatility (functions.md §12): if present, one of immutable|stable|volatile.
+#      Absent ⇒ immutable. Marks a call non-foldable for a future constant-folding pass.
 #
 # Exit 0 = catalog is internally coherent and cross-references resolve; nonzero =
 # the offending problem.
@@ -55,6 +57,7 @@ RESERVED_RESULTS = %w[promoted].to_set
 KNOWN_KINDS      = %w[comparison null_test arithmetic logical function].to_set
 NULL_BEHAVIORS   = %w[propagates detects null_safe kleene].to_set
 RESOLUTIONS      = %w[promote none].to_set
+VOLATILITIES     = %w[immutable stable volatile].to_set
 REQUIRED_FIELDS  = %w[name kind arity arg_families arg_resolution result null errors].freeze
 
 # Aggregate functions (kind = "aggregate") use a distinct field set and validation
@@ -85,7 +88,7 @@ def main
   registry = TomlRB.load_file(File.join(SPEC_DIR, "errors", "registry.toml"))
 
   # (1) schema_version
-  fail!("catalog.toml: schema_version must be 1") unless catalog["schema_version"] == 1
+  fail!("catalog.toml: schema_version must be 2") unless catalog["schema_version"] == 2
 
   # reference sets drawn from the canonical type/error tables
   families   = (scalars["type"] || []).map { |t| t["family"] }.to_set
@@ -187,6 +190,11 @@ def main
       defs.each do |d|
         fail!("operator #{id}: arg_defaults entry #{d.inspect} must be an integer-literal string") unless d.is_a?(String) && d.match?(/\A-?\d+\z/)
       end
+    end
+
+    # (14) optional volatility class (functions.md §12); absent ⇒ immutable.
+    if op.key?("volatility")
+      fail!("operator #{id}: volatility #{op['volatility'].inspect} not in (#{VOLATILITIES.to_a.join('|')})") unless VOLATILITIES.include?(op["volatility"])
     end
 
     # (9) collect for uniqueness — keyed by operand-family signature, so an operator

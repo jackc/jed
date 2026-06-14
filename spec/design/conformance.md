@@ -181,14 +181,25 @@ Every corpus entry MUST obey:
 - **No *unledgered* nondeterminism.** Determinism is **default-deny** ([determinism.md](determinism.md)
   §1): no wall-clock, no random, no hashmap-order leakage — *unless* the behavior is an entry in
   the determinism-exception ledger ([../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml))
-  with a stated blast radius and test mechanism. The only relaxation exercised today is `float64`
-  (below); everything else stays fully deterministic and cross-core byte-identical.
-- **Floats are the one ledgered exception.** `float64` ([float.md](float.md)) is exempt from
+  with a stated blast radius and test mechanism. Two relaxations are exercised today: `float64`
+  (class **A**, below) and the UUID generators (class **B**); everything else stays fully
+  deterministic and cross-core byte-identical.
+- **Floats** are the class-**A** ledgered exception. `float64` ([float.md](float.md)) is exempt from
   cross-core byte-identity for *computed/rendered values only* — compared via the `R` tag's
   tolerant rule (§1). Its *storage* bytes, *total order*, *arithmetic kernel*, *exact-sum
   `SUM`/`AVG`*, and *cost/names/types* remain exact and cross-core (so a float query still carries
   `# cost:`). `decimal` stays the exact path (`1.50` prints `1.50`, a `D`-tag value); a value is
   an `R`-tag value only when it is genuinely `float64`.
+- **The UUID generators** are the class-**B** ledgered exception, but they stay **exact** in the
+  corpus: `uuidv4()` / `uuidv7()` run on a host-injected **random + clock seam** (two functions —
+  [entropy.md](entropy.md)), so a record pins both with the **`# seed: N`** and **`# clock: N`**
+  directives (comments the stock runner ignores, §1.1, bound to the next record and reset after —
+  like `# cost:`): the harness injects the engine's provided deterministic source seeded with `N`
+  (and a fixed clock) and asserts the output byte-for-byte across all cores (the spec'd splitmix64
+  source makes the injected path identical). A generator record WITHOUT a `# seed:` (and, for
+  `uuidv7`, a `# clock:`) is non-conformant. `# cost:` is exact and source-independent. Production's
+  default draws from the OS CSPRNG per value + the wall clock; only those raw reads are
+  non-deterministic (the ledger entries).
 - **Canonical boolean spelling.** A boolean prints as exactly `true`/`false` (NULL as
   `NULL`); no core may emit `t`/`f`, `0`/`1`, or host-cased variants.
 

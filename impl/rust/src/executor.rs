@@ -299,6 +299,14 @@ pub struct Database {
     /// spills. An **in-memory** database ignores it (no backing file to spill to — it stays fully
     /// resident, like the buffer pool). Default [`DEFAULT_WORK_MEM`](crate::spill::DEFAULT_WORK_MEM).
     pub(crate) work_mem: usize,
+    /// The entropy + clock seam for the uuid generators (spec/design/entropy.md): two host-injectable
+    /// functions (a random source + a clock), each defaulting to the platform primitive (OS CSPRNG
+    /// per value / wall clock). Set by [`set_random_source`](Database::set_random_source) /
+    /// [`set_clock_source`](Database::set_clock_source). Tests inject the provided
+    /// [`seeded_random_source`](crate::seam::seeded_random_source) + [`fixed_clock`](crate::seam::fixed_clock)
+    /// (the `# seed:` / `# clock:` directives) for exact cross-core output. A handle setting, not
+    /// stored in the file; does not affect a query that calls no generator.
+    pub(crate) seam: crate::seam::Seam,
 }
 
 /// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
@@ -340,6 +348,7 @@ impl Database {
             max_cost: 0,
             read_only: false,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
+            seam: crate::seam::Seam::default(),
         }
     }
 
@@ -360,6 +369,7 @@ impl Database {
             max_cost: 0,
             read_only: false,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
+            seam: crate::seam::Seam::default(),
         }
     }
 
@@ -448,6 +458,32 @@ impl Database {
     /// The current execution-cost ceiling (`0` ⇒ unlimited). See [`set_max_cost`](Database::set_max_cost).
     pub fn max_cost(&self) -> i64 {
         self.max_cost
+    }
+
+    /// Inject a random source for the uuid generators (spec/design/entropy.md §6) — the
+    /// deterministic / reproducible path. Pass [`seeded_random_source`](crate::seam::seeded_random_source)
+    /// for a byte-identical cross-core stream (the conformance path; tests use the `# seed:`
+    /// directive). A handle setting, not stored in the file.
+    pub fn set_random_source(&mut self, f: crate::seam::RandomSource) {
+        self.seam.set_random(f);
+    }
+
+    /// Clear the injected random source: the generators return to the OS CSPRNG, drawn per value
+    /// (production — unpredictable output).
+    pub fn clear_random_source(&mut self) {
+        self.seam.clear_random();
+    }
+
+    /// Inject a clock source for `uuidv7` (entropy.md §6) — e.g. [`fixed_clock`](crate::seam::fixed_clock)
+    /// (the `# clock:` directive). After this, `uuidv7()` embeds the source's instant instead of the
+    /// wall clock. A handle setting, not stored in the file.
+    pub fn set_clock_source(&mut self, f: crate::seam::ClockSource) {
+        self.seam.set_clock(f);
+    }
+
+    /// Clear the injected clock source: `uuidv7` returns to reading the wall clock (production).
+    pub fn clear_clock_source(&mut self) {
+        self.seam.clear_clock();
     }
 
     /// Set the work-memory budget (in **bytes**) for blocking operators run on this handle
@@ -1625,10 +1661,12 @@ impl Database {
             // expression work (operator_eval), so guard the ceiling per checked row.
             if !checks.is_empty() {
                 meter.guard()?;
+                let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
                 let env = EvalEnv {
                     exec: self,
                     params: &[],
                     outer: &[],
+                    rng: &stmt_rng,
                 };
                 for (name, rexpr) in checks {
                     if matches!(rexpr.eval(&row, &env, meter)?, Value::Bool(false)) {
@@ -1817,10 +1855,12 @@ impl Database {
         params: &[Value],
         meter: &mut Meter,
     ) -> Result<Vec<Vec<Value>>> {
+        let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
         let env = EvalEnv {
             exec: self,
             params,
             outer: &[],
+            rng: &stmt_rng,
         };
         let mut out = Vec::with_capacity(rows.len());
         for (i, &row) in rows.iter().enumerate() {
@@ -1910,10 +1950,12 @@ impl Database {
         // A correlated subquery in the WHERE re-runs per row: the eval environment pushes the
         // current row, so `target.col` (an `OuterColumn`) reads it. `outer` starts empty (DELETE
         // is the top-level statement — no enclosing query).
+        let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
         let env = EvalEnv {
             exec: self,
             params: &bound,
             outer: &[],
+            rng: &stmt_rng,
         };
         // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
         // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
@@ -2131,10 +2173,12 @@ impl Database {
         // A correlated subquery (in an RHS or the WHERE) re-runs per row: the eval environment
         // pushes the current (old) row, so `target.col` (an `OuterColumn`) reads it. `outer`
         // starts empty (UPDATE is the top-level statement — no enclosing query).
+        let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
         let env = EvalEnv {
             exec: self,
             params: &bound,
             outer: &[],
+            rng: &stmt_rng,
         };
         // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
         // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
@@ -3229,10 +3273,12 @@ impl Database {
         outer: &[&[Value]],
         params: &[Value],
     ) -> Result<SelectResult> {
+        let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
         let env = EvalEnv {
             exec: self,
             params,
             outer,
+            rng: &stmt_rng,
         };
         let mut meter = Meter::with_limit(self.max_cost);
 
@@ -4226,6 +4272,15 @@ enum ScalarFunc {
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
     /// float64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
+    /// uuid_extract_version(uuid) → int16 — the version nibble, NULL off-RFC-variant (§12).
+    UuidExtractVersion,
+    /// uuid_extract_timestamp(uuid) → timestamptz — the embedded instant for v1/v7, else NULL (§12).
+    UuidExtractTimestamp,
+    /// uuidv4() → uuid — random (the entropy seam, spec/design/entropy.md §3). VOLATILE.
+    Uuidv4,
+    /// uuidv7([interval]) → uuid — ms timestamp + monotonic counter + random (the entropy+clock
+    /// seam, entropy.md §3); the optional interval shifts the embedded instant. VOLATILE.
+    Uuidv7,
 }
 
 /// A resolved expression: a tree over fixed column indices, ready to evaluate against
@@ -5384,6 +5439,11 @@ struct EvalEnv<'a> {
     exec: &'a Database,
     params: &'a [Value],
     outer: &'a [&'a [Value]],
+    /// The per-statement entropy+clock state (spec/design/entropy.md §5): the uuidv7 monotonic
+    /// counter + the once-resolved statement clock, behind a `Cell` (interior mutability — `EvalEnv`
+    /// is `&`-shared; the draw order is fixed by eval order). The injected random/clock functions
+    /// live on `exec.seam` (handle-scoped); only the volatile uuid generators touch any of this.
+    rng: &'a std::cell::Cell<crate::seam::StmtRng>,
 }
 
 /// Build the constant `RExpr` for a folded uncorrelated-subquery value (§26). The static type
@@ -5831,8 +5891,23 @@ fn resolve_func_call(
             reject_named(&lname, arg_names)?;
             resolve_aggregate(scope, &lname, args, star, agg, params)
         }
-        "abs" | "round" | "ceil" | "floor" | "trunc" | "sqrt" | "exp" | "ln" | "log10" | "pow"
-        | "sin" | "cos" | "tan" => {
+        "abs"
+        | "round"
+        | "ceil"
+        | "floor"
+        | "trunc"
+        | "sqrt"
+        | "exp"
+        | "ln"
+        | "log10"
+        | "pow"
+        | "sin"
+        | "cos"
+        | "tan"
+        | "uuid_extract_version"
+        | "uuid_extract_timestamp"
+        | "uuidv4"
+        | "uuidv7" => {
             reject_named(&lname, arg_names)?;
             resolve_scalar_func(scope, &lname, args, star, agg, params)
         }
@@ -6066,6 +6141,13 @@ fn resolve_scalar_func(
         | ("cos", [Float(_)])
         | ("tan", [Float(_)])
         | ("pow", [Float(_), Float(_)]) => ScalarType::Float64,
+        // uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
+        ("uuid_extract_version", [ResolvedType::Uuid]) => ScalarType::Int16,
+        ("uuid_extract_timestamp", [ResolvedType::Uuid]) => ScalarType::Timestamptz,
+        // uuid generators (spec/design/entropy.md §3): volatile; uuidv7 takes an optional interval
+        // shift. NULL propagation (a NULL interval) is handled centrally at eval.
+        ("uuidv4", []) => ScalarType::Uuid,
+        ("uuidv7", []) | ("uuidv7", [ResolvedType::Interval]) => ScalarType::Uuid,
         _ => return Err(no_func_overload(name)),
     };
     let func = match name {
@@ -6082,6 +6164,10 @@ fn resolve_scalar_func(
         "sin" => ScalarFunc::Sin,
         "cos" => ScalarFunc::Cos,
         "tan" => ScalarFunc::Tan,
+        "uuid_extract_version" => ScalarFunc::UuidExtractVersion,
+        "uuid_extract_timestamp" => ScalarFunc::UuidExtractTimestamp,
+        "uuidv4" => ScalarFunc::Uuidv4,
+        "uuidv7" => ScalarFunc::Uuidv7,
         _ => unreachable!("scalar-func dispatch admits only the names above"),
     };
     // Promote float arguments to float64 when the function computes at float64 (every float
@@ -8755,6 +8841,47 @@ impl RExpr {
                         )?;
                         Ok(Value::Interval(iv))
                     }
+                    // uuid extractors (spec/design/functions.md §12): pure bit inspection. Both
+                    // return NULL (Value::Null) for a non-RFC variant; the timestamp also for any
+                    // version other than 1/7. The NULL-input case is already handled above.
+                    ScalarFunc::UuidExtractVersion => match &vals[0] {
+                        Value::Uuid(b) => {
+                            Ok(crate::uuid::extract_version(b).map_or(Value::Null, Value::Int))
+                        }
+                        _ => unreachable!("resolver restricts uuid_extract_version to a uuid"),
+                    },
+                    ScalarFunc::UuidExtractTimestamp => match &vals[0] {
+                        Value::Uuid(b) => Ok(crate::uuid::extract_timestamp_micros(b)
+                            .map_or(Value::Null, Value::Timestamptz)),
+                        _ => unreachable!("resolver restricts uuid_extract_timestamp to a uuid"),
+                    },
+                    // uuid generators (spec/design/entropy.md §3): draw from the per-statement seam
+                    // (a Cell on EvalEnv — interior mutability), advancing the PRNG/counter. The
+                    // NULL-arg case (uuidv7(NULL)) already returned NULL above.
+                    ScalarFunc::Uuidv4 => {
+                        let mut r = env.rng.get();
+                        let b = r.uuid_v4(&env.exec.seam)?;
+                        env.rng.set(r);
+                        Ok(Value::Uuid(b))
+                    }
+                    ScalarFunc::Uuidv7 => {
+                        let mut r = env.rng.get();
+                        let clock = r.statement_clock_micros(&env.exec.seam);
+                        // The optional interval arg shifts the embedded instant via the existing
+                        // calendar-aware timestamptz arithmetic (entropy.md §4).
+                        let shifted = match vals.first() {
+                            Some(Value::Interval(iv)) => {
+                                crate::interval::ts_shift(clock, iv, false)?
+                            }
+                            Some(_) => {
+                                unreachable!("resolver restricts uuidv7's arg to an interval")
+                            }
+                            None => clock,
+                        };
+                        let b = r.uuid_v7(&env.exec.seam, shifted)?;
+                        env.rng.set(r);
+                        Ok(Value::Uuid(b))
+                    }
                 }
             }
             // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
@@ -9226,8 +9353,14 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         ScalarFunc::Sin => x.sin(),
         ScalarFunc::Cos => x.cos(),
         ScalarFunc::Tan => x.tan(),
-        ScalarFunc::Abs | ScalarFunc::Round | ScalarFunc::MakeInterval => {
-            unreachable!("abs/round/make_interval are handled before eval_float_func")
+        ScalarFunc::Abs
+        | ScalarFunc::Round
+        | ScalarFunc::MakeInterval
+        | ScalarFunc::UuidExtractVersion
+        | ScalarFunc::UuidExtractTimestamp
+        | ScalarFunc::Uuidv4
+        | ScalarFunc::Uuidv7 => {
+            unreachable!("abs/round/make_interval/uuid_* are handled before eval_float_func")
         }
     };
     Ok(Value::Float64(r))

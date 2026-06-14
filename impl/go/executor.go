@@ -248,6 +248,12 @@ type Database struct {
 	// cost are invariant — spill.md §6), only when an operator spills; an in-memory database ignores
 	// it (no file to spill to). Default DefaultWorkMem.
 	workMem int
+	// seam: the entropy + clock seam for the uuid generators (spec/design/entropy.md): two
+	// host-injectable functions (a random source + a clock), each nil ⇒ the platform primitive (OS
+	// CSPRNG per value / wall clock). Set via SetRandomSource / SetClockSource; tests inject the
+	// provided SeededRandomSource + FixedClock (the # seed: / # clock: directives) for exact
+	// cross-core output. A handle setting, not stored in the file.
+	seam Seam
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
@@ -318,6 +324,17 @@ func (db *Database) Path() string { return db.path }
 // is unlimited. The primary guard for safely evaluating untrusted, user-supplied queries; a handle
 // setting, not stored in the file.
 func (db *Database) SetMaxCost(limit int64) { db.maxCost = limit }
+
+// SetRandomSource injects a random source for the uuid generators (spec/design/entropy.md §6) — the
+// deterministic / reproducible path. Pass SeededRandomSource for a byte-identical cross-core stream
+// (the conformance # seed: directive). ClearRandomSource returns to the OS CSPRNG, drawn per value.
+func (db *Database) SetRandomSource(f RandomSource) { db.seam.SetRandom(f) }
+func (db *Database) ClearRandomSource()             { db.seam.ClearRandom() }
+
+// SetClockSource injects a clock source for uuidv7 (entropy.md §6) — e.g. FixedClock (the # clock:
+// directive). ClearClockSource returns to the wall clock.
+func (db *Database) SetClockSource(f ClockSource) { db.seam.SetClock(f) }
+func (db *Database) ClearClockSource()            { db.seam.ClearClock() }
 
 // MaxCost is the current execution-cost ceiling (0 ⇒ unlimited). See SetMaxCost.
 func (db *Database) MaxCost() int64 { return db.maxCost }
@@ -1446,7 +1463,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			if err := meter.Guard(); err != nil {
 				return nil, err
 			}
-			env := &evalEnv{exec: db}
+			env := &evalEnv{exec: db, rng: newStmtRng()}
 			if err := evalChecks(checks, table.Name, row, env, meter); err != nil {
 				return nil, err
 			}
@@ -1605,7 +1622,7 @@ func (db *Database) resolveReturning(table *Table, items SelectItems, baseIsOld 
 // against: others[i] is the row's opposite version (UPDATE's old rows), nil the all-NULL
 // row (INSERT's old side, DELETE's new side).
 func (db *Database) projectReturning(nodes []*rExpr, rows []Row, others []Row, params []Value, meter *Meter) ([][]Value, error) {
-	env := &evalEnv{exec: db, params: params}
+	env := &evalEnv{exec: db, params: params, rng: newStmtRng()}
 	out := make([][]Value, 0, len(rows))
 	for i, row := range rows {
 		if err := meter.Guard(); err != nil {
@@ -1706,7 +1723,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 	}
-	env := &evalEnv{exec: db, params: bound}
+	env := &evalEnv{exec: db, params: bound, rng: newStmtRng()}
 	store := db.working().store(del.Table)
 	// matched collects (key, row) pairs before mutating; the rows feed phase 2's
 	// index-entry removal (indexed columns are fixed-width and always resident).
@@ -1918,7 +1935,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 	}
-	env := &evalEnv{exec: db, params: bound}
+	env := &evalEnv{exec: db, params: bound, rng: newStmtRng()}
 	store := db.working().store(upd.Table)
 	// Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
 	type pending struct {
@@ -3572,7 +3589,7 @@ func (db *Database) newSorterFor(order []orderSlot) *sorter {
 }
 
 func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value) (selectResult, error) {
-	env := &evalEnv{exec: db, params: params, outer: outer}
+	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng()}
 	meter := NewMeterWithLimit(db.maxCost)
 
 	// LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
@@ -4741,6 +4758,15 @@ const (
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
 	// float64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
+	// uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
+	// sfUuidExtractVersion → int16 (NULL off-RFC-variant); sfUuidExtractTimestamp → timestamptz
+	// (the embedded instant for v1/v7, else NULL).
+	sfUuidExtractVersion
+	sfUuidExtractTimestamp
+	// uuid generators (spec/design/entropy.md §3): volatile. sfUuidv4 → random; sfUuidv7 → ms
+	// timestamp + monotonic counter + random, with an optional interval shift.
+	sfUuidv4
+	sfUuidv7
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -4898,6 +4924,10 @@ type evalEnv struct {
 	exec   *Database
 	params []Value
 	outer  []Row
+	// The per-statement entropy+clock state (spec/design/entropy.md §5): the uuidv7 monotonic counter
+	// + the once-resolved statement clock. The injected random/clock functions live on exec.seam
+	// (handle-scoped); only the volatile uuid generators touch any of this.
+	rng *StmtRng
 }
 
 // rCaseArm is one resolved (condition, result) branch of a reCase node (spec/design/grammar.md
@@ -5466,7 +5496,8 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveAggregate(s, fc, ag, params)
 	case "abs", "round", "ceil", "floor", "trunc", "sqrt",
-		"exp", "ln", "log10", "pow", "sin", "cos", "tan":
+		"exp", "ln", "log10", "pow", "sin", "cos", "tan",
+		"uuid_extract_version", "uuid_extract_timestamp", "uuidv4", "uuidv7":
 		if err := rejectNamed(toLowerASCII(fc.Name), fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -5696,6 +5727,18 @@ func resolveScalarFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		fn, result = sfCos, Float64
 	case name == "tan" && floatOne:
 		fn, result = sfTan, Float64
+	// uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
+	case name == "uuid_extract_version" && len(tys) == 1 && tys[0].kind == rtUuid:
+		fn, result = sfUuidExtractVersion, Int16
+	case name == "uuid_extract_timestamp" && len(tys) == 1 && tys[0].kind == rtUuid:
+		fn, result = sfUuidExtractTimestamp, Timestamptz
+	// uuid generators (spec/design/entropy.md §3): volatile; uuidv7 takes an optional interval shift.
+	case name == "uuidv4" && len(tys) == 0:
+		fn, result = sfUuidv4, Uuid
+	case name == "uuidv7" && len(tys) == 0:
+		fn, result = sfUuidv7, Uuid
+	case name == "uuidv7" && len(tys) == 1 && tys[0].kind == rtInterval:
+		fn, result = sfUuidv7, Uuid
 	default:
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
@@ -7782,6 +7825,44 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return IntervalValue(iv), nil
+		case sfUuidExtractVersion:
+			// uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a
+			// non-RFC variant (and, for the timestamp, any version other than 1/7). The
+			// NULL-input case is already handled above.
+			if v, ok := uuidExtractVersion([]byte(vals[0].Str)); ok {
+				return IntValue(v), nil
+			}
+			return NullValue(), nil
+		case sfUuidExtractTimestamp:
+			if mc, ok := uuidExtractTimestampMicros([]byte(vals[0].Str)); ok {
+				return TimestamptzValue(mc), nil
+			}
+			return NullValue(), nil
+		case sfUuidv4:
+			// uuid generators (spec/design/entropy.md §3): draw from the per-statement seam
+			// (env.rng), advancing the PRNG/counter. The NULL-arg case is handled above.
+			b, err := env.rng.uuidV4(&env.exec.seam)
+			if err != nil {
+				return Value{}, err
+			}
+			return UuidValue(b), nil
+		case sfUuidv7:
+			clock := env.rng.statementClockMicros(&env.exec.seam)
+			shifted := clock
+			if len(vals) == 1 {
+				// The optional interval arg shifts the embedded instant via the existing
+				// calendar-aware timestamptz arithmetic (entropy.md §4).
+				s, err := TsShift(clock, vals[0].Iv, false)
+				if err != nil {
+					return Value{}, err
+				}
+				shifted = s
+			}
+			b, err := env.rng.uuidV7(&env.exec.seam, shifted)
+			if err != nil {
+				return Value{}, err
+			}
+			return UuidValue(b), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; float64 for the rest, per the catalog).

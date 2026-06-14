@@ -28,12 +28,14 @@ pub mod parser;
 pub mod pmap;
 #[cfg(test)]
 mod recovery;
+pub mod seam;
 pub mod shared;
 pub mod spill;
 pub mod storage;
 pub mod timestamp;
 pub mod token;
 pub mod types;
+pub mod uuid;
 pub mod value;
 
 pub use api::{PreparedStatement, Rows, Transaction};
@@ -153,6 +155,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.round",
     // Named-argument notation + DEFAULT parameter values, via make_interval — functions.md §11.
     "func.named_arguments",
+    // Pure uuid extractors (uuid_extract_version/_timestamp) — functions.md §12.
+    "func.uuid_extract",
+    // Volatile uuid generators (uuidv4/uuidv7) on the entropy+clock seam — entropy.md.
+    "func.uuid_generate",
     "null.three_valued",
     "compare.promotion",
     "cast.explicit",

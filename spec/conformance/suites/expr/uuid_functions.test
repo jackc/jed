@@ -1,0 +1,91 @@
+# UUID extractor functions (spec/design/functions.md §12) — the PURE inspectors
+# uuid_extract_version(uuid) → int16 and uuid_extract_timestamp(uuid) → timestamptz.
+# PostgreSQL-18-oracle-verified. Both gate on the RFC 4122 variant ((byte 8 & 0xC0) == 0x80):
+# a non-RFC variant (Microsoft GUID, the nil uuid) yields NULL from both. uuid_extract_version
+# returns the version nibble (0..15) for an RFC value; uuid_extract_timestamp returns the
+# embedded instant for VERSION 1 and 7 ONLY (v7 = the 48-bit ms field ×1000; v1 = the 60-bit
+# Gregorian 100-ns count minus the 1582→1970 epoch offset, truncated to micros) and NULL for
+# every other version — v6 included, matching PG 18. NULL input propagates. Both are immutable
+# (deterministic functions of their input bits); the volatile generators uuidv4()/uuidv7() land
+# in a later slice. timestamptz renders UTC (`+00`) under the `T` tag. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.int32, types.int16, types.uuid, types.timestamptz, func.uuid_extract, resource.cost_metering
+
+statement ok
+CREATE TABLE u (id int32 PRIMARY KEY, val uuid)
+
+# One row per case: v4, v7, v1, v6, the nil uuid, a non-RFC variant (top variant bits 00), a
+# Microsoft-GUID variant (top bits 11), and a NULL value.
+statement ok
+INSERT INTO u VALUES
+  (1, '5b2cc7f0-9a3e-4e7b-8c1d-2f3a4b5c6d7e'),
+  (2, '0190b6f7-8000-7000-8000-000000000000'),
+  (3, 'c232ab00-9414-11ec-b3c8-9e6bdeced846'),
+  (4, '1ec9414c-232a-6b00-b3c8-9e6bdeced846'),
+  (5, '00000000-0000-0000-0000-000000000000'),
+  (6, '5b2cc7f0-9a3e-4e7b-0c1d-2f3a4b5c6d7e'),
+  (7, '5b2cc7f0-9a3e-4e7b-cc1d-2f3a4b5c6d7e'),
+  (8, NULL)
+
+# --- version: the version nibble for an RFC value; NULL off-variant and for NULL input -------
+query II nosort
+SELECT id, uuid_extract_version(val) FROM u ORDER BY id
+----
+1
+4
+2
+7
+3
+1
+4
+6
+5
+NULL
+6
+NULL
+7
+NULL
+8
+NULL
+
+# --- timestamp: v1 and v7 only; NULL for v4/v6/off-variant/NULL input -----------------------
+query IT nosort
+SELECT id, uuid_extract_timestamp(val) FROM u ORDER BY id
+----
+1
+NULL
+2
+2024-07-15 15:16:31.872+00
+3
+2022-02-22 19:22:22+00
+4
+NULL
+5
+NULL
+6
+NULL
+7
+NULL
+8
+NULL
+
+# --- both inspectors together, on the v7 row -----------------------------------------------
+query IIT nosort
+SELECT id, uuid_extract_version(val), uuid_extract_timestamp(val) FROM u WHERE id = 2
+----
+2
+7
+2024-07-15 15:16:31.872+00
+
+# --- a literal uuid argument (the `uuid '...'` typed literal), FROM-less; the v1 row's
+# sub-microsecond 100-ns ticks (…ab07) truncate to the same micros as the round value (…ab00).
+# cost: 2
+query T nosort
+SELECT uuid_extract_timestamp(uuid 'c232ab07-9414-11ec-b3c8-9e6bdeced846')
+----
+2022-02-22 19:22:22+00
+
+# cost: 2
+query I nosort
+SELECT uuid_extract_version(uuid '0190b6f7-8000-7000-8000-000000000000')
+----
+7

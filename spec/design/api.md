@@ -301,6 +301,8 @@ only and the engine has no wire protocol).
 | rows cost | `rows.cost()` | `rows.Cost()` | `rows.cost` |
 | rows affected (§4) | `Outcome::Statement { rows_affected: Option<i64>, .. }` | `outcome.RowsAffected, outcome.HasRowsAffected` | `outcome.rowsAffected: number \| null` |
 | set cost ceiling (§8) | `db.set_max_cost(limit)` | `db.SetMaxCost(limit)` | `db.setMaxCost(limit)` |
+| inject random source (§10) | `db.set_random_source(f)` / `db.clear_random_source()` | `db.SetRandomSource(f)` / `db.ClearRandomSource()` | `db.setRandomSource(f)` / `db.clearRandomSource()` |
+| inject clock source (§10) | `db.set_clock_source(f)` / `db.clear_clock_source()` | `db.SetClockSource(f)` / `db.ClearClockSource()` | `db.setClockSource(f)` / `db.clearClockSource()` |
 | table lookup (catalog) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*Table, bool)` | `db.table(name): Table \| undefined` |
 | table names (catalog) | `db.table_names() -> Vec<String>` | `db.TableNames() []string` | `db.tableNames(): string[]` |
 
@@ -375,3 +377,28 @@ options object on `execute`/`prepare`) stays open for later without changing thi
 - **No browser/OPFS host** — the Node `fs` host is built here; the OPFS host is a sibling
   storage host added later ([storage.md](storage.md) §2, CLAUDE.md §9).
 - **No low-level direct-access API** — kept open, not built ([storage.md](storage.md) §5).
+
+## 10. Entropy + clock seam (`set_random_source` / `set_clock_source`)
+
+The volatile UUID generators (`uuidv4`, `uuidv7`) read two host inputs behind seams
+([entropy.md](entropy.md), [determinism.md](determinism.md) §5) so they stay deterministic given
+those inputs. The inputs are injected as **functions**, each defaulting to the platform primitive.
+Like `max_cost`/`work_mem`, they are **handle settings** — not stored in the file, not per-statement
+arguments — configured once on whatever handle runs the generators:
+
+- **`set_random_source(f)` / `clear_random_source()`** — inject a function that fills N random bytes
+  (the deterministic / reproducible path) or clear it. **The default draws from the OS CSPRNG per
+  value, so production UUIDs are unpredictable** — not derived from a single seeded PRNG. The engine
+  provides **`seeded_random_source(u64)`** (a byte-exact splitmix64 stream — entropy.md §2) for the
+  reproducible path; the conformance corpus injects it via the **`# seed:`** directive
+  ([conformance.md](conformance.md) §4).
+- **`set_clock_source(f)` / `clear_clock_source()`** — inject a function returning micros since the
+  Unix epoch that `uuidv7` embeds, or clear it (the default: the wall clock, read once per statement
+  — entropy.md §5). The engine provides **`fixed_clock(i64)`**; the corpus injects it via the
+  **`# clock:`** directive.
+
+Defaults (unset) read **OS entropy per value** and the **wall clock**: Go `crypto/rand` + `time`, TS
+`node:crypto` + `Date`, Rust the `getrandom` crate (the one core dependency, CLAUDE.md §14) +
+`SystemTime`. Neither setting changes what a non-generator query observes; a generator's *cost* is
+invariant to both (one `operator_eval` per call). An out-of-range injected clock makes `uuidv7`
+trap `22008`.

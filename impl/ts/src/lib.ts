@@ -106,6 +106,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "func.round",
   // Named-argument notation + DEFAULT parameter values, via make_interval — functions.md §11.
   "func.named_arguments",
+  // Pure uuid extractors (uuid_extract_version/_timestamp) — functions.md §12.
+  "func.uuid_extract",
+  // Volatile uuid generators (uuidv4/uuidv7) on the entropy+clock seam — entropy.md.
+  "func.uuid_generate",
   "null.three_valued",
   "compare.promotion",
   "cast.explicit",
@@ -210,3 +214,5 @@ export { PreparedStatement, Rows, Transaction, prepare, query, querySql, begin, 
 export { create, open, commit, rollback, close, residentLeaves } from "./file.ts";
 export type { DatabaseOptions, OpenOptions } from "./file.ts";
 export { ReadHandle, SharedDb, WriteHandle } from "./shared.ts";
+export { fixedClock, seededRandomSource } from "./seam.ts";
+export type { ClockFunc, RandomFill } from "./seam.ts";

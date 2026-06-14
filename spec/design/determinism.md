@@ -125,24 +125,31 @@ value can at worst reorder a query result, never the *stored* order.
 
 ## 5. Push it to the boundary — the clock and entropy seams (class B)
 
-**Status: proposed.** This is the jed-idiomatic move and it collapses almost all of class
-**B** back into the deterministic contract. Do not make *the engine* non-deterministic; make
+**Status: RATIFIED for the UUID generators** (`uuidv4`/`uuidv7`, [entropy.md](entropy.md); the
+ledger entries `uuidv4-entropy` / `uuidv7-clock-entropy`); **proposed** for the rest of class B
+(`now()` / `current_timestamp` / a general `random()`), which reuse this exact seam when they
+land. This is the jed-idiomatic move and it collapses almost all of class **B** back into the
+deterministic contract. Do not make *the engine* non-deterministic; make
 the engine a **deterministic function of two new host inputs**, behind seams — exactly like
 the storage seam (CLAUDE.md §9, [storage.md](storage.md)):
 
-- **Clock seam** — `now()` / `current_timestamp` read it. Production returns the wall clock;
-  tests inject a fixed instant. The injected path is fully G1+G2 (every core, given the same
-  injected instant, renders byte-identical).
-- **Entropy seam** — `gen_random_uuid()` (v4) and unseeded `random()` draw from it.
-  Production reads the OS RNG; tests inject a fixed seed.
-- **A spec'd PRNG as shared data** (CLAUDE.md §5) — pin one algorithm (PCG / xoshiro),
-  byte-for-byte, the way CRC-32 and the decimal limb arithmetic are already hand-rolled
-  identically across cores ([decimal.md](decimal.md) §1). Then `setseed(s); random()` is
-  **cross-core identical**, and even `gen_random_uuid` is reproducible under an injected seed.
+- **Clock seam** — `now()` / `current_timestamp` read it. The host injects a clock *function*;
+  production returns the wall clock, tests inject a fixed instant (entropy.md §6). The injected path
+  is fully G1+G2 (every core, given the same injected instant, renders byte-identical).
+- **Entropy seam** — `gen_random_uuid()` (v4) and unseeded `random()` draw from it. The host injects
+  a random-bytes *function*; **production's default reads the OS CSPRNG per value** (so output is
+  unpredictable — not reconstructable from one sample, the security posture), and tests inject the
+  engine's provided deterministic source.
+- **A spec'd PRNG as shared data** (CLAUDE.md §5) — one algorithm pinned byte-for-byte, the way
+  CRC-32 and the decimal limb arithmetic are already hand-rolled identically across cores
+  ([decimal.md](decimal.md) §1). **Landed: splitmix64** ([entropy.md](entropy.md) §2,
+  [../encoding/prng.toml](../encoding/prng.toml) + `prng_verify.rb`) as the engine's *provided
+  deterministic source* (injectable for reproducibility, **not** the production default), so
+  `uuidv4`/`uuidv7` are **cross-core identical** when it is injected; a future `random()` reuses it.
 
-The result: the corpus tests `now()` / `random()` / `uuid` with **injected clock+seed and
-exact assertions** — G1+G2 preserved. The *only* irreducible production non-determinism left
-in class **B** is the raw clock read and the raw entropy draw; everything downstream (the
+The result: the corpus tests `now()` / `random()` / `uuid` with **injected clock+random-source and
+exact assertions** — G1+G2 preserved. The *only* irreducible production non-determinism left in
+class **B** is the raw clock read and the raw per-value entropy draws; everything downstream (the
 rendering of `now()`, the bit-layout of a UUID, the distribution of `random()`) stays in the
 deterministic, honesty-mechanism-covered world.
 
@@ -375,7 +382,7 @@ When a section here moves from proposed/unratified to ratified, update **in the 
 | §2 class **U** | Row order without `ORDER BY` | **ratified** (already `rowsort`, conformance.md §4) |
 | §3 | Non-members (limits, collation, iteration-order) | **ratified** (restates existing rules) |
 | §4 | Containment / no-contamination invariant | **proposed** |
-| §5 class **B** | Clock + entropy seams, spec'd PRNG | **proposed** |
+| §5 class **B** | Clock + entropy seams, spec'd PRNG | **ratified** for `uuidv4`/`uuidv7` ([entropy.md](entropy.md)); **proposed** for `now()`/`random()` |
 | §6 class **A** | Binary floats (`float64`) | **ratified** — spec + ledger authored, cores in progress ([float.md](float.md)) |
 | §7 class **P** | Parallelism = optimization; `order_sensitive` flag | **proposed framework** |
 | §8 class **P** | Plan-dependent observables / cost-identity fork | **unratified** (open) |

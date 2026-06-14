@@ -7,7 +7,15 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
-import { Database, EngineError, execute, render, SUPPORTED_CAPABILITIES } from "../lib.ts";
+import {
+  Database,
+  EngineError,
+  execute,
+  fixedClock,
+  render,
+  seededRandomSource,
+  SUPPORTED_CAPABILITIES,
+} from "../lib.ts";
 
 function suitesDir(): string {
   let dir = import.meta.dirname; // .../impl/ts/src/bin
@@ -183,6 +191,30 @@ function parseMaxCostDirective(line: string): bigint | null {
   }
 }
 
+// parseSeedDirective parses a `# seed: N` directive line (spec/design/entropy.md §6): the fixed
+// PRNG seed (u64) to run the next record under, making the uuid generators cross-core identical.
+function parseSeedDirective(line: string): bigint | null {
+  const m = line.match(/^#\s*seed:\s*(\S+)/);
+  if (!m) return null;
+  try {
+    return BigInt.asUintN(64, BigInt(m[1]!));
+  } catch {
+    return null;
+  }
+}
+
+// parseClockDirective parses a `# clock: N` directive line (entropy.md §6): the fixed statement
+// clock (i64 micros since the Unix epoch) to run the next record under, fixing uuidv7's instant.
+function parseClockDirective(line: string): bigint | null {
+  const m = line.match(/^#\s*clock:\s*(-?\S+)/);
+  if (!m) return null;
+  try {
+    return BigInt(m[1]!);
+  } catch {
+    return null;
+  }
+}
+
 // assertCost checks the accrued execution cost matches a pending `# cost:` directive.
 function assertCost(expected: bigint | null, actual: bigint, sql: string): void {
   if (expected !== null && expected !== actual) {
@@ -243,6 +275,8 @@ function runFile(text: string): void {
   let pendingNames: string[] | null = null;
   let pendingTypes: string[] | null = null;
   let pendingMaxCost: bigint | null = null;
+  let pendingSeed: bigint | null = null;
+  let pendingClock: bigint | null = null;
   while (c.i < lines.length) {
     const line = lines[c.i]!.trim();
     if (line === "") {
@@ -254,10 +288,16 @@ function runFile(text: string): void {
       // comment is ignored.
       const n = parseCostDirective(line);
       const mc = parseMaxCostDirective(line);
+      const sd = parseSeedDirective(line);
+      const ck = parseClockDirective(line);
       if (n !== null) {
         pendingCost = n;
       } else if (mc !== null) {
         pendingMaxCost = mc;
+      } else if (sd !== null) {
+        pendingSeed = sd;
+      } else if (ck !== null) {
+        pendingClock = ck;
       } else {
         const names = parseNamesDirective(line);
         if (names !== null) {
@@ -280,6 +320,14 @@ function runFile(text: string): void {
     // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
     db.setMaxCost(pendingMaxCost ?? 0n);
     pendingMaxCost = null;
+    // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md §6);
+    // absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
+    if (pendingSeed !== null) db.setRandomSource(seededRandomSource(pendingSeed));
+    else db.clearRandomSource();
+    pendingSeed = null;
+    if (pendingClock !== null) db.setClockSource(fixedClock(pendingClock));
+    else db.clearClockSource();
+    pendingClock = null;
     const fields = line.split(/\s+/);
     if (fields[0] === "statement") {
       // `# names:` / `# types:` assert result columns, which a statement lacks.

@@ -101,6 +101,10 @@ var SupportedCapabilities = []string{
 	"func.round",
 	// Named-argument notation + DEFAULT parameter values, via make_interval — functions.md §11.
 	"func.named_arguments",
+	// Pure uuid extractors (uuid_extract_version/_timestamp) — functions.md §12.
+	"func.uuid_extract",
+	// Volatile uuid generators (uuidv4/uuidv7) on the entropy+clock seam — entropy.md.
+	"func.uuid_generate",
 	"null.three_valued",
 	"compare.promotion",
 	"cast.explicit",

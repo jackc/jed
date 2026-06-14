@@ -125,6 +125,7 @@ desc "Verify the spec data tables and byte fixtures"
 task :verify do
   checks = [
     ["key encoding", "spec/encoding/verify.rb"],
+    ["prng + uuid fixtures", "spec/encoding/prng_verify.rb"],
     ["conformance taxonomy", "spec/conformance/verify.rb"],
     ["file format", "spec/fileformat/verify.rb"],
     ["function catalog", "spec/functions/verify.rb"],

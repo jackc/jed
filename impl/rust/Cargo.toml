@@ -15,6 +15,11 @@ name = "conformance"
 path = "src/bin/conformance.rs"
 
 [dependencies]
+# OS entropy for the uuid generators' production path (spec/design/entropy.md §6). Rust `std`
+# has no OS RNG; the engine reads one u64 seed per statement only when a generator runs unseeded
+# (tests inject a fixed seed and never touch this). Approved under CLAUDE.md §14 (the user's
+# "engine reads OS entropy" decision); Go/TS use their stdlib (crypto/rand, node:crypto).
+getrandom = "0.3"
 
 [dev-dependencies]
 # TOML is a TEST-TIME ONLY dependency (CLAUDE.md §5): the cross-check tests read the

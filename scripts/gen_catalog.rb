@@ -77,6 +77,7 @@ def rust_entry(op)
     "        errors: #{rust_slice(op['errors'])},",
     "        arg_names: #{rust_slice(op['arg_names'] || [])},",
     "        arg_defaults: #{rust_slice(op['arg_defaults'] || [])},",
+    "        volatility: #{rust_str(op['volatility'] || 'immutable')},",
     "    },",
   ].join("\n")
 end
@@ -137,6 +138,9 @@ def rust_file(ops, aggs, srfs)
         pub arg_names: &'static [&'static str],
         /// Integer-literal DEFAULTs for the trailing parameters; empty = none.
         pub arg_defaults: &'static [&'static str],
+        /// Value-stability class (functions.md §12): "immutable" | "stable" | "volatile".
+        /// Default "immutable"; marks a call non-foldable (advisory today).
+        pub volatility: &'static str,
     }
 
     /// Every operator in the catalog, in catalog order.
@@ -209,6 +213,7 @@ def go_entry(op)
     ["Errors",        go_slice(op["errors"])],
     ["ArgNames",      go_slice(op["arg_names"] || [])],
     ["ArgDefaults",   go_slice(op["arg_defaults"] || [])],
+    ["Volatility",    go_str(op["volatility"] || "immutable")],
   ]
   w = fields.map { |k, _| k.length }.max
   lines = fields.map { |k, v| "\t\t#{k}:#{' ' * (w - k.length + 1)}#{v}," }
@@ -275,6 +280,9 @@ def go_file(ops, aggs, srfs)
     \t// empty = none. ArgDefaults holds integer-literal DEFAULTs for the trailing parameters.
     \tArgNames    []string
     \tArgDefaults []string
+    \t// Volatility is the value-stability class (functions.md §12): "immutable" | "stable" |
+    \t// "volatile". Default "immutable"; marks a call non-foldable (advisory today).
+    \tVolatility string
     }
 
     // Operators lists every operator in the catalog, in catalog order.
@@ -344,6 +352,7 @@ def ts_entry(op)
   lines << "    errors: #{ts_arr(op['errors'])},"
   lines << "    argNames: #{ts_arr(op['arg_names'] || [])},"
   lines << "    argDefaults: #{ts_arr(op['arg_defaults'] || [])},"
+  lines << "    volatility: #{ts_str(op['volatility'] || 'immutable')},"
   lines << "  },"
   lines.join("\n")
 end
@@ -402,6 +411,9 @@ def ts_file(ops, aggs, srfs)
       argNames: readonly string[];
       // Integer-literal DEFAULTs for the trailing parameters; empty = none.
       argDefaults: readonly string[];
+      // Value-stability class (functions.md §12): "immutable" | "stable" | "volatile".
+      // Default "immutable"; marks a call non-foldable (advisory today).
+      volatility: string;
     }
 
     // Every operator in the catalog, in catalog order.

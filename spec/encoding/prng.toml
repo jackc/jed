@@ -1,0 +1,36 @@
+# PRNG + UUID-generator byte fixtures (CANONICAL DATA — CLAUDE.md §5/§8).
+#
+# The byte-exact contract for the entropy seam (spec/design/entropy.md): the splitmix64 stream and
+# the v4/v7 UUID byte layout. Verified by spec/encoding/prng_verify.rb — an INDEPENDENT Ruby
+# reference implementation that recomputes every value from the algorithm and asserts these
+# fixtures match (the third voice beyond the Rust/Go/TS cores — CLAUDE.md §8). The same values are
+# pinned in the conformance corpus (suites/expr/uuid_generate.test), run by all three cores, so
+# agreement here means Ruby == Rust == Go == TS on the PRNG + UUID bytes.
+
+schema_version = 1
+
+# --- splitmix64 streams: seed → the first N u64 outputs (16-hex, big-endian) ----------------
+[[stream]]
+seed = 1
+outputs = ["910a2dec89025cc1", "beeb8da1658eec67", "f893a2eefb32555e", "71c18690ee42c90b", "71bb54d8d101b5b9"]
+
+[[stream]]
+seed = 1234567
+outputs = ["599ed017fb08fc85", "2c73f08458540fa5", "883ebce5a3f27c77", "3fbef740e9177b3f", "e3b8346708cb5ecd"]
+
+# --- uuidv4: a seeded stream's first v4 = two draws (big-endian) + version 4 + RFC variant ---
+[[uuidv4]]
+seed = 1
+uuid = "910a2dec-8902-4cc1-beeb-8da1658eec67"
+
+[[uuidv4]]
+seed = 2
+uuid = "975835de-1c97-46ce-bfc8-46100bfc1e42"
+
+# --- uuidv7: a 48-bit ms field, a per-statement monotonic counter in rand_a, one random draw --
+# in rand_b. `uuids` is the sequence produced by successive calls in one statement (counter 0, 1,
+# …) at the fixed clock — pinning both the timestamp embedding and the monotonic counter.
+[[uuidv7]]
+seed = 1
+clock_micros = 1721056591872000
+uuids = ["0190b6f7-8000-7000-910a-2dec89025cc1", "0190b6f7-8000-7001-beeb-8da1658eec67"]
