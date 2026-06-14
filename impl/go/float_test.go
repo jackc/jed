@@ -66,7 +66,8 @@ func TestFloatImageRoundTrip(t *testing.T) {
 	// The on-disk single-file image (the §8 cross-core round-trip contract) preserves float bits
 	// verbatim — incl -0 / ±Inf — across a serialize + reload (a NaN canonicalizes to one quiet
 	// pattern but stays a NaN; float.md §10).
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE f (id int32 PRIMARY KEY, a float32, b float64)",
 		"INSERT INTO f VALUES (1, '1.5', 'NaN')",
 		"INSERT INTO f VALUES (2, '-0', '-Infinity')",
@@ -96,7 +97,8 @@ func TestFloatImageRoundTrip(t *testing.T) {
 }
 
 func TestFloatStoredNegZeroPreservesBits(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE f (id int32 PRIMARY KEY, x float64)",
 		"INSERT INTO f VALUES (1, '-0')",
 		"INSERT INTO f VALUES (2, '0')",
@@ -120,7 +122,9 @@ func TestFloatTotalOrderComparator(t *testing.T) {
 		a, b float64
 		want int
 	}{
-		{ninf, -1, -1}, {-1, pinf, -1}, {pinf, nan, -1}, // -inf < finite < +inf < NaN
+		{ninf, -1, -1},
+		{-1, pinf, -1},
+		{pinf, nan, -1}, // -inf < finite < +inf < NaN
 		{nan, nan, 0},   // all NaNs equal
 		{negz, posz, 0}, // -0 == +0
 		{nan, pinf, 1},  // NaN largest
@@ -135,7 +139,8 @@ func TestFloatTotalOrderComparator(t *testing.T) {
 }
 
 func TestFloatNaNEqualsNaNIsTrue(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE f (id int32 PRIMARY KEY, x float64)",
 		"INSERT INTO f VALUES (1, 'NaN')",
 		"INSERT INTO f VALUES (2, 'NaN')",
@@ -152,7 +157,8 @@ func TestFloatNaNEqualsNaNIsTrue(t *testing.T) {
 }
 
 func TestFloatOrderByPlacesNaNLast(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE f (id int32 PRIMARY KEY, x float64)",
 		"INSERT INTO f VALUES (1, 'NaN')",
 		"INSERT INTO f VALUES (2, '-Infinity')",
@@ -169,7 +175,8 @@ func TestFloatOrderByPlacesNaNLast(t *testing.T) {
 }
 
 func TestFloatDistinctCollapsesNaNAndZeroSigns(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE f (id int32 PRIMARY KEY, x float64)",
 		"INSERT INTO f VALUES (1, 'NaN')",
 		"INSERT INTO f VALUES (2, 'NaN')",
@@ -217,7 +224,8 @@ func TestFloatInfNaNOperandPropagateNoTrap(t *testing.T) {
 // --- the promotion tower: float32 + float64 → float64 -------------------------------------
 
 func TestFloatMixedWidthArithmeticPromotes(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE f (id int32 PRIMARY KEY, a float32, b float64)",
 		"INSERT INTO f VALUES (1, '1.5', '2.25')",
 	)
@@ -351,13 +359,15 @@ func TestFloatSumIsOrderIndependent(t *testing.T) {
 	// Classic non-associative case: 1e16 + 1 + -1e16. Naive left-fold in input order loses the 1;
 	// the canonical-order fold sorts first, so it is order-independent and identical regardless of
 	// the INSERT order. Both orders must agree (the in-contract cross-core guarantee).
-	dbA := dbWith(t,
+	dbA := dbWith(
+		t,
 		"CREATE TABLE f (id int32 PRIMARY KEY, x float64)",
 		"INSERT INTO f VALUES (1, '1e16')",
 		"INSERT INTO f VALUES (2, '1')",
 		"INSERT INTO f VALUES (3, '-1e16')",
 	)
-	dbB := dbWith(t,
+	dbB := dbWith(
+		t,
 		"CREATE TABLE f (id int32 PRIMARY KEY, x float64)",
 		"INSERT INTO f VALUES (1, '-1e16')",
 		"INSERT INTO f VALUES (2, '1e16')",
@@ -429,7 +439,8 @@ func TestFloatAvgEmptyIsNull(t *testing.T) {
 }
 
 func TestFloatMinMaxTotalOrder(t *testing.T) {
-	db := dbWith(t,
+	db := dbWith(
+		t,
 		"CREATE TABLE f (id int32 PRIMARY KEY, x float64)",
 		"INSERT INTO f VALUES (1, 'NaN')",
 		"INSERT INTO f VALUES (2, '-5')",
