@@ -5,7 +5,8 @@
 # only for a literal operand. Unknown type name → 42704, malformed → 22P02, out of range → 22003.
 # A runtime text→T cast on a non-literal text expression stays deferred (0A000); a bare string still
 # does not silently coerce to a number/bool. For integer/decimal jed uses its OWN literal grammar:
-# hex/underscore/scientific/NaN trap 22P02 where PG accepts them (documented §36 divergences).
+# scientific `e`-notation IS accepted (`numeric '1.5e3'` → 1500, §14), but hex/underscore/NaN still
+# trap 22P02 where PG accepts them (documented §36 divergences).
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.int16, types.int32, types.int64, types.decimal, types.boolean, types.text, types.bytea, types.uuid, expr.arithmetic, cast.explicit, cast.string_literal
 
 # --- integer typed literals ------------------------------------------------------------
@@ -202,10 +203,36 @@ SELECT integer '0x10'
 statement error 22P02
 SELECT integer '1_000'
 
-# scientific notation: PG accepts `numeric '1.5e3'` → 1500; jed traps 22P02
-statement error 22P02
-SELECT numeric '1.5e3'
-
 # NaN: PG accepts `numeric 'NaN'`; jed's decimal is always finite, so 22P02
 statement error 22P02
 SELECT numeric 'NaN'
+
+# --- scientific e-notation in a typed/cast string (now accepted, matching PG — grammar.md §14) ---
+# jed's text→decimal coercion shares the decimal-literal grammar, so `numeric '1.5e3'` parses the
+# same e-notation as a bare 1.5e3: scale = max(0, frac - exp), value shifted by 10^exponent.
+query D nosort
+SELECT numeric '1.5e3'
+----
+1500
+
+query D nosort
+SELECT numeric '-1.50e-3'
+----
+-0.00150
+
+query D nosort
+SELECT '2.5e2'::numeric
+----
+250
+
+# but an INCOMPLETE exponent in an isolated string is malformed — unlike the lexer (which leaves a
+# bare `e` for the next token), a `type 'string'` value must be a COMPLETE numeric: `1.5e` / `1e+` /
+# `1e2e3` all trap 22P02, matching PG's numeric_in.
+statement error 22P02
+SELECT numeric '1.5e'
+
+statement error 22P02
+SELECT numeric '1e+'
+
+statement error 22P02
+SELECT numeric '1e2e3'

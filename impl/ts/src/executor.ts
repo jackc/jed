@@ -36,7 +36,17 @@ import {
 } from "./catalog.ts";
 import { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
-import { Decimal, MAX_PRECISION, MAX_SCALE, workDiv, workLinear, workMod, workMul } from "./decimal.ts";
+import {
+  Decimal,
+  decimalFromParts,
+  EXP_LIMIT,
+  MAX_PRECISION,
+  MAX_SCALE,
+  workDiv,
+  workLinear,
+  workMod,
+  workMul,
+} from "./decimal.ts";
 import { encodeInt } from "./encoding.ts";
 import { type EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
@@ -5425,9 +5435,10 @@ function parseIntLiteral(s: string, ty: ScalarType): bigint {
 // parseDecimalLiteral parses a string literal's content as a decimal — the text→decimal coercion
 // for NUMERIC '1.5' / CAST('1.5' AS numeric) (grammar.md §36). jed's OWN decimal-literal grammar:
 // trimmed ASCII whitespace, optional sign, ASCII digits with at most one '.' and a digit on at
-// least one side — built into the SAME (neg, digits, scale) the lexer feeds Decimal.fromDigitsScale,
-// so NUMERIC 'x' is byte-identical to writing x. NO scientific / NaN / Infinity (22P02). Caller
-// applies typmod / cap-check.
+// least one side, plus optional scientific e-notation (numeric '1.5e3' → 1500) — built into the SAME
+// (digits, scale) the lexer feeds Decimal.fromDigitsScale (via the shared decimalFromParts), so
+// NUMERIC 'x' is byte-identical to writing x. NO NaN / Infinity and no hex/underscore (22P02).
+// Caller applies typmod / cap-check.
 function parseDecimalLiteral(s: string): Decimal {
   const invalid = (): Error =>
     engineError("invalid_text_representation", `invalid input syntax for type numeric: "${s}"`);
@@ -5439,9 +5450,39 @@ function parseDecimalLiteral(s: string): Decimal {
   } else if (t.startsWith("+")) {
     t = t.slice(1);
   }
-  const dot = t.indexOf(".");
-  const intPart = dot < 0 ? t : t.slice(0, dot);
-  const frac = dot < 0 ? "" : t.slice(dot + 1);
+  // Split off an optional exponent. Unlike the lexer (which leaves a bare e for the next token), an
+  // isolated string must be a COMPLETE numeric, so an e with no [+-]?digit+ after it is malformed
+  // (22P02), matching PG's numeric_in.
+  let mantissa = t;
+  let exp: number | null = null;
+  const ei = t.search(/[eE]/);
+  if (ei >= 0) {
+    mantissa = t.slice(0, ei);
+    let e = t.slice(ei + 1);
+    let eneg = false;
+    if (e.startsWith("-")) {
+      eneg = true;
+      e = e.slice(1);
+    } else if (e.startsWith("+")) {
+      e = e.slice(1);
+    }
+    if (e === "" || !allAsciiDigits(e)) {
+      throw invalid();
+    }
+    // Clamp the magnitude to EXP_LIMIT while accumulating (bounds the coefficient the shared
+    // builder may materialize).
+    let v = 0;
+    for (let k = 0; k < e.length; k++) {
+      if (v < EXP_LIMIT) {
+        v = v * 10 + (e.charCodeAt(k) - 48);
+        if (v > EXP_LIMIT) v = EXP_LIMIT;
+      }
+    }
+    exp = eneg ? -v : v;
+  }
+  const dot = mantissa.indexOf(".");
+  const intPart = dot < 0 ? mantissa : mantissa.slice(0, dot);
+  const frac = dot < 0 ? "" : mantissa.slice(dot + 1);
   // A second '.' lands in frac (indexOf found the first); reject it.
   if (
     frac.includes(".") ||
@@ -5451,7 +5492,8 @@ function parseDecimalLiteral(s: string): Decimal {
   ) {
     throw invalid();
   }
-  return Decimal.fromDigitsScale(neg, intPart + frac, frac.length);
+  const [digits, scale] = decimalFromParts(intPart, frac, exp);
+  return Decimal.fromDigitsScale(neg, digits, scale);
 }
 
 // parseBoolLiteral parses a string literal's content as a boolean — the text→boolean coercion for

@@ -27,6 +27,14 @@ const (
 	// MaxScale is the max digits after the point ANY value may carry — spec/types/
 	// scalars.toml max_scale (PG NUMERIC_DSCALE_MAX; decimal.md §2).
 	MaxScale = 16383
+	// expLimit is the magnitude clamp for a decimal literal's scientific e-notation exponent,
+	// tied to the format caps so lexing/parsing stays bounded — 1e9999999999 must not
+	// materialize a gigabyte of coefficient zeros — without changing any outcome: an exponent
+	// this large already drives the value past the caps (so it traps 22003 at resolve), and a
+	// zero coefficient still normalizes to 0 (spec/design/grammar.md §14). Callers clamp the
+	// exponent magnitude to ±expLimit while scanning (both to honor this bound and to keep the
+	// accumulation inside int64).
+	expLimit = int64(MaxIntDigits) + int64(MaxScale) + 2
 )
 
 // Decimal is an exact base-10 decimal. Neg is the sign (always false for zero — no negative
@@ -74,6 +82,33 @@ func DecimalFromInt64(v int64) Decimal {
 // precision/scale caps (the caller checks them at resolve, trapping 22003).
 func DecimalFromDigitsScale(neg bool, digits string, scale uint32) Decimal {
 	return newDecimal(neg, scale, magFromDecimalStr(digits))
+}
+
+// decimalFromParts is the canonical (coefficient digits, scale) for a decimal literal, from its
+// mantissa (intPart+frac) and an optional scientific exponent (already clamped to ±expLimit by the
+// caller's scanner; hasExp false means no exponent). The display scale is max(0, fracLen-exp); when
+// the exponent drives it below zero the coefficient absorbs the surplus as trailing zeros at
+// scale 0, so the value still reads coefficient × 10^(-scale). Shared by the lexer (bare 1.5e3)
+// and the text→decimal coercion (numeric '1.5e3') so both spell the SAME value
+// (spec/design/grammar.md §14); the result is fed to DecimalFromDigitsScale and cap-checked at
+// resolve.
+func decimalFromParts(intPart, frac string, hasExp bool, exp int64) (string, uint32) {
+	fracLen := int64(len(frac))
+	if !hasExp {
+		return intPart + frac, uint32(fracLen)
+	}
+	effScale := fracLen - exp
+	if effScale >= 0 {
+		return intPart + frac, uint32(effScale)
+	}
+	zeros := int(-effScale)
+	digits := make([]byte, 0, len(intPart)+len(frac)+zeros)
+	digits = append(digits, intPart...)
+	digits = append(digits, frac...)
+	for k := 0; k < zeros; k++ {
+		digits = append(digits, '0')
+	}
+	return string(digits), 0
 }
 
 // IsZero reports whether the value is zero.

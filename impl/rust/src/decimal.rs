@@ -25,6 +25,41 @@ pub const MAX_INT_DIGITS: u32 = 131072;
 /// (PG `NUMERIC_DSCALE_MAX`; spec/design/decimal.md §2).
 pub const MAX_SCALE: u32 = 16383;
 
+/// Magnitude clamp for a decimal literal's scientific `e`-notation exponent. Tied to the
+/// format caps so lexing/parsing stays bounded — `1e9999999999` must not materialize a
+/// gigabyte of coefficient zeros — without changing any outcome: an exponent this large
+/// already drives the value past the caps (so it traps `22003` at resolve), and a zero
+/// coefficient still normalizes to `0` (spec/design/grammar.md §14). Callers clamp the
+/// exponent magnitude to `±EXP_LIMIT` while scanning, both to honor this bound and to keep
+/// the accumulation inside `i64`.
+pub const EXP_LIMIT: i64 = MAX_INT_DIGITS as i64 + MAX_SCALE as i64 + 2;
+
+/// Canonical `(coefficient-digits, scale)` for a decimal literal, from its mantissa
+/// (`int_part` + `frac`) and an optional scientific exponent (already clamped to `±EXP_LIMIT`
+/// by the caller's scanner). The display scale is `max(0, frac_len − exp)`; when the exponent
+/// drives it below zero the coefficient absorbs the surplus as trailing zeros at scale 0, so
+/// the value still reads `coefficient × 10^(−scale)`. Shared by the lexer (bare `1.5e3`) and
+/// the text→decimal coercion (`numeric '1.5e3'`) so both spell the SAME value
+/// (spec/design/grammar.md §14). The result is fed to [`Decimal::from_digits_scale`] and
+/// cap-checked at resolve.
+pub fn decimal_from_parts(int_part: &str, frac: &str, exp: Option<i64>) -> (String, u32) {
+    let frac_len = frac.len() as i64;
+    let Some(exp) = exp else {
+        return (format!("{int_part}{frac}"), frac_len as u32);
+    };
+    let eff_scale = frac_len - exp;
+    if eff_scale >= 0 {
+        (format!("{int_part}{frac}"), eff_scale as u32)
+    } else {
+        let zeros = (-eff_scale) as usize;
+        let mut digits = String::with_capacity(int_part.len() + frac.len() + zeros);
+        digits.push_str(int_part);
+        digits.push_str(frac);
+        digits.extend(std::iter::repeat('0').take(zeros));
+        (digits, 0)
+    }
+}
+
 /// An exact base-10 decimal. `neg` is the sign (always `false` for zero — no negative zero);
 /// `scale` is the display scale; `limbs` is the coefficient magnitude (base 10^9, LSB-first,
 /// no high zero limbs; empty == zero).

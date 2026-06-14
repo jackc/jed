@@ -310,7 +310,7 @@ description = "Explicit CAST(x AS type), including narrowing that may trap"
 
 [[capability]]
 id = "cast.string_literal"
-description = "Typed string literals — PostgreSQL's `type 'string'` form and `CAST(<string literal> AS type)` (spec/design/grammar.md §36): the literal's string is coerced to the NAMED type at resolve (int16/int32/int64, decimal, boolean, text + the string-native bytea/uuid/timestamp/timestamptz/interval). Unknown type name → 42704, malformed → 22P02, out of range → 22003. A runtime text→T cast on a non-literal text expression stays deferred (0A000); a bare string still does not silently coerce to a number/bool (strict, 42804). For integer/decimal, jed's own literal grammar — hex/underscore/scientific/NaN trap 22P02 where PG accepts them"
+description = "Typed string literals — PostgreSQL's `type 'string'` form and `CAST(<string literal> AS type)` (spec/design/grammar.md §36): the literal's string is coerced to the NAMED type at resolve (int16/int32/int64, decimal, boolean, text + the string-native bytea/uuid/timestamp/timestamptz/interval). Unknown type name → 42704, malformed → 22P02, out of range → 22003. A runtime text→T cast on a non-literal text expression stays deferred (0A000); a bare string still does not silently coerce to a number/bool (strict, 42804). For integer/decimal, jed's own literal grammar — scientific `e`-notation is accepted (numeric '1.5e3' → 1500), but hex/underscore/NaN trap 22P02 where PG accepts them"
 
 [[capability]]
 id = "cast.operator"

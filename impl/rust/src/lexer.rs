@@ -1,8 +1,42 @@
 //! Hand-written lexer for the step-1 SQL surface (CLAUDE.md §5: parsers are
 //! per-language, not codegen'd). Produces a flat token vector.
 
+use crate::decimal::{EXP_LIMIT, decimal_from_parts};
 use crate::error::{EngineError, Result, SqlState};
 use crate::token::Token;
+
+/// If `bytes[*i..]` begins a well-formed exponent `[eE][+-]?digit+`, consume it (advancing
+/// `*i`) and return `Some(exponent)` with the magnitude clamped to `±EXP_LIMIT`. Otherwise
+/// leave `*i` unchanged and return `None` — a bare `e` / `ex` is NOT part of the number (it
+/// lexes as the following token, exactly as before e-notation existed; PostgreSQL likewise
+/// rejects `1e` as trailing junk rather than reading it as the number `1`).
+fn scan_exponent(bytes: &[u8], i: &mut usize) -> Option<i64> {
+    let start = *i;
+    if start >= bytes.len() || (bytes[start] != b'e' && bytes[start] != b'E') {
+        return None;
+    }
+    let mut j = start + 1;
+    let mut neg = false;
+    if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+        neg = bytes[j] == b'-';
+        j += 1;
+    }
+    if j >= bytes.len() || !bytes[j].is_ascii_digit() {
+        return None; // not a valid exponent — leave `e` for the next token
+    }
+    let mut exp: i64 = 0;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        if exp < EXP_LIMIT {
+            exp = exp * 10 + (bytes[j] - b'0') as i64;
+            if exp > EXP_LIMIT {
+                exp = EXP_LIMIT;
+            }
+        }
+        j += 1;
+    }
+    *i = j;
+    Some(if neg { -exp } else { exp })
+}
 
 /// Tokenize `sql` into tokens terminated by `Token::Eof`. Whitespace separates
 /// tokens; an integer literal is an unsigned magnitude (the leading `-`, if any, is
@@ -154,29 +188,38 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::Str(s));
             }
             b'0'..=b'9' => {
-                // A numeric literal. Scan the integer digits; if a `.` follows it is a
-                // DECIMAL literal (scan the fractional digits), else an INTEGER literal.
+                // A numeric literal. Scan the integer digits; a following `.` and/or scientific
+                // `e`-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise
+                // it is an INTEGER literal.
                 let start = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
+                let int_part = &sql[start..i];
+                // Optional fractional part: `123.`, `123.45`. The fractional part may be empty.
+                let mut frac = "";
+                let mut has_frac = false;
                 if i < bytes.len() && bytes[i] == b'.' {
-                    // Decimal: `123.`, `123.45`. The fractional part may be empty (`1.`).
-                    let int_part = &sql[start..i];
+                    has_frac = true;
                     i += 1; // consume '.'
                     let frac_start = i;
                     while i < bytes.len() && bytes[i].is_ascii_digit() {
                         i += 1;
                     }
-                    let frac = &sql[frac_start..i];
-                    let digits = format!("{int_part}{frac}");
-                    tokens.push(Token::Decimal(digits, frac.len() as u32));
+                    frac = &sql[frac_start..i];
+                }
+                // Optional exponent (`e3`, `E+2`, `e-10`). Only a well-formed exponent is
+                // consumed; an exponent (even with no `.`) makes the literal a decimal.
+                let exp = scan_exponent(bytes, &mut i);
+                if has_frac || exp.is_some() {
+                    let (digits, scale) = decimal_from_parts(int_part, frac, exp);
+                    tokens.push(Token::Decimal(digits, scale));
                 } else {
                     // Integer literal: an unsigned magnitude. The sign is the `Minus`
                     // operator. The magnitude must be <= 2^63 so that -(2^63) = int64::MIN
                     // is reachable; anything larger cannot be represented (42601). i64
                     // cannot hold 2^63, so carry it unsigned and let the parser convert.
-                    let text = &sql[start..i];
+                    let text = int_part;
                     let n: u64 = text
                         .parse()
                         .map_err(|_| syntax(format!("integer literal out of range: {text}")))?;
@@ -201,7 +244,10 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                         i += 1;
                     }
                     let frac = &sql[frac_start..i];
-                    tokens.push(Token::Decimal(frac.to_string(), frac.len() as u32));
+                    // A leading-dot decimal may also carry an exponent (`.5e2`).
+                    let exp = scan_exponent(bytes, &mut i);
+                    let (digits, scale) = decimal_from_parts("", frac, exp);
+                    tokens.push(Token::Decimal(digits, scale));
                 } else {
                     tokens.push(Token::Dot);
                     i += 1;

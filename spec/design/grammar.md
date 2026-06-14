@@ -118,9 +118,9 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   order, each at most once (§9). There is **no `LIMIT ALL`**, **no `OFFSET … ROWS` /
   `FETCH NEXT … ROWS ONLY`**, and **no SQLite `LIMIT off, cnt` comma form**.
 - **ASCII-only identifiers**, no quoted identifiers (§3).
-- **Literal forms.** Integer, **decimal** (`1.50`, `.5` — §14), **single-quoted string**
-  (the `text` type, `'alice'`, with `''` for an embedded quote), `TRUE`/`FALSE`, and `NULL`.
-  Scientific `e`-notation for decimals (`1.5e3`) is **deferred**. `boolean` exists only as an
+- **Literal forms.** Integer, **decimal** (`1.50`, `.5`, and scientific `e`-notation
+  `1.5e3` / `5e2` / `1e-3` — §14), **single-quoted string** (the `text` type, `'alice'`, with
+  `''` for an embedded quote), `TRUE`/`FALSE`, and `NULL`. `boolean` exists only as an
   *expression* type this slice — there are boolean literals and comparison/logical results,
   but no boolean *column* (see [types.md](types.md) §1).
 - **Function calls — aggregates only.** The expression grammar now has a `function_call`
@@ -434,9 +434,28 @@ literal against an **integer** column is well-typed (the integer promotes to dec
 [../types/compare.toml](../types/compare.toml)), so `WHERE int_col = 1.5` simply never matches
 rather than erroring; but a decimal literal **stored into** an integer column is a `42804`
 type error (the strict matrix has no decimal→integer assignment cast —
-[../types/casts.toml](../types/casts.toml)). Scientific `e`-notation (`1.5e3`) is **deferred**;
-a coefficient beyond `max_precision` significant digits, or a scale beyond `max_scale`
-([../types/scalars.toml](../types/scalars.toml)), traps `22003` at resolve.
+[../types/casts.toml](../types/casts.toml)). A coefficient beyond `max_int_digits` integer-part
+digits, or a scale beyond `max_scale` ([../types/scalars.toml](../types/scalars.toml)), traps
+`22003` at resolve.
+
+**Scientific `e`-notation** (PostgreSQL, `numeric.c` `set_var_from_str`). A significand — with
+a `.` (`1.5e3`, `.5e2`) **or without** (`5e2`, `1e3`) — may carry an exponent
+`[eE][+-]?digit+`. An exponent makes the literal a **decimal** even with no `.` (so `5e2` is the
+decimal `500`, *not* an integer — matching PG, where any exponent forces type `numeric`); a bare
+digit run with no `.` and no exponent stays an integer. The display **scale** is
+`max(0, frac_digits − exponent)` and the value shifts by `10^exponent`: `1.5e3 → 1500` (scale 0),
+`1.50e1 → 15.0` (scale 1), `1.5e-3 → 0.0015` (scale 4), `5e2 → 500` (scale 0), `1.50e-3 → 0.00150`
+(scale 5). When the exponent drives the scale below zero the coefficient absorbs the shift as
+trailing zeros at scale 0. The result is cap-checked at resolve exactly like a written-out literal
+(`1e131072` traps `22003`; `5e2` into an integer column is the same `42804` as any decimal). A
+malformed exponent (`1e`, `1e+`, `1ex` — the `e` not followed by `[+-]?digit`) is **not** consumed
+as part of the number; it lexes as the trailing token and is rejected at parse, like any other
+junk after a literal. The lexer clamps an absurd exponent magnitude (a determinism/resource guard,
+CLAUDE.md §13) so `1e9999999999` cannot materialize a gigabyte of coefficient zeros: a clamped
+exponent always still traps `22003` for a non-zero coefficient, the one documented divergence being
+that a *zero* coefficient with such an exponent (`0e9999999999`) reads as `0` here rather than
+PG's overflow error — an extreme corner the single-field `coefficient × 10^(−scale)`
+representation makes unavoidable.
 
 **The `numeric(p,s)` type modifier** (§6). `numeric` (unconstrained), `numeric(p)`
 (= `numeric(p,0)`), and `numeric(p,s)` are the three forms, in both a column type and a

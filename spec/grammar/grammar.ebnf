@@ -589,9 +589,10 @@ literal        ::= "-"? number
 /* A `number` is an UNSIGNED numeric literal: either an integer or a decimal. The
  * sign, if any, is the unary-minus operator (so "- 5" with a space is legal, and
  * "-5" is the operator applied to "5", folded at parse time). The lexer scans one
- * run of digits-and-an-optional-point and emits an INTEGER token if there is no
- * "." and a DECIMAL token otherwise — so the integer paths (LIMIT/OFFSET `count`,
- * the typmod, array arity) are unaffected. */
+ * run of digits with an optional fractional point and an optional scientific exponent,
+ * emitting an INTEGER token only when there is NEITHER a "." NOR an exponent and a DECIMAL
+ * token otherwise — so the integer paths (LIMIT/OFFSET `count`, the typmod, array arity)
+ * are unaffected (a bare digit run is still an integer). */
 number         ::= decimal | integer
 
 /* An integer is an UNSIGNED magnitude of digits; its magnitude must be <= 2^63
@@ -601,16 +602,25 @@ number         ::= decimal | integer
  * fits no signed integer type and traps 22003 at resolve time. */
 integer        ::= digit+
 
-/* A decimal literal has a "." with digits on at least one side (`1.5`, `1.`, `.5`,
- * `0.00`). Its written form fixes its value AND its scale (number of fractional
- * digits): `1.50` is coefficient 150, scale 2 — distinct in display from `1.5`
- * (scale 1) though equal in value. The coefficient's significant-digit count must be
- * <= max_precision and the scale <= max_scale (../types/scalars.toml; else 22003 at
- * resolve). A decimal literal is an untyped decimal constant that adapts to its
- * context (../design/types.md §6, extended to decimal). Scientific `e`-notation
- * (`1.5e3`) is DEFERRED (../design/grammar.md). */
-decimal        ::= digit+ "." digit*
+/* A decimal literal is either a "."-bearing significand (digits on at least one side —
+ * `1.5`, `1.`, `.5`, `0.00`) or ANY significand followed by a scientific `e`-notation
+ * exponent (`5e2`, `1.5e3`, `.5e-2`, `1e3`). A plain digit run with neither a "." nor an
+ * exponent is an INTEGER, not a decimal. The written form fixes the value AND the scale
+ * (number of fractional digits): `1.50` is coefficient 150, scale 2 — distinct in display
+ * from `1.5` (scale 1) though equal in value. With an exponent the scale is
+ * max(0, frac_digits − exponent) and the value shifts by 10^exponent (PostgreSQL numeric;
+ * ../design/grammar.md §14): `1.5e3` is `1500` (scale 0), `1.5e-3` is `0.0015` (scale 4),
+ * `5e2` is `500`. The coefficient's integer-part digits must be <= max_int_digits and the
+ * scale <= max_scale (../types/scalars.toml; else 22003 at resolve). A decimal literal is an
+ * untyped decimal constant that adapts to its context (../design/types.md §6, extended to
+ * decimal). */
+decimal        ::= significand exponent
+                 | digit+ "." digit*
                  | "." digit+
+significand    ::= digit+ "." digit*
+                 | "." digit+
+                 | digit+
+exponent       ::= ( "e" | "E" ) ( "+" | "-" )? digit+
 
 /* The "." token has two roles, resolved by the lexer on the FOLLOWING byte alone (no
  * preceding-token context, so the rule is trivially identical across cores — §4):

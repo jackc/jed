@@ -24,6 +24,28 @@ export const MAX_INT_DIGITS = 131072;
 // (PG NUMERIC_DSCALE_MAX; spec/design/decimal.md §2).
 export const MAX_SCALE = 16383;
 
+// The magnitude clamp for a decimal literal's scientific e-notation exponent, tied to the format
+// caps so lexing/parsing stays bounded — 1e9999999999 must not materialize a gigabyte of
+// coefficient zeros — without changing any outcome: an exponent this large already drives the
+// value past the caps (so it traps 22003 at resolve), and a zero coefficient still normalizes to 0
+// (spec/design/grammar.md §14). Callers clamp the exponent magnitude to ±EXP_LIMIT while scanning.
+export const EXP_LIMIT = MAX_INT_DIGITS + MAX_SCALE + 2;
+
+// decimalFromParts is the canonical [coefficient digits, scale] for a decimal literal, from its
+// mantissa (intPart+frac) and an optional scientific exponent (already clamped to ±EXP_LIMIT by the
+// caller's scanner; null means no exponent). The display scale is max(0, fracLen-exp); when the
+// exponent drives it below zero the coefficient absorbs the surplus as trailing zeros at scale 0, so
+// the value still reads coefficient × 10^(-scale). Shared by the lexer (bare 1.5e3) and the
+// text→decimal coercion (numeric '1.5e3') so both spell the SAME value (spec/design/grammar.md §14);
+// the result is fed to Decimal.fromDigitsScale and cap-checked at resolve.
+export function decimalFromParts(intPart: string, frac: string, exp: number | null): [string, number] {
+  const fracLen = frac.length;
+  if (exp === null) return [intPart + frac, fracLen];
+  const effScale = fracLen - exp;
+  if (effScale >= 0) return [intPart + frac, effScale];
+  return [intPart + frac + "0".repeat(-effScale), 0];
+}
+
 function overflow(): EngineError {
   return engineError("numeric_value_out_of_range", "value out of range for type decimal");
 }

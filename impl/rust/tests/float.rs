@@ -320,8 +320,9 @@ fn sum_avg_canonical_fold_is_order_independent() {
     let setup = || {
         db_with(&[
             "CREATE TABLE t (id int32 PRIMARY KEY, f float64)",
-            // 1e16 is not a bare-literal (e-notation deferred for bare decimals), so seed zeros
-            // then assign each row via a typed-literal UPDATE.
+            // Seed zeros, then assign each row via a typed-literal UPDATE — the typed `float '…'`
+            // form exercises float64's own string parse (a bare `1e16` would now also lex as a
+            // decimal literal, grammar.md §14, but the typed form is what this test pins).
             "INSERT INTO t VALUES (1, 0.0), (2, 0.0), (3, 0.0), (4, 0.0)",
         ])
     };

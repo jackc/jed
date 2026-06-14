@@ -8013,8 +8013,9 @@ fn parse_int_literal(s: &str, ty: ScalarType) -> Result<i64> {
 /// Parse a string literal's content as a decimal — the text→decimal coercion for `NUMERIC '1.5'`
 /// / `CAST('1.5' AS numeric)` (grammar.md §36). Matches jed's OWN decimal-literal grammar: trimmed
 /// ASCII whitespace, optional sign, ASCII digits with at most one `.` and a digit on at least one
-/// side — built into the SAME `(neg, digits, scale)` the lexer feeds `from_digits_scale`, so a
-/// `NUMERIC 'x'` is byte-identical to writing `x`. NO scientific notation / `NaN` / `Infinity`
+/// side, plus optional scientific `e`-notation (`numeric '1.5e3'` → `1500`) — built into the SAME
+/// `(digits, scale)` the lexer feeds `from_digits_scale` (via the shared `decimal_from_parts`), so a
+/// `NUMERIC 'x'` is byte-identical to writing `x`. NO `NaN` / `Infinity` and no hex/underscore
 /// (those trap `22P02` — jed's decimal is always finite; documented PG divergences). The caller
 /// applies the typmod / cap-check.
 fn parse_decimal_literal(s: &str) -> Result<Decimal> {
@@ -8029,7 +8030,35 @@ fn parse_decimal_literal(s: &str) -> Result<Decimal> {
         Some(r) => (true, r),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    let mut parts = rest.splitn(2, '.');
+    // Split off an optional exponent. Unlike the lexer (which leaves a bare `e` for the next
+    // token), an isolated string must be a COMPLETE numeric, so an `e` with no `[+-]?digit+`
+    // after it is malformed (`22P02`), matching PG's `numeric_in`.
+    let (mantissa, exp) = match rest.find(|c: char| c == 'e' || c == 'E') {
+        Some(pos) => {
+            let (m, e) = (&rest[..pos], &rest[pos + 1..]);
+            let (eneg, edigits) = match e.strip_prefix('-') {
+                Some(r) => (true, r),
+                None => (false, e.strip_prefix('+').unwrap_or(e)),
+            };
+            if edigits.is_empty() || !edigits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            // Clamp the magnitude to `EXP_LIMIT` while accumulating (keeps it in `i64` and
+            // bounds the coefficient the shared builder may materialize).
+            let mut v: i64 = 0;
+            for b in edigits.bytes() {
+                if v < decimal::EXP_LIMIT {
+                    v = v * 10 + (b - b'0') as i64;
+                    if v > decimal::EXP_LIMIT {
+                        v = decimal::EXP_LIMIT;
+                    }
+                }
+            }
+            (m, Some(if eneg { -v } else { v }))
+        }
+        None => (rest, None),
+    };
+    let mut parts = mantissa.splitn(2, '.');
     let int_part = parts.next().unwrap_or("");
     let frac = parts.next().unwrap_or("");
     // A second `.` lands in `frac` (splitn(2) does not split it); reject it.
@@ -8040,8 +8069,8 @@ fn parse_decimal_literal(s: &str) -> Result<Decimal> {
     {
         return Err(invalid());
     }
-    let digits = format!("{int_part}{frac}");
-    Ok(Decimal::from_digits_scale(neg, &digits, frac.len() as u32))
+    let (digits, scale) = decimal::decimal_from_parts(int_part, frac, exp);
+    Ok(Decimal::from_digits_scale(neg, &digits, scale))
 }
 
 /// Parse a string literal's content as a boolean — the text→boolean coercion for `BOOLEAN 'true'`

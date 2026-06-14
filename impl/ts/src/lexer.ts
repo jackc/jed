@@ -3,6 +3,7 @@
 // parsed to bigint; a value outside the int64 range is a structured 42601 syntax error
 // (matching Go's strconv.ParseInt(.., 64) behaviour). Errors throw EngineError.
 
+import { decimalFromParts, EXP_LIMIT } from "./decimal.ts";
 import { engineError } from "./errors.ts";
 import type { Token } from "./token.ts";
 
@@ -16,6 +17,31 @@ function isDigit(c: string): boolean {
 
 function isAlpha(c: string): boolean {
   return c === "_" || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
+}
+
+// scanExponent: if sql[i..] begins a well-formed exponent [eE][+-]?digit+, return [exp, nextIndex]
+// with the magnitude clamped to ±EXP_LIMIT. Otherwise [null, i] — a bare e / ex is NOT part of the
+// number (it lexes as the following token, exactly as before e-notation existed; PostgreSQL
+// likewise rejects `1e` as trailing junk rather than reading it as the number `1`).
+function scanExponent(sql: string, i: number): [number | null, number] {
+  const n = sql.length;
+  if (i >= n || (sql[i] !== "e" && sql[i] !== "E")) return [null, i];
+  let j = i + 1;
+  let neg = false;
+  if (j < n && (sql[j] === "+" || sql[j] === "-")) {
+    neg = sql[j] === "-";
+    j++;
+  }
+  if (j >= n || !isDigit(sql[j]!)) return [null, i];
+  let exp = 0;
+  while (j < n && isDigit(sql[j]!)) {
+    if (exp < EXP_LIMIT) {
+      exp = exp * 10 + (sql.charCodeAt(j) - 48);
+      if (exp > EXP_LIMIT) exp = EXP_LIMIT;
+    }
+    j++;
+  }
+  return [neg ? -exp : exp, j];
 }
 
 // lex tokenizes sql into tokens terminated by an "eof" token.
@@ -147,27 +173,38 @@ export function lex(sql: string): Token[] {
       }
       tokens.push({ kind: "str", str: s });
     } else if (isDigit(c)) {
-      // A numeric literal. Scan the integer digits; if a "." follows it is a DECIMAL literal
-      // (scan the fractional digits), else an INTEGER literal.
+      // A numeric literal. Scan the integer digits; a following "." and/or scientific
+      // e-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise an
+      // INTEGER literal.
       const start = i;
       while (i < n && isDigit(sql[i]!)) {
         i++;
       }
+      const intPart = sql.slice(start, i);
+      // Optional fractional part: `123.`, `123.45`. The fractional part may be empty.
+      let frac = "";
+      let hasFrac = false;
       if (i < n && sql[i] === ".") {
-        // Decimal: `123.`, `123.45`. The fractional part may be empty (`1.`).
-        const intPart = sql.slice(start, i);
+        hasFrac = true;
         i++; // consume "."
         const fracStart = i;
         while (i < n && isDigit(sql[i]!)) {
           i++;
         }
-        const frac = sql.slice(fracStart, i);
-        tokens.push({ kind: "decimal", decDigits: intPart + frac, decScale: frac.length });
+        frac = sql.slice(fracStart, i);
+      }
+      // Optional exponent (`e3`, `E+2`, `e-10`); a well-formed exponent (even with no ".")
+      // makes the literal a decimal.
+      const [exp, next] = scanExponent(sql, i);
+      i = next;
+      if (hasFrac || exp !== null) {
+        const [digits, scale] = decimalFromParts(intPart, frac, exp);
+        tokens.push({ kind: "decimal", decDigits: digits, decScale: scale });
       } else {
         // Integer literal: an unsigned magnitude (the sign is the "minus" operator). The
         // magnitude must be <= 2^63 so that -(2^63) = int64's minimum is reachable; anything
         // larger cannot be represented (42601).
-        const text = sql.slice(start, i);
+        const text = intPart;
         const v = BigInt(text);
         if (v > MAX_MAGNITUDE) {
           throw engineError("syntax_error", `integer literal out of range: ${text}`);
@@ -188,7 +225,11 @@ export function lex(sql: string): Token[] {
           i++;
         }
         const frac = sql.slice(fracStart, i);
-        tokens.push({ kind: "decimal", decDigits: frac, decScale: frac.length });
+        // A leading-dot decimal may also carry an exponent (`.5e2`).
+        const [exp, next] = scanExponent(sql, i);
+        i = next;
+        const [digits, scale] = decimalFromParts("", frac, exp);
+        tokens.push({ kind: "decimal", decDigits: digits, decScale: scale });
       } else {
         tokens.push({ kind: "dot" });
         i++;

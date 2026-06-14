@@ -155,8 +155,8 @@ existing literal machinery — types.md §6, grammar.md §36):
 - **The typed literal `float '…'`** (and `float64 '…'`, `CAST('…' AS float64)`) — the
   `type 'string'` form (grammar.md §36). The string is parsed by float64's input function:
   an optional sign, decimal digits with an optional point and **`e`-notation** (`1.5e10`,
-  `-3E-7` — accepted here even though a *bare* decimal literal's e-notation is still deferred,
-  because this is float64's own string parse), plus the case-insensitive special words
+  `-3E-7` — the same e-notation a bare decimal literal now takes, grammar.md §14, here via
+  float64's own string parse), plus the case-insensitive special words
   **`Infinity`/`+Infinity`/`-Infinity`/`inf`/`NaN`** (PG's `float8in` spellings). Malformed
   input traps **`22P02`** (`invalid_text_representation`) deterministically at resolve, before
   any row is scanned; a value outside the binary64 range traps **`22003`**.

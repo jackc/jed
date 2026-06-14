@@ -388,7 +388,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       the Ruby reference). `numeric.c` (Postgres) was the reference. _(was: XL; §4/§8)_
       **Deferred follow-ups:** decimal in a `PRIMARY KEY`/index (the order-preserving
       `decimal-order-preserving` key encoding is authored in `encoding.md §2.5` but unexercised
-      — decimal PK is rejected `0A000`); scientific `e`-notation literals (`1.5e3`); negative /
+      — decimal PK is rejected `0A000`); ~~scientific `e`-notation literals (`1.5e3`)~~ — ✅
+      **done** across all three cores (bare `1.5e3`/`5e2`/`1e-3` and the text→decimal coercion
+      `numeric '1.5e3'`, [spec/design/grammar.md](spec/design/grammar.md) §14); negative /
       `s>p` scale typmods (PG 15+); `round(x,n)` and other decimal functions. ~~Raising the
       1000-digit / scale-1000 cap once over-page values land~~ — ✅ **done**: the cap is now
       PostgreSQL's numeric format limit (131072 integer / 16383 fractional digits,
@@ -442,8 +444,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       *named, literal* spelling coerces. New capability `cast.string_literal`; pinned by
       `spec/conformance/suites/expr/typed_literal.test` (99/0/0 byte-identical Rust/Go/TS).
       **Documented divergences** (oracle ledger): for `integer`/`decimal`, jed coerces by its OWN
-      literal grammar, so PG's `integer '0x10'` (hex), `'1_000'` (underscores), `numeric '1.5e3'`
-      (scientific), and `numeric 'NaN'` all trap `22P02`. **Deferred follow-up:** the **runtime**
+      literal grammar — which now takes scientific `e`-notation (`numeric '1.5e3'` → 1500,
+      grammar.md §14) — so only PG's `integer '0x10'` (hex), `'1_000'` (underscores), and
+      `numeric 'NaN'` still trap `22P02`. **Deferred follow-up:** the **runtime**
       text→`T` cast on a non-literal text expression (`CAST(text_col AS int)` — the general
       string-function / cast slice). _(size: M; §5; no on-disk change)_
 - [x] **`::` cast operator** (`expr :: type`) — done & committed across Rust/Go/TS. PostgreSQL's

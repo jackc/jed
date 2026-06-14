@@ -205,12 +205,14 @@ comparison with NULL treated as a comparable value (always definite).
 
 ## 6. Literals, casts, rendering, keys, cost
 
-- **Literals** ([grammar.md](grammar.md) §14): a `.`-bearing numeric literal is an *untyped
-  decimal constant* with its written scale, adapting to context like an integer literal
-  ([types.md](types.md) §6). Into a `numeric(p,s)` target it rounds to `s` + precision-checks;
-  with no decimal context it keeps its scale; a literal over the §2 format caps (integer part
-  over `max_int_digits` digits, or scale over `max_scale`) traps `22003` at resolve (PG
-  `numeric_in`).
+- **Literals** ([grammar.md](grammar.md) §14): a `.`-bearing numeric literal — or any
+  significand carrying a scientific `e`-notation exponent (`5e2`, `1.5e3`, `1.5e-3`; an exponent
+  makes even a point-free literal a decimal) — is an *untyped decimal constant* with its written
+  scale, adapting to context like an integer literal ([types.md](types.md) §6). For an exponent
+  the scale is `max(0, frac_digits − exponent)` and the value shifts by `10^exponent` (PG
+  `numeric.c`). Into a `numeric(p,s)` target it rounds to `s` + precision-checks; with no decimal
+  context it keeps its scale; a literal over the §2 format caps (integer part over
+  `max_int_digits` digits, or scale over `max_scale`) traps `22003` at resolve (PG `numeric_in`).
 - **Casts** ([casts.toml](../types/casts.toml)): `int → decimal` **implicit** (lossless, scale
   0); `decimal → int` **explicit** only (round to scale 0 half-away, then range-check, `22003`)
   — **stricter than PG**, which assignment-casts numeric→int; jed forbids the silent narrowing.

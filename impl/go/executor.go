@@ -7145,9 +7145,10 @@ func validFloatNumeric(t string) bool {
 // parseDecimalLiteral parses a string literal's content as a decimal — the text→decimal coercion
 // for NUMERIC '1.5' / CAST('1.5' AS numeric) (grammar.md §36). jed's OWN decimal-literal grammar:
 // trimmed ASCII whitespace, optional sign, ASCII digits with at most one '.' and a digit on at
-// least one side — built into the SAME (neg, digits, scale) the lexer feeds DecimalFromDigitsScale,
-// so NUMERIC 'x' is byte-identical to writing x. NO scientific / NaN / Infinity (22P02). Caller
-// applies typmod / cap-check.
+// least one side, plus optional scientific e-notation (numeric '1.5e3' → 1500) — built into the
+// SAME (digits, scale) the lexer feeds DecimalFromDigitsScale (via the shared decimalFromParts), so
+// NUMERIC 'x' is byte-identical to writing x. NO NaN / Infinity and no hex/underscore (22P02).
+// Caller applies typmod / cap-check.
 func parseDecimalLiteral(s string) (Decimal, error) {
 	t := strings.Trim(s, litWhitespace)
 	invalid := func() (Decimal, error) {
@@ -7160,14 +7161,48 @@ func parseDecimalLiteral(s string) (Decimal, error) {
 	} else if rest, ok := strings.CutPrefix(t, "+"); ok {
 		t = rest
 	}
-	intPart, frac, hasDot := strings.Cut(t, ".")
+	// Split off an optional exponent. Unlike the lexer (which leaves a bare e for the next token),
+	// an isolated string must be a COMPLETE numeric, so an e with no [+-]?digit+ after it is
+	// malformed (22P02), matching PG's numeric_in.
+	mantissa := t
+	hasExp := false
+	var exp int64
+	if ei := strings.IndexAny(t, "eE"); ei >= 0 {
+		mantissa = t[:ei]
+		e := t[ei+1:]
+		eneg := false
+		if rest, ok := strings.CutPrefix(e, "-"); ok {
+			eneg, e = true, rest
+		} else if rest, ok := strings.CutPrefix(e, "+"); ok {
+			e = rest
+		}
+		if e == "" || !allASCIIDigits(e) {
+			return invalid()
+		}
+		// Clamp the magnitude to expLimit while accumulating (keeps it in int64 and bounds the
+		// coefficient the shared builder may materialize).
+		for m := 0; m < len(e); m++ {
+			if exp < expLimit {
+				exp = exp*10 + int64(e[m]-'0')
+				if exp > expLimit {
+					exp = expLimit
+				}
+			}
+		}
+		if eneg {
+			exp = -exp
+		}
+		hasExp = true
+	}
+	intPart, frac, hasDot := strings.Cut(mantissa, ".")
 	// A second '.' lands in frac (Cut splits on the first); reject it.
 	if (hasDot && strings.Contains(frac, ".")) ||
 		!allASCIIDigits(intPart) || !allASCIIDigits(frac) ||
 		(intPart == "" && frac == "") {
 		return invalid()
 	}
-	return DecimalFromDigitsScale(neg, intPart+frac, uint32(len(frac))), nil
+	digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
+	return DecimalFromDigitsScale(neg, digits, scale), nil
 }
 
 // parseBoolLiteral parses a string literal's content as a boolean — the text→boolean coercion for

@@ -5,6 +5,39 @@ import (
 	"strconv"
 )
 
+// scanExponent: if b[i:] begins a well-formed exponent [eE][+-]?digit+, consume it and return
+// (exp, true, nextIndex) with the magnitude clamped to ±expLimit. Otherwise return (0, false, i)
+// — a bare e / ex is NOT part of the number (it lexes as the following token, exactly as before
+// e-notation existed; PostgreSQL likewise rejects 1e as trailing junk rather than the number 1).
+func scanExponent(b []byte, i int) (int64, bool, int) {
+	if i >= len(b) || (b[i] != 'e' && b[i] != 'E') {
+		return 0, false, i
+	}
+	j := i + 1
+	neg := false
+	if j < len(b) && (b[j] == '+' || b[j] == '-') {
+		neg = b[j] == '-'
+		j++
+	}
+	if j >= len(b) || b[j] < '0' || b[j] > '9' {
+		return 0, false, i // not a valid exponent — leave e for the next token
+	}
+	var exp int64
+	for j < len(b) && b[j] >= '0' && b[j] <= '9' {
+		if exp < expLimit {
+			exp = exp*10 + int64(b[j]-'0')
+			if exp > expLimit {
+				exp = expLimit
+			}
+		}
+		j++
+	}
+	if neg {
+		exp = -exp
+	}
+	return exp, true, j
+}
+
 // Lex tokenizes sql into tokens terminated by TokEof (CLAUDE.md §5: parsers are
 // per-language, not codegen'd). Integer literals may carry a leading '-'. Errors are
 // structured (SQLSTATE 42601 syntax error).
@@ -144,28 +177,40 @@ func Lex(sql string) ([]Token, error) {
 			}
 			tokens = append(tokens, Token{Kind: TokStr, Word: string(sb)})
 		case isDigit(c):
-			// A numeric literal. Scan the integer digits; if a '.' follows it is a DECIMAL
-			// literal (scan the fractional digits), else an INTEGER literal.
+			// A numeric literal. Scan the integer digits; a following '.' and/or scientific
+			// e-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise an
+			// INTEGER literal.
 			start := i
 			for i < len(b) && isDigit(b[i]) {
 				i++
 			}
+			intPart := sql[start:i]
+			// Optional fractional part: `123.`, `123.45`. The fractional part may be empty.
+			frac := ""
+			hasFrac := false
 			if i < len(b) && b[i] == '.' {
-				// Decimal: `123.`, `123.45`. The fractional part may be empty (`1.`).
-				intPart := sql[start:i]
+				hasFrac = true
 				i++ // consume '.'
 				fracStart := i
 				for i < len(b) && isDigit(b[i]) {
 					i++
 				}
-				frac := sql[fracStart:i]
-				tokens = append(tokens, Token{Kind: TokDecimal, Word: intPart + frac, Int: uint64(len(frac))})
+				frac = sql[fracStart:i]
+			}
+			// Optional exponent (`e3`, `E+2`, `e-10`); a well-formed exponent (even with no '.')
+			// makes the literal a decimal.
+			var exp int64
+			var hasExp bool
+			exp, hasExp, i = scanExponent(b, i)
+			if hasFrac || hasExp {
+				digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
+				tokens = append(tokens, Token{Kind: TokDecimal, Word: digits, Int: uint64(scale)})
 			} else {
 				// Integer literal: an unsigned magnitude. The sign is TokMinus. The magnitude
 				// must be <= 2^63 so that -(2^63) = int64's minimum is reachable; anything
 				// larger cannot be represented (42601). int64 cannot hold 2^63, so carry it
 				// unsigned and let the parser convert.
-				text := sql[start:i]
+				text := intPart
 				n, err := strconv.ParseUint(text, 10, 64)
 				if err != nil || n > (uint64(1)<<63) {
 					return nil, NewError(SyntaxError, fmt.Sprintf("integer literal out of range: %s", text))
@@ -186,7 +231,12 @@ func Lex(sql string) ([]Token, error) {
 					i++
 				}
 				frac := sql[fracStart:i]
-				tokens = append(tokens, Token{Kind: TokDecimal, Word: frac, Int: uint64(len(frac))})
+				// A leading-dot decimal may also carry an exponent (`.5e2`).
+				var exp int64
+				var hasExp bool
+				exp, hasExp, i = scanExponent(b, i)
+				digits, scale := decimalFromParts("", frac, hasExp, exp)
+				tokens = append(tokens, Token{Kind: TokDecimal, Word: digits, Int: uint64(scale)})
 			} else {
 				tokens = append(tokens, Token{Kind: TokDot})
 				i++

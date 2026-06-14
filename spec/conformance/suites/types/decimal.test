@@ -218,3 +218,53 @@ query B nosort
 SELECT (v + 1 = 1) FROM caps WHERE id = 2
 ----
 false
+
+# --- scientific e-notation literals (grammar.md §14, PostgreSQL numeric.c) --------------------
+# A significand with an exponent `[eE][+-]?digits` is a DECIMAL even with no '.': the display
+# scale is max(0, frac_digits - exponent) and the value shifts by 10^exponent, matching PG. An
+# exponent makes 5e2 a decimal (not an integer), and the written display scale is preserved
+# through storage exactly like a '.'-spelled literal (1.50e1 -> 15.0 scale 1, 1.5e1 -> 15 scale 0).
+statement ok
+CREATE TABLE enote (id int32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO enote VALUES (1, 1.5e3), (2, 5e2), (3, 1.5e-3), (4, 1.50e-3), (5, 1.234e2), (6, 1.50e1), (7, 1.5e1), (8, .5e2), (9, 100e-2), (10, 2E3), (11, 1.5e+3), (12, -1.5e3)
+
+query D nosort
+SELECT v FROM enote ORDER BY id
+----
+1500
+500
+0.0015
+0.00150
+123.4
+15.0
+15
+50
+1.00
+2000
+1500
+-1500
+
+# value equality ignores the spelling: 5e2 (row 2) equals the integer literal 500, and 1.5e3
+# (rows 1 and 11) equals 1500; display scale never affects equality
+query I nosort
+SELECT id FROM enote WHERE v = 500 ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM enote WHERE v = 1500 ORDER BY id
+----
+1
+11
+
+# an exponent makes 5e2 a DECIMAL literal, so storing it into an integer column is the same
+# 42804 as any decimal literal — even though 500 is integer-valued (no decimal->int assignment)
+statement error 42804
+INSERT INTO c VALUES (10, 5e2, 0)
+
+# the exponent obeys the format caps at resolve: 1e131072 is a 131073-digit integer, one past
+# max_int_digits, so it traps 22003 (PG's numeric overflow), exactly like the written-out form
+statement error 22003
+INSERT INTO enote VALUES (99, 1e131072)

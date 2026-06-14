@@ -33,11 +33,6 @@ reason = "jed: a `type 'string'` integer is coerced by jed's own integer-literal
 
 [[override]]
 file = "expr/typed_literal.test"
-sql = "SELECT numeric '1.5e3'"
-reason = "jed: a `type 'string'` decimal is coerced by jed's own decimal-literal grammar — no scientific notation (22P02). PostgreSQL accepts `1.5e3` and returns 1500. jed has no e-notation decimal literal anywhere (a deferred literal form, TODO.md); grammar.md §36."
-
-[[override]]
-file = "expr/typed_literal.test"
 sql = "SELECT numeric 'NaN'"
 reason = "jed: jed's decimal is ALWAYS finite (decimal.md §2 — no NaN/±Infinity), so `numeric 'NaN'` traps 22P02. PostgreSQL's numeric has a NaN value and accepts it. A standing, documented decimal divergence (grammar.md §36, decimal.md §2)."
 
@@ -50,6 +45,11 @@ reason = "jed: decimal vs text is not comparable (42804). PG implicitly coerces 
 file = "types/decimal.test"
 sql = "INSERT INTO c VALUES (2, 1.5, 9.9)"
 reason = "jed: storing a decimal literal into an integer column is an explicit-CAST-only operation (42804), stricter than PG, which assignment-casts 1.5 -> 2 by rounding. (decimal.md)"
+
+[[override]]
+file = "types/decimal.test"
+sql = "INSERT INTO c VALUES (10, 5e2, 0)"
+reason = "jed: the same decimal-literal-into-integer-column 42804 as the `1.5` row above, here reached via e-notation — an exponent makes `5e2` a DECIMAL literal even though 500 is integer-valued (grammar.md §14), and the strict matrix has no decimal→integer assignment cast (§4). PG treats `5e2` as numeric and assignment-casts it to 500."
 
 [[override]]
 file = "types/decimal.test"
