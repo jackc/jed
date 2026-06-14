@@ -577,6 +577,41 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       float PRIMARY KEY `0A000`. The oracle importer (`scripts/oracle_import.rb`) was taught the float
       types (`TYPE_REWRITE` float64→double precision / float32→real; `TAG` → `R`). Scope ratified by
       the user: "everything" incl. casts + exact SUM/AVG + transcendentals. _(S decision → XL build; §8)_
+- [ ] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — the **second container
+      axis**, sibling to `array` (above) and sharing ~80% of its foundation, so sequence the
+      two together (whichever lands first pays the shared cost). **The headline implication:
+      this turns the *closed* type enum into an *open*, user-defined type system.** Today every
+      type is a variant of a fixed `Copy` enum (`impl/*/…/types.rs` `ScalarType`), codegen'd
+      from the build-time enumeration in [spec/types/scalars.toml](spec/types/scalars.toml) — a
+      scalar type is a fact about *the engine*. A composite type is a fact about *a database*:
+      named, created/dropped at runtime, recursive (a field may be a composite/array), living in
+      the catalog. So `ScalarType` (Copy, by-value, everywhere) becomes a `Type { Scalar |
+      Composite(catalog-ref) }` threaded through parser/resolver/evaluator/codec/comparator/
+      catalog in all three cores, and the cross-core contract **shifts in kind**: from "the data
+      table is byte-identical" (scalars) to "the *recursive* codec/comparator/NULL-rule/text-I/O
+      is byte-identical" (composites) — hand-written per core (§5 forbids codegenning it),
+      policed by new golden fixtures + corpus entries (§8). **Subsystems touched:** the
+      [type matrix](spec/types/) (structural/recursive rules, not rows); the on-disk catalog +
+      [format.md](spec/fileformat/format.md) (the 1-byte `type_code` can't name a user type → a
+      reserved code + a new catalog type-definition section, deterministic/topological emit
+      order, `format_version` bump, new golden); the [value codec](spec/fileformat/format.md)
+      (a recursive `Value::Composite` + composite codec, composed with large-values overflow +
+      LZ4); comparison/NULL/ordering (field-by-field 3VL; the PG `ROW IS NULL` = *all*-fields-NULL
+      gotcha; recursive value-canonical identity for GROUP BY/DISTINCT/set-ops; the TS UTF-8 trap
+      recurses); the grammar/parsers (`CREATE/DROP TYPE`, `(expr).field` vs qualified-column
+      ambiguity, `ROW(…)` + bare `(a,b)` constructors, the `record_in`/`record_out` text
+      literal); casts; cost units (construct/access/per-field compare); and `DROP TYPE`
+      dependency tracking under snapshot isolation. **Decisions to ratify spec-first (§8
+      spirit):** (1) named composites only, or also anonymous `record` (→ row-value comparison
+      `(a,b)=(c,d)` + row-valued subqueries, the deferred items above); (2) adopt PG's all-fields
+      `IS NULL` rule (default yes); (3) **defer composite-as-key `0A000`** (author the recursive
+      order-preserving encoding, don't exercise it — the text/decimal-PK precedent); (4) skip
+      PG's implicit *table* row-types for now (documented divergence); (5) match `record_in/out`
+      quoting or a stricter subset; (6) array-vs-composite sequencing + the shared "containers"
+      foundation as one explicit slice. **Path:** NOT a single vertical slice — write
+      `spec/design/composite.md` (the decision doc) + the **CLAUDE.md §4/§5 revision** (the
+      open-type-system commitment) *before* any core touches `ScalarType`, then narrow v1 hard
+      (named types only, no composite keys, no table row-types, no `ALTER TYPE`). _(size: XL; §4/§8)_
 
 ---
 
