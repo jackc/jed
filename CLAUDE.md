@@ -349,7 +349,11 @@ biases below are where an overriding reason *does* steer away from PG.
   the permanent shape.
 - The core defines a **storage seam** (a block/file interface) that each host
   implements: `os.File` in Go, OPFS in the browser, direct file access natively.
-  Designing this seam early is what makes "single-file, embeddable, everywhere" work.
+  Designing this seam early is what makes "single-file, embeddable, everywhere" work. The
+  **formal host interface** — the five-method `BlockStore` byte device, the per-core mapping,
+  the host catalog, and where the encryption codec / replication tee sit — is
+  `spec/design/hosts.md`; the per-core `Pager` (buffer pool, preallocation, fault seam) is the
+  host-independent policy above it.
 - **Keep the storage model pluggable behind the relational layer.** SQL is the primary
   access path and everything MUST be reachable via SQL (§1), but it is not assumed to be
   the only one. The architecture should not foreclose: (a) **multiple physical layouts** —
@@ -359,11 +363,26 @@ biases below are where an overriding reason *does* steer away from PG.
   **undecided** — the requirement is to keep the seam open, not to build them now.
 - **Leave the door open for encryption at rest (file-level).** The single-file format and
   the storage seam (storage.md §2) are kept so whole-file (or per-page) **encryption at
-  rest** can be added later **without a reshape** — e.g. an encrypting wrapper at the block
-  seam, or an encrypted page body behind an authenticated header. Not built now; the only
-  present requirement is that nothing foreclose it (don't assume page bytes are
-  plaintext-comparable on disk). When it lands, the crypto comes from a **vetted library,
-  never a hand-rolled algorithm** — the dependency policy (§14).
+  rest** can be added later **without a reshape**. Not built now; the only present requirement
+  is that nothing foreclose it (don't assume page bytes are plaintext-comparable on disk) —
+  already satisfied (hosts keep page bytes opaque). **Designed in `spec/design/encryption.md`:**
+  a page codec **in the core above the block seam** (not a per-host duty), a standardized AEAD
+  under a **deterministic `(page_index, txid)` nonce** that keeps the §8 cross-core
+  byte-identity (the asymmetry with LZ4 — AEADs *are* standardized, so a library agrees
+  byte-for-byte), the auth tag *closing* the tamper gap the `format_version` 7 CRC leaves open,
+  and the key as a handle setting the engine never persists. When it lands, the crypto comes
+  from a **vetted library, never a hand-rolled algorithm** — the dependency policy (§14), the
+  build gate.
+- **Replication — block-shipping, no WAL (`spec/design/replication.md`).** A door kept open,
+  not built; the architecture is **decided**: replicate by shipping the **per-commit
+  page-delta** (the dirty pages + meta swap §3's commit already produces), in `txid` order, as
+  a tee at the block seam — **not a write-ahead log**. A WAL is unmotivated because copy-on-write
+  + the root swap already give atomicity *and* lock-free reader/writer concurrency (the two
+  reasons to grow one), and the block-delta inherits the §8 byte-identity (it applies
+  byte-identically on any core/host) and the §3 atomic-apply recipe. The tee sits **below** the
+  encryption codec so a backup replica can be **keyless**. The trade is write-amplification
+  (a one-byte change ships whole pages); a **logical** changeset stream (compact wire,
+  heterogeneous consumers) is a separate higher-layer door, not foreclosed and not scheduled.
 - **Compression of large values — ✅ built (large-values Slice B).** Large values (long
   `text`, `bytea`, big `decimal`, future `json`) are **compressed** transparently at the
   storage layer with a **hand-rolled, byte-pinned LZ4-block codec**

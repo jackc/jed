@@ -1106,6 +1106,28 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       sharing — needs O(dirty) orphan tracking to keep the commit incremental, or an O(live)
       reachable-set recompute) and **on-disk free-list persistence** (claim meta offset 28 so open
       skips the reachable-set walk — *persist later only for open speed*). _(size: L; deps: P6.1)_
+- [ ] **File compaction / shrink (return space to the OS)** — ⏳ **approach decided
+      (`to_image`-based whole-image compaction), not built.** The free-list (P6.2) recycles dead
+      space for *jed*, but `page_count` is a monotonic high-water (+ the pager.md §7 preallocation
+      slack), so the file is **grow-only** — insert-a-lot-then-delete leaves it permanently at its
+      peak size, never returned to the OS (SQLite's and PostgreSQL's default too). The **decided
+      shrink mechanism is a host-invoked compaction that re-serializes the committed snapshot
+      through the existing from-scratch `to_image` serializer** (the garbage-free packed image
+      `create` already writes — [spec/fileformat/format.md](spec/fileformat/format.md)
+      *From-scratch image*) into a fresh file and atomically swaps it in (the `create` temp-file +
+      fsync + atomic-rename recipe, [spec/design/api.md](spec/design/api.md) §3), then re-adopts
+      the pager on the new, minimal file. One pass reclaims **all** dead space and defragments —
+      the SQLite `VACUUM` / PG `VACUUM FULL` flavor — and is **crash-safe for free** (the atomic
+      rename is all-or-nothing; a crash leaves the prior file intact). **Explicit / host-invoked,
+      not automatic-per-commit** (per-commit truncation would fight the §7 preallocation:
+      truncate→regrow→re-fsync churn), and gated on the reader-liveness watermark (transactions.md
+      §8) like any reclamation. **Needs nothing new at the storage seam** (hosts.md §2): the
+      compact image is written through the block seam and ends smaller; `set_size`-down is implicit
+      in writing a fresh file. A lighter **in-place trailing-free truncation** (lower `page_count`
+      + `set_size` down when the top pages `[k, page_count)` are all free — the PG-plain-`VACUUM` /
+      SQLite-`incremental_vacuum` flavor) stays open as a cheaper *partial* complement (reclaims
+      only trailing space; must be sequenced against the two-meta-slot fallback §4/§7). Recorded in
+      [spec/design/storage.md](spec/design/storage.md) §6. _(size: M–L; deps: P6.2; §9)_
 - [x] **P6.3 — `page_read` cost unit + corpus cost re-baseline** ✅ — the store is now a
       page-backed B-tree (P6.1), so a distinct **`page_read`** unit was **added** to
       [spec/cost/schedule.toml](spec/cost/schedule.toml) alongside `storage_row_read` (not a
@@ -1299,9 +1321,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       context-typed at resolve (42P18 if indeterminate), bound two-phase before any scan, run
       through `prepare`/`execute`/`execute_params`. Per-impl surface — corpus stays literal-only
       (conformance.md §1.2); tested in-impl (`params` test per core). _(was: size M)_
-- [ ] **Storage hosts** — Node `fs` host **built** (Phase 7, `impl/ts/src/file.ts`; Rust/Go use
-      `std::fs`/`os` directly); build the **browser/OPFS** host (`FileSystemSyncAccessHandle`)
-      and confirm native file-host parity (§9, storage.md §2). _(size: L; §9)_
+- [ ] **Storage hosts** — formal interface authored in
+      [spec/design/hosts.md](spec/design/hosts.md): the five-method `BlockStore` byte device, the
+      host catalog, and the decoration layering (encryption codec above the seam, replication tee
+      below). Node `fs` host **built** (`impl/ts/src/file.ts`; Rust/Go inline `std::fs`/`os` in the
+      per-core `Pager`). Remaining work:
+      - [ ] **`BlockStore` extraction** — lift the file backing out of the per-core `Pager` behind
+            the five-method interface (`read_at`/`write_at`/`sync`/`size`/`set_size`), unify the
+            in-memory path onto it; pure refactor, no behavior/byte change (goldens + corpus
+            unchanged). Foundation for every host below. _(size: M; hosts.md §3/§7)_
+      - [ ] **Browser/OPFS host** (`FileSystemSyncAccessHandle`) — the one new host; map the
+            five methods onto `read`/`write`/`truncate`/`getSize`/`flush` and confirm **file-host
+            parity** (a file written by the Node host opens byte-identically through OPFS and vice
+            versa — the existing goldens already pin the bytes). _(size: L; §9, hosts.md §5)_
 - [x] **Cost ceiling (`max_cost`) + deterministic abort** — ✅ landed (all 3 cores). A handle
       `max_cost` setting (`set_max_cost`/`SetMaxCost`/`setMaxCost`, `0` = unlimited) aborts a
       statement with **`54P01`** (`cost_limit_exceeded`, class 54 program_limit_exceeded) the
@@ -1487,7 +1519,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   §9 already flags alternative physical layouts as open (column-oriented, key-value); a
   vector index would be another. Speculative — noted so the seam stays open.
 - **Encryption at rest (file-level).** Whole-file or per-page **encryption** is a door to
-  keep open, not a scheduled feature (CLAUDE.md §9, storage.md §6). The block seam is the
-  natural insertion point; crypto would come from a **vetted library, never hand-rolled**
-  (§14). The only present requirement is that the on-disk format and storage seam not
-  foreclose it (don't assume page bytes are plaintext-comparable on disk).
+  keep open, not a scheduled feature (CLAUDE.md §9, storage.md §6); **designed in
+  [spec/design/encryption.md](spec/design/encryption.md)**. The insertion point is a page codec
+  **in the core above the block seam** (not a per-host duty); a standardized AEAD under a
+  **deterministic `(page_index, txid)` nonce** keeps the §8 cross-core byte-identity, and the
+  auth tag closes the tamper gap the `format_version` 7 CRC leaves open. Crypto comes from a
+  **vetted library, never hand-rolled** (§14 — the build gate; pure-Go availability binds the Go
+  core). The only present requirement is non-foreclosure (don't assume page bytes are
+  plaintext-comparable on disk) — already satisfied.
+- **Replication.** ✅ **Architecture decided (block-shipping, no WAL), not built** — designed in
+  [spec/design/replication.md](spec/design/replication.md). Ship the **per-commit page-delta**
+  (the dirty pages + meta swap the commit already produces, storage.md §4) in `txid` order, as a
+  tee at the block seam. No WAL: copy-on-write + the root swap already give atomicity *and*
+  lock-free concurrency, and the block-delta inherits the §8 byte-identity + the §4 atomic-apply
+  recipe. The tee sits **below** the encryption codec → **keyless** backup replicas. Trade:
+  write-amplification. A **logical** changeset stream (compact wire, heterogeneous consumers) is
+  a separate higher-layer door at the row-mutation seam — not foreclosed, not scheduled.

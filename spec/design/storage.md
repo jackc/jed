@@ -56,6 +56,13 @@ sync()                                         # durability barrier (fsync-equiv
 block_count()            -> count
 ```
 
+> **The formal interface is [hosts.md](hosts.md).** Those are the *pager's* block-level
+> operations; the per-host **byte backing** beneath them — the five-method `BlockStore`
+> (`read_at`/`write_at`/`sync`/`size`/`set_size`), the per-core idiomatic mapping, the host
+> catalog (in-memory / file / OPFS), and the decoration layering (where the encryption codec
+> and the replication tee sit) — is specified there. This section fixes the *model*; hosts.md
+> fixes the *interface every host conforms to*.
+
 Hosts:
 
 - **Go core** — `os.File` with `ReadAt`/`WriteAt`/`Sync` (pure Go, no cgo — CLAUDE.md §2).
@@ -204,6 +211,30 @@ sits so the options stay open (CLAUDE.md §9).
   the watermark gate then does real work, paired with file-backed reader sharing) and on-disk
   free-list persistence (so open skips the reachable-set walk —
   [../fileformat/format.md](../fileformat/format.md) *Reclamation*).
+- **File compaction / shrink (returning space to the OS)** — ⏳ **approach decided, not built.**
+  The free-list (above) recycles dead space for *jed*, but it never gives it back: `page_count` is
+  a monotonic high-water (plus the pager.md §7 preallocation slack), so the file is **grow-only** —
+  insert-a-lot-then-delete leaves it permanently at its peak size. (This is the SQLite/PostgreSQL
+  default too — both reuse freed space and shrink only under an explicit `VACUUM`.) **The decided
+  shrink mechanism is `to_image`-based whole-image compaction:** re-serialize the committed
+  snapshot through the existing from-scratch `to_image` serializer — the **garbage-free packed
+  image** `create` already writes ([../fileformat/format.md](../fileformat/format.md) *From-scratch
+  image*) — into a fresh file, atomically swap it in (the `create` temp-file + `fsync` + atomic
+  `rename` + dir `fsync` recipe, [api.md](api.md) §3), and re-adopt the pager on the new, minimal
+  file. One pass reclaims **all** dead space and **defragments** (the SQLite `VACUUM` / PostgreSQL
+  `VACUUM FULL` flavor), and it is **crash-safe for free** — the atomic rename is all-or-nothing,
+  so a crash leaves the prior file intact (the property `create` and the step-5b whole-image era
+  relied on). It is **host-invoked / explicit, not automatic-per-commit** — a per-commit
+  truncation would fight the §9/pager.md §7 preallocation (truncate → regrow → re-`fsync` churn) —
+  and, being a writer operation that replaces the file under any demand-paging readers, it is gated
+  on the reader-liveness watermark (transactions.md §8) like any reclamation. It **needs nothing
+  new at the seam** (§2, [hosts.md](hosts.md)): the compact image is written through the block
+  device and simply ends smaller — the file shrinks because the fresh image is smaller, not by an
+  in-place truncate. A lighter **in-place trailing-free truncation** — lower `page_count` and
+  `set_size` down when the top pages `[k, page_count)` are all free (the PG-plain-`VACUUM` /
+  SQLite-`incremental_vacuum` flavor) — stays open as a cheaper *partial* complement: no rewrite,
+  but it reclaims only *trailing* free space and must be sequenced against the two-meta-slot
+  fallback (§4/§7) and the watermark. Tracked in [../../TODO.md](../../TODO.md) Phase 6.
 - **Buffer pool / demand paging** — ⏳ **design landed** ([pager.md](pager.md)), implementation
   in slices. Makes the resident set a **bounded cache of pages** with eviction instead of the
   whole file (CLAUDE.md §9), so a database far larger than RAM is served by paging the working
@@ -218,9 +249,12 @@ sits so the options stay open (CLAUDE.md §9).
   page (a record stores its key + each column's value); an interior node prefixes its records
   with `N+1` child pointers. Slotted-page layout (intra-page free space, in-place updates) is
   a later refinement; P6.1 rewrites a whole node page when it changes.
-- **Crash-recovery story** — the meta double-buffer (§4) gives atomic commit; whether a
-  separate WAL is ever added is deferred (the copy-on-write + root-swap model does not
-  require one for atomicity). The atomicity is **verified at the actual commit points** by the
+- **Crash-recovery story** — the meta double-buffer (§4) gives atomic commit; **no WAL is
+  needed** — the copy-on-write + root-swap model gives both atomicity *and* reader/writer
+  concurrency (transactions.md §10) for free, which are the two reasons an embedded engine
+  usually grows a WAL ([replication.md](replication.md) §1). A separate WAL stays deferred and,
+  on current analysis, unmotivated even for replication (block-shipping the commit delta
+  suffices — replication.md). The atomicity is **verified at the actual commit points** by the
   **fault-injection seam** (§7): a per-core, test-only one-shot crash/tear armed on the pager,
   with a cross-core recovery matrix asserting that a crash anywhere recovers to a valid snapshot.
 - **At-rest corruption detection** — distinct from crash recovery (which protects the *commit*
@@ -237,12 +271,21 @@ sits so the options stay open (CLAUDE.md §9).
   (physical I/O, invisible to `page_read` cost). A dedicated per-core corruption test
   complements the fault-injection matrix.
 - **Alternative physical layouts & direct-access API** — kept open (§5), not scheduled.
-- **Encryption at rest (file-level)** — kept open, not built (CLAUDE.md §9). The block seam
-  (§2) is the natural insertion point: an encrypting host — or a thin layer just above it —
-  can encrypt page bodies, with the meta/header carrying whatever non-secret parameters are
-  needed. The crypto comes from a **vetted library, never hand-rolled** (CLAUDE.md §14). The
-  present requirement is only that the format and seam not foreclose it — concretely, don't
-  bake in assumptions that page bytes are plaintext-comparable on disk.
+- **Encryption at rest (file-level)** — kept open, not built (CLAUDE.md §9); **designed in
+  [encryption.md](encryption.md)**. The insertion point is a **page codec in the core, just
+  above the block seam** (a thin layer, not a per-host duty — hosts.md §6), encrypting page
+  bodies with a standardized AEAD under a **deterministic `(page_index, txid)` nonce** that
+  keeps the §8 cross-core byte-identity, while the auth tag *closes* the tamper gap the
+  `format_version` 7 CRC explicitly leaves open (above). The crypto comes from a **vetted
+  library, never hand-rolled** (CLAUDE.md §14, the build gate). The present requirement is only
+  that the format and seam not foreclose it — concretely, don't bake in assumptions that page
+  bytes are plaintext-comparable on disk (already satisfied — hosts keep page bytes opaque).
+- **Replication** — kept open, not built; **designed in [replication.md](replication.md)**.
+  Decided: **block-shipping** the per-commit page-delta (the dirty pages + meta swap §4 already
+  produces), in `txid` order, **not a WAL**. Inherits the §8 byte-identity (a delta applies
+  byte-identically on any core/host) and the §4 atomic-apply recipe; the tee sits **below** the
+  encryption codec so a replica can be **keyless** (hosts.md §6). A *logical* changeset stream
+  (compact wire / heterogeneous consumers) is a separate higher-layer door, not foreclosed.
 - **Overflow pages + compression of large values** — kept open, not built (CLAUDE.md §9);
   **designed in [large-values.md](large-values.md)** (the TOAST-equivalent subsystem). A value
   that pushes a record over `RECORD_MAX` currently trips the `0A000` oversized-item narrowing
