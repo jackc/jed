@@ -16,7 +16,7 @@ use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
 use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
 use crate::interval::{self, Interval, parse_interval};
-use crate::operators::{OPERATORS, OperatorDesc};
+use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc};
 use crate::pmap::KeyBound;
 use crate::storage::{Row, TableStore};
 use crate::timestamp::{parse_timestamp, parse_timestamptz};
@@ -4983,16 +4983,6 @@ enum AggCtx {
     },
 }
 
-/// The five aggregate functions, parsed from a call name (case-insensitive).
-#[derive(Clone, Copy)]
-enum AggFunc {
-    Count,
-    Sum,
-    Min,
-    Max,
-    Avg,
-}
-
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
 /// (the PG widening — spec/design/aggregates.md §3).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5703,21 +5693,166 @@ fn binary_expr(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
     }
 }
 
-/// Parse an aggregate function name (case-insensitive); an unknown name is 42883.
-fn parse_agg_func(name: &str) -> Result<AggFunc> {
-    Ok(match name.to_ascii_lowercase().as_str() {
-        "count" => AggFunc::Count,
-        "sum" => AggFunc::Sum,
-        "min" => AggFunc::Min,
-        "max" => AggFunc::Max,
-        "avg" => AggFunc::Avg,
-        _ => {
-            return Err(EngineError::new(
-                SqlState::UndefinedFunction,
-                format!("function does not exist: {name}"),
-            ));
-        }
+// === Function registry (spec/design/extensibility.md §5) ============================
+// Resolution for the named scalar functions and the aggregates is DATA-DRIVEN: instead of
+// re-encoding the name set in hand-written `match`es (the old known-name gate + result-type
+// match + name→variant match), it consults the generated catalog descriptor tables
+// (`OPERATORS` rows with kind="function", and `AGGREGATES`) through the lookups below, keyed
+// by (name, arg_families). The per-row KERNEL is still reached by id (`ScalarFunc` / `AggPlan`)
+// and hand-written per core — §5 forbids codegenning the kernels. The only function-specific
+// hand-written datum is `scalar_func_id` (name → kernel id); `registry_covers_catalog` (test)
+// proves it total over the catalog. Host-registered functions would extend these lookups.
+
+/// The argument family a resolved type satisfies, for matching a catalog `arg_families` slot.
+/// `None` for NULL: an untyped NULL matches no *concrete* family — so `abs(NULL)` / `sum(NULL)`
+/// find no overload (42883, the pre-registry behavior) — and only the wildcard "any" accepts it.
+fn arg_family(t: ResolvedType) -> Option<&'static str> {
+    match t {
+        ResolvedType::Int(_) => Some("integer"),
+        ResolvedType::Decimal => Some("decimal"),
+        ResolvedType::Float(_) => Some("float"),
+        ResolvedType::Bool => Some("boolean"),
+        ResolvedType::Text => Some("text"),
+        ResolvedType::Bytea => Some("bytea"),
+        ResolvedType::Uuid => Some("uuid"),
+        ResolvedType::Timestamp => Some("timestamp"),
+        ResolvedType::Timestamptz => Some("timestamptz"),
+        ResolvedType::Interval => Some("interval"),
+        ResolvedType::Null => None,
+    }
+}
+
+/// Whether a resolved argument satisfies one catalog family slot. "any" accepts everything
+/// (NULL included); a concrete family matches only its own type.
+fn family_matches(slot: &str, t: ResolvedType) -> bool {
+    slot == "any" || arg_family(t) == Some(slot)
+}
+
+/// Whether `name` (case-insensitive) is a registered scalar function (catalog kind="function").
+/// This is the data-driven replacement for the old hand-written known-name gate.
+fn is_scalar_func_name(name: &str) -> bool {
+    OPERATORS
+        .iter()
+        .any(|o| o.kind == "function" && o.name.eq_ignore_ascii_case(name))
+}
+
+/// The matched scalar-function overload row for `name` over the resolved argument types: the
+/// `kind="function"` catalog row whose `arg_families` agree by arity + per-slot family. `None`
+/// ⇒ no overload (42883). `make_interval` resolves on its own named/defaulted path (§11).
+fn lookup_scalar_overload(name: &str, arg_tys: &[ResolvedType]) -> Option<&'static OperatorDesc> {
+    OPERATORS.iter().find(|o| {
+        o.kind == "function"
+            && o.name == name
+            && o.arg_families.len() == arg_tys.len()
+            && std::iter::zip(o.arg_families, arg_tys).all(|(slot, t)| family_matches(slot, *t))
     })
+}
+
+/// The kernel id for scalar function `name` — the per-core hand-written half of the registry
+/// (§5: the kernel is reached by id, never codegenned). Total over the catalog's function names
+/// (`registry_covers_catalog` proves it); for Rust the id depends only on the name (one `Abs`
+/// arm serves int/decimal/float; one `Round` arm serves float/decimal — the eval recovers the
+/// overload from the operand value).
+fn scalar_func_id(name: &str) -> ScalarFunc {
+    match name {
+        "abs" => ScalarFunc::Abs,
+        "round" => ScalarFunc::Round,
+        "ceil" => ScalarFunc::Ceil,
+        "floor" => ScalarFunc::Floor,
+        "trunc" => ScalarFunc::Trunc,
+        "sqrt" => ScalarFunc::Sqrt,
+        "exp" => ScalarFunc::Exp,
+        "ln" => ScalarFunc::Ln,
+        "log10" => ScalarFunc::Log10,
+        "pow" => ScalarFunc::Pow,
+        "sin" => ScalarFunc::Sin,
+        "cos" => ScalarFunc::Cos,
+        "tan" => ScalarFunc::Tan,
+        "make_interval" => ScalarFunc::MakeInterval,
+        // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
+        // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
+        "uuid_extract_version" => ScalarFunc::UuidExtractVersion,
+        "uuid_extract_timestamp" => ScalarFunc::UuidExtractTimestamp,
+        "uuidv4" => ScalarFunc::Uuidv4,
+        "uuidv7" => ScalarFunc::Uuidv7,
+        _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
+    }
+}
+
+/// The result `ScalarType` of a scalar function from its catalog `result` code (functions.md §9):
+/// "promoted" = the (single) operand's own type; otherwise the code is a literal scalar-type id
+/// (e.g. "decimal", "float64", "interval", "int16", "timestamptz", "uuid") naming the result.
+fn scalar_result_type(code: &str, arg_tys: &[ResolvedType]) -> ScalarType {
+    if code == "promoted" {
+        return resolved_scalar_type(arg_tys[0]);
+    }
+    ScalarType::from_name(code)
+        .unwrap_or_else(|| unreachable!("scalar_result_type: unknown result code {code}"))
+}
+
+/// The concrete `ScalarType` carried by a numeric resolved type (for the "promoted" /
+/// "same_as_input" result rules). Only reached for the numeric families those rules admit.
+fn resolved_scalar_type(t: ResolvedType) -> ScalarType {
+    match t {
+        ResolvedType::Int(it) => it,
+        ResolvedType::Float(ft) => ft,
+        ResolvedType::Decimal => ScalarType::Decimal,
+        _ => unreachable!("resolved_scalar_type: non-numeric operand"),
+    }
+}
+
+/// Whether aggregate `surface` (case-insensitive) has a `COUNT(*)`-style star overload — only
+/// COUNT does. The data-driven replacement for the special-cased `_ if star` arm.
+fn aggregate_has_star(surface: &str) -> bool {
+    AGGREGATES
+        .iter()
+        .any(|a| a.surface.eq_ignore_ascii_case(surface) && a.arg == "star")
+}
+
+/// The matched aggregate overload row for `surface` over a single operand of resolved type `t`:
+/// the `arg="expr"` catalog row whose lone `arg_families` slot matches. `None` ⇒ no overload
+/// (42883, e.g. `SUM(text)`). MIN/MAX/COUNT take "any" (NULL included); SUM/AVG a numeric family.
+fn lookup_aggregate_overload(surface: &str, t: ResolvedType) -> Option<&'static AggregateDesc> {
+    AGGREGATES.iter().find(|a| {
+        a.surface.eq_ignore_ascii_case(surface)
+            && a.arg == "expr"
+            && a.arg_families.len() == 1
+            && family_matches(a.arg_families[0], t)
+    })
+}
+
+/// The runtime plan + result type for an aggregate over operand type `t`, from the matched
+/// overload's `surface` + catalog `result` code (the PG widening — aggregates.md §3). The plan
+/// is the aggregate's kernel id (fold/finalize switch on it); selecting it from the registered
+/// `result` code keeps the name gate + overload validation data-driven while the kernel stays
+/// hand-written (§5). `surface` is the lowercased call name; `result` the matched row's code.
+fn aggregate_plan(surface: &str, result: &str, t: ResolvedType) -> (AggPlan, ResolvedType) {
+    match (surface, result) {
+        ("count", _) => (AggPlan::Count, ResolvedType::Int(ScalarType::Int64)),
+        // SUM(int16|int32) → int64; SUM(int64) → decimal (PG widening).
+        ("sum", "sum_widen") => match t {
+            ResolvedType::Int(it) if it == ScalarType::Int64 => {
+                (AggPlan::SumDecimal, ResolvedType::Decimal)
+            }
+            ResolvedType::Int(_) => (AggPlan::SumInt, ResolvedType::Int(ScalarType::Int64)),
+            _ => unreachable!("sum_widen matches only the integer family"),
+        },
+        ("sum", "decimal") => (AggPlan::SumDecimal, ResolvedType::Decimal),
+        // SUM(float)/AVG(float) → SAME width (the canonical-order fold — float.md §7).
+        ("sum", "same_as_input") => {
+            let ft = resolved_scalar_type(t);
+            (AggPlan::SumFloat(ft), ResolvedType::Float(ft))
+        }
+        ("avg", "decimal") => (AggPlan::Avg, ResolvedType::Decimal),
+        ("avg", "same_as_input") => {
+            let ft = resolved_scalar_type(t);
+            (AggPlan::AvgFloat(ft), ResolvedType::Float(ft))
+        }
+        // MIN/MAX accept any ordered scalar; the result is the argument's own type.
+        ("min", "same_as_input") => (AggPlan::Min, t),
+        ("max", "same_as_input") => (AggPlan::Max, t),
+        _ => unreachable!("aggregate_plan: unhandled ({surface}, {result})"),
+    }
 }
 
 /// Resolve an aggregate call into a synthetic-row reference, collecting its `AggSpec`. Only
@@ -5738,70 +5873,28 @@ fn resolve_aggregate(
             "aggregate functions are not allowed here",
         ));
     }
-    let func = parse_agg_func(name)?;
     let mut sub = AggCtx::Forbidden;
-    let (plan, operand, result) = match func {
-        AggFunc::Count if star => (
-            AggPlan::CountStar,
-            None,
-            ResolvedType::Int(ScalarType::Int64),
-        ),
-        AggFunc::Count => {
-            let (r, _t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
-            (
-                AggPlan::Count,
-                Some(r),
-                ResolvedType::Int(ScalarType::Int64),
-            )
-        }
-        _ if star => {
+    let (plan, operand, result) = if star {
+        // Only COUNT has a star overload (aggregates.md §3); `SUM(*)` etc. is a syntax error.
+        if !aggregate_has_star(name) {
             return Err(EngineError::new(
                 SqlState::SyntaxError,
                 "* is only valid as the argument of COUNT",
             ));
         }
-        AggFunc::Sum => {
-            let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
-            match t {
-                // int16/int32 -> int64 (accumulate i64); int64 -> decimal (PG widening).
-                ResolvedType::Int(it) if it == ScalarType::Int64 => {
-                    (AggPlan::SumDecimal, Some(r), ResolvedType::Decimal)
-                }
-                ResolvedType::Int(_) => (
-                    AggPlan::SumInt,
-                    Some(r),
-                    ResolvedType::Int(ScalarType::Int64),
-                ),
-                ResolvedType::Decimal => (AggPlan::SumDecimal, Some(r), ResolvedType::Decimal),
-                // SUM(float) → SAME width (the canonical-order fold — spec/design/float.md §7).
-                ResolvedType::Float(ft) => {
-                    (AggPlan::SumFloat(ft), Some(r), ResolvedType::Float(ft))
-                }
-                _ => return Err(no_agg_overload("sum")),
-            }
-        }
-        AggFunc::Avg => {
-            let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
-            match t {
-                ResolvedType::Int(_) | ResolvedType::Decimal => {
-                    (AggPlan::Avg, Some(r), ResolvedType::Decimal)
-                }
-                // AVG(float) → SAME width (= SUM/count, rounded once — spec/design/float.md §7).
-                ResolvedType::Float(ft) => {
-                    (AggPlan::AvgFloat(ft), Some(r), ResolvedType::Float(ft))
-                }
-                _ => return Err(no_agg_overload("avg")),
-            }
-        }
-        // MIN/MAX accept any ordered scalar; the result is the argument's type.
-        AggFunc::Min => {
-            let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
-            (AggPlan::Min, Some(r), t)
-        }
-        AggFunc::Max => {
-            let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
-            (AggPlan::Max, Some(r), t)
-        }
+        (
+            AggPlan::CountStar,
+            None,
+            ResolvedType::Int(ScalarType::Int64),
+        )
+    } else {
+        // One operand, resolved in a fresh Forbidden sub-context. The registry validates the
+        // (surface, operand-family) overload exists (else 42883) and yields its result code; the
+        // plan + result type follow from it (the PG widening).
+        let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
+        let desc = lookup_aggregate_overload(name, t).ok_or_else(|| no_agg_overload(name))?;
+        let (plan, result) = aggregate_plan(name, desc.result, t);
+        (plan, Some(r), result)
     };
     if let AggCtx::Collect { group_keys, specs } = agg {
         // Aggregate results follow the group-key values in the synthetic row.
@@ -5852,12 +5945,12 @@ fn no_agg_overload(func: &str) -> EngineError {
     )
 }
 
-/// Whether `name` (case-insensitive) is one of the five aggregate functions.
+/// Whether `name` (case-insensitive) is a registered aggregate surface (COUNT/SUM/MIN/MAX/AVG).
+/// Data-driven over the catalog (`AGGREGATES`); consulted by the grouping + CHECK-structure walks.
 fn is_aggregate_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "count" | "sum" | "min" | "max" | "avg"
-    )
+    AGGREGATES
+        .iter()
+        .any(|a| a.surface.eq_ignore_ascii_case(name))
 }
 
 /// A scalar function over argument types it has no overload for (e.g. abs(text), round(int,
@@ -5885,37 +5978,24 @@ fn resolve_func_call(
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     let lname = name.to_ascii_lowercase();
-    match lname.as_str() {
-        "make_interval" => resolve_make_interval(scope, args, arg_names, star, agg, params),
-        "count" | "sum" | "min" | "max" | "avg" => {
-            reject_named(&lname, arg_names)?;
-            resolve_aggregate(scope, &lname, args, star, agg, params)
-        }
-        "abs"
-        | "round"
-        | "ceil"
-        | "floor"
-        | "trunc"
-        | "sqrt"
-        | "exp"
-        | "ln"
-        | "log10"
-        | "pow"
-        | "sin"
-        | "cos"
-        | "tan"
-        | "uuid_extract_version"
-        | "uuid_extract_timestamp"
-        | "uuidv4"
-        | "uuidv7" => {
-            reject_named(&lname, arg_names)?;
-            resolve_scalar_func(scope, &lname, args, star, agg, params)
-        }
-        _ => Err(EngineError::new(
-            SqlState::UndefinedFunction,
-            format!("function does not exist: {name}"),
-        )),
+    // make_interval is the one named/defaulted function — it keeps its own resolver (§11).
+    if lname == "make_interval" {
+        return resolve_make_interval(scope, args, arg_names, star, agg, params);
     }
+    // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
+    // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
+    if is_aggregate_name(&lname) {
+        reject_named(&lname, arg_names)?;
+        return resolve_aggregate(scope, &lname, args, star, agg, params);
+    }
+    if is_scalar_func_name(&lname) {
+        reject_named(&lname, arg_names)?;
+        return resolve_scalar_func(scope, &lname, args, star, agg, params);
+    }
+    Err(EngineError::new(
+        SqlState::UndefinedFunction,
+        format!("function does not exist: {name}"),
+    ))
 }
 
 /// Named notation is only valid for a function that declares parameter names. Reject it on any
@@ -6113,63 +6193,15 @@ fn resolve_scalar_func(
         rargs.push(r);
         tys.push(t);
     }
-    use ResolvedType::{Decimal as RDec, Float, Int};
-    let result = match (name, tys.as_slice()) {
-        // abs: result is the operand's own type (range-checked at its boundary for integers; the
-        // operand's float width for floats — spec/design/float.md §8, the only `promoted` float fn).
-        ("abs", [Int(it)]) => *it,
-        ("abs", [RDec]) => ScalarType::Decimal,
-        ("abs", [Float(ft)]) => *ft,
-        // round: decimal/integer overloads return numeric (PG round(5)); the FLOAT overloads
-        // (1- and 2-arg) return float64 (catalog `result = "float64"`).
-        ("round", [RDec])
-        | ("round", [RDec, Int(_)])
-        | ("round", [Int(_)])
-        | ("round", [Int(_), Int(_)]) => ScalarType::Decimal,
-        ("round", [Float(_)]) | ("round", [Float(_), Int(_)]) => ScalarType::Float64,
-        // The other float functions always return float64 (catalog `result = "float64"`), over a
-        // single float arg — exact (ceil/floor/trunc/sqrt) and transcendental (exp/ln/log10/sin/
-        // cos/tan). `pow` takes two floats (mixed widths promote to float64).
-        ("ceil", [Float(_)])
-        | ("floor", [Float(_)])
-        | ("trunc", [Float(_)])
-        | ("sqrt", [Float(_)])
-        | ("exp", [Float(_)])
-        | ("ln", [Float(_)])
-        | ("log10", [Float(_)])
-        | ("sin", [Float(_)])
-        | ("cos", [Float(_)])
-        | ("tan", [Float(_)])
-        | ("pow", [Float(_), Float(_)]) => ScalarType::Float64,
-        // uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
-        ("uuid_extract_version", [ResolvedType::Uuid]) => ScalarType::Int16,
-        ("uuid_extract_timestamp", [ResolvedType::Uuid]) => ScalarType::Timestamptz,
-        // uuid generators (spec/design/entropy.md §3): volatile; uuidv7 takes an optional interval
-        // shift. NULL propagation (a NULL interval) is handled centrally at eval.
-        ("uuidv4", []) => ScalarType::Uuid,
-        ("uuidv7", []) | ("uuidv7", [ResolvedType::Interval]) => ScalarType::Uuid,
-        _ => return Err(no_func_overload(name)),
-    };
-    let func = match name {
-        "abs" => ScalarFunc::Abs,
-        "round" => ScalarFunc::Round,
-        "ceil" => ScalarFunc::Ceil,
-        "floor" => ScalarFunc::Floor,
-        "trunc" => ScalarFunc::Trunc,
-        "sqrt" => ScalarFunc::Sqrt,
-        "exp" => ScalarFunc::Exp,
-        "ln" => ScalarFunc::Ln,
-        "log10" => ScalarFunc::Log10,
-        "pow" => ScalarFunc::Pow,
-        "sin" => ScalarFunc::Sin,
-        "cos" => ScalarFunc::Cos,
-        "tan" => ScalarFunc::Tan,
-        "uuid_extract_version" => ScalarFunc::UuidExtractVersion,
-        "uuid_extract_timestamp" => ScalarFunc::UuidExtractTimestamp,
-        "uuidv4" => ScalarFunc::Uuidv4,
-        "uuidv7" => ScalarFunc::Uuidv7,
-        _ => unreachable!("scalar-func dispatch admits only the names above"),
-    };
+    // Pick the overload by argument families, its result type by the catalog `result` code, and
+    // its kernel id by name (extensibility.md §5) — replacing the old hand-written (name,
+    // arg-types) result match + name→variant match. abs's "promoted" gives the operand's own type
+    // (its boundary range-checks for integers; its width for floats, the only `promoted` float fn);
+    // round's decimal/integer overloads return numeric, its float overloads float64; the remaining
+    // float functions return float64; the uuid extractors/generators return their catalog scalar id.
+    let desc = lookup_scalar_overload(name, &tys).ok_or_else(|| no_func_overload(name))?;
+    let result = scalar_result_type(desc.result, &tys);
+    let func = scalar_func_id(name);
     // Promote float arguments to float64 when the function computes at float64 (every float
     // overload except `abs(float32)`, which keeps its width). The eval then sees one width.
     let widen_args = !matches!(func, ScalarFunc::Abs);
@@ -9495,5 +9527,59 @@ fn family_rank(v: &Value) -> u8 {
         // Poisoned (large-values.md §14): ORDER BY slots are in the touched set, so a sort
         // key is always resolved before it reaches the comparator.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    // The function registry (extensibility.md §5) is data-driven over the generated catalog
+    // tables, but two halves stay hand-written per core: the scalar kernel id (`scalar_func_id`)
+    // and the result-code / plan interpreters. This guards against drift — a catalog row added
+    // without a matching kernel id or with a result code no interpreter handles fails here, not
+    // silently at some query's resolve.
+    #[test]
+    fn registry_covers_catalog() {
+        for o in OPERATORS.iter().filter(|o| o.kind == "function") {
+            // Every function name maps to a kernel id (panics via unreachable! if not).
+            let _ = scalar_func_id(o.name);
+            // Every function result code is one the interpreter understands: "promoted" or a
+            // literal scalar-type id.
+            assert!(
+                o.result == "promoted" || ScalarType::from_name(o.result).is_some(),
+                "function {} has unhandled result code {}",
+                o.name,
+                o.result
+            );
+        }
+        for a in AGGREGATES.iter() {
+            assert!(
+                matches!(
+                    a.result,
+                    "int64" | "decimal" | "sum_widen" | "same_as_input"
+                ),
+                "aggregate {} has unhandled result code {}",
+                a.name,
+                a.result
+            );
+            // Every overload is reachable: a star row via `aggregate_has_star`, an expr row via
+            // `lookup_aggregate_overload` over a representative operand of its declared family.
+            if a.arg == "star" {
+                assert!(aggregate_has_star(a.surface), "{} star overload", a.surface);
+            } else {
+                let probe = match a.arg_families.first().copied() {
+                    Some("integer") => ResolvedType::Int(ScalarType::Int32),
+                    Some("decimal") => ResolvedType::Decimal,
+                    Some("float") => ResolvedType::Float(ScalarType::Float64),
+                    _ => ResolvedType::Int(ScalarType::Int32), // "any"
+                };
+                let found = lookup_aggregate_overload(a.surface, probe)
+                    .expect("expr overload resolves for its declared family");
+                // And its plan/result selection is total (panics via unreachable! otherwise).
+                let lname = a.surface.to_ascii_lowercase();
+                let _ = aggregate_plan(&lname, found.result, probe);
+            }
+        }
     }
 }

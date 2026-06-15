@@ -246,3 +246,21 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
     assert.equal(weight(id), row.big("weight"), `${id}: weight`);
   }
 });
+
+test("function registry covers the catalog (extensibility.md §5)", () => {
+  // Resolution is data-driven over the generated tables, but the result-code interpreters in the
+  // executor (scalarResultType / aggregatePlan) stay hand-written. A catalog row with a result
+  // code no interpreter handles must fail here, not silently at some query's resolve. (The eval
+  // kernel is reached by the function name / the plan; the cross-core Rust + Go cross-check tests
+  // additionally pin their per-core kernel-id maps.)
+  // A scalar function's result code is "promoted" or a literal scalar-type id.
+  for (const o of OPERATORS) {
+    if (o.kind !== "function") continue;
+    const ok = o.result === "promoted" || scalarTypeFromName(o.result) !== undefined;
+    assert.ok(ok, `function ${o.name} has unhandled result code ${o.result}`);
+  }
+  const AGG_RESULT_CODES = new Set(["int64", "decimal", "sum_widen", "same_as_input"]);
+  for (const a of AGGREGATES) {
+    assert.ok(AGG_RESULT_CODES.has(a.result), `aggregate ${a.name} has unhandled result code ${a.result}`);
+  }
+});

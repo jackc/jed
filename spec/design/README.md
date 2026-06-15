@@ -37,3 +37,7 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   (CLAUDE.md §13).
 - [cores.md](cores.md) — what counts as a core vs. a wrapper, when to add the next core,
   and which languages add new divergence (the selection rule behind CLAUDE.md §2).
+- [extensibility.md](extensibility.md) — host extensibility (Phase 9): the PostgreSQL-style
+  catalog type system, host-defined functions, composite types, and core scalar types — and
+  why the system/extension line moves to *who owns cross-core determinism* rather than
+  vanishing (CLAUDE.md §2/§8/§10/§13).

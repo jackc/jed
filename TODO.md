@@ -1386,9 +1386,20 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       hurt a native core), native for clean pure-JAR packaging + in-process host functions
       (no JNI/upcall tax). Decide at scheduling time; Valhalla shifts it toward native.
       _(size: XL native / L wrap; §2)_
+- [x] **Runtime function registry — the §5 dispatch foundation** ([spec/design/extensibility.md](spec/design/extensibility.md) §5).
+      Resolution for the built-in named scalar functions + aggregates is now **data-driven over the
+      generated catalog tables** (`OPERATORS` kind=`function`, `AGGREGATES`): the known-name gate +
+      result-type match + name→variant match collapsed into one `(name, arg_families)` lookup plus
+      small shared result-code / plan interpreters, with the per-row kernel still reached by id
+      (`ScalarFunc` / `AggPlan`, hand-written per core). All three cores, behaviour-preserving
+      (conformance byte- and cost-identical; a per-core cross-check pins the registry to the
+      catalog). Built-in type-vtable dogfood (Fork A) and host registration into the table remain
+      open. _(done)_
 - [ ] **Design the host-function API vectorized/batched** up front — the single decision
       that keeps wrapping viable for any of the above (amortizes the per-row FFI upcall).
-      _(size: M; §2, cross-cutting)_
+      **Sits on the runtime function registry above** — host functions register into the same
+      `(name, arg_families)` table; a host name colliding with a built-in is rejected (propose
+      `42723`). _(size: M; §2, cross-cutting)_
 - [ ] **Host-defined functions must contribute to the cost system** — a hard requirement on
       the host-function API above, not an optional extra. A host function is otherwise
       **opaque to the meter** (its code does not route through `Meter::charge`), which breaks

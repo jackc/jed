@@ -5161,14 +5161,17 @@ func itemsHaveAggregate(items SelectItems) bool {
 	return false
 }
 
-// isAggregateName reports whether name (case-insensitive) is one of the five aggregates.
+// isAggregateName reports whether name (case-insensitive) is a registered aggregate surface
+// (COUNT/SUM/MIN/MAX/AVG). Data-driven over the catalog (Aggregates); consulted by the grouping
+// + CHECK-structure walks.
 func isAggregateName(name string) bool {
-	switch toLowerASCII(name) {
-	case "count", "sum", "min", "max", "avg":
-		return true
-	default:
-		return false
+	lname := toLowerASCII(name)
+	for i := range Aggregates {
+		if toLowerASCII(Aggregates[i].Surface) == lname {
+			return true
+		}
 	}
+	return false
 }
 
 // exprHasAggregate reports whether an expression tree contains an AGGREGATE call anywhere. A
@@ -5392,25 +5395,16 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		operand *rExpr
 		result  resolvedType
 	)
-	switch name {
-	case "count":
-		if fc.Star {
-			plan, operand, result = planCountStar, nil, resolvedType{kind: rtInt, intTy: Int64}
-		} else {
-			arg, err := aggArg(fc)
-			if err != nil {
-				return nil, resolvedType{}, err
-			}
-			r, _, err := resolve(s, arg, nil, sub, params)
-			if err != nil {
-				return nil, resolvedType{}, err
-			}
-			plan, operand, result = planCount, r, resolvedType{kind: rtInt, intTy: Int64}
-		}
-	case "sum", "avg", "min", "max":
-		if fc.Star {
+	if fc.Star {
+		// Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
+		if !aggregateHasStar(name) {
 			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
+		plan, operand, result = planCountStar, nil, resolvedType{kind: rtInt, intTy: Int64}
+	} else {
+		// One operand, resolved in a fresh Forbidden sub-context. The registry validates the
+		// (surface, operand-family) overload exists (else 42883) and yields its result code; the
+		// plan + result type follow from it (the PG widening).
 		arg, err := aggArg(fc)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -5419,42 +5413,12 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		switch name {
-		case "sum":
-			switch {
-			case t.kind == rtInt && t.intTy == Int64:
-				plan, operand, result = planSumDecimal, r, resolvedType{kind: rtDecimal}
-			case t.kind == rtInt:
-				plan, operand, result = planSumInt, r, resolvedType{kind: rtInt, intTy: Int64}
-			case t.kind == rtDecimal:
-				plan, operand, result = planSumDecimal, r, resolvedType{kind: rtDecimal}
-			case t.kind == rtFloat32:
-				// SUM over float stays the input width (same_as_input — spec/design/float.md §7).
-				plan, operand, result = planSumFloat32, r, resolvedType{kind: rtFloat32}
-			case t.kind == rtFloat64:
-				plan, operand, result = planSumFloat64, r, resolvedType{kind: rtFloat64}
-			default:
-				return nil, resolvedType{}, noAggOverload("sum")
-			}
-		case "avg":
-			switch {
-			case t.kind == rtInt || t.kind == rtDecimal:
-				plan, operand, result = planAvg, r, resolvedType{kind: rtDecimal}
-			case t.kind == rtFloat32:
-				// AVG over float stays float (NOT widened to double like PG — float.md §7).
-				plan, operand, result = planAvgFloat32, r, resolvedType{kind: rtFloat32}
-			case t.kind == rtFloat64:
-				plan, operand, result = planAvgFloat64, r, resolvedType{kind: rtFloat64}
-			default:
-				return nil, resolvedType{}, noAggOverload("avg")
-			}
-		case "min":
-			plan, operand, result = planMin, r, t
-		case "max":
-			plan, operand, result = planMax, r, t
+		desc := lookupAggregateOverload(name, t)
+		if desc == nil {
+			return nil, resolvedType{}, noAggOverload(name)
 		}
-	default:
-		return nil, resolvedType{}, NewError(UndefinedFunction, "function does not exist: "+fc.Name)
+		plan, result = aggregatePlan(name, desc.Result, t)
+		operand = r
 	}
 	// Aggregate results follow the group-key values in the synthetic row.
 	slot := len(ag.groupKeys) + len(ag.specs)
@@ -5481,30 +5445,262 @@ func noFuncOverload(fn string) error {
 	return NewError(UndefinedFunction, "no "+fn+" function for those argument types")
 }
 
+// === Function registry (spec/design/extensibility.md §5) ============================
+// Resolution for the named scalar functions and the aggregates is DATA-DRIVEN: instead of
+// re-encoding the name set in hand-written switches (the old known-name gate + result-type
+// match + name→variant match), it consults the generated catalog descriptor tables (Operators
+// rows with Kind=="function", and Aggregates) through the lookups below, keyed by (name,
+// arg_families). The per-row KERNEL is still reached by id (scalarFunc / aggPlan) and
+// hand-written per core — §5 forbids codegenning the kernels. The only function-specific
+// hand-written data are scalarFuncID + aggregatePlan; TestRegistryCoversCatalog proves them
+// total over the catalog. Host-registered functions would extend these lookups.
+
+// argFamily is the family a resolved type satisfies, for matching a catalog arg_families slot.
+// "" for NULL: an untyped NULL matches no *concrete* family (so abs(NULL)/sum(NULL) find no
+// overload — 42883), and only the wildcard "any" slot accepts it.
+func argFamily(t resolvedType) string {
+	switch t.kind {
+	case rtInt:
+		return "integer"
+	case rtDecimal:
+		return "decimal"
+	case rtFloat32, rtFloat64:
+		return "float"
+	case rtBool:
+		return "boolean"
+	case rtText:
+		return "text"
+	case rtBytea:
+		return "bytea"
+	case rtUuid:
+		return "uuid"
+	case rtTimestamp:
+		return "timestamp"
+	case rtTimestamptz:
+		return "timestamptz"
+	case rtInterval:
+		return "interval"
+	default: // rtNull
+		return ""
+	}
+}
+
+// familyMatches reports whether a resolved argument satisfies one catalog family slot. "any"
+// accepts everything (NULL included); a concrete family matches only its own type.
+func familyMatches(slot string, t resolvedType) bool {
+	return slot == "any" || argFamily(t) == slot
+}
+
+// isScalarFuncName reports whether name (lowercased) is a registered scalar function (catalog
+// Kind=="function") — the data-driven replacement for the old hand-written known-name gate.
+func isScalarFuncName(name string) bool {
+	for i := range Operators {
+		if Operators[i].Kind == "function" && Operators[i].Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupScalarOverload returns the matched scalar-function overload row for name over the resolved
+// argument types: the Kind=="function" catalog row whose ArgFamilies agree by arity + per-slot
+// family. nil ⇒ no overload (42883). make_interval resolves on its own named/defaulted path (§11).
+func lookupScalarOverload(name string, tys []resolvedType) *OperatorDesc {
+	for i := range Operators {
+		o := &Operators[i]
+		if o.Kind != "function" || o.Name != name || len(o.ArgFamilies) != len(tys) {
+			continue
+		}
+		match := true
+		for j, slot := range o.ArgFamilies {
+			if !familyMatches(slot, tys[j]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return o
+		}
+	}
+	return nil
+}
+
+// scalarFuncID is the kernel id for scalar function name over its argument types — the per-core
+// hand-written half of the registry (§5: the kernel is reached by id, never codegenned). abs and
+// round split by operand family (the Go core has distinct int/decimal vs float kernels); the rest
+// depend only on the name. Total over the catalog's function names (TestRegistryCoversCatalog).
+func scalarFuncID(name string, tys []resolvedType) scalarFunc {
+	floatArg := len(tys) >= 1 && isFloatKind(tys[0].kind)
+	switch name {
+	case "abs":
+		if floatArg {
+			return sfFloatAbs
+		}
+		return sfAbs
+	case "round":
+		if floatArg {
+			return sfFloatRound
+		}
+		return sfRound
+	case "ceil":
+		return sfCeil
+	case "floor":
+		return sfFloor
+	case "trunc":
+		return sfTrunc
+	case "sqrt":
+		return sfSqrt
+	case "exp":
+		return sfExp
+	case "ln":
+		return sfLn
+	case "log10":
+		return sfLog10
+	case "pow":
+		return sfPow
+	case "sin":
+		return sfSin
+	case "cos":
+		return sfCos
+	case "tan":
+		return sfTan
+	case "make_interval":
+		return sfMakeInterval
+	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
+	// (drawn from the entropy seam at eval); the kernel id is still the name.
+	case "uuid_extract_version":
+		return sfUuidExtractVersion
+	case "uuid_extract_timestamp":
+		return sfUuidExtractTimestamp
+	case "uuidv4":
+		return sfUuidv4
+	case "uuidv7":
+		return sfUuidv7
+	default:
+		panic("scalarFuncID: " + name + " is not a catalog function")
+	}
+}
+
+// scalarResultType is the result ScalarType of a scalar function from its catalog result code
+// (functions.md §9): "promoted" = the (single) operand's own type; otherwise the code is a literal
+// scalar-type id (e.g. "decimal", "float64", "interval", "int16", "timestamptz", "uuid").
+func scalarResultType(code string, tys []resolvedType) ScalarType {
+	if code == "promoted" {
+		return resolvedScalarType(tys[0])
+	}
+	ty, ok := ScalarTypeFromName(code)
+	if !ok {
+		panic("scalarResultType: unknown result code " + code)
+	}
+	return ty
+}
+
+// resolvedScalarType is the concrete ScalarType carried by a numeric resolved type (for the
+// "promoted" / "same_as_input" result rules). Only reached for the numeric families they admit.
+func resolvedScalarType(t resolvedType) ScalarType {
+	switch t.kind {
+	case rtInt:
+		return t.intTy
+	case rtFloat32:
+		return Float32
+	case rtFloat64:
+		return Float64
+	case rtDecimal:
+		return DecimalType
+	default:
+		panic("resolvedScalarType: non-numeric operand")
+	}
+}
+
+// aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
+// overload — only COUNT does. The data-driven replacement for the special-cased star arm.
+func aggregateHasStar(surface string) bool {
+	for i := range Aggregates {
+		if toLowerASCII(Aggregates[i].Surface) == surface && Aggregates[i].Arg == "star" {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupAggregateOverload returns the matched aggregate overload row for surface (lowercased)
+// over a single operand of resolved type t: the Arg=="expr" catalog row whose lone ArgFamilies
+// slot matches. nil ⇒ no overload (42883, e.g. SUM(text)). MIN/MAX/COUNT take "any".
+func lookupAggregateOverload(surface string, t resolvedType) *AggregateDesc {
+	for i := range Aggregates {
+		a := &Aggregates[i]
+		if toLowerASCII(a.Surface) == surface && a.Arg == "expr" && len(a.ArgFamilies) == 1 && familyMatches(a.ArgFamilies[0], t) {
+			return a
+		}
+	}
+	return nil
+}
+
+// aggregatePlan is the runtime plan + result type for an aggregate over operand type t, from the
+// matched overload's surface + catalog result code (the PG widening — aggregates.md §3). The plan
+// is the aggregate's kernel id (fold/finalize switch on it); selecting it from the registered
+// result code keeps the name gate + overload validation data-driven while the kernel stays
+// hand-written (§5). surface is the lowercased call name; result the matched row's code.
+func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedType) {
+	switch {
+	case surface == "count":
+		return planCount, resolvedType{kind: rtInt, intTy: Int64}
+	case surface == "sum" && result == "sum_widen":
+		// SUM(int16|int32) → int64; SUM(int64) → decimal (PG widening).
+		if t.kind == rtInt && t.intTy == Int64 {
+			return planSumDecimal, resolvedType{kind: rtDecimal}
+		}
+		return planSumInt, resolvedType{kind: rtInt, intTy: Int64}
+	case surface == "sum" && result == "decimal":
+		return planSumDecimal, resolvedType{kind: rtDecimal}
+	case surface == "sum" && result == "same_as_input":
+		// SUM/AVG over float stay the input width (the canonical-order fold — float.md §7).
+		if t.kind == rtFloat32 {
+			return planSumFloat32, resolvedType{kind: rtFloat32}
+		}
+		return planSumFloat64, resolvedType{kind: rtFloat64}
+	case surface == "avg" && result == "decimal":
+		return planAvg, resolvedType{kind: rtDecimal}
+	case surface == "avg" && result == "same_as_input":
+		if t.kind == rtFloat32 {
+			return planAvgFloat32, resolvedType{kind: rtFloat32}
+		}
+		return planAvgFloat64, resolvedType{kind: rtFloat64}
+	case surface == "min" && result == "same_as_input":
+		return planMin, t
+	case surface == "max" && result == "same_as_input":
+		return planMax, t
+	default:
+		panic("aggregatePlan: unhandled (" + surface + ", " + result + ")")
+	}
+}
+
 // resolveFuncCall resolves a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar
 // function (abs/round/…, spec/design/functions.md §9), the named/defaulted make_interval (§11),
 // or 42883 for any other name. Aggregates and scalar functions share the call syntax (grammar.md
 // §17); they are distinguished here. Named notation (name => value) is valid only for a function
 // that declares parameter names (make_interval); on every other function it is 42883.
 func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	switch toLowerASCII(fc.Name) {
-	case "make_interval":
+	name := toLowerASCII(fc.Name)
+	// make_interval is the one named/defaulted function — it keeps its own resolver (§11).
+	if name == "make_interval" {
 		return resolveMakeInterval(s, fc, ag, params)
-	case "count", "sum", "min", "max", "avg":
-		if err := rejectNamed(toLowerASCII(fc.Name), fc.ArgNames); err != nil {
+	}
+	// Otherwise the registry (the catalog descriptor tables) decides whether the name is an
+	// aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
+	if isAggregateName(name) {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}
 		return resolveAggregate(s, fc, ag, params)
-	case "abs", "round", "ceil", "floor", "trunc", "sqrt",
-		"exp", "ln", "log10", "pow", "sin", "cos", "tan",
-		"uuid_extract_version", "uuid_extract_timestamp", "uuidv4", "uuidv7":
-		if err := rejectNamed(toLowerASCII(fc.Name), fc.ArgNames); err != nil {
+	}
+	if isScalarFuncName(name) {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}
 		return resolveScalarFunc(s, fc, ag, params)
-	default:
-		return nil, resolvedType{}, NewError(UndefinedFunction, "function does not exist: "+fc.Name)
 	}
+	return nil, resolvedType{}, NewError(UndefinedFunction, "function does not exist: "+fc.Name)
 }
 
 // rejectNamed errors 42883 if any argument is named — named notation is valid only for a function
@@ -5683,102 +5879,20 @@ func resolveScalarFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		rargs = append(rargs, r)
 		tys = append(tys, t)
 	}
-	var (
-		fn     scalarFunc
-		result ScalarType
-	)
-	floatOne := len(tys) == 1 && isFloatKind(tys[0].kind)
-	switch {
-	// abs: result is the operand's own type (range-checked at its boundary for integers; the
-	// float overload — sfFloatAbs — returns the arg width per the catalog's "promoted").
-	case name == "abs" && len(tys) == 1 && tys[0].kind == rtInt:
-		fn, result = sfAbs, tys[0].intTy
-	case name == "abs" && len(tys) == 1 && tys[0].kind == rtDecimal:
-		fn, result = sfAbs, DecimalType
-	case name == "abs" && floatOne:
-		fn, result = sfFloatAbs, floatScalar(tys[0].kind)
-	// round: numeric overloads return decimal (PG round(5)); the float overload (1- or 2-arg)
-	// returns float64 per the catalog (../functions/catalog.toml).
-	case name == "round" && roundArgsOK(tys):
-		fn, result = sfRound, DecimalType
-	case name == "round" && floatRoundArgsOK(tys):
-		fn, result = sfFloatRound, Float64
-	// ceil/floor/trunc/sqrt over a float — exact (sqrt correctly-rounded); result float64 (catalog).
-	case name == "ceil" && floatOne:
-		fn, result = sfCeil, Float64
-	case name == "floor" && floatOne:
-		fn, result = sfFloor, Float64
-	case name == "trunc" && floatOne:
-		fn, result = sfTrunc, Float64
-	case name == "sqrt" && floatOne:
-		fn, result = sfSqrt, Float64
-	// transcendental (exempted, native libm): result float64 (catalog). pow is 2-arg, both float.
-	case name == "exp" && floatOne:
-		fn, result = sfExp, Float64
-	case name == "ln" && floatOne:
-		fn, result = sfLn, Float64
-	case name == "log10" && floatOne:
-		fn, result = sfLog10, Float64
-	case name == "pow" && len(tys) == 2 && isFloatKind(tys[0].kind) && isFloatKind(tys[1].kind):
-		fn, result = sfPow, Float64
-	case name == "sin" && floatOne:
-		fn, result = sfSin, Float64
-	case name == "cos" && floatOne:
-		fn, result = sfCos, Float64
-	case name == "tan" && floatOne:
-		fn, result = sfTan, Float64
-	// uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
-	case name == "uuid_extract_version" && len(tys) == 1 && tys[0].kind == rtUuid:
-		fn, result = sfUuidExtractVersion, Int16
-	case name == "uuid_extract_timestamp" && len(tys) == 1 && tys[0].kind == rtUuid:
-		fn, result = sfUuidExtractTimestamp, Timestamptz
-	// uuid generators (spec/design/entropy.md §3): volatile; uuidv7 takes an optional interval shift.
-	case name == "uuidv4" && len(tys) == 0:
-		fn, result = sfUuidv4, Uuid
-	case name == "uuidv7" && len(tys) == 0:
-		fn, result = sfUuidv7, Uuid
-	case name == "uuidv7" && len(tys) == 1 && tys[0].kind == rtInterval:
-		fn, result = sfUuidv7, Uuid
-	default:
+	// Pick the overload by argument families, its result type by the catalog `result` code, and
+	// its kernel id by name + family (extensibility.md §5) — replacing the old hand-written
+	// (name, arg-types) switch. abs's "promoted" gives the operand's own type (its boundary
+	// range-checks for integers, its width for floats); round's numeric overloads return decimal,
+	// its float overloads float64; the remaining float functions return float64; the uuid
+	// extractors/generators return their catalog scalar id.
+	desc := lookupScalarOverload(name, tys)
+	if desc == nil {
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
+	fn := scalarFuncID(name, tys)
+	result := scalarResultType(desc.Result, tys)
 	rt := resolvedTypeOf(result)
 	return &rExpr{kind: reScalarFunc, sfunc: fn, sargs: rargs, result: result}, rt, nil
-}
-
-// floatScalar maps a float rtKind to its ScalarType.
-func floatScalar(k rtKind) ScalarType {
-	if k == rtFloat32 {
-		return Float32
-	}
-	return Float64
-}
-
-// floatRoundArgsOK reports whether the args match the float round overload: a float value and an
-// optional integer place count (spec/functions/catalog.toml round(float[, integer])).
-func floatRoundArgsOK(tys []resolvedType) bool {
-	switch len(tys) {
-	case 1:
-		return isFloatKind(tys[0].kind)
-	case 2:
-		return isFloatKind(tys[0].kind) && tys[1].kind == rtInt
-	default:
-		return false
-	}
-}
-
-// roundArgsOK reports whether the argument types match a round overload: a numeric value
-// (integer or decimal) and an optional integer count.
-func roundArgsOK(tys []resolvedType) bool {
-	numeric := func(t resolvedType) bool { return t.kind == rtInt || t.kind == rtDecimal }
-	switch len(tys) {
-	case 1:
-		return numeric(tys[0])
-	case 2:
-		return numeric(tys[0]) && tys[1].kind == rtInt
-	default:
-		return false
-	}
 }
 
 // groupingErrorColumn is the 42803 for a non-aggregated column not in GROUP BY.

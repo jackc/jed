@@ -412,3 +412,65 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 		}
 	}
 }
+
+// TestRegistryCoversCatalog guards the function registry (extensibility.md §5): resolution is
+// data-driven over the generated catalog tables, but the scalar kernel id (scalarFuncID) and the
+// result-code / plan interpreters stay hand-written per core. A catalog row added without a
+// matching kernel id, or with a result code no interpreter handles, fails here — not silently at
+// some query's resolve.
+func TestRegistryCoversCatalog(t *testing.T) {
+	probe := func(fam string) resolvedType {
+		switch fam {
+		case "decimal":
+			return resolvedType{kind: rtDecimal}
+		case "float":
+			return resolvedType{kind: rtFloat64}
+		case "uuid":
+			return resolvedType{kind: rtUuid}
+		case "interval":
+			return resolvedType{kind: rtInterval}
+		default: // "integer" or "any"
+			return resolvedType{kind: rtInt, intTy: Int32}
+		}
+	}
+	for i := range Operators {
+		o := &Operators[i]
+		if o.Kind != "function" {
+			continue
+		}
+		tys := make([]resolvedType, len(o.ArgFamilies))
+		for j, fam := range o.ArgFamilies {
+			tys[j] = probe(fam)
+		}
+		_ = scalarFuncID(o.Name, tys) // panics if the name has no kernel id
+		// The result code is "promoted" or a literal scalar-type id.
+		if _, ok := ScalarTypeFromName(o.Result); o.Result != "promoted" && !ok {
+			t.Fatalf("function %s has unhandled result code %s", o.Name, o.Result)
+		}
+		// make_interval resolves on its own named/defaulted path; the rest match via the registry.
+		if o.Name != "make_interval" && lookupScalarOverload(o.Name, tys) == nil {
+			t.Fatalf("function %s %v has no registry overload", o.Name, o.ArgFamilies)
+		}
+	}
+	for i := range Aggregates {
+		a := &Aggregates[i]
+		switch a.Result {
+		case "int64", "decimal", "sum_widen", "same_as_input":
+		default:
+			t.Fatalf("aggregate %s has unhandled result code %s", a.Name, a.Result)
+		}
+		surface := toLowerASCII(a.Surface)
+		if a.Arg == "star" {
+			if !aggregateHasStar(surface) {
+				t.Fatalf("aggregate %s star overload not found", a.Surface)
+			}
+			continue
+		}
+		pt := probe(a.ArgFamilies[0])
+		found := lookupAggregateOverload(surface, pt)
+		if found == nil {
+			t.Fatalf("aggregate %s expr overload not found for its family", a.Surface)
+		}
+		_, _ = aggregatePlan(surface, found.Result, pt) // panics if (surface,result) unhandled
+	}
+}

@@ -92,7 +92,7 @@ import {
   tsDiff,
   tsShift,
 } from "./interval.ts";
-import { OPERATORS, type OperatorDesc } from "./operators.ts";
+import { AGGREGATES, type AggregateDesc, OPERATORS, type OperatorDesc } from "./operators.ts";
 import {
   type Value,
   boolAnd,
@@ -3786,16 +3786,8 @@ function itemsHaveAggregate(items: SelectItems): boolean {
 
 // isAggregateName reports whether name (case-insensitive) is one of the five aggregates.
 function isAggregateName(name: string): boolean {
-  switch (name.toLowerCase()) {
-    case "count":
-    case "sum":
-    case "min":
-    case "max":
-    case "avg":
-      return true;
-    default:
-      return false;
-  }
+  const lname = name.toLowerCase();
+  return AGGREGATES.some((a) => a.surface.toLowerCase() === lname);
 }
 
 // exprHasAggregate reports whether an expression tree contains an AGGREGATE call anywhere. A
@@ -3975,65 +3967,24 @@ function resolveAggregate(
   let result: ResolvedType;
   // The input float width for a float SUM/AVG (so the canonical fold rounds at the right width).
   let floatWidth: ScalarType | undefined;
-  // Each aggregate takes exactly one argument; a different count matches no aggregate overload
-  // and is 42883 (PG).
-  const arg = (): Expr => {
+  if (e.star) {
+    // Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
+    if (!aggregateHasStar(name)) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    plan = "countStar";
+    operand = null;
+    result = { kind: "int", ty: "int64" };
+  } else {
+    // One operand, resolved in a fresh Forbidden sub-context. The registry validates the (surface,
+    // operand-family) overload exists (else 42883) and yields its result code; the plan + result
+    // type follow from it (the PG widening). Each aggregate takes exactly one argument.
     if (e.args.length !== 1) {
       throw engineError("undefined_function", "no aggregate function matches the given argument count");
     }
-    return e.args[0];
-  };
-  if (name === "count") {
-    if (e.star) {
-      plan = "countStar";
-      operand = null;
-      result = { kind: "int", ty: "int64" };
-    } else {
-      operand = resolve(scope, arg(), null, sub, params).node;
-      plan = "count";
-      result = { kind: "int", ty: "int64" };
-    }
-  } else if (name === "sum" || name === "avg" || name === "min" || name === "max") {
-    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-    const r = resolve(scope, arg(), null, sub, params);
+    const r = resolve(scope, e.args[0], null, sub, params);
     operand = r.node;
-    if (name === "sum") {
-      if (r.type.kind === "int" && r.type.ty === "int64") {
-        plan = "sumDecimal";
-        result = { kind: "decimal" };
-      } else if (r.type.kind === "int") {
-        plan = "sumInt";
-        result = { kind: "int", ty: "int64" };
-      } else if (r.type.kind === "decimal") {
-        plan = "sumDecimal";
-        result = { kind: "decimal" };
-      } else if (r.type.kind === "float") {
-        // SUM(floatN) → floatN (same_as_input, matching PG sum(real) → real): the canonical fold.
-        plan = "sumFloat";
-        result = { kind: "float", ty: r.type.ty };
-        floatWidth = r.type.ty;
-      } else {
-        throw noAggOverload("sum");
-      }
-    } else if (name === "avg") {
-      if (r.type.kind === "int" || r.type.kind === "decimal") {
-        plan = "avg";
-        result = { kind: "decimal" };
-      } else if (r.type.kind === "float") {
-        // AVG(floatN) → floatN (a divergence from PG, which widens AVG(real) → double; float.md §7).
-        plan = "avgFloat";
-        result = { kind: "float", ty: r.type.ty };
-        floatWidth = r.type.ty;
-      } else {
-        throw noAggOverload("avg");
-      }
-    } else {
-      // MIN/MAX over any family (incl. float) via the total order; result = the operand's type.
-      plan = name; // "min" | "max"
-      result = r.type;
-    }
-  } else {
-    throw engineError("undefined_function", "function does not exist: " + e.name);
+    const desc = lookupAggregateOverload(name, r.type);
+    if (!desc) throw noAggOverload(name);
+    [plan, result, floatWidth] = aggregatePlan(name, desc.result, r.type);
   }
   // Aggregate results follow the group-key values in the synthetic row.
   const slot = ag.groupKeys.length + ag.specs.length;
@@ -4063,6 +4014,144 @@ function noFuncOverload(fn: string): EngineError {
   return engineError("undefined_function", "no " + fn + " function for those argument types");
 }
 
+// === Function registry (spec/design/extensibility.md §5) ============================
+// Resolution for the named scalar functions and the aggregates is DATA-DRIVEN: instead of
+// re-encoding the name set in hand-written switches (the old known-name gate + result-type match
+// + name→variant match), it consults the generated catalog descriptor tables (OPERATORS rows
+// with kind === "function", and AGGREGATES) through the lookups below, keyed by (name,
+// arg_families). The per-row KERNEL is still reached by id (the `func` name / the `plan`) and
+// hand-written per core — §5 forbids codegenning the kernels. The only function-specific
+// hand-written data are the result-code / plan interpreters; the spec_constants test proves them
+// total over the catalog. Host-registered functions would extend these lookups.
+
+// argFamily is the family a resolved type satisfies, for matching a catalog argFamilies slot.
+// null for the NULL family: an untyped NULL matches no *concrete* family (so abs(NULL)/sum(NULL)
+// find no overload — 42883), and only the wildcard "any" slot accepts it.
+function argFamily(t: ResolvedType): string | null {
+  switch (t.kind) {
+    case "int":
+      return "integer";
+    case "decimal":
+      return "decimal";
+    case "float":
+      return "float";
+    case "bool":
+      return "boolean";
+    case "text":
+      return "text";
+    case "bytea":
+      return "bytea";
+    case "uuid":
+      return "uuid";
+    case "timestamp":
+      return "timestamp";
+    case "timestamptz":
+      return "timestamptz";
+    case "interval":
+      return "interval";
+    case "null":
+      return null;
+  }
+}
+
+// familyMatches reports whether a resolved argument satisfies one catalog family slot. "any"
+// accepts everything (NULL included); a concrete family matches only its own type.
+function familyMatches(slot: string, t: ResolvedType): boolean {
+  return slot === "any" || argFamily(t) === slot;
+}
+
+// isScalarFuncName reports whether name (lowercased) is a registered scalar function (catalog
+// kind === "function") — the data-driven replacement for the old hand-written known-name gate.
+function isScalarFuncName(name: string): boolean {
+  return OPERATORS.some((o) => o.kind === "function" && o.name === name);
+}
+
+// lookupScalarOverload returns the matched scalar-function overload row for name over the resolved
+// argument types: the kind === "function" catalog row whose argFamilies agree by arity + per-slot
+// family. undefined ⇒ no overload (42883). make_interval resolves on its own path (§11).
+function lookupScalarOverload(name: string, tys: ResolvedType[]): OperatorDesc | undefined {
+  return OPERATORS.find(
+    (o) =>
+      o.kind === "function" &&
+      o.name === name &&
+      o.argFamilies.length === tys.length &&
+      o.argFamilies.every((slot, i) => familyMatches(slot, tys[i]!)),
+  );
+}
+
+// resolvedScalarType is the concrete ScalarType carried by a numeric resolved type (for the
+// "promoted" / "same_as_input" result rules). Only reached for the numeric families they admit.
+function resolvedScalarType(t: ResolvedType): ScalarType {
+  switch (t.kind) {
+    case "int":
+    case "float":
+      return t.ty;
+    case "decimal":
+      return "decimal";
+    default:
+      throw new Error("resolvedScalarType: non-numeric operand");
+  }
+}
+
+// scalarResultType is the result ScalarType of a scalar function from its catalog result code
+// (functions.md §9): "promoted" = the (single) operand's own type; otherwise the code is a literal
+// scalar-type id (e.g. "decimal", "float64", "interval", "int16", "timestamptz", "uuid").
+function scalarResultType(code: string, tys: ResolvedType[]): ScalarType {
+  if (code === "promoted") return resolvedScalarType(tys[0]!);
+  const ty = scalarTypeFromName(code);
+  if (ty === undefined) throw new Error("scalarResultType: unknown result code " + code);
+  return ty;
+}
+
+// aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
+// overload — only COUNT does. The data-driven replacement for the special-cased star arm.
+function aggregateHasStar(surface: string): boolean {
+  return AGGREGATES.some((a) => a.surface.toLowerCase() === surface && a.arg === "star");
+}
+
+// lookupAggregateOverload returns the matched aggregate overload row for surface (lowercased) over
+// a single operand of resolved type t: the arg === "expr" catalog row whose lone argFamilies slot
+// matches. undefined ⇒ no overload (42883, e.g. SUM(text)). MIN/MAX/COUNT take "any".
+function lookupAggregateOverload(surface: string, t: ResolvedType): AggregateDesc | undefined {
+  return AGGREGATES.find(
+    (a) =>
+      a.surface.toLowerCase() === surface &&
+      a.arg === "expr" &&
+      a.argFamilies.length === 1 &&
+      familyMatches(a.argFamilies[0]!, t),
+  );
+}
+
+// aggregatePlan is the runtime plan + result type (+ the float width that rides on the Acc) for an
+// aggregate over operand type t, from the matched overload's surface + catalog result code (the PG
+// widening — aggregates.md §3). The plan is the aggregate's kernel id (fold/finalize switch on it);
+// selecting it from the registered result code keeps the name gate + overload validation
+// data-driven while the kernel stays hand-written (§5). surface is the lowercased call name.
+function aggregatePlan(
+  surface: string,
+  code: string,
+  t: ResolvedType,
+): [AggPlan, ResolvedType, ScalarType | undefined] {
+  if (surface === "count") return ["count", { kind: "int", ty: "int64" }, undefined];
+  if (surface === "sum" && code === "sum_widen") {
+    // SUM(int16|int32) → int64; SUM(int64) → decimal (PG widening).
+    if (t.kind === "int" && t.ty === "int64") return ["sumDecimal", { kind: "decimal" }, undefined];
+    return ["sumInt", { kind: "int", ty: "int64" }, undefined];
+  }
+  if (surface === "sum" && code === "decimal") return ["sumDecimal", { kind: "decimal" }, undefined];
+  if (surface === "sum" && code === "same_as_input" && t.kind === "float") {
+    // SUM/AVG over float stay the input width (the canonical-order fold — float.md §7).
+    return ["sumFloat", { kind: "float", ty: t.ty }, t.ty];
+  }
+  if (surface === "avg" && code === "decimal") return ["avg", { kind: "decimal" }, undefined];
+  if (surface === "avg" && code === "same_as_input" && t.kind === "float") {
+    return ["avgFloat", { kind: "float", ty: t.ty }, t.ty];
+  }
+  if (surface === "min" && code === "same_as_input") return ["min", t, undefined];
+  if (surface === "max" && code === "same_as_input") return ["max", t, undefined];
+  throw new Error(`aggregatePlan: unhandled (${surface}, ${code})`);
+}
+
 // resolveFuncCall resolves a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar
 // function (abs/round/…, spec/design/functions.md §9), the named/defaulted make_interval (§11), or
 // 42883 for any other name. Aggregates and scalar functions share the call syntax (grammar.md §17);
@@ -4075,38 +4164,19 @@ function resolveFuncCall(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   const lname = e.name.toLowerCase();
-  switch (lname) {
-    case "make_interval":
-      return resolveMakeInterval(scope, e, ag, params);
-    case "count":
-    case "sum":
-    case "min":
-    case "max":
-    case "avg":
-      rejectNamed(lname, e.argNames);
-      return resolveAggregate(scope, e, ag, params);
-    case "abs":
-    case "round":
-    case "ceil":
-    case "floor":
-    case "trunc":
-    case "sqrt":
-    case "exp":
-    case "ln":
-    case "log10":
-    case "pow":
-    case "sin":
-    case "cos":
-    case "tan":
-    case "uuid_extract_version":
-    case "uuid_extract_timestamp":
-    case "uuidv4":
-    case "uuidv7":
-      rejectNamed(lname, e.argNames);
-      return resolveScalarFunc(scope, e, ag, params);
-    default:
-      throw engineError("undefined_function", "function does not exist: " + e.name);
+  // make_interval is the one named/defaulted function — it keeps its own resolver (§11).
+  if (lname === "make_interval") return resolveMakeInterval(scope, e, ag, params);
+  // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
+  // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
+  if (isAggregateName(lname)) {
+    rejectNamed(lname, e.argNames);
+    return resolveAggregate(scope, e, ag, params);
   }
+  if (isScalarFuncName(lname)) {
+    rejectNamed(lname, e.argNames);
+    return resolveScalarFunc(scope, e, ag, params);
+  }
+  throw engineError("undefined_function", "function does not exist: " + e.name);
 }
 
 // rejectNamed throws 42883 if any argument is named — named notation is valid only for a function
@@ -4251,70 +4321,24 @@ function resolveScalarFunc(
     rargs.push(r.node);
     tys.push(r.type);
   }
-  const numeric = (t: ResolvedType): boolean => t.kind === "int" || t.kind === "decimal";
-
-  // abs / round span int/decimal AND float overloads (float.md §8).
-  if (name === "abs" && tys.length === 1 && tys[0].kind === "int") {
-    // abs: result is the operand's own type (range-checked at its boundary for integers).
-    return scalarFuncNode("abs", rargs, tys[0].ty, undefined);
+  // Pick the overload by argument families and its result type by the catalog `result` code
+  // (extensibility.md §5) — replacing the old hand-written chain of (name, arg-types) checks.
+  const desc = lookupScalarOverload(name, tys);
+  if (!desc) throw noFuncOverload(name);
+  // Every float function computes at the operand's float width (argWidth), so a float32 operand
+  // rounds at binary32 even where the catalog's result is float64; abs(float) also keeps that width
+  // as its result. Non-float args carry no width. pow is the one (float, float) function — it
+  // promotes its mixed-width pair to a common width and widens both arguments to it.
+  let argWidth: ScalarType | undefined;
+  if (name === "pow" && tys[0].kind === "float" && tys[1].kind === "float") {
+    argWidth = promoteFloat(tys[0].ty, tys[1].ty);
+    rargs[0] = widenFloatTo(rargs[0]!, tys[0].ty, argWidth);
+    rargs[1] = widenFloatTo(rargs[1]!, tys[1].ty, argWidth);
+  } else if (tys.length >= 1 && tys[0].kind === "float") {
+    argWidth = tys[0].ty;
   }
-  if (name === "abs" && tys.length === 1 && tys[0].kind === "decimal") {
-    return scalarFuncNode("abs", rargs, "decimal", undefined);
-  }
-  if (name === "abs" && tys.length === 1 && tys[0].kind === "float") {
-    // abs over float: result is the operand's OWN width (the only width-preserving float func —
-    // catalog `result = "promoted"`; the others are always float64). argWidth carries the width
-    // so the evaluator frounds a float32 result.
-    return scalarFuncNode("abs", rargs, tys[0].ty, tys[0].ty);
-  }
-  if (
-    // round: int/decimal → decimal (PG round(5) → numeric); float → float64 (catalog).
-    name === "round" &&
-    ((tys.length === 1 && numeric(tys[0])) || (tys.length === 2 && numeric(tys[0]) && tys[1].kind === "int"))
-  ) {
-    return scalarFuncNode("round", rargs, "decimal", undefined);
-  }
-  if (
-    name === "round" &&
-    ((tys.length === 1 && tys[0].kind === "float") ||
-      (tys.length === 2 && tys[0].kind === "float" && tys[1].kind === "int"))
-  ) {
-    // round(float) / round(float, n) → float64 (catalog result "float64"); argWidth = the value's
-    // width so the rounding is done at that width (and frounded for float32).
-    return scalarFuncNode("round", rargs, "float64", tys[0].ty);
-  }
-
-  // The float-only scalar functions (float.md §8): single float arg → float64 (catalog), except
-  // pow which takes (float, float) promoting to float64. argWidth is the (promoted) arg width so a
-  // float32 operand computes at binary32 where the catalog's result is still float64.
-  const FLOAT_UNARY: readonly ScalarFuncName[] = ["ceil", "floor", "trunc", "sqrt", "exp", "ln", "log10", "sin", "cos", "tan"];
-  if (FLOAT_UNARY.includes(name) && tys.length === 1 && tys[0].kind === "float") {
-    return scalarFuncNode(name, rargs, "float64", tys[0].ty);
-  }
-  if (name === "pow" && tys.length === 2 && tys[0].kind === "float" && tys[1].kind === "float") {
-    // pow promotes a mixed-width pair to float64 (arg_resolution "promote"); result float64.
-    const w = promoteFloat(tys[0].ty, tys[1].ty);
-    const a0 = widenFloatTo(rargs[0]!, tys[0].ty, w);
-    const a1 = widenFloatTo(rargs[1]!, tys[1].ty, w);
-    return scalarFuncNode("pow", [a0, a1], "float64", w);
-  }
-
-  // uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
-  if (name === "uuid_extract_version" && tys.length === 1 && tys[0].kind === "uuid") {
-    return scalarFuncNode("uuid_extract_version", rargs, "int16", undefined);
-  }
-  if (name === "uuid_extract_timestamp" && tys.length === 1 && tys[0].kind === "uuid") {
-    return scalarFuncNode("uuid_extract_timestamp", rargs, "timestamptz", undefined);
-  }
-  // uuid generators (spec/design/entropy.md §3): volatile; uuidv7 takes an optional interval shift.
-  if (name === "uuidv4" && tys.length === 0) {
-    return scalarFuncNode("uuidv4", rargs, "uuid", undefined);
-  }
-  if (name === "uuidv7" && (tys.length === 0 || (tys.length === 1 && tys[0].kind === "interval"))) {
-    return scalarFuncNode("uuidv7", rargs, "uuid", undefined);
-  }
-
-  throw noFuncOverload(name);
+  const result = scalarResultType(desc.result, tys);
+  return scalarFuncNode(name, rargs, result, argWidth);
 }
 
 // scalarFuncNode builds a resolved scalar-function node + its public type.
