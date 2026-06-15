@@ -173,7 +173,7 @@ oracle-checked).
 key-encodable type — the same per-column rule as the column-level form: the integer types,
 `uuid`, `timestamp`, `timestamptz`; a `text`/`decimal`/`bytea`/`boolean` member is the same
 documented `0A000` narrowing ([types.md](types.md) §9/§11/§12/§13). The UPDATE narrowing
-extends naturally: assigning **any** member column traps `0A000` (grammar.md §14 — the
+extends naturally: assigning **any** member column traps `0A000` (CLAUDE.md §11 step 6 — the
 storage key never changes).
 
 **The key bytes are the concatenation** of the members' bare encodings, in **key order**

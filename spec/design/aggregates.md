@@ -17,15 +17,15 @@ but a *fold over rows*, and the first **function-call** syntax ([grammar.md](gra
 ## 1. Role, scope, and staging
 
 The five aggregates are `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`
-([catalog.toml](../functions/catalog.toml), `kind = "aggregate"`). They land in **three
-vertical slices** (CLAUDE.md §10/§11), each a commit across all three cores:
+([catalog.toml](../functions/catalog.toml), `kind = "aggregate"`). They landed in **three
+vertical slices** (CLAUDE.md §10/§11), each a commit across all three cores — all now landed:
 
 1. **Scalar aggregates with no `GROUP BY`** — the function-call syntax and whole-table
    aggregation: the entire (post-`WHERE`) result is one group → exactly one result row.
-   This is what §2–§9 below describe and what this slice implements.
+   This is what §2–§9 below describe.
 2. **`GROUP BY`** — one result row per distinct grouping-key combination, and the
-   grouping-error rule (§10, fleshed out when the slice lands).
-3. **`HAVING`** — a boolean filter over grouped rows (§10).
+   grouping-error rule (§10, [grammar.md](grammar.md) §18).
+3. **`HAVING`** — a boolean filter over grouped rows (§10, [grammar.md](grammar.md) §19).
 
 Locked scope decisions: **PostgreSQL widening** for `SUM`/`AVG` (§3); **`DISTINCT` inside an
 aggregate** (`COUNT(DISTINCT x)`) is **deferred** — rejected `42601` at parse (§5).
@@ -187,8 +187,8 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
 - **`GROUP BY`** (landed) — partitions the post-`WHERE` rows by one or more grouping keys
   (bare/qualified **columns** only, mirroring the `ORDER BY` narrowing — general
   expressions, ordinals, and output-alias keys deferred), emitting one row per distinct key
-  combination (§5). The **grouping-error rule** (§6): every non-aggregated column in the
-  select list (and `ORDER BY`) must be a grouping key, else `42803`. `NULL` forms its own
+  combination. The **grouping-error rule** ([grammar.md](grammar.md) §18): every
+  non-aggregated column in the select list (and `ORDER BY`) must be a grouping key, else `42803`. `NULL` forms its own
   group; decimal keys bucket value-canonically (the displayed key is the first occurrence's
   value). `GROUP BY` over an empty table → zero rows. **`ORDER BY` over the grouped output**
   resolves each key against the grouping keys — a grouping column sorts the group rows

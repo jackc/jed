@@ -4,7 +4,7 @@
 > blocked only during the commit window, exactly one committed version plus one writer's
 > pending set, **not** MVCC. This is a *design* doc and the canonical record for the
 > transaction model. The SQL surface (`BEGIN`/`COMMIT`/`ROLLBACK`) and its conformance
-> corpus land in a later sub-slice (§4); this doc fixes the model they implement. The
+> corpus **landed in P5.2** (§4); this doc is the canonical model they implement. The
 > per-impl host API (the `Transaction` handle, `view`/`update`, the `synchronous` setting) is
 > in [api.md](api.md); the storage realization is in [storage.md](storage.md) §4. When a
 > decision here changes, update [CLAUDE.md](../../CLAUDE.md) §3/§9, [storage.md](storage.md)
@@ -127,7 +127,7 @@ that replaces it for *pages* is Phase 6, and it leans on the §8 watermark.
 ## 4. Modes, control surface, and access modes
 
 > The grammar ([../grammar/grammar.ebnf](../grammar/grammar.ebnf), [grammar.md](grammar.md)),
-> the parsers, and the conformance corpus for the SQL statements land in the **P5.2 sub-slice**
+> the parsers, and the conformance corpus for the SQL statements **landed in the P5.2 sub-slice**
 > ([TODO.md](../../TODO.md) Phase 5), spec-first as always. This section fixes their semantics;
 > the host-API equivalents are in [api.md](api.md).
 

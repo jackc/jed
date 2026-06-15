@@ -15,17 +15,23 @@ Operator *result types* (e.g. the type of `int32 + int32`) live here, not in
 `functions/` defines what operators do with them, **referencing** `types/` rather than
 restating it.
 
-## Covered operators
+## Covered entries
 
-| Kind | Operators | Result | NULL |
+The catalog has grown well past the original operator set. Authored kinds:
+
+| Kind | Members | Result | NULL |
 |---|---|---|---|
 | `logical` | `AND` `OR` `NOT` | `boolean` | `kleene` (AND/OR), `propagates` (NOT) |
-| `comparison` | `=` `<` `>` `<=` `>=` | `boolean` | propagates |
+| `comparison` | `=` `<` `>` `<=` `>=`, `IS [NOT] DISTINCT FROM` | `boolean` | propagates (null-safe for `IS [NOT] DISTINCT FROM`) |
 | `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` (always definite) | detects |
-| `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` | propagates |
+| `arithmetic` | `+` `-` `*` `/` `%`, unary `-` (integer / decimal / float / interval / timestamp families) | `promoted` | propagates |
+| `function` (scalar) | `abs` `round`, `make_interval`, `uuid_extract_version`/`uuid_extract_timestamp`, `uuidv4`/`uuidv7`, `now`/`clock_timestamp` | per-function (§9–§12) | propagates / volatile-on-seam |
+| `aggregate` | `count` `sum` `min` `max` `avg` | per-PG widening | skip-NULL |
+| `set_returning` | `generate_series` | a row **set** | any NULL arg → 0 rows |
 
-> Status: covers the comparison/null-test/arithmetic/logical operators the cores
-> implement today (`<>`/`!=` do not exist). The `precedence` field is now authored;
-> `cost` and the deferred surfaces — `IS [NOT] DISTINCT FROM`, named `function` entries —
-> are added here *first* as their features land. Coherence is checked by
-> [verify.rb](verify.rb) (`rake verify`).
+> Status: covers the operators, scalar functions, aggregates, and set-returning functions
+> the three cores implement today — 28 scalar `function`, 10 `aggregate`, and 2
+> `set_returning` entries alongside the operator kinds (`<>`/`!=` deliberately do not
+> exist — only `=`). The `precedence` and `cost` fields are authored, and
+> `IS [NOT] DISTINCT FROM` plus the named / `DEFAULT`-argument functions have landed.
+> Coherence is checked by [verify.rb](verify.rb) (`rake verify`).

@@ -257,7 +257,7 @@ null_ordering = "nulls-last-ascending"
 # Kleene truth tables for the AND/OR/NOT connectives over that domain live in
 # ../design/types.md (the catalog records only each operator's NULL discipline).
 # `IS [NOT] NULL` is the way to test for NULL; `IS [NOT] DISTINCT FROM` (NULL-safe
-# equality) is now unblocked by the boolean type but not yet authored.
+# equality) has landed, overloaded over the integer, text, and boolean families.
 [null]
 logic = "three-valued"
 comparison_with_null = "unknown"

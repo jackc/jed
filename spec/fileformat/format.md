@@ -606,7 +606,7 @@ the cap (the design rationale and decisions are in
   gathers them, decompresses to `raw_len`, and reconstructs by type.
 
 - **Overflow page (`page_type = 4`).** The chain's stored bytes — the content payload (`0x02`) or
-  the compressed block (`0x04`) — are split into **`C`-byte slabs** (`C = page_size − 12`), one per
+  the compressed block (`0x04`) — are split into **`C`-byte slabs** (`C = page_size − 16`), one per
   page, written in order. Each overflow page's header carries `item_count` = the bytes on **this**
   page and `next_page` = the continuation (`0` terminates). The reader follows `next_page` from
   `first_page`, gathering `payload_len`/`stored_len` bytes, then reconstructs the value by column

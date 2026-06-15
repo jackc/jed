@@ -185,7 +185,7 @@ never-taken `CASE` branch is still touched. Consequences worth naming:
 Transparent LZ4 compression (large-values.md Slice B, [../fileformat/lz4.md](../fileformat/lz4.md))
 is real CPU work in both directions, metered by two units so the §6 ceiling can bound it. Both are
 quantized in **`C`-byte slabs of the *decompressed* (raw) payload** — `ceil(raw_len / C)` with
-`C = page_size − 12`, the same slab size the overflow chains use — proportional to the work yet
+`C = page_size − 16`, the same slab size the overflow chains use — proportional to the work yet
 computable from the stored lengths alone, so the charge never requires re-running the codec.
 
 - **`value_decompress`** joins the scan's **up-front block** next to the chain `page_read`s: for

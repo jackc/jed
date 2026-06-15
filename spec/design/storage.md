@@ -28,16 +28,16 @@ everywhere" real rather than retrofitted (CLAUDE.md §9).
   larger than RAM without falling over**, and nothing here may foreclose it. The
   non-foreclosure hooks are the page-structured format (§5), the page/block storage seam
   (§2), order-preserving keys (encoding.md), and *logical* per-page cost metering (cost.md).
-  The deferred path (all Phase 6, none foreclosed): demand paging / a bounded **buffer pool**
-  (resident set = a cache of pages with eviction), incremental COW commit (dirty pages only;
-  large write sets stage to disk pages, not all RAM — §4), B-tree interior pages (replace the
-  flat record chain — §6), and streaming + **spill-to-disk** blocking operators (sort / hash
-  join / aggregate / DISTINCT under a memory budget — the `ORDER BY` external merge sort has
-  landed, [spill.md](spill.md); the others are follow-ons). **Binding rule for present work:** no
-  code above the storage seam may assume full residency — no "load = whole file into one
-  buffer," no operator that requires its whole input/output in RAM. The whole-image
-  load/commit and flat record chain (§6) are deliberately-narrowed current forms, not the
-  permanent shape.
+  Most of the Phase-6 path has **landed**: incremental COW commit (dirty pages only; large
+  write sets stage to disk pages, not all RAM — §4), B-tree interior pages (replacing the
+  step-5b flat record chain — §6), and demand paging / a bounded **buffer pool** (resident
+  set = a cache of pages with eviction — [pager.md](pager.md), §6). Still deferred (none
+  foreclosed): the **spill-to-disk** blocking operators beyond sort (hash join / aggregate /
+  DISTINCT under a memory budget — the `ORDER BY` external merge sort has landed,
+  [spill.md](spill.md); the others are follow-ons). **Binding rule for present work:** no code
+  above the storage seam may assume full residency — no "load = whole file into one buffer," no
+  operator that requires its whole input/output in RAM. The whole-image serializer now survives
+  only as `create`'s from-scratch write and the golden generator (§4), not the commit path.
 - **SSD-backed persistence.** Persistence targets SSDs: page-aligned I/O,
   write-amplification awareness, no HDD seek-minimization heuristics.
 - **Single file per database.** One database = one file (plus possibly a transient
@@ -131,10 +131,12 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 >
 > **Free-list reclamation (P6.2) has since landed** (reconstruct-on-open): the commit allocator
 > reuses dead pages from a free-list rebuilt on open, so the file no longer grows without bound
-> (§6). **Still deferred** (later Phase-6 items, none foreclosed): continuous within-session
-> reclamation + on-disk free-list persistence (P6.2 follow-ons), demand paging / a bounded
-> buffer pool, overflow pages for over-large values (P6.1 caps a single row at `C/2` → `0A000`),
-> and compression. The whole-image `to_image` survives as the **from-scratch** serializer used by
+> (§6). Demand paging / the bounded buffer pool (P6.4, [pager.md](pager.md)), overflow pages
+> for over-large values, and LZ4 compression (both v3, [large-values.md](large-values.md)) have
+> **also landed**. **Still deferred** (later Phase-6 items, none foreclosed): continuous
+> within-session reclamation + on-disk free-list persistence (P6.2 follow-ons), and the
+> spill-to-disk hash join / aggregate / DISTINCT operators ([spill.md](spill.md)). The
+> whole-image `to_image` survives as the **from-scratch** serializer used by
 > `create`'s initial write and the golden fixtures (the special case where every node is
 > dirty); the live commit path is the incremental one.
 >
@@ -235,16 +237,15 @@ sits so the options stay open (CLAUDE.md §9).
   SQLite-`incremental_vacuum` flavor) — stays open as a cheaper *partial* complement: no rewrite,
   but it reclaims only *trailing* free space and must be sequenced against the two-meta-slot
   fallback (§4/§7) and the watermark. Tracked in [../../TODO.md](../../TODO.md) Phase 6.
-- **Buffer pool / demand paging** — ⏳ **design landed** ([pager.md](pager.md)), implementation
-  in slices. Makes the resident set a **bounded cache of pages** with eviction instead of the
-  whole file (CLAUDE.md §9), so a database far larger than RAM is served by paging the working
-  set in on demand through the block seam (§2). Decision: a **universal** buffer pool (every
-  read paged, no full-residency fast path — pager.md §1), reached **seam-foundation-first**
-  (P6.4a routes the load/commit through the pager with no residency change; P6.4b makes `pmap`
-  nodes lazy + bounds the resident set; P6.4c adds the memory-budget API + hardening). The
-  `page_read` cost unit (P6.3) is already a **logical** count, so the cache stays invisible to
-  the deterministic cost (pager.md §5, cost.md §3). Today's whole-image load is the
-  deliberately-narrowed current form this replaces (§1).
+- **Buffer pool / demand paging** — ✅ **landed (P6.4)** ([pager.md](pager.md)). The resident
+  set is a **bounded cache of pages** with eviction instead of the whole file (CLAUDE.md §9), so
+  a database far larger than RAM is served by paging the working set in on demand through the
+  block seam (§2). It is a **universal** buffer pool (every read paged, no full-residency fast
+  path — pager.md §1), reached **seam-foundation-first** (P6.4a routed the load/commit through
+  the pager with no residency change; P6.4b made `pmap` nodes lazy + bounded the resident set;
+  P6.4c added the `cache_bytes` memory-budget API + hardening). The `page_read` cost unit (P6.3)
+  is a **logical** count, so the cache stays invisible to the deterministic cost (pager.md §5,
+  cost.md §3). The whole-image load survives only as `from_image`/`create`/the goldens (§1).
 - **Within-page structure** — variable-length records packed contiguously into a B-tree node
   page (a record stores its key + each column's value); an interior node prefixes its records
   with `N+1` child pointers. Slotted-page layout (intra-page free space, in-place updates) is

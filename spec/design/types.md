@@ -12,10 +12,11 @@ system — "like SQLite, but with a real type system." It is designed as data, b
 executor, so that every implementation tests against one shared contract instead of
 discovering semantics in code.
 
-## 1. Scope: signed integers + text + boolean + decimal + bytea + uuid (all storable)
+## 1. Scope: the storable scalar set
 
 The storable scalar types are three signed integers (CLAUDE.md §4) plus `text`, `boolean`,
-`decimal`, `bytea`, and `uuid`:
+`decimal`, `bytea`, `uuid`, the temporal types `timestamp`/`timestamptz`/`interval`, and the
+binary floats `float32`/`float64`:
 
 | Canonical id | Aliases | Bits | Range |
 |---|---|---|---|
@@ -27,6 +28,11 @@ The storable scalar types are three signed integers (CLAUDE.md §4) plus `text`,
 | `decimal` | `numeric`, `dec` | — | exact base-10 (`numeric(p,s)`, `1≤p≤1000`, `0≤s≤p`) |
 | `bytea` | — | — | variable-width raw bytes (unsigned byte order) |
 | `uuid` | — | 128 | fixed 16-byte value, RFC 4122 (unsigned byte order) |
+| `timestamp` | `timestamp without time zone` | 64 | zoneless wall clock, int64 microseconds ([timestamp.md](timestamp.md)) |
+| `timestamptz` | `timestamp with time zone` | 64 | UTC instant, int64 microseconds ([timestamp.md](timestamp.md)) |
+| `interval` | — | — | span of months/days/micros, 128-bit canonical ([interval.md](interval.md)) |
+| `float32` | `real` | 32 | IEEE 754 binary32 ([float.md](float.md)) |
+| `float64` | `double precision` | 64 | IEEE 754 binary64 ([float.md](float.md)) |
 
 The integers are signed, two's-complement. **`text`** is the first storable non-integer
 scalar — a variable-width UTF-8 string with one defined collation, `C` (byte / code-point
@@ -44,15 +50,20 @@ entirely. **`bytea`** (§13) is the fourth storable non-integer scalar — a var
 string (raw bytes), compared by unsigned byte order. **`uuid`** (§14) is the fifth — a fixed
 16-byte value (RFC 4122), compared by unsigned byte order, and the **first non-integer type
 usable as a `PRIMARY KEY`** (its fixed-width key encoding is exercised, lifting the key narrowing
-the other non-integer types still defer). The remaining scalars
-(`timestamp`/`timestamptz`, `json`/`jsonb`, and any `float`) are still **deferred**, so the
-float-formatting and NaN/∞ decisions in CLAUDE.md §8 still do **not** bind — there are no floats
-(decimal is finite and exact, never NaN/∞ — §12). The **collation** decision (§8) is settled in
-§11: one collation, `C`. Boolean, text, decimal, bytea, and uuid each add real divergence-prone
-behavior (a render form beyond `I`, three-valued Kleene connectives — §10; UTF-8 vs. UTF-16
-ordering — §11; exact base-10 arithmetic + display-scale — §12; a hex literal/render form — §13;
-and PG-flexible uuid input + a fixed-width non-integer key — §14) on the smallest possible
-surfaces.
+the other non-integer types still defer). The temporal types
+(`timestamp`/`timestamptz`/`interval`) and the binary floats (`float32`/`float64`) have since
+landed, each with its own design doc ([timestamp.md](timestamp.md), [interval.md](interval.md),
+[float.md](float.md)); `timestamp`/`timestamptz` join `uuid` as non-integer `PRIMARY KEY` types,
+while `interval`/`float32`/`float64` stay non-key for now. The remaining scalars (`json`/`jsonb`,
+and the composite `array` container) are still **deferred**. The float-formatting and NaN/∞
+decisions of CLAUDE.md §8 are now **settled** by the landed floats ([float.md](float.md)): they
+keep their own PG total order and the `R` render tag (ledgered in the determinism exceptions),
+and stay off the *decimal* compare/text path (decimal is finite and exact, never NaN/∞ — §12).
+The **collation** decision (§8) is settled in §11: one collation, `C`. Boolean, text, decimal,
+bytea, and uuid each add real divergence-prone behavior (a render form beyond `I`, three-valued
+Kleene connectives — §10; UTF-8 vs. UTF-16 ordering — §11; exact base-10 arithmetic +
+display-scale — §12; a hex literal/render form — §13; and PG-flexible uuid input + a fixed-width
+non-integer key — §14) on the smallest possible surfaces.
 
 ## 2. Canonical names vs. aliases
 
@@ -373,9 +384,10 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   has been **lifted to PostgreSQL's numeric-format limits** (131072 integer / 16383 fractional
   digits — [decimal.md](decimal.md) §2) now that over-page values land via
   [large-values.md](large-values.md), with the size-scaled `decimal_work` cost unit bounding
-  big-value arithmetic ([cost.md](cost.md) §3). Deferred sub-features: decimal in a key
-  (`0A000`; the order-preserving encoding is authored, [encoding.md](encoding.md) §2.5),
-  scientific `e`-notation literals, and negative/over-precision scale typmods.
+  big-value arithmetic ([cost.md](cost.md) §3). Scientific `e`-notation literals have since
+  landed ([decimal.md](decimal.md) §6). Deferred sub-features: decimal in a key (`0A000`; the
+  order-preserving encoding is authored, [encoding.md](encoding.md) §2.5) and
+  negative/over-precision scale typmods.
 - **`bytea`** — ✅ landed as the fourth storable non-integer scalar — variable-width raw bytes,
   unsigned byte-order comparison (§13). Its deferred sub-features (the traditional escape input
   format, bytea⇄other casts, binary functions, and bytea in keys) are enumerated in §13.
@@ -384,8 +396,17 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   output, and the **first non-integer type usable as a `PRIMARY KEY`** (its `uuid-raw16` key
   encoding is exercised, [encoding.md §2.7](encoding.md)). Deferred sub-features (uuid⇄other casts,
   uuid functions like `gen_random_uuid()`) are enumerated in §14.
-- **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4 (e.g.
-  `timestamp`/`timestamptz`, `json`/`jsonb`, `float`).
+- **`timestamp` / `timestamptz`** — ✅ landed ([timestamp.md](timestamp.md)): the instant
+  model (int64 microseconds), no time-zone database, infinity sentinels, and usable as a
+  `PRIMARY KEY` (key encoding = the int64 rule).
+- **`interval`** — ✅ landed ([interval.md](interval.md)): a months/days/micros span with
+  PostgreSQL arithmetic; non-key only (`0A000`).
+- **`float32` / `float64`** — ✅ landed ([float.md](float.md)): IEEE 754 binary32/binary64,
+  the PostgreSQL total order, a trapping arithmetic kernel, and the `R` render tag exempting
+  computed/rendered values from cross-core byte-identity (settling the CLAUDE.md §8 float
+  hotspots); non-key only (`0A000`).
+- **Everything else non-integer** — the rest of the scalar set, per CLAUDE.md §4
+  (`json`/`jsonb`).
 - **Composite `array` type** — a *container* over the scalar set, a separate later type
   axis rather than another scalar (CLAUDE.md §4): its own value codec, order-preserving key
   encoding, element-type and `NULL`-element rules, and equality/ordering. Deferred; match

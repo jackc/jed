@@ -85,7 +85,7 @@ on the first's terms — "it surfaces little new divergence" is not a mark again
 language, because hardening the spec was never the reason to add it.
 
 3. **JS / TypeScript** — ✅ **landed as a native core** (`impl/ts`), at full parity with
-   Rust and Go (all 17 capabilities, all 7 conformance suites, and the byte-exact on-disk
+   Rust and Go (every capability and conformance suite, and the byte-exact on-disk
    format — `rust == go == ts == ruby`). A Rust→WASM wrap remains an acceptable *production*
    fallback, but the native core is what stresses the spec — and it does: int64 is exact
    via uniform `bigint` (JS numbers are f64), names are UTF-8 (JS strings are UTF-16), and
@@ -416,7 +416,10 @@ biases below are where an overriding reason *does* steer away from PG.
   header grows 12→16 bytes for a CRC-32/IEEE on **every** body page, so silent at-rest
   corruption of a catalog/node/overflow page is detected as `XX001` on read rather than
   served as wrong rows; through v6 only the meta slots were checksummed —
-  `spec/fileformat/format.md` *Page header*, `spec/design/storage.md` §6). **Still deferred**
+  `spec/fileformat/format.md` *Page header*, `spec/design/storage.md` §6), and **expression
+  column DEFAULTs** (`format_version` 8 — a per-column flag marks a DEFAULT as a non-constant
+  expression (`uuidv7()`, `1 + 1`) evaluated per row at INSERT through the per-statement seam,
+  rather than a constant folded at `CREATE TABLE`, `spec/design/constraints.md` §2). **Still deferred**
   (later Phase-6, none foreclosed): continuous within-session reclamation + on-disk free-list
   persistence (the P6.2 follow-ons). The from-scratch whole-image serializer survives as
   `create`'s initial write and the golden generator.

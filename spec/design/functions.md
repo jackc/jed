@@ -26,8 +26,9 @@ The catalog now lists:
 | `comparison` (NULL-safe) | `IS DISTINCT FROM`, `IS NOT DISTINCT FROM` | `boolean` |
 | `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` |
 | `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` |
-| `function` (scalar) | `abs` `round` | `promoted` / `decimal` (§9) |
+| `function` (scalar) | `abs` `round` (§9), `make_interval` (§11), `uuid_extract_version`/`uuid_extract_timestamp`, `uuidv4`/`uuidv7`, `now`/`clock_timestamp` (§12) | per-function |
 | `aggregate` | `COUNT` `SUM` `MIN` `MAX` `AVG` | `int64` / `decimal` / widened (§8) |
+| `set_returning` | `generate_series` | a row **set** (§10) |
 
 The **aggregates** are not operators — they collapse a set of rows into one value, have no
 infix symbol or precedence, and widen their result type by the operand type — so they live
@@ -194,10 +195,11 @@ One field is designed but **deliberately not authored yet**, so its absence is i
 Reserved values and kinds still to be authored spec-first with their own executor slices
 ([../../TODO.md](../../TODO.md)):
 
-- The `function` kind is now **partly authored**: the first scalar functions, `abs` and
-  `round`, landed as `[[operator]]` rows with `kind = "function"` (§9). Further scalar
-  functions — `ceil`, `floor`, `mod`, `sign`, the text `length`/`lower`/`upper`, and the
-  like — are follow-on slices that reuse the same mold.
+- The `function` kind is now **substantially authored**: `abs`/`round` (§9), `make_interval`
+  with named + `DEFAULT` arguments (§11), and the uuid extractors/generators + clock functions
+  (§12) all landed as `[[operator]]` rows with `kind = "function"`, plus `generate_series` as a
+  `set_returning` row (§10). Further scalar functions — `ceil`, `floor`, `mod`, `sign`, the
+  text `length`/`lower`/`upper`, and the like — are follow-on slices that reuse the same mold.
 
 **Aggregates are authored (`kind = "aggregate"`).** `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` landed
 in a **separate `[[aggregate]]` array**, not as `[[operator]]` rows, because they do not fit

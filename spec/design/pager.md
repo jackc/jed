@@ -13,14 +13,16 @@ page-backed B-tree + incremental commit (P6.1) and the free-list (P6.2), both la
 on the *logical* `page_read` cost unit (P6.3), which was designed precisely so a cache
 cannot perturb the deterministic cost (§ "Cost" below).
 
-## 1. What we are changing, and why
+## 1. What we changed, and why
 
-**Today (the full-residency current form, CLAUDE.md §9 / storage.md §1).** `open` reads the
-**whole file** into one buffer and `from_image` rebuilds **every** B-tree node of every table
-into resident memory (`read_tree` → an in-memory node per on-disk page). The entire dataset is
-resident; reads then chase resident pointers. This is correct and fast for the **dominant
-RAM-sized case**, but it **forecloses nothing only because** the format is already page
-structured — the residency itself is the wall a larger-than-RAM file hits.
+> **Status: landed (P6.4, all three cores — see §6).** This section is the motivation; the
+> realized form is in §6.
+
+**Before this change (the full-residency form, CLAUDE.md §9 / storage.md §1).** `open` read the
+**whole file** into one buffer and `from_image` rebuilt **every** B-tree node of every table
+into resident memory (`read_tree` → an in-memory node per on-disk page). The entire dataset was
+resident; reads then chased resident pointers. This was correct and fast for the **dominant
+RAM-sized case**, but the residency itself is the wall a larger-than-RAM file hits.
 
 **The change.** The resident set becomes a **bounded buffer pool**: a fixed-budget cache of
 decoded pages with eviction. A node not in the pool is loaded **on demand** from the open file
@@ -203,7 +205,7 @@ change lands alone, on a frozen seam:
 - **P6.4a — the pager seam (no residency change).** Introduce the `Pager` (file + in-memory
   backings, kept open) and route the whole-image load **and** the incremental commit (P6.1)
   through `read_block`/`write_block`. A buffer-pool scaffold exists but the loader still
-  materializes the full tree, so behavior, results, and cost are **byte-unchanged** (the 15
+  materializes the full tree, so behavior, results, and cost are **byte-unchanged** (the
   goldens and `# cost:` values are untouched). This de-risks the seam and the keep-file-open
   lifecycle (`close` now closes the file) before any data-structure surgery. *Mergeable, no
   observable change.*
@@ -221,7 +223,7 @@ change lands alone, on a frozen seam:
   api.md §2.1), with a read-only **`resident_leaves`** gauge (`0` for in-memory). The internal
   `open_with_capacity` seam was promoted to this public API. **Bytes, not a page count**, so the
   caller's budget does not silently scale with the file's `page_size` (§3). **Page-size hardening:** the
-  page size is now bounded **`[48, 65536]`** (the meta-header floor through `MAX_PAGE_SIZE = 64 KiB`) and
+  page size is now bounded **`[52, 65536]`** (the meta-header floor through `MAX_PAGE_SIZE = 64 KiB`) and
   rejected outside it on both paths — `0A000` on `create`, `XX001` on `open` — so a corrupt or hostile
   file cannot record a multi-gigabyte `page_size` and force that allocation before its content is
   validated (CLAUDE.md §13; format.md *Page model*). A large-file test in each core opens a database

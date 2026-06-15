@@ -120,15 +120,18 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
 - **ASCII-only identifiers**, no quoted identifiers (§3).
 - **Literal forms.** Integer, **decimal** (`1.50`, `.5`, and scientific `e`-notation
   `1.5e3` / `5e2` / `1e-3` — §14), **single-quoted string** (the `text` type, `'alice'`, with
-  `''` for an embedded quote), `TRUE`/`FALSE`, and `NULL`. `boolean` exists only as an
-  *expression* type this slice — there are boolean literals and comparison/logical results,
-  but no boolean *column* (see [types.md](types.md) §1).
-- **Function calls — aggregates only.** The expression grammar now has a `function_call`
-  production (`name ( * | expr )`), but it resolves **only** the five aggregate functions
-  (`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`; §17, [aggregates.md](aggregates.md)). **Scalar**
-  functions (`length`, `lower`, …) and **`COUNT(DISTINCT x)`** stay deferred; an unknown
-  function name is `42883`, and `DISTINCT` inside a call is `42601`.
-- **No `;` statement terminator** and **no SQL comment syntax** in the input.
+  `''` for an embedded quote), `TRUE`/`FALSE`, and `NULL`. `boolean` is now a storable column
+  type as well as an expression type (boolean literals, comparison/logical results, and stored
+  boolean columns — see [types.md](types.md) §9).
+- **Function calls.** The expression grammar has a `function_call` production with
+  PostgreSQL named-notation (`name(arg, name => expr)`) and `DEFAULT` arguments (§17). It
+  resolves the five aggregates (`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`; [aggregates.md](aggregates.md))
+  **and** scalar functions (`abs`, `round`, `make_interval`, the uuid/clock functions;
+  [functions.md](functions.md) §9–§12). Still deferred: `COUNT(DISTINCT x)` and further scalar
+  functions (`length`, `lower`, …); an unknown function name is `42883`, and `DISTINCT` inside a
+  call is `42601`.
+- **No `;` statement terminator** — one statement per `execute` (SQL comment syntax, by
+  contrast, *has* landed — `--` line and nesting `/* */` block comments, §33).
 - **Parameter placeholders (`$N`) are parsed, but bound by the host API, not the corpus.**
   The lexer accepts `$` followed by ≥1 ASCII digits as a 1-based bind parameter (`$1`,
   `$2`, …); `$0`, a leading zero (`$01`), and `$` not followed by a digit are `42601`. A
@@ -366,12 +369,12 @@ phase two, after every row has validated, and proceeds in `VALUES` order — so 
 fails validation burns no rowids, and a batch that succeeds assigns consecutive rowids
 left-to-right. This keeps the assignment deterministic and identical across the three cores.
 
-**Cost is unchanged — zero (for the `VALUES` source).** A row's values are literals and
-**pre-evaluated constant defaults** (folded to a value at CREATE TABLE — §16), so an
-`INSERT ... VALUES` reads no storage and evaluates no expression tree: it accrues the same
-zero cost as before ([cost.md](cost.md)). Only a future *expression* default would change
-this. An `INSERT ... SELECT` is different: it accrues exactly the embedded `SELECT`'s cost
-(§24).
+**Cost (for the `VALUES` source).** When a row's values are literals and **pre-evaluated
+constant defaults** (folded to a value at CREATE TABLE — §16), an `INSERT ... VALUES` reads no
+storage and evaluates no expression tree, so it accrues **zero** cost ([cost.md](cost.md)). An
+**expression default** (`DEFAULT now()` / `1 + 1`, §16) is the exception: it evaluates an
+expression tree per row at INSERT, accruing that evaluation's cost. An `INSERT ... SELECT` is
+different again: it accrues exactly the embedded `SELECT`'s cost (§24).
 
 ## 13. `DROP TABLE`
 
@@ -600,10 +603,12 @@ unknown column name in the list is `42703` (`undefined_column`), a column named 
 the column count) is `42601`. Then the usual per-value checks apply in declaration order
 (`22003` / `42804` / `23502`), inside the same two-phase / all-or-nothing pass as §12.
 
-**Defaults are literal-only this slice** and pre-evaluated at CREATE TABLE, so applying one at
-INSERT is substituting a constant — no expression is evaluated and cost stays zero (§12). A
-general-expression default (`DEFAULT now()`) stays deferred ([../../TODO.md](../../TODO.md)); the
-column list and `DEFAULT` keyword apply unchanged when the source is a `SELECT` (§24).
+**Constant defaults** are pre-evaluated at CREATE TABLE, so applying one at INSERT substitutes
+a constant — no expression is evaluated and cost stays zero (§12). **Expression defaults**
+(`DEFAULT now()`, `DEFAULT 1 + 1`) have since landed: a non-constant default is evaluated per
+row at INSERT through the per-statement seam ([constraints.md](constraints.md) §2), accruing
+that evaluation's cost. The column list and `DEFAULT` keyword apply unchanged when the source is
+a `SELECT` (§24).
 
 ## 17. Function-call syntax, aggregate and scalar functions
 

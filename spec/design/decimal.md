@@ -224,7 +224,7 @@ comparison with NULL treated as a comparable value (always definite).
   `123` (no point). Matches PG's display; a determinism surface every core must reproduce.
 - **Key encoding** ([encoding.md](encoding.md) §2.5, `decimal-order-preserving`): authored but
   **unexercised** this slice — a decimal `PRIMARY KEY`/index key is rejected `0A000` (the
-  text-PK precedent). The on-disk **value** codec (type code 5,
+  text-PK precedent). The on-disk **value** codec (type code 6,
   [format.md](../fileformat/format.md)) is what lands now.
 - **Cost** ([cost.md](cost.md) §3 "`decimal_work`"): a decimal compare/arith node charges its
   uniform `operator_eval` **plus `decimal_work` × (W − 1)**, W being the operation's work in

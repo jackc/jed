@@ -20,7 +20,7 @@
 > known-name gate + result-type match + name→variant match collapsed into one registry lookup
 > plus small shared result-code / plan interpreters, with the per-row kernel still reached by id
 > (`ScalarFunc` / `AggPlan`, hand-written per core, §5). It is **behaviour-preserving** — the
-> conformance corpus is byte- and cost-identical (102/102 × rust/go/ts) and a per-core cross-check
+> conformance corpus is byte- and cost-identical (the full corpus passes × rust/go/ts) and a per-core cross-check
 > test pins the registry to the catalog. Everything else here remains a **proposal**: host scalar
 > functions (§4.2), composite types (§4.1), host scalar types (§4.3), the persisted type catalog
 > (§6), host-code cost metering (§7), the host determinism ledger (§8), and the host-extension

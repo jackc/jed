@@ -42,7 +42,7 @@ Two file constructors, deliberately split (open ≠ create):
 
 - **`create(path, opts)`** — make a **new** file-backed database. `opts.page_size` (default
   **8192**, the [storage.md](storage.md) §3 default) is **locked into the file's meta at creation**
-  and cannot change thereafter. It must lie in the **valid range `[48, 65536]`** — the format
+  and cannot change thereafter. It must lie in the **valid range `[52, 65536]`** — the format
   minimum (the meta header floor) through `MAX_PAGE_SIZE` (64 KiB; [../fileformat/format.md](../fileformat/format.md)
   *Page model*); a page size below the minimum is `0A000 feature_not_supported` "page size too small"
   and one above the maximum `0A000` "page size too large" (the cap bounds the largest single
@@ -51,7 +51,7 @@ Two file constructors, deliberately split (open ≠ create):
   it is `58P02 duplicate_file` — `create` never clobbers.
 - **`open(path, opts?)`** — open an **existing** file: load it ([../fileformat/format.md](../fileformat/format.md)),
   adopting its recorded `page_size` and `txid`. The recorded `page_size` is validated to the same
-  `[48, 65536]` range as `create` (above); a value outside it is `XX001 data_corrupted`, so a corrupt
+  `[52, 65536]` range as `create` (above); a value outside it is `XX001 data_corrupted`, so a corrupt
   or hostile file cannot force a multi-gigabyte allocation before its contents are even checked. If the
   path is **absent**, it is `58P01 undefined_file` — `open` never creates. A malformed file is `XX001
   data_corrupted`; an underlying read failure is `58030 io_error`. `opts` is optional open-time
@@ -142,9 +142,9 @@ transactions.md §1). The commit boundary and durability are **decoupled** (tran
   `on`; the `off` batching policy can land later (transactions.md §9). Set at `create`/`open`
   via `opts`.
 
-The staging buffer + `Transaction` surface + SQL `BEGIN`/`COMMIT`/`ROLLBACK` **land in Phase 5**
-([../../TODO.md](../../TODO.md)); their semantics are fixed in transactions.md so this doc stays
-the shape-of-the-API record.
+The `Transaction` surface + SQL `BEGIN`/`COMMIT`/`ROLLBACK` (with `READ ONLY`/`READ WRITE` and
+failed-block poisoning) **landed in Phase 5** ([../../TODO.md](../../TODO.md)); their semantics
+are fixed in transactions.md so this doc stays the shape-of-the-API record.
 
 ### 2.3 Close
 
@@ -197,40 +197,37 @@ The single-handle surface (§2.1–§2.4) is unchanged and remains the default.
 
 ## 3. Persistence & durability
 
-The on-disk model is **whole-image** ([storage.md](storage.md) §4 step-5b status): a commit
-serializes the entire database to one byte image. Incremental copy-on-write stays deferred;
-nothing here forecloses it (CLAUDE.md §9).
+The on-disk model is the **page-backed copy-on-write B-tree** with **incremental commit**
+([../fileformat/format.md](../fileformat/format.md), [storage.md](storage.md) §4): a commit
+writes only the **dirty pages** a mutation introduced — the copy-on-write path from the changed
+leaves up to the root, plus the small rewritten catalog chain — and publishes the new root by
+writing the **alternate meta slot** (`txid & 1`). The whole-image serializer survives only as
+`create`'s initial from-scratch write and the golden generator; it is no longer the commit path.
 
 The recipe below is the **`synchronous=on`** durable-commit path (§2.2, transactions.md §9): it
 fires at **every** durable commit — each autocommit write statement and each explicit `COMMIT`
-alike. Under `synchronous=off` the commit is visible immediately and this recipe is **batched /
-deferred** (still all-or-nothing when it does run). Under whole-image, autocommit therefore
-rewrites the file per write statement at `synchronous=on` — the expected SQLite/PG cost, with
-explicit `BEGIN…COMMIT` (one rewrite for many statements) and Phase 6's incremental COW as the
-two escape hatches.
+alike. Under `synchronous=off` the commit is visible immediately and the `fsync` is **batched /
+deferred** (still all-or-nothing when it does run). Because a commit writes only dirty pages, an
+autocommit write touches a handful of pages, not the whole file — explicit `BEGIN…COMMIT` still
+batches many statements into one commit.
 
 **Crash-safe commit recipe** (identical across cores):
 
-1. Serialize `to_image(page_size, txid + 1)`.
-2. Write the bytes to a **temp file in the same directory** as the target.
-3. `fsync` the temp file.
-4. **Atomically `rename`** the temp file over the target path.
-5. `fsync` the **containing directory** (so the rename itself is durable).
-6. Bump `txid`.
+1. Write the **dirty body pages** (the copy-on-write tree path + the rewritten catalog chain)
+   to their page slots.
+2. `sync` the file, so the body pages are durable **before** the meta swap that references them.
+3. Write the **alternate meta slot** (`txid & 1`) with the new `txid`, `root_page`, and CRC.
+4. `sync` again, committing the atomic root swap.
 
-At every instant the on-disk path is either the previous complete valid image or the new
-complete valid image — never a torn mix — because the new bytes are fully written and
-fsync'd to a *separate* file before the atomic rename. A crash before step 4 leaves the old
-file intact (the temp is an orphan, ignored on next open); a crash during step 4 resolves
-atomically to one name or the other; the loader additionally validates the CRC and the
-double-meta slots, so any residual corruption surfaces as `XX001`, never silent bad data.
-The directory fsync (step 5) is a no-op on platforms without one (Windows); the target is
-SSD/POSIX ([storage.md](storage.md) §1).
+At every instant the on-disk root is either the previous valid meta slot or the new one — never
+a torn mix — because the body pages are durable before the meta swap and the highest-`txid` valid
+slot wins on open. The loader validates each meta slot's CRC **and** every body page's per-page
+CRC (v7), so residual corruption surfaces as `XX001`, never silent bad data; the target is
+SSD/POSIX ([storage.md](storage.md) §1) and the fsync timing is refined by the pager's
+preallocation + `fdatasync` path (pager.md §7).
 
-`create` uses the same recipe to write its initial empty image (with `txid` starting at 1).
-The whole-image writer fills **both** meta slots with the same `txid`; the double-meta
-slots are the forward-compatible hook for the future incremental in-place path
-([storage.md](storage.md) §4), not needed for whole-image durability.
+`create` writes its initial empty image from scratch (with `txid` starting at 1), filling **both**
+meta slots; every commit thereafter is incremental and alternates the slot.
 
 ## 4. Rows and result types
 
@@ -286,10 +283,10 @@ only and the engine has no wire protocol).
 | open file | `Database::open(path) -> Result<Database>` | `Open(path) (*Database, error)` | `open(path): Database` |
 | open in-memory | `Database::new()` | `NewDatabase()` | `new Database()` |
 | commit (current tx) | `db.commit() -> Result<()>` | `db.Commit() error` | `commit(db): void` |
-| rollback (current tx) _(Phase 5)_ | `db.rollback() -> Result<()>` | `db.Rollback() error` | `rollback(db): void` |
-| begin _(Phase 5)_ | `db.begin(writable) -> Result<Transaction>` | `db.Begin(writable) (*Transaction, error)` | `begin(db, writable): Transaction` |
-| view / update (closures) _(Phase 5)_ | `db.view(\|tx\| …)` / `db.update(\|tx\| …)` | `db.View(fn) error` / `db.Update(fn) error` | `view(db, fn)` / `update(db, fn)` |
-| tx commit / rollback _(Phase 5)_ | `tx.commit()` / `tx.rollback()` | `tx.Commit()` / `tx.Rollback() error` | `tx.commit()` / `tx.rollback()` |
+| rollback (current tx) | `db.rollback() -> Result<()>` | `db.Rollback() error` | `rollback(db): void` |
+| begin | `db.begin(writable) -> Result<Transaction>` | `db.Begin(writable) (*Transaction, error)` | `begin(db, writable): Transaction` |
+| view / update (closures) | `db.view(\|tx\| …)` / `db.update(\|tx\| …)` | `db.View(fn) error` / `db.Update(fn) error` | `view(db, fn)` / `update(db, fn)` |
+| tx commit / rollback | `tx.commit()` / `tx.rollback()` | `tx.Commit()` / `tx.Rollback() error` | `tx.commit()` / `tx.rollback()` |
 | close | `db.close()` + `Drop` | `db.Close() error` | `close(db): void` |
 | prepare | `db.prepare(sql) -> Result<PreparedStatement>` | `db.Prepare(sql) (*PreparedStatement, error)` | `prepare(db, sql): PreparedStatement` |
 | stmt execute | `stmt.execute(&mut db, &params) -> Result<Outcome>` | `stmt.Execute(params) (Outcome, error)` | `stmt.execute(params): Outcome` |
@@ -369,8 +366,8 @@ options object on `execute`/`prepare`) stays open for later without changing thi
   result; a fully pull-based cursor is the further step.)
 - **Transactions are IN, not a non-goal.** The §3 staging buffer, autocommit, the `Transaction`
   surface (`begin`/`view`/`update`), the `synchronous` durability setting, and SQL
-  `BEGIN`/`COMMIT`/`ROLLBACK` are **specified** in [transactions.md](transactions.md) and land in
-  **Phase 5**; §2.2–§2.3 above are revised accordingly (autocommit replaces the original "no
+  `BEGIN`/`COMMIT`/`ROLLBACK` are specified in [transactions.md](transactions.md) and **landed in
+  Phase 5**; §2.2–§2.3 above are revised accordingly (autocommit replaces the original "no
   autocommit" rule; `close` no longer drops committed work). What stays deferred is only
   `SAVEPOINT`/nested transactions, `synchronous=off` batching, and group-commit (transactions.md
   §11).

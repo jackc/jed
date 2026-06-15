@@ -51,3 +51,31 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   catalog type system, host-defined functions, composite types, and core scalar types — and
   why the system/extension line moves to *who owns cross-core determinism* rather than
   vanishing (CLAUDE.md §2/§8/§10/§13).
+- [decimal.md](decimal.md) — the exact `decimal`/`numeric` type: representation, PG result-scale
+  rules, half-away-from-zero rounding, e-notation literals, and the `decimal_work` cost unit.
+- [float.md](float.md) — the binary floats `float32`/`float64`: the PG total order, the trapping
+  arithmetic kernel, the order-independent canonical-fold SUM/AVG, and the `R` render tag.
+- [timestamp.md](timestamp.md) — `timestamp`/`timestamptz`: the int64-microsecond instant model,
+  literal parsing, infinity sentinels, and the (no-time-zone-db) scope.
+- [interval.md](interval.md) — the `interval` span (months/days/micros): the input subset, PG
+  render, the canonical 128-bit comparison, and interval/timestamp arithmetic.
+- [constraints.md](constraints.md) — column/table constraints: `NOT NULL`, `DEFAULT` (constant +
+  expression), `CHECK`, and `UNIQUE` (a UNIQUE constraint *is* its backing unique index).
+- [indexes.md](indexes.md) — secondary indexes: the catalog reshape (pk ordinal list + per-table
+  index lists), index B-trees, the unique flag, and the planner's first-column pushdown.
+- [aggregates.md](aggregates.md) — `COUNT`/`SUM`/`MIN`/`MAX`/`AVG`, `GROUP BY`, and `HAVING`: PG
+  widening, the grouping-error rule, NULL handling, and determinism.
+- [pager.md](pager.md) — the per-core buffer pool / demand paging (P6.4): a bounded page cache
+  with eviction above the block seam, the `cache_bytes` budget, and logical-cost invisibility.
+- [spill.md](spill.md) — streaming + spill-to-disk operators: the `ORDER BY` external merge sort
+  bounded by `work_mem` (the hash aggregate / DISTINCT / hash join are follow-ons).
+- [large-values.md](large-values.md) — out-of-line overflow chains + transparent LZ4 compression
+  for over-`RECORD_MAX` values, and the `value_compress`/`value_decompress` cost units.
+- [transactions.md](transactions.md) — the single-writer / immutable-snapshot model and the SQL
+  surface (`BEGIN`/`COMMIT`/`ROLLBACK`, `READ ONLY`/`READ WRITE`, failed-block poisoning).
+- [entropy.md](entropy.md) — the host-injected random + clock seam behind `uuidv4`/`uuidv7` and
+  `now()`/`current_timestamp`/`clock_timestamp()`, kept deterministic-given-the-seam.
+- [cli.md](cli.md) — the `jed` CLI host program: the TUI + script runner, output formats, CSV
+  import, `--dump`, and `--readonly` (a host of the engine, not a core).
+- [benchmarks.md](benchmarks.md) — the wall-clock benchmark harness comparing the three cores
+  against PostgreSQL and SQLite (deliberately outside `rake ci`, answers still cross-checked).

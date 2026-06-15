@@ -28,7 +28,7 @@ format** that realizes it.
 | [fixtures/](fixtures/) | Byte-exact golden `.jed` files at `page_size = 256` (reviewable hex). Each core reads them and writes bytes equal to them. |
 | [verify.rb](verify.rb) | Independent Ruby reference that (re)generates and validates the goldens + LZ4 vectors — a *fourth* implementation, so the goldens are not self-certified by the cores. `--generate` rewrites them; bare run verifies. Test-time only; run via `rake verify`. |
 
-## Scope (`format_version` 6, Phase 6+)
+## Scope (`format_version` 8, Phase 6+)
 
 The format is the **page-backed copy-on-write B-tree** with **incremental commit** (only
 dirty pages are written; the new root is published via the alternate meta slot),
@@ -36,9 +36,13 @@ dirty pages are written; the new root is published via the alternate meta slot),
 plus transparent LZ4 compression ([../design/large-values.md](../design/large-values.md)).
 On top of that base: **`CHECK` constraints** in the catalog entry (v4), the
 **secondary-index catalog reshape** — the explicit pk ordinal list + per-table index lists
-and index B-trees (v5, [../design/indexes.md](../design/indexes.md)) — and the per-index
-**`unique` flags byte** (v6, indexes.md §8). Still deferred: continuous within-session
-reclamation + on-disk free-list persistence (format.md *Reclamation*).
+and index B-trees (v5, [../design/indexes.md](../design/indexes.md)) — the per-index
+**`unique` flags byte** (v6, indexes.md §8), **per-page checksums** (v7 — a CRC-32/IEEE on
+every body page, so silent at-rest corruption is detected as `XX001` on read), and
+**expression column DEFAULTs** (v8 — a per-column flag marking a DEFAULT as a non-constant
+expression, [../design/constraints.md](../design/constraints.md) §2). Still deferred:
+continuous within-session reclamation + on-disk free-list persistence (format.md
+*Reclamation*).
 
 > Status: all three cores (Rust, Go, TS) **and** the Ruby reference read every golden and
 > write byte-identical output (the CLAUDE.md §8 cross-core round-trip), and every core's

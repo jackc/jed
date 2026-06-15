@@ -5,13 +5,14 @@
 > decomposed into the distinct guarantees it actually bundles, and where the few places jed
 > deliberately relaxes one of them are enumerated, bounded, and given a test mechanism.
 >
-> **Status: this doc is a framework + proposal.** The four-guarantee model and the
-> already-existing carve-out (row order without `ORDER BY`) are **ratified**; the
-> seam/injection design, the exception ledger, and the `order_sensitive` catalog flag are
-> **proposed** (not yet built); **binary floats** (§6) and **plan-dependent observables**
-> (§8) are **unratified** open questions. Each section marks its status. When any decision
-> here is ratified, update the data it points at, [conformance.md](conformance.md) §4, and
-> [CLAUDE.md](../../CLAUDE.md) §8/§10/§13 in the same change (§10 below lists the edits).
+> **Status: this doc is a framework + ledger.** The four-guarantee model and the
+> already-existing carve-out (row order without `ORDER BY`) are **ratified**. The clock/entropy
+> seam (§5) and the exception ledger (§9) have **landed**, and **binary floats** (§6, class A)
+> have **landed** across all three cores. Still open: the `order_sensitive` catalog flag and
+> **plan-dependent observables** (§8) remain **unratified**, pending parallelism. Each section
+> marks its status. When any decision here is ratified, update the data it points at,
+> [conformance.md](conformance.md) §4, and [CLAUDE.md](../../CLAUDE.md) §8/§10/§13 in the same
+> change (§10 below lists the edits).
 
 The honesty mechanism of the whole project (CLAUDE.md §2) is *divergence under a shared
 contract*: with no reference implementation, the only thing that says two cores agree is
@@ -172,11 +173,11 @@ is the design that lets them land without breaking G1/G2.
 
 ---
 
-## 6. Binary floats — the only internal surrender of G2 (UNRATIFIED)
+## 6. Binary floats — the only internal surrender of G2
 
-**Status: ratified — `float64` is landing as the first exempted type** ([float.md](float.md);
-the design doc, type-system data, and exception ledger are authored, cores in progress). It is
-the *defining* member of class **A**: the one case where a value that **has** a right answer is
+**Status: landed — `float32`/`float64` are the first exempted types** ([float.md](float.md);
+the design doc, type-system data, and exception ledger are authored and the types are landed
+across all three cores). They are the *defining* members of class **A**: the one case where a value that **has** a right answer is
 computed *differently per core* (G2) and per platform (G3) and cannot be injected away — but the
 exemption is **narrow** (storage, total order, the `+ − * / sqrt` kernel, the exact-sum
 `SUM`/`AVG`, `MIN`/`MAX`/`COUNT`, and cost all stay in-contract; only transcendental *values* and
@@ -317,10 +318,11 @@ query shapes where all cores plan identically.
 
 ## 9. The ledger + admission criteria
 
-**Status: proposed.** Mirror the two precedents already in the repo: the
-[oracle_overrides.toml](../conformance/oracle_overrides.toml) machine-checked PG-divergence
-ledger ([conformance.md](conformance.md) §5) and the §14 default-deny dependency policy.
-Add a `spec/conformance/determinism_exceptions.toml` whose entries each state:
+**Status: landed (populated for classes A and B).** It mirrors the two precedents already in
+the repo: the [oracle_overrides.toml](../conformance/oracle_overrides.toml) machine-checked
+PG-divergence ledger ([conformance.md](conformance.md) §5) and the §14 default-deny dependency
+policy. The [determinism_exceptions.toml](../conformance/determinism_exceptions.toml) ledger
+exists and is wired into `rake verify`; each entry states:
 
 ```toml
 # Determinism-exception ledger (CLAUDE.md §2/§8/§10/§13; spec/design/determinism.md).
@@ -387,7 +389,7 @@ When a section here moves from proposed/unratified to ratified, update **in the 
 | §3 | Non-members (limits, collation, iteration-order) | **ratified** (restates existing rules) |
 | §4 | Containment / no-contamination invariant | **proposed** |
 | §5 class **B** | Clock + entropy seams, spec'd PRNG | **ratified** for `uuidv4`/`uuidv7` and the clock functions `now()`/`current_timestamp`/`clock_timestamp()` ([entropy.md](entropy.md)); **proposed** for `random()` |
-| §6 class **A** | Binary floats (`float64`) | **ratified** — spec + ledger authored, cores in progress ([float.md](float.md)) |
+| §6 class **A** | Binary floats (`float32`/`float64`) | **landed** — spec + ledger authored, all three cores ([float.md](float.md)) |
 | §7 class **P** | Parallelism = optimization; `order_sensitive` flag | **proposed framework** |
 | §8 class **P** | Plan-dependent observables / cost-identity fork | **unratified** (open) |
 | §9 | Exception ledger + admission criteria | **proposed** |

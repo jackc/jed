@@ -77,11 +77,11 @@ evaluate them. A generated descriptor never contains executable comparison logic
 
 Built now to establish the toolchain *before* the catalog grows — retrofitting a generator
 across many hand-written entries is the cost we are avoiding. Honest about today's
-consumers: the descriptor table is read by the cross-check tests now, and the metadata
-(`result`, `null`, `arg_families`, `arg_resolution`) becomes load-bearing for the imminent
-**general expression evaluator / type-checker** (a Phase 1 item in
-[../../TODO.md](../../TODO.md)), which needs exactly this — operator result types and NULL
-behavior — as input. The eval *logic* it dispatches to stays hand-written (§2).
+consumers: the descriptor table is read by the cross-check tests, and the metadata
+(`result`, `null`, `arg_families`, `arg_resolution`) is load-bearing for the **general
+expression evaluator / type-checker** and the **runtime function/aggregate registry** — both
+landed — which consume exactly this (operator result types and NULL behavior) as input. The
+eval *logic* they dispatch to stays hand-written (§2).
 
 ## 5. Forward
 

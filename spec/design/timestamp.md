@@ -141,8 +141,9 @@ Rules:
 - **Special values (checked first).** `infinity` and `-infinity` (case-insensitive, optional
   leading `+` on `infinity`) parse directly to the `i64::MAX` / `i64::MIN` sentinels — no date,
   offset, or era. The **clock-relative** specials (`now`, `today`, `tomorrow`, `yesterday`) and
-  the `epoch` / `allballs` aliases are **not** accepted this slice (deferred with `now()`); they
-  trap `22007`.
+  the `epoch` / `allballs` aliases are **not** accepted this slice (these string-literal forms
+  are deferred — distinct from the `now()`/`current_timestamp` *functions*, which have landed,
+  [entropy.md](entropy.md) §5); they trap `22007`.
 - **Date-only** input → time defaults to `00:00:00`. Both `' '` and `'T'` separators are
   accepted. Surrounding whitespace is trimmed; interior spacing is strict.
 - **Era.** A trailing ` BC` / ` AD` is accepted (PG). `BC` maps the displayed year to the

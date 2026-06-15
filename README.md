@@ -58,3 +58,23 @@ big-endian bytes.
    every matching row is type-checked before any write); assigning a `PRIMARY KEY` column
    is rejected (`0A000`) so the storage key never changes. No-PK rows use a monotonic
    rowid (reconstructed on load), so `DELETE` then `INSERT` never collides.
+
+### Beyond the first six steps
+
+The six steps above are CLAUDE.md §11's "it's alive" bootstrap. Substantial work has landed
+since across **all three cores** (Rust, Go, TS) — forward work is tracked in
+**[TODO.md](TODO.md)**. Highlights:
+
+- **Type system** — the full scalar set: `decimal`/`numeric` (exact), `float32`/`float64`,
+  `text`, `boolean`, `bytea`, `uuid`, `timestamp`/`timestamptz`, `interval`; arithmetic, `CAST`
+  and `::`, typed string literals.
+- **Query surface** — `JOIN` (inner/cross/left/right/full), `GROUP BY`/`HAVING`, aggregates,
+  `UNION`/`INTERSECT`/`EXCEPT`, subqueries (scalar/`IN`/`EXISTS`, correlated), `IN`/`BETWEEN`/
+  `LIKE`/`CASE`, `LIMIT`/`OFFSET`/`DISTINCT`, set-returning `generate_series`, scalar functions.
+- **Schema/DML** — `NOT NULL`/`DEFAULT` (constant + expression)/`CHECK`/`UNIQUE`/composite PK,
+  secondary indexes (`CREATE`/`DROP INDEX`), `INSERT` column list / multi-row / `INSERT … SELECT`,
+  `RETURNING`, explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`).
+- **Storage** — a page-backed copy-on-write B-tree with incremental commit, page reclamation,
+  a bounded buffer pool, large values (overflow chains + LZ4), and per-page checksums
+  (`format_version` 8). Plus deterministic cost metering + a `max_cost` ceiling, a `jed` CLI,
+  and a benchmark harness vs. PostgreSQL and SQLite.

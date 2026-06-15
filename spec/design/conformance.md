@@ -158,7 +158,7 @@ which checks the taxonomy is internally coherent: every required/profiled capabi
 defined, profile `includes` form no cycles, every `.test` has exactly one `# requires:`
 line, and no capability is defined but unused.
 
-Current profiles:
+The foundational profiles (the manifest now defines **18** in total — see below):
 
 | Profile | Adds | Maps to |
 |---|---|---|
@@ -166,6 +166,11 @@ Current profiles:
 | `casts` | `core` + explicit `CAST` narrowing (fits, and traps `22003` when it doesn't). | [../types/casts.toml](../types/casts.toml). |
 | `comparison` | `core` + cross-type integer comparison via the promotion tower (`<`, `>`, `=`). | [../types/compare.toml](../types/compare.toml). |
 | `expression` | `comparison` + the general expression substrate: integer arithmetic (`+ - * / %`, unary `-`, precedence, parens; traps `22003`/`22012`), the expression-only `boolean` type (`TRUE`/`FALSE`, comparisons-as-values), `AND`/`OR`/`NOT` Kleene connectives, and `IS [NOT] DISTINCT FROM` (NULL-safe equality). | [../functions/catalog.toml](../functions/catalog.toml), [../design/types.md](../design/types.md) §9. |
+
+These build up cumulatively to the later profiles — `mutation`, `decimal`, `functions`,
+`joins`/`outer_joins`, `constraints`, `aggregates`/`grouping`/`having`, `predicates`,
+`timestamps`, `set_operations`, `transactions`, and `subqueries` (18 total). The
+[manifest.toml](../conformance/manifest.toml) is the authoritative, complete list.
 
 ## 4. Determinism rules
 
@@ -256,8 +261,7 @@ Each implementation ships a **thin harness** that: reads the manifest, determine
 capabilities the implementation declares, runs every `.test` file whose `# requires:`
 capabilities are all satisfied (skipping the rest), executes each record, and compares
 output under the rules above. Reporting a profile = checking that every test gated by that
-profile's capabilities passes. Harnesses arrive with the first vertical slice
-(CLAUDE.md §11 step 5).
+profile's capabilities passes. All three cores (Rust, Go, TS) ship this harness today.
 
 ## 7. Open / deferred
 

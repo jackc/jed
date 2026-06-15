@@ -49,7 +49,6 @@ Spec data tables (e.g. `spec/encoding/integers.toml`) are read in tests by a tin
 hand-written reader ([tests/tomlmini.ts](tests/tomlmini.ts)) — TOML stays test-time only,
 no runtime dependency (CLAUDE.md §5).
 
-> Status: full parity with the Rust and Go cores — `CREATE TABLE` / `INSERT` / `SELECT` /
-> `UPDATE` / `DELETE` over integers, all 17 capabilities, all 7 conformance suites, and the
-> byte-exact on-disk format (reads the shared goldens and writes byte-identical output —
-> the §8 cross-core honesty test, now `rust == go == ts == ruby`).
+> Status: full parity with the Rust and Go cores — every capability and conformance suite,
+> and the byte-exact on-disk format (reads the shared goldens and writes byte-identical
+> output — the §8 cross-core honesty test, `rust == go == ts == ruby`).

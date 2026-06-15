@@ -33,15 +33,16 @@ Today a value lives **inline** in its B-tree record ([format.md](../fileformat/f
 node page. Two independent ceilings cap how large a value may be, and **both trip a write-side
 `0A000`** (`feature_not_supported`):
 
-1. **`RECORD_MAX = (C − 12) / 2`** — at the 8 KiB default, **~4084 bytes** per *record*
-   ([format.md:243](../fileformat/format.md)). This is the binding limit (it bites first) and
-   it is **not arbitrary**: the *Why the record cap* proof ([format.md:322](../fileformat/format.md))
-   shows capping a record at `C/2` is exactly what guarantees the B-tree's **all-2-way-split,
-   no-empty-node, no-multi-way-spill** invariant across four implementations. Lift it naively
-   and the split/merge byte contract breaks.
+1. **`RECORD_MAX = (C − 12) / 2`** — at the 8 KiB default, **4082 bytes** per *record*
+   ([format.md](../fileformat/format.md) *Page model*). This is the binding limit (it bites
+   first) and it is **not arbitrary**: the *Why the record cap* proof
+   ([format.md](../fileformat/format.md) *Why the record cap*) shows capping a record at `C/2`
+   is exactly what guarantees the B-tree's **all-2-way-split, no-empty-node, no-multi-way-spill**
+   invariant across four implementations. Lift it naively and the split/merge byte contract
+   breaks.
 2. **The value codec's `u16` length field** — a `text`/`bytea` body is a `u16` byte-length
-   then the bytes ([format.md:341](../fileformat/format.md)), so a single value over **65535
-   bytes** is a separate `0A000`, independent of `RECORD_MAX`.
+   then the bytes ([format.md](../fileformat/format.md) *Value codec*), so a single value over
+   **65535 bytes** is a separate `0A000`, independent of `RECORD_MAX`.
 
 The key observation that shapes this whole subsystem: in jed the *purpose* of moving a value
 out-of-line is **not merely "the value won't fit a page."** It is **"shrink the record's inline
@@ -128,7 +129,7 @@ the leaf/interior nodes:
   payload bytes this page carries (a tail page is partially filled). The remaining `C` bytes (=
   `page_size − 16`) hold a slab of the value, and the page's CRC protects the slab like any other.
 - **The chain is filled deterministically:** the value's bytes (compressed or raw) are split
-  into `C − 12`-byte slabs in order, one per page, the last partial. No per-core freedom in how
+  into `C`-byte slabs in order, one per page, the last partial. No per-core freedom in how
   bytes are partitioned — the layout is a §8 byte contract like everything else on disk.
 - **The record holds a fixed-size external pointer** instead of the value body: the first
   overflow page index (`u32`), the stored (on-chain) length, and — when compressed — the original
@@ -164,7 +165,7 @@ discriminator** ahead of a variable-length body, superseding the bare-`u16`-leng
 - **external-\*** = form byte + the §4 external pointer.
 
 This is a value-codec change + a new `page_type`, so it is a **`format_version` 3** bump (clean
-break, like v1→v2; the 15 goldens regenerate byte-exact `rust == go == ts == ruby`). **Reserve
+break, like v1→v2; the goldens regenerate byte-exact `rust == go == ts == ruby`). **Reserve
 all four form codes in the version-3 bump even though compression lands later** (§9): the
 overflow slice writes only forms `0` and `2`, but laying out the full discriminator once means
 the compression slice is **additive within v3** (it starts emitting forms `1`/`3`) rather than a
@@ -321,7 +322,7 @@ Everything an external/compressed value touches is a §8 byte/cost contract:
 - **Disposition decision** (§3) — which values inline/compress/externalize, in largest-first /
   declaration-order sequence — byte-identical across cores.
 - **Compressor output** (§6) — byte-identical, pinned by input→output fixture vectors.
-- **Chain layout** (§4) — value bytes partitioned into `C − 12`-byte slabs in order,
+- **Chain layout** (§4) — value bytes partitioned into `C`-byte slabs in order,
   deterministically.
 - **Cost** (§8) — `page_read` per chain page + `value_decompress`, logical and identical across
   cores; the watermark/free-list interaction is the existing P6.2 contract.
@@ -379,7 +380,7 @@ compression is Slice B). They were chosen with the maintainer; the byte details 
   long before it would overflow `u16`. Only variable-length types (`text`/`bytea`/`decimal`) ever
   spill; fixed-width types are always inline.
 
-- **Overflow page = `page_type 4`.** `P(v)` is split into `C`-byte slabs (`C = page_size − 12`),
+- **Overflow page = `page_type 4`.** `P(v)` is split into `C`-byte slabs (`C = page_size − 16`),
   one per page; each page's header carries `item_count` = bytes in this page and `next_page` =
   the continuation (`0` terminates). The reader follows `next_page` from `first_page`, gathering
   `payload_len` bytes, then reconstructs the value by column type. Allocation order is

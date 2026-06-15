@@ -15,14 +15,22 @@ The reasoning behind these tables lives in
 | [compare.toml](compare.toml) | Comparison & promotion: comparability classes, the numeric promotion tower, three-valued NULL logic. |
 | [casts.toml](casts.toml) | Coercion matrix: which casts exist and their mode (implicit / assignment / explicit). Anything unlisted is forbidden. |
 
-## Current scope — signed integers + text + boolean (all storable)
+## Current scope — the storable scalar set
 
-Per CLAUDE.md §4, the **storable** scalar types are `int16`/`smallint`,
-`int32`/`int`/`integer`, `int64`/`bigint`, `text` (variable-width UTF-8, collation `C`),
-and `boolean` (aliases `bool`; `{false, true}`, ordered false `<` true). `boolean` is also
-the type of comparison/logical results and `TRUE`/`FALSE` literals. Two boolean narrowings
-remain (each relaxable, mirroring text): a boolean `PRIMARY KEY` is rejected `0A000`, and
-`CAST … AS boolean` / boolean⇄integer casts are deferred (`0A000` / `42804`) — see
-[../design/types.md](../design/types.md) §9. `decimal`, `timestamp`/`timestamptz`, `bytea`,
-and `json`/`jsonb` remain deferred, and the float/decimal divergence decisions in CLAUDE.md §8
-still do **not** bind (the collation decision landed: PostgreSQL `C`).
+Per CLAUDE.md §4, the **storable** scalar types are the three signed integers
+(`int16`/`smallint`, `int32`/`int`/`integer`, `int64`/`bigint`), `text` (variable-width
+UTF-8, collation `C`), `boolean` (aliases `bool`; `{false, true}`, ordered false `<` true),
+`decimal`/`numeric` (exact base-10), `bytea` (raw bytes), `uuid` (fixed 16-byte value), the
+temporal types `timestamp`/`timestamptz`/`interval`, and the binary floats `float32`/`real`
+and `float64`/`double precision`. Only `json`/`jsonb` (and the composite `array` container)
+remain deferred. `boolean` is also the type of comparison/logical results and `TRUE`/`FALSE`
+literals.
+
+The CLAUDE.md §8 divergence decisions have **landed and bind**: the collation is PostgreSQL
+`C`; `decimal` rounds **half away from zero** ([../design/decimal.md](../design/decimal.md));
+and the binary floats carry their own PostgreSQL total order plus the `R` render-tolerance tag
+([../design/float.md](../design/float.md), ledgered in
+[../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml)).
+Per-type narrowings — which non-integer types may be a `PRIMARY KEY` (`uuid`, `timestamp`,
+`timestamptz` may; the rest are non-key for now), and which casts exist — are enumerated in
+[../design/types.md](../design/types.md).
