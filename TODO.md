@@ -420,7 +420,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       seconds field is **rejected** (strict) vs PG's roll-to-next-minute. _(was: L; §4;
       spec/design/timestamp.md, encoding/timestamps.toml)_ **Deferred follow-ups:** ~~an `interval`
       type + timestamp arithmetic~~ ✅ **done** (below); date/time functions
-      (`now()`/`current_timestamp`, `EXTRACT`, `date_trunc`, `age`); separate `date` / `time` types;
+      (~~`now()`/`current_timestamp`~~ ✅ **done** + `clock_timestamp()`, on the host clock seam —
+      `spec/design/functions.md` §12, `spec/conformance/suites/expr/clock_functions.test`; `EXTRACT`,
+      `date_trunc`, `age` still deferred); separate `date` / `time` types;
       named-zone `AT TIME ZONE` (needs the host-supplied tz database); timestamp⇄text/date casts;
       sub-second precision typmods (`timestamp(p)`); ~~a context-free `TIMESTAMP '...'` keyword
       literal~~ ✅ **done** — first as the dedicated `TIMESTAMP '...'` / `TIMESTAMPTZ '...'` keyword
@@ -554,8 +556,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       ms, and takes an optional interval shift. Pinned by `spec/conformance/suites/expr/uuid_generate.test`
       (exact UUIDs across all cores), the determinism ledger (`uuidv4-entropy`/`uuidv7-clock-entropy`),
       and the independent Ruby fixtures (`spec/encoding/prng.toml` + `prng_verify.rb`). Capability
-      `func.uuid_generate`. **Groundwork** for `now()`/`current_timestamp` and a future `random()` /
+      `func.uuid_generate`. **Groundwork** for the clock functions and a future `random()` /
       `gen_random_uuid()` / `uuid_generate_v*` (trivial reuses of this seam). _(was: L; §8/§13)_
+- [x] **Current-time functions — `now()` / `current_timestamp` / `clock_timestamp()`** — done &
+      committed across Rust/Go/TS (byte-identical). Three niladic `timestamptz` functions on the
+      host-injected **clock seam** (`spec/design/entropy.md` §5, `spec/design/functions.md` §12).
+      `now()` is STABLE (the statement clock, read once and reused for every row — PG semantics);
+      `current_timestamp` is the SQL-standard bare keyword, **parser sugar** for `now()`;
+      `clock_timestamp()` is VOLATILE (reads the seam on every call). Tests inject a fixed (`# clock:`)
+      or **advancing** (`# clock_advance: start,step`, new) clock so output is exact and cross-core.
+      Pinned by `spec/conformance/suites/expr/clock_functions.test`, the determinism ledger
+      (`now-clock` / `clock-timestamp-clock`, class B), capabilities `func.now` / `func.clock_timestamp`.
+      Reuses the uuidv7 clock seam — no new type work (timestamptz already landed). _(was: M; §8/§13)_
 - [ ] **`json` / `jsonb`** — optional headline feature (§1). Large surface. _(size: XL; §4)_
 - [ ] **Composite `array` type** — a **container** over the scalar set: a new type *axis*,
       not another scalar (CLAUDE.md §4). Array literals, element-type rules, `NULL` element

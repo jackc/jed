@@ -4767,6 +4767,11 @@ const (
 	// timestamp + monotonic counter + random, with an optional interval shift.
 	sfUuidv4
 	sfUuidv7
+	// current-time functions (spec/design/entropy.md §5): sfNow → timestamptz, the statement clock
+	// read ONCE and reused (STABLE; current_timestamp is parser sugar for it); sfClockTimestamp →
+	// timestamptz, the clock seam read on EVERY call (VOLATILE).
+	sfNow
+	sfClockTimestamp
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -5576,6 +5581,10 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfUuidv4
 	case "uuidv7":
 		return sfUuidv7
+	case "now":
+		return sfNow
+	case "clock_timestamp":
+		return sfClockTimestamp
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -7977,6 +7986,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return UuidValue(b), nil
+		case sfNow:
+			// current-time functions (spec/design/entropy.md §5): now() reads the statement clock
+			// ONCE and reuses it (STABLE); clock_timestamp() reads the seam on every call
+			// (VOLATILE). Both return the seam's micros directly as timestamptz.
+			return TimestamptzValue(env.rng.statementClockMicros(&env.exec.seam)), nil
+		case sfClockTimestamp:
+			return TimestamptzValue(env.rng.clockNowMicros(&env.exec.seam)), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; float64 for the rest, per the catalog).

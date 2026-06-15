@@ -155,6 +155,15 @@ fn parse_clock_directive(rest: &str) -> Option<i64> {
         .ok()
 }
 
+/// Parse a `# clock_advance: start,step` directive body (entropy.md §6): an advancing clock that
+/// returns `start`, `start+step`, … one increment per read, so `clock_timestamp()`'s per-call reads
+/// are deterministic and distinguishable from the statement-stable `now()`. Returns `(start, step)`.
+fn parse_clock_advance_directive(rest: &str) -> Option<(i64, i64)> {
+    let body = rest.trim_start().strip_prefix("clock_advance:")?;
+    let (start, step) = body.split_once(',')?;
+    Some((start.trim().parse().ok()?, step.trim().parse().ok()?))
+}
+
 /// Parse a `# names: a, b, ?column?` directive body. Returns the asserted output column
 /// names, or None if this comment is not a names directive (spec/design/conformance.md §1).
 fn parse_names_directive(rest: &str) -> Option<Vec<String>> {
@@ -232,6 +241,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut pending_max_cost: Option<i64> = None;
     let mut pending_seed: Option<u64> = None;
     let mut pending_clock: Option<i64> = None;
+    let mut pending_clock_advance: Option<(i64, i64)> = None;
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -249,6 +259,8 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 pending_seed = Some(s);
             } else if let Some(c) = parse_clock_directive(rest) {
                 pending_clock = Some(c);
+            } else if let Some(sa) = parse_clock_advance_directive(rest) {
+                pending_clock_advance = Some(sa);
             } else if let Some(names) = parse_names_directive(rest) {
                 pending_names = Some(names);
             } else if let Some(types) = parse_types_directive(rest) {
@@ -268,9 +280,14 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             Some(s) => db.set_random_source(jed::seam::seeded_random_source(s)),
             None => db.clear_random_source(),
         }
-        match pending_clock.take() {
-            Some(c) => db.set_clock_source(jed::seam::fixed_clock(c)),
-            None => db.clear_clock_source(),
+        // `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one);
+        // a record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
+        match (pending_clock_advance.take(), pending_clock.take()) {
+            (Some((start, step)), _) => {
+                db.set_clock_source(jed::seam::advancing_clock(start, step))
+            }
+            (None, Some(c)) => db.set_clock_source(jed::seam::fixed_clock(c)),
+            (None, None) => db.clear_clock_source(),
         }
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();
@@ -367,6 +384,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
     let mut pending_max_cost: Option<i64> = None;
     let mut pending_seed: Option<u64> = None;
     let mut pending_clock: Option<i64> = None;
+    let mut pending_clock_advance: Option<(i64, i64)> = None;
     let mut changed = false;
     let mut i = 0;
     while i < out.len() {
@@ -384,6 +402,8 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 pending_seed = Some(s);
             } else if let Some(c) = parse_clock_directive(rest) {
                 pending_clock = Some(c);
+            } else if let Some(sa) = parse_clock_advance_directive(rest) {
+                pending_clock_advance = Some(sa);
             }
             i += 1;
             continue;
@@ -396,9 +416,12 @@ fn rebaseline_file(text: &str) -> Option<String> {
             Some(s) => db.set_random_source(jed::seam::seeded_random_source(s)),
             None => db.clear_random_source(),
         }
-        match pending_clock.take() {
-            Some(c) => db.set_clock_source(jed::seam::fixed_clock(c)),
-            None => db.clear_clock_source(),
+        match (pending_clock_advance.take(), pending_clock.take()) {
+            (Some((start, step)), _) => {
+                db.set_clock_source(jed::seam::advancing_clock(start, step))
+            }
+            (None, Some(c)) => db.set_clock_source(jed::seam::fixed_clock(c)),
+            (None, None) => db.clear_clock_source(),
         }
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();

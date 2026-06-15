@@ -175,6 +175,29 @@ func parseClockDirective(line string) (int64, bool) {
 	return n, true
 }
 
+// clockAdvance is a parsed `# clock_advance: start,step` directive (entropy.md §6): an advancing
+// clock that returns start, start+step, … one increment per read.
+type clockAdvance struct{ start, step int64 }
+
+// parseClockAdvanceDirective parses a `# clock_advance: start,step` directive line: an advancing
+// clock making clock_timestamp()'s per-call reads deterministic and distinguishable from now().
+func parseClockAdvanceDirective(line string) (clockAdvance, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "clock_advance:")
+	if !ok {
+		return clockAdvance{}, false
+	}
+	parts := strings.SplitN(strings.TrimSpace(rest), ",", 2)
+	if len(parts) != 2 {
+		return clockAdvance{}, false
+	}
+	start, err1 := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+	step, err2 := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+	if err1 != nil || err2 != nil {
+		return clockAdvance{}, false
+	}
+	return clockAdvance{start: start, step: step}, true
+}
+
 // assertCost checks the accrued execution cost matches a pending `# cost:` directive.
 func assertCost(expected *int64, actual int64, sql string) error {
 	if expected != nil && *expected != actual {
@@ -247,6 +270,7 @@ func runFile(text string) error {
 	var pendingMaxCost *int64
 	var pendingSeed *uint64
 	var pendingClock *int64
+	var pendingClockAdvance *clockAdvance
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
@@ -264,6 +288,8 @@ func runFile(text string) error {
 				pendingSeed = &s
 			} else if c, ok := parseClockDirective(line); ok {
 				pendingClock = &c
+			} else if ca, ok := parseClockAdvanceDirective(line); ok {
+				pendingClockAdvance = &ca
 			} else if names, ok := parseNamesDirective(line); ok {
 				pendingNames = names
 			} else if types, ok := parseTypesDirective(line); ok {
@@ -294,12 +320,17 @@ func runFile(text string) error {
 			db.ClearRandomSource()
 		}
 		pendingSeed = nil
-		if pendingClock != nil {
+		// `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one);
+		// a record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
+		if pendingClockAdvance != nil {
+			db.SetClockSource(jed.AdvancingClock(pendingClockAdvance.start, pendingClockAdvance.step))
+		} else if pendingClock != nil {
 			db.SetClockSource(jed.FixedClock(*pendingClock))
 		} else {
 			db.ClearClockSource()
 		}
 		pendingClock = nil
+		pendingClockAdvance = nil
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "statement":

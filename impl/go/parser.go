@@ -1829,6 +1829,14 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	case t.Kind == TokWord && toLowerASCII(t.Word) == "false":
 		p.advance()
 		return Expr{Kind: ExprLiteral, Literal: &Literal{Kind: LiteralBool, Bool: false}}, nil
+	case t.Kind == TokWord && toLowerASCII(t.Word) == "current_timestamp" &&
+		!(p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == TokLParen):
+		// `current_timestamp` — the SQL-standard bare keyword (no parens), reserved like the value
+		// literals above. Pure sugar: desugar to a `now()` call so resolution / execution / cost /
+		// volatility are entirely shared (spec/design/functions.md §12). Not fired when followed by
+		// `(` (a precision typmod, deferred) so that form resolves normally (42883).
+		p.advance()
+		return Expr{Kind: ExprFuncCall, FuncCall: &FuncCallExpr{Name: "now"}}, nil
 	case t.Kind == TokWord:
 		// Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
 		// first call syntax — grammar.md §17). The one-token lookahead keeps function names

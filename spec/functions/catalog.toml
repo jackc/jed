@@ -1918,6 +1918,39 @@ null           = "propagates"
 errors         = ["22008"]
 volatility     = "volatile"
 
+# --- current-time functions --------------------------------------------------
+# Niladic timestamptz functions on the host-injected clock seam (spec/design/entropy.md):
+# tests inject a fixed/advancing clock (the `# clock:` / `# clock_advance:` directives) for exact
+# cross-core output; production reads the wall clock. NOT oracle-imported (PG's wall clock differs);
+# expected values are hand-authored under the injected clock.
+#
+# now(): STABLE — the statement clock is read ONCE and reused for every row (PG's now()
+# semantics), so a statement's time cannot vary row-to-row. SQL-standard `current_timestamp`
+# (a bare keyword, no parens) is parser sugar for now() and has no catalog entry of its own.
+# clock_timestamp(): VOLATILE — reads the clock on EVERY call, so it may advance within a
+# statement. volatility marks each non-foldable for a future optimizer.
+[[operator]]
+name           = "now"
+kind           = "function"
+arity          = 0
+arg_families   = []
+arg_resolution = "none"
+result         = "timestamptz"
+null           = "propagates"
+errors         = []
+volatility     = "stable"
+
+[[operator]]
+name           = "clock_timestamp"
+kind           = "function"
+arity          = 0
+arg_families   = []
+arg_resolution = "none"
+result         = "timestamptz"
+null           = "propagates"
+errors         = []
+volatility     = "volatile"
+
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
 # SINGLE value. They are NOT operators — no infix symbol, no precedence, no

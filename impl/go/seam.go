@@ -100,6 +100,19 @@ func SeededRandomSource(seed uint64) RandomSource {
 // injects this (entropy.md §6); a host wanting a frozen instant uses it too.
 func FixedClock(micros int64) ClockSource { return func() int64 { return micros } }
 
+// AdvancingClock is the provided ADVANCING clock source: returns start, then start+step,
+// start+2·step, … — one increment per read (captured state). The # clock_advance: directive injects
+// this (entropy.md §6) to make clock_timestamp()'s per-call reads deterministic and distinguishable
+// from the statement-stable now() cross-core; the draw order follows expression-evaluation order.
+func AdvancingClock(start, step int64) ClockSource {
+	cur := start
+	return func() int64 {
+		v := cur
+		cur += step
+		return v
+	}
+}
+
 // StmtRng is the per-statement mutable seam state: the uuidv7 monotonic counter and the
 // once-resolved statement clock (entropy.md §5 — read once, reused, so a statement's time cannot
 // vary row-to-row). The PRNG state itself lives in the injected RandomSource (handle-scoped).
@@ -112,13 +125,20 @@ type StmtRng struct {
 func newStmtRng() *StmtRng { return &StmtRng{} }
 
 // statementClockMicros returns the statement clock in micros since the Unix epoch, resolved once
-// (entropy.md §5): the seam's clock source. Reused for every uuidv7 in the statement.
+// (entropy.md §5): the seam's clock source. Reused for every uuidv7 / now() in the statement (STABLE).
 func (r *StmtRng) statementClockMicros(seam *Seam) int64 {
 	if !r.clockResolved {
 		r.clock = seam.nowMicros()
 		r.clockResolved = true
 	}
 	return r.clock
+}
+
+// clockNowMicros is a fresh read of the clock seam in micros since the Unix epoch — used by
+// clock_timestamp() (entropy.md §5), which reads on EVERY call (VOLATILE) and so does NOT touch the
+// once-resolved statement clock above. It caches nothing.
+func (r *StmtRng) clockNowMicros(seam *Seam) int64 {
+	return seam.nowMicros()
 }
 
 // uuidV4 — 16 bytes from the seam's random source, version/variant overwritten (entropy.md §3).

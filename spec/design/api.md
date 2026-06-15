@@ -380,11 +380,12 @@ options object on `execute`/`prepare`) stays open for later without changing thi
 
 ## 10. Entropy + clock seam (`set_random_source` / `set_clock_source`)
 
-The volatile UUID generators (`uuidv4`, `uuidv7`) read two host inputs behind seams
+The volatile UUID generators (`uuidv4`, `uuidv7`) and the current-time functions
+(`now()`/`current_timestamp`, `clock_timestamp()`) read two host inputs behind seams
 ([entropy.md](entropy.md), [determinism.md](determinism.md) §5) so they stay deterministic given
 those inputs. The inputs are injected as **functions**, each defaulting to the platform primitive.
 Like `max_cost`/`work_mem`, they are **handle settings** — not stored in the file, not per-statement
-arguments — configured once on whatever handle runs the generators:
+arguments — configured once on whatever handle runs them:
 
 - **`set_random_source(f)` / `clear_random_source()`** — inject a function that fills N random bytes
   (the deterministic / reproducible path) or clear it. **The default draws from the OS CSPRNG per
@@ -393,9 +394,12 @@ arguments — configured once on whatever handle runs the generators:
   reproducible path; the conformance corpus injects it via the **`# seed:`** directive
   ([conformance.md](conformance.md) §4).
 - **`set_clock_source(f)` / `clear_clock_source()`** — inject a function returning micros since the
-  Unix epoch that `uuidv7` embeds, or clear it (the default: the wall clock, read once per statement
-  — entropy.md §5). The engine provides **`fixed_clock(i64)`**; the corpus injects it via the
-  **`# clock:`** directive.
+  Unix epoch that `uuidv7` embeds and that `now()`/`current_timestamp` (read once per statement) and
+  `clock_timestamp()` (read per call) return, or clear it (the default: the wall clock — entropy.md
+  §5). The engine provides **`fixed_clock(i64)`** (a frozen instant) and **`advancing_clock(start,
+  step)`** (returns `start, start+step, …`, one increment per read — distinguishes the per-call
+  `clock_timestamp()` from the statement-stable `now()`); the corpus injects them via the
+  **`# clock:`** and **`# clock_advance:`** directives.
 
 Defaults (unset) read **OS entropy per value** and the **wall clock**: Go `crypto/rand` + `time`, TS
 `node:crypto` + `Date`, Rust the `getrandom` crate (the one core dependency, CLAUDE.md §14) +

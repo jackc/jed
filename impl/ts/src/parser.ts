@@ -1296,6 +1296,14 @@ class Parser {
         this.advance();
         return { kind: "literal", literal: { kind: "bool", value: false } };
       }
+      // `current_timestamp` — the SQL-standard bare keyword (no parens), reserved like the value
+      // literals above. Pure sugar: desugar to a `now()` call so resolution / execution / cost /
+      // volatility are entirely shared (spec/design/functions.md §12). Not fired when followed by
+      // `(` (a precision typmod, deferred) so that form resolves normally (42883).
+      if (w === "current_timestamp" && this.tokens[this.pos + 1]?.kind !== "lparen") {
+        this.advance();
+        return { kind: "funcCall", name: "now", args: [], argNames: [], star: false };
+      }
       // Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
       // first call syntax — grammar.md §17). The one-token lookahead keeps function names
       // non-reserved (a column may be named `count`); a qualified name is never a call. Only

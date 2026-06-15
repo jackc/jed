@@ -110,6 +110,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "func.uuid_extract",
   // Volatile uuid generators (uuidv4/uuidv7) on the entropy+clock seam — entropy.md.
   "func.uuid_generate",
+  // Current-time functions on the clock seam — now()/current_timestamp (STABLE) and
+  // clock_timestamp() (VOLATILE) — entropy.md §5, functions.md §12.
+  "func.now",
+  "func.clock_timestamp",
   "null.three_valued",
   "compare.promotion",
   "cast.explicit",
@@ -214,5 +218,5 @@ export { PreparedStatement, Rows, Transaction, prepare, query, querySql, begin, 
 export { create, open, commit, rollback, close, residentLeaves } from "./file.ts";
 export type { DatabaseOptions, OpenOptions } from "./file.ts";
 export { ReadHandle, SharedDb, WriteHandle } from "./shared.ts";
-export { fixedClock, seededRandomSource } from "./seam.ts";
+export { advancingClock, fixedClock, seededRandomSource } from "./seam.ts";
 export type { ClockFunc, RandomFill } from "./seam.ts";

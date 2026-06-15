@@ -82,6 +82,19 @@ export function fixedClock(micros: bigint): ClockFunc {
   return () => micros;
 }
 
+// advancingClock is the provided ADVANCING clock source: returns start, then start+step,
+// start+2·step, … — one increment per read (captured state). The # clock_advance: directive injects
+// this (entropy.md §6) to make clock_timestamp()'s per-call reads deterministic and distinguishable
+// from the statement-stable now() cross-core; the draw order follows expression-evaluation order.
+export function advancingClock(start: bigint, step: bigint): ClockFunc {
+  let cur = start;
+  return () => {
+    const v = cur;
+    cur += step;
+    return v;
+  };
+}
+
 // StmtRng is the per-statement mutable seam state: the uuidv7 monotonic counter and the
 // once-resolved statement clock (entropy.md §5 — read once, reused, so a statement's time cannot
 // vary row-to-row). The PRNG state itself lives in the injected RandomFill (handle-scoped).
@@ -91,13 +104,20 @@ export class StmtRng {
   private clockResolved = false;
 
   // The statement clock in micros since the Unix epoch, resolved once (entropy.md §5): the seam's
-  // clock source. Reused for every uuidv7 in the statement.
+  // clock source. Reused for every uuidv7 / now() in the statement (STABLE).
   statementClockMicros(seam: Seam): bigint {
     if (!this.clockResolved) {
       this.clock = seam.nowMicros();
       this.clockResolved = true;
     }
     return this.clock;
+  }
+
+  // A fresh read of the clock seam in micros since the Unix epoch — used by clock_timestamp()
+  // (entropy.md §5), which reads on EVERY call (VOLATILE) and so does NOT touch the once-resolved
+  // statement clock above. It caches nothing.
+  clockNowMicros(seam: Seam): bigint {
+    return seam.nowMicros();
   }
 
   // uuidv4 — 16 bytes from the seam's random source, version/variant overwritten (entropy.md §3).

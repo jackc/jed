@@ -456,9 +456,37 @@ function. Cost is the uniform one `operator_eval` per call.
 **The `volatility` field** (catalog schema_version 2). The catalog grows an optional
 `volatility` column — PostgreSQL's class, `immutable | stable | volatile`, absent ⇒
 `immutable`. Every existing operator/function is `immutable` (and stays so by default, no
-re-authoring); the generators will be `volatile`; a future `now()`/the clock seam is `stable`.
+re-authoring); the generators are `volatile`; `now()`/`current_timestamp` (the clock seam) is
+`stable` and `clock_timestamp()` is `volatile` (below).
 It marks a call non-foldable for a future constant-folding/CSE pass. It is **advisory today** —
 no such pass exists yet — exactly the posture §8 takes with the reserved `cost` field: the spec
 states the truth at the point the function is added, and the optimizer slice that needs the
 data finds it already there. `verify.rb` validates the value set; `gen_catalog.rb` emits it
 (default `immutable`) into the descriptor table each core reads.
+
+### Current-time functions — `now()` / `current_timestamp` / `clock_timestamp()`
+
+Three niladic `timestamptz` functions on the host-injected **clock seam**
+([entropy.md](entropy.md) §5; the seam's micros are exactly timestamptz's internal representation,
+so the value passes straight through). They are oracle-*incompatible* by nature (PG's wall clock
+differs), so they are NOT oracle-imported; the corpus pins them under an injected clock
+(`suites/expr/clock_functions.test`).
+
+- **`now()`** — **STABLE**. Reads the **statement clock** ([entropy.md](entropy.md) §5): the seam is
+  read **once per statement** (`StmtRng.statement_clock_micros`) and reused for every row, so a
+  statement's time cannot vary row-to-row (PG's `now()` / `transaction_timestamp()` semantics; jed
+  has no cross-statement transaction yet, so statement scope is the whole of it). Rendered UTC with
+  the `+00` suffix (jed's timestamptz rendering — a documented PG divergence vs. session-tz display).
+- **`current_timestamp`** — the SQL-standard **bare keyword** (no parens), reserved like the
+  `true`/`false`/`null` value literals. Pure **parser sugar**: it desugars to a `now()` call node, so
+  resolution / execution / cost / volatility / the default `now` column label are all shared. (No
+  catalog entry, resolver branch, or executor path of its own. The precision-typmod form
+  `current_timestamp(p)` is deferred — a `(` after it falls through to ordinary resolution, 42883.)
+- **`clock_timestamp()`** — **VOLATILE**. Reads the seam on **every** call (`StmtRng.clock_now_micros`,
+  a fresh read that does *not* touch the statement-clock cache), so it may advance within a statement.
+  The reads follow expression-evaluation order. Tested with an injected **advancing** clock
+  (the `# clock_advance: start,step` directive, [entropy.md](entropy.md) §6) so the per-call advance
+  is deterministic and distinguishable from `now()` cross-core.
+
+Each charges the uniform one `operator_eval` per call (independent of the clock value). The clock
+reads are class-**B** determinism-ledger entries (`now-clock`, `clock-timestamp-clock`).

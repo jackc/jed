@@ -63,7 +63,7 @@ keeps, and the test mechanism that still catches real bugs in it.
 | Class | Source | Examples | Keeps | Drops | Test mechanism |
 |---|---|---|---|---|---|
 | **U** — Underspecified contract | SQL leaves it open | row order without `ORDER BY`; `LIMIT` without `ORDER BY`; `DISTINCT`/`GROUP BY` output order | G1, G2, G3 | G4 (sequence only) | `rowsort` (multiset compare) |
-| **B** — Boundary inputs | host clock / OS entropy | `now()`/`current_timestamp`; `random()`; `gen_random_uuid()` (v4); UUIDv7 | G1, G2 *(injected/seeded)* | — *(prod: G1, G2 on the raw draw only)* | inject fixed clock+seed → exact; else property/bounds (§5) |
+| **B** — Boundary inputs | host clock / OS entropy | `now()`/`current_timestamp`; `clock_timestamp()`; `random()`; `gen_random_uuid()` (v4); UUIDv7 | G1, G2 *(injected/seeded)* | — *(prod: G1, G2 on the raw draw only)* | inject fixed/advancing clock+seed → exact; else property/bounds (§5) |
 | **A** — Approximate / internal | IEEE / libm / approximate algorithm | binary `float` compute (§6); future `approx_count_distinct`, `TABLESAMPLE`, percentiles | G1 *(per binary)* | G2, G3 | epsilon / reduced-precision `R` tag + PG-only oracle |
 | **I** — Implementation identity | the core itself | `version()`, build/identity reflection | G1 | G2, G3 *(by construction)* | property / regex on format, never value |
 | **P** — Plan / strategy dependent | independent planners; parallelism | error *selection* among ≥2 candidate errors; cost under divergent plans; parallel fold order (§7) | varies — see §7/§8 | varies | serial==parallel metamorphic relation (§7); single-error test authoring (§8) |
@@ -126,9 +126,10 @@ value can at worst reorder a query result, never the *stored* order.
 ## 5. Push it to the boundary — the clock and entropy seams (class B)
 
 **Status: RATIFIED for the UUID generators** (`uuidv4`/`uuidv7`, [entropy.md](entropy.md); the
-ledger entries `uuidv4-entropy` / `uuidv7-clock-entropy`); **proposed** for the rest of class B
-(`now()` / `current_timestamp` / a general `random()`), which reuse this exact seam when they
-land. This is the jed-idiomatic move and it collapses almost all of class **B** back into the
+ledger entries `uuidv4-entropy` / `uuidv7-clock-entropy`) **and the clock functions** (`now()` /
+`current_timestamp` / `clock_timestamp()`; the ledger entries `now-clock` / `clock-timestamp-clock`);
+**proposed** for the rest of class B (a general `random()`), which reuses this exact seam when it
+lands. This is the jed-idiomatic move and it collapses almost all of class **B** back into the
 deterministic contract. Do not make *the engine* non-deterministic; make
 the engine a **deterministic function of two new host inputs**, behind seams — exactly like
 the storage seam (CLAUDE.md §9, [storage.md](storage.md)):
@@ -155,8 +156,11 @@ deterministic, honesty-mechanism-covered world.
 
 **Stability scope.** Match PG: `now()` / `current_timestamp` are fixed for the **statement**
 (one read, reused for every row), so a statement's time value cannot vary row-to-row and is
-trivially parallel-safe (§7). A per-call `clock_timestamp()` would be a distinct, separately
-ledgered function.
+trivially parallel-safe (§7). **Landed:** `now()` reads the once-resolved statement clock and
+`current_timestamp` is parser sugar for it; the per-call `clock_timestamp()` is the distinct,
+separately ledgered function (`clock-timestamp-clock`) — it reads the clock seam on every call (a
+fresh read that bypasses the statement-clock cache), and is tested with an injected **advancing**
+clock so its per-call advance is deterministic and distinguishable from `now()`.
 
 **Not class B — deterministic counters.** Sequences / `SERIAL` / identity columns and jed's
 existing synthetic rowid counter (CLAUDE.md §11 step 6) are **fully deterministic** (a
@@ -382,7 +386,7 @@ When a section here moves from proposed/unratified to ratified, update **in the 
 | §2 class **U** | Row order without `ORDER BY` | **ratified** (already `rowsort`, conformance.md §4) |
 | §3 | Non-members (limits, collation, iteration-order) | **ratified** (restates existing rules) |
 | §4 | Containment / no-contamination invariant | **proposed** |
-| §5 class **B** | Clock + entropy seams, spec'd PRNG | **ratified** for `uuidv4`/`uuidv7` ([entropy.md](entropy.md)); **proposed** for `now()`/`random()` |
+| §5 class **B** | Clock + entropy seams, spec'd PRNG | **ratified** for `uuidv4`/`uuidv7` and the clock functions `now()`/`current_timestamp`/`clock_timestamp()` ([entropy.md](entropy.md)); **proposed** for `random()` |
 | §6 class **A** | Binary floats (`float64`) | **ratified** — spec + ledger authored, cores in progress ([float.md](float.md)) |
 | §7 class **P** | Parallelism = optimization; `order_sensitive` flag | **proposed framework** |
 | §8 class **P** | Plan-dependent observables / cost-identity fork | **unratified** (open) |

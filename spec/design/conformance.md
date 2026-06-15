@@ -200,6 +200,17 @@ Every corpus entry MUST obey:
   `uuidv7`, a `# clock:`) is non-conformant. `# cost:` is exact and source-independent. Production's
   default draws from the OS CSPRNG per value + the wall clock; only those raw reads are
   non-deterministic (the ledger entries).
+- **The current-time functions** (`now()` / `current_timestamp` / `clock_timestamp()`,
+  [entropy.md](entropy.md) §5) are the other class-**B** ledgered exception, also kept **exact** in
+  the corpus by injecting the clock seam. A record pins the clock with **`# clock: N`** (a fixed
+  instant) — enough for `now()` / `current_timestamp` (STABLE, one read) and for `clock_timestamp()`
+  under a frozen clock — or with **`# clock_advance: start,step`** (an advancing clock that returns
+  `start, start+step, …`, one increment per read in expression-evaluation order). The advancing form
+  is what makes the VOLATILE `clock_timestamp()`'s per-call reads deterministic *and* distinguishable
+  from the statement-stable `now()` (under it, two `now()` are equal while two `clock_timestamp()`
+  differ). Both directives are stock-runner-ignored comments, bound to the next record and reset
+  after — like `# clock:`/`# cost:`. NOT oracle-imported (PG's wall clock differs); `# cost:` is exact
+  and clock-independent. Production reads the wall clock.
 - **Canonical boolean spelling.** A boolean prints as exactly `true`/`false` (NULL as
   `NULL`); no core may emit `t`/`f`, `0`/`1`, or host-cased variants.
 

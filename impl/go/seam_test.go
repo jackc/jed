@@ -94,3 +94,31 @@ func TestUUIDv7RejectsOutOfRange(t *testing.T) {
 		t.Fatal("expected 22008 for a pre-epoch clock")
 	}
 }
+
+func TestAdvancingClockStepsPerReadAndNowCaches(t *testing.T) {
+	// The advancing clock yields start, start+step, … one increment per read (entropy.md §6).
+	clk := AdvancingClock(1000, 1)
+	for i, want := range []int64{1000, 1001, 1002} {
+		if got := clk(); got != want {
+			t.Fatalf("advancing read %d = %d, want %d", i, got, want)
+		}
+	}
+	// now() (statementClockMicros) reads ONCE and caches: it pulls 1000 then stays 1000 even as
+	// clock_timestamp() (clockNowMicros) keeps advancing the SAME source — the stable-vs-volatile
+	// distinction, made deterministic.
+	var seam Seam
+	seam.SetClock(AdvancingClock(1000, 1))
+	r := newStmtRng()
+	if got := r.statementClockMicros(&seam); got != 1000 {
+		t.Fatalf("first statement clock = %d, want 1000", got)
+	}
+	if got := r.clockNowMicros(&seam); got != 1001 {
+		t.Fatalf("first clock_timestamp = %d, want 1001", got)
+	}
+	if got := r.clockNowMicros(&seam); got != 1002 {
+		t.Fatalf("second clock_timestamp = %d, want 1002", got)
+	}
+	if got := r.statementClockMicros(&seam); got != 1000 {
+		t.Fatalf("statement clock after advances = %d, want cached 1000", got)
+	}
+}

@@ -390,6 +390,14 @@ id = "func.uuid_generate"
 description = "VOLATILE uuid generators on the host-injected entropy+clock seam (spec/design/entropy.md) — uuidv4() (random) and uuidv7([shift interval]) (48-bit ms timestamp + a per-statement monotonic counter in rand_a + random rand_b; an out-of-48-bit/pre-epoch ms traps 22008; the optional interval shifts the embedded instant via calendar-aware timestamptz arithmetic). A spec'd byte-exact PRNG (splitmix64) makes the seeded path cross-core identical; the `# seed:` and `# clock:` corpus directives inject a fixed seed + statement clock so the output is exact and deterministic (production reads OS entropy + the wall clock). NOT oracle-imported (PG's entropy differs); cost is one operator_eval per call, independent of the random values. Builds on types.uuid"
 
 [[capability]]
+id = "func.now"
+description = "STABLE current-time function now() [alias: the bare keyword current_timestamp] → timestamptz, on the host-injected clock seam (spec/design/entropy.md §5, determinism.md §5). Statement-stable: the clock is read ONCE per statement and reused for every row (PG's now() semantics), so a statement's time cannot vary row-to-row. current_timestamp is parser sugar for now() (same value, same `now` column label, same cost). The `# clock:` / `# clock_advance:` corpus directives inject a fixed / advancing clock so output is exact and deterministic cross-core; production reads the wall clock. NOT oracle-imported (PG's wall clock differs); cost is one operator_eval per call, independent of the clock value. Builds on types.timestamptz"
+
+[[capability]]
+id = "func.clock_timestamp"
+description = "VOLATILE current-time function clock_timestamp() → timestamptz, on the host-injected clock seam (spec/design/entropy.md §5, determinism.md §5). Per-call: reads the clock on EVERY evaluation (distinct from the statement-stable now()), so it may advance within a statement. The `# clock_advance: start,step` corpus directive injects an advancing clock (one increment per read, in expression-evaluation order) so the per-call reads are deterministic and distinguishable from now() cross-core; production reads the wall clock per call. NOT oracle-imported (PG's wall clock differs); cost is one operator_eval per call. Builds on types.timestamptz"
+
+[[capability]]
 id = "error.division_by_zero"
 description = "Integer division / modulo by zero is defined and traps SQLSTATE 22012"
 
@@ -492,6 +500,8 @@ capabilities = [
   "func.round",
   "func.uuid_extract",
   "func.uuid_generate",
+  "func.now",
+  "func.clock_timestamp",
 ]
 
 [[profile]]

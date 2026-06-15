@@ -8,6 +8,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import {
+  advancingClock,
   Database,
   EngineError,
   execute,
@@ -215,6 +216,19 @@ function parseClockDirective(line: string): bigint | null {
   }
 }
 
+// parseClockAdvanceDirective parses a `# clock_advance: start,step` directive line (entropy.md §6):
+// an advancing clock (start, start+step, … one increment per read) so clock_timestamp()'s per-call
+// reads are deterministic and distinguishable from the statement-stable now(). Returns [start, step].
+function parseClockAdvanceDirective(line: string): [bigint, bigint] | null {
+  const m = line.match(/^#\s*clock_advance:\s*(-?\d+)\s*,\s*(-?\d+)/);
+  if (!m) return null;
+  try {
+    return [BigInt(m[1]!), BigInt(m[2]!)];
+  } catch {
+    return null;
+  }
+}
+
 // assertCost checks the accrued execution cost matches a pending `# cost:` directive.
 function assertCost(expected: bigint | null, actual: bigint, sql: string): void {
   if (expected !== null && expected !== actual) {
@@ -277,6 +291,7 @@ function runFile(text: string): void {
   let pendingMaxCost: bigint | null = null;
   let pendingSeed: bigint | null = null;
   let pendingClock: bigint | null = null;
+  let pendingClockAdvance: [bigint, bigint] | null = null;
   while (c.i < lines.length) {
     const line = lines[c.i]!.trim();
     if (line === "") {
@@ -290,6 +305,7 @@ function runFile(text: string): void {
       const mc = parseMaxCostDirective(line);
       const sd = parseSeedDirective(line);
       const ck = parseClockDirective(line);
+      const ca = parseClockAdvanceDirective(line);
       if (n !== null) {
         pendingCost = n;
       } else if (mc !== null) {
@@ -298,6 +314,8 @@ function runFile(text: string): void {
         pendingSeed = sd;
       } else if (ck !== null) {
         pendingClock = ck;
+      } else if (ca !== null) {
+        pendingClockAdvance = ca;
       } else {
         const names = parseNamesDirective(line);
         if (names !== null) {
@@ -325,9 +343,17 @@ function runFile(text: string): void {
     if (pendingSeed !== null) db.setRandomSource(seededRandomSource(pendingSeed));
     else db.clearRandomSource();
     pendingSeed = null;
-    if (pendingClock !== null) db.setClockSource(fixedClock(pendingClock));
-    else db.clearClockSource();
+    // `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one); a
+    // record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
+    if (pendingClockAdvance !== null) {
+      db.setClockSource(advancingClock(pendingClockAdvance[0], pendingClockAdvance[1]));
+    } else if (pendingClock !== null) {
+      db.setClockSource(fixedClock(pendingClock));
+    } else {
+      db.clearClockSource();
+    }
     pendingClock = null;
+    pendingClockAdvance = null;
     const fields = line.split(/\s+/);
     if (fields[0] === "statement") {
       // `# names:` / `# types:` assert result columns, which a statement lacks.

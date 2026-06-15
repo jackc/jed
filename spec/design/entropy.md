@@ -3,9 +3,10 @@
 > The host-injected **random and clock seams** — two functions the host supplies (each defaulting
 > to the platform primitive) — and the **spec'd byte-exact PRNG** the engine provides as an
 > injectable *deterministic* source. Together they let nondeterministic functions (`uuidv4`,
-> `uuidv7`, and later `random()`/`now()`) live inside jed's cross-core determinism contract. This
-> RATIFIES [determinism.md](determinism.md) §5 (class **B**) for the UUID generators. Read
-> determinism.md §1/§5 first — this doc is the concrete realization of the seam it proposes.
+> `uuidv7`, `now()`/`current_timestamp`, `clock_timestamp()`, and later `random()`) live inside jed's
+> cross-core determinism contract. This RATIFIES [determinism.md](determinism.md) §5 (class **B**)
+> for the UUID generators and the clock functions. Read determinism.md §1/§5 first — this doc is the
+> concrete realization of the seam it proposes.
 
 ## 1. The problem and the move
 
@@ -34,6 +35,15 @@ CSPRNG bytes and the raw clock read; everything downstream is in-contract.
 **Stability scope (determinism.md §5).** The clock is read **once per statement** and reused for
 every row (PG's `now()` semantics). The random source is asked for fresh bytes per generated value,
 in row-evaluation order, so distinct rows get distinct values.
+
+**Other clock-seam consumers — `now()` / `current_timestamp` / `clock_timestamp()`.** The clock
+seam also feeds the current-time functions ([functions.md](functions.md) §12), all returning
+`timestamptz` (the seam's micros are exactly timestamptz's internal representation). `now()` (and its
+bare-keyword sugar `current_timestamp`) is **STABLE**: it reads the once-resolved **statement clock**
+above and reuses it for every row. `clock_timestamp()` is **VOLATILE**: it reads the seam on **every**
+call (a fresh read that does *not* touch the statement-clock cache), so it may advance within a
+statement — the draws follow expression-evaluation order, exactly like the random source's. They take
+no entropy.
 
 ## 2. The provided deterministic source — splitmix64, byte-exact shared data
 
@@ -149,12 +159,20 @@ file and not per-statement arguments — the host injects them once on the handl
 | inject clock source | `db.set_clock_source(f)` | `db.SetClockSource(f)` | `db.setClockSource(f)` |
 | clear (back to platform) | `db.clear_random_source()` / `db.clear_clock_source()` | `ClearRandomSource` / `ClearClockSource` | `clearRandomSource` / `clearClockSource` |
 
-The engine provides two constructors for the deterministic / reproducible path:
+The engine provides these constructors for the deterministic / reproducible path:
 
 | Provided source | Rust | Go | TS |
 |---|---|---|---|
 | seeded PRNG source | `seeded_random_source(u64)` | `SeededRandomSource(uint64)` | `seededRandomSource(bigint)` |
 | fixed clock | `fixed_clock(i64)` | `FixedClock(int64)` | `fixedClock(bigint)` |
+| advancing clock | `advancing_clock(start, step)` | `AdvancingClock(start, step)` | `advancingClock(start, step)` |
+
+The **advancing clock** returns `start`, then `start+step`, `start+2·step`, … — one increment per
+read (captured state; the `ClockSource` is `FnMut`/a closure). It makes `clock_timestamp()`'s per-call
+reads deterministic and distinguishable from the statement-stable `now()` (which reads the source only
+once): under it, two `now()` in a statement are equal while two `clock_timestamp()` differ. The
+conformance harness injects it via the **`# clock_advance: start,step`** directive
+([conformance.md](conformance.md) §4), the advancing counterpart to `# clock:`.
 
 Unset, the random source reads **OS entropy per value** and the clock reads the **wall clock**: Go
 `crypto/rand` + `time`, TS `node:crypto` + `Date`, Rust `getrandom` (the approved CLAUDE.md §14
@@ -168,7 +186,9 @@ after — exactly the `# max_cost:` pattern.
 A generator call charges the uniform **one `operator_eval`** (like every scalar function),
 **independent of the random values and the draw count** — so cost stays deterministic and identical
 regardless of source/clock (asserted in the corpus by pinning the same `# cost:` under different
-`# seed:` values). The `uuidv7(interval)` argument charges its own `operator_eval`(s).
+`# seed:` values). The `uuidv7(interval)` argument charges its own `operator_eval`(s). `now()` /
+`current_timestamp` / `clock_timestamp()` likewise each charge one `operator_eval`, independent of
+the clock value.
 
 ## 8. Determinism ledger
 
@@ -181,3 +201,8 @@ determinism.md §4); the test mechanism is injected-source+clock-exact plus the 
 The uuidv7 monotonic-counter behavior is itself deterministic — it is **not** a determinism
 exception (and is not oracle-comparable to PG's own counter, since neither core byte-matches PG's
 entropy; the generators are not oracle-imported).
+
+The clock functions are the two further class-**B** entries `now-clock` (STABLE) and
+`clock-timestamp-clock` (VOLATILE, a distinct entry — per-call, not statement-stable): with a fixed
+or advancing clock injected they keep **G1+G2**; production drops G1/G2 only on the raw wall-clock
+read(s). They are likewise **not** oracle-imported (PG's wall clock differs).

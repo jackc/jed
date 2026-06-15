@@ -105,6 +105,10 @@ var SupportedCapabilities = []string{
 	"func.uuid_extract",
 	// Volatile uuid generators (uuidv4/uuidv7) on the entropy+clock seam — entropy.md.
 	"func.uuid_generate",
+	// Current-time functions on the clock seam — now()/current_timestamp (STABLE) and
+	// clock_timestamp() (VOLATILE) — entropy.md §5, functions.md §12.
+	"func.now",
+	"func.clock_timestamp",
 	"null.three_valued",
 	"compare.promotion",
 	"cast.explicit",

@@ -4281,6 +4281,12 @@ enum ScalarFunc {
     /// uuidv7([interval]) → uuid — ms timestamp + monotonic counter + random (the entropy+clock
     /// seam, entropy.md §3); the optional interval shifts the embedded instant. VOLATILE.
     Uuidv7,
+    /// now() → timestamptz — the statement clock (the clock seam, entropy.md §5), read ONCE and
+    /// reused for the whole statement. STABLE. `current_timestamp` is parser sugar for this.
+    Now,
+    /// clock_timestamp() → timestamptz — the clock seam read on EVERY call, so it may advance
+    /// within a statement (entropy.md §5). VOLATILE.
+    ClockTimestamp,
 }
 
 /// A resolved expression: a tree over fixed column indices, ready to evaluate against
@@ -5775,6 +5781,8 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "uuid_extract_timestamp" => ScalarFunc::UuidExtractTimestamp,
         "uuidv4" => ScalarFunc::Uuidv4,
         "uuidv7" => ScalarFunc::Uuidv7,
+        "now" => ScalarFunc::Now,
+        "clock_timestamp" => ScalarFunc::ClockTimestamp,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -8914,6 +8922,20 @@ impl RExpr {
                         env.rng.set(r);
                         Ok(Value::Uuid(b))
                     }
+                    // current-time functions (spec/design/entropy.md §5): now() reads the statement
+                    // clock ONCE and reuses it (STABLE); clock_timestamp() reads the seam on every
+                    // call (VOLATILE). Both return the seam's micros directly as timestamptz.
+                    ScalarFunc::Now => {
+                        let mut r = env.rng.get();
+                        let micros = r.statement_clock_micros(&env.exec.seam);
+                        env.rng.set(r);
+                        Ok(Value::Timestamptz(micros))
+                    }
+                    ScalarFunc::ClockTimestamp => {
+                        let r = env.rng.get();
+                        let micros = r.clock_now_micros(&env.exec.seam);
+                        Ok(Value::Timestamptz(micros))
+                    }
                 }
             }
             // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
@@ -9391,8 +9413,12 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp
         | ScalarFunc::Uuidv4
-        | ScalarFunc::Uuidv7 => {
-            unreachable!("abs/round/make_interval/uuid_* are handled before eval_float_func")
+        | ScalarFunc::Uuidv7
+        | ScalarFunc::Now
+        | ScalarFunc::ClockTimestamp => {
+            unreachable!(
+                "abs/round/make_interval/uuid_*/now/clock_timestamp are handled before eval_float_func"
+            )
         }
     };
     Ok(Value::Float64(r))

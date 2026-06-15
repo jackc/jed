@@ -428,9 +428,10 @@ The design is optimized for AI agents even more than for humans. In practice:
   everything *else* stays bit-reproducible, which is what the agent loop and cross-impl sync
   depend on. Determinism is **default-deny with a ledger** (`spec/design/determinism.md`): the
   few sanctioned relaxations are enumerated in `spec/conformance/determinism_exceptions.toml` —
-  `float64` value/render (class A), and the **`uuidv4`/`uuidv7` generators**, which read entropy +
-  the clock through a **host-injected seam** (`spec/design/entropy.md`) and so stay *deterministic
-  given the seam inputs* (tests inject a fixed seed+clock → byte-identical cross-core; production
+  `float64` value/render (class A), and the **`uuidv4`/`uuidv7` generators** plus the **clock
+  functions `now()`/`current_timestamp`/`clock_timestamp()`**, which read entropy + the clock through
+  a **host-injected seam** (`spec/design/entropy.md`) and so stay *deterministic given the seam
+  inputs* (tests inject a fixed seed + a fixed/advancing clock → byte-identical cross-core; production
   reads OS entropy + wall clock). The seam joins the storage and cost seams as the engine's third
   "host supplies it" boundary.
 - **Benchmarks are wall-clock, never conformance.** `bench/` (`rake bench:setup/run/report`,

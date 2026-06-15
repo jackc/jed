@@ -61,6 +61,28 @@ test         = "injected-source+clock-exact: the `# seed:` / `# clock:` directiv
 status       = "ratified"
 reason       = "Wall-clock + randomness are intrinsic to uuidv7. Both are pushed to host seams (determinism.md §5): with a deterministic source + fixed clock injected the engine is a deterministic function of them, so the only irreducible production non-determinism is the raw per-value entropy + clock reads — G1+G2 hold on the injected/test path."
 
+# --- now() / current_timestamp: STABLE clock seam ----------------------------
+[[exception]]
+id           = "now-clock"
+surface      = "now() [alias the bare keyword current_timestamp] (../design/entropy.md §5) — the STATEMENT timestamptz, read once and reused"
+class        = "B"
+drops        = []
+blast_radius = "the timestamptz result column; promotes to the row multiset / other columns ONLY if that instant flows through a WHERE / ORDER BY...LIMIT / a key. STABLE: the clock is read ONCE per statement and reused for every row (PG's now() semantics), so a statement's time cannot vary row-to-row (trivially parallel-safe). On the INJECTED path (`# clock:` a fixed clock, or `# clock_advance:` an advancing one) NOTHING is dropped: the value is the injected clock's first read, byte-identical across cores. In PRODUCTION the single read is the wall clock — the only non-determinism."
+test         = "injected-clock-exact: the `# clock:` / `# clock_advance:` directives inject the statement clock, so now() is asserted byte-for-byte across all cores (suites/expr/clock_functions.test); current_timestamp shares now()'s once-resolved statement clock (asserted equal even under an advancing clock). # cost: is exact (one operator_eval) and clock-independent."
+status       = "ratified"
+reason       = "The wall clock is intrinsic to now(). It is pushed to the host clock seam (determinism.md §5): with a clock injected the engine is a deterministic function of it, so the only irreducible production non-determinism is the single raw clock read — G1+G2 hold on the injected/test path. NOT oracle-imported (PG's wall clock differs)."
+
+# --- clock_timestamp(): VOLATILE clock seam (per-call) -----------------------
+[[exception]]
+id           = "clock-timestamp-clock"
+surface      = "clock_timestamp() (../design/entropy.md §5) — a per-call timestamptz, read on EVERY evaluation"
+class        = "B"
+drops        = []
+blast_radius = "the timestamptz result column (as for now()). VOLATILE: it reads the clock on EVERY call, so it may advance within a statement (distinct from the statement-stable now()). On the INJECTED path (`# clock_advance: start,step` injects an advancing clock) NOTHING is dropped: each call takes the next tick in expression-evaluation order, byte-identical across cores. In PRODUCTION each call is a raw wall-clock read — the only non-determinism."
+test         = "injected-advancing-clock-exact: the `# clock_advance:` directive injects an advancing clock so the per-call reads are deterministic and distinguishable from now() — asserted byte-for-byte across all cores (suites/expr/clock_functions.test: clock_timestamp() < clock_timestamp(), and the fully-spelled now()-stable-vs-clock_timestamp()-advances contrast). # cost: is exact (one operator_eval per call)."
+status       = "ratified"
+reason       = "The wall clock is intrinsic to clock_timestamp(), read per call by definition. It is pushed to the host clock seam (determinism.md §5): with an advancing clock injected the engine is a deterministic function of it, so the only irreducible production non-determinism is the raw per-call clock reads — G1+G2 hold on the injected/test path. A DISTINCT ledger entry from now() (per-call, not statement-stable). NOT oracle-imported (PG's wall clock differs)."
+
 # --- float64: control-flow promotion of an exempted value --------------------
 [[exception]]
 id           = "float-control-flow"

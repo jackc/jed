@@ -111,6 +111,19 @@ pub fn fixed_clock(micros: i64) -> ClockSource {
     Box::new(move || micros)
 }
 
+/// The provided **advancing** clock source: returns `start`, then `start+step`, `start+2·step`, …
+/// — one increment per read (`FnMut` captured state). The `# clock_advance:` directive injects this
+/// (entropy.md §6) to make `clock_timestamp()`'s per-call reads deterministic and distinguishable
+/// from the statement-stable `now()` cross-core; the draw order follows expression-evaluation order.
+pub fn advancing_clock(start: i64, step: i64) -> ClockSource {
+    let mut cur = start;
+    Box::new(move || {
+        let v = cur;
+        cur = cur.wrapping_add(step);
+        v
+    })
+}
+
 /// The per-statement mutable seam state: the uuidv7 monotonic counter and the once-resolved
 /// statement clock (entropy.md §5 — read once, reused, so a statement's time cannot vary
 /// row-to-row). The PRNG state itself lives in the injected [`RandomSource`] (handle-scoped), not
@@ -129,13 +142,20 @@ impl StmtRng {
     }
 
     /// The statement clock in micros since the Unix epoch, resolved once (entropy.md §5): the seam's
-    /// clock source. Reused for every uuidv7 in the statement.
+    /// clock source. Reused for every uuidv7 / now() in the statement (STABLE).
     pub fn statement_clock_micros(&mut self, seam: &Seam) -> i64 {
         if !self.clock_resolved {
             self.clock = seam.now_micros();
             self.clock_resolved = true;
         }
         self.clock
+    }
+
+    /// A fresh read of the clock seam in micros since the Unix epoch — used by clock_timestamp()
+    /// (entropy.md §5), which reads on EVERY call (VOLATILE) and so does NOT touch the once-resolved
+    /// statement clock above. No `&mut self`: it caches nothing.
+    pub fn clock_now_micros(&self, seam: &Seam) -> i64 {
+        seam.now_micros()
     }
 
     /// uuidv4 — 16 bytes from the seam's random source, version/variant overwritten (entropy.md §3).
@@ -248,6 +268,26 @@ mod tests {
         assert_eq!(extract_version(&v7), Some(7));
         // The embedded instant is a plausible wall-clock time (after 2020-01-01).
         assert!(extract_timestamp_micros(&v7).unwrap() > 1_577_836_800_000_000);
+    }
+
+    #[test]
+    fn advancing_clock_steps_per_read_and_now_caches() {
+        // The advancing clock yields start, start+step, … one increment per read (entropy.md §6).
+        let mut clk = advancing_clock(1_000, 1);
+        assert_eq!(clk(), 1_000);
+        assert_eq!(clk(), 1_001);
+        assert_eq!(clk(), 1_002);
+
+        // now() (statement_clock_micros) reads ONCE and caches: it pulls 1000, then stays 1000 even
+        // as clock_timestamp() (clock_now_micros) keeps advancing the SAME source. This is what
+        // makes the now()-stable vs clock_timestamp()-volatile distinction deterministic.
+        let seam = Seam::default();
+        seam.set_clock(advancing_clock(1_000, 1));
+        let mut r = StmtRng::new();
+        assert_eq!(r.statement_clock_micros(&seam), 1_000); // first read → 1000, cached
+        assert_eq!(r.clock_now_micros(&seam), 1_001); // per-call read advances the source
+        assert_eq!(r.clock_now_micros(&seam), 1_002);
+        assert_eq!(r.statement_clock_micros(&seam), 1_000); // still the cached statement clock
     }
 
     #[test]

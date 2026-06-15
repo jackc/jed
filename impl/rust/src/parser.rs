@@ -1480,6 +1480,22 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Literal(Literal::Bool(false)))
             }
+            // `current_timestamp` — the SQL-standard bare keyword (no parens), reserved like the
+            // value literals above. Pure sugar: desugar to a `now()` call so resolution / execution
+            // / cost / volatility are entirely shared (spec/design/functions.md §12). Not fired when
+            // followed by `(` (a precision typmod, deferred) so that form resolves normally (42883).
+            Token::Word(w)
+                if w.eq_ignore_ascii_case("current_timestamp")
+                    && !matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) =>
+            {
+                self.advance();
+                Ok(Expr::FuncCall {
+                    name: "now".to_string(),
+                    args: Vec::new(),
+                    arg_names: None,
+                    star: false,
+                })
+            }
             Token::Str(_) => {
                 if let Token::Str(s) = self.advance() {
                     Ok(Expr::Literal(Literal::Text(s)))

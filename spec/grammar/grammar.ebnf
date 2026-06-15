@@ -492,6 +492,7 @@ primary        ::= number
                  | string
                  | "TRUE" | "FALSE"
                  | "NULL"
+                 | "CURRENT_TIMESTAMP"
                  | parameter
                  | typed_literal
                  | "CAST" "(" expr "AS" type_name ")"
@@ -500,6 +501,13 @@ primary        ::= number
                  | "EXISTS" "(" query_expr ")"
                  | "(" ( query_expr | expr ) ")"
                  | column_ref
+
+/* CURRENT_TIMESTAMP is the SQL-standard BARE keyword (no parens) for the transaction/statement
+ * timestamp (../design/functions.md §12). It is pure sugar: the parser desugars it to a now() call,
+ * so it shares now()'s resolution / execution / cost / STABLE volatility / default `now` column
+ * label. Reserved as a primary like TRUE/FALSE/NULL (recognized only when NOT followed by "(" — the
+ * precision-typmod form current_timestamp(p) is deferred, so a "(" falls through to ordinary
+ * resolution, 42883). now() and clock_timestamp() are ordinary function_calls, not keywords. */
 
 /* A typed string literal (../design/grammar.md §36): ANY type name IMMEDIATELY followed by a
  * single-quoted string, naming the literal's type so it is CONTEXT-FREE (carries that type in

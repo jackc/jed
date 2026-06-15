@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { fixedClock, Seam, seededRandomSource, StmtRng } from "../src/seam.ts";
+import { advancingClock, fixedClock, Seam, seededRandomSource, StmtRng } from "../src/seam.ts";
 import { parseUuid } from "../src/value.ts";
 import { uuidExtractTimestampMicros, uuidExtractVersion } from "../src/uuid.ts";
 
@@ -68,4 +68,22 @@ test("the unseeded path uses OS entropy and the wall clock", () => {
 test("uuidv7 rejects an out-of-range (pre-epoch) clock", () => {
   const r = new StmtRng();
   assert.throws(() => r.uuidV7(seeded(1n), -1_000_000n));
+});
+
+test("advancing clock steps per read; now() caches while clock_timestamp() advances", () => {
+  // The advancing clock yields start, start+step, … one increment per read (entropy.md §6).
+  const clk = advancingClock(1000n, 1n);
+  assert.equal(clk(), 1000n);
+  assert.equal(clk(), 1001n);
+  assert.equal(clk(), 1002n);
+  // now() (statementClockMicros) reads ONCE and caches: it pulls 1000 then stays 1000 even as
+  // clock_timestamp() (clockNowMicros) keeps advancing the SAME source — the stable-vs-volatile
+  // distinction, made deterministic.
+  const seam = new Seam();
+  seam.clock = advancingClock(1000n, 1n);
+  const r = new StmtRng();
+  assert.equal(r.statementClockMicros(seam), 1000n); // first read → 1000, cached
+  assert.equal(r.clockNowMicros(seam), 1001n); // per-call read advances the source
+  assert.equal(r.clockNowMicros(seam), 1002n);
+  assert.equal(r.statementClockMicros(seam), 1000n); // still the cached statement clock
 });

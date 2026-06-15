@@ -3473,7 +3473,12 @@ type ScalarFuncName =
   // uuid generators (spec/design/entropy.md §3): volatile. uuidv4 → random; uuidv7 → ms timestamp
   // + monotonic counter + random, with an optional interval shift.
   | "uuidv4"
-  | "uuidv7";
+  | "uuidv7"
+  // current-time functions (spec/design/entropy.md §5): now → timestamptz, the statement clock read
+  // ONCE and reused (STABLE; current_timestamp is parser sugar for it); clock_timestamp →
+  // timestamptz, the clock seam read on EVERY call (VOLATILE).
+  | "now"
+  | "clock_timestamp";
 
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
@@ -6438,6 +6443,15 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // timestamptz arithmetic (entropy.md §4).
         const shifted = vals.length === 1 ? tsShift(clock, (vals[0] as { iv: Interval }).iv, false) : clock;
         return uuidValue(env.rng.uuidV7(env.seam, shifted));
+      }
+      // current-time functions (spec/design/entropy.md §5): now() reads the statement clock ONCE and
+      // reuses it (STABLE); clock_timestamp() reads the seam on every call (VOLATILE). Both return
+      // the seam's micros directly as timestamptz.
+      if (e.func === "now") {
+        return timestamptzValue(env.rng.statementClockMicros(env.seam));
+      }
+      if (e.func === "clock_timestamp") {
+        return timestamptzValue(env.rng.clockNowMicros(env.seam));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the
