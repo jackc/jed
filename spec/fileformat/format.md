@@ -126,15 +126,20 @@ reclamation + on-disk free-list persistence (the P6.2 follow-ons).
 
 The file is a flat array of fixed-size **pages**; the page size is a format parameter
 recorded in the meta page (**default 8192**; the golden fixtures use **256** so the hex stays
-reviewable). It must lie in **`[52, 65536]`**: the minimum is `PAGE_HEADER + 36` (below it the
-36-byte meta header does not fit), the maximum is `MAX_PAGE_SIZE = 65536` (64 KiB). A core
-**rejects** a page size outside this range — `0A000` when serializing (`create`), `XX001` when
-reading a file's meta (`open`). The maximum bounds the largest single page allocation: without
-it a corrupt or hostile file could record a multi-gigabyte `page_size` and force that allocation
-before any content is validated (the untrusted-input concern, CLAUDE.md §13). Any value in range
-is accepted (power-of-two is **not** required). `page_count = file_size / page_size`. Every page
-is zero-filled to exactly `page_size`. Two page-payload capacities derive from the page size and
-recur throughout:
+reviewable). It must be a **power of two** in **`[256, 65536]`** — i.e. one of the nine values
+`{256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536}`. `MIN_PAGE_SIZE = 256` is the floor
+(comfortably above the structural minimum `PAGE_HEADER + 36 = 52`, below which the 36-byte meta
+header would not fit) and `MAX_PAGE_SIZE = 65536` (64 KiB) the ceiling. A core **rejects** any
+other page size — `0A000` when serializing (`create`), `XX001` when reading a file's meta
+(`open`). The **power-of-two** requirement keeps every page boundary aligned to the device's
+logical/physical sector (the SSD target, CLAUDE.md §9) — a non-power-of-two page straddles sector
+boundaries and forces read-modify-write amplification — and collapses the legal set to nine
+values, shrinking the cross-core test matrix; it also matches SQLite (the identical rule) and
+PostgreSQL (`BLCKSZ` is a compile-time power of two). The **maximum** bounds the largest single
+page allocation: without it a corrupt or hostile file could record a multi-gigabyte `page_size`
+and force that allocation before any content is validated (the untrusted-input concern, CLAUDE.md
+§13). `page_count = file_size / page_size`. Every page is zero-filled to exactly `page_size`. Two
+page-payload capacities derive from the page size and recur throughout:
 
 ```
 C          = page_size - 16       # PAGE_HEADER (v7); the bytes a page body may hold

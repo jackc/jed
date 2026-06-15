@@ -534,6 +534,52 @@ mod tests {
         assert!(err.message.contains("page size"), "{}", err.message);
     }
 
+    /// Page-size hardening (format.md *Page model*): a page size in range but **not a power of two**
+    /// is rejected — `0A000` on `create`, `XX001` on `open`. Power-of-two keeps page boundaries
+    /// sector-aligned (CLAUDE.md §9) and collapses the legal set to nine values.
+    #[test]
+    fn rejects_non_power_of_two_page_size() {
+        // create: 1000 is within [256, 65536] but not a power of two.
+        let path = tmp("jed_pow2_create.jed");
+        let _ = std::fs::remove_file(&path);
+        let err = Database::create(&path, DatabaseOptions { page_size: 1000 })
+            .err()
+            .expect("a non-power-of-two page size must be rejected");
+        assert_eq!(err.state, SqlState::FeatureNotSupported);
+        assert!(
+            err.message.contains("power of two"),
+            "message names the cause: {}",
+            err.message
+        );
+        assert!(!path.exists(), "no file written on a rejected page size");
+        let _ = std::fs::remove_file(&path);
+
+        // open: a crafted meta recording page_size = 1000 reads as corrupt.
+        let mut image = vec![0u8; 4096];
+        image[0..4].copy_from_slice(b"JEDB");
+        image[8..12].copy_from_slice(&1000u32.to_be_bytes());
+        let err = Database::from_image(&image)
+            .err()
+            .expect("a non-power-of-two page size must be rejected on open");
+        assert_eq!(err.state, SqlState::DataCorrupted);
+        assert!(err.message.contains("page size"), "{}", err.message);
+    }
+
+    /// The new floor (format.md *Page model*): 256 is the smallest legal page size; 128 — a power of
+    /// two but below `MIN_PAGE_SIZE` — is rejected on `create`.
+    #[test]
+    fn rejects_page_size_below_floor() {
+        let path = tmp("jed_pow2_floor.jed");
+        let _ = std::fs::remove_file(&path);
+        let err = Database::create(&path, DatabaseOptions { page_size: 128 })
+            .err()
+            .expect("a sub-256 page size must be rejected");
+        assert_eq!(err.state, SqlState::FeatureNotSupported);
+        assert!(err.message.contains("too small"), "{}", err.message);
+        assert!(!path.exists(), "no file written on a rejected page size");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Large values (spec/design/large-values.md §12) through the **default demand-paged** file path:
     /// a value too big for a record spills to an overflow chain; the paged read faults the leaf and
     /// follows the chain to materialize it exactly; and after a delete + reopen the dead chain's pages

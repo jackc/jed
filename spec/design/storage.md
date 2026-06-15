@@ -82,7 +82,10 @@ method is something every host (including OPFS and pure memory) can implement ch
 - **Fixed-size pages**, page-aligned (SSD target, §1). **Default 8 KiB**, recorded in the
   file header so it is a format parameter, not a hardcoded constant — matches PostgreSQL's
   default block size (a well-proven choice on SSD/OS page granularity) and stays revisitable
-  per the fixtures without code assumptions.
+  per the fixtures without code assumptions. The size must be a **power of two** in
+  `[256, 65536]` (nine legal values; [../fileformat/format.md](../fileformat/format.md) *Page
+  model*) — power-of-two keeps every page boundary sector-aligned (no read-modify-write
+  amplification) and matches SQLite/PostgreSQL.
 - **Page 0 is the header / meta page**: magic number, format version, page size, and the
   **root pointer(s)** for the committed state (§4). Byte layout is specified in
   [../fileformat/](../fileformat/) with fixtures, including the cross-core round-trip test

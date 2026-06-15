@@ -262,3 +262,43 @@ func TestReadRejectsOversizedPageSize(t *testing.T) {
 		t.Fatalf("want XX001 data_corrupted, got %v", err)
 	}
 }
+
+// TestRejectsNonPowerOfTwoPageSize exercises page-size hardening (format.md *Page model*): a page
+// size in range but not a power of two is rejected — 0A000 on Create, XX001 on the read path.
+// Power-of-two keeps page boundaries sector-aligned (CLAUDE.md §9) and collapses the legal set.
+func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
+	// Create: 1000 is within [256, 65536] but not a power of two.
+	path := filepath.Join(t.TempDir(), "pow2.jed")
+	_, err := Create(path, DatabaseOptions{PageSize: 1000})
+	ee, ok := err.(*EngineError)
+	if !ok || ee.Code() != "0A000" {
+		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
+	}
+	if got := ee.Message; !strings.Contains(got, "power of two") {
+		t.Fatalf("message should name the cause, got %q", got)
+	}
+
+	// Read: a crafted meta recording page_size = 1000 reads as corrupt.
+	image := make([]byte, 4096)
+	copy(image[0:4], "JEDB")
+	binary.BigEndian.PutUint32(image[8:12], 1000)
+	_, err = LoadDatabase(image)
+	ee, ok = err.(*EngineError)
+	if !ok || ee.Code() != "XX001" {
+		t.Fatalf("want XX001 data_corrupted, got %v", err)
+	}
+}
+
+// TestRejectsPageSizeBelowFloor exercises the new 256 floor (format.md *Page model*): 128 — a power
+// of two but below minPageSize — is rejected on Create.
+func TestRejectsPageSizeBelowFloor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tiny.jed")
+	_, err := Create(path, DatabaseOptions{PageSize: 128})
+	ee, ok := err.(*EngineError)
+	if !ok || ee.Code() != "0A000" {
+		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
+	}
+	if got := ee.Message; !strings.Contains(got, "too small") {
+		t.Fatalf("message should name the cause, got %q", got)
+	}
+}

@@ -223,10 +223,10 @@ change lands alone, on a frozen seam:
   api.md §2.1), with a read-only **`resident_leaves`** gauge (`0` for in-memory). The internal
   `open_with_capacity` seam was promoted to this public API. **Bytes, not a page count**, so the
   caller's budget does not silently scale with the file's `page_size` (§3). **Page-size hardening:** the
-  page size is now bounded **`[52, 65536]`** (the meta-header floor through `MAX_PAGE_SIZE = 64 KiB`) and
-  rejected outside it on both paths — `0A000` on `create`, `XX001` on `open` — so a corrupt or hostile
-  file cannot record a multi-gigabyte `page_size` and force that allocation before its content is
-  validated (CLAUDE.md §13; format.md *Page model*). A large-file test in each core opens a database
+  page size is now constrained to a **power of two in `[256, 65536]`** (`MIN_PAGE_SIZE = 256` through
+  `MAX_PAGE_SIZE = 64 KiB`, nine legal values) and rejected otherwise on both paths — `0A000` on
+  `create`, `XX001` on `open` — so a corrupt or hostile file cannot record a multi-gigabyte `page_size`
+  and force that allocation before its content is validated (CLAUDE.md §13; format.md *Page model*). A large-file test in each core opens a database
   whose leaf pages far exceed a tiny budget and confirms it scans, mutates, and round-trips correctly
   while the resident leaf count stays `≤ cache_leaves` throughout (including under a repeated-lookup
   workload), plus a `page_size > cache_bytes` case that keeps exactly one leaf resident.

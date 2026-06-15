@@ -73,8 +73,16 @@ const EXTERNAL_COMP_PTR_LEN = 1 + 4 + 4 + 4; // tag + first_page + stored_len + 
 // Content payloads below this many bytes are never fed to the LZ4 encoder (header overhead
 // dominates; PostgreSQL pglz's default min_input_size — large-values.md §13).
 const S_COMPRESS = 32;
-const MIN_PAGE_SIZE = PAGE_HEADER + 36; // smallest valid page size (page + 36-byte meta header; format.md)
+const MIN_PAGE_SIZE = 256; // smallest valid page size; chosen floor above the structural min PAGE_HEADER+36=52 (format.md *Page model*)
 const MAX_PAGE_SIZE = 65536; // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
+
+// A legal page size is a power of two within [MIN_PAGE_SIZE, MAX_PAGE_SIZE] (format.md *Page model* —
+// the nine values {256, 512, … 65536}). Power-of-two keeps every page boundary sector-aligned (the
+// SSD target, CLAUDE.md §9) and shrinks the legal set; the ps !== 0 guard also keeps the pager's
+// page_size divisor non-zero.
+function pageSizeValid(ps: number): boolean {
+  return ps !== 0 && (ps & (ps - 1)) === 0 && ps >= MIN_PAGE_SIZE && ps <= MAX_PAGE_SIZE;
+}
 
 const UTF8 = new TextEncoder();
 const UTF8_DECODE = new TextDecoder("utf-8", { fatal: true });
@@ -714,6 +722,9 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   if (ps > MAX_PAGE_SIZE) {
     throw engineError("feature_not_supported", "page size too large for the format");
   }
+  if ((ps & (ps - 1)) !== 0) {
+    throw engineError("feature_not_supported", "page size must be a power of two");
+  }
   const capacity = ps - PAGE_HEADER;
 
   // Tables in ascending lowercased-name order (no map-iteration order leak).
@@ -1013,7 +1024,7 @@ export function loadDatabase(image: Uint8Array): Database {
   }
   const dv = new DataView(image.buffer, image.byteOffset, image.byteLength);
   const pageSize = dv.getUint32(8, false);
-  if (pageSize < MIN_PAGE_SIZE || pageSize > MAX_PAGE_SIZE || image.length < pageSize * 2) {
+  if (!pageSizeValid(pageSize) || image.length < pageSize * 2) {
     throw engineError("data_corrupted", "invalid page size");
   }
   const mt = selectMeta(image, dv, pageSize);
@@ -1121,7 +1132,7 @@ function collectLeafOverflow(paging: SharedPaging, pageIdx: number, colTypes: Sc
 // per-subtree row count in the format — a deferred follow-on, pager.md §6. Memory is already bounded.)
 export function loadDatabasePaged(paging: SharedPaging): Database {
   const pageSize = paging.pageSize();
-  if (pageSize < MIN_PAGE_SIZE || pageSize > MAX_PAGE_SIZE) {
+  if (!pageSizeValid(pageSize)) {
     throw engineError("data_corrupted", "invalid page size");
   }
 

@@ -42,14 +42,23 @@ const PAGE_HEADER: usize = 16;
 /// — **independent of `PAGE_HEADER`** (spec/fileformat/format.md "Why the record cap"). Both were
 /// 12 through v6; v7 widened the header to 16 but this reserve stays 12.
 const INTERIOR_RESERVE: usize = 12;
-/// Smallest valid page size: the 36-byte meta header (plus the page header) must fit
-/// (spec/fileformat/format.md *Page model*). Below it a file cannot hold its own meta.
-const MIN_PAGE_SIZE: usize = PAGE_HEADER + 36;
+/// Smallest valid page size (spec/fileformat/format.md *Page model*). A chosen floor of 256,
+/// comfortably above the structural minimum `PAGE_HEADER + 36 = 52` (below which the 36-byte meta
+/// header would not fit); sub-256 sizes have only ever served tiny test fixtures.
+const MIN_PAGE_SIZE: usize = 256;
 /// Largest valid page size — 64 KiB (`MAX_PAGE_SIZE`, format.md *Page model*). The cap bounds the
 /// largest single page allocation: without it a corrupt or hostile file could record a
 /// multi-gigabyte `page_size` and force that allocation before its content is validated (CLAUDE.md
 /// §13).
 const MAX_PAGE_SIZE: usize = 65536;
+
+/// Whether `ps` is a legal page size: a **power of two** within `[MIN_PAGE_SIZE, MAX_PAGE_SIZE]`
+/// (format.md *Page model* — the nine values `{256, 512, … 65536}`). Power-of-two keeps every page
+/// boundary sector-aligned (the SSD target, CLAUDE.md §9) and shrinks the legal set; `is_power_of_two()`
+/// also excludes `0`, so the pager's `page_size` divisor is never zero.
+fn page_size_valid(ps: usize) -> bool {
+    ps.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&ps)
+}
 /// `page_type` for a catalog page.
 const PAGE_CATALOG: u8 = 1;
 /// `page_type` for a B-tree leaf node.
@@ -550,6 +559,12 @@ impl Snapshot {
                 "page size too large for the format",
             ));
         }
+        if !ps.is_power_of_two() {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "page size must be a power of two",
+            ));
+        }
         let cap = ps - PAGE_HEADER;
 
         // Tables in ascending lowercased-name order (no hash-map order leak).
@@ -984,7 +999,7 @@ impl Database {
             return Err(corrupt("image smaller than a meta header"));
         }
         let page_size = read_u32_at(image, 8)? as usize;
-        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size) || image.len() < page_size * 2 {
+        if !page_size_valid(page_size) || image.len() < page_size * 2 {
             return Err(corrupt("invalid page size"));
         }
         let meta = select_meta(image, page_size)?;
@@ -1066,7 +1081,7 @@ impl Database {
     /// deferred follow-on, pager.md §6); the residency win — a bounded *resident* set — already holds.
     pub(crate) fn open_paged(pager: Pager, capacity: usize) -> Result<Database> {
         let page_size = pager.page_size() as usize;
-        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size) {
+        if !page_size_valid(page_size) {
             return Err(corrupt("invalid page size"));
         }
         let paging = SharedPaging::new(pager, capacity);

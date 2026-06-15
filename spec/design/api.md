@@ -42,17 +42,19 @@ Two file constructors, deliberately split (open ≠ create):
 
 - **`create(path, opts)`** — make a **new** file-backed database. `opts.page_size` (default
   **8192**, the [storage.md](storage.md) §3 default) is **locked into the file's meta at creation**
-  and cannot change thereafter. It must lie in the **valid range `[52, 65536]`** — the format
-  minimum (the meta header floor) through `MAX_PAGE_SIZE` (64 KiB; [../fileformat/format.md](../fileformat/format.md)
-  *Page model*); a page size below the minimum is `0A000 feature_not_supported` "page size too small"
-  and one above the maximum `0A000` "page size too large" (the cap bounds the largest single
-  allocation, including against a hostile file — §2.1 *open*). `create` writes an initial empty durable
+  and cannot change thereafter. It must be a **power of two** in **`[256, 65536]`** —
+  `MIN_PAGE_SIZE` (256) through `MAX_PAGE_SIZE` (64 KiB; [../fileformat/format.md](../fileformat/format.md)
+  *Page model*, the nine legal values); a page size below the minimum is `0A000 feature_not_supported`
+  "page size too small", one above the maximum `0A000` "page size too large" (the cap bounds the largest
+  single allocation, including against a hostile file — §2.1 *open*), and a non-power-of-two value in
+  range `0A000` "page size must be a power of two". `create` writes an initial empty durable
   image immediately (§3), so the file exists with its page size fixed. If the path **already exists**,
   it is `58P02 duplicate_file` — `create` never clobbers.
 - **`open(path, opts?)`** — open an **existing** file: load it ([../fileformat/format.md](../fileformat/format.md)),
   adopting its recorded `page_size` and `txid`. The recorded `page_size` is validated to the same
-  `[52, 65536]` range as `create` (above); a value outside it is `XX001 data_corrupted`, so a corrupt
-  or hostile file cannot force a multi-gigabyte allocation before its contents are even checked. If the
+  **power-of-two `[256, 65536]`** rule as `create` (above); a value outside the range *or* not a power
+  of two is `XX001 data_corrupted`, so a corrupt or hostile file cannot force a multi-gigabyte
+  allocation before its contents are even checked. If the
   path is **absent**, it is `58P01 undefined_file` — `open` never creates. A malformed file is `XX001
   data_corrupted`; an underlying read failure is `58030 io_error`. `opts` is optional open-time
   settings: the **memory budget** and the **read-only flag** below.

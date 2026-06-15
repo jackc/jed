@@ -22,16 +22,16 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 8               // on-disk format version (8 = per-column expression-default flag bit3 + expr-text; v7 added a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
-	pageHeader             = 16              // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
-	interiorReserve        = 12              // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
-	pageCatalog     byte   = 1               // page_type for a catalog page
-	pageLeaf        byte   = 2               // page_type for a B-tree leaf node
-	pageInterior    byte   = 3               // page_type for a B-tree interior node
-	pageOverflow    byte   = 4               // page_type for an out-of-line value slab (large-values.md §12)
-	rootPage        uint32 = 2               // catalog root of a fresh empty db (relocatable thereafter)
-	minPageSize            = pageHeader + 36 // smallest valid page size (page + 36-byte meta header; format.md)
-	maxPageSize            = 65536           // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
+	formatVersion   uint16 = 8     // on-disk format version (8 = per-column expression-default flag bit3 + expr-text; v7 added a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
+	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
+	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
+	pageCatalog     byte   = 1     // page_type for a catalog page
+	pageLeaf        byte   = 2     // page_type for a B-tree leaf node
+	pageInterior    byte   = 3     // page_type for a B-tree interior node
+	pageOverflow    byte   = 4     // page_type for an out-of-line value slab (large-values.md §12)
+	rootPage        uint32 = 2     // catalog root of a fresh empty db (relocatable thereafter)
+	minPageSize            = 256   // smallest valid page size; chosen floor above the structural min pageHeader+36=52 (format.md *Page model*)
+	maxPageSize            = 65536 // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
 
 	// Value-codec presence tags beyond 0x00 present-inline-plain / 0x01 NULL (large-values.md
 	// §12/§13; format.md "Large values"): 0x02 external-plain (u32 first_page + u32 payload_len),
@@ -255,6 +255,14 @@ func (db *Database) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	return db.committed.ToImage(pageSize, txid)
 }
 
+// pageSizeValid reports whether ps is a legal page size: a power of two within
+// [minPageSize, maxPageSize] (format.md *Page model* — the nine values {256, 512, … 65536}).
+// Power-of-two keeps every page boundary sector-aligned (the SSD target, CLAUDE.md §9) and shrinks
+// the legal set; the ps != 0 guard also keeps the pager's pageSize divisor non-zero.
+func pageSizeValid(ps int) bool {
+	return ps != 0 && ps&(ps-1) == 0 && ps >= minPageSize && ps <= maxPageSize
+}
+
 // ToImage serializes this snapshot's whole state to one on-disk image (format.md). pageSize
 // is recorded in the meta page; txid is written into both meta slots.
 func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
@@ -264,6 +272,9 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	}
 	if ps > maxPageSize {
 		return nil, NewError(FeatureNotSupported, "page size too large for the format")
+	}
+	if ps&(ps-1) != 0 {
+		return nil, NewError(FeatureNotSupported, "page size must be a power of two")
 	}
 	capacity := ps - pageHeader
 
@@ -628,7 +639,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 		return nil, NewError(DataCorrupted, "image smaller than a meta header")
 	}
 	pageSize := int(binary.BigEndian.Uint32(image[8:12]))
-	if pageSize < minPageSize || pageSize > maxPageSize || len(image) < pageSize*2 {
+	if !pageSizeValid(pageSize) || len(image) < pageSize*2 {
 		return nil, NewError(DataCorrupted, "invalid page size")
 	}
 	mt, err := selectMeta(image, pageSize)
@@ -726,7 +737,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 // pager.md §6); the residency win — a bounded resident set — already holds.
 func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 	pageSize := int(pgr.pageSize)
-	if pageSize < minPageSize || pageSize > maxPageSize {
+	if !pageSizeValid(pageSize) {
 		return nil, NewError(DataCorrupted, "invalid page size")
 	}
 	paging := newSharedPaging(pgr, capacity)
