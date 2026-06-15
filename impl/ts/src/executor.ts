@@ -28,6 +28,7 @@ import type {
 import {
   type CheckConstraint,
   type Column,
+  type DefaultExpr,
   type IndexDef,
   type Table,
   columnIndex,
@@ -700,14 +701,30 @@ export class Database {
         pkSeen = true;
         pk.push(columns.length); // this column's ordinal (pushed below)
       }
-      // Evaluate + type-coerce the DEFAULT literal once, here. A bad default fails at CREATE
-      // TABLE: out of range 22003, cross-family 42804, decimal over-precision 22003. NOT NULL
-      // is NOT enforced here (notNull=false), so a DEFAULT NULL on a NOT NULL column is accepted
-      // and traps 23502 only when applied (constraints.md §2).
-      const def_default =
-        def.default === null
-          ? null
-          : storeValue(literalToValue(def.default), ty, decimal, false, def.name);
+      // Classify the DEFAULT by syntactic form (constraints.md §2). A bad default fails at
+      // CREATE TABLE either way; NOT NULL is NOT enforced here (notNull=false), so a DEFAULT
+      // NULL on a NOT NULL column is accepted and traps 23502 only when applied.
+      //   - a bare literal is pre-evaluated + type-coerced to a constant value (the fast-path:
+      //     out of range 22003, cross-family 42804, decimal rounded to typmod);
+      //   - any other expression is validated (structural pre-walk, then resolved against an
+      //     EMPTY scope — a default may not reference a column — then its result type is checked
+      //     assignable to the column, 42804) and stored as text for per-row eval.
+      let def_default: Value | null = null;
+      let def_defaultExpr: DefaultExpr | null = null;
+      if (def.default !== null) {
+        if (def.default.expr.kind === "literal") {
+          def_default = storeValue(literalToValue(def.default.expr.literal), ty, decimal, false, def.name);
+        } else {
+          rejectDefaultStructure(def.default.expr);
+          const { type: rt } = resolve(Scope.empty(this), def.default.expr, ty, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes());
+          if (!assignableTo(rt, ty)) {
+            throw typeError(
+              `column ${def.name} is of type ${canonicalName(ty)} but default expression is of type ${rtName(rt)}`,
+            );
+          }
+          def_defaultExpr = { exprText: def.default.text, expr: def.default.expr };
+        }
+      }
       columns.push({
         name: def.name,
         type: ty,
@@ -715,6 +732,7 @@ export class Database {
         primaryKey: def.primaryKey,
         notNull: def.primaryKey || def.notNull, // PRIMARY KEY ⇒ NOT NULL
         default: def_default,
+        defaultExpr: def_defaultExpr,
       });
     }
 
@@ -931,6 +949,39 @@ export class Database {
       name: c.name,
       node: resolve(scope, c.expr, null, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes()).node,
     }));
+  }
+
+  // resolveDefaultExprs resolves each column's EXPRESSION default (constraints.md §2) to an
+  // RExpr, once per INSERT statement — insertRows (and the VALUES DEFAULT-keyword
+  // materialization) evaluate it per omitted/DEFAULT slot. Returns a slot per column (parallel
+  // to table.columns): the resolved node for an expression default, null for a column with a
+  // constant default or no default. The default resolves against an EMPTY scope (no columns; a
+  // column reference was rejected 0A000 at CREATE TABLE) with the column's type as the operand
+  // hint.
+  private resolveDefaultExprs(table: Table): (RExpr | null)[] {
+    return table.columns.map((col) => {
+      if (col.defaultExpr === null) return null;
+      return resolve(Scope.empty(this), col.defaultExpr.expr, col.type, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes()).node;
+    });
+  }
+
+  // evalDefault is the value an omitted column or a DEFAULT value slot takes (constraints.md §2):
+  // the column's pre-evaluated constant (col.default, or NULL when it has none), OR — for an
+  // expression default — the resolved RExpr evaluated against an empty row through the
+  // per-statement seam/clock (rng) and metered (operator_eval per node). Reused by the VALUES
+  // materialization (a DEFAULT keyword) and insertRows (an omitted column), sharing ONE StmtRng
+  // so a multi-row DEFAULT uuidv7() stays monotonic. defaultRExpr is null for a constant/no default.
+  private evalDefault(col: Column, defaultRExpr: RExpr | null, rng: StmtRng, meter: Meter): Value {
+    if (defaultRExpr === null) return col.default ?? nullValue();
+    meter.guard();
+    const env: EvalEnv = {
+      params: [],
+      outer: [],
+      runSubquery: (p, o) => this.execQueryPlan(p, o, []),
+      seam: this.seam,
+      rng,
+    };
+    return evalExpr(defaultRExpr, [], env, meter);
   }
 
   // executeDropTable removes the table's definition and its row store from the catalog
@@ -1154,6 +1205,10 @@ export class Database {
     // The CHECK constraints, resolved once per statement in evaluation (name) order;
     // insertRows evaluates them per candidate row (constraints.md §4.4).
     const checks = this.resolveChecks(table);
+    // Each column's EXPRESSION default, resolved once per statement (constraints.md §2);
+    // applied per omitted column / DEFAULT slot, sharing one per-statement StmtRng.
+    const defaultExprs = this.resolveDefaultExprs(table);
+    const stmtRng = new StmtRng();
 
     // Resolve the optional column list once. provided[i] >= 0 means table column i takes that
     // value position in each row; -1 means column i is omitted (its default, else NULL). With no
@@ -1233,7 +1288,7 @@ export class Database {
       // RETURNING projection; storing the rows themselves stays unmetered. One meter keeps
       // one ceiling over the whole statement.
       meter.charge(q.cost);
-      const returned = this.insertRows(table, store, pk, checks, provided, q.rows, ret?.nodes ?? null, bound, meter);
+      const returned = this.insertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, q.rows, ret?.nodes ?? null, bound, meter);
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, q.rows.length, meter.accrued);
     }
 
@@ -1263,9 +1318,19 @@ export class Database {
     const ret = ins.returning !== null ? this.resolveReturning(table, ins.returning, false, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize());
 
+    // INSERT ... VALUES reads no rows; with only literal values and constant defaults it
+    // evaluates no expression tree (leaves), so a plain fully-inline insert still costs zero. An
+    // EXPRESSION default (DEFAULT uuidv7()) evaluates a tree per application — operator_eval per
+    // node — the documented exception (constraints.md §2, like CHECK). Other metered work: the
+    // disposition plan's compression attempts for over-RECORD_MAX rows (value_compress) and the
+    // RETURNING projection. The meter is created here (before materialization) so a
+    // DEFAULT-keyword expression default charges it too.
+    const meter = new Meter(this.maxCost);
+
     // Materialize each row into its value-position-indexed candidates (length arity, checked
-    // above), resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that
-    // column's default else NULL. The shared insertRows then builds the declaration-order row.
+    // above), resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
+    // default (a constant, or its expression evaluated for this row through the shared stmtRng).
+    // The shared insertRows then builds the declaration-order row and applies OMITTED defaults.
     const rows: Value[][] = [];
     for (const values of rowsIn) {
       const rv: Value[] = new Array(arity);
@@ -1274,19 +1339,13 @@ export class Database {
         const p = provided[i]!;
         if (p >= 0) {
           const iv = values[p]!;
-          if (iv.kind === "default") rv[p] = col.default ?? nullValue();
+          if (iv.kind === "default") rv[p] = this.evalDefault(col, defaultExprs[i]!, stmtRng, meter);
           else if (iv.kind === "param") rv[p] = bound[iv.index - 1]!;
           else rv[p] = literalToValue(iv.lit);
         }
       }
       rows.push(rv);
     }
-    // INSERT ... VALUES reads no rows and evaluates no expression tree — its values are literals
-    // and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves. The metered
-    // work is the disposition plan's compression attempts for over-RECORD_MAX rows
-    // (value_compress, cost.md §3) and the RETURNING projection (row_produced + item
-    // evaluation per stored row); a plain fully-inline insert still costs zero.
-    const meter = new Meter(this.maxCost);
     // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
     // pre-statement snapshot (grammar.md §32).
     if (ret !== null) {
@@ -1294,7 +1353,7 @@ export class Database {
       ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, foldCost));
       meter.charge(foldCost.value);
     }
-    const returned = this.insertRows(table, store, pk, checks, provided, rows, ret?.nodes ?? null, bound, meter);
+    const returned = this.insertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, rows, ret?.nodes ?? null, bound, meter);
     return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, rows.length, meter.accrued);
   }
 
@@ -1315,6 +1374,8 @@ export class Database {
     store: TableStore,
     pk: number[],
     checks: NamedCheck[],
+    defaultExprs: (RExpr | null)[],
+    rng: StmtRng,
     provided: number[],
     rows: Value[][],
     returning: RExpr[] | null,
@@ -1334,7 +1395,11 @@ export class Database {
       for (let i = 0; i < n; i++) {
         const col = table.columns[i]!;
         const p = provided[i]!;
-        const candidate: Value = p >= 0 ? values[p]! : (col.default ?? nullValue());
+        // An omitted column takes its default — a constant, or its expression evaluated for
+        // this row through the shared per-statement seam/clock (constraints.md §2). evalDefault
+        // charges operator_eval for an expression default; a constant (or no default → NULL) is
+        // free.
+        const candidate: Value = p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
         row[i] = storeValue(candidate, col.type, col.decimal, col.notNull, col.name);
       }
 
@@ -1342,7 +1407,8 @@ export class Database {
       // NULL (storeValue above), before the key/duplicate check (PG's per-row order,
       // constraints.md §4.4). TRUE and NULL pass; the first FALSE aborts the whole
       // statement (two-phase — nothing has been written). Evaluation is metered
-      // expression work (operator_eval), so guard the ceiling per checked row.
+      // expression work (operator_eval), so guard the ceiling per checked row. The
+      // per-statement rng is shared with the default evaluation above (one StmtRng).
       if (checks.length > 0) {
         meter.guard();
         const env: EvalEnv = {
@@ -1350,7 +1416,7 @@ export class Database {
           outer: [],
           runSubquery: (p, o) => this.execQueryPlan(p, o, []),
           seam: this.seam,
-          rng: new StmtRng(),
+          rng,
         };
         evalChecks(checks, table.name, row, env, meter);
       }
@@ -2186,7 +2252,7 @@ export class Database {
     const colName = alias ?? "generate_series";
     const table: Table = {
       name: "generate_series",
-      columns: [{ name: colName, type: colType, decimal: null, primaryKey: false, notNull: false, default: null }],
+      columns: [{ name: colName, type: colType, decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null }],
       pk: [],
       checks: [],
       indexes: [],
@@ -3897,6 +3963,60 @@ function rejectCheckStructure(e: Expr): void {
   }
 }
 
+// rejectDefaultStructure is the structural pre-walk for a DEFAULT expression
+// (spec/design/constraints.md §2), run before name/type resolution (the same micro-order
+// divergence from PG that rejectCheckStructure carries). A default extends the CHECK rejections
+// with one more: it may NOT reference a column (it is computed before the row exists). Codes
+// match PostgreSQL (oracle-probed): a column reference / subquery is 0A000, an aggregate 42803,
+// a parameter 42P02.
+function rejectDefaultStructure(e: Expr): void {
+  switch (e.kind) {
+    case "column":
+    case "qualifiedColumn":
+      throw engineError("feature_not_supported", "cannot use column reference in DEFAULT expression");
+    case "scalarSubquery":
+    case "exists":
+    case "inSubquery":
+      throw engineError("feature_not_supported", "cannot use subquery in DEFAULT expression");
+    case "param":
+      throw engineError("undefined_parameter", "there is no parameter $" + e.index.toString());
+    case "funcCall":
+      if (isAggregateName(e.name)) {
+        throw engineError("grouping_error", "aggregate functions are not allowed in DEFAULT expressions");
+      }
+      for (const a of e.args) rejectDefaultStructure(a);
+      return;
+    case "cast":
+      return rejectDefaultStructure(e.inner);
+    case "unary":
+    case "isNull":
+      return rejectDefaultStructure(e.operand);
+    case "binary":
+    case "isDistinct":
+    case "like":
+      rejectDefaultStructure(e.lhs);
+      return rejectDefaultStructure(e.rhs);
+    case "in":
+      rejectDefaultStructure(e.lhs);
+      for (const elem of e.list) rejectDefaultStructure(elem);
+      return;
+    case "between":
+      rejectDefaultStructure(e.lhs);
+      rejectDefaultStructure(e.lo);
+      return rejectDefaultStructure(e.hi);
+    case "case":
+      if (e.operand !== null) rejectDefaultStructure(e.operand);
+      for (const w of e.whens) {
+        rejectDefaultStructure(w.cond);
+        rejectDefaultStructure(w.result);
+      }
+      if (e.els !== null) rejectDefaultStructure(e.els);
+      return;
+    default: // literal, typedLiteral
+      return;
+  }
+}
+
 // checkReferencedColumns returns the distinct columns a CHECK expression references, as
 // indices into columns — the input to PG's auto-naming rule (constraints.md §4.3: exactly
 // one distinct column → <table>_<col>_check). Resolution already validated every
@@ -4418,6 +4538,14 @@ class Scope {
   // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
   static single(catalog: Database, t: Table): Scope {
     return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }], catalog, null, true);
+  }
+
+  // empty is the column-less scope a DEFAULT expression resolves against (constraints.md §2): a
+  // default may not reference a column (rejected as 0A000 by the structural pre-walk before
+  // resolution) and may not contain a subquery, so there are no relations and subqueries are
+  // disallowed.
+  static empty(catalog: Database): Scope {
+    return new Scope([], catalog, null, false);
   }
 
   // returning is the scope a RETURNING list resolves against (grammar.md §32): the target

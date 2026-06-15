@@ -652,25 +652,48 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			pkSeen = true
 			pk = append(pk, len(columns)) // this column's ordinal (appended below)
 		}
-		// Evaluate + type-coerce the DEFAULT literal once, here. A bad default fails at CREATE
-		// TABLE: out of range 22003, cross-family 42804, decimal over-precision 22003. NOT NULL
-		// is NOT enforced here (notNull=false), so a DEFAULT NULL on a NOT NULL column is
-		// accepted and traps 23502 only when applied (constraints.md §2).
+		// Classify the DEFAULT by syntactic form (constraints.md §2). A bad default fails at
+		// CREATE TABLE either way; NOT NULL is NOT enforced here (notNull=false), so a DEFAULT
+		// NULL on a NOT NULL column is accepted and traps 23502 only when applied.
+		//   - a bare literal is pre-evaluated + type-coerced to a constant value (the fast-path:
+		//     out of range 22003, cross-family 42804, decimal rounded to typmod);
+		//   - any other expression is validated (structural pre-walk, then resolved against an
+		//     EMPTY scope — a default may not reference a column — then its result type is
+		//     checked assignable to the column, 42804) and stored as text for per-row eval.
 		var defaultVal *Value
+		var defaultExpr *DefaultExpr
 		if def.Default != nil {
-			dv, err := storeValue(literalToValue(*def.Default), ty, decimal, false, def.Name)
-			if err != nil {
-				return Outcome{}, err
+			if def.Default.Expr.Kind == ExprLiteral {
+				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, false, def.Name)
+				if err != nil {
+					return Outcome{}, err
+				}
+				defaultVal = &dv
+			} else {
+				if err := rejectDefaultStructure(def.Default.Expr); err != nil {
+					return Outcome{}, err
+				}
+				_, rt, err := resolve(emptyScope(db), def.Default.Expr, &ty, &aggCtx{collecting: false}, &paramTypes{})
+				if err != nil {
+					return Outcome{}, err
+				}
+				if !assignableTo(rt, ty) {
+					return Outcome{}, typeError(fmt.Sprintf(
+						"column %s is of type %s but default expression is of type %s",
+						def.Name, ty.CanonicalName(), rtName(rt),
+					))
+				}
+				defaultExpr = &DefaultExpr{ExprText: def.Default.Text, Expr: def.Default.Expr}
 			}
-			defaultVal = &dv
 		}
 		columns = append(columns, Column{
-			Name:       def.Name,
-			Type:       ty,
-			Decimal:    decimal,
-			PrimaryKey: def.PrimaryKey,
-			NotNull:    def.PrimaryKey || def.NotNull, // PRIMARY KEY ⇒ NOT NULL
-			Default:    defaultVal,
+			Name:        def.Name,
+			Type:        ty,
+			Decimal:     decimal,
+			PrimaryKey:  def.PrimaryKey,
+			NotNull:     def.PrimaryKey || def.NotNull, // PRIMARY KEY ⇒ NOT NULL
+			Default:     defaultVal,
+			DefaultExpr: defaultExpr,
 		})
 	}
 
@@ -934,6 +957,45 @@ func (db *Database) resolveChecks(table *Table) ([]namedCheck, error) {
 		out = append(out, namedCheck{name: table.Checks[i].Name, node: node})
 	}
 	return out, nil
+}
+
+// resolveDefaultExprs resolves each column's EXPRESSION default (constraints.md §2) to an
+// rExpr, once per INSERT statement — insertRows (and the VALUES DEFAULT-keyword
+// materialization) evaluate it per omitted/DEFAULT slot. Returns a slot per column (parallel to
+// table.Columns): a non-nil node for an expression default, nil for a column with a constant
+// default or no default. The default resolves against an EMPTY scope (no columns; a column
+// reference was rejected 0A000 at CREATE TABLE) with the column's type as the operand hint.
+func (db *Database) resolveDefaultExprs(table *Table) ([]*rExpr, error) {
+	out := make([]*rExpr, len(table.Columns))
+	for i := range table.Columns {
+		de := table.Columns[i].DefaultExpr
+		if de == nil {
+			continue
+		}
+		node, _, err := resolve(emptyScope(db), de.Expr, &table.Columns[i].Type, &aggCtx{collecting: false}, &paramTypes{})
+		if err != nil {
+			return nil, err
+		}
+		out[i] = node
+	}
+	return out, nil
+}
+
+// evalDefault is the value an omitted column or a DEFAULT value slot takes (constraints.md §2):
+// the column's pre-evaluated constant (col.Default, or NULL when it has none), OR — for an
+// expression default — the resolved rExpr evaluated against an empty row through the
+// per-statement seam/clock (rng) and metered (operator_eval per node). Reused by the VALUES
+// materialization (a DEFAULT keyword) and insertRows (an omitted column), sharing ONE StmtRng
+// so a multi-row DEFAULT uuidv7() stays monotonic. defaultRExpr is nil for a constant/no default.
+func (db *Database) evalDefault(col Column, defaultRExpr *rExpr, rng *StmtRng, meter *Meter) (Value, error) {
+	if defaultRExpr == nil {
+		return defaultOrNull(col), nil
+	}
+	if err := meter.Guard(); err != nil {
+		return Value{}, err
+	}
+	env := &evalEnv{exec: db, rng: rng}
+	return defaultRExpr.eval(nil, env, meter)
 }
 
 // namedCheck is one statement-resolved CHECK constraint: its name (for the 23514
@@ -1206,6 +1268,13 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	if err != nil {
 		return Outcome{}, err
 	}
+	// Each column's EXPRESSION default, resolved once per statement (constraints.md §2);
+	// applied per omitted column / DEFAULT slot, sharing one per-statement StmtRng.
+	defaultExprs, err := db.resolveDefaultExprs(table)
+	if err != nil {
+		return Outcome{}, err
+	}
+	stmtRng := newStmtRng()
 
 	// Resolve the optional column list once. provided[i] >= 0 means table column i takes that
 	// value position in each row; -1 means column i is omitted (its default, else NULL). With no
@@ -1311,7 +1380,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		// RETURNING projection; storing the rows themselves stays unmetered. One meter keeps
 		// one ceiling over the whole statement.
 		meter.Charge(q.cost)
-		returned, err := db.insertRows(table, store, pk, checks, provided, q.rows, retNodes, bound, meter)
+		returned, err := db.insertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, q.rows, retNodes, bound, meter)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -1364,9 +1433,19 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		return Outcome{}, err
 	}
 
+	// INSERT ... VALUES reads no rows; with only literal values and constant defaults it
+	// evaluates no expression tree (leaves), so a plain fully-inline insert still costs zero. An
+	// EXPRESSION default (DEFAULT uuidv7()) evaluates a tree per application — operator_eval per
+	// node — the documented exception (constraints.md §2, like CHECK). Other metered work: the
+	// disposition plan's compression attempts for over-RECORD_MAX rows (value_compress) and the
+	// RETURNING projection. The meter is created here (before materialization) so a
+	// DEFAULT-keyword expression default charges it too.
+	meter := NewMeterWithLimit(db.maxCost)
+
 	// Materialize each row into its value-position-indexed candidates (length arity, checked
-	// above) resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that
-	// column's default else NULL. The shared insertRows then builds the declaration-order row.
+	// above) resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
+	// default (a constant, or its expression evaluated for this row through the shared stmtRng).
+	// The shared insertRows then builds the declaration-order row and applies OMITTED defaults.
 	rows := make([][]Value, 0, len(ins.Rows))
 	for _, values := range ins.Rows {
 		rv := make([]Value, arity)
@@ -1374,7 +1453,11 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 			if p := provided[i]; p >= 0 {
 				switch iv := values[p]; {
 				case iv.IsDefault:
-					rv[p] = defaultOrNull(col)
+					dv, err := db.evalDefault(col, defaultExprs[i], stmtRng, meter)
+					if err != nil {
+						return Outcome{}, err
+					}
+					rv[p] = dv
 				case iv.IsParam:
 					rv[p] = bound[int(iv.Param)-1]
 				default:
@@ -1384,12 +1467,6 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		}
 		rows = append(rows, rv)
 	}
-	// INSERT ... VALUES reads no rows and evaluates no expression tree — its values are literals
-	// and pre-evaluated constant defaults (folded at CREATE TABLE), i.e. leaves. The metered
-	// work is the disposition plan's compression attempts for over-RECORD_MAX rows
-	// (value_compress, cost.md §3) and the RETURNING projection (row_produced + item
-	// evaluation per stored row); a plain fully-inline insert still costs zero.
-	meter := NewMeterWithLimit(db.maxCost)
 	// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
 	// pre-statement snapshot (grammar.md §32).
 	for _, node := range retNodes {
@@ -1397,7 +1474,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 	}
-	returned, err := db.insertRows(table, store, pk, checks, provided, rows, retNodes, bound, meter)
+	returned, err := db.insertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, rows, retNodes, bound, meter)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -1417,7 +1494,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 // validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
 // observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; params feeds
 // its $Ns. Returns the projected output rows, nil without a clause.
-func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, provided []int, rows [][]Value, returning []*rExpr, params []Value, meter *Meter) ([][]Value, error) {
+func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, meter *Meter) ([][]Value, error) {
 	n := len(table.Columns)
 	type preparedRow struct {
 		key []byte // nil for a no-PK table (rowid allocated in phase 2)
@@ -1445,7 +1522,15 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			if p := provided[i]; p >= 0 {
 				candidate = values[p]
 			} else {
-				candidate = defaultOrNull(col)
+				// An omitted column takes its default — a constant, or its expression
+				// evaluated for this row through the shared per-statement seam/clock
+				// (constraints.md §2). evalDefault charges operator_eval for an expression
+				// default; a constant (or no default → NULL) is free.
+				dv, err := db.evalDefault(col, defaultExprs[i], rng, meter)
+				if err != nil {
+					return nil, err
+				}
+				candidate = dv
 			}
 			v, err := storeValue(candidate, col.Type, col.Decimal, col.NotNull, col.Name)
 			if err != nil {
@@ -1458,12 +1543,13 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		// NULL (storeValue above), before the key/duplicate check (PG's per-row order,
 		// constraints.md §4.4). TRUE and NULL pass; the first FALSE aborts the whole
 		// statement (two-phase — nothing has been written). Evaluation is metered
-		// expression work (operator_eval), so guard the ceiling per checked row.
+		// expression work (operator_eval), so guard the ceiling per checked row. The
+		// per-statement rng is shared with the default evaluation above (one StmtRng).
 		if len(checks) > 0 {
 			if err := meter.Guard(); err != nil {
 				return nil, err
 			}
-			env := &evalEnv{exec: db, rng: newStmtRng()}
+			env := &evalEnv{exec: db, rng: rng}
 			if err := evalChecks(checks, table.Name, row, env, meter); err != nil {
 				return nil, err
 			}
@@ -5318,6 +5404,93 @@ func rejectCheckStructure(e Expr) error {
 	}
 }
 
+// rejectDefaultStructure is the structural pre-walk for a DEFAULT expression (constraints.md
+// §2), run before name/type resolution (the same micro-order divergence from PG that
+// rejectCheckStructure carries). A default extends the CHECK rejections with one more: it may
+// NOT reference a column (it is computed before the row exists). Codes match PostgreSQL
+// (oracle-probed): a column reference / subquery is 0A000, an aggregate 42803, a parameter 42P02.
+func rejectDefaultStructure(e Expr) error {
+	switch e.Kind {
+	case ExprColumn, ExprQualifiedColumn:
+		return NewError(FeatureNotSupported, "cannot use column reference in DEFAULT expression")
+	case ExprScalarSubquery, ExprExists, ExprInSubquery:
+		return NewError(FeatureNotSupported, "cannot use subquery in DEFAULT expression")
+	case ExprParam:
+		return NewError(UndefinedParameter,
+			"there is no parameter $"+strconv.FormatUint(e.Param, 10))
+	case ExprFuncCall:
+		if isAggregateName(e.FuncCall.Name) {
+			return NewError(GroupingError,
+				"aggregate functions are not allowed in DEFAULT expressions")
+		}
+		for _, a := range e.FuncCall.Args {
+			if err := rejectDefaultStructure(*a); err != nil {
+				return err
+			}
+		}
+		return nil
+	case ExprCast:
+		return rejectDefaultStructure(e.Cast.Inner)
+	case ExprUnary:
+		return rejectDefaultStructure(e.Unary.Operand)
+	case ExprIsNull:
+		return rejectDefaultStructure(e.IsNullOf.Operand)
+	case ExprBinary:
+		if err := rejectDefaultStructure(e.Binary.Lhs); err != nil {
+			return err
+		}
+		return rejectDefaultStructure(e.Binary.Rhs)
+	case ExprIsDistinct:
+		if err := rejectDefaultStructure(e.IsDistinct.Lhs); err != nil {
+			return err
+		}
+		return rejectDefaultStructure(e.IsDistinct.Rhs)
+	case ExprLike:
+		if err := rejectDefaultStructure(e.Like.Lhs); err != nil {
+			return err
+		}
+		return rejectDefaultStructure(e.Like.Rhs)
+	case ExprIn:
+		if err := rejectDefaultStructure(e.In.Lhs); err != nil {
+			return err
+		}
+		for _, elem := range e.In.List {
+			if err := rejectDefaultStructure(elem); err != nil {
+				return err
+			}
+		}
+		return nil
+	case ExprBetween:
+		if err := rejectDefaultStructure(e.Between.Lhs); err != nil {
+			return err
+		}
+		if err := rejectDefaultStructure(e.Between.Lo); err != nil {
+			return err
+		}
+		return rejectDefaultStructure(e.Between.Hi)
+	case ExprCase:
+		if e.Case.Operand != nil {
+			if err := rejectDefaultStructure(*e.Case.Operand); err != nil {
+				return err
+			}
+		}
+		for _, w := range e.Case.Whens {
+			if err := rejectDefaultStructure(w.Cond); err != nil {
+				return err
+			}
+			if err := rejectDefaultStructure(w.Result); err != nil {
+				return err
+			}
+		}
+		if e.Case.Els != nil {
+			return rejectDefaultStructure(*e.Case.Els)
+		}
+		return nil
+	default: // ExprLiteral, ExprTypedLiteral
+		return nil
+	}
+}
+
 // checkReferencedColumns returns the distinct columns a CHECK expression references, as
 // indices into columns — the input to PG's auto-naming rule (constraints.md §4.3: exactly
 // one distinct column → <table>_<col>_check). Resolution already validated every
@@ -5980,6 +6153,14 @@ type scope struct {
 // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
 func singleScope(catalog *Database, t *Table) *scope {
 	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}, catalog: catalog, allowSubquery: true}
+}
+
+// emptyScope is the column-less scope a DEFAULT expression resolves against (constraints.md
+// §2): a default may not reference a column (rejected as 0A000 by the structural pre-walk
+// before resolution) and may not contain a subquery, so there are no relations and subqueries
+// are disallowed.
+func emptyScope(catalog *Database) *scope {
+	return &scope{catalog: catalog, allowSubquery: false}
 }
 
 // returningScope is the scope a RETURNING list resolves against (grammar.md §32): the target

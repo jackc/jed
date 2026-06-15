@@ -1,0 +1,110 @@
+# Expression column DEFAULT (spec/design/constraints.md §2) — a column's DEFAULT may be a
+# non-constant expression (a function call like uuidv7(), arithmetic like 1 + 1) rather than only
+# a constant literal. An expression default is stored as expression text and EVALUATED PER ROW at
+# INSERT (unlike a constant default, which is pre-evaluated at CREATE TABLE and costs zero), so it
+# accrues operator_eval cost and reads the per-statement entropy/clock seam. A column reference,
+# subquery, aggregate, or bind parameter in the expression is rejected at CREATE TABLE. The uuid
+# rows use the # seed: / # clock: directives (entropy.md) so the per-row uuidv7() is byte-exact
+# cross-core; this file is therefore NOT oracle-imported (PG's entropy differs), but the
+# structural-rejection codes/messages and the arithmetic defaults were verified by hand against
+# PostgreSQL 18 (all five SQLSTATEs + messages match: 0A000/0A000/42803/42P02/42804).
+# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default_expr, dml.insert, dml.insert_multi_row, dml.insert_column_list, query.select, query.order_by, query.is_null, types.int32, types.uuid, func.uuid_generate, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n int32 DEFAULT 1 + 1)
+
+# an omitted column evaluates its default expression for THIS row: g = uuidv7() (counter 0 under
+# the injected seed/clock), n = 1 + 1 = 2. The INSERT accrues nonzero cost (one operator_eval per
+# default expression node) — the documented exception to "VALUES inserts cost zero".
+# seed: 1
+# clock: 1721056591872000
+# cost: 2
+statement ok
+INSERT INTO t (id) VALUES (1)
+
+query TI nosort
+SELECT g, n FROM t WHERE id = 1
+----
+0190b6f7-8000-7000-910a-2dec89025cc1
+2
+
+# the DEFAULT keyword evaluates the same expression in a positional slot (a fresh statement, so
+# the per-statement counter resets to 0 under the same seed/clock).
+# seed: 1
+# clock: 1721056591872000
+statement ok
+INSERT INTO t (id, g) VALUES (2, DEFAULT)
+
+query T nosort
+SELECT g FROM t WHERE id = 2
+----
+0190b6f7-8000-7000-910a-2dec89025cc1
+
+# a multi-row INSERT shares ONE per-statement StmtRng, so successive uuidv7() defaults are
+# distinct and monotonic (counter 0 then counter 1, like SELECT uuidv7(), uuidv7()).
+# seed: 1
+# clock: 1721056591872000
+statement ok
+INSERT INTO t (id) VALUES (10), (11)
+
+query IT nosort
+SELECT id, g FROM t WHERE id IN (10, 11) ORDER BY id
+----
+10
+0190b6f7-8000-7000-910a-2dec89025cc1
+11
+0190b6f7-8000-7001-beeb-8da1658eec67
+
+# a provided value overrides the default expression (it is not evaluated)
+statement ok
+INSERT INTO t (id, g, n) VALUES (3, '00000000-0000-0000-0000-000000000000', 99)
+
+query TI nosort
+SELECT g, n FROM t WHERE id = 3
+----
+00000000-0000-0000-0000-000000000000
+99
+
+# --- a non-uuid expression default needs no seed (deterministic) ------------------------------
+statement ok
+CREATE TABLE arith (id int32 PRIMARY KEY, a int32 DEFAULT 6 * 7, b int32 DEFAULT -5)
+
+statement ok
+INSERT INTO arith (id) VALUES (1)
+
+query III nosort
+SELECT id, a, b FROM arith
+----
+1
+42
+-5
+
+# an expression default that evaluates to NULL into a NOT NULL column: accepted at CREATE (NOT
+# NULL is not checked there, matching a constant DEFAULT NULL), traps 23502 only when applied.
+# (CASE with no matching branch and no ELSE yields NULL; its result type is int32 from THEN 1.)
+statement ok
+CREATE TABLE nn (id int32 PRIMARY KEY, v int32 NOT NULL DEFAULT CASE WHEN 1 = 2 THEN 1 END)
+
+statement error 23502
+INSERT INTO nn (id) VALUES (1)
+
+# --- CREATE TABLE rejections (structural pre-walk + result type) ------------------------------
+# a column reference is not allowed in a DEFAULT expression (computed before the row exists)
+statement error 0A000
+CREATE TABLE bad (id int32 PRIMARY KEY, x int32 DEFAULT id)
+
+# a subquery is not allowed in a DEFAULT expression
+statement error 0A000
+CREATE TABLE bad (id int32 PRIMARY KEY, x int32 DEFAULT (SELECT 1))
+
+# an aggregate is not allowed in a DEFAULT expression
+statement error 42803
+CREATE TABLE bad (id int32 PRIMARY KEY, x int32 DEFAULT count(*))
+
+# a bind parameter is not allowed in a DEFAULT expression
+statement error 42P02
+CREATE TABLE bad (id int32 PRIMARY KEY, x int32 DEFAULT $1)
+
+# a cross-family default expression is a type error at CREATE TABLE
+statement error 42804
+CREATE TABLE bad (id int32 PRIMARY KEY, g uuid DEFAULT 1 + 1)

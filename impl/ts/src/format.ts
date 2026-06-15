@@ -11,7 +11,7 @@
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
 import type { Expr } from "./ast.ts";
-import { type CheckConstraint, type Column, type IndexDef, type Table, pkIndices } from "./catalog.ts";
+import { type CheckConstraint, type Column, type DefaultExpr, type IndexDef, type Table, pkIndices } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
@@ -51,7 +51,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 7; // on-disk format version (7 = a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
+const FORMAT_VERSION = 8; // on-disk format version (8 = per-column expression-default flag bit3 + expr-text; v7 added a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -615,6 +615,9 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
     let flags = 0;
     if (col.notNull) flags |= 0b10;
     if (col.default !== null) flags |= 0b100;
+    // bit3 default_is_expr (v8) — mutually exclusive with bit2 (a column has at most one of a
+    // constant or an expression default — spec/fileformat/format.md).
+    if (col.defaultExpr !== null) flags |= 0b1000;
     w.u8(flags);
     // A decimal column appends its typmod (precision, scale) — only for type_code 6, so
     // non-decimal entries are byte-unchanged (format.md). precision 0 = unconstrained numeric.
@@ -622,11 +625,17 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
       w.u16(col.decimal ? col.decimal.precision : 0);
       w.u16(col.decimal ? col.decimal.scale : 0);
     }
-    // A column with a DEFAULT (flags bit2) appends its pre-evaluated default value via the same
-    // value codec rows use — AFTER the typmod, presence-gated, so a column without a default is
-    // byte-unchanged (format.md). A DEFAULT NULL is one 0x01.
+    // A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default value via
+    // the same value codec rows use — AFTER the typmod, presence-gated, so a column without a
+    // default is byte-unchanged (format.md). A DEFAULT NULL is one 0x01. An EXPRESSION default
+    // (flags bit3, v8) instead appends its expr-text (u16 length + UTF-8) there, the same token
+    // rendering a CHECK uses — bit2/bit3 are exclusive.
     if (col.default !== null) {
       w.bytes(encodeValue(col.type, col.default));
+    } else if (col.defaultExpr !== null) {
+      const et = UTF8.encode(col.defaultExpr.exprText);
+      w.u16(et.length);
+      w.bytes(et);
     }
   }
   // The primary key (v5): count, then the member column ordinals in KEY order
@@ -1538,10 +1547,27 @@ function decodeTableEntry(
       const scale = readU16(buf, cur);
       if (precision !== 0) decimal = { precision, scale };
     }
-    // The default value follows the typmod, present iff flags bit2 (same value codec as rows).
-    // Absent → no bytes consumed (format.md). A default is a small literal — never externalized —
-    // so no overflow reader is needed (a 0x02 tag here would be a corrupt catalog).
+    // The default follows the typmod (format.md): a CONSTANT default (flags bit2) is a value via
+    // the same value codec rows use — never externalized, so no overflow reader is needed (a
+    // 0x02 tag here would be a corrupt catalog). An EXPRESSION default (flags bit3, v8) is
+    // instead the expr-text (u16 length + UTF-8), re-parsed with the ordinary expression parser
+    // (XX001 if it fails, like a stored check). The two bits are mutually exclusive — both set is
+    // a corrupt catalog.
+    if ((flags & 0b1100) === 0b1100) {
+      throw engineError("data_corrupted", "column has both a constant and an expression default");
+    }
     const colDefault = (flags & 0b100) !== 0 ? readValue(ty, buf, cur, null, []) : null;
+    let colDefaultExpr: DefaultExpr | null = null;
+    if ((flags & 0b1000) !== 0) {
+      const exprText = readString(buf, cur);
+      let expr: Expr;
+      try {
+        expr = parseExpression(exprText);
+      } catch (e) {
+        throw engineError("data_corrupted", "stored default expression does not parse: " + String(e));
+      }
+      colDefaultExpr = { exprText, expr };
+    }
     columns.push({
       name: cname,
       type: ty,
@@ -1549,6 +1575,7 @@ function decodeTableEntry(
       primaryKey: false, // set from the pk list below
       notNull: (flags & 0b10) !== 0,
       default: colDefault,
+      defaultExpr: colDefaultExpr,
     });
   }
   // The primary key (v5): member ordinals in KEY order. Each must name a real column,

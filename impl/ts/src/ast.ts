@@ -150,10 +150,10 @@ export type ColumnDef = {
   typeMod: TypeMod | null;
   primaryKey: boolean;
   notNull: boolean;
-  // An optional DEFAULT <literal> — the value for this column when a row omits it (or uses the
-  // DEFAULT keyword). Literal-only this slice; evaluated + type-coerced once at CREATE TABLE
-  // (spec/design/constraints.md §2). null = no default.
-  default: Literal | null;
+  // An optional DEFAULT <expr> — the value for this column when a row omits it (or uses the
+  // DEFAULT keyword). A constant literal is pre-evaluated at CREATE TABLE; any other expression
+  // is evaluated per row at INSERT (spec/design/constraints.md §2). null = no default.
+  default: DefaultDef | null;
 };
 
 // Assignment is one `SET <column> = <value>` clause; value is a general expression
@@ -188,6 +188,13 @@ export type CreateTable = {
 // persisted text — the source token sequence between the parentheses re-rendered per the
 // closed table in spec/fileformat/format.md "Check-expression text".
 export type CheckDef = { name: string | null; expr: Expr; text: string };
+
+// DefaultDef is a parsed DEFAULT <expr> column constraint (spec/design/constraints.md §2): the
+// default expression and its persisted text (the source token sequence re-rendered per the
+// closed table in spec/fileformat/format.md "Check-expression text", as a CHECK is). Execution
+// classifies it: a bare literal Expr is a constant (pre-evaluated at CREATE TABLE), any other
+// expression is stored as text and evaluated per row at INSERT.
+export type DefaultDef = { expr: Expr; text: string };
 
 // UniqueDef is one parsed UNIQUE constraint (spec/design/grammar.md §31): the optional
 // explicit CONSTRAINT name (null = unnamed; it names the backing index) and the member

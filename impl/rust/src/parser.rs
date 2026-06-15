@@ -5,10 +5,10 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, Delete, DropIndex,
-    DropTable, Expr, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OrderKey,
-    QueryExpr, Select, SelectItem, SelectItems, SetOp, SetOpKind, Statement, TableRef, TypeMod,
-    UnaryOp, UniqueDef, Update,
+    Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, DefaultDef, Delete,
+    DropIndex, DropTable, Expr, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal,
+    OrderKey, QueryExpr, Select, SelectItem, SelectItems, SetOp, SetOpKind, Statement, TableRef,
+    TypeMod, UnaryOp, UniqueDef, Update,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -310,7 +310,14 @@ impl Parser {
                 }
                 Some("default") => {
                     self.advance();
-                    default = Some(self.parse_literal()?);
+                    // A `DEFAULT` takes any scalar expression (constraints.md §2). Capture the
+                    // re-rendered token span as the persisted text (format.md
+                    // "Check-expression text"), as a `CHECK` does — the executor classifies a
+                    // bare literal (constant fast-path) vs an expression (text-persisted).
+                    let start = self.pos;
+                    let expr = self.parse_expr()?;
+                    let text = render_tokens(&self.tokens[start..self.pos]);
+                    default = Some(DefaultDef { expr, text });
                 }
                 Some("unique") => {
                     self.advance();

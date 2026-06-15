@@ -256,6 +256,21 @@ function defaultTableDB(): Database {
   return db;
 }
 
+// defaultExprTableDB exercises EXPRESSION column defaults on disk (v8) — the catalog flags bit3
+// (default_is_expr) + the expr-text written after the typmod: a `uuid DEFAULT uuidv7()`, an
+// `int32 DEFAULT 1 + 1`, a CONSTANT default beside them (bit2), and a plain no-default column.
+// EMPTY table — the catalog encoding is the cross-core proof; the per-row evaluation is covered
+// by the conformance corpus.
+function defaultExprTableDB(): Database {
+  const db = goldenDb();
+  run(
+    db,
+    "CREATE TABLE t (id int32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n int32 DEFAULT 1 + 1, " +
+      "k int32 DEFAULT 7, plain int16)",
+  );
+  return db;
+}
+
 // timestampTableDB exercises the value codec's int64-instant branch (type code 8): a positive
 // instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a NULL. The
 // literals parse to the same micros the golden stores. The PK stays int32.
@@ -353,6 +368,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "bytea_table.jed", build: byteaTableDB },
     { name: "uuid_table.jed", build: uuidTableDB },
     { name: "default_table.jed", build: defaultTableDB },
+    { name: "default_expr_table.jed", build: defaultExprTableDB },
     { name: "timestamp_table.jed", build: timestampTableDB },
     { name: "timestamptz_table.jed", build: timestamptzTableDB },
     { name: "interval_table.jed", build: intervalTableDB },
@@ -389,6 +405,7 @@ test("read goldens reproduces rows", () => {
     { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
     { name: "uuid_table.jed", build: uuidTableDB, table: "t" },
     { name: "default_table.jed", build: defaultTableDB, table: "t" },
+    { name: "default_expr_table.jed", build: defaultExprTableDB, table: "t" },
     { name: "timestamp_table.jed", build: timestampTableDB, table: "t" },
     { name: "timestamptz_table.jed", build: timestamptzTableDB, table: "t" },
     { name: "interval_table.jed", build: intervalTableDB, table: "t" },
@@ -424,8 +441,8 @@ test("read golden reconstructs catalog", () => {
   assert.equal(tbl!.name, "t");
   assert.equal(tbl!.columns.length, 2);
   const [id, v] = tbl!.columns;
-  assert.deepStrictEqual(id, { name: "id", type: "int32", decimal: null, primaryKey: true, notNull: true, default: null });
-  assert.deepStrictEqual(v, { name: "v", type: "int16", decimal: null, primaryKey: false, notNull: false, default: null });
+  assert.deepStrictEqual(id, { name: "id", type: "int32", decimal: null, primaryKey: true, notNull: true, default: null, defaultExpr: null });
+  assert.deepStrictEqual(v, { name: "v", type: "int16", decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null });
   // A NULL value round-trips (id 3's v).
   const rows = loaded.rowsInKeyOrder("t");
   assert.deepStrictEqual(rows[2], [{ kind: "int", int: 3n }, { kind: "null" }]);

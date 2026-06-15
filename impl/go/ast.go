@@ -84,6 +84,16 @@ type CheckDef struct {
 	Text string
 }
 
+// DefaultDef is a parsed DEFAULT <expr> column constraint (spec/design/constraints.md §2):
+// the default expression and its persisted text (the source token sequence re-rendered per
+// the closed table in spec/fileformat/format.md "Check-expression text", as a CHECK is).
+// Execution classifies it: a bare *Literal is a constant (pre-evaluated at CREATE TABLE), any
+// other expression is stored as text and evaluated per row at INSERT.
+type DefaultDef struct {
+	Expr Expr
+	Text string
+}
+
 // DropTable is a DROP TABLE statement. Removes a table — its definition and all its
 // rows — from the catalog. Dropping a table that does not exist is an error (42P01);
 // there is no IF EXISTS this slice. Single table only; no CASCADE/RESTRICT (no
@@ -124,10 +134,10 @@ type ColumnDef struct {
 	// NotNull is an explicit NOT NULL column constraint. A PRIMARY KEY column is implicitly
 	// NOT NULL regardless of this flag; the executor ORs the two (spec/design/constraints.md).
 	NotNull bool
-	// Default is an optional DEFAULT <literal> — the value for this column when a row omits it
-	// (or uses the DEFAULT keyword). Literal-only this slice; evaluated + type-coerced once at
-	// CREATE TABLE (spec/design/constraints.md §2). nil = no default.
-	Default *Literal
+	// Default is an optional DEFAULT <expr> — the value for this column when a row omits it (or
+	// uses the DEFAULT keyword). A constant literal is pre-evaluated at CREATE TABLE; any other
+	// expression is evaluated per row at INSERT (spec/design/constraints.md §2). nil = no default.
+	Default *DefaultDef
 }
 
 // TypeMod is a parsed type modifier: a precision and an optional scale, as written

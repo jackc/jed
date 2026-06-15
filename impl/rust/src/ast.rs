@@ -79,6 +79,17 @@ pub struct CheckDef {
     pub text: String,
 }
 
+/// A parsed `DEFAULT <expr>` column constraint (spec/design/constraints.md §2): the default
+/// expression and its persisted text (the source token sequence re-rendered per the closed
+/// table in spec/fileformat/format.md "Check-expression text", as a `CHECK` is). Execution
+/// classifies it: a bare `Expr::Literal` is a constant (pre-evaluated at CREATE TABLE), any
+/// other expression is stored as text and evaluated per row at INSERT.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DefaultDef {
+    pub expr: Expr,
+    pub text: String,
+}
+
 /// `DROP TABLE <name>`. Removes a table — its definition and all its rows — from the
 /// catalog. Dropping a table that does not exist is an error (42P01); there is no
 /// `IF EXISTS` this slice. Single table only; no `CASCADE` / `RESTRICT` (no dependent
@@ -122,10 +133,10 @@ pub struct ColumnDef {
     /// An explicit `NOT NULL` column constraint. A PRIMARY KEY column is implicitly NOT NULL
     /// regardless of this flag; the executor ORs the two (spec/design/constraints.md).
     pub not_null: bool,
-    /// An optional `DEFAULT <literal>` — the value for this column when a row omits it (or
-    /// uses the `DEFAULT` keyword). Literal-only this slice; evaluated + type-coerced once at
-    /// CREATE TABLE (spec/design/constraints.md §2).
-    pub default: Option<Literal>,
+    /// An optional `DEFAULT <expr>` — the value for this column when a row omits it (or uses
+    /// the `DEFAULT` keyword). A constant literal is pre-evaluated at CREATE TABLE; any other
+    /// expression is evaluated per row at INSERT (spec/design/constraints.md §2).
+    pub default: Option<DefaultDef>,
 }
 
 /// A parsed type modifier: a precision and an optional scale, as written

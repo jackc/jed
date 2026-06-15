@@ -15,15 +15,26 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 7)
+## Version scope (`format_version` 8)
 
-The current on-disk version is **`format_version` 7** — a **per-page checksum on every
-body page** (catalog / B-tree node / overflow), the on-disk-integrity layer that lets the
-loader **detect silent corruption** of a live page rather than returning wrong results or
-panicking ([../design/storage.md §6](../design/storage.md)). Each version is a **clean
-break** — older versions are **not read** (we are pre-1.0 and owe no on-disk
-compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only** version
-7. Two coupled changes:
+The current on-disk version is **`format_version` 8** — an **expression column default**.
+A column's `DEFAULT` may now be a non-constant expression (a function call like `uuidv7()`,
+arithmetic like `1 + 1`) rather than only a constant literal
+([../design/constraints.md §2](../design/constraints.md)). The per-column flags byte gains
+**bit3 `default_is_expr`**: when set, the default's **expression text** — a length-prefixed
+UTF-8 string, the parsed token sequence re-rendered by the same closed token table a `CHECK`
+uses (*Check-expression text* below) — is written after the typmod **in place of** the
+value-codec default that `bit2 has_default` writes. The two bits are **mutually exclusive**.
+On load the text re-parses with the ordinary expression parser (`XX001` if it fails, like a
+stored check); the write paths evaluate it per row. A constant-literal default still takes the
+`bit2` value-codec path unchanged. A catalog-only change. Each version is a **clean break** —
+older versions are **not read** (we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md §1,
+"we own our surface"), so a reader accepts **only** version 8.
+
+`format_version` 7 was the **per-page checksum on every body page** (catalog / B-tree node /
+overflow), the on-disk-integrity layer that lets the loader **detect silent corruption** of a
+live page rather than returning wrong results or panicking
+([../design/storage.md §6](../design/storage.md)). Two coupled changes:
 
 1. The **page header grows from 12 to 16 bytes** — a `crc32` (u32) is appended after
    `next_page` (*Page header* below). Through v6 only the meta slots were checksummed; a
@@ -153,7 +164,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`6`** |
+| 4  | 2 | `format_version` (u16) — current = **`8`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -182,7 +193,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 6`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 8`,
 reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
 slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
 
@@ -239,10 +250,12 @@ list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`col_name_len` | u16 |
 | &nbsp;&nbsp;`col_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`type_code` | u8 (stable, see below) |
-| &nbsp;&nbsp;`flags` | u8 — bit0 reserved 0 (**was** `primary_key` through v4 — the `pk` list below is the authority), bit1 `not_null`, bit2 `has_default` (reader trusts the bits) |
+| &nbsp;&nbsp;`flags` | u8 — bit0 reserved 0 (**was** `primary_key` through v4 — the `pk` list below is the authority), bit1 `not_null`, bit2 `has_default` (constant default), bit3 `default_is_expr` (**new in v8** — expression default; mutually exclusive with bit2, both set is `XX001`) (reader trusts the bits) |
 | &nbsp;&nbsp;`precision` | u16 — **only present when `type_code == 6` (decimal)**; `0` = unconstrained |
 | &nbsp;&nbsp;`scale` | u16 — **only present when `type_code == 6` (decimal)** |
 | &nbsp;&nbsp;`default` | value-codec bytes — **only present when `flags` bit2 (`has_default`)**; written *after* the typmod |
+| &nbsp;&nbsp;`default_expr_len` | u16 — **only present when `flags` bit3 (`default_is_expr`)**; written *after* the typmod (in place of `default`) |
+| &nbsp;&nbsp;`default_expr` | UTF-8 — the default's expression text (*Check-expression text* below), `default_expr_len` bytes |
 | `pk_count` | u16 — primary-key member count (**new in v5**; `0` = no PK, synthetic rowid keys) |
 | `pk_ordinal` ×`pk_count` | u16 each — column ordinals (0-based declaration position) in **key order**; each must be `< col_count` and distinct (else `XX001`) |
 | `check_count` | u16 — the table's `CHECK` constraints (v4; `0` for an unchecked table) |
@@ -343,10 +356,15 @@ column entry **only when `type_code == 6`** — two big-endian `u16`s, `precisio
 constrained `numeric(p,s)` stores `precision = p` (`1 … 1000`) and `scale = s`.
 
 A column with a **`DEFAULT`** ([../design/constraints.md](../design/constraints.md) §2)
-persists its pre-evaluated default value when `flags` **bit2** is set, appended **after** the
-typmod, via the **same value codec rows use** (presence tag + body): a present default is
-`0x00` + the type body, a `DEFAULT NULL` is the lone `0x01`. The field is presence-gated, so a
-column without a default is byte-unchanged.
+persists in one of two presence-gated forms, after the typmod (so a column without a default is
+byte-unchanged). A **constant** default persists its pre-evaluated value when `flags` **bit2**
+(`has_default`) is set, via the **same value codec rows use** (presence tag + body): a present
+default is `0x00` + the type body, a `DEFAULT NULL` is the lone `0x01`. An **expression** default
+(a non-constant `DEFAULT`, e.g. `uuidv7()` or `1 + 1`) persists its **expression text** when
+`flags` **bit3** (`default_is_expr`, **new in v8**) is set: a `u16` length then that many UTF-8
+bytes, the parsed token sequence re-rendered by the closed token table in *Check-expression text*
+below — identical to how a `CHECK` persists, and re-parsed on load (`XX001` if it fails). bit2 and
+bit3 are **mutually exclusive** (both set is `XX001`).
 
 ## The per-table data B-tree
 
@@ -714,7 +732,8 @@ the interior-node format and the split contract.
 | `decimal_table.jed` | a `decimal` column — the decimal branch + per-column `numeric(p,s)` typmod; positive/negative/zero/multi-group/NULL |
 | `bytea_table.jed` | a bytea column — the bytea branch; empty value, embedded `0x00`, a high byte, a NULL |
 | `uuid_table.jed` | a **uuid PRIMARY KEY** (the first non-integer stored key — the §8 cross-core key-path proof) + a nullable uuid column |
-| `default_table.jed` | columns with `DEFAULT` — the `has_default` flag + default value codec written after the typmod |
+| `default_table.jed` | columns with a **constant** `DEFAULT` — the `has_default` flag (bit2) + default value codec written after the typmod |
+| `default_expr_table.jed` | columns with an **expression** `DEFAULT` (v8) — the `default_is_expr` flag (bit3) + the expr-text after the typmod: a `uuid DEFAULT uuidv7()`, an `int32 DEFAULT 1 + 1`, beside a plain no-default column and a constant-default column (bit2) in the same catalog (empty table — the row eval is covered by the conformance corpus) |
 | `timestamp_table.jed` | a timestamp column — the 8-byte int64 branch; epoch, pre-1970, BC-era, `±infinity`, NULL |
 | `timestamptz_table.jed` | a timestamptz column — the same 8-byte branch under type code 10 |
 | `interval_table.jed` | an interval column — the fixed 16-byte branch (i32 months ‖ i32 days ‖ i64 micros, big-endian); a positive multi-field value, a negative value, the zero interval, a months-only/`'1 mon'` value (vs a `'30 days'` value that is span-equal but byte-distinct), and a NULL (single leaf) |

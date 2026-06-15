@@ -9,7 +9,7 @@ use crate::ast::{
     InsertValue, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItems, SetOp, SetOpKind,
     Statement, TableRef, TypeMod, UnaryOp, Update,
 };
-use crate::catalog::{CheckConstraint, Column, IndexDef, Table};
+use crate::catalog::{CheckConstraint, Column, DefaultExpr, IndexDef, Table};
 use crate::cost::Meter;
 use crate::costs::COSTS;
 use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
@@ -816,19 +816,54 @@ impl Database {
                 pk_seen = true;
                 pk.push(columns.len()); // this column's ordinal (pushed below)
             }
-            // Evaluate + type-coerce the DEFAULT literal once, here. A bad default fails at
-            // CREATE TABLE: out of range 22003, cross-family 42804, decimal over-precision
-            // 22003. NOT NULL is NOT enforced here (not_null=false), so a `DEFAULT NULL` on a
-            // NOT NULL column is accepted and traps 23502 only when applied (constraints.md §2).
-            let default = match &def.default {
-                Some(lit) => Some(store_value(
-                    literal_to_value_for(lit, ty)?,
-                    ty,
-                    decimal,
-                    false,
-                    &def.name,
-                )?),
-                None => None,
+            // Classify the DEFAULT by syntactic form (constraints.md §2). A bad default fails
+            // at CREATE TABLE either way; NOT NULL is NOT enforced here (not_null=false), so a
+            // `DEFAULT NULL` on a NOT NULL column is accepted and traps 23502 only when applied.
+            //   - a bare literal is pre-evaluated + type-coerced to a constant value (the
+            //     fast-path: out of range 22003, cross-family 42804, decimal rounded to typmod);
+            //   - any other expression is validated (structural pre-walk, then resolved against
+            //     an EMPTY scope — a default may not reference a column — then its result type is
+            //     checked assignable to the column, 42804) and stored as text for per-row eval.
+            let (default, default_expr) = match &def.default {
+                None => (None, None),
+                Some(d) => match &d.expr {
+                    Expr::Literal(lit) => (
+                        Some(store_value(
+                            literal_to_value_for(lit, ty)?,
+                            ty,
+                            decimal,
+                            false,
+                            &def.name,
+                        )?),
+                        None,
+                    ),
+                    _ => {
+                        reject_default_structure(&d.expr)?;
+                        let scope = Scope::empty(self);
+                        let (_, rty) = resolve(
+                            &scope,
+                            &d.expr,
+                            Some(ty),
+                            &mut AggCtx::Forbidden,
+                            &mut ParamTypes::default(),
+                        )?;
+                        if !rty.assignable_to(ty) {
+                            return Err(type_error(format!(
+                                "column {} is of type {} but default expression is of type {}",
+                                def.name,
+                                ty.canonical_name(),
+                                rty.type_name(),
+                            )));
+                        }
+                        (
+                            None,
+                            Some(DefaultExpr {
+                                expr_text: d.text.clone(),
+                                expr: d.expr.clone(),
+                            }),
+                        )
+                    }
+                },
             };
             columns.push(Column {
                 name: def.name.clone(),
@@ -837,6 +872,7 @@ impl Database {
                 primary_key: def.primary_key,
                 not_null: def.primary_key || def.not_null, // PRIMARY KEY ⇒ NOT NULL
                 default,
+                default_expr,
             });
         }
 
@@ -1147,6 +1183,62 @@ impl Database {
         Ok(out)
     }
 
+    /// Resolve each column's **expression** `DEFAULT` (constraints.md §2) to an `RExpr`, once
+    /// per INSERT statement — `insert_rows` (and the VALUES `DEFAULT`-keyword materialization)
+    /// evaluate it per omitted/`DEFAULT` slot. Returns a slot per column (parallel to
+    /// `table.columns`): `Some(node)` for an expression default, `None` for a column with a
+    /// constant default or no default. The default resolves against an EMPTY scope (no columns;
+    /// a column reference was rejected 0A000 at CREATE TABLE) with the column's type as the
+    /// adaptable-operand hint.
+    fn resolve_default_exprs(&self, table: &Table) -> Result<Vec<Option<RExpr>>> {
+        let mut out = Vec::with_capacity(table.columns.len());
+        for col in &table.columns {
+            match &col.default_expr {
+                Some(de) => {
+                    let scope = Scope::empty(self);
+                    let (node, _) = resolve(
+                        &scope,
+                        &de.expr,
+                        Some(col.ty),
+                        &mut AggCtx::Forbidden,
+                        &mut ParamTypes::default(),
+                    )?;
+                    out.push(Some(node));
+                }
+                None => out.push(None),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The value an omitted column or a `DEFAULT` value slot takes (constraints.md §2): the
+    /// column's pre-evaluated constant (`col.default`, or NULL when it has none), OR — for an
+    /// expression default — the resolved `RExpr` evaluated against an empty row through the
+    /// per-statement seam/clock (`rng`) and metered (`operator_eval` per node). Reused by the
+    /// VALUES materialization (a `DEFAULT` keyword) and `insert_rows` (an omitted column),
+    /// sharing ONE `StmtRng` so a multi-row `DEFAULT uuidv7()` stays monotonic.
+    fn eval_default(
+        &self,
+        col: &Column,
+        default_rexpr: Option<&RExpr>,
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        meter: &mut Meter,
+    ) -> Result<Value> {
+        match default_rexpr {
+            Some(rx) => {
+                meter.guard()?;
+                let env = EvalEnv {
+                    exec: self,
+                    params: &[],
+                    outer: &[],
+                    rng,
+                };
+                rx.eval(&[], &env, meter)
+            }
+            None => Ok(col.default.clone().unwrap_or(Value::Null)),
+        }
+    }
+
     /// Run a DROP TABLE: remove the table's definition and its row store from the
     /// catalog (both keyed by the lower-cased name). A table that does not exist is the
     /// same 42P01 the DML paths raise — there is no `IF EXISTS` this slice
@@ -1369,6 +1461,10 @@ impl Database {
         // The CHECK constraints, resolved once per statement in evaluation (name) order;
         // `insert_rows` evaluates them per candidate row (constraints.md §4.4).
         let checks = self.resolve_checks(tdef)?;
+        // Each column's EXPRESSION default, resolved once per statement (constraints.md §2);
+        // applied per omitted column / `DEFAULT` slot, sharing one per-statement `StmtRng`.
+        let default_exprs = self.resolve_default_exprs(tdef)?;
+        let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
 
         // Resolve the optional column list once. `provided[i] = Some(p)` means table column i
         // takes value position `p` in each row; `None` means column i is omitted (its default,
@@ -1445,10 +1541,22 @@ impl Database {
                 };
                 let bound = bind_params(params, &ptypes.finalize()?)?;
 
+                // INSERT ... VALUES reads no rows; with only literal values and constant
+                // defaults it evaluates no expression tree (leaves), so a plain fully-inline
+                // insert still costs zero. An EXPRESSION default (`DEFAULT uuidv7()`) evaluates a
+                // tree per application — `operator_eval` per node — the documented exception
+                // (constraints.md §2, like CHECK). Other metered work: the disposition plan's
+                // compression attempts for over-RECORD_MAX rows (value_compress) and the
+                // RETURNING projection. The meter is created here (before materialization) so a
+                // `DEFAULT`-keyword expression default charges it too.
+                let mut meter = Meter::with_limit(self.max_cost);
+
                 // Materialize each row into its value-position-indexed candidates (length
                 // `arity`, checked above), resolving each slot: a literal, a bound `$N`, or a
-                // `DEFAULT` keyword → that column's default else NULL. The shared `insert_rows`
-                // then builds the declaration-order row and validates it.
+                // `DEFAULT` keyword → that column's default (a constant, or its expression
+                // evaluated for this row through the shared `stmt_rng`). The shared `insert_rows`
+                // then builds the declaration-order row, applies any OMITTED defaults, and
+                // validates it.
                 let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rows_in.len());
                 for values in &rows_in {
                     let mut rv = vec![Value::Null; arity];
@@ -1457,18 +1565,17 @@ impl Database {
                             rv[p] = match &values[p] {
                                 InsertValue::Lit(lit) => literal_to_value_for(lit, col.ty)?,
                                 InsertValue::Param(nn) => bound[(*nn as usize) - 1].clone(),
-                                InsertValue::Default => col.default.clone().unwrap_or(Value::Null),
+                                InsertValue::Default => self.eval_default(
+                                    col,
+                                    default_exprs[i].as_ref(),
+                                    &stmt_rng,
+                                    &mut meter,
+                                )?,
                             };
                         }
                     }
                     rows.push(rv);
                 }
-                // INSERT ... VALUES reads no rows and evaluates no expression tree — its values
-                // are literals and pre-evaluated constant defaults (leaves). The metered work is
-                // the disposition plan's compression attempts for over-RECORD_MAX rows
-                // (value_compress, cost.md §3) and the RETURNING projection (row_produced +
-                // item evaluation per stored row); a plain fully-inline insert still costs zero.
-                let mut meter = Meter::with_limit(self.max_cost);
                 let mut ret_nodes = ret;
                 if let Some((nodes, _, _)) = &mut ret_nodes {
                     // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3),
@@ -1483,6 +1590,8 @@ impl Database {
                     &columns,
                     &pk,
                     &checks,
+                    &default_exprs,
+                    &stmt_rng,
                     &provided,
                     rows,
                     ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice()),
@@ -1571,6 +1680,8 @@ impl Database {
                     &columns,
                     &pk,
                     &checks,
+                    &default_exprs,
+                    &stmt_rng,
                     &provided,
                     q.rows,
                     ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice()),
@@ -1617,6 +1728,8 @@ impl Database {
         columns: &[Column],
         pk: &[(usize, ScalarType)],
         checks: &[(String, RExpr)],
+        default_exprs: &[Option<RExpr>],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
         provided: &[Option<usize>],
         rows: Vec<Vec<Value>>,
         returning: Option<&[RExpr]>,
@@ -1643,7 +1756,11 @@ impl Database {
             for (i, col) in columns.iter().enumerate() {
                 let candidate = match provided[i] {
                     Some(p) => values[p].clone(),
-                    None => col.default.clone().unwrap_or(Value::Null),
+                    // An omitted column takes its default — a constant, or its expression
+                    // evaluated for this row through the shared per-statement seam/clock
+                    // (constraints.md §2). `eval_default` charges `operator_eval` for an
+                    // expression default; a constant (or no default → NULL) is free.
+                    None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
                 };
                 row.push(store_value(
                     candidate,
@@ -1658,15 +1775,15 @@ impl Database {
             // NOT NULL (`store_value` above), before the key/duplicate check (PG's per-row
             // order, constraints.md §4.4). TRUE and NULL pass; the first FALSE aborts the
             // whole statement (two-phase — nothing has been written). Evaluation is metered
-            // expression work (operator_eval), so guard the ceiling per checked row.
+            // expression work (operator_eval), so guard the ceiling per checked row. The
+            // per-statement `rng` is shared with the default evaluation above (one `StmtRng`).
             if !checks.is_empty() {
                 meter.guard()?;
-                let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
                 let env = EvalEnv {
                     exec: self,
                     params: &[],
                     outer: &[],
-                    rng: &stmt_rng,
+                    rng,
                 };
                 for (name, rexpr) in checks {
                     if matches!(rexpr.eval(&row, &env, meter)?, Value::Bool(false)) {
@@ -2994,6 +3111,7 @@ impl Database {
                 primary_key: false,
                 not_null: false,
                 default: None,
+                default_expr: None,
             }],
             pk: Vec::new(),
             checks: Vec::new(),
@@ -3986,6 +4104,19 @@ impl<'a> Scope<'a> {
             parent: None,
             catalog,
             allow_subquery: true,
+        }
+    }
+
+    /// A column-less scope — the environment a `DEFAULT` expression resolves against
+    /// (constraints.md §2): a default may not reference a column (rejected as 0A000 by the
+    /// structural pre-walk before resolution) and may not contain a subquery, so there are no
+    /// relations and subqueries are disallowed.
+    fn empty(catalog: &'a Database) -> Scope<'a> {
+        Scope {
+            rels: Vec::new(),
+            parent: None,
+            catalog,
+            allow_subquery: false,
         }
     }
 
@@ -5350,6 +5481,77 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
             }
             match els {
                 Some(e) => reject_check_structure(e),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+/// The structural rejections for a `DEFAULT` expression (constraints.md §2), a single
+/// depth-first pre-walk run before name/type resolution (the same micro-order divergence from
+/// PG that `reject_check_structure` carries). A default extends the CHECK rejections with one
+/// more: it may **not reference a column** (it is computed before the row exists). Codes match
+/// PostgreSQL (oracle-probed): a column reference / subquery is `0A000`, an aggregate `42803`,
+/// a bind parameter `42P02`.
+fn reject_default_structure(e: &Expr) -> Result<()> {
+    match e {
+        Expr::Column(_) | Expr::QualifiedColumn { .. } => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "cannot use column reference in DEFAULT expression",
+        )),
+        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {
+            Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "cannot use subquery in DEFAULT expression",
+            ))
+        }
+        Expr::Param(n) => Err(EngineError::new(
+            SqlState::UndefinedParameter,
+            format!("there is no parameter ${n}"),
+        )),
+        Expr::FuncCall { name, args, .. } => {
+            if is_aggregate_name(name) {
+                return Err(EngineError::new(
+                    SqlState::GroupingError,
+                    "aggregate functions are not allowed in DEFAULT expressions",
+                ));
+            }
+            args.iter().try_for_each(reject_default_structure)
+        }
+        Expr::Literal(_) | Expr::TypedLiteral { .. } => Ok(()),
+        Expr::Cast { inner, .. } => reject_default_structure(inner),
+        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
+            reject_default_structure(operand)
+        }
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::Like { lhs, rhs, .. } => {
+            reject_default_structure(lhs)?;
+            reject_default_structure(rhs)
+        }
+        Expr::In { lhs, list, .. } => {
+            reject_default_structure(lhs)?;
+            list.iter().try_for_each(reject_default_structure)
+        }
+        Expr::Between { lhs, lo, hi, .. } => {
+            reject_default_structure(lhs)?;
+            reject_default_structure(lo)?;
+            reject_default_structure(hi)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            if let Some(op) = operand {
+                reject_default_structure(op)?;
+            }
+            for (c, r) in whens {
+                reject_default_structure(c)?;
+                reject_default_structure(r)?;
+            }
+            match els {
+                Some(e) => reject_default_structure(e),
                 None => Ok(()),
             }
         }

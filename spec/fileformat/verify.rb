@@ -14,8 +14,8 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 7 # format_version 7: a per-page CRC-32 on every body page (the header grows 12→16
-# bytes — format.md *Version scope*), atop v6's per-index unique flags byte (indexes.md §8)
+VERSION = 8 # format_version 8: a per-column expression-default flag (bit3) + expr-text in the
+# catalog (format.md *Version scope*); v7 added a per-page CRC-32 on every body page (header 12→16)
 PAGE_HEADER = 16 # v7: the 12-byte v6 header (page_type/item_count/next_page) + a 4-byte per-page crc32 at offset 12
 ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
 TXID = 1
@@ -59,13 +59,16 @@ end
 
 # A column. `precision`/`scale` are the decimal typmod (only meaningful for type "decimal";
 # nil = an unconstrained `numeric` column, or a non-decimal column). `not_null` defaults to the
-# pk flag (a PRIMARY KEY is implicitly NOT NULL). `default` is the column's DEFAULT value as the
-# cores store it (already type-coerced): the sentinel :none = no default (flags bit2 off), `nil`
-# = an explicit DEFAULT NULL, any other value = that default. Always carried so the decode-side
-# column hash compares equal (format.md stores the typmod/default only when their bit is set).
-def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, default: :none)
+# pk flag (a PRIMARY KEY is implicitly NOT NULL). `default` is the column's CONSTANT DEFAULT value
+# as the cores store it (already type-coerced): the sentinel :none = no default (flags bit2 off),
+# `nil` = an explicit DEFAULT NULL, any other value = that default. `default_expr` is the column's
+# EXPRESSION DEFAULT as persisted text (flags bit3, v8; e.g. "uuidv7 ( )" — the rendered token
+# sequence), or nil for none; mutually exclusive with `default`. Always carried so the
+# decode-side column hash compares equal (format.md stores the typmod/default only when its bit is
+# set).
+def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, default: :none, default_expr: nil)
   { name: name, type: type, pk: pk, not_null: not_null.nil? ? pk : not_null,
-    precision: precision, scale: scale, default: default }
+    precision: precision, scale: scale, default: default, default_expr: default_expr }
 end
 
 # A table with a COMPOSITE primary key (constraints.md §3): the stored key is the
@@ -202,6 +205,27 @@ DEFAULT_TABLE = {
   ],
   rows: [[1, 0, "none", nil, 7, "1.50", nil],
          [2, 42, "hi", 5, 9, "2.00", 100]]
+}.freeze
+
+# A table with EXPRESSION column defaults (constraints.md §2, v8): the catalog flags bit3
+# (default_is_expr) + the expr-text written AFTER the typmod, via the same token rendering a
+# CHECK uses. Covers a `uuid DEFAULT uuidv7()` (text "uuidv7 ( )"), an `int32 DEFAULT 1 + 1`
+# (text "1 + 1"), a CONSTANT default beside them (bit2, "k"), and a plain no-default column. An
+# EMPTY table — the catalog encoding of expression defaults is the cross-core proof; the per-row
+# evaluation (nondeterministic without a seed) is exercised by the conformance corpus instead.
+# The cores build this via
+#   CREATE TABLE t (id int32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n int32 DEFAULT 1 + 1,
+#                   k int32 DEFAULT 7, plain int16)
+DEFAULT_EXPR_TABLE = {
+  name: "t",
+  columns: [
+    col("id", "int32", pk: true),
+    col("g", "uuid", default_expr: "uuidv7 ( )"),
+    col("n", "int32", default_expr: "1 + 1"),
+    col("k", "int32", default: 7),
+    col("plain", "int16")
+  ],
+  rows: []
 }.freeze
 
 # A table with a timestamp column: exercises the value codec's timestamp branch (the int64
@@ -381,6 +405,7 @@ FIXTURES = [
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
   { file: "uuid_table.jed",      page_size: 256, tables: [UUID_TABLE] },
   { file: "default_table.jed",   page_size: 256, tables: [DEFAULT_TABLE] },
+  { file: "default_expr_table.jed", page_size: 256, tables: [DEFAULT_EXPR_TABLE] },
   { file: "timestamp_table.jed",   page_size: 256, tables: [TIMESTAMP_TABLE] },
   { file: "timestamptz_table.jed", page_size: 256, tables: [TIMESTAMPTZ_TABLE] },
   { file: "interval_table.jed",    page_size: 256, tables: [INTERVAL_TABLE] },
@@ -538,18 +563,27 @@ def table_entry_bytes(table, root_data_page, index_roots)
     out << u16(c[:name].bytesize) << c[:name].b
     out << [TYPECODE.fetch(c[:type])].pack("C")
     has_default = c[:default] != :none
+    has_default_expr = !c[:default_expr].nil?
     # bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is the
     # single authority; the bit is reserved, written 0 (format.md).
     flags = 0
     flags |= 0b10 if c[:not_null]
     flags |= 0b100 if has_default
+    # bit3 default_is_expr (v8) — mutually exclusive with bit2 (format.md).
+    flags |= 0b1000 if has_default_expr
     out << [flags].pack("C")
     # A decimal column appends its typmod (precision, scale) — only for type_code 6, so
     # non-decimal entries are byte-unchanged. precision 0 = unconstrained numeric.
     out << u16(c[:precision] || 0) << u16(c[:scale] || 0) if c[:type] == "decimal"
-    # A column with a DEFAULT (flags bit2) appends its pre-evaluated default value via the same
-    # value codec rows use — AFTER the typmod, presence-gated. A DEFAULT NULL is one 0x01.
-    out << encode_value(c[:type], c[:default]) if has_default
+    # A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default value via
+    # the same value codec rows use — AFTER the typmod, presence-gated. A DEFAULT NULL is one
+    # 0x01. An EXPRESSION default (flags bit3, v8) instead appends its expr-text (u16 length +
+    # UTF-8) there, the same token rendering a CHECK uses — bit2/bit3 are exclusive.
+    if has_default
+      out << encode_value(c[:type], c[:default])
+    elsif has_default_expr
+      out << u16(c[:default_expr].bytesize) << c[:default_expr].b
+    end
   end
   # The primary key (v5): count, then the member column ordinals in KEY order.
   pk = pk_order(table)
@@ -1025,11 +1059,20 @@ def decode_table_entry(buf, pos)
       precision = p.zero? ? nil : p
       scale = p.zero? ? nil : sb.unpack1("n")
     end
-    # The default value follows the typmod, present iff flags bit2 (same value codec as rows).
+    # The default follows the typmod: a CONSTANT default (bit2) is a value via the value codec; an
+    # EXPRESSION default (bit3, v8) is the expr-text (u16 length + UTF-8). Mutually exclusive.
+    raise "column has both a constant and an expression default" if (f & 0b1100) == 0b1100
+
     default = :none
     default, pos = decode_value(type, buf, pos) if (f & 0b100) != 0
+    default_expr = nil
+    if (f & 0b1000) != 0
+      el, pos = take(buf, pos, 2)
+      de, pos = take(buf, pos, el.unpack1("n"))
+      default_expr = de.force_encoding("UTF-8")
+    end
     columns << { name: cname, type: type, pk: false, not_null: (f & 0b10) != 0,
-                 precision: precision, scale: scale, default: default }
+                 precision: precision, scale: scale, default: default, default_expr: default_expr }
   end
   # The primary key (v5): member ordinals in KEY order; pk membership marks the columns.
   pk = []
@@ -1298,7 +1341,8 @@ def expected_tables(fx)
     { name: t[:name],
       columns: t[:columns].map do |c|
         { name: c[:name], type: c[:type], pk: c[:pk], not_null: c[:not_null],
-          precision: c[:precision], scale: c[:scale], default: c[:default] }
+          precision: c[:precision], scale: c[:scale], default: c[:default],
+          default_expr: c[:default_expr] }
       end,
       pk: pk_order(t),
       checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr] } },

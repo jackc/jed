@@ -1,9 +1,10 @@
 //! On-disk single-file format: serialize / load (spec/fileformat/format.md).
 //!
-//! `format_version` 7 — the page-backed copy-on-write B-tree (Phase 6, P6.1; v3 added large-value
+//! `format_version` 8 — the page-backed copy-on-write B-tree (Phase 6, P6.1; v3 added large-value
 //! overflow/compression, v4 the catalog CHECK-constraint list, v5 the secondary-index catalog
 //! reshape, v6 the per-index unique flags byte, v7 a per-page CRC-32 on every body page — the
-//! header grows 12→16 bytes, spec/fileformat/format.md *Version scope*): each table's rows are
+//! header grows 12→16 bytes, v8 the per-column expression-default flag bit3 + expr-text,
+//! spec/fileformat/format.md *Version scope*): each table's rows are
 //! an on-disk B-tree (leaf + interior node pages), the catalog is a relocatable page chain, and
 //! `to_image` lays the whole tree out post-order (the from-scratch image the goldens pin; the
 //! incremental dirty-page commit reuses the same node codec — storage.md §4). The byte layout is the
@@ -15,7 +16,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::catalog::{CheckConstraint, Column, IndexDef, Table};
+use crate::catalog::{CheckConstraint, Column, DefaultExpr, IndexDef, Table};
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
@@ -30,9 +31,10 @@ use crate::value::{Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 7 = a per-page CRC-32 on every body page (the header grows 12→16
-/// bytes; spec/fileformat/format.md *Version scope*). v6 added the per-index unique flags byte.
-const FORMAT_VERSION: u16 = 7;
+/// On-disk format version — 8 = a per-column expression-default flag (bit3) + expr-text in the
+/// catalog (spec/fileformat/format.md *Version scope*). v7 added a per-page CRC-32 on every body
+/// page (the header grew 12→16 bytes).
+const FORMAT_VERSION: u16 = 8;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -1449,6 +1451,11 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
         if col.default.is_some() {
             flags |= 0b100;
         }
+        if col.default_expr.is_some() {
+            // bit3 default_is_expr (v8) — mutually exclusive with bit2 (a column has at most
+            // one of a constant or an expression default — spec/fileformat/format.md).
+            flags |= 0b1000;
+        }
         out.push(flags);
         // A decimal column appends its typmod (precision, scale) — only for type_code 6, so
         // non-decimal entries are byte-unchanged (spec/fileformat/format.md). `precision 0`
@@ -1461,11 +1468,17 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
             out.extend_from_slice(&precision.to_be_bytes());
             out.extend_from_slice(&scale.to_be_bytes());
         }
-        // A column with a DEFAULT (flags bit2) appends its pre-evaluated default value via the
-        // same value codec rows use — AFTER the typmod, presence-gated, so a column without a
-        // default is byte-unchanged (spec/fileformat/format.md). A `DEFAULT NULL` is one 0x01.
+        // A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default value
+        // via the same value codec rows use — AFTER the typmod, presence-gated, so a column
+        // without a default is byte-unchanged (spec/fileformat/format.md). A `DEFAULT NULL` is
+        // one 0x01. An EXPRESSION default (flags bit3, v8) instead appends its expr-text (u16
+        // length + UTF-8) there, the same token rendering a CHECK uses — bit2/bit3 are exclusive.
         if let Some(d) = &col.default {
             out.extend_from_slice(&encode_value(col.ty, d));
+        } else if let Some(de) = &col.default_expr {
+            let et = de.expr_text.as_bytes();
+            out.extend_from_slice(&(et.len() as u16).to_be_bytes());
+            out.extend_from_slice(et);
         }
     }
     // The primary key (v5): count, then the member column ordinals in KEY order
@@ -1749,13 +1762,28 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
         } else {
             None
         };
-        // The default value follows the typmod, present iff flags bit2 (same value codec as
-        // rows). Absent → no bytes consumed (spec/fileformat/format.md).
-        // A default is a small evaluated literal — never externalized — so no overflow reader
-        // is needed (a `0x02` tag here would be a corrupt catalog).
+        // The default follows the typmod (spec/fileformat/format.md): a CONSTANT default
+        // (flags bit2) is a value via the same value codec rows use — never externalized, so no
+        // overflow reader is needed (a `0x02` tag here would be a corrupt catalog). An
+        // EXPRESSION default (flags bit3, v8) is instead the expr-text (u16 length + UTF-8),
+        // re-parsed with the ordinary expression parser (XX001 if it fails, like a stored
+        // check). The two bits are mutually exclusive — both set is a corrupt catalog.
+        if flags & 0b1100 == 0b1100 {
+            return Err(corrupt(
+                "column has both a constant and an expression default",
+            ));
+        }
         let default = if flags & 0b100 != 0 {
             let mut sink = Vec::new();
             Some(read_value(ty, buf, pos, None, &mut sink)?)
+        } else {
+            None
+        };
+        let default_expr = if flags & 0b1000 != 0 {
+            let expr_text = read_string(buf, pos)?;
+            let expr = crate::parser::parse_expression(&expr_text)
+                .map_err(|e| corrupt(&format!("stored default expression does not parse: {e}")))?;
+            Some(DefaultExpr { expr_text, expr })
         } else {
             None
         };
@@ -1766,6 +1794,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             primary_key: false, // set from the pk list below
             not_null: flags & 0b10 != 0,
             default,
+            default_expr,
         });
     }
     // The primary key (v5): member ordinals in KEY order. Each must name a real column,

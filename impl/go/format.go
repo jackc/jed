@@ -22,7 +22,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 7               // on-disk format version (7 = a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
+	formatVersion   uint16 = 8               // on-disk format version (8 = per-column expression-default flag bit3 + expr-text; v7 added a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
 	pageHeader             = 16              // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12              // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1               // page_type for a catalog page
@@ -1387,6 +1387,11 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 		if col.Default != nil {
 			flags |= 0b100
 		}
+		if col.DefaultExpr != nil {
+			// bit3 default_is_expr (v8) — mutually exclusive with bit2 (a column has at most
+			// one of a constant or an expression default — spec/fileformat/format.md).
+			flags |= 0b1000
+		}
 		out = append(out, flags)
 		// A decimal column appends its typmod (precision, scale) — only for type_code 6, so
 		// non-decimal entries are byte-unchanged (spec/fileformat/format.md). precision 0 =
@@ -1399,11 +1404,16 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 			out = appendU16(out, precision)
 			out = appendU16(out, scale)
 		}
-		// A column with a DEFAULT (flags bit2) appends its pre-evaluated default value via the
-		// same value codec rows use — AFTER the typmod, presence-gated, so a column without a
-		// default is byte-unchanged (spec/fileformat/format.md). A DEFAULT NULL is one 0x01.
+		// A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default value
+		// via the same value codec rows use — AFTER the typmod, presence-gated, so a column
+		// without a default is byte-unchanged (spec/fileformat/format.md). A DEFAULT NULL is one
+		// 0x01. An EXPRESSION default (flags bit3, v8) instead appends its expr-text (u16 length
+		// + UTF-8) there, the same token rendering a CHECK uses — bit2/bit3 are exclusive.
 		if col.Default != nil {
 			out = append(out, encodeValue(col.Type, *col.Default)...)
+		} else if col.DefaultExpr != nil {
+			out = appendU16(out, uint16(len(col.DefaultExpr.ExprText)))
+			out = append(out, col.DefaultExpr.ExprText...)
 		}
 	}
 	// The primary key (v5): count, then the member column ordinals in KEY order
@@ -1718,12 +1728,17 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 				decimal = &DecimalTypmod{Precision: precision, Scale: scale}
 			}
 		}
-		// The default value follows the typmod, present iff flags bit2 (same value codec as
-		// rows). Absent → no bytes consumed (spec/fileformat/format.md).
+		// The default follows the typmod (spec/fileformat/format.md): a CONSTANT default (flags
+		// bit2) is a value via the same value codec rows use — never externalized, so no
+		// overflow reader is needed (a 0x02 tag here would be a corrupt catalog). An EXPRESSION
+		// default (flags bit3, v8) is instead the expr-text (u16 length + UTF-8), re-parsed with
+		// the ordinary expression parser (XX001 if it fails, like a stored check). The two bits
+		// are mutually exclusive — both set is a corrupt catalog.
+		if flags&0b1100 == 0b1100 {
+			return nil, 0, nil, NewError(DataCorrupted, "column has both a constant and an expression default")
+		}
 		var defaultVal *Value
 		if flags&0b100 != 0 {
-			// A default is a small evaluated literal — never externalized — so no overflow reader
-			// is needed (a 0x02 tag here would be a corrupt catalog).
 			var sink []uint32
 			dv, err := readValue(ty, buf, pos, nil, &sink)
 			if err != nil {
@@ -1731,13 +1746,26 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			}
 			defaultVal = &dv
 		}
+		var defaultExpr *DefaultExpr
+		if flags&0b1000 != 0 {
+			exprText, err := readString(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			expr, err := ParseExpression(exprText)
+			if err != nil {
+				return nil, 0, nil, NewError(DataCorrupted, "stored default expression does not parse: "+err.Error())
+			}
+			defaultExpr = &DefaultExpr{ExprText: exprText, Expr: expr}
+		}
 		columns = append(columns, Column{
 			Name:    cname,
 			Type:    ty,
 			Decimal: decimal,
 			// PrimaryKey is set from the pk list below.
-			NotNull: flags&0b10 != 0,
-			Default: defaultVal,
+			NotNull:     flags&0b10 != 0,
+			Default:     defaultVal,
+			DefaultExpr: defaultExpr,
 		})
 	}
 	// The primary key (v5): member ordinals in KEY order. Each must name a real column,

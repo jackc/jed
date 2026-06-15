@@ -21,7 +21,7 @@ table_constraint  ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
 column_def        ::= identifier type_name column_constraint*
 column_constraint ::= "PRIMARY" "KEY"
                     | "NOT" "NULL"
-                    | "DEFAULT" literal
+                    | "DEFAULT" expr
                     | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
                     | ["CONSTRAINT" identifier] "UNIQUE"
 ```
@@ -79,42 +79,80 @@ A `DEFAULT` gives a column the value to use when a row **omits** it. It is exerc
 `INSERT` column list and the `DEFAULT` keyword (grammar.md §16): an unlisted column, or a
 `DEFAULT` value slot, takes the column's default.
 
-**Literal-only this slice.** A `DEFAULT` takes a single `literal` — exactly the grammar an
-`INSERT` value accepts (int / decimal / text / bytea-as-text / boolean / `NULL`, with an
-optional leading `-`). A general-expression default (`DEFAULT 1 + 1`, `DEFAULT now()`) is
-deferred; literal-only keeps the value a deterministic constant with no evaluation at INSERT.
+A `DEFAULT` takes any scalar `expr` (the full expression grammar — arithmetic, `CASE`, `CAST`,
+scalar function calls), with the same structural restrictions a `CHECK` carries plus one more —
+a default may **not reference a column** (it is computed before the row exists):
 
-**Evaluated + coerced once, at CREATE TABLE.** The default literal is converted to a value and
-**type-coerced to the column** at `CREATE TABLE` — the same `store_value` path INSERT uses — and
-the coerced value is stored in the catalog. So a bad default fails *at CREATE TABLE*, not at the
-first INSERT:
+- a **column reference** is **`0A000`** (`cannot use column reference in DEFAULT expression`);
+- a **subquery** is **`0A000`** (`cannot use subquery in DEFAULT expression`);
+- an **aggregate** is **`42803`** (`aggregate functions are not allowed in DEFAULT expressions`);
+- a **bind parameter** `$N` is **`42P02`** (`there is no parameter $N`).
 
-- a default outside the column type's range traps **`22003`** (`DEFAULT 99999` on `int16`);
-- a cross-family default traps **`42804`** (`DEFAULT 'x'` on `int32`);
-- a decimal default is rounded to the column's typmod there (`DEFAULT 1.5` on `numeric(6,2)`
-  stores `1.50`), so the stored default is already in the column's exact form.
+(Like `CHECK` (§4.1), jed runs these structural rejections as a single pre-walk before
+name/type resolution — a documented micro-order divergence from PostgreSQL recorded in the
+oracle-override ledger.)
 
-**`NOT NULL` is *not* checked at CREATE TABLE.** The default is coerced with the NOT NULL check
-disabled, so `DEFAULT NULL` on a `NOT NULL` column is **accepted at CREATE** and stored as NULL
-(matching PostgreSQL). The `23502` fires only if that default is actually *applied* — when a row
-omits the column or uses the `DEFAULT` keyword (§1).
+**Two representations, decided by syntactic form.** The default's *form* picks how it is stored
+and when it is evaluated:
+
+- **A constant `literal`** (a bare literal — int / decimal / text / bytea-as-text / boolean /
+  `NULL`, with an optional leading `-`, which the parser folds into the literal) is
+  **pre-evaluated + type-coerced once at `CREATE TABLE`** via the same `store_value` path INSERT
+  uses, and the coerced value is stored in the catalog. This is the literal fast-path: applying
+  it at INSERT evaluates no expression and costs zero.
+- **Any other expression** (a function call like `uuidv7()`, arithmetic like `1 + 1`, a typed
+  literal like `interval '1 day'`) is stored as **expression text** — the parsed token sequence
+  re-rendered by the closed token table ([../fileformat/format.md](../fileformat/format.md)
+  "Check-expression text"), exactly as a `CHECK` is (§4.5) — and **evaluated per row at INSERT**.
+
+**Validated once, at CREATE TABLE.** Either way a bad default fails *at CREATE TABLE*, not at the
+first INSERT. For a literal the value is checked there (out of range **`22003`**, cross-family
+**`42804`**, decimal rounded to the column's typmod — `DEFAULT 1.5` on `numeric(6,2)` stores
+`1.50`). For an expression the default is resolved against an **empty scope** (no columns) and
+its result type is checked for assignability to the column — a cross-family result traps
+**`42804`** (`column <name> is of type <t> but default expression is of type <u>`); the
+per-value range/rounding (`22003`) then happens at INSERT through `store_value` (its value is
+unknown until evaluated).
+
+**`NOT NULL` is *not* checked at CREATE TABLE.** A literal default is coerced with the NOT NULL
+check disabled, so `DEFAULT NULL` on a `NOT NULL` column is **accepted at CREATE** and stored as
+NULL (matching PostgreSQL); the `23502` fires only when it is *applied*. An expression default is
+likewise not NULL-checked at CREATE — a default expression that evaluates to NULL into a
+`NOT NULL` column traps `23502` only when applied.
 
 **Applying a default.** At INSERT, the candidate value for each column is: the value the row
-provides; or, for a `DEFAULT` slot or an omitted column, the column's stored default; or NULL
-when the column has no default. That candidate then goes through the one `store_value`
-chokepoint, which re-applies the column's real `NOT NULL` — so an applied `DEFAULT NULL`, or an
-omitted no-default `NOT NULL` column (including an omitted `PRIMARY KEY`, which is NOT NULL),
-traps **`23502`**. A column with **no default** that is omitted is simply NULL (allowed iff the
-column is nullable).
+provides; or, for a `DEFAULT` slot or an omitted column, the column's default — the stored
+constant, or the **expression evaluated for that row**; or NULL when the column has no default.
+That candidate then goes through the one `store_value` chokepoint, which re-applies the column's
+real `NOT NULL` (so an applied `DEFAULT NULL`, or an omitted no-default `NOT NULL` column —
+including an omitted `PRIMARY KEY`, which is NOT NULL — traps **`23502`**), the per-value range
+check (`22003`), and the table's `CHECK`s. A column with **no default** that is omitted is simply
+NULL (allowed iff the column is nullable).
 
-**Persistence.** A default is stored in the per-column catalog entry: flags **`bit2 has_default`**
-plus, when set, the coerced value via the row value codec, written after the decimal typmod
-([../fileformat/format.md](../fileformat/format.md)). A `DEFAULT NULL` is the lone presence tag
-`0x01`. The default survives serialize→load and is applied to inserts after a reload.
+An expression default is evaluated through the **per-statement entropy/clock seam**
+([entropy.md](entropy.md)), so a multi-row `INSERT` of `DEFAULT uuidv7()` produces **distinct,
+monotonic, time-ordered** UUIDs — every default evaluation in one statement shares one `StmtRng`
+(the statement clock is read once; the `uuidv7` counter advances across rows).
 
-**Cost.** A default is a pre-evaluated constant, so applying one evaluates no expression tree —
-an `INSERT` with defaults accrues the same zero cost as one with literal values (grammar.md §12,
-CLAUDE.md §13).
+**Persistence.** A default is stored in the per-column catalog entry's flags byte
+([../fileformat/format.md](../fileformat/format.md)): **`bit2 has_default`** for a constant
+(the coerced value via the row value codec, after the typmod; a `DEFAULT NULL` is the lone
+presence tag `0x01`), or **`bit3 default_is_expr`** for an expression (the expr-text as a
+length-prefixed UTF-8 string, after the typmod, re-rendered by the same token table a `CHECK`
+uses and re-parsed on load — unparseable stored text in an otherwise-valid file is **`XX001`**).
+The two bits are mutually exclusive. The default survives serialize→load and is applied to
+inserts after a reload. (This is `format_version` **8**.)
+
+**Cost.** A constant default is pre-evaluated, so applying one evaluates no expression tree — an
+`INSERT` with only literal defaults accrues the same zero cost as one with literal values. An
+**expression default** evaluates a tree per row, so each application accrues `operator_eval` per
+interior node (and the function's own units) — the same documented exception `CHECK` carries to
+"VALUES inserts cost zero" (§4.4, grammar.md §12, CLAUDE.md §13). The ceiling (`max_cost`) aborts
+mid-evaluation deterministically.
+
+**Out of scope (deferred).** `UPDATE ... SET x = DEFAULT` and `INSERT ... DEFAULT VALUES` are not
+supported (the grammar has neither); a default is reachable through column-list omission and the
+`DEFAULT` value keyword, both of which exist.
 
 ## 3. Composite `PRIMARY KEY` (the table constraint)
 

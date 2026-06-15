@@ -6,6 +6,7 @@ import type {
   Assignment,
   BinaryOp,
   CheckDef,
+  DefaultDef,
   UniqueDef,
   ColumnDef,
   Delete,
@@ -328,7 +329,7 @@ class Parser {
     // one-member form (a repeat folds at execution — spec/design/constraints.md §5).
     let primaryKey = false;
     let notNull = false;
-    let def: Literal | null = null;
+    let def: DefaultDef | null = null;
     for (;;) {
       if (this.atCheckConstraint()) {
         checks.push(this.parseCheckConstraint());
@@ -354,7 +355,14 @@ class Parser {
         notNull = true;
       } else if (kw === "default") {
         this.advance();
-        def = this.parseLiteral();
+        // A DEFAULT takes any scalar expression (constraints.md §2). Capture the re-rendered
+        // token span as the persisted text (format.md "Check-expression text"), as a CHECK
+        // does — the executor classifies a bare literal (constant fast-path) vs an expression
+        // (text-persisted).
+        const start = this.pos;
+        const expr = this.parseExpr();
+        const text = renderTokens(this.tokens.slice(start, this.pos));
+        def = { expr, text };
       } else if (kw === "unique") {
         this.advance();
         uniques.push({ name: null, columns: [name] });

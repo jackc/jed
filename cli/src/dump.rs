@@ -72,6 +72,11 @@ fn create_table_sql(table: &Table) -> String {
         if let Some(default) = &col.default {
             line.push_str(" DEFAULT ");
             line.push_str(&value_literal(default));
+        } else if let Some(de) = &col.default_expr {
+            // An EXPRESSION default (constraints.md §2) dumps its persisted expr-text verbatim —
+            // it re-parses to the same expression on replay (the same token contract a CHECK uses).
+            line.push_str(" DEFAULT ");
+            line.push_str(&de.expr_text);
         }
         parts.push(line);
     }
@@ -136,6 +141,7 @@ mod tests {
                 name text NOT NULL,
                 score numeric(5,2) DEFAULT 0.50,
                 ok boolean DEFAULT true,
+                n int32 DEFAULT 1 + 1,
                 blob bytea,
                 PRIMARY KEY (id),
                 CONSTRAINT score_pos CHECK (score >= 0)
@@ -166,12 +172,13 @@ mod tests {
              \x20 name text NOT NULL,\n\
              \x20 score numeric(5,2) DEFAULT 0.50,\n\
              \x20 ok boolean DEFAULT true,\n\
+             \x20 n int32 DEFAULT 1 + 1,\n\
              \x20 blob bytea,\n\
              \x20 PRIMARY KEY (id),\n\
              \x20 CONSTRAINT score_pos CHECK (score >= 0)\n\
              );\n\
-             INSERT INTO users VALUES (1, 40, 'alice', 9.50, true, NULL);\n\
-             INSERT INTO users VALUES (2, 30, 'it''s bob', 0.50, true, '\\x6869');\n\
+             INSERT INTO users VALUES (1, 40, 'alice', 9.50, true, 2, NULL);\n\
+             INSERT INTO users VALUES (2, 30, 'it''s bob', 0.50, true, 2, '\\x6869');\n\
              CREATE INDEX users_age_idx ON users (age);\n\
              CREATE UNIQUE INDEX users_age_key ON users (age);\n\
              COMMIT;\n"

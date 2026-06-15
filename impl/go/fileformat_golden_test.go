@@ -302,6 +302,18 @@ func defaultTableDB(t *testing.T) *Database {
 	return db
 }
 
+// defaultExprTableDB exercises EXPRESSION column defaults on disk (v8) — the catalog flags bit3
+// (default_is_expr) + the expr-text written after the typmod: a `uuid DEFAULT uuidv7()`, an
+// `int32 DEFAULT 1 + 1`, a CONSTANT default beside them (bit2), and a plain no-default column.
+// EMPTY table — the catalog encoding is the cross-core proof; the per-row evaluation is covered
+// by the conformance corpus (it is nondeterministic without an injected seed).
+func defaultExprTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n int32 DEFAULT 1 + 1, "+
+		"k int32 DEFAULT 7, plain int16)")
+	return db
+}
+
 // timestampTableDB exercises the value codec's int64-instant branch (type code 8): a
 // positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a
 // NULL. The literals parse to the same micros the golden stores. The PK stays int32.
@@ -402,6 +414,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"bytea_table.jed", byteaTableDB},
 		{"uuid_table.jed", uuidTableDB},
 		{"default_table.jed", defaultTableDB},
+		{"default_expr_table.jed", defaultExprTableDB},
 		{"timestamp_table.jed", timestampTableDB},
 		{"timestamptz_table.jed", timestamptzTableDB},
 		{"interval_table.jed", intervalTableDB},
@@ -443,6 +456,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"bytea_table.jed", byteaTableDB, "t"},
 		{"uuid_table.jed", uuidTableDB, "t"},
 		{"default_table.jed", defaultTableDB, "t"},
+		{"default_expr_table.jed", defaultExprTableDB, "t"},
 		{"timestamp_table.jed", timestampTableDB, "t"},
 		{"timestamptz_table.jed", timestamptzTableDB, "t"},
 		{"interval_table.jed", intervalTableDB, "t"},

@@ -13,10 +13,27 @@ type Column struct {
 	PrimaryKey bool
 	// NotNull is implied true for a PRIMARY KEY column.
 	NotNull bool
-	// Default is the column's DEFAULT value, pre-evaluated and type-coerced at CREATE TABLE, or
-	// nil if it has no default. A non-nil pointer to a ValNull value is an explicit DEFAULT NULL.
-	// Applied for an omitted column or a DEFAULT keyword at INSERT (spec/design/constraints.md §2).
+	// Default is the column's CONSTANT DEFAULT value, pre-evaluated and type-coerced at CREATE
+	// TABLE, or nil if it has no default or an EXPRESSION default (DefaultExpr). A non-nil
+	// pointer to a ValNull value is an explicit DEFAULT NULL. Applied for an omitted column or a
+	// DEFAULT keyword at INSERT (spec/design/constraints.md §2).
 	Default *Value
+	// DefaultExpr is the column's EXPRESSION DEFAULT (a non-constant default like uuidv7() or
+	// 1 + 1), or nil if it has no default or a constant default (Default). Mutually exclusive
+	// with Default. Stored as expression text (re-rendered verbatim at every commit, like a
+	// CHECK — spec/fileformat/format.md) plus the parsed expression the write paths resolve and
+	// evaluate per row (spec/design/constraints.md §2).
+	DefaultExpr *DefaultExpr
+}
+
+// DefaultExpr is a column's EXPRESSION DEFAULT (spec/design/constraints.md §2): its persisted
+// expression text — written back verbatim at every commit so the catalog bytes are stable
+// (spec/fileformat/format.md "Check-expression text") — and the parsed expression the write
+// paths resolve (against an empty scope, no columns) and evaluate per inserted row. Modeled on
+// CheckConstraint.
+type DefaultExpr struct {
+	ExprText string
+	Expr     Expr
 }
 
 // Table is a table definition.

@@ -16,11 +16,25 @@ export type Column = {
   decimal: DecimalTypmod | null;
   primaryKey: boolean;
   notNull: boolean;
-  // The column's DEFAULT value, pre-evaluated and type-coerced at CREATE TABLE, or null if it
-  // has no default. A `{ kind: "null" }` value is an explicit DEFAULT NULL. Applied for an
-  // omitted column or a DEFAULT keyword at INSERT (spec/design/constraints.md §2).
+  // The column's CONSTANT DEFAULT value, pre-evaluated and type-coerced at CREATE TABLE, or
+  // null if it has no default or an EXPRESSION default (defaultExpr). A `{ kind: "null" }`
+  // value is an explicit DEFAULT NULL. Applied for an omitted column or a DEFAULT keyword at
+  // INSERT (spec/design/constraints.md §2).
   default: Value | null;
+  // The column's EXPRESSION DEFAULT (a non-constant default like uuidv7() or 1 + 1), or null if
+  // it has no default or a constant default (default). Mutually exclusive with default. Stored
+  // as expression text (re-rendered verbatim at every commit, like a CHECK —
+  // spec/fileformat/format.md) plus the parsed expression the write paths resolve and evaluate
+  // per row (spec/design/constraints.md §2).
+  defaultExpr: DefaultExpr | null;
 };
+
+// DefaultExpr is a column's EXPRESSION DEFAULT (spec/design/constraints.md §2): its persisted
+// expression text — written back verbatim at every commit so the catalog bytes are stable
+// (spec/fileformat/format.md "Check-expression text") — and the parsed expression the write
+// paths resolve (against an empty scope, no columns) and evaluate per inserted row. Modeled on
+// CheckConstraint.
+export type DefaultExpr = { exprText: string; expr: Expr };
 
 // Table is a table definition.
 export type Table = {

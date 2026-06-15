@@ -821,7 +821,20 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`DEFAULT`** (literal) — `DEFAULT <literal>` column constraint, evaluated + coerced once
       at CREATE TABLE; applied for an omitted column or the `DEFAULT` keyword; persisted via flags
       bit2 + the value codec. Landed with the **`INSERT` column list** + the `DEFAULT` value
-      keyword (grammar.md §16, constraints.md §2). A general-expression default stays deferred.
+      keyword (grammar.md §16, constraints.md §2).
+- [x] **`DEFAULT`** (expression) ✅ **landed** (all 3 cores + Ruby ref) — a non-constant
+      `DEFAULT <expr>` (a function call like `uuidv7()`, arithmetic like `1 + 1`) is stored as
+      **expression text** (the same token rendering a `CHECK` uses) and **evaluated per row at
+      INSERT** through the per-statement entropy/clock seam — so a multi-row `DEFAULT uuidv7()`
+      yields distinct, monotonic, time-ordered UUIDs. A constant literal keeps the zero-cost
+      pre-evaluated fast-path (flags bit2); an expression takes flags **bit3** + expr-text
+      (`format_version` **8**, the `default_expr_table.jed` golden). A column ref / subquery /
+      aggregate / parameter is rejected at CREATE TABLE (`0A000`/`0A000`/`42803`/`42P02`,
+      PG-matched), and the result type is checked assignable to the column (`42804`); per-row
+      evaluation accrues `operator_eval` cost (the documented "VALUES inserts cost zero"
+      exception, like `CHECK`). Capability `ddl.column_default_expr`; corpus
+      `ddl/column_default_expr.test` (grammar.md §16, constraints.md §2). **Still deferred:**
+      `UPDATE ... SET x = DEFAULT` and `INSERT ... DEFAULT VALUES` (the grammar has neither).
 - [x] **Composite `PRIMARY KEY`** ✅ **landed** (all 3 cores) — the table-level
       `PRIMARY KEY (a, b, …)` constraint (grammar.md §28, constraints.md §3): key bytes are
       the members' concatenated encodings (encoding.md §2.3, now exercised; pinned by the

@@ -28,6 +28,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "ddl.not_null",
   // DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).
   "ddl.column_default",
+  // DEFAULT <expression> column constraint — a non-constant default (e.g. uuidv7(), 1 + 1)
+  // evaluated per row at INSERT (spec/design/constraints.md §2).
+  "ddl.column_default_expr",
   // INSERT with an explicit column list + the DEFAULT keyword (grammar.md §12).
   "dml.insert_column_list",
   // INSERT ... VALUES with positional type-checking + overflow trap.

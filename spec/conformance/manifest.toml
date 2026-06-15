@@ -57,6 +57,10 @@ id = "ddl.column_default"
 description = "DEFAULT <literal> column constraint — evaluated + type-coerced once at CREATE TABLE (bad default traps 22003/42804 there), applied for an omitted column or the DEFAULT keyword (spec/design/constraints.md §2)"
 
 [[capability]]
+id = "ddl.column_default_expr"
+description = "DEFAULT <expression> column constraint — a non-constant default (function calls like uuidv7(), arithmetic like 1 + 1); no column refs/subqueries/aggregates/params (0A000/0A000/42803/42P02), result type checked assignable to the column (42804) at CREATE TABLE; evaluated per row at INSERT through the per-statement seam (spec/design/constraints.md §2)"
+
+[[capability]]
 id = "dml.insert_column_list"
 description = "INSERT with an explicit column list `(a, c)` — unlisted columns take their default else NULL; the DEFAULT keyword in a value slot; unknown column 42703, duplicate 42701 (spec/design/grammar.md §12)"
 
@@ -527,11 +531,12 @@ capabilities = [
 
 [[profile]]
 id = "constraints"
-title = "outer_joins + the NOT NULL / DEFAULT column constraints + INSERT column list / INSERT ... SELECT (spec/design/constraints.md)"
+title = "outer_joins + the NOT NULL / DEFAULT (constant + expression) column constraints + INSERT column list / INSERT ... SELECT (spec/design/constraints.md)"
 includes = "outer_joins"
 capabilities = [
   "ddl.not_null",
   "ddl.column_default",
+  "ddl.column_default_expr",
   "dml.insert_column_list",
   "dml.insert_select",
 ]

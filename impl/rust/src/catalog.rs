@@ -16,10 +16,28 @@ pub struct Column {
     pub primary_key: bool,
     /// A PRIMARY KEY column is implicitly NOT NULL.
     pub not_null: bool,
-    /// The column's `DEFAULT` value, pre-evaluated and type-coerced at CREATE TABLE, or
-    /// `None` if it has no default. `Some(Value::Null)` is an explicit `DEFAULT NULL`. Applied
-    /// for an omitted column or a `DEFAULT` keyword at INSERT (spec/design/constraints.md §2).
+    /// The column's **constant** `DEFAULT` value, pre-evaluated and type-coerced at CREATE
+    /// TABLE, or `None` if it has no default or an *expression* default (`default_expr`).
+    /// `Some(Value::Null)` is an explicit `DEFAULT NULL`. Applied for an omitted column or a
+    /// `DEFAULT` keyword at INSERT (spec/design/constraints.md §2).
     pub default: Option<Value>,
+    /// The column's **expression** `DEFAULT` (a non-constant default like `uuidv7()` or
+    /// `1 + 1`), or `None` if it has no default or a *constant* default (`default`). Mutually
+    /// exclusive with `default`. Stored as expression text (re-rendered verbatim at every
+    /// commit, like a `CHECK` — spec/fileformat/format.md) plus the parsed expression the write
+    /// paths resolve and evaluate per row (spec/design/constraints.md §2).
+    pub default_expr: Option<DefaultExpr>,
+}
+
+/// A column's **expression** `DEFAULT` (spec/design/constraints.md §2): its persisted
+/// expression text — written back verbatim at every commit so the catalog bytes are stable
+/// (spec/fileformat/format.md "Check-expression text") — and the parsed expression the write
+/// paths resolve (against an empty scope, no columns) and evaluate per inserted row. Modeled on
+/// `CheckConstraint`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DefaultExpr {
+    pub expr_text: String,
+    pub expr: Expr,
 }
 
 /// One `CHECK` constraint: its (resolved, unique-per-table) name, its persisted expression

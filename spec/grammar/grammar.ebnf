@@ -107,8 +107,11 @@ table_constraint ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
  * "x int NOT NULL PRIMARY KEY" = "x int PRIMARY KEY NOT NULL"). "PRIMARY KEY" makes the
  * column the table's single-column key and implies NOT NULL. "NOT NULL" forbids a NULL
  * value in the column: storing one — directly, or via an applied/omitted default — traps
- * 23502 (../design/constraints.md). "DEFAULT" gives the column the literal as its
- * default, evaluated + coerced once at CREATE TABLE (../design/constraints.md §2).
+ * 23502 (../design/constraints.md). "DEFAULT" gives the column a default expression
+ * (../design/constraints.md §2): a constant literal is pre-evaluated + coerced once at
+ * CREATE TABLE; any other expression (a function call like "uuidv7()", arithmetic like
+ * "1 + 1") is validated at CREATE TABLE and evaluated per row at INSERT. A column
+ * reference, subquery, aggregate, or parameter in the expression is rejected.
  * "CHECK" declares a row predicate, identical in semantics to the table-level form
  * (../design/constraints.md §4) — its position only feeds the textual definition order.
  * The constraint keywords are NOT reserved (§3). */
@@ -116,7 +119,7 @@ column_def     ::= identifier type_name column_constraint*
 
 column_constraint ::= "PRIMARY" "KEY"
                  | "NOT" "NULL"
-                 | "DEFAULT" literal
+                 | "DEFAULT" expr
                  | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
                  | ["CONSTRAINT" identifier] "UNIQUE"
 

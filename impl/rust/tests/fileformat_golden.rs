@@ -351,6 +351,20 @@ fn default_table_db() -> Database {
     db
 }
 
+/// A table with EXPRESSION column defaults (v8) — the catalog flags bit3 (default_is_expr) + the
+/// expr-text written after the typmod: a `uuid DEFAULT uuidv7()`, an `int32 DEFAULT 1 + 1`, a
+/// CONSTANT default beside them (bit2), and a plain no-default column. EMPTY table — the catalog
+/// encoding is the cross-core proof; the per-row evaluation is covered by the conformance corpus.
+fn default_expr_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n int32 DEFAULT 1 + 1, \
+         k int32 DEFAULT 7, plain int16)",
+    );
+    db
+}
+
 /// A table with a timestamp column — exercises the value codec's int64-instant branch (type
 /// code 8): a positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels,
 /// and a NULL. The literals parse to the same micros the golden stores. The PK stays int32 (a
@@ -472,6 +486,7 @@ fn write_matches_goldens() {
         ("bytea_table.jed", bytea_table_db),
         ("uuid_table.jed", uuid_table_db),
         ("default_table.jed", default_table_db),
+        ("default_expr_table.jed", default_expr_table_db),
         ("timestamp_table.jed", timestamp_table_db),
         ("timestamptz_table.jed", timestamptz_table_db),
         ("interval_table.jed", interval_table_db),
@@ -505,6 +520,7 @@ fn read_goldens_reproduces_rows() {
         ("bytea_table.jed", bytea_table_db, "t"),
         ("uuid_table.jed", uuid_table_db, "t"),
         ("default_table.jed", default_table_db, "t"),
+        ("default_expr_table.jed", default_expr_table_db, "t"),
         ("timestamp_table.jed", timestamp_table_db, "t"),
         ("timestamptz_table.jed", timestamptz_table_db, "t"),
         ("interval_table.jed", interval_table_db, "t"),

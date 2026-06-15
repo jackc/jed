@@ -391,7 +391,7 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef) (Colum
 	// one-member form (a repeat folds at execution — spec/design/constraints.md §5).
 	primaryKey := false
 	notNull := false
-	var def *Literal
+	var def *DefaultDef
 	for {
 		if p.atCheckConstraint() {
 			check, err := p.parseCheckConstraint()
@@ -430,11 +430,17 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef) (Colum
 			notNull = true
 		case "default":
 			p.advance()
-			lit, err := p.parseLiteral()
+			// A DEFAULT takes any scalar expression (constraints.md §2). Capture the
+			// re-rendered token span as the persisted text (format.md "Check-expression
+			// text"), as a CHECK does — the executor classifies a bare literal (constant
+			// fast-path) vs an expression (text-persisted).
+			start := p.pos
+			expr, err := p.parseExpr()
 			if err != nil {
 				return ColumnDef{}, err
 			}
-			def = &lit
+			text := renderTokens(p.tokens[start:p.pos])
+			def = &DefaultDef{Expr: expr, Text: text}
 		case "unique":
 			p.advance()
 			*uniques = append(*uniques, UniqueDef{Columns: []string{name}})
