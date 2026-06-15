@@ -1326,10 +1326,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       host catalog, and the decoration layering (encryption codec above the seam, replication tee
       below). Node `fs` host **built** (`impl/ts/src/file.ts`; Rust/Go inline `std::fs`/`os` in the
       per-core `Pager`). Remaining work:
-      - [ ] **`BlockStore` extraction** — lift the file backing out of the per-core `Pager` behind
-            the five-method interface (`read_at`/`write_at`/`sync`/`size`/`set_size`), unify the
-            in-memory path onto it; pure refactor, no behavior/byte change (goldens + corpus
-            unchanged). Foundation for every host below. _(size: M; hosts.md §3/§7)_
+      - [x] **`BlockStore` extraction** — ✅ **landed** (all 3 cores): the file backing is lifted out
+            of the per-core `Pager` into a `FileBlockStore` (`blockstore.{rs,go,ts}`) behind the
+            five-method interface (`read_at`/`write_at`/`sync`/`size`/`set_size`); the pager composes
+            it and keeps the policy (page math, 1 MiB preallocation chunk, barrier choice, fault
+            seam). Pure refactor — goldens, corpus, crash-recovery, and the NoREC sweep all unchanged.
+            The **in-memory path was deliberately left separate** (decoded tree, `persist` a no-op,
+            fully resident): unifying it onto a byte-buffer `BlockStore` would change observable
+            residency/commit semantics, so it is not a behavior-preserving refactor and stays deferred
+            (hosts.md §4/§7). _(size: M; hosts.md §3/§7)_
       - [ ] **Browser/OPFS host** (`FileSystemSyncAccessHandle`) — the one new host; map the
             five methods onto `read`/`write`/`truncate`/`getSize`/`flush` and confirm **file-host
             parity** (a file written by the Node host opens byte-identically through OPFS and vice

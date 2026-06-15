@@ -18,20 +18,24 @@ the storage stack. Everything above it — the buffer pool, the page math, the c
 B-tree, the commit recipe, the catalog — is host-agnostic core logic, **identical across
 implementations** (CLAUDE.md §2) and identical across hosts within an implementation.
 
-The host is **not** the pager. Today each core's [`pager`](pager.md) is a concrete struct
-that both *owns the `std::fs`/`os`/Node `fs` file* and *implements the policy above it*
+The host is **not** the pager. Each core's [`pager`](pager.md) once was a concrete struct
+that both *owned the `std::fs`/`os`/Node `fs` file* and *implemented the policy above it*
 (chunked preallocation — pager.md §7, the bounded buffer pool, the fault-injection seam —
-storage.md §7). Formalizing storage hosts means **splitting those two jobs**: the policy
-stays in the core pager (per-core, host-independent); the raw byte device becomes a small
+storage.md §7). Formalizing storage hosts **split those two jobs** (✅ done, §7): the policy
+stays in the core pager (per-core, host-independent); the raw byte device is now a small
 **`BlockStore`** the pager composes (§3). That split is what lets the browser/OPFS host, an
 encrypting backing, and a replicating backing each be *an added `BlockStore`*, not a second
 pager.
 
-> **Status.** The seam is real but not yet abstracted: the file backing is inlined into the
-> per-core `Pager` (Rust `pager.rs`, Go `pager.go`, TS `pager.ts` + `file.ts`), and the
-> in-memory path is a separate code path entirely. This doc specifies the **interface those
-> cores will conform to** and the catalog they will grow; the abstraction extraction and the
-> OPFS host are the scheduled work ([TODO.md](../../TODO.md) Phase 7 "Storage hosts").
+> **Status.** ✅ The **`BlockStore` extraction has landed** (§7): the file backing is lifted out
+> of the per-core `Pager` into a `FileBlockStore` the pager composes (Rust `blockstore.rs`, Go
+> `blockstore.go`, TS `blockstore.ts`), with the policy — page math, the 1 MiB preallocation chunk,
+> the barrier choice, the fault-injection seam — staying in the host-independent `Pager`. It was a
+> pure refactor: the goldens, the conformance corpus, and the crash-recovery suites are unchanged.
+> The **in-memory path remains a separate, fully-resident code path** (no `BlockStore`) — unifying it
+> onto a byte-buffer `BlockStore` would change observable residency/commit semantics, so it is *not*
+> a behavior-preserving refactor and stays deferred (§4 in-memory row). The remaining scheduled work
+> is the **OPFS host** (§5; [TODO.md](../../TODO.md) Phase 7 "Storage hosts").
 
 ## 2. The interface
 
@@ -141,23 +145,25 @@ The block-level operations storage.md §2 names stay exactly where they are — 
 | `sync()` | `store.sync()` |
 | `block_count()` | logical `page_count` (meta), distinct from `store.size() / page_size` |
 
-So the extraction is mechanical: the pager's current direct `File` calls become `BlockStore`
-calls, and the file-specific bits move into the file `BlockStore` — `open`, the data-only
-`fdatasync` (`sync()`), and the durable-grow `set_len`+`fsync` (`set_size`). The *policy* of
-*when* to grow (the 1 MiB preallocation chunk) and *when* to barrier (body, then meta) stays in
-the pager — host-independent, identical across cores — so the host never decides between the two
-barriers; it only implements each faithfully. The buffer pool, the preallocation policy, the
-page math, and the fault-injection seam (storage.md §7) **do not move**. The fault seam keeps
-testing the *commit recipe*; it does not need a per-host variant.
+The extraction was mechanical (✅ landed, §7): the pager's former direct `File` calls became
+`BlockStore` calls, and the file-specific bits moved into `FileBlockStore` — `open`, the data-only
+`fdatasync` (`sync()`), and the durable-grow zero-write+`fsync` (`set_size`). The *policy* of
+*when* to grow (the 1 MiB preallocation chunk, in the pager's `reserve`) and *when* to barrier
+(body, then meta) stayed in the pager — host-independent, identical across cores — so the host
+never decides between the two barriers; it only implements each faithfully. The buffer pool, the
+preallocation policy, the page math, and the fault-injection seam (storage.md §7) **did not move**.
+The fault seam keeps testing the *commit recipe*; it does not need a per-host variant. (A short-read
+header check that once relied on a partial `read_exact` now precedes the read as a `size() < 12`
+guard, since `read_at` surfaces a short read as `58030` — same `XX001` outcome.)
 
 ## 4. The host catalog
 
 | host | backing | status | notes |
 |---|---|---|---|
-| **in-memory** | a `Vec`/slice of bytes (or pages) | ✅ built (separate path) | the natural fit for the RAM-sized target (CLAUDE.md §9) and the default for tests/conformance — no filesystem, fully deterministic. `sync()` is a no-op; `commit` is a no-op success (api.md §2.2). After the §3 extraction it becomes a `BlockStore` over a growable byte buffer, unifying it with the file path. |
-| **Rust file** | `std::fs::File`, positioned read/write + `fsync`/`fdatasync` | ✅ built (inlined in `pager.rs`) | pure `std::fs`, no dependency, memory-safe (CLAUDE.md §13). Cross-platform `seek`+read/write (no Unix-only `pread`). |
-| **Go file** | `os.File` `ReadAt`/`WriteAt`/`Truncate`/`Sync` | ✅ built (inlined in `pager.go`) | pure Go — **no cgo, no FFI** (CLAUDE.md §2). `fdatasync` via `syscall.Fdatasync` behind a `linux` build tag, full `Sync` fallback elsewhere. |
-| **Node `fs`** | `openSync`/positioned `writeSync`/`fsyncSync` (`impl/ts/src/file.ts`) | ✅ built | the TS core's durable backing; isolated in `file.ts` precisely so OPFS is a sibling, not a reshape. |
+| **in-memory** | a `Vec`/slice of bytes (or pages) | ✅ built (**separate path**) | the natural fit for the RAM-sized target (CLAUDE.md §9) and the default for tests/conformance — no filesystem, fully deterministic. `sync()` is a no-op; `commit` is a no-op success (api.md §2.2). Stores its data as a **decoded tree** (no `BlockStore`, fully resident, `persist` a no-op): routing it through a byte-buffer `BlockStore` + pager + pool would change observable residency/commit semantics, so unifying it onto the seam is **deferred** — not a behavior-preserving refactor (§7). |
+| **Rust file** | `std::fs::File`, positioned read/write + `fsync`/`fdatasync` | ✅ built (`FileBlockStore`, `blockstore.rs`) | pure `std::fs`, no dependency, memory-safe (CLAUDE.md §13). Cross-platform `seek`+read/write (no Unix-only `pread`). Closes the file on drop (RAII). |
+| **Go file** | `os.File` `ReadAt`/`WriteAt`/`Truncate`/`Sync` | ✅ built (`fileBlockStore`, `blockstore.go`) | pure Go — **no cgo, no FFI** (CLAUDE.md §2). `fdatasync` via `syscall.Fdatasync` behind a `linux` build tag (`blockstore_datasync_linux.go`), full `Sync` fallback elsewhere. |
+| **Node `fs`** | `openSync`/positioned `writeSync`/`fsyncSync` | ✅ built (`FileBlockStore`, `impl/ts/src/blockstore.ts`) | the TS core's durable backing; isolated in `blockstore.ts` (the host program layer is `file.ts`) precisely so OPFS is a sibling, not a reshape. |
 | **Browser / OPFS** | `FileSystemSyncAccessHandle` (`read`/`write`/`truncate`/`getSize`/`flush`) | ⏳ **to build** (§5) | the one new host this slice targets. Synchronous access handle API maps directly onto the §2 `BlockStore` surface. |
 | **encrypting** | wraps another `BlockStore`/the in-core codec | ⏳ design door ([encryption.md](encryption.md)) | a page codec **above** the seam, not a host (encryption.md §2); the host stays opaque-byte. |
 | **replicating** | a tee wrapping another `BlockStore` | ⏳ design door ([replication.md](replication.md)) | a seam-level tee **below** the codec, so it ships ciphertext (replication.md §4). |
@@ -245,11 +251,19 @@ as it crosses. See the two docs for the full designs.
 
 ## 7. Open / deferred
 
-- **`BlockStore` extraction** — ⏳ the abstraction split (§1, §3) is the first scheduled step:
-  lift the file backing out of the per-core `Pager` behind the five-method interface, unify the
-  in-memory path onto it, with no behavior or byte change (a pure refactor verified by the
-  unchanged goldens + corpus). Foundation for every host below.
-- **OPFS host** — ⏳ to build (§5), validated by file-host parity.
+- **`BlockStore` extraction** — ✅ **landed** (§1/§3): the file backing is lifted out of the
+  per-core `Pager` behind the five-method interface (`FileBlockStore` in each core's
+  `blockstore.{rs,go,ts}`), with the policy left in the host-independent `Pager`. A pure refactor —
+  the goldens, the conformance corpus, the crash-recovery suites, and the NoREC sweep are all
+  unchanged. Foundation for every host below.
+  - **In-memory path — deliberately left separate** (a documented divergence from this item's
+    original "unify the in-memory path onto it" wording). In all three cores an in-memory database
+    holds its data as a decoded tree (no `BlockStore`, `persist` a no-op, fully resident,
+    `resident_leaves() == 0`); routing it through a byte-buffer `BlockStore` + pager + pool would
+    change observable residency and commit/no-op semantics, so it is **not** a behavior-preserving
+    refactor. Unifying it stays deferred (the §4 in-memory row's eventual shape).
+- **OPFS host** — ⏳ to build (§5), validated by file-host parity. Now a thin adapter against the
+  extracted seam (the one new `BlockStore`), not a second pager.
 - **Encryption codec** — ⏳ design door ([encryption.md](encryption.md)); not built. Crypto is a
   §14 vetted-library decision requiring explicit confirmation before any dependency lands.
 - **Replication tee** — ⏳ design door ([replication.md](replication.md)); block-shipping decided,

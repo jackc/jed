@@ -8,6 +8,7 @@
 import { closeSync, existsSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { FileBlockStore } from "./blockstore.ts";
 import { DEFAULT_PAGE_SIZE, Database, Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import { incrementalImage, loadDatabasePaged, metaPage, toImage } from "./format.ts";
@@ -40,7 +41,7 @@ export function create(path: string, opts: DatabaseOptions = {}): Database {
   } catch (e) {
     throw ioError(e);
   }
-  db.paging = new SharedPaging(Pager.fromFd(fd), cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize)); // valid header
+  db.paging = new SharedPaging(Pager.fromStore(new FileBlockStore(fd)), cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize)); // valid header
   return db;
 }
 
@@ -99,7 +100,7 @@ export function open(path: string, opts: OpenOptions = {}): Database {
     // Read the file's page size first, then convert the byte budget to a leaf-page capacity; the loader
     // rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
     // page_size = 0 cannot divide by zero before that check runs).
-    const pager = Pager.fromFd(fd);
+    const pager = Pager.fromStore(new FileBlockStore(fd));
     const db = loadDatabasePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)

@@ -50,7 +50,7 @@ func Create(path string, opts DatabaseOptions) (*Database, error) {
 	if err != nil {
 		return nil, ioError(err)
 	}
-	p, err := pagerFromFile(f)
+	p, err := pagerFromStore(&fileBlockStore{f: f})
 	if err != nil {
 		_ = f.Close()
 		return nil, err
@@ -115,7 +115,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
 		}
 		return nil, ioError(err)
 	}
-	p, err := pagerFromFile(f)
+	p, err := pagerFromStore(&fileBlockStore{f: f})
 	if err != nil {
 		_ = f.Close()
 		return nil, err

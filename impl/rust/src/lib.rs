@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod ast;
+pub mod blockstore;
 pub mod bufferpool;
 pub mod catalog;
 pub mod cost;

@@ -1,16 +1,17 @@
-//! Block-device pager — the storage seam (spec/design/storage.md §2) for a file-backed database
-//! (spec/design/pager.md). It owns the **open file for the handle's life** so pages can be read on
-//! demand and the incremental commit (P6.1) can write them without re-opening the file each time.
+//! Block-device pager — the host-independent storage policy (spec/design/pager.md) above the
+//! [`BlockStore`](crate::blockstore) host seam (spec/design/hosts.md §3). It composes a `BlockStore`
+//! kept open for the handle's life, expressing the rest of the core's page-level operations
+//! (`read_block`/`write_block`/`reserve`/`sync`) over the host's byte device — converting a page index
+//! to a byte offset (`index × page_size`), owning the 1 MiB preallocation chunk, and deciding which
+//! durability barrier each step needs. The host (the file backing, [`FileBlockStore`](crate::blockstore))
+//! is the only per-platform code below; everything here is identical across hosts (hosts.md §1).
 //!
-//! P6.4a (this slice) routes the whole-image load and the commit through `read_block`/`write_block`
-//! with **no residency change** — the loader still assembles the full image (`read_all`) and builds
-//! the whole tree. The bounded buffer pool + lazy node loading that make the resident set bounded
-//! (P6.4b) read through this same `read_block`. Pure `std::fs`, no dependencies, memory-safe
-//! (CLAUDE.md §13); cross-platform `seek`+read/write (no Unix-only `pread`).
+//! The whole-image load and the commit route through `read_block`/`write_block`; the bounded buffer
+//! pool + lazy node loading that make the resident set bounded (P6.4b) read through this same
+//! `read_block`. The **fault-injection seam** (spec/design/storage.md §7) lives here, not in the host
+//! — it tests the *commit recipe*, which is host-independent (hosts.md §3).
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-
+use crate::blockstore::BlockStore;
 use crate::error::{EngineError, Result, SqlState};
 
 /// Pages preallocated per file-growth step — ~1 MiB worth, floored at one page (mirrors
@@ -28,11 +29,11 @@ fn prealloc_chunk_pages(page_size: u32) -> u32 {
     (PREALLOC_CHUNK_BYTES / page_size.max(1)).max(1)
 }
 
-/// A file-backed block device: fixed-size pages addressed by index, over an open file kept for the
+/// A block device: fixed-size pages addressed by index, over a [`BlockStore`] host kept open for the
 /// handle's life. One page at a time (storage.md §2); the demand-paging buffer pool (P6.4b) faults
 /// pages in through [`Pager::read_block`].
 pub(crate) struct Pager {
-    file: File,
+    store: Box<dyn BlockStore>,
     page_size: u32,
     /// The number of pages physically **allocated** on disk — the file length in pages, which the
     /// chunked preallocation ([`Pager::reserve`]) runs ahead of the committed high-water. A commit
@@ -92,28 +93,25 @@ impl Fault {
 }
 
 impl Pager {
-    /// Adopt an already-open (read+write) file as the backing, reading the page size from its meta
-    /// header (offset 8, format.md). The host layer (`file.rs`) opens the file — mapping a missing
-    /// path to `58P01` — and hands it here. A header too short or a zero page size is `XX001`.
-    pub(crate) fn from_file(mut file: File) -> Result<Pager> {
-        let mut header = [0u8; 12];
-        file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-        file.read_exact(&mut header).map_err(|e| match e.kind() {
-            std::io::ErrorKind::UnexpectedEof => {
-                corrupt("database file smaller than a meta header")
-            }
-            _ => io_error(e),
-        })?;
+    /// Adopt an already-open `store` as the byte backing, reading the page size from its meta header
+    /// (offset 8, format.md). The host layer (`file.rs`) opens the host — mapping a missing path to
+    /// `58P01` — and hands it here wrapped in a [`BlockStore`]. A store smaller than a meta header, or
+    /// a zero page size, is `XX001`.
+    pub(crate) fn from_store(mut store: Box<dyn BlockStore>) -> Result<Pager> {
+        let size = store.size()?;
+        if size < 12 {
+            return Err(corrupt("database file smaller than a meta header"));
+        }
+        let header = store.read_at(0, 12)?;
         let page_size = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
         if page_size == 0 {
             return Err(corrupt("zero page size in meta header"));
         }
         // The allocation high-water is the current file length in pages — already past the committed
         // page_count if a prior session preallocated slack (reused for free on this session's growth).
-        let len = file.metadata().map_err(io_error)?.len();
-        let allocated_pages = (len / page_size as u64) as u32;
+        let allocated_pages = (size / page_size as u64) as u32;
         Ok(Pager {
-            file,
+            store,
             page_size,
             allocated_pages,
             #[cfg(test)]
@@ -141,14 +139,13 @@ impl Pager {
         self.page_size
     }
 
-    /// Read one page (block `index`) — random access, the demand-paging read path (P6.4b).
+    /// Read one page (block `index`) — random access, the demand-paging read path (P6.4b). Converts
+    /// the page index to a byte offset for the host's [`read_at`](BlockStore::read_at).
     pub(crate) fn read_block(&mut self, index: u32) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; self.page_size as usize];
-        self.file
-            .seek(SeekFrom::Start(index as u64 * self.page_size as u64))
-            .map_err(io_error)?;
-        self.file.read_exact(&mut buf).map_err(io_error)?;
-        Ok(buf)
+        self.store.read_at(
+            index as u64 * self.page_size as u64,
+            self.page_size as usize,
+        )
     }
 
     /// Write one page (`bytes`) at block `index`. Overwrites in place — `persist` always
@@ -156,10 +153,8 @@ impl Pager {
     /// (a reused free page, or a preallocated slot past the old high-water). `bytes` is one page wide.
     pub(crate) fn write_block(&mut self, index: u32, bytes: &[u8]) -> Result<()> {
         self.fault_on_write(index, bytes)?;
-        self.file
-            .seek(SeekFrom::Start(index as u64 * self.page_size as u64))
-            .map_err(io_error)?;
-        self.file.write_all(bytes).map_err(io_error)
+        self.store
+            .write_at(index as u64 * self.page_size as u64, bytes)
     }
 
     /// The fault-injection seam's write hook (spec/design/storage.md §7). In a non-test build this is
@@ -195,22 +190,20 @@ impl Pager {
         self.fault = None; // one-shot
         if let Some(k) = fault.tear_bytes {
             let k = k.min(bytes.len());
-            self.file
-                .seek(SeekFrom::Start(index as u64 * self.page_size as u64))
-                .map_err(io_error)?;
-            self.file.write_all(&bytes[..k]).map_err(io_error)?;
+            self.store
+                .write_at(index as u64 * self.page_size as u64, &bytes[..k])?;
         }
         Err(injected_crash())
     }
 
     /// Ensure the file has at least `min_pages` physically-allocated pages, growing it in fixed
-    /// chunks ([`prealloc_chunk_pages`]) of real, durably-allocated zero blocks when short. Called by
-    /// `persist` before each commit's body write with the new committed high-water, so that write —
-    /// and almost every commit's — lands entirely in already-allocated space and its `fdatasync`
-    /// ([`Pager::sync`]) pays no metadata journaling (spec/design/pager.md §7). The growth itself is a
-    /// **full** `sync_all`: the block allocation + the new file size must be durable *before* commits
-    /// rely on writing into the region (else the body `fdatasync` would have to flush that metadata,
-    /// defeating the point). Crash-safe: the preallocated pages are unreferenced zeros past the
+    /// chunks ([`prealloc_chunk_pages`]) when short. The preallocation *policy* (the 1 MiB chunk, the
+    /// chunk-aligned target) is host-independent and stays here; the durable grow itself — real
+    /// zero blocks + a full `fsync` — is the host's [`set_size`](BlockStore::set_size), the metadata
+    /// barrier (hosts.md §2.1/§3). Called by `persist` before each commit's body write with the new
+    /// committed high-water, so that write — and almost every commit's — lands entirely in
+    /// already-allocated space and its data-only [`sync`](Pager::sync) pays no metadata journaling
+    /// (spec/design/pager.md §7). Crash-safe: the preallocated pages are unreferenced zeros past the
     /// committed `page_count`, so a crash before the next commit publishes simply ignores them.
     pub(crate) fn reserve(&mut self, min_pages: u32) -> Result<()> {
         if min_pages <= self.allocated_pages {
@@ -218,26 +211,19 @@ impl Pager {
         }
         let chunk = prealloc_chunk_pages(self.page_size);
         let target = min_pages.div_ceil(chunk).saturating_mul(chunk);
-        let grow_bytes = (target - self.allocated_pages) as usize * self.page_size as usize;
-        let zeros = vec![0u8; grow_bytes];
-        self.file
-            .seek(SeekFrom::Start(
-                self.allocated_pages as u64 * self.page_size as u64,
-            ))
-            .map_err(io_error)?;
-        self.file.write_all(&zeros).map_err(io_error)?;
-        self.file.sync_all().map_err(io_error)?; // the allocation must be durable before in-region commits
+        self.store.set_size(target as u64 * self.page_size as u64)?;
         self.allocated_pages = target;
         Ok(())
     }
 
-    /// Metadata-free durability barrier (`fdatasync`). Called twice per commit — body pages, then the
-    /// meta — to honour the body-before-meta write-ordering rule (format.md, file.rs `persist`).
-    /// `fdatasync`, not `fsync`, so an overwrite into the preallocated region ([`Pager::reserve`])
-    /// flushes only the data, never a file-size/inode-timestamp metadata journal (spec/design/pager.md §7).
+    /// Metadata-free durability barrier — the host's data-only [`sync`](BlockStore::sync)
+    /// (`fdatasync`). Called twice per commit — body pages, then the meta — to honour the
+    /// body-before-meta write-ordering rule (format.md, file.rs `persist`). Data-only, not a full
+    /// `fsync`, so an overwrite into the preallocated region ([`Pager::reserve`]) flushes only the
+    /// data, never a file-size/inode-timestamp metadata journal (spec/design/pager.md §7).
     pub(crate) fn sync(&mut self) -> Result<()> {
         self.fault_on_sync()?;
-        self.file.sync_data().map_err(io_error)
+        self.store.sync()
     }
 
     /// The fault-injection seam's `sync()` hook (spec/design/storage.md §7) — a no-op in a non-test
@@ -264,10 +250,6 @@ impl Pager {
         }
         Ok(())
     }
-}
-
-fn io_error(e: std::io::Error) -> EngineError {
-    EngineError::new(SqlState::IoError, format!("I/O error: {e}"))
 }
 
 fn corrupt(msg: &str) -> EngineError {

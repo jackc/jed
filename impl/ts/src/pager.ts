@@ -1,15 +1,17 @@
-// Block-device pager — the storage seam (spec/design/storage.md §2) for a file-backed database
-// (spec/design/pager.md). It owns the open file descriptor for the handle's life so pages can be
-// read on demand and the incremental commit (P6.1) can write them without re-opening the file each
-// time. Node `fs` host (the browser/OPFS host is a sibling later — storage.md §2).
+// Block-device pager — the host-independent storage policy (spec/design/pager.md) above the
+// BlockStore host seam (spec/design/hosts.md §3). It composes a BlockStore kept open for the handle's
+// life, expressing the rest of the core's page-level operations (readBlock/writeBlock/reserve/sync)
+// over the host's byte device — converting a page index to a byte offset (index × pageSize), owning
+// the 1 MiB preallocation chunk, and deciding which durability barrier each step needs. The host (the
+// Node `fs` backing, FileBlockStore in blockstore.ts) is the only per-platform code below; everything
+// here is identical across hosts (hosts.md §1).
 //
-// P6.4a (this slice) routes the whole-image load and the commit through readBlock/writeBlock with no
-// residency change — the loader still assembles the full image (readAll) and builds the whole tree.
-// The bounded buffer pool + lazy node loading that make the resident set bounded (P6.4b) read through
-// this same readBlock.
+// The whole-image load and the commit route through readBlock/writeBlock; the bounded buffer pool +
+// lazy node loading that make the resident set bounded (P6.4b) read through this same readBlock. The
+// fault-injection seam (spec/design/storage.md §7) lives here, not in the host — it tests the commit
+// recipe, which is host-independent (hosts.md §3).
 
-import { closeSync, fdatasyncSync, fstatSync, fsyncSync, readSync, writeSync } from "node:fs";
-
+import { type BlockStore } from "./blockstore.ts";
 import { type EngineError, engineError } from "./errors.ts";
 
 // PREALLOC_CHUNK_BYTES is the file-growth step — ~1 MiB worth of pages preallocated at once. Growing
@@ -52,11 +54,11 @@ function injectedCrash(): EngineError {
   return engineError("io_error", "injected commit crash (fault injection)");
 }
 
-// A file-backed block device: fixed-size pages addressed by index, over an open fd kept for the
+// A block device: fixed-size pages addressed by index, over a BlockStore host kept open for the
 // handle's life. One page at a time (storage.md §2); the demand-paging buffer pool (P6.4b) faults
 // pages in through readBlock.
 export class Pager {
-  private fd: number;
+  private store: BlockStore;
   pageSize: number;
   // allocatedPages is the number of pages physically allocated on disk — the file length in pages,
   // which the chunked preallocation (reserve) runs ahead of the committed high-water. A commit whose
@@ -72,8 +74,8 @@ export class Pager {
   private bodyWrites = 0;
   private syncs = 0;
 
-  private constructor(fd: number, pageSize: number, allocatedPages: number) {
-    this.fd = fd;
+  private constructor(store: BlockStore, pageSize: number, allocatedPages: number) {
+    this.store = store;
     this.pageSize = pageSize;
     this.allocatedPages = allocatedPages;
   }
@@ -105,34 +107,35 @@ export class Pager {
     const tear = f.tearBytes ?? -1;
     if (tear >= 0) {
       const k = Math.min(tear, bytes.length);
-      writeSync(this.fd, bytes.subarray(0, k), 0, k, index * this.pageSize);
+      this.store.writeAt(index * this.pageSize, bytes.subarray(0, k));
     }
     throw injectedCrash();
   }
 
-  // fromFd adopts an already-open (r+) fd as the backing, reading the page size from its meta header
-  // (offset 8, format.md). The host layer (file.ts) opens the fd — mapping a missing path to 58P01 —
-  // and hands it here. A header too short or a zero page size is XX001.
-  static fromFd(fd: number): Pager {
-    const header = new Uint8Array(12);
-    if (readSync(fd, header, 0, 12, 0) < 12) {
+  // fromStore adopts an already-open store as the byte backing, reading the page size from its meta
+  // header (offset 8, format.md). The host layer (file.ts) opens the host — mapping a missing path to
+  // 58P01 — and hands it here wrapped in a BlockStore. A store smaller than a meta header, or a zero
+  // page size, is XX001.
+  static fromStore(store: BlockStore): Pager {
+    const size = store.size();
+    if (size < 12) {
       throw engineError("data_corrupted", "database file smaller than a meta header");
     }
+    const header = store.readAt(0, 12);
     const pageSize = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(8, false);
     if (pageSize === 0) {
       throw engineError("data_corrupted", "zero page size in meta header");
     }
     // The allocation high-water is the current file length in pages — already past the committed
     // pageCount if a prior session preallocated slack (reused for free on this session's growth).
-    const allocatedPages = Math.floor(fstatSync(fd).size / pageSize);
-    return new Pager(fd, pageSize, allocatedPages);
+    const allocatedPages = Math.floor(size / pageSize);
+    return new Pager(store, pageSize, allocatedPages);
   }
 
   // readBlock reads one page (block index) — random access, the demand-paging read path (P6.4b).
+  // Converts the page index to a byte offset for the host's readAt.
   readBlock(index: number): Uint8Array {
-    const buf = new Uint8Array(this.pageSize);
-    readSync(this.fd, buf, 0, this.pageSize, index * this.pageSize);
-    return buf;
+    return this.store.readAt(index * this.pageSize, this.pageSize);
   }
 
   // writeBlock writes one page (bytes) at block index. Overwrites in place — persistImpl always
@@ -140,32 +143,31 @@ export class Pager {
   // preallocated slot past the old high-water). bytes is one page wide.
   writeBlock(index: number, bytes: Uint8Array): void {
     this.faultOnWrite(index, bytes);
-    writeSync(this.fd, bytes, 0, bytes.length, index * this.pageSize);
+    this.store.writeAt(index * this.pageSize, bytes);
   }
 
   // reserve ensures the file has at least minPages physically-allocated pages, growing it in fixed
-  // chunks (preallocChunkPages) of real, durably-allocated zero blocks when short. persistImpl calls
-  // it before each commit's body write with the new committed high-water, so that write — and almost
-  // every commit's — lands entirely in already-allocated space and its fdatasync (Pager.sync) pays no
-  // metadata journaling (spec/design/pager.md §7). The growth itself is a full fsync: the block
-  // allocation + the new file size must be durable before commits rely on writing into the region
-  // (else the body fdatasync would have to flush that metadata, defeating the point). Crash-safe: the
-  // preallocated pages are unreferenced zeros past the committed pageCount, so a crash before the next
-  // commit publishes simply ignores them.
+  // chunks (preallocChunkPages) when short. persistImpl calls it before each commit's body write with
+  // the new committed high-water, so that write — and almost every commit's — lands entirely in
+  // already-allocated space and its data-only sync (Pager.sync) pays no metadata journaling
+  // (spec/design/pager.md §7). The preallocation policy (the 1 MiB chunk, the chunk-aligned target) is
+  // host-independent and stays here; the durable grow itself — real zero blocks + a full fsync — is the
+  // host's setSize, the metadata barrier (hosts.md §2.1/§3). Crash-safe: the preallocated pages are
+  // unreferenced zeros past the committed pageCount, so a crash before the next commit publishes
+  // simply ignores them.
   reserve(minPages: number): void {
     if (minPages <= this.allocatedPages) return;
     const chunk = preallocChunkPages(this.pageSize);
     const target = Math.ceil(minPages / chunk) * chunk;
-    const zeros = new Uint8Array((target - this.allocatedPages) * this.pageSize);
-    writeSync(this.fd, zeros, 0, zeros.length, this.allocatedPages * this.pageSize);
-    fsyncSync(this.fd); // the allocation must be durable before in-region commits
+    this.store.setSize(target * this.pageSize);
     this.allocatedPages = target;
   }
 
-  // sync is the metadata-free durability barrier (fdatasync). Called twice per commit — body pages,
-  // then the meta — to honour the body-before-meta write-ordering rule (format.md, file.ts
-  // persistImpl). fdatasync (not fsync) so an overwrite into the preallocated region (reserve) flushes
-  // only the data, never a file-size/inode-timestamp metadata journal (spec/design/pager.md §7).
+  // sync is the metadata-free durability barrier — the host's data-only sync (fdatasync). Called twice
+  // per commit — body pages, then the meta — to honour the body-before-meta write-ordering rule
+  // (format.md, file.ts persistImpl). Data-only (not a full fsync) so an overwrite into the
+  // preallocated region (reserve) flushes only the data, never a file-size/inode-timestamp metadata
+  // journal (spec/design/pager.md §7).
   sync(): void {
     if (this.fault !== null && this.fault.point === "sync") {
       this.syncs++;
@@ -174,11 +176,11 @@ export class Pager {
         throw injectedCrash();
       }
     }
-    fdatasyncSync(this.fd);
+    this.store.sync();
   }
 
-  // close closes the open fd (close()).
+  // close releases the backing store (close()).
   close(): void {
-    closeSync(this.fd);
+    this.store.close();
   }
 }

@@ -9,6 +9,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::blockstore::FileBlockStore;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{DEFAULT_PAGE_SIZE, Database, Snapshot};
 use crate::pager::Pager;
@@ -91,7 +92,7 @@ impl Database {
             .open(path)
             .map_err(io_error)?;
         db.paging = Some(SharedPaging::new(
-            Pager::from_file(file)?,
+            Pager::from_store(Box::new(FileBlockStore::new(file)))?,
             cache_leaves(DEFAULT_CACHE_BYTES, db.page_size),
         ));
         Ok(db)
@@ -132,7 +133,7 @@ impl Database {
             }
             Err(e) => return Err(io_error(e)),
         };
-        let pager = Pager::from_file(file)?;
+        let pager = Pager::from_store(Box::new(FileBlockStore::new(file)))?;
         // Convert the byte budget to a leaf-page capacity by the file's page size; `open_paged`
         // rejects an out-of-range page size as corrupt (`cache_leaves` clamps the divisor so a
         // malformed `page_size = 0` cannot divide by zero before that check runs).
