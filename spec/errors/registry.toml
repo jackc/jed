@@ -41,6 +41,14 @@ name = "numeric_value_out_of_range"
 class = "data exception"
 template = "value out of range for type {type}"
 
+# array_position's optional start subscript must not be NULL (PostgreSQL "initial position
+# must not be null" — ../design/array-functions.md §8). {detail} carries the message.
+[[error]]
+code = "22004"
+name = "null_value_not_allowed"
+class = "data exception"
+template = "{detail}"
+
 [[error]]
 code = "22007"
 name = "invalid_datetime_format"

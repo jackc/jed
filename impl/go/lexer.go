@@ -120,6 +120,15 @@ func Lex(sql string) ([]Token, error) {
 		case c == '%':
 			tokens = append(tokens, Token{Kind: TokPercent})
 			i++
+		case c == '|':
+			// `||` is the array concatenation operator (grammar.md §39), scanned greedily as one
+			// token; a lone `|` is not part of jed's surface (no bitwise-or) — 42601.
+			if i+1 < len(b) && b[i+1] == '|' {
+				tokens = append(tokens, Token{Kind: TokConcat})
+				i += 2
+			} else {
+				return nil, NewError(SyntaxError, "unexpected character '|'")
+			}
 		case c == ':':
 			// `::` is the PostgreSQL typecast operator (grammar.md §37), scanned greedily as one
 			// token; a lone `:` is the array-slice separator a[m:n] (array.md §6).

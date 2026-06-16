@@ -1,0 +1,164 @@
+# Array function/operator surface AF2 (spec/design/array-functions.md §8): the `||` concatenation
+# operator (array∥array → array_cat, array∥element → array_append, element∥array → array_prepend) and
+# the search/edit functions array_remove/array_replace/array_position/array_positions. The functions
+# are non-strict (a NULL array → NULL, but a NULL search/replacement element is matched NULL-safely);
+# array_remove/array_position/array_positions are 1-D/empty only (multidim → 0A000); array_replace
+# works on any dimensionality; array_position returns a SUBSCRIPT in the array's lower-bound space and
+# its optional start subscript must not be NULL (22004). A bare untyped NULL operand of `||` resolves
+# to array_cat (the NULL array = identity), matching PostgreSQL. PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.int32, types.text, func.array, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], ys int32[])
+
+# Row 1: xs has a duplicate 20 (for remove/replace/position). Row 2: an EMPTY xs + a NULL ys. Row 3: a NULL xs.
+statement ok
+INSERT INTO t VALUES
+  (1, ARRAY[10,20,30,20], ARRAY[40,50]),
+  (2, '{}', NULL),
+  (3, NULL, ARRAY[7,8,9])
+
+# --- the || operator: array || array (array_cat, identity-aware) --------------------------
+query IT nosort
+SELECT id, xs || ys FROM t ORDER BY id
+----
+1
+{10,20,30,20,40,50}
+2
+{}
+3
+{7,8,9}
+
+# array || element (array_append): a NULL/empty array yields the singleton.
+query IT nosort
+SELECT id, xs || 99 FROM t ORDER BY id
+----
+1
+{10,20,30,20,99}
+2
+{99}
+3
+{99}
+
+# element || array (array_prepend).
+query IT nosort
+SELECT id, 0 || xs FROM t ORDER BY id
+----
+1
+{0,10,20,30,20}
+2
+{0}
+3
+{0}
+
+# A bare untyped NULL operand resolves to array_cat (the NULL array is the identity).
+query IT nosort
+SELECT id, xs || NULL FROM t ORDER BY id
+----
+1
+{10,20,30,20}
+2
+{}
+3
+NULL
+
+# --- array_remove (1-D/empty only; NULL-safe element) -------------------------------------
+query IT nosort
+SELECT id, array_remove(xs, 20) FROM t ORDER BY id
+----
+1
+{10,30}
+2
+{}
+3
+NULL
+
+# --- array_replace (any dimensionality; NULL-safe element) --------------------------------
+query IT nosort
+SELECT id, array_replace(xs, 20, 99) FROM t ORDER BY id
+----
+1
+{10,99,30,99}
+2
+{}
+3
+NULL
+
+# --- array_position (first match's subscript, NULL if absent) -----------------------------
+query II nosort
+SELECT id, array_position(xs, 20) FROM t ORDER BY id
+----
+1
+2
+2
+NULL
+3
+NULL
+
+# --- array_positions (every match's subscript; {} if none, NULL if the array is NULL) -----
+query IT nosort
+SELECT id, array_positions(xs, 20) FROM t ORDER BY id
+----
+1
+{2,4}
+2
+{}
+3
+NULL
+
+# --- literal forms: precedence, associativity, multidim -----------------------------------
+# || binds tighter than `=`, so `a || b = c` is `(a || b) = c`.
+query B nosort
+SELECT ARRAY[1,2] || ARRAY[3] = ARRAY[1,2,3] FROM t WHERE id = 1
+----
+true
+
+# Left-associative chaining: append/append; prepend/append.
+query TT nosort
+SELECT ARRAY[1] || 2 || 3, 0 || ARRAY[1,2] || 3 FROM t WHERE id = 1
+----
+{1,2,3}
+{0,1,2,3}
+
+# 2-D || 1-D stacks a row (array_cat along the outer dimension).
+query T nosort
+SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] || ARRAY[5,6] FROM t WHERE id = 1
+----
+{{1,2},{3,4},{5,6}}
+
+# array_position over a custom lower bound returns the SUBSCRIPT; the optional start is a subscript.
+query II nosort
+SELECT array_position('[5:7]={10,20,30}'::int32[], 20), array_position(ARRAY[10,20,30,20], 20, 3) FROM t WHERE id = 1
+----
+6
+4
+
+# array_remove preserves the lower bound (a removal shrinks the upper bound).
+query T nosort
+SELECT array_dims(array_remove('[2:4]={1,2,3}'::int32[], 2)) FROM t WHERE id = 1
+----
+[2:3]
+
+# --- errors -------------------------------------------------------------------------------
+# array_remove / array_position / array_positions on a multidimensional array → 0A000.
+statement error 0A000
+SELECT array_remove(ARRAY[ARRAY[1,2],ARRAY[3,4]], 1) FROM t WHERE id = 1
+
+statement error 0A000
+SELECT array_position(ARRAY[ARRAY[1,2],ARRAY[3,4]], 1) FROM t WHERE id = 1
+
+# A NULL start subscript (typed) → 22004.
+statement error 22004
+SELECT array_position(ARRAY[10,20,30], 20, NULL::int32) FROM t WHERE id = 1
+
+# array || element on a multidimensional array → 22000 (the array_append rule).
+statement error 22000
+SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] || 9 FROM t WHERE id = 1
+
+# array || array of incompatible dimensionalities → 2202E (the array_cat rule).
+statement error 2202E
+SELECT ARRAY[ARRAY[1,2]] || ARRAY[ARRAY[3,4,5]] FROM t WHERE id = 1
+
+# An element-type conflict / non-array operand → 42883 (text || and int || int are deferred).
+statement error 42883
+SELECT ARRAY[1,2] || ARRAY['a','b'] FROM t WHERE id = 1

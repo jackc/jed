@@ -444,7 +444,12 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			// A polymorphic array function (array-functions.md §2): its kernel id comes from
 			// arrayFuncID and its result is a reserved poly code or a scalar id.
 			_ = arrayFuncID(o.Name) // panics if the name has no kernel id
-			if _, ok := ScalarTypeFromName(o.Result); o.Result != "anyarray" && o.Result != "anyelement" && !ok {
+			// A concrete array result `<scalar>[]` (array_positions → "int32[]") is also valid.
+			concreteArray := false
+			if base, ok := strings.CutSuffix(o.Result, "[]"); ok {
+				_, concreteArray = ScalarTypeFromName(base)
+			}
+			if _, ok := ScalarTypeFromName(o.Result); o.Result != "anyarray" && o.Result != "anyelement" && !concreteArray && !ok {
 				t.Fatalf("array function %s has unhandled result code %s", o.Name, o.Result)
 			}
 			continue

@@ -20,6 +20,9 @@ const (
 	DataException
 	// NumericValueOutOfRange is 22003 — integer overflow (CLAUDE.md §8).
 	NumericValueOutOfRange
+	// NullValueNotAllowed is 22004 — PostgreSQL "initial position must not be null" for
+	// array_position's optional start subscript (spec/design/array-functions.md §8).
+	NullValueNotAllowed
 	// InvalidDatetimeFormat is 22007 — malformed timestamp/timestamptz input.
 	InvalidDatetimeFormat
 	// DatetimeFieldOverflow is 22008 — an out-of-range datetime field or a value beyond the
@@ -133,6 +136,8 @@ func (s SqlState) Code() string {
 		return "22000"
 	case NumericValueOutOfRange:
 		return "22003"
+	case NullValueNotAllowed:
+		return "22004"
 	case InvalidDatetimeFormat:
 		return "22007"
 	case DatetimeFieldOverflow:

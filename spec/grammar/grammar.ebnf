@@ -419,7 +419,7 @@ where_clause   ::= "WHERE" expr
  * tighter than the one above. The precedence is mirrored as authored data in
  * ../functions/catalog.toml (the `precedence` field) — the hand-written parsers
  * and that table must agree (see ../design/functions.md). Levels:
- *   OR  <  AND  <  NOT  <  comparison/IS NULL  <  additive  <  multiplicative
+ *   OR  <  AND  <  NOT  <  comparison/IS NULL  <  concat (||)  <  additive  <  multiplicative
  *       <  unary minus  <  postfix (`::` cast, `.field`/`.*` field selection)  <  primary
  */
 expr           ::= or_expr
@@ -453,15 +453,22 @@ not_expr       ::= "NOT" not_expr
  * "x BETWEEN a AND b AND c" is "(x BETWEEN a AND b) AND c". LIKE's pattern is one additive
  * expression. PostgreSQL binds IN/BETWEEN/LIKE slightly tighter than the comparison operators;
  * collapsing them into this one non-associative level is a documented narrowing (unobservable,
- * since chaining comparisons is already a syntax error here). */
-comparison     ::= additive ( compare_op additive
+ * since chaining comparisons is already a syntax error here). Every comparison operand is a
+ * `concat` expression, so the `||` operator (one rung tighter) is available inside them. */
+comparison     ::= concat ( compare_op concat
                             | "IS" "NOT"? "NULL"
-                            | "IS" "NOT"? "DISTINCT" "FROM" additive
-                            | "NOT"? "IN" "(" ( query_expr | additive ("," additive)* ) ")"
-                            | "NOT"? "BETWEEN" additive "AND" additive
-                            | "NOT"? "LIKE" additive )?
+                            | "IS" "NOT"? "DISTINCT" "FROM" concat
+                            | "NOT"? "IN" "(" ( query_expr | concat ("," concat)* ) ")"
+                            | "NOT"? "BETWEEN" concat "AND" concat
+                            | "NOT"? "LIKE" concat )?
 
 compare_op     ::= "=" | "<" | ">" | "<=" | ">="   /* no "<>" and no "!=" */
+
+/* The `||` array concatenation operator (../design/array-functions.md §8) — left-associative,
+ * binding tighter than the comparisons but looser than additive (PostgreSQL's "any other
+ * operator" rung; precedence 37 in ../functions/catalog.toml). It has three polymorphic array
+ * overloads (array||array, array||element, element||array); text `||` is deferred. */
+concat         ::= additive ( "||" additive )*
 
 additive       ::= multiplicative ( ("+" | "-") multiplicative )*
 

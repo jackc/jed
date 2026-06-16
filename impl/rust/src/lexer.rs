@@ -126,6 +126,16 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::Percent);
                 i += 1;
             }
+            b'|' => {
+                // `||` is the array concatenation operator (grammar.md §39), scanned greedily as one
+                // token; a lone `|` is not part of jed's surface (no bitwise-or) — 42601.
+                if bytes.get(i + 1) == Some(&b'|') {
+                    tokens.push(Token::Concat);
+                    i += 2;
+                } else {
+                    return Err(syntax("unexpected character '|'".to_string()));
+                }
+            }
             b':' => {
                 // `::` is the PostgreSQL typecast operator (grammar.md §37), scanned greedily as
                 // one token; a lone `:` is the array-slice separator `a[m:n]` (array.md §6).

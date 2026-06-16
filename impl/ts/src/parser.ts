@@ -1222,7 +1222,7 @@ class Parser {
   // dispatches on the NULL vs DISTINCT FROM keyword (spec/grammar/grammar.ebnf
   // `comparison`).
   private parseComparison(): Expr {
-    const lhs = this.parseAdditive();
+    const lhs = this.parseConcat();
     if (this.peekKeyword() === "is") {
       this.advance();
       let negated = false;
@@ -1230,11 +1230,11 @@ class Parser {
         this.advance();
         negated = true;
       }
-      // IS [NOT] DISTINCT FROM <additive> — NULL-safe equality; else IS [NOT] NULL.
+      // IS [NOT] DISTINCT FROM <concat> — NULL-safe equality; else IS [NOT] NULL.
       if (this.peekKeyword() === "distinct") {
         this.advance();
         this.expectKeyword("from");
-        return { kind: "isDistinct", lhs, rhs: this.parseAdditive(), negated };
+        return { kind: "isDistinct", lhs, rhs: this.parseConcat(), negated };
       }
       this.expectKeyword("null");
       return { kind: "isNull", operand: lhs, negated };
@@ -1260,27 +1260,28 @@ class Parser {
         this.expect("rparen");
         return { kind: "inSubquery", lhs, query, negated: predNegated };
       }
-      const list = [this.parseAdditive()];
+      const list = [this.parseConcat()];
       while (this.peek().kind === "comma") {
         this.advance();
-        list.push(this.parseAdditive());
+        list.push(this.parseConcat());
       }
       this.expect("rparen");
       return { kind: "in", lhs, list, negated: predNegated };
     }
     if (this.peekKeyword() === "between") {
       this.advance();
-      // Both bounds parse at the ADDITIVE level, which never consumes `AND` (a looser level
-      // owned by parseAnd). So the BETWEEN's structural `AND` is matched here and
-      // `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c` (grammar.md §21).
-      const lo = this.parseAdditive();
+      // Both bounds parse at the CONCAT level (one tighter than comparison), which never
+      // consumes `AND` (a looser level owned by parseAnd). So the BETWEEN's structural `AND` is
+      // matched here and `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c`
+      // (grammar.md §21); a `||` bound still works.
+      const lo = this.parseConcat();
       this.expectKeyword("and");
-      const hi = this.parseAdditive();
+      const hi = this.parseConcat();
       return { kind: "between", lhs, lo, hi, negated: predNegated };
     }
     if (this.peekKeyword() === "like") {
       this.advance();
-      const rhs = this.parseAdditive();
+      const rhs = this.parseConcat();
       return { kind: "like", lhs, rhs, negated: predNegated };
     }
     let op: BinaryOp;
@@ -1304,7 +1305,22 @@ class Parser {
         return lhs;
     }
     this.advance();
-    return binaryExpr(op, lhs, this.parseAdditive());
+    return binaryExpr(op, lhs, this.parseConcat());
+  }
+
+  // parseConcat parses the `||` array concatenation level (grammar.md §39, array-functions.md §8):
+  // one rung tighter than the comparisons, looser than additive, left-associative. Each operand is
+  // an additive expression, so `a + b || c` is `(a + b) || c`; `a || b || c` is `(a || b) || c`.
+  private parseConcat(): Expr {
+    const base = this.depth;
+    let lhs = this.parseAdditive();
+    while (this.peek().kind === "concat") {
+      this.deepen(); // each chained || is one more AST level
+      this.advance();
+      lhs = binaryExpr("concat", lhs, this.parseAdditive());
+    }
+    this.depth = base;
+    return lhs;
   }
 
   private parseAdditive(): Expr {
@@ -1811,6 +1827,8 @@ function renderToken(t: Token): string {
       return ">=";
     case "colon":
       return ":";
+    case "concat":
+      return "||";
     default: // "eof" — never inside the parentheses
       return "";
   }

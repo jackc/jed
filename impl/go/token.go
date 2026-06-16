@@ -61,6 +61,9 @@ const (
 	// Two chars, scanned greedily after "="; the legacy ":=" is not part of jed's surface
 	// (spec/design/grammar.md §17).
 	TokFatArrow
+	// TokConcat is the "||" array concatenation operator (a || b). Two "|" scanned greedily; a lone
+	// "|" is a 42601 syntax error (jed has no bitwise-or). spec/design/grammar.md §39.
+	TokConcat
 	// TokParam is a bind parameter $N — Int holds the 1-based index. The lexer rejects $0, a
 	// leading zero ($01), and $ with no following digit (42601). Bound by the host API, not the
 	// corpus (spec/design/api.md, grammar.md §5).

@@ -19,6 +19,9 @@ pub enum SqlState {
     DataException,
     /// 22003 — numeric value out of range (integer overflow; CLAUDE.md §8).
     NumericValueOutOfRange,
+    /// 22004 — null value not allowed. PostgreSQL raises it for "initial position must not be
+    /// null" — array_position's optional start subscript (spec/design/array-functions.md §8).
+    NullValueNotAllowed,
     /// 22007 — invalid datetime format (malformed timestamp / timestamptz input).
     InvalidDatetimeFormat,
     /// 22008 — datetime field overflow (an out-of-range datetime field or a value
@@ -133,6 +136,7 @@ impl SqlState {
             SqlState::CardinalityViolation => "21000",
             SqlState::DataException => "22000",
             SqlState::NumericValueOutOfRange => "22003",
+            SqlState::NullValueNotAllowed => "22004",
             SqlState::InvalidDatetimeFormat => "22007",
             SqlState::DatetimeFieldOverflow => "22008",
             SqlState::DivisionByZero => "22012",

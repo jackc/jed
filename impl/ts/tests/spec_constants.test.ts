@@ -257,13 +257,16 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
   // kernel is reached by the function name / the plan; the cross-core Rust + Go cross-check tests
   // additionally pin their per-core kernel-id maps.)
   // A scalar function's result code is "promoted" or a literal scalar-type id; a polymorphic array
-  // function's (array-functions.md §2) is the reserved "anyarray"/"anyelement" or a scalar id.
+  // function's (array-functions.md §2) is the reserved "anyarray"/"anyelement", a concrete array
+  // `<scalar>[]` (array_positions → "int32[]", §8), or a scalar id.
   for (const o of OPERATORS) {
     if (o.kind !== "function") continue;
+    const concreteArray = o.result.endsWith("[]") && scalarTypeFromName(o.result.slice(0, -2)) !== undefined;
     const ok =
       o.result === "promoted" ||
       o.result === "anyarray" ||
       o.result === "anyelement" ||
+      concreteArray ||
       scalarTypeFromName(o.result) !== undefined;
     assert.ok(ok, `function ${o.name} has unhandled result code ${o.result}`);
   }

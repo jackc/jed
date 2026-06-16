@@ -213,8 +213,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         non-strict builders (`array_append`/`array_prepend`/`array_cat`; multidim append → `22000`,
         incompatible cat → `2202E`). All three cores, oracle-checked (`suites/expr/array_functions.test`),
         capability `func.array`, registry code `22000`. → [array-functions.md](spec/design/array-functions.md)
-  - [ ] _follow-ons (each its own slice + obligations; sequenced in array-functions.md §6):_ **AF2**
-        the `||` concatenation operator + `array_remove`/`array_replace`/`array_position`/`array_positions`;
+  - [x] **AF2 — the `||` concatenation operator + the search/edit functions** — `||` as a new
+        operator `kind = "concat"` (precedence 37, between comparison 35 and additive 40; the `||`
+        token + a `parse_concat` rung; `BinaryOp::Concat` → `resolve_concat`, overload resolution over
+        the three concat rows tried cat-first so a bare NULL operand resolves to `array_cat` identity —
+        PG) reusing the AF1 builder kernels, plus `array_remove`/`array_replace`/`array_position`/
+        `array_positions` (NULL-safe element match; 1-D-only `0A000` for remove/position/positions;
+        `array_replace` any-dim; `array_position` returns a SUBSCRIPT, NULL start → `22004`). All three
+        cores, oracle-checked (`suites/expr/array_concat_search.test`), registry code `22004`, result
+        code `int32[]`. → [array-functions.md §8](spec/design/array-functions.md)
+  - [ ] _follow-ons (each its own slice + obligations; sequenced in array-functions.md §6):_
         **AF3** `unnest(anyarray)` (the SRF, polymorphic element column); **AF4** `@>`/`<@`/`&&`
         containment/overlap operators; **AF5** `ANY`/`ALL` quantified comparisons; **AF6** `VARIADIC`.
         Plus: array-of-composite elements; arrays-in-keys (`0A000`, encoding authored §8); runtime

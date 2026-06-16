@@ -43,7 +43,10 @@ export type BinaryOp =
   | "le"
   | "ge"
   | "and"
-  | "or";
+  | "or"
+  // concat is the `||` array concatenation operator (spec/design/array-functions.md §8):
+  // array∥array (array_cat), array∥element (array_append), element∥array (array_prepend).
+  | "concat";
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.
 // The parser builds it via a precedence ladder (spec/grammar/grammar.ebnf `expr`). A

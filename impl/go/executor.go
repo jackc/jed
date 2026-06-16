@@ -5271,6 +5271,10 @@ const (
 	afAppend                       // array_append(anyarray, anyelement) → anyarray; non-strict; 22000 if multidim
 	afPrepend                      // array_prepend(anyelement, anyarray) → anyarray
 	afCat                          // array_cat(anyarray, anyarray) → anyarray; 2202E on incompatible dims
+	afRemove                       // array_remove(anyarray, anyelement) → anyarray; 1-D/empty only (0A000); lb preserved
+	afReplace                      // array_replace(anyarray, anyelement, anyelement) → anyarray; any dim, shape preserved
+	afPosition                     // array_position(anyarray, anyelement[, integer]) → int32; 1-D/empty (0A000); NULL start 22004
+	afPositions                    // array_positions(anyarray, anyelement) → int32[]; 1-D/empty only (0A000)
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -6360,6 +6364,14 @@ func arrayFuncID(name string) arrayFunc {
 		return afPrepend
 	case "array_cat":
 		return afCat
+	case "array_remove":
+		return afRemove
+	case "array_replace":
+		return afReplace
+	case "array_position":
+		return afPosition
+	case "array_positions":
+		return afPositions
 	default:
 		panic("arrayFuncID: " + name + " is not a catalog array function")
 	}
@@ -6456,6 +6468,16 @@ func polyResultType(code string, elem *resolvedType) (resolvedType, error) {
 		}
 		return *elem, nil
 	default:
+		// A concrete array result `<scalar>[]` (array_positions → "int32[]"): the element type is
+		// fixed (independent of ELEM), so the result is Array(scalar) (array-functions.md §8).
+		if base, ok := strings.CutSuffix(code, "[]"); ok {
+			ty, ok := ScalarTypeFromName(base)
+			if !ok {
+				panic("polyResultType: unknown array element " + base)
+			}
+			et := resolvedTypeOf(ty)
+			return resolvedType{kind: rtArray, elem: &et}, nil
+		}
 		ty, ok := ScalarTypeFromName(code)
 		if !ok {
 			panic("polyResultType: unknown result code " + code)
@@ -6572,6 +6594,91 @@ func resolveArrayFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		return nil, resolvedType{}, err
 	}
 	return &rExpr{kind: reArrayFunc, afunc: arrayFuncID(name), sargs: rargs}, result, nil
+}
+
+// resolveConcat resolves the `||` array concatenation operator (array-functions.md §8): overload
+// resolution over the three Kind=="concat" catalog rows — (anyarray,anyarray) [array_cat],
+// (anyarray,anyelement) [array_append], (anyelement,anyarray) [array_prepend] — tried IN CATALOG
+// ORDER, first match wins. It is the operator spelling of the AF1 builders and reuses their kernels.
+//
+// Two passes like resolveArrayFunc, with one deliberate difference: a BARE untyped NULL operand is
+// left un-adapted. matchPoly defers a bare NULL in an anyarray slot, so cat-first makes `arr || NULL`
+// / `NULL || arr` resolve to array_cat (the NULL array = identity), matching PostgreSQL; adapting the
+// bare NULL to a typed element would wrongly steer it into array_append.
+func resolveConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	noOverload := func() error {
+		return NewError(UndefinedFunction,
+			"operator does not exist: the || operands are not an array and a compatible element/array")
+	}
+	// Pass 1: resolve both operands with no hint.
+	rl, lt, err := resolve(s, lhs, nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	rr, rt, err := resolve(s, rhs, nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	// The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
+	var hint *ScalarType
+	if lt.kind == rtArray {
+		if h, ok := elemScalarHint(*lt.elem); ok {
+			hint = &h
+		}
+	} else if rt.kind == rtArray {
+		if h, ok := elemScalarHint(*rt.elem); ok {
+			hint = &h
+		}
+	}
+	// Pass 2: re-resolve the NON-NULL operands with the hint so a bare literal element / untyped
+	// ARRAY[…] adapts. A bare NULL (pass-1 kind rtNull) is skipped — it must stay untyped so the
+	// cat-first overload order matches PG (see the doc comment).
+	if hint != nil {
+		if lt.kind != rtNull {
+			if rl, lt, err = resolve(s, lhs, hint, ag, params); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+		if rt.kind != rtNull {
+			if rr, rt, err = resolve(s, rhs, hint, ag, params); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+	}
+	// Try the three concat overloads in catalog order; the first whose slots unify wins.
+	tys := []resolvedType{lt, rt}
+	var desc *OperatorDesc
+	var elem *resolvedType
+	for i := range Operators {
+		o := &Operators[i]
+		if o.Kind != "concat" {
+			continue
+		}
+		if e, matched := matchPoly(o.ArgFamilies, tys); matched {
+			desc = o
+			elem = e
+			break
+		}
+	}
+	if desc == nil {
+		return nil, resolvedType{}, noOverload()
+	}
+	result, err := polyResultType(desc.Result, elem)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	// The matched overload's slot pattern selects the kernel; the operands stay in source order
+	// (array_prepend's kernel already reads vals[0]=element, vals[1]=array).
+	var fn arrayFunc
+	switch {
+	case desc.ArgFamilies[0] == "anyarray" && desc.ArgFamilies[1] == "anyarray":
+		fn = afCat
+	case desc.ArgFamilies[0] == "anyarray" && desc.ArgFamilies[1] == "anyelement":
+		fn = afAppend
+	default: // anyelement, anyarray
+		fn = afPrepend
+	}
+	return &rExpr{kind: reArrayFunc, afunc: fn, sargs: []*rExpr{rl, rr}}, result, nil
 }
 
 // aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
@@ -8090,6 +8197,8 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		}
 		return &rExpr{kind: reCompare, op: b.Op, lhs: rl, rhs: rr},
 			resolvedType{kind: rtBool}, nil
+	case OpConcat:
+		return resolveConcat(s, b.Lhs, b.Rhs, ag, params)
 	default: // OpAnd, OpOr
 		rl, lt, err := resolve(s, b.Lhs, nil, ag, params)
 		if err != nil {
@@ -8892,9 +9001,128 @@ func evalArrayFunc(fn arrayFunc, vals []Value) (Value, error) {
 		return arrayExtend(vals[0], vals[1], true)
 	case afPrepend:
 		return arrayExtend(vals[1], vals[0], false)
-	default: // afCat
+	case afCat:
 		return arrayCatValues(vals[0], vals[1])
+	case afRemove:
+		return arrayRemoveValue(vals[0], vals[1])
+	case afReplace:
+		return arrayReplaceValue(vals[0], vals[1], vals[2])
+	case afPosition:
+		var start *Value
+		if len(vals) > 2 {
+			start = &vals[2]
+		}
+		return arrayPositionValue(vals[0], vals[1], start)
+	default: // afPositions
+		return arrayPositionsValue(vals[0], vals[1])
 	}
+}
+
+// notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
+// element comparator, so NULL equals NULL and a non-NULL never equals NULL.
+func notDistinct(a, b Value) bool { return valueCmp(a, b) == 0 }
+
+// arrayRemoveValue is array_remove(a, e) (array-functions.md §8): drop every element NOT DISTINCT
+// FROM e. NULL array → NULL; 1-D/empty only (a multidimensional array is 0A000); the lower bound is
+// preserved and an all-removed result is the empty array {}.
+func arrayRemoveValue(arr, elem Value) (Value, error) {
+	if arr.Kind == ValNull {
+		return NullValue(), nil
+	}
+	a := arr.Array
+	if a.Ndim() > 1 {
+		return Value{}, NewError(FeatureNotSupported, "removing elements from multidimensional arrays is not supported")
+	}
+	kept := make([]Value, 0, len(a.Elements))
+	for _, e := range a.Elements {
+		if !notDistinct(e, elem) {
+			kept = append(kept, e)
+		}
+	}
+	if len(kept) == 0 {
+		return ArrayValueOf(EmptyArray()), nil
+	}
+	lb := int32(1)
+	if len(a.Lbounds) > 0 {
+		lb = a.Lbounds[0]
+	}
+	return ArrayValueOf(&ArrayVal{Dims: []int{len(kept)}, Lbounds: []int32{lb}, Elements: kept}), nil
+}
+
+// arrayReplaceValue is array_replace(a, from, to) (array-functions.md §8): substitute every element
+// NOT DISTINCT FROM `from` with `to`. Works on any dimensionality (the shape is preserved). NULL
+// array → NULL.
+func arrayReplaceValue(arr, from, to Value) (Value, error) {
+	if arr.Kind == ValNull {
+		return NullValue(), nil
+	}
+	a := arr.Array
+	elements := make([]Value, len(a.Elements))
+	for i, e := range a.Elements {
+		if notDistinct(e, from) {
+			elements[i] = to
+		} else {
+			elements[i] = e
+		}
+	}
+	return ArrayValueOf(&ArrayVal{Dims: append([]int(nil), a.Dims...), Lbounds: append([]int32(nil), a.Lbounds...), Elements: elements}), nil
+}
+
+// arrayPositionValue is array_position(a, e[, start]) (array-functions.md §8): the SUBSCRIPT (in the
+// array's lower-bound space) of the first element NOT DISTINCT FROM e, NULL if absent. 1-D/empty
+// only (a multidimensional array is 0A000); the optional start is a subscript to begin at, and a
+// NULL start is 22004.
+func arrayPositionValue(arr, elem Value, start *Value) (Value, error) {
+	if arr.Kind == ValNull {
+		return NullValue(), nil
+	}
+	a := arr.Array
+	if a.Ndim() > 1 {
+		return Value{}, NewError(FeatureNotSupported, "searching for elements in multidimensional arrays is not supported")
+	}
+	lb := int32(1)
+	if len(a.Lbounds) > 0 {
+		lb = a.Lbounds[0]
+	}
+	begin := 0
+	if start != nil {
+		if start.Kind == ValNull {
+			return Value{}, NewError(NullValueNotAllowed, "initial position must not be null")
+		}
+		if off := start.Int - int64(lb); off > 0 {
+			begin = int(off)
+		}
+	}
+	for i := begin; i < len(a.Elements); i++ {
+		if notDistinct(a.Elements[i], elem) {
+			return IntValue(int64(lb) + int64(i)), nil
+		}
+	}
+	return NullValue(), nil
+}
+
+// arrayPositionsValue is array_positions(a, e) (array-functions.md §8): the int32[] of every match's
+// subscript (in the array's lower-bound space), the empty array {} if none. NULL array → NULL;
+// 1-D/empty only (a multidimensional array is 0A000).
+func arrayPositionsValue(arr, elem Value) (Value, error) {
+	if arr.Kind == ValNull {
+		return NullValue(), nil
+	}
+	a := arr.Array
+	if a.Ndim() > 1 {
+		return Value{}, NewError(FeatureNotSupported, "searching for elements in multidimensional arrays is not supported")
+	}
+	lb := int32(1)
+	if len(a.Lbounds) > 0 {
+		lb = a.Lbounds[0]
+	}
+	positions := []Value{}
+	for i, e := range a.Elements {
+		if notDistinct(e, elem) {
+			positions = append(positions, IntValue(int64(lb)+int64(i)))
+		}
+	}
+	return ArrayValueOf(OneDimArray(positions)), nil
 }
 
 // arrayDimsText is the array_dims text form `[l1:u1][l2:u2]…` (no trailing `=`, unlike array_out's

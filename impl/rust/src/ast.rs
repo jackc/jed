@@ -590,6 +590,9 @@ pub enum BinaryOp {
     // logical (boolean operands → boolean result, Kleene)
     And,
     Or,
+    // array concatenation `||` (spec/design/array-functions.md §8): array∥array (array_cat),
+    // array∥element (array_append), element∥array (array_prepend). Resolved polymorphically.
+    Concat,
 }
 
 /// One ORDER BY sort key: a bare table column, a sort direction, and a resolved NULL

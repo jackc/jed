@@ -1708,3 +1708,26 @@ field }` for `.field` and `Expr::FieldStar { base }` for `.*`.
 
 Field selection adds no on-disk format change and no new cost unit — `(expr).field` is one interior
 expression node (one `operator_eval`), and `(expr).*` is N independent field-selection nodes.
+
+## 39. The `||` array concatenation operator (`a || b`)
+
+`||` is the array **concatenation operator** ([array-functions.md §8](array-functions.md)) — the
+operator spelling of the AF1 builders, with three polymorphic overloads (`array || array` →
+`array_cat`, `array || element` → `array_append`, `element || array` → `array_prepend`). It is the
+one grammar change AF2 makes:
+
+- **Token.** Two `|` are scanned greedily into a single `||` token (like `::` / `=>`). A lone `|`
+  is a `42601` syntax error — jed has no bitwise-or operator.
+- **Precedence.** A new `concat` rung sits between the comparison level and the additive level
+  ([grammar.ebnf](../grammar/grammar.ebnf) `concat`; `precedence = 37` in
+  [../functions/catalog.toml](../functions/catalog.toml)). This is PostgreSQL's "any other
+  operator" rung: `||` binds **tighter than the comparisons** (`a || b = c` is `(a || b) = c`) and
+  **looser than `+`/`-`**, and is **left-associative** (`a || b || c` is `(a || b) || c`). Every
+  comparison/`IN`/`BETWEEN`/`LIKE` operand parses at the `concat` level, so `||` is usable inside
+  them.
+- **AST + resolution.** One `BinaryOp::Concat` node; the resolver (`resolve_concat`) does overload
+  resolution over the three `concat` catalog rows in order (cat, append, prepend) and reuses the
+  AF1 array kernels. A bare untyped `NULL` operand resolves to `array_cat` (the NULL array is the
+  identity), matching PostgreSQL; a typed null element resolves to `array_append`
+  (array-functions.md §8.1). No matching overload — including text `||` and `int || int`, both
+  deferred — is `42883`.

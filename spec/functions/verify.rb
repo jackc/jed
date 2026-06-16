@@ -11,16 +11,16 @@
 #      length; null_test => arity 1; comparison => arity 2
 #   3. every arg_families entry is "any", a real `family` in scalars.toml, or a
 #      polymorphic pseudo-family (anyarray | anyelement — array-functions.md §2)
-#   4. result is a scalar id in scalars.toml ("boolean"), or a reserved id (promoted |
-#      anyarray | anyelement)
+#   4. result is a scalar id in scalars.toml ("boolean"), a reserved id (promoted |
+#      anyarray | anyelement), or a concrete array result `<scalar>[]` (array_positions → int32[])
 #   5. arg_resolution is "promote" | "none"; "promote" requires the operand pair
 #      to be comparable and the family to have a promotion rule (compare.toml)
 #   6. null is "propagates" | "detects" | "kleene" | "null_safe" | "none" (null_safe = the
 #      NULL-safe equality discipline of IS [NOT] DISTINCT FROM; none = the non-strict array
 #      builders — the kernel handles NULL, the resolver does not short-circuit it)
 #   7. every code in `errors` exists in registry.toml
-#   8. kind is a known kind (comparison | null_test | arithmetic | logical; function
-#      reserved)
+#   8. kind is a known kind (comparison | null_test | arithmetic | logical | concat;
+#      function reserved). "concat" is the `||` array concatenation operator (§8).
 #   9. each (name, arg_families) signature is unique, and each punctuation symbol is
 #      unique per (kind, arity, arg_families). Operators may be OVERLOADED across
 #      operand families — one row per family signature sharing name+symbol (e.g. `=`
@@ -66,7 +66,9 @@ POLYMORPHIC_FAMILIES = %w[anyarray anyelement].to_set
 # `none` is the non-strict discipline (array_append/prepend/cat): the resolver does NOT
 # short-circuit a NULL argument — the kernel handles NULL itself (array-functions.md §4).
 RESERVED_RESULTS = %w[promoted anyarray anyelement].to_set
-KNOWN_KINDS      = %w[comparison null_test arithmetic logical function].to_set
+# "concat" is the `||` array concatenation operator's kind (array-functions.md §8): a binary infix
+# operator with its own precedence, polymorphic over anyarray/anyelement like the array functions.
+KNOWN_KINDS      = %w[comparison null_test arithmetic logical function concat].to_set
 NULL_BEHAVIORS   = %w[propagates detects null_safe kleene none].to_set
 RESOLUTIONS      = %w[promote none].to_set
 VOLATILITIES     = %w[immutable stable volatile].to_set
@@ -147,10 +149,12 @@ def main
       fail!("operator #{id}: arg family #{fam.inspect} is not a family in scalars.toml") unless families.include?(fam)
     end
 
-    # (4) result is a scalar id or a reserved id
+    # (4) result is a scalar id, a reserved id, or a concrete array result `<scalar>[]`
+    # (array_positions → "int32[]"; the resolver reads it as Array(scalar) — array-functions.md §8).
     result = op["result"]
-    unless scalar_ids.include?(result) || RESERVED_RESULTS.include?(result)
-      fail!("operator #{id}: result #{result.inspect} is neither a scalar id nor reserved (#{RESERVED_RESULTS.to_a.join('|')})")
+    array_result = result.is_a?(String) && result.end_with?("[]") && scalar_ids.include?(result[0..-3])
+    unless scalar_ids.include?(result) || RESERVED_RESULTS.include?(result) || array_result
+      fail!("operator #{id}: result #{result.inspect} is neither a scalar id, a reserved id (#{RESERVED_RESULTS.to_a.join('|')}), nor a concrete array `<scalar>[]`")
     end
 
     # (5) arg_resolution; promote must reference a comparable pair + promotion rule

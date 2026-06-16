@@ -54,6 +54,9 @@ pub enum Token {
     /// scanned greedily after `=`; the legacy `:=` spelling is not part of jed's surface. See
     /// spec/design/grammar.md §17.
     FatArrow,
+    /// The `||` array concatenation operator (`a || b`). Two `|` scanned greedily; a lone `|` is a
+    /// 42601 syntax error (jed has no bitwise-or). See spec/design/grammar.md §39, array-functions.md §8.
+    Concat,
     /// End of input.
     Eof,
 }

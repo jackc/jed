@@ -1719,7 +1719,7 @@ func (p *Parser) parseNot() (Expr, error) {
 // `a + 1 IS NULL` binds as `(a + 1) IS NULL`. After the shared `IS` `NOT`? it dispatches
 // on the NULL vs DISTINCT FROM keyword (spec/grammar/grammar.ebnf `comparison`).
 func (p *Parser) parseComparison() (Expr, error) {
-	lhs, err := p.parseAdditive()
+	lhs, err := p.parseConcat()
 	if err != nil {
 		return Expr{}, err
 	}
@@ -1730,13 +1730,13 @@ func (p *Parser) parseComparison() (Expr, error) {
 			p.advance()
 			negated = true
 		}
-		// IS [NOT] DISTINCT FROM <additive> — NULL-safe equality; else IS [NOT] NULL.
+		// IS [NOT] DISTINCT FROM <concat> — NULL-safe equality; else IS [NOT] NULL.
 		if p.peekKeyword() == "distinct" {
 			p.advance()
 			if err := p.expectKeyword("from"); err != nil {
 				return Expr{}, err
 			}
-			rhs, err := p.parseAdditive()
+			rhs, err := p.parseConcat()
 			if err != nil {
 				return Expr{}, err
 			}
@@ -1772,15 +1772,15 @@ func (p *Parser) parseComparison() (Expr, error) {
 			}
 			return Expr{Kind: ExprInSubquery, InSubquery: &InSubqueryExpr{Lhs: lhs, Query: q, Negated: predNegated}}, nil
 		}
-		// A non-empty value list (`IN ()` — parseAdditive on `)` is a 42601 syntax error).
-		first, err := p.parseAdditive()
+		// A non-empty value list (`IN ()` — parseConcat on `)` is a 42601 syntax error).
+		first, err := p.parseConcat()
 		if err != nil {
 			return Expr{}, err
 		}
 		list := []Expr{first}
 		for p.peek().Kind == TokComma {
 			p.advance()
-			elem, err := p.parseAdditive()
+			elem, err := p.parseConcat()
 			if err != nil {
 				return Expr{}, err
 			}
@@ -1793,17 +1793,18 @@ func (p *Parser) parseComparison() (Expr, error) {
 	}
 	if p.peekKeyword() == "between" {
 		p.advance()
-		// Both bounds parse at the ADDITIVE level, which never consumes `AND` (a looser level
-		// owned by parseAnd). So the BETWEEN's structural `AND` is matched here and
-		// `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c` (grammar.md §21).
-		lo, err := p.parseAdditive()
+		// Both bounds parse at the CONCAT level (one tighter than comparison), which never
+		// consumes `AND` (a looser level owned by parseAnd). So the BETWEEN's structural `AND` is
+		// matched here and `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c`
+		// (grammar.md §21); a `||` bound still works.
+		lo, err := p.parseConcat()
 		if err != nil {
 			return Expr{}, err
 		}
 		if err := p.expectKeyword("and"); err != nil {
 			return Expr{}, err
 		}
-		hi, err := p.parseAdditive()
+		hi, err := p.parseConcat()
 		if err != nil {
 			return Expr{}, err
 		}
@@ -1811,7 +1812,7 @@ func (p *Parser) parseComparison() (Expr, error) {
 	}
 	if p.peekKeyword() == "like" {
 		p.advance()
-		rhs, err := p.parseAdditive()
+		rhs, err := p.parseConcat()
 		if err != nil {
 			return Expr{}, err
 		}
@@ -1833,11 +1834,35 @@ func (p *Parser) parseComparison() (Expr, error) {
 		return lhs, nil
 	}
 	p.advance()
-	rhs, err := p.parseAdditive()
+	rhs, err := p.parseConcat()
 	if err != nil {
 		return Expr{}, err
 	}
 	return binaryExpr(op, lhs, rhs), nil
+}
+
+// parseConcat parses the `||` array concatenation level (grammar.md §39, array-functions.md §8):
+// one rung tighter than the comparisons, looser than additive, left-associative. Each operand is an
+// additive expression, so `a + b || c` is `(a + b) || c`; `a || b || c` is `(a || b) || c`.
+func (p *Parser) parseConcat() (Expr, error) {
+	base := p.depth
+	lhs, err := p.parseAdditive()
+	if err != nil {
+		return Expr{}, err
+	}
+	for p.peek().Kind == TokConcat {
+		if err := p.deepen(); err != nil { // each chained || is one more AST level
+			return Expr{}, err
+		}
+		p.advance()
+		rhs, err := p.parseAdditive()
+		if err != nil {
+			return Expr{}, err
+		}
+		lhs = binaryExpr(OpConcat, lhs, rhs)
+	}
+	p.depth = base
+	return lhs, nil
 }
 
 func (p *Parser) parseAdditive() (Expr, error) {
@@ -2573,6 +2598,8 @@ func renderToken(t Token) string {
 		return "=>"
 	case TokColon:
 		return ":"
+	case TokConcat:
+		return "||"
 	default: // TokEof — never inside the parentheses
 		return ""
 	}

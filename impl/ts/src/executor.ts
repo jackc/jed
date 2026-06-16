@@ -3988,7 +3988,11 @@ type ArrayFuncName =
   | "array_dims"
   | "array_append"
   | "array_prepend"
-  | "array_cat";
+  | "array_cat"
+  | "array_remove"
+  | "array_replace"
+  | "array_position"
+  | "array_positions";
 
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
@@ -5073,6 +5077,14 @@ function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
   if (code === "anyelement") {
     if (elem === null) throw indeterminatePoly();
     return elem;
+  }
+  // A concrete array result `<scalar>[]` (array_positions → "int32[]"): the element type is fixed
+  // (independent of ELEM), so the result is Array(scalar) (array-functions.md §8).
+  if (code.endsWith("[]")) {
+    const base = code.slice(0, -2);
+    const bty = scalarTypeFromName(base);
+    if (bty === undefined) throw new Error("polyResultType: unknown array element " + base);
+    return { kind: "array", elem: resolvedTypeOf(bty) };
   }
   const ty = scalarTypeFromName(code);
   if (ty === undefined) throw new Error("polyResultType: unknown result code " + code);
@@ -6336,6 +6348,8 @@ function resolveBinary(
       }
       return { node: { kind: "compare", op, lhs: cl, rhs: cr }, type: { kind: "bool" } };
     }
+    case "concat":
+      return resolveConcat(scope, lhs, rhs, ag, params);
     default: {
       // "and" | "or"
       const l = resolve(scope, lhs, null, ag, params);
@@ -6345,6 +6359,65 @@ function resolveBinary(
       return { node: { kind: op === "and" ? "and" : "or", lhs: l.node, rhs: r.node }, type: { kind: "bool" } };
     }
   }
+}
+
+// resolveConcat resolves the `||` array concatenation operator (array-functions.md §8): overload
+// resolution over the three kind=="concat" catalog rows — (anyarray,anyarray) [array_cat],
+// (anyarray,anyelement) [array_append], (anyelement,anyarray) [array_prepend] — tried IN CATALOG
+// ORDER, first match wins. It is the operator spelling of the AF1 builders and reuses their kernels.
+//
+// Two passes like resolveArrayFunc, with one deliberate difference: a BARE untyped NULL operand is
+// left un-adapted. matchPoly defers a bare NULL in an anyarray slot, so cat-first makes `arr || NULL`
+// / `NULL || arr` resolve to array_cat (the NULL array = identity), matching PostgreSQL; adapting the
+// bare NULL to a typed element would wrongly steer it into array_append.
+function resolveConcat(
+  scope: Scope,
+  lhs: Expr,
+  rhs: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const noOverload = (): EngineError =>
+    engineError(
+      "undefined_function",
+      "operator does not exist: the || operands are not an array and a compatible element/array",
+    );
+  // Pass 1: resolve both operands with no hint.
+  let rl = resolve(scope, lhs, null, ag, params);
+  let rr = resolve(scope, rhs, null, ag, params);
+  // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
+  let hint: ScalarType | null = null;
+  if (rl.type.kind === "array") hint = elemScalarHint(rl.type.elem);
+  else if (rr.type.kind === "array") hint = elemScalarHint(rr.type.elem);
+  // Pass 2: re-resolve the NON-NULL operands with the hint so a bare literal element / untyped
+  // ARRAY[…] adapts. A bare NULL (pass-1 kind "null") is skipped — it must stay untyped so the
+  // cat-first overload order matches PG (see the doc comment).
+  if (hint !== null) {
+    if (rl.type.kind !== "null") rl = resolve(scope, lhs, hint, ag, params);
+    if (rr.type.kind !== "null") rr = resolve(scope, rhs, hint, ag, params);
+  }
+  // Try the three concat overloads in catalog order; the first whose slots unify wins.
+  const tys: ResolvedType[] = [rl.type, rr.type];
+  let chosen: { argFamilies: readonly string[]; result: string } | undefined;
+  let elem: ResolvedType | null = null;
+  for (const o of OPERATORS) {
+    if (o.kind !== "concat") continue;
+    const m = matchPoly(o.argFamilies, tys);
+    if (m.matched) {
+      chosen = o;
+      elem = m.elem;
+      break;
+    }
+  }
+  if (!chosen) throw noOverload();
+  const type = polyResultType(chosen.result, elem);
+  // The matched overload's slot pattern selects the kernel; the operands stay in source order
+  // (array_prepend's kernel already reads vals[0]=element, vals[1]=array).
+  let func: ArrayFuncName;
+  if (chosen.argFamilies[0] === "anyarray" && chosen.argFamilies[1] === "anyarray") func = "array_cat";
+  else if (chosen.argFamilies[0] === "anyarray" && chosen.argFamilies[1] === "anyelement") func = "array_append";
+  else func = "array_prepend";
+  return { node: { kind: "arrayFunc", func, args: [rl.node, rr.node] }, type };
 }
 
 // resolveOperandPair resolves the two operands of a binary operator, giving a bare
@@ -6983,7 +7056,82 @@ function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
       return arrayExtend(vals[1]!, vals[0]!, false);
     case "array_cat":
       return arrayCatValues(vals[0]!, vals[1]!);
+    case "array_remove":
+      return arrayRemoveValue(vals[0]!, vals[1]!);
+    case "array_replace":
+      return arrayReplaceValue(vals[0]!, vals[1]!, vals[2]!);
+    case "array_position":
+      return arrayPositionValue(vals[0]!, vals[1]!, vals.length > 2 ? vals[2]! : null);
+    case "array_positions":
+      return arrayPositionsValue(vals[0]!, vals[1]!);
   }
+}
+
+// notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
+// element comparator, so NULL equals NULL and a non-NULL never equals NULL.
+function notDistinct(a: Value, b: Value): boolean {
+  return valueCmp(a, b) === 0;
+}
+
+// arrayRemoveValue is array_remove(a, e) (array-functions.md §8): drop every element NOT DISTINCT
+// FROM e. NULL array → NULL; 1-D/empty only (a multidimensional array is 0A000); the lower bound is
+// preserved and an all-removed result is the empty array {}.
+function arrayRemoveValue(arr: Value, elem: Value): Value {
+  if (arr.kind !== "array") return nullValue();
+  if (arr.dims.length > 1) {
+    throw engineError("feature_not_supported", "removing elements from multidimensional arrays is not supported");
+  }
+  const kept = arr.elements.filter((e) => !notDistinct(e, elem));
+  if (kept.length === 0) return emptyArray();
+  const lb = arr.lbounds.length > 0 ? arr.lbounds[0]! : 1;
+  return { kind: "array", dims: [kept.length], lbounds: [lb], elements: kept };
+}
+
+// arrayReplaceValue is array_replace(a, from, to) (array-functions.md §8): substitute every element
+// NOT DISTINCT FROM `from` with `to`. Works on any dimensionality (the shape is preserved). NULL
+// array → NULL.
+function arrayReplaceValue(arr: Value, from: Value, to: Value): Value {
+  if (arr.kind !== "array") return nullValue();
+  const elements = arr.elements.map((e) => (notDistinct(e, from) ? to : e));
+  return { kind: "array", dims: [...arr.dims], lbounds: [...arr.lbounds], elements };
+}
+
+// arrayPositionValue is array_position(a, e[, start]) (array-functions.md §8): the SUBSCRIPT (in the
+// array's lower-bound space) of the first element NOT DISTINCT FROM e, NULL if absent. 1-D/empty only
+// (a multidimensional array is 0A000); the optional start is a subscript to begin at, and a NULL
+// start is 22004.
+function arrayPositionValue(arr: Value, elem: Value, start: Value | null): Value {
+  if (arr.kind !== "array") return nullValue();
+  if (arr.dims.length > 1) {
+    throw engineError("feature_not_supported", "searching for elements in multidimensional arrays is not supported");
+  }
+  const lb = arr.lbounds.length > 0 ? arr.lbounds[0]! : 1;
+  let begin = 0;
+  if (start !== null) {
+    if (start.kind === "null") throw engineError("null_value_not_allowed", "initial position must not be null");
+    const off = Number((start as { int: bigint }).int) - lb;
+    if (off > 0) begin = off;
+  }
+  for (let i = begin; i < arr.elements.length; i++) {
+    if (notDistinct(arr.elements[i]!, elem)) return intValue(BigInt(lb + i));
+  }
+  return nullValue();
+}
+
+// arrayPositionsValue is array_positions(a, e) (array-functions.md §8): the int32[] of every match's
+// subscript (in the array's lower-bound space), the empty array {} if none. NULL array → NULL;
+// 1-D/empty only (a multidimensional array is 0A000).
+function arrayPositionsValue(arr: Value, elem: Value): Value {
+  if (arr.kind !== "array") return nullValue();
+  if (arr.dims.length > 1) {
+    throw engineError("feature_not_supported", "searching for elements in multidimensional arrays is not supported");
+  }
+  const lb = arr.lbounds.length > 0 ? arr.lbounds[0]! : 1;
+  const positions: Value[] = [];
+  for (let i = 0; i < arr.elements.length; i++) {
+    if (notDistinct(arr.elements[i]!, elem)) positions.push(intValue(BigInt(lb + i)));
+  }
+  return arrayValue(positions);
 }
 
 // arrayDimsText is the array_dims text form `[l1:u1][l2:u2]…` (no trailing `=`, unlike array_out's

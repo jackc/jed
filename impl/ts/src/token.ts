@@ -27,6 +27,8 @@ export type TokenKind =
   | "colon" // : — the array-slice bound separator a[m:n] (spec/design/array.md §6)
   | "fatArrow" // => — the named-argument arrow (name => value, PostgreSQL named notation); two
   //              chars scanned greedily after "=", the legacy ":=" is not jed's surface (grammar.md §17)
+  | "concat" // || — the array concatenation operator (a || b); two "|" scanned greedily, a lone
+  //              "|" is a 42601 syntax error (jed has no bitwise-or) (spec/design/grammar.md §39)
   | "param" // a bind parameter $N — `paramIndex` holds the 1-based index (spec/design/api.md §5)
   | "eof"; // end of input
 

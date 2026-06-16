@@ -4849,6 +4849,19 @@ enum ArrayFunc {
     /// array_cat(anyarray, anyarray) → anyarray — non-strict identity-aware concatenation along
     /// the outer dimension; incompatible dimensionalities are 2202E (§3.2).
     ArrayCat,
+    /// array_remove(anyarray, anyelement) → anyarray — drop every element NOT DISTINCT FROM the
+    /// value (1-D/empty only — a multidimensional array is 0A000); the lower bound is preserved (§8).
+    ArrayRemove,
+    /// array_replace(anyarray, anyelement, anyelement) → anyarray — substitute every element NOT
+    /// DISTINCT FROM `from` with `to`; any dimensionality, shape preserved (§8).
+    ArrayReplace,
+    /// array_position(anyarray, anyelement[, integer]) → int32 — the first match's SUBSCRIPT (in the
+    /// array's lower-bound space), NULL if absent; 1-D/empty only (0A000); the optional `start`
+    /// subscript begins the scan and a NULL `start` is 22004 (§8).
+    ArrayPosition,
+    /// array_positions(anyarray, anyelement) → int32[] — the int32[] of every match's subscript
+    /// (empty {} if none); 1-D/empty only (0A000) (§8).
+    ArrayPositions,
 }
 
 /// One resolved subscript spec in an [`RExpr::Subscript`] (spec/design/array.md §6): a single
@@ -6630,6 +6643,10 @@ fn array_func_id(name: &str) -> ArrayFunc {
         "array_append" => ArrayFunc::ArrayAppend,
         "array_prepend" => ArrayFunc::ArrayPrepend,
         "array_cat" => ArrayFunc::ArrayCat,
+        "array_remove" => ArrayFunc::ArrayRemove,
+        "array_replace" => ArrayFunc::ArrayReplace,
+        "array_position" => ArrayFunc::ArrayPosition,
+        "array_positions" => ArrayFunc::ArrayPositions,
         _ => unreachable!("array_func_id: {name} is not a catalog array function"),
     }
 }
@@ -6700,6 +6717,14 @@ fn poly_result_type(code: &str, elem: &Option<ResolvedType>) -> Result<ResolvedT
             Some(e) => Ok(e.clone()),
             None => Err(indeterminate_poly()),
         },
+        // A concrete array result `<scalar>[]` (array_positions → "int32[]"): the element type is
+        // fixed (independent of ELEM), so the result is `Array(scalar)` (array-functions.md §8).
+        c if c.ends_with("[]") => {
+            let base = &c[..c.len() - 2];
+            let st = ScalarType::from_name(base)
+                .unwrap_or_else(|| unreachable!("poly_result_type: unknown array element {base}"));
+            Ok(ResolvedType::Array(Box::new(resolved_type_of(st))))
+        }
         _ => Ok(resolved_type_of(
             ScalarType::from_name(code)
                 .unwrap_or_else(|| unreachable!("poly_result_type: unknown result code {code}")),
@@ -8566,7 +8591,77 @@ fn resolve_binary(
             };
             Ok((node, ResolvedType::Bool))
         }
+        BinaryOp::Concat => resolve_concat(scope, lhs, rhs, agg, params),
     }
+}
+
+/// Resolve the `||` array concatenation operator (array-functions.md §8): overload resolution over
+/// the three `concat` catalog rows — `(anyarray,anyarray)` [array_cat], `(anyarray,anyelement)`
+/// [array_append], `(anyelement,anyarray)` [array_prepend] — tried IN CATALOG ORDER, first match
+/// wins. It is the operator spelling of the AF1 builders and reuses their kernels.
+///
+/// Two passes like `resolve_array_func`, with one deliberate difference: a **bare untyped NULL**
+/// operand is left un-adapted. `match_poly` defers a bare NULL in an `anyarray` slot, so cat-first
+/// makes `arr || NULL` / `NULL || arr` resolve to array_cat (the NULL array = identity), matching
+/// PostgreSQL; adapting the bare NULL to a typed element would wrongly steer it into array_append.
+fn resolve_concat(
+    scope: &Scope,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let no_overload = || {
+        EngineError::new(
+            SqlState::UndefinedFunction,
+            "operator does not exist: the || operands are not an array and a compatible element/array",
+        )
+    };
+
+    // Pass 1: resolve both operands with no hint.
+    let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
+    let (mut rr, mut rt) = resolve(scope, rhs, None, agg, params)?;
+    // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
+    let hint = match (&lt, &rt) {
+        (ResolvedType::Array(e), _) => elem_scalar_hint(e),
+        (_, ResolvedType::Array(e)) => elem_scalar_hint(e),
+        _ => None,
+    };
+    // Pass 2: re-resolve the NON-NULL operands with the hint so a bare literal element / untyped
+    // `ARRAY[…]` adapts to the array's element type. A bare NULL (pass-1 type `Null`) is skipped —
+    // it must stay untyped so the cat-first overload order matches PG (see the doc comment).
+    if let Some(s) = hint {
+        if !matches!(lt, ResolvedType::Null) {
+            (rl, lt) = resolve(scope, lhs, Some(s), agg, params)?;
+        }
+        if !matches!(rt, ResolvedType::Null) {
+            (rr, rt) = resolve(scope, rhs, Some(s), agg, params)?;
+        }
+    }
+
+    // Try the three concat overloads in catalog order; the first whose slots unify wins.
+    let tys = [lt, rt];
+    let overload = OPERATORS
+        .iter()
+        .filter(|o| o.kind == "concat")
+        .find_map(|o| match_poly(o.arg_families, &tys).map(|elem| (o, elem)));
+    let (desc, elem) = overload.ok_or_else(no_overload)?;
+    let result = poly_result_type(desc.result, &elem)?;
+    // The matched overload's slot pattern selects the kernel; the operands stay in source order
+    // (array_prepend's kernel already reads vals[0]=element, vals[1]=array).
+    let func = match desc.arg_families {
+        ["anyarray", "anyarray"] => ArrayFunc::ArrayCat,
+        ["anyarray", "anyelement"] => ArrayFunc::ArrayAppend,
+        ["anyelement", "anyarray"] => ArrayFunc::ArrayPrepend,
+        _ => unreachable!("concat overload has an unexpected slot pattern"),
+    };
+    Ok((
+        RExpr::ArrayFunc {
+            func,
+            args: vec![rl, rr],
+        },
+        result,
+    ))
 }
 
 /// Resolve the two operands of a binary operator, giving each adaptable literal the other
@@ -9082,7 +9177,141 @@ fn eval_array_func(func: &ArrayFunc, vals: &[Value]) -> Result<Value> {
         ArrayFunc::ArrayAppend => array_extend(&vals[0], &vals[1], true),
         ArrayFunc::ArrayPrepend => array_extend(&vals[1], &vals[0], false),
         ArrayFunc::ArrayCat => array_cat_values(&vals[0], &vals[1]),
+        ArrayFunc::ArrayRemove => array_remove_value(&vals[0], &vals[1]),
+        ArrayFunc::ArrayReplace => array_replace_value(&vals[0], &vals[1], &vals[2]),
+        ArrayFunc::ArrayPosition => array_position_value(&vals[0], &vals[1], vals.get(2)),
+        ArrayFunc::ArrayPositions => array_positions_value(&vals[0], &vals[1]),
     }
+}
+
+/// IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total element
+/// comparator (the array-element / btree equality), so `NULL` equals `NULL` and a non-NULL never
+/// equals `NULL`. For jed's element types this agrees with PostgreSQL's per-type btree equality.
+fn not_distinct(a: &Value, b: &Value) -> bool {
+    value_cmp(a, b) == std::cmp::Ordering::Equal
+}
+
+/// array_remove(a, e) (array-functions.md §8): drop every element NOT DISTINCT FROM `e`. NULL array
+/// → NULL; **1-D/empty only** (a multidimensional array is 0A000); the lower bound is preserved and
+/// an all-removed result is the empty array `{}`.
+fn array_remove_value(arr: &Value, elem: &Value) -> Result<Value> {
+    let a = match arr {
+        Value::Null => return Ok(Value::Null),
+        Value::Array(a) => a,
+        _ => unreachable!("array_remove: array operand"),
+    };
+    if a.ndim() > 1 {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "removing elements from multidimensional arrays is not supported",
+        ));
+    }
+    let kept: Vec<Value> = a
+        .elements
+        .iter()
+        .filter(|e| !not_distinct(e, elem))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return Ok(Value::Array(ArrayVal::empty()));
+    }
+    let lb = a.lbounds.first().copied().unwrap_or(1);
+    Ok(Value::Array(ArrayVal {
+        dims: vec![kept.len()],
+        lbounds: vec![lb],
+        elements: kept,
+    }))
+}
+
+/// array_replace(a, from, to) (array-functions.md §8): substitute every element NOT DISTINCT FROM
+/// `from` with `to`. Works on **any** dimensionality — the shape (dims/lbounds) is preserved and
+/// only matching element values change. NULL array → NULL.
+fn array_replace_value(arr: &Value, from: &Value, to: &Value) -> Result<Value> {
+    let a = match arr {
+        Value::Null => return Ok(Value::Null),
+        Value::Array(a) => a,
+        _ => unreachable!("array_replace: array operand"),
+    };
+    let elements = a
+        .elements
+        .iter()
+        .map(|e| {
+            if not_distinct(e, from) {
+                to.clone()
+            } else {
+                e.clone()
+            }
+        })
+        .collect();
+    Ok(Value::Array(ArrayVal {
+        dims: a.dims.clone(),
+        lbounds: a.lbounds.clone(),
+        elements,
+    }))
+}
+
+/// array_position(a, e[, start]) (array-functions.md §8): the SUBSCRIPT (in the array's lower-bound
+/// space) of the first element NOT DISTINCT FROM `e`, NULL if absent. **1-D/empty only** (a
+/// multidimensional array is 0A000); the optional `start` is a subscript to begin the scan at, and a
+/// NULL `start` is 22004.
+fn array_position_value(arr: &Value, elem: &Value, start: Option<&Value>) -> Result<Value> {
+    let a = match arr {
+        Value::Null => return Ok(Value::Null),
+        Value::Array(a) => a,
+        _ => unreachable!("array_position: array operand"),
+    };
+    if a.ndim() > 1 {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "searching for elements in multidimensional arrays is not supported",
+        ));
+    }
+    let lb = a.lbounds.first().copied().unwrap_or(1);
+    // The scan's 0-based start offset into `elements`: by default the array's lower bound; an
+    // explicit `start` is a SUBSCRIPT, so the offset is `start - lb` (clamped to >= 0).
+    let begin = match start {
+        None => 0usize,
+        Some(Value::Null) => {
+            return Err(EngineError::new(
+                SqlState::NullValueNotAllowed,
+                "initial position must not be null",
+            ));
+        }
+        Some(Value::Int(s)) => (s - lb as i64).max(0) as usize,
+        _ => unreachable!("array_position: start is the integer family"),
+    };
+    for (i, e) in a.elements.iter().enumerate().skip(begin) {
+        if not_distinct(e, elem) {
+            return Ok(Value::Int(lb as i64 + i as i64));
+        }
+    }
+    Ok(Value::Null)
+}
+
+/// array_positions(a, e) (array-functions.md §8): the int32[] of every match's subscript (in the
+/// array's lower-bound space), the empty array `{}` if none. NULL array → NULL; **1-D/empty only**
+/// (a multidimensional array is 0A000).
+fn array_positions_value(arr: &Value, elem: &Value) -> Result<Value> {
+    let a = match arr {
+        Value::Null => return Ok(Value::Null),
+        Value::Array(a) => a,
+        _ => unreachable!("array_positions: array operand"),
+    };
+    if a.ndim() > 1 {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "searching for elements in multidimensional arrays is not supported",
+        ));
+    }
+    let lb = a.lbounds.first().copied().unwrap_or(1);
+    let positions: Vec<Value> = a
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| not_distinct(e, elem))
+        .map(|(i, _)| Value::Int(lb as i64 + i as i64))
+        .collect();
+    Ok(Value::Array(ArrayVal::one_dim(positions)))
 }
 
 /// The `array_dims` text form `[l1:u1][l2:u2]…` (no trailing `=`, unlike `array_out`'s prefix —
@@ -11811,9 +12040,14 @@ mod registry_tests {
                 // A polymorphic array function (array-functions.md §2): its kernel id comes from
                 // `array_func_id` and its result is a reserved poly code or a scalar id.
                 let _ = array_func_id(o.name);
+                let concrete_array = o
+                    .result
+                    .strip_suffix("[]")
+                    .is_some_and(|base| ScalarType::from_name(base).is_some());
                 assert!(
                     o.result == "anyarray"
                         || o.result == "anyelement"
+                        || concrete_array
                         || ScalarType::from_name(o.result).is_some(),
                     "array function {} has unhandled result code {}",
                     o.name,

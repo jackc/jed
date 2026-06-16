@@ -508,6 +508,10 @@ const (
 	OpAnd
 	// OpOr is OR.
 	OpOr
+	// OpConcat is the `||` array concatenation operator (spec/design/array-functions.md §8):
+	// array∥array (array_cat), array∥element (array_append), element∥array (array_prepend),
+	// resolved polymorphically.
+	OpConcat
 )
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.

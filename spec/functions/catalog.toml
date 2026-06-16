@@ -2067,6 +2067,120 @@ result         = "anyarray"
 null           = "none"
 errors         = ["2202E"]
 
+# === array function/operator surface AF2 (../design/array-functions.md §8) ===================
+# The search/edit functions (array_remove/array_replace/array_position/array_positions) and the
+# `||` concatenation operator. Like AF1 these are polymorphic over anyarray/anyelement (§2) and
+# NON-STRICT (null = "none" — the kernel handles NULL): a NULL array argument yields NULL, but a
+# NULL search/replacement element is a real comparable value (matched with IS NOT DISTINCT FROM,
+# so it can find/remove/replace NULL elements). All rules are oracle-pinned (postgres:18).
+#
+# Search/edit: array_remove(a, e) drops every element NOT DISTINCT FROM e (1-D or empty only — a
+# multidimensional array is 0A000); array_replace(a, from, to) substitutes (any dimensionality —
+# shape preserved); array_position(a, e [, start]) returns the first element's SUBSCRIPT (in the
+# array's own lower-bound space, NULL if absent — 0A000 if multidimensional; the optional start is
+# a subscript to begin at, and a NULL start is 22004); array_positions(a, e) returns the int32[]
+# of every match's subscript (empty {} if none, NULL if a is NULL — 0A000 if multidimensional).
+# array_position returns int32, array_positions int32[] (PG's integer / integer[]); both keep
+# jed's integer-result convention regardless of element type (§3.1).
+
+[[operator]]
+name           = "array_remove"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyarray", "anyelement"]
+arg_resolution = "none"
+result         = "anyarray"
+null           = "none"
+errors         = ["0A000"]
+
+[[operator]]
+name           = "array_replace"
+kind           = "function"
+arity          = 3
+arg_families   = ["anyarray", "anyelement", "anyelement"]
+arg_resolution = "none"
+result         = "anyarray"
+null           = "none"
+errors         = []
+
+[[operator]]
+name           = "array_position"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyarray", "anyelement"]
+arg_resolution = "none"
+result         = "int32"
+null           = "none"
+errors         = ["0A000"]
+
+[[operator]]
+name           = "array_position"
+kind           = "function"
+arity          = 3
+arg_families   = ["anyarray", "anyelement", "integer"]
+arg_resolution = "none"
+result         = "int32"
+null           = "none"
+errors         = ["0A000", "22004"]
+
+[[operator]]
+name           = "array_positions"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyarray", "anyelement"]
+arg_resolution = "none"
+result         = "int32[]"
+null           = "none"
+errors         = ["0A000"]
+
+# --- the `||` array concatenation operator (../design/array-functions.md §8) -----------------
+# A new operator KIND "concat": a binary infix `||` with its own precedence (37 — tighter than the
+# comparisons at 35, looser than additive at 40, matching PostgreSQL's "any other operator" rung).
+# It is the operator spelling of the AF1 builders, with three polymorphic overloads sharing the
+# `||` symbol and the AST node `concat`. The hand-written resolver tries them IN THIS ORDER and
+# takes the first whose anyarray/anyelement slots unify (§2). Cat-first is load-bearing: a bare
+# untyped NULL operand DEFERS in an anyarray slot (binds nothing), so `arr || NULL` / `NULL || arr`
+# resolve to array_cat (NULL array = identity), exactly as PostgreSQL does — while a TYPED null
+# element (`arr || NULL::int32`) is a concrete anyelement and resolves to array_append. The three
+# overloads reuse the AF1 array_cat / array_append / array_prepend kernels (and their 2202E / 22000
+# errors). Element-type / non-array operands that match no overload are 42883 (text `||` deferred).
+
+[[operator]]
+name           = "concat"
+symbol         = "||"
+kind           = "concat"
+arity          = 2
+arg_families   = ["anyarray", "anyarray"]
+arg_resolution = "none"
+result         = "anyarray"
+null           = "none"
+precedence     = 37
+errors         = ["2202E"]
+
+[[operator]]
+name           = "concat"
+symbol         = "||"
+kind           = "concat"
+arity          = 2
+arg_families   = ["anyarray", "anyelement"]
+arg_resolution = "none"
+result         = "anyarray"
+null           = "none"
+precedence     = 37
+errors         = ["22000"]
+
+[[operator]]
+name           = "concat"
+symbol         = "||"
+kind           = "concat"
+arity          = 2
+arg_families   = ["anyelement", "anyarray"]
+arg_resolution = "none"
+result         = "anyarray"
+null           = "none"
+precedence     = 37
+errors         = ["22000"]
+
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
 # SINGLE value. They are NOT operators — no infix symbol, no precedence, no

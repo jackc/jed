@@ -10,13 +10,15 @@
 > `postgres:18` oracle — several array-function NULL/shape rules are subtle (§3) and must be
 > oracle-checked, not guessed.
 >
-> **Status: AF1 landed.** The **polymorphic resolution machinery** (§2) plus the
-> *scalar-function-shaped* surface — introspection (`array_ndims`, `array_length`, `array_lower`,
+> **Status: AF1 + AF2 landed.** AF1 — the **polymorphic resolution machinery** (§2) plus the
+> *scalar-function-shaped* surface: introspection (`array_ndims`, `array_length`, `array_lower`,
 > `array_upper`, `cardinality`, `array_dims`) and builders (`array_append`, `array_prepend`,
-> `array_cat`) — are implemented across all three cores, oracle-checked
-> (`suites/expr/array_functions.test`), capability `func.array`. The remaining slices (§6) —
-> `||`, `unnest`, `@>`/`<@`/`&&`, `ANY`/`ALL`, `VARIADIC` — are sequenced follow-ons, each its
-> own vertical slice.
+> `array_cat`). AF2 (§8) — the **`||` concatenation operator** and the **search/edit functions**
+> (`array_remove`, `array_replace`, `array_position`, `array_positions`). Both are implemented
+> across all three cores, oracle-checked (`suites/expr/array_functions.test`,
+> `suites/expr/array_concat_search.test`), capability `func.array`. The remaining slices (§6) —
+> `unnest`, `@>`/`<@`/`&&`, `ANY`/`ALL`, `VARIADIC` — are sequenced follow-ons, each its own
+> vertical slice.
 
 ## 1. Why a new layer
 
@@ -227,6 +229,21 @@ corpus lands, in [../conformance/oracle_overrides.toml](../conformance/oracle_ov
    (narrower) element type second (`array_cat(ARRAY[1,2], int32[]_col)` → `42883`), where PG would
    find a common type. jed is strict here (the same posture as its array comparison, which requires
    element-family compatibility); put the typed/column array first.
+9. **`||` is array-only — text `||` and `int || int` are deferred** (AF2, §8). jed has no text
+   concatenation operator and no implicit element→text cast yet, so `'a' || 'b'` and `1 || 2` are
+   `42883` (PG would return `'ab'` / `'12'`). The `||` overloads this slice are exactly the three
+   array forms; text `||` lands with the string-function surface (types.md §11).
+10. **Search/edit comparison is IS NOT DISTINCT FROM** (AF2, §8) — `array_remove`/`array_replace`/
+    `array_position`/`array_positions` match an element with NULL-safe equality (jed reuses its total
+    element comparator, `value_cmp == Equal`), so a NULL target finds/removes/replaces NULL elements
+    and a non-NULL target never matches a NULL element. This is PG's behavior (oracle-pinned), and
+    for jed's element types (int/text/…) the total comparator and PG's per-type btree equality agree.
+11. **`array_remove`/`array_position`/`array_positions` are 1-D only** (AF2, §8) — a multidimensional
+    array argument is `0A000` (PG *"removing/searching … in multidimensional arrays is not
+    supported"*), matching PG's code exactly. `array_replace` works on **any** dimensionality (it
+    substitutes element-wise, preserving shape). The `array_position` *subscript* result and the
+    optional `start` argument are in the array's own lower-bound space (so `array_position('[5:7]=
+    {10,20,30}', 20)` is `6`, not `2`); a NULL `start` is `22004`, not a NULL result.
 
 ## 6. Delivery (sub-slices)
 
@@ -237,9 +254,11 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
   `array_length`, `array_lower`, `array_upper`, `cardinality`, `array_dims`, `array_append`,
   `array_prepend`, `array_cat`). No grammar change. All three cores + `func.array` capability +
   `suites/expr/array_functions.test`.
-- **AF2** — the **`||` concatenation operator** (array∥array, element∥array, array∥element — a new
-  catalog operator with precedence + polymorphic operator dispatch) and the search/edit functions
-  `array_remove`, `array_replace`, `array_position`, `array_positions`.
+- **AF2 ✅** (§8) — the **`||` concatenation operator** (array∥array, element∥array, array∥element —
+  a new operator `kind = "concat"` with precedence 37 + polymorphic operator dispatch that reuses
+  the AF1 builder kernels) and the search/edit functions `array_remove`, `array_replace`,
+  `array_position`, `array_positions`. One grammar change (the `||` token + a `parse_concat`
+  precedence rung); all three cores + `suites/expr/array_concat_search.test`.
 - **AF3** — **`unnest(anyarray)`** the set-returning function: generalizes the `generate_series`
   SRF machinery ([functions.md §10](functions.md)) to a **polymorphic element-type** output column
   and a per-element row generator (FROM-clause position first; the SELECT-list SRF, `LATERAL`, and
@@ -255,10 +274,79 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
 
 | Failure | Code |
 |---|---|
-| No array-function overload matches the argument types (incl. element-type conflict `array_cat(int32[], text[])`, or a non-array where `anyarray` is required) | `42883` undefined_function |
-| `array_append`/`array_prepend` on a multidimensional array | `22000` data_exception |
-| `array_cat` of incompatible dimensionalities | `2202E` array_subscript_error |
+| No array-function/`\|\|`-overload matches the argument types (incl. element-type conflict `array_cat(int32[], text[])`, a non-array where `anyarray` is required, or text/`int\|\|int` `\|\|`) | `42883` undefined_function |
+| `array_append`/`array_prepend` / `array \|\| element` on a multidimensional array | `22000` data_exception |
+| `array_cat` / `array \|\| array` of incompatible dimensionalities | `2202E` array_subscript_error |
+| `array_remove`/`array_position`/`array_positions` on a multidimensional array (AF2) | `0A000` feature_not_supported |
+| `array_position(a, e, start)` with a NULL `start` (AF2) | `22004` null_value_not_allowed |
 | Polymorphic type undeterminable (all polymorphic args untyped `NULL`) | `42P18` indeterminate_datatype |
 
 `22000` (`data_exception`) is registered in [../errors/registry.toml](../errors/registry.toml)
-(added with AF1); `2202E`, `42883`, `42P18` already existed.
+(added with AF1); `22004` (`null_value_not_allowed`) was added with AF2; `0A000`, `2202E`, `42883`,
+`42P18` already existed.
+
+## 8. AF2 — the `||` operator and the search/edit functions
+
+AF2 spends the §2 machinery on the rest of the *expression-position* array surface: the **`||`
+concatenation operator** and four **search/edit functions**. Every rule is oracle-pinned
+(`postgres:18`). Like AF1 the functions are ordinary `kind = "function"` rows reached through
+`resolve_array_func`; the `||` operator is a new `kind = "concat"` with its own precedence and a
+hand-written `resolve_concat`.
+
+### 8.1 The `||` concatenation operator
+
+`||` is the **operator spelling of the AF1 builders** — PostgreSQL defines it as three operator
+declarations backed by `array_cat` / `array_append` / `array_prepend`, and jed does the same. It is
+the surface's one grammar change:
+
+- **Lexer** — a new `||` token (two `|` scanned greedily, like `::`/`=>`); a lone `|` stays a
+  `42601` syntax error (jed has no bitwise-or).
+- **Precedence** — a new `parse_concat` rung between the comparison level (35) and the additive
+  level (40), so `precedence = 37`. This matches PostgreSQL's "any other operator" rung: `||` binds
+  **tighter than the comparisons** (`a || b = c` is `(a || b) = c`) and **looser than `+`/`-`**, and
+  is **left-associative** (`a || b || c` is `(a || b) || c`). The comparison/`IN`/`BETWEEN`/`LIKE`
+  operands all parse at the concat level, so `||` is available inside them.
+- **AST + dispatch** — one new `BinaryOp::Concat` node; `resolve_binary` routes it to
+  `resolve_concat`.
+
+**`resolve_concat`** is overload resolution over the three `concat` catalog rows, tried **in catalog
+order — `(anyarray,anyarray)` [cat], `(anyarray,anyelement)` [append], `(anyelement,anyarray)`
+[prepend]** — taking the first whose slots unify (§2 `match_poly`). It:
+
+1. resolves both operands with no hint;
+2. computes the element hint from the **first operand that is an array** and re-resolves the
+   **non-NULL** operands with it (so `col || 40` adapts `40` to the element type, and `col ||
+   ARRAY[…]` adapts the constructor) — a **bare untyped `NULL` operand is deliberately left
+   un-adapted** (see below);
+3. tries the three overloads in order; the first match selects the kernel (`array_cat` /
+   `array_append` / `array_prepend`, called with the operands in source order) and the result type
+   (`anyarray` → `ELEM[]`). No match is `42883`.
+
+**Cat-first ordering is load-bearing.** `match_poly` *defers* a bare untyped `NULL` in an `anyarray`
+slot (it binds nothing), so `arr || NULL` and `NULL || arr` match the **cat** overload first and
+become `array_cat(arr, NULL) = arr` (the NULL array is the identity) — exactly PostgreSQL. A
+**typed** null element (`arr || NULL::int32`) is a concrete `anyelement`, never defers, so cat
+fails and **append** is chosen → `{…,NULL}`. Leaving the bare NULL un-adapted in step 2 is what
+preserves this: adapting it to a typed null would wrongly steer `arr || NULL` into append. (This is
+the one place `resolve_concat` differs from `resolve_array_func`, whose overload is *fixed*, so it
+adapts the bare NULL into the element slot — `array_append(arr, NULL)` is `{…,NULL}`.)
+
+### 8.2 The search/edit functions
+
+| function | signature | result | notes |
+|---|---|---|---|
+| `array_remove` | `(anyarray, anyelement)` | `anyarray` | drop every element NOT DISTINCT FROM `e`; **1-D/empty only** (multi-D `0A000`); lower bound preserved |
+| `array_replace` | `(anyarray, anyelement, anyelement)` | `anyarray` | substitute every element NOT DISTINCT FROM `from` with `to`; **any dimensionality**, shape preserved |
+| `array_position` | `(anyarray, anyelement [, integer])` | `int32` | first match's **subscript** (lower-bound space), else `NULL`; **1-D/empty only** (`0A000`); optional `start` subscript, NULL `start` is `22004` |
+| `array_positions` | `(anyarray, anyelement)` | `int32[]` | the `int32[]` of **every** match's subscript (empty `{}` if none); **1-D/empty only** (`0A000`) |
+
+All four are **non-strict** (`null = "none"`): a `NULL` array argument yields `NULL` (or, for
+`array_position`/`array_positions`, `NULL`), but a `NULL` search/replacement element is a real
+comparable value — matched with the NULL-safe comparator (§5 #10), so it finds/removes/replaces
+`NULL` elements. The element is adapted to the array's element type by the same literal-adaptation
+hint AF1 uses, so `array_remove(int32[]_col, 2)` adapts `2`.
+
+`array_position`/`array_positions` return jed's `int32` / `int32[]` (PostgreSQL's `integer` /
+`integer[]`) regardless of the array's element type, matching the §3.1 introspection convention.
+`int32[]` is a new concrete-array `result` code (`<scalar>[]`), read by the resolver as
+`Array(scalar)` and admitted by `verify.rb` as a fourth `result` form.

@@ -1375,7 +1375,7 @@ impl Parser {
     /// `(a + 1) IS NULL`. After the shared `IS` `NOT`? the parser dispatches on the
     /// `NULL` vs `DISTINCT FROM` keyword (spec/grammar/grammar.ebnf `comparison`).
     fn parse_comparison(&mut self) -> Result<Expr> {
-        let lhs = self.parse_additive()?;
+        let lhs = self.parse_concat()?;
         if self.peek_keyword().as_deref() == Some("is") {
             self.advance();
             let negated = if self.peek_keyword().as_deref() == Some("not") {
@@ -1384,11 +1384,11 @@ impl Parser {
             } else {
                 false
             };
-            // IS [NOT] DISTINCT FROM <additive> — NULL-safe equality; else IS [NOT] NULL.
+            // IS [NOT] DISTINCT FROM <concat> — NULL-safe equality; else IS [NOT] NULL.
             if self.peek_keyword().as_deref() == Some("distinct") {
                 self.advance();
                 self.expect_keyword("from")?;
-                let rhs = self.parse_additive()?;
+                let rhs = self.parse_concat()?;
                 return Ok(Expr::IsDistinctFrom {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
@@ -1418,7 +1418,7 @@ impl Parser {
             self.expect(&Token::LParen)?;
             // `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by
             // a leading `SELECT`; otherwise a non-empty value list (`IN ()` is rejected:
-            // parse_additive on `)` is 42601).
+            // parse_concat on `)` is 42601).
             if self.peek_keyword().as_deref() == Some("select") {
                 let q = self.parse_subquery()?;
                 self.expect(&Token::RParen)?;
@@ -1428,10 +1428,10 @@ impl Parser {
                     negated,
                 });
             }
-            let mut list = vec![self.parse_additive()?];
+            let mut list = vec![self.parse_concat()?];
             while matches!(self.peek(), Token::Comma) {
                 self.advance();
-                list.push(self.parse_additive()?);
+                list.push(self.parse_concat()?);
             }
             self.expect(&Token::RParen)?;
             return Ok(Expr::In {
@@ -1442,12 +1442,13 @@ impl Parser {
         }
         if self.peek_keyword().as_deref() == Some("between") {
             self.advance();
-            // Both bounds parse at the ADDITIVE level, which never consumes `AND` (a looser
-            // level owned by parse_and). So the BETWEEN's structural `AND` is matched here and
-            // `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c` (grammar.md §21).
-            let lo = self.parse_additive()?;
+            // Both bounds parse at the CONCAT level (one tighter than comparison), which never
+            // consumes `AND` (a looser level owned by parse_and). So the BETWEEN's structural `AND`
+            // is matched here and `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c`
+            // (grammar.md §21); a `||` bound (`x BETWEEN a || b AND c`) still works.
+            let lo = self.parse_concat()?;
             self.expect_keyword("and")?;
-            let hi = self.parse_additive()?;
+            let hi = self.parse_concat()?;
             return Ok(Expr::Between {
                 lhs: Box::new(lhs),
                 lo: Box::new(lo),
@@ -1457,7 +1458,7 @@ impl Parser {
         }
         if self.peek_keyword().as_deref() == Some("like") {
             self.advance();
-            let rhs = self.parse_additive()?;
+            let rhs = self.parse_concat()?;
             return Ok(Expr::Like {
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
@@ -1475,11 +1476,27 @@ impl Parser {
         match op {
             Some(op) => {
                 self.advance();
-                let rhs = self.parse_additive()?;
+                let rhs = self.parse_concat()?;
                 Ok(binary(op, lhs, rhs))
             }
             None => Ok(lhs),
         }
+    }
+
+    /// The `||` array concatenation level (grammar.md §39, array-functions.md §8): one rung tighter
+    /// than the comparisons, looser than additive, left-associative. Each operand is an additive
+    /// expression, so `a + b || c` is `(a + b) || c`; chaining `a || b || c` is `(a || b) || c`.
+    fn parse_concat(&mut self) -> Result<Expr> {
+        let base = self.depth;
+        let mut lhs = self.parse_additive()?;
+        while matches!(self.peek(), Token::Concat) {
+            self.deepen()?; // each chained || is one more AST level
+            self.advance();
+            let rhs = self.parse_additive()?;
+            lhs = binary(BinaryOp::Concat, lhs, rhs);
+        }
+        self.depth = base;
+        Ok(lhs)
     }
 
     fn parse_additive(&mut self) -> Result<Expr> {
@@ -2117,6 +2134,7 @@ fn render_token(t: &Token) -> String {
         Token::DoubleColon => "::".into(),
         Token::Colon => ":".into(),
         Token::FatArrow => "=>".into(),
+        Token::Concat => "||".into(),
         Token::Eof => String::new(),
     }
 }
