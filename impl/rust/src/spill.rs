@@ -409,6 +409,16 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             }
             Ok(())
         }
+        // Array — tag 16: element count then each element value, recursive (spec/design/array.md).
+        // Internal merge-sort scratch format only, so the recursion needs no type context.
+        Value::Array(elems) => {
+            w.write_all(&[16])?;
+            write_u32(w, elems.len() as u32)?;
+            for e in elems {
+                write_value(w, e)?;
+            }
+            Ok(())
+        }
         // An untouched large-value reference rides along to the output unread (spill.md §4); spill
         // it opaquely (the pointer/inline block) so it round-trips, never resolving it.
         Value::Unfetched(Unfetched::External { first_page, len }) => {
@@ -538,6 +548,14 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
                 fields.push(read_value(r)?);
             }
             Value::Composite(fields)
+        }
+        16 => {
+            let n = read_u32(r)? as usize;
+            let mut elems = Vec::with_capacity(n);
+            for _ in 0..n {
+                elems.push(read_value(r)?);
+            }
+            Value::Array(elems)
         }
         _ => {
             return Err(io::Error::new(

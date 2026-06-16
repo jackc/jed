@@ -29,6 +29,11 @@ pub enum Token {
     Dot,
     LParen,
     RParen,
+    /// `[` — the array subscript / `ARRAY[…]` constructor / `T[]` type-suffix bracket
+    /// (spec/design/array.md).
+    LBracket,
+    /// `]` — the closing array bracket.
+    RBracket,
     Star,
     Plus,
     Minus,

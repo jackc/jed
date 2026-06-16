@@ -55,6 +55,11 @@ export type Value =
   // (element-wise), recursing into each field's own canonical comparison so a float/decimal/interval
   // field never compares by raw bits (the rule Decimal/Interval already follow).
   | { kind: "composite"; fields: Value[] }
+  // An array value (spec/design/array.md §2) — a flat (1-D) list of element values (a NULL element
+  // is a {kind:"null"}, an empty list is the empty array `{}`). Comparison uses PG btree semantics
+  // (NULLs comparable and mutually equal — NOT the composite 3VL rule, §5), so equality/hashing
+  // (the DISTINCT/GROUP BY key) and the total-order lt3/gt3 are structural over this list.
+  | { kind: "array"; elements: Value[] }
   // An UNFETCHED large-value reference (spec/design/large-values.md §14): a stored
   // external/compressed value loaded as its on-disk pointer instead of being materialized.
   // Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -169,6 +174,11 @@ export function intervalValue(iv: Interval): Value {
 // compositeValue builds a composite (row) value from its ordered field values (spec/design/composite.md §2).
 export function compositeValue(fields: Value[]): Value {
   return { kind: "composite", fields };
+}
+
+// arrayValue builds an array value from its element list (spec/design/array.md §2).
+export function arrayValue(elements: Value[]): Value {
+  return { kind: "array", elements };
 }
 
 // compareBytea compares two byte strings by UNSIGNED byte order (Uint8Array elements are
@@ -361,6 +371,10 @@ export function render(v: Value): string {
       // (spec/design/composite.md §8). The renderer recurses (a composite field's text is itself
       // quoted because it contains parens/commas).
       return recordOut(v.fields);
+    case "array":
+      // An array renders as PG array_out: `{e1,e2,…}` with per-element quoting and an unquoted
+      // `NULL` for a null element (spec/design/array.md §7).
+      return arrayOut(v.elements);
     case "unfetched":
       throw new Error("BUG: unfetched large value escaped the storage layer");
     default:
@@ -422,6 +436,143 @@ function recordFieldNeedsQuote(s: string): boolean {
     }
   }
   return false;
+}
+
+// arrayOut is PostgreSQL array_out (spec/design/array.md §7): render an array's elements as
+// `{e1,e2,…}`. A NULL element is the unquoted token `NULL`; every other element is rendered by its
+// own `render` and double-quoted iff it is empty, equals the literal `NULL` (case-insensitive), or
+// contains a delimiter / brace / quote / backslash / whitespace. Inside the quotes PostgreSQL
+// BACKSLASH-ESCAPES an embedded `"` → `\"` and `\` → `\\` (the contrast with record_out doubling).
+// The empty array renders `{}`. Equals PG byte-for-byte (CLAUDE.md §8).
+export function arrayOut(elems: Value[]): string {
+  let out = "{";
+  for (let i = 0; i < elems.length; i++) {
+    if (i > 0) out += ",";
+    const e = elems[i]!;
+    if (e.kind === "null") {
+      out += "NULL";
+      continue;
+    }
+    const s = render(e);
+    if (arrayElemNeedsQuote(s)) {
+      out += '"';
+      for (const ch of s) {
+        if (ch === '"' || ch === "\\") out += "\\";
+        out += ch;
+      }
+      out += '"';
+    } else {
+      out += s;
+    }
+  }
+  out += "}";
+  return out;
+}
+
+// arrayElemNeedsQuote reports whether an array_out element token must be double-quoted: the empty
+// string, the literal `NULL` (any case — else it would parse back as a NULL element), or any token
+// containing a comma, brace, double-quote, backslash, or whitespace — PostgreSQL's exact rule.
+function arrayElemNeedsQuote(s: string): boolean {
+  if (s.length === 0 || s.toUpperCase() === "NULL") return true;
+  for (const c of s) {
+    if (
+      c === '"' ||
+      c === "\\" ||
+      c === "{" ||
+      c === "}" ||
+      c === "," ||
+      c === " " ||
+      c === "\t" ||
+      c === "\n" ||
+      c === "\v" ||
+      c === "\f" ||
+      c === "\r"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// parseArrayTokens is the PostgreSQL array_in tokenizer (spec/design/array.md §7) — the inverse of
+// arrayOut. It splits the text of an array literal `{e1,e2,…}` into raw element tokens WITHOUT type
+// coercion. An element is quoted (`"…"` with `\"`→`"` and `\\`→`\` un-escaping) or unquoted (read to
+// the next top-level `,`/`}`, surrounding whitespace trimmed, `\x`→`x`). An UNQUOTED `NULL` (any
+// case) is a NULL element (null); a quoted `"NULL"` is the 4-char string. `{}` (optionally with
+// inner whitespace) is the empty array. Returns null on a malformed literal (→ 22P02).
+export function parseArrayTokens(input: string): (string | null)[] | null {
+  const s = input.replace(/^[\t\n\v\f\r ]+/, "").replace(/[\t\n\v\f\r ]+$/, "");
+  let pos = 0;
+  const isWs = (c: string): boolean =>
+    c === " " || c === "\t" || c === "\n" || c === "\v" || c === "\f" || c === "\r";
+  if (s[pos] !== "{") return null;
+  pos++;
+  const elems: (string | null)[] = [];
+  while (pos < s.length && isWs(s[pos]!)) pos++;
+  if (s[pos] === "}") {
+    pos++;
+    return pos === s.length ? elems : null; // empty array
+  }
+  for (;;) {
+    while (pos < s.length && isWs(s[pos]!)) pos++;
+    let buf = "";
+    let quoted = false;
+    if (s[pos] === '"') {
+      quoted = true;
+      pos++; // opening quote
+      for (;;) {
+        if (pos >= s.length) return null; // unterminated quoted element
+        const c = s[pos]!;
+        if (c === '"') {
+          pos++;
+          break; // closing quote
+        }
+        if (c === "\\") {
+          pos++;
+          if (pos >= s.length) return null;
+          buf += s[pos]!;
+          pos++;
+        } else {
+          buf += c;
+          pos++;
+        }
+      }
+      while (pos < s.length && isWs(s[pos]!)) pos++;
+    } else {
+      for (;;) {
+        if (pos >= s.length) return null; // missing '}'
+        const c = s[pos]!;
+        if (c === "," || c === "}") break;
+        if (c === "\\") {
+          pos++;
+          if (pos >= s.length) return null;
+          buf += s[pos]!;
+          pos++;
+        } else {
+          buf += c;
+          pos++;
+        }
+      }
+    }
+    if (quoted) {
+      elems.push(buf);
+    } else {
+      const trimmed = buf.replace(/^[\t\n\v\f\r ]+/, "").replace(/[\t\n\v\f\r ]+$/, "");
+      if (trimmed.length === 0) return null; // a bare empty unquoted element is malformed (PG)
+      elems.push(trimmed.toUpperCase() === "NULL" ? null : trimmed);
+    }
+    const d = s[pos];
+    if (d === ",") {
+      pos++;
+      continue;
+    }
+    if (d === "}") {
+      pos++;
+      break;
+    }
+    return null;
+  }
+  return pos === s.length ? elems : null;
 }
 
 // parseRecordTokens is the PostgreSQL record_in tokenizer (spec/design/composite.md §8) — the exact
@@ -562,7 +713,50 @@ export function eq3(a: Value, b: Value): ThreeValued {
     }
     return anyUnknown ? "unknown" : "true";
   }
+  // Array `=` uses PG btree semantics (spec/design/array.md §5), NOT the composite 3VL rule: same
+  // length and every element pair equal-or-both-NULL → TRUE, else FALSE. NULL elements are
+  // comparable and mutually equal, so the result is ALWAYS definite (never UNKNOWN).
+  if (a.kind === "array" && b.kind === "array") return bool3(arrayEqual(a.elements, b.elements));
   return "unknown";
+}
+
+// arrayEqual is PG array_eq (spec/design/array.md §5): same length and every element pair equal,
+// where two NULL elements are mutually equal (NOT 3VL). Always definite.
+function arrayEqual(a: Value[], b: Value[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const an = a[i]!.kind === "null";
+    const bn = b[i]!.kind === "null";
+    if (an !== bn) return false;
+    if (an) continue; // both NULL → equal
+    if (eq3(a[i]!, b[i]!) !== "true") return false;
+  }
+  return true;
+}
+
+// arrayTotalCmp is the PG array_cmp total order over two arrays (spec/design/array.md §5): walk
+// element pairs; the first non-equal pair decides; if one array is a prefix of the other, the
+// shorter sorts first. NULL elements are comparable — NULL sorts AFTER every non-NULL and two NULLs
+// are equal (NULLs-last). Always total/definite.
+function arrayTotalCmp(a: Value[], b: Value[]): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const c = elemTotalCmp(a[i]!, b[i]!);
+    if (c !== 0) return c;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
+// elemTotalCmp is a total order over two array elements with NULL the largest value (NULLs-last)
+// and two NULLs equal. Present elements use their own definite eq3/lt3 (scalar comparators).
+function elemTotalCmp(x: Value, y: Value): number {
+  const xn = x.kind === "null";
+  const yn = y.kind === "null";
+  if (xn && yn) return 0;
+  if (xn) return 1; // NULL sorts last
+  if (yn) return -1;
+  if (eq3(x, y) === "true") return 0;
+  return lt3(x, y) === "true" ? -1 : 1;
 }
 
 // compositeOrder3 is three-valued lexicographic row ordering (PG row comparison,
@@ -604,6 +798,9 @@ export function lt3(a: Value, b: Value): ThreeValued {
   // §5): the first field that is not equal decides via its own `<`; a field whose `=` is UNKNOWN (a
   // NULL operand) makes the whole comparison UNKNOWN; all-equal rows are not `<`.
   if (a.kind === "composite" && b.kind === "composite") return compositeOrder3(a.fields, b.fields, false);
+  // Array `<` uses the PG array_cmp total order (spec/design/array.md §5): element-wise, NULL after
+  // every non-NULL, shorter prefix first. Always definite.
+  if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a.elements, b.elements) < 0);
   return "unknown";
 }
 
@@ -629,6 +826,8 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) > 0);
   // Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
   if (a.kind === "composite" && b.kind === "composite") return compositeOrder3(a.fields, b.fields, true);
+  // Array `>` — the total-order mirror of `<` (spec/design/array.md §5).
+  if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a.elements, b.elements) > 0);
   return "unknown";
 }
 
@@ -645,6 +844,9 @@ export function valueEqual(a: Value, b: Value): boolean {
     }
     return true;
   }
+  // Two arrays are "not distinct" iff structurally equal (btree equality; NULL elements mutually
+  // equal — spec/design/array.md §5).
+  if (a.kind === "array" && b.kind === "array") return arrayEqual(a.elements, b.elements);
   return eq3(a, b) === "true";
 }
 

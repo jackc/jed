@@ -175,11 +175,33 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       [determinism.md](spec/design/determinism.md)
   - [ ] _follow-on:_ float in a PRIMARY KEY/index (`0A000`); key rule authored, unexercised.
 - [ ] **`json` / `jsonb`** — optional headline feature (§1). Large surface. _(size: XL; §4)_
-- [ ] **Composite `array` type** — a **container** over the scalar set: a new type *axis*,
-      not another scalar (CLAUDE.md §4). Array literals, element-type rules, `NULL` element
-      vs `NULL` array, equality/ordering, and an order-preserving key encoding for
-      arrays-in-keys. Match PostgreSQL array semantics by default (§1). Large surface;
-      sequence after the core scalar set settles. _(size: XL; §4/§8)_
+- [ ] **`array` type** — the **second container axis** (sibling to composite, sharing ~80% of its
+      foundation): a **structural** `Type::Array(Box<Type>)` over any element type, with array
+      *shape* a property of the value (PG-faithful), the compact null-bitmap value codec (no
+      per-element prefix for fixed-width elements), btree-NULL element comparison (*not* composite
+      3VL), and `array_in`/`array_out`. **S0–S4 landed** (`format_version` 10; subscripting `a[i]`
+      in S3). Spec'd in [array.md](spec/design/array.md); decisions §10, errors §11, delivery §12. _(size: XL; §4/§8)_
+  - [x] **S0** — `spec/design/array.md` + the CLAUDE.md §4 array-axis touch (structural; shape is a
+        value property) + this slice breakdown + the §10 decisions + §11 error surface.
+  - [x] **S1** — the open-`Type` `Array(Box<Type>)` arm threaded through parser/resolver/evaluator,
+        behavior-preserving (composite already opened `Type`, so additive). _(size: M)_
+  - [x] **S2** — declarable + storable array **column** (scalar elements) + `type_code = 15` + the
+        value codec ([array.md](spec/design/array.md) §4) + `format_version` 10 + new goldens
+        (`array_table.jed`, `rust == go == ts == ruby`); the `ARRAY[…]` constructor + `'{…}'`/`::`
+        literal (`array_in`) + INSERT/SELECT round-trip + `array_out` rendering — all three cores +
+        Ruby byte-identical. 1-D values only. _(size: L)_
+  - [x] **S3** — subscripting `a[i]` (1-based; OOB/NULL → NULL; non-array base `42804`) — a postfix
+        `[…]` on any base, all three cores + `types/subscript.test`. Slices `a[m:n]` stay deferred `0A000`. _(size: S)_
+  - [x] **S4** — comparison / ordering / `IS NULL`: same-element-type comparable (`42804`
+        otherwise), the **btree-NULL** element-wise `eq3`/`lt3`/`gt3` (§5 — *not* composite 3VL), the
+        `ORDER BY` total-order arm, DISTINCT/GROUP BY array keys, whole-value-only `IS NULL`;
+        oracle-pinned via `rake corpus:check`. (Landed with S1/S2.) _(size: M)_
+  - [ ] _follow-ons (each its own slice + obligations):_ multidimensional values (codec header
+        already supports them); custom lower bounds in construction; array slices `a[m:n]`;
+        array-of-composite elements; arrays-in-keys (`0A000`, encoding authored §8); the array
+        function/operator surface (`array_length`/`cardinality`/`unnest`/`||`/`@>`/`&&`/… + the
+        polymorphic `anyarray`/`anyelement` resolution + `ANY`/`ALL`/`VARIADIC`); runtime
+        text→array, `array::text`, and element-wise array→array casts.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis**, sibling to `array` and sharing ~80% of its foundation, so sequence
       the two together. **The headline implication: this turns the *closed* type enum into an *open*,

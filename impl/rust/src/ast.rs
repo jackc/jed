@@ -228,6 +228,9 @@ pub enum InsertValue {
     /// for a composite target column. Fields are themselves `InsertValue`s (a literal, a `$N`, or a
     /// nested `ROW(…)`); `DEFAULT` is not a valid field (only a top-level slot takes a default).
     Row(Vec<InsertValue>),
+    /// An `ARRAY[…]` constructor in a VALUES slot (spec/design/array.md §1) — an array value for an
+    /// array target column. Elements are themselves `InsertValue`s (a literal or a `$N`).
+    Array(Vec<InsertValue>),
 }
 
 /// `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each assignment's
@@ -405,6 +408,10 @@ pub enum Expr {
     /// from the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The
     /// bare parenthesized `(a, b)` form is deferred (`0A000`) — only the keyword form is parsed.
     Row(Vec<Expr>),
+    /// An `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Builds a 1-D array value
+    /// from the element expressions, unified to a common element type at resolve; `ARRAY[]` is the
+    /// empty array (its element type comes from an enclosing cast/column context).
+    Array(Vec<Expr>),
     /// Field selection `(expr).field` (spec/design/composite.md §S4) — the value of one named field
     /// of a composite `base`. The parser produces this for a `.name` postfix on a parenthesized /
     /// `ROW(…)` / cast / qualified-column base; a bare `a.b` stays `QualifiedColumn` and only falls
@@ -420,6 +427,14 @@ pub enum Expr {
     /// projection list (where `*` expands); in any scalar expression position it is 42601.
     FieldStar {
         base: Box<Expr>,
+    },
+    /// Array element subscript `base[index]` (spec/design/array.md §6) — the *index*-th element of
+    /// an array `base`, **1-based**. An out-of-bounds or NULL subscript yields NULL (PG, not an
+    /// error); the result type is the element type. Subscripting a non-array base is 42804 at
+    /// resolve. The parser produces this for a `[…]` postfix on any base expression.
+    Subscript {
+        base: Box<Expr>,
+        index: Box<Expr>,
     },
     /// A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
     /// `type 'string'` form, equal to `CAST('string' AS type)` over a string-literal operand.

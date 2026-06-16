@@ -323,8 +323,9 @@ class Parser {
 
   private parseColumnDef(checks: CheckDef[], uniques: UniqueDef[]): ColumnDef {
     const name = this.expectIdentifier();
-    const typeName = this.expectIdentifier();
+    const baseType = this.expectIdentifier();
     const typeMod = this.parseTypeMod();
+    const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
     // Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, DEFAULT <literal>,
     // [CONSTRAINT name] CHECK ( expr ), and [CONSTRAINT name] UNIQUE. A boolean constraint
     // may be repeated harmlessly; a repeated DEFAULT keeps the last; each CHECK is a
@@ -382,6 +383,20 @@ class Parser {
   // after a type name (the first parameterized type, decimal — spec/grammar/grammar.ebnf
   // type_name). The shape is accepted for any type name; whether a typmod is meaningful (decimal
   // only) and in range is decided at resolve. Empty parens or a non-integer inside is 42601.
+  // consumeArrayBrackets consumes a trailing array type suffix `[]` (spec/design/array.md §1) after
+  // a type name (and its optional typmod). Returns whether the type is an array. Multiple `[][]`
+  // collapse to one array level — multidimensionality is a value property (§2). Only the empty
+  // bracket form `[]` is accepted this slice.
+  private consumeArrayBrackets(): boolean {
+    let isArray = false;
+    while (this.peek().kind === "lbracket") {
+      this.advance(); // "["
+      this.expect("rbracket");
+      isArray = true;
+    }
+    return isArray;
+  }
+
   private parseTypeMod(): TypeMod | null {
     if (this.peek().kind !== "lparen") return null;
     this.advance(); // "("
@@ -600,6 +615,24 @@ class Parser {
         this.advance(); // the empty ROW() — consume ')'
       }
       return { kind: "row", fields };
+    }
+    if (this.peekKeyword() === "array" && this.peekKindAt(1) === "lbracket") {
+      // ARRAY[elem, …] — recurse on each element (a literal or a $N).
+      this.advance(); // ARRAY
+      this.expect("lbracket");
+      const elements: InsertValue[] = [];
+      if (this.peek().kind !== "rbracket") {
+        for (;;) {
+          elements.push(this.parseInsertValue());
+          const t = this.advance();
+          if (t.kind === "comma") continue;
+          if (t.kind === "rbracket") break;
+          throw engineError("syntax_error", `expected ',' or ']', found ${t.kind}`);
+        }
+      } else {
+        this.advance(); // the empty ARRAY[] — consume ']'
+      }
+      return { kind: "array", elements };
     }
     if (this.peek().kind === "param") {
       return { kind: "param", index: this.advance().paramIndex! };
@@ -1280,9 +1313,20 @@ class Parser {
       const k = this.peek().kind;
       if (k === "doubleColon") {
         this.advance();
-        const typeName = this.expectIdentifier();
+        const baseType = this.expectIdentifier();
         const typeMod = this.parseTypeMod();
+        const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
         expr = { kind: "cast", inner: expr, typeName, typeMod };
+        fieldAccessible = false;
+      } else if (k === "lbracket") {
+        // `base[index]` — array element subscript (spec/design/array.md §6). Applies to ANY base
+        // (no parens rule, unlike `.field`) and chains (`a[1][2]`). The index is a full expression;
+        // a slice `a[m:n]` is deferred (no single-colon token, so it does not parse). After a
+        // subscript a `.field` still needs parens (PG), so it is not field-accessible.
+        this.advance();
+        const index = this.parseExpr();
+        this.expect("rbracket");
+        expr = { kind: "subscript", base: expr, index };
         fieldAccessible = false;
       } else if (k === "dot" && fieldAccessible) {
         // `.field` / `.*` — composite field selection (spec/design/composite.md §S4),
@@ -1353,6 +1397,25 @@ class Parser {
       }
       return { kind: "row", fields };
     }
+    // `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Recognized when `ARRAY` is
+    // immediately followed by `[`, so `array` stays usable as an identifier otherwise.
+    if (this.peekKeyword() === "array" && this.peekKindAt(1) === "lbracket") {
+      this.advance(); // ARRAY
+      this.expect("lbracket");
+      const elements: Expr[] = [];
+      if (this.peek().kind !== "rbracket") {
+        for (;;) {
+          elements.push(this.parseExpr());
+          const t = this.advance();
+          if (t.kind === "comma") continue;
+          if (t.kind === "rbracket") break;
+          throw engineError("syntax_error", `expected ',' or ']', found ${t.kind}`);
+        }
+      } else {
+        this.advance(); // the empty ARRAY[] — consume ']'
+      }
+      return { kind: "array", elements };
+    }
     // A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`, equal to
     // CAST('string' AS type) over a string-literal operand: ANY type-naming word immediately followed
     // by a string (`INTERVAL '1 day'`, `TIMESTAMP '...'`, `INTEGER '42'`, `BYTEA '\xDE'`, …).
@@ -1376,8 +1439,9 @@ class Parser {
       this.expect("lparen");
       const inner = this.parseExpr();
       this.expectKeyword("as");
-      const typeName = this.expectIdentifier();
+      const baseType = this.expectIdentifier();
       const typeMod = this.parseTypeMod();
+      const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
       this.expect("rparen");
       return { kind: "cast", inner, typeName, typeMod };
     }
@@ -1612,6 +1676,10 @@ function renderToken(t: Token): string {
       return "(";
     case "rparen":
       return ")";
+    case "lbracket":
+      return "[";
+    case "rbracket":
+      return "]";
     case "star":
       return "*";
     case "plus":

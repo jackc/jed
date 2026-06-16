@@ -801,7 +801,25 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		var colType Type
 		var decimal *DecimalTypmod
 		isComposite := false
-		if _, ok := ScalarTypeFromName(def.TypeName); ok {
+		isArray := false
+		if base, ok := strings.CutSuffix(def.TypeName, "[]"); ok {
+			// An array column (spec/design/array.md §3). v1 element types are scalars; a typmod on
+			// the array (numeric(p,s)[]) and a composite/nested-array element are deferred (0A000).
+			if def.TypeMod != nil {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a type modifier on an array type is not supported yet")
+			}
+			elemScalar, scalarOK := ScalarTypeFromName(base)
+			if !scalarOK {
+				if db.readSnap().compositeType(base) != nil {
+					return Outcome{}, NewError(FeatureNotSupported,
+						"an array of composite type "+base+" is not supported yet")
+				}
+				return Outcome{}, NewError(UndefinedObject, "type does not exist: "+base)
+			}
+			colType = ArrayT(ScalarT(elemScalar))
+			isArray = true
+		} else if _, ok := ScalarTypeFromName(def.TypeName); ok {
 			ty, d, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
 			if err != nil {
 				return Outcome{}, err
@@ -825,7 +843,9 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// bytea §2.6, boolean's bool-byte) are authored but unexercised, so a
 			// text/decimal/bytea/boolean/composite PRIMARY KEY is a documented 0A000 narrowing
 			// (types.md §9/§11/§12/§13; composite.md §6), relaxable in a later in-key slice.
-			if isComposite {
+			if isComposite || isArray {
+				// A composite/array PRIMARY KEY is rejected 0A000 — the key encoding is authored but
+				// unexercised (composite.md §6, array.md §8).
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+def.TypeName+" primary key is not supported yet")
 			}
@@ -850,11 +870,12 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		//     checked assignable to the column, 42804) and stored as text for per-row eval.
 		var defaultVal *Value
 		var defaultExpr *DefaultExpr
-		if isComposite {
-			// A DEFAULT on a composite-typed column is not supported this slice (composite.md §12).
+		if isComposite || isArray {
+			// A DEFAULT on a composite- or array-typed column is not supported this slice
+			// (composite.md §12 / array.md §12).
 			if def.Default != nil {
 				return Outcome{}, NewError(FeatureNotSupported,
-					"a DEFAULT on a composite-typed column is not supported yet")
+					"a DEFAULT on a composite- or array-typed column is not supported yet")
 			}
 		} else if def.Default != nil {
 			ty := colType.Scalar
@@ -4740,6 +4761,14 @@ func valueToRExpr(v Value) *rExpr {
 			nodes[i] = valueToRExpr(f)
 		}
 		return &rExpr{kind: reRow, sargs: nodes}
+	case ValArray:
+		// A folded array value rebuilds as an ARRAY[...] of its per-element constant nodes
+		// (spec/design/array.md).
+		nodes := make([]*rExpr, len(*v.Array))
+		for i, el := range *v.Array {
+			nodes[i] = valueToRExpr(el)
+		}
+		return &rExpr{kind: reArray, sargs: nodes}
 	default: // ValNull
 		return &rExpr{kind: reConstNull}
 	}
@@ -4827,6 +4856,15 @@ func distinctRowKey(row []Value) string {
 			b.WriteString(strconv.Itoa(len(*v.Comp)))
 			b.WriteByte(':')
 			b.WriteString(distinctRowKey(*v.Comp))
+		case ValArray:
+			// An array keys structurally (spec/design/array.md §5): the element count under a
+			// distinct 'a' tag, then each element's own key recursively. NULL elements key as 'n'
+			// (btree equality — NULLs mutually equal), so structurally-equal arrays share a
+			// DISTINCT/GROUP BY bucket.
+			b.WriteByte('a')
+			b.WriteString(strconv.Itoa(len(*v.Array)))
+			b.WriteByte(':')
+			b.WriteString(distinctRowKey(*v.Array))
 		}
 	}
 	return b.String()
@@ -4870,6 +4908,10 @@ const (
 	// (optional) name and resolved field list. A named catalog type's name drives the `# types:`
 	// output; an anonymous ROW(...) result has a nil name (rendered "record").
 	rtComposite
+	// rtArray is an array type (spec/design/array.md §2): elem carries the resolved element type.
+	// Two arrays are comparable iff their element types are comparable; assignable to an array
+	// column of the same element type.
+	rtArray
 )
 
 // isFloatKind reports whether a resolvedType is one of the two float kinds.
@@ -4888,6 +4930,7 @@ type resolvedType struct {
 	kind  rtKind
 	intTy ScalarType      // valid when kind == rtInt
 	comp  *compositeRType // valid when kind == rtComposite
+	elem  *resolvedType   // valid when kind == rtArray (the element type)
 }
 
 // compositeRType is the resolved shape of a composite type — its (optional) name and resolved field
@@ -5030,6 +5073,11 @@ func rtName(t resolvedType) string {
 			return t.comp.name
 		}
 		return "record"
+	case rtArray:
+		if t.elem != nil {
+			return rtName(*t.elem) + "[]"
+		}
+		return "array"
 	default:
 		return "unknown"
 	}
@@ -5128,11 +5176,20 @@ const (
 	// held in sargs (so the existing fold / references-outer / touched-set walks recurse into them
 	// for free). Evaluates to a ValComposite; one operator_eval per node (cost.md §9).
 	reRow
+	// reArray is an ARRAY[...] constructor (spec/design/array.md §1): its element nodes are held in
+	// sargs (so the fold / references-outer / touched-set walks recurse for free). Evaluates to a
+	// ValArray; one operator_eval per node.
+	reArray
 	// reField is field selection `(composite).field` (spec/design/composite.md §S4): evaluate
 	// `operand` (the base) to a composite value and return its `index`-th field (the field ordinal,
 	// fixed at resolve). A whole-value-NULL composite yields NULL for any field. One operator_eval
 	// per node (cost.md §9).
 	reField
+	// reSubscript is array element subscript `operand[sub]` (spec/design/array.md §6): evaluate
+	// `operand` (the base array) and `sub` (the index) and return the 1-based element. A NULL array,
+	// a NULL index, or an out-of-bounds index yields NULL (PG — never an error). One operator_eval
+	// per node.
+	reSubscript
 )
 
 // subqueryKind selects which subquery form an reSubquery node is (spec/design/grammar.md §26).
@@ -5645,6 +5702,17 @@ func exprHasAggregate(e Expr) bool {
 		// Field selection `(expr).field` / `(expr).*` recurses into the composite base
 		// (spec/design/composite.md §S4) — an aggregate hidden in the base must surface.
 		return exprHasAggregate(*e.Base)
+	case ExprSubscript:
+		// `base[index]` — an aggregate hidden in either the base array or the index must surface.
+		return exprHasAggregate(*e.Base) || exprHasAggregate(*e.Index)
+	case ExprRow, ExprArray:
+		// A ROW(...) / ARRAY[...] constructor recurses into its element expressions.
+		for _, it := range e.RowItems {
+			if exprHasAggregate(it) {
+				return true
+			}
+		}
+		return false
 	default:
 		return false
 	}
@@ -5734,6 +5802,12 @@ func rejectCheckStructure(e Expr) error {
 		// Recurse into the composite base (spec/design/composite.md §S4) so a forbidden
 		// subquery/aggregate/parameter hidden there is still rejected.
 		return rejectCheckStructure(*e.Base)
+	case ExprSubscript:
+		// Recurse into both the array base and the index.
+		if err := rejectCheckStructure(*e.Base); err != nil {
+			return err
+		}
+		return rejectCheckStructure(*e.Index)
 	default: // ExprColumn, ExprQualifiedColumn, ExprLiteral
 		return nil
 	}
@@ -5824,6 +5898,12 @@ func rejectDefaultStructure(e Expr) error {
 	case ExprFieldAccess, ExprFieldStar:
 		// Recurse into the composite base (spec/design/composite.md §S4).
 		return rejectDefaultStructure(*e.Base)
+	case ExprSubscript:
+		// Recurse into both the array base and the index.
+		if err := rejectDefaultStructure(*e.Base); err != nil {
+			return err
+		}
+		return rejectDefaultStructure(*e.Index)
 	default: // ExprLiteral, ExprTypedLiteral
 		return nil
 	}
@@ -5893,6 +5973,10 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 		case ExprFieldAccess, ExprFieldStar:
 			// Field selection recurses into the composite base (spec/design/composite.md §S4).
 			walk(*e.Base)
+		case ExprSubscript:
+			// `base[index]` recurses into both the array base and the index.
+			walk(*e.Base)
+			walk(*e.Index)
 		}
 	}
 	walk(e)
@@ -6767,6 +6851,10 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 // §5): a scalar via resolvedTypeOf, or a composite resolved against the snapshot's type catalog (the
 // reference is guaranteed present — resolved at load / CREATE TYPE). Recursive for nested composites.
 func resolvedTypeOfCol(ty Type, snap *Snapshot) resolvedType {
+	if ty.Array != nil {
+		elem := resolvedTypeOfCol(*ty.Array, snap)
+		return resolvedType{kind: rtArray, elem: &elem}
+	}
 	if ty.Comp == nil {
 		return resolvedTypeOf(ty.Scalar)
 	}
@@ -6878,6 +6966,10 @@ func outputName(s *scope, e Expr) string {
 		// A field selection takes the FIELD name (PG names the output column after the selected
 		// field, lowercased — spec/design/composite.md §S4).
 		return toLowerASCII(e.Field)
+	case ExprSubscript:
+		// A subscript takes the base array's name (PG names `a[1]` after `a`); `a[1][2]` recurses to
+		// the same base. A non-column base falls through to `?column?`.
+		return outputName(s, *e.Base)
 	default:
 		return "?column?"
 	}
@@ -6974,6 +7066,32 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// expression position it is unsupported (PG rejects row expansion here — 0A000).
 		return nil, resolvedType{}, NewError(FeatureNotSupported,
 			"row expansion (.*) is not supported in this context")
+	case ExprSubscript:
+		// `base[index]` — array element subscript (spec/design/array.md §6). The base must be an
+		// array (else 42804); the result type is the element type. The index is an integer (PG int4)
+		// — a literal adapts to the int context; a non-integer index is 42804. OOB / NULL → NULL is
+		// an evaluation-time rule, not a resolve error.
+		baseNode, baseTy, err := resolve(s, *e.Base, nil, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if baseTy.kind != rtArray {
+			return nil, resolvedType{}, typeError(fmt.Sprintf(
+				"cannot subscript a value of type %s, which is not an array", rtName(baseTy),
+			))
+		}
+		elemTy := *baseTy.elem
+		idxCtx := Int32
+		idxNode, idxTy, err := resolve(s, *e.Index, &idxCtx, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if idxTy.kind != rtInt && idxTy.kind != rtNull {
+			return nil, resolvedType{}, typeError(fmt.Sprintf(
+				"array subscript must be an integer, not %s", rtName(idxTy),
+			))
+		}
+		return &rExpr{kind: reSubscript, operand: baseNode, lhs: idxNode}, elemTy, nil
 	case ExprRow:
 		// A ROW(...) constructor (spec/design/composite.md §1): resolve each field (no context — a
 		// field defaults like a bare expression), build the anonymous (structural) composite type
@@ -6990,6 +7108,30 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			fields[i] = compositeRField{name: fmt.Sprintf("f%d", i+1), ty: ty}
 		}
 		return &rExpr{kind: reRow, sargs: nodes}, resolvedType{kind: rtComposite, comp: &compositeRType{fields: fields}}, nil
+	case ExprArray:
+		// An ARRAY[...] constructor (spec/design/array.md §1): resolve each element (natural type),
+		// unify to a common element type, build a reArray. A bare empty ARRAY[] has no element type
+		// to infer — use '{}'::T[] instead (the cast supplies it).
+		if len(e.RowItems) == 0 {
+			return nil, resolvedType{}, typeError(
+				"cannot determine the element type of an empty ARRAY[]; write '{}'::T[]",
+			)
+		}
+		nodes := make([]*rExpr, len(e.RowItems))
+		elemTypes := make([]resolvedType, len(e.RowItems))
+		for i := range e.RowItems {
+			node, ty, err := resolve(s, e.RowItems[i], nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			nodes[i] = node
+			elemTypes[i] = ty
+		}
+		elemType, err := unifyArrayElementTypes(elemTypes)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reArray, sargs: nodes}, resolvedType{kind: rtArray, elem: &elemType}, nil
 	case ExprFuncCall:
 		return resolveFuncCall(s, e.FuncCall, ag, params)
 	case ExprLiteral:
@@ -7134,6 +7276,36 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated}, resolvedType{kind: rtBool}, nil
 	case ExprCast:
+		// An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the
+		// string-literal form `'{…}'::T[]` and a bare NULL; every other array cast (runtime
+		// text→array, array→text, element-wise array→array) is a documented 0A000 narrowing.
+		if base, ok := strings.CutSuffix(e.Cast.TypeName, "[]"); ok {
+			if e.Cast.TypeMod != nil {
+				return nil, resolvedType{}, NewError(FeatureNotSupported,
+					"a type modifier on an array type is not supported yet")
+			}
+			elemScalar, scalarOK := ScalarTypeFromName(base)
+			if !scalarOK {
+				if s.catalog.readSnap().compositeType(base) != nil {
+					return nil, resolvedType{}, NewError(FeatureNotSupported,
+						"an array of composite type "+base+" is not supported yet")
+				}
+				return nil, resolvedType{}, NewError(UndefinedObject, "type does not exist: "+base)
+			}
+			elemRT := resolvedTypeOf(elemScalar)
+			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralText {
+				val, err := coerceStringToArray(in.Literal.Str, ScalarColType(elemScalar))
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return valueToRExpr(val), resolvedType{kind: rtArray, elem: &elemRT}, nil
+			}
+			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralNull {
+				return &rExpr{kind: reConstNull}, resolvedType{kind: rtArray, elem: &elemRT}, nil
+			}
+			return nil, resolvedType{}, NewError(FeatureNotSupported,
+				"casting to an array type is only supported from a string literal this slice")
+		}
 		// A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
 		// (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
 		// `'(…)'::addr` headline); a bare NULL adapts to the composite; a same-named composite
@@ -7237,6 +7409,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// Casting FROM an interval is likewise deferred (0A000).
 		if ity.kind == rtInterval {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from an interval type is not supported yet")
+		}
+		// Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
+		if ity.kind == rtArray {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting an array value is not supported yet")
 		}
 		// int→int (range check), int→decimal (widen), decimal→int (explicit, round),
 		// decimal→decimal (re-scale), and NULL are all castable.
@@ -7668,6 +7844,18 @@ func classifyComparable(lt, rt resolvedType) error {
 		return nil
 	case compL || compR:
 		return typeError("cannot compare a composite value with a value of a different type")
+	}
+	// Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff
+	// their element types are comparable (recursively). A bare NULL is always comparable; an array
+	// vs any non-array is 42804.
+	arrL, arrR := lt.kind == rtArray, rt.kind == rtArray
+	switch {
+	case arrL && rt.kind == rtNull, lt.kind == rtNull && arrR:
+		return nil
+	case arrL && arrR:
+		return classifyComparable(*lt.elem, *rt.elem)
+	case arrL || arrR:
+		return typeError("cannot compare an array value with a value of a different type")
 	}
 	// Boolean compares only with boolean (or NULL); boolean with a number/text is a mismatch.
 	boolL, boolR := lt.kind == rtBool, rt.kind == rtBool
@@ -8161,6 +8349,44 @@ func requireTextOrNull(t resolvedType) error {
 	return typeError("LIKE requires text operands")
 }
 
+// unifyArrayElementTypes unifies the element types of an ARRAY[...] constructor into one element
+// type (spec/design/array.md §1). All-NULL → text (the PG unknown rule). All integer → the widest
+// via the promotion tower (no runtime coercion — every integer is an int64 value). Otherwise every
+// element must be the SAME family — a cross-family mix (including int + decimal) is a documented
+// 42804 narrowing this slice (the representation-changing coercion is deferred with numeric(p,s)[]).
+func unifyArrayElementTypes(types []resolvedType) (resolvedType, error) {
+	nonNull := make([]resolvedType, 0, len(types))
+	for _, t := range types {
+		if t.kind != rtNull {
+			nonNull = append(nonNull, t)
+		}
+	}
+	if len(nonNull) == 0 {
+		return resolvedType{kind: rtText}, nil
+	}
+	allInt := true
+	for _, t := range nonNull {
+		if t.kind != rtInt {
+			allInt = false
+			break
+		}
+	}
+	if allInt {
+		acc := nonNull[0]
+		for _, t := range nonNull[1:] {
+			acc = resolvedType{kind: rtInt, intTy: promote(acc, t)}
+		}
+		return acc, nil
+	}
+	first := nonNull[0]
+	for _, t := range nonNull[1:] {
+		if t.kind != first.kind {
+			return resolvedType{}, typeError("array elements must all be of the same type")
+		}
+	}
+	return first, nil
+}
+
 // unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or rtNull for an
 // implicit ELSE) into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped
 // (they adapt); an all-NULL CASE is text (PostgreSQL). The non-NULL arms must share a family — all
@@ -8343,6 +8569,19 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			vals[i] = v
 		}
 		return CompositeValue(vals), nil
+	case reArray:
+		// An ARRAY[...] constructor — one operator_eval, then build the array from the evaluated
+		// elements (spec/design/array.md §1).
+		m.Charge(Costs.OperatorEval)
+		elems := make([]Value, len(e.sargs))
+		for i, el := range e.sargs {
+			v, err := el.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			elems[i] = v
+		}
+		return ArrayValue(elems), nil
 	case reField:
 		// Field selection `(composite).field` — one operator_eval, then return the `index`-th field
 		// of the evaluated composite base (spec/design/composite.md §S4, cost.md §9). A whole-value
@@ -8360,6 +8599,30 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		default:
 			panic(fmt.Sprintf("field access on a non-composite value: %v", base.Kind))
 		}
+	case reSubscript:
+		// Array element subscript `base[index]`, 1-based (spec/design/array.md §6). A NULL array, a
+		// NULL index, or an out-of-bounds index yields NULL (PG — never an error).
+		m.Charge(Costs.OperatorEval)
+		arr, err := e.operand.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		idx, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if arr.Kind == ValNull || idx.Kind == ValNull {
+			return NullValue(), nil
+		}
+		if arr.Kind != ValArray {
+			panic(fmt.Sprintf("subscript on a non-array value: %v", arr.Kind))
+		}
+		elems := *arr.Array
+		i := idx.Int
+		if i >= 1 && i <= int64(len(elems)) {
+			return elems[i-1], nil // 1-based domain 1..=len
+		}
+		return NullValue(), nil // out of bounds
 	case reConstInt:
 		return IntValue(e.cInt), nil
 	case reConstBool:
@@ -9150,6 +9413,17 @@ func valueCmp(a, b Value) int {
 			}
 		}
 		return cmpInt64(int64(len(x)), int64(len(y)))
+	case a.Kind == ValArray && b.Kind == ValArray:
+		// An array sorts element-wise with NULLs-last per element (the PG array_cmp total order —
+		// spec/design/array.md §5): the first non-equal element decides, recursing through keyCmp;
+		// a shorter array (prefix) sorts first.
+		x, y := *a.Array, *b.Array
+		for i := 0; i < len(x) && i < len(y); i++ {
+			if c := keyCmp(x[i], y[i], false, false); c != 0 {
+				return c
+			}
+		}
+		return cmpInt64(int64(len(x)), int64(len(y)))
 	default:
 		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
 		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -9406,10 +9680,42 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 // coerceForStore coerces a value into a column of resolved type ty for storage
 // (spec/design/composite.md §4): a scalar dispatches to storeValue; a composite to storeComposite.
 func coerceForStore(v Value, ty ColType, typmod *DecimalTypmod, notNull bool, colName string) (Value, error) {
+	if ty.Elem != nil {
+		return storeArray(v, *ty.Elem, notNull, colName)
+	}
 	if ty.Composite {
 		return storeComposite(v, ty.Name, ty.Fields, notNull, colName)
 	}
 	return storeValue(v, ty.Scalar, typmod, notNull, colName)
+}
+
+// storeArray coerces a value into an ARRAY column (spec/design/array.md §4): NULL honours NOT NULL
+// (23502); a ValArray coerces each element to the declared element type via coerceForStore (a NULL
+// element is allowed — array elements are nullable). Any other value is a 42804.
+func storeArray(v Value, elem ColType, notNull bool, colName string) (Value, error) {
+	switch v.Kind {
+	case ValNull:
+		if notNull {
+			return Value{}, NewError(NotNullViolation,
+				"null value in column "+colName+" violates not-null constraint")
+		}
+		return NullValue(), nil
+	case ValArray:
+		vals := *v.Array
+		out := make([]Value, len(vals))
+		for i, el := range vals {
+			// Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[]
+			// is deferred — §12).
+			cv, err := coerceForStore(el, elem, nil, false, colName)
+			if err != nil {
+				return Value{}, err
+			}
+			out[i] = cv
+		}
+		return ArrayValue(out), nil
+	default:
+		return Value{}, typeError("cannot store a non-array value in array column " + colName)
+	}
 }
 
 // storeComposite coerces a value into a COMPOSITE column (spec/design/composite.md §4): NULL honours
@@ -9478,12 +9784,43 @@ func literalToValue(lit Literal) Value {
 // $N. The result is then fully coerced/range-checked by coerceForStore. DEFAULT is handled by the
 // caller at the top level (it is not a valid field inside a ROW(...)).
 func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, error) {
+	if ty.Elem != nil {
+		switch {
+		case iv.IsArray:
+			// ARRAY[e, …]: materialize each element against the element type.
+			vals := make([]Value, len(iv.Array))
+			for i := range iv.Array {
+				ev, err := materializeInsertValue(iv.Array[i], *ty.Elem, bound)
+				if err != nil {
+					return Value{}, err
+				}
+				vals[i] = ev
+			}
+			return ArrayValue(vals), nil
+		case iv.IsParam:
+			return bound[int(iv.Param)-1], nil
+		case iv.IsRow:
+			return Value{}, typeError("cannot assign a record value to an array column")
+		case iv.IsDefault:
+			return Value{}, NewError(SyntaxError, "DEFAULT is not allowed inside ARRAY[...]")
+		case iv.Lit.Kind == LiteralText:
+			// A bare string literal adapts to the array context via array_in (the same
+			// string-adapts-to-context rule bytea/uuid use — spec/design/array.md §7).
+			return coerceStringToArray(iv.Lit.Str, *ty.Elem)
+		case iv.Lit.Kind == LiteralNull:
+			return NullValue(), nil
+		default:
+			return Value{}, typeError("cannot assign a scalar value to an array column")
+		}
+	}
 	if !ty.Composite {
 		switch {
 		case iv.IsDefault:
 			return Value{}, NewError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
 		case iv.IsRow:
 			return Value{}, typeError("cannot assign a record value to a " + ty.Scalar.CanonicalName() + " field")
+		case iv.IsArray:
+			return Value{}, typeError("cannot assign an array value to a " + ty.Scalar.CanonicalName() + " field")
 		case iv.IsParam:
 			return bound[int(iv.Param)-1], nil
 		default:
@@ -9508,9 +9845,82 @@ func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, e
 		return CompositeValue(vals), nil
 	case iv.IsParam:
 		return bound[int(iv.Param)-1], nil
+	case iv.IsArray:
+		return Value{}, typeError("cannot assign an array value to composite column (type " + ty.Name + ")")
 	case iv.IsDefault:
 		return Value{}, NewError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
 	default:
 		return Value{}, typeError("cannot assign a scalar value to composite column (type " + ty.Name + ")")
+	}
+}
+
+// coerceStringToArray parses a text array literal into a ValArray against the element ColType via
+// array_in (spec/design/array.md §7): each token is coerced to the element type (an unquoted NULL
+// token → NULL element). A malformed literal is 22P02.
+func coerceStringToArray(s string, elem ColType) (Value, error) {
+	tokens, ok := parseArrayTokens(s)
+	if !ok {
+		return Value{}, NewError(InvalidTextRepresentation, "malformed array literal")
+	}
+	if elem.Composite || elem.Elem != nil {
+		return Value{}, NewError(FeatureNotSupported,
+			"array literal of a non-scalar element type is not supported")
+	}
+	vals := make([]Value, len(tokens))
+	for i, tok := range tokens {
+		if tok == nil {
+			vals[i] = NullValue()
+			continue
+		}
+		ev, err := coerceStringLiteralToValue(*tok, elem.Scalar)
+		if err != nil {
+			return Value{}, err
+		}
+		vals[i] = ev
+	}
+	return ArrayValue(vals), nil
+}
+
+// coerceStringLiteralToValue coerces an array-element token string to a runtime Value of the
+// element scalar type, via the same string-literal coercion the typed-literal path uses (22P02 /
+// 22003 on bad input).
+func coerceStringLiteralToValue(s string, target ScalarType) (Value, error) {
+	node, _, err := coerceStringLiteral(s, target, nil)
+	if err != nil {
+		return Value{}, err
+	}
+	return rExprConstToValue(node)
+}
+
+// rExprConstToValue extracts the Value from a constant rExpr (the const nodes coerceStringLiteral
+// produces).
+func rExprConstToValue(e *rExpr) (Value, error) {
+	switch e.kind {
+	case reConstNull:
+		return NullValue(), nil
+	case reConstInt:
+		return IntValue(e.cInt), nil
+	case reConstBool:
+		return BoolValue(e.cBool), nil
+	case reConstText:
+		return TextValue(e.cText), nil
+	case reConstDecimal:
+		return DecimalValue(e.cDec), nil
+	case reConstBytea:
+		return ByteaValue(e.cBytea), nil
+	case reConstUuid:
+		return UuidValue(e.cBytea), nil
+	case reConstTimestamp:
+		return TimestampValue(e.cInt), nil
+	case reConstTimestamptz:
+		return TimestamptzValue(e.cInt), nil
+	case reConstInterval:
+		return IntervalValue(e.cIv), nil
+	case reConstFloat32:
+		return Float32Value(float32(e.cFloat)), nil
+	case reConstFloat64:
+		return Float64Value(e.cFloat), nil
+	default:
+		return Value{}, typeError("non-constant array element literal")
 	}
 }

@@ -22,7 +22,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 9     // on-disk format version (9 = composite (row) types: kind-tagged catalog entries + composite-type entries; v8 added the per-column expression-default flag bit3 + expr-text; v7 added a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
+	formatVersion   uint16 = 10    // on-disk format version (10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4). 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 9 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -83,6 +83,43 @@ func typeCodeForScalar(ty ScalarType) byte {
 	default:
 		return 0
 	}
+}
+
+// pushArrayElementType appends an array column's element type descriptor (spec/design/array.md §3):
+// the element's type code, then (for a composite element) its name. v1 element types are scalars;
+// a composite element is handled for forward-compat, a nested array element is rejected
+// (multidimensionality is a value property, not array-of-array — §2).
+func pushArrayElementType(out []byte, elem Type) []byte {
+	if elem.Array != nil {
+		panic("nested array element (array-of-array) is not a jed type — array.md §2")
+	}
+	if elem.Comp != nil {
+		out = append(out, 14)
+		out = appendU16(out, uint16(len(elem.Comp.Name)))
+		return append(out, elem.Comp.Name...)
+	}
+	return append(out, typeCodeForScalar(elem.Scalar))
+}
+
+// readArrayElementType decodes an array column's element type descriptor (inverse of
+// pushArrayElementType).
+func readArrayElementType(buf []byte, pos *int) (Type, error) {
+	code, err := readU8(buf, pos)
+	if err != nil {
+		return Type{}, err
+	}
+	if code == 14 {
+		name, err := readString(buf, pos)
+		if err != nil {
+			return Type{}, err
+		}
+		return CompositeT(name), nil
+	}
+	s, ok := scalarForTypeCode(code)
+	if !ok {
+		return Type{}, NewError(DataCorrupted, "invalid array element code")
+	}
+	return ScalarT(s), nil
 }
 
 // scalarForTypeCode is the inverse of typeCodeForScalar; ok=false for an unknown code.
@@ -153,6 +190,17 @@ func pageCRC(page []byte) uint32 {
 // is the shared presence tag then a body of `null-bitmap ‖ each present field's value-codec body`
 // (no per-field tag — the bitmap carries presence), recursing for nested composites.
 func encodeValue(ty ColType, v Value) []byte {
+	if ty.Elem != nil {
+		// An array column (spec/design/array.md §4): the shared presence tag then the array body.
+		if v.Kind == ValNull {
+			return []byte{0x01}
+		}
+		if v.Kind != ValArray {
+			panic("BUG: a non-array value in an array column")
+		}
+		out := []byte{0x00} // present
+		return append(out, encodeArrayBody(*ty.Elem, *v.Array)...)
+	}
 	if !ty.Composite {
 		return encodeScalar(ty.Scalar, v)
 	}
@@ -164,6 +212,49 @@ func encodeValue(ty ColType, v Value) []byte {
 	}
 	out := []byte{0x00} // present
 	return append(out, encodeCompositeBody(ty.Fields, *v.Comp)...)
+}
+
+// encodeArrayBody is an array value's body (after the 0x00 present tag, spec/design/array.md §4):
+// ndim u8, flags u8, per-dim (len u32 BE, lb i32 BE), then the optional null bitmap (present iff
+// HAS_NULLS) and the present element bodies. v1 writes 1-D values only: an empty array is ndim 0;
+// a non-empty array is ndim 1, len = element count, lb = 1. The bitmap (MSB-first, like composite)
+// is present iff any element is NULL; a NULL element contributes zero body bytes.
+func encodeArrayBody(elem ColType, elems []Value) []byte {
+	if len(elems) == 0 {
+		return []byte{0, 0} // ndim 0, flags 0 (empty array)
+	}
+	hasNulls := false
+	for _, e := range elems {
+		if e.Kind == ValNull {
+			hasNulls = true
+			break
+		}
+	}
+	out := make([]byte, 0, 10+4*len(elems))
+	out = append(out, 1) // ndim = 1 (v1: 1-D values only)
+	if hasNulls {
+		out = append(out, 0x01) // flags: bit 0 = HAS_NULLS
+	} else {
+		out = append(out, 0x00)
+	}
+	out = appendU32(out, uint32(len(elems))) // dim length
+	out = appendU32(out, 1)                  // lower bound = 1
+	if hasNulls {
+		nbytes := (len(elems) + 7) / 8
+		bitmap := make([]byte, nbytes)
+		for i, e := range elems {
+			if e.Kind == ValNull {
+				bitmap[i/8] |= 0x80 >> uint(i%8)
+			}
+		}
+		out = append(out, bitmap...)
+	}
+	for _, e := range elems {
+		if e.Kind != ValNull {
+			out = append(out, encodeValue(elem, e)[1:]...) // body only (no presence tag)
+		}
+	}
+	return out
 }
 
 // encodeCompositeBody is a composite value's body (after the 0x00 present tag,
@@ -204,6 +295,9 @@ func encodeScalar(ty ScalarType, v Value) []byte {
 	case ValComposite:
 		// A composite value is encoded by encodeValue's composite arm, never here.
 		panic("BUG: a composite value reached the scalar codec")
+	case ValArray:
+		// An array value is encoded by encodeValue's array arm, never here.
+		panic("BUG: an array value reached the scalar codec")
 	case ValText, ValBytea:
 		// text (UTF-8) and bytea (raw bytes) share the compact length-prefixed body; both
 		// hold their bytes in Str, so the on-disk form is identical.
@@ -1177,7 +1271,8 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ColType, reached 
 // spills via the same overflow + LZ4 path when a record exceeds RECORD_MAX (spec/design/composite.md
 // §4); a small composite is never actually chosen by the plan.
 func isSpillable(ty ColType) bool {
-	if ty.Composite {
+	if ty.Composite || ty.Elem != nil {
+		// An array's opaque inline body spills via the same overflow + LZ4 path (array.md §4).
 		return true
 	}
 	return ty.Scalar.IsText() || ty.Scalar.IsBytea() || ty.Scalar.IsDecimal()
@@ -1377,6 +1472,11 @@ func recordCompressUnits(colTypes []ColType, key []byte, row Row, capacity int) 
 // externalized (large-values.md §12): raw UTF-8 for text / raw bytes for bytea (both in v.Str), the
 // decimal body (encoding minus its presence tag) for decimal. Only spillable types reach here.
 func valuePayload(ty ColType, v Value) []byte {
+	if ty.Elem != nil {
+		// An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies);
+		// a large array spills through the same overflow + LZ4 path (spec/design/array.md §4).
+		return encodeArrayBody(*ty.Elem, *v.Array)
+	}
 	if ty.Composite {
 		// A composite's payload is its body — the encoding minus the leading presence tag, i.e. the
 		// null bitmap + present-field bodies (spec/design/composite.md §4).
@@ -1395,6 +1495,11 @@ func valuePayload(ty ColType, v Value) []byte {
 // valueFromPayload reconstructs a value from the P(v) content gathered from its overflow chain
 // (inverse of valuePayload) — large-values.md §12.
 func valueFromPayload(ty ColType, payload []byte) (Value, error) {
+	if ty.Elem != nil {
+		// An array's payload is its body; decode it with a fresh cursor (spec/design/array.md §4).
+		pos := 0
+		return readArrayBody(ty, payload, &pos)
+	}
 	if ty.Composite {
 		// A composite's payload is its body (bitmap + present-field bodies); decode it with a fresh
 		// cursor (spec/design/composite.md §4).
@@ -1615,6 +1720,18 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 			out = append(out, flags)
 			out = appendU16(out, uint16(len(col.Type.Comp.Name)))
 			out = append(out, col.Type.Comp.Name...)
+			continue
+		}
+		if col.Type.Array != nil {
+			// An array column (v10): type_code 15, flags, then the element type descriptor
+			// (spec/design/array.md §3). Arrays carry no default this slice (flags bits 2/3 = 0).
+			out = append(out, 15)
+			var flags byte
+			if col.NotNull {
+				flags |= 0b10
+			}
+			out = append(out, flags)
+			out = pushArrayElementType(out, *col.Type.Array)
 			continue
 		}
 		out = append(out, typeCodeForScalar(col.Type.ScalarTy()))
@@ -1960,6 +2077,26 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			columns = append(columns, Column{
 				Name:    cname,
 				Type:    CompositeT(tname),
+				NotNull: flags&0b10 != 0,
+			})
+			continue
+		}
+		if tc == 15 {
+			// An array column (v10): flags, then the element type descriptor (array.md §3).
+			flags, err := readU8(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			if flags&0b01 != 0 {
+				return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit0 set")
+			}
+			elem, err := readArrayElementType(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			columns = append(columns, Column{
+				Name:    cname,
+				Type:    ArrayT(elem),
 				NotNull: flags&0b10 != 0,
 			})
 			continue
@@ -2416,10 +2553,71 @@ func readValue(ty ColType, buf []byte, pos *int, fetch func(uint32) ([]byte, err
 // readInlineBody reads the present-value body (after a 0x00 tag) for any ColType: a scalar via
 // readInlineScalar, or a composite via readCompositeBody (spec/design/composite.md §4).
 func readInlineBody(ty ColType, buf []byte, pos *int) (Value, error) {
+	if ty.Elem != nil {
+		return readArrayBody(ty, buf, pos)
+	}
 	if ty.Composite {
 		return readCompositeBody(ty, buf, pos)
 	}
 	return readInlineScalar(ty.Scalar, buf, pos)
+}
+
+// readArrayBody reads an array value's present body (after the 0x00 tag): inverse of
+// encodeArrayBody (spec/design/array.md §4). Reads ndim/flags/per-dim (len, lb), then the optional
+// null bitmap and the present element bodies. v1 accepts ndim 0 (empty) or 1 (1-D); a higher ndim
+// is rejected XX001 (multidim values are not written this slice — §12).
+func readArrayBody(ty ColType, buf []byte, pos *int) (Value, error) {
+	if ty.Elem == nil {
+		return Value{}, NewError(DataCorrupted, "readArrayBody on a non-array type")
+	}
+	ndim, err := readU8(buf, pos)
+	if err != nil {
+		return Value{}, err
+	}
+	flags, err := readU8(buf, pos)
+	if err != nil {
+		return Value{}, err
+	}
+	if flags&^0x01 != 0 {
+		return Value{}, NewError(DataCorrupted, "array flags has a reserved bit set")
+	}
+	if ndim == 0 {
+		// An empty array — a non-nil empty slice, matching the store path's make([]Value, 0) so an
+		// empty array read back is reflect.DeepEqual to one built in memory (nil != [] in DeepEqual).
+		return ArrayValue([]Value{}), nil
+	}
+	if ndim != 1 {
+		return Value{}, NewError(DataCorrupted, "multidimensional array value not supported (ndim > 1)")
+	}
+	n, err := readU32(buf, pos)
+	if err != nil {
+		return Value{}, err
+	}
+	if _, err := readU32(buf, pos); err != nil { // lower bound (round-tripped, ignored in v1)
+		return Value{}, err
+	}
+	length := int(n)
+	hasNulls := flags&0x01 != 0
+	var bitmap []byte
+	if hasNulls {
+		bitmap, err = take(buf, pos, (length+7)/8)
+		if err != nil {
+			return Value{}, err
+		}
+	}
+	elems := make([]Value, length)
+	for i := 0; i < length; i++ {
+		if hasNulls && bitmap[i/8]&(0x80>>uint(i%8)) != 0 {
+			elems[i] = NullValue()
+		} else {
+			v, err := readInlineBody(*ty.Elem, buf, pos)
+			if err != nil {
+				return Value{}, err
+			}
+			elems[i] = v
+		}
+	}
+	return ArrayValue(elems), nil
 }
 
 // readCompositeBody reads a composite value's present body (after the 0x00 tag): the null bitmap then

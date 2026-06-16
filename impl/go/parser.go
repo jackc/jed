@@ -398,6 +398,13 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef) (Colum
 	if err != nil {
 		return ColumnDef{}, err
 	}
+	isArray, err := p.consumeArrayBrackets()
+	if err != nil {
+		return ColumnDef{}, err
+	}
+	if isArray {
+		typeName += "[]"
+	}
 	// Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, DEFAULT <literal>,
 	// [CONSTRAINT name] CHECK ( expr ), and [CONSTRAINT name] UNIQUE. A boolean constraint
 	// may be repeated harmlessly; a repeated DEFAULT keeps the last; each CHECK is a
@@ -470,6 +477,22 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef) (Colum
 // after a type name (the first parameterized type, decimal — spec/grammar/grammar.ebnf
 // type_name). The shape is accepted for any type name; whether a typmod is meaningful (decimal
 // only) and in range is decided at resolve. Empty parens or a non-integer inside is 42601.
+// consumeArrayBrackets consumes a trailing array type suffix `[]` (spec/design/array.md §1) after a
+// type name (and its optional typmod). Returns whether the type is an array. Multiple `[][]`
+// collapse to one array level — multidimensionality is a value property, not array-of-array (§2).
+// Only the empty-bracket form `[]` is accepted this slice.
+func (p *Parser) consumeArrayBrackets() (bool, error) {
+	isArray := false
+	for p.peek().Kind == TokLBracket {
+		p.advance() // '['
+		if err := p.expect(TokRBracket); err != nil {
+			return false, err
+		}
+		isArray = true
+	}
+	return isArray, nil
+}
+
 func (p *Parser) parseTypeMod() (*TypeMod, error) {
 	if p.peek().Kind != TokLParen {
 		return nil, nil
@@ -823,6 +846,34 @@ func (p *Parser) parseInsertValue() (InsertValue, error) {
 			p.advance() // the empty ROW() — consume ')'
 		}
 		return InsertValue{IsRow: true, Row: fields}, nil
+	}
+	if p.peekKeyword() == "array" && p.peekKindAt(1) == TokLBracket {
+		// ARRAY[elem, …] — recurse on each element (a literal or a $N).
+		p.advance() // ARRAY
+		if err := p.expect(TokLBracket); err != nil {
+			return InsertValue{}, err
+		}
+		var elems []InsertValue
+		if p.peek().Kind != TokRBracket {
+			for {
+				e, err := p.parseInsertValue()
+				if err != nil {
+					return InsertValue{}, err
+				}
+				elems = append(elems, e)
+				tok := p.advance()
+				if tok.Kind == TokComma {
+					continue
+				}
+				if tok.Kind == TokRBracket {
+					break
+				}
+				return InsertValue{}, NewError(SyntaxError, fmt.Sprintf("expected ',' or ']', found %v", tok))
+			}
+		} else {
+			p.advance() // the empty ARRAY[] — consume ']'
+		}
+		return InsertValue{IsArray: true, Array: elems}, nil
 	}
 	if p.peek().Kind == TokParam {
 		n := p.advance().Int
@@ -1829,7 +1880,30 @@ func (p *Parser) parsePostfix() (Expr, error) {
 			if err != nil {
 				return Expr{}, err
 			}
+			isArray, err := p.consumeArrayBrackets()
+			if err != nil {
+				return Expr{}, err
+			}
+			if isArray {
+				typeName += "[]"
+			}
 			expr = Expr{Kind: ExprCast, Cast: &CastExpr{Inner: expr, TypeName: typeName, TypeMod: typeMod}}
+			fieldAccessible = false
+		// `base[index]` — array element subscript (spec/design/array.md §6). Applies to ANY base
+		// (no parens rule, unlike `.field`) and chains (`a[1][2]`). The index is a full expression;
+		// a slice `a[m:n]` is deferred (no single-colon token, so it does not parse). After a
+		// subscript a `.field` still needs parens (PG), so it is not field-accessible.
+		case p.peek().Kind == TokLBracket:
+			p.advance()
+			base := expr
+			index, err := p.parseExpr()
+			if err != nil {
+				return Expr{}, err
+			}
+			if err := p.expect(TokRBracket); err != nil {
+				return Expr{}, err
+			}
+			expr = Expr{Kind: ExprSubscript, Base: &base, Index: &index}
 			fieldAccessible = false
 		// `.field` / `.*` — composite field selection (spec/design/composite.md §S4),
 		// parens-required: only on a parenthesized / chained-field base.
@@ -1926,6 +2000,35 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		}
 		return Expr{Kind: ExprRow, RowItems: items}, nil
 	}
+	// `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Recognized when ARRAY is
+	// immediately followed by `[`, so `array` stays usable as an identifier otherwise.
+	if p.peekKeyword() == "array" && p.peekKindAt(1) == TokLBracket {
+		p.advance() // ARRAY
+		if err := p.expect(TokLBracket); err != nil {
+			return Expr{}, err
+		}
+		var items []Expr
+		if p.peek().Kind != TokRBracket {
+			for {
+				e, err := p.parseExpr()
+				if err != nil {
+					return Expr{}, err
+				}
+				items = append(items, e)
+				tok := p.advance()
+				if tok.Kind == TokComma {
+					continue
+				}
+				if tok.Kind == TokRBracket {
+					break
+				}
+				return Expr{}, NewError(SyntaxError, fmt.Sprintf("expected ',' or ']', found %v", tok))
+			}
+		} else {
+			p.advance() // the empty ARRAY[] — consume ']'
+		}
+		return Expr{Kind: ExprArray, RowItems: items}, nil
+	}
 	if p.peekKeyword() == "cast" {
 		p.advance()
 		if err := p.expect(TokLParen); err != nil {
@@ -1945,6 +2048,13 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		typeMod, err := p.parseTypeMod()
 		if err != nil {
 			return Expr{}, err
+		}
+		isArray, err := p.consumeArrayBrackets()
+		if err != nil {
+			return Expr{}, err
+		}
+		if isArray {
+			typeName += "[]"
 		}
 		if err := p.expect(TokRParen); err != nil {
 			return Expr{}, err
@@ -2299,6 +2409,10 @@ func renderToken(t Token) string {
 		return "("
 	case TokRParen:
 		return ")"
+	case TokLBracket:
+		return "["
+	case TokRBracket:
+		return "]"
 	case TokStar:
 		return "*"
 	case TokPlus:

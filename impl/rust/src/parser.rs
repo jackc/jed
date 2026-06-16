@@ -272,8 +272,14 @@ impl Parser {
         uniques: &mut Vec<UniqueDef>,
     ) -> Result<ColumnDef> {
         let name = self.expect_identifier()?;
-        let type_name = self.expect_identifier()?;
+        let base_type = self.expect_identifier()?;
         let type_mod = self.parse_type_mod()?;
+        let is_array = self.consume_array_brackets()?;
+        let type_name = if is_array {
+            format!("{base_type}[]")
+        } else {
+            base_type
+        };
         // Zero or more order-free column constraints: `PRIMARY KEY`, `NOT NULL`,
         // `DEFAULT <literal>`, `[CONSTRAINT name] CHECK ( expr )`, and
         // `[CONSTRAINT name] UNIQUE`. A boolean constraint may be repeated harmlessly; a
@@ -352,6 +358,21 @@ impl Parser {
     /// `type_name`). The shape is accepted for any type name; whether a typmod is *meaningful*
     /// (decimal only) and in range (1..=1000, 0..=p) is decided at resolve. Empty parens or a
     /// non-integer inside is a 42601 syntax error.
+    /// Consume a trailing array type suffix `[]` (spec/design/array.md §1) after a type name (and
+    /// its optional typmod). Returns whether the type is an array. Multiple `[][]` collapse to one
+    /// array level — multidimensionality is a value property, not array-of-array (§2), so the type
+    /// is dimension-agnostic. Only the empty-bracket form `[]` is accepted this slice (a size like
+    /// `[3]` is deferred).
+    fn consume_array_brackets(&mut self) -> Result<bool> {
+        let mut is_array = false;
+        while matches!(self.peek(), Token::LBracket) {
+            self.advance(); // [
+            self.expect(&Token::RBracket)?;
+            is_array = true;
+        }
+        Ok(is_array)
+    }
+
     fn parse_type_mod(&mut self) -> Result<Option<TypeMod>> {
         if !matches!(self.peek(), Token::LParen) {
             return Ok(None);
@@ -608,6 +629,28 @@ impl Parser {
                 self.advance(); // the empty ROW() — consume ')'
             }
             Ok(InsertValue::Row(fields))
+        } else if self.peek_keyword().as_deref() == Some("array")
+            && matches!(self.peek_at(1), Token::LBracket)
+        {
+            // ARRAY[elem, …] — recurse on each element (a literal or a `$N`).
+            self.advance(); // ARRAY
+            self.expect(&Token::LBracket)?;
+            let mut elems = Vec::new();
+            if !matches!(self.peek(), Token::RBracket) {
+                loop {
+                    elems.push(self.parse_insert_value()?);
+                    match self.advance() {
+                        Token::Comma => continue,
+                        Token::RBracket => break,
+                        other => {
+                            return Err(syntax(format!("expected ',' or ']', found {other:?}")));
+                        }
+                    }
+                }
+            } else {
+                self.advance(); // the empty ARRAY[] — consume ']'
+            }
+            Ok(InsertValue::Array(elems))
         } else if let Token::Param(n) = self.peek() {
             let n = *n;
             self.advance();
@@ -1463,12 +1506,33 @@ impl Parser {
             match self.peek() {
                 Token::DoubleColon => {
                     self.advance();
-                    let type_name = self.expect_identifier()?;
+                    let base_type = self.expect_identifier()?;
                     let type_mod = self.parse_type_mod()?;
+                    let is_array = self.consume_array_brackets()?;
+                    let type_name = if is_array {
+                        format!("{base_type}[]")
+                    } else {
+                        base_type
+                    };
                     expr = Expr::Cast {
                         inner: Box::new(expr),
                         type_name,
                         type_mod,
+                    };
+                    field_accessible = false;
+                }
+                // `base[index]` — array element subscript (spec/design/array.md §6). Applies to ANY
+                // base (no parens rule, unlike `.field`) and chains (`a[1][2]`). The index is a full
+                // expression; a slice `a[m:n]` is deferred (no single-colon token, so it does not
+                // parse). After a subscript a `.field` still needs parens (PG), so it is not
+                // field-accessible.
+                Token::LBracket => {
+                    self.advance();
+                    let index = self.parse_expr()?;
+                    self.expect(&Token::RBracket)?;
+                    expr = Expr::Subscript {
+                        base: Box::new(expr),
+                        index: Box::new(index),
                     };
                     field_accessible = false;
                 }
@@ -1530,8 +1594,14 @@ impl Parser {
             self.expect(&Token::LParen)?;
             let inner = self.parse_expr()?;
             self.expect_keyword("as")?;
-            let type_name = self.expect_identifier()?;
+            let base_type = self.expect_identifier()?;
             let type_mod = self.parse_type_mod()?;
+            let is_array = self.consume_array_brackets()?;
+            let type_name = if is_array {
+                format!("{base_type}[]")
+            } else {
+                base_type
+            };
             self.expect(&Token::RParen)?;
             return Ok(Expr::Cast {
                 inner: Box::new(inner),
@@ -1562,6 +1632,31 @@ impl Parser {
                 self.advance(); // the empty ROW() — consume ')'
             }
             return Ok(Expr::Row(fields));
+        }
+        // `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Recognized only when
+        // `ARRAY` is immediately followed by `[`, so `array` stays usable as an identifier
+        // otherwise. `ARRAY[]` is the empty array.
+        if self.peek_keyword().as_deref() == Some("array")
+            && matches!(self.peek_at(1), Token::LBracket)
+        {
+            self.advance(); // ARRAY
+            self.expect(&Token::LBracket)?;
+            let mut elems = Vec::new();
+            if !matches!(self.peek(), Token::RBracket) {
+                loop {
+                    elems.push(self.parse_expr()?);
+                    match self.advance() {
+                        Token::Comma => continue,
+                        Token::RBracket => break,
+                        other => {
+                            return Err(syntax(format!("expected ',' or ']', found {other:?}")));
+                        }
+                    }
+                }
+            } else {
+                self.advance(); // the empty ARRAY[] — consume ']'
+            }
+            return Ok(Expr::Array(elems));
         }
         // A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`,
         // equal to `CAST('string' AS type)` over a string-literal operand: ANY type-naming word
@@ -1893,6 +1988,8 @@ fn render_token(t: &Token) -> String {
         Token::Dot => ".".into(),
         Token::LParen => "(".into(),
         Token::RParen => ")".into(),
+        Token::LBracket => "[".into(),
+        Token::RBracket => "]".into(),
         Token::Star => "*".into(),
         Token::Plus => "+".into(),
         Token::Minus => "-".into(),

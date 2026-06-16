@@ -27,6 +27,11 @@ const (
 	TokLParen
 	// TokRParen is ")".
 	TokRParen
+	// TokLBracket is "[" — the array subscript / ARRAY[…] / T[] type-suffix bracket
+	// (spec/design/array.md).
+	TokLBracket
+	// TokRBracket is "]".
+	TokRBracket
 	// TokStar is "*".
 	TokStar
 	// TokPlus is "+".

@@ -10,6 +10,8 @@ export type TokenKind =
   //         "." is NOT part of a numeric literal (spec/design/grammar.md §4/§15)
   | "lparen" // (
   | "rparen" // )
+  | "lbracket" // [ — array subscript / ARRAY[…] / T[] type-suffix (spec/design/array.md)
+  | "rbracket" // ]
   | "star" // *
   | "plus" // +
   | "minus" // -

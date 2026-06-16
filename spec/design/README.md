@@ -59,6 +59,12 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   literal parsing, infinity sentinels, and the (no-time-zone-db) scope.
 - [interval.md](interval.md) — the `interval` span (months/days/micros): the input subset, PG
   render, the canonical 128-bit comparison, and interval/timestamp arithmetic.
+- [composite.md](composite.md) — composite (row) types (`CREATE TYPE … AS (…)`): the first
+  user-defined type, the open `Type { Scalar | Composite }`, the recursive value codec + null
+  bitmap, element-wise 3VL comparison, the all-fields `IS NULL` rule, and `record_in`/`record_out`.
+- [array.md](array.md) — array types (`T[]`): the second container axis, the **structural**
+  `Array(Box<Type>)`, shape-as-a-value-property (PG-faithful), the compact null-bitmap value codec
+  (no per-element prefix), btree-NULL element comparison (not composite 3VL), and `array_in`/`array_out`.
 - [constraints.md](constraints.md) — column/table constraints: `NOT NULL`, `DEFAULT` (constant +
   expression), `CHECK`, and `UNIQUE` (a UNIQUE constraint *is* its backing unique index).
 - [indexes.md](indexes.md) — secondary indexes: the catalog reshape (pk ordinal list + per-table

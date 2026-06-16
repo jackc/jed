@@ -119,6 +119,10 @@ export type Expr =
   // the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The bare
   // `(a, b)` form is deferred (0A000); only the keyword form parses.
   | { kind: "row"; fields: Expr[] }
+  // An `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Builds a 1-D array value from
+  // the element expressions, unified to a common element type at resolve; `ARRAY[]` is the empty
+  // array (its element type comes from an enclosing cast/column context).
+  | { kind: "array"; elements: Expr[] }
   // Field selection `(expr).field` (spec/design/composite.md §S4) — the value of one named field of
   // a composite `base`. The parser produces this for a `.name` postfix on a parenthesized / ROW(…) /
   // cast / qualified-column base; a bare `a.b` stays qualifiedColumn and only falls back to field
@@ -129,7 +133,12 @@ export type Expr =
   // Whole-row expansion `(expr).*` (spec/design/composite.md §S4) — expands a composite `base` into
   // one output column per field, in declaration order. Valid only in a SELECT/RETURNING projection
   // list (where `*` expands); in any scalar expression position it is 0A000.
-  | { kind: "fieldStar"; base: Expr };
+  | { kind: "fieldStar"; base: Expr }
+  // Array element subscript `base[index]` (spec/design/array.md §6) — the `index`-th element of an
+  // array `base`, 1-based. An out-of-bounds or NULL subscript yields NULL (PG, not an error); the
+  // result type is the element type. A non-array base is 42804 at resolve. The parser produces this
+  // for a `[…]` postfix on any base expression.
+  | { kind: "subscript"; base: Expr; index: Expr };
 
 // SelectItem is one select-list expression with its optional output-name alias
 // (expr AS name). The alias is an output label only — it never enters resolution
@@ -297,6 +306,9 @@ export type InsertValue =
   // composite target column. Fields are themselves InsertValues (a literal, a $N, or a nested
   // ROW(…)); DEFAULT is not a valid field (only a top-level slot takes a default).
   | { kind: "row"; fields: InsertValue[] }
+  // An ARRAY[…] constructor in a VALUES slot (spec/design/array.md §1) — an array value for an array
+  // target column. Elements are themselves InsertValues (a literal or a $N).
+  | { kind: "array"; elements: InsertValue[] }
   | { kind: "default" };
 
 // TableRef is a table reference in a FROM clause: a table name with an optional alias

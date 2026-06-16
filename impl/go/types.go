@@ -271,7 +271,12 @@ type Type struct {
 	// Comp is the composite reference when this is a composite type, else nil (⇒ scalar). The
 	// pointer is the discriminant (keeps Type ==-comparable for the scalar case).
 	Comp *CompositeRef
-	// Scalar is the inner scalar type when Comp == nil (a scalar type). Meaningless otherwise.
+	// Array is the element type when this is a *structural* array type (`int32[]`), else nil
+	// (spec/design/array.md §2). The element type is carried inline — no catalog object, unlike
+	// Comp. The element is a scalar or composite, never another array (multidimensionality is a
+	// value property, not array-of-array — §2). The pointer also breaks == like Comp.
+	Array *Type
+	// Scalar is the inner scalar type when Comp == nil && Array == nil. Meaningless otherwise.
 	Scalar ScalarType
 }
 
@@ -288,21 +293,27 @@ func ScalarT(s ScalarType) Type { return Type{Scalar: s} }
 // composite is constructed yet); present so the wrapper is complete for later slices.
 func CompositeT(name string) Type { return Type{Comp: &CompositeRef{Name: name}} }
 
+// ArrayT builds a structural array Type over the given element type (spec/design/array.md §2).
+func ArrayT(elem Type) Type { return Type{Array: &elem} }
+
 // ScalarTy returns the inner scalar type. Scalar-only paths (the integer codec, the scalar value
-// codec, the scalar resolver) call this; a composite column reaches those paths only after the
-// caller has branched on IsComposite, so a composite here is an engine-invariant violation
-// (matches the Rust Type::scalar unreachable!).
+// codec, the scalar resolver) call this; a composite/array column reaches those paths only after
+// the caller has branched on IsComposite/IsArray, so a non-scalar here is an engine-invariant
+// violation (matches the Rust Type::scalar unreachable!).
 func (t Type) ScalarTy() ScalarType {
 	if t.Comp != nil {
 		panic("BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " +
 			"composite path must branch before this point (spec/design/composite.md)")
 	}
+	if t.Array != nil {
+		panic("BUG: array type used where a scalar was expected (spec/design/array.md)")
+	}
 	return t.Scalar
 }
 
-// AsScalar returns the inner scalar type and true, or (0, false) for a composite.
+// AsScalar returns the inner scalar type and true, or (0, false) for a composite/array.
 func (t Type) AsScalar() (ScalarType, bool) {
-	if t.Comp != nil {
+	if t.Comp != nil || t.Array != nil {
 		return 0, false
 	}
 	return t.Scalar, true
@@ -311,30 +322,38 @@ func (t Type) AsScalar() (ScalarType, bool) {
 // IsComposite reports whether this is a composite (user-defined row) type.
 func (t Type) IsComposite() bool { return t.Comp != nil }
 
+// IsArray reports whether this is an array type.
+func (t Type) IsArray() bool { return t.Array != nil }
+
 // CanonicalName is this type's canonical name for output / error messages — the scalar's
-// canonical name, or the composite's name.
+// canonical name, the composite's name, or `<elem>[]` for an array.
 func (t Type) CanonicalName() string {
 	if t.Comp != nil {
 		return t.Comp.Name
 	}
+	if t.Array != nil {
+		return t.Array.CanonicalName() + "[]"
+	}
 	return t.Scalar.CanonicalName()
 }
 
-// Scalar-predicate delegates. A composite answers false to every scalar predicate — it is none of
-// these families — so keyability checks (IsInteger || IsUuid || …) correctly reject a composite
-// (0A000), and family branches fall through to their composite handling.
+// Scalar-predicate delegates. A composite/array answers false to every scalar predicate — it is
+// none of these families — so keyability checks (IsInteger || IsUuid || …) correctly reject them
+// (0A000), and family branches fall through to their composite/array handling.
 
-// IsInteger reports whether this is a scalar integer type (false for a composite).
-func (t Type) IsInteger() bool { return t.Comp == nil && t.Scalar.IsInteger() }
+func (t Type) isScalar() bool { return t.Comp == nil && t.Array == nil }
 
-// IsDecimal reports whether this is the scalar decimal type (false for a composite).
-func (t Type) IsDecimal() bool { return t.Comp == nil && t.Scalar.IsDecimal() }
+// IsInteger reports whether this is a scalar integer type (false for a composite/array).
+func (t Type) IsInteger() bool { return t.isScalar() && t.Scalar.IsInteger() }
 
-// IsUuid reports whether this is the scalar uuid type (false for a composite).
-func (t Type) IsUuid() bool { return t.Comp == nil && t.Scalar.IsUuid() }
+// IsDecimal reports whether this is the scalar decimal type (false for a composite/array).
+func (t Type) IsDecimal() bool { return t.isScalar() && t.Scalar.IsDecimal() }
 
-// IsTimestamp reports whether this is the scalar timestamp type (false for a composite).
-func (t Type) IsTimestamp() bool { return t.Comp == nil && t.Scalar.IsTimestamp() }
+// IsUuid reports whether this is the scalar uuid type (false for a composite/array).
+func (t Type) IsUuid() bool { return t.isScalar() && t.Scalar.IsUuid() }
 
-// IsTimestamptz reports whether this is the scalar timestamptz type (false for a composite).
-func (t Type) IsTimestamptz() bool { return t.Comp == nil && t.Scalar.IsTimestamptz() }
+// IsTimestamp reports whether this is the scalar timestamp type (false for a composite/array).
+func (t Type) IsTimestamp() bool { return t.isScalar() && t.Scalar.IsTimestamp() }
+
+// IsTimestamptz reports whether this is the scalar timestamptz type (false for a composite/array).
+func (t Type) IsTimestamptz() bool { return t.isScalar() && t.Scalar.IsTimestamptz() }

@@ -68,6 +68,7 @@ import {
   type ScalarType,
   type Type,
   canonicalName,
+  arrayT,
   compositeT,
   isCompositeType,
   inRange,
@@ -116,6 +117,7 @@ import {
   type Value,
   boolAnd,
   boolNot,
+  arrayValue,
   boolOr,
   boolValue,
   byteaValue,
@@ -123,6 +125,7 @@ import {
   compareBytea,
   compareTextC,
   compositeValue,
+  parseArrayTokens,
   decimalValue,
   eq3,
   float32Value,
@@ -820,7 +823,23 @@ export class Database {
       let colType: Type;
       let decimal: DecimalTypmod | null;
       const ctype = this.compositeType(def.typeName);
-      if (scalarTypeFromName(def.typeName) !== undefined) {
+      if (def.typeName.endsWith("[]")) {
+        // An array column (spec/design/array.md §3). v1 element types are scalars; a typmod on the
+        // array (numeric(p,s)[]) and a composite/nested-array element are deferred (0A000).
+        const base = def.typeName.slice(0, -2);
+        if (def.typeMod !== null) {
+          throw engineError("feature_not_supported", "a type modifier on an array type is not supported yet");
+        }
+        const elemScalar = scalarTypeFromName(base);
+        if (elemScalar === undefined) {
+          if (this.compositeType(base) !== undefined) {
+            throw engineError("feature_not_supported", "an array of composite type " + base + " is not supported yet");
+          }
+          throw engineError("undefined_object", "type does not exist: " + base);
+        }
+        colType = arrayT(scalarT(elemScalar));
+        decimal = null;
+      } else if (scalarTypeFromName(def.typeName) !== undefined) {
         const [s, d] = resolveTypeAndTypmod(def.typeName, def.typeMod);
         colType = scalarT(s);
         decimal = d;
@@ -870,12 +889,13 @@ export class Database {
       //     assignable to the column, 42804) and stored as text for per-row eval.
       let def_default: Value | null = null;
       let def_defaultExpr: DefaultExpr | null = null;
-      if (colType.kind === "composite") {
-        // A DEFAULT on a composite-typed column is not supported this slice (composite.md §12).
+      if (colType.kind === "composite" || colType.kind === "array") {
+        // A DEFAULT on a composite- or array-typed column is not supported this slice
+        // (composite.md §12 / array.md §12).
         if (def.default !== null) {
           throw engineError(
             "feature_not_supported",
-            "a DEFAULT on a composite-typed column is not supported yet",
+            "a DEFAULT on a composite- or array-typed column is not supported yet",
           );
         }
       } else if (def.default !== null) {
@@ -1512,6 +1532,12 @@ export class Database {
             "INSERT ... SELECT into composite column " + col.name + " is not supported yet",
           );
         }
+        if (col.type.kind === "array") {
+          throw engineError(
+            "feature_not_supported",
+            "INSERT ... SELECT into array column " + col.name + " is not supported yet",
+          );
+        }
         if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
           throw typeError(
             `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(q.columnTypes[p]!)}`,
@@ -1959,6 +1985,9 @@ export class Database {
       // round-trip is S3 — spec/design/composite.md §12); reject it for now (0A000).
       if (col.type.kind === "composite") {
         throw engineError("feature_not_supported", "updating composite column " + a.column + " is not supported yet");
+      }
+      if (col.type.kind === "array") {
+        throw engineError("feature_not_supported", "updating array column " + a.column + " is not supported yet");
       }
       const targetScalar = col.type.scalar;
       // The RHS is a general expression evaluated against the OLD row; a literal operand
@@ -3069,8 +3098,15 @@ export class Database {
       case "row":
         e.fields = e.fields.map((f) => this.foldUncorrelatedInRExpr(f, bound, cost));
         return e;
+      case "array":
+        e.elements = e.elements.map((el) => this.foldUncorrelatedInRExpr(el, bound, cost));
+        return e;
       case "field":
         e.base = this.foldUncorrelatedInRExpr(e.base, bound, cost);
+        return e;
+      case "subscript":
+        e.base = this.foldUncorrelatedInRExpr(e.base, bound, cost);
+        e.index = this.foldUncorrelatedInRExpr(e.index, bound, cost);
         return e;
       case "inValues":
         e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
@@ -3523,8 +3559,12 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
       return e.fields.some((f) => rexprReferencesOuter(f, depth));
+    case "array":
+      return e.elements.some((el) => rexprReferencesOuter(el, depth));
     case "field":
       return rexprReferencesOuter(e.base, depth);
+    case "subscript":
+      return rexprReferencesOuter(e.base, depth) || rexprReferencesOuter(e.index, depth);
     default:
       return false; // leaves: column, param, const*
   }
@@ -3580,8 +3620,15 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "row":
       for (const f of e.fields) collectTouched(f, depth, touched);
       return;
+    case "array":
+      for (const el of e.elements) collectTouched(el, depth, touched);
+      return;
     case "field":
       collectTouched(e.base, depth, touched);
+      return;
+    case "subscript":
+      collectTouched(e.base, depth, touched);
+      collectTouched(e.index, depth, touched);
       return;
     default: // leaves: param, const*
   }
@@ -3629,6 +3676,9 @@ function valueToRExpr(v: Value): RExpr {
       // A folded composite constant: fold each field and wrap in a ROW node so eval rebuilds the
       // composite value (spec/design/composite.md).
       return { kind: "row", fields: v.fields.map(valueToRExpr) };
+    case "array":
+      // A folded array constant: fold each element and wrap in an ARRAY node (spec/design/array.md).
+      return { kind: "array", elements: v.elements.map(valueToRExpr) };
     default:
       return { kind: "constNull" };
   }
@@ -3655,6 +3705,11 @@ function distinctValueKey(v: Value): string {
           // Length-prefix the field count and each field's key so a composite never collides with a
           // scalar key and nested composites stay unambiguous.
           return "c" + v.fields.length.toString() + ":" + v.fields.map((f) => distinctValueKey(f)).join(",");
+        case "array":
+          // An array keys structurally (spec/design/array.md §5): the element count under a distinct
+          // 'a' tag, then each element's own key. NULL elements key as 'n' (btree equality — NULLs
+          // mutually equal), so structurally-equal arrays share a DISTINCT/GROUP BY bucket.
+          return "a" + v.elements.length.toString() + ":" + v.elements.map((el) => distinctValueKey(el)).join(",");
         case "null":
           return "n";
         case "int":
@@ -3740,6 +3795,10 @@ type ResolvedType =
   // anonymous ROW(...) result. `fields` are the resolved (name, type) pairs in declaration order
   // (the basis for field access — S4 — and structural assignability).
   | { kind: "composite"; name: string | null; fields: { name: string; type: ResolvedType }[] }
+  // An array type (spec/design/array.md §2), carrying its resolved element type. Two arrays are
+  // comparable iff their element types are comparable; assignable to an array column of the same
+  // element type.
+  | { kind: "array"; elem: ResolvedType }
   | { kind: "null" };
 
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
@@ -3767,10 +3826,17 @@ type RExpr =
   // composite value. Also the folded form of a composite constant (valueToRExpr wraps each field's
   // constant). One operator_eval per node (cost.md §9).
   | { kind: "row"; fields: RExpr[] }
+  // An ARRAY[...] constructor (spec/design/array.md §1): evaluate each element and assemble an array
+  // value. Also the folded form of an array constant. One operator_eval per node.
+  | { kind: "array"; elements: RExpr[] }
   // Field selection `(composite).field` (spec/design/composite.md §S4): evaluate `base` to a
   // composite value and return its `index`-th field (the field ordinal, fixed at resolve). A
   // whole-value-NULL composite yields NULL for any field. One operator_eval per node.
   | { kind: "field"; base: RExpr; index: number }
+  // Array element subscript `base[index]` (spec/design/array.md §6): evaluate `base` to an array and
+  // `index` to an integer, then return the 1-based element. A NULL array, a NULL index, or an
+  // out-of-bounds index yields NULL (PG — never an error). One operator_eval per node.
+  | { kind: "subscript"; base: RExpr; index: RExpr }
   | { kind: "cast"; target: ScalarType; typmod: DecimalTypmod | null; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
   | { kind: "not"; operand: RExpr }
@@ -4189,9 +4255,13 @@ function exprHasAggregate(e: Expr): boolean {
       );
     case "row":
       return e.fields.some(exprHasAggregate);
+    case "array":
+      return e.elements.some(exprHasAggregate);
     case "fieldAccess":
     case "fieldStar":
       return exprHasAggregate(e.base);
+    case "subscript":
+      return exprHasAggregate(e.base) || exprHasAggregate(e.index);
     default:
       return false;
   }
@@ -4264,9 +4334,16 @@ function rejectCheckStructure(e: Expr): void {
     case "row":
       for (const f of e.fields) rejectCheckStructure(f);
       return;
+    case "array":
+      for (const el of e.elements) rejectCheckStructure(el);
+      return;
     case "fieldAccess":
     case "fieldStar":
       return rejectCheckStructure(e.base);
+    case "subscript":
+      rejectCheckStructure(e.base);
+      rejectCheckStructure(e.index);
+      return;
     default: // column, qualifiedColumn, literal
       return;
   }
@@ -4324,9 +4401,16 @@ function rejectDefaultStructure(e: Expr): void {
     case "row":
       for (const f of e.fields) rejectDefaultStructure(f);
       return;
+    case "array":
+      for (const el of e.elements) rejectDefaultStructure(el);
+      return;
     case "fieldAccess":
     case "fieldStar":
       return rejectDefaultStructure(e.base);
+    case "subscript":
+      rejectDefaultStructure(e.base);
+      rejectDefaultStructure(e.index);
+      return;
     default: // literal, typedLiteral
       return;
   }
@@ -4382,9 +4466,16 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
       case "row":
         for (const f of e.fields) walk(f);
         return;
+      case "array":
+        for (const el of e.elements) walk(el);
+        return;
       case "fieldAccess":
       case "fieldStar":
         return walk(e.base);
+      case "subscript":
+        walk(e.base);
+        walk(e.index);
+        return;
       default: // literal, param; subqueries unreachable in a validated check
         return;
     }
@@ -4498,6 +4589,9 @@ function argFamily(t: ResolvedType): string | null {
     case "composite":
       // No catalog function takes a composite this slice; it matches no concrete family (only the
       // wildcard "any" slot, via familyMatches) — spec/design/composite.md.
+      return null;
+    case "array":
+      // No built-in function/aggregate argument family for arrays this slice.
       return null;
     case "null":
       return null;
@@ -4993,6 +5087,7 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
 // composite reference is guaranteed to resolve (CREATE TYPE / the two-pass load validated it).
 function resolvedTypeOfCol(ty: Type, db: Database): ResolvedType {
   if (ty.kind === "scalar") return resolvedTypeOf(ty.scalar);
+  if (ty.kind === "array") return { kind: "array", elem: resolvedTypeOfCol(ty.elem, db) };
   const def = db.compositeType(ty.name);
   if (def === undefined) throw new Error("composite type reference resolved at load / CREATE TYPE");
   return {
@@ -5020,6 +5115,10 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
     // A composite source never assigns to a scalar column (the composite-target case is handled
     // structurally at the call site — spec/design/composite.md §4).
     case "composite":
+      return false;
+    // An array source never assigns to a scalar column (INSERT ... SELECT into an array column is
+    // deferred — spec/design/array.md §12).
+    case "array":
       return false;
     case "int":
       return isInteger(colTy) || isDecimal(colTy);
@@ -5088,6 +5187,8 @@ function rtName(t: ResolvedType): string {
     case "composite":
       // A named composite is its type name; an anonymous ROW(...) is `record` (PG).
       return t.name ?? "record";
+    case "array":
+      return rtName(t.elem) + "[]";
     case "null":
       return "unknown";
   }
@@ -5317,6 +5418,9 @@ function outputName(scope: Scope, e: Expr): string {
   // selection takes the FIELD name lowercased (PG names the output column after the field).
   if (e.kind === "funcCall") return e.name.toLowerCase();
   if (e.kind === "fieldAccess") return e.field.toLowerCase();
+  // A subscript takes the base array's name (PG names `a[1]` after `a`); `a[1][2]` recurses to the
+  // same base. A non-column base falls through to `?column?`.
+  if (e.kind === "subscript") return outputName(scope, e.base);
   return "?column?";
 }
 
@@ -5407,6 +5511,23 @@ function resolve(
       }
       return { node: { kind: "row", fields: nodes }, type: { kind: "composite", name: null, fields } };
     }
+    case "array": {
+      // An ARRAY[...] constructor (spec/design/array.md §1): resolve each element (natural type),
+      // unify to a common element type, build an array node. A bare empty ARRAY[] has no element
+      // type to infer — use '{}'::T[] instead (the cast supplies it).
+      if (e.elements.length === 0) {
+        throw typeError("cannot determine the element type of an empty ARRAY[]; write '{}'::T[]");
+      }
+      const nodes: RExpr[] = [];
+      const elemTypes: ResolvedType[] = [];
+      for (const el of e.elements) {
+        const { node, type } = resolve(scope, el, null, ag, params);
+        nodes.push(node);
+        elemTypes.push(type);
+      }
+      const elem = unifyArrayElementTypes(elemTypes);
+      return { node: { kind: "array", elements: nodes }, type: { kind: "array", elem } };
+    }
     case "column": {
       // Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
       // (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
@@ -5429,6 +5550,21 @@ function resolve(
       // `(expr).*` — whole-row expansion is a projection-list construct only; in a scalar
       // expression position it is unsupported (PG rejects row expansion here — 0A000).
       throw engineError("feature_not_supported", "row expansion (.*) is not supported in this context");
+    case "subscript": {
+      // `base[index]` — array element subscript (spec/design/array.md §6). The base must be an array
+      // (else 42804); the result type is the element type. The index is an integer (PG int4) — a
+      // literal adapts to the int context; a non-integer index is 42804. OOB / NULL → NULL is an
+      // evaluation-time rule, not a resolve error.
+      const base = resolve(scope, e.base, null, ag, params);
+      if (base.type.kind !== "array") {
+        throw typeError(`cannot subscript a value of type ${rtName(base.type)}, which is not an array`);
+      }
+      const idx = resolve(scope, e.index, "int32", ag, params);
+      if (idx.type.kind !== "int" && idx.type.kind !== "null") {
+        throw typeError(`array subscript must be an integer, not ${rtName(idx.type)}`);
+      }
+      return { node: { kind: "subscript", base: base.node, index: idx.node }, type: base.type.elem };
+    }
     case "param": {
       // A bind parameter is an adaptable operand (like an integer/string literal): it takes its
       // type from ctx — the sibling operand, target column, or CAST target. Record the inferred
@@ -5562,6 +5698,31 @@ function resolve(
       };
     }
     case "cast": {
+      // An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the string-literal
+      // form `'{…}'::T[]` and a bare NULL; every other array cast (runtime text→array, array→text,
+      // element-wise array→array) is a documented 0A000 narrowing.
+      if (e.typeName.endsWith("[]")) {
+        const base = e.typeName.slice(0, -2);
+        if (e.typeMod !== null) {
+          throw engineError("feature_not_supported", "a type modifier on an array type is not supported yet");
+        }
+        const elemScalar = scalarTypeFromName(base);
+        if (elemScalar === undefined) {
+          if (scope.catalog.compositeType(base) !== undefined) {
+            throw engineError("feature_not_supported", "an array of composite type " + base + " is not supported yet");
+          }
+          throw engineError("undefined_object", "type does not exist: " + base);
+        }
+        const elemRt = resolvedTypeOf(elemScalar);
+        if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
+          const val = coerceStringToArray(e.inner.literal.text, { kind: "scalar", scalar: elemScalar });
+          return { node: valueToRExpr(val), type: { kind: "array", elem: elemRt } };
+        }
+        if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
+          return { node: { kind: "constNull" }, type: { kind: "array", elem: elemRt } };
+        }
+        throw engineError("feature_not_supported", "casting to an array type is only supported from a string literal this slice");
+      }
       // A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
       // (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
       // `'(…)'::addr` headline); a bare NULL adapts to the composite; a same-named composite operand
@@ -5650,6 +5811,10 @@ function resolve(
       // Casting FROM an interval is likewise deferred (0A000).
       if (inner.type.kind === "interval") {
         throw engineError("feature_not_supported", "casting from an interval type is not supported yet");
+      }
+      // Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
+      if (inner.type.kind === "array") {
+        throw engineError("feature_not_supported", "casting an array value is not supported yet");
       }
       // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
       // decimal→decimal (re-scale), the float casts (int↔float, decimal↔float, float↔float — all
@@ -5945,6 +6110,18 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   if ((compL || compR) && lt.kind !== "null" && rt.kind !== "null") {
     throw typeError("cannot compare a composite value with a value of a different type");
   }
+  // Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff their
+  // element types are comparable (recursively). A bare NULL is always comparable; an array vs any
+  // non-array is 42804.
+  const arrL = lt.kind === "array";
+  const arrR = rt.kind === "array";
+  if (arrL && arrR) {
+    classifyComparable(lt.elem, rt.elem);
+    return;
+  }
+  if ((arrL || arrR) && lt.kind !== "null" && rt.kind !== "null") {
+    throw typeError("cannot compare an array value with a value of a different type");
+  }
   // Boolean compares only with boolean (or NULL); boolean with a number/text is a mismatch.
   const boolL = lt.kind === "bool";
   const boolR = rt.kind === "bool";
@@ -6153,6 +6330,8 @@ function coerceStringToComposite(
       const { node, type } = coerceStringToComposite(tok, nested, db);
       nodes.push(node);
       fieldTypes.push({ name: f.name, type });
+    } else if (f.type.kind === "array") {
+      throw new Error("composite field of array type is not supported this slice");
     } else {
       const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal);
       nodes.push(node);
@@ -6437,6 +6616,26 @@ function requireBool(t: ResolvedType, msg: string): void {
 // type error (spec/design/grammar.md §22).
 function requireTextOrNull(t: ResolvedType): void {
   if (t.kind !== "text" && t.kind !== "null") throw typeError("LIKE requires text operands");
+}
+
+// unifyArrayElementTypes unifies the element types of an ARRAY[...] constructor into one element
+// type (spec/design/array.md §1). All-NULL → text (the PG unknown rule). All integer → the widest
+// via the promotion tower (no runtime coercion — every integer is a bigint). Otherwise every element
+// must be the SAME family — a cross-family mix (including int + decimal) is a documented 42804
+// narrowing this slice (the representation-changing coercion is deferred with numeric(p,s)[]).
+function unifyArrayElementTypes(types: ResolvedType[]): ResolvedType {
+  const nonNull = types.filter((t) => t.kind !== "null");
+  if (nonNull.length === 0) return { kind: "text" };
+  if (nonNull.every((t) => t.kind === "int")) {
+    let acc = nonNull[0]!;
+    for (const t of nonNull.slice(1)) acc = { kind: "int", ty: promote(acc, t) };
+    return acc;
+  }
+  const first = nonNull[0]!;
+  for (const t of nonNull.slice(1)) {
+    if (t.kind !== first.kind) throw typeError("array elements must all be of the same type");
+  }
+  return first;
 }
 
 // unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or "null" for an
@@ -6795,7 +6994,26 @@ function literalToValue(lit: Literal): Value {
 // the INSERT/UPDATE paths use.
 function coerceForStore(v: Value, ty: ColType, typmod: DecimalTypmod | null, notNull: boolean, colName: string): Value {
   if (ty.kind === "scalar") return storeValue(v, ty.scalar, typmod, notNull, colName);
+  if (ty.kind === "array") return storeArray(v, ty.elem, notNull, colName);
   return storeComposite(v, ty.name, ty.fields, notNull, colName);
+}
+
+// storeArray coerces a value into an ARRAY column (spec/design/array.md §4): NULL honours NOT NULL
+// (23502); an array value coerces each element to the declared element type via coerceForStore (a
+// NULL element is allowed — array elements are nullable). Any other value is a 42804.
+function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
+  if (v.kind === "null") {
+    if (notNull) {
+      throw engineError("not_null_violation", "null value in column " + colName + " violates not-null constraint");
+    }
+    return nullValue();
+  }
+  if (v.kind !== "array") {
+    throw typeError("cannot store a non-array value in array column " + colName);
+  }
+  // Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[] deferred).
+  const out = v.elements.map((el) => coerceForStore(el, elem, null, false, colName));
+  return arrayValue(out);
 }
 
 // storeComposite coerces a value into a COMPOSITE column (spec/design/composite.md §4): NULL honours
@@ -6829,6 +7047,27 @@ function storeComposite(v: Value, typeName: string, fields: ColField[], notNull:
 // $N. The result is then fully coerced/range-checked by coerceForStore. DEFAULT is handled by the
 // caller at the top level (it is not a valid field inside a ROW(…)).
 function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): Value {
+  if (ty.kind === "array") {
+    switch (iv.kind) {
+      case "array": {
+        // ARRAY[e, …]: materialize each element against the element type.
+        const vals = iv.elements.map((el) => materializeInsertValue(el, ty.elem, bound));
+        return arrayValue(vals);
+      }
+      case "param":
+        return bound[iv.index - 1]!;
+      case "row":
+        throw typeError("cannot assign a record value to an array column");
+      case "lit":
+        // A bare string literal adapts to the array context via array_in (the same
+        // string-adapts-to-context rule bytea/uuid use — spec/design/array.md §7).
+        if (iv.lit.kind === "text") return coerceStringToArray(iv.lit.text, ty.elem);
+        if (iv.lit.kind === "null") return nullValue();
+        throw typeError("cannot assign a scalar value to an array column");
+      default: // default
+        throw engineError("syntax_error", "DEFAULT is not allowed inside ARRAY[...]");
+    }
+  }
   if (ty.kind === "scalar") {
     switch (iv.kind) {
       case "lit":
@@ -6837,6 +7076,8 @@ function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): V
         return bound[iv.index - 1]!;
       case "row":
         throw typeError("cannot assign a record value to a " + canonicalName(ty.scalar) + " field");
+      case "array":
+        throw typeError("cannot assign an array value to a " + canonicalName(ty.scalar) + " field");
       default: // default
         throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
     }
@@ -6855,8 +7096,60 @@ function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): V
       return bound[iv.index - 1]!;
     case "lit":
       throw typeError("cannot assign a scalar value to composite column (type " + ty.name + ")");
+    case "array":
+      throw typeError("cannot assign an array value to composite column (type " + ty.name + ")");
     default: // default
       throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
+  }
+}
+
+// coerceStringToArray parses a text array literal into an array Value against the element ColType
+// via array_in (spec/design/array.md §7): each token is coerced to the element type (an unquoted
+// NULL token → NULL element). A malformed literal is 22P02.
+function coerceStringToArray(s: string, elem: ColType): Value {
+  const tokens = parseArrayTokens(s);
+  if (tokens === null) throw engineError("invalid_text_representation", "malformed array literal");
+  if (elem.kind !== "scalar") {
+    throw engineError("feature_not_supported", "array literal of a non-scalar element type is not supported");
+  }
+  const elemScalar = elem.scalar;
+  const vals = tokens.map((tok) => {
+    if (tok === null) return nullValue();
+    // Coerce the token to the element scalar via the typed-literal coercion, then read off its value.
+    const { node } = coerceStringLiteral(tok, elemScalar, null);
+    return rexprConstToValue(node);
+  });
+  return arrayValue(vals);
+}
+
+// rexprConstToValue extracts the Value from a constant RExpr (the const nodes coerceStringLiteral
+// produces).
+function rexprConstToValue(e: RExpr): Value {
+  switch (e.kind) {
+    case "constNull":
+      return nullValue();
+    case "constInt":
+      return intValue(e.value);
+    case "constBool":
+      return boolValue(e.value);
+    case "constText":
+      return textValue(e.value);
+    case "constDecimal":
+      return decimalValue(e.value);
+    case "constBytea":
+      return byteaValue(e.value);
+    case "constUuid":
+      return uuidValue(e.value);
+    case "constTimestamp":
+      return timestampValue(e.value);
+    case "constTimestamptz":
+      return timestamptzValue(e.value);
+    case "constInterval":
+      return intervalValue(e.value);
+    case "constFloat":
+      return e.ty === "float32" ? float32Value(e.value) : float64Value(e.value);
+    default:
+      throw typeError("non-constant array element literal");
   }
 }
 
@@ -6952,6 +7245,14 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       for (let i = 0; i < e.fields.length; i++) vals[i] = evalExpr(e.fields[i]!, row, env, m);
       return compositeValue(vals);
     }
+    case "array": {
+      // An ARRAY[...] constructor — one operator_eval, then build the array from the evaluated
+      // elements (spec/design/array.md §1).
+      m.charge(COSTS.operatorEval);
+      const elems: Value[] = new Array(e.elements.length);
+      for (let i = 0; i < e.elements.length; i++) elems[i] = evalExpr(e.elements[i]!, row, env, m);
+      return arrayValue(elems);
+    }
     case "field": {
       // Field selection — one operator_eval, then pull the resolved field ordinal out of the
       // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in range
@@ -6961,6 +7262,19 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (base.kind === "null") return nullValue();
       if (base.kind !== "composite") throw typeError("internal: field access on a non-composite value");
       return base.fields[e.index]!;
+    }
+    case "subscript": {
+      // Array element subscript `base[index]`, 1-based (spec/design/array.md §6). A NULL array, a
+      // NULL index, or an out-of-bounds index yields NULL (PG — never an error).
+      m.charge(COSTS.operatorEval);
+      const arr = evalExpr(e.base, row, env, m);
+      const idx = evalExpr(e.index, row, env, m);
+      if (arr.kind === "null" || idx.kind === "null") return nullValue();
+      if (arr.kind !== "array") throw typeError("internal: subscript on a non-array value");
+      if (idx.kind !== "int") throw typeError("internal: non-integer array subscript");
+      const i = idx.int; // 1-based bigint
+      if (i >= 1n && i <= BigInt(arr.elements.length)) return arr.elements[Number(i) - 1]!;
+      return nullValue(); // out of bounds
     }
     case "cast": {
       m.charge(COSTS.operatorEval);
@@ -7668,6 +7982,17 @@ function valueCmp(a: Value, b: Value): number {
       if (c !== 0) return c;
     }
     return a.fields.length < b.fields.length ? -1 : a.fields.length > b.fields.length ? 1 : 0;
+  }
+  // An array sorts element-wise with NULLs-last per element (the PG array_cmp total order —
+  // spec/design/array.md §5): the first non-equal element decides, recursing through keyCmp; a
+  // shorter array (prefix) sorts first.
+  if (a.kind === "array" && b.kind === "array") {
+    const n = Math.min(a.elements.length, b.elements.length);
+    for (let i = 0; i < n; i++) {
+      const c = keyCmp(a.elements[i]!, b.elements[i]!, false, false);
+      if (c !== 0) return c;
+    }
+    return a.elements.length < b.elements.length ? -1 : a.elements.length > b.elements.length ? 1 : 0;
   }
   // Cross-family arms exist only for totality — ORDER BY is over a single typed column, so a
   // mixed pair is unreachable. A fixed family order keeps the comparator total.

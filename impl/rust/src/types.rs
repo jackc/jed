@@ -303,6 +303,11 @@ pub struct DecimalTypmod {
 pub enum Type {
     Scalar(ScalarType),
     Composite(CompositeRef),
+    /// A **structural** array type over an element type (spec/design/array.md): `int32[]`. The
+    /// element type is carried inline (not a catalog reference like `Composite`) — `T[]` exists for
+    /// every element type with no DDL and no catalog object. The element is a scalar or composite,
+    /// never another array (multidimensionality is a value property, not array-of-array — §2).
+    Array(Box<Type>),
 }
 
 /// A by-name reference to a composite type in the database's type catalog. The display name is
@@ -324,14 +329,18 @@ impl Type {
                  branch before this point (spec/design/composite.md)",
                 r.name
             ),
+            Type::Array(_) => unreachable!(
+                "array type used where a scalar was expected; the array path must branch before \
+                 this point (spec/design/array.md)"
+            ),
         }
     }
 
-    /// The inner scalar type, or `None` for a composite.
+    /// The inner scalar type, or `None` for a composite/array.
     pub fn as_scalar(&self) -> Option<ScalarType> {
         match self {
             Type::Scalar(s) => Some(*s),
-            Type::Composite(_) => None,
+            Type::Composite(_) | Type::Array(_) => None,
         }
     }
 
@@ -340,12 +349,27 @@ impl Type {
         matches!(self, Type::Composite(_))
     }
 
-    /// This type's canonical name for output / error messages — the scalar's canonical name, or
-    /// the composite's name. Borrowed (a composite name is not `'static`).
-    pub fn canonical_name(&self) -> &str {
+    /// Whether this is an array type.
+    pub fn is_array(&self) -> bool {
+        matches!(self, Type::Array(_))
+    }
+
+    /// The element type of an array, or `None` if not an array.
+    pub fn array_element(&self) -> Option<&Type> {
         match self {
-            Type::Scalar(s) => s.canonical_name(),
-            Type::Composite(r) => &r.name,
+            Type::Array(elem) => Some(elem),
+            _ => None,
+        }
+    }
+
+    /// This type's canonical name for output / error messages — the scalar's canonical name, the
+    /// composite's name, or `<elem>[]` for an array. Owned because an array name is computed
+    /// structurally (spec/design/array.md §1: one canonical name per type, dimension-agnostic).
+    pub fn canonical_name(&self) -> String {
+        match self {
+            Type::Scalar(s) => s.canonical_name().to_string(),
+            Type::Composite(r) => r.name.clone(),
+            Type::Array(elem) => format!("{}[]", elem.canonical_name()),
         }
     }
 

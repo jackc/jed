@@ -113,6 +113,20 @@ function uniqueTableDB(): Database {
   return db;
 }
 
+// arrayTableDB has ARRAY (T[]) columns (v10 — spec/design/array.md): pins the catalog array-column
+// entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). An
+// int32[] (fixed-width elements: no per-element length prefix) and a text[]; row 2 has an EMPTY
+// array (ndim=0), row 3 a NULL element (the HAS_NULLS bitmap) and a whole-value NULL array (the
+// lone 0x01 tag). Must match the Ruby reference's ARRAY_TABLE (spec/fileformat/verify.rb).
+function arrayTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])");
+  run(db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])");
+  run(db, "INSERT INTO t VALUES (2, '{40,50}', '{}')");
+  run(db, "INSERT INTO t VALUES (3, ARRAY[1, NULL, 3], NULL)");
+  return db;
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 function nopkTableDB(): Database {
   const db = goldenDb();
@@ -409,6 +423,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "unique_table.jed", build: uniqueTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB },
+    { name: "array_table.jed", build: arrayTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
   ];
   for (const c of cases) {
@@ -448,6 +463,7 @@ test("read goldens reproduces rows", () => {
     { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB, table: "t" },
+    { name: "array_table.jed", build: arrayTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },

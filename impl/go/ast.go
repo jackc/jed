@@ -215,6 +215,10 @@ type InsertValue struct {
 	// takes a ROW(...) value in INSERT VALUES.
 	IsRow bool
 	Row   []InsertValue // valid when IsRow
+	// IsArray marks an ARRAY[...] constructor (spec/design/array.md §1); Array holds the element
+	// slots, in order (each a literal or a $N). An array-typed column takes an ARRAY[...] value.
+	IsArray bool
+	Array   []InsertValue // valid when IsArray
 }
 
 // Update is `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each
@@ -432,6 +436,9 @@ const (
 	// holds the field expressions, in order. A one-field ROW(x) is a one-field row; ROW() is the
 	// zero-field row. The bare `(a, b)` form is deferred (0A000); only the keyword form parses.
 	ExprRow
+	// ExprArray is an `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1): RowItems holds
+	// the element expressions, in order (reusing the RowItems slot). `ARRAY[]` is the empty array.
+	ExprArray
 	// ExprFieldAccess is field selection `(expr).field` (spec/design/composite.md §S4) — the value
 	// of one named field of a composite Base. The parser produces this for a `.name` postfix on a
 	// parenthesized / `ROW(…)` / cast / qualified-column base; a bare `a.b` stays
@@ -444,6 +451,10 @@ const (
 	// SELECT/RETURNING projection list (where `*` expands); in any scalar expression position it is
 	// 0A000.
 	ExprFieldStar
+	// ExprSubscript is array element subscript `Base[Index]` (spec/design/array.md §6) — the
+	// Index-th element of an array Base, 1-based. An out-of-bounds or NULL subscript yields NULL
+	// (PG, not an error); the result type is the element type. A non-array base is 42804 at resolve.
+	ExprSubscript
 )
 
 // UnaryOp is a unary operator.
@@ -516,6 +527,9 @@ type Expr struct {
 	// Field is the selected field name of an ExprFieldAccess (the `.field` part); lookup is
 	// case-insensitive at resolve.
 	Field string
+	// Index is the subscript expression of an ExprSubscript (`Base[Index]`); evaluated to an
+	// integer at run time (spec/design/array.md §6). Base holds the array operand.
+	Index *Expr
 }
 
 // InSubqueryExpr is `Lhs [NOT] IN ( Query )` (spec/design/grammar.md §26) — membership of Lhs in

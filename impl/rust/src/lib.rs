@@ -77,6 +77,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9). S2: the type
     // is created/dropped/persisted; composite columns/values land later (spec/design/composite.md).
     "types.composite",
+    "types.array",
+    // Array element subscript a[i] — 1-based, OOB/NULL → NULL, non-array base 42804 (array.md §6).
+    "expr.array_subscript",
     // NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
     "ddl.not_null",
     // DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

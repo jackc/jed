@@ -14,10 +14,12 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 9 # format_version 9: composite (row) types — the catalog becomes a chain of kind-tagged
-# entries (entry_kind u8: 0 table, 1 composite-type), composite-type entries emitted first
-# (name order); two-pass load (format.md *Version scope*). v8 was the per-column expression-default
-# flag (bit3) + expr-text; v7 added a per-page CRC-32 on every body page (header 12→16)
+VERSION = 10 # format_version 10: array (T[]) columns — a column type can be an array (type_code 15
+# + an element-type descriptor in the catalog, spec/design/array.md §3), and a value is the compact
+# array body (§4). v9 was composite (row) types — the catalog became a chain of kind-tagged entries
+# (entry_kind u8: 0 table, 1 composite-type), composite-type entries first (name order); two-pass
+# load (format.md *Version scope*). v8 was the per-column expression-default flag (bit3) + expr-text;
+# v7 added a per-page CRC-32 on every body page (header 12→16)
 PAGE_HEADER = 16 # v7: the 12-byte v6 header (page_type/item_count/next_page) + a 4-byte per-page crc32 at offset 12
 ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
 TXID = 1
@@ -46,6 +48,10 @@ TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" =>
              "bytea" => 7, "uuid" => 8, "timestamp" => 9, "timestamptz" => 10, "interval" => 11,
              "float64" => 12, "float32" => 13 }.freeze
 CODETYPE = TYPECODE.invert.freeze
+
+# An array (T[]) column type is the element type's string with a trailing "[]" (spec/design/array.md
+# §2 — structural, no catalog object). `array_elem("int32[]")` => "int32"; nil for a non-array type.
+def array_elem(type) = type.is_a?(String) && type.end_with?("[]") ? type[0...-2] : nil
 
 # uuid-raw16 (encoding.md §2.7): the 16 raw bytes of the canonical 8-4-4-4-12 form. Used both
 # as the value-codec body (fixed 16 bytes, no length prefix) and as the PRIMARY-KEY bytes
@@ -432,6 +438,22 @@ UNIQUE_TABLE = {
   rows: [[1, 10, 100], [2, nil, 200], [3, nil, 300]]
 }.freeze
 
+# A table with ARRAY (T[]) columns (v10 — spec/design/array.md): pins the catalog array-column
+# entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). Two
+# array columns — an int32[] (fixed-width elements: NO per-element length prefix) and a text[]
+# (variable-width). Row 1 is a plain int + text array; row 2 has an EMPTY array (ndim=0) and an
+# empty text array; row 3 has a NULL element (the HAS_NULLS bitmap branch) and a whole-value NULL
+# array (the lone 0x01 tag — distinct from an array OF a NULL element). The cores build this via
+#   CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])
+#   INSERT (1, ARRAY[10,20,30], ARRAY['a','b']); (2, '{40,50}', '{}'); (3, ARRAY[1,NULL,3], NULL)
+ARRAY_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("xs", "int32[]"), col("tags", "text[]")],
+  rows: [[1, [10, 20, 30], %w[a b]],
+         [2, [40, 50], []],
+         [3, [1, nil, 3], nil]]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -458,6 +480,7 @@ FIXTURES = [
   { file: "check_table.jed", page_size: 256, tables: [CHECK_TABLE] },
   { file: "index_table.jed", page_size: 256, tables: [INDEX_TABLE] },
   { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
+  { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
     types: COMPOSITE_TYPE_TABLE[:types], tables: COMPOSITE_TYPE_TABLE[:tables] },
   { file: "nested_composite_table.jed", page_size: 256,
@@ -522,6 +545,11 @@ def composite_fields(type) = $ctypes[type.to_s.downcase]
 def encode_value(type, v)
   return "\x01".b if v.nil?
 
+  if (elem = array_elem(type))
+    # An array value (spec/design/array.md §4): present tag, then the compact body.
+    return "\x00".b + encode_array_body(elem, v)
+  end
+
   if (fields = composite_fields(type))
     # A composite value (spec/design/composite.md §4): present tag, then the recursive body.
     return "\x00".b + encode_composite_body(fields, v)
@@ -548,6 +576,57 @@ def encode_value(type, v)
     "\x00".b + encode_float32(v)
   else
     "\x00".b + encode_int(WIDTH.fetch(type), v)
+  end
+end
+
+# An array value's BODY (after the 0x00 present tag, spec/design/array.md §4):
+#   ndim u8 ‖ flags u8 ‖ per-dim (len u32 BE, lb i32 BE) ‖ [null bitmap if HAS_NULLS] ‖ element bodies
+# v1 writes 1-D values only: an empty array is ndim=0 (no dims/bitmap/elements); a non-empty array is
+# ndim=1, len=count, lb=1. The bitmap (MSB-first, like composite) is present iff any element is NULL
+# (the HAS_NULLS flag bit 0). A NULL element contributes zero body bytes; a present element its
+# value-codec body MINUS the presence tag (fixed-width elements thus pay no per-element overhead).
+def encode_array_body(elem_type, elems)
+  out = +"".b
+  if elems.empty?
+    out << [0].pack("C") << [0].pack("C") # ndim = 0 (empty array), flags 0
+    return out
+  end
+  has_nulls = elems.any?(&:nil?)
+  out << [1].pack("C") # ndim = 1 (v1: 1-D values only)
+  out << [has_nulls ? 1 : 0].pack("C") # flags: bit 0 = HAS_NULLS
+  out << u32(elems.size) # dim length
+  out << [1].pack("l>") # lower bound = 1 (i32 BE)
+  if has_nulls
+    nbytes = (elems.size + 7) / 8
+    bitmap = Array.new(nbytes, 0)
+    elems.each_with_index { |e, i| bitmap[i / 8] |= (0x80 >> (i % 8)) if e.nil? }
+    out << bitmap.pack("C*")
+  end
+  elems.each { |e| out << encode_value(elem_type, e).byteslice(1..) unless e.nil? }
+  out
+end
+
+# An array column's ELEMENT-TYPE descriptor (spec/design/array.md §3): the element's type code,
+# then (for a composite element) its name. v1 elements are scalars. Mutates `out`.
+def push_array_element_type(out, elem_type)
+  if composite_fields(elem_type)
+    out << [14].pack("C") << u16(elem_type.bytesize) << elem_type.b
+  else
+    out << [TYPECODE.fetch(elem_type)].pack("C")
+  end
+end
+
+# Decode an array column's element-type descriptor (inverse of push_array_element_type) -> the
+# element type STRING and the new cursor.
+def read_array_element_type(buf, pos)
+  cb, pos = take(buf, pos, 1)
+  code = cb.getbyte(0)
+  if code == 14
+    nl, pos = take(buf, pos, 2)
+    name, pos = take(buf, pos, nl.unpack1("n"))
+    [name, pos]
+  else
+    [CODETYPE.fetch(code), pos]
   end
 end
 
@@ -644,6 +723,14 @@ def table_entry_bytes(table, root_data_page, index_roots)
       out << [14].pack("C")
       out << [c[:not_null] ? 0b10 : 0].pack("C")
       out << u16(c[:type].bytesize) << c[:type].b
+      next
+    end
+    # An array column (v10): type_code 15, flags, then the element-type descriptor
+    # (spec/design/array.md §3). Array columns carry no default this slice (bits 2/3 = 0).
+    if (elem = array_elem(c[:type]))
+      out << [15].pack("C")
+      out << [c[:not_null] ? 0b10 : 0].pack("C")
+      push_array_element_type(out, elem)
       next
     end
     out << [TYPECODE.fetch(c[:type])].pack("C")
@@ -1208,6 +1295,18 @@ def decode_table_entry(buf, pos)
                    precision: nil, scale: nil, default: :none, default_expr: nil }
       next
     end
+    # An array column (v10, type_code 15): flags, then the element-type descriptor
+    # (spec/design/array.md §3). The column type is the element type's string + "[]". No default.
+    if tc.getbyte(0) == 15
+      aflags, pos = take(buf, pos, 1)
+      af = aflags.getbyte(0)
+      raise "reserved flag bit0 set (retired primary_key bit — v5)" if (af & 0b01) != 0
+
+      elem_type, pos = read_array_element_type(buf, pos)
+      columns << { name: cname, type: "#{elem_type}[]", pk: false, not_null: (af & 0b10) != 0,
+                   precision: nil, scale: nil, default: :none, default_expr: nil }
+      next
+    end
     flags, pos = take(buf, pos, 1)
     f = flags.getbyte(0)
     raise "reserved flag bit0 set (retired primary_key bit — v5)" if (f & 0b01) != 0
@@ -1357,6 +1456,11 @@ def decode_value(type, buf, pos, fetch = nil)
   end
   raise "invalid value presence tag" unless t.zero?
 
+  if (elem = array_elem(type))
+    # An array value body (inverse of encode_array_body): ndim/flags/dims, optional bitmap, elements.
+    return decode_array_body(elem, buf, pos)
+  end
+
   if (fields = composite_fields(type))
     # A composite value body (inverse of encode_composite_body): bitmap, then each present field.
     return decode_composite_body(fields, buf, pos)
@@ -1394,6 +1498,40 @@ def decode_value(type, buf, pos, fetch = nil)
     vb, pos = take(buf, pos, WIDTH.fetch(type))
     [decode_int(WIDTH.fetch(type), vb), pos]
   end
+end
+
+# Decode an array value body (inverse of encode_array_body, spec/design/array.md §4): ndim u8 ‖
+# flags u8 ‖ (when ndim=1) len u32 ‖ lb i32 ‖ [bitmap if HAS_NULLS] ‖ element bodies. ndim 0 = the
+# empty array; ndim > 1 is rejected (v1 writes 1-D only). A present element has no tag, so a 0x00 is
+# synthesized onto the remaining buffer and the real cursor advanced by what decode_value consumed
+# past it (npos - 1) — the same trick decode_composite_body uses. Returns [element array, pos].
+def decode_array_body(elem_type, buf, pos)
+  nb, pos = take(buf, pos, 1)
+  fb, pos = take(buf, pos, 1)
+  ndim = nb.getbyte(0)
+  flags = fb.getbyte(0)
+  raise "array flags has a reserved bit set" if (flags & ~0x01) != 0
+  return [[], pos] if ndim.zero? # empty array
+
+  raise "multidimensional array value not supported (ndim > 1)" if ndim != 1
+
+  lenb, pos = take(buf, pos, 4)
+  len = lenb.unpack1("N")
+  _lb, pos = take(buf, pos, 4) # lower bound (i32 bits) — round-tripped, ignored in v1
+  has_nulls = (flags & 0x01) != 0
+  bitmap = nil
+  bitmap, pos = take(buf, pos, (len + 7) / 8) if has_nulls
+  elems = []
+  len.times do |i|
+    if has_nulls && (bitmap.getbyte(i / 8) & (0x80 >> (i % 8))) != 0
+      elems << nil
+    else
+      v, npos = decode_value(elem_type, "\x00".b + buf.byteslice(pos..), 0)
+      pos += (npos - 1)
+      elems << v
+    end
+  end
+  [elems, pos]
 end
 
 # Decode a composite value body (inverse of encode_composite_body): read the null bitmap

@@ -924,32 +924,58 @@ impl Database {
             // carries no typmod (the composite's fields carry their own); a type modifier written on
             // a composite column is rejected (0A000). A composite column is storable but never
             // keyable — the PK gate below rejects it 0A000 (§6).
-            let (ty, decimal): (Type, Option<DecimalTypmod>) =
-                if ScalarType::from_name(&def.type_name).is_some() {
-                    let (s, d) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
-                    (Type::Scalar(s), d)
-                } else if let Some(ctype) = self.read_snap().composite_type(&def.type_name) {
-                    if def.type_mod.is_some() {
+            let (ty, decimal): (Type, Option<DecimalTypmod>) = if let Some(base) =
+                def.type_name.strip_suffix("[]")
+            {
+                // An array column (spec/design/array.md §3). v1 element types are scalars; a
+                // typmod on the array (`numeric(p,s)[]`) and a composite/nested-array element
+                // are deferred (0A000).
+                if def.type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a type modifier on an array type is not supported yet".to_string(),
+                    ));
+                }
+                match ScalarType::from_name(base) {
+                    Some(s) => (Type::Array(Box::new(Type::Scalar(s))), None),
+                    None => {
+                        if self.read_snap().composite_type(base).is_some() {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                format!("an array of composite type {base} is not supported yet"),
+                            ));
+                        }
                         return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            format!(
-                                "a type modifier is not supported for composite type {}",
-                                def.type_name
-                            ),
+                            SqlState::UndefinedObject,
+                            format!("type does not exist: {base}"),
                         ));
                     }
-                    (
-                        Type::Composite(crate::types::CompositeRef {
-                            name: ctype.name.clone(),
-                        }),
-                        None,
-                    )
-                } else {
+                }
+            } else if ScalarType::from_name(&def.type_name).is_some() {
+                let (s, d) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
+                (Type::Scalar(s), d)
+            } else if let Some(ctype) = self.read_snap().composite_type(&def.type_name) {
+                if def.type_mod.is_some() {
                     return Err(EngineError::new(
-                        SqlState::UndefinedObject,
-                        format!("type does not exist: {}", def.type_name),
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "a type modifier is not supported for composite type {}",
+                            def.type_name
+                        ),
                     ));
-                };
+                }
+                (
+                    Type::Composite(crate::types::CompositeRef {
+                        name: ctype.name.clone(),
+                    }),
+                    None,
+                )
+            } else {
+                return Err(EngineError::new(
+                    SqlState::UndefinedObject,
+                    format!("type does not exist: {}", def.type_name),
+                ));
+            };
             if def.primary_key {
                 // Integers and uuid may be a key. uuid is the FIRST non-integer key type — its
                 // fixed `uuid-raw16` encoding (spec/design/encoding.md §2.7) is exercised. The
@@ -985,13 +1011,14 @@ impl Database {
             //   - any other expression is validated (structural pre-walk, then resolved against
             //     an EMPTY scope — a default may not reference a column — then its result type is
             //     checked assignable to the column, 42804) and stored as text for per-row eval.
-            let (default, default_expr) = if ty.is_composite() {
-                // A DEFAULT on a composite-typed column is not supported this slice — there is no
-                // composite literal yet (the ROW constructor lands in a later slice — composite.md).
+            let (default, default_expr) = if ty.is_composite() || ty.is_array() {
+                // A DEFAULT on a composite- or array-typed column is not supported this slice
+                // (composite.md §12 / array.md §12).
                 if def.default.is_some() {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
-                        "a DEFAULT on a composite-typed column is not supported yet".to_string(),
+                        "a DEFAULT on a composite- or array-typed column is not supported yet"
+                            .to_string(),
                     ));
                 }
                 (None, None)
@@ -1179,7 +1206,8 @@ impl Database {
                 | ResolvedType::Timestamptz
                 | ResolvedType::Interval
                 | ResolvedType::Float(_)
-                | ResolvedType::Composite(_) => {
+                | ResolvedType::Composite(_)
+                | ResolvedType::Array(_) => {
                     return Err(type_error("argument of CHECK must be boolean"));
                 }
             }
@@ -1959,6 +1987,17 @@ impl Database {
                                     ),
                                 ));
                             }
+                            // INSERT ... SELECT into an array column is deferred (the VALUES +
+                            // ARRAY[…] path is the supported input — spec/design/array.md §12).
+                            Type::Array(_) => {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    format!(
+                                        "INSERT ... SELECT into array column {} is not supported yet",
+                                        col.name
+                                    ),
+                                ));
+                            }
                         }
                     }
                 }
@@ -2134,6 +2173,11 @@ impl Database {
                         // the key encoding is authored but unexercised, spec/design/composite.md §6).
                         Value::Composite(_) => {
                             unreachable!("a composite primary key is rejected at CREATE TABLE")
+                        }
+                        // Unreachable: an array PRIMARY KEY is rejected at CREATE TABLE (0A000 —
+                        // the key encoding is authored but unexercised, spec/design/array.md §8).
+                        Value::Array(_) => {
+                            unreachable!("an array primary key is rejected at CREATE TABLE")
                         }
                         // Poisoned (large-values.md §14): INSERT values are evaluated
                         // expressions, never lazily-loaded storage rows.
@@ -4229,13 +4273,17 @@ impl Database {
                 }
                 Ok(())
             }
-            RExpr::Row(fields) => {
+            RExpr::Row(fields) | RExpr::Array(fields) => {
                 for f in fields {
                     self.fold_uncorrelated_in_rexpr(f, bound, cost)?;
                 }
                 Ok(())
             }
             RExpr::Field { base, .. } => self.fold_uncorrelated_in_rexpr(base, bound, cost),
+            RExpr::Subscript { base, index } => {
+                self.fold_uncorrelated_in_rexpr(base, bound, cost)?;
+                self.fold_uncorrelated_in_rexpr(index, bound, cost)
+            }
             RExpr::InValues { lhs, .. } => self.fold_uncorrelated_in_rexpr(lhs, bound, cost),
             // Leaves and the (already-handled) Subquery: nothing to recurse into.
             RExpr::Subquery { .. }
@@ -4613,6 +4661,10 @@ enum ResolvedType {
     /// declaration order (the basis for field access — S4 — and structural assignability). Boxed so
     /// the common scalar `ResolvedType` stays small.
     Composite(Box<CompositeRType>),
+    /// An array type (spec/design/array.md §2), carrying its resolved element type. Two arrays are
+    /// comparable iff their element types are equal; an array is assignable to an array column of
+    /// the same element type. Boxed to keep the scalar `ResolvedType` small.
+    Array(Box<ResolvedType>),
 }
 
 /// The resolved shape of a composite type — its (optional) name and resolved field list. The
@@ -4640,6 +4692,7 @@ impl ResolvedType {
             ResolvedType::Float(st) => st.canonical_name().to_string(),
             ResolvedType::Null => "unknown".to_string(),
             ResolvedType::Composite(c) => c.name.clone().unwrap_or_else(|| "record".to_string()),
+            ResolvedType::Array(elem) => format!("{}[]", elem.type_name()),
         }
     }
 
@@ -4660,6 +4713,9 @@ impl ResolvedType {
             // A composite source never assigns to a scalar column (the composite-target case is
             // handled structurally at the call site — spec/design/composite.md §4).
             ResolvedType::Composite(_) => false,
+            // An array source never assigns to a scalar column (INSERT ... SELECT into an array
+            // column is deferred — spec/design/array.md §12).
+            ResolvedType::Array(_) => false,
             ResolvedType::Int(_) => col_ty.is_integer() || col_ty.is_decimal(),
             ResolvedType::Decimal => col_ty.is_decimal(),
             ResolvedType::Bool => col_ty.is_bool(),
@@ -4774,12 +4830,23 @@ enum RExpr {
     /// assemble a `Value::Composite`. Also the folded form of a composite constant (`value_to_rexpr`
     /// wraps each field's constant). One `operator_eval` per node (cost.md §9).
     Row(Vec<RExpr>),
+    /// An `ARRAY[…]` constructor (spec/design/array.md §1): evaluate each element expression
+    /// (coercing to the unified element type) and assemble a `Value::Array`. One `operator_eval`
+    /// per node.
+    Array(Vec<RExpr>),
     /// Field selection `(composite).field` (spec/design/composite.md §S4): evaluate `base` to a
     /// composite value and return its `index`-th field (the field ordinal, fixed at resolve). A
     /// whole-value-NULL composite yields NULL for any field. One `operator_eval` per node.
     Field {
         base: Box<RExpr>,
         index: usize,
+    },
+    /// Array element subscript `base[index]` (spec/design/array.md §6): evaluate `base` to an array
+    /// and `index` to an integer, then return the **1-based** element. A NULL array, a NULL index,
+    /// or an out-of-bounds index yields NULL (PG — never an error). One `operator_eval` per node.
+    Subscript {
+        base: Box<RExpr>,
+        index: Box<RExpr>,
     },
     /// A bind parameter, by 0-based index into the bound-values slice passed to `eval`. Its
     /// static type was inferred from context at resolve (spec/design/api.md §5); the value
@@ -5742,8 +5809,9 @@ fn expr_has_aggregate(e: &Expr) -> bool {
             expr_has_aggregate(lhs) || expr_has_aggregate(lo) || expr_has_aggregate(hi)
         }
         Expr::Like { lhs, rhs, .. } => expr_has_aggregate(lhs) || expr_has_aggregate(rhs),
-        Expr::Row(items) => items.iter().any(expr_has_aggregate),
+        Expr::Row(items) | Expr::Array(items) => items.iter().any(expr_has_aggregate),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_has_aggregate(base),
+        Expr::Subscript { base, index } => expr_has_aggregate(base) || expr_has_aggregate(index),
         Expr::Case {
             operand,
             whens,
@@ -5804,8 +5872,12 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
             reject_check_structure(lhs)?;
             list.iter().try_for_each(reject_check_structure)
         }
-        Expr::Row(items) => items.iter().try_for_each(reject_check_structure),
+        Expr::Row(items) | Expr::Array(items) => items.iter().try_for_each(reject_check_structure),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_check_structure(base),
+        Expr::Subscript { base, index } => {
+            reject_check_structure(base)?;
+            reject_check_structure(index)
+        }
         Expr::Between { lhs, lo, hi, .. } => {
             reject_check_structure(lhs)?;
             reject_check_structure(lo)?;
@@ -5877,8 +5949,14 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
             reject_default_structure(lhs)?;
             list.iter().try_for_each(reject_default_structure)
         }
-        Expr::Row(items) => items.iter().try_for_each(reject_default_structure),
+        Expr::Row(items) | Expr::Array(items) => {
+            items.iter().try_for_each(reject_default_structure)
+        }
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_default_structure(base),
+        Expr::Subscript { base, index } => {
+            reject_default_structure(base)?;
+            reject_default_structure(index)
+        }
         Expr::Between { lhs, lo, hi, .. } => {
             reject_default_structure(lhs)?;
             reject_default_structure(lo)?;
@@ -5965,12 +6043,16 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
                     walk(a, columns, out);
                 }
             }
-            Expr::Row(items) => {
+            Expr::Row(items) | Expr::Array(items) => {
                 for it in items {
                     walk(it, columns, out);
                 }
             }
             Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => walk(base, columns, out),
+            Expr::Subscript { base, index } => {
+                walk(base, columns, out);
+                walk(index, columns, out);
+            }
             // Unreachable in a validated check (rejected by `reject_check_structure`).
             Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {}
         }
@@ -6015,6 +6097,9 @@ fn value_to_rexpr(v: &Value) -> RExpr {
         // A folded composite constant: fold each field and wrap in a ROW node so eval rebuilds the
         // `Value::Composite` (spec/design/composite.md).
         Value::Composite(fields) => RExpr::Row(fields.iter().map(value_to_rexpr).collect()),
+        // A folded array constant: fold each element and wrap in an Array node so eval rebuilds the
+        // `Value::Array` (spec/design/array.md).
+        Value::Array(elems) => RExpr::Array(elems.iter().map(value_to_rexpr).collect()),
         // Poisoned (large-values.md §14): a folded subquery's projections are resolved values.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
@@ -6095,8 +6180,13 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
                 || rexpr_references_outer(els, depth)
         }
         RExpr::ScalarFunc { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
-        RExpr::Row(fields) => fields.iter().any(|f| rexpr_references_outer(f, depth)),
+        RExpr::Row(fields) | RExpr::Array(fields) => {
+            fields.iter().any(|f| rexpr_references_outer(f, depth))
+        }
         RExpr::Field { base, .. } => rexpr_references_outer(base, depth),
+        RExpr::Subscript { base, index } => {
+            rexpr_references_outer(base, depth) || rexpr_references_outer(index, depth)
+        }
         RExpr::Column(_)
         | RExpr::Param(_)
         | RExpr::ConstInt(_)
@@ -6167,12 +6257,16 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
                 collect_touched(a, depth, touched);
             }
         }
-        RExpr::Row(fields) => {
+        RExpr::Row(fields) | RExpr::Array(fields) => {
             for f in fields {
                 collect_touched(f, depth, touched);
             }
         }
         RExpr::Field { base, .. } => collect_touched(base, depth, touched),
+        RExpr::Subscript { base, index } => {
+            collect_touched(base, depth, touched);
+            collect_touched(index, depth, touched);
+        }
         RExpr::Param(_)
         | RExpr::ConstInt(_)
         | RExpr::ConstBool(_)
@@ -6290,8 +6384,8 @@ fn arg_family(t: &ResolvedType) -> Option<&'static str> {
         ResolvedType::Timestamptz => Some("timestamptz"),
         ResolvedType::Interval => Some("interval"),
         ResolvedType::Null => None,
-        // A composite is no built-in function/aggregate argument family this slice.
-        ResolvedType::Composite(_) => None,
+        // A composite/array is no built-in function/aggregate argument family this slice.
+        ResolvedType::Composite(_) | ResolvedType::Array(_) => None,
     }
 }
 
@@ -6913,6 +7007,9 @@ fn output_name(scope: &Scope, e: &Expr) -> String {
         // output column after the selected field). Any other expression takes `?column?`.
         Expr::FuncCall { name, .. } => name.to_ascii_lowercase(),
         Expr::FieldAccess { field, .. } => field.to_ascii_lowercase(),
+        // A subscript takes the base array's name (PG names `a[1]` after `a`); a chained subscript
+        // `a[1][2]` recurses to the same base name. A non-column base falls through to `?column?`.
+        Expr::Subscript { base, .. } => output_name(scope, base),
         _ => "?column?".to_string(),
     }
 }
@@ -6934,7 +7031,8 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> R
         | ResolvedType::Timestamptz
         | ResolvedType::Interval
         | ResolvedType::Float(_)
-        | ResolvedType::Composite(_) => Err(type_error("argument of WHERE must be boolean")),
+        | ResolvedType::Composite(_)
+        | ResolvedType::Array(_) => Err(type_error("argument of WHERE must be boolean")),
     }
 }
 
@@ -7101,6 +7199,7 @@ fn resolved_type_of_col(ty: &Type, db: &Database) -> ResolvedType {
                 fields,
             }))
         }
+        Type::Array(elem) => ResolvedType::Array(Box::new(resolved_type_of_col(elem, db))),
     }
 }
 
@@ -7239,6 +7338,29 @@ fn resolve(
                 ResolvedType::Composite(Box::new(CompositeRType { name: None, fields })),
             ))
         }
+        // An `ARRAY[…]` constructor (spec/design/array.md §1): resolve each element (natural type),
+        // unify to a common element type, and build a `RExpr::Array`. A bare empty `ARRAY[]` has no
+        // element type to infer — use `'{}'::T[]` instead (the cast supplies the element type).
+        Expr::Array(items) => {
+            if items.is_empty() {
+                return Err(type_error(
+                    "cannot determine the element type of an empty ARRAY[]; write '{}'::T[]"
+                        .to_string(),
+                ));
+            }
+            let mut nodes = Vec::with_capacity(items.len());
+            let mut elem_types = Vec::with_capacity(items.len());
+            for it in items {
+                let (node, ty) = resolve(scope, it, None, agg, params)?;
+                nodes.push(node);
+                elem_types.push(ty);
+            }
+            let elem_type = unify_array_element_types(&elem_types)?;
+            Ok((
+                RExpr::Array(nodes),
+                ResolvedType::Array(Box::new(elem_type)),
+            ))
+        }
         Expr::Column(name) => {
             // Resolve against the scope CHAIN (§26). Existence first (42703/42702 take priority,
             // matching PostgreSQL); a Local match then obeys the grouping rule, an Outer
@@ -7259,6 +7381,37 @@ fn resolve(
         Expr::FieldAccess { base, field } => {
             let (node, ty) = resolve(scope, base, None, agg, params)?;
             resolve_field_of(node, ty, field)
+        }
+        // `base[index]` — array element subscript (spec/design/array.md §6). The base must be an
+        // array (else 42804); the result type is the element type. The index is an integer (PG
+        // int4) — a literal adapts to the int context; a non-integer index is 42804. OOB / NULL →
+        // NULL is an evaluation-time rule, not a resolve error.
+        Expr::Subscript { base, index } => {
+            let (base_node, base_ty) = resolve(scope, base, None, agg, params)?;
+            let elem_ty = match base_ty {
+                ResolvedType::Array(elem) => *elem,
+                other => {
+                    return Err(type_error(format!(
+                        "cannot subscript a value of type {}, which is not an array",
+                        other.type_name()
+                    )));
+                }
+            };
+            let (index_node, index_ty) =
+                resolve(scope, index, Some(ScalarType::Int32), agg, params)?;
+            if !matches!(index_ty, ResolvedType::Int(_) | ResolvedType::Null) {
+                return Err(type_error(format!(
+                    "array subscript must be an integer, not {}",
+                    index_ty.type_name()
+                )));
+            }
+            Ok((
+                RExpr::Subscript {
+                    base: Box::new(base_node),
+                    index: Box::new(index_node),
+                },
+                elem_ty,
+            ))
         }
         // `(expr).*` — whole-row expansion is a projection-list construct only; in a scalar
         // expression position it is unsupported (PG rejects row expansion here — 0A000).
@@ -7438,6 +7591,45 @@ fn resolve(
             type_name,
             type_mod,
         } => {
+            // An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the
+            // string-literal form `'{…}'::T[]` and a bare NULL; every other array cast (runtime
+            // text→array, array→text, element-wise array→array) is a documented 0A000 narrowing.
+            if let Some(base) = type_name.strip_suffix("[]") {
+                if type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a type modifier on an array type is not supported yet".to_string(),
+                    ));
+                }
+                let elem_scalar = match ScalarType::from_name(base) {
+                    Some(s) => s,
+                    None => {
+                        if scope.catalog.composite_type(base).is_some() {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                format!("an array of composite type {base} is not supported yet"),
+                            ));
+                        }
+                        return Err(EngineError::new(
+                            SqlState::UndefinedObject,
+                            format!("type does not exist: {base}"),
+                        ));
+                    }
+                };
+                let elem_rt = resolved_type_of(elem_scalar);
+                if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
+                    let val = coerce_string_to_array(s, &ColType::Scalar(elem_scalar))?;
+                    return Ok((value_to_rexpr(&val), ResolvedType::Array(Box::new(elem_rt))));
+                }
+                if let Expr::Literal(Literal::Null) = inner.as_ref() {
+                    return Ok((RExpr::ConstNull, ResolvedType::Array(Box::new(elem_rt))));
+                }
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "casting to an array type is only supported from a string literal this slice"
+                        .to_string(),
+                ));
+            }
             // A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
             // (spec/design/composite.md §8). A STRING LITERAL operand coerces via `record_in` (the
             // `'(…)'::addr` headline); a bare NULL adapts to the composite; a same-named composite
@@ -7598,6 +7790,14 @@ fn resolve(
                         "casting a composite value is not supported yet",
                     ));
                 }
+                // Casting FROM an array (array→text, element-wise array→array) is deferred
+                // (spec/design/array.md §7/§12).
+                ResolvedType::Array(_) => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting an array value is not supported yet",
+                    ));
+                }
             }
             let result_ty = if target.is_decimal() {
                 ResolvedType::Decimal
@@ -7634,7 +7834,8 @@ fn resolve(
                 | ResolvedType::Uuid
                 | ResolvedType::Timestamp
                 | ResolvedType::Timestamptz
-                | ResolvedType::Composite(_) => {
+                | ResolvedType::Composite(_)
+                | ResolvedType::Array(_) => {
                     return Err(type_error("unary minus requires a numeric operand"));
                 }
             };
@@ -8037,8 +8238,8 @@ fn ctx_of(ty: &ResolvedType) -> Option<ScalarType> {
         ResolvedType::Bool => Some(ScalarType::Bool),
         ResolvedType::Decimal => Some(ScalarType::Decimal),
         ResolvedType::Null => None,
-        // A composite sibling offers no scalar adaptation context (a ROW literal is the path).
-        ResolvedType::Composite(_) => None,
+        // A composite/array sibling offers no scalar adaptation context.
+        ResolvedType::Composite(_) | ResolvedType::Array(_) => None,
         // A datetime sibling offers its type so a string literal parses as that datetime.
         ResolvedType::Timestamp => Some(ScalarType::Timestamp),
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
@@ -8141,7 +8342,8 @@ fn require_numeric_operand(ty: &ResolvedType) -> Result<()> {
         | ResolvedType::Timestamptz
         | ResolvedType::Interval
         | ResolvedType::Float(_)
-        | ResolvedType::Composite(_) => {
+        | ResolvedType::Composite(_)
+        | ResolvedType::Array(_) => {
             Err(type_error("arithmetic operators require numeric operands"))
         }
     }
@@ -8154,10 +8356,18 @@ fn require_numeric_operand(ty: &ResolvedType) -> Result<()> {
 /// across these families but never compares across them.
 fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Result<()> {
     use ResolvedType::{
-        Bool, Bytea, Composite, Decimal, Float, Int, Interval, Null, Text, Timestamp, Timestamptz,
-        Uuid,
+        Array, Bool, Bytea, Composite, Decimal, Float, Int, Interval, Null, Text, Timestamp,
+        Timestamptz, Uuid,
     };
     match (lt, rt) {
+        // Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff
+        // their element types are comparable (recursively). A bare NULL is always comparable; an
+        // array vs any non-array is 42804.
+        (Array(_), Null) | (Null, Array(_)) => Ok(()),
+        (Array(a), Array(b)) => classify_comparable(a, b),
+        (Array(_), _) | (_, Array(_)) => Err(type_error(
+            "cannot compare an array value with a value of a different type",
+        )),
         // Composite comparison is element-wise row comparison (spec/design/composite.md §5): two
         // composites are comparable iff they have the SAME field count and each corresponding
         // field pair is itself comparable (recursively — a nested composite recurses here, an
@@ -8332,6 +8542,33 @@ fn require_text_or_null(ty: &ResolvedType) -> Result<()> {
 /// numeric unify to `decimal` if any is decimal, else the widest integer (the promotion tower);
 /// otherwise they must all be the same non-numeric family (text/boolean/bytea). A cross-family
 /// mix (e.g. integer and text) is 42804.
+/// Unify the element types of an `ARRAY[…]` constructor into one element type (spec/design/array.md
+/// §1). All-NULL → text (the PG unknown rule). All integer → the widest via the promotion tower (no
+/// runtime coercion — every integer is an i64 value). Otherwise every element must be the SAME
+/// family — a cross-family mix (including int + decimal) is a documented `42804` narrowing this
+/// slice (the representation-changing coercion is deferred with `numeric(p,s)[]`).
+fn unify_array_element_types(types: &[ResolvedType]) -> Result<ResolvedType> {
+    let non_null: Vec<&ResolvedType> = types.iter().filter(|t| **t != ResolvedType::Null).collect();
+    let Some(&first) = non_null.first() else {
+        return Ok(ResolvedType::Text);
+    };
+    if non_null.iter().all(|t| matches!(t, ResolvedType::Int(_))) {
+        let mut acc = first.clone();
+        for t in &non_null[1..] {
+            acc = ResolvedType::Int(promote(&acc, t));
+        }
+        return Ok(acc);
+    }
+    for t in &non_null[1..] {
+        if std::mem::discriminant(*t) != std::mem::discriminant(first) {
+            return Err(type_error(
+                "array elements must all be of the same type".to_string(),
+            ));
+        }
+    }
+    Ok(first.clone())
+}
+
 fn unify_case_types(arms: &[ResolvedType]) -> Result<ResolvedType> {
     let non_null: Vec<&ResolvedType> = arms.iter().filter(|t| **t != ResolvedType::Null).collect();
     let Some(&first) = non_null.first() else {
@@ -8554,7 +8791,8 @@ fn require_bool(ty: &ResolvedType, msg: &str) -> Result<()> {
         | ResolvedType::Timestamptz
         | ResolvedType::Interval
         | ResolvedType::Float(_)
-        | ResolvedType::Composite(_) => Err(type_error(msg)),
+        | ResolvedType::Composite(_)
+        | ResolvedType::Array(_) => Err(type_error(msg)),
     }
 }
 
@@ -8779,6 +9017,9 @@ fn coerce_string_to_composite(
                         coerce_string_to_composite(&s, nested, catalog)?
                     }
                     Type::Scalar(scalar) => coerce_string_literal(&s, *scalar, f.decimal)?,
+                    Type::Array(_) => {
+                        unreachable!("composite field of array type is not supported this slice")
+                    }
                 };
                 nodes.push(node);
                 field_types.push((f.name.clone(), ty));
@@ -9238,6 +9479,10 @@ fn store_value(
             "cannot store a record value in {} column {col_name}",
             col_ty.canonical_name()
         ))),
+        Value::Array(_) => Err(type_error(format!(
+            "cannot store an array value in {} column {col_name}",
+            col_ty.canonical_name()
+        ))),
         // Poisoned (large-values.md §14): a stored value is an evaluated expression result.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
@@ -9258,6 +9503,37 @@ fn coerce_for_store(
     match ty {
         ColType::Scalar(s) => store_value(v, *s, typmod, not_null, col_name),
         ColType::Composite { name, fields } => store_composite(v, name, fields, not_null, col_name),
+        ColType::Array(elem) => store_array(v, elem, not_null, col_name),
+    }
+}
+
+/// Coerce a value into an **array** column (spec/design/array.md §4): NULL honours NOT NULL
+/// (23502); a `Value::Array` coerces each element to the declared element type via
+/// [`coerce_for_store`] (a NULL element is allowed — array elements are nullable, so the element
+/// store is never NOT NULL); any other value is a 42804.
+fn store_array(v: Value, elem: &ColType, not_null: bool, col_name: &str) -> Result<Value> {
+    match v {
+        Value::Null => {
+            if not_null {
+                return Err(EngineError::new(
+                    SqlState::NotNullViolation,
+                    format!("null value in column {col_name} violates not-null constraint"),
+                ));
+            }
+            Ok(Value::Null)
+        }
+        Value::Array(vals) => {
+            let mut out = Vec::with_capacity(vals.len());
+            for val in vals {
+                // Elements are nullable (not_null = false); the element typmod is unconstrained
+                // this slice (numeric(p,s)[] is deferred — §12).
+                out.push(coerce_for_store(val, elem, None, false, col_name)?);
+            }
+            Ok(Value::Array(out))
+        }
+        _ => Err(type_error(format!(
+            "cannot store a non-array value in array column {col_name}"
+        ))),
     }
 }
 
@@ -9353,6 +9629,10 @@ fn materialize_insert_value(iv: &InsertValue, ty: &ColType, bound: &[Value]) -> 
                 "cannot assign a record value to a {} field",
                 s.canonical_name()
             ))),
+            InsertValue::Array(_) => Err(type_error(format!(
+                "cannot assign an array value to a {} field",
+                s.canonical_name()
+            ))),
             InsertValue::Default => Err(EngineError::new(
                 SqlState::SyntaxError,
                 "DEFAULT is not allowed inside ROW(...)",
@@ -9377,12 +9657,94 @@ fn materialize_insert_value(iv: &InsertValue, ty: &ColType, bound: &[Value]) -> 
             InsertValue::Lit(_) => Err(type_error(format!(
                 "cannot assign a scalar value to composite column (type {name})"
             ))),
+            InsertValue::Array(_) => Err(type_error(format!(
+                "cannot assign an array value to composite column (type {name})"
+            ))),
             InsertValue::Default => Err(EngineError::new(
                 SqlState::SyntaxError,
                 "DEFAULT is not allowed inside ROW(...)",
             )),
         },
+        ColType::Array(elem) => match iv {
+            // ARRAY[e, …]: materialize each element against the element type.
+            InsertValue::Array(elem_ivs) => {
+                let mut vals = Vec::with_capacity(elem_ivs.len());
+                for eiv in elem_ivs {
+                    vals.push(materialize_insert_value(eiv, elem, bound)?);
+                }
+                Ok(Value::Array(vals))
+            }
+            // A bare string literal adapts to the array context via `array_in` (the same
+            // string-adapts-to-context rule bytea/uuid use — types.md §6; spec/design/array.md §7).
+            InsertValue::Lit(Literal::Text(s)) => coerce_string_to_array(s, elem),
+            InsertValue::Lit(Literal::Null) => Ok(Value::Null),
+            InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
+            InsertValue::Lit(_) => Err(type_error(
+                "cannot assign a scalar value to an array column".to_string(),
+            )),
+            InsertValue::Row(_) => Err(type_error(
+                "cannot assign a record value to an array column".to_string(),
+            )),
+            InsertValue::Default => Err(EngineError::new(
+                SqlState::SyntaxError,
+                "DEFAULT is not allowed inside ARRAY[...]",
+            )),
+        },
     }
+}
+
+/// Parse a text array literal into a `Value::Array` against the element `ColType` via `array_in`
+/// (spec/design/array.md §7): each token is coerced to the element type (an unquoted `NULL` token
+/// → NULL element). A malformed literal is `22P02`. Used by INSERT (a bare string adapting to an
+/// array column) and by the runtime string-literal → array cast.
+fn coerce_string_to_array(s: &str, elem: &ColType) -> Result<Value> {
+    let tokens = crate::value::parse_array_tokens(s).ok_or_else(|| {
+        EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            "malformed array literal".to_string(),
+        )
+    })?;
+    let elem_scalar = match elem {
+        ColType::Scalar(s) => *s,
+        _ => {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "array literal of a non-scalar element type is not supported".to_string(),
+            ));
+        }
+    };
+    let mut vals = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        match tok {
+            None => vals.push(Value::Null),
+            Some(t) => {
+                // Coerce the token to the element scalar via the same string-literal coercion the
+                // type's typed-literal path uses (22P02 / 22003 on bad input).
+                let (node, _) = coerce_string_literal(&t, elem_scalar, None)?;
+                vals.push(rexpr_const_to_value(&node)?);
+            }
+        }
+    }
+    Ok(Value::Array(vals))
+}
+
+/// Extract the `Value` from a constant `RExpr` (the const nodes `coerce_string_literal` produces).
+fn rexpr_const_to_value(node: &RExpr) -> Result<Value> {
+    Ok(match node {
+        RExpr::ConstNull => Value::Null,
+        RExpr::ConstInt(n) => Value::Int(*n),
+        RExpr::ConstBool(b) => Value::Bool(*b),
+        RExpr::ConstText(s) => Value::Text(s.clone()),
+        RExpr::ConstDecimal(d) => Value::Decimal(d.clone()),
+        RExpr::ConstFloat32(f) => Value::Float32(*f),
+        RExpr::ConstFloat64(f) => Value::Float64(*f),
+        RExpr::ConstBytea(b) => Value::Bytea(b.clone()),
+        RExpr::ConstUuid(u) => Value::Uuid(*u),
+        RExpr::ConstTimestamp(m) => Value::Timestamp(*m),
+        RExpr::ConstTimestamptz(m) => Value::Timestamptz(*m),
+        RExpr::ConstInterval(iv) => Value::Interval(*iv),
+        _ => return Err(type_error("non-constant array element literal".to_string())),
+    })
 }
 
 impl RExpr {
@@ -9421,6 +9783,16 @@ impl RExpr {
                 }
                 Ok(Value::Composite(vals))
             }
+            // An ARRAY[…] constructor — one operator_eval, then evaluate each element (already
+            // coerced to the element type at resolve) into a `Value::Array` (spec/design/array.md §1).
+            RExpr::Array(elems) => {
+                m.charge(COSTS.operator_eval);
+                let mut vals = Vec::with_capacity(elems.len());
+                for e in elems {
+                    vals.push(e.eval(row, env, m)?);
+                }
+                Ok(Value::Array(vals))
+            }
             // Field selection — one operator_eval, then pull the resolved field ordinal out of the
             // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in
             // range by construction (resolve fixed it against the static field list).
@@ -9431,6 +9803,26 @@ impl RExpr {
                     Value::Null => Ok(Value::Null),
                     other => {
                         unreachable!("field access on a non-composite value: {other:?}")
+                    }
+                }
+            }
+            RExpr::Subscript { base, index } => {
+                m.charge(COSTS.operator_eval);
+                // 1-based (spec/design/array.md §6): element i is at 0-based i-1. A NULL array, a
+                // NULL index, or an out-of-bounds index yields NULL (PG — never an error).
+                let arr = base.eval(row, env, m)?;
+                let idx = index.eval(row, env, m)?;
+                match (arr, idx) {
+                    (Value::Array(elems), Value::Int(i)) => {
+                        if i >= 1 && (i as usize) <= elems.len() {
+                            Ok(elems[(i - 1) as usize].clone())
+                        } else {
+                            Ok(Value::Null) // out of bounds (1-based domain 1..=len)
+                        }
+                    }
+                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                    (other, _) => {
+                        unreachable!("subscript on a non-array value: {other:?}")
                     }
                 }
             }
@@ -9504,6 +9896,9 @@ impl RExpr {
                     Value::Composite(_) => {
                         unreachable!("resolver rejects a composite cast operand this slice")
                     }
+                    Value::Array(_) => {
+                        unreachable!("resolver rejects an array cast operand this slice")
+                    }
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
@@ -9540,6 +9935,9 @@ impl RExpr {
                     Value::Interval(iv) => Ok(Value::Interval(iv.neg()?)),
                     Value::Composite(_) => {
                         unreachable!("resolver rejects a composite unary minus")
+                    }
+                    Value::Array(_) => {
+                        unreachable!("resolver rejects an array unary minus")
                     }
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
@@ -10510,6 +10908,18 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
             }
             x.len().cmp(&y.len())
         }
+        // An array sorts element-wise with NULLs-last per element (the PG `array_cmp` total order —
+        // spec/design/array.md §5): the first non-equal element decides, recursing through
+        // `key_cmp`; a shorter array (prefix) sorts first.
+        (Value::Array(x), Value::Array(y)) => {
+            for (xe, ye) in x.iter().zip(y.iter()) {
+                let c = key_cmp(xe, ye, false, false);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
         (Value::Null, Value::Null) => Ordering::Equal,
         // Cross-family arms exist only for totality — ORDER BY is over a single typed column,
         // so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -10536,6 +10946,9 @@ fn family_rank(v: &Value) -> u8 {
         // A composite sorts only against composites of its own type (ORDER BY is single-typed), so
         // this cross-family rank is only for totality; it sits after the scalar families.
         Value::Composite(_) => 11,
+        // An array sorts only against arrays of its own element type (ORDER BY is single-typed), so
+        // this cross-family rank is only for totality; it sits after composite.
+        Value::Array(_) => 12,
         // Poisoned (large-values.md §14): ORDER BY slots are in the touched set, so a sort
         // key is always resolved before it reaches the comparator.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),

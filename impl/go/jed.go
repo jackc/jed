@@ -22,6 +22,9 @@ var SupportedCapabilities = []string{
 	// Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9); composite
 	// columns/values are a later slice (spec/design/composite.md).
 	"types.composite",
+	"types.array",
+	// Array element subscript a[i] — 1-based, OOB/NULL → NULL, non-array base 42804 (array.md §6).
+	"expr.array_subscript",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
 	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

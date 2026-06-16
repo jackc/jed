@@ -127,6 +127,11 @@ pub enum ColType {
         name: String,
         fields: Vec<ColField>,
     },
+    /// An array's resolved element type (spec/design/array.md §3). Structural — the element type
+    /// is carried inline, recursively; v1 element types are scalars (composite/nested-array
+    /// elements are deferred). The codec reads the element structure; store-coercion coerces each
+    /// element to it.
+    Array(Box<ColType>),
 }
 
 /// One resolved field of a [`ColType::Composite`] — its name, recursively-resolved type, the
@@ -166,6 +171,7 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
                     .collect(),
             }
         }
+        Type::Array(elem) => ColType::Array(Box::new(resolve_col_type(elem, types))),
     }
 }
 

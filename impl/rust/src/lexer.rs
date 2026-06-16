@@ -65,6 +65,14 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::RParen);
                 i += 1;
             }
+            b'[' => {
+                tokens.push(Token::LBracket);
+                i += 1;
+            }
+            b']' => {
+                tokens.push(Token::RBracket);
+                i += 1;
+            }
             b'*' => {
                 tokens.push(Token::Star);
                 i += 1;

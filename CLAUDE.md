@@ -170,11 +170,21 @@ everything else tests against, not a detail discovered during implementation.
     aliases. Two's-complement, with trap-on-overflow (§8). Every other scalar above is
     explicitly **deferred** to a later slice. The float/decimal/collation decisions in §8
     do not bind step 1.
-  - **Beyond scalars — a composite `array` type is intended (eventually).** An array is a
-    *container* layered over the scalar set, not a scalar, so it is a separate later axis
-    with its own value codec, order-preserving key encoding, and comparison rules — not
-    just another row in the scalar table. Match PostgreSQL's array behavior by default
-    (§1). Deferred like the scalars above; sequence it after the core scalar set settles.
+  - **Beyond scalars — the `array` container is the second open-`Type` axis**
+    (`spec/design/array.md`, `int32[]`, `ARRAY[1,2,3]`, `'{1,2,3}'::int32[]`). An array is a
+    *container* layered over the element type, not a scalar — its own value codec, comparison
+    rules, and (deferred) order-preserving key encoding. Two decisions distinguish it from
+    composite. (a) It is a **structural** type — `Type::Array(Box<Type>)` carries the element
+    type inline, no `CREATE TYPE`, no catalog object, no array-type id (contrast composite's
+    *nominal* `Composite(catalog-ref)`); this is observably identical to PostgreSQL because array
+    type identity is a bijection on the element type, and self-describing on disk. (b) Matching
+    PostgreSQL exactly (§1), **array *shape* — dimensionality, lengths, lower bounds — is a
+    property of the *value*, not the type** (`int32[3]` enforces nothing; a column holds arrays
+    of mixed dimensionality), which relaxes "strict static" **only on shape** — the **element
+    type stays static and strictly enforced**. Array comparison uses PostgreSQL btree NULL
+    semantics (NULLs comparable, always a definite boolean), *not* composite's 3VL. Delivered
+    S0–S4; arrays-as-key, multidimensional values, and the array function surface are deferred
+    `0A000` follow-ons (`spec/design/array.md` §12).
   - **The type system is OPEN, not closed — composite (row) types have landed**
     (`spec/design/composite.md`, `CREATE TYPE addr AS (street text, zip int32)`). This is the
     pivot the scalar set above only hinted at: a type is no longer *only* a compiled-in

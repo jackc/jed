@@ -1,0 +1,83 @@
+# Array element subscript a[i] (spec/design/array.md §6): 1-based (PG / SQL-standard), an
+# out-of-bounds index (0 / past the end / negative), a NULL index, a subscript of a NULL array, and
+# a subscript reading a NULL element all yield NULL — never an error (PG, a documented divergence
+# from the SQL standard's mandated data exception). The index is an arbitrary integer expression;
+# subscripting a non-array base is 42804. v1 has no slices (a[m:n] is deferred 0A000).
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.array, types.int32, types.text, expr.array_subscript, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])
+
+statement ok
+INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b', 'c'])
+
+# Row 2: a NULL element inside xs, and a whole-value-NULL tags array.
+statement ok
+INSERT INTO t VALUES (2, ARRAY[1, NULL, 3], NULL)
+
+# 1-based: a[1] is the first element, a[3] the third.
+query I nosort
+SELECT xs[1] FROM t WHERE id = 1
+----
+10
+
+query I nosort
+SELECT xs[3] FROM t WHERE id = 1
+----
+30
+
+query T nosort
+SELECT tags[2] FROM t WHERE id = 1
+----
+b
+
+# Out-of-bounds (0, past the end, negative) → NULL, never an error.
+query I nosort
+SELECT xs[0] FROM t WHERE id = 1
+----
+NULL
+
+query I nosort
+SELECT xs[4] FROM t WHERE id = 1
+----
+NULL
+
+query I nosort
+SELECT xs[-1] FROM t WHERE id = 1
+----
+NULL
+
+# A NULL subscript → NULL.
+query I nosort
+SELECT xs[NULL] FROM t WHERE id = 1
+----
+NULL
+
+# A subscript of a whole-value-NULL array → NULL (row 2's tags).
+query T nosort
+SELECT tags[1] FROM t WHERE id = 2
+----
+NULL
+
+# A subscript reading a NULL element → NULL (row 2's xs[2]).
+query I nosort
+SELECT xs[2] FROM t WHERE id = 2
+----
+NULL
+
+# The index is an arbitrary integer expression.
+query I nosort
+SELECT xs[1 + 1] FROM t WHERE id = 1
+----
+20
+
+# An ARRAY[…] constructor can be subscripted directly.
+query I nosort
+SELECT (ARRAY[100, 200, 300])[3] FROM t WHERE id = 1
+----
+300
+
+# Subscripting a non-array base is 42804 (at resolve).
+statement error 42804
+SELECT id[1] FROM t

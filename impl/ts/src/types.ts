@@ -333,7 +333,8 @@ export function roundToWidth(ty: ScalarType, v: number): number {
 // can yet be created; scalar-only paths call typeScalar(t).
 export type Type =
   | { kind: "scalar"; scalar: ScalarType }
-  | { kind: "composite"; name: string };
+  | { kind: "composite"; name: string }
+  | { kind: "array"; elem: Type };
 
 // scalarT wraps a ScalarType as a Type.
 export function scalarT(s: ScalarType): Type {
@@ -346,18 +347,35 @@ export function compositeT(name: string): Type {
   return { kind: "composite", name };
 }
 
+// arrayT builds a structural array Type over an element type (spec/design/array.md §2). The element
+// type is carried inline (no catalog object, unlike a composite); the element is a scalar or
+// composite, never another array (multidimensionality is a value property, not array-of-array).
+export function arrayT(elem: Type): Type {
+  return { kind: "array", elem };
+}
+
+// isArrayType reports whether this is an array type.
+export function isArrayType(t: Type): boolean {
+  return t.kind === "array";
+}
+
 // typeScalar returns the inner scalar type. Scalar-only paths (the integer codec, the scalar value
 // codec, the scalar resolver) call this; a composite column reaches those paths only after the
 // caller has branched on isCompositeType, so a composite here is an engine-invariant violation —
 // it throws (mirroring Rust's unreachable!). In S1 no composite Type exists yet.
 export function typeScalar(t: Type): ScalarType {
   if (t.kind === "scalar") return t.scalar;
+  if (t.kind === "array") {
+    throw new Error(
+      "array type used where a scalar was expected (spec/design/array.md)",
+    );
+  }
   throw new Error(
     `composite type ${t.name} used where a scalar was expected; the composite path must branch before this point (spec/design/composite.md)`,
   );
 }
 
-// typeAsScalar returns the inner scalar type, or undefined for a composite.
+// typeAsScalar returns the inner scalar type, or undefined for a composite/array.
 export function typeAsScalar(t: Type): ScalarType | undefined {
   return t.kind === "scalar" ? t.scalar : undefined;
 }
@@ -368,9 +386,11 @@ export function isCompositeType(t: Type): boolean {
 }
 
 // typeCanonicalName is this type's canonical name for output / error messages — the scalar's
-// canonical name, or the composite's name.
+// canonical name, the composite's name, or `<elem>[]` for an array.
 export function typeCanonicalName(t: Type): string {
-  return t.kind === "scalar" ? canonicalName(t.scalar) : t.name;
+  if (t.kind === "scalar") return canonicalName(t.scalar);
+  if (t.kind === "array") return typeCanonicalName(t.elem) + "[]";
+  return t.name;
 }
 
 // Scalar-predicate delegates. A composite answers false to every scalar predicate — it is none of

@@ -65,6 +65,12 @@ func Lex(sql string) ([]Token, error) {
 		case c == ')':
 			tokens = append(tokens, Token{Kind: TokRParen})
 			i++
+		case c == '[':
+			tokens = append(tokens, Token{Kind: TokLBracket})
+			i++
+		case c == ']':
+			tokens = append(tokens, Token{Kind: TokRBracket})
+			i++
 		case c == '*':
 			tokens = append(tokens, Token{Kind: TokStar})
 			i++

@@ -52,6 +52,11 @@ const (
 	// count and per-field types match the value's composite type; the storage codec / comparator /
 	// recordOut all recurse over this list.
 	ValComposite
+	// ValArray is an array value (spec/design/array.md §2) — a flat (1-D) list of element values
+	// (a NULL element is a ValNull, an empty list is the empty array `{}`). Array holds a *[]Value
+	// POINTER so the flat Value struct stays ==-comparable (like Comp). Comparison uses PG btree
+	// semantics (NULLs comparable and mutually equal — NOT the composite 3VL rule, §5).
+	ValArray
 	// ValUnfetched is an unfetched large-value reference (spec/design/large-values.md §14): a
 	// stored external/compressed value loaded as its on-disk pointer instead of being
 	// materialized; Unf holds the pointer fields. Internal to the storage/scan layers — the scan
@@ -108,6 +113,10 @@ type Value struct {
 	// two composite Values with raw `==` (that compares pointers); composite equality/hashing go
 	// through Eq3 / the structural value-key path.
 	Comp *[]Value
+	// Array holds the element values when Kind == ValArray (spec/design/array.md §2). A POINTER
+	// (*[]Value) so the flat Value struct stays ==-comparable — like Comp; array equality/hashing
+	// go through Eq3 / the structural value-key path, never raw `==`.
+	Array *[]Value
 }
 
 // IntValue builds a non-null integer value.
@@ -145,6 +154,9 @@ func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, Iv: iv} 
 // (spec/design/composite.md §2). The slice is held by pointer so Value stays ==-comparable;
 // structural equality/ordering go through Eq3/Lt3/Gt3, never raw ==.
 func CompositeValue(fields []Value) Value { return Value{Kind: ValComposite, Comp: &fields} }
+
+// ArrayValue builds an array value from its element list (spec/design/array.md §2).
+func ArrayValue(elems []Value) Value { return Value{Kind: ValArray, Array: &elems} }
 
 // Float32Value builds a non-null float32 value from a Go float32 — the bits are stored verbatim
 // in Int (math.Float32bits, zero-extended), so -0.0 / NaN / ±Inf keep their original pattern
@@ -374,6 +386,10 @@ func (v Value) Render() string {
 		// (spec/design/composite.md §8). The renderer recurses (a composite field's text is itself
 		// quoted because it contains parens/commas).
 		return recordOut(*v.Comp)
+	case ValArray:
+		// An array renders as PG array_out: `{e1,e2,…}` with per-element quoting and an unquoted
+		// `NULL` for a null element (spec/design/array.md §7).
+		return arrayOut(*v.Array)
 	case ValUnfetched:
 		panic("BUG: unfetched large value escaped the storage layer")
 	default:
@@ -480,7 +496,34 @@ func (v Value) Eq3(o Value) ThreeValued {
 		}
 		return True
 	}
+	// Array `=` uses PG btree semantics (spec/design/array.md §5), NOT the composite 3VL rule: same
+	// length and every element pair equal-or-both-NULL → TRUE, else FALSE. NULL elements are
+	// comparable and mutually equal, so the result is ALWAYS definite (never UNKNOWN).
+	if v.Kind == ValArray && o.Kind == ValArray {
+		return bool3(arrayEqual(*v.Array, *o.Array))
+	}
 	return Unknown
+}
+
+// arrayEqual is PG array_eq (spec/design/array.md §5): same length and every element pair equal,
+// where two NULL elements are mutually equal (NOT 3VL). Always definite.
+func arrayEqual(a, b []Value) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		an, bn := a[i].Kind == ValNull, b[i].Kind == ValNull
+		if an != bn {
+			return false
+		}
+		if an {
+			continue // both NULL → equal
+		}
+		if a[i].Eq3(b[i]) != True {
+			return false
+		}
+	}
+	return true
 }
 
 // Lt3 is the three-valued ordering predicate v < o (numerics by value with int↔decimal
@@ -528,6 +571,11 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValComposite && o.Kind == ValComposite {
 		return compositeOrder3(*v.Comp, *o.Comp, false)
 	}
+	// Array `<` uses the PG array_cmp total order (spec/design/array.md §5): element-wise, NULL
+	// sorts after every non-NULL (NULLs mutually equal), shorter prefix first. Always definite.
+	if v.Kind == ValArray && o.Kind == ValArray {
+		return bool3(arrayTotalCmp(*v.Array, *o.Array) < 0)
+	}
 	return Unknown
 }
 
@@ -573,6 +621,10 @@ func (v Value) Gt3(o Value) ThreeValued {
 	if v.Kind == ValComposite && o.Kind == ValComposite {
 		return compositeOrder3(*v.Comp, *o.Comp, true)
 	}
+	// Array `>` — the total-order mirror of `<` (spec/design/array.md §5).
+	if v.Kind == ValArray && o.Kind == ValArray {
+		return bool3(arrayTotalCmp(*v.Array, *o.Array) > 0)
+	}
 	return Unknown
 }
 
@@ -591,6 +643,11 @@ func (v Value) NotDistinctFrom(o Value) bool {
 	// NULL field (the value-level structural equality, not the 3VL Eq3).
 	if v.Kind == ValComposite && o.Kind == ValComposite {
 		return compositeValueEqual(*v.Comp, *o.Comp)
+	}
+	// Two arrays are "not distinct" iff structurally equal (the same btree equality as `=`; NULL
+	// elements are mutually equal — spec/design/array.md §5).
+	if v.Kind == ValArray && o.Kind == ValArray {
+		return arrayEqual(*v.Array, *o.Array)
 	}
 	return v.Eq3(o) == True
 }
@@ -815,6 +872,222 @@ func recordFieldNeedsQuote(s string) bool {
 		}
 	}
 	return false
+}
+
+// arrayTotalCmp is the PG array_cmp total order over two arrays (spec/design/array.md §5): walk
+// element pairs; the first non-equal pair decides; if one array is a prefix of the other, the
+// shorter sorts first. NULL elements are comparable — NULL sorts AFTER every non-NULL and two NULLs
+// are equal (the NULLs-last total order). Always total/definite.
+func arrayTotalCmp(a, b []Value) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if c := elemTotalCmp(a[i], b[i]); c != 0 {
+			return c
+		}
+	}
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	default:
+		return 0
+	}
+}
+
+// elemTotalCmp is a total order over two array elements with NULL the largest value (NULLs-last)
+// and two NULLs equal. Present elements use their own definite Eq3/Lt3 (scalar comparators).
+func elemTotalCmp(x, y Value) int {
+	xn, yn := x.Kind == ValNull, y.Kind == ValNull
+	switch {
+	case xn && yn:
+		return 0
+	case xn: // NULL sorts last
+		return 1
+	case yn:
+		return -1
+	}
+	if x.Eq3(y) == True {
+		return 0
+	}
+	if x.Lt3(y) == True {
+		return -1
+	}
+	return 1
+}
+
+// arrayOut renders an array's elements as PG array_out (spec/design/array.md §7): `{e1,e2,…}`. A
+// NULL element is the unquoted token `NULL`; every other element is rendered by its own Render and
+// double-quoted iff it is empty, equals the literal `NULL` (case-insensitive), or contains a
+// delimiter / brace / quote / backslash / whitespace. Inside the quotes PostgreSQL **backslash-
+// escapes** an embedded `"` → `\"` and `\` → `\\` (the contrast with record_out, which doubles).
+// The empty array renders `{}`. Equals PG byte-for-byte (CLAUDE.md §8).
+func arrayOut(elems []Value) string {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, e := range elems {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		if e.Kind == ValNull {
+			b.WriteString("NULL")
+			continue
+		}
+		s := e.Render()
+		if arrayElemNeedsQuote(s) {
+			b.WriteByte('"')
+			for _, ch := range s {
+				if ch == '"' || ch == '\\' {
+					b.WriteByte('\\')
+				}
+				b.WriteRune(ch)
+			}
+			b.WriteByte('"')
+		} else {
+			b.WriteString(s)
+		}
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+// arrayElemNeedsQuote reports whether an array_out element token must be double-quoted: the empty
+// string, the literal `NULL` (any case — else it would parse back as a NULL element), or any token
+// containing a comma, brace, double-quote, backslash, or whitespace — PostgreSQL's exact rule.
+func arrayElemNeedsQuote(s string) bool {
+	if s == "" || strings.EqualFold(s, "NULL") {
+		return true
+	}
+	for _, c := range s {
+		switch c {
+		case '"', '\\', '{', '}', ',', ' ', '\t', '\n', '\v', '\f', '\r':
+			return true
+		}
+	}
+	return false
+}
+
+// parseArrayTokens is the PG array_in tokenizer (spec/design/array.md §7) — the inverse of
+// arrayOut. It splits the text of an array literal `{e1,e2,…}` into raw element tokens **without**
+// type coercion: the caller coerces each token to the element type. An element is quoted (`"…"`
+// with `\"`→`"` and `\\`→`\` un-escaping) or unquoted (read to the next top-level `,`/`}`,
+// surrounding whitespace trimmed, `\x`→`x`). An **unquoted** `NULL` (any case) is a NULL element (a
+// nil token); a quoted `"NULL"` is the 4-char string. `{}` (optionally with inner whitespace) is
+// the empty array. The second result is false on a malformed literal (→ 22P02).
+func parseArrayTokens(input string) ([]*string, bool) {
+	s := strings.TrimFunc(input, func(r rune) bool { return r <= 0x7F && asciiSpace(byte(r)) })
+	runes := []rune(s)
+	pos := 0
+	peek := func() (rune, bool) {
+		if pos < len(runes) {
+			return runes[pos], true
+		}
+		return 0, false
+	}
+	skipSpace := func() {
+		for pos < len(runes) && runes[pos] <= 0x7F && asciiSpace(byte(runes[pos])) {
+			pos++
+		}
+	}
+	if pos >= len(runes) || runes[pos] != '{' {
+		return nil, false
+	}
+	pos++ // '{'
+	var elems []*string
+	skipSpace()
+	if c, ok := peek(); ok && c == '}' {
+		pos++
+		if pos != len(runes) {
+			return nil, false
+		}
+		return elems, true // empty array
+	}
+	for {
+		skipSpace()
+		var buf strings.Builder
+		quoted := false
+		if c, ok := peek(); ok && c == '"' {
+			quoted = true
+			pos++ // opening quote
+			for {
+				if pos >= len(runes) {
+					return nil, false // unterminated quoted element
+				}
+				c := runes[pos]
+				pos++
+				if c == '"' {
+					break // closing quote
+				}
+				if c == '\\' {
+					if pos >= len(runes) {
+						return nil, false
+					}
+					buf.WriteRune(runes[pos])
+					pos++
+					continue
+				}
+				buf.WriteRune(c)
+			}
+			skipSpace()
+		} else {
+			// Unquoted: read until a top-level `,`/`}`, processing `\x`→`x`.
+			for {
+				c, ok := peek()
+				if !ok {
+					return nil, false // missing '}'
+				}
+				if c == ',' || c == '}' {
+					break
+				}
+				if c == '\\' {
+					pos++
+					if pos >= len(runes) {
+						return nil, false
+					}
+					buf.WriteRune(runes[pos])
+					pos++
+					continue
+				}
+				buf.WriteRune(c)
+				pos++
+			}
+		}
+		if quoted {
+			str := buf.String()
+			elems = append(elems, &str)
+		} else {
+			trimmed := strings.TrimFunc(buf.String(), func(r rune) bool {
+				return r <= 0x7F && asciiSpace(byte(r))
+			})
+			if trimmed == "" {
+				return nil, false // a bare empty unquoted element is malformed (PG)
+			}
+			if strings.EqualFold(trimmed, "NULL") {
+				elems = append(elems, nil)
+			} else {
+				elems = append(elems, &trimmed)
+			}
+		}
+		if pos >= len(runes) {
+			return nil, false
+		}
+		c := runes[pos]
+		pos++
+		if c == ',' {
+			continue
+		}
+		if c == '}' {
+			break
+		}
+		return nil, false
+	}
+	if pos != len(runes) {
+		return nil, false
+	}
+	return elems, true
 }
 
 // --- boolean Value <-> ThreeValued bridges, and the Kleene connectives ----------

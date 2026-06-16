@@ -63,6 +63,12 @@ export function lex(sql: string): Token[] {
     } else if (c === ")") {
       tokens.push({ kind: "rparen" });
       i++;
+    } else if (c === "[") {
+      tokens.push({ kind: "lbracket" });
+      i++;
+    } else if (c === "]") {
+      tokens.push({ kind: "rbracket" });
+      i++;
     } else if (c === "*") {
       tokens.push({ kind: "star" });
       i++;

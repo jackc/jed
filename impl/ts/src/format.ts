@@ -25,6 +25,8 @@ import { TableStore, type Row } from "./storage.ts";
 import {
   type DecimalTypmod,
   type ScalarType,
+  type Type,
+  arrayT,
   compositeT,
   isBool,
   isBytea,
@@ -42,6 +44,7 @@ import {
   type Value,
   boolValue,
   byteaValue,
+  arrayValue,
   compositeValue,
   decimalValue,
   float32Value,
@@ -55,7 +58,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 9; // on-disk format version (9 = kind-tagged catalog entries + composite-type entries; v8 added per-column expression-default flag bit3 + expr-text; v7 added a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
+const FORMAT_VERSION = 10; // on-disk format version (10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4). 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 9 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -158,6 +161,36 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
   }
 }
 
+// pushArrayElementType writes an array column's element type descriptor (spec/design/array.md §3):
+// the element's type code, then (for a composite element) its name. v1 element types are scalars; a
+// composite element is handled for forward-compat, a nested array element is rejected.
+function pushArrayElementType(w: ByteWriter, elem: Type): void {
+  if (elem.kind === "array") {
+    throw new Error("nested array element (array-of-array) is not a jed type — array.md §2");
+  }
+  if (elem.kind === "composite") {
+    w.u8(14);
+    const tn = UTF8.encode(elem.name);
+    w.u16(tn.length);
+    w.bytes(tn);
+    return;
+  }
+  w.u8(typeCodeForScalar(elem.scalar));
+}
+
+// readArrayElementType decodes an array column's element type descriptor (inverse of the above).
+function readArrayElementType(buf: Uint8Array, cur: Cursor): Type {
+  const code = readU8(buf, cur);
+  if (code === 14) {
+    const n = readU16(buf, cur);
+    const name = UTF8_DECODE.decode(take(buf, cur, n));
+    return compositeT(name);
+  }
+  const s = scalarForTypeCode(code);
+  if (s === undefined) throw engineError("data_corrupted", "invalid array element code");
+  return scalarT(s);
+}
+
 // crc32Update folds data into a running CRC-32/IEEE register (reflected, poly 0xEDB88320)
 // WITHOUT the final XOR, so it composes: crc32Update(crc32Update(0xFFFFFFFF, a), b) over a split
 // buffer equals folding a‖b. Both crc32Ieee and the split pageCrc build on it. `>>> 0` keeps the
@@ -196,6 +229,16 @@ function pageCrc(page: Uint8Array): number {
 // composites.
 function encodeValue(ty: ColType, v: Value): Uint8Array {
   if (ty.kind === "scalar") return encodeScalar(ty.scalar, v);
+  if (ty.kind === "array") {
+    // An array column (spec/design/array.md §4): the shared presence tag then the array body.
+    if (v.kind === "null") return Uint8Array.of(0x01);
+    if (v.kind !== "array") throw new Error("BUG: a non-array value in an array column");
+    const body = encodeArrayBody(ty.elem, v.elements);
+    const out = new Uint8Array(1 + body.length);
+    out[0] = 0x00; // present
+    out.set(body, 1);
+    return out;
+  }
   // ty is a composite column type.
   if (v.kind === "null") return Uint8Array.of(0x01);
   if (v.kind !== "composite") throw new Error("BUG: a non-composite value in a composite column");
@@ -204,6 +247,47 @@ function encodeValue(ty: ColType, v: Value): Uint8Array {
   out[0] = 0x00; // present
   out.set(body, 1);
   return out;
+}
+
+// encodeArrayBody builds an array value's BODY (after the 0x00 present tag, spec/design/array.md
+// §4): ndim u8, flags u8, per-dim (len u32 BE, lb i32 BE), then the optional null bitmap (present
+// iff HAS_NULLS) and the present element bodies. v1 writes 1-D values only: an empty array is ndim
+// 0; a non-empty array is ndim 1, len = element count, lb = 1. The bitmap (MSB-first, like
+// composite) is present iff any element is NULL; a NULL element contributes zero body bytes.
+function encodeArrayBody(elem: ColType, elems: Value[]): Uint8Array {
+  if (elems.length === 0) return Uint8Array.of(0, 0); // ndim 0, flags 0 (empty array)
+  let hasNulls = false;
+  for (const e of elems) {
+    if (e.kind === "null") {
+      hasNulls = true;
+      break;
+    }
+  }
+  const n = elems.length >>> 0;
+  const header = Uint8Array.of(
+    1, // ndim = 1 (v1: 1-D values only)
+    hasNulls ? 0x01 : 0x00, // flags: bit 0 = HAS_NULLS
+    (n >>> 24) & 0xff,
+    (n >>> 16) & 0xff,
+    (n >>> 8) & 0xff,
+    n & 0xff, // dim length (u32 BE)
+    0,
+    0,
+    0,
+    1, // lower bound = 1 (i32 BE)
+  );
+  const parts: Uint8Array[] = [header];
+  if (hasNulls) {
+    const bitmap = new Uint8Array(Math.ceil(elems.length / 8));
+    for (let i = 0; i < elems.length; i++) {
+      if (elems[i]!.kind === "null") bitmap[i >> 3]! |= 0x80 >> (i % 8);
+    }
+    parts.push(bitmap);
+  }
+  for (const e of elems) {
+    if (e.kind !== "null") parts.push(encodeValue(elem, e).subarray(1)); // body only (no presence tag)
+  }
+  return concat(parts);
 }
 
 // encodeCompositeBody builds a composite value's BODY (after the 0x00 present tag,
@@ -370,6 +454,8 @@ function concat(parts: Uint8Array[]): Uint8Array {
 // chosen by the plan.
 function isSpillable(ty: ColType): boolean {
   if (ty.kind === "composite") return true;
+  // An array's opaque inline body spills via the same overflow + LZ4 path (array.md §4).
+  if (ty.kind === "array") return true;
   const s = ty.scalar;
   return isText(s) || isBytea(s) || s === "decimal";
 }
@@ -552,6 +638,9 @@ export function recordCompressUnits(
 // Only spillable types reach here.
 function valuePayload(ty: ColType, v: Value): Uint8Array {
   if (ty.kind === "composite" && v.kind === "composite") return encodeCompositeBody(ty.fields, v.fields);
+  // An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies); a large
+  // array spills through the same overflow + LZ4 path (spec/design/array.md §4).
+  if (ty.kind === "array" && v.kind === "array") return encodeArrayBody(ty.elem, v.elements);
   if (v.kind === "text") return UTF8.encode(v.text);
   if (v.kind === "bytea") return v.bytes;
   if (v.kind === "decimal" && ty.kind === "scalar") return encodeScalar(ty.scalar, v).subarray(1); // strip the presence tag
@@ -565,6 +654,10 @@ function valueFromPayload(ty: ColType, payload: Uint8Array): Value {
     // A composite's payload is its body (bitmap + present-field bodies); decode it with a fresh
     // cursor (spec/design/composite.md §4).
     return readCompositeBody(ty, payload, { pos: 0 });
+  }
+  if (ty.kind === "array") {
+    // An array's payload is its body; decode it with a fresh cursor (spec/design/array.md §4).
+    return readArrayBody(ty, payload, { pos: 0 });
   }
   const s = ty.scalar;
   if (isText(s)) {
@@ -682,6 +775,14 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
       w.bytes(tn);
       continue;
     }
+    if (col.type.kind === "array") {
+      // An array column (v10): type_code 15, flags, then the element type descriptor
+      // (spec/design/array.md §3). Arrays carry no default this slice (flags bits 2/3 = 0).
+      w.u8(15);
+      w.u8(col.notNull ? 0b10 : 0);
+      pushArrayElementType(w, col.type.elem);
+      continue;
+    }
     const s = typeScalar(col.type);
     w.u8(typeCodeForScalar(s));
     // bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is the
@@ -769,6 +870,8 @@ function compositeTypeEntryBytes(ct: CompositeType): Uint8Array {
       const tn = UTF8.encode(f.type.name);
       w.u16(tn.length);
       w.bytes(tn);
+    } else if (f.type.kind === "array") {
+      throw new Error("composite field of array type is not supported this slice");
     } else {
       w.u8(typeCodeForScalar(f.type.scalar));
     }
@@ -1737,6 +1840,24 @@ function decodeTableEntry(
       });
       continue;
     }
+    if (tc === 15) {
+      // An array column (v10): flags, then the element type descriptor (array.md §3).
+      const cflags = readU8(buf, cur);
+      if ((cflags & 0b01) !== 0) {
+        throw engineError("data_corrupted", "reserved column flag bit0 set");
+      }
+      const elem = readArrayElementType(buf, cur);
+      columns.push({
+        name: cname,
+        type: arrayT(elem),
+        decimal: null,
+        primaryKey: false,
+        notNull: (cflags & 0b10) !== 0,
+        default: null,
+        defaultExpr: null,
+      });
+      continue;
+    }
     const ty = scalarForTypeCode(tc);
     if (ty === undefined) {
       throw engineError("data_corrupted", "unknown type code");
@@ -2008,7 +2129,32 @@ function readValue(
 // readInlineScalar, or a composite via readCompositeBody (spec/design/composite.md §4).
 function readInlineBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
   if (ty.kind === "composite") return readCompositeBody(ty, buf, cur);
+  if (ty.kind === "array") return readArrayBody(ty, buf, cur);
   return readInlineScalar(ty.scalar, buf, cur);
+}
+
+// readArrayBody reads an array value's present BODY (after the 0x00 tag): inverse of encodeArrayBody
+// (spec/design/array.md §4). Reads ndim/flags/per-dim (len, lb), then the optional null bitmap and
+// the present element bodies. v1 accepts ndim 0 (empty) or 1 (1-D); a higher ndim is rejected XX001
+// (multidim values are not written this slice — §12).
+function readArrayBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
+  if (ty.kind !== "array") throw engineError("data_corrupted", "readArrayBody on a non-array type");
+  const ndim = readU8(buf, cur);
+  const flags = readU8(buf, cur);
+  if ((flags & ~0x01) !== 0) throw engineError("data_corrupted", "array flags has a reserved bit set");
+  if (ndim === 0) return arrayValue([]); // empty array
+  if (ndim !== 1) throw engineError("data_corrupted", "multidimensional array value not supported (ndim > 1)");
+  const length = readU32(buf, cur);
+  readU32(buf, cur); // lower bound (round-tripped, ignored in v1)
+  const hasNulls = (flags & 0x01) !== 0;
+  let bitmap: Uint8Array | null = null;
+  if (hasNulls) bitmap = take(buf, cur, Math.ceil(length / 8));
+  const elems: Value[] = new Array(length);
+  for (let i = 0; i < length; i++) {
+    const isNull = hasNulls && (bitmap![i >> 3]! & (0x80 >> (i % 8))) !== 0;
+    elems[i] = isNull ? nullValue() : readInlineBody(ty.elem, buf, cur);
+  }
+  return arrayValue(elems);
 }
 
 // readCompositeBody reads a composite value's present BODY (after the 0x00 tag): the null bitmap then

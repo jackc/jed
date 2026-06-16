@@ -135,6 +135,26 @@ fn unique_table_db() -> Database {
     db
 }
 
+/// A table with ARRAY (`T[]`) columns (v10 — spec/design/array.md): pins the catalog array-column
+/// entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). An
+/// `int32[]` (fixed-width elements: no per-element length prefix) and a `text[]`; row 2 has an EMPTY
+/// array (ndim=0), row 3 a NULL element (the HAS_NULLS bitmap) and a whole-value NULL array (the
+/// lone 0x01 tag). Must match the Ruby reference's ARRAY_TABLE (spec/fileformat/verify.rb).
+fn array_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])",
+    );
+    run(&mut db, "INSERT INTO t VALUES (2, '{40,50}', '{}')");
+    run(&mut db, "INSERT INTO t VALUES (3, ARRAY[1, NULL, 3], NULL)");
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic int64 rowid key.
 fn nopk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
@@ -534,6 +554,7 @@ fn write_matches_goldens() {
         ("unique_table.jed", unique_table_db),
         ("composite_type_table.jed", composite_type_table_db),
         ("nested_composite_table.jed", nested_composite_table_db),
+        ("array_table.jed", array_table_db),
         ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
@@ -570,6 +591,7 @@ fn read_goldens_reproduces_rows() {
         ("unique_table.jed", unique_table_db, "t"),
         ("composite_type_table.jed", composite_type_table_db, "t"),
         ("nested_composite_table.jed", nested_composite_table_db, "t"),
+        ("array_table.jed", array_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),

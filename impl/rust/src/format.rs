@@ -34,10 +34,12 @@ use crate::value::{Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 8 = a per-column expression-default flag (bit3) + expr-text in the
-/// catalog (spec/fileformat/format.md *Version scope*). v7 added a per-page CRC-32 on every body
-/// page (the header grew 12→16 bytes).
-const FORMAT_VERSION: u16 = 9;
+/// On-disk format version — 10 = array (`T[]`) columns (type_code 15 + an element-type descriptor
+/// in the catalog, spec/design/array.md §3, and the compact array value body, §4). v9 = composite
+/// (row) types (kind-tagged catalog entries); v8 = a per-column expression-default flag; v7 added a
+/// per-page CRC-32 (header grew 12→16 bytes). The bump from 9 was atomic across the Rust/Go/TS cores
+/// + the Ruby golden reference (every `.jed` golden's version byte + CRC changed together).
+const FORMAT_VERSION: u16 = 10;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -112,6 +114,37 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Interval => 11,
         ScalarType::Float64 => 12,
         ScalarType::Float32 => 13,
+    }
+}
+
+/// Append an array column's **element type descriptor** (spec/design/array.md §3): the element's
+/// type code, then (for a composite element) its name. v1 element types are scalars; a composite
+/// element is handled for forward-compat, a nested array element is rejected (multidimensionality
+/// is a value property, not array-of-array — §2).
+fn push_array_element_type(out: &mut Vec<u8>, elem: &Type) {
+    match elem {
+        Type::Scalar(s) => out.push(type_code_for_scalar(*s)),
+        Type::Composite(r) => {
+            out.push(14);
+            let tn = r.name.as_bytes();
+            out.extend_from_slice(&(tn.len() as u16).to_be_bytes());
+            out.extend_from_slice(tn);
+        }
+        Type::Array(_) => {
+            unreachable!("nested array element (array-of-array) is not a jed type — §2")
+        }
+    }
+}
+
+/// Decode an array column's element type descriptor (inverse of [`push_array_element_type`]).
+fn read_array_element_type(buf: &[u8], pos: &mut usize) -> Result<Type> {
+    let code = read_u8(buf, pos)?;
+    if code == 14 {
+        let name = read_string(buf, pos)?;
+        Ok(Type::Composite(crate::types::CompositeRef { name }))
+    } else {
+        let s = scalar_for_type_code(code).ok_or_else(|| corrupt("invalid array element code"))?;
+        Ok(Type::Scalar(s))
     }
 }
 
@@ -190,7 +223,52 @@ fn encode_value(ty: &ColType, v: &Value) -> Vec<u8> {
             }
             _ => panic!("BUG: a non-composite value in a composite column"),
         },
+        ColType::Array(elem) => match v {
+            Value::Null => vec![0x01],
+            Value::Array(elems) => {
+                let mut out = vec![0x00]; // present
+                out.extend_from_slice(&encode_array_body(elem, elems));
+                out
+            }
+            _ => panic!("BUG: a non-array value in an array column"),
+        },
     }
+}
+
+/// An array value's **body** (after the `0x00` present tag, spec/design/array.md §4):
+/// `ndim u8 ‖ flags u8 ‖ per-dim (len u32 BE, lb i32 BE) ‖ [null_bitmap if HAS_NULLS] ‖ element
+/// bodies`. v1 writes 1-D values only: an empty array is `ndim = 0` (no dims/bitmap/elements); a
+/// non-empty array is `ndim = 1`, `len = element count`, `lb = 1`. The bitmap (MSB-first, like
+/// composite) is present iff any element is NULL (the `HAS_NULLS` flag bit); a NULL element
+/// contributes zero body bytes, a present element its value-codec body minus the presence tag.
+fn encode_array_body(elem: &ColType, elems: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if elems.is_empty() {
+        out.push(0); // ndim = 0 (empty array)
+        out.push(0); // flags
+        return out;
+    }
+    let has_nulls = elems.iter().any(|e| matches!(e, Value::Null));
+    out.push(1); // ndim = 1 (v1: 1-D values only)
+    out.push(if has_nulls { 0x01 } else { 0x00 }); // flags: bit 0 = HAS_NULLS
+    out.extend_from_slice(&(elems.len() as u32).to_be_bytes()); // dim length
+    out.extend_from_slice(&1i32.to_be_bytes()); // lower bound = 1
+    if has_nulls {
+        let nbytes = elems.len().div_ceil(8);
+        let mut bitmap = vec![0u8; nbytes];
+        for (i, e) in elems.iter().enumerate() {
+            if matches!(e, Value::Null) {
+                bitmap[i / 8] |= 0x80 >> (i % 8);
+            }
+        }
+        out.extend_from_slice(&bitmap);
+    }
+    for e in elems {
+        if !matches!(e, Value::Null) {
+            out.extend_from_slice(&encode_value(elem, e)[1..]); // body only (no presence tag)
+        }
+    }
+    out
 }
 
 /// A composite value's **body** (after the `0x00` present tag, spec/design/composite.md §4): a null
@@ -307,6 +385,8 @@ fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
         Value::Unfetched(_) => panic!("BUG: encoding an unfetched large value"),
         // A composite value is encoded by `encode_value`'s composite arm, never here.
         Value::Composite(_) => panic!("BUG: a composite value reached the scalar codec"),
+        // An array value is encoded by `encode_value`'s array arm, never here.
+        Value::Array(_) => panic!("BUG: an array value reached the scalar codec"),
     }
 }
 
@@ -319,6 +399,9 @@ fn is_spillable(ty: &ColType) -> bool {
     match ty {
         ColType::Scalar(s) => s.is_text() || s.is_bytea() || s.is_decimal(),
         ColType::Composite { .. } => true,
+        // An array's opaque inline body spills via the same overflow + LZ4 path
+        // (spec/design/array.md §4); a small array is never actually chosen by the plan.
+        ColType::Array(_) => true,
     }
 }
 
@@ -563,6 +646,9 @@ fn value_payload(ty: &ColType, v: &Value) -> Vec<u8> {
         (ColType::Composite { fields, .. }, Value::Composite(vals)) => {
             encode_composite_body(fields, vals)
         }
+        // An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies);
+        // a large array spills through the same overflow + LZ4 path (spec/design/array.md §4).
+        (ColType::Array(elem), Value::Array(elems)) => encode_array_body(elem, elems),
         _ => unreachable!("only spillable values are externalized"),
     }
 }
@@ -586,6 +672,11 @@ fn value_from_payload(ty: &ColType, payload: &[u8]) -> Result<Value> {
         ColType::Composite { .. } => {
             let mut pos = 0usize;
             read_composite_body(ty, payload, &mut pos)
+        }
+        // An array's payload is its body; decode it with a fresh cursor (spec/design/array.md §4).
+        ColType::Array(elem) => {
+            let mut pos = 0usize;
+            read_array_body(elem, payload, &mut pos)
         }
         _ => Err(corrupt("a non-spillable type was stored external")),
     }
@@ -1555,6 +1646,14 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
                 out.extend_from_slice(&(tn.len() as u16).to_be_bytes());
                 out.extend_from_slice(tn);
             }
+            Type::Array(elem) => {
+                // An array column (v10): type_code 15, flags, then the element type descriptor
+                // (spec/design/array.md §3). Arrays carry no default this slice (flags bits 2/3 = 0).
+                out.push(15);
+                let flags = if col.not_null { 0b10u8 } else { 0 };
+                out.push(flags);
+                push_array_element_type(&mut out, elem);
+            }
             Type::Scalar(s) => {
                 out.push(type_code_for_scalar(*s));
                 let mut flags = 0u8;
@@ -1873,6 +1972,9 @@ fn composite_type_entry_bytes(ct: &CompositeType) -> Vec<u8> {
                 out.extend_from_slice(tn);
             }
             Type::Scalar(s) => out.push(type_code_for_scalar(*s)),
+            Type::Array(_) => {
+                unreachable!("composite field of array type is not supported this slice")
+            }
         }
         out.push(if f.not_null { 0b1 } else { 0 });
         if let Type::Scalar(s) = &f.ty {
@@ -1954,6 +2056,25 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             columns.push(Column {
                 name: cname,
                 ty: Type::Composite(crate::types::CompositeRef { name: tname }),
+                decimal: None,
+                primary_key: false,
+                not_null: flags & 0b10 != 0,
+                default: None,
+                default_expr: None,
+            });
+            continue;
+        }
+        if tc == 15 {
+            // An array column (v10): flags, then the element type descriptor
+            // (spec/design/array.md §3). Arrays carry no default this slice.
+            let flags = read_u8(buf, pos)?;
+            if flags & 0b01 != 0 {
+                return Err(corrupt("reserved column flag bit0 set"));
+            }
+            let elem = read_array_element_type(buf, pos)?;
+            columns.push(Column {
+                name: cname,
+                ty: Type::Array(Box::new(elem)),
                 decimal: None,
                 primary_key: false,
                 not_null: flags & 0b10 != 0,
@@ -2159,7 +2280,46 @@ fn read_inline_body(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> 
     match ty {
         ColType::Scalar(s) => read_inline_scalar(*s, buf, pos),
         ColType::Composite { .. } => read_composite_body(ty, buf, pos),
+        ColType::Array(elem) => read_array_body(elem, buf, pos),
     }
+}
+
+/// An array value's present **body** (after the `0x00` tag): inverse of [`encode_array_body`]
+/// (spec/design/array.md §4). Reads `ndim`/`flags`/per-dim `(len, lb)`, then the optional null
+/// bitmap and the present element bodies. v1 accepts `ndim` 0 (empty) or 1 (1-D); a higher `ndim`
+/// is rejected `XX001` (multidim values are not written this slice — §12).
+fn read_array_body(elem: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+    let ndim = read_u8(buf, pos)?;
+    let flags = read_u8(buf, pos)?;
+    if flags & !0x01 != 0 {
+        return Err(corrupt("array flags has a reserved bit set"));
+    }
+    if ndim == 0 {
+        return Ok(Value::Array(Vec::new())); // empty array
+    }
+    if ndim != 1 {
+        return Err(corrupt(
+            "multidimensional array value not supported (ndim > 1)",
+        ));
+    }
+    let len = read_u32(buf, pos)? as usize;
+    let _lbound = read_u32(buf, pos)?; // lower bound (i32 bits) — round-tripped, ignored in v1
+    let has_nulls = flags & 0x01 != 0;
+    let bitmap = if has_nulls {
+        take(buf, pos, len.div_ceil(8))?.to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut elems = Vec::with_capacity(len);
+    for i in 0..len {
+        let is_null = has_nulls && (bitmap[i / 8] & (0x80 >> (i % 8)) != 0);
+        if is_null {
+            elems.push(Value::Null);
+        } else {
+            elems.push(read_inline_body(elem, buf, pos)?);
+        }
+    }
+    Ok(Value::Array(elems))
 }
 
 /// A composite value's present **body** (after the `0x00` tag): the null bitmap then each present

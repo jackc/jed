@@ -132,6 +132,20 @@ func uniqueTableDB(t *testing.T) *Database {
 	return db
 }
 
+// arrayTableDB has ARRAY (T[]) columns (v10 — spec/design/array.md): pins the catalog array-column
+// entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). An
+// int32[] (fixed-width elements: no per-element length prefix) and a text[]; row 2 has an EMPTY
+// array (ndim=0), row 3 a NULL element (the HAS_NULLS bitmap) and a whole-value NULL array (the
+// lone 0x01 tag). Must match the Ruby reference's ARRAY_TABLE (spec/fileformat/verify.rb).
+func arrayTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])")
+	run(t, db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])")
+	run(t, db, "INSERT INTO t VALUES (2, '{40,50}', '{}')")
+	run(t, db, "INSERT INTO t VALUES (3, ARRAY[1, NULL, 3], NULL)")
+	return db
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
 func nopkTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
@@ -453,6 +467,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"unique_table.jed", uniqueTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"nested_composite_table.jed", nestedCompositeTableDB},
+		{"array_table.jed", arrayTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -497,6 +512,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"unique_table.jed", uniqueTableDB, "t"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},
+		{"array_table.jed", arrayTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

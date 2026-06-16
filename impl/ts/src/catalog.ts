@@ -106,7 +106,10 @@ export type ColType =
   | { kind: "scalar"; scalar: ScalarType }
   // A composite type's resolved fields, in declaration order. `name` is the (original-case) type
   // name, used in store-coercion error messages.
-  | { kind: "composite"; name: string; fields: ColField[] };
+  | { kind: "composite"; name: string; fields: ColField[] }
+  // An array's resolved element type (spec/design/array.md §3). Structural — the element type is
+  // carried inline, recursively; v1 element types are scalars.
+  | { kind: "array"; elem: ColType };
 
 // ColField is one resolved field of a composite ColType — its name, recursively-resolved type, the
 // decimal typmod (when the field is decimal), and declared nullability (mirrors CompositeField, but
@@ -120,6 +123,7 @@ export type ColField = { name: string; type: ColType; typmod: DecimalTypmod | nu
 // exists and the graph is acyclic before any store is built (spec/design/composite.md §3).
 export function resolveColType(ty: Type, types: Map<string, CompositeType>): ColType {
   if (ty.kind === "scalar") return { kind: "scalar", scalar: ty.scalar };
+  if (ty.kind === "array") return { kind: "array", elem: resolveColType(ty.elem, types) };
   const def = types.get(ty.name.toLowerCase());
   if (def === undefined) {
     throw new Error("composite type reference resolved by validateCompositeTypes");

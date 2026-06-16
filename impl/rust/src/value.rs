@@ -63,6 +63,14 @@ pub enum Value {
     /// (element-wise), routed through the manual impls below so they never apply raw `==` to a
     /// float/decimal/interval field variant (the rule `Decimal`/`Interval` already follow).
     Composite(Vec<Value>),
+    /// An **array** value (spec/design/array.md §2) — a flat (1-D) list of element values, in
+    /// element order; a NULL element is `Value::Null` of the element type, an empty list is the
+    /// empty array `{}`. The whole list is one `int32[]` value; shape (dimensionality, lengths,
+    /// lower bounds) is a value property carried by the codec (§4) — v1 stores 1-D values, so the
+    /// in-memory form is the flat list. Comparison uses PG **btree** semantics (NULLs comparable
+    /// and mutually equal — *not* the composite 3VL rule, §5), so `PartialEq`/`Eq`/`Hash` (the
+    /// DISTINCT/GROUP BY key) and the total-order `lt3`/`gt3` are structural over this list.
+    Array(Vec<Value>),
     /// An **unfetched** large-value reference (spec/design/large-values.md §14): a stored
     /// external/compressed value loaded as its on-disk pointer instead of being materialized.
     /// Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -177,6 +185,11 @@ impl PartialEq for Value {
             // by value, not bits). NULL fields are equal here (the DISTINCT/GROUP BY rule —
             // `Null == Null` is true at the value level); the three-valued `eq3` differs (§5).
             (Value::Composite(a), Value::Composite(b)) => a == b,
+            // Array equality is structural and uses PG btree semantics: same length and every
+            // element pair equal, where a NULL element equals a NULL element (the value-level
+            // `Null == Null` is true). This is exactly PG `array_eq` (NULLs mutually equal), and
+            // the DISTINCT/GROUP BY key (spec/design/array.md §5).
+            (Value::Array(a), Value::Array(b)) => a == b,
             (Value::Unfetched(a), Value::Unfetched(b)) => a == b,
             _ => false,
         }
@@ -209,6 +222,12 @@ impl std::hash::Hash for Value {
             Value::Composite(fields) => {
                 for f in fields {
                     f.hash(state);
+                }
+            }
+            // Hash each element in order (consistent with the structural `PartialEq`).
+            Value::Array(elems) => {
+                for e in elems {
+                    e.hash(state);
                 }
             }
             Value::Unfetched(u) => u.hash(state),
@@ -293,6 +312,9 @@ impl Value {
             // (spec/design/composite.md §8). The renderer recurses (a composite field's text is
             // itself quoted because it contains parens/commas).
             Value::Composite(fields) => record_out(fields),
+            // An array renders as PG `array_out`: `{e1,e2,…}` with per-element quoting and an
+            // unquoted `NULL` for a null element (spec/design/array.md §7).
+            Value::Array(elems) => array_out(elems),
             Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
         }
     }
@@ -352,6 +374,11 @@ impl Value {
                     ThreeValued::True
                 }
             }
+            // Array `=` uses PG btree semantics (spec/design/array.md §5), NOT the composite 3VL
+            // rule: same length and every element pair equal-or-both-NULL → TRUE, else FALSE.
+            // NULL elements are comparable and mutually equal, so the result is ALWAYS definite
+            // (never UNKNOWN) — exactly `array_eq`. This is the structural `PartialEq`.
+            (Value::Array(a), Value::Array(b)) => bool3(a == b),
             // Poisoned (large-values.md §14): an unfetched value must never be compared —
             // falling through to UNKNOWN here would silently read it as NULL.
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
@@ -386,6 +413,12 @@ impl Value {
             // `<`; a field whose `=` is UNKNOWN (a NULL operand) makes the whole comparison UNKNOWN;
             // all-equal rows are not `<`.
             (Value::Composite(a), Value::Composite(b)) => composite_order3(a, b, false),
+            // Array `<` uses PG `array_cmp` total order (spec/design/array.md §5): element-wise,
+            // NULL sorts after every non-NULL (NULLs mutually equal), shorter prefix sorts first.
+            // Always definite (the btree total order), never UNKNOWN.
+            (Value::Array(a), Value::Array(b)) => {
+                bool3(array_total_cmp(a, b) == std::cmp::Ordering::Less)
+            }
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
                 panic!("BUG: unfetched large value escaped the storage layer")
             }
@@ -415,6 +448,10 @@ impl Value {
             (Value::Interval(a), Value::Interval(b)) => bool3(a > b),
             // Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
             (Value::Composite(a), Value::Composite(b)) => composite_order3(a, b, true),
+            // Array `>` — the total-order mirror of `<` (spec/design/array.md §5).
+            (Value::Array(a), Value::Array(b)) => {
+                bool3(array_total_cmp(a, b) == std::cmp::Ordering::Greater)
+            }
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
                 panic!("BUG: unfetched large value escaped the storage layer")
             }
@@ -436,6 +473,9 @@ impl Value {
             // Two composites are "not distinct" iff structurally equal — NULL-safe, so a NULL
             // field equals a NULL field (the value-level `PartialEq`, not the 3VL `eq3`).
             (Value::Composite(a), Value::Composite(b)) => a == b,
+            // Two arrays are "not distinct" iff structurally equal (the same btree equality as
+            // `==`/`eq3`; NULL elements are mutually equal).
+            (Value::Array(a), Value::Array(b)) => a == b,
             _ => self.eq3(other) == ThreeValued::True,
         }
     }
@@ -613,6 +653,185 @@ fn record_field_needs_quote(s: &str) -> bool {
             matches!(
                 c,
                 '"' | '\\' | '(' | ')' | ',' | ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'
+            )
+        })
+}
+
+/// PG `array_cmp` total order over two arrays (spec/design/array.md §5): walk element pairs; the
+/// first non-equal pair decides; if one array is a prefix of the other, the shorter sorts first.
+/// NULL elements are comparable — a NULL sorts AFTER every non-NULL and two NULLs are equal (the
+/// NULLs-last total order, [compare.toml] `null_ordering`). Always total/definite (never UNKNOWN).
+fn array_total_cmp(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let o = elem_total_cmp(x, y);
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Total order over two array elements, with NULL the largest value (NULLs-last) and two NULLs
+/// equal. Present (non-NULL) elements use their own definite `eq3`/`lt3` (scalar comparators).
+fn elem_total_cmp(x: &Value, y: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (x, y) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater, // NULL sorts last
+        (_, Value::Null) => Ordering::Less,
+        _ => {
+            if x.eq3(y) == ThreeValued::True {
+                Ordering::Equal
+            } else if x.lt3(y) == ThreeValued::True {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+    }
+}
+
+/// PostgreSQL `array_out` (spec/design/array.md §7): render an array's elements as `{e1,e2,…}`. A
+/// NULL element is the unquoted token `NULL`; every other element is rendered by its own `render`
+/// and double-quoted iff it is empty, equals the literal `NULL` (case-insensitive), or contains a
+/// delimiter / brace / quote / backslash / whitespace. Inside the quotes PostgreSQL **backslash-
+/// escapes** an embedded `"` → `\"` and `\` → `\\` (the contrast with `record_out`, which doubles).
+/// The empty array renders `{}`. The spelling must equal PG byte-for-byte (CLAUDE.md §8).
+pub fn array_out(elements: &[Value]) -> String {
+    let mut out = String::from("{");
+    for (i, e) in elements.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match e {
+            Value::Null => out.push_str("NULL"),
+            _ => {
+                let s = e.render();
+                if array_elem_needs_quote(&s) {
+                    out.push('"');
+                    for ch in s.chars() {
+                        if ch == '"' || ch == '\\' {
+                            out.push('\\');
+                        }
+                        out.push(ch);
+                    }
+                    out.push('"');
+                } else {
+                    out.push_str(&s);
+                }
+            }
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// PostgreSQL `array_in` tokenizer (spec/design/array.md §7) — the inverse of `array_out`. Splits
+/// the text of an array literal `{e1,e2,…}` into raw element tokens **without** type coercion: the
+/// caller coerces each token to the element type. An element is either quoted (`"…"` with `\"`→`"`
+/// and `\\`→`\` un-escaping) or unquoted (read to the next top-level `,`/`}`, surrounding
+/// whitespace trimmed, `\x`→`x`). An **unquoted** `NULL` (any case) is a NULL element (`None`); a
+/// quoted `"NULL"` is the 4-char string. `{}` (optionally with inner whitespace) is the empty
+/// array. Returns `None` on a malformed literal — the executor maps that to `22P02`.
+pub fn parse_array_tokens(input: &str) -> Option<Vec<Option<String>>> {
+    let s = input.trim_matches(|c: char| c.is_ascii_whitespace());
+    let mut chars = s.chars().peekable();
+    if chars.next() != Some('{') {
+        return None;
+    }
+    let mut elems: Vec<Option<String>> = Vec::new();
+    // Empty array: optional inner whitespace, then `}`.
+    while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
+        chars.next();
+    }
+    if chars.peek() == Some(&'}') {
+        chars.next();
+        return if chars.next().is_some() {
+            None
+        } else {
+            Some(elems)
+        };
+    }
+    loop {
+        // Leading whitespace before an element is not significant.
+        while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
+            chars.next();
+        }
+        let mut buf = String::new();
+        let mut quoted = false;
+        if chars.peek() == Some(&'"') {
+            quoted = true;
+            chars.next(); // opening quote
+            loop {
+                match chars.next() {
+                    None => return None, // unterminated quoted element
+                    Some('"') => break,  // closing quote
+                    Some('\\') => match chars.next() {
+                        Some(c) => buf.push(c),
+                        None => return None,
+                    },
+                    Some(c) => buf.push(c),
+                }
+            }
+            // Trailing whitespace before the delimiter is allowed.
+            while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
+                chars.next();
+            }
+        } else {
+            // Unquoted: read until a top-level `,`/`}`, processing `\x`→`x`.
+            loop {
+                match chars.peek() {
+                    None => return None, // missing '}'
+                    Some(',') | Some('}') => break,
+                    Some('\\') => {
+                        chars.next();
+                        match chars.next() {
+                            Some(c) => buf.push(c),
+                            None => return None,
+                        }
+                    }
+                    Some(&c) => {
+                        buf.push(c);
+                        chars.next();
+                    }
+                }
+            }
+        }
+        let elem = if quoted {
+            Some(buf)
+        } else {
+            let trimmed = buf.trim_matches(|c: char| c.is_ascii_whitespace());
+            if trimmed.is_empty() {
+                return None; // a bare empty unquoted element is malformed (PG)
+            } else if trimmed.eq_ignore_ascii_case("NULL") {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+        elems.push(elem);
+        match chars.next() {
+            Some(',') => continue,
+            Some('}') => break,
+            _ => return None,
+        }
+    }
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(elems)
+}
+
+/// Whether an `array_out` element token must be double-quoted: the empty string, the literal
+/// `NULL` (any case — else it would parse back as a NULL element), or any token containing a
+/// comma, brace, double-quote, backslash, or whitespace — PostgreSQL's exact rule.
+fn array_elem_needs_quote(s: &str) -> bool {
+    s.is_empty()
+        || s.eq_ignore_ascii_case("NULL")
+        || s.chars().any(|c| {
+            matches!(
+                c,
+                '"' | '\\' | '{' | '}' | ',' | ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'
             )
         })
 }

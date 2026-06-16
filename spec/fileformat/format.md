@@ -15,13 +15,26 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 9)
+## Version scope (`format_version` 10)
 
-The current on-disk version is **`format_version` 9** — **composite (row) types**
+The current on-disk version is **`format_version` 10** — **array (`T[]`) columns**
+([../design/array.md](../design/array.md)). An array is a **structural** type (no catalog object —
+the element type is carried inline), so the only on-disk change is in the **column entry**: a new
+**`type_code = 15`** (the *Stable type codes* table) followed by the **element-type descriptor**
+(the element's own type code, then — for a composite element — its name; *Array column* below) in
+place of a scalar's typmod slot. A value is the compact **array body** (`ndim ‖ flags ‖ per-dim
+(len, lb) ‖ optional null bitmap ‖ element bodies` — *Value codec* below); a fixed-width element
+carries **no per-element length prefix**. The per-table data B-tree and the meta page are
+untouched. A file with no array columns still moves to v10 (only the version byte + meta CRC
+change). Each version is a **clean break** — older versions are **not read** (we are pre-1.0 and
+owe no on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only**
+version 10.
+
+`format_version` 9 was **composite (row) types**
 ([../design/composite.md](../design/composite.md)). A user-defined composite type
 (`CREATE TYPE addr AS (street text, zip int32)`) is a database-level object, so the catalog —
-through v8 a chain of **table** entries — becomes a chain of **kind-tagged** entries. Three
-coupled changes, all in the catalog (the per-table data B-tree and the meta page are untouched):
+through v8 a chain of **table** entries — became a chain of **kind-tagged** entries. Three
+coupled changes, all in the catalog (the per-table data B-tree and the meta page untouched):
 
 1. **Every catalog entry gains a leading `entry_kind` u8**: `0` = a table entry (the v8 layout,
    unchanged after this byte), `1` = a composite-type entry. Composite-type entries are emitted
@@ -36,10 +49,8 @@ coupled changes, all in the catalog (the per-table data B-tree and the meta page
    that every referenced composite name exists and the reference graph is **acyclic** (a dangling
    or cyclic reference is `XX001`), then build the tables (resolving each composite column's name).
 
-A file with no composite types still moves to v9 (the version byte changes, and every table entry
-gains the leading `entry_kind = 0`). Each version is a **clean break** — older versions are **not
-read** (we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a
-reader accepts **only** version 9.
+A file with no composite types still moved to v9 (the version byte changed, and every table entry
+gained the leading `entry_kind = 0`).
 
 `format_version` 8 was an **expression column default**.
 A column's `DEFAULT` may be a non-constant expression (a function call like `uuidv7()`,
@@ -191,7 +202,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`8`** |
+| 4  | 2 | `format_version` (u16) — current = **`10`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -220,7 +231,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 8`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 10`,
 reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
 slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
 
@@ -327,6 +338,14 @@ key this slice — a composite `PRIMARY KEY` / index / `UNIQUE` column is reject
 ([../design/composite.md §6](../design/composite.md)), so no composite key bytes ever reach a
 data record.
 
+An **array column** (a structural `T[]` type — `type_code == 15`, **v10**;
+[../design/array.md §3](../design/array.md)) appends, in the typmod slot, an **element type
+descriptor**: a `u8 element_type_code` (the *Stable type codes* table — a scalar `1`–`13`, or `14`
++ a `u16 name_len` + name for a composite element; a nested-array element `15` is not a jed type).
+The element type is carried **inline** (no array-type catalog object — arrays are structural, not
+nominal), so an array column is self-describing. An array column is **not** a key this slice — an
+array `PRIMARY KEY` / index / `UNIQUE` is rejected `0A000` at DDL ([../design/array.md §8](../design/array.md)).
+
 ### Composite-type entry (`entry_kind = 1`, v9)
 
 A composite-type entry records a `CREATE TYPE name AS (field type, …)` definition
@@ -403,6 +422,7 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 12 | `float64` |
 | 13 | `float32` |
 | 14 | composite (a user-defined row type — followed by the type name, **not** a fixed body; v9) |
+| 15 | array (a structural `T[]` — followed by the element type descriptor, **not** a fixed body; v10) |
 
 A **`float64`** value (`type_code == 12`) is the **8 IEEE 754 bytes, big-endian**, and a
 **`float32`** value (`type_code == 13`) is the **4 IEEE 754 bytes, big-endian** — both behind the
@@ -636,6 +656,19 @@ from v1**. The present-**inline-plain** body depends on the type:
   `addr AS (street text, zip int32)`: `('Main', 90210)` → `00`(tag) `00`(bitmap) `00 04 4D 61 69 6E`
   (text body) `80 01 60 62` (int32 body) — an 11-byte body; `('Main', NULL)` → `00`(tag) `40`
   (bitmap: field 1 NULL) `00 04 4D 61 69 6E` (the int field omitted) — a 7-byte body.
+
+- **array** (`type_code 15`, **v10** — [../design/array.md §4](../design/array.md)) — `ndim u8`,
+  `flags u8` (bit 0 = `HAS_NULLS`; other bits reserved, 0), then per dimension `len u32 BE` +
+  `lb i32 BE`, then (only when `HAS_NULLS`) a **null bitmap** of `ceil(N / 8)` bytes (MSB-first, like
+  composite; `N` = product of the dim lengths), then each **present** element's value-codec body
+  **without its own presence tag** (row-major). v1 writes **1-D** values only: an **empty array** is
+  `ndim = 0` (the two bytes `00 00`, no dims/bitmap/elements); a non-empty array is `ndim = 1`,
+  `len` = element count, `lb = 1`. A **whole-value-NULL** array is the lone `0x01` tag. The element
+  type comes from the column's array type in the catalog, so the body is self-delimiting; fixed-width
+  elements pay **no** per-element prefix. Worked example, `int32[]`: `{1,2,3}` → `00`(tag) `01`(ndim)
+  `00`(flags) `00 00 00 03`(len) `00 00 00 01`(lb) `80 00 00 01 80 00 00 02 80 00 00 03`(three int32
+  bodies); `{1,NULL,3}` → `00 01`(HAS_NULLS) `00 00 00 03 00 00 00 01` `40`(bitmap: elem 1 NULL) +
+  the bodies for elements 0 and 2.
 
 **Rowid reconstruction (no-PK tables).** The synthetic rowid is allocated from a **monotonic
 counter** that is never reused. It is **not stored** — on load it is set to `max(rowid) + 1`

@@ -104,13 +104,16 @@ type ColType struct {
 	// Composite discriminates: false ⇒ a scalar (Scalar is meaningful); true ⇒ a composite
 	// (Name/Fields are meaningful).
 	Composite bool
-	// Scalar is the inner scalar type when Composite == false.
+	// Scalar is the inner scalar type when Composite == false && Elem == nil.
 	Scalar ScalarType
 	// Name is the (original-case) composite type name when Composite == true, used in
 	// store-coercion error messages.
 	Name string
 	// Fields is the composite type's resolved fields in declaration order when Composite == true.
 	Fields []ColField
+	// Elem is the resolved element type when this is an array ColType (spec/design/array.md §3),
+	// else nil. Structural — the element type is carried inline, recursively.
+	Elem *ColType
 }
 
 // ColField is one resolved field of a composite ColType — its name, recursively-resolved type, the
@@ -132,6 +135,10 @@ func ScalarColType(s ScalarType) ColType { return ColType{Scalar: s} }
 // validateCompositeTypes (the two-pass load / CREATE TYPE gate) proved every reference exists and the
 // graph is acyclic before any store is built (spec/design/composite.md §3).
 func ResolveColType(ty Type, types map[string]*CompositeType) ColType {
+	if ty.Array != nil {
+		elem := ResolveColType(*ty.Array, types)
+		return ColType{Elem: &elem}
+	}
 	if ty.Comp == nil {
 		return ColType{Scalar: ty.Scalar}
 	}
