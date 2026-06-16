@@ -1,0 +1,18 @@
+# Cargo config for the Rust core — TEST/BUILD-TIME ONLY, never affects the shipped artifact.
+#
+# RUST_MIN_STACK sizes std::thread-spawned threads (incl. cargo-test worker threads) at RUNTIME of a
+# cargo-launched process; it is NOT a codegen setting, so the compiled library/CLI is byte-for-byte
+# identical with or without it. cargo's [env] injects the var only into processes cargo itself runs
+# (`cargo test`/`build`/`run` from this crate dir) — a shipped CLI binary or a host program linking
+# `jed` runs in its OWN environment and never reads this file, so production stack behavior is
+# unchanged (the engine query path is single-threaded, on whatever thread the host provides).
+#
+# Why: cargo-test worker threads default to a 2 MiB stack. The recursive-descent resolver (and the
+# eval/fold/touched walks) recurse to an expression's nesting depth; in a DEBUG build each giant-match
+# frame is ~25-30 KB, so a ~80-deep expression overflows 2 MiB. Release builds already fit the default.
+# This makes `cargo test` robust in debug. The deeper engine gap (deeply-nested untrusted input can
+# overflow the native stack during resolve, BEFORE cost metering — the cost ceiling can't catch it) is
+# tracked in TODO.md as a §13 hardening item: a deterministic max expression-nesting depth (PG's
+# check_stack_depth / 54001). See impl/rust/tests/cost_limit.rs::pathological_expression_aborts_on_one_row.
+[env]
+RUST_MIN_STACK = "8388608" # 8 MiB
