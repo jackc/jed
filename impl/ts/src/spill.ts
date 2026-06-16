@@ -9,11 +9,32 @@
 // one query while the database file is unchanged — not the §8 on-disk record format. Node stdlib I/O
 // only (no dependency — CLAUDE.md §14).
 
-import { closeSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { Decimal } from "./decimal.ts";
 import type { Row } from "./storage.ts";
 import { type Value, float32Value, float64Value } from "./value.ts";
+
+// SpillSink is the host backing for spilled runs — the Node `fs` implementation is FileSpillSink
+// (spillfile.ts), injected on the Database handle by a durable host that can spill to disk. null for an
+// in-memory / OPFS database (never spill — spill.md §2). Keeping it an interface here is what frees
+// spill.ts — and thus the whole executor — of any `node:*` import, so the engine runs in a browser
+// bundle (the OPFS host). The run codec below is a per-core internal format, never the §8 on-disk
+// format (spill.md §6).
+export interface SpillSink {
+  // writeRun persists one sorted run's bytes and returns a handle to read it back.
+  writeRun(bytes: Uint8Array): SpillRun;
+}
+// SpillRun is one written run; open() streams it back exactly once (the merge opens each run once).
+export interface SpillRun {
+  open(): SpillByteReader;
+}
+// SpillByteReader is a forward byte reader over a run (the codec below pulls bytes through it). close()
+// releases and deletes the run.
+export interface SpillByteReader {
+  byte(): number;
+  bytes(n: number): Uint8Array;
+  u64(): bigint;
+  close(): void;
+}
 
 // DEFAULT_WORK_MEM is the default work-memory budget, in bytes (256 MiB) — the OpenOptions.workMem
 // default (spec/design/spill.md §2, api.md §2.1). Matches the buffer-pool default so a RAM-sized
@@ -25,10 +46,6 @@ export const DEFAULT_WORK_MEM = 256 * 1024 * 1024;
 // stable sort keeps input order — spill.md §6). Injected by the executor so this module never imports
 // keyCmp (which would form a cycle with executor.ts).
 export type RowCompare = (a: Row, b: Row) => number;
-
-// A unique-per-process counter for spill file names (combined with the process id), so concurrent
-// sorters never collide. Internal — it never affects results (spill.md §6).
-let spillSeq = 0;
 
 // valueBytes is a cheap, deterministic estimate of a value's resident bytes (spill.md §2): a fixed
 // base plus the variable-width payload. It need not be exact — it only decides spill timing, which is
@@ -68,23 +85,23 @@ function rowBytes(row: Row): number {
 export class Sorter {
   private compare: RowCompare;
   private budget: number;
-  private spillDir: string | null;
+  private sink: SpillSink | null;
   private buf: Row[] = [];
   private bufBytes = 0;
-  // Spilled run file paths, in input order (run 0 = first chunk — spill.md §6).
-  private runs: string[] = [];
+  // Spilled runs, in input order (run 0 = first chunk — spill.md §6).
+  private runs: SpillRun[] = [];
   total = 0;
 
-  // compare orders rows; budget is the work-memory bound in bytes (0 ⇒ unlimited); spillDir is the
-  // directory for run files, or null for an in-memory database (never spill).
-  constructor(compare: RowCompare, budget: number, spillDir: string | null) {
+  // compare orders rows; budget is the work-memory bound in bytes (0 ⇒ unlimited); sink persists
+  // spilled runs, or null for an in-memory / OPFS database (never spill — spill.md §2).
+  constructor(compare: RowCompare, budget: number, sink: SpillSink | null) {
     this.compare = compare;
     this.budget = budget;
-    this.spillDir = spillDir;
+    this.sink = sink;
   }
 
   private canSpill(): boolean {
-    return this.spillDir !== null && this.budget > 0;
+    return this.sink !== null && this.budget > 0;
   }
 
   // push adds one row, spilling the current run when the in-memory buffer exceeds the budget.
@@ -106,9 +123,7 @@ export class Sorter {
     const w = new ByteWriter();
     w.u64(BigInt(this.buf.length));
     for (const row of this.buf) writeRow(w, row);
-    const path = join(this.spillDir!, `jed-spill-${process.pid}-${spillSeq++}.tmp`);
-    writeFileSync(path, w.result());
-    this.runs.push(path);
+    this.runs.push(this.sink!.writeRun(w.result()));
     this.buf = [];
     this.bufBytes = 0;
   }
@@ -123,7 +138,7 @@ export class Sorter {
     // the highest source index, the tie-break that reproduces input order — spill.md §6).
     const sources: MergeSource[] = [];
     try {
-      for (const path of this.runs) sources.push(new FileSource(path));
+      for (const run of this.runs) sources.push(new RunSource(run.open()));
     } catch (e) {
       for (const s of sources) s.close();
       throw e;
@@ -247,76 +262,30 @@ class MemSource implements MergeSource {
   close(): void {}
 }
 
-const READ_CHUNK = 1 << 16; // 64 KiB — a bounded read buffer per open run
-
-class FileSource implements MergeSource {
-  private path: string;
-  private fd: number;
-  private filePos = 0;
-  private chunk = Buffer.allocUnsafe(READ_CHUNK);
-  private chunkLen = 0;
-  private chunkPos = 0;
+// RunSource is a merge input backed by a spilled run, read lazily one row at a time through the
+// injected SpillByteReader (the Node `fs` reader lives in spillfile.ts). The leading u64 is the run's
+// row count; when drained it closes the reader (which deletes the run file — eager cleanup so a LIMIT
+// that stops the merge early leaks nothing, spill.md §4).
+class RunSource implements MergeSource {
+  private reader: SpillByteReader;
   private remaining: bigint;
-  private closed = false;
 
-  constructor(path: string) {
-    this.path = path;
-    this.fd = openSync(path, "r");
-    this.remaining = this.u64();
+  constructor(reader: SpillByteReader) {
+    this.reader = reader;
+    this.remaining = reader.u64();
   }
 
   next(): Row | null {
     if (this.remaining === 0n) {
-      this.close(); // exhausted — close + delete the run file eagerly
+      this.reader.close();
       return null;
     }
     this.remaining -= 1n;
-    return readRow(this);
+    return readRow(this.reader);
   }
 
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    closeSync(this.fd);
-    try {
-      unlinkSync(this.path);
-    } catch {
-      // best-effort cleanup
-    }
-  }
-
-  // --- the streaming byte reader (a bounded chunk buffer keeps peak memory at one chunk per run) ---
-  private refill(): void {
-    this.chunkLen = readSync(this.fd, this.chunk, 0, this.chunk.length, this.filePos);
-    this.filePos += this.chunkLen;
-    this.chunkPos = 0;
-  }
-  byte(): number {
-    if (this.chunkPos >= this.chunkLen) {
-      this.refill();
-      if (this.chunkLen === 0) throw new Error("unexpected EOF in spill run");
-    }
-    return this.chunk[this.chunkPos++]!;
-  }
-  bytes(n: number): Uint8Array {
-    const out = new Uint8Array(n);
-    let off = 0;
-    while (off < n) {
-      if (this.chunkPos >= this.chunkLen) {
-        this.refill();
-        if (this.chunkLen === 0) throw new Error("unexpected EOF in spill run");
-      }
-      const take = Math.min(n - off, this.chunkLen - this.chunkPos);
-      out.set(this.chunk.subarray(this.chunkPos, this.chunkPos + take), off);
-      this.chunkPos += take;
-      off += take;
-    }
-    return out;
-  }
-  u64(): bigint {
-    let n = 0n;
-    for (let i = 0n; i < 8n; i++) n |= BigInt(this.byte()) << (i * 8n);
-    return n;
+    this.reader.close();
   }
 }
 
@@ -476,19 +445,19 @@ function writeValue(w: ByteWriter, v: Value): void {
   }
 }
 
-function readU32(r: FileSource): number {
+function readU32(r: SpillByteReader): number {
   const b = r.bytes(4);
   return (b[0]! | (b[1]! << 8) | (b[2]! << 16) | (b[3]! << 24)) >>> 0;
 }
 
-function readRow(r: FileSource): Row {
+function readRow(r: SpillByteReader): Row {
   const ncols = readU32(r);
   const row: Row = new Array(ncols);
   for (let i = 0; i < ncols; i++) row[i] = readValue(r);
   return row;
 }
 
-function readValue(r: FileSource): Value {
+function readValue(r: SpillByteReader): Value {
   const tag = r.byte();
   switch (tag) {
     case 0:

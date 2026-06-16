@@ -8,12 +8,14 @@
 import { closeSync, existsSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { FileBlockStore } from "./blockstore.ts";
-import { DEFAULT_PAGE_SIZE, Database, Snapshot } from "./executor.ts";
+import { FileBlockStore } from "./fileblockstore.ts";
+import { DEFAULT_PAGE_SIZE, Database } from "./executor.ts";
 import { engineError } from "./errors.ts";
-import { incrementalImage, loadDatabasePaged, metaPage, toImage } from "./format.ts";
+import { loadDatabasePaged, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
+import { persistImpl } from "./persist.ts";
+import { FileSpillSink } from "./spillfile.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
@@ -42,6 +44,7 @@ export function create(path: string, opts: DatabaseOptions = {}): Database {
     throw ioError(e);
   }
   db.paging = new SharedPaging(Pager.fromStore(new FileBlockStore(fd)), cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize)); // valid header
+  db.spillSink = new FileSpillSink(dirname(path)); // ORDER BY spills next to the database file (spill.md §4)
   return db;
 }
 
@@ -105,6 +108,7 @@ export function open(path: string, opts: OpenOptions = {}): Database {
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;
+    db.spillSink = new FileSpillSink(dirname(path)); // ORDER BY spills next to the database file (spill.md §4)
     if (opts.workMem !== undefined) db.workMem = opts.workMem;
     return db;
   } catch (e) {
@@ -112,36 +116,6 @@ export function open(path: string, opts: OpenOptions = {}): Database {
     if (e instanceof Error && e.name === "EngineError") throw e;
     throw ioError(e);
   }
-}
-
-// persistImpl durably publishes snap to the backing file via an incremental copy-on-write commit
-// (spec/fileformat/format.md *Allocation & incremental commit*; transactions.md §9), installed as the
-// Database.persistHook by create/open and called by commitTx with the working snapshot being
-// published. Write the dirty pages this transaction introduced — reusing free-list pages a prior root
-// abandoned before extending the file (P6.2) — fsync, write the alternate meta slot (snap.txid & 1),
-// fsync. Clean pages are never rewritten. A crash between the two fsyncs leaves the prior meta — and
-// thus the prior snapshot — intact (its pages were not overwritten: a reused free page is reachable
-// from no live snapshot). An in-memory database has no persistHook. db.pageCount / db.freePages advance
-// only after both fsyncs succeed, so a write failure leaves db, committed, and the file's prior meta
-// untouched (the working snapshot is then discarded). The future synchronous=off mode gates here.
-function persistImpl(db: Database, snap: Snapshot): void {
-  // An in-memory database has no paging context — a no-op success (committed swaps in commitTx after
-  // this). JS is single-threaded, so the read (fault) and this commit-write path never overlap.
-  if (db.paging === null) return;
-  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging);
-  // Preallocate the file ahead of the high-water in chunks, so this commit's body write — and most
-  // later commits' — lands in already-allocated space and the body fdatasync below carries no
-  // file-growth metadata journaling (spec/design/pager.md §7).
-  db.paging.reserve(write.pageCount);
-  for (const pg of write.pages) {
-    db.paging.writeBlock(pg.index, pg.bytes);
-  }
-  db.paging.sync(); // body pages durable before the meta can reference them
-  const meta = metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount);
-  db.paging.writeBlock(Number(snap.txid & 1n), meta);
-  db.paging.sync(); // the commit is published
-  db.pageCount = write.pageCount;
-  db.freePages = write.freeRemaining;
 }
 
 // residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an

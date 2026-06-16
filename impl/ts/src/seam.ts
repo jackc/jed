@@ -14,7 +14,6 @@
 // The PRNG runs over `bigint` masked to 64 bits — JS numbers are f64, so splitmix64's 64-bit
 // arithmetic (and the int64 clock/ms) must use bigint, the same discipline as the cost counter.
 
-import { randomBytes } from "node:crypto";
 import { engineError } from "./errors.ts";
 import { buildUuidV4, buildUuidV7 } from "./uuid.ts";
 
@@ -31,13 +30,21 @@ export class Seam {
   randomFill?: RandomFill;
   clock?: ClockFunc;
 
-  // fill writes buf.length random bytes: the injected source, else the OS CSPRNG (node:crypto).
+  // fill writes buf.length random bytes: the injected source, else the OS CSPRNG via the Web Crypto
+  // global (crypto.getRandomValues). The global is present in both browsers/workers AND Node ≥19, so
+  // the engine core imports no `node:*` here and runs unchanged in a browser bundle (the OPFS host) —
+  // identical entropy semantics, no behavior change (the default source is not conformance-checked; the
+  // # seed: directive injects seededRandomSource). getRandomValues fills ≤ 65536 bytes per call; uuid
+  // fills are 8/16 bytes, but chunk for generality.
   fill(buf: Uint8Array): void {
     if (this.randomFill) {
       this.randomFill(buf);
       return;
     }
-    buf.set(randomBytes(buf.length));
+    const QUOTA = 65536;
+    for (let off = 0; off < buf.length; off += QUOTA) {
+      crypto.getRandomValues(buf.subarray(off, Math.min(off + QUOTA, buf.length)));
+    }
   }
 
   // nowMicros returns the current time in micros since the Unix epoch: the injected clock, else the

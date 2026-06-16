@@ -60,8 +60,7 @@ import { encodeInt } from "./encoding.ts";
 import { EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
 import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
-import { dirname } from "node:path";
-import { DEFAULT_WORK_MEM, type RowCompare, Sorter } from "./spill.ts";
+import { DEFAULT_WORK_MEM, type RowCompare, type SpillSink, Sorter } from "./spill.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -454,9 +453,10 @@ export class Database {
   // for a freshly-created file (a from-scratch image leaks nothing).
   freePages: number[];
   // persistHook is the durable-write seam (spec/design/storage.md §2): null for an in-memory
-  // database, set by the file host (file.ts create/open) to the synchronous whole-image write. It
-  // is called by commitTx with the working snapshot being published (transactions.md §4.1/§9).
-  // Injecting it here keeps the executor free of a file-module dependency (no executor→file cycle).
+  // database, set by a durable host (file.ts Node `fs` / opfs.ts Browser/OPFS — both to the shared
+  // incremental commit, persist.ts) — and so the signal that a commit advances txid + persists (used
+  // by commitTx). It is called by commitTx with the working snapshot being published (transactions.md
+  // §4.1/§9). Injecting it here keeps the executor free of a host-module dependency (no import cycle).
   persistHook: ((db: Database, snap: Snapshot) => void) | null;
   // paging is the shared paging context for a file-backed database (spec/design/pager.md): the open
   // pager (kept for the handle's life) + the bounded leaf buffer pool, shared with every table store
@@ -483,6 +483,12 @@ export class Database {
   // spill.md §6), only when an operator spills; an in-memory database ignores it. Default
   // DEFAULT_WORK_MEM.
   workMem: number;
+  // spillSink is the host backing for the ORDER BY external merge sort's spilled runs (spec/design/
+  // spill.md §4): set by a durable host that can spill to disk (file.ts → FileSpillSink), null for an
+  // in-memory or OPFS database (which never spills — sorts stay resident, spill.md §2). A type-only
+  // import keeps the executor free of any node:* dependency (the Node `fs` impl lives in spillfile.ts),
+  // so the engine runs in a browser bundle (the OPFS host).
+  spillSink: SpillSink | null;
   // seam: the entropy + clock seam for the uuid generators (spec/design/entropy.md): two
   // host-injectable functions (a random source + a clock), each unset ⇒ the platform primitive (OS
   // CSPRNG per value / wall clock). Set via setRandomSource / setClockSource; tests inject the
@@ -502,6 +508,7 @@ export class Database {
     this.maxCost = 0n;
     this.readOnly = false;
     this.workMem = DEFAULT_WORK_MEM;
+    this.spillSink = null;
     this.seam = new Seam();
   }
 
@@ -718,16 +725,23 @@ export class Database {
   // commitTx commits the current transaction (spec/design/transactions.md §4.2). With no open block
   // it is a lenient no-op success. A failed block, or any read-only tx, publishes nothing — the
   // working snapshot is dropped (a failed COMMIT is thus a ROLLBACK, PostgreSQL). A READ WRITE block
-  // publishes its working snapshot: bump its txid (file-backed only — an in-memory database stays at
-  // txid 0), make it durable (the persistHook, §9), then swap it in as committed. A durable-write
-  // failure leaves committed untouched and rethrows. Returns to autocommit.
+  // publishes its working snapshot: bump its txid (a durable/persistent database — one with a
+  // persistHook; an in-memory database has none and stays at txid 0), make it durable (the
+  // persistHook, §9), then swap it in as committed. A durable-write failure leaves committed untouched
+  // and rethrows. Returns to autocommit.
   commitTx(): Outcome {
     const tx = this.tx;
     if (tx === null) return { kind: "statement", cost: 0n, rowsAffected: null };
     this.tx = null;
     if (tx.failed || !tx.writable) return { kind: "statement", cost: 0n, rowsAffected: null };
     const working = tx.working;
-    if (this.path !== null) working.txid = this.committed.txid + 1n;
+    // The txid advances for a durable database, signalled by the presence of a persistHook (the file
+    // and OPFS hosts set one; an in-memory database has none and stays at txid 0). Keyed on persistHook,
+    // not `path`: the OPFS host is durable but has no filesystem path (it leaves `path` null so the
+    // disk-spill in newSorterFor stays off), so `path` alone would wrongly hold its txid at the create
+    // value and reuse the same meta slot. For the file and in-memory hosts the two are equivalent
+    // (path and persistHook are set or unset together), so this is observably identical there.
+    if (this.persistHook !== null) working.txid = this.committed.txid + 1n;
     // persistHook (if any) throws on an I/O failure before committed is swapped, so committed is
     // left untouched (the commit failed; the working snapshot is discarded).
     if (this.persistHook !== null) this.persistHook(this, working);
@@ -2703,8 +2717,9 @@ export class Database {
   }
 
   // newSorterFor builds a Sorter for order, bounded by this handle's workMem. Spilling is enabled only
-  // for a file-backed database (an in-memory one has nowhere to spill — spill.md §2); spill runs live
-  // next to the database file (same filesystem, guaranteed writable).
+  // when a spillSink is present — a durable host that can spill to disk sets one (file.ts →
+  // FileSpillSink, writing runs next to the database file); an in-memory or OPFS database leaves it
+  // null and sorts fully resident (spill.md §2).
   private newSorterFor(order: OrderSlot[]): Sorter {
     const compare: RowCompare = (a, b) => {
       for (const k of order) {
@@ -2713,8 +2728,7 @@ export class Database {
       }
       return 0;
     };
-    const spillDir = this.paging !== null && this.path !== null ? dirname(this.path) : null;
-    return new Sorter(compare, this.workMem, spillDir);
+    return new Sorter(compare, this.workMem, this.spillSink);
   }
 
   private execSelectPlan(plan: SelectPlan, outer: Row[], params: Value[]): SelectResult {
