@@ -3112,6 +3112,7 @@ export class Database {
         e.els = this.foldUncorrelatedInRExpr(e.els, bound, cost);
         return e;
       case "scalarFunc":
+      case "arrayFunc":
         e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, cost));
         return e;
       case "row":
@@ -3583,6 +3584,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
         rexprReferencesOuter(e.els, depth)
       );
     case "scalarFunc":
+    case "arrayFunc":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
       return e.fields.some((f) => rexprReferencesOuter(f, depth));
@@ -3656,6 +3658,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       collectTouched(e.els, depth, touched);
       return;
     case "scalarFunc":
+    case "arrayFunc":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
     case "row":
@@ -3918,6 +3921,12 @@ type RExpr =
       result: ScalarType;
       argWidth?: ScalarType;
     }
+  // A polymorphic array-function call (spec/design/array-functions.md §3), evaluated per row.
+  // Distinct from "scalarFunc": it resolves over anyarray/anyelement (§2) and its builders return an
+  // array; the result type lives in the surrounding ResolvedType (carried out of resolve), not on the
+  // node. NULL handling is per-kernel (the introspectors propagate, the builders are non-strict), so
+  // — unlike "scalarFunc" — there is no blanket NULL short-circuit at eval.
+  | { kind: "arrayFunc"; func: ArrayFuncName; args: RExpr[] }
   // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
   // row `level` hops out (1 = immediate parent). A leaf — reads from the outer-row environment.
   | { kind: "outerColumn"; level: number; index: number }
@@ -3966,6 +3975,20 @@ type ScalarFuncName =
   // timestamptz, the clock seam read on EVERY call (VOLATILE).
   | "now"
   | "clock_timestamp";
+
+// ArrayFuncName is the internal identity of a polymorphic array-function node
+// (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
+// from the operand values (the array's own shape header).
+type ArrayFuncName =
+  | "array_ndims"
+  | "array_length"
+  | "array_lower"
+  | "array_upper"
+  | "cardinality"
+  | "array_dims"
+  | "array_append"
+  | "array_prepend"
+  | "array_cat";
 
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
@@ -4787,6 +4810,13 @@ function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     return resolveAggregate(scope, e, ag, params);
   }
+  // The polymorphic array functions (array-functions.md §2) are also kind === "function", so they
+  // must be intercepted BEFORE the generic scalar path — their anyarray/anyelement slots need §2
+  // unification, which lookupScalarOverload's exact-family match cannot do.
+  if (isArrayFuncName(lname)) {
+    rejectNamed(lname, e.argNames);
+    return resolveArrayFunc(scope, e, ag, params);
+  }
   if (isScalarFuncName(lname)) {
     rejectNamed(lname, e.argNames);
     return resolveScalarFunc(scope, e, ag, params);
@@ -4964,6 +4994,177 @@ function scalarFuncNode(
   argWidth: ScalarType | undefined,
 ): { node: RExpr; type: ResolvedType } {
   return { node: { kind: "scalarFunc", func, args, result, argWidth }, type: resolvedTypeOf(result) };
+}
+
+// === Polymorphic array-function resolution (spec/design/array-functions.md §2) ======
+// The anyarray/anyelement pseudo-families are not real families (argFamily returns null for an
+// array), so the generic lookupScalarOverload cannot match an array function. These helpers add the
+// unification: one type variable ELEM, bound from an anyarray slot's element type and an anyelement
+// slot's type by structural equality, read back into the reserved result codes anyarray (= ELEM[])
+// and anyelement (= ELEM).
+
+// isArrayFuncName reports whether name (lowercased) is a polymorphic array function — a
+// kind === "function" catalog row whose argFamilies mention anyarray/anyelement. Data-driven.
+function isArrayFuncName(name: string): boolean {
+  return OPERATORS.some(
+    (o) => o.kind === "function" && o.name === name && o.argFamilies.some((f) => f === "anyarray" || f === "anyelement"),
+  );
+}
+
+// resolvedTypeEqual reports structural equality of two resolved types (the unification check):
+// integers/floats by width, arrays recursively by element type, composites by name + field types,
+// everything else by kind.
+function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "int" || a.kind === "float") return a.ty === (b as { ty: ScalarType }).ty;
+  if (a.kind === "array") return resolvedTypeEqual(a.elem, (b as { elem: ResolvedType }).elem);
+  if (a.kind === "composite") {
+    const bc = b as { name: string | null; fields: { name: string; type: ResolvedType }[] };
+    if (a.name !== bc.name || a.fields.length !== bc.fields.length) return false;
+    return a.fields.every((f, i) => resolvedTypeEqual(f.type, bc.fields[i]!.type));
+  }
+  return true;
+}
+
+// matchPoly matches an overload's slots (which may contain anyarray/anyelement) against the resolved
+// argument types, returning { elem, matched }. When matched, elem is null if every polymorphic arg was
+// an untyped NULL (ELEM undeterminable). Three passes: anyarray (binds ELEM := the element type),
+// anyelement (may precede its binding array — array_prepend), then concrete family slots.
+function matchPoly(slots: readonly string[], tys: ResolvedType[]): { elem: ResolvedType | null; matched: boolean } {
+  let elem: ResolvedType | null = null;
+  const unify = (x: ResolvedType): boolean => {
+    if (elem === null) {
+      elem = x;
+      return true;
+    }
+    return resolvedTypeEqual(elem, x);
+  };
+  for (let j = 0; j < slots.length; j++) {
+    if (slots[j] === "anyarray") {
+      const t = tys[j]!;
+      if (t.kind === "array") {
+        if (!unify(t.elem)) return { elem: null, matched: false };
+      } else if (t.kind !== "null") {
+        return { elem: null, matched: false }; // a non-array where anyarray is required
+      }
+    }
+  }
+  for (let j = 0; j < slots.length; j++) {
+    if (slots[j] === "anyelement" && tys[j]!.kind !== "null") {
+      if (!unify(tys[j]!)) return { elem: null, matched: false };
+    }
+  }
+  for (let j = 0; j < slots.length; j++) {
+    if (slots[j] !== "anyarray" && slots[j] !== "anyelement" && !familyMatches(slots[j]!, tys[j]!)) {
+      return { elem: null, matched: false };
+    }
+  }
+  return { elem, matched: true };
+}
+
+// polyResultType is the result ResolvedType of an array function from its catalog result code and the
+// bound ELEM: anyarray → ELEM[], anyelement → ELEM (both 42P18 if ELEM is undeterminable); any other
+// code is a concrete scalar id (int32, text).
+function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
+  if (code === "anyarray") {
+    if (elem === null) throw indeterminatePoly();
+    return { kind: "array", elem };
+  }
+  if (code === "anyelement") {
+    if (elem === null) throw indeterminatePoly();
+    return elem;
+  }
+  const ty = scalarTypeFromName(code);
+  if (ty === undefined) throw new Error("polyResultType: unknown result code " + code);
+  return resolvedTypeOf(ty);
+}
+
+// indeterminatePoly is the 42P18 raised when an array function's polymorphic type cannot be
+// determined because every polymorphic argument was an untyped NULL (array_append(NULL, NULL)).
+function indeterminatePoly(): EngineError {
+  return engineError("indeterminate_datatype", "could not determine polymorphic type because input has type unknown");
+}
+
+// elemScalarHint is the element type's ScalarType, for the literal-adaptation hint
+// (array-functions.md §2): the bound array element type is threaded back as the ctx when re-resolving
+// the polymorphic args, so a bare integer/decimal literal element adapts (with range-checking) to it.
+// null for a composite/array/NULL element.
+function elemScalarHint(t: ResolvedType): ScalarType | null {
+  switch (t.kind) {
+    case "int":
+    case "float":
+      return t.ty;
+    case "decimal":
+      return "decimal";
+    case "text":
+      return "text";
+    case "bool":
+      return "boolean";
+    case "bytea":
+      return "bytea";
+    case "uuid":
+      return "uuid";
+    case "timestamp":
+      return "timestamp";
+    case "timestamptz":
+      return "timestamptz";
+    case "interval":
+      return "interval";
+    default:
+      return null;
+  }
+}
+
+// resolveArrayFunc resolves a polymorphic array function call (array-functions.md §3): resolve the
+// arguments, unify ELEM across the anyarray/anyelement slots to pick the overload (42883 on no match),
+// and compute the result type from the matched result code. Two passes (§2): pass 1 resolves the
+// arguments with no hint to discover the array's element type; if that element is a scalar, pass 2
+// re-resolves the polymorphic-slot arguments with it as the ctx, so an untyped literal element (or an
+// ARRAY[…] constructor argument) adapts to the array's element type, with a range check. The kernel id
+// is the name; NULL handling lives in the eval kernel.
+function resolveArrayFunc(
+  scope: Scope,
+  e: { name: string; args: Expr[]; star: boolean },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  const name = e.name.toLowerCase() as ArrayFuncName;
+  // Each array-function name is single-overload; find its row by (name, arity). A wrong argument count
+  // matches no overload (42883), exactly as a missing scalar overload does.
+  const desc = OPERATORS.find((o) => o.kind === "function" && o.name === name && o.arity === e.args.length);
+  if (!desc) throw noFuncOverload(name);
+  const slots = desc.argFamilies;
+
+  const rargs: RExpr[] = [];
+  const tys: ResolvedType[] = [];
+  for (const a of e.args) {
+    const r = resolve(scope, a, null, ag, params);
+    rargs.push(r.node);
+    tys.push(r.type);
+  }
+  // Pass 2: adapt the polymorphic args to the array's element type, if it is a scalar. The hint is the
+  // element type of the first anyarray argument.
+  let hint: ScalarType | null = null;
+  for (let j = 0; j < slots.length; j++) {
+    if (slots[j] === "anyarray" && tys[j]!.kind === "array") {
+      hint = elemScalarHint((tys[j] as { elem: ResolvedType }).elem);
+      break;
+    }
+  }
+  if (hint !== null) {
+    for (let j = 0; j < slots.length; j++) {
+      if (slots[j] === "anyarray" || slots[j] === "anyelement") {
+        const r = resolve(scope, e.args[j]!, hint, ag, params);
+        rargs[j] = r.node;
+        tys[j] = r.type;
+      }
+    }
+  }
+  const { elem, matched } = matchPoly(slots, tys);
+  if (!matched) throw noFuncOverload(name);
+  const type = polyResultType(desc.result, elem);
+  return { node: { kind: "arrayFunc", func: name, args: rargs }, type };
 }
 
 // groupingErrorColumn is the 42803 for a non-aggregated column with no GROUP BY.
@@ -5589,10 +5790,15 @@ function resolve(
       if (e.elements.length === 0) {
         throw typeError("cannot determine the element type of an empty ARRAY[]; write '{}'::T[]");
       }
+      // An element-type hint (ctx) flows down to the elements so an array literal adapts its untyped
+      // integer/decimal literals exactly as a scalar literal does — e.g. resolving ARRAY[7,8] with an
+      // int32 context yields int32[], not the default int64[] (the polymorphic array functions pass the
+      // bound element type here, array-functions.md §2). Almost every other caller passes null, so the
+      // default 1-D unification is unchanged.
       const nodes: RExpr[] = [];
       const elemTypes: ResolvedType[] = [];
       for (const el of e.elements) {
-        const { node, type } = resolve(scope, el, null, ag, params);
+        const { node, type } = resolve(scope, el, ctx, ag, params);
         nodes.push(node);
         elemTypes.push(type);
       }
@@ -6736,6 +6942,108 @@ function arraySubscriptErr(detail: string): Error {
   return engineError("array_subscript_error", detail);
 }
 
+// evalArrayFunc evaluates an array function over its already-evaluated argument values
+// (spec/design/array-functions.md §3). The introspectors propagate NULL and return NULL for an
+// out-of-shape request; the builders are non-strict (a NULL array argument is the identity/empty, NOT
+// a propagated NULL). The resolver guarantees the array operand is an array or NULL.
+function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
+  switch (func) {
+    case "array_ndims": {
+      const a = vals[0]!;
+      if (a.kind !== "array") return nullValue();
+      return arrayNdim(a) === 0 ? nullValue() : intValue(BigInt(arrayNdim(a))); // empty → NULL (PG)
+    }
+    case "cardinality": {
+      const a = vals[0]!;
+      if (a.kind !== "array") return nullValue();
+      return intValue(BigInt(a.elements.length)); // 0 for empty (NOT NULL)
+    }
+    case "array_dims": {
+      const a = vals[0]!;
+      if (a.kind !== "array" || arrayNdim(a) === 0) return nullValue();
+      return textValue(arrayDimsText(a));
+    }
+    case "array_length":
+    case "array_lower":
+    case "array_upper": {
+      const a = vals[0]!;
+      const dimV = vals[1]!;
+      if (a.kind !== "array" || dimV.kind === "null") return nullValue();
+      const dim = (dimV as { int: bigint }).int;
+      const nd = arrayNdim(a);
+      if (nd === 0 || dim < 1n || dim > BigInt(nd)) return nullValue();
+      const d = Number(dim) - 1;
+      if (func === "array_length") return intValue(BigInt(a.dims[d]!));
+      if (func === "array_lower") return intValue(BigInt(a.lbounds[d]!));
+      return intValue(BigInt(arrayUbound(a, d)));
+    }
+    case "array_append":
+      return arrayExtend(vals[0]!, vals[1]!, true);
+    case "array_prepend":
+      return arrayExtend(vals[1]!, vals[0]!, false);
+    case "array_cat":
+      return arrayCatValues(vals[0]!, vals[1]!);
+  }
+}
+
+// arrayDimsText is the array_dims text form `[l1:u1][l2:u2]…` (no trailing `=`, unlike array_out's
+// prefix — array-functions.md §3.1).
+function arrayDimsText(a: { dims: number[]; lbounds: number[] }): string {
+  let s = "";
+  for (let d = 0; d < a.dims.length; d++) s += "[" + a.lbounds[d] + ":" + arrayUbound(a, d) + "]";
+  return s;
+}
+
+// arrayExtend is array_append (atEnd=true) / array_prepend (array-functions.md §3.2). The array side
+// is non-strict: a NULL or empty array yields the 1-D singleton {elem} (lower bound 1). A 1-D array
+// grows by one element, preserving its lower bound; a multidimensional array is 22000.
+function arrayExtend(arr: Value, elem: Value, atEnd: boolean): Value {
+  if (arr.kind !== "array" || arr.dims.length === 0) return arrayValue([elem]);
+  if (arr.dims.length !== 1) {
+    throw engineError("data_exception", "argument must be empty or one-dimensional array");
+  }
+  const elements = atEnd ? [...arr.elements, elem] : [elem, ...arr.elements];
+  return { kind: "array", dims: [arr.dims[0]! + 1], lbounds: [...arr.lbounds], elements };
+}
+
+// arrayCatValues is array_cat (array-functions.md §3.2): identity-aware concatenation along the outer
+// dimension. NULL/empty is the identity (both NULL → NULL). Same dimensionality concatenates if the
+// inner dims match; an off-by-one dimensionality appends/prepends the lower one as an outer slice; any
+// other pairing — or an inner-dim mismatch — is 2202E. The flattened element list is always a ++ b
+// (row-major, outer-first); the result lower bounds come from the higher-dim operand.
+function arrayCatValues(a: Value, b: Value): Value {
+  if (a.kind === "null" && b.kind === "null") return nullValue();
+  if (a.kind === "null") return b;
+  if (b.kind === "null") return a;
+  if (a.kind !== "array" || b.kind !== "array") return nullValue(); // unreachable (resolver gate)
+  if (a.dims.length === 0) return b;
+  if (b.dims.length === 0) return a;
+  const mismatch = () => engineError("array_subscript_error", "cannot concatenate incompatible arrays");
+  const eqInts = (x: number[], y: number[]): boolean => x.length === y.length && x.every((v, i) => v === y[i]);
+  const elements = [...a.elements, ...b.elements];
+  const na = a.dims.length;
+  const nb = b.dims.length;
+  if (na === nb) {
+    if (!eqInts(a.dims.slice(1), b.dims.slice(1))) throw mismatch();
+    const dims = [...a.dims];
+    dims[0] = a.dims[0]! + b.dims[0]!;
+    return { kind: "array", dims, lbounds: [...a.lbounds], elements };
+  }
+  if (na === nb + 1) {
+    if (!eqInts(a.dims.slice(1), b.dims)) throw mismatch();
+    const dims = [...a.dims];
+    dims[0] = a.dims[0]! + 1;
+    return { kind: "array", dims, lbounds: [...a.lbounds], elements };
+  }
+  if (nb === na + 1) {
+    if (!eqInts(b.dims.slice(1), a.dims)) throw mismatch();
+    const dims = [...b.dims];
+    dims[0] = b.dims[0]! + 1;
+    return { kind: "array", dims, lbounds: [...b.lbounds], elements };
+  }
+  throw mismatch();
+}
+
 // buildNestedArray stacks the evaluated elements of a nested ARRAY[...] constructor into a value of
 // one higher dimension (spec/design/array.md §4). The resolver guarantees every item is an array; a
 // NULL sub-array or a sub-array of differing shape is a 2202E. Stacking empty sub-arrays yields the
@@ -7797,6 +8105,15 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
       const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
       return decimalValue(d.roundPlaces(places));
+    }
+    case "arrayFunc": {
+      // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval per call;
+      // arguments charge their own. NULL handling is per-kernel (the introspectors propagate, the
+      // builders are non-strict), so — unlike "scalarFunc" — there is no blanket NULL short-circuit.
+      m.charge(COSTS.operatorEval);
+      const vals: Value[] = [];
+      for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+      return evalArrayFunc(e.func, vals);
     }
     case "subquery": {
       // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row. Push

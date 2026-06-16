@@ -4269,7 +4269,7 @@ impl Database {
                 }
                 self.fold_uncorrelated_in_rexpr(els, bound, cost)
             }
-            RExpr::ScalarFunc { args, .. } => {
+            RExpr::ScalarFunc { args, .. } | RExpr::ArrayFunc { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, cost)?;
                 }
@@ -4823,6 +4823,34 @@ enum ScalarFunc {
     ClockTimestamp,
 }
 
+/// The polymorphic array functions (spec/design/array-functions.md). Distinct from
+/// [`ScalarFunc`] because they resolve over the `anyarray`/`anyelement` pseudo-families (§2) and
+/// the builders return an *array* type (not a `ScalarType`), so they get their own resolved node
+/// ([`RExpr::ArrayFunc`]). The kernel id is the function name; the eval recovers everything else
+/// from the operand values (the array's own shape header), so the node carries no result type.
+enum ArrayFunc {
+    /// array_ndims(anyarray) → int32 — the dimension count; NULL for the empty array.
+    ArrayNdims,
+    /// array_length(anyarray, integer) → int32 — length of a dimension; NULL if empty / out of range.
+    ArrayLength,
+    /// array_lower(anyarray, integer) → int32 — a dimension's lower bound; NULL if empty / out of range.
+    ArrayLower,
+    /// array_upper(anyarray, integer) → int32 — a dimension's upper bound; NULL if empty / out of range.
+    ArrayUpper,
+    /// cardinality(anyarray) → int32 — the total element count; 0 for the empty array.
+    Cardinality,
+    /// array_dims(anyarray) → text — the bound spec `[l1:u1][l2:u2]…`; NULL for the empty array.
+    ArrayDims,
+    /// array_append(anyarray, anyelement) → anyarray — non-strict; NULL/empty array → `{e}`;
+    /// a multidimensional array is 22000 (§3.2).
+    ArrayAppend,
+    /// array_prepend(anyelement, anyarray) → anyarray — the mirror of array_append.
+    ArrayPrepend,
+    /// array_cat(anyarray, anyarray) → anyarray — non-strict identity-aware concatenation along
+    /// the outer dimension; incompatible dimensionalities are 2202E (§3.2).
+    ArrayCat,
+}
+
 /// One resolved subscript spec in an [`RExpr::Subscript`] (spec/design/array.md §6): a single
 /// index `a[i]`, or a slice `a[m:n]` whose bounds may be omitted (`a[:n]`, `a[m:]`, `a[:]`).
 enum RSubscript {
@@ -4956,6 +4984,16 @@ enum RExpr {
         func: ScalarFunc,
         args: Vec<RExpr>,
         result: ScalarType,
+    },
+    /// A polymorphic array-function call (spec/design/array-functions.md §3). Resolved over the
+    /// `anyarray`/`anyelement` pseudo-families (§2); the resolved element/array type lives in the
+    /// surrounding `ResolvedType` (carried out of resolve), not on the node — the kernel produces
+    /// the result `Value` from the operand values alone (an array `Value` is self-describing). The
+    /// introspectors propagate NULL; the builders (`array_append`/`prepend`/`cat`) are non-strict
+    /// (`null = "none"`), so NULL handling lives in the kernel, not a blanket short-circuit here.
+    ArrayFunc {
+        func: ArrayFunc,
+        args: Vec<RExpr>,
     },
     /// A correlated column reference (spec/design/grammar.md §26): the column `index` of the
     /// enclosing-query row `level` hops out (1 = immediate parent). A **leaf** — charges no
@@ -6241,7 +6279,9 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
                 .any(|(c, r)| rexpr_references_outer(c, depth) || rexpr_references_outer(r, depth))
                 || rexpr_references_outer(els, depth)
         }
-        RExpr::ScalarFunc { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
+        RExpr::ScalarFunc { args, .. } | RExpr::ArrayFunc { args, .. } => {
+            args.iter().any(|a| rexpr_references_outer(a, depth))
+        }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
         }
@@ -6334,7 +6374,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             }
             collect_touched(els, depth, touched);
         }
-        RExpr::ScalarFunc { args, .. } => {
+        RExpr::ScalarFunc { args, .. } | RExpr::ArrayFunc { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);
             }
@@ -6557,6 +6597,205 @@ fn resolved_scalar_type(t: &ResolvedType) -> ScalarType {
     }
 }
 
+// === Polymorphic array-function resolution (spec/design/array-functions.md §2) ======
+// The `anyarray`/`anyelement` pseudo-families are NOT real families (arg_family returns None for
+// an array), so the generic `lookup_scalar_overload` cannot match an array function. These helpers
+// add the unification: one type variable ELEM, bound from an `anyarray` slot's element type and an
+// `anyelement` slot's type, by structural equality (`ResolvedType: Eq`), and read back into the
+// reserved result codes `anyarray` (= ELEM[]) and `anyelement` (= ELEM).
+
+/// Whether `name` (case-insensitive) is a polymorphic array function — a `kind="function"`
+/// catalog row whose `arg_families` mention `anyarray`/`anyelement`. Data-driven, so adding an
+/// array-function row to the catalog wires it here without touching this gate.
+fn is_array_func_name(name: &str) -> bool {
+    OPERATORS.iter().any(|o| {
+        o.kind == "function"
+            && o.name.eq_ignore_ascii_case(name)
+            && o.arg_families
+                .iter()
+                .any(|f| *f == "anyarray" || *f == "anyelement")
+    })
+}
+
+/// The kernel id for array function `name` (each name is single-arity, so the name alone selects
+/// the kernel). Total over the catalog's array-function names (`is_array_func_name` gates the call).
+fn array_func_id(name: &str) -> ArrayFunc {
+    match name {
+        "array_ndims" => ArrayFunc::ArrayNdims,
+        "array_length" => ArrayFunc::ArrayLength,
+        "array_lower" => ArrayFunc::ArrayLower,
+        "array_upper" => ArrayFunc::ArrayUpper,
+        "cardinality" => ArrayFunc::Cardinality,
+        "array_dims" => ArrayFunc::ArrayDims,
+        "array_append" => ArrayFunc::ArrayAppend,
+        "array_prepend" => ArrayFunc::ArrayPrepend,
+        "array_cat" => ArrayFunc::ArrayCat,
+        _ => unreachable!("array_func_id: {name} is not a catalog array function"),
+    }
+}
+
+/// Bind/check the type variable ELEM against a concrete type `x`: bind if unbound, else require
+/// structural equality. `false` ⇒ a conflict (e.g. `array_cat(int32[], text[])`) — the overload
+/// does not match. An untyped `NULL` operand never reaches here (the caller defers it).
+fn unify_elem(elem: &mut Option<ResolvedType>, x: &ResolvedType) -> bool {
+    match elem {
+        None => {
+            *elem = Some(x.clone());
+            true
+        }
+        Some(e) => e == x,
+    }
+}
+
+/// Match an overload's `arg_families` (which may contain `anyarray`/`anyelement`) against the
+/// resolved argument types, returning the bound ELEM (`Some(None)` = matched but every polymorphic
+/// arg was an untyped NULL, so ELEM is undeterminable; `None` = no match). Three passes: `anyarray`
+/// slots first (they definitively bind ELEM := the element type), then `anyelement` (which may
+/// precede its binding array — `array_prepend`), then the concrete family slots.
+fn match_poly(slots: &[&str], tys: &[ResolvedType]) -> Option<Option<ResolvedType>> {
+    let mut elem: Option<ResolvedType> = None;
+    for (slot, t) in std::iter::zip(slots, tys) {
+        if *slot == "anyarray" {
+            match t {
+                ResolvedType::Array(e) => {
+                    if !unify_elem(&mut elem, e) {
+                        return None;
+                    }
+                }
+                ResolvedType::Null => {} // untyped NULL — defer, contributes no binding
+                _ => return None,        // a non-array where anyarray is required
+            }
+        }
+    }
+    for (slot, t) in std::iter::zip(slots, tys) {
+        if *slot == "anyelement" {
+            match t {
+                ResolvedType::Null => {} // untyped NULL — defer
+                _ => {
+                    if !unify_elem(&mut elem, t) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    for (slot, t) in std::iter::zip(slots, tys) {
+        if *slot != "anyarray" && *slot != "anyelement" && !family_matches(slot, t) {
+            return None;
+        }
+    }
+    Some(elem)
+}
+
+/// The result `ResolvedType` of an array function from its catalog `result` code and the bound
+/// ELEM: `anyarray` → `ELEM[]`, `anyelement` → `ELEM` (both 42P18 if ELEM is undeterminable — every
+/// polymorphic arg was an untyped NULL); any other code is a concrete scalar id (`int32`, `text`).
+fn poly_result_type(code: &str, elem: &Option<ResolvedType>) -> Result<ResolvedType> {
+    match code {
+        "anyarray" => match elem {
+            Some(e) => Ok(ResolvedType::Array(Box::new(e.clone()))),
+            None => Err(indeterminate_poly()),
+        },
+        "anyelement" => match elem {
+            Some(e) => Ok(e.clone()),
+            None => Err(indeterminate_poly()),
+        },
+        _ => Ok(resolved_type_of(
+            ScalarType::from_name(code)
+                .unwrap_or_else(|| unreachable!("poly_result_type: unknown result code {code}")),
+        )),
+    }
+}
+
+/// The 42P18 raised when an array function's polymorphic type cannot be determined because every
+/// polymorphic argument was an untyped `NULL` (`array_append(NULL, NULL)` — array-functions.md §5).
+fn indeterminate_poly() -> EngineError {
+    EngineError::new(
+        SqlState::IndeterminateDatatype,
+        "could not determine polymorphic type because input has type unknown",
+    )
+}
+
+/// The element type's `ScalarType`, for the literal-adaptation hint (array-functions.md §2): the
+/// bound array element type is threaded back as the `ctx` when re-resolving the polymorphic args,
+/// so a bare integer/decimal literal element adapts (with range-checking) to that type — e.g.
+/// `array_append(int32[], 40)` adapts `40` to `int32`. `None` for a composite/array/NULL element.
+fn elem_scalar_hint(t: &ResolvedType) -> Option<ScalarType> {
+    match t {
+        ResolvedType::Int(s) | ResolvedType::Float(s) => Some(*s),
+        ResolvedType::Decimal => Some(ScalarType::Decimal),
+        ResolvedType::Text => Some(ScalarType::Text),
+        ResolvedType::Bool => Some(ScalarType::Bool),
+        ResolvedType::Bytea => Some(ScalarType::Bytea),
+        ResolvedType::Uuid => Some(ScalarType::Uuid),
+        ResolvedType::Timestamp => Some(ScalarType::Timestamp),
+        ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
+        ResolvedType::Interval => Some(ScalarType::Interval),
+        ResolvedType::Null | ResolvedType::Composite(_) | ResolvedType::Array(_) => None,
+    }
+}
+
+/// Resolve a polymorphic array function call (array-functions.md §3): resolve the arguments, unify
+/// ELEM across the `anyarray`/`anyelement` slots to pick the overload (42883 on no match), and
+/// compute the result type from the matched `result` code. The kernel id is the name; NULL handling
+/// (the introspectors propagate, the builders are non-strict) lives in the eval kernel.
+///
+/// Two passes (§2): pass 1 resolves the arguments with no hint to discover the array's element
+/// type; if that element is a scalar, pass 2 re-resolves the polymorphic-slot arguments with it as
+/// the `ctx`, so an untyped literal element (or an `ARRAY[…]` constructor argument) adapts to the
+/// array's element type — `array_append(int32[], 40)` and `array_cat(int32[], ARRAY[7,8])` both
+/// land on `int32`, with a range check on the literal. (The concrete `integer` dimension slot of
+/// `array_length`/`lower`/`upper` keeps its pass-1 resolution.)
+fn resolve_array_func(
+    scope: &Scope,
+    name: &str, // already lowercased
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    // Each array-function name is single-overload; find its row by (name, arity). A wrong argument
+    // count matches no overload (42883), exactly as a missing scalar overload does.
+    let desc = OPERATORS
+        .iter()
+        .find(|o| o.kind == "function" && o.name == name && o.arity as usize == args.len())
+        .ok_or_else(|| no_func_overload(name))?;
+    let slots = desc.arg_families;
+
+    let mut rargs = Vec::with_capacity(args.len());
+    let mut tys = Vec::with_capacity(args.len());
+    for a in args {
+        let (r, t) = resolve(scope, a, None, agg, params)?;
+        rargs.push(r);
+        tys.push(t);
+    }
+    // Pass 2: adapt the polymorphic args to the array's element type, if it is a scalar.
+    let hint = slots
+        .iter()
+        .zip(tys.iter())
+        .find_map(|(slot, t)| match (*slot, t) {
+            ("anyarray", ResolvedType::Array(e)) => elem_scalar_hint(e),
+            _ => None,
+        });
+    if let Some(s) = hint {
+        for (i, slot) in slots.iter().enumerate() {
+            if *slot == "anyarray" || *slot == "anyelement" {
+                let (r, t) = resolve(scope, &args[i], Some(s), agg, params)?;
+                rargs[i] = r;
+                tys[i] = t;
+            }
+        }
+    }
+    let elem = match_poly(slots, &tys).ok_or_else(|| no_func_overload(name))?;
+    let result = poly_result_type(desc.result, &elem)?;
+    Ok((
+        RExpr::ArrayFunc {
+            func: array_func_id(name),
+            args: rargs,
+        },
+        result,
+    ))
+}
+
 /// Whether aggregate `surface` (case-insensitive) has a `COUNT(*)`-style star overload — only
 /// COUNT does. The data-driven replacement for the special-cased `_ if star` arm.
 fn aggregate_has_star(surface: &str) -> bool {
@@ -6743,6 +6982,19 @@ fn resolve_func_call(
     if is_aggregate_name(&lname) {
         reject_named(&lname, arg_names)?;
         return resolve_aggregate(scope, &lname, args, star, agg, params);
+    }
+    // The polymorphic array functions (array-functions.md §2) are also kind="function", so they
+    // must be intercepted BEFORE the generic scalar path — their `anyarray`/`anyelement` slots need
+    // §2 unification, which `lookup_scalar_overload`'s exact-family match cannot do.
+    if is_array_func_name(&lname) {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_array_func(scope, &lname, args, agg, params);
     }
     if is_scalar_func_name(&lname) {
         reject_named(&lname, arg_names)?;
@@ -7453,10 +7705,15 @@ fn resolve(
                         .to_string(),
                 ));
             }
+            // An element-type hint (`ctx`) flows down to the elements so an array literal adapts
+            // its untyped integer/decimal literals exactly as a scalar literal does — e.g. resolving
+            // `ARRAY[7,8]` with an int32 context yields `int32[]`, not the default `int64[]` (the
+            // polymorphic array functions pass the bound element type here, array-functions.md §2).
+            // Almost every other caller passes `None`, so the default 1-D unification is unchanged.
             let mut nodes = Vec::with_capacity(items.len());
             let mut elem_types = Vec::with_capacity(items.len());
             for it in items {
-                let (node, ty) = resolve(scope, it, None, agg, params)?;
+                let (node, ty) = resolve(scope, it, ctx, agg, params)?;
                 nodes.push(node);
                 elem_types.push(ty);
             }
@@ -8770,6 +9027,180 @@ impl Bound {
             Bound::Val(i) => Some(i),
             _ => None,
         }
+    }
+}
+
+/// Evaluate an array function over its already-evaluated argument values
+/// (spec/design/array-functions.md §3). The introspectors `propagate` NULL and return NULL for an
+/// out-of-shape request; the builders are non-strict (a NULL array argument is the identity/empty,
+/// NOT a propagated NULL). The resolver guarantees the array operand is an array or NULL, so the
+/// `_` arms are genuinely unreachable.
+fn eval_array_func(func: &ArrayFunc, vals: &[Value]) -> Result<Value> {
+    match func {
+        ArrayFunc::ArrayNdims => match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Array(a) if a.ndim() == 0 => Ok(Value::Null), // empty array → NULL (PG)
+            Value::Array(a) => Ok(Value::Int(a.ndim() as i64)),
+            _ => unreachable!("array_ndims: array operand"),
+        },
+        ArrayFunc::Cardinality => match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Array(a) => Ok(Value::Int(a.elements.len() as i64)), // 0 for empty (NOT NULL)
+            _ => unreachable!("cardinality: array operand"),
+        },
+        ArrayFunc::ArrayDims => match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Array(a) if a.ndim() == 0 => Ok(Value::Null),
+            Value::Array(a) => Ok(Value::Text(array_dims_text(a))),
+            _ => unreachable!("array_dims: array operand"),
+        },
+        // array_length / array_lower / array_upper (anyarray, dim): propagate either NULL arg,
+        // and return NULL for an empty array or an out-of-range dimension.
+        ArrayFunc::ArrayLength | ArrayFunc::ArrayLower | ArrayFunc::ArrayUpper => {
+            let a = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Array(a) => a,
+                _ => unreachable!("array_length/lower/upper: array operand"),
+            };
+            let dim = match &vals[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(d) => *d,
+                _ => unreachable!("the dimension argument is the integer family"),
+            };
+            if a.ndim() == 0 || dim < 1 || dim > a.ndim() as i64 {
+                return Ok(Value::Null);
+            }
+            let d = (dim - 1) as usize;
+            let v = match func {
+                ArrayFunc::ArrayLength => a.dims[d] as i64,
+                ArrayFunc::ArrayLower => a.lbounds[d] as i64,
+                ArrayFunc::ArrayUpper => a.ubound(d) as i64,
+                _ => unreachable!(),
+            };
+            Ok(Value::Int(v))
+        }
+        ArrayFunc::ArrayAppend => array_extend(&vals[0], &vals[1], true),
+        ArrayFunc::ArrayPrepend => array_extend(&vals[1], &vals[0], false),
+        ArrayFunc::ArrayCat => array_cat_values(&vals[0], &vals[1]),
+    }
+}
+
+/// The `array_dims` text form `[l1:u1][l2:u2]…` (no trailing `=`, unlike `array_out`'s prefix —
+/// array-functions.md §3.1).
+fn array_dims_text(a: &ArrayVal) -> String {
+    let mut s = String::new();
+    for d in 0..a.ndim() {
+        s.push('[');
+        s.push_str(&a.lbounds[d].to_string());
+        s.push(':');
+        s.push_str(&a.ubound(d).to_string());
+        s.push(']');
+    }
+    s
+}
+
+/// array_append (`append=true`) / array_prepend (array-functions.md §3.2). The array side is
+/// non-strict: a NULL or empty array yields the 1-D singleton `{elem}` (lower bound 1). A 1-D array
+/// grows by one element, preserving its lower bound; a multidimensional array is `22000`.
+fn array_extend(arr: &Value, elem: &Value, append: bool) -> Result<Value> {
+    let av = match arr {
+        Value::Null => None,
+        Value::Array(a) => Some(a),
+        _ => unreachable!("array_append/prepend: array operand"),
+    };
+    match av {
+        None => Ok(Value::Array(ArrayVal::one_dim(vec![elem.clone()]))),
+        Some(a) if a.ndim() == 0 => Ok(Value::Array(ArrayVal::one_dim(vec![elem.clone()]))),
+        Some(a) if a.ndim() == 1 => {
+            let mut elements = a.elements.clone();
+            if append {
+                elements.push(elem.clone());
+            } else {
+                elements.insert(0, elem.clone());
+            }
+            Ok(Value::Array(ArrayVal {
+                dims: vec![a.dims[0] + 1],
+                lbounds: a.lbounds.clone(),
+                elements,
+            }))
+        }
+        Some(_) => Err(EngineError::new(
+            SqlState::DataException,
+            "argument must be empty or one-dimensional array",
+        )),
+    }
+}
+
+/// array_cat (array-functions.md §3.2): identity-aware concatenation along the outer dimension.
+/// NULL/empty is the identity (both NULL → NULL). Same dimensionality concatenates if the inner
+/// dims match; an off-by-one dimensionality appends/prepends the lower one as an outer slice; any
+/// other pairing — or an inner-dim mismatch — is `2202E`. The flattened element list is always
+/// `a ++ b` (row-major, outer-first); the result lower bounds come from the higher-dim operand.
+fn array_cat_values(a: &Value, b: &Value) -> Result<Value> {
+    match (a, b) {
+        (Value::Null, Value::Null) => return Ok(Value::Null),
+        (Value::Null, _) => return Ok(b.clone()),
+        (_, Value::Null) => return Ok(a.clone()),
+        _ => {}
+    }
+    let av = match a {
+        Value::Array(x) => x,
+        _ => unreachable!("array_cat: array operand"),
+    };
+    let bv = match b {
+        Value::Array(x) => x,
+        _ => unreachable!("array_cat: array operand"),
+    };
+    if av.ndim() == 0 {
+        return Ok(b.clone());
+    }
+    if bv.ndim() == 0 {
+        return Ok(a.clone());
+    }
+    let mismatch = || {
+        EngineError::new(
+            SqlState::ArraySubscriptError,
+            "cannot concatenate incompatible arrays",
+        )
+    };
+    let mut elements = av.elements.clone();
+    elements.extend(bv.elements.iter().cloned());
+    let (na, nb) = (av.ndim(), bv.ndim());
+    if na == nb {
+        if av.dims[1..] != bv.dims[1..] {
+            return Err(mismatch());
+        }
+        let mut dims = av.dims.clone();
+        dims[0] = av.dims[0] + bv.dims[0];
+        Ok(Value::Array(ArrayVal {
+            dims,
+            lbounds: av.lbounds.clone(),
+            elements,
+        }))
+    } else if na == nb + 1 {
+        if av.dims[1..] != bv.dims[..] {
+            return Err(mismatch());
+        }
+        let mut dims = av.dims.clone();
+        dims[0] = av.dims[0] + 1;
+        Ok(Value::Array(ArrayVal {
+            dims,
+            lbounds: av.lbounds.clone(),
+            elements,
+        }))
+    } else if nb == na + 1 {
+        if bv.dims[1..] != av.dims[..] {
+            return Err(mismatch());
+        }
+        let mut dims = bv.dims.clone();
+        dims[0] = bv.dims[0] + 1;
+        Ok(Value::Array(ArrayVal {
+            dims,
+            lbounds: bv.lbounds.clone(),
+            elements,
+        }))
+    } else {
+        Err(mismatch())
     }
 }
 
@@ -10686,6 +11117,18 @@ impl RExpr {
                     }
                 }
             }
+            // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
+            // per call; arguments charge their own. NULL handling is per-kernel (the introspectors
+            // propagate, the builders are non-strict), so — unlike `ScalarFunc` — there is no
+            // blanket NULL short-circuit here.
+            RExpr::ArrayFunc { func, args } => {
+                m.charge(COSTS.operator_eval);
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    vals.push(a.eval(row, env, m)?);
+                }
+                eval_array_func(func, &vals)
+            }
             // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
             // Push the current row onto the outer-row stack, run the inner plan against it, fold
             // its accrued cost into this meter, plus one operator_eval for the node. (Uncorrelated
@@ -11364,6 +11807,20 @@ mod registry_tests {
     #[test]
     fn registry_covers_catalog() {
         for o in OPERATORS.iter().filter(|o| o.kind == "function") {
+            if is_array_func_name(o.name) {
+                // A polymorphic array function (array-functions.md §2): its kernel id comes from
+                // `array_func_id` and its result is a reserved poly code or a scalar id.
+                let _ = array_func_id(o.name);
+                assert!(
+                    o.result == "anyarray"
+                        || o.result == "anyelement"
+                        || ScalarType::from_name(o.result).is_some(),
+                    "array function {} has unhandled result code {}",
+                    o.name,
+                    o.result
+                );
+                continue;
+            }
             // Every function name maps to a kernel id (panics via unreachable! if not).
             let _ = scalar_func_id(o.name);
             // Every function result code is one the interpreter understands: "promoted" or a

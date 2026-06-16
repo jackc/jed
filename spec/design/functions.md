@@ -93,6 +93,12 @@ the `null` field:
   in [types.md](types.md), not as catalog data — the catalog records only which discipline
   each operator falls under.
 
+- `none` — the **non-strict** discipline (the array builders `array_append`/`array_prepend`/
+  `array_cat`, [array-functions.md §4](array-functions.md)): the resolver does **not**
+  short-circuit a NULL argument — the kernel inspects NULL-ness itself (a NULL array argument is
+  the identity/empty, not a propagated NULL). Distinct from `null_safe` (a *comparison* result
+  rule); `none` says the resolver does no NULL handling at all.
+
 - `null_safe` — NULL is a **comparable value**, not a poison: the result is **always** a
   definite boolean, never `unknown`. `IS NOT DISTINCT FROM` is NULL-safe `=` — `NULL IS
   NOT DISTINCT FROM NULL` is TRUE, `1 IS NOT DISTINCT FROM NULL` is FALSE, and two present
@@ -200,6 +206,17 @@ Reserved values and kinds still to be authored spec-first with their own executo
   (§12) all landed as `[[operator]]` rows with `kind = "function"`, plus `generate_series` as a
   `set_returning` row (§10). Further scalar functions — `ceil`, `floor`, `mod`, `sign`, the
   text `length`/`lower`/`upper`, and the like — are follow-on slices that reuse the same mold.
+
+**The polymorphic array functions are authored (`kind = "function"`, over `anyarray`/`anyelement`).**
+AF1 — `array_ndims`/`array_length`/`array_lower`/`array_upper`/`cardinality`/`array_dims` and the
+non-strict builders `array_append`/`array_prepend`/`array_cat` — reuses the scalar-function mold but
+adds the **`anyarray`/`anyelement` pseudo-families** (admissible in `arg_families`) and the reserved
+result codes `anyarray`/`anyelement` (a type variable `ELEM`, bound by structural unification and
+read back into the result). The dispatch (the unification + the kernels) is hand-written per core;
+`verify.rb` admits the tokens as a small allowlist. The full design — the resolution algorithm,
+the literal-adaptation rule, and the per-function semantics — lives in
+[array-functions.md](array-functions.md); the remaining surface (`||`/`unnest`/`@>`/`&&`/`ANY`/`ALL`/
+`VARIADIC`) is sequenced there (§6).
 
 **Aggregates are authored (`kind = "aggregate"`).** `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` landed
 in a **separate `[[aggregate]]` array**, not as `[[operator]]` rows, because they do not fit
@@ -414,9 +431,9 @@ arguments' own costs), asserted in the corpus (`# cost:`).
 **Deferred (sequenced follow-ons).** General DEFAULT values for *arbitrary* (non-integer)
 literals and user-defined functions are not built (jed has no UDFs; built-ins use overloads or
 `make_interval`-style 0-defaults). The sibling constructors `make_timestamp` /
-`make_timestamptz` reuse this exact mold (their `sec` is also `float64`). **`VARIADIC` is
-blocked** on the composite `array` type ([CLAUDE.md](../../CLAUDE.md) §4), which is deferred —
-it has no value codec yet — so it waits until `array` lands ([../../TODO.md](../../TODO.md)).
+`make_timestamptz` reuse this exact mold (their `sec` is also `float64`). **`VARIADIC`** was blocked
+on the `array` type; that has since landed (array.md), so `VARIADIC` is now **unblocked** and
+sequenced as **AF6** in the array function surface ([array-functions.md §6](array-functions.md)).
 
 ## 12. UUID functions — extractors now, generators on the entropy+clock seam
 

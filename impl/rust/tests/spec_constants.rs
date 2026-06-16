@@ -175,6 +175,7 @@ fn error_codes_are_registered() {
 
     // Every SQLSTATE the core can raise must exist in the registry.
     for st in [
+        SqlState::DataException,
         SqlState::NumericValueOutOfRange,
         SqlState::InvalidDatetimeFormat,
         SqlState::DatetimeFieldOverflow,

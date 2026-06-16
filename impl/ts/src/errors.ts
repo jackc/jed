@@ -8,6 +8,7 @@
 
 export type SqlState =
   | "cardinality_violation" // 21000 — a scalar subquery used as an expression returned >1 row (§26)
+  | "data_exception" // 22000 — bare class-22 (array_append/prepend on a multidim array; array-functions.md §3.2)
   | "numeric_value_out_of_range" // 22003 — integer overflow (CLAUDE.md §8)
   | "invalid_datetime_format" // 22007 — malformed timestamp/timestamptz input
   | "datetime_field_overflow" // 22008 — out-of-range datetime field or value beyond int64 µs
@@ -52,6 +53,7 @@ export type SqlState =
 
 const CODES: Record<SqlState, string> = {
   cardinality_violation: "21000",
+  data_exception: "22000",
   numeric_value_out_of_range: "22003",
   invalid_datetime_format: "22007",
   datetime_field_overflow: "22008",

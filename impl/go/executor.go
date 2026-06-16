@@ -5167,6 +5167,11 @@ const (
 	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
 	// evaluated per row in any context.
 	reScalarFunc
+	// reArrayFunc is a polymorphic array-function call (spec/design/array-functions.md §3),
+	// evaluated per row. Distinct from reScalarFunc: it resolves over anyarray/anyelement (§2) and
+	// its builders return an array; NULL handling is per-kernel (the introspectors propagate, the
+	// builders are non-strict), so there is no blanket NULL short-circuit at eval.
+	reArrayFunc
 	// reOuterColumn is a correlated column reference (spec/design/grammar.md §26): the column
 	// `index` of the enclosing row `level` hops out (1 = immediate parent). A leaf.
 	reOuterColumn
@@ -5251,6 +5256,23 @@ const (
 	sfClockTimestamp
 )
 
+// arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
+// single-arity, so the name alone picks the kernel; the eval recovers everything else from the
+// operand values (the array's own shape header).
+type arrayFunc int
+
+const (
+	afNdims       arrayFunc = iota // array_ndims(anyarray) → int32; NULL for the empty array
+	afLength                       // array_length(anyarray, integer) → int32; NULL if empty / out of range
+	afLower                        // array_lower(anyarray, integer) → int32
+	afUpper                        // array_upper(anyarray, integer) → int32
+	afCardinality                  // cardinality(anyarray) → int32; 0 for the empty array
+	afDims                         // array_dims(anyarray) → text; NULL for the empty array
+	afAppend                       // array_append(anyarray, anyelement) → anyarray; non-strict; 22000 if multidim
+	afPrepend                      // array_prepend(anyelement, anyarray) → anyarray
+	afCat                          // array_cat(anyarray, anyarray) → anyarray; 2202E on incompatible dims
+)
+
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
 // row. Arithmetic/neg nodes carry their (promotion-tower) result type in `result` so the
 // computed value can be range-checked against it.
@@ -5283,6 +5305,10 @@ type rExpr struct {
 	// magnitude is range-checked at that boundary; otherwise decimal.
 	sfunc scalarFunc
 	sargs []*rExpr
+	// reArrayFunc: the polymorphic array function; its argument nodes reuse `sargs`. The result
+	// type lives in the surrounding resolvedType (carried out of resolve), not on the node — the
+	// kernel produces the result value from the operands (an array value is self-describing).
+	afunc arrayFunc
 
 	// reArray: `nested` marks a multidim-stacking constructor (its element nodes evaluate to
 	// arrays, stacked into one higher dimension — spec/design/array.md §4).
@@ -6289,6 +6315,265 @@ func resolvedScalarType(t resolvedType) ScalarType {
 	}
 }
 
+// === Polymorphic array-function resolution (spec/design/array-functions.md §2) ======
+// The anyarray/anyelement pseudo-families are not real families (argFamily returns "" for an
+// array), so the generic lookupScalarOverload cannot match an array function. These helpers add the
+// unification: one type variable ELEM, bound from an anyarray slot's element type and an anyelement
+// slot's type by structural equality, read back into the reserved result codes anyarray (= ELEM[])
+// and anyelement (= ELEM).
+
+// isArrayFuncName reports whether name (lowercased) is a polymorphic array function — a
+// Kind=="function" catalog row whose ArgFamilies mention anyarray/anyelement. Data-driven.
+func isArrayFuncName(name string) bool {
+	for i := range Operators {
+		o := &Operators[i]
+		if o.Kind == "function" && o.Name == name {
+			for _, f := range o.ArgFamilies {
+				if f == "anyarray" || f == "anyelement" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// arrayFuncID is the kernel id for array function name (each name is single-arity). Total over the
+// catalog's array-function names (TestRegistryCoversCatalog).
+func arrayFuncID(name string) arrayFunc {
+	switch name {
+	case "array_ndims":
+		return afNdims
+	case "array_length":
+		return afLength
+	case "array_lower":
+		return afLower
+	case "array_upper":
+		return afUpper
+	case "cardinality":
+		return afCardinality
+	case "array_dims":
+		return afDims
+	case "array_append":
+		return afAppend
+	case "array_prepend":
+		return afPrepend
+	case "array_cat":
+		return afCat
+	default:
+		panic("arrayFuncID: " + name + " is not a catalog array function")
+	}
+}
+
+// resolvedTypeEqual reports structural equality of two resolved types (the unification check):
+// integers by width, arrays recursively by element type, composites by name + field types,
+// everything else by kind.
+func resolvedTypeEqual(a, b resolvedType) bool {
+	if a.kind != b.kind {
+		return false
+	}
+	switch a.kind {
+	case rtInt:
+		return a.intTy == b.intTy
+	case rtArray:
+		return resolvedTypeEqual(*a.elem, *b.elem)
+	case rtComposite:
+		if a.comp.named != b.comp.named || a.comp.name != b.comp.name || len(a.comp.fields) != len(b.comp.fields) {
+			return false
+		}
+		for i := range a.comp.fields {
+			if !resolvedTypeEqual(a.comp.fields[i].ty, b.comp.fields[i].ty) {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+// unifyElem binds/checks the type variable ELEM against a concrete type x: binds if unbound (*set),
+// else requires structural equality. false ⇒ a conflict (array_cat(int32[], text[])) — no match.
+func unifyElem(elem **resolvedType, x resolvedType) bool {
+	if *elem == nil {
+		cp := x
+		*elem = &cp
+		return true
+	}
+	return resolvedTypeEqual(**elem, x)
+}
+
+// matchPoly matches an overload's slots (which may contain anyarray/anyelement) against the resolved
+// argument types, returning (ELEM, matched). When matched, elem is nil if every polymorphic arg was
+// an untyped NULL (ELEM undeterminable). Three passes: anyarray (binds ELEM := the element type),
+// anyelement (may precede its binding array — array_prepend), then concrete family slots.
+func matchPoly(slots []string, tys []resolvedType) (elem *resolvedType, matched bool) {
+	for j, slot := range slots {
+		if slot == "anyarray" {
+			switch tys[j].kind {
+			case rtArray:
+				if !unifyElem(&elem, *tys[j].elem) {
+					return nil, false
+				}
+			case rtNull:
+				// untyped NULL — defer
+			default:
+				return nil, false // a non-array where anyarray is required
+			}
+		}
+	}
+	for j, slot := range slots {
+		if slot == "anyelement" {
+			if tys[j].kind != rtNull { // untyped NULL — defer
+				if !unifyElem(&elem, tys[j]) {
+					return nil, false
+				}
+			}
+		}
+	}
+	for j, slot := range slots {
+		if slot != "anyarray" && slot != "anyelement" && !familyMatches(slot, tys[j]) {
+			return nil, false
+		}
+	}
+	return elem, true
+}
+
+// polyResultType is the result resolvedType of an array function from its catalog result code and
+// the bound ELEM: anyarray → ELEM[], anyelement → ELEM (both 42P18 if ELEM is undeterminable); any
+// other code is a concrete scalar id (int32, text).
+func polyResultType(code string, elem *resolvedType) (resolvedType, error) {
+	switch code {
+	case "anyarray":
+		if elem == nil {
+			return resolvedType{}, indeterminatePoly()
+		}
+		cp := *elem
+		return resolvedType{kind: rtArray, elem: &cp}, nil
+	case "anyelement":
+		if elem == nil {
+			return resolvedType{}, indeterminatePoly()
+		}
+		return *elem, nil
+	default:
+		ty, ok := ScalarTypeFromName(code)
+		if !ok {
+			panic("polyResultType: unknown result code " + code)
+		}
+		return resolvedTypeOf(ty), nil
+	}
+}
+
+// indeterminatePoly is the 42P18 raised when an array function's polymorphic type cannot be
+// determined because every polymorphic argument was an untyped NULL (array_append(NULL, NULL)).
+func indeterminatePoly() error {
+	return NewError(IndeterminateDatatype, "could not determine polymorphic type because input has type unknown")
+}
+
+// elemScalarHint is the element type's ScalarType, for the literal-adaptation hint
+// (array-functions.md §2): the bound array element type is threaded back as the ctx when
+// re-resolving the polymorphic args, so a bare integer/decimal literal element adapts (with
+// range-checking) to it. ok=false for a composite/array/NULL element.
+func elemScalarHint(t resolvedType) (ScalarType, bool) {
+	switch t.kind {
+	case rtInt:
+		return t.intTy, true
+	case rtFloat32:
+		return Float32, true
+	case rtFloat64:
+		return Float64, true
+	case rtDecimal:
+		return DecimalType, true
+	case rtText:
+		return Text, true
+	case rtBool:
+		return Bool, true
+	case rtBytea:
+		return Bytea, true
+	case rtUuid:
+		return Uuid, true
+	case rtTimestamp:
+		return Timestamp, true
+	case rtTimestamptz:
+		return Timestamptz, true
+	case rtInterval:
+		return IntervalType, true
+	default:
+		return 0, false
+	}
+}
+
+// resolveArrayFunc resolves a polymorphic array function call (array-functions.md §3): resolve the
+// arguments, unify ELEM across the anyarray/anyelement slots to pick the overload (42883 on no
+// match), and compute the result type from the matched result code. Two passes (§2): pass 1 resolves
+// the arguments with no hint to discover the array's element type; if that element is a scalar, pass
+// 2 re-resolves the polymorphic-slot arguments with it as the ctx, so an untyped literal element (or
+// an ARRAY[…] constructor argument) adapts to the array's element type, with a range check. The
+// kernel id is the name; NULL handling lives in the eval kernel.
+func resolveArrayFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if fc.Star {
+		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+	}
+	name := toLowerASCII(fc.Name)
+	// Each array-function name is single-overload; find its row by (name, arity). A wrong argument
+	// count matches no overload (42883), exactly as a missing scalar overload does.
+	var desc *OperatorDesc
+	for i := range Operators {
+		o := &Operators[i]
+		if o.Kind == "function" && o.Name == name && o.Arity == len(fc.Args) {
+			desc = o
+			break
+		}
+	}
+	if desc == nil {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	slots := desc.ArgFamilies
+
+	rargs := make([]*rExpr, len(fc.Args))
+	tys := make([]resolvedType, len(fc.Args))
+	for i := range fc.Args {
+		r, t, err := resolve(s, *fc.Args[i], nil, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		rargs[i] = r
+		tys[i] = t
+	}
+	// Pass 2: adapt the polymorphic args to the array's element type, if it is a scalar. The hint
+	// is the element type of the first anyarray argument.
+	var hint *ScalarType
+	for j, slot := range slots {
+		if slot == "anyarray" && tys[j].kind == rtArray {
+			if s, ok := elemScalarHint(*tys[j].elem); ok {
+				hint = &s
+			}
+			break
+		}
+	}
+	if hint != nil {
+		for j, slot := range slots {
+			if slot == "anyarray" || slot == "anyelement" {
+				r, t, err := resolve(s, *fc.Args[j], hint, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				rargs[j] = r
+				tys[j] = t
+			}
+		}
+	}
+	elem, matched := matchPoly(slots, tys)
+	if !matched {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	result, err := polyResultType(desc.Result, elem)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	return &rExpr{kind: reArrayFunc, afunc: arrayFuncID(name), sargs: rargs}, result, nil
+}
+
 // aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
 // overload — only COUNT does. The data-driven replacement for the special-cased star arm.
 func aggregateHasStar(surface string) bool {
@@ -6370,6 +6655,15 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		return resolveAggregate(s, fc, ag, params)
+	}
+	// The polymorphic array functions (array-functions.md §2) are also Kind=="function", so they
+	// must be intercepted BEFORE the generic scalar path — their anyarray/anyelement slots need §2
+	// unification, which lookupScalarOverload's exact-family match cannot do.
+	if isArrayFuncName(name) {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return resolveArrayFunc(s, fc, ag, params)
 	}
 	if isScalarFuncName(name) {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
@@ -7232,10 +7526,15 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				"cannot determine the element type of an empty ARRAY[]; write '{}'::T[]",
 			)
 		}
+		// An element-type hint (ctx) flows down to the elements so an array literal adapts its
+		// untyped integer/decimal literals exactly as a scalar literal does — e.g. resolving
+		// ARRAY[7,8] with an int32 context yields int32[], not the default int64[] (the polymorphic
+		// array functions pass the bound element type here, array-functions.md §2). Almost every
+		// other caller passes nil, so the default 1-D unification is unchanged.
 		nodes := make([]*rExpr, len(e.RowItems))
 		elemTypes := make([]resolvedType, len(e.RowItems))
 		for i := range e.RowItems {
-			node, ty, err := resolve(s, e.RowItems[i], nil, ag, params)
+			node, ty, err := resolve(s, e.RowItems[i], ctx, ag, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -8546,6 +8845,169 @@ func buildNestedArray(subs []Value) (Value, error) {
 	return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elements}), nil
 }
 
+// evalArrayFunc evaluates an array function over its already-evaluated argument values
+// (spec/design/array-functions.md §3). The introspectors propagate NULL and return NULL for an
+// out-of-shape request; the builders are non-strict (a NULL array argument is the identity/empty,
+// NOT a propagated NULL). The resolver guarantees the array operand is an array or NULL.
+func evalArrayFunc(fn arrayFunc, vals []Value) (Value, error) {
+	switch fn {
+	case afNdims:
+		if vals[0].Kind == ValNull {
+			return NullValue(), nil
+		}
+		if vals[0].Array.Ndim() == 0 {
+			return NullValue(), nil // empty array → NULL (PG)
+		}
+		return IntValue(int64(vals[0].Array.Ndim())), nil
+	case afCardinality:
+		if vals[0].Kind == ValNull {
+			return NullValue(), nil
+		}
+		return IntValue(int64(len(vals[0].Array.Elements))), nil // 0 for empty (NOT NULL)
+	case afDims:
+		if vals[0].Kind == ValNull || vals[0].Array.Ndim() == 0 {
+			return NullValue(), nil
+		}
+		return TextValue(arrayDimsText(vals[0].Array)), nil
+	case afLength, afLower, afUpper:
+		// (anyarray, dim): propagate either NULL arg; NULL for an empty array or an out-of-range dim.
+		if vals[0].Kind == ValNull || vals[1].Kind == ValNull {
+			return NullValue(), nil
+		}
+		a := vals[0].Array
+		dim := vals[1].Int
+		if a.Ndim() == 0 || dim < 1 || dim > int64(a.Ndim()) {
+			return NullValue(), nil
+		}
+		d := int(dim - 1)
+		switch fn {
+		case afLength:
+			return IntValue(int64(a.Dims[d])), nil
+		case afLower:
+			return IntValue(int64(a.Lbounds[d])), nil
+		default: // afUpper
+			return IntValue(int64(a.Ubound(d))), nil
+		}
+	case afAppend:
+		return arrayExtend(vals[0], vals[1], true)
+	case afPrepend:
+		return arrayExtend(vals[1], vals[0], false)
+	default: // afCat
+		return arrayCatValues(vals[0], vals[1])
+	}
+}
+
+// arrayDimsText is the array_dims text form `[l1:u1][l2:u2]…` (no trailing `=`, unlike array_out's
+// prefix — array-functions.md §3.1).
+func arrayDimsText(a *ArrayVal) string {
+	var b strings.Builder
+	for d := 0; d < a.Ndim(); d++ {
+		fmt.Fprintf(&b, "[%d:%d]", a.Lbounds[d], a.Ubound(d))
+	}
+	return b.String()
+}
+
+// arrayExtend is array_append (atEnd=true) / array_prepend (array-functions.md §3.2). The array
+// side is non-strict: a NULL or empty array yields the 1-D singleton {elem} (lower bound 1). A 1-D
+// array grows by one element, preserving its lower bound; a multidimensional array is 22000.
+func arrayExtend(arr, elem Value, atEnd bool) (Value, error) {
+	if arr.Kind == ValNull || arr.Array.Ndim() == 0 {
+		return ArrayValueOf(OneDimArray([]Value{elem})), nil
+	}
+	a := arr.Array
+	if a.Ndim() != 1 {
+		return Value{}, NewError(DataException, "argument must be empty or one-dimensional array")
+	}
+	elements := make([]Value, 0, len(a.Elements)+1)
+	if atEnd {
+		elements = append(elements, a.Elements...)
+		elements = append(elements, elem)
+	} else {
+		elements = append(elements, elem)
+		elements = append(elements, a.Elements...)
+	}
+	return ArrayValueOf(&ArrayVal{Dims: []int{a.Dims[0] + 1}, Lbounds: cloneI32(a.Lbounds), Elements: elements}), nil
+}
+
+// arrayCatValues is array_cat (array-functions.md §3.2): identity-aware concatenation along the
+// outer dimension. NULL/empty is the identity (both NULL → NULL). Same dimensionality concatenates
+// if the inner dims match; an off-by-one dimensionality appends/prepends the lower one as an outer
+// slice; any other pairing — or an inner-dim mismatch — is 2202E. The flattened element list is
+// always a ++ b (row-major, outer-first); the result lower bounds come from the higher-dim operand.
+func arrayCatValues(a, b Value) (Value, error) {
+	if a.Kind == ValNull && b.Kind == ValNull {
+		return NullValue(), nil
+	}
+	if a.Kind == ValNull {
+		return b, nil
+	}
+	if b.Kind == ValNull {
+		return a, nil
+	}
+	av, bv := a.Array, b.Array
+	if av.Ndim() == 0 {
+		return b, nil
+	}
+	if bv.Ndim() == 0 {
+		return a, nil
+	}
+	mismatch := func() error { return NewError(ArraySubscriptError, "cannot concatenate incompatible arrays") }
+	elements := make([]Value, 0, len(av.Elements)+len(bv.Elements))
+	elements = append(elements, av.Elements...)
+	elements = append(elements, bv.Elements...)
+	na, nb := av.Ndim(), bv.Ndim()
+	switch {
+	case na == nb:
+		if !equalInts(av.Dims[1:], bv.Dims[1:]) {
+			return Value{}, mismatch()
+		}
+		dims := cloneInts(av.Dims)
+		dims[0] = av.Dims[0] + bv.Dims[0]
+		return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(av.Lbounds), Elements: elements}), nil
+	case na == nb+1:
+		if !equalInts(av.Dims[1:], bv.Dims) {
+			return Value{}, mismatch()
+		}
+		dims := cloneInts(av.Dims)
+		dims[0] = av.Dims[0] + 1
+		return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(av.Lbounds), Elements: elements}), nil
+	case nb == na+1:
+		if !equalInts(bv.Dims[1:], av.Dims) {
+			return Value{}, mismatch()
+		}
+		dims := cloneInts(bv.Dims)
+		dims[0] = bv.Dims[0] + 1
+		return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(bv.Lbounds), Elements: elements}), nil
+	default:
+		return Value{}, mismatch()
+	}
+}
+
+// cloneInts / cloneI32 / equalInts are small slice helpers for the array builders.
+func cloneInts(s []int) []int {
+	out := make([]int, len(s))
+	copy(out, s)
+	return out
+}
+
+func cloneI32(s []int32) []int32 {
+	out := make([]int32, len(s))
+	copy(out, s)
+	return out
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // evalSubscript evaluates an array subscript `base[..][..]` (spec/design/array.md §6). A NULL array
 // or any NULL subscript bound yields NULL; element access returns the element (or NULL), slice
 // access a (renumbered) sub-array.
@@ -9341,6 +9803,21 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// (Float32 only for abs; float64 for the rest, per the catalog).
 			return evalFloatFunc(e.sfunc, vals, e.result)
 		}
+	case reArrayFunc:
+		// A polymorphic array function (spec/design/array-functions.md §3). One operator_eval per
+		// call; arguments charge their own. NULL handling is per-kernel (the introspectors
+		// propagate, the builders are non-strict), so — unlike reScalarFunc — there is no blanket
+		// NULL short-circuit here.
+		m.Charge(Costs.OperatorEval)
+		vals := make([]Value, len(e.sargs))
+		for i, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			vals[i] = v
+		}
+		return evalArrayFunc(e.afunc, vals)
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
 		// Push the current row onto the outer-row stack, run the inner plan, fold its accrued

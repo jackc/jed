@@ -1951,6 +1951,122 @@ null           = "propagates"
 errors         = []
 volatility     = "volatile"
 
+# --- array functions (AF1: the polymorphic surface) --------------------------
+# The scalar-function-shaped array surface (../design/array-functions.md). These are the
+# FIRST functions over the POLYMORPHIC pseudo-families `anyarray`/`anyelement`: an `anyarray`
+# slot matches any array argument and binds ELEM := its element type; an `anyelement` slot
+# matches any argument and binds/checks ELEM := its type; the reserved result codes `anyarray`
+# (= ELEM[]) and `anyelement` (= ELEM) read that binding back. `anyarray`/`anyelement` are
+# catalog CONTRACT TOKENS interpreted by the hand-written resolver (CLAUDE.md §5) — deliberately
+# NOT families in scalars.toml (not storable, no id/codec). verify.rb admits them in
+# arg_families/result as an allowlist. No grammar change (the function_call production already
+# parses them). All rules are oracle-pinned (postgres:18).
+#
+# Introspection (array_ndims/length/lower/upper/cardinality/dims): pure readers of the value's
+# ndim/dims/lbounds header. They `propagate` NULL (a NULL array OR a NULL dimension arg → NULL)
+# and beyond that return NULL for an out-of-shape request — array_length/lower/upper are NULL for
+# an empty array or an out-of-range dimension; array_ndims/array_dims are NULL for the empty
+# array; cardinality is 0 for the empty array (the one introspector distinguishing empty from
+# absent). The dimension arg is the `integer` family (jed accepts any integer width — a minor
+# documented divergence from PG's strict int4). All return int32 (array_dims returns text:
+# `[l1:u1][l2:u2]…`).
+#
+# Builders (array_append/array_prepend/array_cat): result = "anyarray". They are NON-STRICT —
+# null = "none" tells the resolver NOT to short-circuit a NULL argument; the kernel handles NULL
+# itself (a NULL array arg is the identity/empty, NOT a propagated NULL). array_append/prepend
+# require an empty-or-1-D array (a multidimensional one is 22000); array_cat concatenates along the
+# outer dimension and is 2202E on incompatible dimensionalities.
+
+[[operator]]
+name           = "array_ndims"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyarray"]
+arg_resolution = "none"
+result         = "int32"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "array_length"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyarray", "integer"]
+arg_resolution = "none"
+result         = "int32"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "array_lower"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyarray", "integer"]
+arg_resolution = "none"
+result         = "int32"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "array_upper"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyarray", "integer"]
+arg_resolution = "none"
+result         = "int32"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "cardinality"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyarray"]
+arg_resolution = "none"
+result         = "int32"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "array_dims"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyarray"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "array_append"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyarray", "anyelement"]
+arg_resolution = "none"
+result         = "anyarray"
+null           = "none"
+errors         = ["22000"]
+
+[[operator]]
+name           = "array_prepend"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyelement", "anyarray"]
+arg_resolution = "none"
+result         = "anyarray"
+null           = "none"
+errors         = ["22000"]
+
+[[operator]]
+name           = "array_cat"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyarray", "anyarray"]
+arg_resolution = "none"
+result         = "anyarray"
+null           = "none"
+errors         = ["2202E"]
+
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
 # SINGLE value. They are NOT operators — no infix symbol, no precedence, no

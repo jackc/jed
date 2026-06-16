@@ -29,6 +29,10 @@ var SupportedCapabilities = []string{
 	"types.array_multidim",
 	// Array slices a[m:n] (array.md §6) — sub-array reads, renumbered to lower bound 1.
 	"expr.array_slice",
+	// Array function/operator surface AF1 (array-functions.md): the polymorphic anyarray/anyelement
+	// resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
+	// (array_append/prepend/cat).
+	"func.array",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
 	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

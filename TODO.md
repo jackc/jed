@@ -205,11 +205,20 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `array_eq`/`array_cmp` count→ndim→dims→lbounds tiebreak; `2202E` registered. All three cores +
         Ruby (golden row 4), `types/array_multidim.test` + `types/array_slice.test`, capabilities
         `types.array_multidim` + `expr.array_slice`. _(size: XL)_
-  - [ ] _follow-ons (each its own slice + obligations):_ array-of-composite elements; arrays-in-keys
-        (`0A000`, encoding authored §8); the array function/operator surface
-        (`array_length`/`cardinality`/`unnest`/`||`/`@>`/`&&`/… + the polymorphic
-        `anyarray`/`anyelement` resolution + `ANY`/`ALL`/`VARIADIC`); runtime text→array,
-        `array::text`, and element-wise array→array casts.
+  - [x] **AF1 — the array function/operator surface (the polymorphic foundation)** — the
+        `anyarray`/`anyelement` resolution (one type variable `ELEM`, unified by structural equality,
+        read back into the `anyarray`/`anyelement` result codes; the `none` non-strict null discipline;
+        literal adaptation to the array's element type) + the scalar-function surface: introspection
+        (`array_ndims`/`array_length`/`array_lower`/`array_upper`/`cardinality`/`array_dims`) and the
+        non-strict builders (`array_append`/`array_prepend`/`array_cat`; multidim append → `22000`,
+        incompatible cat → `2202E`). All three cores, oracle-checked (`suites/expr/array_functions.test`),
+        capability `func.array`, registry code `22000`. → [array-functions.md](spec/design/array-functions.md)
+  - [ ] _follow-ons (each its own slice + obligations; sequenced in array-functions.md §6):_ **AF2**
+        the `||` concatenation operator + `array_remove`/`array_replace`/`array_position`/`array_positions`;
+        **AF3** `unnest(anyarray)` (the SRF, polymorphic element column); **AF4** `@>`/`<@`/`&&`
+        containment/overlap operators; **AF5** `ANY`/`ALL` quantified comparisons; **AF6** `VARIADIC`.
+        Plus: array-of-composite elements; arrays-in-keys (`0A000`, encoding authored §8); runtime
+        text→array, `array::text`, and element-wise array→array casts.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis**, sibling to `array` and sharing ~80% of its foundation, so sequence
       the two together. **The headline implication: this turns the *closed* type enum into an *open*,

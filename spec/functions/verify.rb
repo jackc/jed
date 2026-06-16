@@ -9,12 +9,15 @@
 #   1. schema_version == 2
 #   2. each operator has the fields required for its kind; arity == arg_families
 #      length; null_test => arity 1; comparison => arity 2
-#   3. every arg_families entry is "any" or a real `family` in scalars.toml
-#   4. result is a scalar id in scalars.toml ("boolean"), or a reserved id (promoted)
+#   3. every arg_families entry is "any", a real `family` in scalars.toml, or a
+#      polymorphic pseudo-family (anyarray | anyelement — array-functions.md §2)
+#   4. result is a scalar id in scalars.toml ("boolean"), or a reserved id (promoted |
+#      anyarray | anyelement)
 #   5. arg_resolution is "promote" | "none"; "promote" requires the operand pair
 #      to be comparable and the family to have a promotion rule (compare.toml)
-#   6. null is "propagates" | "detects" | "kleene" | "null_safe" (null_safe = the
-#      NULL-safe equality discipline of IS [NOT] DISTINCT FROM)
+#   6. null is "propagates" | "detects" | "kleene" | "null_safe" | "none" (null_safe = the
+#      NULL-safe equality discipline of IS [NOT] DISTINCT FROM; none = the non-strict array
+#      builders — the kernel handles NULL, the resolver does not short-circuit it)
 #   7. every code in `errors` exists in registry.toml
 #   8. kind is a known kind (comparison | null_test | arithmetic | logical; function
 #      reserved)
@@ -53,9 +56,18 @@ require "set"
 FUNC_DIR = __dir__
 SPEC_DIR = File.expand_path("..", FUNC_DIR)
 
-RESERVED_RESULTS = %w[promoted].to_set
+# Polymorphic pseudo-families (../design/array-functions.md §2). NOT real families in
+# scalars.toml (not storable, no id/codec) — catalog CONTRACT TOKENS the hand-written resolver
+# interprets: `anyarray` matches any array arg (binds ELEM := its element type); `anyelement`
+# matches any arg (binds/checks ELEM). Admitted in arg_families AND, for the array builders'
+# result, as reserved result codes (anyarray = ELEM[], anyelement = ELEM).
+POLYMORPHIC_FAMILIES = %w[anyarray anyelement].to_set
+
+# `none` is the non-strict discipline (array_append/prepend/cat): the resolver does NOT
+# short-circuit a NULL argument — the kernel handles NULL itself (array-functions.md §4).
+RESERVED_RESULTS = %w[promoted anyarray anyelement].to_set
 KNOWN_KINDS      = %w[comparison null_test arithmetic logical function].to_set
-NULL_BEHAVIORS   = %w[propagates detects null_safe kleene].to_set
+NULL_BEHAVIORS   = %w[propagates detects null_safe kleene none].to_set
 RESOLUTIONS      = %w[promote none].to_set
 VOLATILITIES     = %w[immutable stable volatile].to_set
 REQUIRED_FIELDS  = %w[name kind arity arg_families arg_resolution result null errors].freeze
@@ -129,9 +141,9 @@ def main
       fail!("operator #{id}: comparison must have a `symbol`")
     end
 
-    # (3) arg_families reference real families (or "any")
+    # (3) arg_families reference real families (or "any", or a polymorphic pseudo-family)
     args.each do |fam|
-      next if fam == "any"
+      next if fam == "any" || POLYMORPHIC_FAMILIES.include?(fam)
       fail!("operator #{id}: arg family #{fam.inspect} is not a family in scalars.toml") unless families.include?(fam)
     end
 

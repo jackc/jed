@@ -189,6 +189,7 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 		codes[row.str("code")] = row.str("name")
 	}
 	for _, st := range []SqlState{
+		DataException,
 		NumericValueOutOfRange, InvalidDatetimeFormat, DatetimeFieldOverflow,
 		DivisionByZero, InvalidParameterValue, ArraySubscriptError,
 		InvalidRowCountInLimitClause, InvalidRowCountInOffsetClause,
@@ -437,6 +438,15 @@ func TestRegistryCoversCatalog(t *testing.T) {
 	for i := range Operators {
 		o := &Operators[i]
 		if o.Kind != "function" {
+			continue
+		}
+		if isArrayFuncName(o.Name) {
+			// A polymorphic array function (array-functions.md §2): its kernel id comes from
+			// arrayFuncID and its result is a reserved poly code or a scalar id.
+			_ = arrayFuncID(o.Name) // panics if the name has no kernel id
+			if _, ok := ScalarTypeFromName(o.Result); o.Result != "anyarray" && o.Result != "anyelement" && !ok {
+				t.Fatalf("array function %s has unhandled result code %s", o.Name, o.Result)
+			}
 			continue
 		}
 		tys := make([]resolvedType, len(o.ArgFamilies))

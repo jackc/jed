@@ -404,8 +404,14 @@ each passing `rake ci`, mirroring composite's S0–S6:
   + custom-lb value, `rust == go == ts == ruby`); oracle-checked `types/array_multidim.test` +
   `types/array_slice.test`; capabilities `types.array_multidim` + `expr.array_slice`.
 
+**The array function/operator surface has begun landing** in [array-functions.md](array-functions.md):
+**AF1** (the polymorphic `anyarray`/`anyelement` resolution + the scalar-function-shaped surface —
+`array_ndims`/`array_length`/`array_lower`/`array_upper`/`cardinality`/`array_dims` and
+`array_append`/`array_prepend`/`array_cat`) is implemented across all three cores, oracle-checked
+(`suites/expr/array_functions.test`, capability `func.array`). The remaining slices — `||`,
+`unnest`, `@>`/`<@`/`&&`, `ANY`/`ALL`, `VARIADIC` — are sequenced there (§6).
+
 **Still deferred (each its own follow-on):** **array-of-composite** elements (a fast-follow —
-composite already composes); arrays-in-keys (`0A000`, encoding authored §8); the array
-function/operator surface (`array_length`/`cardinality`/`unnest`/`||`/`array_cat`/`@>`/`&&`/
-`array_append`/…, the polymorphic `anyarray`/`anyelement` resolution, `ANY`/`ALL`, and `VARIADIC` —
-TODO.md); runtime text→array, `array::text`, and element-wise array→array casts.
+composite already composes); arrays-in-keys (`0A000`, encoding authored §8); the **remaining** array
+function/operator surface (`||`/`unnest`/`@>`/`&&`/… + `ANY`/`ALL`/`VARIADIC` — array-functions.md §6);
+runtime text→array, `array::text`, and element-wise array→array casts.

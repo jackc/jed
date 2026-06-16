@@ -26,6 +26,15 @@ class = "cardinality violation"
 template = "more than one row returned by a subquery used as an expression"
 
 # --- data exception (class 22) ----------------------------------------------
+# The bare class-22 catch-all. PostgreSQL raises it for "argument must be empty or
+# one-dimensional array" — array_append/array_prepend on a multidimensional array
+# (../design/array-functions.md §3.2). {detail} carries the message.
+[[error]]
+code = "22000"
+name = "data_exception"
+class = "data exception"
+template = "{detail}"
+
 [[error]]
 code = "22003"
 name = "numeric_value_out_of_range"

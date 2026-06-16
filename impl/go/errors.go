@@ -14,6 +14,10 @@ const (
 	// CardinalityViolation is 21000 — a scalar subquery used as an expression returned more than
 	// one row (spec/design/grammar.md §26).
 	CardinalityViolation SqlState = iota
+	// DataException is 22000 — the bare class-22 data exception. PostgreSQL raises it for
+	// "argument must be empty or one-dimensional array" — array_append/array_prepend on a
+	// multidimensional array (spec/design/array-functions.md §3.2).
+	DataException
 	// NumericValueOutOfRange is 22003 — integer overflow (CLAUDE.md §8).
 	NumericValueOutOfRange
 	// InvalidDatetimeFormat is 22007 — malformed timestamp/timestamptz input.
@@ -125,6 +129,8 @@ func (s SqlState) Code() string {
 	switch s {
 	case CardinalityViolation:
 		return "21000"
+	case DataException:
+		return "22000"
 	case NumericValueOutOfRange:
 		return "22003"
 	case InvalidDatetimeFormat:
