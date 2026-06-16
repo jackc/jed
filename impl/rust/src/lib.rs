@@ -74,6 +74,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
     "ddl.secondary_index",
     "ddl.unique",
+    // Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9). S2: the type
+    // is created/dropped/persisted; composite columns/values land later (spec/design/composite.md).
+    "types.composite",
     // NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
     "ddl.not_null",
     // DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

@@ -24,6 +24,7 @@ import type {
   SetOpKind,
   Statement,
   TableRef,
+  TypeFieldDef,
   TypeMod,
   Update,
 } from "./ast.ts";
@@ -122,9 +123,13 @@ class Parser {
         if (this.peekKeywordAt(1) === "index" || this.peekKeywordAt(1) === "unique") {
           return this.parseCreateIndex();
         }
+        // CREATE TYPE — a 2-token lookahead keeps TYPE non-reserved (the CREATE UNIQUE INDEX
+        // precedent — composite.md §1).
+        if (this.peekKeywordAt(1) === "type") return this.parseCreateType();
         return this.parseCreateTable();
       case "drop":
         if (this.peekKeywordAt(1) === "index") return this.parseDropIndex();
+        if (this.peekKeywordAt(1) === "type") return this.parseDropType();
         return this.parseDropTable();
       case "insert":
         return this.parseInsert();
@@ -445,6 +450,64 @@ class Parser {
     return { kind: "dropIndex", name };
   }
 
+  // parseCreateType parses `CREATE TYPE <name> AS ( <field> <type> [NOT NULL] [, …] )` — a
+  // composite (row) type (spec/design/composite.md, grammar.md). At least one field (an empty
+  // list is a syntax error); each field's type is a bare type name (built-in or a composite),
+  // resolved at execution (42704 if unknown).
+  private parseCreateType(): Statement {
+    this.expectKeyword("create");
+    this.expectKeyword("type");
+    const name = this.expectIdentifier();
+    this.expectKeyword("as");
+    this.expect("lparen");
+    const fields: TypeFieldDef[] = [];
+    for (;;) {
+      const fname = this.expectIdentifier();
+      const typeName = this.expectIdentifier();
+      const typeMod = this.parseTypeMod();
+      let notNull = false;
+      if (this.peekKeyword() === "not") {
+        this.advance();
+        this.expectKeyword("null");
+        notNull = true;
+      }
+      fields.push({ name: fname, typeName, typeMod, notNull });
+      const tok = this.advance();
+      if (tok.kind === "comma") continue;
+      if (tok.kind === "rparen") break;
+      throw engineError("syntax_error", `expected ',' or ')', found ${tok.kind}`);
+    }
+    return { kind: "createType", name, fields };
+  }
+
+  // parseDropType parses `DROP TYPE [IF EXISTS] <name> [RESTRICT | CASCADE]`
+  // (spec/design/composite.md §7). RESTRICT is the default and the only behavior this slice;
+  // CASCADE is rejected (0A000) at parse. A missing type (42704) and dependents (2BP01) are
+  // execution-time.
+  private parseDropType(): Statement {
+    this.expectKeyword("drop");
+    this.expectKeyword("type");
+    let ifExists = false;
+    if (this.peekKeyword() === "if") {
+      this.advance();
+      this.expectKeyword("exists");
+      ifExists = true;
+    }
+    const name = this.expectIdentifier();
+    // Optional trailing RESTRICT / CASCADE (a keyword, consumed here; CASCADE is 0A000).
+    let cascade = false;
+    if (this.peekKeyword() === "restrict") {
+      this.advance();
+    } else if (this.peekKeyword() === "cascade") {
+      this.advance();
+      cascade = true;
+    }
+    if (cascade) {
+      throw engineError("feature_not_supported", "DROP TYPE ... CASCADE is not supported");
+    }
+    return { kind: "dropType", name, ifExists };
+  }
+
   // parseInsert parses `INSERT INTO <table> [( <col> [, <col>]* )] ( VALUES <row> [, <row>]* |
   // <select> )`. The source is either a VALUES list (each <row> is `( <value> [, <value>]* )`,
   // each <value> a literal or the DEFAULT keyword) or a SELECT (INSERT ... SELECT — §24). The
@@ -513,11 +576,30 @@ class Parser {
   }
 
   // parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3), a
-  // bind parameter ($N, bound at execute — spec/design/api.md §5), else a literal.
+  // ROW(…) composite constructor (spec/design/composite.md §1), a bind parameter ($N, bound at
+  // execute — spec/design/api.md §5), else a literal.
   private parseInsertValue(): InsertValue {
     if (this.peekKeyword() === "default") {
       this.advance();
       return { kind: "default" };
+    }
+    if (this.peekKeyword() === "row" && this.peekKindAt(1) === "lparen") {
+      // ROW(field, field, …) — recurse on each field (a literal, a $N, or a nested ROW).
+      this.advance(); // ROW
+      this.expect("lparen");
+      const fields: InsertValue[] = [];
+      if (this.peek().kind !== "rparen") {
+        for (;;) {
+          fields.push(this.parseInsertValue());
+          const t = this.advance();
+          if (t.kind === "comma") continue;
+          if (t.kind === "rparen") break;
+          throw engineError("syntax_error", `expected ',' or ')', found ${t.kind}`);
+        }
+      } else {
+        this.advance(); // the empty ROW() — consume ')'
+      }
+      return { kind: "row", fields };
     }
     if (this.peek().kind === "param") {
       return { kind: "param", index: this.advance().paramIndex! };
@@ -1175,18 +1257,49 @@ class Parser {
     return this.parsePostfix();
   }
 
-  // parsePostfix parses a primary optionally followed by one or more `::type` PostgreSQL typecasts
-  // (grammar.md §37). `expr :: type` desugars to CAST(expr AS type) here at parse time — one
-  // resolver / evaluator / cost path for both spellings — and casts chain left-associatively
-  // (`x::int8::int2` = `(x::int8)::int2`). A typmod rides on the type name exactly as in CAST
-  // (`x::numeric(10,2)`). `::` binds tighter than unary minus (handled by parseUnary above).
+  // parsePostfix parses a primary optionally followed by one or more postfix operators, applied
+  // left-to-right in token order: a `::type` PostgreSQL typecast (grammar.md §37) or a `.field` /
+  // `.*` composite field selection (spec/design/composite.md §S4). `expr :: type` desugars to
+  // CAST(expr AS type) here at parse time — one resolver / evaluator / cost path for both spellings —
+  // and casts chain left-associatively (`x::int8::int2` = `(x::int8)::int2`). A typmod rides on the
+  // type name exactly as in CAST (`x::numeric(10,2)`).
+  //
+  // Field selection follows PostgreSQL's PARENS-REQUIRED rule: `.field` / `.*` applies ONLY to a
+  // PARENTHESIZED base — `(home).zip`, `(t.home).zip`, `(ROW(1,2)).f1` — and chains on a prior field
+  // access (`(c).a.b`). A bare `home.zip` / `t.home.zip` is a (multi-part) column reference, never
+  // field access (PG raises 42P01 for the unparenthesized form). So `.field` fires only when the
+  // primary started with `(` or after a previous `.field`; otherwise the `.` is left for the caller
+  // (a trailing `.field` on a bare name is then a syntax error, like PG). NB: a bare `a.b` is consumed
+  // as a single qualifiedColumn by parseColumnRef inside parsePrimary.
   private parsePostfix(): Expr {
+    // Only a PARENTHESIZED primary is field-accessible (PG requires `(expr).field`). A subsequent
+    // `.field` keeps the chain field-accessible (`(c).a.b`); a `::` cast does not.
+    let fieldAccessible = this.peek().kind === "lparen";
     let expr = this.parsePrimary();
-    while (this.peek().kind === "doubleColon") {
-      this.advance();
-      const typeName = this.expectIdentifier();
-      const typeMod = this.parseTypeMod();
-      expr = { kind: "cast", inner: expr, typeName, typeMod };
+    for (;;) {
+      const k = this.peek().kind;
+      if (k === "doubleColon") {
+        this.advance();
+        const typeName = this.expectIdentifier();
+        const typeMod = this.parseTypeMod();
+        expr = { kind: "cast", inner: expr, typeName, typeMod };
+        fieldAccessible = false;
+      } else if (k === "dot" && fieldAccessible) {
+        // `.field` / `.*` — composite field selection (spec/design/composite.md §S4),
+        // parens-required: only on a parenthesized / chained-field base.
+        this.advance();
+        if (this.peek().kind === "star") {
+          this.advance();
+          expr = { kind: "fieldStar", base: expr };
+          fieldAccessible = false; // `.*` is terminal
+        } else {
+          const field = this.expectIdentifier();
+          expr = { kind: "fieldAccess", base: expr, field };
+          // a field value may itself be composite → `(c).a.b` chains (fieldAccessible stays true)
+        }
+      } else {
+        break;
+      }
     }
     return expr;
   }
@@ -1219,6 +1332,26 @@ class Parser {
       const query = this.parseSubquery();
       this.expect("rparen");
       return { kind: "exists", query };
+    }
+    // `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when `ROW`
+    // is immediately followed by `(`, so `row` stays usable as a column / function name otherwise.
+    // The bare `(a, b)` form is deferred (0A000); only the keyword form parses.
+    if (this.peekKeyword() === "row" && this.peekKindAt(1) === "lparen") {
+      this.advance(); // ROW
+      this.expect("lparen");
+      const fields: Expr[] = [];
+      if (this.peek().kind !== "rparen") {
+        for (;;) {
+          fields.push(this.parseExpr());
+          const t = this.advance();
+          if (t.kind === "comma") continue;
+          if (t.kind === "rparen") break;
+          throw engineError("syntax_error", `expected ',' or ')', found ${t.kind}`);
+        }
+      } else {
+        this.advance(); // the empty ROW() — consume ')'
+      }
+      return { kind: "row", fields };
     }
     // A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`, equal to
     // CAST('string' AS type) over a string-literal operand: ANY type-naming word immediately followed

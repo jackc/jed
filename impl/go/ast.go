@@ -9,6 +9,8 @@ type Statement struct {
 	DropTable   *DropTable
 	CreateIndex *CreateIndex
 	DropIndex   *DropIndex
+	CreateType  *CreateType
+	DropType    *DropType
 	Insert      *Insert
 	Select      *Select
 	// SetOp is a set operation (UNION/INTERSECT/EXCEPT) combining two query expressions
@@ -122,6 +124,35 @@ type DropIndex struct {
 	Name string
 }
 
+// CreateType is a CREATE TYPE <name> AS ( field type [NOT NULL] [, …] ) statement — a
+// user-defined composite (row) type (spec/design/composite.md, grammar.md). Execution resolves
+// each field's type (a built-in scalar or a previously-defined composite — 42704 if unknown),
+// rejects a duplicate type name (42710), and registers it in the catalog. Named composites only
+// this slice; anonymous record is not supported.
+type CreateType struct {
+	Name   string
+	Fields []TypeFieldDef
+}
+
+// TypeFieldDef is one field of a CREATE TYPE definition: its name, its type as written (a built-in
+// scalar alias or a composite type name), an optional numeric(p,s) modifier, and an explicit
+// NOT NULL. Resolved at execution (mirrors ColumnDef).
+type TypeFieldDef struct {
+	Name     string
+	TypeName string
+	TypeMod  *TypeMod
+	NotNull  bool
+}
+
+// DropType is a DROP TYPE [IF EXISTS] <name> [RESTRICT] statement — remove a composite type
+// (spec/design/composite.md §7). RESTRICT (the default and only behavior this slice) fails with
+// 2BP01 if a table column or another composite type still references it; CASCADE is 0A000. A
+// missing type without IF EXISTS is 42704.
+type DropType struct {
+	Name     string
+	IfExists bool
+}
+
 // ColumnDef is a column definition in a CREATE TABLE.
 type ColumnDef struct {
 	Name string
@@ -178,7 +209,12 @@ type InsertValue struct {
 	IsDefault bool
 	IsParam   bool    // a $N bind parameter; Param holds the 1-based index
 	Param     uint64  // valid when IsParam
-	Lit       Literal // valid when !IsDefault && !IsParam
+	Lit       Literal // valid when !IsDefault && !IsParam && !IsRow
+	// IsRow marks a ROW(...) composite constructor (spec/design/composite.md §1); Row holds the
+	// field slots, in order (each itself a literal, a $N, or a nested ROW). A composite-typed column
+	// takes a ROW(...) value in INSERT VALUES.
+	IsRow bool
+	Row   []InsertValue // valid when IsRow
 }
 
 // Update is `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each
@@ -392,6 +428,22 @@ const (
 	// ExprInSubquery is `lhs [NOT] IN ( query_expr )` (spec/design/grammar.md §26) — membership of
 	// lhs in the subquery's single output column (three-valued, like a literal IN).
 	ExprInSubquery
+	// ExprRow is a `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1): RowItems
+	// holds the field expressions, in order. A one-field ROW(x) is a one-field row; ROW() is the
+	// zero-field row. The bare `(a, b)` form is deferred (0A000); only the keyword form parses.
+	ExprRow
+	// ExprFieldAccess is field selection `(expr).field` (spec/design/composite.md §S4) — the value
+	// of one named field of a composite Base. The parser produces this for a `.name` postfix on a
+	// parenthesized / `ROW(…)` / cast / qualified-column base; a bare `a.b` stays
+	// ExprQualifiedColumn and only falls back to field access at resolve when `a` is no relation
+	// but a composite column (the ambiguity rule — table.column first, then column.field). Field
+	// lookup is case-insensitive; an unknown field is 42703, a non-composite base 42809.
+	ExprFieldAccess
+	// ExprFieldStar is whole-row expansion `(expr).*` (spec/design/composite.md §S4) — expands a
+	// composite Base into one output column per field, in declaration order. Valid only in a
+	// SELECT/RETURNING projection list (where `*` expands); in any scalar expression position it is
+	// 0A000.
+	ExprFieldStar
 )
 
 // UnaryOp is a unary operator.
@@ -457,6 +509,13 @@ type Expr struct {
 	Case        *CaseExpr       // ExprCase
 	Subquery    *QueryExpr      // ExprScalarSubquery, ExprExists (the inner query)
 	InSubquery  *InSubqueryExpr // ExprInSubquery
+	RowItems    []Expr          // ExprRow (the ROW(...) field expressions, in order)
+	// Base is the operand of a field-selection postfix (ExprFieldAccess / ExprFieldStar): the
+	// composite expression `(base).field` / `(base).*` selects from (spec/design/composite.md §S4).
+	Base *Expr
+	// Field is the selected field name of an ExprFieldAccess (the `.field` part); lookup is
+	// case-insensitive at resolve.
+	Field string
 }
 
 // InSubqueryExpr is `Lhs [NOT] IN ( Query )` (spec/design/grammar.md §26) — membership of Lhs in

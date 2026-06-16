@@ -399,6 +399,16 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             w.write_all(&iv.days.to_le_bytes())?;
             w.write_all(&iv.micros.to_le_bytes())
         }
+        // Composite — tag 15: field count then each field value, recursive (spec/design/composite.md).
+        // Internal merge-sort scratch format only, so the recursion needs no type context.
+        Value::Composite(fields) => {
+            w.write_all(&[15])?;
+            write_u32(w, fields.len() as u32)?;
+            for f in fields {
+                write_value(w, f)?;
+            }
+            Ok(())
+        }
         // An untouched large-value reference rides along to the output unread (spill.md §4); spill
         // it opaquely (the pointer/inline block) so it round-trips, never resolving it.
         Value::Unfetched(Unfetched::External { first_page, len }) => {
@@ -520,6 +530,14 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             let mut b = [0u8; 4];
             r.read_exact(&mut b)?;
             Value::Float32(f32::from_bits(u32::from_le_bytes(b)))
+        }
+        15 => {
+            let n = read_u32(r)? as usize;
+            let mut fields = Vec::with_capacity(n);
+            for _ in 0..n {
+                fields.push(read_value(r)?);
+            }
+            Value::Composite(fields)
         }
         _ => {
             return Err(io::Error::new(

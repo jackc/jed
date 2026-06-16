@@ -471,6 +471,41 @@ fn float32_table_db() -> Database {
     db
 }
 
+/// A composite TYPE defined + persisted (v9) AND used by a column with stored values (S3): pins
+/// the recursive value codec — the null bitmap, a present-field body, and a NULL field's
+/// zero-byte omission (row 2's `zip`) — spec/design/composite.md §4.
+fn composite_type_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TYPE addr AS (street text NOT NULL, zip int32)",
+    );
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, home addr)");
+    run(&mut db, "INSERT INTO t VALUES (1, ROW('Main', 90210))");
+    run(&mut db, "INSERT INTO t VALUES (2, ROW('Oak', NULL))");
+    db
+}
+
+/// Nested composite types (a field whose type is another composite, by name) used by a column
+/// with a stored nested value (S3). `point` is created first (a referenced type must exist), but
+/// the on-disk order is name-sorted (`line`, `point`) — `line` sorts BEFORE the `point` it
+/// references, so the two-pass load (collect all, then resolve) is exercised; the row pins the
+/// recursive value codec descending through a composite field.
+fn nested_composite_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)",
+    );
+    run(&mut db, "CREATE TYPE line AS (a point, b point)");
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, ln line)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, ROW(ROW(1, 2), ROW(3, 4)))",
+    );
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -497,6 +532,8 @@ fn write_matches_goldens() {
         ("check_table.jed", check_table_db),
         ("index_table.jed", index_table_db),
         ("unique_table.jed", unique_table_db),
+        ("composite_type_table.jed", composite_type_table_db),
+        ("nested_composite_table.jed", nested_composite_table_db),
         ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
@@ -531,6 +568,8 @@ fn read_goldens_reproduces_rows() {
         ("check_table.jed", check_table_db, "t"),
         ("index_table.jed", index_table_db, "t"),
         ("unique_table.jed", unique_table_db, "t"),
+        ("composite_type_table.jed", composite_type_table_db, "t"),
+        ("nested_composite_table.jed", nested_composite_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),
@@ -561,12 +600,12 @@ fn read_golden_reconstructs_catalog() {
     assert_eq!(t.columns.len(), 2);
 
     assert_eq!(t.columns[0].name, "id");
-    assert_eq!(t.columns[0].ty, ScalarType::Int32);
+    assert_eq!(t.columns[0].ty.scalar(), ScalarType::Int32);
     assert!(t.columns[0].primary_key);
     assert!(t.columns[0].not_null);
 
     assert_eq!(t.columns[1].name, "v");
-    assert_eq!(t.columns[1].ty, ScalarType::Int16);
+    assert_eq!(t.columns[1].ty.scalar(), ScalarType::Int16);
     assert!(!t.columns[1].primary_key);
     assert!(!t.columns[1].not_null);
 

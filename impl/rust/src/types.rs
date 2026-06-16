@@ -292,3 +292,79 @@ pub struct DecimalTypmod {
     pub precision: u16,
     pub scale: u16,
 }
+
+/// A column / value type: either a built-in `ScalarType` or a reference to a user-defined
+/// **composite** (row) type (spec/design/composite.md). This is the *open* wrapper above the
+/// closed `ScalarType` enum (CLAUDE.md §4): the scalar set stays a fixed compiled-in enum, but a
+/// column type can now also name a composite living in the database's type catalog. Referenced by
+/// name (case-insensitively, like a table) — the resolved field list lives once in the catalog
+/// (S2+), not inline here. Not `Copy` (it carries a name); scalar-only paths call `scalar()`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Type {
+    Scalar(ScalarType),
+    Composite(CompositeRef),
+}
+
+/// A by-name reference to a composite type in the database's type catalog. The display name is
+/// case-preserved; lookups lowercase it (the table-name convention).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CompositeRef {
+    pub name: String,
+}
+
+impl Type {
+    /// The inner scalar type. Scalar-only paths (the integer codec, the scalar value codec, the
+    /// scalar resolver) call this; a composite column reaches those paths only after the caller
+    /// has branched on `is_composite`, so a composite here is an engine-invariant violation.
+    pub fn scalar(&self) -> ScalarType {
+        match self {
+            Type::Scalar(s) => *s,
+            Type::Composite(r) => unreachable!(
+                "composite type {} used where a scalar was expected; the composite path must \
+                 branch before this point (spec/design/composite.md)",
+                r.name
+            ),
+        }
+    }
+
+    /// The inner scalar type, or `None` for a composite.
+    pub fn as_scalar(&self) -> Option<ScalarType> {
+        match self {
+            Type::Scalar(s) => Some(*s),
+            Type::Composite(_) => None,
+        }
+    }
+
+    /// Whether this is a composite (user-defined row) type.
+    pub fn is_composite(&self) -> bool {
+        matches!(self, Type::Composite(_))
+    }
+
+    /// This type's canonical name for output / error messages — the scalar's canonical name, or
+    /// the composite's name. Borrowed (a composite name is not `'static`).
+    pub fn canonical_name(&self) -> &str {
+        match self {
+            Type::Scalar(s) => s.canonical_name(),
+            Type::Composite(r) => &r.name,
+        }
+    }
+
+    // Scalar-predicate delegates. A composite answers `false` to every scalar predicate — it is
+    // none of these families — so keyability checks (`is_integer || is_uuid || …`) correctly
+    // reject a composite (0A000), and family branches fall through to their composite handling.
+    pub fn is_integer(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_integer())
+    }
+    pub fn is_decimal(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_decimal())
+    }
+    pub fn is_uuid(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_uuid())
+    }
+    pub fn is_timestamp(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_timestamp())
+    }
+    pub fn is_timestamptz(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_timestamptz())
+    }
+}

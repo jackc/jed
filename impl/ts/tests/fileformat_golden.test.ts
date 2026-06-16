@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { Database, execute } from "../src/lib.ts";
 import { crc32Ieee, loadDatabase, toImage } from "../src/format.ts";
+import { scalarT } from "../src/types.ts";
 import { specPath } from "./tomlmini.ts";
 import { bytesEqual, fillerBytesHex, fillerText } from "./util.ts";
 
@@ -354,6 +355,33 @@ function float32TableDB(): Database {
   return db;
 }
 
+// compositeTypeTableDB: a composite TYPE defined + persisted (v9), used by a stored composite COLUMN
+// (S3 — the recursive value codec). Exercises the kind-tagged catalog (a composite-type entry, kind
+// 1, before the table entry, kind 0), a composite column (type_code 14), and the value codec's null
+// bitmap + present-field bodies (row 2's NULL zip field).
+function compositeTypeTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TYPE addr AS (street text NOT NULL, zip int32)");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, home addr)");
+  run(db, "INSERT INTO t VALUES (1, ROW('Main', 90210))");
+  run(db, "INSERT INTO t VALUES (2, ROW('Oak', NULL))");
+  return db;
+}
+
+// nestedCompositeTableDB: nested composite types (a field whose type is another composite, by name)
+// used by a column with a stored nested value (S3). `point` is created first (a referenced type must
+// exist), but the on-disk order is name-sorted (`line`, `point`) — `line` sorts BEFORE the `point` it
+// references, so the two-pass load is exercised; the row pins the recursive value codec descending
+// through a composite field.
+function nestedCompositeTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)");
+  run(db, "CREATE TYPE line AS (a point, b point)");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, ln line)");
+  run(db, "INSERT INTO t VALUES (1, ROW(ROW(1, 2), ROW(3, 4)))");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -379,6 +407,8 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "check_table.jed", build: checkTableDB },
     { name: "index_table.jed", build: indexTableDB },
     { name: "unique_table.jed", build: uniqueTableDB },
+    { name: "composite_type_table.jed", build: compositeTypeTableDB },
+    { name: "nested_composite_table.jed", build: nestedCompositeTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
   ];
   for (const c of cases) {
@@ -416,6 +446,8 @@ test("read goldens reproduces rows", () => {
     { name: "check_table.jed", build: checkTableDB, table: "t" },
     { name: "index_table.jed", build: indexTableDB, table: "t" },
     { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
+    { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
+    { name: "nested_composite_table.jed", build: nestedCompositeTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },
@@ -441,8 +473,8 @@ test("read golden reconstructs catalog", () => {
   assert.equal(tbl!.name, "t");
   assert.equal(tbl!.columns.length, 2);
   const [id, v] = tbl!.columns;
-  assert.deepStrictEqual(id, { name: "id", type: "int32", decimal: null, primaryKey: true, notNull: true, default: null, defaultExpr: null });
-  assert.deepStrictEqual(v, { name: "v", type: "int16", decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null });
+  assert.deepStrictEqual(id, { name: "id", type: scalarT("int32"), decimal: null, primaryKey: true, notNull: true, default: null, defaultExpr: null });
+  assert.deepStrictEqual(v, { name: "v", type: scalarT("int16"), decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null });
   // A NULL value round-trips (id 3's v).
   const rows = loaded.rowsInKeyOrder("t");
   assert.deepStrictEqual(rows[2], [{ kind: "int", int: 3n }, { kind: "null" }]);

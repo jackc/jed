@@ -385,6 +385,14 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		spillWriteU32(w, uint32(v.Iv.Months))
 		spillWriteU32(w, uint32(v.Iv.Days))
 		spillWriteU64(w, uint64(v.Iv.Micros))
+	case ValComposite:
+		// Composite — tag 15: field count then each field value, recursive (spec/design/composite.md).
+		// Internal merge-sort scratch format only, so the recursion needs no type context.
+		_ = w.WriteByte(15)
+		spillWriteU32(w, uint32(len(*v.Comp)))
+		for _, f := range *v.Comp {
+			spillWriteValue(w, f)
+		}
 	case ValUnfetched:
 		// An untouched large-value reference rides along to the output unread (spill.md §4); spill
 		// it opaquely so it round-trips, never resolving it.
@@ -541,6 +549,20 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		}
 		micros, err := spillReadU64(r)
 		return IntervalValue(Interval{Months: int32(months), Days: int32(days), Micros: int64(micros)}), err
+	case 15:
+		n, err := spillReadU32(r)
+		if err != nil {
+			return Value{}, err
+		}
+		fields := make([]Value, n)
+		for i := range fields {
+			f, err := spillReadValue(r)
+			if err != nil {
+				return Value{}, err
+			}
+			fields[i] = f
+		}
+		return CompositeValue(fields), nil
 	default:
 		return Value{}, io.ErrUnexpectedEOF
 	}

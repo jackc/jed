@@ -29,15 +29,15 @@ fn creates_table_with_resolved_types_and_pk() {
     assert_eq!(t.columns.len(), 3);
 
     assert_eq!(t.columns[0].name, "id");
-    assert_eq!(t.columns[0].ty, ScalarType::Int32);
+    assert_eq!(t.columns[0].ty.scalar(), ScalarType::Int32);
     assert!(t.columns[0].primary_key);
     assert!(t.columns[0].not_null, "PRIMARY KEY implies NOT NULL");
 
-    assert_eq!(t.columns[1].ty, ScalarType::Int16);
+    assert_eq!(t.columns[1].ty.scalar(), ScalarType::Int16);
     assert!(!t.columns[1].primary_key);
     assert!(!t.columns[1].not_null);
 
-    assert_eq!(t.columns[2].ty, ScalarType::Int64);
+    assert_eq!(t.columns[2].ty.scalar(), ScalarType::Int64);
     assert_eq!(t.primary_key_index(), Some(0));
 }
 
@@ -50,10 +50,10 @@ fn sql_standard_type_aliases_resolve() {
     )
     .unwrap();
     let t = db.table("t").unwrap();
-    assert_eq!(t.columns[0].ty, ScalarType::Int16);
-    assert_eq!(t.columns[1].ty, ScalarType::Int32);
-    assert_eq!(t.columns[2].ty, ScalarType::Int32);
-    assert_eq!(t.columns[3].ty, ScalarType::Int64);
+    assert_eq!(t.columns[0].ty.scalar(), ScalarType::Int16);
+    assert_eq!(t.columns[1].ty.scalar(), ScalarType::Int32);
+    assert_eq!(t.columns[2].ty.scalar(), ScalarType::Int32);
+    assert_eq!(t.columns[3].ty.scalar(), ScalarType::Int64);
 }
 
 #[test]

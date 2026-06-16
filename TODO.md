@@ -180,9 +180,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       vs `NULL` array, equality/ordering, and an order-preserving key encoding for
       arrays-in-keys. Match PostgreSQL array semantics by default (§1). Large surface;
       sequence after the core scalar set settles. _(size: XL; §4/§8)_
-- [ ] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — the **second container
-      axis**, sibling to `array` and sharing ~80% of its foundation, so sequence the two
-      together. **The headline implication: this turns the *closed* type enum into an *open*,
+- [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
+      **second container axis**, sibling to `array` and sharing ~80% of its foundation, so sequence
+      the two together. **The headline implication: this turns the *closed* type enum into an *open*,
       user-defined type system.** Today every type is a variant of a fixed `Copy` enum
       (`ScalarType`), codegen'd from [scalars.toml](spec/types/scalars.toml). A composite type is
       a fact about *a database*: named, created/dropped at runtime, recursive, living in the
@@ -208,6 +208,46 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       foundation as one explicit slice. **Path:** NOT a single vertical slice — write
       `spec/design/composite.md` + the **CLAUDE.md §4/§5 revision** (the open-type-system commitment)
       *before* any core touches `ScalarType`, then narrow v1 hard. _(size: XL; §4/§8)_
+  - [x] **S0–S2 landed:** `spec/design/composite.md` + the CLAUDE.md §4/§5 open-type-system revision;
+        the open `Type { Scalar | Composite }` wrapper threaded through all three cores (a no-op
+        refactor); `CREATE TYPE` / `DROP TYPE` + the catalog type registry + **`format_version` 9**
+        (kind-tagged catalog entries + a composite-type section + two-pass acyclic load), persisted
+        byte-identically across rust/go/ts/ruby with new goldens (`composite_type_table.jed`,
+        `nested_composite_table.jed`); error `2BP01`; the `types.composite` capability +
+        `ddl/create_type.test`. Nested composites + dependency tracking work.
+  - [x] **S3 landed:** a storable composite **column** (the `0A000` lifted) + the recursive value
+        codec (null bitmap + present-field bodies, [format.md](spec/fileformat/format.md) *Value
+        codec*) threaded through the codec seam (`ColType`) in all three cores; the `ROW(…)`
+        constructor (parser/AST/eval) in expression + INSERT VALUES position; INSERT/SELECT
+        round-trip; `record_out` rendering (PG field quoting); structural `eq3`/`lt3`/`gt3`. The two
+        composite goldens now carry composite-column **values** (rust/go/ts/ruby byte-identical), and
+        `types/composite.test` is oracle-shaped. **S3 narrowings (relaxed later):** composite
+        comparison in `WHERE`, `INSERT … SELECT` into a composite column, and `UPDATE` of one are
+        `0A000`; `DEFAULT` on a composite column is `0A000`.
+  - [x] **S4 landed:** field access `(expr).field` / `(expr).*` — the **parens-required** `.field`/
+        `.*` postfix operator (chains with `::` and itself), the resolver field lookup
+        (case-insensitive; unknown field `42703`, non-composite base `42809`), and `(expr).*`
+        projection-list expansion. The differential oracle **corrected** the planned bare-`col.field`
+        fallback: live PG requires parens (`home.zip` → `42P01`; field access is `(home).zip`), so
+        jed matches PG (no fallback). No on-disk format change.
+  - [x] **S5 landed:** resolver-level element-wise comparison / ordering — `classify_comparable`
+        lifted (same-arity, field-comparable composites OK; `42804` otherwise), the **non-recursive**
+        all-fields `IS NULL`/`IS NOT NULL` rule (the differential oracle corrected the recursive
+        assumption — a composite-valued field counts as present), the `ORDER BY` lexicographic
+        total-order arm, and DISTINCT/GROUP BY composite keys (the S3 value Hash/Eq). S5 corpus rows
+        PG-verified; all three cores green (108/0/0); no format change.
+  - [x] **S6 landed:** PG-exact `record_out` (`"`→`""`, `\`→`\\` doubling — the oracle corrected the
+        S3 `\"` rendering) + `record_in` (`value::parse_record_tokens` + `coerce_string_to_composite`)
+        wired into the `'(…)'::type` cast and the `type '(…)'` typed literal (string-literal →
+        composite; runtime text→composite, `composite::text`, and `ROW(…)::type` stay `0A000`). The
+        oracle check is **green**: `rake corpus:check` regenerates `types/composite.test`
+        byte-identically from live PG (two documented comparison-error-code overrides — jed `42804`
+        vs PG `42883`/`42601`). All three cores green (108/0/0); no format change.
+  - **Still narrowed (relaxable later):** `INSERT … SELECT` / `UPDATE` of a composite column;
+        composite `PRIMARY KEY` / index / `UNIQUE` (`0A000` — key encoding authored, unexercised);
+        `DEFAULT` on a composite column; runtime non-literal text→composite + `composite::text` +
+        anonymous `ROW(…)::type` casts; the nested `ROW(ROW(…),…)`-into-column constructor (a jed
+        extension PG rejects — in unit tests, not the PG-oracle corpus).
 
 ---
 

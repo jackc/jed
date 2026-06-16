@@ -175,6 +175,17 @@ everything else tests against, not a detail discovered during implementation.
     with its own value codec, order-preserving key encoding, and comparison rules — not
     just another row in the scalar table. Match PostgreSQL's array behavior by default
     (§1). Deferred like the scalars above; sequence it after the core scalar set settles.
+  - **The type system is OPEN, not closed — composite (row) types have landed**
+    (`spec/design/composite.md`, `CREATE TYPE addr AS (street text, zip int32)`). This is the
+    pivot the scalar set above only hinted at: a type is no longer *only* a compiled-in
+    `ScalarType` variant but can be **a fact about a database** — named, created/dropped at
+    runtime, recursive, persisted in the catalog. So a column/value type is `Type { Scalar |
+    Composite(catalog-ref) }`, the **open** wrapper threaded through parser/resolver/evaluator/
+    codec/comparator/catalog in every core (the closed `ScalarType` enum is kept *intact inside*
+    `Type::Scalar` — it never gains user variants). Composite is the first **container** axis and
+    the shared open-`Type` foundation the future `array` axis reuses; **named composites only this
+    slice** (no anonymous `record`), with composite-as-key deferred `0A000` (the text/decimal-PK
+    precedent) and no implicit per-table row types (a documented PG divergence).
 - **Three-valued NULL logic.**
 - **An explicit, documented comparison / coercion / promotion matrix** — expressed as
   data, not prose.
@@ -200,6 +211,17 @@ between runtime-loaded data (portable but indirect) and hand-writing N times
 **Do NOT codegen** the parser, planner, executor, storage layer, or expression
 evaluator. Those are irreducibly per-language and are the parts that genuinely cost N
 times. Everything else, push into the shared layer.
+
+**Open types shift the contract in kind, not degree.** For scalars the cross-core contract is
+"the data table is byte-identical" — `scalars.toml`/`compare.toml` are authored once and each
+core is cross-checked against them. A composite type (§4) has no such fixed data table: its set
+is per-database and only known at runtime, so its **recursive codec / comparator / NULL-rule /
+text-I/O is hand-written per core** (the §-above "do not codegen" list now implicitly includes
+it) and verified instead by **golden fixtures + conformance entries** (§8). This is sound because
+every composite method is *derived* from field types that are already cross-core-identical
+(`spec/design/extensibility.md` §4.1), so the byte-identity holds by construction; the data-shaped
+part that *does* stay shared is the *field list*, persisted self-describingly in the on-disk type
+catalog.
 
 ---
 

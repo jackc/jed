@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"math"
 	"strconv"
+	"strings"
 )
 
 // ValueKind tags a runtime value: NULL, an integer, a boolean, text, decimal, or bytea.
@@ -43,6 +44,14 @@ const (
 	// ValFloat64 is an IEEE 754 binary64 (the float64 / double-precision type). Int holds
 	// math.Float64bits(value); same verbatim-storage / canonical-comparison rule as float32.
 	ValFloat64
+	// ValComposite is a composite (row) value — an ordered list of field values, recursive (a
+	// field may itself be a ValComposite), spec/design/composite.md §2. Comp holds a *[]Value
+	// POINTER so the flat Value struct stays ==-comparable (the slice would otherwise be
+	// non-comparable, like Dec): composite equality and hashing are forced through the structural
+	// Eq3 / value-key path, never raw ==, the rule Decimal/Interval already follow. The field
+	// count and per-field types match the value's composite type; the storage codec / comparator /
+	// recordOut all recurse over this list.
+	ValComposite
 	// ValUnfetched is an unfetched large-value reference (spec/design/large-values.md §14): a
 	// stored external/compressed value loaded as its on-disk pointer instead of being
 	// materialized; Unf holds the pointer fields. Internal to the storage/scan layers — the scan
@@ -94,6 +103,11 @@ type Value struct {
 	// '30 days'; their VALUE equality (span-canonical) goes through Eq3 / the DISTINCT key, never
 	// `==` — exactly like decimal (spec/design/interval.md §2).
 	Iv Interval
+	// Comp holds the field values when Kind == ValComposite (spec/design/composite.md §2). A
+	// POINTER (*[]Value) so the flat Value struct stays ==-comparable — like Dec/Unf, never compare
+	// two composite Values with raw `==` (that compares pointers); composite equality/hashing go
+	// through Eq3 / the structural value-key path.
+	Comp *[]Value
 }
 
 // IntValue builds a non-null integer value.
@@ -126,6 +140,11 @@ func TimestamptzValue(m int64) Value { return Value{Kind: ValTimestamptz, Int: m
 
 // IntervalValue builds a non-null interval value.
 func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, Iv: iv} }
+
+// CompositeValue builds a non-null composite (row) value from its field values
+// (spec/design/composite.md §2). The slice is held by pointer so Value stays ==-comparable;
+// structural equality/ordering go through Eq3/Lt3/Gt3, never raw ==.
+func CompositeValue(fields []Value) Value { return Value{Kind: ValComposite, Comp: &fields} }
 
 // Float32Value builds a non-null float32 value from a Go float32 — the bits are stored verbatim
 // in Int (math.Float32bits, zero-extended), so -0.0 / NaN / ±Inf keep their original pattern
@@ -259,6 +278,43 @@ func renderUUID(b []byte) string {
 // IsNull reports whether the value is SQL NULL.
 func (v Value) IsNull() bool { return v.Kind == ValNull }
 
+// IsNullTest evaluates `IS NULL` (negated=false) / `IS NOT NULL` (negated=true) for this value.
+// For a composite the rule is PG's all-fields rule and is **NON-recursive** (the empirically-probed
+// PG 18 behavior — the differential oracle): a field counts as "null" only if it is itself SQL-NULL;
+// a *composite-valued* field is a non-null value, so it counts as PRESENT and is not descended into.
+// `IS NULL` is TRUE iff this value is SQL-NULL or every immediate field is SQL-NULL; `IS NOT NULL`
+// is TRUE iff this value is non-NULL and every immediate field is non-SQL-NULL. So `ROW(1, NULL)`
+// is FALSE for both, and `ROW(ROW(NULL,NULL), ROW(NULL,NULL)) IS NULL` is FALSE (the inner rows are
+// non-null values). A scalar follows the ordinary rule. Always definite (never UNKNOWN).
+func (v Value) IsNullTest(negated bool) bool {
+	switch v.Kind {
+	case ValComposite:
+		fields := *v.Comp
+		if negated {
+			// IS NOT NULL: every immediate field is a non-(SQL-)NULL value.
+			for _, f := range fields {
+				if f.Kind == ValNull {
+					return false
+				}
+			}
+			return true
+		}
+		// IS NULL: every immediate field is SQL-NULL (a composite-valued field is NOT).
+		for _, f := range fields {
+			if f.Kind != ValNull {
+				return false
+			}
+		}
+		return true
+	case ValNull:
+		// A whole-value NULL: IS NULL → true, IS NOT NULL → false.
+		return !negated
+	default:
+		// Any present scalar: IS NULL → false, IS NOT NULL → true.
+		return negated
+	}
+}
+
 // IsTrue reports whether the value is boolean TRUE: a WHERE expression keeps a row
 // only when it is TRUE; FALSE and NULL/unknown both reject (CLAUDE.md §4, Kleene).
 func (v Value) IsTrue() bool { return v.Kind == ValBool && v.Bool }
@@ -313,6 +369,11 @@ func (v Value) Render() string {
 		return renderFloat32(v.F32())
 	case ValFloat64:
 		return renderFloat64(v.F64())
+	case ValComposite:
+		// A composite renders as PG record_out: `(f1,f2,…)` with per-field quoting
+		// (spec/design/composite.md §8). The renderer recurses (a composite field's text is itself
+		// quoted because it contains parens/commas).
+		return recordOut(*v.Comp)
 	case ValUnfetched:
 		panic("BUG: unfetched large value escaped the storage layer")
 	default:
@@ -399,6 +460,26 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValInterval && o.Kind == ValInterval {
 		return bool3(v.Iv.SpanCmp(o.Iv) == 0)
 	}
+	// Composite `=` is element-wise 3VL (PG row comparison, spec/design/composite.md §5): FALSE if
+	// any field is FALSE; else UNKNOWN if any field is UNKNOWN; else TRUE. So a FALSE field
+	// dominates a NULL field. Arity matches (the resolver only compares two composites of the same
+	// type). The recursion bottoms out in the field comparators.
+	if v.Kind == ValComposite && o.Kind == ValComposite {
+		a, b := *v.Comp, *o.Comp
+		anyUnknown := false
+		for i := range a {
+			switch a[i].Eq3(b[i]) {
+			case False:
+				return False
+			case Unknown:
+				anyUnknown = true
+			}
+		}
+		if anyUnknown {
+			return Unknown
+		}
+		return True
+	}
 	return Unknown
 }
 
@@ -439,6 +520,13 @@ func (v Value) Lt3(o Value) ThreeValued {
 	}
 	if v.Kind == ValInterval && o.Kind == ValInterval {
 		return bool3(v.Iv.SpanCmp(o.Iv) < 0)
+	}
+	// Composite `<` is lexicographic with PG row-comparison NULL propagation
+	// (spec/design/composite.md §5): the first field that is not equal decides via its own `<`; a
+	// field whose `=` is UNKNOWN (a NULL operand) makes the whole comparison UNKNOWN; all-equal rows
+	// are not `<`.
+	if v.Kind == ValComposite && o.Kind == ValComposite {
+		return compositeOrder3(*v.Comp, *o.Comp, false)
 	}
 	return Unknown
 }
@@ -481,6 +569,10 @@ func (v Value) Gt3(o Value) ThreeValued {
 	if v.Kind == ValInterval && o.Kind == ValInterval {
 		return bool3(v.Iv.SpanCmp(o.Iv) > 0)
 	}
+	// Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
+	if v.Kind == ValComposite && o.Kind == ValComposite {
+		return compositeOrder3(*v.Comp, *o.Comp, true)
+	}
 	return Unknown
 }
 
@@ -495,7 +587,234 @@ func (v Value) NotDistinctFrom(o Value) bool {
 	if v.Kind == ValNull || o.Kind == ValNull {
 		return v.Kind == ValNull && o.Kind == ValNull
 	}
+	// Two composites are "not distinct" iff structurally equal — NULL-safe, so a NULL field equals a
+	// NULL field (the value-level structural equality, not the 3VL Eq3).
+	if v.Kind == ValComposite && o.Kind == ValComposite {
+		return compositeValueEqual(*v.Comp, *o.Comp)
+	}
 	return v.Eq3(o) == True
+}
+
+// compositeValueEqual is structural (value-level) equality over two composite field lists
+// (spec/design/composite.md §2): same arity and every field NULL-safe-equal, recursing into nested
+// composites. NULL fields are equal here (the DISTINCT/GROUP BY rule — Null == Null is true at the
+// value level); the three-valued Eq3 differs (§5). Mirrors Rust's structural PartialEq.
+func compositeValueEqual(a, b []Value) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !a[i].NotDistinctFrom(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// compositeOrder3 is three-valued lexicographic row ordering (PG row comparison,
+// spec/design/composite.md §5), shared by Lt3 (gt=false) and Gt3 (gt=true): walk fields; the first
+// whose `=` is FALSE decides via that field's `<`/`>`; the first whose `=` is UNKNOWN (a NULL
+// operand) makes the whole comparison UNKNOWN; all-equal rows are neither `<` nor `>` (FALSE).
+// Arity matches (same composite type — the resolver's gate).
+func compositeOrder3(a, b []Value, gt bool) ThreeValued {
+	for i := range a {
+		switch a[i].Eq3(b[i]) {
+		case True:
+			continue
+		case False:
+			if gt {
+				return a[i].Gt3(b[i])
+			}
+			return a[i].Lt3(b[i])
+		case Unknown:
+			return Unknown
+		}
+	}
+	return False
+}
+
+// recordOut renders a composite's fields as PG record_out (spec/design/composite.md §8):
+// `(f1,f2,…)`. A NULL field is the empty string between delimiters; every other field is rendered
+// by its own Render and double-quoted iff it is empty or contains a delimiter / quote / backslash /
+// whitespace. Inside the quotes PostgreSQL **doubles** an embedded `"` → `""` and an embedded
+// `\` → `\\` (NOT backslash-escaping — parseRecordTokens / record_in is the exact inverse). Recurses
+// naturally — a nested composite's text contains parens/commas, so it is quoted. The spelling must
+// equal PG byte-for-byte (CLAUDE.md §8).
+func recordOut(fields []Value) string {
+	var b strings.Builder
+	b.WriteByte('(')
+	for i, f := range fields {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		if f.Kind == ValNull {
+			continue // a NULL field is the empty string between delimiters (unquoted)
+		}
+		s := f.Render()
+		if recordFieldNeedsQuote(s) {
+			b.WriteByte('"')
+			for _, ch := range s {
+				// PG doubles `"` and `\` (rowtypes.c record_out): emit the char twice.
+				if ch == '"' || ch == '\\' {
+					b.WriteRune(ch)
+				}
+				b.WriteRune(ch)
+			}
+			b.WriteByte('"')
+		} else {
+			b.WriteString(s)
+		}
+	}
+	b.WriteByte(')')
+	return b.String()
+}
+
+// parseRecordTokens is the PG record_in tokenizer (spec/design/composite.md §8) — the exact inverse
+// of recordOut. It splits the text of a composite literal `(f1,f2,…)` into its raw field tokens
+// **without** type coercion: the caller (the executor) coerces each token to its field type. A field
+// is either quoted (`"…"` with `""`→`"` and `\x`→`x` un-escaping) or unquoted (read literally up to
+// the next top-level `,`/`)`, with `\x`→`x`); an **unquoted empty** field is SQL-NULL (a nil token),
+// a quoted empty field is the empty string (a non-nil token ""). Surrounding ASCII whitespace around
+// the whole literal is ignored; whitespace *inside* an unquoted token is preserved (PG leaves
+// trimming to each field's input function). The second result is false on a malformed literal — the
+// executor maps that to 22P02 (kept error-free so value need not depend on the error type).
+func parseRecordTokens(input string) ([]*string, bool) {
+	s := strings.TrimFunc(input, func(r rune) bool { return r <= 0x7F && asciiSpace(byte(r)) })
+	runes := []rune(s)
+	pos := 0
+	peek := func() (rune, bool) {
+		if pos < len(runes) {
+			return runes[pos], true
+		}
+		return 0, false
+	}
+	next := func() (rune, bool) {
+		if pos < len(runes) {
+			r := runes[pos]
+			pos++
+			return r, true
+		}
+		return 0, false
+	}
+	if c, ok := next(); !ok || c != '(' {
+		return nil, false
+	}
+	var fields []*string
+	for {
+		var buf strings.Builder
+		quoted := false
+		present := false
+		if c, ok := peek(); ok && c == '"' {
+			quoted = true
+			present = true
+			pos++ // opening quote
+			for {
+				c, ok := next()
+				if !ok {
+					return nil, false // unterminated quoted field
+				}
+				switch c {
+				case '"':
+					if p, ok := peek(); ok && p == '"' {
+						pos++
+						buf.WriteByte('"') // doubled quote → one quote
+						continue
+					}
+					goto closedQuote // closing quote
+				case '\\':
+					e, ok := next()
+					if !ok {
+						return nil, false
+					}
+					buf.WriteRune(e)
+				default:
+					buf.WriteRune(c)
+				}
+			}
+		closedQuote:
+			// A quoted field may be followed by ASCII whitespace before the delimiter (PG).
+			for {
+				if c, ok := peek(); ok && c <= 0x7F && asciiSpace(byte(c)) {
+					pos++
+					continue
+				}
+				break
+			}
+		} else {
+			// Unquoted: read literally until a top-level `,`/`)`, processing `\x`→`x`.
+			for {
+				c, ok := peek()
+				if !ok {
+					return nil, false // missing ')'
+				}
+				if c == ',' || c == ')' {
+					break
+				}
+				if c == '\\' {
+					pos++
+					e, ok := next()
+					if !ok {
+						return nil, false
+					}
+					buf.WriteRune(e)
+					present = true
+					continue
+				}
+				buf.WriteRune(c)
+				present = true
+				pos++
+			}
+		}
+		// An unquoted empty field is SQL-NULL; a quoted (even empty) field is the string.
+		if present || quoted {
+			str := buf.String()
+			fields = append(fields, &str)
+		} else {
+			fields = append(fields, nil)
+		}
+		c, _ := next()
+		switch c {
+		case ',':
+			continue
+		case ')':
+			goto done
+		default:
+			return nil, false
+		}
+	}
+done:
+	// Nothing but trailing nothing may follow the closing ')'.
+	if pos != len(runes) {
+		return nil, false
+	}
+	return fields, true
+}
+
+// asciiSpace reports whether b is a C-locale whitespace byte (isspace): space, tab, newline,
+// vertical tab, form feed, carriage return.
+func asciiSpace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\v', '\f', '\r':
+		return true
+	}
+	return false
+}
+
+// recordFieldNeedsQuote reports whether a record_out field token must be double-quoted: the empty
+// string, or any token containing a comma, parenthesis, double-quote, backslash, or whitespace
+// (C-locale isspace: space, tab, newline, vertical tab, form feed, carriage return) — PostgreSQL's
+// exact rule (spec/design/composite.md §8).
+func recordFieldNeedsQuote(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, c := range s {
+		switch c {
+		case '"', '\\', '(', ')', ',', ' ', '\t', '\n', '\v', '\f', '\r':
+			return true
+		}
+	}
+	return false
 }
 
 // --- boolean Value <-> ThreeValued bridges, and the Kleene connectives ----------

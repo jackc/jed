@@ -5,7 +5,10 @@ import "strings"
 // Column is a column definition: name, declared type, nullability, primary-key flag.
 type Column struct {
 	Name string
-	Type ScalarType
+	// Type is the column's declared type — a built-in scalar or a user-defined composite
+	// (spec/design/composite.md). The open Type wrapper (CLAUDE.md §4): scalar-only call sites
+	// read Type.ScalarTy(); the value codec / resolver branch on Type.IsComposite() (S2+).
+	Type Type
 	// Decimal is the numeric(p,s) typmod for a decimal column, or nil for a non-decimal column
 	// OR an unconstrained numeric (spec/design/decimal.md §2). A constrained decimal column
 	// coerces stored values to this precision/scale.
@@ -64,6 +67,85 @@ type IndexDef struct {
 	Name    string
 	Columns []int
 	Unique  bool
+}
+
+// CompositeType is a user-defined composite (row) type (spec/design/composite.md): a named,
+// ordered list of typed fields, living in the database's type catalog (a database-level object,
+// not per-table). Created by CREATE TYPE name AS (field type, …), referenced by name from a
+// column's Type. Recursive — a field's Type may itself be a composite (a nested composite,
+// persisted by name; spec/fileformat/format.md *Composite-type entry*).
+type CompositeType struct {
+	// Name is the type name (original case — round-trips what the user typed); looked up
+	// case-insensitively.
+	Name string
+	// Fields are the fields in declaration order (≥ 1).
+	Fields []CompositeField
+}
+
+// CompositeField is one field of a composite type: its name, type, and declared nullability.
+type CompositeField struct {
+	Name string
+	Type Type
+	// Decimal is the decimal numeric(p,s) typmod when Type is decimal, else nil (mirrors Column).
+	Decimal *DecimalTypmod
+	// NotNull is whether the field was declared NOT NULL.
+	NotNull bool
+}
+
+// ColType is a fully-resolved storage/codec column type (spec/design/composite.md §4): a scalar,
+// or a composite resolved to the codec/coercion tree of its fields. Built ONCE from a catalog Type
+// against the snapshot's composite-type definitions (ResolveColType) and held by the TableStore, so
+// the value codec and store-coercion never re-walk the type catalog on every row. Recursive — a
+// composite field may itself be composite. Go has no sum types, so the composite arm is a non-nil
+// Fields slice discriminant: Composite == false means scalar (read Scalar); Composite == true means
+// a resolved composite (read Name/Fields). The codec reads only the scalar / field structure; the
+// field Typmod / NotNull are consulted by store-coercion (executor).
+type ColType struct {
+	// Composite discriminates: false ⇒ a scalar (Scalar is meaningful); true ⇒ a composite
+	// (Name/Fields are meaningful).
+	Composite bool
+	// Scalar is the inner scalar type when Composite == false.
+	Scalar ScalarType
+	// Name is the (original-case) composite type name when Composite == true, used in
+	// store-coercion error messages.
+	Name string
+	// Fields is the composite type's resolved fields in declaration order when Composite == true.
+	Fields []ColField
+}
+
+// ColField is one resolved field of a composite ColType — its name, recursively-resolved type, the
+// decimal typmod (when the field is decimal), and declared nullability (mirrors CompositeField, but
+// with the type fully resolved for the codec/coercion path).
+type ColField struct {
+	Name    string
+	Type    ColType
+	Typmod  *DecimalTypmod
+	NotNull bool
+}
+
+// ScalarColType wraps a scalar type as a (scalar) ColType.
+func ScalarColType(s ScalarType) ColType { return ColType{Scalar: s} }
+
+// ResolveColType resolves a catalog Type into a self-contained ColType against the database's
+// composite definitions (keyed by lowercased name, the Snapshot.types map). A composite reference is
+// looked up case-insensitively and recursively resolved; the lookup is guaranteed to succeed because
+// validateCompositeTypes (the two-pass load / CREATE TYPE gate) proved every reference exists and the
+// graph is acyclic before any store is built (spec/design/composite.md §3).
+func ResolveColType(ty Type, types map[string]*CompositeType) ColType {
+	if ty.Comp == nil {
+		return ColType{Scalar: ty.Scalar}
+	}
+	def := types[strings.ToLower(ty.Comp.Name)]
+	fields := make([]ColField, len(def.Fields))
+	for i, f := range def.Fields {
+		fields[i] = ColField{
+			Name:    f.Name,
+			Type:    ResolveColType(f.Type, types),
+			Typmod:  f.Decimal,
+			NotNull: f.NotNull,
+		}
+	}
+	return ColType{Composite: true, Name: def.Name, Fields: fields}
 }
 
 // CheckConstraint is one CHECK constraint: its (resolved, unique-per-table) name, its

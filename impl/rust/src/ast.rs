@@ -10,6 +10,8 @@ pub enum Statement {
     DropTable(DropTable),
     CreateIndex(CreateIndex),
     DropIndex(DropIndex),
+    CreateType(CreateType),
+    DropType(DropType),
     Insert(Insert),
     Select(Select),
     /// A set operation (`UNION`/`INTERSECT`/`EXCEPT`) combining two query expressions
@@ -121,6 +123,38 @@ pub struct DropIndex {
     pub name: String,
 }
 
+/// `CREATE TYPE <name> AS ( field type [NOT NULL] [, …] )` — a user-defined composite (row)
+/// type (spec/design/composite.md, grammar.md). Execution resolves each field's type (built-in
+/// scalar or a previously-defined composite — 42704 if unknown), rejects a duplicate type name
+/// (42710), and registers it in the catalog. Named composites only this slice; anonymous
+/// `record` is not supported.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CreateType {
+    pub name: String,
+    pub fields: Vec<TypeFieldDef>,
+}
+
+/// One field of a `CREATE TYPE` definition: its name, its type as written (a built-in scalar
+/// alias or a composite type name), an optional `numeric(p,s)` modifier, and an explicit
+/// `NOT NULL`. Resolved at execution (mirrors `ColumnDef`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TypeFieldDef {
+    pub name: String,
+    pub type_name: String,
+    pub type_mod: Option<TypeMod>,
+    pub not_null: bool,
+}
+
+/// `DROP TYPE [IF EXISTS] <name> [RESTRICT]` — remove a composite type (spec/design/composite.md
+/// §7). RESTRICT (the default and only behavior this slice) fails with 2BP01 if a table column
+/// or another composite type still references it; `CASCADE` is `0A000`. A missing type without
+/// `IF EXISTS` is 42704.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DropType {
+    pub name: String,
+    pub if_exists: bool,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ColumnDef {
     pub name: String,
@@ -190,6 +224,10 @@ pub enum InsertValue {
     /// A bind parameter `$N` (1-based); typed against the target column at resolve.
     Param(u32),
     Default,
+    /// A `ROW(…)` constructor in a VALUES slot (spec/design/composite.md §1) — a composite value
+    /// for a composite target column. Fields are themselves `InsertValue`s (a literal, a `$N`, or a
+    /// nested `ROW(…)`); `DEFAULT` is not a valid field (only a top-level slot takes a default).
+    Row(Vec<InsertValue>),
 }
 
 /// `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each assignment's
@@ -363,6 +401,26 @@ pub enum Expr {
         name: String,
     },
     Literal(Literal),
+    /// A `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Builds a row value
+    /// from the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The
+    /// bare parenthesized `(a, b)` form is deferred (`0A000`) — only the keyword form is parsed.
+    Row(Vec<Expr>),
+    /// Field selection `(expr).field` (spec/design/composite.md §S4) — the value of one named field
+    /// of a composite `base`. The parser produces this for a `.name` postfix on a parenthesized /
+    /// `ROW(…)` / cast / qualified-column base; a bare `a.b` stays `QualifiedColumn` and only falls
+    /// back to field access at resolve when `a` is no relation but a composite column (the ambiguity
+    /// rule — table.column first, then column.field). Field lookup is case-insensitive; an unknown
+    /// field is 42703, a non-composite base 42809.
+    FieldAccess {
+        base: Box<Expr>,
+        field: String,
+    },
+    /// Whole-row expansion `(expr).*` (spec/design/composite.md §S4) — expands a composite `base`
+    /// into one output column per field, in declaration order. Valid only in a SELECT/RETURNING
+    /// projection list (where `*` expands); in any scalar expression position it is 42601.
+    FieldStar {
+        base: Box<Expr>,
+    },
     /// A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
     /// `type 'string'` form, equal to `CAST('string' AS type)` over a string-literal operand.
     /// `type_name` names the target scalar (resolved by `ScalarType::from_name`; unknown → 42704)

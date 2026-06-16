@@ -420,7 +420,7 @@ where_clause   ::= "WHERE" expr
  * ../functions/catalog.toml (the `precedence` field) — the hand-written parsers
  * and that table must agree (see ../design/functions.md). Levels:
  *   OR  <  AND  <  NOT  <  comparison/IS NULL  <  additive  <  multiplicative
- *       <  unary minus  <  postfix `::` cast  <  primary
+ *       <  unary minus  <  postfix (`::` cast, `.field`/`.*` field selection)  <  primary
  */
 expr           ::= or_expr
 
@@ -483,8 +483,19 @@ unary          ::= "-" unary
  * leading-`-`-of-a-numeric-literal fold (../design/grammar.md §4) is therefore suppressed when a `::`
  * immediately follows the literal, so the cast applies to the unsigned magnitude first.
  *   A bind parameter operand takes the cast TARGET as its inferred type — `$1 :: int` declares `$1`
- * as int (../design/api.md §5), the parameter-typing case the `CAST(... AS ...)` spelling shares. */
-postfix        ::= primary ("::" type_name)*
+ * as int (../design/api.md §5), the parameter-typing case the `CAST(... AS ...)` spelling shares.
+ *   COMPOSITE FIELD SELECTION (../design/composite.md §1, §S4): ".field" selects one field of a
+ * composite base and ".*" expands all its fields (projection list only); both are postfix operators
+ * at this level. Field selection is PARENS-REQUIRED (PostgreSQL): ".field"/".*" applies only to a
+ * PARENTHESIZED base — "(home).zip", "(t.home).zip", "(ROW(1,2)).f1" — and chains on a prior field
+ * access ("(c).a.b"). The unparenthesized "a.b"/"a.b.c" is consumed by column_ref as a (multi-part)
+ * column reference, NEVER field access: its first identifier must name a relation, else 42P01
+ * (there is no bare "col.field" fallback — PG rejects every unparenthesized field reference). Field
+ * lookup is case-insensitive; an unknown field is 42703, a non-composite base 42809, ".*" in a
+ * scalar position 0A000. NB: the grammar below writes the postfix uniformly, but the parens-required
+ * rule is a hand-written-parser SEMANTIC gate (a "field_accessible" flag set true only for a
+ * parenthesized primary and after each ".field"), not expressible as pure EBNF. */
+postfix        ::= primary ( "::" type_name | "." identifier | "." "*" )*
 
 /* A "(" begins either a parenthesized expression "(" expr ")" or a SCALAR SUBQUERY
  * "(" query_expr ")" (../design/grammar.md §26) — disambiguated by a leading "SELECT" after the

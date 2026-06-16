@@ -323,3 +323,71 @@ export function promoteFloat(a: ScalarType, b: ScalarType): ScalarType {
 export function roundToWidth(ty: ScalarType, v: number): number {
   return ty === "float32" ? Math.fround(v) : v;
 }
+
+// Type is a column / value type: either a built-in ScalarType or a by-name reference to a
+// user-defined COMPOSITE (row) type (spec/design/composite.md). This is the *open* wrapper above
+// the closed ScalarType union (CLAUDE.md §4): the scalar set stays a fixed compiled-in union, but
+// a column type can now also name a composite living in the database's type catalog. Modeled as a
+// discriminated union (keyed on `kind`, like Value), with free-function helpers below to match the
+// boring/explicit style (CLAUDE.md §10) — never methods on the union. As of slice S1 no composite
+// can yet be created; scalar-only paths call typeScalar(t).
+export type Type =
+  | { kind: "scalar"; scalar: ScalarType }
+  | { kind: "composite"; name: string };
+
+// scalarT wraps a ScalarType as a Type.
+export function scalarT(s: ScalarType): Type {
+  return { kind: "scalar", scalar: s };
+}
+
+// compositeT makes a by-name reference to a composite type in the database's type catalog. The
+// display name is case-preserved; lookups lowercase it (the table-name convention).
+export function compositeT(name: string): Type {
+  return { kind: "composite", name };
+}
+
+// typeScalar returns the inner scalar type. Scalar-only paths (the integer codec, the scalar value
+// codec, the scalar resolver) call this; a composite column reaches those paths only after the
+// caller has branched on isCompositeType, so a composite here is an engine-invariant violation —
+// it throws (mirroring Rust's unreachable!). In S1 no composite Type exists yet.
+export function typeScalar(t: Type): ScalarType {
+  if (t.kind === "scalar") return t.scalar;
+  throw new Error(
+    `composite type ${t.name} used where a scalar was expected; the composite path must branch before this point (spec/design/composite.md)`,
+  );
+}
+
+// typeAsScalar returns the inner scalar type, or undefined for a composite.
+export function typeAsScalar(t: Type): ScalarType | undefined {
+  return t.kind === "scalar" ? t.scalar : undefined;
+}
+
+// isCompositeType reports whether this is a composite (user-defined row) type.
+export function isCompositeType(t: Type): boolean {
+  return t.kind === "composite";
+}
+
+// typeCanonicalName is this type's canonical name for output / error messages — the scalar's
+// canonical name, or the composite's name.
+export function typeCanonicalName(t: Type): string {
+  return t.kind === "scalar" ? canonicalName(t.scalar) : t.name;
+}
+
+// Scalar-predicate delegates. A composite answers false to every scalar predicate — it is none of
+// these families — so keyability checks (isInteger || isUuid || …) correctly reject a composite
+// (0A000), and family branches fall through to their composite handling.
+export function typeIsInteger(t: Type): boolean {
+  return t.kind === "scalar" && isInteger(t.scalar);
+}
+export function typeIsDecimal(t: Type): boolean {
+  return t.kind === "scalar" && isDecimal(t.scalar);
+}
+export function typeIsUuid(t: Type): boolean {
+  return t.kind === "scalar" && isUuid(t.scalar);
+}
+export function typeIsTimestamp(t: Type): boolean {
+  return t.kind === "scalar" && isTimestamp(t.scalar);
+}
+export function typeIsTimestamptz(t: Type): boolean {
+  return t.kind === "scalar" && isTimestamptz(t.scalar);
+}

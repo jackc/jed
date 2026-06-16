@@ -17,10 +17,10 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::bufferpool::BufferPool;
+use crate::catalog::ColType;
 use crate::error::Result;
 use crate::pager::Pager;
 use crate::pmap::Node;
-use crate::types::ScalarType;
 
 /// The default memory budget for the resident leaf cache, in **bytes** (256 MiB) — the
 /// [`crate::OpenOptions::cache_bytes`] default (spec/design/pager.md §3, api.md §2.1). Sized so the
@@ -57,7 +57,7 @@ impl SharedPaging {
     /// the cached `Arc`, a miss reads + decodes the page (with this table's `col_types`) and caches
     /// it, evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global
     /// page id with a caller-supplied decoder is consistent (pager.md §4).
-    pub(crate) fn fault_leaf(&self, page: u32, col_types: &[ScalarType]) -> Result<Arc<Node>> {
+    pub(crate) fn fault_leaf(&self, page: u32, col_types: &[ColType]) -> Result<Arc<Node>> {
         let mut pool = self.pool.lock().expect("buffer pool mutex poisoned");
         pool.get_or_load(page, || {
             let block = self

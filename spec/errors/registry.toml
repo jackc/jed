@@ -126,6 +126,17 @@ name = "in_failed_sql_transaction"
 class = "invalid transaction state"
 template = "current transaction is aborted, commands ignored until end of transaction block"
 
+# --- dependent objects still exist (class 2B) -------------------------------
+# Raised by `DROP TYPE ... RESTRICT` (the default) when a table column or another
+# composite type still references the type being dropped (spec/design/composite.md §7).
+# PG's exact SQLSTATE for this dependency error; `CASCADE` is not supported this slice
+# (0A000), so RESTRICT is the only behavior and this is always the dependents error.
+[[error]]
+code = "2BP01"
+name = "dependent_objects_still_exist"
+class = "dependent objects still exist"
+template = "cannot drop type {name} because other objects depend on it: {detail}"
+
 # --- syntax error / access rule violation (class 42) ------------------------
 [[error]]
 code = "42601"

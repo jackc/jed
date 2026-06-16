@@ -11,7 +11,7 @@
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
 import type { Expr } from "./ast.ts";
-import { type CheckConstraint, type Column, type DefaultExpr, type IndexDef, type Table, pkIndices } from "./catalog.ts";
+import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type IndexDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
@@ -25,6 +25,7 @@ import { TableStore, type Row } from "./storage.ts";
 import {
   type DecimalTypmod,
   type ScalarType,
+  compositeT,
   isBool,
   isBytea,
   isText,
@@ -32,6 +33,8 @@ import {
   isTimestamptz,
   isInterval,
   isUuid,
+  scalarT,
+  typeScalar,
   widthBytes,
 } from "./types.ts";
 import {
@@ -39,6 +42,7 @@ import {
   type Value,
   boolValue,
   byteaValue,
+  compositeValue,
   decimalValue,
   float32Value,
   float64Value,
@@ -51,7 +55,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 8; // on-disk format version (8 = per-column expression-default flag bit3 + expr-text; v7 added a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
+const FORMAT_VERSION = 9; // on-disk format version (9 = kind-tagged catalog entries + composite-type entries; v8 added per-column expression-default flag bit3 + expr-text; v7 added a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -185,15 +189,51 @@ function pageCrc(page: Uint8Array): number {
   return (crc32Update(c, page.subarray(PAGE_HEADER)) ^ 0xffffffff) >>> 0;
 }
 
-// encodeValue is the value codec (format.md): a 1-byte presence tag (0x01 = NULL), then the
-// type's present-value body. Integers reuse the order-preserving key encoding; text is
-// where the seam diverges — a stored text value needs no ordering, so it is a compact u16
-// byte-length + UTF-8 bytes (collation C, verbatim). A text value whose UTF-8 length exceeds
-// 0xFFFF is unsupported; in practice it also exceeds a page and is caught by the
-// oversized-item rule in packing (0A000), so the u16 write is sound for every supported page
-// size (spec/fileformat/format.md). boolean is a single bool-byte body — 0x00 false, 0x01
-// true (types.md §9).
-function encodeValue(ty: ScalarType, v: Value): Uint8Array {
+// encodeValue is the value codec (format.md): a 1-byte presence tag (0x01 = NULL), then the type's
+// present-value body. A scalar dispatches to encodeScalar; a COMPOSITE value (spec/design/composite.md
+// §4) is the shared presence tag then a body of `null-bitmap ‖ each present field's value-codec body`
+// (no per-field tag — the bitmap carries presence): see encodeCompositeBody. Recurses for nested
+// composites.
+function encodeValue(ty: ColType, v: Value): Uint8Array {
+  if (ty.kind === "scalar") return encodeScalar(ty.scalar, v);
+  // ty is a composite column type.
+  if (v.kind === "null") return Uint8Array.of(0x01);
+  if (v.kind !== "composite") throw new Error("BUG: a non-composite value in a composite column");
+  const body = encodeCompositeBody(ty.fields, v.fields);
+  const out = new Uint8Array(1 + body.length);
+  out[0] = 0x00; // present
+  out.set(body, 1);
+  return out;
+}
+
+// encodeCompositeBody builds a composite value's BODY (after the 0x00 present tag,
+// spec/design/composite.md §4): a null bitmap of ceil(field_count/8) bytes (MSB-first — field i is
+// bit 0x80 >> (i%8) of byte i/8; a set bit = NULL) followed by each PRESENT field's value-codec body
+// in declaration order. A NULL field contributes zero body bytes; a present field's body is its
+// encodeValue minus the leading presence tag (a nested composite recurses).
+function encodeCompositeBody(fields: ColField[], vals: Value[]): Uint8Array {
+  const nbytes = Math.ceil(fields.length / 8);
+  const bitmap = new Uint8Array(nbytes);
+  const bodies: Uint8Array[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const val = vals[i]!;
+    if (val.kind === "null") {
+      bitmap[i >> 3]! |= 0x80 >> (i % 8);
+    } else {
+      bodies.push(encodeValue(fields[i]!.type, val).subarray(1)); // strip the leading presence tag
+    }
+  }
+  return concat([bitmap, ...bodies]);
+}
+
+// encodeScalar is the scalar value codec (the body of encodeValue for a scalar ColType). A 1-byte
+// presence tag (0x01 = NULL), then the type's present-value body. Integers reuse the order-preserving
+// key encoding; text is where the seam diverges — a stored text value needs no ordering, so it is a
+// compact u16 byte-length + UTF-8 bytes (collation C, verbatim). A text value whose UTF-8 length
+// exceeds 0xFFFF is unsupported; in practice it also exceeds a page and is caught by the
+// oversized-item rule in packing (0A000), so the u16 write is sound for every supported page size
+// (spec/fileformat/format.md). boolean is a single bool-byte body — 0x00 false, 0x01 true (types.md §9).
+function encodeScalar(ty: ScalarType, v: Value): Uint8Array {
   if (v.kind === "null") return encodeNullable(ty, null);
   if (v.kind === "unfetched") {
     // An unfetched reference is resolved before any encode/plan (the scan layer for reads,
@@ -324,9 +364,14 @@ function concat(parts: Uint8Array[]): Uint8Array {
 }
 
 // isSpillable reports whether a value of this type can be stored out-of-line (a variable-length
-// type). Fixed-width types are tiny and always stay inline (spec/design/large-values.md §12).
-function isSpillable(ty: ScalarType): boolean {
-  return isText(ty) || isBytea(ty) || ty === "decimal";
+// type). Fixed-width scalars are tiny and always stay inline (spec/design/large-values.md §12). A
+// COMPOSITE is treated as spillable — its opaque inline body spills via the same overflow + LZ4 path
+// when a record exceeds RECORD_MAX (spec/design/composite.md §4); a small composite is never actually
+// chosen by the plan.
+function isSpillable(ty: ColType): boolean {
+  if (ty.kind === "composite") return true;
+  const s = ty.scalar;
+  return isText(s) || isBytea(s) || s === "decimal";
 }
 
 // recordMaxFor is the largest a single record may serialize to and still satisfy the B-tree split
@@ -358,7 +403,7 @@ type RecordPlan = {
 // beats their pointer, moving the bytes pass 1 chose (compressed → a 0x04 chain of the
 // compressed block) until the record fits. Shared by the serializer and recordSize (the B-tree
 // split weight): in-memory node boundaries must match the serialized pages.
-function planDispositions(colTypes: ScalarType[], key: Uint8Array, row: Row, capacity: number): RecordPlan {
+function planDispositions(colTypes: ColType[], key: Uint8Array, row: Row, capacity: number): RecordPlan {
   const inline = colTypes.map((ty, i) => encodeValue(ty, row[i]!).length);
   const plan: RecordPlan = {
     disp: new Array<ValueDisp>(colTypes.length).fill("inline"),
@@ -429,7 +474,7 @@ function planDispositions(colTypes: ScalarType[], key: Uint8Array, row: Row, cap
 // its compressed inline form, an externalized one its fixed pointer size (large-values.md
 // §12/§13). Must equal what the serializer produces, so in-memory node boundaries match
 // serialized page boundaries.
-export function recordSize(colTypes: ScalarType[], key: Uint8Array, row: Row, capacity: number): number {
+export function recordSize(colTypes: ColType[], key: Uint8Array, row: Row, capacity: number): number {
   return planDispositions(colTypes, key, row, capacity).size;
 }
 
@@ -440,7 +485,7 @@ export function recordSize(colTypes: ScalarType[], key: Uint8Array, row: Row, ca
 // ceil(raw/capacity) value_decompress slabs per compressed stored value (inline- or external-).
 // Zero/zero for a fully-inline-plain record or an untouched column.
 export function recordScanUnits(
-  colTypes: ScalarType[],
+  colTypes: ColType[],
   key: Uint8Array,
   row: Row,
   capacity: number,
@@ -492,7 +537,7 @@ export function recordScanUnits(
 // large-values.md §13). Charged once per stored row version at the statement's write site,
 // never for B-tree re-encodes.
 export function recordCompressUnits(
-  colTypes: ScalarType[],
+  colTypes: ColType[],
   key: Uint8Array,
   row: Row,
   capacity: number,
@@ -502,26 +547,35 @@ export function recordCompressUnits(
 
 // valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
 // externalized (large-values.md §12): raw UTF-8 for text, raw bytes for bytea, the decimal body
-// (encoding minus its presence tag) for decimal. Only spillable types reach here.
-function valuePayload(ty: ScalarType, v: Value): Uint8Array {
+// (encoding minus its presence tag) for decimal, and for a COMPOSITE its body — the encoding minus the
+// leading presence tag, i.e. the null bitmap + present-field bodies (spec/design/composite.md §4).
+// Only spillable types reach here.
+function valuePayload(ty: ColType, v: Value): Uint8Array {
+  if (ty.kind === "composite" && v.kind === "composite") return encodeCompositeBody(ty.fields, v.fields);
   if (v.kind === "text") return UTF8.encode(v.text);
   if (v.kind === "bytea") return v.bytes;
-  if (v.kind === "decimal") return encodeValue(ty, v).subarray(1); // strip the presence tag
+  if (v.kind === "decimal" && ty.kind === "scalar") return encodeScalar(ty.scalar, v).subarray(1); // strip the presence tag
   throw engineError("data_corrupted", "only spillable values are externalized");
 }
 
 // valueFromPayload reconstructs a value from the P(v) content gathered from its overflow chain
 // (inverse of valuePayload) — large-values.md §12.
-function valueFromPayload(ty: ScalarType, payload: Uint8Array): Value {
-  if (isText(ty)) {
+function valueFromPayload(ty: ColType, payload: Uint8Array): Value {
+  if (ty.kind === "composite") {
+    // A composite's payload is its body (bitmap + present-field bodies); decode it with a fresh
+    // cursor (spec/design/composite.md §4).
+    return readCompositeBody(ty, payload, { pos: 0 });
+  }
+  const s = ty.scalar;
+  if (isText(s)) {
     try {
       return textValue(UTF8_DECODE.decode(payload));
     } catch {
       throw engineError("data_corrupted", "non-UTF-8 text value");
     }
   }
-  if (isBytea(ty)) return byteaValue(payload.slice());
-  if (ty === "decimal") return decodeDecimalBody(payload, { pos: 0 });
+  if (isBytea(s)) return byteaValue(payload.slice());
+  if (s === "decimal") return decodeDecimalBody(payload, { pos: 0 });
   throw engineError("data_corrupted", "a non-spillable type was stored external");
 }
 
@@ -534,22 +588,21 @@ type OverflowPageOut = { index: number; itemCount: number; nextPage: number; pay
 // inline body. capacity is the page payload (the slab size + the spill-plan input). Shared by the
 // whole-image (serializeNode) and incremental (serializeDirty) writers, which differ only in `take`.
 function encodeRecord(
-  table: Table,
+  colTypes: ColType[],
   key: Uint8Array,
   row: Row,
   capacity: number,
   take: () => number,
   ovf: OverflowPageOut[],
 ): Uint8Array {
-  const colTypes = table.columns.map((c) => c.type);
   const plan = planDispositions(colTypes, key, row, capacity);
   const w = new ByteWriter();
   w.u16(key.length);
   w.bytes(key);
-  for (let i = 0; i < table.columns.length; i++) {
+  for (let i = 0; i < colTypes.length; i++) {
     switch (plan.disp[i]) {
       case "external": {
-        const payload = valuePayload(table.columns[i]!.type, row[i]!);
+        const payload = valuePayload(colTypes[i]!, row[i]!);
         const first = writeOverflowChain(payload, capacity, take, ovf);
         w.u8(TAG_EXTERNAL);
         w.u32(first);
@@ -557,7 +610,7 @@ function encodeRecord(
         break;
       }
       case "inlineComp": {
-        const rawLen = valuePayload(table.columns[i]!.type, row[i]!).length;
+        const rawLen = valuePayload(colTypes[i]!, row[i]!).length;
         const comp = plan.comp[i]!;
         w.u8(TAG_INLINE_COMP);
         w.u32(rawLen);
@@ -567,7 +620,7 @@ function encodeRecord(
       }
       case "externalComp": {
         // The chain carries the COMPRESSED block (its page count follows comp size).
-        const rawLen = valuePayload(table.columns[i]!.type, row[i]!).length;
+        const rawLen = valuePayload(colTypes[i]!, row[i]!).length;
         const comp = plan.comp[i]!;
         const first = writeOverflowChain(comp, capacity, take, ovf);
         w.u8(TAG_EXTERNAL_COMP);
@@ -577,7 +630,7 @@ function encodeRecord(
         break;
       }
       default:
-        w.bytes(encodeValue(table.columns[i]!.type, row[i]!));
+        w.bytes(encodeValue(colTypes[i]!, row[i]!));
     }
   }
   return w.toBytes();
@@ -617,7 +670,20 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
     const cn = UTF8.encode(col.name);
     w.u16(cn.length);
     w.bytes(cn);
-    w.u8(typeCodeForScalar(col.type));
+    if (col.type.kind === "composite") {
+      // A composite column (v9): type_code 14, then flags, then the type name in the typmod slot
+      // (spec/fileformat/format.md). Forward-ready — composite columns are not produced this slice
+      // (composite.md §12), but the encoder handles the case so a later-slice file writes cleanly.
+      // Composite columns carry no default this slice, so flags bits 2/3 are 0.
+      w.u8(14);
+      w.u8(col.notNull ? 0b10 : 0);
+      const tn = UTF8.encode(col.type.name);
+      w.u16(tn.length);
+      w.bytes(tn);
+      continue;
+    }
+    const s = typeScalar(col.type);
+    w.u8(typeCodeForScalar(s));
     // bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is the
     // single authority; the bit is reserved, written 0 (spec/fileformat/format.md).
     let flags = 0;
@@ -629,7 +695,7 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
     w.u8(flags);
     // A decimal column appends its typmod (precision, scale) — only for type_code 6, so
     // non-decimal entries are byte-unchanged (format.md). precision 0 = unconstrained numeric.
-    if (col.type === "decimal") {
+    if (s === "decimal") {
       w.u16(col.decimal ? col.decimal.precision : 0);
       w.u16(col.decimal ? col.decimal.scale : 0);
     }
@@ -639,7 +705,9 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
     // (flags bit3, v8) instead appends its expr-text (u16 length + UTF-8) there, the same token
     // rendering a CHECK uses — bit2/bit3 are exclusive.
     if (col.default !== null) {
-      w.bytes(encodeValue(col.type, col.default));
+      // A column DEFAULT is always a scalar value (composite columns carry no default this slice —
+      // composite.md §12), so encode the scalar body directly.
+      w.bytes(encodeScalar(s, col.default));
     } else if (col.defaultExpr !== null) {
       const et = UTF8.encode(col.defaultExpr.exprText);
       w.u16(et.length);
@@ -680,6 +748,73 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
   }
   w.u32(rootDataPage);
   return w.toBytes();
+}
+
+// compositeTypeEntryBytes serializes a composite-type catalog entry's BODY (after its
+// entry_kind = 1 byte): name, field count, then per field — name, type code, [type name when code
+// 14 (nested composite)], flags (bit0 not_null), [decimal typmod when code 6]
+// (spec/fileformat/format.md *Composite-type entry*).
+function compositeTypeEntryBytes(ct: CompositeType): Uint8Array {
+  const w = new ByteWriter();
+  const nameB = UTF8.encode(ct.name);
+  w.u16(nameB.length);
+  w.bytes(nameB);
+  w.u16(ct.fields.length);
+  for (const f of ct.fields) {
+    const fn = UTF8.encode(f.name);
+    w.u16(fn.length);
+    w.bytes(fn);
+    if (f.type.kind === "composite") {
+      w.u8(14);
+      const tn = UTF8.encode(f.type.name);
+      w.u16(tn.length);
+      w.bytes(tn);
+    } else {
+      w.u8(typeCodeForScalar(f.type.scalar));
+    }
+    w.u8(f.notNull ? 0b1 : 0);
+    if (f.type.kind === "scalar" && f.type.scalar === "decimal") {
+      w.u16(f.decimal ? f.decimal.precision : 0);
+      w.u16(f.decimal ? f.decimal.scale : 0);
+    }
+  }
+  return w.toBytes();
+}
+
+// decodeCompositeTypeEntry decodes a composite-type catalog entry's body (inverse of
+// compositeTypeEntryBytes); the caller has already consumed the entry_kind byte. Nested composite
+// fields hold the referenced type's NAME (resolved/validated after the whole catalog is read — the
+// two-pass load).
+function decodeCompositeTypeEntry(buf: Uint8Array, cur: Cursor): CompositeType {
+  const name = readString(buf, cur);
+  const fieldCount = readU16(buf, cur);
+  const fields: CompositeField[] = [];
+  for (let i = 0; i < fieldCount; i++) {
+    const fname = readString(buf, cur);
+    const tc = readU8(buf, cur);
+    let fty;
+    let decimal: DecimalTypmod | null = null;
+    if (tc === 14) {
+      const tn = readString(buf, cur);
+      fty = compositeT(tn);
+    } else {
+      const s = scalarForTypeCode(tc);
+      if (s === undefined) throw engineError("data_corrupted", "unknown field type code");
+      fty = scalarT(s);
+    }
+    const flags = readU8(buf, cur);
+    if ((flags & ~0b1) !== 0) {
+      throw engineError("data_corrupted", "reserved composite field flag set");
+    }
+    const notNull = (flags & 0b1) !== 0;
+    if (fty.kind === "scalar" && fty.scalar === "decimal") {
+      const precision = readU16(buf, cur);
+      const scale = readU16(buf, cur);
+      if (precision !== 0) decimal = { precision, scale };
+    }
+    fields.push({ name: fname, type: fty, decimal, notNull });
+  }
+  return { name, fields };
 }
 
 // pack greedily packs item sizes into pages of capacity `capacity`, returning groups of
@@ -736,13 +871,14 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   const body: BodyPage[] = [];
   const rootDataPage: number[] = new Array(keys.length).fill(0);
   const indexRoots: number[][] = keys.map(() => []);
-  // Index trees have no value columns — encode against an empty pseudo-table.
-  const indexTable: Table = { name: "", columns: [], pk: [], checks: [], indexes: [] };
+  // Index records are the key alone — no value columns, so they encode against an empty colTypes.
+  const indexColTypes: ColType[] = [];
   let nextIndex = ROOT_PAGE;
   for (let ti = 0; ti < keys.length; ti++) {
-    const root = snap.stores.get(keys[ti]!)!.treeRoot();
+    const store = snap.stores.get(keys[ti]!)!;
+    const root = store.treeRoot();
     if (root !== null) {
-      const r = serializeNode(root, snap.tables.get(keys[ti]!)!, capacity, nextIndex, body);
+      const r = serializeNode(root, store.columnTypes(), capacity, nextIndex, body);
       rootDataPage[ti] = r.index;
       nextIndex = r.next;
     }
@@ -752,7 +888,7 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
       let ir = 0;
       const iroot = snap.indexStore(idx.name.toLowerCase()).treeRoot();
       if (iroot !== null) {
-        const r = serializeNode(iroot, indexTable, capacity, nextIndex, body);
+        const r = serializeNode(iroot, indexColTypes, capacity, nextIndex, body);
         ir = r.index;
         nextIndex = r.next;
       }
@@ -760,11 +896,19 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
     }
   }
 
-  // The catalog chain follows the data; its head is the relocatable root_page.
+  // The catalog chain follows the data; its head is the relocatable root_page. Each entry is
+  // kind-tagged (v9): composite-type entries (kind 1) first in lowercased-name order, then table
+  // entries (kind 0) — spec/fileformat/format.md.
   const catRoot = nextIndex;
-  const entrySizes = keys.map((k) =>
-    tableEntryBytes(snap.tables.get(k)!, 0, snap.tables.get(k)!.indexes.map(() => 0)).length,
-  );
+  const catEntries: Uint8Array[] = [];
+  for (const ct of snap.compositeTypesSorted()) {
+    catEntries.push(concat([Uint8Array.of(1), compositeTypeEntryBytes(ct)]));
+  }
+  for (let ti = 0; ti < keys.length; ti++) {
+    const t = snap.tables.get(keys[ti]!)!;
+    catEntries.push(concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!)]));
+  }
+  const entrySizes = catEntries.map((e) => e.length);
   const catGroups = pack(entrySizes, capacity);
   const pageCount = catRoot + catGroups.length;
 
@@ -785,9 +929,7 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
     const group = catGroups[gi]!;
     const index = catRoot + gi;
     const next = gi + 1 < catGroups.length ? index + 1 : 0;
-    const parts = group.map((ti) =>
-      tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!, indexRoots[ti]!),
-    );
+    const parts = group.map((ei) => catEntries[ei]!);
     writePage(image, ps, index, PAGE_CATALOG, group.length, next, concat(parts));
   }
 
@@ -804,7 +946,7 @@ type BodyPage = { index: number; pageType: number; itemCount: number; nextPage: 
 // whose payload would exceed the page is an oversized record (over RECORD_MAX) → feature_not_supported.
 function serializeNode(
   n: PNode,
-  table: Table,
+  colTypes: ColType[],
   capacity: number,
   nextIndex: number,
   body: BodyPage[],
@@ -816,7 +958,7 @@ function serializeNode(
     // serializeDirty. An OnDisk child would carry a page id from a different layout, so it must not
     // appear here.
     if (c.node === null) throw engineError("data_corrupted", "whole-image serialize hit an OnDisk leaf");
-    const r = serializeNode(c.node, table, capacity, nextIndex, body);
+    const r = serializeNode(c.node, colTypes, capacity, nextIndex, body);
     childPages.push(r.index);
     nextIndex = r.next;
   }
@@ -834,7 +976,7 @@ function serializeNode(
   const ovf: OverflowPageOut[] = [];
   const take = (): number => nextIndex++;
   for (let i = 0; i < n.keys.length; i++) {
-    w.bytes(encodeRecord(table, n.keys[i]!, n.vals[i]!, capacity, take, ovf));
+    w.bytes(encodeRecord(colTypes, n.keys[i]!, n.vals[i]!, capacity, take, ovf));
   }
   const payload = w.toBytes();
   if (payload.length > capacity) {
@@ -910,11 +1052,12 @@ export function incrementalImage(
   const pages: { index: number; bytes: Uint8Array }[] = [];
   const rootDataPage: number[] = new Array(keys.length).fill(0);
   const indexRoots: number[][] = keys.map(() => []);
-  const indexTable: Table = { name: "", columns: [], pk: [], checks: [], indexes: [] };
+  const indexColTypes: ColType[] = [];
   for (let ti = 0; ti < keys.length; ti++) {
-    const root = snap.stores.get(keys[ti]!)!.treeRoot();
+    const store = snap.stores.get(keys[ti]!)!;
+    const root = store.treeRoot();
     if (root !== null) {
-      rootDataPage[ti] = serializeDirty(root, snap.tables.get(keys[ti]!)!, capacity, ps, alloc, pages, paging);
+      rootDataPage[ti] = serializeDirty(root, store.columnTypes(), capacity, ps, alloc, pages, paging);
     }
     // The table's index trees follow its data tree, in catalog (name) order — only their
     // dirty nodes are written, like any tree (spec/fileformat/format.md "Allocation &
@@ -923,7 +1066,7 @@ export function incrementalImage(
       let ir = 0;
       const iroot = snap.indexStore(idx.name.toLowerCase()).treeRoot();
       if (iroot !== null) {
-        ir = serializeDirty(iroot, indexTable, capacity, ps, alloc, pages, paging);
+        ir = serializeDirty(iroot, indexColTypes, capacity, ps, alloc, pages, paging);
       }
       indexRoots[ti]!.push(ir);
     }
@@ -931,19 +1074,25 @@ export function incrementalImage(
 
   // The catalog chain is rewritten to fresh pages every commit (table roots move). Allocate its page
   // indices up front — they may be reused free pages, hence not contiguous — so each page can point at
-  // the next (`pack` always returns ≥ 1 group, so catPages is non-empty).
-  const entrySizes = keys.map((k) =>
-    tableEntryBytes(snap.tables.get(k)!, 0, snap.tables.get(k)!.indexes.map(() => 0)).length,
-  );
+  // the next (`pack` always returns ≥ 1 group, so catPages is non-empty). Entries are kind-tagged
+  // (v9): composite-type entries (kind 1, name order) then table entries (kind 0) —
+  // spec/fileformat/format.md.
+  const catEntries: Uint8Array[] = [];
+  for (const ct of snap.compositeTypesSorted()) {
+    catEntries.push(concat([Uint8Array.of(1), compositeTypeEntryBytes(ct)]));
+  }
+  for (let ti = 0; ti < keys.length; ti++) {
+    const t = snap.tables.get(keys[ti]!)!;
+    catEntries.push(concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!)]));
+  }
+  const entrySizes = catEntries.map((e) => e.length);
   const catGroups = pack(entrySizes, capacity);
   const catPages = catGroups.map(() => alloc.take());
   const catRoot = catPages[0]!;
   for (let gi = 0; gi < catGroups.length; gi++) {
     const group = catGroups[gi]!;
     const nextPage = gi + 1 < catGroups.length ? catPages[gi + 1]! : 0;
-    const parts = group.map((ti) =>
-      tableEntryBytes(snap.tables.get(keys[ti]!)!, rootDataPage[ti]!, indexRoots[ti]!),
-    );
+    const parts = group.map((ei) => catEntries[ei]!);
     pages.push({ index: catPages[gi]!, bytes: makePage(ps, PAGE_CATALOG, group.length, nextPage, concat(parts)) });
   }
 
@@ -955,11 +1104,11 @@ export function incrementalImage(
 // references; the serializer needs their bytes to re-plan and rewrite the record. Unmetered,
 // like all commit work. Returns the row unchanged when nothing is unfetched (the common case);
 // resolution builds a fresh copy, never mutating the shared tree's row.
-function resolveForEncode(row: Row, table: Table, paging: SharedPaging | null): Row {
+function resolveForEncode(row: Row, colTypes: ColType[], paging: SharedPaging | null): Row {
   if (!row.some((v) => v.kind === "unfetched")) return row;
   if (paging === null) throw engineError("data_corrupted", "unfetched large value with no pager at commit");
   const fetch = (p: number): Uint8Array => paging.readBlock(p);
-  return row.map((v, i) => (v.kind === "unfetched" ? resolveUnfetched(table.columns[i]!.type, v.ref, fetch) : v));
+  return row.map((v, i) => (v.kind === "unfetched" ? resolveUnfetched(colTypes[i]!, v.ref, fetch) : v));
 }
 
 // serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
@@ -970,7 +1119,7 @@ function resolveForEncode(row: Row, table: Table, paging: SharedPaging | null): 
 // high-water). Mirrors serializeNode for the byte layout.
 function serializeDirty(
   n: PNode,
-  table: Table,
+  colTypes: ColType[],
   capacity: number,
   ps: number,
   alloc: PageAlloc,
@@ -984,7 +1133,7 @@ function serializeDirty(
   for (const c of n.children) {
     // A resident child recurses (dirty descendants get pages); an OnDisk child is a clean leaf already
     // durable at its page — keep it, write nothing (the incremental-commit win).
-    childPages.push(c.node === null ? c.page : serializeDirty(c.node, table, capacity, ps, alloc, pages, paging));
+    childPages.push(c.node === null ? c.page : serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, paging));
   }
   const w = new ByteWriter();
   let pageType = PAGE_LEAF;
@@ -1001,7 +1150,7 @@ function serializeDirty(
   const ovf: OverflowPageOut[] = [];
   const take = (): number => alloc.take();
   for (let i = 0; i < n.keys.length; i++) {
-    w.bytes(encodeRecord(table, n.keys[i]!, resolveForEncode(n.vals[i]!, table, paging), capacity, take, ovf));
+    w.bytes(encodeRecord(colTypes, n.keys[i]!, resolveForEncode(n.vals[i]!, colTypes, paging), capacity, take, ovf));
   }
   const payload = w.toBytes();
   if (payload.length > capacity) {
@@ -1045,13 +1194,23 @@ export function loadDatabase(image: Uint8Array): Database {
     }
     const cur = { pos: 0 };
     for (let i = 0; i < pg.itemCount; i++) {
+      // Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered now; its
+      // nested refs are validated after the full walk), 0 = a table entry.
+      const kind = readU8(pg.payload, cur);
+      if (kind === 1) {
+        snap.putType(decodeCompositeTypeEntry(pg.payload, cur));
+        continue;
+      }
+      if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
       const { table, root, indexRoots } = decodeTableEntry(pg.payload, cur);
-      const colTypes = table.columns.map((c) => c.type);
       const hasPK = pkIndices(table).length > 0;
       snap.putTable(table, pageSize);
+      // The store resolved each column's ColType from the (types-first) catalog at putTable; the
+      // codec reads it back rather than re-walking the type catalog (spec/design/composite.md §3).
+      const store = snap.stores.get(table.name.toLowerCase())!;
+      const colTypes = store.columnTypes();
       if (root !== 0) {
         const t = readTree(image, dv, pageSize, root, colTypes, reached);
-        const store = snap.stores.get(table.name.toLowerCase())!;
         store.setTree(t.node, t.length);
         // No-PK keys are synthetic int64 rowids — advance the counter past the largest (the last
         // entry in key order) so future inserts don't collide.
@@ -1073,6 +1232,9 @@ export function loadDatabase(image: Uint8Array): Database {
     }
     catPage = pg.nextPage;
   }
+  // Two-pass: validate the composite-type catalog (existence + acyclicity) now that every type
+  // entry has been read (spec/design/composite.md §3); a bad reference is XX001.
+  snap.validateCompositeTypes();
   const db = new Database();
   db.pageSize = pageSize;
   db.pageCount = mt.pageCount; // the on-disk high-water for the next incremental commit
@@ -1089,11 +1251,11 @@ export function loadDatabase(image: Uint8Array): Database {
 // anySpillableMasked is anySpillable restricted to the columns a query's touched set selects —
 // the gate for the masked scan-units walk (cost.md §3 "The touched set"): if no TOUCHED column
 // can spill, the whole walk yields zero and is skipped.
-export function anySpillableMasked(colTypes: ScalarType[], mask: boolean[]): boolean {
+export function anySpillableMasked(colTypes: ColType[], mask: boolean[]): boolean {
   return colTypes.some((ty, i) => mask[i]! && isSpillable(ty));
 }
 
-export function anySpillable(colTypes: ScalarType[]): boolean {
+export function anySpillable(colTypes: ColType[]): boolean {
   return colTypes.some(isSpillable);
 }
 
@@ -1103,7 +1265,7 @@ export function anySpillable(colTypes: ScalarType[]): boolean {
 // the paged-open free-list reconstruction; it decodes each leaf lazily and follows its chains by
 // HEADERS only (chainPages — large-values.md §14), so opening a file never materializes or
 // decompresses a large value.
-function collectLeafOverflow(paging: SharedPaging, pageIdx: number, colTypes: ScalarType[], reached: Set<number>): void {
+function collectLeafOverflow(paging: SharedPaging, pageIdx: number, colTypes: ColType[], reached: Set<number>): void {
   const pg = parsePage(paging.readBlock(pageIdx));
   if (pg.pageType === PAGE_LEAF) {
     const fetch = (p: number): Uint8Array => paging.readBlock(p);
@@ -1155,12 +1317,22 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
     if (pg.pageType !== PAGE_CATALOG) throw engineError("data_corrupted", "expected a catalog page");
     const cur = { pos: 0 };
     for (let i = 0; i < pg.itemCount; i++) {
+      // Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered now; its
+      // nested refs are validated after the full walk), 0 = a table entry.
+      const kind = readU8(pg.payload, cur);
+      if (kind === 1) {
+        snap.putType(decodeCompositeTypeEntry(pg.payload, cur));
+        continue;
+      }
+      if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
       const { table, root, indexRoots } = decodeTableEntry(pg.payload, cur);
-      const colTypes = table.columns.map((c) => c.type);
       const hasPK = pkIndices(table).length > 0;
       snap.putTable(table, pageSize);
       const store = snap.stores.get(table.name.toLowerCase())!;
       store.attachPaging(paging);
+      // The store resolved each column's ColType from the (types-first) catalog at putTable
+      // (spec/design/composite.md §3).
+      const colTypes = store.columnTypes();
       if (root !== 0) {
         const t = readSkeleton(paging, root, colTypes, reached);
         // The skeleton leaves leaves OnDisk (unread), so their records' overflow chains are invisible
@@ -1193,6 +1365,10 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
     catPage = pg.nextPage;
   }
 
+  // Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
+  // reference (spec/design/composite.md §3).
+  snap.validateCompositeTypes();
+
   const db = new Database();
   db.pageSize = pageSize;
   db.pageCount = mt.pageCount;
@@ -1211,7 +1387,7 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
 function readSkeleton(
   paging: SharedPaging,
   root: number,
-  colTypes: ScalarType[],
+  colTypes: ColType[],
   reached: Set<number>,
 ): { node: PNode; length: number } {
   const r = readSkeletonNode(paging, root, colTypes, reached);
@@ -1225,7 +1401,7 @@ function readSkeleton(
 function readSkeletonNode(
   paging: SharedPaging,
   pageIdx: number,
-  colTypes: ScalarType[],
+  colTypes: ColType[],
   reached: Set<number>,
 ): { child: Child; length: number } {
   reached.add(pageIdx);
@@ -1273,7 +1449,7 @@ function readTree(
   dv: DataView,
   ps: number,
   pageIdx: number,
-  colTypes: ScalarType[],
+  colTypes: ColType[],
   reached: Set<number>,
 ): { node: PNode; length: number } {
   reached.add(pageIdx);
@@ -1510,7 +1686,7 @@ function parsePage(block: Uint8Array): Page {
 // unfetched reference — no chain read, no decompression — resolved later only for the columns a
 // query touches. Each weight is the bytes the record occupies on the page (exactly the writer's
 // recordSize).
-export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ScalarType[]): PNode {
+export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ColType[]): PNode {
   const pg = parsePage(block);
   if (pg.pageType !== PAGE_LEAF) throw engineError("data_corrupted", "demand-paged a non-leaf page");
   const keys: Uint8Array[] = [];
@@ -1541,6 +1717,26 @@ function decodeTableEntry(
   for (let i = 0; i < colCount; i++) {
     const cname = readString(buf, cur);
     const tc = readU8(buf, cur);
+    if (tc === 14) {
+      // A composite column (v9): flags, then the type name (spec/fileformat/format.md).
+      // Forward-ready — composite columns are not produced this slice (composite.md §12), but a
+      // reader handles the code so a later-slice file loads cleanly.
+      const cflags = readU8(buf, cur);
+      if ((cflags & 0b01) !== 0) {
+        throw engineError("data_corrupted", "reserved column flag bit0 set");
+      }
+      const tname = readString(buf, cur);
+      columns.push({
+        name: cname,
+        type: compositeT(tname),
+        decimal: null,
+        primaryKey: false,
+        notNull: (cflags & 0b10) !== 0,
+        default: null,
+        defaultExpr: null,
+      });
+      continue;
+    }
     const ty = scalarForTypeCode(tc);
     if (ty === undefined) {
       throw engineError("data_corrupted", "unknown type code");
@@ -1567,7 +1763,8 @@ function decodeTableEntry(
     if ((flags & 0b1100) === 0b1100) {
       throw engineError("data_corrupted", "column has both a constant and an expression default");
     }
-    const colDefault = (flags & 0b100) !== 0 ? readValue(ty, buf, cur, null, []) : null;
+    // A constant default is a scalar value (this branch is the scalar type path).
+    const colDefault = (flags & 0b100) !== 0 ? readValue({ kind: "scalar", scalar: ty }, buf, cur, null, []) : null;
     let colDefaultExpr: DefaultExpr | null = null;
     if ((flags & 0b1000) !== 0) {
       const exprText = readString(buf, cur);
@@ -1581,7 +1778,7 @@ function decodeTableEntry(
     }
     columns.push({
       name: cname,
-      type: ty,
+      type: scalarT(ty),
       decimal,
       primaryKey: false, // set from the pk list below
       notNull: (flags & 0b10) !== 0,
@@ -1655,8 +1852,10 @@ function decodeTableEntry(
 // the record's pointer fields — no chain read, no decompression. The scan layer resolves the
 // references for the columns a query touches (resolveUnfetched); the commit path resolves the
 // rest when a dirty leaf re-encodes (resolveForEncode).
-function readValueLazy(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
+function readValueLazy(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
   const tag = readU8(buf, cur);
+  // A composite's inline body has no nested overflow pointers (its fields are inline —
+  // composite.md §4), so it is read eagerly even in the lazy path.
   if (tag === 0x00) return readInlineBody(ty, buf, cur);
   if (tag === 0x01) return nullValue();
   if (tag === TAG_EXTERNAL) {
@@ -1684,7 +1883,7 @@ function readValueLazy(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
 // writer split on, read off the cursor instead of re-planned (a re-plan would need the unfetched
 // bytes).
 function decodeRecordLazy(
-  colTypes: ScalarType[],
+  colTypes: ColType[],
   buf: Uint8Array,
   cur: Cursor,
 ): { key: Uint8Array; row: Row; weight: number } {
@@ -1702,7 +1901,7 @@ function decodeRecordLazy(
 // (spec/design/large-values.md §14): gather the overflow chain through `fetch` for an external
 // form, decompress a compressed one, and reconstruct by column type. Decompression errors are
 // data_corrupted, surfaced only when the value is actually touched.
-export function resolveUnfetched(ty: ScalarType, ref: Unfetched, fetch: (page: number) => Uint8Array): Value {
+export function resolveUnfetched(ty: ColType, ref: Unfetched, fetch: (page: number) => Uint8Array): Value {
   const sink: number[] = [];
   if (ref.form === TAG_EXTERNAL) {
     return valueFromPayload(ty, readOverflowChain(ref.firstPage, ref.storedLen, fetch, sink));
@@ -1753,7 +1952,7 @@ function markChains(row: Row, fetch: (page: number) => Uint8Array, reached: Set<
 // (for the free-list reachability walk — large-values.md §12). `fetch` reads a page block by index,
 // used to follow overflow chains; null is only valid where no value can be external (a default).
 function decodeRecord(
-  colTypes: ScalarType[],
+  colTypes: ColType[],
   buf: Uint8Array,
   cur: Cursor,
   fetch: ((page: number) => Uint8Array) | null,
@@ -1773,7 +1972,7 @@ function decodeRecord(
 // payload is gathered from the overflow chain via `fetch` and reconstructed by type (large-values.md
 // §12). Pages visited while following a chain are pushed to `ovfOut` for the free-list walk.
 function readValue(
-  ty: ScalarType,
+  ty: ColType,
   buf: Uint8Array,
   cur: Cursor,
   fetch: ((page: number) => Uint8Array) | null,
@@ -1805,9 +2004,34 @@ function readValue(
   throw engineError("data_corrupted", "invalid value presence tag");
 }
 
-// readInlineBody reads the present-value body (after a 0x00 tag): a fixed-width integer, a u16 length
-// + UTF-8 bytes for text, a single bool-byte, the decimal body, etc. (format.md *Value codec*).
-function readInlineBody(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
+// readInlineBody reads the present-value body (after a 0x00 tag) for any ColType: a scalar via
+// readInlineScalar, or a composite via readCompositeBody (spec/design/composite.md §4).
+function readInlineBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
+  if (ty.kind === "composite") return readCompositeBody(ty, buf, cur);
+  return readInlineScalar(ty.scalar, buf, cur);
+}
+
+// readCompositeBody reads a composite value's present BODY (after the 0x00 tag): the null bitmap then
+// each present field's body in declaration order (inverse of encodeCompositeBody,
+// spec/design/composite.md §4). A field whose bitmap bit is set is NULL and consumes no body bytes;
+// otherwise its body is read recursively (no per-field presence tag).
+function readCompositeBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
+  if (ty.kind !== "composite") throw engineError("data_corrupted", "readCompositeBody on a non-composite type");
+  const fields = ty.fields;
+  const nbytes = Math.ceil(fields.length / 8);
+  const bitmap = take(buf, cur, nbytes);
+  const vals: Value[] = new Array(fields.length);
+  for (let i = 0; i < fields.length; i++) {
+    const isNull = (bitmap[i >> 3]! & (0x80 >> (i % 8))) !== 0;
+    vals[i] = isNull ? nullValue() : readInlineBody(fields[i]!.type, buf, cur);
+  }
+  return compositeValue(vals);
+}
+
+// readInlineScalar reads the present-value body of a SCALAR (after a 0x00 tag): a fixed-width
+// integer, a u16 length + UTF-8 bytes for text, a single bool-byte, the decimal body, etc.
+// (format.md *Value codec*).
+function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
   if (isText(ty)) {
     const n = readU16(buf, cur);
     const bytes = take(buf, cur, n);

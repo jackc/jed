@@ -143,7 +143,7 @@ pub fn import_statement(table: &Table, records: &[Vec<Field>]) -> Result<Option<
             if f > 0 {
                 sql.push_str(", ");
             }
-            let lit = literal(&table.columns[cols[f]].ty, field)
+            let lit = literal(&table.columns[cols[f]].ty.scalar(), field)
                 .map_err(|e| format!("row {}, column {}: {e}", r + 1, names[f]))?;
             sql.push_str(&lit);
         }

@@ -91,6 +91,9 @@ const (
 	// WrongObjectType is 42809 — DROP TABLE of an index name, DROP INDEX of a table name
 	// (spec/design/indexes.md §2).
 	WrongObjectType
+	// DependentObjectsStillExist is 2BP01 — DROP TYPE ... RESTRICT of a composite type a
+	// table column or another composite field still references (spec/design/composite.md §7).
+	DependentObjectsStillExist
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
 	// CostLimitExceeded is 54P01 — a query's accrued execution cost reached the caller-set
@@ -176,6 +179,8 @@ func (s SqlState) Code() string {
 		return "42710"
 	case WrongObjectType:
 		return "42809"
+	case DependentObjectsStillExist:
+		return "2BP01"
 	case FeatureNotSupported:
 		return "0A000"
 	case CostLimitExceeded:

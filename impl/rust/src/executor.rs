@@ -5,11 +5,14 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    BinaryOp, CreateIndex, CreateTable, Delete, DropIndex, DropTable, Expr, Insert, InsertSource,
-    InsertValue, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItems, SetOp, SetOpKind,
-    Statement, TableRef, TypeMod, UnaryOp, Update,
+    BinaryOp, CreateIndex, CreateTable, CreateType, Delete, DropIndex, DropTable, DropType, Expr,
+    Insert, InsertSource, InsertValue, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItems,
+    SetOp, SetOpKind, Statement, TableRef, TypeMod, UnaryOp, Update,
 };
-use crate::catalog::{CheckConstraint, Column, DefaultExpr, IndexDef, Table};
+use crate::catalog::{
+    CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
+    IndexDef, Table, resolve_col_type,
+};
 use crate::cost::Meter;
 use crate::costs::COSTS;
 use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
@@ -20,7 +23,7 @@ use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc};
 use crate::pmap::KeyBound;
 use crate::storage::{Row, TableStore};
 use crate::timestamp::{parse_timestamp, parse_timestamptz};
-use crate::types::{DecimalTypmod, ScalarType};
+use crate::types::{DecimalTypmod, ScalarType, Type};
 use crate::value::{ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid};
 use std::collections::{HashMap, HashSet};
 
@@ -106,6 +109,11 @@ pub struct Snapshot {
     /// The snapshot's version — the commit counter (transactions.md §8; the watermark unit).
     pub(crate) txid: u64,
     tables: HashMap<String, Table>,
+    /// User-defined composite (row) types, keyed by lowercased name (spec/design/composite.md).
+    /// A database-level object set, separate from `tables`; serialized into the catalog's
+    /// composite-type entries (spec/fileformat/format.md). Sorted by key when serialized so
+    /// hash-map iteration order never leaks (CLAUDE.md §8).
+    types: HashMap<String, CompositeType>,
     stores: HashMap<String, TableStore>,
     /// Each secondary index's B-tree (spec/design/indexes.md §3): a `TableStore` with ZERO
     /// value columns (entry keys only — the on-disk empty-payload record), keyed by the
@@ -120,8 +128,108 @@ impl Snapshot {
         self.tables.get(&name.to_ascii_lowercase())
     }
 
+    /// Look up a composite type definition by name (case-insensitive).
+    pub fn composite_type(&self, name: &str) -> Option<&CompositeType> {
+        self.types.get(&name.to_ascii_lowercase())
+    }
+
+    /// Register a composite type (CREATE TYPE). Lower-cased name is the key. The caller has
+    /// already resolved field types and checked for a duplicate.
+    pub(crate) fn put_type(&mut self, ty: CompositeType) {
+        self.types.insert(ty.name.to_ascii_lowercase(), ty);
+    }
+
+    /// Remove a composite type (DROP TYPE). The caller has checked there are no dependents.
+    pub(crate) fn remove_type(&mut self, key: &str) {
+        self.types.remove(key);
+    }
+
+    /// All composite types in ascending lowercased-name order — the on-disk emission order
+    /// (spec/fileformat/format.md) and a deterministic order with no hash-iteration leak (§8).
+    pub(crate) fn composite_types_sorted(&self) -> Vec<&CompositeType> {
+        let mut keys: Vec<&String> = self.types.keys().collect();
+        keys.sort();
+        keys.into_iter().map(|k| &self.types[k]).collect()
+    }
+
+    /// Whether any table column or composite-type field still references the composite type
+    /// `name` (case-insensitive) — the `DROP TYPE ... RESTRICT` dependency check (2BP01). Returns
+    /// the first dependent's description for the error detail, or `None` if there are no dependents.
+    pub(crate) fn composite_dependent(&self, name: &str) -> Option<String> {
+        let key = name.to_ascii_lowercase();
+        for t in self.tables.values() {
+            for c in &t.columns {
+                if matches!(&c.ty, Type::Composite(r) if r.name.eq_ignore_ascii_case(&key)) {
+                    return Some(format!("column {} of table {}", c.name, t.name));
+                }
+            }
+        }
+        for ct in self.types.values() {
+            for f in &ct.fields {
+                if matches!(&f.ty, Type::Composite(r) if r.name.eq_ignore_ascii_case(&key)) {
+                    return Some(format!("field {} of type {}", f.name, ct.name));
+                }
+            }
+        }
+        None
+    }
+
+    /// Validate the loaded composite-type catalog (the on-disk two-pass load —
+    /// spec/design/composite.md §3): every composite a field references must exist, and the
+    /// reference graph must be acyclic. A dangling or cyclic reference is a malformed file
+    /// (`XX001`). Called once after the whole catalog is read.
+    pub(crate) fn validate_composite_types(&self) -> Result<()> {
+        // Existence: every nested-composite field names a registered type.
+        for ct in self.types.values() {
+            for f in &ct.fields {
+                if let Type::Composite(r) = &f.ty {
+                    if self.composite_type(&r.name).is_none() {
+                        return Err(EngineError::new(
+                            SqlState::DataCorrupted,
+                            format!(
+                                "composite type {} references unknown type {}",
+                                ct.name, r.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        // Acyclicity: DFS over the type → referenced-types graph (0 unvisited, 1 on-stack, 2 done).
+        fn visit(snap: &Snapshot, key: &str, color: &mut HashMap<String, u8>) -> Result<()> {
+            color.insert(key.to_string(), 1);
+            if let Some(ct) = snap.types.get(key) {
+                for f in &ct.fields {
+                    if let Type::Composite(r) = &f.ty {
+                        let ck = r.name.to_ascii_lowercase();
+                        match color.get(&ck).copied().unwrap_or(0) {
+                            1 => {
+                                return Err(EngineError::new(
+                                    SqlState::DataCorrupted,
+                                    format!("composite type definition cycle through {}", r.name),
+                                ));
+                            }
+                            2 => {}
+                            _ => visit(snap, &ck, color)?,
+                        }
+                    }
+                }
+            }
+            color.insert(key.to_string(), 2);
+            Ok(())
+        }
+        let mut color: HashMap<String, u8> = HashMap::new();
+        let keys: Vec<String> = self.types.keys().cloned().collect();
+        for k in keys {
+            if color.get(&k).copied().unwrap_or(0) == 0 {
+                visit(self, &k, &mut color)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The store for a table (panics if absent — callers resolve the table first).
-    fn store(&self, name: &str) -> &TableStore {
+    pub(crate) fn store(&self, name: &str) -> &TableStore {
         self.stores
             .get(&name.to_ascii_lowercase())
             .expect("store exists for a resolved table")
@@ -154,7 +262,16 @@ impl Snapshot {
     pub(crate) fn put_table(&mut self, table: Table, page_size: u32) {
         let key = table.name.to_ascii_lowercase();
         let cap = page_size as usize - 12; // PAGE_HEADER
-        let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
+        // Resolve each column's `ColType` against the (already-registered) composite-type catalog
+        // — the codec/coercion tree the store keeps so neither re-walks the type catalog per row
+        // (spec/design/composite.md §4). Composite types are registered before any table (the
+        // types-first catalog order / `CREATE TYPE`-before-`CREATE TABLE` rule), so the lookup
+        // inside `resolve_col_type` always resolves.
+        let col_types: Vec<ColType> = table
+            .columns
+            .iter()
+            .map(|c| resolve_col_type(&c.ty, &self.types))
+            .collect();
         self.stores
             .insert(key.clone(), TableStore::new(cap, col_types));
         self.tables.insert(key, table);
@@ -512,6 +629,12 @@ impl Database {
         self.read_snap().table(name)
     }
 
+    /// Look up a composite type definition by name (case-insensitive) in the currently-visible
+    /// snapshot (spec/design/composite.md).
+    pub fn composite_type(&self, name: &str) -> Option<&CompositeType> {
+        self.read_snap().composite_type(name)
+    }
+
     /// The canonical name of every table in the currently-visible snapshot, sorted ascending
     /// by lowercased name (the catalog's standing order — no map-iteration order may leak,
     /// CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6).
@@ -743,6 +866,14 @@ impl Database {
                 reject_params_for_ddl(params)?;
                 self.execute_drop_index(di)
             }
+            Statement::CreateType(ct) => {
+                reject_params_for_ddl(params)?;
+                self.execute_create_type(ct)
+            }
+            Statement::DropType(dt) => {
+                reject_params_for_ddl(params)?;
+                self.execute_drop_type(dt)
+            }
             Statement::Insert(ins) => self.execute_insert(ins, params),
             Statement::Select(sel) => self.execute_select(sel, params),
             Statement::SetOp(so) => self.execute_set_op(so, params),
@@ -788,7 +919,37 @@ impl Database {
                     format!("duplicate column name: {}", def.name),
                 ));
             }
-            let (ty, decimal) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
+            // Resolve the column type: a built-in scalar, or a user-defined composite referenced by
+            // name (spec/design/composite.md §3). An unknown name is 42704. A composite column
+            // carries no typmod (the composite's fields carry their own); a type modifier written on
+            // a composite column is rejected (0A000). A composite column is storable but never
+            // keyable — the PK gate below rejects it 0A000 (§6).
+            let (ty, decimal): (Type, Option<DecimalTypmod>) =
+                if ScalarType::from_name(&def.type_name).is_some() {
+                    let (s, d) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
+                    (Type::Scalar(s), d)
+                } else if let Some(ctype) = self.read_snap().composite_type(&def.type_name) {
+                    if def.type_mod.is_some() {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            format!(
+                                "a type modifier is not supported for composite type {}",
+                                def.type_name
+                            ),
+                        ));
+                    }
+                    (
+                        Type::Composite(crate::types::CompositeRef {
+                            name: ctype.name.clone(),
+                        }),
+                        None,
+                    )
+                } else {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!("type does not exist: {}", def.type_name),
+                    ));
+                };
             if def.primary_key {
                 // Integers and uuid may be a key. uuid is the FIRST non-integer key type — its
                 // fixed `uuid-raw16` encoding (spec/design/encoding.md §2.7) is exercised. The
@@ -824,46 +985,59 @@ impl Database {
             //   - any other expression is validated (structural pre-walk, then resolved against
             //     an EMPTY scope — a default may not reference a column — then its result type is
             //     checked assignable to the column, 42804) and stored as text for per-row eval.
-            let (default, default_expr) = match &def.default {
-                None => (None, None),
-                Some(d) => match &d.expr {
-                    Expr::Literal(lit) => (
-                        Some(store_value(
-                            literal_to_value_for(lit, ty)?,
-                            ty,
-                            decimal,
-                            false,
-                            &def.name,
-                        )?),
-                        None,
-                    ),
-                    _ => {
-                        reject_default_structure(&d.expr)?;
-                        let scope = Scope::empty(self);
-                        let (_, rty) = resolve(
-                            &scope,
-                            &d.expr,
-                            Some(ty),
-                            &mut AggCtx::Forbidden,
-                            &mut ParamTypes::default(),
-                        )?;
-                        if !rty.assignable_to(ty) {
-                            return Err(type_error(format!(
-                                "column {} is of type {} but default expression is of type {}",
-                                def.name,
-                                ty.canonical_name(),
-                                rty.type_name(),
-                            )));
-                        }
-                        (
+            let (default, default_expr) = if ty.is_composite() {
+                // A DEFAULT on a composite-typed column is not supported this slice — there is no
+                // composite literal yet (the ROW constructor lands in a later slice — composite.md).
+                if def.default.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a DEFAULT on a composite-typed column is not supported yet".to_string(),
+                    ));
+                }
+                (None, None)
+            } else {
+                let sty = ty.scalar();
+                match &def.default {
+                    None => (None, None),
+                    Some(d) => match &d.expr {
+                        Expr::Literal(lit) => (
+                            Some(store_value(
+                                literal_to_value_for(lit, sty)?,
+                                sty,
+                                decimal,
+                                false,
+                                &def.name,
+                            )?),
                             None,
-                            Some(DefaultExpr {
-                                expr_text: d.text.clone(),
-                                expr: d.expr.clone(),
-                            }),
-                        )
-                    }
-                },
+                        ),
+                        _ => {
+                            reject_default_structure(&d.expr)?;
+                            let scope = Scope::empty(self);
+                            let (_, rty) = resolve(
+                                &scope,
+                                &d.expr,
+                                Some(sty),
+                                &mut AggCtx::Forbidden,
+                                &mut ParamTypes::default(),
+                            )?;
+                            if !rty.assignable_to(sty) {
+                                return Err(type_error(format!(
+                                    "column {} is of type {} but default expression is of type {}",
+                                    def.name,
+                                    sty.canonical_name(),
+                                    rty.type_name(),
+                                )));
+                            }
+                            (
+                                None,
+                                Some(DefaultExpr {
+                                    expr_text: d.text.clone(),
+                                    expr: d.expr.clone(),
+                                }),
+                            )
+                        }
+                    },
+                }
             };
             columns.push(Column {
                 name: def.name.clone(),
@@ -913,7 +1087,7 @@ impl Database {
                 indices.push(idx);
             }
             for &i in &indices {
-                let ty = columns[i].ty;
+                let ty = &columns[i].ty;
                 if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -955,7 +1129,7 @@ impl Database {
                 indices.push(idx);
             }
             for &i in &indices {
-                let ty = columns[i].ty;
+                let ty = &columns[i].ty;
                 if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -1004,7 +1178,8 @@ impl Database {
                 | ResolvedType::Timestamp
                 | ResolvedType::Timestamptz
                 | ResolvedType::Interval
-                | ResolvedType::Float(_) => {
+                | ResolvedType::Float(_)
+                | ResolvedType::Composite(_) => {
                     return Err(type_error("argument of CHECK must be boolean"));
                 }
             }
@@ -1199,7 +1374,7 @@ impl Database {
                     let (node, _) = resolve(
                         &scope,
                         &de.expr,
-                        Some(col.ty),
+                        Some(col.ty.scalar()),
                         &mut AggCtx::Forbidden,
                         &mut ParamTypes::default(),
                     )?;
@@ -1292,7 +1467,7 @@ impl Database {
                     format!("column does not exist: {name}"),
                 )
             })?;
-            let ty = columns[idx].ty;
+            let ty = &columns[idx].ty;
             if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
@@ -1420,6 +1595,101 @@ impl Database {
         })
     }
 
+    /// Analyze and run a CREATE TYPE (spec/design/composite.md): reject a duplicate type name
+    /// (42710), resolve each field's type (a built-in scalar, or a *previously-defined* composite
+    /// — 42704 if unknown; no self- or forward-reference), reject a duplicate field name (42701),
+    /// then register the composite type in the catalog. Named composites only.
+    fn execute_create_type(&mut self, ct: CreateType) -> Result<Outcome> {
+        if self.read_snap().composite_type(&ct.name).is_some() {
+            return Err(EngineError::new(
+                SqlState::DuplicateObject,
+                format!("type {} already exists", ct.name),
+            ));
+        }
+        let mut fields: Vec<CompositeField> = Vec::with_capacity(ct.fields.len());
+        for f in &ct.fields {
+            if fields.iter().any(|g| g.name.eq_ignore_ascii_case(&f.name)) {
+                return Err(EngineError::new(
+                    SqlState::DuplicateColumn,
+                    format!("attribute {} specified more than once", f.name),
+                ));
+            }
+            let (fty, fdecimal): (Type, Option<DecimalTypmod>) =
+                if ScalarType::from_name(&f.type_name).is_some() {
+                    let (s, d) = resolve_type_and_typmod(&f.type_name, &f.type_mod)?;
+                    (Type::Scalar(s), d)
+                } else if self.read_snap().composite_type(&f.type_name).is_some() {
+                    if f.type_mod.is_some() {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            format!(
+                                "a type modifier is not supported for composite type {}",
+                                f.type_name
+                            ),
+                        ));
+                    }
+                    (
+                        Type::Composite(crate::types::CompositeRef {
+                            name: f.type_name.clone(),
+                        }),
+                        None,
+                    )
+                } else {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!("type does not exist: {}", f.type_name),
+                    ));
+                };
+            fields.push(CompositeField {
+                name: f.name.clone(),
+                ty: fty,
+                decimal: fdecimal,
+                not_null: f.not_null,
+            });
+        }
+        self.working_mut().put_type(CompositeType {
+            name: ct.name.clone(),
+            fields,
+        });
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
+    }
+
+    /// Analyze and run a DROP TYPE (spec/design/composite.md §7). RESTRICT (the only behavior
+    /// this slice): a missing type is 42704 unless `IF EXISTS`; if any table column or composite
+    /// field still references the type, 2BP01; otherwise remove it from the catalog.
+    fn execute_drop_type(&mut self, dt: DropType) -> Result<Outcome> {
+        if self.read_snap().composite_type(&dt.name).is_none() {
+            if dt.if_exists {
+                return Ok(Outcome::Statement {
+                    cost: 0,
+                    rows_affected: None,
+                });
+            }
+            return Err(EngineError::new(
+                SqlState::UndefinedObject,
+                format!("type does not exist: {}", dt.name),
+            ));
+        }
+        if let Some(dep) = self.read_snap().composite_dependent(&dt.name) {
+            return Err(EngineError::new(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot drop type {} because other objects depend on it: {}",
+                    dt.name, dep
+                ),
+            ));
+        }
+        let key = dt.name.to_ascii_lowercase();
+        self.working_mut().remove_type(&key);
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
+    }
+
     /// Analyze and run an INSERT whose rows come from a `VALUES` list or a `SELECT`
     /// (spec/design/grammar.md §12 / §24). An optional column list names the target columns
     /// (unknown → 42703, duplicate → 42701); an unlisted column, or a `DEFAULT` keyword slot,
@@ -1456,7 +1726,7 @@ impl Database {
         let pk: Vec<(usize, ScalarType)> = tdef
             .pk_indices()
             .into_iter()
-            .map(|i| (i, tdef.columns[i].ty))
+            .map(|i| (i, tdef.columns[i].ty.scalar()))
             .collect();
         // The CHECK constraints, resolved once per statement in evaluation (name) order;
         // `insert_rows` evaluates them per candidate row (constraints.md §4.4).
@@ -1464,6 +1734,9 @@ impl Database {
         // Each column's EXPRESSION default, resolved once per statement (constraints.md §2);
         // applied per omitted column / `DEFAULT` slot, sharing one per-statement `StmtRng`.
         let default_exprs = self.resolve_default_exprs(tdef)?;
+        // The columns' resolved `ColType`s (a scalar, or a composite resolved to its field tree),
+        // for composite-aware materialization + store-coercion (spec/design/composite.md §4).
+        let col_types: Vec<ColType> = self.store(&table).col_types().to_vec();
         let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
 
         // Resolve the optional column list once. `provided[i] = Some(p)` means table column i
@@ -1524,8 +1797,12 @@ impl Database {
                     }
                     for (i, col) in columns.iter().enumerate() {
                         if let Some(p) = provided[i] {
-                            if let Some(InsertValue::Param(nn)) = values.get(p) {
-                                ptypes.note((*nn as usize) - 1, Some(col.ty))?;
+                            // Only a scalar column gives a top-level `$N` an inferable type; a
+                            // composite-column param stays untyped (42P18 at finalize this slice).
+                            if let (Some(InsertValue::Param(nn)), Type::Scalar(s)) =
+                                (values.get(p), &col.ty)
+                            {
+                                ptypes.note((*nn as usize) - 1, Some(*s))?;
                             }
                         }
                     }
@@ -1563,14 +1840,16 @@ impl Database {
                     for (i, col) in columns.iter().enumerate() {
                         if let Some(p) = provided[i] {
                             rv[p] = match &values[p] {
-                                InsertValue::Lit(lit) => literal_to_value_for(lit, col.ty)?,
-                                InsertValue::Param(nn) => bound[(*nn as usize) - 1].clone(),
+                                // DEFAULT at the top level → the column's default (constant or
+                                // per-row expression). A `ROW(…)` / literal / `$N` slot is
+                                // materialized against the column's resolved type (composite-aware).
                                 InsertValue::Default => self.eval_default(
                                     col,
                                     default_exprs[i].as_ref(),
                                     &stmt_rng,
                                     &mut meter,
                                 )?,
+                                other => materialize_insert_value(other, &col_types[i], &bound)?,
                             };
                         }
                     }
@@ -1658,13 +1937,28 @@ impl Database {
                 // `insert_rows` then still range-checks values (22003) and enforces NOT NULL.
                 for (i, col) in columns.iter().enumerate() {
                     if let Some(p) = provided[i] {
-                        if !q.column_types[p].assignable_to(col.ty) {
-                            return Err(type_error(format!(
-                                "column {} is of type {} but expression is of type {}",
-                                col.name,
-                                col.ty.canonical_name(),
-                                q.column_types[p].type_name(),
-                            )));
+                        match &col.ty {
+                            Type::Scalar(s) => {
+                                if !q.column_types[p].assignable_to(*s) {
+                                    return Err(type_error(format!(
+                                        "column {} is of type {} but expression is of type {}",
+                                        col.name,
+                                        col.ty.canonical_name(),
+                                        q.column_types[p].type_name(),
+                                    )));
+                                }
+                            }
+                            // INSERT ... SELECT into a composite column lands in a later slice
+                            // (the VALUES + ROW(…) path is S3 — spec/design/composite.md §12).
+                            Type::Composite(_) => {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    format!(
+                                        "INSERT ... SELECT into composite column {} is not supported yet",
+                                        col.name
+                                    ),
+                                ));
+                            }
                         }
                     }
                 }
@@ -1744,6 +2038,8 @@ impl Database {
             .table(table)
             .map(|t| (t.name.clone(), t.indexes.clone()))
             .unwrap_or_else(|| (table.to_string(), Vec::new()));
+        // The columns' resolved `ColType`s, for composite-aware store coercion (composite.md §4).
+        let col_types: Vec<ColType> = self.store(table).col_types().to_vec();
         let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(rows.len());
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
         // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
@@ -1762,9 +2058,9 @@ impl Database {
                     // expression default; a constant (or no default → NULL) is free.
                     None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
                 };
-                row.push(store_value(
+                row.push(coerce_for_store(
                     candidate,
-                    col.ty,
+                    &col_types[i],
                     col.decimal,
                     col.not_null,
                     &col.name,
@@ -1833,6 +2129,11 @@ impl Database {
                             unreachable!(
                                 "a text/decimal/bytea/interval/float primary key is rejected at CREATE TABLE"
                             )
+                        }
+                        // Unreachable: a composite PRIMARY KEY is rejected at CREATE TABLE (0A000 —
+                        // the key encoding is authored but unexercised, spec/design/composite.md §6).
+                        Value::Composite(_) => {
+                            unreachable!("a composite primary key is rejected at CREATE TABLE")
                         }
                         // Poisoned (large-values.md §14): INSERT values are evaluated
                         // expressions, never lazily-loaded storage rows.
@@ -2012,7 +2313,9 @@ impl Database {
         // after the `table` borrow ends (the mutate path takes `&mut self`). The index
         // definitions (and the columns their entry keys read) feed phase 2's maintenance
         // (indexes.md §4).
-        let pk_info = table.primary_key_index().map(|i| (i, table.columns[i].ty));
+        let pk_info = table
+            .primary_key_index()
+            .map(|i| (i, table.columns[i].ty.scalar()));
         let ncols = table.columns.len();
         let indexes = table.indexes.clone();
         let tcolumns: Vec<Column> = if indexes.is_empty() {
@@ -2192,7 +2495,9 @@ impl Database {
         // Capture the PK (index, type) by value for the primary-key pushdown (detected after the
         // `table` borrow ends, since the mutate path takes `&mut self`). Pushdown recognizes
         // single-column keys only (`primary_key_index`); a composite-PK table full-scans.
-        let pk_info = table.primary_key_index().map(|i| (i, table.columns[i].ty));
+        let pk_info = table
+            .primary_key_index()
+            .map(|i| (i, table.columns[i].ty.scalar()));
         let ncols = table.columns.len();
         // The index definitions (and the columns their entry keys read) feed phase 2's
         // maintenance (indexes.md §4): an entry moves only when its key actually changed.
@@ -2219,6 +2524,18 @@ impl Database {
                 ));
             }
             let col = &table.columns[idx];
+            // Updating a composite-typed column lands in a later slice (the storable + INSERT/SELECT
+            // round-trip is S3 — spec/design/composite.md §12); reject it for now (0A000).
+            let Type::Scalar(target_scalar) = &col.ty else {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "updating composite column {} is not supported yet",
+                        a.column
+                    ),
+                ));
+            };
+            let target_scalar = *target_scalar;
             // The RHS is a general expression evaluated against the *old* row; a literal
             // operand adapts to the target column's type. The result must be assignable to
             // the column's family (integer/decimal/text or NULL; never boolean; decimal→int
@@ -2226,15 +2543,15 @@ impl Database {
             let (source, ty) = resolve(
                 &scope,
                 &a.value,
-                Some(col.ty),
+                Some(target_scalar),
                 &mut AggCtx::Forbidden,
                 &mut ptypes,
             )?;
-            require_assignable(ty, col.ty, &a.column)?;
+            require_assignable(&ty, target_scalar, &a.column)?;
             plans.push(AssignPlan {
                 idx,
                 name: col.name.clone(),
-                target: col.ty,
+                target: target_scalar,
                 decimal: col.decimal,
                 not_null: col.not_null,
                 source,
@@ -2602,7 +2919,7 @@ impl Database {
             .column_types()
             .iter()
             .zip(rhs.column_types().iter())
-            .map(|(&l, &r)| unify_setop_column(l, r, so.op))
+            .map(|(l, r)| unify_setop_column(l, r, so.op))
             .collect::<Result<_>>()?;
         let column_names = match &lhs {
             QueryPlan::Select(s) => s.column_names.clone(),
@@ -3106,7 +3423,7 @@ impl Database {
             name: "generate_series".to_string(),
             columns: vec![Column {
                 name: col_name,
-                ty: result,
+                ty: Type::Scalar(result),
                 decimal: None,
                 primary_key: false,
                 not_null: false,
@@ -3912,6 +4229,13 @@ impl Database {
                 }
                 Ok(())
             }
+            RExpr::Row(fields) => {
+                for f in fields {
+                    self.fold_uncorrelated_in_rexpr(f, bound, cost)?;
+                }
+                Ok(())
+            }
+            RExpr::Field { base, .. } => self.fold_uncorrelated_in_rexpr(base, bound, cost),
             RExpr::InValues { lhs, .. } => self.fold_uncorrelated_in_rexpr(lhs, bound, cost),
             // Leaves and the (already-handled) Subquery: nothing to recurse into.
             RExpr::Subquery { .. }
@@ -4258,7 +4582,10 @@ fn outer_of(r: Resolved) -> Resolved {
 /// The static type of a resolved expression. `Null` is an untyped NULL literal (its
 /// type, if needed, is settled by the surrounding operator/context). `Text` is the
 /// `text` family (one collation, `C`); it does not promote.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: the `Composite` arm owns a heap shape (open types — CLAUDE.md §4), so the type
+/// is cloned/borrowed rather than copied. Every other arm is still a trivial tag/scalar.
+#[derive(Clone, PartialEq, Eq)]
 enum ResolvedType {
     Int(ScalarType),
     Bool,
@@ -4280,40 +4607,39 @@ enum ResolvedType {
     /// and comparison promote to `float64` first. A strict island — no implicit int/decimal ↔ float.
     Float(ScalarType),
     Null,
+    /// A composite (row) type (spec/design/composite.md §5). `name` is `Some` for a named catalog
+    /// type — rendered in the `# types:` output and the basis for cross-comparability — or `None`
+    /// for an anonymous `ROW(...)` result. `fields` are the resolved (field-name, type) pairs in
+    /// declaration order (the basis for field access — S4 — and structural assignability). Boxed so
+    /// the common scalar `ResolvedType` stays small.
+    Composite(Box<CompositeRType>),
+}
+
+/// The resolved shape of a composite type — its (optional) name and resolved field list. The
+/// `name` is `None` for an anonymous `ROW(...)` result, `Some` for a named catalog type.
+#[derive(Clone, PartialEq, Eq)]
+struct CompositeRType {
+    name: Option<String>,
+    fields: Vec<(String, ResolvedType)>,
 }
 
 impl ResolvedType {
-    /// The resolved type of a stored column of `ty` — used for the output type of a bare column
-    /// projection (`SELECT *` / `SELECT col`). A column always has a concrete type, never `Null`.
-    fn of_column(ty: ScalarType) -> ResolvedType {
-        match ty {
-            ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64 => ResolvedType::Int(ty),
-            ScalarType::Bool => ResolvedType::Bool,
-            ScalarType::Text => ResolvedType::Text,
-            ScalarType::Decimal => ResolvedType::Decimal,
-            ScalarType::Bytea => ResolvedType::Bytea,
-            ScalarType::Uuid => ResolvedType::Uuid,
-            ScalarType::Timestamp => ResolvedType::Timestamp,
-            ScalarType::Timestamptz => ResolvedType::Timestamptz,
-            ScalarType::Interval => ResolvedType::Interval,
-            ScalarType::Float32 | ScalarType::Float64 => ResolvedType::Float(ty),
-        }
-    }
-
-    /// This type's name, for a `42804` assignability message (the integer width is exact).
-    fn type_name(self) -> &'static str {
+    /// This type's name, for the `# types:` output and a `42804` assignability message (the integer
+    /// width is exact). A named composite is its type name; an anonymous `ROW(...)` is `record` (PG).
+    fn type_name(&self) -> String {
         match self {
-            ResolvedType::Int(st) => st.canonical_name(),
-            ResolvedType::Bool => "boolean",
-            ResolvedType::Text => "text",
-            ResolvedType::Decimal => "decimal",
-            ResolvedType::Bytea => "bytea",
-            ResolvedType::Uuid => "uuid",
-            ResolvedType::Timestamp => "timestamp",
-            ResolvedType::Timestamptz => "timestamptz",
-            ResolvedType::Interval => "interval",
-            ResolvedType::Float(st) => st.canonical_name(),
-            ResolvedType::Null => "unknown",
+            ResolvedType::Int(st) => st.canonical_name().to_string(),
+            ResolvedType::Bool => "boolean".to_string(),
+            ResolvedType::Text => "text".to_string(),
+            ResolvedType::Decimal => "decimal".to_string(),
+            ResolvedType::Bytea => "bytea".to_string(),
+            ResolvedType::Uuid => "uuid".to_string(),
+            ResolvedType::Timestamp => "timestamp".to_string(),
+            ResolvedType::Timestamptz => "timestamptz".to_string(),
+            ResolvedType::Interval => "interval".to_string(),
+            ResolvedType::Float(st) => st.canonical_name().to_string(),
+            ResolvedType::Null => "unknown".to_string(),
+            ResolvedType::Composite(c) => c.name.clone().unwrap_or_else(|| "record".to_string()),
         }
     }
 
@@ -4328,9 +4654,12 @@ impl ResolvedType {
     /// column and a timestamptz only to a timestamptz column (the two never cross — they do not
     /// even compare, timestamp.md), and a NULL-typed projection to any column (a NOT NULL target
     /// then traps 23502 per row). A non-assignable pair is a 42804.
-    fn assignable_to(self, col_ty: ScalarType) -> bool {
+    fn assignable_to(&self, col_ty: ScalarType) -> bool {
         match self {
             ResolvedType::Null => true,
+            // A composite source never assigns to a scalar column (the composite-target case is
+            // handled structurally at the call site — spec/design/composite.md §4).
+            ResolvedType::Composite(_) => false,
             ResolvedType::Int(_) => col_ty.is_integer() || col_ty.is_decimal(),
             ResolvedType::Decimal => col_ty.is_decimal(),
             ResolvedType::Bool => col_ty.is_bool(),
@@ -4441,6 +4770,17 @@ enum RExpr {
     /// A parsed `interval` literal: the three-field span (spec/design/interval.md).
     ConstInterval(Interval),
     ConstNull,
+    /// A `ROW(...)` constructor (spec/design/composite.md §1): evaluate each field expression and
+    /// assemble a `Value::Composite`. Also the folded form of a composite constant (`value_to_rexpr`
+    /// wraps each field's constant). One `operator_eval` per node (cost.md §9).
+    Row(Vec<RExpr>),
+    /// Field selection `(composite).field` (spec/design/composite.md §S4): evaluate `base` to a
+    /// composite value and return its `index`-th field (the field ordinal, fixed at resolve). A
+    /// whole-value-NULL composite yields NULL for any field. One `operator_eval` per node.
+    Field {
+        base: Box<RExpr>,
+        index: usize,
+    },
     /// A bind parameter, by 0-based index into the bound-values slice passed to `eval`. Its
     /// static type was inferred from context at resolve (spec/design/api.md §5); the value
     /// is supplied (and coerced to that type) before evaluation.
@@ -4720,14 +5060,14 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
         detect_pk_bound(
             filter,
             rel.offset + pk_local,
-            rel.table.columns[pk_local].ty,
+            rel.table.columns[pk_local].ty.scalar(),
         )
     }) {
         return Some(ScanBound::Pk(b));
     }
     for idx in &rel.table.indexes {
         let ci = idx.columns[0];
-        let ty = rel.table.columns[ci].ty;
+        let ty = rel.table.columns[ci].ty.scalar();
         let mut terms = Vec::new();
         collect_bound_terms(filter, rel.offset + ci, ty, &mut terms);
         let eqs: Vec<BoundSrc> = terms
@@ -4742,7 +5082,7 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
                 eqs,
                 tail_types: idx.columns[1..]
                     .iter()
-                    .map(|&c| rel.table.columns[c].ty)
+                    .map(|&c| rel.table.columns[c].ty.scalar())
                     .collect(),
             }));
         }
@@ -4762,7 +5102,7 @@ fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: 
             Value::Null => out.push(0x01),
             v => {
                 out.push(0x00);
-                let ty = columns[ci].ty;
+                let ty = columns[ci].ty.scalar();
                 match v {
                     Value::Int(n) => out.extend_from_slice(&encode_int(ty, *n)),
                     Value::Uuid(u) => out.extend_from_slice(u),
@@ -4791,7 +5131,7 @@ fn index_prefix_key(columns: &[Column], def: &IndexDef, row: &Row) -> Option<Vec
             Value::Null => return None,
             v => {
                 out.push(0x00);
-                let ty = columns[ci].ty;
+                let ty = columns[ci].ty.scalar();
                 match v {
                     Value::Int(n) => out.extend_from_slice(&encode_int(ty, *n)),
                     Value::Uuid(u) => out.extend_from_slice(u),
@@ -5402,6 +5742,8 @@ fn expr_has_aggregate(e: &Expr) -> bool {
             expr_has_aggregate(lhs) || expr_has_aggregate(lo) || expr_has_aggregate(hi)
         }
         Expr::Like { lhs, rhs, .. } => expr_has_aggregate(lhs) || expr_has_aggregate(rhs),
+        Expr::Row(items) => items.iter().any(expr_has_aggregate),
+        Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_has_aggregate(base),
         Expr::Case {
             operand,
             whens,
@@ -5462,6 +5804,8 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
             reject_check_structure(lhs)?;
             list.iter().try_for_each(reject_check_structure)
         }
+        Expr::Row(items) => items.iter().try_for_each(reject_check_structure),
+        Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_check_structure(base),
         Expr::Between { lhs, lo, hi, .. } => {
             reject_check_structure(lhs)?;
             reject_check_structure(lo)?;
@@ -5533,6 +5877,8 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
             reject_default_structure(lhs)?;
             list.iter().try_for_each(reject_default_structure)
         }
+        Expr::Row(items) => items.iter().try_for_each(reject_default_structure),
+        Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_default_structure(base),
         Expr::Between { lhs, lo, hi, .. } => {
             reject_default_structure(lhs)?;
             reject_default_structure(lo)?;
@@ -5619,6 +5965,12 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
                     walk(a, columns, out);
                 }
             }
+            Expr::Row(items) => {
+                for it in items {
+                    walk(it, columns, out);
+                }
+            }
+            Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => walk(base, columns, out),
             // Unreachable in a validated check (rejected by `reject_check_structure`).
             Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {}
         }
@@ -5660,6 +6012,9 @@ fn value_to_rexpr(v: &Value) -> RExpr {
         Value::Timestamp(m) => RExpr::ConstTimestamp(*m),
         Value::Timestamptz(m) => RExpr::ConstTimestamptz(*m),
         Value::Interval(iv) => RExpr::ConstInterval(*iv),
+        // A folded composite constant: fold each field and wrap in a ROW node so eval rebuilds the
+        // `Value::Composite` (spec/design/composite.md).
+        Value::Composite(fields) => RExpr::Row(fields.iter().map(value_to_rexpr).collect()),
         // Poisoned (large-values.md §14): a folded subquery's projections are resolved values.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
@@ -5740,6 +6095,8 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
                 || rexpr_references_outer(els, depth)
         }
         RExpr::ScalarFunc { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
+        RExpr::Row(fields) => fields.iter().any(|f| rexpr_references_outer(f, depth)),
+        RExpr::Field { base, .. } => rexpr_references_outer(base, depth),
         RExpr::Column(_)
         | RExpr::Param(_)
         | RExpr::ConstInt(_)
@@ -5810,6 +6167,12 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
                 collect_touched(a, depth, touched);
             }
         }
+        RExpr::Row(fields) => {
+            for f in fields {
+                collect_touched(f, depth, touched);
+            }
+        }
+        RExpr::Field { base, .. } => collect_touched(base, depth, touched),
         RExpr::Param(_)
         | RExpr::ConstInt(_)
         | RExpr::ConstBool(_)
@@ -5914,7 +6277,7 @@ fn binary_expr(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
 /// The argument family a resolved type satisfies, for matching a catalog `arg_families` slot.
 /// `None` for NULL: an untyped NULL matches no *concrete* family — so `abs(NULL)` / `sum(NULL)`
 /// find no overload (42883, the pre-registry behavior) — and only the wildcard "any" accepts it.
-fn arg_family(t: ResolvedType) -> Option<&'static str> {
+fn arg_family(t: &ResolvedType) -> Option<&'static str> {
     match t {
         ResolvedType::Int(_) => Some("integer"),
         ResolvedType::Decimal => Some("decimal"),
@@ -5927,12 +6290,14 @@ fn arg_family(t: ResolvedType) -> Option<&'static str> {
         ResolvedType::Timestamptz => Some("timestamptz"),
         ResolvedType::Interval => Some("interval"),
         ResolvedType::Null => None,
+        // A composite is no built-in function/aggregate argument family this slice.
+        ResolvedType::Composite(_) => None,
     }
 }
 
 /// Whether a resolved argument satisfies one catalog family slot. "any" accepts everything
 /// (NULL included); a concrete family matches only its own type.
-fn family_matches(slot: &str, t: ResolvedType) -> bool {
+fn family_matches(slot: &str, t: &ResolvedType) -> bool {
     slot == "any" || arg_family(t) == Some(slot)
 }
 
@@ -5952,7 +6317,7 @@ fn lookup_scalar_overload(name: &str, arg_tys: &[ResolvedType]) -> Option<&'stat
         o.kind == "function"
             && o.name == name
             && o.arg_families.len() == arg_tys.len()
-            && std::iter::zip(o.arg_families, arg_tys).all(|(slot, t)| family_matches(slot, *t))
+            && std::iter::zip(o.arg_families, arg_tys).all(|(slot, t)| family_matches(slot, t))
     })
 }
 
@@ -5994,7 +6359,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
 /// (e.g. "decimal", "float64", "interval", "int16", "timestamptz", "uuid") naming the result.
 fn scalar_result_type(code: &str, arg_tys: &[ResolvedType]) -> ScalarType {
     if code == "promoted" {
-        return resolved_scalar_type(arg_tys[0]);
+        return resolved_scalar_type(&arg_tys[0]);
     }
     ScalarType::from_name(code)
         .unwrap_or_else(|| unreachable!("scalar_result_type: unknown result code {code}"))
@@ -6002,10 +6367,10 @@ fn scalar_result_type(code: &str, arg_tys: &[ResolvedType]) -> ScalarType {
 
 /// The concrete `ScalarType` carried by a numeric resolved type (for the "promoted" /
 /// "same_as_input" result rules). Only reached for the numeric families those rules admit.
-fn resolved_scalar_type(t: ResolvedType) -> ScalarType {
+fn resolved_scalar_type(t: &ResolvedType) -> ScalarType {
     match t {
-        ResolvedType::Int(it) => it,
-        ResolvedType::Float(ft) => ft,
+        ResolvedType::Int(it) => *it,
+        ResolvedType::Float(ft) => *ft,
         ResolvedType::Decimal => ScalarType::Decimal,
         _ => unreachable!("resolved_scalar_type: non-numeric operand"),
     }
@@ -6022,7 +6387,7 @@ fn aggregate_has_star(surface: &str) -> bool {
 /// The matched aggregate overload row for `surface` over a single operand of resolved type `t`:
 /// the `arg="expr"` catalog row whose lone `arg_families` slot matches. `None` ⇒ no overload
 /// (42883, e.g. `SUM(text)`). MIN/MAX/COUNT take "any" (NULL included); SUM/AVG a numeric family.
-fn lookup_aggregate_overload(surface: &str, t: ResolvedType) -> Option<&'static AggregateDesc> {
+fn lookup_aggregate_overload(surface: &str, t: &ResolvedType) -> Option<&'static AggregateDesc> {
     AGGREGATES.iter().find(|a| {
         a.surface.eq_ignore_ascii_case(surface)
             && a.arg == "expr"
@@ -6036,12 +6401,12 @@ fn lookup_aggregate_overload(surface: &str, t: ResolvedType) -> Option<&'static 
 /// is the aggregate's kernel id (fold/finalize switch on it); selecting it from the registered
 /// `result` code keeps the name gate + overload validation data-driven while the kernel stays
 /// hand-written (§5). `surface` is the lowercased call name; `result` the matched row's code.
-fn aggregate_plan(surface: &str, result: &str, t: ResolvedType) -> (AggPlan, ResolvedType) {
+fn aggregate_plan(surface: &str, result: &str, t: &ResolvedType) -> (AggPlan, ResolvedType) {
     match (surface, result) {
         ("count", _) => (AggPlan::Count, ResolvedType::Int(ScalarType::Int64)),
         // SUM(int16|int32) → int64; SUM(int64) → decimal (PG widening).
         ("sum", "sum_widen") => match t {
-            ResolvedType::Int(it) if it == ScalarType::Int64 => {
+            ResolvedType::Int(it) if *it == ScalarType::Int64 => {
                 (AggPlan::SumDecimal, ResolvedType::Decimal)
             }
             ResolvedType::Int(_) => (AggPlan::SumInt, ResolvedType::Int(ScalarType::Int64)),
@@ -6059,8 +6424,8 @@ fn aggregate_plan(surface: &str, result: &str, t: ResolvedType) -> (AggPlan, Res
             (AggPlan::AvgFloat(ft), ResolvedType::Float(ft))
         }
         // MIN/MAX accept any ordered scalar; the result is the argument's own type.
-        ("min", "same_as_input") => (AggPlan::Min, t),
-        ("max", "same_as_input") => (AggPlan::Max, t),
+        ("min", "same_as_input") => (AggPlan::Min, t.clone()),
+        ("max", "same_as_input") => (AggPlan::Max, t.clone()),
         _ => unreachable!("aggregate_plan: unhandled ({surface}, {result})"),
     }
 }
@@ -6102,8 +6467,8 @@ fn resolve_aggregate(
         // (surface, operand-family) overload exists (else 42883) and yields its result code; the
         // plan + result type follow from it (the PG widening).
         let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
-        let desc = lookup_aggregate_overload(name, t).ok_or_else(|| no_agg_overload(name))?;
-        let (plan, result) = aggregate_plan(name, desc.result, t);
+        let desc = lookup_aggregate_overload(name, &t).ok_or_else(|| no_agg_overload(name))?;
+        let (plan, result) = aggregate_plan(name, desc.result, &t);
         (plan, Some(r), result)
     };
     if let AggCtx::Collect { group_keys, specs } = agg {
@@ -6125,7 +6490,7 @@ fn collect_column(
     idx: usize,
     name: &str,
 ) -> Result<(RExpr, ResolvedType)> {
-    let ty = resolved_type_of(scope.column_at(idx).ty);
+    let ty = resolved_type_of_col(&scope.column_at(idx).ty, scope.catalog);
     match agg {
         AggCtx::Forbidden => Ok((RExpr::Column(idx), ty)),
         AggCtx::Collect { group_keys, .. } => match group_keys.iter().position(|&gk| gk == idx) {
@@ -6419,7 +6784,7 @@ fn resolve_scalar_func(
         rargs = rargs
             .into_iter()
             .zip(tys.iter())
-            .map(|(r, t)| widen_float_to_f64(r, *t))
+            .map(|(r, t)| widen_float_to_f64(r, t))
             .collect();
     }
     Ok((
@@ -6472,16 +6837,46 @@ fn resolve_projections(
                 for (i, c) in rel.table.columns.iter().enumerate() {
                     nodes.push(RExpr::Column(rel.offset + i));
                     names.push(c.name.clone());
-                    types.push(ResolvedType::of_column(c.ty));
+                    types.push(resolved_type_of_col(&c.ty, scope.catalog));
                 }
             }
             Ok((nodes, names, types))
         }
         SelectItems::Items(items) => {
-            let mut nodes = Vec::with_capacity(items.len());
-            let mut names = Vec::with_capacity(items.len());
-            let mut types = Vec::with_capacity(items.len());
+            let mut nodes = Vec::new();
+            let mut names = Vec::new();
+            let mut types = Vec::new();
             for it in items {
+                // `(expr).*` expands a composite base into one output column per field, in
+                // declaration order (spec/design/composite.md §S4). The base AST is re-resolved
+                // per field (Expr is Clone, RExpr is not) — deterministic, since resolution is
+                // pure. An explicit alias on `(c).*` is rejected by PG; we ignore it here (the
+                // parser does not attach one to a star item in practice).
+                if let Expr::FieldStar { base } = &it.expr {
+                    let (_, base_ty) = resolve(scope, base, None, agg, params)?;
+                    let fields = match base_ty {
+                        ResolvedType::Composite(c) => c.fields,
+                        other => {
+                            return Err(EngineError::new(
+                                SqlState::WrongObjectType,
+                                format!(
+                                    "column notation .* applied to type {}, which is not a composite type",
+                                    other.type_name()
+                                ),
+                            ));
+                        }
+                    };
+                    for (i, (fname, fty)) in fields.into_iter().enumerate() {
+                        let (bn, _) = resolve(scope, base, None, agg, params)?;
+                        nodes.push(RExpr::Field {
+                            base: Box::new(bn),
+                            index: i,
+                        });
+                        names.push(fname);
+                        types.push(fty);
+                    }
+                    continue;
+                }
                 let (node, ty) = resolve(scope, &it.expr, None, agg, params)?;
                 names.push(match &it.alias {
                     Some(a) => a.clone(),
@@ -6514,8 +6909,10 @@ fn output_name(scope: &Scope, e: &Expr) -> String {
             Err(_) => name.clone(),
         },
         // An un-aliased aggregate call is named by its lowercased function name (PG;
-        // spec/design/grammar.md §8). Any other expression takes the fixed `?column?`.
+        // spec/design/grammar.md §8). A field selection takes the FIELD name (PG names the
+        // output column after the selected field). Any other expression takes `?column?`.
         Expr::FuncCall { name, .. } => name.to_ascii_lowercase(),
+        Expr::FieldAccess { field, .. } => field.to_ascii_lowercase(),
         _ => "?column?".to_string(),
     }
 }
@@ -6536,7 +6933,8 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> R
         | ResolvedType::Timestamp
         | ResolvedType::Timestamptz
         | ResolvedType::Interval
-        | ResolvedType::Float(_) => Err(type_error("argument of WHERE must be boolean")),
+        | ResolvedType::Float(_)
+        | ResolvedType::Composite(_) => Err(type_error("argument of WHERE must be boolean")),
     }
 }
 
@@ -6655,6 +7053,8 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
             | Statement::DropTable(_)
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
+            | Statement::CreateType(_)
+            | Statement::DropType(_)
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
@@ -6669,6 +7069,8 @@ fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::DropTable(_) => "DROP TABLE",
         Statement::CreateIndex(_) => "CREATE INDEX",
         Statement::DropIndex(_) => "DROP INDEX",
+        Statement::CreateType(_) => "CREATE TYPE",
+        Statement::DropType(_) => "DROP TYPE",
         Statement::Insert(_) => "INSERT",
         Statement::Update(_) => "UPDATE",
         Statement::Delete(_) => "DELETE",
@@ -6676,6 +7078,29 @@ fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::Begin { .. } => "BEGIN",
         Statement::Commit => "COMMIT",
         Statement::Rollback => "ROLLBACK",
+    }
+}
+
+/// The resolved (static) type of a column of (possibly composite) declared type `ty`, resolving a
+/// composite reference against the database's type catalog (spec/design/composite.md §5). Recurses
+/// for nested composites; the lookup always succeeds (`validate_composite_types` proved it).
+fn resolved_type_of_col(ty: &Type, db: &Database) -> ResolvedType {
+    match ty {
+        Type::Scalar(s) => resolved_type_of(*s),
+        Type::Composite(r) => {
+            let def = db
+                .composite_type(&r.name)
+                .expect("composite type reference resolved at load / CREATE TYPE");
+            let fields = def
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), resolved_type_of_col(&f.ty, db)))
+                .collect();
+            ResolvedType::Composite(Box::new(CompositeRType {
+                name: Some(def.name.clone()),
+                fields,
+            }))
+        }
     }
 }
 
@@ -6723,9 +7148,50 @@ fn resolve_column_ref(
     match r {
         Resolved::Local(idx) => collect_column(scope, agg, idx, name),
         Resolved::Outer { level, index } => {
-            let ty = resolved_type_of(scope.column_of(r).ty);
+            let ty = resolved_type_of_col(&scope.column_of(r).ty, scope.catalog);
             Ok((RExpr::OuterColumn { level, index }, ty))
         }
+    }
+}
+
+/// Resolve a composite field selection `base.field` (spec/design/composite.md §S4) given the
+/// already-resolved `base` node and its static type: `base` must be composite — else 42809
+/// (wrong_object_type, PG's "column notation applied to non-composite") — and `field` must name
+/// one of its fields case-insensitively (PG folds the identifier), else 42703 (undefined_column).
+/// Returns the `RExpr::Field` node carrying the fixed field ordinal, plus the field's static type.
+fn resolve_field_of(
+    base_node: RExpr,
+    base_ty: ResolvedType,
+    field: &str,
+) -> Result<(RExpr, ResolvedType)> {
+    let c = match base_ty {
+        ResolvedType::Composite(c) => c,
+        other => {
+            return Err(EngineError::new(
+                SqlState::WrongObjectType,
+                format!(
+                    "column notation .{field} applied to type {}, which is not a composite type",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    match c
+        .fields
+        .iter()
+        .position(|(n, _)| n.eq_ignore_ascii_case(field))
+    {
+        Some(idx) => {
+            let fty = c.fields[idx].1.clone();
+            Ok((
+                RExpr::Field {
+                    base: Box::new(base_node),
+                    index: idx,
+                },
+                fty,
+            ))
+        }
+        None => Err(undefined_column(field)),
     }
 }
 
@@ -6756,6 +7222,23 @@ fn resolve(
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     match e {
+        // A `ROW(...)` constructor (spec/design/composite.md §1): resolve each field with no type
+        // context (its natural type), producing an ANONYMOUS composite (`name = None`, fields named
+        // `f1, f2, …` per PG). Storing it into a named composite column matches structurally
+        // (assignability at the store site coerces each field to the target's declared type).
+        Expr::Row(items) => {
+            let mut nodes = Vec::with_capacity(items.len());
+            let mut fields = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                let (node, ty) = resolve(scope, it, None, agg, params)?;
+                nodes.push(node);
+                fields.push((format!("f{}", i + 1), ty));
+            }
+            Ok((
+                RExpr::Row(nodes),
+                ResolvedType::Composite(Box::new(CompositeRType { name: None, fields })),
+            ))
+        }
         Expr::Column(name) => {
             // Resolve against the scope CHAIN (§26). Existence first (42703/42702 take priority,
             // matching PostgreSQL); a Local match then obeys the grouping rule, an Outer
@@ -6764,9 +7247,25 @@ fn resolve(
             resolve_column_ref(scope, agg, r, name)
         }
         Expr::QualifiedColumn { qualifier, name } => {
+            // A bare `rel.col` resolves strictly against the FROM relations — `qualifier` MUST name
+            // a relation (else 42P01), matching PostgreSQL. Composite field access on a column is
+            // the **parens-required** `(col).field` form (spec/design/composite.md §1/§S4), an
+            // `Expr::FieldAccess`, never this bare qualified-column path (PG raises 42P01 for the
+            // unparenthesized `col.field` / `t.col.field` spellings).
             let r = scope.resolve_qualified(qualifier, name)?;
             resolve_column_ref(scope, agg, r, name)
         }
+        // `(expr).field` — composite field selection (spec/design/composite.md §S4).
+        Expr::FieldAccess { base, field } => {
+            let (node, ty) = resolve(scope, base, None, agg, params)?;
+            resolve_field_of(node, ty, field)
+        }
+        // `(expr).*` — whole-row expansion is a projection-list construct only; in a scalar
+        // expression position it is unsupported (PG rejects row expansion here — 0A000).
+        Expr::FieldStar { .. } => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "row expansion (.*) is not supported in this context",
+        )),
         Expr::Param(n1) => {
             // A bind parameter is an adaptable operand (like an integer/string literal): it
             // takes its type from `ctx` — the sibling operand, target column, or CAST target.
@@ -6861,6 +7360,11 @@ fn resolve(
         // the type by name (unknown → 42704) and coerce the string to it at resolve, independent of
         // any context. No typmod rides on the literal (the parser's one-token lookahead admits none).
         Expr::TypedLiteral { type_name, text } => {
+            // A composite type name (`addr '(Main,90210)'`) coerces the string via `record_in`
+            // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
+            if let Some(ct) = scope.catalog.composite_type(type_name) {
+                return coerce_string_to_composite(text, ct, scope.catalog);
+            }
             let (target, _) = resolve_type_and_typmod(type_name, &None)?;
             coerce_string_literal(text, target, None)
         }
@@ -6877,7 +7381,7 @@ fn resolve(
                     "subquery must return only one column",
                 ));
             }
-            let out_type = plan.column_types()[0];
+            let out_type = plan.column_types()[0].clone();
             Ok((
                 RExpr::Subquery {
                     plan: Box::new(plan),
@@ -6918,7 +7422,7 @@ fn resolve(
                     "subquery has too many columns",
                 ));
             }
-            classify_comparable(lt, plan.column_types()[0])?;
+            classify_comparable(&lt, &plan.column_types()[0])?;
             Ok((
                 RExpr::Subquery {
                     plan: Box::new(plan),
@@ -6934,6 +7438,42 @@ fn resolve(
             type_name,
             type_mod,
         } => {
+            // A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
+            // (spec/design/composite.md §8). A STRING LITERAL operand coerces via `record_in` (the
+            // `'(…)'::addr` headline); a bare NULL adapts to the composite; a same-named composite
+            // operand is the identity. Every other operand (a runtime text expression, an anonymous
+            // `ROW(…)`) is a documented `0A000` narrowing this slice — relaxable. A type modifier on
+            // a composite is meaningless (`0A000`).
+            if let Some(ct) = scope.catalog.composite_type(type_name) {
+                if type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a type modifier is not supported on a composite type",
+                    ));
+                }
+                if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
+                    return coerce_string_to_composite(s, ct, scope.catalog);
+                }
+                let ct_name = ct.name.clone();
+                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                return match &ity {
+                    ResolvedType::Null => Ok((
+                        rinner,
+                        resolved_type_of_col(
+                            &Type::Composite(crate::types::CompositeRef { name: ct_name }),
+                            scope.catalog,
+                        ),
+                    )),
+                    // An identical named composite is the identity cast.
+                    ResolvedType::Composite(c) if c.name.as_deref() == Some(ct_name.as_str()) => {
+                        Ok((rinner, ity))
+                    }
+                    _ => Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting to a composite type is only supported from a string literal",
+                    )),
+                };
+            }
             let (target, typmod) = resolve_type_and_typmod(type_name, type_mod)?;
             // A string LITERAL operand is coerced to the target at resolve — `CAST('42' AS int)`,
             // the same primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5).
@@ -7051,6 +7591,13 @@ fn resolve(
                         "casting from an interval type is not supported yet",
                     ));
                 }
+                // Casting a composite (text↔composite) lands in a later slice (composite.md §8/§12).
+                ResolvedType::Composite(_) => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting a composite value is not supported yet",
+                    ));
+                }
             }
             let result_ty = if target.is_decimal() {
                 ResolvedType::Decimal
@@ -7086,7 +7633,8 @@ fn resolve(
                 | ResolvedType::Bytea
                 | ResolvedType::Uuid
                 | ResolvedType::Timestamp
-                | ResolvedType::Timestamptz => {
+                | ResolvedType::Timestamptz
+                | ResolvedType::Composite(_) => {
                     return Err(type_error("unary minus requires a numeric operand"));
                 }
             };
@@ -7112,7 +7660,7 @@ fn resolve(
             operand,
         } => {
             let (rop, ty) = resolve(scope, operand, None, agg, params)?;
-            require_bool(ty, "NOT requires a boolean operand")?;
+            require_bool(&ty, "NOT requires a boolean operand")?;
             Ok((RExpr::Not(Box::new(rop)), ResolvedType::Bool))
         }
         Expr::IsNull { operand, negated } => {
@@ -7132,7 +7680,7 @@ fn resolve(
             // the operands be comparable (both integer-ish or both text-ish; a mixed pair
             // is 42804). The result is always a definite boolean (functions.md §3).
             let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
-            classify_comparable(lt, rt)?;
+            classify_comparable(&lt, &rt)?;
             Ok((
                 RExpr::Distinct {
                     lhs: Box::new(rl),
@@ -7205,8 +7753,8 @@ fn resolve(
             // operand is 42804. We do NOT use classify_comparable here — it would wrongly accept
             // bytea×bytea, which LIKE does not define.
             let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
-            require_text_or_null(lt)?;
-            require_text_or_null(rt)?;
+            require_text_or_null(&lt)?;
+            require_text_or_null(&rt)?;
             Ok((
                 RExpr::Like {
                     lhs: Box::new(rl),
@@ -7235,7 +7783,7 @@ fn resolve(
                     }
                     None => {
                         let (rc, cty) = resolve(scope, cond, None, agg, params)?;
-                        require_bool(cty, "CASE WHEN condition must be boolean")?;
+                        require_bool(&cty, "CASE WHEN condition must be boolean")?;
                         rc
                     }
                 };
@@ -7281,7 +7829,7 @@ fn resolve_binary(
             // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5).
             // interval * number, number * interval (commute), interval / number. Checked before
             // the ±-only temporal rule below.
-            if let Some(res) = interval_scale_result(op, lt, rt) {
+            if let Some(res) = interval_scale_result(op, &lt, &rt) {
                 let result = res?;
                 let aop = if matches!(op, BinaryOp::Mul) {
                     ArithOp::Mul
@@ -7302,7 +7850,7 @@ fn resolve_binary(
             // ± interval, interval + timestamp[tz], and timestamp[tz] − timestamp[tz] → interval.
             // The eval dispatches on the value kinds; here we settle the result type. A temporal
             // operand in any other combination is a 42804.
-            if let Some(res) = temporal_arith_result(op, lt, rt) {
+            if let Some(res) = temporal_arith_result(op, &lt, &rt) {
                 let result = res?;
                 let aop = if matches!(op, BinaryOp::Add) {
                     ArithOp::Add
@@ -7351,8 +7899,8 @@ fn resolve_binary(
                     }
                 }
             }
-            require_numeric_operand(lt)?;
-            require_numeric_operand(rt)?;
+            require_numeric_operand(&lt)?;
+            require_numeric_operand(&rt)?;
             let aop = match op {
                 BinaryOp::Add => ArithOp::Add,
                 BinaryOp::Sub => ArithOp::Sub,
@@ -7364,7 +7912,7 @@ fn resolve_binary(
             let (result, rty) = if lt == ResolvedType::Decimal || rt == ResolvedType::Decimal {
                 (ScalarType::Decimal, ResolvedType::Decimal)
             } else {
-                let p = promote(lt, rt);
+                let p = promote(&lt, &rt);
                 (p, ResolvedType::Int(p))
             };
             Ok((
@@ -7383,12 +7931,12 @@ fn resolve_binary(
             // text), then require they be comparable — a mixed integer/text pair is 42804.
             // The runtime comparison (eq3/lt3/gt3) dispatches on the value variants.
             let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
-            classify_comparable(lt, rt)?;
+            classify_comparable(&lt, &rt)?;
             // A mixed-width float comparison promotes the float32 side to float64 first (the
             // implicit cast — spec/design/float.md §2/§3), so the runtime compare sees one width.
             let (rl, rr) =
                 if matches!(lt, ResolvedType::Float(_)) && matches!(rt, ResolvedType::Float(_)) {
-                    (widen_float_to_f64(rl, lt), widen_float_to_f64(rr, rt))
+                    (widen_float_to_f64(rl, &lt), widen_float_to_f64(rr, &rt))
                 } else {
                     (rl, rr)
                 };
@@ -7412,8 +7960,8 @@ fn resolve_binary(
         BinaryOp::And | BinaryOp::Or => {
             let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
             let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
-            require_bool(lt, "AND/OR requires boolean operands")?;
-            require_bool(rt, "AND/OR requires boolean operands")?;
+            require_bool(&lt, "AND/OR requires boolean operands")?;
+            require_bool(&rt, "AND/OR requires boolean operands")?;
             let node = if matches!(op, BinaryOp::And) {
                 RExpr::And(Box::new(rl), Box::new(rr))
             } else {
@@ -7448,11 +7996,11 @@ fn resolve_operand_pair(
         (rl, lt, rr, rt)
     } else if lhs_lit {
         let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
-        let (rl, lt) = resolve(scope, lhs, ctx_of(rt), agg, params)?;
+        let (rl, lt) = resolve(scope, lhs, ctx_of(&rt), agg, params)?;
         (rl, lt, rr, rt)
     } else if rhs_lit {
         let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
-        let (rr, rt) = resolve(scope, rhs, ctx_of(lt), agg, params)?;
+        let (rr, rt) = resolve(scope, rhs, ctx_of(&lt), agg, params)?;
         (rl, lt, rr, rt)
     } else {
         let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
@@ -7480,15 +8028,17 @@ fn is_adaptable_operand(e: &Expr) -> bool {
 /// the hex/uuid input); a bind parameter additionally adopts a `decimal`/`boolean` sibling (a
 /// literal ignores those — its arm keeps int64/text — so widening the mapping is safe). Only a
 /// bare NULL offers no context.
-fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
+fn ctx_of(ty: &ResolvedType) -> Option<ScalarType> {
     match ty {
-        ResolvedType::Int(t) => Some(t),
+        ResolvedType::Int(t) => Some(*t),
         ResolvedType::Bytea => Some(ScalarType::Bytea),
         ResolvedType::Uuid => Some(ScalarType::Uuid),
         ResolvedType::Text => Some(ScalarType::Text),
         ResolvedType::Bool => Some(ScalarType::Bool),
         ResolvedType::Decimal => Some(ScalarType::Decimal),
         ResolvedType::Null => None,
+        // A composite sibling offers no scalar adaptation context (a ROW literal is the path).
+        ResolvedType::Composite(_) => None,
         // A datetime sibling offers its type so a string literal parses as that datetime.
         ResolvedType::Timestamp => Some(ScalarType::Timestamp),
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
@@ -7498,7 +8048,7 @@ fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
         // context (decimal/int → float at the sibling's width — spec/design/float.md §4). A bare
         // string literal does NOT adapt to a float sibling (its Literal::Text arm keeps it text),
         // so widening the mapping is safe.
-        ResolvedType::Float(st) => Some(st),
+        ResolvedType::Float(st) => Some(*st),
     }
 }
 
@@ -7511,11 +8061,11 @@ fn ctx_of(ty: ResolvedType) -> Option<ScalarType> {
 /// and evaluates to NULL).
 fn temporal_arith_result(
     op: BinaryOp,
-    lt: ResolvedType,
-    rt: ResolvedType,
+    lt: &ResolvedType,
+    rt: &ResolvedType,
 ) -> Option<Result<ScalarType>> {
     use ResolvedType as R;
-    let temporal = |t: R| matches!(t, R::Interval | R::Timestamp | R::Timestamptz);
+    let temporal = |t: &R| matches!(t, R::Interval | R::Timestamp | R::Timestamptz);
     if !temporal(lt) && !temporal(rt) {
         return None;
     }
@@ -7549,8 +8099,8 @@ fn temporal_arith_result(
 /// temporal rule, which reports the 42804.
 fn interval_scale_result(
     op: BinaryOp,
-    lt: ResolvedType,
-    rt: ResolvedType,
+    lt: &ResolvedType,
+    rt: &ResolvedType,
 ) -> Option<Result<ScalarType>> {
     use ResolvedType as R;
     let l_iv = matches!(lt, R::Interval);
@@ -7558,7 +8108,7 @@ fn interval_scale_result(
     if !l_iv && !r_iv {
         return None;
     }
-    let numeric = |t: R| matches!(t, R::Int(_) | R::Decimal | R::Null);
+    let numeric = |t: &R| matches!(t, R::Int(_) | R::Decimal | R::Null);
     match op {
         BinaryOp::Mul if (l_iv && numeric(rt)) || (r_iv && numeric(lt)) => {
             Some(Ok(ScalarType::Interval))
@@ -7578,7 +8128,7 @@ fn factor_to_fraction(v: &Value) -> Result<(i128, i128)> {
     }
 }
 
-fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
+fn require_numeric_operand(ty: &ResolvedType) -> Result<()> {
     match ty {
         ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null => Ok(()),
         // Float reaches here only as the NON-float side of a mixed pair (a pure float × float pair
@@ -7590,7 +8140,8 @@ fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
         | ResolvedType::Timestamp
         | ResolvedType::Timestamptz
         | ResolvedType::Interval
-        | ResolvedType::Float(_) => {
+        | ResolvedType::Float(_)
+        | ResolvedType::Composite(_) => {
             Err(type_error("arithmetic operators require numeric operands"))
         }
     }
@@ -7601,11 +8152,31 @@ fn require_numeric_operand(ty: ResolvedType) -> Result<()> {
 /// boolean, or both bytea (NULL counts as any). A cross-family pair (numeric/text,
 /// boolean/non-boolean, bytea/non-bytea, …) is a 42804 type error — comparison is overloaded
 /// across these families but never compares across them.
-fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
+fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Result<()> {
     use ResolvedType::{
-        Bool, Bytea, Decimal, Float, Int, Interval, Null, Text, Timestamp, Timestamptz, Uuid,
+        Bool, Bytea, Composite, Decimal, Float, Int, Interval, Null, Text, Timestamp, Timestamptz,
+        Uuid,
     };
     match (lt, rt) {
+        // Composite comparison is element-wise row comparison (spec/design/composite.md §5): two
+        // composites are comparable iff they have the SAME field count and each corresponding
+        // field pair is itself comparable (recursively — a nested composite recurses here, an
+        // anonymous `ROW(…)` compares against a same-shape named type). A bare NULL is always
+        // comparable (the comparison is unknown). A composite vs any non-composite, or a row-size
+        // mismatch, or an incomparable field pair, is 42804.
+        (Composite(_), Null) | (Null, Composite(_)) => Ok(()),
+        (Composite(a), Composite(b)) => {
+            if a.fields.len() != b.fields.len() {
+                return Err(type_error("cannot compare rows of different sizes"));
+            }
+            for ((_, fa), (_, fb)) in a.fields.iter().zip(b.fields.iter()) {
+                classify_comparable(fa, fb)?;
+            }
+            Ok(())
+        }
+        (Composite(_), _) | (_, Composite(_)) => Err(type_error(
+            "cannot compare a composite value with a value of a different type",
+        )),
         // Float is a STRICT ISLAND (spec/design/float.md §3/§6): comparable only float × float
         // (either width — a mixed-width pair promotes to float64 first, compare.toml `max-rank`)
         // or with a bare NULL. Float vs ANY other family (int/decimal included) is 42804 — jed
@@ -7675,9 +8246,9 @@ fn classify_comparable(lt: ResolvedType, rt: ResolvedType) -> Result<()> {
 
 /// The `ScalarType` of an integer-typed resolved expression, or `None` for a NULL
 /// literal or a non-integer type (used to pick a sibling literal's context).
-fn int_type(ty: ResolvedType) -> Option<ScalarType> {
+fn int_type(ty: &ResolvedType) -> Option<ScalarType> {
     match ty {
-        ResolvedType::Int(t) => Some(t),
+        ResolvedType::Int(t) => Some(*t),
         _ => None,
     }
 }
@@ -7685,7 +8256,7 @@ fn int_type(ty: ResolvedType) -> Option<ScalarType> {
 /// Wrap a `float32`-typed operand in an implicit `CAST(... AS float64)` so a mixed-width float
 /// pair (compare or arith) computes at one width (spec/design/float.md §2/§5). A float64 or
 /// non-float operand is returned unchanged; the caller decides when widening is needed.
-fn widen_float_to_f64(node: RExpr, ty: ResolvedType) -> RExpr {
+fn widen_float_to_f64(node: RExpr, ty: &ResolvedType) -> RExpr {
     if matches!(ty, ResolvedType::Float(ScalarType::Float32)) {
         RExpr::Cast {
             inner: Box::new(node),
@@ -7708,20 +8279,20 @@ fn promote_float_arith(
     rt: ResolvedType,
 ) -> Option<(RExpr, RExpr, ScalarType)> {
     use ResolvedType::{Float, Null};
-    let width = match (lt, rt) {
+    let width = match (&lt, &rt) {
         (Float(a), Float(b)) => {
             if a.rank() >= b.rank() {
-                a
+                *a
             } else {
-                b
+                *b
             }
         }
-        (Float(a), Null) | (Null, Float(a)) => a,
+        (Float(a), Null) | (Null, Float(a)) => *a,
         _ => return None,
     };
     // Promote a float32 operand to the common width when the result is float64.
     let (rl, rr) = if width == ScalarType::Float64 {
-        (widen_float_to_f64(rl, lt), widen_float_to_f64(rr, rt))
+        (widen_float_to_f64(rl, &lt), widen_float_to_f64(rr, &rt))
     } else {
         (rl, rr)
     };
@@ -7730,7 +8301,7 @@ fn promote_float_arith(
 
 /// The promotion-tower result type of two arithmetic operands: the higher-ranked
 /// integer type, or int64 when both are untyped NULLs.
-fn promote(a: ResolvedType, b: ResolvedType) -> ScalarType {
+fn promote(a: &ResolvedType, b: &ResolvedType) -> ScalarType {
     match (int_type(a), int_type(b)) {
         (Some(x), Some(y)) => {
             if x.rank() >= y.rank() {
@@ -7748,7 +8319,7 @@ fn promote(a: ResolvedType, b: ResolvedType) -> ScalarType {
 /// LIKE requires both operands be `text` (or a bare NULL literal, which is comparable with
 /// anything and makes the result NULL at eval). A non-text operand is a 42804 type error
 /// (spec/design/grammar.md §22).
-fn require_text_or_null(ty: ResolvedType) -> Result<()> {
+fn require_text_or_null(ty: &ResolvedType) -> Result<()> {
     match ty {
         ResolvedType::Text | ResolvedType::Null => Ok(()),
         _ => Err(type_error("LIKE requires text operands")),
@@ -7762,11 +8333,7 @@ fn require_text_or_null(ty: ResolvedType) -> Result<()> {
 /// otherwise they must all be the same non-numeric family (text/boolean/bytea). A cross-family
 /// mix (e.g. integer and text) is 42804.
 fn unify_case_types(arms: &[ResolvedType]) -> Result<ResolvedType> {
-    let non_null: Vec<ResolvedType> = arms
-        .iter()
-        .copied()
-        .filter(|t| *t != ResolvedType::Null)
-        .collect();
+    let non_null: Vec<&ResolvedType> = arms.iter().filter(|t| **t != ResolvedType::Null).collect();
     let Some(&first) = non_null.first() else {
         // Every arm is NULL/untyped — PostgreSQL types the CASE as text.
         return Ok(ResolvedType::Text);
@@ -7775,24 +8342,24 @@ fn unify_case_types(arms: &[ResolvedType]) -> Result<ResolvedType> {
         .iter()
         .all(|t| matches!(t, ResolvedType::Int(_) | ResolvedType::Decimal));
     if all_numeric {
-        if non_null.iter().any(|t| *t == ResolvedType::Decimal) {
+        if non_null.iter().any(|t| **t == ResolvedType::Decimal) {
             return Ok(ResolvedType::Decimal);
         }
         // All integer: the widest via the promotion tower (width is unobservable in output —
         // every integer renders under the `I` tag — but the fold keeps the type precise).
-        let mut acc = first;
+        let mut acc = first.clone();
         for t in &non_null[1..] {
-            acc = ResolvedType::Int(promote(acc, *t));
+            acc = ResolvedType::Int(promote(&acc, t));
         }
         return Ok(acc);
     }
     // Non-numeric: every arm must be the same family as the first (cross-family is 42804).
     for t in &non_null[1..] {
-        if std::mem::discriminant(t) != std::mem::discriminant(&first) {
+        if std::mem::discriminant(*t) != std::mem::discriminant(first) {
             return Err(type_error("CASE result types must be compatible"));
         }
     }
-    Ok(first)
+    Ok(first.clone())
 }
 
 /// Coerce a CASE arm's value to the unified result type. The only runtime coercion needed is
@@ -7821,11 +8388,11 @@ fn setop_name(op: SetOpKind) -> &'static str {
 /// — PostgreSQL would call a top-level one `text`, but the type is never observed in output); a
 /// same-family non-numeric pair gives that type; anything else is 42804. The set of unifiable
 /// pairs mirrors the comparability matrix (compare.toml).
-fn unify_setop_column(a: ResolvedType, b: ResolvedType, op: SetOpKind) -> Result<ResolvedType> {
+fn unify_setop_column(a: &ResolvedType, b: &ResolvedType, op: SetOpKind) -> Result<ResolvedType> {
     use ResolvedType::*;
     let out = match (a, b) {
         (Null, Null) => Null,
-        (Null, x) | (x, Null) => x,
+        (Null, x) | (x, Null) => x.clone(),
         (Int(_), Int(_)) => Int(promote(a, b)),
         (Decimal, Decimal) | (Int(_), Decimal) | (Decimal, Int(_)) => Decimal,
         (Text, Text) => Text,
@@ -7853,8 +8420,8 @@ fn unify_setop_column(a: ResolvedType, b: ResolvedType, op: SetOpKind) -> Result
 /// change is integer -> decimal (a NULL stays NULL; integer-width promotion is a value no-op since
 /// every integer is i64). Same conversion `coerce_case` uses for CASE.
 fn coerce_setop_rows(rows: &mut [Vec<Value>], from: &[ResolvedType], to: &[ResolvedType]) {
-    for (i, (&f, &t)) in from.iter().zip(to.iter()).enumerate() {
-        if matches!(f, ResolvedType::Int(_)) && t == ResolvedType::Decimal {
+    for (i, (f, t)) in from.iter().zip(to.iter()).enumerate() {
+        if matches!(f, ResolvedType::Int(_)) && *t == ResolvedType::Decimal {
             for row in rows.iter_mut() {
                 if let Value::Int(n) = &row[i] {
                     let n = *n;
@@ -7975,7 +8542,7 @@ fn resolve_setop_order_key(key: &OrderKey, names: &[String]) -> Result<usize> {
         })
 }
 
-fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
+fn require_bool(ty: &ResolvedType, msg: &str) -> Result<()> {
     match ty {
         ResolvedType::Bool | ResolvedType::Null => Ok(()),
         ResolvedType::Int(_)
@@ -7986,7 +8553,8 @@ fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
         | ResolvedType::Timestamp
         | ResolvedType::Timestamptz
         | ResolvedType::Interval
-        | ResolvedType::Float(_) => Err(type_error(msg)),
+        | ResolvedType::Float(_)
+        | ResolvedType::Composite(_) => Err(type_error(msg)),
     }
 }
 
@@ -7994,7 +8562,7 @@ fn require_bool(ty: ResolvedType, msg: &str) -> Result<()> {
 /// integer (or NULL) value; a text column takes a text (or NULL) value; a boolean column
 /// takes a boolean (or NULL) value. Any cross-family pair is a 42804 type error. Mirrors
 /// the INSERT literal type-check, generalized to expressions.
-fn require_assignable(ty: ResolvedType, col_ty: ScalarType, col: &str) -> Result<()> {
+fn require_assignable(ty: &ResolvedType, col_ty: ScalarType, col: &str) -> Result<()> {
     let ok = if col_ty.is_integer() {
         matches!(ty, ResolvedType::Int(_) | ResolvedType::Null)
     } else if col_ty.is_decimal() {
@@ -8170,6 +8738,62 @@ fn decode_uuid_literal(s: &str) -> Result<[u8; 16]> {
 /// uuid), `text` is identity, and the native-syntax types (int / decimal / boolean) are the cast
 /// from text admitted only for a literal operand. Errors: `22P02` malformed / `22003` out of
 /// range / the type's own parse code. `typmod` (decimal only) re-scales the result.
+/// Coerce a composite text literal `'(…)'` to a folded `Value::Composite` — PostgreSQL's
+/// `record_in`, the exact inverse of `record_out` (spec/design/composite.md §8). Used by
+/// `'(…)'::type` and the `type '(…)'` typed literal. Tokenizes via `value::parse_record_tokens`
+/// (a malformed literal or a field-count mismatch is `22P02`), then coerces each present token to
+/// its field's type — a scalar via the same string-literal coercion as a typed literal, a NULL
+/// token to a NULL, a nested composite field recursively. Folds to a constant `RExpr::Row` of the
+/// coerced field nodes (so `eval` rebuilds the `Value::Composite`), statically typed as the named
+/// composite. The recursion is sound because every field type was proven to exist at `CREATE TYPE`.
+fn coerce_string_to_composite(
+    text: &str,
+    ct: &CompositeType,
+    catalog: &Database,
+) -> Result<(RExpr, ResolvedType)> {
+    let malformed = || {
+        EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            format!("malformed record literal: \"{text}\" for type {}", ct.name),
+        )
+    };
+    let tokens = crate::value::parse_record_tokens(text).ok_or_else(malformed)?;
+    if tokens.len() != ct.fields.len() {
+        return Err(malformed());
+    }
+    let mut nodes = Vec::with_capacity(tokens.len());
+    let mut field_types = Vec::with_capacity(tokens.len());
+    for (tok, f) in tokens.into_iter().zip(ct.fields.iter()) {
+        match tok {
+            // A NULL field: a NULL value, typed by the field's declared type.
+            None => {
+                nodes.push(RExpr::ConstNull);
+                field_types.push((f.name.clone(), resolved_type_of_col(&f.ty, catalog)));
+            }
+            Some(s) => {
+                let (node, ty) = match &f.ty {
+                    Type::Composite(r) => {
+                        let nested = catalog
+                            .composite_type(&r.name)
+                            .expect("nested composite type resolved at CREATE TYPE / load");
+                        coerce_string_to_composite(&s, nested, catalog)?
+                    }
+                    Type::Scalar(scalar) => coerce_string_literal(&s, *scalar, f.decimal)?,
+                };
+                nodes.push(node);
+                field_types.push((f.name.clone(), ty));
+            }
+        }
+    }
+    Ok((
+        RExpr::Row(nodes),
+        ResolvedType::Composite(Box::new(CompositeRType {
+            name: Some(ct.name.clone()),
+            fields: field_types,
+        })),
+    ))
+}
+
 fn coerce_string_literal(
     s: &str,
     target: ScalarType,
@@ -8608,8 +9232,73 @@ fn store_value(
                 )))
             }
         }
+        // A composite value into a scalar column is a type mismatch (a composite column routes
+        // through `coerce_for_store`/`store_composite`, never the scalar `store_value` — composite.md §4).
+        Value::Composite(_) => Err(type_error(format!(
+            "cannot store a record value in {} column {col_name}",
+            col_ty.canonical_name()
+        ))),
         // Poisoned (large-values.md §14): a stored value is an evaluated expression result.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
+    }
+}
+
+/// Coerce a value into a column for storage, handling **composite** columns (the recursive,
+/// field-by-field coercion) as well as scalars (delegating to [`store_value`]). The column's
+/// resolved [`ColType`] decides: a scalar column type-checks/range-checks the value as before; a
+/// composite column requires a `Value::Composite` of matching arity, coercing each field to its
+/// declared field type (recursing for nested composites) — spec/design/composite.md §4.
+fn coerce_for_store(
+    v: Value,
+    ty: &ColType,
+    typmod: Option<DecimalTypmod>,
+    not_null: bool,
+    col_name: &str,
+) -> Result<Value> {
+    match ty {
+        ColType::Scalar(s) => store_value(v, *s, typmod, not_null, col_name),
+        ColType::Composite { name, fields } => store_composite(v, name, fields, not_null, col_name),
+    }
+}
+
+/// Coerce a value into a **composite** column (spec/design/composite.md §4): NULL honours NOT NULL
+/// (23502); a `Value::Composite` must have exactly the declared field count (42804) and each field
+/// is coerced to its declared field type via [`coerce_for_store`] (recursing); any other value is a
+/// 42804. A NULL field of a NOT NULL composite field traps 23502.
+fn store_composite(
+    v: Value,
+    type_name: &str,
+    fields: &[ColField],
+    not_null: bool,
+    col_name: &str,
+) -> Result<Value> {
+    match v {
+        Value::Null => {
+            if not_null {
+                return Err(EngineError::new(
+                    SqlState::NotNullViolation,
+                    format!("null value in column {col_name} violates not-null constraint"),
+                ));
+            }
+            Ok(Value::Null)
+        }
+        Value::Composite(vals) => {
+            if vals.len() != fields.len() {
+                return Err(type_error(format!(
+                    "row has {} fields but composite type {type_name} has {}",
+                    vals.len(),
+                    fields.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(vals.len());
+            for (val, f) in vals.into_iter().zip(fields.iter()) {
+                out.push(coerce_for_store(val, &f.ty, f.typmod, f.not_null, &f.name)?);
+            }
+            Ok(Value::Composite(out))
+        }
+        _ => Err(type_error(format!(
+            "cannot store a non-record value in composite column {col_name} (type {type_name})"
+        ))),
     }
 }
 
@@ -8650,6 +9339,52 @@ fn literal_to_value_for(lit: &Literal, col_ty: ScalarType) -> Result<Value> {
     Ok(literal_to_value(lit))
 }
 
+/// Materialize one INSERT VALUES slot into a `Value` against the column's resolved `ColType`
+/// (spec/design/composite.md §1/§4): a scalar slot is a literal (adapted to the type) or a bound
+/// `$N`; a composite slot is a `ROW(…)` whose fields recurse against the composite's field types,
+/// or a bound `$N`. The result is then fully coerced/range-checked by `coerce_for_store`. `DEFAULT`
+/// is handled by the caller at the top level (it is not a valid field inside a `ROW(…)`).
+fn materialize_insert_value(iv: &InsertValue, ty: &ColType, bound: &[Value]) -> Result<Value> {
+    match ty {
+        ColType::Scalar(s) => match iv {
+            InsertValue::Lit(lit) => literal_to_value_for(lit, *s),
+            InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
+            InsertValue::Row(_) => Err(type_error(format!(
+                "cannot assign a record value to a {} field",
+                s.canonical_name()
+            ))),
+            InsertValue::Default => Err(EngineError::new(
+                SqlState::SyntaxError,
+                "DEFAULT is not allowed inside ROW(...)",
+            )),
+        },
+        ColType::Composite { name, fields } => match iv {
+            InsertValue::Row(field_ivs) => {
+                if field_ivs.len() != fields.len() {
+                    return Err(type_error(format!(
+                        "ROW has {} fields but composite type {name} has {}",
+                        field_ivs.len(),
+                        fields.len()
+                    )));
+                }
+                let mut vals = Vec::with_capacity(fields.len());
+                for (fiv, f) in field_ivs.iter().zip(fields.iter()) {
+                    vals.push(materialize_insert_value(fiv, &f.ty, bound)?);
+                }
+                Ok(Value::Composite(vals))
+            }
+            InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
+            InsertValue::Lit(_) => Err(type_error(format!(
+                "cannot assign a scalar value to composite column (type {name})"
+            ))),
+            InsertValue::Default => Err(EngineError::new(
+                SqlState::SyntaxError,
+                "DEFAULT is not allowed inside ROW(...)",
+            )),
+        },
+    }
+}
+
 impl RExpr {
     /// Evaluate against a row, accruing cost into `m`. Returns a `Value` (which may be a
     /// boolean for comparisons/connectives). Arithmetic traps 22003 on overflow and 22012
@@ -8676,6 +9411,29 @@ impl RExpr {
             // A bind parameter — the supplied value, already coerced to its inferred type by
             // `bind_params` before execution (spec/design/api.md §5).
             RExpr::Param(i) => Ok(env.params[*i].clone()),
+            // A ROW(...) constructor — one operator_eval, then build the composite from the
+            // evaluated fields (spec/design/composite.md §1, cost.md §9).
+            RExpr::Row(fields) => {
+                m.charge(COSTS.operator_eval);
+                let mut vals = Vec::with_capacity(fields.len());
+                for f in fields {
+                    vals.push(f.eval(row, env, m)?);
+                }
+                Ok(Value::Composite(vals))
+            }
+            // Field selection — one operator_eval, then pull the resolved field ordinal out of the
+            // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in
+            // range by construction (resolve fixed it against the static field list).
+            RExpr::Field { base, index } => {
+                m.charge(COSTS.operator_eval);
+                match base.eval(row, env, m)? {
+                    Value::Composite(fields) => Ok(fields[*index].clone()),
+                    Value::Null => Ok(Value::Null),
+                    other => {
+                        unreachable!("field access on a non-composite value: {other:?}")
+                    }
+                }
+            }
             RExpr::ConstInt(n) => Ok(Value::Int(*n)),
             RExpr::ConstBool(b) => Ok(Value::Bool(*b)),
             RExpr::ConstText(s) => Ok(Value::Text(s.clone())),
@@ -8743,6 +9501,9 @@ impl RExpr {
                         unreachable!("resolver rejects a timestamp cast operand")
                     }
                     Value::Interval(_) => unreachable!("resolver rejects an interval cast operand"),
+                    Value::Composite(_) => {
+                        unreachable!("resolver rejects a composite cast operand this slice")
+                    }
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
@@ -8777,6 +9538,9 @@ impl RExpr {
                         unreachable!("resolver rejects a timestamp unary minus")
                     }
                     Value::Interval(iv) => Ok(Value::Interval(iv.neg()?)),
+                    Value::Composite(_) => {
+                        unreachable!("resolver rejects a composite unary minus")
+                    }
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
@@ -8917,9 +9681,12 @@ impl RExpr {
             }
             RExpr::IsNull { operand, negated } => {
                 m.charge(COSTS.operator_eval);
-                let is_null = matches!(operand.eval(row, env, m)?, Value::Null);
-                // IS [NOT] NULL is always a definite boolean, never unknown (CLAUDE.md §4).
-                Ok(Value::Bool(is_null != *negated))
+                // IS [NOT] NULL is always a definite boolean, never unknown (CLAUDE.md §4). For a
+                // composite operand this is PG's recursive all-fields rule (NOT a negation —
+                // spec/design/composite.md §5); a scalar follows the ordinary rule. `is_null_test`
+                // unifies both.
+                let v = operand.eval(row, env, m)?;
+                Ok(Value::Bool(v.is_null_test(*negated)))
             }
             RExpr::Distinct { lhs, rhs, negated } => {
                 m.charge(COSTS.operator_eval);
@@ -9729,6 +10496,20 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
         // Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
         (Value::Interval(x), Value::Interval(y)) => x.cmp(y),
+        // A composite sorts lexicographically, NULLs-last per field (the composite sort key —
+        // spec/design/composite.md §5): the first non-equal field decides, recursing through
+        // `key_cmp` so per-field NULL placement and nested composites are handled uniformly. The
+        // caller's `descending` flip in `key_cmp` reverses the whole tuple. A row-size tie-break
+        // keeps it total (same-type rows have equal arity, so it is only reached for safety).
+        (Value::Composite(x), Value::Composite(y)) => {
+            for (xf, yf) in x.iter().zip(y.iter()) {
+                let c = key_cmp(xf, yf, false, false);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
         (Value::Null, Value::Null) => Ordering::Equal,
         // Cross-family arms exist only for totality — ORDER BY is over a single typed column,
         // so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -9752,6 +10533,9 @@ fn family_rank(v: &Value) -> u8 {
         Value::Interval(_) => 8,
         Value::Float32(_) => 9,
         Value::Float64(_) => 10,
+        // A composite sorts only against composites of its own type (ORDER BY is single-typed), so
+        // this cross-family rank is only for totality; it sits after the scalar families.
+        Value::Composite(_) => 11,
         // Poisoned (large-values.md §14): ORDER BY slots are in the touched set, so a sort
         // key is always resolved before it reaches the comparator.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
@@ -9802,11 +10586,11 @@ mod registry_tests {
                     Some("float") => ResolvedType::Float(ScalarType::Float64),
                     _ => ResolvedType::Int(ScalarType::Int32), // "any"
                 };
-                let found = lookup_aggregate_overload(a.surface, probe)
+                let found = lookup_aggregate_overload(a.surface, &probe)
                     .expect("expr overload resolves for its declared family");
                 // And its plan/result selection is total (panics via unreachable! otherwise).
                 let lname = a.surface.to_ascii_lowercase();
-                let _ = aggregate_plan(&lname, found.result, probe);
+                let _ = aggregate_plan(&lname, found.result, &probe);
             }
         }
     }

@@ -216,7 +216,9 @@ class OracleImport
                    "entry to document the divergence."
       return old
     end
-    tags = types.map { |(_name, t)| TAG[t] || raise("no coltype tag for PG type #{t.inspect}") }
+    tags = types.map do |(_name, t)|
+      TAG[t] || (composite_type?(t) ? "T" : raise("no coltype tag for PG type #{t.inspect}"))
+    end
     is_bool = types.map { |(_name, t)| t == "boolean" }
     derived = tags.join
     if derived != declared_coltypes
@@ -242,6 +244,23 @@ class OracleImport
     # the cores' order-insensitive comparison still passes. `nosort` (ORDER BY) is left as-is.
     body = canonical_rowsort(body, ncol) if sortmode == "rowsort"
     body.map { |v| v + "\n" }
+  end
+
+  # Whether a PG result-column type is a COMPOSITE (row) type — it renders as text via PG's
+  # composite output, which jed's `record_out` matches byte-for-byte (spec/design/composite.md §8),
+  # so it takes the `T` tag. `\gdesc` reports the registered composite type's NAME (e.g. `addr`) or
+  # the literal `record` for an anonymous `ROW(...)`; neither is in `TAG`. A registered composite is
+  # detected by `typtype = 'c'` in the replayed session (the `CREATE TYPE`s are in the applied
+  # prefix). Memoized — the lookup is one extra psql round-trip per distinct unknown type.
+  def composite_type?(type_name)
+    return true if type_name == "record"
+
+    @composite_cache ||= {}
+    @composite_cache.fetch(type_name) do
+      lit = type_name.gsub("'", "''")
+      out, = run("SELECT typtype FROM pg_type WHERE typname = '#{lit}';")
+      @composite_cache[type_name] = out.map(&:chomp).include?("c")
+    end
   end
 
   # Mirror the harness's rowsort: group the flat values into rows of `ncol`, sort rows by their

@@ -22,7 +22,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 8     // on-disk format version (8 = per-column expression-default flag bit3 + expr-text; v7 added a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
+	formatVersion   uint16 = 9     // on-disk format version (9 = composite (row) types: kind-tagged catalog entries + composite-type entries; v8 added the per-column expression-default flag bit3 + expr-text; v7 added a per-page CRC-32 on every body page, header 12→16; format.md *Version scope*)
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -148,15 +148,52 @@ func pageCRC(page []byte) uint32 {
 	return ^crc32Update(crc32Update(0xFFFFFFFF, page[0:12]), page[pageHeader:])
 }
 
-// encodeValue is the value codec (format.md): a 1-byte presence tag (0x01 = NULL), then
-// the type's present-value body. Integers reuse the order-preserving key encoding; text is
-// where the seam diverges — a stored text value needs no ordering, so it is a compact u16
-// byte-length + UTF-8 bytes (collation C, verbatim). A text value whose UTF-8 length exceeds
-// uint16's max is unsupported; in practice it also exceeds a page and is caught by the
-// oversized-item rule in pack (0A000), so the cast here is sound for every supported page
-// size (spec/fileformat/format.md). boolean is a single bool-byte body — 0x00 false, 0x01
-// true (types.md §9).
-func encodeValue(ty ScalarType, v Value) []byte {
+// encodeValue is the value codec (format.md): a 1-byte presence tag (0x01 = NULL), then the type's
+// present-value body. A scalar dispatches to encodeScalar; a COMPOSITE (spec/design/composite.md §4)
+// is the shared presence tag then a body of `null-bitmap ‖ each present field's value-codec body`
+// (no per-field tag — the bitmap carries presence), recursing for nested composites.
+func encodeValue(ty ColType, v Value) []byte {
+	if !ty.Composite {
+		return encodeScalar(ty.Scalar, v)
+	}
+	if v.Kind == ValNull {
+		return []byte{0x01}
+	}
+	if v.Kind != ValComposite {
+		panic("BUG: a non-composite value in a composite column")
+	}
+	out := []byte{0x00} // present
+	return append(out, encodeCompositeBody(ty.Fields, *v.Comp)...)
+}
+
+// encodeCompositeBody is a composite value's body (after the 0x00 present tag,
+// spec/design/composite.md §4): a null bitmap of ceil(field_count/8) bytes (MSB-first — field i is
+// bit 0x80 >> (i%8) of byte i/8; a set bit = NULL) followed by each PRESENT field's value-codec body
+// in declaration order. A NULL field contributes zero body bytes; a present field's body is its
+// encodeValue minus the leading presence tag (a nested composite recurses).
+func encodeCompositeBody(fields []ColField, vals []Value) []byte {
+	nbytes := (len(fields) + 7) / 8
+	bitmap := make([]byte, nbytes)
+	var bodies []byte
+	for i := range fields {
+		if vals[i].Kind == ValNull {
+			bitmap[i/8] |= 0x80 >> uint(i%8)
+		} else {
+			bodies = append(bodies, encodeValue(fields[i].Type, vals[i])[1:]...)
+		}
+	}
+	return append(bitmap, bodies...)
+}
+
+// encodeScalar is the scalar value codec (the body of encodeValue for a scalar ColType — format.md):
+// a 1-byte presence tag (0x01 = NULL), then the type's present-value body. Integers reuse the
+// order-preserving key encoding; text is where the seam diverges — a stored text value needs no
+// ordering, so it is a compact u16 byte-length + UTF-8 bytes (collation C, verbatim). A text value
+// whose UTF-8 length exceeds uint16's max is unsupported; in practice it also exceeds a page and is
+// caught by the oversized-item rule in pack (0A000), so the cast here is sound for every supported
+// page size (spec/fileformat/format.md). boolean is a single bool-byte body — 0x00 false, 0x01 true
+// (types.md §9).
+func encodeScalar(ty ScalarType, v Value) []byte {
 	switch v.Kind {
 	case ValNull:
 		return EncodeNullable(ty, nil)
@@ -164,6 +201,9 @@ func encodeValue(ty ScalarType, v Value) []byte {
 		// An unfetched reference is resolved before any encode/plan (the scan layer for reads,
 		// the mutation path for stores, resolveForEncode at commit — large-values.md §14).
 		panic("BUG: encoding an unfetched large value")
+	case ValComposite:
+		// A composite value is encoded by encodeValue's composite arm, never here.
+		panic("BUG: a composite value reached the scalar codec")
 	case ValText, ValBytea:
 		// text (UTF-8) and bytea (raw bytes) share the compact length-prefixed body; both
 		// hold their bytes in Str, so the on-disk form is identical.
@@ -291,12 +331,12 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	var body []bodyPage
 	rootDataPage := make([]uint32, len(keys))
 	indexRoots := make([][]uint32, len(keys))
-	// Index trees have no value columns — encode against an empty pseudo-table.
-	indexTable := &Table{}
+	// Index trees have no value columns — encode against an empty colTypes.
+	var indexColTypes []ColType
 	nextIndex := rootPage
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, np, err := serializeNode(root, s.tables[k], capacity, nextIndex, &body)
+			rp, np, err := serializeNode(root, s.stores[k].colTypes, capacity, nextIndex, &body)
 			if err != nil {
 				return nil, err
 			}
@@ -308,7 +348,7 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 		for _, idx := range s.tables[k].Indexes {
 			var r uint32
 			if root := s.indexStores[strings.ToLower(idx.Name)].treeRoot(); root != nil {
-				rp, np, err := serializeNode(root, indexTable, capacity, nextIndex, &body)
+				rp, np, err := serializeNode(root, indexColTypes, capacity, nextIndex, &body)
 				if err != nil {
 					return nil, err
 				}
@@ -319,11 +359,20 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 		}
 	}
 
-	// The catalog chain follows the data; its head is the relocatable root_page.
+	// The catalog chain follows the data; its head is the relocatable root_page. Each entry is
+	// kind-tagged (v9): composite-type entries (kind 1) first in lowercased-name order, then table
+	// entries (kind 0) — spec/fileformat/format.md.
 	catRoot := nextIndex
-	entrySizes := make([]int, len(keys))
+	var catEntries [][]byte
+	for _, ct := range s.compositeTypesSorted() {
+		catEntries = append(catEntries, append([]byte{1}, compositeTypeEntryBytes(ct)...))
+	}
 	for ti, k := range keys {
-		entrySizes[ti] = len(tableEntryBytes(s.tables[k], 0, make([]uint32, len(s.tables[k].Indexes))))
+		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti])...))
+	}
+	entrySizes := make([]int, len(catEntries))
+	for i, e := range catEntries {
+		entrySizes[i] = len(e)
 	}
 	catGroups, err := pack(entrySizes, capacity)
 	if err != nil {
@@ -351,8 +400,8 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 			next = index + 1
 		}
 		var payload []byte
-		for _, ti := range group {
-			payload = append(payload, tableEntryBytes(s.tables[keys[ti]], rootDataPage[ti], indexRoots[ti])...)
+		for _, ei := range group {
+			payload = append(payload, catEntries[ei]...)
 		}
 		writePage(image, ps, int(index), pageCatalog, uint32(len(group)), next, payload)
 	}
@@ -374,7 +423,7 @@ type bodyPage struct {
 // this node's assigned page index and the next free index. A leaf's payload is its records; an
 // interior's is its N+1 child pointers (big-endian u32) then its N records (format.md). A node whose
 // payload would exceed the page is an oversized record (over RECORD_MAX) — feature_not_supported.
-func serializeNode(n *pnode, table *Table, capacity int, nextIndex uint32, body *[]bodyPage) (uint32, uint32, error) {
+func serializeNode(n *pnode, colTypes []ColType, capacity int, nextIndex uint32, body *[]bodyPage) (uint32, uint32, error) {
 	childPages := make([]uint32, len(n.children))
 	for i, c := range n.children {
 		// Whole-image serialize renumbers pages from scratch and runs only on a fully-resident
@@ -384,7 +433,7 @@ func serializeNode(n *pnode, table *Table, capacity int, nextIndex uint32, body 
 		if c.node == nil {
 			panic("whole-image serialize hit an OnDisk leaf")
 		}
-		cp, np, err := serializeNode(c.node, table, capacity, nextIndex, body)
+		cp, np, err := serializeNode(c.node, colTypes, capacity, nextIndex, body)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -407,7 +456,7 @@ func serializeNode(n *pnode, table *Table, capacity int, nextIndex uint32, body 
 	var ovf []overflowPageOut
 	take := func() uint32 { p := nextIndex; nextIndex++; return p }
 	for i := range n.keys {
-		payload = append(payload, encodeRecord(table, n.keys[i], n.vals[i], capacity, take, &ovf)...)
+		payload = append(payload, encodeRecord(colTypes, n.keys[i], n.vals[i], capacity, take, &ovf)...)
 	}
 	if len(payload) > capacity {
 		return 0, 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
@@ -483,10 +532,10 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 	var pages []dirtyPage
 	rootDataPage := make([]uint32, len(keys))
 	indexRoots := make([][]uint32, len(keys))
-	indexTable := &Table{}
+	var indexColTypes []ColType
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, err := serializeDirty(root, s.tables[k], capacity, ps, alloc, &pages, paging)
+			rp, err := serializeDirty(root, s.stores[k].colTypes, capacity, ps, alloc, &pages, paging)
 			if err != nil {
 				return incrementalWrite{}, err
 			}
@@ -498,7 +547,7 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 		for _, idx := range s.tables[k].Indexes {
 			var r uint32
 			if root := s.indexStores[strings.ToLower(idx.Name)].treeRoot(); root != nil {
-				rp, err := serializeDirty(root, indexTable, capacity, ps, alloc, &pages, paging)
+				rp, err := serializeDirty(root, indexColTypes, capacity, ps, alloc, &pages, paging)
 				if err != nil {
 					return incrementalWrite{}, err
 				}
@@ -510,10 +559,19 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 
 	// The catalog chain is rewritten to fresh pages every commit (table roots move). Allocate its
 	// page indices up front — they may be reused free pages, hence not contiguous — so each page can
-	// point at the next (pack always returns ≥ 1 group, so catPages is non-empty).
-	entrySizes := make([]int, len(keys))
+	// point at the next (pack always returns ≥ 1 group, so catPages is non-empty). Entries are
+	// kind-tagged (v9): composite-type entries (kind 1, name order) then table entries (kind 0) —
+	// spec/fileformat/format.md.
+	var catEntries [][]byte
+	for _, ct := range s.compositeTypesSorted() {
+		catEntries = append(catEntries, append([]byte{1}, compositeTypeEntryBytes(ct)...))
+	}
 	for ti, k := range keys {
-		entrySizes[ti] = len(tableEntryBytes(s.tables[k], 0, make([]uint32, len(s.tables[k].Indexes))))
+		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti])...))
+	}
+	entrySizes := make([]int, len(catEntries))
+	for i, e := range catEntries {
+		entrySizes[i] = len(e)
 	}
 	catGroups, err := pack(entrySizes, capacity)
 	if err != nil {
@@ -530,8 +588,8 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 			nextPage = catPages[gi+1]
 		}
 		var payload []byte
-		for _, ti := range group {
-			payload = append(payload, tableEntryBytes(s.tables[keys[ti]], rootDataPage[ti], indexRoots[ti])...)
+		for _, ei := range group {
+			payload = append(payload, catEntries[ei]...)
 		}
 		pages = append(pages, dirtyPage{index: catPages[gi], bytes: makePage(ps, pageCatalog, uint32(len(group)), nextPage, payload)})
 	}
@@ -544,7 +602,7 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 // references; the serializer needs their bytes to re-plan and rewrite the record. Unmetered,
 // like all commit work. Returns the row unchanged when nothing is unfetched (the common case);
 // resolution builds a fresh copy, never mutating the shared tree's row.
-func resolveForEncode(row Row, table *Table, paging *sharedPaging) (Row, error) {
+func resolveForEncode(row Row, colTypes []ColType, paging *sharedPaging) (Row, error) {
 	needs := false
 	for _, v := range row {
 		if v.Kind == ValUnfetched {
@@ -563,7 +621,7 @@ func resolveForEncode(row Row, table *Table, paging *sharedPaging) (Row, error) 
 	copy(out, row)
 	for i := range out {
 		if out[i].Kind == ValUnfetched {
-			v, err := resolveUnfetched(table.Columns[i].Type, out[i].Unf, fetch)
+			v, err := resolveUnfetched(colTypes[i], out[i].Unf, fetch)
 			if err != nil {
 				return nil, err
 			}
@@ -580,7 +638,7 @@ func resolveForEncode(row Row, table *Table, paging *sharedPaging) (Row, error) 
 // set-once page id is stored here — safe, as the working tree is owned by the single writer at commit.
 // Page indices come from the allocator (free-list first, then the high-water). Mirrors serializeNode
 // for the byte layout.
-func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, pages *[]dirtyPage, paging *sharedPaging) (uint32, error) {
+func serializeDirty(n *pnode, colTypes []ColType, capacity, ps int, alloc *pageAlloc, pages *[]dirtyPage, paging *sharedPaging) (uint32, error) {
 	if n.page != 0 {
 		return n.page, nil
 	}
@@ -592,7 +650,7 @@ func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, 
 			childPages[i] = c.page
 			continue
 		}
-		cp, err := serializeDirty(c.node, table, capacity, ps, alloc, pages, paging)
+		cp, err := serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, paging)
 		if err != nil {
 			return 0, err
 		}
@@ -614,11 +672,11 @@ func serializeDirty(n *pnode, table *Table, capacity, ps int, alloc *pageAlloc, 
 	// unchanged chain is the deferred byte-layout follow-on).
 	var ovf []overflowPageOut
 	for i := range n.keys {
-		row, err := resolveForEncode(n.vals[i], table, paging)
+		row, err := resolveForEncode(n.vals[i], colTypes, paging)
 		if err != nil {
 			return 0, err
 		}
-		payload = append(payload, encodeRecord(table, n.keys[i], row, capacity, alloc.take, &ovf)...)
+		payload = append(payload, encodeRecord(colTypes, n.keys[i], row, capacity, alloc.take, &ovf)...)
 	}
 	if len(payload) > capacity {
 		return 0, NewError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
@@ -667,17 +725,33 @@ func LoadDatabase(image []byte) (*Database, error) {
 		}
 		pos := 0
 		for i := uint32(0); i < pg.itemCount; i++ {
+			// Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered now;
+			// its nested refs are validated after the full walk), 0 = a table entry.
+			kind, err := readU8(pg.payload, &pos)
+			if err != nil {
+				return nil, err
+			}
+			if kind == 1 {
+				ct, err := decodeCompositeTypeEntry(pg.payload, &pos)
+				if err != nil {
+					return nil, err
+				}
+				snap.putType(ct)
+				continue
+			}
+			if kind != 0 {
+				return nil, NewError(DataCorrupted, "unknown catalog entry kind")
+			}
 			table, tableRoot, indexRoots, err := decodeTableEntry(pg.payload, &pos)
 			if err != nil {
 				return nil, err
 			}
-			colTypes := make([]ScalarType, len(table.Columns))
-			for j, c := range table.Columns {
-				colTypes[j] = c.Type
-			}
 			name := table.Name
 			hasPK := len(table.PKIndices()) > 0
 			snap.putTable(table, uint32(pageSize))
+			// The store resolved each column's ColType from the (types-first) catalog at putTable; the
+			// codec reads it back rather than re-walking the type catalog (spec/design/composite.md §3).
+			colTypes := snap.stores[strings.ToLower(name)].colTypes
 			if tableRoot != 0 {
 				root, length, err := readTree(image, pageSize, tableRoot, colTypes, reached)
 				if err != nil {
@@ -711,6 +785,11 @@ func LoadDatabase(image []byte) (*Database, error) {
 			}
 		}
 		catPage = pg.nextPage
+	}
+	// Two-pass: validate the composite-type catalog (existence + acyclicity) now that every type
+	// entry has been read (spec/design/composite.md §3); a bad reference is XX001.
+	if err := snap.validateCompositeTypes(); err != nil {
+		return nil, err
 	}
 	db := NewDatabase()
 	db.pageSize = uint32(pageSize)
@@ -781,19 +860,35 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 		}
 		pos := 0
 		for i := uint32(0); i < pg.itemCount; i++ {
-			table, tableRoot, indexRoots, err := decodeTableEntry(pg.payload, &pos)
+			// Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered now;
+			// its nested refs are validated after the full walk), 0 = a table entry.
+			kind, err := readU8(pg.payload, &pos)
 			if err != nil {
 				return nil, err
 			}
-			colTypes := make([]ScalarType, len(table.Columns))
-			for j, c := range table.Columns {
-				colTypes[j] = c.Type
+			if kind == 1 {
+				ct, err := decodeCompositeTypeEntry(pg.payload, &pos)
+				if err != nil {
+					return nil, err
+				}
+				snap.putType(ct)
+				continue
+			}
+			if kind != 0 {
+				return nil, NewError(DataCorrupted, "unknown catalog entry kind")
+			}
+			table, tableRoot, indexRoots, err := decodeTableEntry(pg.payload, &pos)
+			if err != nil {
+				return nil, err
 			}
 			name := strings.ToLower(table.Name)
 			hasPK := len(table.PKIndices()) > 0
 			snap.putTable(table, uint32(pageSize))
 			store := snap.stores[name]
 			store.attachPaging(paging)
+			// The store resolved each column's ColType from the (types-first) catalog at putTable
+			// (spec/design/composite.md §3).
+			colTypes := store.colTypes
 			if tableRoot != 0 {
 				root, length, err := readSkeleton(paging, tableRoot, colTypes, reached)
 				if err != nil {
@@ -839,6 +934,11 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 		catPage = pg.nextPage
 	}
 
+	// Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
+	// reference (spec/design/composite.md §3).
+	if err := snap.validateCompositeTypes(); err != nil {
+		return nil, err
+	}
 	db := NewDatabase()
 	db.pageSize = uint32(pageSize)
 	db.pageCount = mt.pageCount
@@ -855,7 +955,7 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 // anySpillableMasked is anySpillable restricted to the columns a query's touched set selects —
 // the gate for the masked scan-units walk (cost.md §3 "The touched set"): if no TOUCHED column
 // can spill, the whole walk yields zero and is skipped.
-func anySpillableMasked(colTypes []ScalarType, mask []bool) bool {
+func anySpillableMasked(colTypes []ColType, mask []bool) bool {
 	for i, ty := range colTypes {
 		if mask[i] && isSpillable(ty) {
 			return true
@@ -865,7 +965,7 @@ func anySpillableMasked(colTypes []ScalarType, mask []bool) bool {
 }
 
 // anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
-func anySpillable(colTypes []ScalarType) bool {
+func anySpillable(colTypes []ColType) bool {
 	for _, ty := range colTypes {
 		if isSpillable(ty) {
 			return true
@@ -880,7 +980,7 @@ func anySpillable(colTypes []ScalarType) bool {
 // the paged-open free-list reconstruction; it decodes each leaf lazily and follows its chains by
 // HEADERS only (chainPages — large-values.md §14), so opening a file never materializes or
 // decompresses a large value.
-func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []ScalarType, reached map[uint32]bool) error {
+func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []ColType, reached map[uint32]bool) error {
 	block, err := paging.pgr.readBlock(pageIdx)
 	if err != nil {
 		return err
@@ -929,7 +1029,7 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []Scalar
 // interior nodes resident, each leaf left OnDisk. Returns the root node and the total row count. A
 // table whose root is itself a single leaf has no interior parent to hold an OnDisk reference, so the
 // root leaf is faulted resident (spec/design/pager.md §1/§4).
-func readSkeleton(paging *sharedPaging, root uint32, colTypes []ScalarType, reached map[uint32]bool) (*pnode, int, error) {
+func readSkeleton(paging *sharedPaging, root uint32, colTypes []ColType, reached map[uint32]bool) (*pnode, int, error) {
 	c, length, err := readSkeletonNode(paging, root, colTypes, reached)
 	if err != nil {
 		return nil, 0, err
@@ -948,7 +1048,7 @@ func readSkeleton(paging *sharedPaging, root uint32, colTypes []ScalarType, reac
 // (its rows counted from the header, then dropped — not retained); an interior node becomes a resident
 // childRef with its children resolved recursively. Returns the child reference and the subtree's row
 // count.
-func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ScalarType, reached map[uint32]bool) (childRef, int, error) {
+func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ColType, reached map[uint32]bool) (childRef, int, error) {
 	reached[pageIdx] = true
 	block, err := paging.pgr.readBlock(pageIdx)
 	if err != nil {
@@ -1006,7 +1106,7 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []ScalarTyp
 // N+1 child pointers then its N records; we recurse the pointers, then read the separators. Weights
 // are recomputed from the value codec (the exact size the writer used), so the loaded tree is ready
 // for further size-driven splits.
-func readTree(image []byte, ps int, pageIdx uint32, colTypes []ScalarType, reached map[uint32]bool) (*pnode, int, error) {
+func readTree(image []byte, ps int, pageIdx uint32, colTypes []ColType, reached map[uint32]bool) (*pnode, int, error) {
 	reached[pageIdx] = true
 	capacity := ps - pageHeader
 	pg, err := readPage(image, ps, pageIdx)
@@ -1072,9 +1172,15 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ScalarType, reach
 }
 
 // isSpillable reports whether a value of this type can be stored out-of-line (a variable-length
-// type). Fixed-width types are tiny and always stay inline (spec/design/large-values.md §12).
-func isSpillable(ty ScalarType) bool {
-	return ty.IsText() || ty.IsBytea() || ty.IsDecimal()
+// type). Fixed-width scalars (int*/boolean/uuid/timestamp*) are tiny and always stay inline
+// (spec/design/large-values.md §12). A COMPOSITE is treated as spillable — its opaque inline body
+// spills via the same overflow + LZ4 path when a record exceeds RECORD_MAX (spec/design/composite.md
+// §4); a small composite is never actually chosen by the plan.
+func isSpillable(ty ColType) bool {
+	if ty.Composite {
+		return true
+	}
+	return ty.Scalar.IsText() || ty.Scalar.IsBytea() || ty.Scalar.IsDecimal()
 }
 
 // recordMaxFor is the largest a single record may serialize to and still satisfy the B-tree split
@@ -1117,7 +1223,7 @@ type recordPlan struct {
 // their pointer, moving the bytes pass 1 chose (compressed → a 0x04 chain of the compressed
 // block) until the record fits. Shared by the serializer and recordSize (the B-tree split
 // weight): in-memory node boundaries must match the serialized pages.
-func planDispositions(colTypes []ScalarType, key []byte, row Row, capacity int) recordPlan {
+func planDispositions(colTypes []ColType, key []byte, row Row, capacity int) recordPlan {
 	inline := make([]int, len(colTypes))
 	size := 2 + len(key)
 	for i, ty := range colTypes {
@@ -1197,7 +1303,7 @@ func planDispositions(colTypes []ScalarType, key []byte, row Row, capacity int) 
 // (format.md). Accounts for compression and out-of-line spill: a compressed value contributes its
 // compressed inline form, an externalized one its fixed pointer size (large-values.md §12/§13).
 // Must equal what the serializer produces, so in-memory node boundaries match serialized pages.
-func recordSize(colTypes []ScalarType, key []byte, row Row, capacity int) int {
+func recordSize(colTypes []ColType, key []byte, row Row, capacity int) int {
 	return planDispositions(colTypes, key, row, capacity).size
 }
 
@@ -1207,7 +1313,7 @@ func recordSize(colTypes []ScalarType, key []byte, row Row, capacity int) int {
 // external-plain, the COMPRESSED block for external-compressed) and decompress = ceil(raw/capacity)
 // value_decompress slabs per compressed stored value (inline- or external-). Zero/zero for a
 // fully-inline-plain record or an untouched column.
-func recordScanUnits(colTypes []ScalarType, key []byte, row Row, capacity int, mask []bool) (pages, decompress int) {
+func recordScanUnits(colTypes []ColType, key []byte, row Row, capacity int, mask []bool) (pages, decompress int) {
 	// A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
 	// §14): read the units straight off them — no disposition re-plan, which would need the
 	// unfetched bytes. The numbers equal the resident plan below by construction (the
@@ -1263,19 +1369,24 @@ func recordScanUnits(colTypes []ScalarType, key []byte, row Row, capacity int, m
 // ceil(raw/capacity) block per pass-1 compression attempt, adopted or not (cost.md §3;
 // large-values.md §13). Charged once per stored row version at the statement's write site,
 // never for B-tree re-encodes.
-func recordCompressUnits(colTypes []ScalarType, key []byte, row Row, capacity int) int {
+func recordCompressUnits(colTypes []ColType, key []byte, row Row, capacity int) int {
 	return planDispositions(colTypes, key, row, capacity).compressUnits
 }
 
 // valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
 // externalized (large-values.md §12): raw UTF-8 for text / raw bytes for bytea (both in v.Str), the
 // decimal body (encoding minus its presence tag) for decimal. Only spillable types reach here.
-func valuePayload(ty ScalarType, v Value) []byte {
+func valuePayload(ty ColType, v Value) []byte {
+	if ty.Composite {
+		// A composite's payload is its body — the encoding minus the leading presence tag, i.e. the
+		// null bitmap + present-field bodies (spec/design/composite.md §4).
+		return encodeCompositeBody(ty.Fields, *v.Comp)
+	}
 	switch {
-	case ty.IsText(), ty.IsBytea():
+	case ty.Scalar.IsText(), ty.Scalar.IsBytea():
 		return []byte(v.Str)
-	case ty.IsDecimal():
-		return encodeValue(ty, v)[1:] // strip the leading presence tag
+	case ty.Scalar.IsDecimal():
+		return encodeScalar(ty.Scalar, v)[1:] // strip the leading presence tag
 	default:
 		panic("only spillable values are externalized")
 	}
@@ -1283,16 +1394,22 @@ func valuePayload(ty ScalarType, v Value) []byte {
 
 // valueFromPayload reconstructs a value from the P(v) content gathered from its overflow chain
 // (inverse of valuePayload) — large-values.md §12.
-func valueFromPayload(ty ScalarType, payload []byte) (Value, error) {
+func valueFromPayload(ty ColType, payload []byte) (Value, error) {
+	if ty.Composite {
+		// A composite's payload is its body (bitmap + present-field bodies); decode it with a fresh
+		// cursor (spec/design/composite.md §4).
+		pos := 0
+		return readCompositeBody(ty, payload, &pos)
+	}
 	switch {
-	case ty.IsText():
+	case ty.Scalar.IsText():
 		if !utf8.Valid(payload) {
 			return Value{}, NewError(DataCorrupted, "non-UTF-8 text value")
 		}
 		return TextValue(string(payload)), nil
-	case ty.IsBytea():
+	case ty.Scalar.IsBytea():
 		return ByteaValue(payload), nil
-	case ty.IsDecimal():
+	case ty.Scalar.IsDecimal():
 		pos := 0
 		return decodeDecimalBody(payload, &pos)
 	default:
@@ -1305,25 +1422,21 @@ func valueFromPayload(ty ScalarType, payload []byte) (Value, error) {
 // page(s) via take, append them to *ovf, and write a tag|first_page|len pointer instead of the inline
 // body. capacity is the page payload (the slab size + the spill-plan input). Shared by the whole-image
 // (serializeNode) and incremental (serializeDirty) writers, which differ only in how take allocates.
-func encodeRecord(table *Table, key []byte, row Row, capacity int, take func() uint32, ovf *[]overflowPageOut) []byte {
-	colTypes := make([]ScalarType, len(table.Columns))
-	for i, c := range table.Columns {
-		colTypes[i] = c.Type
-	}
+func encodeRecord(colTypes []ColType, key []byte, row Row, capacity int, take func() uint32, ovf *[]overflowPageOut) []byte {
 	plan := planDispositions(colTypes, key, row, capacity)
 	out := make([]byte, 0, 2+len(key)+len(row)*2)
 	out = appendU16(out, uint16(len(key)))
 	out = append(out, key...)
-	for i, col := range table.Columns {
+	for i, ty := range colTypes {
 		switch plan.disp[i] {
 		case dispExternal:
-			payload := valuePayload(col.Type, row[i])
+			payload := valuePayload(ty, row[i])
 			first := writeOverflowChain(payload, capacity, take, ovf)
 			out = append(out, tagExternal)
 			out = appendU32(out, first)
 			out = appendU32(out, uint32(len(payload)))
 		case dispInlineComp:
-			rawLen := len(valuePayload(col.Type, row[i]))
+			rawLen := len(valuePayload(ty, row[i]))
 			comp := plan.comp[i]
 			out = append(out, tagInlineComp)
 			out = appendU32(out, uint32(rawLen))
@@ -1331,7 +1444,7 @@ func encodeRecord(table *Table, key []byte, row Row, capacity int, take func() u
 			out = append(out, comp...)
 		case dispExternalComp:
 			// The chain carries the COMPRESSED block (its page count follows comp size).
-			rawLen := len(valuePayload(col.Type, row[i]))
+			rawLen := len(valuePayload(ty, row[i]))
 			comp := plan.comp[i]
 			first := writeOverflowChain(comp, capacity, take, ovf)
 			out = append(out, tagExternalComp)
@@ -1339,7 +1452,7 @@ func encodeRecord(table *Table, key []byte, row Row, capacity int, take func() u
 			out = appendU32(out, uint32(len(comp)))
 			out = appendU32(out, uint32(rawLen))
 		default:
-			out = append(out, encodeValue(col.Type, row[i])...)
+			out = append(out, encodeValue(ty, row[i])...)
 		}
 	}
 	return out
@@ -1378,6 +1491,107 @@ func writeOverflowChain(payload []byte, capacity int, take func() uint32, ovf *[
 	return indices[0]
 }
 
+// compositeTypeEntryBytes serializes a composite-type catalog entry's BODY (after its
+// entry_kind = 1 byte): name, field count, then per field — name, type code, [type name when code
+// 14 (nested composite)], flags (bit0 not_null), [decimal typmod when code 6]
+// (spec/fileformat/format.md *Composite-type entry*).
+func compositeTypeEntryBytes(ct *CompositeType) []byte {
+	var out []byte
+	out = appendU16(out, uint16(len(ct.Name)))
+	out = append(out, ct.Name...)
+	out = appendU16(out, uint16(len(ct.Fields)))
+	for _, f := range ct.Fields {
+		out = appendU16(out, uint16(len(f.Name)))
+		out = append(out, f.Name...)
+		if f.Type.Comp != nil {
+			out = append(out, 14)
+			out = appendU16(out, uint16(len(f.Type.Comp.Name)))
+			out = append(out, f.Type.Comp.Name...)
+		} else {
+			out = append(out, typeCodeForScalar(f.Type.ScalarTy()))
+		}
+		var flags byte
+		if f.NotNull {
+			flags |= 0b1
+		}
+		out = append(out, flags)
+		if f.Type.Comp == nil && f.Type.IsDecimal() {
+			var precision, scale uint16
+			if f.Decimal != nil {
+				precision, scale = f.Decimal.Precision, f.Decimal.Scale
+			}
+			out = appendU16(out, precision)
+			out = appendU16(out, scale)
+		}
+	}
+	return out
+}
+
+// decodeCompositeTypeEntry decodes a composite-type catalog entry's body (inverse of
+// compositeTypeEntryBytes); the caller has already consumed the entry_kind byte. Nested composite
+// fields hold the referenced type's NAME (resolved/validated after the whole catalog is read — the
+// two-pass load).
+func decodeCompositeTypeEntry(buf []byte, pos *int) (*CompositeType, error) {
+	name, err := readString(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	fieldCount, err := readU16(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	fields := make([]CompositeField, 0, fieldCount)
+	for i := uint16(0); i < fieldCount; i++ {
+		fname, err := readString(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		tc, err := readU8(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		var fty Type
+		isDecimal := false
+		if tc == 14 {
+			tn, err := readString(buf, pos)
+			if err != nil {
+				return nil, err
+			}
+			fty = CompositeT(tn)
+		} else {
+			s, ok := scalarForTypeCode(tc)
+			if !ok {
+				return nil, NewError(DataCorrupted, "unknown field type code")
+			}
+			fty = ScalarT(s)
+			isDecimal = s.IsDecimal()
+		}
+		flags, err := readU8(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		if flags&^uint8(0b1) != 0 {
+			return nil, NewError(DataCorrupted, "reserved composite field flag set")
+		}
+		var decimal *DecimalTypmod
+		if isDecimal {
+			precision, err := readU16(buf, pos)
+			if err != nil {
+				return nil, err
+			}
+			scale, err := readU16(buf, pos)
+			if err != nil {
+				return nil, err
+			}
+			if precision != 0 {
+				decimal = &DecimalTypmod{Precision: precision, Scale: scale}
+			}
+		}
+		fields = append(fields, CompositeField{Name: fname, Type: fty, Decimal: decimal, NotNull: flags&0b1 != 0})
+	}
+	return &CompositeType{Name: name, Fields: fields}, nil
+}
+
 // tableEntryBytes builds one table's catalog entry (format.md). indexRoots is each
 // index's tree root page, parallel to table.Indexes.
 func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []byte {
@@ -1388,7 +1602,22 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 	for _, col := range table.Columns {
 		out = appendU16(out, uint16(len(col.Name)))
 		out = append(out, col.Name...)
-		out = append(out, typeCodeForScalar(col.Type))
+		if col.Type.Comp != nil {
+			// A composite column (v9): type_code 14, then flags, then the type name in the typmod
+			// slot (spec/fileformat/format.md). Composite columns carry no default this slice, so
+			// flags bits 2/3 are 0. Forward-ready — composite columns are not produced this slice
+			// (composite.md §12), but the codec emits the code so a later-slice file is symmetric.
+			out = append(out, 14)
+			var flags byte
+			if col.NotNull {
+				flags |= 0b10
+			}
+			out = append(out, flags)
+			out = appendU16(out, uint16(len(col.Type.Comp.Name)))
+			out = append(out, col.Type.Comp.Name...)
+			continue
+		}
+		out = append(out, typeCodeForScalar(col.Type.ScalarTy()))
 		// bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is
 		// the single authority; the bit is reserved, written 0 (spec/fileformat/format.md).
 		var flags byte
@@ -1421,7 +1650,9 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 		// 0x01. An EXPRESSION default (flags bit3, v8) instead appends its expr-text (u16 length
 		// + UTF-8) there, the same token rendering a CHECK uses — bit2/bit3 are exclusive.
 		if col.Default != nil {
-			out = append(out, encodeValue(col.Type, *col.Default)...)
+			// A column DEFAULT is always a scalar value (composite columns carry no default this
+			// slice — composite.md §12), so encode the scalar body directly.
+			out = append(out, encodeScalar(col.Type.ScalarTy(), *col.Default)...)
 		} else if col.DefaultExpr != nil {
 			out = appendU16(out, uint16(len(col.DefaultExpr.ExprText)))
 			out = append(out, col.DefaultExpr.ExprText...)
@@ -1666,7 +1897,7 @@ func pageBlock(image []byte, ps int, index uint32) ([]byte, error) {
 // an external/compressed value becomes an Unfetched reference — no chain read, no decompression —
 // resolved later only for the columns a query touches. Each weight is the bytes the record occupies
 // on the page (exactly the writer's recordSize).
-func decodeLeafNode(block []byte, pageID uint32, colTypes []ScalarType) (*pnode, error) {
+func decodeLeafNode(block []byte, pageID uint32, colTypes []ColType) (*pnode, error) {
 	pg, err := parsePage(block)
 	if err != nil {
 		return nil, err
@@ -1711,6 +1942,28 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		if err != nil {
 			return nil, 0, nil, err
 		}
+		if tc == 14 {
+			// A composite column (v9): flags, then the type name (spec/fileformat/format.md).
+			// Forward-ready — composite columns are not produced this slice (composite.md §12),
+			// but a reader handles the code so a later-slice file loads cleanly.
+			flags, err := readU8(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			if flags&0b01 != 0 {
+				return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit0 set")
+			}
+			tname, err := readString(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			columns = append(columns, Column{
+				Name:    cname,
+				Type:    CompositeT(tname),
+				NotNull: flags&0b10 != 0,
+			})
+			continue
+		}
 		ty, ok := scalarForTypeCode(tc)
 		if !ok {
 			return nil, 0, nil, NewError(DataCorrupted, "unknown type code")
@@ -1751,7 +2004,8 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		var defaultVal *Value
 		if flags&0b100 != 0 {
 			var sink []uint32
-			dv, err := readValue(ty, buf, pos, nil, &sink)
+			// A constant default is a scalar value (this branch is the scalar type path).
+			dv, err := readValue(ScalarColType(ty), buf, pos, nil, &sink)
 			if err != nil {
 				return nil, 0, nil, err
 			}
@@ -1771,7 +2025,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		}
 		columns = append(columns, Column{
 			Name:    cname,
-			Type:    ty,
+			Type:    ScalarT(ty),
 			Decimal: decimal,
 			// PrimaryKey is set from the pk list below.
 			NotNull:     flags&0b10 != 0,
@@ -1881,13 +2135,15 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 // the record's pointer fields — no chain read, no decompression. The scan layer resolves the
 // references for the columns a query touches (resolveUnfetched); the commit path resolves the
 // rest when a dirty leaf re-encodes (resolveForEncode).
-func readValueLazy(ty ScalarType, buf []byte, pos *int) (Value, error) {
+func readValueLazy(ty ColType, buf []byte, pos *int) (Value, error) {
 	tag, err := readU8(buf, pos)
 	if err != nil {
 		return Value{}, err
 	}
 	switch tag {
 	case 0x00:
+		// A composite's inline body has no nested overflow pointers (its fields are inline —
+		// composite.md §4), so it is read eagerly even in the lazy path.
 		return readInlineBody(ty, buf, pos)
 	case 0x01:
 		return NullValue(), nil
@@ -1940,7 +2196,7 @@ func readValueLazy(ty ScalarType, buf []byte, pos *int) (Value, error) {
 // where the weight is the bytes the record occupies on the page — exactly the recordSize the
 // writer split on, read off the cursor instead of re-planned (a re-plan would need the unfetched
 // bytes).
-func decodeRecordLazy(colTypes []ScalarType, buf []byte, pos *int) ([]byte, Row, int, error) {
+func decodeRecordLazy(colTypes []ColType, buf []byte, pos *int) ([]byte, Row, int, error) {
 	start := *pos
 	keyLen, err := readU16(buf, pos)
 	if err != nil {
@@ -1967,7 +2223,7 @@ func decodeRecordLazy(colTypes []ScalarType, buf []byte, pos *int) ([]byte, Row,
 // (spec/design/large-values.md §14): gather the overflow chain through fetch for an external
 // form, decompress a compressed one, and reconstruct by column type. Decompression errors are
 // data_corrupted, surfaced only when the value is actually touched.
-func resolveUnfetched(ty ScalarType, u *Unfetched, fetch func(uint32) ([]byte, error)) (Value, error) {
+func resolveUnfetched(ty ColType, u *Unfetched, fetch func(uint32) ([]byte, error)) (Value, error) {
 	var sink []uint32
 	switch u.Form {
 	case tagExternal:
@@ -2055,7 +2311,7 @@ func markChains(row Row, fetch func(uint32) ([]byte, error), reached map[uint32]
 // decodeRecord decodes one record (key, row) and the overflow chain pages any external value
 // followed (for the free-list reachability walk — large-values.md §12). fetch reads a page block by
 // index, used to follow overflow chains; nil is only valid where no value can be external (a default).
-func decodeRecord(colTypes []ScalarType, buf []byte, pos *int, fetch func(uint32) ([]byte, error)) ([]byte, Row, []uint32, error) {
+func decodeRecord(colTypes []ColType, buf []byte, pos *int, fetch func(uint32) ([]byte, error)) ([]byte, Row, []uint32, error) {
 	keyLen, err := readU16(buf, pos)
 	if err != nil {
 		return nil, nil, nil, err
@@ -2082,7 +2338,7 @@ func decodeRecord(colTypes []ScalarType, buf []byte, pos *int, fetch func(uint32
 // first: 0x00 an inline body, 0x01 NULL, 0x02 an external pointer (u32 first_page + u32 len) whose
 // payload is gathered from the overflow chain via fetch and reconstructed by type (large-values.md
 // §12). Pages visited while following a chain are appended to *ovfOut for the free-list walk.
-func readValue(ty ScalarType, buf []byte, pos *int, fetch func(uint32) ([]byte, error), ovfOut *[]uint32) (Value, error) {
+func readValue(ty ColType, buf []byte, pos *int, fetch func(uint32) ([]byte, error), ovfOut *[]uint32) (Value, error) {
 	tag, err := readU8(buf, pos)
 	if err != nil {
 		return Value{}, err
@@ -2157,9 +2413,47 @@ func readValue(ty ScalarType, buf []byte, pos *int, fetch func(uint32) ([]byte, 
 	}
 }
 
-// readInlineBody reads the present-value body (after a 0x00 tag): a fixed-width integer, a u16 length
-// + UTF-8 bytes for text, a single bool-byte, the decimal body, etc. (format.md *Value codec*).
-func readInlineBody(ty ScalarType, buf []byte, pos *int) (Value, error) {
+// readInlineBody reads the present-value body (after a 0x00 tag) for any ColType: a scalar via
+// readInlineScalar, or a composite via readCompositeBody (spec/design/composite.md §4).
+func readInlineBody(ty ColType, buf []byte, pos *int) (Value, error) {
+	if ty.Composite {
+		return readCompositeBody(ty, buf, pos)
+	}
+	return readInlineScalar(ty.Scalar, buf, pos)
+}
+
+// readCompositeBody reads a composite value's present body (after the 0x00 tag): the null bitmap then
+// each present field's body in declaration order (inverse of encodeCompositeBody,
+// spec/design/composite.md §4). A field whose bitmap bit is set is NULL and consumes no body bytes;
+// otherwise its body is read recursively (no per-field presence tag).
+func readCompositeBody(ty ColType, buf []byte, pos *int) (Value, error) {
+	if !ty.Composite {
+		return Value{}, NewError(DataCorrupted, "readCompositeBody on a non-composite type")
+	}
+	nbytes := (len(ty.Fields) + 7) / 8
+	bitmap, err := take(buf, pos, nbytes)
+	if err != nil {
+		return Value{}, err
+	}
+	vals := make([]Value, len(ty.Fields))
+	for i := range ty.Fields {
+		if bitmap[i/8]&(0x80>>uint(i%8)) != 0 {
+			vals[i] = NullValue()
+		} else {
+			v, err := readInlineBody(ty.Fields[i].Type, buf, pos)
+			if err != nil {
+				return Value{}, err
+			}
+			vals[i] = v
+		}
+	}
+	return CompositeValue(vals), nil
+}
+
+// readInlineScalar reads the present-value body of a SCALAR (after a 0x00 tag): a fixed-width integer,
+// a u16 length + UTF-8 bytes for text, a single bool-byte, the decimal body, etc. (format.md *Value
+// codec*).
+func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
 	switch {
 	case ty.IsText():
 		n, err := readU16(buf, pos)

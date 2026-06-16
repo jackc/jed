@@ -2,14 +2,17 @@
 // functions) to match the boring/explicit style (CLAUDE.md §10).
 
 import type { Expr } from "./ast.ts";
-import type { DecimalTypmod, ScalarType } from "./types.ts";
+import { type DecimalTypmod, type ScalarType, type Type } from "./types.ts";
 import type { Value } from "./value.ts";
 
 // Column is a column definition: name, declared type, nullability, primary-key flag, default.
 // notNull is implied true for a PRIMARY KEY column.
 export type Column = {
   name: string;
-  type: ScalarType;
+  // The column's declared type — a built-in scalar or a user-defined composite
+  // (spec/design/composite.md). The open `Type` wrapper (CLAUDE.md §4): scalar-only call sites
+  // read `typeScalar(col.type)`; the value codec / resolver branch on isCompositeType.
+  type: Type;
   // The numeric(p,s) typmod for a decimal column, or null for a non-decimal column OR an
   // unconstrained numeric (spec/design/decimal.md §2). A constrained decimal column coerces
   // stored values to this precision/scale.
@@ -67,6 +70,71 @@ export type IndexDef = { name: string; columns: number[]; unique: boolean };
 // are stable (spec/fileformat/format.md "Check-expression text") — and the parsed
 // expression the write paths resolve and evaluate per candidate row (constraints.md §4).
 export type CheckConstraint = { name: string; exprText: string; expr: Expr };
+
+// CompositeType is a user-defined COMPOSITE (row) type (spec/design/composite.md): a named,
+// ordered list of typed fields, living in the database's type catalog (a database-level object,
+// not per-table). Created by `CREATE TYPE name AS (field type, …)`, referenced by name from a
+// column's Type. Recursive — a field's type may itself be a composite (a nested composite,
+// persisted by name; spec/fileformat/format.md *Composite-type entry*).
+export type CompositeType = {
+  // The type name (original case — round-trips what the user typed); looked up case-insensitively.
+  name: string;
+  // The fields in declaration order (>= 1).
+  fields: CompositeField[];
+};
+
+// CompositeField is one field of a composite type: its name, type, decimal typmod, and declared
+// nullability (mirrors Column).
+export type CompositeField = {
+  name: string;
+  type: Type;
+  // The decimal numeric(p,s) typmod when type is decimal, else null (mirrors Column).
+  decimal: DecimalTypmod | null;
+  // Whether the field was declared NOT NULL.
+  notNull: boolean;
+};
+
+// ColType is a fully-resolved storage/codec column type (spec/design/composite.md §4): a scalar,
+// or a composite resolved to the codec/coercion tree of its fields. Built ONCE from a catalog
+// Type against the snapshot's composite-type definitions (resolveColType) and held by the
+// TableStore, so the value codec and store-coercion never re-walk the type catalog on every row.
+// Recursive — a composite field may itself be composite. The codec reads only the scalar / field
+// structure; the field typmod / notNull are consulted by store-coercion (executor). Modeled as a
+// discriminated union (keyed on `kind`, like Type/Value), with free-function helpers — never
+// methods on the union (CLAUDE.md §10).
+export type ColType =
+  | { kind: "scalar"; scalar: ScalarType }
+  // A composite type's resolved fields, in declaration order. `name` is the (original-case) type
+  // name, used in store-coercion error messages.
+  | { kind: "composite"; name: string; fields: ColField[] };
+
+// ColField is one resolved field of a composite ColType — its name, recursively-resolved type, the
+// decimal typmod (when the field is decimal), and declared nullability (mirrors CompositeField, but
+// with the type fully resolved for the codec/coercion path).
+export type ColField = { name: string; type: ColType; typmod: DecimalTypmod | null; notNull: boolean };
+
+// resolveColType resolves a catalog Type into a self-contained ColType against the database's
+// composite definitions (keyed by lowercased name, the Snapshot.types map). A composite reference
+// is looked up case-insensitively and recursively resolved; the lookup is guaranteed to succeed
+// because validateCompositeTypes (the two-pass load / CREATE TYPE gate) proved every reference
+// exists and the graph is acyclic before any store is built (spec/design/composite.md §3).
+export function resolveColType(ty: Type, types: Map<string, CompositeType>): ColType {
+  if (ty.kind === "scalar") return { kind: "scalar", scalar: ty.scalar };
+  const def = types.get(ty.name.toLowerCase());
+  if (def === undefined) {
+    throw new Error("composite type reference resolved by validateCompositeTypes");
+  }
+  return {
+    kind: "composite",
+    name: def.name,
+    fields: def.fields.map((f) => ({
+      name: f.name,
+      type: resolveColType(f.type, types),
+      typmod: f.decimal,
+      notNull: f.notNull,
+    })),
+  };
+}
 
 // columnIndex returns the index of the named column (case-insensitive), or -1.
 export function columnIndex(t: Table, name: string): number {

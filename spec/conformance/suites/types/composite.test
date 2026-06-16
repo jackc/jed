@@ -1,0 +1,275 @@
+# Composite (row) values (spec/design/composite.md): the ROW(...) constructor + storable composite
+# columns (§1/§4), `record_out` rendering (§8), field access `(expr).field` / `(expr).*` (§S4),
+# element-wise comparison / ordering / the all-fields IS NULL rule (§5), DISTINCT/GROUP BY composite
+# keys, and the `record_in` round-trip (`'(…)'::type` / `type '(…)'`, §8). The DDL surface
+# (CREATE/DROP TYPE, dependency tracking) is in ../ddl/create_type.test. record_out/record_in match
+# PostgreSQL byte-for-byte. NB: type names here avoid PG's built-in geometric types (`point`/`line`/
+# `box`/…), and the corpus uses the PG-compatible record_in literal for NESTED composites — the bare
+# nested `ROW(ROW(…),…)` constructor is a documented jed extension PG rejects, covered by the unit
+# tests, not this PG-oracle corpus. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.group_by, query.aggregates, types.composite, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TYPE addr AS (street text, zip int32)
+
+statement ok
+CREATE TABLE person (id int32 PRIMARY KEY, home addr)
+
+# A ROW(...) constructor builds the composite value stored in the column.
+statement ok
+INSERT INTO person VALUES (1, ROW('Main', 90210))
+
+# A NULL field is the empty string between delimiters; the present text field is unquoted.
+statement ok
+INSERT INTO person VALUES (2, ROW('Oak', NULL))
+
+# An omitted composite column is the whole-value NULL.
+statement ok
+INSERT INTO person (id) VALUES (3)
+
+# record_out renders the composite `(street,zip)`; a NULL field is empty; a whole-NULL is NULL.
+query IT nosort
+SELECT id, home FROM person ORDER BY id
+----
+1
+(Main,90210)
+2
+(Oak,)
+3
+NULL
+
+# record_out field quoting (spec/design/composite.md §8, PG-exact): a field containing whitespace,
+# a comma, a parenthesis, a double-quote, or a backslash is double-quoted; inside the quotes PG
+# DOUBLES an embedded `"` → `""` and `\` → `\\`; the empty string is quoted `""`.
+statement ok
+CREATE TYPE rec AS (a text, b int32)
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, r rec)
+
+statement ok
+INSERT INTO t VALUES (1, ROW('a b', 1)), (2, ROW('x,y', 2)), (3, ROW('', 3)), (4, ROW('q"s', 4)), (5, ROW('a\b', 6))
+
+query T nosort
+SELECT r FROM t ORDER BY id
+----
+("a b",1)
+("x,y",2)
+("",3)
+("q""s",4)
+("a\\b",6)
+
+# Nested composite: a field whose type is another composite. A nested value is written with the
+# PG-compatible record_in literal (the bare nested `ROW(ROW(…),…)` constructor is a jed extension
+# PG rejects — see the unit tests). The inner record is itself quoted in the outer rendering
+# (it contains parens/commas).
+statement ok
+CREATE TYPE coord AS (x int32, y int32)
+
+statement ok
+CREATE TYPE pair AS (p coord, q coord)
+
+query T nosort
+SELECT '("(1,2)","(3,4)")'::pair
+----
+("(1,2)","(3,4)")
+
+# --- S4: field access (expr).field / (expr).* (spec/design/composite.md §S4) ---
+
+# `(expr).field` selects one field; the output column is named after the field.
+query IT nosort
+SELECT (home).zip, (home).street FROM person WHERE id = 1
+----
+90210
+Main
+
+# Field access is PARENS-REQUIRED (PostgreSQL): `(t.home).zip` is relation `t`, column `home`, then
+# field `zip`. The unparenthesized `home.zip` / `t.home.zip` are NOT field access (see the error
+# below) — they resolve as multi-part column references.
+query I nosort
+SELECT (t.home).zip FROM person t WHERE t.id = 1
+----
+90210
+
+# `person.home` (no field) reads the whole composite column.
+query T nosort
+SELECT person.home FROM person WHERE id = 1
+----
+(Main,90210)
+
+# `(expr).*` expands a composite into one output column per field, in declaration order.
+query ITI nosort
+SELECT id, (home).* FROM person WHERE id = 1
+----
+1
+Main
+90210
+
+# A nested composite field chains: (pair).p.x — PG accepts the chain without inner parens.
+query I nosort
+SELECT ('("(1,2)","(3,4)")'::pair).p.x
+----
+1
+
+# An unknown field is 42703.
+statement error 42703
+SELECT (home).nope FROM person
+
+# Field access on a non-composite is 42809 (wrong_object_type).
+statement error 42809
+SELECT (id).zip FROM person
+
+# Field access is parens-required: the unparenthesized `home.zip` is a column reference whose
+# qualifier `home` names no relation → 42P01 (PG-exact; field access needs `(home).zip`).
+statement error 42P01
+SELECT home.zip FROM person
+
+# A qualifier that is neither a relation nor a column is likewise a missing-FROM-entry (42P01).
+statement error 42P01
+SELECT nosuch.col FROM person
+
+# --- S5: comparison / ordering / IS NULL (spec/design/composite.md §5) ---
+
+# Element-wise 3VL equality: equal rows TRUE; a NULL field (else equal) UNKNOWN; a FALSE field
+# dominates a NULL field → FALSE.
+query BBB nosort
+SELECT ROW(1, 2) = ROW(1, 2), ROW(1, NULL) = ROW(1, 2), ROW(1, NULL) = ROW(2, 2)
+----
+true
+NULL
+false
+
+# Lexicographic ordering: the first non-equal field decides.
+query BBB nosort
+SELECT ROW(1, 2) < ROW(1, 3), ROW(2, 1) < ROW(1, 9), ROW(1, 2) >= ROW(1, 2)
+----
+true
+false
+true
+
+# A composite column compares against another composite in WHERE (element-wise). The corpus uses
+# the record_in literal `'(Oak,10)'::loc` (PG-compatible): a bare `ROW('Oak', 10)` types its string
+# literal as PG `unknown`, which PG refuses to compare — the `ROW(…)` comparison form (jed types the
+# literal as text and accepts it) is covered in the unit tests.
+statement ok
+CREATE TYPE loc AS (city text, zip int32)
+
+statement ok
+CREATE TABLE places (id int32 PRIMARY KEY, at loc)
+
+statement ok
+INSERT INTO places VALUES (1, ROW('Oak', 30)), (2, ROW('Oak', 10)), (3, ROW('Elm', 99))
+
+query I nosort
+SELECT id FROM places WHERE at = '(Oak,10)'::loc
+----
+2
+
+# ORDER BY over the composite column sorts lexicographically: Elm/99, Oak/10, Oak/30.
+query I nosort
+SELECT id FROM places ORDER BY at
+----
+3
+2
+1
+
+# PG's all-fields IS NULL / IS NOT NULL rule — NOT negations. A partially-NULL row is FALSE for
+# both; an all-NULL row IS NULL; a fully-present row IS NOT NULL.
+query BB nosort
+SELECT ROW(1, 2) IS NULL, ROW(1, 2) IS NOT NULL
+----
+false
+true
+
+query BB nosort
+SELECT ROW(1, NULL) IS NULL, ROW(1, NULL) IS NOT NULL
+----
+false
+false
+
+query BB nosort
+SELECT ROW(NULL, NULL) IS NULL, ROW(NULL, NULL) IS NOT NULL
+----
+true
+false
+
+# The all-fields rule is ONE LEVEL DEEP, NOT recursive (the PG-probed behavior): a composite-valued
+# field is a non-NULL value, so a nested all-NULL row is IS NULL FALSE / IS NOT NULL TRUE.
+query BB nosort
+SELECT ROW(ROW(NULL, NULL), ROW(NULL, NULL)) IS NULL, ROW(ROW(NULL, NULL), ROW(NULL, NULL)) IS NOT NULL
+----
+false
+true
+
+# DISTINCT / GROUP BY over a composite column use the recursive value key (NULL-safe). Two
+# identical composite values collapse to one group.
+statement ok
+CREATE TABLE dups (id int32 PRIMARY KEY, at loc)
+
+statement ok
+INSERT INTO dups VALUES (1, ROW('Oak', 10)), (2, ROW('Oak', 10)), (3, ROW('Elm', 20))
+
+query T nosort
+SELECT DISTINCT at FROM dups ORDER BY at
+----
+(Elm,20)
+(Oak,10)
+
+query TI nosort
+SELECT at, count(*) FROM dups GROUP BY at ORDER BY at
+----
+(Elm,20)
+1
+(Oak,10)
+2
+
+# A composite compared with a non-composite is 42804; different row sizes is 42804.
+statement error 42804
+SELECT at = 1 FROM places
+
+statement error 42804
+SELECT ROW(1, 2) = ROW(1, 2, 3)
+
+# --- S6: record_in — the `'(…)'::type` / `type '(…)'` round-trip (spec/design/composite.md §8) ---
+
+# record_in is the exact inverse of record_out: the cast and typed-literal spellings are equivalent.
+query T nosort
+SELECT '(Main,90210)'::loc
+----
+(Main,90210)
+
+query T nosort
+SELECT loc '(Main,90210)'
+----
+(Main,90210)
+
+# Quoted field with a comma; field access on a parsed literal pulls the coerced field.
+query I nosort
+SELECT ('("x,y",7)'::loc).zip
+----
+7
+
+# An unquoted-empty field parses as NULL; a quoted-empty field is the empty string (which
+# record_out renders back as `""`, so the round-trip is visible).
+query B nosort
+SELECT ('(,5)'::loc).city IS NULL
+----
+true
+
+query T nosort
+SELECT '("",5)'::loc
+----
+("",5)
+
+# Malformed literals / field-count mismatch / a bad field value are 22P02.
+statement error 22P02
+SELECT '(Main)'::loc
+
+statement error 22P02
+SELECT '(a,b,c)'::loc
+
+statement error 22P02
+SELECT 'not a record'::loc
+
+statement error 22P02
+SELECT '(Main,notanint)'::loc

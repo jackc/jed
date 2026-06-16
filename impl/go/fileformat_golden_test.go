@@ -397,6 +397,32 @@ func float32TableDB(t *testing.T) *Database {
 	return db
 }
 
+// compositeTypeTableDB has a composite TYPE defined + persisted (v9) AND used by a column with
+// stored values (S3): pins the recursive value codec — the null bitmap, a present-field body, and a
+// NULL field's zero-byte omission (row 2's zip) — spec/design/composite.md §4.
+func compositeTypeTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TYPE addr AS (street text NOT NULL, zip int32)")
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, home addr)")
+	run(t, db, "INSERT INTO t VALUES (1, ROW('Main', 90210))")
+	run(t, db, "INSERT INTO t VALUES (2, ROW('Oak', NULL))")
+	return db
+}
+
+// nestedCompositeTableDB has nested composite types (a field whose type is another composite, by
+// name) used by a column with a stored nested value (S3). point is created first (a referenced type
+// must exist), but the on-disk order is name-sorted (line, point) — line sorts BEFORE the point it
+// references, so the two-pass load (collect all, then resolve) is exercised; the row pins the
+// recursive value codec descending through a composite field.
+func nestedCompositeTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)")
+	run(t, db, "CREATE TYPE line AS (a point, b point)")
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, ln line)")
+	run(t, db, "INSERT INTO t VALUES (1, ROW(ROW(1, 2), ROW(3, 4)))")
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -425,6 +451,8 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"check_table.jed", checkTableDB},
 		{"index_table.jed", indexTableDB},
 		{"unique_table.jed", uniqueTableDB},
+		{"composite_type_table.jed", compositeTypeTableDB},
+		{"nested_composite_table.jed", nestedCompositeTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -467,6 +495,8 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"check_table.jed", checkTableDB, "t"},
 		{"index_table.jed", indexTableDB, "t"},
 		{"unique_table.jed", uniqueTableDB, "t"},
+		{"composite_type_table.jed", compositeTypeTableDB, "t"},
+		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},
@@ -508,10 +538,10 @@ func TestReadGoldenReconstructsCatalog(t *testing.T) {
 		t.Fatalf("unexpected table shape: %+v", tbl)
 	}
 	id, v := tbl.Columns[0], tbl.Columns[1]
-	if id.Name != "id" || id.Type != Int32 || !id.PrimaryKey || !id.NotNull {
+	if id.Name != "id" || id.Type.ScalarTy() != Int32 || !id.PrimaryKey || !id.NotNull {
 		t.Errorf("column id wrong: %+v", id)
 	}
-	if v.Name != "v" || v.Type != Int16 || v.PrimaryKey || v.NotNull {
+	if v.Name != "v" || v.Type.ScalarTy() != Int16 || v.PrimaryKey || v.NotNull {
 		t.Errorf("column v wrong: %+v", v)
 	}
 	// A NULL value round-trips (id 3's v).

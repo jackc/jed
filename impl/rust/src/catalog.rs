@@ -1,14 +1,19 @@
 //! The catalog: table and column definitions (CLAUDE.md §4 strict static types).
 
+use std::collections::HashMap;
+
 use crate::ast::Expr;
-use crate::types::{DecimalTypmod, ScalarType};
+use crate::types::{DecimalTypmod, ScalarType, Type};
 use crate::value::Value;
 
 /// A column definition: name, declared type, nullability, primary-key flag, default.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Column {
     pub name: String,
-    pub ty: ScalarType,
+    /// The column's declared type — a built-in scalar or a user-defined composite
+    /// (spec/design/composite.md). The open `Type` wrapper (CLAUDE.md §4): scalar-only call sites
+    /// read `ty.scalar()`; the value codec / resolver branch on `Type::Composite`.
+    pub ty: Type,
     /// The `numeric(p,s)` type modifier for a decimal column, or `None` for a non-decimal
     /// column OR an unconstrained `numeric` (spec/design/decimal.md §2). A constrained
     /// decimal column coerces stored values to this precision/scale.
@@ -64,6 +69,30 @@ pub struct IndexDef {
     pub unique: bool,
 }
 
+/// A user-defined **composite (row) type** (spec/design/composite.md): a named, ordered list of
+/// typed fields, living in the database's type catalog (a database-level object, not per-table).
+/// Created by `CREATE TYPE name AS (field type, …)`, referenced by name from a column's `Type`.
+/// Recursive — a field's `ty` may itself be `Type::Composite` (a nested composite, persisted
+/// by name; spec/fileformat/format.md *Composite-type entry*).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CompositeType {
+    /// The type name (original case — round-trips what the user typed); looked up case-insensitively.
+    pub name: String,
+    /// The fields in declaration order (≥ 1).
+    pub fields: Vec<CompositeField>,
+}
+
+/// One field of a composite type: its name, type, and declared nullability.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CompositeField {
+    pub name: String,
+    pub ty: Type,
+    /// The decimal `numeric(p,s)` typmod when `ty` is `decimal`, else `None` (mirrors `Column`).
+    pub decimal: Option<DecimalTypmod>,
+    /// Whether the field was declared `NOT NULL`.
+    pub not_null: bool,
+}
+
 /// A table definition.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Table {
@@ -81,6 +110,63 @@ pub struct Table {
     /// The table's secondary indexes in **ascending lowercased-name order** (the catalog's
     /// on-disk order and the planner's tie-break order — spec/design/indexes.md §5/§6).
     pub indexes: Vec<IndexDef>,
+}
+
+/// A fully-resolved storage/codec column type (spec/design/composite.md §4): a scalar, or a
+/// composite resolved to the codec/coercion tree of its fields. Built **once** from a catalog
+/// `Type` against the snapshot's composite-type definitions ([`resolve_col_type`]) and held by the
+/// `TableStore`, so the value codec and store-coercion never re-walk the type catalog on every row.
+/// Recursive — a composite field may itself be composite. The codec reads only the scalar / field
+/// structure; the field `typmod` / `not_null` are consulted by store-coercion (executor).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ColType {
+    Scalar(ScalarType),
+    /// A composite type's resolved fields, in declaration order. `name` is the (original-case)
+    /// type name, used in store-coercion error messages.
+    Composite {
+        name: String,
+        fields: Vec<ColField>,
+    },
+}
+
+/// One resolved field of a [`ColType::Composite`] — its name, recursively-resolved type, the
+/// decimal typmod (when the field is `decimal`), and declared nullability (mirrors `CompositeField`,
+/// but with the type fully resolved for the codec/coercion path).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ColField {
+    pub name: String,
+    pub ty: ColType,
+    pub typmod: Option<DecimalTypmod>,
+    pub not_null: bool,
+}
+
+/// Resolve a catalog [`Type`] into a self-contained [`ColType`] against the database's composite
+/// definitions (keyed by lowercased name, the `Snapshot.types` map). A composite reference is
+/// looked up case-insensitively and recursively resolved; the lookup is guaranteed to succeed
+/// because `validate_composite_types` (the two-pass load / `CREATE TYPE` gate) proved every
+/// reference exists and the graph is acyclic before any store is built (spec/design/composite.md §3).
+pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> ColType {
+    match ty {
+        Type::Scalar(s) => ColType::Scalar(*s),
+        Type::Composite(r) => {
+            let def = types
+                .get(&r.name.to_ascii_lowercase())
+                .expect("composite type reference resolved by validate_composite_types");
+            ColType::Composite {
+                name: def.name.clone(),
+                fields: def
+                    .fields
+                    .iter()
+                    .map(|f| ColField {
+                        name: f.name.clone(),
+                        ty: resolve_col_type(&f.ty, types),
+                        typmod: f.decimal,
+                        not_null: f.not_null,
+                    })
+                    .collect(),
+            }
+        }
+    }
 }
 
 impl Table {

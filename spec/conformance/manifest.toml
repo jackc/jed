@@ -289,6 +289,10 @@ id = "types.float32"
 description = "float32 / real scalar type (IEEE 754 binary32): the same surface as float64 at single precision; forms a promotion tower with float64 (float32->float64 lossless-implicit). Exempt from cross-core byte-identity for computed/rendered values (R tag); storage (4 bytes, on-disk code 13) / total order / kernel / exact-sum SUM/AVG / cost in-contract. Non-key column only (0A000). spec/design/float.md"
 
 [[capability]]
+id = "types.composite"
+description = "composite (row) types — CREATE TYPE name AS (field type [NOT NULL], …) / DROP TYPE [IF EXISTS] name [RESTRICT]: a named, user-defined heterogeneous tuple living in the database's type catalog, persisted across reopen (format_version 9 — the catalog becomes kind-tagged entries with a composite-type section, two-pass load). Named composites only (no anonymous record); nested composites (a field typed as another composite) supported by name. Duplicate type 42710, unknown field type 42704, duplicate field 42701, DROP with dependents 2BP01, DROP missing 42704 (unless IF EXISTS). This slice (S2) creates/drops/persists the TYPE; a composite-typed COLUMN, the ROW(…) constructor, field access, comparison, and text I/O are later slices (rejected 0A000 for now) — composite-as-key stays 0A000. spec/design/composite.md"
+
+[[capability]]
 id = "expr.interval_arithmetic"
 description = "interval arithmetic (spec/design/interval.md §5): interval ± interval → interval (field-wise, no justification) and unary minus; a NULL operand propagates; an i32 month/day or i64 micros overflow traps 22008. interval ×÷ number and timestamp ± interval are separate capabilities (later slices)"
 

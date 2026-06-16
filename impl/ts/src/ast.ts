@@ -114,7 +114,22 @@ export type Expr =
   | { kind: "exists"; query: QueryExpr }
   // `lhs [NOT] IN ( query_expr )` (spec/design/grammar.md §26) — membership of lhs in the
   // subquery's single output column (three-valued, like a literal IN).
-  | { kind: "inSubquery"; lhs: Expr; query: QueryExpr; negated: boolean };
+  | { kind: "inSubquery"; lhs: Expr; query: QueryExpr; negated: boolean }
+  // A `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Builds a row value from
+  // the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The bare
+  // `(a, b)` form is deferred (0A000); only the keyword form parses.
+  | { kind: "row"; fields: Expr[] }
+  // Field selection `(expr).field` (spec/design/composite.md §S4) — the value of one named field of
+  // a composite `base`. The parser produces this for a `.name` postfix on a parenthesized / ROW(…) /
+  // cast / qualified-column base; a bare `a.b` stays qualifiedColumn and only falls back to field
+  // access at resolve when `a` is no relation but a composite column (the ambiguity rule — table.column
+  // first, then column.field). Field lookup is case-insensitive; an unknown field is 42703, a
+  // non-composite base 42809.
+  | { kind: "fieldAccess"; base: Expr; field: string }
+  // Whole-row expansion `(expr).*` (spec/design/composite.md §S4) — expands a composite `base` into
+  // one output column per field, in declaration order. Valid only in a SELECT/RETURNING projection
+  // list (where `*` expands); in any scalar expression position it is 0A000.
+  | { kind: "fieldStar"; base: Expr };
 
 // SelectItem is one select-list expression with its optional output-name alias
 // (expr AS name). The alias is an output label only — it never enters resolution
@@ -227,6 +242,29 @@ export type CreateIndex = {
 // (spec/design/indexes.md §2). Missing → 42704; a table's name → 42809.
 export type DropIndex = { kind: "dropIndex"; name: string };
 
+// CreateType is a `CREATE TYPE <name> AS ( field type [NOT NULL] [, …] )` statement — a
+// user-defined composite (row) type (spec/design/composite.md, grammar.md). Execution resolves
+// each field's type (a built-in scalar or a previously-defined composite — 42704 if unknown),
+// rejects a duplicate type name (42710), and registers it in the catalog. Named composites only
+// this slice; anonymous `record` is not supported.
+export type CreateType = { kind: "createType"; name: string; fields: TypeFieldDef[] };
+
+// TypeFieldDef is one field of a CREATE TYPE definition: its name, its type as written (a built-in
+// scalar alias or a composite type name), an optional numeric(p,s) modifier, and an explicit
+// NOT NULL. Resolved at execution (mirrors ColumnDef).
+export type TypeFieldDef = {
+  name: string;
+  typeName: string;
+  typeMod: TypeMod | null;
+  notNull: boolean;
+};
+
+// DropType is a `DROP TYPE [IF EXISTS] <name> [RESTRICT]` statement — remove a composite type
+// (spec/design/composite.md §7). RESTRICT (the default and only behavior this slice) fails with
+// 2BP01 if a table column or another composite type still references it; CASCADE is 0A000. A
+// missing type without IF EXISTS is 42704.
+export type DropType = { kind: "dropType"; name: string; ifExists: boolean };
+
 // Insert is an INSERT ... [(col, ..)] whose rows come from EITHER a VALUES list (each value a
 // literal or the DEFAULT keyword) OR a SELECT (INSERT ... SELECT — spec/design/grammar.md §24).
 // An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
@@ -255,6 +293,10 @@ export type InsertValue =
   | { kind: "lit"; lit: Literal }
   // A bind parameter $N (1-based), bound at execute — spec/design/api.md §5.
   | { kind: "param"; index: number }
+  // A ROW(…) constructor in a VALUES slot (spec/design/composite.md §1) — a composite value for a
+  // composite target column. Fields are themselves InsertValues (a literal, a $N, or a nested
+  // ROW(…)); DEFAULT is not a valid field (only a top-level slot takes a default).
+  | { kind: "row"; fields: InsertValue[] }
   | { kind: "default" };
 
 // TableRef is a table reference in a FROM clause: a table name with an optional alias
@@ -372,6 +414,8 @@ export type Statement =
   | DropTable
   | CreateIndex
   | DropIndex
+  | CreateType
+  | DropType
   | Insert
   | Select
   | SetOp

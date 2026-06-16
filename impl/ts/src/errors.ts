@@ -40,6 +40,7 @@ export type SqlState =
   | "undefined_parameter" // 42P02 — a bind parameter $N where none can exist (a CHECK expression)
   | "duplicate_object" // 42710 — a constraint name already taken on this table (constraints.md §4.3)
   | "wrong_object_type" // 42809 — DROP TABLE of an index name / DROP INDEX of a table name (indexes.md §2)
+  | "dependent_objects_still_exist" // 2BP01 — DROP TYPE ... RESTRICT of a composite still referenced (composite.md §7)
   | "feature_not_supported" // 0A000
   | "cost_limit_exceeded" // 54P01 — accrued cost reached the caller-set max_cost ceiling (cost.md §6)
   | "io_error" // 58030 — an I/O error from the host file layer (spec/design/api.md §2)
@@ -81,6 +82,7 @@ const CODES: Record<SqlState, string> = {
   undefined_parameter: "42P02",
   duplicate_object: "42710",
   wrong_object_type: "42809",
+  dependent_objects_still_exist: "2BP01",
   feature_not_supported: "0A000",
   cost_limit_exceeded: "54P01",
   io_error: "58030",

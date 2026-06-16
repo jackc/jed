@@ -38,14 +38,14 @@ func TestCreatesTableWithResolvedTypesAndPK(t *testing.T) {
 	if len(tbl.Columns) != 3 {
 		t.Fatalf("expected 3 columns, got %d", len(tbl.Columns))
 	}
-	if tbl.Columns[0].Name != "id" || tbl.Columns[0].Type != Int32 ||
+	if tbl.Columns[0].Name != "id" || tbl.Columns[0].Type.ScalarTy() != Int32 ||
 		!tbl.Columns[0].PrimaryKey || !tbl.Columns[0].NotNull {
 		t.Errorf("col 0 wrong: %+v", tbl.Columns[0])
 	}
-	if tbl.Columns[1].Type != Int16 || tbl.Columns[1].PrimaryKey || tbl.Columns[1].NotNull {
+	if tbl.Columns[1].Type.ScalarTy() != Int16 || tbl.Columns[1].PrimaryKey || tbl.Columns[1].NotNull {
 		t.Errorf("col 1 wrong: %+v", tbl.Columns[1])
 	}
-	if tbl.Columns[2].Type != Int64 {
+	if tbl.Columns[2].Type.ScalarTy() != Int64 {
 		t.Errorf("col 2 wrong: %+v", tbl.Columns[2])
 	}
 	if tbl.PrimaryKeyIndex() != 0 {
@@ -59,8 +59,8 @@ func TestSQLStandardTypeAliasesResolve(t *testing.T) {
 	tbl, _ := db.Table("t")
 	want := []ScalarType{Int16, Int32, Int32, Int64}
 	for i, w := range want {
-		if tbl.Columns[i].Type != w {
-			t.Errorf("col %d: got %v want %v", i, tbl.Columns[i].Type, w)
+		if tbl.Columns[i].Type.ScalarTy() != w {
+			t.Errorf("col %d: got %v want %v", i, tbl.Columns[i].Type.ScalarTy(), w)
 		}
 	}
 }

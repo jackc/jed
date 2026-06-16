@@ -15,21 +15,43 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 8)
+## Version scope (`format_version` 9)
 
-The current on-disk version is **`format_version` 8** — an **expression column default**.
-A column's `DEFAULT` may now be a non-constant expression (a function call like `uuidv7()`,
+The current on-disk version is **`format_version` 9** — **composite (row) types**
+([../design/composite.md](../design/composite.md)). A user-defined composite type
+(`CREATE TYPE addr AS (street text, zip int32)`) is a database-level object, so the catalog —
+through v8 a chain of **table** entries — becomes a chain of **kind-tagged** entries. Three
+coupled changes, all in the catalog (the per-table data B-tree and the meta page are untouched):
+
+1. **Every catalog entry gains a leading `entry_kind` u8**: `0` = a table entry (the v8 layout,
+   unchanged after this byte), `1` = a composite-type entry. Composite-type entries are emitted
+   **first** (ascending lowercased-name order), then table entries (ascending lowercased-name
+   order); `item_count` counts all entries, packed greedily exactly as before. The catalog stays
+   a uniform "sequence of entries" — no special head page, no separate page chain.
+2. **A composite-type entry** carries the type's name and ordered field list (the *Composite-type
+   entry* table below). A composite type used as a column type is referenced **by name**, with a
+   new **`type_code = 14`** (the *Stable type codes* table) followed by the type name in the
+   column entry's typmod slot.
+3. **Load is two-pass**: collect every composite-type entry into a name→definition map, validate
+   that every referenced composite name exists and the reference graph is **acyclic** (a dangling
+   or cyclic reference is `XX001`), then build the tables (resolving each composite column's name).
+
+A file with no composite types still moves to v9 (the version byte changes, and every table entry
+gains the leading `entry_kind = 0`). Each version is a **clean break** — older versions are **not
+read** (we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a
+reader accepts **only** version 9.
+
+`format_version` 8 was an **expression column default**.
+A column's `DEFAULT` may be a non-constant expression (a function call like `uuidv7()`,
 arithmetic like `1 + 1`) rather than only a constant literal
-([../design/constraints.md §2](../design/constraints.md)). The per-column flags byte gains
+([../design/constraints.md §2](../design/constraints.md)). The per-column flags byte gained
 **bit3 `default_is_expr`**: when set, the default's **expression text** — a length-prefixed
 UTF-8 string, the parsed token sequence re-rendered by the same closed token table a `CHECK`
 uses (*Check-expression text* below) — is written after the typmod **in place of** the
 value-codec default that `bit2 has_default` writes. The two bits are **mutually exclusive**.
 On load the text re-parses with the ordinary expression parser (`XX001` if it fails, like a
 stored check); the write paths evaluate it per row. A constant-literal default still takes the
-`bit2` value-codec path unchanged. A catalog-only change. Each version is a **clean break** —
-older versions are **not read** (we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md §1,
-"we own our surface"), so a reader accepts **only** version 8.
+`bit2` value-codec path unchanged.
 
 `format_version` 7 was the **per-page checksum on every body page** (catalog / B-tree node /
 overflow), the on-disk-integrity layer that lets the loader **detect silent corruption** of a
@@ -235,16 +257,27 @@ B-tree root moves). Its **encoding is byte-identical to v1**; only its location 
 (`root_page`) and `root_data_page` now points at a **B-tree root node** instead of a record
 chain head.
 
-Tables are emitted in **ascending order of the lowercased table name** (the engine stores
-tables in a hash map keyed by lowercased name; sorting by that key removes any iteration-order
-leak — CLAUDE.md §8; names are unique after lowercasing, so there are no ties). Each page's
-`item_count` is the number of table entries it holds; the total table count is the sum across
-the chain. Catalog entries are packed greedily (a single table entry must fit one page, i.e.
-≤ `C`, else `0A000`; the `RECORD_MAX = C/2` cap is a B-tree-record rule and does **not** apply
-to catalog entries, which never split).
+**Each catalog entry is kind-tagged (v9):** a leading `entry_kind` u8 — `0` = a table entry, `1`
+= a composite-type entry ([../design/composite.md §3](../design/composite.md)). **Composite-type
+entries are emitted first** (ascending lowercased-name order), then table entries (ascending
+lowercased-name order). Each page's `item_count` is the number of entries (of either kind) it
+holds; entries are packed greedily into the chain, kind-tagged in stream order, exactly as table
+entries were through v8 (a single entry must fit one page, i.e. ≤ `C`, else `0A000`; the
+`RECORD_MAX = C/2` cap is a B-tree-record rule and does **not** apply to catalog entries, which
+never split). Tables are emitted in **ascending order of the lowercased table name** (the engine
+stores tables in a hash map keyed by lowercased name; sorting by that key removes any
+iteration-order leak — CLAUDE.md §8; names are unique after lowercasing, so there are no ties);
+composite types likewise.
 
-Each **table entry** (v5 adds the primary-key ordinal list after the columns and the index
-list after the checks, and retires column-flag bit0):
+**Load is two-pass (v9):** the reader walks the whole chain collecting every composite-type entry
+into a name→definition map, validates that every composite **referenced** by a column or a field
+exists and that the reference graph is **acyclic** (a dangling or cyclic reference is `XX001`),
+then builds the tables — resolving each composite column's type name against the map. Because of
+nested composites a single pass cannot guarantee a referenced type is already read (name order
+does not imply dependency order), hence the two passes.
+
+Each **table entry** (after its `entry_kind = 0`; v5 adds the primary-key ordinal list after the
+columns and the index list after the checks, and retires column-flag bit0):
 
 | field | encoding |
 |---|---|
@@ -285,6 +318,39 @@ ascending byte order of the lowercased `check_name` ([../design/constraints.md
 are emitted in **ascending byte order of the lowercased `index_name`** (the catalog's
 in-memory order and the planner's tie-break order — [../design/indexes.md
 §5/§6](../design/indexes.md)); a reader trusts that order too.
+
+A **composite column** (a column whose type is a user-defined composite — `type_code == 14`)
+appends, in the column entry's typmod slot (where a decimal appends precision/scale), a
+`u16 type_name_len` then that many UTF-8 bytes naming the composite type. The named type must
+appear in this catalog's composite-type entries (else `XX001`). A composite column is **not** a
+key this slice — a composite `PRIMARY KEY` / index / `UNIQUE` column is rejected `0A000` at DDL
+([../design/composite.md §6](../design/composite.md)), so no composite key bytes ever reach a
+data record.
+
+### Composite-type entry (`entry_kind = 1`, v9)
+
+A composite-type entry records a `CREATE TYPE name AS (field type, …)` definition
+([../design/composite.md](../design/composite.md)):
+
+| field | encoding |
+|---|---|
+| `entry_kind` | u8 = `1` |
+| `name_len` | u16 |
+| `name` | `name_len` bytes UTF-8 (original case) |
+| `field_count` | u16 — ≥ 1 |
+| per field (×`field_count`): | |
+| &nbsp;&nbsp;`field_name_len` | u16 |
+| &nbsp;&nbsp;`field_name` | UTF-8 (original case) |
+| &nbsp;&nbsp;`field_type_code` | u8 (the *Stable type codes* table; `14` = a nested composite) |
+| &nbsp;&nbsp;`field_type_name_len` | u16 — **only when `field_type_code == 14`** |
+| &nbsp;&nbsp;`field_type_name` | UTF-8 — **only when `field_type_code == 14`**: the referenced composite type's name |
+| &nbsp;&nbsp;`field_flags` | u8 — bit0 `not_null` (declared `NOT NULL`); bits 1–7 reserved, written 0 (a set reserved bit is `XX001`) |
+| &nbsp;&nbsp;`precision` | u16 — **only when `field_type_code == 6` (decimal)**; `0` = unconstrained |
+| &nbsp;&nbsp;`scale` | u16 — **only when `field_type_code == 6` (decimal)** |
+
+Fields are emitted in **declaration order** (the order they appear in `CREATE TYPE`). A field
+type code of `14` references another composite **by name** (nested composites); the loader's
+two-pass validation rejects a dangling reference or a definition cycle (`XX001`).
 
 ### Check-expression text
 
@@ -336,6 +402,7 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 11 | `interval` |
 | 12 | `float64` |
 | 13 | `float32` |
+| 14 | composite (a user-defined row type — followed by the type name, **not** a fixed body; v9) |
 
 A **`float64`** value (`type_code == 12`) is the **8 IEEE 754 bytes, big-endian**, and a
 **`float32`** value (`type_code == 13`) is the **4 IEEE 754 bytes, big-endian** — both behind the
@@ -557,6 +624,18 @@ from v1**. The present-**inline-plain** body depends on the type:
   order-preserving key, and interval is not a key this slice — [../design/interval.md](../design/interval.md)).
   No length prefix; the three fields are independent (PG's representation), and comparison goes
   through the canonical 128-bit span at runtime, never these bytes.
+
+- **composite** (`type_code 14`, v9 — [../design/composite.md §4](../design/composite.md)) — a
+  **null bitmap** of `ceil(field_count / 8)` bytes (**MSB-first**: field *i*'s NULL bit is
+  `0x80 >> (i mod 8)` of byte `i / 8`; a set bit = that field is NULL and contributes **zero** body
+  bytes), then each **present** field's value-codec body **in declaration order**, written
+  **without its own presence tag** (the bitmap carries presence). A field that is itself a
+  composite **recurses** (its body is another bitmap + field bodies). A **whole-value-NULL**
+  composite is the lone `0x01` tag (no bitmap). The field types come from the column's composite
+  type in the catalog, so the body is self-delimiting. Worked example,
+  `addr AS (street text, zip int32)`: `('Main', 90210)` → `00`(tag) `00`(bitmap) `00 04 4D 61 69 6E`
+  (text body) `80 01 60 62` (int32 body) — an 11-byte body; `('Main', NULL)` → `00`(tag) `40`
+  (bitmap: field 1 NULL) `00 04 4D 61 69 6E` (the int field omitted) — a 7-byte body.
 
 **Rowid reconstruction (no-PK tables).** The synthetic rowid is allocated from a **monotonic
 counter** that is never reused. It is **not stored** — on load it is set to `max(rowid) + 1`

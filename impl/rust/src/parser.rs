@@ -5,10 +5,10 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, DefaultDef, Delete,
-    DropIndex, DropTable, Expr, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal,
-    OrderKey, QueryExpr, Select, SelectItem, SelectItems, SetOp, SetOpKind, Statement, TableRef,
-    TypeMod, UnaryOp, UniqueDef, Update,
+    Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, CreateType, DefaultDef,
+    Delete, DropIndex, DropTable, DropType, Expr, Insert, InsertSource, InsertValue, JoinClause,
+    JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItem, SelectItems, SetOp, SetOpKind,
+    Statement, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -46,9 +46,17 @@ impl Parser {
             {
                 Ok(Statement::CreateIndex(self.parse_create_index()?))
             }
+            // CREATE TYPE — a 2-token lookahead keeps TYPE non-reserved (the CREATE UNIQUE INDEX
+            // precedent — composite.md §1).
+            Some("create") if self.peek_keyword_at(1).as_deref() == Some("type") => {
+                Ok(Statement::CreateType(self.parse_create_type()?))
+            }
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
             Some("drop") if self.peek_keyword_at(1).as_deref() == Some("index") => {
                 Ok(Statement::DropIndex(self.parse_drop_index()?))
+            }
+            Some("drop") if self.peek_keyword_at(1).as_deref() == Some("type") => {
+                Ok(Statement::DropType(self.parse_drop_type()?))
             }
             Some("drop") => Ok(Statement::DropTable(self.parse_drop_table()?)),
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
@@ -429,6 +437,75 @@ impl Parser {
         Ok(DropIndex { name })
     }
 
+    /// `CREATE TYPE <name> AS ( <field> <type> [NOT NULL] [, …] )` — a composite (row) type
+    /// (spec/design/composite.md, grammar.md). At least one field (an empty list is a syntax
+    /// error); each field's type is a bare type name (built-in or a composite), resolved at
+    /// execution (42704 if unknown).
+    fn parse_create_type(&mut self) -> Result<CreateType> {
+        self.expect_keyword("create")?;
+        self.expect_keyword("type")?;
+        let name = self.expect_identifier()?;
+        self.expect_keyword("as")?;
+        self.expect(&Token::LParen)?;
+        let mut fields = Vec::new();
+        loop {
+            let fname = self.expect_identifier()?;
+            let type_name = self.expect_identifier()?;
+            let type_mod = self.parse_type_mod()?;
+            let mut not_null = false;
+            if self.peek_keyword().as_deref() == Some("not") {
+                self.advance();
+                self.expect_keyword("null")?;
+                not_null = true;
+            }
+            fields.push(TypeFieldDef {
+                name: fname,
+                type_name,
+                type_mod,
+                not_null,
+            });
+            match self.advance() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
+            }
+        }
+        Ok(CreateType { name, fields })
+    }
+
+    /// `DROP TYPE [IF EXISTS] <name> [RESTRICT | CASCADE]` (spec/design/composite.md §7).
+    /// `RESTRICT` is the default and the only behavior this slice; `CASCADE` is rejected
+    /// (0A000) at execution. A missing type (42704) and dependents (2BP01) are execution-time.
+    fn parse_drop_type(&mut self) -> Result<DropType> {
+        self.expect_keyword("drop")?;
+        self.expect_keyword("type")?;
+        let if_exists = self.peek_keyword().as_deref() == Some("if");
+        if if_exists {
+            self.advance();
+            self.expect_keyword("exists")?;
+        }
+        let name = self.expect_identifier()?;
+        // Optional trailing RESTRICT / CASCADE (a keyword, consumed here; CASCADE is 0A000 at exec).
+        let cascade = match self.peek_keyword().as_deref() {
+            Some("restrict") => {
+                self.advance();
+                false
+            }
+            Some("cascade") => {
+                self.advance();
+                true
+            }
+            _ => false,
+        };
+        if cascade {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "DROP TYPE ... CASCADE is not supported".to_string(),
+            ));
+        }
+        Ok(DropType { name, if_exists })
+    }
+
     /// `INSERT INTO <table> [( <col> [, <col>]* )] ( VALUES <row> [, <row>]* | <select> )`. The
     /// source is either a VALUES list (each `<row>` is `( <value> [, <value>]* )`, each `<value>`
     /// a literal or the `DEFAULT` keyword) or a SELECT (INSERT ... SELECT — §24). The optional
@@ -502,12 +579,35 @@ impl Parser {
         Ok(values)
     }
 
-    /// One INSERT value slot: the `DEFAULT` keyword (not reserved — §3), a bind parameter
-    /// (`$N`, bound at execute — spec/design/api.md §5), else a literal.
+    /// One INSERT value slot: the `DEFAULT` keyword (not reserved — §3), a `ROW(…)` composite
+    /// constructor (spec/design/composite.md §1), a bind parameter (`$N`, bound at execute —
+    /// spec/design/api.md §5), else a literal.
     fn parse_insert_value(&mut self) -> Result<InsertValue> {
         if self.peek_keyword().as_deref() == Some("default") {
             self.advance();
             Ok(InsertValue::Default)
+        } else if self.peek_keyword().as_deref() == Some("row")
+            && matches!(self.peek_at(1), Token::LParen)
+        {
+            // ROW(field, field, …) — recurse on each field (a literal, a `$N`, or a nested ROW).
+            self.advance(); // ROW
+            self.expect(&Token::LParen)?;
+            let mut fields = Vec::new();
+            if !matches!(self.peek(), Token::RParen) {
+                loop {
+                    fields.push(self.parse_insert_value()?);
+                    match self.advance() {
+                        Token::Comma => continue,
+                        Token::RParen => break,
+                        other => {
+                            return Err(syntax(format!("expected ',' or ')', found {other:?}")));
+                        }
+                    }
+                }
+            } else {
+                self.advance(); // the empty ROW() — consume ')'
+            }
+            Ok(InsertValue::Row(fields))
         } else if let Token::Param(n) = self.peek() {
             let n = *n;
             self.advance();
@@ -1341,23 +1441,58 @@ impl Parser {
         self.parse_postfix()
     }
 
-    /// A primary optionally followed by one or more `::type` PostgreSQL typecasts
-    /// (grammar.md §37). `expr :: type` desugars to `CAST(expr AS type)` here at parse time —
-    /// one resolver / evaluator / cost path for both spellings — and casts chain
-    /// left-associatively (`x::int8::int2` = `(x::int8)::int2`). A typmod rides on the type
-    /// name exactly as in `CAST` (`x::numeric(10,2)`). `::` binds tighter than unary minus
-    /// (handled by `parse_unary` above).
+    /// A primary optionally followed by one or more postfix operators, applied left-to-right in
+    /// token order: a `::type` PostgreSQL typecast (grammar.md §37) or a `.field` / `.*` composite
+    /// field selection (spec/design/composite.md §S4). `expr :: type` desugars to
+    /// `CAST(expr AS type)` here at parse time — one resolver / evaluator / cost path for both
+    /// spellings — and casts chain left-associatively (`x::int8::int2` = `(x::int8)::int2`). A
+    /// typmod rides on the type name exactly as in `CAST` (`x::numeric(10,2)`).
+    ///
+    /// Field selection follows PostgreSQL's **parens-required** rule: `.field` / `.*` applies ONLY
+    /// to a **parenthesized** base — `(home).zip`, `(t.home).zip`, `(ROW(1,2)).f1` — and chains on a
+    /// prior field access (`(c).a.b`). A bare `home.zip` / `t.home.zip` is a (multi-part) column
+    /// reference, never field access (PG raises `42P01` for the unparenthesized form). So `.field`
+    /// fires only when the primary started with `(` or after a previous `.field`; otherwise the `.`
+    /// is left for the caller (a trailing `.field` on a bare name is then a syntax error, like PG).
     fn parse_postfix(&mut self) -> Result<Expr> {
+        // Only a PARENTHESIZED primary is field-accessible (PG requires `(expr).field`). A
+        // subsequent `.field` keeps the chain field-accessible (`(c).a.b`); a `::` cast does not.
+        let mut field_accessible = matches!(self.peek(), Token::LParen);
         let mut expr = self.parse_primary()?;
-        while matches!(self.peek(), Token::DoubleColon) {
-            self.advance();
-            let type_name = self.expect_identifier()?;
-            let type_mod = self.parse_type_mod()?;
-            expr = Expr::Cast {
-                inner: Box::new(expr),
-                type_name,
-                type_mod,
-            };
+        loop {
+            match self.peek() {
+                Token::DoubleColon => {
+                    self.advance();
+                    let type_name = self.expect_identifier()?;
+                    let type_mod = self.parse_type_mod()?;
+                    expr = Expr::Cast {
+                        inner: Box::new(expr),
+                        type_name,
+                        type_mod,
+                    };
+                    field_accessible = false;
+                }
+                // `.field` / `.*` — composite field selection (spec/design/composite.md §S4),
+                // parens-required: only on a parenthesized / chained-field base.
+                Token::Dot if field_accessible => {
+                    self.advance();
+                    if matches!(self.peek(), Token::Star) {
+                        self.advance();
+                        expr = Expr::FieldStar {
+                            base: Box::new(expr),
+                        };
+                        field_accessible = false; // `.*` is terminal
+                    } else {
+                        let field = self.expect_identifier()?;
+                        expr = Expr::FieldAccess {
+                            base: Box::new(expr),
+                            field,
+                        };
+                        // a field value may itself be composite → `(c).a.b` chains
+                    }
+                }
+                _ => break,
+            }
         }
         Ok(expr)
     }
@@ -1403,6 +1538,30 @@ impl Parser {
                 type_name,
                 type_mod,
             });
+        }
+        // `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when
+        // `ROW` is immediately followed by `(`, so `row` stays usable as a column / function name
+        // otherwise. The bare `(a, b)` form is deferred (`0A000`); only the keyword form parses.
+        if self.peek_keyword().as_deref() == Some("row") && matches!(self.peek_at(1), Token::LParen)
+        {
+            self.advance(); // ROW
+            self.expect(&Token::LParen)?;
+            let mut fields = Vec::new();
+            if !matches!(self.peek(), Token::RParen) {
+                loop {
+                    fields.push(self.parse_expr()?);
+                    match self.advance() {
+                        Token::Comma => continue,
+                        Token::RParen => break,
+                        other => {
+                            return Err(syntax(format!("expected ',' or ')', found {other:?}")));
+                        }
+                    }
+                }
+            } else {
+                self.advance(); // the empty ROW() — consume ')'
+            }
+            return Ok(Expr::Row(fields));
         }
         // A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`,
         // equal to `CAST('string' AS type)` over a string-literal operand: ANY type-naming word

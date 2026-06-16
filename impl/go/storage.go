@@ -22,9 +22,10 @@ type TableStore struct {
 	// (spec/fileformat).
 	nextRowid int64
 	// cap is the page payload capacity C = page_size − 12 (the split threshold). Fixed for the
-	// database's life. colTypes are the column types, for computing record weights.
+	// database's life. colTypes are the resolved column types (scalar or composite —
+	// spec/design/composite.md §4), for computing record weights and the recursive value codec.
 	cap      int
-	colTypes []ScalarType
+	colTypes []ColType
 	// paging is the shared pager + leaf buffer pool for a file-backed database (spec/design/pager.md):
 	// the read/mutation path faults OnDisk leaves through it. nil for an in-memory database and for a
 	// table created in-session (fully resident until the file is reopened); attached by the
@@ -32,9 +33,9 @@ type TableStore struct {
 	paging *sharedPaging
 }
 
-// NewTableStore builds an empty store for a table whose columns have the given types, serializing at
-// page payload cap (= page_size − 12). In-memory (no paging) until attachPaging.
-func NewTableStore(cap int, colTypes []ScalarType) *TableStore {
+// NewTableStore builds an empty store for a table whose columns have the given resolved types,
+// serializing at page payload cap (= page_size − 12). In-memory (no paging) until attachPaging.
+func NewTableStore(cap int, colTypes []ColType) *TableStore {
 	return &TableStore{cap: cap, colTypes: colTypes}
 }
 
@@ -55,7 +56,7 @@ func (s *TableStore) attachPaging(p *sharedPaging) { s.paging = p }
 // leaf page through this database's shared pool, decoding it with this table's column types.
 type pagedSource struct {
 	paging   *sharedPaging
-	colTypes []ScalarType
+	colTypes []ColType
 }
 
 func (ps *pagedSource) loadLeaf(page uint32) (*pnode, error) {

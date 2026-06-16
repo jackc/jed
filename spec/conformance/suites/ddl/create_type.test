@@ -1,0 +1,75 @@
+# Composite (row) types — CREATE TYPE / DROP TYPE (spec/design/composite.md).
+# A composite type is a named, user-defined heterogeneous tuple in the database's type catalog,
+# persisted across reopen (format_version 9). This file covers the DDL surface — create / drop /
+# dependency tracking; composite-typed COLUMNS, the ROW(...) constructor, and `record_out` are
+# exercised in ../types/composite.test. Named composites only (no anonymous record); nested
+# composites (a field typed as another composite) are supported by name.
+#
+# Errors: duplicate type 42710, unknown field type 42704, duplicate field 42701, DROP with
+# dependents (RESTRICT) 2BP01, DROP missing 42704 (unless IF EXISTS). The PG-divergent records
+# sit LAST with ledger overrides (conformance.md §5): a composite PRIMARY KEY and DROP ... CASCADE
+# both succeed in PostgreSQL but are 0A000 in jed this slice.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, types.composite, types.int32, types.text, resource.cost_metering
+
+# A composite type is created and lives in the catalog.
+statement ok
+CREATE TYPE addr AS (street text NOT NULL, zip int32)
+
+# A second type with the same name is a duplicate object.
+statement error 42710
+CREATE TYPE addr AS (city text)
+
+# An unknown field type does not resolve.
+statement error 42704
+CREATE TYPE bad AS (a nosuchtype)
+
+# A field name may not repeat within a type.
+statement error 42701
+CREATE TYPE bad AS (a int32, a int64)
+
+# A composite type drops cleanly when nothing depends on it.
+statement ok
+DROP TYPE addr
+
+# Dropping a type that does not exist is an error, unless IF EXISTS.
+statement error 42704
+DROP TYPE addr
+
+statement ok
+DROP TYPE IF EXISTS addr
+
+# Nested composites: a field whose type is another composite. The referenced type must exist
+# first (a forward reference is 42704).
+statement error 42704
+CREATE TYPE line AS (a point, b point)
+
+statement ok
+CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)
+
+statement ok
+CREATE TYPE line AS (a point, b point)
+
+# DROP TYPE RESTRICT (the default) refuses while a dependent exists.
+statement error 2BP01
+DROP TYPE point
+
+# Dropping the dependent first frees the referenced type.
+statement ok
+DROP TYPE line
+
+statement ok
+DROP TYPE point
+
+# --- jed narrowings (PG-divergent; ledger overrides) ------------------------------------------
+statement ok
+CREATE TYPE addr AS (street text, zip int32)
+
+# A composite PRIMARY KEY is not supported (the order-preserving composite key encoding is authored
+# but unexercised — composite.md §6). PostgreSQL allows it; jed rejects 0A000.
+statement error 0A000
+CREATE TABLE p (home addr PRIMARY KEY)
+
+# DROP TYPE ... CASCADE is not supported (RESTRICT-only this slice). PostgreSQL drops with CASCADE.
+statement error 0A000
+DROP TYPE addr CASCADE

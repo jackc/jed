@@ -24,6 +24,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
   "ddl.secondary_index",
   "ddl.unique",
+  // Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9); composite
+  // columns/values are a later slice (spec/design/composite.md).
+  "types.composite",
   // NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
   "ddl.not_null",
   // DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

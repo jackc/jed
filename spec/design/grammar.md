@@ -1679,3 +1679,32 @@ a colon). See [grammar.ebnf](../grammar/grammar.ebnf) `double_colon`.
 `0A000` narrowing (§36, [types.md](types.md) §5), `5 :: text`, `x :: boolean`, etc. are `0A000`
 where PostgreSQL succeeds — the *same* documented divergence the `CAST(... AS ...)` spelling
 already carries, not a new one. `::` adds no behavior of its own; it only adds the spelling.
+
+## 38. Composite field selection (`(expr).field` / `(expr).*`)
+
+Field selection reads one named field of a composite value, and `(expr).*` expands a composite into
+all its fields (spec/design/composite.md §1, §S4). Both are **postfix operators at the `::` cast
+level** ([grammar.ebnf](../grammar/grammar.ebnf) `postfix`), so they chain — with `::` and with each
+other, in token order: `(s).p.x`, `(c).a :: int8`. The parser builds an `Expr::FieldAccess { base,
+field }` for `.field` and `Expr::FieldStar { base }` for `.*`.
+
+- **Field access is parens-required** (PostgreSQL): `.field` / `.*` applies only to a
+  **parenthesized** base — `(home).zip`, `(t.home).zip`, `(ROW(1,2)).f1`, `('(…)'::addr).zip` — and
+  chains on a prior field access (`(c).a.b`). The parser tracks field-accessibility: a primary is
+  field-accessible iff it started with `(`, and a `.field` keeps the chain accessible (a `::` cast
+  does not). So `.field` fires only on a parenthesized / chained-field base.
+- **The unparenthesized `a.b` / `a.b.c` form is a (multi-part) column reference, never field
+  access.** `home.zip` is consumed by `column_ref` as a qualified column whose qualifier `home` must
+  name a relation — else `42P01` (missing FROM-clause entry), exactly as PG. There is **no** bare
+  `col.field` fallback (the original plan assumed one; the differential oracle showed PG rejects
+  every unparenthesized field reference, so jed matches PG). To select a field of a composite
+  column you must parenthesize: `(home).zip`.
+- **Errors.** Field lookup is case-insensitive (PG folds the identifier). An unknown field is
+  `42703` (undefined_column); a non-composite base is `42809` (wrong_object_type, PG's "column
+  notation … applied to type …, which is not a composite type"); `.*` outside a projection list is
+  `0A000`.
+- **Output name.** An un-aliased `(expr).field` is named after the **field** (PG); `(expr).*`
+  contributes one output column per field, each named after that field, in declaration order.
+
+Field selection adds no on-disk format change and no new cost unit — `(expr).field` is one interior
+expression node (one `operator_eval`), and `(expr).*` is N independent field-selection nodes.

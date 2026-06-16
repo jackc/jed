@@ -78,6 +78,15 @@ func (p *Parser) parseStatement() (Statement, error) {
 			}
 			return Statement{CreateIndex: ci}, nil
 		}
+		// CREATE TYPE — a 2-token lookahead keeps TYPE non-reserved (the CREATE UNIQUE INDEX
+		// precedent — composite.md §1).
+		if p.peekKeywordAt(1) == "type" {
+			ct, err := p.parseCreateType()
+			if err != nil {
+				return Statement{}, err
+			}
+			return Statement{CreateType: ct}, nil
+		}
 		ct, err := p.parseCreateTable()
 		if err != nil {
 			return Statement{}, err
@@ -90,6 +99,13 @@ func (p *Parser) parseStatement() (Statement, error) {
 				return Statement{}, err
 			}
 			return Statement{DropIndex: di}, nil
+		}
+		if p.peekKeywordAt(1) == "type" {
+			dt, err := p.parseDropType()
+			if err != nil {
+				return Statement{}, err
+			}
+			return Statement{DropType: dt}, nil
 		}
 		dt, err := p.parseDropTable()
 		if err != nil {
@@ -575,6 +591,99 @@ func (p *Parser) parseDropIndex() (*DropIndex, error) {
 	return &DropIndex{Name: name}, nil
 }
 
+// parseCreateType parses `CREATE TYPE <name> AS ( <field> <type> [NOT NULL] [, …] )` — a
+// composite (row) type (spec/design/composite.md, grammar.md). At least one field (an empty list
+// is a syntax error); each field's type is a bare type name (built-in or a composite), resolved at
+// execution (42704 if unknown).
+func (p *Parser) parseCreateType() (*CreateType, error) {
+	if err := p.expectKeyword("create"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("type"); err != nil {
+		return nil, err
+	}
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("as"); err != nil {
+		return nil, err
+	}
+	if err := p.expect(TokLParen); err != nil {
+		return nil, err
+	}
+	var fields []TypeFieldDef
+	for {
+		fname, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		typeName, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		typeMod, err := p.parseTypeMod()
+		if err != nil {
+			return nil, err
+		}
+		notNull := false
+		if p.peekKeyword() == "not" {
+			p.advance()
+			if err := p.expectKeyword("null"); err != nil {
+				return nil, err
+			}
+			notNull = true
+		}
+		fields = append(fields, TypeFieldDef{Name: fname, TypeName: typeName, TypeMod: typeMod, NotNull: notNull})
+		tok := p.advance()
+		if tok.Kind == TokComma {
+			continue
+		}
+		if tok.Kind == TokRParen {
+			break
+		}
+		return nil, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
+	}
+	return &CreateType{Name: name, Fields: fields}, nil
+}
+
+// parseDropType parses `DROP TYPE [IF EXISTS] <name> [RESTRICT | CASCADE]`
+// (spec/design/composite.md §7). RESTRICT is the default and the only behavior this slice;
+// CASCADE is rejected (0A000) at execution. A missing type (42704) and dependents (2BP01) are
+// execution-time.
+func (p *Parser) parseDropType() (*DropType, error) {
+	if err := p.expectKeyword("drop"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("type"); err != nil {
+		return nil, err
+	}
+	ifExists := p.peekKeyword() == "if"
+	if ifExists {
+		p.advance()
+		if err := p.expectKeyword("exists"); err != nil {
+			return nil, err
+		}
+	}
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	// Optional trailing RESTRICT / CASCADE (a keyword, consumed here; CASCADE is 0A000 at exec).
+	cascade := false
+	switch p.peekKeyword() {
+	case "restrict":
+		p.advance()
+	case "cascade":
+		p.advance()
+		cascade = true
+	}
+	if cascade {
+		return nil, NewError(FeatureNotSupported, "DROP TYPE ... CASCADE is not supported")
+	}
+	return &DropType{Name: name, IfExists: ifExists}, nil
+}
+
 // parseInsert parses `INSERT INTO <table> [( <col> [, <col>]* )] VALUES <row> [, <row>]*`,
 // where each <row> is `( <value> [, <value>]* )` and each <value> is a literal or the DEFAULT
 // keyword. The optional column list names the target columns; unlisted columns take their
@@ -680,11 +789,40 @@ func (p *Parser) parseInsertRow() ([]InsertValue, error) {
 }
 
 // parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3), a
-// bind parameter ($N, bound at execute — spec/design/api.md §5), else a literal.
+// ROW(...) composite constructor (spec/design/composite.md §1), a bind parameter ($N, bound at
+// execute — spec/design/api.md §5), else a literal.
 func (p *Parser) parseInsertValue() (InsertValue, error) {
 	if p.peekKeyword() == "default" {
 		p.advance()
 		return InsertValue{IsDefault: true}, nil
+	}
+	if p.peekKeyword() == "row" && p.peekKindAt(1) == TokLParen {
+		// ROW(field, field, …) — recurse on each field (a literal, a $N, or a nested ROW).
+		p.advance() // ROW
+		if err := p.expect(TokLParen); err != nil {
+			return InsertValue{}, err
+		}
+		var fields []InsertValue
+		if p.peek().Kind != TokRParen {
+			for {
+				f, err := p.parseInsertValue()
+				if err != nil {
+					return InsertValue{}, err
+				}
+				fields = append(fields, f)
+				tok := p.advance()
+				if tok.Kind == TokComma {
+					continue
+				}
+				if tok.Kind == TokRParen {
+					break
+				}
+				return InsertValue{}, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
+			}
+		} else {
+			p.advance() // the empty ROW() — consume ')'
+		}
+		return InsertValue{IsRow: true, Row: fields}, nil
 	}
 	if p.peek().Kind == TokParam {
 		n := p.advance().Int
@@ -1657,29 +1795,63 @@ func (p *Parser) parseUnary() (Expr, error) {
 	return p.parsePostfix()
 }
 
-// parsePostfix parses a primary optionally followed by one or more `::type` PostgreSQL typecasts
-// (grammar.md §37). `expr :: type` desugars to CAST(expr AS type) here at parse time — one
-// resolver / evaluator / cost path for both spellings — and casts chain left-associatively
-// (`x::int8::int2` = `(x::int8)::int2`). A typmod rides on the type name exactly as in CAST
-// (`x::numeric(10,2)`). `::` binds tighter than unary minus (handled by parseUnary above).
+// parsePostfix parses a primary optionally followed by one or more postfix operators, applied
+// left-to-right in token order: a `::type` PostgreSQL typecast (grammar.md §37) or a `.field` /
+// `.*` composite field selection (spec/design/composite.md §S4). `expr :: type` desugars to
+// CAST(expr AS type) here at parse time — one resolver / evaluator / cost path for both spellings
+// — and casts chain left-associatively (`x::int8::int2` = `(x::int8)::int2`). A typmod rides on
+// the type name exactly as in CAST (`x::numeric(10,2)`).
+//
+// Field selection follows PostgreSQL's **parens-required** rule: `.field` / `.*` applies ONLY to a
+// **parenthesized** base — `(home).zip`, `(t.home).zip`, `(ROW(1,2)).f1` — and chains on a prior
+// field access (`(c).a.b`). A bare `home.zip` / `t.home.zip` is a (multi-part) column reference,
+// never field access (PG raises `42P01` for the unparenthesized form). So `.field` fires only when
+// the primary started with `(` or after a previous `.field`; otherwise the `.` is left for the
+// caller (a trailing `.field` on a bare name is then a syntax error, like PG). NB: a bare `a.b` is
+// consumed as a single ExprQualifiedColumn by parseColumnRef inside parsePrimary.
 func (p *Parser) parsePostfix() (Expr, error) {
+	// Only a PARENTHESIZED primary is field-accessible (PG requires `(expr).field`). A subsequent
+	// `.field` keeps the chain field-accessible (`(c).a.b`); a `::` cast does not.
+	fieldAccessible := p.peek().Kind == TokLParen
 	expr, err := p.parsePrimary()
 	if err != nil {
 		return Expr{}, err
 	}
-	for p.peek().Kind == TokDoubleColon {
-		p.advance()
-		typeName, err := p.expectIdentifier()
-		if err != nil {
-			return Expr{}, err
+	for {
+		switch {
+		case p.peek().Kind == TokDoubleColon:
+			p.advance()
+			typeName, err := p.expectIdentifier()
+			if err != nil {
+				return Expr{}, err
+			}
+			typeMod, err := p.parseTypeMod()
+			if err != nil {
+				return Expr{}, err
+			}
+			expr = Expr{Kind: ExprCast, Cast: &CastExpr{Inner: expr, TypeName: typeName, TypeMod: typeMod}}
+			fieldAccessible = false
+		// `.field` / `.*` — composite field selection (spec/design/composite.md §S4),
+		// parens-required: only on a parenthesized / chained-field base.
+		case p.peek().Kind == TokDot && fieldAccessible:
+			p.advance()
+			base := expr
+			if p.peek().Kind == TokStar {
+				p.advance()
+				expr = Expr{Kind: ExprFieldStar, Base: &base}
+				fieldAccessible = false // `.*` is terminal
+			} else {
+				field, err := p.expectIdentifier()
+				if err != nil {
+					return Expr{}, err
+				}
+				expr = Expr{Kind: ExprFieldAccess, Base: &base, Field: field}
+				// a field value may itself be composite → `(c).a.b` chains
+			}
+		default:
+			return expr, nil
 		}
-		typeMod, err := p.parseTypeMod()
-		if err != nil {
-			return Expr{}, err
-		}
-		expr = Expr{Kind: ExprCast, Cast: &CastExpr{Inner: expr, TypeName: typeName, TypeMod: typeMod}}
 	}
-	return expr, nil
 }
 
 // parsePrimary parses a parenthesized expression, CAST(...), a literal (integer,
@@ -1723,6 +1895,36 @@ func (p *Parser) parsePrimary() (Expr, error) {
 			return Expr{}, err
 		}
 		return Expr{Kind: ExprExists, Subquery: &q}, nil
+	}
+	// `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when ROW is
+	// immediately followed by `(`, so `row` stays usable as a column / function name otherwise. The
+	// bare `(a, b)` form is deferred (0A000); only the keyword form parses.
+	if p.peekKeyword() == "row" && p.peekKindAt(1) == TokLParen {
+		p.advance() // ROW
+		if err := p.expect(TokLParen); err != nil {
+			return Expr{}, err
+		}
+		var items []Expr
+		if p.peek().Kind != TokRParen {
+			for {
+				e, err := p.parseExpr()
+				if err != nil {
+					return Expr{}, err
+				}
+				items = append(items, e)
+				tok := p.advance()
+				if tok.Kind == TokComma {
+					continue
+				}
+				if tok.Kind == TokRParen {
+					break
+				}
+				return Expr{}, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
+			}
+		} else {
+			p.advance() // the empty ROW() — consume ')'
+		}
+		return Expr{Kind: ExprRow, RowItems: items}, nil
 	}
 	if p.peekKeyword() == "cast" {
 		p.advance()

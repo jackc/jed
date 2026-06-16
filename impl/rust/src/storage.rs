@@ -15,10 +15,10 @@
 
 use std::sync::Arc;
 
+use crate::catalog::ColType;
 use crate::error::Result;
 use crate::paging::SharedPaging;
 use crate::pmap::{KeyBound, LeafSource, Node, PMap};
-use crate::types::ScalarType;
 use crate::value::Value;
 
 /// A stored row: one value per column, in column order.
@@ -30,7 +30,7 @@ pub type Row = Vec<Value>;
 /// mutation of `rows`). A store with no `paging` (in-memory) builds none and never faults.
 struct PagedSource<'a> {
     paging: &'a SharedPaging,
-    col_types: &'a [ScalarType],
+    col_types: &'a [ColType],
 }
 
 impl LeafSource for PagedSource<'_> {
@@ -44,7 +44,7 @@ impl LeafSource for PagedSource<'_> {
 /// to be mutated alongside it.
 fn make_src<'a>(
     paging: &'a Option<Arc<SharedPaging>>,
-    col_types: &'a [ScalarType],
+    col_types: &'a [ColType],
 ) -> Option<PagedSource<'a>> {
     paging.as_ref().map(|p| PagedSource {
         paging: p,
@@ -65,9 +65,10 @@ pub struct TableStore {
     /// Page payload capacity `C = page_size − 12` — the split threshold for the page-backed
     /// B-tree (spec/fileformat/format.md). Fixed for the life of the database.
     cap: usize,
-    /// The table's column types, for computing each row's on-disk record weight
+    /// The table's resolved column types ([`ColType`] — a scalar, or a composite resolved to its
+    /// field-type tree), for the value codec and for computing each row's on-disk record weight
     /// ([`crate::format::record_size`]). `Arc` so a snapshot clone stays O(1).
-    col_types: Arc<Vec<ScalarType>>,
+    col_types: Arc<Vec<ColType>>,
     /// The shared pager + leaf buffer pool for a **file-backed** database (spec/design/pager.md):
     /// the read/mutation path faults `OnDisk` leaves through it. `None` for an in-memory database
     /// and for a table created in-session (fully resident until the file is reopened); attached by
@@ -76,9 +77,9 @@ pub struct TableStore {
 }
 
 impl TableStore {
-    /// A new empty store for a table whose columns have the given types, serializing at page
-    /// payload `cap` (= `page_size − 12`). In-memory (no paging) until [`attach_paging`].
-    pub fn new(cap: usize, col_types: Vec<ScalarType>) -> Self {
+    /// A new empty store for a table whose columns have the given resolved types, serializing at
+    /// page payload `cap` (= `page_size − 12`). In-memory (no paging) until [`attach_paging`].
+    pub fn new(cap: usize, col_types: Vec<ColType>) -> Self {
         TableStore {
             rows: PMap::new(),
             next_rowid: 0,
@@ -330,7 +331,7 @@ impl TableStore {
                     .as_ref()
                     .expect("an unfetched value implies a paged store");
                 let fetch = |p: u32| paging.pager().read_block(p);
-                *v = crate::format::resolve_unfetched(self.col_types[i], u, &fetch)?;
+                *v = crate::format::resolve_unfetched(&self.col_types[i], u, &fetch)?;
             }
         }
         Ok(())
@@ -361,6 +362,12 @@ impl TableStore {
     /// (spec/fileformat/format.md). `None` for an empty table.
     pub(crate) fn tree_root(&self) -> Option<&Arc<Node>> {
         self.rows.root()
+    }
+
+    /// The table's resolved column types — the value codec's input on every serialize/decode path
+    /// (spec/design/composite.md §4). Empty for an index store (records are the key alone).
+    pub(crate) fn col_types(&self) -> &[ColType] {
+        &self.col_types
     }
 
     /// Install a loaded B-tree as this store's contents (format.rs `from_image`).

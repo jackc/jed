@@ -12,7 +12,7 @@
 // observes — so each core realizes it idiomatically (like P5.3's per-core concurrency). JS is
 // single-threaded, so unlike the Rust/Go cores this needs no lock between the read and commit paths.
 
-import type { ScalarType } from "./types.ts";
+import type { ColType } from "./catalog.ts";
 import type { PNode } from "./pmap.ts";
 import { BufferPool } from "./bufferpool.ts";
 import { decodeLeafNode } from "./format.ts";
@@ -48,7 +48,7 @@ export class SharedPaging {
   // the cached node, a miss reads + decodes the page (with this table's colTypes) and caches it,
   // evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global page id
   // with a caller-supplied decoder is consistent (pager.md §4).
-  faultLeaf(page: number, colTypes: ScalarType[]): PNode {
+  faultLeaf(page: number, colTypes: ColType[]): PNode {
     // Materialize any external value by following its overflow chain through the pager (the leaf
     // block holds only the pointer — spec/design/large-values.md §12).
     // Lazy decode (spec/design/large-values.md §14): an external/compressed value stays an

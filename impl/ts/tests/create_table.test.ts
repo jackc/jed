@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Database, execute } from "../src/lib.ts";
+import { typeScalar } from "../src/types.ts";
 import { dbWith, errCode } from "./util.ts";
 
 test("create table then describe via the catalog", () => {
@@ -11,7 +12,7 @@ test("create table then describe via the catalog", () => {
   const t = db.table("t");
   assert.ok(t);
   assert.deepStrictEqual(
-    t!.columns.map((c) => [c.name, c.type, c.primaryKey, c.notNull]),
+    t!.columns.map((c) => [c.name, typeScalar(c.type), c.primaryKey, c.notNull]),
     [
       ["id", "int32", true, true], // PRIMARY KEY ⇒ NOT NULL
       ["a", "int16", false, false],
@@ -25,7 +26,7 @@ test("SQL-standard type aliases resolve to canonical types", () => {
     "CREATE TABLE t (a smallint, b int, c integer, d bigint)",
   ]);
   assert.deepStrictEqual(
-    db.table("t")!.columns.map((c) => c.type),
+    db.table("t")!.columns.map((c) => typeScalar(c.type)),
     ["int16", "int32", "int32", "int64"],
   );
 });

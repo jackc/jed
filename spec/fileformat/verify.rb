@@ -14,8 +14,10 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 8 # format_version 8: a per-column expression-default flag (bit3) + expr-text in the
-# catalog (format.md *Version scope*); v7 added a per-page CRC-32 on every body page (header 12→16)
+VERSION = 9 # format_version 9: composite (row) types — the catalog becomes a chain of kind-tagged
+# entries (entry_kind u8: 0 table, 1 composite-type), composite-type entries emitted first
+# (name order); two-pass load (format.md *Version scope*). v8 was the per-column expression-default
+# flag (bit3) + expr-text; v7 added a per-page CRC-32 on every body page (header 12→16)
 PAGE_HEADER = 16 # v7: the 12-byte v6 header (page_type/item_count/next_page) + a 4-byte per-page crc32 at offset 12
 ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
 TXID = 1
@@ -70,6 +72,44 @@ def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, defaul
   { name: name, type: type, pk: pk, not_null: not_null.nil? ? pk : not_null,
     precision: precision, scale: scale, default: default, default_expr: default_expr }
 end
+
+# A composite-type field (format.md *Composite-type entry*, v9): a name + type (a scalar string,
+# or a composite type NAME for a nested composite) + NOT NULL flag + decimal typmod.
+def field(name, type, not_null: false, precision: nil, scale: nil)
+  { name: name, type: type, not_null: not_null, precision: precision, scale: scale }
+end
+
+# A composite (row) type definition (`CREATE TYPE name AS (...)`): a name + ordered field list.
+def ctype(name, fields) = { name: name, fields: fields }
+
+# A composite type defined, persisted, AND used by a stored column (S3 — composite.md §4). The
+# value codec is pinned: row 1 has both fields present; row 2's `zip` is NULL (the bitmap's bit 1
+# is set and the field contributes ZERO body bytes). A composite value is the field-value array;
+# `nil` is a NULL field. The cores build this via
+#   CREATE TYPE addr AS (street text NOT NULL, zip int32)
+#   CREATE TABLE t (id int32 PRIMARY KEY, home addr)
+#   INSERT (1, ROW('Main', 90210)); INSERT (2, ROW('Oak', NULL))
+COMPOSITE_TYPE_TABLE = {
+  types: [ctype("addr", [field("street", "text", not_null: true), field("zip", "int32")])],
+  tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("home", "addr")],
+             rows: [[1, ["Main", 90210]], [2, ["Oak", nil]]] }]
+}.freeze
+
+# Nested composite types (a field whose type is another composite — persisted by NAME) used by a
+# stored column. `line` sorts BEFORE `point` but references it, so the two-pass load (collect all,
+# then resolve) is exercised: a single name-ordered pass would meet `line`'s reference before
+# `point` is read. The row pins the recursive value codec descending through a composite field. The
+# cores build this via
+#   CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL); CREATE TYPE line AS (a point, b point)
+#   CREATE TABLE t (id int32 PRIMARY KEY, ln line); INSERT (1, ROW(ROW(1, 2), ROW(3, 4)))
+NESTED_COMPOSITE_TABLE = {
+  types: [
+    ctype("line", [field("a", "point"), field("b", "point")]),
+    ctype("point", [field("x", "int32", not_null: true), field("y", "int32", not_null: true)])
+  ],
+  tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("ln", "line")],
+             rows: [[1, [[1, 2], [3, 4]]]] }]
+}.freeze
 
 # A table with a COMPOSITE primary key (constraints.md §3): the stored key is the
 # concatenation of the members' encodings in key order (a 4-byte int32 then a
@@ -418,6 +458,10 @@ FIXTURES = [
   { file: "check_table.jed", page_size: 256, tables: [CHECK_TABLE] },
   { file: "index_table.jed", page_size: 256, tables: [INDEX_TABLE] },
   { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
+  { file: "composite_type_table.jed", page_size: 256,
+    types: COMPOSITE_TYPE_TABLE[:types], tables: COMPOSITE_TYPE_TABLE[:tables] },
+  { file: "nested_composite_table.jed", page_size: 256,
+    types: NESTED_COMPOSITE_TABLE[:types], tables: NESTED_COMPOSITE_TABLE[:tables] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
@@ -466,8 +510,22 @@ end
 # byte-length + bytes (text: UTF-8 collation-C bytes; bytea: raw bytes — byte-identical here,
 # only the source encoding / read-side UTF-8 assertion differs); boolean is a single bool-byte
 # 0x00 false / 0x01 true (format.md "Value codec").
+# The composite types in scope for the codec, keyed by lowercased name → field list. Set per
+# image by `build_image` (encode) and `decode_image` (decode) before any value is coded, so the
+# recursive composite codec can resolve a column's / field's composite type by name. `{}` when no
+# composite types are defined (every existing fixture).
+$ctypes = {}
+
+# The field list of the composite type named `type` (case-insensitive), or nil for a scalar type.
+def composite_fields(type) = $ctypes[type.to_s.downcase]
+
 def encode_value(type, v)
   return "\x01".b if v.nil?
+
+  if (fields = composite_fields(type))
+    # A composite value (spec/design/composite.md §4): present tag, then the recursive body.
+    return "\x00".b + encode_composite_body(fields, v)
+  end
 
   case type
   when "text", "bytea"
@@ -491,6 +549,25 @@ def encode_value(type, v)
   else
     "\x00".b + encode_int(WIDTH.fetch(type), v)
   end
+end
+
+# A composite value's BODY (after the 0x00 present tag, spec/design/composite.md §4): a null bitmap
+# of ceil(field_count/8) bytes (MSB-first — field i is bit 0x80>>(i%8) of byte i/8; a set bit =
+# NULL), then each PRESENT field's value-codec body (no per-field tag) in declaration order. A NULL
+# field contributes zero body bytes. `vals` is the field-value array (a nested composite is itself
+# an array). Recurses for nested composites.
+def encode_composite_body(fields, vals)
+  nbytes = (fields.size + 7) / 8
+  bitmap = Array.new(nbytes, 0)
+  bodies = +"".b
+  fields.each_with_index do |f, i|
+    if vals[i].nil?
+      bitmap[i / 8] |= (0x80 >> (i % 8))
+    else
+      bodies << encode_value(f[:type], vals[i]).byteslice(1..) # body, minus the presence tag
+    end
+  end
+  bitmap.pack("C*").b + bodies
 end
 
 # Float value codec body (format.md code 12/13; spec/design/float.md §10): the IEEE bytes,
@@ -561,6 +638,14 @@ def table_entry_bytes(table, root_data_page, index_roots)
   out << u16(table[:columns].size)
   table[:columns].each do |c|
     out << u16(c[:name].bytesize) << c[:name].b
+    # A composite column (v9): type_code 14, flags, then the type NAME in the typmod slot
+    # (spec/design/composite.md §3). Composite columns carry no default this slice (bits 2/3 = 0).
+    if composite_fields(c[:type])
+      out << [14].pack("C")
+      out << [c[:not_null] ? 0b10 : 0].pack("C")
+      out << u16(c[:type].bytesize) << c[:type].b
+      next
+    end
     out << [TYPECODE.fetch(c[:type])].pack("C")
     has_default = c[:default] != :none
     has_default_expr = !c[:default_expr].nil?
@@ -610,6 +695,26 @@ def table_entry_bytes(table, root_data_page, index_roots)
     out << u32(index_roots[k])
   end
   out << u32(root_data_page)
+  out
+end
+
+# Serialize a composite-type catalog entry's BODY (after the entry_kind=1 byte), v9: name, field
+# count, then per field — name, type code, [type name when code 14 (nested composite)], flags
+# (bit0 not_null), [decimal typmod when code 6] (format.md *Composite-type entry*).
+def composite_type_entry_bytes(ct)
+  out = +"".b
+  out << u16(ct[:name].bytesize) << ct[:name].b
+  out << u16(ct[:fields].size)
+  ct[:fields].each do |f|
+    out << u16(f[:name].bytesize) << f[:name].b
+    if TYPECODE.key?(f[:type])
+      out << [TYPECODE.fetch(f[:type])].pack("C")
+    else
+      out << [14].pack("C") << u16(f[:type].bytesize) << f[:type].b # nested composite, by name
+    end
+    out << [f[:not_null] ? 1 : 0].pack("C")
+    out << u16(f[:precision] || 0) << u16(f[:scale] || 0) if f[:type] == "decimal"
+  end
   out
 end
 
@@ -940,10 +1045,13 @@ end
 # A from-scratch image (format.md "Allocation & incremental commit"): the special case where
 # every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
 # catalog chain, then both meta slots at txid 1.
-def build_image(tables, page_size)
+def build_image(types, tables, page_size)
   ps = page_size
   cap = ps - PAGE_HEADER
+  # Composite types in scope for the recursive value codec, keyed by lowercased name (§4).
+  $ctypes = types.to_h { |t| [t[:name].downcase, t[:fields]] }
   sorted = tables.sort_by { |t| t[:name].downcase }
+  sorted_types = types.sort_by { |t| t[:name].downcase }
 
   data_pages = {} # index => [page_type, item_count, payload]
   root_data = Array.new(sorted.size, 0)
@@ -963,8 +1071,13 @@ def build_image(tables, page_size)
     end
   end
 
+  # Catalog entries are kind-tagged (v9): composite-type entries (kind 1, name order) first, then
+  # table entries (kind 0) — format.md.
   cat_root = next_index
-  cat_groups = pack(sorted.map.with_index { |t, ti| table_entry_bytes(t, root_data[ti], index_roots[ti]).bytesize }, cap)
+  cat_entries = []
+  sorted_types.each { |ct| cat_entries << ("\x01".b + composite_type_entry_bytes(ct)) }
+  sorted.each_with_index { |t, ti| cat_entries << ("\x00".b + table_entry_bytes(t, root_data[ti], index_roots[ti])) }
+  cat_groups = pack(cat_entries.map(&:bytesize), cap)
   page_count = cat_root + cat_groups.size
 
   image = "\x00".b * (page_count * ps)
@@ -976,7 +1089,7 @@ def build_image(tables, page_size)
   cat_groups.each_with_index do |group, gi|
     index = cat_root + gi
     nxt = gi + 1 < cat_groups.size ? index + 1 : 0
-    payload = group.map { |ti| table_entry_bytes(sorted[ti], root_data[ti], index_roots[ti]) }.join.b
+    payload = group.map { |ei| cat_entries[ei] }.join.b
     write_page(image, ps, index, PAGE_CATALOG, group.size, nxt, payload)
   end
 
@@ -985,7 +1098,7 @@ end
 
 # The bytes a fixture should contain (applying any torn-slot corruption).
 def fixture_image(fx)
-  image = build_image(fx[:tables], fx[:page_size])
+  image = build_image(fx[:types] || [], fx[:tables], fx[:page_size])
   if fx[:corrupt_slot]
     off = fx[:corrupt_slot] * fx[:page_size] + 35 # last CRC byte of that slot
     image.setbyte(off, image.getbyte(off) ^ 0xFF)
@@ -1036,6 +1149,43 @@ def read_page(image, ps, index)
     next_page: p.byteslice(8, 4).unpack1("N"), payload: p.byteslice(PAGE_HEADER, ps - PAGE_HEADER) }
 end
 
+# Decode a composite-type catalog entry's body (inverse of composite_type_entry_bytes); the caller
+# has consumed the entry_kind byte. A nested-composite field stores the referenced type's NAME.
+def decode_composite_type_entry(buf, pos)
+  nl, pos = take(buf, pos, 2)
+  name, pos = take(buf, pos, nl.unpack1("n"))
+  fc, pos = take(buf, pos, 2)
+  fields = []
+  fc.unpack1("n").times do
+    fnl, pos = take(buf, pos, 2)
+    fname, pos = take(buf, pos, fnl.unpack1("n"))
+    tcb, pos = take(buf, pos, 1)
+    code = tcb.getbyte(0)
+    precision = nil
+    scale = nil
+    if code == 14
+      tnl, pos = take(buf, pos, 2)
+      tname, pos = take(buf, pos, tnl.unpack1("n"))
+      type = tname
+    else
+      type = CODETYPE.fetch(code)
+    end
+    fl, pos = take(buf, pos, 1)
+    raise "reserved composite field flag set" if (fl.getbyte(0) & ~0b1) != 0
+
+    not_null = (fl.getbyte(0) & 1) != 0
+    if type == "decimal"
+      pb, pos = take(buf, pos, 2)
+      sb, pos = take(buf, pos, 2)
+      p = pb.unpack1("n")
+      precision = p.zero? ? nil : p
+      scale = p.zero? ? nil : sb.unpack1("n")
+    end
+    fields << { name: fname, type: type, not_null: not_null, precision: precision, scale: scale }
+  end
+  [{ name: name, fields: fields }, pos]
+end
+
 def decode_table_entry(buf, pos)
   name_len, pos = take(buf, pos, 2)
   name, pos = take(buf, pos, name_len.unpack1("n"))
@@ -1045,6 +1195,19 @@ def decode_table_entry(buf, pos)
     cnl, pos = take(buf, pos, 2)
     cname, pos = take(buf, pos, cnl.unpack1("n"))
     tc, pos = take(buf, pos, 1)
+    # A composite column (v9, type_code 14): flags, then the type NAME in the typmod slot
+    # (spec/design/composite.md §3). No default this slice.
+    if tc.getbyte(0) == 14
+      cflags, pos = take(buf, pos, 1)
+      cf = cflags.getbyte(0)
+      raise "reserved flag bit0 set (retired primary_key bit — v5)" if (cf & 0b01) != 0
+
+      tnl, pos = take(buf, pos, 2)
+      tname, pos = take(buf, pos, tnl.unpack1("n"))
+      columns << { name: cname, type: tname, pk: false, not_null: (cf & 0b10) != 0,
+                   precision: nil, scale: nil, default: :none, default_expr: nil }
+      next
+    end
     flags, pos = take(buf, pos, 1)
     f = flags.getbyte(0)
     raise "reserved flag bit0 set (retired primary_key bit — v5)" if (f & 0b01) != 0
@@ -1194,6 +1357,11 @@ def decode_value(type, buf, pos, fetch = nil)
   end
   raise "invalid value presence tag" unless t.zero?
 
+  if (fields = composite_fields(type))
+    # A composite value body (inverse of encode_composite_body): bitmap, then each present field.
+    return decode_composite_body(fields, buf, pos)
+  end
+
   case type
   when "text"
     len, pos = take(buf, pos, 2)
@@ -1226,6 +1394,30 @@ def decode_value(type, buf, pos, fetch = nil)
     vb, pos = take(buf, pos, WIDTH.fetch(type))
     [decode_int(WIDTH.fetch(type), vb), pos]
   end
+end
+
+# Decode a composite value body (inverse of encode_composite_body): read the null bitmap
+# (ceil(n/8) bytes), then for each field either NULL (bit set, no body) or its value body decoded
+# recursively (no per-field presence tag). Returns [field-value array, pos]. Composite fields are
+# never external (an over-cap record's WHOLE composite would spill — not handled here, no such
+# fixture), so `fetch` is unneeded; the inline body is self-contained.
+def decode_composite_body(fields, buf, pos)
+  nbytes = (fields.size + 7) / 8
+  bitmap, pos = take(buf, pos, nbytes)
+  vals = []
+  fields.each_with_index do |f, i|
+    if (bitmap.getbyte(i / 8) & (0x80 >> (i % 8))) != 0
+      vals << nil
+    else
+      # A present field has no tag; re-prepend a 0x00 present tag onto the remaining buffer so
+      # `decode_value` reads the body, then advance the real cursor by the bytes it consumed past
+      # that synthetic tag (npos - 1).
+      v, npos = decode_value(f[:type], "\x00".b + buf.byteslice(pos..), 0)
+      pos += (npos - 1)
+      vals << v
+    end
+  end
+  [vals, pos]
 end
 
 def decode_record(columns, buf, pos, fetch)
@@ -1312,7 +1504,11 @@ end
 def decode_image(image)
   ps = image.byteslice(8, 4).unpack1("N")
   meta = select_meta(image, ps)
+  types = []
   tables = []
+  # Composite types in scope for the recursive value codec; populated as the (types-first) catalog
+  # is read, so every composite a table row references is registered before its rows are decoded.
+  $ctypes = {}
   cat = meta[:root_page]
   while cat != 0
     pg = read_page(image, ps, cat)
@@ -1320,6 +1516,16 @@ def decode_image(image)
 
     pos = 0
     pg[:item_count].times do
+      kb, pos = take(pg[:payload], pos, 1) # entry_kind (v9): 0 table, 1 composite type
+      kind = kb.getbyte(0)
+      if kind == 1
+        ct, pos = decode_composite_type_entry(pg[:payload], pos)
+        types << ct
+        $ctypes[ct[:name].downcase] = ct[:fields]
+        next
+      end
+      raise "unknown catalog entry kind #{kind}" unless kind.zero?
+
       entry, pos = decode_table_entry(pg[:payload], pos)
       rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns])
       indexes = entry[:indexes].map do |ix|
@@ -1331,7 +1537,18 @@ def decode_image(image)
     end
     cat = pg[:next_page]
   end
-  tables
+  { types: types, tables: tables }
+end
+
+# The composite-type content a fixture should decode to (name-sorted, normalized fields).
+def expected_types(fx)
+  (fx[:types] || []).sort_by { |t| t[:name].downcase }.map do |t|
+    { name: t[:name],
+      fields: t[:fields].map do |f|
+        { name: f[:name], type: f[:type], not_null: f[:not_null] || false,
+          precision: f[:precision], scale: f[:scale] }
+      end }
+  end
 end
 
 # The logical content a fixture should decode to (torn fixtures decode to the
@@ -1462,10 +1679,17 @@ def verify
 
     decoded = decode_image(on_disk)
     want = expected_tables(fx)
-    fail!("#{fx[:file]}: decoded #{decoded.size} tables, expected #{want.size}") unless decoded.size == want.size
-    decoded.each_with_index do |t, i|
+    fail!("#{fx[:file]}: decoded #{decoded[:tables].size} tables, expected #{want.size}") unless decoded[:tables].size == want.size
+    decoded[:tables].each_with_index do |t, i|
       unless content_equal?(t, want[i])
         fail!("#{fx[:file]}: table #{i} mismatch\n  got:  #{t.inspect}\n  want: #{want[i].inspect}")
+      end
+    end
+    want_types = expected_types(fx)
+    fail!("#{fx[:file]}: decoded #{decoded[:types].size} types, expected #{want_types.size}") unless decoded[:types].size == want_types.size
+    decoded[:types].each_with_index do |t, i|
+      unless content_equal?(t, want_types[i])
+        fail!("#{fx[:file]}: type #{i} mismatch\n  got:  #{t.inspect}\n  want: #{want_types[i].inspect}")
       end
     end
   end

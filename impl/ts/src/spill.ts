@@ -45,6 +45,11 @@ function valueBytes(v: Value): number {
       return base + v.dec.toCodec()[2].length * 2;
     case "unfetched":
       return base + (v.ref.comp?.length ?? 0);
+    case "composite": {
+      let n = base;
+      for (const f of v.fields) n += valueBytes(f);
+      return n;
+    }
     default:
       return base;
   }
@@ -439,6 +444,13 @@ function writeValue(w: ByteWriter, v: Value): void {
       w.u32(v.iv.days);
       w.u64(v.iv.micros);
       break;
+    case "composite":
+      // Composite — tag 15: field count then each field value, recursive (spec/design/composite.md).
+      // Internal merge-sort scratch format only, so the recursion needs no type context.
+      w.u8(15);
+      w.u32(v.fields.length);
+      for (const f of v.fields) writeValue(w, f);
+      break;
     case "unfetched":
       // An untouched large-value reference rides along to the output unread (spill.md §4); spill it
       // opaquely so it round-trips, never resolving it.
@@ -531,6 +543,12 @@ function readValue(r: FileSource): Value {
     case 14: {
       const b = r.bytes(4);
       return float32Value(new DataView(b.buffer, b.byteOffset, b.byteLength).getFloat32(0, true));
+    }
+    case 15: {
+      const n = readU32(r);
+      const fields: Value[] = new Array(n);
+      for (let i = 0; i < n; i++) fields[i] = readValue(r);
+      return { kind: "composite", fields };
     }
     default:
       throw new Error("bad spill value tag");

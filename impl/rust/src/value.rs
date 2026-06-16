@@ -56,6 +56,13 @@ pub enum Value {
     /// `Hash` are **span-canonical** (`'1 mon' == '30 days'`), so DISTINCT/GROUP BY compare by the
     /// 128-bit span while `render` still preserves each value's field representation.
     Interval(Interval),
+    /// A composite (row) value — an ordered list of field values, recursive (a field may itself
+    /// be a `Composite`) — spec/design/composite.md §2. The field count and per-field types match
+    /// the value's composite type; the storage codec / comparator / `record_out` all recurse over
+    /// this list. `PartialEq`/`Eq`/`Hash` (DISTINCT/GROUP BY) and `eq3`/`lt3`/`gt3` are **structural**
+    /// (element-wise), routed through the manual impls below so they never apply raw `==` to a
+    /// float/decimal/interval field variant (the rule `Decimal`/`Interval` already follow).
+    Composite(Vec<Value>),
     /// An **unfetched** large-value reference (spec/design/large-values.md §14): a stored
     /// external/compressed value loaded as its on-disk pointer instead of being materialized.
     /// Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -165,6 +172,11 @@ impl PartialEq for Value {
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
             (Value::Timestamptz(a), Value::Timestamptz(b)) => a == b,
             (Value::Interval(a), Value::Interval(b)) => a == b,
+            // Composite equality is structural: same arity and every field equal (recursing into
+            // each field's own canonical equality, so a `Decimal`/`Interval`/float field compares
+            // by value, not bits). NULL fields are equal here (the DISTINCT/GROUP BY rule —
+            // `Null == Null` is true at the value level); the three-valued `eq3` differs (§5).
+            (Value::Composite(a), Value::Composite(b)) => a == b,
             (Value::Unfetched(a), Value::Unfetched(b)) => a == b,
             _ => false,
         }
@@ -192,6 +204,13 @@ impl std::hash::Hash for Value {
             Value::Timestamp(m) => m.hash(state),
             Value::Timestamptz(m) => m.hash(state),
             Value::Interval(iv) => iv.hash(state),
+            // Hash each field in order (the discriminant tag above already separates a composite
+            // from a scalar), consistent with the structural `PartialEq` (the Hash/Eq contract).
+            Value::Composite(fields) => {
+                for f in fields {
+                    f.hash(state);
+                }
+            }
             Value::Unfetched(u) => u.hash(state),
         }
     }
@@ -270,6 +289,10 @@ impl Value {
             Value::Timestamptz(m) => timestamp::render_timestamptz(*m),
             // Interval renders via the shared formatter (PG `IntervalStyle = postgres`).
             Value::Interval(iv) => interval::render_interval(iv),
+            // A composite renders as PG `record_out`: `(f1,f2,…)` with per-field quoting
+            // (spec/design/composite.md §8). The renderer recurses (a composite field's text is
+            // itself quoted because it contains parens/commas).
+            Value::Composite(fields) => record_out(fields),
             Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
         }
     }
@@ -310,6 +333,25 @@ impl Value {
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a == b),
             // Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
             (Value::Interval(a), Value::Interval(b)) => bool3(a == b),
+            // Composite `=` is element-wise 3VL (PG row comparison, spec/design/composite.md §5):
+            // FALSE if any field is FALSE; else UNKNOWN if any field is UNKNOWN; else TRUE. So a
+            // FALSE field dominates a NULL field. Arity matches (the resolver only compares two
+            // composites of the same type). The recursion bottoms out in the field comparators.
+            (Value::Composite(a), Value::Composite(b)) => {
+                let mut any_unknown = false;
+                for (x, y) in a.iter().zip(b.iter()) {
+                    match x.eq3(y) {
+                        ThreeValued::False => return ThreeValued::False,
+                        ThreeValued::Unknown => any_unknown = true,
+                        ThreeValued::True => {}
+                    }
+                }
+                if any_unknown {
+                    ThreeValued::Unknown
+                } else {
+                    ThreeValued::True
+                }
+            }
             // Poisoned (large-values.md §14): an unfetched value must never be compared —
             // falling through to UNKNOWN here would silently read it as NULL.
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
@@ -339,6 +381,11 @@ impl Value {
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a < b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a < b),
             (Value::Interval(a), Value::Interval(b)) => bool3(a < b),
+            // Composite `<` is lexicographic with PG row-comparison NULL propagation
+            // (spec/design/composite.md §5): the first field that is not equal decides via its own
+            // `<`; a field whose `=` is UNKNOWN (a NULL operand) makes the whole comparison UNKNOWN;
+            // all-equal rows are not `<`.
+            (Value::Composite(a), Value::Composite(b)) => composite_order3(a, b, false),
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
                 panic!("BUG: unfetched large value escaped the storage layer")
             }
@@ -366,6 +413,8 @@ impl Value {
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a > b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a > b),
             (Value::Interval(a), Value::Interval(b)) => bool3(a > b),
+            // Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
+            (Value::Composite(a), Value::Composite(b)) => composite_order3(a, b, true),
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
                 panic!("BUG: unfetched large value escaped the storage layer")
             }
@@ -384,9 +433,188 @@ impl Value {
         match (self, other) {
             (Value::Null, Value::Null) => true,
             (Value::Null, _) | (_, Value::Null) => false,
+            // Two composites are "not distinct" iff structurally equal — NULL-safe, so a NULL
+            // field equals a NULL field (the value-level `PartialEq`, not the 3VL `eq3`).
+            (Value::Composite(a), Value::Composite(b)) => a == b,
             _ => self.eq3(other) == ThreeValued::True,
         }
     }
+
+    /// PostgreSQL's `IS [NOT] NULL` test (spec/design/composite.md §5) — for a composite these are
+    /// **not** negations of each other, they are the all-fields rule, and it is **one level deep,
+    /// NOT recursive** (the empirically-probed PG 18 behavior — the differential oracle). A field
+    /// counts as "null" only if it is itself SQL-NULL; a *composite-valued* field is a non-null
+    /// value, so it counts as **present** and is not descended into. `negated = false` (`IS NULL`):
+    /// TRUE iff this value is SQL-NULL **or** every immediate field is SQL-NULL. `negated = true`
+    /// (`IS NOT NULL`): TRUE iff this value is non-NULL **and** every immediate field is non-SQL-NULL.
+    /// So `ROW(1, NULL)` is FALSE for both, and `ROW(ROW(NULL,NULL), ROW(NULL,NULL)) IS NULL` is
+    /// FALSE (the inner rows are non-null values). A scalar follows the ordinary rule. Always definite.
+    pub fn is_null_test(&self, negated: bool) -> bool {
+        match self {
+            Value::Composite(fields) => {
+                if negated {
+                    // IS NOT NULL: every immediate field is a non-(SQL-)NULL value.
+                    fields.iter().all(|f| !matches!(f, Value::Null))
+                } else {
+                    // IS NULL: every immediate field is SQL-NULL (a composite field is NOT).
+                    fields.iter().all(|f| matches!(f, Value::Null))
+                }
+            }
+            // A whole-value NULL: IS NULL → true, IS NOT NULL → false.
+            Value::Null => !negated,
+            // Any present scalar: IS NULL → false, IS NOT NULL → true.
+            _ => negated,
+        }
+    }
+}
+
+/// Three-valued lexicographic row ordering (PG row comparison, spec/design/composite.md §5),
+/// shared by `lt3` (`gt = false`) and `gt3` (`gt = true`): walk fields; the first whose `=` is
+/// FALSE decides via that field's `<`/`>`; the first whose `=` is UNKNOWN (a NULL operand) makes
+/// the whole comparison UNKNOWN; all-equal rows are neither `<` nor `>` (FALSE). Arity matches
+/// (same composite type — the resolver's gate).
+fn composite_order3(a: &[Value], b: &[Value], gt: bool) -> ThreeValued {
+    for (x, y) in a.iter().zip(b.iter()) {
+        match x.eq3(y) {
+            ThreeValued::True => continue,
+            ThreeValued::False => return if gt { x.gt3(y) } else { x.lt3(y) },
+            ThreeValued::Unknown => return ThreeValued::Unknown,
+        }
+    }
+    ThreeValued::False
+}
+
+/// PostgreSQL `record_out` (spec/design/composite.md §8): render a composite's fields as
+/// `(f1,f2,…)`. A NULL field is the empty string between delimiters; every other field is rendered
+/// by its own `render` and double-quoted iff it is empty or contains a delimiter / quote /
+/// backslash / whitespace. Inside the quotes PostgreSQL **doubles** an embedded `"` → `""` and an
+/// embedded `\` → `\\` (NOT backslash-escaping — `record_in` is the exact inverse). Recurses
+/// naturally — a nested composite's text contains parens/commas, so it is quoted. The spelling must
+/// equal PG byte-for-byte (CLAUDE.md §8).
+pub fn record_out(fields: &[Value]) -> String {
+    let mut out = String::from("(");
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        if matches!(f, Value::Null) {
+            continue; // a NULL field is the empty string between delimiters (unquoted)
+        }
+        let s = f.render();
+        if record_field_needs_quote(&s) {
+            out.push('"');
+            for ch in s.chars() {
+                // PG doubles `"` and `\` (rowtypes.c record_out): emit the char twice.
+                if ch == '"' || ch == '\\' {
+                    out.push(ch);
+                }
+                out.push(ch);
+            }
+            out.push('"');
+        } else {
+            out.push_str(&s);
+        }
+    }
+    out.push(')');
+    out
+}
+
+/// PostgreSQL `record_in` tokenizer (spec/design/composite.md §8) — the exact inverse of
+/// `record_out`. Splits the text of a composite literal `(f1,f2,…)` into its raw field tokens
+/// **without** type coercion: the caller (the executor) coerces each token to its field type. A
+/// field is either quoted (`"…"` with `""`→`"` and `\x`→`x` un-escaping) or unquoted (read literally
+/// up to the next top-level `,`/`)`, with `\x`→`x`); an **unquoted empty** field is SQL-NULL
+/// (`None`), a quoted empty field is the empty string (`Some("")`). Surrounding ASCII whitespace
+/// around the whole literal is ignored; whitespace *inside* an unquoted token is preserved (PG
+/// leaves trimming to each field's input function). Returns `None` on a malformed literal — the
+/// executor maps that to `22P02` (kept error-free so `value` need not depend on the error type).
+pub fn parse_record_tokens(input: &str) -> Option<Vec<Option<String>>> {
+    let s = input.trim_matches(|c: char| c.is_ascii_whitespace());
+    let mut chars = s.chars().peekable();
+    if chars.next() != Some('(') {
+        return None;
+    }
+    let mut fields: Vec<Option<String>> = Vec::new();
+    loop {
+        let mut buf = String::new();
+        let mut quoted = false;
+        let mut present = false;
+        if chars.peek() == Some(&'"') {
+            quoted = true;
+            present = true;
+            chars.next(); // opening quote
+            loop {
+                match chars.next() {
+                    None => return None, // unterminated quoted field
+                    Some('"') => {
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            buf.push('"'); // doubled quote → one quote
+                        } else {
+                            break; // closing quote
+                        }
+                    }
+                    Some('\\') => match chars.next() {
+                        Some(c) => buf.push(c),
+                        None => return None,
+                    },
+                    Some(c) => buf.push(c),
+                }
+            }
+            // A quoted field may be followed by ASCII whitespace before the delimiter (PG).
+            while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
+                chars.next();
+            }
+        } else {
+            // Unquoted: read literally until a top-level `,`/`)`, processing `\x`→`x`.
+            loop {
+                match chars.peek() {
+                    None => return None, // missing ')'
+                    Some(',') | Some(')') => break,
+                    Some('\\') => {
+                        chars.next();
+                        match chars.next() {
+                            Some(c) => {
+                                buf.push(c);
+                                present = true;
+                            }
+                            None => return None,
+                        }
+                    }
+                    Some(&c) => {
+                        buf.push(c);
+                        present = true;
+                        chars.next();
+                    }
+                }
+            }
+        }
+        // An unquoted empty field is SQL-NULL; a quoted (even empty) field is the string.
+        fields.push(if present || quoted { Some(buf) } else { None });
+        match chars.next() {
+            Some(',') => continue,
+            Some(')') => break,
+            _ => return None,
+        }
+    }
+    // Nothing but trailing nothing may follow the closing ')'.
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(fields)
+}
+
+/// Whether a `record_out` field token must be double-quoted: the empty string, or any token
+/// containing a comma, parenthesis, double-quote, backslash, or whitespace (C-locale `isspace`:
+/// space, tab, newline, vertical tab, form feed, carriage return) — PostgreSQL's exact rule.
+fn record_field_needs_quote(s: &str) -> bool {
+    s.is_empty()
+        || s.chars().any(|c| {
+            matches!(
+                c,
+                '"' | '\\' | '(' | ')' | ',' | ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'
+            )
+        })
 }
 
 fn bool3(b: bool) -> ThreeValued {

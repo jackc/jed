@@ -64,6 +64,11 @@ type Snapshot struct {
 	// txid is the snapshot's version — the commit counter (transactions.md §8; the watermark unit).
 	txid   uint64
 	tables map[string]*Table
+	// types holds user-defined composite (row) types, keyed by lowercased name
+	// (spec/design/composite.md). A database-level object set, separate from tables; serialized
+	// into the catalog's composite-type entries (spec/fileformat/format.md). Sorted by key when
+	// serialized so map-iteration order never leaks (CLAUDE.md §8).
+	types  map[string]*CompositeType
 	stores map[string]*TableStore
 	// indexStores holds each secondary index's B-tree (spec/design/indexes.md §3): a
 	// TableStore with ZERO value columns (entry keys only — the on-disk empty-payload
@@ -77,6 +82,7 @@ type Snapshot struct {
 func newSnapshot() *Snapshot {
 	return &Snapshot{
 		tables:      make(map[string]*Table),
+		types:       make(map[string]*CompositeType),
 		stores:      make(map[string]*TableStore),
 		indexStores: make(map[string]*TableStore),
 	}
@@ -89,6 +95,12 @@ func (s *Snapshot) clone() *Snapshot {
 	for k, v := range s.tables {
 		tables[k] = v
 	}
+	// Composite types, like Table, are never mutated in place — only added/removed — so the map
+	// copy is shallow (spec/design/composite.md §3).
+	types := make(map[string]*CompositeType, len(s.types))
+	for k, v := range s.types {
+		types[k] = v
+	}
 	stores := make(map[string]*TableStore, len(s.stores))
 	for k, v := range s.stores {
 		stores[k] = v.clone()
@@ -97,7 +109,7 @@ func (s *Snapshot) clone() *Snapshot {
 	for k, v := range s.indexStores {
 		indexStores[k] = v.clone()
 	}
-	return &Snapshot{txid: s.txid, tables: tables, stores: stores, indexStores: indexStores}
+	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores}
 }
 
 // table looks up a table definition by name (case-insensitive).
@@ -109,14 +121,144 @@ func (s *Snapshot) table(name string) (*Table, bool) {
 // store returns a table's store (the table is known to exist).
 func (s *Snapshot) store(name string) *TableStore { return s.stores[strings.ToLower(name)] }
 
+// compositeType looks up a composite type definition by name (case-insensitive); nil if absent.
+func (s *Snapshot) compositeType(name string) *CompositeType {
+	return s.types[strings.ToLower(name)]
+}
+
+// putType registers a composite type (CREATE TYPE). The lower-cased name is the key. The caller
+// has already resolved field types and checked for a duplicate.
+func (s *Snapshot) putType(ct *CompositeType) {
+	s.types[strings.ToLower(ct.Name)] = ct
+}
+
+// removeType removes a composite type (DROP TYPE). The caller has checked there are no dependents.
+func (s *Snapshot) removeType(key string) {
+	delete(s.types, key)
+}
+
+// compositeTypesSorted returns all composite types in ascending lowercased-name order — the
+// on-disk emission order (spec/fileformat/format.md) and a deterministic order with no
+// map-iteration leak (CLAUDE.md §8).
+func (s *Snapshot) compositeTypesSorted() []*CompositeType {
+	keys := make([]string, 0, len(s.types))
+	for k := range s.types {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]*CompositeType, len(keys))
+	for i, k := range keys {
+		out[i] = s.types[k]
+	}
+	return out
+}
+
+// compositeDependent reports whether any table column or composite-type field still references the
+// composite type name (case-insensitive) — the DROP TYPE ... RESTRICT dependency check (2BP01). It
+// returns the first dependent's description for the error detail, or ("", false) if there are no
+// dependents. Tables and types are scanned in lowercased-name order so the chosen dependent is
+// deterministic (CLAUDE.md §8).
+func (s *Snapshot) compositeDependent(name string) (string, bool) {
+	key := strings.ToLower(name)
+	tableKeys := make([]string, 0, len(s.tables))
+	for k := range s.tables {
+		tableKeys = append(tableKeys, k)
+	}
+	sort.Strings(tableKeys)
+	for _, tk := range tableKeys {
+		t := s.tables[tk]
+		for _, c := range t.Columns {
+			if c.Type.Comp != nil && strings.EqualFold(c.Type.Comp.Name, key) {
+				return "column " + c.Name + " of table " + t.Name, true
+			}
+		}
+	}
+	typeKeys := make([]string, 0, len(s.types))
+	for k := range s.types {
+		typeKeys = append(typeKeys, k)
+	}
+	sort.Strings(typeKeys)
+	for _, ck := range typeKeys {
+		ct := s.types[ck]
+		for _, f := range ct.Fields {
+			if f.Type.Comp != nil && strings.EqualFold(f.Type.Comp.Name, key) {
+				return "field " + f.Name + " of type " + ct.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// validateCompositeTypes validates the loaded composite-type catalog (the on-disk two-pass load —
+// spec/design/composite.md §3): every composite a field references must exist, and the reference
+// graph must be acyclic. A dangling or cyclic reference is a malformed file (XX001). Called once
+// after the whole catalog is read.
+func (s *Snapshot) validateCompositeTypes() error {
+	// Existence: every nested-composite field names a registered type. Visit in name order so the
+	// first reported dangling reference is deterministic.
+	keys := make([]string, 0, len(s.types))
+	for k := range s.types {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		ct := s.types[k]
+		for _, f := range ct.Fields {
+			if f.Type.Comp != nil && s.compositeType(f.Type.Comp.Name) == nil {
+				return NewError(DataCorrupted,
+					"composite type "+ct.Name+" references unknown type "+f.Type.Comp.Name)
+			}
+		}
+	}
+	// Acyclicity: DFS over the type → referenced-types graph (0 unvisited, 1 on-stack, 2 done).
+	color := make(map[string]uint8)
+	var visit func(key string) error
+	visit = func(key string) error {
+		color[key] = 1
+		if ct, ok := s.types[key]; ok {
+			for _, f := range ct.Fields {
+				if f.Type.Comp == nil {
+					continue
+				}
+				ck := strings.ToLower(f.Type.Comp.Name)
+				switch color[ck] {
+				case 1:
+					return NewError(DataCorrupted,
+						"composite type definition cycle through "+f.Type.Comp.Name)
+				case 2:
+				default:
+					if err := visit(ck); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		color[key] = 2
+		return nil
+	}
+	for _, k := range keys {
+		if color[k] == 0 {
+			if err := visit(k); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // putTable registers a new table and its empty store. The store carries the page payload cap (=
 // page_size − 12) and the column types so the page-backed B-tree can weigh records for its
 // size-driven split (spec/fileformat/format.md).
 func (s *Snapshot) putTable(t *Table, pageSize uint32) {
 	key := strings.ToLower(t.Name)
-	colTypes := make([]ScalarType, len(t.Columns))
+	// Resolve each column's ColType against the (already-registered) composite-type catalog — the
+	// codec/coercion tree the store keeps so neither re-walks the type catalog per row
+	// (spec/design/composite.md §4). Composite types are registered before any table (the types-first
+	// catalog order / CREATE TYPE-before-CREATE TABLE rule), so the lookup inside ResolveColType
+	// always resolves.
+	colTypes := make([]ColType, len(t.Columns))
 	for i, c := range t.Columns {
-		colTypes[i] = c.Type
+		colTypes[i] = ResolveColType(c.Type, s.types)
 	}
 	s.stores[key] = NewTableStore(int(pageSize)-12, colTypes) // 12 = pageHeader
 	s.tables[key] = t
@@ -359,6 +501,12 @@ func (db *Database) Table(name string) (*Table, bool) {
 	return db.readSnap().table(name)
 }
 
+// CompositeType looks up a composite type definition by name (case-insensitive) in the visible
+// snapshot (spec/design/composite.md); nil if absent.
+func (db *Database) CompositeType(name string) *CompositeType {
+	return db.readSnap().compositeType(name)
+}
+
 // TableNames is the canonical name of every table in the visible snapshot, sorted ascending
 // by lowercased name (the catalog's standing order — no map-iteration order may leak,
 // CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6).
@@ -529,6 +677,7 @@ func (db *Database) rollbackTx() (Outcome, error) {
 func stmtIsWrite(stmt Statement) bool {
 	return stmt.CreateTable != nil || stmt.DropTable != nil ||
 		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
+		stmt.CreateType != nil || stmt.DropType != nil ||
 		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil
 }
 
@@ -544,6 +693,10 @@ func stmtKind(stmt Statement) string {
 		return "CREATE INDEX"
 	case stmt.DropIndex != nil:
 		return "DROP INDEX"
+	case stmt.CreateType != nil:
+		return "CREATE TYPE"
+	case stmt.DropType != nil:
+		return "DROP TYPE"
 	case stmt.Insert != nil:
 		return "INSERT"
 	case stmt.Update != nil:
@@ -579,6 +732,16 @@ func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error
 			return Outcome{}, err
 		}
 		return db.executeDropIndex(stmt.DropIndex)
+	case stmt.CreateType != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return Outcome{}, err
+		}
+		return db.executeCreateType(stmt.CreateType)
+	case stmt.DropType != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return Outcome{}, err
+		}
+		return db.executeDropType(stmt.DropType)
 	case stmt.Insert != nil:
 		return db.executeInsert(stmt.Insert, params)
 	case stmt.Select != nil:
@@ -630,18 +793,43 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, NewError(DuplicateColumn, "duplicate column name: "+def.Name)
 			}
 		}
-		ty, decimal, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
-		if err != nil {
-			return Outcome{}, err
+		// Resolve the column type: a built-in scalar, or a user-defined composite referenced by name
+		// (spec/design/composite.md §3). An unknown name is 42704. A composite column carries no
+		// typmod (the composite's fields carry their own); a type modifier written on a composite
+		// column is rejected (0A000). A composite column is storable (S3) but never keyable — the PK
+		// gate below rejects it 0A000 (§6).
+		var colType Type
+		var decimal *DecimalTypmod
+		isComposite := false
+		if _, ok := ScalarTypeFromName(def.TypeName); ok {
+			ty, d, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
+			if err != nil {
+				return Outcome{}, err
+			}
+			colType = ScalarT(ty)
+			decimal = d
+		} else if ctype := db.readSnap().compositeType(def.TypeName); ctype != nil {
+			if def.TypeMod != nil {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a type modifier is not supported for composite type "+def.TypeName)
+			}
+			colType = CompositeT(ctype.Name)
+			isComposite = true
+		} else {
+			return Outcome{}, NewError(UndefinedObject, "type does not exist: "+def.TypeName)
 		}
 		if def.PrimaryKey {
 			// Integers and uuid may be a key. uuid is the FIRST non-integer key type — its
 			// fixed uuid-raw16 encoding (spec/design/encoding.md §2.7) is exercised. The other
 			// non-integer types' order-preserving key encodings (text §2.4, decimal §2.5,
 			// bytea §2.6, boolean's bool-byte) are authored but unexercised, so a
-			// text/decimal/bytea/boolean PRIMARY KEY is a documented 0A000 narrowing
-			// (types.md §9/§11/§12/§13), relaxable in a later in-key slice.
-			if !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+			// text/decimal/bytea/boolean/composite PRIMARY KEY is a documented 0A000 narrowing
+			// (types.md §9/§11/§12/§13; composite.md §6), relaxable in a later in-key slice.
+			if isComposite {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a "+def.TypeName+" primary key is not supported yet")
+			}
+			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -662,7 +850,14 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		//     checked assignable to the column, 42804) and stored as text for per-row eval.
 		var defaultVal *Value
 		var defaultExpr *DefaultExpr
-		if def.Default != nil {
+		if isComposite {
+			// A DEFAULT on a composite-typed column is not supported this slice (composite.md §12).
+			if def.Default != nil {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a DEFAULT on a composite-typed column is not supported yet")
+			}
+		} else if def.Default != nil {
+			ty := colType.Scalar
 			if def.Default.Expr.Kind == ExprLiteral {
 				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, false, def.Name)
 				if err != nil {
@@ -688,7 +883,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		columns = append(columns, Column{
 			Name:        def.Name,
-			Type:        ty,
+			Type:        colType,
 			Decimal:     decimal,
 			PrimaryKey:  def.PrimaryKey,
 			NotNull:     def.PrimaryKey || def.NotNull, // PRIMARY KEY ⇒ NOT NULL
@@ -972,7 +1167,8 @@ func (db *Database) resolveDefaultExprs(table *Table) ([]*rExpr, error) {
 		if de == nil {
 			continue
 		}
-		node, _, err := resolve(emptyScope(db), de.Expr, &table.Columns[i].Type, &aggCtx{collecting: false}, &paramTypes{})
+		colScalar := table.Columns[i].Type.ScalarTy()
+		node, _, err := resolve(emptyScope(db), de.Expr, &colScalar, &aggCtx{collecting: false}, &paramTypes{})
 		if err != nil {
 			return nil, err
 		}
@@ -1179,6 +1375,62 @@ func (db *Database) executeDropIndex(di *DropIndex) (Outcome, error) {
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
+// executeCreateType analyzes and runs a CREATE TYPE (spec/design/composite.md): reject a duplicate
+// type name (42710), resolve each field's type (a built-in scalar, or a previously-defined
+// composite — 42704 if unknown; no self- or forward-reference), reject a duplicate field name
+// (42701), then register the composite type in the catalog. Named composites only.
+func (db *Database) executeCreateType(ct *CreateType) (Outcome, error) {
+	if db.readSnap().compositeType(ct.Name) != nil {
+		return Outcome{}, NewError(DuplicateObject, "type "+ct.Name+" already exists")
+	}
+	fields := make([]CompositeField, 0, len(ct.Fields))
+	for _, f := range ct.Fields {
+		for _, g := range fields {
+			if strings.EqualFold(g.Name, f.Name) {
+				return Outcome{}, NewError(DuplicateColumn, "attribute "+f.Name+" specified more than once")
+			}
+		}
+		var fty Type
+		var fdecimal *DecimalTypmod
+		if _, ok := ScalarTypeFromName(f.TypeName); ok {
+			s, d, err := resolveTypeAndTypmod(f.TypeName, f.TypeMod)
+			if err != nil {
+				return Outcome{}, err
+			}
+			fty, fdecimal = ScalarT(s), d
+		} else if db.readSnap().compositeType(f.TypeName) != nil {
+			if f.TypeMod != nil {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a type modifier is not supported for composite type "+f.TypeName)
+			}
+			fty = CompositeT(f.TypeName)
+		} else {
+			return Outcome{}, NewError(UndefinedObject, "type does not exist: "+f.TypeName)
+		}
+		fields = append(fields, CompositeField{Name: f.Name, Type: fty, Decimal: fdecimal, NotNull: f.NotNull})
+	}
+	db.working().putType(&CompositeType{Name: ct.Name, Fields: fields})
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// executeDropType analyzes and runs a DROP TYPE (spec/design/composite.md §7). RESTRICT (the only
+// behavior this slice): a missing type is 42704 unless IF EXISTS; if any table column or composite
+// field still references the type, 2BP01; otherwise remove it from the catalog.
+func (db *Database) executeDropType(dt *DropType) (Outcome, error) {
+	if db.readSnap().compositeType(dt.Name) == nil {
+		if dt.IfExists {
+			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+		}
+		return Outcome{}, NewError(UndefinedObject, "type does not exist: "+dt.Name)
+	}
+	if dep, ok := db.readSnap().compositeDependent(dt.Name); ok {
+		return Outcome{}, NewError(DependentObjectsStillExist,
+			"cannot drop type "+dt.Name+" because other objects depend on it: "+dep)
+	}
+	db.working().removeType(strings.ToLower(dt.Name))
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
 // indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each
 // indexed column as the encoding.md §2.2 nullable slot — 0x00 + the type's bare
 // order-preserving key bytes when present, the lone 0x01 for NULL (always tagged, even
@@ -1193,13 +1445,13 @@ func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) [
 			out = append(out, 0x01)
 		case ValInt:
 			out = append(out, 0x00)
-			out = append(out, EncodeInt(columns[ci].Type, v.Int)...)
+			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		case ValUuid:
 			out = append(out, 0x00)
 			out = append(out, v.Str...)
 		case ValTimestamp, ValTimestamptz:
 			out = append(out, 0x00)
-			out = append(out, EncodeInt(columns[ci].Type, v.Int)...)
+			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		default:
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
@@ -1221,13 +1473,13 @@ func indexPrefixKey(columns []Column, def IndexDef, row Row) ([]byte, bool) {
 			return nil, false
 		case ValInt:
 			out = append(out, 0x00)
-			out = append(out, EncodeInt(columns[ci].Type, v.Int)...)
+			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		case ValUuid:
 			out = append(out, 0x00)
 			out = append(out, v.Str...)
 		case ValTimestamp, ValTimestamptz:
 			out = append(out, 0x00)
-			out = append(out, EncodeInt(columns[ci].Type, v.Int)...)
+			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		default:
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
@@ -1367,7 +1619,14 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		// values (22003) and enforces NOT NULL.
 		for i, col := range table.Columns {
 			if p := provided[i]; p >= 0 {
-				if !assignableTo(q.columnTypes[p], col.Type) {
+				// INSERT ... SELECT into a composite column lands in a later slice (the VALUES +
+				// ROW(...) path is S3 — spec/design/composite.md §12).
+				if col.Type.IsComposite() {
+					return Outcome{}, NewError(FeatureNotSupported, fmt.Sprintf(
+						"INSERT ... SELECT into composite column %s is not supported yet", col.Name,
+					))
+				}
+				if !assignableTo(q.columnTypes[p], col.Type.ScalarTy()) {
 					return Outcome{}, typeError(fmt.Sprintf(
 						"column %s is of type %s but expression is of type %s",
 						col.Name, col.Type.CanonicalName(), rtName(q.columnTypes[p]),
@@ -1404,8 +1663,10 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		}
 		for i, col := range table.Columns {
 			if p := provided[i]; p >= 0 && p < len(values) {
-				if iv := values[p]; iv.IsParam {
-					ct := col.Type
+				// Only a scalar column gives a top-level $N an inferable type; a composite-column
+				// param stays untyped (42P18 at finalize this slice — composite.md §12).
+				if iv := values[p]; iv.IsParam && !col.Type.IsComposite() {
+					ct := col.Type.ScalarTy()
 					if err := ptypes.note(int(iv.Param)-1, &ct); err != nil {
 						return Outcome{}, err
 					}
@@ -1451,17 +1712,22 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		rv := make([]Value, arity)
 		for i, col := range table.Columns {
 			if p := provided[i]; p >= 0 {
-				switch iv := values[p]; {
-				case iv.IsDefault:
+				iv := values[p]
+				if iv.IsDefault {
+					// DEFAULT at the top level → the column's default (constant or per-row expression).
 					dv, err := db.evalDefault(col, defaultExprs[i], stmtRng, meter)
 					if err != nil {
 						return Outcome{}, err
 					}
 					rv[p] = dv
-				case iv.IsParam:
-					rv[p] = bound[int(iv.Param)-1]
-				default:
-					rv[p] = literalToValue(iv.Lit)
+				} else {
+					// A ROW(...) / literal / $N slot is materialized against the column's resolved type
+					// (composite-aware — spec/design/composite.md §1/§4).
+					mv, err := materializeInsertValue(iv, store.colTypes[i], bound)
+					if err != nil {
+						return Outcome{}, err
+					}
+					rv[p] = mv
 				}
 			}
 		}
@@ -1532,7 +1798,9 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 				}
 				candidate = dv
 			}
-			v, err := storeValue(candidate, col.Type, col.Decimal, col.NotNull, col.Name)
+			// The columns' resolved ColTypes (a scalar, or a composite resolved to its field tree),
+			// for composite-aware store coercion (spec/design/composite.md §4).
+			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.NotNull, col.Name)
 			if err != nil {
 				return nil, err
 			}
@@ -1567,7 +1835,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 					// encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
 					key = append(key, row[i].Str...)
 				} else {
-					key = append(key, EncodeInt(table.Columns[i].Type, row[i].Int)...)
+					key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
 				}
 			}
 			// The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
@@ -1947,18 +2215,25 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			}
 		}
 		col := table.Columns[idx]
+		// Updating a composite-typed column lands in a later slice (the storable + INSERT/SELECT
+		// round-trip is S3 — spec/design/composite.md §12); reject it for now (0A000).
+		if col.Type.IsComposite() {
+			return Outcome{}, NewError(FeatureNotSupported,
+				"updating composite column "+a.Column+" is not supported yet")
+		}
 		// The RHS is a general expression evaluated against the *old* row; a literal operand
 		// adapts to the target column's type. The result must be assignable to the column's
 		// family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-		src, ty, err := resolve(s, a.Value, &col.Type, &aggCtx{collecting: false}, ptypes)
+		colScalar := col.Type.ScalarTy()
+		src, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
 		if err != nil {
 			return Outcome{}, err
 		}
-		if err := requireAssignable(ty, col.Type, a.Column); err != nil {
+		if err := requireAssignable(ty, colScalar, a.Column); err != nil {
 			return Outcome{}, err
 		}
 		plans = append(plans, assignPlan{
-			idx: idx, name: col.Name, target: col.Type, decimal: col.Decimal, notNull: col.NotNull, source: src,
+			idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, notNull: col.NotNull, source: src,
 		})
 	}
 
@@ -2957,7 +3232,7 @@ func (db *Database) resolveSRF(name string, args []*Expr, alias *string, parent 
 	}
 	t := &Table{
 		Name:    "generate_series",
-		Columns: []Column{{Name: colName, Type: result}},
+		Columns: []Column{{Name: colName, Type: ScalarT(result)}},
 	}
 	return t, &srfPlan{args: rargs}, nil
 }
@@ -3134,13 +3409,13 @@ type indexBoundPlan struct {
 // scan).
 func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
-		if bp := detectPKBound(filter, rel.offset+pkLocal, rel.table.Columns[pkLocal].Type); bp != nil {
+		if bp := detectPKBound(filter, rel.offset+pkLocal, rel.table.Columns[pkLocal].Type.ScalarTy()); bp != nil {
 			return &scanBound{pk: bp}
 		}
 	}
 	for _, idx := range rel.table.Indexes {
 		ci := idx.Columns[0]
-		ty := rel.table.Columns[ci].Type
+		ty := rel.table.Columns[ci].Type.ScalarTy()
 		var eqs []*rExpr
 		if bp := detectPKBound(filter, rel.offset+ci, ty); bp != nil {
 			for _, t := range bp.terms {
@@ -3152,7 +3427,7 @@ func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 		if len(eqs) > 0 {
 			tail := make([]ScalarType, 0, len(idx.Columns)-1)
 			for _, c := range idx.Columns[1:] {
-				tail = append(tail, rel.table.Columns[c].Type)
+				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
 			}
 			return &scanBound{index: &indexBoundPlan{
 				nameKey: strings.ToLower(idx.Name), colType: ty, eqs: eqs, tailTypes: tail,
@@ -3249,7 +3524,7 @@ func pkBoundFor(table *Table, filter *rExpr) *pkBoundPlan {
 	if pkIdx < 0 {
 		return nil
 	}
-	return detectPKBound(filter, pkIdx, table.Columns[pkIdx].Type)
+	return detectPKBound(filter, pkIdx, table.Columns[pkIdx].Type.ScalarTy())
 }
 
 // detectPKBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction
@@ -4457,6 +4732,14 @@ func valueToRExpr(v Value) *rExpr {
 		return &rExpr{kind: reConstTimestamptz, cInt: v.Int}
 	case ValInterval:
 		return &rExpr{kind: reConstInterval, cIv: v.Iv}
+	case ValComposite:
+		// A folded composite value rebuilds as a ROW(...) of its per-field constant nodes
+		// (spec/design/composite.md), so the recursive structure round-trips.
+		nodes := make([]*rExpr, len(*v.Comp))
+		for i, f := range *v.Comp {
+			nodes[i] = valueToRExpr(f)
+		}
+		return &rExpr{kind: reRow, sargs: nodes}
 	default: // ValNull
 		return &rExpr{kind: reConstNull}
 	}
@@ -4535,6 +4818,15 @@ func distinctRowKey(row []Value) string {
 			// distinct 'f' tag (a column is one float width, so the width need not enter the key).
 			b.WriteByte('f')
 			b.WriteString(floatCanonicalKey(v.asF64()))
+		case ValComposite:
+			// A composite keys structurally (spec/design/composite.md §2/§5): the field count under a
+			// distinct 'c' tag, then each field's own key recursively. NULL fields key as 'n' (the
+			// value-level structural equality, like decimal/interval), so two composites with the same
+			// field values share a DISTINCT/GROUP BY bucket; a nested composite recurses.
+			b.WriteByte('c')
+			b.WriteString(strconv.Itoa(len(*v.Comp)))
+			b.WriteByte(':')
+			b.WriteString(distinctRowKey(*v.Comp))
 		}
 	}
 	return b.String()
@@ -4574,6 +4866,10 @@ const (
 	rtInterval    // interval (a span); compares only with itself, by the canonical span
 	rtFloat32     // float32 / real (binary32); promotes to float64; a strict island vs int/decimal
 	rtFloat64     // float64 / double precision (binary64)
+	// rtComposite is a composite (row) type (spec/design/composite.md §5): comp carries the
+	// (optional) name and resolved field list. A named catalog type's name drives the `# types:`
+	// output; an anonymous ROW(...) result has a nil name (rendered "record").
+	rtComposite
 )
 
 // isFloatKind reports whether a resolvedType is one of the two float kinds.
@@ -4590,7 +4886,23 @@ func promoteFloat(a, b rtKind) ScalarType {
 
 type resolvedType struct {
 	kind  rtKind
-	intTy ScalarType // valid when kind == rtInt
+	intTy ScalarType      // valid when kind == rtInt
+	comp  *compositeRType // valid when kind == rtComposite
+}
+
+// compositeRType is the resolved shape of a composite type — its (optional) name and resolved field
+// list (spec/design/composite.md §5). name is "" (named=false) for an anonymous ROW(...) result, set
+// for a named catalog type. fields are the resolved (field-name, type) pairs in declaration order.
+type compositeRType struct {
+	named  bool
+	name   string
+	fields []compositeRField
+}
+
+// compositeRField is one resolved (name, type) field of a compositeRType.
+type compositeRField struct {
+	name string
+	ty   resolvedType
 }
 
 func intType(t resolvedType) (ScalarType, bool) {
@@ -4712,6 +5024,12 @@ func rtName(t resolvedType) string {
 		return "float32"
 	case rtFloat64:
 		return "float64"
+	case rtComposite:
+		// A named composite is its type name; an anonymous ROW(...) is "record" (PG).
+		if t.comp != nil && t.comp.named {
+			return t.comp.name
+		}
+		return "record"
 	default:
 		return "unknown"
 	}
@@ -4806,6 +5124,15 @@ const (
 	// reInValues is a folded uncorrelated `IN (subquery)`: the subquery ran once yielding `list`;
 	// per row it tests `lhs` for three-valued membership.
 	reInValues
+	// reRow is a ROW(...) composite constructor (spec/design/composite.md §1): its field nodes are
+	// held in sargs (so the existing fold / references-outer / touched-set walks recurse into them
+	// for free). Evaluates to a ValComposite; one operator_eval per node (cost.md §9).
+	reRow
+	// reField is field selection `(composite).field` (spec/design/composite.md §S4): evaluate
+	// `operand` (the base) to a composite value and return its `index`-th field (the field ordinal,
+	// fixed at resolve). A whole-value-NULL composite yields NULL for any field. One operator_eval
+	// per node (cost.md §9).
+	reField
 )
 
 // subqueryKind selects which subquery form an reSubquery node is (spec/design/grammar.md §26).
@@ -5314,6 +5641,10 @@ func exprHasAggregate(e Expr) bool {
 			}
 		}
 		return e.Case.Els != nil && exprHasAggregate(*e.Case.Els)
+	case ExprFieldAccess, ExprFieldStar:
+		// Field selection `(expr).field` / `(expr).*` recurses into the composite base
+		// (spec/design/composite.md §S4) — an aggregate hidden in the base must surface.
+		return exprHasAggregate(*e.Base)
 	default:
 		return false
 	}
@@ -5399,6 +5730,10 @@ func rejectCheckStructure(e Expr) error {
 			return rejectCheckStructure(*e.Case.Els)
 		}
 		return nil
+	case ExprFieldAccess, ExprFieldStar:
+		// Recurse into the composite base (spec/design/composite.md §S4) so a forbidden
+		// subquery/aggregate/parameter hidden there is still rejected.
+		return rejectCheckStructure(*e.Base)
 	default: // ExprColumn, ExprQualifiedColumn, ExprLiteral
 		return nil
 	}
@@ -5486,6 +5821,9 @@ func rejectDefaultStructure(e Expr) error {
 			return rejectDefaultStructure(*e.Case.Els)
 		}
 		return nil
+	case ExprFieldAccess, ExprFieldStar:
+		// Recurse into the composite base (spec/design/composite.md §S4).
+		return rejectDefaultStructure(*e.Base)
 	default: // ExprLiteral, ExprTypedLiteral
 		return nil
 	}
@@ -5552,6 +5890,9 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 			for _, a := range e.FuncCall.Args {
 				walk(*a)
 			}
+		case ExprFieldAccess, ExprFieldStar:
+			// Field selection recurses into the composite base (spec/design/composite.md §S4).
+			walk(*e.Base)
 		}
 	}
 	walk(e)
@@ -6087,7 +6428,7 @@ func groupingErrorColumn(name string) error {
 // be a grouping key — resolved to its synthetic-row slot (its position among the group keys) —
 // else 42803.
 func collectColumn(s *scope, ag *aggCtx, idx int, name string) (*rExpr, resolvedType, error) {
-	ty := resolvedTypeOf(s.columnAt(idx).Type)
+	ty := resolvedTypeOfCol(s.columnAt(idx).Type, s.catalog.readSnap())
 	if !ag.collecting {
 		return &rExpr{kind: reColumn, index: idx}, ty, nil
 	}
@@ -6283,6 +6624,26 @@ func undefinedColumn(name string) error {
 	return NewError(UndefinedColumn, "column does not exist: "+name)
 }
 
+// resolveFieldOf builds field selection `(base).field` over an already-resolved `base` node and
+// its static type (spec/design/composite.md §S4): `base` must be composite — else 42809
+// (wrong_object_type, PG's "column notation applied to non-composite") — and `field` must name one
+// of its fields case-insensitively (PG folds the identifier), else 42703 (undefined_column).
+// Returns the reField node carrying the fixed field ordinal, plus the field's static type.
+func resolveFieldOf(baseNode *rExpr, baseTy resolvedType, field string) (*rExpr, resolvedType, error) {
+	if baseTy.kind != rtComposite {
+		return nil, resolvedType{}, NewError(WrongObjectType, fmt.Sprintf(
+			"column notation .%s applied to type %s, which is not a composite type",
+			field, rtName(baseTy),
+		))
+	}
+	for i, f := range baseTy.comp.fields {
+		if strings.EqualFold(f.name, field) {
+			return &rExpr{kind: reField, operand: baseNode, index: i}, f.ty, nil
+		}
+	}
+	return nil, resolvedType{}, undefinedColumn(field)
+}
+
 // ambiguousColumn is 42702 — a bare column name that more than one relation in scope defines.
 func ambiguousColumn(name string) error {
 	return NewError(AmbiguousColumn, "column reference "+name+" is ambiguous")
@@ -6402,6 +6763,21 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 	}
 }
 
+// resolvedTypeOfCol is the resolved static type of a column of open type ty (spec/design/composite.md
+// §5): a scalar via resolvedTypeOf, or a composite resolved against the snapshot's type catalog (the
+// reference is guaranteed present — resolved at load / CREATE TYPE). Recursive for nested composites.
+func resolvedTypeOfCol(ty Type, snap *Snapshot) resolvedType {
+	if ty.Comp == nil {
+		return resolvedTypeOf(ty.Scalar)
+	}
+	def := snap.compositeType(ty.Comp.Name)
+	fields := make([]compositeRField, len(def.Fields))
+	for i, f := range def.Fields {
+		fields[i] = compositeRField{name: f.Name, ty: resolvedTypeOfCol(f.Type, snap)}
+	}
+	return resolvedType{kind: rtComposite, comp: &compositeRType{named: true, name: def.Name, fields: fields}}
+}
+
 // resolveProjections resolves SELECT items into evaluable projections (any result type is
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
@@ -6433,7 +6809,7 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 			for i := range r.table.Columns {
 				ps = append(ps, &rExpr{kind: reColumn, index: r.offset + i})
 				names = append(names, r.table.Columns[i].Name)
-				types = append(types, resolvedOfColumn(r.table.Columns[i].Type))
+				types = append(types, resolvedTypeOfCol(r.table.Columns[i].Type, s.catalog.readSnap()))
 			}
 		}
 		return ps, names, types, nil
@@ -6442,6 +6818,28 @@ func resolveProjections(s *scope, items SelectItems, ag *aggCtx, params *paramTy
 	names := make([]string, 0, len(items.Items))
 	types := make([]resolvedType, 0, len(items.Items))
 	for _, it := range items.Items {
+		// `(expr).*` expands a composite base into one output column per field, in declaration
+		// order (spec/design/composite.md §S4). The base is resolved once and each output column is
+		// a reField node over a shared base node — the base is pure, so sharing the resolved node is
+		// safe (no clone needed, unlike Rust where RExpr isn't Clone). A non-composite base is 42809.
+		if it.Expr.Kind == ExprFieldStar {
+			baseNode, baseTy, err := resolve(s, *it.Expr.Base, nil, ag, params)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if baseTy.kind != rtComposite {
+				return nil, nil, nil, NewError(WrongObjectType, fmt.Sprintf(
+					"column notation .* applied to type %s, which is not a composite type",
+					rtName(baseTy),
+				))
+			}
+			for i, f := range baseTy.comp.fields {
+				ps = append(ps, &rExpr{kind: reField, operand: baseNode, index: i})
+				names = append(names, f.name)
+				types = append(types, f.ty)
+			}
+			continue
+		}
 		node, ty, err := resolve(s, it.Expr, nil, ag, params)
 		if err != nil {
 			return nil, nil, nil, err
@@ -6476,6 +6874,10 @@ func outputName(s *scope, e Expr) string {
 	case ExprFuncCall:
 		// An un-aliased aggregate call is named by its lowercased function name (PG; §8).
 		return toLowerASCII(e.FuncCall.Name)
+	case ExprFieldAccess:
+		// A field selection takes the FIELD name (PG names the output column after the selected
+		// field, lowercased — spec/design/composite.md §S4).
+		return toLowerASCII(e.Field)
 	default:
 		return "?column?"
 	}
@@ -6503,7 +6905,7 @@ func resolveColumnRef(s *scope, ag *aggCtx, r resolved, name string) (*rExpr, re
 	if r.level == 0 {
 		return collectColumn(s, ag, r.index, name)
 	}
-	return &rExpr{kind: reOuterColumn, level: r.level, index: r.index}, resolvedTypeOf(s.columnOf(r).Type), nil
+	return &rExpr{kind: reOuterColumn, level: r.level, index: r.index}, resolvedTypeOfCol(s.columnOf(r).Type, s.catalog.readSnap()), nil
 }
 
 // planSubquery plans a subquery operand against the scope chain (§26). Rejects a non-SELECT
@@ -6550,11 +6952,44 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return resolveColumnRef(s, ag, r, e.Column)
 	case ExprQualifiedColumn:
+		// A bare `rel.col` resolves strictly against the FROM relations — `qualifier` MUST name a
+		// relation (else 42P01), matching PostgreSQL. Composite field access on a column is the
+		// **parens-required** `(col).field` form (spec/design/composite.md §1/§S4), an
+		// ExprFieldAccess, never this bare qualified-column path (PG raises 42P01 for the
+		// unparenthesized `col.field` / `t.col.field` spellings).
 		r, err := s.resolveQualified(e.Qualifier, e.Column)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return resolveColumnRef(s, ag, r, e.Column)
+	case ExprFieldAccess:
+		// `(expr).field` — composite field selection (spec/design/composite.md §S4).
+		node, ty, err := resolve(s, *e.Base, nil, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return resolveFieldOf(node, ty, e.Field)
+	case ExprFieldStar:
+		// `(expr).*` — whole-row expansion is a projection-list construct only; in a scalar
+		// expression position it is unsupported (PG rejects row expansion here — 0A000).
+		return nil, resolvedType{}, NewError(FeatureNotSupported,
+			"row expansion (.*) is not supported in this context")
+	case ExprRow:
+		// A ROW(...) constructor (spec/design/composite.md §1): resolve each field (no context — a
+		// field defaults like a bare expression), build the anonymous (structural) composite type
+		// (name unset; fields named f1, f2, …) the result types as. Storing it into a named composite
+		// column is structural — the materialize/coerce path handles the field-by-field assignment.
+		nodes := make([]*rExpr, len(e.RowItems))
+		fields := make([]compositeRField, len(e.RowItems))
+		for i := range e.RowItems {
+			node, ty, err := resolve(s, e.RowItems[i], nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			nodes[i] = node
+			fields[i] = compositeRField{name: fmt.Sprintf("f%d", i+1), ty: ty}
+		}
+		return &rExpr{kind: reRow, sargs: nodes}, resolvedType{kind: rtComposite, comp: &compositeRType{fields: fields}}, nil
 	case ExprFuncCall:
 		return resolveFuncCall(s, e.FuncCall, ag, params)
 	case ExprLiteral:
@@ -6645,6 +7080,12 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// `type 'string'`, equal to CAST('string' AS type) over a string-literal operand. Resolve
 		// the type by name (unknown → 42704) and coerce the string to it at resolve, context-free.
 		// No typmod rides on the literal (the parser's one-token lookahead admits none).
+		//
+		// A composite type name (`addr '(Main,90210)'`) coerces the string via record_in
+		// (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
+		if ct := s.catalog.readSnap().compositeType(e.TypeLitName); ct != nil {
+			return coerceStringToComposite(e.TypeLitText, ct, s.catalog)
+		}
 		target, _, err := resolveTypeAndTypmod(e.TypeLitName, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -6693,6 +7134,35 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated}, resolvedType{kind: rtBool}, nil
 	case ExprCast:
+		// A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
+		// (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
+		// `'(…)'::addr` headline); a bare NULL adapts to the composite; a same-named composite
+		// operand is the identity. Every other operand (a runtime text expression, an anonymous
+		// ROW(…)) is a documented 0A000 narrowing this slice — relaxable. A type modifier on a
+		// composite is meaningless (0A000).
+		if ct := s.catalog.readSnap().compositeType(e.Cast.TypeName); ct != nil {
+			if e.Cast.TypeMod != nil {
+				return nil, resolvedType{}, NewError(FeatureNotSupported,
+					"a type modifier is not supported on a composite type")
+			}
+			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralText {
+				return coerceStringToComposite(in.Literal.Str, ct, s.catalog)
+			}
+			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			switch {
+			case ity.kind == rtNull:
+				return rinner, resolvedTypeOfCol(CompositeT(ct.Name), s.catalog.readSnap()), nil
+			case ity.kind == rtComposite && ity.comp.named && ity.comp.name == ct.Name:
+				// An identical named composite is the identity cast.
+				return rinner, ity, nil
+			default:
+				return nil, resolvedType{}, NewError(FeatureNotSupported,
+					"casting to a composite type is only supported from a string literal")
+			}
+		}
 		target, typmod, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -7175,6 +7645,30 @@ func temporalArithResult(op BinaryOp, lt, rt rtKind) (st ScalarType, isTemporal 
 // a boolean with a non-boolean, is a 42804 type error — comparison is overloaded across these
 // families but never compares across them.
 func classifyComparable(lt, rt resolvedType) error {
+	// Composite comparison is element-wise row comparison (spec/design/composite.md §5): two
+	// composites are comparable iff they have the SAME field count and each corresponding field
+	// pair is itself comparable (recursively — a nested composite recurses here, an anonymous
+	// ROW(...) compares against a same-shape named type). A bare NULL is always comparable (the
+	// comparison is unknown). A composite vs any non-composite, or a row-size mismatch, or an
+	// incomparable field pair, is a 42804.
+	compL, compR := lt.kind == rtComposite, rt.kind == rtComposite
+	switch {
+	case compL && rt.kind == rtNull, lt.kind == rtNull && compR:
+		return nil
+	case compL && compR:
+		a, b := lt.comp.fields, rt.comp.fields
+		if len(a) != len(b) {
+			return typeError("cannot compare rows of different sizes")
+		}
+		for i := range a {
+			if err := classifyComparable(a[i].ty, b[i].ty); err != nil {
+				return err
+			}
+		}
+		return nil
+	case compL || compR:
+		return typeError("cannot compare a composite value with a value of a different type")
+	}
 	// Boolean compares only with boolean (or NULL); boolean with a number/text is a mismatch.
 	boolL, boolR := lt.kind == rtBool, rt.kind == rtBool
 	if boolL != boolR && (lt.kind != rtNull && rt.kind != rtNull) {
@@ -7273,6 +7767,55 @@ func floatConstFromDecimal(d Decimal, ctx ScalarType) (*rExpr, resolvedType, err
 		return nil, resolvedType{}, err
 	}
 	return &rExpr{kind: reConstFloat64, cFloat: f}, resolvedType{kind: rtFloat64}, nil
+}
+
+// coerceStringToComposite coerces a string literal to a named composite type via record_in
+// (spec/design/composite.md §8) — the shared engine of `'(…)'::addr` and the `addr '(…)'` typed
+// literal. The text is tokenized by parseRecordTokens (nil or a wrong field count → 22P02
+// invalid_text_representation, a "malformed record literal" message); then each token is coerced to
+// its field's declared type: a NULL token is a typed NULL, a scalar field reuses coerceStringLiteral
+// (the same string-literal coercion as a typed literal), and a composite field recurses. The folded
+// result is an reRow of the coerced const field nodes, typed as the named composite — the inverse of
+// recordOut.
+func coerceStringToComposite(text string, ct *CompositeType, catalog *Database) (*rExpr, resolvedType, error) {
+	snap := catalog.readSnap()
+	malformed := func() error {
+		return NewError(InvalidTextRepresentation,
+			fmt.Sprintf("malformed record literal: %q for type %s", text, ct.Name))
+	}
+	tokens, ok := parseRecordTokens(text)
+	if !ok || len(tokens) != len(ct.Fields) {
+		return nil, resolvedType{}, malformed()
+	}
+	nodes := make([]*rExpr, len(tokens))
+	fields := make([]compositeRField, len(tokens))
+	for i := range tokens {
+		f := ct.Fields[i]
+		switch {
+		case tokens[i] == nil:
+			// A NULL field: a NULL value, typed by the field's declared type.
+			nodes[i] = &rExpr{kind: reConstNull}
+			fields[i] = compositeRField{name: f.Name, ty: resolvedTypeOfCol(f.Type, snap)}
+		case f.Type.Comp != nil:
+			// A nested composite field: the token is its own quoted record literal — recurse.
+			nested := snap.compositeType(f.Type.Comp.Name)
+			node, ty, err := coerceStringToComposite(*tokens[i], nested, catalog)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			nodes[i] = node
+			fields[i] = compositeRField{name: f.Name, ty: ty}
+		default:
+			node, ty, err := coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Decimal)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			nodes[i] = node
+			fields[i] = compositeRField{name: f.Name, ty: ty}
+		}
+	}
+	return &rExpr{kind: reRow, sargs: nodes},
+		resolvedType{kind: rtComposite, comp: &compositeRType{named: true, name: ct.Name, fields: fields}}, nil
 }
 
 // coerceStringLiteral coerces a string literal's content to the named scalar target at resolve —
@@ -7787,6 +8330,36 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// The supplied value, already coerced to its inferred type by bindParams before
 		// execution (spec/design/api.md §5).
 		return env.params[e.index], nil
+	case reRow:
+		// A ROW(...) constructor — one operator_eval, then build the composite from the evaluated
+		// fields (spec/design/composite.md §1, cost.md §9).
+		m.Charge(Costs.OperatorEval)
+		vals := make([]Value, len(e.sargs))
+		for i, f := range e.sargs {
+			v, err := f.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			vals[i] = v
+		}
+		return CompositeValue(vals), nil
+	case reField:
+		// Field selection `(composite).field` — one operator_eval, then return the `index`-th field
+		// of the evaluated composite base (spec/design/composite.md §S4, cost.md §9). A whole-value
+		// NULL composite yields NULL for any field.
+		m.Charge(Costs.OperatorEval)
+		base, err := e.operand.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		switch base.Kind {
+		case ValComposite:
+			return (*base.Comp)[e.index], nil
+		case ValNull:
+			return NullValue(), nil
+		default:
+			panic(fmt.Sprintf("field access on a non-composite value: %v", base.Kind))
+		}
 	case reConstInt:
 		return IntValue(e.cInt), nil
 	case reConstBool:
@@ -8019,8 +8592,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		isNull := v.Kind == ValNull
-		return BoolValue(isNull != e.negated), nil
+		// Composite IS NULL / IS NOT NULL is PG's all-fields rule, NON-recursive (composite.md §5);
+		// a scalar follows the ordinary rule. IsNullTest folds both.
+		return BoolValue(v.IsNullTest(e.negated)), nil
 	case reLike:
 		m.Charge(Costs.OperatorEval)
 		subject, err := e.lhs.eval(row, env, m)
@@ -8563,6 +9137,19 @@ func valueCmp(a, b Value) int {
 		// The PG float8 TOTAL order: -0 = +0, NaN = NaN, NaN largest (spec/design/float.md §3).
 		// Mixed widths widen to float64 (lossless). Drives ORDER BY / MIN / MAX / DISTINCT / GROUP BY.
 		return floatTotalCmp(a.asF64(), b.asF64())
+	case a.Kind == ValComposite && b.Kind == ValComposite:
+		// A composite sorts lexicographically, NULLs-last per field (the composite sort key —
+		// spec/design/composite.md §5): the first non-equal field decides, recursing through keyCmp
+		// so per-field NULL placement and nested composites are handled uniformly. The caller's
+		// `descending` flip in keyCmp reverses the whole tuple. A row-size tie-break keeps it total
+		// (same-type rows have equal arity, so it is only reached for safety).
+		x, y := *a.Comp, *b.Comp
+		for i := 0; i < len(x) && i < len(y); i++ {
+			if c := keyCmp(x[i], y[i], false, false); c != 0 {
+				return c
+			}
+		}
+		return cmpInt64(int64(len(x)), int64(len(y)))
 	default:
 		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
 		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -8816,6 +9403,50 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 	}
 }
 
+// coerceForStore coerces a value into a column of resolved type ty for storage
+// (spec/design/composite.md §4): a scalar dispatches to storeValue; a composite to storeComposite.
+func coerceForStore(v Value, ty ColType, typmod *DecimalTypmod, notNull bool, colName string) (Value, error) {
+	if ty.Composite {
+		return storeComposite(v, ty.Name, ty.Fields, notNull, colName)
+	}
+	return storeValue(v, ty.Scalar, typmod, notNull, colName)
+}
+
+// storeComposite coerces a value into a COMPOSITE column (spec/design/composite.md §4): NULL honours
+// NOT NULL (23502); a composite must have exactly the declared field count (42804) and each field is
+// coerced to its declared field type via coerceForStore (recursing); any other value is a 42804. A
+// NULL field of a NOT NULL composite field traps 23502.
+func storeComposite(v Value, typeName string, fields []ColField, notNull bool, colName string) (Value, error) {
+	switch v.Kind {
+	case ValNull:
+		if notNull {
+			return Value{}, NewError(NotNullViolation,
+				"null value in column "+colName+" violates not-null constraint")
+		}
+		return NullValue(), nil
+	case ValComposite:
+		vals := *v.Comp
+		if len(vals) != len(fields) {
+			return Value{}, typeError(fmt.Sprintf(
+				"row has %d fields but composite type %s has %d", len(vals), typeName, len(fields),
+			))
+		}
+		out := make([]Value, len(vals))
+		for i, f := range fields {
+			cv, err := coerceForStore(vals[i], f.Type, f.Typmod, f.NotNull, f.Name)
+			if err != nil {
+				return Value{}, err
+			}
+			out[i] = cv
+		}
+		return CompositeValue(out), nil
+	default:
+		return Value{}, typeError(fmt.Sprintf(
+			"cannot store a non-record value in composite column %s (type %s)", colName, typeName,
+		))
+	}
+}
+
 // coerceDecimal coerces a decimal into a column's typmod: round to the declared scale and
 // precision-check (22003) for numeric(p,s); for an unconstrained numeric column just cap-check.
 func coerceDecimal(d Decimal, typmod *DecimalTypmod) (Decimal, error) {
@@ -8838,5 +9469,48 @@ func literalToValue(lit Literal) Value {
 		return TextValue(lit.Str)
 	default: // LiteralDecimal
 		return DecimalValue(lit.Dec)
+	}
+}
+
+// materializeInsertValue materializes one INSERT VALUES slot into a Value against the column's
+// resolved ColType (spec/design/composite.md §1/§4): a scalar slot is a literal or a bound $N; a
+// composite slot is a ROW(...) whose fields recurse against the composite's field types, or a bound
+// $N. The result is then fully coerced/range-checked by coerceForStore. DEFAULT is handled by the
+// caller at the top level (it is not a valid field inside a ROW(...)).
+func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, error) {
+	if !ty.Composite {
+		switch {
+		case iv.IsDefault:
+			return Value{}, NewError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
+		case iv.IsRow:
+			return Value{}, typeError("cannot assign a record value to a " + ty.Scalar.CanonicalName() + " field")
+		case iv.IsParam:
+			return bound[int(iv.Param)-1], nil
+		default:
+			return literalToValue(iv.Lit), nil
+		}
+	}
+	switch {
+	case iv.IsRow:
+		if len(iv.Row) != len(ty.Fields) {
+			return Value{}, typeError(fmt.Sprintf(
+				"ROW has %d fields but composite type %s has %d", len(iv.Row), ty.Name, len(ty.Fields),
+			))
+		}
+		vals := make([]Value, len(ty.Fields))
+		for i, f := range ty.Fields {
+			fv, err := materializeInsertValue(iv.Row[i], f.Type, bound)
+			if err != nil {
+				return Value{}, err
+			}
+			vals[i] = fv
+		}
+		return CompositeValue(vals), nil
+	case iv.IsParam:
+		return bound[int(iv.Param)-1], nil
+	case iv.IsDefault:
+		return Value{}, NewError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
+	default:
+		return Value{}, typeError("cannot assign a scalar value to composite column (type " + ty.Name + ")")
 	}
 }

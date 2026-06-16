@@ -252,3 +252,89 @@ func (t ScalarType) InRange(v int64) bool {
 func AllScalarTypes() []ScalarType {
 	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType, Float32, Float64}
 }
+
+// Type is a column / value type: either a built-in ScalarType or a reference to a user-defined
+// composite (row) type (spec/design/composite.md). This is the *open* wrapper above the closed
+// ScalarType set (CLAUDE.md §4): the scalar set stays a fixed compiled-in set, but a column type
+// can now also name a composite living in the database's type catalog, referenced by name
+// (case-insensitively, like a table). The resolved field list lives once in the catalog (S2+),
+// not inline here.
+//
+// Go has no sum types, so the composite arm is a nil-pointer discriminant — the same idiom Value
+// uses for its slice-bearing arms (value.go): Comp == nil means scalar (read Scalar), Comp != nil
+// means composite. A Type with a nil Comp is therefore ==-comparable like ScalarType; two
+// composite Types compare their *pointers*, so equal-by-name composites would compare unequal —
+// composite-aware equality must go through CanonicalName / an explicit helper, never ==. In S1 no
+// composite is ever constructed, so this cannot bite yet (it is the §8 trap to watch in S2+).
+// Scalar-only paths call ScalarTy(); the value codec / resolver branch on IsComposite (S2+).
+type Type struct {
+	// Comp is the composite reference when this is a composite type, else nil (⇒ scalar). The
+	// pointer is the discriminant (keeps Type ==-comparable for the scalar case).
+	Comp *CompositeRef
+	// Scalar is the inner scalar type when Comp == nil (a scalar type). Meaningless otherwise.
+	Scalar ScalarType
+}
+
+// CompositeRef is a by-name reference to a composite type in the database's type catalog. The
+// display name is case-preserved; lookups lowercase it (the table-name convention).
+type CompositeRef struct {
+	Name string
+}
+
+// ScalarT wraps a ScalarType as a (scalar) Type.
+func ScalarT(s ScalarType) Type { return Type{Scalar: s} }
+
+// CompositeT builds a composite Type referencing the named catalog type. Unused in S1 (no
+// composite is constructed yet); present so the wrapper is complete for later slices.
+func CompositeT(name string) Type { return Type{Comp: &CompositeRef{Name: name}} }
+
+// ScalarTy returns the inner scalar type. Scalar-only paths (the integer codec, the scalar value
+// codec, the scalar resolver) call this; a composite column reaches those paths only after the
+// caller has branched on IsComposite, so a composite here is an engine-invariant violation
+// (matches the Rust Type::scalar unreachable!).
+func (t Type) ScalarTy() ScalarType {
+	if t.Comp != nil {
+		panic("BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " +
+			"composite path must branch before this point (spec/design/composite.md)")
+	}
+	return t.Scalar
+}
+
+// AsScalar returns the inner scalar type and true, or (0, false) for a composite.
+func (t Type) AsScalar() (ScalarType, bool) {
+	if t.Comp != nil {
+		return 0, false
+	}
+	return t.Scalar, true
+}
+
+// IsComposite reports whether this is a composite (user-defined row) type.
+func (t Type) IsComposite() bool { return t.Comp != nil }
+
+// CanonicalName is this type's canonical name for output / error messages — the scalar's
+// canonical name, or the composite's name.
+func (t Type) CanonicalName() string {
+	if t.Comp != nil {
+		return t.Comp.Name
+	}
+	return t.Scalar.CanonicalName()
+}
+
+// Scalar-predicate delegates. A composite answers false to every scalar predicate — it is none of
+// these families — so keyability checks (IsInteger || IsUuid || …) correctly reject a composite
+// (0A000), and family branches fall through to their composite handling.
+
+// IsInteger reports whether this is a scalar integer type (false for a composite).
+func (t Type) IsInteger() bool { return t.Comp == nil && t.Scalar.IsInteger() }
+
+// IsDecimal reports whether this is the scalar decimal type (false for a composite).
+func (t Type) IsDecimal() bool { return t.Comp == nil && t.Scalar.IsDecimal() }
+
+// IsUuid reports whether this is the scalar uuid type (false for a composite).
+func (t Type) IsUuid() bool { return t.Comp == nil && t.Scalar.IsUuid() }
+
+// IsTimestamp reports whether this is the scalar timestamp type (false for a composite).
+func (t Type) IsTimestamp() bool { return t.Comp == nil && t.Scalar.IsTimestamp() }
+
+// IsTimestamptz reports whether this is the scalar timestamptz type (false for a composite).
+func (t Type) IsTimestamptz() bool { return t.Comp == nil && t.Scalar.IsTimestamptz() }

@@ -8,11 +8,14 @@ import type {
   BinaryOp,
   CreateIndex,
   CreateTable,
+  CreateType,
   Delete,
   DropIndex,
   DropTable,
+  DropType,
   Expr,
   Insert,
+  InsertValue,
   JoinKind,
   Literal,
   OrderKey,
@@ -27,13 +30,18 @@ import type {
 } from "./ast.ts";
 import {
   type CheckConstraint,
+  type ColField,
+  type ColType,
   type Column,
+  type CompositeField,
+  type CompositeType,
   type DefaultExpr,
   type IndexDef,
   type Table,
   columnIndex,
   pkIndices,
   primaryKeyIndex,
+  resolveColType,
 } from "./catalog.ts";
 import { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
@@ -49,7 +57,7 @@ import {
   workMul,
 } from "./decimal.ts";
 import { encodeInt } from "./encoding.ts";
-import { type EngineError, engineError } from "./errors.ts";
+import { EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
 import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
 import { dirname } from "node:path";
@@ -58,7 +66,10 @@ import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
   type ScalarType,
+  type Type,
   canonicalName,
+  compositeT,
+  isCompositeType,
   inRange,
   isBool,
   isBytea,
@@ -73,7 +84,14 @@ import {
   promoteFloat,
   rank,
   roundToWidth,
+  scalarT,
   scalarTypeFromName,
+  typeCanonicalName,
+  typeIsInteger,
+  typeIsTimestamp,
+  typeIsTimestamptz,
+  typeIsUuid,
+  typeScalar,
   widthBytes,
 } from "./types.ts";
 import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
@@ -104,6 +122,7 @@ import {
   canonFloat,
   compareBytea,
   compareTextC,
+  compositeValue,
   decimalValue,
   eq3,
   float32Value,
@@ -112,11 +131,13 @@ import {
   from3,
   gt3,
   intValue,
+  isNullTest,
   isTrue,
   lt3,
   notDistinctFrom,
   nullValue,
   parseByteaHex,
+  parseRecordTokens,
   parseUuid,
   renderByteaHex,
   renderFloat,
@@ -171,6 +192,12 @@ export class Snapshot {
   // txid is the snapshot's version — the commit counter (transactions.md §8; the watermark unit).
   txid: bigint;
   tables: Map<string, Table>;
+  // types holds the user-defined composite (row) types, keyed by lowercased name
+  // (spec/design/composite.md). A database-level object set, separate from tables; serialized into
+  // the catalog's composite-type entries (spec/fileformat/format.md). Sorted by key when serialized
+  // so map-iteration order never leaks (CLAUDE.md §8). CompositeType objects are never mutated in
+  // place (only added/removed), so the shallow Map copy in clone is safe.
+  types: Map<string, CompositeType>;
   stores: Map<string, TableStore>;
   // indexStores holds each secondary index's B-tree (spec/design/indexes.md §3): a
   // TableStore with ZERO value columns (entry keys only — the on-disk empty-payload
@@ -184,27 +211,119 @@ export class Snapshot {
     tables: Map<string, Table> = new Map(),
     stores: Map<string, TableStore> = new Map(),
     indexStores: Map<string, TableStore> = new Map(),
+    types: Map<string, CompositeType> = new Map(),
   ) {
     this.txid = txid;
     this.tables = tables;
     this.stores = stores;
     this.indexStores = indexStores;
+    this.types = types;
   }
 
-  // clone returns an independent copy: the catalog map is shallow (Table objects are never mutated
-  // in place — only added/removed) and each store is an O(1) persistent-map clone (pmap.ts).
+  // clone returns an independent copy: the catalog maps are shallow (Table / CompositeType objects
+  // are never mutated in place — only added/removed) and each store is an O(1) persistent-map clone
+  // (pmap.ts).
   clone(): Snapshot {
     return new Snapshot(
       this.txid,
       new Map(this.tables),
       cloneStores(this.stores),
       cloneStores(this.indexStores),
+      new Map(this.types),
     );
   }
 
   // table looks up a table definition by name (case-insensitive).
   table(name: string): Table | undefined {
     return this.tables.get(name.toLowerCase());
+  }
+
+  // compositeType looks up a composite type definition by name (case-insensitive).
+  compositeType(name: string): CompositeType | undefined {
+    return this.types.get(name.toLowerCase());
+  }
+
+  // putType registers a composite type (CREATE TYPE). Lower-cased name is the key. The caller has
+  // already resolved field types and checked for a duplicate.
+  putType(ty: CompositeType): void {
+    this.types.set(ty.name.toLowerCase(), ty);
+  }
+
+  // removeType removes a composite type (DROP TYPE). The caller has checked there are no dependents.
+  removeType(key: string): void {
+    this.types.delete(key);
+  }
+
+  // compositeTypesSorted is all composite types in ascending lowercased-name order — the on-disk
+  // emission order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak
+  // (§8). Keys are ASCII (so code-unit sort == byte sort).
+  compositeTypesSorted(): CompositeType[] {
+    return [...this.types.keys()].sort().map((k) => this.types.get(k)!);
+  }
+
+  // compositeDependent reports whether any table column or composite-type field still references the
+  // composite type `name` (case-insensitive) — the DROP TYPE ... RESTRICT dependency check (2BP01).
+  // Returns the first dependent's description for the error detail, or null if there are none.
+  compositeDependent(name: string): string | null {
+    const key = name.toLowerCase();
+    for (const t of this.tables.values()) {
+      for (const c of t.columns) {
+        if (c.type.kind === "composite" && c.type.name.toLowerCase() === key) {
+          return `column ${c.name} of table ${t.name}`;
+        }
+      }
+    }
+    for (const ct of this.types.values()) {
+      for (const f of ct.fields) {
+        if (f.type.kind === "composite" && f.type.name.toLowerCase() === key) {
+          return `field ${f.name} of type ${ct.name}`;
+        }
+      }
+    }
+    return null;
+  }
+
+  // validateCompositeTypes validates the loaded composite-type catalog (the on-disk two-pass load —
+  // spec/design/composite.md §3): every composite a field references must exist, and the reference
+  // graph must be acyclic. A dangling or cyclic reference is a malformed file (XX001). Called once
+  // after the whole catalog is read.
+  validateCompositeTypes(): void {
+    // Existence: every nested-composite field names a registered type.
+    for (const ct of this.types.values()) {
+      for (const f of ct.fields) {
+        if (f.type.kind === "composite" && this.compositeType(f.type.name) === undefined) {
+          throw engineError(
+            "data_corrupted",
+            `composite type ${ct.name} references unknown type ${f.type.name}`,
+          );
+        }
+      }
+    }
+    // Acyclicity: DFS over the type → referenced-types graph (0 unvisited, 1 on-stack, 2 done).
+    const color = new Map<string, number>();
+    const visit = (key: string): void => {
+      color.set(key, 1);
+      const ct = this.types.get(key);
+      if (ct) {
+        for (const f of ct.fields) {
+          if (f.type.kind === "composite") {
+            const ck = f.type.name.toLowerCase();
+            const c = color.get(ck) ?? 0;
+            if (c === 1) {
+              throw engineError(
+                "data_corrupted",
+                `composite type definition cycle through ${f.type.name}`,
+              );
+            }
+            if (c === 0) visit(ck);
+          }
+        }
+      }
+      color.set(key, 2);
+    };
+    for (const k of [...this.types.keys()]) {
+      if ((color.get(k) ?? 0) === 0) visit(k);
+    }
   }
 
   // store returns a table's store (the table is known to exist).
@@ -217,7 +336,11 @@ export class Snapshot {
   // size-driven split (spec/fileformat/format.md).
   putTable(t: Table, pageSize: number): void {
     const key = t.name.toLowerCase();
-    const colTypes = t.columns.map((c) => c.type);
+    // Resolve each column's ColType against the (already-registered) composite-type catalog —
+    // self-contained codec/coercion trees the store carries, so the value codec never re-walks the
+    // type catalog per row (spec/design/composite.md §4). Composite types are registered before any
+    // table (the types-first catalog emission order), so resolveColType always resolves.
+    const colTypes = t.columns.map((c) => resolveColType(c.type, this.types));
     this.stores.set(key, new TableStore(pageSize - 12, colTypes)); // 12 = PAGE_HEADER
     this.tables.set(key, t);
   }
@@ -455,6 +578,12 @@ export class Database {
     return this.readSnap().table(name);
   }
 
+  // compositeType looks up a composite type definition by name (case-insensitive) in the visible
+  // snapshot (spec/design/composite.md).
+  compositeType(name: string): CompositeType | undefined {
+    return this.readSnap().compositeType(name);
+  }
+
   // tableNames is the canonical name of every table in the visible snapshot, sorted ascending
   // by lowercased name (the catalog's standing order — no map-iteration order may leak,
   // CLAUDE.md §8; keys are ASCII, so code-unit sort == byte sort). Secondary indexes are not
@@ -628,6 +757,12 @@ export class Database {
       case "dropIndex":
         rejectParamsForDDL(params);
         return this.executeDropIndex(stmt);
+      case "createType":
+        rejectParamsForDDL(params);
+        return this.executeCreateType(stmt);
+      case "dropType":
+        rejectParamsForDDL(params);
+        return this.executeDropType(stmt);
       case "insert":
         return this.executeInsert(stmt, params);
       case "select":
@@ -677,19 +812,43 @@ export class Database {
           throw engineError("duplicate_column", "duplicate column name: " + def.name);
         }
       }
-      const [ty, decimal] = resolveTypeAndTypmod(def.typeName, def.typeMod);
+      // Resolve the column type: a built-in scalar, or a user-defined composite referenced by name
+      // (spec/design/composite.md §3). An unknown name is 42704. A composite column carries no typmod
+      // (the composite's fields carry their own); a type modifier written on a composite column is
+      // rejected (0A000). A composite column is storable (the recursive value codec — §4) but never
+      // keyable — the PK gate below rejects it 0A000 (§6).
+      let colType: Type;
+      let decimal: DecimalTypmod | null;
+      const ctype = this.compositeType(def.typeName);
+      if (scalarTypeFromName(def.typeName) !== undefined) {
+        const [s, d] = resolveTypeAndTypmod(def.typeName, def.typeMod);
+        colType = scalarT(s);
+        decimal = d;
+      } else if (ctype !== undefined) {
+        if (def.typeMod !== null) {
+          throw engineError(
+            "feature_not_supported",
+            "a type modifier is not supported for composite type " + def.typeName,
+          );
+        }
+        colType = compositeT(ctype.name);
+        decimal = null;
+      } else {
+        throw engineError("undefined_object", "type does not exist: " + def.typeName);
+      }
       if (def.primaryKey) {
         // Integers and uuid may be a key. uuid is the FIRST non-integer key type — its fixed
         // uuid-raw16 encoding (spec/design/encoding.md §2.7) is exercised. The other non-integer
         // types' order-preserving key encodings (text §2.4, decimal §2.5, bytea §2.6, boolean's
-        // bool-byte) are authored but unexercised, so a text/decimal/bytea/boolean PRIMARY KEY is
-        // a documented 0A000 narrowing (types.md §9/§11/§12/§13), relaxable in a later in-key slice.
-        // timestamp / timestamptz are also allowed — they share the int64 int-be-signflip key
-        // encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
-        if (!isInteger(ty) && !isUuid(ty) && !isTimestamp(ty) && !isTimestamptz(ty)) {
+        // bool-byte, composite §2.10) are authored but unexercised, so a text/decimal/bytea/boolean/
+        // composite PRIMARY KEY is a documented 0A000 narrowing (types.md §9/§11/§12/§13,
+        // composite.md §6), relaxable in a later in-key slice. timestamp / timestamptz are also
+        // allowed — they share the int64 int-be-signflip key encoding (exercised + byte-pinned,
+        // spec/design/timestamp.md §6).
+        if (!typeIsInteger(colType) && !typeIsUuid(colType) && !typeIsTimestamp(colType) && !typeIsTimestamptz(colType)) {
           throw engineError(
             "feature_not_supported",
-            "a " + canonicalName(ty) + " primary key is not supported yet",
+            "a " + typeCanonicalName(colType) + " primary key is not supported yet",
           );
         }
         if (pkSeen) {
@@ -711,15 +870,24 @@ export class Database {
       //     assignable to the column, 42804) and stored as text for per-row eval.
       let def_default: Value | null = null;
       let def_defaultExpr: DefaultExpr | null = null;
-      if (def.default !== null) {
+      if (colType.kind === "composite") {
+        // A DEFAULT on a composite-typed column is not supported this slice (composite.md §12).
+        if (def.default !== null) {
+          throw engineError(
+            "feature_not_supported",
+            "a DEFAULT on a composite-typed column is not supported yet",
+          );
+        }
+      } else if (def.default !== null) {
+        const sty = colType.scalar;
         if (def.default.expr.kind === "literal") {
-          def_default = storeValue(literalToValue(def.default.expr.literal), ty, decimal, false, def.name);
+          def_default = storeValue(literalToValue(def.default.expr.literal), sty, decimal, false, def.name);
         } else {
           rejectDefaultStructure(def.default.expr);
-          const { type: rt } = resolve(Scope.empty(this), def.default.expr, ty, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes());
-          if (!assignableTo(rt, ty)) {
+          const { type: rt } = resolve(Scope.empty(this), def.default.expr, sty, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes());
+          if (!assignableTo(rt, sty)) {
             throw typeError(
-              `column ${def.name} is of type ${canonicalName(ty)} but default expression is of type ${rtName(rt)}`,
+              `column ${def.name} is of type ${canonicalName(sty)} but default expression is of type ${rtName(rt)}`,
             );
           }
           def_defaultExpr = { exprText: def.default.text, expr: def.default.expr };
@@ -727,7 +895,7 @@ export class Database {
       }
       columns.push({
         name: def.name,
-        type: ty,
+        type: colType,
         decimal,
         primaryKey: def.primaryKey,
         notNull: def.primaryKey || def.notNull, // PRIMARY KEY ⇒ NOT NULL
@@ -767,10 +935,10 @@ export class Database {
       }
       for (const i of indices) {
         const ty = columns[i]!.type;
-        if (!isInteger(ty) && !isUuid(ty) && !isTimestamp(ty) && !isTimestamptz(ty)) {
+        if (!typeIsInteger(ty) && !typeIsUuid(ty) && !typeIsTimestamp(ty) && !typeIsTimestamptz(ty)) {
           throw engineError(
             "feature_not_supported",
-            "a " + canonicalName(ty) + " primary key is not supported yet",
+            "a " + typeCanonicalName(ty) + " primary key is not supported yet",
           );
         }
         columns[i]!.primaryKey = true;
@@ -805,10 +973,10 @@ export class Database {
       }
       for (const i of indices) {
         const ty = columns[i]!.type;
-        if (!isInteger(ty) && !isUuid(ty) && !isTimestamp(ty) && !isTimestamptz(ty)) {
+        if (!typeIsInteger(ty) && !typeIsUuid(ty) && !typeIsTimestamp(ty) && !typeIsTimestamptz(ty)) {
           throw engineError(
             "feature_not_supported",
-            "a " + canonicalName(ty) + " unique constraint member is not supported yet",
+            "a " + typeCanonicalName(ty) + " unique constraint member is not supported yet",
           );
         }
       }
@@ -961,7 +1129,7 @@ export class Database {
   private resolveDefaultExprs(table: Table): (RExpr | null)[] {
     return table.columns.map((col) => {
       if (col.defaultExpr === null) return null;
-      return resolve(Scope.empty(this), col.defaultExpr.expr, col.type, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes()).node;
+      return resolve(Scope.empty(this), col.defaultExpr.expr, typeScalar(col.type), { collecting: false, groupKeys: [], specs: [] }, new ParamTypes()).node;
     });
   }
 
@@ -1036,10 +1204,10 @@ export class Database {
         throw engineError("undefined_column", "column does not exist: " + name);
       }
       const ty = columns[idx]!.type;
-      if (!isInteger(ty) && !isUuid(ty) && !isTimestamp(ty) && !isTimestamptz(ty)) {
+      if (!typeIsInteger(ty) && !typeIsUuid(ty) && !typeIsTimestamp(ty) && !typeIsTimestamptz(ty)) {
         throw engineError(
           "feature_not_supported",
-          "a " + canonicalName(ty) + " index column is not supported yet",
+          "a " + typeCanonicalName(ty) + " index column is not supported yet",
         );
       }
       // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
@@ -1124,6 +1292,64 @@ export class Database {
       throw engineError("undefined_object", "index does not exist: " + di.name);
     }
     this.working().removeIndex(found[0], di.name.toLowerCase());
+    return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // executeCreateType analyzes and runs a CREATE TYPE (spec/design/composite.md): reject a
+  // duplicate type name (42710), resolve each field's type (a built-in scalar, or a
+  // *previously-defined* composite — 42704 if unknown; no self- or forward-reference), reject a
+  // duplicate field name (42701), then register the composite type in the catalog. Named
+  // composites only.
+  private executeCreateType(ct: CreateType): Outcome {
+    if (this.compositeType(ct.name) !== undefined) {
+      throw engineError("duplicate_object", "type " + ct.name + " already exists");
+    }
+    const fields: CompositeField[] = [];
+    for (const f of ct.fields) {
+      for (const g of fields) {
+        if (g.name.toLowerCase() === f.name.toLowerCase()) {
+          throw engineError("duplicate_column", "attribute " + f.name + " specified more than once");
+        }
+      }
+      let fty: Type;
+      let fdecimal: DecimalTypmod | null = null;
+      if (scalarTypeFromName(f.typeName) !== undefined) {
+        const [s, d] = resolveTypeAndTypmod(f.typeName, f.typeMod);
+        fty = scalarT(s);
+        fdecimal = d;
+      } else if (this.compositeType(f.typeName) !== undefined) {
+        if (f.typeMod !== null) {
+          throw engineError(
+            "feature_not_supported",
+            "a type modifier is not supported for composite type " + f.typeName,
+          );
+        }
+        fty = compositeT(f.typeName);
+      } else {
+        throw engineError("undefined_object", "type does not exist: " + f.typeName);
+      }
+      fields.push({ name: f.name, type: fty, decimal: fdecimal, notNull: f.notNull });
+    }
+    this.working().putType({ name: ct.name, fields });
+    return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // executeDropType analyzes and runs a DROP TYPE (spec/design/composite.md §7). RESTRICT (the only
+  // behavior this slice): a missing type is 42704 unless IF EXISTS; if any table column or composite
+  // field still references the type, 2BP01; otherwise remove it from the catalog.
+  private executeDropType(dt: DropType): Outcome {
+    if (this.compositeType(dt.name) === undefined) {
+      if (dt.ifExists) return { kind: "statement", cost: 0n, rowsAffected: null };
+      throw engineError("undefined_object", "type does not exist: " + dt.name);
+    }
+    const dep = this.readSnap().compositeDependent(dt.name);
+    if (dep !== null) {
+      throw engineError(
+        "dependent_objects_still_exist",
+        "cannot drop type " + dt.name + " because other objects depend on it: " + dep,
+      );
+    }
+    this.working().removeType(dt.name.toLowerCase());
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -1276,10 +1502,19 @@ export class Database {
       // and enforces NOT NULL.
       for (let i = 0; i < n; i++) {
         const p = provided[i]!;
-        if (p >= 0 && !assignableTo(q.columnTypes[p]!, table.columns[i]!.type)) {
-          const col = table.columns[i]!;
+        if (p < 0) continue;
+        const col = table.columns[i]!;
+        // INSERT ... SELECT into a composite column lands in a later slice (the VALUES + ROW(…)
+        // path is S3 — spec/design/composite.md §12).
+        if (col.type.kind === "composite") {
+          throw engineError(
+            "feature_not_supported",
+            "INSERT ... SELECT into composite column " + col.name + " is not supported yet",
+          );
+        }
+        if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
           throw typeError(
-            `column ${col.name} is of type ${canonicalName(col.type)} but expression is of type ${rtName(q.columnTypes[p]!)}`,
+            `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(q.columnTypes[p]!)}`,
           );
         }
       }
@@ -1309,7 +1544,12 @@ export class Database {
         const p = provided[i]!;
         if (p >= 0 && p < values.length) {
           const iv = values[p]!;
-          if (iv.kind === "param") ptypes.note(iv.index - 1, table.columns[i]!.type);
+          // A top-level $N slot takes its target column's scalar type; a composite-column param
+          // stays untyped (42P18 at finalize this slice — materializeInsertValue handles ROW(…)).
+          const ct = table.columns[i]!.type;
+          if (iv.kind === "param" && ct.kind === "scalar") {
+            ptypes.note(iv.index - 1, ct.scalar);
+          }
         }
       }
     }
@@ -1339,9 +1579,11 @@ export class Database {
         const p = provided[i]!;
         if (p >= 0) {
           const iv = values[p]!;
+          // DEFAULT at the top level → the column's default (constant or per-row expression). A
+          // ROW(…) / literal / $N slot is materialized against the column's resolved ColType
+          // (composite-aware — composite.md §1/§4); coerceForStore in insertRows then range-checks.
           if (iv.kind === "default") rv[p] = this.evalDefault(col, defaultExprs[i]!, stmtRng, meter);
-          else if (iv.kind === "param") rv[p] = bound[iv.index - 1]!;
-          else rv[p] = literalToValue(iv.lit);
+          else rv[p] = materializeInsertValue(iv, store.columnTypes()[i]!, bound);
         }
       }
       rows.push(rv);
@@ -1383,6 +1625,9 @@ export class Database {
     meter: Meter,
   ): Value[][] | null {
     const n = table.columns.length;
+    // The columns' resolved ColTypes (a scalar, or a composite resolved to its field tree), for
+    // composite-aware store coercion (spec/design/composite.md §4).
+    const colTypes = store.columnTypes();
     const prepared: { key: Uint8Array | null; row: Row }[] = [];
     const seenKeys = new Set<string>();
     // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
@@ -1400,7 +1645,7 @@ export class Database {
         // charges operator_eval for an expression default; a constant (or no default → NULL) is
         // free.
         const candidate: Value = p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-        row[i] = storeValue(candidate, col.type, col.decimal, col.notNull, col.name);
+        row[i] = coerceForStore(candidate, colTypes[i]!, col.decimal, col.notNull, col.name);
       }
 
       // CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
@@ -1435,10 +1680,10 @@ export class Database {
             // encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
             parts.push(pkv.bytes.slice());
           } else if (pkv.kind === "int") {
-            parts.push(encodeInt(table.columns[i]!.type, pkv.int));
+            parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.int));
           } else if (pkv.kind === "timestamp" || pkv.kind === "timestamptz") {
             // A timestamp / timestamptz PK encodes its int64 instant (spec/design/timestamp.md §6).
-            parts.push(encodeInt(table.columns[i]!.type, pkv.micros));
+            parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.micros));
           } else {
             throw engineError("data_corrupted", "a primary key must be an integer, uuid, or timestamp value");
           }
@@ -1710,12 +1955,18 @@ export class Database {
         }
       }
       const col = table.columns[idx]!;
+      // Updating a composite-typed column lands in a later slice (the storable + INSERT/SELECT
+      // round-trip is S3 — spec/design/composite.md §12); reject it for now (0A000).
+      if (col.type.kind === "composite") {
+        throw engineError("feature_not_supported", "updating composite column " + a.column + " is not supported yet");
+      }
+      const targetScalar = col.type.scalar;
       // The RHS is a general expression evaluated against the OLD row; a literal operand
       // adapts to the target column's type. The result must be assignable to the column's
       // family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-      const { node, type } = resolve(scope, a.value, col.type, { collecting: false, groupKeys: [], specs: [] }, ptypes);
-      requireAssignable(type, col.type, a.column);
-      plans.push({ idx, name: col.name, target: col.type, decimal: col.decimal, notNull: col.notNull, source: node });
+      const { node, type } = resolve(scope, a.value, targetScalar, { collecting: false, groupKeys: [], specs: [] }, ptypes);
+      requireAssignable(type, targetScalar, a.column);
+      plans.push({ idx, name: col.name, target: targetScalar, decimal: col.decimal, notNull: col.notNull, source: node });
     }
 
     let filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
@@ -2252,7 +2503,7 @@ export class Database {
     const colName = alias ?? "generate_series";
     const table: Table = {
       name: "generate_series",
-      columns: [{ name: colName, type: colType, decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null }],
+      columns: [{ name: colName, type: scalarT(colType), decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null }],
       pk: [],
       checks: [],
       indexes: [],
@@ -2815,6 +3066,12 @@ export class Database {
       case "scalarFunc":
         e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, cost));
         return e;
+      case "row":
+        e.fields = e.fields.map((f) => this.foldUncorrelatedInRExpr(f, bound, cost));
+        return e;
+      case "field":
+        e.base = this.foldUncorrelatedInRExpr(e.base, bound, cost);
+        return e;
       case "inValues":
         e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
         return e;
@@ -2877,19 +3134,19 @@ type IndexBound = { nameKey: string; colType: ScalarType; eqs: RExpr[]; tailType
 function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
   const pkLocal = primaryKeyIndex(rel.table);
   if (pkLocal >= 0) {
-    const bp = detectPkBound(filter, rel.offset + pkLocal, rel.table.columns[pkLocal]!.type);
+    const bp = detectPkBound(filter, rel.offset + pkLocal, typeScalar(rel.table.columns[pkLocal]!.type));
     if (bp !== null) return { kind: "pk", pk: bp };
   }
   for (const idx of rel.table.indexes) {
     const ci = idx.columns[0]!;
-    const ty = rel.table.columns[ci]!.type;
+    const ty = typeScalar(rel.table.columns[ci]!.type);
     const bp = detectPkBound(filter, rel.offset + ci, ty);
     const eqs: RExpr[] = [];
     if (bp !== null) {
       for (const t of bp.terms) if (t.op === "eq") eqs.push(t.src);
     }
     if (eqs.length > 0) {
-      const tailTypes = idx.columns.slice(1).map((c) => rel.table.columns[c]!.type);
+      const tailTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
       return { kind: "index", index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, tailTypes } };
     }
   }
@@ -2908,11 +3165,11 @@ function indexEntryKey(columns: Column[], def: IndexDef, storageKey: Uint8Array,
     if (v.kind === "null") {
       parts.push(Uint8Array.of(0x01));
     } else if (v.kind === "int") {
-      parts.push(Uint8Array.of(0x00), encodeInt(columns[ci]!.type, v.int));
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.int));
     } else if (v.kind === "uuid") {
       parts.push(Uint8Array.of(0x00), v.bytes);
     } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
-      parts.push(Uint8Array.of(0x00), encodeInt(columns[ci]!.type, v.micros));
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.micros));
     } else {
       throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
     }
@@ -2939,11 +3196,11 @@ function indexPrefixKey(columns: Column[], def: IndexDef, row: Row): Uint8Array 
     if (v.kind === "null") {
       return null;
     } else if (v.kind === "int") {
-      parts.push(Uint8Array.of(0x00), encodeInt(columns[ci]!.type, v.int));
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.int));
     } else if (v.kind === "uuid") {
       parts.push(Uint8Array.of(0x00), v.bytes);
     } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
-      parts.push(Uint8Array.of(0x00), encodeInt(columns[ci]!.type, v.micros));
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.micros));
     } else {
       throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
     }
@@ -3184,7 +3441,7 @@ function mutationPkBound(table: Table, filter: RExpr | null): PkBound | null {
   if (filter === null) return null;
   const pkIdx = primaryKeyIndex(table);
   if (pkIdx < 0) return null;
-  return detectPkBound(filter, pkIdx, table.columns[pkIdx]!.type);
+  return detectPkBound(filter, pkIdx, typeScalar(table.columns[pkIdx]!.type));
 }
 
 // scanEntries returns the (key,row) entries a mutation scans + the page_read node count: a primary-key
@@ -3264,6 +3521,10 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       );
     case "scalarFunc":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
+    case "row":
+      return e.fields.some((f) => rexprReferencesOuter(f, depth));
+    case "field":
+      return rexprReferencesOuter(e.base, depth);
     default:
       return false; // leaves: column, param, const*
   }
@@ -3316,6 +3577,12 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "scalarFunc":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
+    case "row":
+      for (const f of e.fields) collectTouched(f, depth, touched);
+      return;
+    case "field":
+      collectTouched(e.base, depth, touched);
+      return;
     default: // leaves: param, const*
   }
 }
@@ -3358,6 +3625,10 @@ function valueToRExpr(v: Value): RExpr {
       return { kind: "constTimestamptz", value: v.micros };
     case "interval":
       return { kind: "constInterval", value: v.iv };
+    case "composite":
+      // A folded composite constant: fold each field and wrap in a ROW node so eval rebuilds the
+      // composite value (spec/design/composite.md).
+      return { kind: "row", fields: v.fields.map(valueToRExpr) };
     default:
       return { kind: "constNull" };
   }
@@ -3369,9 +3640,21 @@ function valueToRExpr(v: Value): RExpr {
 // NULL == NULL falls out (both encode "n"), matching the NULL-safe DISTINCT rule. Ints use
 // bigint.toString() — exact, never the lossy `number` path (CLAUDE.md §8).
 function distinctRowKey(row: Value[]): string {
-  return row
-    .map((v) => {
+  return row.map(distinctValueKey).join("|");
+}
+
+// distinctValueKey encodes one value into a collision-free string key for DISTINCT/GROUP BY dedup
+// (spec/design/grammar.md §11). A composite recurses element-wise under a length-prefixed 'c' tag,
+// so composites group/dedup structurally — NULL-safe, with NULL fields included (spec/design/composite.md
+// §5). Shared by distinctRowKey (which joins the per-field keys with a separator no scalar key can
+// contain).
+function distinctValueKey(v: Value): string {
+  {
       switch (v.kind) {
+        case "composite":
+          // Length-prefix the field count and each field's key so a composite never collides with a
+          // scalar key and nested composites stay unambiguous.
+          return "c" + v.fields.length.toString() + ":" + v.fields.map((f) => distinctValueKey(f)).join(",");
         case "null":
           return "n";
         case "int":
@@ -3419,9 +3702,11 @@ function distinctRowKey(row: Value[]): string {
             (v.kind === "float32" ? "f" : "g") +
             (Number.isNaN(v.value) ? "NaN" : renderFloat(canonFloat(v.value)))
           );
+        default:
+          // unfetched never reaches a projected dedup row (the scan layer resolves touched columns).
+          throw new Error("BUG: unfetched large value escaped the storage layer");
       }
-    })
-    .join("|");
+  }
 }
 
 // ============================================================================
@@ -3450,6 +3735,11 @@ type ResolvedType =
   | { kind: "timestamp" } // zoneless instant; does not compare/cast to timestamptz
   | { kind: "timestamptz" } // UTC instant; does not compare/cast to timestamp
   | { kind: "interval" } // a span; compares only with itself, by the canonical span
+  // A composite (row) type (spec/design/composite.md §5). `name` is non-null for a named catalog
+  // type — rendered in the `# types:` output and the basis for cross-comparability — or null for an
+  // anonymous ROW(...) result. `fields` are the resolved (name, type) pairs in declaration order
+  // (the basis for field access — S4 — and structural assignability).
+  | { kind: "composite"; name: string | null; fields: { name: string; type: ResolvedType }[] }
   | { kind: "null" };
 
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
@@ -3473,6 +3763,14 @@ type RExpr =
   | { kind: "constTimestamptz"; value: bigint }
   | { kind: "constInterval"; value: Interval }
   | { kind: "constNull" }
+  // A ROW(...) constructor (spec/design/composite.md §1): evaluate each field and assemble a
+  // composite value. Also the folded form of a composite constant (valueToRExpr wraps each field's
+  // constant). One operator_eval per node (cost.md §9).
+  | { kind: "row"; fields: RExpr[] }
+  // Field selection `(composite).field` (spec/design/composite.md §S4): evaluate `base` to a
+  // composite value and return its `index`-th field (the field ordinal, fixed at resolve). A
+  // whole-value-NULL composite yields NULL for any field. One operator_eval per node.
+  | { kind: "field"; base: RExpr; index: number }
   | { kind: "cast"; target: ScalarType; typmod: DecimalTypmod | null; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
   | { kind: "not"; operand: RExpr }
@@ -3889,6 +4187,11 @@ function exprHasAggregate(e: Expr): boolean {
         e.whens.some((w) => exprHasAggregate(w.cond) || exprHasAggregate(w.result)) ||
         (e.els !== null && exprHasAggregate(e.els))
       );
+    case "row":
+      return e.fields.some(exprHasAggregate);
+    case "fieldAccess":
+    case "fieldStar":
+      return exprHasAggregate(e.base);
     default:
       return false;
   }
@@ -3958,6 +4261,12 @@ function rejectCheckStructure(e: Expr): void {
       }
       if (e.els !== null) rejectCheckStructure(e.els);
       return;
+    case "row":
+      for (const f of e.fields) rejectCheckStructure(f);
+      return;
+    case "fieldAccess":
+    case "fieldStar":
+      return rejectCheckStructure(e.base);
     default: // column, qualifiedColumn, literal
       return;
   }
@@ -4012,6 +4321,12 @@ function rejectDefaultStructure(e: Expr): void {
       }
       if (e.els !== null) rejectDefaultStructure(e.els);
       return;
+    case "row":
+      for (const f of e.fields) rejectDefaultStructure(f);
+      return;
+    case "fieldAccess":
+    case "fieldStar":
+      return rejectDefaultStructure(e.base);
     default: // literal, typedLiteral
       return;
   }
@@ -4064,6 +4379,12 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
       case "funcCall":
         for (const a of e.args) walk(a);
         return;
+      case "row":
+        for (const f of e.fields) walk(f);
+        return;
+      case "fieldAccess":
+      case "fieldStar":
+        return walk(e.base);
       default: // literal, param; subqueries unreachable in a validated check
         return;
     }
@@ -4122,7 +4443,7 @@ function resolveAggregate(
 // be a grouping key — resolved to its synthetic-row slot (its position among the group keys) —
 // else 42803.
 function collectColumn(scope: Scope, ag: AggCtx, idx: number, name: string): { node: RExpr; type: ResolvedType } {
-  const type = resolvedTypeOf(scope.columnAt(idx).type);
+  const type = resolvedTypeOfCol(scope.columnAt(idx).type, scope.catalog);
   if (!ag.collecting) return { node: { kind: "column", index: idx }, type };
   const pos = ag.groupKeys.indexOf(idx);
   if (pos < 0) throw groupingErrorColumn(name);
@@ -4174,6 +4495,10 @@ function argFamily(t: ResolvedType): string | null {
       return "timestamptz";
     case "interval":
       return "interval";
+    case "composite":
+      // No catalog function takes a composite this slice; it matches no concrete family (only the
+      // wildcard "any" slot, via familyMatches) — spec/design/composite.md.
+      return null;
     case "null":
       return null;
   }
@@ -4662,6 +4987,21 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
   return { kind: "int", ty };
 }
 
+// resolvedTypeOfCol is the resolved (static) type of a column of catalog type `ty` — a scalar via
+// resolvedTypeOf, or a composite resolved to a CompositeRType (its name + the resolved field types,
+// recursing) against the database's composite-type catalog (spec/design/composite.md §5). The
+// composite reference is guaranteed to resolve (CREATE TYPE / the two-pass load validated it).
+function resolvedTypeOfCol(ty: Type, db: Database): ResolvedType {
+  if (ty.kind === "scalar") return resolvedTypeOf(ty.scalar);
+  const def = db.compositeType(ty.name);
+  if (def === undefined) throw new Error("composite type reference resolved at load / CREATE TYPE");
+  return {
+    kind: "composite",
+    name: def.name,
+    fields: def.fields.map((f) => ({ name: f.name, type: resolvedTypeOfCol(f.type, db) })),
+  };
+}
+
 // assignableTo reports whether a projected value of type `t` is assignable to a `colTy` column
 // for storage — the FAMILY-level gate INSERT ... SELECT applies up front (spec/design/grammar.md
 // §24), before any row is produced (so it fires even over an empty source). It is the
@@ -4677,6 +5017,10 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
   switch (t.kind) {
     case "null":
       return true;
+    // A composite source never assigns to a scalar column (the composite-target case is handled
+    // structurally at the call site — spec/design/composite.md §4).
+    case "composite":
+      return false;
     case "int":
       return isInteger(colTy) || isDecimal(colTy);
     case "decimal":
@@ -4741,6 +5085,9 @@ function rtName(t: ResolvedType): string {
       return "timestamptz";
     case "interval":
       return "interval";
+    case "composite":
+      // A named composite is its type name; an anonymous ROW(...) is `record` (PG).
+      return t.name ?? "record";
     case "null":
       return "unknown";
   }
@@ -4819,6 +5166,8 @@ export function stmtIsWrite(stmt: Statement): boolean {
     stmt.kind === "dropTable" ||
     stmt.kind === "createIndex" ||
     stmt.kind === "dropIndex" ||
+    stmt.kind === "createType" ||
+    stmt.kind === "dropType" ||
     stmt.kind === "insert" ||
     stmt.kind === "update" ||
     stmt.kind === "delete"
@@ -4837,6 +5186,10 @@ function stmtKind(stmt: Statement): string {
       return "CREATE INDEX";
     case "dropIndex":
       return "DROP INDEX";
+    case "createType":
+      return "CREATE TYPE";
+    case "dropType":
+      return "DROP TYPE";
     case "insert":
       return "INSERT";
     case "update":
@@ -4901,7 +5254,7 @@ function resolveProjections(
       r.table.columns.forEach((c, i) => {
         nodes.push({ kind: "column", index: r.offset + i });
         names.push(c.name);
-        types.push(resolvedTypeOf(c.type));
+        types.push(resolvedTypeOfCol(c.type, scope.catalog));
       });
     }
     return { nodes, names, types };
@@ -4910,6 +5263,26 @@ function resolveProjections(
   const names: string[] = [];
   const types: ResolvedType[] = [];
   for (const it of items.items) {
+    // `(expr).*` expands a composite base into one output column per field, in declaration order
+    // (spec/design/composite.md §S4). The base AST is re-resolved per field (Expr is plain data,
+    // resolution is pure) — deterministic. A non-composite base is 42809.
+    if (it.expr.kind === "fieldStar") {
+      const base = it.expr.base;
+      const { type: baseType } = resolve(scope, base, null, ag, params);
+      if (baseType.kind !== "composite") {
+        throw engineError(
+          "wrong_object_type",
+          "column notation .* applied to type " + rtName(baseType) + ", which is not a composite type",
+        );
+      }
+      baseType.fields.forEach((f, i) => {
+        const { node: bn } = resolve(scope, base, null, ag, params);
+        nodes.push({ kind: "field", base: bn, index: i });
+        names.push(f.name);
+        types.push(f.type);
+      });
+      continue;
+    }
     const { node, type } = resolve(scope, it.expr, null, ag, params);
     nodes.push(node);
     types.push(type);
@@ -4924,11 +5297,26 @@ function resolveProjections(
 // known to exist — resolve validated it.
 function outputName(scope: Scope, e: Expr): string {
   // A bare/qualified column takes the catalog's canonical name, whether it resolves to a local
-  // relation or (correlated) an enclosing one — columnOf handles both.
-  if (e.kind === "column") return scope.columnOf(scope.resolveBare(e.name)).name;
-  if (e.kind === "qualifiedColumn") return scope.columnOf(scope.resolveQualified(e.qualifier, e.name)).name;
-  // An un-aliased aggregate call is named by its lowercased function name (PG; §8).
+  // relation or (correlated) an enclosing one — columnOf handles both. A qualifier that names no
+  // relation (the column.field ambiguity fallback) takes the written name (PG; matching Rust).
+  if (e.kind === "column") {
+    try {
+      return scope.columnOf(scope.resolveBare(e.name)).name;
+    } catch {
+      return e.name;
+    }
+  }
+  if (e.kind === "qualifiedColumn") {
+    try {
+      return scope.columnOf(scope.resolveQualified(e.qualifier, e.name)).name;
+    } catch {
+      return e.name;
+    }
+  }
+  // An un-aliased aggregate call is named by its lowercased function name (PG; §8). A field
+  // selection takes the FIELD name lowercased (PG names the output column after the field).
   if (e.kind === "funcCall") return e.name.toLowerCase();
+  if (e.kind === "fieldAccess") return e.field.toLowerCase();
   return "?column?";
 }
 
@@ -4954,7 +5342,29 @@ function resolveColumnRef(
   name: string,
 ): { node: RExpr; type: ResolvedType } {
   if (r.level === 0) return collectColumn(scope, ag, r.index, name);
-  return { node: { kind: "outerColumn", level: r.level, index: r.index }, type: resolvedTypeOf(scope.columnOf(r).type) };
+  return { node: { kind: "outerColumn", level: r.level, index: r.index }, type: resolvedTypeOfCol(scope.columnOf(r).type, scope.catalog) };
+}
+
+// resolveFieldOf resolves a composite field selection `base.field` (spec/design/composite.md §S4)
+// given the already-resolved `base` node and its static type: `base` must be composite — else 42809
+// (wrong_object_type, PG's "column notation applied to non-composite") — and `field` must name one
+// of its fields case-insensitively (PG folds the identifier), else 42703 (undefined_column). Returns
+// the `field` RExpr node carrying the fixed field ordinal, plus the field's static type.
+function resolveFieldOf(
+  baseNode: RExpr,
+  baseType: ResolvedType,
+  field: string,
+): { node: RExpr; type: ResolvedType } {
+  if (baseType.kind !== "composite") {
+    throw engineError(
+      "wrong_object_type",
+      "column notation ." + field + " applied to type " + rtName(baseType) + ", which is not a composite type",
+    );
+  }
+  const lower = field.toLowerCase();
+  const idx = baseType.fields.findIndex((f) => f.name.toLowerCase() === lower);
+  if (idx < 0) throw undefinedColumn(field);
+  return { node: { kind: "field", base: baseNode, index: idx }, type: baseType.fields[idx]!.type };
 }
 
 // planSubquery plans a subquery operand against the scope chain (§26). Rejects a non-SELECT context
@@ -4983,14 +5393,42 @@ function resolve(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   switch (e.kind) {
+    case "row": {
+      // A ROW(...) constructor (spec/design/composite.md §1): resolve each field with no type
+      // context (its natural type), producing an ANONYMOUS composite (name = null, fields named
+      // f1, f2, … per PG). Storing it into a named composite column matches structurally
+      // (assignability at the store site coerces each field to the target's declared type).
+      const nodes: RExpr[] = [];
+      const fields: { name: string; type: ResolvedType }[] = [];
+      for (let i = 0; i < e.fields.length; i++) {
+        const { node, type } = resolve(scope, e.fields[i]!, null, ag, params);
+        nodes.push(node);
+        fields.push({ name: "f" + (i + 1), type });
+      }
+      return { node: { kind: "row", fields: nodes }, type: { kind: "composite", name: null, fields } };
+    }
     case "column": {
       // Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
       // (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
       return resolveColumnRef(scope, ag, scope.resolveBare(e.name), e.name);
     }
     case "qualifiedColumn": {
+      // A bare `rel.col` resolves STRICTLY against the FROM relations — `qualifier` MUST name a
+      // relation (else 42P01), matching PostgreSQL. Composite field access on a column is the
+      // PARENS-REQUIRED `(col).field` form (spec/design/composite.md §1/§S4), a fieldAccess node,
+      // never this bare qualified-column path (PG raises 42P01 for the unparenthesized `col.field` /
+      // `t.col.field` spellings).
       return resolveColumnRef(scope, ag, scope.resolveQualified(e.qualifier, e.name), e.name);
     }
+    case "fieldAccess": {
+      // `(expr).field` — composite field selection (spec/design/composite.md §S4).
+      const { node, type } = resolve(scope, e.base, null, ag, params);
+      return resolveFieldOf(node, type, e.field);
+    }
+    case "fieldStar":
+      // `(expr).*` — whole-row expansion is a projection-list construct only; in a scalar
+      // expression position it is unsupported (PG rejects row expansion here — 0A000).
+      throw engineError("feature_not_supported", "row expansion (.*) is not supported in this context");
     case "param": {
       // A bind parameter is an adaptable operand (like an integer/string literal): it takes its
       // type from ctx — the sibling operand, target column, or CAST target. Record the inferred
@@ -5007,6 +5445,10 @@ function resolve(
       // `type 'string'`, equal to CAST('string' AS type) over a string-literal operand. Resolve the
       // type by name (unknown → 42704) and coerce the string to it at resolve, context-free. No
       // typmod rides on the literal (the parser's one-token lookahead admits none).
+      // A composite type name (`addr '(Main,90210)'`) coerces the string via record_in
+      // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
+      const ct = scope.catalog.compositeType(e.typeName);
+      if (ct !== undefined) return coerceStringToComposite(e.text, ct, scope.catalog);
       const [target] = resolveTypeAndTypmod(e.typeName, null);
       return coerceStringLiteral(e.text, target, null);
     }
@@ -5120,6 +5562,30 @@ function resolve(
       };
     }
     case "cast": {
+      // A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
+      // (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
+      // `'(…)'::addr` headline); a bare NULL adapts to the composite; a same-named composite operand
+      // is the identity. Every other operand (a runtime text expression, an anonymous `ROW(…)`) is a
+      // documented 0A000 narrowing this slice — relaxable. A type modifier on a composite is
+      // meaningless (0A000).
+      const ct = scope.catalog.compositeType(e.typeName);
+      if (ct !== undefined) {
+        if (e.typeMod !== null) {
+          throw engineError("feature_not_supported", "a type modifier is not supported on a composite type");
+        }
+        if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
+          return coerceStringToComposite(e.inner.literal.text, ct, scope.catalog);
+        }
+        const inner = resolve(scope, e.inner, null, ag, params);
+        if (inner.type.kind === "null") {
+          return { node: inner.node, type: resolvedTypeOfCol({ kind: "composite", name: ct.name }, scope.catalog) };
+        }
+        // An identical named composite is the identity cast.
+        if (inner.type.kind === "composite" && inner.type.name?.toLowerCase() === ct.name.toLowerCase()) {
+          return inner;
+        }
+        throw engineError("feature_not_supported", "casting to a composite type is only supported from a string literal");
+      }
       const [target, typmod] = resolveTypeAndTypmod(e.typeName, e.typeMod);
       // A string LITERAL operand is coerced to the target at resolve — CAST('42' AS int), the same
       // primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5). The ONLY
@@ -5459,6 +5925,26 @@ function resolveOperandPair(
 // a boolean with a non-boolean, is a 42804 type error — comparison is overloaded across these
 // families but never compares across them.
 function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
+  // Composite comparison is element-wise row comparison (spec/design/composite.md §5): two
+  // composites are comparable iff they have the SAME field count and each corresponding field
+  // pair is itself comparable (recursively — a nested composite recurses here, an anonymous
+  // `ROW(…)` compares against a same-shape named type). A bare NULL is always comparable (the
+  // comparison is unknown). A composite vs any non-composite, or a row-size mismatch, or an
+  // incomparable field pair, is 42804 (S5; the old 0A000 narrowing is lifted).
+  const compL = lt.kind === "composite";
+  const compR = rt.kind === "composite";
+  if (compL && compR) {
+    if (lt.fields.length !== rt.fields.length) {
+      throw typeError("cannot compare rows of different sizes");
+    }
+    for (let i = 0; i < lt.fields.length; i++) {
+      classifyComparable(lt.fields[i]!.type, rt.fields[i]!.type);
+    }
+    return;
+  }
+  if ((compL || compR) && lt.kind !== "null" && rt.kind !== "null") {
+    throw typeError("cannot compare a composite value with a value of a different type");
+  }
   // Boolean compares only with boolean (or NULL); boolean with a number/text is a mismatch.
   const boolL = lt.kind === "bool";
   const boolR = rt.kind === "bool";
@@ -5633,6 +6119,47 @@ function coerceStringLiteral(
       return { node: { kind: "constInt", value: n }, type: { kind: "int", ty: target } };
     }
   }
+}
+
+// coerceStringToComposite coerces a string literal to a named composite via record_in
+// (spec/design/composite.md §8) — the shared primitive behind `'(…)'::addr` and the `addr '(…)'`
+// typed literal. It tokenizes the text (a malformed literal or a field-count mismatch is 22P02
+// "malformed record literal: …"), then coerces each token to its field's declared type: a NULL token
+// (unquoted-empty) becomes a typed NULL; a scalar field reuses the same string-literal coercion as a
+// typed literal (its own parse errors surface — e.g. 22P02 for a non-integer); a nested composite
+// field recurses. Folds to a `row` RExpr of the coerced const field nodes, typed as the named
+// composite (the TS-idiomatic equivalent of the Rust `RExpr::Row` over `ResolvedType::Composite`).
+function coerceStringToComposite(
+  text: string,
+  ct: CompositeType,
+  db: Database,
+): { node: RExpr; type: ResolvedType } {
+  const malformed = (): Error =>
+    engineError("invalid_text_representation", `malformed record literal: "${text}" for type ${ct.name}`);
+  const tokens = parseRecordTokens(text);
+  if (tokens === null || tokens.length !== ct.fields.length) throw malformed();
+  const nodes: RExpr[] = [];
+  const fieldTypes: { name: string; type: ResolvedType }[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]!;
+    const f = ct.fields[i]!;
+    if (tok === null) {
+      // A NULL field: a NULL value, typed by the field's declared type.
+      nodes.push({ kind: "constNull" });
+      fieldTypes.push({ name: f.name, type: resolvedTypeOfCol(f.type, db) });
+    } else if (f.type.kind === "composite") {
+      const nested = db.compositeType(f.type.name);
+      if (nested === undefined) throw new Error("nested composite type resolved at CREATE TYPE / load");
+      const { node, type } = coerceStringToComposite(tok, nested, db);
+      nodes.push(node);
+      fieldTypes.push({ name: f.name, type });
+    } else {
+      const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal);
+      nodes.push(node);
+      fieldTypes.push({ name: f.name, type });
+    }
+  }
+  return { node: { kind: "row", fields: nodes }, type: { kind: "composite", name: ct.name, fields: fieldTypes } };
 }
 
 // parseIntLiteral parses a string literal's content as a signed integer of type ty — the
@@ -6263,6 +6790,76 @@ function literalToValue(lit: Literal): Value {
   }
 }
 
+// coerceForStore coerces a value into a column of resolved ColType (spec/design/composite.md §4):
+// a scalar dispatches to storeValue; a composite to storeComposite. The single store-coercion seam
+// the INSERT/UPDATE paths use.
+function coerceForStore(v: Value, ty: ColType, typmod: DecimalTypmod | null, notNull: boolean, colName: string): Value {
+  if (ty.kind === "scalar") return storeValue(v, ty.scalar, typmod, notNull, colName);
+  return storeComposite(v, ty.name, ty.fields, notNull, colName);
+}
+
+// storeComposite coerces a value into a COMPOSITE column (spec/design/composite.md §4): NULL honours
+// NOT NULL (23502); a composite value must have exactly the declared field count (42804) and each
+// field is coerced to its declared field type via coerceForStore (recursing); any other value is a
+// 42804. A NULL field of a NOT NULL composite field traps 23502.
+function storeComposite(v: Value, typeName: string, fields: ColField[], notNull: boolean, colName: string): Value {
+  if (v.kind === "null") {
+    if (notNull) {
+      throw engineError("not_null_violation", "null value in column " + colName + " violates not-null constraint");
+    }
+    return nullValue();
+  }
+  if (v.kind !== "composite") {
+    throw typeError("cannot store a non-record value in composite column " + colName + " (type " + typeName + ")");
+  }
+  if (v.fields.length !== fields.length) {
+    throw typeError("row has " + v.fields.length + " fields but composite type " + typeName + " has " + fields.length);
+  }
+  const out: Value[] = new Array(fields.length);
+  for (let i = 0; i < fields.length; i++) {
+    const f = fields[i]!;
+    out[i] = coerceForStore(v.fields[i]!, f.type, f.typmod, f.notNull, f.name);
+  }
+  return compositeValue(out);
+}
+
+// materializeInsertValue materializes one INSERT VALUES slot into a Value against the column's
+// resolved ColType (spec/design/composite.md §1/§4): a scalar slot is a literal or a bound $N; a
+// composite slot is a ROW(…) whose fields recurse against the composite's field types, or a bound
+// $N. The result is then fully coerced/range-checked by coerceForStore. DEFAULT is handled by the
+// caller at the top level (it is not a valid field inside a ROW(…)).
+function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): Value {
+  if (ty.kind === "scalar") {
+    switch (iv.kind) {
+      case "lit":
+        return literalToValue(iv.lit);
+      case "param":
+        return bound[iv.index - 1]!;
+      case "row":
+        throw typeError("cannot assign a record value to a " + canonicalName(ty.scalar) + " field");
+      default: // default
+        throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
+    }
+  }
+  // ty is a composite column type.
+  switch (iv.kind) {
+    case "row": {
+      if (iv.fields.length !== ty.fields.length) {
+        throw typeError("ROW has " + iv.fields.length + " fields but composite type " + ty.name + " has " + ty.fields.length);
+      }
+      const vals: Value[] = new Array(ty.fields.length);
+      for (let i = 0; i < ty.fields.length; i++) vals[i] = materializeInsertValue(iv.fields[i]!, ty.fields[i]!.type, bound);
+      return compositeValue(vals);
+    }
+    case "param":
+      return bound[iv.index - 1]!;
+    case "lit":
+      throw typeError("cannot assign a scalar value to composite column (type " + ty.name + ")");
+    default: // default
+      throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
+  }
+}
+
 function overflow(ty: ScalarType): Error {
   return engineError("numeric_value_out_of_range", "value out of range for type " + canonicalName(ty));
 }
@@ -6347,6 +6944,24 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return intervalValue(e.value);
     case "constNull":
       return nullValue();
+    case "row": {
+      // A ROW(...) constructor — one operator_eval, then build the composite from the evaluated
+      // fields (spec/design/composite.md §1, cost.md §9).
+      m.charge(COSTS.operatorEval);
+      const vals: Value[] = new Array(e.fields.length);
+      for (let i = 0; i < e.fields.length; i++) vals[i] = evalExpr(e.fields[i]!, row, env, m);
+      return compositeValue(vals);
+    }
+    case "field": {
+      // Field selection — one operator_eval, then pull the resolved field ordinal out of the
+      // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in range
+      // by construction (resolve fixed it against the static field list).
+      m.charge(COSTS.operatorEval);
+      const base = evalExpr(e.base, row, env, m);
+      if (base.kind === "null") return nullValue();
+      if (base.kind !== "composite") throw typeError("internal: field access on a non-composite value");
+      return base.fields[e.index]!;
+    }
     case "cast": {
       m.charge(COSTS.operatorEval);
       const v = evalExpr(e.operand, row, env, m);
@@ -6483,8 +7098,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
     }
     case "isNull": {
       m.charge(COSTS.operatorEval);
-      const isNull = evalExpr(e.operand, row, env, m).kind === "null";
-      return { kind: "bool", value: isNull !== e.negated };
+      // PG's `IS [NOT] NULL` (spec/design/composite.md §5): for a composite the two are NOT
+      // negations but the all-fields rule (one level deep, not recursive); a scalar follows the
+      // ordinary rule. isNullTest folds both cases. Replaces the old `(v is null) !== negated`.
+      const operand = evalExpr(e.operand, row, env, m);
+      return { kind: "bool", value: isNullTest(operand, e.negated) };
     }
     case "distinct": {
       m.charge(COSTS.operatorEval);
@@ -7038,6 +7656,19 @@ function valueCmp(a: Value, b: Value): number {
   }
   // Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
   if (a.kind === "interval" && b.kind === "interval") return intervalCmp(a.iv, b.iv);
+  // A composite sorts lexicographically, NULLs-last per field (the composite sort key —
+  // spec/design/composite.md §5): the first non-equal field decides, recursing through keyCmp so
+  // per-field NULL placement and nested composites are handled uniformly. The caller's descending
+  // flip in keyCmp reverses the whole tuple. A row-size tie-break keeps it total (same-type rows
+  // have equal arity, so it is only reached for safety).
+  if (a.kind === "composite" && b.kind === "composite") {
+    const n = Math.min(a.fields.length, b.fields.length);
+    for (let i = 0; i < n; i++) {
+      const c = keyCmp(a.fields[i]!, b.fields[i]!, false, false);
+      if (c !== 0) return c;
+    }
+    return a.fields.length < b.fields.length ? -1 : a.fields.length > b.fields.length ? 1 : 0;
+  }
   // Cross-family arms exist only for totality — ORDER BY is over a single typed column, so a
   // mixed pair is unreachable. A fixed family order keeps the comparator total.
   const fr = familyRank(a) - familyRank(b);
@@ -7072,8 +7703,12 @@ function familyRank(v: Value): number {
       return 10;
     case "interval":
       return 11;
-    default:
+    // A composite sorts only against composites of its own type (ORDER BY is single-typed), so this
+    // cross-family rank is only for totality; it sits after the scalar families.
+    case "composite":
       return 12;
+    default:
+      return 13;
   }
 }
 

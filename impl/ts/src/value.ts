@@ -48,6 +48,13 @@ export type Value =
   // Holds a 16-byte Uint8Array — a distinct kind from bytea (renders 8-4-4-4-12, its own
   // comparison family), so a uuid never equals a bytea even with identical bytes.
   | { kind: "uuid"; bytes: Uint8Array }
+  // A composite (row) value — an ordered list of field values, recursive (a field may itself be a
+  // composite) — spec/design/composite.md §2. The field count and per-field types match the value's
+  // composite type; the storage codec / comparator / record_out all recurse over this list.
+  // Equality/hashing (DISTINCT/GROUP BY via the value-key path) and eq3/lt3/gt3 are STRUCTURAL
+  // (element-wise), recursing into each field's own canonical comparison so a float/decimal/interval
+  // field never compares by raw bits (the rule Decimal/Interval already follow).
+  | { kind: "composite"; fields: Value[] }
   // An UNFETCHED large-value reference (spec/design/large-values.md §14): a stored
   // external/compressed value loaded as its on-disk pointer instead of being materialized.
   // Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -157,6 +164,11 @@ export function timestamptzValue(m: bigint): Value {
 // intervalValue builds a non-null interval value.
 export function intervalValue(iv: Interval): Value {
   return { kind: "interval", iv };
+}
+
+// compositeValue builds a composite (row) value from its ordered field values (spec/design/composite.md §2).
+export function compositeValue(fields: Value[]): Value {
+  return { kind: "composite", fields };
 }
 
 // compareBytea compares two byte strings by UNSIGNED byte order (Uint8Array elements are
@@ -344,11 +356,157 @@ export function render(v: Value): string {
       return renderTimestamptz(v.micros);
     case "interval":
       return renderInterval(v.iv);
+    case "composite":
+      // A composite renders as PG record_out: `(f1,f2,…)` with per-field quoting
+      // (spec/design/composite.md §8). The renderer recurses (a composite field's text is itself
+      // quoted because it contains parens/commas).
+      return recordOut(v.fields);
     case "unfetched":
       throw new Error("BUG: unfetched large value escaped the storage layer");
     default:
       return v.int.toString();
   }
+}
+
+// recordOut is PostgreSQL record_out (spec/design/composite.md §8): render a composite's fields as
+// `(f1,f2,…)`. A NULL field is the empty string between delimiters (unquoted); every other field is
+// rendered by its own `render` and double-quoted iff it is empty or contains a delimiter / quote /
+// backslash / whitespace. Inside the quotes PostgreSQL DOUBLES an embedded `"` → `""` and an embedded
+// `\` → `\\` (NOT backslash-escaping — `record_in` is the exact inverse). Recurses naturally — a
+// nested composite's text contains parens/commas, so it is quoted. The spelling must equal PG
+// byte-for-byte (CLAUDE.md §8).
+export function recordOut(fields: Value[]): string {
+  let out = "(";
+  for (let i = 0; i < fields.length; i++) {
+    if (i > 0) out += ",";
+    const f = fields[i]!;
+    if (f.kind === "null") continue; // a NULL field is the empty string between delimiters (unquoted)
+    const s = render(f);
+    if (recordFieldNeedsQuote(s)) {
+      out += '"';
+      for (const ch of s) {
+        // PG doubles `"` and `\` (rowtypes.c record_out): emit the char twice.
+        if (ch === '"' || ch === "\\") out += ch;
+        out += ch;
+      }
+      out += '"';
+    } else {
+      out += s;
+    }
+  }
+  out += ")";
+  return out;
+}
+
+// recordFieldNeedsQuote reports whether a record_out field token must be double-quoted: the empty
+// string, or any token containing a comma, parenthesis, double-quote, backslash, or whitespace
+// (C-locale isspace: space, tab, newline, vertical tab \v=0x0b, form feed \f=0x0c, carriage return)
+// — PostgreSQL's exact rule.
+function recordFieldNeedsQuote(s: string): boolean {
+  if (s.length === 0) return true;
+  for (const c of s) {
+    if (
+      c === '"' ||
+      c === "\\" ||
+      c === "(" ||
+      c === ")" ||
+      c === "," ||
+      c === " " ||
+      c === "\t" ||
+      c === "\n" ||
+      c === "\v" ||
+      c === "\f" ||
+      c === "\r"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// parseRecordTokens is the PostgreSQL record_in tokenizer (spec/design/composite.md §8) — the exact
+// inverse of recordOut. It splits the text of a composite literal `(f1,f2,…)` into its raw field
+// tokens WITHOUT type coercion: the caller (the executor) coerces each token to its field type. A
+// field is either quoted (`"…"` with `""`→`"` and `\x`→`x` un-escaping) or unquoted (read literally
+// up to the next top-level `,`/`)`, with `\x`→`x`); an UNQUOTED EMPTY field is SQL-NULL (null), a
+// quoted empty field is the empty string (""). Surrounding ASCII whitespace around the whole literal
+// is ignored; whitespace INSIDE an unquoted token is preserved (PG leaves trimming to each field's
+// input function). Returns null on a malformed literal — the executor maps that to 22P02 (kept
+// error-free so this module need not depend on the error type). A per-field null means SQL-NULL.
+export function parseRecordTokens(input: string): (string | null)[] | null {
+  const s = input.replace(/^[\t\n\v\f\r ]+/, "").replace(/[\t\n\v\f\r ]+$/, "");
+  let pos = 0;
+  const isWs = (c: string): boolean =>
+    c === " " || c === "\t" || c === "\n" || c === "\v" || c === "\f" || c === "\r";
+  if (s[pos] !== "(") return null;
+  pos++;
+  const fields: (string | null)[] = [];
+  for (;;) {
+    let buf = "";
+    let quoted = false;
+    let present = false;
+    if (s[pos] === '"') {
+      quoted = true;
+      present = true;
+      pos++; // opening quote
+      for (;;) {
+        if (pos >= s.length) return null; // unterminated quoted field
+        const c = s[pos]!;
+        if (c === '"') {
+          pos++;
+          if (s[pos] === '"') {
+            pos++;
+            buf += '"'; // doubled quote → one quote
+          } else {
+            break; // closing quote
+          }
+        } else if (c === "\\") {
+          pos++;
+          if (pos >= s.length) return null;
+          buf += s[pos]!;
+          pos++;
+        } else {
+          buf += c;
+          pos++;
+        }
+      }
+      // A quoted field may be followed by ASCII whitespace before the delimiter (PG).
+      while (pos < s.length && isWs(s[pos]!)) pos++;
+    } else {
+      // Unquoted: read literally until a top-level `,`/`)`, processing `\x`→`x`.
+      for (;;) {
+        if (pos >= s.length) return null; // missing ')'
+        const c = s[pos]!;
+        if (c === "," || c === ")") break;
+        if (c === "\\") {
+          pos++;
+          if (pos >= s.length) return null;
+          buf += s[pos]!;
+          present = true;
+          pos++;
+        } else {
+          buf += c;
+          present = true;
+          pos++;
+        }
+      }
+    }
+    // An unquoted empty field is SQL-NULL; a quoted (even empty) field is the string.
+    fields.push(present || quoted ? buf : null);
+    const d = s[pos];
+    if (d === ",") {
+      pos++;
+      continue;
+    }
+    if (d === ")") {
+      pos++;
+      break;
+    }
+    return null;
+  }
+  // Nothing but trailing nothing may follow the closing ')'.
+  if (pos !== s.length) return null;
+  return fields;
 }
 
 // renderFloat formats a float value's JS number to its conformance text (spec/design/float.md §9):
@@ -391,7 +549,35 @@ export function eq3(a: Value, b: Value): ThreeValued {
   if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros === b.micros);
   // Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
   if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) === 0);
+  // Composite `=` is element-wise 3VL (PG row comparison, spec/design/composite.md §5): FALSE if any
+  // field is FALSE; else UNKNOWN if any field is UNKNOWN; else TRUE. So a FALSE field dominates a
+  // NULL field. Arity matches (the resolver only compares two composites of the same type). The
+  // recursion bottoms out in the field comparators.
+  if (a.kind === "composite" && b.kind === "composite") {
+    let anyUnknown = false;
+    for (let i = 0; i < a.fields.length; i++) {
+      const r = eq3(a.fields[i]!, b.fields[i]!);
+      if (r === "false") return "false";
+      if (r === "unknown") anyUnknown = true;
+    }
+    return anyUnknown ? "unknown" : "true";
+  }
   return "unknown";
+}
+
+// compositeOrder3 is three-valued lexicographic row ordering (PG row comparison,
+// spec/design/composite.md §5), shared by lt3 (gt = false) and gt3 (gt = true): walk fields; the
+// first whose `=` is FALSE decides via that field's `<`/`>`; the first whose `=` is UNKNOWN (a NULL
+// operand) makes the whole comparison UNKNOWN; all-equal rows are neither `<` nor `>` (FALSE). Arity
+// matches (same composite type — the resolver's gate).
+function compositeOrder3(a: Value[], b: Value[], gt: boolean): ThreeValued {
+  for (let i = 0; i < a.length; i++) {
+    const r = eq3(a[i]!, b[i]!);
+    if (r === "true") continue;
+    if (r === "false") return gt ? gt3(a[i]!, b[i]!) : lt3(a[i]!, b[i]!);
+    return "unknown"; // r === "unknown"
+  }
+  return "false";
 }
 
 // lt3 is the three-valued ordering predicate a < b (numerics by value with int↔decimal
@@ -414,6 +600,10 @@ export function lt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros < b.micros);
   if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros < b.micros);
   if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) < 0);
+  // Composite `<` is lexicographic with PG row-comparison NULL propagation (spec/design/composite.md
+  // §5): the first field that is not equal decides via its own `<`; a field whose `=` is UNKNOWN (a
+  // NULL operand) makes the whole comparison UNKNOWN; all-equal rows are not `<`.
+  if (a.kind === "composite" && b.kind === "composite") return compositeOrder3(a.fields, b.fields, false);
   return "unknown";
 }
 
@@ -437,7 +627,25 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros > b.micros);
   if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros > b.micros);
   if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) > 0);
+  // Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
+  if (a.kind === "composite" && b.kind === "composite") return compositeOrder3(a.fields, b.fields, true);
   return "unknown";
+}
+
+// valueEqual is value-level (NULL-safe) structural equality — the basis for DISTINCT/GROUP BY
+// dedup and notDistinctFrom (spec/design/composite.md §5). NULL == NULL is TRUE here (unlike the
+// 3VL eq3); a composite recurses element-wise; every other variant reduces to eq3 (definite when
+// neither side is NULL). NOT used for the WHERE/3VL paths.
+export function valueEqual(a: Value, b: Value): boolean {
+  if (a.kind === "null" || b.kind === "null") return a.kind === "null" && b.kind === "null";
+  if (a.kind === "composite" && b.kind === "composite") {
+    if (a.fields.length !== b.fields.length) return false;
+    for (let i = 0; i < a.fields.length; i++) {
+      if (!valueEqual(a.fields[i]!, b.fields[i]!)) return false;
+    }
+    return true;
+  }
+  return eq3(a, b) === "true";
 }
 
 // notDistinctFrom is NULL-safe equality — the `IS NOT DISTINCT FROM` primitive
@@ -449,7 +657,32 @@ export function gt3(a: Value, b: Value): ThreeValued {
 // reduce to eq3, which is definite when neither side is NULL.)
 export function notDistinctFrom(a: Value, b: Value): boolean {
   if (a.kind === "null" || b.kind === "null") return a.kind === "null" && b.kind === "null";
+  // Two composites are "not distinct" iff structurally equal — NULL-safe, so a NULL field equals a
+  // NULL field (the value-level equality, not the 3VL eq3).
+  if (a.kind === "composite" && b.kind === "composite") return valueEqual(a, b);
   return eq3(a, b) === "true";
+}
+
+// isNullTest is PostgreSQL's `IS [NOT] NULL` test (spec/design/composite.md §5) — for a composite
+// these are **not** negations of each other, they are the all-fields rule, and it is **one level
+// deep, NOT recursive** (the empirically-probed PG 18 behavior — the differential oracle). A field
+// counts as "null" only if it is itself SQL-NULL; a *composite-valued* field is a non-null value, so
+// it counts as PRESENT and is not descended into. negated = false (IS NULL): TRUE iff this value is
+// SQL-NULL OR every immediate field is SQL-NULL. negated = true (IS NOT NULL): TRUE iff this value is
+// non-NULL AND every immediate field is non-SQL-NULL. So `ROW(1, NULL)` is FALSE for both, and
+// `ROW(ROW(NULL,NULL), ROW(NULL,NULL)) IS NULL` is FALSE (the inner rows are non-null values). A
+// scalar follows the ordinary rule. Always definite.
+export function isNullTest(v: Value, negated: boolean): boolean {
+  if (v.kind === "composite") {
+    return negated
+      ? // IS NOT NULL: every immediate field is a non-(SQL-)NULL value.
+        v.fields.every((f) => f.kind !== "null")
+      : // IS NULL: every immediate field is SQL-NULL (a composite field is NOT).
+        v.fields.every((f) => f.kind === "null");
+  }
+  // A whole-value NULL: IS NULL → true, IS NOT NULL → false. Any present scalar is the inverse.
+  if (v.kind === "null") return !negated;
+  return negated;
 }
 
 // --- boolean Value <-> ThreeValued bridges, and the Kleene connectives ----------

@@ -11,7 +11,7 @@
 // size-driven split (spec/fileformat/format.md).
 
 import type { Value } from "./value.ts";
-import type { ScalarType } from "./types.ts";
+import type { ColType } from "./catalog.ts";
 import { PMap, pmapFromLoaded, unboundedBound } from "./pmap.ts";
 import type { KeyBound, LeafSource, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
@@ -28,9 +28,9 @@ export type Entry = { key: Uint8Array; row: Row };
 // with no paging (in-memory) builds none (null) and never faults.
 class PagedSource implements LeafSource {
   private paging: SharedPaging;
-  private colTypes: ScalarType[];
+  private colTypes: ColType[];
 
-  constructor(paging: SharedPaging, colTypes: ScalarType[]) {
+  constructor(paging: SharedPaging, colTypes: ColType[]) {
     this.paging = paging;
     this.colTypes = colTypes;
   }
@@ -50,7 +50,7 @@ export class TableStore {
   // cap is the page payload capacity C = page_size − 12 (the split threshold). colTypes are the
   // column types, for computing record weights (recordSize).
   private cap: number;
-  private colTypes: ScalarType[];
+  private colTypes: ColType[];
   // paging is the shared pager + leaf buffer pool for a file-backed database (spec/design/pager.md):
   // the read/mutation path faults OnDisk leaves through it. null for an in-memory database and for a
   // table created in-session (fully resident until the file is reopened); attached by the demand-paged
@@ -59,7 +59,7 @@ export class TableStore {
 
   constructor(
     cap: number,
-    colTypes: ScalarType[],
+    colTypes: ColType[],
     rows: PMap = new PMap(),
     nextRowid = 0n,
     paging: SharedPaging | null = null,
@@ -303,6 +303,14 @@ export class TableStore {
   // (spec/fileformat/format.md). null for an empty table.
   treeRoot(): PNode | null {
     return this.rows.rootNode();
+  }
+
+  // columnTypes is the store's resolved per-column ColTypes (a scalar, or a composite resolved to
+  // its field tree), for the composite-aware value codec / store coercion (spec/design/composite.md
+  // §4). Built once at putTable and read back by the serializer/loader rather than re-walking the
+  // type catalog on every row.
+  columnTypes(): ColType[] {
+    return this.colTypes;
   }
 
   // setTree installs a loaded B-tree as this store's contents (format.ts loadDatabase).

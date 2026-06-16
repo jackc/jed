@@ -16,7 +16,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::catalog::{CheckConstraint, Column, DefaultExpr, IndexDef, Table};
+use crate::catalog::{
+    CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
+    IndexDef, Table,
+};
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
@@ -26,7 +29,7 @@ use crate::pager::Pager;
 use crate::paging::SharedPaging;
 use crate::pmap::{Child, Node};
 use crate::storage::{Row, TableStore};
-use crate::types::{DecimalTypmod, ScalarType};
+use crate::types::{DecimalTypmod, ScalarType, Type};
 use crate::value::{Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
@@ -34,7 +37,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// On-disk format version — 8 = a per-column expression-default flag (bit3) + expr-text in the
 /// catalog (spec/fileformat/format.md *Version scope*). v7 added a per-page CRC-32 on every body
 /// page (the header grew 12→16 bytes).
-const FORMAT_VERSION: u16 = 8;
+const FORMAT_VERSION: u16 = 9;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -172,7 +175,46 @@ fn page_crc(page: &[u8]) -> u32 {
 /// is caught by the oversized-item rule in `pack` (0A000), so the cast here is sound for
 /// every supported page size (spec/fileformat/format.md). `boolean` is a single
 /// `bool-byte` body — `0x00` false, `0x01` true (types.md §9).
-fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
+/// A **composite** value (spec/design/composite.md §4) is the shared presence tag then a body of
+/// `null-bitmap ‖ each present field's value-codec body` (no per-field tag — the bitmap carries
+/// presence): see [`encode_composite_body`]. Recurses for nested composites.
+fn encode_value(ty: &ColType, v: &Value) -> Vec<u8> {
+    match ty {
+        ColType::Scalar(s) => encode_scalar(*s, v),
+        ColType::Composite { fields, .. } => match v {
+            Value::Null => vec![0x01],
+            Value::Composite(vals) => {
+                let mut out = vec![0x00]; // present
+                out.extend_from_slice(&encode_composite_body(fields, vals));
+                out
+            }
+            _ => panic!("BUG: a non-composite value in a composite column"),
+        },
+    }
+}
+
+/// A composite value's **body** (after the `0x00` present tag, spec/design/composite.md §4): a null
+/// bitmap of `ceil(field_count/8)` bytes (MSB-first — field *i* is bit `0x80 >> (i%8)` of byte
+/// `i/8`; a set bit = NULL) followed by each **present** field's value-codec body in declaration
+/// order. A NULL field contributes zero body bytes; a present field's body is its `encode_value`
+/// minus the leading presence tag (a nested composite recurses).
+fn encode_composite_body(fields: &[ColField], vals: &[Value]) -> Vec<u8> {
+    let nbytes = fields.len().div_ceil(8);
+    let mut bitmap = vec![0u8; nbytes];
+    let mut bodies = Vec::new();
+    for (i, (f, val)) in fields.iter().zip(vals.iter()).enumerate() {
+        if matches!(val, Value::Null) {
+            bitmap[i / 8] |= 0x80 >> (i % 8);
+        } else {
+            bodies.extend_from_slice(&encode_value(&f.ty, val)[1..]);
+        }
+    }
+    bitmap.extend_from_slice(&bodies);
+    bitmap
+}
+
+/// The scalar value codec (the body of [`encode_value`] for a `ColType::Scalar`).
+fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
     match v {
         Value::Null => encode_nullable(ty, None),
         Value::Int(n) => encode_nullable(ty, Some(*n)),
@@ -263,30 +305,37 @@ fn encode_value(ty: ScalarType, v: &Value) -> Vec<u8> {
         // An unfetched reference is resolved before any encode/plan (the scan layer for reads,
         // the mutation path for stores, `resolve_for_encode` at commit — large-values.md §14).
         Value::Unfetched(_) => panic!("BUG: encoding an unfetched large value"),
+        // A composite value is encoded by `encode_value`'s composite arm, never here.
+        Value::Composite(_) => panic!("BUG: a composite value reached the scalar codec"),
     }
 }
 
-/// Whether a value of this type can spill out-of-line (a variable-length type). Fixed-width types
+/// Whether a value of this type can spill out-of-line (a variable-length type). Fixed-width scalars
 /// (`int*`/`boolean`/`uuid`/`timestamp*`) are tiny and always stay inline
-/// (spec/design/large-values.md §12).
-fn is_spillable(ty: ScalarType) -> bool {
-    ty.is_text() || ty.is_bytea() || ty.is_decimal()
+/// (spec/design/large-values.md §12). A **composite** is treated as spillable — its opaque inline
+/// body spills via the same overflow + LZ4 path when a record exceeds `RECORD_MAX`
+/// (spec/design/composite.md §4); a small composite is never actually chosen by the plan.
+fn is_spillable(ty: &ColType) -> bool {
+    match ty {
+        ColType::Scalar(s) => s.is_text() || s.is_bytea() || s.is_decimal(),
+        ColType::Composite { .. } => true,
+    }
 }
 
 /// Whether any column of this row shape can ever spill — the cheap gate that keeps the
 /// overflow-page cost walk (`overflow_page_count`) off tables that cannot have chains.
-pub(crate) fn any_spillable(col_types: &[ScalarType]) -> bool {
-    col_types.iter().any(|&ty| is_spillable(ty))
+pub(crate) fn any_spillable(col_types: &[ColType]) -> bool {
+    col_types.iter().any(is_spillable)
 }
 
 /// Like [`any_spillable`], but only over the columns a query's touched set selects — the gate for
 /// the masked scan-units walk (cost.md §3 "The touched set"): if no *touched* column can spill,
 /// the whole walk yields zero and is skipped.
-pub(crate) fn any_spillable_masked(col_types: &[ScalarType], mask: &[bool]) -> bool {
+pub(crate) fn any_spillable_masked(col_types: &[ColType], mask: &[bool]) -> bool {
     col_types
         .iter()
         .zip(mask.iter())
-        .any(|(&ty, &m)| m && is_spillable(ty))
+        .any(|(ty, &m)| m && is_spillable(ty))
 }
 
 /// The largest a single record may serialize to and still satisfy the B-tree split contract —
@@ -323,16 +372,11 @@ struct RecordPlan {
 /// chain of the compressed block) until the record fits. The size is the **weight** the
 /// page-backed B-tree splits on, shared by the serializer and `record_size`: in-memory node
 /// boundaries must match the serialized pages.
-fn plan_dispositions(
-    col_types: &[ScalarType],
-    key: &[u8],
-    row: &[Value],
-    cap: usize,
-) -> RecordPlan {
+fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usize) -> RecordPlan {
     let inline: Vec<usize> = col_types
         .iter()
         .zip(row.iter())
-        .map(|(ty, v)| encode_value(*ty, v).len())
+        .map(|(ty, v)| encode_value(ty, v).len())
         .collect();
     let mut disp: Vec<Disp> = (0..row.len()).map(|_| Disp::Inline).collect();
     let mut cur = inline.clone();
@@ -351,9 +395,9 @@ fn plan_dispositions(
     // (ceil(raw/cap) value_compress slabs) whether or not store-smaller adopts it.
     let mut cand: Vec<usize> = (0..row.len())
         .filter(|&i| {
-            is_spillable(col_types[i])
+            is_spillable(&col_types[i])
                 && !matches!(row[i], Value::Null)
-                && value_payload(col_types[i], &row[i]).len() >= S_COMPRESS
+                && value_payload(&col_types[i], &row[i]).len() >= S_COMPRESS
         })
         .collect();
     cand.sort_by(|&a, &b| inline[b].cmp(&inline[a]).then(a.cmp(&b)));
@@ -361,7 +405,7 @@ fn plan_dispositions(
         if size <= max {
             break;
         }
-        let payload = value_payload(col_types[i], &row[i]);
+        let payload = value_payload(&col_types[i], &row[i]);
         compress_units += payload.len().div_ceil(cap);
         let comp = crate::lz4::compress(&payload);
         if INLINE_COMP_OVERHEAD + comp.len() < inline[i] {
@@ -381,7 +425,7 @@ fn plan_dispositions(
     // current size first, ties by ascending index. (A NULL is 1 byte and never qualifies.)
     let mut cand: Vec<usize> = (0..row.len())
         .filter(|&i| {
-            is_spillable(col_types[i])
+            is_spillable(&col_types[i])
                 && cur[i]
                     > match disp[i] {
                         Disp::InlineComp(_) => EXTERNAL_COMP_PTR_LEN,
@@ -414,7 +458,7 @@ fn plan_dispositions(
 /// value contributes its compressed inline form, an externalized one its fixed pointer size
 /// (spec/design/large-values.md §12/§13). Must equal the length the serializer produces, so
 /// in-memory node boundaries match the serialized pages.
-pub(crate) fn record_size(col_types: &[ScalarType], key: &[u8], row: &Row, cap: usize) -> usize {
+pub(crate) fn record_size(col_types: &[ColType], key: &[u8], row: &Row, cap: usize) -> usize {
     plan_dispositions(col_types, key, row, cap).size
 }
 
@@ -430,7 +474,7 @@ pub(crate) struct ScanUnits {
 }
 
 pub(crate) fn record_scan_units(
-    col_types: &[ScalarType],
+    col_types: &[ColType],
     key: &[u8],
     row: &Row,
     cap: usize,
@@ -479,14 +523,14 @@ pub(crate) fn record_scan_units(
         match d {
             Disp::Inline => {}
             Disp::External => {
-                units.pages += value_payload(col_types[i], &row[i]).len().div_ceil(cap);
+                units.pages += value_payload(&col_types[i], &row[i]).len().div_ceil(cap);
             }
             Disp::InlineComp(_) => {
-                units.decompress += value_payload(col_types[i], &row[i]).len().div_ceil(cap);
+                units.decompress += value_payload(&col_types[i], &row[i]).len().div_ceil(cap);
             }
             Disp::ExternalComp(c) => {
                 units.pages += c.len().div_ceil(cap);
-                units.decompress += value_payload(col_types[i], &row[i]).len().div_ceil(cap);
+                units.decompress += value_payload(&col_types[i], &row[i]).len().div_ceil(cap);
             }
         }
     }
@@ -497,7 +541,7 @@ pub(crate) fn record_scan_units(
 /// pass-1 compression attempt, adopted or not (cost.md §3; large-values.md §13). Charged once
 /// per stored row version at the statement's write site, never for B-tree re-encodes.
 pub(crate) fn record_compress_units(
-    col_types: &[ScalarType],
+    col_types: &[ColType],
     key: &[u8],
     row: &Row,
     cap: usize,
@@ -508,29 +552,42 @@ pub(crate) fn record_compress_units(
 /// A value's **content payload** `P(v)` — the bytes stored in the overflow chain when the value is
 /// externalized (spec/design/large-values.md §12): raw UTF-8 for `text`, raw bytes for `bytea`, the
 /// decimal body (`flags | scale | ndigits | groups`) for `decimal`. Only spillable types reach here.
-fn value_payload(ty: ScalarType, v: &Value) -> Vec<u8> {
-    match v {
-        Value::Text(s) => s.as_bytes().to_vec(),
-        Value::Bytea(b) => b.clone(),
+fn value_payload(ty: &ColType, v: &Value) -> Vec<u8> {
+    match (ty, v) {
+        (ColType::Scalar(_), Value::Text(s)) => s.as_bytes().to_vec(),
+        (ColType::Scalar(_), Value::Bytea(b)) => b.clone(),
         // The decimal inline body is the encoding minus its leading presence tag.
-        Value::Decimal(_) => encode_value(ty, v)[1..].to_vec(),
+        (ColType::Scalar(s), Value::Decimal(_)) => encode_scalar(*s, v)[1..].to_vec(),
+        // A composite's payload is its body — the encoding minus the leading presence tag, i.e.
+        // the null bitmap + present-field bodies (spec/design/composite.md §4).
+        (ColType::Composite { fields, .. }, Value::Composite(vals)) => {
+            encode_composite_body(fields, vals)
+        }
         _ => unreachable!("only spillable values are externalized"),
     }
 }
 
 /// Reconstruct a value from the `P(v)` content payload gathered from its overflow chain (inverse of
 /// [`value_payload`]) — spec/design/large-values.md §12.
-fn value_from_payload(ty: ScalarType, payload: &[u8]) -> Result<Value> {
-    if ty.is_text() {
-        let s = String::from_utf8(payload.to_vec()).map_err(|_| corrupt("non-UTF-8 text value"))?;
-        Ok(Value::Text(s))
-    } else if ty.is_bytea() {
-        Ok(Value::Bytea(payload.to_vec()))
-    } else if ty.is_decimal() {
-        let mut pos = 0usize;
-        decode_decimal_body(payload, &mut pos)
-    } else {
-        Err(corrupt("a non-spillable type was stored external"))
+fn value_from_payload(ty: &ColType, payload: &[u8]) -> Result<Value> {
+    match ty {
+        ColType::Scalar(s) if s.is_text() => {
+            let str =
+                String::from_utf8(payload.to_vec()).map_err(|_| corrupt("non-UTF-8 text value"))?;
+            Ok(Value::Text(str))
+        }
+        ColType::Scalar(s) if s.is_bytea() => Ok(Value::Bytea(payload.to_vec())),
+        ColType::Scalar(s) if s.is_decimal() => {
+            let mut pos = 0usize;
+            decode_decimal_body(payload, &mut pos)
+        }
+        // A composite's payload is its body (bitmap + present-field bodies); decode it with a
+        // fresh cursor (spec/design/composite.md §4).
+        ColType::Composite { .. } => {
+            let mut pos = 0usize;
+            read_composite_body(ty, payload, &mut pos)
+        }
+        _ => Err(corrupt("a non-spillable type was stored external")),
     }
 }
 
@@ -578,34 +635,41 @@ impl Snapshot {
         let mut body: Vec<(u32, u8, u32, u32, Vec<u8>)> = Vec::new();
         let mut root_data_page = vec![0u32; tables.len()];
         let mut index_roots: Vec<Vec<u32>> = vec![Vec::new(); tables.len()];
-        // Index trees have no value columns — encode against an empty pseudo-table.
-        let index_table = index_pseudo_table();
         let mut next_index = ROOT_PAGE;
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
-                root_data_page[ti] = serialize_node(root, table, cap, &mut next_index, &mut body)?;
+                root_data_page[ti] =
+                    serialize_node(root, store.col_types(), cap, &mut next_index, &mut body)?;
             }
             // The table's index trees follow its data tree, in catalog (name) order
-            // (spec/fileformat/format.md "From-scratch image").
+            // (spec/fileformat/format.md "From-scratch image"). Index records are the key alone —
+            // no value columns, so they encode against an empty `col_types`.
             for idx in &table.indexes {
                 let istore = self.index_store(&idx.name.to_ascii_lowercase());
                 let r = match istore.tree_root() {
-                    Some(root) => {
-                        serialize_node(root, &index_table, cap, &mut next_index, &mut body)?
-                    }
+                    Some(root) => serialize_node(root, &[], cap, &mut next_index, &mut body)?,
                     None => 0,
                 };
                 index_roots[ti].push(r);
             }
         }
 
-        // The catalog chain follows the data; its head is the relocatable `root_page`.
+        // The catalog chain follows the data; its head is the relocatable `root_page`. Each entry
+        // is kind-tagged (v9): composite-type entries (kind 1) first in lowercased-name order,
+        // then table entries (kind 0) — spec/fileformat/format.md.
         let cat_root = next_index;
-        let entry_sizes: Vec<usize> = tables
-            .iter()
-            .enumerate()
-            .map(|(ti, (_, t, _))| table_entry_bytes(t, 0, &vec![0; index_roots[ti].len()]).len())
-            .collect();
+        let mut cat_entries: Vec<Vec<u8>> = Vec::new();
+        for ct in self.composite_types_sorted() {
+            let mut e = vec![1u8];
+            e.extend_from_slice(&composite_type_entry_bytes(ct));
+            cat_entries.push(e);
+        }
+        for (ti, (_, t, _)) in tables.iter().enumerate() {
+            let mut e = vec![0u8];
+            e.extend_from_slice(&table_entry_bytes(t, root_data_page[ti], &index_roots[ti]));
+            cat_entries.push(e);
+        }
+        let entry_sizes: Vec<usize> = cat_entries.iter().map(|e| e.len()).collect();
         let cat_groups = pack(&entry_sizes, cap)?;
         let page_count = cat_root + cat_groups.len() as u32;
 
@@ -638,12 +702,8 @@ impl Snapshot {
                 0
             };
             let mut payload = Vec::new();
-            for &ti in group {
-                payload.extend_from_slice(&table_entry_bytes(
-                    tables[ti].1,
-                    root_data_page[ti],
-                    &index_roots[ti],
-                ));
+            for &ei in group {
+                payload.extend_from_slice(&cat_entries[ei]);
             }
             write_page(
                 &mut image,
@@ -660,18 +720,6 @@ impl Snapshot {
     }
 }
 
-/// The zero-column pseudo-table an index tree's records encode against (an index record is
-/// the entry key alone — spec/fileformat/format.md "Index trees").
-fn index_pseudo_table() -> Table {
-    Table {
-        name: String::new(),
-        columns: Vec::new(),
-        pk: Vec::new(),
-        checks: Vec::new(),
-        indexes: Vec::new(),
-    }
-}
-
 /// Serialize one B-tree node and its subtree post-order, appending `(index, page_type, item_count,
 /// payload)` for each node to `body` and returning this node's assigned page index. A leaf's payload
 /// is its records; an interior's payload is its `N+1` child pointers (big-endian `u32`) then its `N`
@@ -679,7 +727,7 @@ fn index_pseudo_table() -> Table {
 /// `RECORD_MAX`) — `feature_not_supported` (`0A000`), matching the v1 oversized-item rule.
 fn serialize_node(
     node: &Arc<Node>,
-    table: &Table,
+    col_types: &[ColType],
     cap: usize,
     next_index: &mut u32,
     body: &mut Vec<(u32, u8, u32, u32, Vec<u8>)>,
@@ -691,7 +739,7 @@ fn serialize_node(
         // incrementally via `serialize_dirty`. An `OnDisk` child would carry a page id from a
         // different layout, so it must not appear here.
         let cp = match child {
-            Child::Resident(n) => serialize_node(n, table, cap, next_index, body)?,
+            Child::Resident(n) => serialize_node(n, col_types, cap, next_index, body)?,
             Child::OnDisk(p) => {
                 unreachable!("whole-image serialize hit an OnDisk leaf (page {p})")
             }
@@ -721,7 +769,7 @@ fn serialize_node(
     };
     for i in 0..node.keys.len() {
         payload.extend_from_slice(&encode_record(
-            table,
+            col_types,
             &node.keys[i],
             &node.vals[i],
             cap,
@@ -748,7 +796,7 @@ fn serialize_node(
 /// like all commit work. Returns `None` when nothing is unfetched (the common case — no clone).
 fn resolve_for_encode(
     row: &Row,
-    table: &Table,
+    col_types: &[ColType],
     paging: Option<&SharedPaging>,
 ) -> Result<Option<Row>> {
     if !row.iter().any(|v| matches!(v, Value::Unfetched(_))) {
@@ -759,7 +807,7 @@ fn resolve_for_encode(
     let mut out = row.clone();
     for (i, v) in out.iter_mut().enumerate() {
         if let Value::Unfetched(u) = v {
-            let resolved = resolve_unfetched(table.columns[i].ty, u, &fetch)?;
+            let resolved = resolve_unfetched(&col_types[i], u, &fetch)?;
             *v = resolved;
         }
     }
@@ -836,27 +884,28 @@ impl Snapshot {
         let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut root_data_page = vec![0u32; tables.len()];
         let mut index_roots: Vec<Vec<u32>> = vec![Vec::new(); tables.len()];
-        let index_table = index_pseudo_table();
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
-                root_data_page[ti] =
-                    serialize_dirty(root, table, cap, ps, &mut alloc, &mut pages, paging)?;
+                root_data_page[ti] = serialize_dirty(
+                    root,
+                    store.col_types(),
+                    cap,
+                    ps,
+                    &mut alloc,
+                    &mut pages,
+                    paging,
+                )?;
             }
             // The table's index trees follow its data tree, in catalog (name) order — only
             // their dirty nodes are written, like any tree (spec/fileformat/format.md
-            // "Allocation & incremental commit").
+            // "Allocation & incremental commit"). Index records carry no value columns (empty
+            // `col_types`).
             for idx in &table.indexes {
                 let istore = self.index_store(&idx.name.to_ascii_lowercase());
                 let r = match istore.tree_root() {
-                    Some(root) => serialize_dirty(
-                        root,
-                        &index_table,
-                        cap,
-                        ps,
-                        &mut alloc,
-                        &mut pages,
-                        paging,
-                    )?,
+                    Some(root) => {
+                        serialize_dirty(root, &[], cap, ps, &mut alloc, &mut pages, paging)?
+                    }
                     None => 0,
                 };
                 index_roots[ti].push(r);
@@ -866,11 +915,20 @@ impl Snapshot {
         // The catalog chain is rewritten to fresh pages every commit (table roots move). Allocate
         // its page indices up front — they may be reused free pages, hence not contiguous — so each
         // page can point at the next (`pack` always returns ≥ 1 group, so `cat_pages` is non-empty).
-        let entry_sizes: Vec<usize> = tables
-            .iter()
-            .enumerate()
-            .map(|(ti, (_, t, _))| table_entry_bytes(t, 0, &vec![0; index_roots[ti].len()]).len())
-            .collect();
+        // Entries are kind-tagged (v9): composite-type entries (kind 1, name order) then table
+        // entries (kind 0) — spec/fileformat/format.md.
+        let mut cat_entries: Vec<Vec<u8>> = Vec::new();
+        for ct in self.composite_types_sorted() {
+            let mut e = vec![1u8];
+            e.extend_from_slice(&composite_type_entry_bytes(ct));
+            cat_entries.push(e);
+        }
+        for (ti, (_, t, _)) in tables.iter().enumerate() {
+            let mut e = vec![0u8];
+            e.extend_from_slice(&table_entry_bytes(t, root_data_page[ti], &index_roots[ti]));
+            cat_entries.push(e);
+        }
+        let entry_sizes: Vec<usize> = cat_entries.iter().map(|e| e.len()).collect();
         let cat_groups = pack(&entry_sizes, cap)?;
         let cat_pages: Vec<u32> = (0..cat_groups.len()).map(|_| alloc.take()).collect();
         let cat_root = cat_pages[0];
@@ -881,12 +939,8 @@ impl Snapshot {
                 0
             };
             let mut payload = Vec::new();
-            for &ti in group {
-                payload.extend_from_slice(&table_entry_bytes(
-                    tables[ti].1,
-                    root_data_page[ti],
-                    &index_roots[ti],
-                ));
+            for &ei in group {
+                payload.extend_from_slice(&cat_entries[ei]);
             }
             pages.push((
                 cat_pages[gi],
@@ -911,7 +965,7 @@ impl Snapshot {
 /// immutable (`AtomicU32`, P5.3b). Mirrors `serialize_node` for the byte layout.
 fn serialize_dirty(
     node: &Arc<Node>,
-    table: &Table,
+    col_types: &[ColType],
     cap: usize,
     ps: usize,
     alloc: &mut PageAlloc,
@@ -927,7 +981,7 @@ fn serialize_dirty(
         // A `Resident` child recurses (dirty descendants get pages); an `OnDisk` child is a clean
         // leaf already durable at its page — keep it, write nothing (the incremental-commit win).
         let cp = match child {
-            Child::Resident(n) => serialize_dirty(n, table, cap, ps, alloc, pages, paging)?,
+            Child::Resident(n) => serialize_dirty(n, col_types, cap, ps, alloc, pages, paging)?,
             Child::OnDisk(p) => *p,
         };
         child_pages.push(cp);
@@ -953,10 +1007,10 @@ fn serialize_dirty(
     {
         let mut take = || alloc.take();
         for i in 0..node.keys.len() {
-            let resolved = resolve_for_encode(&node.vals[i], table, paging)?;
+            let resolved = resolve_for_encode(&node.vals[i], col_types, paging)?;
             let row = resolved.as_ref().unwrap_or(&node.vals[i]);
             payload.extend_from_slice(&encode_record(
-                table,
+                col_types,
                 &node.keys[i],
                 row,
                 cap,
@@ -1022,13 +1076,26 @@ impl Database {
             }
             let mut pos = 0usize;
             for _ in 0..page.item_count {
+                // Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered
+                // now; its nested refs are validated after the full walk), 0 = a table entry.
+                let kind = read_u8(page.payload, &mut pos)?;
+                if kind == 1 {
+                    let ct = decode_composite_type_entry(page.payload, &mut pos)?;
+                    snap.put_type(ct);
+                    continue;
+                }
+                if kind != 0 {
+                    return Err(corrupt("unknown catalog entry kind"));
+                }
                 let (table, root_data_page, index_roots) =
                     decode_table_entry(page.payload, &mut pos)?;
                 let name = table.name.clone();
-                let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
                 let has_pk = !table.pk_indices().is_empty();
                 let indexes = table.indexes.clone();
                 snap.put_table(table, page_size as u32);
+                // The store resolved each column's `ColType` from the (types-first) catalog at
+                // `put_table`; the codec reads it back rather than re-walking the type catalog.
+                let col_types = snap.store(&name).col_types().to_vec();
                 if root_data_page != 0 {
                     let (root, len) =
                         read_tree(image, page_size, root_data_page, &col_types, &mut reached)?;
@@ -1058,6 +1125,9 @@ impl Database {
             }
             cat_page = page.next_page;
         }
+        // Two-pass: validate the composite-type catalog (existence + acyclicity) now that every
+        // type entry has been read (spec/design/composite.md §3); a bad reference is XX001.
+        snap.validate_composite_types()?;
         let mut db = Database::new();
         db.page_size = page_size as u32;
         db.page_count = meta.page_count; // the on-disk high-water for the next incremental commit
@@ -1121,14 +1191,27 @@ impl Database {
             }
             let mut pos = 0usize;
             for _ in 0..page.item_count {
+                // Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered
+                // now; its nested refs are validated after the full walk), 0 = a table entry.
+                let kind = read_u8(page.payload, &mut pos)?;
+                if kind == 1 {
+                    let ct = decode_composite_type_entry(page.payload, &mut pos)?;
+                    snap.put_type(ct);
+                    continue;
+                }
+                if kind != 0 {
+                    return Err(corrupt("unknown catalog entry kind"));
+                }
                 let (table, root_data_page, index_roots) =
                     decode_table_entry(page.payload, &mut pos)?;
                 let name = table.name.clone();
-                let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
                 let has_pk = !table.pk_indices().is_empty();
                 let indexes = table.indexes.clone();
                 snap.put_table(table, page_size as u32);
                 snap.store_mut(&name).attach_paging(paging.clone());
+                // The store resolved each column's `ColType` from the (types-first) catalog at
+                // `put_table` (spec/design/composite.md §3).
+                let col_types = snap.store(&name).col_types().to_vec();
                 if root_data_page != 0 {
                     let (root, len) =
                         read_skeleton(&paging, root_data_page, &col_types, &mut reached)?;
@@ -1169,6 +1252,9 @@ impl Database {
             cat_page = page.next_page;
         }
 
+        // Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
+        // reference (spec/design/composite.md §3).
+        snap.validate_composite_types()?;
         let mut db = Database::new();
         db.page_size = page_size as u32;
         db.page_count = meta.page_count;
@@ -1190,7 +1276,7 @@ impl Database {
 fn collect_leaf_overflow(
     paging: &SharedPaging,
     page_idx: u32,
-    col_types: &[ScalarType],
+    col_types: &[ColType],
     reached: &mut HashSet<u32>,
 ) -> Result<()> {
     let block = paging.pager().read_block(page_idx)?;
@@ -1228,7 +1314,7 @@ fn collect_leaf_overflow(
 fn read_skeleton(
     paging: &SharedPaging,
     root_page: u32,
-    col_types: &[ScalarType],
+    col_types: &[ColType],
     reached: &mut HashSet<u32>,
 ) -> Result<(Arc<Node>, usize)> {
     let (child, len) = read_skeleton_node(paging, root_page, col_types, reached)?;
@@ -1245,7 +1331,7 @@ fn read_skeleton(
 fn read_skeleton_node(
     paging: &SharedPaging,
     page_idx: u32,
-    col_types: &[ScalarType],
+    col_types: &[ColType],
     reached: &mut HashSet<u32>,
 ) -> Result<(Child, usize)> {
     reached.insert(page_idx);
@@ -1299,7 +1385,7 @@ fn read_tree(
     image: &[u8],
     ps: usize,
     page_idx: u32,
-    col_types: &[ScalarType],
+    col_types: &[ColType],
     reached: &mut HashSet<u32>,
 ) -> Result<(Arc<Node>, usize)> {
     reached.insert(page_idx);
@@ -1374,30 +1460,29 @@ struct OverflowPageOut {
 /// spill-plan input). Shared by the whole-image (`serialize_node`) and incremental (`serialize_dirty`)
 /// writers, which differ only in how `take` allocates a page.
 fn encode_record(
-    table: &Table,
+    col_types: &[ColType],
     key: &[u8],
     row: &[Value],
     cap: usize,
     take: &mut dyn FnMut() -> u32,
     ovf: &mut Vec<OverflowPageOut>,
 ) -> Vec<u8> {
-    let col_types: Vec<ScalarType> = table.columns.iter().map(|c| c.ty).collect();
-    let plan = plan_dispositions(&col_types, key, row, cap);
+    let plan = plan_dispositions(col_types, key, row, cap);
     let mut out = Vec::new();
     out.extend_from_slice(&(key.len() as u16).to_be_bytes());
     out.extend_from_slice(key);
-    for (i, (col, val)) in table.columns.iter().zip(row.iter()).enumerate() {
+    for (i, (ty, val)) in col_types.iter().zip(row.iter()).enumerate() {
         match &plan.disp[i] {
-            Disp::Inline => out.extend_from_slice(&encode_value(col.ty, val)),
+            Disp::Inline => out.extend_from_slice(&encode_value(ty, val)),
             Disp::External => {
-                let payload = value_payload(col.ty, val);
+                let payload = value_payload(ty, val);
                 let first = write_overflow_chain(&payload, cap, take, ovf);
                 out.push(TAG_EXTERNAL);
                 out.extend_from_slice(&first.to_be_bytes());
                 out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             }
             Disp::InlineComp(comp) => {
-                let raw_len = value_payload(col.ty, val).len();
+                let raw_len = value_payload(ty, val).len();
                 out.push(TAG_INLINE_COMP);
                 out.extend_from_slice(&(raw_len as u32).to_be_bytes());
                 out.extend_from_slice(&(comp.len() as u16).to_be_bytes());
@@ -1405,7 +1490,7 @@ fn encode_record(
             }
             Disp::ExternalComp(comp) => {
                 // The chain carries the COMPRESSED block (its page count follows comp size).
-                let raw_len = value_payload(col.ty, val).len();
+                let raw_len = value_payload(ty, val).len();
                 let first = write_overflow_chain(comp, cap, take, ovf);
                 out.push(TAG_EXTERNAL_COMP);
                 out.extend_from_slice(&first.to_be_bytes());
@@ -1456,44 +1541,59 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
         let cn = col.name.as_bytes();
         out.extend_from_slice(&(cn.len() as u16).to_be_bytes());
         out.extend_from_slice(cn);
-        out.push(type_code_for_scalar(col.ty));
         // bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is the
         // single authority; the bit is reserved, written 0 (spec/fileformat/format.md).
-        let mut flags = 0u8;
-        if col.not_null {
-            flags |= 0b10;
-        }
-        if col.default.is_some() {
-            flags |= 0b100;
-        }
-        if col.default_expr.is_some() {
-            // bit3 default_is_expr (v8) — mutually exclusive with bit2 (a column has at most
-            // one of a constant or an expression default — spec/fileformat/format.md).
-            flags |= 0b1000;
-        }
-        out.push(flags);
-        // A decimal column appends its typmod (precision, scale) — only for type_code 6, so
-        // non-decimal entries are byte-unchanged (spec/fileformat/format.md). `precision 0`
-        // = unconstrained `numeric`.
-        if col.ty.is_decimal() {
-            let (precision, scale) = match col.decimal {
-                Some(t) => (t.precision, t.scale),
-                None => (0u16, 0u16),
-            };
-            out.extend_from_slice(&precision.to_be_bytes());
-            out.extend_from_slice(&scale.to_be_bytes());
-        }
-        // A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default value
-        // via the same value codec rows use — AFTER the typmod, presence-gated, so a column
-        // without a default is byte-unchanged (spec/fileformat/format.md). A `DEFAULT NULL` is
-        // one 0x01. An EXPRESSION default (flags bit3, v8) instead appends its expr-text (u16
-        // length + UTF-8) there, the same token rendering a CHECK uses — bit2/bit3 are exclusive.
-        if let Some(d) = &col.default {
-            out.extend_from_slice(&encode_value(col.ty, d));
-        } else if let Some(de) = &col.default_expr {
-            let et = de.expr_text.as_bytes();
-            out.extend_from_slice(&(et.len() as u16).to_be_bytes());
-            out.extend_from_slice(et);
+        match &col.ty {
+            Type::Composite(r) => {
+                // A composite column (v9): type_code 14, then flags, then the type name in the
+                // typmod slot (spec/fileformat/format.md). Composite columns carry no default this
+                // slice, so flags bits 2/3 are 0.
+                out.push(14);
+                let flags = if col.not_null { 0b10u8 } else { 0 };
+                out.push(flags);
+                let tn = r.name.as_bytes();
+                out.extend_from_slice(&(tn.len() as u16).to_be_bytes());
+                out.extend_from_slice(tn);
+            }
+            Type::Scalar(s) => {
+                out.push(type_code_for_scalar(*s));
+                let mut flags = 0u8;
+                if col.not_null {
+                    flags |= 0b10;
+                }
+                if col.default.is_some() {
+                    flags |= 0b100;
+                }
+                if col.default_expr.is_some() {
+                    // bit3 default_is_expr (v8) — mutually exclusive with bit2 (a column has at
+                    // most one of a constant or an expression default — spec/fileformat/format.md).
+                    flags |= 0b1000;
+                }
+                out.push(flags);
+                // A decimal column appends its typmod (precision, scale) — only for type_code 6,
+                // so non-decimal entries are byte-unchanged. `precision 0` = unconstrained.
+                if s.is_decimal() {
+                    let (precision, scale) = match col.decimal {
+                        Some(t) => (t.precision, t.scale),
+                        None => (0u16, 0u16),
+                    };
+                    out.extend_from_slice(&precision.to_be_bytes());
+                    out.extend_from_slice(&scale.to_be_bytes());
+                }
+                // A column with a constant DEFAULT (flags bit2) appends its pre-evaluated default
+                // value via the value codec rows use — AFTER the typmod, presence-gated. A
+                // `DEFAULT NULL` is one 0x01. An EXPRESSION default (flags bit3, v8) instead
+                // appends its expr-text (u16 length + UTF-8) there — bit2/bit3 are exclusive.
+                if let Some(d) = &col.default {
+                    // A column DEFAULT is always a scalar value (composite columns carry no
+                    // default this slice — composite.md §12), so encode the scalar body directly.
+                    out.extend_from_slice(&encode_scalar(*s, d));
+                } else if let Some(de) = &col.default_expr {
+                    let et = de.expr_text.as_bytes();
+                    out.extend_from_slice(&(et.len() as u16).to_be_bytes());
+                    out.extend_from_slice(et);
+                }
+            }
         }
     }
     // The primary key (v5): count, then the member column ordinals in KEY order
@@ -1727,7 +1827,7 @@ fn page_block(image: &[u8], ps: usize, index: u32) -> Result<Vec<u8>> {
 /// (large-values.md §14): an external/compressed value becomes an [`Unfetched`] reference — no
 /// chain read, no decompression — resolved later only for the columns a query touches. Each
 /// weight is the bytes the record occupies on the page (exactly the writer's `record_size`).
-pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ScalarType]) -> Result<Node> {
+pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ColType]) -> Result<Node> {
     let parsed = parse_page(block)?;
     if parsed.page_type != PAGE_LEAF {
         return Err(corrupt("demand-paged a non-leaf page"));
@@ -1751,6 +1851,90 @@ pub(crate) fn decode_leaf_node(block: &[u8], page: u32, col_types: &[ScalarType]
 /// Decode one catalog table entry: the `Table` (its pk list, checks, and index definitions
 /// included), its `root_data_page`, and each index's root page (parallel to
 /// `Table::indexes`).
+/// Serialize a composite-type catalog entry's BODY (after its `entry_kind = 1` byte): name,
+/// field count, then per field — name, type code, [type name when code 14 (nested composite)],
+/// flags (bit0 `not_null`), [decimal typmod when code 6] (spec/fileformat/format.md
+/// *Composite-type entry*).
+fn composite_type_entry_bytes(ct: &CompositeType) -> Vec<u8> {
+    let mut out = Vec::new();
+    let name = ct.name.as_bytes();
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&(ct.fields.len() as u16).to_be_bytes());
+    for f in &ct.fields {
+        let fname = f.name.as_bytes();
+        out.extend_from_slice(&(fname.len() as u16).to_be_bytes());
+        out.extend_from_slice(fname);
+        match &f.ty {
+            Type::Composite(r) => {
+                out.push(14);
+                let tn = r.name.as_bytes();
+                out.extend_from_slice(&(tn.len() as u16).to_be_bytes());
+                out.extend_from_slice(tn);
+            }
+            Type::Scalar(s) => out.push(type_code_for_scalar(*s)),
+        }
+        out.push(if f.not_null { 0b1 } else { 0 });
+        if let Type::Scalar(s) = &f.ty {
+            if s.is_decimal() {
+                let (p, sc) = match f.decimal {
+                    Some(t) => (t.precision, t.scale),
+                    None => (0u16, 0u16),
+                };
+                out.extend_from_slice(&p.to_be_bytes());
+                out.extend_from_slice(&sc.to_be_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// Decode a composite-type catalog entry's body (inverse of `composite_type_entry_bytes`); the
+/// caller has already consumed the `entry_kind` byte. Nested composite fields hold the referenced
+/// type's NAME (resolved/validated after the whole catalog is read — the two-pass load).
+fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeType> {
+    let name = read_string(buf, pos)?;
+    let field_count = read_u16(buf, pos)? as usize;
+    let mut fields = Vec::with_capacity(field_count);
+    for _ in 0..field_count {
+        let fname = read_string(buf, pos)?;
+        let tc = read_u8(buf, pos)?;
+        let (ty, mut decimal) = if tc == 14 {
+            let tn = read_string(buf, pos)?;
+            (
+                Type::Composite(crate::types::CompositeRef { name: tn }),
+                None,
+            )
+        } else {
+            let s = scalar_for_type_code(tc).ok_or_else(|| corrupt("unknown field type code"))?;
+            (Type::Scalar(s), None)
+        };
+        let flags = read_u8(buf, pos)?;
+        if flags & !0b1 != 0 {
+            return Err(corrupt("reserved composite field flag set"));
+        }
+        let not_null = flags & 0b1 != 0;
+        if let Type::Scalar(s) = &ty {
+            if s.is_decimal() {
+                let precision = read_u16(buf, pos)?;
+                let scale = read_u16(buf, pos)?;
+                decimal = if precision == 0 {
+                    None
+                } else {
+                    Some(DecimalTypmod { precision, scale })
+                };
+            }
+        }
+        fields.push(CompositeField {
+            name: fname,
+            ty,
+            decimal,
+            not_null,
+        });
+    }
+    Ok(CompositeType { name, fields })
+}
+
 fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u32>)> {
     let name = read_string(buf, pos)?;
     let col_count = read_u16(buf, pos)? as usize;
@@ -1758,6 +1942,26 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
     for _ in 0..col_count {
         let cname = read_string(buf, pos)?;
         let tc = read_u8(buf, pos)?;
+        if tc == 14 {
+            // A composite column (v9): flags, then the type name (spec/fileformat/format.md).
+            // Forward-ready — composite columns are not produced this slice (composite.md §12),
+            // but a reader handles the code so a later-slice file loads cleanly.
+            let flags = read_u8(buf, pos)?;
+            if flags & 0b01 != 0 {
+                return Err(corrupt("reserved column flag bit0 set"));
+            }
+            let tname = read_string(buf, pos)?;
+            columns.push(Column {
+                name: cname,
+                ty: Type::Composite(crate::types::CompositeRef { name: tname }),
+                decimal: None,
+                primary_key: false,
+                not_null: flags & 0b10 != 0,
+                default: None,
+                default_expr: None,
+            });
+            continue;
+        }
         let ty = scalar_for_type_code(tc).ok_or_else(|| corrupt("unknown type code"))?;
         let flags = read_u8(buf, pos)?;
         // bit0 was the primary_key flag through v4; v5 retired it (the pk list below is the
@@ -1790,7 +1994,8 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
         }
         let default = if flags & 0b100 != 0 {
             let mut sink = Vec::new();
-            Some(read_value(ty, buf, pos, None, &mut sink)?)
+            // A constant default is a scalar value (this branch is the scalar type path).
+            Some(read_value(&ColType::Scalar(ty), buf, pos, None, &mut sink)?)
         } else {
             None
         };
@@ -1804,7 +2009,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
         };
         columns.push(Column {
             name: cname,
-            ty,
+            ty: Type::Scalar(ty),
             decimal,
             primary_key: false, // set from the pk list below
             not_null: flags & 0b10 != 0,
@@ -1891,7 +2096,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
 /// block by index, used to follow overflow chains; `None` is only valid where no value can be
 /// external (e.g. a catalog default).
 fn decode_record(
-    col_types: &[ScalarType],
+    col_types: &[ColType],
     buf: &[u8],
     pos: &mut usize,
     fetch: Option<&dyn Fn(u32) -> Result<Vec<u8>>>,
@@ -1900,7 +2105,7 @@ fn decode_record(
     let key = take(buf, pos, key_len)?.to_vec();
     let mut row = Vec::with_capacity(col_types.len());
     let mut ovf = Vec::new();
-    for &ty in col_types {
+    for ty in col_types {
         row.push(read_value(ty, buf, pos, fetch, &mut ovf)?);
     }
     Ok((key, row, ovf))
@@ -1912,7 +2117,7 @@ fn decode_record(
 /// (spec/design/large-values.md §12). Pages visited while following a chain are pushed to `ovf_out`
 /// for the free-list reachability walk.
 fn read_value(
-    ty: ScalarType,
+    ty: &ColType,
     buf: &[u8],
     pos: &mut usize,
     fetch: Option<&dyn Fn(u32) -> Result<Vec<u8>>>,
@@ -1948,9 +2153,41 @@ fn read_value(
     }
 }
 
-/// The present-value body (after a `0x00` tag): a fixed-width integer, a `u16` length + UTF-8 bytes
-/// for `text`, a single `bool-byte`, the decimal body, etc. (spec/fileformat/format.md *Value codec*).
-fn read_inline_body(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+/// The present-value body (after a `0x00` tag) for any [`ColType`]: a scalar via
+/// [`read_inline_scalar`], or a composite via [`read_composite_body`] (spec/design/composite.md §4).
+fn read_inline_body(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+    match ty {
+        ColType::Scalar(s) => read_inline_scalar(*s, buf, pos),
+        ColType::Composite { .. } => read_composite_body(ty, buf, pos),
+    }
+}
+
+/// A composite value's present **body** (after the `0x00` tag): the null bitmap then each present
+/// field's body in declaration order (inverse of [`encode_composite_body`], spec/design/composite.md
+/// §4). A field whose bitmap bit is set is `Value::Null` and consumes no body bytes; otherwise its
+/// body is read recursively (no per-field presence tag).
+fn read_composite_body(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+    let ColType::Composite { fields, .. } = ty else {
+        return Err(corrupt("read_composite_body on a non-composite type"));
+    };
+    let nbytes = fields.len().div_ceil(8);
+    let bitmap = take(buf, pos, nbytes)?.to_vec();
+    let mut vals = Vec::with_capacity(fields.len());
+    for (i, f) in fields.iter().enumerate() {
+        let is_null = bitmap[i / 8] & (0x80 >> (i % 8)) != 0;
+        if is_null {
+            vals.push(Value::Null);
+        } else {
+            vals.push(read_inline_body(&f.ty, buf, pos)?);
+        }
+    }
+    Ok(Value::Composite(vals))
+}
+
+/// The present-value body of a **scalar** (after a `0x00` tag): a fixed-width integer, a `u16`
+/// length + UTF-8 bytes for `text`, a single `bool-byte`, the decimal body, etc.
+/// (spec/fileformat/format.md *Value codec*).
+fn read_inline_scalar(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
     if ty.is_text() {
         let len = read_u16(buf, pos)? as usize;
         let bytes = take(buf, pos, len)?.to_vec();
@@ -2076,8 +2313,10 @@ fn read_overflow_chain(
 /// record's pointer fields — no chain read, no decompression. The scan layer resolves the
 /// references for the columns a query touches ([`resolve_unfetched`]); the commit path resolves
 /// the rest when a dirty leaf re-encodes (`resolve_for_encode`).
-fn read_value_lazy(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+fn read_value_lazy(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
     match read_u8(buf, pos)? {
+        // A composite's inline body has no nested overflow pointers (its fields are inline —
+        // composite.md §4), so it is read eagerly even in the lazy path.
         0x00 => read_inline_body(ty, buf, pos),
         0x01 => Ok(Value::Null),
         TAG_EXTERNAL => {
@@ -2110,7 +2349,7 @@ fn read_value_lazy(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Value>
 /// [`record_size`] the writer split on, read off the cursor instead of re-planned (a re-plan
 /// would need the unfetched bytes).
 fn decode_record_lazy(
-    col_types: &[ScalarType],
+    col_types: &[ColType],
     buf: &[u8],
     pos: &mut usize,
 ) -> Result<(Vec<u8>, Row, usize)> {
@@ -2118,7 +2357,7 @@ fn decode_record_lazy(
     let key_len = read_u16(buf, pos)? as usize;
     let key = take(buf, pos, key_len)?.to_vec();
     let mut row = Vec::with_capacity(col_types.len());
-    for &ty in col_types {
+    for ty in col_types {
         row.push(read_value_lazy(ty, buf, pos)?);
     }
     Ok((key, row, *pos - start))
@@ -2129,7 +2368,7 @@ fn decode_record_lazy(
 /// compressed one, and reconstruct by column type. Decompression errors are `data_corrupted`,
 /// surfaced only when the value is actually touched.
 pub(crate) fn resolve_unfetched(
-    ty: ScalarType,
+    ty: &ColType,
     u: &Unfetched,
     fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
 ) -> Result<Value> {
@@ -2297,7 +2536,7 @@ mod tests {
             std::f64::consts::PI,
         ];
         for &x in &f64s {
-            let enc = encode_value(ScalarType::Float64, &Value::Float64(x));
+            let enc = encode_value(&ColType::Scalar(ScalarType::Float64), &Value::Float64(x));
             // present tag + 8 IEEE bytes, big-endian, no length prefix. A NaN canonicalizes to the
             // single quiet pattern; every other value is verbatim.
             let want_bits = if x.is_nan() {
@@ -2317,7 +2556,14 @@ mod tests {
                 "big-endian IEEE bytes (NaN canonicalized)"
             );
             let mut pos = 0usize;
-            let got = read_value(ScalarType::Float64, &enc, &mut pos, None, &mut sink).unwrap();
+            let got = read_value(
+                &ColType::Scalar(ScalarType::Float64),
+                &enc,
+                &mut pos,
+                None,
+                &mut sink,
+            )
+            .unwrap();
             match got {
                 Value::Float64(y) => assert_eq!(y.to_bits(), want_bits, "bits round-trip"),
                 other => panic!("expected Float64, got {other:?}"),
@@ -2335,7 +2581,7 @@ mod tests {
             f32::from_bits(0x7fc0_0001),
         ];
         for &x in &f32s {
-            let enc = encode_value(ScalarType::Float32, &Value::Float32(x));
+            let enc = encode_value(&ColType::Scalar(ScalarType::Float32), &Value::Float32(x));
             let want_bits = if x.is_nan() {
                 0x7fc0_0000_u32
             } else {
@@ -2348,7 +2594,14 @@ mod tests {
             );
             assert_eq!(&enc[1..], &want_bits.to_be_bytes());
             let mut pos = 0usize;
-            let got = read_value(ScalarType::Float32, &enc, &mut pos, None, &mut sink).unwrap();
+            let got = read_value(
+                &ColType::Scalar(ScalarType::Float32),
+                &enc,
+                &mut pos,
+                None,
+                &mut sink,
+            )
+            .unwrap();
             match got {
                 Value::Float32(y) => assert_eq!(y.to_bits(), want_bits),
                 other => panic!("expected Float32, got {other:?}"),
@@ -2356,10 +2609,11 @@ mod tests {
         }
         // NULL round-trips for both float widths (presence tag only).
         for ty in [ScalarType::Float32, ScalarType::Float64] {
-            let enc = encode_value(ty, &Value::Null);
+            let ct = ColType::Scalar(ty);
+            let enc = encode_value(&ct, &Value::Null);
             let mut pos = 0usize;
             assert!(matches!(
-                read_value(ty, &enc, &mut pos, None, &mut sink).unwrap(),
+                read_value(&ct, &enc, &mut pos, None, &mut sink).unwrap(),
                 Value::Null
             ));
         }
