@@ -1,0 +1,76 @@
+# Build and deploy the jed website (/web) to GitHub Pages (CLAUDE.md §6/§10). The site is entirely
+# static (SvelteKit adapter-static); this workflow gates on the interactive-feature Playwright suite
+# (the contract for the live database / language switcher / OPFS tool), then builds with the project
+# base path and publishes the artifact. The website is a non-core tooling module, so this is separate
+# from the engine's Rake CI.
+
+name: Deploy website
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'web/**'
+      - 'impl/ts/**'
+      - 'spec/**'
+      - '.github/workflows/web-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let a newer push cancel an in-flight run.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.16.0'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      # Gate: the interactive-feature suite drives the BUILT static site (live DB, language switcher,
+      # OPFS tool) in headless Chromium. A failure blocks the deploy.
+      - name: Interactive-feature tests
+        run: npm run test:browser
+
+      - name: Build static site
+        run: npm run build
+        env:
+          # Project-page base path (served from https://<owner>.github.io/<repo>/). SvelteKit also
+          # emits relative asset URLs, so the build is relocatable, but the base keeps in-app links
+          # and the sitemap correct.
+          BASE_PATH: '/${{ github.event.repository.name }}'
+          # Origin only — the sitemap appends BASE_PATH itself.
+          SITE_URL: 'https://${{ github.repository_owner }}.github.io'
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/build
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

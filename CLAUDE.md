@@ -256,6 +256,10 @@ implementation. Suggested layout:
   go/
   ts/                   # later
   ...
+/web/                   # the jed website: static SvelteKit + Tailwind docs + live in-browser
+                        # playground. A NON-CORE tooling module (the bench/ precedent, §14): its
+                        # deps never touch a core manifest. Consumes the TS core (impl/ts) via a
+                        # Vite alias and runs the engine in a Web Worker (in-memory + OPFS). See §10.
 ```
 
 Each implementation ships a **thin harness** that runs the shared conformance corpus.
@@ -500,8 +504,16 @@ The design is optimized for AI agents even more than for humans. In practice:
   before/after a perf-sensitive change, **run the affected benchmarks** and report both
   numbers in the change description (`rake bench:diff` emits the before/after comparison
   as JSONL; `rake bench:html` / `bench:markdown` render a run — with deltas — for humans).
-- **Structured errors**, not free text — so failures are machine-legible and
-  `statement error` matching is stable.
+- **Keep the website (`/web`) in sync with the surface it documents.** The static SvelteKit site
+  (§6) is a tracked downstream consumer of the user-facing surface, like the corpus and benchmarks.
+  When a change **adds or alters a user-facing SQL feature or the host/embedding API**, update the
+  corresponding `/web` docs in the **same change**: the relevant page under `web/src/routes/docs/`
+  (an `api/` per-language page or a `sql/` live-panel page), its live example or per-language
+  `CodeTabs` source (`web/examples/<topic>/{rust.rs,go.go,ts.ts}`), and — if the type/function/error
+  set changed — nothing by hand, since the reference pages generate from the spec TOML. The site runs
+  the **TS core in a browser Web Worker** (in-memory + OPFS), so its `web/e2e/` Playwright suite
+  (`npm run test:browser` in `/web`) is the interactive-feature contract; run it when touching the
+  bridge (`web/src/lib/jed/`) or a documented behavior. Internal-only changes need no `/web` update.
 - **Boring, explicit code over clever abstraction.** In Rust, resist deep generics and
   macro magic. In Go, resist over-interfacing. Flat, well-named, single-responsibility
   modules with small context footprints are easier for agents (and humans) to reason

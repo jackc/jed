@@ -4,6 +4,15 @@
   "service": "app",
   "workspaceFolder": "/workspaces/jed",
 
+  // The jed website (/web) dev + preview/static-serve ports, forwarded to the host so a browser
+  // outside the container can reach them. The servers must bind to 0.0.0.0 (web/vite.config.ts sets
+  // `host: true`; e2e/serve.mjs already does) for forwarding to work.
+  "forwardPorts": [5173, 4173],
+  "portsAttributes": {
+    "5173": { "label": "jed web (dev)", "onAutoForward": "notify" },
+    "4173": { "label": "jed web (preview / static)", "onAutoForward": "notify" }
+  },
+
   "containerEnv": {
     "LANG":              "en_US.UTF-8",
     "CLAUDE_CONFIG_DIR": "/persist/shared/claude",
