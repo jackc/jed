@@ -249,6 +249,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Cost ceiling — a caller-set `max_cost` aborts a query (54P01) the instant accrued cost
     // reaches it; the `# max_cost:` directive runs a record under a ceiling (cost.md §6).
     "resource.cost_limit",
+    // Nesting-depth limit — a fixed MAX_EXPR_DEPTH checked in the parser aborts deeply-nested
+    // input with 54001 before it can overflow the native stack (CLAUDE.md §13; cost.md §7).
+    "resource.depth_limit",
     // Phase 5 — explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes,
     // failed-block poisoning (spec/design/transactions.md §4, grammar.md §27).
     "txn.explicit",

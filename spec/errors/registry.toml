@@ -260,10 +260,30 @@ class = "feature not supported"
 template = "feature not supported: {detail}"
 
 # --- program limit exceeded (class 54) --------------------------------------
-# A caller-imposed limit was exceeded during execution. jed-specific: PostgreSQL has
-# no execution-cost ceiling, so this code (a `P` subclass, like 22P02/42P18/25P02) is
-# a documented divergence (CLAUDE.md §1/§13; spec/design/cost.md §6). The deterministic
-# cost meter (spec/cost/schedule.toml) accrues a query's cost; when it reaches the
+# A caller-imposed (or engine-fixed) limit was exceeded. The two §13 untrusted-query
+# safety gates live here.
+#
+# 54001 statement_too_complex — a statement's expression / subquery / set-operation
+# nesting depth exceeds the engine's fixed maximum (spec/design/cost.md §7). This is the
+# native-stack-safety gate: the recursive-descent parser and the resolve/eval walks recurse
+# to a statement's nesting depth, so deeply-nested untrusted input (`1+1+…` thousands deep,
+# nested parens / ARRAY / subqueries) could overflow the call stack DURING PARSE — before any
+# cost is metered, so the 54P01 cost ceiling cannot catch it. The depth bound aborts such input
+# deterministically instead. This BORROWS PostgreSQL's condition name + code (PG raises 54001
+# `statement_too_complex` from check_stack_depth), but jed's trigger is a fixed nesting depth
+# (deterministic, cross-core identical — §8) rather than PG's runtime stack-pointer probe
+# (build-/platform-dependent). Asserted by the conformance corpus (the resource.depth_limit
+# capability), since the abort point is part of the cross-core contract (no reference impl, §2).
+[[error]]
+code = "54001"
+name = "statement_too_complex"
+class = "program limit exceeded"
+template = "statement too complex: nesting depth exceeds the maximum of {max}"
+
+# 54P01 cost_limit_exceeded — a caller-imposed cost ceiling was exceeded during execution.
+# jed-specific: PostgreSQL has no execution-cost ceiling, so this code (a `P` subclass, like
+# 22P02/42P18/25P02) is a documented divergence (CLAUDE.md §1/§13; spec/design/cost.md §6). The
+# deterministic cost meter (spec/cost/schedule.toml) accrues a query's cost; when it reaches the
 # handle's `max_cost` (spec/design/api.md §8) execution aborts here — the safety gate for
 # untrusted, user-supplied queries. Asserted by the conformance corpus (the resource.cost_limit
 # capability), since the abort point is part of the cross-core contract (no reference impl, §2).

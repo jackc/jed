@@ -101,6 +101,13 @@ pub enum SqlState {
     DependentObjectsStillExist,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
+    /// 54001 — statement too complex: a statement's expression / subquery / set-operation nesting
+    /// depth exceeds the engine's fixed maximum (`parser::MAX_EXPR_DEPTH`). The native-stack-safety
+    /// gate for untrusted input — deeply-nested SQL would otherwise overflow the recursive-descent
+    /// parser / resolve / eval walks BEFORE the cost meter runs, so `54P01` cannot catch it
+    /// (CLAUDE.md §13; spec/design/cost.md §7). Borrows PG's `54001 statement_too_complex` name/code,
+    /// but the trigger is a fixed depth (deterministic, cross-core) not PG's runtime stack probe.
+    StatementTooComplex,
     /// 54P01 — cost limit exceeded: a query's accrued execution cost reached the caller-set
     /// `max_cost` ceiling and execution was aborted (CLAUDE.md §13; spec/design/cost.md §6).
     /// jed-specific (PostgreSQL has no execution-cost ceiling); class 54 program_limit_exceeded.
@@ -155,6 +162,7 @@ impl SqlState {
             SqlState::WrongObjectType => "42809",
             SqlState::DependentObjectsStillExist => "2BP01",
             SqlState::FeatureNotSupported => "0A000",
+            SqlState::StatementTooComplex => "54001",
             SqlState::CostLimitExceeded => "54P01",
             SqlState::IoError => "58030",
             SqlState::UndefinedFile => "58P01",

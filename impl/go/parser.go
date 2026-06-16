@@ -38,15 +38,48 @@ func binaryExpr(op BinaryOp, lhs, rhs Expr) Expr {
 // error rather than panicking, so the harness reports "not yet" cleanly.
 
 // Parser is a token cursor over a single statement.
+// maxExprDepth is the maximum expression / subquery / set-operation nesting depth a statement
+// may reach (spec/design/cost.md §7; CLAUDE.md §13). The §13 native-stack-safety gate for
+// untrusted input: the recursive-descent parser and the resolve/eval walks recurse to a
+// statement's nesting depth, so deeply-nested SQL would overflow the call stack BEFORE the cost
+// meter runs (54P01 cannot catch it). Counting logical depth against this fixed bound — rather
+// than PG's runtime stack-pointer probe — is deterministic and cross-core identical (§8): the
+// constant is the SAME in every core (Rust / Go / TS). 256 sits with a >2× margin under the
+// weakest core's native ceiling (the TS/Node default stack: ~547 nested subqueries) yet far above
+// any realistic query. Exceeding it aborts with 54001 statement_too_complex.
+const maxExprDepth = 256
+
 type Parser struct {
 	tokens []Token
 	pos    int
+	// depth is the current expression/query nesting depth (see maxExprDepth). Incremented once
+	// per AST level descended (deepen), restored on the way back up; left stale on the error path
+	// because a depth error aborts the whole parse.
+	depth int
 }
 
 // NewParser builds a parser over the given tokens.
 func NewParser(tokens []Token) *Parser {
 	return &Parser{tokens: tokens}
 }
+
+// deepen descends one nesting level, enforcing maxExprDepth (spec/design/cost.md §7). Call at
+// every point the AST gains a level — a binary-chain step, a unary, a postfix, a re-entry into a
+// fresh sub-expression, a nested subquery, a set-op branch. The caller restores the depth with
+// undeepen on the success path (an error short-circuits, leaving it stale, which is harmless: the
+// parse is aborting).
+func (p *Parser) deepen() error {
+	p.depth++
+	if p.depth > maxExprDepth {
+		return NewError(StatementTooComplex, fmt.Sprintf(
+			"statement too complex: nesting depth exceeds the maximum of %d", maxExprDepth,
+		))
+	}
+	return nil
+}
+
+// undeepen restores one nesting level taken by deepen (success path only).
+func (p *Parser) undeepen() { p.depth-- }
 
 // ParseSQL parses a single complete statement from sql.
 func ParseSQL(sql string) (Statement, error) {
@@ -963,6 +996,11 @@ func (p *Parser) parseQueryExpr() (Statement, error) {
 // parseQueryExpr but yields a QueryExpr (the subquery operand) rather than a Statement. The caller
 // has consumed the opening "(" and consumes the closing ")".
 func (p *Parser) parseSubquery() (QueryExpr, error) {
+	// A nested scalar subquery / EXISTS / IN (SELECT …) is one query-nesting level deeper; the
+	// guard also protects the parser's own stack against `(SELECT (SELECT … ))`.
+	if err := p.deepen(); err != nil {
+		return QueryExpr{}, err
+	}
 	node, err := p.parseSetExpr()
 	if err != nil {
 		return QueryExpr{}, err
@@ -983,6 +1021,7 @@ func (p *Parser) parseSubquery() (QueryExpr, error) {
 		node.SetOp.Limit = trailing.Limit
 		node.SetOp.Offset = trailing.Offset
 	}
+	p.undeepen()
 	return node, nil
 }
 
@@ -990,6 +1029,7 @@ func (p *Parser) parseSubquery() (QueryExpr, error) {
 // tighter (parsed inside parseIntersectExpr), so `a UNION b INTERSECT c` becomes
 // `a UNION (b INTERSECT c)`.
 func (p *Parser) parseSetExpr() (QueryExpr, error) {
+	base := p.depth
 	left, err := p.parseIntersectExpr()
 	if err != nil {
 		return QueryExpr{}, err
@@ -1002,7 +1042,11 @@ func (p *Parser) parseSetExpr() (QueryExpr, error) {
 		case "except":
 			op = SetOpExcept
 		default:
+			p.depth = base
 			return left, nil
+		}
+		if err := p.deepen(); err != nil { // each chained UNION/EXCEPT is one more set-op level
+			return QueryExpr{}, err
 		}
 		p.advance() // UNION | EXCEPT
 		all := p.parseSetOpQuantifier()
@@ -1016,12 +1060,16 @@ func (p *Parser) parseSetExpr() (QueryExpr, error) {
 
 // parseIntersectExpr parses the higher-precedence, left-associative INTERSECT level.
 func (p *Parser) parseIntersectExpr() (QueryExpr, error) {
+	base := p.depth
 	core, err := p.parseSelectCore()
 	if err != nil {
 		return QueryExpr{}, err
 	}
 	left := QueryExpr{Select: core}
 	for p.peekKeyword() == "intersect" {
+		if err := p.deepen(); err != nil { // each chained INTERSECT is one more set-op level
+			return QueryExpr{}, err
+		}
 		p.advance() // INTERSECT
 		all := p.parseSetOpQuantifier()
 		right, err := p.parseSelectCore()
@@ -1030,6 +1078,7 @@ func (p *Parser) parseIntersectExpr() (QueryExpr, error) {
 		}
 		left = QueryExpr{SetOp: &SetOp{Op: SetOpIntersect, All: all, Lhs: left, Rhs: QueryExpr{Select: right}}}
 	}
+	p.depth = base
 	return left, nil
 }
 
@@ -1591,14 +1640,30 @@ func (p *Parser) parseSelectItems() (SelectItems, error) {
 // this ladder must agree with it.
 
 // parseExpr is the entry point for WHERE, the SELECT list, and UPDATE assignment values.
-func (p *Parser) parseExpr() (Expr, error) { return p.parseOr() }
+func (p *Parser) parseExpr() (Expr, error) {
+	// A fresh sub-expression is one nesting level deeper (parens, ARRAY/ROW/CASE/function
+	// operands, subscript indices all re-enter here). Bounds the recursive descent itself.
+	if err := p.deepen(); err != nil {
+		return Expr{}, err
+	}
+	e, err := p.parseOr()
+	if err != nil {
+		return Expr{}, err
+	}
+	p.undeepen()
+	return e, nil
+}
 
 func (p *Parser) parseOr() (Expr, error) {
+	base := p.depth
 	lhs, err := p.parseAnd()
 	if err != nil {
 		return Expr{}, err
 	}
 	for p.peekKeyword() == "or" {
+		if err := p.deepen(); err != nil { // each chained OR is one more AST level
+			return Expr{}, err
+		}
 		p.advance()
 		rhs, err := p.parseAnd()
 		if err != nil {
@@ -1606,15 +1671,20 @@ func (p *Parser) parseOr() (Expr, error) {
 		}
 		lhs = binaryExpr(OpOr, lhs, rhs)
 	}
+	p.depth = base
 	return lhs, nil
 }
 
 func (p *Parser) parseAnd() (Expr, error) {
+	base := p.depth
 	lhs, err := p.parseNot()
 	if err != nil {
 		return Expr{}, err
 	}
 	for p.peekKeyword() == "and" {
+		if err := p.deepen(); err != nil { // each chained AND is one more AST level
+			return Expr{}, err
+		}
 		p.advance()
 		rhs, err := p.parseNot()
 		if err != nil {
@@ -1622,16 +1692,23 @@ func (p *Parser) parseAnd() (Expr, error) {
 		}
 		lhs = binaryExpr(OpAnd, lhs, rhs)
 	}
+	p.depth = base
 	return lhs, nil
 }
 
 func (p *Parser) parseNot() (Expr, error) {
 	if p.peekKeyword() == "not" {
 		p.advance()
-		operand, err := p.parseNot() // right-associative: NOT NOT x
+		// right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so the
+		// depth guard also protects the parser's own stack).
+		if err := p.deepen(); err != nil {
+			return Expr{}, err
+		}
+		operand, err := p.parseNot()
 		if err != nil {
 			return Expr{}, err
 		}
+		p.undeepen()
 		return Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNot, Operand: operand}}, nil
 	}
 	return p.parseComparison()
@@ -1764,6 +1841,7 @@ func (p *Parser) parseComparison() (Expr, error) {
 }
 
 func (p *Parser) parseAdditive() (Expr, error) {
+	base := p.depth
 	lhs, err := p.parseMultiplicative()
 	if err != nil {
 		return Expr{}, err
@@ -1776,7 +1854,11 @@ func (p *Parser) parseAdditive() (Expr, error) {
 		case TokMinus:
 			op = OpSub
 		default:
+			p.depth = base
 			return lhs, nil
+		}
+		if err := p.deepen(); err != nil { // each chained +/- is one more AST level (`1+1+…`)
+			return Expr{}, err
 		}
 		p.advance()
 		rhs, err := p.parseMultiplicative()
@@ -1788,6 +1870,7 @@ func (p *Parser) parseAdditive() (Expr, error) {
 }
 
 func (p *Parser) parseMultiplicative() (Expr, error) {
+	base := p.depth
 	lhs, err := p.parseUnary()
 	if err != nil {
 		return Expr{}, err
@@ -1802,7 +1885,11 @@ func (p *Parser) parseMultiplicative() (Expr, error) {
 		case TokPercent:
 			op = OpMod
 		default:
+			p.depth = base
 			return lhs, nil
+		}
+		if err := p.deepen(); err != nil { // each chained * / % is one more AST level
+			return Expr{}, err
 		}
 		p.advance()
 		rhs, err := p.parseUnary()
@@ -1837,10 +1924,16 @@ func (p *Parser) parseUnary() (Expr, error) {
 				Kind: LiteralDecimal, Dec: DecimalFromDigitsScale(true, t.Word, uint32(t.Int)),
 			}}, nil
 		}
+		// each chained unary `-` is one more AST level (recursion here, so the depth guard also
+		// protects the parser's own stack against `- - - … x`).
+		if err := p.deepen(); err != nil {
+			return Expr{}, err
+		}
 		operand, err := p.parseUnary()
 		if err != nil {
 			return Expr{}, err
 		}
+		p.undeepen()
 		return Expr{Kind: ExprUnary, Unary: &UnaryExpr{Op: OpNeg, Operand: operand}}, nil
 	}
 	return p.parsePostfix()
@@ -1863,12 +1956,24 @@ func (p *Parser) parseUnary() (Expr, error) {
 func (p *Parser) parsePostfix() (Expr, error) {
 	// Only a PARENTHESIZED primary is field-accessible (PG requires `(expr).field`). A subsequent
 	// `.field` keeps the chain field-accessible (`(c).a.b`); a `::` cast does not.
+	base0 := p.depth
 	fieldAccessible := p.peek().Kind == TokLParen
 	expr, err := p.parsePrimary()
 	if err != nil {
 		return Expr{}, err
 	}
 	for {
+		// each postfix `::`/`[…]`/`.field` wraps the base in one more AST level; deepen only when
+		// a postfix actually follows (not on the terminating non-postfix token).
+		isPostfix := p.peek().Kind == TokDoubleColon || p.peek().Kind == TokLBracket ||
+			(p.peek().Kind == TokDot && fieldAccessible)
+		if !isPostfix {
+			p.depth = base0
+			return expr, nil
+		}
+		if err := p.deepen(); err != nil {
+			return Expr{}, err
+		}
 		switch {
 		case p.peek().Kind == TokDoubleColon:
 			p.advance()
@@ -1952,6 +2057,8 @@ func (p *Parser) parsePostfix() (Expr, error) {
 				// a field value may itself be composite → `(c).a.b` chains
 			}
 		default:
+			// unreachable: the isPostfix precheck above already returned on a non-postfix token.
+			p.depth = base0
 			return expr, nil
 		}
 	}

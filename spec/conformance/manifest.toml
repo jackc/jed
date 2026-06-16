@@ -436,6 +436,10 @@ description = "Deterministic, cross-core-identical query cost accounting (CLAUDE
 id = "resource.cost_limit"
 description = "Caller-set execution-cost ceiling (`max_cost`) with a deterministic, cross-core-identical abort (54P01) the instant accrued cost reaches it (CLAUDE.md §13; spec/design/cost.md §6). The safety gate for untrusted, user-supplied queries; the `# max_cost: N` corpus directive runs the next record under a ceiling of N. Builds on resource.cost_metering."
 
+[[capability]]
+id = "resource.depth_limit"
+description = "Fixed maximum expression / subquery / set-operation nesting depth (MAX_EXPR_DEPTH = 256), checked in the parser and aborting with 54001 (statement_too_complex) (CLAUDE.md §13; spec/design/cost.md §7). The SECOND untrusted-query safety gate: it guards the native call stack, which the cost ceiling cannot — deeply-nested input overflows the recursive parser/resolve/eval walks BEFORE any cost is metered. The limit is a deterministic, cross-core-identical constant (a documented divergence from PG's runtime stack probe), so the same statement is accepted or rejected identically in every core; not oracle-checked."
+
 # Transaction control (Phase 5, spec/design/transactions.md §4). The SQL surface
 # BEGIN/COMMIT/ROLLBACK over the handle's single current transaction; tested by deterministic,
 # single-handle visibility sequences (the harness runs a whole .test file against one Database).

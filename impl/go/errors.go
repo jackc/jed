@@ -99,6 +99,13 @@ const (
 	DependentObjectsStillExist
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
+	// StatementTooComplex is 54001 — a statement's expression / subquery / set-operation nesting
+	// depth exceeds the engine's fixed maximum (maxExprDepth). The native-stack-safety gate for
+	// untrusted input — deeply-nested SQL would otherwise overflow the recursive-descent parser /
+	// resolve / eval walks BEFORE the cost meter runs, so 54P01 cannot catch it (CLAUDE.md §13;
+	// spec/design/cost.md §7). Borrows PG's 54001 statement_too_complex name/code, but the trigger
+	// is a fixed depth (deterministic, cross-core) not PG's runtime stack probe.
+	StatementTooComplex
 	// CostLimitExceeded is 54P01 — a query's accrued execution cost reached the caller-set
 	// max_cost ceiling and execution was aborted (CLAUDE.md §13; spec/design/cost.md §6).
 	// jed-specific (PostgreSQL has no execution-cost ceiling); class 54 program_limit_exceeded.
@@ -188,6 +195,8 @@ func (s SqlState) Code() string {
 		return "2BP01"
 	case FeatureNotSupported:
 		return "0A000"
+	case StatementTooComplex:
+		return "54001"
 	case CostLimitExceeded:
 		return "54P01"
 	case IoError:

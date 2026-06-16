@@ -15,14 +15,56 @@ use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
 use crate::token::Token;
 
+/// Maximum expression / subquery / set-operation **nesting depth** a statement may reach
+/// (spec/design/cost.md §7; CLAUDE.md §13). The §13 native-stack-safety gate for untrusted
+/// input: the recursive-descent parser and the resolve/eval walks recurse to a statement's
+/// nesting depth, so deeply-nested SQL would overflow the call stack BEFORE the cost meter runs
+/// (`54P01` cannot catch it). Counting logical depth against this **fixed** bound — rather than
+/// PG's runtime stack-pointer probe — is deterministic and **cross-core identical** (§8): the
+/// constant is the SAME in every core (Rust / Go / TS). `256` sits with a >2× margin under the
+/// weakest core's native ceiling (the TS/Node default stack: ~547 nested subqueries) yet far
+/// above any realistic query. Exceeding it aborts with `54001 statement_too_complex`.
+pub const MAX_EXPR_DEPTH: usize = 256;
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Current expression/query nesting depth (see `MAX_EXPR_DEPTH`). Incremented once per AST
+    /// level descended (`deepen`), restored on the way back up; left stale on the error path
+    /// because a depth error aborts the whole parse.
+    depth: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Descend one nesting level, enforcing `MAX_EXPR_DEPTH` (spec/design/cost.md §7). Call at
+    /// every point the AST gains a level — a binary-chain step, a unary, a postfix, a re-entry
+    /// into a fresh sub-expression, a nested subquery, a set-op branch. The caller restores the
+    /// depth with `undeepen` on the success path (`?` short-circuits leave it stale, which is
+    /// harmless: the parse is aborting).
+    fn deepen(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            return Err(EngineError::new(
+                SqlState::StatementTooComplex,
+                format!(
+                    "statement too complex: nesting depth exceeds the maximum of {MAX_EXPR_DEPTH}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Restore one nesting level taken by `deepen` (success path only).
+    fn undeepen(&mut self) {
+        self.depth -= 1;
     }
 
     /// Parse a single complete statement from `sql`.
@@ -737,10 +779,13 @@ impl Parser {
     /// `parse_query_expr` but yields a `QueryExpr` (the subquery operand) rather than a `Statement`.
     /// The caller has already consumed the opening `(` and consumes the closing `)`.
     fn parse_subquery(&mut self) -> Result<QueryExpr> {
+        // A nested scalar subquery / EXISTS / IN (SELECT …) is one query-nesting level deeper;
+        // the guard also protects the parser's own stack against `(SELECT (SELECT … ))`.
+        self.deepen()?;
         let node = self.parse_set_expr()?;
         let order_by = self.parse_order_by()?;
         let (limit, offset) = self.parse_limit_offset()?;
-        Ok(match node {
+        let result = match node {
             QueryExpr::Select(mut sel) => {
                 sel.order_by = order_by;
                 sel.limit = limit;
@@ -753,13 +798,16 @@ impl Parser {
                 so.offset = offset;
                 QueryExpr::SetOp(so)
             }
-        })
+        };
+        self.undeepen();
+        Ok(result)
     }
 
     /// `set_expr ::= intersect_expr (("UNION" | "EXCEPT") ("ALL"|"DISTINCT")? intersect_expr)*` —
     /// the lower-precedence, left-associative level. `INTERSECT` binds tighter (parsed inside
     /// `parse_intersect_expr`), so `a UNION b INTERSECT c` becomes `a UNION (b INTERSECT c)`.
     fn parse_set_expr(&mut self) -> Result<QueryExpr> {
+        let base = self.depth;
         let mut left = self.parse_intersect_expr()?;
         loop {
             let op = match self.peek_keyword().as_deref() {
@@ -767,6 +815,7 @@ impl Parser {
                 Some("except") => SetOpKind::Except,
                 _ => break,
             };
+            self.deepen()?; // each chained UNION/EXCEPT is one more set-op nesting level
             self.advance(); // UNION | EXCEPT
             let all = self.parse_setop_quantifier();
             let right = self.parse_intersect_expr()?;
@@ -780,14 +829,17 @@ impl Parser {
                 offset: None,
             }));
         }
+        self.depth = base;
         Ok(left)
     }
 
     /// `intersect_expr ::= select_core ("INTERSECT" ("ALL"|"DISTINCT")? select_core)*` — the
     /// higher-precedence, left-associative `INTERSECT` level.
     fn parse_intersect_expr(&mut self) -> Result<QueryExpr> {
+        let base = self.depth;
         let mut left = QueryExpr::Select(Box::new(self.parse_select_core()?));
         while self.peek_keyword().as_deref() == Some("intersect") {
+            self.deepen()?; // each chained INTERSECT is one more set-op nesting level
             self.advance(); // INTERSECT
             let all = self.parse_setop_quantifier();
             let right = QueryExpr::Select(Box::new(self.parse_select_core()?));
@@ -801,6 +853,7 @@ impl Parser {
                 offset: None,
             }));
         }
+        self.depth = base;
         Ok(left)
     }
 
@@ -1267,34 +1320,48 @@ impl Parser {
     /// Parse a general expression (the entry point for WHERE, the SELECT list, and
     /// UPDATE assignment values).
     fn parse_expr(&mut self) -> Result<Expr> {
-        self.parse_or()
+        // A fresh sub-expression is one nesting level deeper (parens, ARRAY/ROW/CASE/function
+        // operands, subscript indices all re-enter here). Bounds the recursive descent itself.
+        self.deepen()?;
+        let e = self.parse_or()?;
+        self.undeepen();
+        Ok(e)
     }
 
     fn parse_or(&mut self) -> Result<Expr> {
+        let base = self.depth;
         let mut lhs = self.parse_and()?;
         while self.peek_keyword().as_deref() == Some("or") {
+            self.deepen()?; // each chained OR is one more AST level
             self.advance();
             let rhs = self.parse_and()?;
             lhs = binary(BinaryOp::Or, lhs, rhs);
         }
+        self.depth = base;
         Ok(lhs)
     }
 
     fn parse_and(&mut self) -> Result<Expr> {
+        let base = self.depth;
         let mut lhs = self.parse_not()?;
         while self.peek_keyword().as_deref() == Some("and") {
+            self.deepen()?; // each chained AND is one more AST level
             self.advance();
             let rhs = self.parse_not()?;
             lhs = binary(BinaryOp::And, lhs, rhs);
         }
+        self.depth = base;
         Ok(lhs)
     }
 
     fn parse_not(&mut self) -> Result<Expr> {
         if self.peek_keyword().as_deref() == Some("not") {
             self.advance();
-            // right-associative: NOT NOT x
+            // right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so
+            // the depth guard also protects the parser's own stack).
+            self.deepen()?;
             let operand = self.parse_not()?;
+            self.undeepen();
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,
                 operand: Box::new(operand),
@@ -1416,6 +1483,7 @@ impl Parser {
     }
 
     fn parse_additive(&mut self) -> Result<Expr> {
+        let base = self.depth;
         let mut lhs = self.parse_multiplicative()?;
         loop {
             let op = match self.peek() {
@@ -1423,14 +1491,17 @@ impl Parser {
                 Token::Minus => BinaryOp::Sub,
                 _ => break,
             };
+            self.deepen()?; // each chained +/- is one more AST level (the `1+1+…` vector)
             self.advance();
             let rhs = self.parse_multiplicative()?;
             lhs = binary(op, lhs, rhs);
         }
+        self.depth = base;
         Ok(lhs)
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr> {
+        let base = self.depth;
         let mut lhs = self.parse_unary()?;
         loop {
             let op = match self.peek() {
@@ -1439,10 +1510,12 @@ impl Parser {
                 Token::Percent => BinaryOp::Mod,
                 _ => break,
             };
+            self.deepen()?; // each chained * / % is one more AST level
             self.advance();
             let rhs = self.parse_unary()?;
             lhs = binary(op, lhs, rhs);
         }
+        self.depth = base;
         Ok(lhs)
     }
 
@@ -1475,7 +1548,11 @@ impl Parser {
                     ))));
                 }
             }
+            // each chained unary `-` is one more AST level (recursion here, so the depth guard
+            // also protects the parser's own stack against `- - - … x`).
+            self.deepen()?;
             let operand = self.parse_unary()?;
+            self.undeepen();
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
                 operand: Box::new(operand),
@@ -1500,9 +1577,21 @@ impl Parser {
     fn parse_postfix(&mut self) -> Result<Expr> {
         // Only a PARENTHESIZED primary is field-accessible (PG requires `(expr).field`). A
         // subsequent `.field` keeps the chain field-accessible (`(c).a.b`); a `::` cast does not.
+        let base = self.depth;
         let mut field_accessible = matches!(self.peek(), Token::LParen);
         let mut expr = self.parse_primary()?;
         loop {
+            // each postfix `::`/`[…]`/`.field` wraps the base in one more AST level; deepen only
+            // when a postfix actually follows (not on the terminating non-postfix token).
+            let is_postfix = match self.peek() {
+                Token::DoubleColon | Token::LBracket => true,
+                Token::Dot => field_accessible,
+                _ => false,
+            };
+            if !is_postfix {
+                break;
+            }
+            self.deepen()?;
             match self.peek() {
                 Token::DoubleColon => {
                     self.advance();
@@ -1582,6 +1671,7 @@ impl Parser {
                 _ => break,
             }
         }
+        self.depth = base;
         Ok(expr)
     }
 

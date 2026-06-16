@@ -98,6 +98,18 @@ function binaryExpr(op: BinaryOp, lhs: Expr, rhs: Expr): Expr {
 }
 
 // parseSQL parses a single complete statement from sql.
+// MAX_EXPR_DEPTH is the maximum expression / subquery / set-operation nesting depth a statement
+// may reach (spec/design/cost.md §7; CLAUDE.md §13). The §13 native-stack-safety gate for
+// untrusted input: the recursive-descent parser and the resolve/eval walks recurse to a
+// statement's nesting depth, so deeply-nested SQL would overflow the call stack BEFORE the cost
+// meter runs (54P01 cannot catch it; in this core an overflow is an uncatchable-by-design V8
+// RangeError). Counting logical depth against this fixed bound — rather than PG's runtime
+// stack-pointer probe — is deterministic and cross-core identical (§8): the constant is the SAME
+// in every core (Rust / Go / TS). 256 sits with a >2× margin under the weakest core's native
+// ceiling — THIS core, on a default Node/V8 stack, overflows at ~547 nested subqueries — yet far
+// above any realistic query. Exceeding it throws 54001 statement_too_complex.
+export const MAX_EXPR_DEPTH = 256;
+
 export function parseSQL(sql: string): Statement {
   const p = new Parser(lex(sql));
   const stmt = p.parseStatement();
@@ -109,10 +121,35 @@ export function parseSQL(sql: string): Statement {
 class Parser {
   private tokens: Token[];
   private pos: number;
+  // Current expression/query nesting depth (see MAX_EXPR_DEPTH). Incremented once per AST level
+  // descended (deepen), restored on the way back up; left stale on the error path because a depth
+  // error aborts the whole parse.
+  private depth: number;
 
   constructor(tokens: Token[]) {
     this.tokens = tokens;
     this.pos = 0;
+    this.depth = 0;
+  }
+
+  // deepen descends one nesting level, enforcing MAX_EXPR_DEPTH (spec/design/cost.md §7). Call at
+  // every point the AST gains a level — a binary-chain step, a unary, a postfix, a re-entry into a
+  // fresh sub-expression, a nested subquery, a set-op branch. The caller restores the depth with
+  // undeepen on the success path (a throw short-circuits, leaving it stale, which is harmless: the
+  // parse is aborting).
+  private deepen(): void {
+    this.depth++;
+    if (this.depth > MAX_EXPR_DEPTH) {
+      throw engineError(
+        "statement_too_complex",
+        `statement too complex: nesting depth exceeds the maximum of ${MAX_EXPR_DEPTH}`,
+      );
+    }
+  }
+
+  // undeepen restores one nesting level taken by deepen (success path only).
+  private undeepen(): void {
+    this.depth--;
   }
 
   parseStatement(): Statement {
@@ -684,9 +721,13 @@ class Parser {
   // Mirrors parseQueryExpr but yields a QueryExpr. The caller has consumed the opening "(" and
   // consumes the closing ")".
   private parseSubquery(): QueryExpr {
+    // A nested scalar subquery / EXISTS / IN (SELECT …) is one query-nesting level deeper; the
+    // guard also protects the parser's own stack against `(SELECT (SELECT … ))`.
+    this.deepen();
     const node = this.parseSetExpr();
     const orderBy = this.parseOrderBy();
     const { limit, offset } = this.parseLimitOffsetClauses();
+    this.undeepen();
     return { ...node, orderBy, limit, offset };
   }
 
@@ -694,13 +735,18 @@ class Parser {
   // tighter (parsed inside parseIntersectExpr), so `a UNION b INTERSECT c` becomes
   // `a UNION (b INTERSECT c)`.
   private parseSetExpr(): QueryExpr {
+    const base = this.depth;
     let left = this.parseIntersectExpr();
     for (;;) {
       const kw = this.peekKeyword();
       let op: SetOpKind;
       if (kw === "union") op = "union";
       else if (kw === "except") op = "except";
-      else return left;
+      else {
+        this.depth = base;
+        return left;
+      }
+      this.deepen(); // each chained UNION/EXCEPT is one more set-op nesting level
       this.advance(); // UNION | EXCEPT
       const all = this.parseSetOpQuantifier();
       const right = this.parseIntersectExpr();
@@ -710,13 +756,16 @@ class Parser {
 
   // parseIntersectExpr parses the higher-precedence, left-associative INTERSECT level.
   private parseIntersectExpr(): QueryExpr {
+    const base = this.depth;
     let left: QueryExpr = this.parseSelectCore();
     while (this.peekKeyword() === "intersect") {
+      this.deepen(); // each chained INTERSECT is one more set-op nesting level
       this.advance(); // INTERSECT
       const all = this.parseSetOpQuantifier();
       const right = this.parseSelectCore();
       left = { kind: "setOp", op: "intersect", all, lhs: left, rhs: right, orderBy: [], limit: null, offset: null };
     }
+    this.depth = base;
     return left;
   }
 
@@ -1122,32 +1171,47 @@ class Parser {
 
   // parseExpr is the entry point for WHERE, the SELECT list, and UPDATE assignment values.
   parseExpr(): Expr {
-    return this.parseOr();
+    // A fresh sub-expression is one nesting level deeper (parens, ARRAY/ROW/CASE/function
+    // operands, subscript indices all re-enter here). Bounds the recursive descent itself.
+    this.deepen();
+    const e = this.parseOr();
+    this.undeepen();
+    return e;
   }
 
   private parseOr(): Expr {
+    const base = this.depth;
     let lhs = this.parseAnd();
     while (this.peekKeyword() === "or") {
+      this.deepen(); // each chained OR is one more AST level
       this.advance();
       lhs = binaryExpr("or", lhs, this.parseAnd());
     }
+    this.depth = base;
     return lhs;
   }
 
   private parseAnd(): Expr {
+    const base = this.depth;
     let lhs = this.parseNot();
     while (this.peekKeyword() === "and") {
+      this.deepen(); // each chained AND is one more AST level
       this.advance();
       lhs = binaryExpr("and", lhs, this.parseNot());
     }
+    this.depth = base;
     return lhs;
   }
 
   private parseNot(): Expr {
     if (this.peekKeyword() === "not") {
       this.advance();
-      // right-associative: NOT NOT x
-      return { kind: "unary", op: "not", operand: this.parseNot() };
+      // right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so the
+      // depth guard also protects the parser's own stack).
+      this.deepen();
+      const operand = this.parseNot();
+      this.undeepen();
+      return { kind: "unary", op: "not", operand };
     }
     return this.parseComparison();
   }
@@ -1244,25 +1308,35 @@ class Parser {
   }
 
   private parseAdditive(): Expr {
+    const base = this.depth;
     let lhs = this.parseMultiplicative();
     for (;;) {
       let op: BinaryOp;
       if (this.peek().kind === "plus") op = "add";
       else if (this.peek().kind === "minus") op = "sub";
-      else return lhs;
+      else {
+        this.depth = base;
+        return lhs;
+      }
+      this.deepen(); // each chained +/- is one more AST level (the `1+1+…` vector)
       this.advance();
       lhs = binaryExpr(op, lhs, this.parseMultiplicative());
     }
   }
 
   private parseMultiplicative(): Expr {
+    const base = this.depth;
     let lhs = this.parseUnary();
     for (;;) {
       let op: BinaryOp;
       if (this.peek().kind === "star") op = "mul";
       else if (this.peek().kind === "slash") op = "div";
       else if (this.peek().kind === "percent") op = "mod";
-      else return lhs;
+      else {
+        this.depth = base;
+        return lhs;
+      }
+      this.deepen(); // each chained * / % is one more AST level
       this.advance();
       lhs = binaryExpr(op, lhs, this.parseUnary());
     }
@@ -1286,7 +1360,12 @@ class Parser {
         const t = this.advance();
         return { kind: "literal", literal: { kind: "decimal", dec: Decimal.fromDigitsScale(true, t.decDigits!, t.decScale!) } };
       }
-      return { kind: "unary", op: "neg", operand: this.parseUnary() };
+      // each chained unary `-` is one more AST level (recursion here, so the depth guard also
+      // protects the parser's own stack against `- - - … x`).
+      this.deepen();
+      const operand = this.parseUnary();
+      this.undeepen();
+      return { kind: "unary", op: "neg", operand };
     }
     return this.parsePostfix();
   }
@@ -1308,10 +1387,16 @@ class Parser {
   private parsePostfix(): Expr {
     // Only a PARENTHESIZED primary is field-accessible (PG requires `(expr).field`). A subsequent
     // `.field` keeps the chain field-accessible (`(c).a.b`); a `::` cast does not.
+    const base0 = this.depth;
     let fieldAccessible = this.peek().kind === "lparen";
     let expr = this.parsePrimary();
     for (;;) {
       const k = this.peek().kind;
+      // each postfix `::`/`[…]`/`.field` wraps the base in one more AST level; deepen only when a
+      // postfix actually follows (not on the terminating non-postfix token).
+      const isPostfix = k === "doubleColon" || k === "lbracket" || (k === "dot" && fieldAccessible);
+      if (!isPostfix) break;
+      this.deepen();
       if (k === "doubleColon") {
         this.advance();
         const baseType = this.expectIdentifier();
@@ -1365,9 +1450,10 @@ class Parser {
           // a field value may itself be composite → `(c).a.b` chains (fieldAccessible stays true)
         }
       } else {
-        break;
+        break; // unreachable: the isPostfix precheck already broke on a non-postfix token
       }
     }
+    this.depth = base0;
     return expr;
   }
 

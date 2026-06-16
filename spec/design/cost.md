@@ -13,6 +13,11 @@ have landed: the metering **seam** — the cost counter threaded through the exe
 expression evaluator, and storage reads — and the **ceiling + deterministic abort** built on
 it (§6). A caller sets `max_cost` on the handle (spec/design/api.md §8); the instant a
 statement's accrued cost reaches it, execution aborts with `54P01` (`cost_limit_exceeded`).
+A **second**, independent untrusted-query gate guards the *native call stack* rather than
+accrued cost: a fixed maximum expression/query **nesting depth**, checked in the parser,
+aborting with `54001` (`statement_too_complex`) before deeply-nested input can overflow the
+stack — a hazard the cost ceiling structurally cannot catch (it strikes before metering). See
+§7.
 
 ## 1. Why cost is a shared contract, not an implementation detail
 
@@ -782,3 +787,70 @@ Other items recorded against the seam:
   wall-clock**, no allocation/iteration-order basis (§10, [storage.md](storage.md)). A host
   function supplying none of these is admissible only on a handle with `max_cost = 0`
   (unlimited), never the untrusted-query surface. Tracked in TODO.md (Phase 7/9).
+
+## 7. Native-stack safety — the expression nesting-depth limit (landed)
+
+The cost ceiling (§6) bounds *accrued cost*, but it does **not** bound **native call-stack
+depth** — and that is a second, independent §13 untrusted-query hazard. The parser is
+recursive-descent and the downstream walks (resolve `Expr`→`RExpr`, evaluate, constant-fold,
+the touched-column / structural-validation passes) recurse to a statement's **nesting depth**.
+So deeply-nested untrusted input — `1 + 1 + … + 1` thousands deep, or nested
+parens / `ARRAY[…]` / subscripts / `CASE` / scalar subqueries — can **overflow the call
+stack during parse or resolve, *before any cost is metered***. The cost ceiling cannot catch
+this: such a statement SIGABRTs (or, in the TS core, throws an uncatchable-by-design
+`RangeError`) **even at `max_cost = 1`**, because the overflow happens before the meter runs.
+Memory-safety (§13) does not catch it either — a stack overflow is an abort, not a memory
+error the safe language prevents. So it needs its own gate.
+
+**The fix — a fixed maximum nesting depth, checked in the parser.** A single shared
+**depth counter** is threaded through the recursive-descent expression grammar and incremented
+once at each point the AST gains a level: every binary-operator chain step (`OR`/`AND`/
+additive/multiplicative loops), every unary (`NOT`, unary `-`), every postfix
+(`::`cast / `[…]`subscript / `.field`), every re-entry into a fresh expression (parenthesized
+sub-expression, `ARRAY`/`ROW`/function-argument/`CASE`/subscript-index operand), every nested
+**scalar subquery / `EXISTS` / `IN (SELECT …)`**, and every **set-operation** branch
+(`UNION`/`INTERSECT`/`EXCEPT` chain). When the counter exceeds **`MAX_EXPR_DEPTH = 256`** the
+parser aborts with **`54001` `statement_too_complex`** ([../errors/registry.toml](../errors/registry.toml)).
+
+Why enforce in the **parser** and not the evaluator: the parser is the *first* pass and the
+*producer* of the tree. Bounding the depth there means **no `Expr`/`RExpr` taller than the
+limit is ever constructed**, so every downstream walk (resolve, eval, fold, the structural
+`CHECK`/`DEFAULT` validators, the touched-column collector) is transitively safe with **zero
+extra guard sites** — one mechanism, one place. (`IN (list)`, `BETWEEN`, `LIKE`, `CASE` are
+flat `RExpr` nodes, not desugared into deep nesting, so bounding source-AST depth bounds the
+resolved tree to within a constant — the bound is tight.)
+
+**Why `256`, and why a fixed number rather than PG's probe.** PostgreSQL raises this same
+`54001` from `check_stack_depth()`, which compares the *actual* stack pointer against
+`max_stack_depth` — a value that depends on the build, the platform, and the per-frame size, so
+it is **non-deterministic and not cross-core reproducible**. jed instead counts **logical
+nesting depth** against a **fixed** limit: deterministic, identical in every core, independent
+of build mode (debug vs. release) and platform — exactly the §8 cross-core-identity contract
+(the same `(statement)` is accepted or rejected with `54001` in Rust, Go, and TS alike). The
+constant is chosen for **native-stack headroom in the *weakest* core**: the TS core, running on
+a default Node/V8 call stack, overflows at roughly ~547 nested subqueries, ~860 operator-chain
+levels, and ~940 nested parens; the Rust and Go cores tolerate far more (Go's stack grows;
+Rust release frames are small). `256` sits with a **>2× margin** under the tightest of those
+(nested subqueries, which cost two depth units per level and so trip the limit at ~128 actual
+levels), while remaining **far** above any realistic query — hand-written or ORM-generated
+SQL does not nest expressions hundreds deep. It is a deliberate, documented divergence from
+PG's effectively-larger limit (the *overriding reason*: cross-core determinism + the weakest
+core's stack, CLAUDE.md §1/§8/§13), recorded here at the point it is taken.
+
+**Determinism + cost.** The check is **free of cost units** — it is a structural bound on the
+statement, not metered work, and it fires identically regardless of `max_cost`. The depth
+counter resets per statement (a fresh parser per `parse_sql`). Surfacing follows each core's
+idiom like every other engine error (Rust `Result`, Go `error`, TS `throw`), aborting at the
+same logical depth.
+
+**Conformance.** [../conformance/suites/resource/depth_limit.test](../conformance/suites/resource/depth_limit.test)
+pins both directions cross-core (a just-under-limit statement runs; an over-limit one is
+`statement error 54001`), gated by the `resource.depth_limit` capability. Because the trigger
+is jed-specific (not PG's runtime probe), it is **not** oracle-checked.
+
+**Known follow-on (not this slice).** Two recursion vectors are *not* bounded by this
+expression/query-nesting counter: (a) **deeply-nested `CREATE TYPE` composite chains** resolved
+at DDL time, and (b) any future grammar that recurses outside the expression / query-expression
+/ set-op cascade. Both overflow only at far greater depth (or are already capped by an earlier
+engine error — e.g. nested `ROW(…)` in `INSERT … VALUES` is `42601` at depth 2); they are noted
+so the seam's coverage boundary is explicit.

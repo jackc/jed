@@ -511,19 +511,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Cost ceiling (`max_cost`) + deterministic abort** — a handle `max_cost` setting aborts a
       statement with `54P01` the instant accrued cost reaches it, via `Meter::guard()` at the
       unbounded-work points; the `# max_cost:` corpus directive pins it. → [cost.md §6](spec/design/cost.md) _(§13)_
-  - [ ] _follow-on:_ **bound expression-nesting depth** (native-stack safety for untrusted input).
-        The cost ceiling bounds *accrued cost* but NOT native-stack depth: the recursive-descent
-        resolver (and the eval/fold/touched walks) recurse to an expression's nesting depth, so a
-        deeply-nested query (`1+1+…` thousands deep, or nested parens/`ARRAY[…]`/subscripts) can
-        **overflow the call stack during resolve — before any cost is metered** (verified: such a
-        query SIGABRTs even at `max_cost = 1`). This is a §13 untrusted-query gap: memory-safety and
-        the cost ceiling both miss it. Fix the PG way — a deterministic **max nesting depth** checked
-        at parse/resolve (PG's `check_stack_depth()` → register `54001 statement_too_complex`, class
-        54 like `54P01`), cross-core and build-mode-independent. Set the limit generously (PG's
-        effective depth is in the thousands) so ordinary queries are unaffected. (The recursive-descent
-        debug-build frame cost — ~25-30 KB/level — is *separately* why `cargo test`'s
-        `cost_limit::pathological_expression_aborts_on_one_row` needs an 8 MiB test-thread stack, set
-        in `impl/rust/.cargo/config.toml` — a test-only, artifact-inert knob.) _(size: M; §13)_
+  - [x] **Bound expression-nesting depth** (native-stack safety for untrusted input) — a fixed
+        `MAX_EXPR_DEPTH = 256` checked in the recursive-descent parser (one shared counter
+        incremented at every AST level: binary-chain step, unary, postfix, sub-expression re-entry,
+        nested subquery, set-op branch), aborting with `54001 statement_too_complex` BEFORE
+        deeply-nested input (`1+1+…`, nested parens/`ARRAY`/subscripts/subqueries/`UNION`) can
+        overflow the parser/resolve/eval stack — the gap the `54P01` cost ceiling structurally
+        cannot catch (it strikes before metering). Bounding at the parser keeps every downstream
+        walk safe with no extra guard sites. A deterministic, cross-core-identical constant (a
+        documented divergence from PG's runtime `check_stack_depth` probe — chosen for the weakest
+        core's native stack, the TS/Node default, which overflows at ~547 nested subqueries).
+        All three cores + `resource.depth_limit` capability + `resource/depth_limit.test`.
+        → [cost.md §7](spec/design/cost.md) _(§13)_
 - [x] **The `jed` CLI** — a full-screen TUI client (Rust + ratatui/crossterm/tui-textarea, the
       §14-approved deps) + a plain script mode (`-c`/`-f`/stdin; aligned/csv/json). A host program,
       not a core. → [cli.md](spec/design/cli.md)

@@ -200,6 +200,8 @@ fn error_codes_are_registered() {
         SqlState::InvalidTableDefinition,
         SqlState::IndeterminateDatatype,
         SqlState::FeatureNotSupported,
+        SqlState::StatementTooComplex,
+        SqlState::CostLimitExceeded,
         SqlState::IoError,
         SqlState::UndefinedFile,
         SqlState::DuplicateFile,

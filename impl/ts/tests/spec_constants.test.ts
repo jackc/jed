@@ -117,6 +117,8 @@ test("error codes are registered in spec/errors/registry.toml", () => {
     "invalid_table_definition",
     "indeterminate_datatype",
     "feature_not_supported",
+    "statement_too_complex",
+    "cost_limit_exceeded",
     "io_error",
     "undefined_file",
     "duplicate_file",
