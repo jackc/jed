@@ -199,7 +199,7 @@ func encodeValue(ty ColType, v Value) []byte {
 			panic("BUG: a non-array value in an array column")
 		}
 		out := []byte{0x00} // present
-		return append(out, encodeArrayBody(*ty.Elem, *v.Array)...)
+		return append(out, encodeArrayBody(*ty.Elem, v.Array)...)
 	}
 	if !ty.Composite {
 		return encodeScalar(ty.Scalar, v)
@@ -216,40 +216,43 @@ func encodeValue(ty ColType, v Value) []byte {
 
 // encodeArrayBody is an array value's body (after the 0x00 present tag, spec/design/array.md §4):
 // ndim u8, flags u8, per-dim (len u32 BE, lb i32 BE), then the optional null bitmap (present iff
-// HAS_NULLS) and the present element bodies. v1 writes 1-D values only: an empty array is ndim 0;
-// a non-empty array is ndim 1, len = element count, lb = 1. The bitmap (MSB-first, like composite)
-// is present iff any element is NULL; a NULL element contributes zero body bytes.
-func encodeArrayBody(elem ColType, elems []Value) []byte {
-	if len(elems) == 0 {
+// HAS_NULLS) and the present element bodies (row-major). An empty array is ndim 0; otherwise ndim is
+// the dimension count and each dimension records its length and lower bound (multidim + custom lower
+// bounds — spec/design/array.md §12). The bitmap (MSB-first, like composite) is present iff any
+// element is NULL; a NULL element contributes zero body bytes.
+func encodeArrayBody(elem ColType, a *ArrayVal) []byte {
+	if len(a.Elements) == 0 {
 		return []byte{0, 0} // ndim 0, flags 0 (empty array)
 	}
 	hasNulls := false
-	for _, e := range elems {
+	for _, e := range a.Elements {
 		if e.Kind == ValNull {
 			hasNulls = true
 			break
 		}
 	}
-	out := make([]byte, 0, 10+4*len(elems))
-	out = append(out, 1) // ndim = 1 (v1: 1-D values only)
+	out := make([]byte, 0, 2+8*a.Ndim()+4*len(a.Elements))
+	out = append(out, byte(a.Ndim()))
 	if hasNulls {
 		out = append(out, 0x01) // flags: bit 0 = HAS_NULLS
 	} else {
 		out = append(out, 0x00)
 	}
-	out = appendU32(out, uint32(len(elems))) // dim length
-	out = appendU32(out, 1)                  // lower bound = 1
+	for d := 0; d < a.Ndim(); d++ {
+		out = appendU32(out, uint32(a.Dims[d]))    // dim length
+		out = appendU32(out, uint32(a.Lbounds[d])) // lower bound (i32 BE)
+	}
 	if hasNulls {
-		nbytes := (len(elems) + 7) / 8
+		nbytes := (len(a.Elements) + 7) / 8
 		bitmap := make([]byte, nbytes)
-		for i, e := range elems {
+		for i, e := range a.Elements {
 			if e.Kind == ValNull {
 				bitmap[i/8] |= 0x80 >> uint(i%8)
 			}
 		}
 		out = append(out, bitmap...)
 	}
-	for _, e := range elems {
+	for _, e := range a.Elements {
 		if e.Kind != ValNull {
 			out = append(out, encodeValue(elem, e)[1:]...) // body only (no presence tag)
 		}
@@ -1475,7 +1478,7 @@ func valuePayload(ty ColType, v Value) []byte {
 	if ty.Elem != nil {
 		// An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies);
 		// a large array spills through the same overflow + LZ4 path (spec/design/array.md §4).
-		return encodeArrayBody(*ty.Elem, *v.Array)
+		return encodeArrayBody(*ty.Elem, v.Array)
 	}
 	if ty.Composite {
 		// A composite's payload is its body — the encoding minus the leading presence tag, i.e. the
@@ -2564,8 +2567,8 @@ func readInlineBody(ty ColType, buf []byte, pos *int) (Value, error) {
 
 // readArrayBody reads an array value's present body (after the 0x00 tag): inverse of
 // encodeArrayBody (spec/design/array.md §4). Reads ndim/flags/per-dim (len, lb), then the optional
-// null bitmap and the present element bodies. v1 accepts ndim 0 (empty) or 1 (1-D); a higher ndim
-// is rejected XX001 (multidim values are not written this slice — §12).
+// null bitmap and the present element bodies (row-major). Accepts ndim 0 (empty) through 6 (MAXDIM);
+// a higher ndim or an element-count overflow is XX001.
 func readArrayBody(ty ColType, buf []byte, pos *int) (Value, error) {
 	if ty.Elem == nil {
 		return Value{}, NewError(DataCorrupted, "readArrayBody on a non-array type")
@@ -2582,31 +2585,41 @@ func readArrayBody(ty ColType, buf []byte, pos *int) (Value, error) {
 		return Value{}, NewError(DataCorrupted, "array flags has a reserved bit set")
 	}
 	if ndim == 0 {
-		// An empty array — a non-nil empty slice, matching the store path's make([]Value, 0) so an
-		// empty array read back is reflect.DeepEqual to one built in memory (nil != [] in DeepEqual).
-		return ArrayValue([]Value{}), nil
+		// An empty array (ndim 0) — all-empty slices.
+		return ArrayValueOf(EmptyArray()), nil
 	}
-	if ndim != 1 {
-		return Value{}, NewError(DataCorrupted, "multidimensional array value not supported (ndim > 1)")
+	if ndim > 6 {
+		return Value{}, NewError(DataCorrupted, "array ndim exceeds the maximum of 6")
 	}
-	n, err := readU32(buf, pos)
-	if err != nil {
-		return Value{}, err
+	dims := make([]int, ndim)
+	lbounds := make([]int32, ndim)
+	n := 1
+	for d := 0; d < int(ndim); d++ {
+		ln, err := readU32(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		lb, err := readU32(buf, pos) // lower bound (i32 two's-complement)
+		if err != nil {
+			return Value{}, err
+		}
+		dims[d] = int(ln)
+		lbounds[d] = int32(lb)
+		n *= int(ln)
+		if n < 0 || n > (1<<31) {
+			return Value{}, NewError(DataCorrupted, "array element count overflow")
+		}
 	}
-	if _, err := readU32(buf, pos); err != nil { // lower bound (round-tripped, ignored in v1)
-		return Value{}, err
-	}
-	length := int(n)
 	hasNulls := flags&0x01 != 0
 	var bitmap []byte
 	if hasNulls {
-		bitmap, err = take(buf, pos, (length+7)/8)
+		bitmap, err = take(buf, pos, (n+7)/8)
 		if err != nil {
 			return Value{}, err
 		}
 	}
-	elems := make([]Value, length)
-	for i := 0; i < length; i++ {
+	elems := make([]Value, n)
+	for i := 0; i < n; i++ {
 		if hasNulls && bitmap[i/8]&(0x80>>uint(i%8)) != 0 {
 			elems[i] = NullValue()
 		} else {
@@ -2617,7 +2630,7 @@ func readArrayBody(ty ColType, buf []byte, pos *int) (Value, error) {
 			elems[i] = v
 		}
 	}
-	return ArrayValue(elems), nil
+	return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elems}), nil
 }
 
 // readCompositeBody reads a composite value's present body (after the 0x00 tag): the null bitmap then

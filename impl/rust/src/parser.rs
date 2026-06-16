@@ -8,7 +8,7 @@ use crate::ast::{
     Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, CreateType, DefaultDef,
     Delete, DropIndex, DropTable, DropType, Expr, Insert, InsertSource, InsertValue, JoinClause,
     JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItem, SelectItems, SetOp, SetOpKind,
-    Statement, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update,
+    Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -1521,18 +1521,42 @@ impl Parser {
                     };
                     field_accessible = false;
                 }
-                // `base[index]` — array element subscript (spec/design/array.md §6). Applies to ANY
-                // base (no parens rule, unlike `.field`) and chains (`a[1][2]`). The index is a full
-                // expression; a slice `a[m:n]` is deferred (no single-colon token, so it does not
-                // parse). After a subscript a `.field` still needs parens (PG), so it is not
-                // field-accessible.
+                // `base[..][..]` — array subscript (spec/design/array.md §6). Applies to ANY base
+                // (no parens rule, unlike `.field`). Consecutive `[…]` brackets collect into ONE
+                // access (so `a[1][2]` is a single multidim element read, not nested subscripting).
+                // Each spec is an index `[i]` or a slice `[m:n]` (bounds optionally omitted). After a
+                // subscript a `.field` still needs parens (PG), so it is not field-accessible.
                 Token::LBracket => {
-                    self.advance();
-                    let index = self.parse_expr()?;
-                    self.expect(&Token::RBracket)?;
+                    let mut subscripts = Vec::new();
+                    while matches!(self.peek(), Token::LBracket) {
+                        self.advance(); // [
+                        // The lower bound / index is absent only before a `:` or `]` (`[:n]`, `[]`).
+                        let lower = if matches!(self.peek(), Token::Colon | Token::RBracket) {
+                            None
+                        } else {
+                            Some(self.parse_expr()?)
+                        };
+                        if matches!(self.peek(), Token::Colon) {
+                            self.advance(); // :
+                            let upper = if matches!(self.peek(), Token::RBracket) {
+                                None
+                            } else {
+                                Some(self.parse_expr()?)
+                            };
+                            self.expect(&Token::RBracket)?;
+                            subscripts.push(SubscriptSpec::Slice(lower, upper));
+                        } else {
+                            // Index form: a bare `[]` (no index, no colon) is a syntax error.
+                            let idx = lower.ok_or_else(|| {
+                                syntax("array subscript requires an index".to_string())
+                            })?;
+                            self.expect(&Token::RBracket)?;
+                            subscripts.push(SubscriptSpec::Index(idx));
+                        }
+                    }
                     expr = Expr::Subscript {
                         base: Box::new(expr),
-                        index: Box::new(index),
+                        subscripts,
                     };
                     field_accessible = false;
                 }
@@ -2001,6 +2025,7 @@ fn render_token(t: &Token) -> String {
         Token::Le => "<=".into(),
         Token::Ge => ">=".into(),
         Token::DoubleColon => "::".into(),
+        Token::Colon => ":".into(),
         Token::FatArrow => "=>".into(),
         Token::Eof => String::new(),
     }

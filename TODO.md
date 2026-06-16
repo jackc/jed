@@ -179,8 +179,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       foundation): a **structural** `Type::Array(Box<Type>)` over any element type, with array
       *shape* a property of the value (PG-faithful), the compact null-bitmap value codec (no
       per-element prefix for fixed-width elements), btree-NULL element comparison (*not* composite
-      3VL), and `array_in`/`array_out`. **S0–S4 landed** (`format_version` 10; subscripting `a[i]`
-      in S3). Spec'd in [array.md](spec/design/array.md); decisions §10, errors §11, delivery §12. _(size: XL; §4/§8)_
+      3VL), and `array_in`/`array_out`. **S0–S5 landed** (`format_version` 10; subscripting `a[i]`
+      in S3; multidim values + custom lower bounds + slices `a[m:n]` in S5). Spec'd in
+      [array.md](spec/design/array.md); decisions §10, errors §11, delivery §12. _(size: XL; §4/§8)_
   - [x] **S0** — `spec/design/array.md` + the CLAUDE.md §4 array-axis touch (structural; shape is a
         value property) + this slice breakdown + the §10 decisions + §11 error surface.
   - [x] **S1** — the open-`Type` `Array(Box<Type>)` arm threaded through parser/resolver/evaluator,
@@ -191,17 +192,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         literal (`array_in`) + INSERT/SELECT round-trip + `array_out` rendering — all three cores +
         Ruby byte-identical. 1-D values only. _(size: L)_
   - [x] **S3** — subscripting `a[i]` (1-based; OOB/NULL → NULL; non-array base `42804`) — a postfix
-        `[…]` on any base, all three cores + `types/subscript.test`. Slices `a[m:n]` stay deferred `0A000`. _(size: S)_
+        `[…]` on any base, all three cores + `types/subscript.test`. _(size: S)_
   - [x] **S4** — comparison / ordering / `IS NULL`: same-element-type comparable (`42804`
         otherwise), the **btree-NULL** element-wise `eq3`/`lt3`/`gt3` (§5 — *not* composite 3VL), the
         `ORDER BY` total-order arm, DISTINCT/GROUP BY array keys, whole-value-only `IS NULL`;
         oracle-pinned via `rake corpus:check`. (Landed with S1/S2.) _(size: M)_
-  - [ ] _follow-ons (each its own slice + obligations):_ multidimensional values (codec header
-        already supports them); custom lower bounds in construction; array slices `a[m:n]`;
-        array-of-composite elements; arrays-in-keys (`0A000`, encoding authored §8); the array
-        function/operator surface (`array_length`/`cardinality`/`unnest`/`||`/`@>`/`&&`/… + the
-        polymorphic `anyarray`/`anyelement` resolution + `ANY`/`ALL`/`VARIADIC`); runtime
-        text→array, `array::text`, and element-wise array→array casts.
+  - [x] **S5** — multidimensional values + custom lower bounds + slices `a[m:n]`. Value gained
+        `dims`/`lbounds` (codec header already carried them — no format bump); `ARRAY[ARRAY[…],…]`
+        stacking (rectangular/`2202E`), `'{{…},{…}}'` + `'[l:u]={…}'` literals, nested-brace + bound-prefix
+        `array_out`; subscript node became a list (`a[i][j]` multidim element access, domain `lb..ub`),
+        slices (renumber-to-1, clamp, empty→`{}`, NULL-bound→NULL, scalar-in-slice→`1:i`);
+        `array_eq`/`array_cmp` count→ndim→dims→lbounds tiebreak; `2202E` registered. All three cores +
+        Ruby (golden row 4), `types/array_multidim.test` + `types/array_slice.test`, capabilities
+        `types.array_multidim` + `expr.array_slice`. _(size: XL)_
+  - [ ] _follow-ons (each its own slice + obligations):_ array-of-composite elements; arrays-in-keys
+        (`0A000`, encoding authored §8); the array function/operator surface
+        (`array_length`/`cardinality`/`unnest`/`||`/`@>`/`&&`/… + the polymorphic
+        `anyarray`/`anyelement` resolution + `ANY`/`ALL`/`VARIADIC`); runtime text→array,
+        `array::text`, and element-wise array→array casts.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis**, sibling to `array` and sharing ~80% of its foundation, so sequence
       the two together. **The headline implication: this turns the *closed* type enum into an *open*,

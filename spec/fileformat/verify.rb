@@ -443,15 +443,20 @@ UNIQUE_TABLE = {
 # array columns — an int32[] (fixed-width elements: NO per-element length prefix) and a text[]
 # (variable-width). Row 1 is a plain int + text array; row 2 has an EMPTY array (ndim=0) and an
 # empty text array; row 3 has a NULL element (the HAS_NULLS bitmap branch) and a whole-value NULL
-# array (the lone 0x01 tag — distinct from an array OF a NULL element). The cores build this via
+# array (the lone 0x01 tag — distinct from an array OF a NULL element). Row 4 pins the §12 shapes:
+# a 2-D int32[] (ndim=2, dims [2,2]) and a custom-lower-bound text[] ([2:3], so the lb i32 field is
+# exercised). The cores build this via
 #   CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])
 #   INSERT (1, ARRAY[10,20,30], ARRAY['a','b']); (2, '{40,50}', '{}'); (3, ARRAY[1,NULL,3], NULL)
+#   INSERT (4, ARRAY[ARRAY[10,20],ARRAY[30,40]], '[2:3]={x,y}')
 ARRAY_TABLE = {
   name: "t",
   columns: [col("id", "int32", pk: true), col("xs", "int32[]"), col("tags", "text[]")],
   rows: [[1, [10, 20, 30], %w[a b]],
          [2, [40, 50], []],
-         [3, [1, nil, 3], nil]]
+         [3, [1, nil, 3], nil],
+         [4, { dims: [2, 2], lbounds: [1, 1], elements: [10, 20, 30, 40] },
+          { dims: [2], lbounds: [2], elements: %w[x y] }]]
 }.freeze
 
 FIXTURES = [
@@ -581,21 +586,30 @@ end
 
 # An array value's BODY (after the 0x00 present tag, spec/design/array.md §4):
 #   ndim u8 ‖ flags u8 ‖ per-dim (len u32 BE, lb i32 BE) ‖ [null bitmap if HAS_NULLS] ‖ element bodies
-# v1 writes 1-D values only: an empty array is ndim=0 (no dims/bitmap/elements); a non-empty array is
-# ndim=1, len=count, lb=1. The bitmap (MSB-first, like composite) is present iff any element is NULL
-# (the HAS_NULLS flag bit 0). A NULL element contributes zero body bytes; a present element its
-# value-codec body MINUS the presence tag (fixed-width elements thus pay no per-element overhead).
-def encode_array_body(elem_type, elems)
+# An empty array is ndim=0 (no dims/bitmap/elements); otherwise ndim is the dimension count and each
+# dimension records its length and lower bound (multidim + custom lower bounds — §12). The value is
+# either a flat Array (1-D, lower bound 1) or a Hash {dims:, lbounds:, elements:} (a shaped value).
+# The bitmap (MSB-first, like composite) is present iff any element is NULL (HAS_NULLS, flag bit 0);
+# a NULL element contributes zero body bytes; a present element its value-codec body MINUS the tag.
+def encode_array_body(elem_type, val)
+  if val.is_a?(Hash)
+    dims = val[:dims]
+    lbounds = val[:lbounds]
+    elems = val[:elements]
+  else
+    elems = val
+    dims = elems.empty? ? [] : [elems.size]
+    lbounds = elems.empty? ? [] : [1]
+  end
   out = +"".b
   if elems.empty?
     out << [0].pack("C") << [0].pack("C") # ndim = 0 (empty array), flags 0
     return out
   end
   has_nulls = elems.any?(&:nil?)
-  out << [1].pack("C") # ndim = 1 (v1: 1-D values only)
+  out << [dims.size].pack("C") # ndim
   out << [has_nulls ? 1 : 0].pack("C") # flags: bit 0 = HAS_NULLS
-  out << u32(elems.size) # dim length
-  out << [1].pack("l>") # lower bound = 1 (i32 BE)
+  dims.each_with_index { |d, i| out << u32(d) << [lbounds[i]].pack("l>") } # per-dim (len, lb i32 BE)
   if has_nulls
     nbytes = (elems.size + 7) / 8
     bitmap = Array.new(nbytes, 0)
@@ -1501,10 +1515,12 @@ def decode_value(type, buf, pos, fetch = nil)
 end
 
 # Decode an array value body (inverse of encode_array_body, spec/design/array.md §4): ndim u8 ‖
-# flags u8 ‖ (when ndim=1) len u32 ‖ lb i32 ‖ [bitmap if HAS_NULLS] ‖ element bodies. ndim 0 = the
-# empty array; ndim > 1 is rejected (v1 writes 1-D only). A present element has no tag, so a 0x00 is
-# synthesized onto the remaining buffer and the real cursor advanced by what decode_value consumed
-# past it (npos - 1) — the same trick decode_composite_body uses. Returns [element array, pos].
+# flags u8 ‖ per-dim (len u32 ‖ lb i32) ‖ [bitmap if HAS_NULLS] ‖ element bodies. ndim 0 = the empty
+# array; ndim through 6 is accepted (multidim + custom lower bounds, §12). A present element has no
+# tag, so a 0x00 is synthesized onto the remaining buffer and the real cursor advanced by what
+# decode_value consumed past it (npos - 1) — the same trick decode_composite_body uses. Returns a
+# flat element Array for a default-lower-bound 1-D value (matching the simple fixture form), else a
+# Hash {dims:, lbounds:, elements:} (the shaped form). Returns [value, pos].
 def decode_array_body(elem_type, buf, pos)
   nb, pos = take(buf, pos, 1)
   fb, pos = take(buf, pos, 1)
@@ -1512,17 +1528,23 @@ def decode_array_body(elem_type, buf, pos)
   flags = fb.getbyte(0)
   raise "array flags has a reserved bit set" if (flags & ~0x01) != 0
   return [[], pos] if ndim.zero? # empty array
+  raise "array ndim exceeds the maximum of 6" if ndim > 6
 
-  raise "multidimensional array value not supported (ndim > 1)" if ndim != 1
-
-  lenb, pos = take(buf, pos, 4)
-  len = lenb.unpack1("N")
-  _lb, pos = take(buf, pos, 4) # lower bound (i32 bits) — round-tripped, ignored in v1
+  dims = []
+  lbounds = []
+  n = 1
+  ndim.times do
+    lenb, pos = take(buf, pos, 4)
+    lbb, pos = take(buf, pos, 4)
+    dims << lenb.unpack1("N")
+    lbounds << lbb.unpack1("l>") # lower bound (i32 BE)
+    n *= dims.last
+  end
   has_nulls = (flags & 0x01) != 0
   bitmap = nil
-  bitmap, pos = take(buf, pos, (len + 7) / 8) if has_nulls
+  bitmap, pos = take(buf, pos, (n + 7) / 8) if has_nulls
   elems = []
-  len.times do |i|
+  n.times do |i|
     if has_nulls && (bitmap.getbyte(i / 8) & (0x80 >> (i % 8))) != 0
       elems << nil
     else
@@ -1531,7 +1553,13 @@ def decode_array_body(elem_type, buf, pos)
       elems << v
     end
   end
-  [elems, pos]
+  # A default-lower-bound 1-D value decodes to the simple flat Array; anything shaped to the Hash.
+  value = if ndim == 1 && lbounds[0] == 1
+            elems
+          else
+            { dims: dims, lbounds: lbounds, elements: elems }
+          end
+  [value, pos]
 end
 
 # Decode a composite value body (inverse of encode_composite_body): read the null bitmap

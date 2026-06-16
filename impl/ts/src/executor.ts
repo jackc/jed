@@ -25,6 +25,7 @@ import type {
   SetOp,
   SetOpKind,
   Statement,
+  SubscriptSpec,
   TypeMod,
   Update,
 } from "./ast.ts";
@@ -114,9 +115,13 @@ import {
 import { AGGREGATES, type AggregateDesc, OPERATORS, type OperatorDesc } from "./operators.ts";
 import {
   type Value,
+  type ArrayInResult,
   boolAnd,
   boolNot,
   arrayValue,
+  emptyArray,
+  arrayNdim,
+  arrayUbound,
   boolOr,
   boolValue,
   byteaValue,
@@ -124,7 +129,7 @@ import {
   compareBytea,
   compareTextC,
   compositeValue,
-  parseArrayTokens,
+  parseArrayLiteral,
   decimalValue,
   eq3,
   float32Value,
@@ -3120,7 +3125,15 @@ export class Database {
         return e;
       case "subscript":
         e.base = this.foldUncorrelatedInRExpr(e.base, bound, cost);
-        e.index = this.foldUncorrelatedInRExpr(e.index, bound, cost);
+        e.subscripts = e.subscripts.map((s) =>
+          s.isSlice
+            ? {
+                isSlice: true,
+                lower: s.lower === null ? null : this.foldUncorrelatedInRExpr(s.lower, bound, cost),
+                upper: s.upper === null ? null : this.foldUncorrelatedInRExpr(s.upper, bound, cost),
+              }
+            : { isSlice: false, index: this.foldUncorrelatedInRExpr(s.index, bound, cost) },
+        );
         return e;
       case "inValues":
         e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
@@ -3578,10 +3591,24 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "field":
       return rexprReferencesOuter(e.base, depth);
     case "subscript":
-      return rexprReferencesOuter(e.base, depth) || rexprReferencesOuter(e.index, depth);
+      return rexprReferencesOuter(e.base, depth) || rSubscriptBounds(e.subscripts).some((b) => rexprReferencesOuter(b, depth));
     default:
       return false; // leaves: column, param, const*
   }
+}
+
+// rSubscriptBounds is the bound RExprs of a list of resolved subscript specs (each index, or a
+// slice's present lower/upper bounds) — for the RExpr tree walkers (spec/design/array.md §6).
+function rSubscriptBounds(subs: RSubscript[]): RExpr[] {
+  const out: RExpr[] = [];
+  for (const s of subs) {
+    if (!s.isSlice) out.push(s.index);
+    else {
+      if (s.lower !== null) out.push(s.lower);
+      if (s.upper !== null) out.push(s.upper);
+    }
+  }
+  return out;
 }
 
 // collectTouched marks the combined-row columns an expression STATICALLY references — the
@@ -3642,7 +3669,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       return;
     case "subscript":
       collectTouched(e.base, depth, touched);
-      collectTouched(e.index, depth, touched);
+      for (const b of rSubscriptBounds(e.subscripts)) collectTouched(b, depth, touched);
       return;
     default: // leaves: param, const*
   }
@@ -3691,8 +3718,8 @@ function valueToRExpr(v: Value): RExpr {
       // composite value (spec/design/composite.md).
       return { kind: "row", fields: v.fields.map(valueToRExpr) };
     case "array":
-      // A folded array constant: fold each element and wrap in an ARRAY node (spec/design/array.md).
-      return { kind: "array", elements: v.elements.map(valueToRExpr) };
+      // A folded array constant — preserve its full shape (dims/lbounds) in a const node.
+      return { kind: "constArray", value: v };
     default:
       return { kind: "constNull" };
   }
@@ -3720,10 +3747,17 @@ function distinctValueKey(v: Value): string {
           // scalar key and nested composites stay unambiguous.
           return "c" + v.fields.length.toString() + ":" + v.fields.map((f) => distinctValueKey(f)).join(",");
         case "array":
-          // An array keys structurally (spec/design/array.md §5): the element count under a distinct
-          // 'a' tag, then each element's own key. NULL elements key as 'n' (btree equality — NULLs
-          // mutually equal), so structurally-equal arrays share a DISTINCT/GROUP BY bucket.
-          return "a" + v.elements.length.toString() + ":" + v.elements.map((el) => distinctValueKey(el)).join(",");
+          // An array keys structurally INCLUDING its shape (spec/design/array.md §5): the dims and
+          // lower bounds (so [2:4]={1,2,3} and {1,2,3} bucket apart — array_eq considers them), then
+          // each element's own key. NULL elements key as 'n' (btree equality — NULLs mutually equal).
+          return (
+            "a" +
+            v.dims.join(":") +
+            ";" +
+            v.lbounds.join(";") +
+            "=" +
+            v.elements.map((el) => distinctValueKey(el)).join(",")
+          );
         case "null":
           return "n";
         case "int":
@@ -3815,6 +3849,12 @@ type ResolvedType =
   | { kind: "array"; elem: ResolvedType }
   | { kind: "null" };
 
+// RSubscript is one resolved subscript spec in a "subscript" RExpr (spec/design/array.md §6): an
+// index `a[i]`, or a slice `a[m:n]` whose bounds may be null (omitted: `a[:n]`/`a[m:]`/`a[:]`).
+type RSubscript =
+  | { isSlice: false; index: RExpr }
+  | { isSlice: true; lower: RExpr | null; upper: RExpr | null };
+
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
 // their (promotion-tower) result type so the computed value can be range-checked.
 type RExpr =
@@ -3841,16 +3881,19 @@ type RExpr =
   // constant). One operator_eval per node (cost.md §9).
   | { kind: "row"; fields: RExpr[] }
   // An ARRAY[...] constructor (spec/design/array.md §1): evaluate each element and assemble an array
-  // value. Also the folded form of an array constant. One operator_eval per node.
-  | { kind: "array"; elements: RExpr[] }
+  // value. `nested` stacks sub-arrays into one higher dimension (§4). One operator_eval per node.
+  | { kind: "array"; elements: RExpr[]; nested: boolean }
+  // A folded array constant (the valueToRExpr form), preserving its shape; evaluates to it directly.
+  | { kind: "constArray"; value: Value }
   // Field selection `(composite).field` (spec/design/composite.md §S4): evaluate `base` to a
   // composite value and return its `index`-th field (the field ordinal, fixed at resolve). A
   // whole-value-NULL composite yields NULL for any field. One operator_eval per node.
   | { kind: "field"; base: RExpr; index: number }
-  // Array element subscript `base[index]` (spec/design/array.md §6): evaluate `base` to an array and
-  // `index` to an integer, then return the 1-based element. A NULL array, a NULL index, or an
-  // out-of-bounds index yields NULL (PG — never an error). One operator_eval per node.
-  | { kind: "subscript"; base: RExpr; index: RExpr }
+  // Array subscript `base[..][..]` (spec/design/array.md §6): one or more subscript specs applied to
+  // `base`. All-index access reads one element (NULL when the subscript count ≠ ndim or any index is
+  // out of range); a slice (any spec a slice) returns a sub-array, with a scalar index i meaning 1:i.
+  // A NULL array or any NULL bound yields NULL. One operator_eval per node.
+  | { kind: "subscript"; base: RExpr; subscripts: RSubscript[]; isSlice: boolean }
   | { kind: "cast"; target: ScalarType; typmod: DecimalTypmod | null; operand: RExpr }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
   | { kind: "not"; operand: RExpr }
@@ -4239,6 +4282,20 @@ function isAggregateName(name: string): boolean {
   return AGGREGATES.some((a) => a.surface.toLowerCase() === lname);
 }
 
+// astSubscriptExprs is the sub-expressions of a list of AST subscript specs (each index, or a
+// slice's present bounds) — for the Expr tree walkers (spec/design/array.md §6).
+function astSubscriptExprs(subs: SubscriptSpec[]): Expr[] {
+  const out: Expr[] = [];
+  for (const s of subs) {
+    if (!s.isSlice) out.push(s.index);
+    else {
+      if (s.lower !== null) out.push(s.lower);
+      if (s.upper !== null) out.push(s.upper);
+    }
+  }
+  return out;
+}
+
 // exprHasAggregate reports whether an expression tree contains an AGGREGATE call anywhere. A
 // scalar-function call is not itself an aggregate but may CONTAIN one (abs(sum(x))), so its
 // arguments are walked.
@@ -4275,7 +4332,7 @@ function exprHasAggregate(e: Expr): boolean {
     case "fieldStar":
       return exprHasAggregate(e.base);
     case "subscript":
-      return exprHasAggregate(e.base) || exprHasAggregate(e.index);
+      return exprHasAggregate(e.base) || astSubscriptExprs(e.subscripts).some(exprHasAggregate);
     default:
       return false;
   }
@@ -4356,7 +4413,7 @@ function rejectCheckStructure(e: Expr): void {
       return rejectCheckStructure(e.base);
     case "subscript":
       rejectCheckStructure(e.base);
-      rejectCheckStructure(e.index);
+      for (const x of astSubscriptExprs(e.subscripts)) rejectCheckStructure(x);
       return;
     default: // column, qualifiedColumn, literal
       return;
@@ -4423,7 +4480,7 @@ function rejectDefaultStructure(e: Expr): void {
       return rejectDefaultStructure(e.base);
     case "subscript":
       rejectDefaultStructure(e.base);
-      rejectDefaultStructure(e.index);
+      for (const x of astSubscriptExprs(e.subscripts)) rejectDefaultStructure(x);
       return;
     default: // literal, typedLiteral
       return;
@@ -4488,7 +4545,7 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
         return walk(e.base);
       case "subscript":
         walk(e.base);
-        walk(e.index);
+        for (const x of astSubscriptExprs(e.subscripts)) walk(x);
         return;
       default: // literal, param; subqueries unreachable in a validated check
         return;
@@ -5539,8 +5596,13 @@ function resolve(
         nodes.push(node);
         elemTypes.push(type);
       }
-      const elem = unifyArrayElementTypes(elemTypes);
-      return { node: { kind: "array", elements: nodes }, type: { kind: "array", elem } };
+      // If the items are themselves arrays, this is a nested (multidim-stacking) constructor and the
+      // result type is the SAME array type (dimension-agnostic, §2/§4); otherwise a flat 1-D array.
+      const common = unifyArrayElementTypes(elemTypes);
+      if (common.kind === "array") {
+        return { node: { kind: "array", elements: nodes, nested: true }, type: common };
+      }
+      return { node: { kind: "array", elements: nodes, nested: false }, type: { kind: "array", elem: common } };
     }
     case "column": {
       // Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
@@ -5565,19 +5627,36 @@ function resolve(
       // expression position it is unsupported (PG rejects row expansion here — 0A000).
       throw engineError("feature_not_supported", "row expansion (.*) is not supported in this context");
     case "subscript": {
-      // `base[index]` — array element subscript (spec/design/array.md §6). The base must be an array
-      // (else 42804); the result type is the element type. The index is an integer (PG int4) — a
-      // literal adapts to the int context; a non-integer index is 42804. OOB / NULL → NULL is an
-      // evaluation-time rule, not a resolve error.
+      // `base[..][..]` — array subscript (spec/design/array.md §6). The base must be an array (else
+      // 42804). Each subscript bound is an integer (a literal adapts; a non-integer is 42804). If any
+      // spec is a slice the result is the array type (a sub-array); otherwise the element type. OOB /
+      // NULL → NULL is an evaluation-time rule, not a resolve error.
       const base = resolve(scope, e.base, null, ag, params);
       if (base.type.kind !== "array") {
         throw typeError(`cannot subscript a value of type ${rtName(base.type)}, which is not an array`);
       }
-      const idx = resolve(scope, e.index, "int32", ag, params);
-      if (idx.type.kind !== "int" && idx.type.kind !== "null") {
-        throw typeError(`array subscript must be an integer, not ${rtName(idx.type)}`);
-      }
-      return { node: { kind: "subscript", base: base.node, index: idx.node }, type: base.type.elem };
+      const resolveBound = (b: Expr): RExpr => {
+        const r = resolve(scope, b, "int32", ag, params);
+        if (r.type.kind !== "int" && r.type.kind !== "null") {
+          throw typeError(`array subscript must be an integer, not ${rtName(r.type)}`);
+        }
+        return r.node;
+      };
+      let isSlice = false;
+      const rsubs: RSubscript[] = e.subscripts.map((s) => {
+        if (s.isSlice) {
+          isSlice = true;
+          return {
+            isSlice: true,
+            lower: s.lower === null ? null : resolveBound(s.lower),
+            upper: s.upper === null ? null : resolveBound(s.upper),
+          };
+        }
+        return { isSlice: false, index: resolveBound(s.index) };
+      });
+      // A slice yields a sub-array (the array type); all-index access yields an element.
+      const type = isSlice ? base.type : base.type.elem;
+      return { node: { kind: "subscript", base: base.node, subscripts: rsubs, isSlice }, type };
     }
     case "param": {
       // A bind parameter is an adaptable operand (like an integer/string literal): it takes its
@@ -6652,6 +6731,159 @@ function unifyArrayElementTypes(types: ResolvedType[]): ResolvedType {
   return first;
 }
 
+// arraySubscriptErr is a 2202E array-subscript error (spec/design/array.md §11).
+function arraySubscriptErr(detail: string): Error {
+  return engineError("array_subscript_error", detail);
+}
+
+// buildNestedArray stacks the evaluated elements of a nested ARRAY[...] constructor into a value of
+// one higher dimension (spec/design/array.md §4). The resolver guarantees every item is an array; a
+// NULL sub-array or a sub-array of differing shape is a 2202E. Stacking empty sub-arrays yields the
+// empty array (PG: ARRAY['{}'::int[]] → {}).
+function buildNestedArray(subs: Value[]): Value {
+  const mismatch = "multidimensional arrays must have array expressions with matching dimensions";
+  const arrs = subs.map((sv) => {
+    if (sv.kind === "array") return sv;
+    if (sv.kind === "null") throw arraySubscriptErr(mismatch);
+    throw typeError("internal: nested array constructor over a non-array");
+  });
+  const eqNum = (a: number[], b: number[]): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
+  const dims0 = arrs[0]!.dims;
+  const lbounds0 = arrs[0]!.lbounds;
+  for (const a of arrs.slice(1)) {
+    if (!eqNum(a.dims, dims0) || !eqNum(a.lbounds, lbounds0)) throw arraySubscriptErr(mismatch);
+  }
+  if (dims0.length === 0) return emptyArray(); // all sub-arrays empty → empty array
+  const elements: Value[] = [];
+  for (const a of arrs) elements.push(...a.elements);
+  return { kind: "array", dims: [arrs.length, ...dims0], lbounds: [1, ...lbounds0], elements };
+}
+
+// evalSubscript evaluates an array subscript `base[..][..]` (spec/design/array.md §6). A NULL array
+// or any NULL subscript bound yields NULL; element access returns the element (or NULL), slice
+// access a (renumbered) sub-array.
+function evalSubscript(
+  e: { base: RExpr; subscripts: RSubscript[]; isSlice: boolean },
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): Value {
+  const base = evalExpr(e.base, row, env, m);
+  if (base.kind === "null") return nullValue();
+  if (base.kind !== "array") throw typeError("internal: subscript on a non-array value");
+  if (e.isSlice) {
+    // Per-dimension (lower, upper); a scalar index i becomes 1:i (PG), an omitted bound defers to
+    // the array's own bound (null lo/hi). A NULL bound → NULL.
+    const los: (bigint | null)[] = [];
+    const his: (bigint | null)[] = [];
+    for (const s of e.subscripts) {
+      if (!s.isSlice) {
+        const v = evalExpr(s.index, row, env, m);
+        if (v.kind === "null") return nullValue();
+        if (v.kind !== "int") throw typeError("internal: non-integer array subscript");
+        los.push(1n); // scalar i → 1:i
+        his.push(v.int);
+      } else {
+        const lo = evalOptBound(s.lower, row, env, m);
+        if (lo === "null") return nullValue();
+        const hi = evalOptBound(s.upper, row, env, m);
+        if (hi === "null") return nullValue();
+        los.push(lo);
+        his.push(hi);
+      }
+    }
+    return arrayGetSlice(base, los, his);
+  }
+  // Element access: every spec is an index.
+  const idxs: bigint[] = [];
+  for (const s of e.subscripts) {
+    if (s.isSlice) throw typeError("internal: slice spec in element access");
+    const v = evalExpr(s.index, row, env, m);
+    if (v.kind === "null") return nullValue();
+    if (v.kind !== "int") throw typeError("internal: non-integer array subscript");
+    idxs.push(v.int);
+  }
+  return arrayGetElement(base, idxs);
+}
+
+// evalOptBound evaluates an optional slice-bound expression: null expr → null (defer to the array
+// bound); a NULL value → "null" (the whole result is NULL); an integer → its bigint.
+function evalOptBound(e: RExpr | null, row: Row, env: EvalEnv, m: Meter): bigint | null | "null" {
+  if (e === null) return null;
+  const v = evalExpr(e, row, env, m);
+  if (v.kind === "null") return "null";
+  if (v.kind !== "int") throw typeError("internal: non-integer array slice bound");
+  return v.int;
+}
+
+// arrayGetElement reads a single array element by idxs (1-based per dimension, using the value's
+// lower bounds) — spec/design/array.md §6. NULL when the subscript count ≠ ndim or any index is out
+// of range.
+function arrayGetElement(a: { dims: number[]; lbounds: number[]; elements: Value[] }, idxs: bigint[]): Value {
+  const ndim = arrayNdim(a);
+  if (idxs.length !== ndim || a.elements.length === 0) return nullValue();
+  let flat = 0;
+  let stride = 1;
+  for (let d = ndim - 1; d >= 0; d--) {
+    const lb = BigInt(a.lbounds[d]!);
+    const ub = BigInt(arrayUbound(a, d));
+    if (idxs[d]! < lb || idxs[d]! > ub) return nullValue();
+    flat += Number(idxs[d]! - lb) * stride;
+    stride *= a.dims[d]!;
+  }
+  return a.elements[flat]!;
+}
+
+// arrayGetSlice reads an array slice (spec/design/array.md §6): per-dimension requested (lower,
+// upper) bounds (null defers to the value's own bound), clamped to each dimension's [lb,ub]. Too many
+// subscripts, an empty source, or any empty clamped dimension yields the empty array; fewer
+// subscripts than ndim leave the trailing dimensions at full range. The result is renumbered to lower
+// bound 1 on every dimension (PG array_get_slice).
+function arrayGetSlice(
+  a: { dims: number[]; lbounds: number[]; elements: Value[] },
+  los: (bigint | null)[],
+  his: (bigint | null)[],
+): Value {
+  const ndim = arrayNdim(a);
+  if (los.length > ndim || ndim === 0) return emptyArray();
+  const newDims: number[] = new Array(ndim);
+  const starts: number[] = new Array(ndim); // source 0-based start per dimension
+  for (let d = 0; d < ndim; d++) {
+    const lb = BigInt(a.lbounds[d]!);
+    const ub = BigInt(arrayUbound(a, d));
+    let reqLo = lb;
+    let reqHi = ub;
+    if (d < los.length) {
+      if (los[d] !== null) reqLo = los[d]!;
+      if (his[d] !== null) reqHi = his[d]!;
+    }
+    const lo = reqLo < lb ? lb : reqLo;
+    const hi = reqHi > ub ? ub : reqHi;
+    if (lo > hi) return emptyArray(); // any empty dimension → empty slice
+    newDims[d] = Number(hi - lo + 1n);
+    starts[d] = Number(lo - lb);
+  }
+  // Row-major strides over the SOURCE array.
+  const strides: number[] = new Array(ndim);
+  strides[ndim - 1] = 1;
+  for (let d = ndim - 2; d >= 0; d--) strides[d] = strides[d + 1]! * a.dims[d + 1]!;
+  let total = 1;
+  for (const d of newDims) total *= d;
+  const elements: Value[] = new Array(total);
+  const counter: number[] = new Array(ndim).fill(0);
+  for (let k = 0; k < total; k++) {
+    let flat = 0;
+    for (let d = 0; d < ndim; d++) flat += (starts[d]! + counter[d]!) * strides[d]!;
+    elements[k] = a.elements[flat]!;
+    for (let d = ndim - 1; d >= 0; d--) {
+      counter[d]!++;
+      if (counter[d]! < newDims[d]!) break;
+      counter[d] = 0;
+    }
+  }
+  return { kind: "array", dims: newDims, lbounds: new Array(ndim).fill(1), elements };
+}
+
 // unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or "null" for an
 // implicit ELSE) into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped
 // (they adapt); an all-NULL CASE is text (PostgreSQL). The non-NULL arms must share a family — all
@@ -7026,8 +7258,9 @@ function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string):
     throw typeError("cannot store a non-array value in array column " + colName);
   }
   // Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[] deferred).
+  // The shape (dims/lbounds) is preserved.
   const out = v.elements.map((el) => coerceForStore(el, elem, null, false, colName));
-  return arrayValue(out);
+  return { kind: "array", dims: v.dims, lbounds: v.lbounds, elements: out };
 }
 
 // storeComposite coerces a value into a COMPOSITE column (spec/design/composite.md §4): NULL honours
@@ -7064,7 +7297,14 @@ function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): V
   if (ty.kind === "array") {
     switch (iv.kind) {
       case "array": {
-        // ARRAY[e, …]: materialize each element against the element type.
+        // ARRAY[e, …]: a nested constructor (an element is itself ARRAY[…]) stacks the sub-arrays
+        // into a higher dimension (mirrors the evaluator's buildNestedArray, spec/design/array.md
+        // §4); otherwise each element materializes against the element type into a flat 1-D array. A
+        // scalar mixed with an array sub-element errors 42804 (materialized against the array type).
+        if (iv.elements.some((el) => el.kind === "array")) {
+          const subs = iv.elements.map((el) => materializeInsertValue(el, ty, bound));
+          return buildNestedArray(subs);
+        }
         const vals = iv.elements.map((el) => materializeInsertValue(el, ty.elem, bound));
         return arrayValue(vals);
       }
@@ -7121,19 +7361,22 @@ function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): V
 // via array_in (spec/design/array.md §7): each token is coerced to the element type (an unquoted
 // NULL token → NULL element). A malformed literal is 22P02.
 function coerceStringToArray(s: string, elem: ColType): Value {
-  const tokens = parseArrayTokens(s);
-  if (tokens === null) throw engineError("invalid_text_representation", "malformed array literal");
+  const parsed: ArrayInResult = parseArrayLiteral(s);
+  if (!parsed.ok) {
+    if (parsed.err === "boundflip") throw arraySubscriptErr("upper bound cannot be less than lower bound");
+    throw engineError("invalid_text_representation", "malformed array literal");
+  }
   if (elem.kind !== "scalar") {
     throw engineError("feature_not_supported", "array literal of a non-scalar element type is not supported");
   }
   const elemScalar = elem.scalar;
-  const vals = tokens.map((tok) => {
+  const vals = parsed.value.tokens.map((tok) => {
     if (tok === null) return nullValue();
     // Coerce the token to the element scalar via the typed-literal coercion, then read off its value.
     const { node } = coerceStringLiteral(tok, elemScalar, null);
     return rexprConstToValue(node);
   });
-  return arrayValue(vals);
+  return { kind: "array", dims: parsed.value.dims, lbounds: parsed.value.lbounds, elements: vals };
 }
 
 // rexprConstToValue extracts the Value from a constant RExpr (the const nodes coerceStringLiteral
@@ -7260,13 +7503,16 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return compositeValue(vals);
     }
     case "array": {
-      // An ARRAY[...] constructor — one operator_eval, then build the array from the evaluated
-      // elements (spec/design/array.md §1).
+      // An ARRAY[...] constructor — one operator_eval. A `nested` constructor stacks its sub-arrays
+      // into one higher dimension (spec/design/array.md §4); otherwise a flat 1-D array.
       m.charge(COSTS.operatorEval);
       const elems: Value[] = new Array(e.elements.length);
       for (let i = 0; i < e.elements.length; i++) elems[i] = evalExpr(e.elements[i]!, row, env, m);
-      return arrayValue(elems);
+      return e.nested ? buildNestedArray(elems) : arrayValue(elems);
     }
+    case "constArray":
+      // A folded array constant (shape preserved) — return it directly.
+      return e.value;
     case "field": {
       // Field selection — one operator_eval, then pull the resolved field ordinal out of the
       // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in range
@@ -7278,17 +7524,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return base.fields[e.index]!;
     }
     case "subscript": {
-      // Array element subscript `base[index]`, 1-based (spec/design/array.md §6). A NULL array, a
-      // NULL index, or an out-of-bounds index yields NULL (PG — never an error).
+      // Array subscript `base[..][..]` — one operator_eval (spec/design/array.md §6). A NULL array
+      // or any NULL subscript bound yields NULL; element access returns the element (or NULL), slice
+      // access a (renumbered) sub-array. The per-element walk is internal (unmetered).
       m.charge(COSTS.operatorEval);
-      const arr = evalExpr(e.base, row, env, m);
-      const idx = evalExpr(e.index, row, env, m);
-      if (arr.kind === "null" || idx.kind === "null") return nullValue();
-      if (arr.kind !== "array") throw typeError("internal: subscript on a non-array value");
-      if (idx.kind !== "int") throw typeError("internal: non-integer array subscript");
-      const i = idx.int; // 1-based bigint
-      if (i >= 1n && i <= BigInt(arr.elements.length)) return arr.elements[Number(i) - 1]!;
-      return nullValue(); // out of bounds
+      return evalSubscript(e, row, env, m);
     }
     case "cast": {
       m.charge(COSTS.operatorEval);
@@ -7997,16 +8237,22 @@ function valueCmp(a: Value, b: Value): number {
     }
     return a.fields.length < b.fields.length ? -1 : a.fields.length > b.fields.length ? 1 : 0;
   }
-  // An array sorts element-wise with NULLs-last per element (the PG array_cmp total order —
-  // spec/design/array.md §5): the first non-equal element decides, recursing through keyCmp; a
-  // shorter array (prefix) sorts first.
+  // An array sorts by the PG array_cmp total order (spec/design/array.md §5): element-wise over the
+  // flattened elements (NULLs-last per element, recursing through keyCmp), then fewer elements first,
+  // then smaller ndim, then per dimension (length, then lower bound).
   if (a.kind === "array" && b.kind === "array") {
     const n = Math.min(a.elements.length, b.elements.length);
     for (let i = 0; i < n; i++) {
       const c = keyCmp(a.elements[i]!, b.elements[i]!, false, false);
       if (c !== 0) return c;
     }
-    return a.elements.length < b.elements.length ? -1 : a.elements.length > b.elements.length ? 1 : 0;
+    if (a.elements.length !== b.elements.length) return a.elements.length < b.elements.length ? -1 : 1;
+    if (a.dims.length !== b.dims.length) return a.dims.length < b.dims.length ? -1 : 1;
+    for (let d = 0; d < a.dims.length; d++) {
+      if (a.dims[d] !== b.dims[d]) return a.dims[d]! < b.dims[d]! ? -1 : 1;
+      if (a.lbounds[d] !== b.lbounds[d]) return a.lbounds[d]! < b.lbounds[d]! ? -1 : 1;
+    }
+    return 0;
   }
   // Cross-family arms exist only for totality — ORDER BY is over a single typed column, so a
   // mixed pair is unreachable. A fixed family order keeps the comparator total.

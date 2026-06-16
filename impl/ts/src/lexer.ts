@@ -119,12 +119,13 @@ export function lex(sql: string): Token[] {
       i++;
     } else if (c === ":") {
       // `::` is the PostgreSQL typecast operator (grammar.md §37), scanned greedily as one
-      // token. A lone `:` is not part of jed's surface — a 42601 syntax error.
+      // token; a lone `:` is the array-slice separator a[m:n] (array.md §6).
       if (i + 1 < n && sql[i + 1] === ":") {
         tokens.push({ kind: "doubleColon" });
         i += 2;
       } else {
-        throw engineError("syntax_error", "unexpected character ':'");
+        tokens.push({ kind: "colon" });
+        i++;
       }
     } else if (c === "=") {
       // `=>` is the named-argument arrow (grammar.md §17), scanned greedily as one token;

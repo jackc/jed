@@ -1,0 +1,103 @@
+# Multidimensional array values + custom lower bounds (spec/design/array.md §12): the value codec's
+# ndim/dims/lbounds header (§4) is now exercised beyond 1-D-lb-1. ARRAY[ARRAY[…],…] stacks sub-arrays
+# into a higher dimension (row-major; non-rectangular → 2202E, a scalar/array mix → 42804); the
+# '{{…},{…}}' literal parses nested braces (non-rectangular or count-mismatch → 22P02); the
+# '[l:u]={…}' literal sets a custom lower bound (an inverted bound l>u → 2202E). array_out renders
+# nested braces and emits a [l1:u1]…= prefix iff any lower bound ≠ 1. Element access needs all N
+# subscripts (a[i] on an N-D value with fewer is NULL); the index domain is the value's lb..ub.
+# array_eq considers dimensionality and lower bounds, so [2:4]={7,8,9} ≠ {7,8,9}. Values round-trip
+# through storage. array_out matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.int32, expr.array_subscript, resource.cost_metering
+
+statement ok
+CREATE TABLE m (id int32 PRIMARY KEY, g int32[])
+
+# ARRAY[ARRAY[…],…] stacks sub-arrays into a 2-D value (row-major).
+statement ok
+INSERT INTO m VALUES (1, ARRAY[ARRAY[1,2],ARRAY[3,4]])
+
+# The '{{…},{…}}' text literal parses nested braces into the same 2-D value.
+statement ok
+INSERT INTO m VALUES (2, '{{10,20,30},{40,50,60}}')
+
+# The '[l:u]={…}' literal sets a custom lower bound (a 1-D value with lb 2).
+statement ok
+INSERT INTO m VALUES (3, '[2:4]={7,8,9}')
+
+# A 3-D value (ARRAY of ARRAY of ARRAY).
+statement ok
+INSERT INTO m VALUES (4, ARRAY[ARRAY[ARRAY[1,2]],ARRAY[ARRAY[3,4]]])
+
+# array_out renders nested braces; the lb≠1 row renders with a [l:u]= prefix; values round-trip
+# through the on-disk codec.
+query IT nosort
+SELECT id, g FROM m ORDER BY id
+----
+1
+{{1,2},{3,4}}
+2
+{{10,20,30},{40,50,60}}
+3
+[2:4]={7,8,9}
+4
+{{{1,2}},{{3,4}}}
+
+# Multidim element access needs all N subscripts: a[i][j] reads an element.
+query I nosort
+SELECT g[2][1] FROM m WHERE id = 1
+----
+3
+
+# Fewer subscripts than ndim → NULL (a[i] on a 2-D value).
+query I nosort
+SELECT g[1] FROM m WHERE id = 1
+----
+NULL
+
+# A custom lower bound shifts the index domain to lb..ub: g[2] is the first element.
+query I nosort
+SELECT g[2] FROM m WHERE id = 3
+----
+7
+
+# Below the lower bound → NULL.
+query I nosort
+SELECT g[1] FROM m WHERE id = 3
+----
+NULL
+
+# Equality includes the lower bound: [2:4]={7,8,9} is NOT equal to {7,8,9} (same elements, lb 2 vs 1).
+query I nosort
+SELECT id FROM m WHERE g = '{7,8,9}'::int32[] ORDER BY id
+----
+
+# … it equals the explicit-bound literal.
+query I nosort
+SELECT id FROM m WHERE g = '[2:4]={7,8,9}'::int32[] ORDER BY id
+----
+3
+
+# A 1-D value and a 2-D value with the same flattened elements are NOT equal (ndim tiebreak).
+query I nosort
+SELECT id FROM m WHERE g = '{1,2,3,4}'::int32[] ORDER BY id
+----
+
+# Non-rectangular construction → 2202E.
+statement error 2202E
+INSERT INTO m VALUES (5, ARRAY[ARRAY[1,2],ARRAY[3]])
+
+# A scalar mixed with a sub-array in the constructor → 42804.
+statement error 42804
+INSERT INTO m VALUES (5, ARRAY[ARRAY[1,2],3])
+
+# Non-rectangular text literal → 22P02.
+statement error 22P02
+INSERT INTO m VALUES (5, '{{1,2},{3}}')
+
+# A literal whose contents do not match the declared [l:u] dimensions → 22P02.
+statement error 22P02
+INSERT INTO m VALUES (5, '[2:4]={1,2}')
+
+# An inverted [l:u] bound (u < l) → 2202E.
+statement error 2202E
+INSERT INTO m VALUES (5, '[3:1]={1}')

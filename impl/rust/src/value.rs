@@ -63,14 +63,16 @@ pub enum Value {
     /// (element-wise), routed through the manual impls below so they never apply raw `==` to a
     /// float/decimal/interval field variant (the rule `Decimal`/`Interval` already follow).
     Composite(Vec<Value>),
-    /// An **array** value (spec/design/array.md §2) — a flat (1-D) list of element values, in
-    /// element order; a NULL element is `Value::Null` of the element type, an empty list is the
-    /// empty array `{}`. The whole list is one `int32[]` value; shape (dimensionality, lengths,
-    /// lower bounds) is a value property carried by the codec (§4) — v1 stores 1-D values, so the
-    /// in-memory form is the flat list. Comparison uses PG **btree** semantics (NULLs comparable
-    /// and mutually equal — *not* the composite 3VL rule, §5), so `PartialEq`/`Eq`/`Hash` (the
-    /// DISTINCT/GROUP BY key) and the total-order `lt3`/`gt3` are structural over this list.
-    Array(Vec<Value>),
+    /// An **array** value (spec/design/array.md §2) — a shaped, row-major list of element values
+    /// ([`ArrayVal`]). Shape (dimensionality, per-dimension lengths, lower bounds) is a property of
+    /// the *value*, not the type (PG-faithful, CLAUDE.md §4); the whole value is one `int32[]`
+    /// regardless of its `ndim`. A NULL element is `Value::Null` of the element type; the empty
+    /// array `{}` is `ndim = 0` (no elements). Comparison uses PG **btree** semantics (NULLs
+    /// comparable and mutually equal — *not* the composite 3VL rule, §5), so `PartialEq`/`Eq`/`Hash`
+    /// (the DISTINCT/GROUP BY key) and the total-order `lt3`/`gt3` are structural — and, like
+    /// `array_eq`/`array_cmp`, they consider dimensionality and lower bounds, so `[2:4]={1,2,3}`
+    /// and `{1,2,3}` are distinct (§5).
+    Array(ArrayVal),
     /// An **unfetched** large-value reference (spec/design/large-values.md §14): a stored
     /// external/compressed value loaded as its on-disk pointer instead of being materialized.
     /// Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -97,6 +99,58 @@ pub enum Unfetched {
         stored_len: u32,
         raw_len: u32,
     },
+}
+
+/// A shaped array value (spec/design/array.md §4). Shape is a value property: `dims` holds the
+/// per-dimension element counts (row-major), `lbounds` the per-dimension lower bounds (default 1,
+/// same length as `dims`), and `elements` the flattened row-major element values (its length is
+/// the product of `dims`). `ndim` is `dims.len()`; the **empty array** is `ndim = 0` (all three
+/// vectors empty). Equality/ordering are structural and (PG `array_eq`/`array_cmp`) include
+/// `dims` and `lbounds` — derived here over `Value`'s own canonical `Eq`/`Hash`, so a float/decimal
+/// element compares by value, and a NULL element equals a NULL element.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct ArrayVal {
+    /// Per-dimension element counts (row-major); `len()` is the dimension count (`ndim`), `0` =
+    /// the empty array. PostgreSQL caps `ndim` at 6 (`MAXDIM`).
+    pub dims: Vec<usize>,
+    /// Per-dimension lower bounds (default 1), `lbounds.len() == dims.len()`.
+    pub lbounds: Vec<i32>,
+    /// Flattened row-major element values; `len() == dims.iter().product()`. A NULL element is
+    /// `Value::Null`.
+    pub elements: Vec<Value>,
+}
+
+impl ArrayVal {
+    /// The empty array `{}` (`ndim = 0`).
+    pub fn empty() -> ArrayVal {
+        ArrayVal {
+            dims: Vec::new(),
+            lbounds: Vec::new(),
+            elements: Vec::new(),
+        }
+    }
+
+    /// A 1-D array with the default lower bound 1; an empty `elements` collapses to [`empty`].
+    pub fn one_dim(elements: Vec<Value>) -> ArrayVal {
+        if elements.is_empty() {
+            return ArrayVal::empty();
+        }
+        ArrayVal {
+            dims: vec![elements.len()],
+            lbounds: vec![1],
+            elements,
+        }
+    }
+
+    /// The dimension count (`ndim`).
+    pub fn ndim(&self) -> usize {
+        self.dims.len()
+    }
+
+    /// The per-dimension upper bound `lb + len - 1` for dimension `d`.
+    pub fn ubound(&self, d: usize) -> i32 {
+        self.lbounds[d] + self.dims[d] as i32 - 1
+    }
 }
 
 /// A `float64`'s canonical bits for the TOTAL order (spec/design/float.md §3): collapse `-0.0`
@@ -224,12 +278,9 @@ impl std::hash::Hash for Value {
                     f.hash(state);
                 }
             }
-            // Hash each element in order (consistent with the structural `PartialEq`).
-            Value::Array(elems) => {
-                for e in elems {
-                    e.hash(state);
-                }
-            }
+            // Hash the shape then each element (consistent with the structural `PartialEq`, which
+            // includes dims/lbounds — so `[2:4]={1,2,3}` and `{1,2,3}` hash apart).
+            Value::Array(a) => a.hash(state),
             Value::Unfetched(u) => u.hash(state),
         }
     }
@@ -312,9 +363,10 @@ impl Value {
             // (spec/design/composite.md §8). The renderer recurses (a composite field's text is
             // itself quoted because it contains parens/commas).
             Value::Composite(fields) => record_out(fields),
-            // An array renders as PG `array_out`: `{e1,e2,…}` with per-element quoting and an
-            // unquoted `NULL` for a null element (spec/design/array.md §7).
-            Value::Array(elems) => array_out(elems),
+            // An array renders as PG `array_out`: `{e1,e2,…}` (nested braces for a multidim value,
+            // an optional `[l:u]=` bound prefix when any lower bound ≠ 1), with per-element quoting
+            // and an unquoted `NULL` for a null element (spec/design/array.md §7).
+            Value::Array(a) => array_out(a),
             Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
         }
     }
@@ -657,18 +709,39 @@ fn record_field_needs_quote(s: &str) -> bool {
         })
 }
 
-/// PG `array_cmp` total order over two arrays (spec/design/array.md §5): walk element pairs; the
-/// first non-equal pair decides; if one array is a prefix of the other, the shorter sorts first.
+/// PG `array_cmp` total order over two arrays (spec/design/array.md §5): walk the **flattened**
+/// element pairs in row-major order — the first non-equal pair decides; then fewer total elements
+/// sorts first; then smaller `ndim`; then, per dimension, smaller length, then smaller lower bound.
 /// NULL elements are comparable — a NULL sorts AFTER every non-NULL and two NULLs are equal (the
 /// NULLs-last total order, [compare.toml] `null_ordering`). Always total/definite (never UNKNOWN).
-fn array_total_cmp(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
-    for (x, y) in a.iter().zip(b.iter()) {
+fn array_total_cmp(a: &ArrayVal, b: &ArrayVal) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (x, y) in a.elements.iter().zip(b.elements.iter()) {
         let o = elem_total_cmp(x, y);
-        if o != std::cmp::Ordering::Equal {
+        if o != Ordering::Equal {
             return o;
         }
     }
-    a.len().cmp(&b.len())
+    // Equal up to the shorter element list: fewer elements sorts first, then dimensionality.
+    match a.elements.len().cmp(&b.elements.len()) {
+        Ordering::Equal => {}
+        ne => return ne,
+    }
+    match a.ndim().cmp(&b.ndim()) {
+        Ordering::Equal => {}
+        ne => return ne,
+    }
+    for d in 0..a.ndim() {
+        match a.dims[d].cmp(&b.dims[d]) {
+            Ordering::Equal => {}
+            ne => return ne,
+        }
+        match a.lbounds[d].cmp(&b.lbounds[d]) {
+            Ordering::Equal => {}
+            ne => return ne,
+        }
+    }
+    Ordering::Equal
 }
 
 /// Total order over two array elements, with NULL the largest value (NULLs-last) and two NULLs
@@ -691,135 +764,359 @@ fn elem_total_cmp(x: &Value, y: &Value) -> std::cmp::Ordering {
     }
 }
 
-/// PostgreSQL `array_out` (spec/design/array.md §7): render an array's elements as `{e1,e2,…}`. A
-/// NULL element is the unquoted token `NULL`; every other element is rendered by its own `render`
-/// and double-quoted iff it is empty, equals the literal `NULL` (case-insensitive), or contains a
+/// PostgreSQL `array_out` (spec/design/array.md §7): render an array as `{e1,e2,…}`, with nested
+/// braces for a multidimensional value (`{{1,2},{3,4}}`) and an optional `[l1:u1][l2:u2]=` lower-
+/// bound prefix when **any** lower bound differs from 1 (PG emits the bounds only then). A NULL
+/// element is the unquoted token `NULL`; every other element is rendered by its own `render` and
+/// double-quoted iff it is empty, equals the literal `NULL` (case-insensitive), or contains a
 /// delimiter / brace / quote / backslash / whitespace. Inside the quotes PostgreSQL **backslash-
 /// escapes** an embedded `"` → `\"` and `\` → `\\` (the contrast with `record_out`, which doubles).
 /// The empty array renders `{}`. The spelling must equal PG byte-for-byte (CLAUDE.md §8).
-pub fn array_out(elements: &[Value]) -> String {
-    let mut out = String::from("{");
-    for (i, e) in elements.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        match e {
-            Value::Null => out.push_str("NULL"),
-            _ => {
-                let s = e.render();
-                if array_elem_needs_quote(&s) {
-                    out.push('"');
-                    for ch in s.chars() {
-                        if ch == '"' || ch == '\\' {
-                            out.push('\\');
-                        }
-                        out.push(ch);
-                    }
-                    out.push('"');
-                } else {
-                    out.push_str(&s);
-                }
-            }
-        }
+pub fn array_out(a: &ArrayVal) -> String {
+    if a.elements.is_empty() {
+        return "{}".to_string(); // the empty array (ndim 0)
     }
-    out.push('}');
+    let mut out = String::new();
+    if a.lbounds.iter().any(|&lb| lb != 1) {
+        // The dimension prefix `[l1:u1][l2:u2]…=` (PG only emits it when a bound ≠ 1).
+        for d in 0..a.ndim() {
+            out.push('[');
+            out.push_str(&a.lbounds[d].to_string());
+            out.push(':');
+            out.push_str(&a.ubound(d).to_string());
+            out.push(']');
+        }
+        out.push('=');
+    }
+    let mut cursor = 0usize;
+    render_array_dim(a, 0, &mut cursor, &mut out);
     out
 }
 
-/// PostgreSQL `array_in` tokenizer (spec/design/array.md §7) — the inverse of `array_out`. Splits
-/// the text of an array literal `{e1,e2,…}` into raw element tokens **without** type coercion: the
-/// caller coerces each token to the element type. An element is either quoted (`"…"` with `\"`→`"`
-/// and `\\`→`\` un-escaping) or unquoted (read to the next top-level `,`/`}`, surrounding
-/// whitespace trimmed, `\x`→`x`). An **unquoted** `NULL` (any case) is a NULL element (`None`); a
-/// quoted `"NULL"` is the 4-char string. `{}` (optionally with inner whitespace) is the empty
-/// array. Returns `None` on a malformed literal — the executor maps that to `22P02`.
-pub fn parse_array_tokens(input: &str) -> Option<Vec<Option<String>>> {
-    let s = input.trim_matches(|c: char| c.is_ascii_whitespace());
-    let mut chars = s.chars().peekable();
-    if chars.next() != Some('{') {
-        return None;
-    }
-    let mut elems: Vec<Option<String>> = Vec::new();
-    // Empty array: optional inner whitespace, then `}`.
-    while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
-        chars.next();
-    }
-    if chars.peek() == Some(&'}') {
-        chars.next();
-        return if chars.next().is_some() {
-            None
-        } else {
-            Some(elems)
-        };
-    }
-    loop {
-        // Leading whitespace before an element is not significant.
-        while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
-            chars.next();
+/// Render the brace structure for dimension `d` of `a`, consuming flattened elements via `cursor`
+/// (the helper for [`array_out`]). The innermost dimension renders elements; outer dimensions
+/// recurse into nested braces.
+fn render_array_dim(a: &ArrayVal, d: usize, cursor: &mut usize, out: &mut String) {
+    out.push('{');
+    for k in 0..a.dims[d] {
+        if k > 0 {
+            out.push(',');
         }
-        let mut buf = String::new();
-        let mut quoted = false;
-        if chars.peek() == Some(&'"') {
-            quoted = true;
-            chars.next(); // opening quote
+        if d + 1 == a.ndim() {
+            render_array_elem(&a.elements[*cursor], out);
+            *cursor += 1;
+        } else {
+            render_array_dim(a, d + 1, cursor, out);
+        }
+    }
+    out.push('}');
+}
+
+/// Render one array element (with PG `array_out` quoting; a NULL element is the unquoted `NULL`).
+fn render_array_elem(e: &Value, out: &mut String) {
+    match e {
+        Value::Null => out.push_str("NULL"),
+        _ => {
+            let s = e.render();
+            if array_elem_needs_quote(&s) {
+                out.push('"');
+                for ch in s.chars() {
+                    if ch == '"' || ch == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                }
+                out.push('"');
+            } else {
+                out.push_str(&s);
+            }
+        }
+    }
+}
+
+/// The structured result of [`parse_array_literal`]: the shape (`dims`, `lbounds`) and the
+/// flattened row-major element tokens (`None` = a NULL element). The caller coerces each token to
+/// the element type and assembles the [`ArrayVal`].
+pub struct ParsedArray {
+    pub dims: Vec<usize>,
+    pub lbounds: Vec<i32>,
+    pub tokens: Vec<Option<String>>,
+}
+
+/// Why an array literal failed to parse — mapped by the caller to a SQLSTATE.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArrayInError {
+    /// A malformed literal, or declared `[l:u]` dimensions that do not match the brace contents
+    /// → `22P02`.
+    Malformed,
+    /// A declared `[l:u]` bound with `u < l` → `2202E`.
+    BoundFlip,
+}
+
+/// The PostgreSQL maximum array dimensionality (`MAXDIM`).
+const ARRAY_MAXDIM: usize = 6;
+
+/// PostgreSQL `array_in` (spec/design/array.md §7) — the inverse of `array_out`. Parses an array
+/// literal: an optional dimension prefix `[l1:u1][l2:u2]…=`, then a (possibly nested) brace
+/// structure `{…}`. Returns the shape (`dims`/`lbounds`) and the flattened row-major raw element
+/// tokens **without** type coercion (the caller coerces each to the element type). An element is
+/// quoted (`"…"`, `\"`→`"`, `\\`→`\`) or unquoted (to the next top-level `,`/`}`, whitespace
+/// trimmed, `\x`→`x`); an **unquoted** `NULL` (any case) is a NULL element (`None`), a quoted
+/// `"NULL"` the 4-char string. `{}` is the empty array (`ndim 0`). A multidim literal must be
+/// rectangular and, if a prefix is given, the contents must match the declared dimensions (else
+/// `Malformed`); a prefix with `u < l` is `BoundFlip`.
+pub fn parse_array_literal(input: &str) -> Result<ParsedArray, ArrayInError> {
+    let chars: Vec<char> = input
+        .trim_matches(|c: char| c.is_ascii_whitespace())
+        .chars()
+        .collect();
+    let mut p = ArrParser {
+        chars: &chars,
+        i: 0,
+    };
+
+    // Optional dimension prefix `[l:u][l:u]…=`.
+    let mut prefix_lbounds: Vec<i32> = Vec::new();
+    let mut prefix_dims: Vec<usize> = Vec::new();
+    if p.peek() == Some('[') {
+        while p.peek() == Some('[') {
+            p.bump(); // [
+            let lb = p.parse_int()?;
+            if p.peek() != Some(':') {
+                return Err(ArrayInError::Malformed);
+            }
+            p.bump(); // :
+            let ub = p.parse_int()?;
+            if p.peek() != Some(']') {
+                return Err(ArrayInError::Malformed);
+            }
+            p.bump(); // ]
+            if ub < lb {
+                return Err(ArrayInError::BoundFlip);
+            }
+            prefix_lbounds.push(lb as i32);
+            prefix_dims.push((ub - lb + 1) as usize);
+        }
+        if p.peek() != Some('=') {
+            return Err(ArrayInError::Malformed);
+        }
+        p.bump(); // =
+        p.skip_ws();
+    }
+
+    // The brace structure.
+    let node = p.parse_node()?;
+    p.skip_ws();
+    if p.i != p.chars.len() {
+        return Err(ArrayInError::Malformed); // trailing junk
+    }
+    let Node::Arr(top) = &node else {
+        return Err(ArrayInError::Malformed); // a literal must start with a brace
+    };
+
+    // The empty array `{}` (only the bare top-level empty brace; `ndim 0`).
+    if top.is_empty() {
+        if !prefix_dims.is_empty() {
+            return Err(ArrayInError::Malformed); // a prefix on an empty array is contradictory
+        }
+        return Ok(ParsedArray {
+            dims: Vec::new(),
+            lbounds: Vec::new(),
+            tokens: Vec::new(),
+        });
+    }
+
+    let dims = node_dims(&node)?;
+    if dims.len() > ARRAY_MAXDIM {
+        return Err(ArrayInError::Malformed);
+    }
+    let mut tokens = Vec::new();
+    flatten_nodes(&node, &mut tokens);
+
+    let lbounds = if prefix_dims.is_empty() {
+        vec![1; dims.len()]
+    } else {
+        // A declared prefix must match the parsed contents exactly (PG 22P02 otherwise).
+        if prefix_dims != dims {
+            return Err(ArrayInError::Malformed);
+        }
+        prefix_lbounds
+    };
+    Ok(ParsedArray {
+        dims,
+        lbounds,
+        tokens,
+    })
+}
+
+/// A parsed brace node: a scalar token (`None` = the NULL token) or a braced level.
+enum Node {
+    Leaf(Option<String>),
+    Arr(Vec<Node>),
+}
+
+/// A char-slice cursor for [`parse_array_literal`].
+struct ArrParser<'a> {
+    chars: &'a [char],
+    i: usize,
+}
+
+impl ArrParser<'_> {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.i).copied()
+    }
+    fn bump(&mut self) {
+        self.i += 1;
+    }
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(c) if c.is_ascii_whitespace()) {
+            self.bump();
+        }
+    }
+
+    /// Parse a signed decimal integer (a dimension bound).
+    fn parse_int(&mut self) -> Result<i64, ArrayInError> {
+        let mut s = String::new();
+        if self.peek() == Some('-') {
+            s.push('-');
+            self.bump();
+        }
+        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            s.push(self.peek().unwrap());
+            self.bump();
+        }
+        s.parse::<i64>().map_err(|_| ArrayInError::Malformed)
+    }
+
+    /// Parse one element: a nested `{…}` (→ `Node::Arr`) or a scalar token (→ `Node::Leaf`).
+    fn parse_node(&mut self) -> Result<Node, ArrayInError> {
+        self.skip_ws();
+        if self.peek() == Some('{') {
+            self.bump(); // {
+            self.skip_ws();
+            let mut children = Vec::new();
+            if self.peek() == Some('}') {
+                self.bump(); // empty braces
+                return Ok(Node::Arr(children));
+            }
             loop {
-                match chars.next() {
-                    None => return None, // unterminated quoted element
-                    Some('"') => break,  // closing quote
-                    Some('\\') => match chars.next() {
-                        Some(c) => buf.push(c),
-                        None => return None,
-                    },
-                    Some(c) => buf.push(c),
+                children.push(self.parse_node()?);
+                self.skip_ws();
+                match self.peek() {
+                    Some(',') => {
+                        self.bump();
+                        continue;
+                    }
+                    Some('}') => {
+                        self.bump();
+                        break;
+                    }
+                    _ => return Err(ArrayInError::Malformed),
                 }
             }
-            // Trailing whitespace before the delimiter is allowed.
-            while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
-                chars.next();
-            }
+            Ok(Node::Arr(children))
         } else {
-            // Unquoted: read until a top-level `,`/`}`, processing `\x`→`x`.
+            Ok(Node::Leaf(self.parse_scalar()?))
+        }
+    }
+
+    /// Parse one scalar token (quoted or unquoted) — `None` is the unquoted `NULL` token.
+    fn parse_scalar(&mut self) -> Result<Option<String>, ArrayInError> {
+        let mut buf = String::new();
+        if self.peek() == Some('"') {
+            self.bump(); // opening quote
             loop {
-                match chars.peek() {
-                    None => return None, // missing '}'
-                    Some(',') | Some('}') => break,
+                match self.peek() {
+                    None => return Err(ArrayInError::Malformed), // unterminated
+                    Some('"') => {
+                        self.bump();
+                        break;
+                    }
                     Some('\\') => {
-                        chars.next();
-                        match chars.next() {
-                            Some(c) => buf.push(c),
-                            None => return None,
+                        self.bump();
+                        match self.peek() {
+                            Some(c) => {
+                                buf.push(c);
+                                self.bump();
+                            }
+                            None => return Err(ArrayInError::Malformed),
                         }
                     }
-                    Some(&c) => {
+                    Some(c) => {
                         buf.push(c);
-                        chars.next();
+                        self.bump();
                     }
                 }
             }
-        }
-        let elem = if quoted {
-            Some(buf)
+            Ok(Some(buf))
         } else {
+            // Unquoted: read until a top-level `,`/`}`/`{`, processing `\x`→`x`.
+            loop {
+                match self.peek() {
+                    None => return Err(ArrayInError::Malformed),
+                    Some(',') | Some('}') | Some('{') => break,
+                    Some('\\') => {
+                        self.bump();
+                        match self.peek() {
+                            Some(c) => {
+                                buf.push(c);
+                                self.bump();
+                            }
+                            None => return Err(ArrayInError::Malformed),
+                        }
+                    }
+                    Some(c) => {
+                        buf.push(c);
+                        self.bump();
+                    }
+                }
+            }
             let trimmed = buf.trim_matches(|c: char| c.is_ascii_whitespace());
             if trimmed.is_empty() {
-                return None; // a bare empty unquoted element is malformed (PG)
+                Err(ArrayInError::Malformed) // a bare empty unquoted element is malformed (PG)
             } else if trimmed.eq_ignore_ascii_case("NULL") {
-                None
+                Ok(None)
             } else {
-                Some(trimmed.to_string())
+                Ok(Some(trimmed.to_string()))
             }
-        };
-        elems.push(elem);
-        match chars.next() {
-            Some(',') => continue,
-            Some('}') => break,
-            _ => return None,
         }
     }
-    if chars.next().is_some() {
-        return None;
+}
+
+/// The dimensions of a parsed brace `node` (recursing). All sub-arrays at a level must share the
+/// same shape and kind — a mismatch (including a leaf-vs-array mix) is a malformed multidim literal.
+fn node_dims(node: &Node) -> Result<Vec<usize>, ArrayInError> {
+    match node {
+        Node::Leaf(_) => Ok(Vec::new()),
+        Node::Arr(children) => {
+            if children.is_empty() {
+                // A nested empty brace is not a valid sub-array (the bare top-level `{}` is handled
+                // by the caller).
+                return Err(ArrayInError::Malformed);
+            }
+            let child0 = node_dims(&children[0])?;
+            for c in &children[1..] {
+                if node_dims(c)? != child0 {
+                    return Err(ArrayInError::Malformed);
+                }
+            }
+            let mut d = vec![children.len()];
+            d.extend(child0);
+            Ok(d)
+        }
     }
-    Some(elems)
+}
+
+/// Collect the leaf tokens of a parsed brace `node` in row-major order (a left-to-right DFS).
+fn flatten_nodes(node: &Node, out: &mut Vec<Option<String>>) {
+    match node {
+        Node::Leaf(t) => out.push(t.clone()),
+        Node::Arr(children) => {
+            for c in children {
+                flatten_nodes(c, out);
+            }
+        }
+    }
 }
 
 /// Whether an `array_out` element token must be double-quoted: the empty string, the literal

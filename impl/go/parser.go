@@ -1889,21 +1889,50 @@ func (p *Parser) parsePostfix() (Expr, error) {
 			}
 			expr = Expr{Kind: ExprCast, Cast: &CastExpr{Inner: expr, TypeName: typeName, TypeMod: typeMod}}
 			fieldAccessible = false
-		// `base[index]` — array element subscript (spec/design/array.md §6). Applies to ANY base
-		// (no parens rule, unlike `.field`) and chains (`a[1][2]`). The index is a full expression;
-		// a slice `a[m:n]` is deferred (no single-colon token, so it does not parse). After a
-		// subscript a `.field` still needs parens (PG), so it is not field-accessible.
+		// `base[..][..]` — array subscript (spec/design/array.md §6). Applies to ANY base (no parens
+		// rule, unlike `.field`). Consecutive `[…]` brackets collect into ONE access (so `a[1][2]` is
+		// a single multidim element read, not nested). Each spec is an index `[i]` or a slice `[m:n]`
+		// (bounds optionally omitted). After a subscript a `.field` still needs parens (PG).
 		case p.peek().Kind == TokLBracket:
-			p.advance()
 			base := expr
-			index, err := p.parseExpr()
-			if err != nil {
-				return Expr{}, err
+			var subs []SubscriptSpec
+			for p.peek().Kind == TokLBracket {
+				p.advance() // [
+				// The lower bound / index is absent only before a `:` or `]` (`[:n]`, `[]`).
+				var lower *Expr
+				if p.peek().Kind != TokColon && p.peek().Kind != TokRBracket {
+					e, err := p.parseExpr()
+					if err != nil {
+						return Expr{}, err
+					}
+					lower = &e
+				}
+				if p.peek().Kind == TokColon {
+					p.advance() // :
+					var upper *Expr
+					if p.peek().Kind != TokRBracket {
+						e, err := p.parseExpr()
+						if err != nil {
+							return Expr{}, err
+						}
+						upper = &e
+					}
+					if err := p.expect(TokRBracket); err != nil {
+						return Expr{}, err
+					}
+					subs = append(subs, SubscriptSpec{IsSlice: true, Lower: lower, Upper: upper})
+				} else {
+					// Index form: a bare `[]` (no index, no colon) is a syntax error.
+					if lower == nil {
+						return Expr{}, NewError(SyntaxError, "array subscript requires an index")
+					}
+					if err := p.expect(TokRBracket); err != nil {
+						return Expr{}, err
+					}
+					subs = append(subs, SubscriptSpec{Index: lower})
+				}
 			}
-			if err := p.expect(TokRBracket); err != nil {
-				return Expr{}, err
-			}
-			expr = Expr{Kind: ExprSubscript, Base: &base, Index: &index}
+			expr = Expr{Kind: ExprSubscript, Base: &base, Subscripts: subs}
 			fieldAccessible = false
 		// `.field` / `.*` — composite field selection (spec/design/composite.md §S4),
 		// parens-required: only on a parenthesized / chained-field base.
@@ -2435,6 +2464,8 @@ func renderToken(t Token) string {
 		return ">="
 	case TokFatArrow:
 		return "=>"
+	case TokColon:
+		return ":"
 	default: // TokEof — never inside the parentheses
 		return ""
 	}

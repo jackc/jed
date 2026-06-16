@@ -30,6 +30,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "types.array",
   // Array element subscript a[i] — 1-based, OOB/NULL → NULL, non-array base 42804 (array.md §6).
   "expr.array_subscript",
+  // Multidimensional array values + custom lower bounds (array.md §12).
+  "types.array_multidim",
+  // Array slices a[m:n] (array.md §6) — sub-array reads, renumbered to lower bound 1.
+  "expr.array_slice",
   // NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
   "ddl.not_null",
   // DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

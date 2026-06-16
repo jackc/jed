@@ -44,7 +44,7 @@ import {
   type Value,
   boolValue,
   byteaValue,
-  arrayValue,
+  emptyArray,
   compositeValue,
   decimalValue,
   float32Value,
@@ -233,7 +233,7 @@ function encodeValue(ty: ColType, v: Value): Uint8Array {
     // An array column (spec/design/array.md §4): the shared presence tag then the array body.
     if (v.kind === "null") return Uint8Array.of(0x01);
     if (v.kind !== "array") throw new Error("BUG: a non-array value in an array column");
-    const body = encodeArrayBody(ty.elem, v.elements);
+    const body = encodeArrayBody(ty.elem, v);
     const out = new Uint8Array(1 + body.length);
     out[0] = 0x00; // present
     out.set(body, 1);
@@ -251,10 +251,12 @@ function encodeValue(ty: ColType, v: Value): Uint8Array {
 
 // encodeArrayBody builds an array value's BODY (after the 0x00 present tag, spec/design/array.md
 // §4): ndim u8, flags u8, per-dim (len u32 BE, lb i32 BE), then the optional null bitmap (present
-// iff HAS_NULLS) and the present element bodies. v1 writes 1-D values only: an empty array is ndim
-// 0; a non-empty array is ndim 1, len = element count, lb = 1. The bitmap (MSB-first, like
-// composite) is present iff any element is NULL; a NULL element contributes zero body bytes.
-function encodeArrayBody(elem: ColType, elems: Value[]): Uint8Array {
+// iff HAS_NULLS) and the present element bodies (row-major). An empty array is ndim 0; otherwise
+// ndim is the dimension count and each dimension records its length and lower bound (multidim +
+// custom lower bounds — spec/design/array.md §12). The bitmap (MSB-first, like composite) is present
+// iff any element is NULL; a NULL element contributes zero body bytes.
+function encodeArrayBody(elem: ColType, a: { dims: number[]; lbounds: number[]; elements: Value[] }): Uint8Array {
+  const elems = a.elements;
   if (elems.length === 0) return Uint8Array.of(0, 0); // ndim 0, flags 0 (empty array)
   let hasNulls = false;
   for (const e of elems) {
@@ -263,19 +265,15 @@ function encodeArrayBody(elem: ColType, elems: Value[]): Uint8Array {
       break;
     }
   }
-  const n = elems.length >>> 0;
-  const header = Uint8Array.of(
-    1, // ndim = 1 (v1: 1-D values only)
-    hasNulls ? 0x01 : 0x00, // flags: bit 0 = HAS_NULLS
-    (n >>> 24) & 0xff,
-    (n >>> 16) & 0xff,
-    (n >>> 8) & 0xff,
-    n & 0xff, // dim length (u32 BE)
-    0,
-    0,
-    0,
-    1, // lower bound = 1 (i32 BE)
-  );
+  const ndim = a.dims.length;
+  const header = new Uint8Array(2 + 8 * ndim);
+  const dv = new DataView(header.buffer);
+  header[0] = ndim;
+  header[1] = hasNulls ? 0x01 : 0x00; // flags: bit 0 = HAS_NULLS
+  for (let d = 0; d < ndim; d++) {
+    dv.setUint32(2 + 8 * d, a.dims[d]! >>> 0, false); // dim length (u32 BE)
+    dv.setInt32(2 + 8 * d + 4, a.lbounds[d]! | 0, false); // lower bound (i32 BE)
+  }
   const parts: Uint8Array[] = [header];
   if (hasNulls) {
     const bitmap = new Uint8Array(Math.ceil(elems.length / 8));
@@ -640,7 +638,7 @@ function valuePayload(ty: ColType, v: Value): Uint8Array {
   if (ty.kind === "composite" && v.kind === "composite") return encodeCompositeBody(ty.fields, v.fields);
   // An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies); a large
   // array spills through the same overflow + LZ4 path (spec/design/array.md §4).
-  if (ty.kind === "array" && v.kind === "array") return encodeArrayBody(ty.elem, v.elements);
+  if (ty.kind === "array" && v.kind === "array") return encodeArrayBody(ty.elem, v);
   if (v.kind === "text") return UTF8.encode(v.text);
   if (v.kind === "bytea") return v.bytes;
   if (v.kind === "decimal" && ty.kind === "scalar") return encodeScalar(ty.scalar, v).subarray(1); // strip the presence tag
@@ -2135,26 +2133,33 @@ function readInlineBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
 
 // readArrayBody reads an array value's present BODY (after the 0x00 tag): inverse of encodeArrayBody
 // (spec/design/array.md §4). Reads ndim/flags/per-dim (len, lb), then the optional null bitmap and
-// the present element bodies. v1 accepts ndim 0 (empty) or 1 (1-D); a higher ndim is rejected XX001
-// (multidim values are not written this slice — §12).
+// the present element bodies (row-major). Accepts ndim 0 (empty) through 6 (MAXDIM); a higher ndim or
+// an element-count overflow is XX001.
 function readArrayBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
   if (ty.kind !== "array") throw engineError("data_corrupted", "readArrayBody on a non-array type");
   const ndim = readU8(buf, cur);
   const flags = readU8(buf, cur);
   if ((flags & ~0x01) !== 0) throw engineError("data_corrupted", "array flags has a reserved bit set");
-  if (ndim === 0) return arrayValue([]); // empty array
-  if (ndim !== 1) throw engineError("data_corrupted", "multidimensional array value not supported (ndim > 1)");
-  const length = readU32(buf, cur);
-  readU32(buf, cur); // lower bound (round-tripped, ignored in v1)
+  if (ndim === 0) return emptyArray(); // empty array
+  if (ndim > 6) throw engineError("data_corrupted", "array ndim exceeds the maximum of 6");
+  const dims: number[] = new Array(ndim);
+  const lbounds: number[] = new Array(ndim);
+  let n = 1;
+  for (let d = 0; d < ndim; d++) {
+    dims[d] = readU32(buf, cur);
+    lbounds[d] = readU32(buf, cur) | 0; // lower bound (i32 two's-complement)
+    n *= dims[d]!;
+    if (n > 0x7fffffff) throw engineError("data_corrupted", "array element count overflow");
+  }
   const hasNulls = (flags & 0x01) !== 0;
   let bitmap: Uint8Array | null = null;
-  if (hasNulls) bitmap = take(buf, cur, Math.ceil(length / 8));
-  const elems: Value[] = new Array(length);
-  for (let i = 0; i < length; i++) {
+  if (hasNulls) bitmap = take(buf, cur, Math.ceil(n / 8));
+  const elements: Value[] = new Array(n);
+  for (let i = 0; i < n; i++) {
     const isNull = hasNulls && (bitmap![i >> 3]! & (0x80 >> (i % 8))) !== 0;
-    elems[i] = isNull ? nullValue() : readInlineBody(ty.elem, buf, cur);
+    elements[i] = isNull ? nullValue() : readInlineBody(ty.elem, buf, cur);
   }
-  return arrayValue(elems);
+  return { kind: "array", dims, lbounds, elements };
 }
 
 // readCompositeBody reads a composite value's present BODY (after the 0x00 tag): the null bitmap then

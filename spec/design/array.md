@@ -13,14 +13,16 @@
 > PostgreSQL semantics are the default (CLAUDE.md §1) and must be pinned against the live
 > `postgres:18` oracle — several array NULL/comparison rules are subtle (§5, §6).
 >
-> **Status: S0–S4 landed.** Declarable + storable `T[]` columns (scalar elements), the `ARRAY[…]`
+> **Status: S0–S5 landed.** Declarable + storable `T[]` columns (scalar elements), the `ARRAY[…]`
 > constructor and `'{…}'`/`::` literal, `array_out`, the compact value codec, subscripting `a[i]`,
 > and btree-NULL comparison / ordering / DISTINCT / whole-value `IS NULL` are implemented across all
 > three cores at **`format_version` 10** with byte-identical goldens (`rust == go == ts == ruby` —
 > `array_table.jed`) and oracle-checked conformance suites (`types/array.test`, `types/subscript.test`).
+> **S5 added multidimensional values, custom lower bounds, and array slices `a[m:n]`** (`types/array_multidim.test`,
+> `types/array_slice.test`): the codec header's `ndim`/`dims`/`lbounds` is now exercised (the golden's
+> row 4 pins a 2-D value + a custom-lower-bound value, still `format_version` 10 — a pure unlock, §10.7).
 > The decisions in §10 are ratified spec-first; the per-slice delivery is §12. **Remaining:** the §12
-> `0A000` follow-ons (multidim values, custom lower bounds, slices `a[m:n]`, array-of-composite,
-> arrays-in-keys, and the array function/operator surface).
+> `0A000` follow-ons (array-of-composite, arrays-in-keys, and the array function/operator surface).
 
 Arrays are the **second user-facing container type** and the axis the composite (row) type
 already cleared the way for. Where composite added a *nominal* arm to the open type system
@@ -48,7 +50,7 @@ SELECT * FROM t WHERE xs = ARRAY[40, 50]
   create it and no catalog entry for it; it exists the moment its element type does (§2). Matching
   PostgreSQL exactly (CLAUDE.md §1), **array shape (number of dimensions, per-dimension lengths,
   lower bounds) is a property of the *value*, not the type**: the same `int32[]` column may hold a
-  3-element array in one row and (eventually) a 2×2 array in another, and a declared size like
+  3-element array in one row and a 2×2 array in another, and a declared size like
   `int32[3]` enforces nothing. This is the one place arrays relax "strict static" (CLAUDE.md §4) —
   but only on *shape*; the **element type stays static and strictly enforced** (an `int32[]` never
   holds a `text` element), which is the part of §4 that matters. See §10.1.
@@ -207,18 +209,21 @@ UNKNOWN**. This is the opposite of composite/row comparison ([composite.md §5](
 *does* propagate UNKNOWN. Implementers must **not** reuse the composite 3VL path. Pin against the
 oracle (the composite `IS NULL` rule was oracle-corrected — expect the same scrutiny):
 
-- **Equality (`=`, `<>`):** TRUE iff same dimensions *and* every element pair is equal-or-both-NULL;
-  else FALSE. So (proposed, oracle-pinned): `ARRAY[1,NULL] = ARRAY[1,NULL]` → **TRUE**,
-  `ARRAY[1,NULL] = ARRAY[1,2]` → **FALSE**, `ARRAY[1,2] = ARRAY[1,2,3]` → **FALSE** (length differs).
-  `<>` is the boolean negation (not a 3VL negation).
-- **Ordering (`< <= > >=`, and the ORDER BY / DISTINCT / GROUP BY sort key):** element-wise over the
-  linear element order — the first element pair that is not "equal" decides (NULL sorts after every
-  non-NULL, NULLs mutually equal); if one array is a **prefix** of the other, the shorter sorts
-  first; (multidim, when it lands: `ndim` then `dims` then `lbounds` as the final tiebreak, per
-  `array_cmp`). This is a **total** order, so DISTINCT/GROUP BY/ORDER BY over array columns are
-  well-defined, and equal-including-NULLs arrays group together. The recursion bottoms out in the
-  per-element scalar comparators (so the TS UTF-8 text-ordering trap recurses correctly for
-  `text[]`).
+- **Equality (`=`, `<>`):** TRUE iff same dimensionality **and** lower bounds *and* every element
+  pair is equal-or-both-NULL; else FALSE (oracle-pinned): `ARRAY[1,NULL] = ARRAY[1,NULL]` → **TRUE**,
+  `ARRAY[1,NULL] = ARRAY[1,2]` → **FALSE**, `ARRAY[1,2] = ARRAY[1,2,3]` → **FALSE** (length differs),
+  and **`'[2:4]={1,2,3}'::int32[] = '{1,2,3}'::int32[]` → FALSE** (same elements, but lower bound 2 vs
+  1 — `array_eq` considers lower bounds, §10.3). `<>` is the boolean negation (not a 3VL negation).
+- **Ordering (`< <= > >=`, and the ORDER BY / DISTINCT / GROUP BY sort key):** the PG `array_cmp`
+  total order — element-wise over the **flattened** element order (the first element pair that is not
+  "equal" decides; NULL sorts after every non-NULL, NULLs mutually equal); then **fewer total
+  elements** sorts first; then smaller `ndim`; then, per dimension, smaller length, then smaller
+  lower bound. This is a **total** order, so DISTINCT/GROUP BY/ORDER BY over array columns are
+  well-defined, and equal-including-NULLs-and-shape arrays group together. The recursion bottoms out
+  in the per-element scalar comparators (so the TS UTF-8 text-ordering trap recurses correctly for
+  `text[]`). (Caveat: PostgreSQL's *single-array-column* `ORDER BY` can disagree with its own `<`
+  operator on the lower-bound tiebreak — an abbreviated-key artifact; jed implements the consistent
+  `array_cmp` order, so it matches PG's `=`/`<` operators and avoids that inconsistency.)
 - **`IS NULL` / `IS NOT NULL` — whole-value only, NOT element-wise** (the contrast with composite's
   all-fields rule): `arr IS NULL` is TRUE iff the array value is SQL-NULL; a non-NULL array
   containing NULL elements (`{1,NULL}`) is `IS NULL` → **FALSE**, `IS NOT NULL` → **TRUE**. An empty
@@ -226,18 +231,28 @@ oracle (the composite `IS NULL` rule was oracle-corrected — expect the same sc
 
 ## 6. Subscripting and element access
 
-`a[i]` reads the *i*-th element (S-later; see §12). PostgreSQL exactly:
+A subscript access is **one or more** bracketed specs applied to a base (`a[i]`, `a[i][j]`, `a[m:n]`,
+`a[m:n][p:q]`, …) — the parser collects consecutive `[…]` postfixes into a single node, so `a[1][2]`
+is **one** multidim element read, **not** nested subscripting (PG grammar). Each spec is an **index**
+`[i]` or a **slice** `[m:n]` (either bound may be omitted: `[:n]`, `[m:]`, `[:]`). If any spec is a
+slice the whole access is a **slice** (result = the array type); otherwise it is **element access**
+(result = the element type). PostgreSQL exactly:
 
-- **1-based.** `a[1]` is the first element (the SQL-standard / PG convention — no overriding reason
-  to diverge to 0-based, and the corpus oracle is PG; §10.3). The index domain is `1..length`; PG's
-  arbitrary lower bounds are accepted in the *value* header (§4) but v1 constructs only
-  default-lower-bound-1 arrays, so the in-bounds domain is `1..len` (the custom-bound read path lands
-  with multidim/custom-bounds construction, §12).
+- **1-based, with custom lower bounds.** `a[i]` reads element *i* using the value's lower bounds — the
+  index domain is `lb..ub` per dimension (`('[2:4]={7,8,9}')[2]` is `7`). Element access yields the
+  element **iff** the number of subscripts equals the value's `ndim` and every index is in range —
+  fewer or more subscripts yield NULL (`a[i]` on a 2-D value is NULL; `a[i][j]` reads the element).
 - **Out-of-bounds or NULL subscript → NULL, never an error** (PG; a documented divergence from the
-  SQL standard, which mandates a data exception — §10.4). `a[100]` on a 3-element array is NULL;
-  `a[NULL]` is NULL. The result type is the element type.
+  SQL standard, which mandates a data exception — §10.4). `a[100]` is NULL; `a[NULL]` is NULL. A
+  subscript of a NULL array is NULL. The result type is the element type.
 - **Subscripting a non-array base is `42804`** (`cannot subscript a non-array`), at resolve time.
-- **Slices `a[m:n]` are deferred `0A000`** (a follow-on; §12).
+- **Slices `a[m:n]`** return a sub-array, **renumbered to lower bound 1 on every dimension** (PG
+  `array_get_slice`). The requested range is clamped to each dimension's `[lb,ub]`; an empty (or
+  fully out-of-range, or reversed `m>n`) result is the **empty array `{}`** (NOT NULL); a NULL bound,
+  or a slice of a NULL array, yields NULL. An omitted lower/upper bound defaults to the value's own
+  lower/upper bound. In a multidimensional access a scalar index `i` mixed with a slice means `1:i`
+  (PG: "from 1 to the number"); too many subscripts → `{}`, fewer leave the trailing dimensions at
+  full range.
 
 ## 7. Text I/O — `array_out` / `array_in`
 
@@ -251,12 +266,17 @@ bytea/uuid/composite; [conformance.md §1](conformance.md)) — **no new tag**.
   double-quote, backslash, or whitespace. Inside quotes, `"`→`\"` and `\`→`\\` (PG `array_out`
   *backslash-escapes* — the contrast with `record_out`, which *doubles*; pin against the oracle). A
   **NULL element** renders as the unquoted token `NULL` (the contrast with `record_out`, where a
-  NULL field is the empty string). The empty array renders `{}`. Recurses for composite elements.
-- **`array_in`** parses `{…}` into elements (top-level commas, respecting quotes/escapes/braces) and
+  NULL field is the empty string). The empty array renders `{}`. A **multidimensional** value renders
+  with **nested braces** (`{{1,2},{3,4}}`), and a value with **any lower bound ≠ 1** is prefixed with
+  a `[l1:u1][l2:u2]…=` bound spec (`[2:4]={1,2,3}`) — PG emits the prefix only then. Recurses for
+  composite elements.
+- **`array_in`** parses an optional dimension prefix `[l1:u1][l2:u2]…=`, then a (possibly nested)
+  brace structure `{…}` into elements (top-level commas, respecting quotes/escapes/braces) and
   coerces each token to the element type — an **unquoted** `NULL` (any case) is a NULL element,
   `"NULL"` is the 4-char text string, `\x`→`x` un-escapes. It is the inverse of `array_out` (values
-  round-trip). A malformed literal is `22P02`; a bad element value surfaces that element's own parse
-  error.
+  round-trip). A multidim literal must be **rectangular**, and a declared prefix's dimensions must
+  match the contents (else `22P02`); a prefix with `u < l` is `2202E`. A malformed literal is
+  `22P02`; a bad element value surfaces that element's own parse error.
 - An array literal is `'{1,2,3}'::int32[]` or `int32[] '{1,2,3}'` — the cast / typed-literal
   machinery routes the **string-literal → array** coercion through `array_in`, the same
   out-of-matrix path string-literal → scalar/composite coercions use (so
@@ -309,10 +329,11 @@ corpus lands.
    surface, array-type rows can be **synthesized** from the bijection without changing the type
    representation. (Contrast composite, which is nominal — correctly, since same-shaped composites
    are distinct types.)
-3. **1-based subscripting, custom lower bounds shed from the *index domain*** — match the SQL
-   standard / PG indexing base (no overriding reason to diverge to 0-based — "preference" is excluded
-   by §1, and the corpus oracle is PG); the value header still carries lower bounds (PG-faithful, §4)
-   but v1 constructs lower-bound-1 arrays.
+3. **1-based subscripting, custom lower bounds honored** — match the SQL standard / PG indexing base
+   (no overriding reason to diverge to 0-based — "preference" is excluded by §1, and the corpus
+   oracle is PG). A value's lower bounds (PG-faithful, §4) shift the per-dimension index domain to
+   `lb..ub`; the `ARRAY[…]` constructor always produces lower bound 1, while the `'[l:u]={…}'` literal
+   sets a custom one. `array_eq`/`array_cmp` consider lower bounds (so `[2:4]={1,2,3} ≠ {1,2,3}`).
 4. **Out-of-bounds subscript → NULL (match PG; a divergence from the SQL standard)** — PG returns
    NULL where the standard mandates a data exception. Matched for oracle alignment and PG
    least-surprise; the type stays sound (`a[100]` is well-typed, it just yields NULL), so this is not
@@ -323,9 +344,10 @@ corpus lands.
 6. **`IS NULL` tests the whole value only, not element-wise** (§5) — the contrast with composite's
    all-fields rule. PG; oracle-pinned.
 7. **Multidimensionality is a value property, not array-of-array** (§2) — `int32[][]` is
-   `Array(Scalar(int32))` with value `ndim` 2, never `Array(Array(int32))`. v1 ships 1-D values;
-   multidim construction is `0A000` (§12), with the codec header already carrying `ndim`/`dims`/
-   `lbounds` so multidim is a pure unlock (no format bump).
+   `Array(Scalar(int32))` with value `ndim` 2, never `Array(Array(int32))`. Multidim construction
+   (`ARRAY[ARRAY[…],…]` stacking — rectangular or `2202E`; `'{{…},{…}}'` literal) landed in S5; the
+   codec header already carried `ndim`/`dims`/`lbounds`, so it was a pure unlock (no format bump —
+   still `format_version` 10). The resolved type renders as `T[]` regardless of a value's `ndim`.
 8. **`array_out` matches PG byte-for-byte; `array_in` accepts ≥ what `array_out` emits** (§7),
    including PG's backslash-escaping (vs `record_out`'s doubling) and the unquoted `NULL` element
    token.
@@ -340,14 +362,14 @@ corpus lands.
 | Non-unifiable elements in `ARRAY[…]` / array vs array of a different element type | `42804` datatype_mismatch |
 | Subscripting a non-array base | `42804` datatype_mismatch |
 | Element value out of range (via element coercion) | `22003` numeric_value_out_of_range |
-| Malformed array text literal (`array_in`) | `22P02` invalid_text_representation |
+| Malformed array text literal (`array_in`), incl. non-rectangular `'{{…},{…}}'` / declared-dims mismatch | `22P02` invalid_text_representation |
 | Bad element value inside a literal | that element's own parse error (e.g. `22P02`) |
-| Multidimensional construction/literal; array slice `a[m:n]`; array `PRIMARY KEY`/index/`UNIQUE`; nested array (array-of-array); runtime non-literal text→array cast, `array::text`, element-wise array→array cast; `unnest`/`\|\|`/`@>`/`&&`/`ANY`/`ALL`/`VARIADIC` | `0A000` feature_not_supported |
-| (When multidim lands) non-rectangular multidim construction / dimension mismatch | `2202E` array_subscript_error |
+| Non-rectangular multidim construction `ARRAY[…]` (mismatched sub-array dims, incl. a NULL sub-array); a `'[l:u]'` literal bound with `u < l` | `2202E` array_subscript_error |
+| Array `PRIMARY KEY`/index/`UNIQUE`; nested array (array-of-array); runtime non-literal text→array cast, `array::text`, element-wise array→array cast; `unnest`/`\|\|`/`@>`/`&&`/`ANY`/`ALL`/`VARIADIC` | `0A000` feature_not_supported |
 | Corrupt array body (bad `ndim`/length/element) | `XX001` data_corrupted |
 
-`2202E` is **not** registered this slice (multidim is `0A000`); it is added when the multidim
-follow-on lands. All other codes above already exist in [../errors/registry.toml](../errors/registry.toml).
+`2202E` is registered in [../errors/registry.toml](../errors/registry.toml) (added with the S5
+multidim/slice follow-on); all other codes above already existed.
 
 ## 12. Delivery (sub-slices)
 
@@ -366,16 +388,24 @@ each passing `rake ci`, mirroring composite's S0–S6:
   (1-D values only.)
 - **S3 ✅** — subscripting `a[i]` (1-based, OOB/NULL → NULL; non-array base `42804`) — parsed as a
   postfix `[…]` on any base, resolved to the element type, evaluated 1-based with the OOB/NULL→NULL
-  rule. All three cores + `types/subscript.test`. Slices `a[m:n]` stay deferred `0A000` (§6).
+  rule. All three cores + `types/subscript.test`.
 - **S4 ✅** — comparison / ordering / `IS NULL`: the resolver gate (same-element-type arrays
   comparable; `42804` otherwise), the **btree-NULL** element-wise `eq3`/`lt3`/`gt3` (§5 — *not* the
   composite 3VL path), the `ORDER BY` total-order arm, DISTINCT/GROUP BY array keys, the
   whole-value-only `IS NULL`. Oracle-pinned via `rake corpus:check`. (Landed with S1/S2.)
+- **S5 ✅** — multidimensional values, custom lower bounds, and array slices `a[m:n]`. The value
+  representation gained `dims`/`lbounds` (the codec header already carried them — a pure unlock, no
+  format bump); `ARRAY[ARRAY[…],…]` stacks (rectangular or `2202E`; scalar/array mix `42804`); the
+  `'{{…},{…}}'` and `'[l:u]={…}'` literals parse nested braces + a bound prefix (`array_in`); `array_out`
+  renders nested braces + a `[l:u]=` prefix; the subscript node became a list (`a[i][j]` multidim
+  element access, scalar domain `lb..ub`); slices `a[m:n]` (renumber-to-1, clamp, empty→`{}`,
+  NULL-bound→NULL, scalar-in-slice→`1:i`); `array_eq`/`array_cmp` extended with the count→ndim→dims→
+  lbounds tiebreak; `2202E` registered. All three cores + the Ruby reference (golden row 4 pins a 2-D
+  + custom-lb value, `rust == go == ts == ruby`); oracle-checked `types/array_multidim.test` +
+  `types/array_slice.test`; capabilities `types.array_multidim` + `expr.array_slice`.
 
-**Narrowed in v1, relaxed in later slices (each its own follow-on):** multidimensional values
-(construction/literal `0A000`; the codec header already supports them); custom lower bounds in
-construction; array slices `a[m:n]`; **array-of-composite** elements (a fast-follow — composite
-already composes); arrays-in-keys (`0A000`, encoding authored §8); the array function/operator
-surface (`array_length`/`cardinality`/`unnest`/`||`/`array_cat`/`@>`/`&&`/`array_append`/…, the
-polymorphic `anyarray`/`anyelement` resolution, `ANY`/`ALL`, and `VARIADIC` — TODO.md); runtime
-text→array, `array::text`, and element-wise array→array casts.
+**Still deferred (each its own follow-on):** **array-of-composite** elements (a fast-follow —
+composite already composes); arrays-in-keys (`0A000`, encoding authored §8); the array
+function/operator surface (`array_length`/`cardinality`/`unnest`/`||`/`array_cat`/`@>`/`&&`/
+`array_append`/…, the polymorphic `anyarray`/`anyelement` resolution, `ANY`/`ALL`, and `VARIADIC` —
+TODO.md); runtime text→array, `array::text`, and element-wise array→array casts.

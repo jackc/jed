@@ -661,9 +661,10 @@ from v1**. The present-**inline-plain** body depends on the type:
   `flags u8` (bit 0 = `HAS_NULLS`; other bits reserved, 0), then per dimension `len u32 BE` +
   `lb i32 BE`, then (only when `HAS_NULLS`) a **null bitmap** of `ceil(N / 8)` bytes (MSB-first, like
   composite; `N` = product of the dim lengths), then each **present** element's value-codec body
-  **without its own presence tag** (row-major). v1 writes **1-D** values only: an **empty array** is
-  `ndim = 0` (the two bytes `00 00`, no dims/bitmap/elements); a non-empty array is `ndim = 1`,
-  `len` = element count, `lb = 1`. A **whole-value-NULL** array is the lone `0x01` tag. The element
+  **without its own presence tag** (row-major). `ndim` ranges 0–6 (`MAXDIM`): an **empty array** is
+  `ndim = 0` (the two bytes `00 00`, no dims/bitmap/elements); a 1-D value is `ndim = 1`; a multidim
+  value records each dimension's `len`/`lb` (the `lb` field carries a value's custom lower bound —
+  [../design/array.md §12](../design/array.md)). A **whole-value-NULL** array is the lone `0x01` tag. The element
   type comes from the column's array type in the catalog, so the body is self-delimiting; fixed-width
   elements pay **no** per-element prefix. Worked example, `int32[]`: `{1,2,3}` → `00`(tag) `01`(ndim)
   `00`(flags) `00 00 00 03`(len) `00 00 00 01`(lb) `80 00 00 01 80 00 00 02 80 00 00 03`(three int32

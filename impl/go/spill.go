@@ -393,6 +393,20 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		for _, f := range *v.Comp {
 			spillWriteValue(w, f)
 		}
+	case ValArray:
+		// Array — tag 16: ndim, then per-dimension (length, lower bound), then each element value,
+		// recursive (spec/design/array.md). Internal merge-sort scratch format; the full shape
+		// round-trips (multidim + custom bounds).
+		_ = w.WriteByte(16)
+		a := v.Array
+		spillWriteU32(w, uint32(a.Ndim()))
+		for d := 0; d < a.Ndim(); d++ {
+			spillWriteU32(w, uint32(a.Dims[d]))
+			spillWriteU32(w, uint32(a.Lbounds[d]))
+		}
+		for _, el := range a.Elements {
+			spillWriteValue(w, el)
+		}
 	case ValUnfetched:
 		// An untouched large-value reference rides along to the output unread (spill.md §4); spill
 		// it opaquely so it round-trips, never resolving it.
@@ -563,6 +577,36 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			fields[i] = f
 		}
 		return CompositeValue(fields), nil
+	case 16:
+		ndim, err := spillReadU32(r)
+		if err != nil {
+			return Value{}, err
+		}
+		dims := make([]int, ndim)
+		lbounds := make([]int32, ndim)
+		n := 1
+		for d := 0; d < int(ndim); d++ {
+			ln, err := spillReadU32(r)
+			if err != nil {
+				return Value{}, err
+			}
+			lb, err := spillReadU32(r)
+			if err != nil {
+				return Value{}, err
+			}
+			dims[d] = int(ln)
+			lbounds[d] = int32(lb)
+			n *= int(ln)
+		}
+		elems := make([]Value, n)
+		for i := range elems {
+			el, err := spillReadValue(r)
+			if err != nil {
+				return Value{}, err
+			}
+			elems[i] = el
+		}
+		return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elems}), nil
 	default:
 		return Value{}, io.ErrUnexpectedEOF
 	}

@@ -389,6 +389,15 @@ pub struct SelectItem {
     pub alias: Option<String>,
 }
 
+/// One subscript spec inside an [`Expr::Subscript`] (spec/design/array.md §6): an index `[i]` or a
+/// slice `[m:n]`. A slice's lower/upper bound may be omitted (`[:n]`, `[m:]`, `[:]`), defaulting to
+/// the array's own lower / upper bound at evaluation.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SubscriptSpec {
+    Index(Expr),
+    Slice(Option<Expr>, Option<Expr>),
+}
+
 /// A general expression, shared by the SELECT list, WHERE, and UPDATE ... SET. The
 /// productions are layered by precedence in the parser (spec/grammar/grammar.ebnf
 /// `expr`); this is the flat resulting tree. A comparison/logical/null-test node is
@@ -428,13 +437,16 @@ pub enum Expr {
     FieldStar {
         base: Box<Expr>,
     },
-    /// Array element subscript `base[index]` (spec/design/array.md §6) — the *index*-th element of
-    /// an array `base`, **1-based**. An out-of-bounds or NULL subscript yields NULL (PG, not an
-    /// error); the result type is the element type. Subscripting a non-array base is 42804 at
-    /// resolve. The parser produces this for a `[…]` postfix on any base expression.
+    /// Array subscript `base[..][..]` (spec/design/array.md §6) — one or more bracketed specs
+    /// applied to an array `base`. Each spec is an index `[i]` or a slice `[m:n]` (with optionally-
+    /// omitted bounds: `[:n]`, `[m:]`, `[:]`). All-index access reads a single **1-based** element
+    /// (the element type); if any spec is a slice the access returns a sub-array (the array type),
+    /// and a scalar index `i` then means `1:i` (PG). An out-of-bounds / NULL subscript yields NULL
+    /// (PG, not an error); subscripting a non-array base is 42804 at resolve. The parser collects
+    /// consecutive `[…]` postfixes on any base into one node (so `a[1][2]` is one access, two specs).
     Subscript {
         base: Box<Expr>,
-        index: Box<Expr>,
+        subscripts: Vec<SubscriptSpec>,
     },
     /// A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
     /// `type 'string'` form, equal to `CAST('string' AS type)` over a string-literal operand.

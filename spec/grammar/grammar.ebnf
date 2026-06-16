@@ -495,7 +495,14 @@ unary          ::= "-" unary
  * scalar position 0A000. NB: the grammar below writes the postfix uniformly, but the parens-required
  * rule is a hand-written-parser SEMANTIC gate (a "field_accessible" flag set true only for a
  * parenthesized primary and after each ".field"), not expressible as pure EBNF. */
-postfix        ::= primary ( "::" type_name | "." identifier | "." "*" )*
+postfix        ::= primary ( "::" type_name | "." identifier | "." "*" | subscript )*
+
+/* ARRAY SUBSCRIPT (../design/array.md §6): one or more bracketed specs on any base — an index
+ * "[i]" or a slice "[m:n]" (either bound omittable: "[:n]", "[m:]", "[:]"). Consecutive "[…]"
+ * brackets collect into ONE multidim access ("a[1][2]" is one element read, not nested). All-index
+ * access reads one element (the element type); if any spec is a slice the access is a slice (the
+ * array type). Unlike ".field", a subscript applies to ANY base (no parens rule). */
+subscript      ::= "[" ( a_expr [ ":" [ a_expr ] ] | ":" [ a_expr ] ) "]"
 
 /* A "(" begins either a parenthesized expression "(" expr ")" or a SCALAR SUBQUERY
  * "(" query_expr ")" (../design/grammar.md §26) — disambiguated by a leading "SELECT" after the
@@ -656,10 +663,11 @@ exponent       ::= ( "e" | "E" ) ( "+" | "-" )? digit+
 dot            ::= "."
 
 /* The `::` PostgreSQL typecast operator token — exactly two colons, scanned greedily. A LONE
- * `:` is not part of jed's surface (no host-parameter `:name`, no array slice, no `psql`
- * meta-syntax), so a single colon is a 42601 syntax error, reported by the lexer. Consumed only
- * by `postfix` above. */
+ * `:` is the array-slice bound separator `a[m:n]` (../design/array.md §6, the `subscript` above);
+ * it is meaningful only inside subscript brackets (no host-parameter `:name`, no `psql`
+ * meta-syntax), so elsewhere the parser rejects it (42601). */
 double_colon   ::= ":" ":"
+colon          ::= ":"
 
 /* A single-quoted string literal (the `text` type). An embedded single quote is written
  * by doubling it (`''`) — standard_conforming_strings; there are NO backslash escapes. The

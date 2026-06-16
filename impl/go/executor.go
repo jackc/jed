@@ -4762,13 +4762,8 @@ func valueToRExpr(v Value) *rExpr {
 		}
 		return &rExpr{kind: reRow, sargs: nodes}
 	case ValArray:
-		// A folded array value rebuilds as an ARRAY[...] of its per-element constant nodes
-		// (spec/design/array.md).
-		nodes := make([]*rExpr, len(*v.Array))
-		for i, el := range *v.Array {
-			nodes[i] = valueToRExpr(el)
-		}
-		return &rExpr{kind: reArray, sargs: nodes}
+		// A folded array constant — preserve its full shape (dims/lbounds) in a const node.
+		return &rExpr{kind: reConstArray, cArray: v.Array}
 	default: // ValNull
 		return &rExpr{kind: reConstNull}
 	}
@@ -4857,14 +4852,23 @@ func distinctRowKey(row []Value) string {
 			b.WriteByte(':')
 			b.WriteString(distinctRowKey(*v.Comp))
 		case ValArray:
-			// An array keys structurally (spec/design/array.md §5): the element count under a
-			// distinct 'a' tag, then each element's own key recursively. NULL elements key as 'n'
-			// (btree equality — NULLs mutually equal), so structurally-equal arrays share a
-			// DISTINCT/GROUP BY bucket.
+			// An array keys structurally INCLUDING its shape (spec/design/array.md §5): the
+			// dims and lower bounds (so [2:4]={1,2,3} and {1,2,3} bucket apart — array_eq considers
+			// them), then each element's own key recursively. NULL elements key as 'n' (btree
+			// equality — NULLs mutually equal), so structurally-equal arrays share a bucket.
+			a := v.Array
 			b.WriteByte('a')
-			b.WriteString(strconv.Itoa(len(*v.Array)))
-			b.WriteByte(':')
-			b.WriteString(distinctRowKey(*v.Array))
+			b.WriteString(strconv.Itoa(len(a.Dims)))
+			for _, d := range a.Dims {
+				b.WriteByte(':')
+				b.WriteString(strconv.Itoa(d))
+			}
+			for _, lb := range a.Lbounds {
+				b.WriteByte(';')
+				b.WriteString(strconv.FormatInt(int64(lb), 10))
+			}
+			b.WriteByte('=')
+			b.WriteString(distinctRowKey(a.Elements))
 		}
 	}
 	return b.String()
@@ -5178,8 +5182,11 @@ const (
 	reRow
 	// reArray is an ARRAY[...] constructor (spec/design/array.md §1): its element nodes are held in
 	// sargs (so the fold / references-outer / touched-set walks recurse for free). Evaluates to a
-	// ValArray; one operator_eval per node.
+	// ValArray; one operator_eval per node. `nested` stacks sub-arrays into a higher dimension (§4).
 	reArray
+	// reConstArray is a folded array constant (the value_to_rexpr equivalent), preserving its shape;
+	// it evaluates to its ValArray directly (cArray).
+	reConstArray
 	// reField is field selection `(composite).field` (spec/design/composite.md §S4): evaluate
 	// `operand` (the base) to a composite value and return its `index`-th field (the field ordinal,
 	// fixed at resolve). A whole-value-NULL composite yields NULL for any field. One operator_eval
@@ -5277,6 +5284,16 @@ type rExpr struct {
 	sfunc scalarFunc
 	sargs []*rExpr
 
+	// reArray: `nested` marks a multidim-stacking constructor (its element nodes evaluate to
+	// arrays, stacked into one higher dimension — spec/design/array.md §4).
+	nested bool
+	// reSubscript: the subscript specs applied to `operand`, and whether any is a slice (so the
+	// whole access is a slice — spec/design/array.md §6).
+	subs    []rSubscript
+	isSlice bool
+	// reConstArray: a folded array constant (its full shape preserved).
+	cArray *ArrayVal
+
 	// reOuterColumn: the number of frames out (`index` reuses the column index field).
 	level int
 	// reSubquery: the resolved inner plan, which form, and (for sqIn) the resolved lhs (`lhs`)
@@ -5284,6 +5301,15 @@ type rExpr struct {
 	subPlan *queryPlan
 	subKind subqueryKind
 	list    []Value
+}
+
+// rSubscript is one resolved subscript spec in a reSubscript (spec/design/array.md §6): an index
+// `a[i]` (isSlice false), or a slice `a[m:n]` whose bounds may be nil (omitted: `a[:n]`/`a[m:]`/`a[:]`).
+type rSubscript struct {
+	isSlice bool
+	index   *rExpr
+	lower   *rExpr
+	upper   *rExpr
 }
 
 // ============================================================================
@@ -5649,6 +5675,22 @@ func isAggregateName(name string) bool {
 	return false
 }
 
+// subscriptSpecExprs returns the sub-expressions of one AST subscript spec (an index, or a slice's
+// present bounds) — for the Expr tree walkers (spec/design/array.md §6).
+func subscriptSpecExprs(s SubscriptSpec) []*Expr {
+	if !s.IsSlice {
+		return []*Expr{s.Index}
+	}
+	var out []*Expr
+	if s.Lower != nil {
+		out = append(out, s.Lower)
+	}
+	if s.Upper != nil {
+		out = append(out, s.Upper)
+	}
+	return out
+}
+
 // exprHasAggregate reports whether an expression tree contains an AGGREGATE call anywhere. A
 // scalar-function call is not itself an aggregate but may CONTAIN one (abs(sum(x))), so its
 // arguments are walked.
@@ -5703,8 +5745,18 @@ func exprHasAggregate(e Expr) bool {
 		// (spec/design/composite.md §S4) — an aggregate hidden in the base must surface.
 		return exprHasAggregate(*e.Base)
 	case ExprSubscript:
-		// `base[index]` — an aggregate hidden in either the base array or the index must surface.
-		return exprHasAggregate(*e.Base) || exprHasAggregate(*e.Index)
+		// `base[..]` — an aggregate hidden in the base array or any subscript bound must surface.
+		if exprHasAggregate(*e.Base) {
+			return true
+		}
+		for _, s := range e.Subscripts {
+			for _, x := range subscriptSpecExprs(s) {
+				if exprHasAggregate(*x) {
+					return true
+				}
+			}
+		}
+		return false
 	case ExprRow, ExprArray:
 		// A ROW(...) / ARRAY[...] constructor recurses into its element expressions.
 		for _, it := range e.RowItems {
@@ -5803,11 +5855,18 @@ func rejectCheckStructure(e Expr) error {
 		// subquery/aggregate/parameter hidden there is still rejected.
 		return rejectCheckStructure(*e.Base)
 	case ExprSubscript:
-		// Recurse into both the array base and the index.
+		// Recurse into the array base and every subscript bound.
 		if err := rejectCheckStructure(*e.Base); err != nil {
 			return err
 		}
-		return rejectCheckStructure(*e.Index)
+		for _, s := range e.Subscripts {
+			for _, x := range subscriptSpecExprs(s) {
+				if err := rejectCheckStructure(*x); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	default: // ExprColumn, ExprQualifiedColumn, ExprLiteral
 		return nil
 	}
@@ -5899,11 +5958,18 @@ func rejectDefaultStructure(e Expr) error {
 		// Recurse into the composite base (spec/design/composite.md §S4).
 		return rejectDefaultStructure(*e.Base)
 	case ExprSubscript:
-		// Recurse into both the array base and the index.
+		// Recurse into the array base and every subscript bound.
 		if err := rejectDefaultStructure(*e.Base); err != nil {
 			return err
 		}
-		return rejectDefaultStructure(*e.Index)
+		for _, s := range e.Subscripts {
+			for _, x := range subscriptSpecExprs(s) {
+				if err := rejectDefaultStructure(*x); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	default: // ExprLiteral, ExprTypedLiteral
 		return nil
 	}
@@ -5974,9 +6040,13 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 			// Field selection recurses into the composite base (spec/design/composite.md §S4).
 			walk(*e.Base)
 		case ExprSubscript:
-			// `base[index]` recurses into both the array base and the index.
+			// `base[..]` recurses into the array base and every subscript bound.
 			walk(*e.Base)
-			walk(*e.Index)
+			for _, s := range e.Subscripts {
+				for _, x := range subscriptSpecExprs(s) {
+					walk(*x)
+				}
+			}
 		}
 	}
 	walk(e)
@@ -7015,6 +7085,29 @@ func planSubquery(s *scope, inner QueryExpr, params *paramTypes) (queryPlan, err
 	return s.catalog.planQuery(inner, s, params)
 }
 
+// resolveSubscriptInt resolves one array-subscript bound to an integer rExpr (a literal adapts to
+// int4; a non-integer is 42804). A NULL-typed bound is accepted — it evaluates to a NULL subscript
+// → NULL result (spec/design/array.md §6).
+func resolveSubscriptInt(s *scope, e Expr, ag *aggCtx, params *paramTypes) (*rExpr, error) {
+	idxCtx := Int32
+	node, ty, err := resolve(s, e, &idxCtx, ag, params)
+	if err != nil {
+		return nil, err
+	}
+	if ty.kind != rtInt && ty.kind != rtNull {
+		return nil, typeError(fmt.Sprintf("array subscript must be an integer, not %s", rtName(ty)))
+	}
+	return node, nil
+}
+
+// resolveSubscriptIntPtr resolves an optional (possibly-omitted) slice bound; nil stays nil.
+func resolveSubscriptIntPtr(s *scope, e *Expr, ag *aggCtx, params *paramTypes) (*rExpr, error) {
+	if e == nil {
+		return nil, nil
+	}
+	return resolveSubscriptInt(s, *e, ag, params)
+}
+
 // resolve resolves one Expr into an rExpr plus its static type. ctx (non-nil) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); nil
 // defaults a bare literal to int64.
@@ -7067,10 +7160,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		return nil, resolvedType{}, NewError(FeatureNotSupported,
 			"row expansion (.*) is not supported in this context")
 	case ExprSubscript:
-		// `base[index]` — array element subscript (spec/design/array.md §6). The base must be an
-		// array (else 42804); the result type is the element type. The index is an integer (PG int4)
-		// — a literal adapts to the int context; a non-integer index is 42804. OOB / NULL → NULL is
-		// an evaluation-time rule, not a resolve error.
+		// `base[..][..]` — array subscript (spec/design/array.md §6). The base must be an array
+		// (else 42804). Each subscript bound is an integer (a literal adapts; a non-integer is
+		// 42804). If any spec is a slice the result is the array type (a sub-array); otherwise it is
+		// the element type. OOB / NULL → NULL is an evaluation-time rule, not a resolve error.
 		baseNode, baseTy, err := resolve(s, *e.Base, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -7081,17 +7174,39 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			))
 		}
 		elemTy := *baseTy.elem
-		idxCtx := Int32
-		idxNode, idxTy, err := resolve(s, *e.Index, &idxCtx, ag, params)
-		if err != nil {
-			return nil, resolvedType{}, err
+		isSlice := false
+		for _, sp := range e.Subscripts {
+			if sp.IsSlice {
+				isSlice = true
+				break
+			}
 		}
-		if idxTy.kind != rtInt && idxTy.kind != rtNull {
-			return nil, resolvedType{}, typeError(fmt.Sprintf(
-				"array subscript must be an integer, not %s", rtName(idxTy),
-			))
+		rsubs := make([]rSubscript, len(e.Subscripts))
+		for i, sp := range e.Subscripts {
+			if sp.IsSlice {
+				lower, err := resolveSubscriptIntPtr(s, sp.Lower, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				upper, err := resolveSubscriptIntPtr(s, sp.Upper, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				rsubs[i] = rSubscript{isSlice: true, lower: lower, upper: upper}
+			} else {
+				idxNode, err := resolveSubscriptInt(s, *sp.Index, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				rsubs[i] = rSubscript{index: idxNode}
+			}
 		}
-		return &rExpr{kind: reSubscript, operand: baseNode, lhs: idxNode}, elemTy, nil
+		// A slice yields a sub-array (the array type); all-index access yields an element.
+		resTy := elemTy
+		if isSlice {
+			resTy = baseTy
+		}
+		return &rExpr{kind: reSubscript, operand: baseNode, subs: rsubs, isSlice: isSlice}, resTy, nil
 	case ExprRow:
 		// A ROW(...) constructor (spec/design/composite.md §1): resolve each field (no context — a
 		// field defaults like a bare expression), build the anonymous (structural) composite type
@@ -7127,11 +7242,17 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			nodes[i] = node
 			elemTypes[i] = ty
 		}
-		elemType, err := unifyArrayElementTypes(elemTypes)
+		common, err := unifyArrayElementTypes(elemTypes)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		return &rExpr{kind: reArray, sargs: nodes}, resolvedType{kind: rtArray, elem: &elemType}, nil
+		// If the items are themselves arrays, this is a nested (multidim-stacking) constructor and
+		// the result type is the SAME array type (dimension-agnostic, §2/§4); otherwise a flat 1-D
+		// array of the unified element.
+		if common.kind == rtArray {
+			return &rExpr{kind: reArray, sargs: nodes, nested: true}, common, nil
+		}
+		return &rExpr{kind: reArray, sargs: nodes}, resolvedType{kind: rtArray, elem: &common}, nil
 	case ExprFuncCall:
 		return resolveFuncCall(s, e.FuncCall, ag, params)
 	case ExprLiteral:
@@ -8387,6 +8508,222 @@ func unifyArrayElementTypes(types []resolvedType) (resolvedType, error) {
 	return first, nil
 }
 
+// arraySubscriptErr is a 2202E array-subscript error (spec/design/array.md §11).
+func arraySubscriptErr(detail string) error { return NewError(ArraySubscriptError, detail) }
+
+// buildNestedArray stacks the evaluated elements of a nested ARRAY[...] constructor into a value of
+// one higher dimension (spec/design/array.md §4). The resolver guarantees every item is an array; a
+// NULL sub-array or a sub-array of differing shape is a 2202E. Stacking empty sub-arrays yields the
+// empty array (PG: ARRAY['{}'::int[]] → {}).
+func buildNestedArray(subs []Value) (Value, error) {
+	const mismatch = "multidimensional arrays must have array expressions with matching dimensions"
+	arrs := make([]*ArrayVal, len(subs))
+	for i, sv := range subs {
+		switch sv.Kind {
+		case ValArray:
+			arrs[i] = sv.Array
+		case ValNull:
+			return Value{}, arraySubscriptErr(mismatch)
+		default:
+			panic(fmt.Sprintf("nested array constructor over a non-array: %v", sv.Kind))
+		}
+	}
+	dims0, lbounds0 := arrs[0].Dims, arrs[0].Lbounds
+	for _, a := range arrs[1:] {
+		if !intSliceEqual(a.Dims, dims0) || !int32SliceEqual(a.Lbounds, lbounds0) {
+			return Value{}, arraySubscriptErr(mismatch)
+		}
+	}
+	if len(dims0) == 0 {
+		return ArrayValueOf(EmptyArray()), nil // all sub-arrays empty → empty array
+	}
+	dims := append([]int{len(arrs)}, dims0...)
+	lbounds := append([]int32{1}, lbounds0...)
+	var elements []Value
+	for _, a := range arrs {
+		elements = append(elements, a.Elements...)
+	}
+	return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elements}), nil
+}
+
+// evalSubscript evaluates an array subscript `base[..][..]` (spec/design/array.md §6). A NULL array
+// or any NULL subscript bound yields NULL; element access returns the element (or NULL), slice
+// access a (renumbered) sub-array.
+func evalSubscript(e *rExpr, row Row, env *evalEnv, m *Meter) (Value, error) {
+	base, err := e.operand.eval(row, env, m)
+	if err != nil {
+		return Value{}, err
+	}
+	if base.Kind == ValNull {
+		return NullValue(), nil
+	}
+	if base.Kind != ValArray {
+		panic(fmt.Sprintf("subscript on a non-array value: %v", base.Kind))
+	}
+	a := base.Array
+	if e.isSlice {
+		// Per-dimension (lower, upper); a scalar index i becomes 1:i (PG), an omitted bound defers
+		// to the array's own bound. A NULL bound → NULL. A nil lo/hi means "defer to the array bound".
+		los := make([]*int64, len(e.subs))
+		his := make([]*int64, len(e.subs))
+		for i, sp := range e.subs {
+			if !sp.isSlice {
+				v, err := sp.index.eval(row, env, m)
+				if err != nil {
+					return Value{}, err
+				}
+				if v.Kind == ValNull {
+					return NullValue(), nil
+				}
+				one := int64(1)
+				iv := v.Int
+				los[i] = &one // scalar i → 1:i
+				his[i] = &iv
+			} else {
+				lo, isNull, err := evalOptBound(sp.lower, row, env, m)
+				if err != nil {
+					return Value{}, err
+				}
+				if isNull {
+					return NullValue(), nil
+				}
+				hi, isNull, err := evalOptBound(sp.upper, row, env, m)
+				if err != nil {
+					return Value{}, err
+				}
+				if isNull {
+					return NullValue(), nil
+				}
+				los[i] = lo
+				his[i] = hi
+			}
+		}
+		return arrayGetSlice(a, los, his), nil
+	}
+	// Element access: every spec is an index.
+	idxs := make([]int64, len(e.subs))
+	for i, sp := range e.subs {
+		v, err := sp.index.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if v.Kind == ValNull {
+			return NullValue(), nil
+		}
+		idxs[i] = v.Int
+	}
+	return arrayGetElement(a, idxs), nil
+}
+
+// evalOptBound evaluates an optional slice-bound expression: nil expr → (nil, false); a NULL value →
+// (nil, true); an integer → (&i, false).
+func evalOptBound(e *rExpr, row Row, env *evalEnv, m *Meter) (*int64, bool, error) {
+	if e == nil {
+		return nil, false, nil
+	}
+	v, err := e.eval(row, env, m)
+	if err != nil {
+		return nil, false, err
+	}
+	if v.Kind == ValNull {
+		return nil, true, nil
+	}
+	iv := v.Int
+	return &iv, false, nil
+}
+
+// arrayGetElement reads a single array element by idxs (1-based per dimension, using the value's
+// lower bounds) — spec/design/array.md §6. NULL when the subscript count ≠ ndim or any index is out
+// of range.
+func arrayGetElement(a *ArrayVal, idxs []int64) Value {
+	if len(idxs) != a.Ndim() || len(a.Elements) == 0 {
+		return NullValue()
+	}
+	flat := 0
+	stride := 1
+	for d := a.Ndim() - 1; d >= 0; d-- {
+		lb := int64(a.Lbounds[d])
+		ub := int64(a.Ubound(d))
+		if idxs[d] < lb || idxs[d] > ub {
+			return NullValue()
+		}
+		flat += int(idxs[d]-lb) * stride
+		stride *= a.Dims[d]
+	}
+	return a.Elements[flat]
+}
+
+// arrayGetSlice reads an array slice (spec/design/array.md §6): per-dimension requested (lower,
+// upper) bounds (nil defers to the value's own bound), clamped to each dimension's [lb,ub]. Too many
+// subscripts, an empty source, or any empty clamped dimension yields the empty array; fewer
+// subscripts than ndim leave the trailing dimensions at their full range. The result is renumbered
+// to lower bound 1 on every dimension (PG array_get_slice).
+func arrayGetSlice(a *ArrayVal, los, his []*int64) Value {
+	ndim := a.Ndim()
+	if len(los) > ndim || ndim == 0 {
+		return ArrayValueOf(EmptyArray())
+	}
+	newDims := make([]int, ndim)
+	starts := make([]int, ndim) // source 0-based start per dimension
+	for d := 0; d < ndim; d++ {
+		lb := int64(a.Lbounds[d])
+		ub := int64(a.Ubound(d))
+		reqLo, reqHi := lb, ub
+		if d < len(los) {
+			if los[d] != nil {
+				reqLo = *los[d]
+			}
+			if his[d] != nil {
+				reqHi = *his[d]
+			}
+		}
+		lo := reqLo
+		if lo < lb {
+			lo = lb
+		}
+		hi := reqHi
+		if hi > ub {
+			hi = ub
+		}
+		if lo > hi {
+			return ArrayValueOf(EmptyArray()) // any empty dimension → empty slice
+		}
+		newDims[d] = int(hi - lo + 1)
+		starts[d] = int(lo - lb)
+	}
+	// Row-major strides over the SOURCE array.
+	strides := make([]int, ndim)
+	strides[ndim-1] = 1
+	for d := ndim - 2; d >= 0; d-- {
+		strides[d] = strides[d+1] * a.Dims[d+1]
+	}
+	total := 1
+	for _, d := range newDims {
+		total *= d
+	}
+	elements := make([]Value, 0, total)
+	counter := make([]int, ndim)
+	for range total {
+		flat := 0
+		for d := 0; d < ndim; d++ {
+			flat += (starts[d] + counter[d]) * strides[d]
+		}
+		elements = append(elements, a.Elements[flat])
+		for d := ndim - 1; d >= 0; d-- {
+			counter[d]++
+			if counter[d] < newDims[d] {
+				break
+			}
+			counter[d] = 0
+		}
+	}
+	lbounds := make([]int32, ndim)
+	for d := range lbounds {
+		lbounds[d] = 1
+	}
+	return ArrayValueOf(&ArrayVal{Dims: newDims, Lbounds: lbounds, Elements: elements})
+}
+
 // unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or rtNull for an
 // implicit ELSE) into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped
 // (they adapt); an all-NULL CASE is text (PostgreSQL). The non-NULL arms must share a family — all
@@ -8570,8 +8907,8 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		return CompositeValue(vals), nil
 	case reArray:
-		// An ARRAY[...] constructor — one operator_eval, then build the array from the evaluated
-		// elements (spec/design/array.md §1).
+		// An ARRAY[...] constructor — one operator_eval. A `nested` constructor stacks its
+		// sub-arrays into one higher dimension (spec/design/array.md §4); otherwise a flat 1-D array.
 		m.Charge(Costs.OperatorEval)
 		elems := make([]Value, len(e.sargs))
 		for i, el := range e.sargs {
@@ -8581,7 +8918,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 			elems[i] = v
 		}
+		if e.nested {
+			return buildNestedArray(elems)
+		}
 		return ArrayValue(elems), nil
+	case reConstArray:
+		// A folded array constant (shape preserved) — return it directly.
+		return ArrayValueOf(e.cArray), nil
 	case reField:
 		// Field selection `(composite).field` — one operator_eval, then return the `index`-th field
 		// of the evaluated composite base (spec/design/composite.md §S4, cost.md §9). A whole-value
@@ -8600,29 +8943,11 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			panic(fmt.Sprintf("field access on a non-composite value: %v", base.Kind))
 		}
 	case reSubscript:
-		// Array element subscript `base[index]`, 1-based (spec/design/array.md §6). A NULL array, a
-		// NULL index, or an out-of-bounds index yields NULL (PG — never an error).
+		// Array subscript `base[..][..]` — one operator_eval (spec/design/array.md §6). A NULL array
+		// or any NULL subscript bound yields NULL; element access returns the element (or NULL),
+		// slice access a (renumbered) sub-array. The per-element walk is internal (unmetered).
 		m.Charge(Costs.OperatorEval)
-		arr, err := e.operand.eval(row, env, m)
-		if err != nil {
-			return Value{}, err
-		}
-		idx, err := e.lhs.eval(row, env, m)
-		if err != nil {
-			return Value{}, err
-		}
-		if arr.Kind == ValNull || idx.Kind == ValNull {
-			return NullValue(), nil
-		}
-		if arr.Kind != ValArray {
-			panic(fmt.Sprintf("subscript on a non-array value: %v", arr.Kind))
-		}
-		elems := *arr.Array
-		i := idx.Int
-		if i >= 1 && i <= int64(len(elems)) {
-			return elems[i-1], nil // 1-based domain 1..=len
-		}
-		return NullValue(), nil // out of bounds
+		return evalSubscript(e, row, env, m)
 	case reConstInt:
 		return IntValue(e.cInt), nil
 	case reConstBool:
@@ -9414,16 +9739,30 @@ func valueCmp(a, b Value) int {
 		}
 		return cmpInt64(int64(len(x)), int64(len(y)))
 	case a.Kind == ValArray && b.Kind == ValArray:
-		// An array sorts element-wise with NULLs-last per element (the PG array_cmp total order —
-		// spec/design/array.md §5): the first non-equal element decides, recursing through keyCmp;
-		// a shorter array (prefix) sorts first.
-		x, y := *a.Array, *b.Array
-		for i := 0; i < len(x) && i < len(y); i++ {
-			if c := keyCmp(x[i], y[i], false, false); c != 0 {
+		// An array sorts by the PG array_cmp total order (spec/design/array.md §5): element-wise over
+		// the flattened elements (NULLs-last per element, recursing through keyCmp), then fewer
+		// elements first, then smaller ndim, then per dimension (length, then lower bound).
+		x, y := a.Array, b.Array
+		for i := 0; i < len(x.Elements) && i < len(y.Elements); i++ {
+			if c := keyCmp(x.Elements[i], y.Elements[i], false, false); c != 0 {
 				return c
 			}
 		}
-		return cmpInt64(int64(len(x)), int64(len(y)))
+		if c := cmpInt(len(x.Elements), len(y.Elements)); c != 0 {
+			return c
+		}
+		if c := cmpInt(x.Ndim(), y.Ndim()); c != 0 {
+			return c
+		}
+		for d := 0; d < x.Ndim(); d++ {
+			if c := cmpInt(x.Dims[d], y.Dims[d]); c != 0 {
+				return c
+			}
+			if c := cmpInt(int(x.Lbounds[d]), int(y.Lbounds[d])); c != 0 {
+				return c
+			}
+		}
+		return 0
 	default:
 		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
 		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -9701,9 +10040,9 @@ func storeArray(v Value, elem ColType, notNull bool, colName string) (Value, err
 		}
 		return NullValue(), nil
 	case ValArray:
-		vals := *v.Array
-		out := make([]Value, len(vals))
-		for i, el := range vals {
+		a := v.Array
+		out := make([]Value, len(a.Elements))
+		for i, el := range a.Elements {
 			// Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[]
 			// is deferred — §12).
 			cv, err := coerceForStore(el, elem, nil, false, colName)
@@ -9712,7 +10051,7 @@ func storeArray(v Value, elem ColType, notNull bool, colName string) (Value, err
 			}
 			out[i] = cv
 		}
-		return ArrayValue(out), nil
+		return ArrayValueOf(&ArrayVal{Dims: a.Dims, Lbounds: a.Lbounds, Elements: out}), nil
 	default:
 		return Value{}, typeError("cannot store a non-array value in array column " + colName)
 	}
@@ -9787,7 +10126,29 @@ func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, e
 	if ty.Elem != nil {
 		switch {
 		case iv.IsArray:
-			// ARRAY[e, …]: materialize each element against the element type.
+			// ARRAY[e, …]: a nested constructor (an element is itself ARRAY[…]) stacks the sub-arrays
+			// into a higher dimension (mirrors the evaluator's buildNestedArray, spec/design/array.md
+			// §4); otherwise each element materializes against the element type into a flat 1-D array.
+			// A scalar mixed with an array sub-element errors 42804 (materialized against the array
+			// type), matching PG.
+			nested := false
+			for i := range iv.Array {
+				if iv.Array[i].IsArray {
+					nested = true
+					break
+				}
+			}
+			if nested {
+				subs := make([]Value, len(iv.Array))
+				for i := range iv.Array {
+					sv, err := materializeInsertValue(iv.Array[i], ty, bound)
+					if err != nil {
+						return Value{}, err
+					}
+					subs[i] = sv
+				}
+				return buildNestedArray(subs)
+			}
 			vals := make([]Value, len(iv.Array))
 			for i := range iv.Array {
 				ev, err := materializeInsertValue(iv.Array[i], *ty.Elem, bound)
@@ -9858,16 +10219,19 @@ func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, e
 // array_in (spec/design/array.md §7): each token is coerced to the element type (an unquoted NULL
 // token → NULL element). A malformed literal is 22P02.
 func coerceStringToArray(s string, elem ColType) (Value, error) {
-	tokens, ok := parseArrayTokens(s)
-	if !ok {
+	parsed, errKind := parseArrayLiteral(s)
+	switch errKind {
+	case arrayMalformed:
 		return Value{}, NewError(InvalidTextRepresentation, "malformed array literal")
+	case arrayBoundFlip:
+		return Value{}, arraySubscriptErr("upper bound cannot be less than lower bound")
 	}
 	if elem.Composite || elem.Elem != nil {
 		return Value{}, NewError(FeatureNotSupported,
 			"array literal of a non-scalar element type is not supported")
 	}
-	vals := make([]Value, len(tokens))
-	for i, tok := range tokens {
+	vals := make([]Value, len(parsed.Tokens))
+	for i, tok := range parsed.Tokens {
 		if tok == nil {
 			vals[i] = NullValue()
 			continue
@@ -9878,7 +10242,7 @@ func coerceStringToArray(s string, elem ColType) (Value, error) {
 		}
 		vals[i] = ev
 	}
-	return ArrayValue(vals), nil
+	return ArrayValueOf(&ArrayVal{Dims: parsed.Dims, Lbounds: parsed.Lbounds, Elements: vals}), nil
 }
 
 // coerceStringLiteralToValue coerces an array-element token string to a runtime Value of the

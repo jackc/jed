@@ -13,6 +13,7 @@ export type SqlState =
   | "datetime_field_overflow" // 22008 — out-of-range datetime field or value beyond int64 µs
   | "division_by_zero" // 22012 — division or modulo by zero
   | "invalid_parameter_value" // 22023 — a bad numeric typmod (e.g. numeric(0))
+  | "array_subscript_error" // 2202E — non-matching multidim sub-array dims, or inverted [l:u] array bounds
   | "invalid_text_representation" // 22P02 — malformed text input (e.g. bytea hex)
   | "invalid_escape_sequence" // 22025 — a LIKE pattern ending in a lone escape character
   | "invalid_row_count_in_limit_clause" // 2201W — a negative LIMIT count
@@ -55,6 +56,7 @@ const CODES: Record<SqlState, string> = {
   datetime_field_overflow: "22008",
   division_by_zero: "22012",
   invalid_parameter_value: "22023",
+  array_subscript_error: "2202E",
   invalid_text_representation: "22P02",
   invalid_escape_sequence: "22025",
   invalid_row_count_in_limit_clause: "2201W",

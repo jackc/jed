@@ -7,7 +7,7 @@
 use crate::ast::{
     BinaryOp, CreateIndex, CreateTable, CreateType, Delete, DropIndex, DropTable, DropType, Expr,
     Insert, InsertSource, InsertValue, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItems,
-    SetOp, SetOpKind, Statement, TableRef, TypeMod, UnaryOp, Update,
+    SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -24,7 +24,9 @@ use crate::pmap::KeyBound;
 use crate::storage::{Row, TableStore};
 use crate::timestamp::{parse_timestamp, parse_timestamptz};
 use crate::types::{DecimalTypmod, ScalarType, Type};
-use crate::value::{ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid};
+use crate::value::{
+    ArrayVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
+};
 use std::collections::{HashMap, HashSet};
 
 /// The outcome of executing one statement. Both variants carry the deterministic
@@ -4273,16 +4275,31 @@ impl Database {
                 }
                 Ok(())
             }
-            RExpr::Row(fields) | RExpr::Array(fields) => {
+            RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
                 for f in fields {
                     self.fold_uncorrelated_in_rexpr(f, bound, cost)?;
                 }
                 Ok(())
             }
             RExpr::Field { base, .. } => self.fold_uncorrelated_in_rexpr(base, bound, cost),
-            RExpr::Subscript { base, index } => {
+            RExpr::Subscript {
+                base, subscripts, ..
+            } => {
                 self.fold_uncorrelated_in_rexpr(base, bound, cost)?;
-                self.fold_uncorrelated_in_rexpr(index, bound, cost)
+                for s in subscripts {
+                    match s {
+                        RSubscript::Index(i) => self.fold_uncorrelated_in_rexpr(i, bound, cost)?,
+                        RSubscript::Slice { lower, upper } => {
+                            if let Some(l) = lower {
+                                self.fold_uncorrelated_in_rexpr(l, bound, cost)?;
+                            }
+                            if let Some(u) = upper {
+                                self.fold_uncorrelated_in_rexpr(u, bound, cost)?;
+                            }
+                        }
+                    }
+                }
+                Ok(())
             }
             RExpr::InValues { lhs, .. } => self.fold_uncorrelated_in_rexpr(lhs, bound, cost),
             // Leaves and the (already-handled) Subquery: nothing to recurse into.
@@ -4301,6 +4318,7 @@ impl Database {
             | RExpr::ConstTimestamp(_)
             | RExpr::ConstTimestamptz(_)
             | RExpr::ConstInterval(_)
+            | RExpr::ConstArray(_)
             | RExpr::ConstNull => Ok(()),
         }
     }
@@ -4805,6 +4823,16 @@ enum ScalarFunc {
     ClockTimestamp,
 }
 
+/// One resolved subscript spec in an [`RExpr::Subscript`] (spec/design/array.md §6): a single
+/// index `a[i]`, or a slice `a[m:n]` whose bounds may be omitted (`a[:n]`, `a[m:]`, `a[:]`).
+enum RSubscript {
+    Index(Box<RExpr>),
+    Slice {
+        lower: Option<Box<RExpr>>,
+        upper: Option<Box<RExpr>>,
+    },
+}
+
 /// A resolved expression: a tree over fixed column indices, ready to evaluate against
 /// a row. Arithmetic nodes carry their (promotion-tower) result type so the computed
 /// value can be range-checked against it (the int16+int16 → int16 boundary).
@@ -4831,9 +4859,18 @@ enum RExpr {
     /// wraps each field's constant). One `operator_eval` per node (cost.md §9).
     Row(Vec<RExpr>),
     /// An `ARRAY[…]` constructor (spec/design/array.md §1): evaluate each element expression
-    /// (coercing to the unified element type) and assemble a `Value::Array`. One `operator_eval`
-    /// per node.
-    Array(Vec<RExpr>),
+    /// (coercing to the unified element type) and assemble a `Value::Array`. When `nested` is true
+    /// the elements are themselves arrays and are **stacked** into a value of one higher dimension
+    /// (all sub-arrays must share dims/lbounds — else `2202E`); otherwise it is a flat 1-D array
+    /// (lower bound 1). One `operator_eval` per node.
+    Array {
+        elems: Vec<RExpr>,
+        nested: bool,
+    },
+    /// A constant array value (the folded form of an array constant — `value_to_rexpr` — preserving
+    /// its shape). Boxed so the (rarely-used) shaped payload does not widen every `RExpr` frame.
+    /// Eval returns it directly.
+    ConstArray(Box<ArrayVal>),
     /// Field selection `(composite).field` (spec/design/composite.md §S4): evaluate `base` to a
     /// composite value and return its `index`-th field (the field ordinal, fixed at resolve). A
     /// whole-value-NULL composite yields NULL for any field. One `operator_eval` per node.
@@ -4841,12 +4878,15 @@ enum RExpr {
         base: Box<RExpr>,
         index: usize,
     },
-    /// Array element subscript `base[index]` (spec/design/array.md §6): evaluate `base` to an array
-    /// and `index` to an integer, then return the **1-based** element. A NULL array, a NULL index,
-    /// or an out-of-bounds index yields NULL (PG — never an error). One `operator_eval` per node.
+    /// Array subscript `base[..][..]` (spec/design/array.md §6): one or more subscript specs applied
+    /// to `base`. If `is_slice` is false every spec is an index and the node reads a single element
+    /// (the element type) — NULL when the subscript count ≠ ndim or any index is out of range. If
+    /// `is_slice` is true the node returns a sub-array (the array type); a scalar index `i` in that
+    /// context means `1:i`. A NULL array or any NULL bound yields NULL. One `operator_eval` per node.
     Subscript {
         base: Box<RExpr>,
-        index: Box<RExpr>,
+        subscripts: Vec<RSubscript>,
+        is_slice: bool,
     },
     /// A bind parameter, by 0-based index into the bound-values slice passed to `eval`. Its
     /// static type was inferred from context at resolve (spec/design/api.md §5); the value
@@ -5784,6 +5824,15 @@ fn items_have_aggregate(items: &SelectItems) -> bool {
     }
 }
 
+/// The sub-expressions of one AST subscript spec (an index, or a slice's present bounds) — for the
+/// `Expr` tree walkers.
+fn subscript_spec_exprs(s: &SubscriptSpec) -> Vec<&Expr> {
+    match s {
+        SubscriptSpec::Index(i) => vec![i],
+        SubscriptSpec::Slice(lo, hi) => lo.iter().chain(hi.iter()).collect(),
+    }
+}
+
 /// Whether an expression tree contains an AGGREGATE call anywhere. A scalar-function call is
 /// not itself an aggregate, but may CONTAIN one (`abs(sum(x))`), so its arguments are walked.
 fn expr_has_aggregate(e: &Expr) -> bool {
@@ -5811,7 +5860,13 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::Like { lhs, rhs, .. } => expr_has_aggregate(lhs) || expr_has_aggregate(rhs),
         Expr::Row(items) | Expr::Array(items) => items.iter().any(expr_has_aggregate),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_has_aggregate(base),
-        Expr::Subscript { base, index } => expr_has_aggregate(base) || expr_has_aggregate(index),
+        Expr::Subscript { base, subscripts } => {
+            expr_has_aggregate(base)
+                || subscripts
+                    .iter()
+                    .flat_map(subscript_spec_exprs)
+                    .any(expr_has_aggregate)
+        }
         Expr::Case {
             operand,
             whens,
@@ -5874,9 +5929,12 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
         }
         Expr::Row(items) | Expr::Array(items) => items.iter().try_for_each(reject_check_structure),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_check_structure(base),
-        Expr::Subscript { base, index } => {
+        Expr::Subscript { base, subscripts } => {
             reject_check_structure(base)?;
-            reject_check_structure(index)
+            subscripts
+                .iter()
+                .flat_map(subscript_spec_exprs)
+                .try_for_each(reject_check_structure)
         }
         Expr::Between { lhs, lo, hi, .. } => {
             reject_check_structure(lhs)?;
@@ -5953,9 +6011,12 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
             items.iter().try_for_each(reject_default_structure)
         }
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_default_structure(base),
-        Expr::Subscript { base, index } => {
+        Expr::Subscript { base, subscripts } => {
             reject_default_structure(base)?;
-            reject_default_structure(index)
+            subscripts
+                .iter()
+                .flat_map(subscript_spec_exprs)
+                .try_for_each(reject_default_structure)
         }
         Expr::Between { lhs, lo, hi, .. } => {
             reject_default_structure(lhs)?;
@@ -6049,9 +6110,11 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
                 }
             }
             Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => walk(base, columns, out),
-            Expr::Subscript { base, index } => {
+            Expr::Subscript { base, subscripts } => {
                 walk(base, columns, out);
-                walk(index, columns, out);
+                for e in subscripts.iter().flat_map(subscript_spec_exprs) {
+                    walk(e, columns, out);
+                }
             }
             // Unreachable in a validated check (rejected by `reject_check_structure`).
             Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {}
@@ -6097,9 +6160,8 @@ fn value_to_rexpr(v: &Value) -> RExpr {
         // A folded composite constant: fold each field and wrap in a ROW node so eval rebuilds the
         // `Value::Composite` (spec/design/composite.md).
         Value::Composite(fields) => RExpr::Row(fields.iter().map(value_to_rexpr).collect()),
-        // A folded array constant: fold each element and wrap in an Array node so eval rebuilds the
-        // `Value::Array` (spec/design/array.md).
-        Value::Array(elems) => RExpr::Array(elems.iter().map(value_to_rexpr).collect()),
+        // A folded array constant — preserve its full shape (dims/lbounds) in a const node.
+        Value::Array(arr) => RExpr::ConstArray(Box::new(arr.clone())),
         // Poisoned (large-values.md §14): a folded subquery's projections are resolved values.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
@@ -6180,12 +6242,18 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
                 || rexpr_references_outer(els, depth)
         }
         RExpr::ScalarFunc { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
-        RExpr::Row(fields) | RExpr::Array(fields) => {
+        RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
         }
         RExpr::Field { base, .. } => rexpr_references_outer(base, depth),
-        RExpr::Subscript { base, index } => {
-            rexpr_references_outer(base, depth) || rexpr_references_outer(index, depth)
+        RExpr::Subscript {
+            base, subscripts, ..
+        } => {
+            rexpr_references_outer(base, depth)
+                || subscripts
+                    .iter()
+                    .flat_map(subscript_bounds)
+                    .any(|e| rexpr_references_outer(e, depth))
         }
         RExpr::Column(_)
         | RExpr::Param(_)
@@ -6200,7 +6268,21 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
         | RExpr::ConstInterval(_)
+        | RExpr::ConstArray(_)
         | RExpr::ConstNull => false,
+    }
+}
+
+/// The bound expressions of one resolved subscript spec (an index, or a slice's present
+/// lower/upper bounds) — for the RExpr tree walkers.
+fn subscript_bounds(s: &RSubscript) -> Vec<&RExpr> {
+    match s {
+        RSubscript::Index(i) => vec![i],
+        RSubscript::Slice { lower, upper } => lower
+            .iter()
+            .chain(upper.iter())
+            .map(|b| b.as_ref())
+            .collect(),
     }
 }
 
@@ -6257,15 +6339,19 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
                 collect_touched(a, depth, touched);
             }
         }
-        RExpr::Row(fields) | RExpr::Array(fields) => {
+        RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             for f in fields {
                 collect_touched(f, depth, touched);
             }
         }
         RExpr::Field { base, .. } => collect_touched(base, depth, touched),
-        RExpr::Subscript { base, index } => {
+        RExpr::Subscript {
+            base, subscripts, ..
+        } => {
             collect_touched(base, depth, touched);
-            collect_touched(index, depth, touched);
+            for e in subscripts.iter().flat_map(subscript_bounds) {
+                collect_touched(e, depth, touched);
+            }
         }
         RExpr::Param(_)
         | RExpr::ConstInt(_)
@@ -6279,6 +6365,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
         | RExpr::ConstInterval(_)
+        | RExpr::ConstArray(_)
         | RExpr::ConstNull => {}
     }
 }
@@ -7313,6 +7400,24 @@ fn plan_subquery(scope: &Scope, inner: &QueryExpr, params: &mut ParamTypes) -> R
     scope.catalog.plan_query(inner, Some(scope), params)
 }
 
+/// Resolve one array-subscript bound to an integer `RExpr` (a literal adapts to int4; a non-integer
+/// is 42804). A NULL-typed bound is accepted — it evaluates to a NULL subscript → NULL result.
+fn resolve_subscript_int(
+    scope: &Scope,
+    e: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<RExpr> {
+    let (node, ty) = resolve(scope, e, Some(ScalarType::Int32), agg, params)?;
+    if !matches!(ty, ResolvedType::Int(_) | ResolvedType::Null) {
+        return Err(type_error(format!(
+            "array subscript must be an integer, not {}",
+            ty.type_name()
+        )));
+    }
+    Ok(node)
+}
+
 fn resolve(
     scope: &Scope,
     e: &Expr,
@@ -7355,10 +7460,20 @@ fn resolve(
                 nodes.push(node);
                 elem_types.push(ty);
             }
-            let elem_type = unify_array_element_types(&elem_types)?;
+            // Unify the item types. If they are themselves arrays, this is a **nested** (multidim-
+            // stacking) constructor and the result type is the SAME array type (dimension-agnostic,
+            // spec/design/array.md §2/§4); otherwise it is a flat 1-D array of the unified element.
+            let common = unify_array_element_types(&elem_types)?;
+            let (nested, result_ty) = match common {
+                t @ ResolvedType::Array(_) => (true, t),
+                other => (false, ResolvedType::Array(Box::new(other))),
+            };
             Ok((
-                RExpr::Array(nodes),
-                ResolvedType::Array(Box::new(elem_type)),
+                RExpr::Array {
+                    elems: nodes,
+                    nested,
+                },
+                result_ty,
             ))
         }
         Expr::Column(name) => {
@@ -7382,14 +7497,15 @@ fn resolve(
             let (node, ty) = resolve(scope, base, None, agg, params)?;
             resolve_field_of(node, ty, field)
         }
-        // `base[index]` — array element subscript (spec/design/array.md §6). The base must be an
-        // array (else 42804); the result type is the element type. The index is an integer (PG
-        // int4) — a literal adapts to the int context; a non-integer index is 42804. OOB / NULL →
-        // NULL is an evaluation-time rule, not a resolve error.
-        Expr::Subscript { base, index } => {
+        // `base[..][..]` — array subscript (spec/design/array.md §6). The base must be an array
+        // (else 42804). Each subscript bound is an integer (PG int4) — a literal adapts; a
+        // non-integer is 42804. If any spec is a slice the result is the array type (a sub-array);
+        // otherwise it is the element type (a single element). OOB / NULL → NULL is an
+        // evaluation-time rule, not a resolve error.
+        Expr::Subscript { base, subscripts } => {
             let (base_node, base_ty) = resolve(scope, base, None, agg, params)?;
-            let elem_ty = match base_ty {
-                ResolvedType::Array(elem) => *elem,
+            let elem_ty = match &base_ty {
+                ResolvedType::Array(elem) => (**elem).clone(),
                 other => {
                     return Err(type_error(format!(
                         "cannot subscript a value of type {}, which is not an array",
@@ -7397,20 +7513,43 @@ fn resolve(
                     )));
                 }
             };
-            let (index_node, index_ty) =
-                resolve(scope, index, Some(ScalarType::Int32), agg, params)?;
-            if !matches!(index_ty, ResolvedType::Int(_) | ResolvedType::Null) {
-                return Err(type_error(format!(
-                    "array subscript must be an integer, not {}",
-                    index_ty.type_name()
-                )));
+            let is_slice = subscripts
+                .iter()
+                .any(|s| matches!(s, SubscriptSpec::Slice(..)));
+            let mut rsubs = Vec::with_capacity(subscripts.len());
+            for s in subscripts {
+                match s {
+                    SubscriptSpec::Index(e) => {
+                        rsubs.push(RSubscript::Index(Box::new(resolve_subscript_int(
+                            scope, e, agg, params,
+                        )?)));
+                    }
+                    SubscriptSpec::Slice(lo, hi) => {
+                        let lower = match lo {
+                            Some(e) => {
+                                Some(Box::new(resolve_subscript_int(scope, e, agg, params)?))
+                            }
+                            None => None,
+                        };
+                        let upper = match hi {
+                            Some(e) => {
+                                Some(Box::new(resolve_subscript_int(scope, e, agg, params)?))
+                            }
+                            None => None,
+                        };
+                        rsubs.push(RSubscript::Slice { lower, upper });
+                    }
+                }
             }
+            // A slice yields a sub-array (the array type); all-index access yields an element.
+            let result_ty = if is_slice { base_ty } else { elem_ty };
             Ok((
                 RExpr::Subscript {
                     base: Box::new(base_node),
-                    index: Box::new(index_node),
+                    subscripts: rsubs,
+                    is_slice,
                 },
-                elem_ty,
+                result_ty,
             ))
         }
         // `(expr).*` — whole-row expansion is a projection-list construct only; in a scalar
@@ -8569,6 +8708,222 @@ fn unify_array_element_types(types: &[ResolvedType]) -> Result<ResolvedType> {
     Ok(first.clone())
 }
 
+/// A `2202E` array-subscript error (spec/design/array.md §11).
+fn array_subscript_err(detail: &str) -> EngineError {
+    EngineError::new(SqlState::ArraySubscriptError, detail.to_string())
+}
+
+/// Stack the evaluated elements of a **nested** `ARRAY[…]` constructor into a value of one higher
+/// dimension (spec/design/array.md §4). The resolver guarantees every item resolved to an array; a
+/// NULL sub-array or a sub-array of differing shape is a `2202E` ("multidimensional arrays must
+/// have array expressions with matching dimensions"). Stacking empty sub-arrays yields the empty
+/// array (PG: `ARRAY['{}'::int[]]` → `{}`).
+fn build_nested_array(subs: Vec<Value>) -> Result<Value> {
+    const MISMATCH: &str =
+        "multidimensional arrays must have array expressions with matching dimensions";
+    let mut arrs = Vec::with_capacity(subs.len());
+    for s in subs {
+        match s {
+            Value::Array(a) => arrs.push(a),
+            Value::Null => return Err(array_subscript_err(MISMATCH)),
+            other => unreachable!("nested array constructor over a non-array: {other:?}"),
+        }
+    }
+    let dims0 = arrs[0].dims.clone();
+    let lbounds0 = arrs[0].lbounds.clone();
+    for a in &arrs[1..] {
+        if a.dims != dims0 || a.lbounds != lbounds0 {
+            return Err(array_subscript_err(MISMATCH));
+        }
+    }
+    if dims0.is_empty() {
+        return Ok(Value::Array(ArrayVal::empty())); // all sub-arrays empty → empty array
+    }
+    let mut dims = vec![arrs.len()];
+    dims.extend(dims0);
+    let mut lbounds = vec![1i32];
+    lbounds.extend(lbounds0);
+    let mut elements = Vec::new();
+    for a in arrs {
+        elements.extend(a.elements);
+    }
+    Ok(Value::Array(ArrayVal {
+        dims,
+        lbounds,
+        elements,
+    }))
+}
+
+/// An evaluated slice bound: omitted (defer to the array's own bound), a NULL bound, or an integer.
+#[derive(Clone, Copy)]
+enum Bound {
+    Omitted,
+    Null,
+    Val(i64),
+}
+
+impl Bound {
+    /// The bound as `Option<i64>` (omitted → `None`, to be defaulted by the slice); `Null` must be
+    /// handled by the caller before this is called.
+    fn value(self) -> Option<i64> {
+        match self {
+            Bound::Val(i) => Some(i),
+            _ => None,
+        }
+    }
+}
+
+/// Evaluate an array subscript `base[..][..]` (spec/design/array.md §6) — the body of
+/// [`RExpr::Subscript`]'s eval arm, kept here so its locals stay out of `eval`'s frame. A NULL
+/// array or any NULL subscript bound yields NULL; element access returns the element (or NULL),
+/// slice access a (renumbered) sub-array.
+fn eval_subscript(
+    base: &RExpr,
+    subscripts: &[RSubscript],
+    is_slice: bool,
+    row: &[Value],
+    env: &EvalEnv,
+    m: &mut Meter,
+) -> Result<Value> {
+    let a = match base.eval(row, env, m)? {
+        Value::Array(a) => a,
+        Value::Null => return Ok(Value::Null),
+        other => unreachable!("subscript on a non-array value: {other:?}"),
+    };
+    if is_slice {
+        // Per-dimension (lower, upper); a scalar index `i` becomes `1:i` (PG), an omitted bound
+        // defers to the array's own bound. A NULL bound → NULL.
+        let mut bounds = Vec::with_capacity(subscripts.len());
+        for s in subscripts {
+            let b = match s {
+                RSubscript::Index(e) => match e.eval(row, env, m)? {
+                    Value::Int(i) => (Some(1i64), Some(i)),
+                    Value::Null => return Ok(Value::Null),
+                    other => unreachable!("non-int array subscript: {other:?}"),
+                },
+                RSubscript::Slice { lower, upper } => {
+                    let lo = eval_opt_bound(lower, row, env, m)?;
+                    let hi = eval_opt_bound(upper, row, env, m)?;
+                    match (lo, hi) {
+                        (Bound::Null, _) | (_, Bound::Null) => return Ok(Value::Null),
+                        (lo, hi) => (lo.value(), hi.value()),
+                    }
+                }
+            };
+            bounds.push(b);
+        }
+        Ok(array_get_slice(&a, &bounds))
+    } else {
+        // Element access: every spec is an index (a slice would have set `is_slice`).
+        let mut idxs = Vec::with_capacity(subscripts.len());
+        for s in subscripts {
+            let RSubscript::Index(e) = s else {
+                unreachable!("non-index subscript in element access")
+            };
+            match e.eval(row, env, m)? {
+                Value::Int(i) => idxs.push(i),
+                Value::Null => return Ok(Value::Null),
+                other => unreachable!("non-int array subscript: {other:?}"),
+            }
+        }
+        Ok(array_get_element(&a, &idxs))
+    }
+}
+
+/// Evaluate an optional slice-bound expression (spec/design/array.md §6).
+fn eval_opt_bound(
+    b: &Option<Box<RExpr>>,
+    row: &[Value],
+    env: &EvalEnv,
+    m: &mut Meter,
+) -> Result<Bound> {
+    match b {
+        None => Ok(Bound::Omitted),
+        Some(e) => match e.eval(row, env, m)? {
+            Value::Int(i) => Ok(Bound::Val(i)),
+            Value::Null => Ok(Bound::Null),
+            other => unreachable!("non-int array slice bound: {other:?}"),
+        },
+    }
+}
+
+/// Read a single array element by `idxs` (1-based per dimension, using the value's lower bounds) —
+/// spec/design/array.md §6. NULL when the subscript count ≠ `ndim` or any index is out of range.
+fn array_get_element(a: &ArrayVal, idxs: &[i64]) -> Value {
+    if idxs.len() != a.ndim() || a.elements.is_empty() {
+        return Value::Null;
+    }
+    let mut flat = 0usize;
+    let mut stride = 1usize;
+    for d in (0..a.ndim()).rev() {
+        let lb = a.lbounds[d] as i64;
+        let ub = a.ubound(d) as i64;
+        if idxs[d] < lb || idxs[d] > ub {
+            return Value::Null;
+        }
+        flat += (idxs[d] - lb) as usize * stride;
+        stride *= a.dims[d];
+    }
+    a.elements[flat].clone()
+}
+
+/// Read an array slice (spec/design/array.md §6): per-dimension `(lower, upper)` requested bounds
+/// (`None` defers to the value's own bound), clamped to each dimension's `[lb, ub]`. Too many
+/// subscripts, an empty source, or any empty clamped dimension yields the empty array; fewer
+/// subscripts than `ndim` leave the trailing dimensions at their full range. The result is
+/// renumbered to lower bound 1 on every dimension (PG `array_get_slice`).
+fn array_get_slice(a: &ArrayVal, bounds: &[(Option<i64>, Option<i64>)]) -> Value {
+    let ndim = a.ndim();
+    if bounds.len() > ndim || ndim == 0 {
+        return Value::Array(ArrayVal::empty());
+    }
+    let mut new_dims = Vec::with_capacity(ndim);
+    let mut starts = Vec::with_capacity(ndim); // source 0-based start per dimension
+    for d in 0..ndim {
+        let lb = a.lbounds[d] as i64;
+        let ub = a.ubound(d) as i64;
+        let (req_lo, req_hi) = if d < bounds.len() {
+            (bounds[d].0.unwrap_or(lb), bounds[d].1.unwrap_or(ub))
+        } else {
+            (lb, ub) // a trailing unspecified dimension spans its full range
+        };
+        let lo = req_lo.max(lb);
+        let hi = req_hi.min(ub);
+        if lo > hi {
+            return Value::Array(ArrayVal::empty()); // any empty dimension → empty slice
+        }
+        new_dims.push((hi - lo + 1) as usize);
+        starts.push((lo - lb) as usize);
+    }
+    // Row-major strides over the SOURCE array.
+    let mut strides = vec![1usize; ndim];
+    for d in (0..ndim - 1).rev() {
+        strides[d] = strides[d + 1] * a.dims[d + 1];
+    }
+    let total: usize = new_dims.iter().product();
+    let mut elements = Vec::with_capacity(total);
+    let mut counter = vec![0usize; ndim];
+    for _ in 0..total {
+        let mut flat = 0usize;
+        for d in 0..ndim {
+            flat += (starts[d] + counter[d]) * strides[d];
+        }
+        elements.push(a.elements[flat].clone());
+        for d in (0..ndim).rev() {
+            counter[d] += 1;
+            if counter[d] < new_dims[d] {
+                break;
+            }
+            counter[d] = 0;
+        }
+    }
+    Value::Array(ArrayVal {
+        dims: new_dims,
+        lbounds: vec![1i32; ndim],
+        elements,
+    })
+}
+
 fn unify_case_types(arms: &[ResolvedType]) -> Result<ResolvedType> {
     let non_null: Vec<&ResolvedType> = arms.iter().filter(|t| **t != ResolvedType::Null).collect();
     let Some(&first) = non_null.first() else {
@@ -9522,14 +9877,18 @@ fn store_array(v: Value, elem: &ColType, not_null: bool, col_name: &str) -> Resu
             }
             Ok(Value::Null)
         }
-        Value::Array(vals) => {
-            let mut out = Vec::with_capacity(vals.len());
-            for val in vals {
+        Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.elements.len());
+            for val in arr.elements {
                 // Elements are nullable (not_null = false); the element typmod is unconstrained
                 // this slice (numeric(p,s)[] is deferred — §12).
                 out.push(coerce_for_store(val, elem, None, false, col_name)?);
             }
-            Ok(Value::Array(out))
+            Ok(Value::Array(ArrayVal {
+                dims: arr.dims,
+                lbounds: arr.lbounds,
+                elements: out,
+            }))
         }
         _ => Err(type_error(format!(
             "cannot store a non-array value in array column {col_name}"
@@ -9666,13 +10025,25 @@ fn materialize_insert_value(iv: &InsertValue, ty: &ColType, bound: &[Value]) -> 
             )),
         },
         ColType::Array(elem) => match iv {
-            // ARRAY[e, …]: materialize each element against the element type.
+            // ARRAY[e, …]: a nested constructor (an element is itself `ARRAY[…]`) stacks the
+            // sub-arrays into a higher dimension (mirrors the evaluator's `build_nested_array`,
+            // spec/design/array.md §4); otherwise each element materializes against the element type
+            // into a flat 1-D array. A scalar mixed with an array sub-element errors 42804 (the
+            // scalar materialized against the array type), matching PG.
             InsertValue::Array(elem_ivs) => {
-                let mut vals = Vec::with_capacity(elem_ivs.len());
-                for eiv in elem_ivs {
-                    vals.push(materialize_insert_value(eiv, elem, bound)?);
+                if elem_ivs.iter().any(|e| matches!(e, InsertValue::Array(_))) {
+                    let mut subs = Vec::with_capacity(elem_ivs.len());
+                    for eiv in elem_ivs {
+                        subs.push(materialize_insert_value(eiv, ty, bound)?);
+                    }
+                    build_nested_array(subs)
+                } else {
+                    let mut vals = Vec::with_capacity(elem_ivs.len());
+                    for eiv in elem_ivs {
+                        vals.push(materialize_insert_value(eiv, elem, bound)?);
+                    }
+                    Ok(Value::Array(ArrayVal::one_dim(vals)))
                 }
-                Ok(Value::Array(vals))
             }
             // A bare string literal adapts to the array context via `array_in` (the same
             // string-adapts-to-context rule bytea/uuid use — types.md §6; spec/design/array.md §7).
@@ -9698,11 +10069,15 @@ fn materialize_insert_value(iv: &InsertValue, ty: &ColType, bound: &[Value]) -> 
 /// → NULL element). A malformed literal is `22P02`. Used by INSERT (a bare string adapting to an
 /// array column) and by the runtime string-literal → array cast.
 fn coerce_string_to_array(s: &str, elem: &ColType) -> Result<Value> {
-    let tokens = crate::value::parse_array_tokens(s).ok_or_else(|| {
-        EngineError::new(
+    let parsed = crate::value::parse_array_literal(s).map_err(|e| match e {
+        crate::value::ArrayInError::Malformed => EngineError::new(
             SqlState::InvalidTextRepresentation,
             "malformed array literal".to_string(),
-        )
+        ),
+        // An inverted [l:u] bound (`u < l`) — PG `2202E`.
+        crate::value::ArrayInError::BoundFlip => {
+            array_subscript_err("upper bound cannot be less than lower bound")
+        }
     })?;
     let elem_scalar = match elem {
         ColType::Scalar(s) => *s,
@@ -9713,19 +10088,23 @@ fn coerce_string_to_array(s: &str, elem: &ColType) -> Result<Value> {
             ));
         }
     };
-    let mut vals = Vec::with_capacity(tokens.len());
-    for tok in tokens {
+    let mut elements = Vec::with_capacity(parsed.tokens.len());
+    for tok in parsed.tokens {
         match tok {
-            None => vals.push(Value::Null),
+            None => elements.push(Value::Null),
             Some(t) => {
                 // Coerce the token to the element scalar via the same string-literal coercion the
                 // type's typed-literal path uses (22P02 / 22003 on bad input).
                 let (node, _) = coerce_string_literal(&t, elem_scalar, None)?;
-                vals.push(rexpr_const_to_value(&node)?);
+                elements.push(rexpr_const_to_value(&node)?);
             }
         }
     }
-    Ok(Value::Array(vals))
+    Ok(Value::Array(ArrayVal {
+        dims: parsed.dims,
+        lbounds: parsed.lbounds,
+        elements,
+    }))
 }
 
 /// Extract the `Value` from a constant `RExpr` (the const nodes `coerce_string_literal` produces).
@@ -9784,15 +10163,22 @@ impl RExpr {
                 Ok(Value::Composite(vals))
             }
             // An ARRAY[…] constructor — one operator_eval, then evaluate each element (already
-            // coerced to the element type at resolve) into a `Value::Array` (spec/design/array.md §1).
-            RExpr::Array(elems) => {
+            // coerced to the element type at resolve). A `nested` constructor stacks its sub-arrays
+            // into one higher dimension (spec/design/array.md §4); otherwise it is a flat 1-D array.
+            RExpr::Array { elems, nested } => {
                 m.charge(COSTS.operator_eval);
                 let mut vals = Vec::with_capacity(elems.len());
                 for e in elems {
                     vals.push(e.eval(row, env, m)?);
                 }
-                Ok(Value::Array(vals))
+                if *nested {
+                    build_nested_array(vals)
+                } else {
+                    Ok(Value::Array(ArrayVal::one_dim(vals)))
+                }
             }
+            // A folded array constant (shape preserved) — return it directly.
+            RExpr::ConstArray(a) => Ok(Value::Array((**a).clone())),
             // Field selection — one operator_eval, then pull the resolved field ordinal out of the
             // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in
             // range by construction (resolve fixed it against the static field list).
@@ -9806,25 +10192,20 @@ impl RExpr {
                     }
                 }
             }
-            RExpr::Subscript { base, index } => {
+            // Array subscript `base[..][..]` (spec/design/array.md §6) — one operator_eval. A NULL
+            // array or any NULL subscript bound yields NULL. Element access (`!is_slice`) returns
+            // the element when the subscript count equals `ndim` and every index is in range, else
+            // NULL; slice access returns a (renumbered) sub-array, with a scalar index `i` meaning
+            // `1:i`. The per-element walk is internal (unmetered, cost.md §9).
+            // Array subscript — extracted to a free function so its locals do not widen `eval`'s
+            // (debug-build) stack frame on the deep-expression path.
+            RExpr::Subscript {
+                base,
+                subscripts,
+                is_slice,
+            } => {
                 m.charge(COSTS.operator_eval);
-                // 1-based (spec/design/array.md §6): element i is at 0-based i-1. A NULL array, a
-                // NULL index, or an out-of-bounds index yields NULL (PG — never an error).
-                let arr = base.eval(row, env, m)?;
-                let idx = index.eval(row, env, m)?;
-                match (arr, idx) {
-                    (Value::Array(elems), Value::Int(i)) => {
-                        if i >= 1 && (i as usize) <= elems.len() {
-                            Ok(elems[(i - 1) as usize].clone())
-                        } else {
-                            Ok(Value::Null) // out of bounds (1-based domain 1..=len)
-                        }
-                    }
-                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    (other, _) => {
-                        unreachable!("subscript on a non-array value: {other:?}")
-                    }
-                }
+                eval_subscript(base, subscripts, *is_slice, row, env, m)
             }
             RExpr::ConstInt(n) => Ok(Value::Int(*n)),
             RExpr::ConstBool(b) => Ok(Value::Bool(*b)),
@@ -10908,17 +11289,33 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
             }
             x.len().cmp(&y.len())
         }
-        // An array sorts element-wise with NULLs-last per element (the PG `array_cmp` total order —
-        // spec/design/array.md §5): the first non-equal element decides, recursing through
-        // `key_cmp`; a shorter array (prefix) sorts first.
+        // An array sorts by the PG `array_cmp` total order (spec/design/array.md §5): element-wise
+        // over the flattened elements (NULLs-last per element, recursing through `key_cmp`), then
+        // fewer elements first, then smaller ndim, then per dimension (length, then lower bound).
         (Value::Array(x), Value::Array(y)) => {
-            for (xe, ye) in x.iter().zip(y.iter()) {
+            for (xe, ye) in x.elements.iter().zip(y.elements.iter()) {
                 let c = key_cmp(xe, ye, false, false);
                 if c != Ordering::Equal {
                     return c;
                 }
             }
-            x.len().cmp(&y.len())
+            let mut c = x.elements.len().cmp(&y.elements.len());
+            if c != Ordering::Equal {
+                return c;
+            }
+            c = x.dims.len().cmp(&y.dims.len());
+            if c != Ordering::Equal {
+                return c;
+            }
+            for d in 0..x.dims.len() {
+                c = x.dims[d]
+                    .cmp(&y.dims[d])
+                    .then(x.lbounds[d].cmp(&y.lbounds[d]));
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            Ordering::Equal
         }
         (Value::Null, Value::Null) => Ordering::Equal,
         // Cross-family arms exist only for totality — ORDER BY is over a single typed column,

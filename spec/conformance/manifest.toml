@@ -298,7 +298,15 @@ description = "array types (spec/design/array.md) — a structural T[] type over
 
 [[capability]]
 id = "expr.array_subscript"
-description = "array element subscript a[i] (spec/design/array.md §6) — reads the i-th element of an array, 1-based (PG / SQL-standard convention). An out-of-bounds index (0, negative, or past the end), a NULL index, and a subscript of a NULL array all yield NULL — never an error (PG, a documented divergence from the SQL standard's mandated data exception). The result type is the element type; the un-aliased output column is named after the base array. The index is an integer expression (a literal adapts to int4); subscripting a non-array base is 42804. Array slices a[m:n] are deferred (0A000). Builds on types.array"
+description = "array element subscript a[i] (spec/design/array.md §6) — reads the i-th element of an array, 1-based (PG / SQL-standard convention). An out-of-bounds index (0, negative, or past the end), a NULL index, and a subscript of a NULL array all yield NULL — never an error (PG, a documented divergence from the SQL standard's mandated data exception). The result type is the element type; the un-aliased output column is named after the base array. The index is an integer expression (a literal adapts to int4); subscripting a non-array base is 42804. Builds on types.array"
+
+[[capability]]
+id = "types.array_multidim"
+description = "multidimensional array values + custom lower bounds (spec/design/array.md §12) — the codec header (ndim/dims/lbounds) is exercised beyond 1-D-lb-1. ARRAY[ARRAY[…],…] stacks sub-arrays into a higher dimension (non-rectangular → 2202E; a scalar/array mix → 42804); the '{{…},{…}}' literal parses nested braces (non-rectangular / count-mismatch → 22P02); the '[l:u]={…}' literal sets custom lower bounds (an inverted bound l>u → 2202E). array_out renders nested braces and emits a '[l1:u1]…=' prefix iff any lower bound ≠ 1. Element access needs all N subscripts (a[i] on an N-D value with fewer/more is NULL); the subscript domain is the value's lb..ub. array_eq/array_cmp include dimensionality and lower bounds as tiebreaks ([2:4]={1,2,3} ≠ {1,2,3}), after the element-wise comparison and total element count. Builds on types.array"
+
+[[capability]]
+id = "expr.array_slice"
+description = "array slices a[m:n] (spec/design/array.md §6) — read a sub-array; either bound may be omitted ([:n], [m:], [:]) and defaults to the value's own lower/upper bound. The requested range is clamped to each dimension's [lb,ub]; an empty (or fully out-of-range) result is the empty array {} (NOT NULL); a NULL bound, or a slice of a NULL array, yields NULL. If any subscript in a multidimensional access is a slice the whole access is a slice and a scalar index i means 1:i; too many subscripts → {}, fewer leave the trailing dimensions at full range. The result is renumbered to lower bound 1 on every dimension (PG array_get_slice). Builds on expr.array_subscript and types.array_multidim"
 
 [[capability]]
 id = "expr.interval_arithmetic"

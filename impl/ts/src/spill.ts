@@ -420,6 +420,18 @@ function writeValue(w: ByteWriter, v: Value): void {
       w.u32(v.fields.length);
       for (const f of v.fields) writeValue(w, f);
       break;
+    case "array":
+      // Array — tag 16: ndim, then per-dimension (length, lower bound), then each element value,
+      // recursive (spec/design/array.md). Internal merge-sort scratch format; the full shape
+      // round-trips (multidim + custom bounds).
+      w.u8(16);
+      w.u32(v.dims.length);
+      for (let d = 0; d < v.dims.length; d++) {
+        w.u32(v.dims[d]!);
+        w.u32(v.lbounds[d]! >>> 0);
+      }
+      for (const el of v.elements) writeValue(w, el);
+      break;
     case "unfetched":
       // An untouched large-value reference rides along to the output unread (spill.md §4); spill it
       // opaquely so it round-trips, never resolving it.
@@ -518,6 +530,20 @@ function readValue(r: SpillByteReader): Value {
       const fields: Value[] = new Array(n);
       for (let i = 0; i < n; i++) fields[i] = readValue(r);
       return { kind: "composite", fields };
+    }
+    case 16: {
+      const ndim = readU32(r);
+      const dims: number[] = new Array(ndim);
+      const lbounds: number[] = new Array(ndim);
+      let n = 1;
+      for (let d = 0; d < ndim; d++) {
+        dims[d] = readU32(r);
+        lbounds[d] = readU32(r) | 0;
+        n *= dims[d]!;
+      }
+      const elements: Value[] = new Array(n);
+      for (let i = 0; i < n; i++) elements[i] = readValue(r);
+      return { kind: "array", dims, lbounds, elements };
     }
     default:
       throw new Error("bad spill value tag");

@@ -23,7 +23,7 @@ use crate::error::{EngineError, Result, SqlState};
 use crate::executor::key_cmp;
 use crate::interval::Interval;
 use crate::storage::Row;
-use crate::value::{Unfetched, Value};
+use crate::value::{ArrayVal, Unfetched, Value};
 
 /// The default work-memory budget, in **bytes** (256 MiB) — the [`crate::OpenOptions::work_mem`]
 /// default (spec/design/spill.md §2, api.md §2.1). Matches the buffer-pool default so a RAM-sized
@@ -409,12 +409,17 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             }
             Ok(())
         }
-        // Array — tag 16: element count then each element value, recursive (spec/design/array.md).
-        // Internal merge-sort scratch format only, so the recursion needs no type context.
-        Value::Array(elems) => {
+        // Array — tag 16: ndim, then per-dimension (length, lower bound), then each element value,
+        // recursive (spec/design/array.md). Internal merge-sort scratch format only, so the
+        // recursion needs no type context; the full shape round-trips (multidim + custom bounds).
+        Value::Array(arr) => {
             w.write_all(&[16])?;
-            write_u32(w, elems.len() as u32)?;
-            for e in elems {
+            write_u32(w, arr.ndim() as u32)?;
+            for d in 0..arr.ndim() {
+                write_u32(w, arr.dims[d] as u32)?;
+                write_u32(w, arr.lbounds[d] as u32)?;
+            }
+            for e in &arr.elements {
                 write_value(w, e)?;
             }
             Ok(())
@@ -550,12 +555,26 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             Value::Composite(fields)
         }
         16 => {
-            let n = read_u32(r)? as usize;
-            let mut elems = Vec::with_capacity(n);
-            for _ in 0..n {
-                elems.push(read_value(r)?);
+            let ndim = read_u32(r)? as usize;
+            let mut dims = Vec::with_capacity(ndim);
+            let mut lbounds = Vec::with_capacity(ndim);
+            let mut n = 1usize;
+            for _ in 0..ndim {
+                let len = read_u32(r)? as usize;
+                let lb = read_u32(r)? as i32;
+                n = n.saturating_mul(len);
+                dims.push(len);
+                lbounds.push(lb);
             }
-            Value::Array(elems)
+            let mut elements = Vec::with_capacity(n);
+            for _ in 0..n {
+                elements.push(read_value(r)?);
+            }
+            Value::Array(ArrayVal {
+                dims,
+                lbounds,
+                elements,
+            })
         }
         _ => {
             return Err(io::Error::new(

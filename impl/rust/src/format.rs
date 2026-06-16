@@ -30,7 +30,7 @@ use crate::paging::SharedPaging;
 use crate::pmap::{Child, Node};
 use crate::storage::{Row, TableStore};
 use crate::types::{DecimalTypmod, ScalarType, Type};
-use crate::value::{Unfetched, Value};
+use crate::value::{ArrayVal, Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
@@ -225,9 +225,9 @@ fn encode_value(ty: &ColType, v: &Value) -> Vec<u8> {
         },
         ColType::Array(elem) => match v {
             Value::Null => vec![0x01],
-            Value::Array(elems) => {
+            Value::Array(arr) => {
                 let mut out = vec![0x00]; // present
-                out.extend_from_slice(&encode_array_body(elem, elems));
+                out.extend_from_slice(&encode_array_body(elem, arr));
                 out
             }
             _ => panic!("BUG: a non-array value in an array column"),
@@ -237,33 +237,36 @@ fn encode_value(ty: &ColType, v: &Value) -> Vec<u8> {
 
 /// An array value's **body** (after the `0x00` present tag, spec/design/array.md §4):
 /// `ndim u8 ‖ flags u8 ‖ per-dim (len u32 BE, lb i32 BE) ‖ [null_bitmap if HAS_NULLS] ‖ element
-/// bodies`. v1 writes 1-D values only: an empty array is `ndim = 0` (no dims/bitmap/elements); a
-/// non-empty array is `ndim = 1`, `len = element count`, `lb = 1`. The bitmap (MSB-first, like
-/// composite) is present iff any element is NULL (the `HAS_NULLS` flag bit); a NULL element
-/// contributes zero body bytes, a present element its value-codec body minus the presence tag.
-fn encode_array_body(elem: &ColType, elems: &[Value]) -> Vec<u8> {
+/// bodies`. An empty array is `ndim = 0` (no dims/bitmap/elements); otherwise `ndim` is the
+/// dimension count and each dimension records its length and lower bound (multidim + custom lower
+/// bounds — spec/design/array.md §12). The bitmap (MSB-first, like composite) is present iff any
+/// element is NULL (the `HAS_NULLS` flag bit); a NULL element contributes zero body bytes, a
+/// present element its value-codec body minus the presence tag (row-major).
+fn encode_array_body(elem: &ColType, arr: &ArrayVal) -> Vec<u8> {
     let mut out = Vec::new();
-    if elems.is_empty() {
+    if arr.elements.is_empty() {
         out.push(0); // ndim = 0 (empty array)
         out.push(0); // flags
         return out;
     }
-    let has_nulls = elems.iter().any(|e| matches!(e, Value::Null));
-    out.push(1); // ndim = 1 (v1: 1-D values only)
+    let has_nulls = arr.elements.iter().any(|e| matches!(e, Value::Null));
+    out.push(arr.ndim() as u8);
     out.push(if has_nulls { 0x01 } else { 0x00 }); // flags: bit 0 = HAS_NULLS
-    out.extend_from_slice(&(elems.len() as u32).to_be_bytes()); // dim length
-    out.extend_from_slice(&1i32.to_be_bytes()); // lower bound = 1
+    for d in 0..arr.ndim() {
+        out.extend_from_slice(&(arr.dims[d] as u32).to_be_bytes()); // dim length
+        out.extend_from_slice(&arr.lbounds[d].to_be_bytes()); // lower bound (i32 BE)
+    }
     if has_nulls {
-        let nbytes = elems.len().div_ceil(8);
+        let nbytes = arr.elements.len().div_ceil(8);
         let mut bitmap = vec![0u8; nbytes];
-        for (i, e) in elems.iter().enumerate() {
+        for (i, e) in arr.elements.iter().enumerate() {
             if matches!(e, Value::Null) {
                 bitmap[i / 8] |= 0x80 >> (i % 8);
             }
         }
         out.extend_from_slice(&bitmap);
     }
-    for e in elems {
+    for e in &arr.elements {
         if !matches!(e, Value::Null) {
             out.extend_from_slice(&encode_value(elem, e)[1..]); // body only (no presence tag)
         }
@@ -648,7 +651,7 @@ fn value_payload(ty: &ColType, v: &Value) -> Vec<u8> {
         }
         // An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies);
         // a large array spills through the same overflow + LZ4 path (spec/design/array.md §4).
-        (ColType::Array(elem), Value::Array(elems)) => encode_array_body(elem, elems),
+        (ColType::Array(elem), Value::Array(arr)) => encode_array_body(elem, arr),
         _ => unreachable!("only spillable values are externalized"),
     }
 }
@@ -2286,40 +2289,52 @@ fn read_inline_body(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> 
 
 /// An array value's present **body** (after the `0x00` tag): inverse of [`encode_array_body`]
 /// (spec/design/array.md §4). Reads `ndim`/`flags`/per-dim `(len, lb)`, then the optional null
-/// bitmap and the present element bodies. v1 accepts `ndim` 0 (empty) or 1 (1-D); a higher `ndim`
-/// is rejected `XX001` (multidim values are not written this slice — §12).
+/// bitmap and the present element bodies (row-major). Accepts `ndim` 0 (empty) through 6 (`MAXDIM`);
+/// a higher `ndim` or an element-count overflow is `XX001`.
 fn read_array_body(elem: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
-    let ndim = read_u8(buf, pos)?;
+    let ndim = read_u8(buf, pos)? as usize;
     let flags = read_u8(buf, pos)?;
     if flags & !0x01 != 0 {
         return Err(corrupt("array flags has a reserved bit set"));
     }
     if ndim == 0 {
-        return Ok(Value::Array(Vec::new())); // empty array
+        return Ok(Value::Array(ArrayVal::empty())); // empty array
     }
-    if ndim != 1 {
-        return Err(corrupt(
-            "multidimensional array value not supported (ndim > 1)",
-        ));
+    if ndim > 6 {
+        return Err(corrupt("array ndim exceeds the maximum of 6"));
     }
-    let len = read_u32(buf, pos)? as usize;
-    let _lbound = read_u32(buf, pos)?; // lower bound (i32 bits) — round-tripped, ignored in v1
+    let mut dims = Vec::with_capacity(ndim);
+    let mut lbounds = Vec::with_capacity(ndim);
+    let mut n: usize = 1;
+    for _ in 0..ndim {
+        let len = read_u32(buf, pos)? as usize;
+        let lb = read_u32(buf, pos)? as i32; // lower bound (i32 two's-complement)
+        n = n
+            .checked_mul(len)
+            .ok_or_else(|| corrupt("array element count overflow"))?;
+        dims.push(len);
+        lbounds.push(lb);
+    }
     let has_nulls = flags & 0x01 != 0;
     let bitmap = if has_nulls {
-        take(buf, pos, len.div_ceil(8))?.to_vec()
+        take(buf, pos, n.div_ceil(8))?.to_vec()
     } else {
         Vec::new()
     };
-    let mut elems = Vec::with_capacity(len);
-    for i in 0..len {
+    let mut elements = Vec::with_capacity(n);
+    for i in 0..n {
         let is_null = has_nulls && (bitmap[i / 8] & (0x80 >> (i % 8)) != 0);
         if is_null {
-            elems.push(Value::Null);
+            elements.push(Value::Null);
         } else {
-            elems.push(read_inline_body(elem, buf, pos)?);
+            elements.push(read_inline_body(elem, buf, pos)?);
         }
     }
-    Ok(Value::Array(elems))
+    Ok(Value::Array(ArrayVal {
+        dims,
+        lbounds,
+        elements,
+    }))
 }
 
 /// A composite value's present **body** (after the `0x00` tag): the null bitmap then each present

@@ -24,6 +24,10 @@ pub enum SqlState {
     DivisionByZero,
     /// 22023 — invalid parameter value (e.g. a bad numeric typmod, `numeric(0)`).
     InvalidParameterValue,
+    /// 2202E — array subscript error: a multidimensional array constructed/parsed with
+    /// non-matching sub-array dimensions, or an array literal whose declared `[l:u]` bounds are
+    /// inverted (`l > u`) — spec/design/array.md §11.
+    ArraySubscriptError,
     /// 22P02 — invalid text representation (e.g. malformed bytea hex input).
     InvalidTextRepresentation,
     /// 22025 — invalid escape sequence (a LIKE pattern ending in a lone escape character).
@@ -121,6 +125,7 @@ impl SqlState {
             SqlState::DatetimeFieldOverflow => "22008",
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidParameterValue => "22023",
+            SqlState::ArraySubscriptError => "2202E",
             SqlState::InvalidTextRepresentation => "22P02",
             SqlState::InvalidEscapeSequence => "22025",
             SqlState::InvalidRowCountInLimitClause => "2201W",

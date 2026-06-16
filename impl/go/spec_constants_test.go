@@ -190,7 +190,7 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 	}
 	for _, st := range []SqlState{
 		NumericValueOutOfRange, InvalidDatetimeFormat, DatetimeFieldOverflow,
-		DivisionByZero, InvalidParameterValue,
+		DivisionByZero, InvalidParameterValue, ArraySubscriptError,
 		InvalidRowCountInLimitClause, InvalidRowCountInOffsetClause,
 		NotNullViolation, UniqueViolation, CheckViolation,
 		UndefinedParameter, DuplicateObject, WrongObjectType,

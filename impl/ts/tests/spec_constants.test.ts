@@ -95,6 +95,7 @@ test("error codes are registered in spec/errors/registry.toml", () => {
     "datetime_field_overflow",
     "division_by_zero",
     "invalid_parameter_value",
+    "array_subscript_error",
     "invalid_row_count_in_limit_clause",
     "invalid_row_count_in_offset_clause",
     "not_null_violation",

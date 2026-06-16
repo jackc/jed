@@ -451,11 +451,24 @@ const (
 	// SELECT/RETURNING projection list (where `*` expands); in any scalar expression position it is
 	// 0A000.
 	ExprFieldStar
-	// ExprSubscript is array element subscript `Base[Index]` (spec/design/array.md §6) — the
-	// Index-th element of an array Base, 1-based. An out-of-bounds or NULL subscript yields NULL
-	// (PG, not an error); the result type is the element type. A non-array base is 42804 at resolve.
+	// ExprSubscript is array subscript `Base[..][..]` (spec/design/array.md §6) — one or more
+	// bracketed specs (Subscripts) applied to an array Base. Each spec is an index `[i]` or a slice
+	// `[m:n]` (with optionally-omitted bounds). All-index access reads a single 1-based element (the
+	// element type); if any spec is a slice the access returns a sub-array (the array type), and a
+	// scalar index i then means 1:i (PG). An out-of-bounds / NULL subscript yields NULL (PG, not an
+	// error); a non-array base is 42804 at resolve.
 	ExprSubscript
 )
+
+// SubscriptSpec is one subscript spec inside an ExprSubscript (spec/design/array.md §6): an index
+// `[i]` (IsSlice false, Index set) or a slice `[m:n]` (IsSlice true; Lower/Upper may be nil for an
+// omitted bound `[:n]`/`[m:]`/`[:]`).
+type SubscriptSpec struct {
+	IsSlice bool
+	Index   *Expr
+	Lower   *Expr
+	Upper   *Expr
+}
 
 // UnaryOp is a unary operator.
 type UnaryOp int
@@ -527,9 +540,9 @@ type Expr struct {
 	// Field is the selected field name of an ExprFieldAccess (the `.field` part); lookup is
 	// case-insensitive at resolve.
 	Field string
-	// Index is the subscript expression of an ExprSubscript (`Base[Index]`); evaluated to an
-	// integer at run time (spec/design/array.md §6). Base holds the array operand.
-	Index *Expr
+	// Subscripts are the bracketed specs of an ExprSubscript (`Base[..][..]`) — one or more index /
+	// slice specs (spec/design/array.md §6). Base holds the array operand.
+	Subscripts []SubscriptSpec
 }
 
 // InSubqueryExpr is `Lhs [NOT] IN ( Query )` (spec/design/grammar.md §26) — membership of Lhs in

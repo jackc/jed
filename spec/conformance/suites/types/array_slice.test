@@ -1,0 +1,108 @@
+# Array slices a[m:n] (spec/design/array.md §6): read a sub-array. Either bound may be omitted
+# ([:n], [m:], [:]) and defaults to the value's own lower/upper bound. The requested range is clamped
+# to each dimension's [lb,ub]; an empty (or fully out-of-range) result is the empty array {} (NOT
+# NULL); a NULL bound, or a slice of a NULL array, yields NULL. The result is renumbered to lower
+# bound 1 on every dimension. In a multidimensional access any slice subscript makes the whole access
+# a slice and a scalar index i means 1:i; too many subscripts → {}, fewer leave trailing dimensions at
+# full range. array_out matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.array, types.array_multidim, types.int32, expr.array_subscript, expr.array_slice, resource.cost_metering
+
+statement ok
+CREATE TABLE s (id int32 PRIMARY KEY, a int32[])
+
+statement ok
+INSERT INTO s VALUES (1, ARRAY[10,20,30,40,50])
+
+# A value with a custom lower bound (indices 10..14).
+statement ok
+INSERT INTO s VALUES (2, '[10:14]={1,2,3,4,5}')
+
+# A basic slice — a sub-array, renumbered to lower bound 1.
+query T nosort
+SELECT a[2:4] FROM s WHERE id = 1
+----
+{20,30,40}
+
+# The upper bound is clamped to the array's end.
+query T nosort
+SELECT a[2:10] FROM s WHERE id = 1
+----
+{20,30,40,50}
+
+# A fully out-of-range slice is the empty array {}, never NULL.
+query T nosort
+SELECT a[8:10] FROM s WHERE id = 1
+----
+{}
+
+# A reversed range (m > n) is also the empty array.
+query T nosort
+SELECT a[4:2] FROM s WHERE id = 1
+----
+{}
+
+# An omitted lower bound defaults to the array's lower bound.
+query T nosort
+SELECT a[:3] FROM s WHERE id = 1
+----
+{10,20,30}
+
+# An omitted upper bound defaults to the array's upper bound.
+query T nosort
+SELECT a[3:] FROM s WHERE id = 1
+----
+{30,40,50}
+
+# Both omitted → the whole array.
+query T nosort
+SELECT a[:] FROM s WHERE id = 1
+----
+{10,20,30,40,50}
+
+# A slice of a custom-lower-bound value uses lb..ub and renumbers the result to lb 1.
+query T nosort
+SELECT a[11:13] FROM s WHERE id = 2
+----
+{2,3,4}
+
+# A NULL bound makes the whole result NULL.
+query T nosort
+SELECT a[NULL:2] FROM s WHERE id = 1
+----
+NULL
+
+# A slice of a constructed array.
+query T nosort
+SELECT (ARRAY[1,2,3,4,5])[2:4] FROM s WHERE id = 1
+----
+{2,3,4}
+
+statement ok
+CREATE TABLE g (id int32 PRIMARY KEY, m int32[])
+
+statement ok
+INSERT INTO g VALUES (1, ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]])
+
+# A multidimensional slice selects a sub-rectangle, renumbered on each dimension.
+query T nosort
+SELECT m[1:2][2:3] FROM g WHERE id = 1
+----
+{{2,3},{5,6}}
+
+# A scalar index in a slice context means 1:i, so m[2][2:3] is m[1:2][2:3].
+query T nosort
+SELECT m[2][2:3] FROM g WHERE id = 1
+----
+{{2,3},{5,6}}
+
+# Fewer subscripts than ndim → the trailing dimension spans its full range.
+query T nosort
+SELECT m[1:2] FROM g WHERE id = 1
+----
+{{1,2,3},{4,5,6}}
+
+# More subscripts than ndim → the empty array.
+query T nosort
+SELECT m[1:2][1:1][1:1] FROM g WHERE id = 1
+----
+{}

@@ -23,6 +23,7 @@ import type {
   SelectItems,
   SetOpKind,
   Statement,
+  SubscriptSpec,
   TableRef,
   TypeFieldDef,
   TypeMod,
@@ -1319,14 +1320,36 @@ class Parser {
         expr = { kind: "cast", inner: expr, typeName, typeMod };
         fieldAccessible = false;
       } else if (k === "lbracket") {
-        // `base[index]` — array element subscript (spec/design/array.md §6). Applies to ANY base
-        // (no parens rule, unlike `.field`) and chains (`a[1][2]`). The index is a full expression;
-        // a slice `a[m:n]` is deferred (no single-colon token, so it does not parse). After a
-        // subscript a `.field` still needs parens (PG), so it is not field-accessible.
-        this.advance();
-        const index = this.parseExpr();
-        this.expect("rbracket");
-        expr = { kind: "subscript", base: expr, index };
+        // `base[..][..]` — array subscript (spec/design/array.md §6). Applies to ANY base (no parens
+        // rule, unlike `.field`). Consecutive `[…]` brackets collect into ONE access (so `a[1][2]` is
+        // a single multidim element read, not nested). Each spec is an index `[i]` or a slice `[m:n]`
+        // (bounds optionally omitted). After a subscript a `.field` still needs parens (PG).
+        const subscripts: SubscriptSpec[] = [];
+        while (this.peek().kind === "lbracket") {
+          this.advance(); // [
+          // The lower bound / index is absent only before a `:` or `]` (`[:n]`, `[]`).
+          let lower: Expr | null = null;
+          if (this.peek().kind !== "colon" && this.peek().kind !== "rbracket") {
+            lower = this.parseExpr();
+          }
+          if (this.peek().kind === "colon") {
+            this.advance(); // :
+            let upper: Expr | null = null;
+            if (this.peek().kind !== "rbracket") {
+              upper = this.parseExpr();
+            }
+            this.expect("rbracket");
+            subscripts.push({ isSlice: true, lower, upper });
+          } else {
+            // Index form: a bare `[]` (no index, no colon) is a syntax error.
+            if (lower === null) {
+              throw engineError("syntax_error", "array subscript requires an index");
+            }
+            this.expect("rbracket");
+            subscripts.push({ isSlice: false, index: lower });
+          }
+        }
+        expr = { kind: "subscript", base: expr, subscripts };
         fieldAccessible = false;
       } else if (k === "dot" && fieldAccessible) {
         // `.field` / `.*` — composite field selection (spec/design/composite.md §S4),
@@ -1700,6 +1723,8 @@ function renderToken(t: Token): string {
       return "<=";
     case "ge":
       return ">=";
+    case "colon":
+      return ":";
     default: // "eof" — never inside the parentheses
       return "";
   }

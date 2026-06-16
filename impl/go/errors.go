@@ -25,6 +25,9 @@ const (
 	DivisionByZero
 	// InvalidParameterValue is 22023 — a bad numeric typmod (e.g. numeric(0)).
 	InvalidParameterValue
+	// ArraySubscriptError is 2202E — a multidimensional array built/parsed with non-matching
+	// sub-array dimensions, or an array literal with inverted [l:u] bounds (spec/design/array.md §11).
+	ArraySubscriptError
 	// InvalidTextRepresentation is 22P02 — malformed text input (e.g. bytea hex).
 	InvalidTextRepresentation
 	// InvalidEscapeSequence is 22025 — a LIKE pattern ending in a lone escape character.
@@ -125,6 +128,8 @@ func (s SqlState) Code() string {
 		return "22012"
 	case InvalidParameterValue:
 		return "22023"
+	case ArraySubscriptError:
+		return "2202E"
 	case InvalidTextRepresentation:
 		return "22P02"
 	case InvalidEscapeSequence:

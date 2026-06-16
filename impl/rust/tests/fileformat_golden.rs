@@ -152,6 +152,11 @@ fn array_table_db() -> Database {
     );
     run(&mut db, "INSERT INTO t VALUES (2, '{40,50}', '{}')");
     run(&mut db, "INSERT INTO t VALUES (3, ARRAY[1, NULL, 3], NULL)");
+    // Row 4 pins the §12 shapes: a 2-D int32[] and a custom-lower-bound text[] (the lb i32 field).
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (4, ARRAY[ARRAY[10,20],ARRAY[30,40]], '[2:3]={x,y}')",
+    );
     db
 }
 

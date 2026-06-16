@@ -45,8 +45,11 @@ pub enum Token {
     Le,
     Ge,
     /// The `::` PostgreSQL typecast operator (`expr::type` = `CAST(expr AS type)`). Two colons,
-    /// scanned greedily; a lone `:` is a 42601 syntax error. See spec/design/grammar.md §37.
+    /// scanned greedily. See spec/design/grammar.md §37.
     DoubleColon,
+    /// A single `:` — the array-slice bound separator `a[m:n]` (spec/design/array.md §6). Only
+    /// meaningful inside subscript brackets; elsewhere the parser rejects it (42601).
+    Colon,
     /// The `=>` named-argument arrow (`name => value`, PostgreSQL named notation). Two chars,
     /// scanned greedily after `=`; the legacy `:=` spelling is not part of jed's surface. See
     /// spec/design/grammar.md §17.

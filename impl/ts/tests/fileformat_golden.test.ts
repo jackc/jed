@@ -124,6 +124,8 @@ function arrayTableDB(): Database {
   run(db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])");
   run(db, "INSERT INTO t VALUES (2, '{40,50}', '{}')");
   run(db, "INSERT INTO t VALUES (3, ARRAY[1, NULL, 3], NULL)");
+  // Row 4 pins the §12 shapes: a 2-D int32[] and a custom-lower-bound text[] (the lb i32 field).
+  run(db, "INSERT INTO t VALUES (4, ARRAY[ARRAY[10,20],ARRAY[30,40]], '[2:3]={x,y}')");
   return db;
 }
 

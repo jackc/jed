@@ -75,6 +75,12 @@ class = "data exception"
 template = "LIKE pattern must not end with escape character"
 
 [[error]]
+code = "2202E"
+name = "array_subscript_error"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
 code = "22P02"
 name = "invalid_text_representation"
 class = "data exception"

@@ -55,11 +55,13 @@ export type Value =
   // (element-wise), recursing into each field's own canonical comparison so a float/decimal/interval
   // field never compares by raw bits (the rule Decimal/Interval already follow).
   | { kind: "composite"; fields: Value[] }
-  // An array value (spec/design/array.md §2) — a flat (1-D) list of element values (a NULL element
-  // is a {kind:"null"}, an empty list is the empty array `{}`). Comparison uses PG btree semantics
-  // (NULLs comparable and mutually equal — NOT the composite 3VL rule, §5), so equality/hashing
-  // (the DISTINCT/GROUP BY key) and the total-order lt3/gt3 are structural over this list.
-  | { kind: "array"; elements: Value[] }
+  // A shaped array value (spec/design/array.md §2/§4). Shape is a value property: `dims` holds the
+  // per-dimension element counts (row-major), `lbounds` the per-dimension lower bounds (default 1,
+  // same length as dims), and `elements` the flattened row-major element values (its length is the
+  // product of dims). ndim is dims.length; the empty array is ndim 0 (all arrays empty). Comparison
+  // uses PG btree semantics (NULLs comparable and mutually equal — NOT the composite 3VL rule, §5)
+  // and, like array_eq/array_cmp, considers dims and lbounds (so [2:4]={1,2,3} ≠ {1,2,3}).
+  | { kind: "array"; dims: number[]; lbounds: number[]; elements: Value[] }
   // An UNFETCHED large-value reference (spec/design/large-values.md §14): a stored
   // external/compressed value loaded as its on-disk pointer instead of being materialized.
   // Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -176,9 +178,26 @@ export function compositeValue(fields: Value[]): Value {
   return { kind: "composite", fields };
 }
 
-// arrayValue builds an array value from its element list (spec/design/array.md §2).
+// arrayValue builds a 1-D array value with the default lower bound 1 (spec/design/array.md §2); an
+// empty list is the empty array (ndim 0).
 export function arrayValue(elements: Value[]): Value {
-  return { kind: "array", elements };
+  if (elements.length === 0) return { kind: "array", dims: [], lbounds: [], elements: [] };
+  return { kind: "array", dims: [elements.length], lbounds: [1], elements };
+}
+
+// emptyArray is the empty array `{}` (ndim 0).
+export function emptyArray(): Value {
+  return { kind: "array", dims: [], lbounds: [], elements: [] };
+}
+
+// arrayNdim is the dimension count of an array value (0 = the empty array).
+export function arrayNdim(a: { dims: number[] }): number {
+  return a.dims.length;
+}
+
+// arrayUbound is the upper bound of dimension d (lb + len - 1).
+export function arrayUbound(a: { dims: number[]; lbounds: number[] }, d: number): number {
+  return a.lbounds[d] + a.dims[d] - 1;
 }
 
 // compareBytea compares two byte strings by UNSIGNED byte order (Uint8Array elements are
@@ -372,9 +391,10 @@ export function render(v: Value): string {
       // quoted because it contains parens/commas).
       return recordOut(v.fields);
     case "array":
-      // An array renders as PG array_out: `{e1,e2,…}` with per-element quoting and an unquoted
+      // An array renders as PG array_out: `{e1,e2,…}` (nested braces for a multidim value, an
+      // optional `[l:u]=` prefix when any lower bound ≠ 1), with per-element quoting and an unquoted
       // `NULL` for a null element (spec/design/array.md §7).
-      return arrayOut(v.elements);
+      return arrayOut(v);
     case "unfetched":
       throw new Error("BUG: unfetched large value escaped the storage layer");
     default:
@@ -438,35 +458,57 @@ function recordFieldNeedsQuote(s: string): boolean {
   return false;
 }
 
-// arrayOut is PostgreSQL array_out (spec/design/array.md §7): render an array's elements as
-// `{e1,e2,…}`. A NULL element is the unquoted token `NULL`; every other element is rendered by its
-// own `render` and double-quoted iff it is empty, equals the literal `NULL` (case-insensitive), or
-// contains a delimiter / brace / quote / backslash / whitespace. Inside the quotes PostgreSQL
-// BACKSLASH-ESCAPES an embedded `"` → `\"` and `\` → `\\` (the contrast with record_out doubling).
-// The empty array renders `{}`. Equals PG byte-for-byte (CLAUDE.md §8).
-export function arrayOut(elems: Value[]): string {
-  let out = "{";
-  for (let i = 0; i < elems.length; i++) {
-    if (i > 0) out += ",";
-    const e = elems[i]!;
-    if (e.kind === "null") {
-      out += "NULL";
-      continue;
+// arrayOut is PostgreSQL array_out (spec/design/array.md §7): render an array as `{e1,e2,…}`, with
+// nested braces for a multidimensional value and an optional `[l1:u1][l2:u2]=` lower-bound prefix
+// when ANY lower bound differs from 1. A NULL element is the unquoted token `NULL`; every other
+// element is rendered by its own `render` and double-quoted iff it is empty, equals the literal
+// `NULL` (case-insensitive), or contains a delimiter / brace / quote / backslash / whitespace.
+// Inside the quotes PostgreSQL BACKSLASH-ESCAPES an embedded `"` → `\"` and `\` → `\\` (the contrast
+// with record_out doubling). The empty array renders `{}`. Equals PG byte-for-byte (CLAUDE.md §8).
+export function arrayOut(a: { dims: number[]; lbounds: number[]; elements: Value[] }): string {
+  if (a.elements.length === 0) return "{}"; // the empty array (ndim 0)
+  let out = "";
+  if (a.lbounds.some((lb) => lb !== 1)) {
+    for (let d = 0; d < a.dims.length; d++) {
+      out += `[${a.lbounds[d]}:${arrayUbound(a, d)}]`;
     }
-    const s = render(e);
-    if (arrayElemNeedsQuote(s)) {
-      out += '"';
-      for (const ch of s) {
-        if (ch === '"' || ch === "\\") out += "\\";
-        out += ch;
-      }
-      out += '"';
+    out += "=";
+  }
+  const cursor = { i: 0 };
+  return out + renderArrayDim(a, 0, cursor);
+}
+
+// renderArrayDim renders the brace structure for dimension d of a, consuming flattened elements via
+// the cursor (the helper for arrayOut). The innermost dimension renders elements; outer dims recurse.
+function renderArrayDim(
+  a: { dims: number[]; elements: Value[] },
+  d: number,
+  cursor: { i: number },
+): string {
+  let out = "{";
+  for (let k = 0; k < a.dims[d]!; k++) {
+    if (k > 0) out += ",";
+    if (d + 1 === a.dims.length) {
+      out += renderArrayElem(a.elements[cursor.i]!);
+      cursor.i++;
     } else {
-      out += s;
+      out += renderArrayDim(a, d + 1, cursor);
     }
   }
-  out += "}";
-  return out;
+  return out + "}";
+}
+
+// renderArrayElem renders one array element (PG array_out quoting; a NULL element is unquoted NULL).
+function renderArrayElem(e: Value): string {
+  if (e.kind === "null") return "NULL";
+  const s = render(e);
+  if (!arrayElemNeedsQuote(s)) return s;
+  let out = '"';
+  for (const ch of s) {
+    if (ch === '"' || ch === "\\") out += "\\";
+    out += ch;
+  }
+  return out + '"';
 }
 
 // arrayElemNeedsQuote reports whether an array_out element token must be double-quoted: the empty
@@ -494,85 +536,212 @@ function arrayElemNeedsQuote(s: string): boolean {
   return false;
 }
 
-// parseArrayTokens is the PostgreSQL array_in tokenizer (spec/design/array.md §7) — the inverse of
-// arrayOut. It splits the text of an array literal `{e1,e2,…}` into raw element tokens WITHOUT type
-// coercion. An element is quoted (`"…"` with `\"`→`"` and `\\`→`\` un-escaping) or unquoted (read to
-// the next top-level `,`/`}`, surrounding whitespace trimmed, `\x`→`x`). An UNQUOTED `NULL` (any
-// case) is a NULL element (null); a quoted `"NULL"` is the 4-char string. `{}` (optionally with
-// inner whitespace) is the empty array. Returns null on a malformed literal (→ 22P02).
-export function parseArrayTokens(input: string): (string | null)[] | null {
+// ParsedArray is the structured result of parseArrayLiteral: the shape (dims/lbounds) and the
+// flattened row-major element tokens (null = a NULL element).
+export interface ParsedArray {
+  dims: number[];
+  lbounds: number[];
+  tokens: (string | null)[];
+}
+
+// ArrayInResult is parseArrayLiteral's result: a parsed array, or a classified failure —
+// "malformed" (→ 22P02) or "boundflip" (a declared [l:u] with u<l → 2202E).
+export type ArrayInResult = { ok: true; value: ParsedArray } | { ok: false; err: "malformed" | "boundflip" };
+
+// ArrNode is a parsed brace node: a leaf scalar token (leaf, null = the NULL token) or a braced level.
+type ArrNode = { leaf: string | null; isLeaf: true } | { children: ArrNode[]; isLeaf: false };
+
+// parseArrayLiteral is PostgreSQL array_in (spec/design/array.md §7) — the inverse of arrayOut. It
+// parses an optional dimension prefix `[l1:u1][l2:u2]…=`, then a (possibly nested) brace structure
+// `{…}`, returning the shape (dims/lbounds) and flattened row-major raw element tokens (no coercion).
+// An element is quoted (`"…"`, `\"`→`"`, `\\`→`\`) or unquoted (to the next top-level `,`/`}`,
+// whitespace trimmed, `\x`→`x`); an unquoted `NULL` (any case) is a NULL element (null), a quoted
+// `"NULL"` the 4-char string. `{}` is the empty array (ndim 0). A multidim literal must be
+// rectangular and, if a prefix is given, the contents must match the declared dims (else
+// "malformed"); a prefix with u<l is "boundflip".
+export function parseArrayLiteral(input: string): ArrayInResult {
   const s = input.replace(/^[\t\n\v\f\r ]+/, "").replace(/[\t\n\v\f\r ]+$/, "");
-  let pos = 0;
-  const isWs = (c: string): boolean =>
-    c === " " || c === "\t" || c === "\n" || c === "\v" || c === "\f" || c === "\r";
-  if (s[pos] !== "{") return null;
-  pos++;
-  const elems: (string | null)[] = [];
-  while (pos < s.length && isWs(s[pos]!)) pos++;
-  if (s[pos] === "}") {
-    pos++;
-    return pos === s.length ? elems : null; // empty array
+  const p = new ArrParser(s);
+  const malformed: ArrayInResult = { ok: false, err: "malformed" };
+
+  const prefixLb: number[] = [];
+  const prefixDims: number[] = [];
+  if (p.peek() === "[") {
+    while (p.peek() === "[") {
+      p.bump(); // [
+      const lb = p.parseInt();
+      if (lb === null) return malformed;
+      if (p.peek() !== ":") return malformed;
+      p.bump(); // :
+      const ub = p.parseInt();
+      if (ub === null) return malformed;
+      if (p.peek() !== "]") return malformed;
+      p.bump(); // ]
+      if (ub < lb) return { ok: false, err: "boundflip" };
+      prefixLb.push(lb);
+      prefixDims.push(ub - lb + 1);
+    }
+    if (p.peek() !== "=") return malformed;
+    p.bump(); // =
+    p.skipWs();
   }
-  for (;;) {
-    while (pos < s.length && isWs(s[pos]!)) pos++;
+
+  const node = p.parseNode();
+  if (node === null) return malformed;
+  p.skipWs();
+  if (!p.atEnd()) return malformed; // trailing junk
+  if (node.isLeaf) return malformed; // a literal must start with a brace
+  // The bare top-level empty brace `{}` is the empty array (ndim 0).
+  if (node.children.length === 0) {
+    if (prefixDims.length !== 0) return malformed;
+    return { ok: true, value: { dims: [], lbounds: [], tokens: [] } };
+  }
+  const dims = nodeDims(node);
+  if (dims === null || dims.length > 6) return malformed;
+  const tokens: (string | null)[] = [];
+  flattenNodes(node, tokens);
+  let lbounds: number[];
+  if (prefixDims.length === 0) {
+    lbounds = dims.map(() => 1);
+  } else {
+    if (prefixDims.length !== dims.length || prefixDims.some((d, i) => d !== dims[i])) return malformed;
+    lbounds = prefixLb;
+  }
+  return { ok: true, value: { dims, lbounds, tokens } };
+}
+
+// ArrParser is a string cursor for parseArrayLiteral.
+class ArrParser {
+  private s: string;
+  private i = 0;
+  constructor(s: string) {
+    this.s = s;
+  }
+  peek(): string | undefined {
+    return this.s[this.i];
+  }
+  bump(): void {
+    this.i++;
+  }
+  atEnd(): boolean {
+    return this.i >= this.s.length;
+  }
+  skipWs(): void {
+    while (this.i < this.s.length && isArrWs(this.s[this.i]!)) this.i++;
+  }
+  // parseInt parses a signed decimal integer (a dimension bound); null on no digits / bad number.
+  parseInt(): number | null {
     let buf = "";
-    let quoted = false;
-    if (s[pos] === '"') {
-      quoted = true;
-      pos++; // opening quote
-      for (;;) {
-        if (pos >= s.length) return null; // unterminated quoted element
-        const c = s[pos]!;
-        if (c === '"') {
-          pos++;
-          break; // closing quote
-        }
-        if (c === "\\") {
-          pos++;
-          if (pos >= s.length) return null;
-          buf += s[pos]!;
-          pos++;
-        } else {
-          buf += c;
-          pos++;
-        }
-      }
-      while (pos < s.length && isWs(s[pos]!)) pos++;
-    } else {
-      for (;;) {
-        if (pos >= s.length) return null; // missing '}'
-        const c = s[pos]!;
-        if (c === "," || c === "}") break;
-        if (c === "\\") {
-          pos++;
-          if (pos >= s.length) return null;
-          buf += s[pos]!;
-          pos++;
-        } else {
-          buf += c;
-          pos++;
-        }
-      }
+    if (this.peek() === "-") {
+      buf += "-";
+      this.bump();
     }
-    if (quoted) {
-      elems.push(buf);
-    } else {
-      const trimmed = buf.replace(/^[\t\n\v\f\r ]+/, "").replace(/[\t\n\v\f\r ]+$/, "");
-      if (trimmed.length === 0) return null; // a bare empty unquoted element is malformed (PG)
-      elems.push(trimmed.toUpperCase() === "NULL" ? null : trimmed);
+    while (this.i < this.s.length && this.s[this.i]! >= "0" && this.s[this.i]! <= "9") {
+      buf += this.s[this.i]!;
+      this.bump();
     }
-    const d = s[pos];
-    if (d === ",") {
-      pos++;
-      continue;
-    }
-    if (d === "}") {
-      pos++;
-      break;
-    }
-    return null;
+    if (buf === "" || buf === "-") return null;
+    const n = Number(buf);
+    return Number.isInteger(n) ? n : null;
   }
-  return pos === s.length ? elems : null;
+  // parseNode parses one element: a nested `{…}` (a braced level) or a scalar token (a leaf).
+  parseNode(): ArrNode | null {
+    this.skipWs();
+    if (this.peek() === "{") {
+      this.bump(); // {
+      this.skipWs();
+      const children: ArrNode[] = [];
+      if (this.peek() === "}") {
+        this.bump(); // empty braces
+        return { children, isLeaf: false };
+      }
+      for (;;) {
+        const child = this.parseNode();
+        if (child === null) return null;
+        children.push(child);
+        this.skipWs();
+        const c = this.peek();
+        if (c === undefined) return null;
+        this.bump();
+        if (c === ",") continue;
+        if (c === "}") break;
+        return null;
+      }
+      return { children, isLeaf: false };
+    }
+    const tok = this.parseScalar();
+    if (tok === undefined) return null;
+    return { leaf: tok, isLeaf: true };
+  }
+  // parseScalar parses one scalar token (quoted or unquoted); null is the unquoted NULL token,
+  // undefined signals a malformed token.
+  parseScalar(): string | null | undefined {
+    let buf = "";
+    if (this.peek() === '"') {
+      this.bump(); // opening quote
+      for (;;) {
+        const c = this.peek();
+        if (c === undefined) return undefined; // unterminated
+        this.bump();
+        if (c === '"') break;
+        if (c === "\\") {
+          const c2 = this.peek();
+          if (c2 === undefined) return undefined;
+          buf += c2;
+          this.bump();
+        } else {
+          buf += c;
+        }
+      }
+      return buf;
+    }
+    // Unquoted: read until a top-level `,`/`}`/`{`, processing `\x`→`x`.
+    for (;;) {
+      const c = this.peek();
+      if (c === undefined) return undefined;
+      if (c === "," || c === "}" || c === "{") break;
+      if (c === "\\") {
+        this.bump();
+        const c2 = this.peek();
+        if (c2 === undefined) return undefined;
+        buf += c2;
+        this.bump();
+      } else {
+        buf += c;
+        this.bump();
+      }
+    }
+    const trimmed = buf.replace(/^[\t\n\v\f\r ]+/, "").replace(/[\t\n\v\f\r ]+$/, "");
+    if (trimmed.length === 0) return undefined; // a bare empty unquoted element is malformed (PG)
+    return trimmed.toUpperCase() === "NULL" ? null : trimmed;
+  }
+}
+
+function isArrWs(c: string): boolean {
+  return c === " " || c === "\t" || c === "\n" || c === "\v" || c === "\f" || c === "\r";
+}
+
+// nodeDims returns the dimensions of a parsed brace node (recursing), or null if non-rectangular
+// (all sub-arrays at a level must share the same shape and kind — a leaf-vs-array mix is malformed).
+function nodeDims(node: ArrNode): number[] | null {
+  if (node.isLeaf) return [];
+  if (node.children.length === 0) return null; // a nested empty brace is not a valid sub-array
+  const child0 = nodeDims(node.children[0]!);
+  if (child0 === null) return null;
+  for (const c of node.children.slice(1)) {
+    const cd = nodeDims(c);
+    if (cd === null || cd.length !== child0.length || cd.some((d, i) => d !== child0[i])) return null;
+  }
+  return [node.children.length, ...child0];
+}
+
+// flattenNodes collects the leaf tokens of a parsed brace node in row-major order (left-to-right DFS).
+function flattenNodes(node: ArrNode, out: (string | null)[]): void {
+  if (node.isLeaf) {
+    out.push(node.leaf);
+    return;
+  }
+  for (const c of node.children) flattenNodes(c, out);
 }
 
 // parseRecordTokens is the PostgreSQL record_in tokenizer (spec/design/composite.md §8) — the exact
@@ -716,35 +885,49 @@ export function eq3(a: Value, b: Value): ThreeValued {
   // Array `=` uses PG btree semantics (spec/design/array.md §5), NOT the composite 3VL rule: same
   // length and every element pair equal-or-both-NULL → TRUE, else FALSE. NULL elements are
   // comparable and mutually equal, so the result is ALWAYS definite (never UNKNOWN).
-  if (a.kind === "array" && b.kind === "array") return bool3(arrayEqual(a.elements, b.elements));
+  if (a.kind === "array" && b.kind === "array") return bool3(arrayEqual(a, b));
   return "unknown";
 }
 
-// arrayEqual is PG array_eq (spec/design/array.md §5): same length and every element pair equal,
-// where two NULL elements are mutually equal (NOT 3VL). Always definite.
-function arrayEqual(a: Value[], b: Value[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    const an = a[i]!.kind === "null";
-    const bn = b[i]!.kind === "null";
+// ArrayShape is the structural view of an array value (its shape + flattened elements).
+type ArrayShape = { dims: number[]; lbounds: number[]; elements: Value[] };
+
+function numArrEqual(a: number[], b: number[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+// arrayEqual is PG array_eq (spec/design/array.md §5): same dimensionality AND lower bounds AND
+// every element pair equal, where two NULL elements are mutually equal (NOT 3VL). So [2:4]={1,2,3}
+// and {1,2,3} are not equal. Always definite.
+function arrayEqual(a: ArrayShape, b: ArrayShape): boolean {
+  if (!numArrEqual(a.dims, b.dims) || !numArrEqual(a.lbounds, b.lbounds)) return false;
+  for (let i = 0; i < a.elements.length; i++) {
+    const an = a.elements[i]!.kind === "null";
+    const bn = b.elements[i]!.kind === "null";
     if (an !== bn) return false;
     if (an) continue; // both NULL → equal
-    if (eq3(a[i]!, b[i]!) !== "true") return false;
+    if (eq3(a.elements[i]!, b.elements[i]!) !== "true") return false;
   }
   return true;
 }
 
-// arrayTotalCmp is the PG array_cmp total order over two arrays (spec/design/array.md §5): walk
-// element pairs; the first non-equal pair decides; if one array is a prefix of the other, the
-// shorter sorts first. NULL elements are comparable — NULL sorts AFTER every non-NULL and two NULLs
-// are equal (NULLs-last). Always total/definite.
-function arrayTotalCmp(a: Value[], b: Value[]): number {
-  const n = Math.min(a.length, b.length);
+// arrayTotalCmp is the PG array_cmp total order over two arrays (spec/design/array.md §5): walk the
+// flattened element pairs (the first non-equal pair decides), then fewer total elements first, then
+// smaller ndim, then per dimension smaller length and smaller lower bound. NULL elements are
+// comparable — NULL sorts AFTER every non-NULL and two NULLs are equal (NULLs-last). Always definite.
+function arrayTotalCmp(a: ArrayShape, b: ArrayShape): number {
+  const n = Math.min(a.elements.length, b.elements.length);
   for (let i = 0; i < n; i++) {
-    const c = elemTotalCmp(a[i]!, b[i]!);
+    const c = elemTotalCmp(a.elements[i]!, b.elements[i]!);
     if (c !== 0) return c;
   }
-  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+  if (a.elements.length !== b.elements.length) return a.elements.length < b.elements.length ? -1 : 1;
+  if (a.dims.length !== b.dims.length) return a.dims.length < b.dims.length ? -1 : 1;
+  for (let d = 0; d < a.dims.length; d++) {
+    if (a.dims[d] !== b.dims[d]) return a.dims[d]! < b.dims[d]! ? -1 : 1;
+    if (a.lbounds[d] !== b.lbounds[d]) return a.lbounds[d]! < b.lbounds[d]! ? -1 : 1;
+  }
+  return 0;
 }
 
 // elemTotalCmp is a total order over two array elements with NULL the largest value (NULLs-last)
@@ -800,7 +983,7 @@ export function lt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "composite" && b.kind === "composite") return compositeOrder3(a.fields, b.fields, false);
   // Array `<` uses the PG array_cmp total order (spec/design/array.md §5): element-wise, NULL after
   // every non-NULL, shorter prefix first. Always definite.
-  if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a.elements, b.elements) < 0);
+  if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a, b) < 0);
   return "unknown";
 }
 
@@ -827,7 +1010,7 @@ export function gt3(a: Value, b: Value): ThreeValued {
   // Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
   if (a.kind === "composite" && b.kind === "composite") return compositeOrder3(a.fields, b.fields, true);
   // Array `>` — the total-order mirror of `<` (spec/design/array.md §5).
-  if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a.elements, b.elements) > 0);
+  if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a, b) > 0);
   return "unknown";
 }
 
@@ -846,7 +1029,7 @@ export function valueEqual(a: Value, b: Value): boolean {
   }
   // Two arrays are "not distinct" iff structurally equal (btree equality; NULL elements mutually
   // equal — spec/design/array.md §5).
-  if (a.kind === "array" && b.kind === "array") return arrayEqual(a.elements, b.elements);
+  if (a.kind === "array" && b.kind === "array") return arrayEqual(a, b);
   return eq3(a, b) === "true";
 }
 

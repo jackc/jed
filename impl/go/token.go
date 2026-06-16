@@ -53,8 +53,10 @@ const (
 	// TokGe is ">=".
 	TokGe
 	// TokDoubleColon is the "::" PostgreSQL typecast operator (expr::type = CAST(expr AS type)).
-	// Two colons, scanned greedily; a lone ":" is a 42601 syntax error (spec/design/grammar.md §37).
+	// Two colons, scanned greedily (spec/design/grammar.md §37).
 	TokDoubleColon
+	// TokColon is a single ":" — the array-slice bound separator a[m:n] (spec/design/array.md §6).
+	TokColon
 	// TokFatArrow is the "=>" named-argument arrow (name => value, PostgreSQL named notation).
 	// Two chars, scanned greedily after "="; the legacy ":=" is not part of jed's surface
 	// (spec/design/grammar.md §17).

@@ -180,6 +180,7 @@ fn error_codes_are_registered() {
         SqlState::DatetimeFieldOverflow,
         SqlState::DivisionByZero,
         SqlState::InvalidParameterValue,
+        SqlState::ArraySubscriptError,
         SqlState::NotNullViolation,
         SqlState::UniqueViolation,
         SqlState::CheckViolation,

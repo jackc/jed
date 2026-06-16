@@ -134,11 +134,20 @@ export type Expr =
   // one output column per field, in declaration order. Valid only in a SELECT/RETURNING projection
   // list (where `*` expands); in any scalar expression position it is 0A000.
   | { kind: "fieldStar"; base: Expr }
-  // Array element subscript `base[index]` (spec/design/array.md §6) — the `index`-th element of an
-  // array `base`, 1-based. An out-of-bounds or NULL subscript yields NULL (PG, not an error); the
-  // result type is the element type. A non-array base is 42804 at resolve. The parser produces this
-  // for a `[…]` postfix on any base expression.
-  | { kind: "subscript"; base: Expr; index: Expr };
+  // Array subscript `base[..][..]` (spec/design/array.md §6) — one or more bracketed specs applied
+  // to an array `base`. Each spec is an index `[i]` or a slice `[m:n]` (with optionally-omitted
+  // bounds). All-index access reads a single 1-based element (the element type); if any spec is a
+  // slice the access returns a sub-array (the array type), and a scalar index i then means 1:i. An
+  // out-of-bounds / NULL subscript yields NULL (PG); a non-array base is 42804 at resolve. The parser
+  // collects consecutive `[…]` postfixes into one node (so `a[1][2]` is one access, two specs).
+  | { kind: "subscript"; base: Expr; subscripts: SubscriptSpec[] };
+
+// SubscriptSpec is one subscript spec inside a "subscript" expr (spec/design/array.md §6): an index
+// `[i]` (isSlice false, index set) or a slice `[m:n]` (isSlice true; lower/upper may be null for an
+// omitted bound `[:n]`/`[m:]`/`[:]`).
+export type SubscriptSpec =
+  | { isSlice: false; index: Expr }
+  | { isSlice: true; lower: Expr | null; upper: Expr | null };
 
 // SelectItem is one select-list expression with its optional output-name alias
 // (expr AS name). The alias is an output label only — it never enters resolution

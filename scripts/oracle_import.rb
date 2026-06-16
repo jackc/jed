@@ -217,7 +217,10 @@ class OracleImport
       return old
     end
     tags = types.map do |(_name, t)|
-      TAG[t] || (composite_type?(t) ? "T" : raise("no coltype tag for PG type #{t.inspect}"))
+      # An array result column (PG describes it as `<elem>[]`) renders as a printable string, the
+      # `T` tag — like composite/uuid/bytea (spec/design/array.md §7).
+      TAG[t] ||
+        (t.end_with?("[]") || composite_type?(t) ? "T" : raise("no coltype tag for PG type #{t.inspect}"))
     end
     is_bool = types.map { |(_name, t)| t == "boolean" }
     derived = tags.join

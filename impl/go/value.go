@@ -113,10 +113,41 @@ type Value struct {
 	// two composite Values with raw `==` (that compares pointers); composite equality/hashing go
 	// through Eq3 / the structural value-key path.
 	Comp *[]Value
-	// Array holds the element values when Kind == ValArray (spec/design/array.md §2). A POINTER
-	// (*[]Value) so the flat Value struct stays ==-comparable — like Comp; array equality/hashing
-	// go through Eq3 / the structural value-key path, never raw `==`.
-	Array *[]Value
+	// Array holds the shaped array value when Kind == ValArray (spec/design/array.md §2/§4). A
+	// POINTER (*ArrayVal) so the flat Value struct stays ==-comparable — like Comp; array
+	// equality/hashing go through Eq3 / the structural value-key path, never raw `==`.
+	Array *ArrayVal
+}
+
+// ArrayVal is a shaped array value (spec/design/array.md §4). Shape is a value property: Dims holds
+// the per-dimension element counts (row-major), Lbounds the per-dimension lower bounds (default 1,
+// same length as Dims), and Elements the flattened row-major element values (its length is the
+// product of Dims). ndim is len(Dims); the empty array is ndim 0 (all slices empty). Equality and
+// ordering are structural and, like PG array_eq/array_cmp, include Dims and Lbounds — so
+// [2:4]={1,2,3} and {1,2,3} are distinct (Eq3/Lt3/Gt3 / the value key).
+type ArrayVal struct {
+	Dims     []int
+	Lbounds  []int32
+	Elements []Value
+}
+
+// Ndim is the dimension count (0 = the empty array).
+func (a *ArrayVal) Ndim() int { return len(a.Dims) }
+
+// Ubound is the upper bound of dimension d (lb + len - 1).
+func (a *ArrayVal) Ubound(d int) int32 { return a.Lbounds[d] + int32(a.Dims[d]) - 1 }
+
+// EmptyArray is the empty array `{}` (ndim 0). Elements is a non-nil empty slice (matching the
+// store path's make([]Value, 0)) so an empty array read from disk is reflect.DeepEqual to one built
+// in memory (nil != [] in DeepEqual — the golden round-trip test).
+func EmptyArray() *ArrayVal { return &ArrayVal{Elements: []Value{}} }
+
+// OneDimArray builds a 1-D array with the default lower bound 1; an empty slice is the empty array.
+func OneDimArray(elems []Value) *ArrayVal {
+	if len(elems) == 0 {
+		return &ArrayVal{}
+	}
+	return &ArrayVal{Dims: []int{len(elems)}, Lbounds: []int32{1}, Elements: elems}
 }
 
 // IntValue builds a non-null integer value.
@@ -155,8 +186,11 @@ func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, Iv: iv} 
 // structural equality/ordering go through Eq3/Lt3/Gt3, never raw ==.
 func CompositeValue(fields []Value) Value { return Value{Kind: ValComposite, Comp: &fields} }
 
-// ArrayValue builds an array value from its element list (spec/design/array.md §2).
-func ArrayValue(elems []Value) Value { return Value{Kind: ValArray, Array: &elems} }
+// ArrayValue builds a 1-D array value from its element list (spec/design/array.md §2).
+func ArrayValue(elems []Value) Value { return Value{Kind: ValArray, Array: OneDimArray(elems)} }
+
+// ArrayValueOf builds an array value from an already-shaped ArrayVal (spec/design/array.md §4).
+func ArrayValueOf(a *ArrayVal) Value { return Value{Kind: ValArray, Array: a} }
 
 // Float32Value builds a non-null float32 value from a Go float32 — the bits are stored verbatim
 // in Int (math.Float32bits, zero-extended), so -0.0 / NaN / ±Inf keep their original pattern
@@ -387,9 +421,10 @@ func (v Value) Render() string {
 		// quoted because it contains parens/commas).
 		return recordOut(*v.Comp)
 	case ValArray:
-		// An array renders as PG array_out: `{e1,e2,…}` with per-element quoting and an unquoted
-		// `NULL` for a null element (spec/design/array.md §7).
-		return arrayOut(*v.Array)
+		// An array renders as PG array_out: `{e1,e2,…}` (nested braces for a multidim value, an
+		// optional `[l:u]=` prefix when any lower bound ≠ 1), with per-element quoting and an
+		// unquoted `NULL` for a null element (spec/design/array.md §7).
+		return arrayOut(v.Array)
 	case ValUnfetched:
 		panic("BUG: unfetched large value escaped the storage layer")
 	default:
@@ -500,26 +535,51 @@ func (v Value) Eq3(o Value) ThreeValued {
 	// length and every element pair equal-or-both-NULL → TRUE, else FALSE. NULL elements are
 	// comparable and mutually equal, so the result is ALWAYS definite (never UNKNOWN).
 	if v.Kind == ValArray && o.Kind == ValArray {
-		return bool3(arrayEqual(*v.Array, *o.Array))
+		return bool3(arrayEqual(v.Array, o.Array))
 	}
 	return Unknown
 }
 
-// arrayEqual is PG array_eq (spec/design/array.md §5): same length and every element pair equal,
-// where two NULL elements are mutually equal (NOT 3VL). Always definite.
-func arrayEqual(a, b []Value) bool {
-	if len(a) != len(b) {
+// arrayEqual is PG array_eq (spec/design/array.md §5): same dimensionality AND lower bounds AND
+// every element pair equal, where two NULL elements are mutually equal (NOT 3VL). So [2:4]={1,2,3}
+// and {1,2,3} are not equal. Always definite.
+func arrayEqual(a, b *ArrayVal) bool {
+	if !intSliceEqual(a.Dims, b.Dims) || !int32SliceEqual(a.Lbounds, b.Lbounds) {
 		return false
 	}
-	for i := range a {
-		an, bn := a[i].Kind == ValNull, b[i].Kind == ValNull
+	for i := range a.Elements {
+		an, bn := a.Elements[i].Kind == ValNull, b.Elements[i].Kind == ValNull
 		if an != bn {
 			return false
 		}
 		if an {
 			continue // both NULL → equal
 		}
-		if a[i].Eq3(b[i]) != True {
+		if a.Elements[i].Eq3(b.Elements[i]) != True {
+			return false
+		}
+	}
+	return true
+}
+
+func intSliceEqual(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func int32SliceEqual(a, b []int32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
 	}
@@ -574,7 +634,7 @@ func (v Value) Lt3(o Value) ThreeValued {
 	// Array `<` uses the PG array_cmp total order (spec/design/array.md §5): element-wise, NULL
 	// sorts after every non-NULL (NULLs mutually equal), shorter prefix first. Always definite.
 	if v.Kind == ValArray && o.Kind == ValArray {
-		return bool3(arrayTotalCmp(*v.Array, *o.Array) < 0)
+		return bool3(arrayTotalCmp(v.Array, o.Array) < 0)
 	}
 	return Unknown
 }
@@ -623,7 +683,7 @@ func (v Value) Gt3(o Value) ThreeValued {
 	}
 	// Array `>` — the total-order mirror of `<` (spec/design/array.md §5).
 	if v.Kind == ValArray && o.Kind == ValArray {
-		return bool3(arrayTotalCmp(*v.Array, *o.Array) > 0)
+		return bool3(arrayTotalCmp(v.Array, o.Array) > 0)
 	}
 	return Unknown
 }
@@ -647,7 +707,7 @@ func (v Value) NotDistinctFrom(o Value) bool {
 	// Two arrays are "not distinct" iff structurally equal (the same btree equality as `=`; NULL
 	// elements are mutually equal — spec/design/array.md §5).
 	if v.Kind == ValArray && o.Kind == ValArray {
-		return arrayEqual(*v.Array, *o.Array)
+		return arrayEqual(v.Array, o.Array)
 	}
 	return v.Eq3(o) == True
 }
@@ -874,24 +934,43 @@ func recordFieldNeedsQuote(s string) bool {
 	return false
 }
 
-// arrayTotalCmp is the PG array_cmp total order over two arrays (spec/design/array.md §5): walk
-// element pairs; the first non-equal pair decides; if one array is a prefix of the other, the
-// shorter sorts first. NULL elements are comparable — NULL sorts AFTER every non-NULL and two NULLs
-// are equal (the NULLs-last total order). Always total/definite.
-func arrayTotalCmp(a, b []Value) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
+// arrayTotalCmp is the PG array_cmp total order over two arrays (spec/design/array.md §5): walk the
+// flattened element pairs (the first non-equal pair decides), then fewer total elements sorts first,
+// then smaller ndim, then per dimension smaller length and smaller lower bound. NULL elements are
+// comparable — NULL sorts AFTER every non-NULL and two NULLs are equal (the NULLs-last total order).
+// Always total/definite.
+func arrayTotalCmp(a, b *ArrayVal) int {
+	n := len(a.Elements)
+	if len(b.Elements) < n {
+		n = len(b.Elements)
 	}
 	for i := 0; i < n; i++ {
-		if c := elemTotalCmp(a[i], b[i]); c != 0 {
+		if c := elemTotalCmp(a.Elements[i], b.Elements[i]); c != 0 {
 			return c
 		}
 	}
+	if c := cmpInt(len(a.Elements), len(b.Elements)); c != 0 {
+		return c
+	}
+	if c := cmpInt(a.Ndim(), b.Ndim()); c != 0 {
+		return c
+	}
+	for d := 0; d < a.Ndim(); d++ {
+		if c := cmpInt(a.Dims[d], b.Dims[d]); c != 0 {
+			return c
+		}
+		if c := cmpInt(int(a.Lbounds[d]), int(b.Lbounds[d])); c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
+func cmpInt(a, b int) int {
 	switch {
-	case len(a) < len(b):
+	case a < b:
 		return -1
-	case len(a) > len(b):
+	case a > b:
 		return 1
 	default:
 		return 0
@@ -925,33 +1004,70 @@ func elemTotalCmp(x, y Value) int {
 // delimiter / brace / quote / backslash / whitespace. Inside the quotes PostgreSQL **backslash-
 // escapes** an embedded `"` → `\"` and `\` → `\\` (the contrast with record_out, which doubles).
 // The empty array renders `{}`. Equals PG byte-for-byte (CLAUDE.md §8).
-func arrayOut(elems []Value) string {
+func arrayOut(a *ArrayVal) string {
+	if len(a.Elements) == 0 {
+		return "{}" // the empty array (ndim 0)
+	}
 	var b strings.Builder
+	prefix := false
+	for _, lb := range a.Lbounds {
+		if lb != 1 {
+			prefix = true
+			break
+		}
+	}
+	if prefix {
+		for d := 0; d < a.Ndim(); d++ {
+			b.WriteByte('[')
+			b.WriteString(strconv.FormatInt(int64(a.Lbounds[d]), 10))
+			b.WriteByte(':')
+			b.WriteString(strconv.FormatInt(int64(a.Ubound(d)), 10))
+			b.WriteByte(']')
+		}
+		b.WriteByte('=')
+	}
+	cursor := 0
+	renderArrayDim(a, 0, &cursor, &b)
+	return b.String()
+}
+
+// renderArrayDim renders the brace structure for dimension d of a, consuming flattened elements via
+// cursor (the helper for arrayOut). The innermost dimension renders elements; outer dimensions recurse.
+func renderArrayDim(a *ArrayVal, d int, cursor *int, b *strings.Builder) {
 	b.WriteByte('{')
-	for i, e := range elems {
-		if i > 0 {
+	for k := 0; k < a.Dims[d]; k++ {
+		if k > 0 {
 			b.WriteByte(',')
 		}
-		if e.Kind == ValNull {
-			b.WriteString("NULL")
-			continue
-		}
-		s := e.Render()
-		if arrayElemNeedsQuote(s) {
-			b.WriteByte('"')
-			for _, ch := range s {
-				if ch == '"' || ch == '\\' {
-					b.WriteByte('\\')
-				}
-				b.WriteRune(ch)
-			}
-			b.WriteByte('"')
+		if d+1 == a.Ndim() {
+			renderArrayElem(a.Elements[*cursor], b)
+			*cursor++
 		} else {
-			b.WriteString(s)
+			renderArrayDim(a, d+1, cursor, b)
 		}
 	}
 	b.WriteByte('}')
-	return b.String()
+}
+
+// renderArrayElem renders one array element (PG array_out quoting; a NULL element is unquoted NULL).
+func renderArrayElem(e Value, b *strings.Builder) {
+	if e.Kind == ValNull {
+		b.WriteString("NULL")
+		return
+	}
+	s := e.Render()
+	if arrayElemNeedsQuote(s) {
+		b.WriteByte('"')
+		for _, ch := range s {
+			if ch == '"' || ch == '\\' {
+				b.WriteByte('\\')
+			}
+			b.WriteRune(ch)
+		}
+		b.WriteByte('"')
+	} else {
+		b.WriteString(s)
+	}
 }
 
 // arrayElemNeedsQuote reports whether an array_out element token must be double-quoted: the empty
@@ -970,124 +1086,296 @@ func arrayElemNeedsQuote(s string) bool {
 	return false
 }
 
-// parseArrayTokens is the PG array_in tokenizer (spec/design/array.md §7) — the inverse of
-// arrayOut. It splits the text of an array literal `{e1,e2,…}` into raw element tokens **without**
-// type coercion: the caller coerces each token to the element type. An element is quoted (`"…"`
-// with `\"`→`"` and `\\`→`\` un-escaping) or unquoted (read to the next top-level `,`/`}`,
-// surrounding whitespace trimmed, `\x`→`x`). An **unquoted** `NULL` (any case) is a NULL element (a
-// nil token); a quoted `"NULL"` is the 4-char string. `{}` (optionally with inner whitespace) is
-// the empty array. The second result is false on a malformed literal (→ 22P02).
-func parseArrayTokens(input string) ([]*string, bool) {
-	s := strings.TrimFunc(input, func(r rune) bool { return r <= 0x7F && asciiSpace(byte(r)) })
-	runes := []rune(s)
-	pos := 0
-	peek := func() (rune, bool) {
-		if pos < len(runes) {
-			return runes[pos], true
+// arrayInErr classifies why an array literal failed to parse (mapped by the caller to a SQLSTATE).
+type arrayInErr int
+
+const (
+	arrayOK        arrayInErr = iota // parsed cleanly
+	arrayMalformed                   // a malformed literal or mismatched declared dims → 22P02
+	arrayBoundFlip                   // a declared [l:u] with u<l → 2202E
+)
+
+// parsedArray is the structured result of parseArrayLiteral: the shape and the flattened row-major
+// element tokens (nil = a NULL element).
+type parsedArray struct {
+	Dims    []int
+	Lbounds []int32
+	Tokens  []*string
+}
+
+// arrNode is a parsed brace node: a leaf scalar token (Leaf, nil = the NULL token) or a braced level.
+type arrNode struct {
+	isLeaf   bool
+	leaf     *string
+	children []arrNode
+}
+
+// parseArrayLiteral is the PG array_in (spec/design/array.md §7) — the inverse of arrayOut. It parses
+// an optional dimension prefix `[l1:u1][l2:u2]…=`, then a (possibly nested) brace structure `{…}`,
+// returning the shape (Dims/Lbounds) and flattened row-major raw element tokens (without coercion).
+// An element is quoted (`"…"`, `\"`→`"`, `\\`→`\`) or unquoted (to the next top-level `,`/`}`,
+// whitespace trimmed, `\x`→`x`); an unquoted `NULL` (any case) is a NULL element (nil token), a
+// quoted `"NULL"` the 4-char string. `{}` is the empty array (ndim 0). A multidim literal must be
+// rectangular and, if a prefix is given, the contents must match the declared dimensions (else
+// arrayMalformed); a prefix with u<l is arrayBoundFlip.
+func parseArrayLiteral(input string) (*parsedArray, arrayInErr) {
+	runes := []rune(strings.TrimFunc(input, func(r rune) bool { return r <= 0x7F && asciiSpace(byte(r)) }))
+	p := &arrParser{runes: runes}
+
+	var prefixLb []int32
+	var prefixDims []int
+	if c, ok := p.peek(); ok && c == '[' {
+		for {
+			c, ok := p.peek()
+			if !ok || c != '[' {
+				break
+			}
+			p.i++ // [
+			lb, ok := p.parseInt()
+			if !ok {
+				return nil, arrayMalformed
+			}
+			if c, ok := p.peek(); !ok || c != ':' {
+				return nil, arrayMalformed
+			}
+			p.i++ // :
+			ub, ok := p.parseInt()
+			if !ok {
+				return nil, arrayMalformed
+			}
+			if c, ok := p.peek(); !ok || c != ']' {
+				return nil, arrayMalformed
+			}
+			p.i++ // ]
+			if ub < lb {
+				return nil, arrayBoundFlip
+			}
+			prefixLb = append(prefixLb, int32(lb))
+			prefixDims = append(prefixDims, int(ub-lb+1))
 		}
-		return 0, false
-	}
-	skipSpace := func() {
-		for pos < len(runes) && runes[pos] <= 0x7F && asciiSpace(byte(runes[pos])) {
-			pos++
+		if c, ok := p.peek(); !ok || c != '=' {
+			return nil, arrayMalformed
 		}
+		p.i++ // =
+		p.skipSpace()
 	}
-	if pos >= len(runes) || runes[pos] != '{' {
-		return nil, false
+
+	node, err := p.parseNode()
+	if err != arrayOK {
+		return nil, err
 	}
-	pos++ // '{'
-	var elems []*string
-	skipSpace()
-	if c, ok := peek(); ok && c == '}' {
-		pos++
-		if pos != len(runes) {
-			return nil, false
+	p.skipSpace()
+	if p.i != len(p.runes) {
+		return nil, arrayMalformed // trailing junk
+	}
+	if node.isLeaf {
+		return nil, arrayMalformed // a literal must start with a brace
+	}
+	// The bare top-level empty brace `{}` is the empty array (ndim 0).
+	if len(node.children) == 0 {
+		if len(prefixDims) != 0 {
+			return nil, arrayMalformed
 		}
-		return elems, true // empty array
+		return &parsedArray{}, arrayOK
+	}
+	dims, derr := nodeDims(node)
+	if derr != arrayOK {
+		return nil, derr
+	}
+	if len(dims) > 6 {
+		return nil, arrayMalformed
+	}
+	var tokens []*string
+	flattenNodes(node, &tokens)
+	lbounds := make([]int32, len(dims))
+	if len(prefixDims) == 0 {
+		for i := range lbounds {
+			lbounds[i] = 1
+		}
+	} else {
+		if !intSliceEqual(prefixDims, dims) {
+			return nil, arrayMalformed
+		}
+		lbounds = prefixLb
+	}
+	return &parsedArray{Dims: dims, Lbounds: lbounds, Tokens: tokens}, arrayOK
+}
+
+// arrParser is a rune-slice cursor for parseArrayLiteral.
+type arrParser struct {
+	runes []rune
+	i     int
+}
+
+func (p *arrParser) peek() (rune, bool) {
+	if p.i < len(p.runes) {
+		return p.runes[p.i], true
+	}
+	return 0, false
+}
+
+func (p *arrParser) skipSpace() {
+	for p.i < len(p.runes) && p.runes[p.i] <= 0x7F && asciiSpace(byte(p.runes[p.i])) {
+		p.i++
+	}
+}
+
+// parseInt parses a signed decimal integer (a dimension bound).
+func (p *arrParser) parseInt() (int64, bool) {
+	var b strings.Builder
+	if c, ok := p.peek(); ok && c == '-' {
+		b.WriteByte('-')
+		p.i++
 	}
 	for {
-		skipSpace()
-		var buf strings.Builder
-		quoted := false
-		if c, ok := peek(); ok && c == '"' {
-			quoted = true
-			pos++ // opening quote
-			for {
-				if pos >= len(runes) {
-					return nil, false // unterminated quoted element
-				}
-				c := runes[pos]
-				pos++
-				if c == '"' {
-					break // closing quote
-				}
-				if c == '\\' {
-					if pos >= len(runes) {
-						return nil, false
-					}
-					buf.WriteRune(runes[pos])
-					pos++
-					continue
-				}
-				buf.WriteRune(c)
-			}
-			skipSpace()
-		} else {
-			// Unquoted: read until a top-level `,`/`}`, processing `\x`→`x`.
-			for {
-				c, ok := peek()
-				if !ok {
-					return nil, false // missing '}'
-				}
-				if c == ',' || c == '}' {
-					break
-				}
-				if c == '\\' {
-					pos++
-					if pos >= len(runes) {
-						return nil, false
-					}
-					buf.WriteRune(runes[pos])
-					pos++
-					continue
-				}
-				buf.WriteRune(c)
-				pos++
-			}
-		}
-		if quoted {
-			str := buf.String()
-			elems = append(elems, &str)
-		} else {
-			trimmed := strings.TrimFunc(buf.String(), func(r rune) bool {
-				return r <= 0x7F && asciiSpace(byte(r))
-			})
-			if trimmed == "" {
-				return nil, false // a bare empty unquoted element is malformed (PG)
-			}
-			if strings.EqualFold(trimmed, "NULL") {
-				elems = append(elems, nil)
-			} else {
-				elems = append(elems, &trimmed)
-			}
-		}
-		if pos >= len(runes) {
-			return nil, false
-		}
-		c := runes[pos]
-		pos++
-		if c == ',' {
-			continue
-		}
-		if c == '}' {
+		c, ok := p.peek()
+		if !ok || c < '0' || c > '9' {
 			break
 		}
-		return nil, false
+		b.WriteRune(c)
+		p.i++
 	}
-	if pos != len(runes) {
-		return nil, false
+	n, err := strconv.ParseInt(b.String(), 10, 64)
+	if err != nil {
+		return 0, false
 	}
-	return elems, true
+	return n, true
+}
+
+// parseNode parses one element: a nested `{…}` (a braced level) or a scalar token (a leaf).
+func (p *arrParser) parseNode() (arrNode, arrayInErr) {
+	p.skipSpace()
+	if c, ok := p.peek(); ok && c == '{' {
+		p.i++ // {
+		p.skipSpace()
+		var children []arrNode
+		if c, ok := p.peek(); ok && c == '}' {
+			p.i++ // empty braces
+			return arrNode{children: children}, arrayOK
+		}
+		for {
+			child, err := p.parseNode()
+			if err != arrayOK {
+				return arrNode{}, err
+			}
+			children = append(children, child)
+			p.skipSpace()
+			c, ok := p.peek()
+			if !ok {
+				return arrNode{}, arrayMalformed
+			}
+			p.i++
+			if c == ',' {
+				continue
+			}
+			if c == '}' {
+				break
+			}
+			return arrNode{}, arrayMalformed
+		}
+		return arrNode{children: children}, arrayOK
+	}
+	tok, err := p.parseScalar()
+	if err != arrayOK {
+		return arrNode{}, err
+	}
+	return arrNode{isLeaf: true, leaf: tok}, arrayOK
+}
+
+// parseScalar parses one scalar token (quoted or unquoted); a nil token is the unquoted NULL token.
+func (p *arrParser) parseScalar() (*string, arrayInErr) {
+	var buf strings.Builder
+	if c, ok := p.peek(); ok && c == '"' {
+		p.i++ // opening quote
+		for {
+			c, ok := p.peek()
+			if !ok {
+				return nil, arrayMalformed // unterminated
+			}
+			p.i++
+			if c == '"' {
+				break
+			}
+			if c == '\\' {
+				c2, ok := p.peek()
+				if !ok {
+					return nil, arrayMalformed
+				}
+				buf.WriteRune(c2)
+				p.i++
+				continue
+			}
+			buf.WriteRune(c)
+		}
+		s := buf.String()
+		return &s, arrayOK
+	}
+	// Unquoted: read until a top-level `,`/`}`/`{`, processing `\x`→`x`.
+	for {
+		c, ok := p.peek()
+		if !ok {
+			return nil, arrayMalformed
+		}
+		if c == ',' || c == '}' || c == '{' {
+			break
+		}
+		if c == '\\' {
+			p.i++
+			c2, ok := p.peek()
+			if !ok {
+				return nil, arrayMalformed
+			}
+			buf.WriteRune(c2)
+			p.i++
+			continue
+		}
+		buf.WriteRune(c)
+		p.i++
+	}
+	trimmed := strings.TrimFunc(buf.String(), func(r rune) bool { return r <= 0x7F && asciiSpace(byte(r)) })
+	if trimmed == "" {
+		return nil, arrayMalformed // a bare empty unquoted element is malformed (PG)
+	}
+	if strings.EqualFold(trimmed, "NULL") {
+		return nil, arrayOK // the NULL token
+	}
+	return &trimmed, arrayOK
+}
+
+// nodeDims returns the dimensions of a parsed brace node (recursing). All sub-arrays at a level must
+// share the same shape and kind — a mismatch (including a leaf-vs-array mix) is a malformed literal.
+func nodeDims(node arrNode) ([]int, arrayInErr) {
+	if node.isLeaf {
+		return nil, arrayOK
+	}
+	if len(node.children) == 0 {
+		return nil, arrayMalformed // a nested empty brace is not a valid sub-array
+	}
+	child0, err := nodeDims(node.children[0])
+	if err != arrayOK {
+		return nil, err
+	}
+	for _, c := range node.children[1:] {
+		cd, err := nodeDims(c)
+		if err != arrayOK {
+			return nil, err
+		}
+		if !intSliceEqual(cd, child0) {
+			return nil, arrayMalformed
+		}
+	}
+	return append([]int{len(node.children)}, child0...), arrayOK
+}
+
+// flattenNodes collects the leaf tokens of a parsed brace node in row-major order (left-to-right DFS).
+func flattenNodes(node arrNode, out *[]*string) {
+	if node.isLeaf {
+		*out = append(*out, node.leaf)
+		return
+	}
+	for _, c := range node.children {
+		flattenNodes(c, out)
+	}
 }
 
 // --- boolean Value <-> ThreeValued bridges, and the Kleene connectives ----------

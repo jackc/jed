@@ -128,12 +128,13 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
             }
             b':' => {
                 // `::` is the PostgreSQL typecast operator (grammar.md §37), scanned greedily as
-                // one token. A lone `:` is not part of jed's surface — a 42601 syntax error.
+                // one token; a lone `:` is the array-slice separator `a[m:n]` (array.md §6).
                 if bytes.get(i + 1) == Some(&b':') {
                     tokens.push(Token::DoubleColon);
                     i += 2;
                 } else {
-                    return Err(syntax("unexpected character ':'".to_string()));
+                    tokens.push(Token::Colon);
+                    i += 1;
                 }
             }
             b'=' => {
