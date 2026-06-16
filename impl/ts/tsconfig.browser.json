@@ -1,0 +1,13 @@
+{
+  // Type-check the main-thread browser-host client (src/browser/client.ts) + the demo entry, with the
+  // DOM lib for Worker/MessageEvent and NO Node types (the browser bundle has no Node globals). The
+  // worker itself (WebWorker lib, conflicting globals) is checked separately by tsconfig.worker.json.
+  // Vite does the actual transpile/bundle; this config is type-safety only, matching the no-emit model.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "types": []
+  },
+  "include": ["src/browser/client.ts", "browser/**/*.ts"],
+  "exclude": ["src/browser/worker.ts"]
+}

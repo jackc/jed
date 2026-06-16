@@ -1,0 +1,13 @@
+{
+  // Type-check the engine-in-Worker module (src/browser/worker.ts) with the WebWorker lib (self,
+  // postMessage, MessageEvent, the worker's crypto) and NO Node types. Separate from
+  // tsconfig.browser.json because the DOM and WebWorker libs declare conflicting globals and cannot be
+  // combined in one program. Type-safety only; Vite transpiles for the actual run.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["esnext", "webworker"],
+    "types": []
+  },
+  "include": ["src/browser/worker.ts"],
+  "exclude": []
+}

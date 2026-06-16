@@ -18,5 +18,9 @@
     "noUncheckedIndexedAccess": false,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "tests/**/*.ts"],
+  // The browser-host modules (src/browser/**) use WebWorker/DOM globals (self, Worker, MessageEvent),
+  // not Node globals, so they are type-checked by tsconfig.browser.json / tsconfig.worker.json instead.
+  // The node-clean engine modules they import (opfs.ts, executor.ts, …) stay covered here.
+  "exclude": ["src/browser/**"]
 }
