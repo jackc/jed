@@ -2523,4 +2523,15 @@ pub const SET_RETURNING: &[SetReturningDesc] = &[
         null: "empty_on_null",
         errors: &["22023"],
     },
+    SetReturningDesc {
+        name: "unnest",
+        surface: "unnest",
+        arity: 1,
+        arg_families: &["anyarray"],
+        arg_resolution: "none",
+        result: "set_of_element",
+        column: "unnest",
+        null: "empty_on_null",
+        errors: &[],
+    },
 ];

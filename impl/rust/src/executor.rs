@@ -3088,17 +3088,17 @@ impl Database {
             .chain(sel.joins.iter().map(|j| &j.table))
             .collect();
         let mut synthetic: Vec<Box<Table>> = Vec::new();
-        // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, result))` = an SRF.
-        let mut srf_meta: Vec<Option<(usize, Vec<RExpr>, ScalarType)>> =
+        // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, kind))` = an SRF.
+        let mut srf_meta: Vec<Option<(usize, Vec<RExpr>, SrfKind)>> =
             Vec::with_capacity(from_items.len());
         for tref in &from_items {
             match &tref.args {
                 None => srf_meta.push(None),
                 Some(args) => {
-                    let (table, rargs, result) =
+                    let (table, rargs, kind) =
                         self.resolve_srf(&tref.name, args, tref.alias.as_deref(), parent, ptypes)?;
                     synthetic.push(table);
-                    srf_meta.push(Some((synthetic.len() - 1, rargs, result)));
+                    srf_meta.push(Some((synthetic.len() - 1, rargs, kind)));
                 }
             }
         }
@@ -3330,7 +3330,7 @@ impl Database {
         // so the plan outlives the scope and a correlated subquery can re-execute it per row).
         let mut srf_plans: Vec<Option<SrfPlan>> = srf_meta
             .into_iter()
-            .map(|m| m.map(|(_, args, _result)| SrfPlan { args }))
+            .map(|m| m.map(|(_, args, kind)| SrfPlan { kind, args }))
             .collect();
         let rels: Vec<PlanRel> = scope
             .rels
@@ -3401,17 +3401,15 @@ impl Database {
         })
     }
 
-    /// Resolve a FROM-clause set-returning function call (`generate_series(...)`) into a
-    /// **synthetic one-column relation** plus its resolved argument expressions and produced
-    /// column type (spec/design/functions.md §10). Only `generate_series` exists this slice
-    /// (any other name → `42883`), with 2 or 3 integer args (a wrong arity/type → `42883`).
-    /// Non-LATERAL: the args resolve against an EMPTY-local-rels scope whose `parent` is the
-    /// enclosing query, so `$N` and correlated outer columns resolve while a sibling FROM table
-    /// does not (42703/42P01). The produced column is typed at the PROMOTED integer type of the
-    /// args (PG); a NULL-typed arg contributes no width (the call yields zero rows at exec). Its
-    /// NAME follows PostgreSQL's single-column function-alias rule: the table alias when one is
-    /// given (`generate_series(1,5) AS g` ⇒ column `g`), else the function name `generate_series`.
-    /// Returns `(synthetic table, resolved args, result type)`.
+    /// Resolve a FROM-clause set-returning function call into a **synthetic one-column relation**
+    /// plus its resolved argument expressions and the [`SrfKind`] selecting its generator
+    /// (spec/design/functions.md §10, array-functions.md §9). Two SRFs exist: `generate_series`
+    /// (2/3 integer args) and the polymorphic `unnest(anyarray)` (1 array arg); any other name →
+    /// `42883`. Non-LATERAL: the args resolve against an EMPTY-local-rels scope whose `parent` is
+    /// the enclosing query, so `$N` and correlated outer columns resolve while a sibling FROM table
+    /// does not (42703/42P01). The produced column's NAME follows PostgreSQL's single-column
+    /// function-alias rule: the table alias when one is given (`unnest(xs) AS g` ⇒ column `g`),
+    /// else the function name. Returns `(synthetic table, resolved args, kind)`.
     fn resolve_srf(
         &self,
         name: &str,
@@ -3419,16 +3417,7 @@ impl Database {
         alias: Option<&str>,
         parent: Option<&Scope>,
         ptypes: &mut ParamTypes,
-    ) -> Result<(Box<Table>, Vec<RExpr>, ScalarType)> {
-        if !name.eq_ignore_ascii_case("generate_series") {
-            return Err(EngineError::new(
-                SqlState::UndefinedFunction,
-                format!("function does not exist: {name}"),
-            ));
-        }
-        if args.len() != 2 && args.len() != 3 {
-            return Err(no_func_overload("generate_series"));
-        }
+    ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
         // The args see only params/outer — never sibling FROM tables (non-LATERAL).
         let arg_scope = Scope {
             rels: Vec::new(),
@@ -3436,13 +3425,37 @@ impl Database {
             catalog: self,
             allow_subquery: true,
         };
+        if name.eq_ignore_ascii_case("generate_series") {
+            return self.resolve_generate_series(args, alias, &arg_scope, ptypes);
+        }
+        if name.eq_ignore_ascii_case("unnest") {
+            return self.resolve_unnest(args, alias, &arg_scope, ptypes);
+        }
+        Err(EngineError::new(
+            SqlState::UndefinedFunction,
+            format!("function does not exist: {name}"),
+        ))
+    }
+
+    /// Resolve `generate_series(start, stop[, step])` (spec/design/functions.md §10): 2 or 3
+    /// integer args (a wrong arity/type → `42883`). The produced column is typed at the PROMOTED
+    /// integer type of the args (PG); a NULL-typed arg contributes no width (the call yields zero
+    /// rows at exec). All-NULL defaults int64.
+    fn resolve_generate_series(
+        &self,
+        args: &[Expr],
+        alias: Option<&str>,
+        arg_scope: &Scope,
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
+        if args.len() != 2 && args.len() != 3 {
+            return Err(no_func_overload("generate_series"));
+        }
         let mut rargs = Vec::with_capacity(args.len());
-        // The produced column's type is the promoted width of the integer args; a NULL-typed arg
-        // (a bare/typed NULL or untyped $N) adapts and contributes none. All-NULL defaults int64.
         let mut result: Option<ScalarType> = None;
         for a in args {
             let (r, t) = resolve(
-                &arg_scope,
+                arg_scope,
                 a,
                 Some(ScalarType::Int64),
                 &mut AggCtx::Forbidden,
@@ -3461,26 +3474,35 @@ impl Database {
             rargs.push(r);
         }
         let result = result.unwrap_or(ScalarType::Int64);
-        // PG's single-column function-alias rule: the column takes the table alias when one is
-        // given, else the function name. The table's `name` stays the function name (the
-        // un-aliased label fallback).
-        let col_name = alias.unwrap_or("generate_series").to_string();
-        let table = Box::new(Table {
-            name: "generate_series".to_string(),
-            columns: vec![Column {
-                name: col_name,
-                ty: Type::Scalar(result),
-                decimal: None,
-                primary_key: false,
-                not_null: false,
-                default: None,
-                default_expr: None,
-            }],
-            pk: Vec::new(),
-            checks: Vec::new(),
-            indexes: Vec::new(),
-        });
-        Ok((table, rargs, result))
+        let table = srf_table("generate_series", alias, Type::Scalar(result));
+        Ok((table, rargs, SrfKind::GenerateSeries))
+    }
+
+    /// Resolve `unnest(anyarray)` (spec/design/array-functions.md §9): the single argument must be
+    /// an array (binding `ELEM` := its element type, the produced column's type), else `42883`
+    /// (a non-array, e.g. `unnest(5)`). A bare untyped `NULL` argument leaves `ELEM` undeterminable
+    /// → `42P18` (jed's polymorphic posture, exactly like `array_append(NULL, NULL)`); a *typed*
+    /// NULL array (`NULL::int32[]`) resolves and yields zero rows at exec. Arrays hold scalar
+    /// elements this slice (array-of-composite is deferred), so `ELEM` is a scalar.
+    fn resolve_unnest(
+        &self,
+        args: &[Expr],
+        alias: Option<&str>,
+        arg_scope: &Scope,
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
+        if args.len() != 1 {
+            return Err(no_func_overload("unnest"));
+        }
+        let (rarg, t) = resolve(arg_scope, &args[0], None, &mut AggCtx::Forbidden, ptypes)?;
+        let elem_st = match t {
+            ResolvedType::Array(elem) => elem_scalar_hint(&elem)
+                .expect("array element is a scalar (array-of-composite is deferred)"),
+            ResolvedType::Null => return Err(indeterminate_poly()),
+            _ => return Err(no_func_overload("unnest")),
+        };
+        let table = srf_table("unnest", alias, Type::Scalar(elem_st));
+        Ok((table, vec![rarg], SrfKind::Unnest))
     }
 
     /// Generate the rows of a `generate_series(start, stop[, step])` FROM-clause source
@@ -3536,6 +3558,30 @@ impl Database {
                 Some(next) => cur = next,
                 None => break,
             }
+        }
+        Ok(out)
+    }
+
+    /// Generate the rows of an `unnest(anyarray)` FROM-clause source (spec/design/array-functions.md
+    /// §9), as a `Vec` of one-column rows. The single array argument evaluates ONCE against the
+    /// outer environment with an empty local row (non-LATERAL). PostgreSQL semantics: a **NULL
+    /// array** yields zero rows; the **empty array** `{}` yields zero rows; otherwise one row per
+    /// element in **flattened row-major order** (a multidimensional array flattens; a NULL element
+    /// is produced as a NULL row). Each produced element charges one `generated_row` AT THE SOURCE,
+    /// guarded so a `max_cost` ceiling aborts a runaway unnest (54P01) mid-generation, exactly like
+    /// `generate_series` (CLAUDE.md §13).
+    fn unnest_rows(&self, srf: &SrfPlan, env: &EvalEnv, meter: &mut Meter) -> Result<Vec<Row>> {
+        let arr = match srf.args[0].eval(&[], env, meter)? {
+            // A NULL array → zero rows (PG; the `empty_on_null` discipline).
+            Value::Null => return Ok(Vec::new()),
+            Value::Array(a) => a,
+            _ => unreachable!("the resolver restricts unnest's argument to an array"),
+        };
+        let mut out: Vec<Row> = Vec::with_capacity(arr.elements.len());
+        for e in arr.elements {
+            meter.guard()?;
+            meter.charge(COSTS.generated_row);
+            out.push(vec![e]);
         }
         Ok(out)
     }
@@ -3811,7 +3857,10 @@ impl Database {
             // A set-returning relation is generated, not scanned (functions.md §10): produce its
             // rows (charging generated_row per element) and feed them into the same join pipeline.
             if let Some(srf) = &rel.srf {
-                let table_rows = self.generate_series_rows(srf, &env, &mut meter)?;
+                let table_rows = match srf.kind {
+                    SrfKind::GenerateSeries => self.generate_series_rows(srf, &env, &mut meter)?,
+                    SrfKind::Unnest => self.unnest_rows(srf, &env, &mut meter)?,
+                };
                 materialized.push(table_rows);
                 continue;
             }
@@ -5085,13 +5134,49 @@ struct PlanRel {
     srf: Option<SrfPlan>,
 }
 
-/// A resolved set-returning-function row source (spec/design/functions.md §10). The first SRF is
-/// `generate_series`, so the single shape is `args = [start, stop]` or `[start, stop, step]` —
-/// non-LATERAL, so each arg evaluates against the params/outer environment with no local row.
-/// The produced column's promoted integer type lives on the synthetic relation (built in
-/// `resolve_srf`), so the plan needs only the resolved arg expressions here.
+/// Which set-returning function a [`SrfPlan`] is, selecting the row generator at exec
+/// (spec/design/functions.md §10, array-functions.md §9). The dispatch is hand-written per core;
+/// the resolution narrows the catalog name to one of these.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SrfKind {
+    /// `generate_series(start, stop[, step])` — an integer series (functions.md §10).
+    GenerateSeries,
+    /// `unnest(anyarray)` — one row per array element, flattened row-major (array-functions.md §9).
+    Unnest,
+}
+
+/// A resolved set-returning-function row source (spec/design/functions.md §10, array-functions.md
+/// §9). `kind` selects the generator: `generate_series(start, stop[, step])` (`args` = 2 or 3
+/// integers) or `unnest(anyarray)` (`args` = the single array expression). Non-LATERAL, so each
+/// arg evaluates against the params/outer environment with no local row. The produced column's
+/// type lives on the synthetic relation (built in `resolve_srf`), so the plan needs only the
+/// resolved arg expressions here.
 struct SrfPlan {
+    kind: SrfKind,
     args: Vec<RExpr>,
+}
+
+/// Build a set-returning function's **synthetic one-column relation** (spec/design/functions.md
+/// §10). The table's `name` is the function name (the un-aliased label fallback); the lone column's
+/// NAME follows PostgreSQL's single-column function-alias rule — the table alias when one is given,
+/// else the function name — and its TYPE is `col_ty` (the promoted integer for `generate_series`,
+/// the bound element type for `unnest`).
+fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
+    Box::new(Table {
+        name: func_name.to_string(),
+        columns: vec![Column {
+            name: alias.unwrap_or(func_name).to_string(),
+            ty: col_ty,
+            decimal: None,
+            primary_key: false,
+            not_null: false,
+            default: None,
+            default_expr: None,
+        }],
+        pk: Vec::new(),
+        checks: Vec::new(),
+        indexes: Vec::new(),
+    })
 }
 
 /// One join in a SELECT plan: its kind and resolved ON predicate (`None` for CROSS). The right

@@ -1,0 +1,172 @@
+# unnest — the polymorphic set-returning function (AF3, spec/design/array-functions.md §9), the
+# engine's second SRF after generate_series. unnest(anyarray) is a FROM-clause row source
+# (functions.md §10, grammar.md §35) that EXPANDS an array into one row per element: the anyarray
+# argument binds ELEM := its element type and the produced one-column relation (named after the
+# alias, else `unnest`) is typed at ELEM. One row per element in FLATTENED ROW-MAJOR order — a
+# multidimensional array flattens, a NULL element is produced as a NULL row, and the empty array {}
+# and a NULL array argument each yield ZERO rows (the empty_on_null discipline). It composes with
+# WHERE / ORDER BY / LIMIT / cross-join exactly as generate_series does, is non-LATERAL (args see
+# $N / a correlated OUTER column, not a sibling FROM table), and charges one generated_row per
+# produced element (spec/design/cost.md §3) — so a query's cost is the generated rows plus the
+# usual evaluation + row_produced, and a max_cost ceiling bounds a runaway unnest (54P01). A
+# non-array argument is 42883. PostgreSQL-oracle-verified (postgres:18). The ARRAY[…] literal args
+# default to int64 (jed's literal typing), so those columns are int64 — value-identical to PG's
+# int4/int8; the '{…}'::int32[] form pins int32. The SELECT-list SRF position, LATERAL, the
+# column-alias-list form, and a bare untyped NULL (42P18) are out of scope (array-functions.md §6).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.set_returning, func.unnest, func.array, query.order_by, query.limit, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, query.comparison_order, expr.comparison_value, types.int32, types.int64, types.text, types.array, types.array_multidim, resource.cost_metering
+
+# --- the basic case: one column named unnest, one row per element ---------------------
+# The ARRAY[…] constructor is one operator_eval; 3 generated_row + 3 row_produced.
+# names: unnest
+# types: int64
+# cost: 7
+query I rowsort
+SELECT * FROM unnest(ARRAY[10,20,30])
+----
+10
+20
+30
+
+# --- a typed '{…}'::int32[] literal pins the element type (and is a const, no operator_eval) ----
+# 3 generated_row + 3 row_produced.
+# types: int32
+# cost: 6
+query I rowsort
+SELECT * FROM unnest('{1,2,3}'::int32[])
+----
+1
+2
+3
+
+# --- NULL elements are produced as NULL rows (NULLS LAST under ORDER BY) ----------------
+# A non-NULL array containing a NULL element is unnested element-wise; the NULL element is a row.
+# cost: 7
+query I nosort
+SELECT * FROM unnest(ARRAY[1,NULL,3]) AS u ORDER BY u
+----
+1
+3
+NULL
+
+# --- the empty array {} yields ZERO rows -----------------------------------------------
+# cost: 0
+query I rowsort
+SELECT * FROM unnest('{}'::int32[])
+----
+
+# --- a NULL array argument yields ZERO rows (the empty_on_null discipline) --------------
+# cost: 0
+query I rowsort
+SELECT * FROM unnest(NULL::int32[])
+----
+
+# --- a multidimensional array flattens in row-major order ------------------------------
+# ARRAY[ARRAY[1,2],ARRAY[3,4]] is one 2×2 value; unnest flattens to 4 rows. 3 ARRAY constructors
+# (the outer + 2 inner) = 3 operator_eval + 4 generated_row + 4 row_produced.
+# cost: 11
+query I nosort
+SELECT * FROM unnest(ARRAY[ARRAY[1,2],ARRAY[3,4]]) AS u ORDER BY u
+----
+1
+2
+3
+4
+
+# --- a custom lower bound is flattened away (unnest ignores lbounds) --------------------
+# cost: 6
+query I nosort
+SELECT * FROM unnest('[5:7]={10,20,30}'::int32[]) AS u ORDER BY u
+----
+10
+20
+30
+
+# --- a text[] element type: the produced column is text --------------------------------
+# cost: 7
+query T nosort
+SELECT * FROM unnest(ARRAY['a','b','c']) AS u ORDER BY u
+----
+a
+b
+c
+
+# --- alias + qualified column reference ------------------------------------------------
+# PG's single-column function-alias rule: `AS g` renames the output column to `g`, so `g.g`
+# resolves (and `g.unnest` would be 42703 — there is no such column).
+# names: g
+# cost: 7
+query I rowsort
+SELECT g.g FROM unnest(ARRAY[10,20,30]) AS g ORDER BY g.g
+----
+10
+20
+30
+
+# --- WHERE over the produced rows ------------------------------------------------------
+# 1 ARRAY operator_eval + 5 generated_row + 5 operator_eval (the `>` per row) + 3 row_produced.
+# cost: 14
+query I nosort
+SELECT * FROM unnest(ARRAY[1,2,3,4,5]) AS u WHERE u > 2 ORDER BY u
+----
+3
+4
+5
+
+# --- ORDER BY DESC + LIMIT over the produced rows (the SRF takes the eager path) --------
+# 1 ARRAY operator_eval + 4 generated_row + 2 row_produced (the sort/limit are unmetered).
+# cost: 7
+query I nosort
+SELECT * FROM unnest(ARRAY[10,20,30,40]) AS u ORDER BY u DESC LIMIT 2
+----
+40
+30
+
+# --- CROSS JOIN with a base table: the unnested array is one operand of the product -----
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])
+
+statement ok
+INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')
+
+# id-keyed scan of t (page_read + 4 storage_row_read) + 2 generated_row + 8 row_produced.
+# names: id, u
+# cost: 15
+query II nosort
+SELECT t.id, u FROM t CROSS JOIN unnest('{7,8}'::int32[]) AS u ORDER BY t.id, u
+----
+1
+7
+1
+8
+2
+7
+2
+8
+3
+7
+3
+8
+4
+7
+4
+8
+
+# --- a correlated OUTER column as the argument (non-LATERAL): per-row cardinality -------
+# unnest(o.xs) sees the enclosing row's array column; a NULL or empty array contributes zero rows.
+# names: id, n
+# cost: 23
+query II nosort
+SELECT id, (SELECT count(*) FROM unnest(o.xs)) AS n FROM t o ORDER BY id
+----
+1
+2
+2
+1
+3
+0
+4
+0
+
+# --- a non-array argument is undefined_function --------------------------------------
+statement error 42883
+SELECT * FROM unnest(5)

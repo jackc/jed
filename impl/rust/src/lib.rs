@@ -89,6 +89,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
     // (array_append/prepend/cat).
     "func.array",
+    // Array function surface AF3 (array-functions.md §9): the polymorphic SRF unnest(anyarray) — a
+    // FROM-clause row source expanding an array into one row per element (functions.md §10).
+    "func.unnest",
     // NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
     "ddl.not_null",
     // DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

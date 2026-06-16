@@ -2452,4 +2452,15 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     null: "empty_on_null",
     errors: ["22023"],
   },
+  {
+    name: "unnest",
+    surface: "unnest",
+    arity: 1,
+    argFamilies: ["anyarray"],
+    argResolution: "none",
+    result: "set_of_element",
+    column: "unnest",
+    null: "empty_on_null",
+    errors: [],
+  },
 ];

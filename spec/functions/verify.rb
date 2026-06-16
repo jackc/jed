@@ -84,9 +84,13 @@ AGG_REQUIRED_FIELDS  = %w[name kind surface arg result null errors].freeze
 
 # Set-returning functions (kind = "set_returning") use a distinct field set and validation
 # branch — they expand args into a row set, fitting neither operator nor aggregate (functions.md
-# §10). `result` accepts a scalar id or the reserved set id; `null` is the single "empty_on_null"
-# discipline; the uniqueness key is (name, arity).
-RESERVED_SRF_RESULTS = %w[set_of_promoted].to_set
+# §10). `result` accepts a scalar id or a reserved set id; `null` is the single "empty_on_null"
+# discipline; the uniqueness key is (name, arity). An SRF arg_family may also be a polymorphic
+# pseudo-family (anyarray/anyelement — unnest, array-functions.md §2), interpreted by the
+# hand-written resolver exactly as for the array functions. The reserved set results:
+#   set_of_promoted — a row set of one column at the promoted integer type of the args (generate_series).
+#   set_of_element  — a row set of one column at the ELEM bound from the anyarray arg (unnest).
+RESERVED_SRF_RESULTS = %w[set_of_promoted set_of_element].to_set
 SRF_NULL_BEHAVIORS   = %w[empty_on_null].to_set
 SRF_REQUIRED_FIELDS  = %w[name kind surface arity arg_families arg_resolution result column null errors].freeze
 
@@ -293,6 +297,9 @@ def main
     fail!("set_returning #{id}: arity #{sf['arity']} != arg_families length #{args.length}") unless sf["arity"] == args.length
     args.each do |fam|
       next if fam == "any"
+      # A polymorphic pseudo-family (anyarray/anyelement) is interpreted by the hand-written
+      # resolver, not a real family in scalars.toml (unnest, array-functions.md §2).
+      next if POLYMORPHIC_FAMILIES.include?(fam)
       fail!("set_returning #{id}: arg family #{fam.inspect} is not a family in scalars.toml") unless families.include?(fam)
     end
 

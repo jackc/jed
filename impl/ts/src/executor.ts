@@ -2525,11 +2525,20 @@ export class Database {
   // PostgreSQL's single-column function-alias rule: the table alias when one is given
   // (generate_series(1,5) AS g ⇒ column g), else the function name generate_series.
   private resolveSRF(name: string, args: Expr[], alias: string | null, parent: Scope | null, ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
-    if (name.toLowerCase() !== "generate_series") {
-      throw engineError("undefined_function", "function does not exist: " + name);
-    }
-    if (args.length !== 2 && args.length !== 3) throw noFuncOverload("generate_series");
+    // The args see only params/outer — never sibling FROM tables (non-LATERAL).
     const argScope = new Scope([], this, parent, true);
+    const lname = name.toLowerCase();
+    if (lname === "generate_series") return this.resolveGenerateSeries(args, alias, argScope, ptypes);
+    if (lname === "unnest") return this.resolveUnnest(args, alias, argScope, ptypes);
+    throw engineError("undefined_function", "function does not exist: " + name);
+  }
+
+  // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
+  // §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
+  // PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
+  // int64.
+  private resolveGenerateSeries(args: Expr[], alias: string | null, argScope: Scope, ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
+    if (args.length !== 2 && args.length !== 3) throw noFuncOverload("generate_series");
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const rargs: RExpr[] = [];
     let result: ScalarType | null = null;
@@ -2544,19 +2553,28 @@ export class Database {
       }
       rargs.push(node);
     }
-    const colType: ScalarType = result ?? "int64";
-    // PG's single-column function-alias rule: the column takes the table alias when one is given,
-    // else the function name. The table's name stays the function name (the un-aliased label
-    // fallback).
-    const colName = alias ?? "generate_series";
-    const table: Table = {
-      name: "generate_series",
-      columns: [{ name: colName, type: scalarT(colType), decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null }],
-      pk: [],
-      checks: [],
-      indexes: [],
-    };
-    return { table, srf: { args: rargs } };
+    const table = srfTable("generate_series", alias, scalarT(result ?? "int64"));
+    return { table, srf: { kind: "generate_series", args: rargs } };
+  }
+
+  // resolveUnnest resolves unnest(anyarray) (spec/design/array-functions.md §9): the single argument
+  // must be an array (binding ELEM := its element type, the produced column's type), else 42883 (a
+  // non-array, e.g. unnest(5)). A bare untyped NULL argument leaves ELEM undeterminable → 42P18
+  // (jed's polymorphic posture, like array_append(NULL, NULL)); a typed NULL array (NULL::int32[])
+  // resolves and yields zero rows at exec. Arrays hold scalar elements this slice (array-of-composite
+  // is deferred), so ELEM is a scalar.
+  private resolveUnnest(args: Expr[], alias: string | null, argScope: Scope, ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
+    if (args.length !== 1) throw noFuncOverload("unnest");
+    const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const { node, type } = resolve(argScope, args[0]!, null, forbidden, ptypes);
+    if (type.kind === "array") {
+      const elemST = elemScalarHint(type.elem);
+      if (elemST === null) throw new Error("array element is a scalar (array-of-composite is deferred)");
+      const table = srfTable("unnest", alias, scalarT(elemST));
+      return { table, srf: { kind: "unnest", args: [node] } };
+    }
+    if (type.kind === "null") throw indeterminatePoly();
+    throw noFuncOverload("unnest");
   }
 
   // generateSeriesRows generates the rows of a generate_series(start, stop[, step]) FROM-clause
@@ -2593,6 +2611,26 @@ export class Database {
       const next = cur + step;
       if (next > 9223372036854775807n || next < -9223372036854775808n) break;
       cur = next;
+    }
+    return out;
+  }
+
+  // unnestRows generates the rows of an unnest(anyarray) FROM-clause source (spec/design/array-functions.md
+  // §9), as one-column rows. The single array argument evaluates ONCE against the outer environment with no
+  // local row (non-LATERAL). PostgreSQL semantics: a NULL array yields zero rows; the empty array {} yields
+  // zero rows; otherwise one row per element in flattened row-major order (a multidimensional array flattens;
+  // a NULL element is produced as a NULL row). Each produced element charges one generatedRow AT THE SOURCE,
+  // guarded so a maxCost ceiling aborts a runaway unnest (54P01) mid-generation, exactly like generate_series.
+  private unnestRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
+    const v = evalExpr(srf.args[0]!, [], env, meter);
+    // A NULL array → zero rows (PG; the empty_on_null discipline).
+    if (v.kind === "null") return [];
+    if (v.kind !== "array") throw new Error("the resolver restricts unnest's argument to an array");
+    const out: Row[] = [];
+    for (const e of v.elements) {
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      out.push([e]);
     }
     return out;
   }
@@ -2796,7 +2834,9 @@ export class Database {
       // A set-returning relation is generated, not scanned (functions.md §10): produce its rows
       // (charging generated_row per element) and feed them into the same join pipeline.
       if (rel.srf !== undefined) {
-        return this.generateSeriesRows(rel.srf, env, meter);
+        return rel.srf.kind === "unnest"
+          ? this.unnestRows(rel.srf, env, meter)
+          : this.generateSeriesRows(rel.srf, env, meter);
       }
       const store = this.readSnap().store(rel.tableName);
       let rows: Row[];
@@ -4009,11 +4049,33 @@ type ArrayFuncName =
 // the rows instead of scanning (spec/design/functions.md §10).
 type PlanRel = { tableName: string; offset: number; colCount: number; srf?: SrfPlan };
 
-// SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10). The
-// first SRF is generate_series, so args is [start, stop] or [start, stop, step] — non-LATERAL, so
-// each arg evaluates against the params/outer environment with no local row. The produced
-// column's promoted integer type lives on the synthetic relation (built in resolveSRF).
-type SrfPlan = { args: RExpr[] };
+// SrfKind selects which set-returning function an SrfPlan is, picking the row generator at exec
+// (spec/design/functions.md §10, array-functions.md §9). The dispatch is hand-written per core.
+//   "generate_series" — generate_series(start, stop[, step]), an integer series (functions.md §10).
+//   "unnest"          — unnest(anyarray), one row per array element, flattened (array-functions.md §9).
+type SrfKind = "generate_series" | "unnest";
+
+// SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
+// array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
+// 2 or 3 integers) or unnest(anyarray) (args = the single array expression). Non-LATERAL, so each
+// arg evaluates against the params/outer environment with no local row. The produced column's type
+// lives on the synthetic relation (built in resolveSRF).
+type SrfPlan = { kind: SrfKind; args: RExpr[] };
+
+// srfTable builds a set-returning function's SYNTHETIC one-column relation (spec/design/functions.md
+// §10). The table's name is the function name (the un-aliased label fallback); the lone column's
+// NAME follows PostgreSQL's single-column function-alias rule — the table alias when one is given,
+// else the function name — and its TYPE is colTy (the promoted integer for generate_series, the
+// bound element type for unnest).
+function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
+  return {
+    name: funcName,
+    columns: [{ name: alias ?? funcName, type: colTy, decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null }],
+    pk: [],
+    checks: [],
+    indexes: [],
+  };
+}
 
 // PlanJoin is one join in a SELECT plan: its kind and resolved ON predicate (null for CROSS). The
 // right relation is rels[k+1].

@@ -22,6 +22,10 @@ ORDER BY category;`;
 FROM product
 WHERE price > 4
 ORDER BY price DESC;`;
+
+	const unnestExample = `SELECT u AS tag
+FROM unnest(ARRAY['red', 'green', 'blue']) AS u
+ORDER BY u;`;
 </script>
 
 <svelte:head>
@@ -42,6 +46,18 @@ Grouping and aggregation:
 Filtering and ordering — edit the `WHERE` and `ORDER BY` and re-run:
 
 <LiveSql {seed} query={filtered} rows={6} />
+
+## Set-returning functions in `FROM`
+
+A `FROM` item can be a set-returning function — a computed row source instead of a stored table.
+`generate_series(start, stop[, step])` yields an integer series; `unnest(anyarray)` expands an array
+into one row per element (a multidimensional array flattens, a `NULL` element becomes a `NULL` row,
+and a `NULL` or empty array yields no rows). The produced relation has one column, named after the
+function or its alias, and composes with `WHERE` / `ORDER BY` / `LIMIT` / joins like any other:
+
+<LiveSql query={unnestExample} rows={6} />
+
+## Cost
 
 Cost is shown with every result. Each query accrues a deterministic cost, and a caller can set a
 ceiling so an expensive query aborts with `54P01` rather than running away — which is what makes it

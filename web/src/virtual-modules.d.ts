@@ -12,6 +12,6 @@ declare module 'virtual:jed-examples' {
 declare module 'virtual:jed-spec' {
 	type SpecCell = string | number | boolean | (string | number | boolean)[] | Record<string, unknown>;
 	type SpecRow = Record<string, SpecCell>;
-	const spec: { types: SpecRow[]; errors: SpecRow[]; operators: SpecRow[]; aggregates: SpecRow[] };
+	const spec: { types: SpecRow[]; errors: SpecRow[]; operators: SpecRow[]; aggregates: SpecRow[]; setReturning: SpecRow[] };
 	export default spec;
 }

@@ -2522,4 +2522,15 @@ var SetReturning = []SetReturningDesc{
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
+	{
+		Name:          "unnest",
+		Surface:       "unnest",
+		Arity:         1,
+		ArgFamilies:   []string{"anyarray"},
+		ArgResolution: "none",
+		Result:        "set_of_element",
+		Column:        "unnest",
+		Null:          "empty_on_null",
+		Errors:        []string{},
+	},
 }

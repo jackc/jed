@@ -28,7 +28,7 @@ The catalog now lists:
 | `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` |
 | `function` (scalar) | `abs` `round` (§9), `make_interval` (§11), `uuid_extract_version`/`uuid_extract_timestamp`, `uuidv4`/`uuidv7`, `now`/`clock_timestamp` (§12) | per-function |
 | `aggregate` | `COUNT` `SUM` `MIN` `MAX` `AVG` | `int64` / `decimal` / widened (§8) |
-| `set_returning` | `generate_series` | a row **set** (§10) |
+| `set_returning` | `generate_series`, `unnest` (§10, array-functions.md §9) | a row **set** (§10) |
 
 The **aggregates** are not operators — they collapse a set of rows into one value, have no
 infix symbol or precedence, and widen their result type by the operand type — so they live
@@ -311,15 +311,20 @@ above:
 Because it produces rows, an SRF fits neither the operator/scalar result mold nor the
 aggregate fold. It lives in its own catalog array
 ([catalog.toml](../functions/catalog.toml) `[[set_returning]]`, `kind = "set_returning"`)
-with its own field set — `arity`, `arg_families`, `arg_resolution`, a reserved `result`
-(`set_of_promoted` = "a row set of one column at the promoted integer type of the args"), a
-fixed output `column` name, and `null = "empty_on_null"`. Like the aggregate dispatch, the
-resolve path is hand-written per core; the catalog row is the shared registry data
+with its own field set — `arity`, `arg_families`, `arg_resolution`, a reserved `result`, a
+fixed output `column` name, and `null = "empty_on_null"`. Two reserved SRF result codes exist:
+`set_of_promoted` ("a row set of one column at the promoted integer type of the args" —
+`generate_series`) and `set_of_element` ("a row set of one column at the element type bound from
+the `anyarray` argument" — `unnest`, the polymorphic SRF, [array-functions.md §9](array-functions.md)).
+Like the aggregate dispatch, the resolve path is hand-written per core (dispatched by name —
+`generate_series` and `unnest` branches); the catalog row is the shared registry data
 (CLAUDE.md §5). The codegen emits a `SET_RETURNING` descriptor table per core (a §8 drift
 test cross-checks it), and `verify.rb` validates the array on its own branch (`promote`
 there requires each operand family to have a promotion rule — an SRF widens its *own* args
 among themselves, it never compares two families, the one divergence from the operator
-`promote` check).
+`promote` check; it also admits the polymorphic `anyarray`/`anyelement` pseudo-families in an
+SRF `arg_families` slot, interpreted by the hand-written resolver exactly as for the array
+functions).
 
 **`generate_series` (FROM-clause only, integer only).** The first SRF is a row source in the
 `FROM` clause ([grammar.md](grammar.md) §35): `generate_series(start, stop)` and
@@ -343,11 +348,19 @@ params/outer environment with no local row, so a `$N` or a correlated outer colu
 legal argument but a sibling FROM table is not. Deferred: the SELECT-list SRF position,
 `LATERAL`, the column-alias-list form, and non-integer variants (§35).
 
+**The second SRF — `unnest(anyarray)`** ([array-functions.md §9](array-functions.md)) reuses this
+exact machinery: a FROM-clause synthetic relation, the same non-LATERAL arg scope, the same
+single-column function-alias rule, the same `generated_row` cost and `max_cost` ceiling. It differs
+only in (a) its column type — the **bound element type** of its `anyarray` argument (the
+`set_of_element` result, the polymorphic analogue of `generate_series`'s `set_of_promoted`), and (b)
+its generator — one row per element in the value's flattened row-major order (a NULL array or empty
+array → zero rows; a NULL element → a NULL row), rather than a counted series.
+
 **Cost.** Each generated element charges one **`generated_row`** ([cost.md](cost.md) §3),
-guarded so a `max_cost` ceiling aborts a runaway `generate_series(1, 10^18)` with `54P01`
-**mid-generation**, before the whole series materializes (CLAUDE.md §13). An SRF touches no
-store, so it charges **no** `page_read` / `storage_row_read`. `generated_row` is distinct
-from `row_produced` (the result-emission unit): a generated row filtered by a `WHERE` or
+guarded so a `max_cost` ceiling aborts a runaway `generate_series(1, 10^18)` (or an over-cap
+`unnest`) with `54P01` **mid-generation**, before the whole series materializes (CLAUDE.md §13). An
+SRF touches no store, so it charges **no** `page_read` / `storage_row_read`. `generated_row` is
+distinct from `row_produced` (the result-emission unit): a generated row filtered by a `WHERE` or
 dropped by a join still charges `generated_row` but not `row_produced`, so the two diverge
 under `WHERE`/`LIMIT`. The arguments charge their own `operator_eval`s once, up front.
 

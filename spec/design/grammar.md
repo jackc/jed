@@ -1521,11 +1521,14 @@ for zero value); the corpus tests the PG-agreeing surface.
 
 A `table_ref` may be a **set-returning function (SRF)** call instead of a base table name
 ([grammar.ebnf](../grammar/grammar.ebnf) `table_function`): `SELECT * FROM
-generate_series(1, 5)`. An SRF is a **computed row source** — it *expands* its arguments
-into a row set rather than scanning stored rows — and is the engine's first; the semantics,
-the synthetic-relation model, and the cost rule live in [functions.md](functions.md) §10,
-and `generate_series` is registered as shared catalog data
-([catalog.toml](../functions/catalog.toml) `[[set_returning]]`).
+generate_series(1, 5)`, `SELECT * FROM unnest(ARRAY[10,20,30])`. An SRF is a **computed row
+source** — it *expands* its arguments into a row set rather than scanning stored rows. The
+semantics, the synthetic-relation model, and the cost rule live in [functions.md](functions.md)
+§10; the two SRFs — `generate_series` (integer series) and the polymorphic `unnest(anyarray)`
+([array-functions.md §9](array-functions.md), a row per array element) — are registered as shared
+catalog data ([catalog.toml](../functions/catalog.toml) `[[set_returning]]`). The grammar is
+identical for both: a single `table_function` production keyed on a `(` after the leading
+identifier — the resolver dispatches by name.
 
 **Syntax.** `table_function ::= identifier "(" expr ("," expr)* ")"` — a `(` immediately
 after the leading identifier in `table_ref` position marks the function form (a **one-token
@@ -1548,12 +1551,14 @@ an empty-local scope linked outward, so a `$N` parameter or a **correlated outer
 column** is a legal argument (`(SELECT count(*) FROM generate_series(1, o.n)) FROM t o`), but
 a **sibling FROM table** is not (`42703`/`42P01`).
 
-**Deferred narrowings** (each a `0A000` or the relevant error, relaxable later): the
-**SELECT-list** SRF position (`SELECT generate_series(1, 5)` — `generate_series` is not a
-scalar function, `42883`), **`LATERAL`**, the **column-alias-list** form `AS g(c1, …)`
-(`0A000` — a `(` after the alias), and non-integer variants (numeric/timestamp). The integer
-forms and their PostgreSQL edge cases (NULL arg → zero rows, step zero → `22023`, overflow →
-clean stop) are spec'd in [functions.md](functions.md) §10.
+**Deferred narrowings** (each a `0A000` or the relevant error, relaxable later, and shared by both
+SRFs): the **SELECT-list** SRF position (`SELECT generate_series(1, 5)` / `SELECT unnest(…)` — an
+SRF is not a scalar function, `42883`), **`LATERAL`** (so `unnest` over a sibling FROM column is
+reached only via a correlated subquery), the **column-alias-list** form `AS g(c1, …)` (`0A000` — a
+`(` after the alias), **`WITH ORDINALITY`**, and `generate_series`'s non-integer variants
+(numeric/timestamp). The `generate_series` integer forms and their PostgreSQL edge cases (NULL arg →
+zero rows, step zero → `22023`, overflow → clean stop), and `unnest`'s element-expansion semantics,
+are spec'd in [functions.md](functions.md) §10 and [array-functions.md §9](array-functions.md).
 
 ## 36. Typed string literals (`type '…'`) and string-literal casts
 

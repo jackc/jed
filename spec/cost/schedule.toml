@@ -125,8 +125,10 @@ id     = "generated_row"
 weight = 1
 event  = "one row produced by a set-returning function (e.g. generate_series) in the FROM clause"
 # Landed with generate_series — the first set-returning function (../design/functions.md §10,
-# ../design/cost.md §3 "generated_row"). An SRF in the FROM clause is a COMPUTED row source, not
-# a table store: it touches no page and reads no stored row, so it charges neither page_read nor
+# ../design/cost.md §3 "generated_row"); the polymorphic unnest SRF (../design/array-functions.md §9)
+# reuses it unchanged, one charge per array element it emits. An SRF in the FROM clause is a COMPUTED
+# row source, not a table store: it touches no page and reads no stored row, so it charges neither
+# page_read nor
 # storage_row_read. Instead this unit fires once per element the generator emits, charged AT THE
 # SOURCE before the row flows into the join/WHERE pipeline — so it meters the GENERATION work an
 # untrusted query can drive (a runaway generate_series(1, 10^18)) and a max_cost ceiling aborts

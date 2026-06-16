@@ -10,15 +10,17 @@
 > `postgres:18` oracle — several array-function NULL/shape rules are subtle (§3) and must be
 > oracle-checked, not guessed.
 >
-> **Status: AF1 + AF2 landed.** AF1 — the **polymorphic resolution machinery** (§2) plus the
+> **Status: AF1 + AF2 + AF3 landed.** AF1 — the **polymorphic resolution machinery** (§2) plus the
 > *scalar-function-shaped* surface: introspection (`array_ndims`, `array_length`, `array_lower`,
 > `array_upper`, `cardinality`, `array_dims`) and builders (`array_append`, `array_prepend`,
 > `array_cat`). AF2 (§8) — the **`||` concatenation operator** and the **search/edit functions**
-> (`array_remove`, `array_replace`, `array_position`, `array_positions`). Both are implemented
-> across all three cores, oracle-checked (`suites/expr/array_functions.test`,
-> `suites/expr/array_concat_search.test`), capability `func.array`. The remaining slices (§6) —
-> `unnest`, `@>`/`<@`/`&&`, `ANY`/`ALL`, `VARIADIC` — are sequenced follow-ons, each its own
-> vertical slice.
+> (`array_remove`, `array_replace`, `array_position`, `array_positions`). AF3 (§9) — the
+> **`unnest(anyarray)` set-returning function**, the engine's second FROM-clause SRF: it expands an
+> array into one row per element at the bound element type. All three are implemented across all
+> three cores, oracle-checked (`suites/expr/array_functions.test`,
+> `suites/expr/array_concat_search.test`, `suites/query/unnest.test`), capabilities `func.array` +
+> `func.unnest`. The remaining slices (§6) — `@>`/`<@`/`&&`, `ANY`/`ALL`, `VARIADIC` — are sequenced
+> follow-ons, each its own vertical slice.
 
 ## 1. Why a new layer
 
@@ -259,10 +261,11 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
   the AF1 builder kernels) and the search/edit functions `array_remove`, `array_replace`,
   `array_position`, `array_positions`. One grammar change (the `||` token + a `parse_concat`
   precedence rung); all three cores + `suites/expr/array_concat_search.test`.
-- **AF3** — **`unnest(anyarray)`** the set-returning function: generalizes the `generate_series`
-  SRF machinery ([functions.md §10](functions.md)) to a **polymorphic element-type** output column
-  and a per-element row generator (FROM-clause position first; the SELECT-list SRF, `LATERAL`, and
-  the `WITH ORDINALITY` form are their own follow-ons).
+- **AF3 ✅** (§9) — **`unnest(anyarray)`** the set-returning function: generalizes the
+  `generate_series` SRF machinery ([functions.md §10](functions.md)) to a **polymorphic element-type**
+  output column and a per-element row generator. All three cores + `func.unnest` +
+  `suites/query/unnest.test`. (FROM-clause position only; the SELECT-list SRF, `LATERAL`, and the
+  `WITH ORDINALITY` form remain their own follow-ons.)
 - **AF4** — the containment/overlap operators **`@>`** (contains), **`<@`** (contained by),
   **`&&`** (overlaps), as polymorphic `boolean`-result operators.
 - **AF5** — the **`ANY`/`ALL`** quantified comparisons (`x = ANY(array)`, `x op ALL(array)`) — a
@@ -279,7 +282,8 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
 | `array_cat` / `array \|\| array` of incompatible dimensionalities | `2202E` array_subscript_error |
 | `array_remove`/`array_position`/`array_positions` on a multidimensional array (AF2) | `0A000` feature_not_supported |
 | `array_position(a, e, start)` with a NULL `start` (AF2) | `22004` null_value_not_allowed |
-| Polymorphic type undeterminable (all polymorphic args untyped `NULL`) | `42P18` indeterminate_datatype |
+| `unnest` of a non-array, or with the wrong arity (AF3) | `42883` undefined_function |
+| Polymorphic type undeterminable (all polymorphic args untyped `NULL`, incl. bare `unnest(NULL)`) | `42P18` indeterminate_datatype |
 
 `22000` (`data_exception`) is registered in [../errors/registry.toml](../errors/registry.toml)
 (added with AF1); `22004` (`null_value_not_allowed`) was added with AF2; `0A000`, `2202E`, `42883`,
@@ -350,3 +354,70 @@ hint AF1 uses, so `array_remove(int32[]_col, 2)` adapts `2`.
 `integer[]`) regardless of the array's element type, matching the §3.1 introspection convention.
 `int32[]` is a new concrete-array `result` code (`<scalar>[]`), read by the resolver as
 `Array(scalar)` and admitted by `verify.rb` as a fourth `result` form.
+
+## 9. AF3 — the `unnest(anyarray)` set-returning function
+
+AF3 spends the §2 machinery on the array surface's one **set-returning** function — `unnest`, which
+**expands** an array into one row per element. Unlike every prior AF function (a per-row scalar
+expression), `unnest` produces *rows*, so it is jed's second **SRF** after `generate_series` and
+reuses that machinery wholesale ([functions.md §10](functions.md), [grammar.md §35](grammar.md)): a
+FROM-clause row source that resolves to a **synthetic one-column relation**, threads through the
+planner and nested-loop join unchanged, and **generates** its rows at the materialization step
+instead of scanning a store. Every rule is oracle-pinned (`postgres:18`).
+
+**The one new piece is the polymorphic output column.** `generate_series` types its column at the
+*promoted integer* of its args (the `set_of_promoted` result); `unnest` types its column at the
+**element type of its `anyarray` argument** — a new reserved SRF result code, **`set_of_element`**,
+the SRF analogue of the `anyelement` code (§2). Resolution (hand-written per core in
+`resolve_srf`/`resolveSRF`, dispatched by name like the `generate_series` branch):
+
+1. arity is **1** — a wrong count is `42883` (the multi-array `unnest(a, b, …)` PG form is deferred).
+2. resolve the single argument with **no hint** (the argument *is* the array; there is no element to
+   adapt a literal toward, unlike the AF1/AF2 literal-adaptation hint). Its type must be an
+   **array** `E[]` → bind `ELEM := E`, the output column type. A **non-array** (`unnest(5)`) is
+   `42883` (no `anyarray` overload — exactly PG). A **bare untyped `NULL`** (`unnest(NULL)`) leaves
+   `ELEM` undeterminable → **`42P18`** (jed's polymorphic posture, §5 #6 — PG instead reports
+   "function unnest(unknown) is not unique" because it ships several `unnest` overloads; jed has one,
+   so the indeterminate case is the honest answer and is **out of the oracle corpus**). A **typed**
+   NULL array (`NULL::int32[]`) resolves and yields zero rows at exec.
+3. arrays hold **scalar** elements this slice (array-of-composite is the deferred fast-follow,
+   [array.md §12](array.md)), so `ELEM` is always a scalar; the synthetic column carries it
+   (`int32[]` → an `int32` column, `text[]` → `text`, …).
+
+**The generator** (`unnest_rows`/`unnestRows`) evaluates the single array argument **once** against
+the params/outer environment (non-LATERAL, exactly like `generate_series`'s args — a `$N` or a
+**correlated outer column** is a legal argument, a **sibling FROM table is not**), then emits one
+row per element in the value's **flattened row-major element order**. The semantics fall straight
+out of the array value's representation ([array.md §4](array.md)) and are oracle-pinned:
+
+- a **NULL array** argument → **zero rows** (the SRF `empty_on_null` discipline);
+- the **empty array** `{}` → **zero rows**;
+- a **multidimensional** array → its elements in **row-major order** (`unnest(ARRAY[[1,2],[3,4]])` →
+  `1,2,3,4`) — `unnest` flattens, it does not preserve shape;
+- a **custom lower bound** is **dropped** (`unnest('[5:7]={10,20,30}')` → `10,20,30`) — `unnest`
+  yields *elements*, not subscripts (contrast `array_positions`, §8.2);
+- a **NULL element** of a non-NULL array is produced as a **NULL row** (`unnest(ARRAY[1,NULL,3])` →
+  `1`, `NULL`, `3`).
+
+Row order without an `ORDER BY` is **unspecified** (CLAUDE.md §8) — the conformance harness compares
+the multiset (`rowsort`); PostgreSQL happens to preserve element order, and jed does too, but neither
+is contractual. `unnest` composes with `WHERE` / `ORDER BY` / `LIMIT` / cross-join exactly as
+`generate_series` does, and the output column follows the same **single-column function-alias rule**
+(the alias, else `unnest`).
+
+**Cost.** Each produced element charges one **`generated_row`** ([cost.md §3](cost.md)) — the same
+unit `generate_series` charges, guarded so a `max_cost` ceiling aborts a runaway `unnest` (`54P01`)
+**mid-generation** before the whole array materializes (CLAUDE.md §13). An SRF touches no store, so it
+charges **no** `page_read` / `storage_row_read`; the array argument charges its own evaluation cost
+(one `operator_eval` per `ARRAY[…]` constructor node, **zero** for a constant-folded `'{…}'::T[]`
+literal) **once**, up front.
+
+**Catalog & registry.** `unnest` is a `[[set_returning]]` row (`arg_families = ["anyarray"]`,
+`arg_resolution = "none"`, `result = "set_of_element"`, `column = "unnest"`, `null =
+"empty_on_null"`); `verify.rb` admits the polymorphic `anyarray` in an SRF `arg_families` slot and
+the new `set_of_element` reserved result. The row is shared registry data (CLAUDE.md §5) cross-checked
+into each core's `SET_RETURNING` table by `gen_catalog.rb`; the resolve/generate **dispatch** is
+hand-written per core. **Deferred** (each its own follow-on, §6): the SELECT-list SRF position
+(`SELECT unnest(…)` is `42883`, like `generate_series`), `LATERAL` (so the natural "explode a column"
+`FROM t, unnest(t.xs)` is reached only via a correlated subquery this slice), `WITH ORDINALITY`, the
+multi-array `unnest(a, b, …)` form, and array-of-composite elements.

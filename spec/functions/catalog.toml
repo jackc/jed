@@ -2330,11 +2330,12 @@ errors       = []
 # it produces zero or more rows. So, like aggregates, SRFs live in their OWN array with kind =
 # "set_returning" and their own field set (verify.rb validates them on a separate branch;
 # gen_catalog.rb emits a separate SET_RETURNING descriptor table cross-checked per core). The
-# first SRF is `generate_series`, valid ONLY as a FROM-clause row source this slice (not in the
-# SELECT list; no LATERAL; no column-alias list) — semantics, the synthetic-relation model, and
-# the cost rule live in ../design/functions.md §10 and ../design/grammar.md §35. The resolve
-# DISPATCH is hand-written per core (like the aggregate/scalar dispatch); this row is the shared
-# registry data (CLAUDE.md §5).
+# first SRF is `generate_series`; the second is the polymorphic `unnest` (AF3 — array-functions.md
+# §6). Both are valid ONLY as a FROM-clause row source this slice (not in the SELECT list; no
+# LATERAL; no column-alias list) — semantics, the synthetic-relation model, and the cost rule live
+# in ../design/functions.md §10 and ../design/grammar.md §35 (unnest in array-functions.md §9). The
+# resolve DISPATCH is hand-written per core (like the aggregate/scalar dispatch); this row is the
+# shared registry data (CLAUDE.md §5).
 #
 # field doc (set_returning) ---------------------------------------------------
 # name          internal identity + AST/resolver selector. Overloaded across ARITY (the 2-arg
@@ -2343,21 +2344,28 @@ errors       = []
 # kind          always "set_returning".
 # surface       SQL spelling, lowercase canonical (resolved case-insensitively — SRF names are
 #               not reserved, grammar.md §3).
-# arity         operand count (generate_series: 2 = start/stop, 3 = start/stop/step).
+# arity         operand count (generate_series: 2 = start/stop, 3 = start/stop/step; unnest: 1).
 # arg_families  required family of each operand, by position, referencing a `family` in
-#               ../types/scalars.toml. generate_series takes "integer" per position this slice.
+#               ../types/scalars.toml. generate_series takes "integer" per position; unnest takes
+#               the polymorphic pseudo-family "anyarray" (array-functions.md §2 — matches any array
+#               arg and binds ELEM := its element type), interpreted by the hand-written resolver.
 # arg_resolution "promote" = widen all operands via the promotion tower to a common type (the
-#               result column type); "none" = no reconcile. generate_series uses "promote".
+#               result column type); "none" = no reconcile. generate_series uses "promote"; the
+#               single-arg unnest uses "none".
 # result        a reserved set-returning result id (NOT a plain scalar — an SRF returns a row
 #               SET): "set_of_promoted" = a row set of ONE column whose type is the promoted
-#               integer type of the args (the SRF analogue of the aggregates' sum_widen).
+#               integer type of the args (the SRF analogue of the aggregates' sum_widen);
+#               "set_of_element" = a row set of ONE column whose type is the ELEM bound from the
+#               `anyarray` argument (unnest — the SRF analogue of the `anyelement` result code).
 # column        the fixed output column NAME of the produced relation (PG names it after the
-#               function: generate_series). Authored data, not computed.
-# null          "empty_on_null" = any NULL argument yields ZERO rows (PG generate_series), as
-#               opposed to a scalar function's "propagates".
+#               function: generate_series / unnest). Authored data, not computed.
+# null          "empty_on_null" = any NULL argument yields ZERO rows (PG generate_series; a NULL
+#               array → zero rows for unnest), as opposed to a scalar function's "propagates". A
+#               NULL *element* of a non-NULL array is still produced as a NULL row (unnest).
 # errors        SQLSTATE codes the SRF may raise; generate_series carries 22023 (step size of
 #               zero — ../errors/registry.toml). NULL→empty and i64-overflow→clean-stop are NOT
-#               errors.
+#               errors. unnest carries none (a bare untyped NULL arg → 42P18 is a resolver posture,
+#               not a registered SRF error).
 # -----------------------------------------------------------------------------
 
 [[set_returning]]
@@ -2383,3 +2391,23 @@ result         = "set_of_promoted"
 column         = "generate_series"
 null           = "empty_on_null"
 errors         = ["22023"]
+
+# unnest(anyarray) → setof anyelement (AF3 — array-functions.md §9). The SRF analogue of the
+# polymorphic array functions: the `anyarray` arg binds ELEM := its element type and the produced
+# one-column relation is typed at ELEM (the "set_of_element" result). It EXPANDS the array into one
+# row per element in flattened row-major order (a multidimensional array flattens; a NULL element
+# is produced as a NULL row), so a 3-element array yields 3 rows. A NULL array argument yields ZERO
+# rows ("empty_on_null", oracle-pinned); the empty array {} likewise yields zero rows. Each produced
+# element charges one generated_row (cost.md §3), like generate_series. FROM-clause only this slice
+# (the SELECT-list SRF, LATERAL, WITH ORDINALITY are deferred — array-functions.md §6).
+[[set_returning]]
+name           = "unnest"
+kind           = "set_returning"
+surface        = "unnest"
+arity          = 1
+arg_families   = ["anyarray"]
+arg_resolution = "none"
+result         = "set_of_element"
+column         = "unnest"
+null           = "empty_on_null"
+errors         = []

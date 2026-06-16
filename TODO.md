@@ -222,11 +222,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `array_replace` any-dim; `array_position` returns a SUBSCRIPT, NULL start → `22004`). All three
         cores, oracle-checked (`suites/expr/array_concat_search.test`), registry code `22004`, result
         code `int32[]`. → [array-functions.md §8](spec/design/array-functions.md)
+  - [x] **AF3 — `unnest(anyarray)` the set-returning function** — the engine's second FROM-clause
+        SRF (after `generate_series`), generalizing the [functions.md §10](spec/design/functions.md)
+        SRF machinery to a **polymorphic element-type** output column: a new reserved SRF result
+        `set_of_element` (the `anyelement` analogue, bound from the `anyarray` arg → the synthetic
+        one-column relation's type) + a per-element row generator (one row per element in flattened
+        row-major order; a NULL array or empty array → zero rows; a NULL element → a NULL row;
+        multidim flattens, custom lbounds drop). Non-array → `42883`, bare untyped NULL → `42P18`
+        (jed posture); each produced element charges one `generated_row` (the `max_cost` ceiling
+        bounds a runaway `unnest`, 54P01). FROM-clause position only (the SELECT-list SRF, `LATERAL`,
+        `WITH ORDINALITY`, the multi-array form, and array-of-composite elements stay deferred). All
+        three cores + Ruby N/A (no format change), oracle-checked (`suites/query/unnest.test`),
+        capability `func.unnest`. → [array-functions.md §9](spec/design/array-functions.md)
   - [ ] _follow-ons (each its own slice + obligations; sequenced in array-functions.md §6):_
-        **AF3** `unnest(anyarray)` (the SRF, polymorphic element column); **AF4** `@>`/`<@`/`&&`
-        containment/overlap operators; **AF5** `ANY`/`ALL` quantified comparisons; **AF6** `VARIADIC`.
-        Plus: array-of-composite elements; arrays-in-keys (`0A000`, encoding authored §8); runtime
-        text→array, `array::text`, and element-wise array→array casts.
+        **AF4** `@>`/`<@`/`&&` containment/overlap operators; **AF5** `ANY`/`ALL` quantified
+        comparisons; **AF6** `VARIADIC`. Plus: array-of-composite elements; arrays-in-keys (`0A000`,
+        encoding authored §8); runtime text→array, `array::text`, and element-wise array→array casts.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis**, sibling to `array` and sharing ~80% of its foundation, so sequence
       the two together. **The headline implication: this turns the *closed* type enum into an *open*,

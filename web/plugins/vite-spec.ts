@@ -23,7 +23,8 @@ export function jedSpec(specDir: string) {
 			types: scalars.tables.type ?? [],
 			errors: errors.tables.error ?? [],
 			operators: catalog.tables.operator ?? [],
-			aggregates: catalog.tables.aggregate ?? []
+			aggregates: catalog.tables.aggregate ?? [],
+			setReturning: catalog.tables.set_returning ?? []
 		};
 		return `export default ${JSON.stringify(data)};`;
 	}

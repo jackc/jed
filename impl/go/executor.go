@@ -3211,14 +3211,27 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 // single-column function-alias rule: the table alias when one is given (generate_series(1,5) AS g
 // ⇒ column g), else the function name generate_series.
 func (db *Database) resolveSRF(name string, args []*Expr, alias *string, parent *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
-	if !strings.EqualFold(name, "generate_series") {
+	// The args see only params/outer — never sibling FROM tables (non-LATERAL).
+	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true}
+	switch {
+	case strings.EqualFold(name, "generate_series"):
+		return db.resolveGenerateSeries(args, alias, argScope, ptypes)
+	case strings.EqualFold(name, "unnest"):
+		return db.resolveUnnest(args, alias, argScope, ptypes)
+	default:
 		return nil, nil, NewError(UndefinedFunction, "function does not exist: "+name)
 	}
+}
+
+// resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
+// §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
+// PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
+// int64.
+func (db *Database) resolveGenerateSeries(args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	if len(args) != 2 && len(args) != 3 {
 		return nil, nil, noFuncOverload("generate_series")
 	}
 	int64Ctx := Int64
-	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true}
 	forbidden := &aggCtx{}
 	rargs := make([]*rExpr, 0, len(args))
 	var result ScalarType
@@ -3244,18 +3257,52 @@ func (db *Database) resolveSRF(name string, args []*Expr, alias *string, parent 
 	if !haveResult {
 		result = Int64
 	}
-	// PG's single-column function-alias rule: the column takes the table alias when one is given,
-	// else the function name. The table's Name stays the function name (the un-aliased label
-	// fallback).
-	colName := "generate_series"
+	return srfTable("generate_series", alias, ScalarT(result)), &srfPlan{kind: srfGenerateSeries, args: rargs}, nil
+}
+
+// resolveUnnest resolves unnest(anyarray) (spec/design/array-functions.md §9): the single argument
+// must be an array (binding ELEM := its element type, the produced column's type), else 42883 (a
+// non-array, e.g. unnest(5)). A bare untyped NULL argument leaves ELEM undeterminable → 42P18
+// (jed's polymorphic posture, like array_append(NULL, NULL)); a typed NULL array (NULL::int32[])
+// resolves and yields zero rows at exec. Arrays hold scalar elements this slice (array-of-composite
+// is deferred), so ELEM is a scalar.
+func (db *Database) resolveUnnest(args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+	if len(args) != 1 {
+		return nil, nil, noFuncOverload("unnest")
+	}
+	forbidden := &aggCtx{}
+	r, t, err := resolve(argScope, *args[0], nil, forbidden, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch t.kind {
+	case rtArray:
+		elemST, ok := elemScalarHint(*t.elem)
+		if !ok {
+			panic("array element is a scalar (array-of-composite is deferred)")
+		}
+		return srfTable("unnest", alias, ScalarT(elemST)), &srfPlan{kind: srfUnnest, args: []*rExpr{r}}, nil
+	case rtNull:
+		return nil, nil, indeterminatePoly()
+	default:
+		return nil, nil, noFuncOverload("unnest")
+	}
+}
+
+// srfTable builds a set-returning function's SYNTHETIC one-column relation (spec/design/functions.md
+// §10). The table's Name is the function name (the un-aliased label fallback); the lone column's
+// NAME follows PostgreSQL's single-column function-alias rule — the table alias when one is given,
+// else the function name — and its TYPE is colTy (the promoted integer for generate_series, the
+// bound element type for unnest).
+func srfTable(funcName string, alias *string, colTy Type) *Table {
+	colName := funcName
 	if alias != nil {
 		colName = *alias
 	}
-	t := &Table{
-		Name:    "generate_series",
-		Columns: []Column{{Name: colName, Type: ScalarT(result)}},
+	return &Table{
+		Name:    funcName,
+		Columns: []Column{{Name: colName, Type: colTy}},
 	}
-	return t, &srfPlan{args: rargs}, nil
 }
 
 // generateSeriesRows generates the rows of a generate_series(start, stop[, step]) FROM-clause
@@ -3327,6 +3374,37 @@ func (db *Database) generateSeriesRows(sp *srfPlan, env *evalEnv, m *Meter) ([]R
 		cur = next
 	}
 	return out, nil
+}
+
+// unnestRows generates the rows of an unnest(anyarray) FROM-clause source (spec/design/array-functions.md
+// §9), as one-column rows. The single array argument evaluates ONCE against the outer environment with
+// no local row (non-LATERAL). PostgreSQL semantics: a NULL array yields zero rows; the empty array {}
+// yields zero rows; otherwise one row per element in flattened row-major order (a multidimensional array
+// flattens; a NULL element is produced as a NULL row). Each produced element charges one generated_row AT
+// THE SOURCE, guarded so a max_cost ceiling aborts a runaway unnest (54P01) mid-generation, exactly like
+// generate_series (CLAUDE.md §13).
+func (db *Database) unnestRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+	v, err := sp.args[0].eval(nil, env, m)
+	if err != nil {
+		return nil, err
+	}
+	switch v.Kind {
+	case ValNull:
+		// A NULL array → zero rows (PG; the empty_on_null discipline).
+		return nil, nil
+	case ValArray:
+		out := make([]Row, 0, len(v.Array.Elements))
+		for _, e := range v.Array.Elements {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(Costs.GeneratedRow)
+			out = append(out, Row{e})
+		}
+		return out, nil
+	default:
+		panic("the resolver restricts unnest's argument to an array")
+	}
 }
 
 // rowSource is a pull-based row cursor (Volcano-style): each next() yields one row, or
@@ -4013,7 +4091,14 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		// A set-returning relation is generated, not scanned (functions.md §10): produce its rows
 		// (charging generated_row per element) and feed them into the same join pipeline.
 		if rel.srf != nil {
-			tableRows, err := db.generateSeriesRows(rel.srf, env, meter)
+			var tableRows []Row
+			var err error
+			switch rel.srf.kind {
+			case srfGenerateSeries:
+				tableRows, err = db.generateSeriesRows(rel.srf, env, meter)
+			case srfUnnest:
+				tableRows, err = db.unnestRows(rel.srf, env, meter)
+			}
 			if err != nil {
 				return selectResult{}, err
 			}
@@ -5378,11 +5463,24 @@ type planRel struct {
 	srf *srfPlan
 }
 
-// srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10). The
-// first SRF is generate_series, so args is [start, stop] or [start, stop, step] — non-LATERAL,
-// so each arg evaluates against the params/outer environment with no local row. The produced
-// column's promoted integer type lives on the synthetic relation (built in resolveSRF).
+// srfKind selects which set-returning function a srfPlan is, picking the row generator at exec
+// (spec/design/functions.md §10, array-functions.md §9). The dispatch is hand-written per core.
+type srfKind int
+
+const (
+	// srfGenerateSeries is generate_series(start, stop[, step]) — an integer series (functions.md §10).
+	srfGenerateSeries srfKind = iota
+	// srfUnnest is unnest(anyarray) — one row per array element, flattened row-major (array-functions.md §9).
+	srfUnnest
+)
+
+// srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
+// array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
+// 2 or 3 integers) or unnest(anyarray) (args = the single array expression). Non-LATERAL, so each
+// arg evaluates against the params/outer environment with no local row. The produced column's type
+// lives on the synthetic relation (built in resolveSRF).
 type srfPlan struct {
+	kind srfKind
 	args []*rExpr
 }
 
