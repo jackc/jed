@@ -12,10 +12,15 @@
 # use that extension (spec/conformance/suites/**/*.test).
 /impl/go/bin/
 
-# TS core: installed dev-dependencies (typescript + @types/node, type-check only).
+# TS core: installed dev-dependencies (typescript + @types/node for the engine; vite +
+# @playwright/test for the browser/OPFS host's demo + e2e — dev-only, spec/design/hosts.md §5).
 # package-lock.json IS committed for reproducibility; the engine/tests/harness run on
 # bare Node with no install.
 /impl/ts/node_modules/
+# Browser/OPFS host build + e2e artifacts (Vite bundle, Playwright run output).
+/impl/ts/dist-browser/
+/impl/ts/test-results/
+/impl/ts/playwright-report/
 
 # Benchmark subsystem (spec/design/benchmarks.md): generated databases + results are
 # local state; harness build artifacts mirror the per-core ignores above.
