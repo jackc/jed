@@ -67,9 +67,10 @@ Hosts:
 
 - **Go core** — `os.File` with `ReadAt`/`WriteAt`/`Sync` (pure Go, no cgo — CLAUDE.md §2).
 - **Rust core** — direct file access (`pread`/`pwrite`/`fsync`-equivalent).
-- **TS core** — a Node host (direct `fs`) exists now; the browser host (OPFS,
-  `FileSystemSyncAccessHandle`) is still later (CLAUDE.md §9). The engine is kept
-  host-agnostic so the browser host is an added seam, not a reshape.
+- **TS core** — a Node host (direct `fs`, `fileblockstore.ts`) **and** the browser host (OPFS,
+  `FileSystemSyncAccessHandle`, `opfsblockstore.ts`) both exist (hosts.md §5). The browser host
+  landed as an *added seam, not a reshape* — exactly as the host-agnostic design intended — with the
+  engine running in a Web Worker behind an async client.
 - **In-memory** — a `Vec`/slice of pages; the natural fit for the in-RAM target and the
   default for tests (no filesystem, fully deterministic).
 

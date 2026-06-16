@@ -80,7 +80,8 @@ Backings (one `Pager` trait/interface, per-host impls — storage.md §2):
 - **File** — the open file kept for the handle's lifetime (today `open` reads all bytes then
   drops the file; the pager keeps it open and `read_block`s on demand; `close` closes it).
   Rust `pread`/`File::seek+read`, Go `os.File.ReadAt`, TS Node `fs.readSync` at an offset; the
-  browser/OPFS host slots in here later (storage.md §2), unchanged above the seam.
+  browser/OPFS host (`FileSystemSyncAccessHandle`) slotted in here as another `BlockStore`, unchanged
+  above the seam (storage.md §2, hosts.md §5).
 - **In-memory** — a `Vec`/slice of page buffers; the default for tests and the pure-in-memory
   database mode. The pool sits above it too (a trivial, never-evicting backing), so the
   in-memory path exercises the same code.

@@ -316,6 +316,14 @@ only and the engine has no wire protocol).
   otherwise collide with the AST `Statement` the executor consumes).
 - Method names avoid collisions with the kept free functions: Go `ExecuteSQL` (vs package
   `Execute`), TS `executeSql` (vs exported `execute`).
+- **The TS Browser/OPFS host is async** ([hosts.md](hosts.md) §5). Because an OPFS sync access handle
+  is acquired asynchronously and is usable only in a Web Worker, the browser entry points are
+  `createOpfs(name, opts)` / `openOpfs(name, opts)` returning `Promise<Database>` (in the worker), and
+  a main-thread `OpfsDatabase` client whose `create`/`open`/`query`/`execute`/`commit`/`close` are all
+  `Promise`-returning over `postMessage`. This async surface is a deliberate per-platform divergence
+  from the synchronous file `create`/`open` above — the engine itself and the storage seam stay
+  synchronous; only the OPFS acquisition edge and the worker RPC are async. No Rust/Go equivalent
+  (browser-only).
 
 **Catalog reads** (the last two rows) are the host's introspection surface until an SQL-level
 one exists (an `information_schema`-like layer is a possible later feature): both read the
@@ -373,8 +381,10 @@ options object on `execute`/`prepare`) stays open for later without changing thi
   autocommit" rule; `close` no longer drops committed work). What stays deferred is only
   `SAVEPOINT`/nested transactions, `synchronous=off` batching, and group-commit (transactions.md
   §11).
-- **No browser/OPFS host** — the Node `fs` host is built here; the OPFS host is a sibling
-  storage host added later ([storage.md](storage.md) §2, CLAUDE.md §9).
+- **Browser/OPFS host — landed (TS only), not a non-goal.** The Node `fs` host built here has a
+  sibling OPFS host in the TS core ([hosts.md](hosts.md) §5): `OpfsBlockStore` over
+  `FileSystemSyncAccessHandle`, with the engine in a Web Worker driven by an **async** client. Its
+  entry points are `createOpfs`/`openOpfs` (async, see the §6 note); the synchronous core is unchanged.
 - **No low-level direct-access API** — kept open, not built ([storage.md](storage.md) §5).
 
 ## 10. Entropy + clock seam (`set_random_source` / `set_clock_source`)

@@ -492,10 +492,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [x] **`BlockStore` extraction** — the file backing lifted into a `FileBlockStore` behind the
         five-method interface; the pager composes it + keeps the policy. The in-memory path was
         deliberately left separate (not a behavior-preserving refactor). → [hosts.md §3/§7](spec/design/hosts.md)
-  - [ ] **Browser/OPFS host** (`FileSystemSyncAccessHandle`) — the one new host; map the
-        five methods onto `read`/`write`/`truncate`/`getSize`/`flush` and confirm **file-host
-        parity** (a file written by the Node host opens byte-identically through OPFS and vice
-        versa — the existing goldens already pin the bytes). _(size: L; §9, hosts.md §5)_
+  - [x] **Browser/OPFS host** (`FileSystemSyncAccessHandle`) — TS-only `OpfsBlockStore` mapping the
+        five methods onto `read`/`write`/`truncate`/`getSize`/`flush`, with the engine in a Web Worker
+        driven by an async client (`src/browser/`). Confirmed **file-host parity** in Node against the
+        goldens (`tests/opfs_parity.test.ts`); gated real-browser e2e via Vite + Playwright
+        (`npm run test:browser`, needs `npx playwright install chromium`). Making the TS engine
+        browser-bundle-clean lifted its `node:*` imports behind seams (`fileblockstore.ts` split, a
+        `SpillSink` seam + `spillfile.ts`, Web Crypto entropy default). Deferred follow-ons: OPFS
+        disk-spill, the e2e in CI. → [hosts.md §5](spec/design/hosts.md) _(§9)_
 - [x] **Cost ceiling (`max_cost`) + deterministic abort** — a handle `max_cost` setting aborts a
       statement with `54P01` the instant accrued cost reaches it, via `Meter::guard()` at the
       unbounded-work points; the `# max_cost:` corpus directive pins it. → [cost.md §6](spec/design/cost.md) _(§13)_

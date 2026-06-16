@@ -90,9 +90,10 @@ language, because hardening the spec was never the reason to add it.
    fallback, but the native core is what stresses the spec — and it does: int64 is exact
    via uniform `bigint` (JS numbers are f64), names are UTF-8 (JS strings are UTF-16), and
    bytes are big-endian via `DataView`. Runs on modern Node by **native type-stripping**
-   (no build step), TS limited to the erasable subset. Browser/OPFS storage host (CLAUDE.md
-   §9) is still later; the engine is kept host-agnostic so it slots in. Rust, Go, and this
-   TS core **are** the differential set; the honesty work is theirs.
+   (no build step), TS limited to the erasable subset. The **Browser/OPFS storage host** (CLAUDE.md
+   §9) has since **landed** in this core (`spec/design/hosts.md` §5): the engine runs in a Web Worker
+   over an `OpfsBlockStore`, validated by file-host byte parity — proof the host-agnostic seam paid
+   off. Rust, Go, and this TS core **are** the differential set; the honesty work is theirs.
 
 **Beyond the differential set — best experience per language.** For every language past
 core #3 the question is not "how much new divergence does it surface" (usually little) but
@@ -380,8 +381,10 @@ biases below are where an overriding reason *does* steer away from PG.
   deliberately-narrowed *current forms* (§11 step 5b), replaceable behind these seams — not
   the permanent shape.
 - The core defines a **storage seam** (a block/file interface) that each host
-  implements: `os.File` in Go, OPFS in the browser, direct file access natively.
-  Designing this seam early is what makes "single-file, embeddable, everywhere" work. The
+  implements: `os.File` in Go, the **Browser/OPFS host** (`FileSystemSyncAccessHandle`, ✅ built in the
+  TS core — engine-in-a-Web-Worker, `spec/design/hosts.md` §5), direct file access natively.
+  Designing this seam early is what makes "single-file, embeddable, everywhere" work — the OPFS host
+  landed as *an added `BlockStore`*, not a reshape, exactly as intended. The
   **formal host interface** — the five-method `BlockStore` byte device, the per-core mapping,
   the host catalog, and where the encryption codec / replication tee sit — is
   `spec/design/hosts.md`; the per-core `Pager` (buffer pool, preallocation, fault seam) is the

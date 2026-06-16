@@ -29,13 +29,21 @@ pager.
 
 > **Status.** ✅ The **`BlockStore` extraction has landed** (§7): the file backing is lifted out
 > of the per-core `Pager` into a `FileBlockStore` the pager composes (Rust `blockstore.rs`, Go
-> `blockstore.go`, TS `blockstore.ts`), with the policy — page math, the 1 MiB preallocation chunk,
+> `blockstore.go`, TS `fileblockstore.ts` — the TS `node:fs` impl was later split out of `blockstore.ts`,
+> which now holds just the browser-clean interface, for the OPFS work below), with the policy — page math, the 1 MiB preallocation chunk,
 > the barrier choice, the fault-injection seam — staying in the host-independent `Pager`. It was a
 > pure refactor: the goldens, the conformance corpus, and the crash-recovery suites are unchanged.
 > The **in-memory path remains a separate, fully-resident code path** (no `BlockStore`) — unifying it
 > onto a byte-buffer `BlockStore` would change observable residency/commit semantics, so it is *not*
-> a behavior-preserving refactor and stays deferred (§4 in-memory row). The remaining scheduled work
-> is the **OPFS host** (§5; [TODO.md](../../TODO.md) Phase 7 "Storage hosts").
+> a behavior-preserving refactor and stays deferred (§4 in-memory row). The **OPFS host has since
+> landed in the TS core** (§5): an `OpfsBlockStore` over `FileSystemSyncAccessHandle`, validated by
+> file-host byte parity against the Node `fs` host (the §8 cross-core round-trip, run in Node with a
+> fake sync handle), plus a Web-Worker packaging + async client and a Vite/Playwright e2e harness.
+> Making the TS engine browser-bundle-clean required lifting the remaining `node:*` imports out of its
+> transitive graph behind seams (the Node `fs` `FileBlockStore` split into `fileblockstore.ts`; a
+> `SpillSink` seam with the Node spill backing in `spillfile.ts`; Web Crypto for the entropy default) —
+> the same interface/impl discipline as this `BlockStore` split. It is a TS-only host (Rust/Go have no
+> browser target).
 
 ## 2. The interface
 
@@ -163,8 +171,8 @@ guard, since `read_at` surfaces a short read as `58030` — same `XX001` outcome
 | **in-memory** | a `Vec`/slice of bytes (or pages) | ✅ built (**separate path**) | the natural fit for the RAM-sized target (CLAUDE.md §9) and the default for tests/conformance — no filesystem, fully deterministic. `sync()` is a no-op; `commit` is a no-op success (api.md §2.2). Stores its data as a **decoded tree** (no `BlockStore`, fully resident, `persist` a no-op): routing it through a byte-buffer `BlockStore` + pager + pool would change observable residency/commit semantics, so unifying it onto the seam is **deferred** — not a behavior-preserving refactor (§7). |
 | **Rust file** | `std::fs::File`, positioned read/write + `fsync`/`fdatasync` | ✅ built (`FileBlockStore`, `blockstore.rs`) | pure `std::fs`, no dependency, memory-safe (CLAUDE.md §13). Cross-platform `seek`+read/write (no Unix-only `pread`). Closes the file on drop (RAII). |
 | **Go file** | `os.File` `ReadAt`/`WriteAt`/`Truncate`/`Sync` | ✅ built (`fileBlockStore`, `blockstore.go`) | pure Go — **no cgo, no FFI** (CLAUDE.md §2). `fdatasync` via `syscall.Fdatasync` behind a `linux` build tag (`blockstore_datasync_linux.go`), full `Sync` fallback elsewhere. |
-| **Node `fs`** | `openSync`/positioned `writeSync`/`fsyncSync` | ✅ built (`FileBlockStore`, `impl/ts/src/blockstore.ts`) | the TS core's durable backing; isolated in `blockstore.ts` (the host program layer is `file.ts`) precisely so OPFS is a sibling, not a reshape. |
-| **Browser / OPFS** | `FileSystemSyncAccessHandle` (`read`/`write`/`truncate`/`getSize`/`flush`) | ⏳ **to build** (§5) | the one new host this slice targets. Synchronous access handle API maps directly onto the §2 `BlockStore` surface. |
+| **Node `fs`** | `openSync`/positioned `writeSync`/`fsyncSync` | ✅ built (`FileBlockStore`, `impl/ts/src/fileblockstore.ts`) | the TS core's durable backing; the `node:fs` impl is isolated in `fileblockstore.ts` (the browser-clean `BlockStore` interface is `blockstore.ts`; the host program layer is `file.ts`) precisely so OPFS is a sibling, not a reshape — and so `node:fs` never reaches a browser bundle. |
+| **Browser / OPFS** | `FileSystemSyncAccessHandle` (`read`/`write`/`truncate`/`getSize`/`flush`) | ✅ built (`OpfsBlockStore`, `impl/ts/src/opfsblockstore.ts`; TS only) | the synchronous access-handle API maps one-to-one onto the §2 `BlockStore` surface (§5). Acquired async at the bootstrap edge (`opfs.ts`); the engine runs in a Web Worker driven by an async client (`src/browser/`). Validated by file-host byte parity (the existing goldens). |
 | **encrypting** | wraps another `BlockStore`/the in-core codec | ⏳ design door ([encryption.md](encryption.md)) | a page codec **above** the seam, not a host (encryption.md §2); the host stays opaque-byte. |
 | **replicating** | a tee wrapping another `BlockStore` | ⏳ design door ([replication.md](replication.md)) | a seam-level tee **below** the codec, so it ships ciphertext (replication.md §4). |
 
@@ -208,13 +216,40 @@ parity*: write a database through the Node host, open it through OPFS (and vice 
 get identical pages and query results. The existing golden fixtures already pin the bytes;
 OPFS just has to reproduce them. No new conformance capability, no format-version bump.
 
-**Open questions for the OPFS slice** (decided when it is built, not now): the access-handle
-lifetime (one long-lived handle for the database's life, mirroring the file cores' "own the
-file for the handle's life" — pager.md); how `create`'s temp-file + atomic-rename recipe
-(api.md §3) maps to OPFS (which has no POSIX rename — likely write-in-place with the meta-slot
-atomicity carrying all-or-nothing, since the incremental commit no longer rewrites the whole
-file anyway, storage.md §4); and the worker-thread requirement (sync access handles are only
-available off the main thread in some engines).
+**Open questions — resolved when the host was built:**
+
+- **Access-handle lifetime: one long-lived, exclusive handle** for the database's life, acquired at
+  open/create and released by `closeOpfs` — mirroring the file cores' "own the file for the handle's
+  life" (pager.md). OPFS's exclusive lock on a sync access handle *is* the single-writer guarantee
+  (CLAUDE.md §3), enforced by the platform. Documented divergence: one jed handle per file per origin —
+  two tabs cannot both open the same database, even read-only (file hosts allow concurrent OS opens).
+- **`create`: write in place** — no temp-file + rename (OPFS has no POSIX rename). The rename only ever
+  protected the initial whole-image write; every later commit's all-or-nothing comes from the meta-slot
+  swap + per-page CRC (storage.md §4), and a torn `create` is detected as `XX001` on open (never silent
+  bad data, and no committed data to lose). `FileSystemFileHandle.move()` is an optional hardening, not
+  required.
+- **Worker-thread requirement: engine-in-Worker + async RPC.** Sync access handles are Worker-only in
+  most engines and acquisition is async (`getDirectory` → `getFileHandle` → `createSyncAccessHandle`), so
+  the whole TS core runs in a dedicated Web Worker and the main thread drives it over `postMessage`
+  (`src/browser/worker.ts` + `client.ts`). The engine and the `BlockStore` seam stay **synchronous**;
+  only the acquisition edge (`opfs.ts`) and the client surface are async — hence the async browser entry
+  points (`createOpfs`/`openOpfs`), a documented per-platform divergence from the synchronous file
+  create/open (api.md §6). `db.path` is left null for OPFS (it is durable via `db.paging`, but has no
+  filesystem path), which keeps disk-spill off (the `ORDER BY` external merge sort has no OPFS backing
+  yet — a later enhancement; sorts stay resident, spill.md §2). The txid-advance signal was re-keyed
+  from `path` to the `persistHook` so an OPFS commit still advances txid (observably identical for the
+  file/in-memory hosts).
+
+**Browser packaging + verification.** The TS engine was made browser-bundle-clean by lifting its last
+`node:*` imports behind seams (the `BlockStore` interface in `blockstore.ts` with the Node impl in
+`fileblockstore.ts`; a `SpillSink` seam with the Node spill backing in `spillfile.ts`; the entropy
+default via global Web Crypto) — verified by an import-graph trace (`opfs.ts` reaches the engine with
+zero `node:*`) and a clean Vite build of the Worker chunk. Two test layers: a **dependency-free Node
+parity test** (`tests/opfs_parity.test.ts`, a fake sync handle — proves the byte contract both
+directions against the goldens, the §8 "done" criterion) and a **gated real-browser e2e** (Playwright +
+Vite, `e2e/opfs.spec.ts`, `npm run test:browser` — real `FileSystemSyncAccessHandle` in a real Worker,
+incl. durability across a page reload). Both are **outside `rake ci`** (TS unit tests are; the browser
+e2e needs a Chromium binary) — the OPFS host adds no SQL semantics, so conformance is unchanged.
 
 ## 6. The decoration layering (where encryption and replication sit)
 
@@ -252,8 +287,9 @@ as it crosses. See the two docs for the full designs.
 ## 7. Open / deferred
 
 - **`BlockStore` extraction** — ✅ **landed** (§1/§3): the file backing is lifted out of the
-  per-core `Pager` behind the five-method interface (`FileBlockStore` in each core's
-  `blockstore.{rs,go,ts}`), with the policy left in the host-independent `Pager`. A pure refactor —
+  per-core `Pager` behind the five-method interface (`FileBlockStore` — `blockstore.{rs,go}`, and TS
+  `fileblockstore.ts` since the OPFS split left `blockstore.ts` interface-only), with the policy left in
+  the host-independent `Pager`. A pure refactor —
   the goldens, the conformance corpus, the crash-recovery suites, and the NoREC sweep are all
   unchanged. Foundation for every host below.
   - **In-memory path — deliberately left separate** (a documented divergence from this item's
@@ -262,8 +298,14 @@ as it crosses. See the two docs for the full designs.
     `resident_leaves() == 0`); routing it through a byte-buffer `BlockStore` + pager + pool would
     change observable residency and commit/no-op semantics, so it is **not** a behavior-preserving
     refactor. Unifying it stays deferred (the §4 in-memory row's eventual shape).
-- **OPFS host** — ⏳ to build (§5), validated by file-host parity. Now a thin adapter against the
-  extracted seam (the one new `BlockStore`), not a second pager.
+- **OPFS host** — ✅ **landed** in the TS core (§5): `OpfsBlockStore`, a thin adapter against the
+  extracted seam (not a second pager), plus the Web-Worker packaging + async client. Validated by
+  file-host byte parity (Node parity test) + a gated real-browser e2e. TS-only.
+  - **Deferred OPFS follow-ons** (none foreclosed): disk-spill for OPFS (the `ORDER BY` external merge
+    sort currently stays resident for OPFS — `db.path` is null so the `SpillSink` is unset; an
+    OPFS-backed `SpillSink` is the path); read-only multi-handle via `createSyncAccessHandle({ mode })`
+    (not portable yet); and running the real-browser e2e in CI (needs a headless-Chromium binary, today
+    outside `rake ci`).
 - **Encryption codec** — ⏳ design door ([encryption.md](encryption.md)); not built. Crypto is a
   §14 vetted-library decision requiring explicit confirmation before any dependency lands.
 - **Replication tee** — ⏳ design door ([replication.md](replication.md)); block-shipping decided,
