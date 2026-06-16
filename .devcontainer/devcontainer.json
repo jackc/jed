@@ -14,7 +14,8 @@
     "MISE_CACHE_DIR":    "/persist/shared/mise/cache",
     "PSQL_HISTORY":      "/persist/shared/psql/history",
     "PGSERVICEFILE":     "/persist/shared/psql/.pg_service.conf",
-    "PGPASSFILE":        "/persist/shared/psql/.pgpass"
+    "PGPASSFILE":        "/persist/shared/psql/.pgpass",
+    "PLAYWRIGHT_BROWSERS_PATH": "/persist/shared/playwright"
   },
 
   // Features to add to the dev container. More info: https://containers.dev/features.
