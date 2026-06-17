@@ -364,3 +364,16 @@ reason = "jed: a parenthesized-join FROM is a deferred narrowing — a leading `
 file = "subquery/derived.test"
 sql = "SELECT * FROM (WITH c AS (SELECT 1 AS one) SELECT one FROM c) AS d"
 reason = "jed: a derived-table body is the WITH-less query_expr, so a nested WITH is 42601 (the top-level-only narrowing — grammar.md §42, cte.md §1; shared with the §26 subquery forms). PostgreSQL 18 accepts a WITH-prefixed subquery body and returns 1. A deliberate, documented narrowing."
+
+# --- array.test PRE-EXISTING divergences (surfaced during the Batch 2 / G6–G9 work; predate it,
+# identical on the committed file). Both are intentional jed behavior, registered to keep the
+# ledger complete (conformance.md §5).
+[[override]]
+file = "types/array.test"
+sql = "SELECT id FROM t WHERE xs = tags"
+reason = "jed: comparing int32[] to text[] is a cross-type error 42804 (the strict type system, §4 — like bool = int). PostgreSQL has no such operator and raises 42883 (undefined_function). Both reject; the codes differ."
+
+[[override]]
+file = "types/array.test"
+sql = "CREATE TABLE k (xs int32[] PRIMARY KEY)"
+reason = "jed: an array PRIMARY KEY is rejected 0A000 this slice (the order-preserving array key encoding is authored but unexercised — array.md §12). PostgreSQL allows an array primary key, so it does NOT raise. A documented narrowing."

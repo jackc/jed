@@ -16,7 +16,10 @@ INSERT INTO t VALUES (2, 5000000000)
 statement ok
 INSERT INTO t VALUES (3, 1000)
 
-# int64 -> int32 narrowing that fits
+# int64 -> int32 narrowing that fits. The `# types:` directive pins the CAST target width — the
+# resolved type is int32, not the int64 source (all integer widths render under `I`, so this is
+# invisible on rows alone).
+# types: int32
 query I nosort
 SELECT CAST(b AS int32) FROM t WHERE id = 1
 ----
@@ -36,7 +39,9 @@ SELECT CAST(1000 AS int16) FROM t WHERE id = 1
 ----
 1000
 
-# chained narrowing int64 -> int32 -> int16, fits at every step (b = 1000)
+# chained narrowing int64 -> int32 -> int16, fits at every step (b = 1000). The outermost CAST
+# fixes the resolved type at int16.
+# types: int16
 query I nosort
 SELECT CAST(CAST(b AS int32) AS int16) FROM t WHERE id = 3
 ----

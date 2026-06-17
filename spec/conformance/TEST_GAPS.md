@@ -89,6 +89,49 @@ The ledger now holds **61** overrides (was 54 pre-Batch-1: +3 earlier, +4 here).
 
 ---
 
+## Batch 2 status — LANDED 2026-06-17 (G5–G11)
+
+All pass on **all three cores** (`124 passed, 0 failed`), `rake ci` green, and all five touched
+files oracle-check byte-identically against PG (no new overrides needed for the additions).
+Empirically derived via the Rust CLI, cross-checked on every core's harness.
+
+- **G5** — [suites/subquery/in.test](suites/subquery/in.test): a NULL-`k` row added; pins NULL LHS
+  of `[NOT] IN` — empty fold is FALSE/TRUE independent of the LHS (even NULL), non-empty makes a
+  NULL LHS UNKNOWN.
+- **G6** — [suites/types/array.test](suites/types/array.test): array comparison with NULL
+  *elements* yields a **definite** boolean (PG btree, not composite 3VL) — `<`/`>`/`<=`/`=` and
+  ORDER BY (`{1,NULL}` sorts last). (jed has no `<>`/`!=` — grammar.ebnf:499 — so inequality uses
+  `<`/`>`.)
+- **G7** — [promotion.test](suites/compare/promotion.test) + [narrowing.test](suites/cast/narrowing.test):
+  `# types:` pins the promoted width (`int16+int32→int32`, `int16/int32+int64→int64`) and CAST
+  target (`int32`, chained `int16`) — invisible on rows since all integers render `I`.
+- **G8** — array.test: `array_out`/`array_in` quoting — empty string, the `NULL` token vs quoted
+  `"NULL"`, case-insensitive unquoted `nUlL`, whitespace trim, `\"`/`\\`/brace escaping.
+- **G9** — array.test: `text[]` ORDER BY + equality recurse into the element comparator
+  (lowercase-ASCII so collation-independent / oracle-clean; the UTF-8/astral byte-order edge is
+  pinned scalar-side in text.test, same comparator).
+- **G10** — [suites/types/decimal.test](suites/types/decimal.test): exact-half ties round away
+  (`0.125→0.13`, `-0.125→-0.13`, `0.135→0.14`); negative zero never survives (`CAST(-0.4 AS int32)→0`,
+  `-0.0→0.0`).
+- **G11** — [suites/types/float.test](suites/types/float.test): `float64→float32` cast (narrowing)
+  + the binary32-rounding witness `CAST(float32 '0.1' AS float64) → 0.10000000149011612` (diff from
+  float64 `0.1` ≈1.49e-9 > the harness's 1e-9 R-tag tolerance, so it's distinguishable). The `-0`
+  render and NaN canonicalization are **not** corpus-assertable (the R tag treats `-0==+0`,
+  `NaN==NaN`) — correctly covered by per-core tests (Go `TestFloatStoredNegZeroPreservesBits`, TS
+  `renderFloat: specials and -0`) and golden fixtures.
+
+### Findings / cleanups during Batch 2
+
+- **2 pre-existing array.test overrides registered** (they predate Batch 2 — identical on the
+  committed file — and were unledgered): `xs = tags` (jed `42804` cross-type vs PG `42883`) and the
+  array-PK `0A000` (PG allows an array primary key). Ledger now **63**.
+- **Pre-existing, left as-is:** `SELECT DISTINCT xs FROM s` (a `rowsort` query) textually diffs
+  under `corpus:check` because the importer regenerates it in PG's hash-emission order; this is an
+  importer-ordering artifact, **not** a semantic divergence — the conformance harness compares
+  `rowsort` order-insensitively and all three cores pass.
+
+---
+
 ## P0 — verified, highest impact
 
 ### G1 — Float math-function family has **zero** tests  → `expr/scalar_functions.test`

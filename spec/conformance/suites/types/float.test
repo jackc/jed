@@ -142,6 +142,22 @@ SELECT min(d), max(d) FROM t
 -0.5
 NaN
 
+# --- float64 <-> float32 casts: the narrowing direction + the binary32-rounding witness ---
+# float64 -> float32 is an explicit narrowing; an exactly-representable value is preserved.
+query R nosort
+SELECT CAST(float64 '1.5' AS float32)
+----
+1.5
+
+# float32 cannot represent 0.1 exactly. Widening that float32 back to float64 EXPOSES the binary32
+# rounding: the value is the nearest binary32 to 0.1, rendered in full — distinct from float64 0.1,
+# and identical across cores (Rust `as f32`, Go float32(), TS Math.fround). The float32-precision
+# witness (the narrowing's lossiness is invisible until widened back).
+query R nosort
+SELECT CAST(float32 '0.1' AS float64)
+----
+0.10000000149011612
+
 # --- a float64 / float32 PRIMARY KEY is rejected this slice (the float-order-preserving key
 # encoding is authored but unexercised — encoding.md §2.8) ---
 statement error 0A000

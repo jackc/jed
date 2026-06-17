@@ -71,3 +71,39 @@ SELECT id FROM a WHERE k IN (SELECT v FROM vals) ORDER BY id
 query I nosort
 SELECT id FROM a WHERE k NOT IN (SELECT v FROM vals) ORDER BY id
 ----
+
+# --- a NULL on the LHS of [NOT] IN. The empty-result fold (FALSE for IN, TRUE for NOT IN) is
+# independent of the LHS, even when it is NULL; a non-empty result makes a NULL LHS UNKNOWN. Add a
+# NULL-k row so these run with a NULL left operand.
+statement ok
+INSERT INTO a VALUES (4, NULL)
+
+# NULL IN (empty) -> FALSE (the empty fold is FALSE for every LHS): no rows.
+query I nosort
+SELECT id FROM a WHERE k IN (SELECT k FROM b WHERE id = 99) ORDER BY id
+----
+
+# NULL NOT IN (empty) -> TRUE: ALL rows survive, the NULL-k row (id 4) included — the empty NOT-IN
+# fold is TRUE regardless of whether the LHS is NULL.
+query I nosort
+SELECT id FROM a WHERE k NOT IN (SELECT k FROM b WHERE id = 99) ORDER BY id
+----
+1
+2
+3
+4
+
+# NULL IN (non-empty {20,30,40}) -> UNKNOWN for the NULL-k row (dropped); the matching non-NULL
+# rows (k=20,30) survive.
+query I nosort
+SELECT id FROM a WHERE k IN (SELECT k FROM b) ORDER BY id
+----
+2
+3
+
+# NULL NOT IN (non-empty, no NULLs) -> UNKNOWN for the NULL-k row (dropped); the non-matching
+# non-NULL row (id 1, k=10) survives.
+query I nosort
+SELECT id FROM a WHERE k NOT IN (SELECT k FROM b) ORDER BY id
+----
+1

@@ -121,3 +121,128 @@ SELECT id FROM t WHERE xs = tags
 # An array PRIMARY KEY is rejected 0A000 — the key encoding is authored but unexercised.
 statement error 0A000
 CREATE TABLE k (xs int32[] PRIMARY KEY)
+
+# --- array comparison with NULL ELEMENTS yields a DEFINITE boolean (PG btree semantics, array.md
+# §5), NOT the composite 3VL rule: a NULL element sorts LAST (is the largest), every comparison is
+# TRUE or FALSE (never NULL/UNKNOWN), and NULL elements are mutually equal. (jed has no <> / !=
+# operator, so inequality is exercised via <, >, <=, >= — grammar.ebnf.)
+statement ok
+CREATE TABLE cmpn (id int32 PRIMARY KEY, xs int32[])
+
+statement ok
+INSERT INTO cmpn VALUES (1, ARRAY[1,2]), (2, ARRAY[1,NULL]), (3, ARRAY[1,3]), (4, ARRAY[1])
+
+# ORDER BY: a shorter prefix sorts first, then element-wise; a NULL element sorts after every
+# non-NULL, so {1,NULL} is last: {1} < {1,2} < {1,3} < {1,NULL}.
+query T nosort
+SELECT xs FROM cmpn ORDER BY xs
+----
+{1}
+{1,2}
+{1,3}
+{1,NULL}
+
+# {1,NULL} > {1,3}: the 2nd element NULL is larger than 3 -> TRUE (definite, not UNKNOWN).
+query B nosort
+SELECT xs > ARRAY[1,3] FROM cmpn WHERE id = 2
+----
+true
+
+# {1,2} <= {1,NULL}: 2 < NULL -> TRUE.
+query B nosort
+SELECT xs <= ARRAY[1,NULL] FROM cmpn WHERE id = 1
+----
+true
+
+# {1,NULL} = {1,NULL}: NULL elements are mutually equal -> TRUE (not UNKNOWN).
+query B nosort
+SELECT xs = ARRAY[1,NULL] FROM cmpn WHERE id = 2
+----
+true
+
+# --- array_out / array_in text I/O (array.md §7). An element is double-quoted when it is empty,
+# contains a delimiter/brace/quote/backslash, or equals the word NULL; `"` and `\` are
+# backslash-escaped. The unquoted token NULL (any case) is a NULL ELEMENT; "NULL" (quoted) is the
+# 4-character string. array_in is the inverse and trims unquoted surrounding whitespace.
+statement ok
+CREATE TABLE aio (id int32 PRIMARY KEY, tags text[])
+
+statement ok
+INSERT INTO aio VALUES
+  (1, '{""}'),
+  (2, '{NULL}'),
+  (3, '{"NULL"}'),
+  (4, '{nUlL}'),
+  (5, '{a,"NULL",c}'),
+  (6, '{ x , y }')
+
+query IT nosort
+SELECT id, tags FROM aio ORDER BY id
+----
+1
+{""}
+2
+{NULL}
+3
+{"NULL"}
+4
+{NULL}
+5
+{a,"NULL",c}
+6
+{x,y}
+
+# the unquoted-NULL element (id 2) is a NULL ELEMENT, not a NULL array: IS NULL is false (no rows).
+query I nosort
+SELECT id FROM aio WHERE tags IS NULL ORDER BY id
+----
+
+# the quoted "NULL" (id 3) is the 4-character string and equals ARRAY['NULL']; the NULL-element
+# row (id 2) does not.
+query I nosort
+SELECT id FROM aio WHERE tags = ARRAY['NULL'] ORDER BY id
+----
+3
+
+# array_out escapes an embedded double-quote (\") and backslash (\\), and quotes a brace-bearing
+# element.
+statement ok
+CREATE TABLE aesc (id int32 PRIMARY KEY, tags text[])
+
+statement ok
+INSERT INTO aesc VALUES (1, ARRAY['a"b']), (2, ARRAY['a\b']), (3, ARRAY['{x}'])
+
+query T nosort
+SELECT tags FROM aesc ORDER BY id
+----
+{"a\"b"}
+{"a\\b"}
+{"{x}"}
+
+# --- text[] comparison/ORDER BY recurses into the element's text comparator (array.md §5) — the
+# path where the TS UTF-16-vs-UTF-8 ordering trap must not surface (the per-element byte/astral
+# edge is pinned scalar-side in types/text.test; the same comparator is reused here). Lowercase
+# ASCII so the ordering is collation-independent (oracle-clean): a shorter prefix sorts first.
+statement ok
+CREATE TABLE tarr (id int32 PRIMARY KEY, tags text[])
+
+statement ok
+INSERT INTO tarr VALUES (1, ARRAY['banana']), (2, ARRAY['apple']), (3, ARRAY['apple','zebra']), (4, ARRAY['cherry'])
+
+query IT nosort
+SELECT id, tags FROM tarr ORDER BY tags
+----
+2
+{apple}
+3
+{apple,zebra}
+1
+{banana}
+4
+{cherry}
+
+# text[] equality recurses element-wise too (collation-independent).
+query I nosort
+SELECT id FROM tarr WHERE tags = ARRAY['apple','zebra']
+----
+3

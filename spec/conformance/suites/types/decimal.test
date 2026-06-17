@@ -268,3 +268,40 @@ INSERT INTO c VALUES (10, 5e2, 0)
 # max_int_digits, so it traps 22003 (PG's numeric overflow), exactly like the written-out form
 statement error 22003
 INSERT INTO enote VALUES (99, 1e131072)
+
+# --- exact-half rounding ties + negative-zero canonicalization (decimal.md §2/§3) -------------
+# Rounding is half-AWAY-from-zero, so an exact .5 at the rounding digit rounds up in magnitude:
+# 0.125 -> 0.13, -0.125 -> -0.13, 0.135 -> 0.14 at scale 2. This is the canonical determinism
+# example (§3); the money table above uses 1.555/1.554, which are not exact halves at the digit.
+statement ok
+CREATE TABLE htie (id int32 PRIMARY KEY, x numeric(10,2))
+
+statement ok
+INSERT INTO htie VALUES (1, 0.125), (2, -0.125), (3, 0.135)
+
+query D nosort
+SELECT x FROM htie ORDER BY id
+----
+0.13
+-0.13
+0.14
+
+# Negative zero never survives: a decimal carries a positive sign on every zero (§2), so a value
+# that rounds to zero renders 0, never -0. CAST(-0.4 AS int32) rounds half-away to 0 (magnitude
+# < 0.5); the literals -0.0 / -0.000 store and render as 0.0 / 0.000 (scale kept, sign dropped).
+query I nosort
+SELECT CAST(-0.4 AS int32) FROM htie WHERE id = 1
+----
+0
+
+statement ok
+CREATE TABLE nz (id int32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO nz VALUES (1, -0.0), (2, -0.000)
+
+query D nosort
+SELECT v FROM nz ORDER BY id
+----
+0.0
+0.000
