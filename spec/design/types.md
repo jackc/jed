@@ -247,6 +247,20 @@ matrix (§5: adaptation is a value-checked coercion, never a silent reinterpret)
 promotion tower (§4: once typed, a literal participates like any value), and trap-on-overflow
 (§3).
 
+**Deliberate PostgreSQL divergence (the no-context default).** PostgreSQL does *not* treat a
+bare integer constant as untyped: it assigns the **smallest fitting** type at parse time —
+`int4` if it fits, else `int8`, else `numeric` — independent of context. jed's untyped-constant
+model adapts to context instead, and where there is no context it defaults to **`int64`**, *not*
+PG's smallest-fitting `int4`. Two observable consequences, both intentional: (a) a context-free
+integer literal — including the elements of a bare `ARRAY[…]` constructor, which is a no-context
+position — is `int64`, so `ARRAY[1,2,3]` is `int64[]` where PG infers `int4[]`
+([array-functions.md §2/§5 #8](array-functions.md)); (b) literal-only arithmetic is more
+permissive than PG — `2000000000 + 2000000000` computes to `int64` `4000000000`, where PG
+overflows `int4` (`22003`). This is the one place jed's literal typing diverges from PG by
+default (CLAUDE.md §1/§8); the strict comparison/assignment behavior above matches the *intent*
+of a strict type system and is stricter than PG (PG silently returns no rows for
+`int2_col = 100000`, jed raises `22003`).
+
 **String literals adapt to a `bytea` context (the same principle).** A single-quoted literal
 is a `text` value by default (it has the one collation `C`; unlike an integer literal it has no
 width to choose among — §11). But once `bytea` exists (§13) a *string* literal, like an integer
