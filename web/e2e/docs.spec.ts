@@ -36,6 +36,14 @@ test('the select page runs the array containment operators live (@> / <@ / &&)',
 	await expect(panel.getByTestId('result-rows')).toContainText('true');
 });
 
+test('the select page runs the ANY/ALL quantified comparisons live', async ({ page }) => {
+	await page.goto('/docs/sql/select/');
+	// Fifth LiveSql panel = the = ANY / > ALL demo: any_match true, all_greater true, no_match false.
+	const panel = page.getByTestId('live-sql').nth(4);
+	await expect(panel.getByTestId('result-rows')).toContainText('true');
+	await expect(panel.getByTestId('result-rows')).toContainText('false');
+});
+
 test('the reference pages are generated from the spec', async ({ page }) => {
 	await page.goto('/docs/reference/errors/');
 	// 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.

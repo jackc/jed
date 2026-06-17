@@ -123,6 +123,12 @@ export type Expr =
   // `lhs [NOT] IN ( query_expr )` (spec/design/grammar.md §26) — membership of lhs in the
   // subquery's single output column (three-valued, like a literal IN).
   | { kind: "inSubquery"; lhs: Expr; query: QueryExpr; negated: boolean }
+  // `lhs op ANY/SOME/ALL ( array )` — a quantified array comparison (spec/design/array-functions.md
+  // §11), the array spelling of IN. `op` is a comparison (eq/lt/gt/le/ge); `all` is true for ALL,
+  // false for ANY/SOME (SOME folds to ANY at parse). The three-valued fold over the array's
+  // flattened elements reuses the IN-list membership semantics, generalized to all five comparison
+  // operators and both quantifiers. The subquery form `op ANY(SELECT …)` is a deferred 0A000.
+  | { kind: "quantified"; op: BinaryOp; all: boolean; lhs: Expr; array: Expr }
   // A `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Builds a row value from
   // the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The bare
   // `(a, b)` form is deferred (0A000); only the keyword form parses.

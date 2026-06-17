@@ -1,0 +1,161 @@
+# Array function/operator surface AF5 (spec/design/array-functions.md §11): the ANY/ALL/SOME quantified
+# array comparisons (x = ANY(arr), x op ALL(arr)) — the array spelling of IN and its universal dual.
+# Three-valued over the array's FLATTENED elements: ANY/SOME is the OR-fold (TRUE if any x op e is TRUE,
+# else NULL if any is NULL, else FALSE; empty → FALSE), ALL is the AND-fold (FALSE if any is FALSE, else
+# NULL if any is NULL, else TRUE; empty → TRUE). A NULL array operand → NULL. The right operand must be an
+# array (a non-array side is 42809); an incomparable element type is 42883; a bare untyped NULL is 42P18;
+# the subquery quantifier form op ANY(SELECT …) is a deferred 0A000. PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.int32, types.text, func.array_quantified, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, x int32, xs int32[])
+
+# Row 1: x in xs. Row 2: x not in xs. Row 3: x matches, with a NULL element. Row 4: x absent, with a
+# NULL element. Row 5: an EMPTY xs. Row 6: a NULL xs. Row 7: a NULL x over a non-empty array. Row 8: a
+# NULL x over the empty array (the empty short-circuit beats the NULL x for ALL). The int32 column / int32[]
+# array align with PostgreSQL's int4 on both sides, so the comparisons resolve in BOTH engines.
+statement ok
+INSERT INTO t VALUES
+  (1, 2, ARRAY[1,2,3]),
+  (2, 5, ARRAY[1,2,3]),
+  (3, 2, ARRAY[2,NULL]),
+  (4, 1, ARRAY[2,NULL]),
+  (5, 2, '{}'),
+  (6, 2, NULL),
+  (7, NULL, ARRAY[1,2,3]),
+  (8, NULL, '{}')
+
+# --- x = ANY(xs) : the OR-fold (the array spelling of IN) -----------------------------------
+# Row 1 true; row 2 false; row 3 true (a match dominates the NULL element); row 4 NULL (no match, a NULL
+# element); row 5 false (empty → FALSE); row 6 NULL (NULL array); rows 7/8 NULL/false (a NULL x).
+query IB nosort
+SELECT id, x = ANY(xs) FROM t ORDER BY id
+----
+1
+true
+2
+false
+3
+true
+4
+NULL
+5
+false
+6
+NULL
+7
+NULL
+8
+false
+
+# --- x = ALL(xs) : the AND-fold -----------------------------------------------------------
+# Row 1 false; row 2 false; row 3 NULL (a NULL element, no FALSE); row 4 false (a FALSE element dominates
+# the NULL); row 5 true (empty → TRUE); row 6 NULL (NULL array); row 7 NULL; row 8 true (empty beats NULL x).
+query IB nosort
+SELECT id, x = ALL(xs) FROM t ORDER BY id
+----
+1
+false
+2
+false
+3
+NULL
+4
+false
+5
+true
+6
+NULL
+7
+NULL
+8
+true
+
+# --- as a WHERE filter: only the definitely-TRUE rows pass (NULL / FALSE are excluded) --------
+query I nosort
+SELECT id FROM t WHERE x = ANY(xs) ORDER BY id
+----
+1
+3
+
+# x > ALL(xs): row 2 (5 > all of {1,2,3}); the empty-array rows 5 (x=2) and 8 (x=NULL) are vacuously
+# TRUE too (ALL over the empty array is TRUE regardless of x), so they pass the filter.
+query I nosort
+SELECT id FROM t WHERE x > ALL(xs) ORDER BY id
+----
+2
+5
+8
+
+# --- the ordering operators, as bare expressions ------------------------------------------
+# Cost (the per-element membership charge, like IN — array-functions.md §11.4): 1 (the ARRAY[…]
+# constructor node) + 1 (the quantified node) + 3 (one operator_eval per element compared) + 1
+# (the produced row) = 6, byte-identical across rust/go/ts (a §8 / §13 cross-core contract).
+# cost: 6
+query B nosort
+SELECT 5 < ANY(ARRAY[1,2,10])
+----
+true
+
+query B nosort
+SELECT 5 > ALL(ARRAY[1,2,3])
+----
+true
+
+query B nosort
+SELECT 5 <= ALL(ARRAY[5,6,7])
+----
+true
+
+query B nosort
+SELECT 5 > ALL(ARRAY[1,2,9])
+----
+false
+
+# --- SOME is the SQL-standard synonym for ANY ---------------------------------------------
+query B nosort
+SELECT 2 = SOME(ARRAY[1,2,3])
+----
+true
+
+# --- the comparison is over the FLATTENED element multiset (any dimensionality) ------------
+query B nosort
+SELECT 3 = ANY(ARRAY[ARRAY[1,2],ARRAY[3,4]])
+----
+true
+
+query B nosort
+SELECT 4 = ALL(ARRAY[ARRAY[4,4],ARRAY[4,4]])
+----
+true
+
+# A custom lower bound is irrelevant (the quantifiers compare ELEMENTS, not subscripts).
+query B nosort
+SELECT 20 = ANY('[5:6]={10,20}'::int32[])
+----
+true
+
+# --- the empty / NULL array via a typed literal, as bare expressions -----------------------
+query B nosort
+SELECT 1 = ANY('{}'::int32[])
+----
+false
+
+query B nosort
+SELECT 1 = ALL('{}'::int32[])
+----
+true
+
+# --- errors (only the PG-matching ones; the divergent cases are unit-test-only) ------------
+# A non-array right side is 42809 (op ANY/ALL (array) requires array on right side) — PG's code.
+statement error 42809
+SELECT 1 = ANY(5)
+
+# An incomparable element type is 42883 (operator does not exist: integer = text) — PG's code.
+statement error 42883
+SELECT 1 = ANY(ARRAY['a','b'])
+
+# Deliberately OUT of this oracle corpus (PG does not error, so they cannot be oracle-regenerated;
+# the AF3 unnest(NULL) precedent): a bare untyped NULL operand `1 = ANY(NULL)` is 42P18 (jed's
+# indeterminate posture; PG returns NULL), and the subquery form `1 = ANY(SELECT 1)` is a deferred
+# 0A000 (PG runs it). Both are covered by the per-core unit tests (impl/*/…array_quantified*).

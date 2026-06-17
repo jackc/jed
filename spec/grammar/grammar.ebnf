@@ -454,8 +454,16 @@ not_expr       ::= "NOT" not_expr
  * expression. PostgreSQL binds IN/BETWEEN/LIKE slightly tighter than the comparison operators;
  * collapsing them into this one non-associative level is a documented narrowing (unobservable,
  * since chaining comparisons is already a syntax error here). Every comparison operand is a
- * `concat` expression, so the `||` operator (one rung tighter) is available inside them. */
-comparison     ::= concat ( compare_op concat
+ * `concat` expression, so the `||` operator (one rung tighter) is available inside them.
+ *
+ * A `compare_op` may be followed by a QUANTIFIER — "ANY"/"SOME" (existential) or "ALL"
+ * (universal) — over a parenthesized array expression (../design/array-functions.md §11):
+ * "x = ANY(arr)" is true iff x equals some element, "x op ALL(arr)" iff x op holds for every
+ * element, three-valued over a NULL element / a NULL x exactly like the IN-list membership. The
+ * operand is a full `expr` resolving to an array (a non-array right side is 42809); the subquery
+ * form "op ANY(SELECT …)" is a deferred 0A000 (a distinct Phase-4 item). "SOME" is a synonym
+ * for "ANY". */
+comparison     ::= concat ( compare_op ( ("ANY" | "SOME" | "ALL") "(" expr ")" | concat )
                             | "IS" "NOT"? "NULL"
                             | "IS" "NOT"? "DISTINCT" "FROM" concat
                             | "NOT"? "IN" "(" ( query_expr | concat ("," concat)* ) ")"

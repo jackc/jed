@@ -246,10 +246,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         mismatch → `42883`. All three cores + per-core unit test, oracle-checked
         (`suites/expr/array_containment.test`), capability `func.array_containment`, `/web` select-page
         live example + e2e. → [array-functions.md §10](spec/design/array-functions.md)
+  - [x] **AF5 — `ANY`/`ALL`/`SOME` quantified array comparisons** — `x = ANY(arr)` (the array
+        spelling of `IN`) and `x op ALL(arr)` (its universal dual), three-valued over the array's
+        flattened elements. A grammar + resolver + evaluator slice with **no new token / catalog row**
+        (`ANY`/`SOME`/`ALL` are keywords recognized as a quantifier after a `compare_op`, grammar.md
+        §41): an `Expr::Quantified`/`RExpr::Quantified` node whose 3VL fold **reuses the `IN`-list
+        membership machinery** (`eq3`/`lt3`/`gt3`; `ANY` is the OR-fold, `ALL` the AND-fold), charging
+        per-element like `IN` so `max_cost` bounds it (54P01). The right operand must be an array (a
+        non-array side is `42809`); an incomparable element type is `42883`; a bare untyped `NULL`
+        operand is `42P18`; the `op ANY(SELECT …)` **subquery** form stays a deferred `0A000` Phase-4
+        item. All three cores + per-core unit test, oracle-checked
+        (`suites/expr/array_quantified.test`), capability `func.array_quantified`, `/web` select-page
+        live example + e2e. → [array-functions.md §11](spec/design/array-functions.md)
   - [ ] _follow-ons (each its own slice + obligations; sequenced in array-functions.md §6):_
-        **AF5** `ANY`/`ALL` quantified comparisons; **AF6** `VARIADIC`. Plus: array-of-composite
-        elements; arrays-in-keys (`0A000`, encoding authored §8); runtime text→array, `array::text`,
-        and element-wise array→array casts.
+        **AF6** `VARIADIC`. Plus: array-of-composite elements; arrays-in-keys (`0A000`, encoding
+        authored §8); the subquery quantifier form `op ANY(SELECT …)`; runtime text→array,
+        `array::text`, and element-wise array→array casts.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis**, sibling to `array` and sharing ~80% of its foundation, so sequence
       the two together. **The headline implication: this turns the *closed* type enum into an *open*,

@@ -30,6 +30,10 @@ ORDER BY u;`;
 	const containmentExample = `SELECT ARRAY[1, 2, 3] @> ARRAY[2]   AS contains,
        ARRAY[2]       <@ ARRAY[1, 2, 3] AS contained_by,
        ARRAY[1, 2]    && ARRAY[2, 3]    AS overlaps;`;
+
+	const quantifiedExample = `SELECT 2 = ANY(ARRAY[1, 2, 3])  AS any_match,
+       5 > ALL(ARRAY[1, 2, 3])  AS all_greater,
+       9 = ANY(ARRAY[1, 2, 3])  AS no_match;`;
 </script>
 
 <svelte:head>
@@ -69,6 +73,16 @@ element. Matching is strict — a `NULL` element matches nothing, including anot
 `NULL` whole array yields `NULL`:
 
 <LiveSql query={containmentExample} rows={2} />
+
+## Quantified comparisons (`ANY` / `ALL`)
+
+A comparison operator followed by `ANY` (or its synonym `SOME`) or `ALL` over an array tests it
+against every element. `x = ANY(arr)` is the array spelling of `IN` — true when `x` equals some
+element; `x op ALL(arr)` is true when the comparison holds for every element. Both are three-valued,
+exactly like `IN`: a `NULL` element (or a `NULL` `x`) makes the result `NULL` when no element settles
+it, an empty array makes `ANY` false and `ALL` true, and a `NULL` whole array yields `NULL`:
+
+<LiveSql query={quantifiedExample} rows={2} />
 
 ## Cost
 

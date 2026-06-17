@@ -1834,6 +1834,29 @@ func (p *Parser) parseComparison() (Expr, error) {
 		return lhs, nil
 	}
 	p.advance()
+	// `op ANY/SOME/ALL ( array )` — a quantified array comparison (grammar.md §41): a quantifier
+	// may stand in for the ordinary right operand. SOME folds to ANY.
+	if kw := p.peekKeyword(); kw == "all" || kw == "any" || kw == "some" {
+		all := kw == "all"
+		p.advance() // ANY / SOME / ALL
+		if err := p.expect(TokLParen); err != nil {
+			return Expr{}, err
+		}
+		// The subquery quantifier form `op ANY(SELECT …)` is a separate deferred Phase-4 item
+		// (array-functions.md §11); only the array operand is supported.
+		if p.peekKeyword() == "select" {
+			return Expr{}, NewError(FeatureNotSupported,
+				"the subquery form of ANY/ALL is not supported; use an array operand")
+		}
+		array, err := p.parseExpr() // a full expression resolving to an array
+		if err != nil {
+			return Expr{}, err
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprQuantified, Quantified: &QuantifiedExpr{Op: op, All: all, Lhs: lhs, Array: array}}, nil
+	}
 	rhs, err := p.parseConcat()
 	if err != nil {
 		return Expr{}, err

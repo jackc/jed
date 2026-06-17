@@ -1759,3 +1759,31 @@ operators** ([array-functions.md §10](array-functions.md)) — three polymorphi
   NULL); their element matching is **strict equality** — a NULL element matches nothing — over the
   flattened element multiset (any dimensionality), the one place they differ from the search
   functions' NOT DISTINCT FROM (array-functions.md §10).
+
+## 41. The `ANY` / `ALL` quantified array comparisons (`x op ANY(arr)`, `x op ALL(arr)`)
+
+A comparison operator may be followed by a **quantifier** — `ANY`/`SOME` (existential) or `ALL`
+(universal) — over a parenthesized **array** expression ([array-functions.md §11](array-functions.md)).
+`x = ANY(arr)` is the array spelling of `IN`; `x op ALL(arr)` is its universal dual. It is the one
+grammar change AF5 makes — **no new tokens** (`ANY`/`SOME`/`ALL` are plain keywords):
+
+- **Grammar.** A `compare_op` (`= < > <= >=`) is followed by *either* a quantifier `(`expr`)` *or*
+  the ordinary `concat` right operand ([grammar.ebnf](../grammar/grammar.ebnf) `comparison`). The
+  parser, after taking the operator, peeks `ANY`/`SOME`/`ALL`; if present it consumes `( expr )` and
+  builds an `Expr::Quantified { op, all, lhs, array }` (`all = true` for `ALL`, `false` for
+  `ANY`/`SOME`). The operand is a **full `expr`** (so `ARRAY[…]`, `'{…}'::T[]`, a column, or a `||`
+  expression all fit). It is **non-associative**, like the comparisons it extends.
+- **`SOME` is `ANY`** (SQL-standard synonym), folded at parse time.
+- **Semantics** ([array-functions.md §11](array-functions.md)): three-valued over the array's
+  flattened elements — `ANY` is the OR-fold (TRUE if any `x op e` is TRUE; else NULL if any is NULL;
+  else FALSE; **empty → FALSE**), `ALL` is the AND-fold (FALSE if any is FALSE; else NULL if any is
+  NULL; else TRUE; **empty → TRUE**). A NULL array operand → NULL. This reuses the `IN`-list 3VL
+  membership machinery (`x = ANY(arr)` ≡ `x IN (the elements)`), generalized to all five comparison
+  operators and both quantifiers.
+- **Resolution.** `x` and the array operand are resolved with the same literal adaptation the
+  comparison operators use (a bare-literal `x` adapts to the element type; a bare `ARRAY[…]` adapts
+  to `x`'s type). The right operand must be an **array** — a non-array right side is **`42809`**
+  (`op ANY/ALL (array) requires array on right side`, PG) — whose element type must be **comparable**
+  with `x` (else `42883`, PG's `operator does not exist`). The result is always `boolean`. A bare
+  untyped `NULL` array operand is **`42P18`** (jed's polymorphic indeterminate posture, §11). The
+  **subquery** form `op ANY(SELECT …)` is a separate deferred feature — the parser raises `0A000`.

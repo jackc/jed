@@ -4351,6 +4351,10 @@ impl Database {
                 Ok(())
             }
             RExpr::InValues { lhs, .. } => self.fold_uncorrelated_in_rexpr(lhs, bound, cost),
+            RExpr::Quantified { lhs, array, .. } => {
+                self.fold_uncorrelated_in_rexpr(lhs, bound, cost)?;
+                self.fold_uncorrelated_in_rexpr(array, bound, cost)
+            }
             // Leaves and the (already-handled) Subquery: nothing to recurse into.
             RExpr::Subquery { .. }
             | RExpr::Column(_)
@@ -5094,6 +5098,19 @@ enum RExpr {
         lhs: Box<RExpr>,
         list: Vec<Value>,
         negated: bool,
+    },
+    /// A quantified array comparison `lhs op ANY/ALL(array)` (spec/design/array-functions.md §11):
+    /// the array spelling of `IN`. At eval `lhs` is evaluated ONCE, `array` once; then a 3-valued
+    /// fold over the array's flattened elements — `ANY` (all=false) is the OR-fold (TRUE if any
+    /// `lhs op e` is TRUE, else NULL if any is NULL, else FALSE; empty → FALSE), `ALL` (all=true)
+    /// the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE; empty → TRUE). A
+    /// NULL array → NULL. Charges like `InValues`: one `operator_eval` for the node plus one per
+    /// element compared (so `max_cost` bounds the walk).
+    Quantified {
+        op: CmpOp,
+        all: bool,
+        lhs: Box<RExpr>,
+        array: Box<RExpr>,
     },
 }
 
@@ -5999,6 +6016,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::In { lhs, list, .. } => {
             expr_has_aggregate(lhs) || list.iter().any(expr_has_aggregate)
         }
+        Expr::Quantified { lhs, array, .. } => expr_has_aggregate(lhs) || expr_has_aggregate(array),
         Expr::Between { lhs, lo, hi, .. } => {
             expr_has_aggregate(lhs) || expr_has_aggregate(lo) || expr_has_aggregate(hi)
         }
@@ -6071,6 +6089,10 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
         Expr::In { lhs, list, .. } => {
             reject_check_structure(lhs)?;
             list.iter().try_for_each(reject_check_structure)
+        }
+        Expr::Quantified { lhs, array, .. } => {
+            reject_check_structure(lhs)?;
+            reject_check_structure(array)
         }
         Expr::Row(items) | Expr::Array(items) => items.iter().try_for_each(reject_check_structure),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => reject_check_structure(base),
@@ -6152,6 +6174,10 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
             reject_default_structure(lhs)?;
             list.iter().try_for_each(reject_default_structure)
         }
+        Expr::Quantified { lhs, array, .. } => {
+            reject_default_structure(lhs)?;
+            reject_default_structure(array)
+        }
         Expr::Row(items) | Expr::Array(items) => {
             items.iter().try_for_each(reject_default_structure)
         }
@@ -6222,6 +6248,10 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
                 for x in list {
                     walk(x, columns, out);
                 }
+            }
+            Expr::Quantified { lhs, array, .. } => {
+                walk(lhs, columns, out);
+                walk(array, columns, out);
             }
             Expr::Between { lhs, lo, hi, .. } => {
                 walk(lhs, columns, out);
@@ -6368,6 +6398,9 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
                 || query_plan_references_outer(plan, depth + 1)
         }
         RExpr::InValues { lhs, .. } => rexpr_references_outer(lhs, depth),
+        RExpr::Quantified { lhs, array, .. } => {
+            rexpr_references_outer(lhs, depth) || rexpr_references_outer(array, depth)
+        }
         RExpr::Cast { inner, .. } => rexpr_references_outer(inner, depth),
         RExpr::Neg { operand, .. } => rexpr_references_outer(operand, depth),
         RExpr::Not(x) => rexpr_references_outer(x, depth),
@@ -6459,6 +6492,10 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             collect_touched_plan(plan, depth + 1, touched);
         }
         RExpr::InValues { lhs, .. } => collect_touched(lhs, depth, touched),
+        RExpr::Quantified { lhs, array, .. } => {
+            collect_touched(lhs, depth, touched);
+            collect_touched(array, depth, touched);
+        }
         RExpr::Cast { inner, .. } => collect_touched(inner, depth, touched),
         RExpr::Neg { operand, .. } => collect_touched(operand, depth, touched),
         RExpr::Not(x) => collect_touched(x, depth, touched),
@@ -8407,6 +8444,12 @@ fn resolve(
             ))
         }
         Expr::Binary { op, lhs, rhs } => resolve_binary(scope, *op, lhs, rhs, agg, params),
+        Expr::Quantified {
+            op,
+            all,
+            lhs,
+            array,
+        } => resolve_quantified(scope, *op, *all, lhs, array, agg, params),
         Expr::In { lhs, list, negated } => {
             // An EMPTY list reaches here only from folding an IN-subquery whose result was empty
             // (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant
@@ -8751,6 +8794,117 @@ fn resolve_containment(
         },
         ResolvedType::Bool,
     ))
+}
+
+/// Resolve a quantified array comparison `x op ANY/SOME/ALL(arr)` (array-functions.md §11): the
+/// array spelling of `IN`. `x` (`lhs`) and the array operand resolve with the SAME literal
+/// adaptation the comparison operators use — a bare-literal `x` adapts to the array's element type,
+/// a bare `ARRAY[…]` operand adapts its elements to `x`'s type. The right operand must be an array
+/// (a non-array side is `42809`; a bare untyped `NULL` is `42P18`); `x` and the element type must
+/// be comparable (else `42883`, PG's operator-not-found). The result is always `boolean`; the 3VL
+/// fold over the flattened elements reuses the `eq3`/`lt3`/`gt3` kernels at eval (the `IN`-list
+/// membership machinery, generalized to all five operators and both quantifiers).
+fn resolve_quantified(
+    scope: &Scope,
+    op: BinaryOp,
+    all: bool,
+    lhs: &Expr,
+    array: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    // Pass 1: resolve both operands with no hint.
+    let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
+    let (mut ra, mut at) = resolve(scope, array, None, agg, params)?;
+    // If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
+    // bare `ARRAY[…]` constructor, re-resolve the array with `x`'s type as the element hint so the
+    // constructor adapts (`c = ANY(ARRAY[1,2])` over an int32 column → int32[]). Harmless for a
+    // column / cast operand (it ignores the hint).
+    if !is_adaptable_operand(lhs) {
+        if let Some(s) = ctx_of(&lt) {
+            (ra, at) = resolve(scope, array, Some(s), agg, params)?;
+        }
+    }
+    // If the array resolved to `E[]` and `x` is an adaptable bare literal, adapt `x` to `E` (with a
+    // range check) — exactly the operand pairing `=` uses (`5 = ANY(int32[]_col)` lands `x` on int32).
+    if let ResolvedType::Array(e) = &at {
+        if is_adaptable_operand(lhs) {
+            if let Some(s) = elem_scalar_hint(e) {
+                (rl, lt) = resolve(scope, lhs, Some(s), agg, params)?;
+            }
+        }
+    }
+    // The right operand must be an array.
+    let elem = match &at {
+        ResolvedType::Array(e) => (**e).clone(),
+        // A bare untyped NULL leaves the array type undeterminable — jed's polymorphic posture
+        // (§11; the `unnest(NULL)` / §5 #6 precedent), a documented degenerate divergence from PG.
+        ResolvedType::Null => {
+            return Err(EngineError::new(
+                SqlState::IndeterminateDatatype,
+                "could not determine the array element type of a NULL ANY/ALL operand",
+            ));
+        }
+        _ => {
+            return Err(EngineError::new(
+                SqlState::WrongObjectType,
+                "op ANY/ALL (array) requires array on right side",
+            ));
+        }
+    };
+    // `x` and the element type must be comparable; PG reports operator-not-found (42883) here, NOT
+    // the bare 42804 a plain `int = text` raises — matching AF4's element-mismatch posture (§10.2).
+    classify_comparable(&lt, &elem).map_err(|_| {
+        EngineError::new(
+            SqlState::UndefinedFunction,
+            format!(
+                "operator does not exist: {} {} {}",
+                lt.type_name(),
+                binary_op_symbol(op),
+                elem.type_name()
+            ),
+        )
+    })?;
+    let cop = match op {
+        BinaryOp::Eq => CmpOp::Eq,
+        BinaryOp::Lt => CmpOp::Lt,
+        BinaryOp::Gt => CmpOp::Gt,
+        BinaryOp::Le => CmpOp::Le,
+        BinaryOp::Ge => CmpOp::Ge,
+        _ => unreachable!("the parser only builds a Quantified node for a comparison operator"),
+    };
+    Ok((
+        RExpr::Quantified {
+            op: cop,
+            all,
+            lhs: Box::new(rl),
+            array: Box::new(ra),
+        },
+        ResolvedType::Bool,
+    ))
+}
+
+/// The infix symbol for a comparison/arithmetic `BinaryOp`, for an `operator does not exist`
+/// message (only the comparison operators reach `resolve_quantified`).
+fn binary_op_symbol(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Eq => "=",
+        BinaryOp::Lt => "<",
+        BinaryOp::Gt => ">",
+        BinaryOp::Le => "<=",
+        BinaryOp::Ge => ">=",
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Mod => "%",
+        BinaryOp::And => "AND",
+        BinaryOp::Or => "OR",
+        BinaryOp::Concat => "||",
+        BinaryOp::Contains => "@>",
+        BinaryOp::ContainedBy => "<@",
+        BinaryOp::Overlaps => "&&",
+    }
 }
 
 /// Resolve the `||` array concatenation operator (array-functions.md §8): overload resolution over
@@ -11614,7 +11768,95 @@ impl RExpr {
                 let lv = lhs.eval(row, env, m)?;
                 in_membership(&lv, list, *negated, m)
             }
+            // A quantified array comparison `lhs op ANY/ALL(array)` (array-functions.md §11) — the
+            // array spelling of IN, the 3VL fold over the array's flattened elements.
+            RExpr::Quantified {
+                op,
+                all,
+                lhs,
+                array,
+            } => {
+                m.charge(COSTS.operator_eval);
+                let lv = lhs.eval(row, env, m)?;
+                let av = array.eval(row, env, m)?;
+                quantified_membership(*op, *all, &lv, &av, m)
+            }
         }
+    }
+}
+
+/// The three-valued membership fold for `lhs op ANY/ALL(array)` (array-functions.md §11), the
+/// generalization of `in_membership` to all five comparison operators and both quantifiers. A NULL
+/// array → NULL; otherwise, over the flattened elements, `ANY`/`SOME` (all=false) is the OR-fold
+/// (TRUE if any `lhs op e` is TRUE, else NULL if any is NULL, else FALSE; empty → FALSE) and `ALL`
+/// (all=true) is the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE; empty →
+/// TRUE). Each element comparison charges one `operator_eval` (+ size-scaled `decimal_work`),
+/// exactly like `in_membership`, so `max_cost` bounds the walk (54P01, CLAUDE.md §13).
+fn quantified_membership(
+    op: CmpOp,
+    all: bool,
+    lv: &Value,
+    av: &Value,
+    m: &mut Meter,
+) -> Result<Value> {
+    let arr = match av {
+        Value::Null => return Ok(Value::Null),
+        Value::Array(a) => a,
+        _ => unreachable!("the resolver requires an array right operand"),
+    };
+    let mut any_null = false;
+    for e in &arr.elements {
+        m.charge(COSTS.operator_eval);
+        m.charge(COSTS.decimal_work * ((decimal_cmp_work(lv, e) - 1) as i64));
+        m.guard()?;
+        match quantified_cmp3(op, lv, e) {
+            ThreeValued::True => {
+                // ANY short-circuits TRUE; ALL keeps going (TRUE is its neutral element).
+                if !all {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            ThreeValued::False => {
+                // ALL short-circuits FALSE; ANY keeps going (FALSE is its neutral element).
+                if all {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            ThreeValued::Unknown => any_null = true,
+        }
+    }
+    // Drained without a short-circuit: a NULL seen → UNKNOWN; else the quantifier's identity
+    // (ALL → TRUE, ANY → FALSE — also the empty-array result).
+    Ok(if any_null {
+        Value::Null
+    } else {
+        Value::Bool(all)
+    })
+}
+
+/// The per-element three-valued comparison `lhs op e` for a quantified node, normalizing a
+/// mixed-width float pair to `float64` first (the resolver admits `float32` vs `float64`, matching
+/// `RExpr::Compare`'s promote — here the array elements are runtime values, so the widen happens per
+/// element). Bottoms out in the value module's `eq3`/`lt3`/`gt3` kernels.
+fn quantified_cmp3(op: CmpOp, x: &Value, e: &Value) -> ThreeValued {
+    let (xw, ew);
+    let (a, b): (&Value, &Value) = match (x, e) {
+        (Value::Float32(v), Value::Float64(_)) => {
+            xw = Value::Float64(*v as f64);
+            (&xw, e)
+        }
+        (Value::Float64(_), Value::Float32(v)) => {
+            ew = Value::Float64(*v as f64);
+            (x, &ew)
+        }
+        _ => (x, e),
+    };
+    match op {
+        CmpOp::Eq => a.eq3(b),
+        CmpOp::Lt => a.lt3(b),
+        CmpOp::Gt => a.gt3(b),
+        CmpOp::Le => a.lt3(b).or(a.eq3(b)),
+        CmpOp::Ge => a.gt3(b).or(a.eq3(b)),
     }
 }
 

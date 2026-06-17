@@ -39,6 +39,9 @@ var SupportedCapabilities = []string{
 	// Array function surface AF4 (array-functions.md §10): the containment/overlap operators
 	// @>/<@/&& — polymorphic `anyarray <op> anyarray → boolean`, strict element equality.
 	"func.array_containment",
+	// Array function surface AF5 (array-functions.md §11): the ANY/ALL/SOME quantified array
+	// comparisons (x = ANY(arr), x op ALL(arr)) — the array spelling of IN, three-valued.
+	"func.array_quantified",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
 	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

@@ -10,19 +10,21 @@
 > `postgres:18` oracle — several array-function NULL/shape rules are subtle (§3) and must be
 > oracle-checked, not guessed.
 >
-> **Status: AF1 + AF2 + AF3 + AF4 landed.** AF1 — the **polymorphic resolution machinery** (§2) plus
-> the *scalar-function-shaped* surface: introspection (`array_ndims`, `array_length`, `array_lower`,
+> **Status: AF1 + AF2 + AF3 + AF4 + AF5 landed.** AF1 — the **polymorphic resolution machinery** (§2)
+> plus the *scalar-function-shaped* surface: introspection (`array_ndims`, `array_length`, `array_lower`,
 > `array_upper`, `cardinality`, `array_dims`) and builders (`array_append`, `array_prepend`,
 > `array_cat`). AF2 (§8) — the **`||` concatenation operator** and the **search/edit functions**
 > (`array_remove`, `array_replace`, `array_position`, `array_positions`). AF3 (§9) — the
 > **`unnest(anyarray)` set-returning function**, the engine's second FROM-clause SRF: it expands an
 > array into one row per element at the bound element type. AF4 (§10) — the **containment/overlap
 > operators** `@>` (contains), `<@` (contained by), `&&` (overlaps), three polymorphic
-> `anyarray <op> anyarray → boolean` operators. All four are implemented across all three cores,
+> `anyarray <op> anyarray → boolean` operators. AF5 (§11) — the **`ANY`/`ALL`/`SOME` quantified array
+> comparisons** (`x = ANY(arr)`, `x op ALL(arr)`), the array spelling of `IN`/its universal dual,
+> three-valued over the array's elements. All five are implemented across all three cores,
 > oracle-checked (`suites/expr/array_functions.test`, `suites/expr/array_concat_search.test`,
-> `suites/query/unnest.test`, `suites/expr/array_containment.test`), capabilities `func.array` +
-> `func.unnest` + `func.array_containment`. The remaining slices (§6) — `ANY`/`ALL`, `VARIADIC` — are
-> sequenced follow-ons, each its own vertical slice.
+> `suites/query/unnest.test`, `suites/expr/array_containment.test`, `suites/expr/array_quantified.test`),
+> capabilities `func.array` + `func.unnest` + `func.array_containment` + `func.array_quantified`. The
+> remaining slice (§6) — `VARIADIC` — is a sequenced follow-on, its own vertical slice.
 
 ## 1. Why a new layer
 
@@ -272,8 +274,13 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
   **`&&`** (overlaps), as polymorphic `boolean`-result operators sharing `||`'s precedence rung.
   One grammar change (the `@>`/`<@`/`&&` tokens + the broadened `concat` rung); all three cores +
   `suites/expr/array_containment.test`.
-- **AF5** — the **`ANY`/`ALL`** quantified comparisons (`x = ANY(array)`, `x op ALL(array)`) — a
-  grammar + resolver + evaluator slice reusing the `IN`-list 3VL membership machinery.
+- **AF5 ✅** (§11) — the **`ANY`/`ALL`/`SOME`** quantified comparisons (`x = ANY(arr)`,
+  `x op ALL(arr)`): one grammar change (a quantifier after a `compare_op`, no new tokens — `ANY`/
+  `SOME`/`ALL` are keywords), an `Expr::Quantified`/`RExpr::Quantified` node, and a 3VL fold over the
+  array's flattened elements that **reuses the `IN`-list membership machinery** (`x = ANY(arr)` ≡
+  `x IN (the elements)`), generalized to all five comparison operators and both quantifiers. All
+  three cores + `func.array_quantified` + `suites/expr/array_quantified.test`. (Array operand only;
+  the `op ANY(SELECT …)` subquery form is a separate deferred `0A000` Phase-4 item.)
 - **AF6** — **`VARIADIC`** call syntax + variadic overload resolution (the `make_interval`-era
   follow-on, [functions.md §11](functions.md), unblocked by the array type).
 
@@ -287,11 +294,14 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
 | `array_remove`/`array_position`/`array_positions` on a multidimensional array (AF2) | `0A000` feature_not_supported |
 | `array_position(a, e, start)` with a NULL `start` (AF2) | `22004` null_value_not_allowed |
 | `unnest` of a non-array, or with the wrong arity (AF3) | `42883` undefined_function |
-| Polymorphic type undeterminable (all polymorphic args untyped `NULL`, incl. bare `unnest(NULL)`) | `42P18` indeterminate_datatype |
+| `x op ANY/ALL(<non-array>)` — a non-array right side (AF5) | `42809` wrong_object_type |
+| `x op ANY/ALL(arr)` where `x` and the element type are not comparable (AF5) | `42883` undefined_function |
+| `op ANY/ALL(SELECT …)` — the subquery quantifier form (AF5, deferred) | `0A000` feature_not_supported |
+| Polymorphic type undeterminable (all polymorphic args untyped `NULL`, incl. bare `unnest(NULL)` and a bare `x op ANY(NULL)` array operand) | `42P18` indeterminate_datatype |
 
 `22000` (`data_exception`) is registered in [../errors/registry.toml](../errors/registry.toml)
-(added with AF1); `22004` (`null_value_not_allowed`) was added with AF2; `0A000`, `2202E`, `42883`,
-`42P18` already existed.
+(added with AF1); `22004` (`null_value_not_allowed`) was added with AF2; `0A000`, `2202E`, `42809`,
+`42883`, `42P18` already existed.
 
 ## 8. AF2 — the `||` operator and the search/edit functions
 
@@ -508,3 +518,88 @@ to the same per-row `ArrayFunc`-style node carrying a boolean kernel (`contains`
 13. **No dimensionality restriction** — `@>`/`<@`/`&&` operate on the flattened element multiset of
     **any** dimensionality (a multidimensional operand is fine), unlike `array_remove`/`array_position`/
     `array_positions` which are 1-D-only `0A000` (§5 #11). Matches PostgreSQL.
+
+## 11. AF5 — the `ANY` / `ALL` / `SOME` quantified array comparisons
+
+AF5 spends nothing of the §2 *polymorphic* machinery — it is a **grammar + resolver + evaluator**
+slice, the array spelling of `IN`. `x = ANY(arr)` asks "does `x` equal **some** element of `arr`?"
+and `x op ALL(arr)` "does `x op e` hold for **every** element?". Every rule is oracle-pinned
+(`postgres:18`). Unlike the operator slices (`||`, `@>`) it adds **no token and no catalog row** —
+`ANY`/`ALL`/`SOME` are plain keywords, and the construct is recognized in the parser as a quantifier
+*after* a comparison operator (grammar.md §41). PostgreSQL also defines the **subquery** quantifier
+(`x = ANY(SELECT …)`); that is a separate deferred Phase-4 item — the parser raises `0A000` for it.
+
+### 11.1 Grammar & AST
+
+The comparison production (grammar.ebnf `comparison`) lets a `compare_op` (`= < > <= >=`) be
+followed by *either* a quantifier-over-array *or* the ordinary right operand. After taking the
+operator the parser peeks `ANY`/`SOME`/`ALL`; on a match it consumes `( expr )` and builds an
+`Expr::Quantified { op, all, lhs, array }` (`all = true` for `ALL`, `false` for `ANY`/`SOME` —
+**`SOME` folds to `ANY`** at parse time, the SQL-standard synonym). The operand is a **full `expr`**
+(an `ARRAY[…]` constructor, a `'{…}'::T[]` literal, a column, or a `||`/subscript expression all
+fit). The construct is **non-associative**, inheriting the comparison level it extends; jed has no
+`<>`, so the operator set is exactly `= < > <= >=` (PG's `<> ALL` = `NOT IN` is unreachable here, an
+existing documented gap). A leading `SELECT` after the quantifier's `(` is the deferred subquery
+form → **`0A000`** in the parser.
+
+### 11.2 Semantics — three-valued, exactly `IN`'s membership generalized
+
+`x = ANY(arr)` is `x IN (the elements of arr)`; the rest generalize the same 3VL fold to all five
+operators and to the universal quantifier. Over the array's **flattened** elements (row-major, any
+dimensionality — multidim flattens, custom lower bounds are irrelevant, matching `@>`):
+
+- **`ANY`/`SOME` — the OR-fold:** **TRUE** if `x op e` is TRUE for some element; else **NULL** if any
+  comparison is NULL (either `x` is NULL or that element is NULL); else **FALSE**. An **empty array →
+  FALSE** (no element can satisfy it).
+- **`ALL` — the AND-fold:** **FALSE** if `x op e` is FALSE for some element; else **NULL** if any is
+  NULL; else **TRUE**. An **empty array → TRUE** (vacuously). So `NULL = ALL('{}')` is **TRUE** — the
+  empty short-circuit beats the NULL `x`.
+- A **NULL array operand** (the whole value, e.g. `NULL::int32[]`) → **NULL** (the standard strict
+  short-circuit; the array is never iterated).
+
+This is the same fold `IN`'s `in_membership` computes (`any_match` → TRUE, else `any_null` → NULL,
+else FALSE; ALL is its dual), so the per-element comparison reuses the value module's `eq3`/`lt3`/
+`gt3` 3VL kernels — the same ones `RExpr::Compare` and `in_membership` use. `x` is evaluated **once**
+(not once per element, the one efficiency difference from the `IN`-list OR-chain desugar). The node
+is `RExpr::Quantified { op: CmpOp, all: bool, lhs, array }`; no new evaluator shape beyond the fold.
+
+### 11.3 Resolution
+
+`x` (`lhs`) and the array operand are resolved with the **same literal adaptation** the comparison
+operators use (resolve both with no hint; a bare-literal `x` then adapts to the array's element type,
+and a bare `ARRAY[…]` operand adapts its elements to `x`'s type — the §5 #8 first-array-operand hint,
+specialized to a scalar-vs-array pair). Then:
+
+1. the array operand must resolve to an **array** type `E[]`. A **non-array** right side (`1 = ANY(5)`)
+   is **`42809`** (`op ANY/ALL (array) requires array on right side`, PG's exact code + message). A
+   **bare untyped `NULL`** operand (`1 = ANY(NULL)`) leaves the array type undeterminable → **`42P18`**
+   (jed's polymorphic indeterminate posture, §5 #6 / the `unnest(NULL)` precedent; PG instead defaults
+   it, a documented degenerate divergence, out of corpus). A **typed** NULL array (`NULL::int32[]`)
+   resolves and yields NULL at exec.
+2. `x`'s type and the element type `E` must be **comparable** (jed's `classify_comparable`). An
+   incomparable pair (`int = ANY(text[])`) is **`42883`** (`operator does not exist`, matching PG's
+   message + code) — the same posture AF4 takes for an element mismatch (§10.2), *not* the bare
+   `42804` jed's plain `int = text` raises, so the quantified form reports the operator-not-found the
+   way PG does.
+3. the result is always **`boolean`**.
+
+### 11.4 Cost
+
+Mirrors **`IN`** exactly (`RExpr::InValues`, cost.md §3): the node charges one `operator_eval`, and
+each element comparison charges one `operator_eval` (plus the size-scaled `decimal_work` for a
+decimal pair) — the per-element membership walk **is** metered, so a `x = ANY(huge_array)` over an
+untrusted query is bounded by `max_cost` and aborts deterministically (`54P01`, CLAUDE.md §13). This
+is the one place AF5 differs from the containment operators (§10.3, one `operator_eval` per node): it
+follows its `IN`-list lineage rather than the array-comparator lineage. The `lhs` and array operand
+charge their own evaluation cost once, up front. Deterministic and cross-core-identical, asserted
+with `# cost:` in the corpus.
+
+### 11.5 Ratified divergences
+
+14. **The array-operand quantifier only; the subquery form is deferred** — `x op ANY/ALL(arr)` is
+    implemented, `x op ANY/ALL(SELECT …)` is `0A000` (a distinct Phase-4 subquery item). PG supports
+    both; jed stages them, matching the array surface's incremental delivery.
+15. **A non-array right side is `42809`; an incomparable element type is `42883`; a bare untyped
+    `NULL` operand is `42P18`** — the first two match PostgreSQL's codes and messages exactly; the
+    third is jed's untyped-`NULL` strictness (PG defaults the array's element type), a degenerate case
+    out of the oracle corpus, consistent with `unnest(NULL)` (§5 #6).

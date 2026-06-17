@@ -116,6 +116,7 @@ import { AGGREGATES, type AggregateDesc, OPERATORS, type OperatorDesc } from "./
 import {
   type Value,
   type ArrayInResult,
+  type ThreeValued,
   boolAnd,
   boolNot,
   arrayValue,
@@ -3179,6 +3180,10 @@ export class Database {
       case "inValues":
         e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
         return e;
+      case "quantified":
+        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
+        e.array = this.foldUncorrelatedInRExpr(e.array, bound, cost);
+        return e;
       default:
         return e; // leaves: column, outerColumn, param, const*
     }
@@ -3606,6 +3611,8 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       );
     case "inValues":
       return rexprReferencesOuter(e.lhs, depth);
+    case "quantified":
+      return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.array, depth);
     case "cast":
     case "neg":
     case "not":
@@ -3674,6 +3681,10 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       return;
     case "inValues":
       collectTouched(e.lhs, depth, touched);
+      return;
+    case "quantified":
+      collectTouched(e.lhs, depth, touched);
+      collectTouched(e.array, depth, touched);
       return;
     case "cast":
     case "neg":
@@ -3975,7 +3986,11 @@ type RExpr =
   | { kind: "subquery"; plan: QueryPlan; subKind: SubqueryKind; lhs: RExpr | null; negated: boolean }
   // A folded uncorrelated `IN (subquery)`: the subquery ran once yielding `list`; per row it tests
   // `lhs` for three-valued membership (empty → negated; a NULL with no positive match → NULL).
-  | { kind: "inValues"; lhs: RExpr; list: Value[]; negated: boolean };
+  | { kind: "inValues"; lhs: RExpr; list: Value[]; negated: boolean }
+  // A quantified array comparison `lhs op ANY/ALL(array)` (spec/design/array-functions.md §11) — the
+  // array spelling of IN. At eval `lhs` is evaluated once, `array` once; then a 3-valued fold over the
+  // array's flattened elements (ANY = OR-fold, ALL = AND-fold), charging per element like "inValues".
+  | { kind: "quantified"; op: BinaryOp; all: boolean; lhs: RExpr; array: RExpr };
 
 // SubqueryKind selects which subquery form a "subquery" RExpr is (spec/design/grammar.md §26).
 type SubqueryKind = "scalar" | "exists" | "in";
@@ -4427,6 +4442,8 @@ function exprHasAggregate(e: Expr): boolean {
       return exprHasAggregate(e.base);
     case "subscript":
       return exprHasAggregate(e.base) || astSubscriptExprs(e.subscripts).some(exprHasAggregate);
+    case "quantified":
+      return exprHasAggregate(e.lhs) || exprHasAggregate(e.array);
     default:
       return false;
   }
@@ -4509,6 +4526,9 @@ function rejectCheckStructure(e: Expr): void {
       rejectCheckStructure(e.base);
       for (const x of astSubscriptExprs(e.subscripts)) rejectCheckStructure(x);
       return;
+    case "quantified":
+      rejectCheckStructure(e.lhs);
+      return rejectCheckStructure(e.array);
     default: // column, qualifiedColumn, literal
       return;
   }
@@ -4576,6 +4596,9 @@ function rejectDefaultStructure(e: Expr): void {
       rejectDefaultStructure(e.base);
       for (const x of astSubscriptExprs(e.subscripts)) rejectDefaultStructure(x);
       return;
+    case "quantified":
+      rejectDefaultStructure(e.lhs);
+      return rejectDefaultStructure(e.array);
     default: // literal, typedLiteral
       return;
   }
@@ -4641,6 +4664,9 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
         walk(e.base);
         for (const x of astSubscriptExprs(e.subscripts)) walk(x);
         return;
+      case "quantified":
+        walk(e.lhs);
+        return walk(e.array);
       default: // literal, param; subqueries unreachable in a validated check
         return;
     }
@@ -6246,6 +6272,8 @@ function resolve(
     }
     case "binary":
       return resolveBinary(scope, e.op, e.lhs, e.rhs, ag, params);
+    case "quantified":
+      return resolveQuantified(scope, e.op, e.all, e.lhs, e.array, ag, params);
     case "in": {
       // An EMPTY list reaches here only from folding an IN-subquery whose result was empty
       // (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant —
@@ -6529,6 +6557,103 @@ function resolveContainment(
   const tys: ResolvedType[] = [rl.type, rr.type];
   if (!matchPoly(["anyarray", "anyarray"], tys).matched) throw noOverload();
   return { node: { kind: "arrayFunc", func, args: [rl.node, rr.node] }, type: { kind: "bool" } };
+}
+
+// resolveQuantified resolves a quantified array comparison `x op ANY/SOME/ALL(arr)`
+// (array-functions.md §11): the array spelling of IN. `x` (lhs) and the array operand resolve with
+// the SAME literal adaptation the comparison operators use — a bare-literal `x` adapts to the array's
+// element type, a bare ARRAY[…] operand adapts its elements to `x`'s type. The right operand must be
+// an array (a non-array side is 42809; a bare untyped NULL is 42P18); `x` and the element type must
+// be comparable (else 42883, PG's operator-not-found). The result is always boolean.
+function resolveQuantified(
+  scope: Scope,
+  op: BinaryOp,
+  all: boolean,
+  lhs: Expr,
+  array: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // Pass 1: resolve both operands with no hint.
+  let rl = resolve(scope, lhs, null, ag, params);
+  let ra = resolve(scope, array, null, ag, params);
+  // If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
+  // bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the
+  // constructor adapts (`c = ANY(ARRAY[1,2])` over an int32 column → int32[]). Harmless for a
+  // column / cast operand (it ignores the hint).
+  if (!isAdaptableOperand(lhs)) {
+    const h = ctxOf(rl.type);
+    if (h !== null) ra = resolve(scope, array, h, ag, params);
+  }
+  // If the array resolved to E[] and `x` is an adaptable bare literal, adapt `x` to E (with a range
+  // check) — exactly the operand pairing `=` uses (`5 = ANY(int32[]_col)` lands `x` on int32).
+  if (ra.type.kind === "array" && isAdaptableOperand(lhs)) {
+    const h = elemScalarHint(ra.type.elem);
+    if (h !== null) rl = resolve(scope, lhs, h, ag, params);
+  }
+  // The right operand must be an array.
+  if (ra.type.kind === "null") {
+    // A bare untyped NULL leaves the array type undeterminable — jed's polymorphic posture (§11; the
+    // unnest(NULL) / §5 #6 precedent), a documented degenerate divergence from PG.
+    throw engineError(
+      "indeterminate_datatype",
+      "could not determine the array element type of a NULL ANY/ALL operand",
+    );
+  }
+  if (ra.type.kind !== "array") {
+    throw engineError("wrong_object_type", "op ANY/ALL (array) requires array on right side");
+  }
+  const elem = ra.type.elem;
+  // `x` and the element type must be comparable; PG reports operator-not-found (42883) here, NOT the
+  // bare 42804 a plain `int = text` raises — matching AF4's element-mismatch posture (§10.2).
+  try {
+    classifyComparable(rl.type, elem);
+  } catch {
+    throw engineError(
+      "undefined_function",
+      `operator does not exist: ${rtName(rl.type)} ${binaryOpSymbol(op)} ${rtName(elem)}`,
+    );
+  }
+  return { node: { kind: "quantified", op, all, lhs: rl.node, array: ra.node }, type: { kind: "bool" } };
+}
+
+// binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
+// `operator does not exist` message (only the comparison operators reach resolveQuantified).
+function binaryOpSymbol(op: BinaryOp): string {
+  switch (op) {
+    case "eq":
+      return "=";
+    case "lt":
+      return "<";
+    case "gt":
+      return ">";
+    case "le":
+      return "<=";
+    case "ge":
+      return ">=";
+    case "add":
+      return "+";
+    case "sub":
+      return "-";
+    case "mul":
+      return "*";
+    case "div":
+      return "/";
+    case "mod":
+      return "%";
+    case "and":
+      return "AND";
+    case "or":
+      return "OR";
+    case "concat":
+      return "||";
+    case "contains":
+      return "@>";
+    case "containedBy":
+      return "<@";
+    case "overlaps":
+      return "&&";
+  }
 }
 
 // resolveOperandPair resolves the two operands of a binary operator, giving a bare
@@ -8437,6 +8562,66 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const lv = evalExpr(e.lhs, row, env, m);
       return inMembership(lv, e.list, e.negated, m);
     }
+    case "quantified": {
+      // A quantified array comparison `lhs op ANY/ALL(array)` (array-functions.md §11) — the array
+      // spelling of IN, the 3VL fold over the array's flattened elements.
+      m.charge(COSTS.operatorEval);
+      const lv = evalExpr(e.lhs, row, env, m);
+      const av = evalExpr(e.array, row, env, m);
+      return quantifiedMembership(e.op, e.all, lv, av, m);
+    }
+  }
+}
+
+// quantifiedMembership is the three-valued membership fold for `lhs op ANY/ALL(array)`
+// (array-functions.md §11), the generalization of inMembership to all five comparison operators and
+// both quantifiers. A NULL array -> NULL; otherwise, over the flattened elements, ANY/SOME (all=false)
+// is the OR-fold (TRUE if any `lhs op e` is TRUE, else NULL if any is NULL, else FALSE; empty ->
+// FALSE) and ALL (all=true) the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE;
+// empty -> TRUE). Each element comparison charges one operator_eval (+ size-scaled decimal_work),
+// exactly like inMembership, so max_cost bounds the walk (54P01).
+function quantifiedMembership(op: BinaryOp, all: boolean, lv: Value, av: Value, m: Meter): Value {
+  if (av.kind === "null") return nullValue();
+  if (av.kind !== "array") throw new Error("BUG: the resolver requires an array right operand");
+  let anyNull = false;
+  for (const e of av.elements) {
+    m.charge(COSTS.operatorEval);
+    m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(lv, e) - 1));
+    m.guard();
+    const t = quantifiedCmp3(op, lv, e);
+    if (t === "true") {
+      // ANY short-circuits TRUE; ALL keeps going (TRUE is its neutral element).
+      if (!all) return { kind: "bool", value: true };
+    } else if (t === "false") {
+      // ALL short-circuits FALSE; ANY keeps going (FALSE is its neutral element).
+      if (all) return { kind: "bool", value: false };
+    } else {
+      anyNull = true;
+    }
+  }
+  // Drained without a short-circuit: a NULL seen -> UNKNOWN; else the quantifier's identity (ALL ->
+  // TRUE, ANY -> FALSE — also the empty-array result).
+  return anyNull ? nullValue() : { kind: "bool", value: all };
+}
+
+// quantifiedCmp3 is the per-element three-valued comparison `lhs op e` for a quantified node,
+// normalizing a mixed-width float pair to float64 first (the resolver admits float32 vs float64,
+// matching the compare node's promote — here the array elements are runtime values, so the widen
+// happens per element). Bottoms out in the value module's eq3/lt3/gt3 kernels.
+function quantifiedCmp3(op: BinaryOp, x: Value, e: Value): ThreeValued {
+  if (x.kind === "float32" && e.kind === "float64") x = float64Value(x.value);
+  else if (x.kind === "float64" && e.kind === "float32") e = float64Value(e.value);
+  switch (op) {
+    case "eq":
+      return eq3(x, e);
+    case "lt":
+      return lt3(x, e);
+    case "gt":
+      return gt3(x, e);
+    case "le":
+      return or3(lt3(x, e), eq3(x, e));
+    default: // ge
+      return or3(gt3(x, e), eq3(x, e));
   }
 }
 

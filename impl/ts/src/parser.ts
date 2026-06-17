@@ -1305,6 +1305,25 @@ class Parser {
         return lhs;
     }
     this.advance();
+    // `op ANY/SOME/ALL ( array )` — a quantified array comparison (grammar.md §41): a quantifier
+    // may stand in for the ordinary right operand. SOME folds to ANY.
+    const kw = this.peekKeyword();
+    if (kw === "all" || kw === "any" || kw === "some") {
+      const all = kw === "all";
+      this.advance(); // ANY / SOME / ALL
+      this.expect("lparen");
+      // The subquery quantifier form `op ANY(SELECT …)` is a separate deferred Phase-4 item
+      // (array-functions.md §11); only the array operand is supported.
+      if (this.peekKeyword() === "select") {
+        throw engineError(
+          "feature_not_supported",
+          "the subquery form of ANY/ALL is not supported; use an array operand",
+        );
+      }
+      const array = this.parseExpr(); // a full expression resolving to an array
+      this.expect("rparen");
+      return { kind: "quantified", op, all, lhs, array };
+    }
     return binaryExpr(op, lhs, this.parseConcat());
   }
 

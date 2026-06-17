@@ -432,6 +432,11 @@ const (
 	// ExprInSubquery is `lhs [NOT] IN ( query_expr )` (spec/design/grammar.md §26) — membership of
 	// lhs in the subquery's single output column (three-valued, like a literal IN).
 	ExprInSubquery
+	// ExprQuantified is `lhs op ANY/SOME/ALL ( array )` (spec/design/array-functions.md §11) — a
+	// quantified array comparison, the array spelling of IN. The three-valued fold over the array's
+	// flattened elements reuses the IN-list membership semantics, generalized to all five comparison
+	// operators and both quantifiers. The subquery form `op ANY(SELECT …)` is a deferred 0A000.
+	ExprQuantified
 	// ExprRow is a `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1): RowItems
 	// holds the field expressions, in order. A one-field ROW(x) is a one-field row; ROW() is the
 	// zero-field row. The bare `(a, b)` form is deferred (0A000); only the keyword form parses.
@@ -543,6 +548,7 @@ type Expr struct {
 	Case        *CaseExpr       // ExprCase
 	Subquery    *QueryExpr      // ExprScalarSubquery, ExprExists (the inner query)
 	InSubquery  *InSubqueryExpr // ExprInSubquery
+	Quantified  *QuantifiedExpr // ExprQuantified
 	RowItems    []Expr          // ExprRow (the ROW(...) field expressions, in order)
 	// Base is the operand of a field-selection postfix (ExprFieldAccess / ExprFieldStar): the
 	// composite expression `(base).field` / `(base).*` selects from (spec/design/composite.md §S4).
@@ -561,6 +567,18 @@ type InSubqueryExpr struct {
 	Lhs     Expr
 	Query   QueryExpr
 	Negated bool
+}
+
+// QuantifiedExpr is `Lhs Op ANY/SOME/ALL ( Array )` — a quantified array comparison
+// (spec/design/array-functions.md §11), the array spelling of IN. Op is a comparison
+// (OpEq/OpLt/OpGt/OpLe/OpGe); All is true for ALL, false for ANY/SOME (SOME folds to ANY at
+// parse). Array resolves to an array type; the three-valued fold over its flattened elements
+// reuses the IN-list membership semantics, generalized to all five operators and both quantifiers.
+type QuantifiedExpr struct {
+	Op    BinaryOp
+	All   bool
+	Lhs   Expr
+	Array Expr
 }
 
 // CastExpr is CAST(Inner AS TypeName). TypeMod is the optional numeric(p[,s]) modifier.

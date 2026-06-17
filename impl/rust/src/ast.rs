@@ -563,6 +563,18 @@ pub enum Expr {
         query: Box<QueryExpr>,
         negated: bool,
     },
+    /// `lhs op ANY/SOME/ALL ( array )` — a quantified array comparison (grammar.md §41,
+    /// array-functions.md §11). `op` is a comparison (`= < > <= >=`); `all` is true for `ALL`,
+    /// false for `ANY`/`SOME` (SOME folds to ANY at parse). The array operand resolves to an
+    /// array type; the three-valued fold over its flattened elements reuses the `IN`-list
+    /// membership semantics (`x = ANY(arr)` ≡ `x IN (the elements)`), generalized to all five
+    /// operators and both quantifiers. The subquery form `op ANY(SELECT …)` is a deferred 0A000.
+    Quantified {
+        op: BinaryOp,
+        all: bool,
+        lhs: Box<Expr>,
+        array: Box<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

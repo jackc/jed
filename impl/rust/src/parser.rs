@@ -1476,6 +1476,33 @@ impl Parser {
         match op {
             Some(op) => {
                 self.advance();
+                // `op ANY/SOME/ALL ( array )` — a quantified array comparison (grammar.md §41):
+                // a quantifier may stand in for the ordinary right operand. SOME folds to ANY.
+                let quant = match self.peek_keyword().as_deref() {
+                    Some("all") => Some(true),
+                    Some("any") | Some("some") => Some(false),
+                    _ => None,
+                };
+                if let Some(all) = quant {
+                    self.advance(); // ANY / SOME / ALL
+                    self.expect(&Token::LParen)?;
+                    // The subquery quantifier form `op ANY(SELECT …)` is a separate deferred
+                    // Phase-4 item (array-functions.md §11); only the array operand is supported.
+                    if self.peek_keyword().as_deref() == Some("select") {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "the subquery form of ANY/ALL is not supported; use an array operand",
+                        ));
+                    }
+                    let array = self.parse_expr()?; // a full expression resolving to an array
+                    self.expect(&Token::RParen)?;
+                    return Ok(Expr::Quantified {
+                        op,
+                        all,
+                        lhs: Box::new(lhs),
+                        array: Box::new(array),
+                    });
+                }
                 let rhs = self.parse_concat()?;
                 Ok(binary(op, lhs, rhs))
             }

@@ -4816,6 +4816,71 @@ func inMembership(lv Value, list []Value, negated bool, m *Meter) (Value, error)
 	return inVal, nil
 }
 
+// quantifiedMembership is the three-valued membership fold for `lhs op ANY/ALL(array)`
+// (array-functions.md §11), the generalization of inMembership to all five comparison operators and
+// both quantifiers. A NULL array → NULL; otherwise, over the flattened elements, ANY/SOME (all=false)
+// is the OR-fold (TRUE if any `lhs op e` is TRUE, else NULL if any is NULL, else FALSE; empty →
+// FALSE) and ALL (all=true) the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE;
+// empty → TRUE). Each element comparison charges one operator_eval (+ size-scaled decimal_work),
+// exactly like inMembership, so max_cost bounds the walk (54P01).
+func quantifiedMembership(op BinaryOp, all bool, lv, av Value, m *Meter) (Value, error) {
+	if av.Kind == ValNull {
+		return NullValue(), nil
+	}
+	anyNull := false
+	for _, e := range av.Array.Elements {
+		m.Charge(Costs.OperatorEval)
+		m.Charge(Costs.DecimalWork * (decimalCmpWork(lv, e) - 1))
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		switch quantifiedCmp3(op, lv, e) {
+		case True:
+			// ANY short-circuits TRUE; ALL keeps going (TRUE is its neutral element).
+			if !all {
+				return BoolValue(true), nil
+			}
+		case False:
+			// ALL short-circuits FALSE; ANY keeps going (FALSE is its neutral element).
+			if all {
+				return BoolValue(false), nil
+			}
+		case Unknown:
+			anyNull = true
+		}
+	}
+	// Drained without a short-circuit: a NULL seen → UNKNOWN; else the quantifier's identity (ALL →
+	// TRUE, ANY → FALSE — also the empty-array result).
+	if anyNull {
+		return NullValue(), nil
+	}
+	return BoolValue(all), nil
+}
+
+// quantifiedCmp3 is the per-element three-valued comparison `lhs op e` for a quantified node,
+// normalizing a mixed-width float pair to float64 first (the resolver admits float32 vs float64,
+// matching reCompare's promote — here the array elements are runtime values, so the widen happens per
+// element). Bottoms out in the value module's Eq3/Lt3/Gt3 kernels.
+func quantifiedCmp3(op BinaryOp, x, e Value) ThreeValued {
+	if x.Kind == ValFloat32 && e.Kind == ValFloat64 {
+		x = Float64Value(float64(x.F32()))
+	} else if x.Kind == ValFloat64 && e.Kind == ValFloat32 {
+		e = Float64Value(float64(e.F32()))
+	}
+	switch op {
+	case OpEq:
+		return x.Eq3(e)
+	case OpLt:
+		return x.Lt3(e)
+	case OpGt:
+		return x.Gt3(e)
+	case OpLe:
+		return or3(x.Lt3(e), x.Eq3(e))
+	default: // OpGe
+		return or3(x.Gt3(e), x.Eq3(e))
+	}
+}
+
 // valueToRExpr builds the constant rExpr for a folded subquery value (§26). The static type is
 // carried separately (the node's Type), so a NULL value here is just reConstNull.
 func valueToRExpr(v Value) *rExpr {
@@ -5266,6 +5331,12 @@ const (
 	// reInValues is a folded uncorrelated `IN (subquery)`: the subquery ran once yielding `list`;
 	// per row it tests `lhs` for three-valued membership.
 	reInValues
+	// reQuantified is a quantified array comparison `lhs op ANY/ALL(array)`
+	// (spec/design/array-functions.md §11) — the array spelling of IN. `lhs` is the scalar, `rhs`
+	// the array node, `op` the comparison, `quantAll` true for ALL. At eval the three-valued fold
+	// over the array's flattened elements reuses the IN-list membership semantics, charging per
+	// element like reInValues.
+	reQuantified
 	// reRow is a ROW(...) composite constructor (spec/design/composite.md §1): its field nodes are
 	// held in sargs (so the existing fold / references-outer / touched-set walks recurse into them
 	// for free). Evaluates to a ValComposite; one operator_eval per node (cost.md §9).
@@ -5411,6 +5482,10 @@ type rExpr struct {
 	isSlice bool
 	// reConstArray: a folded array constant (its full shape preserved).
 	cArray *ArrayVal
+
+	// reQuantified: `lhs` is the scalar, `rhs` the array node, `op` the comparison, `quantAll`
+	// selects ALL (true) vs ANY/SOME (false) (spec/design/array-functions.md §11).
+	quantAll bool
 
 	// reOuterColumn: the number of frames out (`index` reuses the column index field).
 	level int
@@ -5896,6 +5971,8 @@ func exprHasAggregate(e Expr) bool {
 			}
 		}
 		return false
+	case ExprQuantified:
+		return exprHasAggregate(e.Quantified.Lhs) || exprHasAggregate(e.Quantified.Array)
 	default:
 		return false
 	}
@@ -5998,6 +6075,11 @@ func rejectCheckStructure(e Expr) error {
 			}
 		}
 		return nil
+	case ExprQuantified:
+		if err := rejectCheckStructure(e.Quantified.Lhs); err != nil {
+			return err
+		}
+		return rejectCheckStructure(e.Quantified.Array)
 	default: // ExprColumn, ExprQualifiedColumn, ExprLiteral
 		return nil
 	}
@@ -6101,6 +6183,11 @@ func rejectDefaultStructure(e Expr) error {
 			}
 		}
 		return nil
+	case ExprQuantified:
+		if err := rejectDefaultStructure(e.Quantified.Lhs); err != nil {
+			return err
+		}
+		return rejectDefaultStructure(e.Quantified.Array)
 	default: // ExprLiteral, ExprTypedLiteral
 		return nil
 	}
@@ -6178,6 +6265,9 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 					walk(*x)
 				}
 			}
+		case ExprQuantified:
+			walk(e.Quantified.Lhs)
+			walk(e.Quantified.Array)
 		}
 	}
 	walk(e)
@@ -6833,6 +6923,103 @@ func resolveContainment(s *scope, lhs, rhs Expr, fn arrayFunc, ag *aggCtx, param
 		return nil, resolvedType{}, noOverload()
 	}
 	return &rExpr{kind: reArrayFunc, afunc: fn, sargs: []*rExpr{rl, rr}}, resolvedType{kind: rtBool}, nil
+}
+
+// resolveQuantified resolves a quantified array comparison `x op ANY/SOME/ALL(arr)`
+// (array-functions.md §11): the array spelling of IN. `x` (Lhs) and the array operand resolve with
+// the SAME literal adaptation the comparison operators use — a bare-literal `x` adapts to the array's
+// element type, a bare ARRAY[…] operand adapts its elements to `x`'s type. The right operand must be
+// an array (a non-array side is 42809; a bare untyped NULL is 42P18); `x` and the element type must
+// be comparable (else 42883, PG's operator-not-found). The result is always boolean.
+func resolveQuantified(s *scope, q *QuantifiedExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	// Pass 1: resolve both operands with no hint.
+	rl, lt, err := resolve(s, q.Lhs, nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	ra, at, err := resolve(s, q.Array, nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	// If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
+	// bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the
+	// constructor adapts (`c = ANY(ARRAY[1,2])` over an int32 column → int32[]). Harmless for a
+	// column / cast operand (it ignores the hint).
+	if !isAdaptableOperand(q.Lhs) {
+		if h := ctxOf(lt); h != nil {
+			if ra, at, err = resolve(s, q.Array, h, ag, params); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+	}
+	// If the array resolved to E[] and `x` is an adaptable bare literal, adapt `x` to E (with a
+	// range check) — exactly the operand pairing `=` uses (`5 = ANY(int32[]_col)` lands `x` on int32).
+	if at.kind == rtArray && isAdaptableOperand(q.Lhs) {
+		if h, ok := elemScalarHint(*at.elem); ok {
+			if rl, lt, err = resolve(s, q.Lhs, &h, ag, params); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+	}
+	// The right operand must be an array.
+	switch {
+	case at.kind == rtArray:
+		// good
+	case at.kind == rtNull:
+		// A bare untyped NULL leaves the array type undeterminable — jed's polymorphic posture
+		// (§11; the unnest(NULL) / §5 #6 precedent), a documented degenerate divergence from PG.
+		return nil, resolvedType{}, NewError(IndeterminateDatatype,
+			"could not determine the array element type of a NULL ANY/ALL operand")
+	default:
+		return nil, resolvedType{}, NewError(WrongObjectType,
+			"op ANY/ALL (array) requires array on right side")
+	}
+	// `x` and the element type must be comparable; PG reports operator-not-found (42883) here, NOT
+	// the bare 42804 a plain `int = text` raises — matching AF4's element-mismatch posture (§10.2).
+	if err := classifyComparable(lt, *at.elem); err != nil {
+		return nil, resolvedType{}, NewError(UndefinedFunction,
+			fmt.Sprintf("operator does not exist: %s %s %s", rtName(lt), binaryOpSymbol(q.Op), rtName(*at.elem)))
+	}
+	return &rExpr{kind: reQuantified, op: q.Op, quantAll: q.All, lhs: rl, rhs: ra}, resolvedType{kind: rtBool}, nil
+}
+
+// binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
+// `operator does not exist` message (only the comparison operators reach resolveQuantified).
+func binaryOpSymbol(op BinaryOp) string {
+	switch op {
+	case OpEq:
+		return "="
+	case OpLt:
+		return "<"
+	case OpGt:
+		return ">"
+	case OpLe:
+		return "<="
+	case OpGe:
+		return ">="
+	case OpAdd:
+		return "+"
+	case OpSub:
+		return "-"
+	case OpMul:
+		return "*"
+	case OpDiv:
+		return "/"
+	case OpMod:
+		return "%"
+	case OpAnd:
+		return "AND"
+	case OpOr:
+		return "OR"
+	case OpConcat:
+		return "||"
+	case OpContains:
+		return "@>"
+	case OpContainedBy:
+		return "<@"
+	default: // OpOverlaps
+		return "&&"
+	}
 }
 
 // aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
@@ -8274,6 +8461,8 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reCase, caseArms: arms, caseEls: rels, caseDecimal: unified.kind == rtDecimal},
 			unified, nil
+	case ExprQuantified:
+		return resolveQuantified(s, e.Quantified, ag, params)
 	default: // ExprBinary
 		return resolveBinary(s, e.Binary, ag, params)
 	}
@@ -10302,6 +10491,19 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return Value{}, err
 		}
 		return inMembership(lv, e.list, e.negated, m)
+	case reQuantified:
+		// A quantified array comparison `lhs op ANY/ALL(array)` (array-functions.md §11) — the
+		// array spelling of IN, the 3VL fold over the array's flattened elements.
+		m.Charge(Costs.OperatorEval)
+		lv, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		av, err := e.rhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		return quantifiedMembership(e.op, e.quantAll, lv, av, m)
 	default: // reDistinct
 		m.Charge(Costs.OperatorEval)
 		a, err := e.lhs.eval(row, env, m)

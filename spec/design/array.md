@@ -366,7 +366,7 @@ corpus lands.
 | Malformed array text literal (`array_in`), incl. non-rectangular `'{{…},{…}}'` / declared-dims mismatch | `22P02` invalid_text_representation |
 | Bad element value inside a literal | that element's own parse error (e.g. `22P02`) |
 | Non-rectangular multidim construction `ARRAY[…]` (mismatched sub-array dims, incl. a NULL sub-array); a `'[l:u]'` literal bound with `u < l` | `2202E` array_subscript_error |
-| Array `PRIMARY KEY`/index/`UNIQUE`; nested array (array-of-array); runtime non-literal text→array cast, `array::text`, element-wise array→array cast; the still-deferred operator surface `@>`/`<@`/`&&`/`ANY`/`ALL`/`VARIADIC` (`\|\|` landed AF2, `unnest` landed AF3 — array-functions.md) | `0A000` feature_not_supported |
+| Array `PRIMARY KEY`/index/`UNIQUE`; nested array (array-of-array); runtime non-literal text→array cast, `array::text`, element-wise array→array cast; the still-deferred operator surface `VARIADIC` + the subquery quantifier form `op ANY(SELECT …)` (`\|\|` AF2, `unnest` AF3, `@>`/`<@`/`&&` AF4, `ANY`/`ALL`/`SOME` AF5 — array-functions.md) | `0A000` feature_not_supported |
 | Corrupt array body (bad `ndim`/length/element) | `XX001` data_corrupted |
 
 `2202E` is registered in [../errors/registry.toml](../errors/registry.toml) (added with the S5
@@ -409,13 +409,16 @@ each passing `rake ci`, mirroring composite's S0–S6:
 **AF1** (the polymorphic `anyarray`/`anyelement` resolution + the scalar-function-shaped surface —
 `array_ndims`/`array_length`/`array_lower`/`array_upper`/`cardinality`/`array_dims` and
 `array_append`/`array_prepend`/`array_cat`), **AF2** (the `||` concatenation operator + the
-search/edit functions `array_remove`/`array_replace`/`array_position`/`array_positions`), and **AF3**
-(the `unnest(anyarray)` set-returning function, §9) are implemented across all three cores,
-oracle-checked (`suites/expr/array_functions.test`, `suites/expr/array_concat_search.test`,
-`suites/query/unnest.test`, capabilities `func.array` + `func.unnest`). The remaining slices —
-`@>`/`<@`/`&&`, `ANY`/`ALL`, `VARIADIC` — are sequenced there (§6).
+search/edit functions `array_remove`/`array_replace`/`array_position`/`array_positions`), **AF3**
+(the `unnest(anyarray)` set-returning function, §9), **AF4** (the containment/overlap operators
+`@>`/`<@`/`&&`), and **AF5** (the `ANY`/`ALL`/`SOME` quantified comparisons `x = ANY(arr)` /
+`x op ALL(arr)`, §11) are implemented across all three cores, oracle-checked
+(`suites/expr/array_functions.test`, `suites/expr/array_concat_search.test`, `suites/query/unnest.test`,
+`suites/expr/array_containment.test`, `suites/expr/array_quantified.test`, capabilities `func.array` +
+`func.unnest` + `func.array_containment` + `func.array_quantified`). The remaining slice — `VARIADIC` —
+is sequenced there (§6).
 
 **Still deferred (each its own follow-on):** **array-of-composite** elements (a fast-follow —
 composite already composes); arrays-in-keys (`0A000`, encoding authored §8); the **remaining** array
-operator surface (`@>`/`<@`/`&&` + `ANY`/`ALL`/`VARIADIC` — array-functions.md §6); runtime
-text→array, `array::text`, and element-wise array→array casts.
+operator surface (`VARIADIC`, and the subquery quantifier form `op ANY(SELECT …)` — array-functions.md
+§6/§11); runtime text→array, `array::text`, and element-wise array→array casts.
