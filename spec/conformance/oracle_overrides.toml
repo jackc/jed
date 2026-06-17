@@ -352,3 +352,15 @@ reason = "jed: ln of zero traps 22003 (jed's single numeric range/domain code �
 file = "expr/float_math.test"
 sql = "SELECT log10(x) FROM f WHERE id = 3"
 reason = "jed: log10 of zero traps 22003 (jed's single numeric range/domain code — no granular 2201E in the registry). PostgreSQL raises 2201E (invalid_argument_for_logarithm). Engine-wide collapse to 22003."
+
+# --- derived tables: jed defers two FROM-clause forms PostgreSQL accepts (grammar.md §42). Both are
+# deliberate parser narrowings, relaxable later.
+[[override]]
+file = "subquery/derived.test"
+sql = "SELECT * FROM (t JOIN t ON 1 = 1) AS x"
+reason = "jed: a parenthesized-join FROM is a deferred narrowing — a leading `(` in FROM not followed by SELECT is 42601 (grammar.md §42). PostgreSQL parses `(t JOIN t ON …)` as a parenthesized join and instead reports 42712 (the duplicate `t`). A deliberate surface narrowing; the row behavior of derived tables is unaffected."
+
+[[override]]
+file = "subquery/derived.test"
+sql = "SELECT * FROM (WITH c AS (SELECT 1 AS one) SELECT one FROM c) AS d"
+reason = "jed: a derived-table body is the WITH-less query_expr, so a nested WITH is 42601 (the top-level-only narrowing — grammar.md §42, cte.md §1; shared with the §26 subquery forms). PostgreSQL 18 accepts a WITH-prefixed subquery body and returns 1. A deliberate, documented narrowing."

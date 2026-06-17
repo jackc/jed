@@ -1079,16 +1079,20 @@ impl Parser {
         Ok((from, joins))
     }
 
-    /// `table_ref ::= (identifier | table_function) ("AS"? identifier)?` where
-    /// `table_function ::= identifier "(" expr ("," expr)* ")"` — a base table name OR a
-    /// set-returning function call (`generate_series(1, 5)`) used as a row source, each with an
-    /// optional alias (grammar.md §15/§35). A `(` immediately after the leading identifier marks
-    /// the function form; its argument list is parsed here, the resolver owns arity/type errors.
-    /// The alias logic is identical for both forms: an explicit `AS` takes the next identifier
+    /// `table_ref ::= derived_table derived_alias | (identifier | table_function) ("AS"?
+    /// identifier)?` (grammar.md §15/§35/§42). A `(` at the START of a table_ref, when the next
+    /// token is `SELECT`, begins a DERIVED TABLE — a parenthesized subquery used as a relation,
+    /// `FROM (SELECT …) AS t` (§42); any other leading `(` is a 42601 this slice (no
+    /// parenthesized-join FROM). Otherwise it is a base table name OR a set-returning function call
+    /// (`generate_series(1, 5)`), a `(` immediately after the leading identifier marking the
+    /// function form. The alias logic is shared: an explicit `AS` takes the next identifier
     /// unconditionally; an implicit alias is taken only when the next token is a word that is NOT
     /// a clause/join keyword (so `FROM t WHERE` and `FROM t JOIN ...` keep no alias). The
-    /// stop-keyword set is a §8 cross-core surface.
+    /// stop-keyword set, and the leading-`SELECT` lookahead, are §8 cross-core surfaces.
     fn parse_table_ref(&mut self) -> Result<TableRef> {
+        if matches!(self.peek(), Token::LParen) {
+            return self.parse_derived_table();
+        }
         let name = self.expect_identifier()?;
         // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT` — those
         // are aggregate/star forms, not an SRF argument list).
@@ -1125,7 +1129,71 @@ impl Parser {
                 "column alias list on a table function is not supported yet",
             ));
         }
-        Ok(TableRef { name, alias, args })
+        Ok(TableRef {
+            name,
+            alias,
+            args,
+            subquery: None,
+            column_aliases: None,
+        })
+    }
+
+    /// Parse a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42). The caller has
+    /// verified the next token is `(`. A derived table is recognized only when a `SELECT` follows
+    /// the `(` (the §26 leading-`SELECT` lookahead, a §8 cross-core surface); any other leading `(`
+    /// is a 42601 (no parenthesized-join FROM this slice). The alias is OPTIONAL (PostgreSQL 18
+    /// relaxed the old mandatory-alias rule): present, it is the relation's label and may carry a
+    /// column-rename list `(c1, c2, …)`; absent, the relation has no qualifier (its bare columns
+    /// still resolve and can be ambiguous). `alias`/`name` carry the alias (empty when none).
+    fn parse_derived_table(&mut self) -> Result<TableRef> {
+        // Consume the opening `(`. Only a leading `SELECT` is a derived table; otherwise reject
+        // (a parenthesized-join FROM `(a JOIN b ON …)` is a deferred narrowing).
+        self.advance();
+        if self.peek_keyword().as_deref() != Some("select") {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "subquery in FROM must begin with SELECT (a parenthesized join is not supported)",
+            ));
+        }
+        let body = self.parse_subquery()?;
+        self.expect(&Token::RParen)?;
+        // The alias is optional, parsed exactly like a base table's: an explicit `AS` takes the
+        // next identifier; an implicit alias is a word that is not a clause/join stop keyword.
+        let alias = if self.peek_keyword().as_deref() == Some("as") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            match self.peek() {
+                Token::Word(w) if !is_table_ref_stop_keyword(&w.to_ascii_lowercase()) => {
+                    let a = w.clone();
+                    self.advance();
+                    Some(a)
+                }
+                _ => None,
+            }
+        };
+        // Optional column-rename list `(c1, c2, …)` — only when a table alias was given (PG: a
+        // column list with no preceding alias name, `(SELECT …) (a)`, is a syntax error: the bare
+        // `(` falls through here and a later token check rejects it).
+        let column_aliases = if alias.is_some() && matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let mut cols = vec![self.expect_identifier()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                cols.push(self.expect_identifier()?);
+            }
+            self.expect(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+        Ok(TableRef {
+            name: alias.clone().unwrap_or_default(),
+            alias,
+            args: None,
+            subquery: Some(Box::new(body)),
+            column_aliases,
+        })
     }
 
     /// Parse one `join_clause` if a join keyword begins here, else `None` (ending the FROM

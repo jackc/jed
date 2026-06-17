@@ -141,6 +141,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Non-recursive common table expressions — WITH name [(cols)] AS [NOT] MATERIALIZED (query)
   // [, ...] <query> (spec/design/cte.md).
   "query.cte",
+  // Derived tables — FROM ( query_expr ) AS t: a parenthesized subquery as a FROM relation, the
+  // parser surface over the CTE inline seam (an anonymous always-inlined single-ref CTE) —
+  // spec/design/grammar.md §42.
+  "query.derived_table",
   // Scalar functions abs / round (per-row, valid anywhere an expression is) —
   // spec/design/functions.md §9.
   "func.abs",

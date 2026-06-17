@@ -3193,13 +3193,34 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// one-column table; its args resolve against an EMPTY-local-rels scope whose parent is the
 	// enclosing query (non-LATERAL: a $N/outer reference works, a sibling FROM table does not).
 	var rels []scopeRel
-	srfPlans := make([]*srfPlan, len(tableRefs)) // aligned with rels; nil = a base table
+	srfPlans := make([]*srfPlan, len(tableRefs))       // aligned with rels; nil = a base table
+	derivedPlans := make([]*queryPlan, len(tableRefs)) // aligned with rels; non-nil = a derived table
 	seenLabels := make(map[string]bool)
 	offset := 0
 	for i, tref := range tableRefs {
 		var t *Table
 		var cteIdx *int
-		if tref.IsFunc {
+		if tref.Subquery != nil {
+			// A DERIVED TABLE — `FROM (SELECT …) [AS] t`. Plan the body as an INDEPENDENT query
+			// (parent=nil: not correlated / not LATERAL — §42) that still inherits the statement's
+			// CTE bindings (cte.md §2), build its synthetic relation (the alias is the label; the
+			// optional column-rename list applies, 42P10 on overflow), and keep the plan for
+			// in-place execution.
+			plan, perr := db.planQuery(*tref.Subquery, nil, ctes, ptypes)
+			if perr != nil {
+				return nil, perr
+			}
+			label := ""
+			if tref.Alias != nil {
+				label = strings.ToLower(*tref.Alias)
+			}
+			tbl, terr := cteSyntheticTable(label, &plan, tref.ColumnAliases)
+			if terr != nil {
+				return nil, terr
+			}
+			t = tbl
+			derivedPlans[i] = &plan
+		} else if tref.IsFunc {
 			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, parent, ctes, ptypes)
 			if serr != nil {
 				return nil, serr
@@ -3235,10 +3256,16 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		if tref.Alias != nil {
 			label = strings.ToLower(*tref.Alias)
 		}
-		if seenLabels[label] {
-			return nil, NewError(DuplicateAlias, "table name "+label+" specified more than once")
+		// An unaliased derived table (grammar.md §42, PG 18) has an EMPTY label — it has no
+		// qualifier, so two of them never collide and the duplicate-label check is skipped (its bare
+		// columns still resolve, and stay ambiguous via resolveBare). Every other relation has a
+		// non-empty label (a table/function name or an explicit alias).
+		if label != "" {
+			if seenLabels[label] {
+				return nil, NewError(DuplicateAlias, "table name "+label+" specified more than once")
+			}
+			seenLabels[label] = true
 		}
-		seenLabels[label] = true
 		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx})
 		offset += len(t.Columns)
 	}
@@ -3320,9 +3347,9 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	relBounds := make([]*scanBound, len(rels))
 	if filter != nil {
 		for i, rel := range rels {
-			// A set-returning relation is a computed row source with no PK/index — it never
-			// bounds (functions.md §10), so skip detection for it.
-			if srfPlans[i] != nil {
+			// A set-returning relation or a derived table is a computed row source with no
+			// PK/index — it never bounds (functions.md §10, §42), so skip detection for it.
+			if srfPlans[i] != nil || derivedPlans[i] != nil {
 				continue
 			}
 			relBounds[i] = detectScanBound(filter, rel)
@@ -3413,7 +3440,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// plan outlives the scope and a correlated subquery can re-execute it per row).
 	planRels := make([]planRel, len(s.rels))
 	for i, rel := range s.rels {
-		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i], cte: rel.cte}
+		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i], cte: rel.cte, derived: derivedPlans[i]}
 	}
 	// The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
 	// columns this query statically references, collected depth-aware so a correlated
@@ -4345,7 +4372,9 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		plan.rels[0].srf == nil &&
 		// A CTE reference is a computed/buffered source, not a table store — the eager path
 		// (cte.md §5) delivers its rows; the streaming reader assumes a store.
-		plan.rels[0].cte == nil {
+		plan.rels[0].cte == nil &&
+		// A derived table is a computed source too (grammar.md §42) — eager path.
+		plan.rels[0].derived == nil {
 		return db.execStreamingLimit(plan, env, meter, params)
 	}
 
@@ -4360,7 +4389,9 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) &&
 		plan.rels[0].srf == nil &&
 		// A CTE reference takes the eager path (cte.md §5).
-		plan.rels[0].cte == nil {
+		plan.rels[0].cte == nil &&
+		// A derived table takes the eager path (grammar.md §42).
+		plan.rels[0].derived == nil {
 		return db.execStreamingSort(plan, env, meter, params)
 	}
 
@@ -4416,6 +4447,19 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 				rows = rowsFromValues(r.rows)
 			}
 			materialized[ri] = rows
+			continue
+		}
+		// A DERIVED TABLE runs its body in place (grammar.md §42): the inline path, exactly like a
+		// single-reference CTE. The body was planned parent=nil, so it reads no outer row (nil); it
+		// may reference a statement CTE, so it gets the same context. Its intrinsic cost accrues into
+		// this meter — no cte_scan_row.
+		if rel.derived != nil {
+			r, err := db.execQueryPlan(rel.derived, nil, params, env.ctes)
+			if err != nil {
+				return selectResult{}, err
+			}
+			meter.Charge(r.cost)
+			materialized[ri] = rowsFromValues(r.rows)
 			continue
 		}
 		store := db.readSnap().store(rel.tableName)
@@ -5955,6 +5999,12 @@ type planRel struct {
 	// tableName is then the CTE name (never looked up in the store) and the executor delivers its
 	// rows from the per-statement cteCtx (a materialized buffer, or the inlined body run in place).
 	cte *int
+	// derived is non-nil when this relation is a DERIVED TABLE — `FROM (SELECT …) [AS] t`
+	// (spec/design/grammar.md §42): a parenthesized subquery used as a relation, mechanically an
+	// anonymous always-inlined single-reference CTE. tableName is the alias (never looked up in the
+	// store); the executor runs this plan in place (it was planned parent=nil, so it reads no outer
+	// row), charging its intrinsic cost — no cte_scan_row.
+	derived *queryPlan
 }
 
 // srfKind selects which set-returning function a srfPlan is, picking the row generator at exec
@@ -7984,11 +8034,18 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 		if r.qualifierOnly {
 			continue
 		}
-		if local := r.table.ColumnIndex(name); local >= 0 {
-			if found >= 0 {
-				return resolved{}, ambiguousColumn(name)
+		// Count EVERY matching column, not just the first per relation: a synthetic relation (a CTE
+		// or derived table) may carry two columns of the same name, and a bare reference to that name
+		// is ambiguous (42702) exactly as a match across two relations is (cte.md §2, grammar.md §42).
+		// Base tables have unique column names, so this only ever fires for a duplicate-output-name
+		// synthetic relation.
+		for local, c := range r.table.Columns {
+			if strings.EqualFold(c.Name, name) {
+				if found >= 0 {
+					return resolved{}, ambiguousColumn(name)
+				}
+				found = r.offset + local
 			}
-			found = r.offset + local
 		}
 	}
 	if found >= 0 {

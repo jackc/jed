@@ -408,9 +408,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         snapshot preserved.
   - [x] **`$N` inside a subquery** — one `ParamTypes` threads the whole plan tree; the lone gap
         (a `$N` typed only by the enclosing query) raises `42P18` (documented divergence).
+  - [x] **Derived tables** (`FROM (SELECT …) AS t`) — a parenthesized subquery as a FROM relation,
+        the parser surface over the CTE slice's inline seam: a derived table is mechanically an
+        anonymous, always-inlined single-reference CTE (no materialize path, no `cte_scan_row`).
+        Body planned `parent = None` (non-correlated, no LATERAL) but inheriting CTE bindings;
+        **optional** alias (matching PG 18, which relaxed the mandatory-alias rule — an unaliased
+        derived table has no qualifier), optional column-rename list (`42P10`), explicit-label
+        collision `42712`, leading-`(`-not-`SELECT` `42601`, depth counts toward `54001`. New
+        `query.derived_table` capability. → [grammar.md §42](spec/design/grammar.md)
+    - [ ] _follow-on:_ **`LATERAL`** (body sees earlier FROM relations); a **parenthesized-join
+          FROM** (`FROM (a JOIN b ON …)`); a **`VALUES` body** (`FROM (VALUES …) AS v(x)`).
   - [ ] **Subqueries — remaining seams:** subqueries in an **`INSERT ... VALUES`** slot (blocked on
-        VALUES holding a general expression); **derived tables** (`FROM (SELECT …) AS t`); **`ANY` /
-        `ALL`** and row-valued subqueries. _(size: M)_
+        VALUES holding a general expression); **`ANY` / `ALL`** and row-valued subqueries. _(size: M)_
 - [x] **Set operations — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]`** — a query-expression
       precedence tree (INTERSECT binds tighter), full-PG per-column type unification, NULL-safe
       multiset semantics, trailing ORDER BY by output-column name. → [grammar.md §25](spec/design/grammar.md)

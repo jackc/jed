@@ -263,11 +263,19 @@ type Delete struct {
 // When IsFunc is true the reference is instead a set-returning FUNCTION call used as a row
 // source (generate_series(1, 5)): Name is the function name and Args its argument expressions
 // (the label is then the alias, or the function name when there is none — grammar.md §35).
+// TableRef is one FROM relation: a base table NAME, a set-returning function CALL (IsFunc, Args —
+// generate_series, grammar.md §35), or a DERIVED TABLE (Subquery non-nil — a parenthesized subquery
+// `FROM (SELECT …) [AS] t`, grammar.md §42). A derived table is mechanically an anonymous,
+// always-inlined single-reference CTE: the planner reuses the CTE synthetic-relation seam. Its alias
+// is OPTIONAL (PG 18); when present it is the label and ColumnAliases is the optional column-rename
+// list, when absent Name/Alias are empty and the relation has no qualifier.
 type TableRef struct {
-	Name   string
-	Alias  *string
-	IsFunc bool
-	Args   []*Expr
+	Name          string
+	Alias         *string
+	IsFunc        bool
+	Args          []*Expr
+	Subquery      *QueryExpr
+	ColumnAliases []string
 }
 
 // JoinKind is the kind of a join. Inner and Cross execute this slice; the Left/Right/Full

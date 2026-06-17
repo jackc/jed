@@ -3275,7 +3275,31 @@ impl Database {
         // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, kind))` = an SRF.
         let mut srf_meta: Vec<Option<(usize, Vec<RExpr>, SrfKind)>> =
             Vec::with_capacity(from_items.len());
+        // Per FROM item: the planned body of a DERIVED TABLE (grammar.md §42), else `None`. Held
+        // here through planning and moved into each relation's `PlanRel.derived` at assembly.
+        let mut derived_plans: Vec<Option<QueryPlan>> = Vec::with_capacity(from_items.len());
+        // Per FROM item: the index into `synthetic` of a derived table's relation, else `None`
+        // (distinguishes a derived table from a base table / CTE in the second pass).
+        let mut derived_meta: Vec<Option<usize>> = Vec::with_capacity(from_items.len());
         for tref in &from_items {
+            if let Some(body) = &tref.subquery {
+                // A DERIVED TABLE — `FROM (SELECT …) AS t`. Plan the body as an INDEPENDENT query
+                // (`parent = None`: not correlated / not LATERAL — §42) that still inherits the
+                // statement's CTE bindings (cte.md §2), build its synthetic relation (the alias is
+                // the label; the optional column-rename list applies, 42P10 on overflow), and keep
+                // the plan for in-place execution. Like a single-reference CTE, it borrows a
+                // SYNTHETIC `Table` that must outlive the scope, so it joins `synthetic`.
+                let plan = self.plan_query(body, None, ctes, ptypes)?;
+                let label = tref.alias.clone().unwrap_or_default().to_ascii_lowercase();
+                let table = cte_synthetic_table(&label, &plan, tref.column_aliases.as_deref())?;
+                synthetic.push(table);
+                srf_meta.push(None);
+                derived_meta.push(Some(synthetic.len() - 1));
+                derived_plans.push(Some(plan));
+                continue;
+            }
+            derived_meta.push(None);
+            derived_plans.push(None);
             match &tref.args {
                 None => srf_meta.push(None),
                 Some(args) => {
@@ -3296,23 +3320,26 @@ impl Database {
         let mut rels: Vec<ScopeRel> = Vec::with_capacity(from_items.len());
         let mut seen_labels: HashSet<String> = HashSet::new();
         let mut offset = 0usize;
-        for (tref, meta) in from_items.iter().zip(srf_meta.iter()) {
-            // A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog
-            // table of the same name (cte.md §2); lookup is case-insensitive. A hit bumps the
-            // binding's reference count (the inline-vs-materialize decision — cost.md §3).
+        for (i, (tref, meta)) in from_items.iter().zip(srf_meta.iter()).enumerate() {
+            // A plain FROM name (not an SRF call or a derived table) may resolve to a CTE, which
+            // SHADOWS a catalog table of the same name (cte.md §2); lookup is case-insensitive. A
+            // hit bumps the binding's reference count (the inline-vs-materialize decision —
+            // cost.md §3). A derived table's alias is NOT a name lookup, so it never matches a CTE.
             let lname = tref.name.to_ascii_lowercase();
-            let cte_idx = if meta.is_none() {
+            let cte_idx = if meta.is_none() && derived_meta[i].is_none() {
                 ctes.iter().position(|b| b.name == lname)
             } else {
                 None
             };
-            let (table, cte): (&Table, Option<usize>) = match (meta, cte_idx) {
-                (Some((si, _, _)), _) => (&synthetic[*si], None),
-                (None, Some(i)) => {
+            let (table, cte): (&Table, Option<usize>) = match (meta, derived_meta[i], cte_idx) {
+                (Some((si, _, _)), _, _) => (&synthetic[*si], None),
+                // A derived table resolves against its synthetic relation (built above).
+                (None, Some(si), _) => (&synthetic[si], None),
+                (None, None, Some(i)) => {
                     ctes[i].refs.set(ctes[i].refs.get() + 1);
                     (&*ctes[i].table, Some(i))
                 }
-                (None, None) => (
+                (None, None, None) => (
                     self.table(&tref.name).ok_or_else(|| {
                         EngineError::new(
                             SqlState::UndefinedTable,
@@ -3327,7 +3354,11 @@ impl Database {
                 .clone()
                 .unwrap_or_else(|| table.name.clone())
                 .to_ascii_lowercase();
-            if !seen_labels.insert(label.clone()) {
+            // An unaliased derived table (grammar.md §42, PG 18) has an EMPTY label — it has no
+            // qualifier, so two of them never collide and the duplicate-label check is skipped (its
+            // bare columns still resolve, and stay ambiguous via resolve_bare). Every other relation
+            // has a non-empty label (a table/function name or an explicit alias).
+            if !label.is_empty() && !seen_labels.insert(label.clone()) {
                 return Err(EngineError::new(
                     SqlState::DuplicateAlias,
                     format!("table name {label} specified more than once"),
@@ -3438,8 +3469,10 @@ impl Database {
             .rels
             .iter()
             .enumerate()
-            .map(|(i, rel)| match (&filter, &srf_meta[i]) {
-                (Some(f), None) => detect_scan_bound(f, rel),
+            .map(|(i, rel)| match (&filter, &srf_meta[i], &derived_meta[i]) {
+                // A scan bound applies only to a base table — a set-returning function or a derived
+                // table is a computed source with no store to seek (functions.md §10, §42).
+                (Some(f), None, None) => detect_scan_bound(f, rel),
                 _ => None,
             })
             .collect();
@@ -3551,6 +3584,7 @@ impl Database {
                 col_count: r.table.columns.len(),
                 srf: srf_plans[i].take(),
                 cte: r.cte,
+                derived: derived_plans[i].take().map(Box::new),
             })
             .collect();
         // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14):
@@ -4045,6 +4079,8 @@ impl Database {
             // A CTE reference is a computed/buffered source, not a table store — the eager path
             // (cte.md §5) delivers its rows; the streaming reader assumes a store.
             && plan.rels[0].cte.is_none()
+            // A derived table is a computed source too (grammar.md §42) — eager path.
+            && plan.rels[0].derived.is_none()
         {
             return self.exec_streaming_limit(plan, &env, &mut meter, params);
         }
@@ -4065,6 +4101,8 @@ impl Database {
             && plan.rels[0].srf.is_none()
             // A CTE reference takes the eager path (cte.md §5).
             && plan.rels[0].cte.is_none()
+            // A derived table takes the eager path (grammar.md §42).
+            && plan.rels[0].derived.is_none()
         {
             return self.exec_streaming_sort(plan, &env, &mut meter, params);
         }
@@ -4108,6 +4146,16 @@ impl Database {
                     }
                 };
                 materialized.push(rows);
+                continue;
+            }
+            // A DERIVED TABLE runs its body in place (grammar.md §42): the inline path, exactly like
+            // a single-reference CTE. The body was planned `parent = None`, so it reads no outer row
+            // (`&[]`); it may reference a statement CTE, so it gets the same context. Its intrinsic
+            // cost accrues into this meter — no cte_scan_row.
+            if let Some(dp) = &rel.derived {
+                let r = self.exec_query_plan(dp, &[], params, env.ctes)?;
+                meter.charge(r.cost);
+                materialized.push(r.rows);
                 continue;
             }
             let store = self.store(&rel.table_name);
@@ -4896,11 +4944,18 @@ impl<'a> Scope<'a> {
             if r.qualifier_only {
                 continue;
             }
-            if let Some(local) = r.table.column_index(name) {
-                if found.is_some() {
-                    return Err(ambiguous_column(name));
+            // Count EVERY matching column, not just the first per relation: a synthetic relation (a
+            // CTE or derived table) may carry two columns of the same name, and a bare reference to
+            // that name is ambiguous (42702) exactly as a match across two relations is (cte.md §2,
+            // grammar.md §42). Base tables have unique column names, so this only ever fires for a
+            // duplicate-output-name synthetic relation.
+            for (local, c) in r.table.columns.iter().enumerate() {
+                if c.name.eq_ignore_ascii_case(name) {
+                    if found.is_some() {
+                        return Err(ambiguous_column(name));
+                    }
+                    found = Some(r.offset + local);
                 }
-                found = Some(r.offset + local);
             }
         }
         if let Some(idx) = found {
@@ -5569,6 +5624,12 @@ struct PlanRel {
     /// CTE name (never looked up in the store) and the executor delivers its rows from the
     /// per-statement `CteCtx` (a materialized buffer, or the inlined body run in place).
     cte: Option<usize>,
+    /// When `Some(plan)`, this relation is a DERIVED TABLE — `FROM (SELECT …) AS t`
+    /// (spec/design/grammar.md §42): a parenthesized subquery used as a relation, mechanically an
+    /// anonymous always-inlined single-reference CTE. `table_name` is the alias (never looked up in
+    /// the store); the executor runs `plan` in place (it was planned `parent = None`, so it reads no
+    /// outer row), charging its intrinsic cost — no `cte_scan_row`.
+    derived: Option<Box<QueryPlan>>,
 }
 
 /// How a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE from its

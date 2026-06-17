@@ -574,7 +574,8 @@ grammar/AST/parser reshape was needed. Semantics (PostgreSQL by default, [../../
   `CROSS JOIN` covers the same semantics and comma-`FROM`'s precedence-vs-`JOIN` interaction is a
   future trap. A `,` after the first `table_ref` is a `42601`.
 - **No `USING` / `NATURAL`** join forms (they need column-name matching / merge semantics), **no
-  `t.*`** qualified-star, **no parenthesized / derived-table FROM**, **no subqueries**.
+  `t.*`** qualified-star, **no parenthesized-join FROM** (`FROM (a JOIN b ON …)`). A **derived table**
+  (`FROM (SELECT …) AS t`) *is* now supported — see §42.
 - **`UPDATE` / `DELETE` stay single-table** — they keep one table name and gain nothing here
   (though a qualified `WHERE t.a = 1` referencing their sole table now resolves, harmlessly).
 
@@ -1186,8 +1187,8 @@ real cause (the type can't be determined) and is consistent with its strict, no-
   *by an enclosing-query column* (a per-outer-row constant — degenerate) is **`0A000`**; the
   key machinery is flat local indices. WHERE / HAVING / `ON` / select-list correlation is fully
   supported.
-- **Derived tables** — `FROM ( query_expr ) AS t` (a subquery as a relation) is a separate later
-  slice; it is not part of this one.
+- **Derived tables** — `FROM ( query_expr ) AS t` (a subquery as a relation) landed as its own
+  slice; see §42.
 - **`ANY` / `ALL`** and **row-valued** subqueries are not implemented.
 - **Subqueries in `GROUP BY`** are not reachable — a `GROUP BY` key is grammatically a
   `column_ref` only (§18), so `(SELECT …)` there is a `42601` syntax error by the existing rule.
@@ -1808,3 +1809,94 @@ grammar change AF5 makes — **no new tokens** (`ANY`/`SOME`/`ALL` are plain key
   with `x` (else `42883`, PG's `operator does not exist`). The result is always `boolean`. A bare
   untyped `NULL` array operand is **`42P18`** (jed's polymorphic indeterminate posture, §11). The
   **subquery** form `op ANY(SELECT …)` is a separate deferred feature — the parser raises `0A000`.
+
+## 42. Derived tables (`FROM ( query_expr ) AS t`)
+
+A **derived table** is a parenthesized subquery used as a relation in the `FROM` clause:
+`SELECT d.id FROM (SELECT id, n FROM t WHERE n > 0) AS d`. It is the FROM-position sibling of the
+expression-position subqueries (§26): the same `( query_expr )` body, now a **computed row source**
+rather than a scalar/`IN`/`EXISTS` operand. The body is any query expression — a `SELECT`, a JOIN,
+an aggregate, or a set operation (§25). This lands the *parser surface* over machinery the CTE
+slice already built ([cte.md](cte.md) §3): a derived table is, mechanically, an **anonymous,
+always-inlined single-reference CTE** — the inline evaluation path, the synthetic-relation seam,
+and column resolution are all reused unchanged.
+
+```
+SELECT d.label, d.total
+FROM   (SELECT k AS label, sum(v) AS total FROM t GROUP BY k) AS d
+WHERE  d.total > 100
+```
+
+**The body is planned, then run in place — INLINE.** Unlike a CTE, a derived table has no name to
+reference twice, so there is no materialize path and no `cte_scan_row`: its body is planned once
+(so structural/type errors surface at plan time regardless of outer cardinality, matching §26) and
+**executed in place**, charging its **intrinsic cost** — exactly a single-reference / `NOT
+MATERIALIZED` CTE ([cost.md](cost.md) §3). No new cost unit; no on-disk format change (a derived
+table is purely a query-plan construct).
+
+**The alias is optional (PostgreSQL 18).** The classic rule required a subquery in `FROM` to be
+aliased (*"subquery in FROM must have an alias"*), but **PostgreSQL 18 relaxed it** — `SELECT id FROM
+(SELECT id FROM t)` is valid — and jed matches the oracle ([../../CLAUDE.md](../../CLAUDE.md) §1).
+When present, the alias is the relation's **label** (`d.col` qualifies it) and may carry a
+parenthesized **column-rename list** (`AS d (a, b)`) renaming the body's output columns left-to-right,
+with the **same** rules as a CTE's ([cte.md](cte.md) §1): **fewer** aliases is a partial rename (the
+rest keep their body names), **more** is **`42P10`** (`invalid_column_reference`). A column list with
+no preceding alias name (`(SELECT …) (a)`) is a syntax error (`42601`), matching PG. When the alias is
+**absent**, the relation has **no qualifier** — its columns are reachable only by bare name — so two
+unaliased derived tables coexist without collision (no `42712`), again matching PG 18. Either way, a
+body producing two same-named columns is allowed, `SELECT *` emits both, and a later **bare** reference
+to that name is **`42702`** (ambiguous) — the rule cte.md §2 already anticipated for "a future inline
+derived table" (and the same rule a self-join of same-labelled relations takes). An explicit label
+must be **distinct** from the other FROM relations' labels: a collision is **`42712`**
+(`duplicate_alias`).
+
+**Disambiguation (a §8 cross-core determinism surface).** In `table_ref` position, a leading `(`
+followed by `SELECT` is a derived table — the *same* leading-`SELECT` lookahead scalar subqueries
+and IN-subqueries use (§26), so the three hand-written parsers stay byte-identical. A leading `(`
+**not** followed by `SELECT` is a **`42601`** this slice (a parenthesized join expression
+`FROM (a JOIN b ON …)` is a deferred narrowing, below). The base-table / SRF forms are unchanged: a
+`(` *after* a leading identifier is still the function form (§35).
+
+**The body is NOT correlated (no `LATERAL`).** A derived-table body is planned as an **independent
+query** (`parent = None`), exactly like a non-recursive CTE body ([cte.md](cte.md) §2): it sees its
+own FROM, the catalog, and the statement's **CTE bindings** (so `WITH c AS (…) SELECT * FROM (SELECT
+* FROM c) AS d` works), but **never** the enclosing query's FROM or a sibling FROM relation. A
+reference to an outer or sibling column inside the body is therefore unresolved (`42703`/`42P01`),
+*not* a correlated reference. This is the central behavioral rule, and it matches PostgreSQL:
+without the `LATERAL` keyword a FROM-subquery cannot see the other FROM items. (`LATERAL` — the body
+seeing earlier FROM relations — is a deferred follow-on.) A derived table itself nests freely: its
+body may contain further derived tables, joins, and the expression-position subqueries of §26, each
+counting toward the parser's `MAX_EXPR_DEPTH` nesting limit (`54001`, [cost.md](cost.md) §7) so a
+pathologically nested `FROM (SELECT * FROM (SELECT …))` aborts before overflowing the native stack.
+
+**Composition and reach.** A derived table is a first-class FROM relation: it joins and cross-joins
+other relations, and `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT` and the §26 subqueries
+all compose over it. Because the planner path is shared, a derived table also appears inside any
+**subquery**, including those in an `UPDATE`/`DELETE` `WHERE` / `SET` / `RETURNING` (which observe the
+pre-statement snapshot, §26) — no extra work, since `UPDATE`/`DELETE` reach it only *through* a
+subquery (they remain single-table at top level, §15). **Bind parameters** inside the body are typed
+by the body's own context (§26); a `$N` with no type context errors `42P18` as everywhere.
+
+**Errors.**
+
+| Condition | Code | Notes |
+|---|---|---|
+| MORE column-rename aliases than body columns | `42P10` | `invalid_column_reference`; fewer is a legal partial rename. |
+| A column-rename list with no preceding alias name (`(SELECT …) (a)`) | `42601` | The bare `(` is a leftover token (matches PG). |
+| Duplicate explicit FROM label (alias collides) | `42712` | `duplicate_alias`; the general FROM-label rule (§15). Unaliased derived tables have no label and never collide. |
+| Ambiguous bare reference to a duplicated body output column | `42702` | Within one relation or across two (cte.md §2). |
+| Outer / sibling column referenced inside the body | `42703` / `42P01` | The body is not correlated / not LATERAL. |
+| Leading `(` in FROM not followed by `SELECT` | `42601` | No parenthesized-join FROM this slice — a **documented divergence** (PG parses `(a JOIN b …)`; the override ledger records it). |
+| Nested `WITH` inside the body | `42601` | Top-level-only narrowing (§26, cte.md §1); leftover token — a **documented divergence** (PG 18 accepts a `WITH` body). |
+| Body nesting exceeds `MAX_EXPR_DEPTH` | `54001` | The parser depth gate (cost.md §7). |
+
+**Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
+
+- **`LATERAL`** — a derived table (or SRF, §35) that references earlier FROM relations. The body
+  stays independent (`parent = None`) until this lands.
+- **Parenthesized join / table-reference FROM** — `FROM (a JOIN b ON …) c`. A leading `(` not
+  starting a `SELECT` is `42601`.
+- **A `VALUES` body** — `FROM (VALUES (1),(2)) AS v(x)` — and a `WITH` *inside* the body (nested
+  `WITH`, `42601`). The body production is the WITH-less `query_expr` (`SELECT` / set op).
+- **Top-level `UPDATE`/`DELETE` FROM** stays single-table (§15) — a derived table reaches them only
+  inside a subquery.

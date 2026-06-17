@@ -1314,14 +1314,18 @@ func (p *Parser) parseFromClause() (TableRef, []JoinClause, error) {
 	return from, joins, nil
 }
 
-// parseTableRef parses `table_ref ::= (identifier | table_function) ("AS"? identifier)?` where
-// `table_function ::= identifier "(" expr ("," expr)* ")"` — a base table name OR a
-// set-returning function call (generate_series(1, 5)) used as a row source, each with an
-// optional alias (grammar.md §15/§35). A `(` immediately after the leading identifier marks the
-// function form; the resolver owns arity/type errors. The alias logic is identical for both: an
-// explicit AS takes the next identifier unconditionally; an implicit alias is taken only when the
-// next token is a word that is NOT a clause/join keyword. The stop-keyword set is a §8 surface.
+// parseTableRef parses `table_ref ::= derived_table derived_alias? | (identifier | table_function)
+// ("AS"? identifier)?` (grammar.md §15/§35/§42). A `(` at the START of a table_ref, when a SELECT
+// follows, begins a DERIVED TABLE — a parenthesized subquery used as a relation (§42); any other
+// leading `(` is a 42601 this slice (no parenthesized-join FROM). Otherwise it is a base table name
+// OR a set-returning function call, a `(` immediately after the leading identifier marking the
+// function form; the resolver owns arity/type errors. The alias logic is shared: an explicit AS
+// takes the next identifier unconditionally; an implicit alias is taken only when the next token is
+// a word that is NOT a clause/join keyword. The stop-keyword set is a §8 surface.
 func (p *Parser) parseTableRef() (TableRef, error) {
+	if p.peek().Kind == TokLParen {
+		return p.parseDerivedTable()
+	}
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return TableRef{}, err
@@ -1367,6 +1371,70 @@ func (p *Parser) parseTableRef() (TableRef, error) {
 			"column alias list on a table function is not supported yet")
 	}
 	return TableRef{Name: name, Alias: alias, IsFunc: isFunc, Args: args}, nil
+}
+
+// parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).
+// The caller has verified the next token is `(`. A derived table is recognized only when a SELECT
+// follows the `(` (the §26 leading-SELECT lookahead, a §8 cross-core surface); any other leading `(`
+// is a 42601 (no parenthesized-join FROM this slice). The alias is OPTIONAL (PostgreSQL 18 relaxed
+// the old mandatory-alias rule): present, it is the label and may carry a column-rename list; absent,
+// the relation has no qualifier (its bare columns still resolve). Name/Alias carry the alias (empty
+// when none).
+func (p *Parser) parseDerivedTable() (TableRef, error) {
+	// Consume the opening `(`. Only a leading SELECT is a derived table; otherwise reject (a
+	// parenthesized-join FROM `(a JOIN b ON …)` is a deferred narrowing).
+	p.advance()
+	if p.peekKeyword() != "select" {
+		return TableRef{}, NewError(SyntaxError,
+			"subquery in FROM must begin with SELECT (a parenthesized join is not supported)")
+	}
+	body, err := p.parseSubquery()
+	if err != nil {
+		return TableRef{}, err
+	}
+	if err := p.expect(TokRParen); err != nil {
+		return TableRef{}, err
+	}
+	// The alias is optional, parsed exactly like a base table's.
+	var alias *string
+	if p.peekKeyword() == "as" {
+		p.advance()
+		a, err := p.expectIdentifier()
+		if err != nil {
+			return TableRef{}, err
+		}
+		alias = &a
+	} else if t := p.peek(); t.Kind == TokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
+		a := t.Word
+		p.advance()
+		alias = &a
+	}
+	// Optional column-rename list `(c1, c2, …)` — only when a table alias was given (PG: a column
+	// list with no preceding alias name is a syntax error; the bare `(` falls through and a later
+	// token check rejects it).
+	var columnAliases []string
+	if alias != nil && p.peek().Kind == TokLParen {
+		p.advance()
+		for {
+			c, err := p.expectIdentifier()
+			if err != nil {
+				return TableRef{}, err
+			}
+			columnAliases = append(columnAliases, c)
+			if p.peek().Kind != TokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return TableRef{}, err
+		}
+	}
+	name := ""
+	if alias != nil {
+		name = *alias
+	}
+	return TableRef{Name: name, Alias: alias, Subquery: &body, ColumnAliases: columnAliases}, nil
 }
 
 // parseJoinClause parses one join_clause if a join keyword begins here (returns ok=false to end

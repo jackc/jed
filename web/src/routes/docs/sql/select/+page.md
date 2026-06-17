@@ -28,6 +28,11 @@ ORDER BY price DESC;`;
 )
 SELECT name, price FROM kitchen ORDER BY price DESC;`;
 
+	const derived = `SELECT category, top
+FROM (SELECT category, max(price) AS top FROM product GROUP BY category) AS d
+WHERE top > 5
+ORDER BY category;`;
+
 	const unnestExample = `SELECT u AS tag
 FROM unnest(ARRAY['red', 'green', 'blue']) AS u
 ORDER BY u;`;
@@ -114,6 +119,19 @@ CTEs follow PostgreSQL's evaluation rule: a CTE referenced once is **inlined**, 
 several times (or marked `MATERIALIZED`) runs once and its rows are **buffered** and reused. Add an
 optional column-rename list (`WITH t (a, b) AS (…)`). `WITH RECURSIVE` and data-modifying CTEs are
 not yet supported.
+
+## Derived tables (`FROM (SELECT …) AS t`)
+
+A `FROM` item can be a parenthesized subquery used as a relation — a **derived table**. It is an
+anonymous, always-inlined single-reference CTE: the body runs in place, and you reference its output
+columns through the alias. The alias is optional (matching PostgreSQL 18); when present it may carry a
+column-rename list (`AS t (a, b)`):
+
+<LiveSql {seed} query={derived} rows={4} />
+
+The body is an independent query — it cannot see the enclosing query's other `FROM` relations
+(`LATERAL` is not yet supported). A parenthesized join (`FROM (a JOIN b …)`) and a `WITH`/`VALUES`
+body are likewise not yet supported.
 
 ## Set-returning functions in `FROM`
 

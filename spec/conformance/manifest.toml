@@ -237,6 +237,10 @@ id = "query.cte"
 description = "Non-recursive common table expressions — WITH name [(cols)] AS [NOT] MATERIALIZED (query) [, ...] <query> (spec/design/cte.md). A CTE is a named, statement-local relation the FROM clause references like a table; a list defines one or more, each visible to LATER CTEs in the list and to the main query + its nested subqueries (forward-only: a self/forward reference is 42P01). A CTE name shadows a same-named catalog table in the statement, except inside its own body (which resolves the base table). A body is an INDEPENDENT query — not correlated to the reference site (an outer column inside a body is 42703/42P01). Bodies may be JOINs, aggregates, or set operations. The optional column-rename list renames the body's output columns (a count mismatch is 42P10). Evaluation follows PostgreSQL's hybrid rule: a single-reference CTE is INLINED (body runs in place, like a derived table — a volatile body re-evaluates), a multi-reference or MATERIALIZED one is MATERIALIZED (body runs once, rows buffered, each reference charges cte_scan_row per buffered row; an unreferenced CTE is planned but not executed); [NOT] MATERIALIZED overrides the choice (spec/design/cost.md §3). A duplicate CTE name in one list is 42712. Narrowings: WITH attaches only at the statement top level (a nested WITH is 42601); RECURSIVE, data-modifying CTEs, and WITH on UPDATE/DELETE are deferred"
 
 [[capability]]
+id = "query.derived_table"
+description = "Derived tables — FROM ( query_expr ) [AS] t: a parenthesized subquery used as a FROM relation (spec/design/grammar.md §42). The parser surface over the CTE inline seam — a derived table is mechanically an anonymous, always-inlined single-reference CTE: the body is planned once (structural/type errors surface regardless of outer cardinality) and run IN PLACE, charging its intrinsic cost (no materialize path, no cte_scan_row). The alias is OPTIONAL (PostgreSQL 18 relaxed the old mandatory-alias rule): present, it is the label and may carry a column-rename list AS t(a,b) renaming body output columns left-to-right (fewer is a partial rename, more is 42P10; a column list with no alias name is 42601); absent, the relation has no qualifier and two unaliased derived tables coexist. An explicit label must be distinct from other FROM relations (42712); a body with duplicate output names is allowed but a later bare reference is 42702. The body is an INDEPENDENT query (parent=None, NOT correlated / no LATERAL) inheriting statement CTE bindings — an outer/sibling column inside is 42703/42P01. Disambiguation: a leading ( followed by SELECT is a derived table (the §26 lookahead); any other leading ( in FROM is 42601 (no parenthesized-join FROM — a documented PG divergence). It composes with JOIN/WHERE/GROUP BY/ORDER BY/LIMIT/subqueries and is reachable inside an UPDATE/DELETE subquery; body nesting counts toward MAX_EXPR_DEPTH (54001). Narrowings: LATERAL, a parenthesized-join FROM, and a WITH/VALUES body are deferred. Builds on query.cte / query.subquery_scalar"
+
+[[capability]]
 id = "types.int16"
 description = "int16 / smallint scalar type"
 
@@ -683,7 +687,7 @@ capabilities = [
 
 [[profile]]
 id = "cte"
-title = "subqueries + set operations + non-recursive common table expressions: WITH name [(cols)] AS [NOT] MATERIALIZED (query) [, ...] <query>, forward-only visibility, PG's hybrid inline-single / materialize-multi rule (Phase 4, spec/design/cte.md)"
+title = "subqueries + set operations + non-recursive common table expressions: WITH name [(cols)] AS [NOT] MATERIALIZED (query) [, ...] <query>, forward-only visibility, PG's hybrid inline-single / materialize-multi rule, and derived tables FROM (SELECT …) AS t (Phase 4, spec/design/cte.md, grammar.md §42)"
 includes = "subqueries"
 capabilities = [
   "query.cross_join",
@@ -691,4 +695,5 @@ capabilities = [
   "query.intersect",
   "query.except",
   "query.cte",
+  "query.derived_table",
 ]

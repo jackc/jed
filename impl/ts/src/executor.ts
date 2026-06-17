@@ -2470,13 +2470,24 @@ export class Database {
     const tableRefs = sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
     const rels: ScopeRel[] = [];
     const srfPlans: (SrfPlan | undefined)[] = []; // aligned with rels; undefined = a base table
+    const derivedPlans: (QueryPlan | undefined)[] = []; // aligned with rels; non-undefined = derived
     const seenLabels = new Set<string>();
     let offset = 0;
     for (const tref of tableRefs) {
       let t: Table;
       let srf: SrfPlan | undefined;
       let cteIdx: number | undefined;
-      if (tref.args !== null) {
+      let derived: QueryPlan | undefined;
+      if (tref.subquery !== undefined) {
+        // A DERIVED TABLE — `FROM (SELECT …) [AS] t`. Plan the body as an INDEPENDENT query
+        // (parent=null: not correlated / not LATERAL — §42) that still inherits the statement's CTE
+        // bindings (cte.md §2), build its synthetic relation (the alias is the label; the optional
+        // column-rename list applies, 42P10 on overflow), and keep the plan for in-place execution.
+        const plan = this.planQuery(tref.subquery, null, ctes, ptypes);
+        const label = tref.alias === null ? "" : tref.alias.toLowerCase();
+        t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
+        derived = plan;
+      } else if (tref.args !== null) {
         const r = this.resolveSRF(tref.name, tref.args, tref.alias, parent, ctes, ptypes);
         t = r.table;
         srf = r.srf;
@@ -2497,12 +2508,18 @@ export class Database {
         }
       }
       const label = (tref.alias ?? t.name).toLowerCase();
-      if (seenLabels.has(label)) {
-        throw engineError("duplicate_alias", "table name " + label + " specified more than once");
+      // An unaliased derived table (grammar.md §42, PG 18) has an EMPTY label — it has no qualifier,
+      // so two of them never collide and the duplicate-label check is skipped (its bare columns still
+      // resolve, and stay ambiguous via resolveBare). Every other relation has a non-empty label.
+      if (label !== "") {
+        if (seenLabels.has(label)) {
+          throw engineError("duplicate_alias", "table name " + label + " specified more than once");
+        }
+        seenLabels.add(label);
       }
-      seenLabels.add(label);
       rels.push({ label, table: t, offset, cte: cteIdx });
       srfPlans.push(srf);
+      derivedPlans.push(derived);
       offset += t.columns.length;
     }
     const scope = new Scope(rels, this, parent, true, ctes);
@@ -2620,7 +2637,7 @@ export class Database {
     // (functions.md §10), so skip detection for it. A CTE reference is likewise a computed/buffered
     // source with no store PK (cte.md §5), so skip it too.
     const relBounds: (ScanBound | null)[] = rels.map((rel, i) =>
-      filter === null || srfPlans[i] !== undefined || rel.cte !== undefined
+      filter === null || srfPlans[i] !== undefined || rel.cte !== undefined || derivedPlans[i] !== undefined
         ? null
         : detectScanBound(filter, rel),
     );
@@ -2633,6 +2650,7 @@ export class Database {
       colCount: rel.table.columns.length,
       srf: srfPlans[i],
       cte: rel.cte,
+      derived: derivedPlans[i],
     }));
     // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
     // columns this query statically references, collected depth-aware so a correlated
@@ -2967,7 +2985,9 @@ export class Database {
       plan.rels[0]!.srf === undefined &&
       // A CTE reference is a computed/buffered source, not a table store — the eager path
       // (cte.md §5) delivers its rows; the streaming reader assumes a store.
-      plan.rels[0]!.cte === undefined
+      plan.rels[0]!.cte === undefined &&
+      // A derived table is a computed source too (grammar.md §42) — eager path.
+      plan.rels[0]!.derived === undefined
     ) {
       return this.execStreamingLimit(plan, env, meter, params);
     }
@@ -2988,7 +3008,9 @@ export class Database {
       // A set-returning relation takes the eager path (functions.md §10).
       plan.rels[0]!.srf === undefined &&
       // A CTE reference takes the eager path (cte.md §5).
-      plan.rels[0]!.cte === undefined
+      plan.rels[0]!.cte === undefined &&
+      // A derived table takes the eager path (grammar.md §42).
+      plan.rels[0]!.derived === undefined
     ) {
       return this.execStreamingSort(plan, env, meter, params);
     }
@@ -3025,6 +3047,15 @@ export class Database {
         // Inline: the body is an independent query (parent = null at plan time), so it reads no
         // outer row; it may reference an EARLIER CTE, so pass the same context.
         const r = this.execQueryPlan(env.ctes.plans[ci]!, [], params, env.ctes);
+        meter.charge(r.cost);
+        return r.rows;
+      }
+      // A DERIVED TABLE runs its body in place (grammar.md §42): the inline path, exactly like a
+      // single-reference CTE. The body was planned parent=null, so it reads no outer row ([]); it may
+      // reference a statement CTE, so it gets the same context. Its intrinsic cost accrues into this
+      // meter — no cte_scan_row.
+      if (rel.derived !== undefined) {
+        const r = this.execQueryPlan(rel.derived, [], params, env.ctes);
         meter.charge(r.cost);
         return r.rows;
       }
@@ -4283,7 +4314,12 @@ type VariadicFuncName = "num_nulls" | "num_nonnulls";
 // the statement's CTE list — spec/design/cte.md), not a base table: `tableName` is then the CTE
 // name (never looked up in the store) and the executor delivers its rows from the per-statement
 // CteCtx (a materialized buffer, or the inlined body run in place).
-type PlanRel = { tableName: string; offset: number; colCount: number; srf?: SrfPlan; cte?: number };
+// A `derived` plan marks a DERIVED TABLE — `FROM (SELECT …) [AS] t` (grammar.md §42): a
+// parenthesized subquery used as a relation, mechanically an anonymous always-inlined
+// single-reference CTE. tableName is the alias (never looked up in the store); the executor runs
+// this plan in place (it was planned parent=null, so it reads no outer row), charging its intrinsic
+// cost — no cte_scan_row.
+type PlanRel = { tableName: string; offset: number; colCount: number; srf?: SrfPlan; cte?: number; derived?: QueryPlan };
 
 // SrfKind selects which set-returning function an SrfPlan is, picking the row generator at exec
 // (spec/design/functions.md §10, array-functions.md §9). The dispatch is hand-written per core.
@@ -5713,10 +5749,16 @@ class Scope {
     let found = -1;
     for (const r of this.rels) {
       if (r.qualifierOnly) continue;
-      const local = columnIndex(r.table, name);
-      if (local >= 0) {
-        if (found >= 0) throw ambiguousColumn(name);
-        found = r.offset + local;
+      // Count EVERY matching column, not just the first per relation: a synthetic relation (a CTE or
+      // derived table) may carry two columns of the same name, and a bare reference to that name is
+      // ambiguous (42702) exactly as a match across two relations is (cte.md §2, grammar.md §42).
+      // Base tables have unique column names, so this only fires for a duplicate-output-name relation.
+      const lower = name.toLowerCase();
+      for (let local = 0; local < r.table.columns.length; local++) {
+        if (r.table.columns[local]!.name.toLowerCase() === lower) {
+          if (found >= 0) throw ambiguousColumn(name);
+          found = r.offset + local;
+        }
       }
     }
     if (found >= 0) return { level: 0, index: found };

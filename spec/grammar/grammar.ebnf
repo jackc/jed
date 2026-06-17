@@ -343,18 +343,40 @@ group_by       ::= "GROUP" "BY" column_ref ("," column_ref)*
 
 /* The FROM clause is a left-deep chain: a first table_ref followed by zero or more
  * join_clauses. With no join_clause it is the single-table SELECT the rest of the
- * engine already supported (../design/grammar.md §5/§15). A table_ref is a base table
- * name OR a set-returning function call (table_function — generate_series(1,5), the
- * computed row source of ../design/grammar.md §35), each with an optional alias — "AS"
- * optional ("orders o" = "orders AS o"). The alias (or, with none, the table name /
- * function name) is the relation's LABEL, used to qualify columns (t.col); two relations
- * with the same label (a self-join with no aliases, "t JOIN t") is a 42712 duplicate_alias.
- * A "(" immediately after the leading identifier marks the function form (a one-token
- * lookahead — a §8 determinism surface); the column-alias-list form "AS g(cols)" is a
- * deferred 0A000 narrowing. */
+ * engine already supported (../design/grammar.md §5/§15). A table_ref is one of three
+ * row sources, each with an alias:
+ *   - a DERIVED TABLE — a parenthesized subquery "(" query_expr ")" used as a relation
+ *     (../design/grammar.md §42), e.g. "(SELECT id, n FROM t) AS d". It reuses the same
+ *     computed-row-source seam as a single-reference CTE (../design/cte.md §3): the body
+ *     is planned and run in place, INLINE, charging its intrinsic cost.
+ *   - a base table NAME;
+ *   - a set-returning function CALL (table_function — generate_series(1,5), the computed
+ *     row source of ../design/grammar.md §35).
+ * The alias (or, for a name/function with none, the table name / function name) is the
+ * relation's LABEL, used to qualify columns (t.col); two relations with the same label (a
+ * self-join with no aliases, "t JOIN t") is a 42712 duplicate_alias.
+ *   DISAMBIGUATION (each a §8 cross-core determinism surface): a "(" at the START of a
+ * table_ref begins a derived table when the token after it is "SELECT" (the same leading-
+ * "SELECT" rule scalar subqueries and IN-subqueries use — §26); any other leading "(" is a
+ * 42601 this slice (no parenthesized-join FROM). A "(" immediately after a leading
+ * IDENTIFIER marks the function form (a one-token lookahead; a bare table name has no "("
+ * there).
+ *   ALIAS. A derived table's alias is OPTIONAL (PostgreSQL 18 relaxed the old "subquery in FROM
+ * must have an alias" rule). When present (derived_alias) it is the relation's label and may carry
+ * a parenthesized COLUMN-RENAME list "(c1, c2)" renaming the body's output columns left-to-right
+ * exactly as a CTE's does (fewer names is a partial rename, more is 42P10); a column list with no
+ * preceding alias name is a 42601 syntax error. When absent, the relation has no qualifier (bare
+ * columns still resolve). A base table / function alias stays the bare optional form ("orders o" =
+ * "orders AS o"); their column-alias-list form "AS g(cols)" remains a deferred 0A000 narrowing
+ * (§35). */
 from_clause    ::= table_ref join_clause*
 
-table_ref      ::= (table_function | identifier) ("AS"? identifier)?
+table_ref      ::= derived_table derived_alias?
+                 | (table_function | identifier) ("AS"? identifier)?
+
+derived_table  ::= "(" query_expr ")"
+
+derived_alias  ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?
 
 table_function ::= identifier "(" expr ("," expr)* ")"
 

@@ -1,0 +1,259 @@
+# Derived tables (spec/design/grammar.md §42): FROM ( query_expr ) AS t — a parenthesized subquery
+# used as a FROM relation. Mechanically an anonymous, always-inlined single-reference CTE: the body
+# is planned once and run IN PLACE, charging its intrinsic cost (no materialize path, no
+# cte_scan_row). The alias is OPTIONAL (PostgreSQL 18 relaxed the old mandatory-alias rule — an
+# unaliased derived table has no qualifier but its bare columns resolve); an optional column-rename
+# list AS t(a,b) renames body output columns left-to-right (42P10 if too many); an explicit label must
+# be distinct (42712). The body is an INDEPENDENT query (parent=None, NOT correlated / no LATERAL)
+# inheriting statement CTE bindings — an outer/sibling column inside is 42703/42P01. Rows verified
+# against the live PostgreSQL 18 oracle; cost assertions are jed's deterministic cross-core contract
+# (spec/design/cost.md §3, the inline path).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.group_by, query.join_inner, query.cross_join, query.union, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_in, query.cte, query.derived_table, expr.arithmetic, expr.in_list, types.int32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, n int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+# Basic derived table: a subquery aliased `d`, its columns qualified d.col.
+# names: id, n
+query II nosort
+SELECT d.id, d.n FROM (SELECT id, n FROM t) AS d ORDER BY d.id
+----
+1
+10
+2
+20
+3
+30
+
+# SELECT * expands the derived table's columns in body output order.
+# names: id, n
+query II nosort
+SELECT * FROM (SELECT id, n FROM t) AS d ORDER BY d.id
+----
+1
+10
+2
+20
+3
+30
+
+# The `AS` is optional — `(...) d` is `(...) AS d`. A bare column reference resolves against it.
+# names: id
+query I nosort
+SELECT id FROM (SELECT id FROM t) d ORDER BY id
+----
+1
+2
+3
+
+# Column-rename list renames the body's output columns left-to-right.
+# names: a, b
+query II nosort
+SELECT a, b FROM (SELECT id, n FROM t) AS d (a, b) ORDER BY a
+----
+1
+10
+2
+20
+3
+30
+
+# A PARTIAL rename — fewer aliases than columns — renames the first and keeps the rest (PostgreSQL):
+# the first column becomes `a`, the second keeps its body name `n`.
+# names: a, n
+query II nosort
+SELECT a, n FROM (SELECT id, n FROM t) AS d (a) ORDER BY a
+----
+1
+10
+2
+20
+3
+30
+
+# A WHERE over the derived relation; an aggregate body (GROUP BY) computed in place.
+# names: k, total
+query II nosort
+SELECT k, total FROM (SELECT n AS k, sum(id) AS total FROM t GROUP BY n) AS d WHERE total >= 2 ORDER BY k
+----
+20
+2
+30
+3
+
+# A derived table joined with a base table on the derived column.
+# names: id, m
+query II nosort
+SELECT t.id, d.m FROM t JOIN (SELECT id, n * 2 AS m FROM t) AS d ON t.id = d.id ORDER BY t.id
+----
+1
+20
+2
+40
+3
+60
+
+# A derived table CROSS JOINed with a base table (Cartesian product of 3 rows x 1 derived row).
+# names: id, hi
+query II rowsort
+SELECT t.id, d.hi FROM t CROSS JOIN (SELECT max(n) AS hi FROM t) AS d
+----
+1
+30
+2
+30
+3
+30
+
+# A set-operation body.
+# names: v
+query I nosort
+SELECT v FROM (SELECT n AS v FROM t WHERE id = 1 UNION ALL SELECT n FROM t WHERE id = 2) AS d ORDER BY v
+----
+10
+20
+
+# Nested derived tables: a derived table whose body's FROM is itself a derived table.
+# names: x
+query I nosort
+SELECT x FROM (SELECT id AS x FROM (SELECT id FROM t) AS inner_d) AS d ORDER BY x
+----
+1
+2
+3
+
+# A derived table referencing a CTE — the statement's CTE bindings are inherited into the body
+# (parent=None affects only correlation, not CTE visibility).
+# names: id
+query I nosort
+WITH c AS (SELECT id, n FROM t) SELECT d.id FROM (SELECT id FROM c) AS d ORDER BY d.id
+----
+1
+2
+3
+
+# A derived table inside a scalar subquery.
+# names: id
+query I nosort
+SELECT id FROM t WHERE n = (SELECT max(m) FROM (SELECT n AS m FROM t) AS d) ORDER BY id
+----
+3
+
+# A derived table inside an IN-subquery.
+# names: id
+query I nosort
+SELECT id FROM t WHERE id IN (SELECT x FROM (SELECT id AS x FROM t WHERE n >= 20) AS d) ORDER BY id
+----
+2
+3
+
+# --- derived tables inside an UPDATE / DELETE subquery (reachable through a subquery; UPDATE/DELETE
+# stay single-table at top level — §42/§15) ---
+
+statement ok
+CREATE TABLE m (id int32 PRIMARY KEY, n int32)
+
+statement ok
+INSERT INTO m VALUES (1, 10), (2, 20), (3, 30)
+
+# DELETE whose WHERE subquery's FROM is a derived table (the subquery observes the pre-statement
+# snapshot, §26): deletes the rows with n >= 20, leaving id 1.
+statement ok
+DELETE FROM m WHERE id IN (SELECT x FROM (SELECT id AS x FROM m WHERE n >= 20) AS d)
+
+# names: id, n
+query II nosort
+SELECT id, n FROM m ORDER BY id
+----
+1
+10
+
+# UPDATE whose SET RHS scalar subquery reads a derived table: sum(id) over the surviving row is 1.
+statement ok
+UPDATE m SET n = (SELECT s FROM (SELECT sum(id) AS s FROM m) AS d) WHERE id = 1
+
+# names: id, n
+query II nosort
+SELECT id, n FROM m ORDER BY id
+----
+1
+1
+
+# The alias is OPTIONAL (PostgreSQL 18): an unaliased derived table has no qualifier, but its bare
+# columns resolve normally.
+# names: id
+query I nosort
+SELECT id FROM (SELECT id FROM t) ORDER BY id
+----
+1
+2
+3
+
+# Two UNALIASED derived tables coexist (no qualifier, so no label collision — PG 18).
+# names: a, b
+query II rowsort
+SELECT a, b FROM (SELECT 1 AS a) CROSS JOIN (SELECT 2 AS b)
+----
+1
+2
+
+# --- error cases (spec/design/grammar.md §42) ---
+
+# MORE column-rename aliases than the body has columns -> 42P10 (fewer is a legal partial rename).
+statement error 42P10
+SELECT * FROM (SELECT id FROM t) AS d (a, b)
+
+# A derived table whose label collides with another FROM relation -> 42712 (duplicate_alias).
+statement error 42712
+SELECT 1 FROM t AS d CROSS JOIN (SELECT id FROM t) AS d
+
+# The body is NOT correlated / not LATERAL: a sibling FROM relation referenced inside the body is
+# unresolved -> 42P01 (the qualifier `t` is not in the body's own scope, only its alias `u`).
+statement error 42P01
+SELECT t.id FROM t JOIN (SELECT id FROM t AS u WHERE u.id = t.id) AS d ON t.id = d.id
+
+# A leading `(` in FROM that does NOT begin a SELECT is 42601 this slice (no parenthesized-join FROM
+# — a deferred feature). DOCUMENTED DIVERGENCE: PostgreSQL parses the parenthesized join and instead
+# reports 42712 (the duplicate `t`) — see oracle_overrides.toml.
+statement error 42601
+SELECT * FROM (t JOIN t ON 1 = 1) AS x
+
+# A body producing two columns of the same name is allowed, but a later BARE reference to that name
+# is ambiguous -> 42702 (the same rule a self-join of same-labelled relations takes).
+statement error 42702
+SELECT a FROM (SELECT id AS a, n AS a FROM t) AS d
+
+# A nested WITH inside the body -> 42601 (top-level-only narrowing; the body is the WITH-less
+# query_expr, so the WITH surfaces as a leftover token). DOCUMENTED DIVERGENCE: PostgreSQL 18 accepts
+# a WITH-prefixed subquery body (returns 1) — see oracle_overrides.toml.
+statement error 42601
+SELECT * FROM (WITH c AS (SELECT 1 AS one) SELECT one FROM c) AS d
+
+# --- cost contract (spec/design/cost.md §3, the inline path) ---
+
+# A derived table takes the inline path — its body runs in place at the FROM position and charges its
+# intrinsic cost (never cte_scan_row): body = page_read(1) + 3 storage_row_read + 3 row_produced = 7;
+# the outer scans the computed relation d (no store) and emits 3 rows = 3 row_produced.
+# cost: 10
+query II nosort
+SELECT d.id, d.n FROM (SELECT id, n FROM t) AS d ORDER BY d.id
+----
+1
+10
+2
+20
+3
+30
+
+# Nested derived tables charge each level's inline cost: innermost body 7, the middle derived select
+# 3 row_produced, the outer 3 row_produced = 13.
+# cost: 13
+query I nosort
+SELECT x FROM (SELECT id AS x FROM (SELECT id FROM t) AS inner_d) AS d ORDER BY x
+----
+1
+2
+3

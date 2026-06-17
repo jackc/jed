@@ -278,11 +278,20 @@ pub struct Delete {
 /// row source (`generate_series(1, 5)`): `name` is the function name and `args` its argument
 /// expressions. The label is then the alias, or the function name when there is none
 /// (spec/design/grammar.md §35). `None` = an ordinary base table.
+///
+/// A `subquery` of `Some(body)` instead marks a **derived table** — a parenthesized subquery used
+/// as a relation, `FROM (SELECT …) AS t` (spec/design/grammar.md §42). The alias is then mandatory
+/// (the parser enforces 42601), so `name` and `alias` both carry it and `args` is `None`;
+/// `column_aliases` is the optional column-rename list (`AS t (a, b)`). A derived table is
+/// mechanically an anonymous, always-inlined single-reference CTE — the planner reuses the CTE
+/// synthetic-relation seam.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
     pub args: Option<Vec<Expr>>,
+    pub subquery: Option<Box<QueryExpr>>,
+    pub column_aliases: Option<Vec<String>>,
 }
 
 /// The kind of a join. `Inner` and `Cross` execute this slice; the `Left`/`Right`/`Full`

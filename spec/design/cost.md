@@ -540,7 +540,9 @@ contract: it decides whether a CTE's body runs once-and-is-buffered or runs in p
   `page_read` / `storage_row_read` / `operator_eval` / `generated_row` / `row_produced` its plan
   accrues — once per scan of that relation. Under a correlated subquery it re-runs per outer row
   (the body re-executes), exactly like an inlined subquery's inner re-scan. No new unit; a single
-  reference costs the same as writing the body inline.
+  reference costs the same as writing the body inline. A **derived table** (`FROM (SELECT …) AS t`,
+  [grammar.md §42](grammar.md#42-derived-tables-from--query_expr--as-t)) takes this same inline path
+  — it has no name to reference twice, so it is always inlined and never charges `cte_scan_row`.
 - **Materialized** (referenced ≥ 2 times, or `MATERIALIZED`): the body runs **once**, accruing its
   full intrinsic cost into a row buffer, and **each reference** charges one **`cte_scan_row`** per
   buffered row — accrued **at the source** (before the row enters the join/WHERE pipeline) with a

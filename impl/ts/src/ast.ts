@@ -346,7 +346,18 @@ export type InsertValue =
 // source (generate_series(1, 5)): `name` is the function name and `args` its argument
 // expressions (the label is then the alias, or the function name when there is none —
 // grammar.md §35). `null` = an ordinary base table.
-export type TableRef = { name: string; alias: string | null; args: Expr[] | null };
+// A `subquery` instead marks a DERIVED TABLE — a parenthesized subquery used as a relation,
+// `FROM (SELECT …) [AS] t` (grammar.md §42), mechanically an anonymous always-inlined
+// single-reference CTE (the planner reuses the CTE synthetic-relation seam). The alias is OPTIONAL
+// (PG 18): present, it is the label and `columnAliases` the optional column-rename list; absent,
+// `name` is "" / `alias` is null and the relation has no qualifier.
+export type TableRef = {
+  name: string;
+  alias: string | null;
+  args: Expr[] | null;
+  subquery?: QueryExpr;
+  columnAliases?: string[];
+};
 
 // JoinKind is the kind of a join. "inner"/"cross" execute this slice; the "left"/"right"/"full"
 // outer kinds parse and are carried in the AST but executing one is a documented 0A000

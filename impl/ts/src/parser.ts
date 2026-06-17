@@ -988,13 +988,17 @@ class Parser {
     return { from, joins };
   }
 
-  // parseTableRef parses `table_ref ::= (identifier | table_function) ("AS"? identifier)?` where
-  // `table_function ::= identifier "(" expr ("," expr)* ")"` — a base table name OR a
-  // set-returning function call (generate_series(1, 5)) used as a row source, each with an
-  // optional alias (grammar.md §15/§35). A `(` immediately after the leading identifier marks
-  // the function form; the resolver owns arity/type errors. The alias logic is identical for
-  // both forms. The stop-keyword set is a §8 cross-core surface.
+  // parseTableRef parses `table_ref ::= derived_table derived_alias? | (identifier |
+  // table_function) ("AS"? identifier)?` (grammar.md §15/§35/§42). A `(` at the START of a
+  // table_ref, when a SELECT follows, begins a DERIVED TABLE — a parenthesized subquery used as a
+  // relation (§42); any other leading `(` is a 42601 this slice (no parenthesized-join FROM).
+  // Otherwise it is a base table name OR a set-returning function call, a `(` immediately after the
+  // leading identifier marking the function form; the resolver owns arity/type errors. The alias
+  // logic is shared. The stop-keyword set is a §8 cross-core surface.
   private parseTableRef(): TableRef {
+    if (this.peek().kind === "lparen") {
+      return this.parseDerivedTable();
+    }
     const name = this.expectIdentifier();
     // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
     let args: Expr[] | null = null;
@@ -1027,6 +1031,53 @@ class Parser {
       );
     }
     return { name, alias, args };
+  }
+
+  // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).
+  // The caller has verified the next token is `(`. A derived table is recognized only when a SELECT
+  // follows the `(` (the §26 leading-SELECT lookahead, a §8 cross-core surface); any other leading
+  // `(` is a 42601 (no parenthesized-join FROM this slice). The alias is OPTIONAL (PostgreSQL 18
+  // relaxed the old mandatory-alias rule): present, it is the label and may carry a column-rename
+  // list; absent, the relation has no qualifier (its bare columns still resolve). name/alias carry
+  // the alias ("" / null when none).
+  private parseDerivedTable(): TableRef {
+    // Consume the opening `(`. Only a leading SELECT is a derived table; otherwise reject (a
+    // parenthesized-join FROM `(a JOIN b ON …)` is a deferred narrowing).
+    this.advance();
+    if (this.peekKeyword() !== "select") {
+      throw engineError(
+        "syntax_error",
+        "subquery in FROM must begin with SELECT (a parenthesized join is not supported)",
+      );
+    }
+    const body = this.parseSubquery();
+    this.expect("rparen");
+    // The alias is optional, parsed exactly like a base table's.
+    let alias: string | null = null;
+    if (this.peekKeyword() === "as") {
+      this.advance();
+      alias = this.expectIdentifier();
+    } else {
+      const t = this.peek();
+      if (t.kind === "word" && !isTableRefStopKeyword(lower(t.word!))) {
+        alias = t.word!;
+        this.advance();
+      }
+    }
+    // Optional column-rename list `(c1, c2, …)` — only when a table alias was given (PG: a column
+    // list with no preceding alias name is a syntax error; the bare `(` falls through and a later
+    // token check rejects it).
+    let columnAliases: string[] | undefined;
+    if (alias !== null && this.peek().kind === "lparen") {
+      this.advance();
+      columnAliases = [this.expectIdentifier()];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        columnAliases.push(this.expectIdentifier());
+      }
+      this.expect("rparen");
+    }
+    return { name: alias ?? "", alias, args: null, subquery: body, columnAliases };
   }
 
   // parseJoinClause parses one join_clause if a join keyword begins here (returns null to end

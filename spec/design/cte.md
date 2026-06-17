@@ -141,5 +141,9 @@ purely a query-plan construct — no `format_version` bump).
   cost ceiling does real work there). The forward-only visibility rule (§2) is what this lifts.
 - **Data-modifying CTEs** — `WITH x AS (INSERT … RETURNING …) …`.
 - **`WITH` on `UPDATE`/`DELETE`**, and **nested `WITH`** inside a subquery / CTE body.
-- **Inline derived-table *syntax*** (`FROM (SELECT …) AS t`) — the inline evaluation path (§3)
-  builds this executor seam internally, leaving only the parser surface for a later slice.
+
+**Landed since:**
+
+- **Inline derived-table *syntax*** (`FROM (SELECT …) AS t`) — the parser surface over this slice's
+  inline evaluation path (§3); a derived table is mechanically an anonymous, always-inlined
+  single-reference CTE. See [grammar.md §42](grammar.md#42-derived-tables-from--query_expr--as-t).
