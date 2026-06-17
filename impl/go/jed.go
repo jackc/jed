@@ -133,6 +133,9 @@ var SupportedCapabilities = []string{
 	"query.subquery_in",
 	"query.subquery_exists",
 	"query.subquery_correlated",
+	// Quantified comparison over a subquery — x op ANY/SOME/ALL (SELECT …), the subquery spelling
+	// of IN (array-functions.md §11.6).
+	"query.subquery_quantified",
 	// Non-recursive common table expressions — WITH name [(cols)] AS [NOT] MATERIALIZED (query)
 	// [, ...] <query> (spec/design/cte.md).
 	"query.cte",

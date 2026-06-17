@@ -2029,11 +2029,18 @@ func (p *Parser) parseComparison() (Expr, error) {
 		if err := p.expect(TokLParen); err != nil {
 			return Expr{}, err
 		}
-		// The subquery quantifier form `op ANY(SELECT …)` is a separate deferred Phase-4 item
-		// (array-functions.md §11); only the array operand is supported.
+		// A leading `SELECT` is the SUBQUERY form `op ANY/ALL(SELECT …)` — the subquery spelling of
+		// IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead; anything else is the
+		// array operand (§11.1).
 		if p.peekKeyword() == "select" {
-			return Expr{}, NewError(FeatureNotSupported,
-				"the subquery form of ANY/ALL is not supported; use an array operand")
+			query, err := p.parseSubquery()
+			if err != nil {
+				return Expr{}, err
+			}
+			if err := p.expect(TokRParen); err != nil {
+				return Expr{}, err
+			}
+			return Expr{Kind: ExprQuantifiedSubquery, QuantifiedSubquery: &QuantifiedSubqueryExpr{Op: op, All: all, Lhs: lhs, Query: query}}, nil
 		}
 		array, err := p.parseExpr() // a full expression resolving to an array
 		if err != nil {

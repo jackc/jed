@@ -3346,6 +3346,19 @@ export class Database {
         if (e.subKind === "exists") {
           return { kind: "constBool", value: r.rows.length > 0 !== e.negated };
         }
+        if (e.subKind === "quantified") {
+          // An uncorrelated quantified subquery folds to a constant-array `quantified`
+          // (array-functions.md §11.6): its single column becomes a 1-D array and the node reuses
+          // the array form's 3VL fold — no per-row re-execution.
+          const elements = r.rows.map((row) => row[0]!);
+          return {
+            kind: "quantified",
+            op: e.op!,
+            all: e.all!,
+            lhs: e.lhs!,
+            array: valueToRExpr(arrayValue(elements)),
+          };
+        }
         // in
         const list = r.rows.map((row) => row[0]!);
         return { kind: "inValues", lhs: e.lhs!, list, negated: e.negated };
@@ -4222,7 +4235,17 @@ type RExpr =
   | { kind: "outerColumn"; level: number; index: number }
   // A CORRELATED subquery, re-executed once per outer row at eval (uncorrelated ones are folded to
   // a constant / inValues before exec). `lhs`/`negated` apply to the IN form.
-  | { kind: "subquery"; plan: QueryPlan; subKind: SubqueryKind; lhs: RExpr | null; negated: boolean }
+  | {
+      kind: "subquery";
+      plan: QueryPlan;
+      subKind: SubqueryKind;
+      lhs: RExpr | null;
+      negated: boolean;
+      // For subKind "quantified" (array-functions.md §11.6): the comparison op + ALL flag, so the
+      // body's single column folds through quantifiedMembership exactly like the array form.
+      op?: BinaryOp;
+      all?: boolean;
+    }
   // A folded uncorrelated `IN (subquery)`: the subquery ran once yielding `list`; per row it tests
   // `lhs` for three-valued membership (empty → negated; a NULL with no positive match → NULL).
   | { kind: "inValues"; lhs: RExpr; list: Value[]; negated: boolean }
@@ -4232,7 +4255,7 @@ type RExpr =
   | { kind: "quantified"; op: BinaryOp; all: boolean; lhs: RExpr; array: RExpr };
 
 // SubqueryKind selects which subquery form a "subquery" RExpr is (spec/design/grammar.md §26).
-type SubqueryKind = "scalar" | "exists" | "in";
+type SubqueryKind = "scalar" | "exists" | "in" | "quantified";
 
 // ScalarFuncName is the internal identity of a scalar-function node. abs/round span int/decimal
 // AND float overloads; the rest (ceil…tan) are float-only (spec/design/float.md §8). The
@@ -4766,6 +4789,7 @@ function rejectCheckStructure(e: Expr): void {
     case "scalarSubquery":
     case "exists":
     case "inSubquery":
+    case "quantifiedSubquery":
       throw engineError("feature_not_supported", "cannot use subquery in check constraint");
     case "param":
       throw engineError("undefined_parameter", "there is no parameter $" + e.index.toString());
@@ -4836,6 +4860,7 @@ function rejectDefaultStructure(e: Expr): void {
     case "scalarSubquery":
     case "exists":
     case "inSubquery":
+    case "quantifiedSubquery":
       throw engineError("feature_not_supported", "cannot use subquery in DEFAULT expression");
     case "param":
       throw engineError("undefined_parameter", "there is no parameter $" + e.index.toString());
@@ -6545,6 +6570,29 @@ function resolve(
       classifyComparable(lt, plan.columnTypes[0]!);
       return {
         node: { kind: "subquery", plan, subKind: "in", lhs, negated: e.negated },
+        type: { kind: "bool" },
+      };
+    }
+    case "quantifiedSubquery": {
+      // The subquery spelling of the quantifier (array-functions.md §11.6) — the IN-subquery
+      // pattern with the comparison + 3VL fold. Resolve the outer lhs, plan the body, require ONE
+      // column (42601), and require comparability — reporting operator-not-found (42883) the way the
+      // array quantifier does (§11.3), not the plain 42804. No 21000 cardinality limit.
+      const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
+      const plan = planSubquery(scope, e.query, params);
+      if (plan.columnTypes.length !== 1) {
+        throw engineError("syntax_error", "subquery has too many columns");
+      }
+      try {
+        classifyComparable(lt, plan.columnTypes[0]!);
+      } catch {
+        throw engineError(
+          "undefined_function",
+          `operator does not exist: ${rtName(lt)} ${binaryOpSymbol(e.op)} ${rtName(plan.columnTypes[0]!)}`,
+        );
+      }
+      return {
+        node: { kind: "subquery", plan, subKind: "quantified", lhs, negated: false, op: e.op, all: e.all },
         type: { kind: "bool" },
       };
     }
@@ -9065,6 +9113,13 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.subKind === "exists") {
         // EXISTS ignores the select list entirely and is never NULL.
         return { kind: "bool", value: r.rows.length > 0 !== e.negated };
+      }
+      if (e.subKind === "quantified") {
+        // A correlated quantified subquery (array-functions.md §11.6): gather the body's single
+        // column into an array and run the SAME 3VL fold as the array form.
+        const lv = evalExpr(e.lhs!, row, env, m);
+        const elements = r.rows.map((rr) => rr[0]!);
+        return quantifiedMembership(e.op!, e.all!, lv, arrayValue(elements), m);
       }
       // in
       const lv = evalExpr(e.lhs!, row, env, m);

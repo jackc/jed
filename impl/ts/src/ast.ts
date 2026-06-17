@@ -130,8 +130,13 @@ export type Expr =
   // §11), the array spelling of IN. `op` is a comparison (eq/lt/gt/le/ge); `all` is true for ALL,
   // false for ANY/SOME (SOME folds to ANY at parse). The three-valued fold over the array's
   // flattened elements reuses the IN-list membership semantics, generalized to all five comparison
-  // operators and both quantifiers. The subquery form `op ANY(SELECT …)` is a deferred 0A000.
+  // operators and both quantifiers.
   | { kind: "quantified"; op: BinaryOp; all: boolean; lhs: Expr; array: Expr }
+  // `lhs op ANY/SOME/ALL ( query_expr )` — the SUBQUERY form of the quantified comparison
+  // (spec/design/array-functions.md §11.6), the subquery spelling of IN. Parallel to inSubquery: the
+  // body's single column (42601 if >1) folds through the SAME three-valued fold as `quantified`.
+  // Uncorrelated folds to a constant-array quantified node; correlated re-executes per outer row.
+  | { kind: "quantifiedSubquery"; op: BinaryOp; all: boolean; lhs: Expr; query: QueryExpr }
   // A `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Builds a row value from
   // the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The bare
   // `(a, b)` form is deferred (0A000); only the keyword form parses.

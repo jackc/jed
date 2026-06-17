@@ -1189,7 +1189,8 @@ real cause (the type can't be determined) and is consistent with its strict, no-
   supported.
 - **Derived tables** — `FROM ( query_expr ) AS t` (a subquery as a relation) landed as its own
   slice; see §42.
-- **`ANY` / `ALL`** and **row-valued** subqueries are not implemented.
+- **`ANY` / `ALL` over a subquery** — `x op ANY/ALL(SELECT …)` landed (the subquery spelling of `IN`);
+  see §41 / [array-functions.md §11.6](array-functions.md). **Row-valued** subqueries are not implemented.
 - **Subqueries in `GROUP BY`** are not reachable — a `GROUP BY` key is grammatically a
   `column_ref` only (§18), so `(SELECT …)` there is a `42601` syntax error by the existing rule.
 
@@ -1807,8 +1808,12 @@ grammar change AF5 makes — **no new tokens** (`ANY`/`SOME`/`ALL` are plain key
   to `x`'s type). The right operand must be an **array** — a non-array right side is **`42809`**
   (`op ANY/ALL (array) requires array on right side`, PG) — whose element type must be **comparable**
   with `x` (else `42883`, PG's `operator does not exist`). The result is always `boolean`. A bare
-  untyped `NULL` array operand is **`42P18`** (jed's polymorphic indeterminate posture, §11). The
-  **subquery** form `op ANY(SELECT …)` is a separate deferred feature — the parser raises `0A000`.
+  untyped `NULL` array operand is **`42P18`** (jed's polymorphic indeterminate posture, §11).
+- **The subquery form** `x op ANY/ALL(SELECT …)` (the subquery spelling of `IN`) also resolves: a
+  leading `SELECT` after the quantifier's `(` selects it (the §26 lookahead), folding over the
+  subquery's single column (`42601` if >1) exactly as `IN` does — three-valued, no `21000` cardinality
+  limit, uncorrelated-folded / correlated-re-executed per §26, incomparable types `42883`
+  ([array-functions.md §11.6](array-functions.md)).
 
 ## 42. Derived tables (`FROM ( query_expr ) AS t`)
 

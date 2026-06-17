@@ -610,12 +610,23 @@ pub enum Expr {
     /// false for `ANY`/`SOME` (SOME folds to ANY at parse). The array operand resolves to an
     /// array type; the three-valued fold over its flattened elements reuses the `IN`-list
     /// membership semantics (`x = ANY(arr)` ≡ `x IN (the elements)`), generalized to all five
-    /// operators and both quantifiers. The subquery form `op ANY(SELECT …)` is a deferred 0A000.
+    /// operators and both quantifiers.
     Quantified {
         op: BinaryOp,
         all: bool,
         lhs: Box<Expr>,
         array: Box<Expr>,
+    },
+    /// `lhs op ANY/SOME/ALL ( query_expr )` — the SUBQUERY form of the quantified comparison
+    /// (array-functions.md §11.6), the subquery spelling of `IN`. Parallel to `InSubquery`: the
+    /// body's single column (42601 if >1) folds through the SAME three-valued fold as `Quantified`
+    /// (`= ANY` ≡ `IN`), with no `21000` cardinality limit. Uncorrelated folds to a constant-array
+    /// `Quantified`; correlated re-executes per outer row.
+    QuantifiedSubquery {
+        op: BinaryOp,
+        all: bool,
+        lhs: Box<Expr>,
+        query: Box<QueryExpr>,
     },
 }
 

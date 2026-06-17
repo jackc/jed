@@ -1646,13 +1646,18 @@ impl Parser {
                 if let Some(all) = quant {
                     self.advance(); // ANY / SOME / ALL
                     self.expect(&Token::LParen)?;
-                    // The subquery quantifier form `op ANY(SELECT …)` is a separate deferred
-                    // Phase-4 item (array-functions.md §11); only the array operand is supported.
+                    // A leading `SELECT` is the SUBQUERY form `op ANY/ALL(SELECT …)` — the subquery
+                    // spelling of IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead;
+                    // anything else is the array operand (§11.1).
                     if self.peek_keyword().as_deref() == Some("select") {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            "the subquery form of ANY/ALL is not supported; use an array operand",
-                        ));
+                        let query = self.parse_subquery()?;
+                        self.expect(&Token::RParen)?;
+                        return Ok(Expr::QuantifiedSubquery {
+                            op,
+                            all,
+                            lhs: Box::new(lhs),
+                            query: Box::new(query),
+                        });
                     }
                     let array = self.parse_expr()?; // a full expression resolving to an array
                     self.expect(&Token::RParen)?;

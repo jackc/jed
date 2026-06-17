@@ -45,6 +45,11 @@ ORDER BY u;`;
        5 > ALL(ARRAY[1, 2, 3])  AS all_greater,
        9 = ANY(ARRAY[1, 2, 3])  AS no_match;`;
 
+	const quantifiedSubquery = `SELECT name, price
+FROM product
+WHERE price > ANY(SELECT price FROM product WHERE category = 'office')
+ORDER BY price;`;
+
 	const variadicExample = `SELECT num_nulls(1, NULL, 3)                AS spread,
        num_nulls(VARIADIC ARRAY[1, NULL, 3]) AS variadic,
        num_nonnulls(1, NULL, 3)              AS non_nulls;`;
@@ -161,6 +166,12 @@ exactly like `IN`: a `NULL` element (or a `NULL` `x`) makes the result `NULL` wh
 it, an empty array makes `ANY` false and `ALL` true, and a `NULL` whole array yields `NULL`:
 
 <LiveSql query={quantifiedExample} rows={2} />
+
+The operand may also be a **subquery** — `x op ANY/ALL(SELECT …)`, the subquery spelling of `IN`.
+`x = ANY(SELECT …)` is exactly `x IN (SELECT …)`; the other operators generalize it over the
+subquery's single column, with the same three-valued fold (and no row-count limit):
+
+<LiveSql {seed} query={quantifiedSubquery} rows={4} />
 
 ## Variadic functions (`VARIADIC`)
 

@@ -549,7 +549,7 @@ and `x op ALL(arr)` "does `x op e` hold for **every** element?". Every rule is o
 (`postgres:18`). Unlike the operator slices (`||`, `@>`) it adds **no token and no catalog row** —
 `ANY`/`ALL`/`SOME` are plain keywords, and the construct is recognized in the parser as a quantifier
 *after* a comparison operator (grammar.md §41). PostgreSQL also defines the **subquery** quantifier
-(`x = ANY(SELECT …)`); that is a separate deferred Phase-4 item — the parser raises `0A000` for it.
+(`x = ANY(SELECT …)`); that form has since landed — see §11.6 (the *array* operand is §11.1–§11.5).
 
 ### 11.1 Grammar & AST
 
@@ -561,8 +561,8 @@ operator the parser peeks `ANY`/`SOME`/`ALL`; on a match it consumes `( expr )` 
 (an `ARRAY[…]` constructor, a `'{…}'::T[]` literal, a column, or a `||`/subscript expression all
 fit). The construct is **non-associative**, inheriting the comparison level it extends; jed has no
 `<>`, so the operator set is exactly `= < > <= >=` (PG's `<> ALL` = `NOT IN` is unreachable here, an
-existing documented gap). A leading `SELECT` after the quantifier's `(` is the deferred subquery
-form → **`0A000`** in the parser.
+existing documented gap). A leading `SELECT` after the quantifier's `(` is the **subquery** form
+(§11.6), the §26 leading-`SELECT` lookahead; any other operand is the array form here.
 
 ### 11.2 Semantics — three-valued, exactly `IN`'s membership generalized
 
@@ -618,13 +618,41 @@ with `# cost:` in the corpus.
 
 ### 11.5 Ratified divergences
 
-14. **The array-operand quantifier only; the subquery form is deferred** — `x op ANY/ALL(arr)` is
-    implemented, `x op ANY/ALL(SELECT …)` is `0A000` (a distinct Phase-4 subquery item). PG supports
-    both; jed stages them, matching the array surface's incremental delivery.
-15. **A non-array right side is `42809`; an incomparable element type is `42883`; a bare untyped
+14. **A non-array right side is `42809`; an incomparable element type is `42883`; a bare untyped
     `NULL` operand is `42P18`** — the first two match PostgreSQL's codes and messages exactly; the
     third is jed's untyped-`NULL` strictness (PG defaults the array's element type), a degenerate case
     out of the oracle corpus, consistent with `unnest(NULL)` (§5 #6).
+
+### 11.6 The subquery form — `x op ANY/ALL(SELECT …)`
+
+PostgreSQL's other quantifier operand is a **subquery**: `x = ANY(SELECT k FROM t)` (the subquery
+spelling of `IN`), `x op ALL(SELECT …)` (its universal dual). jed supports it as the **FROM-position
+bridge of §11 and the §26 subquery machinery** — the parser, after the quantifier's `(`, takes the
+§26 leading-`SELECT` lookahead: a `SELECT` is this form, anything else the array form above.
+
+- **Grammar/AST.** The operand alternation becomes `( query_expr | expr )` (grammar.ebnf
+  `comparison`). A leading `SELECT` builds an `Expr::QuantifiedSubquery { op, all, lhs, query }`
+  (parallel to `InSubquery`); the array form's `Expr::Quantified` is untouched.
+- **Semantics — identical fold, over result rows.** The subquery must yield **exactly one column**
+  (else **`42601`**, "subquery has too many columns", as `IN`). Its single column over **all** rows
+  is the value list, and `x op ANY/ALL(list)` is the **same 3VL fold as §11.2** — `ANY` the OR-fold
+  (empty → FALSE), `ALL` the AND-fold (empty → TRUE), a NULL `x` or NULL row → the UNKNOWN element.
+  There is **no `21000` cardinality limit** (unlike a scalar subquery — any row count is a list, not
+  an over-determined scalar). `x = ANY(SELECT …)` ≡ `x IN (SELECT …)`; the other operators
+  generalize it, exactly as for the array operand.
+- **Resolution & comparability.** `x` and the subquery's column type must be **comparable**; an
+  incomparable pair is **`42883`** (`operator does not exist`), the §11.3 posture (not the bare
+  `42804`), so the subquery form reports the operator-not-found like PG. Result is always `boolean`.
+- **Uncorrelated vs correlated** reuse §26's machinery exactly: an **uncorrelated** subquery is
+  planned once and **folded** — its rows become a constant array and the node collapses to the array
+  `RExpr::Quantified`, so a per-row context re-uses the §11.2 evaluator with zero re-execution; a
+  **correlated** one is **re-executed per outer row**, its rows gathered into an array and run through
+  the same `quantified_membership` fold. Bind parameters inside follow §26 (`42P18` only when a `$N`
+  is typed solely by the enclosing query). Cost is §26's (subquery cost, once or per-row) plus §11.4's
+  per-element fold.
+
+`SOME` folds to `ANY`; and jed's lack of `<>` keeps `<> ALL` (≡ `NOT IN`) unreachable, the §11.1 gap,
+here too.
 
 ## 12. AF6 — the `VARIADIC` call syntax + variadic resolution
 

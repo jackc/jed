@@ -4589,6 +4589,31 @@ impl Database {
                         negated,
                     }
                 }
+                // An uncorrelated quantified subquery folds to a constant-array `Quantified`
+                // (array-functions.md §11.6): its single column becomes a 1-D array and the node
+                // reuses the array form's 3VL fold — no per-row re-execution.
+                SubqueryKind::Quantified { op, all } => {
+                    let elements: Vec<Value> = r
+                        .rows
+                        .into_iter()
+                        .map(|mut row| row.swap_remove(0))
+                        .collect();
+                    let arr = if elements.is_empty() {
+                        ArrayVal::empty()
+                    } else {
+                        ArrayVal {
+                            dims: vec![elements.len()],
+                            lbounds: vec![1],
+                            elements,
+                        }
+                    };
+                    RExpr::Quantified {
+                        op,
+                        all,
+                        lhs: lhs.expect("a quantified subquery carries its resolved lhs"),
+                        array: Box::new(RExpr::ConstArray(Box::new(arr))),
+                    }
+                }
             };
             return Ok(());
         }
@@ -5166,7 +5191,7 @@ enum ArithOp {
     Mod,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CmpOp {
     Eq,
     Lt,
@@ -5483,6 +5508,14 @@ enum SubqueryKind {
     Scalar,
     Exists,
     In,
+    /// `lhs op ANY/ALL(SELECT …)` — the quantified-subquery form (array-functions.md §11.6). `lhs`
+    /// is the outer value; the body's single column folds through `quantified_membership` exactly
+    /// like the array `Quantified` node. Survives as a `Subquery` node only when CORRELATED; an
+    /// uncorrelated one is folded to a constant-array `RExpr::Quantified`.
+    Quantified {
+        op: CmpOp,
+        all: bool,
+    },
 }
 
 // ============================================================================
@@ -6558,7 +6591,10 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         }
         // A subquery is an independent query: an aggregate INSIDE it does not make the OUTER query
         // an aggregate query (the outer reference, if any, is just a constant to the subquery).
-        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => false,
+        Expr::ScalarSubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => false,
     }
 }
 
@@ -6568,12 +6604,13 @@ fn expr_has_aggregate(e: &Expr) -> bool {
 /// interleaves these with resolution in parse order, a documented micro-order divergence).
 fn reject_check_structure(e: &Expr) -> Result<()> {
     match e {
-        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {
-            Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "cannot use subquery in check constraint",
-            ))
-        }
+        Expr::ScalarSubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "cannot use subquery in check constraint",
+        )),
         Expr::Param(n) => Err(EngineError::new(
             SqlState::UndefinedParameter,
             format!("there is no parameter ${n}"),
@@ -6655,12 +6692,13 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
             SqlState::FeatureNotSupported,
             "cannot use column reference in DEFAULT expression",
         )),
-        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {
-            Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "cannot use subquery in DEFAULT expression",
-            ))
-        }
+        Expr::ScalarSubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "cannot use subquery in DEFAULT expression",
+        )),
         Expr::Param(n) => Err(EngineError::new(
             SqlState::UndefinedParameter,
             format!("there is no parameter ${n}"),
@@ -6807,7 +6845,10 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
                 }
             }
             // Unreachable in a validated check (rejected by `reject_check_structure`).
-            Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {}
+            Expr::ScalarSubquery(_)
+            | Expr::Exists(_)
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. } => {}
         }
     }
     let mut out = Vec::new();
@@ -9102,6 +9143,56 @@ fn resolve(
             lhs,
             array,
         } => resolve_quantified(scope, *op, *all, lhs, array, agg, params),
+        Expr::QuantifiedSubquery {
+            op,
+            all,
+            lhs,
+            query,
+        } => {
+            // The subquery spelling of the quantifier (array-functions.md §11.6) — the IN-subquery
+            // pattern, with the comparison + 3VL fold of the array form. Resolve the outer `lhs`,
+            // plan the body, require ONE column (42601), and require comparability — reporting
+            // operator-not-found (42883) the way the array quantifier does (§11.3), not the plain
+            // 42804. No 21000 cardinality limit (any row count is a list).
+            let (rlhs, lt) = resolve(scope, lhs, None, agg, params)?;
+            let plan = plan_subquery(scope, query, params)?;
+            if plan.column_types().len() != 1 {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    "subquery has too many columns",
+                ));
+            }
+            classify_comparable(&lt, &plan.column_types()[0]).map_err(|_| {
+                EngineError::new(
+                    SqlState::UndefinedFunction,
+                    format!(
+                        "operator does not exist: {} {} {}",
+                        lt.type_name(),
+                        binary_op_symbol(*op),
+                        plan.column_types()[0].type_name()
+                    ),
+                )
+            })?;
+            let cop = match op {
+                BinaryOp::Eq => CmpOp::Eq,
+                BinaryOp::Lt => CmpOp::Lt,
+                BinaryOp::Gt => CmpOp::Gt,
+                BinaryOp::Le => CmpOp::Le,
+                BinaryOp::Ge => CmpOp::Ge,
+                _ => unreachable!(
+                    "the parser only builds a quantified node for a comparison operator"
+                ),
+            };
+            Ok((
+                RExpr::Subquery {
+                    plan: Box::new(plan),
+                    kind: SubqueryKind::Quantified { op: cop, all: *all },
+                    lhs: Some(Box::new(rlhs)),
+                    negated: false,
+                },
+                ResolvedType::Bool,
+            ))
+        }
         Expr::In { lhs, list, negated } => {
             // An EMPTY list reaches here only from folding an IN-subquery whose result was empty
             // (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant
@@ -12499,6 +12590,29 @@ impl RExpr {
                             .map(|mut row| row.swap_remove(0))
                             .collect();
                         in_membership(&lv, &list, *negated, m)
+                    }
+                    // A correlated quantified subquery (array-functions.md §11.6): gather the body's
+                    // single column into an array and run the SAME 3VL fold as the array form.
+                    SubqueryKind::Quantified { op, all } => {
+                        let lv = lhs
+                            .as_ref()
+                            .expect("a quantified subquery carries its resolved lhs")
+                            .eval(row, env, m)?;
+                        let elements: Vec<Value> = r
+                            .rows
+                            .into_iter()
+                            .map(|mut row| row.swap_remove(0))
+                            .collect();
+                        let arr = if elements.is_empty() {
+                            ArrayVal::empty()
+                        } else {
+                            ArrayVal {
+                                dims: vec![elements.len()],
+                                lbounds: vec![1],
+                                elements,
+                            }
+                        };
+                        quantified_membership(*op, *all, &lv, &Value::Array(arr), m)
                     }
                 }
             }

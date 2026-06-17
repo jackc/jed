@@ -257,10 +257,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         membership machinery** (`eq3`/`lt3`/`gt3`; `ANY` is the OR-fold, `ALL` the AND-fold), charging
         per-element like `IN` so `max_cost` bounds it (54P01). The right operand must be an array (a
         non-array side is `42809`); an incomparable element type is `42883`; a bare untyped `NULL`
-        operand is `42P18`; the `op ANY(SELECT …)` **subquery** form stays a deferred `0A000` Phase-4
-        item. All three cores + per-core unit test, oracle-checked
+        operand is `42P18`. All three cores + per-core unit test, oracle-checked
         (`suites/expr/array_quantified.test`), capability `func.array_quantified`, `/web` select-page
         live example + e2e. → [array-functions.md §11](spec/design/array-functions.md)
+    - [x] **The subquery quantifier form** `x op ANY/ALL(SELECT …)` — the subquery spelling of `IN`,
+          the bridge of AF5 and the §26 subquery machinery. A leading `SELECT` after the quantifier's
+          `(` selects it; the body's single column (`42601` if >1) folds through the SAME 3VL
+          `quantified_membership` (`ANY` OR-fold, `ALL` AND-fold, no `21000` limit). Uncorrelated →
+          folded to a constant-array `Quantified`; correlated → re-executed per outer row. Incomparable
+          types `42883`. New `Expr::QuantifiedSubquery`; capability `query.subquery_quantified`. →
+          [array-functions.md §11.6](spec/design/array-functions.md)
   - [x] **AF6 — the `VARIADIC` call syntax + variadic overload resolution** — the `make_interval`-era
         follow-on unblocked by the array type, spent on the engine's first VARIADIC built-ins
         `num_nulls`/`num_nonnulls` (count the NULL / non-NULL arguments → int32). A new catalog field
@@ -314,8 +320,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         (`suites/query/unnest_composite.test`, `suites/expr/array_composite_functions.test`), capability
         `func.array_composite`. → [array-functions.md §13](spec/design/array-functions.md)
   - [ ] _remaining follow-ons (each its own slice + obligations):_ arrays-in-keys
-        (`0A000`, encoding authored §8); the subquery quantifier form `op ANY(SELECT …)`; runtime
-        text→array, `array::text`, and element-wise array→array casts.
+        (`0A000`, encoding authored §8); runtime text→array, `array::text`, and element-wise
+        array→array casts. (The subquery quantifier form `op ANY/ALL(SELECT …)` has landed — §11.6.)
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis**, sibling to `array` and sharing ~80% of its foundation, so sequence
       the two together. **The headline implication: this turns the *closed* type enum into an *open*,
@@ -418,8 +424,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `query.derived_table` capability. → [grammar.md §42](spec/design/grammar.md)
     - [ ] _follow-on:_ **`LATERAL`** (body sees earlier FROM relations); a **parenthesized-join
           FROM** (`FROM (a JOIN b ON …)`); a **`VALUES` body** (`FROM (VALUES …) AS v(x)`).
+  - [x] **`ANY` / `ALL` over a subquery** — `x op ANY/ALL(SELECT …)`, the subquery spelling of `IN`;
+        see the AF5 sub-item above and [array-functions.md §11.6](spec/design/array-functions.md).
   - [ ] **Subqueries — remaining seams:** subqueries in an **`INSERT ... VALUES`** slot (blocked on
-        VALUES holding a general expression); **`ANY` / `ALL`** and row-valued subqueries. _(size: M)_
+        VALUES holding a general expression); **row-valued** subqueries. _(size: S)_
 - [x] **Set operations — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]`** — a query-expression
       precedence tree (INTERSECT binds tighter), full-PG per-column type unification, NULL-safe
       multiset semantics, trailing ORDER BY by output-column name. → [grammar.md §25](spec/design/grammar.md)

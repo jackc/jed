@@ -4929,6 +4929,16 @@ func (db *Database) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx
 			*e = *valueToRExpr(val)
 		case sqExists:
 			*e = rExpr{kind: reConstBool, cBool: (len(r.rows) > 0) != e.negated}
+		case sqQuantified:
+			// An uncorrelated quantified subquery folds to a constant-array reQuantified
+			// (array-functions.md §11.6): its single column becomes a 1-D array and the node reuses
+			// the array form's 3VL fold — no per-row re-execution.
+			elems := make([]Value, len(r.rows))
+			for i, row := range r.rows {
+				elems[i] = row[0]
+			}
+			arr := &rExpr{kind: reConstArray, cArray: OneDimArray(elems)}
+			*e = rExpr{kind: reQuantified, op: e.op, quantAll: e.quantAll, lhs: e.lhs, rhs: arr}
 		default: // sqIn
 			list := make([]Value, len(r.rows))
 			for i, row := range r.rows {
@@ -5761,6 +5771,11 @@ const (
 	sqScalar subqueryKind = iota
 	sqExists
 	sqIn
+	// sqQuantified is `lhs op ANY/ALL(SELECT …)` (array-functions.md §11.6): the node carries the
+	// comparison `op` and `quantAll`, and the body's single column folds through quantifiedMembership
+	// exactly like the array form. Survives as an reSubquery node only when CORRELATED; an
+	// uncorrelated one is folded to a constant-array reQuantified.
+	sqQuantified
 )
 
 // scalarFunc selects a scalar function (kind = "function"). The overload (integer vs decimal)
@@ -6454,7 +6469,7 @@ func exprHasAggregate(e Expr) bool {
 // a documented micro-order divergence).
 func rejectCheckStructure(e Expr) error {
 	switch e.Kind {
-	case ExprScalarSubquery, ExprExists, ExprInSubquery:
+	case ExprScalarSubquery, ExprExists, ExprInSubquery, ExprQuantifiedSubquery:
 		return NewError(FeatureNotSupported, "cannot use subquery in check constraint")
 	case ExprParam:
 		return NewError(UndefinedParameter,
@@ -6563,7 +6578,7 @@ func rejectDefaultStructure(e Expr) error {
 	switch e.Kind {
 	case ExprColumn, ExprQualifiedColumn:
 		return NewError(FeatureNotSupported, "cannot use column reference in DEFAULT expression")
-	case ExprScalarSubquery, ExprExists, ExprInSubquery:
+	case ExprScalarSubquery, ExprExists, ExprInSubquery, ExprQuantifiedSubquery:
 		return NewError(FeatureNotSupported, "cannot use subquery in DEFAULT expression")
 	case ExprParam:
 		return NewError(UndefinedParameter,
@@ -7475,6 +7490,29 @@ func resolveQuantified(s *scope, q *QuantifiedExpr, ag *aggCtx, params *paramTyp
 			fmt.Sprintf("operator does not exist: %s %s %s", rtName(lt), binaryOpSymbol(q.Op), rtName(*at.elem)))
 	}
 	return &rExpr{kind: reQuantified, op: q.Op, quantAll: q.All, lhs: rl, rhs: ra}, resolvedType{kind: rtBool}, nil
+}
+
+// resolveQuantifiedSubquery resolves `lhs op ANY/ALL ( SELECT … )` (array-functions.md §11.6) — the
+// IN-subquery pattern with the quantifier's comparison + 3VL fold. Resolve the outer lhs, plan the
+// body, require ONE column (42601), and require comparability — reporting operator-not-found (42883)
+// the way the array quantifier does (§11.3), not the plain 42804. No 21000 cardinality limit.
+func resolveQuantifiedSubquery(s *scope, q *QuantifiedSubqueryExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	rlhs, lt, err := resolve(s, q.Lhs, nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	plan, err := planSubquery(s, q.Query, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	if len(plan.columnTypes()) != 1 {
+		return nil, resolvedType{}, NewError(SyntaxError, "subquery has too many columns")
+	}
+	if err := classifyComparable(lt, plan.columnTypes()[0]); err != nil {
+		return nil, resolvedType{}, NewError(UndefinedFunction,
+			fmt.Sprintf("operator does not exist: %s %s %s", rtName(lt), binaryOpSymbol(q.Op), rtName(plan.columnTypes()[0])))
+	}
+	return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqQuantified, op: q.Op, quantAll: q.All, lhs: rlhs}, resolvedType{kind: rtBool}, nil
 }
 
 // binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
@@ -9065,6 +9103,8 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			unified, nil
 	case ExprQuantified:
 		return resolveQuantified(s, e.Quantified, ag, params)
+	case ExprQuantifiedSubquery:
+		return resolveQuantifiedSubquery(s, e.QuantifiedSubquery, ag, params)
 	default: // ExprBinary
 		return resolveBinary(s, e.Binary, ag, params)
 	}
@@ -11125,6 +11165,18 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sqExists:
 			// EXISTS ignores the select list entirely and is never NULL.
 			return BoolValue((len(r.rows) > 0) != e.negated), nil
+		case sqQuantified:
+			// A correlated quantified subquery (array-functions.md §11.6): gather the body's single
+			// column into an array and run the SAME 3VL fold as the array form.
+			lv, lerr := e.lhs.eval(row, env, m)
+			if lerr != nil {
+				return Value{}, lerr
+			}
+			elems := make([]Value, len(r.rows))
+			for i, rr := range r.rows {
+				elems[i] = rr[0]
+			}
+			return quantifiedMembership(e.op, e.quantAll, lv, ArrayValue(elems), m)
 		default: // sqIn
 			lv, lerr := e.lhs.eval(row, env, m)
 			if lerr != nil {

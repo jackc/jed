@@ -1,0 +1,155 @@
+# Quantified comparison over a subquery (spec/design/array-functions.md §11.6): x op ANY/SOME/ALL
+# (SELECT …) — the subquery spelling of IN that bridges AF5 (the array quantifier) and the §26
+# subquery machinery. A leading SELECT after the quantifier's ( selects this form. The body's single
+# column (42601 if >1) folds through the SAME three-valued fold as the array form: ANY/SOME is the
+# OR-fold (empty → FALSE), ALL the AND-fold (empty → TRUE), a NULL x or NULL row is the UNKNOWN
+# element; NO 21000 cardinality limit. x = ANY(SELECT …) ≡ x IN (SELECT …). x and the body column type
+# must be comparable, else 42883 (operator does not exist). Uncorrelated folds once; correlated
+# re-executes per outer row. Verified against the live PostgreSQL 18 oracle; cost is jed's
+# deterministic cross-core contract (spec/design/cost.md §3).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.table_alias, query.qualified_column, query.subquery_correlated, query.subquery_quantified, expr.comparison_value, types.int32, types.text, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE vals (id int32 PRIMARY KEY, v int32)
+
+statement ok
+CREATE TABLE words (id int32 PRIMARY KEY, w text)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)
+
+statement ok
+INSERT INTO vals VALUES (1, 10), (2, NULL)
+
+statement ok
+INSERT INTO words VALUES (1, 'x')
+
+# `= ANY(SELECT …)` is the subquery spelling of IN: a.k {10,20,30} equal to some b.k {20,30,40}.
+query I nosort
+SELECT id FROM a WHERE k = ANY(SELECT k FROM b) ORDER BY id
+----
+2
+3
+
+# `SOME` is the synonym for `ANY`.
+query I nosort
+SELECT id FROM a WHERE k = SOME(SELECT k FROM b) ORDER BY id
+----
+2
+3
+
+# `= ALL` over a single-row body {20}: only a.k = 20.
+query I nosort
+SELECT id FROM a WHERE k = ALL(SELECT k FROM b WHERE id = 1) ORDER BY id
+----
+2
+
+# `< ALL` — less than every b.k (i.e. less than the minimum 20): only k=10.
+query I nosort
+SELECT id FROM a WHERE k < ALL(SELECT k FROM b) ORDER BY id
+----
+1
+
+# `> ANY` — greater than some b.k (i.e. greater than the minimum 20): only k=30.
+query I nosort
+SELECT id FROM a WHERE k > ANY(SELECT k FROM b) ORDER BY id
+----
+3
+
+# `>= ANY` — at least the minimum 20: k=20,30.
+query I nosort
+SELECT id FROM a WHERE k >= ANY(SELECT k FROM b) ORDER BY id
+----
+2
+3
+
+# `<= ALL` — at most the minimum 20: k=10,20.
+query I nosort
+SELECT id FROM a WHERE k <= ALL(SELECT k FROM b) ORDER BY id
+----
+1
+2
+
+# As a projected boolean (the three-valued fold in the select list).
+# names: r
+query B nosort
+SELECT k = ANY(SELECT k FROM b) AS r FROM a ORDER BY id
+----
+false
+true
+true
+
+# An EMPTY body: `ANY` is FALSE for every row (no row survives the WHERE).
+query I nosort
+SELECT id FROM a WHERE k = ANY(SELECT k FROM b WHERE id = 99) ORDER BY id
+----
+
+# An EMPTY body: `ALL` is TRUE for every row (vacuously) — all rows survive.
+query I nosort
+SELECT id FROM a WHERE k = ALL(SELECT k FROM b WHERE id = 99) ORDER BY id
+----
+1
+2
+3
+
+# A NULL in the body, `ANY`: vals.v = {10, NULL}. k=10 matches 10 (TRUE); k=20/30 see only a non-match
+# and a NULL → UNKNOWN, excluded by WHERE. So only id 1.
+query I nosort
+SELECT id FROM a WHERE k = ANY(SELECT v FROM vals) ORDER BY id
+----
+1
+
+# A NULL in the body, `ALL`, projected (three-valued): k=10 → 10=10 TRUE then 10=NULL UNKNOWN, no
+# FALSE → NULL; k=20/30 → a FALSE short-circuits → false.
+# names: id, r
+query IB nosort
+SELECT id, k = ALL(SELECT v FROM vals) AS r FROM a ORDER BY id
+----
+1
+NULL
+2
+false
+3
+false
+
+# CORRELATED: the body references the outer row, re-executed per row. x.k > ANY(earlier-id a.k):
+# id 1 sees an EMPTY body (ANY → FALSE, excluded); id 2,3 each exceed some earlier k.
+query I nosort
+SELECT x.id FROM a x WHERE x.k > ANY(SELECT k FROM a y WHERE y.id < x.id) ORDER BY x.id
+----
+2
+3
+
+# --- error cases (spec/design/array-functions.md §11.6) ---
+
+# A body with more than one column -> 42601 ("subquery has too many columns"), as IN.
+statement error 42601
+SELECT id FROM a WHERE k = ANY(SELECT id, k FROM b)
+
+# An incomparable pair (int32 vs the body's text column) -> 42883 (operator does not exist), the
+# quantifier posture (PG's code + message), not the bare 42804 a plain int = text raises.
+statement error 42883
+SELECT id FROM a WHERE k = ANY(SELECT w FROM words)
+
+# --- cost contract (spec/design/cost.md §3) ---
+
+# Uncorrelated body folds once into a constant array (page_read 1 + 3 storage_row_read + 3
+# row_produced = 7); the outer scans a (page_read 1 + 3 storage_row_read = 4). Each of 3 rows charges
+# the quantified fold: 1 operator_eval for the node + one per element COMPARED — and ANY
+# short-circuits on the first TRUE, so k=10 walks all 3 of {20,30,40}, k=20 stops at 1, k=30 at 2 (6
+# comparisons), i.e. 3 nodes + 6 = 9. Plus 2 surviving rows → row_produced 2. Total 7+4+9+2 = 22.
+# cost: 22
+query I nosort
+SELECT id FROM a WHERE k = ANY(SELECT k FROM b) ORDER BY id
+----
+2
+3

@@ -1437,13 +1437,13 @@ class Parser {
       const all = kw === "all";
       this.advance(); // ANY / SOME / ALL
       this.expect("lparen");
-      // The subquery quantifier form `op ANY(SELECT …)` is a separate deferred Phase-4 item
-      // (array-functions.md §11); only the array operand is supported.
+      // A leading `SELECT` is the SUBQUERY form `op ANY/ALL(SELECT …)` — the subquery spelling of
+      // IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead; anything else is the
+      // array operand (§11.1).
       if (this.peekKeyword() === "select") {
-        throw engineError(
-          "feature_not_supported",
-          "the subquery form of ANY/ALL is not supported; use an array operand",
-        );
+        const query = this.parseSubquery();
+        this.expect("rparen");
+        return { kind: "quantifiedSubquery", op, all, lhs, query };
       }
       const array = this.parseExpr(); // a full expression resolving to an array
       this.expect("rparen");

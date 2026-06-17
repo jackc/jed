@@ -469,8 +469,14 @@ const (
 	// ExprQuantified is `lhs op ANY/SOME/ALL ( array )` (spec/design/array-functions.md §11) — a
 	// quantified array comparison, the array spelling of IN. The three-valued fold over the array's
 	// flattened elements reuses the IN-list membership semantics, generalized to all five comparison
-	// operators and both quantifiers. The subquery form `op ANY(SELECT …)` is a deferred 0A000.
+	// operators and both quantifiers.
 	ExprQuantified
+	// ExprQuantifiedSubquery is `lhs op ANY/SOME/ALL ( query_expr )` (array-functions.md §11.6) — the
+	// SUBQUERY form of the quantified comparison, the subquery spelling of IN. Parallel to
+	// ExprInSubquery: the body's single column (42601 if >1) folds through the SAME three-valued fold
+	// as ExprQuantified. Uncorrelated folds to a constant-array Quantified; correlated re-executes
+	// per outer row.
+	ExprQuantifiedSubquery
 	// ExprRow is a `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1): RowItems
 	// holds the field expressions, in order. A one-field ROW(x) is a one-field row; ROW() is the
 	// zero-field row. The bare `(a, b)` form is deferred (0A000); only the keyword form parses.
@@ -583,7 +589,9 @@ type Expr struct {
 	Subquery    *QueryExpr      // ExprScalarSubquery, ExprExists (the inner query)
 	InSubquery  *InSubqueryExpr // ExprInSubquery
 	Quantified  *QuantifiedExpr // ExprQuantified
-	RowItems    []Expr          // ExprRow (the ROW(...) field expressions, in order)
+
+	QuantifiedSubquery *QuantifiedSubqueryExpr // ExprQuantifiedSubquery
+	RowItems           []Expr                  // ExprRow (the ROW(...) field expressions, in order)
 	// Base is the operand of a field-selection postfix (ExprFieldAccess / ExprFieldStar): the
 	// composite expression `(base).field` / `(base).*` selects from (spec/design/composite.md §S4).
 	Base *Expr
@@ -613,6 +621,16 @@ type QuantifiedExpr struct {
 	All   bool
 	Lhs   Expr
 	Array Expr
+}
+
+// QuantifiedSubqueryExpr is `Lhs Op ANY/SOME/ALL ( Query )` — the SUBQUERY form of the quantified
+// comparison (spec/design/array-functions.md §11.6), the subquery spelling of IN. Op/All as in
+// QuantifiedExpr; Query's single column (42601 if >1) folds through the same three-valued fold.
+type QuantifiedSubqueryExpr struct {
+	Op    BinaryOp
+	All   bool
+	Lhs   Expr
+	Query QueryExpr
 }
 
 // CastExpr is CAST(Inner AS TypeName). TypeMod is the optional numeric(p[,s]) modifier.
