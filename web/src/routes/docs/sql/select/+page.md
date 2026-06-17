@@ -26,6 +26,10 @@ ORDER BY price DESC;`;
 	const unnestExample = `SELECT u AS tag
 FROM unnest(ARRAY['red', 'green', 'blue']) AS u
 ORDER BY u;`;
+
+	const containmentExample = `SELECT ARRAY[1, 2, 3] @> ARRAY[2]   AS contains,
+       ARRAY[2]       <@ ARRAY[1, 2, 3] AS contained_by,
+       ARRAY[1, 2]    && ARRAY[2, 3]    AS overlaps;`;
 </script>
 
 <svelte:head>
@@ -56,6 +60,15 @@ and a `NULL` or empty array yields no rows). The produced relation has one colum
 function or its alias, and composes with `WHERE` / `ORDER BY` / `LIMIT` / joins like any other:
 
 <LiveSql query={unnestExample} rows={6} />
+
+## Array containment and overlap
+
+The `@>` (contains), `<@` (contained by), and `&&` (overlaps) operators compare two arrays as sets:
+`a @> b` is true when every element of `b` appears in `a`, `a && b` when they share at least one
+element. Matching is strict — a `NULL` element matches nothing, including another `NULL` — and a
+`NULL` whole array yields `NULL`:
+
+<LiveSql query={containmentExample} rows={2} />
 
 ## Cost
 

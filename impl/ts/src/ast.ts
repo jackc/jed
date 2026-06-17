@@ -46,7 +46,12 @@ export type BinaryOp =
   | "or"
   // concat is the `||` array concatenation operator (spec/design/array-functions.md §8):
   // array∥array (array_cat), array∥element (array_append), element∥array (array_prepend).
-  | "concat";
+  | "concat"
+  // contains/containedBy/overlaps are the array containment/overlap operators `@>`/`<@`/`&&`
+  // (spec/design/array-functions.md §10): each `anyarray <op> anyarray → boolean`, polymorphic.
+  | "contains"
+  | "containedBy"
+  | "overlaps";
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.
 // The parser builds it via a precedence ladder (spec/grammar/grammar.ebnf `expr`). A

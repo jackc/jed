@@ -1483,17 +1483,26 @@ impl Parser {
         }
     }
 
-    /// The `||` array concatenation level (grammar.md §39, array-functions.md §8): one rung tighter
-    /// than the comparisons, looser than additive, left-associative. Each operand is an additive
-    /// expression, so `a + b || c` is `(a + b) || c`; chaining `a || b || c` is `(a || b) || c`.
+    /// The "any other operator" level (grammar.md §39/§40, array-functions.md §8/§10): one rung
+    /// tighter than the comparisons, looser than additive, left-associative. It hosts `||` array
+    /// concatenation plus the `@>`/`<@`/`&&` array containment/overlap operators — all the same
+    /// precedence in PostgreSQL. Each operand is an additive expression, so `a + b || c` is
+    /// `(a + b) || c`; chaining mixes freely (`a || b @> c` is `(a || b) @> c`).
     fn parse_concat(&mut self) -> Result<Expr> {
         let base = self.depth;
         let mut lhs = self.parse_additive()?;
-        while matches!(self.peek(), Token::Concat) {
-            self.deepen()?; // each chained || is one more AST level
+        loop {
+            let op = match self.peek() {
+                Token::Concat => BinaryOp::Concat,
+                Token::Contains => BinaryOp::Contains,
+                Token::ContainedBy => BinaryOp::ContainedBy,
+                Token::Overlaps => BinaryOp::Overlaps,
+                _ => break,
+            };
+            self.deepen()?; // each chained operator is one more AST level
             self.advance();
             let rhs = self.parse_additive()?;
-            lhs = binary(BinaryOp::Concat, lhs, rhs);
+            lhs = binary(op, lhs, rhs);
         }
         self.depth = base;
         Ok(lhs)
@@ -2135,6 +2144,9 @@ fn render_token(t: &Token) -> String {
         Token::Colon => ":".into(),
         Token::FatArrow => "=>".into(),
         Token::Concat => "||".into(),
+        Token::Contains => "@>".into(),
+        Token::ContainedBy => "<@".into(),
+        Token::Overlaps => "&&".into(),
         Token::Eof => String::new(),
     }
 }

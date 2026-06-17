@@ -150,9 +150,31 @@ export function lex(sql: string): Token[] {
       if (i + 1 < n && sql[i + 1] === "=") {
         tokens.push({ kind: "le" });
         i += 2;
+      } else if (i + 1 < n && sql[i + 1] === "@") {
+        // `<@` is the array contained-by operator (grammar.md §40), scanned greedily.
+        tokens.push({ kind: "containedBy" });
+        i += 2;
       } else {
         tokens.push({ kind: "lt" });
         i++;
+      }
+    } else if (c === "@") {
+      // `@>` is the array containment operator (grammar.md §40), scanned greedily as one token;
+      // a lone `@` is not part of jed's surface — 42601.
+      if (i + 1 < n && sql[i + 1] === ">") {
+        tokens.push({ kind: "contains" });
+        i += 2;
+      } else {
+        throw engineError("syntax_error", "unexpected character '@'");
+      }
+    } else if (c === "&") {
+      // `&&` is the array overlap operator (grammar.md §40), scanned greedily as one token;
+      // a lone `&` is not part of jed's surface (no bitwise-and) — 42601.
+      if (i + 1 < n && sql[i + 1] === "&") {
+        tokens.push({ kind: "overlaps" });
+        i += 2;
+      } else {
+        throw engineError("syntax_error", "unexpected character '&'");
       }
     } else if (c === ">") {
       if (i + 1 < n && sql[i + 1] === "=") {

@@ -593,6 +593,11 @@ pub enum BinaryOp {
     // array concatenation `||` (spec/design/array-functions.md §8): array∥array (array_cat),
     // array∥element (array_append), element∥array (array_prepend). Resolved polymorphically.
     Concat,
+    // array containment / overlap (spec/design/array-functions.md §10): `@>` contains, `<@`
+    // contained-by, `&&` overlaps. Each `anyarray <op> anyarray → boolean`, resolved polymorphically.
+    Contains,
+    ContainedBy,
+    Overlaps,
 }
 
 /// One ORDER BY sort key: a bare table column, a sort direction, and a resolved NULL

@@ -153,9 +153,31 @@ func Lex(sql string) ([]Token, error) {
 			if i+1 < len(b) && b[i+1] == '=' {
 				tokens = append(tokens, Token{Kind: TokLe})
 				i += 2
+			} else if i+1 < len(b) && b[i+1] == '@' {
+				// `<@` is the array contained-by operator (grammar.md §40), scanned greedily.
+				tokens = append(tokens, Token{Kind: TokContainedBy})
+				i += 2
 			} else {
 				tokens = append(tokens, Token{Kind: TokLt})
 				i++
+			}
+		case c == '@':
+			// `@>` is the array containment operator (grammar.md §40), scanned greedily as one
+			// token; a lone `@` is not part of jed's surface — 42601.
+			if i+1 < len(b) && b[i+1] == '>' {
+				tokens = append(tokens, Token{Kind: TokContains})
+				i += 2
+			} else {
+				return nil, NewError(SyntaxError, "unexpected character '@'")
+			}
+		case c == '&':
+			// `&&` is the array overlap operator (grammar.md §40), scanned greedily as one token;
+			// a lone `&` is not part of jed's surface (no bitwise-and) — 42601.
+			if i+1 < len(b) && b[i+1] == '&' {
+				tokens = append(tokens, Token{Kind: TokOverlaps})
+				i += 2
+			} else {
+				return nil, NewError(SyntaxError, "unexpected character '&'")
 			}
 		case c == '>':
 			if i+1 < len(b) && b[i+1] == '=' {

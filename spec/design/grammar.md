@@ -1736,3 +1736,26 @@ one grammar change AF2 makes:
   identity), matching PostgreSQL; a typed null element resolves to `array_append`
   (array-functions.md §8.1). No matching overload — including text `||` and `int || int`, both
   deferred — is `42883`.
+
+## 40. The array containment / overlap operators (`@>` / `<@` / `&&`)
+
+`@>` (contains), `<@` (contained by), and `&&` (overlaps) are the array **containment/overlap
+operators** ([array-functions.md §10](array-functions.md)) — three polymorphic
+`anyarray <op> anyarray → boolean` operators, the one grammar change AF4 makes:
+
+- **Tokens.** `@>` is `@` then `>`; `<@` is `<` then `@`; `&&` is two `&`. Each is scanned greedily
+  into a single token. A lone `@` and a lone `&` are `42601` syntax errors (jed has no
+  unary-`@`/bitwise-and); a lone `<` stays the comparison `<` (only `<@` and `<=` extend it).
+- **Precedence.** They join the existing `concat` rung (the "any other operator" level, `precedence
+  = 37`) — sharing `||`'s precedence, **left-associative**, binding **tighter than the comparisons**
+  and **looser than `+`/`-`**. The `concat` production gains them as alternatives
+  ([grammar.ebnf](../grammar/grammar.ebnf) `concat`), so `a || b @> c` is `(a || b) @> c` (matching
+  PostgreSQL). They are usable inside every comparison/`IN`/`BETWEEN`/`LIKE` operand.
+- **AST + resolution.** Three `BinaryOp` nodes (`Contains` / `ContainedBy` / `Overlaps`); the
+  resolver (`resolve_containment`) unifies the two operands' element types over the single
+  `(anyarray, anyarray)` overload (a non-array operand or an element-type mismatch is `42883`),
+  with the same literal adaptation `resolve_concat` uses (so `xs @> ARRAY[20]` adapts the
+  constructor to `xs`'s element type). The operators are **strict** (a NULL whole-array operand →
+  NULL); their element matching is **strict equality** — a NULL element matches nothing — over the
+  flattened element multiset (any dimensionality), the one place they differ from the search
+  functions' NOT DISTINCT FROM (array-functions.md §10).

@@ -4911,6 +4911,15 @@ enum ArrayFunc {
     /// array_positions(anyarray, anyelement) → int32[] — the int32[] of every match's subscript
     /// (empty {} if none); 1-D/empty only (0A000) (§8).
     ArrayPositions,
+    /// `a @> b` (anyarray, anyarray) → boolean — does `a` CONTAIN `b`: is every element of `b`
+    /// present in `a` (STRICT equality, NULL matches nothing) over the flattened multiset, any
+    /// dimensionality (§10). A NULL whole-array operand → NULL.
+    Contains,
+    /// `a <@ b` (anyarray, anyarray) → boolean — is `a` CONTAINED BY `b` (i.e. `b @> a`) (§10).
+    ContainedBy,
+    /// `a && b` (anyarray, anyarray) → boolean — do `a` and `b` OVERLAP: share at least one element
+    /// (STRICT equality) over the flattened multiset, any dimensionality (§10).
+    Overlaps,
 }
 
 /// One resolved subscript spec in an [`RExpr::Subscript`] (spec/design/array.md §6): a single
@@ -8677,7 +8686,71 @@ fn resolve_binary(
             Ok((node, ResolvedType::Bool))
         }
         BinaryOp::Concat => resolve_concat(scope, lhs, rhs, agg, params),
+        BinaryOp::Contains => {
+            resolve_containment(scope, lhs, rhs, ArrayFunc::Contains, agg, params)
+        }
+        BinaryOp::ContainedBy => {
+            resolve_containment(scope, lhs, rhs, ArrayFunc::ContainedBy, agg, params)
+        }
+        BinaryOp::Overlaps => {
+            resolve_containment(scope, lhs, rhs, ArrayFunc::Overlaps, agg, params)
+        }
     }
+}
+
+/// Resolve an array containment/overlap operator `@>` / `<@` / `&&` (array-functions.md §10): a
+/// polymorphic `anyarray <op> anyarray → boolean`. Like `resolve_concat` (§8.1) it resolves both
+/// operands, adapts a bare literal `ARRAY[…]` to the first array operand's element type, then unifies
+/// the two element types over the single `(anyarray, anyarray)` overload — a non-array operand or an
+/// element-type mismatch is `42883`. The result is always boolean (so an all-untyped-NULL pair is
+/// NOT 42P18 — the type is determinable); the `func` kernel carries the operator. The operators are
+/// strict (`null = "propagates"`), so a NULL whole-array operand short-circuits to NULL at eval.
+fn resolve_containment(
+    scope: &Scope,
+    lhs: &Expr,
+    rhs: &Expr,
+    func: ArrayFunc,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let no_overload = || {
+        EngineError::new(
+            SqlState::UndefinedFunction,
+            "operator does not exist: the containment/overlap operands are not arrays of a common element type",
+        )
+    };
+
+    // Pass 1: resolve both operands with no hint.
+    let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
+    let (mut rr, mut rt) = resolve(scope, rhs, None, agg, params)?;
+    // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8), so a
+    // bare `ARRAY[…]` constructor adapts to the column's element type (`xs @> ARRAY[20]`).
+    let hint = match (&lt, &rt) {
+        (ResolvedType::Array(e), _) => elem_scalar_hint(e),
+        (_, ResolvedType::Array(e)) => elem_scalar_hint(e),
+        _ => None,
+    };
+    // Pass 2: re-resolve the NON-NULL operands with the hint. A bare NULL (pass-1 type `Null`) is
+    // left untyped — it defers in the anyarray slot and the boolean result is unaffected.
+    if let Some(s) = hint {
+        if !matches!(lt, ResolvedType::Null) {
+            (rl, lt) = resolve(scope, lhs, Some(s), agg, params)?;
+        }
+        if !matches!(rt, ResolvedType::Null) {
+            (rr, rt) = resolve(scope, rhs, Some(s), agg, params)?;
+        }
+    }
+
+    // Both slots are `anyarray`: the element types must unify (a non-array / mismatch is 42883).
+    let tys = [lt, rt];
+    match_poly(&["anyarray", "anyarray"], &tys).ok_or_else(no_overload)?;
+    Ok((
+        RExpr::ArrayFunc {
+            func,
+            args: vec![rl, rr],
+        },
+        ResolvedType::Bool,
+    ))
 }
 
 /// Resolve the `||` array concatenation operator (array-functions.md §8): overload resolution over
@@ -9266,7 +9339,52 @@ fn eval_array_func(func: &ArrayFunc, vals: &[Value]) -> Result<Value> {
         ArrayFunc::ArrayReplace => array_replace_value(&vals[0], &vals[1], &vals[2]),
         ArrayFunc::ArrayPosition => array_position_value(&vals[0], &vals[1], vals.get(2)),
         ArrayFunc::ArrayPositions => array_positions_value(&vals[0], &vals[1]),
+        ArrayFunc::Contains => array_contains_value(&vals[0], &vals[1]),
+        ArrayFunc::ContainedBy => array_contains_value(&vals[1], &vals[0]),
+        ArrayFunc::Overlaps => array_overlaps_value(&vals[0], &vals[1]),
     }
+}
+
+/// STRICT element equality for the containment/overlap operators (array-functions.md §10): a NULL
+/// element equals NOTHING — including another NULL — the deliberate inverse of `not_distinct` (§5
+/// #10). For two non-NULL values it is jed's total element comparator (`value_cmp == Equal`), which
+/// for jed's element types agrees with PostgreSQL's per-type btree equality.
+fn strict_elem_eq(a: &Value, b: &Value) -> bool {
+    !matches!(a, Value::Null)
+        && !matches!(b, Value::Null)
+        && value_cmp(a, b) == std::cmp::Ordering::Equal
+}
+
+/// `a @> b` (array-functions.md §10): does `a` CONTAIN `b` — is every element of `b` present in `a`
+/// under STRICT equality, over the flattened element multiset (any dimensionality)? A NULL
+/// whole-array operand → NULL. The empty array is contained by anything (`a @> {}` is true).
+fn array_contains_value(a: &Value, b: &Value) -> Result<Value> {
+    let (ca, cb) = match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+        (Value::Array(ca), Value::Array(cb)) => (ca, cb),
+        _ => unreachable!("array containment: array operands"),
+    };
+    let contained = cb
+        .elements
+        .iter()
+        .all(|eb| ca.elements.iter().any(|ea| strict_elem_eq(ea, eb)));
+    Ok(Value::Bool(contained))
+}
+
+/// `a && b` (array-functions.md §10): do `a` and `b` OVERLAP — share at least one element under
+/// STRICT equality, over the flattened element multiset (any dimensionality)? A NULL whole-array
+/// operand → NULL. The empty array overlaps nothing.
+fn array_overlaps_value(a: &Value, b: &Value) -> Result<Value> {
+    let (ca, cb) = match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+        (Value::Array(ca), Value::Array(cb)) => (ca, cb),
+        _ => unreachable!("array overlap: array operands"),
+    };
+    let overlaps = ca
+        .elements
+        .iter()
+        .any(|ea| cb.elements.iter().any(|eb| strict_elem_eq(ea, eb)));
+    Ok(Value::Bool(overlaps))
 }
 
 /// IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total element

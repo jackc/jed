@@ -234,10 +234,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `WITH ORDINALITY`, the multi-array form, and array-of-composite elements stay deferred). All
         three cores + Ruby N/A (no format change), oracle-checked (`suites/query/unnest.test`),
         capability `func.unnest`. → [array-functions.md §9](spec/design/array-functions.md)
+  - [x] **AF4 — `@>`/`<@`/`&&` the containment/overlap operators** — three polymorphic
+        `anyarray <op> anyarray → boolean` operators of a new operator `kind = "containment"`, sharing
+        `||`'s precedence rung (37, the PG "any other operator" level; the `concat` parse rung gains
+        `@>`/`<@`/`&&` as alternatives, new tokens `@>`/`<@`/`&&` with a lone `@`/`&` → `42601`).
+        `a @> b` iff every element of `b` is in `a`; `a && b` iff they share ≥1; `a <@ b` = `b @> a`.
+        Match is **STRICT** equality over the **flattened** element multiset (any dimensionality — no
+        1-D `0A000`) — a NULL element matches **nothing**, including another NULL (the inverse of the
+        AF2 search functions' NOT DISTINCT FROM) — and the operators are strict (NULL whole-array → NULL);
+        result is always boolean so an all-untyped-NULL pair is **not** `42P18`. Non-array / element
+        mismatch → `42883`. All three cores + per-core unit test, oracle-checked
+        (`suites/expr/array_containment.test`), capability `func.array_containment`, `/web` select-page
+        live example + e2e. → [array-functions.md §10](spec/design/array-functions.md)
   - [ ] _follow-ons (each its own slice + obligations; sequenced in array-functions.md §6):_
-        **AF4** `@>`/`<@`/`&&` containment/overlap operators; **AF5** `ANY`/`ALL` quantified
-        comparisons; **AF6** `VARIADIC`. Plus: array-of-composite elements; arrays-in-keys (`0A000`,
-        encoding authored §8); runtime text→array, `array::text`, and element-wise array→array casts.
+        **AF5** `ANY`/`ALL` quantified comparisons; **AF6** `VARIADIC`. Plus: array-of-composite
+        elements; arrays-in-keys (`0A000`, encoding authored §8); runtime text→array, `array::text`,
+        and element-wise array→array casts.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis**, sibling to `array` and sharing ~80% of its foundation, so sequence
       the two together. **The headline implication: this turns the *closed* type enum into an *open*,

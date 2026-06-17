@@ -1,0 +1,164 @@
+# Array function/operator surface AF4 (spec/design/array-functions.md §10): the array containment /
+# overlap operators @> (contains), <@ (contained by), && (overlaps). Each is a polymorphic
+# `anyarray <op> anyarray → boolean` operator sharing ||'s precedence rung (37). a @> b is true iff
+# every element of b is present in a; a && b iff they share ≥1 element; a <@ b is b @> a. The match is
+# STRICT equality over the FLATTENED element multiset (any dimensionality) — a NULL element matches
+# NOTHING, including another NULL (the inverse of the search/edit functions' NOT DISTINCT FROM) — and
+# the operators are STRICT (a NULL whole-array operand → NULL). PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.int32, types.text, func.array, func.array_containment, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], ys int32[])
+
+# Row 1: xs and ys share 20 (overlap). Row 2: disjoint. Row 3: an EMPTY xs. Row 4: a NULL xs.
+# Row 5: xs has a NULL element (for the strict-equality rule). Row 6: an EMPTY ys (a non-empty xs
+# contains it vacuously). The int32[] columns align with PostgreSQL's int4[] on both sides, so the
+# operators resolve in BOTH engines (a bare ARRAY[…] literal, int64[] in jed but int4[] in PG, only
+# resolves against another bare literal — §5 #8 — so the empty/set cases are exercised via columns).
+statement ok
+INSERT INTO t VALUES
+  (1, ARRAY[10,20,30], ARRAY[20,40]),
+  (2, ARRAY[10,20,30], ARRAY[99]),
+  (3, '{}', ARRAY[1]),
+  (4, NULL, ARRAY[5]),
+  (5, ARRAY[10,20,NULL], ARRAY[20]),
+  (6, ARRAY[10,20,30], '{}')
+
+# --- @> contains (column @> column) -------------------------------------------------------
+# Every element of ys present in xs? Row 3's empty xs contains nothing; row 4's NULL xs → NULL;
+# row 6's empty ys is contained vacuously (a non-empty array @> {} is true).
+query IB nosort
+SELECT id, xs @> ys FROM t ORDER BY id
+----
+1
+false
+2
+false
+3
+false
+4
+NULL
+5
+true
+6
+true
+
+# --- <@ contained-by (column <@ column) ---------------------------------------------------
+# Every element of xs present in ys? Row 3's empty xs is contained by anything (true); NULL → NULL;
+# row 6's non-empty xs is NOT contained by the empty ys.
+query IB nosort
+SELECT id, xs <@ ys FROM t ORDER BY id
+----
+1
+false
+2
+false
+3
+true
+4
+NULL
+5
+false
+6
+false
+
+# --- && overlap (column && column) --------------------------------------------------------
+# Do xs and ys share an element? Only rows 1 and 5 (both share 20). Empty/NULL → false/NULL.
+query IB nosort
+SELECT id, xs && ys FROM t ORDER BY id
+----
+1
+true
+2
+false
+3
+false
+4
+NULL
+5
+true
+6
+false
+
+# --- @> against a literal array (the bare ARRAY[20] adapts to xs's int32 element type) -----
+query IB nosort
+SELECT id, xs @> ARRAY[20] FROM t ORDER BY id
+----
+1
+true
+2
+true
+3
+false
+4
+NULL
+5
+true
+6
+true
+
+# --- STRICT element equality: a NULL element matches NOTHING, including another NULL --------
+# Row 5's xs holds a NULL, yet xs @> '{NULL}' is FALSE (the NULL is not "found"); NULL xs → NULL.
+query IB nosort
+SELECT id, xs @> '{NULL}'::int32[] FROM t ORDER BY id
+----
+1
+false
+2
+false
+3
+false
+4
+NULL
+5
+false
+6
+false
+
+# --- literal-only forms: set semantics / multidimensional / text ---------------------------
+# (Empty-array semantics are exercised via the columns above — rows 3 and 6 — because a bare
+# ARRAY[…] is int64[] in jed but int4[] in PG, so a mixed bare/cast empty literal would resolve in
+# only one engine. The bare-only literals below type identically in both.)
+# Order and duplicates are irrelevant (set semantics).
+query BB nosort
+SELECT ARRAY[1,2,3] @> ARRAY[3,2,1], ARRAY[1,2,2,3] @> ARRAY[2,2,2] FROM t WHERE id = 1
+----
+true
+true
+
+# Any dimensionality — the comparison is over the FLATTENED element multiset (no 1-D restriction).
+query BB nosort
+SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] @> ARRAY[3], ARRAY[ARRAY[1,2],ARRAY[3,4]] && ARRAY[4,9] FROM t WHERE id = 1
+----
+true
+true
+
+# A custom lower bound is irrelevant (the value's elements decide).
+query B nosort
+SELECT '[5:7]={10,20,30}'::int32[] @> ARRAY[20] FROM t WHERE id = 1
+----
+true
+
+# text[] flows through the polymorphic operator too.
+query B nosort
+SELECT ARRAY['a','b','c'] @> ARRAY['b'] FROM t WHERE id = 1
+----
+true
+
+# --- precedence: @> shares ||'s rung (left-assoc), binds tighter than `=`, looser than `+` --
+# `a || b @> c` is `(a || b) @> c`; `a @> b = c` is `(a @> b) = c`.
+query BB nosort
+SELECT ARRAY[1,2] || ARRAY[3] @> ARRAY[3], ARRAY[1,2] @> ARRAY[2] = true FROM t WHERE id = 1
+----
+true
+true
+
+# --- errors: a non-array operand or an element-type mismatch is 42883 ----------------------
+statement error 42883
+SELECT ARRAY[1,2] @> ARRAY['a','b'] FROM t WHERE id = 1
+
+statement error 42883
+SELECT 5 @> ARRAY[1] FROM t WHERE id = 1
+
+statement error 42883
+SELECT ARRAY[1] && 5 FROM t WHERE id = 1

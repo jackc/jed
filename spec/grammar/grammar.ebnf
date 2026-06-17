@@ -419,7 +419,7 @@ where_clause   ::= "WHERE" expr
  * tighter than the one above. The precedence is mirrored as authored data in
  * ../functions/catalog.toml (the `precedence` field) — the hand-written parsers
  * and that table must agree (see ../design/functions.md). Levels:
- *   OR  <  AND  <  NOT  <  comparison/IS NULL  <  concat (||)  <  additive  <  multiplicative
+ *   OR  <  AND  <  NOT  <  comparison/IS NULL  <  concat (|| @> <@ &&)  <  additive  <  multiplicative
  *       <  unary minus  <  postfix (`::` cast, `.field`/`.*` field selection)  <  primary
  */
 expr           ::= or_expr
@@ -464,11 +464,15 @@ comparison     ::= concat ( compare_op concat
 
 compare_op     ::= "=" | "<" | ">" | "<=" | ">="   /* no "<>" and no "!=" */
 
-/* The `||` array concatenation operator (../design/array-functions.md §8) — left-associative,
- * binding tighter than the comparisons but looser than additive (PostgreSQL's "any other
- * operator" rung; precedence 37 in ../functions/catalog.toml). It has three polymorphic array
- * overloads (array||array, array||element, element||array); text `||` is deferred. */
-concat         ::= additive ( "||" additive )*
+/* The "any other operator" rung (../design/array-functions.md §8/§10) — PostgreSQL's precedence
+ * level shared by `||` and the array containment/overlap operators, all left-associative and
+ * binding tighter than the comparisons but looser than additive (precedence 37 in
+ * ../functions/catalog.toml). `||` is array concatenation (three polymorphic overloads —
+ * array||array, array||element, element||array; text `||` is deferred); `@>`/`<@`/`&&` are array
+ * containment (contains), contained-by, and overlap, each `anyarray <op> anyarray → boolean`. The
+ * production keeps the name `concat` (its first inhabitant). Mixing kinds in one rung parses
+ * left-associatively (`a || b @> c` is `(a || b) @> c`), matching PostgreSQL. */
+concat         ::= additive ( ( "||" | "@>" | "<@" | "&&" ) additive )*
 
 additive       ::= multiplicative ( ("+" | "-") multiplicative )*
 

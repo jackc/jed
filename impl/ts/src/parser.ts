@@ -1308,19 +1308,29 @@ class Parser {
     return binaryExpr(op, lhs, this.parseConcat());
   }
 
-  // parseConcat parses the `||` array concatenation level (grammar.md §39, array-functions.md §8):
-  // one rung tighter than the comparisons, looser than additive, left-associative. Each operand is
-  // an additive expression, so `a + b || c` is `(a + b) || c`; `a || b || c` is `(a || b) || c`.
+  // parseConcat parses the "any other operator" level (grammar.md §39/§40, array-functions.md §8/§10):
+  // one rung tighter than the comparisons, looser than additive, left-associative. It hosts `||` array
+  // concatenation plus the `@>`/`<@`/`&&` array containment/overlap operators — all the same precedence
+  // in PostgreSQL. Each operand is an additive expression, so `a + b || c` is `(a + b) || c`; chaining
+  // mixes freely (`a || b @> c` is `(a || b) @> c`).
   private parseConcat(): Expr {
     const base = this.depth;
     let lhs = this.parseAdditive();
-    while (this.peek().kind === "concat") {
-      this.deepen(); // each chained || is one more AST level
+    for (;;) {
+      let op: BinaryOp;
+      const k = this.peek().kind;
+      if (k === "concat") op = "concat";
+      else if (k === "contains") op = "contains";
+      else if (k === "containedBy") op = "containedBy";
+      else if (k === "overlaps") op = "overlaps";
+      else {
+        this.depth = base;
+        return lhs;
+      }
+      this.deepen(); // each chained operator is one more AST level
       this.advance();
-      lhs = binaryExpr("concat", lhs, this.parseAdditive());
+      lhs = binaryExpr(op, lhs, this.parseAdditive());
     }
-    this.depth = base;
-    return lhs;
   }
 
   private parseAdditive(): Expr {
@@ -1829,6 +1839,12 @@ function renderToken(t: Token): string {
       return ":";
     case "concat":
       return "||";
+    case "contains":
+      return "@>";
+    case "containedBy":
+      return "<@";
+    case "overlaps":
+      return "&&";
     default: // "eof" — never inside the parentheses
       return "";
   }

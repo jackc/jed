@@ -1841,17 +1841,33 @@ func (p *Parser) parseComparison() (Expr, error) {
 	return binaryExpr(op, lhs, rhs), nil
 }
 
-// parseConcat parses the `||` array concatenation level (grammar.md §39, array-functions.md §8):
-// one rung tighter than the comparisons, looser than additive, left-associative. Each operand is an
-// additive expression, so `a + b || c` is `(a + b) || c`; `a || b || c` is `(a || b) || c`.
+// parseConcat parses the "any other operator" level (grammar.md §39/§40, array-functions.md §8/§10):
+// one rung tighter than the comparisons, looser than additive, left-associative. It hosts `||` array
+// concatenation plus the `@>`/`<@`/`&&` array containment/overlap operators — all the same precedence
+// in PostgreSQL. Each operand is an additive expression, so `a + b || c` is `(a + b) || c`; chaining
+// mixes freely (`a || b @> c` is `(a || b) @> c`).
 func (p *Parser) parseConcat() (Expr, error) {
 	base := p.depth
 	lhs, err := p.parseAdditive()
 	if err != nil {
 		return Expr{}, err
 	}
-	for p.peek().Kind == TokConcat {
-		if err := p.deepen(); err != nil { // each chained || is one more AST level
+	for {
+		var op BinaryOp
+		switch p.peek().Kind {
+		case TokConcat:
+			op = OpConcat
+		case TokContains:
+			op = OpContains
+		case TokContainedBy:
+			op = OpContainedBy
+		case TokOverlaps:
+			op = OpOverlaps
+		default:
+			p.depth = base
+			return lhs, nil
+		}
+		if err := p.deepen(); err != nil { // each chained operator is one more AST level
 			return Expr{}, err
 		}
 		p.advance()
@@ -1859,10 +1875,8 @@ func (p *Parser) parseConcat() (Expr, error) {
 		if err != nil {
 			return Expr{}, err
 		}
-		lhs = binaryExpr(OpConcat, lhs, rhs)
+		lhs = binaryExpr(op, lhs, rhs)
 	}
-	p.depth = base
-	return lhs, nil
 }
 
 func (p *Parser) parseAdditive() (Expr, error) {
@@ -2600,6 +2614,12 @@ func renderToken(t Token) string {
 		return ":"
 	case TokConcat:
 		return "||"
+	case TokContains:
+		return "@>"
+	case TokContainedBy:
+		return "<@"
+	case TokOverlaps:
+		return "&&"
 	default: // TokEof — never inside the parentheses
 		return ""
 	}

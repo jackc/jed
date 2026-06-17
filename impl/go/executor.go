@@ -5360,6 +5360,9 @@ const (
 	afReplace                      // array_replace(anyarray, anyelement, anyelement) → anyarray; any dim, shape preserved
 	afPosition                     // array_position(anyarray, anyelement[, integer]) → int32; 1-D/empty (0A000); NULL start 22004
 	afPositions                    // array_positions(anyarray, anyelement) → int32[]; 1-D/empty only (0A000)
+	afContains                     // a @> b (anyarray, anyarray) → boolean; does a contain b; strict eq; any dim (§10)
+	afContainedBy                  // a <@ b (anyarray, anyarray) → boolean; is a contained by b (b @> a) (§10)
+	afOverlaps                     // a && b (anyarray, anyarray) → boolean; do a and b share an element; strict eq (§10)
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -6777,6 +6780,59 @@ func resolveConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rE
 		fn = afPrepend
 	}
 	return &rExpr{kind: reArrayFunc, afunc: fn, sargs: []*rExpr{rl, rr}}, result, nil
+}
+
+// resolveContainment resolves an array containment/overlap operator `@>` / `<@` / `&&`
+// (array-functions.md §10): a polymorphic `anyarray <op> anyarray → boolean`. Like resolveConcat
+// (§8.1) it resolves both operands, adapts a bare literal ARRAY[…] to the first array operand's
+// element type, then unifies the two element types over the single (anyarray, anyarray) overload — a
+// non-array operand or an element-type mismatch is 42883. The result is always boolean (so an
+// all-untyped-NULL pair is NOT 42P18). The operators are strict (a NULL whole-array operand → NULL).
+func resolveContainment(s *scope, lhs, rhs Expr, fn arrayFunc, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	noOverload := func() error {
+		return NewError(UndefinedFunction,
+			"operator does not exist: the containment/overlap operands are not arrays of a common element type")
+	}
+	// Pass 1: resolve both operands with no hint.
+	rl, lt, err := resolve(s, lhs, nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	rr, rt, err := resolve(s, rhs, nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	// The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
+	var hint *ScalarType
+	if lt.kind == rtArray {
+		if h, ok := elemScalarHint(*lt.elem); ok {
+			hint = &h
+		}
+	} else if rt.kind == rtArray {
+		if h, ok := elemScalarHint(*rt.elem); ok {
+			hint = &h
+		}
+	}
+	// Pass 2: re-resolve the NON-NULL operands with the hint so a bare ARRAY[…] adapts. A bare NULL
+	// (pass-1 kind rtNull) is left untyped — it defers in the anyarray slot, result is boolean anyway.
+	if hint != nil {
+		if lt.kind != rtNull {
+			if rl, lt, err = resolve(s, lhs, hint, ag, params); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+		if rt.kind != rtNull {
+			if rr, rt, err = resolve(s, rhs, hint, ag, params); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+	}
+	// Both slots are anyarray: the element types must unify (a non-array / mismatch is 42883).
+	tys := []resolvedType{lt, rt}
+	if _, matched := matchPoly([]string{"anyarray", "anyarray"}, tys); !matched {
+		return nil, resolvedType{}, noOverload()
+	}
+	return &rExpr{kind: reArrayFunc, afunc: fn, sargs: []*rExpr{rl, rr}}, resolvedType{kind: rtBool}, nil
 }
 
 // aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
@@ -8297,6 +8353,12 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 			resolvedType{kind: rtBool}, nil
 	case OpConcat:
 		return resolveConcat(s, b.Lhs, b.Rhs, ag, params)
+	case OpContains:
+		return resolveContainment(s, b.Lhs, b.Rhs, afContains, ag, params)
+	case OpContainedBy:
+		return resolveContainment(s, b.Lhs, b.Rhs, afContainedBy, ag, params)
+	case OpOverlaps:
+		return resolveContainment(s, b.Lhs, b.Rhs, afOverlaps, ag, params)
 	default: // OpAnd, OpOr
 		rl, lt, err := resolve(s, b.Lhs, nil, ag, params)
 		if err != nil {
@@ -9111,14 +9173,66 @@ func evalArrayFunc(fn arrayFunc, vals []Value) (Value, error) {
 			start = &vals[2]
 		}
 		return arrayPositionValue(vals[0], vals[1], start)
-	default: // afPositions
+	case afPositions:
 		return arrayPositionsValue(vals[0], vals[1])
+	case afContains:
+		return arrayContainsValue(vals[0], vals[1])
+	case afContainedBy:
+		return arrayContainsValue(vals[1], vals[0])
+	default: // afOverlaps
+		return arrayOverlapsValue(vals[0], vals[1])
 	}
 }
 
 // notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
 // element comparator, so NULL equals NULL and a non-NULL never equals NULL.
 func notDistinct(a, b Value) bool { return valueCmp(a, b) == 0 }
+
+// strictElemEq is STRICT element equality for the containment/overlap operators (array-functions.md
+// §10): a NULL element equals NOTHING — including another NULL — the deliberate inverse of
+// notDistinct (§5 #10). For two non-NULL values it is jed's total element comparator (valueCmp == 0).
+func strictElemEq(a, b Value) bool {
+	return a.Kind != ValNull && b.Kind != ValNull && valueCmp(a, b) == 0
+}
+
+// arrayContainsValue is a @> b (array-functions.md §10): does a CONTAIN b — is every element of b
+// present in a under STRICT equality, over the flattened element multiset (any dimensionality)? A
+// NULL whole-array operand → NULL. The empty array is contained by anything (a @> {} is true).
+func arrayContainsValue(a, b Value) (Value, error) {
+	if a.Kind == ValNull || b.Kind == ValNull {
+		return NullValue(), nil
+	}
+	for _, eb := range b.Array.Elements {
+		found := false
+		for _, ea := range a.Array.Elements {
+			if strictElemEq(ea, eb) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return BoolValue(false), nil
+		}
+	}
+	return BoolValue(true), nil
+}
+
+// arrayOverlapsValue is a && b (array-functions.md §10): do a and b OVERLAP — share at least one
+// element under STRICT equality, over the flattened element multiset (any dimensionality)? A NULL
+// whole-array operand → NULL. The empty array overlaps nothing.
+func arrayOverlapsValue(a, b Value) (Value, error) {
+	if a.Kind == ValNull || b.Kind == ValNull {
+		return NullValue(), nil
+	}
+	for _, ea := range a.Array.Elements {
+		for _, eb := range b.Array.Elements {
+			if strictElemEq(ea, eb) {
+				return BoolValue(true), nil
+			}
+		}
+	}
+	return BoolValue(false), nil
+}
 
 // arrayRemoveValue is array_remove(a, e) (array-functions.md §8): drop every element NOT DISTINCT
 // FROM e. NULL array → NULL; 1-D/empty only (a multidimensional array is 0A000); the lower bound is

@@ -41,6 +41,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Array function surface AF3 (array-functions.md §9): the polymorphic SRF unnest(anyarray) — a
   // FROM-clause row source expanding an array into one row per element (functions.md §10).
   "func.unnest",
+  // Array function surface AF4 (array-functions.md §10): the containment/overlap operators
+  // @>/<@/&& — polymorphic `anyarray <op> anyarray → boolean`, strict element equality.
+  "func.array_containment",
   // NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
   "ddl.not_null",
   // DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

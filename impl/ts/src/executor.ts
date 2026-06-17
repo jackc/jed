@@ -4032,7 +4032,12 @@ type ArrayFuncName =
   | "array_remove"
   | "array_replace"
   | "array_position"
-  | "array_positions";
+  | "array_positions"
+  // The containment/overlap operators `@>`/`<@`/`&&` (array-functions.md §10) — not catalog function
+  // names; resolved via resolveContainment, which selects these kernel ids directly.
+  | "contains"
+  | "contained_by"
+  | "overlaps";
 
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
@@ -6412,6 +6417,12 @@ function resolveBinary(
     }
     case "concat":
       return resolveConcat(scope, lhs, rhs, ag, params);
+    case "contains":
+      return resolveContainment(scope, lhs, rhs, "contains", ag, params);
+    case "containedBy":
+      return resolveContainment(scope, lhs, rhs, "contained_by", ag, params);
+    case "overlaps":
+      return resolveContainment(scope, lhs, rhs, "overlaps", ag, params);
     default: {
       // "and" | "or"
       const l = resolve(scope, lhs, null, ag, params);
@@ -6480,6 +6491,44 @@ function resolveConcat(
   else if (chosen.argFamilies[0] === "anyarray" && chosen.argFamilies[1] === "anyelement") func = "array_append";
   else func = "array_prepend";
   return { node: { kind: "arrayFunc", func, args: [rl.node, rr.node] }, type };
+}
+
+// resolveContainment resolves an array containment/overlap operator `@>` / `<@` / `&&`
+// (array-functions.md §10): a polymorphic `anyarray <op> anyarray → boolean`. Like resolveConcat
+// (§8.1) it resolves both operands, adapts a bare literal ARRAY[…] to the first array operand's
+// element type, then unifies the two element types over the single (anyarray, anyarray) overload — a
+// non-array operand or an element-type mismatch is 42883. The result is always boolean (so an
+// all-untyped-NULL pair is NOT 42P18). The operators are strict (a NULL whole-array operand → NULL).
+function resolveContainment(
+  scope: Scope,
+  lhs: Expr,
+  rhs: Expr,
+  func: ArrayFuncName,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const noOverload = (): EngineError =>
+    engineError(
+      "undefined_function",
+      "operator does not exist: the containment/overlap operands are not arrays of a common element type",
+    );
+  // Pass 1: resolve both operands with no hint.
+  let rl = resolve(scope, lhs, null, ag, params);
+  let rr = resolve(scope, rhs, null, ag, params);
+  // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
+  let hint: ScalarType | null = null;
+  if (rl.type.kind === "array") hint = elemScalarHint(rl.type.elem);
+  else if (rr.type.kind === "array") hint = elemScalarHint(rr.type.elem);
+  // Pass 2: re-resolve the NON-NULL operands with the hint so a bare ARRAY[…] adapts. A bare NULL
+  // (pass-1 kind "null") is left untyped — it defers in the anyarray slot, result is boolean anyway.
+  if (hint !== null) {
+    if (rl.type.kind !== "null") rl = resolve(scope, lhs, hint, ag, params);
+    if (rr.type.kind !== "null") rr = resolve(scope, rhs, hint, ag, params);
+  }
+  // Both slots are anyarray: the element types must unify (a non-array / mismatch is 42883).
+  const tys: ResolvedType[] = [rl.type, rr.type];
+  if (!matchPoly(["anyarray", "anyarray"], tys).matched) throw noOverload();
+  return { node: { kind: "arrayFunc", func, args: [rl.node, rr.node] }, type: { kind: "bool" } };
 }
 
 // resolveOperandPair resolves the two operands of a binary operator, giving a bare
@@ -7126,6 +7175,12 @@ function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
       return arrayPositionValue(vals[0]!, vals[1]!, vals.length > 2 ? vals[2]! : null);
     case "array_positions":
       return arrayPositionsValue(vals[0]!, vals[1]!);
+    case "contains":
+      return arrayContainsValue(vals[0]!, vals[1]!);
+    case "contained_by":
+      return arrayContainsValue(vals[1]!, vals[0]!);
+    case "overlaps":
+      return arrayOverlapsValue(vals[0]!, vals[1]!);
   }
 }
 
@@ -7133,6 +7188,31 @@ function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
 // element comparator, so NULL equals NULL and a non-NULL never equals NULL.
 function notDistinct(a: Value, b: Value): boolean {
   return valueCmp(a, b) === 0;
+}
+
+// strictElemEq is STRICT element equality for the containment/overlap operators (array-functions.md
+// §10): a NULL element equals NOTHING — including another NULL — the deliberate inverse of notDistinct
+// (§5 #10). For two non-NULL values it is jed's total element comparator (valueCmp === 0).
+function strictElemEq(a: Value, b: Value): boolean {
+  return a.kind !== "null" && b.kind !== "null" && valueCmp(a, b) === 0;
+}
+
+// arrayContainsValue is a @> b (array-functions.md §10): does a CONTAIN b — is every element of b
+// present in a under STRICT equality, over the flattened element multiset (any dimensionality)? A NULL
+// whole-array operand → NULL. The empty array is contained by anything (a @> {} is true).
+function arrayContainsValue(a: Value, b: Value): Value {
+  if (a.kind !== "array" || b.kind !== "array") return nullValue();
+  const contained = b.elements.every((eb) => a.elements.some((ea) => strictElemEq(ea, eb)));
+  return boolValue(contained);
+}
+
+// arrayOverlapsValue is a && b (array-functions.md §10): do a and b OVERLAP — share at least one
+// element under STRICT equality, over the flattened element multiset (any dimensionality)? A NULL
+// whole-array operand → NULL. The empty array overlaps nothing.
+function arrayOverlapsValue(a: Value, b: Value): Value {
+  if (a.kind !== "array" || b.kind !== "array") return nullValue();
+  const overlaps = a.elements.some((ea) => b.elements.some((eb) => strictElemEq(ea, eb)));
+  return boolValue(overlaps);
 }
 
 // arrayRemoveValue is array_remove(a, e) (array-functions.md §8): drop every element NOT DISTINCT

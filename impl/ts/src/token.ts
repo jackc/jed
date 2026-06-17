@@ -29,6 +29,11 @@ export type TokenKind =
   //              chars scanned greedily after "=", the legacy ":=" is not jed's surface (grammar.md §17)
   | "concat" // || — the array concatenation operator (a || b); two "|" scanned greedily, a lone
   //              "|" is a 42601 syntax error (jed has no bitwise-or) (spec/design/grammar.md §39)
+  | "contains" // @> — the array containment operator (a @> b — does a contain b); "@" then ">"
+  //              scanned greedily, a lone "@" is a 42601 syntax error (spec/design/grammar.md §40)
+  | "containedBy" // <@ — the array contained-by operator (a <@ b — is a contained by b) (grammar.md §40)
+  | "overlaps" // && — the array overlap operator (a && b — do a and b share an element); two "&"
+  //              scanned greedily, a lone "&" is a 42601 syntax error (spec/design/grammar.md §40)
   | "param" // a bind parameter $N — `paramIndex` holds the 1-based index (spec/design/api.md §5)
   | "eof"; // end of input
 

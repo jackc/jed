@@ -57,6 +57,15 @@ pub enum Token {
     /// The `||` array concatenation operator (`a || b`). Two `|` scanned greedily; a lone `|` is a
     /// 42601 syntax error (jed has no bitwise-or). See spec/design/grammar.md §39, array-functions.md §8.
     Concat,
+    /// The `@>` array containment operator (`a @> b` — does `a` contain `b`). `@` then `>`, scanned
+    /// greedily; a lone `@` is a 42601 syntax error. See spec/design/grammar.md §40, array-functions.md §10.
+    Contains,
+    /// The `<@` array contained-by operator (`a <@ b` — is `a` contained by `b`). `<` then `@`. See
+    /// spec/design/grammar.md §40, array-functions.md §10.
+    ContainedBy,
+    /// The `&&` array overlap operator (`a && b` — do `a` and `b` share an element). Two `&` scanned
+    /// greedily; a lone `&` is a 42601 syntax error. See spec/design/grammar.md §40, array-functions.md §10.
+    Overlaps,
     /// End of input.
     Eof,
 }

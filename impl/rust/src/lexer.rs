@@ -162,9 +162,33 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     tokens.push(Token::Le);
                     i += 2;
+                } else if bytes.get(i + 1) == Some(&b'@') {
+                    // `<@` is the array contained-by operator (grammar.md §40), scanned greedily.
+                    tokens.push(Token::ContainedBy);
+                    i += 2;
                 } else {
                     tokens.push(Token::Lt);
                     i += 1;
+                }
+            }
+            b'@' => {
+                // `@>` is the array containment operator (grammar.md §40), scanned greedily as one
+                // token; a lone `@` is not part of jed's surface — 42601.
+                if bytes.get(i + 1) == Some(&b'>') {
+                    tokens.push(Token::Contains);
+                    i += 2;
+                } else {
+                    return Err(syntax("unexpected character '@'".to_string()));
+                }
+            }
+            b'&' => {
+                // `&&` is the array overlap operator (grammar.md §40), scanned greedily as one
+                // token; a lone `&` is not part of jed's surface (no bitwise-and) — 42601.
+                if bytes.get(i + 1) == Some(&b'&') {
+                    tokens.push(Token::Overlaps);
+                    i += 2;
+                } else {
+                    return Err(syntax("unexpected character '&'".to_string()));
                 }
             }
             b'>' => {

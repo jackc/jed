@@ -68,7 +68,9 @@ POLYMORPHIC_FAMILIES = %w[anyarray anyelement].to_set
 RESERVED_RESULTS = %w[promoted anyarray anyelement].to_set
 # "concat" is the `||` array concatenation operator's kind (array-functions.md §8): a binary infix
 # operator with its own precedence, polymorphic over anyarray/anyelement like the array functions.
-KNOWN_KINDS      = %w[comparison null_test arithmetic logical function concat].to_set
+# "containment" is the kind of the array containment/overlap operators `@>`/`<@`/`&&`
+# (array-functions.md §10): binary infix, `(anyarray, anyarray) → boolean`, sharing `||`'s precedence.
+KNOWN_KINDS      = %w[comparison null_test arithmetic logical function concat containment].to_set
 NULL_BEHAVIORS   = %w[propagates detects null_safe kleene none].to_set
 RESOLUTIONS      = %w[promote none].to_set
 VOLATILITIES     = %w[immutable stable volatile].to_set

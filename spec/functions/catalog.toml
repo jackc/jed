@@ -2181,6 +2181,56 @@ null           = "none"
 precedence     = 37
 errors         = ["22000"]
 
+# --- the array containment / overlap operators (../design/array-functions.md §10) ------------
+# Three new operators of KIND "containment": binary infix `@>` (contains), `<@` (contained by), and
+# `&&` (overlaps), each `(anyarray, anyarray) → boolean`. They share `||`'s precedence (37 — the
+# PostgreSQL "any other operator" rung) and are polymorphic over anyarray/anyelement like the rest
+# of the surface (§2): the two operands' element types must unify, and a non-array operand or an
+# element-type mismatch is 42883. Unlike the non-strict builders they are STRICT (null =
+# "propagates": a NULL whole-array operand → NULL). Element matching is STRICT equality — a NULL
+# element matches NOTHING (UNLIKE the search/edit functions' NOT DISTINCT FROM, §5 #10 / #12) — over
+# the FLATTENED element multiset, so they work on ANY dimensionality and duplicates / custom lower
+# bounds are irrelevant (set semantics). `<@` is `@>` with the operands swapped. The hand-written
+# resolver (resolve_containment) routes each AST node to its boolean kernel; there is one overload
+# per operator, so no overload ORDERING subtlety (contrast `concat`, §8.1). Result is boolean
+# regardless of ELEM, so an all-untyped-NULL pair is NOT 42P18 (the type IS determinable).
+
+[[operator]]
+name           = "contains"
+symbol         = "@>"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyarray", "anyarray"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "contained_by"
+symbol         = "<@"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyarray", "anyarray"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "overlaps"
+symbol         = "&&"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyarray", "anyarray"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
 # SINGLE value. They are NOT operators — no infix symbol, no precedence, no

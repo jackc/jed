@@ -29,6 +29,13 @@ test('the tables page enforces a CHECK constraint live and resets to seed', asyn
 	await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 });
 
+test('the select page runs the array containment operators live (@> / <@ / &&)', async ({ page }) => {
+	await page.goto('/docs/sql/select/');
+	// Fourth LiveSql panel = the @>/<@/&& demo; every column is true (the array sets contain/overlap).
+	const panel = page.getByTestId('live-sql').nth(3);
+	await expect(panel.getByTestId('result-rows')).toContainText('true');
+});
+
 test('the reference pages are generated from the spec', async ({ page }) => {
 	await page.goto('/docs/reference/errors/');
 	// 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.

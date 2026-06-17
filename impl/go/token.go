@@ -64,6 +64,15 @@ const (
 	// TokConcat is the "||" array concatenation operator (a || b). Two "|" scanned greedily; a lone
 	// "|" is a 42601 syntax error (jed has no bitwise-or). spec/design/grammar.md §39.
 	TokConcat
+	// TokContains is the "@>" array containment operator (a @> b — does a contain b). "@" then ">"
+	// scanned greedily; a lone "@" is a 42601 syntax error. spec/design/grammar.md §40.
+	TokContains
+	// TokContainedBy is the "<@" array contained-by operator (a <@ b — is a contained by b). "<"
+	// then "@". spec/design/grammar.md §40.
+	TokContainedBy
+	// TokOverlaps is the "&&" array overlap operator (a && b — do a and b share an element). Two "&"
+	// scanned greedily; a lone "&" is a 42601 syntax error (no bitwise-and). spec/design/grammar.md §40.
+	TokOverlaps
 	// TokParam is a bind parameter $N — Int holds the 1-based index. The lexer rejects $0, a
 	// leading zero ($01), and $ with no following digit (42601). Bound by the host API, not the
 	// corpus (spec/design/api.md, grammar.md §5).

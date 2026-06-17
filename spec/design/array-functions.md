@@ -10,17 +10,19 @@
 > `postgres:18` oracle — several array-function NULL/shape rules are subtle (§3) and must be
 > oracle-checked, not guessed.
 >
-> **Status: AF1 + AF2 + AF3 landed.** AF1 — the **polymorphic resolution machinery** (§2) plus the
-> *scalar-function-shaped* surface: introspection (`array_ndims`, `array_length`, `array_lower`,
+> **Status: AF1 + AF2 + AF3 + AF4 landed.** AF1 — the **polymorphic resolution machinery** (§2) plus
+> the *scalar-function-shaped* surface: introspection (`array_ndims`, `array_length`, `array_lower`,
 > `array_upper`, `cardinality`, `array_dims`) and builders (`array_append`, `array_prepend`,
 > `array_cat`). AF2 (§8) — the **`||` concatenation operator** and the **search/edit functions**
 > (`array_remove`, `array_replace`, `array_position`, `array_positions`). AF3 (§9) — the
 > **`unnest(anyarray)` set-returning function**, the engine's second FROM-clause SRF: it expands an
-> array into one row per element at the bound element type. All three are implemented across all
-> three cores, oracle-checked (`suites/expr/array_functions.test`,
-> `suites/expr/array_concat_search.test`, `suites/query/unnest.test`), capabilities `func.array` +
-> `func.unnest`. The remaining slices (§6) — `@>`/`<@`/`&&`, `ANY`/`ALL`, `VARIADIC` — are sequenced
-> follow-ons, each its own vertical slice.
+> array into one row per element at the bound element type. AF4 (§10) — the **containment/overlap
+> operators** `@>` (contains), `<@` (contained by), `&&` (overlaps), three polymorphic
+> `anyarray <op> anyarray → boolean` operators. All four are implemented across all three cores,
+> oracle-checked (`suites/expr/array_functions.test`, `suites/expr/array_concat_search.test`,
+> `suites/query/unnest.test`, `suites/expr/array_containment.test`), capabilities `func.array` +
+> `func.unnest` + `func.array_containment`. The remaining slices (§6) — `ANY`/`ALL`, `VARIADIC` — are
+> sequenced follow-ons, each its own vertical slice.
 
 ## 1. Why a new layer
 
@@ -266,8 +268,10 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
   output column and a per-element row generator. All three cores + `func.unnest` +
   `suites/query/unnest.test`. (FROM-clause position only; the SELECT-list SRF, `LATERAL`, and the
   `WITH ORDINALITY` form remain their own follow-ons.)
-- **AF4** — the containment/overlap operators **`@>`** (contains), **`<@`** (contained by),
-  **`&&`** (overlaps), as polymorphic `boolean`-result operators.
+- **AF4 ✅** (§10) — the containment/overlap operators **`@>`** (contains), **`<@`** (contained by),
+  **`&&`** (overlaps), as polymorphic `boolean`-result operators sharing `||`'s precedence rung.
+  One grammar change (the `@>`/`<@`/`&&` tokens + the broadened `concat` rung); all three cores +
+  `suites/expr/array_containment.test`.
 - **AF5** — the **`ANY`/`ALL`** quantified comparisons (`x = ANY(array)`, `x op ALL(array)`) — a
   grammar + resolver + evaluator slice reusing the `IN`-list 3VL membership machinery.
 - **AF6** — **`VARIADIC`** call syntax + variadic overload resolution (the `make_interval`-era
@@ -277,7 +281,7 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
 
 | Failure | Code |
 |---|---|
-| No array-function/`\|\|`-overload matches the argument types (incl. element-type conflict `array_cat(int32[], text[])`, a non-array where `anyarray` is required, or text/`int\|\|int` `\|\|`) | `42883` undefined_function |
+| No array-function/`\|\|`/`@>`/`<@`/`&&`-overload matches the argument types (incl. element-type conflict `array_cat(int32[], text[])`, a non-array where `anyarray` is required, or text/`int\|\|int` `\|\|`) | `42883` undefined_function |
 | `array_append`/`array_prepend` / `array \|\| element` on a multidimensional array | `22000` data_exception |
 | `array_cat` / `array \|\| array` of incompatible dimensionalities | `2202E` array_subscript_error |
 | `array_remove`/`array_position`/`array_positions` on a multidimensional array (AF2) | `0A000` feature_not_supported |
@@ -421,3 +425,86 @@ hand-written per core. **Deferred** (each its own follow-on, §6): the SELECT-li
 (`SELECT unnest(…)` is `42883`, like `generate_series`), `LATERAL` (so the natural "explode a column"
 `FROM t, unnest(t.xs)` is reached only via a correlated subquery this slice), `WITH ORDINALITY`, the
 multi-array `unnest(a, b, …)` form, and array-of-composite elements.
+
+## 10. AF4 — the containment / overlap operators (`@>` / `<@` / `&&`)
+
+AF4 spends the §2 machinery on the array surface's three **containment / overlap** operators —
+PostgreSQL's `@>` (contains), `<@` (contained by), and `&&` (overlaps). Each is a polymorphic
+`anyarray <op> anyarray → boolean` operator; they are the array-set predicates that pair with the
+membership `= ANY(…)` quantifier (AF5). Every rule is oracle-pinned (`postgres:18`). Like `||`
+(§8.1) they are a new operator **kind** (`containment`) reached through a hand-written resolver, not
+a `kind = "function"` row; unlike `||` there is exactly **one overload per operator**, so there is
+no overload-ordering subtlety.
+
+### 10.1 Semantics
+
+All three reduce both operands to their **flattened element multiset** (the array value's row-major
+`elements` list — [array.md §4](array.md)) and compare with **strict element equality**:
+
+- **`a @> b` (contains)** — `true` iff **every** element of `b` is present in `a`. The empty array
+  is contained by anything (`a @> '{}'` is `true`, even `'{}' @> '{}'`), and `'{}' @> b` is `false`
+  for any non-empty `b`.
+- **`a <@ b` (contained by)** — exactly `b @> a` (the operands swapped).
+- **`a && b` (overlaps)** — `true` iff `a` and `b` share **at least one** element. The empty array
+  overlaps nothing (`a && '{}'` is `false`).
+
+Three properties distinguish AF4 from the rest of the surface and **must** be oracle-pinned, not
+guessed:
+
+1. **Strict element equality — a NULL element matches NOTHING.** Element comparison treats a NULL as
+   unequal to everything, **including another NULL** — the *opposite* of the search/edit functions'
+   NOT DISTINCT FROM (§5 #10, where a NULL target finds NULL elements). So `ARRAY[1,2,NULL] @>
+   ARRAY[2]` is `true` (2 is found, the NULL is irrelevant) but `ARRAY[1,2,NULL] @> ARRAY[NULL]` is
+   **`false`** (the NULL in `b` is not "found" in `a`), `ARRAY[1,2,3] @> ARRAY[NULL]` is `false`, and
+   `ARRAY[1,NULL] && ARRAY[NULL]` is `false`. This matches PostgreSQL's `array_contain_compare`,
+   which documents the strict-comparison assumption (*"a NULL can't match anything"*) and is the one
+   surprising rule here. The result is still a **definite boolean** — a NULL *element* never makes
+   the operator return NULL.
+2. **Any dimensionality, set semantics.** The comparison is over the flattened element list, so the
+   operators work on **multidimensional** arrays (`ARRAY[[1,2],[3,4]] @> ARRAY[3]` is `true`) — there
+   is **no** 1-D-only `0A000` restriction (contrast `array_remove`/`array_position`, §5 #11). Element
+   **duplicates** and **custom lower bounds** are irrelevant (`ARRAY[1,2,2] @> ARRAY[2,2,2]` is
+   `true`).
+3. **Strict on a NULL whole-array operand.** `null = "propagates"`: a NULL array operand (the whole
+   value, e.g. `NULL::int32[] @> ARRAY[1]`) yields **NULL**, the ordinary strict short-circuit. This
+   is the standard evaluator behavior and needs no kernel handling — but the kernels also guard it so
+   a folded NULL constant is handled uniformly.
+
+### 10.2 Resolution
+
+Both slots are `anyarray`, so resolution is the §2 unification specialized to a fixed shape, in a
+hand-written `resolve_containment` (the AF4 analogue of `resolve_concat`):
+
+1. resolve both operands with no hint;
+2. compute the element hint from the **first operand that is an array** and re-resolve the **non-NULL**
+   operands with it, so a bare `ARRAY[…]` constructor adapts to the column's element type
+   (`int32[]_col @> ARRAY[20]` lands on `int32`, exactly the §8.1 literal adaptation) — a bare untyped
+   `NULL` operand is left un-adapted (it `defer`s in the `anyarray` slot, and the result is boolean
+   regardless);
+3. the single `(anyarray, anyarray)` overload must unify the two element types: a **non-array** operand
+   (`5 @> ARRAY[1]`) or an **element-type mismatch** (`int32[] @> text[]`) matches no overload and is
+   **`42883`** — exactly PostgreSQL (*"operator does not exist: integer[] @> text[]"*).
+
+The result is **`boolean`** independent of the bound `ELEM`, so — unlike the builders (§5 #6) — an
+all-untyped-`NULL` pair (`NULL @> NULL`) is **not** `42P18`: the result type is determinable, and the
+operator evaluates to NULL at runtime (a degenerate case, out of the oracle corpus).
+
+### 10.3 Cost & node
+
+No new cost units. Each `@>`/`<@`/`&&` is one interior node → one `operator_eval`
+([cost.md](cost.md)); the per-element membership walk is unmetered, exactly as the array comparator /
+builder walks are (§3.3). The three operators reuse the array-function node machinery — they resolve
+to the same per-row `ArrayFunc`-style node carrying a boolean kernel (`contains` / `contained_by` /
+`overlaps`), so no new evaluator shape is introduced; the result type is carried out of resolve as
+`boolean`.
+
+### 10.4 Ratified divergences
+
+12. **Containment/overlap element matching is STRICT equality, not NOT DISTINCT FROM** — a NULL
+    element matches nothing (including another NULL), so `@>`/`<@`/`&&` never "find" a NULL. This is
+    PostgreSQL's behavior (`array_contain_compare`), and the deliberate inverse of the search/edit
+    functions' NULL-safe matching (§5 #10) — the two array surfaces match NULLs by **opposite** rules,
+    both oracle-pinned.
+13. **No dimensionality restriction** — `@>`/`<@`/`&&` operate on the flattened element multiset of
+    **any** dimensionality (a multidimensional operand is fine), unlike `array_remove`/`array_position`/
+    `array_positions` which are 1-D-only `0A000` (§5 #11). Matches PostgreSQL.
