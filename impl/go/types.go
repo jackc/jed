@@ -172,14 +172,20 @@ func (t ScalarType) IsFloat() bool { return t == Float32 || t == Float64 }
 // IsInteger reports whether this is one of the fixed-width signed integer types.
 func (t ScalarType) IsInteger() bool { return t == Int16 || t == Int32 || t == Int64 }
 
-// WidthBytes is the fixed storage width in bytes (the value-codec width for the fixed-width
-// types: the three integers, uuid, and the two floats). text/decimal/bytea/interval are
-// variable-width or struct-bodied (return 0) — they carry their own length / fixed body
-// (spec/fileformat/format.md) and never use this. uuid (16) and the floats (4/8) are non-integer
-// fixed-width types; callers branch on IsUuid / IsFloat before the integer decode path, since
-// DecodeInt would sign-flip their bytes (floats store raw IEEE big-endian, no sign flip).
+// WidthBytes is the fixed KEY-encoding width in bytes — the bare key body, no presence tag —
+// for the fixed-width keyable types: the three integers, uuid (16), boolean (1 — the bool-byte
+// key, spec/design/encoding.md §2.9), the two int64-microsecond timestamps, and the two floats.
+// Used by the index tail-slot skip (each self-delimiting component is 0x01 NULL or 0x00 + this
+// many bytes). text/decimal/bytea/interval are variable-width or struct-bodied (return 0) — they
+// are never keys / carry their own length / fixed body (spec/fileformat/format.md) and never use
+// this. uuid (16) and the floats (4/8) are non-integer fixed-width types; callers branch on
+// IsUuid / IsFloat before the integer decode path, since DecodeInt would sign-flip their bytes
+// (floats store raw IEEE big-endian, no sign flip). boolean's VALUE codec has its own 1-byte
+// branch and never reaches the integer decode path either; this width is the key path only.
 func (t ScalarType) WidthBytes() int {
 	switch t {
+	case Bool:
+		return 1
 	case Int16:
 		return 2
 	case Int32:
@@ -348,6 +354,9 @@ func (t Type) IsInteger() bool { return t.isScalar() && t.Scalar.IsInteger() }
 
 // IsDecimal reports whether this is the scalar decimal type (false for a composite/array).
 func (t Type) IsDecimal() bool { return t.isScalar() && t.Scalar.IsDecimal() }
+
+// IsBool reports whether this is the scalar boolean type (false for a composite/array).
+func (t Type) IsBool() bool { return t.isScalar() && t.Scalar.IsBool() }
 
 // IsUuid reports whether this is the scalar uuid type (false for a composite/array).
 func (t Type) IsUuid() bool { return t.isScalar() && t.Scalar.IsUuid() }

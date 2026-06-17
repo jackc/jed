@@ -40,9 +40,12 @@ schema_version = 1
 #               style — ../design/encoding.md §2.5); "uuid-raw16" = the 16 raw bytes of
 #               the value, big-endian, with NO sign-flip, escape, or terminator (fixed-
 #               width, so unsigned memcmp over the bytes IS the order — ../design/encoding.md
-#               §2.7). All sort byte-for-byte identically to logical order. width_bytes is
-#               omitted for the variable-width types (text, bytea, decimal) but PRESENT for
-#               uuid (fixed 16 bytes — uuid is the first non-integer type usable as a key).
+#               §2.7); "bool-byte" = a single byte 0x00 (false) < 0x01 (true), fixed-width
+#               1, no sign-flip/escape/terminator (../design/encoding.md §2.9). All sort
+#               byte-for-byte identically to logical order. width_bytes is omitted for the
+#               variable-width types (text, bytea, decimal) but PRESENT for the fixed-width
+#               non-integer keys uuid (16) and boolean (1) — the two non-integer types usable
+#               as a key (besides the int64-backed timestamps).
 # max_precision for decimal only: the maximum DECLARABLE precision p of numeric(p,s) —
 #               1000, PG's NUMERIC_MAX_PRECISION — and (as in PG) the display-scale clamp
 #               on a division result (../design/decimal.md §4). NOT a cap on what an
@@ -113,11 +116,13 @@ rank = 3
 # compare/order/dedup (false < true; boolean × boolean is comparable — compare.toml).
 # The value codec is the 1-byte `bool-byte` body (0x00 false, 0x01 true) behind the
 # shared presence tag. The domain is {false, true} plus NULL (= unknown), ordered
-# false < true. The order-preserving `bool-byte` KEY encoding rule stays authored but
-# UNEXERCISED this slice: a boolean PRIMARY KEY is rejected 0A000 (a documented,
-# relaxable narrowing, like the text-key narrowing). `CAST(x AS boolean)` and
-# boolean⇄integer casts are likewise still rejected (deferred to a casts slice —
-# casts.toml). No bits/min/max/overflow/rank — those are integer-family fields.
+# false < true. boolean is ALSO usable as a key: its order-preserving `bool-byte` KEY
+# encoding (a single byte, 0x00 false < 0x01 true — fixed-width 1, so self-delimiting with
+# NO sign-flip/escape/terminator, like uuid; ../design/encoding.md §2.9) is EXERCISED — a
+# boolean PRIMARY KEY / index is supported and byte-pinned (the second non-integer key
+# type after uuid). `CAST(x AS boolean)` and boolean⇄integer casts ARE still rejected
+# (deferred to a casts slice — casts.toml). width_bytes = 1 (the fixed key/value body).
+# No bits/min/max/overflow/rank — those are integer-family fields.
 [[type]]
 id = "boolean"
 aliases = ["bool"]

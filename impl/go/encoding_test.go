@@ -46,6 +46,24 @@ func TestEncodingVectors(t *testing.T) {
 			checked++
 			continue
 		}
+		if c.typ == "boolean" {
+			// boolean is the second non-integer key: a single bool-byte (0x00 false / 0x01 true)
+			// EncodeBool produces (encoding.md §2.9); nullable/descending use the shared
+			// tag/inversion.
+			switch c.kind {
+			case "bare":
+				got = EncodeBool(c.boolValue)
+			case "nullable":
+				got = nullableBoolBytes(c)
+			case "descending":
+				got = invertBytes(nullableBoolBytes(c))
+			}
+			if h := hex.EncodeToString(got); h != c.bytes {
+				t.Errorf("%s boolean value=%v null=%v: got %s want %s", c.kind, c.boolValue, c.isNull, h, c.bytes)
+			}
+			checked++
+			continue
+		}
 		switch c.kind {
 		case "bare":
 			got = EncodeInt(st, c.value)

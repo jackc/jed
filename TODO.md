@@ -126,8 +126,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 - [x] **Storable `boolean` column type** — on-disk type code 5, `bool-byte` codec, comparison +
       ORDER BY (false < true, NULLs last). → [types.md](spec/design/types.md)
-  - [ ] **boolean in a key / `PRIMARY KEY`** — rejected `0A000`; the `bool-byte` key rule is
-        authored but unexercised. _(size: S)_
+  - [x] **boolean in a key / `PRIMARY KEY`** — ✅ landed: the `bool-byte` key encoding is
+        exercised (the second non-integer key after uuid; encoding.md §2.9), covering a boolean
+        PRIMARY KEY, a composite-key member, and a secondary index — with point lookup, 23505 on a
+        duplicate key, 23502 on a NULL key, and the `bool_pk_table.jed` golden + `integers.toml`
+        boolean key vectors pinning the bytes cross-core.
   - [ ] **boolean⇄integer casts** — rejected `0A000`/`42804`; PG's are asymmetric, so a dedicated
         cast slice. _(size: S; §5)_
 - [x] **`text` + ONE collation (`C`)** — UTF-8 byte/code-point order, on-disk type code 4, first
@@ -403,8 +406,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       → [indexes.md](spec/design/indexes.md)
   - [ ] _follow-on (each its own slice + NoREC obligation):_ index ranges / multi-column prefixes;
         index scans for UPDATE/DELETE (keep PK pushdown today); LIMIT-streaming combination;
-        non-key-encodable index types (text/decimal/bytea/boolean keys); expression/ordered/partial
-        keys; `IF NOT EXISTS`.
+        non-key-encodable index types (text/decimal/bytea/interval/float keys — boolean has since
+        landed); expression/ordered/partial keys; `IF NOT EXISTS`.
 - [x] **`RETURNING`** — `INSERT`/`UPDATE`/`DELETE … RETURNING <select_items>` projecting affected
       rows (INSERT stored / UPDATE new / DELETE old), evaluated after validation before any write;
       the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.

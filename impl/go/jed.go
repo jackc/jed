@@ -151,7 +151,8 @@ var SupportedCapabilities = []string{
 	// comparison/ordering. Non-key column only this slice (text PRIMARY KEY → 0A000).
 	"types.text",
 	// Storable boolean column: CREATE/INSERT/SELECT of false/true/NULL, boolean×boolean
-	// comparison and ORDER BY. Non-key column only (boolean PRIMARY KEY → 0A000); casts
+	// comparison and ORDER BY. boolean is also keyable — a boolean PRIMARY KEY / index uses the
+	// bool-byte key encoding (the second non-integer key after uuid, encoding.md §2.9); casts
 	// deferred (spec/design/types.md §9).
 	"types.boolean_storable",
 	// decimal / numeric scalar type — exact base-10, the first parameterized type

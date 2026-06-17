@@ -57,7 +57,7 @@ import {
   workMod,
   workMul,
 } from "./decimal.ts";
-import { encodeInt } from "./encoding.ts";
+import { encodeBool, encodeInt } from "./encoding.ts";
 import { EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
 import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
@@ -88,6 +88,7 @@ import {
   scalarT,
   scalarTypeFromName,
   typeCanonicalName,
+  typeIsBoolean,
   typeIsInteger,
   typeIsTimestamp,
   typeIsTimestamptz,
@@ -876,15 +877,21 @@ export class Database {
         throw engineError("undefined_object", "type does not exist: " + def.typeName);
       }
       if (def.primaryKey) {
-        // Integers and uuid may be a key. uuid is the FIRST non-integer key type — its fixed
-        // uuid-raw16 encoding (spec/design/encoding.md §2.7) is exercised. The other non-integer
-        // types' order-preserving key encodings (text §2.4, decimal §2.5, bytea §2.6, boolean's
-        // bool-byte, composite §2.10) are authored but unexercised, so a text/decimal/bytea/boolean/
-        // composite PRIMARY KEY is a documented 0A000 narrowing (types.md §9/§11/§12/§13,
-        // composite.md §6), relaxable in a later in-key slice. timestamp / timestamptz are also
-        // allowed — they share the int64 int-be-signflip key encoding (exercised + byte-pinned,
-        // spec/design/timestamp.md §6).
-        if (!typeIsInteger(colType) && !typeIsUuid(colType) && !typeIsTimestamp(colType) && !typeIsTimestamptz(colType)) {
+        // Integers, boolean, and uuid may be a key. uuid is the first non-integer key type (fixed
+        // uuid-raw16, spec/design/encoding.md §2.7) and boolean the second (fixed 1-byte bool-byte,
+        // §2.9) — both exercised + byte-pinned. The remaining non-integer types' order-preserving
+        // key encodings (text §2.4, decimal §2.5, bytea §2.6, interval, float §2.8, composite §2.10)
+        // are authored but unexercised, so a text/decimal/bytea/interval/float/composite PRIMARY KEY
+        // is a documented 0A000 narrowing (types.md §11/§12/§13, composite.md §6), relaxable in a
+        // later in-key slice. timestamp / timestamptz are also allowed — they share the int64
+        // int-be-signflip key encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
+        if (
+          !typeIsInteger(colType) &&
+          !typeIsBoolean(colType) &&
+          !typeIsUuid(colType) &&
+          !typeIsTimestamp(colType) &&
+          !typeIsTimestamptz(colType)
+        ) {
           throw engineError(
             "feature_not_supported",
             "a " + typeCanonicalName(colType) + " primary key is not supported yet",
@@ -975,7 +982,13 @@ export class Database {
       }
       for (const i of indices) {
         const ty = columns[i]!.type;
-        if (!typeIsInteger(ty) && !typeIsUuid(ty) && !typeIsTimestamp(ty) && !typeIsTimestamptz(ty)) {
+        if (
+          !typeIsInteger(ty) &&
+          !typeIsBoolean(ty) &&
+          !typeIsUuid(ty) &&
+          !typeIsTimestamp(ty) &&
+          !typeIsTimestamptz(ty)
+        ) {
           throw engineError(
             "feature_not_supported",
             "a " + typeCanonicalName(ty) + " primary key is not supported yet",
@@ -1013,7 +1026,13 @@ export class Database {
       }
       for (const i of indices) {
         const ty = columns[i]!.type;
-        if (!typeIsInteger(ty) && !typeIsUuid(ty) && !typeIsTimestamp(ty) && !typeIsTimestamptz(ty)) {
+        if (
+          !typeIsInteger(ty) &&
+          !typeIsBoolean(ty) &&
+          !typeIsUuid(ty) &&
+          !typeIsTimestamp(ty) &&
+          !typeIsTimestamptz(ty)
+        ) {
           throw engineError(
             "feature_not_supported",
             "a " + typeCanonicalName(ty) + " unique constraint member is not supported yet",
@@ -1244,7 +1263,13 @@ export class Database {
         throw engineError("undefined_column", "column does not exist: " + name);
       }
       const ty = columns[idx]!.type;
-      if (!typeIsInteger(ty) && !typeIsUuid(ty) && !typeIsTimestamp(ty) && !typeIsTimestamptz(ty)) {
+      if (
+        !typeIsInteger(ty) &&
+        !typeIsBoolean(ty) &&
+        !typeIsUuid(ty) &&
+        !typeIsTimestamp(ty) &&
+        !typeIsTimestamptz(ty)
+      ) {
         throw engineError(
           "feature_not_supported",
           "a " + typeCanonicalName(ty) + " index column is not supported yet",
@@ -1725,13 +1750,17 @@ export class Database {
             // uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16,
             // encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
             parts.push(pkv.bytes.slice());
+          } else if (pkv.kind === "bool") {
+            // boolean is the second non-integer key: the bare 1-byte bool-byte (0x00 false /
+            // 0x01 true, encoding.md §2.9) — likewise no presence tag.
+            parts.push(encodeBool(pkv.value));
           } else if (pkv.kind === "int") {
             parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.int));
           } else if (pkv.kind === "timestamp" || pkv.kind === "timestamptz") {
             // A timestamp / timestamptz PK encodes its int64 instant (spec/design/timestamp.md §6).
             parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.micros));
           } else {
-            throw engineError("data_corrupted", "a primary key must be an integer, uuid, or timestamp value");
+            throw engineError("data_corrupted", "a primary key must be an integer, boolean, uuid, or timestamp value");
           }
         }
         const total = parts.reduce((acc, b) => acc + b.length, 0);
@@ -3275,6 +3304,8 @@ function indexEntryKey(columns: Column[], def: IndexDef, storageKey: Uint8Array,
       parts.push(Uint8Array.of(0x01));
     } else if (v.kind === "int") {
       parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.int));
+    } else if (v.kind === "bool") {
+      parts.push(Uint8Array.of(0x00), encodeBool(v.value));
     } else if (v.kind === "uuid") {
       parts.push(Uint8Array.of(0x00), v.bytes);
     } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
@@ -3306,6 +3337,8 @@ function indexPrefixKey(columns: Column[], def: IndexDef, row: Row): Uint8Array 
       return null;
     } else if (v.kind === "int") {
       parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.int));
+    } else if (v.kind === "bool") {
+      parts.push(Uint8Array.of(0x00), encodeBool(v.value));
     } else if (v.kind === "uuid") {
       parts.push(Uint8Array.of(0x00), v.bytes);
     } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
@@ -3405,6 +3438,8 @@ function isConstSource(e: RExpr, pkType: ScalarType): boolean {
       return true;
     case "constInt":
       return isInteger(pkType);
+    case "constBool":
+      return isBool(pkType);
     case "constUuid":
       return isUuid(pkType);
     case "constTimestamp":
@@ -3468,14 +3503,17 @@ function buildKeyBound(bp: PkBound, params: Value[], outer: Row[]): KeyBound | n
 }
 
 // encodeBoundKey encodes a const-source's value into the PK's storage key (the same codec INSERT uses —
-// encodeInt for integer/timestamp widths, the raw 16 bytes for uuid). param/outerColumn resolve to a
-// runtime Value first (the param table / the enclosing outer row) and then encode through the shared path.
+// encodeInt for integer/timestamp widths, the raw 16 bytes for uuid, the 1-byte bool-byte for boolean).
+// param/outerColumn resolve to a runtime Value first (the param table / the enclosing outer row) and
+// then encode through the shared path.
 function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[], outer: Row[]): BoundKey {
   switch (src.kind) {
     case "constNull":
       return { kind: "null" };
     case "constInt":
       return inRange(pkType, src.value) ? { kind: "key", key: encodeInt(pkType, src.value) } : { kind: "outOfRange" };
+    case "constBool":
+      return { kind: "key", key: encodeBool(src.value) };
     case "constUuid":
       return { kind: "key", key: src.value.slice() };
     case "constTimestamp":
@@ -3497,6 +3535,7 @@ function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[], outer: 
 // (or an integer outside the PK width) drops its half-bound, widening — still sound.
 function encodeValueKey(pkType: ScalarType, v: Value): BoundKey {
   if (v.kind === "null") return { kind: "null" };
+  if (v.kind === "bool") return { kind: "key", key: encodeBool(v.value) };
   if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
   if (v.kind === "int")
     return inRange(pkType, v.int) ? { kind: "key", key: encodeInt(pkType, v.int) } : { kind: "outOfRange" };

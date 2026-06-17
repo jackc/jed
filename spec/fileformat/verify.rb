@@ -185,11 +185,24 @@ TEXT_TABLE = {
 
 # A table with a boolean column: exercises the value codec's boolean branch (a single
 # bool-byte, 0x00 false / 0x01 true) plus a NULL boolean (the tag alone). The PK is an int32
-# (boolean is not allowed in a key this slice — spec/design/types.md §9).
+# (boolean as a value column; the boolean PRIMARY KEY case is BOOL_PK_TABLE below).
 BOOL_TABLE = {
   name: "t",
   columns: [col("id", "int32", pk: true), col("flag", "boolean")],
   rows: [[1, true], [2, false], [3, nil]]
+}.freeze
+
+# A table with a boolean PRIMARY KEY (the second non-integer stored key after uuid — the
+# bool-byte key encoding, encoding.md §2.9). The stored key is the bare 1-byte body (0x00 false /
+# 0x01 true — a PK is NOT NULL, so no presence tag), pinning the cross-core boolean key bytes; rows
+# are written in key (byte) order: false (0x00) then true (0x01). The nullable boolean value column
+# `v` covers a present and a NULL value. The cores build this via
+#   CREATE TABLE t (k boolean PRIMARY KEY, v boolean)
+#   INSERT (false, true); INSERT (true, NULL)
+BOOL_PK_TABLE = {
+  name: "t",
+  columns: [col("k", "boolean", pk: true), col("v", "boolean")],
+  rows: [[false, true], [true, nil]]
 }.freeze
 
 # A table with a decimal column: exercises the value codec's decimal branch (flags + u16 scale
@@ -468,6 +481,7 @@ FIXTURES = [
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
   { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
   { file: "bool_table.jed",      page_size: 256, tables: [BOOL_TABLE] },
+  { file: "bool_pk_table.jed",   page_size: 256, tables: [BOOL_PK_TABLE] },
   { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
   { file: "uuid_table.jed",      page_size: 256, tables: [UUID_TABLE] },
@@ -531,6 +545,18 @@ end
 
 def decode_int(width, bytes)
   bytes.bytes.reduce(0) { |acc, b| (acc << 8) | b } - (1 << (width * 8 - 1))
+end
+
+# The BARE order-preserving KEY body for one present (non-NULL) value of `type` — no presence
+# tag (callers add it for nullable index slots; a PK member is NOT NULL). uuid is the 16 raw
+# bytes (uuid-raw16, §2.7), boolean a single bool-byte (0x00 false / 0x01 true, §2.9), every
+# other keyable type the sign-flipped fixed-width int encoding (timestamps reuse the int64 rule).
+def key_body(type, v)
+  case type
+  when "uuid" then uuid_to_bytes(v)
+  when "boolean" then (v ? "\x01".b : "\x00".b)
+  else encode_int(WIDTH.fetch(type), v)
+  end
 end
 
 # value codec: presence tag + (when present) the type's body. 0x01 = NULL; 0x00 = present.
@@ -829,16 +855,7 @@ def table_entries(table)
     key = if pk_idxs.empty?
             encode_int(8, i)
           else
-            pk_idxs.map do |pi|
-              pk_type = table[:columns][pi][:type]
-              # uuid is the bare 16 bytes (uuid-raw16), not the sign-flipped int encoding;
-              # a PK member is NOT NULL, so no presence tag either way.
-              if pk_type == "uuid"
-                uuid_to_bytes(row[pi])
-              else
-                encode_int(WIDTH.fetch(pk_type), row[pi])
-              end
-            end.join.b
+            pk_idxs.map { |pi| key_body(table[:columns][pi][:type], row[pi]) }.join.b
           end
     [key, row]
   end
@@ -855,9 +872,8 @@ def index_entry_key(table, ix, storage_key, row)
     if v.nil?
       out << "\x01".b
     else
-      type = table[:columns][ci][:type]
       out << "\x00".b
-      out << (type == "uuid" ? uuid_to_bytes(v) : encode_int(WIDTH.fetch(type), v))
+      out << key_body(table[:columns][ci][:type], v)
     end
   end
   out << storage_key

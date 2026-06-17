@@ -250,7 +250,7 @@ description = "text scalar type (variable-width UTF-8, collation C): storage, li
 
 [[capability]]
 id = "types.boolean_storable"
-description = "storable boolean column: CREATE/INSERT/SELECT of false/true/NULL, boolean×boolean comparison and ORDER BY (false < true). Non-key column only — a boolean PRIMARY KEY is rejected 0A000; boolean⇄integer casts are deferred (spec/design/types.md §9)"
+description = "storable boolean column: CREATE/INSERT/SELECT of false/true/NULL, boolean×boolean comparison and ORDER BY (false < true). boolean is also a KEY type — a boolean PRIMARY KEY / composite-key member / secondary index uses the `bool-byte` key encoding (0x00 false < 0x01 true, the second non-integer key after uuid; spec/design/encoding.md §2.9), with point lookup, 23505 on a duplicate key, and 23502 on a NULL key. boolean⇄integer casts stay deferred (spec/design/types.md §9)"
 
 [[capability]]
 id = "types.decimal"

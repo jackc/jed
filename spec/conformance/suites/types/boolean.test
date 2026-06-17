@@ -1,9 +1,10 @@
 # Storable boolean column (spec/design/types.md §9): CREATE/INSERT/store/retrieve of
 # false/true/NULL, boolean×boolean equality and ordering (false < true), and NULL under
 # three-valued logic. A boolean renders as the canonical `true`/`false` under the `B` tag,
-# and a NULL/unknown boolean as `NULL`. boolean is a NON-key column this slice — a boolean
-# PRIMARY KEY is rejected 0A000, and CAST(x AS boolean) is likewise deferred (0A000), both
-# documented narrowings. Format + the `requires` gate: ../../../design/conformance.md.
+# and a NULL/unknown boolean as `NULL`. boolean is ALSO a KEY type — a boolean PRIMARY KEY /
+# index uses the `bool-byte` key encoding (the second non-integer key after uuid; encoding.md
+# §2.9), exercised below. CAST(x AS boolean) stays deferred (0A000), a documented narrowing.
+# Format + the `requires` gate: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.int32, types.boolean, types.boolean_storable, resource.cost_metering
 
 statement ok
@@ -139,9 +140,63 @@ INSERT INTO t VALUES (6, 1)
 statement error 42804
 INSERT INTO t VALUES (TRUE, TRUE)
 
-# boolean in a PRIMARY KEY is rejected this slice (documented narrowing): 0A000
-statement error 0A000
-CREATE TABLE bad (k boolean PRIMARY KEY)
+# --- boolean as a KEY (encoding.md §2.9): a boolean PRIMARY KEY is SUPPORTED ------------------
+# The stored key is the bare `bool-byte` (0x00 false < 0x01 true; a PK is NOT NULL, so no
+# presence tag). A boolean key admits at most two distinct rows — well-defined, if rarely useful.
+statement ok
+CREATE TABLE bk (k boolean PRIMARY KEY, label text)
+
+statement ok
+INSERT INTO bk VALUES (TRUE, 'yes'), (FALSE, 'no')
+
+# point lookup on the boolean PK (key-encoded equality) resolves the matching row
+query T nosort
+SELECT label FROM bk WHERE k = TRUE
+----
+yes
+
+query T nosort
+SELECT label FROM bk WHERE k = FALSE
+----
+no
+
+# a duplicate boolean PK is a unique violation (23505) — only two keys exist
+statement error 23505
+INSERT INTO bk VALUES (TRUE, 'again')
+
+# a NULL boolean PK is rejected NOT NULL (23502), like any primary key
+statement error 23502
+INSERT INTO bk VALUES (NULL, 'null')
+
+# a full scan iterates in key (byte) order: false (0x00) before true (0x01)
+query BT nosort
+SELECT k, label FROM bk
+----
+false
+no
+true
+yes
+
+# a boolean member of a COMPOSITE primary key concatenates with the leading int32 component;
+# (1,false) and (1,true) are distinct keys, and key order is a-ascending then false<true
+statement ok
+CREATE TABLE ck (a int32, b boolean, v int32, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO ck VALUES (1, TRUE, 10), (1, FALSE, 20), (2, FALSE, 30)
+
+statement error 23505
+INSERT INTO ck VALUES (1, FALSE, 99)
+
+query IB nosort
+SELECT a, b FROM ck
+----
+1
+false
+1
+true
+2
+false
 
 # casting TO boolean is deferred this slice (documented narrowing): 0A000
 statement error 0A000

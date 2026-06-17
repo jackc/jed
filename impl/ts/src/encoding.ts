@@ -64,6 +64,15 @@ export function decodeIntAt(t: ScalarType, b: Uint8Array, off: number): bigint {
   return BigInt(u - 2 ** (width * 8 - 1));
 }
 
+// encodeBool encodes a non-null boolean to its order-preserving key body: a single bool-byte,
+// 0x00 for false < 0x01 for true (method bool-byte, spec/design/encoding.md §2.9). Fixed-width 1,
+// so self-delimiting with no sign-flip / escape / terminator — like uuid. Byte-identical to the
+// boolean value-codec body (a stored boolean reuses these bytes behind the §2.2 presence tag —
+// spec/fileformat/format.md). A PK is NOT NULL, so no presence tag.
+export function encodeBool(value: boolean): Uint8Array {
+  return new Uint8Array([value ? 0x01 : 0x00]);
+}
+
 // encodeNullable encodes a nullable key slot: a 1-byte presence tag (0x00 present, 0x01
 // NULL), with the value bytes following the tag when present. Because 0x00 < 0x01,
 // present values sort before NULL, so NULLs sort LAST in ascending order; descending

@@ -162,13 +162,19 @@ export function scalarTypeFromName(name: string): ScalarType | undefined {
   }
 }
 
-// widthBytes is the fixed storage width in bytes (the key-encoding / value-codec width for the
-// fixed-width types: the three integers and uuid (16)). text/decimal/bytea are variable-width
-// and throw — they carry their own length (spec/fileformat/format.md). uuid is the first
-// non-integer fixed-width type; callers branch on isUuid before the integer decode path, since
-// decodeInt would sign-flip its bytes.
+// widthBytes is the fixed storage width in bytes (the KEY-encoding width — the bare key body,
+// no presence tag — for the fixed-width keyable types: the three integers, the two int64
+// timestamps, uuid (16), and boolean (1 — the bool-byte key, spec/design/encoding.md §2.9)).
+// Used by the index tail-slot skip (each self-delimiting component is 0x01 NULL or 0x00 + this
+// many bytes). text/decimal/bytea/interval are variable-width / non-key and throw — they carry
+// their own length (spec/fileformat/format.md). uuid is the first non-integer fixed-width key
+// type; callers branch on isUuid before the integer decode path, since decodeInt would sign-flip
+// its bytes. (boolean's VALUE codec has its own 1-byte branch and never reaches here; this width
+// is the key path only.)
 export function widthBytes(t: ScalarType): number {
   switch (t) {
+    case "boolean":
+      return 1;
     case "int16":
       return 2;
     case "int32":
@@ -191,8 +197,6 @@ export function widthBytes(t: ScalarType): number {
       return 8;
     case "text":
       throw new Error("text is variable-width; widthBytes is integer-only");
-    case "boolean":
-      throw new Error("boolean uses the bool-byte codec; widthBytes is integer-only");
     case "decimal":
       throw new Error("decimal is variable-width; widthBytes is integer-only");
     case "bytea":
@@ -401,6 +405,9 @@ export function typeIsInteger(t: Type): boolean {
 }
 export function typeIsDecimal(t: Type): boolean {
   return t.kind === "scalar" && isDecimal(t.scalar);
+}
+export function typeIsBoolean(t: Type): boolean {
+  return t.kind === "scalar" && isBool(t.scalar);
 }
 export function typeIsUuid(t: Type): boolean {
   return t.kind === "scalar" && isUuid(t.scalar);

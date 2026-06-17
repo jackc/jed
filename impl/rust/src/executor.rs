@@ -16,7 +16,7 @@ use crate::catalog::{
 use crate::cost::Meter;
 use crate::costs::COSTS;
 use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
-use crate::encoding::encode_int;
+use crate::encoding::{encode_bool, encode_int};
 use crate::error::{EngineError, Result, SqlState};
 use crate::interval::{self, Interval, parse_interval};
 use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc};
@@ -979,15 +979,21 @@ impl Database {
                 ));
             };
             if def.primary_key {
-                // Integers and uuid may be a key. uuid is the FIRST non-integer key type — its
-                // fixed `uuid-raw16` encoding (spec/design/encoding.md §2.7) is exercised. The
-                // other non-integer types' order-preserving key encodings (text §2.4, decimal
-                // §2.5, bytea §2.6, boolean's bool-byte) are authored but unexercised, so a
-                // text/decimal/bytea/boolean PRIMARY KEY is a documented 0A000 narrowing
-                // (spec/design/types.md §9/§11/§12/§13), relaxable in a later in-key slice.
+                // Integers, boolean, and uuid may be a key. uuid is the first non-integer key
+                // type (fixed `uuid-raw16`, spec/design/encoding.md §2.7) and boolean the second
+                // (fixed 1-byte `bool-byte`, §2.9) — both exercised + byte-pinned. The remaining
+                // non-integer types' order-preserving key encodings (text §2.4, decimal §2.5,
+                // bytea §2.6, interval, float §2.8) are authored but unexercised, so a
+                // text/decimal/bytea/interval/float PRIMARY KEY is a documented 0A000 narrowing
+                // (spec/design/types.md §11/§12/§13), relaxable in a later in-key slice.
                 // timestamp / timestamptz are also allowed — they share the int64 `int-be-signflip`
                 // key encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
-                if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
+                if !ty.is_integer()
+                    && !ty.is_bool()
+                    && !ty.is_uuid()
+                    && !ty.is_timestamp()
+                    && !ty.is_timestamptz()
+                {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         format!("a {} primary key is not supported yet", ty.canonical_name()),
@@ -1117,7 +1123,12 @@ impl Database {
             }
             for &i in &indices {
                 let ty = &columns[i].ty;
-                if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
+                if !ty.is_integer()
+                    && !ty.is_bool()
+                    && !ty.is_uuid()
+                    && !ty.is_timestamp()
+                    && !ty.is_timestamptz()
+                {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         format!("a {} primary key is not supported yet", ty.canonical_name()),
@@ -1159,7 +1170,12 @@ impl Database {
             }
             for &i in &indices {
                 let ty = &columns[i].ty;
-                if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
+                if !ty.is_integer()
+                    && !ty.is_bool()
+                    && !ty.is_uuid()
+                    && !ty.is_timestamp()
+                    && !ty.is_timestamptz()
+                {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         format!(
@@ -1498,7 +1514,12 @@ impl Database {
                 )
             })?;
             let ty = &columns[idx].ty;
-            if !ty.is_integer() && !ty.is_uuid() && !ty.is_timestamp() && !ty.is_timestamptz() {
+            if !ty.is_integer()
+                && !ty.is_bool()
+                && !ty.is_uuid()
+                && !ty.is_timestamp()
+                && !ty.is_timestamptz()
+            {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     format!(
@@ -2148,6 +2169,9 @@ impl Database {
                         // uuid is the first non-integer key: its key is the bare 16 bytes
                         // (uuid-raw16, encoding.md §2.7) — a PK is NOT NULL, so no presence tag.
                         Value::Uuid(u) => k.extend_from_slice(u),
+                        // boolean is the second non-integer key: the bare 1-byte `bool-byte`
+                        // (0x00 false / 0x01 true, encoding.md §2.9) — likewise no presence tag.
+                        Value::Bool(b) => k.extend_from_slice(&encode_bool(*b)),
                         // A timestamp / timestamptz PRIMARY KEY is supported: its key bytes are
                         // the int64 instant codec (spec/design/timestamp.md §6).
                         Value::Timestamp(m) | Value::Timestamptz(m) => {
@@ -2155,10 +2179,6 @@ impl Database {
                         }
                         // Unreachable: a PK column is NOT NULL, enforced above.
                         Value::Null => unreachable!("primary key column is NOT NULL"),
-                        // Unreachable: a boolean PRIMARY KEY is rejected at CREATE TABLE (0A000).
-                        Value::Bool(_) => {
-                            unreachable!("a boolean primary key is rejected at CREATE TABLE")
-                        }
                         // Unreachable: a text/decimal/bytea/interval/float PRIMARY KEY is rejected
                         // at CREATE TABLE (0A000) — those non-integer PKs are caught by the gate.
                         Value::Text(_)
@@ -5265,6 +5285,7 @@ struct SelectPlan {
 /// scan", grammar.md §26).
 enum BoundSrc {
     Int(i64),
+    Bool(bool),
     Uuid([u8; 16]),
     Timestamp(i64),
     Null,
@@ -5374,6 +5395,7 @@ fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: 
                 let ty = columns[ci].ty.scalar();
                 match v {
                     Value::Int(n) => out.extend_from_slice(&encode_int(ty, *n)),
+                    Value::Bool(b) => out.extend_from_slice(&encode_bool(*b)),
                     Value::Uuid(u) => out.extend_from_slice(u),
                     Value::Timestamp(m) | Value::Timestamptz(m) => {
                         out.extend_from_slice(&encode_int(ty, *m))
@@ -5403,6 +5425,7 @@ fn index_prefix_key(columns: &[Column], def: &IndexDef, row: &Row) -> Option<Vec
                 let ty = columns[ci].ty.scalar();
                 match v {
                     Value::Int(n) => out.extend_from_slice(&encode_int(ty, *n)),
+                    Value::Bool(b) => out.extend_from_slice(&encode_bool(*b)),
                     Value::Uuid(u) => out.extend_from_slice(u),
                     Value::Timestamp(m) | Value::Timestamptz(m) => {
                         out.extend_from_slice(&encode_int(ty, *m))
@@ -5498,6 +5521,7 @@ fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
         RExpr::Param(i) => Some(BoundSrc::Param(*i)),
         RExpr::ConstNull => Some(BoundSrc::Null),
         RExpr::ConstInt(n) if pk_type.is_integer() => Some(BoundSrc::Int(*n)),
+        RExpr::ConstBool(b) if pk_type.is_bool() => Some(BoundSrc::Bool(*b)),
         RExpr::ConstUuid(u) if pk_type.is_uuid() => Some(BoundSrc::Uuid(*u)),
         RExpr::ConstTimestamp(m) if pk_type.is_timestamp() => Some(BoundSrc::Timestamp(*m)),
         RExpr::ConstTimestamptz(m) if pk_type.is_timestamptz() => Some(BoundSrc::Timestamp(*m)),
@@ -5548,8 +5572,9 @@ fn build_key_bound(bp: &PkBound, params: &[Value], outer: &[&[Value]]) -> Option
 }
 
 /// Encode a const-source's value into the PK's storage key (the same codec INSERT uses — `encode_int`
-/// for integer/timestamp widths, the raw 16 bytes for uuid). `Param`/`Outer` resolve to a runtime
-/// `Value` first (the param table / the enclosing outer row) and then encode through the shared path.
+/// for integer/timestamp widths, the raw 16 bytes for uuid, the 1-byte `bool-byte` for boolean).
+/// `Param`/`Outer` resolve to a runtime `Value` first (the param table / the enclosing outer row)
+/// and then encode through the shared path.
 fn encode_bound_key(
     pk_ty: ScalarType,
     src: &BoundSrc,
@@ -5565,6 +5590,7 @@ fn encode_bound_key(
                 BoundKey::OutOfRange
             }
         }
+        BoundSrc::Bool(b) => BoundKey::Key(encode_bool(*b)),
         BoundSrc::Uuid(u) => BoundKey::Key(u.to_vec()),
         BoundSrc::Timestamp(m) => BoundKey::Key(encode_int(pk_ty, *m)),
         BoundSrc::Param(i) => encode_value_key(pk_ty, &params[*i]),
@@ -5582,6 +5608,7 @@ fn encode_bound_key(
 fn encode_value_key(pk_ty: ScalarType, v: &Value) -> BoundKey {
     match v {
         Value::Null => BoundKey::Null,
+        Value::Bool(b) => BoundKey::Key(encode_bool(*b)),
         Value::Uuid(u) => BoundKey::Key(u.to_vec()),
         Value::Int(n) => {
             if pk_ty.in_range(*n) {
@@ -10248,7 +10275,7 @@ fn missing_from_entry(qualifier: &str) -> EngineError {
 /// resolve here; a genuinely unknown name is a 42704. A type modifier is meaningful only for
 /// decimal (validated to `numeric(p,s)` — 22023); on any other type it is `0A000` (varchar(n)
 /// and other parameterized types are deferred — spec/design/grammar.md §14). Type-specific
-/// narrowings (a text/boolean/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the
+/// narrowings (a text/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the
 /// call site, not here.
 fn resolve_type_and_typmod(
     name: &str,

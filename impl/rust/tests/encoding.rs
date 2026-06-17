@@ -2,12 +2,14 @@
 //! spec/encoding/integers.toml (CLAUDE.md §8). This is what guarantees the Rust and
 //! Go cores iterate keys in the same order. TOML is a test-time-only dependency.
 //!
-//! The file also carries the first NON-integer key vectors, `uuid` (method `uuid-raw16`):
-//! a uuid key is the bare 16 bytes — exactly what `parse_uuid` produces and the executor
-//! stores for a uuid PRIMARY KEY (encoding.md §2.7). The nullable/descending uuid vectors
-//! follow the shared §2.2/§2.3 framing (presence tag, one's-complement).
+//! The file also carries the NON-integer key vectors `uuid` (method `uuid-raw16`): a uuid key
+//! is the bare 16 bytes — exactly what `parse_uuid` produces and the executor stores for a uuid
+//! PRIMARY KEY (encoding.md §2.7) — and `boolean` (method `bool-byte`, §2.9): a single byte
+//! 0x00 false / 0x01 true, what `encode_bool` produces and the executor stores for a boolean
+//! PRIMARY KEY. The nullable/descending vectors follow the shared §2.2/§2.3 framing (presence
+//! tag, one's-complement).
 
-use jed::encoding::{decode_int, encode_int, encode_nullable};
+use jed::encoding::{decode_int, encode_bool, encode_int, encode_nullable};
 use jed::types::ScalarType;
 use jed::value::{Value, parse_uuid};
 use std::path::Path;
@@ -46,6 +48,16 @@ fn nullable_uuid(case: &toml::Value) -> Vec<u8> {
     out
 }
 
+/// The nullable key slot for a boolean case: `0x01` for NULL, else `0x00` + the 1-byte body.
+fn nullable_bool(case: &toml::Value) -> Vec<u8> {
+    if is_null(case) {
+        return vec![0x01];
+    }
+    let mut out = vec![0x00];
+    out.extend_from_slice(&encode_bool(case["value"].as_bool().unwrap()));
+    out
+}
+
 #[test]
 fn bare_vectors_match_and_roundtrip() {
     let v: toml::Value = toml::from_str(&spec("encoding/integers.toml")).unwrap();
@@ -64,6 +76,13 @@ fn bare_vectors_match_and_roundtrip() {
                     value,
                     "uuid round-trip {value}"
                 );
+                continue;
+            }
+            if name == "boolean" {
+                // A boolean key is the single `bool-byte` (0x00 false / 0x01 true) that
+                // `encode_bool` produces and the executor stores for a boolean PRIMARY KEY.
+                let value = case["value"].as_bool().unwrap();
+                assert_eq!(hex(&encode_bool(value)), want, "boolean value {value}");
                 continue;
             }
             let t = ty(name);
@@ -86,6 +105,10 @@ fn nullable_vectors_match() {
                 assert_eq!(hex(&nullable_uuid(case)), want, "nullable uuid");
                 continue;
             }
+            if name == "boolean" {
+                assert_eq!(hex(&nullable_bool(case)), want, "nullable boolean");
+                continue;
+            }
             let t = ty(name);
             let value = if is_null(case) {
                 None
@@ -106,6 +129,14 @@ fn descending_is_inverted_nullable() {
             let want = case["bytes"].as_str().unwrap();
             if name == "uuid" {
                 assert_eq!(hex(&invert(&nullable_uuid(case))), want, "descending uuid");
+                continue;
+            }
+            if name == "boolean" {
+                assert_eq!(
+                    hex(&invert(&nullable_bool(case))),
+                    want,
+                    "descending boolean"
+                );
                 continue;
             }
             let t = ty(name);

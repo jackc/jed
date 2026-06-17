@@ -199,8 +199,8 @@ fn text_table_db() -> Database {
 }
 
 /// A table with a boolean column — exercises the value codec's boolean branch (a single
-/// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (no boolean
-/// key this slice).
+/// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (the boolean
+/// PRIMARY KEY case is `bool_pk_table_db`).
 fn bool_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
@@ -210,6 +210,19 @@ fn bool_table_db() -> Database {
     run(&mut db, "INSERT INTO t VALUES (1, TRUE)");
     run(&mut db, "INSERT INTO t VALUES (2, FALSE)");
     run(&mut db, "INSERT INTO t VALUES (3, NULL)");
+    db
+}
+
+/// A table with a boolean PRIMARY KEY (the second golden with a NON-integer stored key, after
+/// uuid) — the `bool-byte` key encoding (bare 1 byte 0x00 false / 0x01 true, no presence tag
+/// since a PK is NOT NULL, spec/design/encoding.md §2.9), plus a nullable boolean value column.
+/// Rows go in via INSERT and the store sorts them into key (byte) order: false (0x00) then true
+/// (0x01). Must match spec/fileformat/verify.rb's BOOL_PK_TABLE.
+fn bool_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (k boolean PRIMARY KEY, v boolean)");
+    run(&mut db, "INSERT INTO t VALUES (FALSE, TRUE)");
+    run(&mut db, "INSERT INTO t VALUES (TRUE, NULL)");
     db
 }
 
@@ -542,6 +555,7 @@ fn write_matches_goldens() {
         ("pk_table.jed", pk_table_db),
         ("text_table.jed", text_table_db),
         ("bool_table.jed", bool_table_db),
+        ("bool_pk_table.jed", bool_pk_table_db),
         ("decimal_table.jed", decimal_table_db),
         ("bytea_table.jed", bytea_table_db),
         ("uuid_table.jed", uuid_table_db),
@@ -579,6 +593,7 @@ fn read_goldens_reproduces_rows() {
         ("pk_table.jed", pk_table_db, "t"),
         ("text_table.jed", text_table_db, "t"),
         ("bool_table.jed", bool_table_db, "t"),
+        ("bool_pk_table.jed", bool_pk_table_db, "t"),
         ("decimal_table.jed", decimal_table_db, "t"),
         ("bytea_table.jed", bytea_table_db, "t"),
         ("uuid_table.jed", uuid_table_db, "t"),

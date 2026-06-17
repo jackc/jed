@@ -846,7 +846,8 @@ the interior-node format and the split contract.
 | `one_table_empty.jed` | one table, zero rows (`root_data_page = 0`) |
 | `pk_table.jed` | an int PK table whose rows force a **3-node tree** (interior root + two leaves) at page 256 — the load-bearing interior-node + split proof; includes a NULL value in a row |
 | `text_table.jed` | a text column — the value codec's text branch; empty string, embedded quote, multi-byte + astral chars, a NULL (single leaf) |
-| `bool_table.jed` | a boolean column — the `bool-byte` branch (single leaf) |
+| `bool_table.jed` | a boolean column — the `bool-byte` value branch (single leaf) |
+| `bool_pk_table.jed` | a **boolean PRIMARY KEY** (the second non-integer stored key — the `bool-byte` key, `00`/`01`, no presence tag) + a nullable boolean column; rows in key order (false then true) |
 | `decimal_table.jed` | a `decimal` column — the decimal branch + per-column `numeric(p,s)` typmod; positive/negative/zero/multi-group/NULL |
 | `bytea_table.jed` | a bytea column — the bytea branch; empty value, embedded `0x00`, a high byte, a NULL |
 | `uuid_table.jed` | a **uuid PRIMARY KEY** (the first non-integer stored key — the §8 cross-core key-path proof) + a nullable uuid column |

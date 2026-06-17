@@ -12,9 +12,11 @@
 /// `bool`) stores false/true behind the value codec's 1-byte `bool-byte` body (types.md §9).
 /// `decimal` (aliases `numeric`/`dec`) is the exact base-10 numeric (decimal.md). `bytea` is a
 /// variable-width binary string (raw bytes), compared by unsigned byte order — §13. The
-/// integer-only accessors (`width_bytes`/`min`/`max`/`rank`/`in_range`) panic on
-/// `Text`/`Bool`/`Decimal`/`Bytea`; callers route those through their own paths (the value
-/// codec, the comparators), never these, so the panic is an internal-invariant guard.
+/// integer accessors `min`/`max`/`rank`/`in_range` panic on the non-integer types; `width_bytes`
+/// covers every fixed-width KEYABLE type (the integers, `uuid` → 16, `boolean` → 1, the int64
+/// timestamps, the floats) but panics on the variable-width / non-key `Text`/`Decimal`/`Bytea`/
+/// `Interval`. Callers route the panicking cases through their own paths (the value codec, the
+/// comparators), never these, so the panic is an internal-invariant guard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScalarType {
     Int16,
@@ -28,7 +30,8 @@ pub enum ScalarType {
     /// Variable-width binary string (raw bytes), compared by unsigned byte order — types.md §13.
     Bytea,
     /// Fixed 16-byte value (RFC 4122), compared by unsigned byte order — types.md §14. The first
-    /// non-integer type usable as a key; `width_bytes` returns 16 (it is genuinely fixed-width).
+    /// non-integer type usable as a key (`boolean` is the second); `width_bytes` returns 16 (it is
+    /// genuinely fixed-width).
     Uuid,
     /// Zoneless wall clock, int64 microseconds since the Unix epoch (spec/design/timestamp.md).
     Timestamp,
@@ -158,13 +161,18 @@ impl ScalarType {
         )
     }
 
-    /// Fixed storage width in bytes (the key-encoding / value-codec width for the fixed-width
-    /// types): the three integers, the two `int64`-microsecond timestamps (which reuse the int64
-    /// codec — spec/design/timestamp.md), and `uuid` (16 bytes). The variable-width `text`/`bytea`
-    /// and the self-describing `boolean`/`decimal` are never serialized through this path
-    /// (spec/fileformat/format.md), so calling it on them is a bug.
+    /// Fixed storage width in bytes (the KEY-encoding width — the bare key body, no presence tag —
+    /// for the fixed-width keyable types): the three integers, the two `int64`-microsecond
+    /// timestamps (which reuse the int64 codec — spec/design/timestamp.md), `uuid` (16 bytes), and
+    /// `boolean` (1 byte — the `bool-byte` key, spec/design/encoding.md §2.9). Used by the index
+    /// tail-slot skip (each self-delimiting component is `0x01` NULL or `0x00` + this many bytes).
+    /// The variable-width `text`/`bytea` and the self-describing `decimal`/`interval` are never
+    /// keys / never serialized through this path (spec/fileformat/format.md), so calling it on
+    /// them is a bug. (boolean's VALUE codec has its own 1-byte branch and likewise never reaches
+    /// here; this width is the key path only.)
     pub fn width_bytes(self) -> usize {
         match self {
+            ScalarType::Bool => 1,
             ScalarType::Int16 => 2,
             ScalarType::Int32 => 4,
             ScalarType::Int64 | ScalarType::Timestamp | ScalarType::Timestamptz => 8,
@@ -173,13 +181,9 @@ impl ScalarType {
             // codec writes the IEEE bytes big-endian, no length prefix (spec/fileformat/format.md).
             ScalarType::Float32 => 4,
             ScalarType::Float64 => 8,
-            ScalarType::Text
-            | ScalarType::Bool
-            | ScalarType::Decimal
-            | ScalarType::Bytea
-            | ScalarType::Interval => {
+            ScalarType::Text | ScalarType::Decimal | ScalarType::Bytea | ScalarType::Interval => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/interval are not serialized through the fixed-width integer codec; width_bytes covers integers + uuid + timestamps + floats"
+                    "text/decimal/bytea/interval are not serialized through the fixed-width codec; width_bytes covers integers + uuid + boolean + timestamps + floats"
                 )
             }
         }
@@ -381,6 +385,9 @@ impl Type {
     }
     pub fn is_decimal(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_decimal())
+    }
+    pub fn is_bool(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_bool())
     }
     pub fn is_uuid(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_uuid())

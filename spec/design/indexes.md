@@ -29,12 +29,14 @@ DROP INDEX name
   allows it (oracle-probed), and rejecting it would be a gratuitous divergence. (Contrast
   the composite `PRIMARY KEY`, where PG itself rejects a duplicate member, 42701 —
   [constraints.md §3](constraints.md).)
-- **Indexable types = key-encodable types**: the integer widths, `uuid`, `timestamp`,
-  `timestamptz` — exactly the types a `PRIMARY KEY` accepts today. A `text` / `decimal` /
-  `bytea` / `boolean` key column is rejected `0A000` (the same documented narrowing as
-  for PK, lifted per type when its order-preserving key encoding is exercised —
-  [encoding.md §2.4–§2.6](encoding.md)). **Unlike a PK member, an indexed column may be
-  nullable** — this is the first exercise of the encoding.md §2.2 presence tag (§3).
+- **Indexable types = key-encodable types**: the integer widths, `boolean`, `uuid`,
+  `timestamp`, `timestamptz` — exactly the types a `PRIMARY KEY` accepts today. A `text` /
+  `decimal` / `bytea` / `interval` / `float` key column is rejected `0A000` (the same documented
+  narrowing as for PK, lifted per type when its order-preserving key encoding is exercised —
+  [encoding.md §2.4–§2.6](encoding.md); `boolean`'s `bool-byte` key, §2.9, has since lifted).
+  **Unlike a PK member, an indexed column may be nullable** — this is the first exercise of the
+  encoding.md §2.2 presence tag (§3); for a nullable boolean index the slot is `00 00`/`00 01`
+  present, `01` NULL.
 - **Indexing the PK column is legal** (pointless but harmless, as in PG).
 
 ## 2. DDL semantics (PG-matched, oracle-probed)

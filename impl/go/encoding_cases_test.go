@@ -15,12 +15,13 @@ import (
 )
 
 type encCase struct {
-	kind     string // "bare" | "nullable" | "descending"
-	typ      string
-	value    int64
-	strValue string // a quoted value (uuid's canonical string); empty for integer cases
-	isNull   bool
-	bytes    string
+	kind      string // "bare" | "nullable" | "descending"
+	typ       string
+	value     int64
+	strValue  string // a quoted value (uuid's canonical string); empty for integer cases
+	boolValue bool   // an unquoted true/false value (boolean's bool-byte cases)
+	isNull    bool
+	bytes     string
 }
 
 func readEncodingCases(t *testing.T, path string) []encCase {
@@ -62,6 +63,15 @@ func nullableUUIDBytes(c encCase) []byte {
 	return append([]byte{0x00}, b...)
 }
 
+// nullableBoolBytes builds the nullable key slot for a boolean case: 0x01 for NULL, else
+// 0x00 + the 1-byte bool-byte (encoding.md §2.2/§2.9).
+func nullableBoolBytes(c encCase) []byte {
+	if c.isNull {
+		return []byte{0x01}
+	}
+	return append([]byte{0x00}, EncodeBool(c.boolValue)...)
+}
+
 // parseEncCaseLine parses one `{ value = N, bytes = "hex" },` or
 // `{ null = true, bytes = "hex" },` inline-table line.
 func parseEncCaseLine(line, kind, typ string) (encCase, bool) {
@@ -85,10 +95,14 @@ func parseEncCaseLine(line, kind, typ string) (encCase, bool) {
 		v = strings.TrimSpace(v)
 		switch k {
 		case "value":
-			// A quoted value is a uuid's canonical string; an unquoted one is an integer.
-			if strings.HasPrefix(v, "\"") {
+			// A quoted value is a uuid's canonical string; an unquoted true/false is a
+			// boolean's bool-byte value; any other unquoted value is an integer.
+			switch {
+			case strings.HasPrefix(v, "\""):
 				c.strValue = unquote(v)
-			} else {
+			case v == "true" || v == "false":
+				c.boolValue = v == "true"
+			default:
 				n, err := strconv.ParseInt(v, 10, 64)
 				if err != nil {
 					return encCase{}, false

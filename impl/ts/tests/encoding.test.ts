@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { decodeInt, encodeInt, encodeNullable } from "../src/encoding.ts";
+import { decodeInt, encodeBool, encodeInt, encodeNullable } from "../src/encoding.ts";
 import { scalarTypeFromName } from "../src/types.ts";
 import { parseUuid, render, uuidValue } from "../src/value.ts";
 import { type EncCase, readEncodingCases, specPath } from "./tomlmini.ts";
@@ -27,6 +27,15 @@ function uuidBytes(c: EncCase): Uint8Array {
 function nullableUuid(c: EncCase): Uint8Array {
   if (c.isNull) return new Uint8Array([0x01]);
   const b = uuidBytes(c);
+  const out = new Uint8Array(1 + b.length);
+  out.set(b, 1);
+  return out;
+}
+
+// nullableBool is the nullable key slot for a boolean case: 0x01 NULL, else 0x00 + the 1-byte body.
+function nullableBool(c: EncCase): Uint8Array {
+  if (c.isNull) return new Uint8Array([0x01]);
+  const b = encodeBool(c.boolValue);
   const out = new Uint8Array(1 + b.length);
   out.set(b, 1);
   return out;
@@ -55,6 +64,24 @@ test("encoding vectors match spec/encoding/integers.toml", () => {
           break;
       }
       assert.equal(bytesToHex(got!), c.bytes, `${c.kind} uuid value=${c.strValue} null=${c.isNull}`);
+      checked++;
+      continue;
+    }
+    if (c.typ === "boolean") {
+      // boolean is the second non-integer key: a single bool-byte (0x00 false / 0x01 true,
+      // encoding.md §2.9); nullable/descending use the shared presence-tag / inversion framing.
+      switch (c.kind) {
+        case "bare":
+          got = encodeBool(c.boolValue);
+          break;
+        case "nullable":
+          got = nullableBool(c);
+          break;
+        case "descending":
+          got = invertBytes(nullableBool(c));
+          break;
+      }
+      assert.equal(bytesToHex(got!), c.bytes, `${c.kind} boolean value=${c.boolValue} null=${c.isNull}`);
       checked++;
       continue;
     }

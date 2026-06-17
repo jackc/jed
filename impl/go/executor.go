@@ -837,19 +837,22 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			return Outcome{}, NewError(UndefinedObject, "type does not exist: "+def.TypeName)
 		}
 		if def.PrimaryKey {
-			// Integers and uuid may be a key. uuid is the FIRST non-integer key type — its
-			// fixed uuid-raw16 encoding (spec/design/encoding.md §2.7) is exercised. The other
-			// non-integer types' order-preserving key encodings (text §2.4, decimal §2.5,
-			// bytea §2.6, boolean's bool-byte) are authored but unexercised, so a
-			// text/decimal/bytea/boolean/composite PRIMARY KEY is a documented 0A000 narrowing
-			// (types.md §9/§11/§12/§13; composite.md §6), relaxable in a later in-key slice.
+			// Integers, boolean, and uuid may be a key. uuid is the first non-integer key type
+			// (fixed uuid-raw16, spec/design/encoding.md §2.7) and boolean the second (fixed
+			// 1-byte bool-byte, §2.9) — both exercised + byte-pinned. The remaining non-integer
+			// types' order-preserving key encodings (text §2.4, decimal §2.5, bytea §2.6,
+			// interval, float §2.8) are authored but unexercised, so a
+			// text/decimal/bytea/interval/float/composite PRIMARY KEY is a documented 0A000
+			// narrowing (types.md §11/§12/§13; composite.md §6), relaxable in a later in-key slice.
+			// timestamp / timestamptz are also allowed — they share the int64 int-be-signflip key
+			// encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
 			if isComposite || isArray {
 				// A composite/array PRIMARY KEY is rejected 0A000 — the key encoding is authored but
 				// unexercised (composite.md §6, array.md §8).
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+def.TypeName+" primary key is not supported yet")
 			}
-			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -946,7 +949,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -990,7 +993,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
 			}
@@ -1295,7 +1298,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+name)
 		}
 		ty := columns[idx].Type
-		if !ty.IsInteger() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+		if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
 			return Outcome{}, NewError(FeatureNotSupported,
 				"a "+ty.CanonicalName()+" index column is not supported yet")
 		}
@@ -1467,6 +1470,9 @@ func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) [
 		case ValInt:
 			out = append(out, 0x00)
 			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
+		case ValBool:
+			out = append(out, 0x00)
+			out = append(out, EncodeBool(v.Bool)...)
 		case ValUuid:
 			out = append(out, 0x00)
 			out = append(out, v.Str...)
@@ -1495,6 +1501,9 @@ func indexPrefixKey(columns []Column, def IndexDef, row Row) ([]byte, bool) {
 		case ValInt:
 			out = append(out, 0x00)
 			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
+		case ValBool:
+			out = append(out, 0x00)
+			out = append(out, EncodeBool(v.Bool)...)
 		case ValUuid:
 			out = append(out, 0x00)
 			out = append(out, v.Str...)
@@ -1851,11 +1860,16 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			// concatenation is self-delimiting and bytes.Compare equals the tuple's order. A
 			// single-column key is the one-member case of the same rule.
 			for _, i := range pk {
-				if table.Columns[i].Type.IsUuid() {
+				switch {
+				case table.Columns[i].Type.IsUuid():
 					// uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16,
 					// encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
 					key = append(key, row[i].Str...)
-				} else {
+				case table.Columns[i].Type.IsBool():
+					// boolean is the second non-integer key: the bare 1-byte bool-byte (0x00 false /
+					// 0x01 true, encoding.md §2.9) — likewise no presence tag.
+					key = append(key, EncodeBool(row[i].Bool)...)
+				default:
 					key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
 				}
 			}
@@ -3688,6 +3702,8 @@ func isConstSource(e *rExpr, pkType ScalarType) bool {
 		return true
 	case reConstInt:
 		return pkType.IsInteger()
+	case reConstBool:
+		return pkType.IsBool()
 	case reConstUuid:
 		return pkType.IsUuid()
 	case reConstTimestamp:
@@ -3753,10 +3769,11 @@ func (db *Database) buildKeyBound(bp *pkBoundPlan, params []Value, outer []Row) 
 }
 
 // encodeBoundKey encodes a const-source's value into the PK's storage key (the same codec INSERT
-// uses — EncodeInt for integer/timestamp widths, the raw 16 bytes for uuid). isNull ⇒ the value is
-// NULL; ok=false (not null) ⇒ an integer value outside the PK type's range (no key can equal it), so
-// the caller drops this bound. reParam/reOuterColumn resolve to a runtime Value first (the param
-// table / the enclosing outer row) and then encode through the shared path.
+// uses — EncodeInt for integer/timestamp widths, the raw 16 bytes for uuid, the 1-byte bool-byte
+// for boolean). isNull ⇒ the value is NULL; ok=false (not null) ⇒ an integer value outside the PK
+// type's range (no key can equal it), so the caller drops this bound. reParam/reOuterColumn resolve
+// to a runtime Value first (the param table / the enclosing outer row) and then encode through the
+// shared path.
 func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row) (key []byte, isNull bool, ok bool) {
 	switch src.kind {
 	case reConstNull:
@@ -3766,6 +3783,8 @@ func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row) 
 			return nil, false, false
 		}
 		return EncodeInt(pkType, src.cInt), false, true
+	case reConstBool:
+		return EncodeBool(src.cBool), false, true
 	case reConstUuid:
 		return src.cBytea, false, true
 	case reConstTimestamp, reConstTimestamptz:
@@ -3788,6 +3807,8 @@ func encodeValueKey(pkType ScalarType, v Value) (key []byte, isNull bool, ok boo
 		return nil, true, false
 	}
 	switch {
+	case pkType.IsBool():
+		return EncodeBool(v.Bool), false, true
 	case pkType.IsUuid():
 		return []byte(v.Str), false, true
 	case pkType.IsInteger():

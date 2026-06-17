@@ -136,6 +136,7 @@ export type EncCase = {
   typ: string;
   value: bigint;
   strValue: string; // a quoted value (uuid's canonical string); "" for integer cases
+  boolValue: boolean; // a boolean case's value (typ === "boolean"); false otherwise
   isNull: boolean;
   bytes: string;
 };
@@ -257,6 +258,7 @@ function parseEncCaseLine(line: string, kind: EncCase["kind"] | "", typ: string)
   if (cl >= 0) inner = inner.slice(0, cl);
   let value = 0n;
   let strValue = "";
+  let boolValue = false;
   let isNull = false;
   let bytes = "";
   for (const part of inner.split(",")) {
@@ -264,13 +266,15 @@ function parseEncCaseLine(line: string, kind: EncCase["kind"] | "", typ: string)
     if (idx < 0) continue;
     const k = part.slice(0, idx).trim();
     const v = part.slice(idx + 1).trim();
-    // A quoted value is a uuid's canonical string; an unquoted one is an integer.
+    // A quoted value is a uuid's canonical string; a `true`/`false` literal is a boolean
+    // case (the bool-byte key, §2.9); an unquoted number is an integer.
     if (k === "value") {
       if (v.startsWith('"')) strValue = unquote(v);
+      else if (v === "true" || v === "false") boolValue = v === "true";
       else value = BigInt(v);
     } else if (k === "null") isNull = v === "true";
     else if (k === "bytes") bytes = unquote(v);
   }
   if (bytes === "") return null;
-  return { kind, typ, value, strValue, isNull, bytes };
+  return { kind, typ, value, strValue, boolValue, isNull, bytes };
 }

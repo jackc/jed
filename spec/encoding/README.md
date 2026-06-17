@@ -40,7 +40,9 @@ model (NULL is the largest value), ratifying the NULL sort-position decision tha
 
 > Status: rule defined and fixtures authored + verified. Non-integer keys now exercised:
 > `uuid` (method `uuid-raw16`: fixed 16 raw bytes, no sign-flip/escape/terminator;
-> [../design/encoding.md §2.7](../design/encoding.md)) and `timestamp`/`timestamptz` (key
+> [../design/encoding.md §2.7](../design/encoding.md)), `boolean` (method `bool-byte`: a single
+> byte 0x00 false / 0x01 true, no sign-flip/escape/terminator;
+> [../design/encoding.md §2.9](../design/encoding.md)), and `timestamp`/`timestamptz` (key
 > encoding = the int64 rule) — all usable as a `PRIMARY KEY`. The remaining non-integer key
 > vectors (decimal/text/bytea/float/interval) and composite keys follow when those features
 > exercise keys. The directory has also grown beyond pure key encoding to hold cross-core

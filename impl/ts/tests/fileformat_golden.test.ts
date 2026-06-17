@@ -168,14 +168,27 @@ function textTableDB(): Database {
 }
 
 // boolTableDB has a boolean column — exercises the value codec's boolean branch (a single
-// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (no boolean
-// key this slice).
+// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (the boolean
+// PRIMARY KEY case is boolPkTableDB).
 function boolTableDB(): Database {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)");
   run(db, "INSERT INTO t VALUES (1, TRUE)");
   run(db, "INSERT INTO t VALUES (2, FALSE)");
   run(db, "INSERT INTO t VALUES (3, NULL)");
+  return db;
+}
+
+// boolPkTableDB has a boolean PRIMARY KEY (the second golden with a NON-integer stored key,
+// after uuid) — the bool-byte key encoding (bare 1 byte 0x00 false / 0x01 true, no presence
+// tag since a PK is NOT NULL, spec/design/encoding.md §2.9), plus a nullable boolean value
+// column. Rows go in via INSERT and the store sorts them into key (byte) order: false (0x00)
+// then true (0x01). Must match spec/fileformat/verify.rb's BOOL_PK_TABLE.
+function boolPkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (k boolean PRIMARY KEY, v boolean)");
+  run(db, "INSERT INTO t VALUES (FALSE, TRUE)");
+  run(db, "INSERT INTO t VALUES (TRUE, NULL)");
   return db;
 }
 
@@ -408,6 +421,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
     { name: "bool_table.jed", build: boolTableDB },
+    { name: "bool_pk_table.jed", build: boolPkTableDB },
     { name: "decimal_table.jed", build: decimalTableDB },
     { name: "bytea_table.jed", build: byteaTableDB },
     { name: "uuid_table.jed", build: uuidTableDB },
@@ -448,6 +462,7 @@ test("read goldens reproduces rows", () => {
     { name: "pk_table.jed", build: pkTableDB, table: "t" },
     { name: "text_table.jed", build: textTableDB, table: "t" },
     { name: "bool_table.jed", build: boolTableDB, table: "t" },
+    { name: "bool_pk_table.jed", build: boolPkTableDB, table: "t" },
     { name: "decimal_table.jed", build: decimalTableDB, table: "t" },
     { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
     { name: "uuid_table.jed", build: uuidTableDB, table: "t" },

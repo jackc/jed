@@ -23,6 +23,19 @@ func EncodeInt(t ScalarType, value int64) []byte {
 	return out
 }
 
+// EncodeBool encodes a non-null boolean to its order-preserving key body: a single
+// bool-byte, 0x00 for false < 0x01 for true (method bool-byte, spec/design/encoding.md
+// §2.9). Fixed-width 1, so self-delimiting with no sign-flip / escape / terminator — like
+// uuid. Byte-identical to the boolean value-codec body (a stored boolean reuses these bytes
+// behind the §2.2 presence tag — spec/fileformat/format.md). A PK is NOT NULL, so no
+// presence tag.
+func EncodeBool(value bool) []byte {
+	if value {
+		return []byte{0x01}
+	}
+	return []byte{0x00}
+}
+
 // DecodeInt is the inverse of EncodeInt. len(b) must equal the type's width.
 func DecodeInt(t ScalarType, b []byte) int64 {
 	width := t.WidthBytes()

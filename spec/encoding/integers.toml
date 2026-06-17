@@ -9,10 +9,12 @@
 # Reasoning + the encoding rules live in ../design/encoding.md.
 # Test-time only; bytes are lowercase hex, no 0x prefix, no separators.
 #
-# Despite the filename, this file also carries the first NON-integer key vectors: `uuid`
-# (method `uuid-raw16`, ../design/encoding.md §2.7) — a fixed 16-byte value, NO sign-flip,
-# escape, or terminator, so the bytes ARE the value. uuid is the first non-integer type
-# actually usable as a key, so its vectors are exercised, not merely authored.
+# Despite the filename, this file also carries the NON-integer key vectors that are actually
+# exercised (not merely authored): `uuid` (method `uuid-raw16`, ../design/encoding.md §2.7) — a
+# fixed 16-byte value, NO sign-flip, escape, or terminator, so the bytes ARE the value — and
+# `boolean` (method `bool-byte`, §2.9) — a single byte 0x00 false / 0x01 true, fixed-width 1,
+# likewise no sign-flip/escape/terminator. uuid and boolean are the two non-integer types usable
+# as a key (besides the int64-backed timestamps, which reuse the `int-be-signflip` int64 vectors).
 
 schema_version = 1
 
@@ -120,4 +122,34 @@ cases = [
   { null = true,                                     bytes = "fe" },  # NULL sorts first under descending
   { value = "550e8400-e29b-41d4-a716-446655440000", bytes = "ffaaf17bff1d64be2b58e9bb99aabbffff" },
   { value = "00000000-0000-0000-0000-000000000000", bytes = "ffffffffffffffffffffffffffffffffff" },
+]
+
+# --- boolean (width 1, method `bool-byte`) -----------------------------------
+# A single byte: 0x00 false < 0x01 true (../design/encoding.md §2.9). NO sign-flip, escape, or
+# terminator (fixed-width 1, self-delimiting). Cases in ascending logical order (false < true).
+[[bare]]
+type = "boolean"
+cases = [
+  { value = false, bytes = "00" },  # false sorts first
+  { value = true,  bytes = "01" },  # true sorts after false
+]
+
+# nullable boolean slot: 0x00 present + the 1 byte, 0x01 NULL (NULL sorts last ascending).
+[[nullable]]
+type = "boolean"
+cases = [
+  { value = false, bytes = "0000" },
+  { value = true,  bytes = "0001" },
+  { null = true,   bytes = "01"   },  # NULL sorts last
+]
+
+# descending boolean: bitwise inversion of the nullable encoding, tag included. NULL lands
+# first; listed in ascending byte order (= descending logical order) so invariant (3) holds.
+[[descending]]
+type = "boolean"
+base = "nullable"
+cases = [
+  { null = true,   bytes = "fe"   },  # NULL sorts first under descending
+  { value = true,  bytes = "fffe" },
+  { value = false, bytes = "ffff" },
 ]

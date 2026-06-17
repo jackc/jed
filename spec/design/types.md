@@ -41,8 +41,10 @@ order); see §11 for the collation decision and its deferred features. **`boolea
 logical connectives and the type of the `TRUE`/`FALSE` literals, and is now **storable** as a
 column (`storable = true` in [../types/scalars.toml](../types/scalars.toml)) — `CREATE TABLE
 t(flag boolean)`, INSERT/store/retrieve, `boolean × boolean` comparison and `ORDER BY` all work
-(§9); a boolean **PRIMARY KEY** is rejected `0A000`, and `CAST(x AS boolean)` (and
-boolean⇄integer casts) are deferred `0A000` (§9, §10). **`decimal`** (aliases `numeric`, `dec`)
+(§9); a boolean **PRIMARY KEY**/index is **supported** — its fixed-width `bool-byte` key encoding
+is exercised (§9, [encoding.md §2.9](encoding.md)), making boolean the second non-integer key type
+after uuid — while `CAST(x AS boolean)` and boolean⇄integer casts stay deferred `0A000` (§9, §10).
+**`decimal`** (aliases `numeric`, `dec`)
 is the third storable non-integer scalar — an exact base-10 numeric (§12,
 [decimal.md](decimal.md)); its landing **binds the decimal-rounding decision** of CLAUDE.md §8
 (settled: round **half away from zero**) and keeps binary floats out of the compare/text paths
@@ -53,8 +55,8 @@ usable as a `PRIMARY KEY`** (its fixed-width key encoding is exercised, lifting 
 the other non-integer types still defer). The temporal types
 (`timestamp`/`timestamptz`/`interval`) and the binary floats (`float32`/`float64`) have since
 landed, each with its own design doc ([timestamp.md](timestamp.md), [interval.md](interval.md),
-[float.md](float.md)); `timestamp`/`timestamptz` join `uuid` as non-integer `PRIMARY KEY` types,
-while `interval`/`float32`/`float64` stay non-key for now. The remaining scalars (`json`/`jsonb`,
+[float.md](float.md)); `boolean`, `timestamp`, and `timestamptz` join `uuid` as non-integer
+`PRIMARY KEY` types, while `interval`/`float32`/`float64` stay non-key for now. The remaining scalars (`json`/`jsonb`,
 and the composite `array` container) are still **deferred**. The float-formatting and NaN/∞
 decisions of CLAUDE.md §8 are now **settled** by the landed floats ([float.md](float.md)): they
 keep their own PG total order and the `R` render tag (ledgered in the determinism exceptions),
@@ -340,12 +342,19 @@ comparison (`= < > <= >=`, `IS [NOT] DISTINCT FROM` — §4), and `ORDER BY` (fa
 NULLs last — the PostgreSQL model) all work. A stored boolean uses the value codec's 1-byte
 `bool-byte` body (`0x00` false, `0x01` true) behind the shared presence tag (on-disk type code
 `5` — [../fileformat/format.md](../fileformat/format.md)); the same order-preserving `bool-byte`
-is the key encoding rule (scalars.toml), false sorting below true. Two narrowings remain, each
-relaxable and each mirroring text:
+is the key encoding rule (scalars.toml), false sorting below true.
 
-- **boolean PRIMARY KEY** — rejected `0A000`. The `bool-byte` key rule is authored but
-  unexercised this slice (a boolean key permits at most two distinct rows); boolean-in-a-key is
-  a later follow-on, with its key byte-fixtures.
+**boolean PRIMARY KEY / index — supported.** boolean is the **second non-integer key type**
+(after uuid): a `boolean PRIMARY KEY`, a boolean member of a composite key, and a secondary
+index on a boolean column all work. The stored key is the bare `bool-byte` (`0x00` false `<`
+`0x01` true — a PK is NOT NULL, so no presence tag; an index slot tags it per
+[encoding.md §2.9](encoding.md)/§2.2). Like uuid, boolean is fixed-width (1 byte), so its key is
+self-delimiting with no escape/terminator; the executor key path that already generalized to uuid
+extends to boolean unchanged, and the bytes are pinned by the `bool_pk_table.jed` golden and the
+`encoding/integers.toml` boolean vectors. (A boolean key admits at most two distinct rows, so it is
+rarely a *useful* PK, but it is well-defined and supported — strictness over special-casing.) One
+narrowing remains, relaxable and mirroring text:
+
 - **boolean casts** — `CAST(x AS boolean)` and boolean⇄integer casts are rejected `0A000` /
   `42804` (not in the cast matrix — §5, [../types/casts.toml](../types/casts.toml)). PostgreSQL's
   boolean↔integer casts are asymmetric, so they are authored deliberately in a later cast slice
@@ -380,9 +389,10 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   connectives yield `boolean`, arithmetic yields the promoted operand type (functions.md §7).
 - **Storable boolean** — ✅ landed (§9): boolean is a column type with on-disk type code `5`,
   the `bool-byte` value codec, a golden round-trip fixture (`bool_table.jed`), and
-  `boolean × boolean` comparison + `ORDER BY`. Two sub-features remain deferred: **boolean in a
-  key / PRIMARY KEY** (rejected `0A000`; the `bool-byte` key rule is authored but its byte
-  fixtures land when lifted) and **boolean⇄integer casts** (rejected; PG's are asymmetric, so a
+  `boolean × boolean` comparison + `ORDER BY`. **boolean in a key / PRIMARY KEY** — ✅ has since
+  landed (§9): the `bool-byte` key encoding is exercised (the second non-integer key after uuid),
+  with boolean key byte-fixtures (`encoding/integers.toml`) and the `bool_pk_table.jed` golden.
+  One sub-feature remains deferred: **boolean⇄integer casts** (rejected; PG's are asymmetric, so a
   dedicated cast slice — §5, casts.toml).
 - **`IS [NOT] DISTINCT FROM`** — ✅ authored (NULL-safe equality; functions.md §3), now
   overloaded over the integer, text, and boolean families (§4).

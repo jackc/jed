@@ -13,7 +13,7 @@
 require "bundler/setup"
 require "toml-rb"
 
-WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "uuid" => 16 }.freeze
+WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "boolean" => 1, "uuid" => 16 }.freeze
 
 # uuid-raw16: the 16 raw bytes of the canonical 8-4-4-4-12 form (no sign-flip, no
 # escape/terminator — encoding.md §2.7). encode = strip hyphens, pack the 32 hex digits.
@@ -27,9 +27,11 @@ def uuid_from_bytes(bytes)
 end
 
 # bare key encoding. For integers: int-be-signflip (add bias 2^(bits-1), unsigned BE).
-# For uuid (a String value): the raw 16 bytes verbatim, no sign-flip.
+# For uuid (a String value): the raw 16 bytes verbatim, no sign-flip. For boolean (a true/false
+# value): the single bool-byte 0x00 false / 0x01 true (§2.9), no sign-flip.
 def enc_bare(value, width)
   return uuid_to_bytes(value) if value.is_a?(String)
+  return [value ? 1 : 0].pack("C") if value == true || value == false
 
   bias = 1 << (width * 8 - 1)
   u = value + bias
@@ -41,6 +43,7 @@ end
 
 def dec_bare(bytes, width)
   return uuid_from_bytes(bytes) if width == 16 # uuid is the only 16-byte key
+  return bytes.bytes.first == 1 if width == 1 # boolean is the only 1-byte key
 
   bytes.bytes.reduce(0) { |acc, b| (acc << 8) | b } - (1 << (width * 8 - 1))
 end

@@ -126,8 +126,8 @@ encoding above, or `0x01` for NULL).
 **Status — authored, not yet exercised.** This slice (`text` as a storable column) keeps text
 out of keys: a text PRIMARY KEY is rejected `0A000` (a documented, relaxable narrowing —
 [types.md §11](types.md)). So no `text` key fixtures or executor key path exist yet; the rule
-is recorded here as a property of the type, exactly as the `bool-byte` rule is recorded but
-unexercised. Stored text *values* use a separate, simpler **value codec** (length-prefixed
+is recorded here as a property of the type, exactly as the `decimal`/`bytea`/`float` rules are
+recorded but unexercised (the `bool-byte` rule §2.9 has since *landed* and is exercised). Stored text *values* use a separate, simpler **value codec** (length-prefixed
 UTF-8, no order-preservation needed — [../fileformat/format.md](../fileformat/format.md)).
 Lifting the narrowing (text in a key / secondary index) adds the `(value → bytes)` fixtures to
 [../encoding/](../encoding/) and the executor path then.
@@ -271,6 +271,37 @@ type code 12 for `float64` / 13 for `float32`), which preserves the bits verbati
 canonicalization) because a stored value never needs to sort.
 Lifting the narrowing adds the `(value → bytes)` fixtures and the executor key path then.
 
+### 2.9 Boolean — `bool-byte` (the second EXERCISED non-integer key)
+
+`boolean` is a fixed **1-byte** value (the two-element domain `{false, true}`, ordered
+`false < true` — [types.md §9](types.md)). Like `uuid` (§2.7) — and unlike the variable-width
+text/decimal/bytea — it needs **no escape, terminator, or length prefix**: a single byte is
+self-delimiting by width alone. The rule is the simplest in this doc:
+
+1. The value's byte is **`0x00` for `false`, `0x01` for `true`**.
+2. **No sign-flip** (the domain is unsigned), **no escape, no terminator.**
+
+Because `0x00 < 0x01`, unsigned `memcmp` over the one byte **is** the type's logical order
+(`false < true`), so the byte already sorts correctly with no transformation. The body is
+byte-identical to the boolean *value* codec (a stored boolean is the same `bool-byte` behind
+the §2.2 presence tag — [../fileformat/format.md](../fileformat/format.md), type code 5), the
+simplest case of the §3 key/value seam coinciding (as for uuid). Worked bytes:
+
+| value | encoded key bytes |
+|---|---|
+| `false` | `00` |
+| `true` | `01` |
+
+The **nullable** slot is the §2.2 tag (`0x00` present ‖ the 1 byte, or `0x01` for NULL — so
+`false`→`00 00`, `true`→`00 01`, NULL→`01`) and **descending** is the §2.3 whole-component
+bitwise inversion (NULL→`fe`, `true`→`ff fe`, `false`→`ff ff`) — both unchanged.
+
+**Status — EXERCISED.** Like uuid (§2.7), `boolean` **is** allowed in a `PRIMARY KEY` / index
+([types.md §9](types.md)), making it the **second non-integer key type**. So boolean key vectors
+are authored in [../encoding/integers.toml](../encoding/integers.toml) and the executor encodes a
+boolean PK to the bare 1 byte (a PK is NOT NULL, so no presence tag), pinned by the
+`bool_pk_table.jed` golden ([../fileformat/format.md](../fileformat/format.md)).
+
 ## 3. Where this is used today
 
 The bare integer rule is exercised by every stored key. The on-disk **value codec**
@@ -284,7 +315,9 @@ text is not yet allowed in a key. `bytea` (§2.6) is the same: raw-byte *values*
 compact value codec, the order-preserving *key* rule authored but unexercised. `uuid` (§2.7) is
 the **exception and the first non-integer key actually exercised**: a uuid `PRIMARY KEY` stores
 the bare 16 bytes as its key (so the BTree/sorted store iterates uuid PKs in correct logical
-order with no comparator), proving the executor key path generalizes beyond integers.
+order with no comparator), proving the executor key path generalizes beyond integers. `boolean`
+(§2.9) is the **second** such key — a boolean `PRIMARY KEY`/index stores the bare `bool-byte`
+(`0x00`/`0x01`), pinned by the `bool_pk_table.jed` golden.
 **Composite keys are exercised too**: a composite `PRIMARY KEY` ([constraints.md §3](constraints.md))
 concatenates its fixed-width components per §2.3, pinned by the `composite_pk_table.jed`
 golden. Nullable **secondary indexes** have since **landed** ([indexes.md](indexes.md),
