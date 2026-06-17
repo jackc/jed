@@ -5,7 +5,10 @@ product is a strict, static type system: a value is never silently reinterpreted
 Storage is a single in-process file (in the spirit of SQLite), and the observable semantics
 (NULL logic, comparisons, ordering, exact numerics, errors) follow PostgreSQL closely — the
 standing rule is **match PostgreSQL unless there's an overriding reason** ([CLAUDE.md §1](CLAUDE.md)).
-Implemented natively in multiple languages in lockstep with **no reference implementation**.
+A fundamental requirement is that **untrusted SQL is safe to run** — it cannot corrupt memory,
+reach the host (no built-in does I/O or escapes the engine), or exhaust resources
+([CLAUDE.md §13](CLAUDE.md)). Implemented natively in multiple languages in lockstep with
+**no reference implementation**.
 
 ## Read this first
 

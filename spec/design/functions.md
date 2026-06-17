@@ -525,3 +525,32 @@ differs), so they are NOT oracle-imported; the corpus pins them under an injecte
 
 Each charges the uniform one `operator_eval` per call (independent of the clock value). The clock
 reads are class-**B** determinism-ledger entries (`now-clock`, `clock-timestamp-clock`).
+
+## 13. Purity — the built-in surface is safe for untrusted queries
+
+Untrusted SQL is safe to run (CLAUDE.md §13), and this catalog is one of the three pillars
+that guarantee it: **the engine provides no built-in that can do bad things.** Every entry
+here is **pure and side-effect-free** — it is a total (or NULL-/error-returning) mapping from
+input values to an output value, and it touches **nothing else**:
+
+- **No host reach.** No built-in reads or writes the filesystem (no `pg_read_file` /
+  `lo_import` / `COPY … TO/FROM` analogue), opens a socket, spawns a process, reads the
+  environment, or otherwise escapes the engine. The query surface is curated; an escape hatch
+  is **never added**, not merely gated.
+- **No hidden state.** A built-in does not mutate engine state outside the value it returns.
+  Evaluation order among side-effect-free nodes is therefore unobservable (which is also what
+  lets the planner reorder freely).
+- **No unsanctioned nondeterminism.** The **only** window onto the outside world is the
+  host-injected **entropy/clock seam** (§12, [entropy.md](entropy.md)): `uuidv4`/`uuidv7` read
+  entropy, `now()`/`clock_timestamp()` read the clock, and **nothing else** does. These are
+  deterministic-given-the-seam (class-A/B determinism-ledger entries,
+  [determinism.md](determinism.md)) and read *only* entropy + the clock — never arbitrary host
+  state. There is no general clock/random/locale/PID/host-info built-in beyond them.
+
+This makes purity a **standing rule on catalog growth**, alongside the §8 growth rule and the
+§1 "stay descriptive" rule: a proposed function that performs I/O, reaches the host, or
+introduces nondeterminism outside the seam **does not belong in the built-in set**. The rule
+binds *built-ins only*. **Host/application-supplied functions are explicitly out of scope** —
+the engine cannot know what host code does, so a host that registers a function and exposes it
+to untrusted queries owns that risk (CLAUDE.md §13); the meter's only structural defense is
+the host-function cost contract ([cost.md](cost.md) §6).

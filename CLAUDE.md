@@ -613,10 +613,38 @@ from `spec/encoding/` or an old Apache-2.0 tag rather than vendoring the BSL sou
 
 ---
 
-## 13. Untrusted queries: memory safety + deterministic resource accounting
+## 13. Untrusted queries: safe to run
 
-A first-class use case is **safely evaluating untrusted, user-supplied queries** (a host
-exposing an ad-hoc query surface to its own users). Two requirements follow.
+**A fundamental project requirement: untrusted SQL is safe to run.** A first-class use case
+is a host exposing an ad-hoc query surface to its own users, so a query supplied by an
+adversary — not just a careless one — **cannot do bad things**. "Bad things" is concrete and
+bounded: it cannot violate memory safety, it cannot reach outside the database (no
+filesystem, network, process, environment, or clock access beyond the sanctioned seams), and
+it cannot exhaust resources. This is a **standing guarantee about the engine and its
+built-in surface**, not a feature toggled on per query — every core upholds it by
+construction. It rests on **three guarantees**, each below:
+
+1. **Memory safety** — a crafted query cannot corrupt memory (every core is a memory-safe
+   language).
+2. **No dangerous built-ins** — the engine provides **no function or operator that can do
+   bad things**: the built-in catalog is **pure and side-effect-free** (no I/O, no host
+   reach, no nondeterminism outside the §10 entropy/clock seam). There is simply nothing in
+   the surface to abuse.
+3. **Bounded resources** — execution cannot consume unbounded resources: a **deterministic
+   cost meter + ceiling** bounds work, and a **fixed parser nesting-depth limit** bounds
+   native-stack recursion. The two are independent gates (one strikes during execution, the
+   other before any cost is metered).
+
+**Scope boundary — host/application-supplied functions are excluded.** This guarantee covers
+the engine and its built-in surface *only*. The moment a host registers an
+application-supplied function (§2; TODO.md Phase 7/9), that function is **opaque**
+— the engine has no way to know what it does (it may touch the filesystem, the network, or
+burn unbounded CPU). So host-defined functions are **outside** the untrusted-query safety
+guarantee by definition: a host that exposes them to untrusted queries owns that decision and
+its consequences. The engine's one mechanical defense is the cost contract — a host function
+that does not declare its cost is admissible **only** on an unlimited (`max_cost = 0`) handle,
+never the untrusted-query surface (`spec/design/cost.md` §6). Purity and bounded-resources
+above are promises about *jed's* surface, not about arbitrary code a host bolts on.
 
 ### Memory safety — largely free, but a standing requirement
 
@@ -629,13 +657,47 @@ safety as a **standing requirement**, not an accident — any future `unsafe` / 
 dependency policy, §14). It is also one more reason a **wrapped** core (§2) wraps the
 *safe Rust* core rather than dropping to C.
 
-This covers memory safety **only**. It does not bound resource consumption — that is next.
+This covers memory safety **only** — it bounds neither what a query can *reach* nor what it
+can *consume*. Those are the next two guarantees.
 
-### Deterministic resource accounting + a cost ceiling
+### No dangerous built-ins — a pure, side-effect-free surface
 
-An untrusted query must not consume unbounded resources (a pathological scan, cross join,
-or deep expression). The engine must **deterministically meter the cost of executing a
-query** and **abort when a caller-supplied ceiling is exceeded**.
+The engine provides **no function or operator capable of doing harm**. Every built-in in the
+function/operator catalog (`spec/functions/`, `spec/design/functions.md`) is **pure**: it
+maps input values to an output value and **nothing else** — no filesystem access, no network,
+no process or shell execution, no environment or host reach, no mutation of state outside the
+expression. There is deliberately no `pg_read_file`-style escape hatch, no `COPY … TO/FROM`
+to the host, no dynamic-language `DO`/extension loader — the surface is curated, and a
+construct that *could* do bad things is simply **never added** to it. The lone sanctioned
+window onto the outside world is the **entropy/clock seam** (§10, `uuidv4`/`uuidv7`,
+`now()`/`clock_timestamp()`), which is host-injected, deterministic-given-its-inputs, and
+reads *only* entropy + the clock — never arbitrary host state. Keeping the surface pure is a
+**standing requirement on the catalog**, enforced the same way every other catalog property
+is: a new function is added with its semantics stated as data (§5), and a function that
+breaks purity does not belong in the built-in set. (Purity is also what makes the §10
+determinism contract hold; the two requirements reinforce each other.)
+
+This bounds what a query can *reach*. It does not bound what a query can *consume* — that is
+the third guarantee.
+
+### Bounded resources — deterministic cost meter + ceiling, and a depth limit
+
+An untrusted query must not consume unbounded resources. Two distinct hazards, two
+independent gates:
+
+1. a pathological *amount of work* — a runaway scan, a cross join, an expensive expression
+   evaluated over a huge input — bounded by the **deterministic cost meter + ceiling**
+   (below);
+2. pathological *nesting depth* — input like `1 + 1 + … + 1` thousands deep, or deeply nested
+   parens / `ARRAY[…]` / `CASE` / scalar subqueries — which would **overflow the native call
+   stack during parse/resolve, before any cost is metered**, bounded by a **fixed parser
+   nesting-depth limit** (`MAX_EXPR_DEPTH`, abort `54001` `statement_too_complex`,
+   `spec/design/cost.md` §7). The cost ceiling structurally cannot catch this (the overflow
+   precedes metering) and memory safety does not either (a stack overflow is an abort, not a
+   memory error), so the depth limit is its own gate.
+
+The cost meter is the primary mechanism. The engine must **deterministically meter the cost
+of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
 
 - **Deterministic cost.** Execution accrues a running cost from defined units — each **page
   read**, each **row produced**, each **function/operator evaluation**, etc. (the unit
