@@ -1,0 +1,96 @@
+# unnest(composite[]) — AF7 (spec/design/array-functions.md §13): unnest over an array whose element
+# is a CREATE TYPE-named composite. The anyarray argument binds ELEM to the composite type and the
+# produced one-column relation is typed at it, so each element becomes one COMPOSITE row, expanded
+# row-major (a multidimensional array flattens; the empty array {} and a NULL array each yield zero
+# rows). jed models the output as a SINGLE composite column (decision 23), a documented divergence
+# from PostgreSQL's "a composite-returning function in FROM expands into a relation of its fields"
+# rule: this corpus therefore uses the forms that AGREE with PG — `SELECT u` reads the whole composite
+# (PG treats the alias as a whole-row reference), `(u).field` reads a field, count(*) counts the
+# elements, ORDER BY u uses the composite total order. (The SELECT * field-expansion and the
+# NULL-element-renders-as-(,) PG quirks are jed-divergent, decisions 23/24, and live in the per-core
+# unit tests, not here.) Construction uses the PG-portable '{…}'::addr[] / '(…)'::addr text literals.
+# PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.set_returning, func.unnest, func.array, func.array_composite, types.array_composite, types.composite, types.array, types.array_multidim, query.order_by, query.aggregates, query.subquery_correlated, query.qualified_column, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TYPE addr AS (street text, zip int32)
+
+# --- the basic case: unnest produces one COMPOSITE row per element ----------------------
+# `SELECT u` reads the whole composite (the alias is a whole-row reference, agreeing with PG); the
+# composite total order puts (Main,…) before (Side,…). One column named `u`, typed addr.
+# names: u
+# types: addr
+# cost: 4
+query T nosort
+SELECT u FROM unnest('{"(Main,90210)","(Side,5)"}'::addr[]) AS u ORDER BY u
+----
+(Main,90210)
+(Side,5)
+
+# --- field access on the composite output column: (u).street / (u).zip ------------------
+# (ORDER BY u — the whole composite — since ORDER BY by a bare field expression is a separate
+# follow-on; the composite order puts Main before Side.)
+# names: street, zip
+# cost: 8
+query TI nosort
+SELECT (u).street, (u).zip FROM unnest('{"(Main,90210)","(Side,5)"}'::addr[]) AS u ORDER BY u
+----
+Main
+90210
+Side
+5
+
+# --- the empty array {} yields ZERO rows ------------------------------------------------
+# cost: 0
+query T rowsort
+SELECT u FROM unnest('{}'::addr[]) AS u
+----
+
+# --- a NULL array argument yields ZERO rows (the empty_on_null discipline) ---------------
+# cost: 0
+query T rowsort
+SELECT u FROM unnest(NULL::addr[]) AS u
+----
+
+# --- a NULL composite element is still a ROW (count agrees with PG; the render diverges) -
+# unnest of [(Main,90210), NULL] yields TWO rows. (jed renders the NULL element as a whole-NULL
+# composite; PG's FROM-expansion renders it (,) — decision 24 — so the corpus pins the COUNT only.)
+# cost: 5
+query I nosort
+SELECT count(*) FROM unnest('{"(Main,90210)",NULL}'::addr[])
+----
+2
+
+# --- a multidimensional array flattens in row-major order -------------------------------
+# cost: 8
+query T nosort
+SELECT u FROM unnest('{{"(a,1)","(b,2)"},{"(c,3)","(d,4)"}}'::addr[]) AS u ORDER BY u
+----
+(a,1)
+(b,2)
+(c,3)
+(d,4)
+
+# --- a correlated OUTER column (a stored addr[] column) as the argument (non-LATERAL) ----
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, items addr[])
+
+statement ok
+INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}'), (2, '{}'), (3, NULL)
+
+# unnest(o.items) sees the enclosing row's composite array; an empty / NULL array contributes zero.
+# names: id, n
+# cost: 17
+query II nosort
+SELECT id, (SELECT count(*) FROM unnest(o.items)) AS n FROM t o ORDER BY id
+----
+1
+2
+2
+0
+3
+0
+
+# --- a non-array argument is undefined_function ----------------------------------------
+statement error 42883
+SELECT * FROM unnest('(Main,90210)'::addr)

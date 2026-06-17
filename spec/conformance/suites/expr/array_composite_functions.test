@@ -1,0 +1,138 @@
+# The polymorphic array function/operator surface over a COMPOSITE element type — AF7
+# (spec/design/array-functions.md §13). Every AF1–AF6 function/operator works over an array whose
+# element is a CREATE TYPE-named composite (addr[]): the builders (array_append/array_prepend/
+# array_cat/||), the introspectors (array_length/cardinality/array_ndims/array_dims), the
+# containment/overlap operators (@>/<@/&&), the search/edit functions (array_remove/array_replace/
+# array_position/array_positions), the ANY/ALL quantifiers, and num_nulls/num_nonnulls (VARIADIC).
+# The one composite subtlety is the comparison routing: the per-element compare uses the composite
+# TOTAL ORDER (record_eq — NULL FIELDS comparable, definite), so @> / array_remove / = ANY all match a
+# composite element with a NULL field, while a WHOLE-element NULL stays strict for @> (matches
+# nothing) and NULL-safe for the search/edit functions, and folds to UNKNOWN for the quantifiers.
+# Construction uses the PG-portable '{…}'::addr[] / '(…)'::addr literals. PostgreSQL-oracle-verified
+# (postgres:18).
+# requires: query.select, func.array, func.array_composite, func.array_containment, func.array_quantified, func.variadic, types.array_composite, types.composite, types.array, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TYPE addr AS (street text, zip int32)
+
+# --- builders: array_append / array_prepend / array_cat / || (element-agnostic) ---------
+# names: array_append
+# types: addr[]
+# cost: 3
+query T nosort
+SELECT array_append('{"(a,1)"}'::addr[], '(b,2)'::addr)
+----
+{"(a,1)","(b,2)"}
+
+# cost: 3
+query T nosort
+SELECT array_prepend('(z,0)'::addr, '{"(a,1)"}'::addr[])
+----
+{"(z,0)","(a,1)"}
+
+# cost: 4
+query TT nosort
+SELECT array_cat('{"(a,1)"}'::addr[], '{"(b,2)"}'::addr[]), '{"(a,1)"}'::addr[] || '(b,2)'::addr
+----
+{"(a,1)","(b,2)"}
+{"(a,1)","(b,2)"}
+
+# A NULL/empty array is the builder identity (the non-strict `none` discipline).
+# cost: 3
+query T nosort
+SELECT array_append(NULL::addr[], '(a,1)'::addr)
+----
+{"(a,1)"}
+
+# --- introspectors over composite elements (shape readers, element-agnostic) ------------
+# names: array_length, cardinality, array_ndims, array_dims
+# cost: 5
+query IIIT nosort
+SELECT array_length('{"(a,1)","(b,2)"}'::addr[], 1), cardinality('{"(a,1)"}'::addr[]),
+       array_ndims('{"(a,1)"}'::addr[]), array_dims('{"(a,1)","(b,2)"}'::addr[])
+----
+2
+1
+1
+[1:2]
+
+# --- containment / overlap: strict at the value level, total-order at the field level ---
+# A composite element with a NULL FIELD is comparable (record_eq) → @> matches it; but a WHOLE
+# element NULL matches nothing, including another NULL (strict). && / <@ likewise.
+# cost: 5
+query BBBB nosort
+SELECT '{"(a,)"}'::addr[] @> '{"(a,)"}'::addr[],
+       '{"(a,1)",NULL}'::addr[] @> '{NULL}'::addr[],
+       '{"(a,1)"}'::addr[] <@ '{"(a,1)","(b,2)"}'::addr[],
+       '{"(a,1)"}'::addr[] && '{"(a,1)","(b,2)"}'::addr[]
+----
+true
+false
+true
+true
+
+# --- search/edit: NULL-safe element match (the inverse of @>'s strict rule) -------------
+# array_remove of a WHOLE-element NULL removes the NULL; of a NULL-field composite matches it.
+# cost: 4
+query TT nosort
+SELECT array_remove('{"(a,1)",NULL}'::addr[], NULL::addr),
+       array_remove('{"(a,)","(b,2)"}'::addr[], '(a,)'::addr)
+----
+{"(a,1)"}
+{"(b,2)"}
+
+# array_position / array_positions / array_replace over composite elements.
+# names: array_position, array_positions, array_replace
+# cost: 8
+query ITT nosort
+SELECT array_position('{"(a,1)","(b,2)"}'::addr[], '(b,2)'::addr),
+       array_positions('{"(a,1)","(b,2)","(a,1)"}'::addr[], '(a,1)'::addr),
+       array_replace('{"(a,1)"}'::addr[], '(a,1)'::addr, '(z,9)'::addr)
+----
+2
+{1,3}
+{"(z,9)"}
+
+# --- the ANY/ALL quantifiers use the composite TOTAL ORDER (record_eq), NOT bare-ROW 3VL -
+# A composite NULL FIELD is comparable, so = ANY is TRUE (the AF7 fix); a WHOLE-element NULL folds to
+# UNKNOWN; the ordering quantifiers sort the NULL field last.
+# cost: 18
+query BBBBB nosort
+SELECT '(b,2)'::addr = ANY('{"(a,1)","(b,2)"}'::addr[]),
+       '(a,)'::addr = ANY('{"(a,)"}'::addr[]),
+       '(a,)'::addr = ANY('{"(a,2)"}'::addr[]),
+       '(a,1)'::addr < ANY('{"(a,)"}'::addr[]),
+       '(a,)'::addr = ALL('{"(a,)","(a,)"}'::addr[])
+----
+true
+true
+false
+true
+true
+
+# An empty array → ANY FALSE / ALL TRUE (vacuous); a whole-element NULL or a NULL array → UNKNOWN.
+# cost: 12
+query BBBB nosort
+SELECT '(a,1)'::addr = ANY('{}'::addr[]),
+       '(a,1)'::addr = ALL('{}'::addr[]),
+       ('(a,1)'::addr = ANY('{NULL}'::addr[])) IS NULL,
+       ('(a,1)'::addr = ANY(NULL::addr[])) IS NULL
+----
+false
+true
+true
+true
+
+# --- num_nulls / num_nonnulls (VARIADIC) over a composite array -------------------------
+# A composite with a NULL field is a PRESENT value; only a whole-element NULL counts as null.
+# names: num_nulls, num_nonnulls
+# cost: 4
+query II nosort
+SELECT num_nulls(VARIADIC '{"(a,1)",NULL}'::addr[]), num_nonnulls('(a,)'::addr)
+----
+1
+1
+
+# --- an element-type conflict in a builder is undefined_function ------------------------
+statement error 42883
+SELECT array_cat('{"(a,1)"}'::addr[], ARRAY[1,2])

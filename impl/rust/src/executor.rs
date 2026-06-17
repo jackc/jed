@@ -3691,12 +3691,14 @@ impl Database {
         Ok((table, rargs, SrfKind::GenerateSeries))
     }
 
-    /// Resolve `unnest(anyarray)` (spec/design/array-functions.md §9): the single argument must be
-    /// an array (binding `ELEM` := its element type, the produced column's type), else `42883`
+    /// Resolve `unnest(anyarray)` (spec/design/array-functions.md §9, §13): the single argument must
+    /// be an array (binding `ELEM` := its element type, the produced column's type), else `42883`
     /// (a non-array, e.g. `unnest(5)`). A bare untyped `NULL` argument leaves `ELEM` undeterminable
     /// → `42P18` (jed's polymorphic posture, exactly like `array_append(NULL, NULL)`); a *typed*
-    /// NULL array (`NULL::int32[]`) resolves and yields zero rows at exec. Arrays hold scalar
-    /// elements this slice (array-of-composite is deferred), so `ELEM` is a scalar.
+    /// NULL array (`NULL::int32[]`) resolves and yields zero rows at exec. `ELEM` may be a **scalar
+    /// or a composite** (AF7 — `unnest(composite[])`): the synthetic column is typed at the bound
+    /// element type directly (`type_from_resolved`), so a composite array produces composite rows
+    /// (an anonymous-composite element has no catalog name → `0A000`, not reachable from a typed array).
     fn resolve_unnest(
         &self,
         args: &[Expr],
@@ -3708,13 +3710,12 @@ impl Database {
             return Err(no_func_overload("unnest"));
         }
         let (rarg, t) = resolve(arg_scope, &args[0], None, &mut AggCtx::Forbidden, ptypes)?;
-        let elem_st = match t {
-            ResolvedType::Array(elem) => elem_scalar_hint(&elem)
-                .expect("array element is a scalar (array-of-composite is deferred)"),
+        let elem_ty = match t {
+            ResolvedType::Array(elem) => type_from_resolved(&elem)?,
             ResolvedType::Null => return Err(indeterminate_poly()),
             _ => return Err(no_func_overload("unnest")),
         };
-        let table = srf_table("unnest", alias, Type::Scalar(elem_st));
+        let table = srf_table("unnest", alias, elem_ty);
         Ok((table, vec![rarg], SrfKind::Unnest))
     }
 
@@ -12516,7 +12517,34 @@ fn quantified_membership(
 /// mixed-width float pair to `float64` first (the resolver admits `float32` vs `float64`, matching
 /// `RExpr::Compare`'s promote — here the array elements are runtime values, so the widen happens per
 /// element). Bottoms out in the value module's `eq3`/`lt3`/`gt3` kernels.
+///
+/// A **composite** operand pair routes through the composite **total order** (`value_cmp`), NOT the
+/// bare-`ROW` 3VL `eq3`/`lt3`/`gt3` (array-functions.md §13): PostgreSQL's `= ANY(addr[])` dispatches
+/// on the composite `=` *operator* = `record_eq`, which is **definite with NULL fields comparable**
+/// (`ROW('a',NULL)::addr = ANY(ARRAY[ROW('a',NULL)::addr])` is TRUE), the same total order
+/// `array_eq` / `@>` already use for composite elements (array.md §5). A **whole-element NULL** is
+/// still UNKNOWN — the operator stays strict at the value level — so the resolver-guaranteed
+/// same-type pair is composite-vs-composite or composite-vs-NULL.
 fn quantified_cmp3(op: CmpOp, x: &Value, e: &Value) -> ThreeValued {
+    if matches!(x, Value::Composite(_)) || matches!(e, Value::Composite(_)) {
+        // A whole-element NULL → UNKNOWN (3VL at the value level); else the definite total order.
+        if matches!(x, Value::Null) || matches!(e, Value::Null) {
+            return ThreeValued::Unknown;
+        }
+        let ord = value_cmp(x, e);
+        let matched = match op {
+            CmpOp::Eq => ord == std::cmp::Ordering::Equal,
+            CmpOp::Lt => ord == std::cmp::Ordering::Less,
+            CmpOp::Gt => ord == std::cmp::Ordering::Greater,
+            CmpOp::Le => ord != std::cmp::Ordering::Greater,
+            CmpOp::Ge => ord != std::cmp::Ordering::Less,
+        };
+        return if matched {
+            ThreeValued::True
+        } else {
+            ThreeValued::False
+        };
+    }
     let (xw, ew);
     let (a, b): (&Value, &Value) = match (x, e) {
         (Value::Float32(v), Value::Float64(_)) => {

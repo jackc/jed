@@ -2716,20 +2716,21 @@ export class Database {
     return { table, srf: { kind: "generate_series", args: rargs } };
   }
 
-  // resolveUnnest resolves unnest(anyarray) (spec/design/array-functions.md §9): the single argument
-  // must be an array (binding ELEM := its element type, the produced column's type), else 42883 (a
-  // non-array, e.g. unnest(5)). A bare untyped NULL argument leaves ELEM undeterminable → 42P18
-  // (jed's polymorphic posture, like array_append(NULL, NULL)); a typed NULL array (NULL::int32[])
-  // resolves and yields zero rows at exec. Arrays hold scalar elements this slice (array-of-composite
-  // is deferred), so ELEM is a scalar.
+  // resolveUnnest resolves unnest(anyarray) (spec/design/array-functions.md §9, §13): the single
+  // argument must be an array (binding ELEM := its element type, the produced column's type), else
+  // 42883 (a non-array, e.g. unnest(5)). A bare untyped NULL argument leaves ELEM undeterminable →
+  // 42P18 (jed's polymorphic posture, like array_append(NULL, NULL)); a typed NULL array
+  // (NULL::int32[]) resolves and yields zero rows at exec. ELEM may be a scalar OR a composite (AF7 —
+  // unnest(composite[])): the synthetic column is typed at the bound element type directly
+  // (typeFromResolved), so a composite array produces composite rows (an anonymous-composite element
+  // has no catalog name → 0A000, not reachable from a typed array).
   private resolveUnnest(args: Expr[], alias: string | null, argScope: Scope, ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
     if (args.length !== 1) throw noFuncOverload("unnest");
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const { node, type } = resolve(argScope, args[0]!, null, forbidden, ptypes);
     if (type.kind === "array") {
-      const elemST = elemScalarHint(type.elem);
-      if (elemST === null) throw new Error("array element is a scalar (array-of-composite is deferred)");
-      const table = srfTable("unnest", alias, scalarT(elemST));
+      const elemTy = typeFromResolved(type.elem);
+      const table = srfTable("unnest", alias, elemTy);
       return { table, srf: { kind: "unnest", args: [node] } };
     }
     if (type.kind === "null") throw indeterminatePoly();
@@ -9080,7 +9081,37 @@ function quantifiedMembership(op: BinaryOp, all: boolean, lv: Value, av: Value, 
 // normalizing a mixed-width float pair to float64 first (the resolver admits float32 vs float64,
 // matching the compare node's promote — here the array elements are runtime values, so the widen
 // happens per element). Bottoms out in the value module's eq3/lt3/gt3 kernels.
+//
+// A composite operand pair routes through the composite TOTAL ORDER (valueCmp), NOT the bare-ROW 3VL
+// eq3/lt3/gt3 (array-functions.md §13): PostgreSQL's = ANY(addr[]) dispatches on the composite =
+// operator = record_eq, which is DEFINITE with NULL fields comparable (ROW('a',NULL)::addr =
+// ANY(ARRAY[ROW('a',NULL)::addr]) is TRUE), the same total order array_eq / @> already use for
+// composite elements (array.md §5). A whole-element NULL is still UNKNOWN — the operator stays strict
+// at the value level — so the resolver-guaranteed same-type pair is composite-vs-composite or
+// composite-vs-NULL.
 function quantifiedCmp3(op: BinaryOp, x: Value, e: Value): ThreeValued {
+  if (x.kind === "composite" || e.kind === "composite") {
+    if (x.kind === "null" || e.kind === "null") return "unknown";
+    const ord = valueCmp(x, e);
+    let matched: boolean;
+    switch (op) {
+      case "eq":
+        matched = ord === 0;
+        break;
+      case "lt":
+        matched = ord < 0;
+        break;
+      case "gt":
+        matched = ord > 0;
+        break;
+      case "le":
+        matched = ord <= 0;
+        break;
+      default: // ge
+        matched = ord >= 0;
+    }
+    return matched ? "true" : "false";
+  }
   if (x.kind === "float32" && e.kind === "float64") x = float64Value(x.value);
   else if (x.kind === "float64" && e.kind === "float32") e = float64Value(e.value);
   switch (op) {

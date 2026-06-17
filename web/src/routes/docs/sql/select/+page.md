@@ -57,6 +57,18 @@ INSERT INTO person VALUES
 FROM person
 ORDER BY id;`;
 
+	const unnestCompositeExample = `SELECT u          AS place,
+       (u).street AS street,
+       (u).zip    AS zip
+FROM unnest('{"(Main,90210)","(Side,5)"}'::addr[]) AS u
+ORDER BY u;`;
+
+	const arrayCompositeFnExample = `SELECT id,
+       cardinality(places)            AS n,
+       '(Side,5)'::addr = ANY(places) AS has_side
+FROM person
+ORDER BY id;`;
+
 	const compositeArrayFieldSeed = `CREATE TYPE poly AS (name text, pts int32[]);
 CREATE TABLE shapes (id int32 PRIMARY KEY, p poly);
 INSERT INTO shapes VALUES
@@ -151,6 +163,17 @@ element is comparable (so two arrays with matching `NULL` fields are equal and s
 a bare row comparison:
 
 <LiveSql seed={arrayCompositeSeed} query={arrayCompositeExample} rows={2} />
+
+`unnest` expands a composite array into one **composite row** per element — read the whole row
+(`u`) or reach into a field (`(u).zip`):
+
+<LiveSql seed={arrayCompositeSeed} query={unnestCompositeExample} rows={2} />
+
+The array functions and operators work over composite elements too — `array_append`, `||`,
+`cardinality`, `@>`/`<@`/`&&`, `array_remove`, and `= ANY` / `= ALL` (which compares whole rows,
+so a matching `NULL` field still counts as equal):
+
+<LiveSql seed={arrayCompositeSeed} query={arrayCompositeFnExample} rows={2} />
 
 ## Composite types with array fields
 

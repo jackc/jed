@@ -107,6 +107,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Array function surface AF6 (array-functions.md §12): the VARIADIC call syntax + variadic
     // overload resolution — the num_nulls/num_nonnulls built-ins (spread or VARIADIC-array form).
     "func.variadic",
+    // Array function surface AF7 (array-functions.md §13): the whole AF1–AF6 surface over a
+    // COMPOSITE element type + unnest(composite[]) — the quantifiers use the composite total order.
+    "func.array_composite",
     // NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
     "ddl.not_null",
     // DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

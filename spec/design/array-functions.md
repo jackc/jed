@@ -10,7 +10,8 @@
 > `postgres:18` oracle — several array-function NULL/shape rules are subtle (§3) and must be
 > oracle-checked, not guessed.
 >
-> **Status: AF1 + AF2 + AF3 + AF4 + AF5 + AF6 landed — the surface is complete.** AF1 — the
+> **Status: AF1 + AF2 + AF3 + AF4 + AF5 + AF6 + AF7 landed — the surface is complete, scalar and
+> composite element types alike.** AF1 — the
 > **polymorphic resolution machinery** (§2) plus the *scalar-function-shaped* surface: introspection
 > (`array_ndims`, `array_length`, `array_lower`, `array_upper`, `cardinality`, `array_dims`) and builders
 > (`array_append`, `array_prepend`, `array_cat`). AF2 (§8) — the **`||` concatenation operator** and the
@@ -26,7 +27,12 @@
 > (`suites/expr/array_functions.test`, `suites/expr/array_concat_search.test`, `suites/query/unnest.test`,
 > `suites/expr/array_containment.test`, `suites/expr/array_quantified.test`, `suites/expr/array_variadic.test`),
 > capabilities `func.array` + `func.unnest` + `func.array_containment` + `func.array_quantified` +
-> `func.variadic`.
+> `func.variadic`. AF7 (§13) — the same surface (plus `unnest(composite[])`) over a **composite
+> element type**: most of it already worked by construction (the polymorphic resolution unifies a
+> composite element, and the comparison kernels route through the composite *total order*); the two
+> pieces that needed code are `unnest`'s composite output column and the `ANY`/`ALL` per-element
+> compare. Capability `func.array_composite`, oracle-checked
+> (`suites/query/unnest_composite.test`, `suites/expr/array_composite_functions.test`).
 
 ## 1. Why a new layer
 
@@ -288,6 +294,12 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
   on the engine's first VARIADIC built-ins `num_nulls`/`num_nonnulls`. One grammar change (a `VARIADIC`
   keyword before the final call argument); all three cores + `func.variadic` +
   `suites/expr/array_variadic.test`.
+- **AF7 ✅** (§13) — the whole AF1–AF6 surface **over a composite element type**, plus
+  **`unnest(composite[])`**. Mostly free (the polymorphic resolution already unifies a composite
+  element; the comparison kernels already route through the composite total order via `value_cmp`);
+  two pieces needed code — `unnest`'s composite output column and the `ANY`/`ALL` per-element
+  compare. All three cores + `func.array_composite` + `suites/query/unnest_composite.test` +
+  `suites/expr/array_composite_functions.test`.
 
 ## 7. Errors
 
@@ -401,11 +413,11 @@ the SRF analogue of the `anyelement` code (§2). Resolution (hand-written per co
    "function unnest(unknown) is not unique" because it ships several `unnest` overloads; jed has one,
    so the indeterminate case is the honest answer and is **out of the oracle corpus**). A **typed**
    NULL array (`NULL::int32[]`) resolves and yields zero rows at exec.
-3. `unnest`'s `ELEM` is constrained to a **scalar** element this slice; the synthetic column carries
-   it (`int32[]` → an `int32` column, `text[]` → `text`, …). Even though a composite *can* now be an
-   array element (array-of-composite landed, [array.md §12](array.md) AC1), `unnest` over a composite
-   array (a composite-typed SRF output column) is a **deferred** function-surface follow-on — a
-   composite-element array argument is `0A000` at `unnest` resolution, not silently mis-typed.
+3. `unnest`'s `ELEM` may be a **scalar or a composite** element (AF7, §13); the synthetic column
+   carries it (`int32[]` → an `int32` column, `text[]` → `text`, `addr[]` → an `addr` composite
+   column). A composite output column is first-class — it renders via `record_out`, supports
+   `(unnest(…)).field`, and orders/groups by the composite total order — exactly like any composite
+   column. (A nested-array element is still unreachable: arrays-of-arrays do not exist, §2.)
 
 **The generator** (`unnest_rows`/`unnestRows`) evaluates the single array argument **once** against
 the params/outer environment (non-LATERAL, exactly like `generate_series`'s args — a `$N` or a
@@ -440,11 +452,11 @@ literal) **once**, up front.
 "empty_on_null"`); `verify.rb` admits the polymorphic `anyarray` in an SRF `arg_families` slot and
 the new `set_of_element` reserved result. The row is shared registry data (CLAUDE.md §5) cross-checked
 into each core's `SET_RETURNING` table by `gen_catalog.rb`; the resolve/generate **dispatch** is
-hand-written per core. **Deferred** (each its own follow-on, §6): the SELECT-list SRF position
-(`SELECT unnest(…)` is `42883`, like `generate_series`), `LATERAL` (so the natural "explode a column"
-`FROM t, unnest(t.xs)` is reached only via a correlated subquery this slice), `WITH ORDINALITY`, the
-multi-array `unnest(a, b, …)` form, and `unnest` over a composite-element array (array-of-composite
-the *type* landed in array.md §12 AC1; `unnest`'s composite-typed output column is the deferred piece).
+hand-written per core. **`unnest` over a composite-element array landed in AF7** (§13) — the
+composite-typed output column. **Still deferred** (each its own follow-on, §6): the SELECT-list SRF
+position (`SELECT unnest(…)` is `42883`, like `generate_series`), `LATERAL` (so the natural "explode a
+column" `FROM t, unnest(t.xs)` is reached only via a correlated subquery this slice), `WITH
+ORDINALITY`, and the multi-array `unnest(a, b, …)` form.
 
 ## 10. AF4 — the containment / overlap operators (`@>` / `<@` / `&&`)
 
@@ -728,3 +740,123 @@ The two kernels:
     returns NULL on a **NULL whole-array** operand. Both are oracle-pinned PG behavior, and both fall
     out of the `none` discipline (the kernel inspects null-ness itself) plus the array form's
     "evaluate-the-array-first" short-circuit.
+
+## 13. AF7 — the surface over composite element types (+ `unnest(composite[])`)
+
+AF7 is the array function/operator surface over a **composite element type** — `addr[]`, the array
+whose element is a `CREATE TYPE`-named row type (array-of-composite the *type* landed in
+[array.md §12](array.md) AC1). It closes the array surface: every AF1–AF6 function/operator now works
+over composite elements, and `unnest(composite[])` expands a composite array into composite rows.
+Every rule is oracle-pinned (`postgres:18`). The headline is **how little of it needed code** — the
+two foundations the slice rests on (polymorphic resolution by *catalog ref*, and the composite
+*total-order* element compare) were already built for AC1, so most of AF7 is *verification* (the
+conformance corpus) over machinery that was already correct by construction.
+
+### 13.1 What was already free
+
+- **Resolution.** The §2 unification binds `ELEM` by **structural type equality**, which for a
+  composite is its catalog ref (`unify_elem(addr, addr)` holds; `array_cat(addr[], other[])` is
+  `42883`). So the builders (`array_append`/`array_prepend`/`array_cat`/`||`), the introspectors, the
+  containment operators (`@>`/`<@`/`&&`), the quantifiers, and the search/edit functions all *resolve*
+  over composite elements with no change. The literal-adaptation hint (`elem_scalar_hint`) is `None`
+  for a composite element — correct, because a composite element is never a bare adaptable literal; it
+  arrives already typed (a `'(…)'::addr` cast, an `ARRAY[ROW(…)]` under column context, or an array
+  element). 
+- **Builders / introspectors / `num_nulls`.** These manipulate **shape** and the **element list** and
+  never compare elements, so they are element-type-agnostic and correct over composites by
+  construction (`array_append(addr[], addr)` appends; `array_length`/`cardinality`/`array_dims` read
+  the header; `num_nulls(VARIADIC addr[])` counts whole-element NULLs).
+- **Containment + search/edit.** Their element comparison already bottoms out in **`value_cmp` (the
+  composite total order)** — `strict_elem_eq` for `@>`/`<@`/`&&` (a whole-element NULL matches nothing,
+  but two non-NULL composites compare via the total order, NULL *fields* comparable) and the NULL-safe
+  `value_cmp == Equal` for `array_remove`/`array_replace`/`array_position`/`array_positions`. Both are
+  exactly PG's record semantics, so `'{"(a,)"}'::addr[] @> '{"(a,)"}'::addr[]` is **TRUE** (the NULL
+  `zip` field is comparable) yet `'{NULL}'::addr[]` is contained by nothing (the whole-element NULL is
+  strict), and `array_remove(arr, '(a,)'::addr)` removes the NULL-field element. The 1-D-only `0A000`
+  of `array_remove`/`array_position`/`array_positions` (§5 #11) and the `2202E`/`22000` shape rules of
+  the builders are unchanged — they are element-type-independent.
+
+### 13.2 What needed code
+
+Two pieces, one per core (Rust/Go/TS), each tiny:
+
+1. **`unnest(composite[])` — the composite output column.** `resolve_unnest` (§9) bound `ELEM` to a
+   *scalar* and built the synthetic one-column relation at `Type::Scalar(elem)`, panicking/`0A000`-ing
+   on a composite element. AF7 types the column at the **bound element type directly** (`Type::Scalar`
+   *or* `Type::Composite(ref)`) — the same `set_of_element` result, now generalized past scalars. The
+   generator is unchanged (it pushes each element as a one-column row), so a composite array yields one
+   **single composite column** whose values are the elements: a `NULL` element is a `NULL` composite
+   row, the empty array and a `NULL` array each yield zero rows, a multidimensional array flattens
+   row-major. The composite output column is **first-class downstream, exactly like any composite
+   column** — `SELECT u FROM unnest('{…}'::addr[]) AS u` renders each value via `record_out`,
+   `(u).zip` reads a field, and `ORDER BY`/`DISTINCT`/aggregation use the composite total order. (An
+   *anonymous* composite element — a `record[]` with no catalog name — stays `0A000`, the
+   `type_from_resolved` precedent; it is not reachable from a stored/typed array.) **This is a
+   single-composite-column model, a documented divergence from PostgreSQL** (decisions 23/24): jed
+   treats the SRF output like a composite column rather than reproducing PG's "a composite-returning
+   function in FROM expands into a relation of its fields" rule.
+2. **`x op ANY/ALL(composite[])` — the per-element compare.** AF5's per-element 3VL kernel
+   (`quantified_cmp3`) dispatched composites to `eq3`/`lt3`/`gt3`, which for a composite are the
+   **bare-`ROW` 3VL** (a NULL field propagates to UNKNOWN — [composite.md §5](composite.md)). But
+   PostgreSQL's `= ANY(addr[])` uses the composite type's `=` **operator** = `record_eq`, which is
+   **definite with NULL fields comparable** (the inverse of bare-`ROW` 3VL — the same dichotomy
+   array.md §5 records: `ARRAY[ROW(1,NULL)] = ARRAY[ROW(1,NULL)]` is TRUE while bare `ROW(1,NULL) =
+   ROW(1,NULL)` is UNKNOWN). So AF7 routes a **composite** operand pair through the composite
+   **total order** (`value_cmp`), exactly as containment and the array comparator already do:
+
+   - if either whole operand is `NULL` → **UNKNOWN** (the operator stays strict at the value level, so
+     `x = ANY(ARRAY[NULL::addr])` is still NULL and `'(a,1)'::addr = ANY('{NULL}'::addr[])` folds to
+     NULL);
+   - otherwise map `value_cmp(x, e)` to the operator (`=` → Equal, `<` → Less, `<=` → not Greater, …),
+     a **definite** boolean.
+
+   So `ROW('a',NULL)::addr = ANY(ARRAY[ROW('a',NULL)::addr])` is **TRUE** (the NULL `zip` is
+   comparable) and `'(a,1)'::addr < ANY('{"(a,)"}'::addr[])` is **TRUE** (the NULL field sorts last).
+   The **scalar** path is untouched (for two non-NULL scalars `value_cmp` and `eq3`/`lt3`/`gt3` agree,
+   but routing by element type keeps the existing oracle-pinned scalar corpus byte-identical). The OR-/
+   AND-fold, the cost (one `operator_eval` per element), and the `42809`/`42883`/`42P18` resolver
+   postures are all unchanged from AF5.
+
+### 13.3 Ratified decisions & deliberate divergences
+
+19. **The composite-element surface is supported wholesale; most of it was already correct.** The only
+    code is `unnest`'s composite column and the `ANY`/`ALL` per-element compare; the rest passes the
+    oracle by construction. No `format_version` bump, no new catalog row, no grammar change.
+20. **`x op ANY/ALL(composite[])` uses the composite *total order* (definite, NULL fields comparable),
+    NOT the bare-`ROW` 3VL** — matching PostgreSQL's `record_eq`/`record_cmp` operator (the operator
+    `ANY`/`ALL` dispatch on), and the deliberate inverse of the bare `ROW(…) op ROW(…)` row-comparison
+    3VL (composite.md §5). A **whole-element NULL** is still UNKNOWN (3VL at the value level). This is
+    the same total-order routing AC1 gave `array_eq`/`array_cmp` and `@>`/search-edit; AF7 extends it
+    to the quantifiers. Oracle-pinned.
+21. **Containment matches a NULL-field composite element but never a whole-element NULL** — `@>`/`<@`/
+    `&&` use strict equality at the value level (a whole-element `NULL` matches nothing, §10 #12) but
+    the composite total order at the field level (NULL fields comparable), so `'{"(a,)"}'::addr[] @>
+    '{"(a,)"}'::addr[]` is TRUE and `'{NULL}'::addr[]` is contained by nothing. PG; oracle-pinned.
+22. **The construction path in the oracle corpus is the PG-portable text literal** — `'{…}'::addr[]`
+    and `'(…)'::addr` (which round-trip through `array_in`/`record_in`), so the corpus runs unmodified
+    on `postgres:18`. The `ARRAY[ROW(…)]` constructor under a composite column context (a jed extension
+    PG rejects without a cast, and `ROW(…)::addr` itself is the deferred composite-cast `0A000`) is
+    covered by the per-core unit tests, exactly as AC1 did (array.md §12).
+23. **`unnest(composite[])` yields a SINGLE composite column, NOT PG's expanded-fields relation**
+    (deliberate divergence). PostgreSQL treats a composite-returning function in FROM as a relation
+    whose columns are the composite's *fields*, so `SELECT * FROM unnest('{"(Main,90210)"}'::addr[])`
+    returns two columns (`street`, `zip`). jed instead produces **one composite column** (named after
+    the alias, else `unnest`), consistent with how composite columns behave everywhere else in jed (a
+    composite column is never field-expanded by `*`; PG agrees for *stored* composite columns — it is
+    only the function-in-FROM case PG special-cases). The **overriding reason** is scope and
+    consistency: PG's expansion would require a multi-column synthetic SRF relation **and whole-row
+    references** (`SELECT u` reconstructing the row from its columns), neither of which jed has — a far
+    larger slice than this follow-on, and at odds with jed's uniform composite-column model. The
+    explicit forms agree with PG and are what the oracle corpus uses: `SELECT u FROM unnest(…) AS u`
+    (the whole composite — PG reads the alias as a whole-row reference), `(u).street`/`(u).zip` (field
+    access), `count(*)`, and `ORDER BY u`. Only `SELECT *` / `u.*` / `u.street` differ; those are
+    covered by the per-core unit tests, not the corpus.
+24. **A NULL composite element unnests to a whole-`NULL` composite row, NOT PG's all-NULL-fields row**
+    (a corollary of 23). Because PG expands the SRF into field columns, a `NULL` array element becomes
+    a row of NULL columns, and reconstructing it (`SELECT u`) yields `(,)` (a `ROW(NULL,NULL)` value,
+    distinct from SQL-NULL though `IS NULL` is TRUE for both under the all-fields rule). jed's
+    single-column model keeps the element a **whole-`NULL` composite** (`SELECT u` renders `NULL`),
+    matching PG's *SELECT-list* `unnest` (where a NULL element IS NULL) rather than its FROM-expansion
+    quirk. Both are *rows* (the element count / `count(*)` agree, and the NULL sorts last under `ORDER
+    BY` in both), so the oracle corpus pins the count and the non-NULL renders; the NULL-element render
+    is a per-core unit-test assertion.

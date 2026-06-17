@@ -390,8 +390,9 @@ corpus lands.
     access `(a[i]).f`). A composite element keeps array btree NULL-comparable semantics (decision 5)
     by bottoming the per-element compare out in the composite sort key, so an array comparison stays a
     definite boolean even when a composite element has a NULL field. Oracle-pinned. The mirror nesting
-    — a composite type with an **array-typed field** (`CREATE TYPE t AS (xs int32[])`) — and
-    `unnest`/the polymorphic array **function** surface over composite elements stay deferred (§12).
+    — a composite type with an **array-typed field** (`CREATE TYPE t AS (xs int32[])`) — landed
+    (composite.md §12), and `unnest(composite[])` + the polymorphic array **function/operator** surface
+    over composite elements landed (AF7, [array-functions.md §13](array-functions.md)).
 
 ## 11. Errors
 
@@ -486,9 +487,14 @@ references it — the dependency check + two-pass-load validation look through o
 golden `composite_array_field_table.jed` (`rust == go == ts == ruby`); oracle-checked
 `types/composite_array_field.test`. See [composite.md §12](composite.md).
 
-**Still deferred (each its own follow-on):** `unnest(composite[])` and the polymorphic array
-**function/operator** surface over composite elements (`array_append`/`array_cat`/`||`, `@>`/`<@`/`&&`,
-`ANY`/`ALL`, the search/edit functions — AF1–AF6 are scalar-element-tested; composite-element
-behavior is unverified and out of this slice); arrays-in-keys (`0A000`, encoding authored §8); the
-subquery quantifier form `op ANY(SELECT …)` (array-functions.md §11); runtime text→array,
-`array::text`, and element-wise array→array casts.
+**`unnest(composite[])` and the polymorphic array function/operator surface over composite elements
+landed (AF7, [array-functions.md §13](array-functions.md)):** every AF1–AF6 function/operator
+(`array_append`/`array_cat`/`||`, `@>`/`<@`/`&&`, `ANY`/`ALL`, the introspectors, the search/edit
+functions, `num_nulls` VARIADIC) is oracle-checked over a composite element type, and
+`unnest('{…}'::addr[])` expands a composite array into composite rows. Most of it was already correct
+by construction (the polymorphic resolution unifies a composite element by catalog ref; the comparison
+kernels route through the composite total order — §5); the only code was `unnest`'s composite output
+column and the `ANY`/`ALL` per-element compare (which, like `array_eq`, uses the composite total order,
+NOT the bare-`ROW` 3VL — §5). **Still deferred (each its own follow-on):** arrays-in-keys (`0A000`,
+encoding authored §8); the subquery quantifier form `op ANY(SELECT …)` (array-functions.md §11);
+runtime text→array, `array::text`, and element-wise array→array casts.

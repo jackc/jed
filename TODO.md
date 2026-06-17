@@ -300,8 +300,20 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         cast parses through `record_in`/`array_in`. All three cores + Ruby; new golden
         `composite_array_field_table.jed`; oracle-checked `types/composite_array_field.test`;
         capability `types.composite_array_field`. → [array.md §12](spec/design/array.md), [composite.md §12](spec/design/composite.md)
-  - [ ] _remaining follow-ons (each its own slice + obligations):_ `unnest(composite[])`
-        and the polymorphic array **function** surface over composite elements; arrays-in-keys
+  - [x] **AF7 — `unnest(composite[])` + the polymorphic array function/operator surface over composite
+        elements** — every AF1–AF6 function/operator (`array_append`/`array_cat`/`||`, `@>`/`<@`/`&&`,
+        `ANY`/`ALL`, the introspectors, the search/edit functions, `num_nulls` VARIADIC) is oracle-checked
+        over a composite element type, and `unnest('{…}'::addr[])` expands a composite array into composite
+        rows. Mostly free by construction (the §2 polymorphic resolution unifies a composite element by
+        catalog ref; the comparison kernels — `@>`/search-edit — already route through `value_cmp`, the
+        composite *total order*). Two pieces needed one-spot-per-core code: (a) `unnest`'s synthetic output
+        column types at the bound composite element type (was a scalar-only panic); (b) `x op ANY/ALL(addr[])`
+        routes a composite operand pair through the composite total order (definite, NULL fields comparable —
+        PG `record_eq`, NOT the bare-`ROW` 3VL `eq3`), while a whole-element NULL still folds to UNKNOWN. All
+        three cores + per-core unit tests (the `ARRAY[ROW(…)]`-under-column-context extension), oracle-checked
+        (`suites/query/unnest_composite.test`, `suites/expr/array_composite_functions.test`), capability
+        `func.array_composite`. → [array-functions.md §13](spec/design/array-functions.md)
+  - [ ] _remaining follow-ons (each its own slice + obligations):_ arrays-in-keys
         (`0A000`, encoding authored §8); the subquery quantifier form `op ANY(SELECT …)`; runtime
         text→array, `array::text`, and element-wise array→array casts.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The

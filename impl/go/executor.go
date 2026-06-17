@@ -3517,12 +3517,14 @@ func (db *Database) resolveGenerateSeries(args []*Expr, alias *string, argScope 
 	return srfTable("generate_series", alias, ScalarT(result)), &srfPlan{kind: srfGenerateSeries, args: rargs}, nil
 }
 
-// resolveUnnest resolves unnest(anyarray) (spec/design/array-functions.md §9): the single argument
-// must be an array (binding ELEM := its element type, the produced column's type), else 42883 (a
-// non-array, e.g. unnest(5)). A bare untyped NULL argument leaves ELEM undeterminable → 42P18
-// (jed's polymorphic posture, like array_append(NULL, NULL)); a typed NULL array (NULL::int32[])
-// resolves and yields zero rows at exec. Arrays hold scalar elements this slice (array-of-composite
-// is deferred), so ELEM is a scalar.
+// resolveUnnest resolves unnest(anyarray) (spec/design/array-functions.md §9, §13): the single
+// argument must be an array (binding ELEM := its element type, the produced column's type), else
+// 42883 (a non-array, e.g. unnest(5)). A bare untyped NULL argument leaves ELEM undeterminable →
+// 42P18 (jed's polymorphic posture, like array_append(NULL, NULL)); a typed NULL array
+// (NULL::int32[]) resolves and yields zero rows at exec. ELEM may be a scalar OR a composite (AF7 —
+// unnest(composite[])): the synthetic column is typed at the bound element type directly
+// (typeFromResolved), so a composite array produces composite rows (an anonymous-composite element
+// has no catalog name → 0A000, not reachable from a typed array).
 func (db *Database) resolveUnnest(args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload("unnest")
@@ -3534,11 +3536,11 @@ func (db *Database) resolveUnnest(args []*Expr, alias *string, argScope *scope, 
 	}
 	switch t.kind {
 	case rtArray:
-		elemST, ok := elemScalarHint(*t.elem)
-		if !ok {
-			panic("array element is a scalar (array-of-composite is deferred)")
+		elemTy, err := typeFromResolved(*t.elem)
+		if err != nil {
+			return nil, nil, err
 		}
-		return srfTable("unnest", alias, ScalarT(elemST)), &srfPlan{kind: srfUnnest, args: []*rExpr{r}}, nil
+		return srfTable("unnest", alias, elemTy), &srfPlan{kind: srfUnnest, args: []*rExpr{r}}, nil
 	case rtNull:
 		return nil, nil, indeterminatePoly()
 	default:
@@ -5172,7 +5174,38 @@ func quantifiedMembership(op BinaryOp, all bool, lv, av Value, m *Meter) (Value,
 // normalizing a mixed-width float pair to float64 first (the resolver admits float32 vs float64,
 // matching reCompare's promote — here the array elements are runtime values, so the widen happens per
 // element). Bottoms out in the value module's Eq3/Lt3/Gt3 kernels.
+//
+// A composite operand pair routes through the composite TOTAL ORDER (valueCmp), NOT the bare-ROW 3VL
+// Eq3/Lt3/Gt3 (array-functions.md §13): PostgreSQL's = ANY(addr[]) dispatches on the composite =
+// operator = record_eq, which is DEFINITE with NULL fields comparable (ROW('a',NULL)::addr =
+// ANY(ARRAY[ROW('a',NULL)::addr]) is TRUE), the same total order array_eq / @> already use for
+// composite elements (array.md §5). A whole-element NULL is still UNKNOWN — the operator stays strict
+// at the value level — so the resolver-guaranteed same-type pair is composite-vs-composite or
+// composite-vs-NULL.
 func quantifiedCmp3(op BinaryOp, x, e Value) ThreeValued {
+	if x.Kind == ValComposite || e.Kind == ValComposite {
+		if x.Kind == ValNull || e.Kind == ValNull {
+			return Unknown
+		}
+		ord := valueCmp(x, e)
+		var matched bool
+		switch op {
+		case OpEq:
+			matched = ord == 0
+		case OpLt:
+			matched = ord < 0
+		case OpGt:
+			matched = ord > 0
+		case OpLe:
+			matched = ord <= 0
+		default: // OpGe
+			matched = ord >= 0
+		}
+		if matched {
+			return True
+		}
+		return False
+	}
 	if x.Kind == ValFloat32 && e.Kind == ValFloat64 {
 		x = Float64Value(float64(x.F32()))
 	} else if x.Kind == ValFloat64 && e.Kind == ValFloat32 {

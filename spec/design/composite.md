@@ -310,6 +310,15 @@ down). The element may itself be a composite (the doubly-nested `addr[]` field, 
 14` + name). `DROP TYPE` dependency tracking and the two-pass-load existence/acyclicity validation
 look through one array level, so an `addr[]` field (or column) is a `2BP01` dependent of `addr`.
 
+**The array function/operator surface over composite elements** (`array_append`/`array_cat`/`||`,
+`@>`/`<@`/`&&`, `ANY`/`ALL`, the introspectors, the search/edit functions, `num_nulls` VARIADIC) and
+**`unnest(composite[])`** landed (AF7, [array-functions.md §13](array-functions.md), capability
+`func.array_composite`). The one composite-specific subtlety: `x op ANY/ALL(addr[])` compares a
+composite operand pair through the composite **total order** (definite, NULL fields comparable —
+PG `record_eq`/`record_cmp`), **not** the bare-`ROW` 3VL §5 rule — so `ROW('a',NULL)::addr =
+ANY(ARRAY[ROW('a',NULL)::addr])` is **TRUE** (the array-`=`/AC1 dichotomy, extended to the
+quantifiers), while a whole-element `NULL` still folds to UNKNOWN.
+
 **Still narrowed (relaxed in a later slice):** `INSERT … SELECT` into a composite column and
 `UPDATE` of a composite column remain `0A000`; a composite `PRIMARY KEY` / index / `UNIQUE` stays
 `0A000` (§6); `DEFAULT` on a composite column is `0A000`; the runtime (non-literal) text→composite
